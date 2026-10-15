@@ -110,7 +110,7 @@ driver is ever proposed again, this entry is why it has to be argued from a
 stated new reason rather than revived from the old one.
 
 *Revisited 2026-10-15: ivshmem, for waycompose's arena only, for a stated new
-reason* (`waycompose-design.md` §82). **The reason is root in the product path.**
+reason* (`waycompose-design.md` §83). **The reason is root in the product path.**
 The compositor's arena was guest RAM, and on testhost the host can reach guest
 RAM only through QEMU's monitor and descriptor table, both root's, so every
 session the desktop shortcut started became root twice. An `ivshmem-plain`
@@ -118,7 +118,7 @@ device backed by a file at a path lets one group reach those pages instead.
 **The constraint above is met, not waived.** The driver is the Looking Glass B7
 build, signed by *Microsoft Windows Hardware Compatibility Publisher* under
 *Microsoft Windows Third Party Component CA 2014*, so it is not test-signed and
-needs nothing changed in code integrity. §82.8 records the hashes and what
+needs nothing changed in code integrity. §83.8 records the hashes and what
 `Get-AuthenticodeSignature` reported. **The old mechanism objection is not
 contradicted.** It concerns importing a BAR into a GPU driver, and shared_vulkan's
 arena, which is imported, stays guest RAM. The compositor's arena is read and
@@ -804,7 +804,7 @@ outright makes the query fail rather than lie, which degrades the design to
 rather than being replaced.
 
 ### R29 — The ivshmem arena's file is a lever on the VM
-Added 2026-10-15 with `waycompose-design.md` §82. The launcher's arena is BAR2 of
+Added 2026-10-15 with `waycompose-design.md` §83. The launcher's arena is BAR2 of
 an `ivshmem-plain` device whose memory backend is
 `/run/windows-vm/wc-arena/arena`, mode 0660 `root:wc-arena`, in a directory mode
 0750. Membership of `wc-arena` is the whole of the access control, and a member
@@ -838,4 +838,4 @@ them the ability to stop a VM a person is using. Treat membership like `wheel`.
 the first handle that asks and keeps it until that handle closes, so any guest
 process that can open the device can hold the mapping and keep the compositor
 from starting, or read the arena while it has it. On testhost the guest has one
-interactive account. §82.8 records which accounts the device actually opens for.
+interactive account. §83.8 records which accounts the device actually opens for.

@@ -7,6 +7,8 @@
 #   scripts/wc-firefox.sh titlebar    the two levers that leave exactly one title bar
 #   scripts/wc-firefox.sh auto        Firefox under the compiled-in default, vs server
 #   scripts/wc-firefox.sh tabs        the client half of --decorations tabs
+#   scripts/wc-firefox.sh tabs-default  §82: tabs in the caption with no flag, the launcher's profile
+#   scripts/wc-firefox.sh wine-tabs   §82: the same in a Wine HWND: hit test, drag, double-click
 #   scripts/wc-firefox.sh menu        a click, an xdg_popup, and a second window
 #   scripts/wc-firefox.sh wine        the same client into a real HWND, through the proxy
 #   scripts/wc-firefox.sh wine-arena  the same run with the pixels in an arena
@@ -1075,6 +1077,356 @@ block_wine() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# §82: tabs in the title bar, under the defaults
+# ---------------------------------------------------------------------------
+#
+# The arrangement a deployment gets with no flag on the compositor and the
+# launcher's default `titlebar = tabs`: Firefox told MOZ_GTK_TITLEBAR_DECORATION
+# =client, its own window buttons turned off, and a userChrome.css that makes
+# its tab strip the caption's height and leaves the caption buttons' corner
+# empty. The profile is written by `wc-launch --write-firefox-profile`, the same
+# code a launch runs, so this measures the launcher's output and not a copy.
+
+OUTTB="$ROOT/docs/tabs-in-titlebar"
+LAUNCH_BIN="$LINUX_BIN/wc-launch"
+
+# The geometry rectangle's top strip: how many rows from the top at column 700
+# are the colour of row 0. Firefox's tab strip is one flat colour there (it is
+# past the last tab) and the navigation bar under it is another.
+strip_rows() {
+  magick "$1" -crop 1x80+700+0 +repage txt:- 2>/dev/null \
+    | awk 'NR>1 {print $3}' | uniq -c | head -1 | awk '{print $1}'
+}
+
+# The share of the top-right `$2`x`$3` corner that is its most common colour,
+# in percent. An empty corner is ~99.5 (the window's rounded corner is the
+# rest); one with Firefox's tab-list button or close button in it is under 98.
+corner_share() {
+  local img=$1 w=$2 h=$3 width
+  width=$(magick identify -format %w "$img" 2>/dev/null)
+  magick "$img" -crop "${w}x${h}+$((width - w))+0" +repage -format %c histogram:info:- 2>/dev/null \
+    | sort -rn | awk '{n=$1+0; t+=n; if (NR==1) m=n} END {if (t) printf "%.1f", 100*m/t}'
+}
+
+block_tabs_default() {
+  echo "== tabs-default: Firefox's tabs in the caption with no compositor flag (Linux, headless)"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+  have magick || { non "no imagemagick"; return; }
+  fresh_or_skip "$LAUNCH_BIN" "cargo build -p wc-launch"; case $? in 2) non "no wc-launch"; return ;; 1) return ;; esac
+
+  local t="$RUNDIR/tdef-tabs" n="$RUNDIR/tdef-none" c="$RUNDIR/tdef-bare"
+  mkdir -p "$t/profile" "$n/profile" "$c/profile"
+  "$LAUNCH_BIN" --write-firefox-profile tabs 96 "$t/profile" >"$t/launch.txt" 2>&1 \
+    || { bad "wc-launch would not write the tabs profile: $(cat "$t/launch.txt")"; return; }
+  "$LAUNCH_BIN" --write-firefox-profile none 96 "$n/profile" >"$n/launch.txt" 2>&1 \
+    || { bad "wc-launch would not write the none profile"; return; }
+  note "$(cat "$t/launch.txt")"
+
+  # Leg 1: the default. No --decorations; what the launcher writes and sets.
+  FX_DECOR=none; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=client)
+  WC_WAYLAND_DEBUG=1 run_firefox "$t" wc-tdef 25 \
+    || { bad "the compositor never bound its socket (tabs)"; return; }
+  # Leg 2: the opt-out, `titlebar = none`.
+  FX_DECOR=none; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=none)
+  WC_WAYLAND_DEBUG=1 run_firefox "$n" wc-tdefn 25 \
+    || { bad "the compositor never bound its socket (none)"; return; }
+  # Leg 3, the control: the env var and nothing else — a Firefox started by
+  # something other than the launcher. The fold must still happen and the
+  # corner must not be clear, or the sheet is not what clears it.
+  FX_DECOR=none; FX_ENV=(MOZ_GTK_TITLEBAR_DECORATION=client)
+  WC_WAYLAND_DEBUG=1 run_firefox "$c" wc-tdefc 25 \
+    || { bad "the compositor never bound its socket (control)"; return; }
+  FX_DECOR=client; FX_ENV=()
+
+  grep -q 'decorations: manager default is Auto' "$t/srv.log" \
+    && ok "tabs: the compositor ran its default, Auto" \
+    || bad "tabs: the compositor did not run Auto"
+  grep -q 'org_kde_kwin_server_decoration#[0-9]*\.request_mode(1)' "$t/fx.txt" \
+    && ok "tabs: Firefox asked for Client (request_mode(1))" \
+    || bad "tabs: Firefox did not ask for Client"
+  grep -q 'window 1 (firefox) asked to decorate itself (Client) and was told yes, so this window.s caption is folded' "$t/srv.log" \
+    && ok "tabs: the compositor folded the caption because Firefox asked for Client (§82)" \
+    || { bad "tabs: no fold under the default"; grep 'window 1 (' "$t/srv.log" | sed 's/^/        /'; }
+  grep -q 'window 1 mapped surface .* (the system caption folded in)' "$t/srv.log" \
+    && ok "tabs: the platform mapped it with the caption folded in" \
+    || bad "tabs: the platform did not fold"
+
+  grep -q 'request_mode(2)' "$n/fx.txt" \
+    && ok "none: Firefox asked for Server, so the opt-out still opts out" \
+    || bad "none: Firefox did not ask for Server"
+  if grep -q 'caption folded in' "$n/srv.log"; then
+    bad "none: the caption was folded for a Firefox that opted out"
+  else
+    ok "none: the caption was kept: Windows' title bar, the tab strip below it"
+  fi
+  [ -f "$n/profile/chrome/userChrome.css" ] \
+    && bad "none: the opt-out profile has a userChrome.css" \
+    || ok "none: the opt-out profile has no userChrome.css"
+
+  local lt ln lc
+  lt=$(ls "$t"/frames/window1-*.ppm 2>/dev/null | tail -1)
+  ln=$(ls "$n"/frames/window1-*.ppm 2>/dev/null | tail -1)
+  lc=$(ls "$c"/frames/window1-*.ppm 2>/dev/null | tail -1)
+  if [ -z "$lt" ] || [ -z "$lc" ] || [ -z "$ln" ]; then
+    bad "a leg dumped no frames: tabs=${lt:-none} none=${ln:-none} control=${lc:-none}"
+    return
+  fi
+  local rows_t rows_c share_t share_c
+  rows_t=$(strip_rows "$lt"); rows_c=$(strip_rows "$lc")
+  share_t=$(corner_share "$lt" 146 31); share_c=$(corner_share "$lc" 146 31)
+  note "tab strip rows: tabs=$rows_t control=$rows_c; corner 146x31 dominant colour: tabs=$share_t% control=$share_c%"
+  [ "$rows_t" = 31 ] \
+    && ok "tabs: the tab strip is 31 rows, the caption's height at 100% (control: $rows_c)" \
+    || bad "tabs: the tab strip is ${rows_t:-?} rows; the caption is 31"
+  awk -v s="${share_t:-0}" 'BEGIN { exit !(s >= 99) }' \
+    && ok "tabs: the caption-button corner is empty ($share_t% one colour)" \
+    || bad "tabs: something of Firefox's is in the caption-button corner ($share_t% one colour)"
+  awk -v s="${share_c:-100}" 'BEGIN { exit !(s < 99) }' \
+    && ok "control: without the profile Firefox's own widgets are in that corner ($share_c%), so the profile is what empties it" \
+    || bad "control: the corner is empty without the profile too ($share_c%); the measurement cannot tell"
+
+  mkdir -p "$OUTTB"
+  magick "$lt" -crop 1280x80+0+0 +repage "$OUTTB/linux-tabs-default-top.png" 2>/dev/null
+  magick "$lc" -crop 1280x80+0+0 +repage "$OUTTB/linux-tabs-noprofile-top.png" 2>/dev/null
+  magick "$ln" -crop 1280x80+0+0 +repage "$OUTTB/linux-none-top.png" 2>/dev/null
+  note "frame-dump crops (Linux headless compositor, not Windows): ${OUTTB#"$ROOT"/}/linux-{tabs-default,tabs-noprofile,none}-top.png"
+}
+
+# The Wine leg of the same arrangement, and the one place before the guest
+# where the Win32 half runs: WM_NCCALCSIZE, the hit test, the fallback caption
+# buttons, and a real drag through SendInput.
+#
+# WHAT WINE CAN AND CANNOT SAY. Wine's `dwmapi` composites nothing and answers
+# DWMWA_CAPTION_BUTTON_BOUNDS with E_NOTIMPL (§67.4), so this leg sees the
+# compositor's *fallback* buttons (DrawFrameControl), never DWM's, and its
+# hit-test answers come from `caption::hit` rather than DwmDefWindowProc. The
+# modal move and size loops are Wine's own. A pass here says the Win32 code paths
+# are self-consistent and that the client half round-trips; it says nothing
+# about DWM, snap layouts, or real Windows' metrics.
+block_wine_tabs() {
+  echo "== wine-tabs: the default arrangement in a Wine HWND — fold, hit test, drag, double-click"
+  have "$FIREFOX" || { non "no firefox on PATH"; return; }
+  have wine || { non "no wine"; return; }
+  have Xvfb || { non "no Xvfb"; return; }
+  have magick || { non "no imagemagick"; return; }
+  fresh_or_skip "$WIN_BIN/wc-compositor.exe" "cargo build --target x86_64-pc-windows-gnu"; case $? in 2) non "no wc-compositor.exe"; return ;; 1) return ;; esac
+  fresh_or_skip "$WIN_BIN/wc-desk.exe" "cargo build -p wc-desk --target x86_64-pc-windows-gnu"; case $? in 2) non "no wc-desk.exe"; return ;; 1) return ;; esac
+  fresh_or_skip "$LAUNCH_BIN" "cargo build -p wc-launch"; case $? in 2) non "no wc-launch"; return ;; 1) return ;; esac
+
+  local dir="$RUNDIR/wine-tabs"
+  mkdir -p "$dir/rt" "$dir/frames" "$dir/pools" "$dir/keymaps" "$dir/profile"
+  chmod 700 "$dir/rt"
+  winp() { local p=$1; echo "Z:${p//\//\\}"; }
+  "$LAUNCH_BIN" --write-firefox-profile tabs 96 "$dir/profile" >"$dir/launch.txt" 2>&1 \
+    || { bad "wc-launch would not write the profile"; return; }
+
+  wc_substrate_declare wine-fixture \
+    "no QEMU on this box: a Wine run has no guest RAM to locate" || return
+
+  Xvfb :$WC_X_DISPLAY -screen 0 1600x1100x24 -nolisten tcp >"$dir/xvfb.log" 2>&1 &
+  XPID=$!
+  export DISPLAY=":$WC_X_DISPLAY"
+  local up=""
+  for _ in $(seq 1 100); do
+    xwd -root -silent >/dev/null 2>&1 && { up=1; break; }
+    sleep 0.1
+  done
+  [ -n "$up" ] || { bad "Xvfb never came up"; return; }
+  sleep 3
+  local desk="wc-ftabs-$$-$RANDOM" sock=wl-ftabs
+  rm -f "$WINEPREFIX/drive_c"/users/*/AppData/Local/waycompose/"$sock"* 2>/dev/null
+
+  # No --decorations: the compiled-in default, which is the claim.
+  wine explorer "/desktop=$desk,1600x1050" \
+    "$WIN_BIN/wc-compositor.exe" --socket "$sock" --timeout 170 --output "$OUTPUT" \
+    --shared-dir "$(winp "$dir/keymaps")" --shared-peer-prefix "$dir/keymaps/" \
+    --log "$(winp "$dir/srv.log")" >"$dir/loader.log" 2>&1 &
+  local srv=$!
+  local node=""
+  for _ in $(seq 1 300); do
+    node=$(find "$WINEPREFIX/drive_c" -type s -name "$sock" 2>/dev/null | head -1)
+    [ -n "$node" ] && break
+    sleep 0.2
+  done
+  [ -n "$node" ] || { bad "the Windows compositor never created its socket node"; kill "$srv" 2>/dev/null; return; }
+
+  XDG_RUNTIME_DIR="$dir/rt" "$LINUX_BIN/wc-proxy" \
+    --upstream "$node" --socket wl-proxy --runtime-dir "$dir/rt" \
+    --copy pool --transport shared-file --pool-dir "$dir/pools" \
+    --peer-prefix "$(winp "$dir/pools")\\" \
+    --accept-timeout 40 --timeout 160 >"$dir/proxy.log" 2>&1 &
+  local proxy=$!
+  sleep 1
+  env -u DISPLAY MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland MOZ_GTK_TITLEBAR_DECORATION=client \
+    XDG_RUNTIME_DIR="$dir/rt" WAYLAND_DISPLAY=wl-proxy \
+    timeout 140 "$FIREFOX" --no-remote --profile "$dir/profile" about:blank \
+    >"$dir/fx.log" 2>&1 &
+  local cli=$!
+  sleep 35
+
+  # `wc-desk` inside the same virtual desktop (wc-input.sh's lesson: a second
+  # desktop has no WaycomposeToplevel to find), its stdout to a file because a
+  # program started by `wine explorer` has its console inside the desktop.
+  #
+  # **And it is waited for by a file, not by the exit of `wine explorer`.**
+  # Naming a desktop that is already running hands the program to it and
+  # returns at once, so the first version of this leg ran the hit test, the
+  # top-edge drag, the tab-strip drag and the double-click *at the same time*:
+  # the top-edge drag came out as a move, and three of the five gestures had no
+  # "after" line. Measured, and the reason for `.done`.
+  #
+  # **And no point it touches is in the top-left 665x434.** `cmd /c` opens a
+  # visible Wine console at 0,0 of the desktop, over the window, and a
+  # `SendInput` press there goes to the console: the first top-edge drag of
+  # this leg was aimed at x=600 and "did not resize" for exactly that reason.
+  # Hit tests are messages and are not affected; gestures are aimed right of it.
+  desk() {
+    local out=$1; shift
+    rm -f "$out" "$out.done"
+    wine explorer "/desktop=$desk,1600x1050" cmd /c \
+      "$(winp "$WIN_BIN/wc-desk.exe") $* --class WaycomposeToplevel > $(winp "$out") 2>&1 & echo done> $(winp "$out.done")" \
+      >/dev/null 2>&1
+    for _ in $(seq 1 300); do
+      [ -f "$out.done" ] && break
+      sleep 0.2
+    done
+    sleep 0.5
+  }
+  shot() {
+    xwd -root -silent -out "$dir/$1.xwd" 2>/dev/null && magick "$dir/$1.xwd" "$dir/$1.png" 2>/dev/null
+  }
+  shot restored
+
+  # 1. The hit test, at points fixed relative to an edge: the top edge, the
+  #    top-left corner, empty tab strip, the three caption buttons (thirds of
+  #    the fallback strip, which is 3 x SM_CXSIZE at the right), and the
+  #    navigation bar under the strip.
+  desk "$dir/hit.txt" hittest --at -300,2 --at 2,2 --at 800,15 \
+    --at -50,15 --at -30,15 --at -12,15 --at 600,60
+  sed 's/^/        /' "$dir/hit.txt"
+
+  # 2. The top edge, dragged down by 60: the window must get shorter and its
+  #    top must move, and nothing must reach the client.
+  desk "$dir/top.txt" mouse --drag -300,2 -300,62
+  # 3. Empty tab strip, dragged by (+120, +80): Firefox must ask for a move and
+  #    the window must follow.
+  desk "$dir/move.txt" mouse --drag 800,15 920,95
+  shot moved
+  # 4. A double-click on empty tab strip: Firefox's titlebar action, which is
+  #    `set_maximized`.
+  desk "$dir/dbl.txt" mouse --dblclick 800,15
+  shot maximised
+  # Maximised, the window sits above the monitor by its own border (§31.3),
+  # so the first *visible* row is window-relative y = -top, not 2.
+  local mtop
+  mtop=$(grep -o "mouse.after-dbl *[0-9]*x[0-9]* at [0-9-]*,[0-9-]*" "$dir/dbl.txt" | sed "s/.*,//")
+  mtop=${mtop:-0}; if [ "$mtop" -lt 0 ]; then mtop=$((0 - mtop)); else mtop=0; fi
+  desk "$dir/hitmax.txt" hittest --at -300,$mtop --at -12,$((mtop + 15))
+  for f in top move dbl; do sed 's/^/        /' "$dir/$f.txt"; done
+
+  kill "$cli" 2>/dev/null; wait "$cli" 2>/dev/null
+  sleep 1
+  kill "$proxy" 2>/dev/null; wait "$proxy" 2>/dev/null
+  kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
+
+  wc_assert_substrate "$dir/srv.log" "wine-tabs"
+  grep -q 'window 1 (firefox) asked to decorate itself (Client) and was told yes' "$dir/srv.log" \
+    && ok "the compositor folded Firefox's caption under its default, on Win32" \
+    || { bad "no fold"; grep 'window 1 ' "$dir/srv.log" | head -8 | sed 's/^/        /'; }
+  local folded
+  folded=$(grep -o 'window 1 folds [0-9]* px of caption[^;]*' "$dir/srv.log" | head -1)
+  [ -n "$folded" ] && ok "WM_NCCALCSIZE: $folded" || bad "no 'folds N px' line"
+  grep -q "window 1 draws Windows' caption buttons itself (DrawFrameControl)" "$dir/srv.log" \
+    && ok "DWM would not say (Wine), so the window drew the system's buttons itself: $(grep -o 'client rect [0-9,]* [0-9x]*' "$dir/srv.log" | grep -m1 . )" \
+    || bad "no fallback caption buttons under Wine"
+  grep -q 'window 1 leaves the caption-button corner clear' "$dir/srv.log" \
+    && ok "the compositor's own corner check: Firefox left the button strip empty" \
+    || { bad "the compositor saw Firefox's widgets under the buttons"; grep 'CAPTION BUTTONS\|corner clear' "$dir/srv.log" | sed 's/^/        /'; }
+
+  h() { grep -o "hittest *$1 .* -> [A-Z]*" "$2" | grep -o '[A-Z]*$'; }
+  [ "$(h -300,2 "$dir/hit.txt")" = HTTOP ] && ok "hit test: the top edge of the restored window is HTTOP" \
+    || bad "hit test: the top edge is $(h -300,2 "$dir/hit.txt")"
+  [ "$(h 2,2 "$dir/hit.txt")" = HTTOPLEFT ] && ok "hit test: the top-left corner is HTTOPLEFT" \
+    || bad "hit test: the top-left corner is $(h 2,2 "$dir/hit.txt")"
+  [ "$(h 800,15 "$dir/hit.txt")" = HTCLIENT ] && ok "hit test: empty tab strip is HTCLIENT — the client's to drag (§22.8)" \
+    || bad "hit test: empty tab strip is $(h 800,15 "$dir/hit.txt")"
+  [ "$(h -12,15 "$dir/hit.txt")" = HTCLOSE ] && ok "hit test: the right end of the strip is HTCLOSE" \
+    || bad "hit test: the right end of the strip is $(h -12,15 "$dir/hit.txt")"
+  case "$(h -50,15 "$dir/hit.txt") $(h -30,15 "$dir/hit.txt")" in
+    *HTMAXBUTTON*) ok "hit test: HTMAXBUTTON is reachable — what Windows 11 raises snap layouts on" ;;
+    *) bad "hit test: no HTMAXBUTTON at -50,15 or -30,15" ;;
+  esac
+  [ "$(h 600,60 "$dir/hit.txt")" = HTCLIENT ] && ok "hit test: below the strip is the client's" \
+    || bad "hit test: below the strip is $(h 600,60 "$dir/hit.txt")"
+
+  # The gestures, from the rectangles wc-desk printed.
+  geom() { grep -o "mouse\.$1 *[0-9]*x[0-9]* at [0-9-]*,[0-9-]* zoomed=[a-z]*" "$2" | head -1 \
+             | sed 's/mouse\.[a-z-]* *//'; }
+  local tb ta mb ma db da
+  tb=$(geom before "$dir/top.txt"); ta=$(geom after-drag "$dir/top.txt")
+  mb=$(geom before "$dir/move.txt"); ma=$(geom after-drag "$dir/move.txt")
+  db=$(geom before "$dir/dbl.txt"); da=$(geom after-dbl "$dir/dbl.txt")
+  note "top edge: $tb -> $ta"
+  note "tab strip drag: $mb -> $ma"
+  note "double-click: $db -> $da"
+  local th0 th1 ty0 ty1
+  th0=$(echo "$tb" | sed 's/^[0-9]*x\([0-9]*\).*/\1/'); th1=$(echo "$ta" | sed 's/^[0-9]*x\([0-9]*\).*/\1/')
+  ty0=$(echo "$tb" | sed 's/.*,\([0-9-]*\) .*/\1/'); ty1=$(echo "$ta" | sed 's/.*,\([0-9-]*\) .*/\1/')
+  if [ -n "$th0" ] && [ -n "$th1" ] && [ "$th1" -lt "$th0" ] && [ "$ty1" -gt "$ty0" ]; then
+    ok "the top edge resizes: ${th0}px tall at y=$ty0 -> ${th1}px at y=$ty1"
+  else
+    bad "the top edge did not resize ($tb -> $ta)"
+  fi
+  if grep -q 'window 1 handed a move to Windows' "$dir/srv.log"; then
+    ok "Firefox asked for xdg_toplevel.move from a drag on empty tab strip, and it was handed to Windows"
+  else
+    bad "no xdg_toplevel.move reached the compositor from the tab-strip drag"
+  fi
+  local mx0 my0 mx1 my1
+  mx0=$(echo "$mb" | sed 's/.* at \([0-9-]*\),.*/\1/'); mx1=$(echo "$ma" | sed 's/.* at \([0-9-]*\),.*/\1/')
+  my0=$(echo "$mb" | sed 's/.*,\([0-9-]*\) .*/\1/'); my1=$(echo "$ma" | sed 's/.*,\([0-9-]*\) .*/\1/')
+  # Within 25 px of the drag, not exactly it: GTK starts the move only once the
+  # pointer has passed its drag threshold, so the window trails the pointer by
+  # that much. The keyboard-mode bug this replaced moved it by (+286, +82).
+  local mdx mdy
+  mdx=$((${mx1:-0} - ${mx0:-0})); mdy=$((${my1:-0} - ${my0:-0}))
+  if [ -n "$mx0" ] && [ -n "$mx1" ] && [ $((mdx > 120 ? mdx - 120 : 120 - mdx)) -le 25 ] \
+       && [ $((mdy > 80 ? mdy - 80 : 80 - mdy)) -le 25 ]; then
+    ok "the window followed the drag: $mx0,$my0 -> $mx1,$my1, (+$mdx,+$mdy) for a drag of (+120,+80)"
+  else
+    bad "the window did not follow the drag: ${mx0:-?},${my0:-?} -> ${mx1:-?},${my1:-?}"
+  fi
+  case "$da" in
+    *zoomed=true) ok "a double-click on empty tab strip maximised the window" ;;
+    *) bad "the double-click did not maximise ($da)" ;;
+  esac
+  [ "$(h -300,$mtop "$dir/hitmax.txt")" = HTCLIENT ] \
+    && ok "maximised: no top resize band, the monitor's top row (window y=$mtop) is the tab strip" \
+    || bad "maximised: the monitor's top row (window y=$mtop) is $(h -300,$mtop "$dir/hitmax.txt")"
+
+  # The maximised capture, read the way `tabs-default` reads a frame dump:
+  # the screen's top rows at x=700 must be the tab strip, 31 of them at the
+  # launcher's 100% fit, starting at row 0. A shifted window (§82: the
+  # geometry-origin shift this leg found) shows the navigation bar there.
+  local mrows
+  mrows=$(strip_rows "$dir/maximised.png")
+  [ "${mrows:-0}" -ge 28 ] && [ "${mrows:-0}" -le 34 ] \
+    && ok "maximised: the screen's first $mrows rows are Firefox's tab strip" \
+    || bad "maximised: the screen's top is ${mrows:-?} rows of one colour, not the 31-row tab strip"
+
+  mkdir -p "$OUTTB"
+  local name
+  for name in restored moved maximised; do
+    [ -f "$dir/$name.png" ] && cp "$dir/$name.png" "$OUTTB/wine-tabs-$name.png"
+  done
+  note "Wine screenshots (Xvfb root, Wine's own frame, no DWM): ${OUTTB#"$ROOT"/}/wine-tabs-{restored,moved,maximised}.png"
+  # Without the per-commit line, which is 13,000 of its 13,300 lines.
+  grep -v "wl_surface commit$" "$dir/srv.log" >"$OUTTB/wine-tabs-compositor.log" 2>/dev/null
+  cat "$dir/hit.txt" "$dir/top.txt" "$dir/move.txt" "$dir/dbl.txt" "$dir/hitmax.txt" \
+    >"$OUTTB/wine-tabs-desk.txt" 2>/dev/null
+}
+
 WC_X_DISPLAY=${WC_X_DISPLAY:-77}
 
 case "${1:-all}" in
@@ -1086,6 +1438,8 @@ case "${1:-all}" in
   tabs)       block_tabs ;;
   menu)       block_menu ;;
   wine)       block_wine shared-file ;;
+  tabs-default) block_tabs_default ;;
+  wine-tabs)  block_wine_tabs ;;
   wine-arena) block_wine arena ;;
   all)        block_enumerate; block_needs; block_window; block_titlebar; block_auto; block_tabs; block_menu
               block_wine shared-file; block_wine arena ;;

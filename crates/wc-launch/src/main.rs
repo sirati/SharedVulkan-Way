@@ -13,12 +13,12 @@
 //! `wc-launch` — double-click an icon on the Windows desktop, and a Linux
 //! application appears in a window, over memory both machines map.
 //!
-//! Read docs/waycompose-design.md §28 and §82. In one paragraph: the compositor runs here,
+//! Read docs/waycompose-design.md §28 and §83. In one paragraph: the compositor runs here,
 //! in the guest, on the interactive desktop, and provides an arena out of BAR2
 //! of the VM's ivshmem device; the VM host checks the header the compositor
 //! wrote at the front of that region, runs `wc-proxy` on it **as the user**,
 //! and runs the application; the Wayland bytes cross on a loopback relay and an
-//! ssh remote forward. Until §82 the arena was the guest's pinned RAM and the
+//! ssh remote forward. Until §83 the arena was the guest's pinned RAM and the
 //! host had to locate it as root; the shape of this program — **the session is
 //! warm, and a click is one ssh exec** — was the answer to that cost and is
 //! kept because a cold start is still a compositor and a proxy to start.
@@ -145,6 +145,16 @@ fn main() -> ExitCode {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // §82. `--write-firefox-profile TITLEBAR DPI DIR [PREFS]`: write the
+    // `user.js` and `chrome/userChrome.css` a launch would send, into DIR, and
+    // nothing else. On every platform and before any configuration is read,
+    // because its callers are the harnesses that run Firefox against this
+    // compositor on Linux and under Wine — and a harness that wrote its own copy
+    // of the sheet would be testing the copy.
+    if let Some(i) = args.iter().position(|a| a == "--write-firefox-profile") {
+        return write_firefox_profile(&args[i + 1..]);
+    }
+
     // The session name is needed before the configuration can be read, because
     // the log the configuration's errors go into is named after it. It is the
     // default unless `--session-name` says otherwise.
@@ -191,6 +201,47 @@ fn main() -> ExitCode {
         Err(e) => {
             log.say(&format!("failed: {e}"));
             ExitCode::from(1)
+        }
+    }
+}
+
+fn write_firefox_profile(a: &[String]) -> ExitCode {
+    let (Some(t), Some(dpi), Some(dir)) = (a.first(), a.get(1), a.get(2)) else {
+        eprintln!("wc-launch: --write-firefox-profile TITLEBAR DPI DIR [PREFS]");
+        return ExitCode::from(2);
+    };
+    let Some(t) = plan::Titlebar::parse(t) else {
+        eprintln!("wc-launch: titlebar {t:?} is not one of tabs, none, client");
+        return ExitCode::from(2);
+    };
+    let Ok(dpi) = dpi.parse::<u32>() else {
+        eprintln!("wc-launch: dpi {dpi:?} is not a number");
+        return ExitCode::from(2);
+    };
+    let dir = std::path::Path::new(dir);
+    let fit = plan::TitlebarFit::at(dpi, None);
+    let prefs = a.get(3).map(String::as_str).unwrap_or("");
+    let wrote = std::fs::create_dir_all(dir.join("chrome"))
+        .and_then(|()| std::fs::write(dir.join("user.js"), plan::app_user_js(t, prefs)))
+        .and_then(|()| match plan::user_chrome_css(t, fit) {
+            Some(css) => std::fs::write(dir.join("chrome/userChrome.css"), css),
+            None => Ok(()),
+        });
+    match wrote {
+        Ok(()) => {
+            println!(
+                "wc-launch: wrote {:?}'s profile for {} at {dpi} dpi: caption {} px, buttons {} px, env MOZ_GTK_TITLEBAR_DECORATION={}",
+                t,
+                dir.display(),
+                fit.height,
+                fit.reserve,
+                t.moz_env()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("wc-launch: {}: {e}", dir.display());
+            ExitCode::from(2)
         }
     }
 }
@@ -569,7 +620,7 @@ mod win {
 
         // 1. The compositor, here, on the desktop the user is looking at.
         let argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
-        // IVSHMEM ARENA (§82). The arena is BAR2 of the VM's ivshmem device, so
+        // IVSHMEM ARENA (§83). The arena is BAR2 of the VM's ivshmem device, so
         // its size is the device's, set on the VM host, and `arena-mib` decides
         // nothing. Said once per session so that a log read later cannot
         // mistake which substrate ran.
@@ -696,23 +747,98 @@ mod win {
         app: &crate::config::App,
     ) -> Result<(), String> {
         let t = Instant::now();
-        // Four things cross, all base64'd because they go through
+        // Five things cross, all base64'd because they go through
         // `$SSH_ORIGINAL_COMMAND`: the command line, the profile directory the
         // deployment's preferences belong in, those preferences already rendered
-        // as a `user.js`, and what the application is told about its own title
-        // bar. The rendering happens here rather than on the host because it is
-        // the part with a shape to get wrong, and here it is tested.
+        // as a `user.js`, the value of `MOZ_GTK_TITLEBAR_DECORATION`, and — §82
+        // — the `userChrome.css` that fits Firefox's tab strip to Windows'
+        // caption. The rendering happens here rather than on the host because it
+        // is the part with a shape to get wrong, here it is tested, and here is
+        // the only place that knows this desktop's DPI.
+        //
+        // An empty word is sent as `-`, which is not in the base64 alphabet:
+        // `wc-session` splits `$SSH_ORIGINAL_COMMAND` on whitespace, so an
+        // empty argument would vanish and every later one would arrive one
+        // place early — which is what an `exec` without `--profile` did to the
+        // preferences before this.
+        let titlebar = plan::Titlebar::parse(&app.titlebar).unwrap_or(plan::Titlebar::Tabs);
+        let fit = titlebar_fit();
+        let chrome = plan::user_chrome_css(titlebar, fit).unwrap_or_default();
+        if titlebar == plan::Titlebar::Tabs {
+            log.say(&format!(
+                "titlebar: tabs, caption {} px and buttons {} px at this desktop's DPI",
+                fit.height, fit.reserve
+            ));
+        }
+        let word = |s: &str| if s.is_empty() { "-".to_string() } else { plan::b64(s.as_bytes()) };
         let profile = plan::profile_dir(&app.exec).unwrap_or_default();
-        let (exec64, profile64) =
-            (plan::b64(app.exec.as_bytes()), plan::b64(profile.as_bytes()));
-        let (prefs64, titlebar64) = (
-            plan::b64(plan::user_js(&app.prefs).as_bytes()),
-            plan::b64(app.titlebar.as_bytes()),
-        );
-        let said =
-            ssh(cfg, p, &["run", id, &exec64, &profile64, &prefs64, &titlebar64])?;
+        let said = ssh(
+            cfg,
+            p,
+            &[
+                "run",
+                id,
+                &word(&app.exec),
+                &word(&profile),
+                &word(&plan::app_user_js(titlebar, &app.prefs)),
+                &word(titlebar.moz_env()),
+                &word(&chrome),
+            ],
+        )?;
         log.say(&format!("run {}: {said} ({} ms)", app.title, t.elapsed().as_millis()));
         Ok(())
+    }
+
+    /// Windows' caption at this desktop's DPI, for [`plan::TitlebarFit`].
+    ///
+    /// §82. The height is `AdjustWindowRectExForDpi`'s top inset for the
+    /// compositor's own window style, which is the number the compositor folds
+    /// into the client area; the width is scaled from §31's measurement inside
+    /// [`plan::TitlebarFit::at`], because no API answers it without a window on
+    /// screen.
+    ///
+    /// **The thread is made per-monitor aware first**, and that is not
+    /// optional: `GetDpiForSystem` answers 96 to a DPI-unaware caller whatever
+    /// the desktop is set to, and this program declares no awareness in a
+    /// manifest. Every entry point is resolved by name, so a Windows without
+    /// them gets the 100% numbers rather than a launcher that will not start.
+    fn titlebar_fit() -> plan::TitlebarFit {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        // `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`, an opaque pseudo-handle.
+        const PER_MONITOR_AWARE_V2: isize = -4;
+        // The compositor's `WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS`.
+        const STYLE: u32 = 0x00CF_0000 | 0x0200_0000 | 0x0400_0000;
+        let name: Vec<u16> = "user32.dll".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated name of a module every Win32 process has.
+        let user32 = unsafe { LoadLibraryW(name.as_ptr()) };
+        if user32.is_null() {
+            return plan::TitlebarFit::at(96, None);
+        }
+        // SAFETY: ASCII NUL-terminated export names; each transmute is to the
+        // documented signature of that export.
+        unsafe {
+            if let Some(f) = GetProcAddress(user32, c"SetThreadDpiAwarenessContext".as_ptr().cast()) {
+                let f: unsafe extern "system" fn(isize) -> isize = std::mem::transmute(f);
+                f(PER_MONITOR_AWARE_V2);
+            }
+            let dpi = match GetProcAddress(user32, c"GetDpiForSystem".as_ptr().cast()) {
+                Some(f) => {
+                    let f: unsafe extern "system" fn() -> u32 = std::mem::transmute(f);
+                    f()
+                }
+                None => 96,
+            };
+            let caption = GetProcAddress(user32, c"AdjustWindowRectExForDpi".as_ptr().cast())
+                .map(|f| {
+                    let f: unsafe extern "system" fn(*mut RECT, u32, i32, u32, u32) -> i32 =
+                        std::mem::transmute(f);
+                    let mut rc = RECT { left: 0, top: 0, right: 100, bottom: 100 };
+                    f(&mut rc, STYLE, 0, 0, dpi);
+                    -rc.top
+                });
+            plan::TitlebarFit::at(dpi, caption)
+        }
     }
 
     /// The number the user asked for: from this process starting — which is

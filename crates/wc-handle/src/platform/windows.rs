@@ -824,7 +824,7 @@ impl OwnedPipe {
 
 // --------------------------------------------------------------- ivshmem ---
 //
-// IVSHMEM ARENA (docs/waycompose-design.md §82). The user-mode interface of the
+// IVSHMEM ARENA (docs/waycompose-design.md §83). The user-mode interface of the
 // virtio-win `ivshmem` driver, as its `Public.h` states it
 // (kvm-guest-drivers-windows/ivshmem/Public.h). The binary this talks to is the
 // WHQL-signed build Looking Glass B7 ships, `DriverVer 08/03/2022,

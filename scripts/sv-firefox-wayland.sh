@@ -3,7 +3,7 @@
 # **`VK_KHR_wayland_surface`, on a machine that has a GPU.** The control that
 # `docs/firefox-accel.md` names, run as an experiment rather than quoted as one.
 #
-#   scripts/sv-firefox-wayland.sh [probe|firefox] [secs]
+#   scripts/sv-firefox-wayland.sh [probe|firefox|x11|soak|soak-x11] [secs]
 #
 # The topology is the testhost one with the VM taken out and nothing else
 # changed, which is exactly what makes it a control:
@@ -24,11 +24,28 @@ set -uo pipefail
 MODE=${1:-firefox}
 SECS=${2:-60}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BIN=$ROOT/target/release
+# Which build. `target/debug` is what every deployment script ships (wc-guest.sh,
+# wc-firefox.sh), and the two profiles do not have the same stack frames: the
+# Firefox crash series of §0.24 is a debug-build fault (§0.27).
+BIN=${SVWL_BIN:-$ROOT/target/release}
+# The GPU side on **one named device**. Unpinned, the loader offers every ICD on
+# the machine, and on this workstation that includes the leased NVIDIA card
+# other people's jobs run on. RADV here is the AMD iGPU (renderD129). The dev
+# shell's Mesa rather than /run/opengl-driver's: the system RADV is linked
+# against a newer glibc than the one `sv-gpu-server` is built with, and the
+# loader refuses it with ERROR_INCOMPATIBLE_DRIVER.
+GPU_ICD=${SVWL_GPU_ICD:-${SV_MESA:-/run/opengl-driver}/share/vulkan/icd.d/radeon_icd.x86_64.json}
+# Mesa's EGL only, for the same reason: glvnd would otherwise load NVIDIA's
+# vendor library first and open the leased card from Firefox itself.
+export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json}
 RUN=$(mktemp -d /tmp/svwl-XXXXXX)
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
+# Per-session arena on the GPU side. 64 MiB is `sv-gpu-server`'s own default and
+# what this harness always ran with; Firefox in use outgrows it (docs/design.md
+# §0.27), and 256 MiB is `sv-icd`'s default and `sv-cts.sh`'s.
+ARENA=${SVWL_ARENA:-$((64 << 20))}
 XDISPLAY=${SVWL_XDISPLAY:-:78}
 # This machine has Mesa and its ICDs in `/run/opengl-driver` but no
 # `libvulkan.so.1` on the default search path, so both the GPU side and Zink
@@ -70,9 +87,37 @@ for _ in $(seq 1 40); do [ -S "$RUN/xdg/svwl" ] && break; sleep 0.5; done
 
 # --------------------------------------------------------------- GPU side ---
 say "sv-gpu-server on this machine's RADV"
-"$BIN/sv-gpu-server" serve --clients 16 --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
+  # **What the GPU side executed, per half minute.** `SV_TRACE` prints every
+  # command; a five-minute browser run is millions of lines, so they are
+  # counted here rather than kept. A window with queue submissions in it is a
+  # window in which something in Firefox rendered through this driver, which
+  # about:support cannot say: its GPU rows come from the `glxtest` probe, not
+  # from the context WebRender actually made.
+  ( VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 \
+      --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 240)) 2>&1 &
+    echo $! >"$RUN/gpu.pid"; wait ) \
+    | gawk -v out="$RUN/gpu-trace.txt" '
+        BEGIN { t0 = systime(); last = t0 }
+        /^\[trace\]/ { n[$2]++; total++
+          if (systime() - last >= 30) {
+            printf "t=%ds total=%d submit=%d present=%d draw=%d\n", systime() - t0, total,
+              n["vkQueueSubmit"] + n["vkQueueSubmit2"], n["vkQueuePresentKHR"],
+              n["vkCmdDraw"] + n["vkCmdDrawIndexed"] + n["vkCmdDrawIndirect"] >> out
+            fflush(out); delete n; total = 0; last = systime() }
+          next }
+        # One line per recorded command, and the counts above already say
+        # what the blobs carried; a five-minute run wrote 36 MB of these.
+        /^\[blob\]/ { next }
+        { print; fflush() }' >"$RUN/gpu.log" &
+  KIDS+=($!)
+  for _ in $(seq 1 40); do [ -s "$RUN/gpu.pid" ] && break; sleep 0.25; done
+  KIDS+=($(cat "$RUN/gpu.pid"))
+else
+VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
+fi
 for _ in $(seq 1 40); do [ -S "$RUN/gpu.sock" ] && break; sleep 0.5; done
 [ -S "$RUN/gpu.sock" ] || { echo "FAIL: the GPU side never listened"; cat "$RUN/gpu.log"; exit 1; }
 
@@ -107,7 +152,7 @@ if [ "$MODE" = probe ]; then
   exit 0
 fi
 
-if [ "$MODE" = x11 ]; then
+if [ "$MODE" = x11 ] || [ "$MODE" = soak-x11 ]; then
   # **Reap this display number first.** An Xwayland outlives the harness that
   # started it whenever the run does not reach its teardown, and the next run
   # then connects to a server whose compositor is gone: the X client gets a
@@ -146,11 +191,142 @@ if [ "$MODE" = x11 ]; then
   export LIBGL_KOPPER_DRI2=${SVWL_KOPPER_DRI2:-1}
 fi
 
-if [ "$MODE" != x11 ]; then
+if [ "$MODE" != x11 ] && [ "$MODE" != soak-x11 ]; then
   # With no X server reachable `MOZ_ENABLE_WAYLAND` is a preference rather than
   # a choice; unsetting DISPLAY is what makes it one.
   unset DISPLAY
   export MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland
+fi
+
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
+  # **Firefox in use, for SECS, on the forwarded driver** (docs/design.md
+  # §0.27). `sv-firefox-soak.py` drives it through Marionette: a tour of local
+  # pages and real sites, wheel-scrolled, with a WebGL page whose frames are
+  # read back, and the compositor asked after every page. The verdict below is
+  # about what survived and what was used, not about the script returning.
+  PY=${SVWL_PYTHON:-python3}
+  command -v "$PY" >/dev/null || { echo "FAIL: no $PY; run under 'nix shell nixpkgs#python3'"; exit 1; }
+  MPORT=${SVWL_MARIONETTE_PORT:-$((28000 + $$ % 1000))}
+  cat >>"$RUN/profile/user.js" <<PREFS
+user_pref("marionette.port", $MPORT);
+user_pref("webgl.sanitize-unmasked-renderer", false);
+user_pref("layout.css.devPixelsPerPx", "1.0");
+PREFS
+  mkdir -p "$RUN/pages"
+  {
+    echo '<!doctype html><title>sv long page</title><style>'
+    echo 'body{font:16px sans-serif;margin:2em} .card{margin:1em 0;padding:1em;border-radius:12px;'
+    echo 'background:linear-gradient(135deg,#fde,#def);box-shadow:0 4px 12px #0003;transform:rotate(-0.5deg)}'
+    echo '.spin{width:40px;height:40px;background:#c33;animation:s 2s linear infinite;display:inline-block}'
+    echo '@keyframes s{to{transform:rotate(360deg)}}</style>'
+    for i in $(seq 1 200); do
+      echo "<div class=card><div class=spin></div> <b>Card $i</b> — Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</div>"
+    done
+  } >"$RUN/pages/long.html"
+  cat >"$RUN/pages/canvas.html" <<'HTML'
+<!doctype html><title>sv canvas 2d</title><canvas id=c width=900 height=600></canvas>
+<div style="height:3000px;background:linear-gradient(#fff,#88f)"></div>
+<script>
+const x = c.getContext('2d'); let t = 0;
+(function f(){ t++; x.fillStyle='hsl('+(t%360)+',60%,80%)'; x.fillRect(0,0,900,600);
+  for (let i=0;i<200;i++){ x.beginPath(); x.arc(450+300*Math.sin(t/50+i), 300+200*Math.cos(t/37+i*1.3), 10, 0, 7);
+  x.fillStyle='hsl('+((i*7+t)%360)+',80%,50%)'; x.fill(); } requestAnimationFrame(f); })();
+</script>
+HTML
+  cat >"$RUN/pages/webgl.html" <<'HTML'
+<!doctype html><title>sv webgl</title><canvas id=c width=800 height=600></canvas>
+<div style="height:3000px;background:linear-gradient(#fff,#8f8)"></div>
+<script>
+window.__sv = {frames: 0};
+try {
+  const gl = c.getContext('webgl2') || c.getContext('webgl');
+  if (!gl) throw new Error('no WebGL context');
+  const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  __sv.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  __sv.version = gl.getParameter(gl.VERSION);
+  const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, 'attribute vec2 a; uniform float t; void main(){ float c=cos(t), s=sin(t); gl_Position=vec4(mat2(c,-s,s,c)*a,0.,1.); }'));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, 'precision mediump float; void main(){ gl_FragColor=vec4(1.,.5,.1,1.); }'));
+  gl.linkProgram(p); gl.useProgram(p);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,.9,-.8,-.6,.8,-.6]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const ut = gl.getUniformLocation(p, 't'), px = new Uint8Array(4);
+  (function f(){ gl.clearColor(.1,.2,.3,1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.uniform1f(ut, __sv.frames/60); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.readPixels(400, 300, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); __sv.pixel = Array.from(px);
+    __sv.frames++; requestAnimationFrame(f); })();
+} catch (e) { __sv.error = String(e); }
+</script>
+HTML
+  say "firefox (soak), $SECS s through Marionette on port $MPORT"
+  env HOME="$RUN/home" ${SVWL_EXTRA_ENV:-} \
+    "$FIREFOX" --no-remote --marionette -remote-allow-system-access --profile "$RUN/profile" about:blank \
+    >"$RUN/ff.log" 2>&1 &
+  FF=$!
+  KIDS+=($FF)
+  STARTED=$(date +%s)
+  # A screenshot a minute, so the record has pictures from the whole run, and
+  # whether the parent process has our ICD mapped at that moment.
+  ( while kill -0 $FF 2>/dev/null; do sleep 60; (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+      grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
+    done ) &
+  KIDS+=($!)
+  timeout $((SECS + 180)) "$PY" "$ROOT/scripts/sv-firefox-soak.py" "$MPORT" "$SECS" "$RUN" \
+    >"$RUN/soak.log" 2>&1
+  DRIVER=$?
+  ALIVE=0; kill -0 $FF 2>/dev/null && ALIVE=1
+  LIVED=$(( $(date +%s) - STARTED ))
+  (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+  kill $FF 2>/dev/null; wait $FF 2>/dev/null
+
+  fail=0
+  ok()  { echo "  ok   $*"; }
+  bad() { echo "  FAIL $*"; fail=1; }
+  J="$RUN/soak.jsonl"
+  say "---- the verdict ----"
+  [ "$DRIVER" -eq 0 ] && grep -q '"kind": "done"' "$J" \
+    && ok "the tour ran to the end ($(grep -c '"kind": "load"' "$J") page loads, $(grep -c '"kind": "scroll"' "$J") scrolls)" \
+    || bad "the driver stopped early (exit $DRIVER): $(grep '"kind": "fatal"' "$J" | tail -1)"
+  [ "$ALIVE" -eq 1 ] && ok "Firefox was alive after ${LIVED} s" || bad "Firefox was gone after ${LIVED} s"
+  [ "$LIVED" -ge "$SECS" ] && ok "it lived at least the $SECS s asked for" || bad "it lived ${LIVED} s of $SECS"
+  if coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -qi firefox; then
+    bad "a Firefox process dumped core during the run: $(coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -i firefox | head -3)"
+  else
+    ok "no Firefox process dumped core during the run"
+  fi
+  comps=$(grep '"kind": "compositor"' "$J" | sed 's/.*"value": "\([^"]*\)".*/\1/' | sort | uniq -c | tr -s ' ')
+  if [ -n "$comps" ] && ! grep '"kind": "compositor"' "$J" | grep -qv '"value": "WebRender"'; then
+    ok "Firefox called every compositor sample WebRender, not WebRender (Software):$comps"
+  else
+    bad "Firefox did not call the compositor WebRender throughout:${comps:- no samples}"
+  fi
+  # Every full half-minute window of the GPU side's trace, after the first,
+  # must have queue submissions in it: rendering through this driver for the
+  # whole run, not only at start-up.
+  # At least one such window, too: a run that died inside its first minute has
+  # none after the first, and "every one of none" is not a pass.
+  if [ "$(tail -n +2 "$RUN/gpu-trace.txt" 2>/dev/null | wc -l)" -ge 1 ] \
+     && ! tail -n +2 "$RUN/gpu-trace.txt" | grep -q "submit=0 "; then
+    ok "the GPU side executed submissions in every 30 s window: $(tail -n +2 "$RUN/gpu-trace.txt" | awk '{print $3}' | tr '\n' ' ')"
+  else
+    bad "a 30 s window with no queue submission on the GPU side, or no trace: $(tr '\n' ';' <"$RUN/gpu-trace.txt" 2>/dev/null)"
+  fi
+  mapped=$(cat "$RUN/icd-mapped.txt" 2>/dev/null | tr '\n' ' ')
+  echo "$mapped" | grep -q "mappings=0" || [ -z "$mapped" ] \
+    && bad "the parent process did not have libsv_icd.so mapped at every sample: ${mapped:-no samples}" \
+    || ok "libsv_icd.so mapped in the parent process at every sample: $mapped"
+  wg=$(grep '"kind": "webgl"' "$J" | tail -1)
+  if echo "$wg" | grep -qi 'zink' && echo "$wg" | grep -q '"frames": [1-9]'; then
+    ok "WebGL drew on Zink: $wg"
+  else
+    bad "WebGL did not draw on Zink: ${wg:-no sample}"
+  fi
+  say "---- about:support ----"; grep '"kind": "about-support"' "$J" | tail -1
+  echo "run dir: $RUN"
+  [ "$fail" -eq 0 ] && say "sv-firefox-wayland soak: PASS" || say "sv-firefox-wayland soak: FAIL"
+  exit "$fail"
 fi
 
 say "firefox ($MODE), $SECS s, about:support at devPixelsPerPx=$DPPX"

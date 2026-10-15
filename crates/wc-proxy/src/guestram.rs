@@ -305,7 +305,7 @@ impl Plan {
     /// compositor wrote at the front of the region — no locator, no QMP, no
     /// `/proc`, and no privilege beyond being able to open `path`.
     ///
-    /// IVSHMEM ARENA, docs/waycompose-design.md §82. QEMU backs the device's BAR2 with
+    /// IVSHMEM ARENA, docs/waycompose-design.md §83. QEMU backs the device's BAR2 with
     /// the file at `path`, so the guest's arena *is* that file, at
     /// [`wc_handle::ivshmem::HEADER_BYTES`], as one contiguous run. Every
     /// other field the guest-RAM path needed a locator for is in the header.
@@ -696,7 +696,7 @@ mod tests {
     /// out as the device would be, a header written by the very code the
     /// guest runs, and the plan that comes out of it mapped and written
     /// through. What it cannot show is that the guest's BAR and this file are
-    /// the same pages; that is §82's measurement, not a unit test's.
+    /// the same pages; that is §83's measurement, not a unit test's.
     #[test]
     fn an_ivshmem_header_becomes_a_one_run_plan_after_the_header_page() {
         use wc_handle::ivshmem::{HEADER_BYTES, Header};

@@ -169,7 +169,7 @@ wc_assert_topology() {
   local log="$1" tag="${2:-}"
   case "$WC_TOPOLOGY" in
     cross-vm)
-      # IVSHMEM ARENA (§82): the other substrate that proves a hypervisor. A
+      # IVSHMEM ARENA (§83): the other substrate that proves a hypervisor. A
       # run id the guest's compositor printed, found on the VM host in the file
       # QEMU backs the guest's BAR2 with, can only have got there through that
       # device -- nothing else writes that file.

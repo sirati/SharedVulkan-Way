@@ -1131,7 +1131,7 @@ impl Arena {
     /// (`guestram::Plan::from_ivshmem`). One region, never grown.
     ///
     /// Opened as the invoking user: the file's group is the whole of the
-    /// access control, and nothing here needs root. docs/waycompose-design.md §82.
+    /// access control, and nothing here needs root. docs/waycompose-design.md §83.
     pub fn from_ivshmem(id: u32, path: &Path, run_id: u64) -> io::Result<Arena> {
         let plan = crate::guestram::Plan::from_ivshmem(id, path, run_id)?;
         Arena::from_plans(id, std::slice::from_ref(&plan), ProvidedRegion::ivshmem)

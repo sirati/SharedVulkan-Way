@@ -135,7 +135,7 @@ WC_GUEST_CONFIGURED=1
 # this harness drives the same guest through the same launcher, so there is no
 # leg here for which a different answer could be correct.
 wcl_declare() {
-  # IVSHMEM ARENA (§82): the launcher's arena is BAR2 of the VM's ivshmem
+  # IVSHMEM ARENA (§83): the launcher's arena is BAR2 of the VM's ivshmem
   # device, and the developer harnesses keep guest RAM.
   wc_substrate_declare ivshmem || exit 2
   wc_topology_declare cross-vm \
@@ -157,7 +157,7 @@ wcl_declare() {
 # §34.2. `frames=none` is a legitimate outcome — the sweep works, it merely
 # costs seconds — so this records which arm ran instead of requiring one.
 wcl_assert_located() {
-  # IVSHMEM ARENA (§82). There is no locate any more, so the evidence is the
+  # IVSHMEM ARENA (§83). There is no locate any more, so the evidence is the
   # header instead: the run id the compositor printed (`arena: run …`, read off
   # the guest) has to be the run id `wc-session up` read out of the file QEMU
   # backs the BAR with (`up: ivshmem run …`, read off the VM host and reported
@@ -394,7 +394,9 @@ title = $TITLE
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
 prefs = middlemouse.paste=false
-titlebar = none
+# §82: the default, named so the deployed ini says which arrangement it ran.
+# WC_LAUNCH_TITLEBAR=none runs the opt-out.
+titlebar = ${WC_LAUNCH_TITLEBAR:-tabs}
 INI
 
   # A running .exe holds its own file open, so a session that is up must end
@@ -793,7 +795,7 @@ do_verify() {
   [ -n "$provided" ] && ok "the guest mapped the device: $provided" \
                      || bad "the compositor never reported an ivshmem arena"
 
-  # IVSHMEM ARENA (§82): **who the proxy runs as**, asked of the process rather
+  # IVSHMEM ARENA (§83): **who the proxy runs as**, asked of the process rather
   # than of the script that started it. The unit is this session's own user
   # unit, and its main pid's owner is the claim.
   local puser

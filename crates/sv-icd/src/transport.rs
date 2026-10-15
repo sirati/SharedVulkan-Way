@@ -997,12 +997,12 @@ impl RingTransport {
         let seqno = self.push_on(RingClass::Device, &cmd)?;
         let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(b) = blobs.open.get_mut(&command_buffer) {
-            // `upto`, not `b.len`. Vulkan forbids two threads recording into one
-            // command buffer so they cannot differ today, but writing `b.len`
-            // here would mean that if they ever did, the bytes recorded between
-            // the read above and this line would be marked published without
-            // having been sent — commands that vanish, which is the exact
-            // failure the blob exists to remove.
+            // `upto`, not `b.len`. They differ whenever this flush is another
+            // thread's `publish_recorded_first` and the owner recorded more
+            // between the read above and this line; writing `b.len` would mark
+            // those commands published without having sent them — commands
+            // that vanish, which is the exact failure the blob exists to
+            // remove.
             b.published = upto;
             b.in_flight = seqno;
         }
@@ -1082,27 +1082,37 @@ impl RingTransport {
     /// copies the recorded bytes to a new block and the GPU side may still be
     /// reading them out of the old one.
     fn grow_and_write(&self, command_buffer: u64, command: &[u8]) -> IcdResult<()> {
-        let in_flight = {
+        let mut in_flight = {
             let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
             blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
         };
-        // Without the blob lock held: this can block for as long as the GPU
-        // side takes, and a thread recording into a different command buffer
-        // has no reason to wait behind it.
-        self.await_blob_read(in_flight)?;
-        let at = {
+        loop {
+            // Without the blob lock held: this can block for as long as the GPU
+            // side takes, and a thread recording into a different command
+            // buffer has no reason to wait behind it.
+            self.await_blob_read(in_flight)?;
             let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
             let blobs = &mut *blobs;
+            // **Waited for is not the same as still true.** Between the wait and
+            // this lock another thread's `publish_recorded_first` may have
+            // handed the GPU side a newer piece of this very block, and growing
+            // frees the block. Freeing it under a reader is the §5.5 hazard the
+            // wait exists for, so a newer piece means waiting again.
+            let now = blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0);
+            if now != in_flight && now != 0 {
+                in_flight = now;
+                continue;
+            }
             Self::grow(blobs, &self.arena, command_buffer, command.len() as u64)?;
             let b = blobs
                 .open
                 .get_mut(&command_buffer)
                 .ok_or(LowerError::Shape("a blob that grow() did not create"))?;
-            let at = b.off + b.len;
+            // Under the lock, for the reason `record` gives.
+            self.arena.write_bytes(b.off + b.len, command).map_err(lower)?;
             b.len += command.len() as u64;
-            at
-        };
-        self.arena.write_bytes(at, command).map_err(lower)
+            return Ok(());
+        }
     }
 
     /// Return a block to the reserve.
@@ -1225,10 +1235,25 @@ impl Transport for RingTransport {
     /// against 0.075 µs for the entire ring push this is replacing. A blob that
     /// is slower than the packet it removes is not an optimisation.
     ///
-    /// The write happens after the lock is released. That is safe because
-    /// advancing `len` under the lock is what *reserves* the range: no other
-    /// thread can be given the same bytes, and the GPU side cannot see them
-    /// until `publish_blob` names them.
+    /// # The write happens under the lock (docs/design.md §0.27)
+    ///
+    /// It used to happen after: `len` advanced under the lock *reserved* the
+    /// range, and the comment here said the GPU side could not see the bytes
+    /// until `publish_blob` named them. That was true of *this* thread and
+    /// false of every other one. [`RingTransport::publish_recorded_first`] runs
+    /// on whichever thread forwards an unrecorded command, and it flushes every
+    /// open blob up to `len` — including one whose owner has advanced `len` and
+    /// not yet copied the command in. The GPU side then decoded bytes nobody
+    /// had written. Measured: Firefox on Zink, a WebGL page and a scroll, and
+    /// `sv-gpu-server` ended the session with "in a command blob: unknown
+    /// command opcode 4096" after 74 s; Mesa's device-lost path then took
+    /// Firefox down with it.
+    ///
+    /// So `len` only ever covers bytes that are there. The copy is a command —
+    /// tens to hundreds of bytes — and the lock is the one the fast path
+    /// already takes, so it stays one lock, one probe and one `memcpy`; what it
+    /// gives up is overlap between two threads recording two command buffers,
+    /// for the length of a `memcpy`.
     fn record(&self, command_buffer: u64, _opcode: u32, command: &[u8]) -> IcdResult<()> {
         let need = command.len() as u64;
         let flush = {
@@ -1236,11 +1261,9 @@ impl Transport for RingTransport {
             match blobs.open.get_mut(&command_buffer) {
                 Some(b) if b.len + need <= b.cap => {
                     let at = b.off + b.len;
-                    b.len += need;
-                    let flush = b.len - b.published >= BLOB_FLUSH;
-                    drop(blobs);
                     self.arena.write_bytes(at, command).map_err(lower)?;
-                    flush
+                    b.len += need;
+                    b.len - b.published >= BLOB_FLUSH
                 }
                 // No block yet, or a full one. Both are the slow path, and both
                 // are rare: a block that has found its size never grows again.
@@ -1448,4 +1471,136 @@ pub fn send_trace() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SV_SEND_TRACE").is_some())
+}
+
+/// docs/design.md §0.27: a recording's bytes, as the GPU side sees them while
+/// another thread forwards unrecorded commands.
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod blob_race {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use sv_transport::control::{Geometry, RingKind};
+
+    /// One recorded command: a tag, the command buffer it belongs to and its
+    /// index in that recording, then filler. Every byte is non-zero and every
+    /// command is distinguishable, so a byte the GPU side reads that nobody
+    /// wrote — zero, or another recording's — cannot pass for one somebody did.
+    const CMD: usize = 64;
+    const TAG: u32 = 0x5eed_c0de;
+
+    fn command(cb: u64, index: u32) -> [u8; CMD] {
+        let mut c = [0x5au8; CMD];
+        c[0..4].copy_from_slice(&TAG.to_le_bytes());
+        c[4..8].copy_from_slice(&(cb as u32).to_le_bytes());
+        c[8..12].copy_from_slice(&index.to_le_bytes());
+        c
+    }
+
+    /// **The bug**: `record` advanced `len` under the blob lock and copied the
+    /// command in after releasing it, and `publish_recorded_first` — run by
+    /// whichever thread forwards an unrecorded command — flushes every open
+    /// blob up to `len`. So a piece could name bytes not yet written. Firefox
+    /// on Zink met it as "unknown command opcode 4096" in `sv-gpu-server` and a
+    /// lost device.
+    ///
+    /// Here: one thread records into a fresh command buffer per round, which
+    /// grows each block once and publishes at the end; a second forwards
+    /// unrecorded packets as fast as it can, each one a `publish_recorded_first`;
+    /// a third plays the GPU side and checks every command of every piece it is
+    /// handed. The GPU side's checks are what fail, not a timeout.
+    #[test]
+    fn a_flush_from_another_thread_never_publishes_unwritten_bytes() {
+        let g = Geometry::small();
+        let control_region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let arena = Arc::new(SharedRegion::heap(g.arena_size as usize).unwrap());
+        let owner = Arc::new(
+            Control::create(Arc::clone(&control_region), g, crate::protocol_ids(), 1).unwrap(),
+        );
+        let t = Arc::new(
+            RingTransport::finish_attach(control_region, Arc::clone(&arena), g.arena_size)
+                .unwrap()
+                .transport,
+        );
+        let device = (0..g.ring_slot_count)
+            .find(|s| matches!(owner.ring_kind(*s), Ok(RingKind::Device)))
+            .expect("the app side claimed a device ring");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let gpu = {
+            let (owner, arena, stop) = (Arc::clone(&owner), Arc::clone(&arena), Arc::clone(&stop));
+            std::thread::spawn(move || -> Result<u64, String> {
+                let mut cons = RingConsumer::open(&owner, device, Lane::Command).unwrap();
+                let mut next: HashMap<u64, u32> = HashMap::new();
+                let mut seen = 0u64;
+                loop {
+                    // A GPU side that does not beat is one the app side's
+                    // waits presume gone (R4).
+                    let _ = owner.beat_now();
+                    let piece = match cons.next().map_err(|e| e.to_string())? {
+                        Some(p) => sv_proto::sv::ExecuteCommandBlob::decode(p.payload).ok(),
+                        None if stop.load(Ordering::Acquire) => return Ok(seen),
+                        None => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                    };
+                    if let Some(b) = piece {
+                        if b.len % CMD as u64 != 0 {
+                            return Err(format!("a piece of {} bytes", b.len));
+                        }
+                        let mut bytes = vec![0u8; b.len as usize];
+                        arena.read_bytes(b.arena_offset, &mut bytes).unwrap();
+                        for c in bytes.chunks(CMD) {
+                            let want = next.entry(b.command_buffer).or_insert(0);
+                            if c != command(b.command_buffer, *want) {
+                                return Err(format!(
+                                    "command buffer {} command {}: read {:02x?}",
+                                    b.command_buffer,
+                                    *want,
+                                    &c[..12]
+                                ));
+                            }
+                            *want += 1;
+                            seen += 1;
+                        }
+                    }
+                    cons.advance().map_err(|e| e.to_string())?;
+                }
+            })
+        };
+        let noise = {
+            let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                // Not a blob, so the GPU side skips it; what matters is the
+                // `publish_recorded_first` every send runs first.
+                let mut noise = Vec::new();
+                sv_proto::sv::DriverVersions.encode(&mut noise).unwrap();
+                while !stop.load(Ordering::Acquire) {
+                    let _ = t.send(RingClass::Device, 0, &noise);
+                }
+            })
+        };
+
+        const ROUNDS: u64 = 200;
+        const PER_ROUND: u32 = 2_000; // 125 KiB: one growth past `BLOB_INITIAL`
+        let recorded = (|| -> IcdResult<()> {
+            for cb in 1..=ROUNDS {
+                for i in 0..PER_ROUND {
+                    t.record(cb, 0, &command(cb, i))?;
+                }
+                t.publish_blob(cb)?;
+                t.free_blob(cb);
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Release);
+        noise.join().unwrap();
+        // The GPU side's verdict first: when it stops on a bad command it also
+        // stops answering, and the recording thread's error is then only the
+        // echo of that.
+        let seen = gpu.join().unwrap().expect("every command the GPU side was handed was whole");
+        recorded.expect("the recording thread finished");
+        assert_eq!(seen, ROUNDS * u64::from(PER_ROUND), "and every command was handed over");
+    }
 }

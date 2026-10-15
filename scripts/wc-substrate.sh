@@ -107,7 +107,7 @@ wc_substrate_declare() {
       # hour ago cannot license a file on a guest run.
       unset SV_ALLOW_FILE_ARENA
       return 0 ;;
-    # IVSHMEM ARENA, docs/waycompose-design.md §82. BAR2 of a QEMU ivshmem-plain device:
+    # IVSHMEM ARENA, docs/waycompose-design.md §83. BAR2 of a QEMU ivshmem-plain device:
     # the guest maps the BAR, the VM host maps the file QEMU backs it with, and
     # both are the same physical pages. Not a file arena -- that is a file each
     # side maps through its own filesystem -- so the escape hatch is removed

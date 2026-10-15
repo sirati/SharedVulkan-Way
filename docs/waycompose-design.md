@@ -3290,7 +3290,7 @@ locates through `~/rootc` and runs the proxy and its client in a
 because a root call that blocks for a minute frequently returns no output at
 all. The unit's journal is the record and the harness prints it on failure.
 
-**Amended by §82.** Option 2's parenthesis turned out to be the answer, applied
+**Amended by §83.** Option 2's parenthesis turned out to be the answer, applied
 to one region instead of the guest's whole RAM. A dedicated `ivshmem-plain`
 device has a `memory-backend-file` at a path, and a path *can* be given a group.
 The launcher's arena now lives there, the proxy opens it as the user, and
@@ -10085,7 +10085,7 @@ system in a fourth:
   §14.7's, unchanged, on a path where the descriptor that crosses the hypervisor
   is still unrepresentable rather than merely zero.
 
-**Amended by §82: the launcher's arena is an ivshmem device now, and the rule's
+**Amended by §83: the launcher's arena is an ivshmem device now, and the rule's
 reason is what carries over, not its wording.** "Guest RAM, always" was a proxy
 for the real requirement: **the two sides map the same physical pages**, and
 nothing degrades to a file that each side maps through its own filesystem.
@@ -10426,7 +10426,7 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    half seconds shorter with the other one. The warm numbers do not move at all,
    because the warm path locates nothing — which is the point of §28.1 and the
    reason this stage did not wait for that work.
-4. **`rootc` is in the product's path and should not be.** *Closed by §82 for
+4. **`rootc` is in the product's path and should not be.** *Closed by §83 for
    the launcher; the developer harnesses keep it.* The host half becomes
    root through this deployment's developer console, which is a debugging
    facility a person has to have started. A real installation would give
@@ -25203,13 +25203,398 @@ which side got them — so here the evidence *is* a number in the suite. Neither
 answer is better than the other; what would be wrong is reporting one shape of
 evidence as though it were the other.
 
-
----
----
-
-## 82. The arena moves onto an ivshmem device, and root leaves the launcher's path
+## 82. Firefox's tabs in the title bar by default, and the first drag of a folded window
 
 ### 82.1 Status in one paragraph
+
+Until this section Firefox reached Windows' caption only under `--decorations
+tabs`, a flag no deployment passes. The default `auto` treated Firefox as
+`Negotiated` and never folded it. The launcher hard-coded `titlebar = none`, and
+`wc-session` said the frame-extending compositor "does not exist yet", although
+§31 had built it. Now the defaults produce the goal clause end to end:
+`wc-launch` gives Firefox `MOZ_GTK_TITLEBAR_DECORATION=client`, preferences
+that turn off Firefox's own window buttons, and a `userChrome.css` that sizes
+its tab strip to Windows' caption and leaves the caption-button corner empty.
+The compositor's `auto` folds the caption of any window whose client *asked* to
+decorate itself. `titlebar = none` is the per-application opt-out.
+
+**Windows draws minimise, maximise and close, and Firefox draws none** (§82.3
+gives the evidence). The first real drag of a folded window found two defects
+in code that §22.7 and §45.11 had written and nobody had exercised, and one
+misdiagnosis of my own (§82.6):
+
+* `xdg_toplevel.move` entered the *keyboard* move;
+* GTK's maximise pushed the window off its monitor;
+* a "Wine parks maximised windows differently" fix, which was the second
+  defect seen from the wrong side and has been reverted.
+
+What was measured: Linux headless with Firefox 157 (11 passed, 0 failed) and
+Wine with real `SendInput` gestures (20 passed, 0 failed). What was not
+measured: the real guest. Wine has no DWM, so DWM's buttons, snap layouts,
+Windows 11's real metrics, 125%/150% and the launcher's reservation against
+DWM's real button bounds are still unmeasured. §82.10 is the command that
+measures them.
+
+### 82.2 Why `auto` left Firefox's tab strip under the caption
+
+§49 made `auto` fold the caption only for `Decorator::ProbablyItself`, which
+means a client that bound no decoration protocol and draws a margin.
+GTK binds KDE's manager, so Firefox was `Negotiated` on every run. That variant
+said *that* it negotiated and threw away *what*. Started without
+`MOZ_GTK_TITLEBAR_DECORATION=none`, Firefox asks for `Client` whatever the
+default (§22.3's table). The compositor echoes the request (§22.4) and then drew
+Windows' caption above Firefox's tab strip: two title bars, under the default.
+
+The per-surface record is now a map from surface to the mode last agreed:
+KDE's object starts at the manager's default and moves with every echoed
+`request_mode`, and `xdg-decoration` records whatever this compositor
+configured. A new `Decorator::AskedForClient` is folded by `auto`. The decision
+rests on what the client *said* on the protocol that exists for saying it, not
+on a correlate, and it has to: `report_decorator` logged Firefox's inset as
+`0,0` at map, though its trace says `(26, 23)`. The geometry arrives a commit
+after the first buffer, so the inset is not a signal anyone can lean on at that
+moment.
+
+Measured on Linux, no `--decorations` flag, `scripts/wc-firefox.sh tabs-default`:
+
+| client | Firefox asked | compositor |
+|---|---|---|
+| `titlebar = tabs` (env `client`) | `request_mode(1)` | `asked to decorate itself (Client) and was told yes, so this window's caption is folded` |
+| `titlebar = none` (env `none`) | `request_mode(2)` | `negotiated its decorations`, caption kept |
+
+One run of the compositor can therefore hold both, which a run-wide flag could
+not. `--decorations server` and `client` still fold nothing. Under them an
+insisting client is now reported as `THIS WINDOW HAS TWO TITLE BARS` rather than
+"agreed", because that is what it has.
+
+### 82.3 Who draws minimise, maximise and close: Windows
+
+| | Windows draws them (DWM) | Firefox draws them |
+|---|---|---|
+| snap layouts | `DwmDefWindowProc` answers `HTMAXBUTTON` over DWM's button (§31.5). `caption::hit` answers it too (§82.5) | Windows needs `HTMAXBUTTON` over Firefox's maximise button, and no protocol says where that is (§22.8) |
+| look | the system theme, hover and press states, DPI, Windows 11's shapes | GTK symbolic icons in 24 px circles (`browser.css`: `--titlebar-button-size: 24px`, Adwaita backgrounds). These would be the only GNOME-styled controls on the desktop |
+| measured on the guest | yes, `tabs.png` (§31.1) | only as the `nobuttons` control (§31.8) |
+| can the other side's be removed? | Firefox's: **yes, all three**, with `ui.GtkCSD{Minimize,Maximize,Close}Button=0` (§82.4) | DWM's: yes, `--caption-buttons off` |
+| height | the caption's (30 px at 100%) | stretched to Firefox's strip |
+
+The last row is the only one that favours Firefox. §82.4 removes the difference
+by making the strip the caption's height.
+
+**This overturns one conclusion of §22.9 and §31.9, and narrows another.** Both
+said Firefox's close button "cannot be removed". What they measured is that
+`gtk-decoration-layout` cannot remove it, and that is still true. The preference
+names `ui.GtkCSDCloseButton` and its siblings are in Firefox 157's `libxul.so`
+as LookAndFeel overrides. Setting the three to 0 in `user.js` removes all three
+buttons, close included. This was measured on a frame dump of the Linux
+compositor: the corner held the tab-list button and three round GTK buttons
+before, and only the tab-list button after (`/tmp` experiment; the harness
+control leg in §82.4 re-measures it).
+
+### 82.4 Firefox's half: the corner and the height, measured
+
+The sheet is two variables and one width
+(`wc_launch::plan::user_chrome_css`):
+
+```css
+:root { --tab-min-height: 29px !important; --tab-margin-block: 1px !important; }
+#TabsToolbar .titlebar-buttonbox-container { min-width: 146px !important; }
+```
+
+* **Height.** Firefox computes `--tabstrip-min-height` as
+  `--tab-min-height + 2 × --tab-margin-block` (`tabs.css`). Setting a 29 px tab
+  with 1 px margins gives a 31 px strip, which is the guest's `folds 31 px`.
+  29 px is the value of Firefox's own compact density, so nothing is smaller
+  than a size Firefox ships.
+* **Corner.** The button box stays in the tab strip with its buttons hidden, and
+  gets a `min-width` equal to §31.5's measured `146x30` strip.
+  `#TabsToolbar` is required in the selector. The first version left it out and
+  brought back the navigation bar's own button box, which Firefox hides while
+  tabs are shown, and the hamburger menu moved left by 146 px.
+
+From frame dumps of the geometry rectangle, `tabs-default`, 96 DPI numbers:
+
+| leg | tab-strip rows (x = 700, from the top) | share of the 146x31 corner in its commonest colour |
+|---|---|---|
+| launcher profile | **31** | **99.5%** (the rest is the window's rounded corner) |
+| env var only, no profile (control) | 44 | 67.5% (tab-list button plus Firefox's three buttons) |
+
+The crops are `docs/tabs-in-titlebar/linux-tabs-default-top.png`,
+`linux-tabs-noprofile-top.png` and `linux-none-top.png`. They are the
+compositor's frame dumps and contain no Windows frame. A visual check by a
+separate agent confirmed the following:
+
+* in the default crop, only the tab-list button is in the right 150 px;
+* in the control, Firefox's three round buttons are there;
+* the opt-out has a 44-row strip with no window buttons.
+
+**The two DPI-dependent numbers come from the launcher**, which runs on the
+guest:
+
+* The height is `AdjustWindowRectExForDpi`'s top inset for the compositor's own
+  window style, at `GetDpiForSystem`. The thread is made per-monitor aware first,
+  because an unaware caller is told 96.
+* The width is §31's 146 px scaled with rounding up. No API reports the caption
+  buttons' bounds without a window on screen.
+
+`TitlebarFit::at` is unit-tested at 96, 120 and 144 DPI (31/146, 39/183,
+47/219). **CSS pixels are assumed to be device pixels.** That holds because the
+one `wl_output` is scale 1 and the launcher sets no `layout.css.devPixelsPerPx`.
+A host with GTK text scaling would break it, and §82.5's corner check is what
+would say so.
+
+### 82.5 The compositor's half: hit test, metrics and buttons, as functions
+
+`platform/caption.rs` is new and pure. It is compiled on every target and has
+12 unit tests. `win32.rs` gathers the numbers and asks it.
+
+* **`caption::hit`**, for a point `DefWindowProc` called `HTCLIENT`, applies these
+  rules in order:
+  1. The top resize band of a *restored* window is `HTTOP`, `HTTOPLEFT` or
+     `HTTOPRIGHT`, and it wins over the buttons, as on a native window.
+  2. The button strip in thirds is `HTMINBUTTON`, `HTMAXBUTTON` or `HTCLOSE`.
+  3. Everything else is `HTCLIENT`, empty tab strip included. §22.8 still
+     holds: no protocol says which of Firefox's pixels are a title bar, so a
+     drag there is Firefox's to start, with `xdg_toplevel.move`, and a
+     double-click is Firefox's `set_maximized`.
+
+  A maximised window has no band, and its top row over the close button is
+  `HTCLOSE`. `DwmDefWindowProc` is still asked first on Windows. Answering the
+  buttons here as well is the documented way for a custom frame to keep snap
+  layouts, and on Wine it is the only way.
+* **DPI.** Every caption metric is now taken at the *window's* DPI:
+  `GetDpiForWindow`, `GetSystemMetricsForDpi` and `AdjustWindowRectExForDpi`,
+  resolved at runtime. Where those are missing, `caption::rescale` stands in
+  with `MulDiv` rounding, tested at 125% and 150%.
+
+  Before this section, `frame_border` and `top_inset` used `GetSystemMetrics`
+  and `AdjustWindowRectEx`, which answer at the *system* DPI. On a 150% monitor
+  beside a 100% primary, the top band was 8 px instead of 12, and the DWM margin
+  was a 100% caption. §31.13 item 3 called this right "by construction"; that
+  was true only on one monitor.
+* **Fallback buttons.** Wine's `DwmGetWindowAttribute` returns `E_NOTIMPL`
+  (§67.4), so until now a folded window under Wine had no buttons at all, and
+  with Firefox's own buttons off it had no way to close. Where DWM will not
+  say, the window now draws the system's buttons with
+  `DrawFrameControl(DFC_CAPTION)`: three `SM_CXSIZE` buttons at the window's DPI,
+  the folded caption's height, at the right edge. `caption::hit` hit-tests
+  them. They are still Windows' rendering (the classic one), so §31.5's rule
+  ("do not draw the buttons, uncover them") holds wherever there is something to
+  uncover.
+* **The corner check.** `caption::corner_is_clear` asks whether almost every
+  opaque pixel under the button strip is one colour. Transparent pixels are
+  skipped, because the CSD window's rounded corner is alpha 0. Before that
+  change Wine reported a false `DRAWS UNDER THE CAPTION BUTTONS` from 2% of a
+  54x30 strip. The compositor logs the verdict whenever it changes. This is
+  §31.14 item 4, *warn when the levers disagree*, for the one lever whose
+  failure showed only in a photograph.
+
+### 82.6 The first drag, and what it found
+
+`wc-desk` gained `hittest`, which sends `WM_NCHITTEST` at window-relative
+points, and `mouse`, which sends real `SendInput` drags, clicks, double-clicks
+and hovers and prints the window rectangle before and after. `wc-firefox.sh
+wine-tabs` runs both against Firefox in a Wine HWND under the defaults. The
+first runs found three things, and the third was not what it first looked like.
+
+1. **`xdg_toplevel.move` was the keyboard move.** §22.7 posted bare `SC_MOVE`
+   with `lParam = 0`, which is Alt+Space → *Move*. It warps the cursor to the
+   caption's middle and moves the window by the distance from *there*. A drag
+   of (+120, +80) on empty tab strip moved the window by **(+286, +82)**. The
+   extra 166 px is the distance from the press point to the middle of the
+   1288 px window. It is now `SC_MOVE | HTCAPTION` with the cursor in
+   `lParam`, the form a caption click produces, and the same drag moves the
+   window by **(+110, +74)**. The 10 px shortfall on each axis is GTK's drag
+   threshold, crossed before the move is requested.
+2. **GTK's maximise moved the window off the monitor.** §45.11's `ShiftOrigin`
+   moved the `HWND` whenever the window's geometry origin changed, declared or
+   not. GTK re-declares `(26, 23)` as `(0, 0)` when Firefox maximises: the
+   shadow goes, the buffer is replaced, and the window rectangle stays the same.
+   The compositor logged `origin shifted by -26,-23` and pushed the maximised
+   window off its monitor, and the 31-row tab strip with it. The Wine capture
+   showed the navigation bar at the top of the screen. `ShiftOrigin` now fires
+   only for the bounding-box extent that §45.11 was about. Every Wayland
+   compositor keeps the window geometry where it is when it is re-declared, and
+   §45.11's own unit test says the same for the synthetic Win32 ("a declared
+   inset leaves the window where it was put"). It also removes a smaller
+   symptom: every window used to move by its shadow inset just after it mapped,
+   because the geometry arrives a commit late (§82.2).
+3. **A diagnosis that was wrong, corrected in the same section.** The shifted
+   maximised window sat at `-30,-27`. That was read as "Wine parks a maximised
+   window a caption above the screen", and `3e8d5bd` moved the maximised client
+   top to the work area's top. With item 2 fixed, Wine parks it at `-4,-4`: one
+   band, as Windows does. The `-26,-23` was the shadow shift and nothing else, so
+   `a3406ca` puts the band back. A new log line on every maximise compares the
+   client's top with the work area's top. It reports any future mover as
+   `MISMATCH` instead of absorbing it the way the work-area rule would have.
+   This is §55.3's rule again: a symptom is not a diagnosis.
+
+Also measured: the Wine console that `cmd /c` opens sits over the top-left
+665x434 of the desktop and takes `SendInput` presses aimed there. The first
+top-edge drag, at x = 600, "did not resize" for that reason and no other. Hit
+tests are messages and are unaffected. The leg aims its gestures to the right of
+the console and says why.
+
+### 82.7 The Wine leg, and what it does and does not prove
+
+`scripts/wc-firefox.sh wine-tabs` passed 20 of 20. Its assertions cover:
+
+* the fold under the default;
+* `folds 30 px` (Wine's caption);
+* the fallback buttons at `client rect 1226,0 54x30`;
+* the compositor's own corner check reporting clear;
+* hit tests of `HTTOP`, `HTTOPLEFT`, `HTCLIENT` (empty tab strip and below it),
+  `HTMINBUTTON`, `HTMAXBUTTON` and `HTCLOSE`;
+* the top edge resizing (`904 px at y=0 -> 843 px at y=61`);
+* `handed a move to Windows`, with the window following the drag;
+* a double-click on empty tab strip maximising the window;
+* maximised: the monitor's top row is `HTCLIENT`, with the client's top at the
+  work area's top;
+* the maximised capture's first 31 screen rows being the tab strip.
+
+The captures are `docs/tabs-in-titlebar/wine-tabs-{restored,moved,maximised}.png`.
+**They are Wine:** Xvfb, Wine's own frame, no DWM, and the classic fallback
+buttons. A separate visual check found the following:
+
+* the strip is the window's top row in all three captures;
+* the buttons sit about 100 px clear of Firefox's tab-list button;
+* the buttons are 30 px tall against a 31 px strip. Wine's caption is 30 px and
+  the launcher's 100% number is Windows 11's 31;
+* nothing is cut off when maximised.
+
+It found one artefact: a few black pixels at the window's rounded top-left
+corner. That corner is alpha 0 in Firefox's buffer, and GDI's blit ignores
+alpha (§31.6). On the guest the same pixels fall inside the DWM-extended
+region, where alpha 0 is a hole onto the frame; that has not been looked at.
+
+The Wine leg also does not show the following, and cannot:
+
+* DWM's buttons;
+* `DwmDefWindowProc`'s answers;
+* the snap-layouts flyout;
+* Windows 11's metrics;
+* any scale but 96 DPI;
+* whether the launcher's 146 px covers DWM's real strip.
+
+The leg is **not perfectly stable**. On the final tree it ran six times: five
+passed 20 of 20, and one lost all three gestures. That run printed each
+gesture's "before" line and never its "after" line, so `wc-desk` did not finish
+inside the leg's 60 s wait, and the leg reported 14 passed, 6 failed. The cause
+was not found. The run kept no artefacts, and every rerun with `WC_KEEP=1`
+passed. It is recorded rather than averaged away.
+
+### 82.8 The launcher and `wc-session`
+
+* `[app.*] titlebar` defaults to `tabs`, and the shipped example says so. It
+  accepts `tabs`, `none` (alias `server`) and `client`, the last being §31's
+  picture without the profile, kept as a control. A typo is refused by name,
+  because Firefox treats an unknown `MOZ_GTK_TITLEBAR_DECORATION` as "decorate
+  yourself".
+* `wc-session run` gets two words where it used to get one: the env value and
+  the sheet. It writes the sheet only under the launcher's own profile tree. When
+  an app opts out it removes a sheet that carries the launcher's mark, and leaves
+  any other `userChrome.css` alone. The stale "does not exist yet" comment is
+  replaced by the arrangement as it now is.
+* **Empty words now cross as `-`.** `wc-session` splits
+  `$SSH_ORIGINAL_COMMAND` on whitespace, so an empty base64 argument vanished
+  and every later one arrived one place early. An `exec` without `--profile`
+  sent its preferences into the profile slot. Nothing had hit this because the
+  shipped `exec` names a profile.
+* `wc-launch --write-firefox-profile TITLEBAR DPI DIR` writes exactly what a
+  launch sends, on every platform. The harnesses use it, so they measure the
+  launcher's output and not a copy of it.
+
+### 82.9 The gates
+
+Every row was run on this branch at its final code (`a3406ca` plus this
+section), in the shared 10 GB slice. The Wine and Linux rows are this box. **No
+row is the guest.**
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2726 passed, 0 failed**, 8 ignored. The baseline was 2704; `git diff b5c00ef..` adds exactly **22** `#[test]`s and removes none: 12 in `caption.rs`, 4 in `surface.rs`'s decorator tests, 4 in `wc-launch`'s `plan.rs` and 2 in its `config.rs` |
+| `cargo clippy --workspace --all-targets` | exit 0. No warning points at a line this branch wrote; the 718 warning lines are master's, 687 of them in generated `sv_icd_entry.rs` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0, no errors |
+| `cargo clippy -p wc-compositor -p wc-desk -p wc-launch --target x86_64-pc-windows-gnu` | nothing in `caption.rs`, `wc-desk` or `wc-launch`'s new code. One pre-existing warning in `win32.rs` (`create_window`'s eight arguments) |
+| `scripts/wc-pool.sh` | `wc-pool: OK` |
+| `scripts/wc-keymap.sh` | `wc-keymap: OK` |
+| **`scripts/wc-firefox.sh tabs-default`** (new, Linux) | **11 passed, 0 failed** (run twice) |
+| **`scripts/wc-firefox.sh wine-tabs`** (new, Wine) | **20 passed, 0 failed** in 5 of 6 runs on the final tree; 14/6 in one (§82.7) |
+| `scripts/wc-firefox.sh tabs`, `titlebar`, `auto` | 6/0, 9/0, 6/0. Unchanged: the opt-out Firefox is still never folded |
+| `scripts/wc-titlebar.sh local` | 5/0. `weston-terminal` still folds and `weston-flower` still does not |
+| `scripts/wc-titlebar.sh default` (new, guest) | **not run.** It is the later phase's (§82.10) |
+
+`wc-titlebar.sh local` came out as one `FAIL` on the first attempt, from the
+`fresh` check: `cargo test` had not relinked `target/debug/wc-compositor` after
+the last source edit. It passed after `cargo build --workspace`. That is §42's
+check doing its job and is recorded here so the 5/0 is not mistaken for a
+first-try result.
+
+
+### 82.10 What is not proven, and the guest run that proves it
+
+1. **DWM's buttons against the reservation.** This needs the default leg on the
+   guest, where the corner check compares the launcher's 146 px with DWM's real
+   bounds. That leg is new:
+
+   ```
+   WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<absolute path of firefox on the host> \
+     scripts/wc-titlebar.sh deploy
+   WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<same> scripts/wc-titlebar.sh default
+   ```
+
+   It asserts the following:
+   * the fold with no `--decorations`;
+   * Firefox asking for `Client`;
+   * the profile arriving on the host;
+   * `DwmExtendFrameIntoClientArea ok`;
+   * `keeps Windows' own caption buttons`;
+   * **`leaves the caption-button corner clear`** against DWM's bounds;
+   * `HTTOP` at the top edge, `HTCLIENT` on empty strip, and `HTMAXBUTTON` and
+     `HTCLOSE` read back from `DwmDefWindowProc`.
+
+   It injects no input. The picture is `docs/tabs-in-titlebar/default.png`.
+2. **Snap layouts, the drag, the top edge and the double-click on the guest's
+   desktop.** These close §31.13 items 1, 2 and 4. They inject real input into
+   a desktop a person uses, so they are opt-in and need an **unlocked** session
+   (§55.3):
+
+   ```
+   WC_TB_GESTURES=1 WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<same> \
+     scripts/wc-titlebar.sh default
+   ```
+
+   The leg hovers the maximise button for 1.5 s while `wc-desk shot --screen`
+   captures `default-snap-hover.png`; the flyout is the shell's window, so a
+   window capture would miss it. It then drags the top edge and the empty tab
+   strip, double-clicks to maximise (`default-maximised.png`) and double-clicks
+   again to restore.
+3. **125% and 150%.** Set the guest's display scale, log off and on, and repeat
+   item 1 with `WC_TB_DPI=120` and then `WC_TB_DPI=144`, which render the
+   profile at that scale (39/183 and 47/219). The compositor's `dpi N (M%)` line
+   and its `folds N px` line give the real caption. The corner verdict says
+   whether the scaled 146 still covers DWM's strip. All the code is per-DPI and
+   unit-tested; none of it has run above 96.
+4. **The shortcut itself**, with the launcher computing the fit:
+
+   ```
+   scripts/wc-launch.sh deploy && scripts/wc-launch.sh cold && scripts/wc-launch.sh shot
+   WC_LAUNCH_TITLEBAR=none scripts/wc-launch.sh deploy   # the opt-out
+   ```
+
+   Its log should contain `titlebar: tabs, caption N px and buttons M px at this
+   desktop's DPI`.
+5. **Still open, unchanged in kind.** The title is not on screen in this
+   arrangement (§31.13 item 5); it is in the taskbar and Alt-Tab, as for Firefox
+   on Windows. A window with enough tabs will not put one under the buttons, now
+   that the corner is reserved, but nothing has been run with that many tabs.
+   §31.13 item 6 (one theme) and the corner's alpha (§82.7) also remain.
+
+---
+---
+
+## 83. The arena moves onto an ivshmem device, and root leaves the launcher's path
+
+### 83.1 Status in one paragraph
 
 Until this section every session the desktop shortcut started became root on the
 VM host twice: once to locate the guest's arena through QMP and
@@ -25222,9 +25607,13 @@ writes a header at the front of it; the VM host opens the file **as the user**,
 reads the header, and runs the proxy in a *user* unit. `wc-session`'s `up`,
 `proxy` and `down` do not call `$ROOTC` on this path, and there is no fallback to
 the old one. The developer harnesses keep `--arena-guest-ram` and their root.
-What was run on the guest, and what it measured, is 82.8; what was not is 82.9.
+On the guest, the device was hot-plugged into the running VM, the driver is
+installed, a non-administrator process mapped it and its bytes were read on the
+host by `sirati`, and the launcher ran end to end in session 0 with no root
+(83.8). The interactive desktop was not available, and 83.9 lists what that
+leaves unrun.
 
-### 82.2 The reason, which security-model.md R6 asked for
+### 83.2 The reason, which security-model.md R6 asked for
 
 R6 closed with an instruction: *"If a driver is ever proposed again, this entry is
 why it has to be argued from a stated new reason rather than revived from the old
@@ -25248,7 +25637,7 @@ is another VM change with its own consequences."* This section makes that change
 for a dedicated region rather than for the guest's whole RAM. That keeps the
 consequences down to one device, one file and 128 MiB.
 
-### 82.3 Why this is not the file arena, and what §28.2 now says
+### 83.3 Why this is not the file arena, and what §28.2 now says
 
 §28.2's rule is that the file-backed arena must not be reachable from the
 launcher, because "a launcher that could quietly degrade to a file would produce
@@ -25274,7 +25663,7 @@ removes `SV_ALLOW_FILE_ARENA` exactly as `guest-ram` does.
 docs/design.md §1a is satisfied in the same way it was before: the host opens a
 name it can resolve itself, and what crosses the VM boundary is a 64-bit run id.
 
-### 82.4 The header, and why it is outside the arena
+### 83.4 The header, and why it is outside the arena
 
 The plan that `wc-arena-host` used to write held four facts: an object, a length,
 a run id and the outbound window. With a device, QEMU was told the object before
@@ -25307,7 +25696,7 @@ working set and are not charged against the guest's RAM. The launcher also no
 longer runs the Superfetch frame-list query (security-model.md R28), which stays
 in use for shared_vulkan's arena and the developer harnesses.
 
-### 82.5 What it costs
+### 83.5 What it costs
 
 * **128 MiB of host RAM**, pinned under VFIO like the guest's own. The file is on
   `/run`'s tmpfs. On testhost that comes out of the ~1.4 GiB the host has left
@@ -25325,7 +25714,7 @@ in use for shared_vulkan's arena and the developer harnesses.
   one fails at start-up with the reason in the message.
 * **A group that can stop the VM.** security-model.md R29.
 
-### 82.6 The VM side
+### 83.6 The VM side
 
 `virtualisation.windowsVm.waycomposeArena` in nix-config, on branch
 `wc-arena-ivshmem`, adds the `memory-backend-file` and the `ivshmem-plain` device
@@ -25335,10 +25724,10 @@ i440fx). It adds a root `ExecStartPre` that recreates the file for every VM star
 `ExecStopPost` that removes it, and `users.groups.wc-arena.members =
 [ "sirati" ]`. It also sets `restartIfChanged = false` on `windows-vm.service`:
 before this the unit had no such setting, so any `switch` that changed it would
-have restarted the VM somebody is logged into. 82.8 records which of the
+have restarted the VM somebody is logged into. 83.8 and 83.9 record which of the
 persistent change and the hot-plug were applied, and how.
 
-### 82.7 The guest side
+### 83.7 The guest side
 
 The driver is the WHQL-signed `ivshmem` from the Looking Glass B7 host
 installer, the only signed build available (docs/research-vulkan-forwarding.md §2.2).
@@ -25358,18 +25747,185 @@ the same `attach_ivshmem`, writes a marker carrying its pid and run id at arena
 offset 0, reads it back, and with `--bench` times one 1920×1080 RGBA copy out of
 the mapping against the same copy between two heap buffers.
 
-### 82.8 What was run
+### 83.8 What was run, on 2026-10-15
 
-*Not yet run on the guest at the time of writing; this subsection is replaced by
-the measurements when they exist.*
+The guest had been reset at 14:37 after an unrelated hang, and **nobody was
+logged in** for any of this. So everything below ran from ssh: the driver steps
+in the ssh session, and the launcher's runs in session 0, where the compositor's
+windows exist but nobody sees them. Before and after each step that touched the
+VM (hot-plug, driver install, every probe and every launcher run), `ssh true` to
+the guest and `ping <guest-nat-ip>` from testhost were checked, and all passed.
 
-### 82.9 What is not proven
+**The slot, read before anything was added.** `query-pci` on the running VM:
+root-bus slots 0–15, 26 (the CD xHCI, pinned) and 31 (the IGD's mock LPC) are
+in use, and every auto-addressed device is at 15 or below. `info qtree` shows
+`PIIX4_PM` with `acpi-root-pci-hotplug = true`. The 64-bit PCI window is
+`0x7000000000–0x7080000000` (2 GiB, `pci-hole64-size`), of which
+`0x7000000000–0x701104bfff` is assigned, so a 128 MiB prefetchable BAR fits.
+Slot `0x1c` (28) is free and above every auto-addressed device. Adding a device
+there assigns nothing to any existing device, and a cold start with the device
+on the command line gives the auto-addressed devices the slots they have now.
 
-1. **Everything in 82.8 that says "not run".**
-2. **The persistent VM change has not booted.** It was evaluated and built, and
-   82.8 says whether it was activated. A cold start of the VM is the one test it
-   has not had, and that start is not ours to cause.
+**The hot-plug: done, on the running VM, with no restart.** The file was
+created as root through `sudokey`. The `wc-arena` group exists only once the
+NixOS change is active, so sirati was given access by ACL: directory
+`root:root 0750` + `u:sirati:r-x`, file `root:root 0660` + `u:sirati:rw-`. Then
+over QMP `object-add memory-backend-file` (`share=true`, 134217728 bytes) and
+`device_add ivshmem-plain,id=wcarena0,memdev=wcarena,bus=pci.0,addr=0x1c`
+returned `{}` each. `info pci` lists `Bus 0, device 28: RAM controller: PCI
+device 1af4:1110`, and every other device is where `query-pci` had it. Windows
+enumerated it at once as "PCI standard RAM Controller", status OK.
 
-### 82.10 The gates
+**The driver.** The ssh account is an administrator (`IsInRole(Administrator)`
+true) and its session is elevated, so `pnputil /add-driver ivshmem.inf
+/install` ran directly. It published `oem158.inf` and installed it on
+`PCI\VEN_1AF4&DEV_1110&SUBSYS_11001AF4&REV_01\3&267a616a&0&E0`. The device is
+now "IVSHMEM Device", status OK, provider Red Hat, Inc., driver version
+`100.10.100.10000`.
 
-*Recorded with the measurements in 82.8.*
+| file | SHA-256 (identical on this machine and on the guest) |
+|---|---|
+| `looking-glass-host-B7.zip` (looking-glass.io/artifact/B7/host) | `c2415a5a0c405f1d6aa936986bdd4b806c50574b4521747e113c3be2be047b1b` |
+| `looking-glass-host-setup.exe` (inside it) | `9d789e8e18a45aab415d40cd1fc3f07aba54e6871122f26031ac44c7250e5032` |
+| `ivshmem.inf` | `e41554a07eee128aee07cebdd2423dcfcde45e3868e2ae90f7ba8caf52af8f1c` |
+| `ivshmem.cat` | `40cc6242b8bf05600e5361b81ec4f5150b23bfdcbab538b68e406f8ac57e979d` |
+| `ivshmem.sys` | `416c73f68f1bdaf10bdd86f2c29c62370edbdd9d3aeb109cb618eccfd050a45d` |
+
+`Get-AuthenticodeSignature` on the guest: `ivshmem.cat` and `ivshmem.sys` are
+both **Valid**, signer *CN=Microsoft Windows Hardware Compatibility Publisher*,
+issuer *CN=Microsoft Windows Third Party Component CA 2014*, timestamped by
+*Microsoft Time-Stamp Service*.
+
+**The core claim, measured.** `wc-ivshmem-probe --bench` was run under a token
+with **`BUILTIN\Administrators` deny-only** (`runas /trustlevel:0x20000`;
+`whoami /groups` in the same process confirms it). It printed:
+
+```
+mapped ivshmem device 0 (\\?\pci#ven_1af4&dev_1110&…#{df576976-569d-4672-95a0-f57e4ea0b210}) in 7.704 ms:
+  region 134217728 bytes, arena 134213632 bytes
+wrote and read back at arena offset 0 (region byte 4096): WCPROBE1 pid 9804 run 0x92bab4552df52363 -> identical
+```
+
+On testhost, as `sirati` (uid 1000, not root, not in any group the file
+names), an earlier probe's marker read back out of
+`/run/windows-vm/wc-arena/arena` with `xxd -s 4096 -l 32`:
+
+```
+00001000: 5743 5052 4f42 4531 c81f 0000 0000 0000  WCPROBE1........
+00001010: 35eb 7abc dc17 8967 0000 0000 0000 0000  5.z....g........
+```
+
+`0x1fc8` is that probe's pid, 8136, and `0x678917dcbc7aeb35` its run id. So
+bytes written by a non-administrator Windows process into the BAR are in the
+host's file, at the same offset, read by an unprivileged Linux user.
+
+What that token was **not**: its integrity level stayed High, because `runas
+/trustlevel` removes the group and not the label. A UAC-filtered desktop token
+is Medium. The device opened for a non-administrator; whether it opens at
+Medium integrity is shown by the first launcher run on the interactive desktop
+(83.9 item 1). An S4U scheduled task with `RunLevel Limited` was tried first
+and turned out to get a full administrator token, so it proved nothing and is
+not counted.
+
+**The cost of a CACHED mapping, as a copy.** The compositor logs no per-frame
+blit time, so what was measured is the copy its blit makes: one 1920×1080 RGBA
+frame out of the mapping into private memory, 15 successive frames, 5 reps.
+
+| | best | mean | best rate |
+|---|---|---|---|
+| ivshmem CACHED → heap | 0.521–0.565 ms | 0.557–1.063 ms | 14.7–15.9 GB/s |
+| heap → heap (control, same process) | 0.517–0.533 ms | 0.521–0.566 ms | 15.6–16.1 GB/s |
+
+Three runs. The best figures are the same to within 7%, so a cached BAR reads
+at memory speed. The means are noisier on the BAR (one run's mean was 1.06 ms),
+and three runs cannot say why.
+
+**The launcher, functionally, in session 0.** `wc-launch.exe firefox` was run
+over ssh from its own directory (`C:\Users\<guest-user>\wcivs`, its own key restricted
+to `~/wc-launch-ivs/wc-session`) against a session nobody can see. The first
+attempt found a real bug: the forced command's `wc-session` defaulted its
+binaries to `~/wc-launch/bin`, so a second installation started the *first*
+installation's `wc-proxy`, which rejected `--arena-ivshmem` as an unknown
+argument. `wc-session` now runs the binaries installed beside it. After that,
+every run went through:
+
+```
+arena: run 0x23c00e145e1fdd27, 655 ms
+up: ivshmem run 0x23c00e145e1fdd27 generation 2, 134217728 bytes at /run/windows-vm/wc-arena/arena | up ok … (214 ms)
+proxy: proxy ok /tmp/wc-launch/wcl-428/wl-proxy (as sirati, ivshmem) (266 ms)
+cold start: 1164 ms
+CLICK-TO-WINDOW 2336 ms (cold, 0 window(s) before)
+```
+
+`ps` on testhost: `sirati 146229 … ~/wc-launch-ivs/bin/wc-proxy
+… --transport arena --arena-ivshmem /run/windows-vm/wc-arena/arena`. The proxy
+logged `transport arena 0: 134213632 bytes of ivshmem BAR2 … (nothing located,
+nothing opened as root …)`. `$ROOTC` was called on none of `up`, `proxy` and
+`down`. `scripts/wc-launch.sh verify` against the live session:
+**6 passed, 1 failed**. The six include the live compositor's command line
+(`--arena-ivshmem`, no file flag), wc-proxy running as `sirati`, 6 connections
+on one region and one allocator, and `1 fds in, 2 out (2 from the arena)`. The
+one failure is that the main connection's pool counts had not been printed.
+The proxy prints them when a connection closes, and on this run the main
+connection outlived Firefox until the unit was stopped. The proxy's per-pool
+lines show four 217600-byte pools published into arena slices, the closed
+connections show `0 overflows, 0 refusals`, and the compositor logged
+`window 1 pixels served by wl_shm (mapped: 0 section, 0 shared-file, 3
+arena-slice)`, `window 1 mapped 1264x713 (xrgb)` and 101 commits.
+
+| | ivshmem, session 0 (this section) | guest RAM, §28.4 / §28.12 |
+|---|---|---|
+| cold click to window | **2336, 3002, 1930 ms** | 5.7–7.1 s, of which the locate was 2.8–4.1 s |
+| `up` (was the locate) | 205–233 ms | 2832–4098 ms swept |
+| warm click to window | **1015, 1371, 1375 ms** | 1414–1601 ms; 1494–1554 at 64 MiB |
+| `sv-guest.exe` with Firefox up | **private 11.5 MB, working set 40.9 MB** | private 101 MB, working set 120 MB |
+
+**These numbers are not like for like, and the table says so by its column
+heading.** Session 0 has no visible desktop, no DWM composition of the windows
+and no user. §28.4's figures were the interactive desktop, through the shortcut
+and the scheduler's interactive route. The memory row compares like with like
+in what it counts, since a BAR mapping is not private bytes and the old arena
+was 64 MiB of pinned private memory. The click rows bound the cost of the
+locate and the root steps, which are gone, and do not stand in for the
+desktop's numbers. The shortcut (`Firefox (Linux, ivshmem).lnk`, wearing
+Firefox's icon) is installed on the desktop and has not been clicked.
+
+**Cleanup.** Every launcher session was ended with `wc-launch.exe --stop`. No
+process from `C:\Users\<guest-user>\wcivs` is running, and no `wc-proxy` or Firefox of
+this run is left on testhost. Left in place on purpose: the hot-plugged
+device, its file, the installed driver, the shortcut and both installation
+directories. These are the deployment.
+
+### 83.9 What is not proven
+
+1. **Nothing has run on the interactive desktop.** Nobody was logged in. Not
+   yet run: the shortcut clicked through the scheduler's interactive route, its
+   cold, warm and photographed window, and with them the device opening at
+   Medium integrity. The commands are:
+   ```
+   export WC_LAUNCH_DIRNAME=wcivs WC_LAUNCH_HOSTDIR=~/wc-launch-ivs \
+          WC_LAUNCH_TITLE="Firefox (Linux, ivshmem)" WC_LAUNCH_PORT=57441 WC_LAUNCH_SHOTDIR=ivshmem
+   nix develop -c scripts/wc-launch.sh cold
+   nix develop -c scripts/wc-launch.sh warm
+   nix develop -c scripts/wc-launch.sh verify
+   nix develop -c scripts/wc-launch.sh shot     # images to docs/ivshmem/, judged by a separate agent
+   nix develop -c scripts/wc-launch.sh stop
+   ```
+2. **The persistent VM change has not booted, and is not set to.** The nix-config
+   branch `wc-arena-ivshmem` evaluates and builds. It was **not** activated, by
+   `switch` or by `boot`. testhost runs a system with nixpkgs from 2026-08-19
+   that no commit reproduces, and the branch sits on a master 418 commits and a
+   two-month nixpkgs bump ahead of it. A `boot` would have put all of that, not
+   this change, into the next reboot. Until the branch is deployed, a natural
+   restart of the VM drops the device. The launcher then fails at `up` with
+   "no ivshmem arena", as designed, and does not fall back.
+3. **The `SIGBUS` of R29 is the documented behaviour of a truncated shared
+   mapping, not a measurement.** Triggering it would stop the VM.
+4. **The blit is measured as a copy, not as the compositor's present.** The
+   compositor has no per-frame timing for it.
+5. **A full session's pool accounting was not read** (83.8): the main
+   connection's counts print on close, and it closed only when the unit stopped.
+
+### 83.10 The gates
+
+*Recorded with the measurements in 83.8.*

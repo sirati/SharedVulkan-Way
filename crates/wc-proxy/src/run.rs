@@ -53,7 +53,7 @@ struct Args {
     arena_plan: PathBuf,
     /// IVSHMEM ARENA. The file QEMU backs the guest's ivshmem BAR2 with. Set,
     /// `--transport arena` builds its plan from the header at the front of that
-    /// file — no locator, no QMP, no root (docs/waycompose-design.md §82).
+    /// file — no locator, no QMP, no root (docs/waycompose-design.md §83).
     arena_ivshmem: PathBuf,
     /// The run id the compositor printed, which the header must carry.
     /// Required with `--arena-ivshmem`: without it a header left by a previous
@@ -417,7 +417,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // startup failure with the message on stderr, rather than the first client
     // being told "no transport for it" twenty seconds later.
     let shared_arena = match args.transport.as_str() {
-        // IVSHMEM ARENA, docs/waycompose-design.md §82. The region is BAR2 of a QEMU
+        // IVSHMEM ARENA, docs/waycompose-design.md §83. The region is BAR2 of a QEMU
         // ivshmem device, backed by a file at a path this user may open, so the
         // plan comes from the header the compositor wrote rather than from a
         // locator: no QMP, no `/proc/<qemu-pid>/fd`, no root. Everything after

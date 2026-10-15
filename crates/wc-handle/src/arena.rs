@@ -373,7 +373,7 @@ fn ivshmem_slot() -> &'static Mutex<Option<IvshmemState>> {
 
 /// Attach arena `id` as **BAR2 of the ivshmem device numbered `device`**.
 ///
-/// IVSHMEM ARENA, docs/waycompose-design.md §82. The third provider, and the first whose
+/// IVSHMEM ARENA, docs/waycompose-design.md §83. The third provider, and the first whose
 /// far side needs no privilege to reach. [`attach_guest_ram`] commits this
 /// process's own memory and expects the host to *find* it, which takes QEMU's
 /// monitor and QEMU's descriptor table, which on the deployment are root's.
@@ -1848,7 +1848,7 @@ mod tests {
     // A writable file mapping stands in for BAR2 here. What this can check is
     // the header's placement and order, that the arena starts after it, and
     // the refusals; what it cannot is that a driver maps anything, which is a
-    // guest's claim (docs/waycompose-design.md §82).
+    // guest's claim (docs/waycompose-design.md §83).
 
     #[test]
     fn an_ivshmem_region_puts_the_header_first_and_the_arena_after_it() {

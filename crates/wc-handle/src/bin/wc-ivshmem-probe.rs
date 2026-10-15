@@ -1,7 +1,7 @@
 //! `wc-ivshmem-probe` — does the ivshmem device open, map and carry bytes, as
 //! the account that will run the compositor?
 //!
-//! IVSHMEM ARENA, docs/waycompose-design.md §82. The core claim of that section is that
+//! IVSHMEM ARENA, docs/waycompose-design.md §83. The core claim of that section is that
 //! BAR2 of the guest's ivshmem device and the file QEMU backs it with on the VM
 //! host are the same physical pages, reachable on this side **without
 //! elevation** and on that side **without root**. This program is the guest's

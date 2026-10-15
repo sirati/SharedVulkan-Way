@@ -5057,6 +5057,280 @@ to find it, and every part of it would have been needed to build the wrong fix.
 
 ---
 
+### 0.27 Firefox's crash series was the stack — and behind it a lock, a depth and a race
+
+Measured 2026-10-15 on the **icd-crash** workstation, in `nix develop`, with no
+guest: weston headless on the pixman renderer, `sv-gpu-server` on the AMD iGPU
+(`/dev/dri/renderD129`, "RADV RAPHAEL_MENDOCINO", the dev shell's Mesa 26.2.0),
+and the system Firefox 157.0.1 with the system Mesa 26.2.4's Zink on our ICD.
+The NVIDIA card (`renderD128`) is leased to other people's jobs and was kept out
+by name: the GPU side gets `VK_DRIVER_FILES` pointing at RADV only and Firefox
+gets Mesa's EGL vendor only. `nvidia-smi` listed no process of ours at any point.
+
+What differs from the goal's topology: no VM and no `wc-proxy`, so nothing here
+crosses a hypervisor, and this weston can advertise a DRM device where the
+guest's compositor cannot (firefox-accel.md, "The Wayland WSI", §2). The ICD is a
+**debug** build, which is what every deployment script ships
+(`wc-guest.sh`, `wc-firefox.sh`) and what the crash needed.
+
+#### 0.27.1 The reproduction
+
+```
+SVWL_BIN=$PWD/target/debug SVWL_EXTRA_ENV=MOZ_CRASHREPORTER_DISABLE=1 \
+  nix develop -c scripts/sv-firefox-wayland.sh firefox 60
+```
+
+SIGSEGV in the parent process, on WebRender's `Renderer` thread, with c1fd97e's
+backtrace frame for frame:
+
+```
+#4  sv_icd_entry::lower_pnext                         <- in its stack-probe loop
+#5  sv_icd_entry::lower_vk_physical_device_features2
+#6  sv_icd_entry::lower_link_vk_physical_device_features2
+#7  sv_icd_entry::lower_pnext
+#8  sv_icd_entry::lower_vk_device_create_info
+#9  sv_icd_entry::local::sv_vk_create_device
+#10 terminator_CreateDevice                            <- the loader
+#14 zink_internal_create_screen   ...   #18 kopper_init_screen
+#29 mozilla::wr::RenderThread::CreateSingletonGL   ...   #34 nsThread::ThreadFunc
+```
+
+The faulting instruction is `movq $0x0,(%rsp)` inside `lower_pnext`'s prologue —
+the stack probe touching the next page — so this is not a bad pointer. The
+**release** build of the same tree ran the same harness for 90 s without a fault.
+
+#### 0.27.2 The cause, measured
+
+From the core, by `$rsp` per frame:
+
+| | bytes |
+|---|---|
+| the thread's first frame (`__clone3`) to the faulting probe | **260,504** |
+| one `lower_pnext` frame (frame 7 to frame 8) | **143,000** |
+| everything below the ICD — Gecko, Mesa, the loader | 11,552 |
+
+The thread is an `nsThread`, for which Gecko's default stack is 256 KiB (not
+read from this process; the fault's position agrees with it), and the fault is
+254 KiB below its first frame: the outer `lower_pnext` took 143 KB, the inner one
+needed as much again, and about 100 KB was left.
+
+Two things put two of those frames on the stack at once, and both were the
+generator's:
+
+- **A `match` with an arm per link type is a frame the size of all of them in a
+  debug build.** A debug build does not overlap the slots of mutually exclusive
+  arms. §0.24 (8236642) moved each arm's *struct* into an `#[inline(never)]`
+  helper; each arm's `?` still kept a slot of its own, and with the `full`
+  profile's link count the frames were back where they started.
+- **The walk nested.** Every link's `lower_*` walks its own `pNext` under its
+  own membership predicate. For most links that admits nothing; for a link that
+  is itself a parent it re-lowers the whole tail one walker frame down — and
+  `VkPhysicalDeviceFeatures2` inside `VkDeviceCreateInfo`'s chain is exactly what
+  Zink sends. §0.19 item 10 recorded this as waste. It was also the depth.
+
+Every walker, by `objdump` of each prologue's stack allocation (probe loop
+included), debug build:
+
+| function | before | after |
+|---|---|---|
+| `sv_icd_entry::lower_pnext` | 142,984 | **504** |
+| `sv_icd_entry::lower_pnext_tags` | 63,800 | **296** |
+| `sv_proto::decode_pnext` | 145,160 | **1,480** (`decode_pnext_with`) |
+| `sv_proto::encode_pnext` | 122,968 | **632** (+ 11,128 in `encode_pnext_body`) |
+| `sv_gpu_entry::raise_pnext` | 210,712 | **280** (+ 11,128 in `raise_link`) |
+| `sv_gpu_entry::lower_full_pnext` | 140,392 | **504** |
+
+In the release build the ICD's walkers are under 1 KB before any of this (the
+GPU side's `lower_full_pnext` 19,480 and `raise_pnext` 10,392), which is why the
+release build never faulted and the series was only ever seen in deployment.
+
+**The five faults in five locations, re-read.** Two were real and stay fixed:
+the layer-settings link (6cb8db3) and the output chain read as input (07323bc,
+c1fd97e). The other three — `decode_pnext`, and `lower_pnext` under
+`lower_vk_physical_device_features2` twice — were this one cause, met in
+whichever walker happened to be deepest when the page ran out. Each fix moved it
+because each fix changed which frame was last.
+
+#### 0.27.3 The fix
+
+- sType-keyed walkers (`lower_pnext`, `lower_full_pnext`, `lower_pnext_tags`,
+  `decode_pnext`, `decode_pnext_partial`) look their helper up in a **sorted
+  table of function pointers** (`sv_wire::pnext_table_lookup`) and call it once.
+  Nothing per link type is in the walker's frame, in any profile. Each generated
+  table has a test that it is strictly sorted, because a mis-sorted one would
+  make the binary search miss silently.
+- Variant-keyed ones (`encode_pnext*`, `raise_pnext`) go through a body whose
+  arms are plain tail calls — the shape `size_pnext_body` always had, and the one
+  that measured small.
+- A link is lowered from a **copy with `pNext` cut**, which is all the flat wire
+  keeps (links encode with their `_self` form), so no walker frame is ever under
+  another.
+
+`crates/sv-icd-entry/tests/stack.rs` lowers Zink's chain shape, round-trips it
+through the wire and walks it as output storage, each on a thread with **64 KiB**
+— a quarter of the WebRender thread. Against the old generator all three abort
+with "has overflowed its stack"; now they pass, and still pass at 32 KiB (not at
+24).
+
+#### 0.27.4 Then it lived long enough to stall: an error handler that waited for its own caller
+
+With the crash gone the Wayland run survived, and rendered on **llvmpipe**
+(0.27.8). The X11 path through kopper, `LIBGL_KOPPER_DRI2=1` on rootful
+Xwayland — firefox-accel.md, "The Wayland WSI", §3 — rendered through us and
+stopped within seconds: no wheel scroll moved a page, "Timed out waiting for
+animation frame" 54 times in 70 s, 19 queue submissions on the GPU side in 90 s.
+The pre-fix release build of b5c00ef did exactly the same, so it predates this
+work.
+
+A core of our own Firefox, taken mid-stall with SIGABRT, has Mesa's present
+thread here:
+
+```
+kopper_present -> sv_vk_queue_present_khr -> present::x11::Window::put -> quietly
+  -> XFlush -> _XEventsQueued -> handle_error -> _XError
+  -> present::x11::ignore_error -> Mutex<Connection>::lock     <- put holds it
+```
+
+Xlib runs the error handler synchronously, on the thread whose request is
+reading the connection, and on our connection that thread always holds the
+connection's mutex. `ignore_error` read our `Display*` *through* that mutex
+(a0a48ec), so the first X error of ours parked the present thread forever;
+WebRender's thread then waited in `kopper_acquire` on the fence that present
+would have signalled, and WebGL's context creation waited on the EGL display
+lock. The pointer is now also an `AtomicUsize` the handler reads with no lock.
+`the_error_handler_answers_while_the_connection_is_locked` holds the mutex and
+calls the handler: the old body fails at the test's 10 s timeout, the new one
+returns at once.
+
+#### 0.27.5 Then it was black: every frame was `BadMatch`
+
+The handler swallows our errors by design and did so silently, so the window
+stayed black with nothing said. It now names the first four, and the next run
+printed, per frame, `X error 8 on request 72.0` — `BadMatch` on `X_PutImage`.
+The `XImage` had the screen's default depth and Firefox's toplevel does not; the
+image now takes the window's depth from `XGetGeometry`. Same harness, the two
+builds differing in that one line: black below weston's panel (every channel's
+extrema 0,0) against Firefox's tab strip, URL bar and page, colours sampled as
+expected — judged by a separate visual-check agent, not by this author.
+
+This is very probably the "one frame, then nothing" of firefox-accel.md, "The
+Wayland WSI", §5 and §7 on devhost: a `BadMatch` per frame explains black,
+and since a0a48ec the first error also deadlocks. That is an inference about a
+run on another machine and is not re-measured there.
+
+#### 0.27.6 Then the device was lost: bytes published before they were written
+
+At 74 s of use (and ~85 s in an earlier run) `sv-gpu-server` ended the session
+with `ring 2 seqno 313693 FATAL: in a command blob: unknown command opcode 4096`;
+Zink reported DEVICE LOST and Mesa's device-lost path took Firefox down with a
+SIGSEGV in `zink_start_batch`.
+
+`RingTransport::record` advanced a blob's `len` under the blob lock and copied
+the command in after releasing it; its comment said the GPU side could not see
+the bytes until `publish_blob` named them. `publish_recorded_first` (§0.23)
+makes that false: it runs on whichever thread forwards an unrecorded command and
+flushes every open blob up to `len`, including one whose owner has reserved a
+range and not yet filled it. The copy now happens under the lock, so `len` only
+covers bytes that exist; and `grow_and_write` re-checks `in_flight` after
+re-taking the lock, because another thread can publish a newer piece of the
+block between the wait and the growth, and growing frees the block.
+
+`transport::blob_race` runs a real `RingTransport` on heap regions with three
+threads: one records 200 × 2,000 tagged commands, one forwards unrecorded
+packets as fast as it can, one plays the GPU side and checks every command of
+every piece. With the old ordering it failed **3 of 3** — the GPU side read the
+*previous* recording's commands, e.g. command buffer 4's bytes in command buffer
+5's piece. Now **5 of 5** pass.
+
+#### 0.27.7 The arena: 64 MiB is not enough for Firefox in use
+
+`sv-gpu-server serve` defaults to a 64 MiB arena per session, and `sv-icd`
+reserves an eighth of it, 8 MiB, for command blobs (`blob_reserve`). With every
+fix above, a 64 MiB run died at **57 s**: `vkEndCommandBuffer failed
+(VK_ERROR_OUT_OF_DEVICE_MEMORY)`, then the same device-lost path (one run before
+the race fix died the same way at ~85 s). At **256 MiB** — `sv-icd`'s own
+default and `sv-cts.sh`'s — the same tour ran 333 s. Whether 32 MiB of blob
+reserve is a working set or a leak that 5½ minutes did not reach is **not
+established**, and an exhausted reserve still costs the application its device,
+which is the wrong failure for a resource that is ours.
+
+#### 0.27.8 Five minutes of use, and what about:support says
+
+`scripts/sv-firefox-wayland.sh soak-x11 330`, `SVWL_ARENA=268435456`, debug
+build e4a479b: Marionette loads a tour of local pages (cards with CSS
+animation, a 2D canvas, a WebGL page that reads its own pixels back) and real
+sites (Wikipedia, MDN, example.com), wheel-scrolls each, asks the chrome for its
+compositor after every page, and reads about:support at the end.
+
+| | result |
+|---|---|
+| Firefox alive at the end | **yes, 333 s**; no core from any Firefox process |
+| page loads / wheel scrolls | 64 / 64; local pages and Wikipedia scrolled ~2,800 px |
+| GPU-side queue submissions per 30 s | 6,311 – 7,372 in every one of 10 windows |
+| `libsv_icd.so` in the parent | mapped at all 5 samples |
+| WebGL | `zink Vulkan 1.4(AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO) …)`, 317 frames in 3 s, read-back pixel `255,128,25` (the shader's orange) |
+| "Timed out waiting for animation frame" | 0 |
+| screenshots (one a minute) | UI and pages drawn, no artifacts (visual-check agent) |
+
+about:support, verbatim:
+
+```
+Compositing              WebRender
+WebGL 2 Driver Renderer  Mesa -- zink Vulkan 1.4(AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO) (Driver Unknown))
+Window Protocol          xwayland
+Device ID                zink Vulkan 1.4(AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO) (Driver Unknown))
+Driver Vendor            mesa/software-unknown
+WEBRENDER                default available / user force_enabled "Force enabled by pref" /
+                         env blocklisted FEATURE_FAILURE_SOFTWARE_GL
+```
+
+So: **hardware WebRender, on Zink, on the forwarded device — because the harness
+forces it.** Firefox's gfxInfo calls Zink `mesa/software-unknown` and blocklists
+WebRender and OpenGL compositing for it; `gfx.webrender.all=true` in the
+harness's profile is what overrides that. Without the pref Firefox would choose
+software WebRender on this driver. That is the next blocker on the Firefox side,
+and it is a classification, not a capability.
+
+The **Wayland** path is not this. `soak` (Wayland) also reports `Compositing:
+WebRender`, and the GPU side executed 617 commands in its first two seconds —
+two devices created, one destroyed, no queue submission — and nothing after;
+about:support's GPU and WebGL rows said llvmpipe. The `soak` verdict now fails
+on that, through the per-window submission count, because the compositing row
+cannot tell the two apart. `eglinfo` from the dev shell's Mesa on the same
+weston said `ZINK: failed to choose pdev` on the Wayland platform and Zink on
+surfaceless; which of those Firefox's Mesa 26.2.4 met is not established.
+
+#### 0.27.9 Gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2713 passed**, 0 failed, 8 ignored, 92 binaries (2704 before; the 9 new are `tests/stack.rs`'s 3, four table-is-sorted tests, the X handler test and `blob_race`) |
+| `cargo clippy --workspace --all-targets` | exit 0; the same 10 warnings in the same places before and after this work, none in a file it touched |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `tests/stack.rs`, against the old generator | 3 of 3 abort, stack overflow |
+| `blob_race`, against the old ordering | fails 3 of 3 |
+| `the_error_handler_answers_…`, against the old handler | fails at its 10 s timeout |
+| `sv-firefox-wayland.sh firefox 90`, debug, before | SIGSEGV in `lower_pnext` |
+| `sv-firefox-wayland.sh soak-x11 330`, 256 MiB | **PASS**, 333 s |
+| `sv-firefox-wayland.sh soak-x11 330`, 64 MiB | FAIL at 57 s, blob reserve exhausted (0.27.7) |
+| `cargo miri test -p sv-icd-entry --test lowering --test stack` | 13 + 3 passed, no undefined behaviour — after Miri caught a Stacked Borrows violation in the new test's own setup, not in the walker. `blob_race` was not run under Miri |
+| the Windows guest | **not run** — another agent owns it in this phase |
+
+#### 0.27.10 What is not proven
+
+- **The real topology.** Nothing here crossed a VM. The guest's Firefox goes
+  through `wc-proxy` and `wl_shm`, where Mesa will not use a Vulkan driver on
+  the Wayland platform at all (firefox-accel.md, "The Wayland WSI", §2) — the X11
+  path measured here is the one that topology has.
+- **The GPU side's own frames.** `sv_proto::dispatch` is 391,208 bytes and
+  `sv_proto::subdecode` 104,568 in a debug `sv-gpu-server`, on threads Rust
+  gives 2 MiB. Not a fault anywhere yet, and the same class.
+- **Firefox without `gfx.webrender.all`.** Expected to be software WebRender by
+  the blocklist row above; not run.
+- **The arena** (0.27.7): leak or working set.
+
+---
+
 ## 1. Vocabulary, and the invariant everything rests on
 
 - **GPU side** — the process holding the real Vulkan driver. On `testhost`
@@ -5127,7 +5401,7 @@ there are in §0.7.
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM, mapped by the other through QEMU's existing `memory-backend-memfd`. **Measured working end to end** (`measured-gpu-side.md`). No ivshmem, no new device, no unsigned driver. (fwd §2.2) *The compositor's arena, which no GPU imports, is an ivshmem device since `waycompose-design.md` §82; this row is about the Vulkan arena.* |
+| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM, mapped by the other through QEMU's existing `memory-backend-memfd`. **Measured working end to end** (`measured-gpu-side.md`). No ivshmem, no new device, no unsigned driver. (fwd §2.2) *The compositor's arena, which no GPU imports, is an ivshmem device since `waycompose-design.md` §83; this row is about the Vulkan arena.* |
 | D1a | How is it obtained inside the guest? | `VirtualAlloc(MEM_RESERVE\|MEM_COMMIT\|MEM_LARGE_PAGES)` — 2 MiB granularity, each large page physically contiguous and non-pageable. Needs `SeLockMemoryPrivilege` (R25). **Measured** (`measured-gpu-side.md`): 22 runs per 64 MiB, **1 run per GiB**, imported by the driver exactly like ordinary memory. **Fallback, measured:** 4 KiB `VirtualAlloc` + `VirtualLock`, no privilege, 1471 runs per 64 MiB. **AWE and `NONPAGED_LARGE` are measured and rejected** — §5.1. |
 | D2 | Fallback if neither path yields usable pages | **None is planned any more.** The attestation-signed pinning driver is dropped: R19 and R20 are retired, an ordinary pointer imports, AWE returns real frames, and locating costs ~2 s — none of which an EV certificate would improve. It survives as a theoretical last resort, not as a plan, and so does ivshmem. (§5.1; fwd §2.2 verdict table) |
 | D3 | How does the GPU side get `VkDeviceMemory`? | `VK_EXT_external_memory_host`, `HOST_ALLOCATION_BIT_EXT`, **measured present, alignment 4096** (`measured-gpu-side.md`). Behind a pluggable `SlabImport` trait so dma-buf can be substituted on a Linux/AMD GPU side. |
@@ -5746,7 +6020,7 @@ nobody implements. We keep it in the risk table and not in the design.
 
 *Note, 2026-10-15.* This paragraph is about **this** arena, the one a GPU driver
 imports, and it still holds. The compositor's arena in the same repository moved
-onto an `ivshmem-plain` device (`waycompose-design.md` §82). That arena is
+onto an `ivshmem-plain` device (`waycompose-design.md` §83). That arena is
 touched only by CPUs on both sides, so the mechanism objection never applied to
 it, and its new reason, root in the launcher's path, is one this design does
 not have.

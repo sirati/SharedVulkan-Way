@@ -34,19 +34,23 @@ pub struct App {
     /// primary selection, and the window this launcher opens is on a Windows
     /// desktop where a middle click does not.
     pub prefs: String,
-    /// What the application is told to do with its own title bar:
-    /// `MOZ_GTK_TITLEBAR_DECORATION`, by any other name.
+    /// What the application does with its own title bar: `tabs`, `none` or
+    /// `client`. See [`crate::plan::Titlebar`].
     ///
-    /// **`none` today, and that is a waypoint rather than the goal.** §22
-    /// established that one title bar takes two levers, and `none` is the one
-    /// that stops Firefox drawing a *second* bar under Windows'. The goal
-    /// `docs/goal-firefox.md` actually states is different and larger: Firefox's
-    /// tab strip drawn **inside** the native caption, which is
-    /// `DwmExtendFrameIntoClientArea` plus `WM_NCHITTEST` on the compositor's
-    /// side and `client` — not `none` — on this one. Neither lever works without
-    /// the other, and the compositor's half does not exist yet (§17.11 item 1),
-    /// so this is a key rather than a constant: when it does, the deployment
-    /// changes one line instead of a binary.
+    /// **`tabs` by default since §82**, which is the goal clause
+    /// `docs/goal-firefox.md` states: Firefox's tab strip drawn *inside*
+    /// Windows' caption, Windows' own minimise, maximise and close in its
+    /// corner. The compositor's half has existed since §31 and is now its
+    /// default (`auto` folds the caption of a client that asked to decorate
+    /// itself); this half is the three things only the client's machine can
+    /// be told — `MOZ_GTK_TITLEBAR_DECORATION=client`, preferences that turn
+    /// Firefox's own window buttons off, and a `userChrome.css` that reserves
+    /// the buttons' corner and fits the tab strip to the caption's height.
+    ///
+    /// `none` is the per-application opt-out: Windows' caption, the tab strip
+    /// under it — §22's arrangement, unchanged. Until §82 it was the only
+    /// value, because the comment here said the compositor's half "does not
+    /// exist yet"; it had existed for months.
     pub titlebar: String,
 }
 
@@ -82,7 +86,7 @@ pub struct Config {
     /// recover, which is why over-reserving is the more expensive mistake and
     /// why 768 MiB once reached a user.
     ///
-    /// IVSHMEM ARENA (§82): **read and validated, and decides nothing** on the
+    /// IVSHMEM ARENA (§83): **read and validated, and decides nothing** on the
     /// launcher's own path any more. The arena is BAR2 of an ivshmem device and
     /// has the size the VM host gave it. The key stays so an existing
     /// `wc-launch.ini` still parses, and because `outbound` is still checked
@@ -142,7 +146,7 @@ impl Config {
                         icon: id.to_string(),
                         exec: String::new(),
                         prefs: String::new(),
-                        titlebar: "none".into(),
+                        titlebar: "tabs".into(),
                     });
                 }
                 continue;
@@ -223,6 +227,16 @@ impl Config {
             if app.exec.trim().is_empty() {
                 return Err(format!("[app.{id}] exec is required"));
             }
+            // §82. A typo here would otherwise reach the VM host as an
+            // environment variable Firefox does not recognise, and Firefox
+            // answers an unknown value by decorating itself — a window that
+            // looks almost right, which is the worst kind.
+            if crate::plan::Titlebar::parse(&app.titlebar).is_none() {
+                return Err(format!(
+                    "[app.{id}] titlebar = {} is not one of tabs, none, client",
+                    app.titlebar
+                ));
+            }
         }
         Ok(())
     }
@@ -265,9 +279,10 @@ icon  = firefox
 exec  = firefox --profile ~/.wc-launch/firefox
 # A middle click on Windows does not paste, so it must not paste here either.
 prefs = middlemouse.paste=false
-# `none` stops Firefox drawing a second title bar under Windows'. `client` is
-# what tabs-in-the-caption will need, once the compositor extends the frame.
-titlebar = none
+# Firefox's tabs in Windows' caption, with Windows' own minimise, maximise and
+# close in its corner. `none` opts this application out: Windows' caption above,
+# the tab strip below. See docs/waycompose-design.md §82.
+titlebar = tabs
 "#;
 
 #[cfg(test)]
@@ -337,5 +352,24 @@ mod tests {
         let e = Config::parse("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\narena_mib=64\n")
             .unwrap_err();
         assert!(e.contains("arena_mib"), "{e}");
+    }
+
+    /// §82: Firefox's tabs in the caption unless a block says otherwise, and
+    /// the shipped example says so in as many words.
+    #[test]
+    fn titlebar_defaults_to_tabs_and_each_app_can_opt_out() {
+        let cfg = ok("[app.firefox]\nexec=/bin/firefox\n[app.other]\nexec=/bin/firefox\ntitlebar=none\n");
+        assert_eq!(cfg.app("firefox").unwrap().titlebar, "tabs");
+        assert_eq!(cfg.app("other").unwrap().titlebar, "none");
+        assert_eq!(Config::parse(EXAMPLE).unwrap().app("firefox").unwrap().titlebar, "tabs");
+    }
+
+    #[test]
+    fn a_titlebar_typo_is_refused_by_name() {
+        let e = Config::parse(
+            "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.x]\nexec=/bin/x\ntitlebar=tab\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("[app.x] titlebar = tab"), "{e}");
     }
 }

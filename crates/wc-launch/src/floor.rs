@@ -30,7 +30,7 @@
 //!
 //! # IVSHMEM ARENA: this is now a guest-RAM policy the launcher does not use
 //!
-//! docs/waycompose-design.md §82 moved the launcher onto BAR2 of an ivshmem device,
+//! docs/waycompose-design.md §83 moved the launcher onto BAR2 of an ivshmem device,
 //! whose size is set on the VM host, is not `VirtualLock`ed and is not charged
 //! against the guest's RAM. None of the asymmetry above applies to it. The
 //! policy and its evidence stay, because `[session] arena-mib` still defaults

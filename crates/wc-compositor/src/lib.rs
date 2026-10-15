@@ -137,7 +137,7 @@ struct Args {
     /// The arena to provide from **BAR2 of an ivshmem device**, as
     /// `(arena id, device index)`.
     ///
-    /// IVSHMEM ARENA, docs/waycompose-design.md §82. The region is a PCI BAR that QEMU
+    /// IVSHMEM ARENA, docs/waycompose-design.md §83. The region is a PCI BAR that QEMU
     /// backs with a file at a path on the VM host, so the host opens that path
     /// instead of locating guest RAM through QMP and QEMU's descriptor table —
     /// which on the deployment are root's. Nothing is committed, pinned,
@@ -1034,7 +1034,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // and reads the header this process writes once the outbound window
     // exists, below. The run id goes out on the same kind of line as guest
     // RAM's, because the launcher hands it to the host either way, and the
-    // host refuses a header that carries any other. §82.
+    // host refuses a header that carries any other. §83.
     if let Some((id, dev)) = args.ivshmem_arena {
         if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
             eprintln!("wc-compositor: arena {id} is named by both --arena-guest-ram and --arena-ivshmem");
@@ -1143,7 +1143,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         // serves, it merely refuses when it runs out.
         // IVSHMEM ARENA: a BAR is the size it was made, so there is nothing to
         // grow into and no channel to reserve. The proxy refuses `--arena-grow`
-        // on this transport for the same reason (§82).
+        // on this transport for the same reason (§83).
         if wc_handle::arena::is_ivshmem(id) {
             println!(
                 "wc-compositor: arena {id} is an ivshmem region of fixed size; no growth \

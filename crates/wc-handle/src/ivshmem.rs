@@ -1,6 +1,6 @@
 //! The header at the front of an **ivshmem** arena, and nothing else.
 //!
-//! IVSHMEM ARENA (docs/waycompose-design.md §82). The guest compositor maps BAR2 of a
+//! IVSHMEM ARENA (docs/waycompose-design.md §83). The guest compositor maps BAR2 of a
 //! QEMU `ivshmem-plain` device; the VM host maps the file QEMU backs that BAR
 //! with. Both are the same physical pages. What neither side has is any other
 //! way to tell the other what it put there, so the first page of the region is
