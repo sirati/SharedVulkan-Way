@@ -217,6 +217,10 @@ pub struct Driver {
     pub served: Vec<ServedFamily>,
     /// The served decode family, if any, by its (driver and application) index.
     pub decode_family: Option<u32>,
+    /// `VK_KHR_video_queue`'s device entry points, when decode is served: for
+    /// the one video command this side answers by hand,
+    /// `server::get_video_session_memory_requirements_khr`.
+    pub video_queue: Option<ash::khr::video_queue::Device>,
     pub props: vk::PhysicalDeviceProperties,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     /// What the loader on *this* side answers `vkEnumerateInstanceVersion` with,
@@ -364,6 +368,9 @@ impl Driver {
                 // by the loader rather than by the driver — so it is available
                 // whenever the instance enabled it, which `open` does.
                 let debug_utils = Some(ash::ext::debug_utils::Device::new(&instance, &device));
+                let video_queue = decode_family
+                    .is_some()
+                    .then(|| ash::khr::video_queue::Device::new(&instance, &device));
                 Ok(Driver {
                     entry,
                     instance,
@@ -373,6 +380,7 @@ impl Driver {
                     queue_family,
                     served,
                     decode_family,
+                    video_queue,
                     props,
                     mem_props,
                     instance_api_version,

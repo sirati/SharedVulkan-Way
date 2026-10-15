@@ -225,6 +225,49 @@ fn queue_family_video_links(
     ]
 }
 
+/// A driver `memoryTypeBits` for device-local-only memory, as docs/design.md
+/// §9.1's table numbers it: bit 0 — our `DEVICE_LOCAL` type, which
+/// `allocate_memory` backs with the driver's first `DEVICE_LOCAL` type — exactly
+/// when the driver's bits include that type, and nothing else.
+///
+/// Zero is a real answer and is reported rather than papered over: an
+/// application then finds no memory type and fails at allocation, which is the
+/// honest outcome for a resource whose memory this side cannot provide. It has
+/// not been seen on RADV or NVIDIA; it is said once on stderr if it is.
+fn app_memory_type_bits(driver: &Driver, driver_bits: u32, what: &'static str) -> u32 {
+    let ours = driver
+        .memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .map_or(0, |dl| u32::from(driver_bits & (1 << dl) != 0));
+    if ours == 0 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "sv-gpu-server: {what} wants driver memory types {driver_bits:#x}, none of \
+                 which is the DEVICE_LOCAL type this side allocates; reporting no type"
+            );
+        }
+    }
+    ours
+}
+
+/// An image's driver `memoryTypeBits` in §9.1's numbering.
+///
+/// Bit 0 as [`app_memory_type_bits`] gives it. Bits 1–3, the arena's three
+/// types, exactly when the driver's bits include the type the arena was
+/// actually allocated from — which is what binding an image there would mean.
+/// On RADV this reproduces almost exactly what the verbatim forward said (its
+/// type 0 is `DEVICE_LOCAL` and the arena is its type 2); what it changes is
+/// NVIDIA, whose type 0 has no flags.
+fn app_image_memory_type_bits(shared: &Shared, driver_bits: u32) -> u32 {
+    let dl = shared
+        .driver
+        .memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .map_or(0, |dl| u32::from(driver_bits & (1 << dl) != 0));
+    let arena = if driver_bits & (1 << shared.arena.memory_type) != 0 { 0b1110 } else { 0 };
+    dl | arena
+}
+
 /// `VK_SUCCESS`.
 const OK: p::VkResult = p::VkResult(0);
 
@@ -723,6 +766,175 @@ impl GpuHost for GpuServer {
         Ok(p::VkGetPhysicalDeviceQueueFamilyProperties2Reply {
             p_queue_family_property_count: Some(if want == 0 { n } else { n.min(want as u32) }),
             p_queue_family_properties: out,
+        })
+    }
+
+    /// Forwarded for the numbers, renumbered for the mask.
+    ///
+    /// `memoryTypeBits` comes back in the driver's numbering and is read by the
+    /// application against docs/design.md §9.1's table, so it is translated —
+    /// the same argument `sv_icd::icd::get_buffer_memory_requirements` makes for
+    /// buffers, made here because only this side knows which driver type our
+    /// type 0 is. See [`app_memory_type_bits`].
+    ///
+    /// **Session memory never goes in the arena**, and the mask says so: it is
+    /// memory only the video engine touches, which is docs/design.md §0.21.2's
+    /// decision 1 applied to the session as well as to the pictures.
+    fn get_video_session_memory_requirements_khr(
+        &mut self,
+        a: p::VkGetVideoSessionMemoryRequirementsKHRArgs,
+    ) -> WireResult<p::VkGetVideoSessionMemoryRequirementsKHRReply> {
+        let session = self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?;
+        let Some(vq) = self.shared.driver.video_queue.as_ref() else {
+            self.note_missing("vkGetVideoSessionMemoryRequirementsKHR");
+            let mut r = p::VkGetVideoSessionMemoryRequirementsKHRReply::default();
+            r.result = p::VkResult(vk::Result::ERROR_EXTENSION_NOT_PRESENT.as_raw());
+            return Ok(r);
+        };
+        let session = vk::VideoSessionKHR::from_raw(session);
+        let device = self.shared.driver.device.handle();
+        let fp = vq.fp().get_video_session_memory_requirements_khr;
+        let mut n = 0u32;
+        // SAFETY: a count query; the session handle is the driver's own, mapped
+        // above, and the device is the one it was created on.
+        let r = unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
+        let capacity = a.p_memory_requirements.len();
+        if r != vk::Result::SUCCESS || capacity == 0 {
+            return Ok(p::VkGetVideoSessionMemoryRequirementsKHRReply {
+                result: p::VkResult(r.as_raw()),
+                p_memory_requirements_count: Some(n),
+                p_memory_requirements: Vec::new(),
+            });
+        }
+        let mut got = vec![vk::VideoSessionMemoryRequirementsKHR::default(); capacity];
+        let mut m = capacity as u32;
+        // SAFETY: `got` holds `m` elements, each a valid output structure.
+        let r = unsafe { fp(device, session, &mut m, got.as_mut_ptr()) };
+        got.truncate(m as usize);
+        let out = got
+            .iter()
+            .map(|g| {
+                let mut w = p::VkVideoSessionMemoryRequirementsKHR::default();
+                w.memory_bind_index = g.memory_bind_index;
+                w.memory_requirements.size = g.memory_requirements.size;
+                w.memory_requirements.alignment = g.memory_requirements.alignment;
+                w.memory_requirements.memory_type_bits = app_memory_type_bits(
+                    &self.shared.driver,
+                    g.memory_requirements.memory_type_bits,
+                    "video session memory",
+                );
+                w
+            })
+            .collect();
+        Ok(p::VkGetVideoSessionMemoryRequirementsKHRReply {
+            result: p::VkResult(r.as_raw()),
+            p_memory_requirements_count: Some(m),
+            p_memory_requirements: out,
+        })
+    }
+
+    /// Forwarded for the numbers, renumbered for the mask, as above.
+    ///
+    /// Images had gone through verbatim since the first stage. That is right
+    /// only where the driver's numbering happens to agree with docs/design.md
+    /// §9.1's, which on RADV it nearly does (its type 0 is `DEVICE_LOCAL`) and
+    /// on NVIDIA it does not (its type 0 has no flags) — see
+    /// [`app_image_memory_type_bits`].
+    fn get_image_memory_requirements(
+        &mut self,
+        a: p::VkGetImageMemoryRequirementsArgs,
+    ) -> WireResult<p::VkGetImageMemoryRequirementsReply> {
+        let image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, a.image.0)?);
+        // SAFETY: the driver's own image, mapped above, on the device it was
+        // created on.
+        let r = unsafe { self.d().get_image_memory_requirements(image) };
+        let mut w = p::VkMemoryRequirements::default();
+        w.size = r.size;
+        w.alignment = r.alignment;
+        w.memory_type_bits = app_image_memory_type_bits(&self.shared, r.memory_type_bits);
+        Ok(p::VkGetImageMemoryRequirementsReply { p_memory_requirements: Some(Box::new(w)) })
+    }
+
+    /// The `2` form: the generated path — it carries `VkImagePlaneMemoryRequirementsInfo`
+    /// in and `VkMemoryDedicatedRequirements` out — with the mask renumbered on
+    /// the way back.
+    fn get_image_memory_requirements2(
+        &mut self,
+        a: p::VkGetImageMemoryRequirements2Args,
+    ) -> WireResult<p::VkGetImageMemoryRequirements2Reply> {
+        let mut a = a;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            if let Some(inner) = &mut a.p_info {
+                p::handle_map_vk_image_memory_requirements_info2(inner, m)?;
+            }
+        }
+        let Some(f) = self.fns().vk_get_image_memory_requirements2 else {
+            self.note_missing("vkGetImageMemoryRequirements2");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkImageMemoryRequirementsInfo2 = match &a.p_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_image_memory_requirements_info2(x, &mut pool)?;
+                pool.one(v)
+            }
+            None => std::ptr::null(),
+        };
+        let mut out = match &a.p_memory_requirements {
+            Some(v) => sv_gpu_entry::raise_vk_memory_requirements2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: `info` and the chain of `out` are owned by `pool`, which
+        // outlives the call; the device is the driver's own.
+        unsafe { f(self.d().handle().as_raw() as usize as _, info, &mut out) };
+        // SAFETY: `out` was just written by the driver and its chain is `pool`'s.
+        let mut reply = unsafe { sv_gpu_entry::lower_full_vk_memory_requirements2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        let bits = &mut reply.memory_requirements.memory_type_bits;
+        *bits = app_image_memory_type_bits(&self.shared, *bits);
+        Ok(p::VkGetImageMemoryRequirements2Reply { p_memory_requirements: Some(Box::new(reply)) })
+    }
+
+    /// As the `2` form, for an image that does not exist yet.
+    fn get_device_image_memory_requirements(
+        &mut self,
+        a: p::VkGetDeviceImageMemoryRequirementsArgs,
+    ) -> WireResult<p::VkGetDeviceImageMemoryRequirementsReply> {
+        let mut a = a;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            if let Some(inner) = &mut a.p_info {
+                p::handle_map_vk_device_image_memory_requirements(inner, m)?;
+            }
+        }
+        let Some(f) = self.fns().vk_get_device_image_memory_requirements else {
+            self.note_missing("vkGetDeviceImageMemoryRequirements");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkDeviceImageMemoryRequirements = match &a.p_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_device_image_memory_requirements(x, &mut pool)?;
+                pool.one(v)
+            }
+            None => std::ptr::null(),
+        };
+        let mut out = match &a.p_memory_requirements {
+            Some(v) => sv_gpu_entry::raise_vk_memory_requirements2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: as `get_image_memory_requirements2`.
+        unsafe { f(self.d().handle().as_raw() as usize as _, info, &mut out) };
+        // SAFETY: as `get_image_memory_requirements2`.
+        let mut reply = unsafe { sv_gpu_entry::lower_full_vk_memory_requirements2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        let bits = &mut reply.memory_requirements.memory_type_bits;
+        *bits = app_image_memory_type_bits(&self.shared, *bits);
+        Ok(p::VkGetDeviceImageMemoryRequirementsReply {
+            p_memory_requirements: Some(Box::new(reply)),
         })
     }
 

@@ -710,6 +710,27 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "a GPU side has one queue on one family; the driver's table is not ours to pass on",
     ),
     ("vkGetPhysicalDeviceQueueFamilyProperties2", "as vkGetPhysicalDeviceQueueFamilyProperties"),
+    // The memory table again, met from the other end (docs/video-decode.md §7).
+    // The driver answers `memoryTypeBits` in *its* numbering, and an application
+    // reads it against docs/design.md §9.1's four types. Session memory is
+    // device-local by every driver measured, and this side allocates §9.1's
+    // type 0 as the driver's first `DEVICE_LOCAL` type — so the honest answer is
+    // bit 0 exactly when the driver's bits include that type. Forwarded
+    // verbatim, NVIDIA's session memory (driver type 1, `DEVICE_LOCAL`) would
+    // read as our type 1, which is the arena.
+    (
+        "vkGetVideoSessionMemoryRequirementsKHR",
+        "memoryTypeBits is in the driver's numbering and §9.1's table is ours",
+    ),
+    // And the same for images, which had been forwarded verbatim since the
+    // first stage and were right only where the driver's numbering happens to
+    // agree with ours. On RADV it nearly does — its type 0 is `DEVICE_LOCAL`, so
+    // an optimal image's bit 0 lands on our type 0. On NVIDIA it does not: the
+    // driver's type 0 has no flags and type 1 is `DEVICE_LOCAL`, so a DPB whose
+    // bits are the driver's `0x2` reads as our type 1 — the arena.
+    ("vkGetImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
+    ("vkGetImageMemoryRequirements2", "as vkGetVideoSessionMemoryRequirementsKHR"),
+    ("vkGetDeviceImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
     // --- 5. a handle the registry does not type as one --------------------
     //
     // `VkDebugUtilsObjectNameInfoEXT::objectHandle` is a `uint64_t` carrying
