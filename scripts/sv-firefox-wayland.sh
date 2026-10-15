@@ -24,7 +24,20 @@ set -uo pipefail
 MODE=${1:-firefox}
 SECS=${2:-60}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BIN=$ROOT/target/release
+# Which build. `target/debug` is what every deployment script ships (wc-guest.sh,
+# wc-firefox.sh), and the two profiles do not have the same stack frames: the
+# Firefox crash series of §0.24 is a debug-build fault (§0.27).
+BIN=${SVWL_BIN:-$ROOT/target/release}
+# The GPU side on **one named device**. Unpinned, the loader offers every ICD on
+# the machine, and on this workstation that includes the leased NVIDIA card
+# other people's jobs run on. RADV here is the AMD iGPU (renderD129). The dev
+# shell's Mesa rather than /run/opengl-driver's: the system RADV is linked
+# against a newer glibc than the one `sv-gpu-server` is built with, and the
+# loader refuses it with ERROR_INCOMPATIBLE_DRIVER.
+GPU_ICD=${SVWL_GPU_ICD:-${SV_MESA:-/run/opengl-driver}/share/vulkan/icd.d/radeon_icd.x86_64.json}
+# Mesa's EGL only, for the same reason: glvnd would otherwise load NVIDIA's
+# vendor library first and open the leased card from Firefox itself.
+export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json}
 RUN=$(mktemp -d /tmp/svwl-XXXXXX)
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
@@ -70,7 +83,7 @@ for _ in $(seq 1 40); do [ -S "$RUN/xdg/svwl" ] && break; sleep 0.5; done
 
 # --------------------------------------------------------------- GPU side ---
 say "sv-gpu-server on this machine's RADV"
-"$BIN/sv-gpu-server" serve --clients 16 --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 for _ in $(seq 1 40); do [ -S "$RUN/gpu.sock" ] && break; sleep 0.5; done
