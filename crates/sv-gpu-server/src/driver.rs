@@ -117,6 +117,164 @@ pub const DECODE_CODEC_EXTENSIONS: &[(&str, vk::VideoCodecOperationFlagsKHR)] = 
     ("VK_KHR_video_decode_vp9", vk::VideoCodecOperationFlagsKHR::from_raw(0x0000_0008)),
 ];
 
+/// What a driver answers for one decode codec's basic profile: 4:2:0, 8-bit,
+/// H.264 High progressive, H.265 Main, AV1 Main without film grain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecAnswer {
+    /// `vkGetPhysicalDeviceVideoCapabilitiesKHR` failed with this `VkResult`.
+    Refused(i32),
+    /// It answered: `VkVideoDecodeCapabilitiesKHR::flags` and `maxDpbSlots`.
+    Caps { decode_flags: u32, max_dpb_slots: u32 },
+    /// Not asked: this side has no profile struct for the codec (VP9).
+    NotAsked,
+}
+
+impl std::fmt::Display for CodecAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodecAnswer::Refused(r) => write!(f, "capabilities: VkResult {r}"),
+            CodecAnswer::Caps { decode_flags, max_dpb_slots } => {
+                write!(f, "decode flags {decode_flags:#x}, {max_dpb_slots} DPB slots")
+            }
+            CodecAnswer::NotAsked => write!(f, "not asked"),
+        }
+    }
+}
+
+/// The decode codecs whose structures `crate::video_stable` keeps at stable
+/// addresses.
+pub const STABLE_DECODE_CODECS: &[&str] =
+    &["VK_KHR_video_decode_h264", "VK_KHR_video_decode_h265", "VK_KHR_video_decode_av1"];
+
+/// AV1's eight reference frames and the picture being decoded.
+pub const AV1_DPB_SLOTS_NEEDED: u32 = 9;
+
+/// Which of the driver's decode codec extensions to withhold, and why: the
+/// pure rules, from the driver's answers (docs/video-decode.md §7.12).
+///
+/// On every driver:
+/// - a codec whose basic profile the driver refuses;
+/// - a codec whose decode capabilities name neither
+///   `DPB_AND_OUTPUT_COINCIDE` nor `DISTINCT`, which the specification forbids
+///   and on which ffmpeg refuses to open a decoder;
+/// - AV1 with fewer than [`AV1_DPB_SLOTS_NEEDED`] DPB slots. A real stream
+///   keeps eight distinct reference pictures and decodes a ninth, and ffmpeg
+///   then uses slot index 8 whatever the driver said. Intel 101.7076 reports 8.
+///
+/// On a driver that needs the decode structures at stable addresses
+/// (`needs_stable`, Intel's Windows driver), also every codec
+/// [`STABLE_DECODE_CODECS`] does not name. `h264_only`
+/// (`SV_VIDEO_H264_ONLY=1`) withholds all but H.264 on any driver, for testing
+/// the fallback.
+pub fn withheld_decode_codecs(
+    answers: &[(&str, CodecAnswer)],
+    needs_stable: bool,
+    h264_only: bool,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, answer) in answers {
+        let why = if h264_only && *name != "VK_KHR_video_decode_h264" {
+            Some("SV_VIDEO_H264_ONLY=1".to_string())
+        } else if needs_stable && !STABLE_DECODE_CODECS.contains(name) {
+            Some(
+                "this driver keeps pointers from earlier decode calls, and the GPU side keeps no stable \
+                 structures for this codec"
+                    .to_string(),
+            )
+        } else {
+            match *answer {
+                CodecAnswer::Refused(r) => Some(format!("the driver refuses its basic profile (VkResult {r})")),
+                CodecAnswer::Caps { decode_flags, .. } if decode_flags & 0x3 == 0 => Some(format!(
+                    "its decode flags {decode_flags:#x} name neither DPB_AND_OUTPUT_COINCIDE nor DISTINCT"
+                )),
+                CodecAnswer::Caps { max_dpb_slots, .. }
+                    if *name == "VK_KHR_video_decode_av1" && max_dpb_slots < AV1_DPB_SLOTS_NEEDED =>
+                {
+                    Some(format!(
+                        "{max_dpb_slots} DPB slots, and AV1 needs {AV1_DPB_SLOTS_NEEDED} (8 references and the \
+                         picture being decoded)"
+                    ))
+                }
+                _ => None,
+            }
+        };
+        if let Some(why) = why {
+            out.push((name.to_string(), why));
+        }
+    }
+    out
+}
+
+/// Ask the driver about one codec's basic decode profile.
+///
+/// Every structure the driver writes has guard room behind it: Intel's
+/// Windows driver writes four bytes past `VkVideoDecodeCapabilitiesKHR`
+/// (waycompose-design.md §87).
+///
+/// # Safety
+/// `pd` is a physical device of `instance`, which has `VK_KHR_video_queue`.
+unsafe fn codec_answer(entry: &ash::Entry, instance: &ash::Instance, pd: vk::PhysicalDevice, ext: &str) -> CodecAnswer {
+    #[repr(C, align(16))]
+    struct Room<T> {
+        v: T,
+        _guard: [u8; 64],
+    }
+    #[repr(C, align(16))]
+    struct Raw([u8; 256]);
+    let mut h264 = vk::VideoDecodeH264ProfileInfoKHR::default()
+        .std_profile_idc(vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH)
+        .picture_layout(vk::VideoDecodeH264PictureLayoutFlagsKHR::PROGRESSIVE);
+    let mut h265 = vk::VideoDecodeH265ProfileInfoKHR::default()
+        .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN);
+    let mut av1 = vk::VideoDecodeAV1ProfileInfoKHR::default()
+        .std_profile(vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN)
+        .film_grain_support(false);
+    let (op, codec_profile, caps_type): (_, *const std::ffi::c_void, vk::StructureType) = match ext {
+        "VK_KHR_video_decode_h264" => (
+            vk::VideoCodecOperationFlagsKHR::DECODE_H264,
+            (&raw mut h264).cast(),
+            vk::StructureType::VIDEO_DECODE_H264_CAPABILITIES_KHR,
+        ),
+        "VK_KHR_video_decode_h265" => (
+            vk::VideoCodecOperationFlagsKHR::DECODE_H265,
+            (&raw mut h265).cast(),
+            vk::StructureType::VIDEO_DECODE_H265_CAPABILITIES_KHR,
+        ),
+        "VK_KHR_video_decode_av1" => (
+            vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
+            (&raw mut av1).cast(),
+            vk::StructureType::VIDEO_DECODE_AV1_CAPABILITIES_KHR,
+        ),
+        _ => return CodecAnswer::NotAsked,
+    };
+    let mut profile = vk::VideoProfileInfoKHR::default()
+        .video_codec_operation(op)
+        .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+        .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+        .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
+    profile.p_next = codec_profile;
+    // The codec's capabilities struct, as raw bytes with its header written:
+    // each is `sType`, `pNext`, then fields the driver fills.
+    let mut codec = Box::new(Raw([0; 256]));
+    // SAFETY: the buffer is 16-aligned and larger than any of the three.
+    unsafe {
+        let head = codec.0.as_mut_ptr() as *mut vk::BaseOutStructure<'static>;
+        (*head).s_type = caps_type;
+        (*head).p_next = std::ptr::null_mut();
+    }
+    let mut decode = Box::new(Room { v: vk::VideoDecodeCapabilitiesKHR::default(), _guard: [0; 64] });
+    decode.v.p_next = codec.0.as_mut_ptr().cast();
+    let mut caps = Box::new(Room { v: vk::VideoCapabilitiesKHR::default(), _guard: [0; 64] });
+    caps.v.p_next = (&raw mut decode.v).cast();
+    let vq = ash::khr::video_queue::Instance::new(entry, instance);
+    // SAFETY: every structure is live, chained and has room behind it.
+    let r = unsafe { (vq.fp().get_physical_device_video_capabilities_khr)(pd, &profile, &mut caps.v) };
+    if r != vk::Result::SUCCESS {
+        return CodecAnswer::Refused(r.as_raw());
+    }
+    CodecAnswer::Caps { decode_flags: decode.v.flags.as_raw(), max_dpb_slots: caps.v.max_dpb_slots }
+}
+
 /// Which families to serve, from the driver's family table: the pure decision,
 /// separated from the Vulkan calls so that it can be tested.
 ///
@@ -602,36 +760,39 @@ impl Driver {
         if minor >= 2 {
             owned.retain(|c| c.as_c_str() != c"VK_EXT_buffer_device_address");
         }
-        // Intel's Windows driver follows pointers from earlier decode calls, and
-        // `crate::video_stable` keeps only H.264's structures at stable
-        // addresses (docs/video-decode.md §7.11.5). The other decode codecs are
-        // withheld there, extension and all: Firefox decides what it can decode
-        // in hardware from the extension list, so masking the family's codec
-        // bits alone left it offering AV1 and H.265 in hardware.
-        // `SV_VIDEO_H264_ONLY=1` does the same on any driver, for testing the
-        // fallback.
-        let withheld: Vec<String> = if decode_wanted
-            && (crate::set_layout::refuses_push_binding_flags(
-                dev_props.vendor_id,
-                driver_id(instance, pd, dev_props.api_version),
-            ) || std::env::var("SV_VIDEO_H264_ONLY").is_ok_and(|v| v == "1"))
-        {
-            let gone: Vec<String> = DECODE_CODEC_EXTENSIONS
+        // Which decode codecs to serve (docs/video-decode.md §7.11.5, §7.12).
+        // Firefox decides what it can decode in hardware from the extension
+        // list, so a codec is withheld extension and all: masking the
+        // family's codec bits alone left it offering AV1 and H.265 in
+        // hardware. The rules are `withheld_decode_codecs`'; the answers they
+        // read are the driver's own, asked once here.
+        let withheld: Vec<String> = if decode_wanted {
+            let present: Vec<&str> = DECODE_CODEC_EXTENSIONS
                 .iter()
                 .map(|(n, _)| *n)
-                .filter(|n| *n != "VK_KHR_video_decode_h264")
                 .filter(|n| owned.iter().any(|o| o.to_bytes() == n.as_bytes()))
-                .map(str::to_string)
                 .collect();
-            if !gone.is_empty() {
-                eprintln!(
-                    "sv-gpu-server: video decode served for H.264 only on this driver; withheld: {} \
-                     (docs/video-decode.md §7.11.5)",
-                    gone.join(", ")
-                );
-                owned.retain(|c| !gone.iter().any(|g| c.to_bytes() == g.as_bytes()));
+            // SAFETY: `pd` is this instance's device, and `has_video` said it has
+            // `VK_KHR_video_queue` (`decode_wanted` implies it).
+            let answers: Vec<(&str, CodecAnswer)> =
+                present.iter().map(|n| (*n, unsafe { codec_answer(entry, instance, pd, n) })).collect();
+            let needs_stable = crate::set_layout::refuses_push_binding_flags(
+                dev_props.vendor_id,
+                driver_id(instance, pd, dev_props.api_version),
+            );
+            let h264_only = std::env::var("SV_VIDEO_H264_ONLY").is_ok_and(|v| v == "1");
+            let gone = withheld_decode_codecs(&answers, needs_stable, h264_only);
+            let served: Vec<String> = answers
+                .iter()
+                .filter(|(n, _)| !gone.iter().any(|(g, _)| g == n))
+                .map(|(n, a)| format!("{n} ({a})"))
+                .collect();
+            eprintln!("sv-gpu-server: video decode served for: {} (docs/video-decode.md §7.12)", served.join(", "));
+            for (n, why) in &gone {
+                eprintln!("sv-gpu-server: video decode withheld: {n}: {why}");
             }
-            gone
+            owned.retain(|c| !gone.iter().any(|(g, _)| c.to_bytes() == g.as_bytes()));
+            gone.into_iter().map(|(n, _)| n).collect()
         } else {
             Vec::new()
         };
@@ -841,6 +1002,67 @@ impl Drop for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const H264: &str = "VK_KHR_video_decode_h264";
+    const H265: &str = "VK_KHR_video_decode_h265";
+    const AV1: &str = "VK_KHR_video_decode_av1";
+    const VP9: &str = "VK_KHR_video_decode_vp9";
+
+    fn names(w: &[(String, String)]) -> Vec<&str> {
+        w.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// The guest's Intel 101.7076, as docs/video-decode.md §1 and §7.11.2
+    /// measured it: H.264 COINCIDE with 16 slots, H.265 15 slots, AV1 8 slots,
+    /// no VP9. AV1 goes for its slots; H.264 and H.265 are served.
+    #[test]
+    fn intel_101_7076_is_served_h264_and_h265() {
+        let answers = [
+            (H264, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 16 }),
+            (H265, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 15 }),
+            (AV1, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 8 }),
+        ];
+        let w = withheld_decode_codecs(&answers, true, false);
+        assert_eq!(names(&w), [AV1]);
+        assert!(w[0].1.contains("8 DPB slots"), "{}", w[0].1);
+    }
+
+    /// §1's survey read H.265's decode flags as 0x1100: neither output mode,
+    /// which the specification forbids and ffmpeg refuses. If the driver
+    /// answers that, H.265 is withheld rather than offered and then refused
+    /// mid-init.
+    #[test]
+    fn decode_flags_naming_no_output_mode_withhold_the_codec() {
+        let answers = [
+            (H264, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 16 }),
+            (H265, CodecAnswer::Caps { decode_flags: 0x1100, max_dpb_slots: 15 }),
+        ];
+        assert_eq!(names(&withheld_decode_codecs(&answers, true, false)), [H265]);
+    }
+
+    /// RADV and NVIDIA: every codec answers well, nothing is withheld; on a
+    /// driver that needs stable structures VP9 is, as nothing keeps its.
+    #[test]
+    fn a_good_driver_keeps_every_codec_and_vp9_needs_stable_structures() {
+        let answers = [
+            (H264, CodecAnswer::Caps { decode_flags: 0x2, max_dpb_slots: 17 }),
+            (H265, CodecAnswer::Caps { decode_flags: 0x2, max_dpb_slots: 17 }),
+            (AV1, CodecAnswer::Caps { decode_flags: 0x2, max_dpb_slots: 9 }),
+            (VP9, CodecAnswer::NotAsked),
+        ];
+        assert!(withheld_decode_codecs(&answers, false, false).is_empty());
+        assert_eq!(names(&withheld_decode_codecs(&answers, true, false)), [VP9]);
+        assert_eq!(names(&withheld_decode_codecs(&answers, false, true)), [H265, AV1, VP9]);
+    }
+
+    /// A refused basic profile withholds the codec.
+    #[test]
+    fn a_refused_profile_withholds_the_codec() {
+        let answers = [(AV1, CodecAnswer::Refused(-1_000_023_004))];
+        let w = withheld_decode_codecs(&answers, false, false);
+        assert_eq!(names(&w), [AV1]);
+        assert!(w[0].1.contains("-1000023004"));
+    }
     use vk::QueueFlags as Q;
     use vk::VideoCodecOperationFlagsKHR as Op;
 

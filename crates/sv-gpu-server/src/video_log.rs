@@ -79,6 +79,13 @@ pub fn enabled() -> bool {
     sink().is_some()
 }
 
+/// One line from elsewhere in the GPU side, if the log is on: a refusal of the
+/// slot guard (`crate::video_stable`), which never reaches the driver and so
+/// has no observed call of its own.
+pub fn note(line: &str) {
+    emit(&format!("!! {line}"));
+}
+
 fn emit(line: &str) {
     let Some(s) = sink() else { return };
     let t = s.start.elapsed().as_secs_f64();
@@ -953,6 +960,9 @@ unsafe fn decode(shared: &Shared, cb: u64, info: u64) {
         }
     } else if d.p_next.is_null() {
         findings.push("no codec picture info in pNext".into());
+    } else {
+        // SAFETY: the decode info's own chain; each link's `sType` says what it is.
+        unsafe { other_codec_text(d.p_next, &mut codec, &mut findings) };
     }
     if let Some(sess) = &sess
         && refs.len() as u32 > sess.max_refs
@@ -972,6 +982,66 @@ unsafe fn decode(shared: &Shared, cb: u64, info: u64) {
         last.clone_from(&line);
     }
     emit(&line);
+}
+
+/// An H.265 or AV1 picture info, in a few words (docs/video-decode.md §7.12):
+/// the parameter-set ids and picture order count, or the frame type, order
+/// hint, refresh flags, tiles and film grain.
+///
+/// # Safety
+/// `chain` is a live decode info's `pNext`.
+unsafe fn other_codec_text(chain: *const std::ffi::c_void, codec: &mut String, findings: &mut Vec<String>) {
+    // SAFETY (all): links of a live chain, read by the type their `sType` names.
+    let l = unsafe { find_link(chain, vk::StructureType::VIDEO_DECODE_H265_PICTURE_INFO_KHR) };
+    if !l.is_null() {
+        let h = unsafe { &*(l as *const vk::VideoDecodeH265PictureInfoKHR<'static>) };
+        match unsafe { h.p_std_picture_info.as_ref() } {
+            None => findings.push("H.265 picture info has a null pStdPictureInfo".into()),
+            Some(p) => {
+                let _ = write!(
+                    codec,
+                    " h265 vps{} sps{} pps{} poc {} irap {} idr {} ref {}",
+                    p.sps_video_parameter_set_id,
+                    p.pps_seq_parameter_set_id,
+                    p.pps_pic_parameter_set_id,
+                    p.PicOrderCntVal,
+                    p.flags.IrapPicFlag(),
+                    p.flags.IdrPicFlag(),
+                    p.flags.IsReference(),
+                );
+            }
+        }
+        let _ = write!(codec, " segments {}", h.slice_segment_count);
+        if h.slice_segment_count > 0 && h.p_slice_segment_offsets.is_null() {
+            findings.push(format!("sliceSegmentCount {} with a null pSliceSegmentOffsets", h.slice_segment_count));
+        }
+        return;
+    }
+    let l = unsafe { find_link(chain, vk::StructureType::VIDEO_DECODE_AV1_PICTURE_INFO_KHR) };
+    if !l.is_null() {
+        let h = unsafe { &*(l as *const vk::VideoDecodeAV1PictureInfoKHR<'static>) };
+        match unsafe { h.p_std_picture_info.as_ref() } {
+            None => findings.push("AV1 picture info has a null pStdPictureInfo".into()),
+            Some(p) => {
+                let _ = write!(
+                    codec,
+                    " av1 type {} order_hint {} refresh {:#04x} names {:?} grain {}",
+                    p.frame_type,
+                    p.OrderHint,
+                    p.refresh_frame_flags,
+                    h.reference_name_slot_indices,
+                    p.flags.apply_grain(),
+                );
+                if p.pTileInfo.is_null() {
+                    findings.push("AV1 std picture info has a null pTileInfo".into());
+                }
+            }
+        }
+        let _ = write!(codec, " tiles {}", h.tile_count);
+        if h.tile_count > 0 && (h.p_tile_offsets.is_null() || h.p_tile_sizes.is_null()) {
+            findings.push(format!("tileCount {} with a null pTileOffsets or pTileSizes", h.tile_count));
+        }
+    }
 }
 
 /// The last decode line, kept apart from [`State`] so that the fault handler

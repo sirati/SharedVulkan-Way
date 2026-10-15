@@ -185,6 +185,7 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
         video_stable: Default::default(),
+        poisoned: Default::default(),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -468,6 +469,7 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
         video_stable: Default::default(),
+        poisoned: Default::default(),
     });
     let handled = session::serve(
         control,
@@ -770,6 +772,7 @@ fn ivshmem_session(
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
         video_stable: Default::default(),
+        poisoned: Default::default(),
     });
     let served = sess::serve(
         Arc::clone(&control),
@@ -1089,6 +1092,7 @@ fn serve(
             queue_lock: Arc::clone(&queue_lock),
             pool_lock: Arc::clone(&pool_lock),
             video_stable: Default::default(),
+            poisoned: Default::default(),
         });
         let control = Arc::new(control);
         let slot_count = geometry.ring_slot_count;
@@ -1225,6 +1229,7 @@ fn attach(
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
         video_stable: Default::default(),
+        poisoned: Default::default(),
     });
     let handled = session::serve(
         Arc::new(control),
@@ -1420,6 +1425,7 @@ fn guest(
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
         video_stable: Default::default(),
+        poisoned: Default::default(),
     });
     let handled = session::serve(
         control,

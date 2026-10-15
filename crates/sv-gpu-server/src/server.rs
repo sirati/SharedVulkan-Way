@@ -105,6 +105,62 @@ pub struct Shared {
     /// Video decode structures at session-lifetime addresses
     /// (`crate::video_stable`, docs/video-decode.md §7.11.5).
     pub video_stable: Mutex<crate::video_stable::Stores>,
+    /// Command buffers whose recording failed, and what broke each, for every
+    /// ring of the session ([`Poisoned`]).
+    pub poisoned: Poisoned,
+}
+
+/// Command buffers whose recording failed, and what broke each (docs/design.md
+/// §0.24).
+///
+/// Keyed on the **driver's** handle rather than the wire object id, because
+/// the generated dispatch maps handles before it looks an entry point up, so
+/// that is what both the poisoning site and `vkQueueSubmit` are holding.
+///
+/// **Per session, not per ring** (docs/video-decode.md §7.12). A command
+/// buffer is recorded on the device ring and submitted on the queue ring, so a
+/// mark kept by the ring that recorded it was never seen by the submit: the
+/// slot guard's first local run refused a decode, `vkEndCommandBuffer` failed
+/// as it should, and the submit still reached RADV with the buffer unended
+/// (`VUID-vkQueueSubmit2-commandBuffer-03874`).
+///
+/// A map and not a set, so the refusal can name the command that broke
+/// recording rather than only the fact that something did. Empty in every run
+/// where the driver has every entry point the profile carries and no video
+/// command is refused, which is the common case: the submit path then costs
+/// one atomic load.
+#[derive(Default)]
+pub struct Poisoned {
+    marks: Mutex<std::collections::HashMap<u64, &'static str>>,
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl Poisoned {
+    fn marks(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, &'static str>> {
+        self.marks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn insert(&self, command_buffer: u64, why: &'static str) {
+        let mut m = self.marks();
+        m.insert(command_buffer, why);
+        self.count.store(m.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn remove(&self, command_buffer: u64) {
+        if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut m = self.marks();
+        m.remove(&command_buffer);
+        self.count.store(m.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn get(&self, command_buffer: u64) -> Option<&'static str> {
+        if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return None;
+        }
+        self.marks().get(&command_buffer).copied()
+    }
 }
 
 impl Shared {
@@ -122,17 +178,6 @@ pub struct GpuServer {
     /// The last table failure, so the ring can put a real diagnosis in
     /// `fatal_msg` instead of "unknown command 12".
     pub last_error: Option<String>,
-    /// Command buffers whose recording failed, and what broke each.
-    ///
-    /// Keyed on the **driver's** handle rather than the wire object id, because
-    /// the generated dispatch maps handles before it looks an entry point up,
-    /// so that is what both the poisoning site and `vkQueueSubmit` are holding.
-    ///
-    /// A map and not a set, so the refusal can name the command that broke
-    /// recording rather than only the fact that something did. Empty in every
-    /// run where the driver has every entry point the profile carries, which is
-    /// the common case — this costs one `is_empty` on the submit path.
-    poisoned: std::collections::HashMap<u64, &'static str>,
     /// Set by the handle-mapping pass when the command currently being
     /// dispatched named a poisoned command buffer; taken by the generated
     /// dispatch just after. Per-dispatch, which is why it is taken rather than
@@ -146,17 +191,79 @@ pub struct GpuServer {
 
 /// `SV_VIDEO_RETAIN`: how many video commands' raise pools a ring keeps; 0,
 /// the default, keeps none.
+/// The generated commands `crate::video_stable` is told about after each
+/// driver call, whether or not `SV_VIDEO_LOG` is on: the sessions' limits for
+/// the slot guard, and which session each parameters call's raise pool
+/// belongs to (docs/video-decode.md §7.12).
+const STABLE_OBSERVED: &[&str] = &[
+    "vkCreateVideoSessionKHR",
+    "vkDestroyVideoSessionKHR",
+    "vkCreateVideoSessionParametersKHR",
+    "vkUpdateVideoSessionParametersKHR",
+    "vkDestroyVideoSessionParametersKHR",
+];
+
+/// One of [`STABLE_OBSERVED`] returned `result`.
+///
+/// # Safety
+/// `args` are the call's C arguments as the driver received them
+/// (`GpuHost::observe`'s contract): for each command, the device, then its
+/// own parameters in order, the allocator as 0.
+unsafe fn stable_observe(shared: &Shared, command: &'static str, args: &[u64], result: i32) {
+    let a = |i: usize| args.get(i).copied().unwrap_or(0);
+    let mut st = shared.video_stable.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY (each arm): the pointers are the call's own, valid for its
+    // duration, and the output is written once the call returned success.
+    match command {
+        "vkCreateVideoSessionKHR" if result == 0 => unsafe {
+            let ci = a(1) as *const sv_gpu_entry::VkVideoSessionCreateInfoKHR;
+            let out = a(3) as *const u64;
+            if let (Some(ci), false) = (ci.as_ref(), out.is_null()) {
+                st.session_created(*out, ci.max_dpb_slots, ci.max_active_reference_pictures);
+            }
+        },
+        "vkDestroyVideoSessionKHR" => st.session_destroyed(a(1)),
+        "vkCreateVideoSessionParametersKHR" => unsafe {
+            let ci = a(1) as *const sv_gpu_entry::VkVideoSessionParametersCreateInfoKHR;
+            let out = a(3) as *const u64;
+            let params = if result == 0 && !out.is_null() { *out } else { 0 };
+            if let Some(ci) = ci.as_ref() {
+                st.params_created(params, ci.video_session as u64);
+            }
+        },
+        "vkUpdateVideoSessionParametersKHR" => st.params_updated(a(1)),
+        "vkDestroyVideoSessionParametersKHR" => st.params_destroyed(a(1)),
+        _ => {}
+    }
+}
+
 fn video_retain_limit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("SV_VIDEO_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 impl GpuServer {
+    /// The slot guard of `crate::video_stable` refused a video command: it is
+    /// not recorded, and the command buffer is poisoned, so its submit fails
+    /// and the application falls back (docs/video-decode.md §7.12). Said on
+    /// stderr the first time per process, with the numbers.
+    fn refuse_video(&mut self, cb: u64, command: &'static str, r: crate::video_stable::Refusal) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "sv-gpu-server: {command} refused, not handed to the driver: {}; its command buffer will \
+                 not submit (docs/video-decode.md §7.12)",
+                r.detail
+            )
+        });
+        crate::video_log::note(&format!("{command} cb{cb:x} REFUSED: {}", r.detail));
+        self.poison_command_buffer(cb, r.why);
+    }
+
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
         GpuServer {
             shared,
             last_error: None,
-            poisoned: Default::default(),
             dispatch_poison: None,
             retained: Default::default(),
         }
@@ -173,7 +280,7 @@ impl GpuServer {
             return;
         };
         let words = [device, view, 0];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkDestroyImageView", false, &words, 0);
         }
@@ -350,11 +457,8 @@ impl GpuHost for GpuServer {
                 // and cannot miss the one command that matters. A walker written
                 // against the wire signature did miss it: `vkQueueSubmit`'s
                 // buffers are a member of `VkSubmitInfo`, not a parameter.
-                if ty == HandleType::VkCommandBuffer
-                    && !self.poisoned.is_empty()
-                    && self.dispatch_poison.is_none()
-                {
-                    self.dispatch_poison = self.poisoned.get(&h.as_raw()).copied();
+                if ty == HandleType::VkCommandBuffer && self.dispatch_poison.is_none() {
+                    self.dispatch_poison = self.shared.poisoned.get(h.as_raw());
                 }
                 Ok(h.as_raw())
             }
@@ -449,25 +553,66 @@ impl GpuHost for GpuServer {
     /// failed is invalid, and this is that state, kept where the only thing that
     /// can act on it lives.
     fn poison_command_buffer(&mut self, command_buffer: u64, why: &'static str) {
-        self.poisoned.insert(command_buffer, why);
+        self.shared.poisoned.insert(command_buffer, why);
+    }
+
+    fn strip_poisoned_submit(&mut self, a: &mut p::VkQueueSubmitArgs) -> bool {
+        // A device-group chain carries one mask per command buffer, so a batch
+        // with any extension struct is not taken apart.
+        if a.p_submits.iter().any(|s| !s.p_next.is_empty()) {
+            return false;
+        }
+        for s in &mut a.p_submits {
+            s.p_command_buffers.retain(|cb| self.shared.poisoned.get(cb.0).is_none());
+            s.command_buffer_count = s.p_command_buffers.len() as u32;
+        }
+        true
+    }
+
+    fn strip_poisoned_submit2(&mut self, a: &mut p::VkQueueSubmit2Args) -> bool {
+        a.p_submits.clear();
+        a.submit_count = 0;
+        true
+    }
+
+    fn settle_stripped_submit(&mut self, fence: u64) {
+        if fence == 0 {
+            return;
+        }
+        let f = vk::Fence::from_raw(fence);
+        // SAFETY: the fence is the driver's, from the table, and the submit
+        // that names it has just returned. A second at most: the batch is
+        // empty, so it completes once earlier work on the queue has.
+        let _ = unsafe { self.shared.driver.device.wait_for_fences(&[f], true, 1_000_000_000) };
     }
 
     fn unpoison_command_buffer(&mut self, command_buffer: u64) {
-        self.poisoned.remove(&command_buffer);
+        self.shared.poisoned.remove(command_buffer);
     }
 
-    fn observing(&self) -> bool {
-        crate::video_log::enabled()
+    fn observing(&self, command: &'static str) -> bool {
+        crate::video_log::enabled() || STABLE_OBSERVED.contains(&command)
     }
 
     fn observe(&self, command: &'static str, after: bool, args: &[u64], result: i32) {
-        // SAFETY: the generated dispatch calls this with the arguments it is
-        // about to pass, or has just passed, to the driver — `GpuHost::observe`'s
-        // contract, which is `video_log::observe`'s.
-        unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
+        if after && STABLE_OBSERVED.contains(&command) {
+            // SAFETY: as below; `stable_observe` reads only what each
+            // command's signature says the words are.
+            unsafe { stable_observe(&self.shared, command, args, result) };
+        }
+        if crate::video_log::enabled() {
+            // SAFETY: the generated dispatch calls this with the arguments it
+            // is about to pass, or has just passed, to the driver —
+            // `GpuHost::observe`'s contract, which is `video_log::observe`'s.
+            unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
+        }
     }
 
-    fn retain_raise(&mut self, _command: &'static str, pool: sv_gpu_entry::Raise) {
+    fn retain_raise(&mut self, command: &'static str, pool: sv_gpu_entry::Raise) {
+        if matches!(command, "vkCreateVideoSessionParametersKHR" | "vkUpdateVideoSessionParametersKHR") {
+            self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).keep_params(pool);
+            return;
+        }
         let keep = video_retain_limit();
         if keep == 0 {
             return;
@@ -784,7 +929,7 @@ impl GpuHost for GpuServer {
         let mut image = Default::default();
         let device = a.device.0 as usize as _;
         let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut image) as u64];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkCreateImage", false, &words, 0);
         }
@@ -835,7 +980,7 @@ impl GpuHost for GpuServer {
         let mut view = Default::default();
         let device = a.device.0 as usize as _;
         let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut view) as u64];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkCreateImageView", false, &words, 0);
         }
@@ -883,7 +1028,7 @@ impl GpuHost for GpuServer {
             return Ok(());
         };
         let words = [device, image, 0];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkDestroyImage", false, &words, 0);
         }
@@ -927,9 +1072,13 @@ impl GpuHost for GpuServer {
         };
         let cb = a.command_buffer.0;
         // SAFETY: `info` and its array were raised into `pool` for this call.
-        unsafe { self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).begin(cb, info) };
+        let verdict = unsafe { self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).begin(cb, info) };
+        if let Err(r) = verdict {
+            self.refuse_video(cb, "vkCmdBeginVideoCodingKHR", r);
+            return Ok(());
+        }
         let words = [cb, info as u64];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkCmdBeginVideoCodingKHR", false, &words, 0);
         }
@@ -966,22 +1115,39 @@ impl GpuHost for GpuServer {
             None => std::ptr::null(),
         };
         let cb = a.command_buffer.0;
+        // A command buffer the slot guard refused earlier in this recording is
+        // never submitted; nothing more is recorded into it at the driver.
+        // Intel parses a decode at record time, and this one may lie outside
+        // any scope the driver saw begun.
+        if self.shared.poisoned.get(cb).is_some() {
+            return Ok(());
+        }
         // SAFETY: `raised` and everything it points to are in `pool`.
-        let stable = unsafe {
+        let verdict = unsafe {
             self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).decode(cb, raised)
         };
-        if stable.is_none() && !raised.is_null() {
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| {
-                eprintln!(
-                    "sv-gpu-server: a vkCmdDecodeVideoKHR this side cannot keep at stable addresses \
-                     (not H.264, or outside a scope it saw); forwarded as raised (docs/video-decode.md §7.11.5)"
-                )
-            });
-        }
-        let info = stable.unwrap_or(raised);
+        let info = match verdict {
+            crate::video_stable::Decode::Stable(p) => p,
+            crate::video_stable::Decode::Refused(r) => {
+                self.refuse_video(cb, "vkCmdDecodeVideoKHR", r);
+                return Ok(());
+            }
+            crate::video_stable::Decode::Raised => {
+                if !raised.is_null() {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        eprintln!(
+                            "sv-gpu-server: a vkCmdDecodeVideoKHR this side cannot keep at stable addresses \
+                             (not H.264, H.265 or AV1, or outside a scope it saw); forwarded as raised \
+                             (docs/video-decode.md §7.12)"
+                        )
+                    });
+                }
+                raised
+            }
+        };
         let words = [cb, info as u64];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkCmdDecodeVideoKHR", false, &words, 0);
         }
@@ -1010,9 +1176,15 @@ impl GpuHost for GpuServer {
             }
             None => std::ptr::null(),
         };
-        self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).end(cb);
+        // The scope's begin was refused (the slot guard): nothing was begun at
+        // the driver, so nothing is ended there either.
+        if !self.shared.video_stable.lock().unwrap_or_else(|e| e.into_inner()).end(cb)
+            && self.shared.poisoned.get(cb).is_some()
+        {
+            return Ok(());
+        }
         let words = [cb, info as u64];
-        let obs = self.observing();
+        let obs = crate::video_log::enabled();
         if obs {
             self.observe("vkCmdEndVideoCodingKHR", false, &words, 0);
         }

@@ -17,6 +17,12 @@
 #   SVFD_BIN       sv-icd / sv-gpu-server build (default: target/release — the
 #                  debug ICD overflows Firefox's Renderer stack in `lower_pnext`)
 #   SVFD_CLIP      an existing clip to play instead of the generated one
+#   SVFD_CODEC     the codec the clip is, as about:support names it: H264
+#                  (default), HEVC, AV1 or VP9 (docs/video-decode.md §7.12)
+#   SVFD_EXPECT    hardware (default): the clip must decode on the forwarded
+#                  device; software: it must play with *no* frame decoded
+#                  there and about:support must not list SVFD_CODEC as
+#                  hardware, for a codec the GPU side withholds
 #   SVFD_ARENA_MIB the GPU side's arena in MiB (default 96; the guest's slot holds 64)
 #   SVFD_GPU_LAYERS  VK_INSTANCE_LAYERS for the GPU side only, e.g.
 #                  VK_LAYER_SV_intel_shape:VK_LAYER_KHRONOS_validation
@@ -41,6 +47,8 @@
 set -uo pipefail
 
 SECS=${1:-45}
+CODEC=${SVFD_CODEC:-H264}
+EXPECT=${SVFD_EXPECT:-hardware}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${SVFD_BIN:-$ROOT/target/release}
 RUN=$(mktemp -d /tmp/svfd-XXXXXX)
@@ -225,10 +233,18 @@ else
 fi
 
 dev=$(logs | grep -o 'VulkanDeviceHolder: created shared VkDevice for [^"]*' | head -1)
-if [ -n "$dev" ]; then ok "the RDD process made its decode device: ${dev#*for }"; else bad "no Vulkan decode device was created"; fi
+if [ -n "$dev" ]; then ok "the RDD process made its decode device: ${dev#*for }"
+elif [ "$EXPECT" = software ]; then ok "no Vulkan decode device was created"
+else bad "no Vulkan decode device was created"; fi
 
 n=$(logs | grep -a -c -E '\[VULKAN\] readback: [0-9]+x[0-9]+ frame copied to host memory')
-if [ "$n" -gt 0 ]; then
+if [ "$EXPECT" = software ]; then
+  if [ "$n" -eq 0 ]; then
+    ok "no frame was decoded on the forwarded device: $CODEC played in software, as expected"
+  else
+    bad "$n frames were decoded on the forwarded device, and $CODEC was expected in software"
+  fi
+elif [ "$n" -gt 0 ]; then
   ok "$n frames decoded on the forwarded device and read back"
 else
   bad "no frame was read back from a Vulkan decode"
@@ -256,10 +272,16 @@ if [ -s "$RUN/support.json" ] && [ -n "$JQ" ]; then
   "$JQ" -r '.graphics.featureLog.features[]? | select(.name|test("VIDEO")) |
             "        \(.name): \(.status) \((.log // []) | map(.message // .failureId // "") | join("; "))"' \
     "$RUN/support.data.json" 2>/dev/null
-  if "$JQ" -e '.media.codecSupportInfo | test("H264 [^\\n]*HWDEC")' "$RUN/support.data.json" >/dev/null 2>&1; then
-    ok "about:support lists H.264 hardware decoding"
+  listed=0
+  "$JQ" -e --arg c "$CODEC" '.media.codecSupportInfo | test("(^|\\n)" + $c + " [^\\n]*HWDEC")' \
+    "$RUN/support.data.json" >/dev/null 2>&1 && listed=1
+  if [ "$EXPECT" = software ]; then
+    if [ "$listed" = 0 ]; then ok "about:support does not list $CODEC hardware decoding"
+    else bad "about:support lists $CODEC hardware decoding, and the GPU side was to withhold it"; fi
+  elif [ "$listed" = 1 ]; then
+    ok "about:support lists $CODEC hardware decoding"
   else
-    bad "about:support does not list H.264 hardware decoding"
+    bad "about:support does not list $CODEC hardware decoding"
   fi
 else
   bad "no about:support data (Marionette/geckodriver/jq)"
