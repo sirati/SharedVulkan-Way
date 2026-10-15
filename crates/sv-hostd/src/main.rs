@@ -51,6 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("serve") => {}
         Some("qemu") => return qemu_mode(&args),
         Some("qemu-serve") => return qemu_serve(&args),
+        Some("ivshmem-serve") => return ivshmem_serve(&args),
         Some("broker") => return broker_serve(&args),
         Some("broker-request") => return broker_request(&args),
         _ => {
@@ -60,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
+                 sv-hostd ivshmem-serve --region <file> --cold <sock> --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -499,6 +501,175 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// `sv-hostd ivshmem-serve` — the app side of the cross-VM topology with the
+/// GPU sessions' arena on an ivshmem device (waycompose-design.md §87), **as the
+/// user, from start to end**.
+///
+/// For every ICD that connects to `--socket`: connect to the guest's cold path
+/// (`--cold`, the tunnel's forward of the GPU process's port), which gives that
+/// ICD a session of its own in a slot of the BAR; check the slot's stamps in
+/// `--region`, the file QEMU backs the BAR with; tell the guest; and hand the
+/// ICD the file's path and the slot's offsets. The ICD opens the file itself,
+/// by name (docs/design.md §1a), with the same group bit this process used.
+///
+/// Sessions are made on demand rather than located up front, so there is no
+/// count to agree with the guest: Firefox's `glxtest` takes one, ends, and its
+/// slot is the browser's. `--clients N` stops after N (0, the default, never).
+///
+/// With `--bell`, this process also holds the doorbell port's chardev and
+/// serves it to every ICD on `--bell-hub` (`sv_hostd::ivshmem::bell_hub`).
+#[cfg(target_os = "linux")]
+fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use sv_transport::cold::{ColdMessage, recv, send};
+    use sv_transport::stream::{read_message, write_message};
+
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let region = arg("--region").ok_or("--region is required")?;
+    let cold = arg("--cold").ok_or("--cold is required")?;
+    let path = arg("--socket").ok_or("--socket is required")?;
+    let clients: u64 = arg("--clients").map_or(Ok(0), |s| s.parse())?;
+    if unsafe { libc::geteuid() } == 0 {
+        // Nothing here needs root, and the point of this mode is that nothing
+        // runs as root; a root caller is a deployment mistake to refuse, not to
+        // accommodate.
+        return Err("ivshmem-serve runs as the user; refusing to run as root".into());
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&region)
+        .map_err(|e| format!("{region}: {e} (is this user in the region's group?)"))?;
+    let region_len = file.metadata()?.len();
+    let file = std::sync::Arc::new(file);
+
+    if let Some(bell) = arg("--bell") {
+        let hub = arg("--bell-hub").ok_or("--bell needs --bell-hub")?;
+        match UnixStream::connect(&bell) {
+            Ok(up) => {
+                let _ = std::fs::remove_file(&hub);
+                let l = UnixListener::bind(&hub)?;
+                sv_hostd::ivshmem::bell_hub(up, l)?;
+                eprintln!("sv-hostd: doorbell {bell} held, served to every ICD on {hub}");
+            }
+            Err(e) => eprintln!(
+                "sv-hostd: no doorbell ({bell}: {e}); the ICDs' waits will run out their slice"
+            ),
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    eprintln!(
+        "sv-hostd: listening on {path} (ivshmem, as uid {}): each ICD gets its own slot of {region} \
+         ({} MiB) through {cold}",
+        unsafe { libc::geteuid() },
+        region_len >> 20
+    );
+    let mut served = 0u64;
+    for conn in listener.incoming() {
+        let sock = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("sv-hostd: accept: {e}");
+                continue;
+            }
+        };
+        served += 1;
+        let i = served;
+        let (file, region, cold) = (std::sync::Arc::clone(&file), region.clone(), cold.clone());
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let result = (|| -> Result<String, String> {
+                match recv(&sock).map_err(|e| format!("no attach request: {e}"))? {
+                    ColdMessage::AttachRequest => {}
+                    other => return Err(format!("expected AttachRequest, got {other:?}")),
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut port = loop {
+                    match UnixStream::connect(&cold) {
+                        Ok(s) => break s,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(50))
+                        }
+                        Err(e) => return Err(format!("cannot reach the guest at {cold}: {e}")),
+                    }
+                };
+                port.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+                let mut scratch = Vec::new();
+                let hello = match read_message(&mut port, &mut scratch)
+                    .map_err(|e| format!("no Hello from the guest: {e}"))?
+                {
+                    ColdMessage::Hello(h) => h,
+                    ColdMessage::Refuse { code, reason } => {
+                        return Err(format!("the guest refused {code}: {reason}"));
+                    }
+                    other => return Err(format!("expected Hello, got {other:?}")),
+                };
+                let at = match sv_hostd::ivshmem::check_slot(
+                    &file,
+                    &region,
+                    region_len,
+                    &hello.extent,
+                    hello.generation,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = write_message(&mut port, &ColdMessage::Refuse { code: 3, reason: e.clone() });
+                        return Err(e);
+                    }
+                };
+                write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })
+                    .map_err(|e| format!("Accept: {e}"))?;
+                // The guest opens its device, imports the slot's arena and
+                // publishes the control region over the stamps, then says so.
+                // Only then may the ICD map it: before, the control header is
+                // a stamp, which the ICD refuses as a foreign magic.
+                match read_message(&mut port, &mut scratch)
+                    .map_err(|e| format!("the guest never published the session: {e}"))?
+                {
+                    ColdMessage::Ping => {}
+                    ColdMessage::Refuse { code, reason } => {
+                        return Err(format!("the guest could not open the session ({code}): {reason}"));
+                    }
+                    other => return Err(format!("expected the guest's Ping, got {other:?}")),
+                }
+                send(&sock, &ColdMessage::Attach(at.clone())).map_err(|e| format!("Attach: {e}"))?;
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+                match recv(&sock) {
+                    Ok(ColdMessage::Accept { .. }) => {}
+                    Ok(other) => return Err(format!("the ICD said {other:?}")),
+                    Err(e) => return Err(format!("the ICD never acknowledged: {e}")),
+                }
+                Ok(format!(
+                    "slot at +{} MiB, run 0x{:016x}, {} pages checked",
+                    at.control_offset >> 20,
+                    hello.extent.run_id,
+                    (at.control_len + at.arena_len) / sv_transport::region::PAGE as u64
+                ))
+            })();
+            match result {
+                Ok(s) => eprintln!("sv-hostd: ICD client {i} attached: {s} in {:.2?}", t.elapsed()),
+                Err(e) => {
+                    let _ = send(&sock, &ColdMessage::Refuse { code: 2, reason: e.clone() });
+                    eprintln!("sv-hostd: ICD client {i}: {e}");
+                }
+            }
+        });
+        if clients != 0 && served >= clients {
+            break;
+        }
+    }
+    // Let the last client's thread finish its handshake before the process —
+    // and the doorbell hub with it — goes.
+    if clients != 0 {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
     Ok(())
 }
 
