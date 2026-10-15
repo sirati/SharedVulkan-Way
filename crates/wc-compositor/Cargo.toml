@@ -79,6 +79,9 @@ awe-probe = { path = "../awe-probe" }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  # §88: the frame clock lays its grid on DWM's vblank when there is one.
+  "Win32_Graphics_Dwm",
+  "Win32_System_Performance",
   "Win32_System_Console",
   # ADDED FOR STAGE 13: the clipboard. `DataExchange` is where the Windows
   # metadata files `OpenClipboard`, `SetClipboardData` and

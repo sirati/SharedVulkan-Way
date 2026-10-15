@@ -340,6 +340,9 @@ struct WindowState {
     maximized: Cell<bool>,
     minimized: Cell<bool>,
     mapped: Cell<bool>,
+    /// The first `Present` not yet painted, for `WC_FRAME_TRACE`
+    /// (docs/waycompose-design.md §88): how long a frame waits for `WM_PAINT`.
+    unpainted_since: Cell<Option<std::time::Instant>>,
     /// Set while we are the ones calling `ShowWindow`, so the `WM_SIZE` it
     /// provokes is not reported back to the client as a user action. Without
     /// it, a client asking to be maximised receives its own request as an
@@ -441,7 +444,26 @@ impl WindowState {
         // SAFETY: a live window handle; `ps` is written by the call.
         let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
         if !hdc.is_null() {
+            let blit_started = std::time::Instant::now();
             self.blit(hdc);
+            if let Some(since) = self.unpainted_since.take()
+                && sv_transport::frametrace::enabled()
+            {
+                use sv_transport::frametrace as ft;
+                let r = ps.rcPaint;
+                ft::emit_at(
+                    ft::at_us(blit_started),
+                    "wc.paint",
+                    format_args!(
+                        "win={} wait_us={} blit_us={} rect={}x{}",
+                        self.id,
+                        ft::us(blit_started - since),
+                        ft::us(blit_started.elapsed()),
+                        r.right - r.left,
+                        r.bottom - r.top,
+                    ),
+                );
+            }
             // After the blit and inside the paint, because it reads the same
             // buffer the blit just used and must not disagree with what is on
             // the screen. It is a no-op on every frame where the client's title
@@ -2881,6 +2903,7 @@ fn create_window(
         maximized: Cell::new(false),
         minimized: Cell::new(false),
         mapped: Cell::new(false),
+        unpainted_since: Cell::new(None),
         self_driven: Cell::new(false),
         icon_big: Cell::new(0),
         frames: Cell::new(0),
@@ -4295,6 +4318,9 @@ fn is_layered(w: &Rc<WindowState>) -> bool {
 fn present(w: &Rc<WindowState>, damage: &[Rect]) {
     if !w.mapped.get() {
         return;
+    }
+    if w.unpainted_since.get().is_none() && sv_transport::frametrace::enabled() {
+        w.unpainted_since.set(Some(std::time::Instant::now()));
     }
     // STAGE 13. A layered window has no `WM_PAINT`: its content is whatever
     // was last handed to `UpdateLayeredWindow`, so invalidating a rectangle

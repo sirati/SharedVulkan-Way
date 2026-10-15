@@ -654,6 +654,7 @@ mod op {
     pub const SURFACE_COMMIT: u16 = 6;
     pub const SURFACE_DAMAGE_BUFFER: u16 = 9;
     pub const DISPLAY_DELETE_ID: u16 = 1;
+    pub const CALLBACK_DONE: u16 = 0;
 }
 
 /// How long a copy waits for the client to finish writing into the pipe.
@@ -870,6 +871,9 @@ pub struct Session {
     /// stage had to answer about `wl_shm_pool.resize` before it could design
     /// for it, and got a different answer to the one it assumed.
     trace: bool,
+    /// `--pace-frames` (docs/waycompose-design.md §88): this side answers the
+    /// client's frame callbacks. `None` forwards the compositor's, as before.
+    pacer: Option<crate::pace::Pacer>,
     /// Lines worth telling the operator about, drained by the caller so this
     /// stays free of I/O.
     notes: Vec<String>,
@@ -1013,6 +1017,7 @@ impl Session {
             surfaces: HashMap::new(),
             stats: Stats::default(),
             trace: false,
+            pacer: None,
             notes: Vec::new(),
             app_ids: Vec::new(),
             clip: Clip { next_token: 1, ..Clip::default() },
@@ -1050,6 +1055,39 @@ impl Session {
     /// Log every message as it is walked. See the `trace` field.
     pub fn set_trace(&mut self, on: bool) {
         self.trace = on;
+    }
+
+    /// Answer the client's frame callbacks here at `hz`, at most `depth` ahead
+    /// of the compositor. See [`crate::pace`].
+    pub fn set_pacing(&mut self, hz: u32, depth: usize) {
+        self.pacer = (hz > 0).then(|| crate::pace::Pacer::new(hz, depth));
+    }
+
+    /// How long the loop may sleep before a frame tick with work on it.
+    pub fn until_frame_tick(&self, now: Instant) -> Option<Duration> {
+        self.pacer.as_ref().and_then(|p| p.until_tick(now))
+    }
+
+    /// Answer whatever the tick allows, into the client's byte stream.
+    pub fn tick_frames(&mut self, now: Instant) {
+        let Some(p) = self.pacer.as_mut() else { return };
+        let answered = p.tick(now);
+        if answered.is_empty() {
+            return;
+        }
+        let ms = crate::pace::now_ms();
+        for (cb, then_delete) in answered {
+            self.to_client.extend_from_slice(&wire::message(cb, op::CALLBACK_DONE, &ms.to_ne_bytes()));
+            // The compositor's `delete_id`, held until the client had this.
+            if then_delete {
+                self.to_client
+                    .extend_from_slice(&wire::message(1, op::DISPLAY_DELETE_ID, &cb.to_ne_bytes()));
+                self.objects.forget(cb);
+            }
+            if sv_transport::frametrace::enabled() {
+                sv_transport::frametrace::emit("px.done", format_args!("cb={cb} src=local"));
+            }
+        }
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -1107,6 +1145,16 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
+        if sv_transport::frametrace::enabled() {
+            trace_request(&interface, &msg.name, header.object, body, &spans);
+        }
+        if interface == "wl_surface"
+            && msg.name == "frame"
+            && let Some(p) = self.pacer.as_mut()
+            && let Some(cb) = spans.first().and_then(|s| wire::word_at(body, s))
+        {
+            p.requested(cb, header.object);
+        }
 
         // Materialise any pool still being sized, unless *this* message is one
         // of the two that a pool is allowed to be deferred through. Doing it
@@ -1262,6 +1310,9 @@ impl Session {
             }
             ("wl_surface", op::SURFACE_DESTROY) => {
                 self.surfaces.remove(&header.object);
+                if let Some(p) = self.pacer.as_mut() {
+                    p.surface_destroyed(header.object);
+                }
             }
             ("wl_surface", op::SURFACE_ATTACH) => {
                 let buffer = wire::word_at(body, &spans[0]).unwrap_or(0);
@@ -2119,6 +2170,32 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
+        if sv_transport::frametrace::enabled() {
+            trace_event(&interface, &msg.name, header.object);
+        }
+        // §88. A frame callback this side already answered is the compositor's
+        // credit coming back, not news for the client.
+        if interface == "wl_callback"
+            && header.opcode == op::CALLBACK_DONE
+            && let Some(p) = self.pacer.as_mut()
+        {
+            match p.answered(header.object) {
+                crate::pace::Answer::Swallow => return Ok((Vec::new(), Vec::new())),
+                crate::pace::Answer::NotOurs => {}
+            }
+        }
+        if interface == "wl_callback" && header.opcode == op::CALLBACK_DONE && sv_transport::frametrace::enabled() {
+            sv_transport::frametrace::emit("px.done", format_args!("cb={} src=guest", header.object));
+        }
+        if interface == "wl_display"
+            && header.opcode == op::DISPLAY_DELETE_ID
+            && let Some(p) = self.pacer.as_mut()
+            && let Some(id) = spans.first().and_then(|s| wire::word_at(body, s))
+            && p.deleted(id)
+        {
+            // Sent after the proxy's own `done` for it; see `crate::pace`.
+            return Ok((Vec::new(), Vec::new()));
+        }
 
         // STAGE 13. The compositor's own announcements are forwarded untouched,
         // and two of them are *watched* on the way past for the same reason
@@ -2697,6 +2774,18 @@ impl Session {
         // §13.8's retracted throughput number is what happens when one is left
         // inside the measurement.
         self.stats.copy_nanos += started.elapsed().as_nanos() as u64;
+        if sv_transport::frametrace::enabled() {
+            // docs/waycompose-design.md §88: the proxy's half of a frame.
+            sv_transport::frametrace::emit_at(
+                sv_transport::frametrace::at_us(started),
+                "px.commit",
+                format_args!(
+                    "surf={surface_id} buf={buffer_id} attached={} copied={copied} copy_us={}",
+                    attached_now as u8,
+                    sv_transport::frametrace::us(started.elapsed()),
+                ),
+            );
+        }
         // **Only a commit that attached a buffer can be checked**, and this is
         // the instrument's own correctness rather than a convenience.
         //
@@ -2754,6 +2843,35 @@ impl Session {
             self.stats.copies += 1;
             self.stats.bytes_copied += copied as u64;
         }
+    }
+}
+
+/// `WC_FRAME_TRACE` (docs/waycompose-design.md §88): the requests a frame's
+/// pacing is made of, as they pass on the way to the compositor.
+fn trace_request(interface: &str, name: &str, object: u32, body: &[u8], spans: &[wire::Span]) {
+    use sv_transport::frametrace as ft;
+    match (interface, name) {
+        ("wl_surface", "frame") => {
+            let cb = spans.first().and_then(|s| wire::word_at(body, s)).unwrap_or(0);
+            ft::emit("px.frame", format_args!("surf={object} cb={cb}"));
+        }
+        ("wl_surface", "commit") => ft::emit("px.c", format_args!("surf={object}")),
+        ("wl_surface", "attach") => {
+            let buf = spans.first().and_then(|s| wire::word_at(body, s)).unwrap_or(0);
+            ft::emit("px.attach", format_args!("surf={object} buf={buf}"));
+        }
+        _ => {}
+    }
+}
+
+/// The events that answer them, on the way back to the client.
+fn trace_event(interface: &str, name: &str, object: u32) {
+    use sv_transport::frametrace as ft;
+    match (interface, name) {
+        // The compositor's answer arriving; `px.done` is the client being told.
+        ("wl_callback", "done") => ft::emit("px.gdone", format_args!("cb={object}")),
+        ("wl_buffer", "release") => ft::emit("px.release", format_args!("buf={object}")),
+        _ => {}
     }
 }
 

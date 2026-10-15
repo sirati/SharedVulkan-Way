@@ -373,8 +373,13 @@ proxy)
     {
       echo '#!/usr/bin/env bash'
       echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
+      # §88. A `WC_FRAME_TRACE=` line in gpu.env traces the proxy as well:
+      # the frame timeline has a proxy half, and gpu.env is where a measured
+      # run already says what the session's frame should record.
+      ft=$(grep -m1 '^WC_FRAME_TRACE=' "$BASE/gpu.env" 2>/dev/null)
+      [ -n "$ft" ] && printf 'export %q\n' "$ft"
       printf 'rm -f %q\n' "$D/wl-proxy"
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 --copy damage --accept-timeout %s --timeout %s >%q 2>&1\n' \
+      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
@@ -403,7 +408,7 @@ proxy)
 export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 rm -f "$D/wl-proxy"
 "$BIN/wc-proxy" --upstream "$D/up.sock" --socket wl-proxy --runtime-dir "$D" \\
-  --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage \\
+  --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage --pace-frames 60 \\
   --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
   --arena-locator "$BIN/wc-arena-host" --arena-qmp "$QMP" --arena-vm "$VM_HINT" \\
   --accept-timeout ${WC_LAUNCH_SESSION_SECS:-43200} --timeout ${WC_LAUNCH_SESSION_SECS:-43200} \\

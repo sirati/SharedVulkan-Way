@@ -211,6 +211,143 @@ mod imp {
     }
 }
 
+/// When frame callbacks are answered: a steady grid at the display's refresh
+/// (docs/waycompose-design.md §88).
+///
+/// # What it replaced, and the measurement that said so
+///
+/// Window callbacks were answered on the first turn at least 16 ms after the
+/// previous answer, and subsurface callbacks at once, on the turn their commit
+/// landed in. Firefox draws into a subsurface, so its frame clock was the round
+/// trip to this process and back — 18.8 ms through the guest's tunnel, which
+/// was the whole of a 21 ms frame — and with turns 5 ms apart, the 16 ms gate
+/// came round every 20 ms. Neither is a display. A grid is: every callback
+/// asked for before a tick is answered on that tick, the loop wakes *on* the
+/// tick rather than on the next 5 ms turn after it, and a client that keeps up
+/// draws at exactly the refresh rate however far away it is.
+///
+/// # The phase
+///
+/// When DWM can say when the last vblank was (`DwmGetCompositionTimingInfo`,
+/// an interactive session), the grid is laid on it and its period is the
+/// display's, re-read every second. When it cannot — session 0, Wine, Unix —
+/// the grid runs free at 60 Hz, which is what `wl_output` advertises.
+pub struct FrameClock {
+    period: Duration,
+    next: std::time::Instant,
+    rephased: Option<std::time::Instant>,
+    source: &'static str,
+}
+
+/// A tick this early still counts, because a high-resolution wait can return
+/// a fraction of a millisecond before it was asked to (§13.8 measured 5.141 ms
+/// for 5), and missing the tick for that would cost a whole period.
+const EARLY: Duration = Duration::from_micros(500);
+
+impl FrameClock {
+    pub const DEFAULT_PERIOD: Duration = Duration::from_nanos(16_666_667);
+
+    pub fn new() -> Self {
+        let mut c = FrameClock {
+            period: Self::DEFAULT_PERIOD,
+            next: std::time::Instant::now() + Self::DEFAULT_PERIOD,
+            rephased: None,
+            source: "free-running 60 Hz",
+        };
+        c.rephase(std::time::Instant::now());
+        c
+    }
+
+    /// Whether a tick has come, and if so, move to the next one. Ticks missed
+    /// while the loop was busy are skipped, not replayed: one answer per
+    /// callback, never a burst.
+    pub fn due(&mut self, now: std::time::Instant) -> bool {
+        if now + EARLY < self.next {
+            return false;
+        }
+        while self.next <= now + EARLY {
+            self.next += self.period;
+        }
+        if self.rephased.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            self.rephase(now);
+        }
+        true
+    }
+
+    /// How long until the next tick, for the loop's wait.
+    pub fn until_next(&self, now: std::time::Instant) -> Duration {
+        self.next.saturating_duration_since(now)
+    }
+
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
+    /// What the grid is laid on, for the startup line.
+    pub fn describe(&self) -> &'static str {
+        self.source
+    }
+
+    fn rephase(&mut self, now: std::time::Instant) {
+        self.rephased = Some(now);
+        if let Some((vblank_in, period)) = imp_vblank::next_vblank() {
+            // Plausible displays only: 24 to 360 Hz.
+            if period >= Duration::from_micros(2_777) && period <= Duration::from_micros(41_667) {
+                self.period = period;
+                self.next = now + vblank_in;
+                self.source = "DWM vblank";
+                return;
+            }
+        }
+        self.source = "free-running 60 Hz";
+    }
+}
+
+impl Default for FrameClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+mod imp_vblank {
+    use std::time::Duration;
+    use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+    /// Time from now to DWM's next vblank, and the refresh period. `None`
+    /// when DWM is not composing this session.
+    pub fn next_vblank() -> Option<(Duration, Duration)> {
+        let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        let (mut now, mut freq) = (0i64, 0i64);
+        // SAFETY: `info` is a correctly sized, writable DWM_TIMING_INFO with
+        // its size field set, and a null window asks for the desktop's timing;
+        // the counter calls write one i64 each.
+        let ok = unsafe {
+            DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut info) == 0
+                && QueryPerformanceCounter(&mut now) != 0
+                && QueryPerformanceFrequency(&mut freq) != 0
+        };
+        let (period, last) = (info.qpcRefreshPeriod as i64, info.qpcVBlank as i64);
+        if !ok || freq <= 0 || period <= 0 || last <= 0 {
+            return None;
+        }
+        // The first vblank after now.
+        let behind = (now - last).rem_euclid(period);
+        let ahead = period - behind;
+        let to = |ticks: i64| Duration::from_nanos((ticks as i128 * 1_000_000_000 / freq as i128) as u64);
+        Some((to(ahead), to(period)))
+    }
+}
+
+#[cfg(not(windows))]
+mod imp_vblank {
+    pub fn next_vblank() -> Option<(std::time::Duration, std::time::Duration)> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +374,30 @@ mod tests {
     #[test]
     fn it_says_what_it_is() {
         assert!(!Ticker::new().describe().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod frame_clock {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_tick_is_due_once_per_period_and_missed_ticks_are_skipped() {
+        let mut c = FrameClock::new();
+        let p = c.period();
+        let t0 = Instant::now();
+        // Not before the first tick (allowing the early margin).
+        assert!(!c.due(t0));
+        let first = t0 + c.until_next(t0);
+        assert!(c.due(first));
+        // Not again within the same period.
+        assert!(!c.due(first + p / 2));
+        assert!(c.due(first + p));
+        // Five periods late: one answer, and the next tick is ahead of now.
+        let late = first + p * 6 + p / 3;
+        assert!(c.due(late));
+        assert!(!c.due(late));
+        assert!(c.until_next(late) <= p);
     }
 }

@@ -49,6 +49,8 @@
 
 pub mod cold;
 pub mod control;
+/// `WC_FRAME_TRACE`: per-event timestamps for one cross-process frame timeline.
+pub mod frametrace;
 /// The quarantined `SCM_RIGHTS` handoff — see the module's own documentation for
 /// what still needs it and what measurement would remove it.
 #[cfg(target_os = "linux")]

@@ -818,10 +818,13 @@ pub mod wayland {
     /// How many `wl_shm` buffers a swapchain cycles through.
     ///
     /// Three, and the number is about the *compositor* rather than about this
-    /// driver: `vkQueuePresentKHR` here is synchronous, so one buffer would be
-    /// correct were it not that a committed buffer stays the compositor's until
-    /// it sends `wl_buffer.release`, and writing into it before then is a
-    /// visible tear. Three is one being shown, one in flight and one to write.
+    /// driver: frames are put one at a time (by the swapchain's presenter,
+    /// `crate::wsi`), so one buffer would be correct were it not that a
+    /// committed buffer stays the compositor's until it sends
+    /// `wl_buffer.release`, and writing into it before then is a visible tear.
+    /// Three is one being shown, one in flight and one to write. On the guest
+    /// the release crosses ssh.exe and arrives a frame or so late
+    /// (docs/waycompose-design.md §88); three still waited once in 960 frames.
     const BUFFERS: usize = 3;
 
     /// `union wl_argument`, one 64-bit slot per argument.
@@ -1071,8 +1074,8 @@ pub mod wayland {
     // SAFETY: every pointer is a libwayland object, and libwayland is
     // thread-safe for all of them. The one thing that is *not* safe to do from
     // two threads at once is dispatch the same event queue, and this queue is
-    // reachable only through `&mut self` — `crate::wsi::queue_present` holds
-    // the swapchain map's lock across the whole of `present`.
+    // reachable only through `&mut self` — the swapchain's target is behind a
+    // mutex that `crate::wsi` holds across the whole of `present`.
     unsafe impl Send for Surface {}
 
     impl Surface {
@@ -1319,12 +1322,16 @@ pub mod wayland {
             // SAFETY: libwayland entry points on this object's own proxies and
             // its own queue, and a write into this object's own mapping at an
             // offset the constructor established is `frame` bytes long.
+            let traced = sv_transport::frametrace::enabled().then(std::time::Instant::now);
+            let mut waited = false;
+            let (picked, copied, buf_i): (Option<std::time::Instant>, Option<std::time::Instant>, usize);
             unsafe {
                 // Free, without blocking: whatever releases the compositor has
                 // already sent are sitting in our queue.
                 (l.display_dispatch_queue_pending)(self.display, self.queue);
                 let mut idx = self.pick();
                 if idx.is_none() {
+                    waited = true;
                     // Every buffer is still the compositor's. One round trip is
                     // the backpressure — it returns as soon as the compositor
                     // answers a `wl_display.sync`, so it cannot wait on a frame
@@ -1339,6 +1346,8 @@ pub mod wayland {
                 // silently stops presenting is much harder to diagnose.
                 let i = idx.unwrap_or(self.next % self.buffers.len());
                 self.next = (i + 1) % self.buffers.len();
+                picked = traced.map(|_| std::time::Instant::now());
+                buf_i = i;
 
                 let dst = self.map.add(self.buffers[i].offset);
                 if swap_rb {
@@ -1351,6 +1360,7 @@ pub mod wayland {
                 } else {
                     core::ptr::copy_nonoverlapping(src.as_ptr(), dst, frame);
                 }
+                copied = traced.map(|_| std::time::Instant::now());
                 self.buffers[i].busy.store(true, Ordering::Release);
 
                 let mut args = [arg_o(self.buffers[i].proxy), arg_i(0), arg_i(0)];
@@ -1392,6 +1402,24 @@ pub mod wayland {
                     none.as_mut_ptr(),
                 );
                 (l.display_flush)(self.display);
+            }
+            if let (Some(t0), Some(picked), Some(copied)) = (traced, picked, copied) {
+                use sv_transport::frametrace as ft;
+                // The `wl_shm` half of the present (docs/waycompose-design.md
+                // §88): a buffer the compositor still held, the copy out of
+                // the arena, and the attach-damage-commit.
+                ft::emit_at(
+                    ft::at_us(t0),
+                    "icd.put",
+                    format_args!(
+                        "surf={:#x} buf={buf_i} waited={} pick_us={} copy_us={} commit_us={}",
+                        self.surface as usize,
+                        waited as u8,
+                        ft::us(picked - t0),
+                        ft::us(copied - picked),
+                        ft::us(copied.elapsed()),
+                    ),
+                );
             }
         }
 

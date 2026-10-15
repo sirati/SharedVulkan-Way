@@ -86,6 +86,10 @@ pub mod iconlink;
 pub mod icons;
 #[cfg(unix)]
 pub mod objects;
+/// Frame callbacks answered here, a bounded number ahead of the compositor
+/// (docs/waycompose-design.md §88).
+#[cfg(unix)]
+pub mod pace;
 #[cfg(unix)]
 pub mod pool;
 #[cfg(unix)]

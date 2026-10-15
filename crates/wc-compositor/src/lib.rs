@@ -1570,6 +1570,11 @@ fn wayland_thread(
     let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
+    println!(
+        "wc-compositor: frame callbacks on a {:?} grid ({})",
+        state.frame_clock.period(),
+        state.frame_clock.describe()
+    );
     let _ = std::io::stdout().flush();
 
     // §36. `accept()` on the ring directory, beside `accept()` on the socket.
@@ -1756,6 +1761,7 @@ fn wayland_thread(
         // the local socket *before* smithay reads it, or they wait a whole 5 ms
         // tick. `pump` also drains what smithay wrote last turn, which is why it
         // is one call and not two.
+        let turn_started = Instant::now();
         if let Some(rl) = ring_link.as_mut() {
             rl.pump();
         }
@@ -1765,6 +1771,7 @@ fn wayland_thread(
             break;
         }
         state.tick_frames();
+        let dispatched = Instant::now();
         // STAGE 21. After dispatch, because dispatch is where an inhibitor is
         // created, destroyed, or silently lost with the client that held it —
         // and the last of those three is the one nothing else would notice.
@@ -1772,6 +1779,25 @@ fn wayland_thread(
         if let Err(e) = display.flush_clients() {
             eprintln!("wc-compositor: flush failed: {e}");
             break;
+        }
+        // docs/waycompose-design.md §88: a turn that handled a commit, and how
+        // its time divided. The turn is the unit of this loop's latency: a
+        // commit that arrives just after one waits for the next.
+        if state.trace_commits > 0 {
+            if sv_transport::frametrace::enabled() {
+                use sv_transport::frametrace as ft;
+                ft::emit_at(
+                    ft::at_us(turn_started),
+                    "wc.turn",
+                    format_args!(
+                        "commits={} dispatch_us={} flush_us={}",
+                        state.trace_commits,
+                        ft::us(dispatched - turn_started),
+                        ft::us(dispatched.elapsed()),
+                    ),
+                );
+            }
+            state.trace_commits = 0;
         }
 
         let mut live = 0;
@@ -1838,7 +1864,10 @@ fn wayland_thread(
             break;
         }
 
-        ticker.wait(POLL);
+        // Never past the next frame tick (docs/waycompose-design.md §88): the
+        // callbacks it answers go out on the tick, not up to a turn after it.
+        // A floor, so a tick that is a hair away is not a spin.
+        ticker.wait(POLL.min(state.until_frame()).max(Duration::from_micros(200)));
     }
 
     // Said on the way out, always. "The taskbar icon is the generic one" has

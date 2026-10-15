@@ -57,6 +57,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <afunix.h>
+#include <mstcpip.h>
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -105,6 +106,32 @@ done:
     return 0;
 }
 
+/* waycompose-design.md §88. **Small messages must not wait for an ACK.**
+ *
+ * A Wayland connection is many small messages in both directions -- a
+ * `wl_callback.done` is 12 bytes, a key press 20 -- and this socket is the TCP
+ * hop between the compositor and ssh.exe. With Nagle's algorithm on, a small
+ * write made while an earlier one is unacknowledged waits for that ACK, and
+ * the ACK is itself delayed until ssh.exe has something to send back: the next
+ * message from the host. Measured on the real guest, a frame callback the
+ * compositor answered at once reached the host 16 ms later, right after the
+ * host's next commit, every frame -- which made the frame rate the round trip.
+ *
+ * So: TCP_NODELAY on our writes, and an ACK for every segment we receive so
+ * that ssh.exe's own writes to us are not held by its Nagle either (Windows
+ * 10 1607+; refused on older builds, which keeps the old behaviour). Both are
+ * per-socket; nothing system-wide changes. */
+static void low_latency(SOCKET s)
+{
+    BOOL one = TRUE;
+    DWORD freq = 1, got = 0;
+    int nd = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    int ack = WSAIoctl(s, SIO_TCP_SET_ACK_FREQUENCY, &freq, sizeof(freq), NULL, 0, &got, NULL, NULL);
+    printf("[relay] TCP_NODELAY %s, ACK frequency 1 %s\n",
+           nd == 0 ? "on" : "REFUSED", ack == 0 ? "on" : "refused");
+    fflush(stdout);
+}
+
 static DWORD WINAPI conn_thread(LPVOID arg)
 {
     SOCKET tcp = (SOCKET)(ULONG_PTR)arg;
@@ -134,6 +161,7 @@ static DWORD WINAPI conn_thread(LPVOID arg)
     printf("[relay] connection %ld: tcp <-> %s\n",
            (long)InterlockedIncrement(&g_conns), g_path);
     fflush(stdout);
+    low_latency(tcp);
 
     up.from = tcp; up.to = ux; up.fragment = 1; up.label = "client->server";
     down.from = ux; down.to = tcp; down.fragment = 0; down.label = "server->client";

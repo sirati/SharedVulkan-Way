@@ -110,7 +110,7 @@ pub fn negotiated_interface_version() -> u32 {
 /// enumerates drivers.
 static ICD: OnceLock<Option<&'static state::SharedVulkan>> = OnceLock::new();
 
-fn instance() -> Option<&'static state::SharedVulkan> {
+pub(crate) fn instance() -> Option<&'static state::SharedVulkan> {
     *ICD.get_or_init(|| {
         // A GPU side, if one was named. Failing to reach it is fatal rather
         // than a silent fallback to the standalone driver: an application told

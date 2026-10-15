@@ -416,7 +416,12 @@ pub fn pump(
         // upstream contributes 20 and changes nothing.
         let clip_wait = if session.clip_busy() { 1 } else { 20 };
         let ring_wait = if ring_upstream { RING_POLL_LADDER_MS[rung] } else { 20 };
-        let wait = clip_wait.min(ring_wait);
+        let mut wait = clip_wait.min(ring_wait);
+        // §88. Wake for the next frame tick when a callback is waiting on it,
+        // rounded up so a tick less than a millisecond away is not a spin.
+        if let Some(d) = session.until_frame_tick(std::time::Instant::now()) {
+            wait = wait.min(d.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+        }
         // A negative fd in a `pollfd` is ignored by `poll`, which is how the
         // no-icons case costs nothing and needs no second loop.
         // SAFETY: a live array of four `pollfd`s whose length is passed
@@ -585,6 +590,9 @@ pub fn pump(
             to_client.extend_from_slice(&bytes);
             to_client_fds.append(&mut new_fds);
         }
+        // §88. Frame callbacks this side answers, on their tick.
+        session.tick_frames(std::time::Instant::now());
+        to_client.extend_from_slice(&session.take_client_bytes());
 
         // --- writes ---------------------------------------------------------
         if !to_server.is_empty() {
