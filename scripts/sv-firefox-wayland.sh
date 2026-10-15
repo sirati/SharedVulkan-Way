@@ -74,7 +74,12 @@ export LD_LIBRARY_PATH="$VKLOADER/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 KIDS=()
-cleanup() { kill "${KIDS[@]}" 2>/dev/null; }
+cleanup() {
+  kill "${KIDS[@]}" 2>/dev/null
+  # Wine's server outlives the processes it served; this prefix is this
+  # harness's own, so stopping it stops nobody else's.
+  [ "${SERVER:-weston}" = wc-proxy ] && WINEPREFIX="$WINEPREFIX" wineserver -k 2>/dev/null
+}
 trap cleanup EXIT INT TERM
 
 mkdir -p "$RUN/xdg" "$RUN/profile" "$RUN/home" "$RUN/shots"
@@ -85,15 +90,17 @@ export XDG_RUNTIME_DIR="$RUN/xdg"
 # out. Firefox's gfxInfo calls Zink without a DRM node `mesa/software-unknown`
 # and blocklists hardware WebRender for it (docs/design.md §0.27.8), so with
 # them a run measures what the driver can do and without them it measures what
-# a profile nobody configured gets. `SVWL_FORCE=0` is the second (§0.28).
+# a profile nobody configured gets. `SVWL_FORCE=0` is the second (§0.28), and
+# `SVWL_FORCE=wr` is exactly what `wc-session` writes on a host with gpu.env:
+# `gfx.webrender.all` and nothing else.
 FORCE=${SVWL_FORCE:-1}
 : >"$RUN/profile/user.js"
-if [ "$FORCE" = 1 ]; then
-  cat >>"$RUN/profile/user.js" <<PREFS
-user_pref("gfx.webrender.all", true);
-user_pref("webgl.force-enabled", true);
-PREFS
-fi
+case "$FORCE" in
+  1) printf 'user_pref("gfx.webrender.all", true);\nuser_pref("webgl.force-enabled", true);\n' >>"$RUN/profile/user.js" ;;
+  wr) printf 'user_pref("gfx.webrender.all", true);\n' >>"$RUN/profile/user.js" ;;
+  0) ;;
+  *) echo "FAIL: SVWL_FORCE is 1, wr or 0"; exit 1 ;;
+esac
 cat >>"$RUN/profile/user.js" <<PREFS
 user_pref("gfx.webrender.software", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
@@ -105,6 +112,68 @@ user_pref("layout.css.devPixelsPerPx", "$DPPX");
 PREFS
 
 # ------------------------------------------------------------- compositor ---
+# Two servers, one socket name. `weston` is the control this file was written
+# for. `wc-proxy` is the deployed topology with the VM taken out: Firefox is a
+# client of `wc-proxy`, which offers `wl_shm` and nothing that carries a
+# descriptor, and which passes every buffer on through an arena to
+# `wc-compositor.exe` — here under Wine on an Xvfb, as `scripts/wc-proxy.sh`
+# runs it, rather than on the guest's desktop (docs/design.md §0.28).
+SERVER=${SVWL_SERVER:-weston}
+XN=${SVWL_XVFB:-$((90 + $$ % 9))}
+# A picture of whatever the server shows. weston's own screenshooter for
+# weston; the X root of the Xvfb the Wine desktop is on for wc-proxy.
+shot() {
+  if [ "$SERVER" = wc-proxy ]; then
+    local f="$RUN/shots/xroot-$(date +%H-%M-%S)"
+    DISPLAY=":$XN" timeout 20 xwd -root -silent -out "$f.xwd" 2>/dev/null \
+      && magick "$f.xwd" "$f.png" 2>/dev/null; rm -f "$f.xwd"
+  else
+    (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+  fi
+}
+if [ "$SERVER" = wc-proxy ]; then
+  WINBIN=${SVWL_WINBIN:-$ROOT/target/x86_64-pc-windows-gnu/debug}
+  [ -x "$WINBIN/wc-compositor.exe" ] && [ -x "$BIN/wc-proxy" ] \
+    || { echo "FAIL: needs $WINBIN/wc-compositor.exe and $BIN/wc-proxy"; exit 1; }
+  # Its own prefix, so that this never shares a wineserver with
+  # `wc-proxy.sh`'s or anybody else's.
+  export WINEPREFIX=${SVWL_WINEPREFIX:-/tmp/svwl-wineprefix-$(id -u)} WINEDEBUG=-all
+  # Wine refuses to create a prefix whose parent it does not own, and /tmp is
+  # root's; it is content to populate a directory that already exists.
+  mkdir -p "$WINEPREFIX"
+  say "wc-compositor.exe under Wine on Xvfb :$XN, wc-proxy in front of it — wl_shm and an arena"
+  Xvfb ":$XN" -screen 0 1600x1000x24 -nolisten tcp >"$RUN/xvfb.log" 2>&1 &
+  KIDS+=($!)
+  for _ in $(seq 1 100); do DISPLAY=":$XN" xwd -root -silent >/dev/null 2>&1 && break; sleep 0.1; done
+  # The compositor's arena. 256 MiB rather than the launcher's 64, because
+  # Firefox at 1280x900 keeps three 4.6 MB buffers per surface in flight and
+  # this run is about the GPU side, not about how wc-proxy copes when tight.
+  WCARENA=$((256 << 20))
+  truncate -s "$WCARENA" "$RUN/wc-arena"
+  mkdir -p "$RUN/keymaps"
+  WSOCK="svwl-$$"
+  # A file arena is a fixture, and wc-compositor refuses one unless told this
+  # is a fixture run: there is no guest RAM on a box with no hypervisor.
+  DISPLAY=":$XN" SV_ALLOW_FILE_ARENA=1 wine explorer "/desktop=svwl$$,1600x1000" "$WINBIN/wc-compositor.exe" \
+    --socket "$WSOCK" --timeout $((SECS + 400)) \
+    --arena "0:$WCARENA:$(winepath -w "$RUN/wc-arena")" \
+    --shared-dir "$(winepath -w "$RUN/keymaps")" --shared-peer-prefix "$RUN/keymaps/" \
+    --log "$(winepath -w "$RUN/compositor.log")" >"$RUN/wine.log" 2>&1 &
+  KIDS+=($!)
+  NODE=""
+  for _ in $(seq 1 300); do
+    NODE=$(find "$WINEPREFIX/drive_c" -type s -name "$WSOCK" 2>/dev/null | head -1)
+    [ -n "$NODE" ] && break; sleep 0.2
+  done
+  [ -n "$NODE" ] || { echo "FAIL: wc-compositor.exe never listened"; tail -5 "$RUN/wine.log"; exit 1; }
+  SV_ALLOW_FILE_ARENA=1 "$BIN/wc-proxy" --upstream "$NODE" --socket svwl --runtime-dir "$RUN/xdg" --copy damage \
+    --transport arena --arena-path "$RUN/wc-arena" --arena-id 0 --arena-size "$WCARENA" \
+    --accept-timeout 120 --timeout $((SECS + 400)) >"$RUN/proxy.log" 2>&1 &
+  KIDS+=($!)
+  for _ in $(seq 1 80); do [ -S "$RUN/xdg/svwl" ] && break; sleep 0.25; done
+  [ -S "$RUN/xdg/svwl" ] || { echo "FAIL: wc-proxy never listened"; cat "$RUN/proxy.log"; exit 1; }
+  [ "$MODE" = x11 ] || [ "$MODE" = soak-x11 ] && { echo "FAIL: the X11 modes need weston"; exit 1; }
+else
 # `--renderer=pixman` is the whole point: a GL renderer would advertise
 # `zwp_linux_dmabuf` and Mesa would take a path the real topology does not have.
 say "weston, headless, pixman renderer — wl_shm and nothing else"
@@ -113,6 +182,7 @@ weston --backend=headless --renderer=pixman --width=1600 --height=1000 \
 KIDS+=($!)
 for _ in $(seq 1 40); do [ -S "$RUN/xdg/svwl" ] && break; sleep 0.5; done
 [ -S "$RUN/xdg/svwl" ] || { echo "FAIL: weston never listened"; cat "$RUN/weston.log"; exit 1; }
+fi
 
 # --------------------------------------------------------------- GPU side ---
 say "sv-gpu-server on this machine's RADV"
@@ -130,11 +200,12 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
         BEGIN { t0 = systime(); last = t0 }
         /^\[trace\]/ { n[$2]++; total++
           if (systime() - last >= 30) {
-            printf "t=%ds total=%d submit=%d present=%d draw=%d pools=+%d/-%d cbs=+%d/-%d\n", systime() - t0, total,
+            printf "t=%ds total=%d submit=%d present=%d draw=%d pools=+%d/-%d cbs=+%d/-%d mem=+%d/-%d\n", systime() - t0, total,
               n["vkQueueSubmit"] + n["vkQueueSubmit2"], n["vkQueuePresentKHR"],
               n["vkCmdDraw"] + n["vkCmdDrawIndexed"] + n["vkCmdDrawIndirect"],
               n["vkCreateCommandPool"], n["vkDestroyCommandPool"],
-              n["vkAllocateCommandBuffers"], n["vkFreeCommandBuffers"] >> out
+              n["vkAllocateCommandBuffers"], n["vkFreeCommandBuffers"],
+              n["vkAllocateMemory"], n["vkFreeMemory"] >> out
             fflush(out); delete n; total = 0; last = systime() }
           next }
         # One line per recorded command, and the counts above already say
@@ -174,7 +245,7 @@ if [ "$MODE" = probe ]; then
   EGL_PLATFORM=wayland timeout 40 $CMD >"$RUN/probe.log" 2>&1 &
   P=$!
   sleep 20
-  (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+  shot
   wait $P 2>/dev/null
   head -40 "$RUN/probe.log"
   say "---- the ICD ----"; grep -iE "sv-icd|wl_shm|wayland|surface" "$RUN/probe.log" | head -20
@@ -305,7 +376,7 @@ HTML
   STARTED=$(date +%s)
   # A screenshot a minute, so the record has pictures from the whole run, and
   # whether the parent process has our ICD mapped at that moment.
-  ( while kill -0 $FF 2>/dev/null; do sleep 60; (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+  ( while kill -0 $FF 2>/dev/null; do sleep 60; shot
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
     done ) &
   KIDS+=($!)
@@ -314,7 +385,7 @@ HTML
   DRIVER=$?
   ALIVE=0; kill -0 $FF 2>/dev/null && ALIVE=1
   LIVED=$(( $(date +%s) - STARTED ))
-  (cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+  shot
   kill $FF 2>/dev/null; wait $FF 2>/dev/null
 
   fail=0
@@ -373,8 +444,8 @@ FF=$!
 KIDS+=($FF)
 
 sleep $((SECS - 15))
-say "screenshot through weston's own screenshooter"
-(cd "$RUN/shots" && timeout 20 weston-screenshooter >/dev/null 2>&1)
+say "screenshot of what $SERVER shows"
+shot
 wait $FF 2>/dev/null
 
 say "---- firefox stderr (the GFX1 lines are the arbiter's negative half) ----"
