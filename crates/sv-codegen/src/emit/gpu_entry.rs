@@ -693,11 +693,30 @@ fn emit_forward_command(
     // Captured *before* the handle map, because the map overwrites the app
     // side's id with the driver's handle and the table is keyed by the id.
     let mut unbind = Vec::new();
+    // The object a `vkDestroyX` destroys is an `X`, **even when `X` is on the
+    // parent list** (waycompose-design.md §87). `VkCommandPool` and
+    // `VkDescriptorPool` are there because `vkFreeCommandBuffers` and
+    // `vkFreeDescriptorSets` name them as the parent of what they free — and
+    // the same exclusion kept `vkDestroyCommandPool` and
+    // `vkDestroyDescriptorPool` from ever unbinding the pool itself. Every
+    // destroyed pool stayed in the table under its stale driver handle, which
+    // was harmless until §87 began destroying what a session left behind: the
+    // guest's Intel driver faulted on the second `vkDestroyCommandPool` of a
+    // pool `video-probe` had already destroyed. The instance and the device are
+    // excepted because they are this process's, not the application's.
+    let destroyed = c
+        .name
+        .strip_prefix("vkDestroy")
+        .map(|s| format!("Vk{s}"))
+        .filter(|t| t != "VkInstance" && t != "VkDevice");
     if c.name.starts_with("vkDestroy") || c.name.starts_with("vkFree") {
         for f in &wire.inputs {
             let id = naming::ident(&f.rust_name);
             match &f.shape {
-                Shape::Scalar(Scalar::Handle(h)) if !PARENT_HANDLES.contains(&h.as_str()) => {
+                Shape::Scalar(Scalar::Handle(h))
+                    if !PARENT_HANDLES.contains(&h.as_str())
+                        || destroyed.as_deref() == Some(h.as_str()) =>
+                {
                     unbind.push(quote!(__gone.push(a.#id.0);));
                 }
                 Shape::Array { elem, .. } => {

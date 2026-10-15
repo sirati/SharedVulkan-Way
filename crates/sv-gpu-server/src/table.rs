@@ -416,6 +416,28 @@ impl Objects {
         Ok(n)
     }
 
+    /// [`Objects::leftovers`] one by one: `(type, app id, driver handle)`.
+    pub fn leftover_handles(&self) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = self
+            .map
+            .iter()
+            .filter(|(_, o)| {
+                !matches!(
+                    o.ty,
+                    HandleType::VkInstance
+                        | HandleType::VkPhysicalDevice
+                        | HandleType::VkDevice
+                        | HandleType::VkQueue
+                        | HandleType::VkCommandBuffer
+                        | HandleType::VkDescriptorSet
+                )
+            })
+            .map(|(id, o)| (format!("{:?}", o.ty), *id, o.raw))
+            .collect();
+        v.sort();
+        v
+    }
+
     /// What the application created and did not destroy, by type
     /// (waycompose-design.md §87).
     ///

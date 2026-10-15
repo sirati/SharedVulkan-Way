@@ -1096,9 +1096,32 @@ fn serve(
             let _sock = sock;
             let _region = control_region;
             let _file = control_file;
-            match session::serve(control, shared, slot_count, std::time::Duration::from_secs(30)) {
+            match session::serve(control, Arc::clone(&shared), slot_count, std::time::Duration::from_secs(30)) {
                 Ok(n) => eprintln!("[gpu] session {i} finished, {n} commands dispatched"),
                 Err(e) => eprintln!("[gpu] session {i} ended: {e}"),
+            }
+            // What the application left in the table, for the record
+            // (waycompose-design.md §87): the ivshmem path destroys these to
+            // reuse a slot, and an entry here that the application *did*
+            // destroy would be destroyed twice. Printed, never acted on, on
+            // this path.
+            if let Ok(mut o) = shared.objects.lock() {
+                let left = o.leftover_handles();
+                if !left.is_empty() {
+                    eprintln!("[gpu] session {i} left {} object(s): {left:x?}", left.len());
+                    // The ivshmem path's cleanup, run here on request so it can
+                    // be proven on a local driver, under the validation layer,
+                    // before the guest's driver sees it (§87).
+                    if std::env::var_os("SV_DESTROY_LEFTOVERS").is_some_and(|v| v == "1") {
+                        let arena = shared.arena.memory;
+                        let d = &shared.driver.device;
+                        let r = unsafe {
+                            let _ = d.device_wait_idle();
+                            o.destroy_leftovers(d, arena)
+                        };
+                        eprintln!("[gpu] session {i}: destroy_leftovers -> {r:?}");
+                    }
+                }
             }
         }));
     }
