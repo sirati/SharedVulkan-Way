@@ -1506,6 +1506,12 @@ impl State {
         })
     }
 
+    /// §85. The toplevels that exist now, mapped or not: a toplevel that has
+    /// been created and has not drawn yet is an application on its way.
+    pub fn live_toplevels(&self) -> usize {
+        self.windows.values().filter(|w| matches!(w.role, Role::Toplevel(_))).count()
+    }
+
     /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
     /// bottom of the stack first.
     ///

@@ -283,6 +283,9 @@ struct Args {
     /// its own; it is deliberately **not** negotiated in the stream, which §72.3
     /// measured and rejected.
     in_band: bool,
+    /// §85. `--exit-when-empty <secs>`: end the process once it has had a
+    /// window and has had none for this long. See [`EmptyWatch`].
+    exit_when_empty: Option<Duration>,
 }
 
 /// The control socket, where one can exist, and nothing at all where one
@@ -364,6 +367,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         caption_buttons: true,
         control: None,
         in_band: false,
+        exit_when_empty: None,
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
@@ -597,6 +601,14 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                         return Err(2);
                     }
                 }
+            }
+            // §85. 0 means "as soon as the last window is gone".
+            "--exit-when-empty" => {
+                let Some(secs) = it.next().and_then(|s| s.parse::<u64>().ok()) else {
+                    eprintln!("wc-compositor: --exit-when-empty wants a number of seconds");
+                    return Err(2);
+                };
+                args.exit_when_empty = Some(Duration::from_secs(secs));
             }
             "--timeout" => {
                 args.idle_timeout = it
@@ -1363,7 +1375,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx, control, args.in_band);
+                args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -1379,6 +1391,90 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let _ = wayland.join();
 
     std::process::ExitCode::from(exit.load(Ordering::SeqCst))
+}
+
+/// §85. Decides when a session whose windows have all closed should end.
+///
+/// The launcher's session is the compositor (`wc-launch`'s `supervise` waits
+/// on it), and until §85 nothing ended it but its 12-hour deadline: closing
+/// Firefox left the compositor, the relay, the tunnel and the proxy up, holding
+/// the arena (§28.9 item 9). Now it ends `linger` after the last toplevel goes,
+/// which keeps a click shortly after a close warm and gives the memory back
+/// otherwise.
+///
+/// **A client connecting restarts the wait.** A click into a session with no
+/// windows starts an application that connects long before its first window —
+/// Firefox's first frame has been measured at fifteen seconds on the guest
+/// (§84) — and ending the session in that gap would be a click that opened
+/// nothing. A session that never had a window is not ended by this at all:
+/// that is a session still starting, and its deadline is `--timeout`'s.
+pub(crate) struct EmptyWatch {
+    linger: Duration,
+    since: Option<Instant>,
+    clients_seen: usize,
+}
+
+impl EmptyWatch {
+    pub(crate) fn new(linger: Duration) -> EmptyWatch {
+        EmptyWatch { linger, since: None, clients_seen: 0 }
+    }
+
+    /// One turn. `windows` is the number of toplevels that exist now, `ever`
+    /// whether any ever did, `clients_seen` the count of connections accepted
+    /// so far. True when the session should end.
+    pub(crate) fn tick(&mut self, now: Instant, windows: usize, ever: bool, clients_seen: usize) -> bool {
+        if clients_seen != self.clients_seen {
+            self.clients_seen = clients_seen;
+            self.since = None;
+        }
+        if !ever || windows > 0 {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.duration_since(since) >= self.linger
+    }
+}
+
+#[cfg(test)]
+mod empty_watch_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_ends_linger_after_its_last_window() {
+        let t = Instant::now();
+        let s = |n| t + Duration::from_secs(n);
+        let mut w = EmptyWatch::new(Duration::from_secs(60));
+        assert!(!w.tick(s(0), 1, true, 4), "a window is open");
+        assert!(!w.tick(s(10), 0, true, 4), "the wait starts");
+        assert!(!w.tick(s(69), 0, true, 4));
+        assert!(w.tick(s(70), 0, true, 4), "sixty seconds after the last window");
+    }
+
+    #[test]
+    fn a_new_window_or_a_new_client_restarts_the_wait() {
+        let t = Instant::now();
+        let s = |n| t + Duration::from_secs(n);
+        let mut w = EmptyWatch::new(Duration::from_secs(60));
+        w.tick(s(0), 1, true, 4);
+        w.tick(s(10), 0, true, 4);
+        // A click: the application connects at 50 s and has no window yet.
+        assert!(!w.tick(s(50), 0, true, 5));
+        assert!(!w.tick(s(100), 0, true, 5), "the wait restarted at the connect");
+        assert!(w.tick(s(110), 0, true, 5));
+        // And a window reappearing cancels it outright.
+        let mut w = EmptyWatch::new(Duration::from_secs(60));
+        w.tick(s(0), 0, true, 1);
+        assert!(!w.tick(s(30), 1, true, 1));
+        assert!(!w.tick(s(80), 0, true, 1), "the clock starts again at 80 s");
+    }
+
+    #[test]
+    fn a_session_that_never_had_a_window_is_not_ended_by_this() {
+        let t = Instant::now();
+        let mut w = EmptyWatch::new(Duration::from_secs(0));
+        assert!(!w.tick(t + Duration::from_secs(3600), 0, false, 3));
+    }
 }
 
 /// Everything Wayland, on its own thread.
@@ -1403,6 +1499,7 @@ fn wayland_thread(
     control: ControlHook,
     // §79. See `Args::in_band`.
     in_band: bool,
+    exit_when_empty: Option<Duration>,
 ) -> u8 {
     use std::io::Write as _;
 
@@ -1451,6 +1548,13 @@ fn wayland_thread(
 
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
+    let mut empty_watch = exit_when_empty.map(EmptyWatch::new);
+    if let Some(linger) = exit_when_empty {
+        println!(
+            "wc-compositor: will end the session {} s after its last window closes",
+            linger.as_secs()
+        );
+    }
     let mut code = 1u8;
     // STAGE 54. How many clients were still connected on the last turn, so the
     // window-leak report can tell "a window with nobody behind it" from "a
@@ -1695,6 +1799,18 @@ fn wayland_thread(
             } else {
                 0
             };
+            break;
+        }
+
+        if let Some(w) = empty_watch.as_mut()
+            && w.tick(Instant::now(), state.live_toplevels(), state.toplevels > 0, state.clients_seen)
+        {
+            println!(
+                "wc-compositor: the session's last window closed {} s ago and no client has \
+                 connected since; ending the session ({live} client(s) still connected)",
+                w.linger.as_secs()
+            );
+            code = 0;
             break;
         }
 
