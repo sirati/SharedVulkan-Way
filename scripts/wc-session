@@ -144,7 +144,12 @@ resolve_exec() {
   local base; base=$(basename "$want")
   local p; p=$(command -v "$base" 2>/dev/null)
   [ -n "$p" ] && { echo "$p"; return 0; }
-  p=$(ls -d /nix/store/*-"$base"-[0-9]*/bin/"$base" 2>/dev/null | sort -V | tail -1)
+  # Sorted by what follows the hash, not by the whole path: `sort -V` over
+  # whole store paths orders them by hash, and on testhost that picked
+  # firefox-151.0.2 over 157.0.1 -- a Firefox that never loaded the forwarded
+  # GPU (waycompose-design.md §87).
+  p=$(ls -d /nix/store/*-"$base"-[0-9]*/bin/"$base" 2>/dev/null \
+        | sed 's|^/nix/store/[^-]*-\(.*\)$|\1\t&|' | sort -V | tail -1 | cut -f2)
   [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
   return 1
 }
