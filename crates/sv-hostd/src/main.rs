@@ -57,7 +57,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
-                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N]"
+                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]"
             );
             return Err("no subcommand".into());
         }
@@ -404,9 +404,40 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    let drop_to = arg("--drop-to").map(|s| parse_drop_to(&s)).transpose()?;
+
     let mut sessions = Vec::new();
     for cold in &colds {
         sessions.push(qemu_session(&qmp, &hint, cold)?);
+    }
+
+    // **Root for the locate, and not one instruction longer** (waycompose-design.md
+    // §86). QMP and `/proc/<qemu-pid>/fd` are root's on a machine where QEMU is a
+    // system service, so the locate needs root; serving does not. With
+    // `--drop-to` this process becomes that user here, before it binds the
+    // socket an application connects to, and from then on the name it hands out
+    // is its *own* descriptor, `/proc/<this pid>/fd/<n>`, which the same user
+    // can open once the process is dumpable again. So the ICD — Firefox — runs
+    // as the user, where the harness used to run it as root because the only
+    // name on offer was QEMU's.
+    if let Some((uid, gid)) = drop_to {
+        let me = std::process::id();
+        for s in &mut sessions {
+            use std::os::fd::{AsFd, AsRawFd};
+            let own = format!("/proc/{me}/fd/{}", s.hostd.fd.as_fd().as_raw_fd());
+            s.attachment.object = own.clone();
+            s.attachment.arena_object = own;
+        }
+        drop_privileges(uid, gid)?;
+        // Checked rather than assumed: a name the user cannot open is a
+        // Firefox that falls back to software three layers up.
+        let name = &sessions[0].attachment.object;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
+            .map_err(|e| format!("after dropping to {uid}:{gid}, {name} does not open: {e}"))?;
+        eprintln!("sv-hostd: now uid {uid} gid {gid}; serving {name} and its siblings by this process's own descriptors");
     }
 
     let _ = std::fs::remove_file(&path);
@@ -464,6 +495,46 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// `UID:GID`, both numeric. Names are not resolved: this runs as root, and a
+/// lookup through NSS is more code running as root than the two numbers need.
+#[cfg(target_os = "linux")]
+fn parse_drop_to(s: &str) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let (u, g) = s.split_once(':').ok_or("--drop-to wants UID:GID")?;
+    let (uid, gid): (u32, u32) = (u.parse()?, g.parse()?);
+    if uid == 0 || gid == 0 {
+        return Err("--drop-to 0 is not a drop".into());
+    }
+    Ok((uid, gid))
+}
+
+/// Become `uid:gid` for good: no supplementary groups, real, effective and
+/// saved ids all changed, and then **dumpable again**, because `setuid` clears
+/// the flag and a non-dumpable process's `/proc/<pid>/fd` belongs to root.
+/// Refuses to return if root can be taken back.
+#[cfg(target_os = "linux")]
+fn drop_privileges(uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: plain syscalls on integers; no pointers but setgroups' null with
+    // a count of zero, which is the documented way to clear the list.
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            return Err(format!("setgroups: {}", std::io::Error::last_os_error()).into());
+        }
+        if libc::setresgid(gid, gid, gid) != 0 {
+            return Err(format!("setresgid {gid}: {}", std::io::Error::last_os_error()).into());
+        }
+        if libc::setresuid(uid, uid, uid) != 0 {
+            return Err(format!("setresuid {uid}: {}", std::io::Error::last_os_error()).into());
+        }
+        if libc::setuid(0) == 0 {
+            return Err("still able to become root after dropping privileges".into());
+        }
+        if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+            return Err(format!("PR_SET_DUMPABLE: {}", std::io::Error::last_os_error()).into());
+        }
+    }
     Ok(())
 }
 
