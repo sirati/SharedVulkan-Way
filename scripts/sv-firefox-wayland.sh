@@ -119,7 +119,7 @@ PREFS
 # `wc-compositor.exe` — here under Wine on an Xvfb, as `scripts/wc-proxy.sh`
 # runs it, rather than on the guest's desktop (docs/design.md §0.28).
 SERVER=${SVWL_SERVER:-weston}
-XN=${SVWL_XVFB:-$((90 + $$ % 9))}
+XN=""
 # A picture of whatever the server shows. weston's own screenshooter for
 # weston; the X root of the Xvfb the Wine desktop is on for wc-proxy.
 shot() {
@@ -141,10 +141,24 @@ if [ "$SERVER" = wc-proxy ]; then
   # Wine refuses to create a prefix whose parent it does not own, and /tmp is
   # root's; it is content to populate a directory that already exists.
   mkdir -p "$WINEPREFIX"
-  say "wc-compositor.exe under Wine on Xvfb :$XN, wc-proxy in front of it — wl_shm and an arena"
-  Xvfb ":$XN" -screen 0 1600x1000x24 -nolisten tcp >"$RUN/xvfb.log" 2>&1 &
-  KIDS+=($!)
-  for _ in $(seq 1 100); do DISPLAY=":$XN" xwd -root -silent >/dev/null 2>&1 && break; sleep 0.1; done
+  # **Xvfb picks its own display number**, and that is a fix rather than a
+  # style. This used `90 + $$ % 9`, and on a machine other people's harnesses
+  # share, that display was sometimes already somebody's: our Xvfb exited with
+  # "Server is already active for display 90", the readiness probe below
+  # succeeded against *their* server, and when their run ended Wine lost its X
+  # connection, wc-compositor.exe died, wc-proxy closed Firefox's socket and
+  # GDK took Firefox down with "Error reading events from display: Broken
+  # pipe" — twice, at 156 s and at 60 s, and it read as a crash of the path
+  # under test. A display number is a shared identity (firefox-accel.md, "The
+  # Wayland WSI", §6); `-displayfd` makes it this run's.
+  Xvfb -displayfd 7 -screen 0 1600x1000x24 -nolisten tcp >"$RUN/xvfb.log" 2>&1 7>"$RUN/xvfb.display" &
+  XPID=$!
+  KIDS+=($XPID)
+  for _ in $(seq 1 100); do [ -s "$RUN/xvfb.display" ] && break; sleep 0.1; done
+  XN=$(tr -dc 0-9 <"$RUN/xvfb.display")
+  { [ -n "$XN" ] && kill -0 "$XPID" 2>/dev/null; } \
+    || { echo "FAIL: Xvfb did not start"; cat "$RUN/xvfb.log"; exit 1; }
+  say "wc-compositor.exe under Wine on Xvfb :$XN (pid $XPID), wc-proxy in front of it — wl_shm and an arena"
   # The compositor's arena. 256 MiB rather than the launcher's 64, because
   # Firefox at 1280x900 keeps three 4.6 MB buffers per surface in flight and
   # this run is about the GPU side, not about how wc-proxy copes when tight.
