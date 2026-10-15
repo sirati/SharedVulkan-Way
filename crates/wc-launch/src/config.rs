@@ -117,16 +117,22 @@ pub struct Config {
     /// §86. The guest-side loopback port the tunnel forwards to the session's
     /// `audio.sock` on the VM host. 0 means `port + 1`.
     pub audio_port: u16,
-    /// §86. GPU sessions to offer each launcher session: that many
-    /// `sv-guest.exe gpu guest` processes, each its own large-page arena and its
-    /// own cold port, located on the VM host by `sv-hostd broker`. 0 (the
-    /// default) is no forwarded GPU and software rendering on the host.
+    /// §86, §87. The forwarded GPU: 0 (the default) is none, and software
+    /// rendering on the host. N > 0 starts **one** `sv-guest.exe gpu guest`
+    /// process on the GPU arena's ivshmem device, which serves up to N
+    /// sessions at once — as many as fit in the device, if fewer — each in its
+    /// own slot of the BAR. Until §87 it was N processes with N large-page
+    /// arenas that only a root broker on the host could locate.
     pub gpu_sessions: u32,
-    /// §86. The first GPU side's loopback port; the i-th is `gpu_port + i`.
-    /// 0 means `port + 10`.
+    /// §86. The GPU process's loopback port. 0 means `port + 10`.
     pub gpu_port: u16,
-    /// §86. Each GPU session's arena, MiB of the guest's RAM in large pages.
+    /// §86. Each GPU session's arena, MiB of its slot of the BAR.
     pub gpu_arena_mib: u64,
+    /// §87. The root-bus PCI slot of the GPU arena's ivshmem device, as the
+    /// VM's configuration pins it (`waycomposeArena.gpu.pciAddress`).
+    pub gpu_ivshmem_slot: u8,
+    /// §87. The doorbell's virtio-serial port name; empty is no doorbell.
+    pub gpu_bell: String,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -151,6 +157,8 @@ impl Default for Config {
             gpu_sessions: 0,
             gpu_port: 0,
             gpu_arena_mib: 64,
+            gpu_ivshmem_slot: 0x1d,
+            gpu_bell: "org.sirati.svbell.0".into(),
             apps: BTreeMap::new(),
         }
     }
@@ -238,6 +246,16 @@ impl Config {
                     cfg.gpu_port = v.parse().map_err(|e| format!("line {}: gpu-port: {e}", n + 1))?
                 }
                 ("session", "gpu-arena-mib") => cfg.gpu_arena_mib = num("gpu-arena-mib")?,
+                ("session", "gpu-ivshmem-slot") => {
+                    let s = match v.strip_prefix("0x") {
+                        Some(h) => u8::from_str_radix(h, 16).ok(),
+                        None => v.parse::<u8>().ok(),
+                    };
+                    cfg.gpu_ivshmem_slot = s.filter(|s| *s < 32).ok_or_else(|| {
+                        format!("line {}: gpu-ivshmem-slot is a PCI slot, 0..=0x1f", n + 1)
+                    })?
+                }
+                ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "audio-volume") => {
                     cfg.audio_volume = u8::try_from(num("audio-volume")?)
                         .ok()
@@ -301,10 +319,9 @@ impl Config {
         Ok(())
     }
 
-    /// §86. The i-th GPU side's loopback port.
-    pub fn gpu_port(&self, i: u32) -> u16 {
-        let base = if self.gpu_port != 0 { self.gpu_port } else { self.port.wrapping_add(10) };
-        base.wrapping_add(i as u16)
+    /// §86, §87. The GPU process's loopback port.
+    pub fn gpu_port(&self) -> u16 {
+        if self.gpu_port != 0 { self.gpu_port } else { self.port.wrapping_add(10) }
     }
 
     /// §86. Where the tunnel puts the session's sound on this machine.
@@ -483,16 +500,22 @@ mod audio_tests {
 mod gpu_tests {
     use super::*;
 
-    /// §86. No forwarded GPU unless the ini asks, and at most eight sessions.
+    /// §86, §87. No forwarded GPU unless the ini asks, at most eight sessions,
+    /// one port, and the ivshmem slot and doorbell port of testhost's VM
+    /// unless the ini names others.
     #[test]
     fn gpu_sessions_are_off_by_default_and_bounded() {
         let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
         let c = p("").unwrap();
         assert_eq!(c.gpu_sessions, 0);
-        assert_eq!(c.gpu_port(0), c.port + 10);
-        assert_eq!(c.gpu_port(3), c.port + 13);
-        assert_eq!(p("gpu-sessions = 4\ngpu-port = 50000\n").unwrap().gpu_port(1), 50001);
+        assert_eq!(c.gpu_port(), c.port + 10);
+        assert_eq!(p("gpu-sessions = 4\ngpu-port = 50000\n").unwrap().gpu_port(), 50000);
         assert!(p("gpu-sessions = 9\n").is_err());
         assert_eq!(c.gpu_arena_mib, 64);
+        assert_eq!((c.gpu_ivshmem_slot, c.gpu_bell.as_str()), (0x1d, "org.sirati.svbell.0"));
+        let o = p("gpu-ivshmem-slot = 0x1e\ngpu-bell =\n").unwrap();
+        assert_eq!((o.gpu_ivshmem_slot, o.gpu_bell.as_str()), (0x1e, ""));
+        assert_eq!(p("gpu-ivshmem-slot = 29\n").unwrap().gpu_ivshmem_slot, 0x1d);
+        assert!(p("gpu-ivshmem-slot = 0x20\n").is_err());
     }
 }

@@ -102,8 +102,10 @@ AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
 # ICD to the host, and writes `gpu-sessions = N` into the ini. gpu.env itself is
 # written on the host only with WC_LAUNCH_GPU_ENV=write; otherwise deploy prints
-# what it would contain. Either way the host also needs `sv-hostd broker`
-# running as root (docs/waycompose-design.md §86 has the command).
+# what it would contain. Since §87 nothing on either machine runs as root for
+# it: the guest's VM needs the GPU arena's ivshmem device (slot WC_LAUNCH_GPU_SLOT,
+# default 0x1d) and, for the doorbell, the port WC_LAUNCH_GPU_BELL; the host user
+# needs the device's group.
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
@@ -424,6 +426,8 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
+gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 
 [app.firefox]
 title = $TITLE
