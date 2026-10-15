@@ -780,6 +780,18 @@ numbers are in the same log.
   topology will call it. It is the right answer for a compositor that can
   advertise a device, and a `wc-proxy` that could is a different piece of work.
 
+**Later, and measured without a VM (2026-10-15, docs/design.md §0.27).** The X11
+path through kopper was reproduced on one workstation, and the "one frame, then
+nothing" above had two causes of ours: every `XPutImage` was `BadMatch`, because
+the image had the screen's default depth and Firefox's toplevel does not — so
+the frame was black — and since a0a48ec the X error handler took the very lock
+its caller held, so the first such error parked kopper's present thread for
+good. With both fixed, and two more (the debug-build stack, a blob race),
+Firefox ran 333 s of scripted use with about:support reading `WebRender` on
+`zink Vulkan 1.4(… RADV …)` — WebRender forced by `gfx.webrender.all`, because
+Firefox's blocklist calls Zink `mesa/software-unknown`. Whether these were also
+what testhost's 15 s stall was is not re-measured there.
+
 ---
 
 # The stall, decomposed — and it bottoms out in a `Duration` this tree already documents

@@ -410,24 +410,51 @@ fn emit_raise_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, String
 /// allocated. A link this build does not know is dropped, which is the only
 /// thing it can be — an unknown link has no C type to allocate.
 fn emit_raise_pnext(cx: &Ctx<'_>) -> TokenStream {
-    let arms = cx.wire.pnext_links.iter().filter_map(|(name, _)| {
-        if !raisable(cx, name) {
-            return None;
-        }
-        let v = naming::pnext_variant(name);
+    // **One `#[inline(never)]` helper per link, and arms that are tail calls**
+    // (docs/design.md §0.27). As `let mut __l: T = raise_x(..)?;` inside the
+    // `match`, every arm's C struct and `?` had its own slot in `raise_pnext`'s
+    // frame in a debug build: 204 KB, on the thread that serves a session.
+    let raisable_links: Vec<&(String, i64)> =
+        cx.wire.pnext_links.iter().filter(|(name, _)| raisable(cx, name)).collect();
+    let helpers = raisable_links.iter().map(|(name, _)| {
         let f = raise_fn(name);
         let ty = naming::type_ident(name);
-        Some(quote! {
-            sv_proto::PNextLink::#v(__inner) => {
+        let helper = format_ident!("raise_link_{}", naming::snake_case(name));
+        quote! {
+            #[inline(never)]
+            fn #helper(
+                __inner: &sv_proto::#ty,
+                __next: *const core::ffi::c_void,
+                __a: &mut crate::Raise,
+            ) -> sv_wire::Result<*const core::ffi::c_void> {
                 let mut __l: #ty = #f(__inner, &mut *__a)?;
                 // `pNext` is `const void*` in an input struct and `void*` in a
                 // `returnedonly` one, and both occur in the same chain.
                 __l.p_next = __next as _;
-                __a.one::<#ty>(__l) as *const core::ffi::c_void
+                Ok(__a.one::<#ty>(__l) as *const core::ffi::c_void)
             }
-        })
+        }
+    });
+    let arms = raisable_links.iter().map(|(name, _)| {
+        let v = naming::pnext_variant(name);
+        let helper = format_ident!("raise_link_{}", naming::snake_case(name));
+        quote!(sv_proto::PNextLink::#v(__inner) => #helper(__inner, __next, __a),)
     });
     quote! {
+        #(#helpers)*
+
+        /// One link, raised in front of `__next`. Every arm is a tail call.
+        fn raise_link(
+            __link: &sv_proto::PNextLink,
+            __next: *const core::ffi::c_void,
+            __a: &mut crate::Raise,
+        ) -> sv_wire::Result<*const core::ffi::c_void> {
+            match __link {
+                #(#arms)*
+                _ => Ok(__next),
+            }
+        }
+
         /// Rebuild a C `pNext` chain from the wire's flat, length-prefixed form.
         ///
         /// The chain is built **back to front**: a C link holds a pointer to the
@@ -446,10 +473,7 @@ fn emit_raise_pnext(cx: &Ctx<'_>) -> TokenStream {
         ) -> sv_wire::Result<*const core::ffi::c_void> {
             let mut __next: *const core::ffi::c_void = core::ptr::null();
             for __link in links.iter().rev() {
-                __next = match __link {
-                    #(#arms)*
-                    _ => __next,
-                };
+                __next = raise_link(__link, __next, &mut *__a)?;
             }
             Ok(__next)
         }
@@ -1372,57 +1396,21 @@ fn output_struct(f: &FieldPlan) -> Option<&str> {
 
 /// The full-lowering `pNext` walker: C chain → wire links, reading every member.
 ///
-/// A copy of `sv-icd-entry`'s `lower_pnext` in shape and a different function in
-/// substance, because the links it calls are the `lower_full_*` ones. The two
-/// cannot be shared: which of them is correct depends on which side is asking,
-/// not on the direction (see [`Ctx::lower_full`]).
+/// Emitted by the same function as `sv-icd-entry`'s `lower_pnext` and a different
+/// function in substance, because the links it calls are the `lower_full_*` ones:
+/// which of them is correct depends on which side is asking, not on the
+/// direction (see [`Ctx::lower_full`]).
 fn emit_lower_full_pnext(cx: &Ctx<'_>) -> TokenStream {
-    let arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
-        if !cx.shared_struct(name) {
-            return None;
-        }
-        let v = naming::pnext_variant(name);
-        let f = cx.lower_fn(name);
-        let ty = naming::type_ident(name);
-        let val = *value as i32;
-        Some(quote!(#val => sv_proto::PNextLink::#v(Box::new(#f(__p as *const #ty)?)),))
-    });
+    // The same walker as the app side's, from the same emitter: a table rather
+    // than a `match`, and each link lowered with its `pNext` cut so the walk does
+    // not recurse (docs/design.md §0.27). In a debug build this side's copy was
+    // a 136 KB frame.
+    let walker = super::icd_entry::emit_lower_walker(cx);
     quote! {
-        /// Walk a C `pNext` chain the **driver** filled in into wire links.
-        ///
-        /// # Safety
-        /// `head` is null or the chain this side raised and handed to the driver,
-        /// so every link is a struct of our own allocation whose `sType` we set.
-        pub unsafe fn lower_full_pnext(
-            head: *const core::ffi::c_void,
-            allowed: fn(i32) -> bool,
-        ) -> crate::LowerResult<Vec<sv_proto::PNextLink>> {
-            let mut out = Vec::new();
-            let mut __p = head;
-            let mut __guard = 0usize;
-            while !__p.is_null() {
-                __guard += 1;
-                if __guard > crate::MAX_PNEXT_LINKS {
-                    return Err(crate::LowerError::ChainTooLong);
-                }
-                let __base = __p as *const VkBaseInStructure;
-                let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
-                if allowed(__s_type) {
-                    let link = unsafe {
-                        match __s_type {
-                            #(#arms)*
-                            _ => {
-                                __p = __next as *const core::ffi::c_void;
-                                continue;
-                            }
-                        }
-                    };
-                    out.push(link);
-                }
-                __p = __next as *const core::ffi::c_void;
-            }
-            Ok(out)
-        }
+        /// One link's lowering, as a `pNext` dispatch-table entry.
+        type LowerLinkFn =
+            unsafe fn(*const core::ffi::c_void) -> crate::LowerResult<sv_proto::PNextLink>;
+        #walker
     }
 }
 
