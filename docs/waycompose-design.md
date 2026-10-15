@@ -27301,3 +27301,104 @@ check before and after each:
    it reports on the guest beyond `VkVideoDecodeCapabilitiesKHR` is a finding.
 6. **The user manager's groups** (87.4): until `user@1000` restarts, the ACLs
    are what lets user units open the files, and a VM restart drops them.
+
+### 87.12 Follow-up: the fixed build on the guest, the launcher switched on, and a fault in Firefox's decode
+
+Later the same evening, master 6789070 (this section's branch, merged) plus
+what is below. Each guest step had a health check before and after; all passed.
+
+**The fixed build, once each.** `video-probe decode` through the forwarder:
+`b3a1374e…` again, submit→fence median 0.705 ms, the one `GUARD` line for
+`VkVideoDecodeCapabilitiesKHR`, and the session `finished, 452 commands; slot
+released` with nothing left behind — the pools `video-probe` destroys are now
+unbound when it destroys them (87.7). The 330 s Firefox tour (`d1`): alive at the
+end, 61 loads in 11 rounds, 0 step errors, WebGL 192–209 frames in 3 s,
+**45.1 fps** while scrolling, 185 present notes at a mean 34.9 fps with the fence
+at **2.09 ms** (1.93–2.48) and the copy 1.06 ms, about:support as in 87.6, no
+fault. `glxtest` again left 17 objects, eight of them command pools; with the
+pools unbound on destroy these are pools it really did not destroy, and they
+were destroyed without incident.
+
+**The deployed launcher, switched on.** `wc-launch.sh deploy` for `wcivs` with
+`WC_LAUNCH_GPU_SESSIONS=3 WC_LAUNCH_GPU_ENV=write` and `mesa-kopper-wayland`
+26.2.4: 12 passed, 0 failed; `gpu.env` written, `gpu-sessions = 3` in the
+guest's ini. The first session ran **without** the GPU, and the reason was a bug
+in `wc-session`: `resolve_exec` sorted whole store paths with `sort -V`, which is
+an order by hash, and `firefox` resolved to **firefox-151.0.2** — a Firefox that
+never attached a session. It now sorts by what follows the hash. The second
+session: Firefox 157 with `SV_SOCKET`, `SV_BELL` and `VK_DRIVER_FILES` in its
+environment, two ICD sessions attached (`glxtest`, then the GPU process),
+`CLICK-TO-WINDOW 4406 ms`, no fault. That session's proxy and `sv-hostd` ran in
+`sirati`'s user manager, which has no `wc-arena` group (below).
+
+**Group access that survives.** Generation **53** (nix-config c1cd31a on
+3e4f6ad): the prepare step gives every `waycomposeArena.members` entry
+`u:<m>:rx` on the directory and `u:<m>:rw` on `arena` and `gpu`, and the
+doorbell's `ExecStartPost` `u:<m>:rw` on the socket, recreated on every VM
+start. `dry-activate`: only `windows-vm.service`, "would NOT stop"; `switch`:
+"NOT restarting". Checked from a transient unit of the running user manager —
+`groups: 100 1 57 302`, `wc-arena` absent — both files read and writable, and
+`sv-hostd ivshmem-serve` held the doorbell and listened.
+
+**The readback Firefox, deployed**: `/nix/store/rk9rz146p8a31ffrd76pxbck4dn4pxjk-firefox-readback-157.0.1`
+copied to testhost and pinned as `~/wc-launch-ivs/bin/firefox-readback`; it
+carries `lib/firefox/.wc-vulkan-readback`. The deployed launcher does not use it
+(it runs `firefox`, which resolves to the stock 157), so decode stays off there.
+
+**H.264 in Firefox on the guest, once** (the test installation, the readback
+Firefox, a 1280×720 H.264 High clip looped every 10 s): Firefox chose the
+Vulkan decoder on the guest's GPU (`Selected Vulkan device for video decoding:
+Intel(R) UHD Graphics (vendorID=0x8086, deviceID=0xa7a8)`, `[VULKAN] readback:
+decoded frames are copied to host memory`) and the RDD log has **1145**
+`[VULKAN] readback: 1280x720 frame copied to host memory` lines; the page counted
+1147 frames, 40 dropped, `err=none`, for 38 s. Then the GPU side faulted:
+
+```
+[gpu] FAULT: exception 0xc0000005 at 0x7ff92d30185b in …\igvk64.dll+0x2f185b
+[gpu] FAULT: read of 0x7c
+  ring 1: seqno 368 vkGetPhysicalDeviceImageFormatProperties2 (returned)
+  ring 2: seqno 48482 vkWaitForFences (returned)   ring 3: seqno 4654 vkQueueSubmit (returned)
+  20: <sv_gpu_entry::Forward<…GpuServer> as sv_proto::Server>::cmd_decode_video_khr
+  22: sv_proto::subdecode   23: sv_gpu_server::session::drain
+```
+
+— inside Intel's `vkCmdDecodeVideoKHR`, replayed from a command blob, with the
+page then at `err=3` (decode). The last readback lines come from a second
+decoder instance (`MediaPDecoder #2`), so the fault came around the clip's fourth
+loop. The VM stayed up; QEMU logged the iGPU going D0→D3 with the BARs unmapped
+first. **By §86.5's rule GPU work on the guest stopped**, and so did this
+section's guest steps: no about:support Media evidence was captured (the
+driver's snapshot would have come after the clip), and decode is **not** enabled
+in the launcher. Not reproduced locally: the same Firefox, clip and harness
+(`sv-firefox-vulkan-decode.sh 90`, an API dump on the GPU side) decoded 2249
+frames on RADV with the usual 96 MiB arena and 2155 with the guest's 64 MiB, no
+error; the dumped `vkCmdDecodeVideoKHR`s are well formed (bitstream buffer and
+range, a setup slot, three reference slots, each with an image view). A read of
+`0x7c` is a null structure's field, so the first suspect is an argument the
+forwarder hands Intel as null only when ffmpeg re-initialises a decoder; that is
+an inference from the address, not a finding.
+
+**Not run, by the same rule**: ffmpeg through the forwarder and the validation
+layer on the guest (video-decode.md §7.9 steps 4–5).
+
+| what | where now |
+|---|---|
+| forwarded GPU in the deployed launcher (`wcivs`) | **on**: `gpu-sessions = 3`, `gpu.env`, stock Firefox 157, no decode prefs |
+| Vulkan decode in the launcher | off: the deployed `firefox` has no readback marker |
+| testhost NixOS | generation 53 |
+| test installation `wcgpu` | the readback Firefox and `MOZ_LOG` in its `gpu.env`; the fixed build |
+
+What remains, in place of 87.11's items 1 and 2: the `igvk64.dll+0x2f185b` fault
+in `vkCmdDecodeVideoKHR` after about a thousand frames, found on our side
+without the guest (a GPU-side log of every decode's pointers and the decoder's
+re-initialisation is the cheapest next step), before decode is offered again.
+Whether the forwarded GPU should stay switched on in the deployed launcher while
+that is open is a call for whoever owns the guest: the fault needs the readback
+Firefox, which the launcher does not run; to switch it off, `gpu-sessions = 0` in
+`C:\Users\<guest-user>\wcivs\wc-launch.ini`.
+
+Gates at the commit that adds 87.12: `cargo test --workspace --no-fail-fast`
+**100 binaries, 2800 passed, 0 failed**; clippy exit 0 with no warning in a line
+this branch wrote; `cargo check --target x86_64-pc-windows-gnu` exit 0;
+`wc-pool: OK`, `wc-keymap: OK`. (The `wc-session` change has no unit test;
+`bash -n` and the deployed run above are its checks.)
