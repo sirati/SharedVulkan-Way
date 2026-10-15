@@ -49,7 +49,7 @@ impl SlotPlan {
     pub fn new(region_len: u64, geometry: Geometry, max: u32) -> Result<SlotPlan, String> {
         let control_len = geometry.control_size;
         let arena_len = geometry.arena_size;
-        if control_len % PAGE as u64 != 0 || arena_len % PAGE as u64 != 0 {
+        if !control_len.is_multiple_of(PAGE as u64) || !arena_len.is_multiple_of(PAGE as u64) {
             return Err("the control region and the arena must be whole pages".into());
         }
         let slot_len = control_len + arena_len;
