@@ -200,7 +200,7 @@ impl Stores {
     /// raise pool, and its `pReferenceSlots` array may be written.
     pub unsafe fn begin(&mut self, cb: u64, info: *const VkVideoBeginCodingInfoKHR) {
         let Some(info) = (unsafe { info.as_ref() }) else { return };
-        let session = info.video_session as u64;
+        let session = info.video_session;
         self.scope.insert(cb, session);
         let s = self.sessions.entry(session).or_default();
         let n = info.reference_slot_count as usize;
@@ -372,7 +372,7 @@ mod tests {
         };
         free(setup);
         free(reference);
-        assert_eq!(unsafe { (*kept).image_view_binding } as u64, 0xA1);
+        assert_eq!(unsafe { (*kept).image_view_binding }, 0xA1);
         assert_eq!(unsafe { (*kept_std).frame_num }, 3);
         assert_eq!(unsafe { *(*stable).p_reference_slots }.slot_index, 0);
 
@@ -383,7 +383,7 @@ mod tests {
         info.reference_slot_count = 0;
         let stable2 = unsafe { st.decode(cb, &info) }.unwrap();
         assert_eq!(stable2, stable, "one decode store per setup slot");
-        assert_eq!(unsafe { (*kept).image_view_binding } as u64, 0xB1);
+        assert_eq!(unsafe { (*kept).image_view_binding }, 0xB1);
         assert_eq!(unsafe { (*kept_std).frame_num }, 9);
         assert_eq!(st.counts(), (2, 1));
         free(again);
@@ -403,7 +403,7 @@ mod tests {
         let p = elems[0].p_picture_resource;
         assert_ne!(p, unsafe { &raw const (*r).pic }, "the element now points into the store");
         free(r);
-        assert_eq!(unsafe { (*p).image_view_binding } as u64, 0xC4);
+        assert_eq!(unsafe { (*p).image_view_binding }, 0xC4);
     }
 
     /// Another codec's chain is left exactly as raised.

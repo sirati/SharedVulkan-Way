@@ -1811,6 +1811,10 @@ ones, each once.
 
 #### 7.11.4 The confirmation run: the view cache did not stop it
 
+> **[ANSWERED — §7.11.5.]** The experiment below was run: H1, and the fix is
+> in. Decode is on in the deployed launcher; the "Not done" paragraph is
+> superseded.
+
 The one confirmation run, at 22:00, with build 4281721: `sv-guest.exe`
 `88768149…`; the ICD was unchanged. The same session and drive as §7.11.2, with
 the same health checks before, during (52 samples, all good) and after. QEMU
@@ -1886,6 +1890,113 @@ commit that adds this paragraph). `cargo test --workspace --no-fail-fast`:
 hand-written commands) and `ManuallyDrop::drop` of the loader under
 `Driver`'s lock, none of which Miri runs. They are covered by the real-driver
 tests on RADV and lavapipe.
+
+#### 7.11.5 H1 confirmed, the fix, and decode switched on
+
+Three more guest runs, each authorised and each with health checks before,
+during (every 15 s) and after. All were good. QEMU stayed pid 230263 from its
+17:44 start to the end.
+
+**The retention run (22:12, build 974e461, `SV_VIDEO_RETAIN=8192`):**
+§7.11.2's drive, then the 60 s extension. It made **3029 decodes, about ten
+loops and so ten packet-250 IDRs, with no fault**. There were 0 findings and
+`err=none` throughout. The GPU process's working set was 260 MB. The three
+runs before it each faulted by the first to fourth such IDR. So **H1**: the
+driver follows pointers into structures from earlier calls.
+Logs: `docs/video-decode/guest-7.11/retain/`.
+
+**The fix, exactly** (`sv_gpu_server::video_stable`). It does what native
+ffmpeg's memory does. ffmpeg builds the decode structures inside per-picture
+private data that its frame pool recycles and never frees. So a pointer the
+driver keeps always reads a structure of the right type, belonging to whichever
+picture now uses that memory. Per video session, the GPU side keeps:
+
+- one **slot store** per DPB slot index (and one for a begin's index -1):
+  `VkVideoReferenceSlotInfoKHR`, `VkVideoPictureResourceInfoKHR`,
+  `VkVideoDecodeH264DpbSlotInfoKHR`, `StdVideoDecodeH264ReferenceInfo`;
+- one **picture store** per setup slot (and one for a decode with none):
+  `VkVideoDecodeInfoKHR`, `VkVideoDecodeH264PictureInfoKHR`,
+  `StdVideoDecodeH264PictureInfo`, the slice offsets and the reference array.
+
+The stores are `Box::into_raw` allocations, written in place through those
+raw pointers only. Slice buffers that grow are retired, not freed. Everything
+is freed with the connection. `vkCmdBeginVideoCodingKHR`,
+`vkCmdDecodeVideoKHR` and `vkCmdEndVideoCodingKHR` are hand-written
+(`GPU_HAND_WRITTEN` section 7). Each call copies what it was given into the
+store for its slot, and the driver is handed pointers into the stores. The
+begin's array stays per call, as on ffmpeg's stack; its elements point into
+the slot stores. A chain this does not know is forwarded as raised, with one
+log line. The fix covers H.264 only, so on Intel's Windows driver
+(`refuses_push_binding_flags`'s test, vendor 0x8086 and driver id 5) the
+H.265, AV1 and VP9 decode extensions are **withheld**: neither enabled nor
+advertised, with a line saying so. Masking the family's codec bits was not
+enough. The guest's about:support still said AV1 and HEVC `HWDEC`, because
+Firefox reads the extension list. `SV_VIDEO_H264_ONLY=1` does the same on any
+driver.
+
+**Locally:**
+
+- `sv-video-decode.sh`: byte-identical to libavcodec for the fixture and for
+  ffmpeg's H.264 (B-frames, through the stores), H.265, Main10, AV1 and VP9.
+- The Firefox decode with the Intel shape and validation, 120 s: 3560 frames,
+  0 dropped, 0 findings, no new validation message.
+- With `SV_VIDEO_H264_ONLY=1`, an AV1 clip played in software: 1307 frames,
+  0 dropped, `err=none`, no Vulkan decode device created. H.264 still decoded
+  on the GPU, and about:support listed H264 alone as `HWDEC`.
+- `video_stable`'s three tests (a kept pointer still reads its slot after the
+  raised copies are freed and after the slot is set up again; a begin shares
+  the stores; an unknown chain is left alone) pass under Miri, leak check
+  included. Holding the stores as `Box`es failed Miri: the next call's
+  `&mut` re-borrow invalidated the pointers the driver holds. That is why
+  they are raw.
+
+**The confirmation run (22:31, build 1034d4e, no retention):** the same drive
+and extension, **3029 decodes, ten packet-250 IDRs, no fault**, 0 findings,
+`err=none`. The working set was 201 MB. Logs:
+`docs/video-decode/guest-7.11/fixed/`. The RDD log has 3024 `[VULKAN]
+readback` frames.
+
+**Decode switched on in the deployed launcher (22:44, build 0ae446c).** This
+is §87.11's item 2. `wc-launch.sh deploy` for `wcivs` used §87.12's variables
+plus `WC_LAUNCH_FIREFOX=~/wc-launch-ivs/bin/firefox-readback/bin/firefox`:
+12 passed, 0 failed, each binary byte-identical on the far side. The ini now
+runs the readback Firefox. `wc-session` sees its `.wc-vulkan-readback` marker
+and writes the three decode prefs into `~/.wc-launch/firefox/user.js`.
+Previous binaries are in `C:\Users\<guest-user>\wcivs-backup-7115` and
+`~/wc-launch-ivs-backup-7115`.
+
+One playback through it, in session 0: the clip looped 40 s, 1198 frames,
+`err=none`. The GPU log shows the RDD's fourth session and the withholding
+line. Marionette was added for this one capture (`marionette.port` in the
+ini's prefs, `MOZ_MARIONETTE` in `gpu.env`) and both were removed afterwards;
+`gpu.env` is byte-identical to the deployed one again. about:support, Media,
+verbatim:
+
+```
+Codec Name	Software Decoding	Hardware Decoding	Software Encoding	Hardware Encoding
+H264	Supported	Supported	Unsupported	Unsupported
+VP9	Supported	Unsupported	Unsupported	Unsupported
+VP8	Supported	Unsupported	Unsupported	Unsupported
+AV1	Supported	Unsupported	Unsupported	Unsupported
+HEVC	Supported	Unsupported	Unsupported	Unsupported
+```
+
+`HARDWARE_VIDEO_DECODING_VULKAN` reads `user force_enabled` and `env
+blocklisted (FEATURE_VIDEO_DECODING_VULKAN_DISABLED)`, exactly as in the
+test installation's run above, where the RDD log proves 3024 frames decoded
+on the GPU. The playback page and about:support are now in that profile's
+history. Logs: `docs/video-decode/guest-7.11/deployed/`.
+
+**Gates** at the commit that adds this section: `cargo test --workspace
+--no-fail-fast` gives **101 binaries, 2818 passed, 0 failed**, 8 ignored.
+Clippy has no warning in a file this branch touched; the Windows check, `wc-pool`
+and `wc-keymap` are OK. Miri: `video_stable` (3), `video_views` (3) and the six
+pure `features` tests.
+
+**Not done:** H.265, AV1 and VP9 on Intel's Windows driver. They need their
+own DPB-slot and picture-info structures in the stores, then a guest run each.
+Neither did anything run on the interactive desktop. Every run here was in
+session 0.
 
 ## What this does not tell us
 
