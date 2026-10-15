@@ -129,6 +129,9 @@ pub struct Objects {
     /// One entry per slab; `None` until `svImportArenaSlab` names it (§5.2).
     slabs: Vec<Option<vk::DeviceMemory>>,
     slab_size: u64,
+    /// Driver views of video images kept until their image goes
+    /// (`crate::video_views`, docs/video-decode.md §7.11).
+    pub video_views: crate::video_views::VideoViews,
 }
 
 impl Default for Objects {
@@ -145,6 +148,7 @@ impl Objects {
             arena: None,
             slabs: Vec::new(),
             slab_size: 1,
+            video_views: Default::default(),
         }
     }
 
@@ -365,8 +369,17 @@ impl Objects {
             return Err(unhandled);
         }
         let mut n = 0usize;
+        // Views kept for video images (`crate::video_views`) go with the other
+        // views, before the images; and two application ids may name one kept
+        // driver view, which is destroyed once.
+        let kept = self.video_views.take_all();
         for &ty in ORDER {
-            let raws: Vec<u64> = self.map.values().filter(|o| o.ty == ty).map(|o| o.raw).collect();
+            let mut raws: Vec<u64> = self.map.values().filter(|o| o.ty == ty).map(|o| o.raw).collect();
+            if ty == H::VkImageView {
+                raws.extend(kept.iter().copied());
+                raws.sort_unstable();
+                raws.dedup();
+            }
             for raw in raws {
                 // SAFETY: the caller's contract; each handle was created on
                 // `device` by this session and is destroyed exactly once,
@@ -669,6 +682,29 @@ mod tests {
                 )
                 .unwrap();
             add(&mut objs, HandleType::VkImageView, iview.as_raw());
+            // A view kept for a video image (`crate::video_views`): one only the
+            // cache holds, and a second application id naming the first view.
+            // Each driver view is destroyed once, and before the image.
+            let kept = d
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            level_count: 1,
+                            layer_count: 1,
+                            ..Default::default()
+                        }),
+                    None,
+                )
+                .unwrap();
+            objs.video_views.image_created(image.as_raw(), crate::video_views::VIDEO_DECODE_USAGE);
+            let mut desc = sv_proto::VkImageViewCreateInfo::default();
+            desc.image.0 = image.as_raw();
+            objs.video_views.keep(desc, kept.as_raw());
+            add(&mut objs, HandleType::VkImageView, iview.as_raw());
             let sampler = d.create_sampler(&vk::SamplerCreateInfo::default(), None).unwrap();
             add(&mut objs, HandleType::VkSampler, sampler.as_raw());
 
@@ -760,7 +796,7 @@ mod tests {
             d.device_wait_idle().unwrap();
             let n = objs.destroy_leftovers(d, arena).unwrap();
             let pipeline_objects = if crate::workload::spv_words().is_ok() { 2 } else { 0 };
-            assert_eq!(n, 18 + pipeline_objects, "everything but the arena, the device, the instance, the set and the command buffer");
+            assert_eq!(n, 19 + pipeline_objects, "everything but the arena, the device, the instance, the set and the command buffer, plus the kept view, and the doubly named view once");
             assert!(objs.leftovers().is_empty(), "{:?}", objs.leftovers());
             // The arena survived: freeing it now is legal only because it was not freed above.
             d.free_memory(arena, None);

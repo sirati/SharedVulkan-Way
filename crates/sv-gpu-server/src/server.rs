@@ -146,6 +146,24 @@ impl GpuServer {
         &self.shared.driver.device
     }
 
+    /// `vkDestroyImageView` on the driver, observed.
+    fn destroy_view_on_driver(&mut self, device: u64, view: u64) {
+        let Some(f) = self.fns().vk_destroy_image_view else {
+            self.note_missing("vkDestroyImageView");
+            return;
+        };
+        let words = [device, view, 0];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkDestroyImageView", false, &words, 0);
+        }
+        // SAFETY: both handles are the driver's, from the table or the cache.
+        unsafe { f(device as usize as _, view, core::ptr::null()) };
+        if obs {
+            self.observe("vkDestroyImageView", true, &words, 0);
+        }
+    }
+
     /// Record a table failure and turn it into a wire error.
     ///
     /// # It used to say `UnknownCommand { opcode: 0 }`, and that was a lie
@@ -708,6 +726,142 @@ impl GpuHost for GpuServer {
             self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
         }
         Ok(p::VkCreateBufferReply { result: p::VkResult(r.0), p_buffer: a.p_buffer })
+    }
+
+    // -- video images and their views (docs/video-decode.md §7.11) -----------
+    //
+    // Forwarded as the generated code would, plus `crate::video_views`: a video
+    // image's views are created once per description and destroyed with the
+    // image, because Intel's Windows driver reads a view after ffmpeg has
+    // destroyed it. The observer sees exactly the calls the driver sees.
+
+    fn create_image(&mut self, a: p::VkCreateImageArgs) -> WireResult<p::VkCreateImageReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_image_create_info(info, m)?;
+        }
+        let Some(f) = self.fns().vk_create_image else {
+            self.note_missing("vkCreateImage");
+            return Ok(p::VkCreateImageReply { result: p::VkResult(-3), p_image: None });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let ci = sv_gpu_entry::raise_vk_image_create_info(info, &mut pool)?;
+        let mut image = Default::default();
+        let device = a.device.0 as usize as _;
+        let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut image) as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCreateImage", false, &words, 0);
+        }
+        // SAFETY: `ci` and everything it points to live in `pool`.
+        let r = unsafe { f(device, &ci, core::ptr::null(), &mut image) };
+        if obs {
+            self.observe("vkCreateImage", true, &words, r.0);
+        }
+        if r.0 == 0 {
+            self.shared.objects().video_views.image_created(image as usize as u64, ci.usage.0);
+        }
+        if let Some(id) = a.p_image {
+            self.bind(id.0, HandleType::VkImage, image as usize as u64);
+        }
+        Ok(p::VkCreateImageReply { result: p::VkResult(r.0), p_image: a.p_image })
+    }
+
+    fn create_image_view(
+        &mut self,
+        a: p::VkCreateImageViewArgs,
+    ) -> WireResult<p::VkCreateImageViewReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_image_view_create_info(info, m)?;
+        }
+        use crate::video_views::Create;
+        let plan = if crate::video_views::enabled() {
+            self.shared.objects().video_views.lookup(info)
+        } else {
+            Create::Forward
+        };
+        if let Create::Reuse(view) = plan {
+            if let Some(id) = a.p_view {
+                self.bind(id.0, HandleType::VkImageView, view);
+            }
+            return Ok(p::VkCreateImageViewReply { result: OK, p_view: a.p_view });
+        }
+        let Some(f) = self.fns().vk_create_image_view else {
+            self.note_missing("vkCreateImageView");
+            return Ok(p::VkCreateImageViewReply { result: p::VkResult(-3), p_view: None });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let ci = sv_gpu_entry::raise_vk_image_view_create_info(info, &mut pool)?;
+        let mut view = Default::default();
+        let device = a.device.0 as usize as _;
+        let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut view) as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCreateImageView", false, &words, 0);
+        }
+        // SAFETY: `ci` and everything it points to live in `pool`.
+        let r = unsafe { f(device, &ci, core::ptr::null(), &mut view) };
+        if obs {
+            self.observe("vkCreateImageView", true, &words, r.0);
+        }
+        let view = view as usize as u64;
+        if r.0 == 0 && plan == Create::CreateAndKeep {
+            self.shared.objects().video_views.keep((**info).clone(), view);
+        }
+        if let Some(id) = a.p_view {
+            self.bind(id.0, HandleType::VkImageView, view);
+        }
+        Ok(p::VkCreateImageViewReply { result: p::VkResult(r.0), p_view: a.p_view })
+    }
+
+    fn destroy_image_view(&mut self, a: p::VkDestroyImageViewArgs) -> WireResult<()> {
+        let id = a.image_view.0;
+        let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let view = self.map_handle(HandleType::VkImageView, id)?;
+        self.unbind(id);
+        if view == 0 || self.shared.objects().video_views.is_kept(view) {
+            return Ok(());
+        }
+        self.destroy_view_on_driver(device, view);
+        Ok(())
+    }
+
+    fn destroy_image(&mut self, a: p::VkDestroyImageArgs) -> WireResult<()> {
+        let id = a.image.0;
+        let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let image = self.map_handle(HandleType::VkImage, id)?;
+        self.unbind(id);
+        if image == 0 {
+            return Ok(());
+        }
+        let kept = self.shared.objects().video_views.image_destroyed(image);
+        for view in kept {
+            self.destroy_view_on_driver(device, view);
+        }
+        let Some(f) = self.fns().vk_destroy_image else {
+            self.note_missing("vkDestroyImage");
+            return Ok(());
+        };
+        let words = [device, image, 0];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkDestroyImage", false, &words, 0);
+        }
+        // SAFETY: both handles are the driver's, from the table.
+        unsafe { f(device as usize as _, image, core::ptr::null()) };
+        if obs {
+            self.observe("vkDestroyImage", true, &words, 0);
+        }
+        Ok(())
     }
 
     fn free_memory(&mut self, a: p::VkFreeMemoryArgs) -> WireResult<()> {

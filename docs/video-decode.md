@@ -1692,6 +1692,118 @@ later drops its own driver on its own thread, and `glxtest`'s session closes
 while the browser's opens. `Driver::open` and `Driver`'s drop (including the
 loader's unload) now hold one process-wide lock.
 
+#### 7.11.2 The capture run on the guest: it faulted again, and the log says where
+
+One run, §7.10.6 as written, on 2026-10-15 at 21:36. The build was f8a2e37
+(§7.11.1): `sv-guest.exe` `e2c06903…` in `C:\Users\<guest-user>\wcgpu` and
+`libsv_icd.so` `fe55362c…` in `~/wc-launch-gpu/bin`. The session ran in session 0 with
+`SV_VIDEO_LOG` and `SV_MINIDUMP` in `wc-launch.exe`'s environment, and
+`decode-drive.py` drove it. Before it: ssh and ping were good, `query-status`
+said `running`, and QEMU (pid 230263, started 17:44, generation 51 or later;
+the system is 53) had logged `unmapping the BARs` since that start. A
+watchdog checked ssh, ping and QMP every 15 s throughout. It never failed.
+
+- **Every `vkCreateDevice` was accepted.** Intel took all of Firefox's
+  requests with the new feature chain: four sessions, no refusal, no
+  `GUARD`.
+- **It faulted, at the same instruction**, 18 s into the drive (page: 522
+  frames, `err=none` at its last sample). The fault was
+  `igvk64.dll+0x2f185b`, now a "read of `0xffffffffffffffff`". The VM kept
+  running. Health was good after it.
+- **The faulting call was `decode #551`**: an IDR (`idr_pic_id` 1) with setup
+  slot 1, no references, `sps0 pps0`, and a 32768-byte slice whose header the
+  log parsed as an IDR slice naming pps 0. It was the clip's packet-250 IDR
+  in its second loop. §87.12's fault was a few packets before packet 250 in
+  the fourth loop, by its buffered log, which is the same picture. **Zero
+  `!!` findings** in 551 decodes. Every handle was live, every slot in range,
+  every reference bound, every slice header right. The live set at the fault
+  was 1 session, 1 parameters object, 7 video images, 3 views and 3
+  bitstream buffers. Decode #251, the same IDR in loop 1, was identical in
+  every respect but one: the image behind the view. It decoded.
+- **Intel's own answers, recorded for the first time:** `caps codec 0x1:
+  flags 0x2 (SEPARATE_REFERENCE_IMAGES=1) decode flags 0x1 dpb slots 16 active
+  refs 16 bitstream align 4096/4096`. Decode flags `0x1` are
+  `DPB_AND_OUTPUT_COINCIDE`. §7.10.2's table said Intel lacks COINCIDE, and
+  the shape layer clears it, so **no local run ever took the guest's path**.
+  On the guest, in all 551 decodes, the output view is the setup view, and
+  ffmpeg creates that view for each frame on one of 7 frame-pool images and
+  destroys it when the frame is released.
+- **Views are the only objects that die.** Images, buffers, the session and
+  the parameters object live from start to fault. Views: 551 created, 548
+  destroyed. **539 of the creates land at a destroyed view's
+  address**, 289 in loop 1 and 250 in loop 2. In loop 2 an address names a
+  different image than it did in loop 1. `v1c87764a498` was image `…be2b8`
+  at #3 and image `…b5238` at #551.
+
+The minidump (21.9 MB, collected and then deleted from the guest), read with
+breakpad's `minidump_stackwalk`, the guest's own `igvk64.dll` and
+`igvkMedia64.dll`, and `llvm-objdump`:
+
+```
+igvk64.dll+0x2f1850:  mov %rdi,0x20(%rsp); push %r14; sub $0x20,%rsp
+igvk64.dll+0x2f185b:  mov 0x78(%rcx),%r8          <- fault
+rcx = 0x800006a722ca67ac  (non-canonical: a #GP, reported as a read of -1)
+caller, igvkMedia64.dll+0x2c63d..0x2c655:
+    rax = [arg2+0x208]; rcx = [[rax+0x10]]; call [r8+0x2588]   (CFG dispatch)
+```
+
+So Intel's media layer takes a resource (`arg2`) and follows two pointers from
+it to the driver object behind it, and that object pointer is garbage. In
+§87.12 it was `4` (`4 + 0x78` = the `0x7c` read). The intermediate objects are
+not in the dump: it keeps only memory reachable from stacks and registers.
+Every view the dump does contain carries Intel's view magic `0x01cdc0de` and a
+live image.
+
+**The reading.** Intel's decoder keeps something derived from a picture's
+view across decodes. ffmpeg destroys that view after the frame, and the
+driver later follows a pointer through the freed memory. Whether that
+faults, and with what, depends on what the allocator has put there since:
+nothing in loop 1, garbage at a later IDR. The specification binds each
+call's pictures through the views named in that call, so this is a driver
+defect. It is §7.10.5's candidate 1, now with the faulting instruction and
+the view churn measured. Candidates 2 and 3 are out: every slice header read
+right at record time, and no scope was open at a submit.
+
+#### 7.11.3 The workaround: a video image's views live as long as the image
+
+`sv_gpu_server::video_views`. `vkCreateImage`, `vkCreateImageView`,
+`vkDestroyImageView` and `vkDestroyImage` are now hand-written on the GPU side
+(`exceptions::GPU_HAND_WRITTEN`, section 7). They forward exactly as the
+generated code did, and they report to `SV_VIDEO_LOG` themselves. The
+cache works like this:
+
+- an image created with a video decode usage (`DST`, `SRC` or `DPB`) is
+  recorded;
+- the first `vkCreateImageView` of such an image with a given description
+  (the whole wire `VkImageViewCreateInfo`, handles mapped) creates a driver
+  view and keeps it; later identical requests get that driver view, and the
+  driver is not called;
+- `vkDestroyImageView` of a kept view does not reach the driver;
+- `vkDestroyImage` destroys the image's kept views first, then the image;
+- a session's leftovers (`Objects::destroy_leftovers`) destroy kept views with
+  the other views, before images, each driver view once, even when two
+  application ids named it.
+
+The application still gets one handle per call. ffmpeg asks for one or two
+descriptions per image, so the cache is bounded by images, not frames. It
+applies on every driver, so RADV runs the same code the guest does.
+`SV_VIDEO_VIEW_CACHE=0` turns it off.
+
+**Locally, on RADV with the Intel shape layer and validation, 120 s:**
+3564 frames decoded and read back, 0 dropped, H.264 `HWDEC`. `SV_VIDEO_LOG`:
+3566 decodes, 24 IDRs, **13 driver views created in the whole run, 0
+destroyed during it, 0 address reuses**, 0 findings. Validation: only §7.5's
+`pHostPointer` message. The Firefox soak of §7.11.1 again: 0 validation
+errors, the same verdicts. RADV cannot take the coincide path (it reports
+DISTINCT only), so the local run proves the cache and that nothing
+regressed. Only the guest can show the fault gone.
+
+Tests: `video_views`' three (one create per description, distinct
+descriptions and non-video images, leftovers) run under Miri, as do the six
+pure `features` tests. The real-driver leftover test now includes a kept view
+and a second id naming one view. It destroys 19 objects plus the pipeline
+ones, each once.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the
