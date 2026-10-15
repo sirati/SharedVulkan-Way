@@ -200,6 +200,11 @@ fi
 
 # --------------------------------------------------------------- GPU side ---
 say "sv-gpu-server on this machine's RADV"
+# `SVWL_GPU_ENV`: extra `NAME=value` words for the GPU side alone, e.g. a Vulkan
+# layer that should see what the driver is handed and not what Firefox sends
+# (docs/design.md §0.29 ran `VK_LAYER_LUNARG_api_dump` this way). Word-split,
+# never evaluated.
+read -r -a GPU_ENV <<<"${SVWL_GPU_ENV:-}"
 if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
   # **What the GPU side executed, per half minute.** `SV_TRACE` prints every
   # command; a five-minute browser run is millions of lines, so they are
@@ -207,7 +212,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
   # window in which something in Firefox rendered through this driver, which
   # about:support cannot say: its GPU rows come from the `glxtest` probe, not
   # from the context WebRender actually made.
-  ( VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 \
+  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 \
       --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 240)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" '
@@ -230,7 +235,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
   for _ in $(seq 1 40); do [ -s "$RUN/gpu.pid" ] && break; sleep 0.25; done
   KIDS+=($(cat "$RUN/gpu.pid"))
 else
-VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 fi
