@@ -190,7 +190,7 @@ if [ "$SERVER" = wc-proxy ]; then
   [ -n "$NODE" ] || { echo "FAIL: wc-compositor.exe never listened"; tail -5 "$RUN/wine.log"; exit 1; }
   SV_ALLOW_FILE_ARENA=1 "$BIN/wc-proxy" --upstream "$NODE" --socket svwl --runtime-dir "$RUN/xdg" --copy damage \
     --transport arena --arena-path "$RUN/wc-arena" --arena-id 0 --arena-size "$WCARENA" \
-    --accept-timeout 120 --timeout $((SECS + 400)) >"$RUN/proxy.log" 2>&1 &
+    --accept-timeout 120 --timeout $((SECS + 400)) ${SVWL_PROXY_EXTRA:-} >"$RUN/proxy.log" 2>&1 &
   KIDS+=($!)
   for _ in $(seq 1 80); do [ -S "$RUN/xdg/svwl" ] && break; sleep 0.25; done
   [ -S "$RUN/xdg/svwl" ] || { echo "FAIL: wc-proxy never listened"; cat "$RUN/proxy.log"; exit 1; }

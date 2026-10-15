@@ -149,16 +149,19 @@ def main(argv):
     fwd = shifts(px_c[s1], wc_c.get(s1, []), 1) if s1 is not None else {}
     cb_surf = {}
     px_done = collections.defaultdict(list)
+    # The compositor's answer arriving at the proxy. Older traces have only
+    # `px.done`, which was the same thing before the proxy answered any itself.
+    gdone = "px.gdone" if any(e == "px.gdone" for _, e, _, _ in host) else "px.done"
     for t, e, kv, _ in host:
         if e == "px.frame":
             cb_surf[kv.get("cb")] = kv.get("surf")
-        elif e == "px.done":
+        elif e == gdone:
             s = cb_surf.pop(kv.get("cb"), None)
             if s is not None:
                 px_done[s].append(t)
     wc_done = collections.defaultdict(list)
     for t, e, kv, _ in guest:
-        if e in ("wc.done", "wc.done_now"):
+        if e in ("wc.done", "wc.done_now", "wc.done_sub"):
             wc_done[kv.get("surf")] += [t] * max(1, num(kv, "n", 1))
     s2 = busiest(px_done)
     rev = shifts(px_done[s2], wc_done.get(s2, []), -1) if s2 is not None else {}
@@ -220,7 +223,7 @@ def main(argv):
         print("present-to-present   ", dist(intervals))
     for k, label in (("gap_us", "app (between presents)"), ("rt_us", "  of which round trips"),
                      ("rt", "  round trips (count)"), ("reset_us", "present: reset fence"),
-                     ("submit_us", "present: submit copy"), ("wait_us", "present: wait fence"),
+                     ("submit_us", "present: submit copy"), ("queued_us", "present: queued (pipelined)"), ("wait_us", "present: wait fence"),
                      ("show_us", "present: wl_shm put")):
         xs = [num(kv, k) for _, kv in P]
         if k == "rt":
@@ -276,9 +279,11 @@ def main(argv):
     for s in sorted(count_by, key=lambda s: -count_by[s]):
         print("surface %-6s frame requests %5d (%5.1f/s), buffer commits %5d; request->done %s" % (
             s, count_by[s], count_by[s] / (span / 1e6), buf_surfs.get(s, 0), dist(lat_by[s])))
-    dones = collections.Counter(e for t, e, kv, _ in G if e in ("wc.done", "wc.done_now"))
+    dones = collections.Counter(e for t, e, kv, _ in G if e in ("wc.done", "wc.done_now", "wc.done_sub"))
     if dones:
         print("guest answered: %s" % dict(dones))
+    srcs = collections.Counter(kv.get("src", "guest") for t, e, kv, _ in H if e == "px.done")
+    print("the client was answered by: %s" % dict(srcs))
 
     # ------------------------------------------------------------- guest --
     if G:
@@ -323,6 +328,7 @@ def main(argv):
         ("Firefox: between presents (WebRender, Zink, forwarded calls)", med([num(kv, "gap_us") for _, kv in P])),
         ("  of it, blocked on GPU-side round trips", med([num(kv, "rt_us") for _, kv in P])),
         ("present: reset + submit", med([num(kv, "reset_us") + num(kv, "submit_us") for _, kv in P])),
+        ("present: queued for the presenter thread (pipelined)", med([num(kv, "queued_us") for _, kv in P])),
         ("present: fence (GPU render tail + copy to arena + crossing)", med([num(kv, "wait_us") for _, kv in P])),
         ("present: copy arena -> wl_shm, attach, commit", med([num(kv, "show_us") for _, kv in P])),
         ("proxy: picks up the commit", med(lat)),
