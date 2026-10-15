@@ -378,12 +378,18 @@ do_deploy() {
   # own manifest and its own lock file: the repositories are one, so the absolute
   # path dependency that kept it excluded no longer exists (one-binary.md §1.3). The
   # merge deleted it outright; stage 14 put it back, because nothing replaced it.
-  cargo build -p wc-proxy -p wc-arena-host 2>&1 | grep -E '^error' | head -5
-  built_ok "${PIPESTATUS[0]}" "wc-proxy and wc-arena-host" || exit 1
+  cargo build -p wc-arena-host 2>&1 | grep -E '^error' | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-arena-host" || exit 1
+  # §88. wc-proxy in release: it copies every frame and parses every message
+  # of the session on the VM host's two cores, and the debug build's cost
+  # there was measured (a 24 ms p99 between a commit and its copy).
+  cargo build --release -p wc-proxy 2>&1 | grep -E '^error' | head -5
+  built_ok "${PIPESTATUS[0]}" "wc-proxy (release)" || exit 1
   local locator="$LINUX_BIN/wc-arena-host"
-  fresh "$LINUX_BIN/wc-proxy" "cargo build -p wc-proxy" || exit 1
+  local proxy="$REL_LINUX/wc-proxy"
+  fresh "$proxy" "cargo build --release -p wc-proxy" || exit 1
   fresh "$locator"            "cargo build -p wc-arena-host" || exit 1
-  for b in "$LINUX_BIN/wc-proxy" "$locator"; do
+  for b in "$proxy" "$locator"; do
     [ -x "$b" ] || { echo "error: no $b"; exit 1; }
   done
 
@@ -475,12 +481,12 @@ INI
   # inode it already has, which is the whole point of the trick.
   h "rm -f $HOSTDIR/bin/wc-proxy $HOSTDIR/bin/wc-arena-host" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$ROOT/scripts/wc-session" "$HOST:$HOSTDIR/" >/dev/null
-  scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOSTDIR/bin/" >/dev/null \
+  scp "${SSHOPT[@]}" "$proxy" "$locator" "$HOST:$HOSTDIR/bin/" >/dev/null \
     || { echo "error: scp to the VM host"; exit 1; }
   # STAGE 42, the host boundary. The unlink trick above means `scp` cannot fail
   # on a live binary any more, which removes the loud failure and leaves only
   # the quiet one: a copy that did not land where the run will look for it.
-  deployed_is "$LINUX_BIN/wc-proxy" "$HOSTDIR/bin/wc-proxy"      h "re-run $0 deploy" || exit 1
+  deployed_is "$proxy" "$HOSTDIR/bin/wc-proxy"      h "re-run $0 deploy" || exit 1
   deployed_is "$locator"            "$HOSTDIR/bin/wc-arena-host" h "re-run $0 deploy" || exit 1
   h "chmod 755 $HOSTDIR/wc-session $HOSTDIR/bin/*; \
      mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; \

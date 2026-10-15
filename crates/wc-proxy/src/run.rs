@@ -109,6 +109,10 @@ struct Args {
     scope: CopyScope,
     headroom: u64,
     trace: bool,
+    /// §88. Answer the client's frame callbacks here at this rate (0: forward
+    /// the compositor's), at most `pace_depth` ahead of it.
+    pace_hz: u32,
+    pace_depth: usize,
     /// §27. After every copy, compare the region against the client's own
     /// bytes and count the rows that differ. An instrument rather than a mode:
     /// it reads the whole extent every commit. See `Session::verify`.
@@ -204,6 +208,11 @@ usage: wc-proxy --upstream <path> [options]
 
   --copy pool|buffer|damage   how much to copy per commit (default damage)
   --trace                log every message in both directions
+  --pace-frames HZ       answer the client's frame callbacks here, HZ times a
+                         second, at most --pace-depth (default 3) ahead of the
+                         compositor's own answers; for a compositor whose answers
+                         cross a slow link (waycompose-design.md §88). Default 0:
+                         forward the compositor's
   --verify-damage        after every copy, compare the region against the
                          client's own bytes and report the rows that differ.
                          Reads the whole buffer per commit, so it is for finding
@@ -253,6 +262,8 @@ fn parse_args() -> Result<Args, String> {
         scope: CopyScope::Damage,
         headroom: 1,
         trace: false,
+        pace_hz: 0,
+        pace_depth: 3,
         verify: false,
         accept_timeout: Duration::from_secs(20),
         idle_timeout: Duration::from_secs(20),
@@ -312,6 +323,8 @@ fn parse_args() -> Result<Args, String> {
                 a.scope = CopyScope::parse(&v).ok_or_else(|| format!("--copy {v}?"))?;
             }
             "--trace" => a.trace = true,
+            "--pace-frames" => a.pace_hz = next()?.parse().map_err(|e| format!("--pace-frames: {e}"))?,
+            "--pace-depth" => a.pace_depth = next()?.parse().map_err(|e| format!("--pace-depth: {e}"))?,
             "--verify-damage" => a.verify = true,
             "--no-icons" => a.icons = false,
             "--no-clipboard" => a.clipboard = false,
@@ -935,6 +948,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let (spec, scope, headroom, trace, idle) =
             (spec.clone(), args.scope, args.headroom, args.trace, args.idle_timeout);
         let verify = args.verify;
+        let (pace_hz, pace_depth) = (args.pace_hz, args.pace_depth);
         // STAGE 11. The icon feed, one per served connection.
         //
         // **Per connection rather than per process**, which is a decision and
@@ -1047,6 +1061,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_trace(trace);
             session.set_verify(verify);
+            session.set_pacing(pace_hz, pace_depth);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
             match proxy::pump(
                 &mut session,
