@@ -375,9 +375,20 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--arena-frames" => args.arena_frames = it.next(),
-            // §84: the `VirtualLock` path, for a control run. See
-            // `wc_handle::arena::use_small_pages_only`.
-            "--arena-small-pages" => wc_handle::arena::use_small_pages_only(),
+            // §85: a guest-RAM arena is large pages or nothing. This is the
+            // `VirtualLock` path, for a control run, under a name that says
+            // what §84.5 and §84.7 measured it doing.
+            wc_handle::arena::SMALL_PAGES_FLAG => {
+                wc_handle::arena::allow_small_pages_that_may_corrupt_guest_memory()
+            }
+            wc_handle::arena::RETIRED_SMALL_PAGES_FLAG => {
+                eprintln!(
+                    "wc-compositor: --arena-small-pages was retired in §85: without large pages a \
+                     guest-RAM arena is refused, and the VirtualLock path is {} now",
+                    wc_handle::arena::SMALL_PAGES_FLAG
+                );
+                return Err(2);
+            }
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
             "--wayland-cold" => args.wayland_cold = it.next(),
@@ -904,6 +915,35 @@ mod file_arena_tests {
             }
             other => panic!("a permitted fixture was not allowed to run: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod page_policy_tests {
+    use super::*;
+
+    /// §85. §84's flag is refused at start with the new name in the message,
+    /// rather than ignored: a harness that still passed it would otherwise get
+    /// large pages and believe it had run the `VirtualLock` control.
+    #[test]
+    fn the_retired_small_pages_flag_is_refused() {
+        let argv: Vec<String> =
+            ["wc-compositor", "--arena-small-pages"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_args(&argv).err(), Some(2));
+    }
+
+    /// And the new one is accepted and turns the diagnostic policy on.
+    #[test]
+    fn the_flag_that_names_the_danger_selects_small_pages() {
+        let argv: Vec<String> = ["wc-compositor", wc_handle::arena::SMALL_PAGES_FLAG]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_args(&argv).is_ok());
+        assert_eq!(
+            wc_handle::arena::page_policy().unwrap(),
+            wc_handle::arena::PagePolicy::SmallPagesMayCorruptGuestMemory
+        );
     }
 }
 

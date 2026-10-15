@@ -13,6 +13,10 @@
 /// for the host's locator to be told about.
 #[test]
 fn a_committed_id_still_takes_a_tail_of_that_region() {
+    // §85: no hypervisor here, so nothing outside can write a moved page; and
+    // this machine reserves no hugetlb pages. Without this the commit below
+    // is refused and the test would skip instead of running.
+    wc_handle::arena::allow_small_pages_that_may_corrupt_guest_memory();
     const ARENA: u64 = 1 << 20;
     const WINDOW: u64 = 64 << 10;
     let id = 9_501;

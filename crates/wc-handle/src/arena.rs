@@ -255,25 +255,82 @@ pub const STAMP_FILL: u8 = 0xAB;
 /// The page size the stamps and the host's sweep both work in.
 pub use crate::platform::REGION_PAGE;
 
-/// §84. Whether [`attach_guest_ram`] may use large pages, for this process.
-///
-/// On by default, because on the Windows guest it is the only pinning that was
-/// measured to hold. The switch exists so the `VirtualLock` path stays
-/// reachable for a control run on one machine (`wc-compositor
-/// --arena-small-pages`): an environment variable does not reach a process the
-/// task scheduler starts. `WC_ARENA_NO_LARGE_PAGES` is honoured as well.
-static SMALL_PAGES_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// §85. The compositor flag that lets a guest-RAM arena be made of small,
+/// `VirtualLock`ed pages. Its name is the warning: §84.5 measured such pages
+/// moving to other physical frames while the host kept writing the old ones,
+/// and the one run that put them under the host's writes after that coincided
+/// with a guest hard hang (§84.7).
+pub const SMALL_PAGES_FLAG: &str = "--arena-small-pages-may-corrupt-guest-memory";
+/// The same switch as [`SMALL_PAGES_FLAG`], for a process that is not the
+/// compositor (`wc-poolcost`, a test). Any value turns it on.
+pub const SMALL_PAGES_ENV: &str = "WC_ARENA_SMALL_PAGES_MAY_CORRUPT_GUEST_MEMORY";
+/// §84's spellings. Both are refused by name rather than ignored, so a harness
+/// that still passes one fails at start with the new name in front of it
+/// instead of quietly getting large pages, or quietly getting nothing.
+pub const RETIRED_SMALL_PAGES_FLAG: &str = "--arena-small-pages";
+const RETIRED_SMALL_PAGES_ENV: &str = "WC_ARENA_NO_LARGE_PAGES";
 
-/// Refuse large pages for every guest-RAM region this process provides from now
-/// on. See [`SMALL_PAGES_ONLY`].
-pub fn use_small_pages_only() {
-    SMALL_PAGES_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+/// How a guest-RAM arena's pages are pinned. §85.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePolicy {
+    /// Large pages (Windows `MEM_LARGE_PAGES`, Linux `MAP_HUGETLB`) or refuse.
+    /// The default, and the only policy a deployment runs.
+    LargePagesOrRefuse,
+    /// `VirtualLock` / `mlock`, unconditionally. A diagnostic for a control
+    /// run on a machine whose owner accepts that the host may write into
+    /// memory the guest has since given to somebody else.
+    SmallPagesMayCorruptGuestMemory,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn large_pages_allowed() -> bool {
-    !SMALL_PAGES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var_os("WC_ARENA_NO_LARGE_PAGES").is_none()
+static SMALL_PAGES_DIAGNOSTIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make [`attach_guest_ram`] use [`PagePolicy::SmallPagesMayCorruptGuestMemory`]
+/// for the rest of this process. What [`SMALL_PAGES_FLAG`] calls.
+pub fn allow_small_pages_that_may_corrupt_guest_memory() {
+    SMALL_PAGES_DIAGNOSTIC.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The policy this process runs under: the flag, then [`SMALL_PAGES_ENV`];
+/// and `Err` if §84's environment variable is still set, so it cannot be
+/// mistaken for a switch that still works.
+pub fn page_policy() -> io::Result<PagePolicy> {
+    policy_from(
+        SMALL_PAGES_DIAGNOSTIC.load(std::sync::atomic::Ordering::Relaxed),
+        |k| std::env::var_os(k).is_some(),
+    )
+}
+
+/// [`page_policy`] with the process's state passed in, so the decision can be
+/// tested without touching the environment of a multi-threaded test binary.
+fn policy_from(flag: bool, env_set: impl Fn(&str) -> bool) -> io::Result<PagePolicy> {
+    if env_set(RETIRED_SMALL_PAGES_ENV) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{RETIRED_SMALL_PAGES_ENV} is set, and it no longer does anything: small pages are \
+                 refused unless {SMALL_PAGES_ENV} is set (or the compositor is given \
+                 {SMALL_PAGES_FLAG}), because §84 measured them moving under the host's writes"
+            ),
+        ));
+    }
+    if flag || env_set(SMALL_PAGES_ENV) {
+        Ok(PagePolicy::SmallPagesMayCorruptGuestMemory)
+    } else {
+        Ok(PagePolicy::LargePagesOrRefuse)
+    }
+}
+
+/// The message a refused guest-RAM arena carries: the platform's reason, then
+/// why there is no fallback, then what to do instead. One text for both
+/// platforms so the two cannot drift.
+pub(crate) fn refusal_text(why: &str) -> String {
+    format!(
+        "refusing a guest-RAM arena without large pages: {why}. Small pages are not a fallback \
+         (§84.5 measured VirtualLocked pages moving to other frames while the host wrote the old \
+         ones; §84.7, a guest hard hang). Use --arena-ivshmem (§83), or grant the account \
+         SeLockMemoryPrivilege (scripts/win-account-right.ps1) and retry soon after boot, or \
+         pass {SMALL_PAGES_FLAG} for a diagnostic run that accepts the risk"
+    )
 }
 
 /// What [`attach_guest_ram`] did, in the numbers a human needs to judge it.
@@ -292,8 +349,9 @@ pub struct GuestRegion {
     /// allowed to move afterwards, which would invalidate the host's map, so it
     /// is reported rather than swallowed.
     pub locked: bool,
-    /// How the pages were pinned: `large-pages`, `virtual-lock`, `mlock` or
-    /// `none`. §84: on the Windows guest `VirtualLock` keeps pages resident but
+    /// How the pages were pinned: `large-pages`, `hugetlb`, or — only under
+    /// [`PagePolicy::SmallPagesMayCorruptGuestMemory`] — `virtual-lock`, `mlock`
+    /// or `none`. §84: on the Windows guest `VirtualLock` keeps pages resident but
     /// was measured relocating them, so *which* lock it was is part of whether
     /// the host's map can be trusted, and it is reported beside `locked`.
     pub pinning: &'static str,
@@ -333,24 +391,37 @@ pub struct GuestRegion {
 /// later. That is a genuine limitation and not an oversight: re-locating would
 /// need a reserved, never-allocated stamp page, and nothing yet needs it.
 pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
+    attach_guest_ram_with(id, size, page_policy()?)
+}
+
+/// [`attach_guest_ram`] under an explicit [`PagePolicy`], rather than the
+/// process's. What a test that has to see both policies in one process calls.
+///
+/// Under [`PagePolicy::LargePagesOrRefuse`] the region may come back **longer
+/// than asked**: large pages come in their own size and `size` is rounded up to
+/// it. [`GuestRegion::len`] and `pages` are what was made, and every page of it
+/// is stamped.
+pub fn attach_guest_ram_with(id: u32, size: u64, policy: PagePolicy) -> io::Result<GuestRegion> {
     let len = usize::try_from(size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
     refuse_if_outbound(id)?;
     let run_id = random_run_id();
-    let (view, locked, pinning) = platform::alloc_locked_region(len, &|index, page| {
+    let small = policy == PagePolicy::SmallPagesMayCorruptGuestMemory;
+    let made = platform::alloc_locked_region(len, small, &|index, page| {
         page.fill(STAMP_FILL);
         page[STAMP_OFF_MAGIC..STAMP_OFF_MAGIC + 8].copy_from_slice(&STAMP_MAGIC);
         page[STAMP_OFF_RUN_ID..STAMP_OFF_RUN_ID + 8].copy_from_slice(&run_id.to_le_bytes());
         page[STAMP_OFF_PAGE_INDEX..STAMP_OFF_PAGE_INDEX + 4]
             .copy_from_slice(&index.to_le_bytes());
     })?;
+    let len = made.len;
     let mut guard = registry()
         .write()
         .map_err(|_| io::Error::other("arena registry poisoned"))?;
     guard.insert(
         id,
         Attached {
-            view: Arc::new(view),
+            view: Arc::new(made.view),
             len,
             origin: format!("guest RAM, run 0x{run_id:016x}"),
             provided: true,
@@ -358,8 +429,13 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
             fixed: false,
         },
     );
-    Ok(GuestRegion { run_id, len, pages: (len / REGION_PAGE) as u32, locked, pinning }
-    )
+    Ok(GuestRegion {
+        run_id,
+        len,
+        pages: (len / REGION_PAGE) as u32,
+        locked: made.locked,
+        pinning: made.pinning,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +774,9 @@ pub fn reserve_outbound(arena: u32, len: u64) -> io::Result<OutboundWindow> {
         // the ordering (see that function for what a dedicated region did and
         // did not change about the stamp race).
         let region = attach_guest_ram(arena, len)?;
+        // §85: large pages round the region up, and the window is the whole
+        // of it, so the host is told every page that carries a stamp.
+        let len = region.len as u64;
         let mut guard = outbound_slot()
             .lock()
             .map_err(|_| io::Error::other("outbound window poisoned"))?;
@@ -1600,6 +1679,77 @@ mod tests {
     const E: u32 = 9005;
     const F: u32 = 9006;
 
+    /// §85. Every guest-RAM arena in this module's tests is small pages,
+    /// asked for by name: there is no hypervisor here to write a moved page,
+    /// and this machine reserves no hugetlb pages. The refusal has its own
+    /// tests below, under the explicit default policy.
+    fn attach_small(id: u32, size: u64) -> io::Result<GuestRegion> {
+        attach_guest_ram_with(id, size, PagePolicy::SmallPagesMayCorruptGuestMemory)
+    }
+
+    /// §85. Under the default policy a region is large pages or an error;
+    /// never the `VirtualLock`/`mlock` path. Which of the two happens depends
+    /// on whether this machine reserves hugetlb pages, so both are accepted
+    /// and each is checked for what it must say.
+    #[test]
+    fn the_default_policy_is_large_pages_or_a_refusal_that_names_the_way_out() {
+        match attach_guest_ram_with(9020, (3 * REGION_PAGE) as u64, PagePolicy::LargePagesOrRefuse) {
+            Ok(r) => {
+                assert!(
+                    r.pinning == "large-pages" || r.pinning == "hugetlb",
+                    "default policy pinned with {}",
+                    r.pinning
+                );
+                assert!(r.locked);
+                // Rounded up to whole large pages, and every page stamped.
+                assert!(r.len >= 3 * REGION_PAGE && r.len.is_multiple_of(2 << 20), "len {}", r.len);
+                assert_eq!(r.pages as usize, r.len / REGION_PAGE);
+                release_guest_ram(9020).unwrap();
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+                let m = e.to_string();
+                assert!(m.contains("refusing a guest-RAM arena without large pages"), "{m}");
+                assert!(m.contains(SMALL_PAGES_FLAG), "{m}");
+                assert!(m.contains("--arena-ivshmem"), "{m}");
+                // Nothing was registered under the id.
+                assert!(release_guest_ram(9020).is_err());
+            }
+        }
+    }
+
+    /// §85. The diagnostic policy is the small-page path and says so in
+    /// `pinning`, which the compositor prints on the line a harness greps.
+    #[test]
+    fn the_diagnostic_policy_reports_small_pages_by_name() {
+        let r = attach_small(9021, (3 * REGION_PAGE) as u64).unwrap();
+        assert_eq!(r.len, 3 * REGION_PAGE, "small pages are not rounded");
+        assert_eq!(r.pages, 3);
+        let expect: &[&str] = if cfg!(windows) { &["virtual-lock", "none"] } else { &["mlock", "none"] };
+        assert!(expect.contains(&r.pinning), "pinning {}", r.pinning);
+    }
+
+    /// §85. The policy: the flag or the new variable turns small pages on;
+    /// nothing else does; §84's variable is an error, not a silent no-op.
+    #[test]
+    fn small_pages_need_the_flag_or_the_variable_and_the_old_variable_is_refused() {
+        let none = |_: &str| false;
+        assert_eq!(policy_from(false, none).unwrap(), PagePolicy::LargePagesOrRefuse);
+        assert_eq!(policy_from(true, none).unwrap(), PagePolicy::SmallPagesMayCorruptGuestMemory);
+        assert_eq!(
+            policy_from(false, |k: &str| k == SMALL_PAGES_ENV).unwrap(),
+            PagePolicy::SmallPagesMayCorruptGuestMemory
+        );
+        for flag in [false, true] {
+            let e = policy_from(flag, |k: &str| k == RETIRED_SMALL_PAGES_ENV).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(e.to_string().contains(SMALL_PAGES_ENV), "{e}");
+        }
+        // The names carry the danger, which is the point of them.
+        assert!(SMALL_PAGES_FLAG.contains("may-corrupt-guest-memory"));
+        assert!(SMALL_PAGES_ENV.contains("MAY_CORRUPT_GUEST_MEMORY"));
+    }
+
     /// Read a page's stamp the way the host's sweep does.
     fn stamp_of(page: &[u8]) -> ([u8; 8], u64, u32) {
         (
@@ -1618,7 +1768,7 @@ mod tests {
     #[test]
     fn every_page_of_a_guest_ram_arena_carries_its_own_index() {
         let pages = 5;
-        let region = attach_guest_ram(D, (pages * REGION_PAGE) as u64).unwrap();
+        let region = attach_small(D, (pages * REGION_PAGE) as u64).unwrap();
         assert_eq!(region.pages, pages as u32);
 
         let all = Handle::from_descriptor(Descriptor::ArenaSlice {
@@ -1643,8 +1793,8 @@ mod tests {
     /// arena rather than as two arenas.
     #[test]
     fn run_ids_differ_between_regions() {
-        let a = attach_guest_ram(E, REGION_PAGE as u64).unwrap();
-        let b = attach_guest_ram(F, REGION_PAGE as u64).unwrap();
+        let a = attach_small(E, REGION_PAGE as u64).unwrap();
+        let b = attach_small(F, REGION_PAGE as u64).unwrap();
         assert_ne!(a.run_id, b.run_id);
         assert_ne!(a.run_id, 0);
         assert_ne!(b.run_id, 0);
@@ -1653,7 +1803,7 @@ mod tests {
     /// The probe's write path, and the refusal that keeps it a probe.
     #[test]
     fn only_a_provided_arena_may_be_written_through() {
-        let region = attach_guest_ram(9008, (2 * REGION_PAGE) as u64).unwrap();
+        let region = attach_small(9008, (2 * REGION_PAGE) as u64).unwrap();
         guest_write(9008, 4096, b"HOSTPING").unwrap();
         let m = Handle::from_descriptor(Descriptor::ArenaSlice {
             arena: 9008,
@@ -1680,8 +1830,8 @@ mod tests {
     /// that carries no stamp and is silently missing from the host's map.
     #[test]
     fn a_partial_page_is_refused() {
-        assert!(attach_guest_ram(9007, 4095).is_err());
-        assert!(attach_guest_ram(9007, 0).is_err());
+        assert!(attach_small(9007, 4095).is_err());
+        assert!(attach_small(9007, 0).is_err());
     }
 
     // ---------------------------------------------------------------- 10 ---
@@ -1701,7 +1851,7 @@ mod tests {
     #[test]
     fn the_outbound_window_is_the_compositors_and_nothing_else_can_write_it() {
         let pages = 256u64;
-        let region = attach_guest_ram(OUT, pages * REGION_PAGE as u64).unwrap();
+        let region = attach_small(OUT, pages * REGION_PAGE as u64).unwrap();
         assert!(outbound().is_none(), "nothing may be outbound before it is reserved");
 
         // Not provided: refused. An arena somebody else owns has no bytes this
@@ -1735,7 +1885,7 @@ mod tests {
         );
         // And the region it was cut from cannot be swapped underneath it.
         assert_eq!(
-            attach_guest_ram(OUT, 4096).unwrap_err().kind(),
+            attach_small(OUT, 4096).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
 
@@ -1976,7 +2126,7 @@ mod release_tests {
         };
         // An id nothing else in this process uses; the registry is global.
         let id = 9_412;
-        let region = match attach_guest_ram(id, LEN) {
+        let region = match attach_guest_ram_with(id, LEN, PagePolicy::SmallPagesMayCorruptGuestMemory) {
             Ok(r) => r,
             // Pinning needs a working-set quota and the machine may refuse it.
             // A test that cannot commit has measured nothing and says so rather

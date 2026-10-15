@@ -239,6 +239,11 @@ block_linux() {
 export XDG_RUNTIME_DIR=/run/wcrt
 mkdir -p /run/wcrt && chmod 700 /run/wcrt
 uname -sr > /sv/guest-kernel.txt
+# §85: a guest-RAM arena is large pages or nothing, and on Linux that is
+# MAP_HUGETLB from the pool this reserves (none by default). The mlock path is
+# --arena-small-pages-may-corrupt-guest-memory and this leg does not take it.
+echo $((ARENA_MIB / 2 + 16)) > /proc/sys/vm/nr_hugepages
+echo "guest hugetlb: \$(grep -E 'HugePages_(Total|Free)' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
 /sv/wc-compositor --socket wl-vm --timeout $SECS \\
   --arena-guest-ram "0:$ARENA_SIZE" --arena-outbound "0:$ARENA_OUT" \\
   --arena-frames /sv/arena.frames \\
