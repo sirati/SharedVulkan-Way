@@ -25905,6 +25905,8 @@ directories. These are the deployment.
    ```
    export WC_LAUNCH_DIRNAME=wcivs WC_LAUNCH_HOSTDIR=~/wc-launch-ivs \
           WC_LAUNCH_TITLE="Firefox (Linux, ivshmem)" WC_LAUNCH_PORT=57441 WC_LAUNCH_SHOTDIR=ivshmem
+   nix develop -c scripts/wc-launch.sh deploy   # the guest's copy predates the merge of §82
+   nix develop -c scripts/wc-launch.sh install
    nix develop -c scripts/wc-launch.sh cold
    nix develop -c scripts/wc-launch.sh warm
    nix develop -c scripts/wc-launch.sh verify
@@ -25928,4 +25930,16 @@ directories. These are the deployment.
 
 ### 83.10 The gates
 
-*Recorded with the measurements in 83.8.*
+On the tree after merging master (fe24480, §82):
+
+| gate | result |
+|---|---|
+| `nix develop --command cargo test --workspace --no-fail-fast` | **93 binaries, 2740 passed, 0 failed** |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in the code this section added |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | both OK, both legs |
+
+Before the merge the suite was 92 binaries, 2709 passed, against the 2704
+baseline. This section adds five tests and alters none: three in
+`wc_handle::ivshmem`, one in `wc_handle::arena`, and one in
+`wc_proxy::guestram`. The rest of the post-merge count is master's.
