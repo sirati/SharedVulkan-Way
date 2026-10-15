@@ -166,33 +166,8 @@ struct Opened {
     has_dma_buf: bool,
     external_host: Option<ash::ext::external_memory_host::Device>,
     buffer_device_address: bool,
-}
-
-/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR`, vulkan_core.h 1.4.350.
-const STRUCTURE_TYPE_VIDEO_DECODE_VP9_FEATURES_KHR: i32 = 1_000_514_000;
-/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR`, vulkan_core.h 1.4.350.
-const STRUCTURE_TYPE_VIDEO_MAINTENANCE_2_FEATURES_KHR: i32 = 1_000_586_000;
-
-/// A feature struct of the one shape both of the above have:
-/// `{ sType, pNext, VkBool32 }`. `#[repr(C)]` so that it is that shape.
-#[repr(C)]
-struct RawFeature {
-    s_type: vk::StructureType,
-    p_next: *mut std::ffi::c_void,
-    /// Written by `vkGetPhysicalDeviceFeatures2` and read back by the driver
-    /// at `vkCreateDevice`; nothing on this side looks at it.
-    #[allow(dead_code)]
-    enabled: vk::Bool32,
-}
-
-impl RawFeature {
-    fn new(s_type: i32) -> RawFeature {
-        RawFeature {
-            s_type: vk::StructureType::from_raw(s_type),
-            p_next: std::ptr::null_mut(),
-            enabled: vk::FALSE,
-        }
-    }
+    features: sv_proto::VkPhysicalDeviceFeatures2,
+    enabled_extensions: Vec<String>,
 }
 
 /// `VkPhysicalDeviceDriverProperties::driverID`, if the device has the query.
@@ -222,7 +197,7 @@ pub struct Driver {
     /// while an instance is live would unload the loader out from under the
     /// driver. `gpu-probe` learned the same thing.
     #[allow(dead_code)]
-    pub entry: ash::Entry,
+    pub entry: std::mem::ManuallyDrop<ash::Entry>,
     pub instance: ash::Instance,
     pub pd: vk::PhysicalDevice,
     pub device: ash::Device,
@@ -281,11 +256,18 @@ pub struct Driver {
     /// Windows driver, and the device name alone does not tell that driver
     /// from ANV on the same iGPU.
     pub driver_id: i32,
+    /// The device's enabled features: the chain [`crate::features::device_chain`]
+    /// built, as the driver filled it in. An application's `vkCreateDevice` is
+    /// checked against it ([`crate::features::not_enabled`]).
+    pub features: sv_proto::VkPhysicalDeviceFeatures2,
+    /// The device extensions this device was created with.
+    pub enabled_extensions: Vec<String>,
 }
 
 impl Driver {
     /// Open device `index`, or the first one, and enable whatever it offers.
     pub fn open(index: usize) -> Result<Driver> {
+        let _one = OPEN_CLOSE.lock().unwrap_or_else(|p| p.into_inner());
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| DriverError::NoLoader(e.to_string()))?;
         // 1.1 was the floor the arena needed and it is **not** enough for Zink:
@@ -386,6 +368,8 @@ impl Driver {
                 has_dma_buf,
                 external_host,
                 buffer_device_address,
+                features,
+                enabled_extensions,
             }) => {
                 let props = unsafe { instance.get_physical_device_properties(pd) };
                 let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
@@ -401,7 +385,7 @@ impl Driver {
                     .is_some()
                     .then(|| ash::khr::video_queue::Device::new(&instance, &device));
                 Ok(Driver {
-                    entry,
+                    entry: std::mem::ManuallyDrop::new(entry),
                     instance,
                     pd,
                     device,
@@ -420,6 +404,8 @@ impl Driver {
                     debug_utils,
                     buffer_device_address,
                     driver_id,
+                    features,
+                    enabled_extensions,
                 })
             }
             Err(e) => {
@@ -598,117 +584,50 @@ impl Driver {
             }
             owned.retain(|c| !c.to_str().is_ok_and(|s| drop.iter().any(|d| d == s)));
         }
+        // `VK_EXT_buffer_device_address` is the pre-1.2 form of a core feature
+        // this device enables through `VkPhysicalDeviceVulkan12Features`, and
+        // the two together are `VUID-VkDeviceCreateInfo-pNext-04748` (one of
+        // docs/video-decode.md §7.5's three standing messages). Its feature
+        // struct goes with it; an application chaining that struct is checked
+        // against the core block by member name (`crate::features::not_enabled`).
+        let dev_props = unsafe { instance.get_physical_device_properties(pd) };
+        let minor = vk::api_version_minor(dev_props.api_version)
+            .min(vk::api_version_minor(sv_proto::CORE_API_VERSION));
+        if minor >= 2 {
+            owned.retain(|c| c.as_c_str() != c"VK_EXT_buffer_device_address");
+        }
         let names: Vec<*const std::ffi::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
 
-        // The features likewise: ask the driver what it supports and enable all
-        // of it. `VkPhysicalDeviceFeatures2` with the 1.1/1.2/1.3 blocks chained
-        // is the whole set that matters to Zink — `robustBufferAccess`,
-        // `logicOp`, `scalarBlockLayout`, `timelineSemaphore`,
-        // `dynamicRendering`, `nullDescriptor` and the rest all live in one of
-        // these four structures or in an extension one, and an extension feature
-        // struct is enabled by default when its extension is.
-        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut rb2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
-        let mut xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
-        let mut cond = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
-        let mut prov = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
-        let mut line = vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
-        let mut vdiv = vk::PhysicalDeviceVertexAttributeDivisorFeaturesEXT::default();
-        let mut eds = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
-        let mut eds2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
-        let mut dclip = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
-        let mut bcs = vk::PhysicalDeviceBorderColorSwizzleFeaturesEXT::default();
-        let mut cbc = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
-        let mut v2d3 = vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT::default();
-        let mut md = vk::PhysicalDeviceMultiDrawFeaturesEXT::default();
-        let mut cwe = vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
-        let mut nscm = vk::PhysicalDeviceNonSeamlessCubeMapFeaturesEXT::default();
-        let mut pgq = vk::PhysicalDevicePrimitivesGeneratedQueryFeaturesEXT::default();
-        let mut m5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
-        // The six extensions docs/design.md §0.20 added to the profile that carry a
-        // feature struct. Without the struct chained the feature comes back
-        // false and is *enabled* false, so an application that asks for
-        // `VK_EXT_graphics_pipeline_library` finds the extension present and the
-        // feature off — which is a worse answer than not advertising it, because
-        // it fails at `vkCreateGraphicsPipelines` instead of at
-        // `vkCreateDevice`. Adding the extension string and forgetting this is
-        // the shape of mistake `chain_if!` exists to make cheap to avoid.
-        let mut fsr = vk::PhysicalDeviceFragmentShadingRateFeaturesKHR::default();
-        let mut gpl = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
-        let mut sucf = vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR::default();
-        let mut bary = vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
-        let mut ai64 = vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT::default();
-        let mut dbc = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
-        let enabled = |name: &CStr| owned.iter().any(|o| o.as_c_str() == name);
-        let mut f2 = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut f11)
-            .push_next(&mut f12)
-            .push_next(&mut f13);
-        // Only chain a feature struct whose extension was enabled: a driver is
-        // permitted to reject `vkGetPhysicalDeviceFeatures2` chains it does not
-        // recognise, and enabling a feature from an extension that is not in
-        // `ppEnabledExtensionNames` is invalid usage the validation layer will
-        // fail the call for.
-        macro_rules! chain_if {
-            ($name:expr, $s:expr) => {
-                if enabled($name) {
-                    f2 = f2.push_next(&mut $s);
-                }
-            };
+        // The features: every feature struct the device may be created with
+        // whose extension (or core version) is enabled, as the registry says
+        // (`crate::features`), filled in by the driver and enabled as answered.
+        // This replaces a hand-kept list of two dozen structs that had fallen
+        // behind the profile: `VK_EXT_extended_dynamic_state3` was enabled and
+        // its struct never chained, so its features were enabled false while
+        // the forwarded `vkGetPhysicalDeviceFeatures2` told Zink they were
+        // supported (docs/video-decode.md §7.11).
+        let enabled_names: Vec<&str> = owned.iter().filter_map(|c| c.to_str().ok()).collect();
+        let template = sv_proto::VkPhysicalDeviceFeatures2 {
+            p_next: crate::features::device_chain(minor, &enabled_names),
+            ..Default::default()
+        };
+        let mut wanted =
+            crate::features::query_driver(instance, pd, &template).map_err(DriverError::Other)?;
+        let dropped = crate::features::resolve_exclusive(&mut wanted.p_next);
+        if !dropped.is_empty() {
+            eprintln!("sv-gpu-server: not enabling {dropped:?}: exclusive with a feature kept");
         }
-        chain_if!(c"VK_EXT_robustness2", rb2);
-        chain_if!(c"VK_EXT_transform_feedback", xfb);
-        chain_if!(c"VK_EXT_conditional_rendering", cond);
-        chain_if!(c"VK_EXT_provoking_vertex", prov);
-        chain_if!(c"VK_EXT_line_rasterization", line);
-        chain_if!(c"VK_EXT_vertex_attribute_divisor", vdiv);
-        chain_if!(c"VK_EXT_extended_dynamic_state", eds);
-        chain_if!(c"VK_EXT_extended_dynamic_state2", eds2);
-        chain_if!(c"VK_EXT_depth_clip_enable", dclip);
-        chain_if!(c"VK_EXT_border_color_swizzle", bcs);
-        chain_if!(c"VK_EXT_custom_border_color", cbc);
-        chain_if!(c"VK_EXT_image_2d_view_of_3d", v2d3);
-        chain_if!(c"VK_EXT_multi_draw", md);
-        chain_if!(c"VK_EXT_color_write_enable", cwe);
-        chain_if!(c"VK_EXT_non_seamless_cube_map", nscm);
-        chain_if!(c"VK_EXT_primitives_generated_query", pgq);
-        chain_if!(c"VK_KHR_maintenance5", m5);
-        chain_if!(c"VK_KHR_fragment_shading_rate", fsr);
-        chain_if!(c"VK_EXT_graphics_pipeline_library", gpl);
-        chain_if!(c"VK_KHR_shader_subgroup_uniform_control_flow", sucf);
-        chain_if!(c"VK_KHR_fragment_shader_barycentric", bary);
-        chain_if!(c"VK_EXT_shader_image_atomic_int64", ai64);
-        chain_if!(c"VK_EXT_depth_bias_control", dbc);
-        // The video extensions with a feature struct. Same argument as the six
-        // above, and sharper: `VK_KHR_video_decode_vp9`'s whole capability is
-        // its one feature bit, so the extension enabled with the feature off is
-        // an extension that refuses every VP9 profile.
-        let mut vm1 = vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
-        chain_if!(c"VK_KHR_video_maintenance1", vm1);
-        // Two that `ash` 0.38 (1.3.281) predates. Each is `sType`, `pNext` and
-        // one `VkBool32` (vulkan_core.h, 1.4.350), and they are spliced onto the
-        // front of the chain by hand rather than through `push_next`, which
-        // only takes the types `ash` knows.
-        let mut vp9 = RawFeature::new(STRUCTURE_TYPE_VIDEO_DECODE_VP9_FEATURES_KHR);
-        let mut vm2 = RawFeature::new(STRUCTURE_TYPE_VIDEO_MAINTENANCE_2_FEATURES_KHR);
-        if enabled(c"VK_KHR_video_decode_vp9") {
-            vp9.p_next = f2.p_next;
-            f2.p_next = (&raw mut vp9).cast();
-        }
-        if enabled(c"VK_KHR_video_maintenance2") {
-            vm2.p_next = f2.p_next;
-            f2.p_next = (&raw mut vm2).cast();
-        }
-        unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let c_features = sv_gpu_entry::raise_vk_physical_device_features2(&wanted, &mut pool)
+            .map_err(|e| DriverError::Other(format!("raising the feature chain: {e:?}")))?;
 
-        let dci = vk::DeviceCreateInfo::default()
+        let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qi)
-            .enabled_extension_names(&names)
-            .push_next(&mut f2);
+            .enabled_extension_names(&names);
+        dci.p_next = (&raw const c_features).cast();
         let device =
             unsafe { instance.create_device(pd, &dci, None) }.map_err(vkerr("vkCreateDevice"))?;
+        drop(pool);
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         // The codecs this device enabled, for masking the decode family's
         // `videoCodecOperations` — an application told "VP9" by the family and
@@ -739,19 +658,12 @@ impl Driver {
                 }
             })
             .collect();
-        // Read out of the *answer* `vkCreateDevice` was just given, so the two
-        // cannot disagree: §0.4 item 9 hands the physical device's own features
-        // straight back as the enabled set, which is what makes "reported" and
-        // "enabled" the same word here. Recording it is what lets `crate::arena`
-        // allocate memory a shader may take the address of, and what turns
-        // docs/design.md §0.16 item 3's "advertised and not implemented" into
-        // implemented rather than into a retraction.
-        //
-        // After `vkCreateDevice` rather than before it, because `f12` is
-        // mutably borrowed by the chain until then, and the borrow checker is
-        // right: reading a `pNext` link while the chain it is in is still lent
-        // out is exactly the aliasing this project forbids everywhere else.
-        let bda = f12.buffer_device_address != 0;
+        // Read out of the enabled set itself, so the two cannot disagree.
+        // Recording it is what lets `crate::arena` allocate memory a shader may
+        // take the address of (docs/design.md §0.16 item 3).
+        let bda = wanted.p_next.iter().any(|l| {
+            matches!(l, sv_proto::PNextLink::VkPhysicalDeviceVulkan12Features(f) if f.buffer_device_address)
+        });
 
         let external_fd =
             has_fd.then(|| ash::khr::external_memory_fd::Device::new(instance, &device));
@@ -768,6 +680,8 @@ impl Driver {
             has_dma_buf,
             external_host,
             buffer_device_address: bda,
+            features: wanted,
+            enabled_extensions: enabled_names.iter().map(|s| s.to_string()).collect(),
         })
     }
 
@@ -856,12 +770,27 @@ pub fn forwardable_device_extensions(d: &Driver) -> Vec<(String, u32)> {
     out
 }
 
+/// Held while a driver is opened or closed, process-wide.
+///
+/// The Vulkan loader's ICD scan is not safe against another thread of the same
+/// process loading or unloading the loader at the same moment: two tests that
+/// each opened a driver segfaulted in `loader_scanned_icd_add`, under
+/// `vkEnumerateInstanceExtensionProperties`, on every parallel run. The guest's
+/// GPU process is the same shape in production: each ivshmem session opens its
+/// own driver on its own thread (`entry::win_guest_ivshmem`), and `glxtest`'s
+/// session closes while the browser's opens. Opening serially costs a session
+/// at most the other's open, 93–224 ms on the guest (waycompose-design.md §87.3).
+static OPEN_CLOSE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Drop for Driver {
     fn drop(&mut self) {
+        let _one = OPEN_CLOSE.lock().unwrap_or_else(|p| p.into_inner());
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
+            // The loader is unloaded here, under the lock, not after it.
+            std::mem::ManuallyDrop::drop(&mut self.entry);
         }
     }
 }

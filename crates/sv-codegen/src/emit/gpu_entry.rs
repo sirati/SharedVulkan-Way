@@ -1685,7 +1685,158 @@ fn emit_server_impl(
     }
 }
 
-/// Emit the whole `sv-gpu-entry` crate body, as labelled sections.
+/// The device's feature structs, from the registry rather than from a list.
+///
+/// `sv_gpu_server::driver` opens its device before any application connects,
+/// and so has to enable, up front, every feature an application could later
+/// ask for. It used to chain a hand-kept list of two dozen extension feature
+/// structs into that device, and the list was short: Zink recorded
+/// `VK_EXT_extended_dynamic_state3` commands whose features the device had
+/// never enabled (`VUID-vkCmdSet*-None-09423`, docs/video-decode.md §7.10.4),
+/// because the app side forwards `vkGetPhysicalDeviceFeatures2` to the driver
+/// and is told *supported* for every struct the driver knows, while the device
+/// enabled only the structs the list named. What was missing was a class —
+/// every feature struct of an enabled extension that nobody had typed in — so
+/// the answer is the registry's own relation: every struct that extends both
+/// `VkPhysicalDeviceFeatures2` and `VkDeviceCreateInfo`, with the core
+/// versions and extensions of this profile that provide it.
+///
+/// Also emitted: a default link per struct (so the GPU side can build the chain
+/// from an `sType`), and each struct's `VkBool32` members by registry name (so
+/// it can check an application's `VkDeviceCreateInfo` against what it enabled).
+fn emit_device_features(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
+    let canonical = |n: &str| -> String {
+        let mut n = n.to_string();
+        for _ in 0..8 {
+            match cx.model.type_aliases.get(&n) {
+                Some(t) => n = t.clone(),
+                None => break,
+            }
+        }
+        n
+    };
+    let extends = |parent: &str| -> BTreeSet<String> {
+        cx.wire
+            .struct_plan(parent)
+            .map(|p| p.extenders.iter().map(|e| canonical(e)).collect())
+            .unwrap_or_default()
+    };
+    let in_features2 = extends("VkPhysicalDeviceFeatures2");
+    let in_create = extends("VkDeviceCreateInfo");
+    let wanted: BTreeSet<&str> = wanted.iter().map(|s| s.as_str()).collect();
+    // Core versions and this profile's extensions, each with the canonical
+    // names of the types it requires.
+    let providers_of = |s: &str| -> Vec<String> {
+        let mut out: Vec<String> = cx
+            .model
+            .features
+            .iter()
+            .chain(cx.model.extensions.iter().filter(|e| wanted.contains(e.name.as_str())))
+            .filter(|f| {
+                f.requires.iter().any(|r| {
+                    r.items.iter().any(|i| {
+                        matches!(i, vk_registry::model::InterfaceRef::Type(t) if canonical(t) == s)
+                    })
+                })
+            })
+            .map(|f| f.name.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    };
+    let bools = |s: &StructPlan| -> Vec<(String, proc_macro2::Ident)> {
+        s.fields
+            .iter()
+            .filter(|f| matches!(f.shape, Shape::Scalar(Scalar::Bool32)))
+            .map(|f| (f.name.clone(), naming::ident(&f.rust_name)))
+            .collect()
+    };
+
+    let mut table = Vec::new();
+    let mut defaults = Vec::new();
+    let mut bit_arms = Vec::new();
+    let mut set_arms = Vec::new();
+    for (name, s_type) in &cx.wire.pnext_links {
+        if !in_features2.contains(name) || !in_create.contains(name) {
+            continue;
+        }
+        let Some(sp) = cx.wire.struct_plan(name) else { continue };
+        let providers = providers_of(name);
+        let s_type = *s_type as i32;
+        let v = naming::pnext_variant(name);
+        let t = naming::type_ident(name);
+        table.push(quote! {
+            DeviceFeatureStruct { name: #name, s_type: #s_type, providers: &[#(#providers),*] },
+        });
+        defaults.push(quote!(#s_type => sv_proto::PNextLink::#v(Box::default()),));
+        let fields = bools(sp);
+        let names: Vec<&String> = fields.iter().map(|(n, _)| n).collect();
+        let idents: Vec<&proc_macro2::Ident> = fields.iter().map(|(_, i)| i).collect();
+        bit_arms.push(quote! {
+            sv_proto::PNextLink::#v(__s) => Some(vec![#((#names, __s.#idents)),*]),
+        });
+        set_arms.push(quote! {
+            sv_proto::PNextLink::#v(__s) => {
+                let __s: &mut sv_proto::#t = __s;
+                match __name { #(#names => { __s.#idents = __on; true })* _ => false }
+            }
+        });
+    }
+    let core = cx.wire.struct_plan("VkPhysicalDeviceFeatures");
+    let core_fields = core.map(bools).unwrap_or_default();
+    let core_names: Vec<&String> = core_fields.iter().map(|(n, _)| n).collect();
+    let core_idents: Vec<&proc_macro2::Ident> = core_fields.iter().map(|(_, i)| i).collect();
+    let n = table.len();
+    quote! {
+        /// A feature struct a device may be created with: one that extends both
+        /// `VkPhysicalDeviceFeatures2` and `VkDeviceCreateInfo` in the registry.
+        #[derive(Debug, Clone, Copy)]
+        pub struct DeviceFeatureStruct {
+            pub name: &'static str,
+            pub s_type: i32,
+            /// The core versions (`VK_VERSION_1_x`) and this profile's
+            /// extensions that bring the struct in. Empty only for a struct no
+            /// enabled thing provides, which a device must not chain.
+            pub providers: &'static [&'static str],
+        }
+
+        /// Every device feature struct this profile's wire carries.
+        pub const DEVICE_FEATURE_STRUCTS: [DeviceFeatureStruct; #n] = [#(#table)*];
+
+        /// A link of the struct with this `sType`, every member false.
+        pub fn device_feature_link(s_type: i32) -> Option<sv_proto::PNextLink> {
+            Some(match s_type {
+                #(#defaults)*
+                _ => return None,
+            })
+        }
+
+        /// A device feature link's `VkBool32` members by registry name, or `None`
+        /// for a link that is not a device feature struct.
+        pub fn feature_bits(link: &sv_proto::PNextLink) -> Option<Vec<(&'static str, bool)>> {
+            match link {
+                #(#bit_arms)*
+                _ => None,
+            }
+        }
+
+        /// Set one member of a device feature link by registry name; false if
+        /// the link has no such member.
+        pub fn set_feature_bit(link: &mut sv_proto::PNextLink, __name: &str, __on: bool) -> bool {
+            match link {
+                #(#set_arms)*
+                _ => false,
+            }
+        }
+
+        /// `VkPhysicalDeviceFeatures`'s members by registry name.
+        pub fn core_feature_bits(f: &sv_proto::VkPhysicalDeviceFeatures) -> Vec<(&'static str, bool)> {
+            vec![#((#core_names, f.#core_idents)),*]
+        }
+    }
+}
+
 /// The profile's *device* extensions, as a constant the GPU side can filter the
 /// driver's list against.
 ///
@@ -1778,6 +1929,7 @@ fn emit_profile_extensions(cx: &Ctx<'_>, wanted: &[String]) -> TokenStream {
     }
 }
 
+/// Emit the whole `sv-gpu-entry` crate body, as labelled sections.
 pub fn emit_all(
     cx: &Ctx<'_>,
     hand_written: &[&str],
@@ -1855,6 +2007,7 @@ pub fn emit_all(
 
     let mut sections = vec![
         ("extensions".to_string(), emit_profile_extensions(cx, profile_extensions)),
+        ("device features".to_string(), emit_device_features(cx, profile_extensions)),
         ("raise pnext".to_string(), emit_raise_pnext(&raise_cx)),
         ("lower_full pnext".to_string(), emit_lower_full_pnext(&lower_cx)),
     ];

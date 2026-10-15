@@ -793,6 +793,15 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "a GPU side has one queue on one family; the driver's table is not ours to pass on",
     ),
     ("vkGetPhysicalDeviceQueueFamilyProperties2", "as vkGetPhysicalDeviceQueueFamilyProperties"),
+    // The same argument for features (docs/video-decode.md §7.11). The device
+    // exists before the application asks, so what it is told is supported must
+    // be what that device *enabled*: forwarded verbatim, the driver said yes to
+    // `VK_EXT_extended_dynamic_state3` while the device had it off, and Zink
+    // used it.
+    (
+        "vkGetPhysicalDeviceFeatures2",
+        "the answer is masked to the features the already-open device enabled",
+    ),
     // The memory table again, met from the other end (docs/video-decode.md §7).
     // The driver answers `memoryTypeBits` in *its* numbering, and an application
     // reads it against docs/design.md §9.1's four types. Session memory is

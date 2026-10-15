@@ -513,6 +513,38 @@ impl GpuHost for GpuServer {
         // said yes at all. What an application cannot do here is ask for
         // *less* — which no application does, and which costs nothing but the
         // validation layer's opinion of it.
+        //
+        // What it must not do is ask for a feature the device lacks and be
+        // told yes: every command using it would then be undefined behaviour
+        // on the driver (Zink and `VK_EXT_extended_dynamic_state3`,
+        // docs/video-decode.md §7.11). That is the specification's
+        // `VK_ERROR_FEATURE_NOT_PRESENT`, and the members are named.
+        if let Some(info) = a.p_create_info.as_deref() {
+            let driver = &self.shared.driver;
+            let missing = crate::features::not_enabled(info, &driver.features);
+            if !missing.is_empty() {
+                eprintln!(
+                    "sv-gpu-server: vkCreateDevice asks for {} feature(s) this device did not \
+                     enable, refused with VK_ERROR_FEATURE_NOT_PRESENT: {}",
+                    missing.len(),
+                    missing.join(", ")
+                );
+                return Ok(p::VkCreateDeviceReply {
+                    result: fail(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                    p_device: None,
+                });
+            }
+            // Extensions are reported, not refused: the app side implements some
+            // itself (WSI), and the GPU side drops some it advertises when their
+            // instance-level dependency is absent (`crate::driver`).
+            for e in &info.pp_enabled_extension_names {
+                let e = String::from_utf8_lossy(e);
+                let e = e.trim_end_matches('\0');
+                if !driver.enabled_extensions.iter().any(|x| x == e) {
+                    eprintln!("sv-gpu-server: vkCreateDevice enables {e}, which this device did not");
+                }
+            }
+        }
         let raw = self.shared.driver.device.handle();
         if let Some(d) = a.p_device {
             self.shared.objects().insert(d.0, HandleType::VkDevice, raw);
@@ -740,6 +772,24 @@ impl GpuHost for GpuServer {
                 &self.shared.driver.mem_props,
             ))),
         })
+    }
+
+    /// The driver's answer, masked to what this device enabled
+    /// (`crate::features::mask_to_enabled`): an application told a feature is
+    /// supported asks for it, and the device it gets already exists.
+    fn get_physical_device_features2(
+        &mut self,
+        a: p::VkGetPhysicalDeviceFeatures2Args,
+    ) -> WireResult<p::VkGetPhysicalDeviceFeatures2Reply> {
+        let driver = &self.shared.driver;
+        let template = a.p_features.map(|f| *f).unwrap_or_default();
+        let mut f = crate::features::query_driver(&driver.instance, driver.pd, &template)
+            .map_err(|e| {
+                eprintln!("sv-gpu-server: vkGetPhysicalDeviceFeatures2: {e}");
+                WireError::UnknownCommand { opcode: 0 }
+            })?;
+        crate::features::mask_to_enabled(&mut f, &driver.features);
+        Ok(p::VkGetPhysicalDeviceFeatures2Reply { p_features: Some(Box::new(f)) })
     }
 
     fn get_physical_device_memory_properties2(

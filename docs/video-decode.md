@@ -1598,6 +1598,100 @@ The pass/fail reading needs no judgement:
 By §86.5's rule this is one run. A fault ends GPU work on the guest until it is
 read.
 
+### 7.11 The device's features, and the guest capture run
+
+Branch `decode-capture`, 2026-10-15, devhost and testhost.
+
+#### 7.11.1 Every feature an application is told about is a feature the device enabled
+
+§7.10.4 found Zink recording `VK_EXT_extended_dynamic_state3` commands into
+a device that had not enabled one of that extension's features. The cause was
+wider than that one extension. The GPU side opens its device before any
+application connects, so it has to enable up front everything an application
+may later ask for. Meanwhile `vkGetPhysicalDeviceFeatures2` was forwarded
+verbatim, so an application was told what the *driver* supports. The device
+chained a hand-kept list of two dozen extension feature structs, and every
+struct missing from that list was enabled false and advertised true.
+
+The baseline is master's build, under the GPU-side validation layer, in a
+120 s `scripts/sv-firefox-wayland.sh soak` on RADV: **395 validation errors**,
+nearly all of that one kind.
+
+| VUID family | what was not enabled |
+|---|---|
+| `vkCmdSet*EXT-None-09423` (17 commands), `VkGraphicsPipelineCreateInfo-extendedDynamicState3*` (17) | `VK_EXT_extended_dynamic_state3` |
+| `vkCmdSetVertexInputEXT-None-08546`, `pDynamicStates-04807` | `vertexInputDynamicState` |
+| `negativeOneToOne-06470`, `depthClipControl-07453` | `depthClipControl` |
+| `attachmentFeedbackLoopDynamicState-08862`, `attachmentFeedbackLoopLayout-07313` | both feedback-loop features |
+| `VkShaderModuleCreateInfo-pCode-08740` | `shaderFloatControls2` (a 1.4 feature) |
+| `vkCmdBeginRendering-pRenderingInfo-11750` | `maintenance10` |
+| `VkDeviceCreateInfo-pNext-04748`, `-03328` | `VK_EXT_buffer_device_address` enabled beside core 1.2's |
+
+The fix, in `sv_gpu_server::features`:
+
+- **The chain comes from the registry.** `sv-codegen` now emits
+  `DEVICE_FEATURE_STRUCTS`: every struct that extends both
+  `VkPhysicalDeviceFeatures2` and `VkDeviceCreateInfo`, listed with the core
+  versions and profile extensions that provide it (245 in the `full`
+  profile). It also emits a default link per `sType` and each struct's
+  `VkBool32` members by registry name. The device chains the 1.1–1.4 core
+  blocks its version has, plus every struct an enabled extension provides that
+  no core block covers. One trap: vk.xml 1.4.350 files most promoted structs
+  under `VK_BASE_VERSION_1_x`, `VK_COMPUTE_VERSION_1_x` and
+  `VK_GRAPHICS_VERSION_1_x` rather than `VK_VERSION_1_x`.
+- **What the device leaves off on purpose, it does not advertise.**
+  `vkGetPhysicalDeviceFeatures2` is now hand-written on the GPU side
+  (`exceptions::GPU_HAND_WRITTEN`). It asks the driver, then clears every
+  member the device did not enable (`mask_to_enabled`). Two things are left
+  off on purpose. One is an exclusive pair: the KHR fragment shading rate is
+  kept over `VK_NV_shading_rate_image` and `VK_EXT_fragment_density_map`. The
+  other is `VK_EXT_descriptor_buffer`. Zink never used it through the
+  forwarder while it was advertised and not enabled: a descriptor-buffer
+  command would have drawn a message, and the baseline has none. It is
+  driver-written bytes holding GPU-side addresses, which nothing here has
+  tested. Enabled, it is also `VUID-VkDeviceCreateInfo-None-08095` beside RADV's
+  `VK_AMD_shader_fragment_mask`. With it left off, Zink stays on the path
+  every earlier run measured, on RADV and on Intel alike.
+- **A request the device cannot honour is refused.** `vkCreateDevice` checks
+  the application's chain and `pEnabledFeatures` against the enabled set
+  (`not_enabled`; a promoted struct is matched against its core block by member
+  name). A miss is `VK_ERROR_FEATURE_NOT_PRESENT`, the specification's answer,
+  with the members named on stderr. The first build after the registry
+  rewrite showed why this matters. Its block list stopped at 1.3, Zink chained
+  `VkPhysicalDeviceVulkan14Features`, and the check refused 17 members by name.
+  Before the check, that would have been silent undefined behaviour.
+  Extensions are reported, not refused.
+- `VK_EXT_buffer_device_address` is no longer enabled beside core 1.2's
+  feature.
+
+The same soak with the fix: **0 validation errors**, no refusal, and verdicts
+equal to the baseline: 24 loads, WebRender on Zink throughout, about 8000
+submits per 30 s, WebGL 328 frames. `sv-firefox-vulkan-decode.sh 90` with the
+guest's clip, a 64 MiB arena, the Intel shape layer and validation: 2663
+frames decoded and read back, 0 dropped, H.264 `HWDEC`. Validation reports
+only §7.5's `pHostPointer` message, so the dynamic-state messages and both
+BDA messages are gone.
+
+Tests (`features::tests`, seven): the regression on a real driver
+(`everything_the_driver_reports_for_an_enabled_extension_is_enabled`). It asks
+the driver about every struct an enabled extension or core version provides,
+requests all of it, and requires that the device has every member except the
+ones withheld on purpose. Once masked, it requires all of them with no
+exceptions. It passes on RADV and lavapipe. With EDS3 taken out of the chain,
+it fails on RADV and names all of EDS3's members. The other six are pure: EDS3
+is chained without being named, the whole profile chains each extension struct
+once, promoted structs stay in their block, a missing member is named, a
+promoted struct matches its block, and of an exclusive pair the KHR one is
+kept.
+
+Found on the way: with two tests in one process each opening a real driver,
+the first gate segfaulted in the Vulkan loader (`loader_scanned_icd_add` under
+`vkEnumerateInstanceExtensionProperties`) on every parallel run. The guest's
+GPU process has the same shape in production. Each ivshmem session opens and
+later drops its own driver on its own thread, and `glxtest`'s session closes
+while the browser's opens. `Driver::open` and `Driver`'s drop (including the
+loader's unload) now hold one process-wide lock.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the
