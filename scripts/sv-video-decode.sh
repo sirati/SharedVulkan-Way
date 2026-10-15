@@ -3,15 +3,16 @@
 #
 #   scripts/sv-video-decode.sh [icd-manifest-basename]   default: radeon_icd.x86_64.json
 #
-# Six checks. The first four are about the drivers. The last two are about the
-# forwarder, and they are the half that moved: the wire profile that used to
-# refuse to plan now plans, and the forwarded device answers the video
-# capability queries with the driver's own numbers — but the decode itself still
-# does not run, and check 6 says so rather than skipping it.
+# Seven checks. The first four are about the drivers. The last three are about
+# the forwarder: the wire profile plans, the forwarded device answers the video
+# capability queries with the driver's own numbers and decodes the fixture
+# byte-identically to libavcodec (docs/video-decode.md §7), and ffmpeg's own
+# Vulkan decoder runs through it for H.264, H.265, H.265 Main10, AV1 and VP9.
 #
-# The forwarded half needs binaries built for the video profile:
+# The forwarded half needs the binaries built; the default `full` profile
+# carries the video extensions, so no profile switch is needed any more:
 #
-#   SV_PROTO_PROFILE=video cargo build -p sv-icd -p sv-gpu-server -p video-probe
+#   cargo build -p sv-icd -p sv-gpu-server -p video-probe
 #
 #  1. **The survey.** `video-probe caps` asks every physical device the loader
 #     offers what it can decode — per codec, per profile, with the capabilities
@@ -47,7 +48,18 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/debug"
 ICD="${1:-radeon_icd.x86_64.json}"
-ICDDIR=/run/opengl-driver/share/vulkan/icd.d
+# The driver the GPU side opens. The system Mesa in /run/opengl-driver is built
+# against a newer glibc than the dev shell's binaries and no longer loads into
+# them (docs/video-decode.md §7), so the default is the dev shell's own Mesa,
+# found on XDG_DATA_DIRS; SV_VIDEO_ICDDIR overrides.
+ICDDIR=${SV_VIDEO_ICDDIR:-}
+if [ -z "$ICDDIR" ]; then
+  IFS=: read -ra _dirs <<<"${XDG_DATA_DIRS:-}"
+  for d in "${_dirs[@]}"; do
+    [ -f "$d/vulkan/icd.d/$ICD" ] && { ICDDIR="$d/vulkan/icd.d"; break; }
+  done
+  ICDDIR=${ICDDIR:-/run/opengl-driver/share/vulkan/icd.d}
+fi
 RUNDIR="$(mktemp -d /tmp/sv-video-decode.XXXXXX)"
 MANIFEST="$BIN/sv_icd.json"
 SOCK="$RUNDIR/gpu.sock"
@@ -158,9 +170,8 @@ fi
 # ---------------------------------------------------------------------------
 say "6. the same questions, asked of the forwarder"
 # ---------------------------------------------------------------------------
-# The binaries have to have been built with `SV_PROTO_PROFILE=video`, because the
-# profile is a build input: an ICD built for `zink` has no video opcodes and
-# reports no video extensions, correctly.
+# The profile is a build input: an ICD built for `zink` has no video opcodes and
+# reports no video extensions, correctly. The default `full` profile has them.
 #
 # What is compared is not "did it answer" but "did it answer the same thing".
 # The capability numbers are the ones `docs/video-decode.md` §1 says no driver
@@ -204,7 +215,7 @@ if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
   grep -E '^device |^  video extensions' "$RUNDIR/fwd.txt" | sed 's/^/  /'
   if ! grep -q '^  video extensions: VK_KHR_video' "$RUNDIR/fwd.txt"; then
     sed 's/^/  /' "$RUNDIR/fwd.txt" | head -8
-    bad "the forwarded device reports no video extensions — rebuild with SV_PROTO_PROFILE=video"
+    bad "the forwarded device reports no video extensions — rebuild sv-icd and sv-gpu-server"
   else
     ok "the forwarded device advertises the profile's video extensions"
 
@@ -213,39 +224,78 @@ if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
     # a `StdVideoH264LevelIdc`, the type that used to stop the planner — and
     # every `vkGetPhysicalDeviceVideoFormatPropertiesKHR` row.
     #
-    # H.265 and AV1 are in the direct report and not in the forwarded one, on
-    # purpose: the wire profile carries `VK_KHR_video_decode_h264` and neither of
-    # the others, and §0.4 item 8 intersects the advertised list with the
-    # driver's. So the comparison is over the H.264 block, which both have.
-    sed -n '/^  h264/,/^  h265/p' "$RUNDIR/direct.txt" | grep -v '^  h265' > "$RUNDIR/direct.h264"
-    sed -n '/^  h264/,/^  h265/p' "$RUNDIR/fwd.txt"    | grep -v '^  h265' > "$RUNDIR/fwd.h264"
+    # Every codec block from H.264 on — H.265 and AV1 too, since the default
+    # `full` profile carries their extensions and the GPU side serves their
+    # decode family (docs/video-decode.md §7). The ICD's own `[icd]` summary
+    # line on stderr is the only line the direct run cannot have.
+    sed -n '/^  h264/,$p' "$RUNDIR/direct.txt" | grep -v '^\[icd\]' > "$RUNDIR/direct.h264"
+    sed -n '/^  h264/,$p' "$RUNDIR/fwd.txt"    | grep -v '^\[icd\]' > "$RUNDIR/fwd.h264"
     LINES=$(wc -l < "$RUNDIR/direct.h264")
     if [ "$LINES" -gt 20 ] && cmp -s "$RUNDIR/direct.h264" "$RUNDIR/fwd.h264"; then
-      ok "$LINES lines of H.264 capabilities crossed the boundary byte-identically"
+      ok "$LINES lines of H.264, H.265 and AV1 capabilities crossed the boundary byte-identically"
       echo "     sha256 $(sha256sum < "$RUNDIR/direct.h264" | cut -c1-16)…"
     else
       diff "$RUNDIR/direct.h264" "$RUNDIR/fwd.h264" | head -20 | sed 's/^/  /'
       bad "the forwarded capabilities are not the driver's capabilities"
     fi
 
-    # And the decode, which does not run. The wall is no longer a type; it is
-    # the one synthesised queue family of §0.4 item 7, and it is named here
-    # rather than skipped, because "the decode has not been forwarded" is the
-    # finding.
+    # And the decode. It stopped here at "no queue family with VIDEO_DECODE"
+    # until docs/video-decode.md §7, when the GPU side began serving its decode
+    # family; the check is now the same one check 3 makes of the driver: the
+    # frames are the frames.
     if forwarded "$RUNDIR/fwddec.txt" "$PROBE" decode "$RUNDIR/idr.264" "$RUNDIR/fwd.nv12"; then
-      echo "  the forwarded decode SUCCEEDED — docs/video-decode.md §6 needs rewriting"
-      fail=1
-    else
-      sed 's/^/  /' "$RUNDIR/fwddec.txt"
-      if grep -q 'no queue family with VIDEO_DECODE' "$RUNDIR/fwddec.txt"; then
-        ok "the forwarded decode stops where the design says it does: no VIDEO_DECODE family"
+      grep -E '^(device|memory|decoded|decode submit)' "$RUNDIR/fwddec.txt" | sed 's/^/  /'
+      if cmp -s "$RUNDIR/fwd.nv12" "$RUNDIR/ref.nv12"; then
+        ok "decoded through the forwarder, byte-identical to libavcodec ($(sha256sum < "$RUNDIR/fwd.nv12" | cut -c1-16)…)"
       else
-        bad "the forwarded decode failed somewhere other than the queue family"
+        bad "the forwarded decode ran but its frames are not libavcodec's"
       fi
+    else
+      sed 's/^/  /' "$RUNDIR/fwddec.txt" | tail -15
+      bad "the forwarded decode failed"
     fi
   fi
 else
   echo "  (sv-icd / sv-gpu-server not built; skipping the forwarded half)"
+fi
+
+# ---------------------------------------------------------------------------
+say "7. ffmpeg's own Vulkan decoder, through the forwarder, every codec"
+# ---------------------------------------------------------------------------
+# `video-probe` is IDR-only H.264 by design. ffmpeg's `-hwaccel vulkan` is a
+# real decoder — reference lists, B-frames, H.265, AV1, VP9 — and it is what
+# Firefox 153+ decodes with underneath. Each stream is decoded by it through the
+# forwarder, every frame downloaded as NV12 (P010 for Main10), and compared with
+# libavcodec's software decode of the same stream.
+if [ -f "$MANIFEST" ] && [ -x "$BIN/sv-gpu-server" ]; then
+  S2="testsrc2=size=1280x720:rate=30:duration=2"
+  ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=4" \
+    -c:v libx264 -profile:v high -preset medium -b:v 4M -pix_fmt yuv420p -f h264 "$RUNDIR/s.264"
+  ffmpeg -y -loglevel error -f lavfi -i "$S2" -c:v libx265 -preset fast -b:v 2M \
+    -pix_fmt yuv420p -x265-params log-level=error -f hevc "$RUNDIR/s.265"
+  ffmpeg -y -loglevel error -f lavfi -i "$S2" -c:v libx265 -preset fast -b:v 2M \
+    -pix_fmt yuv420p10le -x265-params log-level=error -f hevc "$RUNDIR/s10.265"
+  ffmpeg -y -loglevel error -f lavfi -i "$S2" -c:v libsvtav1 -preset 10 -b:v 2M \
+    -pix_fmt yuv420p -svtav1-params enable-stat-report=0 "$RUNDIR/s.ivf" 2>/dev/null
+  ffmpeg -y -loglevel error -f lavfi -i "$S2" -c:v libvpx-vp9 -deadline realtime \
+    -cpu-used 8 -b:v 2M -pix_fmt yuv420p "$RUNDIR/s.webm"
+  hwdec() {
+    ffmpeg -hide_banner -loglevel error -init_hw_device vulkan=vk:0 -filter_hw_device vk \
+      -hwaccel vulkan -hwaccel_device vk -hwaccel_output_format vulkan -i "$1" \
+      -vf "hwdownload,format=$2" -f rawvideo - 2>"$RUNDIR/ffhw.err" | sha256sum | cut -c1-16 > "$RUNDIR/ffhw.sha"
+  }
+  for spec in s.264:nv12:H.264 s.265:nv12:H.265 s10.265:p010le:H.265-Main10 s.ivf:nv12:AV1 s.webm:nv12:VP9; do
+    IFS=: read -r file fmt name <<<"$spec"
+    sw=$(ffmpeg -hide_banner -loglevel error -i "$RUNDIR/$file" -pix_fmt "$fmt" -f rawvideo - | sha256sum | cut -c1-16)
+    rm -f "$RUNDIR/ffhw.sha"; forwarded "$RUNDIR/ffhw.txt" bash -c "$(declare -f hwdec); RUNDIR=$RUNDIR hwdec $RUNDIR/$file $fmt" || true
+    hw=$(cat "$RUNDIR/ffhw.sha" 2>/dev/null)
+    if [ "$hw" = "$sw" ]; then
+      ok "$name through the forwarder: $hw… = libavcodec"
+    else
+      head -3 "$RUNDIR/ffhw.err" | sed 's/^/  /'
+      bad "$name through the forwarder: '$hw' against libavcodec's $sw"
+    fi
+  done
 fi
 
 echo

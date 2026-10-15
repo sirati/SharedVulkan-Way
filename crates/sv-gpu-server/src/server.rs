@@ -549,9 +549,30 @@ impl GpuHost for GpuServer {
         // mapped — which is a real driver allocation.
         let want = vk::MemoryPropertyFlags::DEVICE_LOCAL;
         let ti = self.shared.driver.memory_type(u32::MAX, want).unwrap_or(0);
-        let ai = vk::MemoryAllocateInfo::default()
+        // **The dedicated-allocation link is carried; nothing else in the chain
+        // is.** A driver may *require* an image's memory to be dedicated to it
+        // (`VkMemoryDedicatedRequirements::requiresDedicatedAllocation`, which
+        // RADV reports for ffmpeg's decode pictures), and the GPU side's
+        // validation layer reported `VUID-VkBindImageMemoryInfo-image-01445` on
+        // every one of them while this link was being dropped (docs/video-decode.md
+        // §7.5). The image or buffer it names is mapped to the driver's handle;
+        // an id that does not resolve fails the call rather than dedicating the
+        // memory to nothing.
+        let dedicated = info.p_next.iter().find_map(|l| match l {
+            p::PNextLink::VkMemoryDedicatedAllocateInfo(d) => Some((d.image.0, d.buffer.0)),
+            _ => None,
+        });
+        let mut ded = vk::MemoryDedicatedAllocateInfo::default();
+        if let Some((image, buffer)) = dedicated {
+            ded.image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
+            ded.buffer = vk::Buffer::from_raw(self.map_handle(HandleType::VkBuffer, buffer)?);
+        }
+        let mut ai = vk::MemoryAllocateInfo::default()
             .allocation_size(info.allocation_size)
             .memory_type_index(ti);
+        if dedicated.is_some() {
+            ai = ai.push_next(&mut ded);
+        }
         match unsafe { self.d().allocate_memory(&ai, None) } {
             Ok(m) => {
                 if let Some(id) = a.p_memory {
