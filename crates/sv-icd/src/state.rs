@@ -137,7 +137,37 @@ pub struct Instance {
 #[derive(Debug)]
 pub struct Device {
     pub physical_device: u64,
-    pub queues: Vec<u64>,
+    pub queues: Vec<QueueSlot>,
+}
+
+/// One `VkQueue` an application asked for at `vkCreateDevice`: which family,
+/// which index in it, and the id minted for it.
+///
+/// Keyed by family since docs/video-decode.md §7, when the GPU side began
+/// serving more than one family. Before that every queue was family 0's and a
+/// flat list indexed by `queueIndex` was the whole truth; with a decode family
+/// it would hand `vkGetDeviceQueue(2, 0)` whatever was created first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSlot {
+    pub family: u32,
+    pub index: u32,
+    pub id: u64,
+}
+
+impl Device {
+    /// The queue at `(family, index)`, if the application asked for one.
+    pub fn queue(&self, family: u32, index: u32) -> Option<u64> {
+        self.queues.iter().find(|q| q.family == family && q.index == index).map(|q| q.id)
+    }
+
+    /// The queue the app side's own work goes on — the swapchain's copies in
+    /// `crate::wsi` — which has to be family 0's, the one family that is
+    /// always `GRAPHICS | COMPUTE | TRANSFER`. The first queue created, if the
+    /// application created none on family 0, which is what this returned before
+    /// there were families to choose between.
+    pub fn universal_queue(&self) -> Option<u64> {
+        self.queue(0, 0).or_else(|| self.queues.first().map(|q| q.id))
+    }
 }
 
 /// A `VkDeviceMemory` as the app side holds it.
@@ -326,6 +356,16 @@ pub struct SharedVulkan {
     /// loader `dlopen`s it once — and the alternative is a lifetime on the
     /// generated `Icd` trait for a `Vec` that is never freed anyway.
     device_extensions: Vec<(&'static str, u32)>,
+    /// The OR of the queue families the GPU side serves, asked once at connect.
+    ///
+    /// What `crate::advertise::unservable_queue_requirement` reads. It was the
+    /// constant of the standalone family table, which was true while the GPU
+    /// side served exactly that one family; since docs/video-decode.md §7 it may
+    /// also serve a decode family, and a gate reading a constant would go on
+    /// refusing the decode extensions the GPU side can now serve — the same
+    /// "right about the condition, wrong about the set it reads" shape §0.22
+    /// records, from the other direction.
+    queue_flags: u32,
     /// Live swapchains, by id (docs/design.md §10, [`crate::wsi`]).
     ///
     /// **A second lock rather than a field of [`State`]**, and the lock order is
@@ -366,6 +406,7 @@ impl SharedVulkan {
             api_version: PROTOCOL_API_VERSION,
             device_api_version: PROTOCOL_API_VERSION,
             device_extensions: Vec::new(),
+            queue_flags: crate::advertise::advertised_queue_flags(),
             swapchains: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
         })
@@ -435,11 +476,46 @@ impl SharedVulkan {
             api_version,
             device_api_version,
             device_extensions: Vec::new(),
+            queue_flags: crate::advertise::advertised_queue_flags(),
             swapchains: Mutex::new(HashMap::new()),
             surfaces: Mutex::new(HashMap::new()),
         };
+        icd.queue_flags = icd.ask_queue_flags();
         icd.device_extensions = icd.ask_device_extensions();
         Ok(icd)
+    }
+
+    /// Ask the GPU side which queue capabilities its families serve, as one mask.
+    ///
+    /// Count-then-fill, two round trips at startup like the extension query
+    /// beside it. A failure falls back to the standalone table's mask, which is
+    /// the conservative direction: it can only *withhold* the decode extensions,
+    /// never claim them.
+    #[cfg(any(target_os = "linux", windows))]
+    fn ask_queue_flags(&self) -> u32 {
+        let fallback = crate::advertise::advertised_queue_flags();
+        let Some(t) = self.wire() else { return fallback };
+        let ask = |capacity: usize| {
+            sv_icd_entry::forward::get_physical_device_queue_family_properties(
+                t,
+                sv_proto::VkGetPhysicalDeviceQueueFamilyPropertiesArgs {
+                    physical_device: sv_proto::VkPhysicalDevice(0),
+                    p_queue_family_property_count: Some(capacity as u32),
+                    p_queue_family_properties: vec![
+                        sv_proto::VkQueueFamilyProperties::default();
+                        capacity
+                    ],
+                },
+            )
+        };
+        let Ok(count) = ask(0) else { return fallback };
+        let n = count.p_queue_family_property_count.unwrap_or(0) as usize;
+        if n == 0 {
+            return fallback;
+        }
+        let Ok(full) = ask(n) else { return fallback };
+        let flags = full.p_queue_family_properties.iter().fold(0u32, |a, f| a | f.queue_flags.0);
+        if flags == 0 { fallback } else { flags }
     }
 
     /// Ask the GPU side which device extensions it will forward.
@@ -530,9 +606,10 @@ impl SharedVulkan {
         // The filter above asks whether the *generator* kept §9.2's promise. It
         // cannot ask whether the *device* can: an extension whose commands must
         // be recorded on a `VIDEO_DECODE` queue is unservable here no matter how
-        // well its marshalling was generated, because
-        // `crate::advertise::queue_families` offers one family and it is
-        // `GRAPHICS | COMPUTE | TRANSFER`.
+        // well its marshalling was generated, unless the GPU side serves a
+        // family with that bit. `self.queue_flags` is the GPU side's own answer
+        // (docs/video-decode.md §7): with a decode family it lets the decode
+        // extensions through and still stops encode, whose family is not served.
         //
         // This went live the moment `full` became the default profile: sixteen
         // video extensions appeared in `vulkaninfo` through the forwarder, and
@@ -540,7 +617,7 @@ impl SharedVulkan {
         // in §0.8 item 7 while the profile was `zink`, with nothing connecting
         // that note to the profile change — see §0.22.
         out.retain(|(n, _)| {
-            match crate::advertise::unservable_queue_requirement(n) {
+            match crate::advertise::unservable_queue_requirement(n, self.queue_flags) {
                 None => true,
                 Some(missing) => {
                     // Always, not under `SV_DEBUG`: an extension silently
@@ -549,7 +626,7 @@ impl SharedVulkan {
                     sv_icd_entry::report_always(&format_args!(
                         "{n} needs a queue family with flags {missing:#x} and this \
                          driver advertises {:#x}; not advertising it",
-                        crate::advertise::advertised_queue_flags()
+                        self.queue_flags
                     ));
                     false
                 }

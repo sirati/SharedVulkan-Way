@@ -219,7 +219,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
         let s = icd.state();
         s.devices
             .get(&device)
-            .and_then(|d| d.queues.first().copied())
+            .and_then(|d| d.universal_queue())
             .ok_or(LowerError::Shape("vkCreateSwapchainKHR: unknown device"))?
     };
     let count = desc

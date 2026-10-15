@@ -242,20 +242,24 @@ impl IcdLocal for SharedVulkan {
             }
         }
         let id = s.mint();
-        // One queue object per requested queue, across all requested families.
-        // We advertise one family with one queue, so an application that asks
-        // for more than that has been told it cannot have them.
-        let wanted: usize = info
+        // One queue object per requested queue, recorded with its family and
+        // index so `vkGetDeviceQueue` can find it again. Every family we
+        // advertise has one queue, so an application that asks for more than
+        // that has been told it cannot have them; and one that asks for none
+        // still gets family 0's, which is what `crate::wsi` records on.
+        let mut wanted: Vec<(u32, u32)> = info
             .p_queue_create_infos
             .iter()
-            .map(|q| q.queue_count.max(1) as usize)
-            .sum::<usize>()
-            .max(1);
-        let mut queue_ids = Vec::with_capacity(wanted);
-        for _ in 0..wanted {
+            .flat_map(|q| (0..q.queue_count.max(1)).map(move |i| (q.queue_family_index, i)))
+            .collect();
+        if wanted.is_empty() {
+            wanted.push((0, 0));
+        }
+        let mut queue_ids = Vec::with_capacity(wanted.len());
+        for (family, index) in wanted {
             let q = s.mint();
             s.queues.insert(q, id);
-            queue_ids.push(q);
+            queue_ids.push(crate::state::QueueSlot { family, index, id: q });
         }
         s.devices.insert(id, crate::state::Device { physical_device, queues: queue_ids });
         drop(s);
@@ -284,38 +288,50 @@ impl IcdLocal for SharedVulkan {
         let mut s = self.state();
         if let Some(d) = s.devices.remove(&device) {
             for q in d.queues {
-                s.queues.remove(&q);
+                s.queues.remove(&q.id);
             }
         }
     }
 
-    /// `vkGetDeviceQueue` — one family, and a family index we do not have is
-    /// *reported* rather than refused.
+    /// `vkGetDeviceQueue` — the queue created for `(family, index)`, and one
+    /// that was never created is *reported* rather than refused.
     ///
     /// The command returns `void`. There is nowhere to put an error, so refusing
     /// meant writing nothing through `pQueue` and leaving the application with
     /// whatever its uninitialised memory held — which Zink then passes to
-    /// `vkQueueSubmit`. An application asking for a family we did not advertise
-    /// has made a mistake; handing it the one queue that exists makes that
-    /// mistake harmless instead of a wild pointer, and `SV_DEBUG` says so.
+    /// `vkQueueSubmit`. An application asking for a queue it did not create
+    /// has made a mistake; handing it family 0's queue makes that mistake
+    /// harmless instead of a wild pointer, and `SV_DEBUG` says so.
+    ///
+    /// Since docs/video-decode.md §7 the GPU side may serve several families
+    /// (the decode family among them), each at the driver's own index, so the
+    /// lookup is by family as well as index and the family crosses unchanged.
     ///
     /// (Zink asks for `sparse_queue`, which it leaves at `UINT32_MAX` when no
     /// family advertises `VK_QUEUE_SPARSE_BINDING_BIT` — so this is not a
     /// hypothetical application error, it is the one in front of us.)
     fn get_device_queue(&self, device: u64, family: u32, index: u32) -> IcdResult<u64> {
-        if family != 0 {
-            sv_icd_entry::report_transport_failure(&format_args!(
-                "vkGetDeviceQueue: queue family {family} was never advertised; \
-                 giving the one queue this device has"
-            ));
-        }
-        let index = if family == 0 { index } else { 0 };
-        let id = {
+        let (id, family, index) = {
             let s = self.state();
-            s.devices
+            let d = s
+                .devices
                 .get(&device)
-                .and_then(|d| d.queues.get(index as usize).copied())
-                .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))?
+                .ok_or(LowerError::Shape("vkGetDeviceQueue: unknown device"))?;
+            match d.queue(family, index) {
+                Some(id) => (id, family, index),
+                None => {
+                    // Never created, which for the families we advertise means
+                    // the application did not ask for it at `vkCreateDevice`.
+                    sv_icd_entry::report_transport_failure(&format_args!(
+                        "vkGetDeviceQueue: queue {index} of family {family} was never \
+                         created; giving family 0's queue"
+                    ));
+                    let id = d
+                        .universal_queue()
+                        .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))?;
+                    (id, 0, 0)
+                }
+            }
         };
         if let Some(t) = self.wire() {
             forward::get_device_queue(

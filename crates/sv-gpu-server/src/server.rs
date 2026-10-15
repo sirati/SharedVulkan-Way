@@ -173,21 +173,56 @@ impl GpuServer {
         WireError::Table
     }
 
-    /// The single family we advertise, with the real properties of the family
-    /// `crate::driver` opened its queue on — except `queueCount`, which is 1
-    /// because that is how many queues exist.
-    fn one_queue_family(&self) -> p::VkQueueFamilyProperties {
-        let all = unsafe {
-            self.shared
-                .driver
-                .instance
-                .get_physical_device_queue_family_properties(self.shared.driver.pd)
-        };
-        let mine = all.get(self.shared.driver.queue_family as usize).copied().unwrap_or_default();
-        let mut w = crate::convert::queue_family(&mine);
-        w.queue_count = 1;
-        w
+    /// The families we advertise, by the index an application sees them at,
+    /// with the real properties of each (`crate::driver::ServedFamily`):
+    /// `queueCount` is 1 because that is how many queues were opened, and the
+    /// capability bits this side does not serve are masked.
+    fn served_queue_families(&self) -> Vec<p::VkQueueFamilyProperties> {
+        self.shared.driver.served.iter().map(|f| crate::convert::queue_family(&f.props)).collect()
     }
+
+    /// The queue `vkGetDeviceQueue(family, …)` names. A family we did not
+    /// advertise gets the first queue rather than nothing — the command returns
+    /// `void`, and `sv_icd::icd::get_device_queue` has already said so.
+    fn queue_for_family(&self, family: u32) -> vk::Queue {
+        self.shared
+            .driver
+            .served
+            .get(family as usize)
+            .map(|f| f.queue)
+            .unwrap_or(self.shared.driver.queue)
+    }
+}
+
+/// The two video links of a `VkQueueFamilyProperties2` reply, for one family.
+///
+/// Always both, whatever the request carried, and that is not an over-answer:
+/// the app side's lowering sends each element of an *output array* as a
+/// default with an empty chain, so the request cannot say which links the
+/// application has; and `store_pnext` on the way back walks the application's
+/// own chain and writes only the links whose `sType` it finds there. A link
+/// the application did not chain is therefore dropped harmlessly, and one it
+/// did chain is never missed. Every other link (`…GlobalPriority…`,
+/// `…Checkpoint…`) stays unanswered, as it was before this stage.
+///
+/// Only when a decode family is served at all, so that the reply of a GPU side
+/// without video is byte-for-byte what it was.
+fn queue_family_video_links(
+    served: &crate::driver::ServedFamily,
+    decode_served: bool,
+) -> Vec<p::PNextLink> {
+    if !decode_served {
+        return Vec::new();
+    }
+    let mut v = p::VkQueueFamilyVideoPropertiesKHR::default();
+    v.video_codec_operations =
+        p::VkVideoCodecOperationFlagsKHR(served.video_codec_operations.as_raw());
+    let mut q = p::VkQueueFamilyQueryResultStatusPropertiesKHR::default();
+    q.query_result_status_support = served.query_result_status;
+    vec![
+        p::PNextLink::VkQueueFamilyVideoPropertiesKHR(Box::new(v)),
+        p::PNextLink::VkQueueFamilyQueryResultStatusPropertiesKHR(Box::new(q)),
+    ]
 }
 
 /// `VK_SUCCESS`.
@@ -432,7 +467,7 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueueArgs,
     ) -> WireResult<p::VkGetDeviceQueueReply> {
-        let q = self.shared.driver.queue;
+        let q = self.queue_for_family(a.queue_family_index);
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -443,7 +478,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueue2Args,
     ) -> WireResult<p::VkGetDeviceQueue2Reply> {
-        let q = self.shared.driver.queue;
+        let family = a.p_queue_info.as_ref().map(|i| i.queue_family_index).unwrap_or(0);
+        let q = self.queue_for_family(family);
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -634,38 +670,59 @@ impl GpuHost for GpuServer {
         })
     }
 
-    /// The one queue family this GPU side has, described from the queue it
-    /// actually opened.
+    /// The queue families this GPU side serves, each described from the queue
+    /// it actually opened.
     ///
-    /// Not the driver's table. docs/design.md §8 gives one physical device and
-    /// `crate::driver` opens one queue on one family; an application handed
-    /// RADV's five families would ask for family 3 and be given family 0's
-    /// queue with no diagnostic. The flags are the real ones for the family we
-    /// chose, so an application that checks `VK_QUEUE_GRAPHICS_BIT` gets a true
-    /// answer — it is the *indexing* that is ours, exactly as with the memory
-    /// table of §9.1.
+    /// Not the driver's whole table. `crate::driver` opens one queue per served
+    /// family, and an application handed RADV's five families would ask for
+    /// family 3 and be given another family's queue with no diagnostic. Without
+    /// video decode that is one family, presented as family 0, exactly as
+    /// before; with it, it is the driver's prefix up to and including the
+    /// decode family, at the driver's own indices (`driver::ServedFamily` says
+    /// why the indices are not renumbered). The flags are the real ones, minus
+    /// the capabilities we do not serve — it is the *selection* that is ours,
+    /// as with the memory table of §9.1.
     fn get_physical_device_queue_family_properties(
         &mut self,
         a: p::VkGetPhysicalDeviceQueueFamilyPropertiesArgs,
     ) -> WireResult<p::VkGetPhysicalDeviceQueueFamilyPropertiesReply> {
-        let one = self.one_queue_family();
+        let all = self.served_queue_families();
+        let n = all.len() as u32;
         let want = a.p_queue_family_properties.len();
         Ok(p::VkGetPhysicalDeviceQueueFamilyPropertiesReply {
-            p_queue_family_property_count: Some(1),
-            p_queue_family_properties: if want == 0 { Vec::new() } else { vec![one] },
+            p_queue_family_property_count: Some(if want == 0 { n } else { n.min(want as u32) }),
+            p_queue_family_properties: all.into_iter().take(want).collect(),
         })
     }
 
+    /// As the plain form, and it carries the two video links of the chain.
+    ///
+    /// `VkQueueFamilyVideoPropertiesKHR` is how an application finds out *which
+    /// codecs* a decode family does — the flag alone says only that it decodes —
+    /// and ffmpeg's `hwcontext_vulkan` reads it to choose its decode queue. Both
+    /// links are answered from what `crate::driver` recorded at open, and the
+    /// codec mask is the one restricted to extensions this device enabled.
     fn get_physical_device_queue_family_properties2(
         &mut self,
         a: p::VkGetPhysicalDeviceQueueFamilyProperties2Args,
     ) -> WireResult<p::VkGetPhysicalDeviceQueueFamilyProperties2Reply> {
-        let mut w = p::VkQueueFamilyProperties2::default();
-        w.queue_family_properties = self.one_queue_family();
+        let served = &self.shared.driver.served;
+        let decode_served = self.shared.driver.decode_family.is_some();
+        let n = served.len() as u32;
         let want = a.p_queue_family_properties.len();
+        let out: Vec<p::VkQueueFamilyProperties2> = a
+            .p_queue_family_properties
+            .into_iter()
+            .zip(served.iter())
+            .map(|(mut w, f)| {
+                w.queue_family_properties = crate::convert::queue_family(&f.props);
+                w.p_next = queue_family_video_links(f, decode_served);
+                w
+            })
+            .collect();
         Ok(p::VkGetPhysicalDeviceQueueFamilyProperties2Reply {
-            p_queue_family_property_count: Some(1),
-            p_queue_family_properties: if want == 0 { Vec::new() } else { vec![w] },
+            p_queue_family_property_count: Some(if want == 0 { n } else { n.min(want as u32) }),
+            p_queue_family_properties: out,
         })
     }
 

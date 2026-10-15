@@ -57,6 +57,144 @@ fn vkerr(what: &'static str) -> impl Fn(vk::Result) -> DriverError {
     move |r| DriverError::Vk(what, r)
 }
 
+/// One queue family the GPU side offers to applications, and the one queue it
+/// opened on it.
+///
+/// # Why the index is the driver's own (docs/video-decode.md §7)
+///
+/// With video decode served, the families an application sees are the driver's
+/// families `0..=max(compute, decode)`, **at their own indices**, each with one
+/// queue. The alternative — a compact list of two with the decode family
+/// renumbered to 1 — would make every `queueFamilyIndex` anywhere in the API a
+/// value to translate: `VkCommandPoolCreateInfo`, `VkVideoSessionCreateInfoKHR`,
+/// `pQueueFamilyIndices` of every concurrent buffer and image, and the
+/// `src`/`dstQueueFamilyIndex` of every barrier inside a recorded command
+/// buffer. None of those is typed as a family index in `vk.xml`, so no
+/// generated pass could find them. Keeping the driver's numbering means there
+/// is nothing to translate, and the price is that an application also sees the
+/// families in between (RADV's async-compute family 1, NVIDIA's transfer and
+/// compute families 1 and 2) — which are real queues on real families, opened
+/// like the others, so seeing them is true rather than merely harmless.
+#[derive(Clone, Copy, Debug)]
+pub struct ServedFamily {
+    /// The driver's properties for this family, with the capability bits this
+    /// GPU side does not serve masked out (see [`SERVED_QUEUE_FLAGS`]) and
+    /// `queueCount` set to the one queue that exists.
+    pub props: vk::QueueFamilyProperties,
+    /// `VkQueueFamilyVideoPropertiesKHR::videoCodecOperations`, restricted to
+    /// the decode codecs whose extension this device enabled. Empty for a
+    /// family that is not served for video.
+    pub video_codec_operations: vk::VideoCodecOperationFlagsKHR,
+    /// `VkQueueFamilyQueryResultStatusPropertiesKHR::queryResultStatusSupport`.
+    pub query_result_status: bool,
+    /// The queue opened on this family, index 0.
+    pub queue: vk::Queue,
+}
+
+/// The queue capabilities a served family may keep. Everything else is masked:
+/// `VIDEO_ENCODE` because encode is not part of this stage and an advertised
+/// encode family would bring `VK_KHR_video_encode_queue` back through
+/// `sv_icd::advertise::unservable_queue_requirement` with nothing measured
+/// behind it; `PROTECTED` because protected content is out of scope by
+/// decision (docs/design.md §0.21.4); `OPTICAL_FLOW_NV` and the rest because no
+/// stage has asked for them.
+pub const SERVED_QUEUE_FLAGS: vk::QueueFlags = vk::QueueFlags::from_raw(
+    vk::QueueFlags::GRAPHICS.as_raw()
+        | vk::QueueFlags::COMPUTE.as_raw()
+        | vk::QueueFlags::TRANSFER.as_raw()
+        | vk::QueueFlags::SPARSE_BINDING.as_raw()
+        | vk::QueueFlags::VIDEO_DECODE_KHR.as_raw(),
+);
+
+/// The decode codec each extension stands for, so that a family's
+/// `videoCodecOperations` names only codecs this device enabled. A driver whose
+/// decode family does VP9 while the profile (or the driver's own extension
+/// list) has no `VK_KHR_video_decode_vp9` must not tell an application it can.
+pub const DECODE_CODEC_EXTENSIONS: &[(&str, vk::VideoCodecOperationFlagsKHR)] = &[
+    ("VK_KHR_video_decode_h264", vk::VideoCodecOperationFlagsKHR::DECODE_H264),
+    ("VK_KHR_video_decode_h265", vk::VideoCodecOperationFlagsKHR::DECODE_H265),
+    ("VK_KHR_video_decode_av1", vk::VideoCodecOperationFlagsKHR::DECODE_AV1),
+    ("VK_KHR_video_decode_vp9", vk::VideoCodecOperationFlagsKHR::from_raw(0x0000_0008)),
+];
+
+/// Which families to serve, from the driver's family table: the pure decision,
+/// separated from the Vulkan calls so that it can be tested.
+///
+/// Returns the driver family indices to open a queue on, in order, and the
+/// decode family if one is served. Without decode it is exactly the one
+/// compute family the GPU side always opened — the behaviour before this stage,
+/// unchanged, so that `SV_VIDEO_DECODE=0` or a driver without decode puts back
+/// what every other gate was measured against.
+pub fn choose_families(
+    flags: &[vk::QueueFlags],
+    codec_ops: &[vk::VideoCodecOperationFlagsKHR],
+    decode_wanted: bool,
+) -> Option<(Vec<u32>, Option<u32>)> {
+    let compute = flags.iter().position(|q| q.contains(vk::QueueFlags::COMPUTE))? as u32;
+    let decode = decode_wanted
+        .then(|| {
+            flags.iter().zip(codec_ops).position(|(q, ops)| {
+                q.contains(vk::QueueFlags::VIDEO_DECODE_KHR) && !ops.is_empty()
+            })
+        })
+        .flatten()
+        .map(|i| i as u32);
+    match decode {
+        // The prefix, so that every served family is at its own index.
+        Some(d) => Some(((0..=compute.max(d)).collect(), Some(d))),
+        None => Some((vec![compute], None)),
+    }
+}
+
+/// Whether video decode is wanted at all. On unless `SV_VIDEO_DECODE=0`, so
+/// that the shape before this stage stays one variable away for anyone
+/// bisecting a regression to it.
+pub fn decode_wanted_by_environment() -> bool {
+    std::env::var("SV_VIDEO_DECODE").map(|v| v != "0").unwrap_or(true)
+}
+
+/// What [`Driver::open_inner`] opened, before the instance-level parts join it.
+/// A struct because the tuple it replaces had grown to eight unnamed fields.
+struct Opened {
+    pd: vk::PhysicalDevice,
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family: u32,
+    served: Vec<ServedFamily>,
+    decode_family: Option<u32>,
+    external_fd: Option<ash::khr::external_memory_fd::Device>,
+    has_dma_buf: bool,
+    external_host: Option<ash::ext::external_memory_host::Device>,
+    buffer_device_address: bool,
+}
+
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR`, vulkan_core.h 1.4.350.
+const STRUCTURE_TYPE_VIDEO_DECODE_VP9_FEATURES_KHR: i32 = 1_000_514_000;
+/// `VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR`, vulkan_core.h 1.4.350.
+const STRUCTURE_TYPE_VIDEO_MAINTENANCE_2_FEATURES_KHR: i32 = 1_000_586_000;
+
+/// A feature struct of the one shape both of the above have:
+/// `{ sType, pNext, VkBool32 }`. `#[repr(C)]` so that it is that shape.
+#[repr(C)]
+struct RawFeature {
+    s_type: vk::StructureType,
+    p_next: *mut std::ffi::c_void,
+    /// Written by `vkGetPhysicalDeviceFeatures2` and read back by the driver
+    /// at `vkCreateDevice`; nothing on this side looks at it.
+    #[allow(dead_code)]
+    enabled: vk::Bool32,
+}
+
+impl RawFeature {
+    fn new(s_type: i32) -> RawFeature {
+        RawFeature {
+            s_type: vk::StructureType::from_raw(s_type),
+            p_next: std::ptr::null_mut(),
+            enabled: vk::FALSE,
+        }
+    }
+}
+
 /// One open driver: instance, physical device, device, queue.
 pub struct Driver {
     /// Held rather than read: it owns the loaded `libvulkan.so`, and dropping it
@@ -69,6 +207,16 @@ pub struct Driver {
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family: u32,
+    /// The families applications see, by the index they see them at.
+    ///
+    /// One entry — the compute family above, presented as family 0 — unless
+    /// video decode is served, in which case it is the driver's own prefix
+    /// `0..=max(compute, decode)` (see [`ServedFamily`]). `queue` and
+    /// `queue_family` stay what the GPU side uses for its own work (the arena
+    /// probe, `svPresentBlit`); this is what `vkGetDeviceQueue` hands out.
+    pub served: Vec<ServedFamily>,
+    /// The served decode family, if any, by its (driver and application) index.
+    pub decode_family: Option<u32>,
     pub props: vk::PhysicalDeviceProperties,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     /// What the loader on *this* side answers `vkEnumerateInstanceVersion` with,
@@ -195,7 +343,18 @@ impl Driver {
     ) -> Result<Driver> {
         let r = Driver::open_inner(&entry, &instance, index);
         match r {
-            Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host, buffer_device_address)) => {
+            Ok(Opened {
+                pd,
+                device,
+                queue,
+                queue_family,
+                served,
+                decode_family,
+                external_fd,
+                has_dma_buf,
+                external_host,
+                buffer_device_address,
+            }) => {
                 let props = unsafe { instance.get_physical_device_properties(pd) };
                 let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
                     .to_string_lossy()
@@ -212,6 +371,8 @@ impl Driver {
                     device,
                     queue,
                     queue_family,
+                    served,
+                    decode_family,
                     props,
                     mem_props,
                     instance_api_version,
@@ -230,21 +391,7 @@ impl Driver {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn open_inner(
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-        index: usize,
-    ) -> Result<(
-        vk::PhysicalDevice,
-        ash::Device,
-        vk::Queue,
-        u32,
-        Option<ash::khr::external_memory_fd::Device>,
-        bool,
-        Option<ash::ext::external_memory_host::Device>,
-        bool,
-    )> {
+    fn open_inner(entry: &ash::Entry, instance: &ash::Instance, index: usize) -> Result<Opened> {
 
         let pds =
             unsafe { instance.enumerate_physical_devices() }.map_err(vkerr("vkEnumeratePhysicalDevices"))?;
@@ -263,18 +410,59 @@ impl Driver {
         let _ = &has;
 
         let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        // The video half of the family table, asked only of a driver that has
+        // the extension: `VkQueueFamilyVideoPropertiesKHR` in a chain the driver
+        // does not know is invalid usage. Count-then-fill through the `2` form,
+        // which a 1.1 instance has.
+        let has_video = has(c"VK_KHR_video_queue") && has(c"VK_KHR_video_decode_queue");
+        let (codec_ops, result_status): (Vec<_>, Vec<_>) = if has_video {
+            let n = unsafe { instance.get_physical_device_queue_family_properties2_len(pd) };
+            let mut vids = vec![vk::QueueFamilyVideoPropertiesKHR::default(); n];
+            let mut qrs = vec![vk::QueueFamilyQueryResultStatusPropertiesKHR::default(); n];
+            let mut fams = vec![vk::QueueFamilyProperties2::default(); n];
+            for ((f, v), q) in fams.iter_mut().zip(vids.iter_mut()).zip(qrs.iter_mut()) {
+                *f = f.push_next(v).push_next(q);
+            }
+            unsafe { instance.get_physical_device_queue_family_properties2(pd, &mut fams) };
+            drop(fams);
+            (
+                vids.iter().map(|v| v.video_codec_operations).collect(),
+                qrs.iter().map(|q| q.query_result_status_support != 0).collect(),
+            )
+        } else {
+            (
+                vec![vk::VideoCodecOperationFlagsKHR::empty(); qfams.len()],
+                vec![false; qfams.len()],
+            )
+        };
+        // Decode is served when the driver has the extensions, the profile
+        // forwards them, and nobody turned it off. The profile half matters:
+        // a build whose profile lacks `VK_KHR_video_decode_queue` has no
+        // forwarders for its commands, and opening a family nothing can record
+        // on would be §0.22's over-promise from the other end.
+        let profile_has = |n: &str| sv_gpu_entry::PROFILE_DEVICE_EXTENSIONS.contains(&n);
+        let decode_wanted = has_video
+            && profile_has("VK_KHR_video_queue")
+            && profile_has("VK_KHR_video_decode_queue")
+            && decode_wanted_by_environment();
+        let flags: Vec<vk::QueueFlags> = qfams.iter().map(|q| q.queue_flags).collect();
         // COMPUTE and TRANSFER, because the acceptance workload is a dispatch
         // and the present path is a copy. Any family with COMPUTE has TRANSFER
         // implicitly per the specification, but asking says what we need.
-        let queue_family = qfams
+        let (open_on, decode_family) = choose_families(&flags, &codec_ops, decode_wanted)
+            .ok_or(DriverError::Missing("a compute-capable queue family"))?;
+        let queue_family = flags
             .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .position(|q| q.contains(vk::QueueFlags::COMPUTE))
             .ok_or(DriverError::Missing("a compute-capable queue family"))? as u32;
 
         let prio = [1.0f32];
-        let qi = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&prio)];
+        let qi: Vec<vk::DeviceQueueCreateInfo> = open_on
+            .iter()
+            .map(|&f| {
+                vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio)
+            })
+            .collect();
 
         // Every extension the profile forwards that this driver actually has,
         // plus the three the arena needs.
@@ -449,6 +637,26 @@ impl Driver {
         chain_if!(c"VK_KHR_fragment_shader_barycentric", bary);
         chain_if!(c"VK_EXT_shader_image_atomic_int64", ai64);
         chain_if!(c"VK_EXT_depth_bias_control", dbc);
+        // The video extensions with a feature struct. Same argument as the six
+        // above, and sharper: `VK_KHR_video_decode_vp9`'s whole capability is
+        // its one feature bit, so the extension enabled with the feature off is
+        // an extension that refuses every VP9 profile.
+        let mut vm1 = vk::PhysicalDeviceVideoMaintenance1FeaturesKHR::default();
+        chain_if!(c"VK_KHR_video_maintenance1", vm1);
+        // Two that `ash` 0.38 (1.3.281) predates. Each is `sType`, `pNext` and
+        // one `VkBool32` (vulkan_core.h, 1.4.350), and they are spliced onto the
+        // front of the chain by hand rather than through `push_next`, which
+        // only takes the types `ash` knows.
+        let mut vp9 = RawFeature::new(STRUCTURE_TYPE_VIDEO_DECODE_VP9_FEATURES_KHR);
+        let mut vm2 = RawFeature::new(STRUCTURE_TYPE_VIDEO_MAINTENANCE_2_FEATURES_KHR);
+        if enabled(c"VK_KHR_video_decode_vp9") {
+            vp9.p_next = f2.p_next;
+            f2.p_next = (&raw mut vp9).cast();
+        }
+        if enabled(c"VK_KHR_video_maintenance2") {
+            vm2.p_next = f2.p_next;
+            f2.p_next = (&raw mut vm2).cast();
+        }
         unsafe { instance.get_physical_device_features2(pd, &mut f2) };
 
         let dci = vk::DeviceCreateInfo::default()
@@ -458,6 +666,35 @@ impl Driver {
         let device =
             unsafe { instance.create_device(pd, &dci, None) }.map_err(vkerr("vkCreateDevice"))?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        // The codecs this device enabled, for masking the decode family's
+        // `videoCodecOperations` — an application told "VP9" by the family and
+        // refused `VK_KHR_video_decode_vp9` by the extension list has been told
+        // two different things.
+        let codecs = DECODE_CODEC_EXTENSIONS
+            .iter()
+            .filter(|(n, _)| owned.iter().any(|o| o.to_bytes() == n.as_bytes()))
+            .fold(vk::VideoCodecOperationFlagsKHR::empty(), |acc, (_, op)| acc | *op);
+        let served: Vec<ServedFamily> = open_on
+            .iter()
+            .map(|&f| {
+                let mut props = qfams[f as usize];
+                props.queue_count = 1;
+                let decode = Some(f) == decode_family;
+                if decode_family.is_some() {
+                    props.queue_flags &= SERVED_QUEUE_FLAGS;
+                }
+                ServedFamily {
+                    props,
+                    video_codec_operations: if decode {
+                        codec_ops[f as usize] & codecs
+                    } else {
+                        vk::VideoCodecOperationFlagsKHR::empty()
+                    },
+                    query_result_status: decode && result_status[f as usize],
+                    queue: unsafe { device.get_device_queue(f, 0) },
+                }
+            })
+            .collect();
         // Read out of the *answer* `vkCreateDevice` was just given, so the two
         // cannot disagree: §0.4 item 9 hands the physical device's own features
         // straight back as the enabled set, which is what makes "reported" and
@@ -476,7 +713,18 @@ impl Driver {
             has_fd.then(|| ash::khr::external_memory_fd::Device::new(instance, &device));
         let external_host =
             has_host.then(|| ash::ext::external_memory_host::Device::new(instance, &device));
-        Ok((pd, device, queue, queue_family, external_fd, has_dma_buf, external_host, bda))
+        Ok(Opened {
+            pd,
+            device,
+            queue,
+            queue_family,
+            served,
+            decode_family,
+            external_fd,
+            has_dma_buf,
+            external_host,
+            buffer_device_address: bda,
+        })
     }
 
     /// The driver's own name, as `sv_arena::import::path_for_driver` spells it.
@@ -571,5 +819,64 @@ impl Drop for Driver {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::QueueFlags as Q;
+    use vk::VideoCodecOperationFlagsKHR as Op;
+
+    const G: Q = Q::from_raw(Q::GRAPHICS.as_raw() | Q::COMPUTE.as_raw() | Q::TRANSFER.as_raw());
+
+    /// RADV's family table as docs/video-decode.md §1 measured it.
+    fn radv() -> (Vec<Q>, Vec<Op>) {
+        let none = Op::empty();
+        (
+            vec![G, Q::COMPUTE | Q::TRANSFER, Q::VIDEO_DECODE_KHR, Q::VIDEO_ENCODE_KHR, Q::SPARSE_BINDING],
+            vec![none, none, Op::DECODE_H264 | Op::DECODE_H265 | Op::DECODE_AV1, Op::ENCODE_H264, none],
+        )
+    }
+
+    #[test]
+    fn without_decode_the_one_compute_family_is_served_exactly_as_before() {
+        let (f, o) = radv();
+        assert_eq!(choose_families(&f, &o, false), Some((vec![0], None)));
+    }
+
+    #[test]
+    fn with_decode_the_served_families_are_the_drivers_own_prefix() {
+        // RADV: decode is family 2, so 0, 1 and 2 are served at their own
+        // indices and the encode family after it is not.
+        let (f, o) = radv();
+        assert_eq!(choose_families(&f, &o, true), Some((vec![0, 1, 2], Some(2))));
+        // NVIDIA: decode is family 3, after transfer and compute families.
+        let n = vec![G, Q::TRANSFER, Q::COMPUTE | Q::TRANSFER, Q::TRANSFER | Q::VIDEO_DECODE_KHR];
+        let no = vec![Op::empty(), Op::empty(), Op::empty(), Op::DECODE_H264];
+        assert_eq!(choose_families(&n, &no, true), Some((vec![0, 1, 2, 3], Some(3))));
+        // The guest Intel: decode is family 1 and the prefix is the whole table.
+        let i = vec![G, Q::VIDEO_DECODE_KHR];
+        let io = vec![Op::empty(), Op::DECODE_H264];
+        assert_eq!(choose_families(&i, &io, true), Some((vec![0, 1], Some(1))));
+    }
+
+    #[test]
+    fn a_decode_family_that_names_no_codec_is_not_a_decode_family() {
+        let f = vec![G, Q::VIDEO_DECODE_KHR];
+        let o = vec![Op::empty(), Op::empty()];
+        assert_eq!(choose_families(&f, &o, true), Some((vec![0], None)));
+    }
+
+    #[test]
+    fn no_compute_family_is_no_device() {
+        assert_eq!(choose_families(&[Q::VIDEO_DECODE_KHR], &[Op::DECODE_H264], true), None);
+    }
+
+    #[test]
+    fn encode_and_protected_are_not_served_capabilities() {
+        assert!(!SERVED_QUEUE_FLAGS.contains(Q::VIDEO_ENCODE_KHR));
+        assert!(!SERVED_QUEUE_FLAGS.contains(Q::PROTECTED));
+        assert!(SERVED_QUEUE_FLAGS.contains(Q::VIDEO_DECODE_KHR | G));
     }
 }
