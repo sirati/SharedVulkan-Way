@@ -300,6 +300,81 @@ impl Plan {
     }
 }
 
+impl Plan {
+    /// The plan for an **ivshmem** arena, built from the header the guest
+    /// compositor wrote at the front of the region — no locator, no QMP, no
+    /// `/proc`, and no privilege beyond being able to open `path`.
+    ///
+    /// IVSHMEM ARENA, docs/waycompose-design.md §83. QEMU backs the device's BAR2 with
+    /// the file at `path`, so the guest's arena *is* that file, at
+    /// [`wc_handle::ivshmem::HEADER_BYTES`], as one contiguous run. Every
+    /// other field the guest-RAM path needed a locator for is in the header.
+    ///
+    /// # What it checks, and why each one
+    ///
+    /// * **The run id the launcher was told.** The header of a compositor that
+    ///   has exited stays in the file until the next one clears it, and a proxy
+    ///   that attached to it would copy pixels into a region nobody reads.
+    ///   `expected_run` is what the compositor printed this session.
+    /// * **The arena id.** The compositor registered the region under one
+    ///   number and every descriptor names it by that number.
+    /// * **The file's length against the header's.** A header that describes a
+    ///   region larger than the file is a header from another VM start, and
+    ///   mapping past the end of a file is a `SIGBUS` on the first frame.
+    ///
+    /// The result is an ordinary [`Plan`], so everything after this — the
+    /// `mmap`, the allocator, the outbound window — is the guest-RAM path's,
+    /// unchanged.
+    pub fn from_ivshmem(id: u32, path: &Path, expected_run: u64) -> io::Result<Plan> {
+        use std::io::Read;
+        use wc_handle::ivshmem::{ENCODED_LEN, HEADER_BYTES, Header};
+        let mut f = std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: {e} (no ivshmem arena: the VM has no wc-arena device, or this user \
+                     is not in the group that may open it)",
+                    path.display()
+                ),
+            )
+        })?;
+        let file_len = f.metadata()?.len();
+        let mut b = [0u8; ENCODED_LEN];
+        f.read_exact(&mut b)?;
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
+        let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
+        if h.run_id != expected_run {
+            return Err(bad(format!(
+                "the header is run 0x{:016x} (generation {}) and the compositor said \
+                 0x{expected_run:016x}: this is another compositor's region, or this one has \
+                 not published yet",
+                h.run_id, h.generation
+            )));
+        }
+        if h.arena_id != id {
+            return Err(bad(format!(
+                "the header says arena {} and --arena-id says {id}",
+                h.arena_id
+            )));
+        }
+        if file_len != h.region_len {
+            return Err(bad(format!(
+                "the file is {file_len} bytes and the header describes a {}-byte region",
+                h.region_len
+            )));
+        }
+        let len = h.arena_len();
+        Ok(Plan {
+            id,
+            object: path.to_path_buf(),
+            len,
+            run_id: h.run_id,
+            outbound: (h.outbound.1 != 0).then_some(h.outbound),
+            runs: vec![Run { arena_offset: 0, file_offset: HEADER_BYTES, len }],
+        })
+    }
+}
+
 /// The guest's arena, scattered through QEMU's backing object, stitched into
 /// one address range.
 pub struct StitchedRegion {
@@ -615,6 +690,55 @@ mod tests {
         let e = Plan::read_all(&p).unwrap_err();
         assert!(e.to_string().contains("region 5"), "{e}");
         assert!(e.to_string().contains("cover 4096 bytes of a 8192-byte arena"), "{e}");
+    }
+
+    /// IVSHMEM ARENA. The host's half end to end on one machine: a file laid
+    /// out as the device would be, a header written by the very code the
+    /// guest runs, and the plan that comes out of it mapped and written
+    /// through. What it cannot show is that the guest's BAR and this file are
+    /// the same pages; that is §83's measurement, not a unit test's.
+    #[test]
+    fn an_ivshmem_header_becomes_a_one_run_plan_after_the_header_page() {
+        use wc_handle::ivshmem::{HEADER_BYTES, Header};
+        let dir = tempdir::Guard::new();
+        let path = dir.path().join("arena");
+        let region = 64 * 4096u64;
+        let h = Header {
+            run_id: 0xfeed_0000_0000_0001,
+            generation: 2,
+            region_len: region,
+            arena_id: 0,
+            outbound: (region - HEADER_BYTES - 8192, 8192),
+        };
+        let mut bytes = vec![0u8; region as usize];
+        // SAFETY: a live buffer of a whole region.
+        unsafe { wc_handle::ivshmem::write_into(bytes.as_mut_ptr(), &h) };
+        bytes[HEADER_BYTES as usize..][..4].copy_from_slice(b"ARN0");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let plan = Plan::from_ivshmem(0, &path, h.run_id).unwrap();
+        assert_eq!(plan.len, region - HEADER_BYTES);
+        assert_eq!(plan.runs, vec![Run { arena_offset: 0, file_offset: HEADER_BYTES, len: plan.len }]);
+        assert_eq!(plan.outbound, Some(h.outbound));
+        let mut r = StitchedRegion::attach(&plan).unwrap();
+        assert_eq!(&r.as_mut_slice()[..4], b"ARN0", "arena offset 0 is the byte after the header");
+        r.as_mut_slice()[4] = b'!';
+        drop(r);
+        assert_eq!(std::fs::read(&path).unwrap()[HEADER_BYTES as usize + 4], b'!');
+
+        // The refusals, each by name.
+        let e = Plan::from_ivshmem(0, &path, 0x1234).unwrap_err().to_string();
+        assert!(e.contains("another compositor's region"), "{e}");
+        let e = Plan::from_ivshmem(3, &path, h.run_id).unwrap_err().to_string();
+        assert!(e.contains("arena 0"), "{e}");
+        std::fs::write(&path, &bytes[..(region as usize) / 2]).unwrap();
+        let e = Plan::from_ivshmem(0, &path, h.run_id).unwrap_err().to_string();
+        assert!(e.contains("describes a"), "{e}");
+        std::fs::write(&path, vec![0u8; region as usize]).unwrap();
+        let e = Plan::from_ivshmem(0, &path, h.run_id).unwrap_err().to_string();
+        assert!(e.contains("no header"), "{e}");
+        let e = Plan::from_ivshmem(0, &dir.path().join("absent"), 1).unwrap_err().to_string();
+        assert!(e.contains("no ivshmem arena"), "{e}");
     }
 
     /// The guest's own memory is a perfectly good stand-in for the guest's

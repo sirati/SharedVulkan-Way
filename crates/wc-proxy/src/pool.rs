@@ -835,6 +835,21 @@ impl ProvidedRegion {
         Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len })
     }
 
+    /// IVSHMEM ARENA. BAR2 of the guest's ivshmem device, as the file QEMU
+    /// backs it with: one run, after the header page, mapped by the same code
+    /// as guest RAM because it is the same operation — `mmap(MAP_SHARED)` of a
+    /// range of a host object the guest's pages live in. Only the origin
+    /// differs, so that a log says which of the two ran.
+    pub fn ivshmem(plan: &crate::guestram::Plan) -> io::Result<ProvidedRegion> {
+        let region = crate::guestram::StitchedRegion::attach(plan)?;
+        let origin = format!(
+            "ivshmem BAR2, run 0x{:016x}, {}",
+            plan.run_id,
+            region.origin()
+        );
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len })
+    }
+
     /// A region backed by a file on this machine.
     ///
     /// **The Wine fixture, and only ever the Wine fixture.** docs/waycompose-design.md §5.1 is
@@ -1108,7 +1123,27 @@ impl Arena {
                 ),
             ));
         }
-        for plan in &plans {
+        Arena::from_plans(id, &plans, ProvidedRegion::guest_ram)
+    }
+
+    /// IVSHMEM ARENA. The arena over the file QEMU backs an ivshmem device's
+    /// BAR2 with, described by the header the guest compositor wrote into it
+    /// (`guestram::Plan::from_ivshmem`). One region, never grown.
+    ///
+    /// Opened as the invoking user: the file's group is the whole of the
+    /// access control, and nothing here needs root. docs/waycompose-design.md §83.
+    pub fn from_ivshmem(id: u32, path: &Path, run_id: u64) -> io::Result<Arena> {
+        let plan = crate::guestram::Plan::from_ivshmem(id, path, run_id)?;
+        Arena::from_plans(id, std::slice::from_ref(&plan), ProvidedRegion::ivshmem)
+    }
+
+    fn from_plans(
+        id: u32,
+        plans: &[crate::guestram::Plan],
+        provide: fn(&crate::guestram::Plan) -> io::Result<ProvidedRegion>,
+    ) -> io::Result<Arena> {
+        let first = &plans[0];
+        for plan in plans {
             if plan.len % ARENA_GRANULARITY != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1120,14 +1155,14 @@ impl Arena {
                 ));
             }
         }
-        let provided = ProvidedRegion::guest_ram(first)?;
+        let provided = provide(first)?;
         let mut arena =
             Arena::over(id, provided.backing, &provided.origin, provided.len);
         if let Some((_, len)) = first.outbound {
             arena.reserve_outbound(len)?;
         }
         for plan in &plans[1..] {
-            let provided = ProvidedRegion::guest_ram(plan)?;
+            let provided = provide(plan)?;
             let mut a = arena.alloc();
             Arena::adopt(
                 &mut a,

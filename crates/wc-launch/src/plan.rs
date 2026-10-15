@@ -1,11 +1,19 @@
 //! Every command line this launcher runs, built in one place and testable on
 //! the machine that compiles it.
 //!
-//! **THE ARENA IS THE GUEST'S OWN RAM AND THERE IS NO OTHER KIND.** The
+//! **THE ARENA IS MEMORY BOTH MACHINES MAP, AND NEVER A FILE ARENA.** The
 //! compositor's arena arguments are written here, in code, from the session's
 //! own numbers; no configuration key and no argument reaches them. `--arena`
 //! (a file), `--arena-provide` and `--shared-dir` do not appear in this file at
-//! all, and `guest_ram_is_the_only_transport` is the test that says so.
+//! all, and `the_arena_is_ivshmem_and_never_a_file` is the test that says so.
+//!
+//! §83 moved the product from the guest's pinned RAM to BAR2 of an ivshmem
+//! device. That is not a step towards the file arena, though the host now
+//! opens a path: the path names QEMU's backing object for the BAR, the same
+//! physical pages the guest maps, exactly as `/proc/<qemu-pid>/fd/<n>` named
+//! the backing object of guest RAM. A file arena is a file each side maps
+//! through its own filesystem, and §10.3 measured that incoherent on a
+//! virtio-fs export.
 //!
 //! That is a hard requirement rather than a preference, and the reason is in
 //! docs/waycompose-design.md §28.2: the file-backed arena is stage 10's hypervisor-free
@@ -30,20 +38,19 @@ pub fn remote_upstream(id: &str) -> String {
     format!("{}/up.sock", remote_dir(id))
 }
 
-/// The compositor half of `sv-guest`, and its arguments. Guest RAM, an outbound window, one output,
-/// a socket and a log — and nothing else. In particular **no `--dump-frames`**:
-/// a Firefox frame is a 2.3 MB PPM and a session is not a 60-second run
-/// (§17.7).
+/// The compositor half of `sv-guest`, and its arguments. An ivshmem arena, an
+/// outbound window, one output, a socket and a log — and nothing else. In
+/// particular **no `--dump-frames`**: a Firefox frame is a 2.3 MB PPM and a
+/// session is not a 60-second run (§17.7).
 ///
-/// `frames` is where the compositor writes the page frame list of the region it
-/// commits. It is the difference between a locate that takes 0.064 s and always
-/// works and one that takes 2.3 s and sometimes reports `page index claimed
-/// twice` — the sweep reads 13 GiB of guest memory whose contents are allowed
-/// to change while it reads them, and five consecutive runs of the test harness
-/// failed that way. The file stays on the guest; the launcher pipes it to the
-/// VM host over the ssh channel it already has, because a 64 MiB arena's list
-/// is 256 KiB and that is not a command-line argument.
-pub fn compositor_argv(cfg: &Config, socket: &str, log: &str, frames: &str) -> Vec<String> {
+/// IVSHMEM ARENA (§83). The arena used to be `--arena-guest-ram`, the guest's
+/// own pinned pages, which the VM host could reach only through QEMU's monitor
+/// and descriptor table — root's, on the deployment — so every session start
+/// ran a locator as root. BAR2 of an ivshmem device is the same physical pages
+/// on both sides and the host reaches it through a file its group may open, so
+/// the product path has no root in it. `--arena-frames` went with the locate it
+/// fed. The developer harnesses keep `--arena-guest-ram`; this launcher does not.
+pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     vec![
         // `sv-guest` is one binary with two halves and the first argument picks
         // one; `sv-guest wayland …` takes exactly the arguments the old
@@ -51,24 +58,19 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str, frames: &str) -> V
         // rather than made configurable for the same reason the arena flags
         // are: there is one compositor in this design and the launcher's job is
         // to start *it*.
-        //
-        // It also means "ensure the compositor is up" stays one process to
-        // check for when the GPU half is wired in beside it, rather than two
-        // that would have to come up in the right order.
         "wayland".into(),
         "--socket".into(),
         socket.into(),
         "--log".into(),
         log.into(),
-        "--arena-frames".into(),
-        frames.into(),
         "--output".into(),
         cfg.output.clone(),
         "--timeout".into(),
         cfg.session_secs.to_string(),
-        // The two that make this an arena over the guest's own pinned pages.
-        "--arena-guest-ram".into(),
-        format!("0:{}", cfg.arena_bytes()),
+        // The two that make this an arena over the device's BAR: region 0 is
+        // the first ivshmem device, and the outbound window is its tail.
+        "--arena-ivshmem".into(),
+        "0".into(),
         "--arena-outbound".into(),
         format!("0:{}", cfg.outbound),
     ]
@@ -415,26 +417,30 @@ mod tests {
     }
 
     /// The hard requirement, as a test rather than as a paragraph. Every
-    /// spelling of "not the guest's RAM" that the compositor understands is
-    /// checked for by name, so that adding one back is a red test and not a
-    /// silent degrade.
+    /// spelling of "a file arena" that the compositor understands is checked
+    /// for by name, so that adding one back is a red test and not a silent
+    /// degrade.
+    ///
+    /// IVSHMEM ARENA (§83). `--arena-guest-ram` is on the list now too, for a
+    /// different reason: it is not a file, but the host can only reach it as
+    /// root, and the point of §83 is that the product path has no root in it.
+    /// A launcher that emitted it would start a session the host's `up` refuses.
     #[test]
-    fn guest_ram_is_the_only_transport() {
+    fn the_arena_is_ivshmem_and_never_a_file() {
         let cfg = cfg();
-        let argv = compositor_argv(&cfg, "wl-x", "log", "frames.txt");
+        let argv = compositor_argv(&cfg, "wl-x", "log");
         assert_eq!(argv[0], "wayland", "the one binary needs its half named first");
-        assert!(argv.iter().any(|a| a == "--arena-guest-ram"), "{argv:?}");
-        assert!(argv.contains(&format!("0:{}", 64u64 * 1024 * 1024)));
-        // The frame list is asked for on every session, because the locate it
-        // replaces is not merely slower but *unreliable*: the sweep searches
-        // 13 GiB of guest memory for stamps while the guest is free to move
-        // pages under it, and five consecutive harness runs failed that way.
-        // Its absence would be a session that still works and sometimes takes
-        // three seconds to start and sometimes does not start at all, which is
-        // exactly the kind of degrade this test exists to make loud.
-        assert!(argv.iter().any(|a| a == "--arena-frames"), "{argv:?}");
-        assert!(argv.contains(&"frames.txt".to_string()), "{argv:?}");
-        for forbidden in ["--arena", "--arena-provide", "--shared-dir", "--shared-peer-prefix"] {
+        let i = argv.iter().position(|a| a == "--arena-ivshmem").expect("no --arena-ivshmem");
+        assert_eq!(argv[i + 1], "0");
+        assert!(argv.contains(&format!("0:{}", cfg.outbound)), "{argv:?}");
+        for forbidden in [
+            "--arena",
+            "--arena-provide",
+            "--shared-dir",
+            "--shared-peer-prefix",
+            "--arena-guest-ram",
+            "--arena-frames",
+        ] {
             assert!(
                 !argv.iter().any(|a| a == forbidden),
                 "{forbidden} reached the compositor's command line: {argv:?}"
@@ -452,7 +458,7 @@ mod tests {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        for forbidden in ["shared-file", "arena-path", "arena-provide", "shared-dir"] {
+        for forbidden in ["shared-file", "arena-path", "arena-provide", "shared-dir", "arena-guest-ram"] {
             assert!(!code.contains(forbidden), "{forbidden} appears in plan.rs's code");
         }
     }
@@ -461,7 +467,7 @@ mod tests {
     fn the_compositor_gets_a_session_length_and_not_a_test_length() {
         let mut c = cfg();
         c.session_secs = 43200;
-        let argv = compositor_argv(&c, "s", "l", "f");
+        let argv = compositor_argv(&c, "s", "l");
         let i = argv.iter().position(|a| a == "--timeout").unwrap();
         assert_eq!(argv[i + 1], "43200");
     }
@@ -485,9 +491,9 @@ mod tests {
 
     #[test]
     fn a_verb_is_the_last_thing_on_the_ssh_line() {
-        let a = ssh_exec(&cfg(), "kh", &["up", "wcl-42", "0x1b44", "65536", "1048576"]);
-        assert_eq!(&a[a.len() - 5..], ["up", "wcl-42", "0x1b44", "65536", "1048576"]);
-        assert_eq!(a[a.len() - 6], "<host-user>@<host-nat-ip>");
+        let a = ssh_exec(&cfg(), "kh", &["up", "wcl-42", "0x1b44", "ivshmem"]);
+        assert_eq!(&a[a.len() - 4..], ["up", "wcl-42", "0x1b44", "ivshmem"]);
+        assert_eq!(a[a.len() - 5], "<host-user>@<host-nat-ip>");
     }
 
     #[test]

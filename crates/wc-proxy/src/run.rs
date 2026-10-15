@@ -51,6 +51,14 @@ struct Args {
     /// of it that are the guest's arena. Set, `--transport arena` maps guest
     /// RAM; unset, it opens `--arena-path` as a file.
     arena_plan: PathBuf,
+    /// IVSHMEM ARENA. The file QEMU backs the guest's ivshmem BAR2 with. Set,
+    /// `--transport arena` builds its plan from the header at the front of that
+    /// file — no locator, no QMP, no root (docs/waycompose-design.md §83).
+    arena_ivshmem: PathBuf,
+    /// The run id the compositor printed, which the header must carry.
+    /// Required with `--arena-ivshmem`: without it a header left by a previous
+    /// compositor would be indistinguishable from this one's.
+    arena_run: Option<u64>,
     /// GROWTH. `wc-arena-host`, and the two things it needs to reach QEMU.
     ///
     /// Empty means this proxy cannot cause a region to exist and falls back to
@@ -150,6 +158,12 @@ usage: wc-proxy --upstream <path> [options]
   --arena-plan PATH      arena: instead of a file, the guest-RAM plan written by
                          wc-arena-host -- the object to open and the runs of it
                          that are the guest's own pinned pages
+  --arena-ivshmem PATH   arena: instead of a plan, the file QEMU backs the guest's
+                         ivshmem BAR2 with; the plan is built from the header the
+                         compositor wrote at its front. Needs --arena-run, and no
+                         root. Fixed size: --arena-grow is refused.
+  --arena-run 0xHEX      arena: the run id the compositor printed; a header with
+                         any other is refused
   --arena-locator PATH   arena: wc-arena-host, so that --arena-grow can ask the
                          compositor for a region and then locate it. Without it
                          growth only watches the plan for a region somebody else
@@ -226,6 +240,8 @@ fn parse_args() -> Result<Args, String> {
         arena_size: 64 << 20,
         arena_path: PathBuf::new(),
         arena_plan: PathBuf::new(),
+        arena_ivshmem: PathBuf::new(),
+        arena_run: None,
         arena_locator: PathBuf::new(),
         arena_qmp: "/run/windows-vm/qmp.sock".into(),
         arena_vm: "windows-vm".into(),
@@ -259,6 +275,13 @@ fn parse_args() -> Result<Args, String> {
             "--peer-prefix" => a.peer_prefix = next()?,
             "--arena-path" => a.arena_path = next()?.into(),
             "--arena-plan" => a.arena_plan = next()?.into(),
+            "--arena-ivshmem" => a.arena_ivshmem = next()?.into(),
+            "--arena-run" => {
+                let v = next()?;
+                let hex = v.strip_prefix("0x").unwrap_or(&v);
+                a.arena_run =
+                    Some(u64::from_str_radix(hex, 16).map_err(|e| format!("--arena-run {v}: {e}"))?)
+            }
             "--arena-locator" => a.arena_locator = next()?.into(),
             "--arena-qmp" => a.arena_qmp = next()?.into(),
             "--arena-vm" => a.arena_vm = next()?,
@@ -394,6 +417,52 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // startup failure with the message on stderr, rather than the first client
     // being told "no transport for it" twenty seconds later.
     let shared_arena = match args.transport.as_str() {
+        // IVSHMEM ARENA, docs/waycompose-design.md §83. The region is BAR2 of a QEMU
+        // ivshmem device, backed by a file at a path this user may open, so the
+        // plan comes from the header the compositor wrote rather than from a
+        // locator: no QMP, no `/proc/<qemu-pid>/fd`, no root. Everything after
+        // the plan is the guest-RAM path's.
+        "arena" if !args.arena_ivshmem.as_os_str().is_empty() => {
+            if !args.arena_plan.as_os_str().is_empty() {
+                return Err("--arena-ivshmem and --arena-plan name two different regions".into());
+            }
+            if args.arena_outbound != 0 {
+                return Err(
+                    "--arena-outbound and --arena-ivshmem are mutually exclusive: the window \
+                     was decided in the guest and travels in the header"
+                        .into(),
+                );
+            }
+            // A BAR is the size QEMU made it. Asking to grow would arm a source
+            // with nothing behind it, which is exactly the armed-and-inert state
+            // §28.12 spent a section on; refusing says so at startup instead.
+            if args.arena_grow {
+                return Err(
+                    "--arena-grow on an ivshmem arena: the region is a PCI BAR of fixed \
+                     size and there is nothing to grow into. A session that fills it \
+                     refuses pools, which it survives (§20)"
+                        .into(),
+                );
+            }
+            let Some(run) = args.arena_run else {
+                return Err(
+                    "--arena-ivshmem needs --arena-run: the run id the compositor printed is \
+                     the only thing that tells its header from a previous compositor's"
+                        .into(),
+                );
+            };
+            let mut t = Arena::from_ivshmem(args.arena_id, &args.arena_ivshmem, run)?;
+            t.set_policy(args.arena_policy)?;
+            println!(
+                "[proxy] transport arena {}: {} bytes of {} (nothing located, nothing \
+                 opened as root, and the compositor opened nothing at all)",
+                t.id(),
+                t.size(),
+                t.origin(),
+            );
+            announce_outbound(&t);
+            Some(t)
+        }
         "arena" if !args.arena_plan.as_os_str().is_empty() => {
             if args.arena_outbound != 0 {
                 return Err(

@@ -75,6 +75,7 @@ WC_SUBSTRATE_LOCATOR=""
 # What a run declares it is about to measure on, before it measures anything.
 #
 #   wc_substrate_declare guest-ram
+#   wc_substrate_declare ivshmem
 #   wc_substrate_declare wine-fixture "no QEMU on this box, so no guest RAM to locate"
 #
 # Returns non-zero if the declaration is refused, and every caller treats that
@@ -104,6 +105,19 @@ wc_substrate_declare() {
       # Not merely "not set": actively removed from this run's environment, so
       # that a value inherited from the shell of somebody who ran a fixture an
       # hour ago cannot license a file on a guest run.
+      unset SV_ALLOW_FILE_ARENA
+      return 0 ;;
+    # IVSHMEM ARENA, docs/waycompose-design.md §83. BAR2 of a QEMU ivshmem-plain device:
+    # the guest maps the BAR, the VM host maps the file QEMU backs it with, and
+    # both are the same physical pages. Not a file arena -- that is a file each
+    # side maps through its own filesystem -- so the escape hatch is removed
+    # exactly as for guest RAM. What proves it is not a locate but the header:
+    # a run id the guest compositor printed, read back on the VM host out of
+    # QEMU's backing object (`wc_ivshmem_proven`).
+    ivshmem)
+      WC_SUBSTRATE=ivshmem
+      WC_SUBSTRATE_LOCATED=""
+      WC_SUBSTRATE_LOCATOR=""
       unset SV_ALLOW_FILE_ARENA
       return 0 ;;
     wine-fixture)
@@ -353,6 +367,17 @@ wc_assert_substrate() {
         return 1
       fi
       ok "${tag:+$tag: }SUBSTRATE guest-ram: $slices arena slice(s) over $WC_SUBSTRATE_LOCATED pages located by $WC_SUBSTRATE_LOCATOR, 0 sections, 0 shared files"
+      return 0 ;;
+    ivshmem)
+      if [ -z "$WC_SUBSTRATE_LOCATED" ]; then
+        bad "${tag:+$tag: }SUBSTRATE UNPROVEN: no ivshmem header was matched to the guest's run id, so '$counts' could be a file"
+        return 1
+      fi
+      if [ "${sections:-0}" -ne 0 ] || [ "${files:-0}" -ne 0 ] || [ "${slices:-0}" -lt 1 ]; then
+        bad "${tag:+$tag: }SUBSTRATE WRONG: $counts -- something was opened by name on an ivshmem run"
+        return 1
+      fi
+      ok "${tag:+$tag: }SUBSTRATE ivshmem: $slices arena slice(s) over $WC_SUBSTRATE_LOCATED pages of the device's BAR2, proven by $WC_SUBSTRATE_LOCATOR, 0 sections, 0 shared files"
       return 0 ;;
     wine-fixture)
       if [ "${sections:-0}" -ne 0 ]; then
