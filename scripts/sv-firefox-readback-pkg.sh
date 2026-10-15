@@ -51,6 +51,10 @@ in pkgs.runCommand \"firefox-readback-157.0.1\" {} ''
   cp -L \${stock}/lib/firefox/defaults/pref/autoconfig.js \$out/lib/firefox/defaults/pref/ 2>/dev/null || true
   cp -L \${stock}/lib/firefox/mozilla.cfg \$out/lib/firefox/ 2>/dev/null || true
   ln -s ../lib/firefox/firefox \$out/bin/.firefox-wrapped
+  # The marker `wc-session run` looks for beside the browser before it turns
+  # Vulkan decode on (waycompose-design.md §86): only this build can read a
+  # decoded frame back instead of exporting it as a dma-buf.
+  touch \$out/lib/firefox/.wc-vulkan-readback
   # The stock wrapper, retargeted: the same environment, this build's binary.
   sed -e 's|\${stock}/bin/.firefox-wrapped|'\$out'/bin/.firefox-wrapped|' \
       \${stock}/bin/firefox > \$out/bin/firefox
