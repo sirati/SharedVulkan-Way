@@ -891,7 +891,7 @@ fn wait_on_queue_ring(icd: &SharedVulkan, args: &p::VkWaitForFencesArgs) -> IcdR
     let mut reply = Vec::new();
     t.call(sv_icd_entry::RingClass::Queue, p::Opcode::VkWaitForFences as u32, &buf, &mut reply)?;
     let mut dec = sv_wire::Decoder::new(&reply);
-    p::decode_reply_vk_wait_for_fences(&mut dec).map_err(|e| LowerError::Wire(e))
+    p::decode_reply_vk_wait_for_fences(&mut dec).map_err(LowerError::Wire)
 }
 
 /// When each swapchain's last present returned, for the gap to the next.

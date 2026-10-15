@@ -165,16 +165,19 @@ def main(argv):
             wc_done[kv.get("surf")] += [t] * max(1, num(kv, "n", 1))
     s2 = busiest(px_done)
     rev = shifts(px_done[s2], wc_done.get(s2, []), -1) if s2 is not None else {}
-    # The pair of shifts whose round trip is smallest without being negative:
-    # a wrong shift on one side makes the sum either impossible (below zero,
-    # an event seen before it happened) or a whole frame too long.
+    # The pair of shifts nearest the heads that is possible at all: both
+    # processes trace from their first message, so (0, 0) is the prior, and a
+    # wrong pairing shows itself by making the round trip negative (an answer
+    # seen before its question). Preferring the smallest round trip instead
+    # picked a wrong pair whenever the real one was longer than a frame's
+    # jitter, which on the guest it was (10 ms).
     offset, d1, d2 = None, [], []
     best = None
     for k1, a in fwd.items():
         for k2, b in rev.items():
             rt = pct(a, 2) + pct(b, 2)
-            if rt >= -200 and (best is None or (rt, abs(k1) + abs(k2)) < best[0]):
-                best = ((rt, abs(k1) + abs(k2)), k1, k2)
+            if rt >= -200 and (best is None or (abs(k1) + abs(k2), rt) < best[0]):
+                best = ((abs(k1) + abs(k2), rt), k1, k2)
     if best is not None:
         d1, d2 = fwd[best[1]], rev[best[2]]
         a, b = pct(d1, 2), pct(d2, 2)

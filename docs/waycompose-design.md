@@ -27486,3 +27486,195 @@ interactive desktop.
 | `wc-pool`, `wc-keymap` | OK, OK |
 | Miri, the new store and rule tests | clean |
 | `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
+
+## 88. Scrolling at 60: a frame timeline across both machines, and a frame clock that does not cross ssh.exe
+
+Written 2026-10-16, on branch `scroll-fps`, from master cd08c7a. The brief:
+§87 measured 40–45 fps while scrolling accelerated Firefox on the guest; find
+where a frame's time goes, end to end, fix what costs most, and reach a
+steady 60 on a 60 Hz output. Every guest run was in session 0, over ssh, on the
+`wcgpu` test installation until the last step; a health watchdog (ssh to the
+guest, ping from the VM host, every 15 s) ran throughout. The reports and
+harness records are in `docs/scroll-fps/`.
+
+### 88.1 Status in one paragraph
+
+**60 fps on the guest.** The scroll harness of §87 (the long page, 40 wheel
+steps, a `requestAnimationFrame` counter, now three rounds with every frame's
+timestamp) went from **44.6 / 45.3 / 43.7 fps** with frame times p50 21.7,
+p95 27.7, p99 38.3 ms to **60.4 / 60.3 / 60.3 fps** with p50 17, p95 18, p99 18
+ms. A 150 s tour afterwards (27 loads, WebGL every round, real sites) ended
+with 59.9 fps and no fault. The cause was not the GPU, the copies or the host's
+CPU: Firefox draws its next frame when the compositor answers
+`wl_surface.frame`, and that answer came back through the launcher's ssh
+tunnel, where **Windows' `ssh.exe` holds a small message from the guest until
+the host next sends something** — 18.8 ms a frame. wc-proxy now answers frame
+callbacks itself on a 60 Hz grid, at most three ahead of the compositor
+(88.4). Four smaller fixes went with it. All are deployed in `wcivs` (88.6).
+
+### 88.2 The instrument: `WC_FRAME_TRACE`
+
+`sv_transport::frametrace` writes `<us> <event> k=v …` lines to the file
+`WC_FRAME_TRACE` names (`%p` is the pid), on a clock every process on one
+machine shares (the wall clock read once, advanced by `Instant`). Off, it is
+one `OnceLock` load per call site. Five processes write their half:
+
+| process | events |
+|---|---|
+| the ICD, in Firefox | `icd.present`: the gap since the last present, the round trips in it by opcode, and the present's phases; `icd.put`: the `wl_shm` buffer wait, the copy, the commit |
+| wc-proxy | `px.frame`, `px.c`, `px.attach`, `px.commit` (with its copy time); `px.gdone` and `px.release` arriving from the compositor; `px.done` sent to the client, and by whom |
+| the compositor | `wc.c` per commit, `wc.done`/`wc.done_sub` per answered callback, `wc.present` (read and compose time), `wc.turn` per loop turn that handled a commit, `wc.paint` on the UI thread (wait for `WM_PAINT`, `SetDIBitsToDevice`) |
+| the GPU side | `gs.ops`: each ring's second, by opcode and execution time |
+| the harness | `harness.scroll-begin`/`-end` around each round |
+
+`scripts/wc-frame-timeline.py` joins them. The guest's wall clock is not the
+host's (it ran 1.570–1.573 s behind); the offset is estimated NTP-style from
+the k-th commit and the k-th answered callback both sides saw, which assumes
+the two directions' fastest crossings are equal, so the split between them is
+an estimate and is labelled as one. `scripts/wc-cpu-sample.py` samples the
+host's CPUs and threads. `sv-firefox-soak.py` gained `SOAK_MODE=scroll` and
+reports rAF percentiles; `sv-firefox-wayland.sh scroll` runs it locally.
+
+### 88.3 Where a frame went, before
+
+Medians per frame, while scrolling, one run (`timeline-base.txt`):
+
+| stage | p50 | p95 |
+|---|---|---|
+| present to present | **21.2 ms** | 31.5 ms |
+| Firefox between presents | 17.8 | 28.6 |
+| … of it blocked on GPU-side round trips (5 a frame) | 7.3 | 10.4 |
+| … `vkWaitForFences` ×1, `vkResetCommandPool` ×2.1, `vkWaitSemaphores` ×1 | 4.5, 1.65, 0.74 | |
+| present: reset + submit, fence wait, copy into `wl_shm` | 0.05, 2.0, 1.2 | |
+| proxy: copy into the compositor's arena | 1.3 | |
+| compositor: read the arena, compose the window | 0.8, 1.6 | |
+| **`wl_surface.frame` to its `done`, at the proxy** | **18.8** | 24.8 |
+| host CPUs 14 and 15 (`user.slice`'s cpuset; the VM has 0–13) | 34 %, 33 % | peaks 48–50 % |
+
+So the host was not CPU-bound, the GPU-side copies were small, and the frame
+period was the callback round trip. The order on the wire showed why: the
+compositor answered each callback at once (`wc.done_now`, a subsurface) and
+flushed, and the proxy received the answer only **after the host's next
+commit had reached the guest**, every frame. With nothing else crossing
+(Firefox idle at start-up) answers took 22–35 ms.
+
+**The tunnel, measured alone.** `probe-tunnel-latency.exe` on the guest sends
+a timestamped 24-byte message every 47 ms through an `ssh.exe -N -T -R` forward
+shaped like the launcher's, to `wc-tunnel-latency.py` on the host, which can
+also send an 8-byte ping every N ms that the guest echoes:
+
+| host-to-guest traffic | guest's unprompted message, wait above the fastest | prompted round trip |
+|---|---|---|
+| none (two runs) | p50 0.5 / 29.9 ms, p99 22.6 / 46.6 ms | — |
+| a ping every 10 ms | p50 14.4, p90 24.3 ms | p50 12.2, p90 22.1 ms |
+| a ping every 2 ms | p50 2.3, p90 7.2 ms | p50 3.0, p90 9.0 ms |
+
+The guest-to-host direction of `ssh.exe` (OpenSSH_for_Windows 9.5p2) moves
+when something arrives from the host. It is not Nagle's algorithm: answers 50
+to 80 ms apart, long since acknowledged, waited just as long, and the relay's
+socket with `TCP_NODELAY` (88.4 item 5) changed nothing (`timeline-a1.txt`:
+41 fps, `done` 14.1 ms after the compositor sent it). Nothing of ours reaches
+inside `ssh.exe`.
+
+### 88.4 The fixes
+
+1. **wc-proxy keeps the client's frame clock** (`crates/wc-proxy/src/pace.rs`,
+   `--pace-frames 60`, passed by `wc-session`). Each `wl_surface.frame` is still
+   forwarded; the proxy answers it on its own 60 Hz grid, and the compositor's
+   later `done` is swallowed and returns a credit. At most `--pace-depth` (3)
+   callbacks may be answered ahead of the compositor, so a compositor that
+   stops answering stops the client after three frames, as it would have
+   directly. Two rules came from running it. A compositor answer that arrives
+   first must not reach the client: forwarding those gave Firefox two clocks
+   and **120 fps under Wine**; it pre-pays the credit instead and the client
+   still hears the grid. And the compositor's `delete_id` for such a callback
+   is held until the proxy's own `done` has gone, or the client would be told
+   its callback is gone while still waiting on it. `done` carries
+   `CLOCK_MONOTONIC` milliseconds, which Firefox evidently uses as its vsync
+   time: rAF timestamps became whole milliseconds, hence the 17/18 ms
+   percentiles.
+2. **The compositor's frame clock** (`tick::FrameClock`). Window callbacks were
+   answered on the first 5 ms turn at least 16 ms after the last answer — every
+   20 ms — and subsurface callbacks at once. Now every callback asked for
+   before a tick is answered on it, the loop sleeps no later than the next
+   tick, and the grid lies on DWM's vblank when DWM reports one (an interactive
+   session; not exercised here) or runs free at 60 Hz. For a proxied client it
+   now only paces the credits; for a client on the guest itself it is the
+   display rate.
+3. **Two round trips gone.** `vkResetFences` and `vkResetCommandPool` are sent
+   without asking for a reply, as `vkQueueSubmit` already was (D15):
+   `VK_SUCCESS` is synthesised and a refusal makes the ring fatal. The rings
+   keep the order (later waits share the device ring, later submits carry a
+   barrier past it). Round trips per frame went from 5 to 2 (p50).
+4. **A pipelined present** (`crate::wsi::Presenter`). `vkQueuePresentKHR`
+   resets and submits the copy and returns; the swapchain's presenter thread
+   waits for it on the **queue** ring (on the device ring the wait would hold
+   that ring for the copy's length) and puts the frame into `wl_shm`.
+   `vkAcquireNextImageKHR` waits for an image whose copy is still being shown.
+   The present costs Firefox's renderer thread 0.06 ms instead of 3.3.
+   `SV_PRESENT_SYNC=1` restores the old order.
+5. **Small things.** wc-proxy is deployed in release (it parses every message
+   and copies every frame on the host's two cores; the debug build's commit to
+   copy was 24 ms at p99). `probe-relay.exe` sets `TCP_NODELAY` and an ACK per
+   segment on its socket to `ssh.exe` — not the cause, but a byte pipe for an
+   interactive protocol should not wait for ACKs.
+
+Not changed, because the timeline said they were not where the time went: the
+GDI blit (not measurable in session 0, where `WM_PAINT` never came, 88.7), the
+two 4 MB copies (1.0 ms each, off the renderer thread now), the compositor's
+5 ms turn, and the host's cpuset.
+
+### 88.5 After
+
+The same harness and build shape, one run each, `wcgpu`:
+
+| | before (`base`) | relay + grid, no proxy clock (`a1`) | all five (`a2`) | 150 s tour (`soak`) |
+|---|---|---|---|---|
+| scroll fps (three rounds) | 44.6, 45.3, 43.7 | 42.0, 38.6, 43.1 | **60.4, 60.3, 60.3** | 59.9 (one round) |
+| rAF frame time p50 / p95 / p99 | 21.7 / 27.7 / 38.3 ms | 22.4 / 34.8 / 47.5 | **17 / 18 / 18** | 17 / 18 / 18 |
+| present to present p50 / p95 / p99 | 21.2 / 31.5 / 45.5 | 22.7 / 34.2 / 47.0 | 16.6 / 20.5 / 22.9 | 16.6 / 20.6 / 21.8 |
+| `frame` to `done` at the proxy, p50 | 18.8 | 20.2 | 14.2 (the grid) | |
+| round trips per frame (p50) and their time | 5, 7.3 ms | 2, 7.5 | 2, 6.5 | |
+| present on the renderer thread | 3.3 ms | 0.08 | 0.06 | |
+| `wl_shm` buffer waits | 0 of 720 | 0 of 691 | 1 of 960 | 0 of 320 |
+| host CPUs 14 / 15 | 34 / 33 % | 32 / 31 % | 40 / 40 % | |
+
+Firefox's own time from a `done` to its next present is p50 12.3, p95 16.0,
+p99 17.6 ms (13.0, 16.8, 18.7 before): 60 is reached, with little room. The
+GPU side's driver spends 5.7 ms a frame in `vkWaitForFences`, Zink waiting for
+the Intel GPU.
+
+Locally (Wine compositor, RADV, wc-proxy, same harness) the grid alone gave
+60.3 fps with p50 16.66 ms where the 5 ms turn had given 175 fps unpaced, and
+the proxy's clock kept it at 60.3; the first version of the proxy's clock
+gave 120.
+
+### 88.6 What is deployed
+
+| where | what |
+|---|---|
+| `wcivs` (the launcher) | backed up to `C:\Users\<guest-user>\wcivs-backup-88` and `~/wc-launch-ivs-backup-88`, then `wc-launch.sh deploy` from this branch with §83.9's and §87.12's variables, `WC_LAUNCH_FIREFOX` as video-decode.md §7.11.5 and `WC_LAUNCH_PULSE`; see 88.7 for its result and the run on it |
+| `wcgpu` (test) | the same build; `gpu.env` as before this section |
+| host `wc-session` | `--pace-frames 60` on both proxy paths |
+
+### 88.7 Gates, and what was not measured
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | see the commit that adds this table |
+| clippy, all targets | see the commit |
+| Windows check | see the commit |
+| `wc-pool`, `wc-keymap` | see the commit |
+| Miri | see the commit |
+
+On the guest: three scroll runs and one tour on `wcgpu`, four tunnel probes
+(no GPU), health every 15 s throughout. One watchdog sample at 01:31:33 lost
+its single ping while ssh to the guest answered; every sample before and after
+was good and QEMU logged nothing.
+
+**Not measured.** The interactive desktop: in session 0 `WM_PAINT` never
+arrived, so the GDI blit's cost and DWM's vblank phase are unmeasured. Pages
+heavier than the long page: the renderer's p99 is within a millisecond of the
+period. `ssh.exe` itself is not fixed; input events from the guest still cross
+it and still wait for host traffic (most of the time a client is drawing,
+there is some).

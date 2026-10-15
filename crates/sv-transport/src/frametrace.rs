@@ -158,7 +158,7 @@ impl OpTally {
     /// The `k` most expensive opcodes, as `name:count:us` joined by commas.
     pub fn top(&self, k: usize, name: impl Fn(u32) -> String) -> String {
         let mut v: Vec<&(u32, u64, u64)> = self.ops.iter().collect();
-        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.sort_by_key(|e| std::cmp::Reverse(e.2));
         v.iter()
             .take(k)
             .map(|e| format!("{}:{}:{}", name(e.0), e.1, e.2 / 1000))
