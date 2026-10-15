@@ -198,7 +198,7 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// The **Windows guest side** of the cross-VM topology.
 ///
 /// ```text
-/// sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS]
+/// sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS] [--allow-small-pages]
 /// ```
 ///
 /// This is the mode `testhost` needs and the one that did not exist: the
@@ -250,6 +250,7 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// per session that it costs there.
 #[cfg(windows)]
 fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    crate::fault::install();
     use awe_probe::alloc::{Mode, Window};
     use std::sync::Arc;
     use sv_gpu_server::driver::Driver;
@@ -271,16 +272,35 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let total = geometry.control_size + geometry.arena_size;
     let extent_pages = (total / PAGE as u64) as usize;
 
-    // Large pages first. It is not a performance preference: 64 MiB of 4 KiB
-    // locked pages measured 1471 physical runs and the same window in 2 MiB
-    // pages measured 22 (`measured-gpu-side.md`), and every run is a separate
-    // `mmap` on the host and 24 bytes in the attach message. `LockedVa` is the
-    // fallback and works without `SeLockMemoryPrivilege`; it is not refused,
-    // because a fragmented arena that runs beats a tidy one that does not.
-    let order = [Mode::LargePages, Mode::LockedVa];
-    let window_pages = awe_probe::alloc::round_pages(&order, extent_pages);
-    let mut window = Window::acquire(&order, window_pages)
-        .map_err(|e| format!("no guest-RAM window: {e}"))?;
+    // Large pages, and since waycompose-design.md §86 **only** large pages unless
+    // the caller says otherwise. 64 MiB of 4 KiB locked pages measured 1471
+    // physical runs and the same window in 2 MiB pages measured 22
+    // (`measured-gpu-side.md`), but that is no longer the reason. §84.5
+    // measured `VirtualLock`ed 4 KiB pages *moving to another frame* on the
+    // deployment guest while locked, in bursts, and §84.7 recorded the guest
+    // hard-hanging during the one run that had the host writing into such an
+    // arena. The host writes this arena on every command. A page that moved
+    // under it would put the host's writes into a frame Windows has given to
+    // someone else, so the old "a fragmented arena that runs beats a tidy one
+    // that does not" is the wrong trade here: refused, with the reason, and
+    // `--allow-small-pages` (or `SV_ALLOW_SMALL_PAGES=1`) puts the fallback
+    // back for a guest where that is known to be safe.
+    let small_ok = args.iter().any(|a| a == "--allow-small-pages")
+        || std::env::var_os("SV_ALLOW_SMALL_PAGES").is_some_and(|v| v == "1");
+    let order: &[Mode] = if small_ok { &[Mode::LargePages, Mode::LockedVa] } else { &[Mode::LargePages] };
+    let window_pages = awe_probe::alloc::round_pages(order, extent_pages);
+    let mut window = Window::acquire(order, window_pages).map_err(|e| {
+        if small_ok {
+            format!("no guest-RAM window: {e}")
+        } else {
+            format!(
+                "no large-page guest-RAM window: {e}. The VirtualLock fallback is refused \
+                 (waycompose-design.md §84.5, §86): this account needs SeLockMemoryPrivilege \
+                 and 2 MiB of contiguous free memory per page, or --allow-small-pages on a \
+                 guest where locked 4 KiB pages are known to stay put"
+            )
+        }
+    })?;
     if window.pages < extent_pages {
         return Err(format!(
             "the allocator gave {} pages of the {extent_pages} the geometry needs",
