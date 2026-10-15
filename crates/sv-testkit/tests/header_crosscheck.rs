@@ -821,7 +821,11 @@ fn the_cross_check_is_deterministic() {
 ///   target, because the failure belongs to the command buffer and not to a call
 ///   with no reply to fail;
 /// - `vkQueueSubmit` and `vkEndCommandBuffer` **refuse**, which is where the
-///   failure becomes visible to an application;
+///   failure becomes visible to an application. Since docs/video-decode.md
+///   §7.12 the three of them (both submits and the end) refuse *after* a
+///   reduced call reaches the driver: the end, so the driver's buffer leaves
+///   the recording state; the submits without the poisoned buffers, so the
+///   fence the application waits on completes;
 /// - `vkBeginCommandBuffer` **clears**, because recording afresh is the only way
 ///   back and the specification routes every reuse through it;
 /// - `vkFreeCommandBuffers` does **neither**, because a destructor that can be
@@ -842,7 +846,21 @@ fn a_failed_recording_is_carried_to_the_submit_and_not_to_the_ring() {
         let end = rest[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(rest.len());
         rest[..end].to_string()
     };
-    let refuses = |n: &str| body(n).contains("if let Some(__why) = __h.take_poisoned_command_buffer()");
+    let refuses_before = |n: &str| body(n).contains("if let Some(__why) = __h.take_poisoned_command_buffer()");
+    // Refused after a reduced driver call: the mark is taken before the call
+    // and reported after it.
+    let refuses_after = |n: &str| {
+        let b = body(n);
+        let (Some(take), Some(call), Some(report)) = (
+            b.find("let __end_poison = __h.take_poisoned_command_buffer()"),
+            b.find("unsafe { __f("),
+            b.rfind("__h.note_poisoned_submit("),
+        ) else {
+            return false;
+        };
+        take < call && call < report
+    };
+    let refuses = |n: &str| refuses_before(n) || refuses_after(n);
     let poisons = |n: &str| body(n).contains("__h.poison_command_buffer(");
     let clears = |n: &str| body(n).contains("__h.unpoison_command_buffer(");
 
@@ -854,6 +872,13 @@ fn a_failed_recording_is_carried_to_the_submit_and_not_to_the_ring() {
     assert!(refuses("queue_submit2"), "vkQueueSubmit2 must too, two levels down");
     // The specification's own answer: recording failed, so ending fails.
     assert!(refuses("end_command_buffer"), "vkEndCommandBuffer must report a failed recording");
+    // ... after the driver has ended its buffer, and the submits after the
+    // driver has their fence (§7.12).
+    for n in ["queue_submit", "queue_submit2", "end_command_buffer"] {
+        assert!(refuses_after(n), "{n} must refuse after a reduced driver call");
+    }
+    assert!(body("queue_submit").contains("strip_poisoned_submit("), "vkQueueSubmit strips poisoned buffers");
+    assert!(body("queue_submit2").contains("strip_poisoned_submit2("), "vkQueueSubmit2 keeps only its fence");
 
     // Recording afresh forgives, and must not refuse the call that forgives.
     assert!(clears("begin_command_buffer"), "vkBeginCommandBuffer must clear the mark");

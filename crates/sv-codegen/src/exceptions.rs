@@ -918,8 +918,11 @@ pub const GPU_OBSERVED: &[&str] = &[
 /// The generated commands whose raise pool `GpuHost::retain_raise` is handed
 /// after the driver call, instead of dropping it (docs/video-decode.md §7.11).
 ///
-/// Since §7.11.5 only `vkCmdControlVideoCodingKHR` is here: begin and decode
-/// are hand-written and call the hook themselves.
+/// Since §7.11.5 begin and decode are hand-written and call the hook
+/// themselves. Since §7.12 the two parameters calls are here as well: the GPU
+/// side keeps their pools (the SPS, PPS, VPS and AV1 sequence header arrays)
+/// as long as the session, as ffmpeg keeps its H.265 parameter-set arrays for
+/// the decoder's life (`sv_gpu_server::video_stable`).
 ///
 /// The guest's Intel driver faulted in `vkCmdDecodeVideoKHR` three times,
 /// each time by following a stale pointer at an IDR. In the last run the
@@ -929,8 +932,11 @@ pub const GPU_OBSERVED: &[&str] = &[
 /// structures in pooled per-picture memory, which would hide that; the
 /// forwarder frees each call's copies when the call returns. Keeping the pools
 /// (`SV_VIDEO_RETAIN`) is the experiment that tells the two explanations apart.
-pub const GPU_RETAIN_RAISE: &[&str] =
-    &["vkCmdControlVideoCodingKHR"];
+pub const GPU_RETAIN_RAISE: &[&str] = &[
+    "vkCmdControlVideoCodingKHR",
+    "vkCreateVideoSessionParametersKHR",
+    "vkUpdateVideoSessionParametersKHR",
+];
 
 /// Just the names, for the generator's set membership.
 pub fn gpu_hand_written() -> Vec<&'static str> {

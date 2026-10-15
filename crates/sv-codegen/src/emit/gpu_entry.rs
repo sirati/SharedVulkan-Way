@@ -1042,7 +1042,7 @@ fn emit_forward_command(
         let n = words.len();
         let result = if c.returns_void { quote!(0i32) } else { quote!(__r.0 as i32) };
         quote! {
-            let __obs = __h.observing();
+            let __obs = __h.observing(#cname);
             let __ow: [u64; #n] = if __obs { [#(#words),*] } else { [0u64; #n] };
             if __obs {
                 __h.observe(#cname, false, &__ow, 0);
@@ -1371,8 +1371,68 @@ fn emit_forward_command(
     // `vkEndCommandBuffer` — and `vkEndCommandBuffer` refusing is not a side
     // effect but the specification: a command buffer whose recording failed
     // returns an error from `vkEndCommandBuffer`.
+    //
+    // `vkEndCommandBuffer` still reaches the driver first (docs/video-decode.md
+    // §7.12). Refused before the call, the driver's buffer stayed in the
+    // recording state, and the application's next `vkBeginCommandBuffer` on it
+    // was then a begin of a buffer still recording. Ended, it is merely a
+    // buffer with a command missing, which is never submitted (the submit is
+    // refused) and is reset by the next begin like any other.
     let asks_about_poison = !wire.is_recorded && !clears && unbind.is_empty();
-    let poison_check = if asks_about_poison {
+    let end_after_call = asks_about_poison && cname == "vkEndCommandBuffer";
+    // A `vkQueueSubmit` naming a poisoned command buffer still reaches the
+    // driver, without that buffer (docs/video-decode.md §7.12). The ICD sends
+    // that one without waiting for a reply and has already told the
+    // application `VK_SUCCESS`, so the application counts on the batch's
+    // semaphore signals and fence; dropped whole, the next wait on them would
+    // never return. The error still goes back and takes the ring fatal, as any
+    // refused asynchronous submit does: the application sees
+    // `VK_ERROR_DEVICE_LOST` on its next call.
+    //
+    // `vkQueueSubmit2` is a round trip, so the application reads the error and
+    // counts no semaphore signal; signalling them anyway put its timeline
+    // values behind the driver's (`VUID-VkSubmitInfo2-semaphore-03882`). But
+    // its fence still has to complete: ffmpeg's next `ff_vk_exec_start` on that
+    // execution context waits for it with no timeout, and refused whole, that
+    // wait never returned. So the driver gets the fence and no batch at all.
+    let strip_hook = match cname {
+        "vkQueueSubmit" => Some(quote!(strip_poisoned_submit)),
+        "vkQueueSubmit2" => Some(quote!(strip_poisoned_submit2)),
+        _ => None,
+    };
+    let submit_after_call = asks_about_poison && strip_hook.is_some();
+    let settle = if cname == "vkQueueSubmit2" {
+        quote!(__h.settle_stripped_submit(a.fence.0);)
+    } else {
+        quote!()
+    };
+    let poison_after = if end_after_call || submit_after_call {
+        quote! {
+            if let Some(__why) = __end_poison {
+                let _ = &__r;
+                #settle
+                __h.note_poisoned_submit(#cname, __why);
+                return #missing_answer;
+            }
+        }
+    } else {
+        quote!()
+    };
+    let poison_check = if end_after_call {
+        quote!(let __end_poison = __h.take_poisoned_command_buffer();)
+    } else if submit_after_call {
+        let hook = strip_hook.expect("checked above");
+        quote! {
+            let __end_poison = __h.take_poisoned_command_buffer();
+            if let Some(__why) = __end_poison
+                && !__h.#hook(&mut a)
+            {
+                // The batch could not be taken apart: refused whole, as before.
+                __h.note_poisoned_submit(#cname, __why);
+                return #missing_answer;
+            }
+        }
+    } else if asks_about_poison {
         quote! {
             if let Some(__why) = __h.take_poisoned_command_buffer() {
                 // Failing *this* call is the whole point: it is detectable, it
@@ -1415,7 +1475,7 @@ fn emit_forward_command(
         }
     };
 
-    let mut_a = if has_pre { quote!(mut) } else { quote!() };
+    let mut_a = if has_pre || submit_after_call { quote!(mut) } else { quote!() };
     Ok(quote! {
         let #mut_a a = a;
         let __h = &mut self.0;
@@ -1448,6 +1508,7 @@ fn emit_forward_command(
         #(#locals)*
         #(#out_decls)*
         #call
+        #poison_after
         #(#guard_checks)*
         #retain
         let __b = __h;
@@ -1574,6 +1635,26 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// because that is what `vkQueueSubmit` will be holding when it
             /// checks.
             fn poison_command_buffer(&mut self, command_buffer: u64, why: &'static str);
+            /// Remove every poisoned command buffer from a `vkQueueSubmit`'s
+            /// batches, keeping their semaphores and the fence; false if the
+            /// batches cannot be taken apart, and the submit is then refused
+            /// whole (docs/video-decode.md §7.12).
+            fn strip_poisoned_submit(&mut self, a: &mut sv_proto::VkQueueSubmitArgs) -> bool {
+                let _ = a;
+                false
+            }
+            /// The same for `vkQueueSubmit2`, whose error the application
+            /// reads: every batch is removed and only the fence is left.
+            fn strip_poisoned_submit2(&mut self, a: &mut sv_proto::VkQueueSubmit2Args) -> bool {
+                let _ = a;
+                false
+            }
+            /// After a `vkQueueSubmit2` stripped to its fence: wait for that
+            /// fence, which the application believes was never submitted and
+            /// may destroy at once (`VUID-vkDestroyFence-fence-01120`).
+            fn settle_stripped_submit(&mut self, fence: u64) {
+                let _ = fence;
+            }
             /// Clear a command buffer's poison: it is being recorded afresh.
             ///
             /// Without this a buffer reused after a failed recording stays
@@ -1612,9 +1693,11 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// per-command locking would let two recordings interleave while
             /// looking synchronised (docs/design.md §0.23).
             fn lock_command_pool(&self) -> crate::QueueGuard<'_>;
-            /// Whether [`GpuHost::observe`] wants to be called at all. Asked
-            /// once per call of a command `exceptions::GPU_OBSERVED` names.
-            fn observing(&self) -> bool {
+            /// Whether [`GpuHost::observe`] wants to be called at all for this
+            /// call of `command`, one of the commands `exceptions::GPU_OBSERVED`
+            /// names.
+            fn observing(&self, command: &'static str) -> bool {
+                let _ = command;
                 false
             }
             /// The driver call of a command `exceptions::GPU_OBSERVED` names,
