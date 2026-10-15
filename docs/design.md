@@ -5609,7 +5609,12 @@ orange read back), submissions in all 11 windows, `libsv_icd.so` mapped at
 every sample, 675 frame notes all at 1280x900 with fence 0.65 ms and copy
 0.24 ms on average, and wc-proxy's own account of the second copy: 40,519
 copies of 4.4 MB at 261 µs each. The compositor titled its window after every
-page ("Firefox - Wikipedia — Mozilla Firefox", "sv webgl — Mozilla Firefox", …).
+page ("Firefox - Wikipedia — Mozilla Firefox", "sv webgl — Mozilla Firefox", …),
+and a visual-check agent judged two of the X-root shots: Firefox drawn as a
+Win32 window on the Wine desktop, "sv long page" and "sv webgl" legible, colours
+right (no red/blue swap by pixel sample), no artifacts. It also saw the Wine
+caption above Firefox's own tab strip — the title-bar item of the goal, not
+this one's.
 
 Two failures came first, and neither was the path under test:
 
