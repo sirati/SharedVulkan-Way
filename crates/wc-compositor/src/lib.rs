@@ -1549,6 +1549,7 @@ fn wayland_thread(
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
     let mut empty_watch = exit_when_empty.map(EmptyWatch::new);
+    let mut deadline_deferred = false;
     if let Some(linger) = exit_when_empty {
         println!(
             "wc-compositor: will end the session {} s after its last window closes",
@@ -1804,17 +1805,34 @@ fn wayland_thread(
 
         if let Some(w) = empty_watch.as_mut()
             && w.tick(Instant::now(), state.live_toplevels(), state.toplevels > 0, state.clients_seen)
+            && live == 0
         {
             println!(
-                "wc-compositor: the session's last window closed {} s ago and no client has \
-                 connected since; ending the session ({live} client(s) still connected)",
+                "wc-compositor: the session's last window closed {} s ago, no client has \
+                 connected since and none is connected now; ending the session",
                 w.linger.as_secs()
             );
             code = 0;
             break;
         }
 
-        if Instant::now() > deadline {
+        // §85. A session's deadline does not cut off a connected client. Firefox
+        // treats a lost display connection as a crash -- measured under Wine:
+        // killing the compositor or the proxy under a running Firefox leaves a
+        // crash event whose MozCrashReason is "Error reading events from
+        // display: Broken pipe" -- so a 12-hour `--timeout` that fired under a
+        // live browser was a crash report with our name on it. Under
+        // `--exit-when-empty` (the launcher's sessions) the deadline waits for
+        // the clients to go; everything else keeps the hard deadline it had.
+        if Instant::now() > deadline && empty_watch.is_some() && live > 0 {
+            if !deadline_deferred {
+                println!(
+                    "wc-compositor: the session deadline has passed with {live} client(s) \
+                     connected; it ends when they have gone"
+                );
+                deadline_deferred = true;
+            }
+        } else if Instant::now() > deadline {
             eprintln!("wc-compositor: idle timeout reached; exiting");
             code = 3;
             break;
