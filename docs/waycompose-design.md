@@ -3290,6 +3290,14 @@ locates through `~/rootc` and runs the proxy and its client in a
 because a root call that blocks for a minute frequently returns no output at
 all. The unit's journal is the record and the harness prints it on failure.
 
+**Amended by §82.** Option 2's parenthesis turned out to be the answer, applied
+to one region instead of the guest's whole RAM. A dedicated `ivshmem-plain`
+device has a `memory-backend-file` at a path, and a path *can* be given a group.
+The launcher's arena now lives there, the proxy opens it as the user, and
+nothing on the product path is root. Everything above still describes the
+guest-RAM arena, which the developer harnesses keep using, and which keeps
+needing root for exactly these reasons.
+
 ### 12.10 The region can be located exactly once, and a second attempt fails loudly
 
 The host writes pixels over the stamps as soon as the first pool is published —
@@ -10077,6 +10085,21 @@ system in a fourth:
   §14.7's, unchanged, on a path where the descriptor that crosses the hypervisor
   is still unrepresentable rather than merely zero.
 
+**Amended by §82: the launcher's arena is an ivshmem device now, and the rule's
+reason is what carries over, not its wording.** "Guest RAM, always" was a proxy
+for the real requirement: **the two sides map the same physical pages**, and
+nothing degrades to a file that each side maps through its own filesystem.
+Guest RAM found in QEMU's memfd met that requirement. BAR2 of an `ivshmem-plain`
+device, which QEMU backs with a host file, meets it in the same way: the guest
+maps the BAR, and the host maps the backend those pages *are*. What the old
+wording could not say is that the guest-RAM route needed root on the host and
+this one does not. So the four enforcement points stand with their subject
+changed. `compositor_argv` emits `--arena-ivshmem`. `wc-session` spells
+`--arena-ivshmem --arena-run` and has no verb that names a file arena.
+`the_arena_is_ivshmem_and_never_a_file` refuses every file flag by name and now
+`--arena-guest-ram` too. `verify` reads the live compositor's command line and
+also asks the VM host which user its proxy runs as.
+
 ### 28.3 One owner, a named mutex, and the liveness test that must not be used
 
 The second requirement is that the compositor starts if it is not running and is
@@ -10403,7 +10426,8 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    half seconds shorter with the other one. The warm numbers do not move at all,
    because the warm path locates nothing — which is the point of §28.1 and the
    reason this stage did not wait for that work.
-4. **`rootc` is in the product's path and should not be.** The host half becomes
+4. **`rootc` is in the product's path and should not be.** *Closed by §82 for
+   the launcher; the developer harnesses keep it.* The host half becomes
    root through this deployment's developer console, which is a debugging
    facility a person has to have started. A real installation would give
    `wc-proxy` a systemd unit and `arena-host` a polkit rule, or run QEMU as the
@@ -25178,3 +25202,174 @@ fits inside one process — create it, open it as the peer would, move bytes, ch
 which side got them — so here the evidence *is* a number in the suite. Neither
 answer is better than the other; what would be wrong is reporting one shape of
 evidence as though it were the other.
+
+
+---
+---
+
+## 82. The arena moves onto an ivshmem device, and root leaves the launcher's path
+
+### 82.1 Status in one paragraph
+
+Until this section every session the desktop shortcut started became root on the
+VM host twice: once to locate the guest's arena through QMP and
+`/proc/<qemu-pid>/fd`, and once to run `wc-proxy` against QEMU's memory backend
+(§12.9, §28.9 item 4). The arena now lives in **BAR2 of a QEMU `ivshmem-plain`
+device** whose memory backend is a file at a path,
+`/run/windows-vm/wc-arena/arena`, mode 0660 `root:wc-arena`. The guest compositor
+maps the BAR through the WHQL-signed ivshmem driver (`--arena-ivshmem 0`) and
+writes a header at the front of it; the VM host opens the file **as the user**,
+reads the header, and runs the proxy in a *user* unit. `wc-session`'s `up`,
+`proxy` and `down` do not call `$ROOTC` on this path, and there is no fallback to
+the old one. The developer harnesses keep `--arena-guest-ram` and their root.
+What was run on the guest, and what it measured, is 82.8; what was not is 82.9.
+
+### 82.2 The reason, which security-model.md R6 asked for
+
+R6 closed with an instruction: *"If a driver is ever proposed again, this entry is
+why it has to be argued from a stated new reason rather than revived from the old
+one."* The old reason ivshmem was dropped was a mechanism: a BAR is
+`VM_IO|VM_PFNMAP`, host-pointer import pins pages, and the pinning path refuses
+such pages (docs/design.md §5.1). That reason is about **importing the arena into a
+GPU driver**, and it still stands for shared_vulkan's arena, which stays guest RAM.
+The compositor's arena is never imported into anything. The guest compositor
+reads it with the CPU and the host proxy writes it with the CPU, so the mechanism
+objection never applied to this path. Nobody had a reason to use a device here
+until now.
+
+The new reason is **root in the product path**. §12.9 said what it would take to
+avoid it, in order of preference, and ruled out each option for its own reason:
+running QEMU as the user is a real question on a VFIO machine; a helper that
+returns a *name* "cannot be written" because a memfd has no name; passing the
+descriptor over `SCM_RIGHTS` breaks the one invariant the design has. §12.9 also
+named the thing that would change the second answer, in parentheses: *"a
+`memory-backend-file` would have one — a path on tmpfs — and swapping the backend
+is another VM change with its own consequences."* This section makes that change
+for a dedicated region rather than for the guest's whole RAM. That keeps the
+consequences down to one device, one file and 128 MiB.
+
+### 82.3 Why this is not the file arena, and what §28.2 now says
+
+§28.2's rule is that the file-backed arena must not be reachable from the
+launcher, because "a launcher that could quietly degrade to a file would produce
+a window that works and pixels that tear". The host now opens a path, so the rule
+has to be read for what it was about. The file arena is a file **each side maps
+through its own filesystem**: on the Wine fixture that is one kernel's page
+cache, and on a virtio-fs export it is two, which §10.3 measured incoherent for
+live mappings (65280 of 65536 bytes wrong). The ivshmem file is not mapped by the
+guest at all. The guest maps a PCI BAR, and QEMU makes that BAR **the same RAM
+pages** as the host file (`hw/misc/ivshmem-pci.c` registers the backend's own
+`MemoryRegion` as BAR2, docs/research-vulkan-forwarding.md §2.2). That is the same
+relationship guest RAM had with `/proc/<qemu-pid>/fd/<n>`, which was also a path
+naming QEMU's backing object.
+
+So `the_arena_is_ivshmem_and_never_a_file` (the old
+`guest_ram_is_the_only_transport`) keeps every refusal it had. `--arena`,
+`--arena-provide`, `--shared-dir` and the source grep for them are all still
+there, and it adds `--arena-guest-ram` and `--arena-frames` to the refused list,
+because a launcher that emitted them would start a session the host's `up` can
+no longer serve without root. `wc-substrate.sh` gains an `ivshmem` substrate that
+removes `SV_ALLOW_FILE_ARENA` exactly as `guest-ram` does.
+
+docs/design.md §1a is satisfied in the same way it was before: the host opens a
+name it can resolve itself, and what crosses the VM boundary is a 64-bit run id.
+
+### 82.4 The header, and why it is outside the arena
+
+The plan that `wc-arena-host` used to write held four facts: an object, a length,
+a run id and the outbound window. With a device, QEMU was told the object before
+the guest booted, so the other three have to travel some other way. They travel
+in the region itself. `wc_handle::ivshmem` defines a 64-byte header in the first
+4 KiB page: magic `WCIVSHM1`, version, header size, run id, generation, region
+length, arena id, and the outbound window. It is encoded and decoded by one
+platform-independent module, so the Windows writer and the Linux reader cannot
+disagree about a field offset, and the test pins the offsets as numbers.
+
+**The page is not part of the arena.** The arena's offset 0 is the region's byte
+4096, on both sides. `Attached` gained a `base` for this, and the proxy's plan is
+one run at file offset 4096. If the header lived at arena offset 0, the proxy's
+first-fit allocator would write pixels over it on the first frame. That is
+§12.10's lesson about the stamps, which also had to be found again later and
+could not be because a pool had overwritten them.
+
+**Ordering.** `attach_ivshmem` clears the previous compositor's magic before it
+registers anything. `publish_ivshmem` runs after the outbound window is reserved
+and before the socket is bound. It writes every field, then a release fence, then
+the magic. The launcher waits for the line printed *after* publishing, `header
+published: run 0x…`. `wc-session up` then checks the magic and the run id with
+`od`, and the proxy checks them again together with the arena id and the file
+length (`Plan::from_ivshmem`). A header left by a compositor that has exited
+therefore fails at `up`, with both run ids in the message.
+
+**What the guest side no longer does.** It does no `VirtualLock`, no stamps, no
+frame list and no deferral of gifts. The BAR's pages are not in the compositor's
+working set and are not charged against the guest's RAM. The launcher also no
+longer runs the Superfetch frame-list query (security-model.md R28), which stays
+in use for shared_vulkan's arena and the developer harnesses.
+
+### 82.5 What it costs
+
+* **128 MiB of host RAM**, pinned under VFIO like the guest's own. The file is on
+  `/run`'s tmpfs. On testhost that comes out of the ~1.4 GiB the host has left
+  after the guest's 13 GiB (`free -m` before the change: 1419 MiB available).
+  The guest gets the matching amount back, because the arena is no longer carved
+  out of its RAM and pinned.
+* **No growth.** A BAR is the size QEMU gave the device. The proxy refuses
+  `--arena-grow` with `--arena-ivshmem` rather than arm growth with nothing
+  behind it, which was §28.12's "armed and inert" state. The compositor reserves
+  no growth channel. A session that fills the arena refuses pools, which it
+  survives (§20). 128 MiB less the header page and the 1 MiB outbound window is
+  about twice the 64 MiB peak §28.12 measured.
+* **One mapping per device.** The driver gives the BAR to one handle and takes it
+  back when that handle closes. So one compositor per VM uses it, and a second
+  one fails at start-up with the reason in the message.
+* **A group that can stop the VM.** security-model.md R29.
+
+### 82.6 The VM side
+
+`virtualisation.windowsVm.waycomposeArena` in nix-config, on branch
+`wc-arena-ivshmem`, adds the `memory-backend-file` and the `ivshmem-plain` device
+on a pinned root-bus slot (`pci.0`, because testhost's machine type is
+i440fx). It adds a root `ExecStartPre` that recreates the file for every VM start
+(directory 0750, file 0660, truncated to the size QEMU is told), an
+`ExecStopPost` that removes it, and `users.groups.wc-arena.members =
+[ "sirati" ]`. It also sets `restartIfChanged = false` on `windows-vm.service`:
+before this the unit had no such setting, so any `switch` that changed it would
+have restarted the VM somebody is logged into. 82.8 records which of the
+persistent change and the hot-plug were applied, and how.
+
+### 82.7 The guest side
+
+The driver is the WHQL-signed `ivshmem` from the Looking Glass B7 host
+installer, the only signed build available (docs/research-vulkan-forwarding.md §2.2).
+`wc_handle::platform::windows::map_ivshmem` finds the device by interface GUID
+`{df576976-569d-4672-95a0-f57e4ea0b210}`, asks `IOCTL_IVSHMEM_REQUEST_SIZE`, and
+maps with `IOCTL_IVSHMEM_REQUEST_MMAP` in **`IVSHMEM_CACHE_CACHED`**. That is
+write-back, the same class as the host's mapping of a tmpfs page, which is what
+R10 requires of two page tables over one page. The driver's default for a BAR
+is uncached, and the compositor is the side that *reads*, so write-combining
+would be the wrong choice too.
+The IOCTL codes are `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801/0x802/0x803,
+METHOD_BUFFERED, FILE_ANY_ACCESS)`, written out by hand. The `IVSHMEM_MMAP`
+layout is taken from the driver's own `Public.h`.
+
+`wc-ivshmem-probe` is the guest's half of the core measurement. It goes through
+the same `attach_ivshmem`, writes a marker carrying its pid and run id at arena
+offset 0, reads it back, and with `--bench` times one 1920×1080 RGBA copy out of
+the mapping against the same copy between two heap buffers.
+
+### 82.8 What was run
+
+*Not yet run on the guest at the time of writing; this subsection is replaced by
+the measurements when they exist.*
+
+### 82.9 What is not proven
+
+1. **Everything in 82.8 that says "not run".**
+2. **The persistent VM change has not booted.** It was evaluated and built, and
+   82.8 says whether it was activated. A cold start of the VM is the one test it
+   has not had, and that start is not ours to cause.
+
+### 82.10 The gates
+
+*Recorded with the measurements in 82.8.*

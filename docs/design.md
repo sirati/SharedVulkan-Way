@@ -5127,7 +5127,7 @@ there are in §0.7.
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM, mapped by the other through QEMU's existing `memory-backend-memfd`. **Measured working end to end** (`measured-gpu-side.md`). No ivshmem, no new device, no unsigned driver. (fwd §2.2) |
+| D1 | Where does the arena live? | Ordinary **guest RAM**, allocated by whichever side is in the VM, mapped by the other through QEMU's existing `memory-backend-memfd`. **Measured working end to end** (`measured-gpu-side.md`). No ivshmem, no new device, no unsigned driver. (fwd §2.2) *The compositor's arena, which no GPU imports, is an ivshmem device since `waycompose-design.md` §82; this row is about the Vulkan arena.* |
 | D1a | How is it obtained inside the guest? | `VirtualAlloc(MEM_RESERVE\|MEM_COMMIT\|MEM_LARGE_PAGES)` — 2 MiB granularity, each large page physically contiguous and non-pageable. Needs `SeLockMemoryPrivilege` (R25). **Measured** (`measured-gpu-side.md`): 22 runs per 64 MiB, **1 run per GiB**, imported by the driver exactly like ordinary memory. **Fallback, measured:** 4 KiB `VirtualAlloc` + `VirtualLock`, no privilege, 1471 runs per 64 MiB. **AWE and `NONPAGED_LARGE` are measured and rejected** — §5.1. |
 | D2 | Fallback if neither path yields usable pages | **None is planned any more.** The attestation-signed pinning driver is dropped: R19 and R20 are retired, an ordinary pointer imports, AWE returns real frames, and locating costs ~2 s — none of which an EV certificate would improve. It survives as a theoretical last resort, not as a plan, and so does ivshmem. (§5.1; fwd §2.2 verdict table) |
 | D3 | How does the GPU side get `VkDeviceMemory`? | `VK_EXT_external_memory_host`, `HOST_ALLOCATION_BIT_EXT`, **measured present, alignment 4096** (`measured-gpu-side.md`). Behind a pluggable `SlabImport` trait so dma-buf can be substituted on a Linux/AMD GPU side. |
@@ -5743,6 +5743,13 @@ precisely because this does not work, and Looking Glass never asks a GPU to DMA
 *out* of the BAR anyway, so its track record is not evidence for our case (fwd
 §2.2). A BAR would need `HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT`, which essentially
 nobody implements. We keep it in the risk table and not in the design.
+
+*Note, 2026-10-15.* This paragraph is about **this** arena, the one a GPU driver
+imports, and it still holds. The compositor's arena in the same repository moved
+onto an `ivshmem-plain` device (`waycompose-design.md` §82). That arena is
+touched only by CPUs on both sides, so the mechanism objection never applied to
+it, and its new reason, root in the launcher's path, is one this design does
+not have.
 
 **How the two sides agree on which pages: locate, do not compute.**
 

@@ -109,6 +109,21 @@ machine, not of the design — but nothing in the plan is now testing it. If a
 driver is ever proposed again, this entry is why it has to be argued from a
 stated new reason rather than revived from the old one.
 
+*Revisited 2026-10-15: ivshmem, for waycompose's arena only, for a stated new
+reason* (`waycompose-design.md` §82). **The reason is root in the product path.**
+The compositor's arena was guest RAM, and on testhost the host can reach guest
+RAM only through QEMU's monitor and descriptor table, both root's, so every
+session the desktop shortcut started became root twice. An `ivshmem-plain`
+device backed by a file at a path lets one group reach those pages instead.
+**The constraint above is met, not waived.** The driver is the Looking Glass B7
+build, signed by *Microsoft Windows Hardware Compatibility Publisher* under
+*Microsoft Windows Third Party Component CA 2014*, so it is not test-signed and
+needs nothing changed in code integrity. §82.8 records the hashes and what
+`Get-AuthenticodeSignature` reported. **The old mechanism objection is not
+contradicted.** It concerns importing a BAR into a GPU driver, and shared_vulkan's
+arena, which is imported, stays guest RAM. The compositor's arena is read and
+written by CPUs only. The new costs are R29.
+
 ### R7 — `unsafe` in our own code
 Mapping shared memory, casting generated structures, and pointer arithmetic in
 the arena allocator are all `unsafe`, and no amount of stance-taking makes a
@@ -787,3 +802,40 @@ the design previously had at any price.
 outright makes the query fail rather than lie, which degrades the design to
 `ScanLocator` — measured working, and the reason the scan stays in the codebase
 rather than being replaced.
+
+### R29 — The ivshmem arena's file is a lever on the VM
+Added 2026-10-15 with `waycompose-design.md` §82. The launcher's arena is BAR2 of
+an `ivshmem-plain` device whose memory backend is
+`/run/windows-vm/wc-arena/arena`, mode 0660 `root:wc-arena`, in a directory mode
+0750. Membership of `wc-arena` is the whole of the access control, and a member
+can do three things with the file.
+
+**Stop the VM.** A member can truncate or `fallocate --punch-hole` the file.
+QEMU maps it as guest-physical memory, and the next guest access to a page that
+is no longer backed is a `SIGBUS` in QEMU. The VM dies without shutting down, and
+the person using it loses their session. This is the new risk, and it is a
+denial of service rather than a disclosure. It has not been triggered on
+purpose, for the obvious reason, so the `SIGBUS` is the documented behaviour of
+a shared file mapping and not a measurement.
+
+**Read and write every frame the guest compositor shows.** The arena holds the
+pixels of every Wayland client and the compositor's keymaps and clipboard
+offers. This is R5 narrowed rather than widened: the guest-RAM route gave root
+the whole of guest RAM, and this gives the group 128 MiB of a dedicated region
+that holds nothing else.
+
+**Feed the guest compositor arbitrary bytes.** This is R2's case, unchanged,
+since a member can already be the proxy. The compositor bounds-checks every
+slice against the region.
+
+*Mitigation:* the group has one member, `sirati`, who is in `wheel` and can
+already stop the VM by other means, so for the current membership nothing is
+new. The file is recreated by the VM's own unit on every start and removed when
+it stops. *What this does not mitigate:* adding anyone else to `wc-arena` gives
+them the ability to stop a VM a person is using. Treat membership like `wheel`.
+
+*The guest side has the matching property.* The ivshmem driver gives the BAR to
+the first handle that asks and keeps it until that handle closes, so any guest
+process that can open the device can hold the mapping and keep the compositor
+from starting, or read the arena while it has it. On testhost the guest has one
+interactive account. §82.8 records which accounts the device actually opens for.
