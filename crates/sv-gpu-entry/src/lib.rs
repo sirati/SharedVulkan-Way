@@ -114,6 +114,90 @@ pub struct Raise {
     /// handed out are the only access path, and they are valid for exactly as
     /// long as this pool is.
     keep: Vec<*mut dyn Any>,
+    /// The guard bytes behind every allocation (waycompose-design.md §87):
+    /// where they start, how many there are, and the type they follow.
+    guards: Vec<(*const u8, usize, &'static str)>,
+}
+
+/// Bytes of canary behind every allocation a driver is handed (§87).
+///
+/// The guest's Intel driver ended the GPU side with `STATUS_HEAP_CORRUPTION`
+/// (0xC0000374) in the middle of `vkGetPhysicalDeviceVideoFormatPropertiesKHR`,
+/// at a different call each run, with arguments that the API dump of the same
+/// calls on RADV and NVIDIA shows well formed. A driver that writes past a
+/// struct or an array it was given corrupts this process's heap, and Windows
+/// notices later, somewhere else. So every allocation the forwarder hands to a
+/// driver carries this many bytes of [`CANARY`] after it: a write past the end
+/// lands in memory this process owns, the session survives, and the check on
+/// drop says which type it was. 256 because the largest plausible overrun is a
+/// struct from another header version, and the largest field such a difference
+/// has added is a `VkExtensionProperties`.
+pub const GUARD: usize = 256;
+/// The value the guard bytes hold until something writes them.
+pub const CANARY: u8 = 0xA7;
+
+#[repr(C)]
+struct Guarded<T> {
+    v: T,
+    g: [u8; GUARD],
+}
+
+/// Say, once per type and at most 32 times in all, that a driver wrote past
+/// something it was given.
+fn report_overrun(what: &str, changed: usize, of: usize) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|s| s == what) || N.fetch_add(1, Ordering::Relaxed) >= 32 {
+        return;
+    }
+    seen.push(what.to_string());
+    eprintln!(
+        "[gpu] GUARD: the driver wrote past {what}: {changed} of the {of} guard bytes after it \
+         changed (waycompose-design.md §87); absorbed, not corrupted"
+    );
+}
+
+/// Count the guard bytes at `p` that no longer hold [`CANARY`].
+///
+/// # Safety
+///
+/// `p` must be valid for reads of `n` initialised bytes.
+unsafe fn changed(p: *const u8, n: usize) -> usize {
+    // SAFETY: the caller's contract.
+    unsafe { core::slice::from_raw_parts(p, n) }.iter().filter(|&&b| b != CANARY).count()
+}
+
+/// Give an output array [`GUARD`] bytes of canary after its last element, in
+/// its spare capacity, before its pointer is handed to the driver (§87). Its
+/// length is unchanged, so the driver is told the same count.
+pub fn guard_spare<T>(v: &mut Vec<T>) {
+    let size = core::mem::size_of::<T>().max(1);
+    let slack = GUARD.div_ceil(size);
+    v.reserve_exact(slack);
+    // SAFETY: `reserve_exact` made at least `slack` elements of spare capacity
+    // after `len`, which is `slack * size` writable bytes this vector owns.
+    unsafe {
+        core::ptr::write_bytes(v.as_mut_ptr().add(v.len()).cast::<u8>(), CANARY, slack * size)
+    };
+}
+
+/// After the driver call: did it write past the array? Reported, never an
+/// error — the bytes it wrote are in memory this process owns.
+pub fn check_spare<T>(v: &[T], cmd: &str, param: &str) {
+    let size = core::mem::size_of::<T>().max(1);
+    let n = GUARD.div_ceil(size) * size;
+    // SAFETY: `guard_spare` initialised these `n` bytes of the same vector's
+    // spare capacity, and nothing has reallocated it since.
+    let c = unsafe { changed(v.as_ptr().add(v.len()).cast::<u8>(), n) };
+    if c != 0 {
+        report_overrun(
+            &format!("{cmd}'s {param} ({} x {})", v.len(), core::any::type_name::<T>()),
+            c,
+            n,
+        );
+    }
 }
 
 impl Raise {
@@ -127,16 +211,26 @@ impl Raise {
     /// writing through the pointer — which happens for `pNext` chain links on
     /// output queries — aliases nothing.
     pub fn one<T: Any>(&mut self, v: T) -> *mut T {
-        let p = Box::into_raw(Box::new(v));
+        let p = Box::into_raw(Box::new(Guarded { v, g: [CANARY; GUARD] }));
+        // SAFETY: just created by `Box::into_raw`; both field pointers are into
+        // that one live allocation.
+        let (v, g) = unsafe { (&raw mut (*p).v, (&raw const (*p).g).cast::<u8>()) };
+        self.guards.push((g, GUARD, core::any::type_name::<T>()));
         self.keep.push(p as *mut dyn Any);
-        p
+        v
     }
 
     /// A pointer to the first of `v`'s elements, valid until this pool is
     /// dropped. Empty input gives a **dangling but aligned** pointer, which no
     /// generated call site uses: the emitter substitutes null for an empty
     /// array before calling this.
-    pub fn slice<T: Any>(&mut self, v: Vec<T>) -> *mut T {
+    pub fn slice<T: Any>(&mut self, mut v: Vec<T>) -> *mut T {
+        guard_spare(&mut v);
+        let size = core::mem::size_of::<T>().max(1);
+        // SAFETY: `guard_spare` initialised these bytes; moving the vector into
+        // a box below moves its header, not its buffer.
+        let g = unsafe { v.as_ptr().add(v.len()).cast::<u8>() };
+        self.guards.push((g, GUARD.div_ceil(size) * size, core::any::type_name::<T>()));
         // A boxed `Vec<T>` rather than a `Box<[T]>`, for a Rust reason and not a
         // Vulkan one: `*mut [T]` is a fat pointer and cannot be stored as
         // `*mut dyn Any`. What matters either way is that the *elements* live in
@@ -194,6 +288,14 @@ impl Raise {
 
 impl Drop for Raise {
     fn drop(&mut self) {
+        for (g, n, ty) in self.guards.drain(..) {
+            // SAFETY: each guard lies in an allocation `keep` still owns, and
+            // was initialised when it was recorded.
+            let c = unsafe { changed(g, n) };
+            if c != 0 {
+                report_overrun(&format!("a {ty}"), c, n);
+            }
+        }
         for p in self.keep.drain(..) {
             // SAFETY: every entry came from `Box::into_raw` in this type's own
             // methods, is dropped exactly once here, and nothing else owns it.
@@ -270,6 +372,37 @@ impl<'a> QueueGuard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §87: a write inside what the driver was given touches no guard byte; a
+    /// write past it — a struct, a pool slice, an output array — changes
+    /// exactly the bytes written, in memory the pool or the vector owns.
+    #[test]
+    fn a_write_past_an_allocation_lands_in_its_guard() {
+        let mut a = Raise::default();
+        let p = a.one([0u64; 4]);
+        let s = a.slice(vec![0u32; 3]);
+        unsafe {
+            (*p)[3] = u64::MAX;
+            *s.add(2) = u32::MAX;
+        }
+        let quiet: Vec<usize> = a.guards.iter().map(|&(g, n, _)| unsafe { changed(g, n) }).collect();
+        assert_eq!(quiet, [0, 0], "writes inside the allocations");
+        unsafe {
+            p.cast::<u8>().add(32).write(1);
+            s.add(3).write(7); // one element past three
+        }
+        let loud: Vec<usize> = a.guards.iter().map(|&(g, n, _)| unsafe { changed(g, n) }).collect();
+        assert_eq!(loud, [1, 4], "the byte past the struct, and all four bytes of the u32 past the slice");
+
+        let mut v = vec![1u16, 2, 3];
+        guard_spare(&mut v);
+        assert_eq!(v.len(), 3, "the count the driver is told is unchanged");
+        let n = GUARD.div_ceil(2) * 2;
+        assert_eq!(unsafe { changed(v.as_ptr().add(3).cast(), n) }, 0);
+        unsafe { v.as_mut_ptr().add(3).write(0x0101) };
+        assert_eq!(unsafe { changed(v.as_ptr().add(3).cast(), n) }, 2);
+        check_spare(&v, "vkTest", "pOut"); // reports; must not panic
+    }
 
     /// The property the whole pass rests on: a pointer handed out by the pool is
     /// still the same memory after the pool has grown.

@@ -854,6 +854,12 @@ fn emit_forward_command(
     }
 
     let mut out_decls = Vec::new();
+    // waycompose-design.md §87: every output array gets canary bytes in its
+    // spare capacity before the call and is checked after it, so a driver that
+    // writes past the count it was given is reported instead of corrupting the
+    // heap (`sv_gpu_entry::guard_spare`).
+    let mut guard_checks = Vec::new();
+    let cname_for_guard = c.name.as_str();
     for (f, kind) in &outs {
         let id = naming::ident(&f.rust_name);
         match kind {
@@ -911,7 +917,10 @@ fn emit_forward_command(
                 out_decls.push(quote! {
                     let mut #id: Vec<#c_ty> = Vec::with_capacity(a.#id.len());
                     #init
+                    crate::guard_spare(&mut #id);
                 });
+                let pname = f.name.as_str();
+                guard_checks.push(quote!(crate::check_spare(&#id, #cname_for_guard, #pname);));
             }
             // Over-aligned deliberately: `vkGetQueryPoolResults` writes
             // `uint64_t` when `VK_QUERY_RESULT_64_BIT` is set, and the caller's
@@ -1359,6 +1368,7 @@ fn emit_forward_command(
         #(#locals)*
         #(#out_decls)*
         #call
+        #(#guard_checks)*
         let __b = __h;
         #tail
     })
