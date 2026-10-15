@@ -874,6 +874,13 @@ fn a_failed_recording_is_carried_to_the_submit_and_not_to_the_ring() {
     assert!(recorded.len() > 80, "only {} vkCmd* found; the sweep did not run", recorded.len());
     for c in &recorded {
         let name = format!("cmd_{c}");
+        // A hand-written recorded command (`GPU_HAND_WRITTEN`: the video
+        // coding scope and decode, docs/video-decode.md §7.11.5) appears here
+        // only as its `GpuHost` declaration, with no body; its poisoning is in
+        // `sv_gpu_server::server`, written the same way.
+        if !body(&name).contains('{') {
+            continue;
+        }
         assert!(
             poisons(&name),
             "vk{c} returns silently when the driver lacks it instead of poisoning its \
