@@ -145,11 +145,12 @@ fn raise_expr(
             // `Vec<[u8; 16]>`: caught by the compiler, but only once a profile
             // reached it.
             let inner_abi = AbiMember { ty: peel_array(&abi.ty)?, ..abi.clone() };
-            let inner = raise_expr(cx, elem, &inner_abi, &quote!((#access)[__i]), owner)?;
+            let i = super::icd_entry::fixed_index(elem);
+            let inner = raise_expr(cx, elem, &inner_abi, &quote!((#access)[#i]), owner)?;
             let cty = fixed_elem_c_type(cx, &abi.ty)?;
             quote!({
                 let mut __t: Vec<#cty> = Vec::with_capacity(#n);
-                for __i in 0..#n { __t.push(#inner); }
+                for #i in 0..#n { __t.push(#inner); }
                 match <[#cty; #n]>::try_from(__t) {
                     Ok(__x) => __x,
                     // Unreachable: the loop pushed exactly #n elements.
