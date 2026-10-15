@@ -585,6 +585,45 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
     None
 }
 
+/// `returnedonly` structs that a command also takes as an **input**, and whose
+/// app-side `lower_*` must therefore read every member.
+///
+/// # The one that dropped a name
+///
+/// `returnedonly` means "the implementation fills this in", and the app side's
+/// `lower_*` honours it by writing zeros instead of reading — right for an
+/// output, whose storage is the caller's uninitialised memory. But output
+/// parameters now take `lower_out_*` (see `emit::icd_entry`), and in the
+/// generated `sv_icd_entry.rs` of the `full` profile `lower_vk_extension_properties`
+/// has exactly two callers: `lower_vk_video_capabilities_khr`, which nothing
+/// calls, and the input below. So for this struct the zeros landed only where it
+/// is *passed in*:
+/// `VkVideoSessionCreateInfoKHR::pStdHeaderVersion` is a
+/// `const VkExtensionProperties*` the application copies out of
+/// `VkVideoCapabilitiesKHR::stdHeaderVersion` and hands back. It crossed as
+/// `{ "", 0 }`, and the GPU side's validation layer said so —
+/// `VUID-VkVideoSessionCreateInfoKHR-pStdHeaderVersion-07190`, "extensionName ''
+/// is an unsupported Video Std header name" (docs/video-decode.md §7). RADV
+/// accepted it anyway; a driver that checks the version would refuse the
+/// session.
+///
+/// A list rather than a rule because the rule — "a `returnedonly` struct
+/// reachable from a non-output member" — would also flip every `returnedonly`
+/// struct nested inside another `returnedonly` struct, whose `lower_*` must
+/// keep zeroing for as long as anything could call it on output storage. The
+/// list is closed and `emit::icd_entry`'s test checks each entry is still
+/// `returnedonly` in the registry, so an entry cannot outlive its reason.
+pub const RETURNED_ONLY_READ_AS_INPUT: &[(&str, &str)] = &[(
+    "VkExtensionProperties",
+    "VkVideoSessionCreateInfoKHR::pStdHeaderVersion is the application's copy of \
+     VkVideoCapabilitiesKHR::stdHeaderVersion, passed back in",
+)];
+
+/// Whether `name` is on [`RETURNED_ONLY_READ_AS_INPUT`].
+pub fn returned_only_read_as_input(name: &str) -> bool {
+    RETURNED_ONLY_READ_AS_INPUT.iter().any(|(n, _)| *n == name)
+}
+
 /// The two commands that frame a blob and are therefore inside it.
 ///
 /// docs/design.md §6.5 gives the sub-decoder "only the `vkCmd*` opcode subset". That

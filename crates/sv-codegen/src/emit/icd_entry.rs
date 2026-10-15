@@ -1091,7 +1091,10 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         // out and must not be read. On the GPU side we are the implementation's
         // proxy and those same members are the driver's answer — the only part
         // of the struct that carries information. See [`Ctx::lower_full`].
-        let validity = if s.returned_only && !cx.lower_full {
+        let validity = if s.returned_only
+            && !cx.lower_full
+            && !crate::exceptions::returned_only_read_as_input(name)
+        {
             partial_validity(field)
         } else {
             PartialValidity::Full
