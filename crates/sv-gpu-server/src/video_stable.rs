@@ -968,7 +968,9 @@ mod tests {
         }
         assert_eq!(st.counts(), (0, 0));
         free(r8);
-        refs.map(free);
+        for r in refs {
+            free(r);
+        }
     }
 
     /// The parameters calls' raise pools stay with their session until it is

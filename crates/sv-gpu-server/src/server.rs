@@ -228,7 +228,7 @@ unsafe fn stable_observe(shared: &Shared, command: &'static str, args: &[u64], r
             let out = a(3) as *const u64;
             let params = if result == 0 && !out.is_null() { *out } else { 0 };
             if let Some(ci) = ci.as_ref() {
-                st.params_created(params, ci.video_session as u64);
+                st.params_created(params, ci.video_session);
             }
         },
         "vkUpdateVideoSessionParametersKHR" => st.params_updated(a(1)),

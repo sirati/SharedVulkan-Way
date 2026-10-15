@@ -1424,9 +1424,11 @@ fn emit_forward_command(
         let hook = strip_hook.expect("checked above");
         quote! {
             let __end_poison = __h.take_poisoned_command_buffer();
-            if __end_poison.is_some() && !__h.#hook(&mut a) {
+            if let Some(__why) = __end_poison
+                && !__h.#hook(&mut a)
+            {
                 // The batch could not be taken apart: refused whole, as before.
-                __h.note_poisoned_submit(#cname, __end_poison.expect("checked"));
+                __h.note_poisoned_submit(#cname, __why);
                 return #missing_answer;
             }
         }
