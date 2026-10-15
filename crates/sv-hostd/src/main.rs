@@ -51,13 +51,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("serve") => {}
         Some("qemu") => return qemu_mode(&args),
         Some("qemu-serve") => return qemu_serve(&args),
+        Some("broker") => return broker_serve(&args),
+        Some("broker-request") => return broker_request(&args),
         _ => {
             eprintln!(
                 "usage:\n  \
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
-                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]"
+                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
+                 sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
+                 sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
             return Err("no subcommand".into());
         }
@@ -726,3 +730,210 @@ fn qemu_session(
     Ok(QemuSession { attachment, runs_for_wire, hostd, port })
 }
 
+
+/// `sv-hostd broker`: the root daemon the desktop launcher asks for GPU
+/// sessions (waycompose-design.md §86, `sv_hostd::broker`).
+///
+/// One request at a time. For each, it checks the peer's session directory and
+/// cold sockets against the peer's own uid, starts
+/// `sv-hostd qemu-serve … --drop-to <peer uid>:<peer gid>` as a child, relays
+/// the child's lines to the peer until the child is listening (or has died),
+/// and only then takes the next request — QEMU's monitor serves one client and
+/// the locate is the part that uses it. The child's later lines go to this
+/// daemon's own standard error, which is its unit's journal.
+#[cfg(target_os = "linux")]
+fn broker_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixListener;
+    use sv_hostd::broker::{self, Kind, Seen};
+
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let listen = arg("--listen").ok_or("--listen is required")?;
+    let qmp = arg("--qmp").unwrap_or_else(|| "/run/windows-vm/qmp.sock".into());
+    let vm = arg("--vm").unwrap_or_else(|| "windows-vm".into());
+    let runroot = arg("--runroot").unwrap_or_else(|| "/tmp/wc-launch".into());
+    let me = std::env::current_exe()?;
+
+    let _ = std::fs::remove_file(&listen);
+    let listener = UnixListener::bind(&listen)?;
+    // Who may ask: the socket's group, read-write, nobody else. Without
+    // `--socket-gid` the socket is root's alone and only root could ask.
+    if let Some(gid) = arg("--socket-gid") {
+        let gid: u32 = gid.parse()?;
+        let c = std::ffi::CString::new(listen.as_bytes())?;
+        // SAFETY: a NUL-terminated path this process just bound.
+        if unsafe { libc::chown(c.as_ptr(), 0, gid) } != 0 {
+            return Err(format!("chown {listen}: {}", std::io::Error::last_os_error()).into());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&listen, std::fs::Permissions::from_mode(0o660))?;
+    } else {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&listen, std::fs::Permissions::from_mode(0o600))?;
+    }
+    eprintln!("sv-hostd broker: listening on {listen}");
+
+    let seen = |path: &str| -> Result<Seen, String> {
+        let m = std::fs::symlink_metadata(path).map_err(|e| format!("{path}: {e}"))?;
+        let ft = m.file_type();
+        let kind = if ft.is_symlink() {
+            Kind::Symlink
+        } else if ft.is_dir() {
+            Kind::Dir
+        } else if ft.is_socket() {
+            Kind::Socket
+        } else {
+            Kind::Other
+        };
+        Ok(Seen { kind, uid: m.uid(), mode: m.mode() })
+    };
+
+    for conn in listener.incoming() {
+        let Ok(mut conn) = conn else { continue };
+        let cred = match peer_cred(&conn) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(conn, "error: no peer credentials: {e}");
+                continue;
+            }
+        };
+        let mut line = String::new();
+        let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        if BufReader::new(&conn).read_line(&mut line).is_err() {
+            continue;
+        }
+        let checked = (|| -> Result<(broker::Request, Vec<String>), String> {
+            if cred.0 == 0 {
+                return Err("root does not need the broker".into());
+            }
+            let req = broker::parse_request(&line)?;
+            broker::check_dir_name(&req.dir, &runroot)?;
+            broker::check_dir(seen(&req.dir)?, cred.0, &req.dir)?;
+            let colds = broker::cold_paths(&req.dir, req.sessions);
+            for c in &colds {
+                broker::check_cold(seen(c)?, cred.0, c)?;
+            }
+            Ok((req, colds))
+        })();
+        let (req, colds) = match checked {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("sv-hostd broker: refused uid {}: {e}", cred.0);
+                let _ = writeln!(conn, "error: {e}");
+                continue;
+            }
+        };
+        let icd = format!("{}/icd.sock", req.dir);
+        let mut cmd = std::process::Command::new(&me);
+        cmd.arg("qemu-serve").args(["--qmp", &qmp, "--vm", &vm]);
+        for c in &colds {
+            cmd.args(["--cold", c]);
+        }
+        cmd.args(["--socket", &icd, "--clients", &req.sessions.to_string()])
+            .args(["--drop-to", &format!("{}:{}", cred.0, cred.1)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        eprintln!("sv-hostd broker: uid {} asks for {} session(s) in {}", cred.0, req.sessions, req.dir);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(conn, "error: could not start qemu-serve: {e}");
+                continue;
+            }
+        };
+        // stdout carries nothing; stderr is the whole account. A reader thread
+        // hands lines over until this loop stops listening, and then drains
+        // the rest of the child's life into this daemon's journal so the child
+        // never blocks on a full pipe.
+        drop(child.stdout.take());
+        let err = child.stderr.take().expect("piped");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tag = req.dir.clone();
+        std::thread::spawn(move || {
+            for l in BufReader::new(err).lines().map_while(Result::ok) {
+                if let Err(e) = tx.send(l) {
+                    eprintln!("sv-hostd broker [{tag}]: {}", e.0);
+                }
+            }
+        });
+        // A child that never listens (a guest that never says Hello) must not
+        // hold the one-at-a-time broker for ever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut outcome = "error: qemu-serve ended before it listened";
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(l) => {
+                    let _ = writeln!(conn, "{l}");
+                    if l.contains("listening on") {
+                        outcome = "ok";
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = child.kill();
+                    outcome = "error: qemu-serve did not listen within 180 s; killed";
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = writeln!(conn, "{outcome}");
+        drop(conn);
+        drop(rx);
+        let tag = req.dir.clone();
+        std::thread::spawn(move || {
+            let rc = child.wait();
+            eprintln!("sv-hostd broker [{tag}]: qemu-serve exited: {rc:?}");
+        });
+    }
+    Ok(())
+}
+
+/// The peer's uid and gid, from the kernel rather than from the request.
+#[cfg(target_os = "linux")]
+fn peer_cred(s: &std::os::unix::net::UnixStream) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let mut c = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a valid socket, and an out buffer of the size given.
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut c as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((c.uid, c.gid))
+}
+
+/// `sv-hostd broker-request`: what `wc-session gpu` runs, as the user. Prints
+/// the broker's relay of qemu-serve's account and exits 0 only on `ok`.
+#[cfg(target_os = "linux")]
+fn broker_request(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, BufReader, Write};
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let sock = arg("--broker").unwrap_or_else(|| "/run/sv-hostd/broker.sock".into());
+    let dir = arg("--dir").ok_or("--dir is required")?;
+    let n = arg("--sessions").ok_or("--sessions is required")?;
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("{sock}: {e}"))?;
+    writeln!(s, "serve {dir} {n}")?;
+    let mut last = String::new();
+    for l in BufReader::new(&s).lines() {
+        let l = l?;
+        println!("{l}");
+        last = l;
+    }
+    if last == "ok" { Ok(()) } else { Err(format!("the broker said: {last}").into()) }
+}

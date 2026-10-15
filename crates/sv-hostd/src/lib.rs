@@ -72,6 +72,7 @@ use sv_transport::region::{PAGE, SharedRegion};
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
+pub mod broker;
 pub mod locate;
 #[cfg(target_os = "linux")]
 pub mod qemu;
