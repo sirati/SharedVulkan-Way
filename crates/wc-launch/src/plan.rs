@@ -121,18 +121,6 @@ pub fn ssh_exec(cfg: &Config, known_hosts: &str, verb: &[&str]) -> Vec<String> {
     a
 }
 
-/// The session's sound: `wc-session audio ID` (§86), whose standard output
-/// is the null sink's monitor as raw s16le 48 kHz stereo. An ordinary verb on
-/// the launcher's own key, so the forced command is all it can reach.
-pub fn audio_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
-    let mut a = ssh_options(cfg, known_hosts);
-    // No pseudo-terminal: the stream is binary and a tty would translate it.
-    a.push("-T".into());
-    a.push(cfg.host.clone());
-    a.extend(["audio".to_string(), id.to_string()]);
-    a
-}
-
 /// The tunnel: a Unix socket **on the VM host** that forwards into the guest's
 /// relay port. It runs from the guest because the guest is where the click is;
 /// stage 12's harness made the same connection in the other direction from a
@@ -155,8 +143,13 @@ pub fn tunnel_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
         "ServerAliveInterval=30".into(),
         "-R".into(),
         format!("{}:127.0.0.1:{}", remote_upstream(id), cfg.port),
-        cfg.host.clone(),
     ]);
+    // §86. The session's sound, the other way: a loopback port here that
+    // reaches the PulseAudio monitor socket `wc-session` made for this session.
+    if cfg.audio {
+        a.extend(["-L".into(), format!("127.0.0.1:{}:{}/audio.sock", cfg.audio_port(), remote_dir(id))]);
+    }
+    a.push(cfg.host.clone());
     a
 }
 
@@ -691,16 +684,17 @@ mod tests {
 mod audio_tests {
     use super::*;
 
-    /// §86. The sound arrives on the same key's forced command as every other
-    /// verb, with no tty in the way of the bytes.
+    /// §86. The tunnel carries the session's sound as a local forward to the
+    /// host's per-session socket, and only when sound is on.
     #[test]
-    fn the_audio_stream_is_a_verb_on_the_launchers_own_key() {
+    fn the_tunnel_forwards_the_sessions_sound_socket() {
         let mut c = Config::default();
         c.host = "u@h".into();
-        c.key = r"C:\k".into();
-        let a = audio_argv(&c, "kh", "wcl-9");
-        assert_eq!(&a[a.len() - 3..], ["u@h", "audio", "wcl-9"]);
-        assert!(a.iter().any(|x| x == "-T"));
-        assert!(a.windows(2).any(|w| w[0] == "-i" && w[1] == r"C:\k"));
+        let a = tunnel_argv(&c, "kh", "wcl-9");
+        let i = a.iter().position(|x| x == "-L").expect("an -L");
+        assert_eq!(a[i + 1], format!("127.0.0.1:{}:/tmp/wc-launch/wcl-9/audio.sock", c.port + 1));
+        assert_eq!(a.last().unwrap(), "u@h", "the host stays last");
+        c.audio = false;
+        assert!(!tunnel_argv(&c, "kh", "wcl-9").iter().any(|x| x == "-L"));
     }
 }

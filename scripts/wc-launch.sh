@@ -399,13 +399,14 @@ outbound   = 1048576
 output     = $OUTPUT
 port       = $PORT
 audio      = ${WC_LAUNCH_AUDIO:-on}
+audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 
 [app.firefox]
 title = $TITLE
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
-prefs = middlemouse.paste=false
+prefs = middlemouse.paste=false${WC_LAUNCH_EXTRA_PREFS:+;$WC_LAUNCH_EXTRA_PREFS}
 # §82: the default, named so the deployed ini says which arrangement it ran.
 # WC_LAUNCH_TITLEBAR=none runs the opt-out.
 titlebar = ${WC_LAUNCH_TITLEBAR:-tabs}

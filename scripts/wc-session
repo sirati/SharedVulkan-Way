@@ -151,8 +151,11 @@ resolve_exec() {
 # *into the guest*: each session gets its own PulseAudio with one null sink,
 # Firefox finds it at `$XDG_RUNTIME_DIR/pulse/native` with no configuration
 # (that is libpulse's default path and `run` already gives Firefox `$D/xdg`),
-# and the guest's launcher runs `audio ID`, which streams the sink's monitor as
-# raw PCM down its own ssh channel to a waveOut player.
+# and the sink's monitor is served as raw PCM on `$D/audio.sock`, which the
+# guest's launcher reaches through the tunnel it already holds (`-L
+# 127.0.0.1:<audio-port>:$D/audio.sock`) and plays with waveOut. The `audio`
+# verb streams the same PCM on stdout, for a person diagnosing: ssh.exe writing
+# into a pipe the launcher created delivered nothing (§86).
 #
 # A null sink consumes in real time whether or not anybody is listening, so
 # Firefox's audio clock runs and its main thread never waits on a server that
@@ -186,7 +189,10 @@ audio_up() {
     printf 'export HOME=%q PULSE_RUNTIME_PATH=%q PULSE_STATE_PATH=%q\n' "$D/pulse-home" "$D/xdg/pulse" "$D/pulse-state"
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
-    printf '  -L %q >%q 2>&1\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1" "$D/pulse.log"
+    printf '  -L %q \\\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1"
+    # The guest's end: raw PCM of the monitor to whoever connects, which is
+    # the launcher's tunnel (`-L 127.0.0.1:<audio-port>:$D/audio.sock`).
+    printf '  -L %q >%q 2>&1\n' "module-simple-protocol-unix socket=$D/audio.sock record=true playback=false source=wc.monitor rate=$AUDIO_RATE channels=2 format=s16le" "$D/pulse.log"
   } >"$D/pulse.sh"
   chmod 755 "$D/pulse.sh"
   export XDG_RUNTIME_DIR="/run/user/$UID_"
@@ -194,9 +200,9 @@ audio_up() {
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pulse.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
   fi
-  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && break; sleep 0.05; done
-  if [ -S "$D/xdg/pulse/native" ]; then
-    echo "pulse $D/xdg/pulse/native (null sink wc, s16le ${AUDIO_RATE} Hz stereo)" >"$D/audio.state"
+  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ] && break; sleep 0.05; done
+  if [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
+    echo "pulse $D/xdg/pulse/native (null sink wc, s16le ${AUDIO_RATE} Hz stereo; monitor on $D/audio.sock)" >"$D/audio.state"
   else
     echo "none: $PA did not open its socket: $(tail -2 "$D/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
   fi
@@ -665,8 +671,8 @@ down)
 
 # ------------------------------------------------------------------- audio ---
 # The session's sound, as raw PCM on stdout: s16le, 48 kHz, stereo, for as
-# long as the reader keeps the channel open (§86). The guest's launcher runs
-# this over its own key and plays what arrives. `parec` gets SIGPIPE when the
+# long as the reader keeps the channel open (§86). A diagnostic: the launcher
+# reads $D/audio.sock through its tunnel instead. `parec` gets SIGPIPE when the
 # ssh channel closes, so a launcher that goes away takes this with it.
 audio)
   ID="${1:-}"; check_id "$ID"

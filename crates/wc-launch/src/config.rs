@@ -114,6 +114,9 @@ pub struct Config {
     /// §86. waveOut volume for that stream, 0..=100. The device's own volume
     /// and the user's mixer still apply on top of it.
     pub audio_volume: u8,
+    /// §86. The guest-side loopback port the tunnel forwards to the session's
+    /// `audio.sock` on the VM host. 0 means `port + 1`.
+    pub audio_port: u16,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -134,6 +137,7 @@ impl Default for Config {
             linger_secs: 60,
             audio: true,
             audio_volume: 100,
+            audio_port: 0,
             apps: BTreeMap::new(),
         }
     }
@@ -208,6 +212,9 @@ impl Config {
                         _ => return Err(format!("line {}: audio is on or off, not {v}", n + 1)),
                     }
                 }
+                ("session", "audio-port") => {
+                    cfg.audio_port = v.parse().map_err(|e| format!("line {}: audio-port: {e}", n + 1))?
+                }
                 ("session", "audio-volume") => {
                     cfg.audio_volume = u8::try_from(num("audio-volume")?)
                         .ok()
@@ -271,6 +278,11 @@ impl Config {
         Ok(())
     }
 
+    /// §86. Where the tunnel puts the session's sound on this machine.
+    pub fn audio_port(&self) -> u16 {
+        if self.audio_port != 0 { self.audio_port } else { self.port.wrapping_add(1) }
+    }
+
     pub fn app(&self, id: &str) -> Result<&App, String> {
         self.apps.get(id).ok_or_else(|| {
             let known: Vec<&str> = self.apps.keys().map(String::as_str).collect();
@@ -303,6 +315,8 @@ linger-secs = 60
 # leaves Firefox with a null audio context on the host instead.
 audio        = on
 audio-volume = 100
+# The loopback port the tunnel forwards to it; default port + 1.
+# audio-port = 57432
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
@@ -431,5 +445,7 @@ mod audio_tests {
         assert_eq!(parse("audio-volume = 5\n").unwrap().audio_volume, 5);
         assert!(parse("audio-volume = 101\n").is_err());
         assert!(parse("audio-volume = 300\n").is_err());
+        assert_eq!(c.audio_port(), c.port + 1);
+        assert_eq!(parse("audio-port = 50000\n").unwrap().audio_port(), 50000);
     }
 }
