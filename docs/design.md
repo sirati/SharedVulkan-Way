@@ -5329,6 +5329,349 @@ surfaceless; which of those Firefox's Mesa 26.2.4 met is not established.
   the blocklist row above; not run.
 - **The arena** (0.27.7): leak or working set.
 
+### 0.28 Firefox as a Wayland client on the forwarded GPU — the Mesa door, the blocklist, and an arena that only had to hold what was unread
+
+Measured 2026-10-15 on the **accel-path** workstation, in `nix develop`, with no
+guest, exactly §0.27's arrangement: `sv-gpu-server` on the AMD iGPU
+(`renderD129`, RADV from the dev shell's Mesa 26.2.0), the system Firefox
+157.0.1, the system Mesa 26.2.4 for everything on the application side, and
+the NVIDIA card kept out by name. Every ICD and GPU side is a **debug** build.
+"Weston" below is `weston --renderer=pixman`, which offers `wl_shm` and no
+DRM device; "wc-proxy" is `wc-proxy` in front of `wc-compositor.exe` under Wine
+(`SVWL_SERVER=wc-proxy`), the deployed topology with the VM taken out.
+
+#### 0.28.1 Why Firefox on Wayland got llvmpipe, from Mesa's source
+
+§0.27.8 left this open: Firefox as a Wayland client reported WebRender, the GPU
+side saw two devices and no submission, and about:support said llvmpipe.
+Mesa 26.2.4's `platform_wayland.c` decides it in four lines:
+
+```c
+dri2_initialize_wayland(_EGLDisplay *disp)
+{
+   if (disp->Options.ForceSoftware)
+      return dri2_initialize_wayland_swrast(disp);
+   else
+      return dri2_initialize_wayland_drm(disp);
+}
+```
+
+The DRM door needs a render node from the compositor (dma-buf feedback or
+`wl_drm`) and wc-proxy can offer neither (§1a). It fails; `eglapi.c` retries with
+`Options.Zink = FALSE, ForceSoftware = TRUE`, and the swrast door then loads
+`swrast`, i.e. llvmpipe. The only other way into the swrast door is
+`LIBGL_ALWAYS_SOFTWARE`, and `zink_screen.c`'s `choose_pdev` reads the same
+variable as "accept only a `VK_PHYSICAL_DEVICE_TYPE_CPU` device". Upstream made
+this deliberate in 25.2 ("egl/wayland: Use the DRM path for Zink when
+!ForceSoftware"). firefox-accel.md, "The Wayland WSI", §2 had it right; this is
+the same reading against the Mesa that is installed.
+
+**What was tried before the patch, and why it is not the answer.** The two
+reads are in different libraries — `eglapi.c` is in `libEGL_mesa.so.0`,
+`choose_pdev` in `libgallium-26.2.4.so` — so an `LD_PRELOAD` that answers
+`getenv("LIBGL_ALWAYS_SOFTWARE")` with `"1"` only when the caller is
+`libEGL_mesa` opens the swrast door with Zink behind it and a GPU device in
+front. It works for everything except the program it was for:
+
+| client, weston, `MESA_LOADER_DRIVER_OVERRIDE=zink` | renderer |
+|---|---|
+| `eglinfo -p wayland` | llvmpipe |
+| `eglinfo -p wayland`, the shim | **zink Vulkan 1.4(… RADV RAPHAEL_MENDOCINO …)** |
+| `eglgears_wayland`, the shim | zink, through this ICD's `VK_KHR_wayland_surface`, 60.0 fps |
+| Firefox, the shim | llvmpipe; the shim never called |
+
+Firefox's own executable exports `getenv`, `setenv`, `putenv`, `unsetenv` and
+`secure_getenv` (mozglue's environment interposer; `nm -D lib/firefox/firefox`),
+and the executable comes before every `LD_PRELOAD` in symbol lookup. There is no
+caller to discriminate.
+
+#### 0.28.2 The decision: Mesa with X11's override on its Wayland platform too
+
+`platform_x11.c` already has the way out for the same situation on X11 —
+`LIBGL_KOPPER_DRI2`, which §0.27 runs on. `nix/mesa-kopper-wayland.patch` gives
+the Wayland platform the same override and nothing else: with Zink selected and
+`LIBGL_KOPPER_DRI2` set, take the kopper path, which presents through the Vulkan
+driver's own `VK_KHR_wayland_surface`, and name the software `EGLDevice` exactly
+as X11 does (`dri2_setup_device(disp, ForceSoftware || force_zink)`), because
+there is no DRM node to name. `nix/mesa-kopper-wayland.nix` is the system's
+Mesa with that patch, built against the same nixpkgs as the Firefox it serves
+so that the two load one `libwayland-client`, and loaded **per process** through
+`__EGL_VENDOR_LIBRARY_FILENAMES`; nothing system-wide changes.
+
+Considered and not taken:
+
+- **This ICD calling itself a CPU device** so that `LIBGL_ALWAYS_SOFTWARE` gets
+  through `choose_pdev`. It works mechanically, and `is_cpu` then changes Zink
+  (`u_init_pipe_screen_caps(…, 0)`, inline uniforms on, no device-local heaps)
+  for every application of this driver. The device is not a CPU.
+- **Firefox on X11 under a rootful Xwayland** (§0.27). It renders, and it puts
+  the whole browser in one X window inside one Wayland surface, which is the
+  opposite of the title-bar and icon work the goal needs.
+- **A cut-down Mesa** (Zink and llvmpipe only). nixpkgs builds Mesa with
+  `auto_features=enabled`, and the short driver list fails at configure (the VA
+  state tracker). The full Mesa with one patch built in about 20 minutes, in the
+  nix daemon rather than in the 10 GB slice, at `--cores 12`.
+
+Measured, weston, `eglinfo -B -p wayland` with this Mesa:
+
+| `LIBGL_KOPPER_DRI2` | renderer |
+|---|---|
+| unset | llvmpipe (unchanged from stock — the patch is inert without it) |
+| `1` | **zink Vulkan 1.4(AMD Ryzen 9 9950X3D … (RADV RAPHAEL_MENDOCINO) (Driver Unknown))** |
+
+Upstream, this is a small MR against `platform_wayland.c` and has not been
+offered.
+
+#### 0.28.3 Firefox on Wayland, measured
+
+`scripts/sv-firefox-wayland.sh soak` builds the patched Mesa and sets the two
+variables for its Wayland modes; `SVWL_KOPPER_MESA=none` is stock Mesa.
+
+| run | Mesa | arena | lived | about:support | GPU-side submissions / 30 s |
+|---|---|---|---|---|---|
+| weston, §0.27.8 | stock | 64 MiB | — | WebRender **on llvmpipe**, WebGL llvmpipe | none after 2 s |
+| weston, 90 s | stock | 64 MiB | 97 s | WebRender, WebGL `llvmpipe (LLVM 21.1.8, 256 bits)`, Driver Vendor `mesa/llvmpipe` | none in any window |
+| weston, 330 s | **patched** | 64 MiB | **337 s**, 66 loads | **WebRender**, WebGL `zink Vulkan 1.4(… RADV …)`, Window Protocol **wayland** | **7,412 – 7,510** in all 10 windows |
+| **wc-proxy**, 330 s | patched | 64 MiB | **339 s**, 68 loads | **WebRender**, WebGL zink, Window Protocol wayland | **14,982 – 20,629** in all 11 windows |
+
+The 330 s weston run's verdict is PASS on every check: the tour ran to the end,
+no core, `WebRender` (not Software) at every one of 66 samples, `libsv_icd.so`
+mapped at every sample, and the WebGL page drew 326 frames on Zink and read back
+the shader's orange. `SV_DEBUG`'s frame notes show the swapchain on the
+application's own `wl_surface` through this ICD's `wl_shm` WSI —
+`vkCreateSwapchainKHR: Wayland { … } 1280x900 format 44`, then
+`presentation: wl_shm ready on the application's display — 1280x900, 3
+buffer(s)` — at 53 – 60 fps while a page animates. A visual-check agent judged
+weston's screenshot of about:support from the same Mesa: fully drawn, no
+artifacts.
+
+#### 0.28.4 The blocklist: why `mesa/software-unknown`, and where the override lives
+
+Firefox's `glxtest` asks the EGL display for its `EGLDevice` and writes
+`MESA_ACCELERATED FALSE` if the device has `EGL_MESA_device_software`
+(`toolkit/xre/gfxtest/glxtest.cpp`); `widget/gtk/GfxInfo.cpp` then files Mesa
+with `!mIsAccelerated` and a renderer that is not llvmpipe, softpipe or
+"software rasterizer" as `DriverVendor::MesaSWUnknown`, and the
+`SoftwareMesaAll` entry blocklists `FEATURE_WEBRENDER` with
+`FEATURE_FAILURE_SOFTWARE_GL`. Mesa names the software device because it has no
+DRM node to name — on X11 since `LIBGL_KOPPER_DRI2` existed, and now on Wayland
+for the same reason. So the classification is right about the `EGLDevice` and
+wrong about the renderer, and it is a fact about a host with no GPU, which is
+what the deployment is.
+
+Measured on weston with the patched Mesa, 90 s each, three profiles (the
+`SVWL_FORCE` switch):
+
+| prefs | Compositing | WEBRENDER decision log | WebGL 2 renderer | submissions / 30 s |
+|---|---|---|---|---|
+| none (`SVWL_FORCE=0`) | **WebRender (Software)** | default available / env blocklisted `FEATURE_FAILURE_SOFTWARE_GL` | zink (… RADV …) | 978 – 980 (WebGL only) |
+| `gfx.webrender.all` alone (`=wr`) | **WebRender** | default available / user force_enabled "Force enabled by pref" / env blocklisted | zink (… RADV …) | 7,439 – 7,521 |
+| that and `webgl.force-enabled` (`=1`, the soak's) | WebRender | as above | zink | 7,412 – 7,510 (the 330 s run) |
+
+WebGL needs no override: `FEATURE_WEBGL_USE_HARDWARE` is blocklisted only for
+`MesaVM`, and `GLLibraryEGL` only takes the software `EGLDevice` display when
+that feature is off. `Driver Vendor` reads `mesa/software-unknown` in every
+patched row.
+
+**Decision: the pref, and only where the GPU is.** `scripts/wc-session`'s `run`
+now reads `$WC_LAUNCH_BASE/gpu.env` — `NAME=value` lines the operator writes on
+the VM host, applied to the application with `env` and never through a shell —
+and when there are any it appends `gfx.webrender.all` to the `user.js` the guest
+sent. Without the file nothing changes. They go together because each is wrong
+without the other: the pref without the GPU puts hardware WebRender on llvmpipe,
+which is slower than the software WebRender Firefox picks there, and the GPU
+without the pref is the first row above. A Mesa change that stopped calling a
+GPU-backed kopper device software would make the pref unnecessary; it is a
+second patch with effects on every application and is not attempted.
+
+`wc-session run` was exercised by hand against a scratch base and a fake
+session socket with `env` as the application: the variables arrived, the pref
+was appended on a line of its own after a guest `user.js` with no trailing
+newline, nothing was appended without `gpu.env`, and `BAD-NAME=1` was refused.
+It was not run on testhost.
+
+#### 0.28.5 The arena: not a leak, not a working set — retention, and one leak
+
+§0.27.7 left "leak or working set" open. An `SV_DEBUG` line now reports the
+blob reserve each time its high-water mark passes another MiB. `soak-x11` at
+64 MiB (8 MiB reserve), the build before the fix:
+
+```
+blob reserve: 1024 KiB held in 16 block(s), largest 64 KiB, 0 KiB not yet sent
+blob reserve: 2048 KiB held in 26 block(s), largest 128 KiB, 0 KiB not yet sent
+blob reserve: 3328 KiB held in 29 block(s), largest 1024 KiB, 4 KiB not yet sent
+blob reserve: 4352 KiB held in 29 block(s), largest 2048 KiB, 7 KiB not yet sent
+```
+
+and Firefox died at 60 s. Twenty-nine blocks for 29 live command buffers (the
+trace: 31 pools created, 2 destroyed), one of which had doubled to 2 MiB — and
+at no point more than **7 KiB** of all of them not yet sent. A block kept every
+byte its recording had ever held, although the GPU side copies each piece out
+of the arena the moment it arrives (`session::protocol_command`'s
+`arena.read_bytes`). The next doubling needed 4 MiB contiguous of an 8 MiB
+reserve. So the reserve held dead bytes: neither a leak nor a working set.
+
+There was also a real leak behind it: `vkDestroyCommandPool` frees its command
+buffers without naming them, and only `vkFreeCommandBuffers` gave a block back.
+
+The fix (`RingTransport::grow_and_write`): a full block is not grown. Its
+unsent bytes are published first; then, if the GPU side has read its last
+piece, it is **rewound**; if not, recording continues in a **fresh** block and
+the old one **retires** until `completed_seqno` passes its last piece, so
+recording never waits for the GPU side. A block is bigger than 64 KiB only
+when one command is. If the reserve cannot supply a block, `reclaim` publishes
+every open recording, waits for the GPU side to read them, and gives back every
+block holding nothing it still needs — up to three rounds — before
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`, which is now reachable only by a single command
+larger than the reserve. `State::command_buffers` maps each command buffer to
+its pool, and `vkDestroyCommandPool` gives their blocks back.
+
+| | before | after |
+|---|---|---|
+| `a_recording_longer_than_the_reserve_streams_through_it` (6.1 MiB, 2 MiB reserve) | `OutOfDeviceMemory` | passes; no block past 64 KiB |
+| `command_buffers_that_are_never_freed_do_not_exhaust_the_reserve` (200 × 94 KiB, never freed) | `OutOfDeviceMemory` | passes; ≤ 2 MiB held |
+| `soak-x11 330`, 64 MiB | died at 57 s (§0.27.7), 60 s here | **PASS, 334 s**, 65 loads |
+| … reserve high-water | ≥ 4.3 MiB, then exhausted | **2 MiB, 32 blocks of 64 KiB**, 0 reclaims needed |
+| … submissions / 30 s | 6,311 – 7,372 at 256 MiB (§0.27.8) | 6,561 – 7,372 at 64 MiB |
+| `soak` (Wayland) 330, 64 MiB | — | **PASS, 337 s**, the same 2 MiB high-water |
+
+Both tests run on `blob_race`'s rig, a real `RingTransport` over heap regions
+with a thread playing the GPU side that checks every command of every piece;
+the race test of §0.27.6 is unchanged and still passes.
+
+#### 0.28.6 Device-local memory that was never freed
+
+`SV_DEBUG` printed `sv-icd: Wire(NoSuchMemory { id: … })` 416, 433 and 439
+times in three 330 s soaks, X11 and Wayland alike — so not new here. A
+backtrace from the error path put it in `vkFreeMemory`, from
+`zink_bo_create` and from this ICD's own `destroy_swapchain`: `free_memory`
+removed the record from `State` and then called the generated forwarder, which
+rewrites the id through `MemoryRewrite`, which looks it up in `State`. Every
+heap-0 free failed on the app side and the GPU side kept every device-local
+allocation until the session ended. It now forwards first. Firefox, Wayland,
+90 s: `NoSuchMemory` 0, and the GPU side's trace balances, `vkAllocateMemory`
++44 against `vkFreeMemory` −44 in the last 30 s window.
+
+#### 0.28.7 The GPU side's own frames
+
+§0.27.10 named `sv_proto::dispatch` (391,208 bytes) and `sv_proto::subdecode`
+(104,568) in a debug `sv-gpu-server`. Same class, same fix shape: each command's
+body is an `#[inline(never)]` helper and the arms are tail calls with one `?`
+after the `match`. By the same `objdump` measure as §0.27.2:
+
+| function | before | after |
+|---|---|---|
+| `sv_proto::dispatch` | 391,208 | **1,144** |
+| `sv_proto::subdecode` | 104,568 | **1,336** |
+| largest `sv_proto::dispatch_*` / `subdecode_*` helper | — | 1,272 |
+
+`crates/sv-proto/tests/stack.rs` runs both on a 64 KiB thread; against the old
+generator the binary aborts with "has overflowed its stack".
+
+#### 0.28.8 What a present costs, and whether it blocks a frame rate
+
+`frame_note` now splits each present into **fence** — `vkResetFences` to the
+end of `vkWaitForFences`: three forwarded calls, the GPU side's
+`vkCmdCopyImageToBuffer` into the arena, and the wait for the application's own
+rendering — and **copy**, the display target's CPU copy out of the arena into
+`wl_shm` and its commit. Firefox on Wayland, 1280x900 (4.6 MB a frame),
+averaged over every note of a 330 s soak:
+
+| arena memory type | notes | fence | copy |
+|---|---|---|---|
+| RADV type 2, `HOST_VISIBLE\|HOST_COHERENT` (write-combined GTT) | 266 | 0.68 ms | **8.15 ms** |
+| RADV type 5, `…\|HOST_CACHED` | 269 | 0.71 ms | **0.32 ms** (max 0.54) |
+
+A 4.6 MB `memcpy` at ~575 MB/s was the CPU reading uncached memory. The
+`GpuExport` provider now prefers `HOST_CACHED`. The deployed arena is guest RAM,
+which is cached anyway, so the change makes the local number say what that one
+would rather than something worse. Through wc-proxy (0.28.9), 675 notes at
+1280x900: fence 0.65 ms, copy 0.24 ms — and wc-proxy's own copy of the same
+frame into the compositor's arena, the next one along, 261 µs.
+
+**So, on one machine, the present does not block a usable frame rate**: about
+1 ms of a 16.7 ms frame. Removing a copy (one-binary.md §2, `sv-host`) is not
+done, for the reason firefox-accel.md's "What the two projects have to share"
+already gave: what costs across the VM is not bytes. There, the fence is three
+forwarded round trips plus a wait, and "The stall, decomposed" measured each
+waiting round trip at a 20 ms quantum when the doorbell does not cross the
+hypervisor. That is the measurement to make on the guest before any copy is
+removed, and it is not made here.
+
+#### 0.28.9 Through wc-proxy, and two failures that were the harness's
+
+`SVWL_SERVER=wc-proxy` puts Firefox in the deployed arrangement on one box:
+Firefox's Wayland server is wc-proxy, which offers `wl_shm` and passes each
+buffer through an arena to `wc-compositor.exe` under Wine on an Xvfb. With the
+patched Mesa and `gfx.webrender.all` alone, 330 s: **PASS** on every check —
+68 loads, WebRender at all 68 samples, WebGL on Zink (872 frames, the shader's
+orange read back), submissions in all 11 windows, `libsv_icd.so` mapped at
+every sample, 675 frame notes all at 1280x900 with fence 0.65 ms and copy
+0.24 ms on average, and wc-proxy's own account of the second copy: 40,519
+copies of 4.4 MB at 261 µs each. The compositor titled its window after every
+page ("Firefox - Wikipedia — Mozilla Firefox", "sv webgl — Mozilla Firefox", …).
+
+Two failures came first, and neither was the path under test:
+
+- **Firefox killed by GDK, twice** (at 156 s and at 60 s): "Error reading
+  events from display: Broken pipe", read out of the core, because wc-proxy had
+  closed Firefox's socket after its upstream reset. The upstream was
+  `wc-compositor.exe`, whose X server had gone: the harness had picked its Xvfb
+  display as `90 + $$ % 9`, Xvfb had exited with "Server is already active for
+  display 90" (and 94), the readiness probe had succeeded against another
+  agent's server, and that server ended with its owner's run. The harness now
+  starts Xvfb with `-displayfd` and fails if its own Xvfb is not running — the
+  shared-identity rule of firefox-accel.md, "The Wayland WSI", §6, met again.
+- **about:support stalling the soak's last step**, on weston: Marionette's read
+  timed out at 120 s with Firefox alive, in 6 of 22 short runs and in one 90 s
+  and one 330 s run. A watchdog took two cores mid-stall, and both have the main
+  thread in `nsDOMWindowUtils::GetCurrentMaxAudioChannels`, called from
+  about:support's load handler, parked in `audioipc::rpccore::Proxy::call`. The
+  harness gives Firefox its own `XDG_RUNTIME_DIR`, so there is no audio server,
+  and the IPC to Firefox's audio process sometimes never answered.
+  `media.cubeb.sandbox=false` did not help (3 of 8 still stalled: CubebUtils
+  turns the sandbox back on with the content sandbox);
+  `media.cubeb.force_null_context`, Firefox's own switch for a session without
+  audio, read about:support in 8 of 8 and is in the soak profile now.
+
+The second is a finding for the deployment and not only for the harness:
+`wc-session run` gives the deployed Firefox `XDG_RUNTIME_DIR=$D/xdg`, which has
+no audio server either, so a deployed Firefox can wedge its main thread the same
+way on any page that asks about audio. That is waycompose's to settle (audio
+forwarding, or a null context set by the launcher) and is reported here rather
+than changed.
+
+#### 0.28.10 Gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2717 passed**, 0 failed, 8 ignored, 93 binaries (2713 before; the 4 new are `sv-proto/tests/stack.rs`'s 2 and the 2 blob-reserve tests). One run reported the citation check failing because this section did not exist yet; with it, that binary passes |
+| `cargo clippy --workspace --all-targets` | exit 0, 9 warnings, all in places this work did not touch; the one that was in `wsi.rs`'s `frame_note` (`n % EVERY`) is fixed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| `sv-proto/tests/stack.rs`, against the old generator | aborts, "has overflowed its stack" |
+| the two blob-reserve tests, against the old transport | both `OutOfDeviceMemory` |
+| `soak-x11 330`, **64 MiB** | **PASS**, 334 s (was: dead at 57 s) |
+| `soak 330` (Wayland, weston), 64 MiB, patched Mesa | **PASS**, 337 s |
+| `soak 330`, `SVWL_SERVER=wc-proxy`, 64 MiB, patched Mesa, `SVWL_FORCE=wr` | **PASS**, 339 s |
+| `soak 90`, stock Mesa | WebRender and WebGL on llvmpipe, no GPU-side submission (the before) |
+| `soak 90`, `SVWL_FORCE=0` / `=wr` | WebRender (Software) / WebRender, both with WebGL on Zink |
+| `wc-session run` with and without `gpu.env` | by hand, as 0.28.4 says; not on testhost |
+| Miri | **not run**: nothing here adds `unsafe` or marshalling; the new tests are a thread-stack budget, which Miri does not model |
+| the Windows guest | **not run** — another agent owns it in this phase |
+
+#### 0.28.11 What is not proven
+
+- **The guest.** Nothing here crossed a VM; the guest belongs to another agent in
+  this phase. The commands for it are in firefox-accel.md, "Wayland on the
+  forwarded GPU".
+- **Audio in the deployed session** (0.28.9): found by the harness, not changed.
+- **Zink's identity.** about:support says `Driver Vendor mesa/software-unknown`
+  and `(Driver Unknown)` in the renderer string in every run; the pref is what
+  overrides the first, and the second is cosmetic and not looked at.
+- **A present across the VM.** 0.28.8's 1 ms is one machine's.
+- **The patched Mesa upstream**, or on any Mesa but 26.2.4.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on
