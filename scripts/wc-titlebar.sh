@@ -85,6 +85,10 @@ OUT="$ROOT/docs/stage17"
 OUTTB="$ROOT/docs/tabs-in-titlebar"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # Everything this run owns is named from this. See the header.
 TBNAME="${WC_TBNAME:-wcs17tb}"
@@ -478,7 +482,7 @@ do_run() {
     return
   fi
   runid=$(echo "$line" | grep -o 'run 0x[0-9a-f]*' | cut -d' ' -f2)
-  pages=$(echo "$line" | grep -o '[0-9]* pages' | cut -d' ' -f1)
+  pages=$(echo "$line" | grep -o '[0-9]* pages' | head -1 | cut -d' ' -f1)
   note "$leg: $line"
 
   h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin

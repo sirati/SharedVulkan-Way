@@ -6,6 +6,8 @@
 #   scripts/wc-desktop.sh window    a real client's window, captured (needs WC_HOST)
 #   scripts/wc-desktop.sh fps       does the poll interval decide the frame rate?
 #   scripts/wc-desktop.sh psgate    the PowerShell this script generates, no guest
+#   scripts/wc-desktop.sh damage    block 12: Firefox scrolled on the desktop, --verify-damage
+#                                   (deploys first; pictures land in docs/block12/)
 #   scripts/wc-desktop.sh all       psgate, deploy, probe, window, fps
 #
 # Run from inside `nix develop`. Everything lands in docs/stage8/.
@@ -80,6 +82,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage8"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # STAGE 13: named, not hard-coded, and it is §16.8's rule arriving here one
 # stage late. More than one experiment runs against this guest at a time, and a
@@ -184,6 +190,12 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # and `g`/`h`, which it uses.
 . "$(dirname "$0")/wc-binaries.sh"
 . "$(dirname "$0")/wc-topology.sh"
+# §84: `damage` declares guest-ram and asserts it, and shares its verdict with
+# `wc-guest.sh damage`.
+. "$(dirname "$0")/wc-substrate.sh"
+. "$(dirname "$0")/wc-damage-verdict.sh"
+# `hostside_start`'s two knobs, empty for every mode but `damage`.
+HOSTSIDE_URL=""; HOSTSIDE_PROXY_EXTRA=""
 
 # ------------------------------------------------------------ the arena ------
 # STAGE 13. Everything the guest-RAM transport needs, in one place, because
@@ -195,7 +207,8 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # is cut out of the compositor's own outbound window (§14), so no `h` argument
 # is ever published on a filesystem and the export is not on the pixel path at
 # all. §12's `wc-guest.sh` has passed this way for two stages.
-ARENA_COMP_ARGS="--arena-guest-ram 0:$ARENA_BYTES --arena-outbound 0:$ARENA_OUTBOUND"
+# §84: spelled by `wc_arena_comp_args` (wc-substrate.sh) now, with the frame
+# list `locate_arena` translates; this script's own copy of the flags is gone.
 
 # Find the region the compositor pinned, and write a plan the proxy can open.
 #   locate_arena <compositor-log-name-on-the-guest> <plan-path-on-WC_HOST>
@@ -215,35 +228,15 @@ ARENA_COMP_ARGS="--arena-guest-ram 0:$ARENA_BYTES --arena-outbound 0:$ARENA_OUTB
 # socket and its `/proc/<pid>/fd` are root-only (§12.9).
 locate_arena() {
   local log="$1" plan="$2"
-  local line="" runid="" pages="" t
-  for t in $(seq 1 40); do
-    line=$(g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null \
-           | grep -o "arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*" \
-           | tail -1)
-    [ -n "$line" ] && break
-    sleep 2
-  done
-  if [ -z "$line" ]; then
-    bad "the compositor never reported a guest-RAM arena -- there is no fallback, so this run stops"
-    g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null | head -20 | sed 's/^/        /'
-    return 1
-  fi
-  note "$line"
-  runid=$(echo "$line" | grep -o "run 0x[0-9a-f]*" | cut -d' ' -f2)
-  pages=$(echo "$line" | grep -o "[0-9]* pages" | cut -d' ' -f1)
-  h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-$HOST_DIR/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $runid --pages $pages \
-  --outbound $ARENA_OUTBOUND --plan '$plan' >'$plan.log' 2>&1
-echo rc=\\\$? >>'$plan.log'
-chmod a+r '$plan.log' '$plan' 2>/dev/null; true\" | eval $ROOTC" >/dev/null 2>&1
-  h "cat $plan.log 2>/dev/null" >"$RUNDIR/locate.log" 2>&1
-  sed 's/^/        /' "$RUNDIR/locate.log" | head -12
-  if grep -q "^rc=0$" "$RUNDIR/locate.log" 2>/dev/null; then
-    ok "the arena is guest RAM, located through QEMU's flat view  <-- §18.2, and there is no file"
-    return 0
-  fi
-  bad "wc-arena-host did not locate the arena; refusing to fall back to a file on the export"
-  return 1
+  # §84: `wc_locate_arena`, which wc-icon.sh and wc-taskbar.sh already use, in
+  # place of this script's own copy. That copy knew only the content sweep, and
+  # the first rerun of block 12 here died on it: "3 page index(es) were claimed
+  # twice", the sweep's documented coin flip on a busy guest (wc-substrate.sh).
+  # The compositor now publishes its frame list beside its log, the locate
+  # translates the guest's own PFNs and reads no stamp, and a run that falls
+  # back to the sweep says so. It also sets WC_SUBSTRATE_LOCATED, which is what
+  # `wc_assert_substrate` needs and what this copy never set.
+  wc_locate_arena "$DESKDIR/$log" "$DESKDIR/${log%.log}.frames" "$plan" "$RUNDIR"
 }
 
 # The export must not be able to serve pixels behind this script's back. A
@@ -295,6 +288,24 @@ int_bg() {
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
        -File '$DESKDIR_WIN\\runint.ps1' -Exe '$exe' -Arguments '$argstr' \
        -Name '$TASK_PREFIX$name' -DeskDir '$DESKDIR_WIN'" 2>&1
+}
+
+# A command on the interactive desktop **with no console window**, its output
+# appended to a file on the guest.
+#   int_quiet <name> <command-line> <out-file>
+#
+# §84. `int … cmd.exe /c …` opens a console on the real desktop for as long as
+# the command runs, and on this guest that window lands over the middle of
+# Firefox: the first block-12 screen capture photographed its own console, and
+# a wheel notch sent while it was up goes to the console, not to the page,
+# because the probe parks the cursor at the window's centre. A PowerShell
+# started `-WindowStyle Hidden` hides the console before the command runs, and
+# the command inherits it. `Out-File -Encoding ascii`, because PowerShell 5's
+# own redirection writes UTF-16.
+int_quiet() {
+  local name="$1" cmdline="$2" outfile="$3"
+  int "$name" "powershell.exe" \
+    "-NoProfile -WindowStyle Hidden -Command $cmdline 2>&1 | Out-File -Append -Encoding ascii $outfile"
 }
 
 # Remove the scheduled tasks this *worktree* left behind, and only those.
@@ -516,6 +527,10 @@ do_deploy() {
   x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-input.exe" "$ROOT/scripts/probe-input.c" \
     -luser32 2>"$stage/cci.log" \
     || { echo "  FAILED to build probe-input.exe"; cat "$stage/cci.log"; }
+  # §84: the wheel for `damage`, `-mwindows` for the same reason.
+  x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-scroll.exe" "$ROOT/scripts/probe-scroll.c" \
+    2>"$stage/ccs.log" \
+    || { echo "  FAILED to build probe-scroll.exe"; cat "$stage/ccs.log"; }
   write_runint "$stage/runint.ps1"
   write_killours "$stage/killours.ps1"
   write_reaptasks "$stage/reaptasks.ps1"
@@ -528,6 +543,17 @@ do_deploy() {
   # another worktree may legitimately be running.
   kill_ours "$DESKNAME" >/dev/null 2>&1
   g "taskkill //F //IM wc-desk.exe >/dev/null 2>&1; true" >/dev/null 2>&1
+  # §84: and anything else still running out of this directory. A run that
+  # stopped at the locate left its `probe-relay.exe` alive for its whole
+  # 330 s timeout -- killing the local ssh did not end it -- and the next
+  # deploy died on `scp: dest open "wcdesk/probe-relay.exe": Failure`.
+  # Matched by executable path with a trailing separator, wc-guest.sh's
+  # `kill_in_dir` rule, so another worktree's directory is never touched.
+  g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -Command \
+     \"\\\$p = '${DESKDIR_WIN}\\\\'; Get-CimInstance Win32_Process | \
+      Where-Object { \\\$_.ExecutablePath -and \\\$_.ExecutablePath.StartsWith(\\\$p) } | \
+      ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
+    >/dev/null 2>&1
   g "mkdir -p $DESKDIR" || exit 1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DESKNAME/" >/dev/null || exit 1
   echo "  copied $(ls "$stage" | grep -c .) files to $GUEST:$DESKDIR"
@@ -652,7 +678,7 @@ fetch() {
     mkdir -p "$OUT"
     if magick "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null \
        || convert "$RUNDIR/$remote" "$OUT/$local_png" 2>/dev/null; then
-      picture_is "$OUT/$local_png" "$kind" "$caption -> docs/stage8/$local_png"
+      picture_is "$OUT/$local_png" "$kind" "$caption -> ${OUT#"$ROOT"/}/$local_png"
     else
       bad "could not convert $remote"
     fi
@@ -661,28 +687,17 @@ fetch() {
   fi
 }
 
-# ---------------------------------------------------------------- window -----
-# The compositor, on the desktop, with an unmodified third-party client on the
-# other side of the hypervisor -- stage 4's topology with stage 8's session.
-do_window() {
-  echo
-  echo "== 5. a real client's window, on the real desktop =="
-  if [ -z "$HOST" ]; then
-    miss "WC_HOST unset: no machine shares a filesystem with the guest, so no client"
-    miss "WC_HOST unset: no window capture"
-    return
-  fi
-  [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
-    miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
-
-  # §51. A hypervisor is in this path. Block 4's timer comparison is a claim
-  # about the *guest's own* scheduler rather than about the boundary, so it is
-  # not gated -- the declaration is what lets a reader tell those two apart,
-  # and what would permit a real cross-VM claim here.
-  wc_topology_declare cross-vm \
-    "the compositor is on the guest, the client on the VM host, over guest RAM" || return
-
-  local sock="wg-s8-$$"
+# ------------------------------------------------- the session, brought up --
+# The compositor on the interactive desktop, its relay, and its arena located:
+# everything `window` and `damage` both need before a client can connect. Taken
+# out of `do_window` rather than copied into `do_damage`, because the two modes
+# must bring the session up the same way and a second spelling of these 130
+# lines would be a second thing to keep right.
+#
+# Sets the globals `sock`, `CPID`, `relay` and `plan`, which the callers use
+# afterwards. Returns 1 when the session did not come up, having said why.
+desk_up() {
+  sock="wg-s8-$$"
   # Stale compositors go **first**, before the frame directory is emptied. An
   # interrupted run leaves one alive for up to its `--timeout`, still dumping
   # into the same directory and still holding the same log file, and a wipe that
@@ -729,10 +744,10 @@ do_window() {
   local locator="$LINUX_BIN/wc-arena-host"
   [ -x "$locator" ] || locator="$ROOT/crates/wc-arena-host/target/debug/wc-arena-host"
   if ! cargo build --manifest-path "$ROOT/crates/wc-arena-host/Cargo.toml" >"$RUNDIR/loc.log" 2>&1; then
-    bad "could not build wc-arena-host"; sed 's/^/        /' "$RUNDIR/loc.log" | tail -10; return
+    bad "could not build wc-arena-host"; sed 's/^/        /' "$RUNDIR/loc.log" | tail -10; return 1
   fi
   scp "${SSHOPT[@]}" "$LINUX_BIN/wc-proxy" "$locator" "$HOST:$HOST_DIR/" >/dev/null || {
-    bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return; }
+    bad "could not copy wc-proxy/wc-arena-host to $HOST -- something is still holding one"; return 1; }
   h "chmod +x $HOST_DIR/wc-proxy $HOST_DIR/wc-arena-host" >/dev/null
   purge_arena_file
 
@@ -767,7 +782,7 @@ do_window() {
   local out_extra=""
   [ -n "$HOST_FIREFOX" ] && out_extra=" --output $OUTPUT_SIZE"
   int_bg wccomp "$DESKDIR_WIN\\wc-compositor.exe" \
-    "--socket $sock --timeout 330 --log $DESKDIR_WIN\\comp-$sock.log $ARENA_COMP_ARGS --dump-frames $SHARE_WIN\\frames$out_extra" \
+    "--socket $sock --timeout 330 --log $DESKDIR_WIN\\comp-$sock.log $(wc_arena_comp_args "$DESKDIR_WIN\\comp-$sock.frames") ${WC_COMP_EXTRA:-}--dump-frames $SHARE_WIN\\frames$out_extra" \
     >/dev/null 2>&1
   sleep 6
   # Everything below addresses windows by pid rather than by class. See
@@ -775,7 +790,7 @@ do_window() {
   # Polled rather than slept for: a scheduled task's process appears when the
   # scheduler gets round to it, which on a loaded guest is several seconds after
   # `Start-ScheduledTask` returns.
-  local CPID=""; local t
+  CPID=""; local t
   for t in 1 2 3 4 5 6; do
     CPID=$(comp_pid "$sock")
     [ -n "$CPID" ] && break
@@ -783,7 +798,7 @@ do_window() {
   done
   if [ -z "$CPID" ]; then
     bad "the compositor did not start on the interactive desktop"
-    return
+    return 1
   fi
   note "our compositor is pid $CPID (socket $sock)"
 
@@ -806,20 +821,27 @@ do_window() {
   ssh "${SSHOPT[@]}" "$GUEST" \
     "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./probe-relay.exe $PORT '$APPDATA_WIN\\$sock' --timeout 330" \
     >"$RUNDIR/relay.log" 2>&1 &
-  local relay=$!
+  relay=$!
   sleep 3
 
   # STAGE 13. The locate, which has to happen between the compositor starting
   # and the proxy running: the guest allocates and stamps, the host then finds
   # the pages. This is the step that did not exist while the arena was a file,
   # and it is the whole difference between the two harnesses.
-  local plan="$HOST_DIR/$sock.plan"
+  plan="$HOST_DIR/$sock.plan"
   if ! locate_arena "comp-$sock.log" "$plan"; then
     kill $relay 2>/dev/null
     kill_ours "$sock" >/dev/null 2>&1
-    return
+    return 1
   fi
+}
 
+# The host side, as root in a transient unit: `wc-proxy` and the client. Uses
+# `sock` and `plan` from `desk_up`, and sets `drv`, the pid of the ssh that
+# runs it. Two knobs, both empty for `window`:
+#   HOSTSIDE_URL          the page Firefox opens (default about:blank)
+#   HOSTSIDE_PROXY_EXTRA  extra wc-proxy flags (`damage` passes --verify-damage)
+hostside_start() {
   # The client and the proxy both live on WC_HOST, which is the machine the VM
   # runs on -- and, not by coincidence, the machine the client runs on, because
   # the client reaches the proxy over an AF_UNIX socket. See §18.5.
@@ -854,7 +876,7 @@ do_window() {
     # never started. libwayland reads a `WAYLAND_DISPLAY` beginning with `/` as
     # a path, and that is what separates the two.
     ffenv="env -u DISPLAY HOME=\$RUN/home XDG_RUNTIME_DIR=\$RUN/xdg WAYLAND_DISPLAY=\$RUN/wl-proxy MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland"
-    ffcmd="$HOST_FIREFOX --no-remote --profile \$RUN/profile about:blank"
+    ffcmd="$HOST_FIREFOX --no-remote --profile \$RUN/profile ${HOSTSIDE_URL:-about:blank}"
   fi
   h "cd $HOST_DIR && cat > s8.sh <<'EOS'
 #!/usr/bin/env bash
@@ -875,7 +897,7 @@ chown -R 0:0 \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\" 2>/dev/null
 chmod 700 \"\$RUN/xdg\" 2>/dev/null
 $HOST_DIR/wc-proxy --upstream \"\$RUN/up.sock\" --socket wl-proxy \
    --runtime-dir \"\$RUN\" --transport arena --arena-plan $plan --arena-id 0 \
-   --copy damage --accept-timeout 25 --timeout 150 >\"\$RUN/proxy.log\" 2>&1 &
+   --copy damage $HOSTSIDE_PROXY_EXTRA --accept-timeout 25 --timeout 150 >\"\$RUN/proxy.log\" 2>&1 &
 P=\$!
 sleep 2
 # The bare WAYLAND_DISPLAY is the weston case; ffenv overrides it with an
@@ -906,7 +928,33 @@ echo S8-CLIENT-BEGIN; head -400 \"\$RUN/cli.log\" 2>/dev/null; echo S8-CLIENT-EN
 EOS
 chmod +x s8.sh" >/dev/null
   h "$HOST_DIR/s8.sh" >"$RUNDIR/s8.log" 2>&1 &
-  local drv=$!
+  drv=$!
+}
+
+# ---------------------------------------------------------------- window -----
+# The compositor, on the desktop, with an unmodified third-party client on the
+# other side of the hypervisor -- stage 4's topology with stage 8's session.
+do_window() {
+  echo
+  echo "== 5. a real client's window, on the real desktop =="
+  if [ -z "$HOST" ]; then
+    miss "WC_HOST unset: no machine shares a filesystem with the guest, so no client"
+    miss "WC_HOST unset: no window capture"
+    return
+  fi
+  [ -n "$HOST_WESTON" ] || [ -n "$HOST_FIREFOX" ] || {
+    miss "WC_HOST_WESTON and WC_HOST_FIREFOX both unset: no client to run"; return; }
+
+  # §51. A hypervisor is in this path. Block 4's timer comparison is a claim
+  # about the *guest's own* scheduler rather than about the boundary, so it is
+  # not gated -- the declaration is what lets a reader tell those two apart,
+  # and what would permit a real cross-VM claim here.
+  wc_topology_declare cross-vm \
+    "the compositor is on the guest, the client on the VM host, over guest RAM" || return
+
+  desk_up || return
+
+  hostside_start
 
   # Give the client time to map, then photograph while it is up. Firefox needs
   # longer than a weston demo: §15.5 measured the first pixels arriving several
@@ -1301,6 +1349,221 @@ chmod +x s8.sh" >/dev/null
   reap_tasks >/dev/null 2>&1
 }
 
+# ---------------------------------------------------------------- damage -----
+# BLOCK 12 on the interactive desktop: Firefox on the guest's compositor over
+# guest RAM, the proxy on the VM host with `--verify-damage`, and the wheel
+# injected on the desktop the window is actually on. docs/waycompose-design.md
+# §84.
+#
+# WHY THIS MODE EXISTS, WHEN `wc-guest.sh damage` ALREADY DID
+#
+# Three runs of `wc-guest.sh damage` (commit 4531325) checked 47, 50 and 44
+# commits with 0 stale, and in every one `probe-scroll` reported a window of
+# class `WaycomposeToplevel` that EXISTS "but never became visible after
+# 150 s" -- so the wheel was never sent, and the leg measured a browser
+# nobody scrolled. That harness starts the compositor over ssh, which is
+# session 0 (§13.2). This one starts it, and the probe, through the scheduler
+# into the logged-on session, which is what `window` already does; the session
+# bring-up is `desk_up`, shared with `window`, and the verdict is
+# `wc_damage_verdict`, shared with `wc-guest.sh`.
+#
+# Firefox opens `about:support`, not `about:blank`. The ssh leg's driver opened
+# `about:blank` for every Firefox leg, so even a wheel that arrived would have
+# scrolled an empty page: a scroll needs something to scroll.
+do_damage() {
+  echo
+  echo "== 12. the damage path, with a hypervisor in it, on the interactive desktop =="
+  if [ -z "$HOST" ]; then miss "WC_HOST unset: the proxy has to run where QEMU is"; return; fi
+  if [ -z "$HOST_FIREFOX" ]; then miss "WC_HOST_FIREFOX unset: no Firefox on $HOST"; return; fi
+  local notches="${WC_NOTCHES:-60}" gap="${WC_GAP:-150}"
+  OUT="$ROOT/docs/block12"; mkdir -p "$OUT"
+
+  wc_substrate_declare guest-ram || return
+  wc_topology_declare cross-vm \
+    "compositor on $GUEST in the interactive session, proxy on $HOST, arena in the guest's own RAM" || return
+
+  HOSTSIDE_URL=about:support
+  HOSTSIDE_PROXY_EXTRA=--verify-damage
+  desk_up || return
+  hostside_start
+  HOSTSIDE_URL=""; HOSTSIDE_PROXY_EXTRA=""
+
+  # Wait for Firefox's toplevel to be mapped, from the compositor's own log,
+  # rather than for a clock: on a contended guest the first map has taken
+  # anywhere from 15 to 40 s.
+  local mapped="" t
+  for t in $(seq 1 45); do
+    mapped=$(g "cat $DESKDIR/comp-$sock.log 2>/dev/null" 2>/dev/null \
+             | grep -oE "window [0-9]+ mapped [0-9]+x[0-9]+ \((tabs|argb|xrgb)" | head -1 | sed "s/ (.*//")
+    [ -n "$mapped" ] && break
+    sleep 2
+  done
+  if [ -z "$mapped" ]; then
+    bad "dmg: Firefox's window was never mapped in 90 s"
+  else
+    ok "dmg: the compositor mapped Firefox's toplevel ($mapped)"
+  fi
+  sleep 5   # the first frames of about:support, so the scroll has a page under it
+
+  # The probe, through the scheduler, into the session the window is in, and
+  # addressed by pid: every compositor on this guest registers the class.
+  local slog="scroll-$sock.log"
+  int_bg wcscroll "$DESKDIR_WIN\\probe-scroll.exe" \
+    "--pid $CPID --class WaycomposeToplevel --wait 60 --notches $notches --gap $gap --settle 3000 --log $DESKDIR_WIN\\$slog" \
+    >/dev/null 2>&1
+  # `Start-ScheduledTask` reports success whether or not the task ran (§13.3),
+  # so the task is believed when the probe's own first line exists.
+  local started=""
+  for t in $(seq 1 20); do
+    started=$(g "cat $DESKDIR/$slog 2>/dev/null" 2>/dev/null | grep -m1 "probe-scroll: session")
+    [ -n "$started" ] && break
+    sleep 1
+  done
+  if [ -z "$started" ]; then
+    bad "dmg: the scroll task was 'started' and never ran -- no line from probe-scroll in 20 s"
+  else
+    note "${started#probe-scroll: }"
+  fi
+
+  # Photographs while the page is moving: the whole screen, which is what the
+  # person at this guest sees, and the window by pid.
+  sleep 6
+  g "rm -f $DESKDIR/dmg-shot.txt" >/dev/null 2>&1
+  int_quiet wcshot "$DESKDIR_WIN\\wc-desk.exe shot --screen --out $DESKDIR_WIN\\dmg-screen.bmp" \
+    "$DESKDIR_WIN\\dmg-shot.txt" >/dev/null 2>&1
+  int_quiet wcshot "$DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DESKDIR_WIN\\dmg-win.bmp" \
+    "$DESKDIR_WIN\\dmg-shot.txt" >/dev/null 2>&1
+
+  # The probe ends on its own: settle + notches * gap after it found the window.
+  local budget=$(( 60 + 3 + notches * gap / 1000 + 20 ))
+  for t in $(seq 1 "$budget"); do
+    g "cat $DESKDIR/$slog 2>/dev/null" 2>/dev/null \
+      | grep -qE "notches towards the user accepted|never became visible|NO window of class" && break
+    sleep 1
+  done
+  g "cat $DESKDIR/$slog" >"$RUNDIR/scroll.log" 2>&1
+  sed 's/^/        /' "$RUNDIR/scroll.log" | head -20
+  cp "$RUNDIR/scroll.log" "$OUT/scroll$SUFFIX.txt" 2>/dev/null
+
+  # THE QUESTION BLOCK 12 COULD NOT ANSWER FROM SSH: is the window visible?
+  # Asked of the probe's own description of the window it picked, and of the
+  # session it ran in, so the answer carries its own provenance.
+  if grep -q "probe-scroll: target hwnd .* visible=1 " "$RUNDIR/scroll.log"; then
+    ok "dmg: Firefox's window is VISIBLE to a process on the interactive desktop: $(grep -o 'target hwnd .* client [0-9]*x[0-9]*' "$RUNDIR/scroll.log" | head -1)"
+  else
+    bad "dmg: no visible window of pid $CPID on the interactive desktop"
+  fi
+  sleep 2
+  int_quiet wcshot "$DESKDIR_WIN\\wc-desk.exe shot --pid $CPID --class WaycomposeToplevel --out $DESKDIR_WIN\\dmg-after.bmp" \
+    "$DESKDIR_WIN\\dmg-shot.txt" >/dev/null 2>&1
+  g "cat $DESKDIR/dmg-shot.txt" 2>/dev/null | sed 's/^/        /'
+  fetch dmg-screen.bmp "block12-screen$SUFFIX.png" "the guest's screen while Firefox scrolls" screen
+  fetch dmg-win.bmp    "block12-window$SUFFIX.png" "Firefox's window, mid-scroll"
+  fetch dmg-after.bmp  "block12-after$SUFFIX.png"  "Firefox's window after the scroll"
+
+  # The host side ends when the client's own timeout does.
+  wait "$drv" 2>/dev/null
+  kill "$relay" 2>/dev/null; wait "$relay" 2>/dev/null
+  g "cat $DESKDIR/comp-$sock.log" >"$RUNDIR/comp.log" 2>&1
+  sed -n '/S8-PROXY-BEGIN/,/S8-PROXY-END/p' "$RUNDIR/s8.log" >"$RUNDIR/proxy.log"
+  cp "$RUNDIR/comp.log" "$OUT/compositor$SUFFIX.log" 2>/dev/null
+  cp "$RUNDIR/s8.log" "$OUT/hostside$SUFFIX.log" 2>/dev/null
+  grep -E "verified [0-9]* commits" "$RUNDIR/proxy.log" | sed 's/^/        /' | head -6
+
+  wc_damage_verdict dmg "$RUNDIR/scroll.log" "$RUNDIR/proxy.log" "$RUNDIR/comp.log"
+
+  kill_ours "$sock" >/dev/null 2>&1
+  reap_tasks >/dev/null 2>&1
+}
+
+# --------------------------------------------------------------- pinning -----
+# §84. Does a `VirtualLock`ed guest-RAM arena keep its physical frames?
+#
+# Everything on the guest-RAM path assumes it does: the host locates the
+# arena's frames once, at startup, and writes pixels into them for the rest of
+# the session. `VirtualLock` promises residency -- the pages are not paged
+# out -- and nothing about physical addresses. Block 12's first interactive
+# run produced three symptoms that a moving page would produce and a fixed one
+# would not: rows of the host's view that changed microseconds after being
+# written, a content sweep that found three arena pages stamped in two frames
+# each, and a translated frame list of which 4868 pages were somewhere else by
+# the time the host verified them.
+#
+# So this measures it with nothing else running: one compositor, its arena,
+# no client, no proxy. The host locates the arena by sweep three times, about
+# 30 s apart, and the plans are compared page by page. A page whose backing
+# frame differs between two locates has moved. Run in the interactive session
+# (the scheduler) and in the ssh session as the control.
+pin_locate() {
+  local runid="$1" pages="$2" plan="$3"
+  h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+$HOST_DIR/wc-arena-host --qmp '$QMP' --vm '$VM_HINT' --run $runid --pages $pages \
+  --outbound $WC_ARENA_OUTBOUND --plan '$plan' >'$plan.log' 2>&1
+echo rc=\\\$? >>'$plan.log'
+chmod a+r '$plan.log' '$plan' 2>/dev/null; true\" | eval $ROOTC" >/dev/null 2>&1
+  h "cat '$plan.log' 2>/dev/null"
+}
+
+# arena page -> backing file page, one line per page, from a plan.
+pin_expand() {
+  awk '/^r / { off = $2 / 4096; f = strtonum($3) / 4096; n = $4 / 4096;
+               for (i = 0; i < n; i++) printf "%d %d\n", off + i, f + i }'
+}
+
+do_pinning() {
+  echo
+  echo "== 13. does a VirtualLock'd arena keep its physical frames? (§84) =="
+  if [ -z "$HOST" ]; then miss "WC_HOST unset: the locate needs the machine QEMU runs on"; return; fi
+  h "mkdir -p $HOST_DIR" >/dev/null
+  local locator="$LINUX_BIN/wc-arena-host"
+  scp "${SSHOPT[@]}" "$locator" "$HOST:$HOST_DIR/" >/dev/null || { bad "could not copy wc-arena-host"; return; }
+  local where
+  for where in ${WC_PIN_WHERE:-interactive ssh}; do
+    local sock="wg-pin-$where-$$" log runid="" pages="" line="" t
+    log="$sock.log"
+    if [ "$where" = interactive ]; then
+      int_bg wcpin "$DESKDIR_WIN\\wc-compositor.exe" \
+        "--socket $sock --timeout 150 --log $DESKDIR_WIN\\$log $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1
+    else
+      ssh "${SSHOPT[@]}" "$GUEST" "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./wc-compositor.exe \
+        --socket $sock --timeout 150 --log '$DESKDIR_WIN\\$log' $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1 &
+    fi
+    for t in $(seq 1 40); do
+      line=$(g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null \
+             | grep -o "arena 0 provided from guest RAM: run 0x[0-9a-f]*, [0-9]* bytes, [0-9]* pages, locked=[a-z]*.*" | tail -1)
+      [ -n "$line" ] && break
+      sleep 2
+    done
+    if [ -z "$line" ]; then
+      bad "pin/$where: the compositor never reported its arena"
+      kill_ours "$sock" >/dev/null 2>&1; continue
+    fi
+    runid=$(echo "$line" | grep -o "run 0x[0-9a-f]*" | cut -d' ' -f2)
+    pages=$(echo "$line" | grep -o "[0-9]* pages" | head -1 | cut -d' ' -f1)
+    note "pin/$where: $line"
+    local i prev="" moved results=""
+    for i in 0 1 2; do
+      [ "$i" -gt 0 ] && sleep 30
+      local plan="$HOST_DIR/$sock-$i.plan"
+      pin_locate "$runid" "$pages" "$plan" >"$RUNDIR/pin-$where-$i.log" 2>&1
+      local v; v=$(grep -oE "verify: [0-9]+/[0-9]+ pages|claimed twice|not where the arena says|located [0-9]+ of [0-9]+ pages" "$RUNDIR/pin-$where-$i.log" | tr '\n' ' ')
+      h "cat '$plan' 2>/dev/null" | pin_expand | sort -k1,1 >"$RUNDIR/pin-$where-$i.map"
+      if [ -s "$RUNDIR/pin-$where-$i.map" ] && [ -n "$prev" ] && [ -s "$prev" ]; then
+        moved=$(join "$prev" "$RUNDIR/pin-$where-$i.map" | awk '$2 != $3' | wc -l)
+        results="$results; locate $i (+$((i * 30)) s): ${v}-> $moved of $(wc -l <"$RUNDIR/pin-$where-$i.map") pages changed frame since locate $((i - 1))"
+      else
+        results="$results; locate $i (+$((i * 30)) s): ${v:-no plan}"
+      fi
+      [ -s "$RUNDIR/pin-$where-$i.map" ] && prev="$RUNDIR/pin-$where-$i.map"
+    done
+    note "pin/$where${results}"
+    echo "pin/$where$results" >>"$OUT/pinning$SUFFIX.txt"
+    kill_ours "$sock" >/dev/null 2>&1
+  done
+  reap_tasks >/dev/null 2>&1
+  wait 2>/dev/null
+}
+
 # ------------------------------------------------------------------ fps -----
 # Does the poll loop's wait decide the frame rate? One binary, one flag.
 #
@@ -1339,8 +1602,9 @@ do_fps() {
     # and the transport is incidental to it -- which is exactly the argument
     # that left the incoherent one in place for five stages. It is one flag.
     purge_arena_file
+    g "rm -f $DESKDIR/fps-$mode.frames" >/dev/null 2>&1
     int_bg wcfps "$DESKDIR_WIN\\wc-compositor.exe" \
-      "--socket $sock --timeout $((secs + 150)) --log $DESKDIR_WIN\\fps-$mode.log $ARENA_COMP_ARGS$extra" \
+      "--socket $sock --timeout $((secs + 150)) --log $DESKDIR_WIN\\fps-$mode.log $(wc_arena_comp_args "$DESKDIR_WIN\\fps-$mode.frames")$extra" \
       >/dev/null 2>&1
     sleep 8
     local plan="$HOST_DIR/$sock.plan"
@@ -1526,8 +1790,10 @@ case "$MODE" in
   window) do_window ;;
   fps)    do_fps ;;
   psgate) do_psgate ;;
+  damage) do_deploy; do_damage ;;
+  pinning) do_deploy; OUT="$ROOT/docs/block12"; mkdir -p "$OUT"; do_pinning ;;
   all)    do_psgate; do_deploy; do_probe; do_window; do_fps ;;
-  *) echo "usage: $0 {deploy|probe|window|fps|psgate|all}"; exit 2 ;;
+  *) echo "usage: $0 {deploy|probe|window|fps|psgate|damage|pinning|all}"; exit 2 ;;
 esac
 
 echo

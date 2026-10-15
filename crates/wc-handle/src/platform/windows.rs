@@ -16,7 +16,13 @@
 use std::io;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, GENERIC_WRITE,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID,
+};
+// §84: `SeLockMemoryPrivilege`, which `MEM_LARGE_PAGES` needs enabled.
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DeleteFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE,
@@ -26,13 +32,14 @@ use windows_sys::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, VirtualAlloc, VirtualFree,
-    VirtualLock, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+    CreateFileMappingW, GetLargePageMinimum, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
+    VirtualAlloc, VirtualFree, VirtualLock, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT,
+    MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
 };
 // STAGE 7: the working-set quota that `VirtualLock` is charged against.
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
+    GetCurrentProcess, GetProcessWorkingSetSize, OpenProcessToken, SetProcessWorkingSetSize,
 };
 
 /// A section object held open by its creator.
@@ -177,12 +184,39 @@ impl Drop for MappedView {
 pub fn alloc_locked_region(
     len: usize,
     stamp: &dyn Fn(u32, &mut [u8]),
-) -> io::Result<(MappedView, bool)> {
+) -> io::Result<(MappedView, bool, &'static str)> {
     if len == 0 || !len.is_multiple_of(REGION_PAGE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
         ));
+    }
+    // §84. **Large pages first.** `VirtualLock` keeps a page resident; it does
+    // not keep it at one physical address, and on the guest it was measured not
+    // doing so: stamps written *after* `VirtualLock` turned up in two frames at
+    // once, in bursts, and every stale commit of block 12's first interactive
+    // run was exactly one 4 KiB page of the host's view. A large page is
+    // non-pageable and is not relocated, which is why shared_vulkan's
+    // `sf-probe` calls it "the chosen path" and why it allocated one on this
+    // guest. It needs `SeLockMemoryPrivilege` and a multiple of the large-page
+    // size, so it can fail, and the fallback is the old path, reported by name.
+    // `--arena-small-pages` (or `WC_ARENA_NO_LARGE_PAGES=1`) forces the fallback, so the two can be measured
+    // against each other on one machine.
+    if crate::arena::large_pages_allowed()
+        && let Some(base) = try_large_pages(len)
+    {
+        let view = MappedView {
+            address: MEMORY_MAPPED_VIEW_ADDRESS { Value: base },
+            len,
+            backing: Backing::Region,
+        };
+        // SAFETY: `base` is a live, committed, `len`-byte read-write region
+        // owned by `view`, and no other reference to it exists yet.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
+        for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+            stamp(i as u32, page);
+        }
+        return Ok((view, true, "large-pages"));
     }
     // SAFETY: a null base asks the kernel to choose the address; the size is
     // checked non-zero above. The result is checked for null before use.
@@ -208,18 +242,89 @@ pub fn alloc_locked_region(
             SetProcessWorkingSetSize(GetCurrentProcess(), lo + len * 2, hi + len * 2);
         }
     }
-    // Stamp before locking. Touching every page is what commits it in practice,
-    // and locking pages that have never been touched is a slower way to reach
-    // the same state.
+    // **Lock, then stamp.** §84. This said "stamp before locking ... locking
+    // pages that have never been touched is a slower way to reach the same
+    // state", and it is not the same state. While the stamps were written the
+    // pages were ordinary unlocked working-set pages, and 64 MiB of freshly
+    // dirtied memory is exactly what Windows trims: a trimmed page that
+    // `VirtualLock` then faults back comes back in a *different frame*, and the
+    // frame it left still holds its stamp until something zeroes or reuses it.
+    // Measured on the guest with this order: the host's content sweep found 219
+    // arena pages stamped in two frames at once (58 from an ssh session),
+    // decaying to 1-5 over the next minute as the old frames were reused, and
+    // refused every locate; the PFN query came back missing pages. Locked first,
+    // every page is resident and pinned before it carries a stamp, so there is
+    // no window in which a stamped page can be moved and no stale copy to find.
+    // SAFETY: the region is live and `len` bytes long.
+    let locked = unsafe { VirtualLock(base, len) } != 0;
     // SAFETY: `base` is a live `len`-byte read-write region owned by `view`, and
     // no other reference to it exists yet.
     let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), len) };
     for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
         stamp(i as u32, page);
     }
-    // SAFETY: the region is live and `len` bytes long.
-    let locked = unsafe { VirtualLock(base, len) } != 0;
-    Ok((view, locked))
+    Ok((view, locked, if locked { "virtual-lock" } else { "none" }))
+}
+
+/// `VirtualAlloc(MEM_LARGE_PAGES)` for `len` bytes, or `None` when this process
+/// cannot have them: no large-page support, a size that is not a multiple of
+/// the large-page minimum, `SeLockMemoryPrivilege` not held by the account, or
+/// no contiguous physical memory left. Every one of those is a reason to take
+/// the `VirtualLock` path, not to fail the arena.
+fn try_large_pages(len: usize) -> Option<*mut core::ffi::c_void> {
+    // SAFETY: no arguments.
+    let min = unsafe { GetLargePageMinimum() };
+    if min == 0 || !len.is_multiple_of(min) {
+        return None;
+    }
+    if !enable_privilege("SeLockMemoryPrivilege") {
+        return None;
+    }
+    // SAFETY: a null base asks the kernel to choose; `len` is a non-zero
+    // multiple of the large-page size, which `MEM_LARGE_PAGES` requires.
+    let base = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,
+            PAGE_READWRITE,
+        )
+    };
+    (!base.is_null()).then_some(base)
+}
+
+/// Enable one privilege the account already holds in this process's token.
+/// `AdjustTokenPrivileges` "succeeds" when the privilege is not held and says
+/// so only through `GetLastError() == ERROR_NOT_ALL_ASSIGNED`, so that is what
+/// decides the answer.
+fn enable_privilege(name: &str) -> bool {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the pseudo-handle needs no closing; `token` is a live out-param.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) }
+        == 0
+    {
+        return false;
+    }
+    let mut luid = LUID { LowPart: 0, HighPart: 0 };
+    let wname = wide(name);
+    // SAFETY: `wname` is NUL-terminated and outlives the call.
+    let ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), wname.as_ptr(), &mut luid) } != 0;
+    let enabled = ok && {
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+        };
+        // SAFETY: `tp` is a complete one-entry TOKEN_PRIVILEGES; no previous
+        // state is requested.
+        let r = unsafe {
+            AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        // SAFETY: no arguments.
+        r != 0 && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED
+    };
+    // SAFETY: `token` was opened above and is closed once.
+    unsafe { CloseHandle(token) };
+    enabled
 }
 
 /// The granularity every stamp and every locate step works in. Not a Windows

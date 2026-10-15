@@ -169,7 +169,7 @@ up)
     "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" "$FRAMES_ARG" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
-    | "$ROOTC" >/dev/null 2>&1
+    | eval "$ROOTC" >/dev/null 2>&1
   if ! grep -q '^rc=0$' "$D/locate.log" 2>/dev/null; then
     echo "wc-session: the locate failed" >&2
     sed 's/^/  /' "$D/locate.log" 2>/dev/null >&2
@@ -243,7 +243,7 @@ EOF
   chmod 755 "$D/proxy.sh"
   BASH=$(command -v bash)
   printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl reset-failed %q 2>/dev/null\nsystemd-run --unit=%q --collect %q %q >/dev/null 2>&1\necho started\n' \
-    "$UNIT" "$UNIT" "$BASH" "$D/proxy.sh" | "$ROOTC" >/dev/null 2>&1
+    "$UNIT" "$UNIT" "$BASH" "$D/proxy.sh" | eval "$ROOTC" >/dev/null 2>&1
   for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
   if [ ! -S "$D/wl-proxy" ]; then
     echo "wc-session: the proxy never bound its socket" >&2
@@ -427,7 +427,7 @@ down)
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
-    "wc-launch-$ID" "wc-launch-$ID" | "$ROOTC" >/dev/null 2>&1
+    "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
   rm -rf "$D"
   echo "down ok"
   ;;

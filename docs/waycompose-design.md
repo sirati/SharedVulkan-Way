@@ -25564,3 +25564,278 @@ first-try result.
    on Windows. A window with enough tabs will not put one under the buttons, now
    that the corner is reserved, but nothing has been run with that many tabs.
    §31.13 item 6 (one theme) and the corner's alpha (§82.7) also remain.
+
+## 84. Block 12 on the desktop: the window was in session 0, and `VirtualLock` does not pin a frame
+
+Written 2026-10-15, on branch `block12-session1`. Two items: the nine harness
+failures of that morning's `wc-guest.sh all`, and Block 12, the cross-VM damage
+leg that had never scrolled anything.
+
+### 84.1 Status in one paragraph
+
+**Firefox on the guest's compositor, scrolled 60 notches on the real desktop,
+over 498 verified commits with 0 stale.** That is
+`scripts/wc-desktop.sh damage`, run at 14:21–14:24: 17 passed, 0 failed. Two
+findings got it there, both measured. First, the old hypothesis held: the leg's
+window was in **session 0**, where Firefox's `HWND` has `WS_VISIBLE` set and
+`IsWindowVisible` still says no. Second, and nobody had predicted it, once the
+page did scroll **59 of 535 commits were stale, each by exactly one 4 KiB
+page**. The cause is that a `VirtualLock`ed arena does not keep its physical
+frames on this guest. The arena is now large pages first. The nine harness
+failures are fixed and `wc-guest.sh all` reads **72 passed, 0 failed**. The
+section ends with an incident (84.7): during the last control run, on the old
+`VirtualLock` path, the guest hard-hung and was reset.
+
+### 84.2 Nine failures, none of them the compositor's
+
+`wc-guest.sh all` at 64 passed, 9 failed (`/tmp/wcrun/sv-wc-guest.log`). Every
+failure was the harness:
+
+| check | cause | fix |
+|---|---|---|
+| block 4 "smithay globals" | greps `5 globals advertised`; the compositor advertises 16 | asserts the handshake and `wl_compositor`, `wl_subcompositor`, `wl_shm`, `xdg_wm_base`, `wl_seat` by name |
+| block 4 fragmented, 4 checks | read the server log 2 s after the client exited, while the relay was still dripping 372 bytes at about 200 B/s; the same log, read later, had every milestone | `relayed()` waits for the server's own `client … disconnected` (bounded, 30 s) |
+| block 9 `term` | asks for a FILE arena; the compositor refuses one on a real VM (§28.2) | leg removed; the driver refuses `arena` by name; `termg` is the same client over guest RAM |
+| block 9 `termf`/`pres`/`termg` pool growth, empty FAIL | positional regex; stage 16 added `reclaimed`/`republished` | fields read by name, here and in `wc-launch.sh`; `10 overflows)` no longer passes as zero |
+
+Also: `wc-guest.sh`, `wc-desktop.sh`, `wc-titlebar.sh` and `wc-popup.sh`
+resolved a `GUEST` default and exported nothing, so `wc_topology_declare
+cross-vm` refused unless the caller had set `WC_GUEST`. All seven harnesses that
+default it now export it. `ROOTC` survives a multi-word value: three scripts
+piped into `"$ROOTC"` and now `eval` it, and `wc-guest.sh` hands it to its driver
+as `${ROOTC@Q}`. A simulated driver ran `'$HOME/rootc'`, `env FOO=1 bash` and
+`env BAR='a b' bash` as one argument each.
+
+Re-run at 13:26 against the real guest: **72 passed, 0 failed, 0 skipped**
+(`/tmp/wcrun/b12-guest-all-1.log`). That is the 64, plus the 8 checks that had
+failed for harness reasons, minus `term`'s single FAIL, now that `term` is gone.
+
+### 84.3 The window was in session 0, measured rather than inferred
+
+§57 and commit 4531325 left this as "a window that EXISTS but never became
+visible". The probe now prints where it is and, on failure, every candidate
+window. The old leg was re-run once at 13:28 as a control (`wc-guest.sh damage`,
+compositor and probe over ssh):
+
+```
+probe-scroll: session 0, station Service-0x0-153fe7b$, desktop Default, input desktop <unreachable>, screen 1024x768
+probe-scroll: candidate hwnd …2e00be pid 5864 visible=0 WS_VISIBLE=1 iconic=0 … window 1024x768+26+23 client 1008x729 title="Mozilla Firefox"
+```
+
+`WS_VISIBLE` is set, and `IsWindowVisible` is false. The input desktop cannot
+even be opened, so `SendInput` had nowhere to go even if the probe had tried. The
+same leg through the scheduler (`wc-desktop.sh damage`, §13.3's route):
+
+```
+probe-scroll: session 1, station WinSta0, desktop Default, input desktop Default, screen 1280x800, desktop window …1000c visible=1 WS_VISIBLE=1
+probe-scroll: target hwnd …e20752 pid 3812 visible=1 WS_VISIBLE=1 iconic=0 … client 1264x713 title="Troubleshooting Information "
+probe-scroll: 60 of 60 notches towards the user accepted, 150 ms apart
+```
+
+**Not measured:** the desktop window's own visibility *in session 0*. I added
+that line after the control run, and the session-0 explanation (the
+non-interactive station's desktop window is not visible, so no top-level window
+under it can be) is consistent with both outputs but has not been printed from
+session 0. The control's verified commits (43, 0 stale) were an unscrolled
+browser, as §57.1 feared.
+
+The old leg also opened `about:blank` for every Firefox run, so even a wheel
+that arrived would have scrolled an empty page. The new mode opens
+`about:support`.
+
+### 84.4 Scrolling found single-page corruption
+
+The first session-1 run (13:30, arena `VirtualLock`ed, located by content sweep):
+
+```
+verified 535 commits (1956 state-only, unverifiable, 7 never reached the copy), 59 stale (worst 2 rows)
+stale: … 1264x713 stride 5056 … -- 2 rows differ after copying extent …
+```
+
+The verifier compares immediately after the copy, in the same thread. A row
+that differs there changed under the copy; it was not missed by it. Two rows is
+the most a single 4096-byte page can touch at a 5056-byte stride, and the worst
+was always 2, so **each stale commit is one page**. The photographs agree:
+`docs/block12/block12-window-run1.png` and `block12-after-run1.png` show 2-px
+seams of old content (y≈455 through the HEVC row, y≈170 through VP9, y≈580),
+and the same run's screen capture shows them through the gaps around a console
+window (84.8). The same proxy code reported 0 stale over 1030 commits on the
+Wine file arena (§57.5), which points at the guest-RAM substrate rather than the
+damage bookkeeping. To make the next occurrence self-explaining, the verifier now
+prints, per stale row, whether the client's row moved since a pre-copy snapshot,
+whether the destination kept what was written, and the arena page. **That
+instrument has not yet seen a stale row**: the run that would have exercised it
+was the control in 84.7.
+
+### 84.5 `VirtualLock` keeps a page resident, not at one address
+
+The next five attempts to run the leg failed at the locate, and each failure was
+a measurement:
+
+* content sweep: `3 page index(es) were claimed twice`, twice, then 51. That is
+  one run's stamp found in two physical frames;
+* the guest's own PFN query: `incomplete: 19 / 1 / 15 of 16384 pages missing`;
+* once the query was complete (16384 frames in 674 ms), and the host's verify
+  seconds later found `11260/16128` pages where the query had put them.
+
+The stamps are written once, at startup, so a stamp in two frames means a page
+was copied to a new frame after it was stamped. `wc-desktop.sh pinning`
+measures this with nothing else running: one compositor, a 64 MiB arena, no
+client, located by sweep three times 30 s apart in each session, plans compared
+page by page. Results, in run order, are in `docs/block12/pinning.txt`:
+
+| arena pinning | session-runs | with a duplicated stamp | pages that changed frame between two clean locates |
+|---|---|---|---|
+| stamp, then `VirtualLock` (the old order) | 2 | 2 (219→4→1 and 58→5→5 across the three locates) | n/a (no clean pair) |
+| `VirtualLock`, then stamp | 13 | 7 (up to 324; once rising from 12 to 67 at +30 s) | 0 of 16384, every pair |
+| `MEM_LARGE_PAGES` | 4 | **0** (12 of 12 locates clean) | **0 of 16384**, every pair |
+
+Reordering helped and did not fix it. With the lock taken first, a stamp still
+turned up in two frames, so **a locked page was relocated after it was
+written**. Quiet stretches move nothing, which is also what `sf-probe --hold 30
+--recheck` saw for a fresh `locked-va` window (16384/16384 unchanged). The
+relocation comes in bursts. That fits 84.4: if a page moves mid-session, the host
+keeps writing the old frame, the compositor shows the new one frozen, and
+whatever Windows puts in the old frame overwrites the host's rows. I also tried
+the PFN query (`--arena-frames`) as the trigger: it looked like the cause over
+three runs and was refuted by the fourth (324 duplicates with it off).
+
+Large pages are non-pageable and physically contiguous. The plans coalesce into
+28–31 runs instead of ~1500. shared_vulkan's `sf-probe` already called them "the
+chosen path". `alloc_locked_region` now tries `VirtualAlloc(MEM_LARGE_PAGES)`
+first, after enabling `SeLockMemoryPrivilege` in its own token. If that fails it
+falls back to lock-then-stamp, and the report line says which:
+`pinning=large-pages|virtual-lock|mlock|none`. `--arena-small-pages` (or
+`WC_ARENA_NO_LARGE_PAGES`) forces the fallback. **No system setting was changed
+to get large pages.** The account on this guest already held the privilege
+(`sf-probe --mode large-pages` allocated before any change of mine), and
+`AdjustTokenPrivileges` only enables it in the running process.
+
+### 84.6 The run
+
+`wc-desktop.sh damage`, 14:21–14:24, compositor in session 1 via the scheduler,
+arena `pinning=large-pages` located from the guest's own frame list (31 runs,
+16128/16128 verified), proxy and Firefox on testhost, `--copy damage
+--verify-damage`, `probe-scroll` in session 1 by pid:
+
+```
+2384 commits, 498 copies, 1290.91 MiB in 159.3 ms; 7 pools (2 released, 0 reclaimed, 0 republished, 3 resizes, 0 overflows, 0 refusals, 0 attaches deferred); 7 fds in, 2 out (2 from the arena); verified 498 commits (1879 state-only, unverifiable, 7 never reached the copy), 0 stale (worst 0 rows)
+```
+
+17 passed, 0 failed. The photographs are `docs/block12/block12-screen.png` (the
+guest's desktop mid-scroll), `block12-window.png` and `block12-after.png` (the
+window, by pid, through `PrintWindow`). A separate visual check of all six found
+seams in every run-1 picture and none in these. The two screen captures have
+their top 28 rows and left 37 columns greyed: that is a family member's desktop,
+and the strips held desktop labels and a document title. Firefox starts at
+(26,23) and nothing of it is lost but its border.
+
+One run each way: 59/535 stale on `VirtualLock`, 0/498 on large pages. That is
+evidence and not yet a statistic.
+
+### 84.7 Incident: the guest hard-hung during the `VirtualLock` control run
+
+To close 84.4 at commit level I started one control run of the same leg with
+`--arena-small-pages` (16384 × 4 KiB, `VirtualLock` then stamp) and
+`--arena-frames`. Timeline (CEST):
+
+* 14:15–14:21 — six large-page arenas allocated and freed (the `pinning` runs),
+  then the 14:21–14:24 run above. All of these completed normally.
+* 14:25:53 — the control run starts: compositor pid 4644 as a session-1 task,
+  PFN query 834 ms, locate clean, Firefox maps its window.
+* 14:27:02 — the harness's last log line. Its next ssh to the guest, which would
+  have registered `probe-scroll` as a task, never returned.
+* ~14:31 — the coordinator found the guest unresponsive: all 12 vCPUs at 99% in
+  QEMU, one kernel loop on every CPU, CPU 9 parked at a fixed RIP, no disk I/O,
+  no ARP or ssh on either address, no guest-agent answer, and an injected NMI
+  ignored. (The RIP values were taken by the coordinator and are not reproduced
+  here.)
+* 14:36 — my loop stopped locally; nothing on the guest or VM touched.
+* 14:37 — the coordinator reset the guest with QMP `system_reset`. It came back
+  healthy, with nobody logged in.
+
+What is measured is the coincidence: the hang began during the one run that put
+a `VirtualLock`ed arena under the host's writes *after* this section had shown
+such pages relocating. What is **not** measured is the mechanism. The hypothesis
+it suggests is serious enough to state: if a locked page relocates mid-session,
+the host keeps writing Firefox's pixels into a frame that Windows has since
+given to someone else, possibly the kernel, and that is a host writing into the
+guest's memory. It is not established: a `VirtualLock`ed arena with the PFN query
+had been allocated ten times before without a hang, and the one earlier run that
+had the host writing pixels into a `VirtualLock`ed arena for minutes (84.4,
+without the query) corrupted rows and did not hang. Standing rule from the coordinator since
+then: no `--arena-frames` PFN scans and no small-page `VirtualLock` arenas on
+the real guest until the hang is understood.
+
+### 84.8 What else changed in the harnesses
+
+* `wc-guest.sh damage` hands over to `wc-desktop.sh damage` and folds its counts
+  in. The driver's ssh-session scroll path is gone. The verdict is
+  `wc_damage_verdict` (`scripts/wc-damage-verdict.sh`), shared by both.
+* `wc-desktop.sh`: `do_window`'s bring-up and host side are now `desk_up` and
+  `hostside_start`, shared with `damage`. `locate_arena` wraps
+  `wc_locate_arena`, so the frame list is used first, as in wc-icon/wc-taskbar.
+  Captures run from a hidden PowerShell (`int_quiet`), because run 1's
+  `cmd.exe /c` console covered Firefox at the very spot where the probe parks
+  the cursor. `deploy` kills everything running from its own directory (a stale
+  `probe-relay.exe` blocked one `scp`). New mode: `pinning`. `WC_COMP_EXTRA`
+  passes extra compositor flags.
+* `wc_locate_arena` took every `N pages` on the report line, and a `frames=none
+  (… 19 of 16384 pages missing …)` tail made `--pages` two lines (`16384:
+  command not found`). Fixed there and in two copies of the same grep.
+* `probe-scroll`: `--pid`, its own session/station/desktop and the desktop
+  window's visibility, and one line per candidate window when none qualifies.
+
+### 84.9 The gates
+
+Local gates on the merged tree (master fe24480 merged in), run with
+`CARGO_BUILD_JOBS=2` because the shared slice was at 9.5 of 10 GB and the first
+attempt was starved:
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **92 binaries, 2735 passed, 0 failed**, 8 ignored, including `every_design_document_citation_resolves` (it failed while this section did not exist yet, on this branch's own `§82` citations, which became `§84`) |
+| `cargo clippy --workspace --all-targets` | exit 0; 32 warnings, none at a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK`, both legs |
+| `scripts/wc-desktop.sh psgate` | **SKIP**: no `pwsh` on this machine, so the generated PowerShell (now including `int_quiet`'s) is unchecked |
+| `bash -n` on the twelve scripts touched | clean |
+
+On the real guest, each run once:
+
+| run | result |
+|---|---|
+| `wc-guest.sh all` (13:26, before the damage hand-over) | **72 passed, 0 failed, 0 skipped** (was 64/9) |
+| `wc-guest.sh damage`, old ssh-session leg, as a control (13:28) | window `WS_VISIBLE=1`, `IsWindowVisible=0`, session 0; no scroll; 43 verified, 0 stale |
+| `wc-desktop.sh damage`, `VirtualLock` arena (13:30) | visible, 60/60 notches; **59 of 535 stale, worst 2 rows** |
+| `wc-desktop.sh damage`, six more attempts (13:36–13:56) | five stopped at the locate (84.5), one at deploy (a stale `probe-relay.exe`, 84.8) |
+| `wc-desktop.sh pinning` (13:47–14:21) | the table in 84.5 |
+| **`wc-desktop.sh damage`, large pages (14:21)** | **17 passed, 0 failed: visible, 60/60 notches, 0 of 498 stale** |
+| control, `--arena-small-pages` (14:25) | guest hard-hung, 84.7 |
+
+### 84.10 What is not proven
+
+1. **Why the guest hung.** 84.7's hypothesis is a hypothesis. Until it is
+   settled, the `VirtualLock` fallback should be read as possibly unsafe, not
+   just possibly stale: it is what runs on any account without
+   `SeLockMemoryPrivilege`, and a default Windows account does not have it.
+   Making the guest-RAM arena *refuse* without large pages (or use AWE pages) is
+   the conservative change. It is not made here, because it changes what every
+   harness can run.
+2. **The relocation's cause inside Windows.** Measured: it happens, in bursts,
+   to locked 4 KiB pages, and not to large pages. Not measured: what triggers it
+   (memory compaction for some contiguous allocation is the usual suspect; the
+   six large-page allocations just before the hang are themselves a candidate).
+3. **Large pages over time.** 12 locates over about 6 minutes and one 3-minute
+   damage run. A long session, and a guest under memory pressure where a 2 MiB
+   allocation can fail, are not covered. On failure the fallback is the path
+   item 1 is about.
+4. **`wc-desktop.sh window` and `fps`** were refactored (`desk_up`,
+   `locate_arena`, `int_quiet` not used by them) and not re-run. `damage` runs
+   the shared parts.
+5. **`wc-guest.sh all` after the last harness commits.** The 72/0 run predates
+   the damage hand-over and the driver's scroll-path removal. Neither is on
+   `all`'s path except as deleted code (the driver no longer takes a scroll
+   prefix it was already passed empty), but it has not been re-run; the guest
+   was reset and nobody is logged in.
+6. **The stale-row instrument** (84.4) has not yet printed a stale row.
