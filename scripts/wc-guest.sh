@@ -6,7 +6,8 @@
 #   scripts/wc-guest.sh stage4   only blocks 7-10, the host half (needs WC_HOST)
 #   scripts/wc-guest.sh arena    only block 10, the guest-RAM arena (needs WC_HOST)
 #   scripts/wc-guest.sh firefox  only block 11, Firefox over guest RAM (needs WC_HOST_FIREFOX)
-#   scripts/wc-guest.sh damage   only block 12, the damage path WITH a hypervisor in it (§46)
+#   scripts/wc-guest.sh damage   only block 12, the damage path WITH a hypervisor in it (§46);
+#                                runs `wc-desktop.sh damage`, in the interactive session (§82)
 #   scripts/wc-guest.sh clean    remove everything this script put on the guest
 #   scripts/wc-guest.sh all      deploy, run, clean
 #
@@ -398,20 +399,7 @@ rm -f "$SHARE/arena.frames" "$SHARE/scroll.log" "$SHARE/s4.log" 2>/dev/null || t
 COMP_SECS=$((SECS + 45))
 [ "$TRANSPORT" = guest-ram ] && COMP_SECS=$((SECS + 90))
 
-# The scroll probe rides the compositor's OWN ssh, and that is the whole fix.
-# Windows OpenSSH gives every connection its own session and window station, and
-# window enumeration only ever sees the calling thread's desktop. A probe over a
-# second ssh therefore polled an empty desktop for its full timeout and reported
-#   probe-scroll: no visible window of class 'WaycomposeToplevel' after 150 s
-# while the compositor, in the other session, had a real HWND with 45 frames
-# blitted into it. Same ssh, same station, and FindWindowW can see it. This is
-# the third harness to meet the session boundary; see wc-input.sh.
-SCROLL_PRE=""
-if [ -n "$VERIFY" ]; then
-  SCROLL_PRE="(./probe-scroll.exe --class WaycomposeToplevel --wait $((SECS)) --notches ${WC_NOTCHES:-60} --gap ${WC_GAP:-150} --settle 6000 --log '$SHARE_WIN\\scroll.log' >scroll.out 2>&1 &) ; "
-  echo "S4-SCROLL: probe-scroll.exe rides the compositor's own session"
-fi
-ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && $SCROLL_PRE ./wc-compositor.exe \
+ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./wc-compositor.exe \
   --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
   --arena-frames '$SHARE_WIN\\arena.frames' \
   --log '$SHARE_WIN\\s4.log' ${OUT_EXTRA[*]@Q} ${COMP_EXTRA[*]@Q} ${KEYMAP_EXTRA[*]@Q}" >"$RUN/comp.out" 2>&1 &
@@ -493,21 +481,6 @@ ssh "${GK[@]}" -N -L "$RUN/up.sock:127.0.0.1:$PORT" "$G" >"$RUN/fwd.out" 2>&1 &
 FWD=$!
 sleep 4
 
-# §46. The scroll, injected **on the guest**, because that is where the
-# compositor's window is. Started here rather than after the client because
-# `probe-scroll.exe` polls for a window of class `WaycomposeToplevel` for
-# `--wait` seconds and then scrolls it: launching it early costs nothing and
-# removes a race against however long Firefox takes to map on a given day.
-#
-# Backgrounded and never waited on. Its exit status is not the measurement --
-# the measurement is the proxy's stale count -- and a probe that failed to find
-# the window would show up as a run with no scroll in it, which the commit floor
-# catches. Blocking the harness on it would trade a detectable failure for a
-# hang.
-# Launched above, inside the compositor's ssh. Not a separate connection any
-# more, so there is no pid here to hold and nothing to wait on.
-SCROLL=0
-
 PROXY=0
 if [ ! -S "$RUN/up.sock" ]; then
   echo "S4-FAIL: the ssh -L forward produced no socket"
@@ -584,7 +557,7 @@ sleep 3
 # only the error path and is now the normal one for guest-ram -- so the zero has
 # to be filtered rather than passed through. The symptom was a driver that
 # printed the client's exit code and then nothing at all.
-for p in $PROXY $FWD $RELAY $COMP $SCROLL; do [ "$p" -gt 0 ] 2>/dev/null && kill "$p" 2>/dev/null; done
+for p in $PROXY $FWD $RELAY $COMP; do [ "$p" -gt 0 ] 2>/dev/null && kill "$p" 2>/dev/null; done
 wait 2>/dev/null
 sleep 1
 
@@ -606,17 +579,6 @@ echo "S4-FRAMES: total=$tot distinct=$dis top=$top first=$geo"
 echo "S4-PROXY-BEGIN";  cat "$RUN/proxy.log"; echo "S4-PROXY-END"
 echo "S4-COMP-BEGIN";   cat "$SHARE/s4.log" 2>/dev/null; echo "S4-COMP-END"
 echo "S4-RELAY-BEGIN";  cat "$RUN/relay.out"; echo "S4-RELAY-END"
-# §57. The scroll probe's own log, fetched from the guest. Without this the
-# only evidence the wheel moved is that the probe did not crash, and a locked
-# Windows session makes SendInput return 0 while the probe exits happily.
-if [ -n "$VERIFY" ]; then
-  echo "S4-SCROLLLOG-BEGIN"
-  # Read from the export, not over ssh: the probe now writes into $SHARE_WIN so
-  # the driver can read it locally, and one fewer connection is one fewer
-  # session to get confused about.
-  cat "$SHARE/scroll.log" 2>/dev/null
-  echo "S4-SCROLLLOG-END"
-fi
 echo "S4-CLIENT-BEGIN"; head -20 "$RUN/cli.log"; echo "S4-CLIENT-END"
 DRIVER
 }
@@ -635,15 +597,6 @@ do_deploy() {
     fi
   done
 
-  # §46's scroll probe, which needs `-mwindows` (it has no console) and no
-  # sockets. It is deployed here rather than by `wc-damage.sh` because the
-  # cross-VM leg's compositor runs *on the guest*, so the thing that scrolls its
-  # window has to be on the guest too -- see `do_damage`.
-  if $cc -O1 -mwindows -o "$STAGE/probe-scroll.exe" "$ROOT/scripts/probe-scroll.c" 2>"$STAGE/cc.log"; then
-    echo "  built probe-scroll.exe"
-  else
-    echo "  FAILED to build probe-scroll.exe"; sed 's/^/        /' "$STAGE/cc.log"; exit 1
-  fi
   if $cc -O1 -o "$STAGE/probe-xkb.exe" "$ROOT/scripts/probe-xkb.c" \
        -I"$WC_XKB_MINGW_DEV/include" -L"$WC_XKB_MINGW/lib" -lxkbcommon 2>"$STAGE/cc.log"; then
     echo "  built probe-xkb.exe"
@@ -1497,42 +1450,26 @@ do_firefox() {
 
 # ---------------------------------------------------------------- damage -----
 #
-# §46. THE CROSS-VM LEG, and the one this project's second symptom needs.
+# §46. THE CROSS-VM LEG, and the one this project's second symptom needs: the
+# compositor on the guest, the proxy on the VM host over an arena located in
+# the guest's own RAM, Firefox scrolling `about:support` with `--verify-damage`
+# on, and the wheel injected on the guest, where the window is.
 #
-# `scripts/wc-damage.sh` measures the damage path exhaustively and declares
-# `same-box`, because Firefox, the proxy and the compositor all run under Wine
-# on one Linux box there. That is the right harness for the copy's correctness
-# -- `--verify-damage` compares two mappings inside one Linux process and Wine
-# is only an upstream that consumes the stream -- and it is the wrong harness
-# for anything about the boundary, which is §27.6's retraction in one sentence.
+# **It runs in `wc-desktop.sh damage` now, and this mode hands over to it.**
+# §82. Every earlier run of this leg started the compositor through this
+# script's driver, over ssh, which is session 0 on a service window station.
+# Measured there with the probe's per-window dump: Firefox's HWND had
+# `WS_VISIBLE` set and `IsWindowVisible` false, on a station whose input
+# desktop cannot even be opened -- so the probe waited out its timeout, no
+# wheel was ever sent, and three runs of 44-50 verified commits each were
+# measurements of a browser nobody scrolled. No setting of this driver fixes
+# that; the window has to be on the interactive desktop, which is what
+# `wc-desktop.sh` reaches through the task scheduler (§13.3).
 #
-# This block is the same measurement with the boundary in it: the compositor on
-# the guest, the proxy on the VM host over an arena located in the guest's own
-# RAM, Firefox scrolling `about:support`, and `probe-scroll.exe` injecting the
-# wheel **on the guest**, where the window is.
-#
-# WHAT IT CAN AND CANNOT SETTLE
-#
-# It settles the correctness question on the real substrate: whether the arrears
-# bookkeeping holds when the region is guest RAM reached through QEMU rather
-# than a file this side mapped. Nothing in §46's argument predicts a difference
-# and the arena leg found none, but "the arena code path on a file" and "guest
-# RAM through a hypervisor" are two claims and only one of them has been made.
-#
-# It does **not** on its own settle the user's second symptom. A stale-row count
-# of zero says the bytes are right; it says nothing about when they arrive. What
-# makes this leg able to speak to that is `wc_topology_declare cross-vm`, which
-# is what `wc_latency_claim` requires before any assertion about the present may
-# be made at all -- so a latency assertion added here later will be permitted,
-# and the same assertion added to `wc-damage.sh` will be refused.
-#
-# **UNRUN.** testhost was down when this was written and nothing here has
-# executed. It is assembled entirely from paths this harness already exercises
-# -- `s4_run ff guest-ram firefox` is §17's, the scroll probe is §46's, and the
-# proxy flag is one argument -- but §14.9's rule is that "implemented" has meant
-# "compiled" twice on this project, so it is marked rather than counted. The
-# first run of it is a measurement; until then it is a hypothesis with a script
-# attached.
+# One verdict for both harnesses: `wc_damage_verdict` in
+# `scripts/wc-damage-verdict.sh`, which is what this function used to inline.
+# The counts the other script prints are folded into this one's, so
+# `wc-guest.sh damage` still answers with one table.
 do_damage() {
   echo
   echo "== 12. the damage path, with a hypervisor in it =="
@@ -1544,101 +1481,22 @@ do_damage() {
     nope "WC_HOST_FIREFOX unset: no Firefox on $HOST"
     return
   fi
-
-  # The declarations, before anything runs, and both of them refuse rather than
-  # default. `guest-ram` is the only substrate this leg may use and
-  # `wc_substrate_declare` will not hand out the file-arena escape hatch to a
-  # harness that has a guest configured; `cross-vm` is refused unless there is
-  # both a VM host and a guest, so it cannot be declared on the Wine box.
-  wc_substrate_declare guest-ram || return
-  wc_topology_declare cross-vm \
-    "compositor on $GUEST, proxy on $HOST, arena in the guest's own RAM" || return
-
-  S4_FIREFOX="$HOST_FIREFOX"; S4_OUTPUT=1600x1000; S4_VERIFY=1
-  s4_run dmg guest-ram firefox $((PORT_BASE + 16)) "${WC_DAMAGE_SECS:-90}"
-  S4_FIREFOX=""; S4_OUTPUT=""; S4_VERIFY=""
-
-  local log="$RUNDIR/s4-dmg.log"
-  [ -s "$log" ] || { bad "the damage leg produced no log"; return; }
-
-  grep -q "S4-SCROLL:" "$log" \
-    && ok "probe-scroll.exe was launched on the guest, where the compositor's window is" \
-    || bad "no scroll was injected; this leg measures an idle browser"
-
-  # **Launched is not injected**, and on this guest that distinction is the
-  # difference between a result and a fiction. §57: a *locked* Windows session
-  # puts the input desktop on `Winlogon`, and a process on `Default` cannot
-  # reach it -- `SendInput` returns 0, sets `ERROR_ACCESS_DENIED`, and the probe
-  # runs to completion having moved nothing. Every number downstream would then
-  # be a real measurement of an unscrolled browser, which is §27.6's shape
-  # exactly: an experiment that did not contain the thing it was about.
-  #
-  # The probe now counts refusals and exits 3 when everything was refused. This
-  # reads its accounting rather than trusting its exit, because the exit code
-  # travels through `ssh` and a backgrounded job and this line does not.
-  local scrolled
-  scrolled=$(sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" \
-             | grep -o '[0-9]* of [0-9]* notches towards the user accepted' | tail -1)
-  if [ -z "$scrolled" ]; then
-    bad "dmg: the scroll probe never reported an accepted count; the wheel cannot be assumed to have moved"
-    sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" | sed 's/^/        /' | head -8
-  elif grep -q "REFUSED by SendInput" "$log"; then
-    bad "dmg: SendInput refused notches -- $scrolled. If the guest session is LOCKED this is expected and the run is void: unlock it and re-run."
-    sed -n '/S4-SCROLLLOG-BEGIN/,/S4-SCROLLLOG-END/p' "$log" | grep -E "REFUSED|LOCKED|scrolled nothing" | sed 's/^/        /'
-    return
-  else
-    ok "dmg: the guest accepted the wheel -- $scrolled"
-  fi
-
-  # The substrate and the topology, from the run's own evidence. `wc_locate_arena`
-  # has set WC_SUBSTRATE_LOCATED by now if a locate ran, and `wc_assert_topology`
-  # refuses a cross-vm claim without one -- a hypervisor in the path is exactly
-  # what makes guest RAM locatable, so the locate is the proof.
-  local comp="$RUNDIR/s4-dmg-comp.log"
-  sed -n '/S4-COMP-BEGIN/,/S4-COMP-END/p' "$log" >"$comp"
-  wc_assert_substrate "$comp" "dmg"
-  wc_assert_topology "$comp" "dmg"
-
-  # THE ASSERTION, and it is `wc-damage.sh`'s, unchanged, over a boundary.
-  local verified skipped unreached stale worst commits
-  verified=$(grep -o 'verified [0-9]* commits' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-  skipped=$(grep -o '([0-9]* state-only, unverifiable' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-  unreached=$(grep -o '[0-9]* never reached the copy' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-  stale=$(grep -o '[0-9]* stale (worst [0-9]* rows)' "$log" | awk -F' stale' '{print $1}' | awk '{s+=$1} END {print s+0}')
-  worst=$(grep -o 'worst [0-9]* rows' "$log" | grep -o '[0-9]*' | sort -n | tail -1)
-  commits=$(grep -o '[0-9]* commits,' "$log" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-
-  if [ "${verified:-0}" -eq 0 ]; then
-    bad "dmg: no commit was checked -- --verify-damage did not reach the proxy on the host"
-    sed -n '/S4-PROXY-BEGIN/,/S4-PROXY-END/p' "$log" | tail -8 | sed 's/^/        /'
-    return
-  fi
-
-  # The identity, as §46.3 defines it: every commit is checked, state-only, or
-  # never reached the copy. Carried over verbatim because a coverage claim that
-  # is only made on one topology is a coverage claim about that topology.
-  local classified=$(( ${verified:-0} + ${skipped:-0} + ${unreached:-0} ))
-  [ "$classified" -eq "${commits:-0}" ] \
-    && ok "dmg: every one of $commits commits is accounted for -- $verified checked, $skipped attached no buffer, $unreached never reached the copy" \
-    || bad "dmg: $classified of $commits commits classified; $(( ${commits:-0} - classified )) unaccounted for"
-
-  if [ "${stale:-0}" -eq 0 ]; then
-    ok "dmg: over a real VM boundary, the region matched the client on every one of $verified checked commits"
-  else
-    bad "dmg: $stale of $verified commits left the region stale, worst ${worst:-?} rows -- and this is guest RAM, not a fixture"
-    grep -o 'stale: .*' "$log" | head -6 | sed 's/^/        /'
-  fi
-
-  # **What this leg is now permitted to say, and the Wine legs are not.** The
-  # gate is called for its permission rather than its refusal here, which is the
-  # whole point of the declaration: the same call in `wc-damage.sh` fails and
-  # this one passes, and the difference is a hypervisor.
-  if wc_latency_claim "the present latency is measurable on this leg"; then
-    ok "dmg: this leg may make a claim about cross-VM latency -- there is a boundary in it"
-    note "The claim itself is not made here. §46.7 item 5: the doorbell's 0.876 ms"
-    note "against 20.29 ms is somebody else's measurement, and pairing it with a"
-    note "scroll-smoothness number is the next run's errand, not this block's."
-  fi
+  note "handing over to scripts/wc-desktop.sh damage: the compositor and the wheel"
+  note "have to be in the interactive session (§82), and that script is what gets there"
+  local out="$RUNDIR/desk-damage.log"
+  # The environment this script resolved, passed on rather than re-defaulted:
+  # a second default for the same machine is how two harnesses end up
+  # measuring two different guests.
+  WC_GUEST="$GUEST" WC_HOST="$HOST" WC_ROOTC="$ROOTC" WC_HOST_FIREFOX="$HOST_FIREFOX" \
+  WC_HOST_GUEST="$HOST_GUEST" WC_QMP="$QMP" WC_VM_HINT="$VM_HINT" \
+  WC_ARENA_PAGES="$ARENA_PAGES" WC_ARENA_OUTBOUND="$ARENA_OUTBOUND" \
+    "$ROOT/scripts/wc-desktop.sh" damage 2>&1 | tee "$out"
+  local p f s
+  p=$(grep -c '^  PASS ' "$out"); f=$(grep -c '^  FAIL ' "$out"); s=$(grep -c '^  SKIP ' "$out")
+  pass=$((pass + p)); fail=$((fail + f)); skip=$((skip + s))
+  # A delegate that died before printing anything must not read as a clean run.
+  grep -q '^== [0-9]* passed, [0-9]* failed' "$out" \
+    || bad "wc-desktop.sh damage ended without its summary line"
 }
 
 have_magick() { command -v magick >/dev/null 2>&1; }
@@ -1782,7 +1640,7 @@ case "$MODE" in
   *) echo "usage: $0 [deploy|run|stage4|arena|firefox|damage|clean|all]"; exit 2 ;;
 esac
 
-if [ "$MODE" = run ] || [ "$MODE" = all ] || [ "$MODE" = stage4 ] || [ "$MODE" = firefox ]; then
+if [ "$MODE" = run ] || [ "$MODE" = all ] || [ "$MODE" = stage4 ] || [ "$MODE" = firefox ] || [ "$MODE" = damage ]; then
   echo
   echo "== $pass passed, $fail failed, $skip skipped -- on real Windows =="
 fi
