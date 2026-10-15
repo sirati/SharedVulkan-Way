@@ -874,6 +874,13 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     ("vkCreateImageView", "a video image's view is made once per description and kept"),
     ("vkDestroyImageView", "a kept view is not destroyed until its image is"),
     ("vkDestroyImage", "destroys the image's kept views first"),
+    // The fix itself (docs/video-decode.md §7.11.5): the driver is handed the
+    // decode structures at per-slot, session-lifetime addresses
+    // (`sv_gpu_server::video_stable`), because Intel's Windows driver follows
+    // pointers from earlier calls. The end closes the command buffer's scope.
+    ("vkCmdBeginVideoCodingKHR", "reference slots point into the session's per-slot stores"),
+    ("vkCmdDecodeVideoKHR", "the decode structures are handed over from per-slot stores"),
+    ("vkCmdEndVideoCodingKHR", "closes the command buffer's scope in the stores"),
 ];
 
 /// The generated commands whose driver call `GpuHost::observe` sees, before and
@@ -903,16 +910,16 @@ pub const GPU_OBSERVED: &[&str] = &[
     "vkDestroyVideoSessionParametersKHR",
     "vkDestroyBuffer",
     "vkBindBufferMemory",
-    "vkCmdBeginVideoCodingKHR",
     "vkCmdControlVideoCodingKHR",
-    "vkCmdDecodeVideoKHR",
-    "vkCmdEndVideoCodingKHR",
     "vkQueueSubmit",
     "vkQueueSubmit2",
 ];
 
 /// The generated commands whose raise pool `GpuHost::retain_raise` is handed
 /// after the driver call, instead of dropping it (docs/video-decode.md §7.11).
+///
+/// Since §7.11.5 only `vkCmdControlVideoCodingKHR` is here: begin and decode
+/// are hand-written and call the hook themselves.
 ///
 /// The guest's Intel driver faulted in `vkCmdDecodeVideoKHR` three times,
 /// each time by following a stale pointer at an IDR. In the last run the
@@ -923,7 +930,7 @@ pub const GPU_OBSERVED: &[&str] = &[
 /// forwarder frees each call's copies when the call returns. Keeping the pools
 /// (`SV_VIDEO_RETAIN`) is the experiment that tells the two explanations apart.
 pub const GPU_RETAIN_RAISE: &[&str] =
-    &["vkCmdBeginVideoCodingKHR", "vkCmdControlVideoCodingKHR", "vkCmdDecodeVideoKHR"];
+    &["vkCmdControlVideoCodingKHR"];
 
 /// Just the names, for the generator's set membership.
 pub fn gpu_hand_written() -> Vec<&'static str> {

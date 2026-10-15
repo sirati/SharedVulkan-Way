@@ -168,6 +168,7 @@ struct Opened {
     buffer_device_address: bool,
     features: sv_proto::VkPhysicalDeviceFeatures2,
     enabled_extensions: Vec<String>,
+    withheld_extensions: Vec<String>,
 }
 
 /// `VkPhysicalDeviceDriverProperties::driverID`, if the device has the query.
@@ -262,6 +263,9 @@ pub struct Driver {
     pub features: sv_proto::VkPhysicalDeviceFeatures2,
     /// The device extensions this device was created with.
     pub enabled_extensions: Vec<String>,
+    /// Extensions the driver has that this side deliberately neither enables
+    /// nor advertises (Intel's non-H.264 decode, docs/video-decode.md §7.11.5).
+    pub withheld_extensions: Vec<String>,
 }
 
 impl Driver {
@@ -370,6 +374,7 @@ impl Driver {
                 buffer_device_address,
                 features,
                 enabled_extensions,
+                withheld_extensions,
             }) => {
                 let props = unsafe { instance.get_physical_device_properties(pd) };
                 let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
@@ -406,6 +411,7 @@ impl Driver {
                     driver_id,
                     features,
                     enabled_extensions,
+                    withheld_extensions,
                 })
             }
             Err(e) => {
@@ -596,6 +602,39 @@ impl Driver {
         if minor >= 2 {
             owned.retain(|c| c.as_c_str() != c"VK_EXT_buffer_device_address");
         }
+        // Intel's Windows driver follows pointers from earlier decode calls, and
+        // `crate::video_stable` keeps only H.264's structures at stable
+        // addresses (docs/video-decode.md §7.11.5). The other decode codecs are
+        // withheld there, extension and all: Firefox decides what it can decode
+        // in hardware from the extension list, so masking the family's codec
+        // bits alone left it offering AV1 and H.265 in hardware.
+        // `SV_VIDEO_H264_ONLY=1` does the same on any driver, for testing the
+        // fallback.
+        let withheld: Vec<String> = if decode_wanted
+            && (crate::set_layout::refuses_push_binding_flags(
+                dev_props.vendor_id,
+                driver_id(instance, pd, dev_props.api_version),
+            ) || std::env::var("SV_VIDEO_H264_ONLY").is_ok_and(|v| v == "1"))
+        {
+            let gone: Vec<String> = DECODE_CODEC_EXTENSIONS
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| *n != "VK_KHR_video_decode_h264")
+                .filter(|n| owned.iter().any(|o| o.to_bytes() == n.as_bytes()))
+                .map(str::to_string)
+                .collect();
+            if !gone.is_empty() {
+                eprintln!(
+                    "sv-gpu-server: video decode served for H.264 only on this driver; withheld: {} \
+                     (docs/video-decode.md §7.11.5)",
+                    gone.join(", ")
+                );
+                owned.retain(|c| !gone.iter().any(|g| c.to_bytes() == g.as_bytes()));
+            }
+            gone
+        } else {
+            Vec::new()
+        };
         let names: Vec<*const std::ffi::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
 
         // The features: every feature struct the device may be created with
@@ -682,6 +721,7 @@ impl Driver {
             buffer_device_address: bda,
             features: wanted,
             enabled_extensions: enabled_names.iter().map(|s| s.to_string()).collect(),
+            withheld_extensions: withheld,
         })
     }
 
@@ -759,6 +799,9 @@ pub fn forwardable_device_extensions(d: &Driver) -> Vec<(String, u32)> {
     };
     let mut out = Vec::new();
     for want in sv_gpu_entry::PROFILE_DEVICE_EXTENSIONS {
+        if d.withheld_extensions.iter().any(|w| w == want) {
+            continue;
+        }
         for e in &exts {
             let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
             if name.to_bytes() == want.as_bytes() {

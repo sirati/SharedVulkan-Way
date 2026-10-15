@@ -32,6 +32,7 @@ pub mod session;
 pub mod set_layout;
 pub mod table;
 pub mod video_log;
+pub mod video_stable;
 pub mod video_views;
 pub mod workload;
 
