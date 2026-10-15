@@ -160,7 +160,15 @@ const CLASSIFIED: &[(&str, Where, &str)] = &[
 
     // -- fences and idles: ordinary forwards
     ("vkGetFenceStatus", Where::ForwardsWhenConnected, "forwards"),
-    ("vkResetFences", Where::ForwardsWhenConnected, "forwards"),
+    ("vkResetFences", Where::CannedShouldForward,
+     "**sent unanswered** (waycompose-design.md §88): the packet reaches the \
+      driver and VK_SUCCESS is synthesised, as for vkQueueSubmit. Its only \
+      failures are the out-of-memory codes, which make the ring fatal and \
+      surface as VK_ERROR_DEVICE_LOST on the next call. The rings keep its \
+      order: later waits share its device ring, later submits carry a barrier"),
+    ("vkResetCommandPool", Where::CannedShouldForward,
+     "as vkResetFences: sent unanswered, VK_SUCCESS synthesised (§88). Zink \
+      resets two pools a frame and each answer cost 0.8 ms on the guest"),
     ("vkWaitForFences", Where::ForwardsWhenConnected, "forwards"),
     ("vkDeviceWaitIdle", Where::ForwardsWhenConnected, "forwards"),
     ("vkQueueWaitIdle", Where::ForwardsWhenConnected, "forwards"),

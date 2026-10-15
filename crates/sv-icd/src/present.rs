@@ -818,10 +818,13 @@ pub mod wayland {
     /// How many `wl_shm` buffers a swapchain cycles through.
     ///
     /// Three, and the number is about the *compositor* rather than about this
-    /// driver: `vkQueuePresentKHR` here is synchronous, so one buffer would be
-    /// correct were it not that a committed buffer stays the compositor's until
-    /// it sends `wl_buffer.release`, and writing into it before then is a
-    /// visible tear. Three is one being shown, one in flight and one to write.
+    /// driver: frames are put one at a time (by the swapchain's presenter,
+    /// `crate::wsi`), so one buffer would be correct were it not that a
+    /// committed buffer stays the compositor's until it sends
+    /// `wl_buffer.release`, and writing into it before then is a visible tear.
+    /// Three is one being shown, one in flight and one to write. On the guest
+    /// the release crosses ssh.exe and arrives a frame or so late
+    /// (docs/waycompose-design.md §88); three still waited once in 960 frames.
     const BUFFERS: usize = 3;
 
     /// `union wl_argument`, one 64-bit slot per argument.
@@ -1071,8 +1074,8 @@ pub mod wayland {
     // SAFETY: every pointer is a libwayland object, and libwayland is
     // thread-safe for all of them. The one thing that is *not* safe to do from
     // two threads at once is dispatch the same event queue, and this queue is
-    // reachable only through `&mut self` — `crate::wsi::queue_present` holds
-    // the swapchain map's lock across the whole of `present`.
+    // reachable only through `&mut self` — the swapchain's target is behind a
+    // mutex that `crate::wsi` holds across the whole of `present`.
     unsafe impl Send for Surface {}
 
     impl Surface {

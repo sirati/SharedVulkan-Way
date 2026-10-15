@@ -1329,6 +1329,16 @@ pub(crate) static ROUND_TRIPS: Mutex<sv_transport::frametrace::OpTally> =
     Mutex::new(sv_transport::frametrace::OpTally::new());
 pub(crate) static SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    static UNTALLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's round trips are not the application's: the presenter's
+/// waits are reported as the present's own phases.
+pub(crate) fn untallied_on_this_thread() {
+    UNTALLIED.with(|u| u.set(true));
+}
+
 impl Transport for RingTransport {
     fn call(
         &self,
@@ -1337,7 +1347,7 @@ impl Transport for RingTransport {
         command: &[u8],
         reply: &mut Vec<u8>,
     ) -> IcdResult<()> {
-        if !sv_transport::frametrace::enabled() {
+        if !sv_transport::frametrace::enabled() || UNTALLIED.with(|u| u.get()) {
             return self.call_untimed(class, command, reply);
         }
         let started = std::time::Instant::now();

@@ -124,7 +124,10 @@ struct SwapImage {
 pub struct Swapchain {
     device: u64,
     queue: u64,
-    target: crate::present::Target,
+    /// Shared with the presenter, which shows frames from its own thread.
+    target: std::sync::Arc<std::sync::Mutex<crate::present::Target>>,
+    /// `None` presents on the calling thread (see [`queue_present`]).
+    presenter: Option<Presenter>,
     /// What the surface was when this swapchain was created. Compared against
     /// the surface's size on every acquire, which is how the application is
     /// told to rebuild one (`VK_SUBOPTIMAL_KHR`).
@@ -137,9 +140,9 @@ pub struct Swapchain {
     swap_rb: bool,
     images: Vec<SwapImage>,
     pool: u64,
-    /// Round-robin acquire cursor. Present is synchronous — it waits for its own
-    /// fence — so an image is free the moment the present that used it returns,
-    /// and there is no in-flight set to track.
+    /// Round-robin acquire cursor. An image is free once the present that used
+    /// it has been shown, which a synchronous present has done by the time it
+    /// returns and a pipelined one says through [`Presenter::wait_for`].
     next: usize,
 }
 
@@ -280,7 +283,12 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
         Swapchain {
             device,
             queue,
-            target: crate::present::Target::open(desc.target, desc.width, desc.height),
+            target: std::sync::Arc::new(std::sync::Mutex::new(crate::present::Target::open(
+                desc.target,
+                desc.width,
+                desc.height,
+            ))),
+            presenter: Presenter::start(icd, images.len()),
             present_target: desc.target,
             width: desc.width,
             height: desc.height,
@@ -558,15 +566,19 @@ pub fn acquire_next_image(
     semaphore: u64,
     fence: u64,
 ) -> IcdResult<u32> {
-    let (index, queue) = {
+    let (index, queue, busy) = {
         let mut chains = icd.swapchains();
         let sc = chains
             .get_mut(&swapchain)
             .ok_or(LowerError::Shape("vkAcquireNextImageKHR: unknown swapchain"))?;
         let index = sc.next;
         sc.next = (sc.next + 1) % sc.images.len().max(1);
-        (index as u32, sc.queue)
+        (index as u32, sc.queue, sc.presenter.as_ref().map(|p| std::sync::Arc::clone(&p.busy)))
     };
+    // A pipelined present of this image may still be copying out of it.
+    if let Some(busy) = busy {
+        Presenter::wait_for(&busy, index as usize);
+    }
     let _ = device;
     if semaphore != 0 || fence != 0 {
         let mut si = p::VkSubmitInfo::default();
@@ -587,16 +599,29 @@ pub fn acquire_next_image(
 
 /// `vkQueuePresentKHR`.
 ///
-/// Four steps and one round trip: reset the fence, submit the pre-recorded copy
-/// behind the application's wait semaphores, wait for it, and hand the arena
-/// bytes to the display target.
+/// Reset the image's fence and submit its pre-recorded copy behind the
+/// application's wait semaphores — both without waiting for an answer — and
+/// then either finish here or hand the rest to the swapchain's presenter.
 ///
-/// The wait is what makes this synchronous, and it is deliberate at this stage
-/// rather than an oversight. The alternative — return immediately and blit on a
-/// later frame — needs the timeline mirror of §9.3, which is not wired to
-/// submissions yet; and `vkQueueSubmit` on this side is itself still synchronous
-/// (§0.3, `icd::queue_submit`), so a present that did not wait would still cost
-/// a round trip and would additionally be able to show a half-written frame.
+/// # Pipelined (docs/waycompose-design.md §88)
+///
+/// The rest is the wait for the copy and the display target's copy out of the
+/// arena: on the real guest 2.0 ms and 1.2 ms of every frame, spent on
+/// Firefox's renderer thread with nothing else happening. With a presenter
+/// that work runs on its own thread while the application builds its next
+/// frame, and `vkAcquireNextImageKHR` is what waits, for that one image, if it
+/// comes round before its copy is shown.
+///
+/// The presenter waits on the **queue** ring. A wait on the device ring would
+/// hold that ring for the length of the copy, and the application's next
+/// device-ring call would queue behind it; on the queue ring it is ordered
+/// after the copy it waits for by construction, and the only thing it can
+/// delay is the application's next submission, which cannot be sooner than
+/// the next frame. The reset before it is on the device ring, and the queue
+/// ring's barrier puts the wait after it.
+///
+/// `SV_PRESENT_SYNC=1` keeps the old order, everything on the calling thread,
+/// so the two can be compared in one binary.
 pub fn queue_present(
     icd: &SharedVulkan,
     queue: u64,
@@ -604,7 +629,7 @@ pub fn queue_present(
     image_index: u32,
     waits: &[u64],
 ) -> IcdResult<()> {
-    let (device, cmd, fence, pixels, len, width, height, swap_rb) = {
+    let (job, presenter) = {
         let chains = icd.swapchains();
         let sc = chains
             .get(&swapchain)
@@ -614,26 +639,37 @@ pub fn queue_present(
             .get(image_index as usize)
             .ok_or(LowerError::Shape("vkQueuePresentKHR: image index out of range"))?;
         (
-            sc.device,
-            img.command_buffer,
-            img.fence,
-            img.pixels,
-            sc.bytes(),
-            sc.width,
-            sc.height,
-            sc.swap_rb,
+            Job {
+                swapchain,
+                image_index,
+                device: sc.device,
+                fence: img.fence,
+                pixels: img.pixels,
+                len: sc.bytes(),
+                width: sc.width,
+                height: sc.height,
+                swap_rb: sc.swap_rb,
+                target: std::sync::Arc::clone(&sc.target),
+                cmd: img.command_buffer,
+                started: std::time::Instant::now(),
+                reset: None,
+                submitted: None,
+                app: None,
+            },
+            sc.presenter.as_ref().map(|p| (p.tx.clone(), std::sync::Arc::clone(&p.busy))),
         )
     };
+    let mut job = job;
 
-    let started = std::time::Instant::now();
-    let app = traced_app_interval(swapchain, started);
+    job.started = std::time::Instant::now();
+    job.app = traced_app_interval(swapchain, job.started);
     let r = icd.reset_fences(p::VkResetFencesArgs {
-        device: p::VkDevice(device),
+        device: p::VkDevice(job.device),
         fence_count: 1,
-        p_fences: vec![p::VkFence(fence)],
+        p_fences: vec![p::VkFence(job.fence)],
     })?;
     result_ok(r.result)?;
-    let reset = std::time::Instant::now();
+    job.reset = Some(std::time::Instant::now());
 
     let mut si = p::VkSubmitInfo::default();
     si.wait_semaphore_count = waits.len() as u32;
@@ -644,71 +680,218 @@ pub fn queue_present(
     si.p_wait_dst_stage_mask =
         waits.iter().map(|_| p::VkPipelineStageFlags::VK_PIPELINE_STAGE_TRANSFER_BIT).collect();
     si.command_buffer_count = 1;
-    si.p_command_buffers = vec![p::VkCommandBuffer(cmd)];
+    si.p_command_buffers = vec![p::VkCommandBuffer(job.cmd)];
     let r = icd.queue_submit(p::VkQueueSubmitArgs {
         queue: p::VkQueue(queue),
         submit_count: 1,
         p_submits: vec![si],
-        fence: p::VkFence(fence),
+        fence: p::VkFence(job.fence),
     })?;
     result_ok(r.result)?;
     let submitted = std::time::Instant::now();
+    job.submitted = Some(submitted);
 
-    let r = icd.wait_for_fences(p::VkWaitForFencesArgs {
-        device: p::VkDevice(device),
+    if let Some((tx, busy)) = presenter {
+        {
+            let mut b = busy.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = b.get_mut(image_index as usize) {
+                *slot = true;
+            }
+        }
+        if let Err(back) = tx.send(job) {
+            // The presenter is gone, which only teardown does; finish here.
+            let job = back.0;
+            busy.0.lock().unwrap_or_else(|e| e.into_inner())[image_index as usize] = false;
+            busy.1.notify_all();
+            return finish_present(icd, job, false);
+        }
+        if sv_transport::frametrace::enabled() {
+            PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, submitted);
+        }
+        return Ok(());
+    }
+    finish_present(icd, job, false)
+}
+
+/// One present, from its copy being submitted to its frame being shown.
+struct Job {
+    swapchain: u64,
+    image_index: u32,
+    device: u64,
+    fence: u64,
+    cmd: u64,
+    pixels: usize,
+    len: usize,
+    width: u32,
+    height: u32,
+    swap_rb: bool,
+    target: std::sync::Arc<std::sync::Mutex<crate::present::Target>>,
+    started: std::time::Instant,
+    reset: Option<std::time::Instant>,
+    submitted: Option<std::time::Instant>,
+    app: Option<AppInterval>,
+}
+
+/// The images a presenter has not finished with, and the condition
+/// `vkAcquireNextImageKHR` waits on.
+type Busy = std::sync::Arc<(std::sync::Mutex<Vec<bool>>, std::sync::Condvar)>;
+
+/// A swapchain's present thread (see [`queue_present`]).
+pub(crate) struct Presenter {
+    tx: std::sync::mpsc::Sender<Job>,
+    busy: Busy,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Presenter {
+    /// Only for the process's one ICD: the thread outlives the call that made
+    /// it and needs an ICD that lives as long. `None` means present on the
+    /// calling thread, which is also what `SV_PRESENT_SYNC=1` asks for.
+    fn start(icd: &SharedVulkan, images: usize) -> Option<Presenter> {
+        if std::env::var_os("SV_PRESENT_SYNC").is_some_and(|v| v != "0") {
+            return None;
+        }
+        let global = crate::instance().filter(|g| std::ptr::eq(*g, icd))?;
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let busy: Busy =
+            std::sync::Arc::new((std::sync::Mutex::new(vec![false; images]), std::sync::Condvar::new()));
+        let theirs = std::sync::Arc::clone(&busy);
+        let thread = std::thread::Builder::new()
+            .name("sv-present".into())
+            .spawn(move || {
+                // This thread's waits are the present's own, not the
+                // application's round trips (`WC_FRAME_TRACE`).
+                crate::transport::untallied_on_this_thread();
+                while let Ok(job) = rx.recv() {
+                    let index = job.image_index as usize;
+                    if let Err(e) = finish_present(global, job, true) {
+                        trace!("vkQueuePresentKHR (presenter): {e:?}; that frame is dropped");
+                    }
+                    let mut b = theirs.0.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(slot) = b.get_mut(index) {
+                        *slot = false;
+                    }
+                    theirs.1.notify_all();
+                }
+            })
+            .ok()?;
+        Some(Presenter { tx, busy, thread: Some(thread) })
+    }
+
+    /// Wait until `index`'s last present has been shown. Bounded: a presenter
+    /// that never finishes is a GPU side that has stopped answering, and the
+    /// application's next call will say so. Takes the shared state rather than
+    /// `self` so the swapchain table is not held while it waits.
+    fn wait_for(busy: &Busy, index: usize) {
+        let (lock, cv) = &**busy;
+        let b = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cv.wait_timeout_while(b, std::time::Duration::from_secs(10), |b| {
+            b.get(index).copied().unwrap_or(false)
+        });
+    }
+
+    /// Finish every present already queued, then stop.
+    fn stop(mut self) {
+        drop(self.tx);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Wait for a present's copy and show the frame. `queue_ring` is the
+/// presenter's choice of ring for the wait; the calling thread's present keeps
+/// the device ring it always used.
+fn finish_present(icd: &SharedVulkan, job: Job, queue_ring: bool) -> IcdResult<()> {
+    let submitted = job.submitted.unwrap_or(job.started);
+    let dequeued = std::time::Instant::now();
+    let args = p::VkWaitForFencesArgs {
+        device: p::VkDevice(job.device),
         fence_count: 1,
-        p_fences: vec![p::VkFence(fence)],
+        p_fences: vec![p::VkFence(job.fence)],
         wait_all: true,
-        timeout: u64::MAX,
-    })?;
+        // Bounded on the presenter, where nothing else would notice a copy
+        // that never finished; the calling thread's wait is the application's
+        // and keeps its `UINT64_MAX`.
+        timeout: if queue_ring { 10_000_000_000 } else { u64::MAX },
+    };
+    let r = if queue_ring {
+        wait_on_queue_ring(icd, &args)?
+    } else {
+        icd.wait_for_fences(args)?
+    };
     result_ok(r.result)?;
 
     // SAFETY: `pixels` is the address `vkMapMemory` returned for this buffer's
     // arena allocation, whose length is at least `len` by construction in
     // `create_readback`, and the arena mapping outlives every swapchain
     // (docs/design.md §5.3). The GPU side's write to it is ordered before this read
-    // by the fence just waited on.
-    let bytes = unsafe { core::slice::from_raw_parts(pixels as *const u8, len) };
+    // by the fence just waited on, and the application cannot present this image
+    // again — so the copy cannot be rewritten — until `vkAcquireNextImageKHR`
+    // has seen this present finish.
+    let bytes = unsafe { core::slice::from_raw_parts(job.pixels as *const u8, job.len) };
     let fenced = std::time::Instant::now();
-    {
-        let mut chains = icd.swapchains();
-        if let Some(sc) = chains.get_mut(&swapchain) {
-            sc.target.present(bytes, width, height, swap_rb);
-        }
-    }
+    job.target
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .present(bytes, job.width, job.height, job.swap_rb);
     let shown = std::time::Instant::now();
-    frame_note(swapchain, bytes, width, height, fenced - started, shown - fenced);
-    if let Some(app) = app {
+    let (swapchain, width, height, image_index) = (job.swapchain, job.width, job.height, job.image_index);
+    frame_note(swapchain, bytes, width, height, fenced - job.started, shown - fenced);
+    if let Some(app) = job.app {
         use sv_transport::frametrace as ft;
         // The ICD's half of the frame timeline (docs/waycompose-design.md §88).
         // `gap` is the application's own time between two presents, and
-        // `rt`/`rt_us` the part of it spent waiting on the GPU side; the four
-        // phases after it are this function's.
+        // `rt`/`rt_us` the part of it spent waiting on the GPU side; the
+        // phases after it are the present's. `queued_us` is how long a
+        // pipelined present waited for its presenter.
         ft::emit_at(
-            ft::at_us(started),
+            ft::at_us(job.started),
             "icd.present",
             format_args!(
                 "sc={swapchain:#x} img={image_index} {width}x{height} gap_us={} rt={} rt_us={} sends={} \
-                 top={} reset_us={} submit_us={} wait_us={} show_us={} end={}",
+                 top={} reset_us={} submit_us={} queued_us={} wait_us={} show_us={} pipelined={} end={}",
                 app.gap_us,
                 app.round_trips,
                 app.round_trip_us,
                 app.sends,
                 app.top,
-                ft::us(reset - started),
-                ft::us(submitted - reset),
-                ft::us(fenced - submitted),
+                ft::us(job.reset.unwrap_or(job.started) - job.started),
+                ft::us(submitted - job.reset.unwrap_or(job.started)),
+                ft::us(dequeued.saturating_duration_since(submitted)),
+                ft::us(fenced - dequeued),
                 ft::us(shown - fenced),
+                queue_ring as u8,
                 ft::at_us(shown),
             ),
         );
-        PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, shown);
-        // The present's own three round trips are its phases above; they are
-        // not the next frame's application time.
-        crate::transport::ROUND_TRIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        crate::transport::SENDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        if !queue_ring {
+            PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, shown);
+            // The present's own round trips are its phases above; they are
+            // not the next frame's application time.
+            crate::transport::ROUND_TRIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            crate::transport::SENDS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Ok(())
+}
+
+/// `vkWaitForFences` as a call on the queue ring (see [`queue_present`]).
+fn wait_on_queue_ring(icd: &SharedVulkan, args: &p::VkWaitForFencesArgs) -> IcdResult<p::VkWaitForFencesReply> {
+    let Some(t) = icd.wire() else {
+        return Ok(p::VkWaitForFencesReply { result: p::VkResult(0) });
+    };
+    let mut buf = vec![0u8; p::size_cmd_vk_wait_for_fences(args)];
+    {
+        let mut enc = sv_wire::Encoder::new(&mut buf);
+        p::encode_cmd_vk_wait_for_fences(&mut enc, sv_wire::CMD_FLAG_GENERATE_REPLY, args)
+            .map_err(LowerError::Wire)?;
+        enc.finish().map_err(LowerError::Wire)?;
+    }
+    let mut reply = Vec::new();
+    t.call(sv_icd_entry::RingClass::Queue, p::Opcode::VkWaitForFences as u32, &buf, &mut reply)?;
+    let mut dec = sv_wire::Decoder::new(&reply);
+    p::decode_reply_vk_wait_for_fences(&mut dec).map_err(|e| LowerError::Wire(e))
 }
 
 /// When each swapchain's last present returned, for the gap to the next.
@@ -831,7 +1014,12 @@ fn frame_note(
 
 /// `vkDestroySwapchainKHR`.
 pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
-    let Some(sc) = icd.swapchains().remove(&swapchain) else { return };
+    let Some(mut sc) = icd.swapchains().remove(&swapchain) else { return };
+    // Every queued present is finished first: they read this swapchain's
+    // buffers and show on its target.
+    if let Some(p) = sc.presenter.take() {
+        p.stop();
+    }
     // Everything below is best-effort: `vkDestroySwapchainKHR` returns void, and
     // an application that destroys a swapchain while a present is in flight has
     // already been told not to. A failed teardown leaks a GPU-side object rather

@@ -64,6 +64,26 @@ macro_rules! forwarded {
     };
 }
 
+/// Encode a device-ring command without asking for a reply, and send it.
+///
+/// For commands whose only possible failures are out-of-memory codes and whose
+/// ordering the rings already keep (docs/waycompose-design.md §88): the GPU
+/// side makes a refusal nobody asked about fatal, so it is never silent.
+fn send_unanswered(
+    t: &dyn sv_icd_entry::Transport,
+    opcode: p::Opcode,
+    size: usize,
+    encode: impl FnOnce(&mut sv_wire::Encoder<'_>) -> sv_wire::Result<()>,
+) -> IcdResult<()> {
+    let mut buf = vec![0u8; size];
+    {
+        let mut enc = sv_wire::Encoder::new(&mut buf);
+        encode(&mut enc).map_err(LowerError::Wire)?;
+        enc.finish().map_err(LowerError::Wire)?;
+    }
+    t.send(sv_icd_entry::RingClass::Device, opcode as u32, &buf)
+}
+
 /// Encode one command straight into a command buffer's blob (docs/design.md §6.5).
 ///
 /// The generated forwarders do this for every `vkCmd*`; this is for the two
@@ -1611,10 +1631,48 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// `vkResetFences` goes out without waiting for its answer, as
+    /// `vkQueueSubmit` does (D15), and for the reason docs/waycompose-design.md
+    /// §88 measured: on the guest a round trip is about 0.7 ms of crossing for
+    /// a command the driver runs in microseconds, and Zink resets a fence every
+    /// frame. The results it can return are the two out-of-memory codes; one
+    /// the driver did return makes the ring fatal with this opcode, and the
+    /// application sees `VK_ERROR_DEVICE_LOST` on its next call.
+    ///
+    /// Order is kept by the rings, not by the wait: a later wait or status
+    /// query is on this same device ring, FIFO, and a later submission naming
+    /// the fence is on the queue ring with a barrier past this packet
+    /// ([`crate::transport`]'s `Barriers`).
     fn reset_fences(&self, args: p::VkResetFencesArgs) -> IcdResult<p::VkResetFencesReply> {
-        forwarded!(self, reset_fences, args, {
-            Ok(p::VkResetFencesReply { result: p::VkResult(0) })
-        })
+        if let Some(t) = self.wire() {
+            send_unanswered(
+                t,
+                p::Opcode::VkResetFences,
+                p::size_cmd_vk_reset_fences(&args),
+                |enc| p::encode_cmd_vk_reset_fences(enc, 0, &args),
+            )?;
+        }
+        Ok(p::VkResetFencesReply { result: p::VkResult(0) })
+    }
+
+    /// `vkResetCommandPool`, unanswered for the same reason as
+    /// [`Self::reset_fences`]: Zink resets two pools a frame, and on the guest
+    /// each answer cost 0.8 ms of a 21 ms frame (§88). Recording into the
+    /// pool's buffers afterwards travels in blobs on this same device ring,
+    /// behind it.
+    fn reset_command_pool(
+        &self,
+        args: p::VkResetCommandPoolArgs,
+    ) -> IcdResult<p::VkResetCommandPoolReply> {
+        if let Some(t) = self.wire() {
+            send_unanswered(
+                t,
+                p::Opcode::VkResetCommandPool,
+                p::size_cmd_vk_reset_command_pool(&args),
+                |enc| p::encode_cmd_vk_reset_command_pool(enc, 0, &args),
+            )?;
+        }
+        Ok(p::VkResetCommandPoolReply { result: p::VkResult(0) })
     }
 
     fn wait_for_fences(
