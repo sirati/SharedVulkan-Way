@@ -1,6 +1,6 @@
 /* Scroll a compositor window, for a long time, the way a user does.
  *
- *   probe-scroll.exe --class WaycomposeToplevel --wait 40 --notches 60 --gap 250
+ *   probe-scroll.exe [--pid N] --class WaycomposeToplevel --wait 40 --notches 60 --gap 250
  *
  * §27, with §57's refusal counting. `probe-input.exe` injects one wheel
  * notch, because the question it was written for is "does a notch arrive, and
@@ -32,20 +32,46 @@
  *
  * `FindWindowW(cls, NULL)` returns the FIRST window of the class in Z-order,
  * and the compositor owns more than one: a toplevel it shows, and hidden
- * helper/owner windows of the same class. The probe took the first, found it
- * hidden, and waited out its whole timeout reporting "exists but never became
- * visible" while the real toplevel was up with 50 frames blitted into it. That
- * sent one run chasing a Windows session boundary that was never the problem.
- *
- * So: walk every top-level window, match the class, and take the first that is
+ * helper/owner windows of the same class. So: walk every top-level window,
+ * match the class (and the process, with `--pid`), and take the first that is
  * actually VISIBLE and has a non-empty client rect. `found_any` is kept so the
  * failure can still distinguish "no window of this class at all" from "they are
- * all hidden", which is the distinction that made this diagnosable. */
+ * all hidden".
+ *
+ * `--pid`, because the class is not an identity on this guest: every
+ * compositor in every worktree registers `WaycomposeToplevel`, and a probe
+ * that scrolled the first visible one would scroll somebody else's window and
+ * report on ours. `wc-desktop.sh` addresses everything by pid for that reason
+ * (its `comp_pid`), and this probe now can too. */
 struct find_ctx {
 	const wchar_t *cls;
+	DWORD pid;		/* 0: any process */
 	HWND hit;
 	int found_any;
+	int dump;		/* print every candidate, for the failure report */
 };
+
+static void describe(HWND h, const char *why)
+{
+	RECT wr = { 0 }, cr = { 0 };
+	DWORD pid = 0;
+	wchar_t title[96] = L"";
+	LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+	LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+
+	GetWindowThreadProcessId(h, &pid);
+	GetWindowRect(h, &wr);
+	GetClientRect(h, &cr);
+	GetWindowTextW(h, title, 96);
+	printf("probe-scroll: %s hwnd %p pid %lu visible=%d WS_VISIBLE=%d iconic=%d "
+	       "owner=%p style=0x%llx ex=0x%llx window %ldx%ld+%ld+%ld client %ldx%ld title=\"%ls\"\n",
+	       why, (void *)h, (unsigned long)pid, (int)IsWindowVisible(h),
+	       (int)((style & WS_VISIBLE) != 0), (int)IsIconic(h),
+	       (void *)GetWindow(h, GW_OWNER), (unsigned long long)style,
+	       (unsigned long long)ex, (long)(wr.right - wr.left),
+	       (long)(wr.bottom - wr.top), (long)wr.left, (long)wr.top,
+	       (long)cr.right, (long)cr.bottom, title);
+}
 
 static BOOL CALLBACK find_cb(HWND h, LPARAM lp)
 {
@@ -54,7 +80,17 @@ static BOOL CALLBACK find_cb(HWND h, LPARAM lp)
 
 	if (!GetClassNameW(h, buf, 128) || wcscmp(buf, c->cls) != 0)
 		return TRUE;
+	if (c->pid) {
+		DWORD pid = 0;
+		GetWindowThreadProcessId(h, &pid);
+		if (pid != c->pid)
+			return TRUE;
+	}
 	c->found_any = 1;
+	if (c->dump) {
+		describe(h, "candidate");
+		return TRUE;
+	}
 	if (IsWindowVisible(h)) {
 		RECT r;
 		if (GetClientRect(h, &r) && r.right > 1 && r.bottom > 1) {
@@ -67,11 +103,11 @@ static BOOL CALLBACK find_cb(HWND h, LPARAM lp)
 
 static int g_found_hidden;	/* the class exists here; every one was hidden */
 
-static HWND find_target(const wchar_t *cls, int seconds)
+static HWND find_target(const wchar_t *cls, DWORD pid, int seconds)
 {
 	g_found_hidden = 0;
 	for (int i = 0; i < seconds * 10; i++) {
-		struct find_ctx c = { cls, NULL, 0 };
+		struct find_ctx c = { cls, pid, NULL, 0, 0 };
 		EnumWindows(find_cb, (LPARAM)&c);
 		if (c.hit)
 			return c.hit;
@@ -80,6 +116,31 @@ static HWND find_target(const wchar_t *cls, int seconds)
 		Sleep(100);
 	}
 	return NULL;
+}
+
+/* Where this probe is, measured rather than assumed. Block 12's probe and its
+ * compositor were in an ssh session for three runs that each reported a window
+ * that "never became visible", and the theory that the session was the cause
+ * could not be checked from the log because the log did not say which session
+ * it was. These are the facts `wc-desk station` prints, for this process. */
+static void where_am_i(void)
+{
+	DWORD session = (DWORD)-1;
+	wchar_t sta[128] = L"?", desk[128] = L"?", in[128] = L"<unreachable>";
+	HDESK input;
+
+	ProcessIdToSessionId(GetCurrentProcessId(), &session);
+	GetUserObjectInformationW(GetProcessWindowStation(), UOI_NAME, sta, sizeof sta, NULL);
+	GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desk,
+				  sizeof desk, NULL);
+	input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+	if (input) {
+		GetUserObjectInformationW(input, UOI_NAME, in, sizeof in, NULL);
+		CloseDesktop(input);
+	}
+	printf("probe-scroll: session %lu, station %ls, desktop %ls, input desktop %ls, screen %dx%d\n",
+	       (unsigned long)session, sta, desk, in, GetSystemMetrics(SM_CXSCREEN),
+	       GetSystemMetrics(SM_CYSCREEN));
 }
 
 static void move_to(int x, int y)
@@ -138,6 +199,7 @@ int main(int argc, char **argv)
 {
 	wchar_t cls[128] = L"WaycomposeToplevel";
 	int wait = 40, notches = 60, gap = 250, settle = 3000;
+	DWORD pid = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--log") && i + 1 < argc) {
@@ -150,6 +212,8 @@ int main(int argc, char **argv)
 			setvbuf(stdout, NULL, _IONBF, 0);
 		} else if (!strcmp(argv[i], "--class") && i + 1 < argc) {
 			MultiByteToWideChar(CP_ACP, 0, argv[++i], -1, cls, 128);
+		} else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
+			pid = (DWORD)strtoul(argv[++i], NULL, 10);
 		} else if (!strcmp(argv[i], "--wait") && i + 1 < argc) {
 			wait = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--notches") && i + 1 < argc) {
@@ -164,16 +228,23 @@ int main(int argc, char **argv)
 		}
 	}
 
-	HWND target = find_target(cls, wait);
+	where_am_i();
+	HWND target = find_target(cls, pid, wait);
 	if (!target) {
 		if (g_found_hidden)
 			printf("probe-scroll: a window of class '%ls' EXISTS in this desktop but never became visible after %d s -- the compositor made it and did not show it, or it is on a station with no visible desktop\n", cls, wait);
 		else
 			printf("probe-scroll: NO window of class '%ls' exists in this desktop at all after %d s -- wrong session/window station, or the compositor never created one\n", cls, wait);
+		/* Every candidate, with the facts that decide "visible": the
+		 * two lines above say THAT nothing qualified, and three runs of
+		 * block 12 could not say why from them. */
+		struct find_ctx c = { cls, pid, NULL, 0, 1 };
+		EnumWindows(find_cb, (LPARAM)&c);
 		return 1;
 	}
 	RECT rc;
 	GetClientRect(target, &rc);
+	describe(target, "target");
 	printf("probe-scroll: target HWND %p, client %ldx%ld\n",
 	       (void *)target, (long)rc.right, (long)rc.bottom);
 
