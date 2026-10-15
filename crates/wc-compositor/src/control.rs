@@ -80,7 +80,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 
-use crate::platform::{FromUi, WindowId};
+use crate::platform::{Edge, FromUi, WindowId};
 
 /// One window, as the synthetic Win32 sees it: a rectangle with an identity.
 #[derive(Clone, Copy, Debug)]
@@ -144,6 +144,12 @@ pub trait Windows {
     /// from `MonitorFromWindow` and `GetMonitorInfo`, and here it is the one
     /// output minus wherever the suite put the window.
     fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect);
+    /// §85. A move (`None`) or resize (`Some(edge)`) the compositor has handed
+    /// to the platform since the last turn. Win32 runs these in `SC_MOVE`'s
+    /// modal loop; the stand-in has to run them itself. See [`Gesture`].
+    fn take_gesture(&self) -> Option<(WindowId, Option<Edge>)> {
+        None
+    }
 }
 
 impl Windows for crate::state::State {
@@ -154,6 +160,30 @@ impl Windows for crate::state::State {
     fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect) {
         self.set_popup_bounds(id, bounds);
     }
+
+    fn take_gesture(&self) -> Option<(WindowId, Option<Edge>)> {
+        self.take_gesture_request()
+    }
+}
+
+/// §85. An interactive move or resize, run the way Windows runs `SC_MOVE` and
+/// `SC_SIZE`: from the press that started it until that button comes up, the
+/// pointer moves the window rather than reaching it, and the release is
+/// consumed by the loop. Until §85 the stand-in had no window manager at all
+/// and every such gesture was logged and dropped, which made the four WLCS
+/// interactive move/resize tests "expected" failures on this leg and left the
+/// two reactive-popup tests, which move their parent this way, untestable.
+///
+/// The edge arithmetic is `WM_SIZING`'s: a left or top edge moves the origin
+/// and shrinks the window by the same amount, a right or bottom edge only
+/// changes the size, and the new size is reported as `WM_SIZE` reports it.
+struct Gesture {
+    id: WindowId,
+    key: (u32, u32),
+    edge: Option<Edge>,
+    pointer: (f64, f64),
+    position: (i32, i32),
+    size: (i32, i32),
 }
 
 /// A parsed request, and the channel its answer goes back on.
@@ -223,6 +253,8 @@ pub struct Control {
     /// its windows within and what its positioner tests expect a popup to be
     /// kept inside.
     output: (i32, i32),
+    /// §85. The move or resize being run, if any. See [`Gesture`].
+    gesture: Option<Gesture>,
 }
 
 impl Control {
@@ -255,6 +287,7 @@ impl Control {
             focus: None,
             started: std::time::Instant::now(),
             output,
+            gesture: None,
         })
     }
 
@@ -268,6 +301,9 @@ impl Control {
     pub fn service(&mut self, windows: &impl Windows) {
         self.follow_focus(windows);
         self.publish_bounds(windows);
+        if let Some((id, edge)) = windows.take_gesture() {
+            self.begin_gesture(id, edge, windows);
+        }
         loop {
             let job = match self.jobs.try_recv() {
                 Ok(j) => j,
@@ -379,6 +415,91 @@ impl Control {
         self.started.elapsed().as_millis() as u32
     }
 
+    /// §85. Start a [`Gesture`] if a button is still held over `id`, which is
+    /// the condition Windows' modal loop starts under; otherwise do nothing,
+    /// as `SC_MOVE` does nothing for a button that has already come up.
+    fn begin_gesture(&mut self, id: WindowId, edge: Option<Edge>, windows: &impl Windows) {
+        let (Some(at), false) = (self.at, self.held.is_empty()) else {
+            println!("wc-compositor: [control] window {id} gesture ignored: no button held");
+            return;
+        };
+        let mapped = windows.mapped();
+        let Some(r) = mapped.iter().find(|r| r.id == id && r.toplevel) else { return };
+        let key = (r.client, r.surface);
+        self.gesture = Some(Gesture {
+            id,
+            key,
+            edge,
+            pointer: at,
+            position: self.position_of(key.0, key.1),
+            size: (r.w, r.h),
+        });
+        // The compositor sent `leave` when it handed the gesture over; the
+        // stand-in's idea of where the pointer is must agree, so that the
+        // first motion after the loop is an `enter`.
+        self.over = None;
+        println!(
+            "wc-compositor: [control] window {id} {} started at {:.0},{:.0}",
+            match edge {
+                None => "move".to_owned(),
+                Some(e) => format!("resize from {e:?}"),
+            },
+            at.0,
+            at.1
+        );
+    }
+
+    /// One pointer motion inside a [`Gesture`]: the window moves or resizes,
+    /// and nothing reaches the client but the configure a resize implies.
+    fn step_gesture(&mut self, x: f64, y: f64) {
+        let Some(g) = self.gesture.as_ref() else { return };
+        let (dx, dy) = ((x - g.pointer.0) as i32, (y - g.pointer.1) as i32);
+        let (mut px, mut py) = g.position;
+        let (mut w, mut h) = g.size;
+        match g.edge {
+            None => {
+                px += dx;
+                py += dy;
+            }
+            Some(e) => {
+                let (left, right, top, bottom) = match e {
+                    Edge::Left => (true, false, false, false),
+                    Edge::Right => (false, true, false, false),
+                    Edge::Top => (false, false, true, false),
+                    Edge::Bottom => (false, false, false, true),
+                    Edge::TopLeft => (true, false, true, false),
+                    Edge::TopRight => (false, true, true, false),
+                    Edge::BottomLeft => (true, false, false, true),
+                    Edge::BottomRight => (false, true, false, true),
+                    Edge::None => (false, false, false, false),
+                };
+                if left {
+                    px += dx;
+                    w -= dx;
+                }
+                if right {
+                    w += dx;
+                }
+                if top {
+                    py += dy;
+                    h -= dy;
+                }
+                if bottom {
+                    h += dy;
+                }
+                (w, h) = (w.max(1), h.max(1));
+            }
+        }
+        let (id, key, resized) = (g.id, g.key, g.edge.is_some() && (w, h) != g.size);
+        match self.positions.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => *v = (px, py),
+            None => self.positions.push((key, (px, py))),
+        }
+        if resized {
+            let _ = self.events.send(FromUi::Resized { id, width: w, height: h });
+        }
+    }
+
     /// Where a window's top left corner is, in compositor coordinates.
     ///
     /// A toplevel is wherever the suite put it. **A popup is wherever the
@@ -479,7 +600,11 @@ impl Control {
                     return "err pointer-move wants <x> <y>\n".to_owned();
                 };
                 self.at = Some((x, y));
-                self.refresh(windows);
+                if self.gesture.is_some() {
+                    self.step_gesture(x, y);
+                } else {
+                    self.refresh(windows);
+                }
                 "ok\n".to_owned()
             }
             "pointer-button" => {
@@ -487,6 +612,25 @@ impl Control {
                     return "err pointer-button wants <code> <0|1>\n".to_owned();
                 };
                 let (code, down) = (code as u32, down != 0.0);
+                // §85. Inside a gesture the loop owns the buttons: a release
+                // that empties the held set ends it and reaches nobody, and the
+                // pointer is re-entered wherever it now is.
+                if self.gesture.is_some() {
+                    if down {
+                        if !self.held.contains(&code) {
+                            self.held.push(code);
+                        }
+                    } else {
+                        self.held.retain(|b| *b != code);
+                    }
+                    if self.held.is_empty()
+                        && let Some(g) = self.gesture.take()
+                    {
+                        println!("wc-compositor: [control] window {} gesture ended", g.id);
+                        self.refresh(windows);
+                    }
+                    return "ok\n".to_owned();
+                }
                 let Some(id) = self.over else {
                     // Not an error: WLCS is entitled to click on nothing, and
                     // a compositor that has nothing under the cursor sends
@@ -759,6 +903,7 @@ mod tests {
                 focus: None,
                 started: std::time::Instant::now(),
                 output: (800, 600),
+                gesture: None,
             },
             rx,
         )
@@ -880,6 +1025,57 @@ mod tests {
         let f = Fake::new(vec![win(1, 1, 3, 100, 100), win(2, 1, 4, 100, 100)]);
         c.handle("pointer-move 50 50", &f);
         assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { id: 2, .. })));
+    }
+
+    /// §85. A move started with the button down drags the window with the
+    /// pointer, sends the client nothing while it runs, eats the release, and
+    /// leaves the pointer entered at the same point of the window it started
+    /// from — which is WLCS `surface_can_be_moved_interactively` in miniature.
+    #[test]
+    fn a_move_drags_the_window_and_eats_its_release() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
+        c.handle("position 1 3 100 100", &f);
+        c.handle("pointer-move 105 105", &f);
+        c.handle("pointer-button 272 1", &f);
+        while rx.try_recv().is_ok() {}
+        c.begin_gesture(1, None, &f);
+        c.handle("pointer-move 165 65", &f);
+        assert!(rx.try_recv().is_err(), "nothing reaches the client during the loop");
+        assert_eq!(c.handle("pointer-button 272 0", &f), "ok\n");
+        assert_eq!(c.position_of(1, 3), (160, 60));
+        // The release is consumed and the pointer re-enters where it is.
+        assert!(matches!(rx.try_recv(), Ok(FromUi::PointerEnter { id: 1, x, y, .. }) if (x, y) == (5.0, 5.0)));
+        assert!(rx.try_recv().is_err(), "no button event after the loop");
+    }
+
+    /// §85. A top-left resize moves the corner with the pointer and reports
+    /// the smaller size, as `WM_SIZING` from that corner does.
+    #[test]
+    fn a_top_left_resize_moves_the_corner_and_reports_the_size() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 400, 300)]);
+        c.handle("position 1 3 100 100", &f);
+        c.handle("pointer-move 105 105", &f);
+        c.handle("pointer-button 272 1", &f);
+        while rx.try_recv().is_ok() {}
+        c.begin_gesture(1, Some(Edge::TopLeft), &f);
+        c.handle("pointer-move 165 65", &f);
+        assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 1, width: 340, height: 340 })));
+        c.handle("pointer-button 272 0", &f);
+        assert_eq!(c.position_of(1, 3), (160, 60));
+    }
+
+    /// §85. A gesture asked for after the button came up is not started:
+    /// `SC_MOVE` does nothing then either, and a stand-in that moved the
+    /// window anyway would be kinder than Windows.
+    #[test]
+    fn a_gesture_without_a_held_button_does_nothing() {
+        let (mut c, _rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
+        c.handle("pointer-move 50 50", &f);
+        c.begin_gesture(1, None, &f);
+        assert!(c.gesture.is_none());
     }
 
     #[test]
