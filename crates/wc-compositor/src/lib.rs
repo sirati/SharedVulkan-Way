@@ -787,7 +787,8 @@ fn arm_arena_for_first_client(grow: &mut Option<crate::grow::Service>, clients_s
             // silence, because a session that cannot grow and does not say so
             // is the failure stage 53 exists to remove.
             Ok(None) => println!(
-                "wc-compositor: no outbound window, so no growth channel; this session \
+                "wc-compositor: no growth channel (no outbound window, or a fixed-size ivshmem \
+                 region); this session \
                  cannot be asked for more memory"
             ),
             Err(e) => eprintln!(
