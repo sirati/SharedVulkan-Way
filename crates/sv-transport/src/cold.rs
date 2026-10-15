@@ -123,6 +123,14 @@ pub enum Locator {
     /// `security-model.md` R28 has the scan check it once, at attach, on the one
     /// occasion when the stamps still exist to check it against.
     Pfns(Vec<PfnRun>),
+    /// **No locating at all** (waycompose-design.md §87): the extent is a
+    /// contiguous slice of an ivshmem device's BAR, starting `region_offset`
+    /// bytes into it, and the attaching side opens the file QEMU backs that BAR
+    /// with — by its path, as the user, with a group bit — and reads the pages
+    /// there. The stamps are still written and still checked, once, at attach,
+    /// so this is a locator that names a place and is then verified, not one
+    /// that is trusted.
+    Ivshmem { region_offset: u64 },
 }
 
 impl Locator {
@@ -196,6 +204,7 @@ impl ExtentDesc {
             + match &self.locator {
                 Locator::Scan | Locator::Probe => 8,
                 Locator::Pfns(runs) => 8 + runs.len() * 16,
+                Locator::Ivshmem { .. } => 8 + 8,
             }
     }
 
@@ -220,6 +229,11 @@ impl ExtentDesc {
                     e.u64(r.first_frame)?;
                     e.u64(r.frames)?;
                 }
+            }
+            Locator::Ivshmem { region_offset } => {
+                e.u32(3)?;
+                e.array_size(0)?;
+                e.u64(*region_offset)?;
             }
         }
         Ok(())
@@ -265,6 +279,12 @@ impl ExtentDesc {
                     runs.push(run);
                 }
                 Locator::Pfns(runs)
+            }
+            3 => {
+                if d.u64()? != 0 {
+                    return Err(Error::BadColdMessage("an ivshmem locator carried a frame list"));
+                }
+                Locator::Ivshmem { region_offset: d.u64()? }
             }
             _ => return Err(Error::BadColdMessage("unknown locator")),
         };
@@ -730,6 +750,23 @@ mod tests {
             assert_eq!(&ColdMessage::decode(&buf).unwrap(), m, "{m:?}");
         }
         assert_eq!(msgs.len(), 7, "every variant must appear above");
+    }
+
+    /// §87: the ivshmem locator crosses as an offset and decodes to the same
+    /// offset, and a frame list smuggled in front of it is refused rather than
+    /// skipped.
+    #[test]
+    fn an_ivshmem_locator_round_trips_and_carries_one_offset() {
+        let mut h = hello();
+        if let ColdMessage::Hello(b) = &mut h {
+            b.extent.locator = Locator::Ivshmem { region_offset: 80 << 20 };
+            assert_eq!(b.extent.size(), 8 + 4 + 8 + 8 + 4 + 16);
+        }
+        let mut buf = Vec::new();
+        h.encode(&mut buf).unwrap();
+        assert_eq!(ColdMessage::decode(&buf).unwrap(), h);
+        assert_eq!(Locator::Ivshmem { region_offset: 1 }.frame_count(), 0);
+        assert_eq!(Locator::Ivshmem { region_offset: 1 }.pfn_runs(), None);
     }
 
     /// docs/design.md §4.3: the descriptor "is small in every case: on the two
