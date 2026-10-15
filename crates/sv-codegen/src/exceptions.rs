@@ -841,6 +841,18 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "objectHandle is a handle only `objecttype=` identifies; no type-directed pass sees it",
     ),
     ("vkSetDebugUtilsObjectTagEXT", "as vkSetDebugUtilsObjectNameEXT"),
+    // --- 6. a shape one driver must never see -----------------------------
+    //
+    // Intel's Windows driver (`igvk64.dll` 101.7076) faults inside
+    // `vkCreatePipelineLayout` when the first set layout is a PUSH_DESCRIPTOR
+    // one created with a `VkDescriptorSetLayoutBindingFlagsCreateInfo`, which
+    // is what Zink makes for every set layout. On a passed-through iGPU the
+    // fault stopped the VM (docs/design.md §0.29). The layout is shaped where
+    // it is created, because by `vkCreatePipelineLayout` it is a handle.
+    (
+        "vkCreateDescriptorSetLayout",
+        "an all-zero binding-flags link is dropped, exactly; Intel's Windows driver faults on it",
+    ),
 ];
 
 /// Just the names, for the generator's set membership.

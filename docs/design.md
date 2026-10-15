@@ -5774,6 +5774,330 @@ than changed.
 - **A present across the VM.** 0.28.8's 1 ms is one machine's.
 - **The patched Mesa upstream**, or on any Mesa but 26.2.4.
 
+### 0.29 A driver fault that stopped the VM — Intel's `vkCreatePipelineLayout`, and the binding-flags link dropped before it
+
+Measured 2026-10-15. The guest numbers are the **deploy-guest** branch's
+(commit f30ace0, `crates/vk-probe/src/bin/layout-probe.rs`, and the API trace
+it left in testhost's `/tmp/svff-int/apidump.txt`), read and not re-run. The
+fix was proven on the **accel-path** workstation only, on the AMD iGPU
+(`renderD129`, RADV from the dev shell's Mesa 26.2.0) with debug builds, in
+§0.28's arrangement. **Nothing in this section ran on the Windows guest or on
+testhost's GPU**, and 0.29.1 is the reason.
+
+#### 0.29.1 The incident, and the rule that follows from it
+
+In three of four Firefox runs on the guest, Firefox's GPU process died in
+`vkCreatePipelineLayout` inside Intel's Windows driver (`igvk64.dll`
+101.7076, Raptor Lake-P UHD Graphics, driver id
+`VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS`), at `igvk64.dll+0xdb8d3`, reading
+address 0x8. The GPU side's fault filter (7ca52e4) named the command:
+`ring 2: seqno 202 vkCreatePipelineLayout (IN THE DRIVER)`. The fourth run,
+slowed down by tracing, fell back to software WebRender and never got that far.
+
+`layout-probe` then made the faulting layout and variations of it directly on
+the driver, one child process each. Its one run, 17:06–17:07, faulted the
+driver three times in a few seconds, and at 17:07:16 QEMU stopped the VM with
+`kvm run failed Bad address` (status `internal-error`), the vCPU in a
+guest-kernel register-polling loop. The iGPU is passed through with VFIO. The
+likely mechanism is a GPU reset after the faults revoking the BAR mapping under
+that read. That is not proven.
+
+So a user-mode fault in this driver is not contained to the process that
+caused it: **it can stop the VM.** The rule is:
+
+- **Crash bisection never runs on the guest.** Nothing goes to the guest that is
+  expected to fault, or that exists to find out whether something faults:
+  probes, variation sweeps, "one more run with tracing". A shape suspected of
+  faulting the driver is kept from the driver. Whether it really faults stays
+  unknown.
+- **A fix for a guest-driver fault is proven without the guest**: by tests
+  against a driver that records what it was given, and by the real application
+  on a local driver with a layer that shows what reached it (0.29.5). The
+  claim that the guest no longer sees the faulting shape is an argument from
+  those and from the guest's existing trace (0.29.6). It is not a run.
+
+#### 0.29.2 What the probe measured
+
+All variations have the same push-constant range as the faulting layout
+(`ALL_GRAPHICS`, 0..52). "Link" means a `VkDescriptorSetLayoutBindingFlagsCreateInfo`
+in the set layout's `pNext`, of the set's own binding count, every flag 0, as
+Zink makes them. "push" is a PUSH_DESCRIPTOR set of five `UNIFORM_BUFFER`
+bindings 0..4, one per graphics stage. "empty" has no bindings. "texel" is one
+`UNIFORM_TEXEL_BUFFER` at binding 0, fragment.
+
+| variation | set layouts, in order | result |
+|---|---|---|
+| `zink` | push, empty, texel; all with the link | **0xc0000005** |
+| `zink-no-pnext` | push, empty, texel; none with the link | ok |
+| `push-empty` | push, empty; with the link | **0xc0000005** |
+| `push-texel` | push, texel; with the link | **0xc0000005** |
+| `empty-texel` | empty, texel; with the link | ok |
+| `plain-empty-texel` | an ordinary one-UBO set, empty, texel; with the link | ok |
+| `push-only`, `empty-only` | — | **never ran**: the VM stopped first |
+
+The fault needs a PUSH_DESCRIPTOR set layout created with the link, first in
+the pipeline layout, with at least one set after it. Without the link (`zink`
+→ `zink-no-pnext`, one variable) it does not fault. With an ordinary set in
+the push set's place (`plain-empty-texel`) it does not fault either. Whether a
+lone push set with the link faults was not measured. `ZINK_DEBUG=nopc` did not
+avoid the fault.
+
+#### 0.29.3 What Zink sends, and why every flag is zero
+
+From Mesa 26.2.4, the Mesa Firefox loaded on the guest
+(`mesa-kopper-wayland-26.2.4`, §0.28.2). `zink_descriptors.c`'s
+`descriptor_layout_create` makes **every** set layout Zink creates outside
+descriptor-buffer mode:
+
+```c
+   else if (t == ZINK_DESCRIPTOR_TYPE_UNIFORMS)
+      dcslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+
+   if (screen->info.have_EXT_descriptor_indexing) {
+      dcslci.pNext = &fci;
+      ...
+      fci.bindingCount = num_bindings;
+      fci.pBindingFlags = flags;
+      for (unsigned i = 0; i < num_bindings; i++) {
+         flags[i] = 0;
+      }
+   }
+```
+
+So the link comes from Zink. It is attached whenever descriptor indexing is
+present, which it is on Intel (`descriptorBindingPartiallyBound = 1` in the
+trace), and its flags are always zero. The push set is the `UNIFORMS` type
+whenever push descriptors exist, and it is always set 0 (`pg->dsl[pg->num_dsl++] =
+push_count ? ctx->dd.push_dsl[pidx]->layout : ctx->dd.dummy_dsl->layout`, with
+the comment "push set is always 0"). Missing sets in between are filled with
+`dummy_dsl`, the empty layout, which also carries the link with count 0. The only
+non-zero binding flags Zink ever writes are the bindless layout's
+(`zink_screen.c`: `UPDATE_UNUSED_WHILE_PENDING | PARTIALLY_BOUND`, plus
+`UPDATE_AFTER_BIND`), and the bindless layout is not a push set.
+
+The guest's trace agrees. It has five `vkCreateDescriptorSetLayout` calls and
+two `vkCreatePipelineLayout` calls:
+
+| handle | flags | bindings | link |
+|---|---|---|---|
+| 0x6 | `UPDATE_AFTER_BIND_POOL` | 4 × 1024 (sampler, texel, storage image, storage texel), all stages | flags 7, 7, 7, 7 |
+| 0xc | **PUSH_DESCRIPTOR** | 5 × `UNIFORM_BUFFER`, bindings 0..4, one per graphics stage | 0, 0, 0, 0, 0 |
+| 0xd | PUSH_DESCRIPTOR | 1 × `UNIFORM_BUFFER`, binding 5, compute | 0 |
+| 0xe | 0 | none | count 0 |
+| 0x6f | 0 | 1 × `UNIFORM_TEXEL_BUFFER`, **binding 128**, fragment | 0 |
+
+| pipeline layout | sets | result on Intel |
+|---|---|---|
+| 0x7 | none, push constants only | `VK_SUCCESS` |
+| (none) | 0xc, 0xe, 0x6f; push constants `ALL_GRAPHICS` 0..52 | **`VK_ERROR_DEVICE_LOST`**: the fault |
+
+All four `vkGetDescriptorSetLayoutSupport` queries in the trace, both push sets
+with the link among them, returned `supported = 1` without a fault. So the
+driver handles the link when it creates the set layout, and faults only when
+the set layout goes into a pipeline layout.
+
+#### 0.29.4 The transformation, and why it is exact
+
+**`sv-gpu-server` drops every all-zero `VkDescriptorSetLayoutBindingFlagsCreateInfo`
+from a `vkCreateDescriptorSetLayout`, on every driver, before the driver is
+called.** The rest of the chain keeps its order. It is exact because the
+specification defines the link's absence: "If `bindingCount` is zero or if
+this structure is not included in the `pNext` chain, the
+`VkDescriptorBindingFlags` for each descriptor set layout binding is
+considered to be zero." A link whose flags are all zero says exactly that,
+so the set layout the driver creates is the one the application asked for.
+
+Three decisions, each with its reason:
+
+- **Every set layout, not only the push one.** Stripping only the push set
+  would hand the driver push (no link), empty (link), texel (link), and
+  `layout-probe` never made that shape. Stripping all of them hands it
+  `zink-no-pnext`, which it did make, and which did not fault (0.29.6).
+- **Every driver, not only Intel's.** The transformation is exact, so there
+  is nothing to scope. Applying it everywhere also means it is exercised on
+  every driver this project runs on. Scoped to Intel's Windows driver, it would
+  run only where it can no longer be tested.
+- **At set-layout creation, not at pipeline-layout creation.** By
+  `vkCreatePipelineLayout` the set layout is a handle the driver already
+  created with the link. `vkCreateDescriptorSetLayout` is added to
+  `sv_codegen::exceptions::GPU_HAND_WRITTEN` (group 6, "a shape one driver
+  must never see"), so the generated forwarder delegates it to
+  `GpuServer::create_descriptor_set_layout`. That method maps the handles,
+  then calls `sv_gpu_server::set_layout::create`, which lowers and calls
+  the driver. The trait makes this the only path for that command to reach a
+  driver. The wire protocol is unchanged: `sv_proto::PROTOCOL_HASH` is still
+  `0x403720e574aa9434`, the one the deployed ICD reported in the guest run, so a
+  new `sv-guest.exe` serves the ICD that is already deployed.
+
+**Non-zero flags on a push set.** `VUID-VkDescriptorSetLayoutBindingFlagsCreateInfo-flags-03003`
+forbids `UPDATE_AFTER_BIND`, `UPDATE_UNUSED_WHILE_PENDING` and
+`VARIABLE_DESCRIPTOR_COUNT` on a PUSH_DESCRIPTOR set layout, so the only flag
+a valid push set's link can carry is `PARTIALLY_BOUND`. Dropping that is
+**not** exact: it removes a relaxation the application relied on, and a
+descriptor the application left unwritten would then be undefined behaviour
+the application never wrote. So on Intel's Windows driver (vendor 0x8086 **and**
+driver id 5, because the same iGPU under Linux is ANV, a different driver) a
+push set layout whose link has any non-zero flag is **refused**:
+`VK_ERROR_INITIALIZATION_FAILED`, a `[gpu] vkCreateDescriptorSetLayout
+refused: …` line, and no driver call. Whether that shape faults is not known,
+and finding out costs the VM. The GPU side says so at startup on that driver
+only. On every other driver it is forwarded as it came. Non-zero flags on a set
+that is not a push set (Zink's bindless layout) are forwarded on every driver:
+that is not the shape that faulted. Zink never sends a push set with non-zero
+flags (0.29.3).
+
+**What is not changed.** `vkGetDescriptorSetLayoutSupport` stays generated and
+still carries the link: the guest answered four such queries without a fault
+(0.29.3), and an exact strip cannot change the answer. The one case where the
+two disagree is the refusal: support says yes and create fails. Zink's
+`descriptor_layout_create` logs `vkCreateDescriptorSetLayout failed` and does
+not otherwise check the result. A refusal is therefore loud in two logs, not
+handled gracefully in Zink, and that was judged acceptable for a shape Zink
+never sends.
+
+#### 0.29.5 The proof without the guest
+
+**A driver that records what it was given.** `set_layout`'s tests call
+`create` with an `extern "system"` mock in the driver's slot. The mock reads
+the raised C structs through their pointers, as a driver does: every `pNext`
+`sType`, the bindings, and the flags.
+
+| test | asserts |
+|---|---|
+| `firefox_s_pipeline_layout_reaches_the_driver_as_the_variation_that_did_not_fault` | the trace's 0xc, 0xe and 0x6f create infos, refusal armed: all three reach the driver with an **empty** `pNext` chain, bindings unchanged: `zink-no-pnext` |
+| `the_same_on_every_other_driver` | the same with the refusal off |
+| `a_push_set_with_partially_bound_never_reaches_intel_s_windows_driver` | `VK_ERROR_INITIALIZATION_FAILED`, and the mock was **not called** |
+| `a_push_set_with_partially_bound_is_forwarded_unchanged_elsewhere` | the link arrives with flags `[0, PARTIALLY_BOUND]` |
+| `non_zero_flags_on_an_ordinary_set_are_forwarded_on_intel_too` | the bindless shape keeps its flags 7 |
+| `a_duplicate_link_cannot_smuggle_flags_past_the_refusal` | a zero link followed by a non-zero one on a push set is still refused |
+| `other_links_keep_their_place`, `a_layout_without_the_link_is_unchanged`, `only_intel_s_windows_driver_is_singled_out` | as named; the last checks 0x8086/5 against ANV (6), RADV (3) and NVIDIA (4) |
+
+The first three fail when the strip is disabled. That was checked by
+disabling it, and the first failure printed what a driver would have seen:
+`Seen { flags: 1, bindings: [(0, 6, 1) … (4, 6, 1)], chain: [1000161000],
+binding_flags: Some([0, 0, 0, 0, 0]) }`. Under Miri (`nix develop .#miri -c
+cargo miri test -p sv-gpu-server --lib set_layout`) all 9 pass with no
+undefined behaviour. The one warning is the integer-to-pointer cast of the
+opaque device handle, which the mock never dereferences.
+
+**Firefox on RADV, with a layer showing what the driver was handed.**
+`scripts/sv-firefox-wayland.sh` now takes `SVWL_GPU_ENV`, environment for the
+GPU side alone. `soak 90` with `VK_LAYER_LUNARG_api_dump` on the GPU side
+only (its dump: 2.9 GB in 90 s, so not for long runs):
+
+| what RADV was handed | count |
+|---|---|
+| `vkGetDescriptorSetLayoutSupport`, PUSH_DESCRIPTOR, **with** the link (still generated, so this is what Zink sent) | 24 |
+| `vkGetDescriptorSetLayoutSupport`, flags 0, with the link | 11 |
+| `vkCreateDescriptorSetLayout`, PUSH_DESCRIPTOR, `pNext = NULL` | **24** |
+| `vkCreateDescriptorSetLayout`, flags 0, `pNext = NULL` | **11** |
+| `vkCreateDescriptorSetLayout`, `UPDATE_AFTER_BIND_POOL`, link with flags 7 kept | 2 |
+| `vkCreatePipelineLayout` [] / [push] / [push, empty, texel] / [push, empty, 1–8 × combined image sampler] | 2 / 5 / 2 / 13 |
+
+Zink sent the link on all 35 ordinary and push set layouts, and the driver
+received it on none of them. No pipeline layout contained a set layout with a
+link. The bindless layouts were created and never used in a pipeline layout.
+That run passed (17 loads, WebRender at every sample, WebGL on Zink).
+
+**And nothing regressed:** `soak 330`, weston, 64 MiB, the patched Mesa, no
+layer: **PASS**, 334 s, 66 loads, WebRender at all 66 samples, WebGL drew 327
+frames on Zink and read back the shader's orange, and 7,384 – 7,567 submissions
+in every one of the 10 windows (§0.28.3: 7,412 – 7,510).
+
+#### 0.29.6 Why the guest would no longer see the faulting shape
+
+1. The guest's trace has two `vkCreatePipelineLayout` calls (0.29.3). The first
+   has no set layouts, so this change does not touch it, and it succeeded on
+   Intel.
+2. The second names 0xc, 0xe and 0x6f. Each was created with a link whose flags
+   are all zero (0xe's has count 0), so the GPU side now drops all three links
+   before the driver sees them. The first test in 0.29.5 runs exactly those
+   three create infos and asserts that the driver sees no `pNext` at all.
+3. What the driver then holds is push (five UBOs at 0..4, one per stage), empty,
+   texel, all without the link, with push constants `ALL_GRAPHICS` 0..52. That
+   is `zink-no-pnext`, which ran on this driver without a fault. The one
+   difference from the probe is the texel set's binding number, 128 against the
+   probe's 0. It is in a set after the push set, and `empty-texel` and
+   `plain-empty-texel` put the same set (binding 0) in the same position
+   without a fault. That the number does not matter is an inference, not a
+   measurement.
+4. The command has one way to the driver, through `GpuHost::create_descriptor_set_layout`,
+   which the trait enforces. Every set layout goes through that path, so after
+   this change Intel can only be handed a push set layout with a link if the
+   link has a non-zero flag, and that is refused before the driver is called.
+   **The measured faulting shape, a push set layout with a link first in a
+   pipeline layout, can no longer reach the driver**, whatever Firefox does
+   after the point where the trace ends.
+
+What the argument does **not** cover is the other pipeline layouts Firefox would
+make after that point. They no longer contain the faulting shape, but they are
+other shapes, and the probe did not make them. The RADV run lists them:
+`[push]` alone (the probe's `push-only` never ran, and that was with the link),
+and `[push, empty, N × combined image sampler]` (the probe only had a texel
+set). Both are push first without a link, which is `zink-no-pnext`'s class and
+not the faulting one. The first deployed run will measure them.
+
+#### 0.29.7 The rest of the trace: what else only Intel might reject
+
+Read from the guest's trace; nothing was run for it. Every other call in the
+trace returned `VK_SUCCESS`. These are the candidates:
+
+1. **`VkPhysicalDeviceVulkan14Properties` came back all zeros**:
+   `maxPushDescriptors = 0`, `maxVertexAttribDivisor = 0`,
+   `maxCombinedImageSamplerDescriptorCount = 0`, an all-zero
+   `optimalTilingLayoutUUID`. It looked like Intel's driver not filling a struct
+   it claims. **It is not Intel's**: `vulkaninfo` through the forwarder on
+   RADV returns the same zeros, and RADV directly says `maxPushDescriptors =
+   32`, `maxVertexAttribDivisor = 4294967295`. The 1.1–1.3 property structs
+   arrive intact. So the forwarder drops the 1.4 one. Zink 26.2.4 reads none of
+   these fields (it keys push descriptors on the feature, not the limit), and
+   this is a separate bug, not fixed here.
+2. **The bindless set layout** (0x6: `UPDATE_AFTER_BIND_POOL`, 4 × 1024
+   descriptors, flags 7 on every binding, all six stages). Intel created it. It
+   was never put in a pipeline layout, there or on RADV. When it is, it follows
+   a push set, which now has no link, and it keeps its own non-zero link. The
+   probe did not make that shape. 4 × 1024 is within Intel's
+   `maxPerSetDescriptors` (6159) and its update-after-bind limits (1,048,576).
+   Firefox's WebRender does not use bindless textures, so nothing seen so far
+   reaches this.
+3. **Zink's framebuffer-fetch push layout** (`create_gfx_layout(…, fbfetch = true)`)
+   adds an `INPUT_ATTACHMENT` binding to the push set. It loses its link like
+   the others. The probe never made it, and it is not in the trace.
+4. **Sparse binding numbers**: the compute push set at binding 5 alone, the
+   texel set at 128. Intel created both set layouts. Only 128 went into a
+   pipeline layout, the faulting one, where the link explains the fault.
+5. **Memory and buffer-view `pNext`**: `VkMemoryPriorityAllocateInfoEXT` and
+   `VkMemoryAllocateFlagsInfo` on all 21 `vkAllocateMemory` calls, and
+   `VkBufferUsageFlags2CreateInfo` on `vkCreateBufferView`. All succeeded.
+   They are listed only because they are the remaining extension structs this
+   driver was handed.
+
+#### 0.29.8 Gates
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2779 passed**, 0 failed, 8 ignored, 98 binaries (2770 before; the 9 new are `set_layout`'s) |
+| `cargo clippy --workspace --all-targets` | no warning in `sv-gpu-server`; the others are where they were |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo miri test -p sv-gpu-server --lib set_layout` | 9 passed, no undefined behaviour. The other new `unsafe`, `Driver`'s `vkGetPhysicalDeviceProperties2` for the driver id, is a call into a real driver like the rest of `Driver::open`, and is not under Miri |
+| the 3 strip tests with the strip disabled | fail, naming the link the driver would have seen |
+| `sv-firefox-wayland.sh soak 90`, api_dump on the GPU side | **PASS**; RADV handed 0 links on 35 push and ordinary set layouts |
+| `sv-firefox-wayland.sh soak 330`, weston, 64 MiB | **PASS**, 334 s |
+| the Windows guest, testhost's GPU | **not run**, by the rule in 0.29.1 |
+
+#### 0.29.9 What is not proven
+
+- **That Firefox renders on the guest.** 0.29.6 shows the faulting shape cannot
+  reach Intel's driver. It does not show that the shapes that do reach it are
+  all safe; the first deployed run measures that. Under 0.29.1 that run is
+  a deployment and not a probe: it carries a build expected not to fault.
+- **The mechanism of the VM stop.** The GPU-reset reading is the likely one
+  and is not proven.
+- **Intel's own bug.** Why the driver reads 0x8 is not known, and it has not
+  been reported to Intel.
+- **`push-only` and `empty-only`**, which never ran.
+- **The 1.4 properties** (0.29.7 item 1): found, not fixed.
+
 ---
 
 ## 1. Vocabulary, and the invariant everything rests on

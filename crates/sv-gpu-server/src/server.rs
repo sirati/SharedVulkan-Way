@@ -1121,6 +1121,41 @@ impl GpuHost for GpuServer {
         Ok(p::VkSetDebugUtilsObjectTagEXTReply { result: OK })
     }
 
+    // -- 6. a shape one driver must never see -------------------------------
+
+    /// Forwarded with an all-zero binding-flags link dropped, which is exact,
+    /// and on Intel's Windows driver refused for a push set layout with
+    /// non-zero binding flags, which could not be made exact. The argument is
+    /// `crate::set_layout`'s, and docs/design.md §0.29's.
+    fn create_descriptor_set_layout(
+        &mut self,
+        a: p::VkCreateDescriptorSetLayoutArgs,
+    ) -> WireResult<p::VkCreateDescriptorSetLayoutReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        // The immutable samplers, which are handles: what the generated
+        // forwarder's mapping pass would have done.
+        p::handle_map_vk_descriptor_set_layout_create_info(info, &mut sv_gpu_entry::Mapping(&mut *self))?;
+        let Some(f) = self.fns().vk_create_descriptor_set_layout else {
+            self.note_missing("vkCreateDescriptorSetLayout");
+            let mut r = p::VkCreateDescriptorSetLayoutReply::default();
+            r.result = p::VkResult(crate::set_layout::VK_ERROR_INITIALIZATION_FAILED);
+            return Ok(r);
+        };
+        let refuse = self.shared.driver.refuses_push_binding_flags();
+        let (r, layout) = crate::set_layout::create(f, a.device.0, info, refuse)?;
+        if r != 0 {
+            let mut reply = p::VkCreateDescriptorSetLayoutReply::default();
+            reply.result = p::VkResult(r);
+            return Ok(reply);
+        }
+        if let Some(id) = a.p_set_layout {
+            self.bind(id.0, HandleType::VkDescriptorSetLayout, layout);
+        }
+        Ok(p::VkCreateDescriptorSetLayoutReply { result: OK, p_set_layout: a.p_set_layout })
+    }
+
     fn enumerate_device_extension_properties(
         &mut self,
         a: p::VkEnumerateDeviceExtensionPropertiesArgs,
