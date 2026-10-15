@@ -36,14 +36,31 @@ fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 }
 
 /// The links of a Zink-shaped `vkCreateDevice` chain, owned so that a thread
-/// can build and lower it. Boxed, so the addresses stay put while linked.
+/// can build and lower it.
+///
+/// Raw pointers from `Box::into_raw`, freed in `Drop`, and never a `Box` moved
+/// after a pointer into it was taken: moving a `Box` retags it as unique, which
+/// invalidates every raw pointer derived from it before. Miri reports that
+/// (Stacked Borrows), correctly, and it is the test's bug and not the walker's —
+/// the same lesson `lowering.rs`'s cyclic-chain case records.
 struct ZinkChain {
-    create: Box<VkDeviceCreateInfo>,
-    _features2: Box<VkPhysicalDeviceFeatures2>,
-    _v11: Box<VkPhysicalDeviceVulkan11Features>,
-    _v12: Box<VkPhysicalDeviceVulkan12Features>,
-    _v13: Box<VkPhysicalDeviceVulkan13Features>,
-    _clip: Box<VkPhysicalDeviceDepthClipEnableFeaturesEXT>,
+    create: *mut VkDeviceCreateInfo,
+    links: [*mut c_void; 5],
+}
+
+impl Drop for ZinkChain {
+    fn drop(&mut self) {
+        // SAFETY: each pointer came from `Box::into_raw` of the type named here,
+        // in `zink_chain`, and is freed exactly once.
+        unsafe {
+            drop(Box::from_raw(self.create));
+            drop(Box::from_raw(self.links[0] as *mut VkPhysicalDeviceFeatures2));
+            drop(Box::from_raw(self.links[1] as *mut VkPhysicalDeviceVulkan11Features));
+            drop(Box::from_raw(self.links[2] as *mut VkPhysicalDeviceVulkan12Features));
+            drop(Box::from_raw(self.links[3] as *mut VkPhysicalDeviceVulkan13Features));
+            drop(Box::from_raw(self.links[4] as *mut VkPhysicalDeviceDepthClipEnableFeaturesEXT));
+        }
+    }
 }
 
 /// The sTypes of [`ZinkChain`]'s links, in chain order.
@@ -60,35 +77,50 @@ const ORDER: [VkStructureType; 5] = [
 /// made the old walk nest; the depth-clip link is the one the §0.24 fault was
 /// lowering when it died.
 fn zink_chain() -> ZinkChain {
-    let mut clip = Box::new(VkPhysicalDeviceDepthClipEnableFeaturesEXT::default());
+    let mut clip = VkPhysicalDeviceDepthClipEnableFeaturesEXT::default();
     clip.s_type = ORDER[4];
     clip.depth_clip_enable = 1;
+    let clip = Box::into_raw(Box::new(clip));
 
-    let mut v13 = Box::new(VkPhysicalDeviceVulkan13Features::default());
+    let mut v13 = VkPhysicalDeviceVulkan13Features::default();
     v13.s_type = ORDER[3];
     v13.dynamic_rendering = 1;
-    v13.p_next = &raw mut *clip as *mut c_void;
+    v13.p_next = clip as *mut c_void;
+    let v13 = Box::into_raw(Box::new(v13));
 
-    let mut v12 = Box::new(VkPhysicalDeviceVulkan12Features::default());
+    let mut v12 = VkPhysicalDeviceVulkan12Features::default();
     v12.s_type = ORDER[2];
     v12.timeline_semaphore = 1;
-    v12.p_next = &raw mut *v13 as *mut c_void;
+    v12.p_next = v13 as *mut c_void;
+    let v12 = Box::into_raw(Box::new(v12));
 
-    let mut v11 = Box::new(VkPhysicalDeviceVulkan11Features::default());
+    let mut v11 = VkPhysicalDeviceVulkan11Features::default();
     v11.s_type = ORDER[1];
     v11.multiview = 1;
-    v11.p_next = &raw mut *v12 as *mut c_void;
+    v11.p_next = v12 as *mut c_void;
+    let v11 = Box::into_raw(Box::new(v11));
 
-    let mut features2 = Box::new(VkPhysicalDeviceFeatures2::default());
+    let mut features2 = VkPhysicalDeviceFeatures2::default();
     features2.s_type = ORDER[0];
     features2.features.geometry_shader = 1;
-    features2.p_next = &raw mut *v11 as *mut c_void;
+    features2.p_next = v11 as *mut c_void;
+    let features2 = Box::into_raw(Box::new(features2));
 
-    let mut create = Box::new(VkDeviceCreateInfo::default());
+    let mut create = VkDeviceCreateInfo::default();
     create.s_type = VkStructureType::VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    create.p_next = &raw const *features2 as *const c_void;
+    create.p_next = features2 as *const c_void;
+    let create = Box::into_raw(Box::new(create));
 
-    ZinkChain { create, _features2: features2, _v11: v11, _v12: v12, _v13: v13, _clip: clip }
+    ZinkChain {
+        create,
+        links: [
+            features2 as *mut c_void,
+            v11 as *mut c_void,
+            v12 as *mut c_void,
+            v13 as *mut c_void,
+            clip as *mut c_void,
+        ],
+    }
 }
 
 /// Zink's device chain lowers on a quarter of a WebRender thread's stack, and
@@ -100,8 +132,7 @@ fn zinks_device_chain_lowers_flat_on_a_quarter_of_a_webrender_stack() {
     let wire = on_small_stack(|| {
         let chain = zink_chain();
         // SAFETY: a live chain of `#[repr(C)]` structs this closure owns.
-        unsafe { lower_vk_device_create_info(&raw const *chain.create) }
-            .expect("the chain lowers")
+        unsafe { lower_vk_device_create_info(chain.create) }.expect("the chain lowers")
     });
     let tags: Vec<i32> = wire.p_next.iter().map(|l| l.s_type()).collect();
     assert_eq!(tags, ORDER.map(|s| s.0).to_vec(), "every link, in chain order");
@@ -140,7 +171,7 @@ fn zinks_device_chain_lowers_flat_on_a_quarter_of_a_webrender_stack() {
 fn the_chain_round_trips_through_the_wire_on_the_same_budget() {
     let chain = zink_chain();
     // SAFETY: as above.
-    let wire = unsafe { lower_vk_device_create_info(&raw const *chain.create) }.unwrap();
+    let wire = unsafe { lower_vk_device_create_info(chain.create) }.unwrap();
     let links = wire.p_next;
 
     let back = on_small_stack(move || {
@@ -165,7 +196,7 @@ fn the_chain_as_output_storage_gives_up_its_tags_on_the_same_budget() {
         // SAFETY: as above; the tag walk reads two fields of each link.
         unsafe {
             lower_pnext_tags(
-                chain.create.p_next,
+                (*chain.create).p_next,
                 sv_proto::pnext_allowed_in_vk_device_create_info,
             )
         }
