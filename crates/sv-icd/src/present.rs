@@ -289,6 +289,19 @@ pub mod x11 {
     /// display is now read from [`OUR_DISPLAY`], which needs nothing.
     unsafe extern "C" fn ignore_error(dpy: *mut Display, event: *mut c_void) -> c_int {
         if !dpy.is_null() && OUR_DISPLAY.load(Ordering::Acquire) == dpy as usize {
+            // Swallowed, but **not silently**: the stall above was invisible for
+            // as long as it was partly because nothing ever said an error had
+            // happened. The first few are named, and no more, because a
+            // persistent one arrives once per frame.
+            if ERRORS_SAID.fetch_add(1, Ordering::Relaxed) < 4 && !event.is_null() {
+                // SAFETY: Xlib passes an `XErrorEvent*` as the second argument,
+                // valid for the duration of this call.
+                let e = unsafe { &*(event as *const XErrorEvent) };
+                eprintln!(
+                    "sv-icd: X error {} on request {}.{} for resource {:#x}; that frame is dropped",
+                    e.error_code, e.request_code, e.minor_code, e.resourceid
+                );
+            }
             return 0;
         }
         match PREVIOUS.get().copied().flatten() {
@@ -425,6 +438,21 @@ pub mod x11 {
     /// connection opens, and a null `Display*` is never ours.
     static OUR_DISPLAY: AtomicUsize = AtomicUsize::new(0);
 
+    /// How many of our own X errors [`ignore_error`] has named.
+    static ERRORS_SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Xlib's `XErrorEvent`, as far as the fields this module reads.
+    #[repr(C)]
+    struct XErrorEvent {
+        type_: c_int,
+        display: *mut Display,
+        resourceid: c_ulong,
+        serial: c_ulong,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
     fn connection() -> Option<&'static Mutex<Connection>> {
         CONN.get_or_init(|| {
             let l = lib()?;
@@ -514,13 +542,40 @@ pub mod x11 {
             // every X server this can reach is 24-bit TrueColor with the
             // channels in the order `VK_FORMAT_B8G8R8A8_UNORM` already has them
             // — which is why the copy in `put` is a `memcpy` and not a shuffle.
+            //
+            // **The depth is the window's, not the screen's** (docs/design.md
+            // §0.27). `XPutImage` requires the image's depth to equal the
+            // drawable's, and Firefox's toplevel is not at the screen's default
+            // depth: every frame was `BadMatch` (error 8) on `X_PutImage`
+            // (request 72), swallowed by `ignore_error`, and the window stayed
+            // black while everything behind it rendered. A 32-bit TrueColor
+            // visual has the same channel masks as the 24-bit one with alpha in
+            // the top byte, which is where `B8G8R8A8` keeps it, so the default
+            // visual still describes the pixels.
             quietly(l, dpy, || unsafe {
                 let pixels = libc::malloc(len.max(1)) as *mut u8;
                 if pixels.is_null() {
                     return None;
                 }
                 let visual = (l.default_visual)(dpy, g.screen);
-                let depth = (l.default_depth)(dpy, g.screen) as c_uint;
+                let mut depth = (l.default_depth)(dpy, g.screen) as c_uint;
+                let mut root: c_ulong = 0;
+                let (mut x, mut y) = (0 as c_int, 0 as c_int);
+                let (mut w, mut h, mut b, mut d) = (0 as c_uint, 0, 0, 0);
+                let ok = (l.get_geometry)(
+                    dpy,
+                    window as c_ulong,
+                    &mut root,
+                    &mut x,
+                    &mut y,
+                    &mut w,
+                    &mut h,
+                    &mut b,
+                    &mut d,
+                );
+                if ok != 0 && (d == 24 || d == 32) {
+                    depth = d;
+                }
                 let image = (l.create_image)(
                     dpy,
                     visual,
