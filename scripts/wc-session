@@ -304,10 +304,54 @@ run)
   # Written **only** under this launcher's own tree, so a profile somewhere else
   # is never touched.
   PROFILE=$(printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
+
+  # THE FORWARDED GPU, IF THIS HOST HAS ONE. shared_vulkan's docs/design.md §0.28.
+  #
+  # `$BASE/gpu.env` is this host's statement that the guest's GPU is reachable
+  # through sv-icd: `NAME=value` lines, put in front of the application exactly
+  # as written (no shell ever sees them). Typically the five that make Mesa run
+  # Zink on the forwarded device and present it to a `wl_shm`-only proxy:
+  #
+  #   MESA_LOADER_DRIVER_OVERRIDE=zink
+  #   LIBGL_KOPPER_DRI2=1
+  #   __EGL_VENDOR_LIBRARY_FILENAMES=<mesa-kopper-wayland>/share/glvnd/egl_vendor.d/50_mesa.json
+  #   VK_DRIVER_FILES=<dir>/sv_icd.json
+  #   SV_SOCKET=<the GPU side's socket>
+  #
+  # It is a file here and not a word from the guest because only this machine
+  # knows whether those paths exist; a guest that asked for acceleration from a
+  # host without it would get a Firefox that cannot start its renderer.
+  #
+  # **And the profile gets `gfx.webrender.all` with it, never without it.**
+  # Firefox decides software or hardware WebRender from one fact: whether Mesa's
+  # EGL device says `EGL_MESA_device_software`. With no DRM node on this host
+  # Mesa has only its software device to give, so Firefox files Zink-on-a-GPU
+  # as `mesa/software-unknown` and blocklists hardware WebRender
+  # (FEATURE_FAILURE_SOFTWARE_GL). The pref overrides exactly that entry. Set
+  # without the GPU it would put hardware WebRender on llvmpipe, which is slower
+  # than the software WebRender Firefox would otherwise choose, so the two go
+  # together or not at all.
+  GPUENV=()
+  if [ -f "$BASE/gpu.env" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ''|'#'*) ;;
+        [A-Za-z_]*=*)
+          case "${line%%=*}" in *[!A-Za-z0-9_]*) die "gpu.env: bad name in: $line" ;; esac
+          GPUENV+=("$line") ;;
+        *) die "gpu.env: not NAME=value: $line" ;;
+      esac
+    done <"$BASE/gpu.env"
+  fi
+
   case "$PROFILE" in
     "$HOME"/.wc-launch/*)
       mkdir -p "$PROFILE" 2>/dev/null
       printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
+      if [ ${#GPUENV[@]} -gt 0 ]; then
+        printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
+          >> "$PROFILE/user.js"
+      fi
       ;;
   esac
 
@@ -334,6 +378,7 @@ run)
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    "${GPUENV[@]}" \
     $CMD >>"$D/app.log" 2>&1 &
   echo "run ok $!"
   ;;
