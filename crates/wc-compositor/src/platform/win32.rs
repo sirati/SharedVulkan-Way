@@ -129,6 +129,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
     // window makes, handed to Windows' own modal loops.
     GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    // §82: where the pointer is when a move is handed over. See
+    // `begin_sysmenu_gesture`.
+    GetCursorPos,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
@@ -708,6 +711,7 @@ impl WindowState {
                 shadow.pixels(),
                 shadow.width(),
                 shadow.height(),
+                shadow.format().has_alpha(),
                 caption::Rect { left: rc.left, top: rc.top, right: rc.right, bottom: rc.bottom },
             )
         };
@@ -864,6 +868,27 @@ impl WindowState {
             && maximized != self.maximized.get()
         {
             self.maximized.set(maximized);
+            // §82: where a folded window's client area landed when it was
+            // maximised, against the work area it should start at. One line
+            // per transition; it is the number the guest run reads to say the
+            // tab strip's first row is the monitor's first row.
+            if maximized && self.frame.get().extend_top {
+                let mut origin = POINT { x: 0, y: 0 };
+                // SAFETY: a live window handle; written in place.
+                unsafe { ClientToScreen(self.hwnd(), &mut origin) };
+                println!(
+                    "wc-compositor: window {} maximised: client area starts at screen y={}, \
+                     work area at y={}{}",
+                    self.id,
+                    origin.y,
+                    work_area_of(self.hwnd()).map_or(i32::MIN, |r| r.top),
+                    if Some(origin.y) == work_area_of(self.hwnd()).map(|r| r.top) {
+                        " -- the tab strip's first row is the monitor's"
+                    } else {
+                        " -- MISMATCH: part of the tab strip is off the monitor or below its top"
+                    }
+                );
+            }
             if !self.self_driven.get() {
                 let _ = self.events.send(FromUi::Maximized {
                     id: self.id,
@@ -3226,7 +3251,18 @@ fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -
         let window_top = (*params).rgrc[0].top;
         let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wparam, lparam);
         let ordinary_top = (*params).rgrc[0].top;
-        let inset = if is_maximized(hwnd) { frame_border(hwnd).1 } else { 0 };
+        // §82: the work area's top, not the band; see
+        // `caption::maximised_top_inset` for the Wine measurement that
+        // separated the two.
+        let inset = if is_maximized(hwnd) {
+            caption::maximised_top_inset(
+                window_top,
+                work_area_of(hwnd).map(|r| r.top),
+                frame_border(hwnd).1,
+            )
+        } else {
+            0
+        };
         (*params).rgrc[0].top = window_top + inset;
         state.nc_top.set(ordinary_top - window_top);
         Some(r)
@@ -3549,12 +3585,38 @@ fn frame_glass(w: &WindowState) -> bool {
 /// `DefWindowProc` refuses to start a sizing or moving loop for a window that
 /// holds the capture. The symptom is a window that simply does not move, with
 /// nothing in any log.
+///
+/// # §82: a move is `SC_MOVE | HTCAPTION`, with the cursor in `lParam`
+///
+/// Until §82 a move was posted as bare `SC_MOVE` with `lParam = 0`, and that
+/// is the **keyboard** move — Alt+Space, *Move* — which warps the cursor to
+/// the middle of the caption and moves the window by the distance from
+/// *there*. Nothing had dragged a window before §82, so nothing had seen it.
+/// Measured under Wine with `wc-desk mouse --drag 800,15 920,95` on Firefox's
+/// empty tab strip: the window moved by **(+286, +82)** for a drag of
+/// (+120, +80) — the 166 px of x it gained is the distance from the press to
+/// the middle of the 1288 px window. `SC_MOVE | HTCAPTION` (`0xF012`) is the
+/// mouse move a caption click produces, and it follows the pointer from where
+/// it is. Resizes already passed a `WMSZ_*` edge in the low bits, which is the
+/// mouse form, and are unchanged.
 fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
+    const HTCAPTION: u32 = 2;
+    let (command, lparam) = if command == SC_MOVE {
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: `pt` is written in place.
+        unsafe { GetCursorPos(&mut pt) };
+        (
+            SC_MOVE | HTCAPTION,
+            ((pt.y as u32 & 0xffff) << 16 | (pt.x as u32 & 0xffff)) as LPARAM,
+        )
+    } else {
+        (command, 0)
+    };
     // SAFETY: a live window handle, on the thread that created it.
     // `ReleaseCapture` is a no-op when this thread holds no capture.
     unsafe {
         ReleaseCapture();
-        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, 0);
+        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, lparam);
     }
     println!("wc-compositor: window {} handed a {what} to Windows", w.id);
 }

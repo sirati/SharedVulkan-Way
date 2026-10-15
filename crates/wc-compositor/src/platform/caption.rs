@@ -81,6 +81,26 @@ pub fn resize_band(size_frame: i32, padded_border: i32) -> i32 {
     size_frame + padded_border
 }
 
+/// How far below the top of a **maximised** window its client area starts.
+///
+/// §31.3 answered "the resize band": a maximised `WS_OVERLAPPEDWINDOW` hangs
+/// over the monitor by exactly that on real Windows (`hwnd at -8,-8`, photographed),
+/// so insetting by it puts the tab strip's first row on the monitor's first.
+/// That is a fact about where Windows parks a maximised window, not a law, and
+/// Wine parks it differently — measured: `1608x1108 at -30,-27`, so an inset of
+/// the 4 px band left 23 rows of Firefox's tab strip above the screen, which
+/// is the whole strip. The rule that is true in both places is the one the
+/// band was standing in for: **the client area starts at the top of the work
+/// area.** The band stays as the answer when there is no work area to ask, or
+/// when the distance is not a plausible frame (a window that is not where
+/// its monitor is).
+pub fn maximised_top_inset(window_top: i32, work_top: Option<i32>, band: i32) -> i32 {
+    match work_top {
+        Some(w) if w > window_top && w - window_top <= 100 => w - window_top,
+        _ => band,
+    }
+}
+
 /// What a point in a folded caption is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -203,7 +223,13 @@ pub fn fallback_buttons(client_width: i32, button_w: i32, height: i32) -> Rect {
 /// Returns `None` when there is nothing to judge — no pixels, or a strip that
 /// is off the buffer — rather than an answer about pixels that do not exist,
 /// which is §31.6's panic lesson in a second place.
-pub fn corner_is_clear(pixels: &[u8], width: i32, height: i32, strip: Rect) -> Option<bool> {
+pub fn corner_is_clear(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+    has_alpha: bool,
+    strip: Rect,
+) -> Option<bool> {
     let s = Rect {
         left: strip.left.max(0),
         top: strip.top.max(0),
@@ -213,9 +239,15 @@ pub fn corner_is_clear(pixels: &[u8], width: i32, height: i32, strip: Rect) -> O
     if width <= 0 || height <= 0 || s.is_empty() {
         return None;
     }
-    let at = |x: i32, y: i32| -> Option<[u8; 3]> {
+    // `None` for a pixel that is off the buffer, `Some(None)` for one the
+    // client left transparent. The second is not a widget: it is the rounded
+    // top-right corner of a client-side-decorated window, which Firefox draws
+    // with alpha 0 and which is 2% of a 54x30 strip — measured, under Wine, as
+    // a false "draws under the caption buttons" before this skipped it.
+    let at = |x: i32, y: i32| -> Option<Option<[u8; 3]>> {
         let o = ((y * width + x) * 4) as usize;
-        pixels.get(o..o + 3).map(|p| [p[0], p[1], p[2]])
+        let p = pixels.get(o..o + 4)?;
+        Some((!has_alpha || p[3] >= 128).then_some([p[0], p[1], p[2]]))
     };
     // The most common colour, from a coarse histogram. A tab strip's empty
     // corner is one flat colour; anti-aliased glyphs are a scatter of others.
@@ -223,8 +255,10 @@ pub fn corner_is_clear(pixels: &[u8], width: i32, height: i32, strip: Rect) -> O
     let mut total = 0u32;
     for y in s.top..s.bottom {
         for x in s.left..s.right {
-            *counts.entry(at(x, y)?).or_insert(0) += 1;
-            total += 1;
+            if let Some(c) = at(x, y)? {
+                *counts.entry(c).or_insert(0) += 1;
+                total += 1;
+            }
         }
     }
     let (bg, _) = counts.iter().max_by_key(|(_, n)| **n)?;
@@ -263,6 +297,21 @@ mod tests {
         assert_eq!(resize_band(4, 4), 8);
         assert_eq!(resize_band(rescale(4, 96, 120), rescale(4, 96, 120)), 10);
         assert_eq!(resize_band(rescale(4, 96, 144), rescale(4, 96, 144)), 12);
+    }
+
+    /// Real Windows parks a maximised window one band above the work area,
+    /// Wine parks it a caption above; both come out at the work area's top.
+    #[test]
+    fn a_maximised_client_starts_at_the_top_of_the_work_area() {
+        assert_eq!(maximised_top_inset(-8, Some(0), 8), 8); // Windows, 100%
+        assert_eq!(maximised_top_inset(-12, Some(0), 12), 12); // Windows, 150%
+        assert_eq!(maximised_top_inset(-27, Some(0), 4), 27); // Wine, measured
+        // A taskbar on top: the work area starts below it.
+        assert_eq!(maximised_top_inset(32, Some(40), 8), 8);
+        // Nothing to ask, or nothing plausible: the band.
+        assert_eq!(maximised_top_inset(-8, None, 8), 8);
+        assert_eq!(maximised_top_inset(-8, Some(-20), 8), 8);
+        assert_eq!(maximised_top_inset(-900, Some(0), 8), 8);
     }
 
     // --- hit testing ---------------------------------------------------------
@@ -387,7 +436,7 @@ mod tests {
         let (w, h) = (300, 50);
         let strip = Rect { left: 154, top: 0, right: 300, bottom: 31 };
         let mut px = canvas(w, h, [0xfb, 0xfa, 0xfa, 0xff]);
-        assert_eq!(corner_is_clear(&px, w, h, strip), Some(true));
+        assert_eq!(corner_is_clear(&px, w, h, false, strip), Some(true));
         // A 14x14 dark glyph — Firefox's close button — in the middle of it.
         for y in 8..22 {
             for x in 260..274 {
@@ -395,18 +444,38 @@ mod tests {
                 px[o..o + 3].copy_from_slice(&[0x20, 0x20, 0x20]);
             }
         }
-        assert_eq!(corner_is_clear(&px, w, h, strip), Some(false));
+        assert_eq!(corner_is_clear(&px, w, h, false, strip), Some(false));
         // A glyph *outside* the strip is not the strip's business.
         let left = Rect { left: 0, top: 0, right: 100, bottom: 31 };
-        assert_eq!(corner_is_clear(&px, w, h, left), Some(true));
+        assert_eq!(corner_is_clear(&px, w, h, false, left), Some(true));
+    }
+
+    /// The rounded top-right corner of a CSD window is transparent, and it is
+    /// not a widget. With alpha honoured it is skipped; without, the same
+    /// buffer reads as a corner with something drawn in it.
+    #[test]
+    fn a_transparent_rounded_corner_is_not_a_widget() {
+        let (w, h) = (54, 30);
+        let strip = Rect { left: 0, top: 0, right: 54, bottom: 30 };
+        let mut px = canvas(w, h, [0xeb, 0xe9, 0xe9, 0xff]);
+        for y in 0..8 {
+            for x in (w - 8 + y)..w {
+                let o = ((y * w + x) * 4) as usize;
+                px[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+        assert_eq!(corner_is_clear(&px, w, h, true, strip), Some(true));
+        assert_eq!(corner_is_clear(&px, w, h, false, strip), Some(false));
+        let clear = canvas(w, h, [0, 0, 0, 0]);
+        assert_eq!(corner_is_clear(&clear, w, h, true, strip), None);
     }
 
     #[test]
     fn nothing_to_judge_is_none_not_a_verdict() {
         let strip = Rect { left: 0, top: 0, right: 10, bottom: 10 };
-        assert_eq!(corner_is_clear(&[], 0, 0, strip), None);
+        assert_eq!(corner_is_clear(&[], 0, 0, false, strip), None);
         let px = canvas(4, 4, [0; 4]);
         let off = Rect { left: 10, top: 10, right: 20, bottom: 20 };
-        assert_eq!(corner_is_clear(&px, 4, 4, off), None);
+        assert_eq!(corner_is_clear(&px, 4, 4, false, off), None);
     }
 }

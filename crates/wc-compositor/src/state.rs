@@ -2803,7 +2803,25 @@ impl State {
         // its windows are. Windows owns that (`control.rs`'s header), and the
         // only thing this side can truthfully say is "whatever you have, it
         // moved by this much".
-        if mapped && was != (gx, gy) {
+        //
+        // **§82: only when the extent is the bounding box, never a declared
+        // geometry.** A declared origin moving is a client changing its drop
+        // shadow, not a window moving: GTK re-declares `(26, 23)` as `(0, 0)`
+        // when Firefox is maximised — the shadow goes, the buffer is replaced
+        // by one without it, and the window rectangle is the same rectangle.
+        // Shifting the `HWND` by `(-26, -23)` there moved a *maximised* window
+        // off its monitor by the shadow, and the first 23 rows of Firefox's tab
+        // strip with it; measured under Wine (`origin shifted by -26,-23`, then
+        // the tab strip above the screen in the capture), and the same message
+        // would do the same on the guest. Every Wayland compositor keeps the
+        // window geometry where it is and moves the surface under it, which is
+        // what not shifting means here, and it is what §45.11's own unit test
+        // already says for the synthetic Win32: "a declared inset leaves the
+        // window where it was put". The bounding-box case — a subsurface
+        // growing the window leftwards — is the one §45.11 was about and is
+        // unchanged.
+        let declared = matches!(geometry, Some(r) if r.size.w > 0 && r.size.h > 0);
+        if mapped && was != (gx, gy) && !declared {
             self.ui.send(ToUi::ShiftOrigin {
                 id: wid,
                 dx: gx - was.0,
