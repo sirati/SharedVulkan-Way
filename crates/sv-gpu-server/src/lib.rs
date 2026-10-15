@@ -30,6 +30,7 @@ pub mod server;
 pub mod session;
 pub mod set_layout;
 pub mod table;
+pub mod video_log;
 pub mod workload;
 
 /// The reserved object id for "the arena's own `VkDeviceMemory`".

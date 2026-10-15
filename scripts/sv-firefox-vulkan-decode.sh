@@ -16,6 +16,12 @@
 #                  check fails
 #   SVFD_BIN       sv-icd / sv-gpu-server build (default: target/release — the
 #                  debug ICD overflows Firefox's Renderer stack in `lower_pnext`)
+#   SVFD_CLIP      an existing clip to play instead of the generated one
+#   SVFD_ARENA_MIB the GPU side's arena in MiB (default 96; the guest's slot holds 64)
+#   SVFD_GPU_LAYERS  VK_INSTANCE_LAYERS for the GPU side only, e.g.
+#                  VK_LAYER_SV_intel_shape:VK_LAYER_KHRONOS_validation
+#                  (docs/video-decode.md §7.10), with SVFD_GPU_LAYER_PATH added
+#                  to the loader's search path. Firefox never sees these.
 #
 # The topology is sv-firefox-wayland.sh's — the testhost one with the VM taken
 # out — with Xvfb in weston's place (see below): no DRI3, no dmabuf, the GPU side on
@@ -63,9 +69,13 @@ export XDG_RUNTIME_DIR="$RUN/xdg"
 # H.264 High in MP4, the codec and container every Firefox build can demux, and
 # the one the guest's Intel decodes (§1). Ten seconds, looped.
 say "an H.264 clip and a page that plays it"
-ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
-  -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
-  "$RUN/clip.mp4" || { echo "FAIL: ffmpeg could not make the clip"; exit 1; }
+if [ -n "${SVFD_CLIP:-}" ]; then
+  cp "$SVFD_CLIP" "$RUN/clip.mp4" || { echo "FAIL: no clip at $SVFD_CLIP"; exit 1; }
+else
+  ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
+    -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
+    "$RUN/clip.mp4" || { echo "FAIL: ffmpeg could not make the clip"; exit 1; }
+fi
 cat >"$RUN/play.html" <<'HTML'
 <!doctype html><title>starting</title>
 <video id=v src="clip.mp4" autoplay muted loop width=640></video>
@@ -118,7 +128,8 @@ for _ in $(seq 1 40); do [ -S "/tmp/.X11-unix/X${XDISPLAY#:}" ] && break; sleep 
 # One session per Firefox process that loads the ICD — glxtest, the Vulkan
 # probe, WebRender's Zink, the RDD decoder — each with its own arena.
 say "sv-gpu-server on $(basename "$(dirname "$(dirname "$(dirname "$ICD")")")")'s RADV"
-VK_DRIVER_FILES="$ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena $((96 << 20)) \
+VK_DRIVER_FILES="$ICD" VK_INSTANCE_LAYERS="${SVFD_GPU_LAYERS:-}" VK_ADD_LAYER_PATH="${SVFD_GPU_LAYER_PATH:-}" \
+  "$BIN/sv-gpu-server" serve --clients 16 --arena $((${SVFD_ARENA_MIB:-96} << 20)) \
   --socket "$RUN/gpu.sock" --idle $((SECS + 60)) >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 for _ in $(seq 1 40); do [ -S "$RUN/gpu.sock" ] && break; sleep 0.5; done

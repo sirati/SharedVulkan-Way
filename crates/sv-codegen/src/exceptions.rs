@@ -855,6 +855,43 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
     ),
 ];
 
+/// The generated commands whose driver call `GpuHost::observe` sees, before and
+/// after (docs/video-decode.md §7.10).
+///
+/// The guest's Intel driver faulted inside `vkCmdDecodeVideoKHR` replayed from a
+/// command blob after a thousand good frames (waycompose-design.md §87.12), and
+/// nothing on either side had recorded what that call was given: a recorded
+/// command has no reply, and the fault handler can only name the ring. So the
+/// video path's lifecycle is observable — sessions, their parameters, the
+/// images and views a DPB is made of, the coding scope and the decode itself,
+/// and the submits that run them — and `sv_gpu_server::video_log` writes one
+/// line per call *before* the driver sees it when `SV_VIDEO_LOG` is set.
+///
+/// Images, views and buffers are here for their lifetimes: the log only keeps
+/// the ones a video command uses, and it is the order of their destroys
+/// against the decodes that name them that the log exists to show. Every entry
+/// must be a generated command; a hand-written one calls the observer itself.
+pub const GPU_OBSERVED: &[&str] = &[
+    "vkGetPhysicalDeviceVideoCapabilitiesKHR",
+    "vkCreateVideoSessionKHR",
+    "vkDestroyVideoSessionKHR",
+    "vkCreateVideoSessionParametersKHR",
+    "vkUpdateVideoSessionParametersKHR",
+    "vkDestroyVideoSessionParametersKHR",
+    "vkCreateImage",
+    "vkDestroyImage",
+    "vkCreateImageView",
+    "vkDestroyImageView",
+    "vkDestroyBuffer",
+    "vkBindBufferMemory",
+    "vkCmdBeginVideoCodingKHR",
+    "vkCmdControlVideoCodingKHR",
+    "vkCmdDecodeVideoKHR",
+    "vkCmdEndVideoCodingKHR",
+    "vkQueueSubmit",
+    "vkQueueSubmit2",
+];
+
 /// Just the names, for the generator's set membership.
 pub fn gpu_hand_written() -> Vec<&'static str> {
     GPU_HAND_WRITTEN.iter().map(|(n, _)| *n).collect()

@@ -1332,6 +1332,272 @@ host-pointer-imported memory — an ivshmem BAR since §87 — with
 session cleanup (a command pool destroyed twice, fixed and proven on RADV), and by
 the rule of §86.5 steps 4–6 did not run.
 
+### 7.10 The fault in Intel's `vkCmdDecodeVideoKHR`: what is known, the instrument, and one guest run
+
+Branch `decode-reinit`, 2026-10-15, devhost. Nothing was run on the guest.
+
+**The root cause is not identified.** What follows is what the guest's logs do
+and do not say, what was reproduced locally and what was not, the instrument
+that will name the faulting call on the next guest run, and the causes still
+standing, ranked.
+
+#### 7.10.1 What the guest run actually shows
+
+waycompose-design.md §87.12 records `igvk64.dll+0x2f185b`, a read of `0x7c`,
+inside `vkCmdDecodeVideoKHR` replayed from a command blob, and reads the RDD
+log's last lines as coming from a *second decoder instance* (`MediaPDecoder #2`).
+**That reading is wrong.** `MediaPDecoder #1` and `#2` are the two threads of
+Firefox's decoder task queue, and they alternate frame by frame from the first
+frame. The RDD log (`/tmp/svgpu-soak/moz.log.child-2.moz_log` on testhost) has
+exactly one `Initialising Vulkan FFmpeg decoder` and one `Vulkan FFmpeg init
+successful`. What happens at each of the 10-second clip's loop points is a
+drain (`End of stream`) and `ProcessFlush()` — `avcodec_flush_buffers` — at log
+lines 1599–1612, 3105–3118 and 4611–4624, three times. No decoder is destroyed
+or re-created, and no SPS or PPS is re-sent: the clip (`clip.mp4`, x264 High,
+`keyint` 250, IDRs at packets 0 and 250) carries its parameter sets only in the
+`avcC` extradata.
+
+The last logged sample is `mTime=8233333` in the fourth loop, decode-order
+packets 245–247, a few packets before the second IDR (packet 250), and about 245
+frames *after* the third flush. The same packets decoded cleanly in loops 1–3.
+The MOZ_LOG file is buffered and the RDD process crashed later, so the log's
+end is not an exact time; the page's own count (`frames 1147 … err=3`, with
+`t` reaching 9.9 while no frame arrived) puts the stall at about that frame. So
+the fault **builds up over time or is a race**. It is not tied to the
+re-initialisation §87.12 suspected, which did not happen, nor to a particular
+frame of the stream.
+
+The fault report's ring lines do not name the faulting session:
+`crate::fault`'s slots are indexed by ring number and shared by every session
+of the process, so the `vkQueueSubmit` and `vkWaitForFences` it lists may
+belong to the WebRender or glxtest sessions. The backtrace
+(`cmd_decode_video_khr` ← `subdecode` ← `drain`) is the only part that is
+certainly the decoder's. The guest's GPU-side stderr from that run was not kept
+on testhost.
+
+#### 7.10.2 What Intel's ffmpeg path does that RADV's did not
+
+Every earlier local run took a different path through ffmpeg 9.0.1 than the
+guest did, because the two drivers answer differently:
+
+| | RADV (every earlier run) | Intel 101.7076 (guest) |
+|---|---|---|
+| `VK_KHR_video_maintenance2` | yes: SPS/PPS **inline** in every decode | no: a `VkVideoSessionParametersKHR` **object** |
+| `VK_KHR_video_maintenance1` | yes | no: buffers created against a profile list, plus an empty parameters object for the reset |
+| H.264 decode flags | `DPB_AND_OUTPUT_DISTINCT` (0x2) | `DPB_AND_OUTPUT_DISTINCT \| 0x10000` |
+| DPB slots, bitstream alignment | 17, 256/128 | 16, 4096/4096 |
+| `SEPARATE_REFERENCE_IMAGES` | set | **never recorded** |
+
+Both drivers lack `COINCIDE`, so ffmpeg uses a dedicated DPB on both. The first
+two rows, though, mean RADV never exercised the parameters-object path at all.
+`scripts/vk-intel-shape-layer.c` is a Vulkan layer, loaded **in the GPU side
+only** (`SVFD_GPU_LAYERS`), that makes RADV answer the way Intel does: it hides
+both maintenance extensions, caps H.264 at 16 slots, raises both alignments to
+4096 and clears `COINCIDE`; with `SV_SHAPE_SEPARATE_REFS=0` it also clears
+`SEPARATE_REFERENCE_IMAGES`, which gives ffmpeg's layered DPB. It only takes
+capabilities away, so the driver below can still do everything the application
+is told it can.
+
+#### 7.10.3 The instrument: `SV_VIDEO_LOG`
+
+`sv_gpu_server::video_log` writes one line per video call, **before** the
+driver sees it, from the arguments exactly as the driver receives them. So on a
+thread that dies inside the driver, the last `decode` line is the faulting call.
+`SV_VIDEO_LOG=1` writes to stderr; a path appends to a file, one unbuffered
+`write` per line. The hook is generated: `sv_codegen::exceptions::GPU_OBSERVED`
+names 18 commands, and their generated forwarders call `GpuHost::observe`
+before and after the driver call. Off, the cost is one call to `observing()`
+per observed command. `tests/gpu_observed.rs` checks that every entry is
+generated and calls the observer twice, and that nothing else does.
+`vkCreateBuffer` is hand-written and reports itself.
+
+It logs the capabilities the driver answered (including the general `flags`
+Intel's survey never recorded); sessions; parameters objects with each SPS
+and PPS id; images with a video usage, their views, bitstream buffers and their
+memory binding; every `begin`, `control`, `end` and `decode` with each slot,
+picture resource, view and layer; and the submits of command buffers that
+recorded video. It marks with `!!`:
+
+- a slot index outside the session's DPB;
+- a session, parameters object, image or view that is already destroyed, or
+  was never seen;
+- a reference not bound by the scope's `begin`, or bound to a different
+  resource;
+- a missing setup slot, codec link or standard struct, or NULL slice offsets;
+- a decode outside a coding scope, or a submit with a scope still open;
+- no live parameters object of the session carrying the picture's PPS;
+- and the **bytes at every slice offset**, read through the GPU side's own
+  mapping of the arena: a start code, an H.264 slice NAL, IDR agreeing with
+  `IdrPicFlag`, and a `pic_parameter_set_id` equal to the picture's.
+
+The last check is there because of how Intel's decoder works. Intel's hardware
+takes parsed slice parameters, and Vulkan Video gives a driver only slice
+offsets. Mesa's ANV therefore parses each slice header **on the CPU, from the
+bitstream buffer, at `vkCmdDecodeVideoKHR`** (`vk_video_parse_h264_slice_header`).
+That Intel's Windows driver does the same is an inference, not a measurement.
+If it does, the bytes are an *input to the recording*. A header naming a PPS
+the session lacks would be a NULL PPS to that parser, while AMD's firmware
+parses on the GPU and would at worst damage a frame.
+
+At a fault, `crate::fault`'s Windows filter now also writes:
+
+- the video log's last decode line;
+- live counts of sessions, parameters, video images, views and bitstream
+  buffers;
+- the command buffers with a coding scope still open;
+- all of it into the log file as well as to stderr;
+- and, when `SV_MINIDUMP=<file>` is set, a minidump from `MiniDumpWriteDump`
+  (thread stacks, data segments and indirectly referenced memory), so that the
+  structures the faulting frame points at can be read afterwards.
+
+The state is read with `try_lock`, so a thread that died holding it costs one
+line rather than a hang.
+
+Tests: `video_log`'s three unit tests (slice-header parsing through emulation
+prevention, view liveness, reading a raw `VkVideoDecodeInfoKHR`) run clean under
+Miri.
+
+#### 7.10.4 The local proof, and what it leaves
+
+`scripts/sv-firefox-vulkan-decode.sh 140` with the guest's own `clip.mp4`
+(`SVFD_CLIP`), the guest's 64 MiB arena (`SVFD_ARENA_MIB=64`), the readback
+Firefox 157.0.1, the GPU side shaped as Intel and under
+`VK_LAYER_KHRONOS_validation` with synchronisation validation, and
+`SV_VIDEO_LOG`:
+
+| | |
+|---|---|
+| frames decoded and read back | **4165**; page 4151, dropped 0, `err=none` |
+| loops | ~14 (13 flushes in the RDD log) |
+| decodes logged | 4167, of them 28 IDR |
+| parameters objects, sessions | 2 (the reset's empty one, destroyed after its wait, and one with sps0/pps0), 1 |
+| largest setup slot index | 4 (of 16) |
+| `!!` findings | **0**: every slice offset a slice NAL with pps 0, every view and image live, every reference bound by its `begin` |
+| validation, video and `SYNC-` messages | **0** |
+| validation, anything else | §7.5's three: `pHostPointer` NULL, `-03328`, `-04748`; plus Zink's dynamic-state messages (below) |
+
+Two shorter runs agree: 80 s with `SEPARATE_REFERENCE_IMAGES` as RADV reports
+it and 80 s with it cleared (the layered DPB), 2341 and 2368 frames, no video
+messages; and 115 s with the log alone, 3412 frames, 0 findings. RADV never
+handed out a destroyed view's address again: 6828 views created and 6818
+destroyed in 3414 decodes, two of each per frame, by ffmpeg's
+`ff_vk_decode_prepare_frame` and `ff_vk_decode_free_frame`.
+
+So the forwarder delivers what Firefox asked for, consistently, through more
+than three times the guest's frame count. The forwarder-side candidates the
+investigation started from are ruled out on this path:
+
+- a slot index beyond the DPB;
+- parameters or a session used after destroy (one parameters object lives for
+  the decoder's life);
+- inconsistent `begin` slots;
+- NULL standard structs;
+- nested-struct lowering, because the GPU-side validation layer sees what the
+  driver sees;
+- a stale handle reaching the driver as NULL. Handles are never NULLed: an
+  unknown id is a fatal table error, and ordering is `publish_recorded_first`'s
+  (docs/design.md §0.23).
+
+**What this leaves untested is precisely what differs on the guest:**
+
+- the arena imported as host pointers, slab by slab, from an ivshmem BAR (RADV
+  cannot import a host pointer at all, `sv_gpu_server::arena`);
+- the Windows GPU side;
+- and Intel's own internal state.
+
+NVIDIA imports host pointers and would cover the first. A `gpu-run` lease had
+12 jobs queued ahead, so it was not waited for.
+
+An application-side validation layer (in every Firefox process) was tried
+once. Firefox then never created its decode device, so that run says nothing
+about decode.
+
+Found on the way, not part of this fault: Zink, through the forwarder, records
+`VK_EXT_extended_dynamic_state3` commands that the validation layer says are
+not enabled (`VUID-vkCmdSet*-None-09423`, 40 each per run).
+`sv_gpu_server::driver` enables every feature struct it chains, and does not
+chain `VkPhysicalDeviceExtendedDynamicState3FeaturesEXT`.
+
+#### 7.10.5 The causes still standing, ranked
+
+Each one has to fit: Intel-only, invisible to RADV and to the validation layer,
+appearing after about a thousand frames, and not tied to a frame of the stream.
+
+1. **Intel keeps a DPB slot's picture by its view object, and ffmpeg destroys
+   views every frame.** ffmpeg creates the output and DPB views for each picture
+   and destroys them in `ff_vk_decode_free_frame` once the picture is released,
+   while the DPB slot that picture set up stays active for later decodes. The
+   specification binds a slot's picture through the view named *in each call*.
+   A driver that instead remembered the view from the setup decode would read a
+   freed object, and would only fault once its allocator had reused or cleared
+   that memory: no fixed frame, after enough churn. That is a driver defect if
+   so, and an exact workaround is cheap: the GPU side keeps one driver view per
+   image and view description alive until the image is destroyed. It is **not
+   applied**, because nothing yet shows it. The log names each slot's view on
+   every decode and says when a new view lands at a destroyed view's address.
+2. **The bitstream bytes Intel parses at record time are not the ones the
+   application wrote** — a visibility or ordering race on the guest's ivshmem
+   arena that RADV's GPU-side parsing would never notice. Bitstream buffers are
+   pooled (2 MiB each in the arena, rotated as decodes complete), so a slice
+   offset can land on an earlier frame's bytes if the write is not yet visible
+   through the guest's mapping when the blob is replayed. Locally every slice
+   offset held the right header 4167 times; the log reads the bytes at the same
+   instant on the guest and marks a mismatch.
+3. **A command buffer re-recorded while Intel still has it in flight.**
+   ffmpeg's exec pool waits on each command buffer's fence before reusing it,
+   and the app side orders the replay after that wait. A difference on the
+   guest's rings (four sessions on one GPU process) would show in the log as a
+   `begin` on a command buffer whose previous submit has not completed, or a
+   scope open at submit.
+
+Ruled out, from the coordinator's list:
+
+- **Query reuse:** ffmpeg 9.0.1 creates its decode exec pool with no queries.
+- **The bitstream offset or alignment wrapping:** `srcBufferOffset` is always
+  0, the range at most 28672 of a 2 MiB buffer, and the 4096 alignment was
+  emulated.
+- **DPB slot activation leaking:** slot indices stay within 0–4 across 28 IDRs
+  and 13 flushes. Whether Intel's *internal* activation state leaks is
+  candidate 1's question.
+
+#### 7.10.6 The one guest run
+
+One run, the §87.12 soak unchanged except for two variables and the build:
+
+1. Build both halves from this branch's commit, as §7.9 step 1 says:
+   `cargo build --release -p sv-icd` on the host, and
+   `cargo build --release -p sv-guest --target x86_64-pc-windows-gnu` for the
+   guest. Deploy them to the `wcgpu` test installation (`~/wc-launch-gpu` and
+   `C:\Users\<guest-user>\wcgpu`) as §87.6 did.
+2. Start the session as §87.6 did, with two variables added to `wc-launch.exe`'s
+   environment, which the GPU process inherits:
+   `SV_VIDEO_LOG=C:\Users\<guest-user>\wcgpu\vlog.txt` and
+   `SV_MINIDUMP=C:\Users\<guest-user>\wcgpu\gpu.dmp`. Keep `gpu.env`'s
+   `MOZ_LOG=PlatformDecoderModule:5,FFmpegVideo:5`.
+3. Drive Firefox with `~/svgpu-test/decode-drive.py` on the same
+   `/tmp/svgpu-soak/pages/play.html` and `clip.mp4`, for 16 × 2.5 s. If it
+   survives, run it once more for 60 s: §87.12 faulted at 38 s, and a
+   no-fault result needs at least twice that.
+4. Collect `vlog.txt`, `gpu.dmp` if written, the GPU process's stderr, the RDD
+   MOZ_LOG and the soak's JSONL.
+
+The pass/fail reading needs no judgement:
+
+- `vlog.txt`'s first lines must include `caps codec 0x1: flags …`. That is
+  also Intel's `SEPARATE_REFERENCE_IMAGES`, the one capability still unknown.
+- If it faults: the last `decode #N` line before `[gpu] FAULT` is the faulting
+  call, with every handle, slot and slice header it carried. A `!!` on it, or
+  on anything since the previous IDR, names the cause. No `!!` and a view on
+  that line created at a destroyed view's address points to candidate 1, and
+  the minidump shows what the faulting instruction's base register held.
+- If it does not fault: the run is still the first record of Intel's own
+  answers (`caps`, the parameters object, the view and slot pattern), and the
+  next step is the candidate-1 workaround behind a switch, measured against
+  this log.
+
+By §86.5's rule this is one run. A fault ends GPU work on the guest until it is
+read.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the

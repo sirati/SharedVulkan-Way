@@ -418,6 +418,17 @@ impl GpuHost for GpuServer {
         self.poisoned.remove(&command_buffer);
     }
 
+    fn observing(&self) -> bool {
+        crate::video_log::enabled()
+    }
+
+    fn observe(&self, command: &'static str, after: bool, args: &[u64], result: i32) {
+        // SAFETY: the generated dispatch calls this with the arguments it is
+        // about to pass, or has just passed, to the driver — `GpuHost::observe`'s
+        // contract, which is `video_log::observe`'s.
+        unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
+    }
+
     fn take_poisoned_command_buffer(&mut self) -> Option<&'static str> {
         self.dispatch_poison.take()
     }
@@ -660,6 +671,7 @@ impl GpuHost for GpuServer {
         let r = unsafe {
             f(a.device.0 as usize as _, &ci, core::ptr::null(), &mut buffer)
         };
+        crate::video_log::buffer_created(buffer as usize as u64, ci.usage.0, ci.size, r.0);
         if let Some(id) = a.p_buffer {
             self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
         }

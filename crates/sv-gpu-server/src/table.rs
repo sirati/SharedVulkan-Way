@@ -208,6 +208,18 @@ impl Objects {
         self.arena
     }
 
+    /// The arena offset of `offset` bytes into the driver allocation `memory`,
+    /// if `memory` is one of this session's arena slabs — the inverse of
+    /// [`Objects::arena_slab`], for `sv_gpu_server::video_log`, which has a
+    /// driver handle and wants the bytes behind it.
+    pub fn arena_offset_of(&self, memory: u64, offset: u64) -> Option<u64> {
+        if memory == 0 || offset >= self.slab_size {
+            return None;
+        }
+        let slab = self.slabs.iter().position(|s| s.is_some_and(|m| m.as_raw() == memory))?;
+        Some(slab as u64 * self.slab_size + offset)
+    }
+
     pub fn slab_size(&self) -> u64 {
         self.slab_size
     }
