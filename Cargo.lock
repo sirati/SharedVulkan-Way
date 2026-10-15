@@ -928,6 +928,7 @@ dependencies = [
  "sv-proto",
  "sv-transport",
  "sv-wire",
+ "wc-handle",
 ]
 
 [[package]]

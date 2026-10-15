@@ -26,8 +26,8 @@
 #   wc-session run  ID CMD PROFILE PREFS TITLEBAR [CHROME]
 #                                             run a Wayland client against that proxy;
 #                                             every word base64, `-` for an empty one
-#   wc-session gpu  ID N                      ask the host's root broker to locate the guest's N
-#                                             GPU sides and serve them as this user (§86)
+#   wc-session gpu  ID N                      serve the guest's GPU process's sessions to this
+#                                             session's ICDs, as this user, on ivshmem (§86, §87)
 #   wc-session audio ID                       the session's sound as raw PCM on stdout (§86)
 #   wc-session icon APPID                     the app's icon from this machine's theme
 #   wc-session down ID                        stop the proxy and remove the run directory
@@ -84,6 +84,10 @@ RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
 ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
 # IVSHMEM ARENA. Made by the VM's own unit, 0660 root:wc-arena (§83).
 ARENA="${WC_LAUNCH_ARENA:-/run/windows-vm/wc-arena/arena}"
+# The GPU sessions' arena, a second ivshmem device, and the doorbell port's
+# chardev socket; both made by the VM's own unit for the same group (§87).
+GPUREGION="${WC_LAUNCH_GPU_REGION:-/run/windows-vm/wc-arena/gpu}"
+BELL="${WC_LAUNCH_BELL:-/run/windows-vm/wc-arena/svbell.sock}"
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -521,6 +525,9 @@ run)
   if [ ${#GPUENV[@]} -gt 0 ]; then
     if [ -S "$D/icd.sock" ]; then
       GPUENV+=("SV_SOCKET=$D/icd.sock")
+      # The doorbell (§87): every ICD shares the one port through the hub
+      # `gpu` started, if the port was there to hold.
+      [ -S "$D/bell.sock" ] && GPUENV+=("SV_BELL=$D/bell.sock")
       GPU_ON=1
     else
       echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2
@@ -552,6 +559,16 @@ run)
     "$HOME"/.wc-launch/*)
       mkdir -p "$PROFILE" 2>/dev/null
       printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
+      # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
+      # session can end with Firefox still running -- `down`, the guest logging
+      # off, the VM host's proxy going -- and Firefox counts a run that did not
+      # end cleanly as a startup crash; after three in a row it puts a modal
+      # dialog in front of the next start, in a window the user did not ask for
+      # and on a desktop where nobody may be able to answer it. -1 turns the
+      # count off. Every launcher profile, always: it is a property of how this
+      # deployment ends Firefox, not of any one session.
+      printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
+        >> "$PROFILE/user.js"
       if [ ${#GPUENV[@]} -gt 0 ]; then
         printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
           >> "$PROFILE/user.js"
@@ -693,6 +710,8 @@ down)
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-audio-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-gpu-$ID" 2>/dev/null
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-gpu-$ID" 2>/dev/null
   if [ -f "$D/arena.plan" ]; then
     printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
       "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
@@ -702,31 +721,52 @@ down)
   ;;
 
 # --------------------------------------------------------------------- gpu ---
-# The forwarded GPU for one session (§86). The guest's launcher has started N
-# GPU sides and its tunnel has put their cold ports at $D/cold<i>.sock; this
-# asks the VM host's root broker (`sv-hostd broker`, started by the operator or
-# the machine's configuration, never by this script) to locate them and serve
-# them on $D/icd.sock **as this user**. No root here, and no fallback to a
-# root of our own: without the broker there is no GPU and `run` says so.
+# The forwarded GPU for one session (§86, §87). The guest's launcher has
+# started one GPU process on the GPU arena's ivshmem device and its tunnel has
+# put that process's port at $D/cold.sock. This starts `sv-hostd
+# ivshmem-serve` in a user unit, **as this user**: it opens $GPUREGION -- the
+# file QEMU backs the device's BAR with, 0660 root:wc-arena -- and serves every
+# ICD that connects to $D/icd.sock a session of its own, in a slot of the BAR it
+# checks before handing it over. With $BELL present it also holds the
+# doorbell's port and shares it with every ICD on $D/bell.sock. No root, no
+# broker, nothing that can read guest RAM: security-model.md R30.
+#
+# N is the guest's own cap on concurrent sessions and is only checked here.
 gpu)
-  ID="${1:-}"; check_id "$ID"; N="${2:-}"
+  ID="${1:-}"; check_id "$ID"; N="${2:-1}"
   case "$N" in [1-8]) ;; *) die "gpu: 1..8 sessions, not '$N'" ;; esac
   D=$(dir_of "$ID")
   [ -d "$D" ] || die "no session $ID"
-  BROKER="${WC_LAUNCH_BROKER:-/run/sv-hostd/broker.sock}"
-  [ -S "$BROKER" ] || die "no GPU broker at $BROKER (sv-hostd broker is not running on this host)"
   [ -x "$BIN/sv-hostd" ] || die "no $BIN/sv-hostd"
-  for i in $(seq 0 $((N - 1))); do
-    for _ in $(seq 1 100); do [ -S "$D/cold$i.sock" ] && break; sleep 0.05; done
-    [ -S "$D/cold$i.sock" ] || die "no cold socket $D/cold$i.sock: the guest's tunnel did not forward GPU side $i"
-  done
-  if ! "$BIN/sv-hostd" broker-request --broker "$BROKER" --dir "$D" --sessions "$N" >"$D/hostd.log" 2>&1; then
-    echo "wc-session: the broker refused or failed:" >&2
-    tail -6 "$D/hostd.log" | sed 's/^/  /' >&2
+  [ -r "$GPUREGION" ] && [ -w "$GPUREGION" ] \
+    || die "cannot open the GPU arena $GPUREGION as $(id -un) (is the VM's GPU ivshmem device configured, and this user in its group?)"
+  for _ in $(seq 1 100); do [ -S "$D/cold.sock" ] && break; sleep 0.05; done
+  [ -S "$D/cold.sock" ] || die "no cold socket $D/cold.sock: the guest's tunnel did not forward the GPU process"
+  UNIT="wc-launch-gpu-$ID"
+  BELLARGS=""
+  if [ -S "$BELL" ] && [ -w "$BELL" ]; then
+    BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
+  fi
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
+    printf 'rm -f %q %q\n' "$D/icd.sock" "$D/bell.sock"
+    printf 'exec %q ivshmem-serve --region %q --cold %q --socket %q %s >%q 2>&1\n' \
+      "$BIN/sv-hostd" "$GPUREGION" "$D/cold.sock" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
+  } >"$D/gpu.sh"
+  chmod 755 "$D/gpu.sh"
+  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
+    || die "systemd-run --user could not start $UNIT"
+  for _ in $(seq 1 100); do [ -S "$D/icd.sock" ] && break; sleep 0.05; done
+  if [ ! -S "$D/icd.sock" ]; then
+    echo "wc-session: sv-hostd ivshmem-serve never listened:" >&2
+    tail -6 "$D/hostd.log" 2>/dev/null | sed 's/^/  /' >&2
     exit 1
   fi
-  grep -o 'located [0-9/]* pages in [0-9.]*m\?s[^;]*' "$D/hostd.log" | sed 's/^/gpu /'
-  echo "gpu ok $N session(s) at $D/icd.sock"
+  grep -E 'doorbell' "$D/hostd.log" | sed 's/^sv-hostd: /gpu /'
+  echo "gpu ok up to $N session(s) at $D/icd.sock (as $(id -un), ivshmem $GPUREGION$([ -S "$D/bell.sock" ] && echo ', doorbell'))"
   ;;
 
 # ------------------------------------------------------------------- audio ---

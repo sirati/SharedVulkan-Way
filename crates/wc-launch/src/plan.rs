@@ -144,11 +144,11 @@ pub fn tunnel_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
         "-R".into(),
         format!("{}:127.0.0.1:{}", remote_upstream(id), cfg.port),
     ]);
-    // §86. One reverse forward per GPU side: `$D/cold<i>.sock` on the VM host
-    // reaches that side's cold port here, which is where `sv-hostd` (started
-    // by the host's broker) takes its Hello.
-    for i in 0..cfg.gpu_sessions {
-        a.extend(["-R".into(), format!("{}/cold{i}.sock:127.0.0.1:{}", remote_dir(id), cfg.gpu_port(i))]);
+    // §86, §87. One reverse forward for the GPU process: `$D/cold.sock` on the
+    // VM host reaches its port here. Each connection the host's
+    // `sv-hostd ivshmem-serve` makes through it is one session, in its own slot.
+    if cfg.gpu_sessions > 0 {
+        a.extend(["-R".into(), format!("{}/cold.sock:127.0.0.1:{}", remote_dir(id), cfg.gpu_port())]);
     }
     // §86. The session's sound, the other way: a loopback port here that
     // reaches the PulseAudio monitor socket `wc-session` made for this session.
@@ -704,20 +704,31 @@ mod audio_tests {
     }
 }
 
-/// §86. The i-th GPU side: `sv-guest.exe gpu guest`, its own cold port, its own
-/// large-page arena (the GPU side refuses `VirtualLock` pages unless told
-/// otherwise, §86), alive as long as the session may be.
-pub fn gpu_argv(cfg: &Config, i: u32) -> Vec<String> {
-    vec![
+/// §86, §87. The GPU process: `sv-guest.exe gpu guest` on the GPU arena's
+/// ivshmem device, one port, up to `gpu-sessions` sessions at once in slots of
+/// the BAR, and the doorbell port if the ini names one. `--idle` is how long a
+/// session waits for its application to claim its rings once the host has
+/// asked for it, which is seconds, not the session's life: the process lives
+/// as long as the launcher session, which kills it.
+pub fn gpu_argv(cfg: &Config) -> Vec<String> {
+    let mut a: Vec<String> = vec![
         "gpu".into(),
         "guest".into(),
         "--port".into(),
-        cfg.gpu_port(i).to_string(),
+        cfg.gpu_port().to_string(),
+        "--ivshmem-slot".into(),
+        format!("{:#04x}", cfg.gpu_ivshmem_slot),
         "--arena".into(),
         (cfg.gpu_arena_mib << 20).to_string(),
+        "--sessions".into(),
+        cfg.gpu_sessions.to_string(),
         "--idle".into(),
-        cfg.session_secs.to_string(),
-    ]
+        "60".into(),
+    ];
+    if !cfg.gpu_bell.is_empty() {
+        a.extend(["--bell".into(), cfg.gpu_bell.clone()]);
+    }
+    a
 }
 
 #[cfg(test)]
@@ -725,17 +736,21 @@ mod gpu_tests {
     use super::*;
 
     #[test]
-    fn each_gpu_side_has_its_port_and_its_reverse_forward() {
+    fn the_gpu_process_has_one_port_one_forward_and_its_device() {
         let mut c = Config { host: "u@h".into(), ..Config::default() };
         assert!(!tunnel_argv(&c, "kh", "wcl-1").iter().any(|x| x.contains("cold")));
-        c.gpu_sessions = 2;
+        c.gpu_sessions = 3;
         let a = tunnel_argv(&c, "kh", "wcl-1");
         let colds: Vec<&String> = a.iter().filter(|x| x.contains("/cold")).collect();
-        assert_eq!(colds, [&format!("/tmp/wc-launch/wcl-1/cold0.sock:127.0.0.1:{}", c.port + 10),
-                           &format!("/tmp/wc-launch/wcl-1/cold1.sock:127.0.0.1:{}", c.port + 11)]);
-        let g = gpu_argv(&c, 1);
-        assert_eq!(&g[..4], ["gpu", "guest", "--port", &(c.port + 11).to_string()]);
+        assert_eq!(colds, [&format!("/tmp/wc-launch/wcl-1/cold.sock:127.0.0.1:{}", c.port + 10)]);
+        let g = gpu_argv(&c);
+        assert_eq!(&g[..6], ["gpu", "guest", "--port", &(c.port + 10).to_string(), "--ivshmem-slot", "0x1d"]);
+        let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
+        assert_eq!(after("--sessions"), Some("3"));
+        assert_eq!(after("--bell"), Some("org.sirati.svbell.0"));
         assert!(!g.iter().any(|x| x.contains("small-pages")), "the launcher never asks for small pages");
+        c.gpu_bell.clear();
+        assert!(!gpu_argv(&c).iter().any(|x| x == "--bell"));
         assert_eq!(a.last().unwrap(), "u@h");
     }
 }

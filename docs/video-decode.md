@@ -1319,6 +1319,19 @@ when a session has a forwarded GPU and the browser carries the readback marker,
 but GPU work on the guest is suspended until the Intel driver fault of `waycompose-design.md` §86.4 is
 fixed on the forwarder's side.
 
+**Later the same day (`waycompose-design.md` §87): steps 2 and 3 ran on the
+guest.** Step 2 needed a fix first: Intel's driver writes four bytes past
+`VkVideoDecodeCapabilitiesKHR`, which corrupted the GPU side's heap
+(`STATUS_HEAP_CORRUPTION`) until every allocation handed to a driver got guard
+bytes; with them the capabilities through the forwarder are §1's survey, except
+one decode queue where the driver has two. **Step 3 passed**: 24 frames,
+`sha256 b3a1374e…`, byte-identical to libavcodec, the bitstream buffer bound into
+host-pointer-imported memory — an ivshmem BAR since §87 — with
+`VIDEO_DECODE_SRC`, so §7.9's first question is answered yes; submit→fence median
+1.027 ms. The run ended with a fault in `igvk64.dll` in the GPU side's own
+session cleanup (a command pool destroyed twice, fixed and proven on RADV), and by
+the rule of §86.5 steps 4–6 did not run.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the

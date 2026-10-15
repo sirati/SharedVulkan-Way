@@ -840,7 +840,30 @@ process that can open the device can hold the mapping and keep the compositor
 from starting, or read the arena while it has it. On testhost the guest has one
 interactive account. §83.8 records which accounts the device actually opens for.
 
+*Since `waycompose-design.md` §87 the group reaches two more things.* **The GPU
+sessions' arena**, `/run/windows-vm/wc-arena/gpu`, 256 MiB: each session's
+control region and its arena, so a member can read every host-visible buffer a
+forwarded application has (command blobs, staging uploads, read-back frames) and
+**write a session's rings**, which is to say send Vulkan commands to the guest's
+GPU driver. That is new in kind: §86.5 recorded a fault in that driver stopping
+the VM, so a member can try to make the driver fault. It is the same reach the
+user running the forwarded application already has, and `sirati` is that user.
+**The doorbell's socket**, `svbell.sock`: a member can send spurious wakes,
+which cost a syscall each, or hold QEMU's one connection and leave every session
+without a doorbell, which makes it slow and not wrong. Both are recreated by the
+VM's unit and given the group by it. *Mitigation, unchanged:* one member, in
+`wheel`.
+
 ### R30 — The GPU broker hands its group the guest's memory
+
+**Resolved by `waycompose-design.md` §87, by removal.** The GPU sessions' arena
+moved onto a second ivshmem device whose file the user opens with R29's group
+bit; `sv-hostd ivshmem-serve` runs as the user, refuses to run as root, and
+locates nothing, so nothing on the launch path holds QEMU's memory backend and
+nobody is handed `/proc/<pid>/fd/<n>` for all of guest RAM. The broker was never
+started on testhost. Its code stays for the developer harnesses, which keep
+the guest-RAM arena and their root, and the entry below stays as the record of
+what it would cost to start it.
 
 Added 2026-10-15 with `waycompose-design.md` §86. `sv-hostd broker` is a root
 daemon that the desktop launcher's `wc-session gpu` asks for GPU sessions. It

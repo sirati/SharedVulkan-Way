@@ -207,9 +207,54 @@ pub unsafe fn invalidate(page: *mut u8) -> Option<u64> {
     Header::decode(&old).ok().map(|h| h.generation)
 }
 
+/// Which of `paths` — ivshmem device interface paths — is the device in
+/// root-bus slot `slot`, function 0 (waycompose-design.md §87).
+///
+/// A device interface path ends `#<instance id>#{guid}`, and a PCI instance
+/// id's last `&`-component is the devfn in hex, `slot << 3 | function`: the
+/// compositor's device at slot 0x1c is `…&0&E0`, the GPU arena's at 0x1d is
+/// `…&0&E8`. Matched case-insensitively and on the whole last component only.
+/// Here rather than in `platform::windows` because it is string handling,
+/// which this machine can test.
+pub fn path_for_slot(paths: &[String], slot: u8) -> Option<String> {
+    let devfn = format!("{:02x}", u16::from(slot) << 3);
+    paths
+        .iter()
+        .find(|p| {
+            let lower = p.to_ascii_lowercase();
+            let mut parts = lower.rsplitn(3, '#');
+            let _guid = parts.next();
+            let instance = parts.next().unwrap_or("");
+            instance.rsplit('&').next() == Some(devfn.as_str())
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two devices testhost has (§83, §87), as the setup API spells
+    /// them; slot 0x1c is `E0`, 0x1d is `E8`, and a slot with no device is
+    /// `None` rather than a near miss.
+    #[test]
+    fn a_slot_names_one_device_by_its_devfn() {
+        let paths = vec![
+            r"\\?\pci#ven_1af4&dev_1110&subsys_11001af4&rev_01#3&267a616a&0&e0#{df576976-569d-4672-95a0-f57e4ea0b210}".to_string(),
+            r"\\?\pci#ven_1af4&dev_1110&subsys_11001af4&rev_01#3&267a616a&0&e8#{df576976-569d-4672-95a0-f57e4ea0b210}".to_string(),
+        ];
+        assert_eq!(path_for_slot(&paths, 0x1c).as_deref(), Some(paths[0].as_str()));
+        assert_eq!(path_for_slot(&paths, 0x1d).as_deref(), Some(paths[1].as_str()));
+        assert_eq!(path_for_slot(&paths, 0x1e), None);
+        // A devfn that appears as an earlier component of the instance id is
+        // not the device's; only the last component counts.
+        assert_eq!(path_for_slot(&paths, 0x01), None);
+        let tricky = vec![r"\\?\pci#ven_1af4&dev_1110#3&e0&0&e8#{guid}".to_string()];
+        assert_eq!(path_for_slot(&tricky, 0x1c), None);
+        assert_eq!(path_for_slot(&tricky, 0x1d).as_deref(), Some(tricky[0].as_str()));
+        let upper: Vec<String> = paths.iter().map(|p| p.to_ascii_uppercase()).collect();
+        assert_eq!(path_for_slot(&upper, 0x1d).as_deref(), Some(upper[1].as_str()));
+    }
 
     fn h() -> Header {
         Header {

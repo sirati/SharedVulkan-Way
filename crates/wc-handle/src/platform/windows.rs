@@ -1002,7 +1002,48 @@ struct IvshmemMmap {
 ///   allows one per device and keeps it until the handle that made it closes,
 ///   so a compositor that is already running holds it.
 pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
-    let path = ivshmem_path(index)?;
+    let paths = ivshmem_paths()?;
+    let path = paths.get(index as usize).cloned().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no ivshmem device {index} of {} (interface {{df576976-569d-4672-95a0-f57e4ea0b210}}): \
+                 the VM has no such ivshmem-plain device, or its driver is not installed",
+                paths.len()
+            ),
+        )
+    })?;
+    map_ivshmem_path(path)
+}
+
+/// The ivshmem device in PCI slot `slot` of the root bus, mapped as
+/// [`map_ivshmem`] maps one.
+///
+/// # Why a slot and not an index (waycompose-design.md §87)
+///
+/// Since the GPU sessions' arena became a second ivshmem device, "device 0" is
+/// a question about enumeration order. [`map_ivshmem`] sorts the interfaces by
+/// path, which makes the order stable, but which device comes first is still a
+/// fact about two strings rather than about the VM's configuration. The slot
+/// is what the VM's configuration pins (`waycomposeArena.pciAddress`), and it
+/// is in the device instance path as the last component: `…&0&E8` is device
+/// 0x1d function 0, because that component is `devfn = slot << 3 | function`.
+pub fn map_ivshmem_slot(slot: u8) -> io::Result<(MappedView, u64, String)> {
+    let paths = ivshmem_paths()?;
+    let path = crate::ivshmem::path_for_slot(&paths, slot).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no ivshmem device in PCI slot {slot:#04x} among the {} present ({paths:?}): the \
+                 VM has no ivshmem-plain device at that address, or its driver is not installed",
+                paths.len()
+            ),
+        )
+    })?;
+    map_ivshmem_path(path)
+}
+
+fn map_ivshmem_path(path: String) -> io::Result<(MappedView, u64, String)> {
     let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: a live NUL-terminated path; no security attributes, no template.
     let handle = unsafe {
@@ -1088,7 +1129,26 @@ pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
     Ok((view, size, path))
 }
 
-/// The device path of the `index`th present ivshmem interface.
+/// Every present ivshmem interface's device path, **sorted**.
+///
+/// Sorted so that an index names the same device every time: the setup API
+/// returns the registry's order, which nothing promises. With one device the
+/// question did not arise; with the GPU arena's second device it does.
+fn ivshmem_paths() -> io::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for index in 0..64 {
+        match ivshmem_path(index) {
+            Ok(p) => paths.push(p),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// The device path of the `index`th present ivshmem interface, in the setup
+/// API's order.
 fn ivshmem_path(index: u32) -> io::Result<String> {
     // SAFETY: a static GUID, no enumerator, no window; the result is checked
     // and destroyed on every path below.

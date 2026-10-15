@@ -91,7 +91,79 @@ mod sys {
         pub fn FlushFileBuffers(h: isize) -> i32;
         pub fn CloseHandle(h: isize) -> i32;
         pub fn GetLastError() -> u32;
+        pub fn CreateEventW(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> isize;
+        pub fn GetOverlappedResult(h: isize, ov: *mut Overlapped, done: *mut u32, wait: i32) -> i32;
     }
+
+    pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    pub const ERROR_IO_PENDING: u32 = 997;
+
+    /// `OVERLAPPED`, x64: two `ULONG_PTR`s, the offset pair, the event.
+    #[repr(C)]
+    pub struct Overlapped {
+        pub internal: usize,
+        pub internal_high: usize,
+        pub offset: u32,
+        pub offset_high: u32,
+        pub event: isize,
+    }
+}
+
+/// One overlapped `ReadFile` or `WriteFile`, waited for.
+///
+/// waycompose-design.md §87. **A synchronous handle serialises every I/O on
+/// it**: the I/O manager holds the file object's lock for the whole call, so
+/// while the doorbell's reader sits in `ReadFile` waiting for a byte, a
+/// `WriteFile` from any other thread on the same handle waits behind it — and
+/// a virtio-serial port takes one opener, so there is no second handle to
+/// write through. The first run with a doorbell on the Windows GPU side hung
+/// exactly so: the first reply's bell blocked the ring thread behind the
+/// reader, and no command after it was served. Opened overlapped, each call
+/// carries its own `OVERLAPPED` and the two directions are independent.
+#[cfg(windows)]
+fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
+    // SAFETY: a fresh manual-reset event, closed below on every path.
+    let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+    if event == 0 {
+        return Err(unsafe { sys::GetLastError() });
+    }
+    let mut ov = sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event };
+    let mut done: u32 = 0;
+    // SAFETY: `buf` is valid for `len` bytes for the duration of the call,
+    // which does not return before the operation has completed: either the
+    // call finishes synchronously or `GetOverlappedResult` waits for it.
+    let ok = unsafe {
+        let ovp = (&raw mut ov).cast::<core::ffi::c_void>();
+        if write {
+            sys::WriteFile(handle, buf, len, &mut done, ovp)
+        } else {
+            sys::ReadFile(handle, buf, len, &mut done, ovp)
+        }
+    };
+    let result = if ok != 0 {
+        // Completed at once; `done` may not be set on an overlapped handle,
+        // so the count is taken from the overlapped record either way.
+        let mut n = 0u32;
+        if unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 0) } != 0 {
+            Ok(n)
+        } else {
+            Ok(done)
+        }
+    } else {
+        let e = unsafe { sys::GetLastError() };
+        if e != sys::ERROR_IO_PENDING {
+            Err(e)
+        } else {
+            let mut n = 0u32;
+            if unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 1) } != 0 {
+                Ok(n)
+            } else {
+                Err(unsafe { sys::GetLastError() })
+            }
+        }
+    };
+    unsafe { sys::CloseHandle(event) };
+    result
 }
 
 #[cfg(windows)]
@@ -106,6 +178,10 @@ pub struct Pipe {
     /// Servers disconnect before closing so the next `ConnectNamedPipe` on a
     /// reused instance behaves; clients simply close.
     server: bool,
+    /// Opened with `FILE_FLAG_OVERLAPPED` (the virtio-serial ports, §87), so
+    /// reads and writes go through [`overlapped_io`] and do not wait for each
+    /// other.
+    overlapped: bool,
 }
 
 #[cfg(windows)]
@@ -183,12 +259,12 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
                     0,
                     core::ptr::null_mut(),
                     sys::OPEN_EXISTING,
-                    0,
+                    sys::FILE_FLAG_OVERLAPPED,
                     0,
                 )
             };
             if handle != sys::INVALID_HANDLE_VALUE {
-                return Ok(Pipe { handle, server: false });
+                return Ok(Pipe { handle, server: false, overlapped: true });
             }
             last = unsafe { sys::GetLastError() } as i32;
         }
@@ -239,7 +315,7 @@ impl Pipe {
             unsafe { sys::CloseHandle(handle) };
             return Err(Error::Os { call: "ConnectNamedPipe", errno: e });
         }
-        Ok(Pipe { handle, server: true })
+        Ok(Pipe { handle, server: true, overlapped: false })
     }
 
     /// Connect to a pipe the peer is serving, waiting up to `timeout_ms` for it
@@ -265,7 +341,7 @@ impl Pipe {
                 )
             };
             if handle != sys::INVALID_HANDLE_VALUE {
-                return Ok(Pipe { handle, server: false });
+                return Ok(Pipe { handle, server: false, overlapped: false });
             }
             if std::time::Instant::now() >= deadline {
                 return Err(Error::Os {
@@ -300,12 +376,22 @@ impl std::io::Read for &Pipe {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut got: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
-        // SAFETY: `buf` is valid for `len` bytes and `handle` is live.
-        let ok = unsafe {
-            sys::ReadFile(self.handle, buf.as_mut_ptr(), len, &mut got, core::ptr::null_mut())
+        let failed = if self.overlapped {
+            match overlapped_io(self.handle, false, buf.as_mut_ptr(), len) {
+                Ok(n) => {
+                    got = n;
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        } else {
+            // SAFETY: `buf` is valid for `len` bytes and `handle` is live.
+            let ok = unsafe {
+                sys::ReadFile(self.handle, buf.as_mut_ptr(), len, &mut got, core::ptr::null_mut())
+            };
+            (ok == 0).then(|| unsafe { sys::GetLastError() })
         };
-        if ok == 0 {
-            let e = unsafe { sys::GetLastError() };
+        if let Some(e) = failed {
             // A closed pipe reads as an error, and the layer above wants EOF —
             // `stream::read_message` turns a zero-length read into "the cold
             // path closed", which is the message a human needs.
@@ -351,6 +437,13 @@ impl std::io::Write for &Pipe {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut put: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
+        if self.overlapped {
+            // The buffer is only read; `overlapped_io` takes `*mut` for both
+            // directions.
+            return overlapped_io(self.handle, true, buf.as_ptr().cast_mut(), len)
+                .map(|n| n as usize)
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32));
+        }
         // SAFETY: `buf` is valid for `len` bytes and `handle` is live.
         let ok = unsafe {
             sys::WriteFile(self.handle, buf.as_ptr(), len, &mut put, core::ptr::null_mut())
@@ -362,6 +455,12 @@ impl std::io::Write for &Pipe {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        // An overlapped write has completed when `overlapped_io` returns, and
+        // a flush on the handle is one more call that could queue behind the
+        // reader on a driver that serialises it; there is nothing to flush.
+        if self.overlapped {
+            return Ok(());
+        }
         // SAFETY: `handle` is live.
         unsafe { sys::FlushFileBuffers(self.handle) };
         Ok(())

@@ -87,6 +87,9 @@ HOSTLINK="${WC_LAUNCH_HOSTLINK:-<host-user>@<host-nat-ip>}"
 # no `bin/firefox` in it at all, so neither that path nor `command -v firefox`
 # nor `/run/current-system/sw/bin/firefox` is an answer on this machine.
 FIREFOX="${WC_LAUNCH_FIREFOX:-firefox}"
+# The profile, which must be under the VM host's ~/.wc-launch for `run` to write
+# its user.js; a second installation that may run beside the first needs its own.
+# WC_LAUNCH_PROFILE.
 NATIVE_FIREFOX='C:\Program Files\Mozilla Firefox\firefox.exe'
 
 ARENA_MIB="${WC_LAUNCH_ARENA_MIB:-64}"
@@ -102,8 +105,10 @@ AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
 # ICD to the host, and writes `gpu-sessions = N` into the ini. gpu.env itself is
 # written on the host only with WC_LAUNCH_GPU_ENV=write; otherwise deploy prints
-# what it would contain. Either way the host also needs `sv-hostd broker`
-# running as root (docs/waycompose-design.md §86 has the command).
+# what it would contain. Since §87 nothing on either machine runs as root for
+# it: the guest's VM needs the GPU arena's ivshmem device (slot WC_LAUNCH_GPU_SLOT,
+# default 0x1d) and, for the doorbell, the port WC_LAUNCH_GPU_BELL; the host user
+# needs the device's group.
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
@@ -424,11 +429,13 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
+gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 
 [app.firefox]
 title = $TITLE
 icon  = firefox
-exec  = $FIREFOX --profile ~/.wc-launch/firefox
+exec  = $FIREFOX --profile ${WC_LAUNCH_PROFILE:-~/.wc-launch/firefox}
 prefs = middlemouse.paste=false${WC_LAUNCH_EXTRA_PREFS:+;$WC_LAUNCH_EXTRA_PREFS}
 # §82: the default, named so the deployed ini says which arrangement it ran.
 # WC_LAUNCH_TITLEBAR=none runs the opt-out.

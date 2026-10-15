@@ -39,7 +39,7 @@ struct Push {
 /// note in `build.rs`.
 const ARENA_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arena.spv"));
 
-fn spv_words() -> Result<Vec<u32>> {
+pub(crate) fn spv_words() -> Result<Vec<u32>> {
     if ARENA_SPV.is_empty() {
         return Err(DriverError::Other(
             "this build has no compute shader: glslangValidator was not on PATH \

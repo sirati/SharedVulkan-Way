@@ -73,6 +73,8 @@ use std::sync::Arc;
 
 pub mod broker;
 #[cfg(target_os = "linux")]
+pub mod ivshmem;
+#[cfg(target_os = "linux")]
 pub mod locate;
 #[cfg(target_os = "linux")]
 pub mod qemu;

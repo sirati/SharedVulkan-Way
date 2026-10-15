@@ -770,71 +770,64 @@ mod win {
         comp_log: std::path::PathBuf,
     }
 
-    /// The forwarded GPU (§86): `gpu-sessions` GPU sides, each `sv-guest.exe gpu
-    /// guest` on its own cold port with its own large-page arena, then
-    /// `wc-session gpu ID N`, which asks the VM host's root broker to locate
-    /// them and serve them to this session's Firefox as the user.
+    /// The forwarded GPU (§86, §87): one `sv-guest.exe gpu guest` on the GPU
+    /// arena's ivshmem device, serving up to `gpu-sessions` sessions in slots
+    /// of its BAR, then `wc-session gpu ID N`, which starts this session's
+    /// `sv-hostd ivshmem-serve` on the VM host **as the user**. No root on
+    /// either machine: the guest maps a device its driver hands to any user,
+    /// and the host opens the device's backing file with a group bit.
     ///
-    /// Started after the proxy, so a failure before here leaves no pinned
-    /// memory behind; every failure from here kills what it started and
-    /// returns none, and the host then gives Firefox no GPU environment, so it
-    /// renders in software rather than failing to start its renderer.
+    /// Started after the proxy; every failure from here kills what it started
+    /// and returns none, and the host then gives Firefox no GPU environment, so
+    /// it renders in software rather than failing to start its renderer.
     fn start_gpu(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Vec<Child> {
         let t = Instant::now();
-        let mut kids: Vec<Child> = Vec::new();
-        let mut logs = Vec::new();
-        for i in 0..cfg.gpu_sessions {
-            let path = p.state_dir.join(format!("wc-launch-{}-gpu{i}.log", cfg.session));
-            let _ = std::fs::remove_file(&path);
-            let file = match std::fs::File::create(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
-                    break;
-                }
-            };
-            match Command::new(&cfg.compositor)
-                .args(plan::gpu_argv(cfg, i))
-                .creation_flags(CREATE_NO_WINDOW)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(file))
-                .spawn()
-            {
-                Ok(c) => {
-                    kids.push(c);
-                    logs.push(path);
-                }
-                Err(e) => {
-                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
-                    break;
-                }
+        let path = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
+        let _ = std::fs::remove_file(&path);
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                return Vec::new();
             }
-        }
-        let give_up = |kids: &mut Vec<Child>, log: &mut Log, why: String| {
-            for k in kids.iter_mut() {
-                let _ = k.kill();
+        };
+        let mut kid = match Command::new(&cfg.compositor)
+            .args(plan::gpu_argv(cfg))
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
+                return Vec::new();
             }
+        };
+        let give_up = |kid: &mut Child, log: &mut Log, why: String| {
+            let _ = kid.kill();
             log.say(&format!("gpu: {why}; no forwarded GPU this session, the host renders in software"));
             Vec::new()
         };
-        if kids.len() != cfg.gpu_sessions as usize {
-            return give_up(&mut kids, log, "not every GPU side started".into());
+        if wait_for(&path, 30, |l| l.contains("publishing the extent").then_some(())).is_err() {
+            let tail = std::fs::read_to_string(&path).unwrap_or_default();
+            let last = tail.lines().last().unwrap_or("").to_string();
+            return give_up(&mut kid, log, format!("{} never published ({last})", path.display()));
         }
-        for path in &logs {
-            if wait_for(path, 30, |l| l.contains("publishing the extent").then_some(())).is_err() {
-                let tail = std::fs::read_to_string(path).unwrap_or_default();
-                let last = tail.lines().last().unwrap_or("").to_string();
-                return give_up(&mut kids, log, format!("{} never published ({last})", path.display()));
-            }
+        // The guest's own account of the device and the doorbell, for the log:
+        // the two lines that say whether this session has a slot plan and a bell.
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for l in text.lines().filter(|l| l.contains("ivshmem slot") || l.contains("doorbell")) {
+            log.say(&format!("gpu: {}", l.trim()));
         }
         let n = cfg.gpu_sessions.to_string();
         match ssh(cfg, p, &["gpu", id, &n]) {
             Ok(s) => {
                 log.say(&format!("gpu: {} ({} ms)", s.replace('\n', " | "), t.elapsed().as_millis()));
-                kids
+                vec![kid]
             }
-            Err(e) => give_up(&mut kids, log, format!("the host said: {e}")),
+            Err(e) => give_up(&mut kid, log, format!("the host said: {e}")),
         }
     }
 

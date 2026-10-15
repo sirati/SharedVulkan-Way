@@ -173,9 +173,9 @@ pub enum ServeEnd {
 ///
 /// Runs until the port closes or `stop` is set, so it belongs on its own thread
 /// — see [`Doorman::spawn`], which is the form callers should use.
-pub fn serve_port<R: Read>(
+pub fn serve_port<R: Read, T: BellTarget + ?Sized>(
     mut port: R,
-    control: &Control,
+    target: &T,
     stop: &AtomicBool,
     woken: &AtomicU64,
 ) -> ServeEnd {
@@ -203,14 +203,37 @@ pub fn serve_port<R: Read>(
         // Several bytes may arrive in one read when the peer rang more than one
         // lane before this thread was scheduled. Each is independent.
         for &token in &buf[..n] {
+            target.ring_token(token, woken);
+        }
+    }
+}
+
+/// Where a doorbell byte is delivered: one session's control region, or every
+/// live session's (waycompose-design.md §87).
+///
+/// A virtio-serial port takes one opener, so a guest process serving several
+/// sessions has one port for all of them, and a byte carries a slot and a lane
+/// but not a session. Ringing that lane in **every** session is correct by this
+/// module's own framing argument: the session the byte was meant for wakes, and
+/// in every other one it is a spurious wake on a lane that then finds its ring
+/// empty, which costs one syscall.
+pub trait BellTarget: Send + Sync {
+    /// Ring the lane `token` names, counting each delivery in `woken` before
+    /// making it. Returns whether anything was rung.
+    fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool;
+}
+
+impl BellTarget for Control {
+    fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
+        {
             let (slot, lane) = crate::park::lane_from_token(token);
             // Every failure here is a *bad token*, and the right response to one
             // is to ignore it: a slot out of range or a ring that is not mapped
             // is a stale or corrupt byte, and this module's framing argument is
             // that such a byte must cost nothing. Erroring out would let one
             // stray byte take the doorbell down for the whole session.
-            let Ok(ctrl) = RingCtrl::open(control, slot) else { continue };
-            let Ok(bell) = ctrl.bell(lane) else { continue };
+            let Ok(ctrl) = RingCtrl::open(self, slot) else { return false };
+            let Ok(bell) = ctrl.bell(lane) else { return false };
             // COUNT BEFORE RINGING, and the order is the whole of it.
             //
             // `ring_local` is what makes the wake observable: the waiter it
@@ -237,7 +260,61 @@ pub fn serve_port<R: Read>(
             // thing checked, and it made a shared gate red for everyone.
             woken.fetch_add(1, Ordering::Relaxed);
             bell.ring_local();
+            true
         }
+    }
+}
+
+/// Every live session's control region, for a process that serves several
+/// over one port (§87). Sessions join with [`ControlSet::add`] and leave by
+/// being dropped: the set holds them weakly, so a session that has ended is
+/// not kept alive by its doorbell, and is pruned at the next byte.
+#[derive(Default)]
+pub struct ControlSet {
+    members: std::sync::Mutex<Vec<std::sync::Weak<Control>>>,
+}
+
+impl ControlSet {
+    pub fn new() -> Arc<ControlSet> {
+        Arc::new(ControlSet::default())
+    }
+
+    pub fn add(&self, control: &Arc<Control>) {
+        if let Ok(mut m) = self.members.lock() {
+            m.retain(|w| w.strong_count() > 0);
+            m.push(Arc::downgrade(control));
+        }
+    }
+
+    /// Sessions currently in the set, after pruning the ended ones.
+    pub fn len(&self) -> usize {
+        self.members.lock().map_or(0, |mut m| {
+            m.retain(|w| w.strong_count() > 0);
+            m.len()
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl BellTarget for ControlSet {
+    fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
+        // Upgrade under the lock, ring outside it: `ring_local` is a syscall,
+        // and a session joining should not wait behind one.
+        let live: Vec<Arc<Control>> = match self.members.lock() {
+            Ok(mut m) => {
+                m.retain(|w| w.strong_count() > 0);
+                m.iter().filter_map(std::sync::Weak::upgrade).collect()
+            }
+            Err(_) => return false,
+        };
+        let mut any = false;
+        for c in &live {
+            any |= c.ring_token(token, woken);
+        }
+        any
     }
 }
 
@@ -256,6 +333,15 @@ impl Doorman {
     /// `control` is cloned into the thread, which is why it is taken by
     /// `Arc`: the reader outlives the caller's borrow by construction.
     pub fn spawn<R: Read + Send + 'static>(port: R, control: Arc<Control>) -> Doorman {
+        Doorman::spawn_target(port, control)
+    }
+
+    /// Start answering the door for any [`BellTarget`] — one control region,
+    /// or a [`ControlSet`] of every session a process serves (§87).
+    pub fn spawn_target<R: Read + Send + 'static, T: BellTarget + ?Sized + 'static>(
+        port: R,
+        control: Arc<T>,
+    ) -> Doorman {
         let stop = Arc::new(AtomicBool::new(false));
         let woken = Arc::new(AtomicU64::new(0));
         let handle = {
@@ -263,7 +349,7 @@ impl Doorman {
             let woken = Arc::clone(&woken);
             std::thread::Builder::new()
                 .name("sv-doorbell".into())
-                .spawn(move || serve_port(port, &control, &stop, &woken))
+                .spawn(move || serve_port(port, &*control, &stop, &woken))
                 .expect("a thread")
         };
         Doorman { stop, woken, handle: Some(handle) }
@@ -321,6 +407,15 @@ pub fn attach(port: PortHandle, control: Arc<Control>) -> std::io::Result<Doorma
     let (reader, writer) = port.split()?;
     crate::park::install_cross_wake(Some(Arc::new(PortWake::new(writer)) as Arc<dyn CrossWake>));
     Ok(Doorman::spawn(reader, control))
+}
+
+/// [`attach`] for a process that serves several sessions over one port: the
+/// writer is installed exactly as there, and the reader rings every session in
+/// `set` (§87).
+pub fn attach_set(port: PortHandle, set: Arc<ControlSet>) -> std::io::Result<Doorman> {
+    let (reader, writer) = port.split()?;
+    crate::park::install_cross_wake(Some(Arc::new(PortWake::new(writer)) as Arc<dyn CrossWake>));
+    Ok(Doorman::spawn_target(reader, set))
 }
 
 /// A port that can be split into a reader and a writer over one description.
@@ -603,6 +698,38 @@ mod tests {
         // required and not tidiness.
         drop(host_end);
         assert_eq!(doorman.join(), ServeEnd::Closed);
+    }
+
+    /// §87: one port, several sessions. A byte rings its lane in every live
+    /// session, and a session that has ended is dropped from the set rather
+    /// than kept alive by it.
+    #[test]
+    fn a_control_set_rings_every_live_session_and_forgets_ended_ones() {
+        let (a, slot_a) = setup();
+        let (b, slot_b) = setup();
+        assert_eq!(slot_a, slot_b, "the same claim order gives the same slot");
+        let set = ControlSet::new();
+        set.add(&a);
+        set.add(&b);
+        assert_eq!(set.len(), 2);
+        let (mut host_end, guest_end) = pipe();
+        let doorman = Doorman::spawn_target(guest_end, Arc::clone(&set));
+        let wait_for = |n: u64| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while doorman.woken() < n && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            doorman.woken()
+        };
+        host_end.write_all(&[crate::park::lane_token(slot_a, Lane::Reply)]).unwrap();
+        assert_eq!(wait_for(2), 2, "one byte, two sessions, two deliveries");
+        drop(b);
+        assert_eq!(set.len(), 1);
+        host_end.write_all(&[crate::park::lane_token(slot_a, Lane::Reply)]).unwrap();
+        assert_eq!(wait_for(3), 3, "the ended session is not rung");
+        drop(host_end);
+        assert_eq!(doorman.join(), ServeEnd::Closed);
+        drop(a);
     }
 
     /// `Bell::ring` must poke the installed doorbell, so that no producer call

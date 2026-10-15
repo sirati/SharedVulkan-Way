@@ -26965,3 +26965,339 @@ On the real machines, each once unless the table says otherwise:
    "Ethernet 2" had fallen back to an APIPA address (169.254.171.236). Nothing
    here touched networking, and this section does not know when it happened
    or why; it is reported, not changed.
+
+## 87. The GPU sessions' arena on a second ivshmem device: no root for the GPU, a doorbell that crosses, and two faults found on the guest
+
+Written 2026-10-15, on branch `gpu-guest`, from master 0ffe238. The brief: hardware
+acceleration on the real guest with no root anywhere in the launch path, the
+doorbell §86 left out, accelerated Firefox, hardware decode, and the Troubleshoot
+Mode prompt. In order: the decision (87.2), whether Intel's driver takes an
+ivshmem BAR (87.3), the guest and host halves (87.4), the doorbell (87.5),
+accelerated Firefox (87.6), decode and the two faults it found (87.7), the
+Troubleshoot prompt (87.8), what was deployed (87.9), the gates (87.10) and what
+remains (87.11). Nobody was logged in to the guest, so every guest run was in
+session 0, over ssh; nothing here was photographed.
+
+### 87.1 Status in one paragraph
+
+**The GPU path needs no root and no broker.** The GPU sessions' arena is BAR2 of
+a second ivshmem device (256 MiB, slot 0x1d, `/run/windows-vm/wc-arena/gpu`,
+`0660 root:wc-arena`); one guest process maps it and serves each session in its
+own 80 MiB slot; the host's `sv-hostd ivshmem-serve` runs in a user unit as
+`sirati` and refuses to run as root. Intel's Windows driver **imports a pointer
+into the BAR** with `VK_EXT_external_memory_host` and the GPU reads and writes it
+exactly. The doorbell port is hot-added and works once its Windows handle is
+opened overlapped: vulkaninfo's mean ring wait fell from **10.18 ms to 0.017
+ms**. Firefox 157 on Zink on the guest's Intel UHD ran a **340 s** tour with
+`Compositing WebRender`, the present's fence at **2.09 ms** and **40.4 fps**
+while scrolling. `video-probe` decoded H.264 through the forwarder
+byte-identically to libavcodec (`b3a1374e…`). That run then ended with **a fault
+in `igvk64.dll`** — caused by this branch's own slot cleanup destroying a command
+pool a second time — and by the rule of §86.5 GPU work on the guest stopped
+there. The cause is fixed and proven on RADV and NVIDIA (87.7); the fixed build
+has not run on the guest, so the launcher's GPU is **not** switched on (87.9).
+
+### 87.2 The decision: a second device, one process, slots
+
+§86 measured each GPU session at 80 MiB (16 MiB control region + a 64 MiB arena)
+and Firefox wanting several. Two facts about an ivshmem device settle the shape.
+**Its driver gives the BAR to one handle** (§83.5), so one guest process maps it
+and every session is a slice. **The doorbell's port takes one opener** (§36's
+`vdoorbell` header), the same answer from the other side. And a session that
+ends must give its slot back, because Firefox's `glxtest` takes one and exits
+before the browser asks for its own.
+
+So: a second device rather than carving the compositor's 128 MiB, which is twice
+§28.12's peak and has no room; 256 MiB rather than 512, because testhost had
+1363 MiB available before the hot-plug and 1090 after it (`free -m`), and three
+concurrent sessions cover `glxtest`, the GPU process and an RDD or a restart.
+`sv-gpu-server guest --ivshmem-slot 0x1d` (`crates/sv-gpu-server/src/ivshmem.rs`,
+`entry.rs::win_guest_ivshmem`) maps the device **by slot** — the instance path's
+last component is the devfn, `&E8` for 0x1d — accepts one TCP connection per
+session on one port, and gives each the lowest free slot: stamped as the
+guest-RAM path stamped it, offered with `Locator::Ivshmem { region_offset }`, its
+own `VkDevice`, its own import of its slot's arena. `wc_handle::map_ivshmem`
+sorts the interfaces now, so the compositor's `--arena-ivshmem 0` is still the
+device at 0x1c with two present.
+
+### 87.3 Does Intel's driver take a BAR mapping as a host pointer? Yes
+
+§83.2 kept guest-RAM arenas for shared_vulkan because a BAR is `VM_IO|VM_PFNMAP`
+to Linux's pinning path. Whether the *Windows* driver pins a user mapping of an
+I/O-space MDL was the open question. `sv-ivshmem-probe` (in
+`crates/sv-gpu-server/src/bin/`) asked it in three steps, each opt-in past the
+first, on the hot-plugged device, nothing else running:
+
+| step | result |
+|---|---|
+| `vkGetMemoryHostPointerPropertiesEXT`, heap pointer (control) | `SUCCESS`, `memoryTypeBits 0x6` |
+| the same, BAR pointer (+1 MiB) | `SUCCESS`, `0x6`; `minImportedHostPointerAlignment 4096` |
+| `--import`: `vkAllocateMemory` of 4 MiB of the BAR | **ok**, memory type 1 (`DEVICE_LOCAL\|HOST_VISIBLE\|HOST_COHERENT`), 104 µs |
+| GPU copy BAR → device-local → BAR (2 × 2 MiB) + `vkCmdFillBuffer` | **0 of 524288 words wrong**, 1.18 ms; best of 5, 0.72 ms (5.8 GB/s) |
+| the filled page in `/run/windows-vm/wc-arena/gpu`, read by `sirati` on the host | all 1024 words `PGVS`; the copied words at their offsets (`53564750 cd613ee1 …`) |
+
+So no staging copy is needed. Its price was measured anyway (`--staging`, 4 MiB,
+best of 5): BAR → driver-allocated cached memory 0.27 ms and back 0.26 ms
+(15.7 GB/s); to write-combined memory 0.28 ms, and **29.2 ms** back out of it,
+which is what reading WC costs. A session's device, its 64 MiB import and its
+control region took 93–224 ms on the guest; the host's check of a slot's 20480
+stamped pages, 116–343 ms.
+
+**Not measured:** whether the import keeps working across a guest driver reset,
+and whether a BAR import costs the GPU anything per access that guest RAM does
+not (Firefox's numbers in 87.6 are the only comparison, and §86 never had one).
+
+### 87.4 The two halves, and the run that found the ordering
+
+**Guest.** One process, `sv-guest.exe gpu guest --port P --ivshmem-slot 0x1d
+--sessions N --bell org.sirati.svbell.0`. A session ends 5 s after its
+application's heartbeat stops (`session::APP_GONE_AFTER`): `wait_until`'s own
+liveness check started a fresh 600 ms window on each 50 ms call and never fired,
+so an exited application had only been noticed by the 120 s idle limit, which
+with slots is a slot `glxtest` keeps from the browser. A slot whose application
+destroyed everything is released; one with leftovers has them destroyed first
+(`Objects::destroy_leftovers`, children before parents, never the arena's own
+memory, nothing at all if an unhandled type such as a video session is left, in
+which case the slot is quarantined). Measured on vulkaninfo ×4 in one process:
+slots 0, 1, 0, 1, each `released`.
+
+**Host.** `sv-hostd ivshmem-serve --region … --cold $D/cold.sock --socket
+$D/icd.sock [--bell … --bell-hub $D/bell.sock]`, started by `wc-session gpu ID N`
+in the user unit `wc-launch-gpu-ID`. Per ICD: connect to the guest through the
+tunnel's one forward, take the `Hello`, read every stamped page of the slot,
+`Accept`, **wait for the guest's `Ping`**, and hand the ICD the file's path and
+the slot's offsets. The ICD opens the file itself, by name (docs/design.md §1a).
+
+**The `Ping` is the run that found the ordering.** The first vulkaninfo was
+refused by the ICD with `magic is 0x31414e4552415653` — `SVARENA1`, the stamp.
+On guest RAM every session was located before any ICD existed, so its control
+region was always published by the time one attached; here the ICD is what asks
+for the session, and it read the control header while the guest was still
+opening its device. The guest now says `Ping` after `Control::create`, or
+`Refuse` with the reason.
+
+**One deployment fact, not a code one.** The first launcher run's proxy got
+`Permission denied` on `/run/windows-vm/wc-arena/arena`: `sirati`'s systemd user
+manager predates generation 51, which added the user to `wc-arena`, so user units
+run without the group (`/proc/<pid>/status`: `Groups: 1 57 100 302`). The VM's
+17:44 start recreated the file without §83's ACL. The files and the bell socket
+were given `u:sirati:rw` by ACL, as §83 did; the next login or reboot makes that
+unnecessary.
+
+### 87.5 The doorbell: hot-added, and a Windows handle that serialised it
+
+`chardev-add` of a server socket `/run/windows-vm/wc-arena/svbell.sock` and
+`device_add virtserialport,bus=vioserial.0,chardev=svbell,name=org.sirati.svbell.0`
+on the running VM, then `chgrp wc-arena` and `chmod 0660` on the socket, which
+QEMU had made `root 0755`. The guest opened the port by name at once, as §36.16
+found for a fresh port.
+
+**The first run with it hung, and the cause was ours.** vulkaninfo's first
+`vkCreateInstance` waited 3 × 10 s and died `DEVICE_LOST`; without the bell it
+ran. `winpipe::open_virtio_port` opened the port synchronously, and **the I/O
+manager serialises every call on a synchronous handle**: the doorman sat in
+`ReadFile`, so the first reply's `WriteFile` — the bell — waited behind it, and
+the ring thread that rang it served nothing more. `sv-bell-probe` never met this
+because it reads and writes from one thread in turn. Ports are now opened
+`FILE_FLAG_OVERLAPPED`, each call with its own `OVERLAPPED`.
+
+**One port, every session.** A byte carries a ring slot and a lane but not a
+session, so the guest rings it in every live session (`vdoorbell::ControlSet`)
+and the host's hub (`sv_hostd::ivshmem::bell_hub`) holds QEMU's one chardev
+connection and passes bytes to and from every ICD. The session it was for wakes;
+the rest see a spurious wake, which §36.6.4 already prices at a syscall.
+
+| | ring waits | parked | mean | histogram |
+|---|---|---|---|---|
+| vulkaninfo, no doorbell | 2357 | 23,994 ms | **10.18 ms** | `<100us=666 <1ms=160 <10ms=598 <100ms=932` |
+| vulkaninfo, doorbell (×5) | 2356–2357 | 33–42 ms | **0.014–0.018 ms** | `<10us=2257…2288 <100us≈30 <1ms≈50` |
+| Firefox, guest without its port (control) | — | — | — | Marionette's `NewSession` had not returned at 120 s |
+
+### 87.6 Accelerated Firefox on the guest's Intel UHD
+
+A second launcher installation (`C:\Users\<guest-user>\wcgpu`, `~/wc-launch-gpu`,
+port 57471, profile `~/.wc-launch/firefox-gpu`, `gpu-sessions = 3`, a test
+`gpu.env` adding `SV_DEBUG=1` and Marionette), started over ssh as
+`wc-launch.exe --session-name wcg firefox`; `scripts/sv-firefox-soak.py` drove
+Firefox from the host. The §0.29 strip was confirmed active in every GPU log
+before the first Firefox (`Intel's Windows driver (driver id 5): a
+PUSH_DESCRIPTOR set layout with non-zero binding flags will be refused`). A
+health watchdog (ssh and ping every 15 s) ran beside every run and never failed.
+
+about:support, verbatim, at the end of the 340 s run:
+
+```
+Compositing              WebRender
+WebGL 2 Driver Renderer  Mesa -- zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))
+WebGL 2 Driver Version   4.3 (Core Profile) Mesa 26.2.4
+Window Protocol          wayland
+Description              zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))
+Driver Vendor            mesa/software-unknown
+Device ID                0xa7a8
+WEBRENDER                default available / user force_enabled "Force enabled by pref" /
+                         env blocklisted FEATURE_FAILURE_SOFTWARE_GL
+```
+
+| run | result |
+|---|---|
+| 340 s tour (`c1`) | **alive at the end**; 60 loads in 10 rounds, mean 0.27 s, 0 step errors |
+| WebGL page, each round | 176–194 frames in 3 s, read-back pixel `255,128,25` every time |
+| scrolling, the long page, 5.6 s of wheel input | **40.4 fps** (226 `requestAnimationFrame`s) |
+| ICD present notes, 162 × 60 frames | 30.6 fps mean over the whole tour (navigations included); **fence 2.09 ms** (1.94–2.30), copy 1.08 ms |
+| the same, a 500×120 window (`b1`, before the soak asked for 1280×900) | fence 0.76–1.31 ms, copy 0.09–0.40 ms |
+| cold click to window, session 0, with the GPU | 4521, 4099, 4888 ms |
+| `glxtest`'s session | left 17 objects, destroyed them, slot released (but see 87.7) |
+| GPU faults | none in any Firefox run |
+
+So the cross-VM present costs about 2 ms of a frame at 1228×848, against
+§0.28.8's 0.7 ms on one machine; the frame rate while scrolling is 40 fps, not
+60. What the other 20 ms are is not established: the ICD's notes measure the
+present, not where a frame's time goes. **Not measured:** the interactive
+desktop (DWM, a person), longer than 340 s, a second tab playing video, CPU use.
+
+### 87.7 Decode, and the two faults it found
+
+**Capabilities through the forwarder**, three runs: the GPU process died each
+time partway through `video-probe caps`, inside a different
+`vkGetPhysicalDeviceVideoFormatPropertiesKHR` each run (`SV_TRACE=pre`),
+printing nothing — the fault handler never ran. A wrapper that waits for the
+process gave the reason: **exit code `0xC0000374`, `STATUS_HEAP_CORRUPTION`**.
+The API dump of the same forwarded calls on RADV and NVIDIA is well formed. So
+every allocation the forwarder hands a driver now carries 256 bytes of canary
+(`sv_gpu_entry::Raise`, `guard_spare` / `check_spare` for output arrays, emitted
+by the generator), and the next run said, once:
+
+```
+[gpu] GUARD: the driver wrote past a sv_icd_entry::VkVideoDecodeCapabilitiesKHR:
+      4 of the 256 guard bytes after it changed
+```
+
+Intel's `vkGetPhysicalDeviceVideoCapabilitiesKHR` writes four bytes past
+`VkVideoDecodeCapabilitiesKHR`. The in-guest `video-probe.exe` of video-decode.md
+§1 has the struct on its stack, where four bytes go unnoticed. With the guard
+every profile answered as that survey did — H.264 baseline to high interlaced,
+H.265 main and main10, AV1 8- and 10-bit supported, AV1 with film grain
+`ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR` — except that the decode family has
+one queue through the forwarder and two on the driver, because the GPU side
+opens one.
+
+**The decode**, video-decode.md §7.9's step 3:
+
+```
+memory: bitstream buffer 8192 B, bits 0xe -> type 1 HOST_VISIBLE | HOST_COHERENT
+decoded 24 frames of 320x180 (coded 320x192) as G8_B8R8_2PLANE_420_UNORM on Intel(R) UHD Graphics
+decode submit->fence: median 1.027 ms over 24 frames
+b3a1374ee5f09350b022a225b35528b6549af33fc025db08fd224b232e9a187a  out.nv12
+```
+
+**Byte-identical to libavcodec**, and §7.9's first question is answered: Intel
+takes a bitstream buffer with `VIDEO_DECODE_SRC` bound into host-pointer-imported
+memory, here a BAR.
+
+**Then `igvk64.dll` faulted**, after `video-probe` had exited, in the slot
+cleanup:
+
+```
+[gpu] FAULT: exception 0xc0000005 at 0x7ff92d1003e8 in …\iigd_dch.inf_amd64_a8d32ac2abbe057a\igvk64.dll+0xf03e8
+[gpu] FAULT: read of 0x1345712e1a8
+  ring 1: seqno 21 vkDestroyInstance (returned)   ring 2: seqno 191 vkDestroyDevice (returned)
+  12: <sv_gpu_server::table::Objects>::destroy_leftovers
+```
+
+The guest stayed up (ssh and ping before and after); QEMU logged the iGPU going
+D0→D3 and `guest disables memory decode … unmapping the BARs before the host
+does`, which is generation 51's patch doing its job. **By §86.5's rule GPU work
+on the guest stopped here**, and the cause was found and fixed locally:
+
+- The generator's parent list — `VkCommandPool` and `VkDescriptorPool`, so that
+  `vkFreeCommandBuffers` does not unbind the pool its buffers came from — also
+  kept **`vkDestroyCommandPool` and `vkDestroyDescriptorPool` from unbinding the
+  pool they destroy**. Every destroyed pool stayed in the table. The API dump
+  showed `video-probe` destroying both of its command pools; the table still
+  held them; `destroy_leftovers` destroyed them again. A `vkDestroyX` now
+  unbinds its `X` (`sv-codegen`, `emit/gpu_entry.rs`). `glxtest`'s "8 command
+  pools" in 87.6 were, by the same reading, destroyed twice on Intel three times
+  without a fault.
+- Proven without the guest: the local serve path prints each session's
+  leftovers and, with `SV_DESTROY_LEFTOVERS=1`, destroys them. A Zink `gl-probe`
+  session on RADV left 49 objects; every one was checked against the API dump as
+  created after its handle's last destroy (handle reuse is real: one buffer
+  address was destroyed and created again); all 49 were destroyed with the
+  Khronos validation layer loaded and no message from the destruction.
+  `video-probe` through the fixed forwarder leaves nothing. A unit test makes
+  one object of every handled type on the local driver and destroys it.
+
+**Not run, because GPU work on the guest stopped:** the fixed build on the
+guest; ffmpeg through the forwarder (§7.9 step 4); the validation layer on the
+guest (step 5); the readback Firefox with H.264 (step 6).
+
+### 87.8 "Open Firefox in Troubleshoot Mode?"
+
+`wc-session run` now writes `toolkit.startup.max_resumed_crashes = -1` into every
+launcher profile's `user.js`. Measured in session 0 with the deployed `wcivs`
+installation (software rendering, so not GPU work): five sessions each ended
+with `wc-launch.exe --stop` under a running Firefox. Firefox still counts them —
+`toolkit.startup.recent_crashes` went 1, 2, 3, 4 — but the fifth start, at 4,
+past the default limit of 3, opened the browser: the compositor logged `title
+-> "Restore Session — Mozilla Firefox"`, not the dialog. Cleaned on testhost:
+the counter removed from all five launcher profiles' `prefs.js`, the pref added
+to the three `user.js` files that lacked it, and a stale `lock` in
+`ff-h264exp` (pid 1580081, not running) removed. **Not changed:** the "Restore
+Session" page each such start shows; `browser.sessionstore.resume_from_crash`
+would hide it and would also throw away the tabs of a real crash.
+
+### 87.9 What is deployed, and where
+
+| where | what |
+|---|---|
+| testhost, running VM | `wcgpu0` ivshmem-plain 256 MiB at 0x1d (`/run/windows-vm/wc-arena/gpu`), `svbellport` / chardev `svbell` (`…/wc-arena/svbell.sock`, `0660 root:wc-arena`), both QMP hot-adds; ACL `u:sirati:rw` on `arena`, `gpu`, `svbell.sock` (87.4) |
+| testhost NixOS | **generation 52** = nix-config `testhost-wc-gpu-ivshmem` (3e4f6ad on 492af3e): `waycomposeArena.gpu` and `.doorbell`, the same ids, slot and name. `dry-activate`: only `windows-vm.service` changed and "would NOT stop"; `switch`: "NOT restarting … windows-vm.service". Active from the VM's next start |
+| testhost `~/wc-launch-ivs` | `wc-session` of this branch (the Troubleshoot pref); `gpu-sessions = 0` in the guest's ini, no `gpu.env`, no `sv-hostd`: **the product's GPU is not switched on** |
+| testhost `~/wc-launch-gpu`, guest `C:\Users\<guest-user>\wcgpu` | the test installation of 87.6, with the **fixed** build (f0b8d9d) |
+| guest `C:\Users\<guest-user>\svgpu` | `sv-ivshmem-probe.exe`, the fixed `sv-guest.exe`, helper scripts |
+| root on the launch path | none: the guest's GPU process maps a device its driver opens for a non-administrator (§83.8, the same driver); `sv-hostd ivshmem-serve` runs in a user unit, logs `as uid 1000`, and exits if `geteuid() == 0`; `sv-hostd broker` was never started |
+
+### 87.10 The gates
+
+On the branch at the commit that adds this section (master 0ffe238 plus this
+branch):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` (`CARGO_BUILD_JOBS=4`, a copied Wine prefix) | **100 binaries, 2800 passed, 0 failed**, 8 ignored (master: 2790; the 10 new are `wc_handle::ivshmem`'s slot test, the ivshmem locator's round trip, `ControlSet`, two slot-plan tests, three `sv_hostd::ivshmem` tests, the leftover test on a real driver, the guard test) |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning at a line this branch wrote (the remaining ones are `vk-registry` and `wc-handle/src/grow.rs`, not touched) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| Miri | not run: the new `unsafe` is FFI (`DeviceIoControl`, overlapped I/O) and pointer arithmetic into memory a driver writes, which Miri does not model |
+
+On the real machines, each run once unless the table says otherwise, a health
+check before and after each:
+
+| run | result |
+|---|---|
+| QMP hot-add of `wcgpu0` (256 MiB, 0x1d) and of the doorbell port | `{}` each; Windows: "IVSHMEM Device", status OK, `…&0&E8` |
+| `sv-ivshmem-probe` query, then `--import --staging` | 87.3 |
+| vulkaninfo through the forwarder (seven runs, with and without the doorbell) | 87.4, 87.5; four in one process reused slots 0, 1, 0, 1 |
+| accelerated Firefox (eight starts: three lost to the missing group (87.4) and to two launcher runs of mine overlapping, a 30 s look, a 90 s in a 500×120 window, a 90 s, the 340 s, one without the guest's doorbell) | 87.6; no GPU fault |
+| `video-probe caps` (×4) | three `STATUS_HEAP_CORRUPTION`, then the guard run (87.7) |
+| `video-probe decode` (×1) | byte-identical, then the `igvk64.dll` fault (87.7); GPU work stopped |
+| five launcher sessions ended under Firefox, software rendering | 87.8 |
+| NixOS | generation 52, `dry-activate` then `switch` (87.9) |
+
+### 87.11 What remains
+
+1. **The fixed build on the guest.** One run of `video-probe decode` through the
+   forwarder, then one 340 s Firefox, with `GUARD` and `destroyed … left behind`
+   lines read; then the launcher's GPU switched on: `gpu.env` and `gpu-sessions =
+   3` for `wcivs` (`WC_LAUNCH_GPU_SESSIONS=3 WC_LAUNCH_GPU_ENV=write
+   WC_LAUNCH_KOPPER_MESA=/nix/store/9nnjvvqxg5c71k18wv4iqqb9fxnd0fvy-mesa-kopper-wayland-26.2.4
+   scripts/wc-launch.sh deploy` with §83.9's variables).
+2. **Decode in Firefox**: video-decode.md §7.9 steps 4–6, with the readback
+   package `/nix/store/rk9rz146p8a31ffrd76pxbck4dn4pxjk-firefox-readback-157.0.1`
+   (still on the workstation only; testhost has the unmarked `aqgy9h…`).
+3. **The interactive desktop**: everything above was session 0.
+4. **Why 40 fps and not 60** while scrolling (87.6).
+5. **Other drivers' overruns**: the guard reports one type per process; anything
+   it reports on the guest beyond `VkVideoDecodeCapabilitiesKHR` is a finding.
+6. **The user manager's groups** (87.4): until `user@1000` restarts, the ACLs
+   are what lets user units open the files, and a VM restart drops them.
