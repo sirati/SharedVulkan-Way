@@ -519,72 +519,107 @@ fn emit_server_trait(plan: &Plan) -> TokenStream {
 }
 
 fn emit_dispatcher(plan: &Plan) -> TokenStream {
-    let arms = plan.commands.iter().map(|c| {
-        let v = naming::opcode_variant(&c.name);
+    // **Each command's body is a function of its own, and the arms only call
+    // it** (docs/design.md §0.28). In a debug build a `match` whose arms
+    // decode and call inline is one frame holding every arm's locals at once,
+    // because rustc does not overlap the slots of mutually exclusive arms
+    // there: `dispatch` measured 391,208 bytes and `subdecode` 104,568, on
+    // ring threads Rust gives 2 MiB. That is the class §0.27 met on the app
+    // side — the frame that faults is whichever is deepest when the page runs
+    // out — so it is fixed here before it bites rather than after. The arms
+    // left are tail calls with one `?` after the `match`, the shape
+    // `size_pnext_body` always had and the one §0.27 measured small.
+    let helpers = plan.commands.iter().map(|c| {
         let m = naming::command_method(&c.name);
         let decode_cmd = format_ident!("decode_cmd_{}", naming::snake_case(&c.name));
-        if c.generates_reply {
+        let helper = format_ident!("dispatch_{}", naming::snake_case(&c.name));
+        let body = if c.generates_reply {
             let encode_reply = format_ident!("encode_reply_{}", naming::snake_case(&c.name));
             let size_reply = format_ident!("size_reply_{}", naming::snake_case(&c.name));
             quote! {
-                Opcode::#v => {
-                    let args = #decode_cmd(&mut body)?;
-                    let r = srv.#m(args)?;
-                    // Encoded whether or not anyone asked, so that a caller
-                    // which sent this command *without* `GENERATE_REPLY` can
-                    // still look at the `VkResult` before throwing the bytes
-                    // away. That is not hypothetical: `vkQueueSubmit` is sent
-                    // fire-and-forget (D15), and without this its result would
-                    // be discarded here — a driver refusing a submission would
-                    // be silence on both sides. The consumer decides what to do
-                    // with the reply; this pass only produces it.
-                    let n = #size_reply(&r);
-                    let at = reply.len();
-                    reply.resize(at + n, 0);
-                    let mut enc = sv_wire::Encoder::new(&mut reply[at..]);
-                    #encode_reply(&mut enc, &r)?;
-                    enc.finish()?;
-                }
+                let args = #decode_cmd(body)?;
+                let r = srv.#m(args)?;
+                // Encoded whether or not anyone asked, so that a caller
+                // which sent this command *without* `GENERATE_REPLY` can
+                // still look at the `VkResult` before throwing the bytes
+                // away. That is not hypothetical: `vkQueueSubmit` is sent
+                // fire-and-forget (D15), and without this its result would
+                // be discarded here — a driver refusing a submission would
+                // be silence on both sides. The consumer decides what to do
+                // with the reply; this pass only produces it.
+                let n = #size_reply(&r);
+                let at = reply.len();
+                reply.resize(at + n, 0);
+                let mut enc = sv_wire::Encoder::new(&mut reply[at..]);
+                #encode_reply(&mut enc, &r)?;
+                enc.finish()?;
+                Ok(())
             }
         } else {
             quote! {
-                Opcode::#v => {
-                    let args = #decode_cmd(&mut body)?;
-                    srv.#m(args)?;
-                }
+                let _ = reply;
+                let args = #decode_cmd(body)?;
+                srv.#m(args)?;
+                Ok(())
+            }
+        };
+        quote! {
+            #[inline(never)]
+            fn #helper(
+                body: &mut sv_wire::Decoder<'_>,
+                srv: &mut dyn Server,
+                reply: &mut Vec<u8>,
+            ) -> sv_wire::Result<()> {
+                #body
             }
         }
     });
+    let arms = plan.commands.iter().map(|c| {
+        let v = naming::opcode_variant(&c.name);
+        let helper = format_ident!("dispatch_{}", naming::snake_case(&c.name));
+        quote! { Opcode::#v => #helper(&mut body, srv, reply), }
+    });
 
-    let sub_arms = plan
+    let recorded: Vec<_> = plan
         .commands
         .iter()
         .filter(|c| c.is_recorded || crate::exceptions::BLOB_FRAMING.contains(&c.name.as_str()))
-        .map(|c| {
-            let v = naming::opcode_variant(&c.name);
-            let m = naming::command_method(&c.name);
-            let decode_cmd = format_ident!("decode_cmd_{}", naming::snake_case(&c.name));
-            // A framing command returns a `VkResult` and there is nobody to
-            // give it to: the app side answered `VK_SUCCESS` optimistically
-            // when it recorded the call. A failure here is not lost — it is
-            // reported through the ring's `fatal_msg`, which is what the whole
-            // blob shares, and which is the right granularity because a
-            // command buffer that failed to open has no meaningful partial
-            // outcome.
-            let call = if c.generates_reply {
-                quote!(let _ = srv.#m(args)?;)
-            } else {
-                quote!(srv.#m(args)?;)
-            };
-            quote! {
-                Opcode::#v => {
-                    let args = #decode_cmd(&mut body)?;
-                    #call
-                }
+        .collect();
+    let sub_helpers = recorded.iter().map(|c| {
+        let m = naming::command_method(&c.name);
+        let decode_cmd = format_ident!("decode_cmd_{}", naming::snake_case(&c.name));
+        let helper = format_ident!("subdecode_{}", naming::snake_case(&c.name));
+        // A framing command returns a `VkResult` and there is nobody to
+        // give it to: the app side answered `VK_SUCCESS` optimistically
+        // when it recorded the call. A failure here is not lost — it is
+        // reported through the ring's `fatal_msg`, which is what the whole
+        // blob shares, and which is the right granularity because a
+        // command buffer that failed to open has no meaningful partial
+        // outcome.
+        let call = if c.generates_reply {
+            quote!(let _ = srv.#m(args)?;)
+        } else {
+            quote!(srv.#m(args)?;)
+        };
+        quote! {
+            #[inline(never)]
+            fn #helper(body: &mut sv_wire::Decoder<'_>, srv: &mut dyn Server) -> sv_wire::Result<()> {
+                let args = #decode_cmd(body)?;
+                #call
+                Ok(())
             }
-        });
+        }
+    });
+    let sub_arms = recorded.iter().map(|c| {
+        let v = naming::opcode_variant(&c.name);
+        let helper = format_ident!("subdecode_{}", naming::snake_case(&c.name));
+        quote! { Opcode::#v => #helper(&mut body, srv), }
+    });
 
     quote! {
+        #(#helpers)*
+        #(#sub_helpers)*
+
         /// Decode one command and hand it to the server.
         ///
         /// The header's `cmd_size` is checked against what decoding actually
@@ -611,7 +646,7 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
 
             match opcode {
                 #(#arms)*
-            }
+            }?;
 
             if body.remaining() != 0 {
                 return Err(sv_wire::WireError::CommandLengthMismatch {
@@ -663,10 +698,10 @@ fn emit_dispatcher(plan: &Plan) -> TokenStream {
                 }
                 match opcode {
                     #(#sub_arms)*
-                    _ => return Err(sv_wire::WireError::UnknownCommand {
+                    _ => Err(sv_wire::WireError::UnknownCommand {
                         opcode: header.cmd_type,
                     }),
-                }
+                }?;
                 if body.remaining() != 0 {
                     return Err(sv_wire::WireError::CommandLengthMismatch {
                         declared: header.cmd_size,
