@@ -117,6 +117,16 @@ pub struct Config {
     /// §86. The guest-side loopback port the tunnel forwards to the session's
     /// `audio.sock` on the VM host. 0 means `port + 1`.
     pub audio_port: u16,
+    /// §86. GPU sessions to offer each launcher session: that many
+    /// `sv-guest.exe gpu guest` processes, each its own large-page arena and its
+    /// own cold port, located on the VM host by `sv-hostd broker`. 0 (the
+    /// default) is no forwarded GPU and software rendering on the host.
+    pub gpu_sessions: u32,
+    /// §86. The first GPU side's loopback port; the i-th is `gpu_port + i`.
+    /// 0 means `port + 10`.
+    pub gpu_port: u16,
+    /// §86. Each GPU session's arena, MiB of the guest's RAM in large pages.
+    pub gpu_arena_mib: u64,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -138,6 +148,9 @@ impl Default for Config {
             audio: true,
             audio_volume: 100,
             audio_port: 0,
+            gpu_sessions: 0,
+            gpu_port: 0,
+            gpu_arena_mib: 64,
             apps: BTreeMap::new(),
         }
     }
@@ -215,6 +228,16 @@ impl Config {
                 ("session", "audio-port") => {
                     cfg.audio_port = v.parse().map_err(|e| format!("line {}: audio-port: {e}", n + 1))?
                 }
+                ("session", "gpu-sessions") => {
+                    cfg.gpu_sessions = u32::try_from(num("gpu-sessions")?)
+                        .ok()
+                        .filter(|v| *v <= 8)
+                        .ok_or_else(|| format!("line {}: gpu-sessions is 0..=8", n + 1))?
+                }
+                ("session", "gpu-port") => {
+                    cfg.gpu_port = v.parse().map_err(|e| format!("line {}: gpu-port: {e}", n + 1))?
+                }
+                ("session", "gpu-arena-mib") => cfg.gpu_arena_mib = num("gpu-arena-mib")?,
                 ("session", "audio-volume") => {
                     cfg.audio_volume = u8::try_from(num("audio-volume")?)
                         .ok()
@@ -276,6 +299,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// §86. The i-th GPU side's loopback port.
+    pub fn gpu_port(&self, i: u32) -> u16 {
+        let base = if self.gpu_port != 0 { self.gpu_port } else { self.port.wrapping_add(10) };
+        base.wrapping_add(i as u16)
     }
 
     /// §86. Where the tunnel puts the session's sound on this machine.
@@ -447,5 +476,23 @@ mod audio_tests {
         assert!(parse("audio-volume = 300\n").is_err());
         assert_eq!(c.audio_port(), c.port + 1);
         assert_eq!(parse("audio-port = 50000\n").unwrap().audio_port(), 50000);
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    /// §86. No forwarded GPU unless the ini asks, and at most eight sessions.
+    #[test]
+    fn gpu_sessions_are_off_by_default_and_bounded() {
+        let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
+        let c = p("").unwrap();
+        assert_eq!(c.gpu_sessions, 0);
+        assert_eq!(c.gpu_port(0), c.port + 10);
+        assert_eq!(c.gpu_port(3), c.port + 13);
+        assert_eq!(p("gpu-sessions = 4\ngpu-port = 50000\n").unwrap().gpu_port(1), 50001);
+        assert!(p("gpu-sessions = 9\n").is_err());
+        assert_eq!(c.gpu_arena_mib, 64);
     }
 }

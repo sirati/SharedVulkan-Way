@@ -739,6 +739,10 @@ mod win {
         //    the session's audio server; never fatal, because a session without
         //    sound is still a session and the host has already given Firefox a
         //    null audio context if there is no server.
+        // 7. The forwarded GPU (§86), only when the ini asks for sessions.
+        //    Never fatal either: without it the host renders in software.
+        let gpus = if cfg.gpu_sessions > 0 { start_gpu(cfg, p, log, &id) } else { Vec::new() };
+
         if cfg.audio {
             start_audio(cfg, p);
         } else {
@@ -753,7 +757,7 @@ mod win {
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay, tunnel, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp, relay, tunnel, gpus, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
@@ -761,7 +765,77 @@ mod win {
         comp: Child,
         relay: Child,
         tunnel: Child,
+        /// The GPU sides this session started (§86); empty without `gpu-sessions`.
+        gpus: Vec<Child>,
         comp_log: std::path::PathBuf,
+    }
+
+    /// The forwarded GPU (§86): `gpu-sessions` GPU sides, each `sv-guest.exe gpu
+    /// guest` on its own cold port with its own large-page arena, then
+    /// `wc-session gpu ID N`, which asks the VM host's root broker to locate
+    /// them and serve them to this session's Firefox as the user.
+    ///
+    /// Started after the proxy, so a failure before here leaves no pinned
+    /// memory behind; every failure from here kills what it started and
+    /// returns none, and the host then gives Firefox no GPU environment, so it
+    /// renders in software rather than failing to start its renderer.
+    fn start_gpu(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Vec<Child> {
+        let t = Instant::now();
+        let mut kids: Vec<Child> = Vec::new();
+        let mut logs = Vec::new();
+        for i in 0..cfg.gpu_sessions {
+            let path = p.state_dir.join(format!("wc-launch-{}-gpu{i}.log", cfg.session));
+            let _ = std::fs::remove_file(&path);
+            let file = match std::fs::File::create(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                    break;
+                }
+            };
+            match Command::new(&cfg.compositor)
+                .args(plan::gpu_argv(cfg, i))
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+            {
+                Ok(c) => {
+                    kids.push(c);
+                    logs.push(path);
+                }
+                Err(e) => {
+                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
+                    break;
+                }
+            }
+        }
+        let give_up = |kids: &mut Vec<Child>, log: &mut Log, why: String| {
+            for k in kids.iter_mut() {
+                let _ = k.kill();
+            }
+            log.say(&format!("gpu: {why}; no forwarded GPU this session, the host renders in software"));
+            Vec::new()
+        };
+        if kids.len() != cfg.gpu_sessions as usize {
+            return give_up(&mut kids, log, "not every GPU side started".into());
+        }
+        for path in &logs {
+            if wait_for(path, 30, |l| l.contains("publishing the extent").then_some(())).is_err() {
+                let tail = std::fs::read_to_string(path).unwrap_or_default();
+                let last = tail.lines().last().unwrap_or("").to_string();
+                return give_up(&mut kids, log, format!("{} never published ({last})", path.display()));
+            }
+        }
+        let n = cfg.gpu_sessions.to_string();
+        match ssh(cfg, p, &["gpu", id, &n]) {
+            Ok(s) => {
+                log.say(&format!("gpu: {} ({} ms)", s.replace('\n', " | "), t.elapsed().as_millis()));
+                kids
+            }
+            Err(e) => give_up(&mut kids, log, format!("the host said: {e}")),
+        }
     }
 
     /// The session's sound (§86): connect to the loopback port the tunnel
@@ -964,6 +1038,9 @@ mod win {
         log.say(&format!("the compositor exited: {rc}"));
         let _ = s.relay.kill();
         let _ = s.tunnel.kill();
+        for g in s.gpus.iter_mut() {
+            let _ = g.kill();
+        }
         let _ = ssh(cfg, p, &["down", &s.id]);
         let _ = std::fs::remove_file(&p.state);
         let _ = std::fs::remove_file(&s.comp_log);
