@@ -12,18 +12,26 @@
       url = "github:edolstra/flake-compat";
       flake = false;
     };
+    # Content-addressed compilation cache, the same one hnl-base uses.
+    # `follows` so it builds against this flake's nixpkgs rather than a second
+    # copy.
+    kache = {
+      url = "github:sirati/nix-drv-kache";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     nixpkgs,
     flake-utils,
     rust-overlay,
+    kache,
     ...
   }:
     flake-utils.lib.eachSystem ["x86_64-linux"] (system: let
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [rust-overlay.overlays.default];
+        overlays = [rust-overlay.overlays.default kache.overlays.default];
       };
 
       # Toolchain from the nix store, pinned by flake.lock. No rustup, no
@@ -90,9 +98,25 @@
         '';
       };
 
-      devShells.default = pkgs.mkShell {
+      # `kache.lib.withKache` supplies the package, RUSTC_WRAPPER pointed at it,
+      # and a shellHook (appended after ours) that writes a gitignored
+      # `.kache.toml`. Our hook below decides where the store lives. The miri
+      # shell above is deliberately not wrapped: nightly, interpreted, and
+      # with a target directory of its own.
+      devShells.default = pkgs.mkShell (kache.lib.withKache {inherit (pkgs) kache;} {
         packages = with pkgs; [
           rustToolchain
+
+          # --- Compilation cache ---------------------------------------------
+          # kache caches rustc outputs by *content*, so every worktree keeps
+          # its own target/ (scripts/sv-worktree.sh says why that is not
+          # negotiable here) and still reuses every compile another tree has
+          # already done. A hit is restored as a reflink, which is free on the
+          # btrfs /mnt/datasets and a full copy anywhere else.
+          # `RUSTC_WRAPPER= cargo build` bypasses it for one command.
+          # Spelled `pkgs.kache` because a bare `kache` is the flake input:
+          # the function argument shadows `with pkgs`.
+          pkgs.kache
 
           # --- Vulkan ---------------------------------------------------
           # vulkan-headers carries registry/vk.xml, which is the input to the
@@ -336,6 +360,41 @@
         ];
 
         shellHook = ''
+          # ONE kache store per project, shared by every worktree: the OUTERMOST
+          # shared-vulkan checkout at or above $PWD, so a tree under
+          # `<project>/.claude/worktrees/<name>` (where scripts/sv-worktree.sh
+          # puts them) resolves to <project>. Ported from hnl-base's flake.nix,
+          # whose comment carries the measurements (751 GB across 23 trees with
+          # one store per checkout). Matched on more than a bare flake.nix so
+          # the walk cannot hand the store to an unrelated ancestor.
+          # `SV_KACHE_ROOT` overrides the walk.
+          #
+          # KACHE_CACHE_DIR rather than only the generated config: kache finds
+          # `.kache.toml` by walking up from rustc's cwd, which for a registry
+          # crate is ~/.cargo/registry/src/..., so without the variable every
+          # dependency compile falls through to ~/.cache/kache. The log path is
+          # separate because kache's log ignores the cache directory.
+          svKacheRoot=
+          svKacheProbe=$PWD
+          while [ -n "$svKacheProbe" ]; do
+            if [ -f "$svKacheProbe/flake.nix" ] \
+               && [ -d "$svKacheProbe/crates/sv-wire" ] \
+               && [ -d "$svKacheProbe/crates/sv-codegen" ]; then
+              svKacheRoot=$svKacheProbe
+            fi
+            [ "$svKacheProbe" = / ] && break
+            svKacheProbe=$(dirname "$svKacheProbe")
+          done
+          [ -n "''${SV_KACHE_ROOT:-}" ] && svKacheRoot=$SV_KACHE_ROOT
+          if [ -z "$svKacheRoot" ]; then
+            svKacheRoot=$PWD
+            echo "kache: no shared-vulkan checkout at or above $PWD; store goes to $PWD/.kache-store" >&2
+          fi
+          export KACHE_STORE_DIR="$svKacheRoot/.kache-store"
+          export KACHE_CACHE_DIR="$KACHE_STORE_DIR"
+          export KACHE_LOG_FILE_PATH="$KACHE_CACHE_DIR/kache.log"
+          unset svKacheRoot svKacheProbe
+
           # Where the codegen reads the registry from, so it is never a
           # question of which vk.xml happened to be on the machine.
           export VK_XML="${pkgs.vulkan-headers}/share/vulkan/registry/vk.xml"
@@ -401,8 +460,9 @@
           echo "  vk.xml   $VK_XML"
           echo "  wlcs     ${pkgs.wlcs.version}"
           echo "  wine     $(wine --version 2>/dev/null || echo 'unavailable')"
+          echo "  kache    $KACHE_CACHE_DIR"
         '';
-      };
+      });
 
       # The development guest of §13 step 7.
       #

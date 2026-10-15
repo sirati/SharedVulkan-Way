@@ -18,3 +18,8 @@ shadercache.bin
 
 # stray Firefox MOZ_LOG output from a probe run
 .child-*.moz_log
+# kache: the config is regenerated on every `nix develop`, the store is huge.
+.kache.toml
+.kache-store/
+# worktrees live inside the project so they share the kache store above
+.claude/worktrees/

@@ -29,7 +29,11 @@ set -uo pipefail
 
 ROOT=/mnt/datasets/builds
 BASE="$ROOT/shared-vulkan-base"
-TREES="$ROOT/sv-worktrees"
+# Inside the project, not beside it, as in hnl-base: the flake's kache resolver
+# anchors the compile cache on the OUTERMOST checkout above $PWD, so a tree here
+# shares the base's one store, and a sibling directory would get a store of its
+# own and share nothing.
+TREES="$BASE/.claude/worktrees"
 
 mkdir -p "$TREES"
 
