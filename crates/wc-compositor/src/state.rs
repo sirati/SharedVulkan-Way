@@ -125,8 +125,8 @@ use crate::platform::{
     CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
 };
 use crate::surface::{
-    bars, decorator, fold_caption, Bars, PixelError, PixelFormat, PixelSource, Rect, Shadow,
-    ShmSource,
+    bars, decorator, fold_caption, Agreed, Bars, Decorator, PixelError, PixelFormat, PixelSource,
+    Rect, Shadow, ShmSource,
 };
 
 /// Which decoration mode the compositor advertises, and answers with.
@@ -501,7 +501,12 @@ pub struct State {
     /// indistinguishable in the log from one that accepted the system's — and
     /// the difference is the whole of the bug the user reported. See
     /// [`crate::surface::decorator`].
-    negotiated_decoration: std::collections::HashSet<WlSurface>,
+    ///
+    /// **§82: a map, and the value is the mode the two sides settled on.** The
+    /// set could say *that* Firefox negotiated and not *what*, and what it
+    /// negotiated is the difference between a tab strip in the caption and a
+    /// tab strip under it.
+    negotiated_decoration: HashMap<WlSurface, Agreed>,
     next_id: WindowId,
     started: Instant,
     last_frame: Instant,
@@ -879,7 +884,7 @@ impl State {
             sources: vec![Box::new(ShmSource)],
             staging: HashMap::new(),
             windows: HashMap::new(),
-            negotiated_decoration: std::collections::HashSet::new(),
+            negotiated_decoration: HashMap::new(),
             next_id: 1,
             started: Instant::now(),
             last_frame: Instant::now(),
@@ -2598,8 +2603,12 @@ impl State {
                 .geometry
                 .map_or((0, 0), |r| (r.loc.x, r.loc.y))
         });
-        let negotiated = self.negotiated_decoration.contains(root);
-        let who = decorator(inset, negotiated);
+        let agreed = self
+            .negotiated_decoration
+            .get(root)
+            .copied()
+            .unwrap_or(Agreed::Nothing);
+        let who = decorator(inset, agreed);
         // The verdict is the pair. See [`crate::surface::bars`]: §31's fold
         // reverses which of these two clients is the correct one, so a message
         // that named "two title bars" from `who` alone was right only while the
@@ -2614,17 +2623,33 @@ impl State {
             who,
         );
         let app = if app_id.is_empty() { "<no app id>" } else { app_id };
-        match bars(who, folded) {
-            Bars::Agreed => println!(
+        match (who, bars(who, folded)) {
+            // §82. The client said, on the protocol, that it draws its own bar.
+            // Two lines rather than one arm per verdict because the reason is
+            // different from the guessed case below and the log is where a
+            // reader finds out which of the two this window was.
+            (Decorator::AskedForClient, Bars::OneClient) => println!(
+                "wc-compositor: window {id} ({app}) asked to decorate itself (Client) and was \
+                 told yes, so this window's caption is folded into its client area ({:?}) and \
+                 the client's own title bar -- Firefox's tab strip -- is the window's (§82)",
+                self.decorations
+            ),
+            (Decorator::AskedForClient, _) => println!(
+                "wc-compositor: window {id} ({app}) asked to decorate itself (Client) and this run \
+                 does not fold its caption ({:?}), so THIS WINDOW HAS TWO TITLE BARS -- \
+                 §22.4's cost of echoing; the default `auto` folds it (§82)",
+                self.decorations
+            ),
+            (_, Bars::Agreed) => println!(
                 "wc-compositor: window {id} ({app}) negotiated its decorations; \
                  geometry inset {},{}",
                 inset.0, inset.1
             ),
-            Bars::OneSystem => println!(
+            (_, Bars::OneSystem) => println!(
                 "wc-compositor: window {id} ({app}) bound no decoration protocol and has no \
                  margin around its window; Windows' caption is the only title bar"
             ),
-            Bars::OneClient => println!(
+            (_, Bars::OneClient) => println!(
                 "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
                  {},{} margin around its window -- it is drawing its own title bar, so this \
                  window's caption is folded into its client area ({:?}) and that bar is the \
@@ -2635,13 +2660,13 @@ impl State {
             // compositor is telling the truth about a window the user is about
             // to find wrong, and a line that read like the other two would be
             // read like the other two.
-            Bars::Two => println!(
+            (_, Bars::Two) => println!(
                 "wc-compositor: window {id} ({app}) bound no decoration protocol and reports a \
                  {},{} margin around its window -- it is drawing its own title bar and did not \
                  read our default of {:?}, so THIS WINDOW HAS TWO TITLE BARS (§33)",
                 inset.0, inset.1, self.decorations
             ),
-            Bars::None => println!(
+            (_, Bars::None) => println!(
                 "wc-compositor: window {id} ({app}) draws no title bar of its own and this run \
                  folds the caption away ({:?}), so THIS WINDOW HAS NO TITLE BAR -- \
                  `--decorations tabs` is right for a self-decorating client and wrong for this \
@@ -4447,7 +4472,8 @@ impl XdgDecorationHandler for State {
         let mode = self.decorations.xdg();
         // STAGE 33. This client has been told; whatever it draws afterwards it
         // is not drawing in ignorance. See [`crate::surface::decorator`].
-        self.negotiated_decoration.insert(toplevel.wl_surface().clone());
+        self.negotiated_decoration
+            .insert(toplevel.wl_surface().clone(), agreed_xdg(mode));
         println!("wc-compositor: xdg-decoration: client created a decoration object, telling it {mode:?}");
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
@@ -4457,6 +4483,8 @@ impl XdgDecorationHandler for State {
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, requested: DecorationMode) {
         let mode = self.decorations.xdg();
+        self.negotiated_decoration
+            .insert(toplevel.wl_surface().clone(), agreed_xdg(mode));
         println!("wc-compositor: xdg-decoration: client asked for {requested:?}, answering {mode:?}");
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
@@ -4466,6 +4494,8 @@ impl XdgDecorationHandler for State {
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         let mode = self.decorations.xdg();
+        self.negotiated_decoration
+            .insert(toplevel.wl_surface().clone(), agreed_xdg(mode));
         println!("wc-compositor: xdg-decoration: client unset its mode, answering {mode:?}");
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
@@ -4493,13 +4523,20 @@ impl KdeDecorationHandler for State {
         // STAGE 33, and this is the protocol GTK uses, so it is the one that
         // fires for Firefox. `weston-terminal` never reaches this function at
         // all, which is the measurement §33 is about.
-        self.negotiated_decoration.insert(surface.clone());
+        // §82: the object starts at the manager's default and only a
+        // `request_mode` moves it, so a client that never asks has agreed to
+        // the default.
+        let agreed = match self.decorations.kde() {
+            KdeDefaultMode::Client => Agreed::Client,
+            _ => Agreed::Server,
+        };
+        self.negotiated_decoration.insert(surface.clone(), agreed);
         println!("wc-compositor: kde-decoration: client created a decoration object");
     }
 
     fn request_mode(
         &mut self,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         decoration: &OrgKdeKwinServerDecoration,
         mode: WEnum<KdeMode>,
     ) {
@@ -4529,7 +4566,24 @@ impl KdeDecorationHandler for State {
         // right even when the picture inside it has a bar too many.
         if let WEnum::Value(mode) = mode {
             decoration.mode(mode);
+            // §82: what was echoed is what was agreed, and it is what `auto`
+            // decides this window's frame from at map. `None` asks for no
+            // decoration from either side; it is not a client that is about to
+            // draw a bar, so it is not folded.
+            let agreed = match mode {
+                KdeMode::Client => Agreed::Client,
+                _ => Agreed::Server,
+            };
+            self.negotiated_decoration.insert(surface.clone(), agreed);
         }
+    }
+}
+
+/// The `xdg-decoration` answer this compositor gave, as an [`Agreed`]. §82.
+fn agreed_xdg(mode: DecorationMode) -> Agreed {
+    match mode {
+        DecorationMode::ClientSide => Agreed::Client,
+        _ => Agreed::Server,
     }
 }
 
