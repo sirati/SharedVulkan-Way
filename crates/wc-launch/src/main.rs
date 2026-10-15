@@ -561,20 +561,34 @@ mod win {
         app: Option<&crate::config::App>,
         t0: Instant,
     ) -> Result<(), String> {
-        match claim(&cfg.session)? {
-            // Somebody else owns the session. This is the warm path and the one
-            // the user pays for on every click after the first.
-            None => {
-                log.say("a session is already up; joining it");
-                let s = join(p, 60)?;
-                let Some(app) = app else {
-                    log.say("--session with a session already up: nothing to do");
-                    return Ok(());
-                };
-                let before = count_mapped(Path::new(&s.comp_log));
-                start_app(cfg, p, log, &s.id, app)?;
-                report(log, Path::new(&s.comp_log), before, t0, "warm")
+        // §85. A session now ends `linger-secs` after its last window, so a
+        // click can land in the seconds while one is winding down: it joins,
+        // and the session goes from under it. That click starts a new session
+        // instead of failing, once, after the old owner has let go.
+        let mut owned = claim(&cfg.session)?;
+        if owned.is_none() {
+            log.say("a session is already up; joining it");
+            match join_and_start(cfg, p, log, app, t0) {
+                Ok(()) => return Ok(()),
+                Err(e) if !p.state.exists() => {
+                    log.say(&format!("the session ended under this click ({e}); starting a new one"));
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        owned = claim(&cfg.session)?;
+                        if owned.is_some() {
+                            break;
+                        }
+                        if Instant::now() > deadline {
+                            return Err(format!("{e}, and the old session never let go"));
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                Err(e) => return Err(e),
             }
+        }
+        match owned {
+            None => unreachable!("joined above, or claimed"),
             // Nobody does. Become it.
             Some(owner) => {
                 let s = match cold(cfg, p, log, &owner) {
@@ -597,6 +611,25 @@ mod win {
                 supervise(cfg, p, log, s)
             }
         }
+    }
+
+    /// Somebody else owns the session. This is the warm path and the one the
+    /// user pays for on every click after the first.
+    fn join_and_start(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        app: Option<&crate::config::App>,
+        t0: Instant,
+    ) -> Result<(), String> {
+        let s = join(p, 60)?;
+        let Some(app) = app else {
+            log.say("--session with a session already up: nothing to do");
+            return Ok(());
+        };
+        let before = count_mapped(Path::new(&s.comp_log));
+        start_app(cfg, p, log, &s.id, app)?;
+        report(log, Path::new(&s.comp_log), before, t0, "warm")
     }
 
     /// Everything that has to happen once. Timed line by line in the log,

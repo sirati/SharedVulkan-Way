@@ -459,11 +459,22 @@ pub struct State {
     /// and "not reached by the current traversal" is not a property anybody
     /// can rely on while the scene graph is still growing.
     cursor_surface: Option<WlSurface>,
-    /// The popup that called `xdg_popup.grab`, if one is up.
+    /// The popups that called `xdg_popup.grab`, outermost first.
     ///
-    /// ADDED FOR STAGE 13. See [`XdgShellHandler::grab`] for what it is and
-    /// [`Self::dismiss_grab_if_outside`] for what it does.
-    popup_grab: Option<WindowId>,
+    /// ADDED FOR STAGE 13 as one id; a stack since §85, because a submenu is a
+    /// grab on top of its menu and the protocol dismisses them innermost first,
+    /// all at once, for one click outside. See [`XdgShellHandler::grab`] and
+    /// [`Self::dismiss_grabs_for_click`].
+    popup_grabs: Vec<WindowId>,
+    /// §85. The last `xdg_toplevel.move`/`resize` handed to the platform, for
+    /// the one platform that has to run the gesture itself: the conformance
+    /// stand-in (`crate::control`). Win32 runs it in `SC_MOVE`'s modal loop
+    /// and never reads this. A `Cell` because the stand-in reads it through
+    /// `&self`.
+    gesture_request: std::cell::Cell<Option<(WindowId, Option<Edge>)>>,
+    /// §85. The buttons smithay has been told are down, so a gesture can tell
+    /// it they are up (smithay keeps its own list private).
+    buttons_down: Vec<u32>,
     /// Caps Lock and Num Lock as the system last reported them, carried in on
     /// [`FromUi::KeyboardFocus`]. See [`Self::sync_locked_modifiers`].
     locks: (bool, bool),
@@ -875,7 +886,9 @@ impl State {
             _cursor_shape: CursorShapeManagerState::new::<State>(dh),
             cursor_pixels: None,
             cursor_surface: None,
-            popup_grab: None,
+            popup_grabs: Vec::new(),
+            gesture_request: std::cell::Cell::new(None),
+            buttons_down: Vec::new(),
             locks: (false, false),
             display: dh.clone(),
             seat,
@@ -1078,6 +1091,19 @@ impl State {
                     });
                 }
                 FromUi::Activated { id, on } => {
+                    // §85. A menu does not outlive its window losing the
+                    // foreground: on Windows that is a click in another
+                    // application, which this compositor never sees as a
+                    // click, and a Firefox menu stayed open over whatever the
+                    // user had switched to.
+                    if !on
+                        && self
+                            .popup_grabs
+                            .first()
+                            .is_some_and(|&g| self.popup_chain(g).last() == Some(&id))
+                    {
+                        self.dismiss_grabs_above(0, &format!("window {id} was deactivated"));
+                    }
                     self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
                 }
                 FromUi::KeyboardFocus { id, on, caps, num } => {
@@ -1138,6 +1164,9 @@ impl State {
                 }
             }
         }
+        // §85. After the events, because a move is one of them: on Win32 the
+        // parent's `WM_WINDOWPOSCHANGED` has just rewritten its bounds.
+        self.reconstrain_reactive_popups();
     }
 
     /// The Win32 clipboard changed: offer it to Wayland.
@@ -1477,6 +1506,12 @@ impl State {
         })
     }
 
+    /// §85. The toplevels that exist now, mapped or not: a toplevel that has
+    /// been created and has not drawn yet is an application on its way.
+    pub fn live_toplevels(&self) -> usize {
+        self.windows.values().filter(|w| matches!(w.role, Role::Toplevel(_))).count()
+    }
+
     /// Every mapped window, as `(id, client ordinal, surface object id, w, h)`,
     /// bottom of the stack first.
     ///
@@ -1581,6 +1616,61 @@ impl State {
         }
     }
 
+    /// Move every reactive popup whose rectangle the parent's bounds now
+    /// constrain differently. §85.
+    ///
+    /// `xdg_positioner.set_reactive`: "the popup will be reconstrained if the
+    /// conditions used for constraining changed, e.g. the parent window moved".
+    /// The answer goes out as a bare `configure`, with no `repositioned`
+    /// (that one belongs to `xdg_popup.reposition` and its token), and the
+    /// platform is told to move the window. A popup that is not reactive is
+    /// left at its offset from the parent, which on Win32 is the platform's
+    /// to keep (`follow_owner`) and in the stand-in is `control.rs`'s.
+    ///
+    /// Every turn rather than on an event, for the reason `publish_bounds`
+    /// gives: the bounds are a cell the platform rewrites, and nothing tells
+    /// this side when. A handful of rectangles per turn.
+    fn reconstrain_reactive_popups(&mut self) {
+        let mut moved = Vec::new();
+        for w in self.windows.values() {
+            let (Role::Popup(p), Some((parent, x, y))) = (&w.role, w.popup_at) else { continue };
+            if !p.is_initial_configure_sent() {
+                continue;
+            }
+            let positioner = p.with_pending_state(|s| s.positioner);
+            if !positioner.reactive {
+                continue;
+            }
+            let bounds = self.by_id(parent).and_then(popup_bounds_of);
+            let rect = Self::constrain(positioner, bounds);
+            let current = p.with_pending_state(|s| s.geometry);
+            if rect != current || (rect.loc.x, rect.loc.y) != (x, y) {
+                moved.push((w.id, p.clone(), rect));
+            }
+        }
+        for (id, p, rect) in moved {
+            println!(
+                "wc-compositor: reactive xdg_popup window {id} reconstrained to {},{} {}x{}",
+                rect.loc.x, rect.loc.y, rect.size.w, rect.size.h
+            );
+            p.with_pending_state(|s| s.geometry = rect);
+            let _ = p.send_configure();
+            if let Some(w) = self.windows.get_mut(p.wl_surface())
+                && let Some(at) = w.popup_at.as_mut()
+            {
+                at.1 = rect.loc.x;
+                at.2 = rect.loc.y;
+            }
+            self.ui.send(ToUi::MovePopup {
+                id,
+                x: rect.loc.x,
+                y: rect.loc.y,
+                width: rect.size.w,
+                height: rect.size.h,
+            });
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------
@@ -1602,6 +1692,8 @@ impl State {
             let Some(surface) = self.surface_of(id) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
+            // §85: a grabbing popup of this window takes the keys instead.
+            let surface = self.keyboard_target().unwrap_or(surface);
             // **The clipboard follows the keyboard, and until §29 nothing
             // said so.** `wl_data_device`'s selection is offered to the client
             // with *data device focus*, which smithay keeps separately and
@@ -1797,6 +1889,53 @@ impl State {
         pointer.frame(self);
     }
 
+    /// §85. A move or resize is starting, and the platform's modal loop is
+    /// about to own the pointer: tell the client it left, and end the press
+    /// that started the gesture without telling the client it was released.
+    ///
+    /// Windows' `SC_MOVE` loop eats the `WM_LBUTTONUP` that ends it, so this
+    /// side never hears that release. Until §85 nothing ended the press here
+    /// either, and smithay's implicit click grab — which holds the pointer to
+    /// the surface a button went down on until every button is up — stayed
+    /// installed after the move: motion over any other surface of ours was
+    /// still delivered to the window that had been dragged, until the next
+    /// click. A tab dragged by its strip left the rest of the session's hover
+    /// pointed at it.
+    ///
+    /// `leave` is what the protocol owes the client here (WLCS
+    /// `pointer_leaves_surface_during_interactive_move`/`_resize`), and it is
+    /// also what a client takes as "every button is up". The pointer comes
+    /// back with the next motion the platform reports after the loop.
+    fn hand_pointer_to_platform(&mut self, id: WindowId) {
+        let pointer = self.pointer.clone();
+        let time = self.now_ms();
+        if pointer.is_grabbed() {
+            pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+        }
+        if self.pointer_focus == Some(id) {
+            self.pointer_motion(None, 0.0, 0.0, time);
+        }
+        // Focus is gone, so these reach nobody; they only empty smithay's
+        // pressed set, so the next press starts a fresh click grab.
+        for button in std::mem::take(&mut self.buttons_down) {
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                    button,
+                    state: ButtonState::Released,
+                },
+            );
+        }
+    }
+
+    /// See [`Self::gesture_request`]. Read only by the Unix-only stand-in.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn take_gesture_request(&self) -> Option<(WindowId, Option<Edge>)> {
+        self.gesture_request.take()
+    }
+
     fn pointer_button(&mut self, id: WindowId, button: u32, pressed: bool, time: u32) {
         let pointer = self.pointer.clone();
         // ADDED FOR STAGE 20, and it is about touch rather than about the
@@ -1818,6 +1957,21 @@ impl State {
             // delivered, so the pointer is put back over the window first.
             let (x, y) = self.pointer_at;
             self.pointer_motion(Some(id), x, y, time);
+        }
+        if pressed {
+            if !self.buttons_down.contains(&button) {
+                self.buttons_down.push(button);
+            }
+        } else if self.buttons_down.contains(&button) {
+            self.buttons_down.retain(|b| *b != button);
+        } else {
+            // §85: a release for a press `hand_pointer_to_platform` already
+            // ended. smithay has been told; the client was told `leave`.
+            println!(
+                "wc-compositor: window {id} pointer button {button:#x} release after a gesture \
+                 ended its press; not delivered"
+            );
+            return;
         }
         pointer.button(
             self,
@@ -1847,7 +2001,7 @@ impl State {
         // its frame are one logical group and `popup_done` is a different
         // interface's event about a different object.
         if !pressed {
-            self.dismiss_grab_if_outside(id);
+            self.dismiss_grabs_for_click(id);
         }
     }
 
@@ -1905,31 +2059,96 @@ impl State {
         pointer.frame(self);
     }
 
-    /// Dismiss the grabbing popup if the press landed anywhere else.
+    /// Dismiss the grabbing popups a click landed outside of.
     ///
     /// ADDED FOR STAGE 13. A menu is closed by the compositor and not by the
     /// client, because the client cannot see a click outside its own surfaces.
     /// Without this a menu stays up until the application decides to take it
     /// down, which for a click on the page behind it is never.
     ///
+    /// §85: a click dismisses **every** grab above the one it landed in, and all
+    /// of them when it landed in none, innermost first. Stage 13 dismissed only
+    /// the innermost and relied on the client's destroy to expose the next, so
+    /// a Firefox submenu took one click per level to close and the outer menu
+    /// was never told at all by a client that did not destroy on `popup_done`
+    /// (WLCS `grabbed_popups_get_done_events_in_correct_order`). A click in a
+    /// non-grabbing popup counts as a click in the nearest grabbing popup it
+    /// hangs off, so a tooltip over a menu does not close the menu.
+    ///
     /// The popup itself is not destroyed here. `popup_done` is a *request* —
     /// the client destroys the object, and that arrives as
     /// [`XdgShellHandler::popup_destroyed`], which is the only place a window
     /// is removed. Tearing the `HWND` down from here as well would race the
     /// client and leave the protocol object pointing at nothing.
-    fn dismiss_grab_if_outside(&mut self, clicked: WindowId) {
-        let Some(grabbing) = self.popup_grab else { return };
-        if grabbing == clicked {
+    fn dismiss_grabs_for_click(&mut self, clicked: WindowId) {
+        if self.popup_grabs.is_empty() {
             return;
         }
-        if let Some(Window { role: Role::Popup(p), .. }) = self.by_id(grabbing) {
-            println!(
-                "wc-compositor: click on window {clicked} outside the grab -> \
-                 window {grabbing} dismissed (xdg_popup.popup_done)"
-            );
-            p.send_popup_done();
+        let keep = self
+            .popup_chain(clicked)
+            .into_iter()
+            .find_map(|w| self.popup_grabs.iter().position(|&g| g == w))
+            .map_or(0, |i| i + 1);
+        self.dismiss_grabs_above(keep, &format!("click on window {clicked} outside the grab"));
+    }
+
+    /// `clicked`, then the window it is a popup of, and so on to the toplevel.
+    fn popup_chain(&self, mut id: WindowId) -> Vec<WindowId> {
+        let mut chain = vec![id];
+        while let Some((parent, _, _)) = self.by_id(id).and_then(|w| w.popup_at) {
+            if chain.contains(&parent) {
+                break;
+            }
+            chain.push(parent);
+            id = parent;
         }
-        self.popup_grab = None;
+        chain
+    }
+
+    /// Send `popup_done` to every grabbing popup from index `keep` up,
+    /// innermost first, and forget them as grabs. The keyboard goes back to
+    /// whatever is grabbing now, or to the toplevel.
+    fn dismiss_grabs_above(&mut self, keep: usize, why: &str) {
+        while self.popup_grabs.len() > keep {
+            let Some(grabbing) = self.popup_grabs.pop() else { break };
+            if let Some(Window { role: Role::Popup(p), .. }) = self.by_id(grabbing) {
+                println!(
+                    "wc-compositor: {why} -> window {grabbing} dismissed (xdg_popup.popup_done)"
+                );
+                p.send_popup_done();
+            }
+        }
+        self.refocus_keyboard();
+    }
+
+    /// §85. Where keys go: the innermost grabbing popup, if it hangs off the
+    /// window Windows has focused; otherwise that window.
+    ///
+    /// `keyboard_focus` stays the *platform's* answer — the `HWND` with
+    /// `WM_SETFOCUS`, which is always a toplevel because a popup is
+    /// `WS_EX_NOACTIVATE` — and this is the surface smithay is told. The two
+    /// had been the same thing, which is why a grabbed menu could not be driven
+    /// with the arrow keys (WLCS `grabbed_popup_gets_keyboard_focus`).
+    fn keyboard_target(&self) -> Option<WlSurface> {
+        let focused = self.keyboard_focus?;
+        let grab = self
+            .popup_grabs
+            .iter()
+            .rev()
+            .find(|&&g| self.popup_chain(g).last() == Some(&focused));
+        self.surface_of(*grab.unwrap_or(&focused))
+    }
+
+    /// Point smithay's keyboard at [`Self::keyboard_target`] if it is not
+    /// there already. A no-op while nothing has keyboard focus.
+    fn refocus_keyboard(&mut self) {
+        let Some(keyboard) = self.keyboard.clone() else { return };
+        let Some(target) = self.keyboard_target() else { return };
+        if keyboard.current_focus().as_ref() == Some(&target) {
+            return;
+        }
+        self.set_clipboard_focus(Some(&target));
+        keyboard.set_focus(self, Some(target), SERIAL_COUNTER.next_serial());
     }
 
     // --- touch, stage 20 ---------------------------------------------------
@@ -3534,6 +3753,10 @@ impl XdgShellHandler for State {
         let client = client_index(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
         let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
+        // §85. A new toplevel ends every popup grab: the grab was a claim on
+        // the pointer and keyboard for a menu, and a new window is about to
+        // take both. WLCS `grabbed_popup_gets_done_event_when_new_toplevel_created`.
+        self.dismiss_grabs_above(0, "a new toplevel was created");
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
             self.toplevels
@@ -3644,8 +3867,11 @@ impl XdgShellHandler for State {
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
         if let Some(window) = self.windows.get(surface.wl_surface()) {
-            println!("wc-compositor: window {} asked to be moved", window.id);
-            self.ui.send(ToUi::BeginMove { id: window.id });
+            let id = window.id;
+            println!("wc-compositor: window {id} asked to be moved");
+            self.hand_pointer_to_platform(id);
+            self.gesture_request.set(Some((id, None)));
+            self.ui.send(ToUi::BeginMove { id });
         }
     }
 
@@ -3671,11 +3897,11 @@ impl XdgShellHandler for State {
                 // edge" starts a keyboard-driven resize rather than refusing.
                 _ => Edge::None,
             };
-            println!("wc-compositor: window {} asked to be resized from {edge:?}", window.id);
-            self.ui.send(ToUi::BeginResize {
-                id: window.id,
-                edge,
-            });
+            let id = window.id;
+            println!("wc-compositor: window {id} asked to be resized from {edge:?}");
+            self.hand_pointer_to_platform(id);
+            self.gesture_request.set(Some((id, Some(edge))));
+            self.ui.send(ToUi::BeginResize { id, edge });
         }
     }
 
@@ -3937,8 +4163,12 @@ impl XdgShellHandler for State {
             if self.pointer_focus == Some(id) {
                 self.pointer_motion(None, 0.0, 0.0, self.now_ms());
             }
-            if self.popup_grab == Some(id) {
-                self.popup_grab = None;
+            if let Some(i) = self.popup_grabs.iter().position(|&g| g == id) {
+                // A grab destroyed from the middle takes the ones above it
+                // with it: they hang off it and the protocol says so.
+                self.dismiss_grabs_above(i + 1, "the popup under it was destroyed");
+                self.popup_grabs.truncate(i);
+                self.refocus_keyboard();
             }
         }
         if let Some(window) = self.windows.remove(surface.wl_surface()) {
@@ -3974,8 +4204,15 @@ impl XdgShellHandler for State {
         _serial: smithay::utils::Serial,
     ) {
         if let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) {
-            println!("wc-compositor: xdg_popup grab -> window {id} owns the pointer");
-            self.popup_grab = Some(id);
+            println!(
+                "wc-compositor: xdg_popup grab -> window {id} owns the pointer and the keyboard \
+                 ({} grab(s) under it)",
+                self.popup_grabs.len()
+            );
+            if !self.popup_grabs.contains(&id) {
+                self.popup_grabs.push(id);
+            }
+            self.refocus_keyboard();
         }
     }
 

@@ -186,24 +186,41 @@ impl Drop for MappedView {
     }
 }
 
-/// Commit `len` bytes of this process's own memory, pin them into the working
-/// set, and let the caller stamp every 4096-byte page before the region is
-/// handed back **read-only**.
+/// What [`alloc_locked_region`] made: the view, the length it actually has
+/// (rounded up to the large-page size on the large-page path), and how it is
+/// pinned.
+pub struct LockedRegion {
+    pub view: MappedView,
+    pub len: usize,
+    pub locked: bool,
+    pub pinning: &'static str,
+}
+
+/// Commit at least `len` bytes of this process's own memory, pin them, and let
+/// the caller stamp every 4096-byte page before the region is handed back
+/// **read-only**.
 ///
-/// STAGE 7, and the whole substrate change. Returns `(view, locked)`: `locked`
-/// is false when `VirtualLock` failed, which is a real and survivable state —
-/// the pages are still guest RAM and still findable, they are merely allowed to
-/// move — and the caller reports it rather than this function pretending.
+/// STAGE 7, and the whole substrate change; §84 and §85 for which pinning.
 ///
-/// # Why the working set is resized first
+/// # Large pages, or nothing
 ///
-/// `VirtualLock` fails with `ERROR_WORKING_SET_QUOTA` (1453) unless the
-/// process's minimum working set is large enough to hold the region as well as
-/// everything else it has. The default minimum is on the order of a megabyte,
-/// so a 64 MiB arena fails without this call and the failure reads as "locking
-/// is not permitted" rather than "the quota is too small". Same recipe as
-/// `shared_vulkan`'s `awe_probe::alloc::try_locked`, and it is deliberate that
-/// the numbers match: this is the same allocation its step-0 experiment made.
+/// `VirtualLock` keeps a page resident; it does not keep it at one physical
+/// address, and on the guest it was measured not doing so (§84.5): stamps
+/// written *after* `VirtualLock` turned up in two frames at once, in bursts,
+/// and every stale commit of block 12's first interactive run was exactly one
+/// 4 KiB page of the host's view. The one run that put a `VirtualLock`ed arena
+/// under the host's writes after that was measured coincided with a guest hard
+/// hang (§84.7). A host that keeps writing into a frame Windows has given to
+/// somebody else is writing into the guest's memory. So since §85 the
+/// small-page path is not a fallback: when large pages cannot be had this
+/// returns an error that says why, and only `small_pages_diagnostic` (the
+/// compositor's `--arena-small-pages-may-corrupt-guest-memory`) takes the
+/// `VirtualLock` path, unconditionally, for a control run.
+///
+/// The large-page path rounds `len` up to `GetLargePageMinimum()`, because
+/// `MEM_LARGE_PAGES` needs a multiple of it. A growth request is a pool's
+/// length and is almost never one, so before §85 every grown region silently
+/// took the `VirtualLock` path. The caller is told the length that came back.
 ///
 /// # Why the caller stamps here rather than afterwards
 ///
@@ -214,28 +231,22 @@ impl Drop for MappedView {
 /// this function is what lets the contract stay unconditional.
 pub fn alloc_locked_region(
     len: usize,
+    small_pages_diagnostic: bool,
     stamp: &dyn Fn(u32, &mut [u8]),
-) -> io::Result<(MappedView, bool, &'static str)> {
+) -> io::Result<LockedRegion> {
     if len == 0 || !len.is_multiple_of(REGION_PAGE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
         ));
     }
-    // §84. **Large pages first.** `VirtualLock` keeps a page resident; it does
-    // not keep it at one physical address, and on the guest it was measured not
-    // doing so: stamps written *after* `VirtualLock` turned up in two frames at
-    // once, in bursts, and every stale commit of block 12's first interactive
-    // run was exactly one 4 KiB page of the host's view. A large page is
-    // non-pageable and is not relocated, which is why shared_vulkan's
-    // `sf-probe` calls it "the chosen path" and why it allocated one on this
-    // guest. It needs `SeLockMemoryPrivilege` and a multiple of the large-page
-    // size, so it can fail, and the fallback is the old path, reported by name.
-    // `--arena-small-pages` (or `WC_ARENA_NO_LARGE_PAGES=1`) forces the fallback, so the two can be measured
-    // against each other on one machine.
-    if crate::arena::large_pages_allowed()
-        && let Some(base) = try_large_pages(len)
-    {
+    if !small_pages_diagnostic {
+        let (base, len) = try_large_pages(len).map_err(|why| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                crate::arena::refusal_text(&why),
+            )
+        })?;
         let view = MappedView {
             address: MEMORY_MAPPED_VIEW_ADDRESS { Value: base },
             len,
@@ -247,8 +258,9 @@ pub fn alloc_locked_region(
         for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
             stamp(i as u32, page);
         }
-        return Ok((view, true, "large-pages"));
+        return Ok(LockedRegion { view, len, locked: true, pinning: "large-pages" });
     }
+    // The diagnostic path: `VirtualLock`, which §84 measured relocating pages.
     // SAFETY: a null base asks the kernel to choose the address; the size is
     // checked non-zero above. The result is checked for null before use.
     let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
@@ -263,29 +275,23 @@ pub fn alloc_locked_region(
     // From here on `view` owns the reservation, so every early return releases
     // it. That ordering is why the `MappedView` is built before the region is
     // touched rather than after.
+    //
+    // The working set is resized first because `VirtualLock` fails with
+    // `ERROR_WORKING_SET_QUOTA` (1453) unless the minimum working set holds the
+    // region as well as everything else; same recipe as shared_vulkan's
+    // `awe_probe::alloc::try_locked`.
     let (mut lo, mut hi) = (0usize, 0usize);
     // SAFETY: both out-parameters are live locals; the pseudo-handle from
     // `GetCurrentProcess` needs no closing.
     unsafe {
         if GetProcessWorkingSetSize(GetCurrentProcess(), &mut lo, &mut hi) != 0 {
-            // Twice the region, as shared_vulkan does: the arena has to fit and
-            // so does everything the process already had resident.
             SetProcessWorkingSetSize(GetCurrentProcess(), lo + len * 2, hi + len * 2);
         }
     }
-    // **Lock, then stamp.** §84. This said "stamp before locking ... locking
-    // pages that have never been touched is a slower way to reach the same
-    // state", and it is not the same state. While the stamps were written the
-    // pages were ordinary unlocked working-set pages, and 64 MiB of freshly
-    // dirtied memory is exactly what Windows trims: a trimmed page that
-    // `VirtualLock` then faults back comes back in a *different frame*, and the
-    // frame it left still holds its stamp until something zeroes or reuses it.
-    // Measured on the guest with this order: the host's content sweep found 219
-    // arena pages stamped in two frames at once (58 from an ssh session),
-    // decaying to 1-5 over the next minute as the old frames were reused, and
-    // refused every locate; the PFN query came back missing pages. Locked first,
-    // every page is resident and pinned before it carries a stamp, so there is
-    // no window in which a stamped page can be moved and no stale copy to find.
+    // **Lock, then stamp.** §84: stamped first, a trimmed page that
+    // `VirtualLock` faulted back came back in a different frame and the old
+    // frame still carried its stamp (219 pages claimed twice). Locked first,
+    // that window is closed. It did not stop locked pages relocating later.
     // SAFETY: the region is live and `len` bytes long.
     let locked = unsafe { VirtualLock(base, len) } != 0;
     // SAFETY: `base` is a live `len`-byte read-write region owned by `view`, and
@@ -294,22 +300,23 @@ pub fn alloc_locked_region(
     for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
         stamp(i as u32, page);
     }
-    Ok((view, locked, if locked { "virtual-lock" } else { "none" }))
+    Ok(LockedRegion { view, len, locked, pinning: if locked { "virtual-lock" } else { "none" } })
 }
 
-/// `VirtualAlloc(MEM_LARGE_PAGES)` for `len` bytes, or `None` when this process
-/// cannot have them: no large-page support, a size that is not a multiple of
-/// the large-page minimum, `SeLockMemoryPrivilege` not held by the account, or
-/// no contiguous physical memory left. Every one of those is a reason to take
-/// the `VirtualLock` path, not to fail the arena.
-fn try_large_pages(len: usize) -> Option<*mut core::ffi::c_void> {
+/// `VirtualAlloc(MEM_LARGE_PAGES)` for `len` bytes rounded up to the
+/// large-page size, or the reason this process cannot have them: no
+/// large-page support, `SeLockMemoryPrivilege` not held by the account, or no
+/// contiguous physical memory left. Since §85 each of those is a refusal, and
+/// the reason is the first thing its message says.
+fn try_large_pages(len: usize) -> Result<(*mut core::ffi::c_void, usize), String> {
     // SAFETY: no arguments.
     let min = unsafe { GetLargePageMinimum() };
-    if min == 0 || !len.is_multiple_of(min) {
-        return None;
+    if min == 0 {
+        return Err("GetLargePageMinimum() is 0: this system has no large pages".into());
     }
+    let len = len.div_ceil(min).checked_mul(min).ok_or("arena too large")?;
     if !enable_privilege("SeLockMemoryPrivilege") {
-        return None;
+        return Err("this account does not hold SeLockMemoryPrivilege, which large pages need".into());
     }
     // SAFETY: a null base asks the kernel to choose; `len` is a non-zero
     // multiple of the large-page size, which `MEM_LARGE_PAGES` requires.
@@ -321,7 +328,14 @@ fn try_large_pages(len: usize) -> Option<*mut core::ffi::c_void> {
             PAGE_READWRITE,
         )
     };
-    (!base.is_null()).then_some(base)
+    if base.is_null() {
+        return Err(format!(
+            "VirtualAlloc(MEM_LARGE_PAGES, {len} bytes) failed: {} (no contiguous physical memory \
+             left is the usual reason on a guest that has been up a while)",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok((base, len))
 }
 
 /// Enable one privilege the account already holds in this process's token.

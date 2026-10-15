@@ -67,6 +67,11 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
         cfg.output.clone(),
         "--timeout".into(),
         cfg.session_secs.to_string(),
+        // §85. The session ends this long after its last window closes; the
+        // launcher's `supervise` is waiting on the compositor and tears down
+        // the rest when it goes.
+        "--exit-when-empty".into(),
+        cfg.linger_secs.to_string(),
         // The two that make this an arena over the device's BAR: region 0 is
         // the first ivshmem device, and the outbound window is its tail.
         "--arena-ivshmem".into(),
@@ -470,6 +475,17 @@ mod tests {
         let argv = compositor_argv(&c, "s", "l");
         let i = argv.iter().position(|a| a == "--timeout").unwrap();
         assert_eq!(argv[i + 1], "43200");
+    }
+
+    /// §85. The last window closing ends the session after `linger-secs`.
+    #[test]
+    fn the_compositor_is_told_to_end_the_session_after_its_last_window() {
+        let mut c = cfg();
+        c.linger_secs = 75;
+        let argv = compositor_argv(&c, "s", "l");
+        let i = argv.iter().position(|a| a == "--exit-when-empty").unwrap();
+        assert_eq!(argv[i + 1], "75");
+        assert_eq!(Config::default().linger_secs, 60);
     }
 
     #[test]

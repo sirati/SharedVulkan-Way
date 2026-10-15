@@ -584,6 +584,19 @@ pub(crate) struct SubsurfaceState {
     /// `SubsurfaceCachedState::current` when the **parent** commits. Readers are
     /// unaffected: `current().location` is still where the applied position is.
     pub(crate) pending_location: Mutex<Point<i32, Logical>>,
+    /// waycompose §85. The position the **parent** has committed and not yet
+    /// applied: `pending_location` as it stood at the parent's last commit.
+    ///
+    /// The parent's state, like any surface's, is committed by its
+    /// `wl_surface.commit` and *applied* only when that commit takes effect —
+    /// at once for a desync parent, at its own parent's commit for a sync one.
+    /// §68 kept one stage where the protocol has two, so a sync middle level
+    /// applied its children's positions from the bare request whenever its
+    /// parent committed, whether or not it had committed itself. WLCS
+    /// `subsurface_with_sync_parent_does_not_move_when_only_grandparent_committed`
+    /// and `subsurface_does_not_move_when_grandparent_commit_is_before_sync_parent_commit`
+    /// measure exactly that, and Mir passes both.
+    pub(crate) committed_location: Mutex<Option<Point<i32, Logical>>>,
 }
 
 impl SubsurfaceState {
@@ -591,6 +604,7 @@ impl SubsurfaceState {
         SubsurfaceState {
             sync: AtomicBool::new(true),
             pending_location: Mutex::new((0, 0).into()),
+            committed_location: Mutex::new(None),
         }
     }
 }

@@ -46,7 +46,11 @@ where
                 }
             }
             xdg_positioner::Request::SetAnchorRect { x, y, width, height } => {
-                if width < 1 || height < 1 {
+                // waycompose §85: xdg-shell says "If a negative size is set the
+                // invalid_input error is raised"; a zero-size anchor rectangle
+                // (a point, which is what a menu at the cursor anchors to) is
+                // legal. Upstream refused it (WLCS `zero_size_anchor_rect_stable`).
+                if width < 0 || height < 0 {
                     positioner.post_error(
                         xdg_positioner::Error::InvalidInput,
                         "Invalid size for positioner's anchor rectangle.",

@@ -19,6 +19,10 @@
 /// answering some time after an unrelated client connected.
 #[test]
 fn the_channel_takes_the_front_and_gifts_come_from_after_it() {
+    // §85: no hypervisor here, so nothing outside can write a moved page; and
+    // this machine reserves no hugetlb pages. Without this the commit below
+    // is refused and the test would skip instead of running.
+    wc_handle::arena::allow_small_pages_that_may_corrupt_guest_memory();
     const ARENA: u64 = 4 << 20;
     // Comfortably more than `CONTROL_BYTES`, so a window is left over.
     const WINDOW: u64 = 1 << 20;

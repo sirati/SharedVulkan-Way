@@ -362,6 +362,13 @@ struct WindowState {
     corner_clear: Cell<Option<bool>>,
     /// §82: whether `draw_fallback_buttons` has said so yet.
     fallback_said: Cell<bool>,
+    /// §85. For a popup: where it sits in its owner's client coordinates now,
+    /// which is `kind`'s `x, y` until `ToUi::MovePopup` says otherwise. Kept so
+    /// the popup can be put back there when the *owner* moves: an owned
+    /// `WS_POPUP` does not follow its owner on Windows, and `xdg_popup` is
+    /// positioned relative to its parent, so without this a menu stayed where
+    /// the window had been.
+    popup_offset: Cell<(i32, i32)>,
     /// The taskbar identity currently on this window's property store.
     ///
     /// ADDED FOR STAGE 32. Held so that a repeated `set_app_id` with the same
@@ -1457,6 +1464,11 @@ unsafe extern "system" fn toplevel_proc(
         // negotiation with it.
         WM_WINDOWPOSCHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             state.publish_popup_bounds();
+            if msg == WM_WINDOWPOSCHANGED
+                && let Some(ui) = ui()
+            {
+                follow_owner(&ui, state.id, hwnd);
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_ACTIVATE => {
@@ -2510,6 +2522,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         // is already up, and re-showing it would flicker.
         ToUi::MovePopup { id, x, y, width, height } => {
             if let Some(w) = window(ui, id) {
+                w.popup_offset.set((x, y));
                 let mut origin = POINT { x, y };
                 // SAFETY: live handles; `ClientToScreen` converts in place and
                 // the owner is the one set at creation.
@@ -2876,6 +2889,10 @@ fn create_window(
         caption_colour: Cell::new(None),
         corner_clear: Cell::new(None),
         fallback_said: Cell::new(false),
+        popup_offset: Cell::new(match kind {
+            WindowKind::Popup { x, y, .. } => (x, y),
+            WindowKind::Toplevel => (0, 0),
+        }),
         aumid: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
@@ -3588,6 +3605,45 @@ fn frame_glass(w: &WindowState) -> bool {
 /// mouse move a caption click produces, and it follows the pointer from where
 /// it is. Resizes already passed a `WMSZ_*` edge in the low bits, which is the
 /// mouse form, and are unchanged.
+/// §85. Put every mapped popup owned by window `owner` back at its offset in
+/// the owner's client area, after the owner moved.
+///
+/// The popup's own `WM_WINDOWPOSCHANGED` does the same for *its* popups, so a
+/// submenu follows its menu without this recursing. The list is copied out of
+/// the registry before any `SetWindowPos`, which reenters this procedure.
+fn follow_owner(ui: &Rc<Ui>, owner: WindowId, owner_hwnd: HWND) {
+    let popups: Vec<Rc<WindowState>> = ui
+        .windows
+        .borrow()
+        .values()
+        .filter(|w| matches!(w.kind, WindowKind::Popup { parent, .. } if parent == owner))
+        .filter(|w| w.mapped.get())
+        .cloned()
+        .collect();
+    for p in popups {
+        let (x, y) = p.popup_offset.get();
+        let mut origin = POINT { x, y };
+        let mut now = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: live handles on the thread that owns them; `ClientToScreen`
+        // and `GetWindowRect` write only the structures they are given.
+        unsafe {
+            ClientToScreen(owner_hwnd, &mut origin);
+            if GetWindowRect(p.hwnd(), &mut now) != 0 && (now.left, now.top) == (origin.x, origin.y) {
+                continue;
+            }
+            SetWindowPos(
+                p.hwnd(),
+                std::ptr::null_mut(),
+                origin.x,
+                origin.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
 fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
     const HTCAPTION: u32 = 2;
     let (command, lparam) = if command == SC_MOVE {
@@ -3607,6 +3663,11 @@ fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
         ReleaseCapture();
         PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, lparam);
     }
+    // §85. The modal loop eats the `WM_LBUTTONUP`, so the count `on_button`
+    // keeps would stay at one for the rest of the window's life and the next
+    // press would not take the capture. The compositor ends the press on its
+    // side for the same reason (`State::hand_pointer_to_platform`).
+    w.buttons_down.set(0);
     println!("wc-compositor: window {} handed a {what} to Windows", w.id);
 }
 

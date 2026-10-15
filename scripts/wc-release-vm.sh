@@ -255,6 +255,11 @@ export XDG_RUNTIME_DIR=/tmp
 # by the guest's own kernel, into the guest's own log.
 echo "guest kernel: \$(uname -r)"
 echo "guest uname: \$(uname -a)"
+# §85: a guest-RAM arena is large pages or nothing, and on Linux that is
+# MAP_HUGETLB from the pool this reserves (none by default). The mlock path is
+# --arena-small-pages-may-corrupt-guest-memory and this leg does not take it.
+echo $((ARENA_MIB / 2 + 128)) > /proc/sys/vm/nr_hugepages
+echo "guest hugetlb: \$(grep -E 'HugePages_(Total|Free)' /proc/meminfo | tr -s ' ' | tr '\n' ' ')"
 /sv/wc-compositor --wayland-cold /dev/virtio-ports/org.sirati.svcold.0 \
   --socket wcrel --timeout 400 \
   --arena-guest-ram 0:$((ARENA_MIB * 1024 * 1024)) --arena-outbound 0:$OUTBOUND \
