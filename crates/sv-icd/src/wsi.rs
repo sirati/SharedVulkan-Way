@@ -718,7 +718,7 @@ fn frame_note(
     FENCE_NS.fetch_add(fence.as_nanos() as u64, Ordering::Relaxed);
     COPY_NS.fetch_add(copy.as_nanos() as u64, Ordering::Relaxed);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n % EVERY != 0 {
+    if !n.is_multiple_of(EVERY) {
         return;
     }
     let frames = if n == 0 { 1.0 } else { EVERY as f64 };
