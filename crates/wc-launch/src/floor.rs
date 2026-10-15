@@ -27,6 +27,17 @@
 //!
 //! That is why 768 MiB reaching a user was a bug and not a tuning error, and it
 //! is why the correct direction is always "as small as the evidence allows".
+//!
+//! # IVSHMEM ARENA: this is now a guest-RAM policy the launcher does not use
+//!
+//! docs/waycompose-design.md §82 moved the launcher onto BAR2 of an ivshmem device,
+//! whose size is set on the VM host, is not `VirtualLock`ed and is not charged
+//! against the guest's RAM. None of the asymmetry above applies to it. The
+//! policy and its evidence stay, because `[session] arena-mib` still defaults
+//! from [`Floor::CURRENT`] and the developer harnesses still start guest-RAM
+//! arenas; only `mib` has a caller in this binary, which is why the dead-code
+//! lint is quieted for the module rather than the evidence deleted.
+#![allow(dead_code)]
 
 /// What one region has to hold **on its own**, from measurements on the
 /// deployment this launcher runs.

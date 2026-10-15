@@ -11,15 +11,17 @@
 // another machine, and the Windows gate is where it has to be alive.
 #![cfg_attr(not(windows), allow(dead_code))]
 //! `wc-launch` — double-click an icon on the Windows desktop, and a Linux
-//! application appears in a window, over the guest's own RAM.
+//! application appears in a window, over memory both machines map.
 //!
-//! Read docs/waycompose-design.md §28. In one paragraph: the compositor runs here, in the
-//! guest, on the interactive desktop, and provides an arena out of its own
-//! pinned pages; the VM host locates those pages once, runs `wc-proxy` on the
-//! plan, and runs the application; the Wayland bytes cross on a loopback relay
-//! and an ssh remote forward. The expensive step is the locate — 2.4 s of
-//! sweeping 13 GiB for stamps (§12.5) — and the whole shape of this program is
-//! an answer to it: **the session is warm, and a click is one ssh exec.**
+//! Read docs/waycompose-design.md §28 and §82. In one paragraph: the compositor runs here,
+//! in the guest, on the interactive desktop, and provides an arena out of BAR2
+//! of the VM's ivshmem device; the VM host checks the header the compositor
+//! wrote at the front of that region, runs `wc-proxy` on it **as the user**,
+//! and runs the application; the Wayland bytes cross on a loopback relay and an
+//! ssh remote forward. Until §82 the arena was the guest's pinned RAM and the
+//! host had to locate it as root; the shape of this program — **the session is
+//! warm, and a click is one ssh exec** — was the answer to that cost and is
+//! kept because a cold start is still a compositor and a proxy to start.
 //!
 //! The first instance to run takes a named mutex and becomes the session's
 //! owner; every later one finds the mutex taken, reads the session's state file
@@ -566,80 +568,50 @@ mod win {
             .map_err(|e| format!("state file: {e}"))?;
 
         // 1. The compositor, here, on the desktop the user is looking at.
-        let argv = plan::compositor_argv(
-            cfg,
-            &socket,
-            &p.comp_log.to_string_lossy(),
-            &p.comp_log.with_file_name("arena.frames").to_string_lossy(),
-        );
-        // Which floor policy this session started under, and why. A run whose
-        // startup size cannot be explained from its own output is a run
-        // somebody will have to guess about later — and guessing about this
-        // number is how 768 MiB survived an afternoon.
-        log.say(&format!(
-            "arena floor: {} MiB — {}",
-            cfg.arena_mib,
-            crate::floor::Floor::CURRENT.why()
-        ));
+        let argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
+        // IVSHMEM ARENA (§82). The arena is BAR2 of the VM's ivshmem device, so
+        // its size is the device's, set on the VM host, and `arena-mib` decides
+        // nothing. Said once per session so that a log read later cannot
+        // mistake which substrate ran.
+        log.say("arena: ivshmem BAR2, sized by the VM host's device (arena-mib is unused)");
         log.say(&format!("compositor: {} {}", cfg.compositor, argv.join(" ")));
         let comp = quiet(Command::new(&cfg.compositor).args(&argv))
             .spawn()
             .map_err(|e| format!("{}: {e}", cfg.compositor))?;
         let comp_pid = comp.id();
 
-        // 2. Its arena, and the run id the host has to sweep for. This line is
-        //    printed after the stamps are written, so waiting for it is waiting
-        //    for the region to be findable (§12.10).
-        let (run_id, pages) = wait_for(&p.comp_log, 60, |l| {
-            let rest = l.split_once("provided from guest RAM: run ")?.1;
-            let run = rest.split(',').next()?.trim().to_string();
-            let pages = rest.split(", ").nth(2)?.split_whitespace().next()?.parse::<u64>().ok()?;
-            Some((run, pages))
+        // 2. Its arena's run id, from the line printed **after** the header is
+        //    published. Waiting for the earlier "provided" line would race the
+        //    header: the host would read a cleared magic and refuse.
+        //
+        // **Every failure from here on kills the compositor**, and that is a
+        // fix rather than tidiness: a compositor left running holds the
+        // device's one mapping — the driver allows one per device, so the next
+        // click's compositor could not map it — holds its own executable open,
+        // so the next deploy fails with `scp: dest open "sv-guest.exe":
+        // Failure`, and holds the mutex's session half-built.
+        let run_id = wait_for(&p.comp_log, 60, |l| {
+            let rest = l.split_once("header published: run ")?.1;
+            Some(rest.split(',').next()?.trim().to_string())
         })
         .map_err(|_| {
             kill(comp_pid);
-            "the compositor never provided a guest-RAM arena".to_string()
+            "the compositor never published an ivshmem arena".to_string()
         })?;
-        log.say(&format!("arena: run {run_id}, {pages} pages, {} ms", t.elapsed().as_millis()));
+        log.say(&format!("arena: run {run_id}, {} ms", t.elapsed().as_millis()));
 
-        // 3. The locate, on the VM host. §12.5's 2.4 s, paid here and not on a
-        //    click.
-        //
-        // **Every failure from here on kills the compositor**, and that is a
-        // fix rather than tidiness: a compositor left running holds 768 MiB of
-        // the guest's pinned RAM, holds its own executable open — so the next
-        // deploy fails with `scp: dest open "sv-guest.exe": Failure`, which
-        // reads as a permissions problem — and holds the mutex's session
-        // half-built. The first version returned `?` here and the next click
-        // met a guest with a compositor nobody owned.
-        // The frame list, if the compositor managed one. Its absence is a
-        // *slow* locate rather than a broken one — the host falls back to the
-        // sweep — so this is conditional and says which way it went. A guest
-        // whose account lacks the privilege, or a build without the query, is
-        // still a working session.
-        let frames_path = p.comp_log.with_file_name("arena.frames");
-        let frames = std::fs::metadata(&frames_path).map(|m| m.len() > 0).unwrap_or(false);
+        // 3. The host checks the header against the run id. No locate, no root:
+        //    it opens a file its group may open. What used to be §12.5's 2.4 s
+        //    sweep and then §34.8's frame-list translation is one read.
         let t_locate = Instant::now();
-        let mut verb: Vec<String> =
-            ["up", &id, &run_id, &pages.to_string(), &cfg.outbound.to_string()]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        if frames {
-            // The word is what tells `wc-session` to read stdin at all. A verb
-            // that always read it would block on a launcher that sent nothing,
-            // which is the older spelling of this call and has to keep working.
-            verb.push("frames".into());
-        }
-        let verb: Vec<&str> = verb.iter().map(String::as_str).collect();
-        let said = match ssh_in(cfg, p, &verb, frames.then_some(frames_path.as_path())) {
+        let said = match ssh(cfg, p, &["up", &id, &run_id, "ivshmem"]) {
             Ok(s) => s,
             Err(e) => {
                 kill(comp_pid);
                 return Err(e);
             }
         };
-        log.say(&format!("locate: {} ({} ms)", said.replace('\n', " | "), t_locate.elapsed().as_millis()));
+        log.say(&format!("up: {} ({} ms)", said.replace('\n', " | "), t_locate.elapsed().as_millis()));
 
         // 4. The relay, and the tunnel that gives the host an end of it.
         let relay = quiet(

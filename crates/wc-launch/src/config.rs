@@ -81,6 +81,12 @@ pub struct Config {
     /// window. Its size is a floor for the whole session that release can never
     /// recover, which is why over-reserving is the more expensive mistake and
     /// why 768 MiB once reached a user.
+    ///
+    /// IVSHMEM ARENA (§82): **read and validated, and decides nothing** on the
+    /// launcher's own path any more. The arena is BAR2 of an ivshmem device and
+    /// has the size the VM host gave it. The key stays so an existing
+    /// `wc-launch.ini` still parses, and because `outbound` is still checked
+    /// against it.
     pub arena_mib: u64,
     /// How much of it the compositor keeps for the objects it makes for clients.
     pub outbound: u64,
@@ -226,10 +232,6 @@ impl Config {
             let known: Vec<&str> = self.apps.keys().map(String::as_str).collect();
             format!("no [app.{id}] in the configuration; it has {}", known.join(", "))
         })
-    }
-
-    pub fn arena_bytes(&self) -> u64 {
-        self.arena_mib * 1024 * 1024
     }
 }
 
