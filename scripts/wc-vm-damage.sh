@@ -217,7 +217,7 @@ block_linux() {
   # first two runs of this leg reported "2 client msgs, 0 server msgs" -- the
   # client reached the proxy, the compositor answered, and the answers went
   # nowhere. Starting this side first costs nothing and removes the race.
-  socat "UNIX-LISTEN:$RUNDIR/upstream.sock,fork" "UNIX-CONNECT:$RUNDIR/wl.sock" \\
+  socat "UNIX-LISTEN:$RUNDIR/upstream.sock,fork" "UNIX-CONNECT:$RUNDIR/wl.sock" \
     >"$RUNDIR/relay-host.log" 2>&1 &
   RELAY_HOST=$!
   sleep 1
