@@ -90,6 +90,29 @@ pub const CMD_FLAG_GENERATE_REPLY: u32 = 0x1;
 /// The `pNext` chain terminator: a zero link length.
 pub const PNEXT_TERMINATOR: u32 = 0;
 
+/// Find the entry for `s_type` in a generated `pNext` dispatch table.
+///
+/// **Why the chain walkers dispatch through a table and not a `match`**
+/// (docs/design.md §0.27): a `match` with an arm per link type compiles, in a
+/// debug build, to a frame holding every arm's temporaries side by side —
+/// measured at 140 KB for `lower_pnext` and 145 KB for `decode_pnext` — and a
+/// Firefox WebRender thread has 256 KiB of stack in total. A table of function
+/// pointers puts nothing per link in the walker's frame, in any profile.
+///
+/// The generator emits each table sorted by `sType` with no duplicates; the
+/// generated crates test that, because a mis-sorted table would make this
+/// lookup miss silently.
+#[inline]
+pub fn pnext_table_lookup<F: Copy>(table: &[(i32, F)], s_type: i32) -> Option<F> {
+    table.binary_search_by_key(&s_type, |e| e.0).ok().map(|i| table[i].1)
+}
+
+/// Whether a generated `pNext` dispatch table is strictly increasing by
+/// `sType`, which is what [`pnext_table_lookup`] relies on.
+pub fn pnext_table_is_sorted<F>(table: &[(i32, F)]) -> bool {
+    table.windows(2).all(|w| w[0].0 < w[1].0)
+}
+
 /// Anything that can go wrong reading or writing the wire.
 ///
 /// Deliberately not `Vec`-allocating and deliberately `Copy`: this type appears
