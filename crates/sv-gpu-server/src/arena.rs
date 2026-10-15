@@ -290,9 +290,18 @@ pub fn allocate_and_export(driver: &Driver, len: u64) -> Result<Arena> {
         vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
     };
 
-    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // **Cached if the driver has it** (docs/design.md §0.28). Every presented
+    // frame comes back through this arena and is *read* by the CPU — the
+    // swapchain's readback buffer lives here — and RADV's first
+    // HOST_VISIBLE|HOST_COHERENT type is write-combined GTT, where a CPU read is
+    // uncached. Measured: Firefox at 1280x900 spent 8 ms a frame copying 4.6 MB
+    // out of it. The arena the real topology uses is guest RAM, which is cached
+    // anyway, so this makes the local measurement say what that one would
+    // rather than something worse.
+    let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let type_index = driver
-        .memory_type(u32::MAX, want)
+        .memory_type(u32::MAX, coherent | vk::MemoryPropertyFlags::HOST_CACHED)
+        .or_else(|| driver.memory_type(u32::MAX, coherent))
         .ok_or(DriverError::Missing("a HOST_VISIBLE|HOST_COHERENT memory type"))?;
 
     let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(kind);

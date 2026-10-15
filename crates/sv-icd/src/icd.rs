@@ -367,7 +367,11 @@ impl IcdLocal for SharedVulkan {
             // `svExecuteCommandBlob` descriptors. **That is not built** — see
             // the note in `sv_gpu_server::server` — so no block is reserved and
             // each `vkCmd*` crosses as its own device-ring packet instead.
-            (0..info.command_buffer_count.max(1)).map(|_| s.mint()).collect()
+            let ids: Vec<u64> = (0..info.command_buffer_count.max(1)).map(|_| s.mint()).collect();
+            for id in &ids {
+                s.command_buffers.insert(*id, info.command_pool.0);
+            }
+            ids
         };
         if let Some(t) = self.wire() {
             let reply = forward::allocate_command_buffers(
@@ -396,6 +400,12 @@ impl IcdLocal for SharedVulkan {
                     p_command_buffers: buffers.iter().map(|b| p::VkCommandBuffer(*b)).collect(),
                 },
             );
+        }
+        {
+            let mut s = self.state();
+            for b in buffers {
+                s.command_buffers.remove(b);
+            }
         }
         // After the free has been queued, not before: `free_blob` waits for the
         // GPU side to finish with the block, and the packet it is waiting past
@@ -873,32 +883,39 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// Arena memory is given back here; heap-0 memory is forwarded, and
+    /// **forwarded before it is forgotten** (docs/design.md §0.28).
+    ///
+    /// The generated `forward::free_memory` rewrites the id through
+    /// `MemoryRewrite`, which looks it up in the very table this removes it
+    /// from. Removing first made every heap-0 free fail on this side with
+    /// `NoSuchMemory` — reported only under `SV_DEBUG`, and only as a line —
+    /// so the GPU side never freed a single device-local allocation: 416 to
+    /// 439 per five-minute Firefox run, each a real driver allocation kept
+    /// until the session ended.
     fn free_memory(&self, args: p::VkFreeMemoryArgs) -> IcdResult<()> {
-        let arena_backed = {
-            let mut s = self.state();
-            match s.memories.remove(&args.memory.0) {
-                Some(m) => match m.allocation {
-                    Some(a) => {
-                        // docs/design.md §5.5 defers this until the timelines an
-                        // allocation could be referenced by have passed. The
-                        // timeline mirror is not wired to submissions yet, so
-                        // this is still immediate — the honest gap, and the one
-                        // `ArenaAllocator::free_deferred` is waiting for.
-                        let _ = s.allocator.free_now(a);
-                        true
-                    }
-                    None => false,
-                },
-                None => return Ok(()),
-            }
+        let id = args.memory.0;
+        let arena_backed = match self.state().memories.get(&id) {
+            Some(m) => m.allocation.is_some(),
+            None => return Ok(()),
         };
         // Arena memory has no GPU-side object to free: it is a sub-range of the
         // one arena allocation, which outlives every application. Heap-0 memory
         // does, and it is a real driver allocation there.
-        if !arena_backed && let Some(t) = self.wire() {
-            forward::free_memory(t, args)?;
+        let forwarded = match (arena_backed, self.wire()) {
+            (false, Some(t)) => forward::free_memory(t, args),
+            _ => Ok(()),
+        };
+        let mut s = self.state();
+        if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
+            // docs/design.md §5.5 defers this until the timelines an
+            // allocation could be referenced by have passed. The timeline
+            // mirror is not wired to submissions yet, so this is still
+            // immediate — the honest gap, and the one
+            // `ArenaAllocator::free_deferred` is waiting for.
+            let _ = s.allocator.free_now(a);
         }
-        Ok(())
+        forwarded
     }
 
     fn get_buffer_memory_requirements(
@@ -1389,8 +1406,30 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// Destroying a pool frees every command buffer allocated from it, and so
+    /// every blob block they hold (docs/design.md §0.28).
+    ///
+    /// The blocks go back after the destroy is queued, for the reason
+    /// `free_command_buffers` gives: `free_blob` waits for the GPU side to
+    /// finish reading, and the packets it waits past must be on the ring.
     fn destroy_command_pool(&self, args: p::VkDestroyCommandPoolArgs) -> IcdResult<()> {
-        forwarded!(self, destroy_command_pool, args, { Ok(()) })
+        let pool = args.command_pool.0;
+        let r = forwarded!(self, destroy_command_pool, args, { Ok(()) });
+        let freed: Vec<u64> = {
+            let mut s = self.state();
+            let freed: Vec<u64> =
+                s.command_buffers.iter().filter(|(_, p)| **p == pool).map(|(cb, _)| *cb).collect();
+            for cb in &freed {
+                s.command_buffers.remove(cb);
+            }
+            freed
+        };
+        if let Some(t) = self.ring_transport() {
+            for cb in freed {
+                t.free_blob(cb);
+            }
+        }
+        r
     }
 
     /// docs/design.md §6.5, and the correction to it that the blob forced.

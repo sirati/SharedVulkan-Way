@@ -291,6 +291,14 @@ pub struct State {
     /// anything, and the pool that will take the record away. See
     /// [`State::set_layouts`] and [`DescriptorSet`].
     pub descriptor_sets: HashMap<u64, DescriptorSet>,
+    /// `VkCommandBuffer` id → the `VkCommandPool` it was allocated from.
+    ///
+    /// Kept for one reason: `vkDestroyCommandPool` frees every command buffer
+    /// of the pool without naming one of them, and each of those holds a block
+    /// of the blob reserve. Without this the blocks of a destroyed pool were
+    /// never given back — Zink destroys a pool with every context, and Firefox
+    /// makes a WebGL context per page (docs/design.md §0.28).
+    pub command_buffers: HashMap<u64, u64>,
     pub allocator: Box<dyn Backing>,
 }
 
@@ -307,6 +315,7 @@ impl State {
             templates: HashMap::new(),
             set_layouts: HashMap::new(),
             descriptor_sets: HashMap::new(),
+            command_buffers: HashMap::new(),
             allocator,
         }
     }

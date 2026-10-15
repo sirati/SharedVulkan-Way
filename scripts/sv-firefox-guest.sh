@@ -283,6 +283,20 @@ fi
 # about one environment variable does not need an edit to this file.
 EXTRA=${SVFF_EXTRA_ENV:-}
 
+# **Zink on the Wayland platform needs a Mesa that allows it** (docs/design.md
+# §0.28). `wc-proxy` offers `wl_shm` and no DRM device, and stock Mesa then loads
+# llvmpipe on the Wayland platform whatever this ICD offers. `SVFF_KOPPER_MESA`
+# is the store path of `nix/mesa-kopper-wayland.nix` — this host's own Mesa plus
+# the override platform_x11.c already reads — built on this host against the
+# nixpkgs its Firefox comes from (the command is in docs/design.md §0.28).
+# Unset, the run is what it always was. Not used by `x11`, which has kopper on
+# stock Mesa already.
+KOPPER_MESA=${SVFF_KOPPER_MESA:-}
+KOPPER_ENV=""
+if [ -n "$KOPPER_MESA" ] && [ "$MODE" != soft ] && [ "$MODE" != x11 ]; then
+  KOPPER_ENV="__EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json LIBGL_KOPPER_DRI2=1"
+fi
+
 # `probe` runs eglinfo on the **Wayland** platform instead of Firefox, against
 # the same proxy, in the same unit, with the same environment. It exists because
 # "Failed to create EGLConfig for WebRender" is Firefox reporting somebody
@@ -333,6 +347,7 @@ X11
 else
   CLIENTCMD="$FIREFOX --no-remote --profile $RUN/profile $URL"
 fi
+GLENV="$GLENV${KOPPER_ENV:+ $KOPPER_ENV}"
 say "mode=$MODE, GL env: $GLENV ${EXTRA:+(extra: $EXTRA)}"
 
 cat >"$RUN/hostside.sh" <<HOSTSIDE
