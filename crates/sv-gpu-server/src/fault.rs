@@ -120,11 +120,103 @@ mod win {
         }
         msg.push_str("[gpu] FAULT: the last command on each ring:\n");
         msg.push_str(&super::report());
+        // docs/video-decode.md §7.10: the ring slots above are shared by every
+        // session of the process, so the video log's own last line is what
+        // names the call that was inside a decode driver.
+        msg.push_str(&crate::video_log::fault_summary());
         msg.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
         // Written in one call so that two dying threads do not interleave.
         use std::io::Write;
         let _ = std::io::stderr().write_all(msg.as_bytes());
+        // Also into the video log's file, if it has one: that file is what
+        // the guest run collects.
+        crate::video_log::emit_raw(&msg);
+        // SAFETY: `p` is the filter's own argument, valid for this call.
+        unsafe { minidump(p) };
         CONTINUE_SEARCH
+    }
+
+    #[repr(C, packed(4))]
+    struct MinidumpExceptionInformation {
+        thread_id: u32,
+        exception_pointers: *mut ExceptionPointers,
+        client_pointers: i32,
+    }
+
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    type MiniDumpWriteDump = unsafe extern "system" fn(
+        process: *mut c_void,
+        pid: u32,
+        file: *mut c_void,
+        dump_type: u32,
+        exception: *const MinidumpExceptionInformation,
+        user_stream: *const c_void,
+        callback: *const c_void,
+    ) -> i32;
+
+    /// `SV_MINIDUMP=<file>`: a minidump of this process at the fault, with
+    /// every thread's stack and the data segments, for the guest run of
+    /// docs/video-decode.md §7.10. Written from inside the dying process — the
+    /// documented caveat of doing so is that a corrupted loader lock can stop
+    /// it, in which case the text report above has already been written.
+    unsafe fn minidump(p: *mut ExceptionPointers) {
+        let Some(path) = std::env::var_os("SV_MINIDUMP") else { return };
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.encode_wide().chain([0]).collect();
+        let lib: Vec<u16> = "dbghelp.dll".encode_utf16().chain([0]).collect();
+        // SAFETY: plain Win32 calls with NUL-terminated strings; every handle
+        // is checked before use and closed after.
+        unsafe {
+            let m = LoadLibraryW(lib.as_ptr());
+            if m.is_null() {
+                eprintln!("[gpu] FAULT: no dbghelp.dll, no minidump");
+                return;
+            }
+            let f = GetProcAddress(m, c"MiniDumpWriteDump".as_ptr().cast());
+            if f.is_null() {
+                return;
+            }
+            let write: MiniDumpWriteDump = std::mem::transmute(f);
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const CREATE_ALWAYS: u32 = 2;
+            const INVALID: isize = -1;
+            let h = CreateFileW(wide.as_ptr(), GENERIC_WRITE, 0, std::ptr::null_mut(), CREATE_ALWAYS, 0x80, std::ptr::null_mut());
+            if h as isize == INVALID || h.is_null() {
+                eprintln!("[gpu] FAULT: cannot create the minidump file");
+                return;
+            }
+            let info = MinidumpExceptionInformation {
+                thread_id: GetCurrentThreadId(),
+                exception_pointers: p,
+                client_pointers: 0,
+            };
+            // MiniDumpWithDataSegs | MiniDumpWithHandleData |
+            // MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory:
+            // the faulting frame's pointers are what is wanted, and the
+            // indirectly referenced memory is what holds the structures they
+            // point at.
+            let kind = 0x1 | 0x4 | 0x40 | 0x1000;
+            let ok = write(GetCurrentProcess(), GetCurrentProcessId(), h, kind, &info, std::ptr::null(), std::ptr::null());
+            CloseHandle(h);
+            eprintln!("[gpu] FAULT: minidump {} ({})", path.to_string_lossy(), if ok != 0 { "written" } else { "failed" });
+        }
     }
 
     /// Install the filter. Once per process; later calls replace it with itself.

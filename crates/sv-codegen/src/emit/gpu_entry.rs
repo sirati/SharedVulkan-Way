@@ -995,6 +995,55 @@ fn emit_forward_command(
         quote!(let __r = unsafe { __f(#(#args),*) };)
     };
 
+    // # An observer, for the few commands `exceptions::GPU_OBSERVED` names
+    //
+    // `GpuHost::observe` sees the arguments **as the driver receives them** —
+    // raised, mapped, pointers into this call's own pool — immediately before
+    // the call and again after it. It exists for docs/video-decode.md §7.10:
+    // a driver that faults inside a recorded command leaves no reply and no
+    // trace, and the only record of what it was given is one written before it
+    // was given it. Each argument crosses as a `u64` (a pointer's address, a
+    // handle's raw value, an integer); the observer knows each command's
+    // signature. Off, it costs one call to `observing`.
+    let call = if crate::exceptions::GPU_OBSERVED.contains(&cname) {
+        let words: Vec<TokenStream> = args
+            .iter()
+            .zip(&c.params)
+            .map(|(a, p)| {
+                let is_out_one = outs.iter().any(|(f, k)| {
+                    f.name == p.name && matches!(k, Out::Count { .. } | Out::One { .. } | Out::Scalar { .. })
+                });
+                if p.name == "pAllocator" {
+                    quote!(0u64)
+                } else if is_out_one {
+                    let id = outs
+                        .iter()
+                        .find(|(f, _)| f.name == p.name)
+                        .map(|(f, _)| naming::ident(&f.rust_name))
+                        .expect("found above");
+                    quote!((&raw mut #id) as usize as u64)
+                } else {
+                    quote!((#a) as usize as u64)
+                }
+            })
+            .collect();
+        let n = words.len();
+        let result = if c.returns_void { quote!(0i32) } else { quote!(__r.0 as i32) };
+        quote! {
+            let __obs = __h.observing();
+            let __ow: [u64; #n] = if __obs { [#(#words),*] } else { [0u64; #n] };
+            if __obs {
+                __h.observe(#cname, false, &__ow, 0);
+            }
+            #call
+            if __obs {
+                __h.observe(#cname, true, &__ow, #result);
+            }
+        }
+    } else {
+        call
+    };
+
     // # External synchronisation of the one `VkQueue` (docs/design.md §0.12 item 4)
     //
     // Vulkan makes `vkQueueSubmit`, `vkQueueWaitIdle`, `vkQueueBindSparse` and
@@ -1550,6 +1599,24 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// per-command locking would let two recordings interleave while
             /// looking synchronised (docs/design.md §0.23).
             fn lock_command_pool(&self) -> crate::QueueGuard<'_>;
+            /// Whether [`GpuHost::observe`] wants to be called at all. Asked
+            /// once per call of a command `exceptions::GPU_OBSERVED` names.
+            fn observing(&self) -> bool {
+                false
+            }
+            /// The driver call of a command `exceptions::GPU_OBSERVED` names,
+            /// just before it (`after` false) and just after it (`after` true,
+            /// with the `VkResult`, or 0 for a `void` command).
+            ///
+            /// `args` holds the C arguments exactly as the driver receives
+            /// them, each widened to a `u64`: a pointer's address, a handle's
+            /// raw value, an integer. Every pointer is valid for the duration
+            /// of this call and no longer — it points into the dispatch's own
+            /// raise pool or output storage — and an output is only written
+            /// once `after` is true.
+            fn observe(&self, command: &'static str, after: bool, args: &[u64], result: i32) {
+                let _ = (command, after, args, result);
+            }
 
             #(#methods)*
         }
