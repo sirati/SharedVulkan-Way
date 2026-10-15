@@ -7,7 +7,7 @@
 #   scripts/wc-guest.sh arena    only block 10, the guest-RAM arena (needs WC_HOST)
 #   scripts/wc-guest.sh firefox  only block 11, Firefox over guest RAM (needs WC_HOST_FIREFOX)
 #   scripts/wc-guest.sh damage   only block 12, the damage path WITH a hypervisor in it (§46);
-#                                runs `wc-desktop.sh damage`, in the interactive session (§82)
+#                                runs `wc-desktop.sh damage`, in the interactive session (§84)
 #   scripts/wc-guest.sh clean    remove everything this script put on the guest
 #   scripts/wc-guest.sh all      deploy, run, clean
 #
@@ -1456,7 +1456,7 @@ do_firefox() {
 # on, and the wheel injected on the guest, where the window is.
 #
 # **It runs in `wc-desktop.sh damage` now, and this mode hands over to it.**
-# §82. Every earlier run of this leg started the compositor through this
+# §84. Every earlier run of this leg started the compositor through this
 # script's driver, over ssh, which is session 0 on a service window station.
 # Measured there with the probe's per-window dump: Firefox's HWND had
 # `WS_VISIBLE` set and `IsWindowVisible` false, on a station whose input
@@ -1482,7 +1482,7 @@ do_damage() {
     return
   fi
   note "handing over to scripts/wc-desktop.sh damage: the compositor and the wheel"
-  note "have to be in the interactive session (§82), and that script is what gets there"
+  note "have to be in the interactive session (§84), and that script is what gets there"
   local out="$RUNDIR/desk-damage.log"
   # The environment this script resolved, passed on rather than re-defaulted:
   # a second default for the same machine is how two harnesses end up

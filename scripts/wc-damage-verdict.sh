@@ -10,7 +10,7 @@
 # WHY IT IS ITS OWN FILE
 #
 # This was the second half of `wc-guest.sh`'s `do_damage`. The leg moved to the
-# interactive session (`wc-desktop.sh damage`, docs/waycompose-design.md §82)
+# interactive session (`wc-desktop.sh damage`, docs/waycompose-design.md §84)
 # because the ssh session's windows are never visible and so are never
 # scrolled, and the verdict on what that run produced is the same verdict: a
 # second copy of it in the second harness would be a second thing to drift,

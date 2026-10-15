@@ -2624,7 +2624,7 @@ impl Session {
             String::new()
         };
 
-        // §82. The client's bytes as they were *before* the copy, so that a
+        // §84. The client's bytes as they were *before* the copy, so that a
         // stale row can say which side moved. Verify mode only: it is a second
         // full read of the buffer, which is the instrument's cost, not the
         // copy's, and it is taken outside the timed span.
@@ -2842,7 +2842,7 @@ fn extent_bytes<'a>(src: &'a [u8], info: &BufferInfo, usable: usize) -> Option<&
     (end > start).then(|| &src[start..end])
 }
 
-/// §82. Which side moved, for the first few stale rows of one commit.
+/// §84. Which side moved, for the first few stale rows of one commit.
 ///
 /// `stale_rows` runs microseconds after the copy, in the same thread, so a
 /// row that differs there has changed under the copy rather than been missed by

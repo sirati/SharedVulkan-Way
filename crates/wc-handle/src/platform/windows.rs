@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, GENERIC_WRITE,
     GetLastError, HANDLE, INVALID_HANDLE_VALUE, LUID,
 };
-// §82: `SeLockMemoryPrivilege`, which `MEM_LARGE_PAGES` needs enabled.
+// §84: `SeLockMemoryPrivilege`, which `MEM_LARGE_PAGES` needs enabled.
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -191,7 +191,7 @@ pub fn alloc_locked_region(
             format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
         ));
     }
-    // §82. **Large pages first.** `VirtualLock` keeps a page resident; it does
+    // §84. **Large pages first.** `VirtualLock` keeps a page resident; it does
     // not keep it at one physical address, and on the guest it was measured not
     // doing so: stamps written *after* `VirtualLock` turned up in two frames at
     // once, in bursts, and every stale commit of block 12's first interactive
@@ -242,7 +242,7 @@ pub fn alloc_locked_region(
             SetProcessWorkingSetSize(GetCurrentProcess(), lo + len * 2, hi + len * 2);
         }
     }
-    // **Lock, then stamp.** §82. This said "stamp before locking ... locking
+    // **Lock, then stamp.** §84. This said "stamp before locking ... locking
     // pages that have never been touched is a slower way to reach the same
     // state", and it is not the same state. While the stamps were written the
     // pages were ordinary unlocked working-set pages, and 64 MiB of freshly

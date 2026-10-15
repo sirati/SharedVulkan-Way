@@ -237,7 +237,7 @@ pub const STAMP_FILL: u8 = 0xAB;
 /// The page size the stamps and the host's sweep both work in.
 pub use crate::platform::REGION_PAGE;
 
-/// §82. Whether [`attach_guest_ram`] may use large pages, for this process.
+/// §84. Whether [`attach_guest_ram`] may use large pages, for this process.
 ///
 /// On by default, because on the Windows guest it is the only pinning that was
 /// measured to hold. The switch exists so the `VirtualLock` path stays
@@ -275,7 +275,7 @@ pub struct GuestRegion {
     /// is reported rather than swallowed.
     pub locked: bool,
     /// How the pages were pinned: `large-pages`, `virtual-lock`, `mlock` or
-    /// `none`. §82: on the Windows guest `VirtualLock` keeps pages resident but
+    /// `none`. §84: on the Windows guest `VirtualLock` keeps pages resident but
     /// was measured relocating them, so *which* lock it was is part of whether
     /// the host's map can be trusted, and it is reported beside `locked`.
     pub pinning: &'static str,

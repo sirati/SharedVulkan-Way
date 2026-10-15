@@ -142,7 +142,7 @@ static void where_am_i(void)
 	 * true only if the window AND every ancestor has WS_VISIBLE, and a
 	 * top-level window's ancestor is this desktop's desktop window. A
 	 * window with WS_VISIBLE=1 and IsWindowVisible=0 was measured in the
-	 * ssh session (§82); this is the line that says whether that is why. */
+	 * ssh session (§84); this is the line that says whether that is why. */
 	HWND dw = GetDesktopWindow();
 	printf("probe-scroll: session %lu, station %ls, desktop %ls, input desktop %ls, screen %dx%d, "
 	       "desktop window %p visible=%d WS_VISIBLE=%d\n",

@@ -190,7 +190,7 @@ h() { [ -n "$HOST" ] && ssh "${SSHOPT[@]}" "$HOST" "$@"; }
 # and `g`/`h`, which it uses.
 . "$(dirname "$0")/wc-binaries.sh"
 . "$(dirname "$0")/wc-topology.sh"
-# §82: `damage` declares guest-ram and asserts it, and shares its verdict with
+# §84: `damage` declares guest-ram and asserts it, and shares its verdict with
 # `wc-guest.sh damage`.
 . "$(dirname "$0")/wc-substrate.sh"
 . "$(dirname "$0")/wc-damage-verdict.sh"
@@ -207,7 +207,7 @@ HOSTSIDE_URL=""; HOSTSIDE_PROXY_EXTRA=""
 # is cut out of the compositor's own outbound window (§14), so no `h` argument
 # is ever published on a filesystem and the export is not on the pixel path at
 # all. §12's `wc-guest.sh` has passed this way for two stages.
-# §82: spelled by `wc_arena_comp_args` (wc-substrate.sh) now, with the frame
+# §84: spelled by `wc_arena_comp_args` (wc-substrate.sh) now, with the frame
 # list `locate_arena` translates; this script's own copy of the flags is gone.
 
 # Find the region the compositor pinned, and write a plan the proxy can open.
@@ -228,7 +228,7 @@ HOSTSIDE_URL=""; HOSTSIDE_PROXY_EXTRA=""
 # socket and its `/proc/<pid>/fd` are root-only (§12.9).
 locate_arena() {
   local log="$1" plan="$2"
-  # §82: `wc_locate_arena`, which wc-icon.sh and wc-taskbar.sh already use, in
+  # §84: `wc_locate_arena`, which wc-icon.sh and wc-taskbar.sh already use, in
   # place of this script's own copy. That copy knew only the content sweep, and
   # the first rerun of block 12 here died on it: "3 page index(es) were claimed
   # twice", the sweep's documented coin flip on a busy guest (wc-substrate.sh).
@@ -294,7 +294,7 @@ int_bg() {
 # appended to a file on the guest.
 #   int_quiet <name> <command-line> <out-file>
 #
-# §82. `int … cmd.exe /c …` opens a console on the real desktop for as long as
+# §84. `int … cmd.exe /c …` opens a console on the real desktop for as long as
 # the command runs, and on this guest that window lands over the middle of
 # Firefox: the first block-12 screen capture photographed its own console, and
 # a wheel notch sent while it was up goes to the console, not to the page,
@@ -527,7 +527,7 @@ do_deploy() {
   x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-input.exe" "$ROOT/scripts/probe-input.c" \
     -luser32 2>"$stage/cci.log" \
     || { echo "  FAILED to build probe-input.exe"; cat "$stage/cci.log"; }
-  # §82: the wheel for `damage`, `-mwindows` for the same reason.
+  # §84: the wheel for `damage`, `-mwindows` for the same reason.
   x86_64-w64-mingw32-gcc -O1 -mwindows -o "$stage/probe-scroll.exe" "$ROOT/scripts/probe-scroll.c" \
     2>"$stage/ccs.log" \
     || { echo "  FAILED to build probe-scroll.exe"; cat "$stage/ccs.log"; }
@@ -543,7 +543,7 @@ do_deploy() {
   # another worktree may legitimately be running.
   kill_ours "$DESKNAME" >/dev/null 2>&1
   g "taskkill //F //IM wc-desk.exe >/dev/null 2>&1; true" >/dev/null 2>&1
-  # §82: and anything else still running out of this directory. A run that
+  # §84: and anything else still running out of this directory. A run that
   # stopped at the locate left its `probe-relay.exe` alive for its whole
   # 330 s timeout -- killing the local ssh did not end it -- and the next
   # deploy died on `scp: dest open "wcdesk/probe-relay.exe": Failure`.
@@ -1353,7 +1353,7 @@ do_window() {
 # BLOCK 12 on the interactive desktop: Firefox on the guest's compositor over
 # guest RAM, the proxy on the VM host with `--verify-damage`, and the wheel
 # injected on the desktop the window is actually on. docs/waycompose-design.md
-# §82.
+# §84.
 #
 # WHY THIS MODE EXISTS, WHEN `wc-guest.sh damage` ALREADY DID
 #
@@ -1477,7 +1477,7 @@ do_damage() {
 }
 
 # --------------------------------------------------------------- pinning -----
-# §82. Does a `VirtualLock`ed guest-RAM arena keep its physical frames?
+# §84. Does a `VirtualLock`ed guest-RAM arena keep its physical frames?
 #
 # Everything on the guest-RAM path assumes it does: the host locates the
 # arena's frames once, at startup, and writes pixels into them for the rest of
@@ -1512,7 +1512,7 @@ pin_expand() {
 
 do_pinning() {
   echo
-  echo "== 13. does a VirtualLock'd arena keep its physical frames? (§82) =="
+  echo "== 13. does a VirtualLock'd arena keep its physical frames? (§84) =="
   if [ -z "$HOST" ]; then miss "WC_HOST unset: the locate needs the machine QEMU runs on"; return; fi
   h "mkdir -p $HOST_DIR" >/dev/null
   local locator="$LINUX_BIN/wc-arena-host"

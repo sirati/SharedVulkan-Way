@@ -364,7 +364,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--arena-frames" => args.arena_frames = it.next(),
-            // §82: the `VirtualLock` path, for a control run. See
+            // §84: the `VirtualLock` path, for a control run. See
             // `wc_handle::arena::use_small_pages_only`.
             "--arena-small-pages" => wc_handle::arena::use_small_pages_only(),
             "--socket" => args.socket = it.next(),
