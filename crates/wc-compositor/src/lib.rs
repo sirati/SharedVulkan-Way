@@ -364,6 +364,9 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--arena-frames" => args.arena_frames = it.next(),
+            // §82: the `VirtualLock` path, for a control run. See
+            // `wc_handle::arena::use_small_pages_only`.
+            "--arena-small-pages" => wc_handle::arena::use_small_pages_only(),
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
             "--wayland-cold" => args.wayland_cold = it.next(),
@@ -984,8 +987,8 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 let note = publish_frames(&args, *id, r.pages, &mut frames_written);
                 println!(
                     "wc-compositor: arena {id} provided from guest RAM: \
-                     run 0x{:016x}, {} bytes, {} pages, locked={}{note}",
-                    r.run_id, r.len, r.pages, r.locked
+                     run 0x{:016x}, {} bytes, {} pages, locked={}{note}, pinning={}",
+                    r.run_id, r.len, r.pages, r.locked, r.pinning
                 );
             }
             Err(e) => {

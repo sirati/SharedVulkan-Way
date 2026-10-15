@@ -237,6 +237,27 @@ pub const STAMP_FILL: u8 = 0xAB;
 /// The page size the stamps and the host's sweep both work in.
 pub use crate::platform::REGION_PAGE;
 
+/// §82. Whether [`attach_guest_ram`] may use large pages, for this process.
+///
+/// On by default, because on the Windows guest it is the only pinning that was
+/// measured to hold. The switch exists so the `VirtualLock` path stays
+/// reachable for a control run on one machine (`wc-compositor
+/// --arena-small-pages`): an environment variable does not reach a process the
+/// task scheduler starts. `WC_ARENA_NO_LARGE_PAGES` is honoured as well.
+static SMALL_PAGES_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse large pages for every guest-RAM region this process provides from now
+/// on. See [`SMALL_PAGES_ONLY`].
+pub fn use_small_pages_only() {
+    SMALL_PAGES_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn large_pages_allowed() -> bool {
+    !SMALL_PAGES_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var_os("WC_ARENA_NO_LARGE_PAGES").is_none()
+}
+
 /// What [`attach_guest_ram`] did, in the numbers a human needs to judge it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestRegion {
@@ -253,6 +274,11 @@ pub struct GuestRegion {
     /// allowed to move afterwards, which would invalidate the host's map, so it
     /// is reported rather than swallowed.
     pub locked: bool,
+    /// How the pages were pinned: `large-pages`, `virtual-lock`, `mlock` or
+    /// `none`. §82: on the Windows guest `VirtualLock` keeps pages resident but
+    /// was measured relocating them, so *which* lock it was is part of whether
+    /// the host's map can be trusted, and it is reported beside `locked`.
+    pub pinning: &'static str,
 }
 
 /// Attach arena `id` as **this process's own memory**, stamped so that a
@@ -293,7 +319,7 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
     refuse_if_outbound(id)?;
     let run_id = random_run_id();
-    let (view, locked) = platform::alloc_locked_region(len, &|index, page| {
+    let (view, locked, pinning) = platform::alloc_locked_region(len, &|index, page| {
         page.fill(STAMP_FILL);
         page[STAMP_OFF_MAGIC..STAMP_OFF_MAGIC + 8].copy_from_slice(&STAMP_MAGIC);
         page[STAMP_OFF_RUN_ID..STAMP_OFF_RUN_ID + 8].copy_from_slice(&run_id.to_le_bytes());
@@ -312,7 +338,7 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
             provided: true,
         },
     );
-    Ok(GuestRegion { run_id, len, pages: (len / REGION_PAGE) as u32, locked }
+    Ok(GuestRegion { run_id, len, pages: (len / REGION_PAGE) as u32, locked, pinning }
     )
 }
 

@@ -197,7 +197,7 @@ pub const REGION_PAGE: usize = 4096;
 pub fn alloc_locked_region(
     len: usize,
     stamp: &dyn Fn(u32, &mut [u8]),
-) -> io::Result<(MappedView, bool)> {
+) -> io::Result<(MappedView, bool, &'static str)> {
     if len == 0 || !len.is_multiple_of(REGION_PAGE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -231,7 +231,7 @@ pub fn alloc_locked_region(
     // ordinary account and a region that is merely resident is still a region.
     // SAFETY: the mapping is live and `len` bytes long.
     let locked = unsafe { libc::mlock(ptr, len) } == 0;
-    Ok((view, locked))
+    Ok((view, locked, if locked { "mlock" } else { "none" }))
 }
 
 /// Create an object named by a filesystem path.
