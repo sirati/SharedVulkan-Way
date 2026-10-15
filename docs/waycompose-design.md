@@ -27432,3 +27432,57 @@ Six guest runs, each authorised, all in session 0, with health checks every
   with the decode prefs. On this driver the GPU side serves H.264 decode
   only, and H.265, AV1 and VP9 fall back to software, cleanly. One playback
   through it: about:support Media `H264 … Hardware Decoding Supported`.
+
+### 87.14 Follow-up: H.265 decode on in the launcher; AV1 and VP9 stay in software
+
+Branch `decode-codecs`, 2026-10-15 and 16. The detail is video-decode.md
+§7.12. Two guest runs, both authorised, both in session 0, with health checks
+every 15 s (41 samples, all good). QEMU never stopped, and nothing faulted.
+
+- **What the driver offers.** Intel 101.7076 answers H.264 and H.265 with
+  COINCIDE output and 16 and 15 DPB slots. It answers AV1 with **8 slots**,
+  refuses AV1 film grain, and has no VP9 extension. The GPU side now asks
+  each codec's basic profile itself and prints what it serves.
+- **H.265 (on).** The per-slot, session-lifetime stores of §87.13 now cover
+  H.265 and AV1 as well as H.264, as ffmpeg's per-picture memory does. The
+  SPS, PPS and VPS arrays are kept for the session's life. On the test
+  installation, 3029 H.265 decodes over 12 IDRs, 1214 H.264 decodes, 0
+  findings, no fault.
+- **AV1 (withheld).** A real AV1 stream needs 9 slots: 8 references and the
+  picture being decoded. With 8, ffmpeg uses slot index 8 anyway, and RADV
+  shaped to 8 slots gave wrong frames with no error. No remapping on our side
+  can fit those streams into 8. So AV1 is withheld on any driver with fewer
+  than 9 slots, and on the guest it plays in software: the YouTube 720p60
+  clip played with `err=none` and lost 41% of its frames on testhost's CPU.
+  Through the stores, at 9 slots, AV1 is byte-identical to libavcodec (RADV).
+- **A slot guard.** A decode naming a slot beyond its session is never
+  handed to the driver. Its command buffer fails to submit and Firefox falls
+  back to software. That fixed three faults in poisoning: the marks were per
+  ring, a refused end left the driver's buffer recording, and a refused
+  submit left ffmpeg waiting for a fence forever.
+- **Deployed.** `wcivs` was backed up (`C:\Users\<guest-user>\wcivs-backup-712`,
+  `~/wc-launch-ivs-backup-712`), then redeployed from d113d80: 12 passed, 0
+  failed. One playback through it: HEVC, 1200 frames, `err=none`, 1209
+  frames decoded on the GPU. about:support Media: `H264` and `HEVC` with
+  hardware decoding Supported; `AV1`, `VP9` and `VP8` without. The
+  temporary Marionette and log settings were removed; the ini and `gpu.env`
+  are byte-identical to the deployed ones.
+
+| what | where now |
+|---|---|
+| Vulkan decode in `wcivs` | H.264 and H.265 Main in hardware; H.265 Main10, AV1 and VP9 in software |
+| `wcivs` binaries | `sv-guest.exe` `551f8508…`, `libsv_icd.so` `33145d1f…` (d113d80) |
+| test installation `wcgpu` | the same build; the previous one beside it as `sv-guest.exe.h264` and `libsv_icd.so.prev-0ae4` |
+
+What remains: VP9 and AV1 need a newer Intel driver (VP9 support, 9 AV1
+slots), and VP9 then needs its own stores. Nothing has run on the
+interactive desktop.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 101 binaries, 2826 passed, 0 failed, 8 ignored |
+| clippy, all targets | exit 0, no warning in a touched file |
+| Windows check | exit 0 |
+| `wc-pool`, `wc-keymap` | OK, OK |
+| Miri, the new store and rule tests | clean |
+| `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
