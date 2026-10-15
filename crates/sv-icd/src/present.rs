@@ -192,6 +192,7 @@ pub mod x11 {
     //! Xlib, through `dlopen`, and only the eleven symbols a `XPutImage` needs.
 
     use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     /// `ZPixmap`, the only image format anything has used this century.
@@ -275,10 +276,19 @@ pub mod x11 {
     /// arrived on, and Xlib passes the same pointer as the first argument. So
     /// "swallow errors this module caused" is expressible exactly, without ever
     /// hiding one of the application's.
+    ///
+    /// **It takes no lock** (docs/design.md §0.27). Xlib calls it synchronously,
+    /// on the thread whose request is reading the connection — and on our
+    /// connection that thread is always inside [`Window::put`], [`geometry`] or
+    /// a `Drop`, holding the mutex on [`CONN`]. The version that read the
+    /// display through that mutex deadlocked on the first error of ours it
+    /// handled: Mesa's kopper present thread waiting on itself in
+    /// `XFlush` → `_XError` → here, the WebRender thread waiting on kopper's
+    /// fence behind it, and Firefox's refresh driver stopped. That was the
+    /// local reproduction of "Firefox on X11 through kopper stalls". The
+    /// display is now read from [`OUR_DISPLAY`], which needs nothing.
     unsafe extern "C" fn ignore_error(dpy: *mut Display, event: *mut c_void) -> c_int {
-        if let Some(c) = CONN.get().and_then(|c| c.as_ref())
-            && c.lock().map(|g| g.display).unwrap_or(0) == dpy as usize
-        {
+        if !dpy.is_null() && OUR_DISPLAY.load(Ordering::Acquire) == dpy as usize {
             return 0;
         }
         match PREVIOUS.get().copied().flatten() {
@@ -405,11 +415,15 @@ pub mod x11 {
         screen: c_int,
     }
 
-    /// Module-level rather than a local of [`connection`], because
-    /// [`ignore_error`] has to read it: the whole point of that handler is to
-    /// tell an error on *our* display from one on the application's, and the
-    /// only thing that distinguishes them is this pointer.
+    /// Module-level rather than a local of [`connection`]. [`ignore_error`]
+    /// needs the pointer inside it, and reads it from [`OUR_DISPLAY`] rather than
+    /// through this mutex, because it runs while the mutex is held.
     static CONN: OnceLock<Option<Mutex<Connection>>> = OnceLock::new();
+
+    /// The same pointer as `CONN`'s `display`, readable without its mutex,
+    /// which is the one thing [`ignore_error`] may not take. Zero until the
+    /// connection opens, and a null `Display*` is never ours.
+    static OUR_DISPLAY: AtomicUsize = AtomicUsize::new(0);
 
     fn connection() -> Option<&'static Mutex<Connection>> {
         CONN.get_or_init(|| {
@@ -428,6 +442,7 @@ pub mod x11 {
             }
             // SAFETY: a live display.
             let screen = unsafe { (l.default_screen)(display) };
+            OUR_DISPLAY.store(display as usize, Ordering::Release);
             Some(Mutex::new(Connection { display: display as usize, screen }))
         })
         .as_ref()
@@ -602,6 +617,44 @@ pub mod x11 {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        /// Xlib runs the error handler on the thread whose request is reading
+        /// the connection, and on ours that thread holds the connection's
+        /// mutex. So the handler has to answer "is this ours?" **while that
+        /// mutex is held** (docs/design.md §0.27). The version that read the
+        /// display through the mutex never returned from this test.
+        ///
+        /// The connection is a fake one — a pointer that is compared and never
+        /// handed to Xlib — so the test needs no X server. Nothing else in this
+        /// crate's unit tests opens an X connection, which is what makes
+        /// setting `CONN` here safe.
+        #[test]
+        fn the_error_handler_answers_while_the_connection_is_locked() {
+            let fake = 0x5eed_0000usize;
+            let _ = CONN.set(Some(Mutex::new(Connection { display: fake, screen: 0 })));
+            OUR_DISPLAY.store(fake, Ordering::Release);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let c = CONN.get().and_then(|c| c.as_ref()).expect("the fake connection");
+                // What `Window::put` holds while `XFlush` delivers an error.
+                let _held = c.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: the handler only compares the pointer for a display
+                // that is ours, and never dereferences `event` on that path.
+                let r = unsafe { ignore_error(fake as *mut Display, core::ptr::null_mut()) };
+                let _ = tx.send(r);
+            });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)),
+                Ok(0),
+                "the handler did not return: it is waiting for the lock its own caller holds"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
