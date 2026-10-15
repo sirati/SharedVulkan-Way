@@ -583,6 +583,21 @@ justified_failure_patterns() {
   # loop does, and all four pass on this leg. They were excused because the leg
   # could not observe the path; now it can, so they are assertions again.
   [ "$leg" = headless ] || return 0
+
+  # §85. Headless only: the Wine leg cannot drive a pointer, so it never runs
+  # these. The suite's own contradiction, settled by a reference run rather than
+  # by reading. After `place_above(subsurface, other)` (or `place_below(other,
+  # subsurface)`) on two subsurfaces covering the same point, the protocol puts
+  # `subsurface` on top; each test first asserts the other one is not focused
+  # -- this compositor passes that -- and then that `subsurface` is not focused
+  # either, which no stacking can satisfy. Mir 2.29, WLCS's reference
+  # compositor, fails both too (on the first assertion) and lists both in its
+  # own expected_wlcs_failures.list.
+  local selfcontra='WLCS 1.8.1 asserts that neither restacked subsurface is on top; the first assertion (the restack took effect) passes here, the second contradicts it, and Mir 2.29 fails both tests as well (§85)'
+  for t in place_above_simple place_below_simple; do
+    printf 'XdgShellStableSubsurfaces/SubsurfaceTest.%s/0\t%s\n' "$t" "$selfcontra"
+  done
+
 }
 
 justified_failures() {
