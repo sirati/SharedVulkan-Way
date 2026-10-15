@@ -6,6 +6,6 @@
     "library_path": "./libVkLayer_sv_intel_shape.so",
     "api_version": "1.4.313",
     "implementation_version": "1",
-    "description": "answers H.264 decode queries as Intel 101.7076 does"
+    "description": "answers H.264, H.265, AV1 and VP9 decode queries as Intel 101.7076 does"
   }
 }
