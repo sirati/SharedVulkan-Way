@@ -778,11 +778,30 @@ fn ivshmem_session(
     // session is over. Nothing reads it any more.
     drop(stream);
 
-    // Is the slot reusable? Only if the application destroyed what it made.
-    // Otherwise the device and its import are kept — leaked for the life of
-    // the process, deliberately — and the slot with them.
+    // Is the slot reusable? If the application destroyed what it made, at
+    // once. If it left objects behind of types this side knows how to
+    // destroy, after destroying them on the idle device (`Objects::
+    // destroy_leftovers`), which Firefox's `glxtest` needs every time. Only if
+    // something else is left are the device and its import kept — leaked for
+    // the life of the process, deliberately — and the slot with them.
     let leftovers = shared.objects.lock().map(|o| o.leftovers()).unwrap_or_default();
-    let clean = leftovers.is_empty() && Arc::strong_count(&shared) == 1;
+    let mut clean = Arc::strong_count(&shared) == 1;
+    if clean && !leftovers.is_empty() {
+        let destroyed = shared.objects.lock().map_err(|_| vec!["poisoned".to_string()]).and_then(|mut o| unsafe {
+            let _ = shared.driver.device.device_wait_idle();
+            o.destroy_leftovers(&shared.driver.device, arena_memory)
+        });
+        match destroyed {
+            Ok(n) => eprintln!("[gpu] session {session}: destroyed {n} object(s) it left behind ({leftovers:?})"),
+            Err(kinds) => {
+                eprintln!(
+                    "[gpu] session {session}: left behind {leftovers:?}, including {kinds:?}, which \
+                     this side does not destroy; keeping its device and slot {slot}"
+                );
+                clean = false;
+            }
+        }
+    }
     if clean {
         drop(control);
         match Arc::try_unwrap(shared) {
@@ -800,7 +819,6 @@ fn ivshmem_session(
             }
         }
     } else {
-        eprintln!("[gpu] session {session}: left behind {leftovers:?}; keeping its device and slot {slot}");
         std::mem::forget(shared);
         std::mem::forget(control);
     }

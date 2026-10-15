@@ -283,6 +283,139 @@ impl Objects {
         self.map.len()
     }
 
+    /// Destroy what the application left behind, children before parents, on a
+    /// device it can no longer reach (waycompose-design.md §87).
+    ///
+    /// The first Firefox on the ivshmem path measured why this exists: its
+    /// `glxtest` process exits with a buffer, eight command pools, four set
+    /// layouts, a pipeline layout, two samplers and a semaphore still alive, so
+    /// every Firefox start would cost a session slot for the life of the GPU
+    /// process. Destroying a valid object on an idle device is ordinary Vulkan —
+    /// the application would have made exactly these calls — so the slot can
+    /// be reused and the device destroyed with no children, as the
+    /// specification requires.
+    ///
+    /// Only types whose destroy call is core Vulkan are handled. If anything
+    /// else is left (a video session, an acceleration structure, …) nothing is
+    /// destroyed and the types are returned, and the caller keeps the device.
+    /// `arena` is the session's arena import: memory objects that are slices of
+    /// it are not the application's to free.
+    ///
+    /// # Safety
+    ///
+    /// `device` must be the device every handle here was created on, idle
+    /// (`vkDeviceWaitIdle` returned), and no thread may use any of them again.
+    pub unsafe fn destroy_leftovers(
+        &mut self,
+        device: &ash::Device,
+        arena: vk::DeviceMemory,
+    ) -> Result<usize, Vec<String>> {
+        use HandleType as H;
+        // Dependency order: what uses a thing goes before the thing.
+        const ORDER: &[HandleType] = &[
+            H::VkPipeline,
+            H::VkPipelineLayout,
+            H::VkPipelineCache,
+            H::VkDescriptorPool,
+            H::VkDescriptorUpdateTemplate,
+            H::VkDescriptorSetLayout,
+            H::VkFramebuffer,
+            H::VkRenderPass,
+            H::VkImageView,
+            H::VkBufferView,
+            H::VkSampler,
+            H::VkSamplerYcbcrConversion,
+            H::VkImage,
+            H::VkBuffer,
+            H::VkShaderModule,
+            H::VkCommandPool,
+            H::VkQueryPool,
+            H::VkEvent,
+            H::VkFence,
+            H::VkSemaphore,
+            H::VkDeviceMemory,
+        ];
+        const OWNED_ELSEWHERE: &[HandleType] = &[
+            H::VkInstance,
+            H::VkPhysicalDevice,
+            H::VkDevice,
+            H::VkQueue,
+            H::VkCommandBuffer,
+            H::VkDescriptorSet,
+        ];
+        let unhandled: Vec<String> = self
+            .map
+            .values()
+            .filter(|o| !OWNED_ELSEWHERE.contains(&o.ty) && !ORDER.contains(&o.ty))
+            .map(|o| format!("{:?}", o.ty))
+            .collect();
+        if !unhandled.is_empty() {
+            return Err(unhandled);
+        }
+        let mut n = 0usize;
+        for &ty in ORDER {
+            let raws: Vec<u64> = self.map.values().filter(|o| o.ty == ty).map(|o| o.raw).collect();
+            for raw in raws {
+                // SAFETY: the caller's contract; each handle was created on
+                // `device` by this session and is destroyed exactly once,
+                // because the table is cleared below.
+                unsafe {
+                    match ty {
+                        H::VkPipeline => device.destroy_pipeline(vk::Pipeline::from_raw(raw), None),
+                        H::VkPipelineLayout => {
+                            device.destroy_pipeline_layout(vk::PipelineLayout::from_raw(raw), None)
+                        }
+                        H::VkPipelineCache => {
+                            device.destroy_pipeline_cache(vk::PipelineCache::from_raw(raw), None)
+                        }
+                        H::VkDescriptorPool => {
+                            device.destroy_descriptor_pool(vk::DescriptorPool::from_raw(raw), None)
+                        }
+                        H::VkDescriptorUpdateTemplate => device.destroy_descriptor_update_template(
+                            vk::DescriptorUpdateTemplate::from_raw(raw),
+                            None,
+                        ),
+                        H::VkDescriptorSetLayout => device.destroy_descriptor_set_layout(
+                            vk::DescriptorSetLayout::from_raw(raw),
+                            None,
+                        ),
+                        H::VkFramebuffer => device.destroy_framebuffer(vk::Framebuffer::from_raw(raw), None),
+                        H::VkRenderPass => device.destroy_render_pass(vk::RenderPass::from_raw(raw), None),
+                        H::VkImageView => device.destroy_image_view(vk::ImageView::from_raw(raw), None),
+                        H::VkBufferView => device.destroy_buffer_view(vk::BufferView::from_raw(raw), None),
+                        H::VkSampler => device.destroy_sampler(vk::Sampler::from_raw(raw), None),
+                        H::VkSamplerYcbcrConversion => device.destroy_sampler_ycbcr_conversion(
+                            vk::SamplerYcbcrConversion::from_raw(raw),
+                            None,
+                        ),
+                        H::VkImage => device.destroy_image(vk::Image::from_raw(raw), None),
+                        H::VkBuffer => device.destroy_buffer(vk::Buffer::from_raw(raw), None),
+                        H::VkShaderModule => device.destroy_shader_module(vk::ShaderModule::from_raw(raw), None),
+                        H::VkCommandPool => device.destroy_command_pool(vk::CommandPool::from_raw(raw), None),
+                        H::VkQueryPool => device.destroy_query_pool(vk::QueryPool::from_raw(raw), None),
+                        H::VkEvent => device.destroy_event(vk::Event::from_raw(raw), None),
+                        H::VkFence => device.destroy_fence(vk::Fence::from_raw(raw), None),
+                        H::VkSemaphore => device.destroy_semaphore(vk::Semaphore::from_raw(raw), None),
+                        H::VkDeviceMemory => {
+                            // A host-visible allocation is a slice of the
+                            // arena and names the arena's memory; that one is
+                            // the session's, freed by the caller.
+                            if raw == arena.as_raw() {
+                                continue;
+                            }
+                            device.free_memory(vk::DeviceMemory::from_raw(raw), None)
+                        }
+                        _ => unreachable!("only ORDER's types reach here"),
+                    }
+                }
+                n += 1;
+            }
+        }
+        self.map.retain(|_, o| OWNED_ELSEWHERE.contains(&o.ty));
+        self.memory.retain(|id, _| *id == crate::ARENA_MEMORY_ID);
+        Ok(n)
+    }
+
     /// What the application created and did not destroy, by type
     /// (waycompose-design.md §87).
     ///
@@ -409,6 +542,197 @@ impl sv_proto::HandleMapper for Mapper<'_> {
 mod tests {
     use super::*;
 
+
+    /// §87, on a real driver: every type `destroy_leftovers` handles, made the
+    /// way an application makes it and left behind, is destroyed on an idle
+    /// device, the arena's memory is not, and an unhandled type makes it touch
+    /// nothing. Run against whatever `Driver::open(0)` finds — lavapipe in the
+    /// dev shell, RADV with `VK_ICD_FILENAMES` naming it — and skipped where
+    /// there is no Vulkan loader at all.
+    #[test]
+    fn leftovers_of_every_handled_type_are_destroyed_on_a_real_driver() {
+        use crate::driver::Driver;
+        let driver = match Driver::open(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no Vulkan driver here ({e}); skipped");
+                return;
+            }
+        };
+        let d = &driver.device;
+        let mut objs = Objects::new();
+        let mut id = 100u64;
+        let mut add = |o: &mut Objects, ty: HandleType, raw: u64| {
+            id += 1;
+            o.insert_raw(id, ty, raw);
+        };
+        let local = |bits: u32| driver.memory_type(bits, vk::MemoryPropertyFlags::empty()).unwrap();
+        unsafe {
+            // The arena stand-in, which must survive.
+            let arena = d
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(1 << 16).memory_type_index(local(u32::MAX)), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkDeviceMemory, arena.as_raw());
+            add(&mut objs, HandleType::VkDevice, d.handle().as_raw());
+            add(&mut objs, HandleType::VkInstance, driver.instance.handle().as_raw());
+
+            let buffer = d
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(1 << 16)
+                        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER),
+                    None,
+                )
+                .unwrap();
+            let req = d.get_buffer_memory_requirements(buffer);
+            let mem = d
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(local(req.memory_type_bits)), None)
+                .unwrap();
+            d.bind_buffer_memory(buffer, mem, 0).unwrap();
+            add(&mut objs, HandleType::VkBuffer, buffer.as_raw());
+            add(&mut objs, HandleType::VkDeviceMemory, mem.as_raw());
+            let bview = d
+                .create_buffer_view(
+                    &vk::BufferViewCreateInfo::default().buffer(buffer).format(vk::Format::R32_UINT).range(vk::WHOLE_SIZE),
+                    None,
+                )
+                .unwrap();
+            add(&mut objs, HandleType::VkBufferView, bview.as_raw());
+
+            let image = d
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .extent(vk::Extent3D { width: 16, height: 16, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT),
+                    None,
+                )
+                .unwrap();
+            let ireq = d.get_image_memory_requirements(image);
+            let imem = d
+                .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(ireq.size).memory_type_index(local(ireq.memory_type_bits)), None)
+                .unwrap();
+            d.bind_image_memory(image, imem, 0).unwrap();
+            add(&mut objs, HandleType::VkImage, image.as_raw());
+            add(&mut objs, HandleType::VkDeviceMemory, imem.as_raw());
+            let iview = d
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_UNORM)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            level_count: 1,
+                            layer_count: 1,
+                            ..Default::default()
+                        }),
+                    None,
+                )
+                .unwrap();
+            add(&mut objs, HandleType::VkImageView, iview.as_raw());
+            let sampler = d.create_sampler(&vk::SamplerCreateInfo::default(), None).unwrap();
+            add(&mut objs, HandleType::VkSampler, sampler.as_raw());
+
+            let attach = [vk::AttachmentDescription::default()
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .final_layout(vk::ImageLayout::GENERAL)];
+            let cref = [vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::GENERAL }];
+            let sub = [vk::SubpassDescription::default().color_attachments(&cref)];
+            let rp = d
+                .create_render_pass(&vk::RenderPassCreateInfo::default().attachments(&attach).subpasses(&sub), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkRenderPass, rp.as_raw());
+            let views = [iview];
+            let fb = d
+                .create_framebuffer(
+                    &vk::FramebufferCreateInfo::default().render_pass(rp).attachments(&views).width(16).height(16).layers(1),
+                    None,
+                )
+                .unwrap();
+            add(&mut objs, HandleType::VkFramebuffer, fb.as_raw());
+
+            let bindings = [0, 1].map(|b| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            });
+            let dsl = d
+                .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkDescriptorSetLayout, dsl.as_raw());
+            let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(2)];
+            let dpool = d
+                .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkDescriptorPool, dpool.as_raw());
+            let set = d
+                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(dpool).set_layouts(&[dsl]))
+                .unwrap()[0];
+            add(&mut objs, HandleType::VkDescriptorSet, set.as_raw());
+            let layouts = [dsl];
+            let pl = d
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkPipelineLayout, pl.as_raw());
+            let cache = d.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None).unwrap();
+            add(&mut objs, HandleType::VkPipelineCache, cache.as_raw());
+            if let Ok(code) = crate::workload::spv_words() {
+                let sm = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).unwrap();
+                add(&mut objs, HandleType::VkShaderModule, sm.as_raw());
+                let stage = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::COMPUTE)
+                    .module(sm)
+                    .name(c"main");
+                let p = d
+                    .create_compute_pipelines(cache, &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pl)], None)
+                    .unwrap()[0];
+                add(&mut objs, HandleType::VkPipeline, p.as_raw());
+            }
+
+            let cpool = d
+                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(driver.queue_family), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkCommandPool, cpool.as_raw());
+            let cb = d
+                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cpool).command_buffer_count(1))
+                .unwrap()[0];
+            add(&mut objs, HandleType::VkCommandBuffer, cb.as_raw());
+            let qp = d
+                .create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::OCCLUSION).query_count(1), None)
+                .unwrap();
+            add(&mut objs, HandleType::VkQueryPool, qp.as_raw());
+            add(&mut objs, HandleType::VkEvent, d.create_event(&vk::EventCreateInfo::default(), None).unwrap().as_raw());
+            add(&mut objs, HandleType::VkFence, d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap().as_raw());
+            add(&mut objs, HandleType::VkSemaphore, d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap().as_raw());
+
+            let left = objs.leftovers();
+            assert!(!left.contains_key("VkDevice") && !left.contains_key("VkCommandBuffer"), "{left:?}");
+
+            // An unhandled type: nothing is destroyed and the type is named.
+            objs.insert_raw(9999, HandleType::VkVideoSessionKHR, 1);
+            let before = objs.len();
+            assert_eq!(objs.destroy_leftovers(d, arena).unwrap_err(), vec!["VkVideoSessionKHR".to_string()]);
+            assert_eq!(objs.len(), before);
+            objs.remove(9999);
+
+            d.device_wait_idle().unwrap();
+            let n = objs.destroy_leftovers(d, arena).unwrap();
+            let pipeline_objects = if crate::workload::spv_words().is_ok() { 2 } else { 0 };
+            assert_eq!(n, 18 + pipeline_objects, "everything but the arena, the device, the instance, the set and the command buffer");
+            assert!(objs.leftovers().is_empty(), "{:?}", objs.leftovers());
+            // The arena survived: freeing it now is legal only because it was not freed above.
+            d.free_memory(arena, None);
+            eprintln!("destroyed {n} leftover objects on {}", driver.name);
+        }
+    }
     #[test]
     fn a_type_confusion_is_named_rather_than_dereferenced() {
         let mut o = Objects::new();
