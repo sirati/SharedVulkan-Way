@@ -1254,6 +1254,12 @@ impl Transport for RingTransport {
     /// already takes, so it stays one lock, one probe and one `memcpy`; what it
     /// gives up is overlap between two threads recording two command buffers,
     /// for the length of a `memcpy`.
+    ///
+    /// The video work met the same race from the other side and fixed it the
+    /// same way: ffmpeg's frame threads submitting on one queue while another
+    /// records gave a 10-second `CALL_TIMEOUT` stall in roughly one
+    /// multi-threaded decode in seven, and none after (docs/video-decode.md
+    /// §7.6).
     fn record(&self, command_buffer: u64, _opcode: u32, command: &[u8]) -> IcdResult<()> {
         let need = command.len() as u64;
         let flush = {

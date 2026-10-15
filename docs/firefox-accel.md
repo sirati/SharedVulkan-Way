@@ -160,6 +160,13 @@ application needs is the one nothing measured.** That is the same shape as §0.9
   `docs/video-decode.md` §5 still recommends software decode, and §6 records that
   the forwarder carries the capability queries and not a decode.
 
+  > **[SUPERSEDED — 2026-10-15, `docs/video-decode.md` §7.7.]** The forwarder
+  > decodes, and a Firefox 157.0.1 built with `nix/firefox-vulkan-readback.patch`
+  > decodes H.264 on the forwarded RADV (`scripts/sv-firefox-vulkan-decode.sh`).
+  > Software decode is still what an *unpatched* Firefox does on this topology,
+  > and it does so cleanly: its Vulkan probe needs an accelerated GL, and Zink
+  > on a device with no DRM node is reported as software.
+
 ## 7. Where the frame ends up, and the copy count
 
 Question 3 was what a shared handle between the two projects would have to be.

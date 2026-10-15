@@ -245,12 +245,14 @@ fn conservative_limits() -> VkPhysicalDeviceLimits {
     l
 }
 
-/// The one queue family.
+/// The one queue family, for the **standalone** configuration only.
 ///
-/// A single universal queue rather than a mirror of the GPU side's families:
-/// design.md D8 gives each queue its own ring, and every family we advertise is
-/// a ring the GPU side has to consume. One is what the milestone needs and it is
-/// what an application that asks for `GRAPHICS | COMPUTE | TRANSFER` gets.
+/// With a GPU side attached the family table is the GPU side's answer, forwarded
+/// (`sv_gpu_server::driver::ServedFamily`), and since docs/video-decode.md §7 it
+/// may hold a decode family beside this one. Without a GPU side there is nothing
+/// to decode on, so this stays the single universal family it always was. All
+/// families share the one queue *ring* (`RingClass::Queue`) — D8's ring per queue
+/// was never built, and serving a second family did not need it.
 pub fn queue_families() -> Vec<VkQueueFamilyProperties> {
     let mut q = VkQueueFamilyProperties::default();
     q.queue_flags = VkQueueFlags::VK_QUEUE_GRAPHICS_BIT
@@ -262,7 +264,8 @@ pub fn queue_families() -> Vec<VkQueueFamilyProperties> {
     vec![q]
 }
 
-/// The queue capabilities an application can actually reach, as one mask.
+/// The queue capabilities of the standalone family table, as one mask. The
+/// connected ICD uses the GPU side's answer instead (`SharedVulkan::queue_flags`).
 ///
 /// Derived from [`queue_families`] rather than written down beside it, so that
 /// opening a second family is the only edit needed to make the extensions that
@@ -302,10 +305,11 @@ pub fn advertised_queue_flags() -> u32 {
 ///
 /// **An honest refusal, not a placeholder.** A gate with nothing behind it is
 /// worse than a documented gap: if we cannot serve a video queue we must not
-/// claim one. When the ICD grows a real video family — §0.21's path — this
-/// function starts returning `None` for those extensions on its own.
-pub fn unservable_queue_requirement(extension: &str) -> Option<u32> {
-    let have = advertised_queue_flags();
+/// claim one. `have` is the OR of the families actually served — the GPU side's
+/// answer when connected — so when the GPU side serves a decode family
+/// (docs/video-decode.md §7) this returns `None` for the decode extensions on its
+/// own, and keeps refusing `VK_KHR_video_encode_queue`, whose family is not served.
+pub fn unservable_queue_requirement(extension: &str, have: u32) -> Option<u32> {
     let reqs = sv_icd_entry::EXTENSION_QUEUE_REQUIREMENTS
         .binary_search_by_key(&extension, |(name, _)| name)
         .ok()
@@ -588,7 +592,7 @@ mod tests {
             let unservable = masks.iter().any(|m| m & have == 0);
             assert_eq!(
                 unservable,
-                unservable_queue_requirement(ext).is_some(),
+                unservable_queue_requirement(ext, have).is_some(),
                 "{ext}: the gate disagrees with the table it reads"
             );
             if unservable {
@@ -609,18 +613,37 @@ mod tests {
         // `queues="VK_QUEUE_VIDEO_DECODE_BIT_KHR,VK_QUEUE_VIDEO_ENCODE_BIT_KHR"`
         // and cannot be recorded on any family this driver offers.
         assert!(
-            unservable_queue_requirement("VK_KHR_video_queue").is_some(),
+            unservable_queue_requirement("VK_KHR_video_queue", have).is_some(),
             "VK_KHR_video_queue needs a video family and we open none"
         );
         assert!(
-            unservable_queue_requirement("VK_KHR_video_decode_queue").is_some(),
+            unservable_queue_requirement("VK_KHR_video_decode_queue", have).is_some(),
             "VK_KHR_video_decode_queue needs a video family and we open none"
         );
         // And the control: an extension whose commands run on graphics must not
         // be caught by the same rule, or the gate is refusing everything.
         assert!(
-            unservable_queue_requirement("VK_EXT_transform_feedback").is_none(),
+            unservable_queue_requirement("VK_EXT_transform_feedback", have).is_none(),
             "VK_EXT_transform_feedback records on graphics and must be servable"
+        );
+    }
+
+    /// With a decode family served the gate opens for decode, and only for
+    /// decode. `VK_QUEUE_VIDEO_DECODE_BIT_KHR` is `0x20`; the encode bit `0x40`
+    /// is masked on the GPU side (`sv_gpu_server::driver::SERVED_QUEUE_FLAGS`),
+    /// so `VK_KHR_video_encode_queue` must stay refused — and
+    /// `VK_KHR_video_queue`, whose begin/end/control commands are
+    /// `queues="…DECODE…,…ENCODE…"`, a disjunction, must become servable.
+    #[test]
+    fn a_served_decode_family_opens_the_decode_extensions_and_not_encode() {
+        let have = advertised_queue_flags() | 0x20;
+        for ext in ["VK_KHR_video_queue", "VK_KHR_video_decode_queue"] {
+            assert_eq!(unservable_queue_requirement(ext, have), None, "{ext}");
+        }
+        assert_eq!(
+            unservable_queue_requirement("VK_KHR_video_encode_queue", have),
+            Some(0x40),
+            "encode is not served and must not be advertised"
         );
     }
 

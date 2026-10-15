@@ -585,6 +585,89 @@ pub fn memory_offset_sibling(members: &[String], memory_member: &str) -> Option<
     None
 }
 
+/// `returnedonly` structs that a command also takes as an **input**, and whose
+/// app-side `lower_*` must therefore read every member.
+///
+/// # The one that dropped a name
+///
+/// `returnedonly` means "the implementation fills this in", and the app side's
+/// `lower_*` honours it by writing zeros instead of reading — right for an
+/// output, whose storage is the caller's uninitialised memory. But output
+/// parameters now take `lower_out_*` (see `emit::icd_entry`), and in the
+/// generated `sv_icd_entry.rs` of the `full` profile `lower_vk_extension_properties`
+/// has exactly two callers: `lower_vk_video_capabilities_khr`, which nothing
+/// calls, and the input below. So for this struct the zeros landed only where it
+/// is *passed in*:
+/// `VkVideoSessionCreateInfoKHR::pStdHeaderVersion` is a
+/// `const VkExtensionProperties*` the application copies out of
+/// `VkVideoCapabilitiesKHR::stdHeaderVersion` and hands back. It crossed as
+/// `{ "", 0 }`, and the GPU side's validation layer said so —
+/// `VUID-VkVideoSessionCreateInfoKHR-pStdHeaderVersion-07190`, "extensionName ''
+/// is an unsupported Video Std header name" (docs/video-decode.md §7). RADV
+/// accepted it anyway; a driver that checks the version would refuse the
+/// session.
+///
+/// A list rather than a rule because the rule — "a `returnedonly` struct
+/// reachable from a non-output member" — would also flip every `returnedonly`
+/// struct nested inside another `returnedonly` struct, whose `lower_*` must
+/// keep zeroing for as long as anything could call it on output storage. The
+/// list is closed and `emit::icd_entry`'s test checks each entry is still
+/// `returnedonly` in the registry, so an entry cannot outlive its reason.
+pub const RETURNED_ONLY_READ_AS_INPUT: &[(&str, &str)] = &[(
+    "VkExtensionProperties",
+    "VkVideoSessionCreateInfoKHR::pStdHeaderVersion is the application's copy of \
+     VkVideoCapabilitiesKHR::stdHeaderVersion, passed back in",
+)];
+
+/// Whether `name` is on [`RETURNED_ONLY_READ_AS_INPUT`].
+pub fn returned_only_read_as_input(name: &str) -> bool {
+    RETURNED_ONLY_READ_AS_INPUT.iter().any(|(n, _)| *n == name)
+}
+
+/// Array members whose length is a member of an **enclosing** struct, not of
+/// their own: `(owner, member, key)`.
+///
+/// # The one that took H.265 down
+///
+/// `video.xml` gives `StdVideoH265HrdParameters::pSubLayerHrdParametersNal` and
+/// `…Vcl` the length `len="*_max_sub_layers_minus1 + 1"`, and its comment says
+/// what the `*` stands for: `sps_max_sub_layers_minus1 + 1` or
+/// `vps_max_sub_layers_minus1 + 1`, "depending on whether the HRD parameters
+/// are part of the SPS or VPS". No sibling holds it, so the app side refused to
+/// lower the HRD struct — and with it the VPS, the SPS (through its VUI), and
+/// every H.265 session-parameters and inline-parameters structure. Those links
+/// then fell out of their `pNext` chains without a word: H.265 session
+/// parameters reached the driver empty, the first decode lost the device, and
+/// RADV took the GPU side down with it (docs/video-decode.md §7).
+///
+/// The answer is the registry's own: the enclosing struct that has the count
+/// publishes it under `key` while its members are lowered
+/// ([`LEN_CONTEXT_PROVIDERS`]), and the array reads it back. A lowering that
+/// reaches the array with no provider above it fails with `Shape` rather than
+/// guessing a length — the bound is application memory we did not allocate.
+pub const LEN_FROM_CONTEXT: &[(&str, &str, &str)] = &[
+    ("StdVideoH265HrdParameters", "pSubLayerHrdParametersNal", "h265_max_sub_layers"),
+    ("StdVideoH265HrdParameters", "pSubLayerHrdParametersVcl", "h265_max_sub_layers"),
+];
+
+/// The structs that publish a [`LEN_FROM_CONTEXT`] key while their members are
+/// lowered: `(struct, member, key, addend)` — the value is `member + addend`,
+/// which is the `+ 1` of the registry's `len=`.
+pub const LEN_CONTEXT_PROVIDERS: &[(&str, &str, &str, usize)] = &[
+    ("StdVideoH265VideoParameterSet", "vps_max_sub_layers_minus1", "h265_max_sub_layers", 1),
+    ("StdVideoH265SequenceParameterSet", "sps_max_sub_layers_minus1", "h265_max_sub_layers", 1),
+];
+
+/// The context key an array member reads its length from, if it is one.
+pub fn len_from_context(owner: &str, member: &str) -> Option<&'static str> {
+    LEN_FROM_CONTEXT.iter().find(|(o, m, _)| *o == owner && *m == member).map(|(_, _, k)| *k)
+}
+
+/// The `(member, key, addend)` a struct publishes, if it publishes one.
+pub fn len_context_provider(owner: &str) -> Option<(&'static str, &'static str, usize)> {
+    LEN_CONTEXT_PROVIDERS.iter().find(|(o, ..)| *o == owner).map(|(_, m, k, a)| (*m, *k, *a))
+}
+
 /// The two commands that frame a blob and are therefore inside it.
 ///
 /// docs/design.md §6.5 gives the sub-decoder "only the `vkCmd*` opcode subset". That
@@ -710,6 +793,37 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "a GPU side has one queue on one family; the driver's table is not ours to pass on",
     ),
     ("vkGetPhysicalDeviceQueueFamilyProperties2", "as vkGetPhysicalDeviceQueueFamilyProperties"),
+    // The memory table again, met from the other end (docs/video-decode.md §7).
+    // The driver answers `memoryTypeBits` in *its* numbering, and an application
+    // reads it against docs/design.md §9.1's four types. Session memory is
+    // device-local by every driver measured, and this side allocates §9.1's
+    // type 0 as the driver's first `DEVICE_LOCAL` type — so the honest answer is
+    // bit 0 exactly when the driver's bits include that type. Forwarded
+    // verbatim, NVIDIA's session memory (driver type 1, `DEVICE_LOCAL`) would
+    // read as our type 1, which is the arena.
+    (
+        "vkGetVideoSessionMemoryRequirementsKHR",
+        "memoryTypeBits is in the driver's numbering and §9.1's table is ours",
+    ),
+    // And the same for images, which had been forwarded verbatim since the
+    // first stage and were right only where the driver's numbering happens to
+    // agree with ours. On RADV it nearly does — its type 0 is `DEVICE_LOCAL`, so
+    // an optimal image's bit 0 lands on our type 0. On NVIDIA it does not: the
+    // driver's type 0 has no flags and type 1 is `DEVICE_LOCAL`, so a DPB whose
+    // bits are the driver's `0x2` reads as our type 1 — the arena.
+    // Session memory a driver will not take from our type 0's driver type. RADV's
+    // AV1 session wants a host-visible type (driver bits `0x678`, none of them
+    // its type 0), and §9.1 has exactly one non-arena type to offer. The bind
+    // is the first moment this side knows which session and bind index a
+    // `VkDeviceMemory` is for, so a dedicated allocation is re-made there from a
+    // type the driver accepts.
+    (
+        "vkBindVideoSessionMemoryKHR",
+        "a dedicated type-0 allocation is re-made from a driver type the session accepts",
+    ),
+    ("vkGetImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
+    ("vkGetImageMemoryRequirements2", "as vkGetVideoSessionMemoryRequirementsKHR"),
+    ("vkGetDeviceImageMemoryRequirements", "as vkGetVideoSessionMemoryRequirementsKHR"),
     // --- 5. a handle the registry does not type as one --------------------
     //
     // `VkDebugUtilsObjectNameInfoEXT::objectHandle` is a `uint64_t` carrying

@@ -564,6 +564,7 @@ fn run_session(
                 &mem_props,
                 r.memory_requirements,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                "session",
             )?;
             owned.memories.push(mem);
             binds.push(
@@ -1203,10 +1204,23 @@ fn alloc(
     props: &vk::PhysicalDeviceMemoryProperties,
     req: vk::MemoryRequirements,
     want: vk::MemoryPropertyFlags,
+    what: &str,
 ) -> Result<vk::DeviceMemory> {
     let ty = find_memory_type(props, req.memory_type_bits, want)
         .or_else(|| find_memory_type(props, req.memory_type_bits, vk::MemoryPropertyFlags::empty()))
         .ok_or_else(|| anyhow!("no memory type for bits {:#x}", req.memory_type_bits))?;
+    // Printed because *where* each allocation lands is a result here, not a
+    // detail: through the forwarder the bitstream is meant to be in the arena
+    // (host-visible) and the session, DPB and decode target never are
+    // (docs/design.md §0.21.2). A type without the wanted flags is the
+    // fallback above firing, and the line says so.
+    let flags = props.memory_types[ty as usize].property_flags;
+    println!(
+        "memory: {what} {} B, bits {:#x} -> type {ty} {flags:?}{}",
+        req.size,
+        req.memory_type_bits,
+        if flags.contains(want) { "" } else { " (NOT the wanted flags)" }
+    );
     let ai = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
         .memory_type_index(ty);
@@ -1256,7 +1270,8 @@ fn make_image(
     owned.images.push(image);
     // SAFETY: the image was just created.
     let req = unsafe { device.get_image_memory_requirements(image) };
-    let mem = alloc(device, props, req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+    let what = if usage.contains(vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR) { "dpb image" } else { "decode target image" };
+    let mem = alloc(device, props, req, vk::MemoryPropertyFlags::DEVICE_LOCAL, what)?;
     owned.memories.push(mem);
     // SAFETY: the memory is large enough and unbound.
     unsafe { device.bind_image_memory(image, mem, 0) }?;
@@ -1310,6 +1325,7 @@ fn make_host_buffer(
         props,
         req,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        if usage.contains(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR) { "bitstream buffer" } else { "readback buffer" },
     )?;
     owned.memories.push(mem);
     // SAFETY: the allocation is at least `req.size` and nothing else is bound.

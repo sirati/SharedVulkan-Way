@@ -317,6 +317,43 @@ pub unsafe extern "system" fn sv_vk_destroy_device(
     }
 }
 
+/// `vkGetDeviceQueue2`: the same queue `vkGetDeviceQueue` names.
+///
+/// `flags` must equal the flags the queue was created with, and the only bit
+/// core defines is `PROTECTED`, which nothing here creates (docs/design.md
+/// §0.21.4) — so a queue asked for with flags this ICD never created it with
+/// does not exist, and the specification's answer for that is a null handle.
+/// ffmpeg 9 asks with `VkDeviceQueueCreateInfo::flags` copied from its own
+/// `vkCreateDevice`, which is zero unless it enabled internally synchronised
+/// queues, so the common case is the plain lookup.
+pub unsafe extern "system" fn sv_vk_get_device_queue2(
+    device: VkDevice,
+    p_queue_info: *const VkDeviceQueueInfo2,
+    p_queue: *mut VkQueue,
+) {
+    if p_queue.is_null() {
+        return;
+    }
+    if p_queue_info.is_null() {
+        // SAFETY: writable storage for one handle.
+        unsafe { *p_queue = core::ptr::null_mut() };
+        return;
+    }
+    // SAFETY: the application's structure, valid for the call.
+    let (family, index, flags) = unsafe {
+        ((*p_queue_info).queue_family_index, (*p_queue_info).queue_index, (*p_queue_info).flags.0)
+    };
+    // `VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT` is 0x1; any other bit belongs to
+    // an extension whose flag the GPU side ignores at creation as well.
+    if flags & 0x1 != 0 {
+        // SAFETY: writable storage for one handle.
+        unsafe { *p_queue = core::ptr::null_mut() };
+        return;
+    }
+    // SAFETY: the same contract as `vkGetDeviceQueue`'s.
+    unsafe { sv_vk_get_device_queue(device, family, index, p_queue) }
+}
+
 pub unsafe extern "system" fn sv_vk_get_device_queue(
     device: VkDevice,
     queue_family_index: u32,

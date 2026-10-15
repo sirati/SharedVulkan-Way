@@ -967,6 +967,13 @@ the second ring D8 would otherwise demand never exists, and the app side never
 sees a queue family it cannot use. That is the shape the topology wants anyway,
 and it is what §11's future work should say.
 
+> **[CORRECTED — 2026-10-15, §0.27.]** The GPU side now serves its driver's
+> decode family to the application, and that is what made decode work. D8's
+> second ring was never built — every queue shares `RingClass::Queue` — and the
+> family is the one ffmpeg and Firefox need, not one to hide. What this item was
+> protecting, the session and pictures staying on the GPU side, holds anyway:
+> they are driver objects there, and the application holds ids.
+
 **3. Both video decode queue families in play cannot copy.** RADV's is
 `VIDEO_DECODE` alone and the guest Intel's is `VIDEO_DECODE` alone; only NVIDIA's
 also carries `TRANSFER`. So a decode and its readback are two queues on two
@@ -1136,6 +1143,10 @@ mean a second ring (D8), a family the app side can see, and building the design
 below that decision works, and that what remains is a stage: the GPU side owning
 the session, the DPB and the decode queue privately, answering a protocol
 command the generator cannot write. §11's future work.
+
+> **[CORRECTED — 2026-10-15, §0.27.]** Removed by adding the family after all,
+> at the driver's own index; `video-decode.md` §7.1 says why the objection did
+> not hold and §7.5 what decodes through it.
 
 One thing about the harness rather than the result. **A `pNext` that the
 specification requires and the driver does not check is a segfault with no
@@ -3496,6 +3507,12 @@ a name.**
 
 #### 0.21.2 Decision 1 — the frame lives in the GPU side's own device memory
 
+> **[AMENDED — 2026-10-15, §0.27.]** The decision stands and is met by a
+> different mechanism: not a *private* session behind a protocol command, but
+> the application's own forwarded session, whose DPB and output images are
+> GPU-side allocations in §9.1's type 0 (`video-decode.md` §7.1 prints where
+> each lands). Nothing below about the arena or readback changes.
+
 A decoded picture is a `VkImage` the GPU side allocated, out of a private video
 session it owns entirely: the session, the DPB, the session parameters and the
 decode queue, exactly as §0.8 item 2 predicted. What crosses is:
@@ -3624,6 +3641,12 @@ the browser and not in the transport, and the honest statement is that this
 section specifies a destination rather than reporting an arrival.
 
 #### 0.21.6 A live hazard: `full` already advertises what it cannot serve
+
+> **[CLOSED — 2026-08-14, §0.22; and reopened on purpose 2026-10-15, §0.27.]**
+> §0.22 withdrew the video extensions while no decode family was served. §0.27
+> serves one, so the same derived gate now advertises the decode extensions —
+> and the half of the hazard that was Firefox exporting a dma-buf is answered
+> by refusing every fd command app-side.
 
 Found while inventorying for this section, and it is not a design question — it
 is true of the shipped default today.
@@ -5054,6 +5077,80 @@ both sides of a boundary, and the test would still lose the device.
 four minutes and printed the answer in the first line of output. Not one part of
 the filed mechanism — maintenance4, blob replay, `completed_seqno` — was needed
 to find it, and every part of it would have been needed to build the wrong fix.
+
+### 0.27 Video decode through the forwarder, and the private session that was not needed
+
+Measured 2026-10-15 on **devhost**, branch `decode-forwarder`; the whole
+account is `docs/video-decode.md` §7. Numbered 0.27 because 0.26 is the last
+section on this branch's base; if master has grown its own 0.27 meanwhile, this
+one should take the next free number rather than either being renumbered.
+
+**What decodes.** `video-probe decode` through the forwarder, on RADV: frames
+byte-identical to libavcodec (`b3a1374e…`, `9cc17c94…`). ffmpeg's Vulkan
+hwaccel — Firefox's decoder underneath — through the forwarder: H.264 High with
+B-frames, H.265 Main and Main10, AV1 and VP9, every frame of every stream
+byte-identical to libavcodec's software decode, on two Mesas. The validation
+layer on both sides at once reports nothing from the application and only
+pre-existing findings from the GPU side.
+
+**1. §0.8 item 2, §0.21.2 and §11 planned a private session behind a protocol
+command, and it was not needed.** The objection to showing the application a
+decode family was D8's second ring and a family to be avoided. D8's per-queue
+ring was never built — every queue already shares `RingClass::Queue` — and the
+family is precisely what ffmpeg and Firefox look for. The property the private
+design protected holds anyway: the session, its memory, the parameters and
+every DPB and output image are the driver's objects on the GPU side, in §9.1's
+type 0; the bitstream is in the arena; a picture crosses only if the
+application copies it out. §0.6's rule — a capability expressible in the
+forwarded API does not deserve a protocol extension — turns out to apply after
+all, now that the types are expressible (§0.9).
+
+**2. The families are the driver's own prefix, at the driver's own indices.**
+Renumbering the decode family to 1 would make every `queueFamilyIndex` a value
+to translate, including those inside recorded barriers, and none of them is
+typed as a family index in `vk.xml`. Serving `0..=max(compute, decode)` leaves
+nothing to translate. `VIDEO_ENCODE` and `PROTECTED` are masked; §0.22's derived
+gate, now fed the GPU side's served flags rather than a constant, opens for the
+decode extensions and keeps refusing encode with no name added to any list.
+`SV_VIDEO_DECODE=0` restores the single family.
+
+**3. Seven faults, every one invisible until a real consumer reached it** — the
+`returnedonly` struct passed *in* (`pStdHeaderVersion` crossed empty), nested
+fixed arrays sharing one loop index (an out-of-bounds read inside
+`vkCmdDecodeVideoKHR`'s lowering), H.265's HRD arrays whose length lives in an
+ancestor (no lowering at all, so H.265 parameter sets fell silently out of their
+chains and RADV lost the device), the driver's memory-type numbering leaking
+through image and session requirements, `vkGetMemoryFdKHR` forwarded as a
+bare descriptor number from the GPU side's process, `vkGetDeviceQueue2` left a
+refused stub, and a race in command-blob recording (item 5). §0.9 item 2's
+pattern again: *implemented* had meant *compiled*.
+
+**4. One shape is left in place and should be next**: an app-side `pNext` link
+with no lowering is *dropped* rather than refused, which is why H.265 failed as
+a device loss three calls later rather than as an error at the call.
+
+**5. Firefox decodes on it, with tier 1 of §0.21.9, and §0.21.8 had found one
+lock of three.** Firefox 157.0.1 (nixpkgs, prebuilt) still ends both Vulkan
+output paths in `vkGetMemoryFdKHR` at 157, 158 and `main`. The patch
+(`nix/firefox-vulkan-readback.patch`, 123 lines) adds the readback branch
+§0.21.8 named — `av_hwframe_transfer_data` into a `PlanarYCbCrImage` — and two
+gates nobody had read as far as: Firefox probes Vulkan decode only if its GL
+test reports an accelerated GL, and Mesa's EGL reports Zink on a device with no
+DRM node as *software*, which the real host (no `/dev/dri`) always is; and
+`HARDWARE_VIDEO_DECODING` "Requires DMABUF". Built locally inside the build
+slice, the patched browser decoded 1770 frames of a looped 720p H.264 clip on
+the forwarded RADV, the page reported no media error, and about:support listed
+`H264 SWDEC HWDEC` with `HARDWARE_VIDEO_DECODING` available
+(`scripts/sv-firefox-vulkan-decode.sh`, `video-decode.md` §7.7). Reaching it
+also needed `vkGetDeviceQueue2` written (ffmpeg 9 fetches every queue with it)
+and a race in command-blob recording fixed: a thread's `publish_recorded_first`
+could publish another thread's half-copied command, the GPU side read zeros, and
+the application waited out a 10-second timeout in about one multi-threaded
+decode in seven. **An unpatched Firefox on this topology decodes in software,
+cleanly** — the GL gate stops it before the fatal export path §0.21.6 feared.
+
+**What remains is the guest and NVIDIA**, neither run: `video-decode.md` §7.9
+lists the steps in order, each with a hash or a log line as its pass condition.
 
 ---
 
@@ -7631,6 +7728,10 @@ impossible". R12 in `security-model.md` is annotated accordingly. *What would
 change my mind:* Zink shipping and conformant, plus a decision to expose a
 second, non-suballocated, permanently-resident memory class for BDA-using
 applications. That is a different project and it comes after this one.
+
+> **[SUPERSEDED — 2026-10-15, §0.27.]** It took no protocol extension: the
+> GPU side serves its decode queue family and the generated forwarders carry the
+> rest. H.264, H.265 (8- and 10-bit), AV1 and VP9 decode through it on RADV.
 
 **Video decode is in scope, and the shape it takes is a protocol extension.**
 The types cross today and the capability queries cross byte-identically to the
