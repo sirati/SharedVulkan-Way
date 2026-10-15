@@ -134,6 +134,16 @@ struct Args {
     /// backend and write into them. The compositor prints the run id, which is
     /// the only thing the host needs and the only thing that crosses.
     guest_arenas: Vec<(u32, u64)>,
+    /// The arena to provide from **BAR2 of an ivshmem device**, as
+    /// `(arena id, device index)`.
+    ///
+    /// IVSHMEM ARENA, docs/waycompose-design.md §82. The region is a PCI BAR that QEMU
+    /// backs with a file at a path on the VM host, so the host opens that path
+    /// instead of locating guest RAM through QMP and QEMU's descriptor table —
+    /// which on the deployment are root's. Nothing is committed, pinned,
+    /// stamped or swept for; the compositor prints a run id the host checks
+    /// against the header at the front of the region (`wc_handle::ivshmem`).
+    ivshmem_arena: Option<(u32, u32)>,
     /// Where to write the **page frame list** of every region this process
     /// commits, so the host can locate it by translation instead of by
     /// searching guest RAM for its stamps.
@@ -338,6 +348,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         arenas: Vec::new(),
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
+        ivshmem_arena: None,
         arena_frames: None,
         provide_arenas: Vec::new(),
         outbound: None,
@@ -413,6 +424,28 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     return Err(2);
                 };
                 args.guest_arenas.push((id, size));
+            }
+            // `id[:device]`. No size, because the device has the size QEMU gave
+            // it and the driver reports it; a second opinion here could only
+            // disagree. No path either: the device is found by its interface.
+            "--arena-ivshmem" => {
+                let Some(v) = it.next() else {
+                    eprintln!("wc-compositor: --arena-ivshmem needs id[:device]");
+                    return Err(2);
+                };
+                let (id, dev) = v.split_once(':').unwrap_or((&v, "0"));
+                let (Ok(id), Ok(dev)) = (id.parse::<u32>(), dev.parse::<u32>()) else {
+                    eprintln!("wc-compositor: --arena-ivshmem {v:?}: wants id[:device], both numbers");
+                    return Err(2);
+                };
+                if args.ivshmem_arena.is_some() {
+                    eprintln!(
+                        "wc-compositor: --arena-ivshmem given twice: the driver allows one mapping \
+                         per device, and one region is what the host's header describes"
+                    );
+                    return Err(2);
+                }
+                args.ivshmem_arena = Some((id, dev));
             }
             // `id:size:path`, split from the left twice for the same reason
             // `--arena` is: a Windows path has a colon two characters in.
@@ -809,7 +842,7 @@ fn file_arena_verdict(file_arenas: usize, allowed: bool) -> FileArenaVerdict {
         return FileArenaVerdict::Refuse(
             "wc-compositor: the FILE arena is not a target. `--arena` and \
              `--arena-provide` open files, which is a Wine-only fixture for a machine \
-             with no hypervisor. Use `--arena-guest-ram <id>:<bytes>`. Set \
+             with no hypervisor. Use `--arena-ivshmem <id>` or `--arena-guest-ram <id>:<bytes>`. Set \
              SV_ALLOW_FILE_ARENA=1 for a fixture run — never to make a guest run pass."
                 .to_owned(),
         );
@@ -995,6 +1028,30 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         }
     }
 
+    // IVSHMEM ARENA. The region is a device's, so there is nothing to commit
+    // and nothing for the host to find: it opens the file QEMU backs BAR2 with
+    // and reads the header this process writes once the outbound window
+    // exists, below. The run id goes out on the same kind of line as guest
+    // RAM's, because the launcher hands it to the host either way, and the
+    // host refuses a header that carries any other. §82.
+    if let Some((id, dev)) = args.ivshmem_arena {
+        if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
+            eprintln!("wc-compositor: arena {id} is named by both --arena-guest-ram and --arena-ivshmem");
+            return std::process::ExitCode::from(2);
+        }
+        match wc_handle::arena::attach_ivshmem(id, dev) {
+            Ok(r) => println!(
+                "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \
+                 generation {}, region {} bytes, {} (no pages pinned, nothing to locate)",
+                r.run_id, r.arena_len, r.generation, r.region_len, r.device
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not provide arena {id} from ivshmem device {dev}: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     // And the ones this process provides as a file. See `--arena-provide`: this
     // is `--arena` opened read-write, which is what makes an outbound window
     // possible on a machine with no hypervisor in it.
@@ -1083,15 +1140,25 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         //
         // Failure is reported and not fatal: a session that cannot grow still
         // serves, it merely refuses when it runs out.
-        match wc_handle::arena::reserve_growth_channel(id) {
-            Ok((off, len)) => println!(
-                "wc-compositor: arena {id} growth channel reserved at {off}+{len}, \
-                 before any object is given out of the outbound window"
-            ),
-            Err(e) => eprintln!(
-                "wc-compositor: arena {id} has no growth channel ({e}); this session \
-                 cannot be asked for more memory and will refuse under pressure instead"
-            ),
+        // IVSHMEM ARENA: a BAR is the size it was made, so there is nothing to
+        // grow into and no channel to reserve. The proxy refuses `--arena-grow`
+        // on this transport for the same reason (§82).
+        if wc_handle::arena::is_ivshmem(id) {
+            println!(
+                "wc-compositor: arena {id} is an ivshmem region of fixed size; no growth \
+                 channel, and a session that fills it refuses rather than grows"
+            );
+        } else {
+            match wc_handle::arena::reserve_growth_channel(id) {
+                Ok((off, len)) => println!(
+                    "wc-compositor: arena {id} growth channel reserved at {off}+{len}, \
+                     before any object is given out of the outbound window"
+                ),
+                Err(e) => eprintln!(
+                    "wc-compositor: arena {id} has no growth channel ({e}); this session \
+                     cannot be asked for more memory and will refuse under pressure instead"
+                ),
+            }
         }
 
         // STAGE 12, and it is a correction rather than a feature. The window's
@@ -1114,6 +1181,24 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 "wc-compositor: arena {id} objects made for clients are held in memory until the \
                  first client connects, so that the host can still find every page's stamp"
             );
+        }
+    }
+
+    // IVSHMEM ARENA. The header, now that the outbound window it describes
+    // exists, and before the socket: a client cannot connect before the proxy
+    // has read it, and the proxy cannot read it before this line. Every field,
+    // a release fence, then the magic (`wc_handle::ivshmem::write_into`).
+    if let Some((id, _)) = args.ivshmem_arena {
+        match wc_handle::arena::publish_ivshmem(id) {
+            Ok(h) => println!(
+                "wc-compositor: arena {id} header published: run 0x{:016x}, generation {}, \
+                 outbound {}+{}",
+                h.run_id, h.generation, h.outbound.0, h.outbound.1
+            ),
+            Err(e) => {
+                eprintln!("wc-compositor: could not publish arena {id}'s header: {e}");
+                return std::process::ExitCode::from(2);
+            }
         }
     }
 
