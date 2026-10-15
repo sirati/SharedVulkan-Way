@@ -42,6 +42,11 @@ use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};
 use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError, forward};
 use sv_proto as p;
 
+/// `VK_ERROR_TOO_MANY_OBJECTS`, vulkan_core.h.
+const VK_ERROR_TOO_MANY_OBJECTS: i32 = -10;
+/// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, vulkan_core.h.
+const VK_ERROR_INVALID_EXTERNAL_HANDLE: i32 = -1_000_072_003;
+
 /// Forward if there is a GPU side, otherwise answer with `$local`.
 ///
 /// Every physical-device query below has this shape, and writing it out
@@ -242,20 +247,24 @@ impl IcdLocal for SharedVulkan {
             }
         }
         let id = s.mint();
-        // One queue object per requested queue, across all requested families.
-        // We advertise one family with one queue, so an application that asks
-        // for more than that has been told it cannot have them.
-        let wanted: usize = info
+        // One queue object per requested queue, recorded with its family and
+        // index so `vkGetDeviceQueue` can find it again. Every family we
+        // advertise has one queue, so an application that asks for more than
+        // that has been told it cannot have them; and one that asks for none
+        // still gets family 0's, which is what `crate::wsi` records on.
+        let mut wanted: Vec<(u32, u32)> = info
             .p_queue_create_infos
             .iter()
-            .map(|q| q.queue_count.max(1) as usize)
-            .sum::<usize>()
-            .max(1);
-        let mut queue_ids = Vec::with_capacity(wanted);
-        for _ in 0..wanted {
+            .flat_map(|q| (0..q.queue_count.max(1)).map(move |i| (q.queue_family_index, i)))
+            .collect();
+        if wanted.is_empty() {
+            wanted.push((0, 0));
+        }
+        let mut queue_ids = Vec::with_capacity(wanted.len());
+        for (family, index) in wanted {
             let q = s.mint();
             s.queues.insert(q, id);
-            queue_ids.push(q);
+            queue_ids.push(crate::state::QueueSlot { family, index, id: q });
         }
         s.devices.insert(id, crate::state::Device { physical_device, queues: queue_ids });
         drop(s);
@@ -284,38 +293,50 @@ impl IcdLocal for SharedVulkan {
         let mut s = self.state();
         if let Some(d) = s.devices.remove(&device) {
             for q in d.queues {
-                s.queues.remove(&q);
+                s.queues.remove(&q.id);
             }
         }
     }
 
-    /// `vkGetDeviceQueue` — one family, and a family index we do not have is
-    /// *reported* rather than refused.
+    /// `vkGetDeviceQueue` — the queue created for `(family, index)`, and one
+    /// that was never created is *reported* rather than refused.
     ///
     /// The command returns `void`. There is nowhere to put an error, so refusing
     /// meant writing nothing through `pQueue` and leaving the application with
     /// whatever its uninitialised memory held — which Zink then passes to
-    /// `vkQueueSubmit`. An application asking for a family we did not advertise
-    /// has made a mistake; handing it the one queue that exists makes that
-    /// mistake harmless instead of a wild pointer, and `SV_DEBUG` says so.
+    /// `vkQueueSubmit`. An application asking for a queue it did not create
+    /// has made a mistake; handing it family 0's queue makes that mistake
+    /// harmless instead of a wild pointer, and `SV_DEBUG` says so.
+    ///
+    /// Since docs/video-decode.md §7 the GPU side may serve several families
+    /// (the decode family among them), each at the driver's own index, so the
+    /// lookup is by family as well as index and the family crosses unchanged.
     ///
     /// (Zink asks for `sparse_queue`, which it leaves at `UINT32_MAX` when no
     /// family advertises `VK_QUEUE_SPARSE_BINDING_BIT` — so this is not a
     /// hypothetical application error, it is the one in front of us.)
     fn get_device_queue(&self, device: u64, family: u32, index: u32) -> IcdResult<u64> {
-        if family != 0 {
-            sv_icd_entry::report_transport_failure(&format_args!(
-                "vkGetDeviceQueue: queue family {family} was never advertised; \
-                 giving the one queue this device has"
-            ));
-        }
-        let index = if family == 0 { index } else { 0 };
-        let id = {
+        let (id, family, index) = {
             let s = self.state();
-            s.devices
+            let d = s
+                .devices
                 .get(&device)
-                .and_then(|d| d.queues.get(index as usize).copied())
-                .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))?
+                .ok_or(LowerError::Shape("vkGetDeviceQueue: unknown device"))?;
+            match d.queue(family, index) {
+                Some(id) => (id, family, index),
+                None => {
+                    // Never created, which for the families we advertise means
+                    // the application did not ask for it at `vkCreateDevice`.
+                    sv_icd_entry::report_transport_failure(&format_args!(
+                        "vkGetDeviceQueue: queue {index} of family {family} was never \
+                         created; giving family 0's queue"
+                    ));
+                    let id = d
+                        .universal_queue()
+                        .ok_or(LowerError::Shape("vkGetDeviceQueue: no such queue"))?;
+                    (id, 0, 0)
+                }
+            }
         };
         if let Some(t) = self.wire() {
             forward::get_device_queue(
@@ -346,7 +367,11 @@ impl IcdLocal for SharedVulkan {
             // `svExecuteCommandBlob` descriptors. **That is not built** — see
             // the note in `sv_gpu_server::server` — so no block is reserved and
             // each `vkCmd*` crosses as its own device-ring packet instead.
-            (0..info.command_buffer_count.max(1)).map(|_| s.mint()).collect()
+            let ids: Vec<u64> = (0..info.command_buffer_count.max(1)).map(|_| s.mint()).collect();
+            for id in &ids {
+                s.command_buffers.insert(*id, info.command_pool.0);
+            }
+            ids
         };
         if let Some(t) = self.wire() {
             let reply = forward::allocate_command_buffers(
@@ -375,6 +400,12 @@ impl IcdLocal for SharedVulkan {
                     p_command_buffers: buffers.iter().map(|b| p::VkCommandBuffer(*b)).collect(),
                 },
             );
+        }
+        {
+            let mut s = self.state();
+            for b in buffers {
+                s.command_buffers.remove(b);
+            }
         }
         // After the free has been queued, not before: `free_blob` waits for the
         // GPU side to finish with the block, and the packet it is waiting past
@@ -687,6 +718,62 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// **A file descriptor is refused here, never forwarded** (docs/design.md
+    /// §1a), and the six commands that would carry one say so with an error.
+    ///
+    /// Forwarded, `vkGetMemoryFdKHR` returned the number of a descriptor that
+    /// is open in the *GPU side's* process: an integer that means nothing here,
+    /// or worse, names an unrelated descriptor of this process that the
+    /// application will now import and eventually close. The import direction
+    /// was the mirror image — the GPU side's driver taking ownership of, and
+    /// closing, whatever its own descriptor of that number was (its socket,
+    /// the arena). Neither had happened because nothing called them; Firefox's
+    /// Vulkan decoder does, on its first frame, once the forwarder serves a
+    /// decode queue (docs/video-decode.md §7). The external-memory queries
+    /// above already answer "no handle type is supported", so an application
+    /// that asks first never gets here; this is for the ones that do not ask.
+    ///
+    /// `VK_ERROR_TOO_MANY_OBJECTS` is one of the two results the specification
+    /// allows the getters; `VK_ERROR_INVALID_EXTERNAL_HANDLE` is the importers'.
+    fn get_memory_fd_khr(&self, _args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
+        Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_semaphore_fd_khr(
+        &self,
+        _args: p::VkGetSemaphoreFdKHRArgs,
+    ) -> IcdResult<p::VkGetSemaphoreFdKHRReply> {
+        Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_fence_fd_khr(&self, _args: p::VkGetFenceFdKHRArgs) -> IcdResult<p::VkGetFenceFdKHRReply> {
+        Ok(p::VkGetFenceFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_memory_fd_properties_khr(
+        &self,
+        _args: p::VkGetMemoryFdPropertiesKHRArgs,
+    ) -> IcdResult<p::VkGetMemoryFdPropertiesKHRReply> {
+        Ok(p::VkGetMemoryFdPropertiesKHRReply {
+            result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE),
+            p_memory_fd_properties: None,
+        })
+    }
+
+    fn import_semaphore_fd_khr(
+        &self,
+        _args: p::VkImportSemaphoreFdKHRArgs,
+    ) -> IcdResult<p::VkImportSemaphoreFdKHRReply> {
+        Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
+    }
+
+    fn import_fence_fd_khr(
+        &self,
+        _args: p::VkImportFenceFdKHRArgs,
+    ) -> IcdResult<p::VkImportFenceFdKHRReply> {
+        Ok(p::VkImportFenceFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
+    }
+
     fn get_physical_device_format_properties(
         &self,
         args: p::VkGetPhysicalDeviceFormatPropertiesArgs,
@@ -796,32 +883,39 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// Arena memory is given back here; heap-0 memory is forwarded, and
+    /// **forwarded before it is forgotten** (docs/design.md §0.28).
+    ///
+    /// The generated `forward::free_memory` rewrites the id through
+    /// `MemoryRewrite`, which looks it up in the very table this removes it
+    /// from. Removing first made every heap-0 free fail on this side with
+    /// `NoSuchMemory` — reported only under `SV_DEBUG`, and only as a line —
+    /// so the GPU side never freed a single device-local allocation: 416 to
+    /// 439 per five-minute Firefox run, each a real driver allocation kept
+    /// until the session ended.
     fn free_memory(&self, args: p::VkFreeMemoryArgs) -> IcdResult<()> {
-        let arena_backed = {
-            let mut s = self.state();
-            match s.memories.remove(&args.memory.0) {
-                Some(m) => match m.allocation {
-                    Some(a) => {
-                        // docs/design.md §5.5 defers this until the timelines an
-                        // allocation could be referenced by have passed. The
-                        // timeline mirror is not wired to submissions yet, so
-                        // this is still immediate — the honest gap, and the one
-                        // `ArenaAllocator::free_deferred` is waiting for.
-                        let _ = s.allocator.free_now(a);
-                        true
-                    }
-                    None => false,
-                },
-                None => return Ok(()),
-            }
+        let id = args.memory.0;
+        let arena_backed = match self.state().memories.get(&id) {
+            Some(m) => m.allocation.is_some(),
+            None => return Ok(()),
         };
         // Arena memory has no GPU-side object to free: it is a sub-range of the
         // one arena allocation, which outlives every application. Heap-0 memory
         // does, and it is a real driver allocation there.
-        if !arena_backed && let Some(t) = self.wire() {
-            forward::free_memory(t, args)?;
+        let forwarded = match (arena_backed, self.wire()) {
+            (false, Some(t)) => forward::free_memory(t, args),
+            _ => Ok(()),
+        };
+        let mut s = self.state();
+        if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
+            // docs/design.md §5.5 defers this until the timelines an
+            // allocation could be referenced by have passed. The timeline
+            // mirror is not wired to submissions yet, so this is still
+            // immediate — the honest gap, and the one
+            // `ArenaAllocator::free_deferred` is waiting for.
+            let _ = s.allocator.free_now(a);
         }
-        Ok(())
+        forwarded
     }
 
     fn get_buffer_memory_requirements(
@@ -1312,8 +1406,30 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// Destroying a pool frees every command buffer allocated from it, and so
+    /// every blob block they hold (docs/design.md §0.28).
+    ///
+    /// The blocks go back after the destroy is queued, for the reason
+    /// `free_command_buffers` gives: `free_blob` waits for the GPU side to
+    /// finish reading, and the packets it waits past must be on the ring.
     fn destroy_command_pool(&self, args: p::VkDestroyCommandPoolArgs) -> IcdResult<()> {
-        forwarded!(self, destroy_command_pool, args, { Ok(()) })
+        let pool = args.command_pool.0;
+        let r = forwarded!(self, destroy_command_pool, args, { Ok(()) });
+        let freed: Vec<u64> = {
+            let mut s = self.state();
+            let freed: Vec<u64> =
+                s.command_buffers.iter().filter(|(_, p)| **p == pool).map(|(cb, _)| *cb).collect();
+            for cb in &freed {
+                s.command_buffers.remove(cb);
+            }
+            freed
+        };
+        if let Some(t) = self.ring_transport() {
+            for cb in freed {
+                t.free_blob(cb);
+            }
+        }
+        r
     }
 
     /// docs/design.md §6.5, and the correction to it that the blob forced.

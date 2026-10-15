@@ -219,7 +219,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
         let s = icd.state();
         s.devices
             .get(&device)
-            .and_then(|d| d.queues.first().copied())
+            .and_then(|d| d.universal_queue())
             .ok_or(LowerError::Shape("vkCreateSwapchainKHR: unknown device"))?
     };
     let count = desc
@@ -625,6 +625,7 @@ pub fn queue_present(
         )
     };
 
+    let started = std::time::Instant::now();
     let r = icd.reset_fences(p::VkResetFencesArgs {
         device: p::VkDevice(device),
         fence_count: 1,
@@ -665,11 +666,15 @@ pub fn queue_present(
     // (docs/design.md §5.3). The GPU side's write to it is ordered before this read
     // by the fence just waited on.
     let bytes = unsafe { core::slice::from_raw_parts(pixels as *const u8, len) };
-    frame_note(swapchain, bytes, width, height);
-    let mut chains = icd.swapchains();
-    if let Some(sc) = chains.get_mut(&swapchain) {
-        sc.target.present(bytes, width, height, swap_rb);
+    let fenced = std::time::Instant::now();
+    {
+        let mut chains = icd.swapchains();
+        if let Some(sc) = chains.get_mut(&swapchain) {
+            sc.target.present(bytes, width, height, swap_rb);
+        }
     }
+    let shown = std::time::Instant::now();
+    frame_note(swapchain, bytes, width, height, fenced - started, shown - fenced);
     Ok(())
 }
 
@@ -687,17 +692,38 @@ pub fn queue_present(
 /// Sampled rather than summed: a 4K frame is 33 MB and this runs sixty times a
 /// second, so it reads one pixel per 4 KiB — enough to tell "all zero" from
 /// "an image" and cheap enough to leave in.
-fn frame_note(swapchain: u64, bytes: &[u8], width: u32, height: u32) {
+///
+/// It also says what the present itself cost, in two parts (docs/design.md
+/// §0.28): `fence`, from `vkResetFences` to the end of `vkWaitForFences` — three
+/// forwarded calls, the GPU side's `vkCmdCopyImageToBuffer` into the arena, and
+/// waiting for the application's own rendering, which the copy waits on — and
+/// `copy`, the display target's CPU copy out of the arena and its commit. The
+/// second is what a zero-copy present would remove; the first it would not.
+fn frame_note(
+    swapchain: u64,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    fence: std::time::Duration,
+    copy: std::time::Duration,
+) {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     const EVERY: u64 = 60;
     static COUNT: AtomicU64 = AtomicU64::new(0);
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static FENCE_NS: AtomicU64 = AtomicU64::new(0);
+    static COPY_NS: AtomicU64 = AtomicU64::new(0);
 
+    FENCE_NS.fetch_add(fence.as_nanos() as u64, Ordering::Relaxed);
+    COPY_NS.fetch_add(copy.as_nanos() as u64, Ordering::Relaxed);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    if n % EVERY != 0 {
+    if !n.is_multiple_of(EVERY) {
         return;
     }
+    let frames = if n == 0 { 1.0 } else { EVERY as f64 };
+    let fence_ms = FENCE_NS.swap(0, Ordering::Relaxed) as f64 / frames / 1e6;
+    let copy_ms = COPY_NS.swap(0, Ordering::Relaxed) as f64 / frames / 1e6;
     // The rate is the other half, and it is what turns "Firefox gave up" into a
     // number that can be attributed. It is measured between notes rather than
     // around one present, so it includes everything a frame costs on this side:
@@ -721,7 +747,8 @@ fn frame_note(swapchain: u64, bytes: &[u8], width: u32, height: u32) {
     match per_frame {
         Some(s) => trace!(
             "vkQueuePresentKHR: swapchain {swapchain:#x} frame {n} {width}x{height} — \
-             {nonzero}/{sampled} sampled pixels are not black, {:.1} ms/frame ({:.1} fps)",
+             {nonzero}/{sampled} sampled pixels are not black, {:.1} ms/frame ({:.1} fps); \
+             present: fence {fence_ms:.2} ms, copy {copy_ms:.2} ms",
             s * 1e3,
             1.0 / s
         ),

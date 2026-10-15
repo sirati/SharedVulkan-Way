@@ -698,11 +698,12 @@ fn lower_expr(
         Shape::Scalar(s) => lower_scalar(cx, s, access)?,
         Shape::FixedArray { elem, count, .. } => {
             let n = *count as usize;
-            let inner = lower_expr(cx, elem, abi, &quote!((#access)[__i]), member_access, owner)?;
+            let i = fixed_index(elem);
+            let inner = lower_expr(cx, elem, abi, &quote!((#access)[#i]), member_access, owner)?;
             let ty = wire_type(elem);
             quote!({
                 let mut __v: Vec<#ty> = Vec::with_capacity(#n);
-                for __i in 0..#n { __v.push(#inner); }
+                for #i in 0..#n { __v.push(#inner); }
                 match <[#ty; #n]>::try_from(__v) {
                     Ok(a) => a,
                     Err(_) => return Err(crate::LowerError::Shape(#owner)),
@@ -721,8 +722,16 @@ fn lower_expr(
                 .len
                 .as_ref()
                 .ok_or_else(|| format!("{owner}.{}: an array with no resolvable len=", abi.name))?;
-            let n = count_expr(len, member_access)
-                .ok_or_else(|| format!("{owner}.{}: len={len:?} is not a sibling", abi.name))?;
+            // A length an enclosing struct holds (`exceptions::LEN_FROM_CONTEXT`)
+            // is read from the lowering context it published, and a missing
+            // one is a refusal of this call, not a guess.
+            let n = match (count_expr(len, member_access), crate::exceptions::len_from_context(owner, &abi.name)) {
+                (Some(n), _) => n,
+                (None, Some(key)) => quote!(crate::lowering_context::get(#key)?),
+                (None, None) => {
+                    return Err(format!("{owner}.{}: len={len:?} is not a sibling", abi.name));
+                }
+            };
             // **`stride=`: the application's array may not be tightly packed.**
             //
             // `(#access).add(__i)` strides by `size_of` the element, which is
@@ -1087,7 +1096,10 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         // out and must not be read. On the GPU side we are the implementation's
         // proxy and those same members are the driver's answer — the only part
         // of the struct that carries information. See [`Ctx::lower_full`].
-        let validity = if s.returned_only && !cx.lower_full {
+        let validity = if s.returned_only
+            && !cx.lower_full
+            && !crate::exceptions::returned_only_read_as_input(name)
+        {
             partial_validity(field)
         } else {
             PartialValidity::Full
@@ -1130,12 +1142,25 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         inits.push(quote!(#id: #e,));
     }
     let doc = format!("Lower a C `{name}` into its wire form.");
+    // A struct that holds a length its descendants need publishes it for the
+    // duration of its own lowering (`exceptions::LEN_CONTEXT_PROVIDERS`).
+    let body = quote!(unsafe { Ok(sv_proto::#ty { #(#inits)* }) });
+    let body = match crate::exceptions::len_context_provider(name) {
+        Some((member, key, add)) if !cx.lower_full => {
+            let access = member_access(member);
+            quote!({
+                let __len = unsafe { (#access) as usize } + #add;
+                crate::lowering_context::with(#key, __len, || #body)
+            })
+        }
+        _ => body,
+    };
     Ok(quote! {
         #[doc = #doc]
         #[allow(unused_unsafe, unused_variables)]
         pub unsafe fn #f(p: *const #ty) -> crate::LowerResult<sv_proto::#ty> {
             let _ = p;
-            unsafe { Ok(sv_proto::#ty { #(#inits)* }) }
+            #body
         }
     })
 }
@@ -1156,14 +1181,15 @@ fn store_stmt(
         Shape::Scalar(s) => store_scalar(cx, s, src, dst)?,
         Shape::FixedArray { elem, count, .. } => {
             let n = *count as usize;
+            let i = fixed_index(elem);
             let inner = store_stmt(
                 cx,
                 elem,
-                &quote!((#src)[__i]),
-                &quote!((#dst)[__i]),
+                &quote!((#src)[#i]),
+                &quote!((#dst)[#i]),
                 owner,
             )?;
-            quote!(for __i in 0..#n { #inner })
+            quote!(for #i in 0..#n { #inner })
         }
         // A returned struct whose members are pointers to caller storage cannot
         // be filled in without knowing the caller's capacity, and no struct on
@@ -1294,6 +1320,12 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkCreateDevice",
     "vkDestroyDevice",
     "vkGetDeviceQueue",
+    // Returns a dispatchable `VkQueue`, like the one above. It was a refused
+    // stub that left `*pQueue` untouched, which was harmless while nothing
+    // called it; ffmpeg 9's Vulkan device (and so Firefox 157's decoder)
+    // fetches every queue with it, then submitted on whatever its stack held
+    // and the GPU side handed RADV a null queue (docs/video-decode.md §7.7).
+    "vkGetDeviceQueue2",
     "vkAllocateCommandBuffers",
     "vkFreeCommandBuffers",
     "vkEnumerateInstanceExtensionProperties",
@@ -3416,4 +3448,31 @@ pub fn emit_all(cx: &Ctx<'_>) -> (Vec<(String, TokenStream)>, Refusals) {
         m.into_iter().filter(|(_, why)| why != NOT_NEEDED).collect()
     };
     (sections, Refusals { lower: keep(lower_refused), store: keep(store_refused), commands })
+}
+
+/// The loop index for one level of a fixed-size array, distinct per level.
+///
+/// # The two-dimensional array, met a third time
+///
+/// `StdVideoH264ScalingLists::ScalingList4x4` is `uint8_t[6][16]`. Every
+/// fixed-array loop was `for __i in 0..n`, so the inner loop's `__i` shadowed
+/// the outer one and the element read was `ScalingList4x4[__i][__i]` with the
+/// inner index — out of bounds at 6 on the first dimension. It was found by
+/// ffmpeg's Vulkan H.264 decoder through the forwarder (a stream with scaling
+/// matrices reaches it; `video-probe`'s fixtures never set them), as a panic in
+/// `sv_vk_cmd_decode_video_khr` (docs/video-decode.md §7). The same shadowing
+/// was in the GPU side's `raise` and in the app side's writeback, and all
+/// three use this.
+///
+/// Named by how many fixed-array levels lie *below* this one (`__f0` for the
+/// innermost), and never `__i`, which the pointer-array loops use: an array of
+/// fixed arrays would otherwise shadow its outer `.add(__i)` the same way.
+pub(crate) fn fixed_index(elem: &Shape) -> proc_macro2::Ident {
+    fn below(s: &Shape) -> usize {
+        match s {
+            Shape::FixedArray { elem, .. } => 1 + below(elem),
+            _ => 0,
+        }
+    }
+    format_ident!("__f{}", below(elem))
 }

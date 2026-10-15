@@ -47,12 +47,13 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How much of the arena is set aside for command blobs.
 ///
 /// An eighth, between 4 MiB and 64 MiB. There is no measurement behind the
-/// fraction and it should not pretend otherwise; what is behind the *bounds* is
-/// that a blob has to hold one whole command buffer's recording, a real frame
-/// records a few hundred kilobytes of them, and several may be open at once.
-/// The failure when it is too small is clean and named — `BlobArenaFull` on the
-/// `vkCmd*` that did not fit — which is the property that matters, because the
-/// thing it replaces was not.
+/// fraction and it should not pretend otherwise. What is behind the bounds
+/// changed in docs/design.md §0.28: a block no longer holds a whole recording,
+/// only what the GPU side has not read yet (see
+/// [`RingTransport::grow_and_write`]), so the reserve is a buffer between the
+/// recording threads and the GPU side rather than a store of recordings. Too
+/// small now costs waiting — a recording that cannot get a block reclaims and
+/// waits for the GPU side — and not the device.
 fn blob_reserve(arena_len: u64) -> u64 {
     let want = (arena_len / 8).clamp(4 << 20, 64 << 20);
     // Never take more than half the arena, however small it is: a 4 MiB arena
@@ -163,6 +164,60 @@ struct Blobs {
     /// Where the reserve starts in the arena. `Placeholder` counts from zero.
     base: u64,
     open: std::collections::HashMap<u64, Blob, IdHash>,
+    /// Blocks a recording has moved out of while the GPU side was still
+    /// reading their last piece, each with the seqno that piece went out
+    /// under. Given back by [`Blobs::retire_read`] once `completed_seqno`
+    /// passes it. See [`RingTransport::grow_and_write`].
+    retiring: Vec<(Blob, u64)>,
+    /// Bytes of the reserve held by blocks, open or retiring, and the
+    /// high-water mark `SV_DEBUG` last reported (docs/design.md §0.28).
+    held: u64,
+    reported: u64,
+}
+
+impl Blobs {
+    /// One line under `SV_DEBUG` each time the reserve's high-water mark
+    /// passes another MiB: how many blocks, how big the largest, and how much
+    /// of their bytes has not even been sent. That is the measurement that
+    /// told retention (blocks the size of their whole recording, although
+    /// every piece but the last has long been read) from a working set.
+    fn note_high_water(&mut self) {
+        if self.held < self.reported + (1 << 20) {
+            return;
+        }
+        self.reported = self.held;
+        let largest = self.open.values().map(|b| b.cap).max().unwrap_or(0);
+        let live: u64 = self.open.values().map(|b| b.len - b.published).sum();
+        sv_icd_entry::report_transport_failure(&format_args!(
+            "blob reserve: {} KiB held in {} block(s) and {} retiring, largest {} KiB, {} KiB not yet sent",
+            self.held >> 10,
+            self.open.len(),
+            self.retiring.len(),
+            largest >> 10,
+            live >> 10
+        ));
+    }
+
+    /// Give back every retiring block whose last piece the GPU side has read.
+    fn retire_read(&mut self, completed: u64) {
+        let mut i = 0;
+        while i < self.retiring.len() {
+            if self.retiring[i].1 <= completed {
+                let (b, _) = self.retiring.swap_remove(i);
+                RingTransport::release(self, b);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Bytes a block can still hand out, or `None` with no block to write to.
+    fn alloc_block(&mut self, want: u64) -> Option<(u64, u64)> {
+        let a = self.alloc.alloc(want).ok()?;
+        let off = self.base + self.alloc.arena_offset(a).ok()?;
+        self.held += a.size;
+        Some((off, a.size))
+    }
 }
 
 /// The block a recording starts with. One 4 KiB page would be a growth on the
@@ -183,6 +238,11 @@ const BLOB_INITIAL: u64 = 64 << 10;
 /// being recorded.
 const BLOB_FLUSH: u64 = 8 << 10;
 
+/// How many times a recording that cannot get a block reclaims the reserve
+/// before it reports `VK_ERROR_OUT_OF_DEVICE_MEMORY`. More than one because
+/// another thread can take what a reclaim freed before this one asks again.
+const RECLAIM_ROUNDS: u32 = 3;
+
 impl Blobs {
     fn new(base: u64, reserve: u64) -> Blobs {
         Blobs {
@@ -194,6 +254,9 @@ impl Blobs {
                 .expect("the blob reserve is a whole number of pages"),
             base,
             open: std::collections::HashMap::default(),
+            retiring: Vec::new(),
+            held: 0,
+            reported: 0,
         }
     }
 }
@@ -939,39 +1002,6 @@ impl RingTransport {
         }
     }
 
-    /// Grow `cb`'s block to hold `need` more bytes, or make it one.
-    ///
-    /// Doubling with a copy, rather than a chain of chunks. The chunk list is
-    /// the tidier data structure and it buys nothing here: recording is
-    /// append-only and a doubling copy is amortised nothing, the *steady state*
-    /// after one frame is a block that never grows again, and one contiguous
-    /// range keeps `svExecuteCommandBlob` a fixed-size message and the GPU side
-    /// a single `subdecode`. The copy happens only while a workload is finding
-    /// its size.
-    fn grow(blobs: &mut Blobs, arena: &SharedRegion, cb: u64, need: u64) -> IcdResult<()> {
-        let old = blobs.open.get(&cb).copied();
-        let want = match old {
-            Some(b) => (b.cap * 2).max(b.len + need),
-            None => BLOB_INITIAL.max(need),
-        };
-        let a = blobs.alloc.alloc(want).map_err(|_| LowerError::OutOfDeviceMemory)?;
-        let off = blobs.base
-            + blobs.alloc.arena_offset(a).map_err(|_| LowerError::OutOfDeviceMemory)?;
-        if let Some(b) = old {
-            // Read out and write back rather than a mapped-memory move: the
-            // arena is peer-visible and `SharedRegion` deliberately offers no
-            // `&mut [u8]` over it (R7, `region`'s invariant I3).
-            let mut carry = vec![0u8; b.len as usize];
-            arena.read_bytes(b.off, &mut carry).map_err(lower)?;
-            arena.write_bytes(off, &carry).map_err(lower)?;
-            Self::release(blobs, b);
-        }
-        let (len, published, in_flight) =
-            old.map(|b| (b.len, b.published, b.in_flight)).unwrap_or((0, 0, 0));
-        blobs.open.insert(cb, Blob { off, len, published, cap: a.size, in_flight });
-        Ok(())
-    }
-
     /// Hand the GPU side everything recorded since the last piece.
     ///
     /// Called when a block passes [`BLOB_FLUSH`] of unsent bytes and again at
@@ -1078,41 +1108,134 @@ impl RingTransport {
 
     /// The slow half of [`Transport::record`]: make room, then write.
     ///
-    /// Growing has to wait for every piece already handed over, because it
-    /// copies the recorded bytes to a new block and the GPU side may still be
-    /// reading them out of the old one.
+    /// # A block holds what the GPU side has not read, not the whole recording
+    ///
+    /// This used to *grow*: double the block, copy the recording across, and
+    /// keep every byte of it until the command buffer was freed. But the GPU
+    /// side copies each piece out of the arena the moment it arrives
+    /// (`sv_gpu_server::session::protocol_command`), so once a piece is read
+    /// its bytes are dead, and a block the size of its whole recording was a
+    /// block of dead bytes. Measured (docs/design.md §0.28): Firefox on Zink,
+    /// 64 MiB arena, 8 MiB reserve — 29 blocks, the largest doubled to 2 MiB,
+    /// and at most 7 KiB of all of them not yet sent; the next doubling needed
+    /// 4 MiB contiguous and the device was lost at 60 s.
+    ///
+    /// So a full block is not grown. Everything unsent is published first,
+    /// which leaves the block holding only pieces already handed over, and
+    /// then:
+    ///
+    /// - if the GPU side has read the last of them, the block is **rewound**
+    ///   and recording continues at its start — no allocation and no copy;
+    /// - if it has not, recording continues in a **fresh** block and the old
+    ///   one *retires* with the seqno of its last piece, to be given back once
+    ///   `completed_seqno` passes it. Recording does not wait for the GPU side,
+    ///   which is the pipelining §6.5 measured (105 µs against 130 µs) kept.
+    ///
+    /// A block is bigger than [`BLOB_INITIAL`] only when one command is.
+    ///
+    /// # Running out is back-pressure, not a lost device
+    ///
+    /// If the reserve cannot supply a block, [`Self::reclaim`] publishes every
+    /// open recording, waits for the GPU side to read them, and gives back
+    /// every block that holds nothing it still needs — retiring ones and idle
+    /// ones alike — before asking again. What is left after that is only what
+    /// the GPU side has not read, so the allocation can then fail only for a
+    /// single command larger than the reserve.
     fn grow_and_write(&self, command_buffer: u64, command: &[u8]) -> IcdResult<()> {
-        let mut in_flight = {
-            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
-            blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0)
-        };
-        loop {
-            // Without the blob lock held: this can block for as long as the GPU
-            // side takes, and a thread recording into a different command
-            // buffer has no reason to wait behind it.
-            self.await_blob_read(in_flight)?;
-            let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
-            let blobs = &mut *blobs;
-            // **Waited for is not the same as still true.** Between the wait and
-            // this lock another thread's `publish_recorded_first` may have
-            // handed the GPU side a newer piece of this very block, and growing
-            // frees the block. Freeing it under a reader is the §5.5 hazard the
-            // wait exists for, so a newer piece means waiting again.
-            let now = blobs.open.get(&command_buffer).map(|b| b.in_flight).unwrap_or(0);
-            if now != in_flight && now != 0 {
-                in_flight = now;
+        let need = command.len() as u64;
+        // Only this thread records into `command_buffer` (Vulkan's external
+        // synchronisation), so once this returns the block has nothing unsent
+        // until the write below.
+        self.flush_blob(command_buffer)?;
+        for attempt in 0..=RECLAIM_ROUNDS {
+            let completed = self.completed_device_seqno()?;
+            let mut guard = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            let blobs = &mut *guard;
+            blobs.retire_read(completed);
+            let old = blobs.open.get(&command_buffer).copied();
+            let placed = match old {
+                // Read to the end and big enough: rewind it.
+                Some(b) if b.in_flight <= completed && need <= b.cap => Some((b.off, b.cap)),
+                _ => {
+                    let want = old.map_or(BLOB_INITIAL, |b| b.cap.max(BLOB_INITIAL)).max(need);
+                    let fresh = blobs.alloc_block(want);
+                    if let (Some(_), Some(b)) = (fresh, old) {
+                        blobs.open.remove(&command_buffer);
+                        if b.in_flight <= completed {
+                            Self::release(blobs, b);
+                        } else {
+                            blobs.retiring.push((b, b.in_flight));
+                        }
+                    }
+                    fresh
+                }
+            };
+            let Some((off, cap)) = placed else {
+                drop(guard);
+                if attempt == RECLAIM_ROUNDS {
+                    break;
+                }
+                self.reclaim()?;
                 continue;
-            }
-            Self::grow(blobs, &self.arena, command_buffer, command.len() as u64)?;
-            let b = blobs
-                .open
-                .get_mut(&command_buffer)
-                .ok_or(LowerError::Shape("a blob that grow() did not create"))?;
+            };
             // Under the lock, for the reason `record` gives.
-            self.arena.write_bytes(b.off + b.len, command).map_err(lower)?;
-            b.len += command.len() as u64;
+            self.arena.write_bytes(off, command).map_err(lower)?;
+            blobs
+                .open
+                .insert(command_buffer, Blob { off, len: need, published: 0, cap, in_flight: 0 });
+            blobs.note_high_water();
             return Ok(());
         }
+        let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        sv_icd_entry::report_transport_failure(&format_args!(
+            "blob reserve exhausted for a {need}-byte command after {RECLAIM_ROUNDS} reclaims: \
+             {} KiB held in {} block(s) and {} retiring",
+            blobs.held >> 10,
+            blobs.open.len(),
+            blobs.retiring.len()
+        ));
+        Err(LowerError::OutOfDeviceMemory)
+    }
+
+    /// Make the reserve hold only what the GPU side has not read yet.
+    ///
+    /// Publish every open recording, wait until the GPU side has read the
+    /// newest piece of any block, then give back every retiring block and every
+    /// open block with nothing unsent. An open block given back is not lost to
+    /// its command buffer: its next `vkCmd*` takes the slow path and gets a
+    /// fresh one, and every piece it already sent was read whole.
+    fn reclaim(&self) -> IcdResult<()> {
+        self.publish_recorded_first()?;
+        let newest = {
+            let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+            let open = blobs.open.values().map(|b| b.in_flight);
+            open.chain(blobs.retiring.iter().map(|r| r.1)).max().unwrap_or(0)
+        };
+        self.await_blob_read(newest)?;
+        let completed = self.completed_device_seqno()?;
+        let mut blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
+        blobs.retire_read(completed);
+        let idle: Vec<u64> = blobs
+            .open
+            .iter()
+            .filter(|(_, b)| b.len == b.published && b.in_flight <= completed)
+            .map(|(cb, _)| *cb)
+            .collect();
+        for cb in idle {
+            if let Some(b) = blobs.open.remove(&cb) {
+                Self::release(&mut blobs, b);
+            }
+        }
+        Ok(())
+    }
+
+    /// How far the GPU side has got through the device ring.
+    fn completed_device_seqno(&self) -> IcdResult<u64> {
+        let ctrl = {
+            let d = self.device.lock().unwrap_or_else(|e| e.into_inner());
+            d.ctrl.clone()
+        };
+        ctrl.completed_seqno().map_err(lower)
     }
 
     /// Return a block to the reserve.
@@ -1125,6 +1248,7 @@ impl RingTransport {
             size: b.cap,
         };
         let _ = blobs.alloc.free_now(a);
+        blobs.held -= b.cap;
     }
 
     /// Wait until the GPU side has finished with a block before overwriting it.
@@ -1254,6 +1378,12 @@ impl Transport for RingTransport {
     /// already takes, so it stays one lock, one probe and one `memcpy`; what it
     /// gives up is overlap between two threads recording two command buffers,
     /// for the length of a `memcpy`.
+    ///
+    /// The video work met the same race from the other side and fixed it the
+    /// same way: ffmpeg's frame threads submitting on one queue while another
+    /// records gave a 10-second `CALL_TIMEOUT` stall in roughly one
+    /// multi-threaded decode in seven, and none after (docs/video-decode.md
+    /// §7.6).
     fn record(&self, command_buffer: u64, _opcode: u32, command: &[u8]) -> IcdResult<()> {
         let need = command.len() as u64;
         let flush = {
@@ -1266,7 +1396,8 @@ impl Transport for RingTransport {
                     b.len - b.published >= BLOB_FLUSH
                 }
                 // No block yet, or a full one. Both are the slow path, and both
-                // are rare: a block that has found its size never grows again.
+                // are rare: a block is rewound rather than grown, so only a
+                // command bigger than the block itself makes a bigger one.
                 _ => {
                     drop(blobs);
                     self.grow_and_write(command_buffer, command)?;
@@ -1497,20 +1628,15 @@ mod blob_race {
         c
     }
 
-    /// **The bug**: `record` advanced `len` under the blob lock and copied the
-    /// command in after releasing it, and `publish_recorded_first` — run by
-    /// whichever thread forwards an unrecorded command — flushes every open
-    /// blob up to `len`. So a piece could name bytes not yet written. Firefox
-    /// on Zink met it as "unknown command opcode 4096" in `sv-gpu-server` and a
-    /// lost device.
-    ///
-    /// Here: one thread records into a fresh command buffer per round, which
-    /// grows each block once and publishes at the end; a second forwards
-    /// unrecorded packets as fast as it can, each one a `publish_recorded_first`;
-    /// a third plays the GPU side and checks every command of every piece it is
-    /// handed. The GPU side's checks are what fail, not a timeout.
-    #[test]
-    fn a_flush_from_another_thread_never_publishes_unwritten_bytes() {
+    /// A real `RingTransport` on heap regions, a thread that plays the GPU side
+    /// and checks every command of every piece, and optionally one that
+    /// forwards unrecorded packets as fast as it can. `record` runs on the
+    /// calling thread; the result is how many commands the GPU side saw whole,
+    /// and what `record` returned.
+    fn rig(
+        noisy: bool,
+        record: impl FnOnce(&RingTransport) -> IcdResult<()>,
+    ) -> (u64, IcdResult<()>, Arc<RingTransport>) {
         let g = Geometry::small();
         let control_region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
         let arena = Arc::new(SharedRegion::heap(g.arena_size as usize).unwrap());
@@ -1569,7 +1695,7 @@ mod blob_race {
                 }
             })
         };
-        let noise = {
+        let noise = noisy.then(|| {
             let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
             std::thread::spawn(move || {
                 // Not a blob, so the GPU side skips it; what matters is the
@@ -1580,11 +1706,36 @@ mod blob_race {
                     let _ = t.send(RingClass::Device, 0, &noise);
                 }
             })
-        };
+        });
+        let recorded = record(&t);
+        stop.store(true, Ordering::Release);
+        if let Some(n) = noise {
+            n.join().unwrap();
+        }
+        // The GPU side's verdict first: when it stops on a bad command it also
+        // stops answering, and the recording thread's error is then only the
+        // echo of that.
+        let seen = gpu.join().unwrap().expect("every command the GPU side was handed was whole");
+        (seen, recorded, t)
+    }
 
+    /// **The bug**: `record` advanced `len` under the blob lock and copied the
+    /// command in after releasing it, and `publish_recorded_first` — run by
+    /// whichever thread forwards an unrecorded command — flushes every open
+    /// blob up to `len`. So a piece could name bytes not yet written. Firefox
+    /// on Zink met it as "unknown command opcode 4096" in `sv-gpu-server` and a
+    /// lost device.
+    ///
+    /// Here: one thread records into a fresh command buffer per round, which
+    /// fills a block and moves on at least once, and publishes at the end; a second forwards
+    /// unrecorded packets as fast as it can, each one a `publish_recorded_first`;
+    /// a third plays the GPU side and checks every command of every piece it is
+    /// handed. The GPU side's checks are what fail, not a timeout.
+    #[test]
+    fn a_flush_from_another_thread_never_publishes_unwritten_bytes() {
         const ROUNDS: u64 = 200;
-        const PER_ROUND: u32 = 2_000; // 125 KiB: one growth past `BLOB_INITIAL`
-        let recorded = (|| -> IcdResult<()> {
+        const PER_ROUND: u32 = 2_000; // 125 KiB: two blocks' worth
+        let (seen, recorded, _) = rig(true, |t| {
             for cb in 1..=ROUNDS {
                 for i in 0..PER_ROUND {
                     t.record(cb, 0, &command(cb, i))?;
@@ -1593,14 +1744,58 @@ mod blob_race {
                 t.free_blob(cb);
             }
             Ok(())
-        })();
-        stop.store(true, Ordering::Release);
-        noise.join().unwrap();
-        // The GPU side's verdict first: when it stops on a bad command it also
-        // stops answering, and the recording thread's error is then only the
-        // echo of that.
-        let seen = gpu.join().unwrap().expect("every command the GPU side was handed was whole");
+        });
         recorded.expect("the recording thread finished");
         assert_eq!(seen, ROUNDS * u64::from(PER_ROUND), "and every command was handed over");
+    }
+
+    /// docs/design.md §0.28: a block used to grow to its whole recording, so
+    /// one recording longer than the reserve was `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+    /// — and in Firefox a lost device. The GPU side copies each piece out on
+    /// arrival, so a block only has to hold what it has not read. Here one
+    /// recording is three times the 2 MiB reserve.
+    #[test]
+    fn a_recording_longer_than_the_reserve_streams_through_it() {
+        const COMMANDS: u32 = 100_000; // 6.1 MiB
+        let (seen, recorded, t) = rig(false, |t| {
+            for i in 0..COMMANDS {
+                t.record(1, 0, &command(1, i))?;
+            }
+            t.publish_blob(1)
+        });
+        recorded.expect("recorded without running out");
+        assert_eq!(seen, u64::from(COMMANDS));
+        // Blocks the GPU side was still reading retire rather than block the
+        // recording, so how many are held depends on how far it lagged; what
+        // may not happen is a block growing to the recording.
+        let blobs = t.blobs.lock().unwrap();
+        assert!(blobs.held <= 2 << 20, "{} bytes held", blobs.held);
+        let largest = blobs.open.values().chain(blobs.retiring.iter().map(|r| &r.0)).map(|b| b.cap).max();
+        assert_eq!(largest, Some(BLOB_INITIAL), "no block grew past its first size");
+    }
+
+    /// The other half of §0.28: command buffers whose blocks nobody gives back
+    /// — a `vkDestroyCommandPool` the transport was never told about, or just
+    /// more live command buffers than the reserve has blocks for. 200 of them
+    /// at a block each is 12.5 MiB against a 2 MiB reserve; running out is
+    /// back-pressure that reclaims every block the GPU side has finished with,
+    /// not an error.
+    #[test]
+    fn command_buffers_that_are_never_freed_do_not_exhaust_the_reserve() {
+        const BUFFERS: u64 = 200;
+        const PER_BUFFER: u32 = 1_500; // 94 KiB each
+        let (seen, recorded, t) = rig(true, |t| {
+            for cb in 1..=BUFFERS {
+                for i in 0..PER_BUFFER {
+                    t.record(cb, 0, &command(cb, i))?;
+                }
+                t.publish_blob(cb)?;
+            }
+            Ok(())
+        });
+        recorded.expect("recorded without running out");
+        assert_eq!(seen, BUFFERS * u64::from(PER_BUFFER));
+        let blobs = t.blobs.lock().unwrap();
+        assert!(blobs.held <= 2 << 20, "{} bytes held", blobs.held);
     }
 }

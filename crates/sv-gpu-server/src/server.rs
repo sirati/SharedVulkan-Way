@@ -173,21 +173,106 @@ impl GpuServer {
         WireError::Table
     }
 
-    /// The single family we advertise, with the real properties of the family
-    /// `crate::driver` opened its queue on — except `queueCount`, which is 1
-    /// because that is how many queues exist.
-    fn one_queue_family(&self) -> p::VkQueueFamilyProperties {
-        let all = unsafe {
-            self.shared
-                .driver
-                .instance
-                .get_physical_device_queue_family_properties(self.shared.driver.pd)
-        };
-        let mine = all.get(self.shared.driver.queue_family as usize).copied().unwrap_or_default();
-        let mut w = crate::convert::queue_family(&mine);
-        w.queue_count = 1;
-        w
+    /// The families we advertise, by the index an application sees them at,
+    /// with the real properties of each (`crate::driver::ServedFamily`):
+    /// `queueCount` is 1 because that is how many queues were opened, and the
+    /// capability bits this side does not serve are masked.
+    fn served_queue_families(&self) -> Vec<p::VkQueueFamilyProperties> {
+        self.shared.driver.served.iter().map(|f| crate::convert::queue_family(&f.props)).collect()
     }
+
+    /// The queue `vkGetDeviceQueue(family, …)` names. A family we did not
+    /// advertise gets the first queue rather than nothing — the command returns
+    /// `void`, and `sv_icd::icd::get_device_queue` has already said so.
+    fn queue_for_family(&self, family: u32) -> vk::Queue {
+        self.shared
+            .driver
+            .served
+            .get(family as usize)
+            .map(|f| f.queue)
+            .unwrap_or(self.shared.driver.queue)
+    }
+}
+
+/// The two video links of a `VkQueueFamilyProperties2` reply, for one family.
+///
+/// Always both, whatever the request carried, and that is not an over-answer:
+/// the app side's lowering sends each element of an *output array* as a
+/// default with an empty chain, so the request cannot say which links the
+/// application has; and `store_pnext` on the way back walks the application's
+/// own chain and writes only the links whose `sType` it finds there. A link
+/// the application did not chain is therefore dropped harmlessly, and one it
+/// did chain is never missed. Every other link (`…GlobalPriority…`,
+/// `…Checkpoint…`) stays unanswered, as it was before this stage.
+///
+/// Only when a decode family is served at all, so that the reply of a GPU side
+/// without video is byte-for-byte what it was.
+fn queue_family_video_links(
+    served: &crate::driver::ServedFamily,
+    decode_served: bool,
+) -> Vec<p::PNextLink> {
+    if !decode_served {
+        return Vec::new();
+    }
+    let mut v = p::VkQueueFamilyVideoPropertiesKHR::default();
+    v.video_codec_operations =
+        p::VkVideoCodecOperationFlagsKHR(served.video_codec_operations.as_raw());
+    let mut q = p::VkQueueFamilyQueryResultStatusPropertiesKHR::default();
+    q.query_result_status_support = served.query_result_status;
+    vec![
+        p::PNextLink::VkQueueFamilyVideoPropertiesKHR(Box::new(v)),
+        p::PNextLink::VkQueueFamilyQueryResultStatusPropertiesKHR(Box::new(q)),
+    ]
+}
+
+/// A video session bind's driver `memoryTypeBits`, as docs/design.md §9.1's
+/// table numbers it: bit 0 — our `DEVICE_LOCAL` type, and never an arena bit —
+/// whenever the driver accepts any type at all.
+///
+/// Bit 0 is honest even when the driver's bits exclude the type `allocate_memory`
+/// normally backs our type 0 with, because `bind_video_session_memory_khr`
+/// re-makes a dedicated allocation from a type the driver does accept. RADV's AV1
+/// session is the case that needs it: its bits are `0x678`, all host-visible
+/// types, none of them RADV's type 0.
+///
+/// Zero is reported as zero: an application then finds no memory type and fails
+/// at allocation. Not seen on RADV; said once on stderr if it is.
+fn session_memory_type_bits(driver_bits: u32) -> u32 {
+    if driver_bits == 0 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            eprintln!("sv-gpu-server: a video session bind accepts no memory type at all");
+        }
+        return 0;
+    }
+    1
+}
+
+/// The driver memory type a session bind is re-made from: the first
+/// `DEVICE_LOCAL` type the driver accepts, else the first type it accepts.
+fn session_memory_type(driver: &Driver, driver_bits: u32) -> Option<u32> {
+    driver
+        .memory_type(driver_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .or_else(|| driver.memory_type(driver_bits, vk::MemoryPropertyFlags::empty()))
+}
+
+/// An image's driver `memoryTypeBits` in §9.1's numbering.
+///
+/// Bit 0 exactly when the driver's bits include our type 0's driver type (the
+/// first `DEVICE_LOCAL`, as `allocate_memory` picks it). Bits 1–3, the arena's three
+/// types, exactly when the driver's bits include the type the arena was
+/// actually allocated from — which is what binding an image there would mean.
+/// On RADV this reproduces almost exactly what the verbatim forward said (its
+/// type 0 is `DEVICE_LOCAL` and the arena is its type 2); what it changes is
+/// NVIDIA, whose type 0 has no flags.
+fn app_image_memory_type_bits(shared: &Shared, driver_bits: u32) -> u32 {
+    let dl = shared
+        .driver
+        .memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .map_or(0, |dl| u32::from(driver_bits & (1 << dl) != 0));
+    let arena = if driver_bits & (1 << shared.arena.memory_type) != 0 { 0b1110 } else { 0 };
+    dl | arena
 }
 
 /// `VK_SUCCESS`.
@@ -432,7 +517,7 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueueArgs,
     ) -> WireResult<p::VkGetDeviceQueueReply> {
-        let q = self.shared.driver.queue;
+        let q = self.queue_for_family(a.queue_family_index);
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -443,7 +528,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueue2Args,
     ) -> WireResult<p::VkGetDeviceQueue2Reply> {
-        let q = self.shared.driver.queue;
+        let family = a.p_queue_info.as_ref().map(|i| i.queue_family_index).unwrap_or(0);
+        let q = self.queue_for_family(family);
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -463,9 +549,30 @@ impl GpuHost for GpuServer {
         // mapped — which is a real driver allocation.
         let want = vk::MemoryPropertyFlags::DEVICE_LOCAL;
         let ti = self.shared.driver.memory_type(u32::MAX, want).unwrap_or(0);
-        let ai = vk::MemoryAllocateInfo::default()
+        // **The dedicated-allocation link is carried; nothing else in the chain
+        // is.** A driver may *require* an image's memory to be dedicated to it
+        // (`VkMemoryDedicatedRequirements::requiresDedicatedAllocation`, which
+        // RADV reports for ffmpeg's decode pictures), and the GPU side's
+        // validation layer reported `VUID-VkBindImageMemoryInfo-image-01445` on
+        // every one of them while this link was being dropped (docs/video-decode.md
+        // §7.5). The image or buffer it names is mapped to the driver's handle;
+        // an id that does not resolve fails the call rather than dedicating the
+        // memory to nothing.
+        let dedicated = info.p_next.iter().find_map(|l| match l {
+            p::PNextLink::VkMemoryDedicatedAllocateInfo(d) => Some((d.image.0, d.buffer.0)),
+            _ => None,
+        });
+        let mut ded = vk::MemoryDedicatedAllocateInfo::default();
+        if let Some((image, buffer)) = dedicated {
+            ded.image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
+            ded.buffer = vk::Buffer::from_raw(self.map_handle(HandleType::VkBuffer, buffer)?);
+        }
+        let mut ai = vk::MemoryAllocateInfo::default()
             .allocation_size(info.allocation_size)
             .memory_type_index(ti);
+        if dedicated.is_some() {
+            ai = ai.push_next(&mut ded);
+        }
         match unsafe { self.d().allocate_memory(&ai, None) } {
             Ok(m) => {
                 if let Some(id) = a.p_memory {
@@ -634,38 +741,324 @@ impl GpuHost for GpuServer {
         })
     }
 
-    /// The one queue family this GPU side has, described from the queue it
-    /// actually opened.
+    /// The queue families this GPU side serves, each described from the queue
+    /// it actually opened.
     ///
-    /// Not the driver's table. docs/design.md §8 gives one physical device and
-    /// `crate::driver` opens one queue on one family; an application handed
-    /// RADV's five families would ask for family 3 and be given family 0's
-    /// queue with no diagnostic. The flags are the real ones for the family we
-    /// chose, so an application that checks `VK_QUEUE_GRAPHICS_BIT` gets a true
-    /// answer — it is the *indexing* that is ours, exactly as with the memory
-    /// table of §9.1.
+    /// Not the driver's whole table. `crate::driver` opens one queue per served
+    /// family, and an application handed RADV's five families would ask for
+    /// family 3 and be given another family's queue with no diagnostic. Without
+    /// video decode that is one family, presented as family 0, exactly as
+    /// before; with it, it is the driver's prefix up to and including the
+    /// decode family, at the driver's own indices (`driver::ServedFamily` says
+    /// why the indices are not renumbered). The flags are the real ones, minus
+    /// the capabilities we do not serve — it is the *selection* that is ours,
+    /// as with the memory table of §9.1.
     fn get_physical_device_queue_family_properties(
         &mut self,
         a: p::VkGetPhysicalDeviceQueueFamilyPropertiesArgs,
     ) -> WireResult<p::VkGetPhysicalDeviceQueueFamilyPropertiesReply> {
-        let one = self.one_queue_family();
+        let all = self.served_queue_families();
+        let n = all.len() as u32;
         let want = a.p_queue_family_properties.len();
         Ok(p::VkGetPhysicalDeviceQueueFamilyPropertiesReply {
-            p_queue_family_property_count: Some(1),
-            p_queue_family_properties: if want == 0 { Vec::new() } else { vec![one] },
+            p_queue_family_property_count: Some(if want == 0 { n } else { n.min(want as u32) }),
+            p_queue_family_properties: all.into_iter().take(want).collect(),
         })
     }
 
+    /// As the plain form, and it carries the two video links of the chain.
+    ///
+    /// `VkQueueFamilyVideoPropertiesKHR` is how an application finds out *which
+    /// codecs* a decode family does — the flag alone says only that it decodes —
+    /// and ffmpeg's `hwcontext_vulkan` reads it to choose its decode queue. Both
+    /// links are answered from what `crate::driver` recorded at open, and the
+    /// codec mask is the one restricted to extensions this device enabled.
     fn get_physical_device_queue_family_properties2(
         &mut self,
         a: p::VkGetPhysicalDeviceQueueFamilyProperties2Args,
     ) -> WireResult<p::VkGetPhysicalDeviceQueueFamilyProperties2Reply> {
-        let mut w = p::VkQueueFamilyProperties2::default();
-        w.queue_family_properties = self.one_queue_family();
+        let served = &self.shared.driver.served;
+        let decode_served = self.shared.driver.decode_family.is_some();
+        let n = served.len() as u32;
         let want = a.p_queue_family_properties.len();
+        let out: Vec<p::VkQueueFamilyProperties2> = a
+            .p_queue_family_properties
+            .into_iter()
+            .zip(served.iter())
+            .map(|(mut w, f)| {
+                w.queue_family_properties = crate::convert::queue_family(&f.props);
+                w.p_next = queue_family_video_links(f, decode_served);
+                w
+            })
+            .collect();
         Ok(p::VkGetPhysicalDeviceQueueFamilyProperties2Reply {
-            p_queue_family_property_count: Some(1),
-            p_queue_family_properties: if want == 0 { Vec::new() } else { vec![w] },
+            p_queue_family_property_count: Some(if want == 0 { n } else { n.min(want as u32) }),
+            p_queue_family_properties: out,
+        })
+    }
+
+    /// Forwarded for the numbers, renumbered for the mask.
+    ///
+    /// `memoryTypeBits` comes back in the driver's numbering and is read by the
+    /// application against docs/design.md §9.1's table, so it is translated —
+    /// the same argument `sv_icd::icd::get_buffer_memory_requirements` makes for
+    /// buffers, made here because only this side knows which driver type our
+    /// type 0 is. See [`session_memory_type_bits`].
+    ///
+    /// **Session memory never goes in the arena**, and the mask says so: it is
+    /// memory only the video engine touches, which is docs/design.md §0.21.2's
+    /// decision 1 applied to the session as well as to the pictures.
+    fn get_video_session_memory_requirements_khr(
+        &mut self,
+        a: p::VkGetVideoSessionMemoryRequirementsKHRArgs,
+    ) -> WireResult<p::VkGetVideoSessionMemoryRequirementsKHRReply> {
+        let session = self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?;
+        let Some(vq) = self.shared.driver.video_queue.as_ref() else {
+            self.note_missing("vkGetVideoSessionMemoryRequirementsKHR");
+            let mut r = p::VkGetVideoSessionMemoryRequirementsKHRReply::default();
+            r.result = p::VkResult(vk::Result::ERROR_EXTENSION_NOT_PRESENT.as_raw());
+            return Ok(r);
+        };
+        let session = vk::VideoSessionKHR::from_raw(session);
+        let device = self.shared.driver.device.handle();
+        let fp = vq.fp().get_video_session_memory_requirements_khr;
+        let mut n = 0u32;
+        // SAFETY: a count query; the session handle is the driver's own, mapped
+        // above, and the device is the one it was created on.
+        let r = unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
+        let capacity = a.p_memory_requirements.len();
+        if r != vk::Result::SUCCESS || capacity == 0 {
+            return Ok(p::VkGetVideoSessionMemoryRequirementsKHRReply {
+                result: p::VkResult(r.as_raw()),
+                p_memory_requirements_count: Some(n),
+                p_memory_requirements: Vec::new(),
+            });
+        }
+        let mut got = vec![vk::VideoSessionMemoryRequirementsKHR::default(); capacity];
+        let mut m = capacity as u32;
+        // SAFETY: `got` holds `m` elements, each a valid output structure.
+        let r = unsafe { fp(device, session, &mut m, got.as_mut_ptr()) };
+        got.truncate(m as usize);
+        let out = got
+            .iter()
+            .map(|g| {
+                let mut w = p::VkVideoSessionMemoryRequirementsKHR::default();
+                w.memory_bind_index = g.memory_bind_index;
+                w.memory_requirements.size = g.memory_requirements.size;
+                w.memory_requirements.alignment = g.memory_requirements.alignment;
+                w.memory_requirements.memory_type_bits =
+                    session_memory_type_bits(g.memory_requirements.memory_type_bits);
+                w
+            })
+            .collect();
+        Ok(p::VkGetVideoSessionMemoryRequirementsKHRReply {
+            result: p::VkResult(r.as_raw()),
+            p_memory_requirements_count: Some(m),
+            p_memory_requirements: out,
+        })
+    }
+
+    /// Forwarded, after making sure each dedicated type-0 allocation is of a
+    /// driver type the session accepts for that bind index.
+    ///
+    /// [`session_memory_type_bits`] tells the application "our type 0" for any
+    /// bind the driver can serve at all, and our type 0 is normally the driver's
+    /// first `DEVICE_LOCAL` type. Where the driver wants something else — RADV's
+    /// AV1 session, whose bits are all host-visible types — the allocation is
+    /// re-made here, the first moment the session and bind index are known.
+    ///
+    /// **Only a dedicated allocation is re-made**: offset 0 and the whole
+    /// allocation bound. That is what ffmpeg and `video-probe` do, and it is
+    /// the only case where nothing else could already be bound into the memory
+    /// being replaced. Anything else is passed through and the driver answers.
+    fn bind_video_session_memory_khr(
+        &mut self,
+        a: p::VkBindVideoSessionMemoryKHRArgs,
+    ) -> WireResult<p::VkBindVideoSessionMemoryKHRReply> {
+        let session = vk::VideoSessionKHR::from_raw(
+            self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?,
+        );
+        let Some((get_reqs, bind)) = self
+            .shared
+            .driver
+            .video_queue
+            .as_ref()
+            .map(|vq| (vq.fp().get_video_session_memory_requirements_khr, vq.fp().bind_video_session_memory_khr))
+        else {
+            self.note_missing("vkBindVideoSessionMemoryKHR");
+            return Ok(p::VkBindVideoSessionMemoryKHRReply {
+                result: p::VkResult(vk::Result::ERROR_EXTENSION_NOT_PRESENT.as_raw()),
+            });
+        };
+        let device = self.shared.driver.device.handle();
+        // The driver's requirements, by bind index.
+        let reqs = {
+            let fp = get_reqs;
+            let mut n = 0u32;
+            // SAFETY: a count query on the driver's own session and device.
+            // A failure leaves `n` at 0 and the bind below finds no
+            // requirement to re-make against, which is the driver's answer.
+            let _ = unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
+            let mut v = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
+            // SAFETY: `v` holds `n` output structures.
+            let _ = unsafe { fp(device, session, &mut n, v.as_mut_ptr()) };
+            v.truncate(n as usize);
+            v
+        };
+        let usual = self.shared.driver.memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        let mut binds = Vec::with_capacity(a.p_bind_session_memory_infos.len());
+        for b in &a.p_bind_session_memory_infos {
+            let (memory, offset) = self.rewrite_memory(b.memory.0, b.memory_offset)?;
+            let mut memory = vk::DeviceMemory::from_raw(memory);
+            let want = reqs
+                .iter()
+                .find(|r| r.memory_bind_index == b.memory_bind_index)
+                .map(|r| r.memory_requirements.memory_type_bits);
+            let range = self.shared.objects().memory(b.memory.0);
+            if let (Some(want), Some(range), Some(usual)) = (want, range, usual)
+                && b.memory.0 != crate::ARENA_MEMORY_ID
+                && want & (1 << usual) == 0
+                && b.memory_offset == 0
+                && b.memory_size == range.len
+                && let Some(ty) = session_memory_type(&self.shared.driver, want)
+            {
+                let ai = vk::MemoryAllocateInfo::default()
+                    .allocation_size(range.len)
+                    .memory_type_index(ty);
+                // SAFETY: an ordinary allocation on the driver's own device.
+                match unsafe { self.d().allocate_memory(&ai, None) } {
+                    Ok(m) => {
+                        // SAFETY: the replaced allocation is dedicated to this
+                        // bind (offset 0, whole size) and so has nothing bound.
+                        unsafe { self.d().free_memory(range.memory, None) };
+                        self.shared.objects().insert_memory(
+                            b.memory.0,
+                            crate::table::MemoryRange { memory: m, base: 0, len: range.len },
+                        );
+                        memory = m;
+                    }
+                    Err(e) => {
+                        return Ok(p::VkBindVideoSessionMemoryKHRReply { result: fail(e) });
+                    }
+                }
+            }
+            binds.push(
+                vk::BindVideoSessionMemoryInfoKHR::default()
+                    .memory_bind_index(b.memory_bind_index)
+                    .memory(memory)
+                    .memory_offset(offset)
+                    .memory_size(b.memory_size),
+            );
+        }
+        // SAFETY: `binds` outlives the call; every handle in it is the driver's.
+        let r = unsafe {
+            bind(device, session, binds.len() as u32, binds.as_ptr())
+        };
+        Ok(p::VkBindVideoSessionMemoryKHRReply { result: p::VkResult(r.as_raw()) })
+    }
+
+    /// Forwarded for the numbers, renumbered for the mask, as above.
+    ///
+    /// Images had gone through verbatim since the first stage. That is right
+    /// only where the driver's numbering happens to agree with docs/design.md
+    /// §9.1's, which on RADV it nearly does (its type 0 is `DEVICE_LOCAL`) and
+    /// on NVIDIA it does not (its type 0 has no flags) — see
+    /// [`app_image_memory_type_bits`].
+    fn get_image_memory_requirements(
+        &mut self,
+        a: p::VkGetImageMemoryRequirementsArgs,
+    ) -> WireResult<p::VkGetImageMemoryRequirementsReply> {
+        let image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, a.image.0)?);
+        // SAFETY: the driver's own image, mapped above, on the device it was
+        // created on.
+        let r = unsafe { self.d().get_image_memory_requirements(image) };
+        let mut w = p::VkMemoryRequirements::default();
+        w.size = r.size;
+        w.alignment = r.alignment;
+        w.memory_type_bits = app_image_memory_type_bits(&self.shared, r.memory_type_bits);
+        Ok(p::VkGetImageMemoryRequirementsReply { p_memory_requirements: Some(Box::new(w)) })
+    }
+
+    /// The `2` form: the generated path — it carries `VkImagePlaneMemoryRequirementsInfo`
+    /// in and `VkMemoryDedicatedRequirements` out — with the mask renumbered on
+    /// the way back.
+    fn get_image_memory_requirements2(
+        &mut self,
+        a: p::VkGetImageMemoryRequirements2Args,
+    ) -> WireResult<p::VkGetImageMemoryRequirements2Reply> {
+        let mut a = a;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            if let Some(inner) = &mut a.p_info {
+                p::handle_map_vk_image_memory_requirements_info2(inner, m)?;
+            }
+        }
+        let Some(f) = self.fns().vk_get_image_memory_requirements2 else {
+            self.note_missing("vkGetImageMemoryRequirements2");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkImageMemoryRequirementsInfo2 = match &a.p_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_image_memory_requirements_info2(x, &mut pool)?;
+                pool.one(v)
+            }
+            None => std::ptr::null(),
+        };
+        let mut out = match &a.p_memory_requirements {
+            Some(v) => sv_gpu_entry::raise_vk_memory_requirements2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: `info` and the chain of `out` are owned by `pool`, which
+        // outlives the call; the device is the driver's own.
+        unsafe { f(self.d().handle().as_raw() as usize as _, info, &mut out) };
+        // SAFETY: `out` was just written by the driver and its chain is `pool`'s.
+        let mut reply = unsafe { sv_gpu_entry::lower_full_vk_memory_requirements2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        let bits = &mut reply.memory_requirements.memory_type_bits;
+        *bits = app_image_memory_type_bits(&self.shared, *bits);
+        Ok(p::VkGetImageMemoryRequirements2Reply { p_memory_requirements: Some(Box::new(reply)) })
+    }
+
+    /// As the `2` form, for an image that does not exist yet.
+    fn get_device_image_memory_requirements(
+        &mut self,
+        a: p::VkGetDeviceImageMemoryRequirementsArgs,
+    ) -> WireResult<p::VkGetDeviceImageMemoryRequirementsReply> {
+        let mut a = a;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            if let Some(inner) = &mut a.p_info {
+                p::handle_map_vk_device_image_memory_requirements(inner, m)?;
+            }
+        }
+        let Some(f) = self.fns().vk_get_device_image_memory_requirements else {
+            self.note_missing("vkGetDeviceImageMemoryRequirements");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkDeviceImageMemoryRequirements = match &a.p_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_device_image_memory_requirements(x, &mut pool)?;
+                pool.one(v)
+            }
+            None => std::ptr::null(),
+        };
+        let mut out = match &a.p_memory_requirements {
+            Some(v) => sv_gpu_entry::raise_vk_memory_requirements2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: as `get_image_memory_requirements2`.
+        unsafe { f(self.d().handle().as_raw() as usize as _, info, &mut out) };
+        // SAFETY: as `get_image_memory_requirements2`.
+        let mut reply = unsafe { sv_gpu_entry::lower_full_vk_memory_requirements2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        let bits = &mut reply.memory_requirements.memory_type_bits;
+        *bits = app_image_memory_type_bits(&self.shared, *bits);
+        Ok(p::VkGetDeviceImageMemoryRequirementsReply {
+            p_memory_requirements: Some(Box::new(reply)),
         })
     }
 

@@ -160,6 +160,13 @@ application needs is the one nothing measured.** That is the same shape as §0.9
   `docs/video-decode.md` §5 still recommends software decode, and §6 records that
   the forwarder carries the capability queries and not a decode.
 
+  > **[SUPERSEDED — 2026-10-15, `docs/video-decode.md` §7.7.]** The forwarder
+  > decodes, and a Firefox 157.0.1 built with `nix/firefox-vulkan-readback.patch`
+  > decodes H.264 on the forwarded RADV (`scripts/sv-firefox-vulkan-decode.sh`).
+  > Software decode is still what an *unpatched* Firefox does on this topology,
+  > and it does so cleanly: its Vulkan probe needs an accelerated GL, and Zink
+  > on a device with no DRM node is reported as software.
+
 ## 7. Where the frame ends up, and the copy count
 
 Question 3 was what a shared handle between the two projects would have to be.
@@ -792,6 +799,15 @@ Firefox ran 333 s of scripted use with about:support reading `WebRender` on
 Firefox's blocklist calls Zink `mesa/software-unknown`. Whether these were also
 what testhost's 15 s stall was is not re-measured there.
 
+**And the Wayland gate itself, opened (2026-10-15, docs/design.md §0.28).** §2's
+reading of Mesa holds for the installed 26.2.4 and upstream made it deliberate
+in 25.2. `nix/mesa-kopper-wayland.patch` gives `platform_wayland.c` the override
+`platform_x11.c` already has, `LIBGL_KOPPER_DRI2`, and nothing else; with it,
+Firefox as a Wayland client of a `wl_shm`-only weston ran 337 s on Zink through
+this ICD's `VK_KHR_wayland_surface`, and through `wc-proxy` in front of
+`wc-compositor.exe` under Wine it rendered the same way. The commands for the
+guest are in "Wayland on the forwarded GPU" below.
+
 ---
 
 # The stall, decomposed — and it bottoms out in a `Duration` this tree already documents
@@ -963,3 +979,60 @@ that can carry video and one that cannot. But it belongs after the doorbell and
 after an asynchronous present, not instead of them. Getting that order wrong
 would be §0.13's mistake in its most expensive form — a real improvement,
 honestly measured, aimed at the wrong bottleneck.
+
+---
+
+# Wayland on the forwarded GPU — what was built, and how to check it on the guest
+
+docs/design.md §0.28 has the measurements; this is the deployment half.
+
+**The pieces.**
+
+| piece | what it does |
+|---|---|
+| `nix/mesa-kopper-wayland.{nix,patch}` | the host's own Mesa, plus `LIBGL_KOPPER_DRI2` on the Wayland platform: Zink presents through the Vulkan driver's `VK_KHR_wayland_surface` with no DRM device from the compositor. Built against the nixpkgs the host's Firefox comes from; loaded per process through `__EGL_VENDOR_LIBRARY_FILENAMES`. |
+| `sv_icd::present::wayland` | that WSI, unchanged: a `wl_shm` ring on the application's own `wl_surface`. §1 above built it; nothing called it until now. |
+| `scripts/wc-session` `gpu.env` | the host says it forwards a GPU; `run` applies the variables and appends `gfx.webrender.all` to the profile's `user.js`, never one without the other. |
+| `scripts/sv-firefox-guest.sh` `SVFF_KOPPER_MESA` | the guest harness's `zink` and `probe` modes on that Mesa. |
+
+**A `gpu.env` for testhost**, in `~/wc-launch/gpu.env`, once sv-hostd serves
+the GPU sessions the launcher's Firefox should use (that wiring is not part of
+`wc-session` and is not done here):
+
+```
+MESA_LOADER_DRIVER_OVERRIDE=zink
+LIBGL_KOPPER_DRI2=1
+__EGL_VENDOR_LIBRARY_FILENAMES=<mesa-kopper-wayland>/share/glvnd/egl_vendor.d/50_mesa.json
+VK_DRIVER_FILES=<dir>/sv_icd.json
+SV_SOCKET=<the sv-hostd socket>
+```
+
+**Commands for the guest, on testhost, from a checkout of this branch**, none
+of them run in this phase:
+
+```
+# 1. The Mesa, against this host's nixpkgs (the one its Firefox is from), and
+#    an eglinfo built against the same glibc.
+MK=$(nix build --no-link --print-out-paths --impure --expr \
+  '(builtins.getFlake "nixpkgs").legacyPackages.x86_64-linux.callPackage ./nix/mesa-kopper-wayland.nix {}' \
+  | grep -v -- '-[a-z_]*$' | head -1)
+DEMOS=$(nix build --no-link --print-out-paths nixpkgs#mesa-demos)
+
+# 2. eglinfo on the Wayland platform against wc-proxy: stock, then patched.
+#    Expect llvmpipe, then "zink Vulkan 1.x(<the guest's GPU> ...)".
+SVFF_DEMOS=$DEMOS scripts/sv-firefox-guest.sh 2 60 probe
+SVFF_DEMOS=$DEMOS SVFF_KOPPER_MESA=$MK scripts/sv-firefox-guest.sh 2 60 probe
+
+# 3. Firefox as a Wayland client of wc-proxy, on the guest's GPU.
+#    Expect about:support Compositing "WebRender", WebGL "zink ...",
+#    Window Protocol "wayland", and sv-hostd serving submissions throughout.
+SVFF_KOPPER_MESA=$MK scripts/sv-firefox-guest.sh 4 300 zink
+```
+
+The thing to watch in 3 is not whether it renders — on one machine it does — but
+the frame notes' `present: fence … ms`. Locally the whole present is about 1 ms
+(§0.28.8). Across the VM the fence is three forwarded round trips and a wait,
+and "The stall, decomposed" above measured each waiting round trip at a 20 ms
+quantum when the doorbell does not cross; run with `SVFF_EXTRA_ENV=SV_DEBUG=1`
+to get the notes.
+

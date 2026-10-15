@@ -117,6 +117,19 @@ const CLASSIFIED: &[(&str, Where, &str)] = &[
      "as vkGetPhysicalDeviceExternalBufferProperties"),
     ("vkGetPhysicalDeviceExternalFenceProperties", Where::ClientSide,
      "as vkGetPhysicalDeviceExternalBufferProperties"),
+    // -- file descriptors: refused, because forwarded they are the GPU side's
+    //    descriptor numbers (docs/video-decode.md §7)
+    ("vkGetMemoryFdKHR", Where::ClientSide,
+     "§1a: a forwarded answer is a descriptor number open in the GPU side's \
+      process; VK_ERROR_TOO_MANY_OBJECTS is the true answer"),
+    ("vkGetSemaphoreFdKHR", Where::ClientSide, "as vkGetMemoryFdKHR: a sync_fd is a descriptor too"),
+    ("vkGetFenceFdKHR", Where::ClientSide, "as vkGetMemoryFdKHR: a fence fd is a descriptor too"),
+    ("vkGetMemoryFdPropertiesKHR", Where::ClientSide,
+     "§1a: no descriptor of this process names anything the GPU side has"),
+    ("vkImportSemaphoreFdKHR", Where::ClientSide,
+     "§1a: forwarded, the GPU side's driver would take ownership of, and close, \
+      its own descriptor of that number"),
+    ("vkImportFenceFdKHR", Where::ClientSide, "as vkImportSemaphoreFdKHR, for a fence instead"),
 
     // -- object creation: the id is ours (§6.4), the object is the driver's
     ("vkCreateBuffer", Where::ForwardsWhenConnected, "forwards; the id is minted here (§6.4)"),
