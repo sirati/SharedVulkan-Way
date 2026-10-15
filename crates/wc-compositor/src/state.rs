@@ -520,7 +520,11 @@ pub struct State {
     negotiated_decoration: HashMap<WlSurface, Agreed>,
     next_id: WindowId,
     started: Instant,
-    last_frame: Instant,
+    /// When frame callbacks are answered (docs/waycompose-design.md §88).
+    pub frame_clock: crate::tick::FrameClock,
+    /// Callbacks of surfaces that are not windows — subsurfaces and cursors —
+    /// waiting for the next tick, with the surface they were asked on.
+    pending_callbacks: Vec<(WlCallback, u32)>,
     /// Synthesise an icon at map time, so the platform's icon path is executed
     /// by something rather than merely compiled.
     debug_icon: bool,
@@ -903,7 +907,8 @@ impl State {
             negotiated_decoration: HashMap::new(),
             next_id: 1,
             started: Instant::now(),
-            last_frame: Instant::now(),
+            frame_clock: crate::tick::FrameClock::new(),
+            pending_callbacks: Vec::new(),
             debug_icon,
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
@@ -951,17 +956,22 @@ impl State {
         self.started.elapsed().as_millis() as u32
     }
 
-    /// Answer frame callbacks, at most once per vsync-ish interval.
+    /// How long the loop may sleep before the next frame tick.
+    pub fn until_frame(&self) -> std::time::Duration {
+        self.frame_clock.until_next(Instant::now())
+    }
+
+    /// Answer every frame callback asked for since the last tick, on the tick.
     ///
-    /// 16 ms rather than a real vblank because there is no output object yet
-    /// and nothing to synchronise to. It is a throttle, not a timing guarantee,
-    /// and it is the difference between an animating client using a few percent
-    /// of a core and using all of one.
+    /// The tick is [`crate::tick::FrameClock`]'s grid, and the loop wakes on
+    /// it ([`State::until_frame`]). Window and subsurface callbacks alike: a
+    /// subsurface used to be answered at once, which made a client drawing
+    /// into one — Firefox — run at whatever rate the round trip allowed
+    /// rather than at the display's (docs/waycompose-design.md §88).
     pub fn tick_frames(&mut self) {
-        if self.last_frame.elapsed().as_millis() < 16 {
+        if !self.frame_clock.due(Instant::now()) {
             return;
         }
-        self.last_frame = Instant::now();
         let now = self.now_ms();
         for (root, window) in self.windows.iter_mut() {
             if sv_transport::frametrace::enabled() && !window.frame_callbacks.is_empty() {
@@ -976,6 +986,23 @@ impl State {
                 );
             }
             for cb in window.frame_callbacks.drain(..) {
+                cb.done(now);
+            }
+        }
+        if !self.pending_callbacks.is_empty() {
+            if sv_transport::frametrace::enabled() {
+                let mut by: Vec<(u32, u32)> = Vec::new();
+                for (_, s) in &self.pending_callbacks {
+                    match by.iter_mut().find(|e| e.0 == *s) {
+                        Some(e) => e.1 += 1,
+                        None => by.push((*s, 1)),
+                    }
+                }
+                for (s, n) in by {
+                    sv_transport::frametrace::emit("wc.done_sub", format_args!("surf={s} n={n}"));
+                }
+            }
+            for (cb, _) in self.pending_callbacks.drain(..) {
                 cb.done(now);
             }
         }
@@ -3429,19 +3456,10 @@ impl CompositorHandler for State {
             window.frame_callbacks.extend(callbacks);
         } else {
             // A surface with no window of its own — a cursor, or a subsurface.
-            // Its callbacks still have to be answered or its client stops
-            // drawing, and answering at once is right because nothing is
-            // throttling it to a display.
-            if sv_transport::frametrace::enabled() && !callbacks.is_empty() {
-                sv_transport::frametrace::emit(
-                    "wc.done_now",
-                    format_args!("surf={} n={}", surface.id().protocol_id(), callbacks.len()),
-                );
-            }
-            let now = self.now_ms();
-            for cb in callbacks {
-                cb.done(now);
-            }
+            // Its callbacks are answered on the next tick, like a window's: it
+            // is on the same display (docs/waycompose-design.md §88).
+            let id = surface.id().protocol_id();
+            self.pending_callbacks.extend(callbacks.into_iter().map(|cb| (cb, id)));
         }
 
         // Buffer scale and transform are honoured only in their identity form.

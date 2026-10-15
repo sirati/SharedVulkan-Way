@@ -1570,6 +1570,11 @@ fn wayland_thread(
     let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
     println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
+    println!(
+        "wc-compositor: frame callbacks on a {:?} grid ({})",
+        state.frame_clock.period(),
+        state.frame_clock.describe()
+    );
     let _ = std::io::stdout().flush();
 
     // §36. `accept()` on the ring directory, beside `accept()` on the socket.
@@ -1859,7 +1864,10 @@ fn wayland_thread(
             break;
         }
 
-        ticker.wait(POLL);
+        // Never past the next frame tick (docs/waycompose-design.md §88): the
+        // callbacks it answers go out on the tick, not up to a turn after it.
+        // A floor, so a tick that is a hair away is not a spin.
+        ticker.wait(POLL.min(state.until_frame()).max(Duration::from_micros(200)));
     }
 
     // Said on the way out, always. "The taskbar icon is the generic one" has
