@@ -806,32 +806,39 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// Arena memory is given back here; heap-0 memory is forwarded, and
+    /// **forwarded before it is forgotten** (docs/design.md §0.28).
+    ///
+    /// The generated `forward::free_memory` rewrites the id through
+    /// `MemoryRewrite`, which looks it up in the very table this removes it
+    /// from. Removing first made every heap-0 free fail on this side with
+    /// `NoSuchMemory` — reported only under `SV_DEBUG`, and only as a line —
+    /// so the GPU side never freed a single device-local allocation: 416 to
+    /// 439 per five-minute Firefox run, each a real driver allocation kept
+    /// until the session ended.
     fn free_memory(&self, args: p::VkFreeMemoryArgs) -> IcdResult<()> {
-        let arena_backed = {
-            let mut s = self.state();
-            match s.memories.remove(&args.memory.0) {
-                Some(m) => match m.allocation {
-                    Some(a) => {
-                        // docs/design.md §5.5 defers this until the timelines an
-                        // allocation could be referenced by have passed. The
-                        // timeline mirror is not wired to submissions yet, so
-                        // this is still immediate — the honest gap, and the one
-                        // `ArenaAllocator::free_deferred` is waiting for.
-                        let _ = s.allocator.free_now(a);
-                        true
-                    }
-                    None => false,
-                },
-                None => return Ok(()),
-            }
+        let id = args.memory.0;
+        let arena_backed = match self.state().memories.get(&id) {
+            Some(m) => m.allocation.is_some(),
+            None => return Ok(()),
         };
         // Arena memory has no GPU-side object to free: it is a sub-range of the
         // one arena allocation, which outlives every application. Heap-0 memory
         // does, and it is a real driver allocation there.
-        if !arena_backed && let Some(t) = self.wire() {
-            forward::free_memory(t, args)?;
+        let forwarded = match (arena_backed, self.wire()) {
+            (false, Some(t)) => forward::free_memory(t, args),
+            _ => Ok(()),
+        };
+        let mut s = self.state();
+        if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
+            // docs/design.md §5.5 defers this until the timelines an
+            // allocation could be referenced by have passed. The timeline
+            // mirror is not wired to submissions yet, so this is still
+            // immediate — the honest gap, and the one
+            // `ArenaAllocator::free_deferred` is waiting for.
+            let _ = s.allocator.free_now(a);
         }
-        Ok(())
+        forwarded
     }
 
     fn get_buffer_memory_requirements(
