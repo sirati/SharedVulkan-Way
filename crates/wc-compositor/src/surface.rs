@@ -532,9 +532,22 @@ impl PixelSource for ShmSource {
 /// window style on by itself. §33.6 is the argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decorator {
-    /// The client used a decoration protocol, so it was *told* and agreed.
+    /// The client used a decoration protocol, so it was *told* and agreed —
+    /// and what it agreed to is that **the system** draws the title bar.
     /// Whatever it draws, it is not drawing it in ignorance.
     Negotiated,
+    /// The client used a decoration protocol and the mode it ended up with is
+    /// **`Client`**: it asked to draw its own title bar and was answered yes.
+    ///
+    /// ADDED FOR §82. Before it, this was part of [`Self::Negotiated`] and was
+    /// never folded under `auto`, which is why Firefox's tabs reached the
+    /// caption only with `--decorations tabs`: GTK binds KDE's manager, so
+    /// Firefox is always "negotiated", and the one bit that says whether it is
+    /// about to draw a tab strip — the mode it asked for — was printed and then
+    /// thrown away. It is the cleanest input this function has, because it is
+    /// not a correlate: the client *said* it decorates itself, on the protocol
+    /// that exists for saying it.
+    AskedForClient,
     /// No decoration protocol and no margin around the window: nothing suggests
     /// this client is drawing a title bar. `weston-flower`.
     ProbablySystem,
@@ -544,15 +557,38 @@ pub enum Decorator {
     ProbablyItself,
 }
 
-/// Which of the three this window is, from the two facts a compositor has at
+/// The decoration mode a surface and this compositor settled on, if they spoke
+/// about it at all.
+///
+/// ADDED FOR §82. It is the *last* answer the compositor gave on either
+/// protocol: KDE's object starts at the manager's default and moves with every
+/// echoed `request_mode`, and `xdg-decoration` is whatever this compositor
+/// configured. Kept per surface by `State` and read once, at map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Agreed {
+    /// No decoration object was ever created. `weston-terminal`.
+    Nothing,
+    /// The system draws the title bar. Firefox with
+    /// `MOZ_GTK_TITLEBAR_DECORATION=none`.
+    Server,
+    /// The client draws its own. Firefox with nothing set, or with
+    /// `MOZ_GTK_TITLEBAR_DECORATION=client`, which is what the launcher sets
+    /// for tabs in the title bar.
+    Client,
+}
+
+/// Which of the four this window is, from the two facts a compositor has at
 /// map time.
 ///
 /// `inset` is the window-geometry origin — `xdg_surface.set_window_geometry`'s
-/// x and y — and `negotiated` is whether this surface ever created a decoration
-/// object on either protocol.
-pub fn decorator(inset: (i32, i32), negotiated: bool) -> Decorator {
-    if negotiated {
-        return Decorator::Negotiated;
+/// x and y — and `agreed` is the decoration mode this surface ended up with on
+/// either protocol, or [`Agreed::Nothing`] if it never created a decoration
+/// object.
+pub fn decorator(inset: (i32, i32), agreed: Agreed) -> Decorator {
+    match agreed {
+        Agreed::Server => return Decorator::Negotiated,
+        Agreed::Client => return Decorator::AskedForClient,
+        Agreed::Nothing => {}
     }
     // Either axis. A client with a shadow on the top and none on the left is
     // still a client with a shadow, and `> 0` on both would miss it.
@@ -601,8 +637,13 @@ pub enum Bars {
 pub fn bars(who: Decorator, extends_frame: bool) -> Bars {
     match (who, extends_frame) {
         (Decorator::Negotiated, _) => Bars::Agreed,
-        (Decorator::ProbablyItself, false) => Bars::Two,
-        (Decorator::ProbablyItself, true) => Bars::OneClient,
+        // §82. A client that asked for `Client` and was told yes is drawing a
+        // bar, so it is judged like the client that draws one unasked: right
+        // when the caption is folded, two bars when it is not. The second is
+        // `--decorations server` or `client` with a client that insisted —
+        // §22.4's documented cost, and now it says so instead of "agreed".
+        (Decorator::ProbablyItself | Decorator::AskedForClient, false) => Bars::Two,
+        (Decorator::ProbablyItself | Decorator::AskedForClient, true) => Bars::OneClient,
         (Decorator::ProbablySystem, false) => Bars::OneSystem,
         (Decorator::ProbablySystem, true) => Bars::None,
     }
@@ -654,11 +695,24 @@ pub fn bars(who: Decorator, extends_frame: bool) -> Bars {
 /// does not change under the user afterwards. The cost is a client that starts
 /// maximised and decorates itself, which is diagnosed rather than handled — the
 /// map-time report says which way it went and §46.6 says what it costs.
+///
+/// # §82: and a client that *asked* to decorate itself
+///
+/// The paragraph above said Firefox is `Negotiated` on every run, and that was
+/// true only because the mode it negotiated was thrown away. Firefox started
+/// without `MOZ_GTK_TITLEBAR_DECORATION=none` asks for `Client` whatever the
+/// manager's default (§22.3's table), the compositor echoes it (§22.4), and
+/// the window then had two title bars under `auto` — Windows' caption, and the
+/// tab strip under it. That client is now [`Decorator::AskedForClient`] and is
+/// folded, which is what puts Firefox's tabs in the caption under the default
+/// rather than under a flag. The client that asked for `Server` is unchanged,
+/// so `MOZ_GTK_TITLEBAR_DECORATION=none` is still the per-application opt-out
+/// it always was, and a run can contain both.
 pub fn fold_caption(mode_folds: bool, mode_is_auto: bool, who: Decorator) -> bool {
     if mode_folds {
         return true;
     }
-    mode_is_auto && who == Decorator::ProbablyItself
+    mode_is_auto && matches!(who, Decorator::ProbablyItself | Decorator::AskedForClient)
 }
 
 #[cfg(test)]
@@ -669,23 +723,23 @@ mod decorator_tests {
     #[test]
     fn the_two_weston_clients_come_out_different() {
         // weston-terminal: set_window_geometry(32, 32, 742, 427), no protocol.
-        assert_eq!(decorator((32, 32), false), Decorator::ProbablyItself);
+        assert_eq!(decorator((32, 32), Agreed::Nothing), Decorator::ProbablyItself);
         // weston-flower: set_window_geometry(0, 0, 200, 200), no protocol.
-        assert_eq!(decorator((0, 0), false), Decorator::ProbablySystem);
+        assert_eq!(decorator((0, 0), Agreed::Nothing), Decorator::ProbablySystem);
     }
 
     /// §22's Firefox, from a toolkit that shares no code with weston's. The
     /// inset is not square, which is why this is two numbers and not one.
     #[test]
     fn firefox_under_client_side_decorations() {
-        assert_eq!(decorator((26, 23), false), Decorator::ProbablyItself);
+        assert_eq!(decorator((26, 23), Agreed::Nothing), Decorator::ProbablyItself);
     }
 
     /// One axis is enough.
     #[test]
     fn a_margin_on_one_side_only_still_counts() {
-        assert_eq!(decorator((0, 23), false), Decorator::ProbablyItself);
-        assert_eq!(decorator((26, 0), false), Decorator::ProbablyItself);
+        assert_eq!(decorator((0, 23), Agreed::Nothing), Decorator::ProbablyItself);
+        assert_eq!(decorator((26, 0), Agreed::Nothing), Decorator::ProbablyItself);
     }
 
     /// A client that spoke a decoration protocol is never guessed about, even
@@ -693,8 +747,8 @@ mod decorator_tests {
     /// that, and it is drawing its own bar *because it was told to*.
     #[test]
     fn negotiation_beats_the_correlate() {
-        assert_eq!(decorator((26, 23), true), Decorator::Negotiated);
-        assert_eq!(decorator((0, 0), true), Decorator::Negotiated);
+        assert_eq!(decorator((26, 23), Agreed::Server), Decorator::Negotiated);
+        assert_eq!(decorator((0, 0), Agreed::Server), Decorator::Negotiated);
     }
 
     /// A negative inset is not a shadow. `set_window_geometry` is clamped to
@@ -703,7 +757,7 @@ mod decorator_tests {
     /// shadow and that would be wrong.
     #[test]
     fn a_negative_origin_is_not_a_margin() {
-        assert_eq!(decorator((-4, -4), false), Decorator::ProbablySystem);
+        assert_eq!(decorator((-4, -4), Agreed::Nothing), Decorator::ProbablySystem);
     }
 
     /// The two §33 clients under both of §31's arrangements, which is the whole
@@ -711,8 +765,8 @@ mod decorator_tests {
     /// client.
     #[test]
     fn the_verdict_reverses_when_the_caption_is_folded() {
-        let terminal = decorator((32, 32), false);
-        let flower = decorator((0, 0), false);
+        let terminal = decorator((32, 32), Agreed::Nothing);
+        let flower = decorator((0, 0), Agreed::Nothing);
 
         // `--decorations server`: what the user photographed.
         assert_eq!(bars(terminal, false), Bars::Two);
@@ -728,7 +782,7 @@ mod decorator_tests {
     /// arrangement: it agreed to what it is doing.
     #[test]
     fn a_negotiated_client_is_not_judged() {
-        let fx = decorator((26, 23), true);
+        let fx = decorator((26, 23), Agreed::Server);
         assert_eq!(bars(fx, false), Bars::Agreed);
         assert_eq!(bars(fx, true), Bars::Agreed);
     }
@@ -739,9 +793,9 @@ mod decorator_tests {
     /// This is the whole of the bug fix, as a table.
     #[test]
     fn auto_folds_only_for_the_client_that_decorates_itself() {
-        let terminal = decorator((32, 32), false); // ProbablyItself
-        let flower = decorator((0, 0), false); //     ProbablySystem
-        let firefox = decorator((26, 23), true); //   Negotiated
+        let terminal = decorator((32, 32), Agreed::Nothing); // ProbablyItself
+        let flower = decorator((0, 0), Agreed::Nothing); //     ProbablySystem
+        let firefox = decorator((26, 23), Agreed::Server); //   Negotiated
 
         assert!(fold_caption(false, true, terminal));
         assert!(!fold_caption(false, true, flower));
@@ -754,9 +808,9 @@ mod decorator_tests {
     #[test]
     fn under_auto_all_three_clients_get_one_bar() {
         for (who, want) in [
-            (decorator((32, 32), false), Bars::OneClient),
-            (decorator((0, 0), false), Bars::OneSystem),
-            (decorator((26, 23), true), Bars::Agreed),
+            (decorator((32, 32), Agreed::Nothing), Bars::OneClient),
+            (decorator((0, 0), Agreed::Nothing), Bars::OneSystem),
+            (decorator((26, 23), Agreed::Server), Bars::Agreed),
         ] {
             assert_eq!(bars(who, fold_caption(false, true, who)), want);
         }
@@ -767,7 +821,7 @@ mod decorator_tests {
     /// `weston-flower` no title bar at all.
     #[test]
     fn tabs_is_unconditional_and_that_is_why_it_is_not_the_default() {
-        let flower = decorator((0, 0), false);
+        let flower = decorator((0, 0), Agreed::Nothing);
         assert!(fold_caption(true, false, flower));
         assert_eq!(bars(flower, fold_caption(true, false, flower)), Bars::None);
     }
@@ -776,9 +830,64 @@ mod decorator_tests {
     /// the deliberate two-bar leg and must stay one.
     #[test]
     fn the_named_arrangements_are_unchanged() {
-        let terminal = decorator((32, 32), false);
+        let terminal = decorator((32, 32), Agreed::Nothing);
         assert!(!fold_caption(false, false, terminal));
         assert_eq!(bars(terminal, fold_caption(false, false, terminal)), Bars::Two);
+    }
+
+    // --- §82: Firefox's tabs in the caption under the default ----------------
+
+    /// The mode a client agreed to beats any inset, in both directions. The
+    /// inset for Firefox at map is whatever the geometry cache held, and
+    /// `report_decorator` logged `0,0` for a Firefox whose trace said
+    /// `(26, 23)` — so the decision must not lean on it when the client said.
+    #[test]
+    fn the_agreed_mode_decides_and_the_inset_does_not() {
+        for inset in [(0, 0), (26, 23)] {
+            assert_eq!(decorator(inset, Agreed::Client), Decorator::AskedForClient);
+            assert_eq!(decorator(inset, Agreed::Server), Decorator::Negotiated);
+        }
+    }
+
+    /// The default arrangement, for the two Firefoxes the launcher can start:
+    /// `titlebar = tabs` (it asks for `Client`) folds, `titlebar = none` (it
+    /// asks for `Server`) does not. One run, one flag, both right.
+    #[test]
+    fn auto_folds_firefox_that_asked_for_client_and_not_the_one_that_opted_out() {
+        let tabs = decorator((26, 23), Agreed::Client);
+        let opted_out = decorator((0, 0), Agreed::Server);
+        assert!(fold_caption(false, true, tabs));
+        assert!(!fold_caption(false, true, opted_out));
+        assert_eq!(bars(tabs, fold_caption(false, true, tabs)), Bars::OneClient);
+        assert_eq!(bars(opted_out, fold_caption(false, true, opted_out)), Bars::Agreed);
+    }
+
+    /// Under the named legs the insisting client keeps §22.4's cost — and the
+    /// verdict now says "two" rather than "agreed", because it is two.
+    #[test]
+    fn server_and_client_legs_do_not_fold_an_insisting_client() {
+        let fx = decorator((26, 23), Agreed::Client);
+        assert!(!fold_caption(false, false, fx));
+        assert_eq!(bars(fx, false), Bars::Two);
+        // `tabs` folds it, as it always did.
+        assert!(fold_caption(true, false, fx));
+        assert_eq!(bars(fx, true), Bars::OneClient);
+    }
+
+    /// Nothing under `auto` has two bars or none any more, across all four
+    /// kinds of client — the claim §46 made for three, extended to the fourth.
+    #[test]
+    fn under_auto_every_kind_of_client_gets_one_bar() {
+        for agreed in [Agreed::Nothing, Agreed::Server, Agreed::Client] {
+            for inset in [(0, 0), (32, 32)] {
+                let who = decorator(inset, agreed);
+                let verdict = bars(who, fold_caption(false, true, who));
+                assert!(
+                    !matches!(verdict, Bars::Two | Bars::None),
+                    "{agreed:?} {inset:?} -> {verdict:?}"
+                );
+            }
+        }
     }
 }
 

@@ -19,7 +19,9 @@
 #                                             frame list arrives on stdin and is
 #                                             translated instead of swept for.
 #   wc-session proxy ID                       start wc-proxy on the plan, as root
-#   wc-session run  ID BASE64CMD              run a Wayland client against that proxy
+#   wc-session run  ID CMD PROFILE PREFS TITLEBAR [CHROME]
+#                                             run a Wayland client against that proxy;
+#                                             every word base64, `-` for an empty one
 #   wc-session icon APPID                     the app's icon from this machine's theme
 #   wc-session down ID                        stop the proxy and remove the run directory
 #   wc-session status ID
@@ -303,7 +305,7 @@ run)
   #
   # Written **only** under this launcher's own tree, so a profile somewhere else
   # is never touched.
-  PROFILE=$(printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
+  PROFILE=$( [ "$B64PROFILE" = - ] || printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
   case "$PROFILE" in
     "$HOME"/.wc-launch/*)
       mkdir -p "$PROFILE" 2>/dev/null
@@ -311,23 +313,54 @@ run)
       ;;
   esac
 
-  # And what the application is told about its own title bar. §22 established
-  # that one bar takes two levers and this is the client's; `none` stops Firefox
-  # drawing a second one under Windows'. It is passed rather than hard-coded
-  # because the *goal* is `client` plus a compositor that extends the frame into
-  # the client area, and that compositor does not exist yet.
-  TITLEBAR=$(printf '%s' "$B64TITLEBAR" | base64 -d 2>/dev/null)
-  [ -n "$TITLEBAR" ] || TITLEBAR=none
+  # WHAT THE APPLICATION IS TOLD ABOUT ITS OWN TITLE BAR -- docs/waycompose-design.md §82.
+  #
+  # Two words from the launcher: the value of MOZ_GTK_TITLEBAR_DECORATION, and a
+  # userChrome.css (or `-`, meaning none). The launcher renders both, because it
+  # is where they are tested and the only side that knows the desktop's DPI.
+  #
+  #   titlebar = tabs (the default)  ->  client, plus the userChrome.css. Firefox
+  #       asks the compositor for Client; the compositor's default `auto` folds
+  #       the caption of a window whose client asked for that, so Firefox's tab
+  #       strip is *inside* Windows' caption, and the sheet makes the strip the
+  #       caption's height and leaves the corner where Windows draws minimise,
+  #       maximise and close empty. user.js turns Firefox's own three buttons off.
+  #   titlebar = none (the opt-out)  ->  none, and no sheet. Windows' caption
+  #       above, the tab strip below: §22's arrangement.
+  #
+  # Until §82 this said the frame-extending compositor "does not exist yet" and
+  # sent `none` unconditionally; §31 built it months before. None of these is
+  # carried by any protocol -- they are facts about the machine the client runs
+  # on, and this is the program that starts it. A Firefox started some other way
+  # gets two title bars (no env) or a chevron under Windows' buttons (no sheet),
+  # and the compositor's log now says which (`DRAWS UNDER THE CAPTION BUTTONS`).
+  #
+  # `-` is how the launcher spells an empty word: this script's arguments arrive
+  # split on whitespace from $SSH_ORIGINAL_COMMAND, where an empty one vanishes.
+  # An older launcher sends five words and no sheet, which is `none` as before.
+  unb64() { [ "${1:-}" = - ] || printf '%s' "${1:-}" | base64 -d 2>/dev/null; }
+  TITLEBAR=$(unb64 "$B64TITLEBAR")
+  case "$TITLEBAR" in
+    client|none) ;;
+    *) TITLEBAR=none ;;
+  esac
+  case "$PROFILE" in
+    "$HOME"/.wc-launch/*)
+      CHROME=$(unb64 "${6:-}")
+      if [ -n "$CHROME" ]; then
+        mkdir -p "$PROFILE/chrome" 2>/dev/null
+        printf '%s\n' "$CHROME" > "$PROFILE/chrome/userChrome.css"
+      elif head -c 40 "$PROFILE/chrome/userChrome.css" 2>/dev/null \
+             | grep -qF '/* wc-launch: tabs in the title bar.'; then
+        # Ours, from a previous `tabs` start: an application that opted out
+        # must not keep a tab strip sized for a caption it no longer has. A
+        # sheet without the mark is the user's and is left alone.
+        rm -f "$PROFILE/chrome/userChrome.css"
+      fi
+      ;;
+  esac
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
-  # MOZ_GTK_TITLEBAR_DECORATION=none is a **deployment assumption and there is no
-  # protocol that carries it**. Without it Firefox draws its own titlebar on top
-  # of the one the compositor's HWND already has, with no diagnostic anywhere:
-  # two title bars, and nothing in either log saying so. The compositor's half of
-  # the fix -- answering the KDE decoration manager's bind with `default_mode(2)`
-  # -- is necessary and not sufficient; both levers are needed, and this is the
-  # one that lives where the client is started. So it lives here, in the launcher
-  # that *is* the deployment.
   # shellcheck disable=SC2086
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$D/xdg" \

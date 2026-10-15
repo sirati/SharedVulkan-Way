@@ -376,7 +376,9 @@ title = Firefox (Linux)
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
 prefs = middlemouse.paste=false
-titlebar = none
+# §82: the default, named so the deployed ini says which arrangement it ran.
+# WC_LAUNCH_TITLEBAR=none runs the opt-out.
+titlebar = ${WC_LAUNCH_TITLEBAR:-tabs}
 INI
 
   # A running .exe holds its own file open, so a session that is up must end

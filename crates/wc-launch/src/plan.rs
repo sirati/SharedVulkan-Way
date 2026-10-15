@@ -177,6 +177,177 @@ pub fn user_js(prefs: &str) -> String {
     out
 }
 
+// ------------------------------------------------- the title bar, §82 ------
+//
+// What the application is told about its own title bar is three things, and
+// all three have to be true on the machine it runs on, because no Wayland
+// protocol carries any of them:
+//
+// 1. `MOZ_GTK_TITLEBAR_DECORATION`: whether Firefox draws a title bar at all.
+//    `client` for tabs in the caption — Firefox asks the compositor for
+//    `Client`, and the compositor's default `auto` folds the caption of a
+//    window whose client asked for that (§82). `none` for the opt-out.
+// 2. Preferences: `ui.GtkCSD{Minimize,Maximize,Close}Button = 0`. **Measured,
+//    Firefox 157:** these remove all three of Firefox's own window buttons,
+//    close included — which `gtk-decoration-layout` could not do (§22.9,
+//    §31.9). They are LookAndFeel overrides, so they need no GTK file and no
+//    `XDG_CONFIG_HOME`.
+// 3. A `userChrome.css` that reserves the corner Windows draws its buttons in,
+//    and makes the tab strip exactly as tall as Windows' caption, so the two
+//    title bars are one: the tabs sit in the band the buttons sit in.
+//
+// Windows draws minimise, maximise and close, and Firefox draws none. That is
+// a decision with evidence behind it, and §82.3 has it: DWM's buttons were
+// photographed on the guest (§31), they bring their own hover, theme, DPI and
+// `HTMAXBUTTON` — so snap layouts — and Firefox's are GTK's, which on this
+// desktop would be the only GNOME-styled controls on it and would have no
+// `HTMAXBUTTON` for Windows to find.
+
+/// The title-bar arrangement for one application, as `[app.*] titlebar` names
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Titlebar {
+    /// Firefox's tabs in Windows' caption, Windows' buttons in its corner. The
+    /// default since §82.
+    Tabs,
+    /// Windows' caption above, Firefox's tab strip below, no buttons of
+    /// Firefox's. The arrangement §22 shipped, and the per-application opt-out.
+    None,
+    /// Firefox decorates itself and nothing else is done: its own buttons, no
+    /// reserved corner. The compositor still folds the caption, so this is
+    /// §31's picture with Firefox's close button under Windows'. Kept as the
+    /// control leg, as `--decorations client` is.
+    Client,
+}
+
+impl Titlebar {
+    /// `[app.*] titlebar`. `server` is accepted for `none` because it is what
+    /// the compositor's flag calls the same arrangement.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tabs" => Some(Self::Tabs),
+            "none" | "server" => Some(Self::None),
+            "client" => Some(Self::Client),
+            _ => None,
+        }
+    }
+
+    /// `MOZ_GTK_TITLEBAR_DECORATION`.
+    pub fn moz_env(self) -> &'static str {
+        match self {
+            Self::Tabs | Self::Client => "client",
+            Self::None => "none",
+        }
+    }
+
+    /// The preferences this arrangement adds to the application's own, in
+    /// `[app.*] prefs` syntax. The application's come second, so a deployment
+    /// that wants to override one of these can.
+    pub fn prefs(self) -> &'static str {
+        match self {
+            Self::Tabs => {
+                "ui.GtkCSDMinimizeButton=0;ui.GtkCSDMaximizeButton=0;ui.GtkCSDCloseButton=0;\
+                 toolkit.legacyUserProfileCustomizations.stylesheets=true"
+            }
+            Self::None | Self::Client => "",
+        }
+    }
+}
+
+/// Windows' caption, measured on the guest at 100%: `folds 31 px of caption`
+/// and a `146x30` button strip (§31.1, §31.5). Scaled by [`TitlebarFit::at`].
+const CAPTION_AT_96: i32 = 31;
+const BUTTONS_AT_96: i32 = 146;
+
+/// How tall Firefox's tab strip must be, and how much of its right-hand end it
+/// must leave empty, for Windows' caption at one DPI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TitlebarFit {
+    /// The caption's height in pixels — `AdjustWindowRectExForDpi`'s top inset
+    /// on Windows, which is what the compositor folds in.
+    pub height: i32,
+    /// The caption buttons' width in pixels.
+    pub reserve: i32,
+}
+
+impl TitlebarFit {
+    /// The fit at `dpi`. `caption` is the measured top inset when the caller
+    /// has one (the launcher does, on Windows); otherwise it is §31's 100%
+    /// number, scaled.
+    ///
+    /// The button strip has no API that answers without a window on screen —
+    /// `DWMWA_CAPTION_BUTTON_BOUNDS` needs one — so it is §31.5's measured
+    /// 146 px, scaled with `MulDiv`'s rounding. A reservation a few pixels too
+    /// wide is empty tab strip; one too narrow is a chevron under a button, so
+    /// the rounding is up. The compositor checks the result on every window
+    /// and says in its log if the client drew under the buttons anyway.
+    ///
+    /// **CSS pixels are assumed to be device pixels**, which they are here: the
+    /// compositor's one `wl_output` is scale 1 and the launcher sets no
+    /// `layout.css.devPixelsPerPx`. A host with GTK text scaling would break
+    /// the assumption, and the compositor's corner check is what would say so.
+    pub fn at(dpi: u32, caption: Option<i32>) -> Self {
+        let scale = |v: i32| -> i32 {
+            let d = i64::from(dpi.max(1));
+            ((i64::from(v) * d + 95) / 96) as i32
+        };
+        Self {
+            height: caption.filter(|h| *h > 0).unwrap_or_else(|| scale(CAPTION_AT_96)),
+            reserve: scale(BUTTONS_AT_96),
+        }
+    }
+}
+
+/// The first line of every `userChrome.css` this launcher writes. `wc-session`
+/// removes a `userChrome.css` that starts with it when an application opts out,
+/// and leaves alone one that does not, because that one is the user's.
+pub const USER_CHROME_MARK: &str = "/* wc-launch: tabs in the title bar.";
+
+/// The `userChrome.css` for [`Titlebar::Tabs`], or `None` for the others.
+///
+/// **Measured against Firefox 157 on the Linux compositor, frame dumps of the
+/// geometry rectangle** (§82.4): with this sheet at 31/146 the tab strip is 31
+/// rows from the top of the window to the first row of the navigation bar
+/// (44 without it), and the rightmost 146 columns of those rows are one flat
+/// colour (the tab-list button and Firefox's three window buttons are there
+/// without it).
+///
+/// * `--tab-min-height` and `--tab-margin-block` are the two variables
+///   Firefox's own `--tabstrip-min-height` is computed from (`tabs.css`). The
+///   margin is 1 px, so the tab is `height - 2`; at 100% that is 29 px, which
+///   is the value of Firefox's own compact density, so nothing is smaller than
+///   a size Firefox already ships.
+/// * The reservation is a `min-width` on the button box *in the tab strip
+///   only*. The navigation bar has a button box of its own that Firefox hides
+///   while tabs are shown, and a selector without `#TabsToolbar` brings it back
+///   and pushes the hamburger menu left — which the first version of this did.
+pub fn user_chrome_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
+    if t != Titlebar::Tabs {
+        return None;
+    }
+    let tab = (fit.height - 2).max(1);
+    Some(format!(
+        "{USER_CHROME_MARK} Written on every start; edits are lost.\n\
+         \x20  See docs/waycompose-design.md §82. Windows draws minimise, maximise and close;\n\
+         \x20  this makes Firefox's tab strip the caption's height ({h} px) and leaves the\n\
+         \x20  {r} px Windows draws them in empty. */\n\
+         :root {{\n\
+         \x20 --tab-min-height: {tab}px !important;\n\
+         \x20 --tab-margin-block: 1px !important;\n\
+         }}\n\
+         #TabsToolbar .titlebar-buttonbox-container {{\n\
+         \x20 min-width: {r}px !important;\n\
+         }}\n",
+        h = fit.height,
+        r = fit.reserve,
+    ))
+}
+
+/// The application's `user.js`: the arrangement's preferences, then its own.
+pub fn app_user_js(t: Titlebar, prefs: &str) -> String {
+    user_js(&format!("{};{prefs}", t.prefs()))
+}
+
 /// The directory an application was told to keep its profile in, if it was told
 /// at all — `--profile <dir>` or `-profile <dir>`. It is the only argument this
 /// launcher looks *inside* a command line for, and it is here rather than in
@@ -419,5 +590,65 @@ mod tests {
         assert_eq!(profile_dir("firefox -profile /tmp/p").as_deref(), Some("/tmp/p"));
         assert_eq!(profile_dir("firefox"), None);
         assert_eq!(profile_dir("firefox --profile"), None);
+    }
+
+    // --- §82: the title bar ---------------------------------------------------
+
+    #[test]
+    fn titlebar_values_parse_and_server_is_none() {
+        assert_eq!(Titlebar::parse("tabs"), Some(Titlebar::Tabs));
+        assert_eq!(Titlebar::parse("none"), Some(Titlebar::None));
+        assert_eq!(Titlebar::parse("server"), Some(Titlebar::None));
+        assert_eq!(Titlebar::parse("client"), Some(Titlebar::Client));
+        assert_eq!(Titlebar::parse("Tabs"), None);
+        assert_eq!(Titlebar::Tabs.moz_env(), "client");
+        assert_eq!(Titlebar::None.moz_env(), "none");
+    }
+
+    /// The fit at the three scales a user picks. 100% is §31's measurement;
+    /// the other two are scaled up, never down, so the reservation is never
+    /// narrower than the strip it reserves for.
+    #[test]
+    fn the_fit_scales_with_dpi_and_rounds_up() {
+        assert_eq!(TitlebarFit::at(96, None), TitlebarFit { height: 31, reserve: 146 });
+        assert_eq!(TitlebarFit::at(120, None), TitlebarFit { height: 39, reserve: 183 });
+        assert_eq!(TitlebarFit::at(144, None), TitlebarFit { height: 47, reserve: 219 });
+        // A measured caption wins over the scaled guess; a nonsense one does not.
+        assert_eq!(TitlebarFit::at(144, Some(45)).height, 45);
+        assert_eq!(TitlebarFit::at(144, Some(0)).height, 47);
+    }
+
+    /// The sheet carries the numbers, is scoped to the tab strip, and is
+    /// marked so `wc-session` can tell it from the user's own.
+    #[test]
+    fn the_user_chrome_reserves_the_corner_and_fits_the_caption() {
+        let css = user_chrome_css(Titlebar::Tabs, TitlebarFit::at(96, None)).unwrap();
+        assert!(css.starts_with(USER_CHROME_MARK), "{css}");
+        assert!(css.contains("--tab-min-height: 29px !important;"), "{css}");
+        assert!(css.contains("--tab-margin-block: 1px !important;"), "{css}");
+        assert!(css.contains("#TabsToolbar .titlebar-buttonbox-container {\n  min-width: 146px"), "{css}");
+        let css = user_chrome_css(Titlebar::Tabs, TitlebarFit::at(144, None)).unwrap();
+        assert!(css.contains("--tab-min-height: 45px") && css.contains("min-width: 219px"), "{css}");
+        assert_eq!(user_chrome_css(Titlebar::None, TitlebarFit::at(96, None)), None);
+        assert_eq!(user_chrome_css(Titlebar::Client, TitlebarFit::at(96, None)), None);
+    }
+
+    /// Tabs turns Firefox's three buttons off and stylesheets on; the
+    /// application's own preferences follow, so they can override.
+    #[test]
+    fn tabs_adds_its_preferences_before_the_applications_own() {
+        let js = app_user_js(Titlebar::Tabs, "middlemouse.paste=false");
+        for want in [
+            "user_pref(\"ui.GtkCSDMinimizeButton\", 0);",
+            "user_pref(\"ui.GtkCSDMaximizeButton\", 0);",
+            "user_pref(\"ui.GtkCSDCloseButton\", 0);",
+            "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);",
+        ] {
+            assert!(js.contains(want), "{want} missing from\n{js}");
+        }
+        assert!(js.find("GtkCSDCloseButton") < js.find("middlemouse"), "{js}");
+        let none = app_user_js(Titlebar::None, "middlemouse.paste=false");
+        assert!(!none.contains("GtkCSD"), "{none}");
+        assert!(none.contains("middlemouse.paste"), "{none}");
     }
 }

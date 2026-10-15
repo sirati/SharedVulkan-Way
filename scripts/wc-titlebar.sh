@@ -11,6 +11,8 @@
 #   scripts/wc-titlebar.sh noglass  the same, without DwmExtendFrameIntoClientArea
 #   scripts/wc-titlebar.sh nobuttons  the same, with the client's pixels over the
 #                                   whole caption and no system buttons at all
+#   scripts/wc-titlebar.sh default  §82: no --decorations, the launcher's profile -- what a user
+#                                   gets; WC_TB_GESTURES=1 adds real input (unlocked session)
 #   scripts/wc-titlebar.sh both     deploy, then server and client
 #   scripts/wc-titlebar.sh pair     deploy, then tabs and server
 #   scripts/wc-titlebar.sh all      deploy, then all five
@@ -286,6 +288,9 @@ do_run() {
     tabs)          mode=tabs; outdir="$OUTTB" ;;
     noglass)       mode=tabs; glass_arg="--dwm-glass off"; outdir="$OUTTB" ;;
     nobuttons)     mode=tabs; glass_arg="--caption-buttons off"; outdir="$OUTTB" ;;
+    # §82: the compiled-in default (no --decorations) and the launcher's
+    # default profile -- the arrangement a user gets from the shortcut.
+    default)       mode=auto; outdir="$OUTTB" ;;
     *) bad "unknown leg $leg"; return ;;
   esac
   case "$leg" in
@@ -316,6 +321,7 @@ do_run() {
     tabs)      port=$((PORT + 2)) ;;
     noglass)   port=$((PORT + 3)) ;;
     nobuttons) port=$((PORT + 4)) ;;
+    default)   port=$((PORT + 5)) ;;
   esac
   local arena=$((ARENA_PAGES * 4096))
   local fxenv=""
@@ -324,6 +330,25 @@ do_run() {
   # because the tab strip they put inside the caption is the thing this
   # variable turns off (§22.3).
   [ "$leg" = server ] && fxenv="MOZ_GTK_TITLEBAR_DECORATION=none"
+  # §82: `default` passes no --decorations at all (the claim is the default),
+  # and gives Firefox exactly what `wc-launch` gives it: MOZ_GTK_TITLEBAR_
+  # DECORATION=client plus the user.js and userChrome.css `wc-launch
+  # --write-firefox-profile` renders, at WC_TB_DPI (the guest desktop's DPI;
+  # 96 unless told).
+  local decor_arg="--decorations $mode" profjs="" profcss=""
+  if [ "$leg" = default ]; then
+    decor_arg=""
+    fxenv="MOZ_GTK_TITLEBAR_DECORATION=client"
+    local pd="$RUNDIR/profile-$leg"
+    "$LINUX_BIN/wc-launch" --write-firefox-profile tabs "${WC_TB_DPI:-96}" "$pd" >/dev/null \
+      || { bad "$leg: wc-launch would not render the profile"; return; }
+    profjs=$(base64 -w0 <"$pd/user.js")
+    profcss=$(base64 -w0 <"$pd/chrome/userChrome.css")
+  fi
+  # Escaped for the same double-quoted-into-quoted-heredoc trip as `gtkini`
+  # below: `\$RUN` survives to the host. Asserted on the host afterwards.
+  local profline=""
+  [ -n "$profjs" ] && profline="echo $profjs | base64 -d > \"\$RUN/profile/user.js\"; mkdir -p \"\$RUN/profile/chrome\"; echo $profcss | base64 -d > \"\$RUN/profile/chrome/userChrome.css\""
 
   # ----- TABS IN THE TITLE BAR: the corner Windows' own caption buttons are drawn in -------
   #
@@ -391,7 +416,7 @@ do_run() {
   # log and the frame dumps go to the export because this side has to read them
   # while the guest is busy; neither is a protocol object.
   int_bg "$GDIR_WIN\\wc-compositor.exe" \
-    "--socket $sock --timeout $((SECS + 150)) --output $OUTPUT --decorations $mode $glass_arg \
+    "--socket $sock --timeout $((SECS + 150)) --output $OUTPUT $decor_arg $glass_arg \
 --arena-guest-ram 0:$arena --arena-outbound 0:$ARENA_OUTBOUND \
 --dump-frames $SHARE_WIN\\frames-$leg --log $SHARE_WIN\\tb-$leg.log" comp >/dev/null 2>&1
 
@@ -508,6 +533,7 @@ RUN=/tmp/$TBNAME-$leg-run
 rm -rf \"\$RUN\"; mkdir -p \"\$RUN/home\" \"\$RUN/profile\" \"\$RUN/xdg\" \"\$RUN/config/gtk-3.0\"
 chmod 700 \"\$RUN/xdg\"
 $gtkini
+$profline
 ssh -i $HOST_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
     -N -L \"\$RUN/up.sock:127.0.0.1:$port\" $HOST_GUEST >\"\$RUN/fwd.log\" 2>&1 &
 FWD=\$!
@@ -555,6 +581,58 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
   g "cat $GDIR/shot-$leg.txt" >"$RUNDIR/shot-$leg.txt" 2>&1
   sed 's/^/        /' "$RUNDIR/shot-$leg.txt"
 
+  # ----- 5b. §82, the default leg: the hit test, and (opt-in) the gestures ----
+  #
+  # The hit test is `WM_NCHITTEST` sent to our own window: it injects nothing
+  # and is always run. Over DWM's buttons the answer is `DwmDefWindowProc`'s,
+  # which is the first time that has been read back rather than inferred.
+  #
+  # The gestures are **real input on a desktop a person uses**, so they run only
+  # with WC_TB_GESTURES=1, and need an *unlocked* session (§55.3: a locked one
+  # accepts `SendInput` and discards it). In order: hover the maximise button
+  # for 1.5 s and photograph the whole screen (the snap-layouts flyout is the
+  # shell's window, so `shot --screen`, not the window); drag the top edge
+  # down; drag empty tab strip; double-click empty tab strip; photograph the
+  # maximised window; double-click again to restore.
+  if [ "$leg" = default ]; then
+    int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe hittest --pid $cpid --class WaycomposeToplevel \
+--at -400,2 --at 2,2 --at 800,15 --at -120,15 --at -70,15 --at -20,15 --at -400,45 \
+> $GDIR_WIN\\hit-$leg.txt 2>&1" hit >/dev/null 2>&1
+    g "cat $GDIR/hit-$leg.txt" | tr -d '\r' >"$RUNDIR/hit-$leg.txt" 2>&1
+    sed 's/^/        /' "$RUNDIR/hit-$leg.txt"
+    local hh
+    hh() { grep -o "hittest *$1 .* -> [A-Z]*" "$RUNDIR/hit-$leg.txt" | grep -o '[A-Z]*$'; }
+    [ "$(hh -400,2)" = HTTOP ] && ok "$leg: the top edge is HTTOP" || bad "$leg: the top edge is $(hh -400,2)"
+    [ "$(hh 800,15)" = HTCLIENT ] && ok "$leg: empty tab strip is HTCLIENT" || bad "$leg: empty tab strip is $(hh 800,15)"
+    [ "$(hh -70,15)" = HTMAXBUTTON ] && ok "$leg: DWM's maximise button answers HTMAXBUTTON (snap layouts' trigger)" \
+      || bad "$leg: the middle of DWM's strip is $(hh -70,15), not HTMAXBUTTON"
+    [ "$(hh -20,15)" = HTCLOSE ] && ok "$leg: DWM's close button answers HTCLOSE" || bad "$leg: the close button is $(hh -20,15)"
+    if [ "${WC_TB_GESTURES:-0}" = 1 ]; then
+      int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe mouse --pid $cpid --class WaycomposeToplevel --hover -70,15 1500 \
+> $GDIR_WIN\\hover-$leg.txt 2>&1" hover >/dev/null 2>&1 &
+      sleep 2
+      int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe shot --screen --out $GDIR_WIN\\snap-$leg.bmp > $GDIR_WIN\\snapshot-$leg.txt 2>&1" snap >/dev/null 2>&1
+      wait
+      int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe mouse --pid $cpid --class WaycomposeToplevel \
+--drag -400,2 -400,62 --drag 800,15 920,95 --dblclick 800,15 > $GDIR_WIN\\gest-$leg.txt 2>&1" gest >/dev/null 2>&1
+      int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe shot --pid $cpid --class WaycomposeToplevel --out $GDIR_WIN\\max-$leg.bmp > $GDIR_WIN\\maxshot-$leg.txt 2>&1" maxshot >/dev/null 2>&1
+      int "cmd.exe" "/c $GDIR_WIN\\wc-desk.exe mouse --pid $cpid --class WaycomposeToplevel --dblclick 800,15 > $GDIR_WIN\\restore-$leg.txt 2>&1" restore >/dev/null 2>&1
+      g "cat $GDIR/gest-$leg.txt $GDIR/restore-$leg.txt" | tr -d '\r' >"$RUNDIR/gest-$leg.txt" 2>&1
+      sed 's/^/        /' "$RUNDIR/gest-$leg.txt"
+      scp "${SSHOPT[@]}" "$GUEST:$TBNAME/snap-$leg.bmp" "$RUNDIR/" >/dev/null 2>&1 \
+        && magick "$RUNDIR/snap-$leg.bmp" "$outdir/default-snap-hover.png" 2>/dev/null \
+        && note "$leg: the screen while hovering maximise -> ${outdir#"$ROOT"/}/default-snap-hover.png (look for the flyout)"
+      scp "${SSHOPT[@]}" "$GUEST:$TBNAME/max-$leg.bmp" "$RUNDIR/" >/dev/null 2>&1 \
+        && magick "$RUNDIR/max-$leg.bmp" "$outdir/default-maximised.png" 2>/dev/null \
+        && note "$leg: maximised -> ${outdir#"$ROOT"/}/default-maximised.png"
+      grep -q 'mouse.after-dbl .* zoomed=true' "$RUNDIR/gest-$leg.txt" \
+        && ok "$leg: a double-click on empty tab strip maximised the window" \
+        || bad "$leg: the double-click did not maximise"
+    else
+      note "$leg: gestures skipped (WC_TB_GESTURES=1 runs them; needs an unlocked session)"
+    fi
+  fi
+
   scp "${SSHOPT[@]}" "$GUEST:$TBNAME/tb-$leg.bmp" "$RUNDIR/tb-$leg.bmp" >/dev/null 2>&1
   mkdir -p "$outdir"
   # STAGE 42. Same vacuous gate as the four `fetch` helpers, inlined here: the
@@ -587,6 +665,17 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
     esac
   fi
 
+  # §82: the profile, for the same reason as the settings.ini above — a lever
+  # delivered out of band has to be checked for on the far side.
+  if [ "$leg" = default ]; then
+    h "head -c 40 /tmp/$TBNAME-$leg-run/profile/chrome/userChrome.css; echo; \
+       grep -c GtkCSD /tmp/$TBNAME-$leg-run/profile/user.js" 2>/dev/null | tr -d '\r' >"$RUNDIR/prof-$leg.txt"
+    grep -q '^/\* wc-launch: tabs in the title bar\.' "$RUNDIR/prof-$leg.txt" \
+      && [ "$(tail -1 "$RUNDIR/prof-$leg.txt")" = 3 ] \
+      && ok "$leg: the launcher's userChrome.css and the three GtkCSD prefs reached the client's profile" \
+      || bad "$leg: the profile did not arrive on the host: $(tr '\n' ' ' <"$RUNDIR/prof-$leg.txt")"
+  fi
+
   h "cat /tmp/$TBNAME-$leg-run/proxy.log 2>/dev/null" >"$RUNDIR/proxy-$leg.log"
   h "cat $SHARE/tb-$leg.log 2>/dev/null" >"$RUNDIR/comp-$leg.log"
   cp "$RUNDIR/comp-$leg.log" "$outdir/compositor-$leg.log" 2>/dev/null
@@ -606,6 +695,9 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
     # when the manager's default says so. A `tabs` leg where Firefox asked for
     # Server has lost the thing it is photographing.
     "tabs:Value(Client)") ok "$leg: Firefox asked for Client, on real Windows" ;;
+    # §82: the default leg asks for Client too -- MOZ_GTK_TITLEBAR_DECORATION=
+    # client -- under a manager default of Server (`auto`).
+    "auto:Value(Client)") ok "$leg: Firefox asked for Client under the default, on real Windows" ;;
     *) bad "$leg: Firefox asked for ${asked:-nothing}" ;;
   esac
 
@@ -628,12 +720,13 @@ systemd-run --unit=$TBNAME-$leg --collect /run/current-system/sw/bin/bash \
   folded=$(grep -o 'folds [0-9]* px of caption into its client area[^"]*' \
            "$RUNDIR/comp-$leg.log" | tail -1)
   case "$mode" in
-    tabs)
+    tabs|auto)
       [ -n "$folded" ] \
         && ok "$leg: $folded" \
         || bad "$leg: the compositor never folded the caption into the client area"
       case "$leg:$folded" in
-        tabs:*"DwmExtendFrameIntoClientArea ok"* | nobuttons:*"DwmExtendFrameIntoClientArea ok"*)
+        tabs:*"DwmExtendFrameIntoClientArea ok"* | nobuttons:*"DwmExtendFrameIntoClientArea ok"* \
+        | default:*"DwmExtendFrameIntoClientArea ok"*)
           ok "$leg: DwmExtendFrameIntoClientArea returned S_OK on real Windows" ;;
         noglass:*"--dwm-glass off"*)
           ok "$leg: the DWM call was skipped, which is what this leg is for" ;;
@@ -656,6 +749,22 @@ caption buttons and DWM would not say.*\|has no caption buttons.*\)" \
           ok "$leg: ${buttons#window 1 }" ;;
         *) bad "$leg: DWM would not say where its caption buttons are: ${buttons:-nothing logged}" ;;
       esac
+      # §82, the default leg only: why it folded, and the corner. The second is
+      # the first measurement of the launcher's reservation against DWM's real
+      # button bounds -- Wine has none (E_NOTIMPL) and the Linux leg has no
+      # Windows -- so it is the one assertion in §82 only this leg can make.
+      if [ "$leg" = default ]; then
+        grep -q "window 1 (firefox) asked to decorate itself (Client) and was told yes" "$RUNDIR/comp-$leg.log" \
+          && ok "$leg: folded because Firefox asked for Client, with no --decorations (§82)" \
+          || bad "$leg: the default did not fold Firefox's caption"
+        local corner
+        corner=$(grep -o "window 1 \(leaves the caption-button corner clear\|DRAWS UNDER THE CAPTION BUTTONS\)[^(]*" "$RUNDIR/comp-$leg.log" | tail -1)
+        case "$corner" in
+          *"corner clear"*) ok "$leg: $corner -- the launcher's reservation covers DWM's buttons" ;;
+          *) bad "$leg: ${corner:-no corner verdict logged}" ;;
+        esac
+        grep -o "window 1 maximised: client area starts at [^-]*-- [a-zA-Z' ]*" "$RUNDIR/comp-$leg.log" | tail -1 | sed "s/^/        /"
+      fi
       ;;
     *)
       [ -z "$folded" ] \
@@ -769,6 +878,7 @@ case "$MODE" in
   server)  do_run server ;;
   client)  do_run client ;;
   tabs)    do_run tabs ;;
+  default) do_run default ;;
   noglass)   do_run noglass ;;
   nobuttons) do_run nobuttons ;;
   both)    do_deploy; do_run server; do_run client ;;

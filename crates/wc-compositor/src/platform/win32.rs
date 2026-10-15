@@ -54,6 +54,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+use super::caption;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, ExcludeClipRect, FillRect,
@@ -62,6 +63,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     // ADDED FOR STAGE 9. `ClientToScreen` is filed under GDI rather than under
     // WindowsAndMessaging, which is where one would look for it.
     ClientToScreen,
+    // §82: the caption buttons Windows draws when DWM will not say where its
+    // own are — Wine, chiefly. Filed under GDI with the other drawing calls.
+    DrawFrameControl, DFCS_CAPTIONCLOSE, DFCS_CAPTIONMAX, DFCS_CAPTIONMIN, DFCS_CAPTIONRESTORE,
+    DFC_CAPTION,
     // ADDED FOR STAGE 13, for per-pixel alpha on popups. `BLENDFUNCTION` and
     // its two constants are filed under GDI even though the call that takes
     // them, `UpdateLayeredWindow`, is filed under WindowsAndMessaging.
@@ -124,6 +129,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 17: the three toplevel requests a client-decorated
     // window makes, handed to Windows' own modal loops.
     GetSystemMenu, TrackPopupMenu, SC_MOVE, SC_SIZE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    // §82: where the pointer is when a move is handed over. See
+    // `begin_sysmenu_gesture`.
+    GetCursorPos,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
@@ -150,8 +158,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // exists ask `WM_NCCALCSIZE` again, and without it the fold happens on the
     // *next* resize instead of at map, which looks like a compositor that
     // works only after the user grabs a corner.
-    GWL_STYLE, HTTOP, HTTOPLEFT, HTTOPRIGHT, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER,
-    SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOSIZE, WM_DPICHANGED, WM_NCCALCSIZE,
+    GWL_STYLE, NCCALCSIZE_PARAMS, SM_CXPADDEDBORDER,
+    SM_CXSIZE, SM_CXSIZEFRAME, SM_CYSIZEFRAME, SWP_FRAMECHANGED, SWP_NOSIZE, WM_DPICHANGED, WM_NCCALCSIZE,
     WM_NCHITTEST, WS_MAXIMIZE,
     // The five DWM cares about. `WM_NCHITTEST` is handled on its own path
     // because it has an answer to fall back to; these five are pure forwarding.
@@ -344,12 +352,16 @@ struct WindowState {
     /// ADDED FOR TABS IN THE TITLE BAR. How many pixels of top frame `DefWindowProc` wanted
     /// the last time it was asked, which is how many `WM_NCCALCSIZE` handed to
     /// the client. Recorded rather than computed because it is the *window's*
-    /// number at the *window's* DPI, and `top_inset()`'s is the desktop's.
+    /// number at the *window's* DPI as `DefWindowProc` computed it.
     nc_top: Cell<i32>,
     /// The last colour handed to `DWMWA_CAPTION_COLOR`, so the three DWM calls
     /// happen when the client's title bar changes colour and not once per
     /// frame of every animation it runs.
     caption_colour: Cell<Option<u32>>,
+    /// §82: the last verdict of `check_corner`, so it is printed on change.
+    corner_clear: Cell<Option<bool>>,
+    /// §82: whether `draw_fallback_buttons` has said so yet.
+    fallback_said: Cell<bool>,
     /// The taskbar identity currently on this window's property store.
     ///
     /// ADDED FOR STAGE 32. Held so that a repeated `set_app_id` with the same
@@ -428,6 +440,7 @@ impl WindowState {
             // the screen. It is a no-op on every frame where the client's title
             // bar has not changed colour, which is almost all of them.
             self.match_caption_colour();
+            self.check_corner();
         }
         // SAFETY: paired with the `BeginPaint` above, same `ps`.
         unsafe {
@@ -615,13 +628,131 @@ impl WindowState {
         );
     }
 
-    fn uncover_caption_buttons(&self, hdc: HDC) {
-        if !self.frame.get().extend_top || !self.frame.get().caption_buttons {
+    /// The caption-button strip in **client** coordinates, and whether it is
+    /// DWM's (`true`) or the fallback this window draws itself (`false`).
+    ///
+    /// ADDED FOR §82. `None` when this window has no buttons: not folded,
+    /// `--caption-buttons off`, or a popup.
+    ///
+    /// The fallback is [`caption::fallback_buttons`]: three `SM_CXSIZE`-wide
+    /// buttons at this window's DPI, at the right edge, the folded caption's
+    /// height. It exists because Wine's `DwmGetWindowAttribute` is `E_NOTIMPL`
+    /// (§67.4), and before it a folded window under Wine had no way to
+    /// minimise, maximise or close except the keyboard — and once Firefox is
+    /// told to draw no buttons of its own (§82), not even its own.
+    fn button_strip(&self) -> Option<(RECT, bool)> {
+        let frame = self.frame.get();
+        if !frame.extend_top || !frame.caption_buttons || matches!(self.kind, WindowKind::Popup { .. }) {
+            return None;
+        }
+        if let Some(rc) = caption_button_rect(self.hwnd()) {
+            return Some((rc, true));
+        }
+        let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window handle; the rectangle is written in place.
+        unsafe { GetClientRect(self.hwnd(), &mut cr) };
+        let dpi = window_dpi(self.hwnd());
+        let height = match self.nc_top.get() {
+            n if n > 0 => n,
+            _ => top_inset(self.hwnd()),
+        };
+        let r = caption::fallback_buttons(
+            cr.right - cr.left,
+            metric_for_dpi(SM_CXSIZE, dpi),
+            height,
+        );
+        (!r.is_empty()).then_some((
+            RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+            false,
+        ))
+    }
+
+    /// Everything [`caption::hit`] needs, in screen coordinates. §82.
+    fn caption_geometry(&self) -> caption::Geometry {
+        let hwnd = self.hwnd();
+        let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: live window handle; both are written in place.
+        unsafe {
+            GetWindowRect(hwnd, &mut wr);
+            ClientToScreen(hwnd, &mut origin);
+        }
+        caption::Geometry {
+            window: caption::Rect { left: wr.left, top: wr.top, right: wr.right, bottom: wr.bottom },
+            band: frame_border(hwnd),
+            buttons: self.button_strip().map(|(r, _)| caption::Rect {
+                left: r.left + origin.x,
+                top: r.top + origin.y,
+                right: r.right + origin.x,
+                bottom: r.bottom + origin.y,
+            }),
+            maximized: is_maximized(hwnd),
+        }
+    }
+
+    /// Say, when it changes, whether the client left the button strip empty.
+    ///
+    /// ADDED FOR §82, and it is §31.14 item 4 — *warn when the levers
+    /// disagree* — for the one lever whose failure is visible only in a
+    /// photograph. A Firefox started without the launcher's profile draws its
+    /// tab-list chevron and close button in the corner Windows is drawing its
+    /// own buttons over; nothing in either log said so. The compositor has the
+    /// pixels, so it looks. [`caption::corner_is_clear`] is the judgement and
+    /// is unit-tested; this is the plumbing and the log line, printed only when
+    /// the verdict changes, so a steady client costs one line.
+    fn check_corner(&self) {
+        let Some((rc, from_dwm)) = self.button_strip() else { return };
+        let verdict = {
+            let shadow = match self.shadow.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            caption::corner_is_clear(
+                shadow.pixels(),
+                shadow.width(),
+                shadow.height(),
+                shadow.format().has_alpha(),
+                caption::Rect { left: rc.left, top: rc.top, right: rc.right, bottom: rc.bottom },
+            )
+        };
+        let Some(clear) = verdict else { return };
+        if self.corner_clear.replace(Some(clear)) == Some(clear) {
             return;
         }
-        let Some(mut rc) = caption_button_rect(self.hwnd()) else {
+        let whose = if from_dwm { "DWM's" } else { "the fallback" };
+        if clear {
+            println!(
+                "wc-compositor: window {} leaves the caption-button corner clear: client rect \
+                 {},{} {}x{} ({whose}) has nothing of the client's in it",
+                self.id,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top
+            );
+        } else {
+            println!(
+                "wc-compositor: window {} DRAWS UNDER THE CAPTION BUTTONS: client rect {},{} {}x{} \
+                 ({whose}) has the client's own widgets in it, which Windows' buttons hide -- \
+                 for Firefox, the launcher's profile (titlebar = tabs) is what moves them \
+                 (docs/waycompose-design.md §82)",
+                self.id,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top
+            );
+        }
+    }
+
+    fn uncover_caption_buttons(&self, hdc: HDC) {
+        let Some((mut rc, from_dwm)) = self.button_strip() else {
             return;
         };
+        if !from_dwm {
+            self.draw_fallback_buttons(hdc, rc);
+            return;
+        }
         // Down to the bottom of the strip that was folded in, not to the
         // bottom DWM reported. The two differ by a pixel or two of rounding at
         // 100% and by more at 150%, and the pixels between them are a sliver of
@@ -636,6 +767,49 @@ impl WindowState {
             let brush = CreateSolidBrush(0);
             FillRect(hdc, &rc, brush as HBRUSH);
             DeleteObject(brush as _);
+        }
+    }
+
+    /// Windows' caption buttons, drawn by Windows, where DWM is not drawing
+    /// them. §82.
+    ///
+    /// `DrawFrameControl(DFC_CAPTION)` is the system's own rendering of a
+    /// minimise, maximise (or restore) and close button — the pre-DWM one, so
+    /// it looks classic, and it is still the system's rather than ours. It
+    /// keeps the rule §31.5 set ("do not draw the buttons — uncover them")
+    /// where there is nothing to uncover: the buttons stay Windows', their hit
+    /// test is [`caption::hit`]'s, and a click on one goes to `DefWindowProc`
+    /// as `HTCLOSE` and comes back as `SC_CLOSE`, exactly as DWM's would.
+    ///
+    /// Reached on real Windows only if DWM declines to report its bounds,
+    /// which no guest run has seen; under Wine it is every frame.
+    fn draw_fallback_buttons(&self, hdc: HDC, strip: RECT) {
+        let third = (strip.right - strip.left) / 3;
+        if third <= 0 {
+            return;
+        }
+        let max = if is_maximized(self.hwnd()) { DFCS_CAPTIONRESTORE } else { DFCS_CAPTIONMAX };
+        for (i, kind) in [DFCS_CAPTIONMIN, max, DFCS_CAPTIONCLOSE].into_iter().enumerate() {
+            let left = strip.left + third * i as i32;
+            let right = if i == 2 { strip.right } else { left + third };
+            let mut r = RECT { left, top: strip.top, right, bottom: strip.bottom };
+            // SAFETY: the DC `BeginPaint` supplied and a rectangle inside this
+            // window's client area, written in place by nothing.
+            unsafe {
+                DrawFrameControl(hdc, &mut r, DFC_CAPTION, kind);
+            }
+        }
+        if !self.fallback_said.replace(true) {
+            println!(
+                "wc-compositor: window {} draws Windows' caption buttons itself \
+                 (DrawFrameControl): DWM would not say where its own are -- client rect \
+                 {},{} {}x{}",
+                self.id,
+                strip.left,
+                strip.top,
+                strip.right - strip.left,
+                strip.bottom - strip.top
+            );
         }
     }
 
@@ -694,6 +868,27 @@ impl WindowState {
             && maximized != self.maximized.get()
         {
             self.maximized.set(maximized);
+            // §82: where a folded window's client area landed when it was
+            // maximised, against the work area it should start at. One line
+            // per transition; it is the number the guest run reads to say the
+            // tab strip's first row is the monitor's first row.
+            if maximized && self.frame.get().extend_top {
+                let mut origin = POINT { x: 0, y: 0 };
+                // SAFETY: a live window handle; written in place.
+                unsafe { ClientToScreen(self.hwnd(), &mut origin) };
+                println!(
+                    "wc-compositor: window {} maximised: client area starts at screen y={}, \
+                     work area at y={}{}",
+                    self.id,
+                    origin.y,
+                    work_area_of(self.hwnd()).map_or(i32::MIN, |r| r.top),
+                    if Some(origin.y) == work_area_of(self.hwnd()).map(|r| r.top) {
+                        " -- the tab strip's first row is the monitor's"
+                    } else {
+                        " -- MISMATCH: part of the tab strip is off the monitor or below its top"
+                    }
+                );
+            }
             if !self.self_driven.get() {
                 let _ = self.events.send(FromUi::Maximized {
                     id: self.id,
@@ -2679,6 +2874,8 @@ fn create_window(
         icon_small: Cell::new(0),
         nc_top: Cell::new(0),
         caption_colour: Cell::new(None),
+        corner_clear: Cell::new(None),
+        fallback_said: Cell::new(false),
         aumid: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
@@ -2860,7 +3057,94 @@ struct Margins {
     bottom: i32,
 }
 
-/// The thickness of the resize border Windows draws around a sizing window.
+/// One `user32` export, resolved by name and cached.
+///
+/// §82. The DPI entry points below are Windows 10 1607 and later, so they are
+/// resolved rather than linked — the same treatment `GetDpiForWindow` gets in
+/// `window_geometry` — and a missing one is a value the caller can fall back
+/// from rather than a load failure at process start.
+fn user32_fn(
+    cache: &'static std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>>,
+    symbol: &std::ffi::CStr,
+) -> Option<unsafe extern "system" fn() -> isize> {
+    *cache.get_or_init(|| {
+        let name = wide("user32.dll");
+        // SAFETY: a NUL-terminated module name; `user32` is already loaded and
+        // the handle is deliberately not freed.
+        let dll = unsafe { LoadLibraryW(name.as_ptr()) };
+        if dll.is_null() {
+            return None;
+        }
+        // SAFETY: an ASCII, NUL-terminated export name.
+        unsafe { GetProcAddress(dll, symbol.as_ptr().cast()) }
+    })
+}
+
+/// The DPI the *system* metrics are reported at: what `GetSystemMetrics` and
+/// `AdjustWindowRectEx` answer in for a per-monitor-aware process. 96 when
+/// `GetDpiForSystem` is missing, which is every Windows before 1607 and the
+/// value those systems use.
+fn system_dpi() -> u32 {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> =
+        std::sync::OnceLock::new();
+    match user32_fn(&SYM, c"GetDpiForSystem") {
+        // SAFETY: `GetDpiForSystem() -> UINT`.
+        Some(f) => unsafe {
+            let f: unsafe extern "system" fn() -> u32 = std::mem::transmute(f);
+            f().max(1)
+        },
+        None => caption::BASE_DPI,
+    }
+}
+
+/// The DPI of the monitor this window is on, as Windows assigned it.
+///
+/// **This is the number every caption metric must be at**, and before §82 none
+/// of them were: `GetSystemMetrics` answers at the *system* DPI — the primary
+/// monitor's at logon — so a window on a 150% monitor beside a 100% primary
+/// was hit-tested with a 100% resize band and extended by a 100% caption.
+/// §31.13 item 3 said this was right "by construction"; it was right only on a
+/// machine with one monitor.
+fn window_dpi(hwnd: HWND) -> u32 {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> =
+        std::sync::OnceLock::new();
+    match user32_fn(&SYM, c"GetDpiForWindow") {
+        // SAFETY: `GetDpiForWindow(HWND) -> UINT`, a live handle.
+        Some(f) => unsafe {
+            let f: unsafe extern "system" fn(HWND) -> u32 = std::mem::transmute(f);
+            match f(hwnd) {
+                0 => system_dpi(),
+                d => d,
+            }
+        },
+        None => system_dpi(),
+    }
+}
+
+/// `GetSystemMetricsForDpi`, or `GetSystemMetrics` rescaled from the system DPI
+/// where it does not exist.
+///
+/// The fallback is [`caption::rescale`], which is `MulDiv`'s rounding and is
+/// unit-tested at 125% and 150%. It is a fallback and not an equal: Windows'
+/// own per-DPI metrics are not always a linear scale of the 100% ones (the
+/// caption height comes from a font), which is exactly why the real entry
+/// point is preferred whenever it is there.
+fn metric_for_dpi(index: i32, dpi: u32) -> i32 {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> =
+        std::sync::OnceLock::new();
+    match user32_fn(&SYM, c"GetSystemMetricsForDpi") {
+        // SAFETY: `GetSystemMetricsForDpi(int, UINT) -> int`.
+        Some(f) => unsafe {
+            let f: unsafe extern "system" fn(i32, u32) -> i32 = std::mem::transmute(f);
+            f(index, dpi)
+        },
+        // SAFETY: `GetSystemMetrics` takes an index and returns an int.
+        None => caption::rescale(unsafe { GetSystemMetrics(index as _) }, system_dpi(), dpi),
+    }
+}
+
+/// The thickness of the resize border Windows draws around a sizing window,
+/// **at this window's DPI**.
 ///
 /// `SM_CXSIZEFRAME` alone is 4 px on a themed desktop and is *not* the grab
 /// area: since Vista the sensitive band is that plus `SM_CXPADDEDBORDER`, which
@@ -2868,32 +3152,54 @@ struct Margins {
 /// hit-test written against `SM_CXSIZEFRAME` on its own produces a window whose
 /// top edge can be grabbed only by pixel-perfect aiming, which reads as a
 /// resize that "sometimes" works.
-fn frame_border() -> (i32, i32) {
-    // SAFETY: `GetSystemMetrics` takes an index and returns an int.
-    unsafe {
-        let pad = GetSystemMetrics(SM_CXPADDEDBORDER);
-        (
-            GetSystemMetrics(SM_CXSIZEFRAME) + pad,
-            GetSystemMetrics(SM_CYSIZEFRAME) + pad,
-        )
-    }
+///
+/// §82: per window. At 150% the band is 12 px, not 8, and a hit test that used
+/// the 100% number would put the top edge's last four pixels inside the tab
+/// strip.
+fn frame_border(hwnd: HWND) -> (i32, i32) {
+    let dpi = window_dpi(hwnd);
+    let pad = metric_for_dpi(SM_CXPADDEDBORDER, dpi);
+    (
+        caption::resize_band(metric_for_dpi(SM_CXSIZEFRAME, dpi), pad),
+        caption::resize_band(metric_for_dpi(SM_CYSIZEFRAME, dpi), pad),
+    )
 }
 
-/// The top frame this theme wants, in pixels: caption, buttons and top border.
+/// The top frame this theme wants, in pixels: caption, buttons and top border,
+/// **at this window's DPI**.
 ///
-/// Measured with `AdjustWindowRectEx` rather than assembled out of
+/// Measured with `AdjustWindowRectExForDpi` rather than assembled out of
 /// `SM_CYCAPTION` and the border metrics, for the reason `map_window` already
 /// gives: the sum of the metrics is not what Windows uses, and on a themed or
-/// scaled desktop it is not even close. Only used for the DWM margin and for
-/// the log line; the number `WM_NCCALCSIZE` needs is taken from
-/// `DefWindowProc`'s own answer, which is correct at any DPI by construction.
-fn top_inset() -> i32 {
+/// scaled desktop it is not even close. Used for the DWM margin, the fallback
+/// button strip and the log line; the number `WM_NCCALCSIZE` hands the client
+/// is still taken from `DefWindowProc`'s own answer.
+///
+/// §82: the window's DPI rather than the desktop's. The DWM margin is the
+/// height of the region DWM composites through, and a 100% margin on a 150%
+/// window is a hole 15 px shorter than the caption buttons it is meant to
+/// uncover.
+fn top_inset(hwnd: HWND) -> i32 {
+    static SYM: std::sync::OnceLock<Option<unsafe extern "system" fn() -> isize>> =
+        std::sync::OnceLock::new();
+    let dpi = window_dpi(hwnd);
+    let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
     let mut rc = RECT { left: 0, top: 0, right: 100, bottom: 100 };
-    // SAFETY: `rc` is written in place; the style matches `create_window`'s.
-    unsafe {
-        AdjustWindowRectEx(&mut rc, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0);
+    match user32_fn(&SYM, c"AdjustWindowRectExForDpi") {
+        // SAFETY: `rc` is written in place; the transmute is to
+        // `AdjustWindowRectExForDpi(LPRECT, DWORD, BOOL, DWORD, UINT) -> BOOL`.
+        Some(f) => unsafe {
+            let f: unsafe extern "system" fn(*mut RECT, u32, i32, u32, u32) -> i32 =
+                std::mem::transmute(f);
+            f(&mut rc, style, 0, 0, dpi);
+            -rc.top
+        },
+        // SAFETY: as above, with the system-DPI entry point.
+        None => unsafe {
+            AdjustWindowRectEx(&mut rc, style, 0, 0);
+            caption::rescale(-rc.top, system_dpi(), dpi)
+        },
     }
-    -rc.top
 }
 
 fn is_maximized(hwnd: HWND) -> bool {
@@ -2945,24 +3251,21 @@ fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -
         let window_top = (*params).rgrc[0].top;
         let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wparam, lparam);
         let ordinary_top = (*params).rgrc[0].top;
-        let inset = if is_maximized(hwnd) { frame_border().1 } else { 0 };
+        let inset = if is_maximized(hwnd) { frame_border(hwnd).1 } else { 0 };
         (*params).rgrc[0].top = window_top + inset;
         state.nc_top.set(ordinary_top - window_top);
         Some(r)
     }
 }
 
-/// `WM_NCHITTEST`, and it exists only to put the top resize edge back.
+/// `WM_NCHITTEST` for a folded caption: the top resize edge, the caption
+/// buttons, and the client's tab strip.
 ///
 /// `DefWindowProc` answers first and its answer is kept for everything it still
 /// owns — the side and bottom borders, the corners, and `HTNOWHERE` outside the
-/// window. The only case that is overridden is the one `WM_NCCALCSIZE` created:
-/// a band at the top of the window that used to be non-client and now reports
-/// `HTCLIENT`, because the client area starts there.
-///
-/// A maximised window is left alone: it has no top edge to drag, and returning
-/// `HTTOP` there would put a resize cursor over the first eight pixels of the
-/// tab strip for no reason.
+/// window. Only `HTCLIENT` is looked at again, because that is the answer
+/// `WM_NCCALCSIZE` changed: the band at the top of the window used to be
+/// non-client.
 ///
 /// **DWM is asked before anything else**, and that is what puts the caption
 /// buttons back. `DwmDefWindowProc` answers `HTMINBUTTON`, `HTMAXBUTTON` or
@@ -2971,12 +3274,20 @@ fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -
 /// call is the difference between §22.8's documented casualty and a window that
 /// snaps like any other. See `dwm_defwindowproc`.
 ///
+/// §82: the rest of the decision is [`caption::hit`], which is pure and unit
+/// tested, with this window's DPI-scaled resize band and its button strip —
+/// DWM's bounds, or the fallback strip this window draws itself when DWM will
+/// not say (`WindowState::button_strip`). Answering the buttons here as well
+/// as through DWM is not redundancy: it is the documented way a custom frame
+/// keeps snap layouts, and on Wine it is the only way the buttons work at all.
+///
 /// **No `HTCAPTION`, and this part of §22.8 does still stand.** The compositor
 /// cannot know which parts of Firefox's tab strip are draggable, because
 /// Wayland has no protocol by which a client publishes its draggable region, so
 /// the strip stays `HTCLIENT` and a drag arrives afterwards as
-/// `xdg_toplevel.move` (§22.7). The buttons are a different question and have a
-/// different answer only because they are *Windows'* buttons.
+/// `xdg_toplevel.move` (§22.7); a double-click arrives as `set_maximized`. The
+/// buttons are a different question and have a different answer only because
+/// they are *Windows'* buttons.
 fn nchittest(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     if !state.frame.get().extend_top || matches!(state.kind, WindowKind::Popup { .. }) {
         return None;
@@ -2986,9 +3297,9 @@ fn nchittest(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) ->
     {
         return Some(r);
     }
-    // SAFETY: a live window handle; `wr` is written in place.
+    // SAFETY: a live window handle.
     let hit = unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, wparam, lparam) };
-    if hit as u32 != HTCLIENT || is_maximized(hwnd) {
+    if hit as u32 != HTCLIENT {
         return Some(hit);
     }
     // Screen coordinates, signed: a window can be at a negative x on a
@@ -2996,22 +3307,7 @@ fn nchittest(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) ->
     // 65533 and puts the hit test on the wrong side of the desktop.
     let x = (lparam & 0xffff) as i16 as i32;
     let y = ((lparam >> 16) & 0xffff) as i16 as i32;
-    let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-    // SAFETY: live window handle; the rectangle is written in place.
-    unsafe {
-        GetWindowRect(hwnd, &mut wr);
-    }
-    let (bx, by) = frame_border();
-    if y < wr.top + by {
-        return Some(if x < wr.left + bx {
-            HTTOPLEFT as LRESULT
-        } else if x >= wr.right - bx {
-            HTTOPRIGHT as LRESULT
-        } else {
-            HTTOP as LRESULT
-        });
-    }
-    Some(hit)
+    Some(caption::hit(&state.caption_geometry(), x, y).ht() as LRESULT)
 }
 
 /// `DwmExtendFrameIntoClientArea`, resolved rather than linked.
@@ -3222,7 +3518,7 @@ fn frame_glass(w: &WindowState) -> bool {
     if !w.frame.get().extend_top || matches!(w.kind, WindowKind::Popup { .. }) {
         return false;
     }
-    let inset = top_inset();
+    let inset = top_inset(w.hwnd());
     let dwm = if w.frame.get().dwm_glass {
         dwm_extend_frame(w.hwnd(), inset)
     } else {
@@ -3278,12 +3574,38 @@ fn frame_glass(w: &WindowState) -> bool {
 /// `DefWindowProc` refuses to start a sizing or moving loop for a window that
 /// holds the capture. The symptom is a window that simply does not move, with
 /// nothing in any log.
+///
+/// # §82: a move is `SC_MOVE | HTCAPTION`, with the cursor in `lParam`
+///
+/// Until §82 a move was posted as bare `SC_MOVE` with `lParam = 0`, and that
+/// is the **keyboard** move — Alt+Space, *Move* — which warps the cursor to
+/// the middle of the caption and moves the window by the distance from
+/// *there*. Nothing had dragged a window before §82, so nothing had seen it.
+/// Measured under Wine with `wc-desk mouse --drag 800,15 920,95` on Firefox's
+/// empty tab strip: the window moved by **(+286, +82)** for a drag of
+/// (+120, +80) — the 166 px of x it gained is the distance from the press to
+/// the middle of the 1288 px window. `SC_MOVE | HTCAPTION` (`0xF012`) is the
+/// mouse move a caption click produces, and it follows the pointer from where
+/// it is. Resizes already passed a `WMSZ_*` edge in the low bits, which is the
+/// mouse form, and are unchanged.
 fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
+    const HTCAPTION: u32 = 2;
+    let (command, lparam) = if command == SC_MOVE {
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: `pt` is written in place.
+        unsafe { GetCursorPos(&mut pt) };
+        (
+            SC_MOVE | HTCAPTION,
+            ((pt.y as u32 & 0xffff) << 16 | (pt.x as u32 & 0xffff)) as LPARAM,
+        )
+    } else {
+        (command, 0)
+    };
     // SAFETY: a live window handle, on the thread that created it.
     // `ReleaseCapture` is a no-op when this thread holds no capture.
     unsafe {
         ReleaseCapture();
-        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, 0);
+        PostMessageW(w.hwnd(), WM_SYSCOMMAND, command as usize, lparam);
     }
     println!("wc-compositor: window {} handed a {what} to Windows", w.id);
 }
