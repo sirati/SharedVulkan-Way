@@ -143,8 +143,19 @@ pub fn tunnel_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
         "ServerAliveInterval=30".into(),
         "-R".into(),
         format!("{}:127.0.0.1:{}", remote_upstream(id), cfg.port),
-        cfg.host.clone(),
     ]);
+    // §86. One reverse forward per GPU side: `$D/cold<i>.sock` on the VM host
+    // reaches that side's cold port here, which is where `sv-hostd` (started
+    // by the host's broker) takes its Hello.
+    for i in 0..cfg.gpu_sessions {
+        a.extend(["-R".into(), format!("{}/cold{i}.sock:127.0.0.1:{}", remote_dir(id), cfg.gpu_port(i))]);
+    }
+    // §86. The session's sound, the other way: a loopback port here that
+    // reaches the PulseAudio monitor socket `wc-session` made for this session.
+    if cfg.audio {
+        a.extend(["-L".into(), format!("127.0.0.1:{}:{}/audio.sock", cfg.audio_port(), remote_dir(id))]);
+    }
+    a.push(cfg.host.clone());
     a
 }
 
@@ -672,5 +683,59 @@ mod tests {
         let none = app_user_js(Titlebar::None, "middlemouse.paste=false");
         assert!(!none.contains("GtkCSD"), "{none}");
         assert!(none.contains("middlemouse.paste"), "{none}");
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    /// §86. The tunnel carries the session's sound as a local forward to the
+    /// host's per-session socket, and only when sound is on.
+    #[test]
+    fn the_tunnel_forwards_the_sessions_sound_socket() {
+        let mut c = Config { host: "u@h".into(), ..Config::default() };
+        let a = tunnel_argv(&c, "kh", "wcl-9");
+        let i = a.iter().position(|x| x == "-L").expect("an -L");
+        assert_eq!(a[i + 1], format!("127.0.0.1:{}:/tmp/wc-launch/wcl-9/audio.sock", c.port + 1));
+        assert_eq!(a.last().unwrap(), "u@h", "the host stays last");
+        c.audio = false;
+        assert!(!tunnel_argv(&c, "kh", "wcl-9").iter().any(|x| x == "-L"));
+    }
+}
+
+/// §86. The i-th GPU side: `sv-guest.exe gpu guest`, its own cold port, its own
+/// large-page arena (the GPU side refuses `VirtualLock` pages unless told
+/// otherwise, §86), alive as long as the session may be.
+pub fn gpu_argv(cfg: &Config, i: u32) -> Vec<String> {
+    vec![
+        "gpu".into(),
+        "guest".into(),
+        "--port".into(),
+        cfg.gpu_port(i).to_string(),
+        "--arena".into(),
+        (cfg.gpu_arena_mib << 20).to_string(),
+        "--idle".into(),
+        cfg.session_secs.to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    #[test]
+    fn each_gpu_side_has_its_port_and_its_reverse_forward() {
+        let mut c = Config { host: "u@h".into(), ..Config::default() };
+        assert!(!tunnel_argv(&c, "kh", "wcl-1").iter().any(|x| x.contains("cold")));
+        c.gpu_sessions = 2;
+        let a = tunnel_argv(&c, "kh", "wcl-1");
+        let colds: Vec<&String> = a.iter().filter(|x| x.contains("/cold")).collect();
+        assert_eq!(colds, [&format!("/tmp/wc-launch/wcl-1/cold0.sock:127.0.0.1:{}", c.port + 10),
+                           &format!("/tmp/wc-launch/wcl-1/cold1.sock:127.0.0.1:{}", c.port + 11)]);
+        let g = gpu_argv(&c, 1);
+        assert_eq!(&g[..4], ["gpu", "guest", "--port", &(c.port + 11).to_string()]);
+        assert!(!g.iter().any(|x| x.contains("small-pages")), "the launcher never asks for small pages");
+        assert_eq!(a.last().unwrap(), "u@h");
     }
 }

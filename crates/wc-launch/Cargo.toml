@@ -28,4 +28,8 @@ windows-sys = { workspace = true, features = [
   # §82: `LoadLibraryW` and `GetProcAddress`, for the DPI entry points that
   # size Firefox's tab strip to Windows' caption. Resolved, not linked.
   "Win32_System_LibraryLoader",
+  # §86: waveOut, which plays the session's sound. The oldest audio API is
+  # the right size here: one fixed PCM format, a bounded queue, no callbacks.
+  "Win32_Media",
+  "Win32_Media_Audio",
 ] }

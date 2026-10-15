@@ -1036,3 +1036,16 @@ and "The stall, decomposed" above measured each waiting round trip at a 20 ms
 quantum when the doorbell does not cross; run with `SVFF_EXTRA_ENV=SV_DEBUG=1`
 to get the notes.
 
+
+## On the real guest, 2026-10-15
+
+`waycompose-design.md` §86 ran the commands above on testhost, with
+`sv-firefox-guest.sh` changed to the ivshmem compositor arena and root only for
+`sv-hostd` (`--drop-to`). eglinfo on the Wayland platform names
+`zink Vulkan 1.4(Intel(R) UHD Graphics …) Mesa 26.2.4`. Firefox's renderer then
+faults the GPU side inside Intel's `igvk64.dll` on its first pipeline layout (a
+push-descriptor set layout carrying a binding-flags struct, with another set
+after it), so no Firefox frame was presented on the guest's GPU and the
+present's `fence … ms` is still unmeasured. Isolating the fault on the guest was
+followed by QEMU stopping the VM; driver-crash bisection does not run on the
+guest (`waycompose-design.md` §86.5).

@@ -1312,6 +1312,13 @@ hash or a log line, not a judgement.
    count with `err=none`, then about:support's H264 row.
 
 
+**Status, 2026-10-15.** None of the steps above has run on the guest.
+`waycompose-design.md` §86 built the readback-patched Firefox as a store path
+(`scripts/sv-firefox-readback-pkg.sh`) and wired the launcher to turn decode on
+when a session has a forwarded GPU and the browser carries the readback marker,
+but GPU work on the guest is suspended until the Intel driver fault of `waycompose-design.md` §86.4 is
+fixed on the forwarder's side.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the

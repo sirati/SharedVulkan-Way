@@ -26,6 +26,9 @@
 #   wc-session run  ID CMD PROFILE PREFS TITLEBAR [CHROME]
 #                                             run a Wayland client against that proxy;
 #                                             every word base64, `-` for an empty one
+#   wc-session gpu  ID N                      ask the host's root broker to locate the guest's N
+#                                             GPU sides and serve them as this user (§86)
+#   wc-session audio ID                       the session's sound as raw PCM on stdout (§86)
 #   wc-session icon APPID                     the app's icon from this machine's theme
 #   wc-session down ID                        stop the proxy and remove the run directory
 #   wc-session status ID
@@ -140,6 +143,72 @@ resolve_exec() {
   p=$(ls -d /nix/store/*-"$base"-[0-9]*/bin/"$base" 2>/dev/null | sort -V | tail -1)
   [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
   return 1
+}
+
+# ------------------------------------------------------------------- AUDIO ---
+# docs/waycompose-design.md §86. Where Firefox's sound goes.
+#
+# On testhost the speakers belong to the VM: QEMU's emulated HDA plays
+# through ALSA `hw:0,0` directly, the host has no PipeWire or Pulse, and the
+# guest's own audio is what the person at the laptop hears. So the route is
+# *into the guest*: each session gets its own PulseAudio with one null sink,
+# Firefox finds it at `$XDG_RUNTIME_DIR/pulse/native` with no configuration
+# (that is libpulse's default path and `run` already gives Firefox `$D/xdg`),
+# and the sink's monitor is served as raw PCM on `$D/audio.sock`, which the
+# guest's launcher reaches through the tunnel it already holds (`-L
+# 127.0.0.1:<audio-port>:$D/audio.sock`) and plays with waveOut. The `audio`
+# verb streams the same PCM on stdout, for a person diagnosing: ssh.exe writing
+# into a pipe the launcher created delivered nothing (§86).
+#
+# A null sink consumes in real time whether or not anybody is listening, so
+# Firefox's audio clock runs and its main thread never waits on a server that
+# is not there — the stall docs/design.md §0.28.9 measured. If no server could be
+# started at all, `run` sets `media.cubeb.force_null_context` instead, which is
+# Firefox's own "no audio" switch, and says so loudly. There is no third state.
+#
+# Fixed format, because both ends are ours: s16le, 48 kHz, stereo.
+AUDIO_RATE=48000
+pulse_bin() {
+  # 1. `$BIN/pulse`, a GC-rooted link to the package the deploy step chose;
+  # 2. this machine's own, by `resolve_exec`.
+  if [ -x "$BIN/pulse/bin/$1" ]; then echo "$BIN/pulse/bin/$1"; return 0; fi
+  resolve_exec "$1"
+}
+
+# audio_up D ID: start the session's PulseAudio as a user unit beside the
+# proxy's. Never fatal: a session without sound is still a session. What
+# happened is left in $D/audio.state, which `run` and `audio` read.
+audio_up() {
+  local D="$1" ID="$2" PA UNIT="wc-launch-audio-$2"
+  if [ "${WC_LAUNCH_AUDIO:-on}" = off ]; then
+    echo "none: switched off on this host (WC_LAUNCH_AUDIO=off)" >"$D/audio.state"; return 0
+  fi
+  if ! PA=$(pulse_bin pulseaudio); then
+    echo "none: no pulseaudio on this host (no $BIN/pulse, none in the store)" >"$D/audio.state"; return 0
+  fi
+  mkdir -p "$D/xdg/pulse" "$D/pulse-state" "$D/pulse-home"
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'export HOME=%q PULSE_RUNTIME_PATH=%q PULSE_STATE_PATH=%q\n' "$D/pulse-home" "$D/xdg/pulse" "$D/pulse-state"
+    printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
+    printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
+    printf '  -L %q \\\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1"
+    # The guest's end: raw PCM of the monitor to whoever connects, which is
+    # the launcher's tunnel (`-L 127.0.0.1:<audio-port>:$D/audio.sock`).
+    printf '  -L %q >%q 2>&1\n' "module-simple-protocol-unix socket=$D/audio.sock record=true playback=false source=wc.monitor rate=$AUDIO_RATE channels=2 format=s16le" "$D/pulse.log"
+  } >"$D/pulse.sh"
+  chmod 755 "$D/pulse.sh"
+  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pulse.sh" >/dev/null 2>&1; then
+    echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
+  fi
+  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ] && break; sleep 0.05; done
+  if [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
+    echo "pulse $D/xdg/pulse/native (null sink wc, s16le ${AUDIO_RATE} Hz stereo; monitor on $D/audio.sock)" >"$D/audio.state"
+  else
+    echo "none: $PA did not open its socket: $(tail -2 "$D/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
+  fi
 }
 
 case "$VERB" in
@@ -311,7 +380,9 @@ proxy)
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
+    audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem)"
+    echo "audio $(cat "$D/audio.state")"
     exit 0
   fi
   [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
@@ -343,7 +414,9 @@ EOF
     tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
     exit 1
   fi
+  audio_up "$D" "$ID"
   echo "proxy ok $D/wl-proxy"
+  echo "audio $(cat "$D/audio.state")"
   ;;
 
 # --------------------------------------------------------------------- run ---
@@ -439,6 +512,42 @@ run)
     done <"$BASE/gpu.env"
   fi
 
+  # THE GPU IS PER SESSION, NOT PER HOST (§86). gpu.env says how to reach a
+  # forwarded GPU; whether *this* session has one is whether `gpu` made
+  # $D/icd.sock. Without it the GPU environment is not applied at all: forcing
+  # Zink with nothing behind it is a Firefox whose renderer cannot start, and
+  # software WebRender is what it should get instead. Said loudly.
+  GPU_ON=""
+  if [ ${#GPUENV[@]} -gt 0 ]; then
+    if [ -S "$D/icd.sock" ]; then
+      GPUENV+=("SV_SOCKET=$D/icd.sock")
+      GPU_ON=1
+    else
+      echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2
+      GPUENV=()
+    fi
+  fi
+  # HARDWARE VIDEO DECODE (§86, docs/video-decode.md §7.7): only a Firefox with
+  # the readback patch can decode on a forwarded GPU, and its package says so
+  # with a marker beside the browser. With it and a GPU, the decode prefs go
+  # into user.js and the RDD sandbox is lifted (it brokers connect() to the
+  # display sockets only, so the decoder could not reach the GPU side).
+  DECODE=""
+  if [ -n "$GPU_ON" ] && [ -e "$(dirname "$EXE")/../lib/firefox/.wc-vulkan-readback" ]; then
+    DECODE=1
+    GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
+  fi
+  # What `proxy` managed for this session's sound (§86). Read once, here.
+  AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
+  case "$AUDIO" in
+    pulse*) ;;
+    *)
+      # Loudly, in both places a person looks: the application's log on this
+      # machine and the launcher's log on the guest (it logs what `run` says).
+      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >>"$D/app.log"
+      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >&2
+      ;;
+  esac
   case "$PROFILE" in
     "$HOME"/.wc-launch/*)
       mkdir -p "$PROFILE" 2>/dev/null
@@ -447,6 +556,19 @@ run)
         printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
           >> "$PROFILE/user.js"
       fi
+      if [ -n "$DECODE" ]; then
+        printf '\n// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU.\nuser_pref("media.hardware-video-decoding-vulkan.enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.force-enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);\n' \
+          >> "$PROFILE/user.js"
+      fi
+      # AUDIO (§86): no server means Firefox's own null context, never a
+      # Firefox that waits on an audio process for ever.
+      case "$AUDIO" in
+        pulse*) ;;
+        *)
+          printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
+            >> "$PROFILE/user.js"
+          ;;
+      esac
       ;;
   esac
 
@@ -506,7 +628,7 @@ run)
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
     "${GPUENV[@]}" \
     $CMD >>"$D/app.log" 2>&1 &
-  echo "run ok $!"
+  echo "run ok $! audio=${AUDIO%%[: ]*}"
   ;;
 
 # -------------------------------------------------------------------- icon ---
@@ -569,12 +691,57 @@ down)
   # plan; an ivshmem session never had a root unit to stop (§83).
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-audio-$ID" 2>/dev/null
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
   if [ -f "$D/arena.plan" ]; then
     printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
       "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
   fi
   rm -rf "$D"
   echo "down ok"
+  ;;
+
+# --------------------------------------------------------------------- gpu ---
+# The forwarded GPU for one session (§86). The guest's launcher has started N
+# GPU sides and its tunnel has put their cold ports at $D/cold<i>.sock; this
+# asks the VM host's root broker (`sv-hostd broker`, started by the operator or
+# the machine's configuration, never by this script) to locate them and serve
+# them on $D/icd.sock **as this user**. No root here, and no fallback to a
+# root of our own: without the broker there is no GPU and `run` says so.
+gpu)
+  ID="${1:-}"; check_id "$ID"; N="${2:-}"
+  case "$N" in [1-8]) ;; *) die "gpu: 1..8 sessions, not '$N'" ;; esac
+  D=$(dir_of "$ID")
+  [ -d "$D" ] || die "no session $ID"
+  BROKER="${WC_LAUNCH_BROKER:-/run/sv-hostd/broker.sock}"
+  [ -S "$BROKER" ] || die "no GPU broker at $BROKER (sv-hostd broker is not running on this host)"
+  [ -x "$BIN/sv-hostd" ] || die "no $BIN/sv-hostd"
+  for i in $(seq 0 $((N - 1))); do
+    for _ in $(seq 1 100); do [ -S "$D/cold$i.sock" ] && break; sleep 0.05; done
+    [ -S "$D/cold$i.sock" ] || die "no cold socket $D/cold$i.sock: the guest's tunnel did not forward GPU side $i"
+  done
+  if ! "$BIN/sv-hostd" broker-request --broker "$BROKER" --dir "$D" --sessions "$N" >"$D/hostd.log" 2>&1; then
+    echo "wc-session: the broker refused or failed:" >&2
+    tail -6 "$D/hostd.log" | sed 's/^/  /' >&2
+    exit 1
+  fi
+  grep -o 'located [0-9/]* pages in [0-9.]*m\?s[^;]*' "$D/hostd.log" | sed 's/^/gpu /'
+  echo "gpu ok $N session(s) at $D/icd.sock"
+  ;;
+
+# ------------------------------------------------------------------- audio ---
+# The session's sound, as raw PCM on stdout: s16le, 48 kHz, stereo, for as
+# long as the reader keeps the channel open (§86). A diagnostic: the launcher
+# reads $D/audio.sock through its tunnel instead. `parec` gets SIGPIPE when the
+# ssh channel closes, so a launcher that goes away takes this with it.
+audio)
+  ID="${1:-}"; check_id "$ID"
+  D=$(dir_of "$ID")
+  AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no session $ID")
+  case "$AUDIO" in pulse*) ;; *) die "no audio for $ID: $AUDIO" ;; esac
+  PAREC=$(pulse_bin parec) || die "no parec on this host"
+  exec env PULSE_SERVER="unix:$D/xdg/pulse/native" PULSE_RUNTIME_PATH="$D/xdg/pulse" HOME="$D/pulse-home" \
+    "$PAREC" --device=wc.monitor --format=s16le --rate=$AUDIO_RATE --channels=2 --latency-msec=20 --raw 2>>"$D/parec.log"
   ;;
 
 status)
@@ -594,6 +761,6 @@ logs)
   ;;
 
 *)
-  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|run|icon|down|status|logs"
+  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|gpu|run|audio|icon|down|status|logs"
   ;;
 esac

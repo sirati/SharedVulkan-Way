@@ -30,6 +30,7 @@
 //! mutex rather than a happy accident of it.
 
 mod floor;
+mod audio;
 mod config;
 mod ico;
 mod plan;
@@ -734,6 +735,20 @@ mod win {
             return Err(format!("the host would not start its proxy: {last}"));
         }
 
+        // 6. The sound (§86). Started after the proxy, which is what started
+        //    the session's audio server; never fatal, because a session without
+        //    sound is still a session and the host has already given Firefox a
+        //    null audio context if there is no server.
+        // 7. The forwarded GPU (§86), only when the ini asks for sessions.
+        //    Never fatal either: without it the host renders in software.
+        let gpus = if cfg.gpu_sessions > 0 { start_gpu(cfg, p, log, &id) } else { Vec::new() };
+
+        if cfg.audio {
+            start_audio(cfg, p);
+        } else {
+            log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
+        }
+
         let state = State {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
@@ -742,7 +757,7 @@ mod win {
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay, tunnel, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp, relay, tunnel, gpus, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
@@ -750,7 +765,114 @@ mod win {
         comp: Child,
         relay: Child,
         tunnel: Child,
+        /// The GPU sides this session started (§86); empty without `gpu-sessions`.
+        gpus: Vec<Child>,
         comp_log: std::path::PathBuf,
+    }
+
+    /// The forwarded GPU (§86): `gpu-sessions` GPU sides, each `sv-guest.exe gpu
+    /// guest` on its own cold port with its own large-page arena, then
+    /// `wc-session gpu ID N`, which asks the VM host's root broker to locate
+    /// them and serve them to this session's Firefox as the user.
+    ///
+    /// Started after the proxy, so a failure before here leaves no pinned
+    /// memory behind; every failure from here kills what it started and
+    /// returns none, and the host then gives Firefox no GPU environment, so it
+    /// renders in software rather than failing to start its renderer.
+    fn start_gpu(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Vec<Child> {
+        let t = Instant::now();
+        let mut kids: Vec<Child> = Vec::new();
+        let mut logs = Vec::new();
+        for i in 0..cfg.gpu_sessions {
+            let path = p.state_dir.join(format!("wc-launch-{}-gpu{i}.log", cfg.session));
+            let _ = std::fs::remove_file(&path);
+            let file = match std::fs::File::create(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                    break;
+                }
+            };
+            match Command::new(&cfg.compositor)
+                .args(plan::gpu_argv(cfg, i))
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(file))
+                .spawn()
+            {
+                Ok(c) => {
+                    kids.push(c);
+                    logs.push(path);
+                }
+                Err(e) => {
+                    log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
+                    break;
+                }
+            }
+        }
+        let give_up = |kids: &mut Vec<Child>, log: &mut Log, why: String| {
+            for k in kids.iter_mut() {
+                let _ = k.kill();
+            }
+            log.say(&format!("gpu: {why}; no forwarded GPU this session, the host renders in software"));
+            Vec::new()
+        };
+        if kids.len() != cfg.gpu_sessions as usize {
+            return give_up(&mut kids, log, "not every GPU side started".into());
+        }
+        for path in &logs {
+            if wait_for(path, 30, |l| l.contains("publishing the extent").then_some(())).is_err() {
+                let tail = std::fs::read_to_string(path).unwrap_or_default();
+                let last = tail.lines().last().unwrap_or("").to_string();
+                return give_up(&mut kids, log, format!("{} never published ({last})", path.display()));
+            }
+        }
+        let n = cfg.gpu_sessions.to_string();
+        match ssh(cfg, p, &["gpu", id, &n]) {
+            Ok(s) => {
+                log.say(&format!("gpu: {} ({} ms)", s.replace('\n', " | "), t.elapsed().as_millis()));
+                kids
+            }
+            Err(e) => give_up(&mut kids, log, format!("the host said: {e}")),
+        }
+    }
+
+    /// The session's sound (§86): connect to the loopback port the tunnel
+    /// forwards to the host's per-session monitor socket, and play what
+    /// arrives on a thread of its own, which logs through its own handle.
+    ///
+    /// It is a socket and not an ssh exec's standard output because that was
+    /// tried first and ssh.exe delivered nothing into the pipe this program
+    /// gave it, while the same command through an MSYS pipe streamed. The
+    /// tunnel is already up and already this session's, so the stream ends when
+    /// the session does: `supervise` kills the tunnel and the read sees EOF.
+    ///
+    /// The forward connects on demand, so a host with no server for the session
+    /// shows up here as a connection that closes at once; that is logged, and
+    /// the host has then given Firefox a null audio context.
+    fn start_audio(cfg: &Config, p: &Paths) {
+        let port = cfg.audio_port();
+        let log_path = p.log.clone();
+        let volume = cfg.audio_volume;
+        std::thread::spawn(move || {
+            let mut log = Log::open(&log_path);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let stream = loop {
+                match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => break s,
+                    Err(e) if Instant::now() > deadline => {
+                        log.say(&format!("audio: 127.0.0.1:{port} never answered ({e}); no sound this session"));
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
+            };
+            log.say(&format!("audio: connected to the session's monitor through the tunnel, 127.0.0.1:{port}"));
+            if let Err(e) = crate::audio::play(stream, volume, |l| log.say(l)) {
+                log.say(&format!("audio: {e}; no sound this session"));
+            }
+        });
     }
 
     /// A click that is not the first one. It reads the owner's state file and
@@ -916,6 +1038,9 @@ mod win {
         log.say(&format!("the compositor exited: {rc}"));
         let _ = s.relay.kill();
         let _ = s.tunnel.kill();
+        for g in s.gpus.iter_mut() {
+            let _ = g.kill();
+        }
         let _ = ssh(cfg, p, &["down", &s.id]);
         let _ = std::fs::remove_file(&p.state);
         let _ = std::fs::remove_file(&s.comp_log);

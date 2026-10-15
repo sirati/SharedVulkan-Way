@@ -839,3 +839,33 @@ the first handle that asks and keeps it until that handle closes, so any guest
 process that can open the device can hold the mapping and keep the compositor
 from starting, or read the arena while it has it. On testhost the guest has one
 interactive account. §83.8 records which accounts the device actually opens for.
+
+### R30 — The GPU broker hands its group the guest's memory
+
+Added 2026-10-15 with `waycompose-design.md` §86. `sv-hostd broker` is a root
+daemon that the desktop launcher's `wc-session gpu` asks for GPU sessions. It
+locates the guest's GPU arenas through QMP and `/proc/<qemu-pid>/fd` as root and
+then runs `qemu-serve --drop-to <peer>`, so that Firefox opens its sessions as
+the user rather than as root. That is the point of it, and it is also the risk:
+the dropped `qemu-serve` holds QEMU's memory backend, the whole of guest RAM,
+and the peer can open it through `/proc/<pid>/fd/<n>` for as long as the
+process lives. **Whoever may connect to the broker's socket may read and write
+the VM's memory.** That is R5's "root sees all of guest RAM" extended to the
+socket's group, and it is wider than R29, whose file is 128 MiB of a dedicated
+region.
+
+*What the broker checks:* the peer's uid from `SO_PEERCRED`, never from the
+request; the session directory is exactly `<runroot>/<id>` with a plain id,
+a directory and not a link, owned by the peer and not writable by others; each
+`cold<i>.sock` is a socket owned by the peer; at most 8 sessions; one request at
+a time, 180 s to listen. *What it does not check:* that the sockets are not
+swapped for something else between the check and the connect (the directory is
+the peer's, so they can be), and what the guest side behind a cold socket
+offers — the peer controls that too, and gets all of guest RAM anyway.
+
+*Mitigation:* the socket is 0660 `root:<gid>` for the gid given and 0600 root's
+without one; it is not running on testhost and has never run as root. *Before
+it does:* the group must be one whose members could already stop or read the VM
+(today, `wc-arena`'s one member, `sirati`, who is in `wheel`). A narrower design
+would hand the ICD only the located runs, which needs a mapping of part of a
+memfd that another process can open, and none exists without CAP_SYS_ADMIN.

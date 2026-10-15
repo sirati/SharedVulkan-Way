@@ -71,6 +71,7 @@ use sv_transport::control::{Control, Geometry, ProtocolIds};
 use sv_transport::region::{PAGE, SharedRegion};
 use std::sync::Arc;
 
+pub mod broker;
 #[cfg(target_os = "linux")]
 pub mod locate;
 #[cfg(target_os = "linux")]

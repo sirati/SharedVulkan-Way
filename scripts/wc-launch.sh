@@ -92,6 +92,23 @@ NATIVE_FIREFOX='C:\Program Files\Mozilla Firefox\firefox.exe'
 ARENA_MIB="${WC_LAUNCH_ARENA_MIB:-64}"
 OUTPUT="${WC_LAUNCH_OUTPUT:-1600x1000}"
 PORT="${WC_LAUNCH_PORT:-57431}"
+# §86. The session's sound. The PulseAudio package the VM host's `wc-session`
+# runs per session, as a store path that must already be on the host (`nix copy`
+# it there); deploy pins it with a GC root at $HOSTDIR/bin/pulse. Unset or absent,
+# sessions have no audio server and Firefox gets a null audio context.
+PULSE="${WC_LAUNCH_PULSE:-}"
+AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
+# §86. The forwarded GPU, **off unless asked for**. WC_LAUNCH_GPU_SESSIONS=N
+# (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
+# ICD to the host, and writes `gpu-sessions = N` into the ini. gpu.env itself is
+# written on the host only with WC_LAUNCH_GPU_ENV=write; otherwise deploy prints
+# what it would contain. Either way the host also needs `sv-hostd broker`
+# running as root (docs/waycompose-design.md §86 has the command).
+GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
+GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
+KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
+REL_WIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/release"
+REL_LINUX="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 
 export SSH_AUTH_SOCK="$AGENT"
 export MSYS_NO_PATHCONV=1
@@ -370,6 +387,17 @@ do_deploy() {
   x86_64-w64-mingw32-gcc -O2 -o "$stage/probe-relay.exe" "$ROOT/scripts/probe-relay.c" -lws2_32 \
     || { echo "error: probe-relay.exe did not build"; exit 1; }
   cp "$WIN_BIN/wc-launch.exe" "$WIN_BIN/sv-guest.exe" "$WIN_BIN/wc-desk.exe" "$stage/"
+  if [ "$GPU_SESSIONS" -gt 0 ]; then
+    # One binary, both halves: the GPU side is `sv-guest.exe gpu guest`. Release,
+    # because a debug ICD overflowed Firefox's renderer stack (video-decode.md
+    # §7.7) and both halves of the wire must come from one build.
+    echo "  building sv-guest.exe with its GPU half, and sv-hostd and the ICD (release)"
+    cargo build --release --target x86_64-pc-windows-gnu -p sv-guest 2>&1 | grep -E '^error' | head -5
+    built_ok "${PIPESTATUS[0]}" "sv-guest (gpu + wayland) for Windows" || exit 1
+    cargo build --release -p sv-hostd -p sv-icd 2>&1 | grep -E '^error' | head -5
+    built_ok "${PIPESTATUS[0]}" "sv-hostd and sv-icd" || exit 1
+    cp "$REL_WIN/sv-guest.exe" "$stage/sv-guest.exe"
+  fi
   write_runint "$stage/runint.ps1"
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
@@ -392,12 +420,16 @@ arena-mib  = $ARENA_MIB
 outbound   = 1048576
 output     = $OUTPUT
 port       = $PORT
+audio      = ${WC_LAUNCH_AUDIO:-on}
+audio-port = $((PORT + 1))
+audio-volume = $AUDIO_VOLUME
+gpu-sessions = $GPU_SESSIONS
 
 [app.firefox]
 title = $TITLE
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
-prefs = middlemouse.paste=false
+prefs = middlemouse.paste=false${WC_LAUNCH_EXTRA_PREFS:+;$WC_LAUNCH_EXTRA_PREFS}
 # §82: the default, named so the deployed ini says which arrangement it ran.
 # WC_LAUNCH_TITLEBAR=none runs the opt-out.
 titlebar = ${WC_LAUNCH_TITLEBAR:-tabs}
@@ -449,6 +481,35 @@ INI
        echo 'restrict,port-forwarding,command=\"$HOSTDIR/wc-session\" $pub' >> ~/.ssh/authorized_keys; \
      grep -c wc-launch-guest ~/.ssh/authorized_keys" >/dev/null
   echo "  copied wc-session, wc-proxy and wc-arena-host to $HOST:$HOSTDIR, and restricted the guest's key to it"
+  if [ "$GPU_SESSIONS" -gt 0 ]; then
+    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so" >/dev/null 2>&1
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
+      || { echo "error: scp of the GPU half to the VM host"; exit 1; }
+    h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
+    deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
+    local genv
+    genv="MESA_LOADER_DRIVER_OVERRIDE=zink
+LIBGL_KOPPER_DRI2=1
+__EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
+LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
+VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
+    if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
+      printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
+      echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"
+    else
+      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_KOPPER_MESA enable it); it would be:"
+      printf '%b\n' "$genv" | sed 's/^/          /'
+    fi
+  fi
+  if [ -n "$PULSE" ]; then
+    if h "nix-store -r $PULSE --add-root $HOSTDIR/bin/pulse --indirect >/dev/null && test -x $HOSTDIR/bin/pulse/bin/pulseaudio"; then
+      echo "  sessions get a PulseAudio null sink from $PULSE (GC root $HOSTDIR/bin/pulse)"
+    else
+      bad "$PULSE is not on $HOST: nix copy it there first; sessions will have no sound"
+    fi
+  else
+    note "WC_LAUNCH_PULSE unset: wc-session looks for pulseaudio in the host's store, and without one Firefox gets a null audio context"
+  fi
 
   # And the one end-to-end check of the path that does not need a compositor.
   # Asked of `wc-launch.exe` itself rather than of a hand-built ssh command
