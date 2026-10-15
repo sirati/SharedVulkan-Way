@@ -171,7 +171,7 @@ PREFS
 [ -n "${SVFF_DPPX:-}" ] && echo "user_pref(\"layout.css.devPixelsPerPx\", \"$SVFF_DPPX\");" >>"$RUN/profile/user.js"
 # More prefs, `name=value;name=value`, values written as JavaScript literals
 # (`true`, `5`, `"text"`). The first use was `media.cubeb.force_null_context=true`:
-# this harness has no audio server, and design.md §0.28.9 measured about:support
+# this harness has no audio server, and docs/design.md §0.28.9 measured about:support
 # stalling on that in 6 of 22 runs.
 if [ -n "${SVFF_PREFS:-}" ]; then
   IFS=';' read -ra _prefs <<<"$SVFF_PREFS"

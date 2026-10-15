@@ -26617,3 +26617,324 @@ merge brought in no compositor, proxy or `wc-handle` change.
 10. **§28.6's start-up segfaults** remain unexplained.
 11. **The black frame round menus under Wine** (85.4) is attributed to Wine by
     §18.5's guest photograph, not by a run here.
+
+## 86. Deploying to the real guest: sound, a GPU path with no root in Firefox, a driver fault, and a VM that stopped
+
+Written 2026-10-15, on branch `deploy-guest`, on master 40935af with d9b3a27
+(§85) merged in. The brief was integration on the real machines: audio, the
+accelerated path, hardware decode and the end-to-end launcher run. What is in
+this section, in order: what was deployed (86.2), the accelerated path as far as
+it got (86.3), the driver fault that stopped it (86.4), the incident that fault
+led to and the rule that came out of it (86.5), sound (86.6), the GPU and decode
+wiring for the launcher, committed and **not** enabled (86.7), the gates (86.8)
+and what remains (86.9). Nobody was logged in to the guest at any point, so
+every guest run here was in session 0.
+
+### 86.1 Status in one paragraph
+
+**Sound works end to end on the real guest.** A Firefox started by
+`wc-launch.exe` played a WebAudio tone for 63.4 s through a per-session
+PulseAudio on testhost, over the launcher's own tunnel, into waveOut in the
+guest: 63.4 s played, all of it non-silent, 0 chunks dropped, 2 underruns. A
+session without a server gives Firefox `media.cubeb.force_null_context` and says
+so on both machines, so the stall of docs/design.md §0.28.9 cannot happen on the
+launcher's path any more. **The accelerated path reached the guest's Intel GPU
+and stopped at a driver fault**: eglinfo on the Wayland platform names
+`zink Vulkan 1.4(Intel(R) UHD Graphics …) Mesa 26.2.4`, Firefox's renderer
+faults the GPU side inside Intel's `igvk64.dll` on its first pipeline layout,
+and the layout that does it is isolated (86.4). **The isolation run was followed
+within seconds by QEMU stopping the VM** (86.5); the coordinator reset it. GPU
+work on the guest is suspended until the fault is fixed on our side, which
+another branch (`intel-layout-fix`) owns. The launcher's GPU and decode wiring
+is committed and off.
+
+### 86.2 What was deployed, and where
+
+| where | what |
+|---|---|
+| testhost store | Firefox 157.0.1 `/nix/store/a6d0xgdw14rjpw84frvyxcqhyf8qmbwy-firefox-157.0.1` (nixpkgs#firefox, the build `mesa-kopper-wayland` was made against: both use `wayland-1.26.0` li1008…); `/nix/store/9nnjvvqxg5c71k18wv4iqqb9fxnd0fvy-mesa-kopper-wayland-26.2.4`; `mesa-demos-9.0.0` p2si5i…; `pulseaudio-17.0` xmgw0c…; `vulkan-tools-lunarg-1.4.357.0` rrbwd0…; the readback Firefox `/nix/store/aqgy9hl76pgiwnjbdi106wmi4gzlm6zj-firefox-readback-157.0.1` (without the 86.7 marker; the marked rebuild, rk9rz1…, is on the workstation only) |
+| testhost `~/wc-launch-ivs` | `wc-session` (this branch), `bin/wc-proxy`, `bin/wc-arena-host`, `bin/pulse` → pulseaudio-17.0 as an indirect GC root. **No** `gpu.env`, no `sv-hostd`, no ICD |
+| testhost `/tmp/svff-int` | the harness's release `sv-hostd`, `wc-proxy`, `libsv_icd.so`, `sv_icd.json`, `video-probe`, and the logs and `apidump.txt` of 86.3–86.4 |
+| guest `C:\Users\<guest-user>\wcivs` | `wc-launch.exe`, `sv-guest.exe` (compositor half only), `wc-desk.exe`, `probe-relay.exe`, `wc-launch.ini` with `audio = on`, `gpu-sessions = 0` |
+| guest `C:\Users\<guest-user>\svffint` | release `sv-guest.exe` (both halves), `video-probe.exe`, `probe-relay.exe`. `layout-probe.exe` was **deleted** after 86.5 so that nobody runs it by accident |
+| NixOS | unchanged: generation 50, 102f747 |
+
+### 86.3 The accelerated path, on the guest's GPU
+
+`scripts/sv-firefox-guest.sh` as the accel agent left it could not be run here:
+its compositor used `--arena-guest-ram` with `--arena-frames`, the two things
+§84.7's rule forbids on this guest, and its root was `~/rootc`, which is gone.
+This branch changed it to the ivshmem arena (`--arena-ivshmem 0`, the header
+checked in the file as `wc-session up` checks it), root through `sudokey` for
+`sv-hostd` and nothing else, the proxy and Firefox as `sirati`, and an exit trap
+that ends its own guest processes by path. Two code changes made the last part
+possible and safer:
+
+* **`sv-hostd qemu-serve --drop-to UID:GID`.** The locate needs QMP and
+  `/proc/<qemu-pid>/fd`, both root's. After it, `sv-hostd` drops every id,
+  clears supplementary groups, makes itself dumpable again, refuses to go on if
+  `setuid(0)` still works, and hands out `/proc/<its own pid>/fd/<n>` instead of
+  QEMU's descriptor. Measured on testhost: `now uid 1000 gid 100; serving
+  /proc/198066/fd/4`, `icd.sock` owned by `sirati`, and Firefox and eglinfo
+  ran as `sirati`. Until now the harness ran Firefox as root.
+* **The GPU side refuses `VirtualLock` arenas.** `sv-gpu-server guest` used
+  large pages and fell back to locked 4 KiB pages; §84.5 measured such pages
+  moving frame under the host's writes, and the host writes this arena on every
+  command. The fallback now needs `--allow-small-pages` or
+  `SV_ALLOW_SMALL_PAGES=1`. Every GPU side here reported `large-pages window:
+  80 MiB of guest RAM`.
+
+Measured, session 0:
+
+| run | result |
+|---|---|
+| locate of one 80 MiB GPU arena (×14) | 2.19–2.25 s each, 7–27 runs, `all 20480 pages carry their own index` |
+| `probe`, stock Mesa 26.2.0 (control) | Wayland platform: `zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))`, Mesa 26.2.0 |
+| `probe`, `mesa-kopper-wayland` 26.2.4 | Wayland platform: `zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))`, **Mesa 26.2.4** |
+| ICD ring waits in a probe, no doorbell | 1657 waits, mean 6.49 ms, `[<10us=444 <100us=532 <1ms=28 <10ms=258 <100ms=395]`; 1356, mean 7.89 ms in the other |
+| `zink`, Firefox 157, `SV_DEBUG=1` | GPU side 1 **faulted**; Firefox `DeviceLost`, `vkCreatePipelineLayout failed (VK_ERROR_DEVICE_LOST)`; window 1×1 |
+| the same with `SV_TRACE=pre` on the GPU sides | no fault; every `eglChooseConfig` for WebRender failed and Firefox fell back to software WebRender (`InitDeviceTask is slow: 14280`) |
+| the same with `ZINK_DEBUG=nopc` | faulted, in the same place |
+
+So the stock control *also* reaches Zink here, unlike on the workstation
+(docs/design.md §0.28.1). Why the harness's Mesa 26.2.0 behaves differently from the
+workstation's stock 26.2.4 was not investigated. The present's
+`fence … ms` was **not** measured: no Firefox frame was presented on the GPU.
+The doorbell port (§36.16) was not hot-added; the ring-wait histogram above is
+what the 20 ms slice costs without it, and the many waits in the
+`<100ms` bucket say a usable frame rate will need it.
+
+### 86.4 The fault: Intel's driver, `vkCreatePipelineLayout`, one layout
+
+The GPU side died as a bare `Segmentation fault` from MSYS. It now carries
+`sv_gpu_server::fault`: each ring stores its in-flight opcode and seqno in one
+relaxed atomic before dispatch and marks it returned after, and on Windows an
+unhandled-exception filter prints the exception, its module and every ring's
+last command. Three runs, the same answer each time:
+
+```
+[gpu] FAULT: exception 0xc0000005 at 0x7ff8bccab8d3 in C:\WINDOWS\System32\DriverStore\FileRepository\iigd_dch.inf_amd64_a8d32ac2abbe057a\igvk64.dll+0xdb8d3
+[gpu] FAULT: read of 0x8
+  ring 2: seqno 195 vkCreatePipelineLayout (IN THE DRIVER)
+```
+
+The LunarG api_dump layer between Zink and the ICD on the host gave the
+arguments: `flags 0`, three set layouts — `0xc`, `PUSH_DESCRIPTOR`, five
+`UNIFORM_BUFFER` bindings, one per graphics stage, with a
+`VkDescriptorSetLayoutBindingFlagsCreateInfo` whose five flags are all zero;
+`0xe`, Zink's empty dummy layout; `0x6f`, one `UNIFORM_TEXEL_BUFFER` for the
+fragment stage — and a push-constant range `ALL_GRAPHICS 0..52`. None is null
+and the forwarder translated all three to driver handles, so `read of 0x8` is
+not a null handle of ours. Zink's separable-shader path, which does pass null
+set layouts, was ruled out by `nopc` above.
+
+`vk-probe`'s `layout-probe` made that layout and variations directly on the
+driver, with no forwarder, one child process per variation:
+
+| variation | result |
+|---|---|
+| the layout above, exactly | **0xc0000005** |
+| the same without the binding-flags pNext | ok |
+| push set + empty set | **0xc0000005** |
+| push set + texel set | **0xc0000005** |
+| empty set + texel set | ok |
+| an ordinary (not push) UBO set + empty + texel | ok |
+| push set alone, empty set alone | not run (86.5) |
+
+So the fault needs a `PUSH_DESCRIPTOR` set layout that carries a binding-flags
+pNext, in a pipeline layout with at least one set after it. Dropping an
+all-zero binding-flags struct from push-descriptor layouts on this driver
+avoids it in this probe; that fix, and proving it, belong to
+`intel-layout-fix`. Driver version: the guest's Intel UHD driver, igvk64.dll
+from `iigd_dch.inf_amd64_a8d32ac2abbe057a`.
+
+### 86.5 Incident: QEMU stopped the VM after the driver faulted three times
+
+`layout-probe.exe` ran in the guest at about 17:06–17:07 CEST. It printed the
+first six rows of 86.4 — three of them a fault in `igvk64.dll` within a few
+seconds — and nothing more. The watchdog saw ssh and ping fail at 17:07:41.
+Read-only diagnosis, nothing reset or resumed by this branch:
+
+* `query-status`: `{"status": "internal-error", "running": false}`;
+* QEMU's journal at 17:07:16: `error: kvm run failed Bad address`, then the
+  vCPU's registers: `CPL=0`, `RIP=fffff8052cee1a63`, the instruction
+  `41 8b 0f` (`mov ecx,[r15]`) with `r15 = fffff971a9730044`, inside a loop
+  whose registers hold a timeout computation (`rcx = 10,000,000`);
+* every vCPU thread asleep, load 0.08, QEMU's I/O counters unchanged over 5 s.
+  That is not §84.7's hang, where all twelve vCPUs spun at 99%.
+
+`KVM_RUN` returned `EFAULT` while the guest kernel was reading what has the
+shape of a device register in a polling loop. The likely mechanism is the
+passed-through iGPU being reset after the user-mode faults, with VFIO revoking
+the BAR mapping under that read. **That is an inference from the shape of the
+registers, not a measurement.** The earlier Firefox runs faulted the same driver
+once each and the VM carried on; this run faulted it three times in a few
+seconds. The coordinator recovered the guest with QMP `system_reset` and `cont`
+at 17:12; the Intel GPU and the ivshmem device both reported OK afterwards.
+
+**The rule, from the coordinator, and this section is where it is written down:
+bisecting a driver crash never runs on the guest.** A user-mode fault in the
+Intel driver on this VM can take the VM down, which a fault in a process on a
+machine with its own GPU does not. Isolate on a local driver, reason from the
+api_dump, or fix the forwarder so the driver never sees the input; the guest
+gets the fixed build once it is proven elsewhere. `layout-probe` carries that
+warning at the top of its source.
+
+### 86.6 Sound
+
+**Where the speakers are.** testhost's QEMU has `-audiodev
+alsa,…,out.dev=hw:0,0` behind an emulated `intel-hda`, so the guest owns the
+card exclusively; `testhost-mixer-unity.service` pins the host mixer to 100%
+for it; there is no PipeWire or Pulse for `sirati` and `/dev/snd` is group
+`audio`. Routing Firefox into the host's audio stack would mean a server that
+shares `hw:0,0` with QEMU, which is a change to `windows-vm.service` and a VM
+restart. So the route is into the guest: what Firefox plays is played by
+Windows.
+
+**The route.**
+
+1. `wc-session proxy` also starts `wc-launch-audio-<ID>`, a user unit running
+   `pulseaudio -n` with a null sink `wc` (s16le, 48 kHz, stereo), its native
+   socket at `$D/xdg/pulse/native` — libpulse's default under the
+   `XDG_RUNTIME_DIR` Firefox is already given, so Firefox needs no setting —
+   and `module-simple-protocol-unix` serving the sink's monitor as raw PCM on
+   `$D/audio.sock`. `down` stops the unit. The package is `$BIN/pulse`, a GC
+   root that `wc-launch.sh deploy` makes from `WC_LAUNCH_PULSE`.
+2. The launcher's tunnel gains `-L 127.0.0.1:<audio-port>:$D/audio.sock`
+   (`audio-port` defaults to `port + 1`).
+3. `wc-launch.exe` connects there and plays the stream with waveOut through a
+   queue of 8 × 20 ms buffers. A chunk that finds all eight queued is dropped,
+   so the delay never grows past 160 ms; a device that runs dry is an underrun.
+   Both are counted. `audio-volume` sets waveOut's volume for this stream.
+4. With no server (`audio.state` says why), `run` writes
+   `media.cubeb.force_null_context` into `user.js` and prints `NO AUDIO … Firefox
+   gets media.cubeb.force_null_context` to the app log and to the launcher, which
+   logs it. A null sink consumes in real time whether or not anyone is
+   connected, so a Firefox with a server never waits on it either.
+
+**The first route did not work, and why it was abandoned rather than fixed.**
+Version one ran a `wc-session audio ID` verb (`parec` to stdout) over its own
+ssh exec and read ssh.exe's stdout from a pipe `wc-launch.exe` created. The
+player received nothing: `parec` wrote 2.25 MB and blocked, while ssh.exe on
+the guest wrote nothing into the pipe. The same command through an MSYS pipe
+streamed 1.52 MB in 8 s, with or without `-n`. So Win32 ssh.exe and that pipe do
+not get on; the cause was not found. The tunnel already belongs to the session,
+so the socket costs nothing new, and the verb is kept for a person diagnosing.
+
+**Measured, session 0 on the real guest, Firefox 157 in software WebRender**
+(no GPU environment), a page playing a 440 Hz WebAudio tone at gain 0.05 and
+putting its `AudioContext` state and clock in the title:
+
+| | |
+|---|---|
+| `waveOutOpen` in session 0 | succeeded (`WAVE_MAPPER`) |
+| player, at the end of the session | **63.4 s played, 63.4 s of it not silent, 0 chunks dropped, 2 underruns** |
+| Firefox's clock, from the compositor's title log | `tone running t=62.2` when the player said 60.0 s |
+| Pulse on the host | sink input `application.name = "Firefox"`, float32le 2ch 48 kHz, `Corked: no`, buffer latency 31.25 ms, sink latency 13.5 ms; source output `protocol-simple.c` s16le 2ch 48 kHz; sink `wc` RUNNING |
+| teardown | both user units stopped, no `pulseaudio`, `parec`, `wc-proxy` or Firefox left |
+| the fallback, by hand on the workstation | no `audio.state`: `run ok … audio=none`, the `NO AUDIO` line in both places, `force_null_context` appended; with one: nothing appended |
+
+The guest played the tone at 5% waveOut volume on the laptop's speakers, with
+nobody logged in, for about two minutes in total. Two things this run found
+that are not sound: Firefox stopped at **"Open Firefox in Troubleshoot Mode?"**
+on the first try, because earlier launcher sessions had ended under it and
+counted as startup crashes (`toolkit.startup.max_resumed_crashes=-1` was set for
+the test, through `WC_LAUNCH_EXTRA_PREFS`, not in the product); and a run
+directory's `xdg/` survives `down`, recreated after `rm -rf` by the Firefox
+that `down` does not stop. That predates this section (a §83 directory had the
+same) and was cleaned up by hand.
+
+**Not measured:** what anybody heard (session 0, nobody there); the delay from
+the null sink to the speakers, and so how far the picture leads the sound —
+up to the 160 ms queue plus the tunnel, with Firefox's audio clock running on
+the host's null sink and knowing none of it; drift over an hour; session 1,
+where the user's own audio device and volume apply; and `<video>` with sound.
+
+### 86.7 The GPU and decode wiring for the launcher: committed, not enabled
+
+What the launcher needs to give Firefox the guest's GPU, and none of it is
+switched on: testhost has no `gpu.env`, no `sv-hostd` in `~/wc-launch-ivs`,
+no broker running, and the deployed ini says `gpu-sessions = 0`.
+
+* **Guest.** `[session] gpu-sessions = N` (0..=8, default 0), `gpu-port`
+  (default `port + 10`), `gpu-arena-mib` (default 64). After the proxy,
+  `wc-launch.exe` starts N `sv-guest.exe gpu guest --port … --arena … --idle
+  <session-secs>` (large pages or a refusal), waits for each to publish, and
+  calls `wc-session gpu ID N`. The tunnel reverse-forwards
+  `$D/cold<i>.sock` to each GPU side's port. Any failure kills what was
+  started and logs `no forwarded GPU this session, the host renders in
+  software`. `supervise` kills them with the session.
+* **Host, root.** `sv-hostd broker --listen /run/sv-hostd/broker.sock
+  --socket-gid <gid>`: a root daemon on a group-only socket. A request names a
+  directory exactly `/tmp/wc-launch/<id>` and a count; the directory and every
+  `cold<i>.sock` must be the **peer's** by `SO_PEERCRED`, the directory not
+  writable by others; then the broker runs `qemu-serve … --drop-to <peer
+  uid>:<peer gid>`, relays its lines until it listens, and takes the next
+  request — QMP serves one client. A child that does not listen in 180 s is
+  killed. Unprivileged here, it refused a missing cold socket, `..`, a count of
+  9 and a mode-777 directory, and ran `qemu-serve` against the peer's directory
+  otherwise. It has not run as root. The operator starts it; one way, until
+  nix-config has a unit for it:
+  ```
+  sudokey run -- systemd-run --unit=sv-hostd-broker -p RuntimeDirectory=sv-hostd \
+    -p RuntimeDirectoryMode=0750 -p Group=wc-arena \
+    ~/wc-launch-ivs/bin/sv-hostd broker --listen /run/sv-hostd/broker.sock \
+    --socket-gid $(getent group wc-arena | cut -d: -f3)
+  ```
+* **Host, user.** `wc-session gpu ID N` checks the cold sockets and runs
+  `sv-hostd broker-request`; `run` applies `gpu.env` **only** when this session
+  has `$D/icd.sock`, adds `SV_SOCKET=$D/icd.sock`, and otherwise prints `NO GPU
+  … Firefox renders in software` and applies nothing — a forced Zink with nothing
+  behind it is a Firefox that cannot start its renderer. Tested by hand on the
+  workstation both ways.
+* **Decode.** `scripts/sv-firefox-readback-pkg.sh OBJDIR` turns the
+  readback-patched `./mach` tree into a store path with a real closure (the
+  stock wrapper retargeted, so the patched browser gets ffmpeg 9 and
+  libpulseaudio exactly as stock does) and a marker,
+  `lib/firefox/.wc-vulkan-readback`. When the session has a GPU and the
+  resolved Firefox carries the marker, `run` adds the three
+  `media.hardware-video-decoding-vulkan.*` prefs and
+  `MOZ_DISABLE_RDD_SANDBOX=1`. Name it with `WC_LAUNCH_FIREFOX=<store
+  path>/bin/firefox`. Built: `/nix/store/rk9rz146p8a31ffrd76pxbck4dn4pxjk-firefox-readback-157.0.1`
+  (2.7 GiB closure, `--version` says 157.0.1).
+* **Deploy.** `WC_LAUNCH_GPU_SESSIONS=N` builds `sv-guest.exe` with its GPU
+  half (release), copies release `sv-hostd` and `libsv_icd.so` and writes
+  `bin/sv_icd.json`; `gpu.env` is written only with `WC_LAUNCH_GPU_ENV=write`
+  and `WC_LAUNCH_KOPPER_MESA`, and otherwise printed.
+
+**The cost the broker carries, in security-model.md R30:** the dropped
+`qemu-serve` holds QEMU's memory backend, so the peer can open all of guest RAM
+through `/proc/<pid>/fd/<n>`. Membership of the broker's group is access to the
+VM's memory.
+
+### 86.8 The gates
+
+PLACEHOLDER-GATES
+
+### 86.9 What remains for "Firefox fully works on Windows"
+
+1. **The Intel driver fault** (86.4). Fixed on our side, proven on a local
+   driver, then one guest run of the `zink` harness — not of `layout-probe`.
+2. **A present across the VM**: the `fence … ms` of firefox-accel.md, never
+   measured because no frame was presented on the GPU. The ring waits in 86.3
+   say the doorbell (§36.16) will be needed for a usable frame rate; its port is
+   a QMP hot-add, which was not done.
+3. **Accelerated Firefox through the launcher**: the broker run as root on
+   testhost (a unit in nix-config on top of 102f747, after a dry-activate),
+   `gpu.env`, `gpu-sessions = 4`, and the session-1 run; and a decision on R30.
+4. **Hardware decode on the guest** (video-decode.md §7.9): every step, starting
+   with whether the Intel driver takes a bitstream buffer in host-pointer-
+   imported guest RAM. Nothing ran (GPU work was suspended).
+5. **The session-1 run**: deploy, install, cold, warm, verify and shot on the
+   ivshmem path with tabs in the title bar, the photographs (window, taskbar
+   icon, title, tabs in the caption, about:support's Graphics and Media, a
+   scrolled page) each judged by a visual-check agent, §85.10's guest list, and
+   sound heard by a person: the sound path in session 1, with the user's own
+   device.
+6. **Troubleshoot Mode after an ended session** (86.6): a launcher session that
+   ends under Firefox counts as a startup crash; three in a row put a modal
+   dialog in front of the next start. Either the session end stops Firefox
+   cleanly, or the deployment sets `toolkit.startup.max_resumed_crashes`.
+7. **Audio delay and drift** (86.6, not measured), and sound for a second
+   application in the same session (one sink, mixed; untested).
+8. **The persistent VM change** (§83.9 item 2) is still not booted.

@@ -694,8 +694,7 @@ mod audio_tests {
     /// host's per-session socket, and only when sound is on.
     #[test]
     fn the_tunnel_forwards_the_sessions_sound_socket() {
-        let mut c = Config::default();
-        c.host = "u@h".into();
+        let mut c = Config { host: "u@h".into(), ..Config::default() };
         let a = tunnel_argv(&c, "kh", "wcl-9");
         let i = a.iter().position(|x| x == "-L").expect("an -L");
         assert_eq!(a[i + 1], format!("127.0.0.1:{}:/tmp/wc-launch/wcl-9/audio.sock", c.port + 1));
@@ -727,8 +726,7 @@ mod gpu_tests {
 
     #[test]
     fn each_gpu_side_has_its_port_and_its_reverse_forward() {
-        let mut c = Config::default();
-        c.host = "u@h".into();
+        let mut c = Config { host: "u@h".into(), ..Config::default() };
         assert!(!tunnel_argv(&c, "kh", "wcl-1").iter().any(|x| x.contains("cold")));
         c.gpu_sessions = 2;
         let a = tunnel_argv(&c, "kh", "wcl-1");

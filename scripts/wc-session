@@ -162,7 +162,7 @@ resolve_exec() {
 #
 # A null sink consumes in real time whether or not anybody is listening, so
 # Firefox's audio clock runs and its main thread never waits on a server that
-# is not there — the stall design.md §0.28.9 measured. If no server could be
+# is not there — the stall docs/design.md §0.28.9 measured. If no server could be
 # started at all, `run` sets `media.cubeb.force_null_context` instead, which is
 # Firefox's own "no audio" switch, and says so loudly. There is no third state.
 #
