@@ -42,6 +42,11 @@ use crate::state::{Memory, PROTOCOL_API_VERSION, SharedVulkan};
 use sv_icd_entry::{Icd, IcdLocal, IcdResult, LowerError, forward};
 use sv_proto as p;
 
+/// `VK_ERROR_TOO_MANY_OBJECTS`, vulkan_core.h.
+const VK_ERROR_TOO_MANY_OBJECTS: i32 = -10;
+/// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, vulkan_core.h.
+const VK_ERROR_INVALID_EXTERNAL_HANDLE: i32 = -1_000_072_003;
+
 /// Forward if there is a GPU side, otherwise answer with `$local`.
 ///
 /// Every physical-device query below has this shape, and writing it out
@@ -701,6 +706,62 @@ impl Icd for SharedVulkan {
         Ok(p::VkGetPhysicalDeviceExternalFencePropertiesReply {
             p_external_fence_properties: Some(Box::default()),
         })
+    }
+
+    /// **A file descriptor is refused here, never forwarded** (docs/design.md
+    /// §1a), and the six commands that would carry one say so with an error.
+    ///
+    /// Forwarded, `vkGetMemoryFdKHR` returned the number of a descriptor that
+    /// is open in the *GPU side's* process: an integer that means nothing here,
+    /// or worse, names an unrelated descriptor of this process that the
+    /// application will now import and eventually close. The import direction
+    /// was the mirror image — the GPU side's driver taking ownership of, and
+    /// closing, whatever its own descriptor of that number was (its socket,
+    /// the arena). Neither had happened because nothing called them; Firefox's
+    /// Vulkan decoder does, on its first frame, once the forwarder serves a
+    /// decode queue (docs/video-decode.md §7). The external-memory queries
+    /// above already answer "no handle type is supported", so an application
+    /// that asks first never gets here; this is for the ones that do not ask.
+    ///
+    /// `VK_ERROR_TOO_MANY_OBJECTS` is one of the two results the specification
+    /// allows the getters; `VK_ERROR_INVALID_EXTERNAL_HANDLE` is the importers'.
+    fn get_memory_fd_khr(&self, _args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
+        Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_semaphore_fd_khr(
+        &self,
+        _args: p::VkGetSemaphoreFdKHRArgs,
+    ) -> IcdResult<p::VkGetSemaphoreFdKHRReply> {
+        Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_fence_fd_khr(&self, _args: p::VkGetFenceFdKHRArgs) -> IcdResult<p::VkGetFenceFdKHRReply> {
+        Ok(p::VkGetFenceFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    }
+
+    fn get_memory_fd_properties_khr(
+        &self,
+        _args: p::VkGetMemoryFdPropertiesKHRArgs,
+    ) -> IcdResult<p::VkGetMemoryFdPropertiesKHRReply> {
+        Ok(p::VkGetMemoryFdPropertiesKHRReply {
+            result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE),
+            p_memory_fd_properties: None,
+        })
+    }
+
+    fn import_semaphore_fd_khr(
+        &self,
+        _args: p::VkImportSemaphoreFdKHRArgs,
+    ) -> IcdResult<p::VkImportSemaphoreFdKHRReply> {
+        Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
+    }
+
+    fn import_fence_fd_khr(
+        &self,
+        _args: p::VkImportFenceFdKHRArgs,
+    ) -> IcdResult<p::VkImportFenceFdKHRReply> {
+        Ok(p::VkImportFenceFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
     }
 
     fn get_physical_device_format_properties(
