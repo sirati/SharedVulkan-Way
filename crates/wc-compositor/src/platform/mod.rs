@@ -55,6 +55,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::surface::{Rect, Shadow};
 
+// §82. Pure, so on every target: the Win32 caption's decisions, tested on the
+// machine that builds them. Only `win32.rs` calls it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod caption;
 #[cfg(windows)]
 mod drag;
 #[cfg(windows)]
