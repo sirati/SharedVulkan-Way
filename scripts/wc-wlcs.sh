@@ -577,32 +577,27 @@ justified_failure_patterns() {
       "$t" "$why"
   done
 
-  # ------------------------------------------------------------ §64, headless -
-  #
-  # **Headless only, and that is the whole reason the leg argument exists.**
-  #
-  # These four drive `xdg_toplevel.move` and `.resize` and then assert the
-  # window actually moved. §22.7 wired both to Win32's `SC_MOVE`/`SC_SIZE`, so
-  # on the Wine leg they reach a real window manager and are entitled to pass;
-  # excusing them there would be exactly the false green this table's own
-  # self-check exists to prevent. On the headless platform there is no window
-  # manager at all — `platform/headless.rs` answers `ToUi::BeginMove` and
-  # `ToUi::BeginResize` with a `println!` and nothing moves, deliberately, so
-  # that a Linux run can still assert the request *arrived*.
-  #
-  # So this is not "the compositor is wrong and we accept it". It is "this leg
-  # cannot observe the half of the path that would make it right", which is the
-  # same shape as the 22 above and a different reason. §64.3 counts what
-  # reclassifying them does to the debt number, and says why the number was
-  # wrong rather than the tests.
+  # §64's four headless-only entries (interactive move and resize: "the
+  # headless platform has no window manager") are gone since §85: the stand-in
+  # in `control.rs` now runs the gesture the way `SC_MOVE`/`SC_SIZE`'s modal
+  # loop does, and all four pass on this leg. They were excused because the leg
+  # could not observe the path; now it can, so they are assertions again.
   [ "$leg" = headless ] || return 0
-  local nowm='interactive move and resize: the headless platform has no window manager, so BeginMove/BeginResize are logged and nothing moves. Wired to SC_MOVE/SC_SIZE on Win32 (§22.7), where this leg cannot see it — the Wine leg is where these must pass (§64.2)'
-  for t in surface_can_be_moved_interactively \
-           surface_can_be_resized_interactively \
-           pointer_leaves_surface_during_interactive_move \
-           pointer_leaves_surface_during_interactive_resize; do
-    printf 'XdgToplevelStableTest.%s\t%s\n' "$t" "$nowm"
+
+  # §85. Headless only: the Wine leg cannot drive a pointer, so it never runs
+  # these. The suite's own contradiction, settled by a reference run rather than
+  # by reading. After `place_above(subsurface, other)` (or `place_below(other,
+  # subsurface)`) on two subsurfaces covering the same point, the protocol puts
+  # `subsurface` on top; each test first asserts the other one is not focused
+  # -- this compositor passes that -- and then that `subsurface` is not focused
+  # either, which no stacking can satisfy. Mir 2.29, WLCS's reference
+  # compositor, fails both too (on the first assertion) and lists both in its
+  # own expected_wlcs_failures.list.
+  local selfcontra='WLCS 1.8.1 asserts that neither restacked subsurface is on top; the first assertion (the restack took effect) passes here, the second contradicts it, and Mir 2.29 fails both tests as well (§85)'
+  for t in place_above_simple place_below_simple; do
+    printf 'XdgShellStableSubsurfaces/SubsurfaceTest.%s/0\t%s\n' "$t" "$selfcontra"
   done
+
 }
 
 justified_failures() {

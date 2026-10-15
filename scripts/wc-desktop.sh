@@ -1494,6 +1494,11 @@ do_damage() {
 # 30 s apart, and the plans are compared page by page. A page whose backing
 # frame differs between two locates has moved. Run in the interactive session
 # (the scheduler) and in the ssh session as the control.
+#
+# §85: the compositor now refuses a guest-RAM arena without large pages, so by
+# default this measures large pages only. The `VirtualLock` rows of §84.5 need
+# WC_PIN_COMP_EXTRA=--arena-small-pages-may-corrupt-guest-memory, and the
+# coordinator's standing rule since §84.7 is not to run that on the real guest.
 pin_locate() {
   local runid="$1" pages="$2" plan="$3"
   h "echo \"export PATH=/run/current-system/sw/bin:/run/wrappers/bin
@@ -1523,10 +1528,10 @@ do_pinning() {
     log="$sock.log"
     if [ "$where" = interactive ]; then
       int_bg wcpin "$DESKDIR_WIN\\wc-compositor.exe" \
-        "--socket $sock --timeout 150 --log $DESKDIR_WIN\\$log $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1
+        "--socket $sock --timeout 150 --log $DESKDIR_WIN\\$log ${WC_PIN_COMP_EXTRA:-} $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1
     else
       ssh "${SSHOPT[@]}" "$GUEST" "export MSYS_NO_PATHCONV=1; cd $DESKNAME && ./wc-compositor.exe \
-        --socket $sock --timeout 150 --log '$DESKDIR_WIN\\$log' $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1 &
+        --socket $sock --timeout 150 --log '$DESKDIR_WIN\\$log' ${WC_PIN_COMP_EXTRA:-} $(wc_arena_comp_args ${WC_PIN_FRAMES:+"$DESKDIR_WIN\\$sock.frames"})" >/dev/null 2>&1 &
     fi
     for t in $(seq 1 40); do
       line=$(g "cat $DESKDIR/$log 2>/dev/null" 2>/dev/null \

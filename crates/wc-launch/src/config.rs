@@ -101,6 +101,12 @@ pub struct Config {
     /// How long a session may last before the compositor's own deadline ends
     /// it. Not an idle timeout — see docs/waycompose-design.md §28.9.
     pub session_secs: u64,
+    /// §85. How long the session outlives its last window, in seconds. A click
+    /// within it is a warm start; after it the compositor exits and the
+    /// session, its relay, tunnel and proxy, and its hold on the arena, go with
+    /// it (§28.9 item 9). `linger-secs = 0` ends it as soon as the last window
+    /// closes.
+    pub linger_secs: u64,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -118,6 +124,7 @@ impl Default for Config {
             output: "1600x1000".into(),
             port: 57431,
             session_secs: 43200,
+            linger_secs: 60,
             apps: BTreeMap::new(),
         }
     }
@@ -184,6 +191,7 @@ impl Config {
                     cfg.port = v.parse().map_err(|e| format!("line {}: port: {e}", n + 1))?
                 }
                 ("session", "session-secs") => cfg.session_secs = num("session-secs")?,
+                ("session", "linger-secs") => cfg.linger_secs = num("linger-secs")?,
                 ("session", other) => {
                     return Err(format!("line {}: [session] has no {other}", n + 1));
                 }
@@ -266,6 +274,9 @@ arena-mib  = 64
 outbound   = 1048576
 output     = 1600x1000
 port       = 57431
+# Seconds the session outlives its last window (§85): a click within it is warm,
+# and after it the session ends and gives its arena back. 0 = at once.
+linger-secs = 60
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.

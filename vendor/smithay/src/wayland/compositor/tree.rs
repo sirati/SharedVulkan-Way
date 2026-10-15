@@ -309,7 +309,12 @@ impl PrivateSurfaceData {
                 else {
                     return;
                 };
-                let pending = *sub.pending_location.lock().unwrap();
+                // §85: what the parent *committed*, not what was last asked
+                // for. Nothing committed since the last application means
+                // nothing to apply.
+                let Some(pending) = sub.committed_location.lock().unwrap().take() else {
+                    return;
+                };
                 // **Both halves, and the pending one is not redundant.**
                 //
                 // `SubsurfaceCachedState` is still a `Cacheable`, so the child's
@@ -328,6 +333,23 @@ impl PrivateSurfaceData {
                     .get::<super::handlers::SubsurfaceCachedState>();
                 cached.pending().location = pending;
                 cached.current().location = pending;
+            });
+        }
+    }
+
+    /// waycompose §85. `surface` committed: its children's requested
+    /// positions become its committed state, to be applied by
+    /// [`Self::apply_child_positions`] when that commit takes effect.
+    fn stage_child_positions(surface: &WlSurface) {
+        for child in Self::get_children(surface) {
+            if child.id() == surface.id() {
+                continue;
+            }
+            Self::with_states(&child, |states| {
+                if let Some(sub) = states.data_map.get::<super::handlers::SubsurfaceState>() {
+                    let requested = *sub.pending_location.lock().unwrap();
+                    *sub.committed_location.lock().unwrap() = Some(requested);
+                }
             });
         }
     }
@@ -375,6 +397,8 @@ impl PrivateSurfaceData {
         // The synchronized case is not skipped, only deferred: when a desync
         // ancestor eventually commits, `commit_sync_surface_tree` walks this
         // subtree and applies each level's children there.
+        // §85: committed now, applied now only if this commit takes effect.
+        Self::stage_child_positions(surface);
         if !is_sync {
             Self::apply_child_positions(surface, dh);
         }

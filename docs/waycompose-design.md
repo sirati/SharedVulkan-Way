@@ -10453,7 +10453,9 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    that script has not been run here.
 9. **Closing the window does not end anything.** The compositor, the relay, the
    tunnel and the proxy stay up holding 64 MiB of the guest's pinned RAM, which
-   is right for the next click and wrong for the rest of the day.
+   is right for the next click and wrong for the rest of the day. *§85.7: the
+   session now ends `linger-secs` after its last window, never under a connected
+   client; measured under Wine, not from the launcher.*
 10. **A session whose start-up fails part-way leaves a directory on the VM host.**
    The teardown runs when the compositor exits, and a launcher killed by a deploy
    never gets there; `/tmp/wc-launch/` had three of them by the end of the day.
@@ -10474,7 +10476,9 @@ is why the older acceptance scripts are not re-run here and why their numbers in
    alone cannot tell the two apart: the thing that can is the **proxy's** log,
    where a real exhaustion leaves `no run of N bytes` and a stop that says the
    *compositor* closed the connection. Anyone chasing the user's report should
-   start there rather than in Firefox's output.
+   start there rather than in Firefox's output. *§85.3: Firefox's profile is a
+   better place still. A lost display connection leaves a crash event whose
+   `MozCrashReason` is "Error reading events from display: Broken pipe".*
 
 ### 28.10 What to do next
 
@@ -24622,11 +24626,15 @@ what the broken state scored, 5 / 7, and only the log told the two apart.
 4. **`zero_size_anchor_rect_stable`**, where we raise a protocol error on
    something legal.
 
+*All four closed in §85.4; the popup suites are 12 / 0 on the headless leg.*
+
 ### 78.5 Unchanged and still open from §72
 
 The two three-level grandparent orderings, `subsurface_extends_parent_input_region`,
 and the two restacking assertions that now fail only their second half. None of
-them is touched by this.
+them is touched by this. *§85.4: the orderings are fixed; the restacking pair
+is the suite's own contradiction, which a Mir reference run supports; the input
+region case stays open, and Mir fails it too.*
 
 *(Committed unsigned: 1Password holds the signing key and its session was killed
 by an over-broad `pkill -9 -f weston` elsewhere on the machine. Recorded rather
@@ -26199,7 +26207,8 @@ On the real guest, each run once:
    `SeLockMemoryPrivilege`, and a default Windows account does not have it.
    Making the guest-RAM arena *refuse* without large pages (or use AWE pages) is
    the conservative change. It is not made here, because it changes what every
-   harness can run.
+   harness can run. *Made in §85.2: large pages or a refusal, and `VirtualLock`
+   only under `--arena-small-pages-may-corrupt-guest-memory`.*
 2. **The relocation's cause inside Windows.** Measured: it happens, in bursts,
    to locked 4 KiB pages, and not to large pages. Not measured: what triggers it
    (memory compaction for some contiguous allocation is the usual suspect; the
@@ -26217,3 +26226,394 @@ On the real guest, each run once:
    prefix it was already passed empty), but it has not been re-run; the guest
    was reset and nobody is logged in.
 6. **The stale-row instrument** (84.4) has not yet printed a stale row.
+
+## 85. Firefox polish: large pages or nothing, a session that ends, and popups that behave
+
+Written 2026-10-15, on branch `firefox-polish`. Seven items, all compositor-side
+and all checked on this workstation: the Linux build, `wc-compositor.exe` under
+Wine 11.14 on Xvfb, WLCS, a local NixOS VM and a local Firefox 157. **Nothing
+here ran on the Windows guest.** 85.10 lists what needs it, with the commands.
+
+### 85.1 Status in one paragraph
+
+A guest-RAM arena now **refuses to start without large pages**. The
+`VirtualLock` path that §84.5 measured moving and §84.7 ran into a hang is
+reachable only under `--arena-small-pages-may-corrupt-guest-memory`. Popup grabs
+are a stack: they take the keyboard and close in one click. The conformance
+stand-in now runs interactive moves and resizes itself, two subsurface orderings
+are fixed in `vendor/smithay`, and a reference run against Mir settles §74.4.
+**WLCS headless goes from 416 passed / 50 failed to 428 / 38, and the debts
+from 20 to 10.** A launcher session now ends when its last window has been gone
+for `linger-secs`, and it never ends while a client is still connected. That
+second rule exists because of the one finding in this section that bears on
+the user's "crashed Firefox" reports: **Firefox records a lost display
+connection as a crash** (85.3). No compositor fault reproduced, in 10 minutes
+of Wine stress or under gdb on Linux. The first-frame stall is not on this
+side (85.8).
+
+### 85.2 The arena: large pages or nothing
+
+`alloc_locked_region` used to try `MEM_LARGE_PAGES` and fall back to
+`VirtualLock` silently. It now takes a policy:
+
+* **`LargePagesOrRefuse`**, the default. On Windows this is
+  `VirtualAlloc(MEM_LARGE_PAGES)`. On Linux it is `mmap(MAP_HUGETLB)` from
+  `vm.nr_hugepages`, and its report is `pinning=hugetlb`. If neither is
+  available, `attach_guest_ram` returns `Unsupported` with the platform's
+  reason, why small pages are not a fallback, and the ways out:
+  `--arena-ivshmem`, `SeLockMemoryPrivilege` via
+  `scripts/win-account-right.ps1`, or the flag below.
+* **`SmallPagesMayCorruptGuestMemory`**, the diagnostic. The compositor flag
+  `--arena-small-pages-may-corrupt-guest-memory`, or
+  `WC_ARENA_SMALL_PAGES_MAY_CORRUPT_GUEST_MEMORY` for other processes, selects
+  it. It always takes `VirtualLock`/`mlock`, as `--arena-small-pages` did.
+  §84's `--arena-small-pages` and `WC_ARENA_NO_LARGE_PAGES` are refused by name,
+  with the new name in the message. A harness that still passed them would
+  otherwise quietly get large pages and believe it had run the control.
+
+Linux applies the same rule because `mlock` has the same flaw: compaction
+migrates mlocked pages unless `vm.compact_unevictable_allowed` is 0. Hugetlb
+pages are not moved by kcompactd, but an explicit migration can still move them
+(offlining, a contiguous allocation). **No Linux guest was measured for
+relocation**, so `hugetlb` is the stronger of the two Linux pinnings and not a
+measured equivalent of Windows' large pages.
+
+**A latent fallback went with it.** The large-page path required the requested
+length to be a multiple of `GetLargePageMinimum()`. A growth request is a pool's
+length and almost never is one, so before this **every grown region took
+`VirtualLock`** while the startup region reported `large-pages`. The large-page
+path now rounds up, and the caller is told the length it got.
+`create_outbound`'s own region makes the whole rounded region its window, so
+every stamped page is one the host is told about.
+
+Measured:
+
+| run | result |
+|---|---|
+| `wc-compositor.exe --arena-guest-ram 0:64MiB` under Wine (no privilege) | exit 2: `refusing a guest-RAM arena without large pages: this account does not hold SeLockMemoryPrivilege, which large pages need. …` |
+| the same with `--arena-small-pages-may-corrupt-guest-memory` | starts, `pinning=none` (Wine's `VirtualLock` fails) |
+| the same with `--arena-small-pages` | exit 2, the retirement message |
+| `scripts/wc-vm-damage.sh linux` (Linux compositor in the local NixOS VM, which now reserves `nr_hugepages`) | `pinning=hugetlb`, frame list 16384 frames, **verify 16128/16128**; 13 passed, 2 failed, which is §71.6's score and §71.5's wire |
+
+That harness also had a bug of its own. Outside its heredoc the host relay's
+line ended in `\\`, a literal backslash, so `socat` got three addresses and
+exited. It is fixed. `wc-release-vm.sh` reserves hugetlb pages the same way and
+was not run. `wc-desktop.sh pinning` now measures large pages only, and the
+`VirtualLock` rows need `WC_PIN_COMP_EXTRA=--arena-small-pages-may-corrupt-guest-memory`,
+which the standing rule forbids on the real guest. No other harness passed the
+old flag. The real-guest harnesses (`wc-guest.sh`, `wc-desktop.sh`,
+`wc-icon.sh`, `wc-taskbar.sh`, `wc-titlebar.sh`) all get large pages on this
+guest, whose account holds the privilege (§84.5). **None of them was re-run.**
+
+Unit tests: the default policy either produces `large-pages`/`hugetlb` with a
+length rounded up to 2 MiB, or fails `Unsupported` with the flag and
+`--arena-ivshmem` in the message and nothing registered. The diagnostic policy
+reports its pinning by name. The policy resolution is tested, including the
+retired variable. The compositor refuses the retired flag and accepts the new
+one. Four `wc-handle` integration tests used to *skip* when the commit failed
+(`if … is_err() { return }`). They now ask for small pages by name, so they run
+rather than skip silently.
+
+### 85.3 Crashes: nothing reproduced, and what "crashed Firefox" most likely is
+
+**Stress.** `wc-compositor.exe` under Wine and `wc-proxy` ran a page that opens
+and closes up to ten windows every 150 ms, resizes and moves each of them,
+retitles itself every 50 ms in three scripts (`é中😀`), and animates a canvas.
+Over it, `xdotool` drove random moves, left and right clicks, Escape, Alt,
+drags, double clicks, `ctrl+t`, `ctrl+Tab` and an occasional `ctrl+w`. Over
+10 minutes and 2351 input actions there were **208 toplevels and 162 popups,
+the compositor alive at the end, and Firefox alive at the end**. Shorter runs
+before it (40 s, 5 min, 60 s) also had no fault. The Linux compositor (headless platform) also ran under `gdb`, with Firefox
+connected to it directly and the same window storm, ten windows every 150 ms
+with no input. The run made in isolation lasted the full 600 s: **1471
+toplevels**, 20144 retitles, no signal and no panic. Firefox ended at its own
+`timeout` (124). An earlier run of the same script, made while other Wine runs
+were going on beside it, ended 76 s early. Firefox exited with 11 and "Error
+reading events from display: Broken pipe", the compositor's log stopped
+without a line, and `gdb` printed no signal. **That one is not explained.** It
+is consistent with something outside killing the debugger, and it did not
+recur on its own.
+
+**What did reproduce is a crash *report*, and it is Firefox's.** With Firefox
+running through the proxy, killing the compositor or killing the proxy leaves
+Firefox gone and a crash event in its profile's `crashes/events`. Each of the
+two runs left one event, with the same reason:
+
+```
+"MozCrashReason":"() Error reading events from display: Broken pipe Proxy: WP:E WP:RT WP:CA WP:CR WP:CPCA WP:CPCF "
+```
+
+GTK's display error goes through `MOZ_CRASH`. Every way a session can end under
+a running browser therefore files a crash: a deploy that kills `sv-guest.exe`, a
+harness `pkill`, the compositor's 12-hour `--timeout` (§28.9 item 1), and a
+compositor that faults. §28.9 item 11 found "Exiting due to channel error" in
+the logs and rightly said it proves nothing. The crash event is the artefact
+that would appear in Firefox's own UI as "Firefox closed unexpectedly". That
+this is what the user saw is **a hypothesis**, not measured on the guest; the
+guest command is in 85.10. What changed: a session no longer ends under a
+connected client (85.7).
+
+**Not reproduced:** §28.6's six start-up segfaults (`0xc0000005` at
+`wc-compositor.exe+0x123100`, before the first `println!`, on the real guest).
+A fault before `main` prints is not something a Wine or Linux run reaches, and
+that binary is gone. It stays §28.9 item 5.
+
+### 85.4 Popups and menus (§78.4, §78.5)
+
+**Grabs are a stack** (`State::popup_grabs`, outermost first).
+
+* A click that ends outside every grab dismisses **all** of them, innermost
+  first, in one go. A click inside grab *i*, or inside a popup that hangs off
+  it, dismisses only the grabs above *i*. Stage 13 dismissed one level per click
+  and relied on the client destroying the popup to expose the next. A client
+  that does not destroy on `popup_done` left the outer menu up, and WLCS's
+  client does not.
+* The innermost grab that hangs off the focused toplevel **takes the
+  keyboard**. `keyboard_focus` stays what Windows says, the `HWND` with
+  `WM_SETFOCUS`. The surface smithay is told is `keyboard_target()`, and it
+  goes back to the next grab or to the toplevel when the grab ends.
+* A new toplevel ends every grab, and so does the grab's toplevel losing
+  activation. On Windows that is a click in another application, which this
+  compositor never sees as a click, so a menu stayed open over whatever the
+  user had switched to.
+* **Reactive popups** (`set_reactive`) are reconstrained every turn against
+  their parent's bounds. A change gets a bare `configure`, with no
+  `repositioned`, and a `MovePopup`.
+* **On Win32 every owned popup now follows its owner.** An owned `WS_POPUP`
+  does not move with its owner, and `xdg_popup` is positioned relative to its
+  parent, so a menu open while its window moved stayed where the window had
+  been. `WM_WINDOWPOSCHANGED` now puts each mapped popup back at its offset.
+  This is compiled and checked for Windows; it was not run on Windows, and
+  Wine's virtual desktop gave no move to test it with.
+
+**Moves and resizes hand the pointer over.** `xdg_toplevel.move`/`resize` now
+sends the client `leave`, unsets smithay's click grab and empties its pressed
+set (`hand_pointer_to_platform`). `SC_MOVE`'s modal loop eats the
+`WM_LBUTTONUP`, so the implicit click grab used to outlive the move. Every
+motion over another surface of ours then went to the dragged window until the
+next click. That follows from smithay's `ClickGrab` and was not observed on the
+guest. `win32.rs` also resets its capture count, for the same reason. The
+stand-in (`control.rs`) now runs the gesture the way the modal loop does. It
+starts only while a button is held, moves or resizes with the pointer, sends
+nothing to the client meanwhile, eats the release and re-enters wherever the
+pointer is. §64's four "headless has no window manager" excuses are gone; all
+four pass.
+
+**`vendor/smithay`, two fixes.** A zero-size anchor rectangle is legal: the
+protocol raises `invalid_input` for a *negative* one. A subsurface position is
+now the parent's *committed* state. §68 kept one stage where the protocol has
+two, so a sync middle level moved its children whenever the grandparent
+committed, whether it had committed itself or not.
+
+**Reference run.** Mir 2.29 (nixpkgs `mir`, `miral_wlcs_integration.so`,
+under the wlcs 1.8.1 built against the same nixpkgs) on the five remaining
+subsurface failures:
+
+| test | Mir 2.29 | here |
+|---|---|---|
+| `subsurface_with_sync_parent_does_not_move_when_only_grandparent_committed` | pass | **pass** (was fail) |
+| `subsurface_does_not_move_when_grandparent_commit_is_before_sync_parent_commit` | pass | **pass** (was fail) |
+| `place_above_simple` | fail, first assertion | fail, second assertion |
+| `place_below_simple` | fail, first assertion | fail, second assertion |
+| `subsurface_extends_parent_input_region` | fail, "bad optional access" | fail, the same |
+
+Mir also lists all three failures in its `expected_wlcs_failures.list`. The two
+restacking tests are now in `wc-wlcs.sh`'s expected table, headless only, with
+that reason. Here the first assertion (the restack took effect) passes and the
+second asserts that the restacked subsurface is not on top either.
+`subsurface_extends_parent_input_region` stays a debt. Failing it the same way
+as Mir is not an explanation.
+
+**WLCS headless:**
+
+| | before (master dff9e3b) | after |
+|---|---|---|
+| passed / failed / skipped | 416 / 50 / 759 | **428 / 38 / 759** |
+| expected on this leg | 30 | 28 (26 §45.4, 2 above) |
+| debts | 20 | **10** |
+| `XdgPopupStable/XdgPopupTest` + `XdgPopupTest` | 6 / 6 | 12 / 0 |
+| `XdgShellStableSubsurfaces` | 19 / 5 | 21 / 3 |
+
+**WLCS Wine leg: 27 passed, 8 failed** of its 35. There is no same-tree master
+run to compare it with: §26's table had 22 / 13 on a far older tree. The eight
+are the clipboard pair, `test_truncated_shm_file`, the decoration orphan, the
+unconfigured-buffer error, and three `XdgToplevelStableConfigurationTest` cases
+(`defaults` is the size §26 said the platform really configures). The leg's
+table also flags 26 "stale" entries: the §45.4 rows apply to tests this leg
+filters out. That is the harness and is not new. The dev shell's
+`WINEPREFIX=/tmp/wc-wineprefix` cannot be created on this machine (`'/tmp' is
+not owned by you`). With a fresh prefix the first run times out every test
+while `wineboot` builds it. The run above used a pre-built prefix.
+
+**Firefox's menus under Wine.** A right-click menu, Down twice, Escape, then
+Alt, V, Down, Right for View ▸ Sidebar ▸ …, then one click on the page.
+Measured from the compositor's log: **Firefox called `xdg_popup.grab` zero
+times** over four popups. Its menus are driven from the main window's keyboard,
+so the grab work above changes nothing for Firefox's own menus. It matters for
+GTK clients and for the protocol. One click on the page destroyed both levels
+of View ▸ Sidebar (windows 4 and 3, in that order). A visual check by a separate agent
+(`docs/firefox-polish/menu-context-open.png`, `menu-context-down2.png`,
+`menu-view-submenu.png`, `menu-dismissed-one-click.png`) found the context menu at the click
+point, one item highlighted after Down ×2 (the bookmark star, consistent with
+the disabled Back and Forward being skipped), the submenu attached at the right
+edge level with its row, and no menus left after either click. It also found a
+**4–5 px black frame round every menu**, which is §18.5's transparent margin
+drawn opaque. On the guest `UpdateLayeredWindow` composites that margin away.
+Under Wine's virtual desktop on Xvfb it does not, and the cause was not
+pinned down. §18.5's guest photograph is the evidence that the guest is right.
+
+### 85.5 Title and taskbar with Firefox
+
+Under a Wine **shell** desktop (`explorer /desktop=shell,…`, which draws a
+taskbar), with Firefox on two tabs, "Alpha page" and "Beta page ünï", it ran
+`ctrl+Tab` twice. Each switch logged `window 1 title -> "… — Mozilla Firefox"`,
+and `wc-desk windows` read the same string back through `GetWindowTextW`
+(Alpha, Beta, Alpha). The visual check read the taskbar button as "Alpha page
+— Mozilla Fir…", then "Beta page ünï — Mozilla …" with both diaeresis marks,
+then Alpha again (`docs/firefox-polish/title-alpha.png`, `title-beta.png`). Alt-Tab and the taskbar both take the window text, which is
+what `SetWindowTextW` sets. **Alt-Tab itself was not photographed.**
+
+The icon: the compositor logged `icon <- 3 image(s) published for "firefox"`
+and `WM_SETICON` big 32×32 and small 16×16. The Wine taskbar button showed
+**no icon**. A control settles that it is Wine: Notepad, in the same kind of
+desktop, has no icon on its taskbar button either, but has one in its caption.
+So Wine cannot answer this question. The taskbar photograph with Firefox is a
+guest run (85.10).
+
+### 85.6 Cursor shapes with Firefox
+
+From the 10-minute stress's log (Wine), the shape names Firefox sent over
+`wp_cursor_shape_v1` and what they became: `pointer (IDC_HAND)` ×19,
+`text (IDC_IBEAM)` ×54, `default (IDC_ARROW)` ×92, `ns-resize`/`s-resize
+(IDC_SIZENS)` ×9, `grab (IDC_HAND)` ×6, `crosshair` ×5, `help` ×3, `wait` ×1,
+and 18 buffer cursors through `wl_pointer.set_cursor`. **No photograph:** `xwd`
+does not capture the X cursor, and §23.7 records that `GetCursorInfo` kills the
+probe under Wine. The resize arrows at a window's own edges come from
+`DefWindowProc` on the Windows frame, not from Firefox, and Wine is not
+evidence for them. Guest command in 85.10.
+
+### 85.7 Session lifecycle, and two applications on one arena
+
+`wc-compositor --exit-when-empty <secs>` (`EmptyWatch`) ends the process once
+three things hold:
+
+1. it has had a toplevel;
+2. it has had none for `secs`, with no client connecting in that time;
+3. **no client is connected now.**
+
+A connecting client restarts the wait, because a click into an empty session
+starts an application that connects long before its first window. Under
+`--exit-when-empty` the `--timeout` deadline also waits for the clients to
+go, and says so once. Both follow from 85.3: ending a session under a
+connected Firefox is a crash report.
+
+`wc-launch` passes `[session] linger-secs` (default 60), and `supervise()`
+already tears the relay, the tunnel and the host side down when the compositor
+exits. So the session stops holding the arena (§28.9 item 9). A click that
+joins a session as it ends now waits for the old owner to let go and starts a
+new one, once. That launcher path is compiled for Windows and is clippy-clean.
+It was not run, because it runs only on the guest.
+
+Measured under Wine with Firefox and `--exit-when-empty 10`: `ctrl+q`, six
+disconnects, the toplevel destroyed, and the compositor gone **11.7 s** after
+the keystroke with the new line.
+
+**Two applications, one session, one arena** (Wine; the file-arena fixture,
+`SV_ALLOW_FILE_ARENA=1`, as `wc-firefox.sh wine-arena` uses it): Firefox, then
+`weston-terminal`, both through one `wc-proxy --transport arena` into one
+compositor.
+
+* Two toplevels, with app ids `firefox` and
+  `org.freedesktop.weston.wayland-terminal`.
+* Five connections joined arena 0, with 0 overflows and 0 refusals.
+* Closing the terminal left the session up.
+* Closing Firefox ended it after 9 s, with linger 8.
+
+**On screen, the second toplevel is solid black**
+(`docs/firefox-polish/two-apps-second-window-black.png`; the frame the
+compositor actually received is `two-apps-terminal-frame-dump.png`), whichever application it
+belongs to: Firefox's own second window from `window.open` is black too. The
+compositor received the right pixels (its frame dump shows the terminal's
+prompt). Instrumented, `WM_PAINT` arrived and `SetDIBitsToDevice` returned 441
+of 441 lines from a non-black buffer. **Master's `wc-compositor.exe` (dff9e3b)
+does the same**, so it is not a regression. The Wine-drawn caption of that
+window is black as well. That points below the blit, at Wine's virtual desktop.
+The cause was not found. On the guest §32 photographed two applications' windows
+side by side, drawn. A guest re-run with Firefox as one of the two is in 85.10.
+
+### 85.8 First frame
+
+Under Wine, from `exec firefox` to the compositor's first log line of each kind,
+three runs:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| first client connected | 0.06 s | 0.05 s | 0.06 s |
+| `xdg_toplevel` created | 1.09 s | 0.95 s | 0.96 s |
+| window mapped (first frame) | 1.09 s | 1.00 s | 1.02 s |
+
+So on the `wl_shm` path the compositor turns Firefox's first commit into a
+window in the same second, and the whole start is about one second. The ~15 s
+of §34/`docs/firefox-accel.md` is the **forwarded GPU present**: 216.9 ms per
+`vkQueuePresentKHR`, which is eleven 20 ms doorbell slices. That is
+`sv_transport::park`, not the compositor, and it belongs to the accel work.
+This run did not re-measure it on the guest.
+
+### 85.9 The gates
+
+On the merged tree (master 40935af, which includes 08cce06, merged in as
+3f611fa):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **98 binaries, 2770 passed, 0 failed**, 8 ignored (`CARGO_BUILD_JOBS=4`) |
+| `cargo clippy --workspace --all-targets` | exit 0; 27 warnings, none at a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-wlcs.sh headless` | **428 passed, 38 failed, 759 skipped**; 28 expected, 10 debts |
+| `scripts/wc-wlcs.sh wine` | 27 passed, 8 failed (before the merge; 85.4) |
+| `scripts/wc-vm-damage.sh linux` | 13 passed, 2 failed, §71.6's score (before the merge; 85.2) |
+
+The Wine runs in 85.3 to 85.8 used this branch's binaries before the merge. The
+merge brought in no compositor, proxy or `wc-handle` change.
+
+### 85.10 What is not proven, and the guest commands
+
+1. **The arena refusal on the guest.** No guest harness was re-run. The account
+   holds `SeLockMemoryPrivilege`, so `pinning=large-pages` is expected and the
+   growth path now rounds up. Check both with:
+   `WC_HOST=testhost scripts/wc-guest.sh all` (expect §84.2's 72/0 and
+   `pinning=large-pages` on every arena line, including any `grew arena`), and
+   `WC_HOST=testhost scripts/wc-desktop.sh damage`.
+2. **Whether "crashed Firefox" is 85.3's crash event.** On testhost, after a
+   reported crash, read
+   `~/.wc-launch/firefox/crashes/events/*`, or the profile `exec` names, and
+   grep `MozCrashReason`. "Error reading events from display" is this. Anything
+   else is a different bug.
+3. **Popups following their owner on Win32, and focus-loss dismissal.**
+   Neither had a Windows to run on: Wine's virtual desktop gave no window move
+   and no foreground change to test them with. Open a Firefox menu and drag the
+   window by its tab strip, then open a menu and click another application.
+4. **Moves releasing the click grab.** Derived from smithay's `ClickGrab`, not
+   observed: after dragging a Firefox window, hover a second Firefox window
+   without clicking. The tabs should light up.
+5. **Taskbar icon and Alt-Tab with Firefox:**
+   `WC_HOST=testhost WC_CLIENT=firefox WC_APP_ID=firefox WC_CLIENT_CMD='env -u DISPLAY MOZ_ENABLE_WAYLAND=1 firefox --no-remote --profile /tmp/wcicon-ff about:blank' scripts/wc-icon.sh all`
+   (the photograph), and for Alt-Tab a capture taken while holding Alt-Tab
+   through the scheduler, which no harness does yet.
+6. **Cursors:** `scripts/wc-cursor.sh` on the guest has the `GetCursorInfo`
+   reading Wine kills (§23.7). With Firefox over a link, text and the window
+   edge, that is the photograph 85.6 could not take.
+7. **Two applications with Firefox on the guest:** `wc-taskbar.sh apps` runs
+   `$WC_HOST_WESTON/$WC_APP_A`, so point `WC_HOST_WESTON` at a directory holding
+   both `firefox` and `weston-flower` (a directory of two symlinks), then
+   `WC_HOST=testhost WC_HOST_WESTON=<that dir> WC_APP_A=firefox WC_APP_A_ID=firefox WC_APP_A_ICON=firefox scripts/wc-taskbar.sh apps`.
+   This would also show whether the black second window of 85.7 is Wine's.
+8. **The session end, from the launcher.** Double-click the Firefox shortcut,
+   close Firefox, and after `linger-secs` read the launcher log for
+   `the compositor exited` and `session down`.
+9. **`subsurface_extends_parent_input_region`**, `CopyCutPaste`'s sink-focus
+   case and the rest of the 10 headless debts are unchanged.
+10. **§28.6's start-up segfaults** remain unexplained.
+11. **The black frame round menus under Wine** (85.4) is attributed to Wine by
+    §18.5's guest photograph, not by a run here.

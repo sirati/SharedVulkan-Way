@@ -17,6 +17,10 @@
 /// the floor the size of the thing that actually has to stay.
 #[test]
 fn an_uncommitted_id_commits_a_region_whose_whole_extent_is_the_window() {
+    // §85: no hypervisor here, so nothing outside can write a moved page; and
+    // this machine reserves no hugetlb pages. Without this the commit below
+    // is refused and the test would skip instead of running.
+    wc_handle::arena::allow_small_pages_that_may_corrupt_guest_memory();
     const LEN: u64 = 256 << 10;
     let id = 9_500;
     let w = match wc_handle::arena::reserve_outbound(id, LEN) {

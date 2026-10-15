@@ -179,15 +179,35 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
 /// stays 4096 whatever the allocator did (shared_vulkan docs/waycompose-design.md §5.1).
 pub const REGION_PAGE: usize = 4096;
 
-/// Commit `len` bytes of this process's own memory, pin them, and let the caller
-/// stamp every 4096-byte page before the region is handed back read-only.
+/// What [`alloc_locked_region`] made. See the Windows twin.
+pub struct LockedRegion {
+    pub view: MappedView,
+    pub len: usize,
+    pub locked: bool,
+    pub pinning: &'static str,
+}
+
+/// Commit at least `len` bytes of this process's own memory, pin them, and let
+/// the caller stamp every 4096-byte page before the region is handed back
+/// read-only.
 ///
 /// STAGE 7. The Windows implementation is the shipping one — a guest-RAM arena
 /// only means anything inside the VM — and this is its Unix twin, for the same
 /// reason every other function in this file has one: it is what makes the path
-/// testable on the machine that builds it. `mmap(MAP_ANONYMOUS)` for
-/// `VirtualAlloc`, `mlock` for `VirtualLock`, the same stamping loop, the same
-/// "locked is a report and not a requirement" contract.
+/// testable on the machine that builds it, and it is what `wc-release-vm.sh`
+/// runs inside a Linux guest.
+///
+/// §85: the same rule as on Windows. `mlock` is `VirtualLock`'s twin in the way
+/// that matters: it keeps pages resident and Linux still migrates them
+/// (compaction moves mlocked pages unless `vm.compact_unevictable_allowed` is 0),
+/// so it is the diagnostic path, taken only when asked for by name. The default
+/// is `MAP_HUGETLB`, from the pool `vm.nr_hugepages` reserves: those pages are
+/// never swapped and kcompactd does not move them. They can still be migrated by
+/// an explicit operation (memory offlining, a contiguous allocation that asks
+/// for it), so this is the stronger of the two Linux pinnings and **not** a
+/// measured equivalent of Windows' large pages; nothing in §84 or §85 measured a
+/// Linux guest. With no hugetlb pages reserved, which is the default, this
+/// refuses and the message says how to reserve them.
 ///
 /// It is **not** a mock. What it cannot reproduce is the only part that matters
 /// on the guest — that these pages are inside a VM and findable from outside it
@@ -196,28 +216,44 @@ pub const REGION_PAGE: usize = 4096;
 /// lifetime, which are where the ordinary bugs live.
 pub fn alloc_locked_region(
     len: usize,
+    small_pages_diagnostic: bool,
     stamp: &dyn Fn(u32, &mut [u8]),
-) -> io::Result<(MappedView, bool, &'static str)> {
+) -> io::Result<LockedRegion> {
     if len == 0 || !len.is_multiple_of(REGION_PAGE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
         ));
     }
+    let (len, flags) = if small_pages_diagnostic {
+        (len, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS)
+    } else {
+        let huge = hugetlb_page_size();
+        let rounded = len.div_ceil(huge).checked_mul(huge).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "arena too large")
+        })?;
+        (rounded, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB)
+    };
     // SAFETY: an anonymous mapping with a null address hint and a length checked
     // non-zero above; no descriptor is involved. The result is checked.
     let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
     };
     if ptr == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        if small_pages_diagnostic {
+            return Err(e);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::arena::refusal_text(&format!(
+                "mmap(MAP_HUGETLB, {len} bytes) failed: {e} (reserve {} pages of {} KiB with \
+                 `sysctl vm.nr_hugepages=N`; this machine has {} free)",
+                len / hugetlb_page_size(),
+                hugetlb_page_size() / 1024,
+                hugetlb_free().map_or("an unknown number".into(), |n| n.to_string()),
+            )),
+        ));
     }
     // Owns the mapping from here, so every early return unmaps it.
     let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
@@ -227,11 +263,31 @@ pub fn alloc_locked_region(
     for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
         stamp(i as u32, page);
     }
+    if !small_pages_diagnostic {
+        // hugetlb pages are faulted in by the stamps above and never swapped.
+        return Ok(LockedRegion { view, len, locked: true, pinning: "hugetlb" });
+    }
     // Best effort, exactly as on Windows: `RLIMIT_MEMLOCK` is small for an
     // ordinary account and a region that is merely resident is still a region.
     // SAFETY: the mapping is live and `len` bytes long.
     let locked = unsafe { libc::mlock(ptr, len) } == 0;
-    Ok((view, locked, if locked { "mlock" } else { "none" }))
+    Ok(LockedRegion { view, len, locked, pinning: if locked { "mlock" } else { "none" } })
+}
+
+/// `Hugepagesize:` from `/proc/meminfo`, which is the size `MAP_HUGETLB` with
+/// no size bits uses; 2 MiB when it cannot be read.
+fn hugetlb_page_size() -> usize {
+    meminfo_kib("Hugepagesize:").map_or(2 << 20, |k| k as usize * 1024)
+}
+
+fn hugetlb_free() -> Option<u64> {
+    meminfo_kib("HugePages_Free:")
+}
+
+fn meminfo_kib(key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with(key))?;
+    line[key.len()..].split_whitespace().next()?.parse().ok()
 }
 
 /// Create an object named by a filesystem path.
