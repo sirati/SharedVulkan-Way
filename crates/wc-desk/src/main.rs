@@ -142,7 +142,7 @@ usage: wc-desk <command> [options]
   hittest --pid N --at X,Y [--at X,Y ...]
                            WM_NCHITTEST at window-relative points; a negative
                            coordinate counts from the right or bottom edge
-  mouse --pid N [--drag A B] [--click A] [--dblclick A] [--step-ms N]
+  mouse --pid N [--drag A B] [--click A] [--dblclick A] [--hover A MS] [--step-ms N]
                            real input through SendInput, the window rectangle
                            printed before and after each gesture
 
@@ -1254,6 +1254,18 @@ usage: wc-desk <command> [options]
                     pause(1200);
                     say(if times == 2 { "after-dbl" } else { "after-clk" }, &rect());
                     i += 2;
+                }
+                // Park the pointer and wait, with no button down: what raises
+                // Windows 11's snap-layouts flyout over a maximise button. The
+                // flyout is a window of the shell's, so `shot --screen` taken
+                // during the wait is what photographs it.
+                "--hover" if i + 2 < args.len() => {
+                    let (x, y) = at(&args[i + 1], &r)?;
+                    let ms: u64 = args[i + 2].parse().unwrap_or(1500);
+                    send_mouse(x, y, 0);
+                    println!("mouse.hover      {},{} for {ms} ms", x, y);
+                    pause(ms);
+                    i += 3;
                 }
                 _ => i += 1,
             }

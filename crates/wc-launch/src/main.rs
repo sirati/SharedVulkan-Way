@@ -143,6 +143,16 @@ fn main() -> ExitCode {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // §82. `--write-firefox-profile TITLEBAR DPI DIR [PREFS]`: write the
+    // `user.js` and `chrome/userChrome.css` a launch would send, into DIR, and
+    // nothing else. On every platform and before any configuration is read,
+    // because its callers are the harnesses that run Firefox against this
+    // compositor on Linux and under Wine — and a harness that wrote its own copy
+    // of the sheet would be testing the copy.
+    if let Some(i) = args.iter().position(|a| a == "--write-firefox-profile") {
+        return write_firefox_profile(&args[i + 1..]);
+    }
+
     // The session name is needed before the configuration can be read, because
     // the log the configuration's errors go into is named after it. It is the
     // default unless `--session-name` says otherwise.
@@ -189,6 +199,47 @@ fn main() -> ExitCode {
         Err(e) => {
             log.say(&format!("failed: {e}"));
             ExitCode::from(1)
+        }
+    }
+}
+
+fn write_firefox_profile(a: &[String]) -> ExitCode {
+    let (Some(t), Some(dpi), Some(dir)) = (a.first(), a.get(1), a.get(2)) else {
+        eprintln!("wc-launch: --write-firefox-profile TITLEBAR DPI DIR [PREFS]");
+        return ExitCode::from(2);
+    };
+    let Some(t) = plan::Titlebar::parse(t) else {
+        eprintln!("wc-launch: titlebar {t:?} is not one of tabs, none, client");
+        return ExitCode::from(2);
+    };
+    let Ok(dpi) = dpi.parse::<u32>() else {
+        eprintln!("wc-launch: dpi {dpi:?} is not a number");
+        return ExitCode::from(2);
+    };
+    let dir = std::path::Path::new(dir);
+    let fit = plan::TitlebarFit::at(dpi, None);
+    let prefs = a.get(3).map(String::as_str).unwrap_or("");
+    let wrote = std::fs::create_dir_all(dir.join("chrome"))
+        .and_then(|()| std::fs::write(dir.join("user.js"), plan::app_user_js(t, prefs)))
+        .and_then(|()| match plan::user_chrome_css(t, fit) {
+            Some(css) => std::fs::write(dir.join("chrome/userChrome.css"), css),
+            None => Ok(()),
+        });
+    match wrote {
+        Ok(()) => {
+            println!(
+                "wc-launch: wrote {:?}'s profile for {} at {dpi} dpi: caption {} px, buttons {} px, env MOZ_GTK_TITLEBAR_DECORATION={}",
+                t,
+                dir.display(),
+                fit.height,
+                fit.reserve,
+                t.moz_env()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("wc-launch: {}: {e}", dir.display());
+            ExitCode::from(2)
         }
     }
 }
