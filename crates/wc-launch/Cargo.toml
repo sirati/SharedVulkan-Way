@@ -25,4 +25,7 @@ windows-sys = { workspace = true, features = [
   # name is not (§16.8) and which a probe of the compositor's own socket must
   # not be (§17.4: the first client releases the held keymap).
   "Win32_System_Threading",
+  # §82: `LoadLibraryW` and `GetProcAddress`, for the DPI entry points that
+  # size Firefox's tab strip to Windows' caption. Resolved, not linked.
+  "Win32_System_LibraryLoader",
 ] }

@@ -135,7 +135,42 @@ fn emit_link_enum(plan: &Plan) -> TokenStream {
     }
 }
 
+/// The link types `keep` admits, in `sType` order, for a dispatch table that
+/// `sv_wire::pnext_table_lookup` binary-searches.
+///
+/// Two link types sharing an `sType` would make the table ambiguous. The
+/// registry never does that, so it is a generator failure rather than a choice
+/// to make quietly.
+pub fn table_order(
+    links: &[(String, i64)],
+    keep: impl Fn(&str) -> bool,
+) -> Vec<(&str, i32)> {
+    let mut v: Vec<(&str, i32)> =
+        links.iter().filter(|(n, _)| keep(n)).map(|(n, s)| (n.as_str(), *s as i32)).collect();
+    v.sort_by_key(|e| e.1);
+    for w in v.windows(2) {
+        assert!(w[0].1 != w[1].1, "{} and {} share sType {}", w[0].0, w[1].0, w[0].1);
+    }
+    v
+}
+
 fn emit_walkers(plan: &Plan) -> TokenStream {
+    // **No walker here may hold a per-link temporary in its own frame**, and the
+    // reason is stack (docs/design.md §0.27).
+    //
+    // A `match` with one arm per link type compiles, in a debug build, to a
+    // frame holding *every* arm's temporaries side by side: a debug build does
+    // not overlap the slots of mutually exclusive arms. §0.24 moved each arm's
+    // struct into an `#[inline(never)]` helper and measured 180 KB → 20 KB; the
+    // `?` on each arm's result still cost a slot per arm, and with the link
+    // count of the `full` profile the frame was back at **145 KB**
+    // (`decode_pnext`) and **123 KB** (`encode_pnext`). A Firefox WebRender
+    // thread has 256 KiB of stack in all.
+    //
+    // So: the sType-keyed walkers look their helper up in a sorted table of
+    // function pointers and call it once, and the variant-keyed ones go through
+    // a body function whose every arm is a plain tail call — the shape
+    // `size_pnext_body` always had, and the one that measured small.
     let size_arms = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let f = super::wire::size_self_fn(name);
@@ -154,7 +189,7 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
     let encode_arms = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let f = super::wire::encode_self_fn(name);
-        quote!(PNextLink::#v(inner) => #f(enc, inner)?,)
+        quote!(PNextLink::#v(inner) => #f(enc, inner),)
     });
     let encode_partial_arms = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
@@ -164,27 +199,10 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
         } else {
             super::wire::encode_self_fn(name)
         };
-        quote!(PNextLink::#v(inner) => #f(enc, inner)?,)
+        quote!(PNextLink::#v(inner) => #f(enc, inner),)
     });
-    // **One `#[inline(never)]` helper per link, and the reason is stack.**
-    //
-    // As `#val => PNextLink::V(Box::new(decode_x(&mut body)?)),` every arm
-    // materialises its struct as a temporary *in `decode_pnext`'s own frame*
-    // before the `Box` moves it to the heap. A debug build does not overlap the
-    // slots of mutually exclusive match arms, so the frame is the **sum** of a
-    // thousand link types rather than the largest — measured from a Firefox
-    // core at **180 KB in one frame** (docs/design.md §0.24).
-    //
-    // Firefox reaches this on a Mesa thread, under `kopper_init_screen`, with
-    // twenty frames already below it, and a worker thread's stack is a few
-    // hundred kilobytes. So the decoder overflowed the stack and Firefox took
-    // SIGSEGV in a crate that is `#![forbid(unsafe_code)]` — which is what said
-    // it could not be a wild pointer and had to be exhaustion.
-    //
-    // Moving each arm into its own function makes `decode_pnext`'s frame a
-    // handful of words and each link's temporary transient: the helper's frame
-    // is popped before the next link is read. `#[inline(never)]` is what keeps
-    // that true against an optimiser that would otherwise undo it.
+    // One `#[inline(never)]` helper per link, so that each link's struct is a
+    // temporary of the helper's frame and is popped before the next is read.
     let decode_helpers = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let f = super::wire::decode_self_fn(name);
@@ -198,12 +216,6 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
             }
         }
     });
-    let decode_arms = plan.pnext_links.iter().map(|(name, value)| {
-        let helper = format_ident!("decode_link_{}", naming::snake_case(name));
-        let val = *value as i32;
-        quote!(#val => #helper(&mut body)?,)
-    });
-    // The partial walk has the same frame problem and the same fix.
     let decode_partial_helpers = plan.pnext_links.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
         let has_partial = plan.struct_plan(name).map(|s| s.needs_partial).unwrap_or(false);
@@ -220,15 +232,36 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
             }
         }
     });
-    let decode_partial_arms = plan.pnext_links.iter().map(|(name, value)| {
+    let order = table_order(&plan.pnext_links, |_| true);
+    let n = order.len();
+    let decode_rows = order.iter().map(|(name, val)| {
+        let helper = format_ident!("decode_link_{}", naming::snake_case(name));
+        quote!((#val, #helper as DecodeLinkFn),)
+    });
+    let decode_partial_rows = order.iter().map(|(name, val)| {
         let helper = format_ident!("decode_link_partial_{}", naming::snake_case(name));
-        let val = *value as i32;
-        quote!(#val => #helper(&mut body)?,)
+        quote!((#val, #helper as DecodeLinkFn),)
     });
 
     quote! {
         #(#decode_helpers)*
         #(#decode_partial_helpers)*
+
+        /// One link's decoder, as a table entry.
+        type DecodeLinkFn = fn(&mut sv_wire::Decoder<'_>) -> sv_wire::Result<PNextLink>;
+
+        /// Every link's full decoder, sorted by `sType` (docs/design.md §0.27).
+        static DECODE_LINKS: [(i32, DecodeLinkFn); #n] = [#(#decode_rows)*];
+
+        /// Every link's partial decoder, in the same order.
+        static DECODE_LINKS_PARTIAL: [(i32, DecodeLinkFn); #n] = [#(#decode_partial_rows)*];
+
+        #[cfg(test)]
+        #[test]
+        fn pnext_decode_tables_are_sorted() {
+            assert!(sv_wire::pnext_table_is_sorted(&DECODE_LINKS));
+            assert!(sv_wire::pnext_table_is_sorted(&DECODE_LINKS_PARTIAL));
+        }
 
         /// Bytes a chain occupies, terminator included.
         pub fn size_pnext(links: &[PNextLink]) -> usize {
@@ -261,6 +294,27 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
             }
         }
 
+        /// One link's body. Every arm is a tail call, so no arm owns a slot.
+        fn encode_pnext_body(
+            enc: &mut sv_wire::Encoder<'_>,
+            link: &PNextLink,
+        ) -> sv_wire::Result<()> {
+            match link {
+                #(#encode_arms)*
+                PNextLink::Unknown { body, .. } => enc.packed_bytes(body),
+            }
+        }
+
+        fn encode_pnext_body_partial(
+            enc: &mut sv_wire::Encoder<'_>,
+            link: &PNextLink,
+        ) -> sv_wire::Result<()> {
+            match link {
+                #(#encode_partial_arms)*
+                PNextLink::Unknown { body, .. } => enc.packed_bytes(body),
+            }
+        }
+
         /// Write a chain.
         ///
         /// The length of each link is patched in after the body is written
@@ -275,10 +329,7 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
                 let patch = enc.reserve_u32()?;
                 let mark = enc.position();
                 enc.i32(link.s_type())?;
-                match link {
-                    #(#encode_arms)*
-                    PNextLink::Unknown { body, .. } => enc.packed_bytes(body)?,
-                }
+                encode_pnext_body(enc, link)?;
                 let written = enc.since(mark) as u32;
                 enc.patch_u32(patch, written);
             }
@@ -293,10 +344,7 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
                 let patch = enc.reserve_u32()?;
                 let mark = enc.position();
                 enc.i32(link.s_type())?;
-                match link {
-                    #(#encode_partial_arms)*
-                    PNextLink::Unknown { body, .. } => enc.packed_bytes(body)?,
-                }
+                encode_pnext_body_partial(enc, link)?;
                 let written = enc.since(mark) as u32;
                 enc.patch_u32(patch, written);
             }
@@ -308,47 +356,20 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
             dec: &mut sv_wire::Decoder<'_>,
             allowed: fn(i32) -> bool,
         ) -> sv_wire::Result<Vec<PNextLink>> {
-            let mut out = Vec::new();
-            loop {
-                let link_size = dec.u32()?;
-                if link_size == sv_wire::PNEXT_TERMINATOR {
-                    return Ok(out);
-                }
-                if link_size < 4 {
-                    return Err(sv_wire::WireError::PNextLengthMismatch {
-                        declared: link_size,
-                        consumed: 4,
-                    });
-                }
-                let mut link = dec.sub(link_size as usize)?;
-                let s_type = link.i32()?;
-                let mut body = link;
-                if !allowed(s_type) {
-                    out.push(unknown_or_fatal(dec.unknown_pnext_policy(), s_type, &mut body)?);
-                    continue;
-                }
-                let decoded = match s_type {
-                    #(#decode_arms)*
-                    _ => {
-                        out.push(unknown_or_fatal(
-                            dec.unknown_pnext_policy(), s_type, &mut body,
-                        )?);
-                        continue;
-                    }
-                };
-                if body.remaining() != 0 {
-                    return Err(sv_wire::WireError::PNextLengthMismatch {
-                        declared: link_size,
-                        consumed: link_size as usize - body.remaining(),
-                    });
-                }
-                out.push(decoded);
-            }
+            decode_pnext_with(dec, allowed, &DECODE_LINKS)
         }
 
         pub fn decode_pnext_partial(
             dec: &mut sv_wire::Decoder<'_>,
             allowed: fn(i32) -> bool,
+        ) -> sv_wire::Result<Vec<PNextLink>> {
+            decode_pnext_with(dec, allowed, &DECODE_LINKS_PARTIAL)
+        }
+
+        fn decode_pnext_with(
+            dec: &mut sv_wire::Decoder<'_>,
+            allowed: fn(i32) -> bool,
+            table: &[(i32, DecodeLinkFn)],
         ) -> sv_wire::Result<Vec<PNextLink>> {
             let mut out = Vec::new();
             loop {
@@ -365,19 +386,16 @@ fn emit_walkers(plan: &Plan) -> TokenStream {
                 let mut link = dec.sub(link_size as usize)?;
                 let s_type = link.i32()?;
                 let mut body = link;
-                if !allowed(s_type) {
+                let helper = if allowed(s_type) {
+                    sv_wire::pnext_table_lookup(table, s_type)
+                } else {
+                    None
+                };
+                let Some(helper) = helper else {
                     out.push(unknown_or_fatal(dec.unknown_pnext_policy(), s_type, &mut body)?);
                     continue;
-                }
-                let decoded = match s_type {
-                    #(#decode_partial_arms)*
-                    _ => {
-                        out.push(unknown_or_fatal(
-                            dec.unknown_pnext_policy(), s_type, &mut body,
-                        )?);
-                        continue;
-                    }
                 };
+                let decoded = helper(&mut body)?;
                 if body.remaining() != 0 {
                     return Err(sv_wire::WireError::PNextLengthMismatch {
                         declared: link_size,

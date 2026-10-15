@@ -591,10 +591,6 @@ fn wire_default(shape: &Shape) -> TokenStream {
     }
 }
 
-fn lower_struct_fn(name: &str) -> proc_macro2::Ident {
-    // Kept for the app side; a full-lowering context goes through `Ctx::lower_fn`.
-    format_ident!("lower_{}", naming::snake_case(name))
-}
 fn lower_out_struct_fn(name: &str) -> proc_macro2::Ident {
     format_ident!("lower_out_{}", naming::snake_case(name))
 }
@@ -2967,50 +2963,139 @@ fn emit_tables(cx: &Ctx<'_>, refused: &BTreeSet<String>) -> TokenStream {
     }
 }
 
-fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
-    let cx = lower_cx;
-    // **One `#[inline(never)]` helper per link, for the stack.**
-    //
-    // The same defect as `sv_proto::decode_pnext`'s (docs/design.md §0.24) and
-    // it survived that fix because it is a different crate: as
-    // `#val => PNextLink::V(Box::new(lower_x(__p as *const T)?)),` every arm
-    // materialises its struct as a temporary **in `lower_pnext`'s own frame**
-    // before the `Box` moves it to the heap, and a debug build does not overlap
-    // the slots of mutually exclusive match arms — so the frame is the *sum* of
-    // a thousand link types rather than the largest.
-    //
-    // It is worse here than on the decode side, because this one **nests**: a
-    // chain parent that is itself a link — `VkPhysicalDeviceFeatures2` inside
-    // `VkDeviceCreateInfo`'s chain, which is exactly what Zink sends — puts two
-    // of these frames on the stack at once. Firefox reaches it on a Mesa thread
-    // with twenty frames already below.
-    let lower_helpers = cx.wire.pnext_links.iter().filter_map(|(name, _)| {
-        if !lower_cx.shared.contains(name) {
-            return None;
-        }
+/// The C → wire `pNext` walker: `lower_pnext`, or `lower_full_pnext` in a
+/// full-lowering context, with one helper per link and the table that finds it.
+///
+/// # Two properties, both for the stack (docs/design.md §0.27)
+///
+/// **The walker's frame does not grow with the number of link types.** As a
+/// `match` with an arm per link, a debug build gives every arm's temporaries
+/// their own slot: §0.24 moved each arm's struct into a helper and the frame
+/// was still **140 KB**, because each arm's `?` kept one. Firefox's WebRender
+/// thread has 256 KiB in all. The walker now looks the helper up in a sorted
+/// table of function pointers and calls it once.
+///
+/// **The walk does not nest.** Every link type's `lower_*` lowers its own
+/// `pNext` member, so the old helper — which called it on the application's
+/// link — walked the rest of the chain again from each link, under that link's
+/// own membership predicate. For most links the predicate admits nothing and
+/// the inner walk only costs a frame; for a link that is itself a parent it
+/// re-lowers the whole tail one level down. Zink's `VkPhysicalDeviceFeatures2`
+/// inside `VkDeviceCreateInfo` is exactly that, so the walk was three walker
+/// frames deep, and every tail but the outermost was thrown away because the
+/// wire's links are flat and encode with their `_self` form (§0.19 item 10
+/// recorded the waste). The helper lowers a **copy** of the link with `pNext`
+/// cut, which is the whole of what the wire keeps, so no walker frame is ever
+/// under another.
+///
+/// The copy is a plain read of the link's C struct: the walker already reads
+/// every member of it, and the specification makes the whole struct valid for
+/// reads for the duration of the call.
+pub(crate) fn emit_lower_walker(cx: &Ctx<'_>) -> TokenStream {
+    let full = cx.lower_full;
+    let prefix = if full { "lower_full_link_" } else { "lower_link_" };
+    let order = crate::emit::pnext::table_order(&cx.wire.pnext_links, |n| cx.shared_struct(n));
+    let helpers = order.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
-        let f = lower_struct_fn(name);
+        let f = cx.lower_fn(name);
         let ty = naming::type_ident(name);
-        let helper = format_ident!("lower_link_{}", naming::snake_case(name));
-        let doc = format!("One `{name}` link, lowered in its own frame.");
-        Some(quote! {
+        let helper = format_ident!("{prefix}{}", naming::snake_case(name));
+        let doc = format!("One `{name}` link, lowered in its own frame with its `pNext` cut.");
+        quote! {
             #[doc = #doc]
             #[inline(never)]
             unsafe fn #helper(
                 __p: *const core::ffi::c_void,
             ) -> crate::LowerResult<sv_proto::PNextLink> {
-                unsafe { Ok(sv_proto::PNextLink::#v(Box::new(#f(__p as *const #ty)?))) }
+                unsafe {
+                    let mut __c: #ty = core::ptr::read(__p as *const #ty);
+                    __c.p_next = core::ptr::null_mut::<core::ffi::c_void>() as _;
+                    Ok(sv_proto::PNextLink::#v(Box::new(#f(&__c)?)))
+                }
             }
-        })
-    });
-    let lower_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
-        if !lower_cx.shared.contains(name) {
-            return None;
         }
-        let helper = format_ident!("lower_link_{}", naming::snake_case(name));
-        let val = *value as i32;
-        Some(quote!(#val => #helper(__p)?,))
     });
+    let rows = order.iter().map(|(name, val)| {
+        let helper = format_ident!("{prefix}{}", naming::snake_case(name));
+        quote!((#val, #helper as LowerLinkFn),)
+    });
+    let n = order.len();
+    let walker = cx.lower_pnext_fn();
+    let table = if full { format_ident!("LOWER_FULL_LINKS") } else { format_ident!("LOWER_LINKS") };
+    let test = format_ident!("{}_table_is_sorted", walker);
+    let (doc, safety) = if full {
+        (
+            "Walk a C `pNext` chain the **driver** filled in into wire links.",
+            "`head` is null or the chain this side raised and handed to the driver, \
+             so every link is a struct of our own allocation whose `sType` we set.",
+        )
+    } else {
+        (
+            "Walk a C `pNext` chain into the wire's flat, length-prefixed form.\n\n\
+             `allowed` is the generated per-parent membership predicate. A link \
+             whose `sType` the parent does not accept, or that this build does not \
+             know, is **dropped and the walk continues** — docs/design.md §6.1's \
+             asymmetry: \"the app side silently drops unknown links and continues \
+             down `pNext`; the GPU side treats one as fatal\".",
+            "`head` is null or points at a chain of `VkBaseInStructure`-prefixed \
+             structs, each of which lives for the duration of the call. That is the \
+             Vulkan specification's contract; the loop bound below is not part of \
+             it, and exists so that a cyclic chain is an error rather than a hang.",
+        )
+    };
+    let doc = format!("{doc}\n\n# Safety\n{safety}");
+    quote! {
+        #(#helpers)*
+
+        #[doc = "Every link's lowering, sorted by `sType` (docs/design.md §0.27)."]
+        static #table: [(i32, LowerLinkFn); #n] = [#(#rows)*];
+
+        #[cfg(test)]
+        #[test]
+        fn #test() {
+            assert!(sv_wire::pnext_table_is_sorted(&#table));
+        }
+
+        #[doc = #doc]
+        pub unsafe fn #walker(
+            head: *const core::ffi::c_void,
+            allowed: fn(i32) -> bool,
+        ) -> crate::LowerResult<Vec<sv_proto::PNextLink>> {
+            let mut out = Vec::new();
+            let mut __p = head;
+            let mut __guard = 0usize;
+            while !__p.is_null() {
+                __guard += 1;
+                if __guard > crate::MAX_PNEXT_LINKS {
+                    return Err(crate::LowerError::ChainTooLong);
+                }
+                let __base = __p as *const VkBaseInStructure;
+                let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
+                if allowed(__s_type)
+                    && let Some(__f) = sv_wire::pnext_table_lookup(&#table, __s_type)
+                {
+                    out.push(unsafe { __f(__p)? });
+                }
+                __p = __next as *const core::ffi::c_void;
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// The type every generated `lower_*link_*` helper has, as a table entry.
+fn emit_lower_link_fn_type() -> TokenStream {
+    quote! {
+        /// One link's lowering, as a `pNext` dispatch-table entry.
+        type LowerLinkFn =
+            unsafe fn(*const core::ffi::c_void) -> crate::LowerResult<sv_proto::PNextLink>;
+    }
+}
+
+fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
+    let cx = lower_cx;
+    let lower_walker = emit_lower_walker(lower_cx);
+    let link_fn_type = emit_lower_link_fn_type();
     let store_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
         if !store_cx.shared.contains(name) {
             return None;
@@ -3024,18 +3109,40 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
         })
     });
 
-    // The tag-only arms: the same links, with no contents read.
-    let tag_arms = cx.wire.pnext_links.iter().filter_map(|(name, value)| {
-        if !lower_cx.shared.contains(name) {
-            return None;
-        }
+    // The tag-only walk: the same links, with no contents read, through the same
+    // kind of table and for the same reason — as `match` arms each building a
+    // `Box<Default>` it was a 60 KB frame in a debug build.
+    let tag_order =
+        crate::emit::pnext::table_order(&cx.wire.pnext_links, |n| lower_cx.shared.contains(n));
+    let tag_helpers = tag_order.iter().map(|(name, _)| {
         let v = naming::pnext_variant(name);
-        let val = *value as i32;
-        Some(quote!(#val => sv_proto::PNextLink::#v(Box::new(Default::default())),))
+        let helper = format_ident!("tag_link_{}", naming::snake_case(name));
+        quote! {
+            #[inline(never)]
+            fn #helper() -> sv_proto::PNextLink {
+                sv_proto::PNextLink::#v(Box::default())
+            }
+        }
     });
+    let tag_rows = tag_order.iter().map(|(name, val)| {
+        let helper = format_ident!("tag_link_{}", naming::snake_case(name));
+        quote!((#val, #helper as fn() -> sv_proto::PNextLink),)
+    });
+    let tag_n = tag_order.len();
 
     quote! {
-        #(#lower_helpers)*
+        #link_fn_type
+        #lower_walker
+        #(#tag_helpers)*
+
+        /// Every link's tag-only form, sorted by `sType`.
+        static TAG_LINKS: [(i32, fn() -> sv_proto::PNextLink); #tag_n] = [#(#tag_rows)*];
+
+        #[cfg(test)]
+        #[test]
+        fn tag_links_table_is_sorted() {
+            assert!(sv_wire::pnext_table_is_sorted(&TAG_LINKS));
+        }
 
         /// Walk a `pNext` chain that is **output storage**, taking the tags and
         /// nothing else.
@@ -3076,56 +3183,10 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
                 }
                 let __base = __p as *const VkBaseInStructure;
                 let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
-                if allowed(__s_type) {
-                    let link = match __s_type {
-                        #(#tag_arms)*
-                        _ => { __p = __next as *const core::ffi::c_void; continue; }
-                    };
-                    out.push(link);
-                }
-                __p = __next as *const core::ffi::c_void;
-            }
-            Ok(out)
-        }
-
-        /// Walk a C `pNext` chain into the wire's flat, length-prefixed form.
-        ///
-        /// `allowed` is the generated per-parent membership predicate. A link
-        /// whose `sType` the parent does not accept, or that this build does not
-        /// know, is **dropped and the walk continues** — docs/design.md §6.1's
-        /// asymmetry: "the app side silently drops unknown links and continues
-        /// down `pNext`; the GPU side treats one as fatal".
-        ///
-        /// # Safety
-        /// `head` is null or points at a chain of `VkBaseInStructure`-prefixed
-        /// structs, each of which lives for the duration of the call. That is the
-        /// Vulkan specification's contract; the loop bound below is not part of
-        /// it, and exists so that a cyclic chain is an error rather than a hang.
-        pub unsafe fn lower_pnext(
-            head: *const core::ffi::c_void,
-            allowed: fn(i32) -> bool,
-        ) -> crate::LowerResult<Vec<sv_proto::PNextLink>> {
-            let mut out = Vec::new();
-            let mut __p = head;
-            let mut __guard = 0usize;
-            while !__p.is_null() {
-                __guard += 1;
-                if __guard > crate::MAX_PNEXT_LINKS {
-                    return Err(crate::LowerError::ChainTooLong);
-                }
-                let __base = __p as *const VkBaseInStructure;
-                let (__s_type, __next) = unsafe { ((*__base).s_type.0, (*__base).p_next) };
-                if allowed(__s_type) {
-                    let link = unsafe {
-                        match __s_type {
-                            #(#lower_arms)*
-                            _ => {
-                                __p = __next as *const core::ffi::c_void;
-                                continue;
-                            }
-                        }
-                    };
-                    out.push(link);
+                if allowed(__s_type)
+                    && let Some(__f) = sv_wire::pnext_table_lookup(&TAG_LINKS, __s_type)
+                {
+                    out.push(__f());
                 }
                 __p = __next as *const core::ffi::c_void;
             }

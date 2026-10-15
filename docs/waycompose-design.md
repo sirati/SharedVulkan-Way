@@ -25178,3 +25178,389 @@ fits inside one process — create it, open it as the peer would, move bytes, ch
 which side got them — so here the evidence *is* a number in the suite. Neither
 answer is better than the other; what would be wrong is reporting one shape of
 evidence as though it were the other.
+
+## 82. Firefox's tabs in the title bar by default, and the first drag of a folded window
+
+### 82.1 Status in one paragraph
+
+Until this section Firefox reached Windows' caption only under `--decorations
+tabs`, a flag no deployment passes. The default `auto` treated Firefox as
+`Negotiated` and never folded it. The launcher hard-coded `titlebar = none`, and
+`wc-session` said the frame-extending compositor "does not exist yet", although
+§31 had built it. Now the defaults produce the goal clause end to end:
+`wc-launch` gives Firefox `MOZ_GTK_TITLEBAR_DECORATION=client`, preferences
+that turn off Firefox's own window buttons, and a `userChrome.css` that sizes
+its tab strip to Windows' caption and leaves the caption-button corner empty.
+The compositor's `auto` folds the caption of any window whose client *asked* to
+decorate itself. `titlebar = none` is the per-application opt-out.
+
+**Windows draws minimise, maximise and close, and Firefox draws none** (§82.3
+gives the evidence). The first real drag of a folded window found two defects
+in code that §22.7 and §45.11 had written and nobody had exercised, and one
+misdiagnosis of my own (§82.6):
+
+* `xdg_toplevel.move` entered the *keyboard* move;
+* GTK's maximise pushed the window off its monitor;
+* a "Wine parks maximised windows differently" fix, which was the second
+  defect seen from the wrong side and has been reverted.
+
+What was measured: Linux headless with Firefox 157 (11 passed, 0 failed) and
+Wine with real `SendInput` gestures (20 passed, 0 failed). What was not
+measured: the real guest. Wine has no DWM, so DWM's buttons, snap layouts,
+Windows 11's real metrics, 125%/150% and the launcher's reservation against
+DWM's real button bounds are still unmeasured. §82.10 is the command that
+measures them.
+
+### 82.2 Why `auto` left Firefox's tab strip under the caption
+
+§49 made `auto` fold the caption only for `Decorator::ProbablyItself`, which
+means a client that bound no decoration protocol and draws a margin.
+GTK binds KDE's manager, so Firefox was `Negotiated` on every run. That variant
+said *that* it negotiated and threw away *what*. Started without
+`MOZ_GTK_TITLEBAR_DECORATION=none`, Firefox asks for `Client` whatever the
+default (§22.3's table). The compositor echoes the request (§22.4) and then drew
+Windows' caption above Firefox's tab strip: two title bars, under the default.
+
+The per-surface record is now a map from surface to the mode last agreed:
+KDE's object starts at the manager's default and moves with every echoed
+`request_mode`, and `xdg-decoration` records whatever this compositor
+configured. A new `Decorator::AskedForClient` is folded by `auto`. The decision
+rests on what the client *said* on the protocol that exists for saying it, not
+on a correlate, and it has to: `report_decorator` logged Firefox's inset as
+`0,0` at map, though its trace says `(26, 23)`. The geometry arrives a commit
+after the first buffer, so the inset is not a signal anyone can lean on at that
+moment.
+
+Measured on Linux, no `--decorations` flag, `scripts/wc-firefox.sh tabs-default`:
+
+| client | Firefox asked | compositor |
+|---|---|---|
+| `titlebar = tabs` (env `client`) | `request_mode(1)` | `asked to decorate itself (Client) and was told yes, so this window's caption is folded` |
+| `titlebar = none` (env `none`) | `request_mode(2)` | `negotiated its decorations`, caption kept |
+
+One run of the compositor can therefore hold both, which a run-wide flag could
+not. `--decorations server` and `client` still fold nothing. Under them an
+insisting client is now reported as `THIS WINDOW HAS TWO TITLE BARS` rather than
+"agreed", because that is what it has.
+
+### 82.3 Who draws minimise, maximise and close: Windows
+
+| | Windows draws them (DWM) | Firefox draws them |
+|---|---|---|
+| snap layouts | `DwmDefWindowProc` answers `HTMAXBUTTON` over DWM's button (§31.5). `caption::hit` answers it too (§82.5) | Windows needs `HTMAXBUTTON` over Firefox's maximise button, and no protocol says where that is (§22.8) |
+| look | the system theme, hover and press states, DPI, Windows 11's shapes | GTK symbolic icons in 24 px circles (`browser.css`: `--titlebar-button-size: 24px`, Adwaita backgrounds). These would be the only GNOME-styled controls on the desktop |
+| measured on the guest | yes, `tabs.png` (§31.1) | only as the `nobuttons` control (§31.8) |
+| can the other side's be removed? | Firefox's: **yes, all three**, with `ui.GtkCSD{Minimize,Maximize,Close}Button=0` (§82.4) | DWM's: yes, `--caption-buttons off` |
+| height | the caption's (30 px at 100%) | stretched to Firefox's strip |
+
+The last row is the only one that favours Firefox. §82.4 removes the difference
+by making the strip the caption's height.
+
+**This overturns one conclusion of §22.9 and §31.9, and narrows another.** Both
+said Firefox's close button "cannot be removed". What they measured is that
+`gtk-decoration-layout` cannot remove it, and that is still true. The preference
+names `ui.GtkCSDCloseButton` and its siblings are in Firefox 157's `libxul.so`
+as LookAndFeel overrides. Setting the three to 0 in `user.js` removes all three
+buttons, close included. This was measured on a frame dump of the Linux
+compositor: the corner held the tab-list button and three round GTK buttons
+before, and only the tab-list button after (`/tmp` experiment; the harness
+control leg in §82.4 re-measures it).
+
+### 82.4 Firefox's half: the corner and the height, measured
+
+The sheet is two variables and one width
+(`wc_launch::plan::user_chrome_css`):
+
+```css
+:root { --tab-min-height: 29px !important; --tab-margin-block: 1px !important; }
+#TabsToolbar .titlebar-buttonbox-container { min-width: 146px !important; }
+```
+
+* **Height.** Firefox computes `--tabstrip-min-height` as
+  `--tab-min-height + 2 × --tab-margin-block` (`tabs.css`). Setting a 29 px tab
+  with 1 px margins gives a 31 px strip, which is the guest's `folds 31 px`.
+  29 px is the value of Firefox's own compact density, so nothing is smaller
+  than a size Firefox ships.
+* **Corner.** The button box stays in the tab strip with its buttons hidden, and
+  gets a `min-width` equal to §31.5's measured `146x30` strip.
+  `#TabsToolbar` is required in the selector. The first version left it out and
+  brought back the navigation bar's own button box, which Firefox hides while
+  tabs are shown, and the hamburger menu moved left by 146 px.
+
+From frame dumps of the geometry rectangle, `tabs-default`, 96 DPI numbers:
+
+| leg | tab-strip rows (x = 700, from the top) | share of the 146x31 corner in its commonest colour |
+|---|---|---|
+| launcher profile | **31** | **99.5%** (the rest is the window's rounded corner) |
+| env var only, no profile (control) | 44 | 67.5% (tab-list button plus Firefox's three buttons) |
+
+The crops are `docs/tabs-in-titlebar/linux-tabs-default-top.png`,
+`linux-tabs-noprofile-top.png` and `linux-none-top.png`. They are the
+compositor's frame dumps and contain no Windows frame. A visual check by a
+separate agent confirmed the following:
+
+* in the default crop, only the tab-list button is in the right 150 px;
+* in the control, Firefox's three round buttons are there;
+* the opt-out has a 44-row strip with no window buttons.
+
+**The two DPI-dependent numbers come from the launcher**, which runs on the
+guest:
+
+* The height is `AdjustWindowRectExForDpi`'s top inset for the compositor's own
+  window style, at `GetDpiForSystem`. The thread is made per-monitor aware first,
+  because an unaware caller is told 96.
+* The width is §31's 146 px scaled with rounding up. No API reports the caption
+  buttons' bounds without a window on screen.
+
+`TitlebarFit::at` is unit-tested at 96, 120 and 144 DPI (31/146, 39/183,
+47/219). **CSS pixels are assumed to be device pixels.** That holds because the
+one `wl_output` is scale 1 and the launcher sets no `layout.css.devPixelsPerPx`.
+A host with GTK text scaling would break it, and §82.5's corner check is what
+would say so.
+
+### 82.5 The compositor's half: hit test, metrics and buttons, as functions
+
+`platform/caption.rs` is new and pure. It is compiled on every target and has
+12 unit tests. `win32.rs` gathers the numbers and asks it.
+
+* **`caption::hit`**, for a point `DefWindowProc` called `HTCLIENT`, applies these
+  rules in order:
+  1. The top resize band of a *restored* window is `HTTOP`, `HTTOPLEFT` or
+     `HTTOPRIGHT`, and it wins over the buttons, as on a native window.
+  2. The button strip in thirds is `HTMINBUTTON`, `HTMAXBUTTON` or `HTCLOSE`.
+  3. Everything else is `HTCLIENT`, empty tab strip included. §22.8 still
+     holds: no protocol says which of Firefox's pixels are a title bar, so a
+     drag there is Firefox's to start, with `xdg_toplevel.move`, and a
+     double-click is Firefox's `set_maximized`.
+
+  A maximised window has no band, and its top row over the close button is
+  `HTCLOSE`. `DwmDefWindowProc` is still asked first on Windows. Answering the
+  buttons here as well is the documented way for a custom frame to keep snap
+  layouts, and on Wine it is the only way.
+* **DPI.** Every caption metric is now taken at the *window's* DPI:
+  `GetDpiForWindow`, `GetSystemMetricsForDpi` and `AdjustWindowRectExForDpi`,
+  resolved at runtime. Where those are missing, `caption::rescale` stands in
+  with `MulDiv` rounding, tested at 125% and 150%.
+
+  Before this section, `frame_border` and `top_inset` used `GetSystemMetrics`
+  and `AdjustWindowRectEx`, which answer at the *system* DPI. On a 150% monitor
+  beside a 100% primary, the top band was 8 px instead of 12, and the DWM margin
+  was a 100% caption. §31.13 item 3 called this right "by construction"; that
+  was true only on one monitor.
+* **Fallback buttons.** Wine's `DwmGetWindowAttribute` returns `E_NOTIMPL`
+  (§67.4), so until now a folded window under Wine had no buttons at all, and
+  with Firefox's own buttons off it had no way to close. Where DWM will not
+  say, the window now draws the system's buttons with
+  `DrawFrameControl(DFC_CAPTION)`: three `SM_CXSIZE` buttons at the window's DPI,
+  the folded caption's height, at the right edge. `caption::hit` hit-tests
+  them. They are still Windows' rendering (the classic one), so §31.5's rule
+  ("do not draw the buttons, uncover them") holds wherever there is something to
+  uncover.
+* **The corner check.** `caption::corner_is_clear` asks whether almost every
+  opaque pixel under the button strip is one colour. Transparent pixels are
+  skipped, because the CSD window's rounded corner is alpha 0. Before that
+  change Wine reported a false `DRAWS UNDER THE CAPTION BUTTONS` from 2% of a
+  54x30 strip. The compositor logs the verdict whenever it changes. This is
+  §31.14 item 4, *warn when the levers disagree*, for the one lever whose
+  failure showed only in a photograph.
+
+### 82.6 The first drag, and what it found
+
+`wc-desk` gained `hittest`, which sends `WM_NCHITTEST` at window-relative
+points, and `mouse`, which sends real `SendInput` drags, clicks, double-clicks
+and hovers and prints the window rectangle before and after. `wc-firefox.sh
+wine-tabs` runs both against Firefox in a Wine HWND under the defaults. The
+first runs found three things, and the third was not what it first looked like.
+
+1. **`xdg_toplevel.move` was the keyboard move.** §22.7 posted bare `SC_MOVE`
+   with `lParam = 0`, which is Alt+Space → *Move*. It warps the cursor to the
+   caption's middle and moves the window by the distance from *there*. A drag
+   of (+120, +80) on empty tab strip moved the window by **(+286, +82)**. The
+   extra 166 px is the distance from the press point to the middle of the
+   1288 px window. It is now `SC_MOVE | HTCAPTION` with the cursor in
+   `lParam`, the form a caption click produces, and the same drag moves the
+   window by **(+110, +74)**. The 10 px shortfall on each axis is GTK's drag
+   threshold, crossed before the move is requested.
+2. **GTK's maximise moved the window off the monitor.** §45.11's `ShiftOrigin`
+   moved the `HWND` whenever the window's geometry origin changed, declared or
+   not. GTK re-declares `(26, 23)` as `(0, 0)` when Firefox maximises: the
+   shadow goes, the buffer is replaced, and the window rectangle stays the same.
+   The compositor logged `origin shifted by -26,-23` and pushed the maximised
+   window off its monitor, and the 31-row tab strip with it. The Wine capture
+   showed the navigation bar at the top of the screen. `ShiftOrigin` now fires
+   only for the bounding-box extent that §45.11 was about. Every Wayland
+   compositor keeps the window geometry where it is when it is re-declared, and
+   §45.11's own unit test says the same for the synthetic Win32 ("a declared
+   inset leaves the window where it was put"). It also removes a smaller
+   symptom: every window used to move by its shadow inset just after it mapped,
+   because the geometry arrives a commit late (§82.2).
+3. **A diagnosis that was wrong, corrected in the same section.** The shifted
+   maximised window sat at `-30,-27`. That was read as "Wine parks a maximised
+   window a caption above the screen", and `3e8d5bd` moved the maximised client
+   top to the work area's top. With item 2 fixed, Wine parks it at `-4,-4`: one
+   band, as Windows does. The `-26,-23` was the shadow shift and nothing else, so
+   `a3406ca` puts the band back. A new log line on every maximise compares the
+   client's top with the work area's top. It reports any future mover as
+   `MISMATCH` instead of absorbing it the way the work-area rule would have.
+   This is §55.3's rule again: a symptom is not a diagnosis.
+
+Also measured: the Wine console that `cmd /c` opens sits over the top-left
+665x434 of the desktop and takes `SendInput` presses aimed there. The first
+top-edge drag, at x = 600, "did not resize" for that reason and no other. Hit
+tests are messages and are unaffected. The leg aims its gestures to the right of
+the console and says why.
+
+### 82.7 The Wine leg, and what it does and does not prove
+
+`scripts/wc-firefox.sh wine-tabs` passed 20 of 20. Its assertions cover:
+
+* the fold under the default;
+* `folds 30 px` (Wine's caption);
+* the fallback buttons at `client rect 1226,0 54x30`;
+* the compositor's own corner check reporting clear;
+* hit tests of `HTTOP`, `HTTOPLEFT`, `HTCLIENT` (empty tab strip and below it),
+  `HTMINBUTTON`, `HTMAXBUTTON` and `HTCLOSE`;
+* the top edge resizing (`904 px at y=0 -> 843 px at y=61`);
+* `handed a move to Windows`, with the window following the drag;
+* a double-click on empty tab strip maximising the window;
+* maximised: the monitor's top row is `HTCLIENT`, with the client's top at the
+  work area's top;
+* the maximised capture's first 31 screen rows being the tab strip.
+
+The captures are `docs/tabs-in-titlebar/wine-tabs-{restored,moved,maximised}.png`.
+**They are Wine:** Xvfb, Wine's own frame, no DWM, and the classic fallback
+buttons. A separate visual check found the following:
+
+* the strip is the window's top row in all three captures;
+* the buttons sit about 100 px clear of Firefox's tab-list button;
+* the buttons are 30 px tall against a 31 px strip. Wine's caption is 30 px and
+  the launcher's 100% number is Windows 11's 31;
+* nothing is cut off when maximised.
+
+It found one artefact: a few black pixels at the window's rounded top-left
+corner. That corner is alpha 0 in Firefox's buffer, and GDI's blit ignores
+alpha (§31.6). On the guest the same pixels fall inside the DWM-extended
+region, where alpha 0 is a hole onto the frame; that has not been looked at.
+
+The Wine leg also does not show the following, and cannot:
+
+* DWM's buttons;
+* `DwmDefWindowProc`'s answers;
+* the snap-layouts flyout;
+* Windows 11's metrics;
+* any scale but 96 DPI;
+* whether the launcher's 146 px covers DWM's real strip.
+
+The leg is **not perfectly stable**. On the final tree it ran six times: five
+passed 20 of 20, and one lost all three gestures. That run printed each
+gesture's "before" line and never its "after" line, so `wc-desk` did not finish
+inside the leg's 60 s wait, and the leg reported 14 passed, 6 failed. The cause
+was not found. The run kept no artefacts, and every rerun with `WC_KEEP=1`
+passed. It is recorded rather than averaged away.
+
+### 82.8 The launcher and `wc-session`
+
+* `[app.*] titlebar` defaults to `tabs`, and the shipped example says so. It
+  accepts `tabs`, `none` (alias `server`) and `client`, the last being §31's
+  picture without the profile, kept as a control. A typo is refused by name,
+  because Firefox treats an unknown `MOZ_GTK_TITLEBAR_DECORATION` as "decorate
+  yourself".
+* `wc-session run` gets two words where it used to get one: the env value and
+  the sheet. It writes the sheet only under the launcher's own profile tree. When
+  an app opts out it removes a sheet that carries the launcher's mark, and leaves
+  any other `userChrome.css` alone. The stale "does not exist yet" comment is
+  replaced by the arrangement as it now is.
+* **Empty words now cross as `-`.** `wc-session` splits
+  `$SSH_ORIGINAL_COMMAND` on whitespace, so an empty base64 argument vanished
+  and every later one arrived one place early. An `exec` without `--profile`
+  sent its preferences into the profile slot. Nothing had hit this because the
+  shipped `exec` names a profile.
+* `wc-launch --write-firefox-profile TITLEBAR DPI DIR` writes exactly what a
+  launch sends, on every platform. The harnesses use it, so they measure the
+  launcher's output and not a copy of it.
+
+### 82.9 The gates
+
+Every row was run on this branch at its final code (`a3406ca` plus this
+section), in the shared 10 GB slice. The Wine and Linux rows are this box. **No
+row is the guest.**
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **2726 passed, 0 failed**, 8 ignored. The baseline was 2704; `git diff b5c00ef..` adds exactly **22** `#[test]`s and removes none: 12 in `caption.rs`, 4 in `surface.rs`'s decorator tests, 4 in `wc-launch`'s `plan.rs` and 2 in its `config.rs` |
+| `cargo clippy --workspace --all-targets` | exit 0. No warning points at a line this branch wrote; the 718 warning lines are master's, 687 of them in generated `sv_icd_entry.rs` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0, no errors |
+| `cargo clippy -p wc-compositor -p wc-desk -p wc-launch --target x86_64-pc-windows-gnu` | nothing in `caption.rs`, `wc-desk` or `wc-launch`'s new code. One pre-existing warning in `win32.rs` (`create_window`'s eight arguments) |
+| `scripts/wc-pool.sh` | `wc-pool: OK` |
+| `scripts/wc-keymap.sh` | `wc-keymap: OK` |
+| **`scripts/wc-firefox.sh tabs-default`** (new, Linux) | **11 passed, 0 failed** (run twice) |
+| **`scripts/wc-firefox.sh wine-tabs`** (new, Wine) | **20 passed, 0 failed** in 5 of 6 runs on the final tree; 14/6 in one (§82.7) |
+| `scripts/wc-firefox.sh tabs`, `titlebar`, `auto` | 6/0, 9/0, 6/0. Unchanged: the opt-out Firefox is still never folded |
+| `scripts/wc-titlebar.sh local` | 5/0. `weston-terminal` still folds and `weston-flower` still does not |
+| `scripts/wc-titlebar.sh default` (new, guest) | **not run.** It is the later phase's (§82.10) |
+
+`wc-titlebar.sh local` came out as one `FAIL` on the first attempt, from the
+`fresh` check: `cargo test` had not relinked `target/debug/wc-compositor` after
+the last source edit. It passed after `cargo build --workspace`. That is §42's
+check doing its job and is recorded here so the 5/0 is not mistaken for a
+first-try result.
+
+
+### 82.10 What is not proven, and the guest run that proves it
+
+1. **DWM's buttons against the reservation.** This needs the default leg on the
+   guest, where the corner check compares the launcher's 146 px with DWM's real
+   bounds. That leg is new:
+
+   ```
+   WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<absolute path of firefox on the host> \
+     scripts/wc-titlebar.sh deploy
+   WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<same> scripts/wc-titlebar.sh default
+   ```
+
+   It asserts the following:
+   * the fold with no `--decorations`;
+   * Firefox asking for `Client`;
+   * the profile arriving on the host;
+   * `DwmExtendFrameIntoClientArea ok`;
+   * `keeps Windows' own caption buttons`;
+   * **`leaves the caption-button corner clear`** against DWM's bounds;
+   * `HTTOP` at the top edge, `HTCLIENT` on empty strip, and `HTMAXBUTTON` and
+     `HTCLOSE` read back from `DwmDefWindowProc`.
+
+   It injects no input. The picture is `docs/tabs-in-titlebar/default.png`.
+2. **Snap layouts, the drag, the top edge and the double-click on the guest's
+   desktop.** These close §31.13 items 1, 2 and 4. They inject real input into
+   a desktop a person uses, so they are opt-in and need an **unlocked** session
+   (§55.3):
+
+   ```
+   WC_TB_GESTURES=1 WC_HOST=<host-user>@<host-ip> WC_HOST_FIREFOX=<same> \
+     scripts/wc-titlebar.sh default
+   ```
+
+   The leg hovers the maximise button for 1.5 s while `wc-desk shot --screen`
+   captures `default-snap-hover.png`; the flyout is the shell's window, so a
+   window capture would miss it. It then drags the top edge and the empty tab
+   strip, double-clicks to maximise (`default-maximised.png`) and double-clicks
+   again to restore.
+3. **125% and 150%.** Set the guest's display scale, log off and on, and repeat
+   item 1 with `WC_TB_DPI=120` and then `WC_TB_DPI=144`, which render the
+   profile at that scale (39/183 and 47/219). The compositor's `dpi N (M%)` line
+   and its `folds N px` line give the real caption. The corner verdict says
+   whether the scaled 146 still covers DWM's strip. All the code is per-DPI and
+   unit-tested; none of it has run above 96.
+4. **The shortcut itself**, with the launcher computing the fit:
+
+   ```
+   scripts/wc-launch.sh deploy && scripts/wc-launch.sh cold && scripts/wc-launch.sh shot
+   WC_LAUNCH_TITLEBAR=none scripts/wc-launch.sh deploy   # the opt-out
+   ```
+
+   Its log should contain `titlebar: tabs, caption N px and buttons M px at this
+   desktop's DPI`.
+5. **Still open, unchanged in kind.** The title is not on screen in this
+   arrangement (§31.13 item 5); it is in the taskbar and Alt-Tab, as for Firefox
+   on Windows. A window with enough tabs will not put one under the buttons, now
+   that the corner is reserved, but nothing has been run with that many tabs.
+   §31.13 item 6 (one theme) and the corner's alpha (§82.7) also remain.
