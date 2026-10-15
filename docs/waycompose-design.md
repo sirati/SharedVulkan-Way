@@ -27626,18 +27626,18 @@ two 4 MB copies (1.0 ms each, off the renderer thread now), the compositor's
 
 ### 88.5 After
 
-The same harness and build shape, one run each, `wcgpu`:
+The same harness and build shape, one run each; the first four on `wcgpu`:
 
-| | before (`base`) | relay + grid, no proxy clock (`a1`) | all five (`a2`) | 150 s tour (`soak`) |
-|---|---|---|---|---|
-| scroll fps (three rounds) | 44.6, 45.3, 43.7 | 42.0, 38.6, 43.1 | **60.4, 60.3, 60.3** | 59.9 (one round) |
-| rAF frame time p50 / p95 / p99 | 21.7 / 27.7 / 38.3 ms | 22.4 / 34.8 / 47.5 | **17 / 18 / 18** | 17 / 18 / 18 |
-| present to present p50 / p95 / p99 | 21.2 / 31.5 / 45.5 | 22.7 / 34.2 / 47.0 | 16.6 / 20.5 / 22.9 | 16.6 / 20.6 / 21.8 |
-| `frame` to `done` at the proxy, p50 | 18.8 | 20.2 | 14.2 (the grid) | |
-| round trips per frame (p50) and their time | 5, 7.3 ms | 2, 7.5 | 2, 6.5 | |
-| present on the renderer thread | 3.3 ms | 0.08 | 0.06 | |
-| `wl_shm` buffer waits | 0 of 720 | 0 of 691 | 1 of 960 | 0 of 320 |
-| host CPUs 14 / 15 | 34 / 33 % | 32 / 31 % | 40 / 40 % | |
+| | before (`base`) | relay + grid, no proxy clock (`a1`) | all five (`a2`) | 150 s tour (`soak`) | deployed `wcivs` |
+|---|---|---|---|---|---|
+| scroll fps (three rounds) | 44.6, 45.3, 43.7 | 42.0, 38.6, 43.1 | **60.4, 60.3, 60.3** | 59.9 (one round) | **60.4, 60.2, 60.4** |
+| rAF frame time p50 / p95 / p99 | 21.7 / 27.7 / 38.3 ms | 22.4 / 34.8 / 47.5 | **17 / 18 / 18** | 17 / 18 / 18 | 17 / 18 / 18 |
+| present to present p50 / p95 / p99 | 21.2 / 31.5 / 45.5 | 22.7 / 34.2 / 47.0 | 16.6 / 20.5 / 22.9 | 16.6 / 20.6 / 21.8 | 16.7 / 20.1 / 22.2 |
+| `frame` to `done` at the proxy, p50 | 18.8 | 20.2 | 14.2 (the grid) | | |
+| round trips per frame (p50) and their time | 5, 7.3 ms | 2, 7.5 | 2, 6.5 | | |
+| present on the renderer thread | 3.3 ms | 0.08 | 0.06 | | |
+| `wl_shm` buffer waits | 0 of 720 | 0 of 691 | 1 of 960 | 0 of 320 | 0 of 960 |
+| host CPUs 14 / 15 | 34 / 33 % | 32 / 31 % | 40 / 40 % | | 25 / 25 % |
 
 Firefox's own time from a `done` to its next present is p50 12.3, p95 16.0,
 p99 17.6 ms (13.0, 16.8, 18.7 before): 60 is reached, with little room. The
@@ -27653,22 +27653,27 @@ gave 120.
 
 | where | what |
 |---|---|
-| `wcivs` (the launcher) | backed up to `C:\Users\<guest-user>\wcivs-backup-88` and `~/wc-launch-ivs-backup-88`, then `wc-launch.sh deploy` from this branch with §83.9's and §87.12's variables, `WC_LAUNCH_FIREFOX` as video-decode.md §7.11.5 and `WC_LAUNCH_PULSE`; see 88.7 for its result and the run on it |
-| `wcgpu` (test) | the same build; `gpu.env` as before this section |
+| `wcivs` (the launcher) | backed up to `C:\Users\<guest-user>\wcivs-backup-88` and `~/wc-launch-ivs-backup-88` (§87.14's `sv-guest.exe` `551f8508…`), then `wc-launch.sh deploy` from 6f4f133 with §83.9's and §87.12's variables, `WC_LAUNCH_FIREFOX` as video-decode.md §7.11.5 and `WC_LAUNCH_PULSE`: **12 passed, 0 failed**, every binary byte-identical on the far side; the ini and `gpu.env` came out unchanged |
+| `wcivs` binaries | `sv-guest.exe` `08f26ad9…`, `libsv_icd.so` `517fd75f…`, `wc-proxy` `d051f05a…` (release, 1.8 MB where the debug build was 48 MB), `sv-hostd` `52e8258f…`, `probe-relay.exe` `57478dea…` |
+| `wcivs`, checked | one session in session 0 with Marionette and the test profile `firefox-gpu` put in for it (so the harness stayed out of the profile a person uses) and taken out after; the ini and `gpu.env` are byte-identical to the deployed ones again: **60.4, 60.2, 60.4 fps**, p50 17, p95 18, p99 18, max 18 ms; 961 callbacks all answered by the proxy; no buffer wait; no fault line (`timeline-wcivs.txt`) |
+| `wcgpu` (test) | the same build; `gpu.env` as before this section; the previous binaries beside it as `*.pre-scroll` |
 | host `wc-session` | `--pace-frames 60` on both proxy paths |
 
 ### 88.7 Gates, and what was not measured
 
 | gate | result |
 |---|---|
-| `cargo test --workspace --no-fail-fast` | see the commit that adds this table |
-| clippy, all targets | see the commit |
-| Windows check | see the commit |
-| `wc-pool`, `wc-keymap` | see the commit |
-| Miri | see the commit |
+| `cargo test --workspace --no-fail-fast` | **101 binaries, 2832 passed, 0 failed**, 8 ignored (master: 2826; new: the opcode tally, the frame clock, four pacer tests) |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| Miri (`nix develop .#miri`) | the pacer's 4 tests, the frame clock's and the opcode tally's: no undefined behaviour. The new `unsafe` is FFI (`DwmGetCompositionTimingInfo`, `clock_gettime`), which Miri does not model; the present's read of the arena is the old one, moved |
+| `scripts/wc-xref.sh --list` | 1187 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
 
 On the guest: three scroll runs and one tour on `wcgpu`, four tunnel probes
-(no GPU), health every 15 s throughout. One watchdog sample at 01:31:33 lost
+(no GPU), one scroll run on the deployed `wcivs`; health every 15 s
+throughout. No GPU fault, `GUARD` or fatal line in any GPU log. One watchdog sample at 01:31:33 lost
 its single ping while ssh to the guest answered; every sample before and after
 was good and QEMU logged nothing.
 
