@@ -12,6 +12,10 @@
 //!
 //! Under Miri as well: `cargo +nightly miri test -p sv-icd-entry --test h265_context`.
 
+// A Vulkan Std struct is `Default` plus the two or three fields under test, as
+// in `lowering.rs`.
+#![allow(clippy::field_reassign_with_default)]
+
 use sv_icd_entry::*;
 
 fn sub_layers(base: u32) -> [StdVideoH265SubLayerHrdParameters; 3] {

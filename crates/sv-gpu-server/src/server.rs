@@ -896,10 +896,12 @@ impl GpuHost for GpuServer {
             let fp = get_reqs;
             let mut n = 0u32;
             // SAFETY: a count query on the driver's own session and device.
-            unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
+            // A failure leaves `n` at 0 and the bind below finds no
+            // requirement to re-make against, which is the driver's answer.
+            let _ = unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
             let mut v = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
             // SAFETY: `v` holds `n` output structures.
-            unsafe { fp(device, session, &mut n, v.as_mut_ptr()) };
+            let _ = unsafe { fp(device, session, &mut n, v.as_mut_ptr()) };
             v.truncate(n as usize);
             v
         };
