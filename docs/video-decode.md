@@ -933,8 +933,9 @@ is the first moment the GPU side knows which session and bind index a
 `VkDeviceMemory` is for, so a *dedicated* type-0 allocation (offset 0, whole
 size bound — what ffmpeg and `video-probe` both do) is re-made there from a
 type the driver accepts. A shared allocation is passed through and the driver
-answers. Without this, AV1 and VP9 failed in ffmpeg with `No memory type found
-for flags 0xffffffff`.
+answers. Without this, AV1 failed in ffmpeg with `No memory type found for
+flags 0xffffffff`, and VP9's hwaccel failed to initialise; both decode with it.
+The VP9 failure's cause was not separately confirmed.
 
 `vkAllocateMemory` now also carries `VkMemoryDedicatedAllocateInfo`. RADV
 reports `requiresDedicatedAllocation` for ffmpeg's decode pictures, and the GPU
@@ -1059,8 +1060,9 @@ forwarder only since fault 6) gives the same hashes for the four 8-bit streams.
 
 **The validation layer, on both sides at once** (`VK_INSTANCE_LAYERS` in the
 environment of the GPU side and the application), over all four ffmpeg
-streams after the fixes: the **application** side reports nothing. The GPU side
-reports two things, neither new: `VUID-VkDeviceCreateInfo-pNext-04748` and
+streams, and again over H.264 and AV1 after the dedicated-allocation fix: the
+**application** side reports nothing. The GPU side, after that fix, reports two
+things, neither new: `VUID-VkDeviceCreateInfo-pNext-04748` and
 `-03328` (the GPU side enables both `VK_KHR_` and `VK_EXT_buffer_device_address`
 when it opens its device), and `VUID-vkGetMemoryHostPointerPropertiesEXT-pHostPointer-parameter`,
 which is ffmpeg probing `VK_EXT_external_memory_host` with a `malloc` pointer
