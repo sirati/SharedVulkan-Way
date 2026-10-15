@@ -96,6 +96,10 @@ WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 # Named rather than hard-coded, because more than one experiment runs against
 # this guest at a time and a shared directory means one deploy overwrites the
 # other's binaries in the middle of its run — which presents as the other run
@@ -296,36 +300,18 @@ KEYMAP_EXTRA=(--shared-dir "$SHARE_WIN\\keymaps" --shared-peer-prefix "$SHARE/ke
 
 case "$TRANSPORT" in
   arena)
-    # Provided out of band, before either side starts, which is what an arena
-    # is. Truncated to zero first: a region left full of the previous run's
-    # pixels is a way for a frozen frame to look like a live one.
-    #
-    # STAGE 41. **This is the file arena on a machine that has a guest, which is
-    # the one combination the rest of stage 41 exists to make impossible — and
-    # it is licensed here, by name, for the one reason that survives.** §18.2's
-    # second bullet: this branch is a *control*. It is how the export's
-    # incoherence is re-measured rather than assumed, and §12.6 is the section
-    # made of its output. A control that cannot be run is an assumption.
-    #
-    # What makes that legitimate rather than the defect §41 removed is that it
-    # is never silent. The transport is a positional argument of this driver —
-    # `s4_run term arena …`, `s4_run termg guest-ram …` — it is in the tag of
-    # every line the run prints, and `s4_run`'s `case "$transport:$counts"`
-    # asserts that the substrate named is the substrate that served the pixels.
-    # `SV_ALLOW_FILE_ARENA` is exported for this branch alone, so the two
-    # `guest-ram` legs below cannot inherit it and degrade to a file if their
-    # locate fails; they fail instead, which is the whole point.
-    #
-    # `wc-proxy` and `wc-compositor` each print their own warning on top of this
-    # one. Three lines saying "not a target" is the correct number for a
-    # substrate §10.3 measured 65280-of-65536 bytes wrong in both directions.
-    echo "S4-SUBSTRATE: FILE arena on the export -- a CONTROL for §12.6's incoherence"
-    echo "S4-SUBSTRATE: measurement, NOT a result about the deployment. Guest RAM is"
-    echo "S4-SUBSTRATE: the substrate; the guest-ram legs are the ones that measure it."
-    export SV_ALLOW_FILE_ARENA=1
-    : >"$SHARE/arena"; truncate -s $ARENA_SIZE "$SHARE/arena"; chmod 666 "$SHARE/arena"
-    COMP_EXTRA=(--arena "0:$ARENA_SIZE:$SHARE_WIN\\arena")
-    PROXY_EXTRA=(--transport arena --arena-path "$SHARE/arena" --arena-id 0 --arena-size $ARENA_SIZE) ;;
+    # STAGE 41 licensed this branch as a CONTROL for §12.6's incoherence: a file
+    # arena on the export, run beside the guest-RAM legs. It has not been
+    # runnable since the compositor began refusing a file arena outright (§28.2,
+    # `file_arena_verdict`): `SV_ALLOW_FILE_ARENA` was exported here, on the VM
+    # host, while the compositor it was meant for runs on the guest over an ssh
+    # that never sees this environment. So the leg asked for a substrate the
+    # compositor will not serve, and failed as "no xdg_toplevel", which reads as
+    # a protocol failure. Guest RAM is the only arena on a real VM; the export's
+    # incoherence stays block 7's to measure, with no compositor in the way.
+    # Refused by name rather than deleted, so a caller that asks is told why.
+    echo "S4-FAIL: the file arena is not a substrate on a real VM (§28.2); use guest-ram"
+    exit 2 ;;
   shared-file)
     COMP_EXTRA=()
     PROXY_EXTRA=(--transport shared-file --pool-dir "$SHARE/live" --peer-prefix "$SHARE_WIN\\live\\") ;;
@@ -806,7 +792,24 @@ relayed() {
   else
     echo "no forward socket" >"$RUNDIR/$sock.client.log"
   fi
-  sleep 2
+  # **Wait for the server to say the client left, not for a clock.** This was
+  # `sleep 2`, and the fragmented leg failed all four milestones in one run and
+  # passed them in the next, with a server log that -- read afterwards -- held
+  # every one of them. The client finishes writing long before the server has
+  # read it: with `--chunk 3 --delay 15` the relay drips 372 bytes at about
+  # 200 B/s through a 15.6 ms timer tick, and then the server's log still has to
+  # come back over this ssh. Killing that ssh two seconds after the client exits
+  # reads a log that is still arriving.
+  #
+  # Both servers print `client … disconnected` when the relay closes its side,
+  # and the relay closes only after it has forwarded everything the client
+  # sent, so that line is the last milestone of the exchange. Bounded, so a
+  # server that never says it fails the checks below rather than hanging.
+  local _
+  for _ in $(seq 1 60); do
+    grep -q "disconnected" "$RUNDIR/$sock.server.log" 2>/dev/null && break
+    sleep 0.5
+  done
   kill $comp $relay $fwd 2>/dev/null
   wait $comp $relay $fwd 2>/dev/null
 }
@@ -877,11 +880,27 @@ do_run() {
   echo
   echo "== 4. smithay, on real Windows =="
   gq "export MSYS_NO_PATHCONV=1; cd $GUESTDIR && rm -f cp-*.log && (./wc-compositor.exe --socket wg-cp --timeout 20 > cp-comp.log 2>&1 &) && sleep 4 && WAYLAND_DISPLAY=wg-cp ./wc-probe.exe > cp-probe.log 2>&1; WAYLAND_DISPLAY=wg-cp ./wc-probe.exe --shm > cp-shm.log 2>&1; cat cp-probe.log cp-shm.log" >"$RUNDIR/cp.log"
-  if grep -q "5 globals advertised" "$RUNDIR/cp.log"; then
-    ok "wc-compositor.exe advertises smithay's five globals"
+  # The handshake, and the five globals this block is named for -- by name, not
+  # by count. It grepped for "5 globals advertised", which was the whole list
+  # when stage 5 wrote it and has been wrong since the compositor grew a sixth:
+  # it advertises 16 today, so the check failed on a compositor that was doing
+  # more than it asked, and printed the list that proved it. A count asserts
+  # nothing about which globals are there; the names below are what smithay
+  # provides and what every later block depends on.
+  local n_globals missing="" gl
+  n_globals=$(grep -o "PASS — handshake completed, [0-9]* globals advertised" "$RUNDIR/cp.log" \
+              | head -1 | grep -o "[0-9]* globals" | tr -dc 0-9)
+  for gl in wl_compositor wl_subcompositor wl_shm xdg_wm_base wl_seat; do
+    grep -qE "global [0-9]+: $gl v[0-9]+" "$RUNDIR/cp.log" || missing="$missing $gl"
+  done
+  if [ -z "$n_globals" ]; then
+    bad "smithay: wc-probe.exe did not complete the handshake against wc-compositor.exe"
+    sed 's/^/        /' "$RUNDIR/cp.log"
+  elif [ -n "$missing" ]; then
+    bad "smithay: the handshake completed but these globals are missing:$missing"
     grep -E "  global " "$RUNDIR/cp.log" | sort -u | sed 's/^/        /'
   else
-    bad "smithay globals"; sed 's/^/        /' "$RUNDIR/cp.log"
+    ok "wc-compositor.exe completed the handshake and advertises smithay's five core globals (of $n_globals)"
   fi
   grep -q "the server processed create_pool without error" "$RUNDIR/cp.log" \
     && ok "smithay's ShmState accepted a create_pool carrying a real named section" \
@@ -1104,7 +1123,11 @@ do_stage4() {
     return
   fi
 
-  s4_run term  arena       weston-terminal         $((PORT_BASE + 10)) 12
+  # `term` -- weston-terminal over a FILE arena on the export -- is gone. The
+  # compositor refuses a file arena on a real VM (§28.2, wc-substrate.sh), so
+  # the leg failed as "no xdg_toplevel" on every run; `termg` below is the same
+  # client over the substrate that replaced it, and `termf` keeps the export
+  # as a pool transport, which the compositor still serves.
   s4_run termf shared-file weston-terminal         $((PORT_BASE + 12)) 12
   # STAGE 7. `weston-presentation-shm` over a *file* arena is what §10.7
   # measured -- 645 frames, 18 distinct, one image 462 of them -- and it is not
@@ -1127,8 +1150,14 @@ s4_run() {
   # `ARENA_SIZE=$((PAGES * 4096))` with "wctest: unbound variable", because bash
   # arithmetic reads a bare word as a variable name. Three guest runs of block 12
   # failed on this before the run directory was kept long enough to read.
+  #
+  # `${ROOTC@Q}` for the same family of reason. The driver runs it with
+  # `eval "$ROOTC"`, so it has to arrive as one argument whatever it holds:
+  # `sudokey run -- bash` is three words, and a value with its own quotes
+  # broke the `\"…\"` this used to be. Single-quoted, the default
+  # `$HOME/rootc` is still expanded -- by the eval, on the host, as before.
   echo "  -- $client / $transport --"
-  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" '$HOST_WESTON' $secs '$QMP' '$VM_HINT' \"$ROOTC\" $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT' '$S4_VERIFY'" >"$log"
+  h "$HOST_DIR/wc-stage4 $transport $client $port $SHARE '$SHARE_WIN' $HOST_GUEST \"$HOST_KEY\" '$HOST_WESTON' $secs '$QMP' '$VM_HINT' ${ROOTC@Q} $ARENA_PAGES $GUESTNAME $ARENA_OUTBOUND '$S4_FIREFOX' '$S4_OUTPUT' '$S4_VERIFY'" >"$log"
 
   if grep -q "S4-FAIL" "$log"; then
     bad "$tag: $(grep S4-FAIL "$log")"
@@ -1285,12 +1314,23 @@ s4_run() {
   # §9.11 item 4: the pool growth the deferral design rests on. What matters is
   # not the count -- see below, it is not a constant -- but that every resize
   # was absorbed before anything else was asked of the pool.
-  local pools
-  pools=$(grep -o "[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)" "$log" | tail -1)
-  case "$pools" in
-    *"0 overflows)") ok "$tag: $pools -- every resize arrived before the pool was used" ;;
-    *) bad "$tag: $pools" ;;
-  esac
+  #
+  # **The fields are read by name, not by position.** This matched the exact
+  # sequence `N pools (R released, S resizes, O overflows)`, and stage 16 put
+  # `reclaimed` and `republished` between the first two and appended
+  # `refusals` and `attaches deferred` after the last -- so it matched nothing
+  # and printed an empty FAIL on three legs that had no overflow at all. The
+  # old `*"0 overflows)"` also accepted `10 overflows)`.
+  local pools overflows
+  pools=$(grep -o "[0-9]* pools ([^)]*)" "$log" | tail -1)
+  overflows=$(echo "$pools" | grep -o "[0-9]* overflows" | tr -dc 0-9)
+  if [ -z "$pools" ] || [ -z "$overflows" ]; then
+    bad "$tag: the proxy printed no pool counts with an overflow field (${pools:-nothing})"
+  elif [ "$overflows" -eq 0 ]; then
+    ok "$tag: $pools -- every resize arrived before the pool was used"
+  else
+    bad "$tag: $overflows overflow(s): $pools"
+  fi
 
   # And what the frames themselves say. `distinct` well below `total` means the
   # compositor presented the same image many times: for a client that redraws
@@ -1416,7 +1456,7 @@ do_firefox() {
   # What the arena actually held, which is §15.10's table arriving on the
   # deployment it is about.
   local pools
-  pools=$(grep -o '[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)' "$log" | tail -1)
+  pools=$(grep -o '[0-9]* pools ([^)]*)' "$log" | tail -1)
   [ -n "$pools" ] && note "Firefox's pools through the arena: $pools"
   grep -o 'client [0-9]*: joins arena 0 ([0-9]* connection(s) on it now, [0-9]* of [0-9]* bytes out)' "$log" \
     | tail -1 | sed 's/^/  ----  /'

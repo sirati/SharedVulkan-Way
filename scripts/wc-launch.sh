@@ -54,6 +54,10 @@ WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 HOST="${WC_HOST:-<host-user>@testhost}"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 
@@ -824,13 +828,19 @@ do_verify() {
   # were formatted for a reader. An overflow is a client that asked for arena
   # space and was refused, which is the failure §20 exists about, and it printed
   # as a decorated line.
-  local pools
-  pools=$(echo "$hostlog" | grep -o '[0-9]* pools ([0-9]* released, [0-9]* resizes, [0-9]* overflows)' | tail -1)
-  case "$pools" in
-    "") bad "the proxy reported no pool counts; the arena's own accounting is unchecked" ;;
-    *"0 overflows)") ok "Firefox through the arena: $pools -- every resize was absorbed" ;;
-    *) bad "Firefox through the arena: $pools -- an overflow is a client refused arena space" ;;
-  esac
+  # Read by field name: stage 16 added `reclaimed`/`republished` inside the
+  # parentheses and the positional pattern stopped matching (wc-guest.sh has
+  # the same fix and the longer story).
+  local pools overflows
+  pools=$(echo "$hostlog" | grep -o '[0-9]* pools ([^)]*)' | tail -1)
+  overflows=$(echo "$pools" | grep -o '[0-9]* overflows' | tr -dc 0-9)
+  if [ -z "$pools" ] || [ -z "$overflows" ]; then
+    bad "the proxy reported no pool counts; the arena's own accounting is unchecked"
+  elif [ "$overflows" -eq 0 ]; then
+    ok "Firefox through the arena: $pools -- every resize was absorbed"
+  else
+    bad "Firefox through the arena: $pools -- an overflow is a client refused arena space"
+  fi
 }
 
 n=""; warms=""; i=""
