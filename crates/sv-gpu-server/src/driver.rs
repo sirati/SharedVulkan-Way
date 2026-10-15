@@ -195,6 +195,27 @@ impl RawFeature {
     }
 }
 
+/// `VkPhysicalDeviceDriverProperties::driverID`, if the device has the query.
+///
+/// The instance is at least 1.1 (`open`), so `vkGetPhysicalDeviceProperties2` is
+/// core; the structure is the device's to answer, at 1.2 or with
+/// `VK_KHR_driver_properties`.
+fn driver_id(instance: &ash::Instance, pd: vk::PhysicalDevice, api_version: u32) -> i32 {
+    let has_ext = unsafe { instance.enumerate_device_extension_properties(pd) }
+        .map(|exts| {
+            exts.iter()
+                .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == c"VK_KHR_driver_properties")
+        })
+        .unwrap_or(false);
+    if api_version < vk::API_VERSION_1_2 && !has_ext {
+        return 0;
+    }
+    let mut dp = vk::PhysicalDeviceDriverProperties::default();
+    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut dp);
+    unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
+    dp.driver_id.as_raw()
+}
+
 /// One open driver: instance, physical device, device, queue.
 pub struct Driver {
     /// Held rather than read: it owns the loaded `libvulkan.so`, and dropping it
@@ -253,6 +274,13 @@ pub struct Driver {
     /// be taken here or not at all. Setting the bit unconditionally is invalid
     /// usage on a driver without the feature, so it is conditional on this.
     pub buffer_device_address: bool,
+    /// `VkPhysicalDeviceDriverProperties::driverID`, or 0 where the device
+    /// cannot say (below 1.2 without `VK_KHR_driver_properties`).
+    ///
+    /// Read for one reason: [`crate::set_layout`] refuses a shape on Intel's
+    /// Windows driver, and the device name alone does not tell that driver
+    /// from ANV on the same iGPU.
+    pub driver_id: i32,
 }
 
 impl Driver {
@@ -364,6 +392,7 @@ impl Driver {
                     .to_string_lossy()
                     .into_owned();
                 let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+                let driver_id = driver_id(&instance, pd, props.api_version);
                 // Instance-level extension, device-level entry points, provided
                 // by the loader rather than by the driver — so it is available
                 // whenever the instance enabled it, which `open` does.
@@ -390,6 +419,7 @@ impl Driver {
                     external_host,
                     debug_utils,
                     buffer_device_address,
+                    driver_id,
                 })
             }
             Err(e) => {
@@ -397,6 +427,12 @@ impl Driver {
                 Err(e)
             }
         }
+    }
+
+    /// Whether a PUSH_DESCRIPTOR set layout with non-zero binding flags is
+    /// refused rather than forwarded on this driver (docs/design.md §0.29).
+    pub fn refuses_push_binding_flags(&self) -> bool {
+        crate::set_layout::refuses_push_binding_flags(self.props.vendor_id, self.driver_id)
     }
 
     fn open_inner(entry: &ash::Entry, instance: &ash::Instance, index: usize) -> Result<Opened> {

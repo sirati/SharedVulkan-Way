@@ -12,6 +12,7 @@
 //! | [`server`] | `impl sv_proto::Server`: decoded arguments in, driver calls out |
 //! | [`convert`] | `ash` → wire, for the values reported back |
 //! | [`session`] | publish, then one thread per ring |
+//! | [`set_layout`] | `vkCreateDescriptorSetLayout`, shaped so that Intel's Windows driver never sees the layout it faults on |
 
 // The former `main.rs`, now a module so that `sv-guest` can be this and the
 // compositor at once. `extern crate self` lets its 15 `sv_gpu_server::…` paths
@@ -25,6 +26,7 @@ pub mod convert;
 pub mod driver;
 pub mod server;
 pub mod session;
+pub mod set_layout;
 pub mod table;
 pub mod workload;
 

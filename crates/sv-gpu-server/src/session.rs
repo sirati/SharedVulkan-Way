@@ -98,6 +98,13 @@ pub fn serve(
         shared.driver.name,
         shared.driver.driver_key()
     );
+    if shared.driver.refuses_push_binding_flags() {
+        eprintln!(
+            "[gpu] Intel's Windows driver (driver id {}): a PUSH_DESCRIPTOR set layout with \
+             non-zero binding flags will be refused (docs/design.md §0.29)",
+            shared.driver.driver_id
+        );
+    }
 
     // The heartbeat has to keep going while the ring threads block, and it
     // cannot be any one of them: a ring with nothing on it parks, and a parked
