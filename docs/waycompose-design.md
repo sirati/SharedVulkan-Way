@@ -26909,7 +26909,29 @@ VM's memory.
 
 ### 86.8 The gates
 
-PLACEHOLDER-GATES
+On the merged tree (master d9b3a27 in), at the commit that adds this section:
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` (`CARGO_BUILD_JOBS=4`, a copied Wine prefix) | **99 binaries, 2781 passed, 0 failed**, 8 ignored (master: 2770 at 98 binaries; the 11 new are `fault`'s 1, the broker's 3, `wc-launch`'s 7 across audio, config and plan) |
+| `cargo clippy --workspace --all-targets` | exit 0; 30 warnings, none at a line this branch wrote (two in the new plan tests were fixed) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 (it caught `pub mod broker;` having taken `locate`'s `cfg(linux)`) |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| `bash -n` on `wc-session`, `wc-launch.sh`, `sv-firefox-guest.sh`, `sv-firefox-readback-pkg.sh` | clean |
+| Miri | not run: the new `unsafe` is FFI (waveOut, `SetUnhandledExceptionFilter`, `setresuid`, `SO_PEERCRED`), which Miri does not model |
+
+On the real machines, each once unless the table says otherwise:
+
+| run | result |
+|---|---|
+| `sv-firefox-guest.sh 2 60 probe`, stock Mesa | Zink on Intel UHD, Wayland platform; sv-hostd dropped to uid 1000 |
+| the same, `mesa-kopper-wayland` 26.2.4 | Zink on Intel UHD, Mesa 26.2.4 |
+| `sv-firefox-guest.sh 4 120 zink`, Firefox 157 (×5) | GPU-side fault in `igvk64.dll` ×4 (86.4); software WebRender ×1 under `SV_TRACE=pre` |
+| `layout-probe.exe` in the guest | 86.4's table; **followed by the VM stopping** (86.5) |
+| `wc-launch.sh deploy` to `wcivs` (×4) | 11 passed, 0 failed each time |
+| `wc-launch.exe firefox` in session 0, the tone page | 63.4 s played, all audible, 0 dropped, 2 underruns (86.6) |
+| the first audio route, ssh.exe stdout into a pipe | nothing delivered (86.6) |
+| guest health, ssh and ping, before and after each guest step | all passed except 86.5; at the very end ssh to <guest-ip> failed with the guest alive on <guest-nat-ip> and its LAN adapter on an APIPA address (86.9 item 9) |
 
 ### 86.9 What remains for "Firefox fully works on Windows"
 
@@ -26938,3 +26960,8 @@ PLACEHOLDER-GATES
 7. **Audio delay and drift** (86.6, not measured), and sound for a second
    application in the same session (one sink, mixed; untested).
 8. **The persistent VM change** (§83.9 item 2) is still not booted.
+9. **The guest's LAN.** At the end of this work the guest answered on the
+   host-only link (<guest-nat-ip>) and not on <guest-ip>: its adapter
+   "Ethernet 2" had fallen back to an APIPA address (169.254.171.236). Nothing
+   here touched networking, and this section does not know when it happened
+   or why; it is reported, not changed.
