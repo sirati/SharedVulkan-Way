@@ -138,9 +138,17 @@ static void where_am_i(void)
 		GetUserObjectInformationW(input, UOI_NAME, in, sizeof in, NULL);
 		CloseDesktop(input);
 	}
-	printf("probe-scroll: session %lu, station %ls, desktop %ls, input desktop %ls, screen %dx%d\n",
+	/* The desktop window's own visibility, because `IsWindowVisible` is
+	 * true only if the window AND every ancestor has WS_VISIBLE, and a
+	 * top-level window's ancestor is this desktop's desktop window. A
+	 * window with WS_VISIBLE=1 and IsWindowVisible=0 was measured in the
+	 * ssh session (§82); this is the line that says whether that is why. */
+	HWND dw = GetDesktopWindow();
+	printf("probe-scroll: session %lu, station %ls, desktop %ls, input desktop %ls, screen %dx%d, "
+	       "desktop window %p visible=%d WS_VISIBLE=%d\n",
 	       (unsigned long)session, sta, desk, in, GetSystemMetrics(SM_CXSCREEN),
-	       GetSystemMetrics(SM_CYSCREEN));
+	       GetSystemMetrics(SM_CYSCREEN), (void *)dw, (int)IsWindowVisible(dw),
+	       (int)((GetWindowLongPtrW(dw, GWL_STYLE) & WS_VISIBLE) != 0));
 }
 
 static void move_to(int x, int y)
