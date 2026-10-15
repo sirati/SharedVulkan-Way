@@ -3251,18 +3251,7 @@ fn nccalcsize(state: &WindowState, hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -
         let window_top = (*params).rgrc[0].top;
         let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wparam, lparam);
         let ordinary_top = (*params).rgrc[0].top;
-        // §82: the work area's top, not the band; see
-        // `caption::maximised_top_inset` for the Wine measurement that
-        // separated the two.
-        let inset = if is_maximized(hwnd) {
-            caption::maximised_top_inset(
-                window_top,
-                work_area_of(hwnd).map(|r| r.top),
-                frame_border(hwnd).1,
-            )
-        } else {
-            0
-        };
+        let inset = if is_maximized(hwnd) { frame_border(hwnd).1 } else { 0 };
         (*params).rgrc[0].top = window_top + inset;
         state.nc_top.set(ordinary_top - window_top);
         Some(r)

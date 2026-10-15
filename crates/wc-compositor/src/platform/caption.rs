@@ -81,26 +81,6 @@ pub fn resize_band(size_frame: i32, padded_border: i32) -> i32 {
     size_frame + padded_border
 }
 
-/// How far below the top of a **maximised** window its client area starts.
-///
-/// §31.3 answered "the resize band": a maximised `WS_OVERLAPPEDWINDOW` hangs
-/// over the monitor by exactly that on real Windows (`hwnd at -8,-8`, photographed),
-/// so insetting by it puts the tab strip's first row on the monitor's first.
-/// That is a fact about where Windows parks a maximised window, not a law, and
-/// Wine parks it differently — measured: `1608x1108 at -30,-27`, so an inset of
-/// the 4 px band left 23 rows of Firefox's tab strip above the screen, which
-/// is the whole strip. The rule that is true in both places is the one the
-/// band was standing in for: **the client area starts at the top of the work
-/// area.** The band stays as the answer when there is no work area to ask, or
-/// when the distance is not a plausible frame (a window that is not where
-/// its monitor is).
-pub fn maximised_top_inset(window_top: i32, work_top: Option<i32>, band: i32) -> i32 {
-    match work_top {
-        Some(w) if w > window_top && w - window_top <= 100 => w - window_top,
-        _ => band,
-    }
-}
-
 /// What a point in a folded caption is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -297,21 +277,6 @@ mod tests {
         assert_eq!(resize_band(4, 4), 8);
         assert_eq!(resize_band(rescale(4, 96, 120), rescale(4, 96, 120)), 10);
         assert_eq!(resize_band(rescale(4, 96, 144), rescale(4, 96, 144)), 12);
-    }
-
-    /// Real Windows parks a maximised window one band above the work area,
-    /// Wine parks it a caption above; both come out at the work area's top.
-    #[test]
-    fn a_maximised_client_starts_at_the_top_of_the_work_area() {
-        assert_eq!(maximised_top_inset(-8, Some(0), 8), 8); // Windows, 100%
-        assert_eq!(maximised_top_inset(-12, Some(0), 12), 12); // Windows, 150%
-        assert_eq!(maximised_top_inset(-27, Some(0), 4), 27); // Wine, measured
-        // A taskbar on top: the work area starts below it.
-        assert_eq!(maximised_top_inset(32, Some(40), 8), 8);
-        // Nothing to ask, or nothing plausible: the band.
-        assert_eq!(maximised_top_inset(-8, None, 8), 8);
-        assert_eq!(maximised_top_inset(-8, Some(-20), 8), 8);
-        assert_eq!(maximised_top_inset(-900, Some(0), 8), 8);
     }
 
     // --- hit testing ---------------------------------------------------------
