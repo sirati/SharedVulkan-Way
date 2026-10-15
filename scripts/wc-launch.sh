@@ -59,9 +59,17 @@ AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 
 # This stage's own directory on the shared guest, and its own names for
 # everything. §16.8: an identity is a path, never an image name.
-DIR_WIN='C:\Users\<guest-user>\wclaunch'
-DIR_MSYS='/c/Users/<guest-user>/wclaunch'
+# `WC_LAUNCH_DIRNAME` so a run can keep out of another's directory on the
+# shared guest; the guest's key for the VM host lives there too, so a second
+# directory is a second key with its own forced command.
+DIRNAME="${WC_LAUNCH_DIRNAME:-wclaunch}"
+DIR_WIN="C:\\Users\\<guest-user>\\$DIRNAME"
+DIR_MSYS="/c/Users/<guest-user>/$DIRNAME"
 SESSION="${WC_LAUNCH_SESSION:-wcl}"
+# The shortcut's title, which is also its file name on the desktop.
+TITLE="${WC_LAUNCH_TITLE:-Firefox (Linux)}"
+# Where `shot` puts its photographs, under docs/, and their file-name prefix.
+SHOTDIR="${WC_LAUNCH_SHOTDIR:-stage14}"
 APPDATA_MSYS='/c/Users/<guest-user>/AppData/Local/waycompose'
 
 # The VM host's half.
@@ -127,9 +135,11 @@ WC_GUEST_CONFIGURED=1
 # this harness drives the same guest through the same launcher, so there is no
 # leg here for which a different answer could be correct.
 wcl_declare() {
-  wc_substrate_declare guest-ram || exit 2
+  # IVSHMEM ARENA (§82): the launcher's arena is BAR2 of the VM's ivshmem
+  # device, and the developer harnesses keep guest RAM.
+  wc_substrate_declare ivshmem || exit 2
   wc_topology_declare cross-vm \
-    "sv-guest.exe on $GUEST, wc-proxy on $HOST, arena in the guest's own RAM" || exit 2
+    "sv-guest.exe on $GUEST, wc-proxy on $HOST as the user, arena on the VM's ivshmem device" || exit 2
 }
 
 # The declaration checked against the run's own evidence, from the one line the
@@ -147,24 +157,29 @@ wcl_declare() {
 # §34.2. `frames=none` is a legitimate outcome — the sweep works, it merely
 # costs seconds — so this records which arm ran instead of requiring one.
 wcl_assert_located() {
-  local line pages
-  line=$(read_clock | grep 'locate:' | tail -1)
-  if [ -z "$line" ]; then
-    bad "the launcher reported no locate: nothing here says the arena is guest RAM"
+  # IVSHMEM ARENA (§82). There is no locate any more, so the evidence is the
+  # header instead: the run id the compositor printed (`arena: run …`, read off
+  # the guest) has to be the run id `wc-session up` read out of the file QEMU
+  # backs the BAR with (`up: ivshmem run …`, read off the VM host and reported
+  # back by the launcher). Two machines agreeing on 64 random bits that only one
+  # of them chose, through a file only QEMU's device writes, is the proof.
+  local clock guest_run line host_run len
+  clock=$(read_clock)
+  guest_run=$(echo "$clock" | grep -o 'arena: run 0x[0-9a-f]*' | tail -1 | awk '{print $3}')
+  line=$(echo "$clock" | grep 'up: ' | tail -1)
+  host_run=$(echo "$line" | grep -o 'ivshmem run 0x[0-9a-f]*' | awk '{print $3}')
+  len=$(echo "$line" | grep -oE '[0-9]+ bytes at' | awk '{print $1}')
+  if [ -z "$guest_run" ] || [ -z "$host_run" ]; then
+    bad "no ivshmem header was matched: guest said '${guest_run:-nothing}', host said '${line:-nothing}'"
     return 1
   fi
-  pages=$(echo "$line" | grep -oE 'located [0-9]+ of [0-9]+ pages' | head -1 | awk '{print $2}')
-  if [ -z "$pages" ] || [ "$pages" -eq 0 ]; then
-    bad "the locate placed no pages: ${line}"
+  if [ "$guest_run" != "$host_run" ]; then
+    bad "the guest's compositor is run $guest_run and the host's header says $host_run"
     return 1
   fi
-  WC_SUBSTRATE_LOCATED="$pages"
-  case "$line" in
-    *"by frame list"*) WC_SUBSTRATE_LOCATOR=frames ;;
-    *"frames=none"*)   WC_SUBSTRATE_LOCATOR=sweep ;;
-    *)                 WC_SUBSTRATE_LOCATOR=sweep ;;
-  esac
-  ok "the arena is guest RAM: $pages pages located by $WC_SUBSTRATE_LOCATOR on $HOST"
+  WC_SUBSTRATE_LOCATED=$(( ${len:-0} / 4096 - 1 ))
+  WC_SUBSTRATE_LOCATOR="the ivshmem header (run $host_run)"
+  ok "the arena is the ivshmem device: run $guest_run on the guest is the header's run on $HOST, ${len:-?} bytes"
   wc_assert_topology "/dev/null" "launch"
 }
 
@@ -355,6 +370,9 @@ do_deploy() {
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
   write_shot   "$stage/shot.ps1"
+  # The scripts name their own directory literally; a run in another one
+  # (`WC_LAUNCH_DIRNAME`) gets its own spelled in.
+  [ "$DIRNAME" = wclaunch ] || sed -i "s/<guest-user>\\\\wclaunch/<guest-user>\\\\$DIRNAME/g" "$stage"/*.ps1
 
   # The configuration. Written here because the harness knows the paths; a real
   # installation would ship it beside the exe.
@@ -372,7 +390,7 @@ output     = $OUTPUT
 port       = $PORT
 
 [app.firefox]
-title = Firefox (Linux)
+title = $TITLE
 icon  = firefox
 exec  = $FIREFOX --profile ~/.wc-launch/firefox
 prefs = middlemouse.paste=false
@@ -387,7 +405,7 @@ INI
        ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
     >/dev/null 2>&1
   sleep 1
-  scp "${SSHOPT[@]}" "$stage"/* "$GUEST:wclaunch/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
+  scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DIRNAME/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
   echo "  copied wc-launch.exe, sv-guest.exe, wc-desk.exe, probe-relay.exe and the ini to $DIR_WIN"
   # STAGE 42. `sv-guest.exe` is the GPU side, which is the binary the
   # wire-version refusal is actually about: it is *copied* here, so rebuilding
@@ -558,7 +576,7 @@ do_click() {
   else
     ok "$kind click to window: ${ms} ms, inside the ${waited}s the harness waited (the figure itself is informational: it is a rate on a contended guest)"
   fi
-  read_clock | grep -E 'arena:|locate:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
+  read_clock | grep -E 'arena:|locate:|up:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
   # Only a click that started the session has a locate of its own to check; a
   # warm click joins one and its `locate:` line belongs to the cold click that
   # came before, which this harness has already deleted the log of.
@@ -626,7 +644,7 @@ do_shot() {
     return
   fi
   note "the compositor of this session is pid $cpid"
-  mkdir -p "$ROOT/docs/stage14"
+  mkdir -p "$ROOT/docs/$SHOTDIR"
   # Deleted first: a shot of a window that is not there leaves the previous
   # shot's file, and the harness then reports a photograph it did not take
   # (§16.8).
@@ -635,36 +653,36 @@ do_shot() {
   # more than one — one attempt came back 338x196, which is a real window of the
   # right process and not the browser.
   local best=0 tries
-  rm -f "$ROOT/docs/stage14/stage14-firefox-shortcut.bmp"
+  rm -f "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp"
   for tries in 1 2 3; do
     g "rm -f $DIR_MSYS/window.bmp; printf '%s' 'shot --pid $cpid --out $DIR_WIN\\\\window.bmp' > $DIR_MSYS/shotargs.txt" >/dev/null
     int "wclaunch-shot" "powershell.exe" \
         "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $DIR_WIN\\shot.ps1" -Wait >/dev/null
     sleep 3
     g "test -s $DIR_MSYS/window.bmp && echo yes" | grep -q yes || continue
-    g "base64 $DIR_MSYS/window.bmp" | base64 -d > "$ROOT/docs/stage14/cand.bmp"
+    g "base64 $DIR_MSYS/window.bmp" | base64 -d > "$ROOT/docs/$SHOTDIR/cand.bmp"
     local w=0
     command -v magick >/dev/null 2>&1 && \
-      w=$(magick identify -format '%w' "$ROOT/docs/stage14/cand.bmp" 2>/dev/null)
+      w=$(magick identify -format '%w' "$ROOT/docs/$SHOTDIR/cand.bmp" 2>/dev/null)
     if [ "${w:-0}" -gt "$best" ]; then
       best=${w:-0}
-      mv "$ROOT/docs/stage14/cand.bmp" "$ROOT/docs/stage14/stage14-firefox-shortcut.bmp"
+      mv "$ROOT/docs/$SHOTDIR/cand.bmp" "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp"
     else
-      rm -f "$ROOT/docs/stage14/cand.bmp"
+      rm -f "$ROOT/docs/$SHOTDIR/cand.bmp"
     fi
     [ "$best" -ge 900 ] && break
   done
-  if [ ! -s "$ROOT/docs/stage14/stage14-firefox-shortcut.bmp" ]; then
+  if [ ! -s "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp" ]; then
     bad "wc-desk captured nothing"
     return
   fi
   if command -v magick >/dev/null 2>&1; then
-    magick "$ROOT/docs/stage14/stage14-firefox-shortcut.bmp" \
-           "$ROOT/docs/stage14/stage14-firefox-shortcut.png" 2>/dev/null
-    rm -f "$ROOT/docs/stage14/stage14-firefox-shortcut.bmp"
+    magick "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp" \
+           "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.png" 2>/dev/null
+    rm -f "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp"
     local colours geo
-    colours=$(magick "$ROOT/docs/stage14/stage14-firefox-shortcut.png" -format %k info: 2>/dev/null)
-    geo=$(magick identify -format '%wx%h' "$ROOT/docs/stage14/stage14-firefox-shortcut.png" 2>/dev/null)
+    colours=$(magick "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.png" -format %k info: 2>/dev/null)
+    geo=$(magick identify -format '%wx%h' "$ROOT/docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.png" 2>/dev/null)
     # Both halves, because either alone passes something that is not the
     # browser. A "Profile Missing" dialog is 626x182 with 875 distinct colours
     # and satisfies §17.5's colour count exactly; the first run of this stage
@@ -676,7 +694,7 @@ do_shot() {
       bad "the window is $geo with ${colours:-0} distinct colours -- too small or too flat to be Firefox's own"
     fi
   else
-    ok "captured docs/stage14/stage14-firefox-shortcut.bmp"
+    ok "captured docs/$SHOTDIR/$SHOTDIR-firefox-shortcut.bmp"
   fi
 }
 
@@ -690,7 +708,7 @@ do_desktop_shot() {
   # STAGE 42. This writes a **checked-in photograph** — the evidence that the
   # shortcut is on the desktop — and both arms were `note`, so nothing asserted
   # anything about it. A 1x1 or all-black capture landed in `docs/stage14/` and
-  # the run said "docs/stage14/stage14-desktop.png" either way. Informational is
+  # the run said "docs/$SHOTDIR/$SHOTDIR-desktop.png" either way. Informational is
   # a legitimate state for a number (see `wc-proxy.sh`'s audit block) but not
   # for the artefact a section cites as its evidence.
   #
@@ -698,13 +716,13 @@ do_desktop_shot() {
   # photographed (§13), and that is a fact about the machine rather than a
   # failure of this stage.
   if g "test -s $DIR_MSYS/desktop.bmp && echo yes" | grep -q yes; then
-    g "base64 $DIR_MSYS/desktop.bmp" | base64 -d > "$ROOT/docs/stage14/stage14-desktop.bmp"
+    g "base64 $DIR_MSYS/desktop.bmp" | base64 -d > "$ROOT/docs/$SHOTDIR/$SHOTDIR-desktop.bmp"
     if command -v magick >/dev/null 2>&1; then
-      magick "$ROOT/docs/stage14/stage14-desktop.bmp" "$ROOT/docs/stage14/stage14-desktop.png" 2>/dev/null
-      rm -f "$ROOT/docs/stage14/stage14-desktop.bmp"
-      picture_is "$ROOT/docs/stage14/stage14-desktop.png" screen "the desktop with the shortcut on it -> docs/stage14/stage14-desktop.png"
+      magick "$ROOT/docs/$SHOTDIR/$SHOTDIR-desktop.bmp" "$ROOT/docs/$SHOTDIR/$SHOTDIR-desktop.png" 2>/dev/null
+      rm -f "$ROOT/docs/$SHOTDIR/$SHOTDIR-desktop.bmp"
+      picture_is "$ROOT/docs/$SHOTDIR/$SHOTDIR-desktop.png" screen "the desktop with the shortcut on it -> docs/$SHOTDIR/$SHOTDIR-desktop.png"
     else
-      note "docs/stage14/stage14-desktop.bmp (no imagemagick here, so nothing checked the pixels)"
+      note "docs/$SHOTDIR/$SHOTDIR-desktop.bmp (no imagemagick here, so nothing checked the pixels)"
     fi
   else
     note "no screen capture (the guest's screen is a lock screen, §13)"
@@ -758,8 +776,9 @@ do_verify() {
   cmdline=$(g "export MSYS_NO_PATHCONV=1; powershell.exe -NoProfile -Command \
      \"(Get-CimInstance Win32_Process -Filter 'ProcessId = $cpid').CommandLine\"" | tr -d '\r')
   case "$cmdline" in
-    *--arena-guest-ram*) ok "the live compositor (pid $cpid) is over guest RAM: $cmdline" ;;
-    *) bad "the compositor's command line has no --arena-guest-ram: $cmdline" ;;
+    *--arena-guest-ram*) bad "the live compositor (pid $cpid) is over guest RAM, which the host reaches only as root: $cmdline" ;;
+    *--arena-ivshmem*) ok "the live compositor (pid $cpid) is over the ivshmem device: $cmdline" ;;
+    *) bad "the compositor's command line has no --arena-ivshmem: $cmdline" ;;
   esac
   case "$cmdline" in
     *--shared-dir*|*--arena\ *|*--arena-provide*)
@@ -770,9 +789,21 @@ do_verify() {
   local comp
   comp=$(g "cat $APPDATA_MSYS/wc-launch-$SESSION-comp.log" | tr -d '\r')
   local provided
-  provided=$(echo "$comp" | grep -o 'arena 0 provided from guest RAM: .*' | tail -1)
-  [ -n "$provided" ] && ok "the guest pinned and stamped it: $provided" \
-                     || bad "the compositor never reported a guest-RAM arena"
+  provided=$(echo "$comp" | grep -o 'arena 0 provided from ivshmem: .*' | tail -1)
+  [ -n "$provided" ] && ok "the guest mapped the device: $provided" \
+                     || bad "the compositor never reported an ivshmem arena"
+
+  # IVSHMEM ARENA (§82): **who the proxy runs as**, asked of the process rather
+  # than of the script that started it. The unit is this session's own user
+  # unit, and its main pid's owner is the claim.
+  local puser
+  puser=$(h "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user show -p MainPID --value wc-launch-$id 2>/dev/null \
+             | xargs -r ps -o user= -o pid= -o args= -p" 2>/dev/null | head -1)
+  case "$puser" in
+    root*) bad "wc-proxy runs as root: $puser" ;;
+    sirati*) ok "wc-proxy runs as the user, not root: $puser" ;;
+    *) bad "could not find this session's wc-proxy (unit wc-launch-$id): ${puser:-nothing}" ;;
+  esac
 
   local hostlog
   hostlog=$(h "SSH_ORIGINAL_COMMAND='logs $id' $HOSTDIR/wc-session" 2>/dev/null)

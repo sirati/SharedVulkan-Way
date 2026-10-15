@@ -169,6 +169,14 @@ wc_assert_topology() {
   local log="$1" tag="${2:-}"
   case "$WC_TOPOLOGY" in
     cross-vm)
+      # IVSHMEM ARENA (§82): the other substrate that proves a hypervisor. A
+      # run id the guest's compositor printed, found on the VM host in the file
+      # QEMU backs the guest's BAR2 with, can only have got there through that
+      # device -- nothing else writes that file.
+      if [ "${WC_SUBSTRATE:-}" = ivshmem ] && [ -n "${WC_SUBSTRATE_LOCATED:-}" ]; then
+        ok "${tag:+$tag: }TOPOLOGY cross-vm: proven by ${WC_SUBSTRATE_LOCATOR:-the ivshmem header} -- the guest's run id, read on the VM host out of QEMU's backing file for the guest's BAR2"
+        return 0
+      fi
       if [ "${WC_SUBSTRATE:-}" != guest-ram ] || [ -z "${WC_SUBSTRATE_LOCATED:-}" ]; then
         bad "${tag:+$tag: }TOPOLOGY UNPROVEN: declared cross-vm, but the substrate is '${WC_SUBSTRATE:-none}'${WC_SUBSTRATE_LOCATED:+ (located)} -- a hypervisor in the path is what makes guest RAM locatable, so a run that did not locate it has not shown one"
         return 1
