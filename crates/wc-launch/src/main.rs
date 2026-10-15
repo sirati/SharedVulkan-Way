@@ -30,6 +30,7 @@
 //! mutex rather than a happy accident of it.
 
 mod floor;
+mod audio;
 mod config;
 mod ico;
 mod plan;
@@ -734,6 +735,15 @@ mod win {
             return Err(format!("the host would not start its proxy: {last}"));
         }
 
+        // 6. The sound (§86). Started after the proxy, which is what started
+        //    the session's audio server; never fatal, because a session without
+        //    sound is still a session and the host has already given Firefox a
+        //    null audio context if there is no server.
+        let audio = if cfg.audio { start_audio(cfg, p, &id) } else {
+            log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
+            None
+        };
+
         let state = State {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
@@ -742,7 +752,7 @@ mod win {
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay, tunnel, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp, relay, tunnel, audio, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
@@ -750,12 +760,60 @@ mod win {
         comp: Child,
         relay: Child,
         tunnel: Child,
+        /// The ssh exec carrying the session's sound, if it started (§86).
+        audio: Option<Child>,
         comp_log: std::path::PathBuf,
     }
 
     /// A click that is not the first one. It reads the owner's state file and
     /// waits for `ready`, which is the whole synchronisation between two
     /// double-clicks a second apart.
+    /// `wc-session audio ID` with its standard output piped into a waveOut
+    /// player on a thread of its own (§86). The thread writes to the session's
+    /// log through its own handle; the child is the session's to kill.
+    ///
+    /// The host refuses the verb when it has no server for the session, which
+    /// arrives here as a stream that ends at once and is logged with the
+    /// host's reason, read from the child's stderr.
+    fn start_audio(cfg: &Config, p: &Paths, id: &str) -> Option<Child> {
+        let argv = plan::audio_argv(cfg, &p.known_hosts.to_string_lossy(), id);
+        let mut child = match Command::new(&cfg.ssh)
+            .args(&argv)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                Log::open(&p.log).say(&format!("audio: {}: {e}; no sound this session", cfg.ssh));
+                return None;
+            }
+        };
+        let out = child.stdout.take()?;
+        let err = child.stderr.take();
+        let log_path = p.log.clone();
+        let volume = cfg.audio_volume;
+        std::thread::spawn(move || {
+            let mut log = Log::open(&log_path);
+            match crate::audio::play(out, volume, |l| log.say(l)) {
+                Ok(_) => {}
+                Err(e) => log.say(&format!("audio: {e}; no sound this session")),
+            }
+            if let Some(mut err) = err {
+                let mut why = String::new();
+                use std::io::Read;
+                let _ = err.read_to_string(&mut why);
+                let why = why.trim();
+                if !why.is_empty() {
+                    log.say(&format!("audio: the host said: {why}"));
+                }
+            }
+        });
+        Some(child)
+    }
+
     fn join(p: &Paths, secs: u64) -> Result<State, String> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
@@ -916,6 +974,9 @@ mod win {
         log.say(&format!("the compositor exited: {rc}"));
         let _ = s.relay.kill();
         let _ = s.tunnel.kill();
+        if let Some(a) = s.audio.as_mut() {
+            let _ = a.kill();
+        }
         let _ = ssh(cfg, p, &["down", &s.id]);
         let _ = std::fs::remove_file(&p.state);
         let _ = std::fs::remove_file(&s.comp_log);

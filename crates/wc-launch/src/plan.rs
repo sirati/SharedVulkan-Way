@@ -121,6 +121,18 @@ pub fn ssh_exec(cfg: &Config, known_hosts: &str, verb: &[&str]) -> Vec<String> {
     a
 }
 
+/// The session's sound: `wc-session audio ID` (§86), whose standard output
+/// is the null sink's monitor as raw s16le 48 kHz stereo. An ordinary verb on
+/// the launcher's own key, so the forced command is all it can reach.
+pub fn audio_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
+    let mut a = ssh_options(cfg, known_hosts);
+    // No pseudo-terminal: the stream is binary and a tty would translate it.
+    a.push("-T".into());
+    a.push(cfg.host.clone());
+    a.extend(["audio".to_string(), id.to_string()]);
+    a
+}
+
 /// The tunnel: a Unix socket **on the VM host** that forwards into the guest's
 /// relay port. It runs from the guest because the guest is where the click is;
 /// stage 12's harness made the same connection in the other direction from a
@@ -672,5 +684,23 @@ mod tests {
         let none = app_user_js(Titlebar::None, "middlemouse.paste=false");
         assert!(!none.contains("GtkCSD"), "{none}");
         assert!(none.contains("middlemouse.paste"), "{none}");
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    /// §86. The sound arrives on the same key's forced command as every other
+    /// verb, with no tty in the way of the bytes.
+    #[test]
+    fn the_audio_stream_is_a_verb_on_the_launchers_own_key() {
+        let mut c = Config::default();
+        c.host = "u@h".into();
+        c.key = r"C:\k".into();
+        let a = audio_argv(&c, "kh", "wcl-9");
+        assert_eq!(&a[a.len() - 3..], ["u@h", "audio", "wcl-9"]);
+        assert!(a.iter().any(|x| x == "-T"));
+        assert!(a.windows(2).any(|w| w[0] == "-i" && w[1] == r"C:\k"));
     }
 }

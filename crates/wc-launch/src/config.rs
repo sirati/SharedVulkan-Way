@@ -107,6 +107,13 @@ pub struct Config {
     /// it (§28.9 item 9). `linger-secs = 0` ends it as soon as the last window
     /// closes.
     pub linger_secs: u64,
+    /// §86. Play the session's sound on this machine: `wc-session audio` over
+    /// this launcher's own key, into waveOut. `audio = off` leaves it to the
+    /// host, which then gives Firefox a null audio context.
+    pub audio: bool,
+    /// §86. waveOut volume for that stream, 0..=100. The device's own volume
+    /// and the user's mixer still apply on top of it.
+    pub audio_volume: u8,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -125,6 +132,8 @@ impl Default for Config {
             port: 57431,
             session_secs: 43200,
             linger_secs: 60,
+            audio: true,
+            audio_volume: 100,
             apps: BTreeMap::new(),
         }
     }
@@ -192,6 +201,19 @@ impl Config {
                 }
                 ("session", "session-secs") => cfg.session_secs = num("session-secs")?,
                 ("session", "linger-secs") => cfg.linger_secs = num("linger-secs")?,
+                ("session", "audio") => {
+                    cfg.audio = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: audio is on or off, not {v}", n + 1)),
+                    }
+                }
+                ("session", "audio-volume") => {
+                    cfg.audio_volume = u8::try_from(num("audio-volume")?)
+                        .ok()
+                        .filter(|v| *v <= 100)
+                        .ok_or_else(|| format!("line {}: audio-volume is 0..=100", n + 1))?
+                }
                 ("session", other) => {
                     return Err(format!("line {}: [session] has no {other}", n + 1));
                 }
@@ -277,6 +299,10 @@ port       = 57431
 # Seconds the session outlives its last window (§85): a click within it is warm,
 # and after it the session ends and gives its arena back. 0 = at once.
 linger-secs = 60
+# The session's sound plays here, through the default device (§86): `off`
+# leaves Firefox with a null audio context on the host instead.
+audio        = on
+audio-volume = 100
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
@@ -382,5 +408,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("[app.x] titlebar = tab"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    fn parse(extra: &str) -> Result<Config, String> {
+        Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{extra}"))
+    }
+
+    /// §86. Sound is on unless the ini says off, and the two words are the
+    /// only two.
+    #[test]
+    fn audio_is_on_by_default_and_spelled_on_or_off() {
+        let c = parse("").unwrap();
+        assert!(c.audio);
+        assert_eq!(c.audio_volume, 100);
+        assert!(!parse("audio = off\n").unwrap().audio);
+        assert!(parse("audio = yes\n").is_err());
+        assert_eq!(parse("audio-volume = 5\n").unwrap().audio_volume, 5);
+        assert!(parse("audio-volume = 101\n").is_err());
+        assert!(parse("audio-volume = 300\n").is_err());
     }
 }

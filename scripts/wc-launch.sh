@@ -92,6 +92,12 @@ NATIVE_FIREFOX='C:\Program Files\Mozilla Firefox\firefox.exe'
 ARENA_MIB="${WC_LAUNCH_ARENA_MIB:-64}"
 OUTPUT="${WC_LAUNCH_OUTPUT:-1600x1000}"
 PORT="${WC_LAUNCH_PORT:-57431}"
+# §86. The session's sound. The PulseAudio package the VM host's `wc-session`
+# runs per session, as a store path that must already be on the host (`nix copy`
+# it there); deploy pins it with a GC root at $HOSTDIR/bin/pulse. Unset or absent,
+# sessions have no audio server and Firefox gets a null audio context.
+PULSE="${WC_LAUNCH_PULSE:-}"
+AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 
 export SSH_AUTH_SOCK="$AGENT"
 export MSYS_NO_PATHCONV=1
@@ -392,6 +398,8 @@ arena-mib  = $ARENA_MIB
 outbound   = 1048576
 output     = $OUTPUT
 port       = $PORT
+audio      = ${WC_LAUNCH_AUDIO:-on}
+audio-volume = $AUDIO_VOLUME
 
 [app.firefox]
 title = $TITLE
@@ -449,6 +457,15 @@ INI
        echo 'restrict,port-forwarding,command=\"$HOSTDIR/wc-session\" $pub' >> ~/.ssh/authorized_keys; \
      grep -c wc-launch-guest ~/.ssh/authorized_keys" >/dev/null
   echo "  copied wc-session, wc-proxy and wc-arena-host to $HOST:$HOSTDIR, and restricted the guest's key to it"
+  if [ -n "$PULSE" ]; then
+    if h "nix-store -r $PULSE --add-root $HOSTDIR/bin/pulse --indirect >/dev/null && test -x $HOSTDIR/bin/pulse/bin/pulseaudio"; then
+      echo "  sessions get a PulseAudio null sink from $PULSE (GC root $HOSTDIR/bin/pulse)"
+    else
+      bad "$PULSE is not on $HOST: nix copy it there first; sessions will have no sound"
+    fi
+  else
+    note "WC_LAUNCH_PULSE unset: wc-session looks for pulseaudio in the host's store, and without one Firefox gets a null audio context"
+  fi
 
   # And the one end-to-end check of the path that does not need a compositor.
   # Asked of `wc-launch.exe` itself rather than of a hand-built ssh command
