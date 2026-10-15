@@ -726,8 +726,16 @@ fn lower_expr(
                 .len
                 .as_ref()
                 .ok_or_else(|| format!("{owner}.{}: an array with no resolvable len=", abi.name))?;
-            let n = count_expr(len, member_access)
-                .ok_or_else(|| format!("{owner}.{}: len={len:?} is not a sibling", abi.name))?;
+            // A length an enclosing struct holds (`exceptions::LEN_FROM_CONTEXT`)
+            // is read from the lowering context it published, and a missing
+            // one is a refusal of this call, not a guess.
+            let n = match (count_expr(len, member_access), crate::exceptions::len_from_context(owner, &abi.name)) {
+                (Some(n), _) => n,
+                (None, Some(key)) => quote!(crate::lowering_context::get(#key)?),
+                (None, None) => {
+                    return Err(format!("{owner}.{}: len={len:?} is not a sibling", abi.name));
+                }
+            };
             // **`stride=`: the application's array may not be tightly packed.**
             //
             // `(#access).add(__i)` strides by `size_of` the element, which is
@@ -1138,12 +1146,25 @@ pub fn emit_lower_struct(cx: &Ctx<'_>, s: &StructPlan) -> Result<TokenStream, St
         inits.push(quote!(#id: #e,));
     }
     let doc = format!("Lower a C `{name}` into its wire form.");
+    // A struct that holds a length its descendants need publishes it for the
+    // duration of its own lowering (`exceptions::LEN_CONTEXT_PROVIDERS`).
+    let body = quote!(unsafe { Ok(sv_proto::#ty { #(#inits)* }) });
+    let body = match crate::exceptions::len_context_provider(name) {
+        Some((member, key, add)) if !cx.lower_full => {
+            let access = member_access(member);
+            quote!({
+                let __len = unsafe { (#access) as usize } + #add;
+                crate::lowering_context::with(#key, __len, || #body)
+            })
+        }
+        _ => body,
+    };
     Ok(quote! {
         #[doc = #doc]
         #[allow(unused_unsafe, unused_variables)]
         pub unsafe fn #f(p: *const #ty) -> crate::LowerResult<sv_proto::#ty> {
             let _ = p;
-            unsafe { Ok(sv_proto::#ty { #(#inits)* }) }
+            #body
         }
     })
 }

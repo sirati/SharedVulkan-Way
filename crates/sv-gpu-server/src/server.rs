@@ -225,35 +225,42 @@ fn queue_family_video_links(
     ]
 }
 
-/// A driver `memoryTypeBits` for device-local-only memory, as docs/design.md
-/// §9.1's table numbers it: bit 0 — our `DEVICE_LOCAL` type, which
-/// `allocate_memory` backs with the driver's first `DEVICE_LOCAL` type — exactly
-/// when the driver's bits include that type, and nothing else.
+/// A video session bind's driver `memoryTypeBits`, as docs/design.md §9.1's
+/// table numbers it: bit 0 — our `DEVICE_LOCAL` type, and never an arena bit —
+/// whenever the driver accepts any type at all.
 ///
-/// Zero is a real answer and is reported rather than papered over: an
-/// application then finds no memory type and fails at allocation, which is the
-/// honest outcome for a resource whose memory this side cannot provide. It has
-/// not been seen on RADV or NVIDIA; it is said once on stderr if it is.
-fn app_memory_type_bits(driver: &Driver, driver_bits: u32, what: &'static str) -> u32 {
-    let ours = driver
-        .memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        .map_or(0, |dl| u32::from(driver_bits & (1 << dl) != 0));
-    if ours == 0 {
+/// Bit 0 is honest even when the driver's bits exclude the type `allocate_memory`
+/// normally backs our type 0 with, because `bind_video_session_memory_khr`
+/// re-makes a dedicated allocation from a type the driver does accept. RADV's AV1
+/// session is the case that needs it: its bits are `0x678`, all host-visible
+/// types, none of them RADV's type 0.
+///
+/// Zero is reported as zero: an application then finds no memory type and fails
+/// at allocation. Not seen on RADV; said once on stderr if it is.
+fn session_memory_type_bits(driver_bits: u32) -> u32 {
+    if driver_bits == 0 {
         use std::sync::atomic::{AtomicBool, Ordering};
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "sv-gpu-server: {what} wants driver memory types {driver_bits:#x}, none of \
-                 which is the DEVICE_LOCAL type this side allocates; reporting no type"
-            );
+            eprintln!("sv-gpu-server: a video session bind accepts no memory type at all");
         }
+        return 0;
     }
-    ours
+    1
+}
+
+/// The driver memory type a session bind is re-made from: the first
+/// `DEVICE_LOCAL` type the driver accepts, else the first type it accepts.
+fn session_memory_type(driver: &Driver, driver_bits: u32) -> Option<u32> {
+    driver
+        .memory_type(driver_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .or_else(|| driver.memory_type(driver_bits, vk::MemoryPropertyFlags::empty()))
 }
 
 /// An image's driver `memoryTypeBits` in §9.1's numbering.
 ///
-/// Bit 0 as [`app_memory_type_bits`] gives it. Bits 1–3, the arena's three
+/// Bit 0 exactly when the driver's bits include our type 0's driver type (the
+/// first `DEVICE_LOCAL`, as `allocate_memory` picks it). Bits 1–3, the arena's three
 /// types, exactly when the driver's bits include the type the arena was
 /// actually allocated from — which is what binding an image there would mean.
 /// On RADV this reproduces almost exactly what the verbatim forward said (its
@@ -775,7 +782,7 @@ impl GpuHost for GpuServer {
     /// application against docs/design.md §9.1's table, so it is translated —
     /// the same argument `sv_icd::icd::get_buffer_memory_requirements` makes for
     /// buffers, made here because only this side knows which driver type our
-    /// type 0 is. See [`app_memory_type_bits`].
+    /// type 0 is. See [`session_memory_type_bits`].
     ///
     /// **Session memory never goes in the arena**, and the mask says so: it is
     /// memory only the video engine touches, which is docs/design.md §0.21.2's
@@ -818,11 +825,8 @@ impl GpuHost for GpuServer {
                 w.memory_bind_index = g.memory_bind_index;
                 w.memory_requirements.size = g.memory_requirements.size;
                 w.memory_requirements.alignment = g.memory_requirements.alignment;
-                w.memory_requirements.memory_type_bits = app_memory_type_bits(
-                    &self.shared.driver,
-                    g.memory_requirements.memory_type_bits,
-                    "video session memory",
-                );
+                w.memory_requirements.memory_type_bits =
+                    session_memory_type_bits(g.memory_requirements.memory_type_bits);
                 w
             })
             .collect();
@@ -831,6 +835,103 @@ impl GpuHost for GpuServer {
             p_memory_requirements_count: Some(m),
             p_memory_requirements: out,
         })
+    }
+
+    /// Forwarded, after making sure each dedicated type-0 allocation is of a
+    /// driver type the session accepts for that bind index.
+    ///
+    /// [`session_memory_type_bits`] tells the application "our type 0" for any
+    /// bind the driver can serve at all, and our type 0 is normally the driver's
+    /// first `DEVICE_LOCAL` type. Where the driver wants something else — RADV's
+    /// AV1 session, whose bits are all host-visible types — the allocation is
+    /// re-made here, the first moment the session and bind index are known.
+    ///
+    /// **Only a dedicated allocation is re-made**: offset 0 and the whole
+    /// allocation bound. That is what ffmpeg and `video-probe` do, and it is
+    /// the only case where nothing else could already be bound into the memory
+    /// being replaced. Anything else is passed through and the driver answers.
+    fn bind_video_session_memory_khr(
+        &mut self,
+        a: p::VkBindVideoSessionMemoryKHRArgs,
+    ) -> WireResult<p::VkBindVideoSessionMemoryKHRReply> {
+        let session = vk::VideoSessionKHR::from_raw(
+            self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?,
+        );
+        let Some((get_reqs, bind)) = self
+            .shared
+            .driver
+            .video_queue
+            .as_ref()
+            .map(|vq| (vq.fp().get_video_session_memory_requirements_khr, vq.fp().bind_video_session_memory_khr))
+        else {
+            self.note_missing("vkBindVideoSessionMemoryKHR");
+            return Ok(p::VkBindVideoSessionMemoryKHRReply {
+                result: p::VkResult(vk::Result::ERROR_EXTENSION_NOT_PRESENT.as_raw()),
+            });
+        };
+        let device = self.shared.driver.device.handle();
+        // The driver's requirements, by bind index.
+        let reqs = {
+            let fp = get_reqs;
+            let mut n = 0u32;
+            // SAFETY: a count query on the driver's own session and device.
+            unsafe { fp(device, session, &mut n, std::ptr::null_mut()) };
+            let mut v = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
+            // SAFETY: `v` holds `n` output structures.
+            unsafe { fp(device, session, &mut n, v.as_mut_ptr()) };
+            v.truncate(n as usize);
+            v
+        };
+        let usual = self.shared.driver.memory_type(u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        let mut binds = Vec::with_capacity(a.p_bind_session_memory_infos.len());
+        for b in &a.p_bind_session_memory_infos {
+            let (memory, offset) = self.rewrite_memory(b.memory.0, b.memory_offset)?;
+            let mut memory = vk::DeviceMemory::from_raw(memory);
+            let want = reqs
+                .iter()
+                .find(|r| r.memory_bind_index == b.memory_bind_index)
+                .map(|r| r.memory_requirements.memory_type_bits);
+            let range = self.shared.objects().memory(b.memory.0);
+            if let (Some(want), Some(range), Some(usual)) = (want, range, usual)
+                && b.memory.0 != crate::ARENA_MEMORY_ID
+                && want & (1 << usual) == 0
+                && b.memory_offset == 0
+                && b.memory_size == range.len
+                && let Some(ty) = session_memory_type(&self.shared.driver, want)
+            {
+                let ai = vk::MemoryAllocateInfo::default()
+                    .allocation_size(range.len)
+                    .memory_type_index(ty);
+                // SAFETY: an ordinary allocation on the driver's own device.
+                match unsafe { self.d().allocate_memory(&ai, None) } {
+                    Ok(m) => {
+                        // SAFETY: the replaced allocation is dedicated to this
+                        // bind (offset 0, whole size) and so has nothing bound.
+                        unsafe { self.d().free_memory(range.memory, None) };
+                        self.shared.objects().insert_memory(
+                            b.memory.0,
+                            crate::table::MemoryRange { memory: m, base: 0, len: range.len },
+                        );
+                        memory = m;
+                    }
+                    Err(e) => {
+                        return Ok(p::VkBindVideoSessionMemoryKHRReply { result: fail(e) });
+                    }
+                }
+            }
+            binds.push(
+                vk::BindVideoSessionMemoryInfoKHR::default()
+                    .memory_bind_index(b.memory_bind_index)
+                    .memory(memory)
+                    .memory_offset(offset)
+                    .memory_size(b.memory_size),
+            );
+        }
+        // SAFETY: `binds` outlives the call; every handle in it is the driver's.
+        let r = unsafe {
+            bind(device, session, binds.len() as u32, binds.as_ptr())
+        };
+        Ok(p::VkBindVideoSessionMemoryKHRReply { result: p::VkResult(r.as_raw()) })
     }
 
     /// Forwarded for the numbers, renumbered for the mask, as above.
