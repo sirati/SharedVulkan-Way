@@ -33,3 +33,26 @@ fn every_observed_command_is_generated_and_calls_the_observer() {
     let calls = flat.matches(".observe(\"").count();
     assert_eq!(calls, 2 * exceptions::GPU_OBSERVED.len(), "one call before and one after per entry");
 }
+
+/// `exceptions::GPU_RETAIN_RAISE`, likewise: each entry's generated forwarder
+/// hands its raise pool to `GpuHost::retain_raise`, and nothing else does
+/// (docs/video-decode.md §7.11).
+#[test]
+fn every_retained_command_hands_its_pool_to_the_host() {
+    let Ok(path) = vk_registry::registry_path() else {
+        eprintln!("no vk.xml in this environment; skipping (VK_XML is set in nix develop)");
+        return;
+    };
+    let reg = vk_registry::Registry::load_from(path).expect("vk.xml loads");
+    let model = reg.model().expect("the model builds");
+    let profile = sv_codegen::profile_by_name(sv_codegen::DEFAULT_PROFILE).expect("the default profile");
+    let generated = sv_codegen::generate_gpu_entry(&model, &profile).expect("the GPU entry generates");
+    let hand = exceptions::gpu_hand_written();
+    let flat: String = generated.source.chars().filter(|c| !c.is_whitespace()).collect();
+    for name in exceptions::GPU_RETAIN_RAISE {
+        assert!(!hand.contains(name), "{name} is hand-written; the hook would never run");
+        let needle = format!("retain_raise(\"{name}\",__pool)");
+        assert!(flat.contains(&needle), "{name}: its generated forwarder does not hand over its pool");
+    }
+    assert_eq!(flat.matches(".retain_raise(\"").count(), exceptions::GPU_RETAIN_RAISE.len());
+}

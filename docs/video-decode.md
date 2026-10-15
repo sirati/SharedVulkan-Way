@@ -1598,6 +1598,295 @@ The pass/fail reading needs no judgement:
 By §86.5's rule this is one run. A fault ends GPU work on the guest until it is
 read.
 
+### 7.11 The device's features, and the guest capture run
+
+Branch `decode-capture`, 2026-10-15, devhost and testhost.
+
+#### 7.11.1 Every feature an application is told about is a feature the device enabled
+
+§7.10.4 found Zink recording `VK_EXT_extended_dynamic_state3` commands into
+a device that had not enabled one of that extension's features. The cause was
+wider than that one extension. The GPU side opens its device before any
+application connects, so it has to enable up front everything an application
+may later ask for. Meanwhile `vkGetPhysicalDeviceFeatures2` was forwarded
+verbatim, so an application was told what the *driver* supports. The device
+chained a hand-kept list of two dozen extension feature structs, and every
+struct missing from that list was enabled false and advertised true.
+
+The baseline is master's build, under the GPU-side validation layer, in a
+120 s `scripts/sv-firefox-wayland.sh soak` on RADV: **395 validation errors**,
+nearly all of that one kind.
+
+| VUID family | what was not enabled |
+|---|---|
+| `vkCmdSet*EXT-None-09423` (17 commands), `VkGraphicsPipelineCreateInfo-extendedDynamicState3*` (17) | `VK_EXT_extended_dynamic_state3` |
+| `vkCmdSetVertexInputEXT-None-08546`, `pDynamicStates-04807` | `vertexInputDynamicState` |
+| `negativeOneToOne-06470`, `depthClipControl-07453` | `depthClipControl` |
+| `attachmentFeedbackLoopDynamicState-08862`, `attachmentFeedbackLoopLayout-07313` | both feedback-loop features |
+| `VkShaderModuleCreateInfo-pCode-08740` | `shaderFloatControls2` (a 1.4 feature) |
+| `vkCmdBeginRendering-pRenderingInfo-11750` | `maintenance10` |
+| `VkDeviceCreateInfo-pNext-04748`, `-03328` | `VK_EXT_buffer_device_address` enabled beside core 1.2's |
+
+The fix, in `sv_gpu_server::features`:
+
+- **The chain comes from the registry.** `sv-codegen` now emits
+  `DEVICE_FEATURE_STRUCTS`: every struct that extends both
+  `VkPhysicalDeviceFeatures2` and `VkDeviceCreateInfo`, listed with the core
+  versions and profile extensions that provide it (245 in the `full`
+  profile). It also emits a default link per `sType` and each struct's
+  `VkBool32` members by registry name. The device chains the 1.1–1.4 core
+  blocks its version has, plus every struct an enabled extension provides that
+  no core block covers. One trap: vk.xml 1.4.350 files most promoted structs
+  under `VK_BASE_VERSION_1_x`, `VK_COMPUTE_VERSION_1_x` and
+  `VK_GRAPHICS_VERSION_1_x` rather than `VK_VERSION_1_x`.
+- **What the device leaves off on purpose, it does not advertise.**
+  `vkGetPhysicalDeviceFeatures2` is now hand-written on the GPU side
+  (`exceptions::GPU_HAND_WRITTEN`). It asks the driver, then clears every
+  member the device did not enable (`mask_to_enabled`). Two things are left
+  off on purpose. One is an exclusive pair: the KHR fragment shading rate is
+  kept over `VK_NV_shading_rate_image` and `VK_EXT_fragment_density_map`. The
+  other is `VK_EXT_descriptor_buffer`. Zink never used it through the
+  forwarder while it was advertised and not enabled: a descriptor-buffer
+  command would have drawn a message, and the baseline has none. It is
+  driver-written bytes holding GPU-side addresses, which nothing here has
+  tested. Enabled, it is also `VUID-VkDeviceCreateInfo-None-08095` beside RADV's
+  `VK_AMD_shader_fragment_mask`. With it left off, Zink stays on the path
+  every earlier run measured, on RADV and on Intel alike.
+- **A request the device cannot honour is refused.** `vkCreateDevice` checks
+  the application's chain and `pEnabledFeatures` against the enabled set
+  (`not_enabled`; a promoted struct is matched against its core block by member
+  name). A miss is `VK_ERROR_FEATURE_NOT_PRESENT`, the specification's answer,
+  with the members named on stderr. The first build after the registry
+  rewrite showed why this matters. Its block list stopped at 1.3, Zink chained
+  `VkPhysicalDeviceVulkan14Features`, and the check refused 17 members by name.
+  Before the check, that would have been silent undefined behaviour.
+  Extensions are reported, not refused.
+- `VK_EXT_buffer_device_address` is no longer enabled beside core 1.2's
+  feature.
+
+The same soak with the fix: **0 validation errors**, no refusal, and verdicts
+equal to the baseline: 24 loads, WebRender on Zink throughout, about 8000
+submits per 30 s, WebGL 328 frames. `sv-firefox-vulkan-decode.sh 90` with the
+guest's clip, a 64 MiB arena, the Intel shape layer and validation: 2663
+frames decoded and read back, 0 dropped, H.264 `HWDEC`. Validation reports
+only §7.5's `pHostPointer` message, so the dynamic-state messages and both
+BDA messages are gone.
+
+Tests (`features::tests`, seven): the regression on a real driver
+(`everything_the_driver_reports_for_an_enabled_extension_is_enabled`). It asks
+the driver about every struct an enabled extension or core version provides,
+requests all of it, and requires that the device has every member except the
+ones withheld on purpose. Once masked, it requires all of them with no
+exceptions. It passes on RADV and lavapipe. With EDS3 taken out of the chain,
+it fails on RADV and names all of EDS3's members. The other six are pure: EDS3
+is chained without being named, the whole profile chains each extension struct
+once, promoted structs stay in their block, a missing member is named, a
+promoted struct matches its block, and of an exclusive pair the KHR one is
+kept.
+
+Found on the way: with two tests in one process each opening a real driver,
+the first gate segfaulted in the Vulkan loader (`loader_scanned_icd_add` under
+`vkEnumerateInstanceExtensionProperties`) on every parallel run. The guest's
+GPU process has the same shape in production. Each ivshmem session opens and
+later drops its own driver on its own thread, and `glxtest`'s session closes
+while the browser's opens. `Driver::open` and `Driver`'s drop (including the
+loader's unload) now hold one process-wide lock.
+
+#### 7.11.2 The capture run on the guest: it faulted again, and the log says where
+
+One run, §7.10.6 as written, on 2026-10-15 at 21:36. The build was f8a2e37
+(§7.11.1): `sv-guest.exe` `e2c06903…` in `C:\Users\<guest-user>\wcgpu` and
+`libsv_icd.so` `fe55362c…` in `~/wc-launch-gpu/bin`. The session ran in session 0 with
+`SV_VIDEO_LOG` and `SV_MINIDUMP` in `wc-launch.exe`'s environment, and
+`decode-drive.py` drove it. Before it: ssh and ping were good, `query-status`
+said `running`, and QEMU (pid 230263, started 17:44, generation 51 or later;
+the system is 53) had logged `unmapping the BARs` since that start. A
+watchdog checked ssh, ping and QMP every 15 s throughout. It never failed.
+
+- **Every `vkCreateDevice` was accepted.** Intel took all of Firefox's
+  requests with the new feature chain: four sessions, no refusal, no
+  `GUARD`.
+- **It faulted, at the same instruction**, 18 s into the drive (page: 522
+  frames, `err=none` at its last sample). The fault was
+  `igvk64.dll+0x2f185b`, now a "read of `0xffffffffffffffff`". The VM kept
+  running. Health was good after it.
+- **The faulting call was `decode #551`**: an IDR (`idr_pic_id` 1) with setup
+  slot 1, no references, `sps0 pps0`, and a 32768-byte slice whose header the
+  log parsed as an IDR slice naming pps 0. It was the clip's packet-250 IDR
+  in its second loop. §87.12's fault was a few packets before packet 250 in
+  the fourth loop, by its buffered log, which is the same picture. **Zero
+  `!!` findings** in 551 decodes. Every handle was live, every slot in range,
+  every reference bound, every slice header right. The live set at the fault
+  was 1 session, 1 parameters object, 7 video images, 3 views and 3
+  bitstream buffers. Decode #251, the same IDR in loop 1, was identical in
+  every respect but one: the image behind the view. It decoded.
+- **Intel's own answers, recorded for the first time:** `caps codec 0x1:
+  flags 0x2 (SEPARATE_REFERENCE_IMAGES=1) decode flags 0x1 dpb slots 16 active
+  refs 16 bitstream align 4096/4096`. Decode flags `0x1` are
+  `DPB_AND_OUTPUT_COINCIDE`. §7.10.2's table said Intel lacks COINCIDE, and
+  the shape layer clears it, so **no local run ever took the guest's path**.
+  On the guest, in all 551 decodes, the output view is the setup view, and
+  ffmpeg creates that view for each frame on one of 7 frame-pool images and
+  destroys it when the frame is released.
+- **Views are the only objects that die.** Images, buffers, the session and
+  the parameters object live from start to fault. Views: 551 created, 548
+  destroyed. **539 of the creates land at a destroyed view's
+  address**, 289 in loop 1 and 250 in loop 2. In loop 2 an address names a
+  different image than it did in loop 1. `v1c87764a498` was image `…be2b8`
+  at #3 and image `…b5238` at #551.
+
+The minidump (21.9 MB, collected and then deleted from the guest), read with
+breakpad's `minidump_stackwalk`, the guest's own `igvk64.dll` and
+`igvkMedia64.dll`, and `llvm-objdump`:
+
+```
+igvk64.dll+0x2f1850:  mov %rdi,0x20(%rsp); push %r14; sub $0x20,%rsp
+igvk64.dll+0x2f185b:  mov 0x78(%rcx),%r8          <- fault
+rcx = 0x800006a722ca67ac  (non-canonical: a #GP, reported as a read of -1)
+caller, igvkMedia64.dll+0x2c63d..0x2c655:
+    rax = [arg2+0x208]; rcx = [[rax+0x10]]; call [r8+0x2588]   (CFG dispatch)
+```
+
+So Intel's media layer takes a resource (`arg2`) and follows two pointers from
+it to the driver object behind it, and that object pointer is garbage. In
+§87.12 it was `4` (`4 + 0x78` = the `0x7c` read). The intermediate objects are
+not in the dump: it keeps only memory reachable from stacks and registers.
+Every view the dump does contain carries Intel's view magic `0x01cdc0de` and a
+live image.
+
+**The reading, as it stood after this run** (§7.11.4 refutes it: with the
+views kept alive the fault came anyway). Intel's decoder keeps something derived from a picture's
+view across decodes. ffmpeg destroys that view after the frame, and the
+driver later follows a pointer through the freed memory. Whether that
+faults, and with what, depends on what the allocator has put there since:
+nothing in loop 1, garbage at a later IDR. The specification binds each
+call's pictures through the views named in that call, so this is a driver
+defect. It is §7.10.5's candidate 1, now with the faulting instruction and
+the view churn measured. Candidates 2 and 3 are out: every slice header read
+right at record time, and no scope was open at a submit.
+
+#### 7.11.3 The workaround: a video image's views live as long as the image
+
+> **[SUPERSEDED as the fix — §7.11.4.]** The cache does what it says, and the
+> confirmation run still faulted. It stays in: it is harmless, it removes one
+> class of stale view on every driver, and the next run is measured with it.
+
+`sv_gpu_server::video_views`. `vkCreateImage`, `vkCreateImageView`,
+`vkDestroyImageView` and `vkDestroyImage` are now hand-written on the GPU side
+(`exceptions::GPU_HAND_WRITTEN`, section 7). They forward exactly as the
+generated code did, and they report to `SV_VIDEO_LOG` themselves. The
+cache works like this:
+
+- an image created with a video decode usage (`DST`, `SRC` or `DPB`) is
+  recorded;
+- the first `vkCreateImageView` of such an image with a given description
+  (the whole wire `VkImageViewCreateInfo`, handles mapped) creates a driver
+  view and keeps it; later identical requests get that driver view, and the
+  driver is not called;
+- `vkDestroyImageView` of a kept view does not reach the driver;
+- `vkDestroyImage` destroys the image's kept views first, then the image;
+- a session's leftovers (`Objects::destroy_leftovers`) destroy kept views with
+  the other views, before images, each driver view once, even when two
+  application ids named it.
+
+The application still gets one handle per call. ffmpeg asks for one or two
+descriptions per image, so the cache is bounded by images, not frames. It
+applies on every driver, so RADV runs the same code the guest does.
+`SV_VIDEO_VIEW_CACHE=0` turns it off.
+
+**Locally, on RADV with the Intel shape layer and validation, 120 s:**
+3564 frames decoded and read back, 0 dropped, H.264 `HWDEC`. `SV_VIDEO_LOG`:
+3566 decodes, 24 IDRs, **13 driver views created in the whole run, 0
+destroyed during it, 0 address reuses**, 0 findings. Validation: only §7.5's
+`pHostPointer` message. The Firefox soak of §7.11.1 again: 0 validation
+errors, the same verdicts. RADV cannot take the coincide path (it reports
+DISTINCT only), so the local run proves the cache and that nothing
+regressed. Only the guest can show the fault gone.
+
+Tests: `video_views`' three (one create per description, distinct
+descriptions and non-video images, leftovers) run under Miri, as do the six
+pure `features` tests. The real-driver leftover test now includes a kept view
+and a second id naming one view. It destroys 19 objects plus the pipeline
+ones, each once.
+
+#### 7.11.4 The confirmation run: the view cache did not stop it
+
+The one confirmation run, at 22:00, with build 4281721: `sv-guest.exe`
+`88768149…`; the ICD was unchanged. The same session and drive as §7.11.2, with
+the same health checks before, during (52 samples, all good) and after. QEMU
+was still pid 230263 throughout.
+
+- **The cache worked as designed.** 7 driver views for the whole run (one per
+  frame-pool image), none destroyed, no address reuse, 0 findings.
+- **It faulted anyway**, 9 s in, at **decode #251**: the packet-250 IDR again,
+  now in the first loop, with setup slot 1, no references and 32768 bytes. The
+  fault was in the same function, at `igvk64.dll+0x2f1936`, as "access of
+  `0x0`". The VM kept running.
+- The minidump shows `mov 0x430(%rbp,%r8),%rcx` with `r8 =
+  0xa7a7a7a7a7a7a7a7`. **That is this side's guard canary**
+  (`sv_gpu_entry::CANARY`). The function's object argument was a 16-byte
+  allocation from one of *our* `Raise` pools, and `[obj+0x78]` read the guard
+  behind it. So the pointer Intel followed, `[[arg2+0x208]+0x10]`, named heap
+  memory that had been freed and handed to this side's own allocations since.
+  In the capture run the same memory held garbage (`0x800006a722ca67ac`); in
+  §87.12 it held `4`.
+
+So §7.11.3 is **not the fix**, and §7.10.5's candidate 1 was not the cause.
+Intel's views no longer die, and the stale pointer remains. The three faults
+share one picture, not one loop: **the IDR at packet 250**, an IDR that
+arrives with the DPB full of earlier pictures and no reset before it. The IDRs
+at a start (#1) or after a flush (#301) have never faulted. What remains:
+
+- **H1: Intel keeps a pointer into a structure from an earlier call.** For
+  example, a slot's `VkVideoPictureResourceInfoKHR` from the decode that set
+  it up, which it follows when an IDR retires the slots. Native ffmpeg keeps
+  those structures in per-picture memory that its frame pool recycles, so
+  such a pointer would always read *some* valid picture. The forwarder's
+  `Raise` pool frees its copies when the call returns, and the heap reuses
+  them at once, as the canary shows. This fits all three faults.
+- **H2: an Intel-internal use-after-free** of something other than views,
+  such as per-command-buffer state (ffmpeg alternates two command buffers).
+
+The dump cannot separate them. The pointer's holder is not in it: a minidump
+with `MiniDumpWithIndirectlyReferencedMemory` keeps what stacks and
+registers reach, not heap that only heap reaches.
+
+**The experiment that separates them is built and not run.** The generated
+forwarders of `vkCmdBeginVideoCodingKHR`, `vkCmdControlVideoCodingKHR` and
+`vkCmdDecodeVideoKHR` hand their raise pool to `GpuHost::retain_raise`
+(`exceptions::GPU_RETAIN_RAISE`; `tests/gpu_observed.rs` checks the hook is
+emitted for exactly those three). `GpuServer` keeps the last
+`SV_VIDEO_RETAIN` of them per ring, and none by default. Locally, with
+`SV_VIDEO_RETAIN=4096`, the Intel shape and validation: 2662 frames, 0
+dropped, peak RSS of the serving process 186 MB. The next authorised guest
+run is §7.11.2's drive with `SV_VIDEO_RETAIN=8192`, which keeps every video
+command's structures for a 60 s soak at about 5 KB each. No fault at packet
+250 means H1. Then the exact fix is to give the driver per-slot picture
+structures that live as long as the session, as ffmpeg's pool does. A fault
+means H2, and it goes to Intel with this log and dump.
+
+**Not done, because the soak did not survive:** hardware decode is not
+enabled in the deployed launcher (`wcivs` runs the stock Firefox 157 and no
+decode prefs, as §87.12 left it), and no about:support Media capture was
+taken on the guest. The test installation `wcgpu` has build 4281721's
+`sv-guest.exe`; its previous binaries are beside it as `sv-guest.exe.prev`
+(f0b8d9d) and `sv-guest.exe.capture` (f8a2e37). Both dumps were deleted from
+the guest after copying. They are not in the repository (22 MB of process
+memory each). The logs of both runs are in `docs/video-decode/guest-7.11/`.
+
+**Gates**, on this branch (master 4f4ea7d plus f8a2e37, 4281721 and the
+commit that adds this paragraph). `cargo test --workspace --no-fail-fast`:
+**101 binaries, 2815 passed, 0 failed**, 8 ignored (master: 2804; +7 for
+`features`, +3 for `video_views`, +1 for the retain hook). `cargo clippy
+--workspace --all-targets`: exit 0, no warning in a file this branch touched.
+`cargo check --workspace --target x86_64-pc-windows-gnu`: exit 0.
+`wc-pool: OK`, `wc-keymap: OK`. Miri (`nix develop .#miri`): the six pure
+`features` tests and `video_views`' three, no undefined behaviour. The new
+`unsafe` is calls into a real driver (`features::query_driver`, the four
+hand-written commands) and `ManuallyDrop::drop` of the loader under
+`Driver`'s lock, none of which Miri runs. They are covered by the real-driver
+tests on RADV and lavapipe.
+
 ## What this does not tell us
 
 > **[PARTLY SUPERSEDED — 2026-10-15, §7.]** The first two bullets and the

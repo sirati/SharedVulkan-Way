@@ -135,15 +135,50 @@ pub struct GpuServer {
     /// dispatch just after. Per-dispatch, which is why it is taken rather than
     /// read — a stale one would be reported against the next command.
     dispatch_poison: Option<&'static str>,
+    /// Raise pools of the last `SV_VIDEO_RETAIN` video commands this ring
+    /// replayed (`exceptions::GPU_RETAIN_RAISE`, docs/video-decode.md §7.11).
+    /// Empty unless the variable is set.
+    retained: std::collections::VecDeque<sv_gpu_entry::Raise>,
+}
+
+/// `SV_VIDEO_RETAIN`: how many video commands' raise pools a ring keeps; 0,
+/// the default, keeps none.
+fn video_retain_limit() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SV_VIDEO_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 impl GpuServer {
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
-        GpuServer { shared, last_error: None, poisoned: Default::default(), dispatch_poison: None }
+        GpuServer {
+            shared,
+            last_error: None,
+            poisoned: Default::default(),
+            dispatch_poison: None,
+            retained: Default::default(),
+        }
     }
 
     fn d(&self) -> &ash::Device {
         &self.shared.driver.device
+    }
+
+    /// `vkDestroyImageView` on the driver, observed.
+    fn destroy_view_on_driver(&mut self, device: u64, view: u64) {
+        let Some(f) = self.fns().vk_destroy_image_view else {
+            self.note_missing("vkDestroyImageView");
+            return;
+        };
+        let words = [device, view, 0];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkDestroyImageView", false, &words, 0);
+        }
+        // SAFETY: both handles are the driver's, from the table or the cache.
+        unsafe { f(device as usize as _, view, core::ptr::null()) };
+        if obs {
+            self.observe("vkDestroyImageView", true, &words, 0);
+        }
     }
 
     /// Record a table failure and turn it into a wire error.
@@ -429,6 +464,17 @@ impl GpuHost for GpuServer {
         unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
     }
 
+    fn retain_raise(&mut self, _command: &'static str, pool: sv_gpu_entry::Raise) {
+        let keep = video_retain_limit();
+        if keep == 0 {
+            return;
+        }
+        self.retained.push_back(pool);
+        while self.retained.len() > keep {
+            self.retained.pop_front();
+        }
+    }
+
     fn take_poisoned_command_buffer(&mut self) -> Option<&'static str> {
         self.dispatch_poison.take()
     }
@@ -513,6 +559,38 @@ impl GpuHost for GpuServer {
         // said yes at all. What an application cannot do here is ask for
         // *less* — which no application does, and which costs nothing but the
         // validation layer's opinion of it.
+        //
+        // What it must not do is ask for a feature the device lacks and be
+        // told yes: every command using it would then be undefined behaviour
+        // on the driver (Zink and `VK_EXT_extended_dynamic_state3`,
+        // docs/video-decode.md §7.11). That is the specification's
+        // `VK_ERROR_FEATURE_NOT_PRESENT`, and the members are named.
+        if let Some(info) = a.p_create_info.as_deref() {
+            let driver = &self.shared.driver;
+            let missing = crate::features::not_enabled(info, &driver.features);
+            if !missing.is_empty() {
+                eprintln!(
+                    "sv-gpu-server: vkCreateDevice asks for {} feature(s) this device did not \
+                     enable, refused with VK_ERROR_FEATURE_NOT_PRESENT: {}",
+                    missing.len(),
+                    missing.join(", ")
+                );
+                return Ok(p::VkCreateDeviceReply {
+                    result: fail(vk::Result::ERROR_FEATURE_NOT_PRESENT),
+                    p_device: None,
+                });
+            }
+            // Extensions are reported, not refused: the app side implements some
+            // itself (WSI), and the GPU side drops some it advertises when their
+            // instance-level dependency is absent (`crate::driver`).
+            for e in &info.pp_enabled_extension_names {
+                let e = String::from_utf8_lossy(e);
+                let e = e.trim_end_matches('\0');
+                if !driver.enabled_extensions.iter().any(|x| x == e) {
+                    eprintln!("sv-gpu-server: vkCreateDevice enables {e}, which this device did not");
+                }
+            }
+        }
         let raw = self.shared.driver.device.handle();
         if let Some(d) = a.p_device {
             self.shared.objects().insert(d.0, HandleType::VkDevice, raw);
@@ -678,6 +756,142 @@ impl GpuHost for GpuServer {
         Ok(p::VkCreateBufferReply { result: p::VkResult(r.0), p_buffer: a.p_buffer })
     }
 
+    // -- video images and their views (docs/video-decode.md §7.11) -----------
+    //
+    // Forwarded as the generated code would, plus `crate::video_views`: a video
+    // image's views are created once per description and destroyed with the
+    // image, because Intel's Windows driver reads a view after ffmpeg has
+    // destroyed it. The observer sees exactly the calls the driver sees.
+
+    fn create_image(&mut self, a: p::VkCreateImageArgs) -> WireResult<p::VkCreateImageReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_image_create_info(info, m)?;
+        }
+        let Some(f) = self.fns().vk_create_image else {
+            self.note_missing("vkCreateImage");
+            return Ok(p::VkCreateImageReply { result: p::VkResult(-3), p_image: None });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let ci = sv_gpu_entry::raise_vk_image_create_info(info, &mut pool)?;
+        let mut image = Default::default();
+        let device = a.device.0 as usize as _;
+        let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut image) as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCreateImage", false, &words, 0);
+        }
+        // SAFETY: `ci` and everything it points to live in `pool`.
+        let r = unsafe { f(device, &ci, core::ptr::null(), &mut image) };
+        if obs {
+            self.observe("vkCreateImage", true, &words, r.0);
+        }
+        if r.0 == 0 {
+            self.shared.objects().video_views.image_created(image as usize as u64, ci.usage.0);
+        }
+        if let Some(id) = a.p_image {
+            self.bind(id.0, HandleType::VkImage, image as usize as u64);
+        }
+        Ok(p::VkCreateImageReply { result: p::VkResult(r.0), p_image: a.p_image })
+    }
+
+    fn create_image_view(
+        &mut self,
+        a: p::VkCreateImageViewArgs,
+    ) -> WireResult<p::VkCreateImageViewReply> {
+        let mut a = a;
+        a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
+        {
+            let mut ad = sv_gpu_entry::Mapping(&mut *self);
+            let m: &mut dyn p::HandleMapper = &mut ad;
+            p::handle_map_vk_image_view_create_info(info, m)?;
+        }
+        use crate::video_views::Create;
+        let plan = if crate::video_views::enabled() {
+            self.shared.objects().video_views.lookup(info)
+        } else {
+            Create::Forward
+        };
+        if let Create::Reuse(view) = plan {
+            if let Some(id) = a.p_view {
+                self.bind(id.0, HandleType::VkImageView, view);
+            }
+            return Ok(p::VkCreateImageViewReply { result: OK, p_view: a.p_view });
+        }
+        let Some(f) = self.fns().vk_create_image_view else {
+            self.note_missing("vkCreateImageView");
+            return Ok(p::VkCreateImageViewReply { result: p::VkResult(-3), p_view: None });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let ci = sv_gpu_entry::raise_vk_image_view_create_info(info, &mut pool)?;
+        let mut view = Default::default();
+        let device = a.device.0 as usize as _;
+        let words = [a.device.0, (&raw const ci) as u64, 0, (&raw mut view) as u64];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkCreateImageView", false, &words, 0);
+        }
+        // SAFETY: `ci` and everything it points to live in `pool`.
+        let r = unsafe { f(device, &ci, core::ptr::null(), &mut view) };
+        if obs {
+            self.observe("vkCreateImageView", true, &words, r.0);
+        }
+        let view = view as usize as u64;
+        if r.0 == 0 && plan == Create::CreateAndKeep {
+            self.shared.objects().video_views.keep((**info).clone(), view);
+        }
+        if let Some(id) = a.p_view {
+            self.bind(id.0, HandleType::VkImageView, view);
+        }
+        Ok(p::VkCreateImageViewReply { result: p::VkResult(r.0), p_view: a.p_view })
+    }
+
+    fn destroy_image_view(&mut self, a: p::VkDestroyImageViewArgs) -> WireResult<()> {
+        let id = a.image_view.0;
+        let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let view = self.map_handle(HandleType::VkImageView, id)?;
+        self.unbind(id);
+        if view == 0 || self.shared.objects().video_views.is_kept(view) {
+            return Ok(());
+        }
+        self.destroy_view_on_driver(device, view);
+        Ok(())
+    }
+
+    fn destroy_image(&mut self, a: p::VkDestroyImageArgs) -> WireResult<()> {
+        let id = a.image.0;
+        let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
+        let image = self.map_handle(HandleType::VkImage, id)?;
+        self.unbind(id);
+        if image == 0 {
+            return Ok(());
+        }
+        let kept = self.shared.objects().video_views.image_destroyed(image);
+        for view in kept {
+            self.destroy_view_on_driver(device, view);
+        }
+        let Some(f) = self.fns().vk_destroy_image else {
+            self.note_missing("vkDestroyImage");
+            return Ok(());
+        };
+        let words = [device, image, 0];
+        let obs = self.observing();
+        if obs {
+            self.observe("vkDestroyImage", false, &words, 0);
+        }
+        // SAFETY: both handles are the driver's, from the table.
+        unsafe { f(device as usize as _, image, core::ptr::null()) };
+        if obs {
+            self.observe("vkDestroyImage", true, &words, 0);
+        }
+        Ok(())
+    }
+
     fn free_memory(&mut self, a: p::VkFreeMemoryArgs) -> WireResult<()> {
         let id = a.memory.0;
         if id == crate::ARENA_MEMORY_ID {
@@ -740,6 +954,24 @@ impl GpuHost for GpuServer {
                 &self.shared.driver.mem_props,
             ))),
         })
+    }
+
+    /// The driver's answer, masked to what this device enabled
+    /// (`crate::features::mask_to_enabled`): an application told a feature is
+    /// supported asks for it, and the device it gets already exists.
+    fn get_physical_device_features2(
+        &mut self,
+        a: p::VkGetPhysicalDeviceFeatures2Args,
+    ) -> WireResult<p::VkGetPhysicalDeviceFeatures2Reply> {
+        let driver = &self.shared.driver;
+        let template = a.p_features.map(|f| *f).unwrap_or_default();
+        let mut f = crate::features::query_driver(&driver.instance, driver.pd, &template)
+            .map_err(|e| {
+                eprintln!("sv-gpu-server: vkGetPhysicalDeviceFeatures2: {e}");
+                WireError::UnknownCommand { opcode: 0 }
+            })?;
+        crate::features::mask_to_enabled(&mut f, &driver.features);
+        Ok(p::VkGetPhysicalDeviceFeatures2Reply { p_features: Some(Box::new(f)) })
     }
 
     fn get_physical_device_memory_properties2(

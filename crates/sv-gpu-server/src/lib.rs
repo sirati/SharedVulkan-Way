@@ -23,6 +23,7 @@ extern crate self as sv_gpu_server;
 pub mod arena;
 pub mod entry;
 pub mod fault;
+pub mod features;
 pub mod ivshmem;
 pub mod convert;
 pub mod driver;
@@ -31,6 +32,7 @@ pub mod session;
 pub mod set_layout;
 pub mod table;
 pub mod video_log;
+pub mod video_views;
 pub mod workload;
 
 /// The reserved object id for "the arena's own `VkDeviceMemory`".

@@ -793,6 +793,15 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "a GPU side has one queue on one family; the driver's table is not ours to pass on",
     ),
     ("vkGetPhysicalDeviceQueueFamilyProperties2", "as vkGetPhysicalDeviceQueueFamilyProperties"),
+    // The same argument for features (docs/video-decode.md §7.11). The device
+    // exists before the application asks, so what it is told is supported must
+    // be what that device *enabled*: forwarded verbatim, the driver said yes to
+    // `VK_EXT_extended_dynamic_state3` while the device had it off, and Zink
+    // used it.
+    (
+        "vkGetPhysicalDeviceFeatures2",
+        "the answer is masked to the features the already-open device enabled",
+    ),
     // The memory table again, met from the other end (docs/video-decode.md §7).
     // The driver answers `memoryTypeBits` in *its* numbering, and an application
     // reads it against docs/design.md §9.1's four types. Session memory is
@@ -853,6 +862,18 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
         "vkCreateDescriptorSetLayout",
         "an all-zero binding-flags link is dropped, exactly; Intel's Windows driver faults on it",
     ),
+    // --- 7. a lifetime one driver gets wrong ----------------------------------
+    //
+    // Intel's Windows driver reads a decode picture's image view after the
+    // application has destroyed it, and faulted inside `vkCmdDecodeVideoKHR` on
+    // the guest twice (docs/video-decode.md §7.11). A video image's views are
+    // therefore made once per description and destroyed with the image
+    // (`sv_gpu_server::video_views`), which needs all four commands: the image's
+    // usage at creation, the view's description, and both destroys.
+    ("vkCreateImage", "records which images are video images, for vkCreateImageView"),
+    ("vkCreateImageView", "a video image's view is made once per description and kept"),
+    ("vkDestroyImageView", "a kept view is not destroyed until its image is"),
+    ("vkDestroyImage", "destroys the image's kept views first"),
 ];
 
 /// The generated commands whose driver call `GpuHost::observe` sees, before and
@@ -867,10 +888,12 @@ pub const GPU_HAND_WRITTEN: &[(&str, &str)] = &[
 /// and the submits that run them — and `sv_gpu_server::video_log` writes one
 /// line per call *before* the driver sees it when `SV_VIDEO_LOG` is set.
 ///
-/// Images, views and buffers are here for their lifetimes: the log only keeps
-/// the ones a video command uses, and it is the order of their destroys
-/// against the decodes that name them that the log exists to show. Every entry
-/// must be a generated command; a hand-written one calls the observer itself.
+/// Buffers are here for their lifetimes: the log only keeps the ones a video
+/// command uses, and it is the order of their destroys against the decodes that
+/// name them that the log exists to show. Images and views were too, until
+/// they became hand-written for the view cache (docs/video-decode.md §7.11);
+/// they report themselves now. Every entry must be a generated command; a
+/// hand-written one calls the observer itself.
 pub const GPU_OBSERVED: &[&str] = &[
     "vkGetPhysicalDeviceVideoCapabilitiesKHR",
     "vkCreateVideoSessionKHR",
@@ -878,10 +901,6 @@ pub const GPU_OBSERVED: &[&str] = &[
     "vkCreateVideoSessionParametersKHR",
     "vkUpdateVideoSessionParametersKHR",
     "vkDestroyVideoSessionParametersKHR",
-    "vkCreateImage",
-    "vkDestroyImage",
-    "vkCreateImageView",
-    "vkDestroyImageView",
     "vkDestroyBuffer",
     "vkBindBufferMemory",
     "vkCmdBeginVideoCodingKHR",
@@ -891,6 +910,20 @@ pub const GPU_OBSERVED: &[&str] = &[
     "vkQueueSubmit",
     "vkQueueSubmit2",
 ];
+
+/// The generated commands whose raise pool `GpuHost::retain_raise` is handed
+/// after the driver call, instead of dropping it (docs/video-decode.md §7.11).
+///
+/// The guest's Intel driver faulted in `vkCmdDecodeVideoKHR` three times,
+/// each time by following a stale pointer at an IDR. In the last run the
+/// memory that pointer named had been reused by this side's own raise
+/// allocations. One explanation is that the driver keeps a pointer into a
+/// structure it was handed by an earlier call. Native ffmpeg keeps those
+/// structures in pooled per-picture memory, which would hide that; the
+/// forwarder frees each call's copies when the call returns. Keeping the pools
+/// (`SV_VIDEO_RETAIN`) is the experiment that tells the two explanations apart.
+pub const GPU_RETAIN_RAISE: &[&str] =
+    &["vkCmdBeginVideoCodingKHR", "vkCmdControlVideoCodingKHR", "vkCmdDecodeVideoKHR"];
 
 /// Just the names, for the generator's set membership.
 pub fn gpu_hand_written() -> Vec<&'static str> {
