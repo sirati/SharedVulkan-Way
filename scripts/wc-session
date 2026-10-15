@@ -559,6 +559,16 @@ run)
     "$HOME"/.wc-launch/*)
       mkdir -p "$PROFILE" 2>/dev/null
       printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
+      # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
+      # session can end with Firefox still running -- `down`, the guest logging
+      # off, the VM host's proxy going -- and Firefox counts a run that did not
+      # end cleanly as a startup crash; after three in a row it puts a modal
+      # dialog in front of the next start, in a window the user did not ask for
+      # and on a desktop where nobody may be able to answer it. -1 turns the
+      # count off. Every launcher profile, always: it is a property of how this
+      # deployment ends Firefox, not of any one session.
+      printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
+        >> "$PROFILE/user.js"
       if [ ${#GPUENV[@]} -gt 0 ]; then
         printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
           >> "$PROFILE/user.js"

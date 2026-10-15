@@ -133,6 +133,16 @@ def main():
     log("hello", hello=m.hello)
     m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})
     m.call("WebDriver:SetTimeouts", {"pageLoad": 60000, "script": 30000})
+    # A fresh profile's first window can come up small enough that the wheel
+    # at (200, 200) is outside it (waycompose-design.md §87 measured a 500x52
+    # viewport through the launcher), and every scroll is then an error rather
+    # than a scroll. Ask for the size the other harnesses use; a compositor
+    # that refuses leaves the window as it was, and the log says which.
+    try:
+        rect = m.call("WebDriver:SetWindowRect", {"width": 1280, "height": 900})
+        log("window", rect=rect)
+    except RuntimeError as e:
+        log("window", error=str(e)[:200])
     log("session")
     rounds = 0
     while time.monotonic() - T0 < SECS:
@@ -159,6 +169,20 @@ def main():
                 # A page that fails to load is recorded and the tour goes on;
                 # a browser that has gone away ends the run below.
                 log("step-error", url=url, error=str(e)[:300])
+    # The frame rate *while scrolling* (waycompose-design.md §87): the long
+    # page, a requestAnimationFrame counter, and wheel input for about five
+    # seconds. rAF runs at the rate the compositor's frame callbacks allow, so
+    # this is what a person scrolling sees, not what the GPU could do.
+    try:
+        m.call("WebDriver:Navigate", {"url": TOUR[0]})
+        m.script("""window.__fps = {n: 0, t0: performance.now()};
+                    (function f(){ window.__fps.n++; requestAnimationFrame(f); })();""")
+        wheel(m, 120, 40)
+        r = m.script("""const d = performance.now() - window.__fps.t0;
+                        return {frames: window.__fps.n, ms: d, y: window.scrollY};""")
+        log("scroll-fps", fps=round(r["frames"] * 1000.0 / r["ms"], 1), **r)
+    except (RuntimeError, socket.timeout, KeyError, TypeError) as e:
+        log("scroll-fps", error=str(e)[:200])
     m.call("WebDriver:Navigate", {"url": "about:support"})
     time.sleep(3)
     text = m.script("return document.body.innerText;")

@@ -87,6 +87,9 @@ HOSTLINK="${WC_LAUNCH_HOSTLINK:-<host-user>@<host-nat-ip>}"
 # no `bin/firefox` in it at all, so neither that path nor `command -v firefox`
 # nor `/run/current-system/sw/bin/firefox` is an answer on this machine.
 FIREFOX="${WC_LAUNCH_FIREFOX:-firefox}"
+# The profile, which must be under the VM host's ~/.wc-launch for `run` to write
+# its user.js; a second installation that may run beside the first needs its own.
+# WC_LAUNCH_PROFILE.
 NATIVE_FIREFOX='C:\Program Files\Mozilla Firefox\firefox.exe'
 
 ARENA_MIB="${WC_LAUNCH_ARENA_MIB:-64}"
@@ -432,7 +435,7 @@ gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 [app.firefox]
 title = $TITLE
 icon  = firefox
-exec  = $FIREFOX --profile ~/.wc-launch/firefox
+exec  = $FIREFOX --profile ${WC_LAUNCH_PROFILE:-~/.wc-launch/firefox}
 prefs = middlemouse.paste=false${WC_LAUNCH_EXTRA_PREFS:+;$WC_LAUNCH_EXTRA_PREFS}
 # §82: the default, named so the deployed ini says which arrangement it ran.
 # WC_LAUNCH_TITLEBAR=none runs the opt-out.
