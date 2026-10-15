@@ -13,18 +13,39 @@
 # starts applications, and it is not a shell.
 #
 #   wc-session ping
+#   wc-session up   ID RUNID ivshmem          check the ivshmem arena's header against
+#                                             the run id the compositor printed. No
+#                                             root and no locate: the product path (§82).
 #   wc-session up   ID RUNID PAGES OUTBOUND [frames]
 #                                             locate the guest-RAM arena, write the
 #                                             plan. With `frames`, the arena's page
 #                                             frame list arrives on stdin and is
 #                                             translated instead of swept for.
-#   wc-session proxy ID                       start wc-proxy on the plan, as root
+#   wc-session proxy ID                       start wc-proxy: as this user on an
+#                                             ivshmem session, as root on a guest-RAM one
 #   wc-session run  ID BASE64CMD              run a Wayland client against that proxy
 #   wc-session icon APPID                     the app's icon from this machine's theme
 #   wc-session down ID                        stop the proxy and remove the run directory
 #   wc-session status ID
 #
-# THE ARENA IS GUEST RAM AND THERE IS NO OTHER KIND HERE
+# THE ARENA IS NEVER A FILE ARENA, AND SINCE §82 THE PRODUCT PATH HAS NO ROOT
+#
+# Two substrates reach this script, and on both the guest and this machine map
+# the same physical pages:
+#
+#   * IVSHMEM, the product path (docs/waycompose-design.md §82). The compositor maps
+#     BAR2 of a QEMU ivshmem-plain device, and QEMU backs that BAR with $ARENA,
+#     a file whose group is what lets this user open it. `up ID RUNID ivshmem`
+#     checks the header the compositor wrote against the run id it printed;
+#     `proxy` runs wc-proxy **as this user** in a user unit; `down` stops that
+#     unit. $ROOTC is called by none of the three. If the file is absent or this
+#     user cannot open it, `up` fails and says so. There is no fallback to the
+#     guest-RAM path (§34.2): a session that quietly became root again would be
+#     the regression §82 exists to remove.
+#   * GUEST RAM, the developer harnesses' path, kept as it was and described
+#     below. It needs root for the reason §12.9 gives.
+#
+# THE GUEST-RAM ARENA
 #
 # `up` takes a run id and a page count that only a compositor which has pinned
 # and stamped its own memory can produce, and `proxy` starts wc-proxy with
@@ -52,6 +73,8 @@ BASE="${WC_LAUNCH_BASE:-$HOME/wc-launch}"
 BIN="$BASE/bin"
 RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
 ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
+# IVSHMEM ARENA. Made by the VM's own unit, 0660 root:wc-arena (§82).
+ARENA="${WC_LAUNCH_ARENA:-/run/windows-vm/wc-arena/arena}"
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -130,6 +153,35 @@ up)
   ID="${1:-}"; RUNID="${2:-}"; PAGES="${3:-}"; OUTBOUND="${4:-1048576}"
   check_id "$ID"
   case "$RUNID" in 0x*[!0-9a-fA-Fx]*|"") die "bad run id" ;; esac
+  # IVSHMEM ARENA (§82). Nothing to locate: QEMU was told where the region is,
+  # by a path, before the guest booted. What is left is to check that the
+  # region *now* describes the compositor that asked -- magic, then run id --
+  # because a header from a compositor that has exited stays in the file until
+  # the next one clears it. The proxy checks the same again when it maps the
+  # region; this check is here so that a wrong region fails at `up`, with the
+  # reason, rather than as a proxy that never binds its socket.
+  if [ "$PAGES" = ivshmem ]; then
+    case "$RUNID" in 0x*) ;; *) die "bad run id" ;; esac
+    D=$(dir_of "$ID")
+    rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
+    [ -e "$ARENA" ] || die "no ivshmem arena at $ARENA: the VM has no wc-arena device (virtualisation.windowsVm.waycomposeArena), and there is no fallback to guest RAM"
+    if [ ! -r "$ARENA" ] || [ ! -w "$ARENA" ]; then
+      die "$ARENA exists and $(id -un) cannot read and write it: not in its group ($(stat -c %G "$ARENA" 2>/dev/null)), and there is no fallback to root"
+    fi
+    MAGIC=$(head -c 8 "$ARENA" 2>/dev/null | tr -d '\0')
+    [ "$MAGIC" = WCIVSHM1 ] || die "$ARENA has no published header (magic '$MAGIC'): the compositor has not published, or has exited"
+    # The u64s are little-endian and so is this machine, so od prints them as
+    # numbers. Offsets are wc_handle::ivshmem's: run id 16, generation 24, length 32.
+    HAVE=$(od -A n -t x8 -j 16 -N 8 "$ARENA" | tr -d ' ')
+    WANT=$(printf '%016x' "$RUNID")
+    [ "$HAVE" = "$WANT" ] || die "$ARENA describes run 0x$HAVE and the compositor said $RUNID: another compositor's header"
+    GEN=$(od -A n -t u8 -j 24 -N 8 "$ARENA" | tr -d ' ')
+    LEN=$(od -A n -t u8 -j 32 -N 8 "$ARENA" | tr -d ' ')
+    printf '%s\n' "$RUNID" >"$D/arena.run"
+    echo "ivshmem run $RUNID generation $GEN, $LEN bytes at $ARENA"
+    echo "up ok $D"
+    exit 0
+  fi
   case "$PAGES$OUTBOUND" in *[!0-9]*|"") die "bad page count" ;; esac
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
@@ -219,6 +271,43 @@ up)
 proxy)
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
+  # IVSHMEM ARENA (§82): this user, a user unit, no $ROOTC. The socket is made
+  # by this user, so there is nothing to chown. `--arena-run` is the run id `up`
+  # checked, and the proxy refuses a header carrying any other. No
+  # `--arena-grow`: a BAR is the size QEMU made it, and the proxy refuses the
+  # flag on this transport rather than arm growth with nothing behind it.
+  #
+  # A *user* unit rather than `setsid`, for the reason the root path used a
+  # transient unit: it outlives this ssh exec, `down` can stop it by name, and
+  # its journal is a record. It needs this user's manager to outlive logins
+  # (`loginctl enable-linger`), and says so if it does not.
+  if [ -f "$D/arena.run" ]; then
+    [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
+    UNIT="wc-launch-$ID"
+    RUN=$(cat "$D/arena.run")
+    {
+      echo '#!/usr/bin/env bash'
+      echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
+      printf 'rm -f %q\n' "$D/wl-proxy"
+      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 --copy damage --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" \
+        "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
+    } >"$D/proxy.sh"
+    chmod 755 "$D/proxy.sh"
+    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    systemctl --user reset-failed "$UNIT" 2>/dev/null
+    systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
+      || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
+    for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
+    if [ ! -S "$D/wl-proxy" ]; then
+      echo "wc-session: the proxy never bound its socket" >&2
+      tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
+      exit 1
+    fi
+    echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem)"
+    exit 0
+  fi
   [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
   [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
   [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
@@ -393,8 +482,15 @@ icon)
 down)
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
-  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
-    "wc-launch-$ID" "wc-launch-$ID" | "$ROOTC" >/dev/null 2>&1
+  # The user unit first, always: stopping one that does not exist costs
+  # nothing. Root only for a guest-RAM session, which is the kind that wrote a
+  # plan; an ivshmem session never had a root unit to stop (§82).
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-$ID" 2>/dev/null
+  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
+  if [ -f "$D/arena.plan" ]; then
+    printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
+      "wc-launch-$ID" "wc-launch-$ID" | "$ROOTC" >/dev/null 2>&1
+  fi
   rm -rf "$D"
   echo "down ok"
   ;;
