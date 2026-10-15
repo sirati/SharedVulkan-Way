@@ -80,6 +80,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage8"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # STAGE 13: named, not hard-coded, and it is §16.8's rule arriving here one
 # stage late. More than one experiment runs against this guest at a time, and a

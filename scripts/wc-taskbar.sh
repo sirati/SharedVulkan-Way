@@ -77,6 +77,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage32"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 # STAGE 41. This harness ssh's into a real Windows guest, which is the fact
 # `wc_substrate_declare` needs in order to refuse to hand this run the
 # file-arena escape hatch. Set before the library is sourced, because it reads it.

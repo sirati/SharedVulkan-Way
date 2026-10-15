@@ -42,6 +42,10 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage38"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 DESKNAME="${WC_DESKNAME:-wcdesk38}"
 DESKDIR="/c/Users/<guest-user>/$DESKNAME"

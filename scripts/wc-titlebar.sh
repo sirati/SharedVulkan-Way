@@ -83,6 +83,10 @@ OUT="$ROOT/docs/stage17"
 OUTTB="$ROOT/docs/tabs-in-titlebar"
 
 GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+# Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
+# WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
+# unless the caller had happened to set the variable this line defaults.
+export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # Everything this run owns is named from this. See the header.
 TBNAME="${WC_TBNAME:-wcs17tb}"
