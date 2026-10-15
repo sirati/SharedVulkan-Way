@@ -2624,6 +2624,13 @@ impl Session {
             String::new()
         };
 
+        // §82. The client's bytes as they were *before* the copy, so that a
+        // stale row can say which side moved. Verify mode only: it is a second
+        // full read of the buffer, which is the instrument's cost, not the
+        // copy's, and it is taken outside the timed span.
+        let before: Option<Vec<u8>> = (self.verify && attached_now)
+            .then(|| extent_bytes(src, &info, usable).map(<[u8]>::to_vec))
+            .flatten();
         let started = Instant::now();
         let copied = match self.scope {
             CopyScope::Pool => {
@@ -2720,10 +2727,18 @@ impl Session {
                     // say which one, and twenty is enough to see a pattern
                     // without turning a 4000-commit run into a 4000-line log.
                     if self.stats.stale_commits <= 20 {
+                        let arena_offset = match &region.descriptor {
+                            Descriptor::ArenaSlice { offset, .. } => Some(*offset),
+                            _ => None,
+                        };
+                        let detail = before
+                            .as_deref()
+                            .map(|b| stale_detail(src, dst, b, &info, usable, arena_offset))
+                            .unwrap_or_default();
                         self.notes.push(format!(
                             "stale: surface {surface_id} buffer {buffer_id} \
                              {}x{} stride {} offset {} -- {stale} rows differ after copying \
-                             {owed_kind} (this commit damaged {} rects, first {:?})",
+                             {owed_kind} (this commit damaged {} rects, first {:?}){detail}",
                             info.width,
                             info.height,
                             info.stride,
@@ -2818,6 +2833,78 @@ fn stale_rows(src: &[u8], dst: &[u8], info: &BufferInfo, usable: usize) -> usize
         }
     }
     stale
+}
+
+/// One buffer's extent within the pool, as `copy_extent` would read it.
+fn extent_bytes<'a>(src: &'a [u8], info: &BufferInfo, usable: usize) -> Option<&'a [u8]> {
+    let start = usize::try_from(info.offset).ok()?;
+    let end = info.end()?.min(usable).min(src.len());
+    (end > start).then(|| &src[start..end])
+}
+
+/// §82. Which side moved, for the first few stale rows of one commit.
+///
+/// `stale_rows` runs microseconds after the copy, in the same thread, so a
+/// row that differs there has changed under the copy rather than been missed by
+/// it. Three facts tell the cases apart, all read here rather than inferred:
+/// whether the **client's** row still equals the snapshot taken before the copy
+/// (`src moved`: the client wrote a buffer it had committed); whether the
+/// **destination** still holds the snapshot (`dst kept`: if not, something
+/// other than this copy wrote those arena bytes, or two rows of the view are
+/// the same memory); and where in the arena the row lives, to the page, so the
+/// row can be held against the locate's page list and the stitched runs.
+fn stale_detail(
+    src: &[u8],
+    dst: &[u8],
+    before: &[u8],
+    info: &BufferInfo,
+    usable: usize,
+    arena_offset: Option<u64>,
+) -> String {
+    let (Ok(base), Ok(stride), Ok(width)) = (
+        usize::try_from(info.offset),
+        usize::try_from(info.stride),
+        usize::try_from(info.width),
+    ) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut shown = 0;
+    for row in 0..info.height.max(0) as usize {
+        let from = base + row * stride;
+        let to = from + width * 4;
+        if to > usable || to > src.len() || to > dst.len() || to - base > before.len() {
+            break;
+        }
+        if src[from..to] == dst[from..to] {
+            continue;
+        }
+        let snap = &before[from - base..to - base];
+        let differ = src[from..to].iter().zip(&dst[from..to]).filter(|(a, b)| a != b).count();
+        let first = src[from..to]
+            .iter()
+            .zip(&dst[from..to])
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        let src_moved = &src[from..to] != snap;
+        let dst_kept = &dst[from..to] == snap;
+        let at = arena_offset
+            .map(|o| {
+                let byte = o + (from + first) as u64;
+                format!(", arena byte {byte} = page {} +{}", byte / 4096, byte % 4096)
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "; row {row}: {differ} bytes differ from byte {first}, src moved {}, dst kept {}{at}",
+            if src_moved { "YES" } else { "no" },
+            if dst_kept { "yes" } else { "NO" },
+        ));
+        shown += 1;
+        if shown == 3 {
+            break;
+        }
+    }
+    out
 }
 
 /// Copy the whole of one buffer's extent within the pool.
