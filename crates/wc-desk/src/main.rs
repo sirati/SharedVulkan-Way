@@ -102,10 +102,15 @@ mod imp {
         CreateWaitableTimerExW, GetCurrentProcessId, GetCurrentThreadId, SetWaitableTimer, Sleep,
         WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
     };
+    // §82: `mouse`, which drives a real drag through `SendInput`.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        PostMessageW, SendMessageTimeoutW,
+        PostMessageW, SendMessageTimeoutW, IsZoomed, SetForegroundWindow, WM_NCHITTEST,
         GWL_EXSTYLE, GWL_STYLE, GW_OWNER, PW_RENDERFULLCONTENT, SC_SIZE, SMTO_ABORTIFHUNG,
         SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN, WM_KEYDOWN, WM_KEYUP, WM_NULL, WM_SYSCOMMAND, WS_EX_APPWINDOW,
@@ -134,6 +139,12 @@ usage: wc-desk <command> [options]
   drag --pid N             put a window into Windows' modal sizing loop, grow it
        [--steps N]           from the keyboard, and leave it there for --hold-ms
        [--hold-ms N]         so that something else can watch it repaint
+  hittest --pid N --at X,Y [--at X,Y ...]
+                           WM_NCHITTEST at window-relative points; a negative
+                           coordinate counts from the right or bottom edge
+  mouse --pid N [--drag A B] [--click A] [--dblclick A] [--step-ms N]
+                           real input through SendInput, the window rectangle
+                           printed before and after each gesture
 
   --unaware                do NOT ask for per-monitor DPI awareness first.
                            Every command takes it; it is how a capture in real
@@ -165,6 +176,8 @@ usage: wc-desk <command> [options]
             "shot" => cmd_shot(&args[1..], &dpi),
             "tick" => cmd_tick(&args[1..]),
             "drag" => cmd_drag(&args[1..]),
+            "hittest" => cmd_hittest(&args[1..]),
+            "mouse" => cmd_mouse(&args[1..]),
             other => {
                 eprintln!("wc-desk: unknown command {other:?}");
                 eprint!("{}", usage());
@@ -1047,6 +1060,204 @@ usage: wc-desk <command> [options]
         let grew = area(&after) > area(&before);
         println!("drag.entered      {}", if grew { "yes" } else { "no" });
         println!("drag.grew         {}", if grew { "yes" } else { "no" });
+        Ok(())
+    }
+
+    // ------------------------------------------------------ §82: the caption --
+
+    /// A window-relative point, `X,Y`. A negative coordinate counts from the
+    /// far edge — `-20,15` is twenty pixels in from the right — because the
+    /// points worth asking about (the close button, the top edge) are fixed
+    /// relative to an edge and the window's size is the client's choice.
+    fn at(spec: &str, r: &RECT) -> std::io::Result<(i32, i32)> {
+        let (x, y) = spec
+            .split_once(',')
+            .ok_or_else(|| std::io::Error::other(format!("{spec:?}: want X,Y")))?;
+        let n = |s: &str| {
+            s.trim().parse::<i32>().map_err(|e| std::io::Error::other(format!("{spec:?}: {e}")))
+        };
+        let (x, y) = (n(x)?, n(y)?);
+        let x = if x < 0 { r.right - r.left + x } else { x };
+        let y = if y < 0 { r.bottom - r.top + y } else { y };
+        Ok((r.left + x, r.top + y))
+    }
+
+    fn ht_name(v: isize) -> &'static str {
+        match v {
+            -2 => "HTTRANSPARENT",
+            0 => "HTNOWHERE",
+            1 => "HTCLIENT",
+            2 => "HTCAPTION",
+            3 => "HTSYSMENU",
+            8 => "HTMINBUTTON",
+            9 => "HTMAXBUTTON",
+            10 => "HTLEFT",
+            11 => "HTRIGHT",
+            12 => "HTTOP",
+            13 => "HTTOPLEFT",
+            14 => "HTTOPRIGHT",
+            15 => "HTBOTTOM",
+            16 => "HTBOTTOMLEFT",
+            17 => "HTBOTTOMRIGHT",
+            20 => "HTCLOSE",
+            _ => "?",
+        }
+    }
+
+    /// Ask the window what is under each point: `WM_NCHITTEST`, exactly as
+    /// Windows asks it before every mouse message.
+    ///
+    /// ADDED FOR §82, and it is the test §31.13 item 4 said nobody had: the
+    /// compositor's answer for the top edge, the caption buttons and the empty
+    /// tab strip of a folded window, read back from the window procedure
+    /// itself rather than inferred from a cursor shape in a photograph. On the
+    /// guest, the answers over DWM's buttons come from `DwmDefWindowProc`;
+    /// under Wine from the compositor's own fallback. Either way the line says
+    /// what Windows will do with a click there.
+    fn cmd_hittest(args: &[String]) -> std::io::Result<()> {
+        let hwnd = find_window(args)?;
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window handle; the rectangle is written in place.
+        unsafe { GetWindowRect(hwnd, &mut r) };
+        println!(
+            "hittest.window    {}x{} at {},{} zoomed={}",
+            r.right - r.left,
+            r.bottom - r.top,
+            r.left,
+            r.top,
+            // SAFETY: a live window handle.
+            unsafe { IsZoomed(hwnd) } != 0
+        );
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--at"
+                && let Some(spec) = args.get(i + 1)
+            {
+                let (sx, sy) = at(spec, &r)?;
+                let lp = ((sy as u32 & 0xffff) << 16 | (sx as u32 & 0xffff)) as LPARAM;
+                let mut result: usize = 0;
+                // SAFETY: a live window handle; `result` is written on success.
+                let ok = unsafe {
+                    SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0, lp, SMTO_ABORTIFHUNG, 2000, &mut result)
+                };
+                let v = result as isize;
+                if ok == 0 {
+                    println!("hittest {spec:>10} screen {sx},{sy} -> (no answer)");
+                } else {
+                    println!("hittest {spec:>10} screen {sx},{sy} -> {} ({v})", ht_name(v));
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// One mouse event through `SendInput`, at a screen point.
+    fn send_mouse(x: i32, y: i32, flags: u32) {
+        // SAFETY: plain metric reads.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        let nx = (i64::from(x) * 65535 / i64::from((w - 1).max(1))) as i32;
+        let ny = (i64::from(y) * 65535 / i64::from((h - 1).max(1))) as i32;
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: nx,
+                    dy: ny,
+                    mouseData: 0,
+                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        // SAFETY: one well-formed `INPUT`, its size passed with it.
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    }
+
+    /// Drive the mouse over a window: `--drag A B`, `--click A`, `--dblclick A`,
+    /// each point window-relative as for `hittest`, in the order given.
+    ///
+    /// ADDED FOR §82. §22.11 item 1 — *nothing has been dragged* — has been
+    /// open since stage 17, because a drag of a client-decorated window is a
+    /// round trip nothing on this side can fake: the press reaches the client,
+    /// the client decides it was on its title bar and asks for
+    /// `xdg_toplevel.move`, the compositor hands that to Windows' modal loop,
+    /// and only then do the remaining moves move the window. So this is real
+    /// input, through `SendInput`, with the button held across enough small
+    /// steps for that round trip to happen, and the window rectangle printed
+    /// before and after each gesture. A window that did not follow says so.
+    fn cmd_mouse(args: &[String]) -> std::io::Result<()> {
+        let hwnd = find_window(args)?;
+        let step_ms: u64 = opt(args, "--step-ms").unwrap_or("40").parse().unwrap_or(40);
+        let rect = || {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: a live window handle; the rectangle is written in place.
+            unsafe { GetWindowRect(hwnd, &mut r) };
+            r
+        };
+        let say = |what: &str, r: &RECT| {
+            println!(
+                "mouse.{what:<10} {}x{} at {},{} zoomed={}",
+                r.right - r.left,
+                r.bottom - r.top,
+                r.left,
+                r.top,
+                // SAFETY: a live window handle.
+                unsafe { IsZoomed(hwnd) } != 0
+            );
+        };
+        let pause = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+        // SAFETY: a live window handle; refused while another window is in the
+        // foreground on some desktops, which the printed rectangles will show.
+        unsafe { SetForegroundWindow(hwnd) };
+        pause(300);
+        let mut i = 0;
+        while i < args.len() {
+            let r = rect();
+            match args[i].as_str() {
+                "--drag" if i + 2 < args.len() => {
+                    let (x0, y0) = at(&args[i + 1], &r)?;
+                    let (x1, y1) = at(&args[i + 2], &r)?;
+                    say("before", &r);
+                    send_mouse(x0, y0, 0);
+                    pause(step_ms * 4);
+                    send_mouse(x0, y0, MOUSEEVENTF_LEFTDOWN);
+                    pause(step_ms * 4);
+                    let n = 24;
+                    for s in 1..=n {
+                        let x = x0 + (x1 - x0) * s / n;
+                        let y = y0 + (y1 - y0) * s / n;
+                        send_mouse(x, y, 0);
+                        pause(step_ms);
+                    }
+                    pause(step_ms * 4);
+                    send_mouse(x1, y1, MOUSEEVENTF_LEFTUP);
+                    pause(600);
+                    say("after-drag", &rect());
+                    i += 3;
+                }
+                "--click" | "--dblclick" if i + 1 < args.len() => {
+                    let (x, y) = at(&args[i + 1], &r)?;
+                    say("before", &r);
+                    let times = if args[i] == "--dblclick" { 2 } else { 1 };
+                    send_mouse(x, y, 0);
+                    pause(step_ms * 4);
+                    for _ in 0..times {
+                        send_mouse(x, y, MOUSEEVENTF_LEFTDOWN);
+                        pause(30);
+                        send_mouse(x, y, MOUSEEVENTF_LEFTUP);
+                        pause(60);
+                    }
+                    pause(1200);
+                    say(if times == 2 { "after-dbl" } else { "after-clk" }, &rect());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
         Ok(())
     }
 
