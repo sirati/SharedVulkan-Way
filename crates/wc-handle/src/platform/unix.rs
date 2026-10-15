@@ -465,3 +465,15 @@ pub fn create_pipe(path: &str) -> io::Result<OwnedPipe> {
 pub fn open_pipe(path: &str, for_write: bool) -> io::Result<File> {
     OpenOptions::new().read(!for_write).write(for_write).open(path)
 }
+
+/// IVSHMEM ARENA. An ivshmem device is a PCI device in a *guest*, reached
+/// through a Windows driver; there is nothing on this side to open. The VM
+/// host's half maps the file QEMU backs the BAR with, which is
+/// `wc_proxy::guestram`'s business and needs no platform call. Tests stand a
+/// writable file mapping in for the BAR (`crate::arena`'s tests).
+pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("ivshmem device {index}: an ivshmem device is a Windows guest's, not this machine's"),
+    ))
+}

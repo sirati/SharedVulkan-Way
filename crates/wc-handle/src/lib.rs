@@ -123,6 +123,9 @@ pub mod arena;
 /// on shared_vulkan's existing control region and rings rather than as a
 /// mechanism of its own.
 pub mod grow;
+/// IVSHMEM ARENA. The header at the front of an ivshmem region, encoded and
+/// decoded by the same code on both sides of the hypervisor.
+pub mod ivshmem;
 mod platform;
 pub mod publish;
 

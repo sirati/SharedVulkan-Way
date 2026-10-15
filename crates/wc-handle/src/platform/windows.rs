@@ -30,6 +30,13 @@ use windows_sys::Win32::System::Memory::{
     VirtualLock, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, PAGE_READWRITE,
 };
+// IVSHMEM ARENA: finding the device and asking its driver for a mapping.
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA,
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
+    SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+};
+use windows_sys::Win32::System::IO::DeviceIoControl;
 // STAGE 7: the working-set quota that `VirtualLock` is charged against.
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
@@ -95,6 +102,12 @@ enum Backing {
     /// `VirtualAlloc(MEM_COMMIT)` — memory this process owns, released with
     /// `VirtualFree(MEM_RELEASE)`. See [`alloc_locked_region`].
     Region,
+    /// IVSHMEM ARENA. BAR2 of an ivshmem device, mapped into this process by
+    /// the driver's `REQUEST_MMAP`. Given back with `RELEASE_MMAP` and then by
+    /// closing the device handle, which the driver also treats as a release —
+    /// it allows one mapping per device and ties it to the handle that asked.
+    /// See [`map_ivshmem`].
+    Device(HANDLE),
 }
 
 /// A read-only view of a section, or of a region this process allocated.
@@ -143,6 +156,24 @@ impl Drop for MappedView {
             // `VirtualLock` on the region is undone by the release.
             Backing::Region => unsafe {
                 VirtualFree(self.address.Value, 0, MEM_RELEASE);
+            },
+            // SAFETY: the handle came from `CreateFileW` in `map_ivshmem`, which
+            // made this mapping through it, and is closed exactly once here.
+            // The release IOCTL takes no buffers; its failure is not
+            // actionable, and closing the handle releases the mapping anyway.
+            Backing::Device(handle) => unsafe {
+                let mut got = 0u32;
+                DeviceIoControl(
+                    handle,
+                    IOCTL_IVSHMEM_RELEASE_MMAP,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut got,
+                    std::ptr::null_mut(),
+                );
+                CloseHandle(handle);
             },
         }
     }
@@ -789,4 +820,225 @@ impl OwnedPipe {
     pub fn as_file(&self) -> &std::fs::File {
         match *self {}
     }
+}
+
+// --------------------------------------------------------------- ivshmem ---
+//
+// IVSHMEM ARENA (docs/waycompose-design.md §82). The user-mode interface of the
+// virtio-win `ivshmem` driver, as its `Public.h` states it
+// (kvm-guest-drivers-windows/ivshmem/Public.h). The binary this talks to is the
+// WHQL-signed build Looking Glass B7 ships, `DriverVer 08/03/2022,
+// 100.10.100.10000`; the ABI below is the one that header has carried since the
+// cache-mode argument was added, and the IOCTL codes are `CTL_CODE(
+// FILE_DEVICE_UNKNOWN, 0x80n, METHOD_BUFFERED, FILE_ANY_ACCESS)` worked out by
+// hand, because windows-sys has no business knowing a third-party driver's
+// numbers.
+
+/// `{df576976-569d-4672-95a0-f57e4ea0b210}`, the interface the driver's INF
+/// registers (`AddInterface=` under `[IVSHMEM_Device.NT.Interfaces]`).
+const GUID_DEVINTERFACE_IVSHMEM: windows_sys::core::GUID = windows_sys::core::GUID {
+    data1: 0xdf57_6976,
+    data2: 0x569d,
+    data3: 0x4672,
+    data4: [0x95, 0xa0, 0xf5, 0x7e, 0x4e, 0xa0, 0xb2, 0x10],
+};
+const IOCTL_IVSHMEM_REQUEST_SIZE: u32 = 0x0022_2004;
+const IOCTL_IVSHMEM_REQUEST_MMAP: u32 = 0x0022_2008;
+const IOCTL_IVSHMEM_RELEASE_MMAP: u32 = 0x0022_200c;
+/// `IVSHMEM_CACHE_CACHED`. Write-back, which is the only class that is the
+/// same on both sides: the host maps the backing file as ordinary write-back
+/// memory, and KVM does not force a RAM-backed BAR uncacheable
+/// (docs/research-vulkan-forwarding.md §2.2, and security-model.md R10's rule
+/// that the two page tables must agree). `NONCACHED` is the driver's default
+/// for a BAR and costs every read a trip to memory; `WRITECOMBINED` makes the
+/// compositor's *reads* uncached, and the compositor is the side that reads.
+const IVSHMEM_CACHE_CACHED: u8 = 1;
+
+/// `IVSHMEM_MMAP`, x64 layout: `u16` peer id, then the `u64` size at 8, the
+/// pointer at 16 and the `u16` vector count at 24, padded to 32.
+#[repr(C)]
+#[derive(Default)]
+struct IvshmemMmap {
+    peer_id: u16,
+    size: u64,
+    ptr: usize,
+    vectors: u16,
+}
+
+/// The ivshmem device numbered `index` among those present, mapped into this
+/// process **read-write and cached**.
+///
+/// Returns the view of the whole BAR, its length and the device path it was
+/// reached by (for a log line). The view owns the device handle; dropping it is
+/// the release.
+///
+/// # What can refuse, and what each refusal means
+///
+/// * **No device.** The VM was started without `-device ivshmem-plain`, or the
+///   driver is not installed and nothing has bound the interface. Said with the
+///   GUID, because that is what a person searches Device Manager for.
+/// * **`CreateFileW` refused.** The account cannot open the device; the
+///   driver's default security is what decides that, not this program.
+/// * **`REQUEST_MMAP` refused.** Almost always a second mapping: the driver
+///   allows one per device and keeps it until the handle that made it closes,
+///   so a compositor that is already running holds it.
+pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
+    let path = ivshmem_path(index)?;
+    let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: a live NUL-terminated path; no security attributes, no template.
+    let handle = unsafe {
+        CreateFileW(
+            wpath.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("opening ivshmem device {path}: {e}")));
+    }
+    // From here every early return must close `handle`.
+    let close = |e: io::Error| {
+        // SAFETY: the handle opened above, closed once on this error path.
+        unsafe {
+            CloseHandle(handle);
+        }
+        e
+    };
+    let mut size: u64 = 0;
+    let mut got = 0u32;
+    // SAFETY: no input; the output is a live `u64` of the size given.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_IVSHMEM_REQUEST_SIZE,
+            std::ptr::null(),
+            0,
+            (&raw mut size).cast(),
+            std::mem::size_of::<u64>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let e = io::Error::last_os_error();
+        return Err(close(io::Error::new(e.kind(), format!("IOCTL_IVSHMEM_REQUEST_SIZE: {e}"))));
+    }
+    let config: u8 = IVSHMEM_CACHE_CACHED;
+    let mut map = IvshmemMmap::default();
+    // SAFETY: the input is one live byte (`IVSHMEM_MMAP_CONFIG` is a single
+    // `UINT8`), the output a live `IVSHMEM_MMAP` of the size given.
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_IVSHMEM_REQUEST_MMAP,
+            (&raw const config).cast(),
+            1,
+            (&raw mut map).cast(),
+            std::mem::size_of::<IvshmemMmap>() as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        let e = io::Error::last_os_error();
+        return Err(close(io::Error::new(
+            e.kind(),
+            format!(
+                "IOCTL_IVSHMEM_REQUEST_MMAP: {e} (the driver allows one mapping per device; \
+                 is another compositor, or a Looking Glass host, holding it?)"
+            ),
+        )));
+    }
+    if map.ptr == 0 || map.size != size {
+        return Err(close(io::Error::other(format!(
+            "the driver mapped {} bytes at {:#x} of a {size}-byte device",
+            map.size, map.ptr
+        ))));
+    }
+    let len = usize::try_from(size).map_err(|_| close(io::Error::other("ivshmem too large")))?;
+    let view = MappedView {
+        address: MEMORY_MAPPED_VIEW_ADDRESS { Value: map.ptr as *mut core::ffi::c_void },
+        len,
+        backing: Backing::Device(handle),
+    };
+    Ok((view, size, path))
+}
+
+/// The device path of the `index`th present ivshmem interface.
+fn ivshmem_path(index: u32) -> io::Result<String> {
+    // SAFETY: a static GUID, no enumerator, no window; the result is checked
+    // and destroyed on every path below.
+    let set = unsafe {
+        SetupDiGetClassDevsW(
+            &GUID_DEVINTERFACE_IVSHMEM,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        )
+    };
+    if set == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut data = SP_DEVICE_INTERFACE_DATA {
+            cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a live device-info set and a live, sized interface record.
+        if unsafe {
+            SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &GUID_DEVINTERFACE_IVSHMEM, index, &mut data)
+        } == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no ivshmem device {index} (interface {{df576976-569d-4672-95a0-f57e4ea0b210}}): \
+                     the VM has no ivshmem-plain device, or its driver is not installed"
+                ),
+            ));
+        }
+        let mut need = 0u32;
+        // SAFETY: the size query: no output buffer, the required size back.
+        unsafe {
+            SetupDiGetDeviceInterfaceDetailW(set, &data, std::ptr::null_mut(), 0, &mut need, std::ptr::null_mut());
+        }
+        if need < std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32 {
+            return Err(io::Error::last_os_error());
+        }
+        // A `u32`-aligned buffer of the size asked for, with the fixed header
+        // the API wants in it: `cbSize` is the size of the *struct*, 8 on x64,
+        // not of the buffer.
+        let mut buf = vec![0u32; (need as usize).div_ceil(4)];
+        let detail = buf.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+        // SAFETY: `buf` is at least `need` bytes and suitably aligned.
+        unsafe {
+            (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+        }
+        // SAFETY: as above, with the buffer the size query asked for.
+        if unsafe {
+            SetupDiGetDeviceInterfaceDetailW(set, &data, detail, need, std::ptr::null_mut(), std::ptr::null_mut())
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `DevicePath` is a NUL-terminated UTF-16 string inside `buf`,
+        // starting four bytes in.
+        let path = unsafe {
+            let p = (&raw const (*detail).DevicePath).cast::<u16>();
+            let max = (need as usize - 4) / 2;
+            let n = (0..max).take_while(|&i| *p.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
+        };
+        Ok(path)
+    })();
+    // SAFETY: destroyed once, after its last use.
+    unsafe {
+        SetupDiDestroyDeviceInfoList(set);
+    }
+    result
 }

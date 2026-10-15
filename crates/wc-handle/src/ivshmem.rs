@@ -1,0 +1,275 @@
+//! The header at the front of an **ivshmem** arena, and nothing else.
+//!
+//! IVSHMEM ARENA (docs/waycompose-design.md §82). The guest compositor maps BAR2 of a
+//! QEMU `ivshmem-plain` device; the VM host maps the file QEMU backs that BAR
+//! with. Both are the same physical pages. What neither side has is any other
+//! way to tell the other what it put there, so the first page of the region is
+//! a header the guest writes and the host reads, and that page is **not part of
+//! the arena**: the arena's offset 0 is the region's byte [`HEADER_BYTES`].
+//!
+//! # Why the header is outside the arena rather than at its offset 0
+//!
+//! Because the proxy's pool allocator is first-fit from offset 0 and would write
+//! pixels over it the moment a client drew. That is §12.10's lesson about the
+//! stamps, arriving a third time: anything a reader has to find later must not
+//! live in bytes an allocator will hand out. A header that survives the session
+//! is also what lets a proxy be restarted while the compositor is still up, and
+//! lets a human read the region's identity off the host with `xxd`.
+//!
+//! # Why this file is platform-independent
+//!
+//! The writer is a Windows process and the reader is a Linux one, and the one
+//! failure worth designing out is the two of them disagreeing about a field
+//! offset. So the layout is encoded and decoded **here, once**, by the same
+//! code on both sides, and tested on the machine that compiles it. Nothing in
+//! this module touches a device.
+//!
+//! # The ordering rule
+//!
+//! The guest writes every field and then, after a release fence, the magic.
+//! The host reads the magic first and the rest after an acquire fence. A reader
+//! that sees the magic therefore sees a complete header, and a reader that sees
+//! anything else sees "no header" — never a header with a stale run id in it.
+//! [`invalidate`] is the other half: a compositor that is starting clears the
+//! previous run's magic **before** it touches anything, so the header of a
+//! compositor that has exited is not mistaken for the header of the one that is
+//! starting.
+
+use std::io;
+
+/// The first eight bytes of a published header.
+pub const MAGIC: [u8; 8] = *b"WCIVSHM1";
+/// Bumped when the layout below changes. A reader refuses any other value.
+pub const VERSION: u32 = 1;
+/// How many bytes at the front of the region the header owns. One 4 KiB page,
+/// because the arena behind it is allocated in pages and must start on one.
+pub const HEADER_BYTES: u64 = 4096;
+
+const OFF_MAGIC: usize = 0;
+const OFF_VERSION: usize = 8;
+const OFF_HEADER_BYTES: usize = 12;
+const OFF_RUN_ID: usize = 16;
+const OFF_GENERATION: usize = 24;
+const OFF_REGION_LEN: usize = 32;
+const OFF_ARENA_ID: usize = 40;
+const OFF_OUTBOUND_OFF: usize = 48;
+const OFF_OUTBOUND_LEN: usize = 56;
+/// The number of bytes a header actually occupies. The rest of the page is
+/// zero and reserved.
+pub const ENCODED_LEN: usize = 64;
+
+/// What the guest says about the region it mapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// Random per compositor start, never zero. The launcher passes the value
+    /// the compositor printed to the host, which refuses a header carrying any
+    /// other one: that is what stops a proxy attaching to the region a
+    /// *previous* compositor described.
+    pub run_id: u64,
+    /// One more than the previous header's, or 1 when there was none. A count
+    /// of compositor starts on this region since the file was created, for logs
+    /// and for a human; the run id is what is checked.
+    pub generation: u64,
+    /// The whole device, header included, as the driver reported it.
+    pub region_len: u64,
+    /// The arena id the compositor registered the region under — the number in
+    /// every `Descriptor::ArenaSlice` that names it.
+    pub arena_id: u32,
+    /// The compositor's outbound window, `(offset, len)`, in **arena** offsets
+    /// (that is, relative to [`HEADER_BYTES`]). `(0, 0)` is "none".
+    pub outbound: (u64, u64),
+}
+
+impl Header {
+    /// The arena's length: the region less the header page.
+    pub fn arena_len(&self) -> u64 {
+        self.region_len.saturating_sub(HEADER_BYTES)
+    }
+
+    /// The header's bytes, magic **included**. A writer must not copy this as
+    /// one block — see [`write_into`] — but a test and a reader want it whole.
+    pub fn encode(&self) -> [u8; ENCODED_LEN] {
+        let mut b = [0u8; ENCODED_LEN];
+        b[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(&MAGIC);
+        b[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
+        b[OFF_HEADER_BYTES..OFF_HEADER_BYTES + 4]
+            .copy_from_slice(&(HEADER_BYTES as u32).to_le_bytes());
+        b[OFF_RUN_ID..OFF_RUN_ID + 8].copy_from_slice(&self.run_id.to_le_bytes());
+        b[OFF_GENERATION..OFF_GENERATION + 8].copy_from_slice(&self.generation.to_le_bytes());
+        b[OFF_REGION_LEN..OFF_REGION_LEN + 8].copy_from_slice(&self.region_len.to_le_bytes());
+        b[OFF_ARENA_ID..OFF_ARENA_ID + 4].copy_from_slice(&self.arena_id.to_le_bytes());
+        b[OFF_OUTBOUND_OFF..OFF_OUTBOUND_OFF + 8].copy_from_slice(&self.outbound.0.to_le_bytes());
+        b[OFF_OUTBOUND_LEN..OFF_OUTBOUND_LEN + 8].copy_from_slice(&self.outbound.1.to_le_bytes());
+        b
+    }
+
+    /// Read a header, refusing everything that is not exactly one.
+    ///
+    /// Every refusal names what it saw, because the reader is a launcher on
+    /// another machine and "bad header" is not a message anybody can act on.
+    pub fn decode(b: &[u8]) -> io::Result<Header> {
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        if b.len() < ENCODED_LEN {
+            return Err(bad(format!("{} bytes is shorter than a header", b.len())));
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        if b[OFF_MAGIC..OFF_MAGIC + 8] != MAGIC {
+            return Err(bad(format!(
+                "no header (magic {:02x?}): no compositor has published this region, or the \
+                 one that is starting has not finished",
+                &b[OFF_MAGIC..OFF_MAGIC + 8]
+            )));
+        }
+        let version = u32_at(OFF_VERSION);
+        if version != VERSION {
+            return Err(bad(format!("header version {version}, and this reader knows {VERSION}")));
+        }
+        let header_bytes = u32_at(OFF_HEADER_BYTES) as u64;
+        if header_bytes != HEADER_BYTES {
+            return Err(bad(format!(
+                "the header says it is {header_bytes} bytes and this reader puts the arena \
+                 after {HEADER_BYTES}"
+            )));
+        }
+        let h = Header {
+            run_id: u64_at(OFF_RUN_ID),
+            generation: u64_at(OFF_GENERATION),
+            region_len: u64_at(OFF_REGION_LEN),
+            arena_id: u32_at(OFF_ARENA_ID),
+            outbound: (u64_at(OFF_OUTBOUND_OFF), u64_at(OFF_OUTBOUND_LEN)),
+        };
+        if h.run_id == 0 {
+            return Err(bad("run id 0, which no compositor writes".into()));
+        }
+        if h.region_len <= HEADER_BYTES || !h.region_len.is_multiple_of(HEADER_BYTES) {
+            return Err(bad(format!(
+                "a {}-byte region cannot hold a {HEADER_BYTES}-byte header and a whole number \
+                 of pages after it",
+                h.region_len
+            )));
+        }
+        let (off, len) = h.outbound;
+        if len != 0 && off.checked_add(len) != Some(h.arena_len()) {
+            return Err(bad(format!(
+                "an outbound window at {off}+{len} is not the tail of a {}-byte arena",
+                h.arena_len()
+            )));
+        }
+        Ok(h)
+    }
+}
+
+/// Publish `h` into the first page of a region: every field, then a release
+/// fence, then the magic.
+///
+/// # Safety
+///
+/// `page` must be valid for writes of [`ENCODED_LEN`] bytes for the duration of
+/// the call. Concurrent readers are the point; they are on the other side of a
+/// hypervisor and synchronise through the magic.
+pub unsafe fn write_into(page: *mut u8, h: &Header) {
+    let bytes = h.encode();
+    // SAFETY: the caller promises `page` covers `ENCODED_LEN` bytes. Volatile,
+    // because the reader is not in this program and the compiler must not
+    // merge, reorder or drop these stores on the grounds that nothing here
+    // reads them back.
+    unsafe {
+        for (i, b) in bytes.iter().enumerate().skip(8) {
+            page.add(i).write_volatile(*b);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        for (i, b) in bytes.iter().enumerate().take(8) {
+            page.add(i).write_volatile(*b);
+        }
+    }
+}
+
+/// Clear the magic so that the region reads as "no header" until the next
+/// [`write_into`]. Returns the generation the previous header carried, if it
+/// had one, so that the next can be one more.
+///
+/// # Safety
+///
+/// As [`write_into`].
+pub unsafe fn invalidate(page: *mut u8) -> Option<u64> {
+    let mut old = [0u8; ENCODED_LEN];
+    // SAFETY: the caller promises `page` covers `ENCODED_LEN` bytes.
+    unsafe {
+        for (i, b) in old.iter_mut().enumerate() {
+            *b = page.add(i).read_volatile();
+        }
+        for i in 0..8 {
+            page.add(i).write_volatile(0);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+    Header::decode(&old).ok().map(|h| h.generation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h() -> Header {
+        Header {
+            run_id: 0x1b44_0000_dead_beef,
+            generation: 3,
+            region_len: 128 << 20,
+            arena_id: 0,
+            outbound: ((128 << 20) - HEADER_BYTES - (1 << 20), 1 << 20),
+        }
+    }
+
+    #[test]
+    fn a_header_round_trips_and_the_layout_is_the_one_written_down() {
+        let b = h().encode();
+        assert_eq!(&b[0..8], b"WCIVSHM1");
+        // Offsets pinned as numbers: a reordering of the struct must not move
+        // a field on one side of the hypervisor and not the other.
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 0x1b44_0000_dead_beef);
+        assert_eq!(u64::from_le_bytes(b[32..40].try_into().unwrap()), 128 << 20);
+        assert_eq!(Header::decode(&b).unwrap(), h());
+        assert_eq!(h().arena_len(), (128 << 20) - 4096);
+    }
+
+    #[test]
+    fn everything_that_is_not_exactly_a_header_is_refused_by_name() {
+        let mut b = h().encode();
+        b[0] = 0;
+        assert!(Header::decode(&b).unwrap_err().to_string().contains("no header"));
+        let mut b = h().encode();
+        b[8] = 2;
+        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 2"));
+        let mut z = h();
+        z.run_id = 0;
+        assert!(Header::decode(&z.encode()).is_err());
+        let mut w = h();
+        w.outbound = (0, 1 << 20);
+        assert!(Header::decode(&w.encode()).unwrap_err().to_string().contains("not the tail"));
+        let mut s = h();
+        s.region_len = HEADER_BYTES;
+        assert!(Header::decode(&s.encode()).is_err());
+        assert!(Header::decode(&[0u8; 10]).is_err());
+    }
+
+    /// The magic goes last and is the only thing a reader trusts, and
+    /// `invalidate` hands back the generation so the next one can count on.
+    #[test]
+    fn publish_then_invalidate_on_a_page_of_memory() {
+        let mut page = vec![0u8; HEADER_BYTES as usize];
+        let p = page.as_mut_ptr();
+        // SAFETY: a live, page-sized local buffer.
+        unsafe {
+            assert_eq!(invalidate(p), None, "a zero page has no header");
+            write_into(p, &h());
+        }
+        assert_eq!(Header::decode(&page).unwrap(), h());
+        // SAFETY: as above.
+        let prev = unsafe { invalidate(page.as_mut_ptr()) };
+        assert_eq!(prev, Some(3));
+        assert!(Header::decode(&page).is_err(), "an invalidated header must not read");
+        // The fields are still there for a human with xxd; only the magic went.
+        assert_eq!(u64::from_le_bytes(page[24..32].try_into().unwrap()), 3);
+    }
+}

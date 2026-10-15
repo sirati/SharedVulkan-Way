@@ -30,6 +30,11 @@ windows-sys = { workspace = true, features = [
   # evidence that releasing a region actually returned the pages. See
   # `arena::committed_bytes`.
   "Win32_System_ProcessStatus",
+  # IVSHMEM ARENA. `SetupDiGetClassDevsW` and friends to find the device by its
+  # interface GUID, and `DeviceIoControl` to ask its driver for the mapping.
+  # See `platform::windows::map_ivshmem`.
+  "Win32_Devices_DeviceAndDriverInstallation",
+  "Win32_System_IO",
 ] }
 
 [target.'cfg(unix)'.dependencies]

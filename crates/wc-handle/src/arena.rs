@@ -95,6 +95,15 @@ struct Attached {
     /// the outbound window's job, and the two are separate on purpose: `provided`
     /// is a fact about the region, and the window is a decision about part of it.
     provided: bool,
+    /// IVSHMEM ARENA. Where the arena starts inside `view`. Zero for every
+    /// region except an ivshmem one, whose first page is the header
+    /// ([`crate::ivshmem`]) and not the arena's: the arena's offset 0 is the
+    /// view's byte `base`, on both sides of the hypervisor.
+    base: usize,
+    /// IVSHMEM ARENA. A device region: its pages are a PCI BAR, not memory this
+    /// process committed, so [`release_guest_ram`] has nothing to give back and
+    /// refuses rather than unmapping the only mapping the driver allows.
+    fixed: bool,
 }
 
 type Registry = RwLock<HashMap<u32, Attached>>;
@@ -126,7 +135,14 @@ pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
         .map_err(|_| io::Error::other("arena registry poisoned"))?;
     guard.insert(
         id,
-        Attached { view: Arc::new(view), len, origin: path.to_owned(), provided: false },
+        Attached {
+            view: Arc::new(view),
+            len,
+            origin: path.to_owned(),
+            provided: false,
+            base: 0,
+            fixed: false,
+        },
     );
     Ok(())
 }
@@ -169,6 +185,8 @@ pub fn provide_file(id: u32, path: &str, size: u64) -> io::Result<()> {
             len,
             origin: format!("provided file {path}"),
             provided: true,
+            base: 0,
+            fixed: false,
         },
     );
     Ok(())
@@ -310,10 +328,188 @@ pub fn attach_guest_ram(id: u32, size: u64) -> io::Result<GuestRegion> {
             len,
             origin: format!("guest RAM, run 0x{run_id:016x}"),
             provided: true,
+            base: 0,
+            fixed: false,
         },
     );
     Ok(GuestRegion { run_id, len, pages: (len / REGION_PAGE) as u32, locked }
     )
+}
+
+// ---------------------------------------------------------------------------
+// IVSHMEM ARENA: a region that is a device, and needs no root to find
+// ---------------------------------------------------------------------------
+
+/// What [`attach_ivshmem`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvshmemRegion {
+    /// Random per start, never zero. The host refuses a header carrying any
+    /// other, so this is what stops a proxy attaching to the region a previous
+    /// compositor described. The same role `GuestRegion::run_id` has, with
+    /// nothing to search for.
+    pub run_id: u64,
+    /// One more than the previous compositor's on this region, or 1.
+    pub generation: u64,
+    /// The whole device, header page included.
+    pub region_len: u64,
+    /// The arena: the device less [`crate::ivshmem::HEADER_BYTES`].
+    pub arena_len: u64,
+    /// The device path it was reached by, for the log.
+    pub device: String,
+}
+
+/// The one ivshmem region this process has, and what its header will say.
+struct IvshmemState {
+    arena: u32,
+    run_id: u64,
+    generation: u64,
+    region_len: u64,
+}
+
+fn ivshmem_slot() -> &'static Mutex<Option<IvshmemState>> {
+    static SLOT: OnceLock<Mutex<Option<IvshmemState>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Attach arena `id` as **BAR2 of the ivshmem device numbered `device`**.
+///
+/// IVSHMEM ARENA, docs/waycompose-design.md §82. The third provider, and the first whose
+/// far side needs no privilege to reach. [`attach_guest_ram`] commits this
+/// process's own memory and expects the host to *find* it, which takes QEMU's
+/// monitor and QEMU's descriptor table, which on the deployment are root's.
+/// This maps a PCI BAR that QEMU backs with a **file at a path**, so the host
+/// opens that path — with a group bit, not root — and reads where things are
+/// from a header instead of locating them.
+///
+/// # What it does not do, on purpose
+///
+/// * **No `VirtualLock`.** The pages are the device's: they are not in this
+///   process's working set, Windows cannot page them, and they were never
+///   charged against the guest's RAM at all. The 64 MiB `sv-guest.exe` pinned
+///   (§28.12) is the cost this removes.
+/// * **No stamps.** Nothing searches for these pages. The host knows where the
+///   region is because QEMU was told, by a path, before the guest booted.
+/// * **No growth.** A BAR has the size it was given at device creation. The
+///   proxy refuses `--arena-grow` on this transport rather than asking for a
+///   region nothing can provide.
+///
+/// # The order of what it writes
+///
+/// The previous header's magic is cleared **first**, before the region is
+/// registered, so a header describing a compositor that has gone cannot be read
+/// as describing this one. The new header is written by [`publish_ivshmem`],
+/// later, once the outbound window it has to describe exists.
+pub fn attach_ivshmem(id: u32, device: u32) -> io::Result<IvshmemRegion> {
+    refuse_if_outbound(id)?;
+    let (view, size, path) = platform::map_ivshmem(device)?;
+    attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"))
+}
+
+/// Everything [`attach_ivshmem`] does after the device is mapped — split out so
+/// that a writable file mapping can stand in for the BAR in a test on the
+/// machine that compiles this.
+fn attach_ivshmem_view(
+    id: u32,
+    view: platform::MappedView,
+    size: u64,
+    origin: String,
+) -> io::Result<IvshmemRegion> {
+    use crate::ivshmem::HEADER_BYTES;
+    if size <= HEADER_BYTES || !size.is_multiple_of(REGION_PAGE as u64) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "a {size}-byte ivshmem region cannot hold a {HEADER_BYTES}-byte header and a \
+                 whole number of {REGION_PAGE}-byte pages after it"
+            ),
+        ));
+    }
+    let mut slot = ivshmem_slot().lock().map_err(|_| io::Error::other("ivshmem slot poisoned"))?;
+    if let Some(s) = slot.as_ref() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "arena {} is already an ivshmem region in this process: the driver allows one \
+                 mapping per device and this process holds it",
+                s.arena
+            ),
+        ));
+    }
+    // SAFETY: the view is the whole region, read-write, at least one header
+    // page long (checked above), and owned by this function until it is moved
+    // into the registry below.
+    let previous = unsafe { crate::ivshmem::invalidate(view.ptr().cast_mut()) };
+    let generation = previous.map_or(1, |g| g.wrapping_add(1).max(1));
+    let run_id = random_run_id();
+    let arena_len = size - HEADER_BYTES;
+    let len = usize::try_from(arena_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
+    registry()
+        .write()
+        .map_err(|_| io::Error::other("arena registry poisoned"))?
+        .insert(
+            id,
+            Attached {
+                view: Arc::new(view),
+                len,
+                origin: format!("{origin}, run 0x{run_id:016x}"),
+                provided: true,
+                base: HEADER_BYTES as usize,
+                fixed: true,
+            },
+        );
+    *slot = Some(IvshmemState { arena: id, run_id, generation, region_len: size });
+    Ok(IvshmemRegion {
+        run_id,
+        generation,
+        region_len: size,
+        arena_len,
+        device: origin,
+    })
+}
+
+/// Whether arena `id` is this process's ivshmem region.
+pub fn is_ivshmem(id: u32) -> bool {
+    ivshmem_slot().lock().ok().is_some_and(|s| s.as_ref().is_some_and(|s| s.arena == id))
+}
+
+/// Write arena `id`'s header, describing the outbound window as it stands
+/// **now**, and return what was written.
+///
+/// Called once, after [`reserve_outbound`] and before the socket is bound: the
+/// header is how the host learns the window, and a header published before the
+/// window existed would tell the proxy's allocator the whole arena was its own.
+/// That is the same reason the guest-RAM path carries the window in the plan
+/// rather than on a second command line (`wc_proxy::guestram::Plan::outbound`).
+///
+/// Every field first, then a release fence, then the magic
+/// ([`crate::ivshmem::write_into`]).
+pub fn publish_ivshmem(id: u32) -> io::Result<crate::ivshmem::Header> {
+    let state = ivshmem_slot().lock().map_err(|_| io::Error::other("ivshmem slot poisoned"))?;
+    let Some(s) = state.as_ref().filter(|s| s.arena == id) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("arena {id} is not an ivshmem region of this process"),
+        ));
+    };
+    let outbound = outbound().filter(|w| w.arena == id).map_or((0, 0), |w| (w.offset, w.len));
+    let header = crate::ivshmem::Header {
+        run_id: s.run_id,
+        generation: s.generation,
+        region_len: s.region_len,
+        arena_id: id,
+        outbound,
+    };
+    let guard = registry().read().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let a = guard.get(&id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not attached"))
+    })?;
+    // SAFETY: `a.view` is the whole region, mapped read-write by
+    // `attach_ivshmem`, and its first page is the header's. The registry entry
+    // is never replaced or removed for a `fixed` region, so the view outlives
+    // the call.
+    unsafe { crate::ivshmem::write_into(a.view.ptr().cast_mut(), &header) };
+    Ok(header)
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +1071,7 @@ fn write_provided(arena: u32, offset: u64, bytes: &[u8]) -> io::Result<()> {
     unsafe {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
-            a.view.ptr().cast_mut().add(offset),
+            a.view.ptr().cast_mut().add(a.base + offset),
             bytes.len(),
         );
     }
@@ -1095,7 +1291,7 @@ pub fn region_base(arena: u32) -> Option<usize> {
     if !a.provided {
         return None;
     }
-    Some(a.view.ptr() as usize)
+    Some(a.view.ptr() as usize + a.base)
 }
 
 /// Give a guest-RAM region back to the operating system.
@@ -1144,6 +1340,16 @@ pub fn release_guest_ram(arena: u32) -> io::Result<u64> {
             format!(
                 "arena {arena} was opened, not provided: these are not this process's \
                  pages and releasing them would free nothing while looking like it worked"
+            ),
+        ));
+    }
+    if a.fixed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "arena {arena} is {}: a device's pages, not memory this process committed, \
+                 so there is nothing to give back",
+                a.origin
             ),
         ));
     }
@@ -1279,7 +1485,7 @@ pub(crate) fn window(arena: u32, offset: u64, len: u64) -> io::Result<Mapping> {
             format!("arena slice {offset}..{end} runs past the end of arena {arena} ({})", a.len),
         ));
     }
-    Ok(Mapping { inner: MappingInner::Window(a.view.clone()), offset, len })
+    Ok(Mapping { inner: MappingInner::Window(a.view.clone()), offset: a.base + offset, len })
 }
 
 #[cfg(test)]
@@ -1636,6 +1842,75 @@ mod tests {
             "a write that only overlaps the window's first byte must still be refused"
         );
         guest_write(OUT, 0, b"probe").unwrap();
+    }
+
+    // ------------------------------------------------------------ ivshmem ---
+    // A writable file mapping stands in for BAR2 here. What this can check is
+    // the header's placement and order, that the arena starts after it, and
+    // the refusals; what it cannot is that a driver maps anything, which is a
+    // guest's claim (docs/waycompose-design.md §82).
+
+    #[test]
+    fn an_ivshmem_region_puts_the_header_first_and_the_arena_after_it() {
+        use crate::ivshmem::{HEADER_BYTES, Header};
+        const IV: u32 = 9200;
+        let size = 64 * REGION_PAGE as u64;
+        let path = format!("{}/wc-ivshmem-test-{}", std::env::temp_dir().display(), std::process::id());
+        let _ = std::fs::remove_file(&path);
+        // A previous compositor's header, which must be cleared before anything
+        // else happens and whose generation the next one counts on from.
+        let stale = Header {
+            run_id: 0x5747_4c45,
+            generation: 7,
+            region_len: size,
+            arena_id: IV,
+            outbound: (0, 0),
+        };
+        let mut bytes = vec![0u8; size as usize];
+        bytes[..crate::ivshmem::ENCODED_LEN].copy_from_slice(&stale.encode());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let view = platform::map_file_mut(&path, size as usize).unwrap();
+        let r = attach_ivshmem_view(IV, view, size, "test file".into()).unwrap();
+        assert_eq!(r.generation, 8, "one more than the header it replaced");
+        assert_eq!(r.arena_len, size - HEADER_BYTES);
+        assert_ne!(r.run_id, stale.run_id);
+        assert!(is_ivshmem(IV));
+        // Cleared, not merely about to be overwritten: between attach and
+        // publish the region must read as "no header".
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(Header::decode(&on_disk).is_err(), "the stale header survived attach");
+
+        // A second ivshmem region in one process is refused: the driver gives
+        // one mapping per device and this process already holds it.
+        let view2 = platform::map_file_mut(&path, size as usize).unwrap();
+        assert_eq!(
+            attach_ivshmem_view(IV + 1, view2, size, "again".into()).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // The arena's offset 0 is the region's byte HEADER_BYTES, so a slice
+        // the peer names by arena offset lands after the header.
+        guest_write(IV, 0, b"ARENA0").unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[HEADER_BYTES as usize..][..6], b"ARENA0");
+        let m = Handle::from_descriptor(Descriptor::ArenaSlice { arena: IV, offset: 0, len: 6 })
+            .map()
+            .unwrap();
+        assert_eq!(m.as_slice(), b"ARENA0");
+        // And the end of the arena is the end of the region, not 4 KiB past it.
+        assert!(guest_write(IV, size - HEADER_BYTES, b"x").is_err());
+
+        // Published: what the host will read, magic last.
+        let h = publish_ivshmem(IV).unwrap();
+        let read = Header::decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read, h);
+        assert_eq!((read.run_id, read.generation, read.arena_id), (r.run_id, 8, IV));
+        assert_eq!(read.outbound, (0, 0), "no window was reserved in this arena");
+
+        // A device region is never released: there is nothing to give back.
+        assert_eq!(release_guest_ram(IV).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(publish_ivshmem(IV + 1).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
