@@ -1324,6 +1324,12 @@ pub const HAND_WRITTEN: &[&str] = &[
     "vkCreateDevice",
     "vkDestroyDevice",
     "vkGetDeviceQueue",
+    // Returns a dispatchable `VkQueue`, like the one above. It was a refused
+    // stub that left `*pQueue` untouched, which was harmless while nothing
+    // called it; ffmpeg 9's Vulkan device (and so Firefox 157's decoder)
+    // fetches every queue with it, then submitted on whatever its stack held
+    // and the GPU side handed RADV a null queue (docs/video-decode.md §7.7).
+    "vkGetDeviceQueue2",
     "vkAllocateCommandBuffers",
     "vkFreeCommandBuffers",
     "vkEnumerateInstanceExtensionProperties",

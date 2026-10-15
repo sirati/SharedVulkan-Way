@@ -1116,9 +1116,9 @@ mod tests {
             "vkGetDeviceGroupSurfacePresentModesKHR",
             "vkGetPhysicalDevicePresentRectanglesKHR",
             // Returns dispatchable objects, so it belongs with the hand-written
-            // set and has not been written.
+            // set and has not been written. (`vkGetDeviceQueue2` was here too
+            // until docs/video-decode.md §7.7 wrote it.)
             "vkEnumeratePhysicalDeviceGroups",
-            "vkGetDeviceQueue2",
             // **`vkGetBufferDeviceAddress` and its two friends left this list**
             // (docs/design.md §0.20). §0.3 finding 5 put them here — a command
             // returning a value that is neither `void` nor `VkResult` had no
