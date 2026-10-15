@@ -38,6 +38,24 @@ GPU_ICD=${SVWL_GPU_ICD:-${SV_MESA:-/run/opengl-driver}/share/vulkan/icd.d/radeon
 # Mesa's EGL only, for the same reason: glvnd would otherwise load NVIDIA's
 # vendor library first and open the leased card from Firefox itself.
 export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json}
+# **The Mesa the Wayland modes need** (docs/design.md §0.28). Stock Mesa will not
+# put Zink on a Wayland compositor that offers only `wl_shm` — it takes the DRM
+# door, finds no device, and loads llvmpipe — so Firefox as a Wayland client of
+# this weston, or of wc-proxy, renders in software whatever this ICD offers.
+# `nix/mesa-kopper-wayland.nix` is the system's own Mesa plus the override
+# platform_x11.c already has (`LIBGL_KOPPER_DRI2`). Built against the registry's
+# nixpkgs, which is the one the system Firefox comes from, so both load one
+# libwayland-client. `SVWL_KOPPER_MESA=none` measures stock Mesa instead.
+KOPPER_MESA=${SVWL_KOPPER_MESA:-}
+if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = probe ]; }; then
+  KOPPER_MESA=$(nix build --no-link --print-out-paths --impure --expr \
+    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
+    2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
+  [ -n "$KOPPER_MESA" ] || { echo "FAIL: could not build nix/mesa-kopper-wayland.nix (SVWL_KOPPER_MESA=none to run stock Mesa)"; exit 1; }
+fi
+if [ -n "$KOPPER_MESA" ] && [ "$KOPPER_MESA" != none ]; then
+  export __EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json
+fi
 RUN=$(mktemp -d /tmp/svwl-XXXXXX)
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
@@ -63,10 +81,21 @@ mkdir -p "$RUN/xdg" "$RUN/profile" "$RUN/home" "$RUN/shots"
 chmod 700 "$RUN/xdg"
 export XDG_RUNTIME_DIR="$RUN/xdg"
 
-cat >"$RUN/profile/user.js" <<PREFS
+# **The two prefs that override Firefox's blocklist**, and a switch to leave them
+# out. Firefox's gfxInfo calls Zink without a DRM node `mesa/software-unknown`
+# and blocklists hardware WebRender for it (docs/design.md §0.27.8), so with
+# them a run measures what the driver can do and without them it measures what
+# a profile nobody configured gets. `SVWL_FORCE=0` is the second (§0.28).
+FORCE=${SVWL_FORCE:-1}
+: >"$RUN/profile/user.js"
+if [ "$FORCE" = 1 ]; then
+  cat >>"$RUN/profile/user.js" <<PREFS
 user_pref("gfx.webrender.all", true);
-user_pref("gfx.webrender.software", false);
 user_pref("webgl.force-enabled", true);
+PREFS
+fi
+cat >>"$RUN/profile/user.js" <<PREFS
+user_pref("gfx.webrender.software", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.sessionstore.resume_from_crash", false);
@@ -101,9 +130,11 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
         BEGIN { t0 = systime(); last = t0 }
         /^\[trace\]/ { n[$2]++; total++
           if (systime() - last >= 30) {
-            printf "t=%ds total=%d submit=%d present=%d draw=%d\n", systime() - t0, total,
+            printf "t=%ds total=%d submit=%d present=%d draw=%d pools=+%d/-%d cbs=+%d/-%d\n", systime() - t0, total,
               n["vkQueueSubmit"] + n["vkQueueSubmit2"], n["vkQueuePresentKHR"],
-              n["vkCmdDraw"] + n["vkCmdDrawIndexed"] + n["vkCmdDrawIndirect"] >> out
+              n["vkCmdDraw"] + n["vkCmdDrawIndexed"] + n["vkCmdDrawIndirect"],
+              n["vkCreateCommandPool"], n["vkDestroyCommandPool"],
+              n["vkAllocateCommandBuffers"], n["vkFreeCommandBuffers"] >> out
             fflush(out); delete n; total = 0; last = systime() }
           next }
         # One line per recorded command, and the counts above already say
@@ -196,6 +227,11 @@ if [ "$MODE" != x11 ] && [ "$MODE" != soak-x11 ]; then
   # a choice; unsetting DISPLAY is what makes it one.
   unset DISPLAY
   export MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland
+  # The patched Mesa's override, read by its Wayland platform exactly as the
+  # X11 platform reads it: take the kopper path with no DRM device. Inert in
+  # stock Mesa, whose Wayland platform does not read it.
+  [ "${KOPPER_MESA:-none}" != none ] && export LIBGL_KOPPER_DRI2=${SVWL_KOPPER_DRI2:-1}
+  say "Mesa for the Wayland platform: ${KOPPER_MESA:-none} (LIBGL_KOPPER_DRI2=${LIBGL_KOPPER_DRI2:-unset})"
 fi
 
 if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
