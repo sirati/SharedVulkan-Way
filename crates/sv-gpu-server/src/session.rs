@@ -425,6 +425,7 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut blob = Vec::new();
     let mut idle_since = Instant::now();
     let trace = std::env::var_os("SV_TRACE").is_some();
+    let trace_pre = std::env::var_os("SV_TRACE").is_some_and(|v| v == "pre");
 
     loop {
         if control.flags().map_err(err)? & Flags::SHUTDOWN != 0 {
@@ -493,6 +494,7 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
         // the *Vulkan* dispatcher and one of these arriving there would be a
         // bug rather than a protocol.
         if sv_proto::sv::peek_opcode(&payload).is_some_and(sv_proto::sv::is_protocol) {
+            crate::fault::begin(slot, sv_proto::sv::peek_opcode(&payload).unwrap_or(u32::MAX), seqno);
             match protocol_command(&payload, &mut srv, &mut blob, &mut reply) {
                 Ok(n) => handled += n,
                 Err(detail) => {
@@ -508,9 +510,18 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
             continue;
         }
 
+        // `SV_TRACE=pre` names the command *before* the driver sees it. The
+        // ordinary trace prints after dispatch, so when the driver itself
+        // faults the last line names the command before the one that killed
+        // the process (found on the real guest, waycompose-design.md §86).
+        if trace_pre && let Some(op) = sv_proto::sv::peek_opcode(&payload).and_then(sv_proto::Opcode::from_u32) {
+            eprintln!("[trace>] ring {slot} seqno {seqno} {}", op.name());
+        }
+        crate::fault::begin(slot, sv_proto::sv::peek_opcode(&payload).unwrap_or(u32::MAX), seqno);
         let mut dec = sv_wire::Decoder::new(&payload);
         match sv_proto::dispatch(&mut dec, &mut srv, &mut reply) {
             Ok(op) => {
+                crate::fault::end(slot);
                 // `SV_TRACE=1` prints every command and the `VkResult` its reply
                 // carries. It exists because the failure mode of a forwarder is
                 // "the application says something failed" with no way to tell

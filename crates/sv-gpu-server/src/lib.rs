@@ -21,6 +21,7 @@ extern crate self as sv_gpu_server;
 
 pub mod arena;
 pub mod entry;
+pub mod fault;
 pub mod convert;
 pub mod driver;
 pub mod server;
