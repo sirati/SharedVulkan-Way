@@ -606,6 +606,9 @@ pub struct State {
     /// than inferring it from a picture.
     pub popups: usize,
     pub presents: usize,
+    /// Commits since the dispatch loop last looked, for `WC_FRAME_TRACE`
+    /// (docs/waycompose-design.md §88).
+    pub trace_commits: u32,
     pub stopped: bool,
 }
 
@@ -931,6 +934,7 @@ impl State {
             toplevels: 0,
             popups: 0,
             presents: 0,
+            trace_commits: 0,
             stopped: false,
         }
     }
@@ -959,7 +963,18 @@ impl State {
         }
         self.last_frame = Instant::now();
         let now = self.now_ms();
-        for window in self.windows.values_mut() {
+        for (root, window) in self.windows.iter_mut() {
+            if sv_transport::frametrace::enabled() && !window.frame_callbacks.is_empty() {
+                sv_transport::frametrace::emit(
+                    "wc.done",
+                    format_args!(
+                        "win={} surf={} n={}",
+                        window.id,
+                        root.id().protocol_id(),
+                        window.frame_callbacks.len()
+                    ),
+                );
+            }
             for cb in window.frame_callbacks.drain(..) {
                 cb.done(now);
             }
@@ -2358,6 +2373,7 @@ impl State {
         let root = root_of(surface);
         let is_root_of_a_window = self.windows.contains_key(&root);
 
+        let read_started = Instant::now();
         let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
         let mut served_by = "";
@@ -2415,7 +2431,22 @@ impl State {
         // Composite the tree, and find out what that changed. `Some(rects)` is
         // the damage in window coordinates; `None` means the canvas itself was
         // reshaped and everything is new.
+        let composed_started = Instant::now();
         let (composited, cw, ch) = self.compose_tree(&root, surface, &written);
+        if sv_transport::frametrace::enabled() {
+            let ft_read = sv_transport::frametrace::us(composed_started - read_started);
+            sv_transport::frametrace::emit_at(
+                sv_transport::frametrace::at_us(read_started),
+                "wc.present",
+                format_args!(
+                    "surf={} root={} read_us={ft_read} compose_us={} rects={} {cw}x{ch}",
+                    surface.id().protocol_id(),
+                    root.id().protocol_id(),
+                    sv_transport::frametrace::us(composed_started.elapsed()),
+                    composited.len(),
+                ),
+            );
+        }
         if cw <= 0 || ch <= 0 {
             // The tree has no canvas yet. This is not a corner case: Firefox
             // commits the **subsurface** holding the browser before it commits
@@ -3381,6 +3412,19 @@ impl CompositorHandler for State {
                 )
             });
 
+        self.trace_commits += 1;
+        if sv_transport::frametrace::enabled() {
+            sv_transport::frametrace::emit(
+                "wc.c",
+                format_args!(
+                    "surf={} win={} buf={} cbs={}",
+                    surface.id().protocol_id(),
+                    self.windows.contains_key(surface) as u8,
+                    matches!(buffer, Some(BufferAssignment::NewBuffer(_))) as u8,
+                    callbacks.len(),
+                ),
+            );
+        }
         if let Some(window) = self.windows.get_mut(surface) {
             window.frame_callbacks.extend(callbacks);
         } else {
@@ -3388,6 +3432,12 @@ impl CompositorHandler for State {
             // Its callbacks still have to be answered or its client stops
             // drawing, and answering at once is right because nothing is
             // throttling it to a display.
+            if sv_transport::frametrace::enabled() && !callbacks.is_empty() {
+                sv_transport::frametrace::emit(
+                    "wc.done_now",
+                    format_args!("surf={} n={}", surface.id().protocol_id(), callbacks.len()),
+                );
+            }
             let now = self.now_ms();
             for cb in callbacks {
                 cb.done(now);

@@ -47,7 +47,7 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/shar
 # nixpkgs, which is the one the system Firefox comes from, so both load one
 # libwayland-client. `SVWL_KOPPER_MESA=none` measures stock Mesa instead.
 KOPPER_MESA=${SVWL_KOPPER_MESA:-}
-if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = probe ]; }; then
+if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = probe ]; }; then
   KOPPER_MESA=$(nix build --no-link --print-out-paths --impure --expr \
     "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
@@ -85,6 +85,12 @@ trap cleanup EXIT INT TERM
 mkdir -p "$RUN/xdg" "$RUN/profile" "$RUN/home" "$RUN/shots"
 chmod 700 "$RUN/xdg"
 export XDG_RUNTIME_DIR="$RUN/xdg"
+# `SVWL_FRAME_TRACE=1`: every process of the frame writes its half of one
+# timeline (waycompose-design.md §88), read by `scripts/wc-frame-timeline.py`.
+if [ "${SVWL_FRAME_TRACE:-0}" = 1 ]; then
+  mkdir -p "$RUN/trace"
+  export WC_FRAME_TRACE="$RUN/trace/%p.txt"
+fi
 
 # **The two prefs that override Firefox's blocklist**, and a switch to leave them
 # out. Firefox's gfxInfo calls Zink without a DRM node `mesa/software-unknown`
@@ -168,7 +174,9 @@ if [ "$SERVER" = wc-proxy ]; then
   WSOCK="svwl-$$"
   # A file arena is a fixture, and wc-compositor refuses one unless told this
   # is a fixture run: there is no guest RAM on a box with no hypervisor.
-  DISPLAY=":$XN" SV_ALLOW_FILE_ARENA=1 wine explorer "/desktop=svwl$$,1600x1000" "$WINBIN/wc-compositor.exe" \
+  # The compositor is a Windows program and opens a Windows path.
+  [ -n "${WC_FRAME_TRACE:-}" ] && CTRACE="WC_FRAME_TRACE=$(winepath -w "$RUN/trace")\\%p.txt"
+  DISPLAY=":$XN" SV_ALLOW_FILE_ARENA=1 env ${CTRACE:-} wine explorer "/desktop=svwl$$,1600x1000" "$WINBIN/wc-compositor.exe" \
     --socket "$WSOCK" --timeout $((SECS + 400)) \
     --arena "0:$WCARENA:$(winepath -w "$RUN/wc-arena")" \
     --shared-dir "$(winepath -w "$RUN/keymaps")" --shared-peer-prefix "$RUN/keymaps/" \
@@ -324,7 +332,7 @@ if [ "$MODE" != x11 ] && [ "$MODE" != soak-x11 ]; then
   say "Mesa for the Wayland platform: ${KOPPER_MESA:-none} (LIBGL_KOPPER_DRI2=${LIBGL_KOPPER_DRI2:-unset})"
 fi
 
-if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = scroll ]; then
   # **Firefox in use, for SECS, on the forwarded driver** (docs/design.md
   # §0.27). `sv-firefox-soak.py` drives it through Marionette: a tour of local
   # pages and real sites, wheel-scrolled, with a WebGL page whose frames are
@@ -410,9 +418,26 @@ HTML
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
     done ) &
   KIDS+=($!)
+  [ "$MODE" = scroll ] && export SOAK_MODE=scroll
+  if [ "$MODE" = scroll ]; then
+    CPUFILE="$RUN/cpu.txt"
+    ( sleep 25; "$PY" "$ROOT/scripts/wc-cpu-sample.py" "${SVWL_CPU_SECS:-20}" "$CPUFILE" >/dev/null 2>&1 ) &
+  fi
   timeout $((SECS + 180)) "$PY" "$ROOT/scripts/sv-firefox-soak.py" "$MPORT" "$SECS" "$RUN" \
     >"$RUN/soak.log" 2>&1
   DRIVER=$?
+  if [ "$MODE" = scroll ]; then
+    # **Only the frame rate while scrolling** (waycompose-design.md §88): no
+    # tour, so the timeline is the scroll and nothing else.
+    kill $FF 2>/dev/null; wait $FF 2>/dev/null
+    say "---- scroll ----"; grep -E '"kind": "(scroll-fps|compositor|fatal)"' "$RUN/soak.jsonl"
+    if [ -n "${WC_FRAME_TRACE:-}" ] && [ -f "$ROOT/scripts/wc-frame-timeline.py" ]; then
+      "$PY" "$ROOT/scripts/wc-frame-timeline.py" "$RUN/trace" --harness "$RUN/harness.trace" --soak "$RUN/soak.jsonl" ${CPUFILE:+--cpu "$CPUFILE"} >"$RUN/timeline.txt" 2>&1
+      cat "$RUN/timeline.txt"
+    fi
+    echo "run dir: $RUN"
+    grep -q '"kind": "done"' "$RUN/soak.jsonl"; exit $?
+  fi
   ALIVE=0; kill -0 $FF 2>/dev/null && ALIVE=1
   LIVED=$(( $(date +%s) - STARTED ))
   shot

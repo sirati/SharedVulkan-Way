@@ -424,6 +424,25 @@ fn protocol_command(
     }
 }
 
+/// One `gs.ops` line: the second's busiest opcodes on this ring and how much
+/// of the second the driver had.
+fn ft_flush(slot: u32, tally: &mut sv_transport::frametrace::OpTally, window: Duration) {
+    if tally.is_empty() {
+        return;
+    }
+    let (n, ns) = tally.total();
+    sv_transport::frametrace::emit(
+        "gs.ops",
+        format_args!(
+            "ring={slot} window_us={} busy_us={} n={n} top={}",
+            sv_transport::frametrace::us(window),
+            ns / 1000,
+            tally.top(6, |op| sv_proto::sv::opcode_name(op).into_owned()),
+        ),
+    );
+    tally.clear();
+}
+
 /// One ring, until the app side shuts down or stops talking.
 fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, String> {
     let mut cons = RingConsumer::open(&control, slot, Lane::Command).map_err(err)?;
@@ -453,6 +472,13 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut idle_since = Instant::now();
     let trace = std::env::var_os("SV_TRACE").is_some();
     let trace_pre = std::env::var_os("SV_TRACE").is_some_and(|v| v == "pre");
+    // `WC_FRAME_TRACE` (docs/waycompose-design.md §88): what this ring spent
+    // executing, per opcode, once a second. Execution time on this side is
+    // the driver's time; the app side's round trips minus this is the
+    // crossing.
+    let ft_on = sv_transport::frametrace::enabled();
+    let mut ft_tally = sv_transport::frametrace::OpTally::new();
+    let mut ft_window = Instant::now();
 
     loop {
         if control.flags().map_err(err)? & Flags::SHUTDOWN != 0 {
@@ -528,6 +554,11 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
         // no variant for one, and that is the point: `sv_proto::dispatch` is
         // the *Vulkan* dispatcher and one of these arriving there would be a
         // bug rather than a protocol.
+        let ft_started = ft_on.then(Instant::now);
+        if ft_on && ft_window.elapsed() >= Duration::from_secs(1) {
+            ft_flush(slot, &mut ft_tally, ft_window.elapsed());
+            ft_window = Instant::now();
+        }
         if sv_proto::sv::peek_opcode(&payload).is_some_and(sv_proto::sv::is_protocol) {
             crate::fault::begin(slot, sv_proto::sv::peek_opcode(&payload).unwrap_or(u32::MAX), seqno);
             match protocol_command(&payload, &mut srv, &mut blob, &mut reply) {
@@ -537,6 +568,9 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
                     eprintln!("[gpu] ring {slot} seqno {seqno} FATAL: {detail}");
                     return Err(format!("ring {slot} seqno {seqno}: {detail}"));
                 }
+            }
+            if let Some(t) = ft_started {
+                ft_tally.add(sv_proto::sv::peek_opcode(&payload).unwrap_or(u32::MAX), t.elapsed());
             }
             if !reply.is_empty() {
                 replies.push_seq(seqno, &reply, None).map_err(err)?;
@@ -591,6 +625,9 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
                     let _ = ctrl.set_fatal(1, seqno, &detail);
                     eprintln!("[gpu] ring {slot} seqno {seqno} FATAL: {detail}");
                     return Err(format!("ring {slot} seqno {seqno}: {detail}"));
+                }
+                if let Some(t) = ft_started {
+                    ft_tally.add(op as u32, t.elapsed());
                 }
                 handled += 1;
             }

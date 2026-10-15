@@ -1279,14 +1279,8 @@ impl RingTransport {
     }
 }
 
-impl Transport for RingTransport {
-    fn call(
-        &self,
-        class: RingClass,
-        _opcode: u32,
-        command: &[u8],
-        reply: &mut Vec<u8>,
-    ) -> IcdResult<()> {
+impl RingTransport {
+    fn call_untimed(&self, class: RingClass, command: &[u8], reply: &mut Vec<u8>) -> IcdResult<()> {
         // Before the ring lock, because publishing takes it. See
         // `publish_recorded_first`.
         self.publish_recorded_first()?;
@@ -1326,8 +1320,36 @@ impl Transport for RingTransport {
             return Ok(());
         }
     }
+}
+
+/// What the application waited on the GPU side for since the last present
+/// (`WC_FRAME_TRACE`, docs/waycompose-design.md §88): every synchronous round
+/// trip, by opcode, and how many fire-and-forget packets went with them.
+pub(crate) static ROUND_TRIPS: Mutex<sv_transport::frametrace::OpTally> =
+    Mutex::new(sv_transport::frametrace::OpTally::new());
+pub(crate) static SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Transport for RingTransport {
+    fn call(
+        &self,
+        class: RingClass,
+        opcode: u32,
+        command: &[u8],
+        reply: &mut Vec<u8>,
+    ) -> IcdResult<()> {
+        if !sv_transport::frametrace::enabled() {
+            return self.call_untimed(class, command, reply);
+        }
+        let started = std::time::Instant::now();
+        let r = self.call_untimed(class, command, reply);
+        ROUND_TRIPS.lock().unwrap_or_else(|e| e.into_inner()).add(opcode, started.elapsed());
+        r
+    }
 
     fn send(&self, class: RingClass, _opcode: u32, command: &[u8]) -> IcdResult<()> {
+        if sv_transport::frametrace::enabled() {
+            SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.publish_recorded_first()?;
         self.push_on(class, command).map(|_| ())
     }

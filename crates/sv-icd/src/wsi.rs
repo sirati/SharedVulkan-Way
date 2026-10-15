@@ -626,12 +626,14 @@ pub fn queue_present(
     };
 
     let started = std::time::Instant::now();
+    let app = traced_app_interval(swapchain, started);
     let r = icd.reset_fences(p::VkResetFencesArgs {
         device: p::VkDevice(device),
         fence_count: 1,
         p_fences: vec![p::VkFence(fence)],
     })?;
     result_ok(r.result)?;
+    let reset = std::time::Instant::now();
 
     let mut si = p::VkSubmitInfo::default();
     si.wait_semaphore_count = waits.len() as u32;
@@ -650,6 +652,7 @@ pub fn queue_present(
         fence: p::VkFence(fence),
     })?;
     result_ok(r.result)?;
+    let submitted = std::time::Instant::now();
 
     let r = icd.wait_for_fences(p::VkWaitForFencesArgs {
         device: p::VkDevice(device),
@@ -675,7 +678,74 @@ pub fn queue_present(
     }
     let shown = std::time::Instant::now();
     frame_note(swapchain, bytes, width, height, fenced - started, shown - fenced);
+    if let Some(app) = app {
+        use sv_transport::frametrace as ft;
+        // The ICD's half of the frame timeline (docs/waycompose-design.md §88).
+        // `gap` is the application's own time between two presents, and
+        // `rt`/`rt_us` the part of it spent waiting on the GPU side; the four
+        // phases after it are this function's.
+        ft::emit_at(
+            ft::at_us(started),
+            "icd.present",
+            format_args!(
+                "sc={swapchain:#x} img={image_index} {width}x{height} gap_us={} rt={} rt_us={} sends={} \
+                 top={} reset_us={} submit_us={} wait_us={} show_us={} end={}",
+                app.gap_us,
+                app.round_trips,
+                app.round_trip_us,
+                app.sends,
+                app.top,
+                ft::us(reset - started),
+                ft::us(submitted - reset),
+                ft::us(fenced - submitted),
+                ft::us(shown - fenced),
+                ft::at_us(shown),
+            ),
+        );
+        PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, shown);
+        // The present's own three round trips are its phases above; they are
+        // not the next frame's application time.
+        crate::transport::ROUND_TRIPS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        crate::transport::SENDS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
+}
+
+/// When each swapchain's last present returned, for the gap to the next.
+static PRESENT_END: std::sync::Mutex<std::collections::BTreeMap<u64, std::time::Instant>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// What the application did between its last present and this one, as the
+/// transport counted it. `None` when `WC_FRAME_TRACE` is off.
+struct AppInterval {
+    gap_us: u64,
+    round_trips: u64,
+    round_trip_us: u64,
+    sends: u64,
+    top: String,
+}
+
+fn traced_app_interval(swapchain: u64, now: std::time::Instant) -> Option<AppInterval> {
+    use std::sync::atomic::Ordering;
+    if !sv_transport::frametrace::enabled() {
+        return None;
+    }
+    let gap_us = PRESENT_END
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&swapchain)
+        .map_or(0, |t| sv_transport::frametrace::us(now.saturating_duration_since(*t)));
+    let mut tally = crate::transport::ROUND_TRIPS.lock().unwrap_or_else(|e| e.into_inner());
+    let (round_trips, ns) = tally.total();
+    let top = tally.top(4, |op| p::sv::opcode_name(op).into_owned());
+    tally.clear();
+    Some(AppInterval {
+        gap_us,
+        round_trips,
+        round_trip_us: ns / 1000,
+        sends: crate::transport::SENDS.swap(0, Ordering::Relaxed),
+        top: if top.is_empty() { "-".into() } else { top },
+    })
 }
 
 /// Say, occasionally and only under `SV_DEBUG`, whether the frame about to be

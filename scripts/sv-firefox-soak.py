@@ -128,7 +128,65 @@ def webgl_check(m):
     """)
 
 
+def mark(what):
+    """A line in OUTDIR/harness.trace on the clock `WC_FRAME_TRACE` uses
+    (microseconds of the wall clock), so the frame timeline can be cut to the
+    seconds a wheel was turning (waycompose-design.md §88)."""
+    with open(os.path.join(OUT, "harness.trace"), "a") as f:
+        f.write(f"{time.time_ns() // 1000} harness.{what}\n")
+
+
+def pct(xs, p):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    return round(xs[min(len(xs) - 1, int(round(p / 100.0 * (len(xs) - 1))))], 2)
+
+
+def scroll_fps(m, label, steps=40):
+    """The §87 measurement: the long page, wheel input for about five seconds,
+    and every requestAnimationFrame's timestamp, so the result is a frame-time
+    distribution and not only a mean."""
+    m.call("WebDriver:Navigate", {"url": TOUR[0]})
+    time.sleep(2)
+    m.script("""window.__fps = {ts: [], t0: performance.now()};
+                (function f(t){ window.__fps.ts.push(t); requestAnimationFrame(f); })(performance.now());""")
+    mark(f"scroll-begin {label}")
+    wheel(m, 120, steps)
+    mark(f"scroll-end {label}")
+    r = m.script("""const d = performance.now() - window.__fps.t0;
+                    return {ts: window.__fps.ts, ms: d, y: window.scrollY};""")
+    ts = r["ts"]
+    dts = [b - a for a, b in zip(ts, ts[1:])]
+    log("scroll-fps", label=label, fps=round(len(ts) * 1000.0 / r["ms"], 1), frames=len(ts),
+        ms=round(r["ms"], 1), y=r["y"], p50=pct(dts, 50), p95=pct(dts, 95), p99=pct(dts, 99),
+        max=round(max(dts), 2) if dts else None)
+
+
+def scroll_only():
+    """`SOAK_MODE=scroll`: no tour, only the scroll measurement, ROUNDS times.
+    A guest run is a budgeted thing; this is the shortest one that answers the
+    frame-rate question."""
+    m = Marionette(PORT)
+    log("hello", hello=m.hello)
+    m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})
+    m.call("WebDriver:SetTimeouts", {"pageLoad": 60000, "script": 30000})
+    try:
+        log("window", rect=m.call("WebDriver:SetWindowRect", {"width": 1280, "height": 900}))
+    except RuntimeError as e:
+        log("window", error=str(e)[:200])
+    log("compositor", value=compositor(m))
+    for i in range(int(os.environ.get("SOAK_ROUNDS", "3"))):
+        try:
+            scroll_fps(m, f"r{i + 1}")
+        except (RuntimeError, socket.timeout, KeyError, TypeError) as e:
+            log("scroll-fps", label=f"r{i + 1}", error=str(e)[:200])
+    log("done")
+
+
 def main():
+    if os.environ.get("SOAK_MODE") == "scroll":
+        return scroll_only()
     m = Marionette(PORT)
     log("hello", hello=m.hello)
     m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})
@@ -174,13 +232,7 @@ def main():
     # seconds. rAF runs at the rate the compositor's frame callbacks allow, so
     # this is what a person scrolling sees, not what the GPU could do.
     try:
-        m.call("WebDriver:Navigate", {"url": TOUR[0]})
-        m.script("""window.__fps = {n: 0, t0: performance.now()};
-                    (function f(){ window.__fps.n++; requestAnimationFrame(f); })();""")
-        wheel(m, 120, 40)
-        r = m.script("""const d = performance.now() - window.__fps.t0;
-                        return {frames: window.__fps.n, ms: d, y: window.scrollY};""")
-        log("scroll-fps", fps=round(r["frames"] * 1000.0 / r["ms"], 1), **r)
+        scroll_fps(m, "tour")
     except (RuntimeError, socket.timeout, KeyError, TypeError) as e:
         log("scroll-fps", error=str(e)[:200])
     m.call("WebDriver:Navigate", {"url": "about:support"})

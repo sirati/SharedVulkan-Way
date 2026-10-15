@@ -1107,6 +1107,9 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
+        if sv_transport::frametrace::enabled() {
+            trace_request(&interface, &msg.name, header.object, body, &spans);
+        }
 
         // Materialise any pool still being sized, unless *this* message is one
         // of the two that a pool is allowed to be deferred through. Doing it
@@ -2119,6 +2122,9 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
+        if sv_transport::frametrace::enabled() {
+            trace_event(&interface, &msg.name, header.object);
+        }
 
         // STAGE 13. The compositor's own announcements are forwarded untouched,
         // and two of them are *watched* on the way past for the same reason
@@ -2697,6 +2703,18 @@ impl Session {
         // §13.8's retracted throughput number is what happens when one is left
         // inside the measurement.
         self.stats.copy_nanos += started.elapsed().as_nanos() as u64;
+        if sv_transport::frametrace::enabled() {
+            // docs/waycompose-design.md §88: the proxy's half of a frame.
+            sv_transport::frametrace::emit_at(
+                sv_transport::frametrace::at_us(started),
+                "px.commit",
+                format_args!(
+                    "surf={surface_id} buf={buffer_id} attached={} copied={copied} copy_us={}",
+                    attached_now as u8,
+                    sv_transport::frametrace::us(started.elapsed()),
+                ),
+            );
+        }
         // **Only a commit that attached a buffer can be checked**, and this is
         // the instrument's own correctness rather than a convenience.
         //
@@ -2754,6 +2772,34 @@ impl Session {
             self.stats.copies += 1;
             self.stats.bytes_copied += copied as u64;
         }
+    }
+}
+
+/// `WC_FRAME_TRACE` (docs/waycompose-design.md §88): the requests a frame's
+/// pacing is made of, as they pass on the way to the compositor.
+fn trace_request(interface: &str, name: &str, object: u32, body: &[u8], spans: &[wire::Span]) {
+    use sv_transport::frametrace as ft;
+    match (interface, name) {
+        ("wl_surface", "frame") => {
+            let cb = spans.first().and_then(|s| wire::word_at(body, s)).unwrap_or(0);
+            ft::emit("px.frame", format_args!("surf={object} cb={cb}"));
+        }
+        ("wl_surface", "commit") => ft::emit("px.c", format_args!("surf={object}")),
+        ("wl_surface", "attach") => {
+            let buf = spans.first().and_then(|s| wire::word_at(body, s)).unwrap_or(0);
+            ft::emit("px.attach", format_args!("surf={object} buf={buf}"));
+        }
+        _ => {}
+    }
+}
+
+/// The events that answer them, on the way back to the client.
+fn trace_event(interface: &str, name: &str, object: u32) {
+    use sv_transport::frametrace as ft;
+    match (interface, name) {
+        ("wl_callback", "done") => ft::emit("px.done", format_args!("cb={object}")),
+        ("wl_buffer", "release") => ft::emit("px.release", format_args!("buf={object}")),
+        _ => {}
     }
 }
 

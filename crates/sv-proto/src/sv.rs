@@ -394,3 +394,17 @@ mod tests {
         assert_eq!(declared as usize, buf.len());
     }
 }
+
+/// A printable name for any opcode on a ring, ours or Vulkan's, for
+/// instruments (`WC_FRAME_TRACE`, docs/waycompose-design.md §88).
+pub fn opcode_name(op: u32) -> std::borrow::Cow<'static, str> {
+    match op {
+        SV_EXECUTE_COMMAND_BLOB => "svExecuteCommandBlob".into(),
+        SV_IMPORT_ARENA_SLAB => "svImportArenaSlab".into(),
+        SV_DRIVER_VERSIONS => "svDriverVersions".into(),
+        _ => match crate::Opcode::from_u32(op) {
+            Some(o) => o.name().into(),
+            None => format!("op{op:#x}").into(),
+        },
+    }
+}
