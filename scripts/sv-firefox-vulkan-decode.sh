@@ -149,7 +149,7 @@ env HOME="$RUN/home" timeout "$SECS" "$FIREFOX" --no-remote --marionette --remot
   "file://$RUN/play.html" "about:support" >"$RUN/ff.log" 2>&1 &
 FF=$!
 KIDS+=($FF)
-sleep $((SECS - 15))
+sleep $((SECS - 25))
 
 GECKODRIVER=${SVFD_GECKODRIVER:-$(command -v geckodriver)}
 if [ -n "$GECKODRIVER" ]; then
@@ -157,8 +157,14 @@ if [ -n "$GECKODRIVER" ]; then
   "$GECKODRIVER" --connect-existing --marionette-port "$MPORT" --port "$GDPORT" >"$RUN/geckodriver.log" 2>&1 &
   KIDS+=($!)
   sleep 1
-  wd() { curl -s -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$GDPORT$1" -d "$2"; }
-  wd /session '{"capabilities":{}}' >"$RUN/wd-session.json"
+  wd() { curl -s --max-time 30 -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$GDPORT$1" -d "$2"; }
+  # The session handshake has timed out under load (the decoder and the
+  # compositor busy), so it is retried rather than trusted to the first attempt.
+  for _ in 1 2 3; do
+    wd /session '{"capabilities":{}}' >"$RUN/wd-session.json"
+    grep -q sessionId "$RUN/wd-session.json" && break
+    sleep 2
+  done
   sid=$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "$RUN/wd-session.json")
   if [ -n "$sid" ]; then
     wd "/session/$sid/moz/context" '{"context":"chrome"}' >/dev/null
