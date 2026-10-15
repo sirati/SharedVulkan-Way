@@ -1,0 +1,11 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_SV_intel_shape",
+    "type": "GLOBAL",
+    "library_path": "./libVkLayer_sv_intel_shape.so",
+    "api_version": "1.4.313",
+    "implementation_version": "1",
+    "description": "answers H.264 decode queries as Intel 101.7076 does"
+  }
+}
