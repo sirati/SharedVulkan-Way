@@ -305,7 +305,10 @@ HTML
   # Every full half-minute window of the GPU side's trace, after the first,
   # must have queue submissions in it: rendering through this driver for the
   # whole run, not only at start-up.
-  if [ -s "$RUN/gpu-trace.txt" ] && ! tail -n +2 "$RUN/gpu-trace.txt" | grep -q "submit=0 "; then
+  # At least one such window, too: a run that died inside its first minute has
+  # none after the first, and "every one of none" is not a pass.
+  if [ "$(tail -n +2 "$RUN/gpu-trace.txt" 2>/dev/null | wc -l)" -ge 1 ] \
+     && ! tail -n +2 "$RUN/gpu-trace.txt" | grep -q "submit=0 "; then
     ok "the GPU side executed submissions in every 30 s window: $(tail -n +2 "$RUN/gpu-trace.txt" | awk '{print $3}' | tr '\n' ' ')"
   else
     bad "a 30 s window with no queue submission on the GPU side, or no trace: $(tr '\n' ';' <"$RUN/gpu-trace.txt" 2>/dev/null)"
