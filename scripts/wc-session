@@ -69,7 +69,11 @@
 # would set ROOTC=bash and lose nothing.
 set -uo pipefail
 
-BASE="${WC_LAUNCH_BASE:-$HOME/wc-launch}"
+# The directory this script was installed in, so that an installation that is
+# not ~/wc-launch runs its *own* binaries: the forced command names the script
+# and nothing else, and a fixed default here ran a second install's wc-session
+# against the first install's wc-proxy (found by §83's session-0 run).
+BASE="${WC_LAUNCH_BASE:-$(cd "$(dirname "$0")" && pwd)}"
 BIN="$BASE/bin"
 RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
 ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
