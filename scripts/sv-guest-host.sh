@@ -81,7 +81,7 @@ pkill -f '$DIR/sv-hostd' 2>/dev/null
 systemctl stop 'svff-hostd-*' 'svff-app-*' 2>/dev/null
 systemctl reset-failed 'svff-*' 2>/dev/null
 rm -f $DIR/icd.sock $DIR/hostd.ready $DIR/hostd.done
-true" | "$ROOTC" >/dev/null 2>&1
+true" | eval "$ROOTC" >/dev/null 2>&1
 rm -f "$DIR"/cold*.sock "$DIR"/*.log "$DIR"/hostd.ready "$DIR"/hostd.done
 
 # ---------------------------------------------------------------- forward ---
@@ -130,7 +130,7 @@ HOSTD
 chmod 755 "$DIR/hostd.sh"
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 systemd-run --unit=$UNIT --collect '$BASH_BIN' '$DIR/hostd.sh' >/dev/null 2>&1
-echo started" | "$ROOTC" >/dev/null 2>&1
+echo started" | eval "$ROOTC" >/dev/null 2>&1
 
 for _ in $(seq 1 200); do [ -f "$DIR/hostd.ready" ] && break; sleep 1; done
 say "---- sv-hostd ----"
@@ -138,7 +138,7 @@ sed 's/^/  /' "$DIR/hostd.log" 2>/dev/null
 if [ ! -S "$DIR/icd.sock" ]; then
   echo "FAIL: sv-hostd never offered the extent"
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-journalctl -u $UNIT --no-pager 2>&1 | tail -20" | "$ROOTC" 2>&1 | sed 's/^/  unit: /'
+journalctl -u $UNIT --no-pager 2>&1 | tail -20" | eval "$ROOTC" 2>&1 | sed 's/^/  unit: /'
   exit 1
 fi
 
@@ -191,7 +191,7 @@ APP
 chmod 755 "$DIR/app.sh"
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 systemd-run --unit=svff-app-$$ --collect --wait '$BASH_BIN' '$DIR/app.sh' >/dev/null 2>&1
-echo done" | "$ROOTC" >/dev/null 2>&1
+echo done" | eval "$ROOTC" >/dev/null 2>&1
 
 say "---- the app side, on a host with no GPU ----"
 sed 's/^/  /' "$DIR/app.log" 2>/dev/null
@@ -251,6 +251,6 @@ else
 fi
 
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-pkill -f '$DIR/sv-hostd' 2>/dev/null; systemctl stop $UNIT 2>/dev/null; true" | "$ROOTC" >/dev/null 2>&1
+pkill -f '$DIR/sv-hostd' 2>/dev/null; systemctl stop $UNIT 2>/dev/null; true" | eval "$ROOTC" >/dev/null 2>&1
 [ "$fail" -eq 0 ] && say "sv-guest-host: PASS" || say "sv-guest-host: FAIL"
 exit "$fail"

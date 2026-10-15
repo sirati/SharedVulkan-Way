@@ -114,7 +114,7 @@ cleanup() {
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 pkill -f '$DIR/sv-hostd' 2>/dev/null
 systemctl stop '$UNITPFX-run-*' 2>/dev/null; systemctl reset-failed '$UNITPFX-*' 2>/dev/null
-true" | "$ROOTC" >/dev/null 2>&1
+true" | eval "$ROOTC" >/dev/null 2>&1
 }
 trap cleanup EXIT INT TERM
 
@@ -155,7 +155,7 @@ systemctl stop '$UNITPFX-run-*' '$UNITPFX-hostd-*' '$UNITPFX-app-*' 2>/dev/null
 systemctl reset-failed '$UNITPFX-*' 2>/dev/null
 rm -rf $SHARE; mkdir -p $SHARE/frames; chmod -R 777 $SHARE
 rm -f $DIR/icd.sock
-true" | "$ROOTC" >/dev/null 2>&1
+true" | eval "$ROOTC" >/dev/null 2>&1
 rm -f "$DIR"/cold*.sock "$DIR"/*.log
 # Only sockets this experiment made. §17's rule: identity is a path, not a name.
 ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/$UNITPFX-* 2>/dev/null; true" >/dev/null 2>&1
@@ -236,7 +236,7 @@ echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $DIR/wc-arena-host --qmp /run/windows-vm/qmp.sock --vm windows-vm --run $RUNID \
   --pages $FOUNDPAGES --outbound $ARENA_OUTBOUND $FRAMES_ARG --plan '$RUN/arena.plan' >'$RUN/locate.log' 2>&1
 echo \"rc=\$?\" >>'$RUN/locate.log'
-chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | "$ROOTC" >/dev/null 2>&1
+chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | eval "$ROOTC" >/dev/null 2>&1
 sed 's/^/  /' "$RUN/locate.log" 2>/dev/null
 grep -q "^rc=0$" "$RUN/locate.log" 2>/dev/null || { echo "FAIL: wc-arena-host did not locate the compositor's arena"; exit 1; }
 
@@ -382,7 +382,7 @@ chmod 755 "$RUN/hostside.sh"
 
 echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 systemd-run --unit=$UNIT --collect '$BASH_BIN' '$RUN/hostside.sh' >/dev/null 2>&1
-echo started" | "$ROOTC" >/dev/null 2>&1
+echo started" | eval "$ROOTC" >/dev/null 2>&1
 
 for _ in $(seq 1 $((SECS + 260))); do [ -f "$RUN/hostside.done" ] && break; sleep 1; done
 
@@ -399,7 +399,7 @@ grep -viE "gdk_seat_get_keyboard|GDK_IS_SEAT|^$" "$RUN/ff.log" 2>/dev/null | tai
 if [ ! -f "$RUN/hostside.done" ]; then
   echo "FAIL: the host-side unit never finished"
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-journalctl -u $UNIT --no-pager 2>&1 | tail -20" | "$ROOTC" 2>&1 | sed 's/^/  unit: /'
+journalctl -u $UNIT --no-pager 2>&1 | tail -20" | eval "$ROOTC" 2>&1 | sed 's/^/  unit: /'
 fi
 
 say "---- the compositor, inside the VM ----"
