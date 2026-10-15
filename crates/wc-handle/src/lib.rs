@@ -129,6 +129,11 @@ pub mod ivshmem;
 mod platform;
 pub mod publish;
 
+/// An ivshmem device by root-bus slot, mapped read-write and cached, for the
+/// GPU sessions' arena (waycompose-design.md §87). The view owns the device
+/// handle; dropping it is the release.
+pub use platform::{MappedView, map_ivshmem_slot};
+
 /// How many objects of each kind this process has mapped.
 ///
 /// See [`map_counts`]. Deliberately process-global and deliberately not

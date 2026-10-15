@@ -36,6 +36,12 @@ libc.workspace = true
 # for no gain, and the two would drift.
 [target.'cfg(windows)'.dependencies]
 awe-probe = { path = "../awe-probe" }
+# The ivshmem device: finding it by slot and asking its driver for the BAR
+# mapping (waycompose-design.md §87). The compositor's arena moved onto such a
+# device in §83 and the code that talks to the driver lives in `wc-handle`;
+# the GPU sessions' arena is the second device, and a second copy of that FFI
+# would be the drift `awe-probe`'s comment above warns about.
+wc-handle = { path = "../wc-handle" }
 
 [dev-dependencies]
 # Only so the two sides' shared constants can be *compared* rather than each
