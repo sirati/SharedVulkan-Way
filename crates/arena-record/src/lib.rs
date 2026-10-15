@@ -51,6 +51,9 @@ pub const MODE_AWE: u32 = 1;
 pub const MODE_LOCKED_VA: u32 = 0;
 pub const MODE_LARGE_PAGES: u32 = 2;
 pub const MODE_AWE2_LARGE: u32 = 3;
+/// A page of an ivshmem BAR (waycompose-design.md §87): not guest RAM at all,
+/// so there is no allocator to name and no frame to report.
+pub const MODE_IVSHMEM: u32 = 4;
 
 pub fn put_u32(page: &mut [u8], off: usize, v: u32) {
     page[off..off + 4].copy_from_slice(&v.to_le_bytes());

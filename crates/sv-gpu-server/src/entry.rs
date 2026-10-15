@@ -250,6 +250,9 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// per session that it costs there.
 #[cfg(windows)]
 fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.iter().any(|a| a == "--ivshmem-slot") {
+        return win_guest_ivshmem(args);
+    }
     crate::fault::install();
     use awe_probe::alloc::{Mode, Window};
     use std::sync::Arc;
@@ -475,6 +478,338 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // would unlock and free memory the host still has mapped.
     std::mem::forget(window);
     Ok(())
+}
+
+/// The Windows guest side **on an ivshmem device** (waycompose-design.md §87).
+///
+/// ```text
+/// sv-gpu-server guest --port <tcp> --ivshmem-slot <pci slot> [--device N]
+///                     [--arena BYTES] [--sessions N] [--idle SECS] [--bell PORT]
+/// ```
+///
+/// [`win_guest`] with the arena moved from large-page guest RAM, which the
+/// VM host can only reach as root, onto BAR2 of an ivshmem device, whose
+/// backing file it opens as the user. What that changes:
+///
+/// * **one process, several sessions.** The device's driver gives the BAR to
+///   one handle and the doorbell's port takes one opener, so this process maps
+///   both once and serves each connection on `--port` as its own session in its
+///   own slot of the BAR ([`crate::ivshmem`]): its own control region, its own
+///   arena, its own `VkDevice`, exactly the isolation one process per session
+///   gave. A slot whose session ended cleanly is given to the next one; one
+///   whose session left objects behind is quarantined, its device kept, so
+///   that nothing is destroyed under a driver that still holds it.
+/// * **no window, no lock, no large pages.** The BAR's pages are the device's,
+///   not this process's working set, so §84.5's moving frames and §86's
+///   large-pages-or-refuse rule have nothing to apply to.
+/// * **no locate.** The `Hello` carries the slot's offset in the region
+///   (`Locator::Ivshmem`); the host maps the file there and checks the stamps,
+///   which are written exactly as before so that a host reading the wrong
+///   slot or the wrong file says so.
+///
+/// The import is the same `VK_EXT_external_memory_host` import as on guest
+/// RAM. Intel's driver taking a pointer into a BAR mapping was the open
+/// question, and `sv-ivshmem-probe` measured it: the query and the import
+/// succeed and a GPU copy through the BAR is exact (§87).
+#[cfg(windows)]
+fn win_guest_ivshmem(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    crate::fault::install();
+    use std::sync::Arc;
+    use sv_gpu_server::ivshmem::{SlotPlan, Slots};
+
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let port: u16 = arg("--port").ok_or("--port is required")?.parse()?;
+    let device: usize = arg("--device").map_or(Ok(0), |s| s.parse())?;
+    let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
+    let idle: u64 = arg("--idle").map_or(Ok(30), |s| s.parse())?;
+    let max: u32 = arg("--sessions").map_or(Ok(0), |s| s.parse())?;
+    let pci = arg("--ivshmem-slot").ok_or("--ivshmem-slot is required")?;
+    let pci: u8 = match pci.strip_prefix("0x") {
+        Some(h) => u8::from_str_radix(h, 16)?,
+        None => pci.parse()?,
+    };
+
+    let geometry = geometry_for(arena_size);
+    let started = std::time::Instant::now();
+    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    let plan = SlotPlan::new(size, geometry, max)?;
+    eprintln!(
+        "[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, {} session slot(s) of \
+         {} MiB ({} MiB control + {} MiB arena)",
+        started.elapsed(),
+        size >> 20,
+        plan.count,
+        plan.slot_len >> 20,
+        plan.control_len >> 20,
+        plan.arena_len >> 20,
+    );
+    // The view owns the device handle, and so the mapping; it lives as long as
+    // the process, and every session's regions borrow from it.
+    let bar = view.ptr().cast_mut() as usize;
+    let slots = Arc::new(Slots::new(plan));
+
+    // THE DOORBELL, for every session at once. One port, one opener, so one
+    // reader that rings each byte's lane in every live session
+    // (`vdoorbell::ControlSet`), and one writer every session's bells poke.
+    let set = sv_transport::vdoorbell::ControlSet::new();
+    let _doorman = match arg("--bell") {
+        None => None,
+        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+            .and_then(|p| sv_transport::vdoorbell::attach_set(p, Arc::clone(&set)))
+        {
+            Ok(d) => {
+                eprintln!("[gpu] doorbell attached on \\\\.\\Global\\{name}, shared by every session");
+                Some(d)
+            }
+            Err(e) => {
+                eprintln!("[gpu] no doorbell on {name} ({e}); waits will run out their slice");
+                None
+            }
+        },
+    };
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+    // The launcher waits for these words; they are the same as `win_guest`'s.
+    eprintln!("[gpu] publishing the extent on 127.0.0.1:{port} (ivshmem, one session per connection)");
+    let mut n = 0u64;
+    for conn in listener.incoming() {
+        let mut stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[gpu] accept: {e}");
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        n += 1;
+        let session = n;
+        let slots = Arc::clone(&slots);
+        let set = Arc::clone(&set);
+        std::thread::spawn(move || {
+            let Some(slot) = slots.acquire() else {
+                let (free, busy, q) = slots.census();
+                let reason = format!(
+                    "all {} GPU session slots are taken ({busy} busy, {q} quarantined, {free} free)",
+                    slots.plan.count
+                );
+                eprintln!("[gpu] session {session}: refused: {reason}");
+                let _ = sv_transport::stream::write_message(
+                    &mut stream,
+                    &sv_transport::cold::ColdMessage::Refuse { code: 4, reason },
+                );
+                return;
+            };
+            let outcome = ivshmem_session(session, slot, bar, &slots.plan, device, idle, &set, stream);
+            match outcome {
+                Ok((cmds, clean)) => {
+                    if clean {
+                        slots.release(slot);
+                    } else {
+                        slots.quarantine(slot);
+                    }
+                    let (free, busy, q) = slots.census();
+                    eprintln!(
+                        "[gpu] session {session} (slot {slot}) finished, {cmds} commands; slot {}; \
+                         slots free {free}, busy {busy}, quarantined {q}",
+                        if clean { "released" } else { "quarantined" }
+                    );
+                }
+                Err((e, clean)) => {
+                    if clean {
+                        slots.release(slot);
+                    } else {
+                        slots.quarantine(slot);
+                    }
+                    eprintln!(
+                        "[gpu] session {session} (slot {slot}) ended: {e}; slot {}",
+                        if clean { "released" } else { "quarantined" }
+                    );
+                }
+            }
+        });
+    }
+    drop(view);
+    Ok(())
+}
+
+/// One session in one slot of the BAR: stamp, hand the host the offset, wait
+/// for its `Accept`, open a device, import the slot's arena, serve.
+///
+/// Returns the command count and whether the slot may be reused; on error,
+/// the message and the same verdict. A session whose device was never opened
+/// left nothing in the driver, so its slot is always clean.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn ivshmem_session(
+    session: u64,
+    slot: u32,
+    bar: usize,
+    plan: &sv_gpu_server::ivshmem::SlotPlan,
+    device: usize,
+    idle: u64,
+    set: &std::sync::Arc<sv_transport::vdoorbell::ControlSet>,
+    mut stream: std::net::TcpStream,
+) -> Result<(u64, bool), (String, bool)> {
+    use std::sync::Arc;
+    use sv_gpu_server::driver::Driver;
+    use sv_gpu_server::{arena, server::Shared, session as sess, table::Objects};
+    use sv_transport::cold::{ColdMessage, ExtentDesc, Granularity, Hello, Locator};
+    use sv_transport::control::{Control, ENDIAN_MARKER};
+    use sv_transport::region::{PAGE, SharedRegion};
+    use sv_transport::stream::{read_message, write_message};
+
+    let fail = |e: String| (e, true);
+    let offset = plan.offset(slot);
+    // SAFETY: `offset + slot_len <= region_len` by `SlotPlan`, the BAR mapping
+    // lives as long as the process, and this slot is this thread's alone until
+    // it is released.
+    let base = unsafe { (bar as *mut u8).add(offset as usize) };
+    let pages = (plan.slot_len / PAGE as u64) as usize;
+    let run_id = awe_probe::new_run_id() | 1;
+    for i in 0..pages {
+        let page = arena_record::make_guest_page(run_id, i as u32, arena_record::MODE_IVSHMEM, 0);
+        // SAFETY: page `i` of this slot, inside the mapping.
+        unsafe { std::ptr::copy_nonoverlapping(page.as_ptr(), base.add(i * PAGE), PAGE) };
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    eprintln!(
+        "[gpu] session {session}: slot {slot} at +{} MiB, run 0x{run_id:016x}, stamped {pages} pages",
+        offset >> 20
+    );
+
+    let geometry = sv_transport::control::Geometry::for_arena(plan.arena_len);
+    write_message(
+        &mut stream,
+        &ColdMessage::Hello(Box::new(Hello {
+            ids: sv_gpu_server::protocol_ids(),
+            generation: 1,
+            extent: ExtentDesc {
+                run_id,
+                // Nothing here is a page frame; the granularity says what the
+                // stamps were written at, which is 4 KiB.
+                granularity: Granularity::Small4K,
+                control_pages: plan.control_pages(),
+                arena_pages: plan.arena_pages(),
+                locator: Locator::Ivshmem { region_offset: offset },
+            },
+            geometry,
+            endianness: ENDIAN_MARKER,
+            pointer_width: 64,
+        })),
+    )
+    .map_err(|e| fail(format!("Hello: {e}")))?;
+    let mut scratch = Vec::new();
+    match read_message(&mut stream, &mut scratch).map_err(|e| fail(format!("no reply to Hello: {e}")))? {
+        ColdMessage::Accept { generation: 1 } => {}
+        ColdMessage::Refuse { code, reason } => return Err(fail(format!("the host refused {code}: {reason}"))),
+        other => return Err(fail(format!("unexpected cold-path reply {other:?}"))),
+    }
+
+    // After the Accept, never before: `Control::create` zeroes the stamps the
+    // host has just checked.
+    let control_region = Arc::new(unsafe { SharedRegion::from_raw(base, plan.control_len as usize) });
+    let arena_region = Arc::new(unsafe {
+        SharedRegion::from_raw(base.add(plan.control_len as usize), plan.arena_len as usize)
+    });
+
+    let t = std::time::Instant::now();
+    let setup = (|| -> Result<_, String> {
+        let driver = Driver::open(device).map_err(|e| format!("Driver::open: {e}"))?;
+        let gpu_arena = arena::import_whole(&driver, Arc::clone(&arena_region))
+            .map_err(|e| format!("importing the slot's arena: {e}"))?;
+        let control =
+            Control::create(Arc::clone(&control_region), geometry, sv_gpu_server::protocol_ids(), 1)
+                .map_err(|e| format!("Control::create: {e}"))?;
+        control.stamp_epoch().map_err(|e| format!("stamp_epoch: {e}"))?;
+        Ok((driver, gpu_arena, control))
+    })();
+    let (driver, gpu_arena, control) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = write_message(&mut stream, &ColdMessage::Refuse { code: 5, reason: e.clone() });
+            return Err(fail(e));
+        }
+    };
+    eprintln!(
+        "[gpu] session {session}: {} ({}), arena {} MiB of the BAR imported as a host pointer, \
+         memory type {}, device, import and control region in {:.2?}",
+        driver.name,
+        driver.driver_key(),
+        gpu_arena.len >> 20,
+        gpu_arena.memory_type,
+        t.elapsed()
+    );
+    let arena_memory = gpu_arena.memory;
+    let control = Arc::new(control);
+    set.add(&control);
+    // PUBLISHED. On guest RAM the host located every session before any ICD
+    // existed, so the control region was always published by the time one
+    // attached. Here the ICD is what asks for the session, and the host must
+    // not hand it the slot while the stamps are still where the control
+    // header goes — the ICD reads `SVARENA1` as a foreign magic and refuses
+    // (measured, the first run of §87). So the host waits for this word.
+    // A host that has gone sends no application; the session then times out
+    // waiting for its rings to be claimed, which is the ordinary end.
+    if let Err(e) = write_message(&mut stream, &ColdMessage::Ping) {
+        eprintln!("[gpu] session {session}: could not say it is published: {e}");
+    }
+
+    let fns = driver.load_fns();
+    report_missing(&fns);
+    let mut objects = Objects::new();
+    objects.set_arena(gpu_arena.memory, gpu_arena.len);
+    let shared = Arc::new(Shared {
+        driver: Arc::new(driver),
+        arena: gpu_arena,
+        objects: std::sync::Mutex::new(objects),
+        fns: Arc::new(fns),
+        queue_lock: Arc::new(std::sync::Mutex::new(())),
+        pool_lock: Arc::new(std::sync::Mutex::new(())),
+    });
+    let served = sess::serve(
+        Arc::clone(&control),
+        Arc::clone(&shared),
+        geometry.ring_slot_count,
+        std::time::Duration::from_secs(idle),
+    );
+    // The stream is the host's view of this session; closing it now says the
+    // session is over. Nothing reads it any more.
+    drop(stream);
+
+    // Is the slot reusable? Only if the application destroyed what it made.
+    // Otherwise the device and its import are kept — leaked for the life of
+    // the process, deliberately — and the slot with them.
+    let leftovers = shared.objects.lock().map(|o| o.leftovers()).unwrap_or_default();
+    let clean = leftovers.is_empty() && Arc::strong_count(&shared) == 1;
+    if clean {
+        drop(control);
+        match Arc::try_unwrap(shared) {
+            Ok(s) => {
+                unsafe {
+                    let _ = s.driver.device.device_wait_idle();
+                    s.driver.device.free_memory(arena_memory, None);
+                }
+                // `Driver::drop` destroys the device and the instance.
+                drop(s);
+            }
+            Err(s) => {
+                std::mem::forget(s);
+                return Err(("the session's state is still shared; slot kept".into(), false));
+            }
+        }
+    } else {
+        eprintln!("[gpu] session {session}: left behind {leftovers:?}; keeping its device and slot {slot}");
+        std::mem::forget(shared);
+        std::mem::forget(control);
+    }
+    drop(control_region);
+    drop(arena_region);
+    match served {
+        Ok(n) => Ok((n, clean)),
+        Err(e) => Err((e, clean)),
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]

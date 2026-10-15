@@ -283,6 +283,36 @@ impl Objects {
         self.map.len()
     }
 
+    /// What the application created and did not destroy, by type
+    /// (waycompose-design.md §87).
+    ///
+    /// Leaves out what this side owns rather than the application — the
+    /// instance, physical device, device and queues, which `create_*` hand out
+    /// and `destroy_*` deliberately do not remove — and what Vulkan frees with
+    /// its parent: command buffers with their pool, descriptor sets with
+    /// theirs. Everything else here is an object the driver still holds for a
+    /// session that has ended, and a process that serves another session on
+    /// the same arena slot must know that before it destroys the device under
+    /// it.
+    pub fn leftovers(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for o in self.map.values() {
+            if matches!(
+                o.ty,
+                HandleType::VkInstance
+                    | HandleType::VkPhysicalDevice
+                    | HandleType::VkDevice
+                    | HandleType::VkQueue
+                    | HandleType::VkCommandBuffer
+                    | HandleType::VkDescriptorSet
+            ) {
+                continue;
+            }
+            *out.entry(format!("{:?}", o.ty)).or_insert(0) += 1;
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

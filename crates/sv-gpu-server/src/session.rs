@@ -29,6 +29,21 @@ use sv_transport::ring::{Lane, RingConsumer, RingCtrl, RingProducer, barrier_sat
 /// infinite one; this is the session's.
 pub const IDLE_LIMIT: Duration = Duration::from_secs(120);
 
+/// How long the app side's heartbeat may be silent before a ring thread
+/// concludes it has exited (waycompose-design.md §87).
+///
+/// `wait_until` has its own liveness check, but it starts a fresh observation
+/// window on every call and a ring thread calls it with a 50 ms deadline, so
+/// its 600 ms window never elapsed and an application that had exited was
+/// noticed only by [`IDLE_LIMIT`], two minutes later. That cost nothing while
+/// every session was its own process that the harness killed; with one
+/// process serving several sessions in slots of one device, a slot held for
+/// two minutes by Firefox's exited `glxtest` is a slot the browser cannot
+/// have. The ICD beats every 20 ms from a thread of its own, whatever the
+/// application is doing, so five seconds of silence is an exited process or a
+/// stopped one, not a busy one.
+pub const APP_GONE_AFTER: Duration = Duration::from_secs(5);
+
 /// Errors cross thread boundaries as strings: a worker's failure has to be
 /// reportable by the thread that joins it, and `Box<dyn Error>` is not `Send`.
 fn err<E: std::fmt::Display>(e: E) -> String {
@@ -430,6 +445,11 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     // nothing here after its first frame. See `protocol_command` for why the
     // copy is not the thing docs/design.md §6.5 was trying to avoid.
     let mut blob = Vec::new();
+    let mut gone = sv_transport::control::LivenessMonitor::new(
+        Instant::now(),
+        APP_GONE_AFTER,
+        Duration::from_millis(50),
+    );
     let mut idle_since = Instant::now();
     let trace = std::env::var_os("SV_TRACE").is_some();
     let trace_pre = std::env::var_os("SV_TRACE").is_some_and(|v| v == "pre");
@@ -462,7 +482,15 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
             Duration::from_millis(200),
         ) {
             Ok(()) => {}
-            Err(sv_transport::Error::TimedOut { .. }) => continue,
+            Err(sv_transport::Error::TimedOut { .. }) => {
+                match gone.poll(&control, Instant::now()).map_err(err)? {
+                    sv_transport::control::Liveness::Gone => break,
+                    sv_transport::control::Liveness::Restarted { generation } => {
+                        return Err(format!("ring {slot}: the app side restarted as generation {generation}"));
+                    }
+                    _ => continue,
+                }
+            }
             // The app side going away is how a session normally ends, not a
             // failure: it has already got its replies.
             Err(sv_transport::Error::PeerGone { .. }) => break,
