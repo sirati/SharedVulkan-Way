@@ -75,7 +75,21 @@ SHARE=${SVFF_SHARE:-/srv/winshare/svff}
 SHARE_WIN=${SVFF_SHARE_WIN:-'Z:\svff'}
 G=${SVFF_GUEST:-<guest-user>@<guest-nat-ip>}
 GK=(-i "$HOME/.ssh/wc_guest" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
-ROOTC=${SVFF_ROOTC:-$HOME/rootc}
+# Root, for sv-hostd's locate and nothing else (waycompose-design.md §86). The
+# old default, ~/rootc, is gone from testhost; `sudokey` is how root is
+# reached there now, through the forwarded 1Password agent (`ssh -A
+# testhost-ts`).
+ROOTC=${SVFF_ROOTC:-sudokey run -- bash}
+# The compositor's arena. **ivshmem by default** (waycompose-design.md §83):
+# BAR2 of the VM's ivshmem device, which the host opens as this user through a
+# file, so the compositor needs no locate, no root and no guest RAM under the
+# host's writes. `guest-ram` is the old path, for a guest without the device;
+# it no longer passes `--arena-frames` (§84.7: no PFN scans on the real guest).
+ARENA_KIND=${SVFF_ARENA:-ivshmem}
+IVSHMEM_FILE=${SVFF_IVSHMEM_FILE:-/run/windows-vm/wc-arena/arena}
+# Who the application runs as. Since §86 `sv-hostd --drop-to` makes the GPU
+# sessions openable by this user, so Firefox is not root any more.
+ME_UID=$(id -u); ME_GID=$(id -g)
 BASH_BIN=$(command -v bash)
 # The systemd unit names, the run directory and the compositor's socket name.
 # Globbed in the cleanup steps, which is the reason it is a knob rather than a
@@ -111,9 +125,18 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 KIDS=()
 cleanup() {
   kill "${KIDS[@]}" 2>/dev/null
+  # And this experiment's processes in the guest, by executable path, as the
+  # start of the next run would. Without it the compositor and the GPU sides
+  # lived on to their own timeouts after every run — up to four minutes of
+  # pinned large pages and a held ivshmem mapping on a machine somebody uses.
+  ssh "${GK[@]}" "$G" "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -Command \
+     \"\\\$p = 'C:\\\\Users\\\\<guest-user>\\\\$GDIR\\\\'; Get-CimInstance Win32_Process | \
+      Where-Object { \\\$_.ExecutablePath -and \\\$_.ExecutablePath.StartsWith(\\\$p) } | \
+      ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
+    >/dev/null 2>&1
   echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 pkill -f '$DIR/sv-hostd' 2>/dev/null
-systemctl stop '$UNITPFX-run-*' 2>/dev/null; systemctl reset-failed '$UNITPFX-*' 2>/dev/null
+systemctl stop '$UNITPFX-run-*' '$UNITPFX-hostd-*' 2>/dev/null; systemctl reset-failed '$UNITPFX-*' 2>/dev/null
 true" | eval "$ROOTC" >/dev/null 2>&1
 }
 trap cleanup EXIT INT TERM
@@ -146,6 +169,16 @@ PREFS
 # fit, not which renderer draws them. Off by default so the ordinary run is the
 # ordinary run.
 [ -n "${SVFF_DPPX:-}" ] && echo "user_pref(\"layout.css.devPixelsPerPx\", \"$SVFF_DPPX\");" >>"$RUN/profile/user.js"
+# More prefs, `name=value;name=value`, values written as JavaScript literals
+# (`true`, `5`, `"text"`). The first use was `media.cubeb.force_null_context=true`:
+# this harness has no audio server, and design.md §0.28.9 measured about:support
+# stalling on that in 6 of 22 runs.
+if [ -n "${SVFF_PREFS:-}" ]; then
+  IFS=';' read -ra _prefs <<<"$SVFF_PREFS"
+  for kv in "${_prefs[@]}"; do
+    [ -n "$kv" ] && echo "user_pref(\"${kv%%=*}\", ${kv#*=});" >>"$RUN/profile/user.js"
+  done
+fi
 
 # ------------------------------------------------------------------ clean ---
 say "clearing what this experiment left behind (by path, never by image name)"
@@ -180,11 +213,19 @@ sleep 2
 
 # ------------------------------------------------------------- compositor ---
 COMP_SECS=$((SECS + 150))
-say "starting wc-compositor.exe in the guest (guest-RAM arena, $OUTPUT output)"
+if [ "$ARENA_KIND" = ivshmem ]; then
+  COMP_ARENA="--arena-ivshmem 0 --arena-outbound '0:$ARENA_OUTBOUND'"
+else
+  COMP_ARENA="--arena-guest-ram '0:$((ARENA_PAGES * 4096))' --arena-outbound '0:$ARENA_OUTBOUND'"
+fi
+# Frames are dumped only when asked (`SVFF_DUMP=1`): a 1280x900 PPM per commit
+# into the share is 3.5 MB each, and on the real guest that is disk traffic on
+# somebody's machine for a picture nobody looks at.
+DUMP=""; [ -n "${SVFF_DUMP:-}" ] && DUMP="--dump-frames '$SHARE_WIN\\frames'"
+say "starting the compositor in the guest ($ARENA_KIND arena, $OUTPUT output)"
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./sv-guest.exe wayland \
-  --socket $SOCK --timeout $COMP_SECS --dump-frames '$SHARE_WIN\\frames' \
-  --log '$SHARE_WIN\\s.log' --output $OUTPUT --arena-frames '$SHARE_WIN\\arena.frames' \
-  --arena-guest-ram '0:$((ARENA_PAGES * 4096))' --arena-outbound '0:$ARENA_OUTBOUND'" \
+  --socket $SOCK --timeout $COMP_SECS $DUMP \
+  --log '$SHARE_WIN\\s.log' --output $OUTPUT $COMP_ARENA" \
   >"$DIR/comp.out" 2>&1 &
 KIDS+=($!)
 
@@ -195,12 +236,28 @@ KIDS+=($!)
 # because it forks `glxtest` before the browser exists.
 say "starting $SESSIONS GPU side(s) in the guest"
 for i in $(seq 0 $((SESSIONS - 1))); do
-  ssh "${GK[@]}" "$G" "cd $GDIR && ./sv-guest.exe gpu guest --port $((BASE + i)) \
+  ssh "${GK[@]}" "$G" "cd $GDIR && ${SVFF_GPU_ENV:+env $SVFF_GPU_ENV} ./sv-guest.exe gpu guest --port $((BASE + i)) \
     --arena $GPU_ARENA --idle $((SECS + 120)) 2>&1" </dev/null >"$DIR/gpu$i.log" 2>&1 &
   KIDS+=($!)
 done
 
 # ------------------------------------------- locate the compositor's arena ---
+# IVSHMEM: nothing to locate. Wait for the line the compositor prints after it
+# has published the header, then check the header's magic and run id in the
+# file exactly as `wc-session up` does.
+if [ "$ARENA_KIND" = ivshmem ]; then
+  RUNID=""
+  for _ in $(seq 1 60); do
+    RUNID=$(grep -o "header published: run 0x[0-9a-f]*" "$SHARE/s.log" 2>/dev/null | tail -1 | grep -o "0x[0-9a-f]*")
+    [ -n "$RUNID" ] && break
+    sleep 1
+  done
+  [ -n "$RUNID" ] || { echo "FAIL: the compositor never published an ivshmem header"; sed -n '1,20p' "$SHARE/s.log" 2>/dev/null; cat "$DIR/comp.out"; exit 1; }
+  HAVE=$(od -A n -t x8 -j 16 -N 8 "$IVSHMEM_FILE" | tr -d ' ')
+  [ "$(head -c 8 "$IVSHMEM_FILE" | tr -d '\0')" = WCIVSHM1 ] && [ "0x$HAVE" = "$(printf '0x%016x' "$RUNID")" ] \
+    || { echo "FAIL: $IVSHMEM_FILE describes run 0x$HAVE, the compositor said $RUNID"; exit 1; }
+  say "compositor arena: ivshmem, run $RUNID, header checked in $IVSHMEM_FILE"
+else
 # The compositor prints its run id *after* the stamps are written, so waiting
 # for that line is waiting for the region to be findable. A sweep started
 # earlier returns zero pages, which reads exactly like the arena not being
@@ -239,6 +296,7 @@ echo \"rc=\$?\" >>'$RUN/locate.log'
 chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | eval "$ROOTC" >/dev/null 2>&1
 sed 's/^/  /' "$RUN/locate.log" 2>/dev/null
 grep -q "^rc=0$" "$RUN/locate.log" 2>/dev/null || { echo "FAIL: wc-arena-host did not locate the compositor's arena"; exit 1; }
+fi
 
 # ------------------------------------------------ the Wayland byte channel ---
 say "relay + ssh -L for the Wayland socket"
@@ -350,56 +408,63 @@ fi
 GLENV="$GLENV${KOPPER_ENV:+ $KOPPER_ENV}"
 say "mode=$MODE, GL env: $GLENV ${EXTRA:+(extra: $EXTRA)}"
 
-cat >"$RUN/hostside.sh" <<HOSTSIDE
-#!/usr/bin/env bash
-export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-export XDG_RUNTIME_DIR="$RUN"
-
-"$DIR/sv-hostd" qemu-serve --qmp /run/windows-vm/qmp.sock --vm windows-vm \\
-  ${COLD[*]} --socket "$DIR/icd.sock" --clients $SESSIONS >"$DIR/hostd.log" 2>&1 &
-SVH=\$!
-for _ in \$(seq 1 200); do [ -S "$DIR/icd.sock" ] && break; sleep 1; done
-if [ ! -S "$DIR/icd.sock" ]; then
-  echo "the GPU sessions were never offered" >"$RUN/hostside.err"
-  touch "$RUN/hostside.done"; exit 1
+# **Root for sv-hostd's locate, and for nothing after it** (waycompose-design.md
+# §86). Until §86 this whole block ran as one root unit, Firefox included,
+# because the only name sv-hostd could give the ICD was QEMU's own
+# `/proc/<qemu-pid>/fd/<n>`. `--drop-to` makes sv-hostd become this user once
+# the locate is done and hand out its own descriptor instead, so the unit below
+# is root for a few seconds and the proxy and Firefox never are.
+HOSTD_UNIT="$UNITPFX-hostd-$$"
+rm -f "$DIR/icd.sock" "$DIR/hostd.log"
+echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+systemd-run --unit=$HOSTD_UNIT --collect -p StandardOutput=file:$DIR/hostd.log -p StandardError=file:$DIR/hostd.log \
+  '$DIR/sv-hostd' qemu-serve --qmp /run/windows-vm/qmp.sock --vm windows-vm \
+  ${COLD[*]} --socket '$DIR/icd.sock' --clients $SESSIONS --drop-to $ME_UID:$ME_GID >/dev/null 2>&1
+echo started" | eval "$ROOTC" >/dev/null 2>&1
+if [ "$MODE" != soft ]; then
+  for _ in $(seq 1 200); do [ -S "$DIR/icd.sock" ] && break; sleep 1; done
+  if [ ! -S "$DIR/icd.sock" ]; then
+    echo "FAIL: the GPU sessions were never offered"
+    sed 's/^/  /' "$DIR/hostd.log" 2>/dev/null | tail -20
+    exit 1
+  fi
+  say "sv-hostd offers $SESSIONS session(s) on $DIR/icd.sock, owned by $(stat -c %U "$DIR/icd.sock")"
 fi
 
-"$DIR/wc-proxy" --upstream "$RUN/up.sock" --socket wl-proxy \\
-  --runtime-dir "$RUN" --transport arena --arena-plan "$RUN/arena.plan" --arena-id 0 \\
+# The proxy, as this user. ivshmem: the file the VM's unit made, opened through
+# its group or ACL; no plan, no root.
+if [ "$ARENA_KIND" = ivshmem ]; then
+  PROXY_ARENA=(--arena-ivshmem "$IVSHMEM_FILE" --arena-run "$RUNID")
+else
+  PROXY_ARENA=(--arena-plan "$RUN/arena.plan")
+fi
+"$DIR/wc-proxy" --upstream "$RUN/up.sock" --socket wl-proxy \
+  --runtime-dir "$RUN" --transport arena "${PROXY_ARENA[@]}" --arena-id 0 \
   --copy damage --accept-timeout 30 --timeout $((SECS + 15)) >"$RUN/proxy.log" 2>&1 &
-P=\$!
-sleep 2
-
-# This unit is root because /proc/<qemu-pid>/fd is, and Firefox refuses to start
-# as root when \$HOME belongs to somebody else -- a real check against a real
-# mistake. The answer is to give the run its own home rather than argue with it.
-chown -R 0:0 "$RUN/home" "$RUN/profile" "$RUN/xdg" 2>/dev/null
-chmod 700 "$RUN/xdg" 2>/dev/null
+P=$!
+KIDS+=($P)
+for _ in $(seq 1 100); do [ -S "$RUN/wl-proxy" ] && break; sleep 0.1; done
+[ -S "$RUN/wl-proxy" ] || { echo "FAIL: wc-proxy never bound its socket"; tail -20 "$RUN/proxy.log"; exit 1; }
+chmod 700 "$RUN/xdg"
 
 # env -u DISPLAY because with an X server reachable MOZ_ENABLE_WAYLAND is a
 # *preference* and Firefox will quietly use X11 instead.
-env -u DISPLAY \\
-  HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN/xdg" \\
-  WAYLAND_DISPLAY="$RUN/wl-proxy" MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \\
-  LD_LIBRARY_PATH="$MESA/lib:$GLVND/lib:$VKLOADER/lib" \\
-  LIBGL_DRIVERS_PATH="$MESA/lib/dri" \\
-  __EGL_VENDOR_LIBRARY_DIRS="$MESA/share/glvnd/egl_vendor.d" \\
-  $GLENV $EXTRA \\
-  timeout $SECS $CLIENTCMD \\
+# shellcheck disable=SC2086
+env -u DISPLAY \
+  HOME="$RUN/home" XDG_RUNTIME_DIR="$RUN/xdg" \
+  WAYLAND_DISPLAY="$RUN/wl-proxy" MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
+  LD_LIBRARY_PATH="$MESA/lib:$GLVND/lib:$VKLOADER/lib" \
+  LIBGL_DRIVERS_PATH="$MESA/lib/dri" \
+  __EGL_VENDOR_LIBRARY_DIRS="$MESA/share/glvnd/egl_vendor.d" \
+  $GLENV $EXTRA \
+  timeout $SECS $CLIENTCMD \
   >"$RUN/ff.log" 2>&1
-echo "firefox rc=\$?" >"$RUN/ff.rc"
+echo "firefox rc=$?" >"$RUN/ff.rc"
 sleep 3
-kill \$P \$SVH 2>/dev/null; wait 2>/dev/null
-chmod -R a+rwX "$RUN" 2>/dev/null
+kill $P 2>/dev/null; wait $P 2>/dev/null
 touch "$RUN/hostside.done"
-HOSTSIDE
-chmod 755 "$RUN/hostside.sh"
+UNIT=$HOSTD_UNIT
 
-echo "export PATH=/run/current-system/sw/bin:/run/wrappers/bin
-systemd-run --unit=$UNIT --collect '$BASH_BIN' '$RUN/hostside.sh' >/dev/null 2>&1
-echo started" | eval "$ROOTC" >/dev/null 2>&1
-
-for _ in $(seq 1 $((SECS + 260))); do [ -f "$RUN/hostside.done" ] && break; sleep 1; done
 
 # ---------------------------------------------------------------- report ----
 say "---- sv-hostd ----";  sed 's/^/  /' "$DIR/hostd.log" 2>/dev/null | tail -20
