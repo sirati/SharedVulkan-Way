@@ -300,6 +300,10 @@ pub struct State {
     /// makes a WebGL context per page (docs/design.md §0.28).
     pub command_buffers: HashMap<u64, u64>,
     pub allocator: Box<dyn Backing>,
+    /// Most arena bytes ever in use at once, and the value `SV_DEBUG` last
+    /// reported ([`State::note_arena_use`]).
+    pub arena_high_water: u64,
+    pub arena_reported: u64,
 }
 
 impl State {
@@ -317,6 +321,8 @@ impl State {
             descriptor_sets: HashMap::new(),
             command_buffers: HashMap::new(),
             allocator,
+            arena_high_water: 0,
+            arena_reported: 0,
         }
     }
 
@@ -324,6 +330,71 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// What the arena holds, as one clause for a diagnostic line: bytes in
+    /// use of the application's share, in how many `VkDeviceMemory`, and the
+    /// high-water mark.
+    pub fn arena_use(&self) -> String {
+        if let Some(d) = self.allocator.describe() {
+            return d;
+        }
+        let len = self.allocator.arena_len();
+        let used = len - self.allocator.free_bytes().min(len);
+        let live = self.memories.values().filter(|m| m.allocation.is_some()).count();
+        format!(
+            "arena {} KiB of {} KiB in use in {live} allocation(s), largest free run {} KiB, \
+             high water {} KiB",
+            used >> 10,
+            len >> 10,
+            self.allocator.largest_free_run() >> 10,
+            self.arena_high_water.max(used) >> 10
+        )
+    }
+
+    /// Track the arena's high-water mark after an allocation or a free, and
+    /// under `SV_DEBUG` print the use, with the seconds since the first arena
+    /// allocation, whenever it has moved by 2 MiB either way since the last
+    /// line. That series is what tells a working set that fits from one that
+    /// grows until it does not.
+    pub fn note_arena_use(&mut self) {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        let t0 = *T0.get_or_init(std::time::Instant::now);
+        let len = self.allocator.arena_len();
+        let used = len - self.allocator.free_bytes().min(len);
+        self.arena_high_water = self.arena_high_water.max(used);
+        if used.abs_diff(self.arena_reported) >= 2 << 20 {
+            self.arena_reported = used;
+            if sv_icd_entry::debug_enabled() {
+                eprintln!("sv-icd: t={:.1}s {}", t0.elapsed().as_secs_f64(), self.arena_use());
+            }
+        }
+    }
+}
+
+/// The first of each of these failures is said unconditionally, once.
+///
+/// Each one ends, two layers up, in a `GL_OUT_OF_MEMORY` or a lost device with
+/// nothing in the log that names this ICD (waycompose-design.md §95): Zink's
+/// "vkCreateBuffer failed" carries no result, and the GPU side never learns
+/// that an arena allocation was refused because it never sees one. Once, not
+/// per occurrence, so that a failure in a loop cannot become the output; and
+/// a flag per kind rather than `report_always`'s per-message set, because each
+/// message carries numbers and would otherwise never repeat.
+pub static ARENA_EXHAUSTED_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static SLAB_IMPORT_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static CREATE_BUFFER_FAILED_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// The leased arena's one line at attach (waycompose-design.md §97).
+pub static POOL_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print `msg` the first time `flag` is seen clear.
+pub fn say_once(flag: &std::sync::atomic::AtomicBool, msg: &dyn std::fmt::Display) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("sv-icd: {msg}");
     }
 }
 
@@ -436,7 +507,7 @@ impl SharedVulkan {
     #[cfg(any(target_os = "linux", windows))]
     pub fn connected(endpoint: &str) -> Result<SharedVulkan, String> {
         let socket = endpoint;
-        let attached = crate::transport::RingTransport::connect(socket)?;
+        let attached = connect_waiting_for_slot(socket)?;
         let arena = Mapping::attach(&attached.transport.arena, attached.arena_len);
         // `CanaryPolicy::None`: R26's canary detects a *guest page* moving
         // underneath a `VirtualLock`ed window, which is a Windows-in-a-VM
@@ -444,12 +515,19 @@ impl SharedVulkan {
         // not migrate under a `MAP_SHARED` mapping, and driver memory is the
         // driver's — so the canary here would cost a page per slab to detect
         // something that cannot happen.
-        let allocator = sv_arena::alloc::ArenaAllocator::new(
-            attached.arena_len,
-            attached.slab_size,
-            sv_arena::canary::CanaryPolicy::None,
-        )
-        .map_err(|e| format!("{e}"))?;
+        // A leased arena (waycompose-design.md §97) has no window to carve:
+        // the allocator starts with nothing and leases as it needs.
+        let allocator: Box<dyn Backing> = match attached.transport.pool.as_ref() {
+            Some(p) => Box::new(crate::arena::Leased::new(p.granule)),
+            None => Box::new(
+                sv_arena::alloc::ArenaAllocator::new(
+                    attached.arena_len,
+                    attached.slab_size,
+                    sv_arena::canary::CanaryPolicy::None,
+                )
+                .map_err(|e| format!("{e}"))?,
+            ),
+        };
         // **Before anything else is asked of the ring.** The loader may call
         // `vkEnumerateInstanceVersion` before `vkCreateInstance` — it is a global
         // command — so the answer has to exist by the time this constructor
@@ -480,7 +558,7 @@ impl SharedVulkan {
         let mut icd = SharedVulkan {
             arena,
             arena_len: attached.arena_len,
-            state: Mutex::new(State::new(Box::new(allocator))),
+            state: Mutex::new(State::new(allocator)),
             transport: Some(attached.transport),
             api_version,
             device_api_version,
@@ -771,6 +849,21 @@ impl SharedVulkan {
         self.transport.as_ref()
     }
 
+    /// The arena heap's size as an application should see it: the arena's
+    /// length, or on a leased arena (waycompose-design.md §97) the most this
+    /// session may lease — the pool's size or the session's cap, whichever is
+    /// less. Not `arena_len`, which on a leased arena is the address space
+    /// reserved for every region the pool could have: reported as a heap it
+    /// took the device heap's whole size away, and Zink refused every
+    /// device-local allocation ("can't allocate … from heap that's only 0
+    /// bytes").
+    pub fn heap_len(&self) -> u64 {
+        match self.transport.as_ref().and_then(|t| t.pool.as_ref()) {
+            Some(p) => p.session_cap.min(p.capacity),
+            None => self.arena_len,
+        }
+    }
+
     /// docs/design.md §5.3's rewrite, app-side half: allocation coordinates become
     /// arena coordinates.
     ///
@@ -865,7 +958,7 @@ fn announce(how: Negotiated, advertised: u32, driver_device: u32) {
 
 /// The memory table, with this ICD's arena size in it.
 pub fn memory_properties(icd: &SharedVulkan) -> sv_icd_entry::VkPhysicalDeviceMemoryProperties {
-    advertise::memory_properties(icd.arena_len)
+    advertise::memory_properties(icd.heap_len())
 }
 
 #[cfg(test)]
@@ -972,5 +1065,85 @@ mod tests {
                 .contains(&("VK_EXT_external_memory_host", "vkGetMemoryHostPointerPropertiesEXT")),
             "and for the wild host pointer, not for some other reason"
         );
+    }
+}
+
+/// How long a process waits for a GPU session slot before it gives up.
+///
+/// A slot comes back when the session in it ends, and the GPU side ends one
+/// either when its application says so at exit or, for one that did not, when
+/// its heartbeat has been silent for `APP_GONE_AFTER` (5 s) and its leftovers
+/// are destroyed. Ten seconds covers the second case with room.
+#[cfg(any(target_os = "linux", windows))]
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// When this process stops waiting for a slot, as milliseconds of the wall
+/// clock: the first call starts the budget and every later one shares it.
+///
+/// **Per process, not per load.** The loader loads an ICD several times in one
+/// process (once for the pre-instance queries, again for the instance), and a
+/// refused load leaves nothing loaded, so a static here starts fresh each
+/// time: with every slot really taken, three loads would wait thirty seconds.
+/// The budget is kept in a file named by the pid in the temporary directory,
+/// which outlives an unload; a file left by an earlier process of the same pid
+/// holds a deadline in the past, which only means that process does not wait.
+#[cfg(any(target_os = "linux", windows))]
+fn slot_wait_deadline_ms() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("sv-icd-slot-wait-{}", std::process::id()));
+    if let Some(d) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()) {
+        return d;
+    }
+    let d = now + SLOT_WAIT.as_millis() as u64;
+    let _ = std::fs::write(&path, d.to_string());
+    d
+}
+
+/// [`crate::transport::RingTransport::connect`], retried while the guest says
+/// every GPU session slot is taken (waycompose-design.md §95.10).
+///
+/// Refusing at once is right for a GPU side that is absent and wrong for one
+/// that is busy for a few seconds more: Firefox's browser process asks for its
+/// slot moments after `glxtest` has exited from one, and with two slots it was
+/// refused and fell back to llvmpipe for the life of the process. The refusal
+/// reaches this side as text through `sv-hostd`, so it is matched by the
+/// guest's own words, `GPU session slots are taken`; anything else fails as
+/// before.
+#[cfg(any(target_os = "linux", windows))]
+fn connect_waiting_for_slot(socket: &str) -> Result<crate::transport::Attached, String> {
+    let started = std::time::Instant::now();
+    let mut deadline = None;
+    let mut said = false;
+    loop {
+        match crate::transport::RingTransport::connect(socket) {
+            Err(e) if e.contains("GPU session slots are taken") => {
+                let d = *deadline.get_or_insert_with(slot_wait_deadline_ms);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|t| t.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if now >= d {
+                    return Err(e);
+                }
+                if !said {
+                    said = true;
+                    eprintln!(
+                        "sv-icd: {e}; waiting up to {:.1} s for one to come back",
+                        (d - now) as f64 / 1000.0
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(a) => {
+                if deadline.is_some() {
+                    eprintln!("sv-icd: got a GPU session slot after {:.1?}", started.elapsed());
+                }
+                return Ok(a);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }

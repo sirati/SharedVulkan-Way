@@ -315,6 +315,12 @@ impl ArenaAllocator {
         self.slabs.iter().map(|s| u64::from(s.free.free_pages) * GRANULARITY).sum()
     }
 
+    /// The longest run of free bytes in any one slab: the largest allocation
+    /// that would succeed now, which `free_bytes` alone cannot say.
+    pub fn largest_free_run(&self) -> u64 {
+        self.slabs.iter().map(|s| u64::from(s.free.largest()) * GRANULARITY).max().unwrap_or(0)
+    }
+
     /// Allocate `size` bytes, rounded up to the granularity.
     ///
     /// Slabs are tried in order, so a session touches the fewest slabs it can —

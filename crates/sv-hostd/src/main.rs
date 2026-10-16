@@ -646,11 +646,16 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(other) => return Err(format!("the ICD said {other:?}")),
                     Err(e) => return Err(format!("the ICD never acknowledged: {e}")),
                 }
+                // What was checked: a slot's every page, or a pooled session's
+                // control region only (its arena is the whole device, §97).
+                let pooled = matches!(hello.extent.locator, sv_transport::cold::Locator::IvshmemPool { .. });
+                let checked = if pooled { at.control_len } else { at.control_len + at.arena_len };
                 Ok(format!(
-                    "slot at +{} MiB, run 0x{:016x}, {} pages checked",
-                    at.control_offset >> 20,
+                    "{} at +{} KiB, run 0x{:016x}, {} pages checked",
+                    if pooled { "pooled session's control region" } else { "slot" },
+                    at.control_offset >> 10,
                     hello.extent.run_id,
-                    (at.control_len + at.arena_len) / sv_transport::region::PAGE as u64
+                    checked / sv_transport::region::PAGE as u64
                 ))
             })();
             match result {

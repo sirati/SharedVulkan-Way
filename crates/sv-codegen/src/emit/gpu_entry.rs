@@ -1122,6 +1122,24 @@ fn emit_forward_command(
         call
     };
 
+    // # The driver's own errors, told to the host (waycompose-design.md §95)
+    //
+    // A `VkResult` the driver returns is forwarded unchanged, which is right,
+    // and was also all that happened to it: a GPU side whose driver lost its
+    // device or ran out of memory said nothing, and the application's log
+    // could not say which side failed. After the locks above are released,
+    // so the host may take its own.
+    let call = if wire.returns_result {
+        quote! {
+            #call
+            if __r.0 < 0 {
+                __h.note_driver_error(#cname, __r.0);
+            }
+        }
+    } else {
+        call
+    };
+
     // -- 5. bind created objects, and lower the outputs back ----------------
     let mut post = Vec::new();
     let mut reply_fields = Vec::new();
@@ -1729,6 +1747,12 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
             /// once `after` is true.
             fn observe(&self, command: &'static str, after: bool, args: &[u64], result: i32) {
                 let _ = (command, after, args, result);
+            }
+            /// The driver returned a negative `VkResult` from `command`. The
+            /// reply carries it either way; this is so that the side holding
+            /// the driver can say so (waycompose-design.md §95).
+            fn note_driver_error(&self, command: &'static str, result: i32) {
+                let _ = (command, result);
             }
             /// The raise pool of a command `exceptions::GPU_RETAIN_RAISE` names,
             /// after its driver call: every C structure the driver was handed.

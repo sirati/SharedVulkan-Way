@@ -941,6 +941,41 @@ pub fn wait_until(
     overall: Deadline,
     liveness_interval: Duration,
 ) -> Result<()> {
+    wait_until_gone_after(
+        control,
+        ctrl,
+        lane,
+        parker,
+        ready,
+        overall,
+        liveness_interval,
+        liveness_interval * 3,
+    )
+}
+
+/// [`wait_until`] with the peer declared gone only after `gone_after` of
+/// heartbeat silence, instead of three liveness intervals.
+///
+/// The two numbers mean different things and a peer in another VM is where
+/// that shows. `liveness_interval` is how often the wait looks; `gone_after`
+/// is how long a peer may say nothing before it is presumed dead. Three
+/// polls is a fine window between two processes on one kernel. Across a VM
+/// boundary it is not: a guest that is not scheduled for a few hundred
+/// milliseconds (a host short of memory, a passed-through GPU coming out of
+/// D3) stops *every* thread of the GPU side, its heartbeat with them, and
+/// the app side's own stall credit cannot see that, because the app side was
+/// running the whole time (waycompose-design.md §95).
+#[allow(clippy::too_many_arguments)]
+pub fn wait_until_gone_after(
+    control: &Control,
+    ctrl: &RingCtrl,
+    lane: Option<Lane>,
+    parker: &dyn Parker,
+    ready: &dyn Fn() -> bool,
+    overall: Deadline,
+    liveness_interval: Duration,
+    gone_after: Duration,
+) -> Result<()> {
     let entered = Instant::now();
     let _account = ParkAccount(entered);
     let status = || ctrl.status();
@@ -954,7 +989,7 @@ pub fn wait_until(
     let mut site = WaitSite::new(ctrl.id(), ready, &status).with_beat(&beat);
     site.bell = bell;
     let mut monitor =
-        LivenessMonitor::new(Instant::now(), liveness_interval * 3, liveness_interval);
+        LivenessMonitor::new(Instant::now(), gone_after, liveness_interval);
     loop {
         // Beat before parking. A side that is blocked here is *alive*, and if it
         // stops saying so then two peers waiting on each other — the normal
@@ -1060,6 +1095,48 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Error::PeerGone { ring: slot });
+    }
+
+    /// waycompose-design.md §95: a peer that says nothing for longer than
+    /// three polls (a guest VM that was not scheduled) and then answers is
+    /// slow, not gone, when the window is wider than its silence.
+    #[test]
+    fn a_silence_shorter_than_gone_after_is_slow_not_gone() {
+        let (owner, peer, slot) = setup();
+        let ctrl = RingCtrl::open(&owner, slot).unwrap();
+        peer.beat(1, 0).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let d = Arc::clone(&done);
+        let answer = std::thread::spawn(move || {
+            // Silent for 30 polls, then the answer arrives.
+            std::thread::sleep(Duration::from_millis(150));
+            d.store(true, Ordering::Release);
+        });
+        let ready = || done.load(Ordering::Acquire);
+        // The window `wait_until` would build from a 5 ms poll is 15 ms, which
+        // this silence overruns ten times: that is the failure being fixed.
+        let short = wait_until(
+            &owner,
+            &ctrl,
+            None,
+            &SpinYield::eager(),
+            &ready,
+            Deadline::after(Duration::from_secs(5)),
+            Duration::from_millis(5),
+        );
+        assert_eq!(short, Err(Error::PeerGone { ring: slot }));
+        let r = wait_until_gone_after(
+            &owner,
+            &ctrl,
+            None,
+            &SpinYield::eager(),
+            &ready,
+            Deadline::after(Duration::from_secs(5)),
+            Duration::from_millis(5),
+            Duration::from_secs(2),
+        );
+        answer.join().unwrap();
+        assert_eq!(r, Ok(()));
     }
 
     #[test]

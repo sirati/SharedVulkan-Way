@@ -184,9 +184,86 @@ def scroll_only():
     log("done")
 
 
+def two_windows():
+    """`SOAK_MODE=two-windows`: the session that ran out of buffers on the
+    guest (waycompose-design.md §95). Two windows at 1280x752, one page in
+    the first retitling itself ten times a second, both grown to 1296x768
+    (what a maximise gave there), and then the tour, alternating windows,
+    until SECS have passed."""
+    m = Marionette(PORT)
+    log("hello", hello=m.hello)
+    m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})
+    m.call("WebDriver:SetTimeouts", {"pageLoad": 60000, "script": 30000})
+
+    def size(w, h):
+        try:
+            log("window", rect=m.call("WebDriver:SetWindowRect", {"width": w, "height": h}))
+        except RuntimeError as e:
+            log("window", error=str(e)[:200])
+
+    first = m.call("WebDriver:GetWindowHandle")
+    first = first.get("value", first) if isinstance(first, dict) else first
+    size(1280, 752)
+    # `SOAK_VIDEO=1`: the first window plays a looping clip for the whole run
+    # (§97: two windows plus a video), and the tour stays in the second.
+    video = os.environ.get("SOAK_VIDEO") == "1"
+    m.call("WebDriver:Navigate", {"url": page_uri("video.html" if video else "retitle.html")})
+    second = m.call("WebDriver:NewWindow", {"type": "window"})["handle"]
+    m.call("WebDriver:SwitchToWindow", {"handle": second})
+    size(1280, 752)
+    m.call("WebDriver:Navigate", {"url": TOUR[0]})
+    time.sleep(5)
+    for h in (first, second):
+        m.call("WebDriver:SwitchToWindow", {"handle": h})
+        size(1296, 768)
+    log("session", windows=[first, second])
+    rounds = 0
+    while time.monotonic() - T0 < SECS:
+        rounds += 1
+        for i, url in enumerate(TOUR + [page_uri("retitle.html")]):
+            if time.monotonic() - T0 >= SECS:
+                break
+            h = second if video else (first, second)[i % 2]
+            try:
+                m.call("WebDriver:SwitchToWindow", {"handle": h})
+                t = time.monotonic()
+                m.call("WebDriver:Navigate", {"url": url})
+                log("load", round=rounds, window=h, url=url, secs=round(time.monotonic() - t, 2))
+                wheel(m, 240, 12)
+                wheel(m, -240, 6)
+                time.sleep(2)
+                log("compositor", value=compositor(m))
+            except (RuntimeError, socket.timeout) as e:
+                log("step-error", url=url, error=str(e)[:300])
+        if video:
+            try:
+                m.call("WebDriver:SwitchToWindow", {"handle": first})
+                t = m.call("WebDriver:GetTitle")
+                log("video", title=t.get("value", t) if isinstance(t, dict) else t)
+            except (RuntimeError, socket.timeout) as e:
+                log("step-error", url="video.html", error=str(e)[:300])
+    log("done", rounds=rounds)
+    # Quit as a person does: close one window, then quit from the last one
+    # (`Marionette:Quit`; closing the last window over WebDriver leaves this
+    # browser running with no window at all). A session on the guest crashed
+    # in xpcom-shutdown-threads at its last window (§95). The harness waits
+    # for the exit and looks for a minidump.
+    try:
+        m.call("WebDriver:SwitchToWindow", {"handle": second})
+        m.call("WebDriver:CloseWindow")
+        log("closed", window=second)
+        m.call("WebDriver:SwitchToWindow", {"handle": first})
+        m.call("Marionette:Quit", {"flags": ["eAttemptQuit"]})
+        log("closed", window=first, quit=True)
+    except (RuntimeError, socket.timeout, ConnectionError, OSError) as e:
+        log("closed", error=str(e)[:200])
+
+
 def main():
     if os.environ.get("SOAK_MODE") == "scroll":
         return scroll_only()
+    if os.environ.get("SOAK_MODE") == "two-windows":
+        return two_windows()
     m = Marionette(PORT)
     log("hello", hello=m.hello)
     m.call("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"pageLoadStrategy": "normal"}}})

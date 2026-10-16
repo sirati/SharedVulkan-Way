@@ -427,6 +427,36 @@ fn fail(e: vk::Result) -> p::VkResult {
     p::VkResult(e.as_raw())
 }
 
+/// Say that the driver returned a lost device or an out-of-memory, once per
+/// command and result (waycompose-design.md §95).
+///
+/// Those are the results that end an application, and the reply that carries
+/// them says nothing about *which side* produced them: on the guest a Firefox
+/// died of `VK_ERROR_DEVICE_LOST` twice and this side's log was empty, so
+/// nobody could tell the driver's loss from the transport's. Other negative
+/// results are routine answers (`VK_ERROR_FORMAT_NOT_SUPPORTED` from a format
+/// probe, `VK_ERROR_OUT_OF_POOL_MEMORY` from a descriptor pool an application
+/// grows on demand) and stay quiet.
+pub(crate) fn note_driver_error(command: &'static str, result: i32) {
+    let what = match result {
+        -1 => "VK_ERROR_OUT_OF_HOST_MEMORY",
+        -2 => "VK_ERROR_OUT_OF_DEVICE_MEMORY",
+        -4 => "VK_ERROR_DEVICE_LOST",
+        _ => return,
+    };
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SAID: Mutex<Option<HashSet<(&'static str, i32)>>> = Mutex::new(None);
+    let first = SAID
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert((command, result));
+    if first {
+        eprintln!("sv-gpu-server: the driver returned {what} from {command}");
+    }
+}
+
 /// A required `pCreateInfo` that was null.
 fn no_info() -> WireError {
     WireError::Truncated { need: 1, have: 0 }
@@ -606,6 +636,10 @@ impl GpuHost for GpuServer {
             // `GpuHost::observe`'s contract, which is `video_log::observe`'s.
             unsafe { crate::video_log::observe(&self.shared, command, after, args, result) }
         }
+    }
+
+    fn note_driver_error(&self, command: &'static str, result: i32) {
+        note_driver_error(command, result);
     }
 
     fn retain_raise(&mut self, command: &'static str, pool: sv_gpu_entry::Raise) {
@@ -804,11 +838,29 @@ impl GpuHost for GpuServer {
             ded.image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
             ded.buffer = vk::Buffer::from_raw(self.map_handle(HandleType::VkBuffer, buffer)?);
         }
+        // **And the allocate flags** (waycompose-design.md §96). Since buffers
+        // may live in type 0, a buffer created for `SHADER_DEVICE_ADDRESS` can
+        // be bound here, and its memory must have been allocated with
+        // `DEVICE_ADDRESS` (`VUID-vkBindBufferMemory-bufferDeviceAddress-03339`,
+        // reported for Zink's buffers the first time they left the arena).
+        // The flags are the application's; the device mask is meaningful only
+        // with `DEVICE_MASK`, which a single-device GPU side keeps as given.
+        let flags = info.p_next.iter().find_map(|l| match l {
+            p::PNextLink::VkMemoryAllocateFlagsInfo(f) => Some((f.flags.0, f.device_mask)),
+            _ => None,
+        });
+        let mut fl = vk::MemoryAllocateFlagsInfo::default();
+        if let Some((bits, mask)) = flags {
+            fl = fl.flags(vk::MemoryAllocateFlags::from_raw(bits)).device_mask(mask);
+        }
         let mut ai = vk::MemoryAllocateInfo::default()
             .allocation_size(info.allocation_size)
             .memory_type_index(ti);
         if dedicated.is_some() {
             ai = ai.push_next(&mut ded);
+        }
+        if flags.is_some() {
+            ai = ai.push_next(&mut fl);
         }
         match unsafe { self.d().allocate_memory(&ai, None) } {
             Ok(m) => {
@@ -824,7 +876,10 @@ impl GpuHost for GpuServer {
                 }
                 Ok(p::VkAllocateMemoryReply { result: OK, p_memory: a.p_memory })
             }
-            Err(e) => Ok(p::VkAllocateMemoryReply { result: fail(e), p_memory: None }),
+            Err(e) => {
+                note_driver_error("vkAllocateMemory", e.as_raw());
+                Ok(p::VkAllocateMemoryReply { result: fail(e), p_memory: None })
+            }
         }
     }
 
@@ -898,6 +953,7 @@ impl GpuHost for GpuServer {
             f(a.device.0 as usize as _, &ci, core::ptr::null(), &mut buffer)
         };
         crate::video_log::buffer_created(buffer as usize as u64, ci.usage.0, ci.size, r.0);
+        note_driver_error("vkCreateBuffer", r.0);
         if let Some(id) = a.p_buffer {
             self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
         }
@@ -935,6 +991,7 @@ impl GpuHost for GpuServer {
         }
         // SAFETY: `ci` and everything it points to live in `pool`.
         let r = unsafe { f(device, &ci, core::ptr::null(), &mut image) };
+        note_driver_error("vkCreateImage", r.0);
         if obs {
             self.observe("vkCreateImage", true, &words, r.0);
         }

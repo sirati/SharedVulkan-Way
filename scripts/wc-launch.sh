@@ -103,6 +103,11 @@ FIREFOX="${WC_LAUNCH_FIREFOX:-firefox}"
 # WC_LAUNCH_PROFILE: its first word is the profile and any further words are the
 # application's fixed arguments (apps.ini `args`).
 NATIVE_FIREFOX='C:\Program Files\Mozilla Firefox\firefox.exe'
+# §96. Applications beside Firefox: WC_LAUNCH_EXTRA_APPS is a file of apps.ini
+# sections for the host (scripts/wc-session documents the keys; every `exec`
+# must already be on the host), WC_LAUNCH_EXTRA_APP_BLOCKS a file of `[app.ID]`
+# blocks for the guest's ini, and WC_LAUNCH_INSTALL_APPS the ids `install` puts
+# on the desktop (default: firefox). docs/minecraft.md has Minecraft's.
 
 ARENA_MIB="${WC_LAUNCH_ARENA_MIB:-64}"
 OUTPUT="${WC_LAUNCH_OUTPUT:-1600x1000}"
@@ -128,6 +133,9 @@ AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # it: the guest's VM needs the GPU arena's ivshmem device (slot WC_LAUNCH_GPU_SLOT,
 # default 0x1d) and, for the doorbell, the port WC_LAUNCH_GPU_BELL; the host user
 # needs the device's group.
+# §97. WC_LAUNCH_GPU_ARENA=pool (the default) has the GPU process lease every
+# session's memory from one pool over the whole device; =slots is §87's fixed
+# slots. With the pool, WC_LAUNCH_GPU_SESSIONS bounds how many run at once.
 # §91. **Which token a click runs with, and the default is a double-click's.**
 # Explorer starts a shortcut with the user's filtered token at medium integrity;
 # until §91 every harness click ran at `-RunLevel Highest`, the administrator's
@@ -487,6 +495,9 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+# §97: one pool over the whole GPU device, leased as each session needs it;
+# `slots` is §87's fixed slots of gpu-arena-mib.
+gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 # §89: the Wayland rings' doorbell port; empty sends the Wayland connections
@@ -502,6 +513,14 @@ host-app = firefox
 desktop = firefox
 icon  = firefox
 INI
+  # §96: more applications, each a block of the guest's ini and a section of the
+  # host's apps.ini (WC_LAUNCH_EXTRA_APPS and WC_LAUNCH_EXTRA_APP_BLOCKS, files
+  # appended as they are). The host's half is checked by `wc-session apps` below
+  # like Firefox's; the guest's by the launcher's own parser at the next start.
+  if [ -n "${WC_LAUNCH_EXTRA_APP_BLOCKS:-}" ]; then
+    [ -f "$WC_LAUNCH_EXTRA_APP_BLOCKS" ] || { echo "error: no $WC_LAUNCH_EXTRA_APP_BLOCKS"; exit 1; }
+    { echo; cat "$WC_LAUNCH_EXTRA_APP_BLOCKS"; } >>"$stage/wc-launch.ini"
+  fi
 
   # §94. THE HOST'S DEFINITION OF THE APPLICATION, which the guest names by id
   # and cannot change. Everything that used to be a word of `run`: the
@@ -529,6 +548,10 @@ titlebar = ${WC_LAUNCH_TITLEBAR:-tabs}
 desktop  = firefox
 gpu      = on
 APPS
+  if [ -n "${WC_LAUNCH_EXTRA_APPS:-}" ]; then
+    [ -f "$WC_LAUNCH_EXTRA_APPS" ] || { echo "error: no $WC_LAUNCH_EXTRA_APPS"; exit 1; }
+    { echo; cat "$WC_LAUNCH_EXTRA_APPS"; } >>"$hstage/apps.ini"
+  fi
 
   # A running .exe holds its own file open, so a session that is up must end
   # before its binaries can be replaced. By path, not by image name.
@@ -686,6 +709,22 @@ VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
 # --------------------------------------------------------------- install -----
 do_install() {
   echo "== install =="
+  # §96: the applications to install, by the id of their `[app.*]` block;
+  # Firefox's unless WC_LAUNCH_INSTALL_APPS says otherwise. Firefox's checks
+  # below are Firefox's; any other id gets its shortcut and its log line.
+  local apps="${WC_LAUNCH_INSTALL_APPS:-firefox}" a
+  for a in $apps; do
+    [[ "$a" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] && [[ "$a" != *..* ]] || { bad "not an app id: $a"; return; }
+    [ "$a" = firefox ] && continue
+    local o l
+    o=$(g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --install $a; echo rc=\$?" | tr -d '\r')
+    l=$(g "tail -20 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'installed ' | tail -1)
+    case "$l" in
+      *"installed "*) ok "$a: the shortcut is on the desktop: ${l#*installed }" ;;
+      *) bad "$a: no shortcut was installed ($o)" ;;
+    esac
+  done
+  case " $apps " in *" firefox "*) ;; *) return ;; esac
   local out
   out=$(g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --install firefox; echo rc=\$?" | tr -d '\r')
   note "wc-launch --install: $out"

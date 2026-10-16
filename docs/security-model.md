@@ -1137,3 +1137,47 @@ the URLs the user removed from the list) and to Windows' own jump-list file for
 the identity. Nothing on either side logs a URL or a title. Firefox's
 `browser.taskbar.lists.enabled` and `…frequent.enabled` turn the pages off.
 Private windows record no history, so nothing from one can appear.
+
+### R34 — The GPU sessions share one pool
+Added 2026-10-16 with `waycompose-design.md` §97. The GPU ivshmem device was cut
+into fixed slots, one per session (§87); it is now one pool, and every session
+leases ranges of it as it needs them. Two applications' memory can now sit side
+by side in the device, and a range one session gave back can be another's on
+the next call.
+
+**On the host nothing is wider than R29.** Every ICD maps the device's whole
+file, by name, because a lease can be anywhere in it. Under §87 an ICD mapped
+only its slot, but the file was already readable and writable by every process
+of the group, which is to say by the user every forwarded application runs as;
+a process that wanted another session's slot could open the file. A buggy ICD
+can now scribble on another session's leases where it used to be confined to
+its own slot by its mapping, and the cost of that is a corrupt frame or buffer
+in the other application, not a reach it did not have.
+
+**On the GPU side a session reaches only its own leases.** Every
+`(memory, offset)` an application names is resolved in its session's own lease
+table (`Objects::arena_slab`), and a command blob is read only when it lies in a
+lease of that session; anything else is a protocol error on that session's
+ring. Each lease is its own import into the session's own `VkDevice`, and a
+release frees the import before the range returns to the pool, so a range is
+never in two devices at once. The driver never sees another session's memory
+through this session's device. *What this does not cover:* a forged offset the
+lease table would accept, one inside the session's own leases, is the
+session's own memory, R2's case, unchanged.
+
+**One application can no longer take the whole device from the others, and
+cannot take more than its share of it.** A session may lease three quarters of
+the pool, its control region excepted, and the last `control + blob reserve`
+bytes are kept for a session that has not started yet. A full pool refuses a
+lease with `VK_ERROR_OUT_OF_DEVICE_MEMORY`, never by losing the device. *What
+this does not cover:* two applications that each stay under the cap can still
+fill the pool between them; the second to ask is refused. The pool's log line
+names every session's holding at each refusal and each 32 MiB high-water step,
+so who held the memory is on record.
+
+**Size is a VM setting, not a run-time one.** The device does not grow while
+the VM runs: vfio pins every byte of an ivshmem BAR (§97.3), so a device added
+at run time would be host RAM taken from the host's applications, and adding
+one takes QEMU's monitor, which is root's. Nothing on the launch path asks for
+either. The device's size is set in the VM's configuration, beside the guest's
+RAM, by whoever can change the VM.

@@ -74,6 +74,19 @@ pub fn is_arena_backed(memory_type_index: u32) -> bool {
 /// driver's mask would index our table with somebody else's numbering.
 pub const ARENA_MEMORY_TYPE_BITS: u32 = 0b1110;
 
+/// The `memoryTypeBits` a buffer gets **with a GPU side**: all four, so a buffer
+/// the application never maps can live in type 0, a GPU-side allocation, as
+/// docs/design.md §9.1's table always said ("anything the app does not map").
+///
+/// waycompose-design.md §96. Until then a buffer could only be in the arena,
+/// and the arena is small where it matters: on the guest a GPU session has
+/// 64 MiB of it (240 with one session). Minecraft through Zink ran out
+/// there — `GL_OUT_OF_MEMORY in glNamedBufferStorage` with 1024 buffers alive —
+/// and VulkanMod's vertex and staging pools did not fit in 240 MiB even on the
+/// workstation. Buffers the application maps still choose a host-visible type,
+/// which is still the arena; only the ones it never maps leave it.
+pub const BUFFER_MEMORY_TYPE_BITS: u32 = 0b1111;
+
 /// The memory table of docs/design.md §9.1.
 ///
 /// `arena_len` is the real arena size and is reported honestly: "applications
