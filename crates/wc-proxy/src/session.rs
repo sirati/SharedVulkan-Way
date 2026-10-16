@@ -685,6 +685,8 @@ const WANTED_TEXT: &[&str] = &[
     "TEXT",
 ];
 const WANTED_HTML: &str = "text/html";
+/// §93. A picture: what Firefox offers for "Copy Image", among other names.
+const WANTED_IMAGE: &str = "image/png";
 
 /// One selection's worth of bytes: a payload per mime type.
 pub type Payloads = Vec<(String, Vec<u8>)>;
@@ -1729,6 +1731,7 @@ impl Session {
     /// a transfer costs a millisecond of latency and a spin that lasts as long
     /// as the transfer does.
     pub fn pump_transfers(&mut self) {
+        let mut progressed = false;
         for out in &mut self.clip.outgoing {
             if out.done {
                 continue;
@@ -1742,6 +1745,15 @@ impl Session {
                 };
                 if n > 0 {
                     out.buf.extend_from_slice(&buf[..n as usize]);
+                    progressed = true;
+                    // Past the cap there is nothing this can still publish
+                    // (`fit_selection` leaves it out), so it stops reading:
+                    // the deadline now waits for a client that has gone
+                    // quiet, and one that never does must not grow this.
+                    if out.buf.len() > MAX_SELECTION_BYTES {
+                        out.done = true;
+                        break;
+                    }
                     continue;
                 }
                 if n == 0 {
@@ -1757,6 +1769,12 @@ impl Session {
                 }
                 break;
             }
+        }
+        // §93: the deadline is for a client that has gone *quiet*, not for a
+        // big copy. Measured from the start, a page of HTML that took longer
+        // than two seconds to write was published cut off in the middle.
+        if progressed && self.clip.started.is_some() {
+            self.clip.started = Some(Instant::now());
         }
 
         let expired = self
@@ -1793,7 +1811,25 @@ impl Session {
                 payloads.len(),
                 payloads.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>().join(", ")
             ));
-            self.clip.ready = Some(Pulled { payloads, for_drag });
+            // §93: never more than the compositor holds. Past its cap the
+            // compositor refused the whole publish with a protocol error,
+            // which ended this connection's clipboard feed: one large copy (a
+            // long page's HTML) and copy and paste did nothing for the rest
+            // of the session.
+            let (payloads, dropped) = fit_selection(payloads, MAX_SELECTION_BYTES);
+            if !dropped.is_empty() {
+                self.note(format!(
+                    "the selection is larger than the compositor holds ({} MiB); left out: {}",
+                    MAX_SELECTION_BYTES >> 20,
+                    dropped.join(", ")
+                ));
+            }
+            // Nothing that fits: the system clipboard is left as it was
+            // rather than emptied, the same choice `begin_pull` makes for a
+            // selection with no type this clipboard carries.
+            if !(payloads.is_empty() && !dropped.is_empty()) {
+                self.clip.ready = Some(Pulled { payloads, for_drag });
+            }
             // The client no longer owns the selection — the system does, and it
             // holds a copy. Telling it so is what lets a clipboard tool exit
             // rather than sit forever waiting to serve a `send` that will never
@@ -2927,7 +2963,45 @@ fn wanted_mimes(offered: &[String]) -> Vec<String> {
     if offered.iter().any(|m| m == WANTED_HTML) {
         out.push(WANTED_HTML.to_owned());
     }
+    if offered.iter().any(|m| m == WANTED_IMAGE) {
+        out.push(WANTED_IMAGE.to_owned());
+    }
     out
+}
+
+/// The most one selection may carry to the compositor, in bytes.
+///
+/// `wc-compositor`'s `clipboard::MAX_SELECTION_BYTES`, written down twice for
+/// the reason `CHUNK` is (the two crates share an XML file and no code). A
+/// test on each side pins the number.
+pub(crate) const MAX_SELECTION_BYTES: usize = 32 << 20;
+
+/// §93. Make a pulled selection fit in `cap` bytes: the text is what a paste
+/// most needs, so everything else goes first, largest first; a text that does
+/// not fit on its own goes too. Returns what is kept and the mime types left
+/// out.
+pub(crate) fn fit_selection(mut payloads: Payloads, cap: usize) -> (Payloads, Vec<String>) {
+    let mut dropped = Vec::new();
+    let total = |p: &Payloads| p.iter().map(|(_, b)| b.len()).sum::<usize>();
+    while total(&payloads) > cap {
+        let is_text = |m: &str| WANTED_TEXT.contains(&m);
+        let victim = payloads
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, _))| !is_text(m))
+            .max_by_key(|(_, (_, b))| b.len())
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                payloads
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, (_, b))| b.len())
+                    .map_or(0, |(i, _)| i)
+            });
+        let (mime, bytes) = payloads.remove(victim);
+        dropped.push(format!("{mime} ({} bytes)", bytes.len()));
+    }
+    (payloads, dropped)
 }
 
 /// A Wayland string is NUL-terminated inside its length.

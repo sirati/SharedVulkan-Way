@@ -1281,6 +1281,7 @@ version = "0.1.0"
 dependencies = [
  "awe-probe",
  "libc",
+ "png",
  "smithay",
  "sv-arena",
  "sv-proto",
