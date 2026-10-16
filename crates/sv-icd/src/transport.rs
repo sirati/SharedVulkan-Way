@@ -862,6 +862,7 @@ impl RingTransport {
         let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         arm_park_report();
+        arm_goodbye(Arc::clone(&control));
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -1694,6 +1695,48 @@ pub(crate) fn arm_park_report() {
             // no arguments that touches only atomics and stderr.
             unsafe { libc::atexit(park_time_atexit) };
         });
+    }
+}
+
+/// Every control region this process attached, for [`goodbye_atexit`].
+static GOODBYE: Mutex<Vec<Arc<Control>>> = Mutex::new(Vec::new());
+
+/// Tell the GPU side this process is done, when it exits.
+///
+/// `RingTransport::shutdown` existed and nothing called it, so the GPU side
+/// learned that an application had gone only from its heartbeat going quiet,
+/// `APP_GONE_AFTER` (5 s) later, and held the session's slot until then. On
+/// the guest that is a slot of a fixed few: Firefox's `glxtest` exits and the
+/// browser asks for its own slot within those five seconds, and with two slots
+/// the browser was refused and drew on llvmpipe (waycompose-design.md §95.10).
+/// With the flag set at exit the GPU side's ring threads stop at their next
+/// 50 ms slice, it destroys what the session left and gives the slot back.
+///
+/// At exit and not at the last `vkDestroyInstance`, because an application may
+/// make another instance after that and this process has one connection.
+/// A process that dies without running `atexit` handlers still costs the five
+/// seconds; `connect_waiting_for_slot` is the other half for that case.
+fn arm_goodbye(control: Arc<Control>) {
+    GOODBYE.lock().unwrap_or_else(|e| e.into_inner()).push(control);
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            // SAFETY: `goodbye_atexit` is a plain `extern "C"` function with no
+            // arguments that sets one flag word in each mapped control region.
+            unsafe { libc::atexit(goodbye_atexit) };
+        });
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn goodbye_atexit() {
+    // `try_lock`: a thread that held the lock when `exit` was called will
+    // never release it, and an exit must not hang on it.
+    if let Ok(all) = GOODBYE.try_lock() {
+        for c in all.iter() {
+            let _ = c.set_flag(Flags::SHUTDOWN);
+        }
     }
 }
 
