@@ -1780,6 +1780,12 @@ fn wayland_thread(
             eprintln!("wc-compositor: flush failed: {e}");
             break;
         }
+        // §89: the input this turn handed to smithay has now left the
+        // compositor — into the socket, or into the ring below.
+        if state.trace_inputs > 0 {
+            sv_transport::frametrace::emit("wc.flush", format_args!("inputs={}", state.trace_inputs));
+            state.trace_inputs = 0;
+        }
         // docs/waycompose-design.md §88: a turn that handled a commit, and how
         // its time divided. The turn is the unit of this loop's latency: a
         // commit that arrives just after one waits for the next.

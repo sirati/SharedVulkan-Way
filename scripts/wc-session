@@ -378,6 +378,10 @@ proxy)
       # run already says what the session's frame should record.
       ft=$(grep -m1 '^WC_FRAME_TRACE=' "$BASE/gpu.env" 2>/dev/null)
       [ -n "$ft" ] && printf 'export %q\n' "$ft"
+      # §89: and its clock, so the proxy's half of an input timeline is on
+      # the machine's monotonic counter like the compositor's.
+      ft=$(grep -m1 '^WC_FRAME_TRACE_CLOCK=' "$BASE/gpu.env" 2>/dev/null)
+      [ -n "$ft" ] && printf 'export %q\n' "$ft"
       printf 'rm -f %q\n' "$D/wl-proxy"
       printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" \

@@ -613,6 +613,12 @@ pub fn pump(
                 Ok(n) => {
                     drop(to_client.drain(..n));
                     to_client_fds.clear();
+                    // §89: input events this write carried have reached the
+                    // client's socket, which is the end of the measured path.
+                    let inputs = session.take_trace_inputs();
+                    if inputs > 0 {
+                        sv_transport::frametrace::emit("px.out", format_args!("inputs={inputs}"));
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 // **`ConnectionReset` is an ordinary ending, not a failure**,

@@ -644,6 +644,38 @@ pub mod dnd_action {
     }
 }
 
+/// `WC_FRAME_TRACE` (docs/waycompose-design.md §89): one line for an input
+/// event at a named stage of its way to the client — `wc.in` when the UI thread
+/// has it from Windows, `wc.in_tx` when the Wayland thread hands it to smithay.
+/// The message time is the key the analysis pairs on: it is what the client is
+/// sent as the event's `time`, and the proxy logs the same number.
+///
+/// Returns whether `e` was an input event, so a caller can count them.
+pub fn trace_input(stage: &str, e: &FromUi) -> bool {
+    use sv_transport::frametrace as ft;
+    match e {
+        FromUi::PointerMotion { x, y, time, .. } => {
+            ft::emit(stage, format_args!("kind=motion t={time} x={x} y={y}"))
+        }
+        FromUi::PointerEnter { x, y, time, .. } => {
+            ft::emit(stage, format_args!("kind=enter t={time} x={x} y={y}"))
+        }
+        FromUi::PointerButton { button, pressed, time, .. } => ft::emit(
+            stage,
+            format_args!("kind=button t={time} b={button} down={}", u8::from(*pressed)),
+        ),
+        FromUi::PointerAxis { v120_h, v120_v, time, .. } => {
+            ft::emit(stage, format_args!("kind=axis t={time} v120={v120_v} h120={v120_h}"))
+        }
+        FromUi::Key { keycode, pressed, time, .. } => ft::emit(
+            stage,
+            format_args!("kind=key t={time} code={keycode} down={}", u8::from(*pressed)),
+        ),
+        _ => return false,
+    }
+    true
+}
+
 /// UI thread -> Wayland thread.
 #[derive(Debug)]
 pub enum FromUi {
