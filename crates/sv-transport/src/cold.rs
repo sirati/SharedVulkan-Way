@@ -131,6 +131,16 @@ pub enum Locator {
     /// so this is a locator that names a place and is then verified, not one
     /// that is trusted.
     Ivshmem { region_offset: u64 },
+    /// **A session of the leased pool** (waycompose-design.md §97): the control
+    /// region is the `control_pages` pages at `control_offset` of the boot
+    /// device, stamped and checked as [`Locator::Ivshmem`]'s slot was, and
+    /// there is no arena in the extent at all — `arena_pages` is zero, and the
+    /// arena is the whole pool, leased a range at a time over the rings.
+    /// `pool_nonce` is the number the pool's owner wrote into the pool header
+    /// at the start of the device; the attaching side checks it there, which
+    /// is what says that the file it opened is the pool this session belongs
+    /// to and not merely a file with stamps in it.
+    IvshmemPool { control_offset: u64, pool_nonce: u64 },
 }
 
 impl Locator {
@@ -205,6 +215,7 @@ impl ExtentDesc {
                 Locator::Scan | Locator::Probe => 8,
                 Locator::Pfns(runs) => 8 + runs.len() * 16,
                 Locator::Ivshmem { .. } => 8 + 8,
+                Locator::IvshmemPool { .. } => 8 + 16,
             }
     }
 
@@ -234,6 +245,12 @@ impl ExtentDesc {
                 e.u32(3)?;
                 e.array_size(0)?;
                 e.u64(*region_offset)?;
+            }
+            Locator::IvshmemPool { control_offset, pool_nonce } => {
+                e.u32(4)?;
+                e.array_size(0)?;
+                e.u64(*control_offset)?;
+                e.u64(*pool_nonce)?;
             }
         }
         Ok(())
@@ -285,6 +302,12 @@ impl ExtentDesc {
                     return Err(Error::BadColdMessage("an ivshmem locator carried a frame list"));
                 }
                 Locator::Ivshmem { region_offset: d.u64()? }
+            }
+            4 => {
+                if d.u64()? != 0 {
+                    return Err(Error::BadColdMessage("an ivshmem locator carried a frame list"));
+                }
+                Locator::IvshmemPool { control_offset: d.u64()?, pool_nonce: d.u64()? }
             }
             _ => return Err(Error::BadColdMessage("unknown locator")),
         };
@@ -767,6 +790,22 @@ mod tests {
         assert_eq!(ColdMessage::decode(&buf).unwrap(), h);
         assert_eq!(Locator::Ivshmem { region_offset: 1 }.frame_count(), 0);
         assert_eq!(Locator::Ivshmem { region_offset: 1 }.pfn_runs(), None);
+    }
+
+    /// §97: a pooled session's locator carries the control region's offset and
+    /// the pool's nonce, both intact, and no frames.
+    #[test]
+    fn a_pool_locator_round_trips_with_its_nonce() {
+        let mut h = hello();
+        if let ColdMessage::Hello(b) = &mut h {
+            b.extent.locator = Locator::IvshmemPool { control_offset: 64 << 10, pool_nonce: 0x5650_4f4f_4c00_0001 };
+            b.extent.arena_pages = 0;
+            assert_eq!(b.extent.size(), 8 + 4 + 8 + 8 + 4 + 24);
+        }
+        let mut buf = Vec::new();
+        h.encode(&mut buf).unwrap();
+        assert_eq!(ColdMessage::decode(&buf).unwrap(), h);
+        assert_eq!(Locator::IvshmemPool { control_offset: 0, pool_nonce: 0 }.frame_count(), 0);
     }
 
     /// docs/design.md §4.3: the descriptor "is small in every case: on the two

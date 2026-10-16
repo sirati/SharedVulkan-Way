@@ -5,6 +5,7 @@
 #
 #   scripts/sv-minecraft.sh setup                      Prism, the game, Fabric, VulkanMod
 #   scripts/sv-minecraft.sh run stock|vulkanmod [secs] play it, and judge what happened
+#   scripts/sv-minecraft.sh ship SSH-HOST              Phase 2: the game, ready to launch, on a VM host
 #
 # Run from inside `nix develop` (Xvfb, Wine, ImageMagick and the dev shell's
 # RADV come from there). Prism, Java, xdotool, GLFW and Python come from
@@ -43,6 +44,8 @@
 #   SVMC_FULLSCREEN 1: press F11 during the run and judge the window
 #   SVMC_SOUND     1: give the game this desktop's PulseAudio, at master volume 0
 #   SVMC_MEM       the game's memory cap (6G); the heap is Prism's 3 GiB
+#   SVMC_GPU_ARENA_MIB  the GPU side's arena (512); the guest gives a session 64 or 240
+#   SVMC_GPU_POOL_MIB   lease from one pool of this size instead, as the guest does (§97)
 set -uo pipefail
 
 CMD=${1:-}
@@ -324,7 +327,7 @@ run() {
     local VVL; VVL=$(nixpath vulkan-validation-layers)
     GPU_ENV+=(VK_LAYER_PATH="$VVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
-  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $((512 << 20)) \
+  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )) ${SVMC_GPU_POOL_MIB:+--pool $(( SVMC_GPU_POOL_MIB << 20 ))} \
       --socket "$RUN/gpu.sock" --idle $((secs + 120)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" -v keep="${SVMC_KEEP_PIPELINE_TRACE:-0}" -v keepf="$RUN/gpu-pipelines.txt" '
@@ -540,8 +543,74 @@ verdict() {
   return "$fail"
 }
 
+# ------------------------------------------------------------ bundle, ship ---
+# Phase 2 (waycompose-design.md §96): what the VM host gets. `setup`'s data
+# directory and recorded launches, moved to SVMC_HOST_DIR (~/wc-mc),
+# with Prism configured for that host, the options a person wants (the
+# narrator off, the sound on, vsync on, a view distance for a laptop), the
+# launcher `scripts/minecraft-demo`, and desktop entries and Minecraft's own
+# icon in share/, where `wc-session`'s `app` and `icon` verbs look.
+HOST_DIR=${SVMC_HOST_DIR:-~/wc-mc}
+bundle() {
+  [ -s "$CAP/stock/stdin" ] && [ -s "$CAP/vulkanmod/stdin" ] || die "run '$0 setup' first"
+  local host=${1:?bundle HOSTNAME} B="$DATA/bundle/wc-mc"
+  rm -rf "$DATA/bundle"; mkdir -p "$B/bin" "$B/capture" "$B/share/applications"
+  rsync -a --exclude 'logs/' --exclude 'screenshots/' --exclude 'hs_err_pid*' --exclude 'core*' \
+    --exclude 'crash-reports/' --exclude 'debug/' "$PRISM_DIR" "$B/"
+  local v f kv k val
+  for v in stock vulkanmod; do
+    mkdir -p "$B/capture/$v"
+    for f in argv stdin cwd; do sed "s|$PRISM_DIR|$HOST_DIR/prism|g" "$CAP/$v/$f" >"$B/capture/$v/$f"; done
+    # Only the library path of Prism's wrapper: the rest of the recorded
+    # environment was this workstation's.
+    grep '^LD_LIBRARY_PATH=' "$CAP/$v/env" >"$B/capture/$v/env"
+    sed -i -e '/^WrapperCommand=/d' -e 's/^OverrideCommands=true/OverrideCommands=false/' \
+      "$B/prism/instances/mc-$v/instance.cfg"
+    local O="$B/prism/instances/mc-$v/minecraft/options.txt"
+    for kv in narrator:0 narratorHotkey:false onboardAccessibility:false renderDistance:6 \
+              simulationDistance:6 enableVsync:true maxFps:120 soundCategory_master:1.0 \
+              pauseOnLostFocus:true fullscreen:false tutorialStep:none; do
+      k=${kv%%:*}; val=${kv#*:}
+      grep -q "^$k:" "$O" && sed -i "s/^$k:.*/$k:$val/" "$O" || echo "$k:$val" >>"$O"
+    done
+  done
+  sed -i -e "s/^LastHostname=.*/LastHostname=$host/" -e 's/^MaxMemAlloc=.*/MaxMemAlloc=1024/' \
+    -e 's/^MinMemAlloc=.*/MinMemAlloc=256/' "$B/prism/prismlauncher.cfg"
+  install -m 755 "$ROOT/scripts/minecraft-demo" "$B/bin/minecraft-demo"
+  # Minecraft's own icon, from the game's assets (`icons/icon_*.png`).
+  local idx="$PRISM_DIR/assets/indexes/29.json" sz h
+  for sz in 256x256 128x128 48x48; do
+    h=$(grep -oE "\"icons/icon_$sz.png\": \{\"hash\": \"[0-9a-f]+\"" "$idx" | grep -oE '[0-9a-f]{40}')
+    [ -n "$h" ] || die "no icons/icon_$sz.png in $idx"
+    mkdir -p "$B/share/icons/hicolor/$sz/apps"
+    cp "$PRISM_DIR/assets/objects/${h:0:2}/$h" "$B/share/icons/hicolor/$sz/apps/wc-minecraft.png"
+  done
+  printf '[Desktop Entry]\nType=Application\nName=Minecraft (demo)\nComment=Minecraft %s in demo mode, OpenGL through Zink on the guest'"'"'s GPU\nExec=minecraft-demo stock\nIcon=wc-minecraft\nCategories=Game;\n' \
+    "$MC_VERSION" >"$B/share/applications/wc-minecraft.desktop"
+  printf '[Desktop Entry]\nType=Application\nName=Minecraft (demo, VulkanMod)\nComment=Minecraft %s in demo mode with VulkanMod, Vulkan on the guest'"'"'s GPU\nExec=minecraft-demo vulkanmod\nIcon=wc-minecraft\nCategories=Game;\n' \
+    "$MC_VERSION" >"$B/share/applications/wc-minecraft-vulkanmod.desktop"
+  grep -rl "$PRISM_DIR" "$B/capture" && die "a recorded launch still names $PRISM_DIR"
+  say "bundle for $host in $B ($(du -sh "$B" | cut -f1))"
+}
+
+# Copy it there: the store paths the launch names (`nix copy`; this user is
+# trusted on the VM host, so the locally built Prism wrapper needs no
+# signature), then the bundle. Nothing is built on the host.
+ship() {
+  local target=${1:?ship SSH-HOST}
+  local host; host=$(ssh -o BatchMode=yes "$target" hostname) || die "cannot reach $target"
+  bundle "$host"
+  nix copy --no-check-sigs --to "ssh-ng://$target" "$PRISM" "$JDK" "$GLFW" || die "nix copy to $target"
+  rsync -a --delete "$DATA/bundle/wc-mc/" "$target:$HOST_DIR/" || die "rsync to $target"
+  ssh "$target" "bash -n $HOST_DIR/bin/minecraft-demo && test -x $(head -1 "$CAP/stock/argv")" \
+    || die "the launcher or its Java is not usable on $target"
+  say "shipped to $target:$HOST_DIR"
+}
+
 case "$CMD" in
   setup) setup ;;
   run) shift; run "$@" ;;
+  bundle) shift; bundle "${1:-$(hostname)}" ;;
+  ship) shift; ship "$@" ;;
   *) sed -n '3,9p' "$0"; exit 2 ;;
 esac

@@ -878,9 +878,10 @@ mod audio_tests {
     }
 }
 
-/// §86, §87. The GPU process: `sv-guest.exe gpu guest` on the GPU arena's
-/// ivshmem device, one port, up to `gpu-sessions` sessions at once in slots of
-/// the BAR, and the doorbell port if the ini names one. `--idle` is how long a
+/// §86, §87, §97. The GPU process: `sv-guest.exe gpu guest` on the GPU arena's
+/// ivshmem device, one port, up to `gpu-sessions` sessions at once — leasing
+/// from one pool over the whole device (`gpu-arena = pool`, the default) or in
+/// §87's fixed slots of the BAR — and the doorbell port if the ini names one. `--idle` is how long a
 /// session waits for its application to claim its rings once the host has
 /// asked for it, which is seconds, not the session's life: the process lives
 /// as long as the launcher session, which kills it.
@@ -892,13 +893,18 @@ pub fn gpu_argv(cfg: &Config) -> Vec<String> {
         cfg.gpu_port().to_string(),
         "--ivshmem-slot".into(),
         format!("{:#04x}", cfg.gpu_ivshmem_slot),
-        "--arena".into(),
-        (cfg.gpu_arena_mib << 20).to_string(),
+    ];
+    if cfg.gpu_pool {
+        a.push("--pool".into());
+    } else {
+        a.extend(["--arena".into(), (cfg.gpu_arena_mib << 20).to_string()]);
+    }
+    a.extend([
         "--sessions".into(),
         cfg.gpu_sessions.to_string(),
         "--idle".into(),
         "60".into(),
-    ];
+    ]);
     if !cfg.gpu_bell.is_empty() {
         a.extend(["--bell".into(), cfg.gpu_bell.clone()]);
     }
@@ -921,6 +927,12 @@ mod gpu_tests {
         assert_eq!(&g[..6], ["gpu", "guest", "--port", &(c.port + 10).to_string(), "--ivshmem-slot", "0x1d"]);
         let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
         assert_eq!(after("--sessions"), Some("3"));
+        assert!(g.iter().any(|x| x == "--pool") && !g.iter().any(|x| x == "--arena"), "the pool by default (§97)");
+        c.gpu_pool = false;
+        let s = gpu_argv(&c);
+        assert!(!s.iter().any(|x| x == "--pool"));
+        assert_eq!(s.iter().position(|x| x == "--arena").map(|i| s[i + 1].as_str()), Some("67108864"));
+        c.gpu_pool = true;
         assert_eq!(after("--bell"), Some("org.sirati.svbell.0"));
         assert!(!g.iter().any(|x| x.contains("small-pages")), "the launcher never asks for small pages");
         c.gpu_bell.clear();

@@ -7001,6 +7001,23 @@ app side were the VM they swap, and nothing above §5 changes.
 
 ### 5.2 Slabs, cache class, and the allocator
 
+> **[On the GPU ivshmem path, superseded in part — 2026-10-16,
+> `waycompose-design.md` §97]** The arena there is not one window per session
+> but **one pool per GPU process**, the whole ivshmem device, leased to
+> sessions as they ask (`svLeaseArena`) and given back as they free
+> (`svReleaseArena`). What a slab was is now a **lease**: the unit the GPU side
+> imports, inside which one `VkDeviceMemory` lies whole. A lease is either a
+> 4 MiB chunk the app side sub-allocates small allocations from, or the room
+> of one allocation of 1 MiB or more. The app side still allocates (§5.2's rule), in
+> `sv_arena::heap`; the pool is `sv_arena::pool`, a TLSF allocator per region
+> at a 64 KiB granule, owned by the guest's GPU process; the GPU side imports
+> each lease on its own and resolves every `(memory, offset)` only inside the
+> session's own leases. A full pool is `VK_ERROR_OUT_OF_DEVICE_MEMORY` to the
+> application that asked, as R11 says; a session may hold three quarters of
+> the pool, and the room one session needs to start is kept free. The paths
+> below this note (the guest-RAM arena, and the export path's own arena per
+> session) are unchanged.
+
 The arena is divided into **slabs** of `arena_slab_size` (default 64 MiB). A
 slab is the unit of GPU-side import and the unit of cache-attribute uniformity.
 gfxstream uses 16 MiB with 1 MiB rounding for small allocations

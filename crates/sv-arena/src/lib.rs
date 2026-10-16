@@ -41,6 +41,9 @@ pub mod canary;
 pub mod extent;
 pub mod handle;
 pub mod shared;
+pub mod tlsf;
+pub mod pool;
+pub mod heap;
 /// The Linux guest-side provider. Gated because it is `mlock` and `smaps`, and
 /// because the *other* guest-side provider is `awe-probe`'s Win32 one.
 #[cfg(target_os = "linux")]

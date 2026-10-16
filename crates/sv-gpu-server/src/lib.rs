@@ -25,6 +25,8 @@ pub mod entry;
 pub mod fault;
 pub mod features;
 pub mod ivshmem;
+pub mod pool;
+pub mod pool_guest;
 pub mod convert;
 pub mod driver;
 pub mod server;
@@ -60,7 +62,12 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 /// over and the hash cannot see it. An app side that asks a GPU side built
 /// before it gets "unknown protocol command", which is fatal to that ring — the
 /// coarse check in front is precisely what this counter is for.
-pub const WIRE_VERSION: u32 = 2;
+///
+/// **3** since waycompose-design.md §97: `svArenaInfo`, `svLeaseArena` and
+/// `svReleaseArena`, the leased arena. An app side that leases from a GPU side
+/// built before them would be refused on its first allocation; this refuses it
+/// at attach instead, by name.
+pub const WIRE_VERSION: u32 = 3;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///

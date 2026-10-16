@@ -411,6 +411,9 @@ pub struct RingTransport {
     /// pointer `vkMapMemory` handed out, and this is the only thing that lives
     /// as long as the process.
     pub arena: Arc<SharedRegion>,
+    /// The pool this session leases its arena from, when it does
+    /// (waycompose-design.md §97). `None` on a fixed arena.
+    pub pool: Option<PoolView>,
     /// Clearing this stops the heartbeat thread.
     beating: Arc<std::sync::atomic::AtomicBool>,
     /// The cross-VM doorbell reader thread (§36.6). Held so it lives as long as
@@ -602,7 +605,20 @@ impl RingTransport {
         // Acknowledge, so a daemon that created the name may release it. Sent
         // after both mappings exist, which is what makes it mean anything.
         let _ = send(&sock, &ColdMessage::Accept { generation: at.generation });
-        RingTransport::finish_attach(control_region, arena, at.arena_len)
+        // What the pool's regions are mapped from, should the GPU side say the
+        // arena is leased: the named file (region 0, and the files beside it),
+        // or on the development export path the one descriptor.
+        let source = if at.arena_object.is_empty() {
+            match fds.first().map(|f| f.try_clone()) {
+                Some(Ok(fd)) => PoolSource::Fd(fd),
+                _ => PoolSource::None,
+            }
+        } else {
+            PoolSource::Path(at.arena_object.clone())
+        };
+        let mut attached = RingTransport::finish_attach(control_region, arena, at.arena_len)?;
+        attached.enter_pool(source, at.arena_offset, at.arena_len)?;
+        Ok(attached)
     }
 
     /// Connect to a Windows GPU side over a named pipe and two named sections.
@@ -899,6 +915,7 @@ impl RingTransport {
                 parker: Futex::default(),
                 blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
+                pool: None,
                 beating,
                 _doorman: doorman,
             },
@@ -2033,5 +2050,169 @@ mod abandoned_calls {
         stop.store(true, Ordering::Release);
         heart.join().unwrap();
         assert_eq!(got.instance_api_version, 2, "with its own reply, not the first call's");
+    }
+}
+
+/// Where a leased pool's regions are mapped from (waycompose-design.md §97).
+pub enum PoolSource {
+    /// Region 0 is this file, and region `k` the file
+    /// `sv_transport::poolhdr::region_path` names beside it: the GPU ivshmem
+    /// device's backing file on the VM host, opened by name (docs/design.md §1a).
+    Path(String),
+    /// The development export path's one descriptor: region 0 only.
+    #[cfg(target_os = "linux")]
+    Fd(std::os::fd::OwnedFd),
+    None,
+}
+
+/// A leased arena as this process sees it: one reserved range with each
+/// region's file mapped at its stride, so a pool offset is an offset into
+/// [`RingTransport::arena`] whichever region it is in.
+pub struct PoolView {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    source: PoolSource,
+    /// `(region, bytes mapped)`.
+    mapped: Mutex<Vec<(u32, u64)>>,
+    pub granule: u64,
+    pub session_cap: u64,
+    pub capacity: u64,
+}
+
+
+/// This process's name, for the GPU side's log of who holds what.
+#[cfg(target_os = "linux")]
+fn process_name() -> String {
+    std::fs::read_to_string("/proc/self/comm")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| format!("pid {}", std::process::id()))
+}
+
+impl Attached {
+    /// Ask the GPU side how the arena is provided, and if it is leased, make
+    /// [`RingTransport::arena`] the pool view and lease the blob reserve
+    /// (waycompose-design.md §97). On a fixed arena nothing changes.
+    #[cfg(target_os = "linux")]
+    pub fn enter_pool(&mut self, source: PoolSource, arena_offset: u64, arena_len: u64) -> Result<(), String> {
+        use std::os::fd::AsFd;
+        use sv_arena::pool::{MAX_REGIONS, REGION_STRIDE};
+        let t = &mut self.transport;
+        let Some(info) = t.arena_info(&process_name()) else { return Ok(()) };
+        if info.mode != sv_proto::sv::ARENA_MODE_LEASED {
+            return Ok(());
+        }
+        let view = SharedRegion::reserve((REGION_STRIDE as usize) * MAX_REGIONS)
+            .map_err(|e| format!("reserving the pool's address space: {e}"))?;
+        match &source {
+            PoolSource::Path(p) => {
+                let f = sv_transport::region::open_named(p).map_err(|e| format!("{p}: {e}"))?;
+                view.map_fixed(0, f.as_fd(), arena_offset, arena_len).map_err(|e| format!("{p}: {e}"))?;
+            }
+            PoolSource::Fd(fd) => {
+                view.map_fixed(0, fd.as_fd(), arena_offset, arena_len).map_err(|e| format!("the pool descriptor: {e}"))?;
+            }
+            PoolSource::None => return Err("the arena is leased and nothing names the pool to map".into()),
+        }
+        t.arena = Arc::new(view);
+        t.pool = Some(PoolView {
+            source,
+            mapped: Mutex::new(vec![(0, arena_len)]),
+            granule: info.lease_granule,
+            session_cap: info.session_cap,
+            capacity: info.capacity,
+        });
+        let (off, len, _) = t
+            .lease_arena(sv_arena::pool::BLOB_LEASE, sv_proto::sv::LEASE_BLOBS)
+            .map_err(|e| format!("leasing the command-blob reserve: {e:?}"))?;
+        *t.blobs.lock().unwrap_or_else(|e| e.into_inner()) = Blobs::new(off, len);
+        self.arena_len = (REGION_STRIDE as usize * MAX_REGIONS) as u64;
+        self.slab_size = self.arena_len;
+        crate::state::say_once(
+            &crate::state::POOL_SAID,
+            &format_args!(
+                "the arena is leased from the GPU side's {} MiB pool; this process may lease {} MiB",
+                info.capacity >> 20,
+                info.session_cap >> 20
+            ),
+        );
+        Ok(())
+    }
+}
+
+impl RingTransport {
+    pub fn is_pooled(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// `svArenaInfo`, on the instance ring. `None` for any failure, which is
+    /// a fixed arena: a GPU side too old to know the question is refused at
+    /// attach by `WIRE_VERSION` before it gets here.
+    #[cfg(target_os = "linux")]
+    fn arena_info(&self, name: &str) -> Option<sv_proto::sv::ArenaInfoReply> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::ArenaInfo::named(name).encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_ARENA_INFO, &cmd, &mut reply).ok()?;
+        sv_proto::sv::ArenaInfoReply::decode(&reply).ok()
+    }
+
+    /// `svLeaseArena`: `(pool offset, length, memory type)`. The lease's
+    /// region is mapped here first if it is not yet. A refusal is
+    /// `LowerError::Result(VK_ERROR_OUT_OF_DEVICE_MEMORY)`.
+    pub fn lease_arena(&self, len: u64, purpose: u32) -> IcdResult<(u64, u64, u32)> {
+        let pool = self.pool.as_ref().ok_or(LowerError::Shape("a lease on a fixed arena"))?;
+        let mut cmd = Vec::new();
+        sv_proto::sv::LeaseArena { len, purpose }.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_LEASE_ARENA, &cmd, &mut reply)?;
+        let r = sv_proto::sv::LeaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Err(LowerError::Result(r.result));
+        }
+        let (region, local) = sv_arena::pool::split(r.offset);
+        let covered = pool
+            .mapped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(k, n)| k == region && local + r.len <= n);
+        if !covered {
+            self.map_region(pool, region)?;
+        }
+        Ok((r.offset, r.len, r.memory_type))
+    }
+
+    /// Map region `k`'s file into the view, whole.
+    #[cfg(target_os = "linux")]
+    fn map_region(&self, pool: &PoolView, k: u32) -> IcdResult<()> {
+        use std::os::fd::AsFd;
+        let PoolSource::Path(boot) = &pool.source else {
+            return Err(LowerError::Shape("a lease in a region this process has no name for"));
+        };
+        let path = sv_transport::poolhdr::region_path(boot, k);
+        let f = sv_transport::region::open_named(&path).map_err(lower)?;
+        let len = f.metadata().map_err(|_| LowerError::Shape("a pool region with no size"))?.len();
+        self.arena
+            .map_fixed(u64::from(k) * sv_arena::pool::REGION_STRIDE, f.as_fd(), 0, len)
+            .map_err(lower)?;
+        pool.mapped.lock().unwrap_or_else(|e| e.into_inner()).push((k, len));
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn map_region(&self, _pool: &PoolView, _k: u32) -> IcdResult<()> {
+        Err(LowerError::Shape("a pooled arena on this system"))
+    }
+
+    /// `svReleaseArena`.
+    pub fn release_arena(&self, offset: u64) -> IcdResult<()> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::ReleaseArena { offset }.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_RELEASE_ARENA, &cmd, &mut reply)?;
+        let r = sv_proto::sv::ReleaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Err(LowerError::Result(r.result));
+        }
+        Ok(())
     }
 }

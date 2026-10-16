@@ -67,6 +67,10 @@ pub enum ArenaError {
     OutOfMemory,
     BadGeometry(&'static str),
     NotMapped,
+    /// A leased arena (waycompose-design.md §97) needs a lease of `len` bytes
+    /// before this allocation can succeed: ask the GPU side for one, hand it
+    /// to [`Backing::add_lease`] and allocate again.
+    NeedLease { len: u64, dedicated: bool },
 }
 
 pub type Result<T> = std::result::Result<T, ArenaError>;
@@ -81,10 +85,27 @@ pub trait Backing: Send {
     fn arena_offset(&self, a: Allocation) -> Result<u64>;
     /// Freed immediately here. The real allocator defers until the timelines an
     /// allocation could be referenced by have passed (docs/design.md §5.5).
-    fn free_now(&mut self, a: Allocation) -> Result<()>;
+    ///
+    /// On a leased arena a free can empty a lease; it is returned as
+    /// `(pool offset, length)` for the caller to give back with
+    /// `svReleaseArena`, outside whatever lock guards this allocator.
+    fn free_now(&mut self, a: Allocation) -> Result<Option<(u64, u64)>>;
     fn free_bytes(&self) -> u64;
     /// The largest allocation that would succeed now.
     fn largest_free_run(&self) -> u64;
+    /// Take a lease the GPU side granted (waycompose-design.md §97).
+    fn add_lease(&mut self, _offset: u64, _len: u64, _dedicated: bool) -> Result<()> {
+        Err(ArenaError::BadGeometry("this arena is not leased"))
+    }
+    /// Is this a leased arena?
+    fn leased(&self) -> bool {
+        false
+    }
+    /// One clause for a diagnostic line, when the default
+    /// (`State::arena_use`'s) does not describe this allocator.
+    fn describe(&self) -> Option<String> {
+        None
+    }
 }
 
 pub const fn round_up(size: u64) -> u64 {
@@ -188,7 +209,7 @@ impl Backing for Placeholder {
         Ok(off)
     }
 
-    fn free_now(&mut self, a: Allocation) -> Result<()> {
+    fn free_now(&mut self, a: Allocation) -> Result<Option<(u64, u64)>> {
         let off = self.arena_offset(a)?;
         let pos = self.free.partition_point(|(o, _)| *o < off);
         self.free.insert(pos, (off, a.size));
@@ -205,7 +226,7 @@ impl Backing for Placeholder {
                 i += 1;
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn free_bytes(&self) -> u64 {
@@ -213,6 +234,88 @@ impl Backing for Placeholder {
     }
     fn largest_free_run(&self) -> u64 {
         self.free.iter().map(|(_, l)| *l).max().unwrap_or(0)
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// the leased arena
+// ---------------------------------------------------------------------------
+
+/// The app side's allocator on a leased arena (waycompose-design.md §97):
+/// `sv_arena::heap::SessionHeap` behind [`Backing`].
+///
+/// An [`Allocation`] here carries its **pool offset** in `offset_in_slab`
+/// and `slab` 0, and [`Backing::slab_size`] is the whole pool's address
+/// space, so `slab × slab_size + offset_in_slab` — which is what every caller
+/// that predates leases computes — is the pool offset. A lease is what a slab
+/// was: the unit the GPU side imports, inside which one `VkDeviceMemory`
+/// lies whole.
+pub struct Leased {
+    heap: sv_arena::heap::SessionHeap,
+}
+
+impl Leased {
+    pub fn new(lease_granule: u64) -> Leased {
+        let cfg = sv_arena::heap::HeapConfig { lease_granule: lease_granule.max(GRANULARITY), ..Default::default() };
+        Leased { heap: sv_arena::heap::SessionHeap::new(cfg) }
+    }
+}
+
+impl Backing for Leased {
+    fn slab_size(&self) -> u64 {
+        sv_arena::pool::REGION_STRIDE * sv_arena::pool::MAX_REGIONS as u64
+    }
+    fn arena_len(&self) -> u64 {
+        self.heap.leased()
+    }
+    fn alloc(&mut self, size: u64) -> Result<Allocation> {
+        match self.heap.alloc(size) {
+            Ok(a) => Ok(Allocation { slab: 0, offset_in_slab: a.offset, size: a.size }),
+            Err(sv_arena::heap::HeapError::NeedLease { len, dedicated }) => Err(ArenaError::NeedLease { len, dedicated }),
+            Err(_) => Err(ArenaError::OutOfMemory),
+        }
+    }
+    fn arena_offset(&self, a: Allocation) -> Result<u64> {
+        if a.slab != 0 || self.heap.size_of(a.offset_in_slab).is_none() {
+            return Err(ArenaError::BadGeometry("not an allocation of this arena"));
+        }
+        Ok(a.offset_in_slab)
+    }
+    fn free_now(&mut self, a: Allocation) -> Result<Option<(u64, u64)>> {
+        self.heap
+            .free(a.offset_in_slab)
+            .map_err(|_| ArenaError::BadGeometry("freeing a range that is not allocated"))
+    }
+    fn free_bytes(&self) -> u64 {
+        let s = self.heap.stats();
+        s.leased - s.used
+    }
+    fn largest_free_run(&self) -> u64 {
+        // Inside what is leased; the pool behind it is the GPU side's to say.
+        self.free_bytes()
+    }
+    fn add_lease(&mut self, offset: u64, len: u64, dedicated: bool) -> Result<()> {
+        self.heap
+            .add_lease(offset, len, dedicated)
+            .map_err(|_| ArenaError::BadGeometry("a lease that overlaps one this arena holds"))
+    }
+    fn leased(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> Option<String> {
+        let s = self.heap.stats();
+        Some(format!(
+            "leased arena {} KiB in use in {} allocation(s), {} KiB leased in {} chunk(s) ({} empty) and {} \
+             dedicated lease(s), high water {} KiB leased",
+            s.used >> 10,
+            s.allocations,
+            s.leased >> 10,
+            s.chunks,
+            s.empty_chunks,
+            s.dedicated,
+            s.high_water >> 10
+        ))
     }
 }
 
@@ -250,7 +353,7 @@ impl Backing for sv_arena::alloc::ArenaAllocator {
         )
         .map_err(|_| ArenaError::BadGeometry("allocation is outside the arena"))
     }
-    fn free_now(&mut self, a: Allocation) -> Result<()> {
+    fn free_now(&mut self, a: Allocation) -> Result<Option<(u64, u64)>> {
         sv_arena::alloc::ArenaAllocator::free_now(
             self,
             sv_arena::alloc::Allocation {
@@ -260,6 +363,7 @@ impl Backing for sv_arena::alloc::ArenaAllocator {
             },
         )
         .map_err(|_| ArenaError::BadGeometry("freeing a range that is not allocated"))
+        .map(|()| None)
     }
     fn free_bytes(&self) -> u64 {
         sv_arena::alloc::ArenaAllocator::free_bytes(self)

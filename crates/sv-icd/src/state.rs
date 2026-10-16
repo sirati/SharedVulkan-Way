@@ -336,6 +336,9 @@ impl State {
     /// use of the application's share, in how many `VkDeviceMemory`, and the
     /// high-water mark.
     pub fn arena_use(&self) -> String {
+        if let Some(d) = self.allocator.describe() {
+            return d;
+        }
         let len = self.allocator.arena_len();
         let used = len - self.allocator.free_bytes().min(len);
         let live = self.memories.values().filter(|m| m.allocation.is_some()).count();
@@ -385,6 +388,8 @@ pub static SLAB_IMPORT_SAID: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 pub static CREATE_BUFFER_FAILED_SAID: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// The leased arena's one line at attach (waycompose-design.md §97).
+pub static POOL_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Print `msg` the first time `flag` is seen clear.
 pub fn say_once(flag: &std::sync::atomic::AtomicBool, msg: &dyn std::fmt::Display) {
@@ -510,12 +515,19 @@ impl SharedVulkan {
         // not migrate under a `MAP_SHARED` mapping, and driver memory is the
         // driver's — so the canary here would cost a page per slab to detect
         // something that cannot happen.
-        let allocator = sv_arena::alloc::ArenaAllocator::new(
-            attached.arena_len,
-            attached.slab_size,
-            sv_arena::canary::CanaryPolicy::None,
-        )
-        .map_err(|e| format!("{e}"))?;
+        // A leased arena (waycompose-design.md §97) has no window to carve:
+        // the allocator starts with nothing and leases as it needs.
+        let allocator: Box<dyn Backing> = match attached.transport.pool.as_ref() {
+            Some(p) => Box::new(crate::arena::Leased::new(p.granule)),
+            None => Box::new(
+                sv_arena::alloc::ArenaAllocator::new(
+                    attached.arena_len,
+                    attached.slab_size,
+                    sv_arena::canary::CanaryPolicy::None,
+                )
+                .map_err(|e| format!("{e}"))?,
+            ),
+        };
         // **Before anything else is asked of the ring.** The loader may call
         // `vkEnumerateInstanceVersion` before `vkCreateInstance` — it is a global
         // command — so the answer has to exist by the time this constructor
@@ -546,7 +558,7 @@ impl SharedVulkan {
         let mut icd = SharedVulkan {
             arena,
             arena_len: attached.arena_len,
-            state: Mutex::new(State::new(Box::new(allocator))),
+            state: Mutex::new(State::new(allocator)),
             transport: Some(attached.transport),
             api_version,
             device_api_version,
@@ -837,6 +849,21 @@ impl SharedVulkan {
         self.transport.as_ref()
     }
 
+    /// The arena heap's size as an application should see it: the arena's
+    /// length, or on a leased arena (waycompose-design.md §97) the most this
+    /// session may lease — the pool's size or the session's cap, whichever is
+    /// less. Not `arena_len`, which on a leased arena is the address space
+    /// reserved for every region the pool could have: reported as a heap it
+    /// took the device heap's whole size away, and Zink refused every
+    /// device-local allocation ("can't allocate … from heap that's only 0
+    /// bytes").
+    pub fn heap_len(&self) -> u64 {
+        match self.transport.as_ref().and_then(|t| t.pool.as_ref()) {
+            Some(p) => p.session_cap.min(p.capacity),
+            None => self.arena_len,
+        }
+    }
+
     /// docs/design.md §5.3's rewrite, app-side half: allocation coordinates become
     /// arena coordinates.
     ///
@@ -931,7 +958,7 @@ fn announce(how: Negotiated, advertised: u32, driver_device: u32) {
 
 /// The memory table, with this ICD's arena size in it.
 pub fn memory_properties(icd: &SharedVulkan) -> sv_icd_entry::VkPhysicalDeviceMemoryProperties {
-    advertise::memory_properties(icd.arena_len)
+    advertise::memory_properties(icd.heap_len())
 }
 
 #[cfg(test)]
