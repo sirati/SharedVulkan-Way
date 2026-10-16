@@ -502,7 +502,7 @@ impl SharedVulkan {
     #[cfg(any(target_os = "linux", windows))]
     pub fn connected(endpoint: &str) -> Result<SharedVulkan, String> {
         let socket = endpoint;
-        let attached = crate::transport::RingTransport::connect(socket)?;
+        let attached = connect_waiting_for_slot(socket)?;
         let arena = Mapping::attach(&attached.transport.arena, attached.arena_len);
         // `CanaryPolicy::None`: R26's canary detects a *guest page* moving
         // underneath a `VirtualLock`ed window, which is a Windows-in-a-VM
@@ -1038,5 +1038,85 @@ mod tests {
                 .contains(&("VK_EXT_external_memory_host", "vkGetMemoryHostPointerPropertiesEXT")),
             "and for the wild host pointer, not for some other reason"
         );
+    }
+}
+
+/// How long a process waits for a GPU session slot before it gives up.
+///
+/// A slot comes back when the session in it ends, and the GPU side ends one
+/// either when its application says so at exit or, for one that did not, when
+/// its heartbeat has been silent for `APP_GONE_AFTER` (5 s) and its leftovers
+/// are destroyed. Ten seconds covers the second case with room.
+#[cfg(any(target_os = "linux", windows))]
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// When this process stops waiting for a slot, as milliseconds of the wall
+/// clock: the first call starts the budget and every later one shares it.
+///
+/// **Per process, not per load.** The loader loads an ICD several times in one
+/// process (once for the pre-instance queries, again for the instance), and a
+/// refused load leaves nothing loaded, so a static here starts fresh each
+/// time: with every slot really taken, three loads would wait thirty seconds.
+/// The budget is kept in a file named by the pid in the temporary directory,
+/// which outlives an unload; a file left by an earlier process of the same pid
+/// holds a deadline in the past, which only means that process does not wait.
+#[cfg(any(target_os = "linux", windows))]
+fn slot_wait_deadline_ms() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("sv-icd-slot-wait-{}", std::process::id()));
+    if let Some(d) = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()) {
+        return d;
+    }
+    let d = now + SLOT_WAIT.as_millis() as u64;
+    let _ = std::fs::write(&path, d.to_string());
+    d
+}
+
+/// [`crate::transport::RingTransport::connect`], retried while the guest says
+/// every GPU session slot is taken (waycompose-design.md §95.10).
+///
+/// Refusing at once is right for a GPU side that is absent and wrong for one
+/// that is busy for a few seconds more: Firefox's browser process asks for its
+/// slot moments after `glxtest` has exited from one, and with two slots it was
+/// refused and fell back to llvmpipe for the life of the process. The refusal
+/// reaches this side as text through `sv-hostd`, so it is matched by the
+/// guest's own words, `GPU session slots are taken`; anything else fails as
+/// before.
+#[cfg(any(target_os = "linux", windows))]
+fn connect_waiting_for_slot(socket: &str) -> Result<crate::transport::Attached, String> {
+    let started = std::time::Instant::now();
+    let mut deadline = None;
+    let mut said = false;
+    loop {
+        match crate::transport::RingTransport::connect(socket) {
+            Err(e) if e.contains("GPU session slots are taken") => {
+                let d = *deadline.get_or_insert_with(slot_wait_deadline_ms);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|t| t.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if now >= d {
+                    return Err(e);
+                }
+                if !said {
+                    said = true;
+                    eprintln!(
+                        "sv-icd: {e}; waiting up to {:.1} s for one to come back",
+                        (d - now) as f64 / 1000.0
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Ok(a) => {
+                if deadline.is_some() {
+                    eprintln!("sv-icd: got a GPU session slot after {:.1?}", started.elapsed());
+                }
+                return Ok(a);
+            }
+            Err(e) => return Err(e),
+        }
     }
 }

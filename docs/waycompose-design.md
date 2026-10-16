@@ -29656,6 +29656,67 @@ side can be deployed separately.
    with Firefox open ends with Firefox alive. If anything fails, the lines of
    95.4 say which layer.
 
+### 95.10 Two slots and Firefox's start: a slot held five seconds after its process exits
+
+The deploy of 95.9 (gpu-oom merged with master, `gpu-sessions = 2`,
+`gpu-arena-mib = 112`) showed that Intel's driver takes the 112 MiB import
+(`2 session slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`), and that two
+slots broke Firefox's start. Sessions 1 and 2 (367 and 11 commands) held both
+slots. Clients 3 to 6 were refused (`all 2 GPU session slots are taken`). The
+browser process was among them, so it had no `libsv_icd.so` mapped and drew on
+llvmpipe.
+
+**A slot outlived its process by five seconds.** `RingTransport::shutdown`
+sets the control region's `SHUTDOWN` flag, which the GPU side's ring threads
+check every 50 ms, and nothing called it. So the GPU side learned that a
+session was over only when its heartbeat had been silent for `APP_GONE_AFTER`.
+Measured with `scripts/sv-slot-release.sh`: `vulkaninfo` exits and its session
+ends 5156 ms later. Firefox's `glxtest` exits and the browser asks for its slot
+well inside that time. **And a refused ICD gave up at once**, for the life of
+the process.
+
+Two changes, both in the ICD:
+
+* At exit the ICD sets `SHUTDOWN` on every control region it attached (an
+  `atexit` handler, `transport::arm_goodbye`). The same measurement: the
+  session ends 67 ms after `vulkaninfo` exits.
+* A connection refused because every slot is taken waits for one, retrying
+  every 250 ms. The budget is 10 s for the process as a whole, kept in
+  `$TMPDIR/sv-icd-slot-wait-<pid>`, because the loader loads the ICD up to
+  three times in one process and a refused load leaves nothing loaded to
+  remember the wait. The refusal reaches the ICD only as text through
+  `sv-hostd`, so it is matched by the guest's words
+  `GPU session slots are taken`. Any other refusal fails at once, as before.
+
+`sv-gpu-server serve --slots N` refuses past N concurrent sessions with the
+guest's message. It reads the client's `AttachRequest` first, as `sv-hostd`
+does, so that the refusal does not race the client's write. This is how the
+fixed slots were measured here.
+
+| `scripts/sv-slot-release.sh` (one slot) | before | after |
+|---|---|---|
+| `vulkaninfo` exits; its session ends | 5156 ms later | 67 ms later |
+| a holder is SIGKILLed (no `atexit`); a second client asks at once | refused at once, no GPU | served after 5.3 s (`sv-icd: got a GPU session slot after 5.3s`) |
+| the holder stays; a second client asks | refused at once | refused after 10070 ms in total |
+
+| `sv-firefox-wayland.sh two-windows`, `SVWL_SLOTS=1`, 112 MiB | result |
+|---|---|
+| before | the guest's failure exactly: four `sv-icd: refusing to load rather than answering locally`, the browser with `libsv_icd.so` unmapped, `ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)`, no GPU-side submission after `glxtest` |
+| after, 3 runs | the browser connected at the first attempt (`glxtest`'s slot was already back); submissions in every window, a clean quit |
+
+Locally Firefox 157 opens two sessions at start (`glxtest`, then the browser),
+with or without the deployed Vulkan-decode prefs (`SVWL_VULKAN_DECODE=1`). The
+guest's 11-command session is not reproduced here. If it belongs to a process
+that stays alive, two slots leave nothing for a third (a video decoder, or a
+restart that overlaps), and that process waits 10 s and then runs without the
+GPU.
+
+**The 69 MiB alternative.** Three slots of 16 + 69 MiB fill 255 of the 256 MiB.
+Four 300 s two-window runs at a 69 MiB arena passed with no allocation failure.
+The application's share is 60.4 MiB against the 53 MiB high water of 95.2, so
+88 %, against 95 % at 64 MiB, where one run in two failed. That is less margin
+than four runs can prove.
+
 ## 96. Minecraft: a pointer that holds still, a window that follows, and three forwarder gaps a game found
 
 Branch `minecraft`, from master `59a6e8e` with `ab009e9` (§94) merged in,
