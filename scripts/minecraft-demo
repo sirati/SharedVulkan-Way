@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Minecraft 1.21.11 in Mojang's demo mode, started exactly as Prism Launcher
+# started it (waycompose-design.md §96, docs/minecraft.md).
+#
+#   minecraft-demo stock       OpenGL, which on this host is Zink on the guest's GPU
+#   minecraft-demo vulkanmod   Fabric with VulkanMod: Vulkan on the guest's GPU
+#
+# `capture/<variant>` is the launch Prism made on the workstation -- argv, the
+# library path of Prism's own wrapper, and the launch script Prism writes to
+# the game's stdin, with `--demo` and an access token of 0 -- with its data
+# directory moved here. `wc-session` puts the session's Wayland display, sound
+# and GPU environment in front of this; nothing here chooses a GPU.
+set -u
+V=${1:-stock}
+case "$V" in stock|vulkanmod) ;; *) echo "minecraft-demo: stock or vulkanmod, not $V" >&2; exit 2 ;; esac
+H=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+C="$H/capture/$V"
+G=$(cat "$C/cwd")
+[ -d "$G" ] || { echo "minecraft-demo: no game directory $G" >&2; exit 1; }
+mapfile -t ARGV <"$C/argv"
+# The heap for this host: the VM has most of its 15 GiB, so the game gets 1 GiB
+# rather than the 3 GiB the workstation's launch asked for.
+for i in "${!ARGV[@]}"; do
+  case "${ARGV[$i]}" in
+    -Xmx*) ARGV[$i]="-Xmx${MINECRAFT_HEAP:-1024m}" ;;
+    -Xms*) ARGV[$i]=-Xms256m ;;
+  esac
+done
+# Straight into the demo world when it exists (Prism's "quick play").
+QP=()
+[ -d "$G/saves/Demo_World" ] && QP=(--quickPlaySingleplayer Demo_World)
+LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$C/env")
+cd "$G" || exit 1
+exec env LD_LIBRARY_PATH="$LDP" __GLX_VENDOR_LIBRARY_NAME=mesa "${ARGV[@]}" \
+  < <(grep -v '^launch$' "$C/stdin"; for a in "${QP[@]}"; do echo "param $a"; done; echo launch)
