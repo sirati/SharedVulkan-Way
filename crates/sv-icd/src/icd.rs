@@ -834,8 +834,58 @@ impl Icd for SharedVulkan {
         // bug"), and §5.3 makes the resulting `VkDeviceMemory` a sub-range of a
         // slab the GPU side has already imported. There is nothing to ask for.
         let allocation = if advertise::is_arena_backed(type_index) {
+            // A leased arena (waycompose-design.md §97) may have to ask the GPU
+            // side for room first: a chunk for a small allocation, a lease of
+            // its own for a large one. The state lock is dropped across that
+            // round trip; two threads that both needed a lease at once simply
+            // leave a spare chunk.
+            let mut asked = 0;
+            loop {
             match s.allocator.alloc(info.allocation_size) {
-                Ok(a) => Some(a),
+                Ok(a) => break Some(a),
+                Err(crate::arena::ArenaError::NeedLease { len, dedicated }) if asked < 2 => {
+                    asked += 1;
+                    drop(s);
+                    let purpose = if dedicated { p::sv::LEASE_DEDICATED } else { p::sv::LEASE_CHUNK };
+                    let got = match self.ring_transport() {
+                        Some(t) => t.lease_arena(len, purpose),
+                        None => Err(LowerError::Shape("a leased arena with no transport")),
+                    };
+                    s = self.state();
+                    match got {
+                        Ok((off, l, _)) => {
+                            if s.allocator.add_lease(off, l, dedicated).is_err() {
+                                drop(s);
+                                if let Some(t) = self.ring_transport() {
+                                    let _ = t.release_arena(off);
+                                }
+                                s = self.state();
+                            }
+                        }
+                        Err(e) => {
+                            // The pool's refusal: the one place this ICD can say
+                            // whose memory ran out. The GPU side's log has the
+                            // pool's whole state at the same moment.
+                            crate::state::say_once(
+                                &crate::state::ARENA_EXHAUSTED_SAID,
+                                &format_args!(
+                                    "vkAllocateMemory: the GPU side's pool refused a {} KiB lease for a \
+                                     {}-byte allocation ({e:?}); {}; returning \
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY",
+                                    len >> 10,
+                                    info.allocation_size,
+                                    s.arena_use()
+                                ),
+                            );
+                            return Ok(p::VkAllocateMemoryReply {
+                                result: p::VkResult(
+                                    sv_icd_entry::VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY.0,
+                                ),
+                                p_memory: None,
+                            });
+                        }
+                    }
+                }
                 Err(_) => {
                     // R11: the arena is a fixed pre-negotiated window, and
                     // exhaustion is a normal condition an application handles.
@@ -859,13 +909,17 @@ impl Icd for SharedVulkan {
                     });
                 }
             }
+            }
         } else {
             // Heap 0 is `DEVICE_LOCAL` and never mapped, so it *is* a GPU-side
             // allocation and it does cross.
             None
         };
         let size = allocation.map(|a| a.size).unwrap_or(info.allocation_size);
-        let slab_geometry = allocation.map(|a| (a.slab, s.allocator.slab_size()));
+        // A lease is imported when it is granted; only a fixed arena's slabs
+        // are imported on first use.
+        let slab_geometry =
+            allocation.filter(|_| !s.allocator.leased()).map(|a| (a.slab, s.allocator.slab_size()));
         s.memories.insert(
             id,
             Memory { memory_type_index: type_index, allocation, size, mapped: false },
@@ -954,14 +1008,29 @@ impl Icd for SharedVulkan {
             _ => Ok(()),
         };
         let mut s = self.state();
+        let mut back = None;
         if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
             // docs/design.md §5.5 defers this until the timelines an
             // allocation could be referenced by have passed. The timeline
             // mirror is not wired to submissions yet, so this is still
             // immediate — the honest gap, and the one
-            // `ArenaAllocator::free_deferred` is waiting for.
-            let _ = s.allocator.free_now(a);
+            // `ArenaAllocator::free_deferred` is waiting for. Vulkan makes it
+            // safe meanwhile: memory may be freed only once no submitted work
+            // uses it (VUID-vkFreeMemory-memory-00677).
+            back = s.allocator.free_now(a).ok().flatten();
             s.note_arena_use();
+        }
+        drop(s);
+        // A lease this free emptied goes back to the pool at once, where the
+        // next allocation of any session can have it (waycompose-design.md
+        // §97).
+        if let (Some((lease, _)), Some(t)) = (back, self.ring_transport())
+            && let Err(e) = t.release_arena(lease)
+        {
+            crate::state::say_once(
+                &crate::state::SLAB_IMPORT_SAID,
+                &format_args!("vkFreeMemory: the GPU side did not take back the lease at {lease:#x}: {e:?}"),
+            );
         }
         forwarded
     }
@@ -2075,7 +2144,7 @@ fn buffer_requirements(r: &mut p::VkMemoryRequirements) {
 }
 
 fn memory_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceMemoryProperties {
-    let c = advertise::memory_properties(icd.arena_len);
+    let c = advertise::memory_properties(icd.heap_len());
     let mut w = p::VkPhysicalDeviceMemoryProperties::default();
     w.memory_type_count = c.memory_type_count;
     for i in 0..c.memory_type_count as usize {
