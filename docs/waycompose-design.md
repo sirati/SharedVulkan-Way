@@ -28851,7 +28851,7 @@ after 06:38 ran without input.
 Nothing is deployed to `wcivs`. The fixes are proven under Wine and, for the
 clipboard's basic paths, on the guest. The menu and the real-program checks
 need an unlocked session. The test install `wcclip` holds this branch's
-build (the second deploy, before the master merge). The way to deploy, once
+build with master merged (the third deploy, 13 passed). The way to deploy, once
 the guest checks below pass, is §91.10's: back up to `wcivs-backup-93`, then
 run `wc-launch.sh deploy` from the merged branch with §88.6's variables, and
 expect 13 passed.
@@ -28860,9 +28860,13 @@ To run on the guest once <guest-user>'s session is unlocked, through the lease,
 with the session-1 agent and no Win-key chords:
 1. Hamburger → Help and Report → About Firefox; Bookmarks → a folder → an
    item; a `<select>`. The question is whether real Windows activates a
-   clicked `WS_EX_NOACTIVATE` popup as Wine does. The fix covers both cases.
-2. Copy in a fresh Notepad window on a scratch file, a Word document opened
-   through COM, and the Run box; paste into each from Firefox.
+   clicked `WS_EX_NOACTIVATE` popup as Wine does. The fix covers both cases;
+   the same clicks with an `sv-guest.exe` built from master's compositor
+   (`/tmp/cs/sv-guest-master-compositor.exe`) say whether the bug was this
+   one on the guest too.
+2. Copy in a fresh Notepad window on a scratch file and in a Word document
+   opened through COM, and paste into each from Firefox. The Run box is left
+   out: it opens only with Win+R, which no agent sends any more.
 3. Copy text in Windows, then double-click, then paste (the start-up
    announcement).
 4. The 6 MB copy, then a small one; "copy image" pasted into Paint or Word;
