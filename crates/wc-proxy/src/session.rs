@@ -1746,6 +1746,14 @@ impl Session {
                 if n > 0 {
                     out.buf.extend_from_slice(&buf[..n as usize]);
                     progressed = true;
+                    // Past the cap there is nothing this can still publish
+                    // (`fit_selection` leaves it out), so it stops reading:
+                    // the deadline now waits for a client that has gone
+                    // quiet, and one that never does must not grow this.
+                    if out.buf.len() > MAX_SELECTION_BYTES {
+                        out.done = true;
+                        break;
+                    }
                     continue;
                 }
                 if n == 0 {
