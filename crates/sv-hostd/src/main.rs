@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some("qemu") => return qemu_mode(&args),
         Some("qemu-serve") => return qemu_serve(&args),
         Some("ivshmem-serve") => return ivshmem_serve(&args),
+        Some("bell-hub") => return bell_hub_serve(&args),
         Some("broker") => return broker_serve(&args),
         Some("broker-request") => return broker_request(&args),
         _ => {
@@ -62,6 +63,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve --region <file> --cold <sock> --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n  \
+                 sv-hostd bell-hub --port <chardev sock>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -1112,4 +1114,48 @@ fn broker_request(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         last = l;
     }
     if last == "ok" { Ok(()) } else { Err(format!("the broker said: {last}").into()) }
+}
+
+/// `sv-hostd bell-hub` (waycompose-design.md §99): the doorbell ports, held
+/// by no session. Each `--port UPSTREAM=HUB` is QEMU's chardev socket for a
+/// virtio-serial port and the socket every session connects to instead. Runs
+/// until killed; a systemd user unit (`wc-bell-hub.service`) keeps it up.
+#[cfg(target_os = "linux")]
+fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("bell-hub runs as the user; refusing to run as root".into());
+    }
+    let mut hubs = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--port" {
+            continue;
+        }
+        let spec = args.get(i + 1).ok_or("--port wants UPSTREAM=HUB")?;
+        let (up, at) = spec.split_once('=').ok_or("--port wants UPSTREAM=HUB")?;
+        let name = std::path::Path::new(up)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "port".into());
+        let l = sv_hostd::bellhub::bind_private(std::path::Path::new(at))?;
+        eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
+        hubs.push(sv_hostd::bellhub::run(&name, up.into(), l)?);
+    }
+    if hubs.is_empty() {
+        return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+        for h in &hubs {
+            use std::sync::atomic::Ordering::Relaxed;
+            eprintln!(
+                "bell-hub: {} client(s); {} byte(s) down ({} dropped), {} up ({} dropped), {} upstream connect(s)",
+                h.client_count(),
+                h.stats.down.load(Relaxed),
+                h.stats.down_dropped.load(Relaxed),
+                h.stats.up.load(Relaxed),
+                h.stats.up_dropped.load(Relaxed),
+                h.stats.upstream_connects.load(Relaxed)
+            );
+        }
+    }
 }
