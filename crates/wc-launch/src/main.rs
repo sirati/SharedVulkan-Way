@@ -185,6 +185,16 @@ fn main() -> ExitCode {
     if let Some(i) = args.iter().position(|a| a == "--write-firefox-profile") {
         return write_firefox_profile(&args[i + 1..]);
     }
+    // §94. `--render-app-files TITLEBAR DPI CAPTION OUTDIR [PREFS]`: what
+    // `wc-session` runs **on the VM host** for every launch, from the host's
+    // own definition of the application and the two numbers the guest sent.
+    // It writes OUTDIR/user.js, and for `tabs` OUTDIR/userChrome.css and
+    // OUTDIR/gtk.css, and prints `moz-env VALUE`. Until §94 these were
+    // rendered here on the guest and sent as text; a key that sends file
+    // contents is a key that writes a profile's preferences.
+    if let Some(i) = args.iter().position(|a| a == "--render-app-files") {
+        return render_app_files(&args[i + 1..]);
+    }
 
     // The session name is needed before the configuration can be read, because
     // the log the configuration's errors go into is named after it. It is the
@@ -268,6 +278,44 @@ fn write_firefox_profile(a: &[String]) -> ExitCode {
                 fit.reserve,
                 t.moz_env()
             );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("wc-launch: {}: {e}", dir.display());
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn render_app_files(a: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!("wc-launch: --render-app-files TITLEBAR DPI CAPTION OUTDIR [PREFS]");
+        ExitCode::from(2)
+    };
+    let (Some(t), Some(dpi), Some(cap), Some(dir)) = (a.first(), a.get(1), a.get(2), a.get(3)) else {
+        return usage();
+    };
+    let (Ok(dpi), Ok(cap)) = (dpi.parse::<u32>(), cap.parse::<u32>()) else {
+        return usage();
+    };
+    let f = match plan::host_files(t, dpi, cap, a.get(4).map(String::as_str).unwrap_or("")) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("wc-launch: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let dir = Path::new(dir);
+    let mut wrote = std::fs::write(dir.join("user.js"), &f.user_js);
+    for (name, body) in [("userChrome.css", &f.user_chrome), ("gtk.css", &f.gtk_css)] {
+        if let (Ok(()), Some(b)) = (&wrote, body) {
+            wrote = std::fs::write(dir.join(name), b);
+        }
+    }
+    match wrote {
+        Ok(()) => {
+            println!("moz-env {}", f.moz_env);
+            println!("fit {} {}", f.fit.height, f.fit.reserve);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1033,56 +1081,18 @@ mod win {
         req: crate::Request,
     ) -> Result<(), String> {
         let t = Instant::now();
-        // Six things cross, all base64'd because they go through
-        // `$SSH_ORIGINAL_COMMAND`: the command line, the profile directory the
-        // deployment's preferences belong in, those preferences already rendered
-        // as a `user.js`, the value of `MOZ_GTK_TITLEBAR_DECORATION`, and — §82
-        // — the `userChrome.css` that fits Firefox's tab strip to Windows'
-        // caption, and (§91.8) the GTK sheet that does the same for its dialogs'
-        // header bars. The rendering happens here rather than on the host because it
-        // is the part with a shape to get wrong, here it is tested, and here is
-        // the only place that knows this desktop's DPI.
-        //
-        // An empty word is sent as `-`, which is not in the base64 alphabet:
-        // `wc-session` splits `$SSH_ORIGINAL_COMMAND` on whitespace, so an
-        // empty argument would vanish and every later one would arrive one
-        // place early — which is what an `exec` without `--profile` did to the
-        // preferences before this.
-        let titlebar = plan::Titlebar::parse(&app.titlebar).unwrap_or(plan::Titlebar::Tabs);
-        let fit = titlebar_fit();
-        let chrome = plan::user_chrome_css(titlebar, fit).unwrap_or_default();
-        if titlebar == plan::Titlebar::Tabs {
-            log.say(&format!(
-                "titlebar: tabs, caption {} px and buttons {} px at this desktop's DPI",
-                fit.height, fit.reserve
-            ));
-        }
-        let word = |s: &str| if s.is_empty() { "-".to_string() } else { plan::b64(s.as_bytes()) };
-        let profile = plan::profile_dir(&app.exec).unwrap_or_default();
-        // §92. A task or a page names the desktop entry and the action or URL,
-        // and the executable the host should run it with; the host builds the
-        // argv from its own desktop entry. The last five words are the same
-        // as `run`'s, so a task that starts the application cold gives it this
-        // installation's profile, preferences, title bar and GTK sheet.
-        let program = app.exec.split_whitespace().next().unwrap_or_default();
-        let mut verb: Vec<String> = match req {
-            crate::Request::Run => vec!["run".into(), id.into(), word(&app.exec)],
-            crate::Request::Action(a) => {
-                vec!["action".into(), id.into(), app.desktop.clone(), a.into(), word(program)]
-            }
-            crate::Request::Open(u) => {
-                vec!["open".into(), id.into(), app.desktop.clone(), word(u), word(program)]
-            }
-        };
-        verb.extend([
-            word(&profile),
-            word(&plan::app_user_js(titlebar, &app.prefs)),
-            word(titlebar.moz_env()),
-            word(&chrome),
-            // §91.8: the GTK sheet, for the dialogs. A `wc-session` older
-            // than §91 ignores a seventh word of `run`.
-            word(&plan::gtk_css(titlebar, fit).unwrap_or_default()),
-        ]);
+        // §94. What crosses is the host's id for the application, the action
+        // or URL a jump-list entry names, and two numbers only this desktop
+        // can measure: its DPI and Windows' caption height at that DPI, from
+        // which the host sizes Firefox's tab strip and the GTK dialogs'
+        // header bars (§82, §91.8). The command line, the profile, the
+        // preferences and the title-bar arrangement are the host's, in
+        // `apps.ini` beside `wc-session`; until §94 they crossed from here,
+        // and a key that can send a command line can run anything
+        // (security-model.md R33).
+        let (dpi, caption) = desktop_metrics();
+        log.say(&format!("desktop: {dpi} dpi, caption {} px", caption.unwrap_or(0)));
+        let verb = plan::launch_verb(id, &app.host_app, req, dpi, caption);
         let words: Vec<&str> = verb.iter().map(String::as_str).collect();
         let said = ssh(cfg, p, &words)?;
         // A page's URL is the user's history and is not written to this log.
@@ -1095,7 +1105,8 @@ mod win {
         Ok(())
     }
 
-    /// Windows' caption at this desktop's DPI, for [`plan::TitlebarFit`].
+    /// This desktop's DPI and Windows' caption height at it, which the host
+    /// turns into a [`plan::TitlebarFit`] (§94).
     ///
     /// §82. The height is `AdjustWindowRectExForDpi`'s top inset for the
     /// compositor's own window style, which is the number the compositor folds
@@ -1108,7 +1119,7 @@ mod win {
     /// the desktop is set to, and this program declares no awareness in a
     /// manifest. Every entry point is resolved by name, so a Windows without
     /// them gets the 100% numbers rather than a launcher that will not start.
-    fn titlebar_fit() -> plan::TitlebarFit {
+    fn desktop_metrics() -> (u32, Option<i32>) {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         // `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`, an opaque pseudo-handle.
@@ -1119,7 +1130,7 @@ mod win {
         // SAFETY: a NUL-terminated name of a module every Win32 process has.
         let user32 = unsafe { LoadLibraryW(name.as_ptr()) };
         if user32.is_null() {
-            return plan::TitlebarFit::at(96, None);
+            return (96, None);
         }
         // SAFETY: ASCII NUL-terminated export names; each transmute is to the
         // documented signature of that export.
@@ -1143,7 +1154,7 @@ mod win {
                     f(&mut rc, STYLE, 0, 0, dpi);
                     -rc.top
                 });
-            plan::TitlebarFit::at(dpi, caption)
+            (dpi, caption)
         }
     }
 
@@ -1308,7 +1319,6 @@ mod win {
         let _ = std::fs::create_dir_all(&p.apps);
         let jump = p.jump.join(section);
         let _ = std::fs::create_dir_all(&jump);
-        let program = app.exec.split_whitespace().next().unwrap_or_default();
         let dark = crate::shell::taskbar_is_dark();
 
         // 1. What the host says about the application, kept for the next
@@ -1316,7 +1326,9 @@ mod win {
         let meta_path = p.apps.join(format!("{section}.meta"));
         if what == Refresh::Full {
             let theme = if dark { "dark" } else { "light" };
-            match ssh(cfg, p, &["app", &app.desktop, &plan::b64(program.as_bytes()), theme]) {
+            // §94: by the host's id; the host knows the desktop entry and the
+            // executable it belongs to.
+            match ssh(cfg, p, &["app", &app.host_app, theme]) {
                 Ok(out) => match appmeta::Meta::parse(&out) {
                     Ok(_) => {
                         let _ = std::fs::write(&meta_path, &out);
@@ -1358,15 +1370,14 @@ mod win {
         }
 
         // 3. The jump list. Pages only for an application whose Exec= takes a
-        //    URL and whose profile the launcher names; the host answers
-        //    `prefs none` otherwise.
+        //    URL; the host answers `prefs none` for one without a profile in
+        //    its definition (§94: the profile is the host's to name).
         let Some(meta) = meta else {
             log.say(&format!("pins: {aumid}: no desktop entry known yet, so no jump list"));
             return;
         };
-        let profile = plan::profile_dir(&app.exec).unwrap_or_default();
-        let (prefs, pages) = if meta.takes_url && !profile.is_empty() {
-            match ssh(cfg, p, &["frequent", &plan::b64(profile.as_bytes())]) {
+        let (prefs, pages) = if meta.takes_url {
+            match ssh(cfg, p, &["frequent", &app.host_app]) {
                 Ok(out) => appmeta::parse_frequent(&out),
                 Err(e) => {
                     // First line only: a failed reply can carry the pages after it.

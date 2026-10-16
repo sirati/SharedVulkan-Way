@@ -10,35 +10,48 @@
 # the command it asked for arrives in $SSH_ORIGINAL_COMMAND rather than as this
 # script's argv. That is the whole reason the key can live on a Windows guest
 # that anybody with the screen unlocked can read: it opens a Wayland session and
-# starts applications, and it is not a shell.
+# starts the applications this machine defines, and it is not a shell.
+#
+# §94: AND IT NAMES APPLICATIONS, IT DOES NOT SEND COMMANDS. Until §94 `run`
+# took a base64'd command line from the guest and ran it, so the key could run
+# any program here (security-model.md R33). Now every application is a section
+# of $APPS (`apps.ini` beside this script, written by the deploy step): its
+# executable, fixed arguments, profile, preferences, title bar, environment,
+# desktop entry and whether the forwarded GPU applies. The guest names a
+# section, and for a jump-list entry an action id or a URL; the only free
+# values it sends are the desktop's DPI and caption height, as numbers.
 #
 #   wc-session ping
 #   wc-session up   ID RUNID ivshmem          check the ivshmem arena's header against
 #                                             the run id the compositor printed. No
 #                                             root and no locate: the product path (§83).
 #   wc-session up   ID RUNID PAGES OUTBOUND [frames]
-#                                             locate the guest-RAM arena, write the
-#                                             plan. With `frames`, the arena's page
-#                                             frame list arrives on stdin and is
-#                                             translated instead of swept for.
+#                                             locate the guest-RAM arena, as root. Refused
+#                                             unless this host set WC_LAUNCH_GUEST_RAM=1 (§94)
 #   wc-session proxy ID                       start wc-proxy: as this user on an
 #                                             ivshmem session, as root on a guest-RAM one
-#   wc-session run  ID CMD PROFILE PREFS TITLEBAR [CHROME]
-#                                             run a Wayland client against that proxy;
-#                                             every word base64, `-` for an empty one
+#   wc-session run    ID APP DPI CAPTION      start the application APP of $APPS against
+#                                             that proxy (§94)
+#   wc-session action ID APP ACTION DPI CAPTION
+#                                             run one of APP's desktop-entry actions, by id (§92)
+#   wc-session open   ID APP B64URL DPI CAPTION
+#                                             open an http(s)/file URL in the slot its %u marks (§92)
 #   wc-session gpu  ID N                      serve the guest's GPU process's sessions to this
 #                                             session's ICDs, as this user, on ivshmem (§86, §87)
 #   wc-session audio ID                       the session's sound as raw PCM on stdout (§86)
-#   wc-session icon APPID                     the app's icon from this machine's theme
-#   wc-session app  APPID B64EXE THEME        the app's desktop entry: name, actions, task
+#   wc-session icon APP                       APP's icon from this machine's theme
+#   wc-session app  APP THEME                 APP's desktop entry: name, actions, task
 #                                             icons and icon, for the guest's pin and jump list (§92)
-#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
-#                                             run one of the desktop entry's actions, by id (§92)
-#   wc-session open ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
-#                                             open an http(s)/file URL in the slot its %u marks (§92)
-#   wc-session frequent B64PROFILE            the jump list's frequent pages and their favicons (§92)
+#   wc-session frequent APP                   the jump list's frequent pages of APP's profile (§92)
 #   wc-session down ID                        stop the proxy and remove the run directory
 #   wc-session status ID
+#   wc-session logs ID
+#
+# DPI is 48..960 and CAPTION 0..512 (0: not measured), decimal. Operator verbs,
+# from argv on this machine and refused from the guest:
+#
+#   wc-session apps                           check $APPS and print each definition
+#   wc-session resolve NAME                   where a program name resolves here
 #
 # THE ARENA IS NEVER A FILE ARENA, AND SINCE §83 THE PRODUCT PATH HAS NO ROOT
 #
@@ -55,7 +68,9 @@
 #     guest-RAM path (§34.2): a session that quietly became root again would be
 #     the regression §83 exists to remove.
 #   * GUEST RAM, the developer harnesses' path, kept as it was and described
-#     below. It needs root for the reason §12.9 gives.
+#     below. It needs root for the reason §12.9 gives, and since §94 it is
+#     refused unless this host sets WC_LAUNCH_GUEST_RAM=1: nothing of ours asks
+#     for it, and it was the one way from the guest's key to $ROOTC.
 #
 # THE GUEST-RAM ARENA
 #
@@ -103,22 +118,60 @@ VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
 GID_=$(id -g)
 
-# The forced command puts the request here. Fall back to argv so the script can
-# be driven by hand on this machine.
-if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
-  # shellcheck disable=SC2086
-  set -- $SSH_ORIGINAL_COMMAND
-fi
-VERB="${1:-}"; shift 2>/dev/null || true
+# §94. The application definitions. One section per application the guest may
+# start, written by `scripts/wc-launch.sh deploy`; see `load_app`.
+APPS="${WC_LAUNCH_APPS:-$BASE/apps.ini}"
 
 die() { echo "wc-session: $*" >&2; exit 1; }
 
-# An id is ours if it is [A-Za-z0-9_-]. It becomes a directory name and a
-# systemd unit name, and this is a script the guest can reach.
-check_id() {
-  case "$1" in
-    *[!A-Za-z0-9_-]*|"") die "bad id" ;;
+# THE REQUEST (§94). The forced command puts it in $SSH_ORIGINAL_COMMAND; argv
+# is how this script is driven by hand on this machine, and is never the
+# guest's: the forced command names this script with no arguments.
+#
+# The request is refused whole, before any verb sees it, unless it is at most
+# 16 KiB, at most 12 words, and made only of the characters some verb needs:
+# letters, digits, space and `+ / = . _ -` (ids, numbers, base64). No shell
+# metacharacter, quote, `*`, `?`, `[`, `~`, `$`, newline, control character or
+# non-ASCII byte gets as far as a verb. It is split with `read -a`, which does
+# no pathname expansion: `set -- $SSH_ORIGINAL_COMMAND`, which this was until
+# §94, globbed every word against this user's home directory. The list of
+# characters is spelled out rather than written as ranges, because a range in a
+# bracket expression follows the locale's collation and this list must not.
+GUEST=""
+if [ -n "${SSH_ORIGINAL_COMMAND+set}" ]; then
+  GUEST=1
+  [ "${#SSH_ORIGINAL_COMMAND}" -le 16384 ] || die "request longer than 16384 bytes"
+  case "$SSH_ORIGINAL_COMMAND" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\ +/=._-]*)
+      die "request with a character no verb takes (only letters, digits, space and + / = . _ -)" ;;
   esac
+  read -r -a REQ <<<"$SSH_ORIGINAL_COMMAND"
+  [ "${#REQ[@]}" -le 12 ] || die "request of more than 12 words"
+  set -- "${REQ[@]}"
+fi
+VERB="${1:-}"; shift 2>/dev/null || true
+
+# words MIN MAX USAGE "$@": the verb's word count, or a refusal that says the
+# verb's shape. Extra words are refused rather than ignored, so that a request
+# in an older shape -- `run` with a command line -- fails by name (§94).
+words() {
+  local min="$1" max="$2" usage="$3"; shift 3
+  [ "$#" -ge "$min" ] && [ "$#" -le "$max" ] || die "$VERB takes $usage"
+}
+
+# A session id: a letter or digit, then letters, digits, `_` and `-`, at most
+# 64. It becomes a directory name and a systemd unit name; the first character
+# keeps it out of every option position.
+check_id() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || die "bad id"
+}
+
+# check_metrics DPI CAPTION: the two numbers the guest measures (§94), decimal
+# without leading zeros, DPI 48..960 and CAPTION 0..512. The renderer checks the
+# ranges again (`plan::host_files`).
+check_metrics() {
+  [[ "${1:-}" =~ ^[1-9][0-9]{1,2}$ ]] && [ "$1" -ge 48 ] && [ "$1" -le 960 ] || die "bad dpi (48..960)"
+  [[ "${2:-}" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$2" -le 512 ] || die "bad caption height (0..512)"
 }
 
 dir_of() { echo "$RUNROOT/$1"; }
@@ -146,6 +199,12 @@ dir_of() { echo "$RUNROOT/$1"; }
 # Step 3 is a store search and it is deliberate: the alternative is a path in a
 # configuration file that a garbage collection silently invalidates, and the
 # symptom of that is a shortcut that does nothing.
+#
+# §94: **at deploy time, not when the guest asks.** Until §94 `run` resolved the
+# first word of the guest's command line with this, so the guest chose the
+# program. Now an application's `exec` in $APPS is an absolute path, the deploy
+# step resolves a name with the operator verb `resolve` and GC-roots a store
+# path it lands on, and this is left for the tools (`pulse_bin`) and for that.
 resolve_exec() {
   local want="$1"
   case "$want" in
@@ -212,51 +271,128 @@ app_dirs() {
   echo "${out#:}"
 }
 
-# An application id as the guest names it: the desktop id. wc-proxy checks it
-# again; this keeps a bad word out of every command line below.
+# An application id as the guest names it (§94): a section of $APPS. A letter or
+# digit first, then letters, digits, `.`, `_`, `-` and `+`, no `..`, at most 64;
+# `config::host_app_ok` on the guest is the same rule. A desktop id is checked
+# with it too (wc-proxy checks that one again).
 check_app() {
-  case "$1" in
-    .*|*..*|*[!A-Za-z0-9_.+-]*|"") die "bad app id" ;;
-  esac
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] && [[ "$1" != *..* ]] || die "bad app id"
 }
 
-# The profile word of `run`, `action` and `open`: `-`, or a directory under
-# ~/.wc-launch, base64'd. Echoes the directory or nothing.
-profile_of() {
-  local p
-  [ "${1:-}" = - ] && return 0
-  p=$(printf '%s' "${1:-}" | base64 -d 2>/dev/null) || die "bad profile"
-  case "$p" in
-    "") ;;
-    *..*|*[[:space:]]*) die "profile $p is not a plain directory under ~/.wc-launch" ;;
-    "$HOME"/.wc-launch/*) echo "$p" ;;
-    *) die "profile outside ~/.wc-launch" ;;
-  esac
-}
-
-# launch_desktop KIND ARG ID APPID B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+# ---------------------------------------------------- THE HOST'S APPLICATIONS ---
+# docs/waycompose-design.md §94. Everything that decides what runs on this
+# machine when the guest names an application, in one file this machine owns:
 #
-# `action` and `open`: ask wc-proxy for the argv the desktop entry gives KIND
-# and ARG (an action id, or a URL), check that the launcher's executable is the
-# entry's program, and hand the result to `run`. Nothing the guest sent becomes
-# a command: it named an id or a URL, wc-proxy built the argument list from
-# this machine's file, and `run` executes it as an array (security-model.md R33).
-launch_desktop() {
-  local KIND="$1" ARG="$2" ID="$3" APPID="$4" B64EXE="$5" B64PROFILE="$6" OUT PROG ARGS WANT RES PROFILE CMD
-  check_id "$ID"; check_app "$APPID"
-  [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
-  WANT=$(printf '%s' "$B64EXE" | base64 -d 2>/dev/null) || die "$KIND: bad base64"
-  case "$WANT" in ""|*[[:space:]]*) die "$KIND: bad executable" ;; esac
-  RES=$(resolve_exec "$WANT") || die "$KIND: cannot find $WANT on this machine"
-  OUT=$("$BIN/wc-proxy" desktop "$KIND" "$APPID" "$ARG" --dirs "$(app_dirs "$WANT")" 2>&1) \
-    || die "$KIND $APPID: $OUT"
-  PROG=$(sed -n 's/^program //p' <<<"$OUT"); ARGS=$(sed -n 's/^args //p' <<<"$OUT")
-  [ "$(basename "$RES")" = "$PROG" ] \
-    || die "$KIND: the launcher runs $(basename "$RES") and $APPID.desktop runs $PROG"
-  PROFILE=$(profile_of "$B64PROFILE") || exit 1
-  CMD="$RES${PROFILE:+ --profile $PROFILE}${ARGS:+ $ARGS}"
-  shift 6
-  exec env -u SSH_ORIGINAL_COMMAND bash "$0" run "$ID" "$(printf '%s' "$CMD" | base64 -w0)" "$B64PROFILE" "$@"
+#   [firefox]
+#   exec     = ~/wc-launch-ivs/bin/firefox-readback/bin/firefox
+#   args     =                        fixed arguments, split on whitespace
+#   profile  = ~/.wc-launch/firefox
+#                                     `--profile DIR` is added, and DIR is where
+#                                     user.js and userChrome.css are written
+#   prefs    = middlemouse.paste=false
+#                                     `[app.*] prefs` syntax, rendered into user.js
+#   titlebar = tabs                   tabs, none or client (§82)
+#   desktop  = firefox                the desktop entry: name, icon, actions (§92)
+#   gpu      = on                     whether gpu.env applies (§86); default on
+#   env      = NAME=value             repeatable, put in front of the application
+#
+# `exec` is an absolute path to an executable and is never resolved by name at
+# run time: the deploy step resolved it (`wc-session resolve`) and, for a store
+# path, rooted it. The readback Firefox (§86) is chosen by pointing `exec` at it;
+# its marker beside the browser still decides the decode preferences. A key this
+# parser does not know is refused, as `wc-launch.ini`'s parser refuses one,
+# because a typo here is a setting silently not applied.
+#
+# load_app APP sets DEF_EXEC, DEF_ARGS (array), DEF_PROFILE, DEF_PREFS,
+# DEF_TITLEBAR, DEF_DESKTOP, DEF_GPU and DEF_ENV (array), or dies.
+load_app() {
+  local want="$1" sec="" line k v found=""
+  check_app "$want"
+  DEF_EXEC=""; DEF_ARGS=(); DEF_PROFILE=""; DEF_PREFS=""; DEF_TITLEBAR=tabs
+  DEF_DESKTOP="$want"; DEF_GPU=on; DEF_ENV=()
+  [ -f "$APPS" ] || die "no applications are defined on this host ($APPS is missing; the deploy step writes it)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|'#'*|';'*) continue ;;
+      '['*']') sec="${line:1:${#line}-2}"; [ "$sec" = "$want" ] && found=1; continue ;;
+    esac
+    [ "$sec" = "$want" ] || continue
+    case "$line" in *=*) ;; *) die "$APPS [$want]: not key = value: $line" ;; esac
+    k="${line%%=*}"; k="${k%"${k##*[![:space:]]}"}"
+    v="${line#*=}"; v="${v#"${v%%[![:space:]]*}"}"
+    case "$k" in
+      exec) DEF_EXEC="$v" ;;
+      args) read -r -a DEF_ARGS <<<"$v" ;;
+      profile) DEF_PROFILE="$v" ;;
+      prefs) DEF_PREFS="$v" ;;
+      titlebar) DEF_TITLEBAR="$v" ;;
+      desktop) DEF_DESKTOP="$v" ;;
+      gpu) DEF_GPU="$v" ;;
+      env) DEF_ENV+=("$v") ;;
+      *) die "$APPS [$want]: no key $k" ;;
+    esac
+  done <"$APPS"
+  [ -n "$found" ] || die "no application $want on this host"
+  case "$DEF_EXEC" in
+    /*) ;;
+    *) die "$APPS [$want]: exec must be an absolute path" ;;
+  esac
+  [[ "$DEF_EXEC" != *[[:space:]]* ]] && [ -x "$DEF_EXEC" ] && [ ! -d "$DEF_EXEC" ] \
+    || die "$APPS [$want]: $DEF_EXEC is not an executable"
+  if [ -n "$DEF_PROFILE" ]; then
+    case "$DEF_PROFILE" in
+      "$HOME"/.wc-launch/*) ;;
+      *) die "$APPS [$want]: profile must be a directory under $HOME/.wc-launch" ;;
+    esac
+    [[ "${DEF_PROFILE#"$HOME"/.wc-launch/}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [[ "$DEF_PROFILE" != *..* ]] \
+      || die "$APPS [$want]: profile must be one plain directory name under $HOME/.wc-launch"
+  fi
+  case "$DEF_TITLEBAR" in tabs|none|server|client) ;; *) die "$APPS [$want]: titlebar is tabs, none or client" ;; esac
+  case "$DEF_GPU" in on|off) ;; *) die "$APPS [$want]: gpu is on or off" ;; esac
+  ( check_app "$DEF_DESKTOP" ) 2>/dev/null || die "$APPS [$want]: desktop $DEF_DESKTOP is not a desktop id"
+  local e
+  for e in "${DEF_ENV[@]}"; do
+    [[ "$e" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "$APPS [$want]: env is NAME=value, not $e"
+  done
+}
+
+# launch KIND ID APP ARG DPI CAPTION -- `run` (ARG empty), `action` (ARG an
+# action id) and `open` (ARG a URL), §94.
+#
+# The argv is built here, as an array, from $APPS and -- for an action or a URL
+# -- from the application's own desktop entry through `wc-proxy desktop`, which
+# refuses an action the entry does not list, a URL that is not http(s)/file,
+# and an argument that is not one word (security-model.md R33). Nothing the
+# guest sent is a program, an option or a path: APP is a section name, ARG is
+# an id or a URL that lands in the slot the entry's `%u` marks, and DPI and
+# CAPTION are numbers the renderer turns into style sheets.
+launch() {
+  local KIND="$1" ID="$2" APP="$3" ARG="$4" DPI="$5" CAPTION="$6"
+  check_id "$ID"; check_app "$APP"; check_metrics "$DPI" "$CAPTION"
+  D=$(dir_of "$ID")
+  [ -S "$D/wl-proxy" ] || die "no session $ID"
+  load_app "$APP"
+  EXE="$DEF_EXEC"
+  CMDV=("$EXE")
+  [ -n "$DEF_PROFILE" ] && CMDV+=(--profile "$DEF_PROFILE")
+  CMDV+=("${DEF_ARGS[@]}")
+  if [ "$KIND" != run ]; then
+    local OUT PROG ARGS EARGS
+    [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
+    # The options first: `wc-proxy desktop` reads none after its first word,
+    # so the id and the URL can only ever be words (§94).
+    OUT=$("$BIN/wc-proxy" desktop --dirs "$(app_dirs "$EXE")" "$KIND" "$DEF_DESKTOP" "$ARG" 2>&1) \
+      || die "$KIND $APP: $OUT"
+    PROG=$(sed -n 's/^program //p' <<<"$OUT"); ARGS=$(sed -n 's/^args //p' <<<"$OUT")
+    [ "$(basename "$EXE")" = "$PROG" ] \
+      || die "$KIND: $APP runs $(basename "$EXE") and $DEF_DESKTOP.desktop runs $PROG"
+    # One word per argument is wc-proxy's guarantee (`desktop::safe_arg`), and
+    # `read -a` does no pathname expansion: a URL's `?` and `[` stay characters.
+    read -r -a EARGS <<<"$ARGS"
+    CMDV+=("${EARGS[@]}")
+  fi
+  start_app "$ID" "$DPI" "$CAPTION"
 }
 # ------------------------------------------------------------------- AUDIO ---
 # docs/waycompose-design.md §86. Where Firefox's sound goes.
@@ -324,6 +460,276 @@ audio_up() {
   fi
 }
 
+# --------------------------------------------------------------- start_app ---
+# start_app ID DPI CAPTION: one Wayland client, against the session's proxy,
+# with the argv `launch` built in CMDV from the definition `load_app` read
+# (§94). D is the session's directory and EXE the application's executable.
+#
+# The environment is §17.7's, minus the root: `env -u DISPLAY` because with an X
+# server reachable MOZ_ENABLE_WAYLAND is a *preference* and Firefox will quietly
+# use X11 instead, and an absolute WAYLAND_DISPLAY because the socket and the
+# runtime directory are separate here (libwayland takes a leading '/' as a path).
+# DBUS is passed so that a second launch reaches the first one's instance
+# instead of colliding on its profile lock -- which is what a second click on a
+# Windows application does too.
+start_app() {
+  local ID="$1" DPI="$2" CAPTION="$3" R RO TITLEBAR PROFILE="$DEF_PROFILE"
+  # An application's data directory, created on demand -- and *only* under this
+  # launcher's own tree (`load_app` refuses any other).
+  #
+  # It is here because the first run of the shortcut produced a window in 680 ms
+  # and the window said **"Your Firefox profile cannot be loaded"**: `--profile`
+  # names a directory Firefox will not create, and a modal dialog is a mapped
+  # toplevel like any other. Every number in that run was real and measured the
+  # wrong window, which is why §28 has a photograph next to every one of them.
+  [ -n "$PROFILE" ] && mkdir -p "$PROFILE" 2>/dev/null
+
+  # WHAT THE DEFINITION RENDERS TO (§94): user.js from `prefs` and `titlebar`,
+  # and for `tabs` the userChrome.css and the GTK sheet sized from the guest's
+  # DPI and caption height. By `wc-launch --render-app-files`, which is the
+  # launcher's own tested renderer (`plan::host_files`) built for this machine:
+  # until §94 the guest rendered these and sent them as text, and a key that
+  # sends a user.js is a key that sets any preference of the profile.
+  [ -x "$BIN/wc-launch" ] || die "no $BIN/wc-launch (the profile renderer, §94; the deploy step copies it)"
+  R=$(mktemp -d "$D/render-XXXXXX") || die "mktemp in $D"
+  RO=$("$BIN/wc-launch" --render-app-files "$DEF_TITLEBAR" "$DPI" "$CAPTION" "$R" "$DEF_PREFS" 2>&1) \
+    || { rm -rf "$R"; die "render: $RO"; }
+  TITLEBAR=$(sed -n 's/^moz-env //p' <<<"$RO")
+
+  # THE PREFERENCES THE DEPLOYMENT SETS, RE-APPLIED ON EVERY START.
+  #
+  # `user.js` rather than a one-off edit of `prefs.js`, because "the deployment
+  # says so" has to survive the user changing it in the UI and the application
+  # writing its settings back out. The file is rendered by `wc_launch::plan::
+  # user_js`, where it is tested; nothing here parses it.
+  #
+  # The one that made this necessary is `middlemouse.paste=false`: on Linux a
+  # middle click pastes the primary selection, and this window is on a Windows
+  # desktop where a middle click does not — which is a difference between the two
+  # sides that no protocol expresses and only the deployment can settle.
+  #
+  # Written **only** under this launcher's own tree, so a profile somewhere else
+  # is never touched.
+
+  # THE FORWARDED GPU, IF THIS HOST HAS ONE. shared_vulkan's docs/design.md §0.28.
+  #
+  # `$BASE/gpu.env` is this host's statement that the guest's GPU is reachable
+  # through sv-icd: `NAME=value` lines, put in front of the application exactly
+  # as written (no shell ever sees them). Typically the five that make Mesa run
+  # Zink on the forwarded device and present it to a `wl_shm`-only proxy:
+  #
+  #   MESA_LOADER_DRIVER_OVERRIDE=zink
+  #   LIBGL_KOPPER_DRI2=1
+  #   __EGL_VENDOR_LIBRARY_FILENAMES=<mesa-kopper-wayland>/share/glvnd/egl_vendor.d/50_mesa.json
+  #   VK_DRIVER_FILES=<dir>/sv_icd.json
+  #   SV_SOCKET=<the GPU side's socket>
+  #
+  # It is a file here and not a word from the guest because only this machine
+  # knows whether those paths exist; a guest that asked for acceleration from a
+  # host without it would get a Firefox that cannot start its renderer.
+  #
+  # **And the profile gets `gfx.webrender.all` with it, never without it.**
+  # Firefox decides software or hardware WebRender from one fact: whether Mesa's
+  # EGL device says `EGL_MESA_device_software`. With no DRM node on this host
+  # Mesa has only its software device to give, so Firefox files Zink-on-a-GPU
+  # as `mesa/software-unknown` and blocklists hardware WebRender
+  # (FEATURE_FAILURE_SOFTWARE_GL). The pref overrides exactly that entry. Set
+  # without the GPU it would put hardware WebRender on llvmpipe, which is slower
+  # than the software WebRender Firefox would otherwise choose, so the two go
+  # together or not at all.
+  #
+  # §94: and only for an application whose definition does not say `gpu = off`.
+  GPUENV=()
+  if [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ''|'#'*) ;;
+        [A-Za-z_]*=*)
+          case "${line%%=*}" in *[!A-Za-z0-9_]*) die "gpu.env: bad name in: $line" ;; esac
+          GPUENV+=("$line") ;;
+        *) die "gpu.env: not NAME=value: $line" ;;
+      esac
+    done <"$BASE/gpu.env"
+  fi
+
+  # THE GPU IS PER SESSION, NOT PER HOST (§86). gpu.env says how to reach a
+  # forwarded GPU; whether *this* session has one is whether `gpu` made
+  # $D/icd.sock. Without it the GPU environment is not applied at all: forcing
+  # Zink with nothing behind it is a Firefox whose renderer cannot start, and
+  # software WebRender is what it should get instead. Said loudly.
+  GPU_ON=""
+  if [ ${#GPUENV[@]} -gt 0 ]; then
+    if [ -S "$D/icd.sock" ]; then
+      GPUENV+=("SV_SOCKET=$D/icd.sock")
+      # The doorbell (§87): every ICD shares the one port through the hub
+      # `gpu` started, if the port was there to hold.
+      [ -S "$D/bell.sock" ] && GPUENV+=("SV_BELL=$D/bell.sock")
+      GPU_ON=1
+    else
+      echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2
+      GPUENV=()
+    fi
+  fi
+  # HARDWARE VIDEO DECODE (§86, docs/video-decode.md §7.7): only a Firefox with
+  # the readback patch can decode on a forwarded GPU, and its package says so
+  # with a marker beside the browser. With it and a GPU, the decode prefs go
+  # into user.js and the RDD sandbox is lifted (it brokers connect() to the
+  # display sockets only, so the decoder could not reach the GPU side).
+  DECODE=""
+  if [ -n "$GPU_ON" ] && [ -e "$(dirname "$EXE")/../lib/firefox/.wc-vulkan-readback" ]; then
+    DECODE=1
+    GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
+  fi
+  # What `proxy` managed for this session's sound (§86). Read once, here.
+  AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
+  case "$AUDIO" in
+    pulse*) ;;
+    *)
+      # Loudly, in both places a person looks: the application's log on this
+      # machine and the launcher's log on the guest (it logs what `run` says).
+      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >>"$D/app.log"
+      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >&2
+      ;;
+  esac
+  case "$PROFILE" in
+    "$HOME"/.wc-launch/*)
+      cp "$R/user.js" "$PROFILE/user.js" 2>/dev/null
+      # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
+      # session can end with Firefox still running -- `down`, the guest logging
+      # off, the VM host's proxy going -- and Firefox counts a run that did not
+      # end cleanly as a startup crash; after three in a row it puts a modal
+      # dialog in front of the next start, in a window the user did not ask for
+      # and on a desktop where nobody may be able to answer it. -1 turns the
+      # count off. Every launcher profile, always: it is a property of how this
+      # deployment ends Firefox, not of any one session.
+      printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
+        >> "$PROFILE/user.js"
+      if [ ${#GPUENV[@]} -gt 0 ]; then
+        printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
+          >> "$PROFILE/user.js"
+      fi
+      if [ -n "$DECODE" ]; then
+        printf '\n// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU.\nuser_pref("media.hardware-video-decoding-vulkan.enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.force-enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);\n' \
+          >> "$PROFILE/user.js"
+      fi
+      # AUDIO (§86): no server means Firefox's own null context, never a
+      # Firefox that waits on an audio process for ever.
+      case "$AUDIO" in
+        pulse*) ;;
+        *)
+          printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
+            >> "$PROFILE/user.js"
+          ;;
+      esac
+      ;;
+  esac
+
+  # WHAT THE APPLICATION IS TOLD ABOUT ITS OWN TITLE BAR -- docs/waycompose-design.md §82.
+  #
+  # The value of MOZ_GTK_TITLEBAR_DECORATION, and a userChrome.css or none, both
+  # from the definition's `titlebar` (§94; until then the launcher sent them):
+  #
+  #   titlebar = tabs (the default)  ->  client, plus the userChrome.css. Firefox
+  #       asks the compositor for Client; the compositor's default `auto` folds
+  #       the caption of a window whose client asked for that, so Firefox's tab
+  #       strip is *inside* Windows' caption, and the sheet makes the strip the
+  #       caption's height and leaves the corner where Windows draws minimise,
+  #       maximise and close empty. user.js turns Firefox's own three buttons off.
+  #   titlebar = none (the opt-out)  ->  none, and no sheet. Windows' caption
+  #       above, the tab strip below: §22's arrangement.
+  #
+  # None of these is carried by any protocol -- they are facts about the machine
+  # the client runs on, and this is the program that starts it. A Firefox
+  # started some other way gets two title bars (no env) or a chevron under
+  # Windows' buttons (no sheet), and the compositor's log says which (`DRAWS
+  # UNDER THE CAPTION BUTTONS`). The sheet's size is the one thing the guest
+  # still decides, as the two numbers DPI and CAPTION.
+  case "$TITLEBAR" in
+    client|none) ;;
+    *) TITLEBAR=none ;;
+  esac
+  case "$PROFILE" in
+    "$HOME"/.wc-launch/*)
+      if [ -f "$R/userChrome.css" ]; then
+        mkdir -p "$PROFILE/chrome" 2>/dev/null
+        cp "$R/userChrome.css" "$PROFILE/chrome/userChrome.css"
+      elif head -c 40 "$PROFILE/chrome/userChrome.css" 2>/dev/null \
+             | grep -qF '/* wc-launch: tabs in the title bar.'; then
+        # Ours, from a previous `tabs` start: an application that opted out
+        # must not keep a tab strip sized for a caption it no longer has. A
+        # sheet without the mark is the user's and is left alone.
+        rm -f "$PROFILE/chrome/userChrome.css"
+      fi
+      ;;
+  esac
+  # THE GTK SHEET, FOR THE DIALOGS -- docs/waycompose-design.md §91.8.
+  #
+  # For `tabs` the renderer wrote a gtk.css that pads every GTK header bar's end
+  # by the width of Windows' caption buttons, because the compositor folds the caption
+  # of GTK's dialogs (the file chooser, Save As, Print) just as it does
+  # Firefox's main window, and without it the file chooser's Open button sat
+  # under Windows' close button. GTK reads gtk.css and settings.ini from
+  # $XDG_CONFIG_HOME/gtk-{3,4}.0 and nowhere else a launcher can reach, and the
+  # user's real ~/.config is not ours to write. So the application gets a
+  # session-private XDG_CONFIG_HOME that is an overlay of the real one: every
+  # entry of it is a symbolic link back to the user's, so user-dirs.dirs, the
+  # file chooser's bookmarks, dconf (the icon theme), fontconfig, mimeapps.list
+  # and ~/.config/mozilla behave as before -- measured: a bare private
+  # directory lost the sidebar's folders and the icon theme. Only gtk.css and
+  # settings.ini are replaced: gtk.css imports the user's own first, and
+  # settings.ini is the user's with gtk-decoration-layout set to none, so a GTK
+  # window with a header bar draws no second set of window buttons. A file an
+  # application creates at the top of the directory lands in the overlay and
+  # goes with the session; one written through a link lands in the user's.
+  GTKCSS=""
+  [ -f "$R/gtk.css" ] && GTKCSS=$(cat "$R/gtk.css")
+  rm -rf "$R"
+  CONFIG_ENV=()
+  if [ -n "$GTKCSS" ]; then
+    REAL="${XDG_CONFIG_HOME:-$HOME/.config}"
+    C="$D/xdg-config"
+    rm -rf "$C"; mkdir -p "$C"
+    for e in "$REAL"/* "$REAL"/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "${e##*/}" in gtk-3.0|gtk-4.0) ;; *) ln -s "$e" "$C/${e##*/}" ;; esac
+    done
+    for v in gtk-3.0 gtk-4.0; do
+      mkdir -p "$C/$v"
+      for e in "$REAL/$v"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in gtk.css|settings.ini) ;; *) ln -s "$e" "$C/$v/${e##*/}" ;; esac
+      done
+      {
+        [ -f "$REAL/$v/gtk.css" ] && printf '@import url("file://%s");\n' "$REAL/$v/gtk.css"
+        printf '%s\n' "$GTKCSS"
+      } > "$C/$v/gtk.css"
+      {
+        if [ -f "$REAL/$v/settings.ini" ]; then
+          grep -v '^[[:space:]]*gtk-decoration-layout[[:space:]]*=' "$REAL/$v/settings.ini"
+        else
+          echo '[Settings]'
+        fi
+        echo 'gtk-decoration-layout=:'
+      } > "$C/$v/settings.ini"
+    done
+    CONFIG_ENV=(XDG_CONFIG_HOME="$C")
+  fi
+  DBUS=""
+  [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  # shellcheck disable=SC2086
+  setsid env -u DISPLAY \
+    XDG_RUNTIME_DIR="$D/xdg" \
+    WAYLAND_DISPLAY="$D/wl-proxy" \
+    MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
+    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    "${CONFIG_ENV[@]}" \
+    "${GPUENV[@]}" \
+    "${DEF_ENV[@]}" \
+    "${CMDV[@]}" >>"$D/app.log" 2>&1 &
+  echo "run ok $! audio=${AUDIO%%[: ]*} titlebar=$DEF_TITLEBAR"
+}
+
+
 # §92. THE TWO VERBS WHOSE ANSWER IS WRITTEN IN PIECES ARE SENT IN ONE.
 #
 # Windows' own ssh.exe, with its standard output on a file (§28.6's
@@ -346,6 +752,7 @@ esac
 case "$VERB" in
 
 ping)
+  words 0 0 "no words" "$@"
   echo "wc-session ok $(hostname)"
   ;;
 
@@ -357,9 +764,14 @@ ping)
 # ~2.4 s for a 13 GiB guest (§12.5), and this is the cost the whole design is
 # arranged around: it is paid once per session here, not once per launch.
 up)
+  words 3 5 "ID RUNID ivshmem" "$@"
   ID="${1:-}"; RUNID="${2:-}"; PAGES="${3:-}"; OUTBOUND="${4:-1048576}"
   check_id "$ID"
-  case "$RUNID" in 0x*[!0-9a-fA-Fx]*|"") die "bad run id" ;; esac
+  # §94: `0x` and one to sixteen hex digits, on both paths. Until §94 this only
+  # refused a `0x` word with a non-hex digit in it, so a run id without the
+  # prefix -- `1;anything` -- passed, and the guest-RAM path below printed it
+  # into the script it pipes to $ROOTC with `%s`.
+  [[ "$RUNID" =~ ^0x[0-9a-fA-F]{1,16}$ ]] || die "bad run id"
   # IVSHMEM ARENA (§83). Nothing to locate: QEMU was told where the region is,
   # by a path, before the guest booted. What is left is to check that the
   # region *now* describes the compositor that asked -- magic, then run id --
@@ -368,7 +780,7 @@ up)
   # region; this check is here so that a wrong region fails at `up`, with the
   # reason, rather than as a proxy that never binds its socket.
   if [ "$PAGES" = ivshmem ]; then
-    case "$RUNID" in 0x*) ;; *) die "bad run id" ;; esac
+    [ "$#" -eq 3 ] || die "up ID RUNID ivshmem takes no more words"
     D=$(dir_of "$ID")
     rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
     [ -e "$ARENA" ] || die "no ivshmem arena at $ARENA: the VM has no wc-arena device (virtualisation.windowsVm.waycomposeArena), and there is no fallback to guest RAM"
@@ -416,7 +828,18 @@ up)
     echo "up ok $D"
     exit 0
   fi
-  case "$PAGES$OUTBOUND" in *[!0-9]*|"") die "bad page count" ;; esac
+  # THE GUEST-RAM PATH RUNS AS ROOT, AND SINCE §94 ONLY WHERE THIS HOST SAYS SO.
+  # Nothing of ours asks for it -- the launcher has been on ivshmem since §83
+  # and the developer harnesses locate their own arena -- and it is the one
+  # path by which this script's caller reaches $ROOTC. So it is refused unless
+  # the environment this script runs in sets WC_LAUNCH_GUEST_RAM=1, which the
+  # guest cannot do (sshd accepts no environment from it, and the forced
+  # command sets none): an operator who wants it writes it into the key's
+  # `command="WC_LAUNCH_GUEST_RAM=1 …/wc-session"` on purpose.
+  [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ] \
+    || die "the guest-RAM arena (as root) is not served on this host; the launcher's arena is ivshmem (§83, §94)"
+  [[ "$PAGES" =~ ^[1-9][0-9]{0,7}$ ]] && [[ "$OUTBOUND" =~ ^[0-9]{1,12}$ ]] || die "bad page count"
+  [ -z "${5:-}" ] || [ "$5" = frames ] || die "up: the fifth word is frames or nothing"
   D=$(dir_of "$ID")
   rm -rf "$D"; mkdir -p "$D/xdg"; chmod 700 "$D" "$D/xdg"
   [ -x "$BIN/wc-arena-host" ] || die "no $BIN/wc-arena-host"
@@ -449,7 +872,7 @@ up)
     fi
   fi
   # shellcheck disable=SC2086
-  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%s --qmp %q --vm %q --run %s --pages %s --outbound %s %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%q --qmp %q --vm %q --run %q --pages %q --outbound %q %s --plan %q >%q 2>&1\necho "rc=$?" >>%q\nchown %s:%s %q %q 2>/dev/null\ntrue\n' \
     "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$OUTBOUND" "$FRAMES_ARG" \
     "$D/arena.plan" "$D/locate.log" "$D/locate.log" \
     "$UID_" "$GID_" "$D/locate.log" "$D/arena.plan" \
@@ -503,6 +926,7 @@ up)
 # with the user's own warm profile starts in a second and a root one with a
 # fresh home does not.
 proxy)
+  words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   # IVSHMEM ARENA (§83): this user, a user unit, no $ROOTC. The socket is made
@@ -572,6 +996,8 @@ proxy)
     exit 0
   fi
   [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
+  # §94: the root unit only where `up` was allowed to write a plan.
+  [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ] || die "the guest-RAM proxy (as root) is not served on this host (§94)"
   [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
   [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
   UNIT="wc-launch-$ID"
@@ -605,301 +1031,24 @@ EOF
   echo "audio $(cat "$D/audio.state")"
   ;;
 
-# --------------------------------------------------------------------- run ---
-# One Wayland client, against the session's proxy. The command arrives base64'd
-# because it comes through $SSH_ORIGINAL_COMMAND and a quoting bug here would be
-# a shell injection rather than a wrong window.
-#
-# The environment is §17.7's, minus the root: `env -u DISPLAY` because with an X
-# server reachable MOZ_ENABLE_WAYLAND is a *preference* and Firefox will quietly
-# use X11 instead, and an absolute WAYLAND_DISPLAY because the socket and the
-# runtime directory are separate here (libwayland takes a leading '/' as a path).
-# DBUS is passed so that a second launch reaches the first one's instance
-# instead of colliding on its profile lock -- which is what a second click on a
-# Windows application does too.
-run)
-  ID="${1:-}"; check_id "$ID"; B64="${2:-}"
-  B64PROFILE="${3:-}"; B64PREFS="${4:-}"; B64TITLEBAR="${5:-}"
-  D=$(dir_of "$ID")
-  [ -S "$D/wl-proxy" ] || die "no session $ID"
-  CMD=$(printf '%s' "$B64" | base64 -d 2>/dev/null) || die "run: bad base64"
-  [ -n "$CMD" ] || die "run: empty command"
-  # The first word is the application; the rest is its own business.
-  WANT=${CMD%% *}; REST=${CMD#"$WANT"}
-  EXE=$(resolve_exec "$WANT") || die "run: cannot find $WANT on this machine"
-  CMD="$EXE$REST"
-  # §92. Split into an array once, on whitespace and **without globbing**: a URL
-  # from a jump list (`open`) carries `?`, `*` and `[` as ordinary characters,
-  # and an unquoted `$CMD` would have offered each of them to pathname expansion.
-  read -r -a CMDV <<<"$CMD"
-  # An application's data directory, created on demand -- and *only* under this
-  # launcher's own tree, so this can never be asked to make a directory
-  # somewhere else.
-  #
-  # It is here because the first run of the shortcut produced a window in 680 ms
-  # and the window said **"Your Firefox profile cannot be loaded"**: `--profile`
-  # names a directory Firefox will not create, and a modal dialog is a mapped
-  # toplevel like any other. Every number in that run was real and measured the
-  # wrong window, which is why §28 has a photograph next to every one of them.
-  for w in "${CMDV[@]:1}"; do
-    case "$w" in
-      "$HOME"/.wc-launch/*) mkdir -p "$w" 2>/dev/null ;;
-    esac
-  done
-
-  # THE PREFERENCES THE DEPLOYMENT SETS, RE-APPLIED ON EVERY START.
-  #
-  # `user.js` rather than a one-off edit of `prefs.js`, because "the deployment
-  # says so" has to survive the user changing it in the UI and the application
-  # writing its settings back out. The file is rendered by `wc_launch::plan::
-  # user_js` on the guest, where it is tested; nothing here parses it.
-  #
-  # The one that made this necessary is `middlemouse.paste=false`: on Linux a
-  # middle click pastes the primary selection, and this window is on a Windows
-  # desktop where a middle click does not — which is a difference between the two
-  # sides that no protocol expresses and only the deployment can settle.
-  #
-  # Written **only** under this launcher's own tree, so a profile somewhere else
-  # is never touched.
-  PROFILE=$( [ "$B64PROFILE" = - ] || printf '%s' "$B64PROFILE" | base64 -d 2>/dev/null)
-
-  # THE FORWARDED GPU, IF THIS HOST HAS ONE. shared_vulkan's docs/design.md §0.28.
-  #
-  # `$BASE/gpu.env` is this host's statement that the guest's GPU is reachable
-  # through sv-icd: `NAME=value` lines, put in front of the application exactly
-  # as written (no shell ever sees them). Typically the five that make Mesa run
-  # Zink on the forwarded device and present it to a `wl_shm`-only proxy:
-  #
-  #   MESA_LOADER_DRIVER_OVERRIDE=zink
-  #   LIBGL_KOPPER_DRI2=1
-  #   __EGL_VENDOR_LIBRARY_FILENAMES=<mesa-kopper-wayland>/share/glvnd/egl_vendor.d/50_mesa.json
-  #   VK_DRIVER_FILES=<dir>/sv_icd.json
-  #   SV_SOCKET=<the GPU side's socket>
-  #
-  # It is a file here and not a word from the guest because only this machine
-  # knows whether those paths exist; a guest that asked for acceleration from a
-  # host without it would get a Firefox that cannot start its renderer.
-  #
-  # **And the profile gets `gfx.webrender.all` with it, never without it.**
-  # Firefox decides software or hardware WebRender from one fact: whether Mesa's
-  # EGL device says `EGL_MESA_device_software`. With no DRM node on this host
-  # Mesa has only its software device to give, so Firefox files Zink-on-a-GPU
-  # as `mesa/software-unknown` and blocklists hardware WebRender
-  # (FEATURE_FAILURE_SOFTWARE_GL). The pref overrides exactly that entry. Set
-  # without the GPU it would put hardware WebRender on llvmpipe, which is slower
-  # than the software WebRender Firefox would otherwise choose, so the two go
-  # together or not at all.
-  GPUENV=()
-  if [ -f "$BASE/gpu.env" ]; then
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in
-        ''|'#'*) ;;
-        [A-Za-z_]*=*)
-          case "${line%%=*}" in *[!A-Za-z0-9_]*) die "gpu.env: bad name in: $line" ;; esac
-          GPUENV+=("$line") ;;
-        *) die "gpu.env: not NAME=value: $line" ;;
-      esac
-    done <"$BASE/gpu.env"
-  fi
-
-  # THE GPU IS PER SESSION, NOT PER HOST (§86). gpu.env says how to reach a
-  # forwarded GPU; whether *this* session has one is whether `gpu` made
-  # $D/icd.sock. Without it the GPU environment is not applied at all: forcing
-  # Zink with nothing behind it is a Firefox whose renderer cannot start, and
-  # software WebRender is what it should get instead. Said loudly.
-  GPU_ON=""
-  if [ ${#GPUENV[@]} -gt 0 ]; then
-    if [ -S "$D/icd.sock" ]; then
-      GPUENV+=("SV_SOCKET=$D/icd.sock")
-      # The doorbell (§87): every ICD shares the one port through the hub
-      # `gpu` started, if the port was there to hold.
-      [ -S "$D/bell.sock" ] && GPUENV+=("SV_BELL=$D/bell.sock")
-      GPU_ON=1
-    else
-      echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2
-      GPUENV=()
-    fi
-  fi
-  # HARDWARE VIDEO DECODE (§86, docs/video-decode.md §7.7): only a Firefox with
-  # the readback patch can decode on a forwarded GPU, and its package says so
-  # with a marker beside the browser. With it and a GPU, the decode prefs go
-  # into user.js and the RDD sandbox is lifted (it brokers connect() to the
-  # display sockets only, so the decoder could not reach the GPU side).
-  DECODE=""
-  if [ -n "$GPU_ON" ] && [ -e "$(dirname "$EXE")/../lib/firefox/.wc-vulkan-readback" ]; then
-    DECODE=1
-    GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
-  fi
-  # What `proxy` managed for this session's sound (§86). Read once, here.
-  AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
-  case "$AUDIO" in
-    pulse*) ;;
-    *)
-      # Loudly, in both places a person looks: the application's log on this
-      # machine and the launcher's log on the guest (it logs what `run` says).
-      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >>"$D/app.log"
-      echo "wc-session: NO AUDIO for $ID -- $AUDIO; Firefox gets media.cubeb.force_null_context" >&2
-      ;;
-  esac
-  case "$PROFILE" in
-    "$HOME"/.wc-launch/*)
-      mkdir -p "$PROFILE" 2>/dev/null
-      printf '%s' "$B64PREFS" | base64 -d > "$PROFILE/user.js" 2>/dev/null
-      # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
-      # session can end with Firefox still running -- `down`, the guest logging
-      # off, the VM host's proxy going -- and Firefox counts a run that did not
-      # end cleanly as a startup crash; after three in a row it puts a modal
-      # dialog in front of the next start, in a window the user did not ask for
-      # and on a desktop where nobody may be able to answer it. -1 turns the
-      # count off. Every launcher profile, always: it is a property of how this
-      # deployment ends Firefox, not of any one session.
-      printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
-        >> "$PROFILE/user.js"
-      if [ ${#GPUENV[@]} -gt 0 ]; then
-        printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
-          >> "$PROFILE/user.js"
-      fi
-      if [ -n "$DECODE" ]; then
-        printf '\n// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU.\nuser_pref("media.hardware-video-decoding-vulkan.enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.force-enabled", true);\nuser_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);\n' \
-          >> "$PROFILE/user.js"
-      fi
-      # AUDIO (§86): no server means Firefox's own null context, never a
-      # Firefox that waits on an audio process for ever.
-      case "$AUDIO" in
-        pulse*) ;;
-        *)
-          printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
-            >> "$PROFILE/user.js"
-          ;;
-      esac
-      ;;
-  esac
-
-  # WHAT THE APPLICATION IS TOLD ABOUT ITS OWN TITLE BAR -- docs/waycompose-design.md §82.
-  #
-  # Two words from the launcher: the value of MOZ_GTK_TITLEBAR_DECORATION, and a
-  # userChrome.css (or `-`, meaning none). The launcher renders both, because it
-  # is where they are tested and the only side that knows the desktop's DPI.
-  #
-  #   titlebar = tabs (the default)  ->  client, plus the userChrome.css. Firefox
-  #       asks the compositor for Client; the compositor's default `auto` folds
-  #       the caption of a window whose client asked for that, so Firefox's tab
-  #       strip is *inside* Windows' caption, and the sheet makes the strip the
-  #       caption's height and leaves the corner where Windows draws minimise,
-  #       maximise and close empty. user.js turns Firefox's own three buttons off.
-  #   titlebar = none (the opt-out)  ->  none, and no sheet. Windows' caption
-  #       above, the tab strip below: §22's arrangement.
-  #
-  # Until §82 this said the frame-extending compositor "does not exist yet" and
-  # sent `none` unconditionally; §31 built it months before. None of these is
-  # carried by any protocol -- they are facts about the machine the client runs
-  # on, and this is the program that starts it. A Firefox started some other way
-  # gets two title bars (no env) or a chevron under Windows' buttons (no sheet),
-  # and the compositor's log now says which (`DRAWS UNDER THE CAPTION BUTTONS`).
-  #
-  # `-` is how the launcher spells an empty word: this script's arguments arrive
-  # split on whitespace from $SSH_ORIGINAL_COMMAND, where an empty one vanishes.
-  # An older launcher sends five words and no sheet, which is `none` as before.
-  unb64() { [ "${1:-}" = - ] || printf '%s' "${1:-}" | base64 -d 2>/dev/null; }
-  TITLEBAR=$(unb64 "$B64TITLEBAR")
-  case "$TITLEBAR" in
-    client|none) ;;
-    *) TITLEBAR=none ;;
-  esac
-  case "$PROFILE" in
-    "$HOME"/.wc-launch/*)
-      CHROME=$(unb64 "${6:-}")
-      if [ -n "$CHROME" ]; then
-        mkdir -p "$PROFILE/chrome" 2>/dev/null
-        printf '%s\n' "$CHROME" > "$PROFILE/chrome/userChrome.css"
-      elif head -c 40 "$PROFILE/chrome/userChrome.css" 2>/dev/null \
-             | grep -qF '/* wc-launch: tabs in the title bar.'; then
-        # Ours, from a previous `tabs` start: an application that opted out
-        # must not keep a tab strip sized for a caption it no longer has. A
-        # sheet without the mark is the user's and is left alone.
-        rm -f "$PROFILE/chrome/userChrome.css"
-      fi
-      ;;
-  esac
-  # THE GTK SHEET, FOR THE DIALOGS -- docs/waycompose-design.md §91.8.
-  #
-  # The seventh word is a gtk.css that pads every GTK header bar's end by the
-  # width of Windows' caption buttons, because the compositor folds the caption
-  # of GTK's dialogs (the file chooser, Save As, Print) just as it does
-  # Firefox's main window, and without it the file chooser's Open button sat
-  # under Windows' close button. GTK reads gtk.css and settings.ini from
-  # $XDG_CONFIG_HOME/gtk-{3,4}.0 and nowhere else a launcher can reach, and the
-  # user's real ~/.config is not ours to write. So the application gets a
-  # session-private XDG_CONFIG_HOME that is an overlay of the real one: every
-  # entry of it is a symbolic link back to the user's, so user-dirs.dirs, the
-  # file chooser's bookmarks, dconf (the icon theme), fontconfig, mimeapps.list
-  # and ~/.config/mozilla behave as before -- measured: a bare private
-  # directory lost the sidebar's folders and the icon theme. Only gtk.css and
-  # settings.ini are replaced: gtk.css imports the user's own first, and
-  # settings.ini is the user's with gtk-decoration-layout set to none, so a GTK
-  # window with a header bar draws no second set of window buttons. A file an
-  # application creates at the top of the directory lands in the overlay and
-  # goes with the session; one written through a link lands in the user's.
-  GTKCSS=$(unb64 "${7:-}")
-  CONFIG_ENV=()
-  if [ -n "$GTKCSS" ]; then
-    REAL="${XDG_CONFIG_HOME:-$HOME/.config}"
-    C="$D/xdg-config"
-    rm -rf "$C"; mkdir -p "$C"
-    for e in "$REAL"/* "$REAL"/.[!.]*; do
-      [ -e "$e" ] || [ -L "$e" ] || continue
-      case "${e##*/}" in gtk-3.0|gtk-4.0) ;; *) ln -s "$e" "$C/${e##*/}" ;; esac
-    done
-    for v in gtk-3.0 gtk-4.0; do
-      mkdir -p "$C/$v"
-      for e in "$REAL/$v"/*; do
-        [ -e "$e" ] || [ -L "$e" ] || continue
-        case "${e##*/}" in gtk.css|settings.ini) ;; *) ln -s "$e" "$C/$v/${e##*/}" ;; esac
-      done
-      {
-        [ -f "$REAL/$v/gtk.css" ] && printf '@import url("file://%s");\n' "$REAL/$v/gtk.css"
-        printf '%s\n' "$GTKCSS"
-      } > "$C/$v/gtk.css"
-      {
-        if [ -f "$REAL/$v/settings.ini" ]; then
-          grep -v '^[[:space:]]*gtk-decoration-layout[[:space:]]*=' "$REAL/$v/settings.ini"
-        else
-          echo '[Settings]'
-        fi
-        echo 'gtk-decoration-layout=:'
-      } > "$C/$v/settings.ini"
-    done
-    CONFIG_ENV=(XDG_CONFIG_HOME="$C")
-  fi
-  DBUS=""
-  [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
-  # shellcheck disable=SC2086
-  setsid env -u DISPLAY \
-    XDG_RUNTIME_DIR="$D/xdg" \
-    WAYLAND_DISPLAY="$D/wl-proxy" \
-    MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
-    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
-    "${CONFIG_ENV[@]}" \
-    "${GPUENV[@]}" \
-    "${CMDV[@]}" >>"$D/app.log" 2>&1 &
-  echo "run ok $! audio=${AUDIO%%[: ]*}"
-  ;;
-
 # --------------------------------------------------------------------- app ---
 # docs/waycompose-design.md §92. Everything the guest needs to build the
 # application's Start menu entry, its pinned button's name and icon, and its
 # jump list's tasks: `wc-proxy desktop info` (name, actions, localised names),
 # one icon per Firefox task, and the application's icon as `icon` prints it.
 #
-#   wc-session app APPID B64EXE THEME      THEME is light or dark: the colour the
-#                                          task glyphs are drawn in
+#   wc-session app APP THEME      THEME is light or dark: the colour the task
+#                                 glyphs are drawn in
+#
+# §94: APP is the host's id, and the desktop entry and the executable whose
+# package it is read from are the definition's. Until §94 the guest sent the
+# executable, and so chose which directories were searched.
 app)
-  APPID="${1:-}"; check_app "$APPID"
-  WANT=$(printf '%s' "${2:-}" | base64 -d 2>/dev/null) || die "app: bad base64"
-  case "$WANT" in ""|*[[:space:]]*) die "app: bad executable" ;; esac
-  THEME="${3:-light}"; case "$THEME" in light|dark) ;; *) die "app: theme is light or dark" ;; esac
+  words 1 2 "APP [light|dark]" "$@"
+  APPID="${1:-}"; load_app "$APPID"
+  THEME="${2:-light}"; case "$THEME" in light|dark) ;; *) die "app: theme is light or dark" ;; esac
   [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
-  INFO=$("$BIN/wc-proxy" desktop info "$APPID" --dirs "$(app_dirs "$WANT")" 2>&1) || die "app $APPID: $INFO"
+  INFO=$("$BIN/wc-proxy" desktop --dirs "$(app_dirs "$DEF_EXEC")" info "$DEF_DESKTOP" 2>&1) || die "app $APPID: $INFO"
   printf '%s\n' "$INFO"
   # THE TASKS' OWN ICONS. Windows' Firefox draws "new tab", "new window" and
   # "new private window" with three icons of its own; the Linux package has the
@@ -910,7 +1059,7 @@ app)
   # one; a stock package keeps it in omni.ja and its tasks wear the app icon),
   # and only with rsvg-convert -- without it the tasks wear the app icon too.
   if [ "$(sed -n 's/^program //p' <<<"$INFO")" = firefox ] && RSVG=$(store_tool librsvg rsvg-convert); then
-    EXE=$(resolve_exec "$WANT" 2>/dev/null || true)
+    EXE="$DEF_EXEC"
     SKIN="$(dirname "$(dirname "$(readlink -f "$EXE")")")/lib/firefox/browser/chrome/browser/skin/classic/browser"
     if [ "$THEME" = dark ]; then INK='#fbfbfe'; PRIV='#c689ff'; else INK='#15141a'; PRIV='#8000d7'; fi
     for pair in new-tab:new-tab.svg:"$INK" new-window:window.svg:"$INK" new-private-window:privateBrowsing.svg:"$PRIV"; do
@@ -923,26 +1072,51 @@ app)
     done
   fi
   # The application's icon, as the install step has always fetched it.
-  env -u SSH_ORIGINAL_COMMAND bash "$0" icon "$APPID" "$WANT" || true
+  env -u SSH_ORIGINAL_COMMAND bash "$0" icon "$APPID" || true
   ;;
 
-# ------------------------------------------------------------ action, open ---
-# §92. A jump-list task, or a frequent page, through the session's proxy:
+# ------------------------------------------------------- run, action, open ---
+# §94. The application, one of its desktop entry's actions (a jump-list task),
+# or a URL (a frequent page), through the session's proxy:
 #
-#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
-#   wc-session open   ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#   wc-session run    ID APP DPI CAPTION
+#   wc-session action ID APP ACTION DPI CAPTION
+#   wc-session open   ID APP B64URL DPI CAPTION
 #
-# The guest names an action id or a URL; the argv is the desktop entry's
-# (`launch_desktop`). The last five words are `run`'s, so a task that starts
-# the application cold gives it the profile, preferences and title bar a click
-# on the shortcut would.
+# `launch` builds the argv from $APPS and the desktop entry. A task that starts
+# the application cold gets the profile, preferences and title bar a click on
+# the shortcut would, because all three come from the one definition.
+#
+# The word counts are exact. `run` with a command line -- `run ID B64CMD
+# B64PROFILE B64PREFS B64TITLEBAR [B64CHROME [B64GTK]]`, the form before §94 --
+# is seven or eight words and is refused here by its count, and its third word,
+# base64, is not an application id even when it happens to fit the alphabet:
+# no section of $APPS is called that.
+run)
+  words 4 4 "ID APP DPI CAPTION: an application id from $APPS, never a command line (§94)" "$@"
+  launch run "$1" "$2" "" "$3" "$4"
+  ;;
 action)
-  ACT="${3:-}"; case "$ACT" in *[!A-Za-z0-9-]*|"") die "bad action id" ;; esac
-  launch_desktop action "$ACT" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
+  words 5 5 "ID APP ACTION DPI CAPTION (§94)" "$@"
+  [[ "$3" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,63}$ ]] || die "bad action id"
+  launch action "$1" "$2" "$3" "$4" "$5"
   ;;
 open)
-  URL=$(printf '%s' "${3:-}" | base64 -d 2>/dev/null) || die "open: bad base64"
-  launch_desktop open "$URL" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
+  words 5 5 "ID APP B64URL DPI CAPTION (§94)" "$@"
+  # base64 of at most 4096 bytes. The URL itself must be http(s):// or
+  # file:/// -- so never `-`-leading, never an option -- with every byte
+  # printable ASCII and no quote or backslash; wc-proxy's `url_ok` checks the
+  # same again before it puts it in the entry's `%u` slot.
+  [[ "$3" =~ ^[A-Za-z0-9+/]{4,5464}={0,2}$ ]] || die "open: the URL is not base64 of at most 4096 bytes"
+  URL=$(printf '%s' "$3" | base64 -d 2>/dev/null) || die "open: bad base64"
+  [ "${#URL}" -le 4096 ] || die "open: URL longer than 4096 bytes"
+  case "$URL" in
+    http://*|https://*|HTTP://*|HTTPS://*|file:///*) ;;
+    *) die "open: only http://, https:// and file:/// URLs are opened" ;;
+  esac
+  case "$URL" in *\"*|*\\*|*$'\n'*) die "open: URL with a quote, a backslash or a newline" ;; esac
+  printf '%s' "$URL" | LC_ALL=C grep -q '[^!-~]' && die "open: URL with whitespace, a control character or non-ASCII"
+  launch open "$1" "$2" "$URL" "$4" "$5"
   ;;
 
 # ---------------------------------------------------------------- frequent ---
@@ -951,7 +1125,11 @@ open)
 # own: history sorted by visit count (frequent) or by last visit (recent), as
 # many as `browser.taskbar.lists.maxListItemCount` says, each with its favicon.
 #
-#   wc-session frequent B64PROFILE
+#   wc-session frequent APP
+#
+# §94: the profile is the definition's. Until §94 the guest named a directory
+# under ~/.wc-launch, and so could read the history of any launcher profile on
+# this machine, another installation's included.
 #
 # Prints `prefs ...` and then `item KIND B64URL B64TITLE B64ICON` lines (`-` for
 # no title or icon). Firefox's own switches are respected: with
@@ -964,7 +1142,8 @@ open)
 # here logs a URL or a title: they go to the guest on stdout and nowhere else.
 # Private windows write no history, so nothing from one can appear.
 frequent)
-  PROFILE=$(profile_of "${1:--}") || exit 1
+  words 1 1 "APP" "$@"
+  load_app "$1"; PROFILE="$DEF_PROFILE"
   [ -n "$PROFILE" ] && [ -f "$PROFILE/places.sqlite" ] || { echo "prefs none"; exit 0; }
   SQLITE=$(store_tool sqlite sqlite3) || die "frequent: no sqlite3 on this host (WC_LAUNCH_SQLITE)"
   pref() {  # NAME DEFAULT: user.js wins over prefs.js, as Firefox reads them
@@ -1041,9 +1220,11 @@ frequent)
 # the shortcut. Largest first, because a shortcut is drawn at 48 and Windows
 # would rather downscale than blow up a 16.
 icon)
-  APPID="${1:-}"; case "$APPID" in *[!A-Za-z0-9_.+-]*|"") die "bad app id" ;; esac
-  # The second argument is the application's own executable, and it is the one
-  # that works on this machine.
+  words 1 1 "APP" "$@"
+  APPID="$1"; load_app "$APPID"
+  # §94: the executable is the definition's, and the entry is its `desktop`.
+  # Until §94 the guest sent the executable as a second word, so it chose the
+  # store prefix this searched.
   #
   # §17.2 recorded that stage 11's resolver published `0 image(s)` for
   # "firefox", "because the resolver runs where the proxy runs and the VM host
@@ -1052,25 +1233,25 @@ icon)
   # own store path, next to its bin. So the first place looked at is the prefix
   # of the executable this launcher is about to run — which is exact by
   # construction, needs no theme, and cannot resolve to a different Firefox.
-  EXEC=$(resolve_exec "${2:-$APPID}" 2>/dev/null || true)
-  DIRS=""
-  if [ -n "$EXEC" ]; then
-    P=$(dirname "$(dirname "$(readlink -f "$EXEC")")")
-    DIRS="$P/share"
-    # A wrapped program is a shell script in one store path while its icons are
-    # in the package's own, so the executable's prefix is not always enough.
-    # The package by name is, and this is install time -- a store listing here
-    # costs nothing anybody waits for.
-    for extra in $(ls -d /nix/store/*-"$(basename "$EXEC")"-[0-9]*/share 2>/dev/null | sort -V | tail -2); do
-      DIRS="$DIRS $extra"
-    done
-  fi
+  EXEC="$DEF_EXEC"
+  P=$(dirname "$(dirname "$(readlink -f "$EXEC")")")
+  DIRS="$P/share"
+  # A wrapped program is a shell script in one store path while its icons are
+  # in the package's own, so the executable's prefix is not always enough.
+  # The package by name is, and this is install time -- a store listing here
+  # costs nothing anybody waits for.
+  for extra in $(ls -d /nix/store/*-"$(basename "$EXEC")"-[0-9]*/share 2>/dev/null | sort -V | tail -2); do
+    DIRS="$DIRS $extra"
+  done
   DIRS="$DIRS /run/current-system/sw/share $HOME/.nix-profile/share /usr/share"
+  APPID="$DEF_DESKTOP"
   NAME="$APPID"
   for d in $DIRS; do
     [ -f "$d/applications/$APPID.desktop" ] || continue
     I=$(grep -m1 '^Icon=' "$d/applications/$APPID.desktop" | cut -d= -f2-)
-    [ -n "$I" ] && NAME="$I"
+    # A theme name only: an `Icon=` that is a path, or has `..` in it, would
+    # turn the lookup below into a read of some other file (§94).
+    [[ "$I" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] && [[ "$I" != *..* ]] && NAME="$I"
     break
   done
   for size in 256x256 128x128 96x96 64x64 48x48; do
@@ -1087,6 +1268,7 @@ icon)
 
 # -------------------------------------------------------------------- down ---
 down)
+  words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   # The user unit first, always: stopping one that does not exist costs
@@ -1098,7 +1280,7 @@ down)
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-gpu-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-gpu-$ID" 2>/dev/null
-  if [ -f "$D/arena.plan" ]; then
+  if [ -f "$D/arena.plan" ] && [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ]; then
     printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
       "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
   fi
@@ -1119,6 +1301,7 @@ down)
 #
 # N is the guest's own cap on concurrent sessions and is only checked here.
 gpu)
+  words 1 2 "ID [N]" "$@"
   ID="${1:-}"; check_id "$ID"; N="${2:-1}"
   case "$N" in [1-8]) ;; *) die "gpu: 1..8 sessions, not '$N'" ;; esac
   D=$(dir_of "$ID")
@@ -1161,6 +1344,7 @@ gpu)
 # reads $D/audio.sock through its tunnel instead. `parec` gets SIGPIPE when the
 # ssh channel closes, so a launcher that goes away takes this with it.
 audio)
+  words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no session $ID")
@@ -1171,12 +1355,14 @@ audio)
   ;;
 
 status)
+  words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   [ -S "$D/wl-proxy" ] && echo "status up $D" || echo "status down $D"
   ;;
 
 logs)
+  words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   for f in locate.log proxy.log app.log; do
@@ -1186,7 +1372,30 @@ logs)
   done
   ;;
 
+# ---------------------------------------------------------- operator verbs ---
+# §94. For the person and the deploy step on this machine, from argv. Refused
+# from the guest: they read configuration and resolve names, which is nothing
+# the guest's key needs.
+apps)
+  [ -z "$GUEST" ] || die "apps is an operator verb, not served to the guest"
+  [ -f "$APPS" ] || die "no $APPS"
+  N=0
+  for A in $(sed -n 's/^[[:space:]]*\[\([^]]*\)\][[:space:]]*$/\1/p' "$APPS"); do
+    ( load_app "$A"
+      printf 'app %s exec %s profile %s titlebar %s desktop %s gpu %s args %s env %s\n' "$A" "$DEF_EXEC" \
+        "${DEF_PROFILE:--}" "$DEF_TITLEBAR" "$DEF_DESKTOP" "$DEF_GPU" "${#DEF_ARGS[@]}" "${#DEF_ENV[@]}" ) || exit 1
+    N=$((N + 1))
+  done
+  [ "$N" -gt 0 ] || die "$APPS defines no application"
+  echo "apps ok $N"
+  ;;
+resolve)
+  [ -z "$GUEST" ] || die "resolve is an operator verb, not served to the guest"
+  [ -n "${1:-}" ] || die "resolve NAME"
+  resolve_exec "$1" || die "cannot find $1 on this machine"
+  ;;
+
 *)
-  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|gpu|run|action|open|app|frequent|audio|icon|down|status|logs"
+  die "unknown verb ${VERB:0:32}; try ping|up|proxy|gpu|run|action|open|app|frequent|audio|icon|down|status|logs"
   ;;
 esac

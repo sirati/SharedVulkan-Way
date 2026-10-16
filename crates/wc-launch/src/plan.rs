@@ -418,22 +418,82 @@ pub fn app_user_js(t: Titlebar, prefs: &str) -> String {
     user_js(&format!("{};{prefs}", t.prefs()))
 }
 
-/// The directory an application was told to keep its profile in, if it was told
-/// at all — `--profile <dir>` or `-profile <dir>`. It is the only argument this
-/// launcher looks *inside* a command line for, and it is here rather than in
-/// `wc-session` so that it is tested.
-pub fn profile_dir(exec: &str) -> Option<String> {
-    let words: Vec<&str> = exec.split_whitespace().collect();
-    words
-        .iter()
-        .position(|w| *w == "--profile" || *w == "-profile")
-        .and_then(|i| words.get(i + 1))
-        .map(|s| (*s).to_string())
+// ------------------------------------------- what a launch sends, §94 ------
+//
+// Until §94 a launch sent `run ID CMD PROFILE PREFS TITLEBAR CHROME GTK`: the
+// command line, the profile directory, the rendered `user.js`, the title-bar
+// environment value and both style sheets, all base64'd. The command line was
+// the hole security-model.md R33 records: whoever holds the guest's key could
+// name any program on the VM host. Every one of those words is now the host's,
+// in `apps.ini` beside `wc-session`, and the files are rendered there by this
+// same code ([`host_files`], run as `wc-launch --render-app-files`). What is
+// left for the guest to say is which application, which action or URL, and
+// two numbers only the guest can measure.
+
+/// The desktop DPI the host accepts: Windows' 100% is 96 and its largest
+/// scale, 500%, is 480. Anything outside is refused on both sides.
+pub const DPI_MIN: u32 = 48;
+pub const DPI_MAX: u32 = 960;
+/// The caption height the host accepts, in pixels; 0 means "not measured",
+/// and the host scales §31's 100% number by the DPI instead.
+pub const CAPTION_MAX: u32 = 512;
+
+/// The verb of one launch: `run ID APP DPI CAPTION`, `action ID APP ACTION DPI
+/// CAPTION` or `open ID APP B64URL DPI CAPTION`. `APP` is the host's id for
+/// the application (`[app.*] host-app`). The URL is base64'd because it is the
+/// one word with characters `wc-session`'s whitelist refuses (`?`, `&`, `%`).
+pub fn launch_verb(id: &str, app: &str, req: crate::Request, dpi: u32, caption: Option<i32>) -> Vec<String> {
+    let dpi = dpi.clamp(DPI_MIN, DPI_MAX);
+    let caption = caption.filter(|h| *h > 0).map_or(0, |h| (h as u32).min(CAPTION_MAX));
+    let mut v: Vec<String> = match req {
+        crate::Request::Run => vec!["run".into(), id.into(), app.into()],
+        crate::Request::Action(a) => vec!["action".into(), id.into(), app.into(), a.into()],
+        crate::Request::Open(u) => vec!["open".into(), id.into(), app.into(), b64(u.as_bytes())],
+    };
+    v.push(dpi.to_string());
+    v.push(caption.to_string());
+    v
 }
 
-/// base64, because the application's command line crosses in
-/// `$SSH_ORIGINAL_COMMAND` and a quoting bug in that path would be a shell
-/// injection on the VM host rather than a wrong window.
+/// What the host writes for one launch of an application, rendered from its
+/// `apps.ini` definition and the guest's two numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostFiles {
+    /// `user.js`: the arrangement's preferences, then the definition's.
+    pub user_js: String,
+    /// `chrome/userChrome.css`, for [`Titlebar::Tabs`] only.
+    pub user_chrome: Option<String>,
+    /// The GTK sheet of §91.8, for [`Titlebar::Tabs`] only.
+    pub gtk_css: Option<String>,
+    /// The value of `MOZ_GTK_TITLEBAR_DECORATION`.
+    pub moz_env: &'static str,
+    pub fit: TitlebarFit,
+}
+
+/// §94. Render [`HostFiles`] on the VM host. `titlebar` and `prefs` are the
+/// host's definition; `dpi` and `caption` are the guest's, and are refused
+/// outside [`DPI_MIN`]..=[`DPI_MAX`] and 0..=[`CAPTION_MAX`] (0: not measured).
+pub fn host_files(titlebar: &str, dpi: u32, caption: u32, prefs: &str) -> Result<HostFiles, String> {
+    let t = Titlebar::parse(titlebar).ok_or_else(|| format!("titlebar {titlebar:?} is not one of tabs, none, client"))?;
+    if !(DPI_MIN..=DPI_MAX).contains(&dpi) {
+        return Err(format!("dpi {dpi} is outside {DPI_MIN}..={DPI_MAX}"));
+    }
+    if caption > CAPTION_MAX {
+        return Err(format!("caption {caption} is outside 0..={CAPTION_MAX}"));
+    }
+    let fit = TitlebarFit::at(dpi, Some(caption as i32).filter(|h| *h > 0));
+    Ok(HostFiles {
+        user_js: app_user_js(t, prefs),
+        user_chrome: user_chrome_css(t, fit),
+        gtk_css: gtk_css(t, fit),
+        moz_env: t.moz_env(),
+        fit,
+    })
+}
+
+/// base64, for the words that cross in `$SSH_ORIGINAL_COMMAND` with
+/// characters `wc-session` refuses there: a jump-list page's URL, and the
+/// desktop entry's free text coming back.
 pub fn b64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -635,12 +695,15 @@ mod tests {
         assert!(!user_js(" ; ; ").contains("user_pref"));
     }
 
+    /// §94: the preference is the deployment's, so it is in the host's
+    /// `apps.ini` that the deploy step writes, and the guest's file has none.
     #[test]
-    fn the_shipped_configuration_turns_off_the_middle_click_paste() {
-        let c = cfg();
-        let app = c.app("firefox").unwrap();
-        assert!(app.prefs.contains("middlemouse.paste=false"), "{}", app.prefs);
-        assert!(user_js(&app.prefs).contains("user_pref(\"middlemouse.paste\", false);"));
+    fn the_deployment_turns_off_the_middle_click_paste_on_the_host() {
+        let deploy = include_str!("../../../scripts/wc-launch.sh");
+        let apps = deploy.split("<<APPS").nth(1).and_then(|t| t.split("\nAPPS\n").next()).expect("an apps.ini heredoc");
+        assert!(apps.contains("prefs    = middlemouse.paste=false"), "{apps}");
+        assert!(user_js("middlemouse.paste=false").contains("user_pref(\"middlemouse.paste\", false);"));
+        assert!(!EXAMPLE.contains("middlemouse"));
     }
 
     /// The codec the host CPU can afford, stated by the deployment.
@@ -681,15 +744,46 @@ mod tests {
         );
     }
 
+    /// §94. A launch names the application and nothing the host runs: no
+    /// path, no profile, no file content. Two numbers and, for a page, its
+    /// URL in base64.
     #[test]
-    fn the_profile_directory_is_read_off_the_command_line_or_absent() {
+    fn a_launch_sends_an_app_id_and_two_numbers_and_never_a_command_line() {
+        assert_eq!(launch_verb("wcl-7", "firefox", crate::Request::Run, 144, Some(45)), ["run", "wcl-7", "firefox", "144", "45"]);
         assert_eq!(
-            profile_dir("firefox --profile /home/s/.wc-launch/firefox about:blank").as_deref(),
-            Some("/home/s/.wc-launch/firefox")
+            launch_verb("wcl-7", "firefox", crate::Request::Action("new-private-window"), 96, None),
+            ["action", "wcl-7", "firefox", "new-private-window", "96", "0"]
         );
-        assert_eq!(profile_dir("firefox -profile /tmp/p").as_deref(), Some("/tmp/p"));
-        assert_eq!(profile_dir("firefox"), None);
-        assert_eq!(profile_dir("firefox --profile"), None);
+        let o = launch_verb("wcl-7", "firefox", crate::Request::Open("https://e.org/?a=1&b"), 96, Some(-3));
+        assert_eq!(o[..3], ["open", "wcl-7", "firefox"]);
+        assert_eq!(unb64(&o[3]).unwrap(), b"https://e.org/?a=1&b");
+        assert_eq!(o[4..], ["96", "0"]);
+        // Out of range is clamped here and refused on the host.
+        assert_eq!(launch_verb("i", "a", crate::Request::Run, 5000, Some(9000))[3..], ["960", "512"]);
+        // Every word is in the alphabet `wc-session` admits before it looks
+        // at a verb at all.
+        for v in [launch_verb("i", "firefox", crate::Request::Run, 96, None), o] {
+            assert!(v.iter().all(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || "+/=._-".contains(c))), "{v:?}");
+        }
+    }
+
+    /// §94. The host renders what the guest used to send, from its own
+    /// definition and the guest's two numbers, and refuses numbers outside
+    /// their range.
+    #[test]
+    fn the_host_renders_the_profile_files_and_refuses_numbers_out_of_range() {
+        let f = host_files("tabs", 144, 45, "middlemouse.paste=false").unwrap();
+        assert_eq!(f.moz_env, "client");
+        assert_eq!(f.fit, TitlebarFit { height: 45, reserve: 219 });
+        assert!(f.user_js.contains("user_pref(\"middlemouse.paste\", false);"));
+        assert!(f.user_chrome.as_deref().unwrap().contains("min-width: 219px"));
+        assert!(f.gtk_css.as_deref().unwrap().contains("padding-right: 219px"));
+        assert_eq!(host_files("tabs", 96, 0, "").unwrap().fit, TitlebarFit { height: 31, reserve: 146 });
+        let n = host_files("none", 96, 0, "").unwrap();
+        assert_eq!((n.moz_env, n.user_chrome, n.gtk_css), ("none", None, None));
+        for (t, d, c) in [("tab", 96, 0), ("tabs", 47, 0), ("tabs", 961, 0), ("tabs", 96, 513)] {
+            assert!(host_files(t, d, c, "").is_err(), "{t} {d} {c}");
+        }
     }
 
     // --- §82: the title bar ---------------------------------------------------

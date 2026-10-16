@@ -29176,3 +29176,176 @@ under the rules of 93.6:
    picture from Windows pasted into the page's paste zone.
 4. The ssh fallback, with `wayland-bell =` empty in `wcclip`'s ini.
 5. Clear the test string from the clipboard, if it still holds exactly that.
+
+## 94. The guest names an application, never a command line
+
+Branch `run-appid`, from master `59a6e8e`, 2026-10-16. The brief:
+security-model.md R33 (added with §92) recorded that `wc-session run` took a
+whole command line from the guest, base64'd, and ran it. So any process on the
+Windows guest that can read the launcher's key could run any program on the VM
+host as `sirati`, through the very forced command whose job was to stop that
+(§28.5: "the guest cannot run anything on the VM host except the verbs"). Close
+it: the guest names an application by id, the host owns the definitions, the
+old form is removed with no way back for the key, and every other verb is
+audited the same way.
+
+**Status.** Closed, and the audit found two more holes of the same family and
+several narrower ones (94.4). `wc-session` now refuses any request that is not
+made of the characters some verb needs, any verb with the wrong number of words,
+and any word that is not of its verb's type; `run`, `action` and `open` start
+only an application defined in the host's `apps.ini`. A harness runs the real
+script with 133 hostile requests and 12 hostile definitions (94.5); against master it fails eleven of
+its fifteen tests, among them a command line accepted and run, and a run id
+that reached the root step. Deployed to `wcivs` (94.7).
+
+### 94.1 What the guest could send
+
+| verb (until §94) | guest-chosen words | what they reached |
+|---|---|---|
+| `run ID CMD PROFILE PREFS TITLEBAR [CHROME [GTK]]` | the command line; a profile path; the whole `user.js`; the value of `MOZ_GTK_TITLEBAR_DECORATION`; the whole `userChrome.css`; the whole `gtk.css` | the first word went through `resolve_exec` and the rest were the program's arguments: **any program, any arguments**. `user.js` set **any preference** of the profile, `devtools.chrome.enabled` and the remote debugger among them |
+| `action`, `open` | as `run`, plus the executable (`B64EXE`) | the argv came from the desktop entry, but the executable, profile and files were the guest's |
+| `app APPID B64EXE THEME`, `icon APPID [EXE]` | an executable path or name | which package's directories were searched; `icon` then followed the entry's `Icon=` as a path fragment |
+| `frequent B64PROFILE` | any directory under `~/.wc-launch` | **any launcher profile's history**, another installation's included |
+| `up ID RUNID PAGES OUTBOUND` | the run id | checked only if it began with `0x`; `1;cmd` passed and was printed with `%s` into the script `up` pipes to `$ROOTC`: **a root command injection** in design, not exploitable on testhost only because `~/rootc` no longer exists (§12.9; the memory note of 2026-08-21) |
+| every verb | every word | `set -- $SSH_ORIGINAL_COMMAND`, unquoted: each word was glob-expanded against the home directory, and extra words were ignored |
+
+### 94.2 The host's definitions
+
+One file, `apps.ini`, beside `wc-session` in the installation's directory
+(`~/wc-launch-ivs/apps.ini` for `wcivs`), written by `wc-launch.sh deploy` and
+read by nothing else. It is not in the stage that goes to the guest, and no
+verb writes under the installation's directory. A section per application:
+
+```
+[firefox]
+exec     = ~/wc-launch-ivs/bin/firefox-readback/bin/firefox
+args     =
+profile  = ~/.wc-launch/firefox
+prefs    = middlemouse.paste=false
+titlebar = tabs
+desktop  = firefox
+gpu      = on
+```
+
+(`env = NAME=value`, repeatable, is the eighth key.) `load_app` refuses a key
+it does not know, an `exec` that is not an absolute path to an executable file,
+a `profile` that is not one plain directory name under `~/.wc-launch`, and a
+`titlebar`, `gpu`, `desktop` or `env` outside its alphabet. `wc-session apps`
+(an operator verb, refused from the guest) checks the whole file, and deploy
+runs it as a PASS line.
+
+Every word `run` used to carry, and where it is now:
+
+| was | now |
+|---|---|
+| the command line's first word, resolved by `resolve_exec` at every launch | `exec`, absolute. A name in `WC_LAUNCH_FIREFOX` is resolved **at deploy time** by the operator verb `wc-session resolve`, and a store path it lands on is GC-rooted at `bin/app-firefox` |
+| `--profile DIR` in the command line, and the profile word | `profile`; `--profile DIR` is added to the argv, and `user.js`/`userChrome.css` are written there and only there |
+| the rest of the command line | `args` (fixed, split on whitespace; Firefox has none) |
+| `user.js`, rendered on the guest from `[app.*] prefs` and the title bar | rendered **on the host** from `prefs` and `titlebar` by `wc-launch --render-app-files`, which is `plan::host_files`: the same tested renderer, built for Linux and deployed as `bin/wc-launch`. `wc-session` still appends its own lines (crash count, `gfx.webrender.all`, the decode prefs, the null audio context) |
+| `userChrome.css`, `gtk.css` (§82, §91.8) | rendered by the same call, sized from the guest's two numbers (94.3); the private `XDG_CONFIG_HOME` overlay is built from the host's `gtk.css` as before |
+| `MOZ_GTK_TITLEBAR_DECORATION` | from `titlebar` (`Titlebar::moz_env`, printed by the renderer) |
+| the GPU environment (`gpu.env`, §86) | unchanged, and applied only where the definition says `gpu = on` |
+| the readback Firefox (§86) | chosen by `exec` pointing at it; its `.wc-vulkan-readback` marker still turns the decode prefs on |
+| audio (§86) | unchanged: per session, from `audio.state` |
+| the jump list's `B64EXE` | the definition's `exec`, whose basename must still be the desktop entry's program |
+| `frequent`'s profile | the definition's `profile` |
+
+On the guest, `[app.*]` is now display and identity only: `title`, `icon`,
+`desktop`, `app-id` (§92's taskbar identity) and `host-app`, the host's id
+(the section's by default). `exec`, `prefs` and `titlebar` are refused by name
+with a message that points at `apps.ini`, so a pre-§94 ini fails at the line
+rather than being half-read.
+
+### 94.3 What the guest still sends, and how it is typed
+
+Before any verb runs, the request must be at most 16 KiB and 12 words, and made
+only of letters, digits, space and `+ / = . _ -` (spelled out, not as ranges, so
+the locale's collation cannot widen it). It is split with `read -a`, which does
+no pathname expansion. Then each verb checks its word count exactly and each
+word's type:
+
+| verb | words | types |
+|---|---|---|
+| `run` | `ID APP DPI CAPTION` | session id: a letter or digit, then `[A-Za-z0-9_-]`, ≤ 64. App id: a letter or digit, then `[A-Za-z0-9._+-]`, no `..`, ≤ 64, and a section of `apps.ini`. DPI: decimal 48..960, no leading zero. CAPTION: decimal 0..512 (0 = not measured) |
+| `action` | `ID APP ACTION DPI CAPTION` | ACTION: a letter or digit, then `[A-Za-z0-9-]`, ≤ 64, and one the desktop entry lists (`wc-proxy desktop`) |
+| `open` | `ID APP B64URL DPI CAPTION` | base64 of ≤ 4096 bytes; the URL `http(s)://` or `file:///`, every byte printable ASCII, no quote, backslash or newline; checked again by `desktop::url_ok` and put in the `%u` slot |
+| `app` | `APP [light\|dark]` | |
+| `icon`, `frequent` | `APP` | |
+| `up` | `ID RUNID ivshmem` | RUNID `0x` + 1..16 hex digits; the guest-RAM form (`ID RUNID PAGES OUTBOUND [frames]`) is refused unless the host's own environment sets `WC_LAUNCH_GUEST_RAM=1` |
+| `proxy`, `down`, `status`, `logs`, `audio` | `ID` | |
+| `gpu` | `ID [N]` | N 1..8 |
+| `ping` | none | |
+
+DPI and CAPTION are the only free values left, and they are numbers: the
+desktop's DPI and Windows' caption height there (`AdjustWindowRectExForDpi`),
+which only the guest can measure and from which the host sizes Firefox's tab
+strip and the GTK header bars (§82, §91.8). The renderer checks the ranges
+again. A launch's words are built in `plan::launch_verb`, and its test checks
+that every word is in the request alphabet.
+
+`wc-proxy desktop` now reads its options only before its first word (`--dirs`,
+or `--`): until §94 a positional that read `--dirs` was taken as the option.
+`wc-session` passes the options first.
+
+### 94.4 The audit, verb by verb
+
+| verb | finding | fix |
+|---|---|---|
+| all | unquoted `set -- $SSH_ORIGINAL_COMMAND` globbed every word; extra words ignored; no size limit | the alphabet, size and word limits of 94.3; `read -a`; exact word counts |
+| `run` | command line from the guest (R33) | app id; argv from `apps.ini` |
+| `run`, `action`, `open` | `user.js`, `userChrome.css`, `gtk.css` as guest text: any preference, any sheet | rendered on the host from the definition and two numbers |
+| `action`, `open`, `app`, `icon` | the guest chose the executable, so the package directories searched | the definition's `exec` |
+| `icon` | an `Icon=` value was used as a path fragment (`…/apps/$NAME.png`) | only a theme name (`[A-Za-z0-9._+-]`, no `..`) is followed |
+| `frequent` | any profile under `~/.wc-launch` | the definition's profile |
+| `up` (guest RAM) | run id without `0x` unchecked and printed with `%s` into the root script | `^0x[0-9a-fA-F]{1,16}$` on both paths, `%q` throughout, and the guest-RAM path refused unless the host sets `WC_LAUNCH_GUEST_RAM=1`; `proxy` and `down` take their root steps only under the same condition |
+| `up` (ivshmem) | `0x` with no digits, or extra words, passed | the same regex; exactly three words |
+| ids, app ids, action ids | a leading `-` was allowed | a letter or digit first |
+| `open` | the URL became a positional of `wc-proxy desktop`, which looked for `--dirs` anywhere | options before the first word; the URL's scheme checked in `wc-session` first |
+| `proxy` (ivshmem), `gpu`, `audio`, `status`, `logs`, `down`, `ping` | arguments are a checked id (and `N`); every path is under `$RUNROOT/$ID`; units are `wc-launch-…-$ID` | word counts only |
+| environment | `WC_LAUNCH_ROOTC` is `eval`ed and every `WC_LAUNCH_*` changes paths, so a guest that could set the environment would own the script | none needed: testhost's sshd has no `AcceptEnv` and `PermitUserEnvironment` is off (checked), so the guest sets nothing |
+
+Two operator verbs, `apps` and `resolve`, are served only from argv: the forced
+command names the script with no arguments, so the guest never reaches argv.
+
+### 94.5 The tests
+
+`crates/wc-launch/tests/wc_session.rs`, in the style of `sv-testkit`'s
+`kill_safety`: the real `scripts/wc-session`, run as the guest reaches it (the
+request in `$SSH_ORIGINAL_COMMAND`), in a scratch host with an `apps.ini`, a
+live session (a bound `wl-proxy` socket) and stand-ins for the application and
+`wc-proxy` that write down their argv. The renderer is this crate's own binary.
+`$WC_LAUNCH_ROOTC` is a command that leaves a file. Every hostile request must
+exit non-zero, say `wc-session:` why, start nothing, reach no root step and
+create no file it names.
+
+* five positive tests: `run` (argv, `user.js`, `userChrome.css` at 144 dpi and
+  a 45 px caption, the environment, the GTK overlay), a definition with no
+  profile and `titlebar = none`, `action` (the options-first call to
+  `wc-proxy`), `open` (`https://example.org/a?q=[a]*&x=%41#f` arrives as one
+  argument, unexpanded), `frequent`;
+* the old forms: `run` with a command line in four shapes, a base64'd program
+  as the app id, `sh` and `bash` as app ids, the old `action`, `open`, `app`,
+  `icon` and `frequent`;
+* shell metacharacters (`;`, `&&`, `|`, `$(…)`, backticks, newline, CR, tab,
+  `*`, `?`, `[`, `~`, quotes, `>`, `${HOME}`, backslash, non-ASCII, a control
+  character); `..` and paths in every verb that takes an id; `-`-leading words
+  in every slot; numbers out of range, octal-looking and hex; URLs that are
+  options, `javascript:`, `data:`, `file:/`, `about:`, `chrome:`, or carry a
+  space, newline, quote, backslash, non-ASCII or a bell; 20 000-byte and
+  13-word requests; 16 unknown verbs (`sh`, `scp -t`, `rsync --server`,
+  `internal-sftp`, …); the operator verbs from the guest;
+* the root steps: master's injection shape `up t94 1;id 16384 1048576`, the
+  guest-RAM `up` in every form, `proxy` and `down` of a session with a plan;
+* definitions outside the rules (relative, missing or directory `exec`;
+  profile outside, with `..`, nested; an unknown key; bad `titlebar`, `gpu`,
+  `env`, `desktop`; no `apps.ini`).
+
+Run against master's `wc-session` the harness fails 11 of 15: `run` accepted the
+command line and started it (`run ok … audio=none`), `up t94 1;id 16384 1048576`
+**reached the root step**, `status -rf` and a 13-word `status` were accepted, and
+a refused `up` had already removed the session it named. The positive tests fail
+there too, because master has no `apps.ini`.
+
+Also new: `plan::launch_verb` and `plan::host_files` with their tests,
+`config` tests for the refused keys and `host-app`, and
+`desktop::options_end_at_the_first_word`.
