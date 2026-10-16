@@ -418,6 +418,50 @@ pub fn attach_set(port: PortHandle, set: Arc<ControlSet>) -> std::io::Result<Doo
     Ok(Doorman::spawn_target(reader, set))
 }
 
+/// A `Write` that hands each write to a thread of its own and never blocks.
+///
+/// A doorbell byte means "look at your rings", and a lost one costs a wait its
+/// slice; a blocked writer costs the application every call it is making. So
+/// a write is queued (at most [`DetachedWriter::QUEUE`] at once) and a full
+/// queue is `WouldBlock`, which [`PortWake::poke`] counts as dropped.
+#[cfg(unix)]
+pub struct DetachedWriter {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+#[cfg(unix)]
+impl DetachedWriter {
+    /// Bytes in flight before a write is refused.
+    pub const QUEUE: usize = 256;
+
+    pub fn spawn<W: Write + Send + 'static>(mut w: W) -> std::io::Result<DetachedWriter> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(Self::QUEUE);
+        std::thread::Builder::new().name("sv-bell-write".into()).spawn(move || {
+            // Ends when every sender is gone, or the socket is.
+            while let Ok(b) = rx.recv() {
+                if w.write_all(&b).and_then(|()| w.flush()).is_err() {
+                    break;
+                }
+            }
+        })?;
+        Ok(DetachedWriter { tx })
+    }
+}
+
+#[cfg(unix)]
+impl Write for DetachedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.tx.try_send(buf.to_vec()) {
+            Ok(()) => Ok(buf.len()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A port that can be split into a reader and a writer over one description.
 ///
 /// Three shapes, because the port is a different type on each side and the
@@ -470,10 +514,16 @@ impl PortHandle {
                 let w = f.try_clone()?;
                 (Box::new(f), Box::new(w))
             }
+            // The writer never blocks its caller (waycompose-design.md §97.10):
+            // a hub that stops reading — on the guest, a stale session's
+            // `sv-hostd` held QEMU's one connection and the next hub's sat
+            // unaccepted — filled this socket, and Firefox's renderer thread
+            // then sat in `send()` inside `vkCreateGraphicsPipelines` until
+            // every call it was making had timed out.
             #[cfg(unix)]
             PortHandle::Unix(s) => {
                 let w = s.try_clone()?;
-                (Box::new(s), Box::new(w))
+                (Box::new(s), Box::new(DetachedWriter::spawn(w)?))
             }
             // One handle, shared, rather than a `DuplicateHandle`: a
             // virtio-serial port permits one opener and the point of the `Arc`
@@ -521,6 +571,27 @@ mod tests {
     use crate::region::SharedRegion;
     use crate::ring::Lane;
     use std::time::{Duration, Instant};
+
+    /// §97.10: a hub that never reads must not stop the application. The
+    /// socket fills, the queue fills, and every poke after that returns at
+    /// once as dropped; the first ones still arrive.
+    #[cfg(unix)]
+    #[test]
+    fn a_doorbell_nobody_reads_never_blocks_the_poker() {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (_reader, writer) = PortHandle::Unix(ours).split().unwrap();
+        let wake = PortWake::new(writer);
+        let t = Instant::now();
+        for _ in 0..2_000_000 {
+            wake.poke(1);
+        }
+        assert!(t.elapsed() < Duration::from_secs(20), "pokes blocked: {:?}", t.elapsed());
+        let (poked, dropped) = wake.stats();
+        assert!(dropped > 0 && poked > 0, "poked {poked}, dropped {dropped}");
+        theirs.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 16];
+        assert!(std::io::Read::read(&mut &theirs, &mut b).unwrap() > 0, "the first bytes arrive");
+    }
 
     /// The cross-VM doorbell is **process-global**, and `cargo test` runs tests
     /// as threads of one process. So a test that installs one is mutating a
