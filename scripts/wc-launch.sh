@@ -194,7 +194,10 @@ wcl_assert_located() {
   guest_run=$(echo "$clock" | grep -o 'arena: run 0x[0-9a-f]*' | tail -1 | awk '{print $3}')
   line=$(echo "$clock" | grep 'up: ' | tail -1)
   host_run=$(echo "$line" | grep -o 'ivshmem run 0x[0-9a-f]*' | awk '{print $3}')
-  len=$(echo "$line" | grep -oE '[0-9]+ bytes at' | awk '{print $1}')
+  # The first `N bytes at` is the arena's. §89 put the rings' own
+  # `transport rings: N bytes at …` on the same line, and taking both made the
+  # division below an arithmetic error that skipped this check (§90).
+  len=$(echo "$line" | grep -oE '[0-9]+ bytes at' | head -1 | awk '{print $1}')
   if [ -z "$guest_run" ] || [ -z "$host_run" ]; then
     bad "no ivshmem header was matched: guest said '${guest_run:-nothing}', host said '${line:-nothing}'"
     return 1

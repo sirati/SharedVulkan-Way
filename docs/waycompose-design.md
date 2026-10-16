@@ -27956,3 +27956,277 @@ unchanged. No descriptor can cross: the ring takes `&[u8]` and the doorbell a
   onto rings is two more claims per connection and is the next step if a
   paste ever feels slow.
 * **The NixOS switch** (89.8).
+
+---
+---
+
+## 90. The desktop test: Firefox from the shortcut, on the desktop a person uses
+
+Branch `desktop-e2e`, 2026-10-16, 03:56–04:47. The first run of the whole
+product on the guest's interactive desktop (session 1), with a person logged in
+for it, against the checklist of `docs/goal-firefox.md`. Everything before this
+ran in session 0, under Wine, or both. The evidence is in `docs/desktop-e2e/`.
+
+### 90.1 Status in one paragraph
+
+Through the click route the harnesses have always used, Firefox works on the
+desktop:
+- **the window.** A real window that drags, maximises, snaps and resizes, with
+  its tabs in the caption.
+- **the title.** It is correct and follows tab switches.
+- **rendering.** Hardware WebRender on zink on the Intel UHD, at 58–60 fps
+  while scrolling.
+- **input.** Keyboard, mouse, menus, cursors and the clipboard in both
+  directions.
+- **two windows.** A second window renders.
+- **the session end.** Closing the last window ends the session after 60 s.
+
+Four things are wrong.
+1. **A real double-click gets a much worse product.** The harnesses' click
+   runs elevated; Explorer's runs at medium integrity, and at medium integrity
+   the virtio-serial doorbells cannot be opened. That cold start took 12.7 s
+   instead of 2.3 s, Firefox fell back to software WebRender, and the window
+   came minutes late (90.3).
+2. **The taskbar and Alt-Tab icon was Windows' generic one.** The launcher's
+   Firefox package has no `share/`. **Fixed** and proven on the guest (90.4).
+3. **Hardware video decode produces empty pictures.** H.264 and HEVC play with
+   advancing clocks and no error, and every pixel is (0,77,0). VP9, decoded in
+   software, shows the same clip correctly through the same path (90.5).
+4. **Windows' caption buttons vanish now and then**, while still working
+   (90.6).
+
+The second window also opens at 252x304 in the screen's corner (90.7).
+
+### 90.2 Verdicts against the goal
+
+| requirement (goal-firefox.md) | verdict | evidence |
+|---|---|---|
+| appears as a window on Windows | **pass** | `A-window.png`, `B-after-drag.png`, `B-maximised.png`, `B-snap-hover.png`, `B-after-topedge.png`, `H-win1.png`, `H-win2.png`; hit tests and rectangles in `actions.txt` (`w2`, `b1`, `b2`) |
+| taskbar icon correct | **fail as deployed, pass after the fix in 90.4** | before: `taskbar-before.png`, `alttab-before.png` and the compositor's `window 1 has no icon; the taskbar keeps the generic one`; after: `taskbar-after.png`, `alttab-after.png` |
+| title correct | **pass** | Alt-Tab `alttab-*.png` ("Mozilla Firefox"); `actions.txt` `h3`: Ctrl+T gives `Mozilla Firefox`, Ctrl+Tab back gives the page's title; every navigation's title reached `GetWindowText` within 110–705 ms (`c1`, `d1`, `d2`, `e1`) |
+| Firefox paints its UI into the title bar | **pass, with bug 90.6** | `A-window.png` (tabs in the caption; buttons at x 780–923 clear of the tab-list button at 761), `B-snap-hover.png` (snap-layouts flyout on hover), `B-maximised.png`; `caption-buttons-*.png` for the bug |
+| hardware acceleration for the renderer | **pass on the harness route; fail on a real double-click (90.3)** | `Q-graphics-1.png`: Compositing `WebRender`, WebGL 1 renderer `Mesa -- zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))`; `C2-support-gpu.png`: GPU #1 active, zink on Intel UHD; scrolling 58.0–59.6 fps (90.8); `medium-launcher.log` for the double-click |
+| hardware acceleration for video decoding | **fail** | `C-support-codecs.png`: H264 and HEVC "Hardware Decoding: Supported"; but `E-video.png`, `P-h264.png`, `P-hevc.png` are one flat (0,77,0); `P-vp9.png` (software) is correct |
+
+### 90.3 Bug: a real double-click runs at medium integrity, and the doorbells refuse it
+
+The guest's Explorer starts a shortcut at medium integrity. The first click of
+this run was exactly that: `Start-Process` on the `.lnk`, from a process in
+session 1 at the `Limited` run level. The launcher's log (`medium-launcher.log`):
+
+```
+SSH FALLBACK: the Wayland connections will cross the ssh tunnel this session -- wc-compositor: WAYLAND RINGS UNAVAILABLE: the doorbell port org.sirati.wcbell.0 did not open (CreateFileW (virtio-serial port) failed: errno 5)
+gpu: [gpu] no doorbell on org.sirati.svbell.0 (CreateFileW (virtio-serial port) failed: errno 5); waits will run out their slice
+cold start: 12711 ms
+CLICK-TO-WINDOW never (cold); no window mapped in 120 s
+```
+
+Firefox's own log said `Failed to create EGLConfig for WebRender!` and then
+`Fallback WR to SW-WR`. A window was up at 04:09, 4.5 minutes after the click,
+at 516x128. It later grew to the profile's 931x525. It rendered, with its tabs in
+the caption (`medium-window.png`).
+
+**The cause, measured.** One `CreateFileW` of
+`\\.\Global\org.sirati.wcbell.0` and `…svbell.0` (`GENERIC_READ|WRITE`):
+
+- from a scheduled task at the `Limited` run level (`S-1-16-8192`, medium):
+  both fail with error 5;
+- from the ssh session, which holds the administrator's full token: both open.
+
+The ivshmem devices (the arena and the GPU slot) do open at medium integrity
+(`arena 0 provided from ivshmem`, `mapped in 12.44ms`). So §83.9's question
+about the device at medium has a split answer: ivshmem yes, virtio-serial no.
+
+**Why no earlier section saw it.** `wc-launch.sh`'s `runint.ps1` registers its
+task with `-RunLevel Highest`, so every click of every harness ran the launcher
+elevated. The same shortcut through that route: rings and both doorbells up,
+cold start 2.3 s, and a window in **4302 ms** (later 4430 ms and 3963 ms).
+Everything else in this section used that route, because it is the one the brief
+names.
+
+**Not fixed.** The fix is a security descriptor on the virtio-serial port
+devices that lets the interactive user open them. That is a change to the guest
+system and to the security argument of security-model.md R31 (any medium
+process of that user could then write to the ports). It is the owner's step. The
+alternative is a launcher that runs elevated, which would put a UAC prompt on
+every click.
+
+### 90.4 Bug, fixed: the generic icon
+
+The compositor's log: `icon published for "firefox": 0 image(s) []`, and the
+proxy's: `app id "firefox": nothing to show (no firefox.desktop in any data
+directory, and no theme has "firefox" either)`. Since §87.14 the launcher runs
+`firefox-readback`, a package with `bin/` and `lib/` and no `share/`, so neither
+a theme nor §18.5's walk up from the executable finds anything. The desktop
+shortcut still showed Firefox's icon only because it was installed before that
+switch.
+
+The package's pixels are `lib/firefox/browser/chrome/icons/default/default{16,32,48,64,128}.png`
+(Thunderbird uses `chrome/icons/default/`). `icons::bundled_icons` collects
+`default<N>.png` from beside the client's `/proc/<pid>/exe`, and `resolve` uses
+them only when no theme has the name, so a user's theme still wins. A new unit
+test covers the layout, the precedence and Thunderbird's variant.
+
+On the guest after the deploy (90.10):
+
+```
+[proxy] client 2: icon: app id "firefox": icon "firefox" -> 3 image(s) [48x48 32x32 16x16] from …/firefox-readback-157.0.1/lib/firefox/browser/chrome/icons/default/default16.png (24.3 ms)
+wc-compositor: window 1 icon set: 2 of 2 slots from 3 image(s) [48x48 32x32 16x16]
+```
+
+Two visual checks agreed: before the fix, the taskbar button and the Alt-Tab
+entry wore the generic icon; after it, both show Firefox's
+(`taskbar-before.png`, `taskbar-after.png`, `alttab-before.png`,
+`alttab-after.png`).
+
+### 90.5 Bug: hardware decode returns empty pictures
+
+Hardware decode is advertised, and it is used:
+- about:support Media lists H264 and HEVC under hardware decoding
+  (`C-support-codecs.png`);
+- the GPU side serves `VK_KHR_video_decode_h264` and `…h265`.
+
+But the picture is empty. One 30 s clip (a navy frame, a yellow running
+timestamp, and a white flash with a beep every second) was played in three
+encodings, about 4 s into each:
+
+| encoding | decoded by | video area |
+|---|---|---|
+| VP9 (`P-vp9.png`) | Firefox, in software | correct: 7008 colours, mean (36,37,64), timestamp `00:00:03.833` |
+| H.264 High (`P-h264.png`, and `E-video.png` 20 minutes earlier) | the GPU side, Vulkan Video | **one colour, (0,77,0)** |
+| HEVC Main (`P-hevc.png`) | the GPU side, Vulkan Video | **one colour, (0,77,0)** |
+
+(0,77,0) is BT.709 limited-range YUV with all three planes zero. In every case
+the page's own counters advance: 102 frames in 3.4 s with 0 dropped, and over a
+16 s run 479 frames with 2 dropped, all `err=none`. No `GUARD`, fault or error
+line appears in the GPU log, so the failure is silent.
+
+**Not known: whether this is the new driver.** The guest's driver went from
+101.7076 to 101.7092 just before this run. §87.13 and §87.14 checked frame
+counts and about:support on the guest, never the decoded pixels, so there is no
+earlier picture to compare with. It is reported here for whoever evaluates the
+driver; nothing was rolled back or changed.
+
+**Audio.** Played and consumed. The launcher's player counted 20.4 s that was
+not silence over the first session, which is the clip's 0.1 s beep per second.
+A/V sync was not measured, and nobody confirmed hearing it.
+
+### 90.6 Bug: Windows' caption buttons vanish, and still work
+
+Windows' minimise, maximise and close glyphs are sometimes missing from a
+maximised window, in both sessions:
+- the corner shows only the tab strip's colour (`caption-buttons-scroll-vs-webgl.png`,
+  `caption-buttons-X-series.png`, `caption-buttons-Y-series.png`,
+  `caption-buttons-P-h264.png`);
+- they come back for single frames (`Y03` in the series) and after some
+  navigations;
+- a second session stayed correct through the same sequence
+  (`caption-buttons-session2.png`) and then lost them on a video page.
+
+The buttons still work while invisible: hit tests answer `HTMAXBUTTON` and
+`HTCLOSE`, and two closes in this run clicked an invisible close button.
+
+The only paint path, `WM_PAINT`, does `SetDIBitsToDevice` and then `FillRect`s
+the button strip with alpha 0 inside the same clip, so neither half of
+`uncover_caption_buttons` is skipped by a partial update. Something else makes
+the strip opaque again between paints. Not found. Candidates for the next look:
+- DWM's caption-colour updates (`match_caption_colour` sets
+  `DWMWA_CAPTION_COLOR` many times a second while Firefox animates its tab strip;
+  the log has runs of 10–14 lines);
+- `DwmDefWindowProc` not seeing the non-client mouse messages;
+- the 1 px rounding between DWM's bounds and `nc_top`.
+
+Smaller things seen in the same captures:
+- a 1 px black row above the buttons of a restored window (§82.7's corner
+  alpha);
+- a 1 px dark line under the button strip after scrolling
+  (`caption-buttons-session2.png`, rows 2 and 4).
+
+### 90.7 Bug: the second window opens at 252x304, in the corner
+
+A second click while Firefox ran: **758 ms** to a new window, which is the
+warm number. That window is real Firefox and renders (`H-win2.png`), so the
+black second window of §85.7 is Wine's. But it was mapped at 252x304 at (0,0),
+and it stayed that size, with its toolbar clipped. The medium-integrity first
+window also started small (516x128) before it took the profile's size. Both
+look like the size Firefox commits before it has read its own saved geometry,
+taken by the compositor as final. Not investigated further.
+
+### 90.8 Everything else that was run
+
+Input was real `SendInput`, from an agent in session 1 that refused any click
+whose point was not over one of our windows and any key while another process
+held the foreground (`session1-agent.ps1`; it refused one stale click, in
+`actions.txt` `q4`). Typing used scancodes through the guest's German layout,
+so `:` and `/` crossed as Shift chords.
+
+| item | result | evidence |
+|---|---|---|
+| drag by empty tab strip | moved (130,130) to (220,184) | `actions.txt` `b1` |
+| double-click strip | maximised (zoomed=True), double-click again restored | `b1`, `B-maximised.png` |
+| top edge | `HTTOP`, resized 570 to 610 px tall | `b2`, `B-after-topedge.png` |
+| snap layouts | flyout under the hovered maximise button | `B-snap-hover.png` |
+| hit tests | strip `HTCLIENT`, top `HTTOP`, max `HTMAXBUTTON`, close `HTCLOSE`, left `HTLEFT`, corner `HTBOTTOMRIGHT` | `w2` |
+| the launcher's fit | `titlebar: tabs, caption 31 px and buttons 146 px at this desktop's DPI`; `leaves the caption-button corner clear` | compositor log, 90.2 |
+| scrolling (in-page `requestAnimationFrame` while the wheel turns, 40 notches 150 ms apart) | 58.0, 58.6, 59.1 fps cumulative, p50 17, p95 18, p99 33 ms; second session 59.6 (p99 19) restored and 59.2 maximised | `d1`, `p1`, `D-scroll-mid.png`, `D-scroll-end.png` |
+| WebGL | triangle drawn, centre pixel (255,128,25); 289 frames in 5.1 s; renderer reported as Firefox's sanitised `Intel(R) HD Graphics, or similar` | `d2`, `D-webgl.png` |
+| tearing, stale regions, black rectangles | none in any capture (each judged by a visual check) | — |
+| cursors | `HAND` over a link, `IBEAM` over text, `ARROW` on the strip, `SIZEWE`, `SIZENWSE`, `SIZENS` at the edges | `cursors-…png`, `f1`, `h3` |
+| hamburger menu | a 341x731 popup, fully drawn, no black frame; slid up to (937,21) to fit above the taskbar | `F-hamburger.png` |
+| context menu | at the pointer (639,194), fully drawn, no black frame | `F-context.png` |
+| clipboard, Firefox to Windows | Firefox's Ctrl+C reached the Windows clipboard (`copied-from-firefox-4711`) and pasted into a Windows edit control | `g1`, `G-editor.png` |
+| clipboard, Windows to Firefox | text typed in the Windows control, copied there, pasted into Firefox's textarea: `ta:copied-from-firefox-4711 / typed-in-windows-0815` | `g2` |
+| menu open while dragging its window (§85.10 item 3) | the press on the strip dismissed the menu, then the window moved | `h3` |
+| menu follows its window | an open menu was at x 890 after its window had moved 90 px, where it had been at 800 | `h3` |
+| focus loss | clicking the other window dismissed the menu | `h3` |
+| moves release the click grab (§85.10 item 4) | after a drag, hovering the other window lit its toolbar buttons (52 and 55 px changed; 0 over the disabled Back) | `h5` |
+| black frames round menus (§85.10 item 11) | none on Windows: Wine's | `F-*.png` |
+| crash events (§85.10 item 2) | none: `crashes/events/` empty after four sessions | — |
+| session end (§85.10 item 8) | four times: `the compositor exited: exit code: 0`, `session down` 60 s after the last close, nothing left on the VM host | `k1`, `p4` |
+
+The Alt-Tab captures were taken with Alt held, and the switcher was cancelled
+with Escape, so no window of the user's was activated.
+
+### 90.9 What was not run
+
+- **125% and 150%** (§82.10 item 3): changing the display scale is the user's
+  setting.
+- **`wc-guest.sh all`** (§85.10 item 1): not a session-1 item.
+- **A person hearing the sound, and A/V sync.**
+- **Input latency on the desktop** (§89.12).
+- **The §88 Marionette harness.** It needs test settings in the profile; the
+  in-page counter needed none.
+
+### 90.10 What was deployed
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-90` and `~/wc-launch-ivs-backup-90`, then `wc-launch.sh deploy` from this branch with §88.6's variables: **12 passed, 0 failed** (`deploy-90.txt`) |
+| changed | `wc-proxy` `23658bff…` to `04cbc5d4…` (the fix). `libsv_icd.so` `68eefa15…` to `9dc148a5…`: the same source, rebuilt in another worktree path. The green video predates it. |
+| unchanged | `sv-guest.exe`, `wc-launch.exe`, `wc-desk.exe`, `probe-relay.exe`, `wc-arena-host`, `sv-hostd` byte-identical; the ini, `gpu.env` and `wc-session` byte-identical |
+| removed after the run | the session-1 agent, its scheduled tasks and `C:\Users\<guest-user>\wce2e`; the harness's `wclaunch-click-cold` task; `/tmp/e2e-pages` on the VM host |
+
+Health: 165 samples of ssh to the guest plus a ping of <guest-nat-ip> from the VM
+host, every 15 s (`health.txt`). Two single misses: 04:39:41, where both of the
+workstation's ssh connections failed at once, and 04:41:55, one guest ssh while
+the ping answered. No fault, `GUARD` or fatal line in any GPU log, and QEMU never
+stopped.
+
+### 90.11 Also fixed: the harness's locate check had stopped running
+
+Since §89, `wc-launch.sh`'s `up:` line carries two `N bytes at` (the arena's and
+the rings'), so `wcl_assert_located`'s division was an arithmetic error. The
+check was skipped, and the leg still printed a pass. It now takes the first. On
+the guest: `the arena is the ivshmem device: run 0xa91e… … 134217728 bytes` and
+the topology assertion, both passing again.
+
+### 90.12 Gates
+
+| gate | result |
+|---|---|
+| `cargo test -p wc-proxy` | 124 passed, 0 failed, 3 ignored (one new: `a_package_without_share_falls_back_to_the_icons_beside_its_binary`) |
+| `cargo clippy -p wc-proxy --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | 1206 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
+| privacy | the full-screen captures are cropped above the taskbar, cut down to the taskbar button or the Alt-Tab panel, or masked grey outside Firefox (`H-two-redacted.png`); a separate check of every committed image: 33 of 34 images clean on the first pass; the Alt-Tab crops then lost 10 rows of cut-off desktop text under the panel |

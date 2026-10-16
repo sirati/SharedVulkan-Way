@@ -1072,9 +1072,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the
         // connection and this is where the connection still is.
-        let client_dirs = wc_proxy::proxy::Listener::peer_pid(&client)
-            .map(wc_proxy::icons::dirs_for_pid)
-            .unwrap_or_default();
+        let client_pid = wc_proxy::proxy::Listener::peer_pid(&client);
+        let client_dirs = client_pid.map(wc_proxy::icons::dirs_for_pid).unwrap_or_default();
+        // §90: the icons beside the executable, for a package with no `share/`.
+        let client_bundled =
+            client_pid.map(wc_proxy::icons::bundled_icons_for_pid).unwrap_or_default();
         let extra_dirs = args.icon_dirs.clone();
         let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
@@ -1104,6 +1106,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 let search = wc_proxy::icons::Search {
                     data_dirs,
                     theme: icon_theme,
+                    bundled: client_bundled,
                 };
                 // A failure here is logged and shrugged off. The whole feature
                 // is cosmetic: a compositor too old to have the global, or a
