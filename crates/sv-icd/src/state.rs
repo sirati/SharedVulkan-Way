@@ -953,4 +953,24 @@ mod tests {
         assert_eq!(version_string((1 << 22) | (4 << 12) | 323), "1.4.323");
         assert_eq!(version_string((1 << 22) | (3 << 12)), "1.3.0");
     }
+
+    /// docs/video-decode.md §7.13.5: the forwarder cannot import an
+    /// application's own memory, so `VK_EXT_external_memory_host` is not
+    /// promised. While it was, ffmpeg's `av_hwframe_transfer_data` (Firefox's
+    /// readback) imported its `malloc`ed frame, Intel's driver accepted the NULL
+    /// the GPU side passed on, and every hardware-decoded picture on the guest
+    /// read back as zeros. The withdrawal is derived (the pointer's command is
+    /// not in `ICD_EXPANDS_ARENA_POINTER`); this pins it.
+    #[test]
+    fn the_host_pointer_extension_is_not_promised() {
+        assert!(
+            sv_icd_entry::INCOMPLETE_EXTENSIONS.binary_search(&"VK_EXT_external_memory_host").is_ok(),
+            "VK_EXT_external_memory_host must not be advertised"
+        );
+        assert!(
+            sv_icd_entry::LOWERING_INCOMPLETE
+                .contains(&("VK_EXT_external_memory_host", "vkGetMemoryHostPointerPropertiesEXT")),
+            "and for the wild host pointer, not for some other reason"
+        );
+    }
 }

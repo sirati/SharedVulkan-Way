@@ -1225,11 +1225,26 @@ mod tests {
         // sayable, under the name that is actually in `NOT_IMPLEMENTED`: for a
         // promoted extension that is the core spelling, not the suffixed alias,
         // which is the indirection the original bug hid behind.
-        let named: Vec<&str> = INCOMPLETE_EXTENSION_REASONS.iter().map(|(e, _)| *e).collect();
+        //
+        // **Two reason tables, one output list.** The generator withholds an
+        // extension for a refused entry point (`INCOMPLETE_EXTENSION_REASONS`)
+        // or for a lowering that would put the application's own pointer on the
+        // wire (`LOWERING_INCOMPLETE`), and both land in
+        // `INCOMPLETE_EXTENSIONS`. Comparing against the first alone held only
+        // while the second was empty, which it stopped being when
+        // `VK_EXT_external_memory_host` was withdrawn (docs/video-decode.md
+        // §7.13.5).
+        let mut named: Vec<&str> = INCOMPLETE_EXTENSION_REASONS
+            .iter()
+            .map(|(e, _)| *e)
+            .chain(LOWERING_INCOMPLETE.iter().map(|(e, _)| *e))
+            .collect();
+        named.sort_unstable();
+        named.dedup();
         assert_eq!(
             named, INCOMPLETE_EXTENSIONS,
-            "INCOMPLETE_EXTENSION_REASONS and INCOMPLETE_EXTENSIONS are emitted from one \
-             set and must not disagree"
+            "INCOMPLETE_EXTENSIONS is emitted from the two reason tables together and \
+             must not disagree with them"
         );
 
         // An extension listed without a refused entry point is a promise
@@ -1250,8 +1265,10 @@ mod tests {
         // refused, nothing may be excluded.
         if NOT_IMPLEMENTED.is_empty() {
             assert!(
-                INCOMPLETE_EXTENSIONS.is_empty(),
-                "no entry point refuses, so no extension can be incomplete"
+                INCOMPLETE_EXTENSIONS
+                    .iter()
+                    .all(|e| LOWERING_INCOMPLETE.iter().any(|(l, _)| l == e)),
+                "no entry point refuses, so only a wild lowering can make an extension incomplete"
             );
         }
 
