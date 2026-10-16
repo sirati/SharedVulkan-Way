@@ -878,7 +878,11 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "serve" => {
             let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
             let clients: usize = arg("--clients").map_or(Ok(1), |s| s.parse())?;
-            serve(driver, &socket, arena_size, clients)
+            // `--slots N`: at most N sessions at once, the rest refused in the
+            // guest's words, so that the ivshmem path's fixed slots can be
+            // measured on this machine (waycompose-design.md §95.10).
+            let slots: usize = arg("--slots").map_or(Ok(0), |s| s.parse())?;
+            serve(driver, &socket, arena_size, clients, slots)
         }
         "attach" => attach(driver, &socket),
         "guest" => {
@@ -890,7 +894,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             eprintln!(
                 "usage: sv-gpu-server <serve|attach|guest> --socket <path> \
-                 [--device N] [--arena BYTES] [--clients N] [--huge] [--bell PORT]"
+                 [--device N] [--arena BYTES] [--clients N] [--slots N] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())
         }
@@ -904,6 +908,7 @@ fn serve(
     socket: &str,
     arena_size: u64,
     clients: usize,
+    slots: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
@@ -973,8 +978,24 @@ fn serve(
     // real and is stated rather than hidden**: `N` × `--arena` bytes of device
     // memory, so `--clients 8 --arena 256M` is 2 GiB. `--arena` is the knob.
     let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    for i in 0..clients {
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut i = 0;
+    while i < clients {
         let (sock, _) = listener.accept()?;
+        let busy = live.load(std::sync::atomic::Ordering::Acquire);
+        if slots != 0 && busy >= slots {
+            let reason = format!(
+                "all {slots} GPU session slots are taken ({busy} busy, 0 quarantined, 0 free)"
+            );
+            eprintln!("[gpu] a client: refused: {reason}");
+            // After its `AttachRequest`, as `sv-hostd` answers: a refusal
+            // written before the client has written anything races its write,
+            // which then fails with EPIPE instead of reading the reason.
+            let _ = sv_transport::cold::recv(&sock);
+            let _ = sv_transport::cold::send(&sock, &sv_transport::cold::ColdMessage::Refuse { code: 4, reason });
+            continue;
+        }
+        live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         // Everything below is per session, and it is built *after* the accept so
         // that a client that never comes costs nothing.
@@ -1100,6 +1121,7 @@ fn serve(
         // here: closing it is how the client learns the GPU side is gone, and a
         // client whose cold path closed under it while its rings were live would
         // read that as a crash.
+        let live = Arc::clone(&live);
         sessions.push(std::thread::spawn(move || {
             let _sock = sock;
             let _region = control_region;
@@ -1131,7 +1153,9 @@ fn serve(
                     }
                 }
             }
+            live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }));
+        i += 1;
     }
 
     for s in sessions {

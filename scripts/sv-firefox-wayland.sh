@@ -116,6 +116,16 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("layout.css.devPixelsPerPx", "$DPPX");
 PREFS
+# `SVWL_VULKAN_DECODE=1`: the three prefs `wc-session` writes on the deployed
+# install (waycompose-design.md §95.10). With them Firefox starts more processes
+# that open a GPU session at start-up, which is what two slots ran out of.
+if [ "${SVWL_VULKAN_DECODE:-0}" = 1 ]; then
+  cat >>"$RUN/profile/user.js" <<PREFS
+user_pref("media.hardware-video-decoding-vulkan.enabled", true);
+user_pref("media.hardware-video-decoding-vulkan.force-enabled", true);
+user_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);
+PREFS
+fi
 
 # ------------------------------------------------------------- compositor ---
 # Two servers, one socket name. `weston` is the control this file was written
@@ -220,7 +230,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; th
   # window in which something in Firefox rendered through this driver, which
   # about:support cannot say: its GPU rows come from the `glxtest` probe, not
   # from the context WebRender actually made.
-  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 \
+  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} \
       --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 240)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" '
@@ -243,7 +253,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; th
   for _ in $(seq 1 40); do [ -s "$RUN/gpu.pid" ] && break; sleep 0.25; done
   KIDS+=($(cat "$RUN/gpu.pid"))
 else
-env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 fi
