@@ -54,9 +54,8 @@ const PUMP_CHUNK: usize = 64 * 1024;
 
 /// One accepted connection: the ring, and the socket end smithay does not have.
 struct Link {
-    /// Which directory slot this is. Carried so a stuck connection can be named
-    /// in a log by the same number both ends use for it.
-    #[allow(dead_code)]
+    /// Which directory slot this is: the number both ends use for it, and
+    /// since §89 what `RingLink::reap` checks before giving a slot back.
     slot: u32,
     channel: ByteChannel,
     /// Our end of the pair. smithay holds the other.
@@ -233,6 +232,81 @@ impl RingLink {
         Ok(RingLink { control: Arc::new(control), links: Vec::new(), seen: Vec::new() })
     }
 
+    /// Listen on a control region this process has already created — the
+    /// tail of the ivshmem arena (waycompose-design.md §89). The region was
+    /// zeroed and published by `Control::create`; what is left is the
+    /// directory poll.
+    pub fn over(control: Arc<Control>) -> RingLink {
+        RingLink { control, links: Vec::new(), seen: Vec::new() }
+    }
+
+    /// The doorbell half of the loop's wait (§89): before it sleeps, set
+    /// `parked` on the lane every live connection's proxy writes, so a write
+    /// rings the port instead of waiting for the next turn. Then look once
+    /// more: returns whether a lane already has something, in which case the
+    /// caller should not sleep at all. Always followed by [`Self::unpark`].
+    pub fn park(&self) -> bool {
+        let mut ready = false;
+        for link in self.links.iter().filter(|l| !l.dead && !l.ring_eof) {
+            if let Ok(bell) = link.channel.rx_bell() {
+                bell.parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            // A lane whose bytes are held back by the local socket (smithay not
+            // reading yet) is not a reason to skip the wait: the next turn
+            // could not take them either, and counting it would spin.
+            ready |= link.to_local.is_empty() && link.channel.readable().unwrap_or(true);
+        }
+        ready
+    }
+
+    /// Undo [`Self::park`] for the same set of connections: nothing between
+    /// the two calls changes `links`.
+    pub fn unpark(&self) {
+        for link in self.links.iter().filter(|l| !l.dead && !l.ring_eof) {
+            if let Ok(bell) = link.channel.rx_bell() {
+                bell.parked.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Give back the slots of connections both ends have finished with (§89).
+    ///
+    /// `Control::kill_ring`'s rule kept a dead slot dead for the life of the
+    /// region, and the region now lives as long as the session — twelve hours
+    /// of Firefox starts, each taking several connections. So the slot comes
+    /// back, by the protocol `Control::recycle_ring` documents: the proxy marks
+    /// `DEAD` as its last touch, and this side
+    ///
+    /// * treats `DEAD` with nothing left in the lane as the end of the stream
+    ///   (a proxy that went without writing its end is still gone), so the
+    ///   client is disconnected after its last bytes, by `Link::pump`;
+    /// * recycles a `DEAD` slot no link of its own is still using, and forgets
+    ///   it was seen, because the number will next mean a new connection.
+    pub fn reap(&mut self) -> usize {
+        use sv_transport::control::{RingKind, RingState};
+        for link in self.links.iter_mut().filter(|l| !l.dead && !l.ring_eof) {
+            if self.control.ring_state(link.slot).ok() == Some(RingState::Dead)
+                && !link.channel.readable().unwrap_or(true)
+            {
+                link.ring_eof = true;
+            }
+        }
+        let mut recycled = 0;
+        for slot in 0..self.control.layout().geometry.ring_slot_count {
+            if self.control.ring_state(slot).ok() != Some(RingState::Dead)
+                || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
+                || self.links.iter().any(|l| l.slot == slot)
+            {
+                continue;
+            }
+            if self.control.recycle_ring(slot).is_ok() {
+                self.seen.retain(|s| *s != slot);
+                recycled += 1;
+            }
+        }
+        recycled
+    }
+
     /// New connections since the last call — **this is `accept()`**.
     ///
     /// Returns the stream to hand to `insert_client` for each. A slot is only
@@ -359,6 +433,74 @@ impl Link {
             }
         }
     }
+}
+
+/// What a byte on the rings' port does in the compositor (§89): end the
+/// Wayland thread's wait. The byte names a slot and a lane, and which one does
+/// not matter — the turn it starts pumps every ring.
+pub struct WakeOnBell(pub crate::tick::Waker);
+
+impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
+    fn ring_token(&self, _token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
+        woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.wake();
+        true
+    }
+}
+
+/// Open the Wayland rings' doorbell (waycompose-design.md §89): the
+/// virtio-serial port `name` on the guest, or — when `name` is a path — the
+/// Unix socket a test stands in for it with.
+///
+/// Half a second, not the ten `PortHandle::guest_port` waits: that wait is for
+/// a port being hot-added under a harness, and here a missing port is a VM
+/// without the device, whose answer is the socket path, now rather than in ten
+/// seconds of a user's click. A port another process holds is refused at once
+/// by the driver (one opener per port), which is the same answer.
+pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::PortHandle> {
+    #[cfg(unix)]
+    if name.contains('/') {
+        return sv_transport::vdoorbell::PortHandle::host_socket(name);
+    }
+    #[cfg(windows)]
+    {
+        sv_transport::winpipe::open_virtio_port(name, 500)
+            .map(|p| sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)))
+            .map_err(|e| std::io::Error::other(format!("{e}")))
+    }
+    #[cfg(not(windows))]
+    sv_transport::vdoorbell::PortHandle::guest_port(name)
+}
+
+/// The ring region at the tail of ivshmem arena `id` (§89): create the control
+/// region there, install the port's writer as this process's cross-VM
+/// doorbell, and hand back the listener, the port's reader — which the
+/// Wayland thread turns into wakes of its own loop — and the slot count.
+///
+/// The region is the compositor's to create, as every ring region has been
+/// (this module's header): it zeroes the tail and publishes a control header
+/// the proxy attaches to after it has checked the arena header's run id.
+pub fn over_ivshmem(
+    id: u32,
+    port: sv_transport::vdoorbell::PortHandle,
+) -> Result<(RingLink, Box<dyn Read + Send>, u32), String> {
+    let (base, len) = wc_handle::arena::ivshmem_rings(id).map_err(|e| e.to_string())?;
+    // SAFETY: `ivshmem_rings` returns the tail of the ivshmem view, which the
+    // arena registry keeps mapped for the life of the process, `len` bytes
+    // long; nothing else in this process uses those bytes.
+    let region = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base, len) });
+    let geometry = Geometry::for_wayland();
+    let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+    let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
+    control.stamp_epoch().map_err(|e| e.to_string())?;
+    let (reader, writer) = port.split().map_err(|e| e.to_string())?;
+    // The writer is what `Bell::ring` pokes when the proxy is parked on a lane
+    // this process writes. One per process, and this process has no other
+    // rings.
+    sv_transport::park::install_cross_wake(Some(
+        Arc::new(sv_transport::vdoorbell::PortWake::new(writer)) as Arc<dyn sv_transport::park::CrossWake>,
+    ));
+    Ok((RingLink::over(Arc::new(control)), reader, geometry.ring_slot_count))
 }
 
 /// Why `--wayland-cold` is Linux-only, in one place.

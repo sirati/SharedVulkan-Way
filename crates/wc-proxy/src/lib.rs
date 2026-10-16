@@ -94,6 +94,10 @@ pub mod pace;
 pub mod pool;
 #[cfg(unix)]
 pub mod proxy;
+/// The session's Wayland connections as rings in the ivshmem region, and
+/// the doorbell that wakes a pump parked on one (docs/waycompose-design.md §89).
+#[cfg(unix)]
+pub mod rings;
 #[cfg(unix)]
 pub mod session;
 #[cfg(unix)]

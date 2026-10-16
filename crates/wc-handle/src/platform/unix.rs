@@ -535,7 +535,22 @@ pub fn map_ivshmem_slot(slot: u8) -> io::Result<(MappedView, u64, String)> {
 }
 
 /// See [`map_ivshmem_slot`].
+///
+/// **One stand-in, for a Linux test of the §89 path end to end**: with
+/// `WC_IVSHMEM_STANDIN=<file>` set, that file is mapped read-write as device
+/// `index`'s BAR, so a Linux compositor and a proxy on one machine run the
+/// launcher's whole ivshmem layout — header, arena, rings — with a file where
+/// the device would be (`scripts/wc-rings.sh`). It exists only here: the
+/// compositor the launcher runs is the Windows one, whose `map_ivshmem` maps a
+/// device and nothing else, so this cannot turn the product's arena into a
+/// file (§28.2's rule is about that compositor, and it still holds).
 pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
+    if let Some(path) = std::env::var_os("WC_IVSHMEM_STANDIN") {
+        let path = path.to_string_lossy().into_owned();
+        let len = std::fs::metadata(&path)?.len();
+        let view = map_file_mut(&path, len as usize)?;
+        return Ok((view, len, format!("stand-in file {path} for device {index}")));
+    }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!("ivshmem device {index}: an ivshmem device is a Windows guest's, not this machine's"),

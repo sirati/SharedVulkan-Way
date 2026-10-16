@@ -460,7 +460,10 @@ impl PortHandle {
         std::os::unix::net::UnixStream::connect(path).map(PortHandle::Unix)
     }
 
-    fn split(self) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    /// One reader and one writer over the one open (see [`attach`]). Public
+    /// since waycompose-design.md §89, whose compositor wakes its own loop
+    /// with the reader rather than a ring's futex.
+    pub fn split(self) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         Ok(match self {
             #[cfg(unix)]
             PortHandle::File(f) => {

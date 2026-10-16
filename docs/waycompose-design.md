@@ -27683,3 +27683,276 @@ heavier than the long page: the renderer's p99 is within a millisecond of the
 period. `ssh.exe` itself is not fixed; input events from the guest still cross
 it and still wait for host traffic (most of the time a client is drawing,
 there is some).
+
+## 89. Input in under a millisecond: the Wayland connections leave ssh for rings in the ivshmem region
+
+Written 2026-10-16, on branch `tunnel-latency`, from master 03b0585. The brief:
+§88 left input (keyboard, pointer, wheel, from Win32 on the guest to Firefox
+on the host) waiting behind `ssh.exe`'s hold on small guest-to-host messages;
+measure the input path end to end, choose a low-latency transport for the
+Wayland stream with evidence, build it with the old path as a loud fallback,
+verify on the guest, and enable it in `wcivs`. Every guest run was in session
+0 over ssh, on the `wcgpu` test installation until the last step, with a
+health watchdog (ssh to the guest and ping from the VM host, every 15 s) that
+never failed. The results are in `docs/tunnel-latency/`.
+
+### 89.1 Status in one paragraph
+
+**Input from Windows to the client's socket now takes 0.70 ms at the median,
+2.40 ms at p99 and 3.17 ms at worst, against 14.93, 34.98 and 50.91 ms
+before** (Firefox on a static page; the animated and wheel cases are in 89.6).
+The Wayland connections are §36's rings, at last used by the launcher: the
+compositor keeps the last 6 MiB of its ivshmem BAR (§83) for a 32-slot
+shared_vulkan control region, the header says where, and a second
+virtio-serial port, `org.sirati.wcbell.0`, carries the wakes in both
+directions, as §87's port does for the GPU. The crossing itself is 0.02 ms,
+below what the clock can resolve. Two smaller fixes in the compositor took the
+rest: the Wayland thread is woken by queued input instead of finishing a 5 ms
+wait, and pumps the rings again after it flushes. ssh keeps authentication,
+control, the sound, the GPU's cold path and the icon and clipboard feeds; a
+session without the port falls back to the tunnel and says so, in capitals,
+at four layers. Scrolling stays at 60 fps and sound is unchanged. Deployed in
+`wcivs`; the port was hot-added to the running VM and its NixOS persistence is
+built and dry-activated but not switched (89.8).
+
+### 89.2 The instrument
+
+§88's `WC_FRAME_TRACE` gained an input timeline and a clock that can be
+compared across the two machines.
+
+| stamp | where | what |
+|---|---|---|
+| `inj` | `probe-input-latency.exe` (guest) | posts `WM_MOUSEMOVE`, or a move and a `WM_MOUSEWHEEL`, into the largest window of `sv-guest.exe`, every 25–75 ms (jittered so nothing that ticks hides its share) |
+| `wc.in` | compositor, UI thread | the window procedure has the event |
+| `wc.in_tx` | compositor, Wayland thread | the event leaves the UI channel for smithay |
+| `wc.flush` | compositor, Wayland thread | the turn's flush: its bytes are in the socket, or the ring |
+| `px.in` | wc-proxy | the event parsed from the compositor's stream, with its `time` |
+| `px.out` | wc-proxy | the write to the client's socket that carried it returned |
+
+`WC_FRAME_TRACE_CLOCK=mono` stamps with `QueryPerformanceCounter` on the guest
+and `CLOCK_MONOTONIC` on the host, which every process on a machine shares
+whatever the wall clock is doing. The offset between the two counters is
+measured, not estimated from the traffic being timed: `wc-clock-sync.py`
+pings `probe-tunnel-latency.exe` every 5 ms over a second tunnel made with Git
+for Windows' ssh (whose guest-to-host direction does not hold, 89.4), keeps
+the fastest ping of every two-second window and fits a line through them. In
+every run the fastest round trips were 0.17–1.35 ms, the drift 1–4 ppm, and no
+window lay more than 69 µs off the line; a crossing below about 0.1 ms is
+therefore below the instrument, which is why two medians in 89.6 read −0.00
+and −0.02. `scripts/wc-input-latency.py` pairs the stamps (by the event's
+`time` where it has one, by position for `wl_pointer.enter`) and reports each
+gap. In session 0 the real cursor is never over the window, so the
+compositor's `TrackMouseEvent` answers every posted move with
+`WM_MOUSELEAVE` and every move becomes an `enter`; it takes the same path from
+`wc.in` on.
+
+### 89.3 Where an input event went, before
+
+`wcgpu`, accelerated Firefox, 60 s each, ms:
+
+| stage | static page p50 / p90 / p99 / max | animated page (60 Hz) | wheel (scrolling) |
+|---|---|---|---|
+| Windows to the window procedure | 0.15 / 0.22 / 0.33 / 0.55 | 0.15 / 0.22 / 0.32 / 0.51 | 0.13 / 0.23 / 0.36 / 0.73 |
+| waiting for the Wayland thread's turn | 2.88 / 5.16 / 7.13 / 8.59 | 2.47 / 5.02 / 5.42 / 6.03 | 2.92 / 6.00 / 8.39 / 9.32 |
+| smithay to the flush | 0.25 / 2.03 / 3.78 / 4.59 | 0.20 / 0.38 / 0.67 / 1.54 | 0.29 / 2.35 / 4.30 / 5.17 |
+| **the crossing** (relay, ssh.exe, sshd, the socket) | **11.39 / 23.17 / 30.84 / 46.33** | **14.73 / 28.19 / 37.42 / 55.47** | 0.45 / 1.32 / 20.49 / 25.62 |
+| wc-proxy | 0.03 / 0.07 / 0.65 / 3.16 | 0.03 / 0.05 / 0.12 / 0.97 | 0.03 / 0.19 / 0.95 / 3.02 |
+| **Windows to the client's socket** | **14.93 / 26.93 / 34.98 / 50.91** | **17.95 / 31.42 / 38.96 / 56.31** | 4.83 / 9.26 / 24.36 / 34.22 |
+
+The hold is not cured by the client drawing: with a square turning at 60 Hz
+the crossing was worse, because the frames go over the GPU rings and the
+proxy now answers frame callbacks itself (§88), so little Wayland traffic
+flows from host to guest to release the guest's messages. Scrolling releases
+them, by commits, most of the time and not at p99.
+
+### 89.4 The candidates, and the choice
+
+| candidate | crossing, measured or expected | authority the guest gains | robustness | fit |
+|---|---|---|---|---|
+| ssh.exe as now | p50 11.4, p99 30.8 ms (89.3) | — | works | — |
+| a host-to-guest keepalive at 2 ms (§88's probe) | p50 2.3, p90 7.2 ms | none | costs a wake every 2 ms on both machines for as long as a session is up | a workaround for another program's bug |
+| **Git for Windows' ssh** (OpenSSH 10.3, MSYS2) as the tunnel | **p50 0.58, p99 0.99, max 1.75 ms** end to end; 0.65/1.06 ms above the fastest crossing alone | none: the same key, forced command and forwards | depends on a third-party install being on the guest; its key-permission check passes only because MSYS2 mounts with `noacl`; it refused to start the launcher's tunnel because stale tunnels of other sessions still held the audio port (Windows' ssh.exe binds beside them) | the data stays in ssh, encrypted, through a relay process and TCP |
+| plain TCP on the host-only link with a per-session secret | ~1 ms (the link's ping is 0.73–1.15 ms) | a new listener on the host reachable from the guest's network; the secret is the only thing keeping anything else on that link out | needs a firewall rule on the host (a networking change, which this work may not make) | a second authenticated channel beside ssh |
+| vsock | tens of µs | a new device class and a host listener on a vsock port any host process could bind first | `/dev/vhost-vsock` exists on the host, but the guest has **no viosock driver** (virtio-win's installed set is balloon, ivshmem, viofs, vioinput, viorng, vioscsi, vioser, viostor, netkvm, viomem): a new kernel driver and a Winsock provider on a machine a family member uses daily | a second transport family |
+| a virtio-serial port carrying the Wayland bytes | tens of µs (§36.6.3: 17.6 µs round trip) | none new (89.9) | one opener per port, so Firefox's several connections, the feeds and resynchronisation after a session all need a multiplexing layer | §36.3 rejected one stream for several connections: head-of-line blocking and an id-rewriting layer |
+| **§36's rings in the ivshmem region, a virtio-serial port as the doorbell** | **0.02 ms** (89.6) | none new (89.9) | the driver is already installed and the port is hot-pluggable (§87.5); the ring code is shared_vulkan's, Miri-checked; a missing port falls back | the design's own answer: §36.2 calls a Wayland connection a ring slot and "the real one" |
+
+The last is chosen. It is the only candidate whose latency is the hypervisor's
+rather than a network's, it moves no authority (89.9 and security-model.md
+R31), it needs no driver the guest does not have, and it is what §36 said the
+Wayland connection should have been from the start. Git's ssh is the measured
+runner-up and the cheapest; it is recorded here because a fallback that wanted
+to be faster could use it, not built.
+
+### 89.5 What was built
+
+**The region.** `wc_handle::arena::attach_ivshmem_with_rings` keeps the BAR's
+last `Geometry::for_wayland().control_size` (6 MiB) out of the arena: the
+arena's offset 0 stays at byte 4096 and only its length shrinks, by 6 MiB of
+128. The header (`wc_handle::ivshmem`) is version 2: `rings` at offsets 64 and
+72, in region offsets, refused anywhere but the region's tail; a version-1
+header reads as one with no rings, so a host updated first still serves an
+older compositor. `Geometry::for_wayland` is 32 slots of 64 KiB lanes (a
+Wayland message is at most 4 KiB; 32 is below the doorbell byte's 64 slots).
+
+**Slots come back.** `Control::kill_ring` kept a dead slot dead for the
+region's life, which was right for a test and wrong for a twelve-hour session.
+`Control::recycle_ring` (owner only, `DEAD` only, never the reverse ring) zeroes
+the control block and stores `FREE` with release; the proxy marks `DEAD` as its
+last touch of a connection (`RingUpstream`'s `Drop`, after its end of stream);
+the compositor's `RingLink::reap` treats `DEAD` with an empty lane as the end
+of the stream, ends the client, and recycles slots no link of its own still
+uses. `scripts/wc-rings.sh` runs 40 clients in a row through one recycled slot.
+
+**The doorbell.** The compositor opens `org.sirati.wcbell.0` (half a second's
+wait, not the ten `PortHandle::guest_port` gives a port being hot-added) and
+installs its writer as the process's `CrossWake`; `Bell::ring` pokes it when
+the proxy is parked. wc-proxy connects to QEMU's socket for the port, installs
+its writer the same way, and runs one thread (`rings::BellHub`) that turns a
+byte naming a connection's reply lane into a write to that connection's
+`eventfd`, which is in the pump's `poll` set. Both sides park on the lane they
+read before they sleep and look once more after, `Bell`'s handshake with a
+`poll` and a waitable timer where the futex was. A ring with a doorbell sleeps
+like a socket; the 20 ms timeout is only the bound on a lost byte.
+
+**The compositor's turn.** `tick::Ticker` gained a `Waker` (an auto-reset
+event on Windows) that the UI thread sets when it queues an event and the
+doorbell's reader sets on every byte, so the loop handles input on arrival.
+That took the turn from p50 2.88, p99 7.13 ms to 0.09 and 1.81. The rings are
+pumped again right after `flush_clients`, so what smithay flushed leaves in the
+same turn instead of the next.
+
+**The launch path.** `wc-launch` passes `--wayland-rings <wayland-bell>`
+(default `org.sirati.wcbell.0`, empty to turn it off) and logs what the
+compositor said. `wc-session up` reads the header's version and rings and
+checks the port's socket; `proxy` adds `--wayland-rings --wayland-bell` only
+when both are there and reports what the proxy made of them. The proxy keeps
+`--upstream`: the icon and clipboard feeds use it, and so does any connection
+that cannot have a ring. The tunnel is opened exactly as before.
+
+### 89.6 After
+
+`wcgpu`, the same build of Firefox and the same harness as 89.3, ms:
+
+| stage | static page p50 / p90 / p99 / max | animated page | wheel |
+|---|---|---|---|
+| Windows to the window procedure | 0.16 / 0.22 / 0.34 / 0.82 | 0.15 / 0.23 / 0.30 / 0.69 | 0.18 / 0.27 / 0.40 / 0.70 |
+| waiting for the turn | **0.09 / 0.17 / 1.81 / 2.64** | 0.09 / 0.14 / 0.30 / 0.51 | 0.10 / 0.16 / 0.33 / 0.60 |
+| smithay to the flush | 0.38 / 0.53 / 0.87 / 2.50 | 0.43 / 0.57 / 0.70 / 0.83 | 0.44 / 0.60 / 0.77 / 0.95 |
+| **the crossing** (ring and doorbell) | **0.02 / 0.05 / 0.58 / 1.06** | −0.00 / 0.04 / 0.09 / 1.36 | −0.02 / 0.03 / 0.11 / 1.47 |
+| wc-proxy | 0.03 / 0.04 / 0.21 / 1.65 | 0.03 / 0.04 / 0.10 / 0.49 | 0.03 / 0.05 / 0.13 / 1.52 |
+| **Windows to the client's socket** | **0.70 / 0.97 / 2.40 / 3.17** | **0.72 / 0.89 / 1.07 / 1.97** | **0.75 / 0.96 / 1.23 / 2.43** |
+
+| check | result |
+|---|---|
+| §88's scroll harness, three rounds | **60.3, 60.2, 60.5 fps**, rAF p50 17, p95 18, p99 18–19, max 19 ms (§88: 60.4, 60.3, 60.3; p99 18) |
+| sound, a 440 Hz WebAudio tone for 30 s at waveOut volume 0 (night, a person's speakers), rings | 33.4 s played, 31.4 s of it not silent, 84 chunks dropped and 12 underruns, all in the first 10 s |
+| the same, the same session shape on the ssh path (`wayland-bell =`) | 32.4 s played, 30.5 s not silent, **84 dropped, 12 underruns, all in the first 10 s**: unchanged by the transport |
+| fallback: `wayland-bell = org.sirati.nosuch.0` | the compositor's `WAYLAND RINGS UNAVAILABLE … CreateFileW … errno 2`, `wc-session up`'s and `proxy`'s `SSH FALLBACK`, three `SSH FALLBACK` lines in the launcher's log; Windows to the socket p50 10.64, p99 31.15 ms, the turn's fix kept |
+| locally, `scripts/wc-rings.sh` | 40 of 40 clients on a ring, one recycled slot; then 40 of 40 on the socket, the fallback said at both ends |
+
+What remains of the path is smithay's own work between taking an event and
+flushing it (0.4 ms) and Windows' queue (0.15 ms). Neither was the brief's.
+
+### 89.7 Two things found that are not this section's
+
+**Stale tunnels in `wcgpu`.** Three Windows `ssh.exe` tunnels started on
+2026-10-15 between 18:36 and 18:51 (the §87 sessions, parent processes gone)
+still listen on `wcgpu`'s audio port 57472, and Windows' ssh.exe binds a fourth
+beside them; the launcher's sound then connects to one of the stale ones and
+plays nothing ("0.0 s played"), which is how every `wcgpu` session of this
+section ran until the audio checks moved to port 57475. They were not started
+by this work and were not killed; whoever owns them can end them by pid (2860,
+8300, 5840) or let the next guest restart do it. `wcivs`'s ports were free.
+The launcher now kills its relay and tunnel when a cold start fails after
+starting them, which is one way such a tunnel was being left behind.
+
+**An idle sink drops and underruns.** On a page that plays nothing, the
+launcher's player counted 44 dropped chunks and 6.25 underruns a second, on
+the rings and on the ssh path alike (`wcivs`, 41 s and 74 s); with a tone
+playing the counts stop growing after the first seconds. The PCM of an idle
+null sink arrives in bursts. It is inaudible (it is silence) and predates this
+section; it is recorded because the counters look alarming.
+
+### 89.8 The VM side
+
+The port was hot-added to the running VM over QMP as root, with the ids the
+persistent configuration uses: `chardev-add` of a server socket
+`/run/windows-vm/wc-arena/wcbell.sock` with id `wcbell`, `device_add
+virtserialport,bus=vioserial.0,chardev=wcbell,name=org.sirati.wcbell.0,id=wcbellport`,
+then `chgrp wc-arena`, `chmod 0660` and `setfacl -m u:sirati:rw` on the
+socket. `query-status` said `running` before and after, the watchdog never
+failed, and the guest opened the port by name at once.
+
+nix-config branch `testhost-wc-wayland-rings` (6511e8a, on c1cd31a, which
+builds to exactly generation 53's `g9vz217c…`) adds
+`waycomposeArena.waylandBell` beside `doorbell`: the same chardev and port on
+the QEMU command line, the socket in the `ExecStartPost` that gives the GPU's
+socket its group and named ACLs, and removal with the arena's files. testhost
+enables it. The system `k77fwidz…` is built, copied to testhost, pinned by
+`~/wc-tl/system-wcbell`, and `switch-to-configuration dry-activate` says
+**"would NOT stop the following changed units: windows-vm.service"** and
+nothing else. **It is not switched**: switching is the owner's step. Until it
+is, the next VM start drops the port and every session falls back to the
+tunnel, loudly. The switch is
+`sudokey run -- /nix/store/k77fwidz52c4s2ghd9wff2q08sadfnx3-nixos-system-testhost-26.11.20260819.ffb3c9b/bin/switch-to-configuration switch`
+together with `nix-env -p /nix/var/nix/profiles/system --set` on that path for
+a boot entry; `windows-vm.service` has `restartIfChanged = false`, so the VM
+keeps running.
+
+### 89.9 Security
+
+The guest gains no authority (security-model.md R31 has the argument). In
+short: what crosses is bytes into a region the guest could already write
+(the ivshmem arena, R29) and one byte per wake into a socket QEMU made, `0660
+root:wc-arena` with a named ACL for `sirati`, exactly like §87's. Nothing new
+listens on the host: QEMU's chardev is the listener, the filesystem is its
+authentication, and wc-proxy *connects* to it. The guest's port has one opener,
+and whatever guest process holds it can only send wakes to, and write Wayland
+bytes for, the proxy that already parses everything the guest sends. The
+proxy still checks the header's run id before it attaches the rings, the ring
+layout against its own, and bounds every offset. ssh keeps the guest's one
+authority on the host: the forced command, its verbs and its forwards are
+unchanged. No descriptor can cross: the ring takes `&[u8]` and the doorbell a
+`u8` (§14.7, §36.5).
+
+### 89.10 What is deployed
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-89` and `~/wc-launch-ivs-backup-89`, then `wc-launch.sh deploy` from this branch with §88.6's variables: **12 passed, 0 failed**, every binary byte-identical on the far side; `gpu.env` byte-identical; the ini differs only by `wayland-bell = org.sirati.wcbell.0` and its comment |
+| `wcivs`, checked | one session in session 0, Marionette and the test profile put in for it and taken out after (the ini and `gpu.env` are the deployed ones again): rings and doorbell up at all four layers; Windows to the client's socket **p50 0.67, p90 0.88, p99 1.28, max 3.16 ms**; the same with `wayland-bell =`: p50 15.29, p99 38.62 ms; a tone: 32.6 s played, 30.8 s not silent |
+| `wcgpu` | this branch's build; `gpu.env` and the ini as before this section; the previous binaries as `*.pre-tl` |
+| testhost | the `wcbell` port, hot-added; NixOS generation built and dry-activated, not switched (89.8) |
+
+### 89.11 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **101 binaries, 2847 passed, 0 failed**, 8 ignored (master: 2832; 15 new: the monotonic clock, five ring tests in `wlbytes`, three header tests, the waker, three proxy ring tests, two launcher tests; the ivshmem attach test now attaches with rings) |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-rings.sh` | `wc-rings: OK` |
+| Miri (`nix develop .#miri`) | sv-transport's 17 `wlbytes` tests (recycling, `readable`, the parked words, the Wayland geometry) and wc-handle's 7 header tests: no undefined behaviour. The new `unsafe` otherwise is FFI Miri does not model (`eventfd`, `QueryPerformanceCounter`, `clock_gettime`, `CreateEventW`/`SetEvent`) and one pointer offset inside the ivshmem view (`ivshmem_rings`), exercised natively by the arena test |
+| `scripts/wc-xref.sh --list` | 1205 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
+
+### 89.12 What is not measured, and what is not done
+
+* **The interactive desktop.** As in §88, nobody was logged in: input was
+  posted into a session-0 window, so the time from a real device to the window
+  procedure (Windows' own input stack) is not in these numbers, and every move
+  was an `enter`. From the window procedure on, the path is the one a person's
+  input takes.
+* **The client's own reading.** The path ends at wc-proxy's write into the
+  client's socket; Firefox's read of it is a local `AF_UNIX` hop.
+* **Host to guest** is faster too (the doorbell wakes the compositor when the
+  proxy writes, where a commit used to wait for the next 5 ms turn) and was not
+  timed separately; §88's scroll numbers are its check.
+* **Still on ssh:** the clipboard and icon feeds (one each per connection; a
+  paste from Windows into Firefox still waits for the hold), the sound (host to
+  guest, which ssh.exe does not hold), and the GPU's cold path. Moving the feeds
+  onto rings is two more claims per connection and is the next step if a
+  paste ever feels slow.
+* **The NixOS switch** (89.8).

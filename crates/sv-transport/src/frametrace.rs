@@ -27,6 +27,16 @@
 //! boundary the two wall clocks are not the same clock; the analysis estimates
 //! their offset from events both sides see rather than trusting them.
 //!
+//! **`WC_FRAME_TRACE_CLOCK=mono`** (docs/waycompose-design.md §89) replaces the
+//! wall clock with the machine's monotonic counter: `QueryPerformanceCounter`
+//! in microseconds on Windows, `CLOCK_MONOTONIC` on Linux. Every process on a
+//! machine reads the *same* counter, so two processes started minutes apart
+//! agree exactly even while the wall clock is being slewed — which a guest's
+//! time service does, and which across a one-minute input run is milliseconds.
+//! It is also the clock `probe-tunnel-latency.exe` and `wc-clock-sync.py`
+//! stamp with, so the offset between the two machines can be measured rather
+//! than estimated from the traffic being timed.
+//!
 //! # The file
 //!
 //! `WC_FRAME_TRACE=<path>`, with `%p` replaced by the process id, opened for
@@ -55,10 +65,14 @@ fn trace() -> Option<&'static Trace> {
         let path = path.replace("%p", &std::process::id().to_string());
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
         let epoch_instant = Instant::now();
-        let epoch_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+        let mono = std::env::var("WC_FRAME_TRACE_CLOCK").is_ok_and(|v| v == "mono");
+        let epoch_us = match mono.then(mono_us).flatten() {
+            Some(us) => us,
+            None => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0),
+        };
         Some(Trace {
             epoch_instant,
             epoch_us,
@@ -69,6 +83,47 @@ fn trace() -> Option<&'static Trace> {
         })
     })
     .as_ref()
+}
+
+/// The machine's monotonic counter in microseconds, the clock
+/// `WC_FRAME_TRACE_CLOCK=mono` asks for. Read once, at the first event; the
+/// process's `Instant` advances it after that, and `Instant` is this same
+/// counter on both platforms, so the two never drift apart.
+#[cfg(windows)]
+pub fn mono_us() -> Option<u64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(count: *mut i64) -> i32;
+        fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+    }
+    let (mut c, mut f) = (0i64, 0i64);
+    // SAFETY: two out-parameters on this stack frame.
+    let ok = unsafe { QueryPerformanceCounter(&mut c) != 0 && QueryPerformanceFrequency(&mut f) != 0 };
+    (ok && f > 0).then(|| (c as u128 * 1_000_000 / f as u128) as u64)
+}
+
+#[cfg(unix)]
+pub fn mono_us() -> Option<u64> {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    // CLOCK_MONOTONIC is 1 on Linux, the only Unix this crate's tracing runs on.
+    const CLOCK_MONOTONIC: i32 = 1;
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: an out-parameter on this stack frame, of the layout `clock_gettime`
+    // writes on a 64-bit Linux.
+    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+    (rc == 0).then(|| ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn mono_us() -> Option<u64> {
+    None
 }
 
 /// Whether `WC_FRAME_TRACE` names a file this process could open.
@@ -174,6 +229,19 @@ impl OpTally {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §89. The `mono` clock is the counter `Instant` reads, so the two must
+    /// advance together; a wall clock would not, while it is being slewed.
+    #[test]
+    #[cfg_attr(miri, ignore = "FFI: clock_gettime / QueryPerformanceCounter")]
+    fn the_monotonic_clock_advances_with_instant() {
+        let (a, i) = (mono_us().expect("a monotonic counter"), Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        let (b, j) = (mono_us().expect("a monotonic counter"), Instant::now());
+        assert!(b > a, "the counter went from {a} to {b}");
+        let skew = (b - a) as i64 - (j - i).as_micros() as i64;
+        assert!(skew.abs() < 5_000, "the counter and Instant disagree by {skew} us over 20 ms");
+    }
 
     #[test]
     fn a_tally_sums_per_opcode_and_sorts_by_time() {

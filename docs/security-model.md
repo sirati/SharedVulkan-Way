@@ -892,3 +892,63 @@ it does:* the group must be one whose members could already stop or read the VM
 (today, `wc-arena`'s one member, `sirati`, who is in `wheel`). A narrower design
 would hand the ICD only the located runs, which needs a mapping of part of a
 memfd that another process can open, and none exists without CAP_SYS_ADMIN.
+
+### R31 — The Wayland rings' doorbell is a second port into the host
+Added 2026-10-16 with `waycompose-design.md` §89. The launcher's Wayland
+connections no longer cross the ssh tunnel. They are rings in the last 6 MiB of
+the ivshmem arena device (R29's region, one file, one group), and a second
+virtio-serial port, `org.sirati.wcbell.0`, carries one byte per wake in each
+direction. Its host end is QEMU's chardev socket
+`/run/windows-vm/wc-arena/wcbell.sock`, `0660 root:wc-arena` with a named ACL
+for each member, made by the VM's unit exactly as §87's `svbell.sock` is.
+
+**What the guest can do with it that it could not before: nothing.** The
+argument, piece by piece, because "a new channel from the guest to the host"
+is the kind of change that has to be argued rather than asserted:
+
+* *No new listener.* QEMU's chardev socket is the listener, and only members of
+  `wc-arena` can connect to it (the filesystem is its authentication, as for
+  R29's files). wc-proxy, running as `sirati`, connects. Nothing listens on a
+  network, a vsock port or a loopback port. The guest cannot reach any process
+  on the host through the port except the one that connected to it.
+* *No new data reach.* The ring bytes are written into the ivshmem region the
+  guest could already write in full (R29: every frame, every keymap, and the
+  compositor's half of the arena). The rings are its last 6 MiB.
+* *No new parser.* What wc-proxy reads from a ring is the Wayland stream it
+  already parsed when that stream came through the tunnel: the same
+  `Session::server_message`, the same bounds checks. What it reads from the port
+  is one byte at a time, each decoded as a slot and a lane; a byte that names
+  nothing it waits on is counted as stray and ignored (`rings::BellHub`). The
+  worst a hostile guest does with the port is wake a pump spuriously, which
+  costs a syscall, or stay silent, which costs the pump its 20 ms timeout.
+* *No new authority on the host.* ssh remains the guest's only way to cause
+  anything to happen on the host: the forced command, its verbs and its
+  forwards are unchanged, and it is still what starts the proxy and the
+  application. The rings are found through the header the compositor wrote,
+  and the proxy attaches them only after the header's run id matches the one
+  `up` was given over ssh, then checks the control region's protocol ids
+  (R13) and every directory offset against its own layout (R2).
+* *No descriptor.* The ring's write takes `&[u8]` and the doorbell's poke a
+  `u8`. Neither has a parameter through which a descriptor could be named
+  (§14.7, §36.5).
+
+**What a member of `wc-arena` gains:** the ability to send the guest's
+compositor spurious wakes, or to hold QEMU's one connection to the port and
+leave every session's rings without a doorbell. QEMU serves one client at a
+time and leaves the next in the kernel's backlog, so the proxy's connect
+succeeds and is never served: its pumps fall back to their 20 ms timeout and
+the compositor's to its 5 ms turn, which is slow and not wrong, and the
+proxy's closing line says `0 wake(s) delivered`. Both are R29's lever over
+again, smaller.
+
+**What a guest process other than the compositor can do:** the port has one
+opener. A process that opens it first keeps the compositor from having rings
+(it falls back, loudly) and receives the proxy's wakes, which carry no data.
+It could also write wake bytes. It can do nothing with the rings themselves
+that it could not do to R29's arena already. On testhost the guest has one
+interactive account.
+
+*Mitigation, unchanged:* `wc-arena` has one member, `sirati`, who is in
+`wheel`. The socket is recreated with the group by the VM's unit on every start
+(once the NixOS change of §89.8 is switched); until then it exists only as
+hot-added, with the same mode and ACL set by hand.

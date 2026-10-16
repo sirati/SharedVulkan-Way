@@ -437,6 +437,9 @@ audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
+# §89: the Wayland rings' doorbell port; empty sends the Wayland connections
+# through the ssh tunnel, as a VM without the port does (loudly, either way).
+wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 
 [app.firefox]
 title = $TITLE

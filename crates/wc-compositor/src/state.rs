@@ -613,6 +613,9 @@ pub struct State {
     /// Commits since the dispatch loop last looked, for `WC_FRAME_TRACE`
     /// (docs/waycompose-design.md §88).
     pub trace_commits: u32,
+    /// Input events handed to smithay since the loop last flushed, for
+    /// `WC_FRAME_TRACE`'s `wc.flush` (docs/waycompose-design.md §89).
+    pub trace_inputs: u32,
     pub stopped: bool,
 }
 
@@ -940,6 +943,7 @@ impl State {
             popups: 0,
             presents: 0,
             trace_commits: 0,
+            trace_inputs: 0,
             stopped: false,
         }
     }
@@ -1082,6 +1086,13 @@ impl State {
     /// Drain everything the UI thread has said since the last turn.
     pub fn pump_ui_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
+            // §89: the input event leaving the UI channel for smithay; the
+            // turn's `wc.flush` is when its bytes leave the compositor.
+            if sv_transport::frametrace::enabled()
+                && crate::platform::trace_input("wc.in_tx", &event)
+            {
+                self.trace_inputs += 1;
+            }
             match event {
                 FromUi::Stopped => self.stopped = true,
                 FromUi::Resized { id, width, height } => self.on_resized(id, width, height),

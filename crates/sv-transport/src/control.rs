@@ -360,6 +360,37 @@ impl Geometry {
             timeline_count: 64,
         }
     }
+
+    /// The region that carries the launcher's Wayland connections, at the tail
+    /// of the compositor's ivshmem arena (waycompose-design.md §89).
+    ///
+    /// Shaped by what crosses on it, which is not what a Vulkan ring carries:
+    ///
+    /// * **64 KiB a lane, not 256.** A Wayland message is at most 4 KiB
+    ///   (libwayland's own limit), pixels go through the arena and a pool's
+    ///   descriptor has already become integers, so the stream is small and
+    ///   bursty. 64 KiB is sixteen of the largest messages in flight.
+    /// * **32 slots, not 16.** Slots are connections, Firefox makes several per
+    ///   start, and a dead slot only comes back through
+    ///   [`Control::recycle_ring`] once both ends have let go. 32 is also below
+    ///   [`crate::park::lane_token`]'s 64, so every slot can still ring a bell.
+    /// * **No arena of its own.** The region's arena *is* the ivshmem arena in
+    ///   front of it, which the proxy places pools in by offset; the slab
+    ///   directory is laid out for one 64 MiB slab nobody registers, because
+    ///   [`Layout::compute`] has no notion of a control region without one.
+    ///
+    /// 6 MiB, which the layout fills to a little over 4.3; the rest is room for
+    /// the directory to grow without moving the arena.
+    pub fn for_wayland() -> Self {
+        Geometry {
+            control_size: 6 << 20,
+            arena_size: 64 << 20,
+            arena_slab_size: 64 << 20,
+            ring_slot_count: 32,
+            ring_data_bytes: 64 << 10,
+            timeline_count: 16,
+        }
+    }
 }
 
 /// Where everything is. Computed once, published, and read rather than
@@ -857,6 +888,48 @@ impl Control {
     pub fn kill_ring(&self, slot: u32) -> Result<()> {
         let e = self.layout.ring_dir_entry(slot)?;
         self.region.atomic_u32(e + RD_STATE)?.store(RingState::Dead as u32, Ordering::Release);
+        Ok(())
+    }
+
+    /// Give a `DEAD` ring's slot back for the next claim. **Owner only**, and
+    /// only for a slot both ends have let go of (waycompose-design.md §89).
+    ///
+    /// [`Control::kill_ring`]'s rule — dead stays dead within a generation —
+    /// exists because "has the peer stopped reading this buffer" has no cheap
+    /// answer in general. A Wayland connection has one, and it is the protocol
+    /// this function is the last step of:
+    ///
+    /// 1. the side that claimed the slot marks it `DEAD` as its **last** access
+    ///    to the ring — after its final write and after it has stopped reading;
+    /// 2. the owner sees `DEAD`, drains what is left in the lane it reads, and
+    ///    drops its own end;
+    /// 3. only then does it call this: the control block is zeroed (heads,
+    ///    tails, seqnos, both doorbells, any fatal record) and the slot is
+    ///    stored `FREE` with `Release`, so a claimer whose CAS acquires `FREE`
+    ///    sees the zeroed block and nothing of the previous connection.
+    ///
+    /// The data buffers are not cleared: a lane's bytes are only ever read
+    /// between its head and its tail, and both are zero again.
+    ///
+    /// Refused for the reverse ring, for a slot that is not `DEAD`, and from a
+    /// peer, because each of those would be the lifetime race the rule above
+    /// was written against.
+    pub fn recycle_ring(&self, slot: u32) -> Result<()> {
+        if self.role != Role::Owner {
+            return Err(Error::Unsupported("only the region's owner may recycle a ring"));
+        }
+        if slot == REVERSE_RING_SLOT {
+            return Err(Error::Unsupported("the reverse ring is never recycled"));
+        }
+        if self.ring_state(slot)? != RingState::Dead {
+            return Err(Error::RingBusy { ring: slot });
+        }
+        let ctrl = self.layout.ring_ctrl(slot)?;
+        self.region.fill(ctrl, RING_CTRL_SIZE, 0)?;
+        let e = self.layout.ring_dir_entry(slot)?;
+        self.region.atomic_u64(e + RD_OWNER_ID)?.store(0, Ordering::Relaxed);
+        self.region.atomic_u32(e + RD_DEPENDS_RING)?.store(u32::MAX, Ordering::Relaxed);
+        self.region.atomic_u32(e + RD_STATE)?.store(RingState::Free as u32, Ordering::Release);
         Ok(())
     }
 

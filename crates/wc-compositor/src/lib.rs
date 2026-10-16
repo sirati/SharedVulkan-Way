@@ -144,6 +144,11 @@ struct Args {
     /// stamped or swept for; the compositor prints a run id the host checks
     /// against the header at the front of the region (`wc_handle::ivshmem`).
     ivshmem_arena: Option<(u32, u32)>,
+    /// §89. With `--arena-ivshmem`, keep the region's tail for the session's
+    /// Wayland connections as rings, woken through this virtio-serial port
+    /// (`org.sirati.wcbell.0`; a path is a Unix socket, for a test). Without
+    /// the port the rings are not offered and every connection uses the socket.
+    wayland_rings: Option<String>,
     /// Where to write the **page frame list** of every region this process
     /// commits, so the host can locate it by translation instead of by
     /// searching guest RAM for its stamps.
@@ -352,6 +357,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
         ivshmem_arena: None,
+        wayland_rings: None,
         arena_frames: None,
         provide_arenas: Vec::new(),
         outbound: None,
@@ -396,6 +402,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--socket" => args.socket = it.next(),
             "--wayland-ring" => args.wayland_ring = it.next(),
             "--wayland-cold" => args.wayland_cold = it.next(),
+            "--wayland-rings" => args.wayland_rings = it.next(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -633,6 +640,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         eprintln!("wc-compositor: {e}");
         return Err(2);
     }
+    // §89. The rings are the ivshmem region's tail; without the region there
+    // is nowhere to put them, and the other two ring flags name other regions.
+    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() {
+        eprintln!("wc-compositor: --wayland-rings keeps the tail of the --arena-ivshmem region, and there is none");
+        return Err(2);
+    }
+    if args.wayland_rings.is_some() && (args.wayland_ring.is_some() || args.wayland_cold.is_some()) {
+        eprintln!("wc-compositor: --wayland-rings and --wayland-ring/--wayland-cold each name the one ring region");
+        return Err(2);
+    }
     Ok(args)
 }
 
@@ -757,7 +774,6 @@ fn publish_frames(args: &Args, id: u32, pages: u32, written: &mut usize) -> Stri
 /// could not grow, and — because `Op::Release` is a request on that same
 /// channel — could not give a region back either. Both halves were silent,
 /// because a path that is not taken says nothing.
-///
 /// # The ordering, which is the whole of why this is *here* and not earlier
 ///
 /// GROWTH is created at the first client for exactly the reason the gifts are
@@ -1090,20 +1106,63 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // exists, below. The run id goes out on the same kind of line as guest
     // RAM's, because the launcher hands it to the host either way, and the
     // host refuses a header that carries any other. §83.
+    // §89. The Wayland rings' doorbell is opened first, because whether the
+    // region keeps a tail for rings depends on it: rings nobody can wake are a
+    // poll, and the socket path is the honest fallback for that.
+    let mut bell_port = match (&args.wayland_rings, args.ivshmem_arena) {
+        (Some(port), Some(_)) => match ringlink::open_bell_port(port) {
+            Ok(p) => Some((port.clone(), p)),
+            Err(e) => {
+                println!(
+                    "wc-compositor: WAYLAND RINGS UNAVAILABLE: the doorbell port {port} did not \
+                     open ({e}); no rings are kept and every connection uses the socket"
+                );
+                None
+            }
+        },
+        _ => None,
+    };
+    let mut ivshmem_rings: Option<(ringlink::RingLink, Box<dyn std::io::Read + Send>)> = None;
     if let Some((id, dev)) = args.ivshmem_arena {
         if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
             eprintln!("wc-compositor: arena {id} is named by both --arena-guest-ram and --arena-ivshmem");
             return std::process::ExitCode::from(2);
         }
-        match wc_handle::arena::attach_ivshmem(id, dev) {
-            Ok(r) => println!(
-                "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \
-                 generation {}, region {} bytes, {} (no pages pinned, nothing to locate)",
-                r.run_id, r.arena_len, r.generation, r.region_len, r.device
-            ),
+        let rings_len = if bell_port.is_some() {
+            sv_transport::control::Geometry::for_wayland().control_size
+        } else {
+            0
+        };
+        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+            Ok(r) => {
+                println!(
+                    "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \
+                     generation {}, region {} bytes, {} (no pages pinned, nothing to locate)",
+                    r.run_id, r.arena_len, r.generation, r.region_len, r.device
+                );
+                r.rings.0
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not provide arena {id} from ivshmem device {dev}: {e}");
                 return std::process::ExitCode::from(2);
+            }
+        };
+        if let Some((port, handle)) = bell_port.take() {
+            match ringlink::over_ivshmem(id, handle) {
+                Ok((link, reader, slots)) => {
+                    println!(
+                        "wc-compositor: wayland rings: {slots} connection slots in the last {rings_len} \
+                         bytes of the region (offset {rings_at}), doorbell {port}"
+                    );
+                    ivshmem_rings = Some((link, reader));
+                }
+                // The tail stays kept and is published as rings: the arena ends
+                // there either way. The proxy finds no control region in it and
+                // falls back, connection by connection, and says so.
+                Err(e) => println!(
+                    "wc-compositor: WAYLAND RINGS UNAVAILABLE: the ring region could not be made \
+                     ({e}); every connection uses the socket"
+                ),
             }
         }
     }
@@ -1373,7 +1432,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     let wayland = std::thread::Builder::new()
         .name("wayland".into())
         .spawn(move || {
-            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, args.idle_timeout, args.debug_icon,
+            let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty);
             thread_exit.store(code, Ordering::SeqCst);
@@ -1487,6 +1546,9 @@ fn wayland_thread(
     socket: Option<String>,
     wayland_ring: Option<String>,
     wayland_cold: Option<String>,
+    // §89: the ivshmem region's rings and their doorbell's reader, when the
+    // compositor made them.
+    ivshmem_rings: Option<(ringlink::RingLink, Box<dyn std::io::Read + Send>)>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -1569,7 +1631,24 @@ fn wayland_thread(
     // `Control::create` zeroes bytes the host is still locating by until then.
     let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
-    println!("wc-compositor: poll interval {POLL:?} using {}", ticker.describe());
+    let (ivshmem_link, bell_reader) = match ivshmem_rings {
+        Some((link, reader)) => (Some(link), Some(reader)),
+        None => (None, None),
+    };
+    // §89: a byte on the rings' port is the proxy saying it wrote to a lane
+    // this loop had parked on; it ends the wait like input does. The thread
+    // blocks on the port and costs nothing between bytes.
+    let _doorman = bell_reader.map(|r| {
+        sv_transport::vdoorbell::Doorman::spawn_target(r, Arc::new(ringlink::WakeOnBell(ticker.waker())))
+    });
+    // §89: the UI thread ends the wait when it queues input, so a key or a
+    // pointer event is handled on arrival rather than at the end of the turn.
+    platform::set_ui_waker(ticker.waker());
+    println!(
+        "wc-compositor: poll interval {POLL:?} using {}, woken early by input{}",
+        ticker.describe(),
+        if _doorman.is_some() { " and by the Wayland rings' doorbell" } else { "" }
+    );
     println!(
         "wc-compositor: frame callbacks on a {:?} grid ({})",
         state.frame_clock.period(),
@@ -1611,7 +1690,10 @@ fn wayland_thread(
             (None, Some(path)) => {
                 Some(ringlink::RingLink::create(path).map(|rl| (rl, path.to_string())))
             }
-            (None, None) => None,
+            // §89: made before the header was published, in the ivshmem
+            // region's tail; `--wayland-rings` excludes the other two.
+            (None, None) => ivshmem_link
+                .map(|rl| Ok((rl, "the ivshmem region's tail (doorbell on its port)".to_string()))),
         };
         match made {
             None => None,
@@ -1780,6 +1862,24 @@ fn wayland_thread(
             eprintln!("wc-compositor: flush failed: {e}");
             break;
         }
+        // §89. And straight into the ring: what smithay just flushed is in the
+        // local socket pair, and without this second pump it waited there for
+        // the next turn — up to a whole wait, on every event this turn sent,
+        // which on the input path was the larger part of what is left. Then
+        // the slots whose connections both ends have finished go back.
+        if let Some(rl) = ring_link.as_mut() {
+            rl.pump();
+            let recycled = rl.reap();
+            if recycled > 0 && sv_transport::frametrace::enabled() {
+                sv_transport::frametrace::emit("wc.recycled", format_args!("slots={recycled}"));
+            }
+        }
+        // §89: the input this turn handed to smithay has now left the
+        // compositor — into the socket, or into the ring.
+        if state.trace_inputs > 0 {
+            sv_transport::frametrace::emit("wc.flush", format_args!("inputs={}", state.trace_inputs));
+            state.trace_inputs = 0;
+        }
         // docs/waycompose-design.md §88: a turn that handled a commit, and how
         // its time divided. The turn is the unit of this loop's latency: a
         // commit that arrives just after one waits for the next.
@@ -1867,7 +1967,16 @@ fn wayland_thread(
         // Never past the next frame tick (docs/waycompose-design.md §88): the
         // callbacks it answers go out on the tick, not up to a turn after it.
         // A floor, so a tick that is a hair away is not a spin.
-        ticker.wait(POLL.min(state.until_frame()).max(Duration::from_micros(200)));
+        // §89: parked on every ring the proxy writes, so its next write rings
+        // the port and ends this wait; and not waiting at all if one already
+        // has something, which the park's last look is for.
+        let parked_ready = ring_link.as_ref().is_some_and(|rl| rl.park());
+        if !parked_ready {
+            ticker.wait(POLL.min(state.until_frame()).max(Duration::from_micros(200)));
+        }
+        if let Some(rl) = ring_link.as_ref() {
+            rl.unpark();
+        }
     }
 
     // Said on the way out, always. "The taskbar icon is the generic one" has

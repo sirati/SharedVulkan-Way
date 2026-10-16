@@ -946,7 +946,14 @@ impl WindowState {
     // -----------------------------------------------------------------------
 
     fn send(&self, e: FromUi) {
+        // §89: the moment Windows handed the compositor the input, before the
+        // Wayland thread's turn adds its share.
+        if sv_transport::frametrace::enabled() {
+            super::trace_input("wc.in", &e);
+        }
         let _ = self.events.send(e);
+        // §89: and the loop handles it now, not at the end of its wait.
+        super::wake_wayland();
     }
 
     /// A client-area point, in the surface's own coordinates.

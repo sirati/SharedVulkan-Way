@@ -198,17 +198,81 @@ const UPSTREAM_REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_se
 /// is why this enum can exist at all without weakening the invariant.
 pub enum Upstream {
     Socket(UnixStream),
-    Ring(Box<sv_transport::wlbytes::ByteChannel>),
+    Ring(Box<RingUpstream>),
+}
+
+/// One connection on a ring slot: the channel, the region it is in, and —
+/// with §89's doorbell — the wake a pump parked on it is ended by.
+///
+/// **Dropping it ends the connection on the ring**: what this side can still
+/// say (its end of stream, if the lane has room), then the slot marked `DEAD`
+/// as this side's last touch of it, which is the first half of
+/// `Control::recycle_ring`'s protocol. The compositor drains what is left and
+/// gives the slot back. Before §89 nothing marked a proxy's ring dead and a
+/// slot was gone for the life of the region; that was tolerable for a test
+/// fixture and is not for a twelve-hour session.
+pub struct RingUpstream {
+    channel: sv_transport::wlbytes::ByteChannel,
+    control: std::sync::Arc<sv_transport::control::Control>,
+    wake: Option<crate::rings::RingWake>,
+}
+
+impl RingUpstream {
+    pub fn new(
+        channel: sv_transport::wlbytes::ByteChannel,
+        control: std::sync::Arc<sv_transport::control::Control>,
+        wake: Option<crate::rings::RingWake>,
+    ) -> RingUpstream {
+        RingUpstream { channel, control, wake }
+    }
+
+    pub fn slot(&self) -> u32 {
+        self.channel.slot()
+    }
+}
+
+impl Drop for RingUpstream {
+    fn drop(&mut self) {
+        // The wake first, so a byte for this slot after this point is a stray
+        // rather than a wake for whichever connection gets the slot next.
+        self.wake = None;
+        let _ = self.channel.write_eof();
+        let _ = self.channel.kill(&self.control);
+    }
 }
 
 impl Upstream {
     /// The descriptor `poll` should watch, or `-1` for an upstream that has
     /// none. A negative fd in a `pollfd` is ignored, which is how the ring case
     /// needs no second loop — the same trick the icon and clipboard feeds use.
+    /// A ring with §89's doorbell has one: its eventfd.
     fn poll_fd(&self) -> RawFd {
         match self {
             Upstream::Socket(s) => s.as_raw_fd(),
-            Upstream::Ring(_) => -1,
+            Upstream::Ring(r) => r.wake.as_ref().map_or(-1, |w| w.fd()),
+        }
+    }
+
+    /// A ring a doorbell can wake, which a pump may therefore sleep on.
+    fn has_doorbell(&self) -> bool {
+        matches!(self, Upstream::Ring(r) if r.wake.is_some())
+    }
+
+    /// Before the pump's `poll`: park on the lane this side reads, and say
+    /// whether it already has something, in which case the poll must not
+    /// sleep. Nothing to do for a socket, whose readiness `poll` sees itself.
+    fn park(&self) -> bool {
+        match self {
+            Upstream::Ring(r) => r.wake.as_ref().is_some_and(|w| w.park(&r.channel)),
+            Upstream::Socket(_) => false,
+        }
+    }
+
+    fn unpark(&self) {
+        if let Upstream::Ring(r) = self
+            && let Some(w) = &r.wake
+        {
+            w.unpark(&r.channel);
         }
     }
 
@@ -239,7 +303,7 @@ impl Upstream {
                 }
                 Ok(Some(n as usize))
             }
-            Upstream::Ring(ch) => match ch.read(buf).map_err(ring_err)? {
+            Upstream::Ring(r) => match r.channel.read(buf).map_err(ring_err)? {
                 sv_transport::wlbytes::ReadOutcome::Bytes(n) => Ok(Some(n)),
                 sv_transport::wlbytes::ReadOutcome::Empty => Ok(Some(0)),
                 sv_transport::wlbytes::ReadOutcome::Eof => Ok(None),
@@ -253,7 +317,7 @@ impl Upstream {
     fn write_chunk(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Upstream::Socket(s) => write_some(s.as_raw_fd(), buf),
-            Upstream::Ring(ch) => ch.write(buf).map_err(ring_err),
+            Upstream::Ring(r) => r.channel.write(buf).map_err(ring_err),
         }
     }
 
@@ -358,7 +422,8 @@ pub fn pump(
     // back and look. A socket keeps the wait it always had and never advances a
     // rung.
     let ring_upstream = upstream.is_ring();
-    let mut rung = 0usize;
+    let mut rung_at = 0usize;
+    let belled = upstream.has_doorbell();
     let mut quiet_turns = 0u32;
 
     let mut from_client = Vec::<u8>::new();
@@ -389,7 +454,10 @@ pub fn pump(
                 revents: 0,
             },
         ];
-        if !to_server.is_empty() {
+        // A ring's descriptor, when it has one, is its doorbell's eventfd,
+        // which is always writable: asking it for POLLOUT would be a spin. A
+        // full ring is waited out by the short wait below instead.
+        if !to_server.is_empty() && !ring_upstream {
             pollfds[1].events |= libc::POLLOUT;
         }
         if !to_client.is_empty() {
@@ -415,18 +483,39 @@ pub fn pump(
         // sleep, and honouring both means honouring the tighter one. A socket
         // upstream contributes 20 and changes nothing.
         let clip_wait = if session.clip_busy() { 1 } else { 20 };
-        let ring_wait = if ring_upstream { RING_POLL_LADDER_MS[rung] } else { 20 };
+        // §89: a ring with a doorbell is woken by the compositor's write, so
+        // it sleeps like a socket; the 20 ms is only the bound on a lost byte.
+        // Without one it climbs §36's ladder, as before.
+        let ring_wait = if belled {
+            20
+        } else if ring_upstream {
+            RING_POLL_LADDER_MS[rung_at]
+        } else {
+            20
+        };
         let mut wait = clip_wait.min(ring_wait);
+        // A full ring has no descriptor to say it has room again; the
+        // compositor drains it on its next turn.
+        if ring_upstream && !to_server.is_empty() {
+            wait = wait.min(1);
+        }
         // §88. Wake for the next frame tick when a callback is waiting on it,
         // rounded up so a tick less than a millisecond away is not a spin.
         if let Some(d) = session.until_frame_tick(std::time::Instant::now()) {
             wait = wait.min(d.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+        }
+        // §89: parked on the lane the compositor writes, and not sleeping at
+        // all if it already has something — the last look after `parked` is
+        // what closes the window a write could otherwise fall through.
+        if upstream.park() {
+            wait = 0;
         }
         // A negative fd in a `pollfd` is ignored by `poll`, which is how the
         // no-icons case costs nothing and needs no second loop.
         // SAFETY: a live array of four `pollfd`s whose length is passed
         // truthfully.
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 4, wait) };
+        upstream.unpark();
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -613,6 +702,12 @@ pub fn pump(
                 Ok(n) => {
                     drop(to_client.drain(..n));
                     to_client_fds.clear();
+                    // §89: input events this write carried have reached the
+                    // client's socket, which is the end of the measured path.
+                    let inputs = session.take_trace_inputs();
+                    if inputs > 0 {
+                        sv_transport::frametrace::emit("px.out", format_args!("inputs={inputs}"));
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 // **`ConnectionReset` is an ordinary ending, not a failure**,
@@ -666,13 +761,13 @@ pub fn pump(
         // ladder on the latency path it exists to keep off it.
         if ring_upstream {
             if last_traffic.elapsed() < std::time::Duration::from_millis(1) {
-                rung = 0;
+                rung_at = 0;
                 quiet_turns = 0;
             } else {
                 quiet_turns += 1;
                 if quiet_turns >= RING_POLL_PATIENCE {
                     quiet_turns = 0;
-                    rung = (rung + 1).min(RING_POLL_LADDER_MS.len() - 1);
+                    rung_at = (rung_at + 1).min(RING_POLL_LADDER_MS.len() - 1);
                 }
             }
         }

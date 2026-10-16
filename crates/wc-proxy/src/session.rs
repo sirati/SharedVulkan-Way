@@ -874,6 +874,9 @@ pub struct Session {
     /// `--pace-frames` (docs/waycompose-design.md §88): this side answers the
     /// client's frame callbacks. `None` forwards the compositor's, as before.
     pacer: Option<crate::pace::Pacer>,
+    /// Input events (`wl_pointer`, `wl_keyboard`) translated since the caller
+    /// last asked, for `WC_FRAME_TRACE`'s `px.out` (waycompose-design.md §89).
+    trace_inputs: u32,
     /// Lines worth telling the operator about, drained by the caller so this
     /// stays free of I/O.
     notes: Vec<String>,
@@ -1018,6 +1021,7 @@ impl Session {
             stats: Stats::default(),
             trace: false,
             pacer: None,
+            trace_inputs: 0,
             notes: Vec::new(),
             app_ids: Vec::new(),
             clip: Clip { next_token: 1, ..Clip::default() },
@@ -1061,6 +1065,11 @@ impl Session {
     /// of the compositor. See [`crate::pace`].
     pub fn set_pacing(&mut self, hz: u32, depth: usize) {
         self.pacer = (hz > 0).then(|| crate::pace::Pacer::new(hz, depth));
+    }
+
+    /// Input events translated since the last call (§89's `px.out`).
+    pub fn take_trace_inputs(&mut self) -> u32 {
+        std::mem::take(&mut self.trace_inputs)
     }
 
     /// How long the loop may sleep before a frame tick with work on it.
@@ -2170,8 +2179,10 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
-        if sv_transport::frametrace::enabled() {
-            trace_event(&interface, &msg.name, header.object);
+        if sv_transport::frametrace::enabled()
+            && trace_event(&interface, &msg.name, header.object, body, &spans)
+        {
+            self.trace_inputs += 1;
         }
         // §88. A frame callback this side already answered is the compositor's
         // credit coming back, not news for the client.
@@ -2864,15 +2875,43 @@ fn trace_request(interface: &str, name: &str, object: u32, body: &[u8], spans: &
     }
 }
 
-/// The events that answer them, on the way back to the client.
-fn trace_event(interface: &str, name: &str, object: u32) {
+/// The events that answer them, on the way back to the client — and, since
+/// §89, the input events, as they arrive from the compositor. Their `t` is the
+/// event's own `time` argument, which the compositor's `wc.in` line carries
+/// too, and is what `scripts/wc-input-latency.py` pairs the two machines on.
+///
+/// Returns whether this was an input event.
+fn trace_event(interface: &str, name: &str, object: u32, body: &[u8], spans: &[wire::Span]) -> bool {
     use sv_transport::frametrace as ft;
+    let word = |i: usize| spans.get(i).and_then(|s| wire::word_at(body, s)).unwrap_or(0);
+    let fixed = |i: usize| f64::from(word(i) as i32) / 256.0;
     match (interface, name) {
         // The compositor's answer arriving; `px.done` is the client being told.
         ("wl_callback", "done") => ft::emit("px.gdone", format_args!("cb={object}")),
         ("wl_buffer", "release") => ft::emit("px.release", format_args!("buf={object}")),
+        ("wl_pointer", "motion") => {
+            ft::emit("px.in", format_args!("kind=motion t={} x={} y={}", word(0), fixed(1), fixed(2)));
+            return true;
+        }
+        ("wl_pointer", "enter") => {
+            ft::emit("px.in", format_args!("kind=enter x={} y={}", fixed(2), fixed(3)));
+            return true;
+        }
+        ("wl_pointer", "button") => {
+            ft::emit("px.in", format_args!("kind=button t={} b={} down={}", word(1), word(2), word(3)));
+            return true;
+        }
+        ("wl_pointer", "axis") => {
+            ft::emit("px.in", format_args!("kind=axis t={} axis={} v={}", word(0), word(1), fixed(2)));
+            return true;
+        }
+        ("wl_keyboard", "key") => {
+            ft::emit("px.in", format_args!("kind=key t={} code={} down={}", word(1), word(2), word(3)));
+            return true;
+        }
         _ => {}
     }
+    false
 }
 
 /// Which of a client's offered mime types to actually pull. See

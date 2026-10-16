@@ -39,8 +39,10 @@ use std::io;
 
 /// The first eight bytes of a published header.
 pub const MAGIC: [u8; 8] = *b"WCIVSHM1";
-/// Bumped when the layout below changes. A reader refuses any other value.
-pub const VERSION: u32 = 1;
+/// Bumped when the layout below changes. A reader refuses any version it does
+/// not know. Version 2 (waycompose-design.md §89) added the Wayland rings'
+/// region at the tail; a version-1 header reads as one with no rings.
+pub const VERSION: u32 = 2;
 /// How many bytes at the front of the region the header owns. One 4 KiB page,
 /// because the arena behind it is allocated in pages and must start on one.
 pub const HEADER_BYTES: u64 = 4096;
@@ -54,9 +56,13 @@ const OFF_REGION_LEN: usize = 32;
 const OFF_ARENA_ID: usize = 40;
 const OFF_OUTBOUND_OFF: usize = 48;
 const OFF_OUTBOUND_LEN: usize = 56;
+const OFF_RINGS_OFF: usize = 64;
+const OFF_RINGS_LEN: usize = 72;
 /// The number of bytes a header actually occupies. The rest of the page is
 /// zero and reserved.
-pub const ENCODED_LEN: usize = 64;
+pub const ENCODED_LEN: usize = 80;
+/// What a version-1 header occupied, which is all a reader may assume of one.
+const ENCODED_LEN_V1: usize = 64;
 
 /// What the guest says about the region it mapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +84,19 @@ pub struct Header {
     /// The compositor's outbound window, `(offset, len)`, in **arena** offsets
     /// (that is, relative to [`HEADER_BYTES`]). `(0, 0)` is "none".
     pub outbound: (u64, u64),
+    /// The region that carries the session's Wayland connections as rings
+    /// (waycompose-design.md §89), `(offset, len)` in **region** offsets — it
+    /// is not part of the arena, so arena offsets cannot name it. Always the
+    /// region's tail, so the arena is what lies between the header page and
+    /// it. `(0, 0)` is "none": the compositor was not asked for rings, or could
+    /// not open its doorbell, and every connection crosses the socket path.
+    pub rings: (u64, u64),
 }
 
 impl Header {
-    /// The arena's length: the region less the header page.
+    /// The arena's length: the region less the header page and the rings.
     pub fn arena_len(&self) -> u64 {
-        self.region_len.saturating_sub(HEADER_BYTES)
+        self.region_len.saturating_sub(HEADER_BYTES).saturating_sub(self.rings.1)
     }
 
     /// The header's bytes, magic **included**. A writer must not copy this as
@@ -100,6 +113,8 @@ impl Header {
         b[OFF_ARENA_ID..OFF_ARENA_ID + 4].copy_from_slice(&self.arena_id.to_le_bytes());
         b[OFF_OUTBOUND_OFF..OFF_OUTBOUND_OFF + 8].copy_from_slice(&self.outbound.0.to_le_bytes());
         b[OFF_OUTBOUND_LEN..OFF_OUTBOUND_LEN + 8].copy_from_slice(&self.outbound.1.to_le_bytes());
+        b[OFF_RINGS_OFF..OFF_RINGS_OFF + 8].copy_from_slice(&self.rings.0.to_le_bytes());
+        b[OFF_RINGS_LEN..OFF_RINGS_LEN + 8].copy_from_slice(&self.rings.1.to_le_bytes());
         b
     }
 
@@ -107,9 +122,11 @@ impl Header {
     ///
     /// Every refusal names what it saw, because the reader is a launcher on
     /// another machine and "bad header" is not a message anybody can act on.
+    /// A version-1 header is read as one with no rings: it is what a compositor
+    /// from before §89 wrote, and the fields it has mean what they meant.
     pub fn decode(b: &[u8]) -> io::Result<Header> {
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        if b.len() < ENCODED_LEN {
+        if b.len() < ENCODED_LEN_V1 {
             return Err(bad(format!("{} bytes is shorter than a header", b.len())));
         }
         let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -122,8 +139,13 @@ impl Header {
             )));
         }
         let version = u32_at(OFF_VERSION);
-        if version != VERSION {
-            return Err(bad(format!("header version {version}, and this reader knows {VERSION}")));
+        if version != 1 && version != VERSION {
+            return Err(bad(format!(
+                "header version {version}, and this reader knows 1 and {VERSION}"
+            )));
+        }
+        if version == VERSION && b.len() < ENCODED_LEN {
+            return Err(bad(format!("{} bytes is shorter than a version-{VERSION} header", b.len())));
         }
         let header_bytes = u32_at(OFF_HEADER_BYTES) as u64;
         if header_bytes != HEADER_BYTES {
@@ -138,6 +160,7 @@ impl Header {
             region_len: u64_at(OFF_REGION_LEN),
             arena_id: u32_at(OFF_ARENA_ID),
             outbound: (u64_at(OFF_OUTBOUND_OFF), u64_at(OFF_OUTBOUND_LEN)),
+            rings: if version == 1 { (0, 0) } else { (u64_at(OFF_RINGS_OFF), u64_at(OFF_RINGS_LEN)) },
         };
         if h.run_id == 0 {
             return Err(bad("run id 0, which no compositor writes".into()));
@@ -148,6 +171,22 @@ impl Header {
                  of pages after it",
                 h.region_len
             )));
+        }
+        let (roff, rlen) = h.rings;
+        if rlen != 0
+            && (!roff.is_multiple_of(HEADER_BYTES)
+                || !rlen.is_multiple_of(HEADER_BYTES)
+                || roff.checked_add(rlen) != Some(h.region_len)
+                || roff <= HEADER_BYTES)
+        {
+            return Err(bad(format!(
+                "rings at {roff}+{rlen} are not whole pages at the tail of a {}-byte region, \
+                 after its header",
+                h.region_len
+            )));
+        }
+        if rlen == 0 && roff != 0 {
+            return Err(bad(format!("rings at {roff} with no length")));
         }
         let (off, len) = h.outbound;
         if len != 0 && off.checked_add(len) != Some(h.arena_len()) {
@@ -263,6 +302,7 @@ mod tests {
             region_len: 128 << 20,
             arena_id: 0,
             outbound: ((128 << 20) - HEADER_BYTES - (1 << 20), 1 << 20),
+            rings: (0, 0),
         }
     }
 
@@ -284,8 +324,8 @@ mod tests {
         b[0] = 0;
         assert!(Header::decode(&b).unwrap_err().to_string().contains("no header"));
         let mut b = h().encode();
-        b[8] = 2;
-        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 2"));
+        b[8] = 3;
+        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 3"));
         let mut z = h();
         z.run_id = 0;
         assert!(Header::decode(&z.encode()).is_err());
@@ -316,5 +356,56 @@ mod tests {
         assert!(Header::decode(&page).is_err(), "an invalidated header must not read");
         // The fields are still there for a human with xxd; only the magic went.
         assert_eq!(u64::from_le_bytes(page[24..32].try_into().unwrap()), 3);
+    }
+
+    /// §89. Rings at the tail: the arena shrinks by them, the outbound window
+    /// is the tail of what is left, and the offsets are pinned as numbers.
+    fn with_rings() -> Header {
+        let rings = 6 << 20;
+        let arena = (128 << 20) - HEADER_BYTES - rings;
+        Header { outbound: (arena - (1 << 20), 1 << 20), rings: ((128 << 20) - rings, rings), ..h() }
+    }
+
+    #[test]
+    fn a_version_2_header_carries_the_rings_at_the_regions_tail() {
+        let r = with_rings();
+        let b = r.encode();
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(b[64..72].try_into().unwrap()), (128 << 20) - (6 << 20));
+        assert_eq!(u64::from_le_bytes(b[72..80].try_into().unwrap()), 6 << 20);
+        assert_eq!(Header::decode(&b).unwrap(), r);
+        assert_eq!(r.arena_len(), (128 << 20) - 4096 - (6 << 20));
+        assert_eq!(r.rings.0, HEADER_BYTES + r.arena_len(), "the rings start where the arena ends");
+    }
+
+    #[test]
+    fn rings_anywhere_but_the_tail_are_refused() {
+        let mut r = with_rings();
+        r.rings.0 -= 4096;
+        assert!(Header::decode(&r.encode()).unwrap_err().to_string().contains("tail"));
+        let mut r = with_rings();
+        r.rings = (HEADER_BYTES, (128 << 20) - HEADER_BYTES);
+        r.outbound = (0, 0);
+        assert!(Header::decode(&r.encode()).is_err(), "rings that leave no arena");
+        let mut r = with_rings();
+        r.rings.1 = 0;
+        assert!(Header::decode(&r.encode()).is_err(), "an offset with no length");
+        // An outbound window that is the tail of the region rather than of the
+        // arena is the mistake a writer that forgot the rings would make.
+        let mut r = with_rings();
+        r.outbound = ((128 << 20) - HEADER_BYTES - (1 << 20), 1 << 20);
+        assert!(Header::decode(&r.encode()).unwrap_err().to_string().contains("not the tail"));
+    }
+
+    /// A compositor from before §89 wrote version 1 and 64 bytes. It must still
+    /// read, as a header with no rings, so a host updated first is not a host
+    /// that refuses the guest it has.
+    #[test]
+    fn a_version_1_header_reads_as_one_without_rings() {
+        let mut b = h().encode();
+        b[8..12].copy_from_slice(&1u32.to_le_bytes());
+        b[64..80].copy_from_slice(&[0xee; 16]);
+        assert_eq!(Header::decode(&b[..64]).unwrap(), h());
+        assert_eq!(Header::decode(&b).unwrap().rings, (0, 0), "v1 bytes past 64 are not rings");
     }
 }

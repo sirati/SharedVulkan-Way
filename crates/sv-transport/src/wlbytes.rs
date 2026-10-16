@@ -340,6 +340,25 @@ impl ByteChannel {
         self.held_at < self.held.len()
     }
 
+    /// Would [`Self::read`] return something other than `Empty` — bytes, or the
+    /// end of the stream? Reads the lane's head and tail and nothing else.
+    ///
+    /// This is the consumer's last look before it sleeps (waycompose-design.md
+    /// §89): set `parked` on [`Self::rx_bell`], *then* ask this, and sleep only
+    /// on `false`. A producer that published before the `parked` store is seen
+    /// here; one that published after it sees `parked` and rings. That is
+    /// [`crate::park::Bell`]'s handshake, done by a caller whose wait is a
+    /// `poll` rather than a futex.
+    pub fn readable(&self) -> Result<bool> {
+        Ok(self.has_buffered() || self.rx_eof || !self.rx.is_empty()?)
+    }
+
+    /// The doorbell of the lane this end reads: the words a sleeping reader
+    /// sets so that the other end's write rings it (§89).
+    pub fn rx_bell(&self) -> Result<crate::park::Bell<'_>> {
+        self.rx.ctrl().bell(self.endpoint.rx())
+    }
+
     /// Bytes of ring space available to [`Self::write`] right now. Diagnostics,
     /// and the number to print when a connection stalls.
     pub fn free_bytes(&self) -> Result<u64> {
@@ -598,5 +617,113 @@ mod tests {
         assert_eq!(w(&mut host, b"bytes only").unwrap(), 10);
         let mut buf = [0u8; 16];
         assert_eq!(r(&mut guest, &mut buf).unwrap(), ReadOutcome::Bytes(10));
+    }
+
+    /// §89. `readable` is the last look before a reader sleeps: it must see
+    /// bytes, a held remainder and the end of the stream, and nothing else.
+    #[test]
+    fn readable_sees_bytes_held_bytes_and_the_end() {
+        let (_c, mut host, mut guest) = pair();
+        assert!(!guest.readable().unwrap(), "an empty lane is not readable");
+        host.write(b"0123456789").unwrap();
+        assert!(guest.readable().unwrap(), "bytes in the lane");
+        let mut small = [0u8; 4];
+        guest.read(&mut small).unwrap();
+        assert!(guest.readable().unwrap(), "bytes held from a short read");
+        read_all(&mut guest);
+        assert!(!guest.readable().unwrap());
+        host.write_eof().unwrap();
+        assert!(guest.readable().unwrap(), "the end of the stream is something to read");
+        read_all(&mut guest);
+        assert!(guest.readable().unwrap(), "and it stays readable: the next read says Eof again");
+    }
+
+    /// §89. The doorbell a reader parks on is its *own* lane's, and its token
+    /// names the slot and that lane, so the byte the writer sends wakes it.
+    #[test]
+    fn each_end_parks_on_the_lane_it_reads() {
+        let (_c, host, guest) = pair();
+        let slot = host.slot();
+        assert_eq!(host.rx_bell().unwrap().token, crate::park::lane_token(slot, Lane::Reply));
+        assert_eq!(guest.rx_bell().unwrap().token, crate::park::lane_token(slot, Lane::Command));
+        host.rx_bell().unwrap().parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            guest.tx.ctrl().bell(Lane::Reply).unwrap().parked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the writer must see the parked word the reader set"
+        );
+    }
+
+    /// §89. A connection's slot comes back: claim, talk, end, mark dead,
+    /// recycle, and the next claim gets the same slot with nothing of the last
+    /// connection in it.
+    #[test]
+    fn a_dead_slot_is_recycled_clean_and_claimed_again() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let owner = Control::create(Arc::clone(&region), g, ProtocolIds::new(7, 0xfeed_face_dead_beef), 1).unwrap();
+        let peer = Control::attach(region, ProtocolIds::new(7, 0xfeed_face_dead_beef)).unwrap();
+
+        // `peer` plays the proxy (claims), `owner` the compositor (accepts).
+        let mut host = ByteChannel::claim(&peer, 1).unwrap();
+        let slot = host.slot();
+        let mut guest = ByteChannel::open(&owner, slot, Endpoint::Peer).unwrap();
+        host.write(b"first connection").unwrap();
+        guest.write(b"reply").unwrap();
+        host.write_eof().unwrap();
+        host.rx_bell().unwrap().parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // Not dead yet: recycling a live slot is the race the rule forbids.
+        assert!(owner.recycle_ring(slot).is_err());
+        // And only the owner may do it.
+        host.kill(&peer).unwrap();
+        assert!(peer.recycle_ring(slot).is_err(), "a peer must not recycle");
+        drop(host);
+        let (got, eof) = read_all(&mut guest);
+        assert_eq!((got.as_slice(), eof), (&b"first connection"[..], true));
+        drop(guest);
+        owner.recycle_ring(slot).unwrap();
+        assert!(owner.recycle_ring(slot).is_err(), "a free slot is not dead");
+
+        let mut host2 = ByteChannel::claim(&peer, 2).unwrap();
+        assert_eq!(host2.slot(), slot, "the first free slot is the recycled one");
+        let mut guest2 = ByteChannel::open(&owner, slot, Endpoint::Peer).unwrap();
+        assert!(!guest2.readable().unwrap(), "the old connection's bytes must be gone");
+        assert!(!host2.readable().unwrap(), "and so must the old reply");
+        assert_eq!(host2.rx_bell().unwrap().parked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        host2.write(b"second").unwrap();
+        let (got, eof) = read_all(&mut guest2);
+        assert_eq!((got.as_slice(), eof), (&b"second"[..], false));
+        guest2.write(b"ok").unwrap();
+        let (got, _) = read_all(&mut host2);
+        assert_eq!(got, b"ok");
+    }
+
+    /// The reverse ring is the session's, never a connection's.
+    #[test]
+    fn the_reverse_ring_is_never_recycled() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let owner = Control::create(region, g, ProtocolIds::new(7, 1), 1).unwrap();
+        owner.kill_ring(crate::control::REVERSE_RING_SLOT).unwrap();
+        assert!(owner.recycle_ring(crate::control::REVERSE_RING_SLOT).is_err());
+    }
+
+    /// §89's geometry fits, and every slot can still name itself in a doorbell
+    /// byte.
+    #[test]
+    fn the_wayland_geometry_lays_out_and_every_slot_has_a_token() {
+        let g = Geometry::for_wayland();
+        let layout = crate::control::Layout::compute(g).unwrap();
+        assert!(layout.used <= g.control_size);
+        let last = g.ring_slot_count - 1;
+        let (s, l) = crate::park::lane_from_token(crate::park::lane_token(last, Lane::Reply));
+        assert_eq!((s, l), (last, Lane::Reply), "slot {last} does not survive a doorbell byte");
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let control = Control::create(region, g, ProtocolIds::new(7, 1), 1).unwrap();
+        let conns: Vec<ByteChannel> =
+            (0..g.ring_slot_count - 1).map(|i| ByteChannel::claim(&control, u64::from(i)).unwrap()).collect();
+        assert_eq!(conns.len() as u32, g.ring_slot_count - 1, "every slot but the reverse ring");
+        assert!(ByteChannel::claim(&control, 99).is_err(), "and then the directory is full");
     }
 }

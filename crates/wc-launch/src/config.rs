@@ -133,6 +133,11 @@ pub struct Config {
     pub gpu_ivshmem_slot: u8,
     /// §87. The doorbell's virtio-serial port name; empty is no doorbell.
     pub gpu_bell: String,
+    /// §89. The Wayland rings' virtio-serial port: with it the compositor
+    /// keeps the ivshmem region's tail for the session's Wayland connections
+    /// and they cross as shared memory; empty, or a VM without the port, and
+    /// they cross the ssh tunnel as before, which the log says loudly.
+    pub wayland_bell: String,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -159,6 +164,7 @@ impl Default for Config {
             gpu_arena_mib: 64,
             gpu_ivshmem_slot: 0x1d,
             gpu_bell: "org.sirati.svbell.0".into(),
+            wayland_bell: "org.sirati.wcbell.0".into(),
             apps: BTreeMap::new(),
         }
     }
@@ -256,6 +262,7 @@ impl Config {
                     })?
                 }
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
+                ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
                 ("session", "audio-volume") => {
                     cfg.audio_volume = u8::try_from(num("audio-volume")?)
                         .ok()
@@ -517,5 +524,15 @@ mod gpu_tests {
         assert_eq!((o.gpu_ivshmem_slot, o.gpu_bell.as_str()), (0x1e, ""));
         assert_eq!(p("gpu-ivshmem-slot = 29\n").unwrap().gpu_ivshmem_slot, 0x1d);
         assert!(p("gpu-ivshmem-slot = 0x20\n").is_err());
+    }
+
+    /// §89. The rings' port is on by default — a VM without it costs a loud
+    /// line and the ssh path, not a failure — and an empty value turns it off.
+    #[test]
+    fn the_wayland_rings_port_is_on_by_default_and_can_be_turned_off() {
+        let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
+        assert_eq!(p("").unwrap().wayland_bell, "org.sirati.wcbell.0");
+        assert_eq!(p("wayland-bell =\n").unwrap().wayland_bell, "");
+        assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
     }
 }

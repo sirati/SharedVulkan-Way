@@ -644,6 +644,60 @@ pub mod dnd_action {
     }
 }
 
+/// The Wayland thread's [`crate::tick::Waker`], for the UI thread to end its
+/// turn's wait with when it has queued an event (waycompose-design.md §89).
+///
+/// A global because the UI side is reached from a window procedure, which has
+/// no way to be handed anything; set once, by the Wayland thread, when its
+/// ticker exists. Unset — before that, or in a build that never sets it — the
+/// event simply waits for the turn, which is what every event did before.
+static UI_WAKER: std::sync::OnceLock<crate::tick::Waker> = std::sync::OnceLock::new();
+
+pub fn set_ui_waker(w: crate::tick::Waker) {
+    let _ = UI_WAKER.set(w);
+}
+
+/// End the Wayland thread's wait: an event is queued for it. Called by the
+/// Win32 platform's input; the headless one has no input to hurry.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn wake_wayland() {
+    if let Some(w) = UI_WAKER.get() {
+        w.wake();
+    }
+}
+
+/// `WC_FRAME_TRACE` (docs/waycompose-design.md §89): one line for an input
+/// event at a named stage of its way to the client — `wc.in` when the UI thread
+/// has it from Windows, `wc.in_tx` when the Wayland thread hands it to smithay.
+/// The message time is the key the analysis pairs on: it is what the client is
+/// sent as the event's `time`, and the proxy logs the same number.
+///
+/// Returns whether `e` was an input event, so a caller can count them.
+pub fn trace_input(stage: &str, e: &FromUi) -> bool {
+    use sv_transport::frametrace as ft;
+    match e {
+        FromUi::PointerMotion { x, y, time, .. } => {
+            ft::emit(stage, format_args!("kind=motion t={time} x={x} y={y}"))
+        }
+        FromUi::PointerEnter { x, y, time, .. } => {
+            ft::emit(stage, format_args!("kind=enter t={time} x={x} y={y}"))
+        }
+        FromUi::PointerButton { button, pressed, time, .. } => ft::emit(
+            stage,
+            format_args!("kind=button t={time} b={button} down={}", u8::from(*pressed)),
+        ),
+        FromUi::PointerAxis { v120_h, v120_v, time, .. } => {
+            ft::emit(stage, format_args!("kind=axis t={time} v120={v120_v} h120={v120_h}"))
+        }
+        FromUi::Key { keycode, pressed, time, .. } => ft::emit(
+            stage,
+            format_args!("kind=key t={time} code={keycode} down={}", u8::from(*pressed)),
+        ),
+        _ => return false,
+    }
+    true
+}
+
 /// UI thread -> Wayland thread.
 #[derive(Debug)]
 pub enum FromUi {

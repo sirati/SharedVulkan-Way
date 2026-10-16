@@ -88,6 +88,9 @@ ARENA="${WC_LAUNCH_ARENA:-/run/windows-vm/wc-arena/arena}"
 # chardev socket; both made by the VM's own unit for the same group (§87).
 GPUREGION="${WC_LAUNCH_GPU_REGION:-/run/windows-vm/wc-arena/gpu}"
 BELL="${WC_LAUNCH_BELL:-/run/windows-vm/wc-arena/svbell.sock}"
+# The Wayland rings' doorbell (§89): QEMU's socket for the virtio-serial port
+# org.sirati.wcbell.0, made by the VM's unit for the same group.
+WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -263,6 +266,33 @@ up)
     LEN=$(od -A n -t u8 -j 32 -N 8 "$ARENA" | tr -d ' ')
     printf '%s\n' "$RUNID" >"$D/arena.run"
     echo "ivshmem run $RUNID generation $GEN, $LEN bytes at $ARENA"
+    # THE WAYLAND RINGS (docs/waycompose-design.md §89). A version-2 header
+    # says where the compositor kept the region's tail for them (offsets 64
+    # and 72); the doorbell is the rings' virtio-serial port, whose socket the
+    # VM's unit made for this group as it made §87's. Both, or the session's
+    # Wayland connections cross ssh as before -- said here, in capitals, and
+    # again by the proxy, because a session that went back to ssh is otherwise
+    # indistinguishable from one that did not until somebody measures it.
+    VER=$(od -A n -t u4 -j 8 -N 4 "$ARENA" | tr -d ' ')
+    RLEN=0
+    [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$ARENA" | tr -d ' ')
+    if [ "${RLEN:-0}" = 0 ]; then
+      WHY="the compositor kept no rings (header version $VER; its log says why)"
+    elif [ ! -S "$WCBELL" ]; then
+      WHY="no doorbell socket at $WCBELL: the VM has no org.sirati.wcbell.0 port"
+    elif [ ! -r "$WCBELL" ] || [ ! -w "$WCBELL" ]; then
+      WHY="$WCBELL exists and $(id -un) cannot use it (group $(stat -c %G "$WCBELL" 2>/dev/null))"
+    else
+      WHY=""
+    fi
+    if [ -z "$WHY" ]; then
+      ROFF=$(od -A n -t u8 -j 64 -N 8 "$ARENA" | tr -d ' ')
+      echo "rings" >"$D/transport"
+      echo "transport rings: $RLEN bytes at $ROFF, doorbell $WCBELL"
+    else
+      echo "ssh: $WHY" >"$D/transport"
+      echo "transport SSH FALLBACK: $WHY"
+    fi
     echo "up ok $D"
     exit 0
   fi
@@ -378,9 +408,19 @@ proxy)
       # run already says what the session's frame should record.
       ft=$(grep -m1 '^WC_FRAME_TRACE=' "$BASE/gpu.env" 2>/dev/null)
       [ -n "$ft" ] && printf 'export %q\n' "$ft"
+      # §89: and its clock, so the proxy's half of an input timeline is on
+      # the machine's monotonic counter like the compositor's.
+      ft=$(grep -m1 '^WC_FRAME_TRACE_CLOCK=' "$BASE/gpu.env" 2>/dev/null)
+      [ -n "$ft" ] && printf 'export %q\n' "$ft"
       printf 'rm -f %q\n' "$D/wl-proxy"
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
-        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" \
+      # §89: the rings, when `up` found both them and their doorbell. The
+      # tunnel's socket stays the upstream either way: the icon and clipboard
+      # feeds use it, and so does a connection that cannot have a ring.
+      RINGARGS=""
+      [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
+        && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$WCBELL")
+      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
@@ -396,6 +436,18 @@ proxy)
     fi
     audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem)"
+    # §89: what the proxy made of the rings, in its own words. It attaches
+    # them after it binds its socket, so the line is waited for briefly.
+    if [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
+      T=""
+      for _ in $(seq 1 40); do
+        T=$(grep -m1 -oE '(wayland rings: .*|SSH FALLBACK: .*)' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
+        sleep 0.05
+      done
+      echo "transport ${T:-SSH FALLBACK: the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
+    else
+      echo "transport SSH FALLBACK: $(sed 's/^ssh: //' "$D/transport" 2>/dev/null || echo 'up found no rings')"
+    fi
     echo "audio $(cat "$D/audio.state")"
     exit 0
   fi
