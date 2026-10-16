@@ -25,7 +25,8 @@ use sv_transport::park::{Deadline, Futex, wait_until};
 use sv_transport::ring::{Lane, RingConsumer, RingCtrl, RingProducer, barrier_satisfied};
 
 /// How long a ring thread will sit with nothing arriving before it concludes the
-/// app side is gone. R4 says every wait has a deadline and there is no API for an
+/// app side is gone. Only while the app side's heartbeat is not seen
+/// moving: a live heartbeat resets it (§97.10). R4 says every wait has a deadline and there is no API for an
 /// infinite one; this is the session's.
 pub const IDLE_LIMIT: Duration = Duration::from_secs(120);
 
@@ -630,6 +631,17 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
                     sv_transport::control::Liveness::Gone => break,
                     sv_transport::control::Liveness::Restarted { generation } => {
                         return Err(format!("ring {slot}: the app side restarted as generation {generation}"));
+                    }
+                    // A quiet ring of a live application is not a gone one: the
+                    // heartbeat is the test of that (APP_GONE_AFTER), and
+                    // IDLE_LIMIT is only for an app side that never beats.
+                    // Measured on the guest (waycompose-design.md §97.10): Firefox
+                    // left alone for two minutes lost its session to the limit,
+                    // its control region went to the next session, and the
+                    // browser crashed on DEVICE_LOST.
+                    sv_transport::control::Liveness::Alive => {
+                        idle_since = Instant::now();
+                        continue;
                     }
                     _ => continue,
                 }
