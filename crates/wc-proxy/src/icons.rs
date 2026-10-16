@@ -114,6 +114,10 @@ pub struct Search {
     pub data_dirs: Vec<PathBuf>,
     /// The theme to try before `hicolor`.
     pub theme: String,
+    /// Icons shipped beside the client's own executable, as (size, path):
+    /// the last resort, used only when no theme has the icon by name. See
+    /// [`bundled_icons`].
+    pub bundled: Vec<(u32, PathBuf)>,
 }
 
 impl Default for Search {
@@ -121,6 +125,7 @@ impl Default for Search {
         Search {
             data_dirs: default_data_dirs(),
             theme: std::env::var("WC_ICON_THEME").unwrap_or_else(|_| "hicolor".into()),
+            bundled: Vec::new(),
         }
     }
 }
@@ -213,6 +218,57 @@ pub fn dirs_for_pid(pid: i32) -> Vec<PathBuf> {
     }
 }
 
+/// Icons an application ships **beside its executable**, as (size, path).
+///
+/// ADDED FOR §90 (docs/waycompose-design.md). The launcher's Firefox is a
+/// package with no `share/` at all, only `bin/` and `lib/`, so neither a theme
+/// nor [`client_prefix_dirs`] finds anything. Its taskbar button and its
+/// Alt-Tab entry wore Windows' generic icon on the first session-1 run, while
+/// the browser's own pixels sat in `lib/firefox/browser/chrome/icons/default/`
+/// as `default16.png` … `default128.png`. That is the Mozilla layout
+/// (Thunderbird keeps the same files under `chrome/icons/default/`), and the
+/// size is in the file name.
+///
+/// Only consulted when the app id resolved to nothing by name ([`resolve`]),
+/// so a theme the user installed still wins. Nothing here comes from the
+/// client: the directory is the kernel's `/proc/<pid>/exe`, as in
+/// [`dirs_for_pid`], and only files named `default<N>.png` are taken.
+pub fn bundled_icons(exe: &Path) -> Vec<(u32, PathBuf)> {
+    let mut out = Vec::new();
+    let Some(dir) = exe.parent() else { return out };
+    for sub in ["browser/chrome/icons/default", "chrome/icons/default"] {
+        let Ok(entries) = std::fs::read_dir(dir.join(sub)) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(size) = name
+                .strip_prefix("default")
+                .and_then(|s| s.strip_suffix(".png"))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if size > 0 && path.is_file() {
+                out.push((size, path));
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// [`bundled_icons`] for a live process id; empty where `/proc` declines.
+#[cfg(unix)]
+pub fn bundled_icons_for_pid(pid: i32) -> Vec<(u32, PathBuf)> {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) => bundled_icons(&exe),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// The whole lookup: app id in, pixels out.
 pub fn resolve(app_id: &str, search: &Search) -> Resolution {
     let (desktop, icon_name) = match desktop_entry(app_id, search) {
@@ -223,7 +279,12 @@ pub fn resolve(app_id: &str, search: &Search) -> Resolution {
         None => (None, app_id.to_owned()),
     };
 
-    let candidates = icon_files(&icon_name, search);
+    let mut candidates = icon_files(&icon_name, search);
+    // docs/waycompose-design.md §90: a package with no `share/` at all (the
+    // launcher's readback Firefox) has its pixels only beside its binary.
+    if candidates.is_empty() {
+        candidates = search.bundled.clone();
+    }
     let mut files = Vec::new();
     let mut images = Vec::new();
     for want in WANTED {
@@ -564,6 +625,7 @@ mod tests {
         let search = Search {
             data_dirs: vec![PathBuf::from("/nonexistent")],
             theme: "Adwaita".into(),
+            bundled: Vec::new(),
         };
         let chain = theme_chain(&search.theme, &search);
         assert_eq!(chain, vec!["Adwaita".to_string(), "hicolor".to_string()]);
@@ -574,6 +636,7 @@ mod tests {
         let search = Search {
             data_dirs: vec![PathBuf::from("/usr/share")],
             theme: "hicolor".into(),
+            bundled: Vec::new(),
         };
         assert!(icon_files("../../etc/passwd", &search).is_empty());
         assert!(icon_files(".hidden", &search).is_empty());
@@ -647,6 +710,7 @@ mod tests {
         let search = Search {
             data_dirs: vec![root.clone()],
             theme: "hicolor".into(),
+            bundled: Vec::new(),
         };
         let r = resolve("wc-test-app", &search);
         assert_eq!(r.icon_name, "wc-test-icon");
@@ -665,6 +729,55 @@ mod tests {
 
     /// A 2x1 RGBA PNG: red opaque, red at alpha 128. Built here rather than
     /// checked in as a binary blob so that what it contains is readable.
+    /// §90: a Firefox with no `share/` (the launcher's readback build) is
+    /// resolved from the icons beside its binary, and only when no theme has
+    /// the name: a theme icon still wins.
+    #[test]
+    fn a_package_without_share_falls_back_to_the_icons_beside_its_binary() {
+        let root = std::env::temp_dir().join(format!("wc-bundled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lib = root.join("store/firefox-readback/lib/firefox");
+        let icons = lib.join("browser/chrome/icons/default");
+        std::fs::create_dir_all(&icons).unwrap();
+        std::fs::write(lib.join("firefox"), b"").unwrap();
+        for s in [16, 32, 48, 128] {
+            std::fs::write(icons.join(format!("default{s}.png")), tiny_png()).unwrap();
+        }
+        std::fs::write(icons.join("defaultX.png"), tiny_png()).unwrap();
+        std::fs::write(icons.join("other16.png"), tiny_png()).unwrap();
+
+        let bundled = bundled_icons(&lib.join("firefox"));
+        let sizes: Vec<u32> = bundled.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sizes, vec![16, 32, 48, 128], "only default<N>.png, sorted");
+        assert!(client_prefix_dirs(&lib.join("firefox")).is_empty(), "no share/ anywhere");
+
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let search = Search {
+            data_dirs: vec![empty.clone()],
+            theme: "hicolor".into(),
+            bundled: bundled.clone(),
+        };
+        let r = resolve("firefox", &search);
+        assert!(!r.images.is_empty(), "{}", r.summary());
+        assert!(r.files.iter().all(|f| f.starts_with(&icons)), "{:?}", r.files);
+
+        // A theme that has the name wins over the bundled files.
+        let theme = empty.join("icons/hicolor/48x48/apps");
+        std::fs::create_dir_all(&theme).unwrap();
+        std::fs::write(theme.join("firefox.png"), tiny_png()).unwrap();
+        let r = resolve("firefox", &search);
+        assert!(r.files.iter().all(|f| f.starts_with(&theme)), "{:?}", r.files);
+
+        // Thunderbird's layout, and an executable with nothing beside it.
+        let tb = root.join("thunderbird");
+        std::fs::create_dir_all(tb.join("chrome/icons/default")).unwrap();
+        std::fs::write(tb.join("chrome/icons/default/default48.png"), tiny_png()).unwrap();
+        assert_eq!(bundled_icons(&tb.join("thunderbird")).len(), 1);
+        assert!(bundled_icons(&empty.join("nothing")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn tiny_png() -> Vec<u8> {
         fn chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
             let mut out = (data.len() as u32).to_be_bytes().to_vec();
