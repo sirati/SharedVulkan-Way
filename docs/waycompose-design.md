@@ -28254,7 +28254,15 @@ All three are fixed.
   title change (91.5).
 - **Bug 3.** The map echoed the client's first size back as a configure, which
   Firefox obeyed, and read the window's position before Windows had chosen it
-  (91.6).
+  (91.6). A maximise asked for before the first frame was undone by the map,
+  and a client that commits only its minimum now gets a default size.
+- **GTK dialogs** (reported from real use while this ran): the file chooser's
+  *Open* sat under Windows' buttons. A session-private GTK sheet pads every
+  header bar by the buttons' width (91.8).
+
+On the guest (91.7) the double-click route is proven. The caption buttons and
+the dialogs are measured on the Linux build only, because <guest-user>'s session was
+locked for the rest of the run.
 
 ### 91.2 Bug 1: the ports' descriptor
 
@@ -28453,6 +28461,70 @@ WLCS headless: `XdgToplevelStableConfigurationTest.defaults`, which expects no
 size in the first configure and failed on both legs before (the old comment in `control.rs` said so), now passes, and
 `window_can_maximize_itself` still passes.
 
+### 91.7 On the guest
+
+All in session 1 unless it says otherwise. The evidence is in `docs/medium-il/`.
+
+**<guest-user>'s own double-click, 05:48, on the deployed `wcivs`** (unchanged binaries,
+21 minutes after the port descriptor was applied; `double-click-<guest-user>.txt`).
+`wc-launch.exe`'s parent was `explorer.exe`, and it and all three of its children
+ran at `S-1-16-8192`, not elevated. The log: `wayland rings: 32 connection
+slots…, doorbell org.sirati.wcbell.0`, `doorbell attached on
+\\.\Global\org.sirati.svbell.0`, `cold start: 1394 ms`, `CLICK-TO-WINDOW 3173 ms`.
+Firefox's log had no `Fallback WR to SW-WR`, and the GPU side served it six ICD
+sessions. §90.3's double-click: no rings, no doorbell, a 12.7 s cold start, and
+the window about 4.5 minutes after the click.
+
+**The harness's medium click on the test install `wcmil`** (`medium-click.txt`).
+`cold: the click ran as a double-click does: medium integrity (S-1-16-8192), not
+elevated`, the rings and both doorbells up, `cold start: 3111 ms`,
+`CLICK-TO-WINDOW 6003 ms`. Earlier runs of the same leg, while the window-size
+work was in progress: 5093, 4000 and 4276 ms. The profile was new at the first
+of them and never had a saved window size. Firefox opened on `about:support#graphics-features-tbody`, and a
+visual check of the window capture (`about-support-medium.png`) read Compositing
+`WebRender` and WebGL 1 renderer
+`Mesa -- zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))`, with no row
+saying software. The black strips at the capture's right and bottom edges are
+the frame area of a `PrintWindow` capture, not the product's pixels.
+
+**The window's size, with that new profile.** Firefox's first commit is 1x1 and
+its second 500x120, its own minimum. The compositor configured 1152x676 (90% of
+the 1280x752 work area, §91.6), and the window followed to 1168x684 at 104,68.
+
+**The fallback after the fix**, session 0, `wcmil` with both bells emptied from
+its ini, so that nothing had a doorbell: `cold start: 2319 ms`,
+`CLICK-TO-WINDOW 5251 ms`. Firefox's log had no software fallback, and the GPU
+side served three ICD sessions without one.
+
+**What was not run on Windows, and why.** The caption buttons (91.5) and the
+dialogs (91.8) need input on the desktop: a page to retitle, the window
+maximised, Ctrl+O, Ctrl+S, Ctrl+P, a drag. <guest-user>'s session was locked from 06:38
+(another agent's test sent Win+L), and the rule is then no session-1 input at
+all. Both rest on the measurements and arguments in their sections: for 91.5
+the cause and the WPF precedent, for 91.8 the frame dumps on the Linux build
+of the same `state.rs`. Neither has been seen on Windows yet. A pre-map
+maximise was tried as a second window opened from a maximised one. It did not
+get that far, see the next paragraph.
+
+**A GPU fault, recorded for whoever owns the GPU side.** At 06:58:21 the agent
+maximised the test window (`ShowWindowAsync`, while the session was locked).
+Two seconds later Firefox's GPU process printed
+`ZINK: vkCreateBufferView failed (VK_ERROR_DEVICE_LOST)` and died of `SIGSEGV`
+(crash report `5fa27af5-…` in the profile's `Crash Reports/pending`). The
+System log has no display-driver reset (no event 4101), the VM stayed healthy,
+and the journal shows the passed-through iGPU cycling D0/D3 about every 20 s
+while the session was locked (50 transitions from 06:40 to 06:59). §90 maximised
+the same window on an unlocked desktop with no fault. Not investigated further:
+it is a GPU-side fault and no more GPU work was run while the screen was locked.
+
+**Two harness bugs this run also found** (fixed, 91.4) and two it did not fix:
+- `wc-launch.exe --install` hung for minutes at the end of the `icon` reply.
+  The host had answered, and `ssh.exe` never exited after writing about 17 KB
+  of base64 to its output file. The test install got its shortcut by hand.
+- `shot` also photographs the whole desktop for the shortcut's icon. A capture
+  of <guest-user>'s screen was taken that way at 06:18, and was deleted unviewed and
+  uncommitted; the window captures here use `wc-desk shot --pid` only.
+
 ### 91.8 GTK's dialogs under Windows' caption buttons
 
 Reported by the user from real use: in Firefox's Ctrl+O file chooser, the
@@ -28505,3 +28577,25 @@ file pickers are the same `GtkFileChooser`. The `settings.ini` and a GSettings
 keyfile arm measured identically, so the layout override is not needed for these
 three dialogs, which show no window buttons in either case; it stays for GTK
 windows that would. The measurement on the guest is in 91.7.
+
+### 91.9 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | **2852 passed, 0 failed**, 8 ignored (master: 2848); new: `only_a_windows_wait_with_no_doorbell_sleeps_its_short_rungs`, `the_labels_a_launch_meets_have_their_windows_names`, `showing_a_window_does_not_tell_it_its_own_size_back`, `the_gtk_sheet_pads_the_header_bar_by_the_caption_buttons` |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this branch changed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-wlcs.sh headless` | **429 passed, 37 failed, 759 skipped** (§85: 428, 38); `XdgToplevelStableConfigurationTest.defaults` passes |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-xref.sh --list` | 1207 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | **13 passed, 0 failed** (§90's 12, and the port access) |
+
+### 91.10 What is deployed, and the way back
+
+| where | what |
+|---|---|
+| the guest's two port devices | the descriptor of 91.2 for <guest-user>'s SID, live and as the PnP `Security` property; `C:\Program Files\waycompose\wc-port-access.ps1` and the SYSTEM task `waycompose port access` (at startup). **Way back:** `wc-port-access.ps1 -Action uninstall` with no session up restores `D:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(ML;;NW;;;LW)`, removes the property, the task and the copy |
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-91` and `~/wc-launch-ivs-backup-91`, then `wc-launch.sh deploy` from this branch (master merged, so the ICD without `VK_EXT_external_memory_host`) with §88.6's variables: 13 passed (`deploy-91.txt`) |
+| changed | `wc-launch.exe` `22c7fdf1…` to `91a62e28…`, `sv-guest.exe` `b458eb1b…` to `9f62c1c9…`, `wc-session`, `wc-proxy`, `wc-arena-host`, `sv-hostd`, and `libsv_icd.so` `e71f5a89…` to `53632f4e…` (the same ICD source as master, built in this worktree); `runint.ps1`; new `wc-port-access.ps1` |
+| unchanged | `wc-desk.exe`, `probe-relay.exe`, `click.ps1`; the ini and `gpu.env` byte-identical |
+| the test install `wcmil` | left installed and stopped (`C:\Users\<guest-user>\wcmil`, `~/wc-launch-mil`, profile `~/.wc-launch/firefox-mil`), with no desktop shortcut; its agent and scheduled tasks are removed |
