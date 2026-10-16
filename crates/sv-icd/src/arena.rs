@@ -83,6 +83,8 @@ pub trait Backing: Send {
     /// allocation could be referenced by have passed (docs/design.md §5.5).
     fn free_now(&mut self, a: Allocation) -> Result<()>;
     fn free_bytes(&self) -> u64;
+    /// The largest allocation that would succeed now.
+    fn largest_free_run(&self) -> u64;
 }
 
 pub const fn round_up(size: u64) -> u64 {
@@ -209,6 +211,9 @@ impl Backing for Placeholder {
     fn free_bytes(&self) -> u64 {
         self.free.iter().map(|(_, l)| *l).sum()
     }
+    fn largest_free_run(&self) -> u64 {
+        self.free.iter().map(|(_, l)| *l).max().unwrap_or(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +263,9 @@ impl Backing for sv_arena::alloc::ArenaAllocator {
     }
     fn free_bytes(&self) -> u64 {
         sv_arena::alloc::ArenaAllocator::free_bytes(self)
+    }
+    fn largest_free_run(&self) -> u64 {
+        sv_arena::alloc::ArenaAllocator::largest_free_run(self)
     }
 }
 

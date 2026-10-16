@@ -32,7 +32,7 @@
 use std::sync::{Arc, Mutex};
 use sv_icd_entry::{IcdResult, LowerError, RingClass, Transport};
 use sv_transport::control::{Control, Flags};
-use sv_transport::park::{Deadline, Futex, wait_until};
+use sv_transport::park::{Deadline, Futex, wait_until_gone_after};
 use sv_transport::region::SharedRegion;
 use crate::arena::Backing as _;
 use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProducer};
@@ -43,6 +43,43 @@ use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProdu
 /// peer heartbeat and the generation counter before deciding between 'slow' and
 /// 'gone'." `wait_until` does that check; this is the budget it does it within.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a wait looks at the GPU side's heartbeat.
+const LIVENESS_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long the GPU side's heartbeat may be silent before it is presumed gone
+/// and the call returns `VK_ERROR_DEVICE_LOST`.
+///
+/// It was three polls, 150 ms, which is the default `wait_until` builds, and
+/// that is a window for two processes on one kernel. The GPU side beats every
+/// 20 ms from a thread of its own, but in another VM *all* of its threads stop
+/// while the guest is not scheduled, and this side keeps running, so its stall
+/// credit sees nothing to forgive. A 400 ms stop of the GPU side was enough to
+/// lose Firefox's device (waycompose-design.md §95), and on the guest the iGPU
+/// coming out of D3 and a host with 244 MB free are the likely stops. Five
+/// seconds is what the GPU side allows the app side (`APP_GONE_AFTER`): long
+/// enough that only a stopped or exited peer is silent that long, and still
+/// inside [`CALL_TIMEOUT`].
+///
+/// A test build waits 400 ms instead, so that `abandoned_calls` can outlast it.
+const PEER_GONE_AFTER: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(400)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// Every wait this transport makes on the GPU side: [`LIVENESS_POLL`] and
+/// [`PEER_GONE_AFTER`], so that no site can pick its own window again.
+fn wait_for_peer(
+    control: &Control,
+    ctrl: &RingCtrl,
+    lane: Option<Lane>,
+    parker: &dyn sv_transport::park::Parker,
+    ready: &dyn Fn() -> bool,
+    overall: Deadline,
+) -> sv_transport::Result<()> {
+    wait_until_gone_after(control, ctrl, lane, parker, ready, overall, LIVENESS_POLL, PEER_GONE_AFTER)
+}
 
 /// How much of the arena is set aside for command blobs.
 ///
@@ -422,7 +459,18 @@ pub struct Attached {
 /// reports `NotConnected` for every ring problem, which is true and useless:
 /// the first run of the end-to-end test said exactly that and the real answer
 /// was a packet larger than the ring.
+///
+/// **The first of each kind is said unconditionally** (waycompose-design.md
+/// §95). A Firefox on the deployed install died twice with `zink: DEVICE
+/// LOST!` and nothing from either side to say whether the GPU side's driver
+/// had lost its device or this transport had declared the peer gone; the
+/// reason existed only here, behind `SV_DEBUG`, which nobody runs a desktop
+/// session with. Once per kind, because after the first every outstanding
+/// call reports the same thing.
 fn lower(e: sv_transport::Error) -> LowerError {
+    use std::sync::atomic::AtomicBool;
+    static LOST_SAID: AtomicBool = AtomicBool::new(false);
+    static OTHER_SAID: AtomicBool = AtomicBool::new(false);
     sv_icd_entry::report_transport_failure(&e);
     match e {
         // §4.3: "the app side turns that into `VK_ERROR_DEVICE_LOST` on every
@@ -431,8 +479,23 @@ fn lower(e: sv_transport::Error) -> LowerError {
         sv_transport::Error::PeerRestarted { .. }
         | sv_transport::Error::PeerGone { .. }
         | sv_transport::Error::TimedOut { .. }
-        | sv_transport::Error::RingFatal { .. } => LowerError::DeviceLost,
-        _ => LowerError::NotConnected,
+        | sv_transport::Error::RingFatal { .. } => {
+            crate::state::say_once(
+                &LOST_SAID,
+                &format_args!(
+                    "transport: {e}; returning VK_ERROR_DEVICE_LOST (the GPU side is \
+                     taken to be gone, not its driver's device)"
+                ),
+            );
+            LowerError::DeviceLost
+        }
+        _ => {
+            crate::state::say_once(
+                &OTHER_SAID,
+                &format_args!("transport: {e}; returning VK_ERROR_INITIALIZATION_FAILED"),
+            );
+            LowerError::NotConnected
+        }
     }
 }
 
@@ -972,14 +1035,13 @@ impl RingTransport {
                     // that only arises under a burst.
                     let has_room =
                         || ring.producer.free_bytes().map(|f| f >= want).unwrap_or(true);
-                    wait_until(
+                    wait_for_peer(
                         &self.control,
                         &ring.ctrl,
                         None,
                         &self.parker,
                         &has_room,
                         deadline,
-                        std::time::Duration::from_millis(50),
                     )
                     .map_err(lower)?;
                 }
@@ -1187,7 +1249,8 @@ impl RingTransport {
             return Ok(());
         }
         let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
-        sv_icd_entry::report_transport_failure(&format_args!(
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::state::say_once(&SAID, &format_args!(
             "blob reserve exhausted for a {need}-byte command after {RECLAIM_ROUNDS} reclaims: \
              {} KiB held in {} block(s) and {} retiring",
             blobs.held >> 10,
@@ -1266,14 +1329,13 @@ impl RingTransport {
         if ctrl.completed_seqno().map_err(lower)? >= in_flight {
             return Ok(());
         }
-        wait_until(
+        wait_for_peer(
             &self.control,
             &ctrl,
             None,
             &self.parker,
             &|| ctrl.completed_seqno().map(|c| c >= in_flight).unwrap_or(false),
             Deadline::after(CALL_TIMEOUT),
-            std::time::Duration::from_millis(50),
         )
         .map_err(lower)
     }
@@ -1295,24 +1357,37 @@ impl RingTransport {
         // application is waiting for an answer to.
         let seqno = self.push_into(class, ring, command, deadline)?;
         loop {
-            wait_until(
+            wait_for_peer(
                 &self.control,
                 &ring.ctrl,
                 Some(Lane::Reply),
                 &self.parker,
                 &|| !ring.replies.is_empty().unwrap_or(false),
                 deadline,
-                std::time::Duration::from_millis(50),
             )
             .map_err(lower)?;
             let got = ring.replies.next().map_err(lower)?.map(|p| (p.seqno, p.payload.to_vec()));
             let Some((got_seqno, payload)) = got else { continue };
             ring.replies.advance().map_err(lower)?;
+            if got_seqno < seqno {
+                // **The answer to an earlier call that stopped waiting for it.**
+                // A call that times out, or that decides the peer is gone,
+                // leaves its command on the ring, and the GPU side, if it was
+                // only slow, still answers it. This used to be the error below,
+                // and it was not one error: the call that met the late reply
+                // left its *own* reply behind for the next call, and so on, so
+                // every later call on the ring failed, and Zink would report each
+                // `vkCreateBuffer` after that as failed, for the rest of the process
+                // (waycompose-design.md §95). Sequence numbers only grow, so an
+                // older one is exactly an abandoned call's, and it is dropped.
+                continue;
+            }
             if got_seqno != seqno {
-                // A ring is SPSC and this call holds the producer, so this
-                // cannot happen — which is exactly why it is checked. If it ever
-                // does, a reply has been matched to the wrong command and the
-                // application would get another call's answer.
+                // A ring is SPSC and this call holds the producer, so a reply
+                // *newer* than the command cannot happen, which is exactly why
+                // it is checked. If it ever does, a reply has been matched to
+                // the wrong command and the application would get another
+                // call's answer.
                 return Err(LowerError::Shape("a reply arrived out of order"));
             }
             reply.clear();
@@ -1829,5 +1904,91 @@ mod blob_race {
         assert_eq!(seen, BUFFERS * u64::from(PER_BUFFER));
         let blobs = t.blobs.lock().unwrap();
         assert!(blobs.held <= 2 << 20, "{} bytes held", blobs.held);
+    }
+}
+
+/// waycompose-design.md §95: a call that gives up on a GPU side that was only
+/// stopped, and the call after it.
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod abandoned_calls {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use sv_transport::control::{Geometry, RingKind};
+
+    /// A `RingTransport` on heap regions and a GPU side that answers every
+    /// `DriverVersions` with its own sequence number. Before answering the
+    /// first, it stops beating for twice [`PEER_GONE_AFTER`], which is what a
+    /// guest VM that is not scheduled looks like from here.
+    #[test]
+    fn a_late_reply_to_an_abandoned_call_is_not_the_next_calls_answer() {
+        let g = Geometry::small();
+        let control_region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let arena = Arc::new(SharedRegion::heap(g.arena_size as usize).unwrap());
+        let owner = Arc::new(
+            Control::create(Arc::clone(&control_region), g, crate::protocol_ids(), 1).unwrap(),
+        );
+        let t = RingTransport::finish_attach(control_region, arena, g.arena_size)
+            .unwrap()
+            .transport;
+        let device = (0..g.ring_slot_count)
+            .find(|s| matches!(owner.ring_kind(*s), Ok(RingKind::Device)))
+            .expect("the app side claimed a device ring");
+
+        let beating = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let heart = {
+            let (owner, beating, stop) = (Arc::clone(&owner), Arc::clone(&beating), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if beating.load(Ordering::Acquire) {
+                        let _ = owner.beat_now();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        let gpu = {
+            let (owner, beating) = (Arc::clone(&owner), Arc::clone(&beating));
+            std::thread::spawn(move || {
+                let mut cons = RingConsumer::open(&owner, device, Lane::Command).unwrap();
+                let mut replies = RingProducer::open(&owner, device, Lane::Reply).unwrap();
+                for n in 0..2 {
+                    let seqno = loop {
+                        if let Some(p) = cons.next().unwrap() {
+                            break p.seqno;
+                        }
+                        std::thread::yield_now();
+                    };
+                    cons.advance().unwrap();
+                    if n == 0 {
+                        beating.store(false, Ordering::Release);
+                        std::thread::sleep(PEER_GONE_AFTER * 2);
+                        beating.store(true, Ordering::Release);
+                    }
+                    let mut out = Vec::new();
+                    sv_proto::sv::DriverVersionsReply {
+                        instance_api_version: seqno as u32,
+                        device_api_version: 0,
+                    }
+                    .encode(&mut out)
+                    .unwrap();
+                    replies.push_seq(seqno, &out, None).unwrap();
+                }
+            })
+        };
+
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).unwrap();
+        let mut reply = Vec::new();
+        let first = t.call(RingClass::Device, 0, &cmd, &mut reply);
+        assert_eq!(first, Err(LowerError::DeviceLost), "the silence outlasted PEER_GONE_AFTER");
+        // Before the fix this was `Shape("a reply arrived out of order")`, and
+        // so was every call after it.
+        t.call(RingClass::Device, 0, &cmd, &mut reply).expect("the second call is answered");
+        let got = sv_proto::sv::DriverVersionsReply::decode(&reply).unwrap();
+        gpu.join().unwrap();
+        stop.store(true, Ordering::Release);
+        heart.join().unwrap();
+        assert_eq!(got.instance_api_version, 2, "with its own reply, not the first call's");
     }
 }
