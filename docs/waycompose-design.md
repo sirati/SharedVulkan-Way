@@ -30484,6 +30484,62 @@ Not yet run on the guest: Firefox with two windows and a video, and
 Minecraft. Both need the desktop session, and VulkanMod needs the 1024 MiB
 device (97.6).
 
+### 97.10 On the guest with the 1024 MiB device: two failures, and the soak
+
+The VM restarted at 18:20 with the 1024 MiB GPU device and 12544 MiB of
+RAM (97.3). `wcgpu` and `wcmc` were redeployed from master `ad406ac`
+(`gpu-arena = pool`, 15 of 15 checks each). The first Firefox crashed twice
+before the soak ran, for two reasons, neither of them the pool's allocator.
+
+**A quiet session was ended while its application lived.** Firefox sat
+idle for two minutes before the soak driver connected. The guest's GPU
+process ended the browser's session with "ring 1: nothing for 120s; the app
+side is gone" (`session::IDLE_LIMIT`), although the ICD was beating every
+20 ms. The pool gave the freed control region to the next session, Firefox's
+RDD process, and re-creating its rings reset the generation under the live
+browser: "peer restarted: generation 1 became 0", `VK_ERROR_DEVICE_LOST`, and
+Zink took the browser down. The 120 s limit was older than the pool (the slot
+path shares `session::drain`), but a slot path's freed slot was not handed on
+at once. Fixed in `efb7b03`: a live heartbeat resets the idle clock, so
+`IDLE_LIMIT` applies only to an app side that never beats; and a pooled
+session the GPU side ends with an error keeps its control region and leases
+instead of handing them on. Locally, a session holding 184 MiB with no ring
+traffic for 135 s beside a second session kept working and freed and
+reallocated normally.
+
+**A stale session held the doorbell.** Redeploying `wcgpu` stopped the
+guest's launcher, but the crashed session's host units
+(`wc-launch-gpu-wcg-13688` and its proxy and audio) kept running. Its
+`sv-hostd` kept QEMU's only connection to `svbell.sock`; the next session's
+hub connected into QEMU's backlog, never to be accepted, and the ICD's socket
+to the hub filled. Firefox's renderer thread then sat in `send()`
+(`PortWake::poke`, inside `vkCreateGraphicsPipelines`) and its main thread in
+a synchronous `FlushRendering`, until the ICD's calls timed out. Fixed for
+the application in `8b68865` (the host-side doorbell writer queues to a
+thread of its own and drops a byte rather than block); fixed at the cause in
+§99, which takes the port away from sessions altogether.
+
+**The soak**, 19:06–19:37, `wcgpu` on the 1024 MiB pool, Firefox's two
+windows with the first playing a looping 720p H.264 clip
+(`SOAK_MODE=two-windows SOAK_VIDEO=1`, the driver on the workstation over a
+forward of Marionette):
+
+| check | result |
+|---|---|
+| page loads, compositor samples | 375; WebRender in all 375 |
+| step errors, DEVICE_LOST | 0, 0 |
+| video | 55,861 frames, 190 dropped (0.34%), `err=none` |
+| quit | clean from the last window, no minidump |
+| pool high water | 97.7 of 1024 MiB: browser 74.1, RDD (video decode) 23.5 |
+
+Minecraft on the same pool (`wcmc` and the `wcl` installation): stock
+1.21.11 rendered through Zink on the Intel iGPU at 52 fps, and VulkanMod
+0.6.8 at 30 fps, both with F3 showing the renderer and no artifacts
+(`/tmp/wcrun/minecraft-shots/`). The user played both from TeamViewer. One
+compositor bug was found and left for its owner: leaving fullscreen (F11 on
+a fullscreen window) minimised the window to (-32000,-32000), and neither
+`ShowWindow(SW_RESTORE)` nor a click on its taskbar button brought it back.
+
 ## 98. Firefox's crash at quit: a frame shown after its surface was gone
 
 Branch `quit-crash`, from `desktop-checks` 8d8c32b, 2026-10-16. The brief: §95.4
@@ -30685,3 +30741,65 @@ example, a `wl_shm` pool on the arena itself, which removes the 1.2 ms copy.
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 | the citation check (`design_citations`) | passes: 0 missing, §98's included |
 | the recipe, 120 s, after the fix | 9 runs that count, 0 crashes; 6 more with the window widened, 0 crashes (98.6) |
+
+## 99. The doorbells belong to no session: one hub per user, every installation and every application on it
+
+Branch `bell-hub`, from master `0f486c4`, 2026-10-16. The user's requirement,
+after 97.10: **any number of applications must be able to run together**, so
+a doorbell is a shared resource, and no session, crashed or alive, may hold
+one against the others.
+
+### 99.1 What held what
+
+| port | QEMU's socket | held by, until §99 | consequence |
+|---|---|---|---|
+| `org.sirati.svbell.0` (GPU rings, §87) | `svbell.sock` | each session's `sv-hostd ivshmem-serve`, from its start to its end | the first session's hub owned the port; a later one's connection sat in QEMU's backlog (97.10) |
+| `org.sirati.wcbell.0` (Wayland rings, §89) | `wcbell.sock` | each session's `wc-proxy`, directly | the same shape, with no hub at all |
+
+QEMU's chardev serves one connection. A later connection is accepted into
+the backlog and never served, so a session that came second could write
+its bells and never be read, and, until `8b68865`, blocked on them.
+
+On the guest each port has one opener, and that is already right: one GPU
+process maps the GPU device (§87.2) and serves every session over one port
+handle (`vdoorbell::attach_set`), and one compositor holds the Wayland port.
+Any number of applications share those two processes; nothing more is
+needed there.
+
+### 99.2 The hub
+
+`sv-hostd bell-hub --port UPSTREAM=HUB …`, the user unit
+`wc-bell-hub.service` (`Restart=always`), started by `wc-launch.sh deploy`
+and by `wc-session` if a session finds it down. It runs as the user and
+refuses to run as root.
+
+* It holds `svbell.sock` and `wcbell.sock` for as long as the VM runs,
+  retrying every 500 ms while they are absent and reconnecting when QEMU
+  restarts; clients stay connected across that.
+* Every session's ICDs connect to `/run/user/<uid>/wc-bell/sv.sock`
+  (`SV_BELL`) and every session's `wc-proxy` to `…/wl.sock`
+  (`--wayland-bell`). `sv-hostd ivshmem-serve` no longer touches the port.
+* A byte from the guest goes to every client; a byte from any client goes
+  to the guest. A doorbell byte names a ring slot and lane, not a session
+  (`park::lane_token`), so it cannot be routed by session without changing
+  the wire; every client rings that lane in its own sessions, the right one
+  wakes, and the others pay one spurious wake, as the doorbell's framing
+  argument always priced it.
+* **Nothing blocks on anybody.** Each client has a writer thread fed by a
+  bounded queue of its own (256 writes), and so does the upstream. A full
+  queue drops the byte and counts it; a client that stops reading, crashes
+  or hangs costs only its own bells, and a client that leaves is forgotten.
+
+Without the hub, a session falls back to holding the port itself and says
+so in capitals (`NO SHARED DOORBELL HUB`), which is the pre-§99 behaviour.
+Every installation must therefore be redeployed with this `wc-session`: an
+old one would take QEMU's socket away from the hub.
+
+### 99.3 Tests
+
+| test | holds |
+|---|---|
+| `bellhub::a_stalled_client_blocks_no_other_and_not_the_guest` | 4 MiB from the guest with one client never reading: the guest's writes return, the other clients get bytes, the stalled client's are dropped and counted, and a client's byte still reaches the guest |
+| `bellhub::clients_survive_the_upstream_reconnecting` | the upstream closes (the VM stops): the hub reconnects by itself and a client connected before carries on both ways |
+| `bellhub::a_client_leaving_affects_no_other` | a client leaving is forgotten, the rest still get the guest's bytes; the socket is 0600 |
+| `vdoorbell::a_doorbell_nobody_reads_never_blocks_the_poker` (`8b68865`) | the ICD's side: two million pokes into a socket nobody reads return at once |
