@@ -665,9 +665,12 @@ APPS
     # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
     # installation: it, not a session, holds QEMU's two doorbell sockets.
     # Its own copy of sv-hostd, so that redeploying one installation never
-    # swaps the binary under another's running hub; restarted only when that
-    # copy or the unit changed (a restart costs running sessions their bells
-    # for a moment: their waits fall back to the slice, nothing fails).
+    # swaps the binary under another's running hub. A RUNNING HUB IS NEVER
+    # RESTARTED HERE: its clients (every session's ICDs and proxies) do not
+    # reconnect, so a restart would leave every running session of every
+    # installation on the slice until it ends. A changed binary or unit is
+    # installed and takes effect at the hub's next start (the next VM host
+    # boot, or `systemctl --user restart wc-bell-hub` when nothing runs).
     local hubbin=~/wc-bell/sv-hostd hubunit=.config/systemd/user/wc-bell-hub.service
     h "mkdir -p ~/wc-bell \$HOME/.config/systemd/user" >/dev/null
     local before; before=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
@@ -687,10 +690,14 @@ RestartSec=2
 WantedBy=default.target
 UNIT
     local after; after=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
-    h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; if [ '$before' != '$after' ]; then systemctl --user restart wc-bell-hub.service; else systemctl --user start wc-bell-hub.service; fi" >/dev/null 2>&1
+    h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; systemctl --user start wc-bell-hub.service" >/dev/null 2>&1
     local hs; hs=$(h "sleep 1; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service; ls /run/user/\$(id -u)/wc-bell/ 2>/dev/null | tr '\n' ' '")
     case "$hs" in
-      active*sv.sock*wl.sock*) ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
+      active*sv.sock*wl.sock*)
+        if [ "$before" != "$after" ] && [ -n "$before" ]; then
+          note "the doorbell hub was already running and was NOT restarted; the new binary or unit takes effect at its next start"
+        fi
+        ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
       *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;
     esac
     local genv
