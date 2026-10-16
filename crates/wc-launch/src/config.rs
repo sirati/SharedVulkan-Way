@@ -21,40 +21,22 @@ pub struct App {
     /// The icon's name in the *host's* theme. §16: the pixels live on the
     /// machine the application runs on, and there is no second copy here.
     pub icon: String,
-    /// The command line to run on the VM host, as written.
-    pub exec: String,
-    /// Preferences the *deployment* sets on the application's profile, as
-    /// `key=value` separated by `;`.
+    /// §94. The application's id **on the VM host**: a section of the host's
+    /// `apps.ini` beside `wc-session`, which holds everything that decides what
+    /// runs there — the executable, its fixed arguments, the profile, the
+    /// preferences, the title-bar arrangement, the environment and whether the
+    /// forwarded GPU applies. The section's id by default.
     ///
-    /// This is the same class of thing as `MOZ_GTK_TITLEBAR_DECORATION=none` in
-    /// `wc-session run` and it exists for the same reason: a setting that has to
-    /// be true on the client's machine, that no protocol carries, and that the
-    /// launcher is the only thing in a position to state. `middlemouse.paste` is
-    /// the one that made it necessary — on Linux a middle click pastes the
-    /// primary selection, and the window this launcher opens is on a Windows
-    /// desktop where a middle click does not.
-    pub prefs: String,
-    /// What the application does with its own title bar: `tabs`, `none` or
-    /// `client`. See [`crate::plan::Titlebar`].
-    ///
-    /// **`tabs` by default since §82**, which is the goal clause
-    /// `docs/goal-firefox.md` states: Firefox's tab strip drawn *inside*
-    /// Windows' caption, Windows' own minimise, maximise and close in its
-    /// corner. The compositor's half has existed since §31 and is now its
-    /// default (`auto` folds the caption of a client that asked to decorate
-    /// itself); this half is the three things only the client's machine can
-    /// be told — `MOZ_GTK_TITLEBAR_DECORATION=client`, preferences that turn
-    /// Firefox's own window buttons off, and a `userChrome.css` that reserves
-    /// the buttons' corner and fits the tab strip to the caption's height.
-    ///
-    /// `none` is the per-application opt-out: Windows' caption, the tab strip
-    /// under it — §22's arrangement, unchanged. Until §82 it was the only
-    /// value, because the comment here said the compositor's half "does not
-    /// exist yet"; it had existed for months.
-    pub titlebar: String,
+    /// Until §94 this block carried `exec`, `prefs` and `titlebar`, and the
+    /// launcher sent the command line to the host. A key that can send a
+    /// command line can run any program as the host's user
+    /// (security-model.md R33), so the guest now names the application and
+    /// nothing else; `exec`, `prefs` and `titlebar` are refused by name.
+    pub host_app: String,
     /// §92. The application's desktop entry on the VM host, by id: `firefox`
-    /// for `firefox.desktop`. Its name, icon and `Actions=` become the Start
-    /// menu entry, the pin and the jump list. The section's id by default.
+    /// for `firefox.desktop`. On this side it is identity only: with
+    /// [`App::app_id`] it is what the pin's taskbar identity is derived from
+    /// before the host has answered. The section's id by default.
     pub desktop: String,
     /// §92. The Wayland app id the application's windows carry, which is what
     /// their taskbar identity is derived from (`taskbar::identity`). Empty by
@@ -201,9 +183,7 @@ impl Config {
                     cfg.apps.entry(id.to_string()).or_insert(App {
                         title: id.to_string(),
                         icon: id.to_string(),
-                        exec: String::new(),
-                        prefs: String::new(),
-                        titlebar: "tabs".into(),
+                        host_app: id.to_string(),
                         desktop: id.to_string(),
                         app_id: String::new(),
                     });
@@ -222,9 +202,16 @@ impl Config {
                 match k {
                     "title" => app.title = v.into(),
                     "icon" => app.icon = v.into(),
-                    "exec" => app.exec = v.into(),
-                    "prefs" => app.prefs = v.into(),
-                    "titlebar" => app.titlebar = v.into(),
+                    "host-app" => app.host_app = v.into(),
+                    // §94. What runs on the VM host is the host's to say.
+                    "exec" | "prefs" | "titlebar" => {
+                        return Err(format!(
+                            "line {}: [app.{id}] {k} is not the guest's to set since §94: the command \
+                             line, profile, preferences and title bar are defined on the VM host, in \
+                             apps.ini beside wc-session; name the application with host-app",
+                            n + 1
+                        ));
+                    }
                     "desktop" => app.desktop = v.into(),
                     "app-id" => app.app_id = v.into(),
                     other => return Err(format!("line {}: [app.{id}] has no {other}", n + 1)),
@@ -323,13 +310,6 @@ impl Config {
             ));
         }
         for (id, app) in &self.apps {
-            if app.exec.trim().is_empty() {
-                return Err(format!("[app.{id}] exec is required"));
-            }
-            // §82. A typo here would otherwise reach the VM host as an
-            // environment variable Firefox does not recognise, and Firefox
-            // answers an unknown value by decorating itself — a window that
-            // looks almost right, which is the worst kind.
             // §92. The desktop id becomes a file name on the VM host and a word in
             // $SSH_ORIGINAL_COMMAND; the host refuses anything else, and saying so
             // here names the line.
@@ -344,10 +324,14 @@ impl Config {
                     app.desktop, app.app_id
                 ));
             }
-            if crate::plan::Titlebar::parse(&app.titlebar).is_none() {
+            // §94. The host app id is a word of the request and a section name
+            // in the host's apps.ini, and `wc-session` checks it with the same
+            // rule ([`host_app_ok`]).
+            if !host_app_ok(&app.host_app) {
                 return Err(format!(
-                    "[app.{id}] titlebar = {} is not one of tabs, none, client",
-                    app.titlebar
+                    "[app.{id}] host-app = {} is not an application id (a letter or digit, then \
+                     letters, digits, . _ - +, at most 64)",
+                    app.host_app
                 ));
             }
         }
@@ -370,6 +354,18 @@ impl Config {
             format!("no [app.{id}] in the configuration; it has {}", known.join(", "))
         })
     }
+}
+
+/// §94. An application id as `wc-session` accepts it: a letter or digit first
+/// (so it can never be read as an option), then letters, digits, `.`, `_`,
+/// `-` and `+`, no `..`, at most 64 bytes. Must agree with `check_app` in
+/// `scripts/wc-session`.
+pub fn host_app_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && !s.contains("..")
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
 /// The example the install step writes when there is no file yet. It is here
@@ -402,19 +398,15 @@ audio-volume = 100
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
 #
-# `exec` is resolved on the VM host, and `/run/current-system/sw/bin/firefox` is
-# a symlink into that machine's current system rather than a store path: a store
-# path is correct for exactly one rebuild.
+# What runs on the VM host -- the executable, the profile, the preferences, the
+# title bar -- is defined there, in apps.ini beside wc-session, and this block
+# names it by `host-app` (docs/waycompose-design.md §94). The rest is how it
+# looks on this desktop.
 [app.firefox]
-title = Firefox (Linux)
-icon  = firefox
-exec  = firefox --profile ~/.wc-launch/firefox
-# A middle click on Windows does not paste, so it must not paste here either.
-prefs = middlemouse.paste=false
-# Firefox's tabs in Windows' caption, with Windows' own minimise, maximise and
-# close in its corner. `none` opts this application out: Windows' caption above,
-# the tab strip below. See docs/waycompose-design.md §82.
-titlebar = tabs
+title    = Firefox (Linux)
+icon     = firefox
+host-app = firefox
+desktop  = firefox
 "#;
 
 #[cfg(test)]
@@ -435,9 +427,11 @@ mod tests {
         assert_eq!(cfg.apps.len(), 1);
         let app = cfg.app("firefox").unwrap();
         assert_eq!(app.title, "Firefox (Linux)");
-        // The store path changes on every rebuild of the host; a launcher that
-        // hard-coded one would work until the next `nixos-rebuild`.
-        assert!(!app.exec.contains("/nix/store/"), "{}", app.exec);
+        assert_eq!(app.host_app, "firefox");
+        // §94: nothing in the guest's file says what runs on the host.
+        for k in ["exec", "prefs", "titlebar", "--profile", "/nix/store/"] {
+            assert!(!EXAMPLE.lines().any(|l| !l.starts_with('#') && l.contains(k)), "{k}");
+        }
     }
 
     #[test]
@@ -465,16 +459,36 @@ mod tests {
         assert!(e.contains("leaves nothing"), "{e}");
     }
 
+    /// §94. The three keys that used to say what runs on the VM host are
+    /// refused by name, so an ini from before §94 fails at the line that
+    /// needs changing rather than sending a command line nobody reads.
     #[test]
-    fn an_app_without_an_exec_is_refused() {
-        let e = Config::parse("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.x]\n")
-            .unwrap_err();
-        assert!(e.contains("[app.x] exec"), "{e}");
+    fn a_command_line_preferences_or_a_title_bar_in_the_guest_s_file_are_refused() {
+        for (k, v) in [("exec", "/bin/firefox --profile /tmp/p"), ("prefs", "a.b=1"), ("titlebar", "none")] {
+            let e = Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.x]\n{k}={v}\n"))
+                .unwrap_err();
+            assert!(e.contains(&format!("[app.x] {k} is not the guest's")) && e.contains("apps.ini"), "{e}");
+        }
+    }
+
+    /// §94. The host app id defaults to the section's and is held to the
+    /// alphabet `wc-session` accepts: a leading `-` would be an option.
+    #[test]
+    fn the_host_app_id_defaults_to_the_section_and_is_checked() {
+        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.ff]\n";
+        assert_eq!(Config::parse(base).unwrap().app("ff").unwrap().host_app, "ff");
+        let c = Config::parse(&format!("{base}host-app=firefox-esr\n")).unwrap();
+        assert_eq!(c.app("ff").unwrap().host_app, "firefox-esr");
+        for bad in ["-x", "--dirs", ".x", "a..b", "a/b", "a b", "a;b", "$(id)", &"a".repeat(65)] {
+            assert!(Config::parse(&format!("{base}host-app={bad}\n")).is_err(), "{bad}");
+            assert!(!host_app_ok(bad), "{bad}");
+        }
+        assert!(host_app_ok("org.mozilla.firefox") && host_app_ok("7zip+x_y-z"));
     }
 
     #[test]
     fn an_unknown_app_lists_the_known_ones() {
-        let cfg = ok("[app.firefox]\nexec=/bin/firefox\n[app.gimp]\nexec=/bin/gimp\n");
+        let cfg = ok("[app.firefox]\n[app.gimp]\n");
         let e = cfg.app("inkscape").unwrap_err();
         assert!(e.contains("firefox, gimp"), "{e}");
     }
@@ -486,22 +500,12 @@ mod tests {
         assert!(e.contains("arena_mib"), "{e}");
     }
 
-    /// §82: Firefox's tabs in the caption unless a block says otherwise, and
-    /// the shipped example says so in as many words.
-    #[test]
-    fn titlebar_defaults_to_tabs_and_each_app_can_opt_out() {
-        let cfg = ok("[app.firefox]\nexec=/bin/firefox\n[app.other]\nexec=/bin/firefox\ntitlebar=none\n");
-        assert_eq!(cfg.app("firefox").unwrap().titlebar, "tabs");
-        assert_eq!(cfg.app("other").unwrap().titlebar, "none");
-        assert_eq!(Config::parse(EXAMPLE).unwrap().app("firefox").unwrap().titlebar, "tabs");
-    }
-
     /// §92. The desktop id defaults to the section's, the app id to nothing
     /// (meaning the entry's StartupWMClass), and neither may leave the
     /// alphabet the host accepts.
     #[test]
     fn the_desktop_id_and_app_id_default_and_are_checked() {
-        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.firefox]\nexec=firefox\n";
+        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.firefox]\n";
         let c = Config::parse(base).unwrap();
         let a = c.app("firefox").unwrap();
         assert_eq!((a.desktop.as_str(), a.app_id.as_str()), ("firefox", ""));
@@ -512,15 +516,6 @@ mod tests {
             assert!(Config::parse(&format!("{base}desktop={bad}\n")).is_err(), "{bad}");
             assert!(Config::parse(&format!("{base}app-id={bad}\n")).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn a_titlebar_typo_is_refused_by_name() {
-        let e = Config::parse(
-            "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.x]\nexec=/bin/x\ntitlebar=tab\n",
-        )
-        .unwrap_err();
-        assert!(e.contains("[app.x] titlebar = tab"), "{e}");
     }
 }
 

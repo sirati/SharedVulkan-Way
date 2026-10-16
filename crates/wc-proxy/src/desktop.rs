@@ -467,35 +467,51 @@ pub fn info_lines(e: &Entry) -> Vec<String> {
     out
 }
 
-/// `wc-proxy desktop info ID --dirs A:B`, `… action ID ACTION --dirs …` and
-/// `… open ID URL --dirs …`. Exit status 1 with the reason on stderr when the
-/// answer is no.
-pub fn cli(args: &[String]) -> std::process::ExitCode {
+/// `wc-proxy desktop [--dirs A:B] info|action|open …`, split into the
+/// directories and the words.
+///
+/// §94: **options come first, and the first word that is not one ends them**
+/// (as does `--`). Until §94 `--dirs` was looked for anywhere, so a word in a
+/// positional slot that read `--dirs` — the URL of `open`, say — was taken as
+/// the option and the next word as its value. `wc-session` passes the URL as
+/// one argument and checks its scheme first, so this was not reachable from
+/// the guest; it is closed here so that it does not depend on that.
+pub fn split_args(args: &[String]) -> Result<(Vec<PathBuf>, Vec<String>), String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut words: Vec<&str> = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--dirs" {
-            dirs.extend(
-                it.next()
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .split(':')
-                    .filter(|s| !s.is_empty())
-                    .map(PathBuf::from),
-            );
-        } else {
-            words.push(a);
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "--dirs" => {
+                let v = args.get(i + 1).ok_or("--dirs needs a value")?;
+                dirs.extend(v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+                i += 2;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
         }
     }
+    Ok((dirs, args[i..].to_vec()))
+}
+
+/// `wc-proxy desktop --dirs A:B info ID`, `… action ID ACTION` and `… open ID
+/// URL`. Exit status 1 with the reason on stderr when the answer is no.
+pub fn cli(args: &[String]) -> std::process::ExitCode {
     let fail = |m: String| {
         eprintln!("wc-proxy desktop: {m}");
         std::process::ExitCode::from(1)
     };
+    let (dirs, words) = match split_args(args) {
+        Ok(v) => v,
+        Err(e) => return fail(e.to_string()),
+    };
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
     let entry = match words.get(1).map(|id| find(id, &dirs)) {
         Some(Ok(e)) => e,
         Some(Err(e)) => return fail(e),
-        None => return fail("usage: desktop info|action|open ID [ACTION|URL] --dirs A:B".into()),
+        None => return fail("usage: desktop [--dirs A:B] info|action|open ID [ACTION|URL]".into()),
     };
     let cmd = match (words.first().copied(), words.get(2)) {
         (Some("info"), None) => {
@@ -506,7 +522,7 @@ pub fn cli(args: &[String]) -> std::process::ExitCode {
         }
         (Some("action"), Some(id)) => action_command(&entry, id),
         (Some("open"), Some(url)) => open_command(&entry, url),
-        _ => return fail("usage: desktop info|action|open ID [ACTION|URL] --dirs A:B".into()),
+        _ => return fail("usage: desktop [--dirs A:B] info|action|open ID [ACTION|URL]".into()),
     };
     match cmd {
         Ok(c) => {
@@ -714,5 +730,20 @@ Name=Profile Manager
         assert!(e.actions.iter().any(|x| x.id == "new-tab"));
         assert!(find("../b/applications/firefox", std::slice::from_ref(&b)).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// §94. An option is only an option before the first word, so a URL or
+    /// an id in its slot that reads `--dirs` stays a word.
+    #[test]
+    fn options_end_at_the_first_word() {
+        let v = |a: &[&str]| split_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let (d, w) = v(&["--dirs", "/a:/b", "open", "firefox", "--dirs", "/evil"]).unwrap();
+        assert_eq!(d, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(w, ["open", "firefox", "--dirs", "/evil"]);
+        let (d, w) = v(&["info", "--dirs", "/evil"]).unwrap();
+        assert!(d.is_empty());
+        assert_eq!(w, ["info", "--dirs", "/evil"]);
+        assert_eq!(v(&["--dirs", "/a", "--", "--dirs"]).unwrap().1, ["--dirs"]);
+        assert!(v(&["--dirs"]).is_err());
     }
 }

@@ -923,7 +923,7 @@ is the kind of change that has to be argued rather than asserted:
   costs a syscall, or stay silent, which costs the pump its 20 ms timeout.
 * *No new authority on the host.* ssh remains the guest's only way to cause
   anything to happen on the host: the forced command, its verbs and its
-  forwards are unchanged, and it is still what starts the proxy and the
+  forwards are unchanged (R33 for what the verbs admit since §94), and it is still what starts the proxy and the
   application. The rings are found through the header the compositor wrote,
   and the proxy attaches them only after the header's run id matches the one
   `up` was given over ssh, then checks the control region's protocol ids
@@ -1039,56 +1039,94 @@ some process holds open cannot be opened to change it (it is exclusive), so run
 either with no session up.
 
 ### R33 — Jump lists put a command on the guest that reaches the host
-Added 2026-10-16 with `waycompose-design.md` §92. A pinned Linux application's
-jump list has tasks ("Open new private window") and pages (the profile's most
-visited sites). Each entry is a Windows shortcut that runs
-`wc-launch.exe firefox --action new-private-window` or
+Added 2026-10-16 with `waycompose-design.md` §92. **Resolved 2026-10-16 by §94**
+for the gap it recorded (`run` took a command line); the argument for the whole
+forced command, as it now stands, follows.
+
+A pinned Linux application's jump list has tasks ("Open new private window")
+and pages (the profile's most visited sites). Each entry is a Windows shortcut
+that runs `wc-launch.exe firefox --action new-private-window` or
 `wc-launch.exe firefox --url https://…`, and every entry on that list is written
-by the guest. So anyone who can write the guest user's jump-list files, or who
-can run `wc-launch.exe` with arguments of their choice, can ask the VM host to
-do something. This entry is the argument that what they can ask for is no more
-than what the launcher could already ask for.
+by the guest. So anyone who can write the guest user's jump-list files, who can
+run `wc-launch.exe` with arguments of their choice, or who can read the
+launcher's key (`id_host`, readable by every process of the guest user) can ask
+the VM host to do something. The claim is that what they can ask for is: open a
+session, start an application **the host defines**, run one of its desktop
+entry's actions, open an http(s) or `file:///` URL in it, and read that
+application's name, icon and jump-list pages. Not a program, an argument, a
+path, a preference or a file of their choosing.
 
-**What crosses is an id or a URL, never a command.** The guest sends:
+**Until §94 that claim was false.** `wc-session run ID CMD …` carried a base64'd
+command line from the guest since §28: its first word was resolved and run, the
+rest were its arguments. Any holder of the key could run any program on the VM
+host as `sirati`. The same verb took the profile's whole `user.js` (any
+preference, the remote debugger's included) and both style sheets as guest
+text; `action`, `open`, `app` and `icon` took the executable; `frequent` took a
+profile path. §94.4 found one more of the same family: the guest-RAM `up`
+checked a run id only when it began with `0x`, and printed it with `%s` into the
+script it pipes to `$ROOTC`, so `up ID 1;cmd PAGES OUTBOUND` was a root command
+injection in design. It was not exploitable on testhost only because `$ROOTC`
+(`~/rootc`) no longer exists there.
 
-* `wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME]`.
-  `APPID` is a desktop id (`[A-Za-z0-9._+-]`, no leading dot, no `..`), checked
-  by `wc-session` and again by `wc-proxy desktop`, which looks it up as a file
-  name under `applications/` in the host's own data directories. `ACTION` is
-  an action id (`[A-Za-z0-9-]`, at most 64) and must be one the desktop entry
-  lists in `Actions=` with a `[Desktop Action …]` group, or the one action the
-  host defines in code (Firefox's `new-tab`, `--new-tab about:newtab`). Any
-  other id is refused (`desktop::tests::only_the_entry_s_own_action_ids_run`).
-* `wc-session open ID APPID B64URL B64EXE …`. The URL must be `http://`,
-  `https://` or `file:///`, so it can never begin with `-` and be read as an
-  option. It must have no whitespace, control character, quote, backslash or
-  non-ASCII byte, and be at most 4096 bytes
-  (`desktop::tests::urls_are_checked_strictly`). It becomes one argument, in
-  the slot the entry's own `Exec=` marks with `%u` (or `%U`, `%f`, `%F`). An
-  entry whose `Exec=` takes no URL cannot be asked to open one.
+**What crosses now (§94.3).** The forced command refuses the request whole
+unless it is at most 16 KiB and 12 words of letters, digits, space and
+`+ / = . _ -`, so no shell metacharacter, quote, glob character, newline or
+non-ASCII byte reaches a verb; it splits it without pathname expansion. Each
+verb takes an exact word count, and each word has a type: a session id or an
+application id (a letter or digit first, so never an option; no `/`, no `..`;
+at most 64), an action id, a base64'd URL, a run id (`0x` and hex), or a decimal
+number in a range (DPI 48..960, caption height 0..512, GPU sessions 1..8). The
+harness `crates/wc-launch/tests/wc_session.rs` runs the real script with 133
+hostile requests and asserts each is refused, starts nothing, reaches no root
+step and creates no file; against master's script it fails 11 of its 15 tests.
 
-**The argv is the host's.** `wc-proxy desktop action|open` builds the argument
-list from the desktop entry on the host. It follows the specification's quoting
-and field codes, refuses an action whose program differs from the entry's own,
-and refuses one whose arguments are not single words. `wc-session` then checks
-that the executable the launcher names (`B64EXE`, the `[app.*]` section's
-program) has the basename of the entry's program. It adds `--profile` only for
-a directory under `~/.wc-launch/`, as `run` always has, and hands the result to
-`run`. `run` now executes its command as an array split on whitespace with no
-pathname expansion (a URL's `?`, `*` and `[` are characters, not patterns), and
-nothing on this path is `eval`ed.
+**The argv is the host's.** An application is a section of `apps.ini` beside
+`wc-session`, written by the deploy step and by nothing the guest reaches: an
+absolute `exec`, fixed `args`, a `profile` under `~/.wc-launch`, `prefs`,
+`titlebar`, `desktop`, `gpu` and `env`. `run` executes exactly that, as an
+array. `action` and `open` add what `wc-proxy desktop` builds from the
+application's desktop entry on the host: it accepts an action id only if the
+entry lists it (or it is the one built-in, Firefox's `new-tab`), refuses an
+action whose program differs from the entry's own, and refuses any argument
+that is not one word (`desktop::tests::only_the_entry_s_own_action_ids_run`).
+The URL must be `http://`, `https://` or `file:///`, so it can never begin with
+`-`; it must have no whitespace, control character, quote, backslash or
+non-ASCII byte and be at most 4096 bytes (`desktop::tests::urls_are_checked_strictly`); it becomes one argument, in the slot the entry's own `Exec=` marks
+with `%u`. `wc-proxy desktop` reads its options only before its first word, so
+an id or a URL cannot be taken as `--dirs` (`desktop::tests::options_end_at_the_first_word`). The profile's `user.js`, `userChrome.css` and
+GTK sheet are rendered on the host from the definition, by the launcher's own
+renderer (`plan::host_files`) built for Linux; the guest's only input to them is
+the two numbers.
 
-**What this does not close: `run` itself.** `wc-session run ID CMD …` has
-carried a base64'd command line from the guest since §28, and `run` resolves
-its first word with `resolve_exec` and runs the rest as given. So a holder of
-the guest's key can already run any program on the VM host as `sirati`, under
-the forced command: name it as the first word. §28.5's "the guest cannot run
-anything on the VM host except the verbs" is true of the verbs and not of
-`run`'s argument. The new verbs do not widen this, and they could not narrow it
-alone. Closing it means `run` naming an application by desktop id, as `action`
-does, with the command line moved to the host. That would move the deployment's
-`--profile` and the readback Firefox's path out of `wc-launch.ini` into a file
-on the host, and it is recorded as §92's next step, not done here.
+**Root is out of reach.** The product's arena is ivshmem (R29) and needs no
+root. The guest-RAM path, the only one that pipes to `$ROOTC`, is refused unless
+the environment the script runs in sets `WC_LAUNCH_GUEST_RAM=1`. The guest
+cannot set it: testhost's sshd has no `AcceptEnv` and no
+`PermitUserEnvironment`, and the forced command sets nothing. The run id is
+checked and quoted on that path anyway.
+
+**What this does not close.**
+
+* *The application is as powerful as its own interface.* The key now decides
+  which programs start, with which arguments. It does not decide what a started
+  Firefox does next, and the guest drives that Firefox: its window is on the
+  guest's desktop, and any process of the guest user can send it input. Through
+  Firefox's own UI that is everything Firefox can do as `sirati` on the host:
+  Save As to any path the user can write (`~/.bashrc`, the installation's own
+  `apps.ini`), `file:///` URLs that show any readable file, and with
+  `devtools.chrome.enabled` the Browser Console, which runs privileged script
+  that can start processes. So a hostile process on the guest that can also
+  drive the guest's desktop can still reach code execution on the host, one
+  step further than before and visibly, in a window. Closing that needs the
+  application to run as a user or in a sandbox that is not `sirati`, which is a
+  change to the product's shape and is recorded here, not made.
+* *The installations on one guest share the run root.* Every launcher key on
+  the guest can `down`, `logs` or `up` (which clears the directory) a session
+  of another installation if it knows the id (`<name>-<pid>`). All of them are
+  the same Windows user's.
+* *`file:///` pages.* A frequent page may be a local file, as in Windows'
+  Firefox, so `open` takes `file:///` URLs: the same reach as typing one into
+  the address bar, which the bullet above already grants.
 
 **The jump list's pages are history.** `wc-session frequent` reads the launcher
 profile's `places.sqlite` and `favicons.sqlite`, from copies in a 0700 directory
