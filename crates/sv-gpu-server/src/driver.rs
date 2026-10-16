@@ -159,7 +159,8 @@ pub const AV1_DPB_SLOTS_NEEDED: u32 = 9;
 ///   and on which ffmpeg refuses to open a decoder;
 /// - AV1 with fewer than [`AV1_DPB_SLOTS_NEEDED`] DPB slots. A real stream
 ///   keeps eight distinct reference pictures and decodes a ninth, and ffmpeg
-///   then uses slot index 8 whatever the driver said. Intel 101.7076 reports 8.
+///   then uses slot index 8 whatever the driver said. Intel 101.7076 reports 8,
+///   and so does 101.7092, the newest driver for this GPU (§7.13).
 ///
 /// On a driver that needs the decode structures at stable addresses
 /// (`needs_stable`, Intel's Windows driver), also every codec
@@ -1014,9 +1015,10 @@ mod tests {
 
     /// The guest's Intel 101.7076, as docs/video-decode.md §1 and §7.11.2
     /// measured it: H.264 COINCIDE with 16 slots, H.265 15 slots, AV1 8 slots,
-    /// no VP9. AV1 goes for its slots; H.264 and H.265 are served.
+    /// no VP9. AV1 goes for its slots; H.264 and H.265 are served. 101.7092,
+    /// the newest driver for this GPU, answers every one the same (§7.13).
     #[test]
-    fn intel_101_7076_is_served_h264_and_h265() {
+    fn intel_101_7076_and_7092_are_served_h264_and_h265() {
         let answers = [
             (H264, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 16 }),
             (H265, CodecAnswer::Caps { decode_flags: 0x1, max_dpb_slots: 15 }),

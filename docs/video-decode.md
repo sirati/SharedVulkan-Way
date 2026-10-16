@@ -2239,6 +2239,11 @@ generated submit code only in form (an `if let` where clippy objected to
 
 #### 7.12.6 What is enabled, and what is not
 
+> **[CORRECTED — 2026-10-16, §7.13.5.]** "Hardware" for H.264 and H.265 below
+> was a frame count. The frames were decoded correctly and read back as zeros
+> (the green pictures of §90), because the ICD advertised
+> `VK_EXT_external_memory_host` and could not honour it. Fixed in §7.13.5.
+
 | codec | on the guest |
 |---|---|
 | H.264 | hardware (since §7.11.5) |
@@ -2273,6 +2278,300 @@ The new `unsafe` that Miri does not run is the driver capability query
 (`driver::codec_answer`) and `stable_observe`'s reads of the session and
 parameters create infos. The real-driver runs above cover them, on RADV and
 on the guest.
+
+### 7.13 The newest Intel driver: 101.7092, and nothing changes for AV1 or VP9
+
+Branch `intel-driver`, 2026-10-16, testhost. The user authorised updating
+the guest's graphics driver, to see whether a newer one reports the ninth AV1
+slot (§7.12.2) or `VK_KHR_video_decode_vp9`. It does neither. Every video
+answer is the same as 101.7076's, so the guest is back on 101.7076. The
+regression checks found something else: every hardware-decoded picture
+read back as zeros, on both drivers. That is a forwarder bug, fixed here
+(§7.13.5).
+
+#### 7.13.1 Which driver, and why
+
+Intel moved 11th to 14th gen graphics, Raptor Lake-P's UHD Graphics
+included, to a "legacy software support model" in September 2025. The Arc and
+Core Ultra driver line (101.8xxx and 101.9xxx) no longer covers this GPU. The
+legacy line is 101.7076, 7080, 7082, 7084, 7085, 7088 and **101.7092 WHQL**,
+2026-09-25, the newest. Its release notes list one game fix. The notes of
+7084, 7085, 7088 and 7092 say nothing about Vulkan Video, AV1 or VP9.
+
+| | 101.7076 (before, and kept) | 101.7092 (tried) |
+|---|---|---|
+| driver | 32.0.101.7076, 2025-09-12 | **32.0.101.7092**, 2026-09-03 (built), released 2026-09-25 |
+| package | Lenovo-distributed `iigd_dch.inf`, `oem111.inf`, matching `PCI\VEN_8086&DEV_A7A8&SUBSYS_3C4417AA`, rank `0x00CF0001` | Intel generic `iigd_dch.inf`, `oem159.inf`, matching `PCI\VEN_8086&DEV_A7A8`, rank `0x00CF2001`, section `iRPLPD_w11_DS` (the same as before) |
+| extension INFs | Lenovo's six `iigd_ext.inf` (`oem21`, `39`, `48`, `73`, `79`, `95`) | the same six, still bound |
+| Vulkan ICD | `igvk64.dll` 26.6 MB, `api_version` 1.4.323 | `igvk64.dll` 6.4 MB, `api_version` 1.4.323 |
+
+The package, `gfx_win_101.7092.exe` from Intel's download page 864990:
+
+| file | SHA-256 |
+|---|---|
+| `gfx_win_101.7092.exe` (SHA-512 `35a863fc…385b9d`, as Intel's page lists it) | `9643cc60a899ceadf65df2ec80c17cdb69daeb41cdb2c9ccde0d214a79f968f8` |
+| `Installer.exe` | `c6b6b444e2496067f990996fc6a0d43ca7edf9bbe79b3b59bb02ab80fedd12f0` |
+| `Graphics/iigd_dch.inf` | `1d7b0a25b71f924025875f24b8832ade7c39234965a782dcd34b3a53bca69847` |
+| `Graphics/igdlh.cat` | `d5647c1ac7da82de86bb7e57fb60ca446353ff6b7b1a1750b580e0630ffa2142` |
+| `Graphics/igvk64.dll` | `a8767ef3e59a7e942c7621b80deacac02130299c3ac3e260da154d6bde77b97f` |
+
+`Get-AuthenticodeSignature` on the guest: the exe, `Installer.exe`,
+`igvk64.dll`, `igvkMedia64.dll` and `igdkmdn64.sys` are `Valid`, signed by
+Intel Corporation. The catalog `igdlh.cat` is `Valid`, signed by Microsoft
+Windows Hardware Compatibility Publisher (WHQL).
+
+**The prediction, before installing.** No file in the package contains the
+string `VK_KHR_video_decode_vp9`. The other video extensions are plain strings
+in `igvk64.dll`, as they are in 101.7076's. So 7092 could not offer VP9. The AV1
+slot count cannot be read from the binaries; only the installed driver's
+answer settles it.
+
+#### 7.13.2 Before changing anything
+
+- The driver package was exported: `pnputil /export-driver oem111.inf
+  C:\Users\<guest-user>\intel-driver-backup-101.7076`. That is 175 files, 2.06 GB,
+  `iigd_dch.inf` SHA-256 `4025b79d…2bb1ad`, catalog `Valid`. Lenovo's six
+  extension INFs are in `…\extensions\oemNN`.
+- A System Restore point, number 231, "Before Intel graphics driver update
+  (from 101.7076)". System Protection was already on for C:. **The restore
+  point did not survive the next boot**: Volsnap event 25 deleted C:'s shadow
+  copies at 03:52:45 because "the shadow copy storage could not be grown in
+  time". This guest does that at most boots (also 2026-10-15 09:35 and 17:12),
+  so System Restore is not a rollback path here. The exported package is.
+- Recorded: `pnputil /enum-drivers` and `/enum-devices /class Display
+  /drivers`, Win32_VideoController, the monitors (one output: the panel,
+  `DISPLAY\LEN9156`, internal connection, active), both IVSHMEM devices OK,
+  and DWM. Before, after the install and after the restart:
+  `docs/video-decode/guest-7.13/record-*.txt`.
+- The restart path. QEMU runs without `-no-reboot`, so a guest restart is a
+  `RESET` event, which `windows-vm-guest-watch` ignores. It arms a host
+  poweroff only on `SHUTDOWN`, and not while `/run/windows-vm-sleep/stopping`
+  exists, which `systemctl stop` creates. Windows restarted itself three times
+  inside one QEMU on 2026-10-14 without harm.
+
+#### 7.13.3 The install
+
+03:50:00 to 03:50:57, while <guest-user> was logged in (session locked):
+`Installer.exe -s --noExtras --report …` as a one-shot SYSTEM scheduled task,
+so that an ssh drop during the GPU reset could not kill it. There was no `-f`, so
+the old package and Lenovo's extensions stay in the store, and no `-b`.
+
+- The installer forced the INF (`DiInstallDriver`, `DIIRFLAG_FORCE_INF`) over
+  the better-ranked OEM match, which took 41 s. It stopped and restored `wuauserv`
+  and the Intel Graphics Software service. It found no firmware update
+  service for this device (`AddService IntelGFXFWupdateTool … NOT present`),
+  so no firmware was touched.
+- It exited **0, success, no restart needed**. The driver went live at once:
+  the adapter OK on 32.0.101.7092, DWM the same process, the panel still the
+  active output.
+- The log: `docs/video-decode/guest-7.13/IntelGFX-7092.log`. Its ERROR lines
+  are about restoring ACLs on the copied package folder.
+- At 03:52:13 the VM was cold-restarted from the host (`systemctl restart
+  windows-vm`). The guest agent powered it down cleanly, `guest-watch` was
+  stopped first and armed nothing, the iGPU went to i915 and back to vfio,
+  and the guest answered ssh at 03:53:26. After the boot the adapter was OK on
+  7092, with both IVSHMEM devices OK, and no display or TDR events. The TPM
+  15/27 events and the Intel Platform License Manager timeout (7009) at boot
+  occur at every boot since 2026-10-14, under 101.7076 too.
+
+Health every 15 s from 03:40 on (ssh to the guest, `ping <guest-nat-ip>` from the
+host, QMP `query-status`): every sample good except three, all inside the
+restart (03:52:21 to 03:53:08). No VM stop, no `kvm run failed`.
+
+#### 7.13.4 What 101.7092 answers
+
+`video-probe.exe caps` in the guest, session 0 (`guest-7.13/caps-7092.txt`):
+
+| | 101.7076 (§1) | 101.7092 |
+|---|---|---|
+| video extensions | av1(1), h264(8), h265(7), decode_queue(7), video_queue(8) | the same |
+| `VK_KHR_video_decode_vp9` | absent | **absent** |
+| decode family | family 1, 2 queues, `VIDEO_DECODE` only, H.264, H.265, AV1 | the same |
+| H.264 (baseline, main, high, high interlaced) | 16 slots / 16 refs, 8×8 to 4096×4096 | the same |
+| H.265 Main | 15 / 15, 8×8 to 8192×8192, decode flags raw `0x1100` | the same |
+| H.265 Main10 | supported, no DST or DPB format | the same |
+| AV1 Main 8- and 10-bit, no film grain | **8 / 8** | **8 / 8** |
+| AV1 with film grain | `ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR` | the same |
+| bitstream alignment | 4096 / 4096 | the same |
+
+So the rules of §7.12.3 give the same result on 7092: H.264 and H.265 served,
+AV1 withheld for its slots, VP9 not offered. Nothing in the code changes. The
+Intel workarounds are keyed to vendor 0x8086 and
+`VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS`, not to a version, and 7092 reports
+that id. So the push-set refusal (§0.29), the stable decode structures and the
+view cache stay on. The rule test is now
+`intel_101_7076_and_7092_are_served_h264_and_h265`, and the shape layer's
+header says 7092 answers the same.
+
+#### 7.13.5 The regression checks, and the green pictures they found
+
+Session 0 on the test installation `wcgpu` (<guest-user> was logged in; nothing
+on the desktop), one `wcg` session per run held by `hold.sh`, the checks
+driven from testhost (`guest-7.13/fwd-checks*.sh`). ffmpeg is 9.0.1, the
+build whose `libavcodec` the deployed Firefox loads (`lzd6qqah…-ffmpeg-9.0.1-lib`),
+so the CLI exercises the same Vulkan decoder code as Firefox's RDD process.
+The clips are §7.12.4's: the H.264 and H.265 Main ones reproduce its
+libavcodec hashes exactly, and a third H.265 clip (5 refs, 8 B-frames,
+B-pyramid, open GOP, keyint 60) has its own.
+
+**On 7092:**
+
+| check | result |
+|---|---|
+| `video-probe decode` of the IDR fixture, in the guest | `b3a1374e…`, byte-identical to 101.7076's output of August |
+| the same through the forwarder | `b3a1374e…` |
+| `vulkaninfo` through the forwarder | Intel(R) UHD Graphics, driverInfo 101.7092 |
+| the GPU side's log | `video decode served for: …h264 (decode flags 0x1, 16 DPB slots), …h265 (decode flags 0x1, 15 DPB slots)`; `withheld: …av1: 8 DPB slots, and AV1 needs 9` |
+| §88 scroll, 3 rounds | 60.6, 60.2, 60.3 fps; p50/p95/p99 17/18/18 ms, as §88 |
+| ffmpeg `-hwaccel vulkan`, `hwdownload`, against libavcodec | **all three clips `a991196100087288`**, 180 frames each, exit 0, no error |
+
+Three different streams that give one hash: `a991196100087288` is the hash of 180
+all-zero 1280×720 NV12 frames. Y = U = V = 0 is the (0,77,0) green the
+desktop test saw in Firefox (§90). The earlier guest runs (§7.11.5, §7.12.5)
+counted frames and never looked at a pixel.
+
+**Was it 7092?** The rule agreed beforehand was to roll back on a mismatch, so the
+driver was rolled back (§7.13.6) and the same check run on 7076: **the same
+zeros**, all three clips. So 7092 did not cause it, and none of the checks
+above tell the two drivers apart.
+
+**Telling the causes apart**, on 7076, with the shape layer loaded on the
+testhost side on top of `libsv_icd.so` (two new knobs, below):
+
+| ffmpeg told | decode mode | `VK_EXT_external_memory_host` | result |
+|---|---|---|---|
+| decode flags as forwarded (`0x1`, COINCIDE) | `reuse_dst_dpb` | offered | zeros |
+| `SV_SHAPE_DECODE_FLAGS=2` (DISTINCT) | `dedicated_dpb` | offered | zeros |
+| `SV_SHAPE_DECODE_FLAGS=1`, `SV_SHAPE_HIDE_EXT=VK_EXT_external_memory_host` | `reuse_dst_dpb` | **hidden** | **byte-identical to libavcodec**, all three |
+
+So the decoder was right all along, in either output mode. The pictures were
+lost when they were read back.
+
+**The cause.** `av_hwframe_transfer_data`, which is ffmpeg's `hwdownload` and
+Firefox's readback, imports the destination frame's own `malloc`ed memory
+through `VK_EXT_external_memory_host` when the device offers it, and copies
+the decoded image straight into it. The forwarder cannot import application
+memory. `sv_codegen::exceptions` exempted `vkGetMemoryHostPointerPropertiesEXT`
+from the wild-pointer check on the theory that its pointer *is* arena memory.
+No application passes arena memory there. The ICD sent the raw pointer, and the
+GPU side handed the driver NULL (§7.5's `pHostPointer` validation message is
+this). RADV refuses NULL, so ffmpeg fell back to a staging buffer and every
+local proof passed. Intel's Windows driver accepted NULL: the copy went into
+memory the application never sees, and the frame it handed on stayed zero.
+
+**The fix** (`sv_codegen::exceptions::ICD_EXPANDS_ARENA_POINTER`): the
+exemption is gone, so the derived check puts `VK_EXT_external_memory_host`
+in `INCOMPLETE_EXTENSIONS` and the ICD stops advertising it. Its commands
+are extension-only, so this withdraws an extension rather than failing the build. ffmpeg and
+Firefox then read back through a mapped staging buffer, which lives in the
+arena and works. The GPU side's own use of the extension, importing the
+arena on Intel, is a different device and does not change. The test
+`the_host_pointer_extension_is_not_promised` pins the withdrawal and its
+reason. Honouring a non-arena pointer would need a bounce through the arena
+that nothing implements.
+
+**The confirmation, on 7076, one session:**
+- **Build and deploy:** release `libsv_icd.so` `e71f5a89be67670e`, deployed to
+  `~/wc-launch-gpu/bin` with the previous one kept as
+  `libsv_icd.so.pre-hostmem` (`68eefa150dab399c`). `sv-guest.exe` is
+  unchanged: the wire is the same.
+- **vulkaninfo through the forwarder:** 137 device extensions, none of them
+  `VK_EXT_external_memory_host`.
+- **ffmpeg through the forwarder, no layer:** H.264 `6e435f0ce7f0846f`, H.265
+  `1542ee36b31efcdb`, H.265 complex `c4e7e77eccfabe7c`, each **= libavcodec**.
+- **Firefox:** the §7.11 H.264 page and §7.12's HEVC page, each played 6 s.
+  The current frame was then drawn into a canvas and read
+  (`guest-7.13/pixel-check.py`):
+
+| | before the fix | after the fix |
+|---|---|---|
+| H.264 | mean RGB (124,130,126), 115 colours, but **decoded in software** (Vulkan instance creation failed in that run) | **(124,130,126), 115 colours, Vulkan decoder** |
+| HEVC, hardware | **(0,77,0), one colour, 100 % green** | **(124,130,126), 107 colours, 0 % green** |
+
+After the fix the RDD log shows both Vulkan decoders and 368 readback
+frames, with no fallback. The element screenshots are in
+`guest-7.13/pixels/`. A visual check of them (a fresh Sonnet agent, per
+the project's rule) agrees: HEVC before is a flat dark green frame, and
+both after-pictures show the test pattern with its timecode, without
+artifacts.
+
+**Locally**, `sv-video-decode.sh` passes with the fix, on RADV, unshaped. The
+fixture and ffmpeg's H.264, H.265, Main10, AV1 and VP9 through the forwarder
+are byte-identical to libavcodec. No local driver shows the bug, because
+RADV refuses the NULL pointer. The guest is where it shows.
+
+The shape layer gained the two knobs used above. `SV_SHAPE_DECODE_FLAGS=N`
+replaces the decode flags. Clearing COINCIDE over the forwarded Intel device
+would leave neither mode, which ffmpeg refuses. `SV_SHAPE_HIDE_EXT` hides
+further device extensions.
+
+#### 7.13.6 Rolled back to 101.7076, and why it stays
+
+05:06:52, `pnputil /add-driver C:\Users\<guest-user>\intel-driver-backup-101.7076\iigd_dch.inf
+/install` as a SYSTEM task. The package was still in the store as `oem111`,
+and pnputil put it back on the device in 2 s. The adapter returned OK on
+32.0.101.7076, with the panel the active output, DWM running, and both
+IVSHMEM devices OK (`guest-7.13/rollback.log`, `record-after-rollback.txt`).
+The four packages 7092 had added, all now unbound (`oem159` to `oem162`:
+`iigd_dch`, `cui_dch`, `mshdadac`, `hdbusext`), were deleted from the store.
+What is left is 101.7076's own set: `oem111`, `oem123`, `oem132`, `oem133`,
+`oem73`. The two scheduled tasks were removed.
+
+It stays at 7076, for these reasons:
+- 7092 offers nothing for AV1 or VP9.
+- It measured identically on every check here, including the bug.
+- 7076 is the Lenovo-distributed build matched to this machine's subsystem
+  ID, the one Windows ranks best, and the one <guest-user>'s machine has run
+  since May.
+- Intel's own release notes say to go back to the OEM driver after testing a
+  generic one.
+
+The 7092 package is kept at `C:\Users\<guest-user>\intel-driver-101.7092` (pkg/,
+the verified exe) should anyone want it. The 7076 export stays at
+`C:\Users\<guest-user>\intel-driver-backup-101.7076`.
+
+Health from 03:40 to the end of the runs, every 15 s: guest ssh and host-only ping
+good in every sample outside the 03:52 restart. QMP was unreadable from
+04:54 to 05:10 because the workstation's 1Password agent, through which
+sudokey authenticates, was not answering. Ping and ssh were good
+throughout that window. No VM stop.
+
+#### 7.13.7 What is enabled, and what is not
+
+| codec | on the guest |
+|---|---|
+| H.264, H.265 Main | hardware, **with real pictures since this branch's ICD** (`libsv_icd.so` `e71f5a89`), on `wcgpu` and, deployed by the coordinator afterwards, on `wcivs` |
+| H.265 Main10 | software (no formats) |
+| AV1 | software: 8 DPB slots on 101.7076 and on 101.7092 |
+| VP9 | software: no `VK_KHR_video_decode_vp9` in either driver |
+
+So §7.12.6's "hardware" for H.264 and H.265 was a frame count: the frames
+were decoded right and read back as zeros. A driver with nine AV1 slots or
+VP9 would have to come from Intel's Arc line, which does not cover Raptor
+Lake-P, or from an OEM. There is none now.
+
+**`wcivs`**, the user's desktop installation, was in use for the desktop
+test, so this branch left it alone. The coordinator then put the same
+`libsv_icd.so` (`e71f5a89be67670e`) into `~/wc-launch-ivs/bin` and kept the
+previous one as `libsv_icd.so.pre-hostmem` (`9dc148a58f5879cb`). No guest
+run of `wcivs` was made from this branch after that.
+
+**Gates** at the commits that add this section:
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **101 binaries, 2848 passed, 0 failed**, 8 ignored (master 2847; +1, `the_host_pointer_extension_is_not_promised`) |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this branch touched |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `wc-pool.sh`, `wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| `sv-video-decode.sh` (RADV, unshaped) | PASS: the fixture and ffmpeg's H.264, H.265, Main10, AV1 and VP9 byte-identical to libavcodec |
+| Miri | not run: no new store or `unsafe` code |
+
+`sv-icd-entry`'s `no_extension_is_advertised_with_a_stubbed_entry_point`
+compared `INCOMPLETE_EXTENSIONS` with the stub reasons alone. That held only while
+the wild-lowering class was empty. It now compares with both reason tables.
+
+## What this does not tell us
 
 ## What this does not tell us
 
