@@ -28421,8 +28421,87 @@ work area's top-left corner. The `SetWindowPos` then moved the window there, ove
 the cascade position Windows had just chosen. It is now read after `ShowWindow`,
 so a new window opens where Windows' cascade puts it, fitted to the work area.
 
+**What Firefox commits, traced.** With `WAYLAND_DEBUG` against the Linux build:
+a window Firefox opens maximised (a new window from a maximised one, or a fresh
+profile on a small screen) sends `set_maximized` *before its first commit*. The
+compositor answered with a maximised configure carrying 0x0, and GTK then
+commits its own fallback, 252x304: that is §90.7's number. On win32,
+`set_window_state` then maximised a window that had never been shown, and
+`map_window`'s `SW_SHOWNORMAL` restored it at 252x304. Now a request that
+arrives before the map is kept (`maximize_at_map`) and the map shows the window
+with `SW_SHOWMAXIMIZED`, whose `WM_SIZE` gives the client the work area as its
+size.
+
+**Two more, found on the guest with a fresh profile.**
+- Firefox's first commit there is a 1x1 geometry. Windows will not make an
+  overlapped window smaller than its minimum track size (166x47 at 125%), and
+  `settle_placement` first reported that larger size as a configure, which took
+  the size away from Firefox: the window stayed 148x38. A placement larger than
+  the commit is now not reported; only a smaller one is.
+- Firefox then commits 500x120, which is exactly its own `set_min_size`. With no
+  saved geometry Firefox sizes a window from `screen.availWidth`/`Height` (90%,
+  at most 1280x1040), and on the guest those are not known yet when the window
+  is made. A resizable toplevel with no parent, still choosing its size, whose
+  commit is exactly its minimum, has chosen nothing. The compositor configures
+  it to Firefox's own rule against the work area it is on and resizes the window
+  to match. Dialogs, fixed-size windows (min = max) and any other size are left
+  alone. This is also §90.3's medium first window, 516x128 with its frame.
+
 **Tests.** The headless stand-in sent a `Resized` at map to mirror win32 and no
 longer does (`showing_a_window_does_not_tell_it_its_own_size_back`).
 WLCS headless: `XdgToplevelStableConfigurationTest.defaults`, which expects no
 size in the first configure and failed on both legs before (the old comment in `control.rs` said so), now passes, and
 `window_can_maximize_itself` still passes.
+
+### 91.8 GTK's dialogs under Windows' caption buttons
+
+Reported by the user from real use: in Firefox's Ctrl+O file chooser, the
+*Open* button, at the right end of the GTK header bar, sat behind Windows'
+caption buttons. The compositor's default `auto` folds the caption of every
+window whose client asked to draw its own title bar, and GTK's dialogs (the file
+chooser, Save As, Print) ask exactly as Firefox's main window does. Only the main
+window had its corner reserved, by the launcher's `userChrome.css` (§82). The
+user's ruling: keep folding the dialogs, and make GTK leave the corner empty.
+
+**The fix.** `plan::gtk_css` renders a `gtk.css` with
+`headerbar { padding-right: <reserve>px; }` at the same reservation as the tab
+strip's (146, 183 and 219 px at 100, 125 and 150%), and square top corners,
+because the window is opaque to GDI and the pixels outside a rounded corner
+were drawn black. The launcher sends it to `wc-session run` as a seventh word,
+next to the `userChrome.css`. `wc-session` gives the application a
+session-private `XDG_CONFIG_HOME`, because GTK 3 and 4 read `gtk.css` and
+`settings.ini` from `$XDG_CONFIG_HOME/gtk-{3,4}.0` and the user's own
+`~/.config` is not the launcher's to write. The private directory is an overlay.
+Every entry of the real one is a symbolic link back to it, and only `gtk.css`
+(which imports the user's own first) and `settings.ini` (the user's, with
+`gtk-decoration-layout=:` so a GTK window draws no window buttons of its own)
+are replaced. A bare private directory was tried first and was wrong: the file
+chooser's sidebar lost Documents, Downloads and the other user folders
+(`user-dirs.dirs`), its bookmarks (`gtk-3.0/bookmarks`) and the icon theme
+(dconf). On testhost the overlay also keeps `~/.config/mozilla` and
+`fontconfig` reachable. A file an application creates at the top of the
+directory lands in the overlay and is gone with the session.
+
+**Measured** with Firefox 157 against the Linux compositor in `auto`, frame dumps
+of the dialog (`docs/medium-il/gtk-dialogs/run.sh`; a page whose only element is
+a full-window file input, a download link with downloads set to ask where, and
+a print button with `print.prefer_system_dialog`, each opened by a scripted
+click). The colours in the rightmost 146 columns of the header bar's rows, where
+Windows draws its buttons:
+
+| dialog | without the sheet | with it |
+|---|---|---|
+| Open (file chooser), 1096x869 / 1231x949 | 179 (Search and Open) | 2 (header background) |
+| Save As, 1231x949 | 181 (Search and Save) | 2 |
+| Print, 614x505 | 92 (Print) | 2 |
+
+A visual check of the six frames: with the sheet, Open and Save end at x=1084
+of 1231 and Print at x=467 of 614, each exactly at the boundary; no dialog has a
+GTK close button either way; the overlay variant's sidebar lists the same places
+with the same icons as the unmodified one. The header bars are in
+`docs/medium-il/gtk-dialogs/*-headerbar.png` (cropped to the bar, because the
+full frames show this workstation's volumes and printers). `about:preferences`'
+file pickers are the same `GtkFileChooser`. The `settings.ini` and a GSettings
+keyfile arm measured identically, so the layout override is not needed for these
+three dialogs, which show no window buttons in either case; it stays for GTK
+windows that would. The measurement on the guest is in 91.7.

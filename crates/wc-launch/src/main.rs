@@ -954,12 +954,13 @@ mod win {
         app: &crate::config::App,
     ) -> Result<(), String> {
         let t = Instant::now();
-        // Five things cross, all base64'd because they go through
+        // Six things cross, all base64'd because they go through
         // `$SSH_ORIGINAL_COMMAND`: the command line, the profile directory the
         // deployment's preferences belong in, those preferences already rendered
         // as a `user.js`, the value of `MOZ_GTK_TITLEBAR_DECORATION`, and — §82
         // — the `userChrome.css` that fits Firefox's tab strip to Windows'
-        // caption. The rendering happens here rather than on the host because it
+        // caption, and (§91.8) the GTK sheet that does the same for its dialogs'
+        // header bars. The rendering happens here rather than on the host because it
         // is the part with a shape to get wrong, here it is tested, and here is
         // the only place that knows this desktop's DPI.
         //
@@ -990,6 +991,9 @@ mod win {
                 &word(&plan::app_user_js(titlebar, &app.prefs)),
                 &word(titlebar.moz_env()),
                 &word(&chrome),
+                // §91.8: the GTK sheet, for the dialogs. A `wc-session` older
+                // than §91 ignores a seventh word.
+                &word(&plan::gtk_css(titlebar, fit).unwrap_or_default()),
             ],
         )?;
         log.say(&format!("run {}: {said} ({} ms)", app.title, t.elapsed().as_millis()));

@@ -168,7 +168,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // over the folded one (see `defproc_without_caption_paint`), and a new
     // toplevel's size: the client's own, its min and max, and a user's drag.
     WM_SETTEXT, WM_NCACTIVATE, WS_VISIBLE, WM_GETMINMAXINFO, MINMAXINFO, WM_ENTERSIZEMOVE,
-    WM_EXITSIZEMOVE, IsZoomed,
+    WM_EXITSIZEMOVE, IsZoomed, SW_SHOWMAXIMIZED,
 };
 // ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
 // rather than anywhere near the window APIs, because it is not about a window:
@@ -361,6 +361,9 @@ struct WindowState {
     /// told is decided once, after the placement: nothing if it got what it
     /// committed, a configure if the work area made it smaller.
     placing: Cell<bool>,
+    /// §91: the client asked to be maximised before the window was shown;
+    /// `map_window` shows it maximised.
+    maximize_at_map: Cell<bool>,
     /// §91: inside `WM_ENTERSIZEMOVE` … `WM_EXITSIZEMOVE`, when the user owns
     /// the window's size and a client commit must not resize it.
     user_sizing: Cell<bool>,
@@ -3005,6 +3008,7 @@ fn create_window(
         unpainted_since: Cell::new(None),
         self_driven: Cell::new(false),
         placing: Cell::new(false),
+        maximize_at_map: Cell::new(false),
         user_sizing: Cell::new(false),
         size_hints: Cell::new(((0, 0), (0, 0))),
         icon_big: Cell::new(0),
@@ -3869,6 +3873,17 @@ fn settle_placement(w: &WindowState, width: i32, height: i32) {
         w.last_configured.set((width, height));
         return;
     }
+    // **Larger is not news.** Windows will not make an overlapped window
+    // smaller than its minimum track size (166x47 at 125%), and Firefox's first
+    // commit on the guest is a 1x1 geometry. Telling it the minimum took the
+    // size away from it, and it stayed 148x38 (§91.6, measured on the guest).
+    // A window the client is still sizing just shows its content in a larger
+    // frame until the next commit, which `follow_client_size` then follows.
+    // Only a placement smaller than the commit (the work area) must be told.
+    if got.0 >= width && got.1 >= height {
+        w.last_configured.set(got);
+        return;
+    }
     w.last_configured.set(got);
     let _ = w.events.send(FromUi::Resized { id: w.id, width: got.0, height: got.1 });
 }
@@ -4065,85 +4080,122 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
     // told the size it got.
     // SAFETY: live window handle; both calls send messages to `toplevel_proc`
     // on this thread before returning.
-    w.placing.set(true);
-    w.self_driven.set(true);
-    unsafe {
-        if !w.mapped.replace(true) {
-            ShowWindow(w.hwnd(), SW_SHOWNORMAL);
+    // §91: **a client that asked to be maximised before its first frame is
+    // shown maximised**, rather than placed. Firefox opens a new window
+    // maximised when the window it came from is (`set_maximized` before the
+    // first commit), and `set_window_state` on a window nobody had shown yet
+    // maximised a window with no pixels, which this function's `SW_SHOWNORMAL`
+    // then restored: §90.7's second window, at its pre-layout 252x304. The
+    // `WM_SIZE` that `SW_SHOWMAXIMIZED` sends is the size the client must lay
+    // out at, so `placing` is off for it; `self_driven` holds back only the
+    // echo of the state the client itself asked for.
+    let maximize = !w.mapped.get() && w.maximize_at_map.replace(false);
+    if maximize {
+        w.mapped.set(true);
+        // SAFETY: live window handle; the messages arrive synchronously.
+        unsafe {
+            if w.frame.get().extend_top {
+                w.placing.set(true);
+                SetWindowPos(
+                    w.hwnd(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+                w.placing.set(false);
+            }
+            w.self_driven.set(true);
+            ShowWindow(w.hwnd(), SW_SHOWMAXIMIZED);
+            w.self_driven.set(false);
         }
-    }
-    let (ox, oy) = window_origin(w.hwnd());
-    let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
-    let mut got = asked;
-    if let Some(work) = work_area_of(w.hwnd()) {
-        got = crate::platform::fit_to_work_area(
-            asked,
-            (work.left, work.top, work.right, work.bottom),
+        println!(
+            "wc-compositor: window {} shown maximised, as its client asked before its first frame",
+            w.id
         );
-        if got != asked {
-            println!(
-                "wc-compositor: window {} asked for {}x{} at {},{} and the work area is \
-                 {}x{} at {},{} -> {}x{} at {},{}",
-                w.id,
-                asked.2,
-                asked.3,
-                asked.0,
-                asked.1,
-                work.right - work.left,
-                work.bottom - work.top,
-                work.left,
-                work.top,
-                got.2,
-                got.3,
-                got.0,
-                got.1
+    } else {
+        w.placing.set(true);
+        w.self_driven.set(true);
+        unsafe {
+            if !w.mapped.replace(true) {
+                ShowWindow(w.hwnd(), SW_SHOWNORMAL);
+            }
+        }
+        let (ox, oy) = window_origin(w.hwnd());
+        let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
+        let mut got = asked;
+        if let Some(work) = work_area_of(w.hwnd()) {
+            got = crate::platform::fit_to_work_area(
+                asked,
+                (work.left, work.top, work.right, work.bottom),
+            );
+            if got != asked {
+                println!(
+                    "wc-compositor: window {} asked for {}x{} at {},{} and the work area is \
+                     {}x{} at {},{} -> {}x{} at {},{}",
+                    w.id,
+                    asked.2,
+                    asked.3,
+                    asked.0,
+                    asked.1,
+                    work.right - work.left,
+                    work.bottom - work.top,
+                    work.left,
+                    work.top,
+                    got.2,
+                    got.3,
+                    got.0,
+                    got.1
+                );
+            }
+        }
+        let (x, y, ww, wh) = got;
+        // SAFETY: as above.
+        unsafe {
+            SetWindowPos(
+                w.hwnd(),
+                std::ptr::null_mut(),
+                x,
+                y,
+                ww,
+                wh,
+                // §46: `SWP_FRAMECHANGED` when this window's caption is folded, so
+                // that the one `SetWindowPos` at map both sizes the window and asks
+                // `WM_NCCALCSIZE` again. `frame_glass` above did the DWM half and
+                // deliberately no `SetWindowPos` of its own — two of them at map is
+                // what made the Wine keyboard leg flaky.
+                SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
             );
         }
-    }
-    let (x, y, ww, wh) = got;
-    // SAFETY: as above.
-    unsafe {
-        SetWindowPos(
-            w.hwnd(),
-            std::ptr::null_mut(),
-            x,
-            y,
-            ww,
-            wh,
-            // §46: `SWP_FRAMECHANGED` when this window's caption is folded, so
-            // that the one `SetWindowPos` at map both sizes the window and asks
-            // `WM_NCCALCSIZE` again. `frame_glass` above did the DWM half and
-            // deliberately no `SetWindowPos` of its own — two of them at map is
-            // what made the Wine keyboard leg flaky.
-            SWP_NOZORDER
-                | SWP_NOACTIVATE
-                | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
-        );
-    }
-    w.self_driven.set(false);
-    w.placing.set(false);
-    settle_placement(w, width, height);
-    // What the window actually turned out to be, once, in the log — because
-    // the placement above is the one thing here that Windows is entitled to
-    // overrule, and a line that says so is the difference between finding that
-    // out in a minute and finding it out in a run.
-    {
-        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        // SAFETY: a live window handle; the rectangle is written in place.
-        unsafe { GetWindowRect(w.hwnd(), &mut rc) };
-        if (rc.right - rc.left, rc.bottom - rc.top, rc.left, rc.top) != (ww, wh, x, y) {
-            println!(
-                "wc-compositor: window {} was placed at {ww}x{wh} at {x},{y} and Windows made \
-                 it {}x{} at {},{}",
-                w.id,
-                rc.right - rc.left,
-                rc.bottom - rc.top,
-                rc.left,
-                rc.top
-            );
+        w.self_driven.set(false);
+        w.placing.set(false);
+        settle_placement(w, width, height);
+        // What the window actually turned out to be, once, in the log — because
+        // the placement above is the one thing here that Windows is entitled to
+        // overrule, and a line that says so is the difference between finding that
+        // out in a minute and finding it out in a run.
+        {
+            let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: a live window handle; the rectangle is written in place.
+            unsafe { GetWindowRect(w.hwnd(), &mut rc) };
+            if (rc.right - rc.left, rc.bottom - rc.top, rc.left, rc.top) != (ww, wh, x, y) {
+                println!(
+                    "wc-compositor: window {} was placed at {ww}x{wh} at {x},{y} and Windows made \
+                     it {}x{} at {},{}",
+                    w.id,
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    rc.left,
+                    rc.top
+                );
+            }
         }
+    
     }
-
     // TABS IN THE TITLE BAR, and after `ShowWindow` on purpose: DWM has no caption buttons
     // to report the bounds of until the window has been shown, and asking in
     // `apply_frame` — which runs at create, before the window exists on a
@@ -4561,6 +4613,15 @@ fn present(w: &Rc<WindowState>, damage: &[Rect]) {
 }
 
 fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Option<bool>) {
+    // §91: a window that has not been shown has nothing to maximise yet.
+    // `ShowWindow(SW_MAXIMIZE)` here would show it with no pixels, and the map
+    // would then restore it. The request is kept for `map_window`.
+    if !w.mapped.get() {
+        if let Some(m) = maximized {
+            w.maximize_at_map.set(m);
+        }
+        return;
+    }
     w.self_driven.set(true);
     // SAFETY: live window handle. `ShowWindow` sends `WM_SIZE` synchronously;
     // `self_driven` is what stops that from being reported back to the client

@@ -2533,13 +2533,44 @@ impl State {
                     && !s.states.contains(xdg_state::Fullscreen)
             })
         });
-        let follow = toplevel && !first && client_chooses && (w, h) != window.shown_size;
+        let mut follow = toplevel && !first && client_chooses && (w, h) != window.shown_size;
         if first || follow {
             window.shown_size = (w, h);
         }
         let hints = if toplevel { size_hints_of(&root) } else { window.size_hints };
         let hints_changed = hints != window.size_hints;
         window.size_hints = hints;
+        // §91.6. **A client that chose nothing gets a default.** Firefox sizes
+        // a window with no saved geometry from `screen.availWidth`/`Height`
+        // (90% of it, at most 1280x1040), and on the guest those read as
+        // nothing when the window is made, so it commits exactly its own
+        // `set_min_size`, 500x120, and stays there. A resizable toplevel with
+        // no parent that is still choosing and has committed precisely its
+        // minimum has not chosen a size; it is configured to Firefox's own rule
+        // against the work area this window is on, and the window is resized to
+        // match. A dialog (it has a parent), a fixed-size window (min = max)
+        // and any client that commits anything but its minimum are left alone.
+        let mut default_size = None;
+        if toplevel
+            && client_chooses
+            // The hints can arrive a commit after the size does (they did on
+            // the guest), so the commit that changes them is asked too.
+            && (first || follow || hints_changed)
+            && hints.0.0 > 0
+            && hints.0.1 > 0
+            && (w, h) == hints.0
+            && hints.1 != hints.0
+            && window.role.toplevel().is_some_and(|t| t.parent().is_none())
+            && let Some(b) = popup_bounds_of(window)
+        {
+            let dw = (b.w * 9 / 10).min(1280).max(hints.0.0);
+            let dh = (b.h * 9 / 10).min(1040).max(hints.0.1);
+            if (dw, dh) != (w, h) {
+                default_size = Some((dw, dh));
+                window.shown_size = (dw, dh);
+                follow = false;
+            }
+        }
         self.presents += 1;
         // Before `Map`, so that the first placement already answers
         // `WM_GETMINMAXINFO` with them.
@@ -2549,6 +2580,16 @@ impl State {
         if follow {
             println!("wc-compositor: window {id} client chose {w}x{h}; the window follows");
             self.ui.send(ToUi::Resize { id, width: w, height: h });
+        }
+        if let Some((dw, dh)) = default_size {
+            println!(
+                "wc-compositor: window {id} committed only its minimum size {w}x{h}; \
+                 configuring the default {dw}x{dh} (§91.6)"
+            );
+            if !first {
+                self.ui.send(ToUi::Resize { id, width: dw, height: dh });
+            }
+            self.on_resized(id, dw, dh);
         }
 
         if first {
@@ -2600,10 +2641,12 @@ impl State {
                     aumid: crate::taskbar::identity(&app_id, client),
                 });
             }
+            // §91.6: a client that chose nothing is shown at its default.
+            let (mw, mh) = default_size.unwrap_or((w, h));
             self.ui.send(ToUi::Map {
                 id,
-                width: w,
-                height: h,
+                width: mw,
+                height: mh,
                 fold_caption,
             });
             if !title.is_empty() {
