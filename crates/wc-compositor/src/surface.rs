@@ -323,6 +323,10 @@ impl Shadow {
     /// subsurfaces really are translucent — a rounded corner over a background
     /// this compositor drew — the difference will show as a hard edge, and that
     /// is the point at which this becomes a blend.
+    ///
+    /// §95: that point came (Firefox's `<select>` dropdown). The root of a tree
+    /// is still copied with this; every surface drawn after it goes through
+    /// [`Shadow::compose_over`].
     pub fn compose(&mut self, src: &Shadow, at: (i32, i32)) {
         if src.is_empty() || self.is_empty() {
             return;
@@ -347,6 +351,74 @@ impl Shadow {
             let d = (dst.y as usize + row) * dst_stride + dst.x as usize * bpp;
             self.pixels[d..d + bytes].copy_from_slice(&src.pixels[s..s + bytes]);
         }
+    }
+
+    /// Draw `src` **over** this shadow with its top-left corner at `at`,
+    /// clipped to both: `dst = src + dst * (1 - src.alpha)`, which is the
+    /// Porter-Duff "over" for the premultiplied pixels `wl_shm`'s ARGB is.
+    ///
+    /// §95. [`Shadow::compose`]'s note said this would be needed "when something
+    /// arrives whose subsurfaces really are translucent", and Firefox's `<select>`
+    /// dropdown is that: GTK makes it a `wl_subsurface` of the window (not an
+    /// `xdg_popup`), drawn with a transparent shadow margin and rounded corners.
+    /// Copied, the margin's (0,0,0,0) pixels replaced the page under them and
+    /// the dropdown wore a thick black frame, on the guest and in the Linux
+    /// build's frame dumps alike.
+    ///
+    /// An `Xrgb8888` source is copied: its fourth byte is padding, not alpha.
+    /// A row whose pixels are all opaque is copied too, which is every row of
+    /// Firefox's content subsurface, so the common frame costs a scan of the
+    /// alpha bytes on top of the `memcpy` it always cost.
+    pub fn compose_over(&mut self, src: &Shadow, at: (i32, i32)) {
+        if !src.spec.format.has_alpha() {
+            self.compose(src, at);
+            return;
+        }
+        if src.is_empty() || self.is_empty() {
+            return;
+        }
+        let bpp = PixelFormat::BYTES_PER_PIXEL;
+        let Some(dst) = Rect::new(at.0, at.1, src.width(), src.height())
+            .clip(self.spec.width, self.spec.height)
+        else {
+            return;
+        };
+        let sx = dst.x - at.0;
+        let sy = dst.y - at.1;
+        let src_stride = src.spec.stride as usize;
+        let dst_stride = self.spec.stride as usize;
+        let bytes = dst.w as usize * bpp;
+        for row in 0..dst.h as usize {
+            let s = (sy as usize + row) * src_stride + sx as usize * bpp;
+            let d = (dst.y as usize + row) * dst_stride + dst.x as usize * bpp;
+            let from = &src.pixels[s..s + bytes];
+            let to = &mut self.pixels[d..d + bytes];
+            if from.chunks_exact(bpp).all(|p| p[3] == 0xFF) {
+                to.copy_from_slice(from);
+                continue;
+            }
+            for (o, i) in to.chunks_exact_mut(bpp).zip(from.chunks_exact(bpp)) {
+                match i[3] {
+                    0xFF => o.copy_from_slice(i),
+                    0 => {}
+                    a => {
+                        let keep = 255 - u32::from(a);
+                        for c in 0..4 {
+                            // Rounded division by 255; premultiplied, so a
+                            // channel never exceeds its alpha and the sum
+                            // never exceeds 255.
+                            let under = (u32::from(o[c]) * keep + 127) / 255;
+                            o[c] = (u32::from(i[c]) + under).min(255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every pixel transparent black, at the current size.
+    pub fn clear(&mut self) {
+        self.pixels.fill(0);
     }
 }
 
@@ -967,6 +1039,49 @@ mod tests {
         src[16..24].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
         shadow.blit(&src, s, &[]);
         assert_eq!(shadow.pixels(), &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    fn shadow_of(w: i32, h: i32, format: PixelFormat, px: [u8; 4]) -> Shadow {
+        let mut s = Shadow::empty();
+        let spec = BufferSpec { width: w, height: h, stride: w * 4, format };
+        s.blit(&px.repeat((w * h) as usize), spec, &[]);
+        s
+    }
+
+    #[test]
+    fn a_translucent_subsurface_is_drawn_over_its_parent_not_instead_of_it() {
+        // §95: Firefox's <select> dropdown, a subsurface with a transparent
+        // shadow margin. Copied, the margin was a black frame over the page.
+        let mut canvas = shadow_of(4, 1, PixelFormat::Argb8888, [200, 100, 50, 255]);
+        let mut child = Shadow::empty();
+        let spec = BufferSpec { width: 3, height: 1, stride: 12, format: PixelFormat::Argb8888 };
+        // Transparent, half-covered (premultiplied 50% white), opaque blue.
+        child.blit(&[0, 0, 0, 0, 128, 128, 128, 128, 255, 0, 0, 255], spec, &[]);
+        canvas.compose_over(&child, (1, 0));
+        assert_eq!(&canvas.pixels()[0..4], &[200, 100, 50, 255], "outside the child");
+        assert_eq!(&canvas.pixels()[4..8], &[200, 100, 50, 255], "under a transparent pixel");
+        // 128 + 200 * 127/255, and so on: the page shows through at half.
+        assert_eq!(&canvas.pixels()[8..12], &[228, 178, 153, 255]);
+        assert_eq!(&canvas.pixels()[12..16], &[255, 0, 0, 255], "an opaque pixel replaces");
+    }
+
+    #[test]
+    fn an_xrgb_subsurface_is_copied_whatever_its_padding_byte_says() {
+        let mut canvas = shadow_of(2, 1, PixelFormat::Argb8888, [9, 9, 9, 255]);
+        // Padding of zero must not read as "transparent".
+        let child = shadow_of(2, 1, PixelFormat::Xrgb8888, [1, 2, 3, 0]);
+        canvas.compose_over(&child, (0, 0));
+        assert_eq!(canvas.pixels(), &[1, 2, 3, 0, 1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn an_opaque_subsurface_draws_exactly_as_the_copy_did() {
+        let mut a = shadow_of(3, 2, PixelFormat::Argb8888, [5, 6, 7, 255]);
+        let mut b = shadow_of(3, 2, PixelFormat::Argb8888, [5, 6, 7, 255]);
+        let child = shadow_of(2, 2, PixelFormat::Argb8888, [40, 50, 60, 255]);
+        a.compose(&child, (1, 1));
+        b.compose_over(&child, (1, 1));
+        assert_eq!(a.pixels(), b.pixels());
     }
 
     #[test]
