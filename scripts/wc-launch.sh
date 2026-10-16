@@ -43,6 +43,13 @@
 # `WinSta0\Default` and not in an ssh window station where the pixels go
 # nowhere.
 #
+# §91: **and with the token a double-click gets.** The task's run level was
+# `Highest` until §91, so every click here ran with the administrator's full
+# token, and §90.3 is what that hid: a real double-click runs at medium
+# integrity and could not open the virtio-serial doorbells. The click now runs
+# at `Limited`, the filtered medium token Explorer uses, and the launcher's
+# `token:` line is checked for it. `WC_LAUNCH_CLICK=elevated` is the old route.
+#
 # The scheduler costs about a minute to start a task (§16.8). That minute is
 # *before* wc-launch's process exists and is therefore outside every number
 # below, which is the reason the clock is inside the launcher rather than here.
@@ -109,6 +116,24 @@ AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # it: the guest's VM needs the GPU arena's ivshmem device (slot WC_LAUNCH_GPU_SLOT,
 # default 0x1d) and, for the doorbell, the port WC_LAUNCH_GPU_BELL; the host user
 # needs the device's group.
+# §91. **Which token a click runs with, and the default is a double-click's.**
+# Explorer starts a shortcut with the user's filtered token at medium integrity;
+# until §91 every harness click ran at `-RunLevel Highest`, the administrator's
+# full token, which reaches devices a real double-click cannot (§90.3: the
+# virtio-serial doorbells). `medium` (the default) is the scheduler's `Limited`
+# run level on the interactive session, which is that filtered token;
+# `elevated` is the old route, kept for comparing the two.
+CLICK_LEVEL="${WC_LAUNCH_CLICK:-medium}"
+case "$CLICK_LEVEL" in
+  medium) CLICK_RUNLEVEL=Limited ;;
+  elevated) CLICK_RUNLEVEL=Highest ;;
+  *) echo "WC_LAUNCH_CLICK must be medium or elevated, not $CLICK_LEVEL" >&2; exit 2 ;;
+esac
+# §91. `deploy` grants the guest user the two doorbell ports
+# (`scripts/wc-port-access.ps1 install`), which is what lets a medium-integrity
+# launch open them. `skip` leaves the guest's device security alone.
+PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
+PORT_USER="${WC_LAUNCH_PORT_USER:-<guest-user>}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
@@ -216,7 +241,7 @@ wcl_assert_located() {
 int() {
   local name="$1" exe="$2" argstr="$3" wait="${4:-}"
   g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
-       -File '$DIR_WIN\\runint.ps1' -Exe '$exe' -Arguments '$argstr' -Name '$name' $wait"
+       -File '$DIR_WIN\\runint.ps1' -Exe '$exe' -Arguments '$argstr' -Name '$name' $wait -RunLevel ${INT_LEVEL:-Highest}"
 }
 
 write_runint() { cat >"$1" <<'PS1'
@@ -233,13 +258,17 @@ param(
   [string]$Name = "wclaunch",
   [string]$WorkDir = "C:\Users\<guest-user>\wclaunch",
   [switch]$Wait,
-  [int]$TimeoutSec = 180
+  [int]$TimeoutSec = 180,
+  # §91: Limited is the token Explorer gives a double-click (filtered, medium
+  # integrity); Highest is the administrator's full token, which every click of
+  # every harness had until §91 and which a real double-click never gets.
+  [ValidateSet("Highest", "Limited")][string]$RunLevel = "Highest"
 )
 $ErrorActionPreference = "Stop"
 $a = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory $WorkDir
 # sshd sets USERDOMAIN=WORKGROUP, which resolves to no SID at all (§13).
 $p = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-                                -LogonType Interactive -RunLevel Highest
+                                -LogonType Interactive -RunLevel $RunLevel
 $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                                   -MultipleInstances Parallel
 $s.ExecutionTimeLimit = "PT0S"
@@ -349,7 +378,7 @@ do_deploy() {
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
   # A session from the last run holds both halves' binaries open. Ended through
   # the product's own verb, which kills by the pid in its own state file.
-  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --stop" >/dev/null 2>&1
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null 2>&1
 
   # STAGE 44. **Three builds whose success was never established.** Each is a
   # bare pipeline in a script with no `set -e`, so its status was simply not
@@ -412,6 +441,7 @@ do_deploy() {
     built_ok "${PIPESTATUS[0]}" "sv-hostd and sv-icd" || exit 1
     cp "$REL_WIN/sv-guest.exe" "$stage/sv-guest.exe"
   fi
+  cp "$ROOT/scripts/wc-port-access.ps1" "$stage/"
   write_runint "$stage/runint.ps1"
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
@@ -472,6 +502,29 @@ INI
   # run rather than diagnosed from a handshake failure during it.
   deployed_all "$stage" "$DIR_MSYS" g "re-run $0 deploy with nothing of ours running on the guest" \
     wc-launch.exe sv-guest.exe wc-desk.exe || exit 1
+
+  # §91. The doorbell ports for a medium-integrity launch: the two port devices'
+  # descriptor gains read and write for $PORT_USER (and nothing else changes),
+  # and a SYSTEM task re-applies it at every startup. Run over ssh, which holds
+  # the administrator's token. A port another session holds keeps its live
+  # descriptor until it is free (opening a held vioser port disconnects its
+  # holder); the PnP property, which the next device start applies, is written
+  # regardless. `scripts/wc-port-access.ps1 -Action uninstall` undoes all of it.
+  if [ "$PORT_ACCESS" = install ]; then
+    local pa
+    pa=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-port-access.ps1' -Action install -User $PORT_USER" | tr -d '\r')
+    echo "$pa" | sed 's/^/        /'
+    if ! echo "$pa" | grep -q 'installed:'; then
+      bad "the doorbell ports were not opened to $PORT_USER; a double-click will fall back to ssh"
+    elif echo "$pa" | grep -q 'NOT changed'; then
+      note "the ports' PnP descriptor admits $PORT_USER, and the live one waits for the ports to be free (re-run deploy, or the next boot applies it)"
+    else
+      ok "the doorbell ports admit $PORT_USER at medium integrity, live and at every device start"
+    fi
+  else
+    note "WC_LAUNCH_PORT_ACCESS=$PORT_ACCESS: the guest's port security is left alone"
+  fi
 
   # The guest's key for the VM host, generated on the guest so the private half
   # never leaves it, and restricted on the host to wc-session's verbs.
@@ -536,7 +589,7 @@ VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
   # of this check went through two shells, lost every backslash of the key's
   # path, and reported "Permission denied (publickey)" for a file it had never
   # opened.
-  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --ping" >/dev/null
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --ping" >/dev/null
   local said
   said=$(read_clock | grep 'PING' | tail -1)
   case "$said" in
@@ -549,7 +602,7 @@ VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
 do_install() {
   echo "== install =="
   local out
-  out=$(g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --install firefox; echo rc=\$?" | tr -d '\r')
+  out=$(g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --install firefox; echo rc=\$?" | tr -d '\r')
   note "wc-launch --install: $out"
   local logline
   logline=$(g "tail -20 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'installed ' | tail -1)
@@ -597,20 +650,32 @@ session_up() {
 # `WC_LAUNCH_FRESH=1` removes the profile as well — which is also what makes a
 # Linux measurement comparable with the native one, since `native.ps1` wipes its
 # profile before every sample.
+#
+# §91: **this installation's profile, and only it.** The pattern was
+# `wc-launch/firefox`, which every launcher profile matches — the deployed one a
+# person uses (`~/.wc-launch/firefox`) included — so a test installation's
+# `cold` ended the person's Firefox too, and `WC_LAUNCH_FRESH` deleted *their*
+# profile whatever profile this run used.
+PROFILE_DIR="${WC_LAUNCH_PROFILE:-~/.wc-launch/firefox}"
+PROFILE_DIR="${PROFILE_DIR%% *}"
 kill_host_firefox() {
-  [ -n "${WC_LAUNCH_FRESH:-}" ] && h "rm -rf ~/.wc-launch/firefox" >/dev/null 2>&1
-  h "pkill -f 'wc-launch/firefox' 2>/dev/null
+  case "$PROFILE_DIR" in
+    ~/.wc-launch/?*) ;;
+    *) bad "refusing to touch a profile outside ~/.wc-launch: $PROFILE_DIR"; return ;;
+  esac
+  [ -n "${WC_LAUNCH_FRESH:-}" ] && h "rm -rf '$PROFILE_DIR'" >/dev/null 2>&1
+  h "pkill -f -- '--profile $PROFILE_DIR( |\$)' 2>/dev/null
      for _ in \$(seq 1 40); do
-       pgrep -f 'wc-launch/firefox' >/dev/null 2>&1 || break
+       pgrep -f -- '--profile $PROFILE_DIR( |\$)' >/dev/null 2>&1 || break
        sleep 0.5
      done
-     rm -f ~/.wc-launch/firefox/.parentlock ~/.wc-launch/firefox/lock 2>/dev/null
+     rm -f '$PROFILE_DIR/.parentlock' '$PROFILE_DIR/lock' 2>/dev/null
      true" >/dev/null 2>&1
 }
 
 do_stop() {
   echo "== stop =="
-  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --stop" >/dev/null
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null
   kill_host_firefox
   sleep 2
   note "session: $(session_up)"
@@ -622,7 +687,7 @@ do_click() {
   wcl_declare
   g "rm -f $APPDATA_MSYS/wc-launch-$SESSION.log" >/dev/null
   local t0; t0=$(date +%s)
-  int "wclaunch-click-$kind" "powershell.exe" \
+  INT_LEVEL=$CLICK_RUNLEVEL int "wclaunch-click-$kind" "powershell.exe" \
       "-NoProfile -ExecutionPolicy Bypass -File $DIR_WIN\\click.ps1" >/dev/null
   # The scheduler's own latency is outside the number; this only has to outlast
   # it. §16.8: a task costs about a minute to start.
@@ -662,7 +727,38 @@ do_click() {
   else
     ok "$kind click to window: ${ms} ms, inside the ${waited}s the harness waited (the figure itself is informational: it is a rate on a contended guest)"
   fi
-  read_clock | grep -E 'arena:|locate:|up:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
+  read_clock | grep -E 'token:|arena:|locate:|up:|proxy:|run Firefox|cold start|session up' | sed 's/^/        /'
+  # §91. The route the click took, from the launcher's own line, and what it
+  # got. A medium click that says anything but medium is not a double-click,
+  # whatever it measured.
+  local tok; tok=$(read_clock | grep 'token: ' | tail -1)
+  case "$CLICK_LEVEL" in
+    medium)
+      case "$tok" in
+        *"medium integrity"*"not elevated"*) ok "$kind: the click ran as a double-click does: ${tok#*token: }" ;;
+        *) bad "$kind: WC_LAUNCH_CLICK=medium but the launcher says: ${tok:-no token line}" ;;
+      esac ;;
+    elevated) note "$kind: an ELEVATED click (WC_LAUNCH_CLICK=elevated), not what a double-click gets: ${tok#*token: }" ;;
+  esac
+  # Only the click that started the session brought the transports up.
+  case "$kind" in
+    cold|warm-first)
+      local clock; clock=$(read_clock)
+      if echo "$clock" | grep -q 'SSH FALLBACK'; then
+        bad "$kind: the Wayland connections fell back to ssh: $(echo "$clock" | grep -m1 'SSH FALLBACK' | cut -c1-240)"
+      elif echo "$clock" | grep -q 'transport rings:'; then
+        ok "$kind: the Wayland connections are on the ivshmem rings, with their doorbell"
+      else
+        bad "$kind: no 'transport rings:' line, and no fallback line either"
+      fi
+      if [ "$GPU_SESSIONS" -gt 0 ]; then
+        if echo "$clock" | grep -q 'doorbell attached on'; then
+          ok "$kind: the GPU side has its doorbell: $(echo "$clock" | grep -m1 'doorbell attached on' | sed 's/.*doorbell attached on/attached on/')"
+        else
+          bad "$kind: the GPU side has no doorbell: $(echo "$clock" | grep -m1 'no doorbell' | cut -c1-240)"
+        fi
+      fi ;;
+  esac
   # Only a click that started the session has a locate of its own to check; a
   # warm click joins one and its `locate:` line belongs to the cold click that
   # came before, which this harness has already deleted the log of.
@@ -684,7 +780,7 @@ do_warm()  {
 do_native() {
   echo "== native Firefox on Windows, on the same machine =="
   g "rm -f $DIR_MSYS/native.txt" >/dev/null
-  int "wclaunch-native" "powershell.exe" \
+  INT_LEVEL=$CLICK_RUNLEVEL int "wclaunch-native" "powershell.exe" \
       "-NoProfile -ExecutionPolicy Bypass -File $DIR_WIN\\native.ps1 -Runs 5" >/dev/null
   local out=""
   for _ in $(seq 1 60); do

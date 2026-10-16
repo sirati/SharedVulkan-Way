@@ -357,6 +357,11 @@ struct Window {
     /// lands in the wrong place for exactly one frame, the least debuggable
     /// version of this bug.
     content_offset: (i32, i32),
+    /// §91: the window size the platform last mapped or followed, so a commit
+    /// that changes it is the client choosing a new size ([`ToUi::Resize`]).
+    shown_size: (i32, i32),
+    /// §91: the last `set_min_size` / `set_max_size` handed to the platform.
+    size_hints: ((i32, i32), (i32, i32)),
 }
 
 pub struct State {
@@ -2597,7 +2602,85 @@ impl State {
         // first run of the `apps` experiment put `Waycompose.unnamed.c1` on
         // three of `weston-terminal`'s context menus, harmlessly and wrongly.
         let toplevel = window.role.toplevel().is_some();
+        // §91. **Is the client still the one choosing its size?** It is until
+        // this compositor has configured it with one: the initial configure
+        // carries none, and only a user's resize, a maximise or a fullscreen
+        // puts one in the pending state. While it chooses, a commit at a new
+        // window geometry *is* the new size, and the window follows it —
+        // Firefox commits a first size before it has read its saved geometry,
+        // and its real one a few frames later (§90.7). Once it has been told a
+        // size, a commit at another one is the client catching up, and the
+        // window keeps the size it was given.
+        let client_chooses = window.role.toplevel().is_some_and(|t| {
+            t.with_pending_state(|s| {
+                s.size.is_none()
+                    && !s.states.contains(xdg_state::Maximized)
+                    && !s.states.contains(xdg_state::Fullscreen)
+            })
+        });
+        let mut follow = toplevel && !first && client_chooses && (w, h) != window.shown_size;
+        if first || follow {
+            window.shown_size = (w, h);
+        }
+        let hints = if toplevel { size_hints_of(&root) } else { window.size_hints };
+        let hints_changed = hints != window.size_hints;
+        window.size_hints = hints;
+        // §91.6. **A client that chose nothing gets a default.** Firefox sizes
+        // a window with no saved geometry from `screen.availWidth`/`Height`
+        // (90% of it, at most 1280x1040), and on the guest those read as
+        // nothing when the window is made, so it commits exactly its own
+        // `set_min_size`, 500x120, and stays there. A resizable toplevel with
+        // no parent that is still choosing and has committed precisely its
+        // minimum has not chosen a size; it is configured to Firefox's own rule
+        // against the work area this window is on, and the window is resized to
+        // match. A dialog (it has a parent), a fixed-size window (min = max), a
+        // minimum that is a usable size, and any client that commits anything
+        // but its minimum are left alone.
+        let mut default_size = None;
+        if toplevel
+            && client_chooses
+            // The hints can arrive a commit after the size does (they did on
+            // the guest), so the commit that changes them is asked too.
+            && (first || follow || hints_changed)
+            && hints.0.0 > 0
+            && hints.0.1 > 0
+            && (w, h) == hints.0
+            && hints.1 != hints.0
+            // And degenerate: Firefox's crash reporter commits its minimum,
+            // 600x400, and means it (measured on the guest, where the first
+            // version of this rule enlarged it).
+            && (w < 320 || h < 200)
+            && window.role.toplevel().is_some_and(|t| t.parent().is_none())
+            && let Some(b) = popup_bounds_of(window)
+        {
+            let dw = (b.w * 9 / 10).min(1280).max(hints.0.0);
+            let dh = (b.h * 9 / 10).min(1040).max(hints.0.1);
+            if (dw, dh) != (w, h) {
+                default_size = Some((dw, dh));
+                window.shown_size = (dw, dh);
+                follow = false;
+            }
+        }
         self.presents += 1;
+        // Before `Map`, so that the first placement already answers
+        // `WM_GETMINMAXINFO` with them.
+        if hints_changed {
+            self.ui.send(ToUi::SizeHints { id, min: hints.0, max: hints.1 });
+        }
+        if follow {
+            println!("wc-compositor: window {id} client chose {w}x{h}; the window follows");
+            self.ui.send(ToUi::Resize { id, width: w, height: h });
+        }
+        if let Some((dw, dh)) = default_size {
+            println!(
+                "wc-compositor: window {id} committed only its minimum size {w}x{h}; \
+                 configuring the default {dw}x{dh} (§91.6)"
+            );
+            if !first {
+                self.ui.send(ToUi::Resize { id, width: dw, height: dh });
+            }
+            self.on_resized(id, dw, dh);
+        }
 
         if first {
             // Which source served this surface, said once per window. When
@@ -2648,10 +2731,12 @@ impl State {
                     aumid: crate::taskbar::identity(&app_id, client),
                 });
             }
+            // §91.6: a client that chose nothing is shown at its default.
+            let (mw, mh) = default_size.unwrap_or((w, h));
             self.ui.send(ToUi::Map {
                 id,
-                width: w,
-                height: h,
+                width: mw,
+                height: mh,
                 fold_caption,
             });
             if !title.is_empty() {
@@ -3266,6 +3351,17 @@ fn popup_bounds_of(window: &Window) -> Option<Rect> {
 /// stored one to detect a client's intent. Keeping the two cases distinct here
 /// is what stops the caller confusing "the client changed its mind" with "a
 /// subsurface moved".
+/// §91: the committed `xdg_toplevel.set_min_size` and `set_max_size`, 0 where
+/// unset (which is what the protocol's own 0 means too).
+fn size_hints_of(root: &WlSurface) -> ((i32, i32), (i32, i32)) {
+    use smithay::wayland::shell::xdg::SurfaceCachedState;
+    compositor::with_states(root, |states| {
+        let mut cache = states.cached_state.get::<SurfaceCachedState>();
+        let c = cache.current();
+        ((c.min_size.w, c.min_size.h), (c.max_size.w, c.max_size.h))
+    })
+}
+
 fn declared_geometry(root: &WlSurface) -> Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> {
     use smithay::wayland::shell::xdg::SurfaceCachedState;
     compositor::with_states(root, |states| {
@@ -4032,6 +4128,8 @@ impl XdgShellHandler for State {
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 icon_from_client: false,
+                shown_size: (0, 0),
+                size_hints: ((0, 0), (0, 0)),
                 icon_dirty: false,
                 popup_bounds,
                 popup_at: None,
@@ -4190,8 +4288,25 @@ impl XdgShellHandler for State {
         // the optimism is bounded by the same round trip that used to be waited
         // for, and the disagreement is now the exceptional case rather than the
         // ordinary one.
+        //
+        // **§91: and it carries a size.** A maximised configure is one the
+        // client must obey, so it has to say what to obey; it used to inherit
+        // the size of the configure every window got at map, and §91 removed
+        // that one (it echoed a client's first commit back as an instruction).
+        // The size sent is where the window's popups may go — on Windows the
+        // monitor's work area, which a maximised window with its caption folded
+        // fills exactly (§82), and the stand-in's output headless — and the
+        // `WM_SIZE` that the maximise produces corrects it if Windows disagrees.
         match id {
-            Some(id) => self.set_state(id, |s| toggle(s, xdg_state::Maximized, true)),
+            Some(id) => {
+                let size = self.by_id(id).and_then(popup_bounds_of).map(|b| (b.w, b.h));
+                self.set_state(id, |s| {
+                    toggle(s, xdg_state::Maximized, true);
+                    if let Some((w, h)) = size.filter(|&(w, h)| w > 0 && h > 0) {
+                        s.size = Some((w, h).into());
+                    }
+                })
+            }
             None => { surface.send_configure(); }
         }
     }
@@ -4358,6 +4473,8 @@ impl XdgShellHandler for State {
                 // these can ever be true of one. They are here because `Window`
                 // is one type for both roles, which is stage 9's decision.
                 icon_from_client: false,
+                shown_size: (0, 0),
+                size_hints: ((0, 0), (0, 0)),
                 icon_dirty: false,
                 popup_bounds,
                 popup_at: Some((parent_id, rect.loc.x, rect.loc.y)),
