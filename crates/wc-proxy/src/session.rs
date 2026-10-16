@@ -888,6 +888,10 @@ pub struct Session {
     /// bytes-in / bytes-out and has no business opening an icon theme or
     /// writing to a second socket. What it can do is notice.
     app_ids: Vec<String>,
+    /// §96: the app id for a toplevel whose client sets an empty one, from the
+    /// client's own `WC_APP_ID` ([`crate::icons::client_env`]). See
+    /// [`Session::set_default_app_id`].
+    default_app_id: Option<String>,
     clip: Clip,
     data_ops: DataOps,
     /// STAGE 16. Events this proxy invents for its own client, drained by the
@@ -1026,6 +1030,7 @@ impl Session {
             trace_inputs: 0,
             notes: Vec::new(),
             app_ids: Vec::new(),
+            default_app_id: None,
             clip: Clip { next_token: 1, ..Clip::default() },
             data_ops,
             to_client: Vec::new(),
@@ -1119,6 +1124,21 @@ impl Session {
         self.notes.push(s);
     }
 
+    /// §96 (docs/waycompose-design.md 96.11). The app id to give a toplevel
+    /// whose client calls `xdg_toplevel.set_app_id("")`.
+    ///
+    /// GLFW 3.4 does exactly that unless the application sets the
+    /// `GLFW_WAYLAND_APP_ID` hint (`if (window->wl.appId)` is true for the
+    /// empty string it duplicated), and Minecraft does not set it. A window
+    /// with no app id has no icon and no taskbar identity: on the guest it was
+    /// `Waycompose.unnamed.c4`, the generic icon, a button of its own and no
+    /// pin. The id comes from whoever started the client, as `WC_APP_ID` in
+    /// its environment, which the caller reads from `/proc`. Only an empty id
+    /// is replaced: a client that names itself is never overruled.
+    pub fn set_default_app_id(&mut self, id: Option<String>) {
+        self.default_app_id = id;
+    }
+
     /// The app ids seen since the last call. See the field.
     pub fn take_app_ids(&mut self) -> Vec<String> {
         std::mem::take(&mut self.app_ids)
@@ -1190,9 +1210,26 @@ impl Session {
         // (`crate::icons`). Matched on the message's **name** rather than on an
         // opcode constant, because the opcode is a position in somebody else's
         // XML and this is the only place that would notice if it moved.
+        //
+        // §96: and the one it rewrites, when the string is empty and the
+        // client's launcher said what it should be (`set_default_app_id`).
+        let mut rewritten: Option<Vec<u8>> = None;
         if interface == "xdg_toplevel" && msg.name == "set_app_id"
             && let Some(app_id) = spans.first().and_then(|s| wire::string_at(body, s)) {
-                self.app_ids.push(app_id);
+                match (self.default_app_id.clone(), app_id.is_empty()) {
+                    (Some(id), true) => {
+                        let mut b = Vec::new();
+                        wire::push_string(&mut b, &id);
+                        self.note(format!(
+                            "xdg_toplevel@{} set an empty app id; it is {id:?}, from the \
+                             client's WC_APP_ID",
+                            header.object
+                        ));
+                        self.app_ids.push(id);
+                        rewritten = Some(b);
+                    }
+                    _ => self.app_ids.push(app_id),
+                }
             }
 
         // STAGE 13. The one *family* this program answers itself rather than
@@ -1383,7 +1420,9 @@ impl Session {
             _ => {}
         }
 
-        let out_body = if msg.has_fd() {
+        let out_body = if let Some(b) = rewritten {
+            b
+        } else if msg.has_fd() {
             // Every `h` must have produced a descriptor above. Splicing a
             // zero-length one instead would be the §2.4 failure in its purest
             // form: a well-formed message the compositor parses happily and

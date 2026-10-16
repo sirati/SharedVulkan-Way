@@ -2311,3 +2311,54 @@ fn a_drop_keeps_the_offer_the_drags_even_after_the_leave() {
     );
 }
 
+
+/// §96 (docs/waycompose-design.md 96.11). GLFW sends `set_app_id("")` when the
+/// application names no app id, which Minecraft never does. With a default
+/// from the client's `WC_APP_ID`, the compositor gets that id instead, in a
+/// well-framed message; a client that names itself is never overruled, and
+/// with no default the empty id goes through as it came.
+#[test]
+fn an_empty_app_id_takes_the_launchers_and_a_named_one_is_left_alone() {
+    fn toplevel(h: &mut Harness) -> u32 {
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let wm = h.bind(registry, 4, "xdg_wm_base", 6);
+        let surface_id = h.id();
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        h.send_words(compositor, 0, &[surface_id]);
+        let xdg = h.id();
+        h.send_words(wm, 2, &[xdg, surface_id]); // get_xdg_surface
+        let top = h.id();
+        h.send_words(xdg, 1, &[top]); // get_toplevel
+        top
+    }
+    fn app_id(h: &mut Harness, top: u32, id: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        wire::push_string(&mut body, id);
+        h.send(top, 3, &body, &mut VecDeque::new()); // set_app_id
+        let msgs = h.upstream_messages();
+        let (object, opcode, forwarded) = msgs.last().unwrap().clone();
+        assert_eq!((object, opcode), (top, 3));
+        forwarded
+    }
+    let spec = Spec::builtin().unwrap();
+    assert_eq!(spec.request("xdg_toplevel", 3).unwrap().name, "set_app_id");
+    let d = tmpdir("appid");
+    let encoded = |s: &str| {
+        let mut b = Vec::new();
+        wire::push_string(&mut b, s);
+        b
+    };
+
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    h.session.set_default_app_id(Some("wc-minecraft".into()));
+    let top = toplevel(&mut h);
+    assert_eq!(app_id(&mut h, top, ""), encoded("wc-minecraft"));
+    assert_eq!(h.session.take_app_ids(), vec!["wc-minecraft".to_string()]);
+    assert_eq!(app_id(&mut h, top, "org.example.Named"), encoded("org.example.Named"));
+
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    let top = toplevel(&mut h);
+    assert_eq!(app_id(&mut h, top, ""), encoded(""));
+    let _ = std::fs::remove_dir_all(&d);
+}

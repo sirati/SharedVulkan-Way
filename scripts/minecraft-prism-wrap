@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Prism Launcher's wrapper command for every instance on the VM host
+# (waycompose-design.md §96.11, docs/minecraft.md): the game Prism starts gets
+# the same identity on the Windows taskbar as the one the desktop shortcut
+# starts, and the same icon.
+#
+# Prism runs `<wrapper> <java> <args...>` with INST_ID, INST_NAME and INST_DIR
+# set. Everything else the game needs it already has from Prism, which has it
+# from `wc-session`: the session's Wayland display, sound, the GPU environment,
+# and the library path Prism's own launch sets (system GLFW, `UseNativeGLFW`).
+#
+#   WC_APP_ID       the app id wc-proxy gives the game's window, which sets an
+#                   empty one (GLFW without GLFW_WAYLAND_APP_ID). It is the
+#                   desktop id the launcher's shortcut uses, so the window and
+#                   a pinned shortcut are one taskbar button.
+#   XDG_DATA_DIRS   with this installation's share/ first, where the desktop
+#                   entries and Minecraft's own icon are, so wc-proxy finds them.
+set -u
+H=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+case "${INST_ID:-}" in
+  *vulkanmod*) id=wc-minecraft-vulkanmod ;;
+  *) id=wc-minecraft ;;
+esac
+export WC_APP_ID="${WC_APP_ID_OVERRIDE:-$id}"
+export XDG_DATA_DIRS="$H/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+exec "$@"

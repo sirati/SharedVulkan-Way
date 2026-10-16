@@ -1084,6 +1084,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // §90: the icons beside the executable, for a package with no `share/`.
         let client_bundled =
             client_pid.map(wc_proxy::icons::bundled_icons_for_pid).unwrap_or_default();
+        // §96: what the client's launcher put in its environment, its app id
+        // for a toplevel that sets an empty one and its own data directories.
+        let client_env = client_pid.map(wc_proxy::icons::client_env).unwrap_or_default();
+        if let Some(id) = &client_env.app_id {
+            println!("[proxy] client {n}: WC_APP_ID={id} names a toplevel with no app id");
+        }
         let extra_dirs = args.icon_dirs.clone();
         let want_clipboard = args.clipboard;
         threads.push(std::thread::spawn(move || {
@@ -1107,8 +1113,17 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 // 3. The client's own package prefix, last, because it is the
                 //    guaranteed answer rather than the preferred one — the
                 //    application's own pixels, found where the application is.
+                // 4. (§96) The client's own `XDG_DATA_DIRS`, between the
+                //    two: an application installed under a home directory is
+                //    found nowhere else, because its executable is an
+                //    interpreter's (Minecraft's is Java's).
                 let mut data_dirs = extra_dirs;
                 data_dirs.extend(wc_proxy::icons::default_data_dirs());
+                for d in &client_env.data_dirs {
+                    if !data_dirs.contains(d) {
+                        data_dirs.push(d.clone());
+                    }
+                }
                 data_dirs.extend(client_dirs);
                 let search = wc_proxy::icons::Search {
                     data_dirs,
@@ -1175,6 +1190,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let mut session = Session::new(spec, transport, scope, headroom);
+            session.set_default_app_id(client_env.app_id.clone());
             session.set_trace(trace);
             session.set_verify(verify);
             session.set_pacing(pace_hz, pace_depth);
