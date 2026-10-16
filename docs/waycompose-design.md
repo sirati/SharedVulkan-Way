@@ -29425,7 +29425,92 @@ fault.
    who creates it first. That is a host-local concern, not one the guest can
    reach beyond the session ids, and is unchanged.
 
-## 95. Firefox on the forwarded GPU: an arena too small, and a guest pause taken for a dead peer
+## 95. The desktop checks: menus, the clipboard, dialogs and a day's use, on the deployed launcher
+
+Branch `desktop-checks`, 2026-10-16, 11:10–15:11, continued after the VM restart. The checks §91 and §93.8
+left pending, run against the deployed `wcivs` on <guest-user>'s desktop (session 1)
+the way a person starts it: a click on the pinned `Firefox (Linux)` taskbar
+button, at medium integrity. The evidence is in `docs/desktop-checks/`.
+
+### 95.1 Status in one paragraph
+
+**Every multi-step menu works on real Windows.** That includes the one the
+user asked about: Hamburger, Help and Report, About Firefox. So do the clipboard
+in every direction asked for, the GTK dialogs, a second window from a
+maximised one, the pin, a typed URL, scrolling, H.264 video with sound, and
+the ssh fallback. Five bugs were found:
+- **Firefox crashed four times in two hours of ordinary use.** Two causes,
+  found and reproduced locally by a background agent (95.4):
+  - **The lost device:** a short stall of the guest made the ICD declare the
+    GPU side gone. Fixed: the ICD waits 5 s, drops late replies, and gives
+    a slot back when its process exits.
+  - **The arena:** the 64 MiB arena of a GPU session ran out with two
+    windows open. Not fixed here. Larger fixed slots (2 x 112 MiB) were
+    tried on the guest and starved Firefox's parent of a slot at start-up
+    (95.4.10). The user ruled for dynamic allocation on the ivshmem device,
+    which another agent now owns, so the guest keeps 3 x 64 MiB.
+- **A `<select>` dropdown wore a thick black frame**: a translucent
+  subsurface was copied over the page instead of blended. Fixed (95.5).
+- **Windows' caption buttons still vanished after page loads** in a new
+  window: `WM_NCPAINT` painted the caption over the strip §91 clears.
+  Fixed (95.6).
+- **Closing the last window crashed Firefox once**, during shutdown (95.4).
+  Reproduced locally later the same day and found to be ours: the ICD's
+  pipelined present (§88) can still attach a frame to Firefox's `wl_surface`
+  after Firefox has destroyed it. The fix is on branch `quit-crash`.
+- Two harmless log oddities: the audio player's drop counter while the stream
+  is silent, and Firefox's `Broken pipe` warnings on a selection (95.8).
+
+**Still open, waiting on the VM restart:** the last redeploy (3 x 64 MiB with gpu-oom c744796), its desktop check, putting <guest-user>'s clipboard back and deleting this run's history entries. 95.7 and 95.9 say what is deployed until then.
+
+### 95.2 The checks
+
+| check | result | evidence |
+|---|---|---|
+| pin click, cold | window in 4.3 s (CLICK-TO-WINDOW 4269 ms, §94's), 7–13 s on later clicks that restored a crashed session; one button, `– 1 aktives Fenster angeheftet` | `actions.txt` g0, g1b, g4, g5 |
+| start-up clipboard | text copied before the click pasted into the address bar, rings and ssh fallback alike | `guest/g6-paste.png`, g0, g4 |
+| Hamburger → Help and Report → About Firefox | the panel switches to the Help subview; `About Mozilla Firefox` 746x427 opens | `guest/g1b-8b.png` |
+| Hamburger → More tools → Task Manager | the More tools subview; `Process Manager` opens in a tab | `guest/g1b-1b.png` |
+| Bookmarks (menu bar) → a nested folder → an item | the nested popup opens on hover; the item navigates | `guest/g1b-2c.png` |
+| History (menu bar) → Recently Closed Tabs → an item | the submenu opens; the tab comes back | `guest/g1b-3b.png` (history rows masked) |
+| Hamburger → History → Recently closed tabs → an item | the subview; the tab comes back | `guest/g1b-4b.png` |
+| tab context menu → Move Tab → Move to New Window | the submenu; a new window | `guest/g1b-5c.png` |
+| link context menu → Open Link in New Container Tab → Personal | the submenu; a container tab opens (`about:robots` from `about:about`) | `guest/g1b-7c.png` |
+| `<select>` | the list opens, `gamma` sets `SEL:gamma`; **black frame** round the list (95.5) | `guest/g1b-6a.png` |
+| Word → Firefox (COM, `Content.Copy()`) | `TA:` the exact text with ü, ß, ✓; the paste zone saw `text/html,text/plain` | `actions.txt` g2 A |
+| Firefox → Word | `wcdc Word->FF Grüße ✓ 42` in the document; owner `sv-guest` | g2 B |
+| Notepad → Firefox, Firefox → Notepad | both exact; a new Notepad window on a scratch file, closed without saving, the user's restored tab untouched | g2 C |
+| the 6 MB copy, then a small one | `CBIG:true 6291489`, Windows text length 6,401,866 (CRLF); then `wcdc-small after big ✓`; Firefox lived | g2 D |
+| Firefox Copy Image → Windows → Word | `PNG`, `DeviceIndependentBitmap`, `Bitmap`; 128x96 red/blue/white exact; one inline shape in Word | `guest/ffimg.png`, g2 E |
+| Windows picture → Firefox | a .NET `Clipboard.SetImage` bitmap: `image/png` 160x120; Word's picture copy: `image/png` 200x150, colours right | `guest/g5-pasted.png`, g5 B; a first try crashed Firefox (95.4) |
+| ssh fallback (`wayland-bell =` emptied for one session, the ini restored byte for byte) | `SSH FALLBACK: wayland-bell is empty…`, window in 4057 ms; start-up paste, Firefox → Windows, Windows → Firefox all exact | `guest/g6-paste.png`, g6 |
+| caption buttons, maximised and restored, page retitling 10 Hz | visible in 24 of 24 captures | g3a |
+| caption buttons after page loads in a new window | **lost** in 3 of 5 sessions until a later paint (95.6) | `guest/caption-lost-*.png` |
+| GTK dialogs: Open File, Save As, Print | every header-bar button left of Windows' buttons; one close button; dragged by the header bar (138,73 for a 150,80 drag, the move threshold) | `guest/g5-dlg-*-corner.png` |
+| second window from a maximised one | `Ctrl+N` opened maximised, 1296x768 at −8,−8 | `guest/g5-second-top.png` |
+| type a URL, scroll | the long page loaded; 15 notches scrolled cleanly | `guest/g4-scrolled.png` |
+| H.264 with sound | 20 s, 600 frames, 0 dropped; a correct colour test pattern; the launcher's player: `20.0 s of it not silent`, 0 drops and 0 underruns while audible | `guest/g4-video.png` |
+| close everything, session end | `session down` 60 s after the last close, 6 times; once the close crashed Firefox (95.4) | — |
+| Wine, the same menu paths | all pass (tab Move submenu, More tools, History submenus, link submenus, Help → About) | — |
+
+### 95.3 The leftover test string, and the clipboard history
+
+The clipboard did not hold §93's `PRE-SESSION ü 42 wcc-pre` at the start of
+this run: it held 22 characters of something else. It was kept for the run
+(in the agent's memory and DPAPI-encrypted for <guest-user>) and put back at the end
+(pending: the restore waits on the redeploy). Clipboard history is on
+(`EnableClipboardHistory 1`); the entries this run created (16 since 11:10)
+are to be deleted through the WinRT API, and only those, at the end of the
+run (pending).
+
+### 95.4 Firefox on the forwarded GPU: an arena too small, and a guest pause taken for a dead peer
+
+This is the record of the background agent this branch started for the
+crashes (branch `gpu-oom`, merged here). Where it proposes larger fixed
+slots as the arena fix (95.4.6, 95.4.9), that was overtaken: the 2 x 112 MiB
+geometry starved Firefox's parent of a slot on the guest (95.4.10, 95.7), and
+the user ruled that GPU memory be allocated dynamically on the ivshmem device
+instead, which another agent now owns. The ICD and GPU-side fixes stand.
 
 Branch `gpu-oom`, from master `ab009e9`, 2026-10-16. The brief was two Firefox
 crashes on the deployed `wcivs` install. Crash 2 (session 12:34:29 to 12:45:02)
@@ -29443,17 +29528,17 @@ image was pasted.
 **Status.** Two causes, both reproduced on this workstation's RADV and both
 ours. The OOM is the 64 MiB arena: Firefox with two windows has a working set
 that fills the application's 56 MiB of it, and the free space fragments below
-one 2 MiB slab (95.2). The lost device is the ICD declaring the GPU side gone
+one 2 MiB slab (95.4.2). The lost device is the ICD declaring the GPU side gone
 after 150 ms without a heartbeat, which a guest that is not scheduled for that
-long produces with nothing wrong on either side (95.3). The ICD now waits five
+long produces with nothing wrong on either side (95.4.3). The ICD now waits five
 seconds, drops a late reply instead of handing it to the next call, frees a
 half-built swapchain, and says once, whatever `SV_DEBUG` says, why it failed a
 call. The GPU side says when its driver returns a lost device or an
 out-of-memory. What the 120 `vkCreateBuffer` failures of crash 2 were is **not
-established** (95.4); the next one will say. The arena fix is an ini change on
-the guest (95.6); nothing here ran on the guest or on testhost.
+established** (95.4.4); the next one will say. The arena fix is an ini change on
+the guest (95.4.6); nothing here ran on the guest or on testhost.
 
-### 95.1 Where "ZINK: vkCreateBuffer failed" comes from
+#### 95.4.1 Where "ZINK: vkCreateBuffer failed" comes from
 
 Mesa 26.2.4 (the deployed kopper build's source,
 `/nix/store/9s209y4515mm50m7kpxlqc6nji1rw13v-source`) prints it in one place,
@@ -29474,7 +29559,7 @@ this section both were silent without `SV_DEBUG`. wcl-1332's
 `couldn't allocate memory` lines are the other path, and that is the one the
 local runs reproduce.
 
-### 95.2 The arena: a working set, not a leak
+#### 95.4.2 The arena: a working set, not a leak
 
 `scripts/sv-firefox-wayland.sh two-windows SECS` is a new mode of the existing
 harness: weston (pixman, `wl_shm` only), `sv-gpu-server` on RADV, Firefox 157.0.1
@@ -29491,7 +29576,7 @@ the time, whenever it moves by 2 MiB.
 | 300 s, `SV_DEBUG` | 64 MiB | no failure; largest free run down to **2048 KiB** at t=276 s, against the 2112 KiB the first run failed on |
 | 240 s, no `SV_DEBUG` | 64 MiB | `vkAllocateMemory: the arena is exhausted: 2097152 bytes asked for, arena 51040 KiB of 57344 KiB in use in 21 allocation(s), largest free run 1936 KiB, high water 51040 KiB`, then the same fallback |
 | 600 s, `SV_DEBUG` | 256 MiB | no failure, 129 page loads; in use between 42 and 51 MiB for the whole run, high water **53152 KiB** at about 120 s and never higher |
-| 300 s, `SV_DEBUG`, this branch with master 2982bdd merged in (a trial merge, not committed) | 112 MiB, the size 95.6 recommends (98 MiB to the application) | no failure, WebRender throughout, high water 53088 KiB, largest free run never below the 34 MiB of the end; the same run at 64 MiB exhausted again (`53024 KiB of 57344 KiB in use … largest free run 1876 KiB`) and fell back |
+| 300 s, `SV_DEBUG`, this branch with master 2982bdd merged in (a trial merge, not committed) | 112 MiB, the size 95.4.6 recommends (98 MiB to the application) | no failure, WebRender throughout, high water 53088 KiB, largest free run never below the 34 MiB of the end; the same run at 64 MiB exhausted again (`53024 KiB of 57344 KiB in use … largest free run 1876 KiB`) and fell back |
 
 At 256 MiB the use rises to a plateau within two minutes and stays there for
 ten, so nothing leaks over this workload; Zink's BO cache gives memory back
@@ -29511,7 +29596,7 @@ swapchain whose second image could not get its readback buffer kept the first
 one's for the life of the process, and an allocation whose slab the GPU side did
 not import stayed allocated with no handle anyone could free.
 
-### 95.3 The lost device: 150 ms of silence
+#### 95.4.3 The lost device: 150 ms of silence
 
 Every wait the ICD makes on a ring passed a 50 ms liveness interval to
 `wait_until`, which builds its peer-gone window as three intervals. So a GPU side
@@ -29547,13 +29632,13 @@ A reply older than the call's own sequence number is now dropped.
 window before it answers: the first call is `DeviceLost`, the second gets its own
 reply. Without the fix the second call fails.
 
-### 95.4 What crash 2's vkCreateBuffer failures were
+#### 95.4.4 What crash 2's vkCreateBuffer failures were
 
-Not established. By 95.1 they were a failed `vkCreateBuffer` from the ICD, and
+Not established. By 95.4.1 they were a failed `vkCreateBuffer` from the ICD, and
 three things could produce it: the Intel driver's own result (forwarded
 unchanged, and until now not logged by the GPU side), a transport failure
 (printed only under `SV_DEBUG`), or a lowering error. The ring desynchronisation
-of 95.3 would fail every call on the device ring, `vkCreateImage` and
+of 95.4.3 would fail every call on the device ring, `vkCreateImage` and
 `vkCreateSampler` with it, and crash 2's log has only `vkCreateBuffer` failures
 until t≈630 s, so it is the least likely of the three. The next occurrence will
 name its layer:
@@ -29569,13 +29654,13 @@ name its layer:
   driver call that returns a `VkResult`; the hand-written `vkCreateBuffer`,
   `vkCreateImage` and `vkAllocateMemory` call it too.
 
-### 95.5 Crash 1: what can be said
+#### 95.4.5 Crash 1: what can be said
 
 The old ICD returned `VK_ERROR_DEVICE_LOST` for a ring wait that saw 150 ms of
 heartbeat silence, a call that took over 10 s (`CALL_TIMEOUT`), a ring the GPU
 side marked fatal, or a GPU side that restarted. The last two leave a line in
 the GPU side's log, and it had none. The driver itself could also have returned
-it, and the old GPU side would have forwarded that silently. 95.3 shows that the
+it, and the old GPU side would have forwarded that silently. 95.4.3 shows that the
 first produces this exact signature, and a guest that stalls while its
 passed-through iGPU changes power state, 2.3 s before the failure, is the kind of
 pause that triggers it. So the likeliest reading is the ICD's window, which this
@@ -29587,7 +29672,7 @@ crashed instead), and avoiding it would mean keeping the iGPU out of D3 while a
 GPU session is open, either by a power setting on the guest or by
 `disable_idle_d3` on the host's vfio-pci. Neither was tried.
 
-### 95.6 The geometry, and what it costs
+#### 95.4.6 The geometry, and what it costs
 
 The GPU arena is a 256 MiB ivshmem device cut into `gpu-sessions` slots of
 16 MiB control plus `gpu-arena-mib` arena (§87.2). `sv-hostd` takes each slot's
@@ -29610,7 +29695,7 @@ about the third row are unverified on the guest: that Intel's driver imports a
 112 MiB host pointer as it does a 64 MiB one (§87.3), and that a Firefox start
 never needs a third slot at once.
 
-### 95.7 The quit crash
+#### 95.4.7 The quit crash
 
 A session on the deployed build (wcl-2652) crashed when its last window closed,
 in `xpcom-shutdown-threads`, and the crash reporter deleted the minidump. Here, a
@@ -29623,20 +29708,20 @@ leaves this Firefox running with no window, so the harness quits through
 `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in the launcher's environment would keep the
 next dump.
 
-### 95.8 Gates
+#### 95.4.8 Gates
 
 | gate | result |
 |---|---|
 | `cargo test --release -p sv-transport -p sv-arena -p sv-icd -p sv-icd-entry` | all pass; new: `park::a_silence_shorter_than_gone_after_is_slow_not_gone`, `transport::abandoned_calls::a_late_reply_to_an_abandoned_call_is_not_the_next_calls_answer` (fails without the fix) |
 | `cargo test --release -p sv-gpu-server -p sv-codegen -p sv-gpu-entry` | all pass |
 | `cargo clippy --release` on the touched crates | no new warnings |
-| `sv-firefox-wayland.sh two-windows`, the runs of 95.2, 95.3 and 95.7 | as tabled |
+| `sv-firefox-wayland.sh two-windows`, the runs of 95.4.2, 95.4.3 and 95.4.7 | as tabled |
 | the same on a trial merge with master 2982bdd (not committed; the only conflict is this file's tail) | builds; the tests above pass; 25 x 1 s stalls survived and quit cleanly, 112 MiB passed, 64 MiB exhausted |
 
 The protocol hash is unchanged (`0x403720e574aa9434`), so the ICD and the GPU
 side can be deployed separately.
 
-### 95.9 What to deploy, and what to check
+#### 95.4.9 What to deploy, and what to check
 
 1. **testhost, `~/wc-launch-ivs/bin/libsv_icd.so`**: this branch's release
    build. It is the liveness window, the stale-reply fix, the swapchain cleanup
@@ -29645,7 +29730,7 @@ side can be deployed separately.
    `x86_64-pc-windows-gnu`, for the GPU side's driver-error lines. It changes no
    behaviour.
 3. **The guest's `wc-launch.ini`**: `gpu-sessions = 2` and `gpu-arena-mib = 112`
-   (95.6).
+   (95.4.6).
 4. Then check, in this order: the GPU process's first line says `2 session
    slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`; Firefox starts on the
    GPU (about:support `Compositing: WebRender`, a `sv-icd: connected` line in
@@ -29654,11 +29739,11 @@ side can be deployed separately.
    ten minutes of use) leaves `app.log` with no `couldn't allocate memory`, no
    `OutOfMemory` and no `sv-icd: … returning` line; and a screen lock of an hour
    with Firefox open ends with Firefox alive. If anything fails, the lines of
-   95.4 say which layer.
+   95.4.4 say which layer.
 
-### 95.10 Two slots and Firefox's start: a slot held five seconds after its process exits
+#### 95.4.10 Two slots and Firefox's start: a slot held five seconds after its process exits
 
-The deploy of 95.9 (gpu-oom merged with master, `gpu-sessions = 2`,
+The deploy of 95.4.9 (gpu-oom merged with master, `gpu-sessions = 2`,
 `gpu-arena-mib = 112`) showed that Intel's driver takes the 112 MiB import
 (`2 session slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`), and that two
 slots broke Firefox's start. Sessions 1 and 2 (367 and 11 commands) held both
@@ -29713,9 +29798,140 @@ GPU.
 
 **The 69 MiB alternative.** Three slots of 16 + 69 MiB fill 255 of the 256 MiB.
 Four 300 s two-window runs at a 69 MiB arena passed with no allocation failure.
-The application's share is 60.4 MiB against the 53 MiB high water of 95.2, so
+The application's share is 60.4 MiB against the 53 MiB high water of 95.4.2, so
 88 %, against 95 % at 64 MiB, where one run in two failed. That is less margin
 than four runs can prove.
+
+### 95.5 Bug, fixed: the `<select>` dropdown's black frame
+
+On the guest the open list of a `<select>` had a thick black frame with black
+showing outside its rounded corners (`guest/g1b-6a.png`). The compositor's
+log had no popup for it, only `wl_surface created`. Traced against the Linux
+build with `WAYLAND_DEBUG`: GTK makes the dropdown a `wl_subsurface` of the
+window (`wl_subcompositor.get_subsurface` after the click), not an `xdg_popup`
+as every menu is. Its buffer has a transparent margin for the shadow.
+
+`Shadow::compose` copied every surface of a window's tree onto the canvas. Its
+own note (stage 9) said a copy was right until a translucent subsurface
+arrived, and that it would then show as a hard edge. That is what happened: the
+margin's premultiplied (0,0,0,0) replaced the page under it.
+
+**The fix.** The root of a tree is still copied. Every later surface goes
+through `Shadow::compose_over`, a premultiplied "over"
+(`dst = src + dst·(1 − α)`):
+- an `Xrgb8888` source is copied, since its fourth byte is padding;
+- a row that is all opaque is copied, which is every row of Firefox's content
+  subsurface, so the common frame costs one scan of the alpha bytes more than
+  before;
+- a tree whose bounds reach past the root starts from transparent, not from
+  the last frame.
+
+**Proof.** The same page and click against the Linux compositor, before and
+after (`select-linux-before.png`, `select-linux-after.png`, `select-run.sh`):
+the black frame is gone and the page shows round the corners. Three unit tests
+pin the blend, the XRGB copy and the opaque case. Under Wine the dropdown has
+no frame and `gamma` still sets the value. On the guest: 95.7.
+
+### 95.6 Bug, fixed: the caption buttons, a third time
+
+§91.5 stopped `DefWindowProc` painting the caption over the folded button strip
+on `WM_SETTEXT`, `WM_SETICON` and `WM_NCACTIVATE`. In this run the glyphs still
+vanished, but differently:
+- **Not on title changes.** 24 captures with the page retitling 10 times a
+  second, restored and maximised: all visible.
+- **Not on activation or caption-colour changes.** 8 captures while switching
+  the foreground between two windows, with the colour animating: all visible.
+- **After a page load in a window that had just been created**, in three
+  sessions (`caption-lost-g0-test.png`, `caption-lost-g4-long.png`), and back
+  after a later scroll (`caption-back-g4-scrolled.png`). The same loads in an
+  older window: 20 captures, all visible.
+
+The pixels say who painted. Where the glyphs should be, a lost capture holds
+one colour, (40,29,68): Firefox's own tab-strip pixel. A good capture shows
+DWM's caption colour (41,30,69) behind the glyphs. So the strip had been
+painted opaque from outside `WM_PAINT`, whose blit always clears it inside its
+update region.
+
+**The fix.** `WM_NCPAINT` is the general form of what §91 handled for three
+messages. A folded toplevel still needs the default handler for its frame, so
+after it the strip is invalidated again. `present()` also adds the strip to
+every frame's invalidation, so anything else that paints there lasts until the
+client's next frame at most. That is one 146x31 blit and fill per frame,
+inside a paint that is happening anyway. Under Wine (fallback buttons) the
+window and its buttons are unchanged. On the guest: 95.7.
+
+### 95.7 On the guest after the deploys
+
+Two deploys of `wcivs` from this branch, and a third pending, each `wc-launch.sh deploy` with
+§94's variables after a backup to `C:\Users\<guest-user>\wcivs-backup-95` and
+`~/wc-launch-ivs-backup-95`:
+
+| deploy | what changed | result |
+|---|---|---|
+| 13:47 (`deploy-95.txt`) | the two compositor fixes, with master (§96's ICD and `wc-proxy`); 3 x 64 MiB | 16 passed, 0 failed. Not checked on the desktop: <guest-user>'s session had locked at 13:39 from inactivity |
+| 14:00 (`deploy-95b.txt`) | gpu-oom's ICD and GPU-side fixes (50c5571); `gpu-sessions = 2`, `gpu-arena-mib = 112` | 16 passed, 0 failed; checked below |
+| pending | gpu-oom's slot release (c744796); back to 3 x 64 MiB | waits on the VM restart |
+
+**After the second deploy** (14:02–14:07, a fresh Sonnet agent, `v1` in
+`actions.txt`):
+- **The GPU device:** `2 session slot(s) of 128 MiB (16 MiB control +
+  112 MiB arena)`, so Intel's driver imports a 112 MiB host pointer.
+- **The pin's jump list:** 7 Häufig pages and the three tasks. "Neues
+  privates Fenster öffnen" opened a private window in 6–15 s.
+- **The `<select>`:** no black frame, page round the corners
+  (`guest/v1-select.png`).
+- **The caption glyphs, after page loads in three new windows:** visible in
+  11 of 12 captures. The twelfth, 3.4 s after a load, had lost them, and a
+  capture 50 ms later had them again. Before the fix a loss lasted until
+  something repainted the strip: seconds, and once over a minute.
+- **about:support said Compositing `WebRender`, and WebGL `llvmpipe`.** The
+  parent process had Mesa loaded and not `libsv_icd.so`, so WebRender was
+  drawing on llvmpipe. The GPU side's log explains it: clients 3 to 6 were
+  `refused: all 2 GPU session slots are taken`. That is 95.4.10, fixed in the
+  ICD by gpu-oom c744796, and it is why the geometry went back to three
+  slots.
+
+### 95.8 Two log oddities, not defects
+
+- **The audio player's drop counter.** Every session logs about 434 dropped
+  chunks and 62 underruns per 10 s played. That happens only while the stream
+  is silent: the null sink's monitor then delivers about 15 chunks per burst,
+  the queue holds 8, and the rest are dropped. While the H.264 clip played, the
+  10 s that were all sound had 0 drops and 0 underruns. The counter misleads,
+  and the sound is fine.
+- **`Error writing selection data: Broken pipe`** in Firefox's log, once per
+  copy. A reader closed a selection pipe before Firefox finished writing to it.
+  Every copy arrived whole (95.2).
+
+The grey patch that is in every capture near (104,141) is the capture tool's
+privacy mask over some other process's transparent window that sits above
+ours; `WindowFromPoint` there answers our window.
+
+### 95.9 What is deployed, and the way back
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-95` and `~/wc-launch-ivs-backup-95` (the state §94 left), then the two deploys of 95.7; the third is pending |
+| what each deploy copies | `wc-launch.exe`, `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe` and the ini to `C:\Users\<guest-user>\wcivs`; `wc-session`, `wc-proxy`, `wc-arena-host` and `wc-launch` to `~/wc-launch-ivs` (`deploy-95.txt`, `deploy-95b.txt`). Which of them differ from the backup byte for byte is to be hashed at the final redeploy (pending) |
+| `wc-session` | starts applications with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, so a dismissed crash reporter keeps its minidump |
+| deployed now, to be reverted | the 2 x 112 MiB geometry of the 14:00 deploy (95.4.6), which leaves Firefox's parent without a GPU slot (95.4.10). The pending redeploy goes back to 3 x 64 MiB; by the user's ruling the arena is to be allocated dynamically on the ivshmem device instead, by another agent |
+| the guest otherwise | the session-1 agent quit at 14:29. `C:\Users\<guest-user>\wcdc` (its scratch file, captures, and the clipboard kept for the run) stays until the clipboard is put back (pending); the ini's `wayland-bell` restored byte for byte after the fallback session (SHA-256 `2660a039…` before and after) |
+
+**Way back:** copy `wcivs-backup-95` over `wcivs`, and
+`~/wc-launch-ivs-backup-95` over `~/wc-launch-ivs`, with no session up.
+
+### 95.10 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` (master 2982bdd and gpu-oom c744796 merged) | **102 binaries, 2944 passed, 0 failed**, 8 ignored. New here: `a_translucent_subsurface_is_drawn_over_its_parent_not_instead_of_it`, `an_xrgb_subsurface_is_copied_whatever_its_padding_byte_says`, `an_opaque_subsurface_draws_exactly_as_the_copy_did`; gpu-oom's in 95.4.8 |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | 1234 citations resolve to one section |
+| the select, Linux build | `select-run.sh` before and after (95.5) |
+| Wine | the menu paths of 95.2; after the fixes: the window, the fallback caption buttons through a navigation, the select without a frame |
+| `wc-launch.sh deploy` (`wcivs`) | 16 passed, 0 failed, both times (95.7) |
+| privacy | every committed capture is of a private window, a test page, a menu of Firefox's own, a caption corner or a dialog's header bar; a separate check of all 22 found one with two history rows (masked) and slivers of the desktop at the edges (masked) |
 
 ## 96. Minecraft: a pointer that holds still, a window that follows, and three forwarder gaps a game found
 
