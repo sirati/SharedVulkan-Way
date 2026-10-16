@@ -104,8 +104,9 @@ mod imp {
     };
     // §82: `mouse`, which drives a real drag through `SendInput`.
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MOVE, MOUSEINPUT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
@@ -143,6 +144,8 @@ usage: wc-desk <command> [options]
                            WM_NCHITTEST at window-relative points; a negative
                            coordinate counts from the right or bottom edge
   mouse --pid N [--drag A B] [--click A] [--dblclick A] [--hover A MS] [--step-ms N]
+                           [--key NAME] [--hold NAME MS] [--rel DX DY N] [--wait MS]
+                           (§96: keys by scan code, relative motion for a locked pointer)
                            real input through SendInput, the window rectangle
                            printed before and after each gesture
 
@@ -1194,6 +1197,56 @@ usage: wc-desk <command> [options]
         unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
     }
 
+    /// §96: relative motion, which `SendInput` without `MOUSEEVENTF_ABSOLUTE`
+    /// produces exactly as a mouse would, raw input included.
+    fn send_rel(dx: i32, dy: i32) {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 },
+            },
+        };
+        // SAFETY: one well-formed `INPUT`, its size passed with it.
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    }
+
+    /// §96: one key transition, by scan code.
+    fn send_key(scan: u16, up: bool) {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: scan,
+                    dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        // SAFETY: one well-formed `INPUT`, its size passed with it.
+        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    }
+
+    /// §96: the keys a game test needs, by set-1 scan code. Deliberately a
+    /// short list, and no Windows key: nothing here may reach the shell.
+    fn scan_code(name: &str) -> std::io::Result<u16> {
+        Ok(match name.to_ascii_uppercase().as_str() {
+            "ESC" | "ESCAPE" => 0x01,
+            "W" => 0x11,
+            "A" => 0x1e,
+            "S" => 0x1f,
+            "D" => 0x20,
+            "E" => 0x12,
+            "SPACE" => 0x39,
+            "F1" => 0x3b,
+            "F2" => 0x3c,
+            "F3" => 0x3d,
+            "F11" => 0x57,
+            other => return Err(std::io::Error::other(format!("--key: no key {other:?}"))),
+        })
+    }
+
     /// Drive the mouse over a window: `--drag A B`, `--click A`, `--dblclick A`,
     /// each point window-relative as for `hittest`, in the order given.
     ///
@@ -1276,6 +1329,45 @@ usage: wc-desk <command> [options]
                 // Windows 11's snap-layouts flyout over a maximise button. The
                 // flyout is a window of the shell's, so `shot --screen` taken
                 // during the wait is what photographs it.
+                // §96: a key, by its scan code, which is what the compositor
+                // translates (`crate::input` in wc-compositor) and what a game
+                // reads positionally.
+                "--key" if i + 1 < args.len() => {
+                    let sc = scan_code(&args[i + 1])?;
+                    send_key(sc, false);
+                    pause(60);
+                    send_key(sc, true);
+                    println!("mouse.key        {} (scan {sc:#04x})", args[i + 1]);
+                    pause(step_ms * 4);
+                    i += 2;
+                }
+                "--hold" if i + 2 < args.len() => {
+                    let sc = scan_code(&args[i + 1])?;
+                    let ms: u64 = args[i + 2].parse().unwrap_or(1000);
+                    send_key(sc, false);
+                    pause(ms);
+                    send_key(sc, true);
+                    println!("mouse.hold       {} for {ms} ms", args[i + 1]);
+                    pause(step_ms * 4);
+                    i += 3;
+                }
+                // §96: N relative moves of (DX, DY): what a mouse does, and the
+                // only motion a locked pointer reports (raw input).
+                "--rel" if i + 3 < args.len() => {
+                    let dx: i32 = args[i + 1].parse().unwrap_or(0);
+                    let dy: i32 = args[i + 2].parse().unwrap_or(0);
+                    let n: u32 = args[i + 3].parse().unwrap_or(1);
+                    for _ in 0..n {
+                        send_rel(dx, dy);
+                        pause(step_ms);
+                    }
+                    println!("mouse.rel        {n} x ({dx},{dy})");
+                    i += 4;
+                }
+                "--wait" if i + 1 < args.len() => {
+                    pause(args[i + 1].parse().unwrap_or(1000));
+                    i += 2;
+                }
                 "--hover" if i + 2 < args.len() => {
                     let (x, y) = at(&args[i + 1], &r)?;
                     let ms: u64 = args[i + 2].parse().unwrap_or(1500);
