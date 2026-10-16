@@ -44,6 +44,7 @@
 #   SVMC_FULLSCREEN 1: press F11 during the run and judge the window
 #   SVMC_SOUND     1: give the game this desktop's PulseAudio, at master volume 0
 #   SVMC_MEM       the game's memory cap (6G); the heap is Prism's 3 GiB
+#   SVMC_GPU_ARENA_MIB  the GPU side's arena (512); the guest gives a session 64 or 240
 set -uo pipefail
 
 CMD=${1:-}
@@ -325,7 +326,7 @@ run() {
     local VVL; VVL=$(nixpath vulkan-validation-layers)
     GPU_ENV+=(VK_LAYER_PATH="$VVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
-  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $((512 << 20)) \
+  ( env "${GPU_ENV[@]}" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )) \
       --socket "$RUN/gpu.sock" --idle $((secs + 120)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" -v keep="${SVMC_KEEP_PIPELINE_TRACE:-0}" -v keepf="$RUN/gpu-pipelines.txt" '
