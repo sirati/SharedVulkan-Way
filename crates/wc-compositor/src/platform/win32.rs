@@ -148,6 +148,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
+    // §93: a click on a popup activates nothing. See `WM_MOUSEACTIVATE`.
+    MA_NOACTIVATE, WM_MOUSEACTIVATE,
     // ADDED FOR STAGE 21: `xdg_activation_v1` (raise a window) and the
     // screensaver half of `zwp_idle_inhibit_manager_v1`.
     FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
@@ -257,6 +259,8 @@ const WM_CLIPBOARDUPDATE: u32 = 0x031D;
 /// `winuser.h` and have not moved since Windows 3.1.
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
+/// §93. `CF_DIB`: a bitmap with its header, which is how a picture is read.
+const CF_DIB: u32 = 8;
 
 /// The colour behind a window whose buffer does not fill it.
 ///
@@ -1291,6 +1295,8 @@ pub(crate) struct Ui {
     /// returns 0 and no HTML crosses, which is the same outcome as a clipboard
     /// with no HTML on it.
     html_format: Cell<u32>,
+    /// §93. `RegisterClipboardFormatW("PNG")`, resolved once, like `html_format`.
+    png_format: Cell<u32>,
     /// Where to write a PPM of every presented frame, if asked.
     ///
     /// ADDED FOR STAGE 4. Until then this was headless-only, and that asymmetry
@@ -1580,6 +1586,18 @@ unsafe extern "system" fn toplevel_proc(
                 follow_owner(&ui, state.id, hwnd);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // §93. A click on a menu must not take the focus. `WS_EX_NOACTIVATE`
+        // keeps a popup from becoming the *foreground* window, and that is
+        // all its documentation promises: Wine gave the clicked popup
+        // `WM_SETFOCUS` (and took it from the toplevel), the client heard
+        // `wl_keyboard.leave` on its window, and Firefox rolls its menus up
+        // on focus-out, so clicking "Help" in its menu closed the menu
+        // instead of opening the Help panel. `MA_NOACTIVATE` is the answer
+        // menus and tooltips give: the click is delivered, and neither
+        // activation nor focus moves.
+        WM_MOUSEACTIVATE if matches!(state.kind, WindowKind::Popup { .. }) => {
+            MA_NOACTIVATE as LRESULT
         }
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
@@ -2146,7 +2164,7 @@ unsafe extern "system" fn controller_proc(
     }
     if msg == WM_CLIPBOARDUPDATE {
         if let Some(ui) = ui() {
-            on_clipboard_update(&ui);
+            on_clipboard_update(&ui, "WM_CLIPBOARDUPDATE");
         }
         return 0;
     }
@@ -2191,11 +2209,11 @@ unsafe extern "system" fn controller_proc(
 /// The cost of keeping it is one extra round trip per copy. That is the right
 /// side of the trade, and it is also what makes client-to-client copying work
 /// transitively through Windows' own clipboard.
-fn on_clipboard_update(ui: &Rc<Ui>) {
+fn on_clipboard_update(ui: &Rc<Ui>, why: &str) {
     let formats = available_formats(ui);
     let mimes = crate::clipboard::mimes_for(&formats);
     println!(
-        "wc-compositor: WM_CLIPBOARDUPDATE: [{}] -> {} mime type(s)",
+        "wc-compositor: {why}: [{}] -> {} mime type(s)",
         formats.iter().map(|f| f.name()).collect::<Vec<_>>().join(", "),
         mimes.len()
     );
@@ -2214,15 +2232,30 @@ fn html_format(ui: &Rc<Ui>) -> u32 {
     id
 }
 
+/// §93. `RegisterClipboardFormatW("PNG")`: the name browsers, Office and the
+/// Snipping Tool register, so it is the same number theirs is.
+fn png_format(ui: &Rc<Ui>) -> u32 {
+    if ui.png_format.get() != 0 {
+        return ui.png_format.get();
+    }
+    let name = wide("PNG");
+    // SAFETY: a NUL-terminated UTF-16 buffer that outlives the call.
+    let id = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+    ui.png_format.set(id);
+    id
+}
+
 pub(crate) fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
     match format {
         SystemFormat::UnicodeText => CF_UNICODETEXT,
         SystemFormat::Html => html_format(ui),
         SystemFormat::HDrop => CF_HDROP,
+        SystemFormat::Png => png_format(ui),
+        SystemFormat::Dib => CF_DIB,
     }
 }
 
-/// Which of the three formats this compositor carries are on the clipboard.
+/// Which of the formats this compositor carries are on the clipboard.
 ///
 /// `IsClipboardFormatAvailable` rather than `EnumClipboardFormats`, because it
 /// does **not** require the clipboard to be open — which matters more than the
@@ -2231,7 +2264,7 @@ pub(crate) fn format_id(ui: &Rc<Ui>, format: SystemFormat) -> u32 {
 /// it and has not yet closed it, and losing that fight would mean announcing an
 /// empty clipboard to Wayland at precisely the moment something was copied.
 fn available_formats(ui: &Rc<Ui>) -> Vec<SystemFormat> {
-    [SystemFormat::UnicodeText, SystemFormat::Html, SystemFormat::HDrop]
+    SystemFormat::ALL
         .into_iter()
         .filter(|f| {
             let id = format_id(ui, *f);
@@ -2400,7 +2433,7 @@ fn fetch_clipboard(ui: &Rc<Ui>, token: u64, from_drag: bool, mime: &str) {
     }
     let formats = available_formats(ui);
     let data = with_clipboard(ui, "answer a paste", || {
-        formats.iter().find_map(|f| {
+        formats.iter().filter(|f| crate::clipboard::can_answer(mime, **f)).find_map(|f| {
             let bytes = read_format(format_id(ui, *f))?;
             crate::clipboard::from_system(mime, *f, &bytes)
         })
@@ -5606,6 +5639,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         controller: Cell::new(controller as isize),
         idle_inhibited: Cell::new(false),
         html_format: Cell::new(0),
+        png_format: Cell::new(0),
         dump_frames: config.dump_frames.clone(),
         // The arrow, so that the very first `WM_SETCURSOR` — which arrives
         // before any client has said anything about a cursor — installs the
@@ -5636,6 +5670,14 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     } else {
         println!("wc-compositor: watching the system clipboard (WM_CLIPBOARDUPDATE)");
     }
+    // §93. **And say what is on it already.** `WM_CLIPBOARDUPDATE` reports a
+    // change, so whatever the user copied *before* this compositor started —
+    // a URL copied in another program, then a double-click on the shortcut —
+    // was never offered to Wayland, and the first paste in a new session
+    // pasted nothing until something was copied again. A session ends a
+    // minute after its last window closes, so every reopened window started
+    // that way. One announcement now, of the clipboard as it is.
+    on_clipboard_update(&ui, "at start-up, the clipboard already holds");
 
     Ok(assemble(
         tx,

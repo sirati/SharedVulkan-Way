@@ -316,8 +316,18 @@ impl ClipLink {
         std::mem::take(&mut self.answers)
     }
 
+    /// §93. The feed is being dropped by its owner: everything still open is
+    /// answered, and nothing more is sent.
+    pub fn abandon(&mut self) {
+        self.give_up();
+    }
+
     pub fn on_writable(&mut self) -> io::Result<()> {
         use std::io::Write as _;
+        if self.phase == Phase::Off {
+            self.out.clear();
+            return Ok(());
+        }
         while !self.out.is_empty() {
             match (&self.sock).write(&self.out) {
                 Ok(0) => break,
@@ -363,6 +373,10 @@ impl ClipLink {
     /// on `read`.
     fn give_up(&mut self) {
         self.phase = Phase::Off;
+        // §93: and nothing more is written to it. The queued rest of a large
+        // selection used to go on being written into the closed socket, and
+        // the EPIPE was the error that ended the application's connection.
+        self.out.clear();
         if self.drag_running {
             // The one `drag_finished` the client is owed, manufactured here
             // because nobody else can send it now. `none` is the truth: no drop
@@ -518,6 +532,37 @@ fn error_text(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §93. A feed whose compositor end went away fails its write once — the
+    /// pump drops the feed on that and keeps the client — and once abandoned
+    /// it answers every open paste and writes nothing more. Before, the
+    /// queued rest of a large selection went on being written into the
+    /// closed socket and the EPIPE ended the application's connection.
+    #[test]
+    fn a_dead_feed_answers_its_pastes_and_writes_nothing_more() {
+        let dir = std::env::temp_dir().join(format!("wc-clip-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut link = ClipLink::connect(&path, &Spec::builtin().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(link.fetch(7, Source::Clipboard, "text/plain"));
+        drop(server);
+        // A big enough write that the closed peer cannot be hidden by a buffer.
+        link.out.extend_from_slice(&vec![0u8; 1 << 20]);
+        assert!(link.on_writable().is_err(), "the closed socket is an error, once");
+        link.abandon();
+        let answers = link.take_answers();
+        assert!(
+            matches!(answers.as_slice(), [(7, Answer::Failed(_))]),
+            "the open paste is answered: {answers:?}"
+        );
+        assert!(!link.wants_write());
+        assert!(link.on_writable().is_ok(), "and nothing is written any more");
+        assert!(!link.fetch(8, Source::Clipboard, "text/plain"), "a dead feed takes no fetch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_opcodes_come_out_of_the_xml_the_compositor_was_generated_from() {
