@@ -953,7 +953,92 @@ interactive account.
 (once the NixOS change of §89.8 is switched); until then it exists only as
 hot-added, with the same mode and ACL set by hand.
 
-### R32 — Jump lists put a command on the guest that reaches the host
+### R32 — The two doorbell ports admit the interactive user at medium integrity
+Added 2026-10-16 with `waycompose-design.md` §91. R31 and §87 put two
+virtio-serial ports on the guest, `org.sirati.wcbell.0` and `org.sirati.svbell.0`.
+vioser makes every port a raw PDO with the descriptor
+`D:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(ML;;NW;;;LW)`, which admits SYSTEM and the
+Administrators group and nobody else. A shortcut started by Explorer runs with
+the user's filtered token at medium integrity, so it could not open either port,
+and every real double-click got the ssh fallback and no GPU doorbell (§90.3).
+
+**The change.** `scripts/wc-port-access.ps1` gives exactly those two device
+objects the descriptor
+
+    D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;<the user's SID>)S:(ML;;NWNR;;;ME)
+
+It keeps the two original entries, adds read and write (`0x12019f`, which has no
+`WRITE_DAC`, `WRITE_OWNER` or `DELETE`) for one named account, and adds a Medium
+label that refuses read and write to anything below medium integrity. The tool touches no
+other port, the QEMU guest agent's included. The tool writes the descriptor in two places. The device's PnP
+`Security` property is applied by the PnP manager whenever the device starts,
+which covers a reboot and a vioser update. The live device object is set through
+a handle, so the change takes effect without restarting a device. A SYSTEM task,
+`waycompose port access`, re-applies both at every startup and finds the ports by
+name, so a renumbered port still gets it. The task runs a copy of the script
+under `C:\Program Files\waycompose`, which only Administrators and SYSTEM may
+write; a SYSTEM task that ran a file the user can edit would give the user
+SYSTEM.
+
+**Who it admits, measured on testhost's guest (§91.2).** A process in session 1
+started by the scheduler at the `Limited` run level (`S-1-16-8192`, not elevated,
+the token Explorer gives a double-click) opens both ports read and write. A
+Low-integrity copy of that token is refused with error 5, and so is a Low copy of
+the administrator's token, so the label holds. Before the change the same medium
+process was refused.
+
+**What any medium-integrity process of that user can now do with the ports.**
+Every program <guest-user> runs (a browser, a game, a downloaded tool) runs with this
+token, so the argument has to cover all of them.
+
+* *Write wake bytes to the host.* The host reads each byte as a lane number and
+  treats it as a hint. R31 already argues this: a wrong byte wakes a pump that
+  finds nothing to do (one syscall) or is counted as stray. The GPU doorbell is
+  the same mechanism on the GPU rings (§87). Neither byte carries data, and
+  neither can name a descriptor, a file or a command.
+* *Read the host's wake bytes.* They carry no data. Their timing tells a reader
+  roughly when the Wayland session or a GPU session is busy. The same process
+  can already learn far more, see below.
+* *Hold a port first.* A port has one opener (vioser makes it exclusive). A
+  process that opens a port before the launcher does makes the next session fall
+  back to ssh or to slice-length GPU waits, loudly and correctly. That is a
+  denial of service against the user's own session, by the user's own program.
+* *Nothing on the host.* The host ends are QEMU chardev sockets in
+  `/run/windows-vm/wc-arena`, mode 0660 for `wc-arena` (R29, R31). The guest
+  reaches only the process that connected to them, and only with bytes it
+  treats as hints.
+
+**Why this adds nothing a medium process could not already do.** The ivshmem
+devices that carry the arena and the GPU sessions (R29) have the Looking Glass
+driver's descriptor, measured on the same guest:
+
+    D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1201bf;;;WD)(A;;0x1200a9;;;RC)S:AI(ML;;NW;;;LW)
+
+Everyone (`WD`) may open them read and write, and their label is Low. Any
+process of any user, Low-integrity ones included, can map the arena that holds
+every frame, keymap and clipboard offer of the session, and write a GPU
+session's rings. The port grant is narrower in every respect: one named
+account, medium integrity and up, and a channel that carries no data. *Not
+changed here, and worth a decision by the owner:* the ivshmem devices'
+descriptor could get the same treatment (`wc-port-access.ps1` would need only
+the device paths), which would close the Low-integrity reach to the arena.
+
+**Alternatives that were weighed (§91.2).** A doorbell on the ivshmem device
+itself (`ivshmem-doorbell`, which the Looking Glass driver supports through
+`IOCTL_IVSHMEM_RING_DOORBELL` and event registration) needs the VM reconfigured
+and restarted and an `ivshmem-server` on the host, a new resident component on
+each side. A guest service that owns the ports and relays to user processes
+over an ACL'd pipe is a new resident component, an extra hop per wake, and the
+same grant expressed as a pipe ACL. Running the launcher elevated puts a UAC
+prompt on every click and gives Firefox's session an administrator token.
+
+**The way back.** `wc-port-access.ps1 -Action revert` restores the original
+descriptor above on both ports and removes the PnP property;
+`-Action uninstall` also removes the task and the Program Files copy. A port
+some process holds open cannot be opened to change it (it is exclusive), so run
+either with no session up.
+
+### R33 — Jump lists put a command on the guest that reaches the host
 Added 2026-10-16 with `waycompose-design.md` §92. A pinned Linux application's
 jump list has tasks ("Open new private window") and pages (the profile's most
 visited sites). Each entry is a Windows shortcut that runs

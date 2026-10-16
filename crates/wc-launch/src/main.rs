@@ -52,6 +52,7 @@ pub enum Request<'a> {
     Action(&'a str),
     Open(&'a str),
 }
+mod token;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -314,7 +315,7 @@ fn run(
             "--refresh" => refresh_only = Some(it.next().map(String::as_str).unwrap_or("")),
             // §92. A jump-list task names an action of the desktop entry, and a
             // frequent page a URL. Both are checked again on the VM host, where
-            // the check is the one that counts (security-model.md R32).
+            // the check is the one that counts (security-model.md R33).
             "--action" => {
                 let id = it.next().map(String::as_str).unwrap_or("");
                 if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
@@ -360,6 +361,9 @@ fn run(
         (None, true) => (None, ""),
         (None, false) => return Err("no application named, and no --session".into()),
     };
+    // §91: which route this launch came by. A double-click from Explorer is
+    // medium and not elevated; a harness task at `-RunLevel Highest` is high.
+    log.say(&format!("token: {}", token::describe()));
     win::launch(cfg, p, log, app.map(|a| (section, a)), request, t0)
 }
 
@@ -1029,12 +1033,13 @@ mod win {
         req: crate::Request,
     ) -> Result<(), String> {
         let t = Instant::now();
-        // Five things cross, all base64'd because they go through
+        // Six things cross, all base64'd because they go through
         // `$SSH_ORIGINAL_COMMAND`: the command line, the profile directory the
         // deployment's preferences belong in, those preferences already rendered
         // as a `user.js`, the value of `MOZ_GTK_TITLEBAR_DECORATION`, and — §82
         // — the `userChrome.css` that fits Firefox's tab strip to Windows'
-        // caption. The rendering happens here rather than on the host because it
+        // caption, and (§91.8) the GTK sheet that does the same for its dialogs'
+        // header bars. The rendering happens here rather than on the host because it
         // is the part with a shape to get wrong, here it is tested, and here is
         // the only place that knows this desktop's DPI.
         //
@@ -1056,9 +1061,9 @@ mod win {
         let profile = plan::profile_dir(&app.exec).unwrap_or_default();
         // §92. A task or a page names the desktop entry and the action or URL,
         // and the executable the host should run it with; the host builds the
-        // argv from its own desktop entry. The last four words are the same
+        // argv from its own desktop entry. The last five words are the same
         // as `run`'s, so a task that starts the application cold gives it this
-        // installation's profile, preferences and title bar.
+        // installation's profile, preferences, title bar and GTK sheet.
         let program = app.exec.split_whitespace().next().unwrap_or_default();
         let mut verb: Vec<String> = match req {
             crate::Request::Run => vec!["run".into(), id.into(), word(&app.exec)],
@@ -1074,6 +1079,9 @@ mod win {
             word(&plan::app_user_js(titlebar, &app.prefs)),
             word(titlebar.moz_env()),
             word(&chrome),
+            // §91.8: the GTK sheet, for the dialogs. A `wc-session` older
+            // than §91 ignores a seventh word of `run`.
+            word(&plan::gtk_css(titlebar, fit).unwrap_or_default()),
         ]);
         let words: Vec<&str> = verb.iter().map(String::as_str).collect();
         let said = ssh(cfg, p, &words)?;

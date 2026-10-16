@@ -345,16 +345,15 @@ impl Control {
         if want == self.focus {
             return;
         }
-        // `ShowWindow` sends `WM_SIZE`, so a window that appears is told its
-        // size — and `win32.rs` turns that into an `xdg_toplevel.configure`
-        // carrying it. Without this line the headless leg stays at 0x0 for
-        // ever and the two legs disagree, which is exactly what
-        // `scripts/wc-wlcs.sh compare` found and the reason it exists: the
-        // stand-in was being *kinder* than Windows, which is the dangerous
-        // direction. Sending it makes both legs fail
-        // `XdgToplevelStableConfigurationTest.defaults`, and that is the right
-        // answer — the compositor really does configure a size where WLCS
-        // expects none, on the platform that ships.
+        // `ShowWindow` sends `WM_SIZE`, and until §91 `win32.rs` turned it into
+        // an `xdg_toplevel.configure` carrying the size the client had just
+        // committed, so this stand-in sent a `Resized` here to match (and both
+        // legs failed `XdgToplevelStableConfigurationTest.defaults`, correctly:
+        // the compositor configured a size where WLCS expects none). §91 found
+        // that configure locking Firefox's second window at its first, tiny
+        // size: a client told its own size back has been *told* a size. Win32
+        // now swallows the `WM_SIZE`s its own placement causes and says nothing
+        // to a client that got what it committed, so neither does this.
         let time = self.now_ms();
         if let Some(old) = self.focus.take() {
             let _ = self.events.send(FromUi::Activated { id: old, on: false });
@@ -368,13 +367,6 @@ impl Control {
         }
         if let Some(new) = want {
             self.focus = Some(new);
-            if let Some(r) = mapped.iter().find(|r| r.id == new) {
-                let _ = self.events.send(FromUi::Resized {
-                    id: new,
-                    width: r.w,
-                    height: r.h,
-                });
-            }
             let _ = self.events.send(FromUi::Activated { id: new, on: true });
             // `caps` and `num` are both off. There is no machine here whose
             // lock keys could be on, and inventing a state would make the
@@ -1147,22 +1139,20 @@ mod tests {
     fn a_newly_mapped_toplevel_takes_the_activation_and_the_focus() {
         let (mut c, rx) = control();
         c.follow_focus(&Fake::new(vec![win(3, 1, 2, 10, 10)]));
-        assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 3, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 3, on: true })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::KeyboardFocus { id: 3, on: true, .. })));
     }
 
-    /// `ShowWindow` sends `WM_SIZE`. The stand-in has to as well, and the size
-    /// has to be the one the window actually has — which is the buffer the
-    /// client committed, not a guess.
+    /// §91. Showing a window does not tell the client its own size back: a
+    /// configure with a size is an instruction, and Firefox obeyed the one that
+    /// echoed its first, tiny commit for the rest of the window's life.
     #[test]
-    fn showing_a_window_tells_it_its_size_the_way_win32_does() {
+    fn showing_a_window_does_not_tell_it_its_own_size_back() {
         let (mut c, rx) = control();
         c.follow_focus(&Fake::new(vec![win(1, 1, 2, 200, 320)]));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(FromUi::Resized { id: 1, width: 200, height: 320 })
-        ));
+        while let Ok(m) = rx.try_recv() {
+            assert!(!matches!(m, FromUi::Resized { .. }), "a configure went out at map: {m:?}");
+        }
     }
 
     #[test]
@@ -1183,7 +1173,6 @@ mod tests {
         c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10), win(2, 1, 3, 10, 10)]));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 1, on: false })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::KeyboardFocus { id: 1, on: false, .. })));
-        assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 2, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 2, on: true })));
     }
 
@@ -1193,7 +1182,6 @@ mod tests {
         let mut popup = win(2, 1, 3, 10, 10);
         popup.toplevel = false;
         c.follow_focus(&Fake::new(vec![win(1, 1, 2, 10, 10), popup]));
-        assert!(matches!(rx.try_recv(), Ok(FromUi::Resized { id: 1, .. })));
         assert!(matches!(rx.try_recv(), Ok(FromUi::Activated { id: 1, on: true })));
     }
 

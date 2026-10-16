@@ -32,9 +32,9 @@
 #   wc-session icon APPID                     the app's icon from this machine's theme
 #   wc-session app  APPID B64EXE THEME        the app's desktop entry: name, actions, task
 #                                             icons and icon, for the guest's pin and jump list (§92)
-#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME]
+#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
 #                                             run one of the desktop entry's actions, by id (§92)
-#   wc-session open ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME]
+#   wc-session open ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
 #                                             open an http(s)/file URL in the slot its %u marks (§92)
 #   wc-session frequent B64PROFILE            the jump list's frequent pages and their favicons (§92)
 #   wc-session down ID                        stop the proxy and remove the run directory
@@ -234,13 +234,13 @@ profile_of() {
   esac
 }
 
-# launch_desktop KIND ARG ID APPID B64EXE PROFILE PREFS TITLEBAR [CHROME]
+# launch_desktop KIND ARG ID APPID B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
 #
 # `action` and `open`: ask wc-proxy for the argv the desktop entry gives KIND
 # and ARG (an action id, or a URL), check that the launcher's executable is the
 # entry's program, and hand the result to `run`. Nothing the guest sent becomes
 # a command: it named an id or a URL, wc-proxy built the argument list from
-# this machine's file, and `run` executes it as an array (security-model.md R32).
+# this machine's file, and `run` executes it as an array (security-model.md R33).
 launch_desktop() {
   local KIND="$1" ARG="$2" ID="$3" APPID="$4" B64EXE="$5" B64PROFILE="$6" OUT PROG ARGS WANT RES PROFILE CMD
   check_id "$ID"; check_app "$APPID"
@@ -821,6 +821,56 @@ run)
       fi
       ;;
   esac
+  # THE GTK SHEET, FOR THE DIALOGS -- docs/waycompose-design.md §91.8.
+  #
+  # The seventh word is a gtk.css that pads every GTK header bar's end by the
+  # width of Windows' caption buttons, because the compositor folds the caption
+  # of GTK's dialogs (the file chooser, Save As, Print) just as it does
+  # Firefox's main window, and without it the file chooser's Open button sat
+  # under Windows' close button. GTK reads gtk.css and settings.ini from
+  # $XDG_CONFIG_HOME/gtk-{3,4}.0 and nowhere else a launcher can reach, and the
+  # user's real ~/.config is not ours to write. So the application gets a
+  # session-private XDG_CONFIG_HOME that is an overlay of the real one: every
+  # entry of it is a symbolic link back to the user's, so user-dirs.dirs, the
+  # file chooser's bookmarks, dconf (the icon theme), fontconfig, mimeapps.list
+  # and ~/.config/mozilla behave as before -- measured: a bare private
+  # directory lost the sidebar's folders and the icon theme. Only gtk.css and
+  # settings.ini are replaced: gtk.css imports the user's own first, and
+  # settings.ini is the user's with gtk-decoration-layout set to none, so a GTK
+  # window with a header bar draws no second set of window buttons. A file an
+  # application creates at the top of the directory lands in the overlay and
+  # goes with the session; one written through a link lands in the user's.
+  GTKCSS=$(unb64 "${7:-}")
+  CONFIG_ENV=()
+  if [ -n "$GTKCSS" ]; then
+    REAL="${XDG_CONFIG_HOME:-$HOME/.config}"
+    C="$D/xdg-config"
+    rm -rf "$C"; mkdir -p "$C"
+    for e in "$REAL"/* "$REAL"/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "${e##*/}" in gtk-3.0|gtk-4.0) ;; *) ln -s "$e" "$C/${e##*/}" ;; esac
+    done
+    for v in gtk-3.0 gtk-4.0; do
+      mkdir -p "$C/$v"
+      for e in "$REAL/$v"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in gtk.css|settings.ini) ;; *) ln -s "$e" "$C/$v/${e##*/}" ;; esac
+      done
+      {
+        [ -f "$REAL/$v/gtk.css" ] && printf '@import url("file://%s");\n' "$REAL/$v/gtk.css"
+        printf '%s\n' "$GTKCSS"
+      } > "$C/$v/gtk.css"
+      {
+        if [ -f "$REAL/$v/settings.ini" ]; then
+          grep -v '^[[:space:]]*gtk-decoration-layout[[:space:]]*=' "$REAL/$v/settings.ini"
+        else
+          echo '[Settings]'
+        fi
+        echo 'gtk-decoration-layout=:'
+      } > "$C/$v/settings.ini"
+    done
+    CONFIG_ENV=(XDG_CONFIG_HOME="$C")
+  fi
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
   # shellcheck disable=SC2086
@@ -829,6 +879,7 @@ run)
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
     "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*}"
@@ -878,20 +929,20 @@ app)
 # ------------------------------------------------------------ action, open ---
 # §92. A jump-list task, or a frequent page, through the session's proxy:
 #
-#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME]
-#   wc-session open   ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME]
+#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#   wc-session open   ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
 #
 # The guest names an action id or a URL; the argv is the desktop entry's
-# (`launch_desktop`). The last four words are `run`'s, so a task that starts
+# (`launch_desktop`). The last five words are `run`'s, so a task that starts
 # the application cold gives it the profile, preferences and title bar a click
 # on the shortcut would.
 action)
   ACT="${3:-}"; case "$ACT" in *[!A-Za-z0-9-]*|"") die "bad action id" ;; esac
-  launch_desktop action "$ACT" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}"
+  launch_desktop action "$ACT" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
   ;;
 open)
   URL=$(printf '%s' "${3:-}" | base64 -d 2>/dev/null) || die "open: bad base64"
-  launch_desktop open "$URL" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}"
+  launch_desktop open "$URL" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
   ;;
 
 # ---------------------------------------------------------------- frequent ---

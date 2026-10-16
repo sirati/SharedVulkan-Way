@@ -209,7 +209,7 @@ pub fn parse_frequent(out: &str) -> (JumpPrefs, Vec<Page>) {
 
 /// The guest's half of the host's `url_ok`: a URL that can be one argument of
 /// a Windows command line and that the host will accept. The host checks
-/// again, and its check is the one that matters (security-model.md R32).
+/// again, and its check is the one that matters (security-model.md R33).
 pub fn url_ok(u: &str) -> bool {
     let lower = u.get(..8).unwrap_or(u).to_ascii_lowercase();
     (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("file:///"))

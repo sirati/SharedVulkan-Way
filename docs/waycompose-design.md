@@ -28231,6 +28231,375 @@ the topology assertion, both passing again.
 | `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
 | privacy | the full-screen captures are cropped above the taskbar, cut down to the taskbar button or the Alt-Tab panel, or masked grey outside Firefox (`H-two-redacted.png`); a separate check of every committed image: 33 of 34 images clean on the first pass; the Alt-Tab crops then lost 10 rows of cut-off desktop text under the panel |
 
+## 91. A double-click gets the doorbells, the fallback takes seconds, and two window bugs
+
+Branch `medium-il`, 2026-10-16. The three bugs §90 left open that are not the
+video decode: a real double-click ran without the ring and GPU doorbells
+(§90.3), Windows' caption buttons vanished from maximised windows (§90.6), and a
+second window opened at 252x304 in the screen's corner (§90.7).
+
+### 91.1 Status in one paragraph
+
+All three are fixed.
+- **Bug 1.** The two virtio-serial ports carried vioser's admin-only descriptor.
+  They now admit the interactive user at medium integrity (91.2,
+  security-model.md R32). The first real double-click after the change,
+  <guest-user>'s own at 05:48, had rings, both doorbells and a window in 3173 ms.
+- **The slow fallback.** The guest's waits cost a 15.6 ms timer tick per rung
+  when no doorbell was attached, and the port open retried access denied for
+  10 s. Both are fixed (91.3).
+- **The harness** now clicks with a double-click's token by default and checks
+  the route from the launcher's own `token:` line (91.4).
+- **Bug 2.** `DefWindowProc` painted the caption over the button strip on every
+  title change (91.5).
+- **Bug 3.** The map echoed the client's first size back as a configure, which
+  Firefox obeyed, and read the window's position before Windows had chosen it
+  (91.6). A maximise asked for before the first frame was undone by the map,
+  and a client that commits only its minimum now gets a default size.
+- **GTK dialogs** (reported from real use while this ran): the file chooser's
+  *Open* sat under Windows' buttons. A session-private GTK sheet pads every
+  header bar by the buttons' width (91.8).
+
+On the guest (91.7) the double-click route is proven. The caption buttons and
+the dialogs are measured on the Linux build only, because <guest-user>'s session was
+locked for the rest of the run.
+
+### 91.2 Bug 1: the ports' descriptor
+
+**Measured.** `QueryDosDevice("Global\org.sirati.wcbell.0")` is `\Device\00000042`,
+the PDO of `{6FDE7547-…}\VIOSERIALPORT\4&34687BC8&0&05`, and `svbell.0` is
+`…&0&04` (`\Device\00000041`). Both device objects had
+`D:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(ML;;NW;;;LW)` and no PnP `Security` property.
+That is vioser's `WdfDeviceInitAssignSDDLString(…, SDDL_DEVOBJ_SYS_ALL_ADM_ALL)`
+for its raw port PDOs (vioserial `Port.c`). The `Global\` alias is not a
+different object with a different descriptor, as `winpipe.rs` had guessed; it is
+a link to the PDO. The ivshmem devices, by contrast, admit Everyone (R32 quotes
+their descriptor), which is why §90.3 saw them open at medium.
+
+**The options.**
+
+| option | verdict |
+|---|---|
+| descriptor on the two port PDOs | **chosen**: no resident component, one account, medium and up, survives reboots through the PnP property |
+| doorbell on the ivshmem device (`ivshmem-doorbell`; the Looking Glass driver has `IOCTL_IVSHMEM_RING_DOORBELL` and event registration) | needs the VM reconfigured and restarted and an `ivshmem-server` on the host |
+| a guest service owning the ports, relaying over an ACL'd pipe | a new resident component, a hop per wake, and the same grant as a pipe ACL |
+| an elevated launcher | a UAC prompt per click, and an administrator token for the session |
+
+**The fix**, `scripts/wc-port-access.ps1` (`show`, `apply`, `revert`, `install`,
+`uninstall`). It sets
+`D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;<SID>)S:(ML;;NWNR;;;ME)` both as the
+device's PnP property (`SPDRP_SECURITY_SDS`, applied by PnP at every device
+start) and on the live device object (`SetSecurityInfo` on a handle). `install`
+also copies itself to `C:\Program Files\waycompose` and registers the SYSTEM
+task `waycompose port access`, which runs `apply` at every startup and finds the
+ports by name. `wc-launch.sh deploy` runs `install -User <guest-user>`
+(`WC_LAUNCH_PORT_ACCESS=skip` leaves the guest alone). R32 is the security
+argument.
+
+**Applied on testhost's guest at 05:34** (`docs/medium-il/port-access.txt`):
+both live descriptors and both PnP properties read back as the new one, with
+<guest-user>'s SID `S-1-5-21-2794265523-3702185664-1359551570-1001`. Then, from
+`docs/medium-il/probe.txt`:
+
+| token | `CreateFileW(GENERIC_READ\|GENERIC_WRITE)` on each port |
+|---|---|
+| session 1, scheduler `Limited` run level: `S-1-16-8192`, not elevated | opened |
+| a Low-integrity copy of that token | error 5 |
+| ssh, the administrator's token | opened |
+| a Low-integrity copy of the administrator's token | error 5 |
+
+**What was not tested:** a reboot, and a vioser update. The PnP property is the
+documented mechanism for both (the PnP manager applies a device's `Security`
+property to its device objects when it starts the device), and the startup task
+applies the descriptor whatever PnP does. Restarting a port's device to prove it
+was not done: vioser creates a port's symbolic link from a work item when the
+host names the port, and a restarted PDO might come back without it until the
+next boot.
+
+**A worry, tested and retired.** vioser's create handler answers a second open
+of a held port with `STATUS_OBJECT_NAME_EXISTS`, which is a success code, and its
+close handler then clears `GuestConnected` and tells QEMU the guest closed the
+port. If a second open reached it, opening a held port even for `READ_CONTROL`
+would cut the holder's host-to-guest wakes. It cannot reach it: vioser also sets
+`WdfDeviceInitSetExclusive`, and the I/O manager refuses the second open. A
+process that held `wcbell.0` and asked vioser (`IOCTL_GET_INFORMATION`) before
+and after another process's `READ_CONTROL` open read `guest_connected=1` both
+times, and the second open failed with error 5. So `wc-port-access.ps1` can run
+beside a session. A held port keeps its live descriptor until it is free, and
+the tool says so.
+
+### 91.3 The fallback that took minutes
+
+§90.3's medium-integrity session had its window 4.5 minutes after the click. Two
+causes, both fixed.
+
+**A timer tick per rung.** `Futex::first_slice` says the guest's first rung is
+1 ms. Measured on the guest with a 40-sample loop: `WaitOnAddress` with a 1 ms
+timeout returns after p10 15.51, p50 15.98, p90 16.22 ms; 2 ms and 8 ms timeouts
+return after the same. The timeout is rounded up to the 15.625 ms tick in a
+process that has not raised the timer resolution, and none of ours does
+(`tick.rs`). With a doorbell this is invisible, because a delivered wake ends the
+wait. Without one, every rung of every guest wait was a tick, a forwarded call
+cost two ladders of 16-31 ms, and Firefox's GPU process came up so slowly that
+its EGL setup failed and WebRender fell back to software. The fix is
+`park::sleep_the_rung`. On Windows, in a process with no cross-VM doorbell, a
+rung shorter than a tick is a `std::thread::sleep`, which is a high-resolution
+waitable timer since Windows 10 1803 (0.57 ms for a 100 µs request and 1.58 ms
+for 1 ms, on the same guest). Nothing on that kernel would have rung the word
+anyway. With a doorbell nothing changes.
+
+**Ten seconds of retrying access denied.** `open_virtio_port` retried every
+failure for 10 s, because a hot-added port appears a moment after QEMU adds it.
+That port is `ERROR_FILE_NOT_FOUND`. Access denied is a descriptor or a holder,
+and neither changes in 10 s, so it now retries for 1 s, and the error names both
+causes and the script. §90.3's `gpu ok … (10378 ms)` and most of its 12.7 s cold
+start were this.
+
+The measurement of the fallback after the fix is in 91.7.
+
+### 91.4 The harness clicks like a double-click
+
+`runint.ps1` takes `-RunLevel`. `wc-launch.sh`'s clicks (and the native
+Firefox measurement) use `Limited` unless `WC_LAUNCH_CLICK=elevated`. That is
+the filtered medium token in session 1 that Explorer uses. `wc-launch.exe` logs
+`token: medium integrity (S-1-16-8192), not elevated` (or what it got) once per
+launch, and the cold leg checks three things: that the token is a double-click's,
+that the Wayland connections are on the rings (`transport rings:`, no
+`SSH FALLBACK`), and with a GPU that the GPU side has its doorbell.
+
+Two harness bugs turned up while running a second installation beside the
+deployed one. `--stop`, `--ping` and `--install` were sent without
+`--session-name`, so they acted on the default session `wcl`, which is the
+deployed installation a person uses. `kill_host_firefox` killed every process
+matching `wc-launch/firefox`, which includes the deployed profile, and
+`WC_LAUNCH_FRESH` deleted `~/.wc-launch/firefox` whatever profile the run used.
+All of them now use the installation's own session and profile.
+
+### 91.5 Bug 2: the caption buttons
+
+The window extends DWM's frame into its client area, makes the caption-button
+strip transparent in `WM_PAINT`, and lets DWM draw the buttons behind it (§82).
+`DefWindowProc` answers `WM_SETTEXT`, `WM_SETICON` and `WM_NCACTIVATE` by painting
+the caption it believes the window has, synchronously and outside `WM_PAINT`,
+into that strip. The strip turns opaque, the buttons behind it disappear, and
+hit testing still finds them. They come back when a later paint's damage covers
+the strip, which is why navigations brought them back. Every capture in §90.6
+that lost them was of a page that retitles itself several times a second (the
+scroll counter, the video clock), and the compositor forwards each title with
+`SetWindowTextW`. That the losses were all maximised follows from the order of
+§90's run: every retitling page was shown after the window was maximised.
+
+The fix is what WPF's `WindowChrome` does for this frame. For a folded window,
+`WM_SETTEXT` and `WM_SETICON` go to `DefWindowProc` with `WS_VISIBLE` cleared for
+the call (`defproc_without_caption_paint`), and `WM_NCACTIVATE` goes with
+`lParam` -1, which tells it not to repaint the non-client area. After each, the
+strip is invalidated, so the next `WM_PAINT` clears it again whatever drew there.
+
+### 91.6 Bug 3: the second window's size and place
+
+**The size.** `map_window` shows the window and then sizes it to the client's
+first commit. `ShowWindow` on a `CW_USEDEFAULT` window sends a `WM_SIZE` with the
+cascade's default size, and the `SetWindowPos` sends one with the committed
+size. `on_size` turned each into an `xdg_toplevel.configure` with that size.
+A configure with a size is an instruction. Firefox commits a first geometry
+before it has read its saved one (252x304 for the second window, 516x128 for the
+medium session's first), was told that size back, and kept it. Nothing on the
+Win32 side followed a later commit either. This is also the "configured twice at
+map" that the stage-38 comment in `map_window` could not explain.
+
+Now `placing` covers the map's `ShowWindow` and `SetWindowPos`, `on_size` reports
+nothing inside it, and `settle_placement` decides afterwards: a client that got
+what it committed hears nothing, and one the work area shrank gets one configure
+with the size it got. While a toplevel has never been configured with a size
+(no user resize, maximise or fullscreen), a commit at a new window geometry is
+the client choosing again. `state.rs` sends `ToUi::Resize` and the window
+follows (`follow_client_size`), except during the user's own move or size loop
+and while maximised or minimised. `xdg_toplevel.set_min_size` and `set_max_size`
+reach Win32 as `ToUi::SizeHints` and are answered in `WM_GETMINMAXINFO`, before
+the first placement.
+
+The maximise configure used to inherit its size from the configure every window
+got at map. It now carries the size of where the window's popups may go (the
+monitor's work area on Windows, the output headless), and the `WM_SIZE` that
+follows corrects it.
+
+**The place.** The origin was read before `ShowWindow`, when a `CW_USEDEFAULT`
+window has no position yet, and the work-area fit clamped that placeholder to the
+work area's top-left corner. The `SetWindowPos` then moved the window there, over
+the cascade position Windows had just chosen. It is now read after `ShowWindow`,
+so a new window opens where Windows' cascade puts it, fitted to the work area.
+
+**What Firefox commits, traced.** With `WAYLAND_DEBUG` against the Linux build:
+a window Firefox opens maximised (a new window from a maximised one, or a fresh
+profile on a small screen) sends `set_maximized` *before its first commit*. The
+compositor answered with a maximised configure carrying 0x0, and GTK then
+commits its own fallback, 252x304: that is §90.7's number. On win32,
+`set_window_state` then maximised a window that had never been shown, and
+`map_window`'s `SW_SHOWNORMAL` restored it at 252x304. Now a request that
+arrives before the map is kept (`maximize_at_map`) and the map shows the window
+with `SW_SHOWMAXIMIZED`, whose `WM_SIZE` gives the client the work area as its
+size.
+
+**Two more, found on the guest with a fresh profile.**
+- Firefox's first commit there is a 1x1 geometry. Windows will not make an
+  overlapped window smaller than its minimum track size (166x47 at 125%), and
+  `settle_placement` first reported that larger size as a configure, which took
+  the size away from Firefox: the window stayed 148x38. A placement larger than
+  the commit is now not reported; only a smaller one is.
+- Firefox then commits 500x120, which is exactly its own `set_min_size`. With no
+  saved geometry Firefox sizes a window from `screen.availWidth`/`Height` (90%,
+  at most 1280x1040), and on the guest those are not known yet when the window
+  is made. A resizable toplevel with no parent, still choosing its size, whose
+  commit is exactly its minimum, has chosen nothing. The compositor configures
+  it to Firefox's own rule against the work area it is on and resizes the window
+  to match. Dialogs, fixed-size windows (min = max) and any other size are left
+  alone. This is also §90.3's medium first window, 516x128 with its frame.
+
+**Tests.** The headless stand-in sent a `Resized` at map to mirror win32 and no
+longer does (`showing_a_window_does_not_tell_it_its_own_size_back`).
+WLCS headless: `XdgToplevelStableConfigurationTest.defaults`, which expects no
+size in the first configure and failed on both legs before (the old comment in `control.rs` said so), now passes, and
+`window_can_maximize_itself` still passes.
+
+### 91.7 On the guest
+
+All in session 1 unless it says otherwise. The evidence is in `docs/medium-il/`.
+
+**<guest-user>'s own double-click, 05:48, on the deployed `wcivs`** (unchanged binaries,
+21 minutes after the port descriptor was applied; `double-click-<guest-user>.txt`).
+`wc-launch.exe`'s parent was `explorer.exe`, and it and all three of its children
+ran at `S-1-16-8192`, not elevated. The log: `wayland rings: 32 connection
+slots…, doorbell org.sirati.wcbell.0`, `doorbell attached on
+\\.\Global\org.sirati.svbell.0`, `cold start: 1394 ms`, `CLICK-TO-WINDOW 3173 ms`.
+Firefox's log had no `Fallback WR to SW-WR`, and the GPU side served it six ICD
+sessions. §90.3's double-click: no rings, no doorbell, a 12.7 s cold start, and
+the window about 4.5 minutes after the click.
+
+**The harness's medium click on the test install `wcmil`** (`medium-click.txt`).
+`cold: the click ran as a double-click does: medium integrity (S-1-16-8192), not
+elevated`, the rings and both doorbells up, `cold start: 3111 ms`,
+`CLICK-TO-WINDOW 6003 ms`. Earlier runs of the same leg, while the window-size
+work was in progress: 5093, 4000 and 4276 ms. The profile was new at the first
+of them and never had a saved window size. Firefox opened on `about:support#graphics-features-tbody`, and a
+visual check of the window capture (`about-support-medium.png`) read Compositing
+`WebRender` and WebGL 1 renderer
+`Mesa -- zink Vulkan 1.4(Intel(R) UHD Graphics (Driver Unknown))`, with no row
+saying software. The black strips at the capture's right and bottom edges are
+the frame area of a `PrintWindow` capture, not the product's pixels.
+
+**The window's size, with that new profile.** Firefox's first commit is 1x1 and
+its second 500x120, its own minimum. The compositor configured 1152x676 (90% of
+the 1280x752 work area, §91.6), and the window followed to 1168x684 at 104,68.
+
+**The fallback after the fix**, session 0, `wcmil` with both bells emptied from
+its ini, so that nothing had a doorbell: `cold start: 2319 ms`,
+`CLICK-TO-WINDOW 5251 ms`. Firefox's log had no software fallback, and the GPU
+side served three ICD sessions without one.
+
+**What was not run on Windows, and why.** The caption buttons (91.5) and the
+dialogs (91.8) need input on the desktop: a page to retitle, the window
+maximised, Ctrl+O, Ctrl+S, Ctrl+P, a drag. <guest-user>'s session was locked from 06:38
+(another agent's test sent Win+L), and the rule is then no session-1 input at
+all. Both rest on the measurements and arguments in their sections: for 91.5
+the cause and the WPF precedent, for 91.8 the frame dumps on the Linux build
+of the same `state.rs`. Neither has been seen on Windows yet. A pre-map
+maximise was tried as a second window opened from a maximised one. It did not
+get that far, see the next paragraph.
+
+**A GPU fault, recorded for whoever owns the GPU side.** At 06:58:21 the agent
+maximised the test window (`ShowWindowAsync`, while the session was locked).
+Two seconds later Firefox's GPU process printed
+`ZINK: vkCreateBufferView failed (VK_ERROR_DEVICE_LOST)` and died of `SIGSEGV`
+(crash report `5fa27af5-…` in the profile's `Crash Reports/pending`). The
+System log has no display-driver reset (no event 4101), the VM stayed healthy,
+and the journal shows the passed-through iGPU cycling D0/D3 about every 20 s
+while the session was locked (50 transitions from 06:40 to 06:59). §90 maximised
+the same window on an unlocked desktop with no fault. Not investigated further:
+it is a GPU-side fault and no more GPU work was run while the screen was locked.
+
+**Two harness bugs this run also found** (fixed, 91.4) and two it did not fix:
+- `wc-launch.exe --install` hung for minutes at the end of the `icon` reply.
+  The host had answered, and `ssh.exe` never exited after writing about 17 KB
+  of base64 to its output file. The test install got its shortcut by hand.
+- `shot` also photographs the whole desktop for the shortcut's icon. A capture
+  of <guest-user>'s screen was taken that way at 06:18, and was deleted unviewed and
+  uncommitted; the window captures here use `wc-desk shot --pid` only.
+
+### 91.8 GTK's dialogs under Windows' caption buttons
+
+Reported by the user from real use: in Firefox's Ctrl+O file chooser, the
+*Open* button, at the right end of the GTK header bar, sat behind Windows'
+caption buttons. The compositor's default `auto` folds the caption of every
+window whose client asked to draw its own title bar, and GTK's dialogs (the file
+chooser, Save As, Print) ask exactly as Firefox's main window does. Only the main
+window had its corner reserved, by the launcher's `userChrome.css` (§82). The
+user's ruling: keep folding the dialogs, and make GTK leave the corner empty.
+
+**The fix.** `plan::gtk_css` renders a `gtk.css` with
+`headerbar { padding-right: <reserve>px; }` at the same reservation as the tab
+strip's (146, 183 and 219 px at 100, 125 and 150%), and square top corners,
+because the window is opaque to GDI and the pixels outside a rounded corner
+were drawn black. The launcher sends it to `wc-session run` as a seventh word,
+next to the `userChrome.css`. `wc-session` gives the application a
+session-private `XDG_CONFIG_HOME`, because GTK 3 and 4 read `gtk.css` and
+`settings.ini` from `$XDG_CONFIG_HOME/gtk-{3,4}.0` and the user's own
+`~/.config` is not the launcher's to write. The private directory is an overlay.
+Every entry of the real one is a symbolic link back to it, and only `gtk.css`
+(which imports the user's own first) and `settings.ini` (the user's, with
+`gtk-decoration-layout=:` so a GTK window draws no window buttons of its own)
+are replaced. A bare private directory was tried first and was wrong: the file
+chooser's sidebar lost Documents, Downloads and the other user folders
+(`user-dirs.dirs`), its bookmarks (`gtk-3.0/bookmarks`) and the icon theme
+(dconf). On testhost the overlay also keeps `~/.config/mozilla` and
+`fontconfig` reachable. A file an application creates at the top of the
+directory lands in the overlay and is gone with the session.
+
+**Measured** with Firefox 157 against the Linux compositor in `auto`, frame dumps
+of the dialog (`docs/medium-il/gtk-dialogs/run.sh`; a page whose only element is
+a full-window file input, a download link with downloads set to ask where, and
+a print button with `print.prefer_system_dialog`, each opened by a scripted
+click). The colours in the rightmost 146 columns of the header bar's rows, where
+Windows draws its buttons:
+
+| dialog | without the sheet | with it |
+|---|---|---|
+| Open (file chooser), 1096x869 / 1231x949 | 179 (Search and Open) | 2 (header background) |
+| Save As, 1231x949 | 181 (Search and Save) | 2 |
+| Print, 614x505 | 92 (Print) | 2 |
+
+A visual check of the six frames: with the sheet, Open and Save end at x=1084
+of 1231 and Print at x=467 of 614, each exactly at the boundary; no dialog has a
+GTK close button either way; the overlay variant's sidebar lists the same places
+with the same icons as the unmodified one. The header bars are in
+`docs/medium-il/gtk-dialogs/*-headerbar.png` (cropped to the bar, because the
+full frames show this workstation's volumes and printers). `about:preferences`'
+file pickers are the same `GtkFileChooser`. The `settings.ini` and a GSettings
+keyfile arm measured identically, so the layout override is not needed for these
+three dialogs, which show no window buttons in either case; it stays for GTK
+windows that would. The measurement on the guest is in 91.7.
+
+### 91.9 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | **2852 passed, 0 failed**, 8 ignored (master: 2848); new: `only_a_windows_wait_with_no_doorbell_sleeps_its_short_rungs`, `the_labels_a_launch_meets_have_their_windows_names`, `showing_a_window_does_not_tell_it_its_own_size_back`, `the_gtk_sheet_pads_the_header_bar_by_the_caption_buttons` |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this branch changed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-wlcs.sh headless` | **429 passed, 37 failed, 759 skipped** (§85: 428, 38); `XdgToplevelStableConfigurationTest.defaults` passes |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-xref.sh --list` | 1207 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | **13 passed, 0 failed** (§90's 12, and the port access) |
+
+### 91.10 What is deployed, and the way back
+
+| where | what |
+|---|---|
+| the guest's two port devices | the descriptor of 91.2 for <guest-user>'s SID, live and as the PnP `Security` property; `C:\Program Files\waycompose\wc-port-access.ps1` and the SYSTEM task `waycompose port access` (at startup). **Way back:** `wc-port-access.ps1 -Action uninstall` with no session up restores `D:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(ML;;NW;;;LW)`, removes the property, the task and the copy |
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-91` and `~/wc-launch-ivs-backup-91`, then `wc-launch.sh deploy` from this branch (master merged, so the ICD without `VK_EXT_external_memory_host`) with §88.6's variables: 13 passed (`deploy-91.txt`) |
+| changed | `wc-launch.exe` `22c7fdf1…` to `91a62e28…`, `sv-guest.exe` `b458eb1b…` to `9f62c1c9…`, `wc-session`, `wc-proxy`, `wc-arena-host`, `sv-hostd`, and `libsv_icd.so` `e71f5a89…` to `53632f4e…` (the same ICD source as master, built in this worktree); `runint.ps1`; new `wc-port-access.ps1` |
+| unchanged | `wc-desk.exe`, `probe-relay.exe`, `click.ps1`; the ini and `gpu.env` byte-identical |
+| the test install `wcmil` | left installed and stopped (`C:\Users\<guest-user>\wcmil`, `~/wc-launch-mil`, profile `~/.wc-launch/firefox-mil`), with no desktop shortcut; its agent and scheduled tasks are removed |
+
 ## 92. Pinning Linux applications to the taskbar, and their jump lists
 
 Branch `taskbar-pins`, 2026-10-16. The brief: a Linux application can be
@@ -28344,11 +28713,11 @@ the list every `refreshInSeconds`, so the Frequent pages follow the history.
 
 ### 92.6 The security argument
 
-docs/security-model.md R32, in short: the guest names a desktop id and an
+docs/security-model.md R33, in short: the guest names a desktop id and an
 action id, or a URL, and never a command. The host builds the argv from its
 own desktop entry, checks the program against the entry's and the launcher's,
 and runs it as an array. URLs are `http`, `https` or `file:///` only, one
 word, and go into the slot the entry's `%u` marks. **What it does not close is
 `run`**, which has carried a whole command line from the guest since §28. A
-holder of the guest's key could already run any program as `sirati`. R32
+holder of the guest's key could already run any program as `sirati`. R33
 records it, and what closing it would take.

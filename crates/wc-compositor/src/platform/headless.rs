@@ -553,6 +553,17 @@ impl PumpInner {
                     );
                 }
             }
+            // §91: the window follows its client's own size, as win32's does.
+            ToUi::Resize { id, width, height } => {
+                if let Some(w) = windows.get_mut(&id) {
+                    w.surface = (width, height);
+                    println!("wc-compositor: window {id} follows its client to {width}x{height}");
+                }
+            }
+            ToUi::SizeHints { id, min, max } => println!(
+                "wc-compositor: window {id} size hints: min {}x{}, max {}x{} (0 = none)",
+                min.0, min.1, max.0, max.1
+            ),
             // §45.11. There is no window rectangle here to move — `control.rs`
             // owns positions on this platform and derives the corner from the
             // window's `content_offset` directly, so it already knows. Logged

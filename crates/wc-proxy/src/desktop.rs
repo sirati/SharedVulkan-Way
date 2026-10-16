@@ -29,7 +29,7 @@
 //!
 //! A frequent-page item is the same: the guest sends a URL, never an argv, and
 //! the URL becomes one argument in the slot the entry's own `%u` marks.
-//! docs/security-model.md R32 has the argument in full.
+//! docs/security-model.md R33 has the argument in full.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

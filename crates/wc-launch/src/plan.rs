@@ -376,6 +376,43 @@ pub fn user_chrome_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
     ))
 }
 
+/// The first line of the GTK sheet this launcher writes (§91.8).
+pub const GTK_CSS_MARK: &str = "/* wc-launch: GTK windows under Windows' caption.";
+
+/// The `gtk.css` for [`Titlebar::Tabs`], or `None` for the others.
+///
+/// §91.8. The compositor folds Windows' caption into every window whose client
+/// draws its own title bar, and that includes the GTK dialogs Firefox opens
+/// (the file chooser, Save As, Print): their header bar is the caption. Only
+/// Firefox's main window had its right-hand corner reserved, by
+/// [`user_chrome_css`], so a dialog's rightmost buttons (the file chooser's
+/// *Open*) sat under Windows' minimise, maximise and close. This pads every
+/// header bar's end by the same reservation. `headerbar` is the node name in
+/// GTK 3.20 and later and in GTK 4. The top corners are squared because the
+/// window is opaque to GDI, so the transparent pixels outside a rounded corner
+/// were drawn black.
+///
+/// Measured with Firefox 157's GTK3 file chooser on the Linux compositor
+/// (frame dumps): without the sheet, the rightmost 146 columns of the header
+/// bar hold Search and Open; with it, Open ends 146 px from the edge and those
+/// columns are header-bar background.
+pub fn gtk_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
+    if t != Titlebar::Tabs {
+        return None;
+    }
+    Some(format!(
+        "{GTK_CSS_MARK} Written on every start; edits are lost.\n\
+         \x20  See docs/waycompose-design.md §91.8. Windows draws minimise, maximise and close\n\
+         \x20  in the rightmost {r} px of a folded caption; a header bar leaves them empty. */\n\
+         headerbar {{\n\
+         \x20 padding-right: {r}px;\n\
+         \x20 border-top-left-radius: 0;\n\
+         \x20 border-top-right-radius: 0;\n\
+         }}\n",
+        r = fit.reserve,
+    ))
+}
+
 /// The application's `user.js`: the arrangement's preferences, then its own.
 pub fn app_user_js(t: Titlebar, prefs: &str) -> String {
     user_js(&format!("{};{prefs}", t.prefs()))
@@ -694,6 +731,19 @@ mod tests {
         assert!(css.contains("--tab-min-height: 45px") && css.contains("min-width: 219px"), "{css}");
         assert_eq!(user_chrome_css(Titlebar::None, TitlebarFit::at(96, None)), None);
         assert_eq!(user_chrome_css(Titlebar::Client, TitlebarFit::at(96, None)), None);
+    }
+
+    /// §91.8: the GTK sheet pads every header bar by the same reservation as
+    /// the tab strip's, at each of §82's three scales.
+    #[test]
+    fn the_gtk_sheet_pads_the_header_bar_by_the_caption_buttons() {
+        for (dpi, px) in [(96, 146), (120, 183), (144, 219)] {
+            let css = gtk_css(Titlebar::Tabs, TitlebarFit::at(dpi, None)).unwrap();
+            assert!(css.starts_with(GTK_CSS_MARK), "{css}");
+            assert!(css.contains(&format!("headerbar {{\n  padding-right: {px}px;")), "{dpi}: {css}");
+        }
+        assert_eq!(gtk_css(Titlebar::None, TitlebarFit::at(96, None)), None);
+        assert_eq!(gtk_css(Titlebar::Client, TitlebarFit::at(96, None)), None);
     }
 
     /// Tabs turns Firefox's three buttons off and stylesheets on; the
