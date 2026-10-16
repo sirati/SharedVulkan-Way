@@ -316,7 +316,9 @@ scripts/
                      docs/stage14/
   wc-session         the VM host's half of stage 14, and the **forced command**
                      of the guest's ssh key there: the guest can open a session
-                     and start applications and cannot get a shell
+                     and start the applications the host defines in apps.ini,
+                     by id, and cannot send a command line (waycompose-design.md
+                     §94; tested by crates/wc-launch/tests/wc_session.rs)
   gen-keymap.sh      RMLVO -> keymap string, on Linux, at build time (and why)
   probe-xkb.c        the C half of wc-xkb.sh
   wc-worktree.sh     reflink-seeded worktrees (read the comments before changing)

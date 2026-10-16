@@ -29349,3 +29349,78 @@ there too, because master has no `apps.ini`.
 Also new: `plan::launch_verb` and `plan::host_files` with their tests,
 `config` tests for the refused keys and `host-app`, and
 `desktop::options_end_at_the_first_word`.
+
+### 94.6 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **102 binaries, 2924 passed, 0 failed**, 8 ignored (master 2908). New: `wc_session` (15), `launch_verb`, `host_files`, the deploy's `middlemouse.paste` pin, `desktop::options_end_at_the_first_word`, two `config` tests; removed: four tests of the guest-side `exec`, `titlebar` and `profile_dir` |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-xref.sh --list` (and `design_citations`) | 1209 citations resolve, 0 missing |
+| `wc-launch.sh deploy` (`wcivs`) | **16 passed, 0 failed** (`docs/run-appid/deploy-94.txt`): §93's 13, and the Linux `wc-launch`'s freshness, its byte identity on the host, and `wc-session apps` |
+
+### 94.7 What is deployed, and how it was checked
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-94` and `~/wc-launch-ivs-backup-94` (with `authorized_keys.pre-94`), then `wc-launch.sh deploy` from `7b55f47` with §91.10's variables: 16 passed |
+| changed | `wc-session` `160c5016…` to `a15c69d2…`; `wc-launch.exe` `6bc8a26d…` to `e6c6afef…`; `wc-proxy` `7ac8cf09…` to `ead9f7e5…`; `libsv_icd.so` `6bf828e8…` to `8d40513f…` (the same ICD source, built in this worktree); new: `bin/wc-launch` `8f61371f…` (the renderer) and `apps.ini` (94.2's text, with `exec` the readback Firefox); the ini's `[app.firefox]` is now `title`, `host-app`, `desktop`, `icon` |
+| unchanged | `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe`, the `.ps1` files, `wc-arena-host`, `sv-hostd`, `sv_icd.json`; the ini's `[session]`, `gpu.env` and `authorized_keys` byte-identical |
+| the other installations | `~/wc-launch`, `~/wc-launch-gpu`, `~/wc-launch-mil`, `~/wc-launch-clip`, `~/wc-launch-pins` each have a key in `authorized_keys`, and the private halves of five of them are on the guest (`wclaunch`, `wcgpu`, `wcmil`, `wcclip`, `wcpins`). Their `wc-session` was each an older copy that ran a command line, so the gap was open through every one of them. Each now has this branch's `wc-session` (the old one beside it as `wc-session.pre-94`) and no `apps.ini`, so every launch through them is refused until that installation is redeployed; `ping` through `wcclip`'s guest key answers and its old-form `run` is refused |
+
+**Session 0, no desktop input** (`docs/run-appid/session0-94.txt`,
+`rawkey-94.txt`). Through `wcivs`'s real key from the guest: `ping`,
+`app firefox light` (the entry, four actions, three task glyphs, the icon),
+`frequent firefox` (Firefox's prefs and the profile's pages) and `icon firefox`
+answer as before; the pre-§94 `app`, `frequent` and `run` shapes, `run … sh`,
+`up … 1;id …`, the guest-RAM `up`, `status ../..`, `apps` and `resolve` are
+refused, and the canary file of the old-form `run` was never made. Then, with a
+temporary definition (`[firefox-t94]` on the host with a fresh profile, `[app.t94]`
+on the guest with its own taskbar identity, so the user's profile and jump list
+were never touched), `wc-launch.exe` in session 0: a cold launch by app id
+(`desktop: 96 dpi, caption 31 px`, `run ok … audio=pulse titlebar=tabs`,
+CLICK-TO-WINDOW 4403 ms), then `--action new-window` (1040 ms),
+`--action new-private-window` (1332 ms), `--action new-tab` and
+`--url https://example.org/` (a tab each, as §92 recorded), and `--stop`.
+Against the live session the old-form `run` with a command line, a base64'd
+program as the app id, `sh`, `--new-window` as an action and as a URL were
+refused. The test profile's `user.js` had the host-rendered prefs and the GPU and
+readback-decode prefs, so `gpu = on` and the readback marker were applied. All of
+it was removed afterwards: both definitions, the Start menu entry, the icon,
+relaunch file, cached answer and jump-list directory, the test aumid's
+`customDestinations-ms` file (the one with `t94` in its links; the user's own list
+had not changed), and the test profile. Last, `wc-launch.exe --refresh firefox`
+rebuilt the user's own jump list through the new `app` and `frequent`:
+`jump list 3 task(s), Häufig: 7 page(s)`.
+
+**Session 1, one click** (`docs/run-appid/session1-pin-94.txt`). With the lease
+held and session 1 unlocked (`WTS_SESSIONSTATE_UNLOCK`; the desktop idle for
+625 s), a one-shot script at the Limited run level sent one left click on the
+taskbar button `Firefox (Linux) angeheftet` and nothing else. A `Mozilla Firefox`
+window appeared 4 s later; the launcher logged `token: medium integrity`, the
+rings, `run ok … titlebar=tabs`, CLICK-TO-WINDOW 4269 ms and
+`jump list 3 task(s), Häufig: 7 page(s)`. The window was left as a click leaves
+it. A first attempt a minute earlier stopped at its own guard without clicking:
+it took Windows 11's resident LockApp, whose threads are all suspended after an
+unlock, for a lock screen. No screenshot of the desktop was taken.
+
+Guest health was checked before and after every guest step; the VM logged no
+fault.
+
+### 94.8 What is not done
+
+1. **The started application is as powerful as its interface**
+   (security-model.md R33): a guest process that can drive the desktop can make
+   Firefox save files, open `file:///` pages or run its Browser Console as
+   `sirati`. The key no longer runs commands; the application it starts can.
+   Running applications as another user or in a sandbox is a product change and
+   is not made here.
+2. **The other installations need a redeploy to launch again**, from this
+   branch (it writes their `apps.ini`); until then they serve every verb but
+   `run`, `action`, `open`, `app`, `icon` and `frequent`. Their keys could
+   instead be removed from `authorized_keys`, which is the owner's decision.
+3. **`/tmp/wc-launch` is shared by every installation** and by any local user
+   who creates it first. That is a host-local concern, not one the guest can
+   reach beyond the session ids, and is unchanged.
