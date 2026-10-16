@@ -29862,15 +29862,16 @@ window and its buttons are unchanged. On the guest: 95.7.
 
 ### 95.7 On the guest after the deploys
 
-Two deploys of `wcivs` from this branch, and a third pending, each `wc-launch.sh deploy` with
-§94's variables after a backup to `C:\Users\<guest-user>\wcivs-backup-95` and
-`~/wc-launch-ivs-backup-95`:
+Three deploys of `wcivs` from this branch, each `wc-launch.sh deploy` with
+§94's variables: the first two after a backup to `C:\Users\<guest-user>\wcivs-backup-95`
+and `~/wc-launch-ivs-backup-95`, the third after one to `wcivs-backup-98` and
+`~/wc-launch-ivs-backup-98`:
 
 | deploy | what changed | result |
 |---|---|---|
 | 13:47 (`deploy-95.txt`) | the two compositor fixes, with master (§96's ICD and `wc-proxy`); 3 x 64 MiB | 16 passed, 0 failed. Not checked on the desktop: <guest-user>'s session had locked at 13:39 from inactivity |
 | 14:00 (`deploy-95b.txt`) | gpu-oom's ICD and GPU-side fixes (50c5571); `gpu-sessions = 2`, `gpu-arena-mib = 112` | 16 passed, 0 failed; checked below |
-| pending | gpu-oom's slot release (c744796); back to 3 x 64 MiB | waits on the VM restart |
+| 20:30 (`deploy-98.txt`), after the VM restart | master d5dbeef: the GPU pool of §97 (`gpu-arena = pool`, 3 sessions, the new 1024 MiB device) in place of fixed slots, the shared doorbell hub of §99, gpu-oom's slot release, and §98's fix for the crash at quit | 17 passed, 0 failed, the hub's check among them |
 
 **After the second deploy** (14:02–14:07, a fresh Sonnet agent, `v1` in
 `actions.txt`):
@@ -29911,14 +29912,15 @@ ours; `WindowFromPoint` there answers our window.
 
 | where | what |
 |---|---|
-| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-95` and `~/wc-launch-ivs-backup-95` (the state §94 left), then the two deploys of 95.7; the third is pending |
-| what each deploy copies | `wc-launch.exe`, `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe` and the ini to `C:\Users\<guest-user>\wcivs`; `wc-session`, `wc-proxy`, `wc-arena-host` and `wc-launch` to `~/wc-launch-ivs` (`deploy-95.txt`, `deploy-95b.txt`). Which of them differ from the backup byte for byte is to be hashed at the final redeploy (pending) |
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-95` and `~/wc-launch-ivs-backup-95` (the state §94 left), then the deploys of 95.7; before the third, again to `wcivs-backup-98` and `~/wc-launch-ivs-backup-98` |
+| what each deploy copies | `wc-launch.exe`, `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe` and the ini to `C:\Users\<guest-user>\wcivs`; `wc-session`, `wc-proxy`, `wc-arena-host` and `wc-launch` to `~/wc-launch-ivs` (`deploy-95.txt`, `deploy-95b.txt`, `deploy-98.txt`). Changed by the third against `-backup-98`: `sv-guest.exe`, `wc-desk.exe`, `wc-launch.exe` and the ini on the guest; `libsv_icd.so`, `sv-hostd`, `wc-arena-host`, `wc-launch`, `wc-proxy` and `wc-session` on the host. It also installs `wc-bell-hub.service` (§99), which was already running and was not restarted |
 | `wc-session` | starts applications with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, so a dismissed crash reporter keeps its minidump |
-| deployed now, to be reverted | the 2 x 112 MiB geometry of the 14:00 deploy (95.4.6), which leaves Firefox's parent without a GPU slot (95.4.10). The pending redeploy goes back to 3 x 64 MiB; by the user's ruling the arena is to be allocated dynamically on the ivshmem device instead, by another agent |
+| replaced | the 2 x 112 MiB geometry of the 14:00 deploy (95.4.6), which left Firefox's parent without a GPU slot (95.4.10): the third deploy has §97's pool, the dynamic allocation on the ivshmem device the user asked for |
 | the guest otherwise | the session-1 agent quit at 14:29. `C:\Users\<guest-user>\wcdc` (its scratch file, captures, and the clipboard kept for the run) stays until the clipboard is put back (pending); the ini's `wayland-bell` restored byte for byte after the fallback session (SHA-256 `2660a039…` before and after) |
 
-**Way back:** copy `wcivs-backup-95` over `wcivs`, and
-`~/wc-launch-ivs-backup-95` over `~/wc-launch-ivs`, with no session up.
+**Way back:** copy `wcivs-backup-98` over `wcivs`, and
+`~/wc-launch-ivs-backup-98` over `~/wc-launch-ivs`, for the state before the
+third deploy (`-95` for the state §94 left), with no session up.
 
 ### 95.10 Gates
 
