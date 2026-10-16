@@ -716,12 +716,15 @@ start_app() {
   fi
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  # §95: a crash reporter that is dismissed deletes its minidump, and four of
+  # §95's crashes left nothing to read. Kept in the profile's minidumps/.
+  KEEP_DUMPS="MOZ_CRASHREPORTER_NO_DELETE_DUMP=1"
   # shellcheck disable=SC2086
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$D/xdg" \
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
-    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS $KEEP_DUMPS \
     "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
     "${DEF_ENV[@]}" \

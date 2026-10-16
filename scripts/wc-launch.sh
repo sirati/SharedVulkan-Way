@@ -147,6 +147,10 @@ esac
 PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-<guest-user>}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
+# §95. Each session slot of the GPU device is 16 MiB of control and this much
+# arena (`gpu-arena-mib`, default 64). Firefox with two windows needs about
+# 53 MiB of arena and 64 MiB leaves it 56: testhost runs 2 sessions of 112.
+GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
 REL_WIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/release"
@@ -487,6 +491,7 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+gpu-arena-mib = $GPU_ARENA_MIB
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 # §89: the Wayland rings' doorbell port; empty sends the Wayland connections
