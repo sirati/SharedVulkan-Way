@@ -2548,8 +2548,9 @@ impl State {
         // no parent that is still choosing and has committed precisely its
         // minimum has not chosen a size; it is configured to Firefox's own rule
         // against the work area this window is on, and the window is resized to
-        // match. A dialog (it has a parent), a fixed-size window (min = max)
-        // and any client that commits anything but its minimum are left alone.
+        // match. A dialog (it has a parent), a fixed-size window (min = max), a
+        // minimum that is a usable size, and any client that commits anything
+        // but its minimum are left alone.
         let mut default_size = None;
         if toplevel
             && client_chooses
@@ -2560,6 +2561,10 @@ impl State {
             && hints.0.1 > 0
             && (w, h) == hints.0
             && hints.1 != hints.0
+            // And degenerate: Firefox's crash reporter commits its minimum,
+            // 600x400, and means it (measured on the guest, where the first
+            // version of this rule enlarged it).
+            && (w < 320 || h < 200)
             && window.role.toplevel().is_some_and(|t| t.parent().is_none())
             && let Some(b) = popup_bounds_of(window)
         {
