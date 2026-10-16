@@ -201,6 +201,12 @@ impl Spec {
         // whose *own* messages it has to walk. No tablet global is advertised,
         // so no client can obtain one to send.
         spec.load(include_str!("../protocols/cursor-shape-v1.xml"))?;
+        // ADDED FOR §96: pointer locks and relative motion, which a game's
+        // mouse-look is made of. Same `wayland-protocols 0.32.12` as the
+        // compositor's smithay. Neither carries an `h` argument; both have to be
+        // walkable or the first `lock_pointer` kills the connection.
+        spec.load(include_str!("../protocols/pointer-constraints-unstable-v1.xml"))?;
+        spec.load(include_str!("../protocols/relative-pointer-unstable-v1.xml"))?;
         Ok(spec)
     }
 
@@ -348,7 +354,9 @@ mod tests {
         // and the object it hands out, which is the shape all four happen to
         // have — taking 32 to 40. STAGE 12's `wp_cursor_shape_v1` has the same
         // shape and takes it to 42.
-        assert_eq!(s.len(), 42, "interfaces: {:?}", s.names());
+        // §96 adds pointer-constraints (three interfaces: the manager, the
+        // locked and the confined pointer) and relative-pointer (two): 47.
+        assert_eq!(s.len(), 47, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,
@@ -514,6 +522,8 @@ mod tests {
             "xdg_activation_v1",
             "zwp_keyboard_shortcuts_inhibit_manager_v1",
             "wp_cursor_shape_manager_v1",
+            "zwp_pointer_constraints_v1",
+            "zwp_relative_pointer_manager_v1",
         ] {
             assert!(
                 s.interface(iface).is_some(),

@@ -114,6 +114,9 @@ windows-sys = { workspace = true, features = [
   # `WM_MOUSELEAVE` at all), `SetCapture`/`ReleaseCapture` (without which a
   # drag off the window loses its release), and `GetKeyboardLayout` (which
   # chooses the keymap).
+  # ADDED FOR §96: raw input (`RegisterRawInputDevices`, `GetRawInputData`),
+  # which is how a locked pointer still reports the mouse's motion.
+  "Win32_UI_Input",
   "Win32_UI_Input_KeyboardAndMouse",
   # ADDED FOR STAGE 20: `GetPointerType` and `GetPointerTouchInfo`, which are
   # the whole of the `wl_touch` source. The `WM_POINTER*` message numbers and

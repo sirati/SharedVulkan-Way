@@ -471,6 +471,9 @@ pub enum ToUi {
         maximized: Option<bool>,
         minimized: Option<bool>,
     },
+    /// §96: `xdg_toplevel.set_fullscreen` (`on`) or `unset_fullscreen`. Borderless
+    /// over the whole monitor on Win32; the size comes back as `Resized`.
+    Fullscreen { id: WindowId, on: bool },
 
     /// The pointer should look like this from now on.
     ///
@@ -479,6 +482,17 @@ pub enum ToUi {
     /// client is using as its cursor, and — from smithay, without any client
     /// asking — on every pointer leave, which is what puts the arrow back.
     Cursor { spec: CursorSpec },
+
+    /// Hold the system pointer for this window, or let it go (`None`).
+    ///
+    /// ADDED FOR §96: `zwp_pointer_constraints_v1`. Sent when the hold changes
+    /// and not otherwise; a `None` names the window that held it. The platform
+    /// is expected to let go **on its own** as well — on losing the keyboard or
+    /// the foreground, before this side has heard — and to take the hold back
+    /// when the window gets them again while the last word here was `Some`.
+    /// A pointer trapped in a window the user has left is the one failure
+    /// this feature must not have, so it is not left to one thread's message.
+    PointerHold { id: WindowId, hold: Option<crate::hold::PointerHold> },
 
     /// `xdg_toplevel.move`: a drag has begun somewhere the client considers a
     /// title bar, and it wants the window manager to take over.
@@ -807,6 +821,13 @@ pub enum FromUi {
     /// The keyboard layout changed under us (`WM_INPUTLANGCHANGE`), naming one
     /// of `crate::input::LAYOUTS`.
     Layout { name: &'static str },
+    /// Motion of the mouse itself, in pixels, while the pointer is locked.
+    ///
+    /// ADDED FOR §96. A locked pointer does not move, so `PointerMotion` has
+    /// nothing to say; on Win32 this is raw input (`WM_INPUT`), registered only
+    /// while a lock is held. It becomes `zwp_relative_pointer_v1.relative_motion`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    PointerRelative { id: WindowId, dx: f64, dy: f64, time: u32 },
 
     // --- the clipboard, §29 -------------------------------------------
     /// The system clipboard changed, and now holds these mime types.

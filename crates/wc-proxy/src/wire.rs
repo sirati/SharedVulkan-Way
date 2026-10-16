@@ -537,7 +537,12 @@ mod tests {
         // `get_tablet_tool_v2` on the manager, `destroy` and `set_shape` on the
         // device — and no events at all, which is what a protocol that only
         // ever tells the compositor something looks like.
-        assert_eq!(checked, 436, "the vendored protocols changed shape");
+        //
+        // 436 to 468 in §96, for `zwp_pointer_constraints_v1` (three interfaces,
+        // eight requests and four events) and `zwp_relative_pointer_manager_v1`
+        // (two interfaces, three requests and one event): sixteen messages,
+        // each walked in both directions, which a game's mouse-look needs.
+        assert_eq!(checked, 468, "the vendored protocols changed shape");
     }
 }
 

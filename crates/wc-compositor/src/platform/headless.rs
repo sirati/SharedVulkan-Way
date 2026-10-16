@@ -639,6 +639,11 @@ impl PumpInner {
             // in the same greppable shape as everything else, so that a harness
             // can assert the request *arrived* — which is the half of the path
             // that lives in `state.rs` and is the half a Linux run can check.
+            // §96. No monitor to cover here; the Wayland side has already put the
+            // state and the output's size in the configure.
+            ToUi::Fullscreen { id, on } => {
+                println!("wc-compositor: window {id} fullscreen {on} (no monitor here)");
+            }
             ToUi::BeginMove { id } => {
                 println!("wc-compositor: window {id} asked the platform to move it");
             }
@@ -667,6 +672,14 @@ impl PumpInner {
             ToUi::Activate { id } => {
                 println!("wc-compositor: window {id} asked to be activated (no foreground here)");
             }
+            // §96. There is no system pointer to clip here: the Wayland half
+            // enforces the hold itself (a locked pointer's positions become
+            // relative motion, a confined one's are clamped), which is what
+            // makes it testable by WLCS. The line is what a harness reads.
+            ToUi::PointerHold { id, hold } => match hold {
+                Some(hold) => println!("wc-compositor: window {id} pointer hold {hold:?}"),
+                None => println!("wc-compositor: window {id} pointer hold released"),
+            },
             ToUi::Destroy { id } => {
                 println!("wc-compositor: window {id} destroyed");
                 windows.remove(&id);
