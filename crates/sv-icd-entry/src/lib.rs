@@ -348,7 +348,25 @@ pub const MAX_PNEXT_LINKS: usize = 256;
 
 /// Map a lowering failure onto a `VkResult`.
 pub fn lower_failed(e: LowerError) -> VkResult {
-    report_failure(e);
+    match e {
+        // A result the implementation chose on purpose (an out-of-date
+        // swapchain, a timeout) is an answer, and a refused stub has its own
+        // once-per-command line ([`not_implemented`]).
+        LowerError::Result(_) | LowerError::NotImplemented(_) => report_failure(e),
+        // Everything else is this ICD failing a call the application made,
+        // and the application's log is the only place it can be seen: Zink
+        // prints "vkCreateBuffer failed" with no result at all. Once per
+        // distinct error, whatever `SV_DEBUG` says (waycompose-design.md §95).
+        _ => report_always(&format_args!(
+            "a call failed in this ICD: {e:?}, returning {}",
+            match e {
+                LowerError::OutOfHostMemory => "VK_ERROR_OUT_OF_HOST_MEMORY",
+                LowerError::OutOfDeviceMemory => "VK_ERROR_OUT_OF_DEVICE_MEMORY",
+                LowerError::DeviceLost => "VK_ERROR_DEVICE_LOST",
+                _ => "VK_ERROR_INITIALIZATION_FAILED",
+            }
+        )),
+    }
     match e {
         LowerError::OutOfHostMemory => VkResult::VK_ERROR_OUT_OF_HOST_MEMORY,
         LowerError::OutOfDeviceMemory => VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -429,7 +447,8 @@ pub fn not_implemented(command: &'static str) {
     report_always(&format_args!("{command} is not implemented in this build"));
 }
 
-fn debug_enabled() -> bool {
+/// Whether `SV_DEBUG` (or `VK_LOADER_DEBUG`) asked for the diagnostic lines.
+pub fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {

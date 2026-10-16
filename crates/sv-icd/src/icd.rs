@@ -839,6 +839,18 @@ impl Icd for SharedVulkan {
                 Err(_) => {
                     // R11: the arena is a fixed pre-negotiated window, and
                     // exhaustion is a normal condition an application handles.
+                    // It is also the one this side can explain and nobody else
+                    // can: Zink says only "couldn't allocate memory: heap=N size=M" and
+                    // WebRender only OutOfMemory, and the GPU side never sees the call.
+                    // So the first one is said, always, with the numbers.
+                    crate::state::say_once(
+                        &crate::state::ARENA_EXHAUSTED_SAID,
+                        &format_args!(
+                            "vkAllocateMemory: the arena is exhausted: {} bytes asked for, {}",
+                            info.allocation_size,
+                            s.arena_use()
+                        ),
+                    );
                     return Ok(p::VkAllocateMemoryReply {
                         result: p::VkResult(
                             sv_icd_entry::VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY.0,
@@ -858,6 +870,9 @@ impl Icd for SharedVulkan {
             id,
             Memory { memory_type_index: type_index, allocation, size, mapped: false },
         );
+        if allocation.is_some() {
+            s.note_arena_use();
+        }
         drop(s);
 
         // docs/design.md §5.2: "When the app side needs a slab it picks a free region
@@ -874,7 +889,19 @@ impl Icd for SharedVulkan {
         if let (Some((slab, slab_size)), Some(t)) = (slab_geometry, self.ring_transport())
             && let Err(e) = t.ensure_slab(slab, u64::from(slab) * slab_size, slab_size)
         {
-            sv_icd_entry::report_failure(e);
+            crate::state::say_once(
+                &crate::state::SLAB_IMPORT_SAID,
+                &format_args!(
+                    "vkAllocateMemory: the GPU side did not import slab {slab}: {e:?}; \
+                     returning VK_ERROR_OUT_OF_DEVICE_MEMORY"
+                ),
+            );
+            // The application gets no handle, so it can never free this one:
+            // give the range back here or it is lost for the session.
+            let mut s = self.state();
+            if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
+                let _ = s.allocator.free_now(a);
+            }
             return Ok(p::VkAllocateMemoryReply {
                 result: p::VkResult(sv_icd_entry::VkResult::VK_ERROR_OUT_OF_DEVICE_MEMORY.0),
                 p_memory: None,
@@ -934,6 +961,7 @@ impl Icd for SharedVulkan {
             // immediate — the honest gap, and the one
             // `ArenaAllocator::free_deferred` is waiting for.
             let _ = s.allocator.free_now(a);
+            s.note_arena_use();
         }
         forwarded
     }
@@ -974,6 +1002,7 @@ impl Icd for SharedVulkan {
             return Err(LowerError::Shape("vkCreateBuffer: no VkBufferCreateInfo"));
         };
         let size = info.size;
+        let usage = info.usage.0;
         let id = {
             let mut s = self.state();
             let id = s.mint();
@@ -995,7 +1024,21 @@ impl Icd for SharedVulkan {
                 },
             )?;
             if reply.result.0 != 0 {
-                self.state().buffers.remove(&id);
+                // The GPU side's answer, forwarded. Zink prints "vkCreateBuffer
+                // failed" with no result and no size, so this is the only line
+                // that can say whose failure it was.
+                let mut s = self.state();
+                crate::state::say_once(
+                    &crate::state::CREATE_BUFFER_FAILED_SAID,
+                    &format_args!(
+                        "vkCreateBuffer: the GPU side returned {} for a {size}-byte \
+                         buffer (usage {:#x}); {}",
+                        reply.result.0,
+                        usage,
+                        s.arena_use()
+                    ),
+                );
+                s.buffers.remove(&id);
                 return Ok(reply);
             }
             return Ok(p::VkCreateBufferReply {

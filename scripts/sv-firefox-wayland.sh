@@ -47,7 +47,7 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/shar
 # nixpkgs, which is the one the system Firefox comes from, so both load one
 # libwayland-client. `SVWL_KOPPER_MESA=none` measures stock Mesa instead.
 KOPPER_MESA=${SVWL_KOPPER_MESA:-}
-if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = probe ]; }; then
+if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = two-windows ] || [ "$MODE" = probe ]; }; then
   KOPPER_MESA=$(nix build --no-link --print-out-paths --impure --expr \
     "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
@@ -213,7 +213,7 @@ say "sv-gpu-server on this machine's RADV"
 # (docs/design.md §0.29 ran `VK_LAYER_LUNARG_api_dump` this way). Word-split,
 # never evaluated.
 read -r -a GPU_ENV <<<"${SVWL_GPU_ENV:-}"
-if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; then
   # **What the GPU side executed, per half minute.** `SV_TRACE` prints every
   # command; a five-minute browser run is millions of lines, so they are
   # counted here rather than kept. A window with queue submissions in it is a
@@ -332,7 +332,7 @@ if [ "$MODE" != x11 ] && [ "$MODE" != soak-x11 ]; then
   say "Mesa for the Wayland platform: ${KOPPER_MESA:-none} (LIBGL_KOPPER_DRI2=${LIBGL_KOPPER_DRI2:-unset})"
 fi
 
-if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = scroll ]; then
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = scroll ] || [ "$MODE" = two-windows ]; then
   # **Firefox in use, for SECS, on the forwarded driver** (docs/design.md
   # §0.27). `sv-firefox-soak.py` drives it through Marionette: a tour of local
   # pages and real sites, wheel-scrolled, with a WebGL page whose frames are
@@ -378,6 +378,14 @@ const x = c.getContext('2d'); let t = 0;
   x.fillStyle='hsl('+((i*7+t)%360)+',80%,50%)'; x.fill(); } requestAnimationFrame(f); })();
 </script>
 HTML
+  # The page from the guest session that ran out of buffers (waycompose-design.md
+  # §95): its title changes ten times a second, so the tab strip and the window
+  # title redraw continuously, and a little text below it does too.
+  cat >"$RUN/pages/retitle.html" <<'HTML'
+<!doctype html><title>sv retitle</title><style>body{font:16px sans-serif;margin:2em}</style>
+<h1 id=h>0</h1><div style="height:3000px;background:linear-gradient(#fff,#f88)"></div>
+<script>let n = 0; setInterval(() => { n++; document.title = 'sv retitle ' + n; h.textContent = n; }, 100);</script>
+HTML
   cat >"$RUN/pages/webgl.html" <<'HTML'
 <!doctype html><title>sv webgl</title><canvas id=c width=800 height=600></canvas>
 <div style="height:3000px;background:linear-gradient(#fff,#8f8)"></div>
@@ -418,7 +426,22 @@ HTML
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
     done ) &
   KIDS+=($!)
+  # `SVWL_STALL_MS=N`: stop the GPU side for N ms every `SVWL_STALL_EVERY`
+  # seconds (default 20), from 30 s on. A `SIGSTOP` stops every thread of it,
+  # its heartbeat too, which is what a guest VM that is not scheduled looks
+  # like from the host (waycompose-design.md §95: the iGPU's D3->D0, a host
+  # with 244 MB free). Each stall is a line in stalls.txt.
+  if [ -n "${SVWL_STALL_MS:-}" ] && [ -s "$RUN/gpu.pid" ]; then
+    ( GP=$(cat "$RUN/gpu.pid"); sleep 30
+      while kill -0 $FF 2>/dev/null; do
+        kill -STOP "$GP"; sleep "$(printf '%d.%03d' $((SVWL_STALL_MS / 1000)) $((SVWL_STALL_MS % 1000)))"; kill -CONT "$GP"
+        echo "t=$(( $(date +%s) - STARTED ))s stopped the GPU side for ${SVWL_STALL_MS} ms" >>"$RUN/stalls.txt"
+        sleep "${SVWL_STALL_EVERY:-20}"
+      done ) &
+    KIDS+=($!)
+  fi
   [ "$MODE" = scroll ] && export SOAK_MODE=scroll
+  [ "$MODE" = two-windows ] && export SOAK_MODE=two-windows
   if [ "$MODE" = scroll ]; then
     CPUFILE="$RUN/cpu.txt"
     ( sleep 25; "$PY" "$ROOT/scripts/wc-cpu-sample.py" "${SVWL_CPU_SECS:-20}" "$CPUFILE" >/dev/null 2>&1 ) &
@@ -440,6 +463,15 @@ HTML
   fi
   ALIVE=0; kill -0 $FF 2>/dev/null && ALIVE=1
   LIVED=$(( $(date +%s) - STARTED ))
+  # `two-windows` ends by closing both windows (§95), so the browser should
+  # now be quitting on its own: give it 30 s, and keep its exit status.
+  QUIT=
+  if [ "$MODE" = two-windows ] && grep -q '"kind": "closed"' "$RUN/soak.jsonl"; then
+    for _ in $(seq 1 $(( ${SVWL_QUIT_WAIT:-30} * 2 ))); do kill -0 $FF 2>/dev/null || break; sleep 0.5; done
+    if kill -0 $FF 2>/dev/null; then QUIT="still running ${SVWL_QUIT_WAIT:-30} s after its last window closed"
+    else wait $FF; QUIT="exit $?"; fi
+    ALIVE=1
+  fi
   shot
   kill $FF 2>/dev/null; wait $FF 2>/dev/null
 
@@ -453,6 +485,12 @@ HTML
     || bad "the driver stopped early (exit $DRIVER): $(grep '"kind": "fatal"' "$J" | tail -1)"
   [ "$ALIVE" -eq 1 ] && ok "Firefox was alive after ${LIVED} s" || bad "Firefox was gone after ${LIVED} s"
   [ "$LIVED" -ge "$SECS" ] && ok "it lived at least the $SECS s asked for" || bad "it lived ${LIVED} s of $SECS"
+  if [ -n "$QUIT" ]; then
+    dumps=$(ls "$RUN/profile/minidumps/"*.dmp 2>/dev/null | wc -l)
+    [ "$QUIT" = "exit 0" ] && [ "$dumps" -eq 0 ] \
+      && ok "closing the last window quit Firefox cleanly (exit 0, no minidump)" \
+      || bad "closing the last window: $QUIT, $dumps minidump(s) in the profile"
+  fi
   if coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -qi firefox; then
     bad "a Firefox process dumped core during the run: $(coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -i firefox | head -3)"
   else
@@ -479,12 +517,24 @@ HTML
   echo "$mapped" | grep -q "mappings=0" || [ -z "$mapped" ] \
     && bad "the parent process did not have libsv_icd.so mapped at every sample: ${mapped:-no samples}" \
     || ok "libsv_icd.so mapped in the parent process at every sample: $mapped"
-  wg=$(grep '"kind": "webgl"' "$J" | tail -1)
-  if echo "$wg" | grep -qi 'zink' && echo "$wg" | grep -q '"frames": [1-9]'; then
-    ok "WebGL drew on Zink: $wg"
-  else
-    bad "WebGL did not draw on Zink: ${wg:-no sample}"
+  if [ "$MODE" != two-windows ]; then
+    wg=$(grep '"kind": "webgl"' "$J" | tail -1)
+    if echo "$wg" | grep -qi 'zink' && echo "$wg" | grep -q '"frames": [1-9]'; then
+      ok "WebGL drew on Zink: $wg"
+    else
+      bad "WebGL did not draw on Zink: ${wg:-no sample}"
+    fi
   fi
+  # waycompose-design.md §95: what the guest session printed before WebRender
+  # gave up, and what this ICD now says about it whatever SV_DEBUG says.
+  FAILS="ZINK: vk[A-Za-z]+ failed|couldn't allocate memory|OutOfMemory|DEVICE LOST"
+  SAID="^sv-icd: (vkAllocateMemory: |vkCreateBuffer: the GPU|transport: .*; returning|blob reserve exhausted|a call failed in this ICD)"
+  fails=$(grep -cE "$FAILS" "$RUN/ff.log")
+  [ "$fails" -eq 0 ] && ok "no Vulkan call failed in Firefox's log" \
+    || bad "$fails Vulkan failure line(s) in Firefox's log: $(grep -E "$FAILS|$SAID" "$RUN/ff.log" | sort | uniq -c | sort -rn | head -6 | tr -s ' ' | tr '\n' ';')"
+  last=$(grep -E "^sv-icd: t=[0-9.]+s arena" "$RUN/ff.log" | tail -1)
+  [ -n "$last" ] && echo "  arena, last SV_DEBUG line: ${last#sv-icd: }"
+  [ -s "$RUN/stalls.txt" ] && echo "  GPU side stopped $(wc -l <"$RUN/stalls.txt") time(s) for ${SVWL_STALL_MS} ms"
   say "---- about:support ----"; grep '"kind": "about-support"' "$J" | tail -1
   echo "run dir: $RUN"
   [ "$fail" -eq 0 ] && say "sv-firefox-wayland soak: PASS" || say "sv-firefox-wayland soak: FAIL"
