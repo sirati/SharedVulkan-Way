@@ -49,10 +49,11 @@ use std::collections::BTreeMap;
 pub enum VoidPolicy {
     /// An offset into the passthrough arena.
     ///
-    /// `pHostPointer` is the interesting one, exactly as §7.4 says: it is
-    /// `VK_EXT_external_memory_host`, and in our design a host pointer *is* an
-    /// arena offset (docs/design.md §5.3). It crosses as a `u64` offset, and the GPU
-    /// side resolves it against its own mapping of the same pages.
+    /// `pHostPointer` was meant to be the interesting one (§7.4): a host pointer
+    /// taken to be arena memory, crossing as a `u64` offset for the GPU side to
+    /// resolve against its own mapping of the same pages. No application passes
+    /// arena memory there, so `VK_EXT_external_memory_host` is withdrawn instead
+    /// (docs/video-decode.md §7.13.5, [`ICD_EXPANDS_ARENA_POINTER`]).
     ArenaOffset,
     /// An opaque token the app side owns and the GPU side never dereferences.
     ///
@@ -148,8 +149,10 @@ pub fn void_policy(owner: &str, field: &str) -> Option<VoidPolicy> {
 /// derived check is not.
 ///
 /// Struct *members* are not covered and do not need to be: a `pNext` chain is
-/// expanded by the same override, and `VkImportMemoryHostPointerInfoEXT`'s
-/// `pHostPointer` is genuinely arena memory by the extension's own contract.
+/// expanded by the same override. `VkImportMemoryHostPointerInfoEXT`'s
+/// `pHostPointer` is a member too, and is not reached because its extension is
+/// withdrawn with `vkGetMemoryHostPointerPropertiesEXT` (docs/video-decode.md
+/// §7.13.5).
 pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
     // `sv_icd::icd::update_descriptor_set_with_template` reads `pData` through
     // the template and emits `VkWriteDescriptorSet`s; the pointer never crosses.
@@ -182,17 +185,20 @@ pub const ICD_EXPANDS_ARENA_POINTER: &[&str] = &[
     // list.
     "vkCmdPushDescriptorSetWithTemplate2",
     "vkCmdPushDescriptorSetWithTemplate2KHR",
-    // Safe for the *other* reason, and the check's first run found it: nothing
-    // expands `pHostPointer` because nothing has to. `VK_EXT_external_memory_host`
-    // is the extension whose entire contract is "this pointer is host memory the
-    // driver will import", and in this design that memory is the arena
-    // (docs/design.md §5.3) — so `arena_base + offset` is not an approximation of the
-    // pointer, it is what the pointer is.
-    //
-    // Listed rather than special-cased in the check, because "the policy is
-    // right here" and "something fixes it up first" are different facts and a
-    // reader should be able to tell which applies to a given line.
-    "vkGetMemoryHostPointerPropertiesEXT",
+    // **`vkGetMemoryHostPointerPropertiesEXT` is no longer listed, and that is
+    // what withdraws `VK_EXT_external_memory_host`** (docs/video-decode.md
+    // §7.13.5). It was here as "safe for the other reason": the extension's
+    // pointer was taken to be arena memory, so `arena_base + offset` would be
+    // what it is. That was never true of the application that uses it. ffmpeg's
+    // `av_hwframe_transfer_data`, which is also Firefox's readback, imports its
+    // own `malloc`ed frame as a host-pointer buffer and copies the decoded
+    // picture into it. The ICD sent that pointer raw, the GPU side handed the
+    // driver NULL, RADV refused NULL (so ffmpeg fell back to a staging buffer,
+    // and every local proof passed), and Intel's Windows driver accepted it: the
+    // copy went into memory the application never sees, and every hardware-
+    // decoded frame on the guest read back as zeros, the green picture of
+    // §7.13.5. Honouring a non-arena pointer needs a bounce through the arena
+    // that nothing implements, so the extension is not promised.
 ];
 
 /// Commands whose `VoidPolicy::NotSerialisable` **parameter** is answered on the
