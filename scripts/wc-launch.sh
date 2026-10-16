@@ -133,6 +133,9 @@ AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # it: the guest's VM needs the GPU arena's ivshmem device (slot WC_LAUNCH_GPU_SLOT,
 # default 0x1d) and, for the doorbell, the port WC_LAUNCH_GPU_BELL; the host user
 # needs the device's group.
+# §97. WC_LAUNCH_GPU_ARENA=pool (the default) has the GPU process lease every
+# session's memory from one pool over the whole device; =slots is §87's fixed
+# slots. With the pool, WC_LAUNCH_GPU_SESSIONS bounds how many run at once.
 # §91. **Which token a click runs with, and the default is a double-click's.**
 # Explorer starts a shortcut with the user's filtered token at medium integrity;
 # until §91 every harness click ran at `-RunLevel Highest`, the administrator's
@@ -492,6 +495,9 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+# §97: one pool over the whole GPU device, leased as each session needs it;
+# `slots` is §87's fixed slots of gpu-arena-mib.
+gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 # §89: the Wayland rings' doorbell port; empty sends the Wayland connections

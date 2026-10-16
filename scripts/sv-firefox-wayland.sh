@@ -56,7 +56,8 @@ fi
 if [ -n "$KOPPER_MESA" ] && [ "$KOPPER_MESA" != none ]; then
   export __EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json
 fi
-RUN=$(mktemp -d /tmp/svwl-XXXXXX)
+# `SVWL_RUNROOT`: where the run directory goes. Large; keep it off a small /tmp.
+RUN=$(mktemp -d "${SVWL_RUNROOT:-/tmp}/svwl-XXXXXX")
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
@@ -64,6 +65,8 @@ DPPX=${SVWL_DPPX:-0.4}
 # what this harness always ran with; Firefox in use outgrows it (docs/design.md
 # §0.27), and 256 MiB is `sv-icd`'s default and `sv-cts.sh`'s.
 ARENA=${SVWL_ARENA:-$((64 << 20))}
+# `SVWL_POOL=BYTES`: every GPU session leases from one pool of this size instead
+# of getting `ARENA` of its own (waycompose-design.md §97), as on the guest.
 XDISPLAY=${SVWL_XDISPLAY:-:78}
 # This machine has Mesa and its ICDs in `/run/opengl-driver` but no
 # `libvulkan.so.1` on the default search path, so both the GPU side and Zink
@@ -230,7 +233,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; th
   # window in which something in Firefox rendered through this driver, which
   # about:support cannot say: its GPU rows come from the `glxtest` probe, not
   # from the context WebRender actually made.
-  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} \
+  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} ${SVWL_POOL:+--pool $SVWL_POOL} \
       --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 240)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" '
@@ -253,7 +256,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; th
   for _ in $(seq 1 40); do [ -s "$RUN/gpu.pid" ] && break; sleep 0.25; done
   KIDS+=($(cat "$RUN/gpu.pid"))
 else
-env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} ${SVWL_POOL:+--pool $SVWL_POOL} --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 fi
@@ -396,6 +399,26 @@ HTML
 <h1 id=h>0</h1><div style="height:3000px;background:linear-gradient(#fff,#f88)"></div>
 <script>let n = 0; setInterval(() => { n++; document.title = 'sv retitle ' + n; h.textContent = n; }, 100);</script>
 HTML
+  # `SVWL_VIDEO=1` (two-windows): the first window plays a 720p H.264 clip in a
+  # loop for the whole run instead of retitling, and says how playback goes in
+  # its title (waycompose-design.md §97: two windows plus a video).
+  if [ "${SVWL_VIDEO:-0}" = 1 ]; then
+    ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
+      -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
+      "$RUN/pages/clip.mp4" || { echo "FAIL: ffmpeg could not make the clip"; exit 1; }
+    cat >"$RUN/pages/video.html" <<'HTML'
+<!doctype html><title>sv video</title>
+<video id=v src="clip.mp4" autoplay muted loop width=960></video>
+<script>
+const v = document.getElementById('v');
+setInterval(() => {
+  const q = v.getVideoPlaybackQuality();
+  document.title = `sv video frames ${q.totalVideoFrames} dropped ${q.droppedVideoFrames} err=${v.error ? v.error.code : 'none'}`;
+}, 100);
+</script>
+HTML
+    export SOAK_VIDEO=1
+  fi
   cat >"$RUN/pages/webgl.html" <<'HTML'
 <!doctype html><title>sv webgl</title><canvas id=c width=800 height=600></canvas>
 <div style="height:3000px;background:linear-gradient(#fff,#8f8)"></div>
