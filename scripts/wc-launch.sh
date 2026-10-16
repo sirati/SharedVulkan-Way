@@ -492,6 +492,7 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+gpu-arena-mib = ${WC_LAUNCH_GPU_ARENA_MIB:-64}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 # §89: the Wayland rings' doorbell port; empty sends the Wayland connections

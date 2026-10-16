@@ -80,6 +80,7 @@ mod imp {
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP,
         HDC, SRCCOPY,
     };
+    use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows_sys::Win32::Storage::Xps::PrintWindow;
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::Win32::System::Performance::{
@@ -135,6 +136,9 @@ usage: wc-desk <command> [options]
                              it: on a guest two worktrees share, the class name
                              alone selects somebody else's compositor.
        --screen              the whole virtual screen, through GetDC(NULL)
+       --visible             crop to what DWM draws (DWMWA_EXTENDED_FRAME_BOUNDS):
+                             without it the picture includes Windows 11's
+                             invisible resize borders, black in a capture
   tick [--samples N]       what Sleep(1), Sleep(5) and a high-resolution
                            waitable timer actually cost (default 20 samples)
   drag --pid N             put a window into Windows' modal sizing loop, grow it
@@ -908,6 +912,44 @@ usage: wc-desk <command> [options]
         Err(std::io::Error::other("shot: need --title, --class, --hwnd or --screen"))
     }
 
+    /// §96: the part of a window capture that DWM actually draws.
+    ///
+    /// `GetWindowRect` on Windows 10 and 11 includes the invisible resize
+    /// borders, 8 px left, right and bottom at 96 dpi, and `PrintWindow` leaves
+    /// them black. The first Minecraft captures on the guest showed exactly that,
+    /// and it looked like a client that did not fill its window. It wasn't one:
+    /// the client area was 854x480, as the game said. `DWMWA_EXTENDED_FRAME_BOUNDS`
+    /// is the drawn rectangle, in physical pixels like the per-monitor-aware
+    /// `GetWindowRect` it is cropped against.
+    fn crop_to_visible(hwnd: HWND, rect: &RECT, cap: Capture) -> std::io::Result<Capture> {
+        let mut ext = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window; the attribute is a RECT and its size is passed.
+        let hr = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                (&mut ext as *mut RECT).cast(),
+                std::mem::size_of::<RECT>() as u32,
+            )
+        };
+        if hr != 0 {
+            return Err(std::io::Error::other(format!("DwmGetWindowAttribute: 0x{hr:08x}")));
+        }
+        let x0 = (ext.left - rect.left).clamp(0, cap.w);
+        let y0 = (ext.top - rect.top).clamp(0, cap.h);
+        let x1 = (ext.right - rect.left).clamp(x0, cap.w);
+        let y1 = (ext.bottom - rect.top).clamp(y0, cap.h);
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut bits = Vec::with_capacity((w * h * 4) as usize);
+        // Bottom-up rows in both: the new bottom row is the old row `y1 - 1`.
+        for j in 0..h {
+            let src_row = (cap.h - y1 + j) as usize;
+            let start = src_row * cap.w as usize * 4 + x0 as usize * 4;
+            bits.extend_from_slice(&cap.bits[start..start + w as usize * 4]);
+        }
+        Ok(Capture { w, h, bits })
+    }
+
     fn cmd_shot(args: &[String], dpi: &Dpi) -> std::io::Result<()> {
         let out = opt(args, "--out").ok_or_else(|| std::io::Error::other("shot: --out is required"))?;
         let (cap, what) = if args.iter().any(|a| a == "--screen") {
@@ -919,7 +961,10 @@ usage: wc-desk <command> [options]
             unsafe {
                 GetWindowRect(hwnd, &mut rect);
             }
-            let cap = capture_window(hwnd)?;
+            let mut cap = capture_window(hwnd)?;
+            if args.iter().any(|a| a == "--visible") {
+                cap = crop_to_visible(hwnd, &rect, cap)?;
+            }
             (
                 cap,
                 format!(
