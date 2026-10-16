@@ -732,21 +732,47 @@ pub fn pump(
         // Deliberately last, and deliberately not counted as traffic: a run
         // whose client has gone quiet should still time out, and the icon
         // connection is chatty exactly once, at the start.
+        //
+        // §93: **a feed that fails is dropped, and the client goes on.** These
+        // used to be `?`, so an error on either side connection ended the
+        // application's own connection: Firefox copied 7 MB, the compositor
+        // refused the selection and closed the clipboard feed, the next write
+        // of the queued chunks was EPIPE, and the `?` closed Firefox's Wayland
+        // socket. Firefox reports a lost display as a crash (§85.3). A feed is
+        // an extra; its failure costs copy and paste, or icons, and nothing
+        // else.
+        let mut icon_failed = None;
         if let Some(link) = icons.as_deref_mut() {
-            if pollfds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                link.on_readable(log)?;
-            }
-            if link.wants_write() {
-                link.on_writable()?;
+            let readable = pollfds[2].revents & (libc::POLLIN | libc::POLLHUP) != 0;
+            let r = if readable { link.on_readable(log) } else { Ok(()) };
+            icon_failed = r.and_then(|()| if link.wants_write() { link.on_writable() } else { Ok(()) }).err();
+        }
+        if let Some(e) = icon_failed {
+            log(&format!("the icon feed failed ({e}); icons stop for this client, the client goes on"));
+            icons = None;
+        }
+        let mut clip_failed = None;
+        if let Some(link) = clip.as_deref_mut() {
+            let readable = pollfds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0;
+            let r = if readable { link.on_readable(log) } else { Ok(()) };
+            clip_failed = r.and_then(|()| if link.wants_write() { link.on_writable() } else { Ok(()) }).err();
+            if clip_failed.is_some() {
+                // Every paste still waiting is answered, so no client is left
+                // blocked on a pipe nobody will write to.
+                link.abandon();
+                for (token, answer) in link.take_answers() {
+                    session.deliver(token, answer);
+                }
+                if let Some(action) = link.take_drag_result() {
+                    session.drag_finished(action);
+                }
             }
         }
-        if let Some(link) = clip.as_deref_mut() {
-            if pollfds[3].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-                link.on_readable(log)?;
-            }
-            if link.wants_write() {
-                link.on_writable()?;
-            }
+        if let Some(e) = clip_failed {
+            log(&format!(
+                "clipboard: the feed failed ({e}); copy and paste stop for this client, the client goes on"
+            ));
+            clip = None;
         }
 
         // A transfer in flight keeps the connection alive. Without this a copy

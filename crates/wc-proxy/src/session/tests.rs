@@ -1886,14 +1886,14 @@ fn a_copy_pulls_the_clients_bytes_out_through_a_pipe_this_side_made() {
 /// A selection this clipboard cannot carry leaves the system clipboard alone.
 ///
 /// Publishing an empty set instead would be *destructive*: a client that copied
-/// an image would silently wipe whatever the user had copied in a Windows
-/// application a moment earlier.
+/// a JPEG (§93: a PNG is carried now) would silently wipe whatever the user
+/// had copied in a Windows application a moment earlier.
 #[test]
 fn a_selection_of_formats_we_cannot_carry_does_not_wipe_the_clipboard() {
     let (mut h, manager, device) = clipboard_harness();
     let source = h.id();
     h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
-    let body = string_body("image/png");
+    let body = string_body("image/jpeg");
     h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
     h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
 
@@ -2049,6 +2049,77 @@ fn a_client_that_never_closes_its_pipe_is_not_a_selection_lost_forever() {
     assert_eq!(pulled.payloads[0].1, b"half a sentence");
     assert_eq!(h.session.stats.copy_timeouts, 1);
     drop(held);
+}
+
+/// §93. The deadline is for a client that went quiet. One that is still
+/// writing when two seconds have passed — a long page's HTML — is waited for,
+/// and published whole, not cut off in the middle.
+#[test]
+fn a_copy_still_being_written_past_the_deadline_is_published_whole() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+
+    let (_, fds) = h.session.take_client_messages();
+    let held = std::fs::File::from(fds.into_iter().next().unwrap());
+    let step = COPY_DEADLINE / 4;
+    let started = std::time::Instant::now();
+    let mut written = Vec::new();
+    while started.elapsed() < COPY_DEADLINE + step * 2 {
+        use std::io::Write as _;
+        let part = format!("part {} ", written.len());
+        (&held).write_all(part.as_bytes()).unwrap();
+        written.push(part);
+        h.session.pump_transfers();
+        assert!(
+            h.session.take_selection().is_none(),
+            "published while the client was still writing, after {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(step);
+    }
+    drop(held);
+    h.session.pump_transfers();
+    let pulled = h.session.take_selection().expect("the EOF published it");
+    assert_eq!(pulled.payloads[0].1, written.concat().into_bytes());
+    assert_eq!(h.session.stats.copy_timeouts, 0);
+}
+
+/// §93. What does not fit in the compositor's cap is left out, the rich
+/// flavour before the text, and a text that cannot fit on its own goes too —
+/// rather than the whole publish being refused with an error that ended the
+/// clipboard feed.
+#[test]
+fn a_selection_too_big_for_the_compositor_keeps_its_text() {
+    let text = ("text/plain;charset=utf-8".to_owned(), vec![b'a'; 60]);
+    let html = ("text/html".to_owned(), vec![b'<'; 80]);
+
+    let (kept, dropped) = fit_selection(vec![text.clone(), html.clone()], 200);
+    assert_eq!(kept.len(), 2, "within the cap nothing is touched");
+    assert!(dropped.is_empty());
+
+    let (kept, dropped) = fit_selection(vec![text.clone(), html.clone()], 100);
+    assert_eq!(kept, vec![text.clone()], "the HTML goes first");
+    assert_eq!(dropped, vec!["text/html (80 bytes)".to_owned()]);
+
+    let (kept, dropped) = fit_selection(vec![text.clone(), html], 50);
+    assert!(kept.is_empty(), "a text larger than the cap cannot be sent at all");
+    assert_eq!(dropped.len(), 2);
+}
+
+/// §93. The cap is the compositor's, written down on both sides; this pins
+/// the two to each other.
+#[test]
+fn the_selection_cap_is_the_compositors() {
+    let theirs = include_str!("../../../wc-compositor/src/clipboard.rs");
+    assert!(
+        theirs.contains("pub const MAX_SELECTION_BYTES: usize = 32 << 20;"),
+        "wc-compositor's MAX_SELECTION_BYTES moved; move session::MAX_SELECTION_BYTES with it"
+    );
+    assert_eq!(MAX_SELECTION_BYTES, 32 << 20);
 }
 
 /// A paste from a **drag** asks Windows for the drag, not for the clipboard.

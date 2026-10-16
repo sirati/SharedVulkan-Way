@@ -18,6 +18,9 @@
  *   probe-clip.exe set-html HTML  put HTML on it, with the CF_HTML header
  *   probe-clip.exe list         the format numbers on it now
  *   probe-clip.exe wait-for S N poll up to N s for text containing S, print it
+ *   probe-clip.exe set-dib W H  put a W x H picture on it as CF_DIB (§93)
+ *   probe-clip.exe wait-dib N   poll up to N s for a CF_DIB; print its size
+ *                               and the size of the "PNG" beside it
  *
  * Exit code 0 on success, 1 if the format is not there, 2 on a usage or API
  * error, so a shell harness can assert without parsing.
@@ -229,6 +232,61 @@ static int set_html(const char *fragment) {
     return rc;
 }
 
+/* §93. A picture, the way Paint puts one there: CF_DIB, a 40-byte header,
+ * 32-bit BI_RGB rows bottom-up, the fourth byte zero (BI_RGB calls it
+ * reserved). Memory row r has R=200, G=80*r, B=40*x, so the image's top-left
+ * pixel -- the *last* row in memory -- is (200, 80*(h-1), 0). */
+static int set_dib(int w, int h) {
+    size_t len = 40 + (size_t)w * h * 4;
+    unsigned char *buf = (unsigned char *)calloc(1, len);
+    BITMAPINFOHEADER *bih = (BITMAPINFOHEADER *)buf;
+    int x, y, rc;
+    bih->biSize = 40;
+    bih->biWidth = w;
+    bih->biHeight = h;
+    bih->biPlanes = 1;
+    bih->biBitCount = 32;
+    bih->biCompression = BI_RGB;
+    bih->biSizeImage = (DWORD)(w * h * 4);
+    for (y = 0; y < h; y++)
+        for (x = 0; x < w; x++) {
+            unsigned char *p = buf + 40 + ((size_t)y * w + x) * 4;
+            p[0] = (unsigned char)(40 * x);
+            p[1] = (unsigned char)(80 * y);
+            p[2] = 200;
+            p[3] = 0;
+        }
+    rc = put(CF_DIB, buf, len);
+    free(buf);
+    return rc;
+}
+
+/* §93. Wait for a picture on the clipboard and describe it: the CF_DIB's
+ * header, and the size of the registered "PNG" beside it (0 if none). */
+static int wait_dib(int seconds) {
+    UINT png = RegisterClipboardFormatW(L"PNG");
+    int i;
+    for (i = 0; i < seconds * 4; i++) {
+        if (open_clipboard()) {
+            HANDLE h = GetClipboardData(CF_DIB);
+            if (h) {
+                const BITMAPINFOHEADER *bih = (const BITMAPINFOHEADER *)GlobalLock(h);
+                HANDLE hp = GetClipboardData(png);
+                unsigned long png_len = hp ? (unsigned long)GlobalSize(hp) : 0;
+                printf("dib %ldx%ld bpp %u png %lu\n", (long)bih->biWidth, (long)bih->biHeight,
+                       (unsigned)bih->biBitCount, png_len);
+                GlobalUnlock(h);
+                CloseClipboard();
+                return 0;
+            }
+            CloseClipboard();
+        }
+        Sleep(250);
+    }
+    fprintf(stderr, "probe-clip: no CF_DIB after %d s\n", seconds);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -255,6 +313,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "set-html") && argc >= 3)
         return set_html(argv[2]);
+    if (!strcmp(argv[1], "set-dib") && argc >= 4)
+        return set_dib(atoi(argv[2]), atoi(argv[3]));
+    if (!strcmp(argv[1], "wait-dib"))
+        return wait_dib(argc >= 3 ? atoi(argv[2]) : 30);
     fprintf(stderr, "probe-clip: unknown command %s\n", argv[1]);
     return 2;
 }

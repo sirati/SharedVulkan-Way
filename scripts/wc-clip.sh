@@ -361,6 +361,37 @@ block_wine() {
     fi
   fi
 
+  # -- pictures (§93) --------------------------------------------------------
+  #
+  # A PNG a Linux client copies goes on as the registered "PNG", byte for byte,
+  # and as the CF_DIB that Paint and every bitmap-only program reads. A CF_DIB
+  # a Windows program puts there comes back as image/png. Both always
+  # reported, for the reason the HTML block gives.
+  local pic="$RUNDIR/pic.png" dib=""
+  magick -size 5x3 xc:'#e03030' "$pic" 2>>"$DIR/copy.log"
+  ( wl timeout 40 wl-copy --type image/png <"$pic" >>"$DIR/copy.log" 2>&1 ) &
+  copier=$!
+  dib=$(clip wait-dib 30)
+  wait "$copier" 2>/dev/null
+  case "$dib" in
+    "dib 5x3 bpp 32 png $(stat -c %s "$pic")"*)
+      ok "a PNG a Linux client copied is on the Windows clipboard as PNG and as a 5x3 CF_DIB" ;;
+    *) bad "image/png did not arrive as PNG + CF_DIB: ${dib:-<nothing>}"
+       grep -iE "clipboard|selection" "$DIR/srv.log" | tail -4 ;;
+  esac
+  if clip set-dib 4 2; then
+    sleep 2
+    wl timeout 25 wl-paste --type image/png >"$RUNDIR/back.png" 2>>"$DIR/paste.log"
+    local said
+    said=$(magick "$RUNDIR/back.png" -format '%w %h %[pixel:p{0,0}]' info: 2>&1)
+    case "$said" in
+      "4 2 "*"200,80,0"*) ok "a Windows CF_DIB came back to a Linux client as image/png, top row first and opaque ($said)" ;;
+      *) bad "the CF_DIB did not come back as the right PNG: ${said:-<nothing>}" ;;
+    esac
+  else
+    bad "probe-clip.exe could not put a CF_DIB on the clipboard"
+  fi
+
   # -- the counters ----------------------------------------------------------
   # One line from a connection that copied and one from a connection that
   # pasted, because the two have different fd counts and §29.4 is an argument

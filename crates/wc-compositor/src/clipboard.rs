@@ -28,6 +28,9 @@
 //!   resolved at runtime there.
 //! * **`CF_HDROP`**, in one direction only, and that asymmetry is argued in
 //!   [`hdrop_to_uri_list`] rather than hidden.
+//! * **Pictures** (§93): the registered `"PNG"` and `CF_DIB`, both ways, as
+//!   `image/png`. A browser, Office and the Snipping Tool put a PNG there;
+//!   Paint and older programs read only the bitmap. See [`dib_from_png`].
 
 /// The generated bindings for `protocols/wc-clipboard-v1.xml`.
 ///
@@ -61,6 +64,10 @@ pub enum SystemFormat {
     Html,
     /// `CF_HDROP`: a `DROPFILES` header and a double-NUL-terminated path list.
     HDrop,
+    /// §93. The registered `"PNG"`: a PNG file, byte for byte.
+    Png,
+    /// §93. `CF_DIB`: a `BITMAPINFOHEADER` and the pixels, bottom-up.
+    Dib,
 }
 
 impl SystemFormat {
@@ -75,10 +82,12 @@ impl SystemFormat {
     /// right that nothing uses it — the same note `platform::PopupBounds`
     /// carries for the same reason.
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub const ALL: [SystemFormat; 3] = [
+    pub const ALL: [SystemFormat; 5] = [
         SystemFormat::UnicodeText,
         SystemFormat::Html,
         SystemFormat::HDrop,
+        SystemFormat::Png,
+        SystemFormat::Dib,
     ];
 
     /// For a log line, so a run says which formats were on the clipboard rather
@@ -88,6 +97,8 @@ impl SystemFormat {
             SystemFormat::UnicodeText => "CF_UNICODETEXT",
             SystemFormat::Html => "HTML Format",
             SystemFormat::HDrop => "CF_HDROP",
+            SystemFormat::Png => "PNG",
+            SystemFormat::Dib => "CF_DIB",
         }
     }
 }
@@ -109,6 +120,8 @@ pub const TEXT_MIMES: &[&str] = &[
 
 pub const HTML_MIME: &str = "text/html";
 pub const URI_LIST_MIME: &str = "text/uri-list";
+/// §93. A picture, both ways.
+pub const PNG_MIME: &str = "image/png";
 
 /// Which system format can answer a request for this mime type.
 ///
@@ -134,6 +147,9 @@ pub fn format_for(mime: &str) -> Option<SystemFormat> {
     if lowered == URI_LIST_MIME {
         return Some(SystemFormat::HDrop);
     }
+    if lowered == PNG_MIME {
+        return Some(SystemFormat::Png);
+    }
     None
 }
 
@@ -156,6 +172,12 @@ pub fn mimes_for(formats: &[SystemFormat]) -> Vec<String> {
         if !formats.contains(&SystemFormat::UnicodeText) {
             out.extend(TEXT_MIMES.iter().map(|m| (*m).to_owned()));
         }
+    }
+    // §93. After the text: a program that copies text sometimes puts a
+    // picture of it there too, and a client choosing by this order should
+    // take the words.
+    if formats.contains(&SystemFormat::Png) || formats.contains(&SystemFormat::Dib) {
+        out.push(PNG_MIME.to_owned());
     }
     out
 }
@@ -386,12 +408,18 @@ fn file_uri(path: &str) -> String {
 
 /// The largest selection this compositor will hold, in bytes.
 ///
-/// 4 MiB is a page of dense HTML with images inlined as data URIs and then
-/// some. The limit exists because the bytes arrive from a client one chunk at
-/// a time and a client that chunks forever and never publishes would otherwise
+/// The limit exists because the bytes arrive from a client one chunk at a
+/// time and a client that chunks forever and never publishes would otherwise
 /// be a memory leak with a protocol in front of it — the same reasoning, and
 /// the same shape of defence, as `crate::icon::MAX_IMAGE_BYTES`.
-pub const MAX_SELECTION_BYTES: usize = 4 << 20;
+///
+/// §93: 32 MiB, from 4. Four was "a page of dense HTML and then some", and a
+/// long page selected with Ctrl+A in Firefox is more than that once its HTML
+/// comes along; so is a screenshot. `wc-proxy` keeps the same number
+/// (`session::MAX_SELECTION_BYTES`) and leaves out what does not fit, and a
+/// selection that is too big anyway is refused without ending the feed
+/// ([`Staging::overflowed`]).
+pub const MAX_SELECTION_BYTES: usize = 32 << 20;
 
 /// How many mime types one selection may carry.
 pub const MAX_MIMES: usize = 16;
@@ -415,6 +443,9 @@ pub const CHUNK: usize = 3072;
 pub struct Staging {
     bytes: Vec<u8>,
     payloads: Vec<(String, Vec<u8>)>,
+    /// §93. The cap was passed since the last `take`: the rest of this
+    /// selection is swallowed and the publish installs nothing.
+    overflowed: bool,
 }
 
 /// Why a staged selection was refused. Each maps to one protocol error.
@@ -427,16 +458,33 @@ pub enum StageError {
 }
 
 impl Staging {
+    /// `Err(TooBig)` once, the first time the cap is passed; after that the
+    /// selection's remaining chunks are swallowed until [`Self::take`].
     pub fn chunk(&mut self, data: &[u8]) -> Result<(), StageError> {
+        if self.overflowed {
+            return Ok(());
+        }
         if self.staged() + data.len() > MAX_SELECTION_BYTES {
+            self.overflowed = true;
+            self.bytes = Vec::new();
+            self.payloads = Vec::new();
             return Err(StageError::TooBig);
         }
         self.bytes.extend_from_slice(data);
         Ok(())
     }
 
+    /// Whether the selection being staged was too big and will install
+    /// nothing.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     /// Close off one mime type's payload.
     pub fn data(&mut self, mime: String) -> Result<(), StageError> {
+        if self.overflowed {
+            return Ok(());
+        }
         let bytes = std::mem::take(&mut self.bytes);
         // A repeat replaces rather than duplicating: a clipboard has one
         // payload per format and the last word is the client's.
@@ -462,6 +510,7 @@ impl Staging {
     /// claimed are dropped, for the reason `crate::icon::Staging::take` gives.
     pub fn take(&mut self) -> Vec<(String, Vec<u8>)> {
         self.bytes.clear();
+        self.overflowed = false;
         std::mem::take(&mut self.payloads)
     }
 }
@@ -496,8 +545,212 @@ pub fn to_system(payloads: &[(String, Vec<u8>)]) -> Vec<(SystemFormat, Vec<u8>)>
     {
         out.push((SystemFormat::Html, html_wrap(&String::from_utf8_lossy(bytes))));
     }
+    // §93. A picture goes on as the PNG itself, for the programs that read
+    // one, and as a bitmap for the ones that read only that. One that does
+    // not decode goes on as neither: a program would paste garbage.
+    if let Some((_, bytes)) = payloads
+        .iter()
+        .find(|(m, _)| format_for(m) == Some(SystemFormat::Png))
+        && let Some(dib) = dib_from_png(bytes)
+    {
+        out.push((SystemFormat::Png, bytes.clone()));
+        out.push((SystemFormat::Dib, dib));
+    }
     // `text/uri-list` is deliberately absent. See `hdrop_to_uri_list`.
     out
+}
+
+// ---------------------------------------------------------------------------
+// Pictures (§93)
+// ---------------------------------------------------------------------------
+
+/// `BITMAPINFOHEADER`'s size: the `CF_DIB` this writes, and the smallest one
+/// it reads.
+const BIH_LEN: usize = 40;
+const BI_RGB: u32 = 0;
+const BI_BITFIELDS: u32 = 3;
+/// A picture larger than this many pixels is not converted (a 16k x 16k
+/// screen is 256 Mi of them; this is a quarter of that).
+const MAX_PIXELS: usize = 64 << 20;
+
+/// A PNG as `CF_DIB`: a 40-byte `BITMAPINFOHEADER`, then 32-bit BGRA rows
+/// bottom-up, which is what Paint and every program that reads only a bitmap
+/// takes. Alpha is kept in the fourth byte (`BI_RGB` calls it reserved; the
+/// programs that understand alpha read the `"PNG"` beside it instead).
+pub fn dib_from_png(png_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    if w == 0 || h == 0 || w.checked_mul(h)? > MAX_PIXELS {
+        return None;
+    }
+    let channels = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(BIH_LEN + w * h * 4);
+    out.extend_from_slice(&(BIH_LEN as u32).to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes()); // positive: bottom-up
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+    out.extend_from_slice(&BI_RGB.to_le_bytes());
+    out.extend_from_slice(&((w * h * 4) as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]); // resolution, colours used, important
+    for y in (0..h).rev() {
+        let row = buf.get(y * info.line_size..y * info.line_size + w * channels)?;
+        for px in row.chunks_exact(channels) {
+            let (r, g, b, a) = match channels {
+                4 => (px[0], px[1], px[2], px[3]),
+                3 => (px[0], px[1], px[2], 0xFF),
+                2 => (px[0], px[0], px[0], px[1]),
+                _ => (px[0], px[0], px[0], 0xFF),
+            };
+            out.extend_from_slice(&[b, g, r, a]);
+        }
+    }
+    Some(out)
+}
+
+/// `CF_DIB` as a PNG, for a Wayland client asking for `image/png`.
+///
+/// What Windows hands out as `CF_DIB` is whatever the copying program put
+/// there or what Windows synthesised from its `CF_BITMAP`/`CF_DIBV5`, so this
+/// reads the shapes that actually occur: a 40-byte header or a V4/V5 one,
+/// 32-bit `BI_RGB` or `BI_BITFIELDS`, 24-bit, and 8-, 4- or 1-bit with a
+/// palette; bottom-up or top-down. A 32-bit bitmap whose fourth byte is zero
+/// everywhere is opaque, not invisible: `BI_RGB` defines that byte as unused,
+/// and programs leave it at zero.
+pub fn png_from_dib(dib: &[u8]) -> Option<Vec<u8>> {
+    let u32_at = |o: usize| Some(u32::from_le_bytes(dib.get(o..o + 4)?.try_into().ok()?));
+    let i32_at = |o: usize| Some(i32::from_le_bytes(dib.get(o..o + 4)?.try_into().ok()?));
+    let u16_at = |o: usize| Some(u16::from_le_bytes(dib.get(o..o + 2)?.try_into().ok()?));
+    let header = u32_at(0)? as usize;
+    if header < BIH_LEN {
+        return None;
+    }
+    let width = i32_at(4)?;
+    let height = i32_at(8)?;
+    let bpp = u16_at(14)? as usize;
+    let compression = u32_at(16)?;
+    let colours_used = u32_at(32)? as usize;
+    if width <= 0 || height == 0 {
+        return None;
+    }
+    let (w, h) = (width as usize, height.unsigned_abs() as usize);
+    if w.checked_mul(h)? > MAX_PIXELS {
+        return None;
+    }
+    let top_down = height < 0;
+
+    // The masks: inside a V4/V5 header, or three words after a 40-byte one.
+    let mut at = header;
+    let masks = if compression == BI_BITFIELDS {
+        if header == BIH_LEN {
+            at += 12;
+            Some([u32_at(40)?, u32_at(44)?, u32_at(48)?, 0])
+        } else {
+            Some([u32_at(40)?, u32_at(44)?, u32_at(48)?, if header >= 56 { u32_at(52)? } else { 0 }])
+        }
+    } else if compression == BI_RGB {
+        None
+    } else {
+        return None; // RLE, JPEG or PNG inside a bitmap: not seen on a clipboard
+    };
+    let palette: Vec<[u8; 3]> = if bpp <= 8 {
+        let n = if colours_used == 0 { 1 << bpp } else { colours_used.min(256) };
+        let mut p = Vec::with_capacity(n);
+        for i in 0..n {
+            let e = dib.get(at + i * 4..at + i * 4 + 3)?;
+            p.push([e[2], e[1], e[0]]);
+        }
+        at += n * 4;
+        p
+    } else {
+        Vec::new()
+    };
+    if !matches!(bpp, 1 | 4 | 8 | 24 | 32) || (bpp == 24 && masks.is_some()) {
+        return None;
+    }
+    let stride = (w * bpp).div_ceil(32) * 4;
+    let pixels = dib.get(at..at + stride * h)?;
+
+    let channel = |v: u32, mask: u32| -> u8 {
+        if mask == 0 {
+            return 0;
+        }
+        let shift = mask.trailing_zeros();
+        let max = mask >> shift;
+        (((v & mask) >> shift) * 255 / max) as u8
+    };
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    let mut any_alpha = false;
+    for y in 0..h {
+        let src_y = if top_down { y } else { h - 1 - y };
+        let row = &pixels[src_y * stride..src_y * stride + stride];
+        for x in 0..w {
+            let px = match bpp {
+                32 => {
+                    let v = u32::from_le_bytes(row[x * 4..x * 4 + 4].try_into().ok()?);
+                    match masks {
+                        Some([r, g, b, a]) => [
+                            channel(v, r),
+                            channel(v, g),
+                            channel(v, b),
+                            if a == 0 { 0 } else { channel(v, a) },
+                        ],
+                        None => [row[x * 4 + 2], row[x * 4 + 1], row[x * 4], row[x * 4 + 3]],
+                    }
+                }
+                24 => [row[x * 3 + 2], row[x * 3 + 1], row[x * 3], 0xFF],
+                _ => {
+                    let per_byte = 8 / bpp;
+                    let byte = row[x / per_byte];
+                    let shift = 8 - bpp * (x % per_byte + 1);
+                    let index = ((byte >> shift) & ((1u16 << bpp) - 1) as u8) as usize;
+                    let [r, g, b] = *palette.get(index)?;
+                    [r, g, b, 0xFF]
+                }
+            };
+            any_alpha |= bpp == 32 && px[3] != 0;
+            rgba.extend_from_slice(&px);
+        }
+    }
+    if bpp == 32 && !any_alpha {
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// Whether [`from_system`] can answer `mime` out of `format` at all, so a
+/// paste reads only the formats that can answer it. Reading one is
+/// `GetClipboardData`, and for a program that renders late (Word) that makes
+/// the program produce it.
+pub fn can_answer(mime: &str, format: SystemFormat) -> bool {
+    matches!(
+        (format_for(mime), format),
+        (Some(SystemFormat::UnicodeText), SystemFormat::UnicodeText | SystemFormat::HDrop)
+            | (Some(SystemFormat::Html), SystemFormat::Html)
+            | (Some(SystemFormat::HDrop), SystemFormat::HDrop)
+            | (Some(SystemFormat::Png), SystemFormat::Png | SystemFormat::Dib)
+    )
 }
 
 /// Turn a system format's bytes into the payload for a mime type.
@@ -512,6 +765,9 @@ pub fn from_system(mime: &str, format: SystemFormat, bytes: &[u8]) -> Option<Vec
         (SystemFormat::HDrop, SystemFormat::HDrop) => {
             Some(hdrop_to_uri_list(bytes)?.into_bytes())
         }
+        // §93. The PNG a program put there, else the bitmap, encoded.
+        (SystemFormat::Png, SystemFormat::Png) => Some(bytes.to_vec()),
+        (SystemFormat::Png, SystemFormat::Dib) => png_from_dib(bytes),
         // A file list asked for as text: the names, one per line. This is the
         // pairing `mimes_for` announces when the clipboard holds files and no
         // text, and it is the only cross-format conversion here.
@@ -541,7 +797,8 @@ mod tests {
         }
         assert_eq!(format_for("text/html"), Some(SystemFormat::Html));
         assert_eq!(format_for("text/uri-list"), Some(SystemFormat::HDrop));
-        assert_eq!(format_for("image/png"), None);
+        assert_eq!(format_for("image/png"), Some(SystemFormat::Png));
+        assert_eq!(format_for("image/jpeg"), None);
     }
 
     #[test]
@@ -642,6 +899,23 @@ mod tests {
         s.data("text/plain".into()).unwrap();
         // The cap counts what is already closed off, not just the current run.
         assert_eq!(s.chunk(&[0u8; 2]), Err(StageError::TooBig));
+        // §93: and it is said once. The rest of that selection is swallowed,
+        // it installs nothing, and the next selection starts clean — the feed
+        // is not ended.
+        assert!(s.overflowed());
+        assert_eq!(s.chunk(&[0u8; 2]), Ok(()));
+        assert_eq!(s.data("text/html".into()), Ok(()));
+        assert!(s.take().is_empty(), "a refused selection installs nothing");
+        assert!(!s.overflowed(), "take starts the next selection clean");
+        s.chunk(b"next").unwrap();
+        s.data("text/plain".into()).unwrap();
+        assert_eq!(s.take(), vec![("text/plain".to_owned(), b"next".to_vec())]);
+    }
+
+    /// §93. `wc-proxy` keeps the same number and checks this file for it.
+    #[test]
+    fn the_selection_cap_is_thirty_two_mebibytes() {
+        assert_eq!(MAX_SELECTION_BYTES, 32 << 20);
     }
 
     #[test]
@@ -667,7 +941,7 @@ mod tests {
             .chain(std::iter::once(("image/png".to_owned(), vec![0x89, b'P'])))
             .collect();
         let system = to_system(&payloads);
-        assert_eq!(system.len(), 2, "text and html, and the png dropped");
+        assert_eq!(system.len(), 2, "text and html, and the png that does not decode dropped");
         assert_eq!(system[0].0, SystemFormat::UnicodeText);
         assert_eq!(utf8_from_utf16(&utf16_units(&system[0].1)), "hi");
         assert_eq!(system[1].0, SystemFormat::Html);
@@ -705,5 +979,131 @@ mod tests {
         );
         assert_eq!(from_system("text/html", SystemFormat::UnicodeText, b"x"), None);
         assert_eq!(from_system("image/png", SystemFormat::UnicodeText, b"x"), None);
+    }
+
+    // --- §93: pictures --------------------------------------------------
+
+    /// A 3x2 RGBA picture with a transparent pixel, as a PNG.
+    fn a_png() -> (Vec<u8>, Vec<u8>) {
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, /**/ 0, 255, 0, 255, /**/ 0, 0, 255, 255, // top row
+            10, 20, 30, 255, /**/ 40, 50, 60, 128, /**/ 0, 0, 0, 0, // bottom row
+        ];
+        let mut out = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut out, 3, 2);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Eight);
+            e.write_header().unwrap().write_image_data(&rgba).unwrap();
+        }
+        (out, rgba)
+    }
+
+    fn decode(png_bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut r = png::Decoder::new(std::io::Cursor::new(png_bytes)).read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size().unwrap()];
+        let info = r.next_frame(&mut buf).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        (info.width, info.height, buf)
+    }
+
+    #[test]
+    fn a_picture_is_offered_and_asked_for_as_image_png() {
+        assert_eq!(format_for("image/png"), Some(SystemFormat::Png));
+        assert_eq!(format_for("IMAGE/PNG"), Some(SystemFormat::Png));
+        for held in [SystemFormat::Png, SystemFormat::Dib] {
+            assert_eq!(mimes_for(&[held]), vec!["image/png".to_owned()]);
+            assert!(can_answer("image/png", held));
+            assert!(!can_answer("text/plain", held));
+        }
+        // After the words, when a program put both there.
+        let both = mimes_for(&[SystemFormat::UnicodeText, SystemFormat::Dib]);
+        assert_eq!(both.first().map(String::as_str), Some("text/plain;charset=utf-8"));
+        assert_eq!(both.last().map(String::as_str), Some("image/png"));
+        assert!(!can_answer("image/png", SystemFormat::UnicodeText));
+    }
+
+    /// The bitmap a PNG becomes: Windows' header, bottom-up rows, BGRA.
+    #[test]
+    fn a_copied_png_goes_on_as_itself_and_as_a_bottom_up_bitmap() {
+        let (png_bytes, _) = a_png();
+        let sys = to_system(&[("image/png".into(), png_bytes.clone())]);
+        assert_eq!(sys.len(), 2);
+        assert_eq!(sys[0], (SystemFormat::Png, png_bytes));
+        let (f, dib) = &sys[1];
+        assert_eq!(*f, SystemFormat::Dib);
+        assert_eq!(u32::from_le_bytes(dib[0..4].try_into().unwrap()), 40);
+        assert_eq!(i32::from_le_bytes(dib[4..8].try_into().unwrap()), 3);
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2, "positive: bottom-up");
+        assert_eq!(u16::from_le_bytes(dib[14..16].try_into().unwrap()), 32);
+        assert_eq!(dib.len(), 40 + 3 * 2 * 4);
+        // The first row in memory is the picture's *bottom* row.
+        assert_eq!(&dib[40..44], &[30, 20, 10, 255], "BGRA of the bottom-left pixel");
+        assert_eq!(&dib[44..48], &[60, 50, 40, 128], "alpha is kept");
+        assert_eq!(&dib[52..56], &[0, 0, 255, 255], "the top-left pixel, red, comes after");
+    }
+
+    #[test]
+    fn a_bitmap_and_back_is_the_same_picture() {
+        let (png_bytes, rgba) = a_png();
+        let dib = dib_from_png(&png_bytes).unwrap();
+        let back = from_system("image/png", SystemFormat::Dib, &dib).unwrap();
+        assert_eq!(decode(&back), (3, 2, rgba));
+        assert_eq!(from_system("image/png", SystemFormat::Png, &png_bytes), Some(png_bytes));
+    }
+
+    /// What Windows synthesises from a `CF_BITMAP`: 32-bit `BI_BITFIELDS`,
+    /// masks after a 40-byte header, top-down here, and the fourth byte zero
+    /// everywhere — which is opaque, not invisible.
+    #[test]
+    fn a_bitfields_bitmap_with_no_alpha_is_opaque() {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&2i32.to_le_bytes());
+        dib.extend_from_slice(&(-1i32).to_le_bytes()); // top-down
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&32u16.to_le_bytes());
+        dib.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        dib.extend_from_slice(&[0u8; 20]);
+        for m in [0x00ff_0000u32, 0x0000_ff00, 0x0000_00ff] {
+            dib.extend_from_slice(&m.to_le_bytes());
+        }
+        dib.extend_from_slice(&[0x11, 0x22, 0x33, 0, 0xaa, 0xbb, 0xcc, 0]);
+        let (w, h, px) = decode(&png_from_dib(&dib).unwrap());
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(px, vec![0x33, 0x22, 0x11, 0xff, 0xcc, 0xbb, 0xaa, 0xff]);
+    }
+
+    /// 24-bit rows are padded to four bytes; an 8-bit one reads its palette.
+    #[test]
+    fn padded_and_palette_bitmaps_read_right() {
+        let header = |w: i32, h: i32, bpp: u16, used: u32| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&40u32.to_le_bytes());
+            d.extend_from_slice(&w.to_le_bytes());
+            d.extend_from_slice(&h.to_le_bytes());
+            d.extend_from_slice(&1u16.to_le_bytes());
+            d.extend_from_slice(&bpp.to_le_bytes());
+            d.extend_from_slice(&0u32.to_le_bytes());
+            d.extend_from_slice(&[0u8; 12]);
+            d.extend_from_slice(&used.to_le_bytes());
+            d.extend_from_slice(&0u32.to_le_bytes());
+            d
+        };
+        // 1x2, 24-bit, bottom-up: each row is 3 bytes + 1 of padding.
+        let mut d = header(1, 2, 24, 0);
+        d.extend_from_slice(&[1, 2, 3, 0, 4, 5, 6, 0]);
+        let (_, _, px) = decode(&png_from_dib(&d).unwrap());
+        assert_eq!(px, vec![6, 5, 4, 255, 3, 2, 1, 255], "the second row in memory is the top");
+        // 2x1, 8-bit, two palette entries.
+        let mut d = header(2, 1, 8, 2);
+        d.extend_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0]); // red, green (BGRX)
+        d.extend_from_slice(&[1, 0, 0, 0]);
+        let (_, _, px) = decode(&png_from_dib(&d).unwrap());
+        assert_eq!(px, vec![0, 255, 0, 255, 255, 0, 0, 255]);
+        // Garbage is refused, not a panic.
+        assert_eq!(png_from_dib(&[1, 2, 3]), None);
+        assert_eq!(png_from_dib(&header(4, 4, 32, 0)), None, "no pixels after the header");
+        assert_eq!(dib_from_png(b"not a png"), None);
     }
 }

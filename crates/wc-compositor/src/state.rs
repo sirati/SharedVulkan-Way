@@ -4690,9 +4690,22 @@ impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
 
         match request {
             Request::Chunk { data: bytes } => {
-                if let Err(e) = data.0.lock().unwrap().chunk(&bytes) {
-                    let (code, why) = fail(e);
-                    resource.post_error(code, why);
+                match data.0.lock().unwrap().chunk(&bytes) {
+                    // §93: **not** a protocol error. It used to be, and the
+                    // error ended the feed: after one copy too large (a long
+                    // page's HTML), copy and paste did nothing for the rest
+                    // of that client's session. The selection is refused and
+                    // the feed stays.
+                    Err(StageError::TooBig) => println!(
+                        "wc-compositor: a selection passed {} MiB; it is refused and the \
+                         system clipboard is left as it was",
+                        crate::clipboard::MAX_SELECTION_BYTES >> 20
+                    ),
+                    Err(e) => {
+                        let (code, why) = fail(e);
+                        resource.post_error(code, why);
+                    }
+                    Ok(()) => {}
                 }
             }
             Request::Data { mime_type } => {
@@ -4702,7 +4715,12 @@ impl Dispatch<WcClipboardManagerV1, ClipboardState> for State {
                 }
             }
             Request::Publish => {
+                let refused = data.0.lock().unwrap().overflowed();
                 let payloads = data.0.lock().unwrap().take();
+                if refused {
+                    println!("wc-compositor: the refused selection's publish installs nothing");
+                    return;
+                }
                 let system = crate::clipboard::to_system(&payloads);
                 state.clip_published += 1;
                 println!(
