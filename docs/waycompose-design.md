@@ -30196,7 +30196,9 @@ not capped.
 ### 96.9 What is not done
 
 1. **Phase 2**: the guest, its Intel iGPU, a launcher app and the session's
-   sound. Recorded here when it is done.
+   sound. Played by the user on the guest, both renderers, with sound; what
+   that found is 96.10 and 96.11, and what is still to be seen there is at the
+   end of 96.11.
 2. **Absolute pointers**: mouse-look from a remote desktop (TeamViewer injects
    absolute positions) is implemented (`AbsoluteMotion`) and not measured; it
    stops at the edge of the remote screen by construction.
@@ -30255,6 +30257,94 @@ second monitor, the show states).
   Measured on the guest: `wc-desk windows` from the scheduled task with a
   restored fullscreen Minecraft in front, and the game stayed in front and was
   not minimised. With the old helper, every run minimised it.
+
+### 96.11 Minecraft's icon, and Prism Launcher from Windows
+
+**Minecraft names no app id.** On the guest its window was
+`Waycompose.unnamed.c4`: the generic icon, a taskbar button of its own,
+nothing to pin. GLFW 3.4 takes its Wayland app id from the
+`GLFW_WAYLAND_APP_ID` hint, and Minecraft does not set it. On plain
+`xdg_toplevel` GLFW then sends `set_app_id("")`. On libdecor, which
+glfw3-minecraft uses when libdecor is there, it sends nothing at all
+(`libdecor_frame_set_app_id` only `if (strlen(appId))`, `wl_window.c:822`).
+The local run showed the second: the proxy saw no `set_app_id`.
+
+**The launcher says it in the environment, and the proxy acts on it.** The
+proxy already reads `/proc/<pid>/exe` of each client (§18.5). It now also
+reads `/proc/<pid>/environ` for two variables (`icons::client_env`):
+
+* `WC_APP_ID`: a toplevel of that client starts with this app id, sent right
+  after `xdg_surface.get_toplevel`, and an empty `set_app_id` is replaced by
+  it. A client that names itself is never overruled: its own non-empty
+  `set_app_id` follows and replaces the default, as any second one does. The
+  value must be a desktop id (`icons::app_id_ok`, the launcher's rule).
+* `XDG_DATA_DIRS`: joins the icon search after the proxy's own directories and
+  before the executable's prefix. An application installed under a home
+  directory and run by an interpreter (`~/wc-mc`, Java) is found nowhere else.
+
+What a client can choose this way is the name of its own icon and where its
+own desktop entry is, which it could already choose with `set_app_id`.
+
+`minecraft-demo` sets `WC_APP_ID` to the desktop id of its shortcut
+(`wc-minecraft`, `wc-minecraft-vulkanmod`) and puts the installation's
+`share/` first in `XDG_DATA_DIRS`. Since the launcher derives the shortcut's
+identity from that same desktop id (§92.1), window and pin are one button.
+Measured locally (Phase 1 harness, `SVMC_GAME_ENV` with the two variables):
+`xdg_toplevel@28 starts with app id "wc-minecraft"`, the icon resolved from
+the bundle's `48x48/apps/wc-minecraft.png` (Minecraft's own, from the game's
+assets), `window 1 icon <- 1 image(s) published for "wc-minecraft"`, and the
+window moved to `Waycompose.app.wc-minecraft`. Every other check of the run
+passed, including a clean quit.
+
+**Prism Launcher from Windows.** `prism` is an application like the others
+(`scripts/sv-minecraft-apps.ini`): Prism 11.1.1 from nixpkgs on Prism's data
+in `~/wc-mc/prism`, with both instances, named "Minecraft 1.21.11" and
+"Minecraft 1.21.11 (VulkanMod)". It gets a desktop shortcut, a Start menu
+entry and a pinnable identity like Firefox's.
+
+* **Qt on Wayland, Windows' caption.** `env = QT_QPA_PLATFORM=wayland` (never
+  X11) and `QT_WAYLAND_DISABLE_WINDOWDECORATION=1`, so Qt draws no frame of its
+  own and the compositor gives the window Windows' caption (`titlebar = none`,
+  §82). On the guest: Windows' caption with Prism's icon and three buttons, and
+  nothing of Qt's above the page.
+* **One identity.** Qt's app id is the desktop file's name,
+  `org.prismlauncher.PrismLauncher`. The launcher would have derived the
+  shortcut's identity from the entry's `StartupWMClass` (`PrismLauncher`),
+  making window and pin two buttons, so the guest block sets
+  `app-id = org.prismlauncher.PrismLauncher`. On the guest:
+  `aumid="Waycompose.app.org.prismlauncher.PrismLauncher"`, a relaunch command
+  (`wc-launch.exe prism`), and Prism's own 256 px icon resolved by the proxy
+  from its package.
+* **The game Prism starts** inherits everything from Prism, which has it from
+  `wc-session`: the session's Wayland display (GLFW picks Wayland by itself
+  with no `DISPLAY`), its sound (`$XDG_RUNTIME_DIR/pulse/native`), the GPU
+  environment (`gpu.env` and the session's `SV_SOCKET`). From the instances it
+  gets system GLFW (`UseNativeGLFW`), the narrator off and Prism's 1 GiB heap.
+  The one thing Prism cannot pass on is the identity. Prism's global wrapper
+  command, `bin/minecraft-prism-wrap`, sets `WC_APP_ID` by instance (`INST_ID`)
+  and the data directory, then `exec`s the game. It is a global setting, so an
+  instance the person adds later has it too. A game from Prism and the same
+  game from its shortcut are the same taskbar button with Minecraft's icon,
+  separate from Prism's: that is how Windows shows a launcher and the game it
+  started.
+* **No account, and none prevented.** With no valid account Prism opens its
+  Quick Setup page ("Add Microsoft account") at every start
+  (`Application::createSetupWizard`: `login = !anyAccountIsValid() &&
+  SupportsMSA`); **Finish** goes on without one. Play then asks "No
+  Accounts" (No), "Play demo?" (Play Demo) and a player name (OK), and the game
+  starts with `--demo`. A person who wants their own Microsoft account adds it
+  in Prism. Nothing here stops that, and the automation never enters
+  credentials. The login watchdog and the refusing `xdg-open` of 96.2 belong to
+  `sv-minecraft.sh setup` and are not in the deployed path.
+* **`ship` keeps what the player owns**: worlds, `options.txt`,
+  `servers.dat`, `accounts.json`, logs and screenshots are excluded from the
+  copy and from `--delete`. The bundle's `options.txt` goes only where an
+  instance has none.
+
+**Not yet seen on the guest** (the desktop was the user's): a game started
+from Prism, and Minecraft's icon on the guest's taskbar. Both need one short
+slot: open Prism from its shortcut, Finish, select an instance, Play, then the
+three dialogs, then a look at the taskbar.
 
 ## 97. The GPU arena becomes one pool: leases instead of slots, and a device carved out of the guest's RAM
 

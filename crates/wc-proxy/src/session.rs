@@ -1231,6 +1231,29 @@ impl Session {
                     _ => self.app_ids.push(app_id),
                 }
             }
+        // §96: and a toplevel whose client may never call `set_app_id` at all.
+        // GLFW on libdecor (glfw3-minecraft takes that path when libdecor is
+        // there) calls `libdecor_frame_set_app_id` only for a non-empty id,
+        // so Minecraft's window never named itself and the rewrite above had
+        // nothing to rewrite. The default follows `get_toplevel` at once; an
+        // id the client names later still replaces it, as any second
+        // `set_app_id` does.
+        let mut injected: Option<Vec<u8>> = None;
+        if interface == "xdg_surface" && msg.name == "get_toplevel"
+            && let Some(id) = self.default_app_id.clone()
+            && let Some(top) = spans.first().and_then(|s| wire::word_at(body, s))
+            && let Some(op) = self.spec.interface("xdg_toplevel").and_then(|i| {
+                i.requests.iter().position(|m| m.name == "set_app_id")
+            })
+        {
+            let mut b = Vec::new();
+            wire::push_string(&mut b, &id);
+            self.note(format!(
+                "xdg_toplevel@{top} starts with app id {id:?}, from the client's WC_APP_ID"
+            ));
+            self.app_ids.push(id);
+            injected = Some(wire::message(top, op as u16, &b));
+        }
 
         // STAGE 13. The one *family* this program answers itself rather than
         // forwarding. See [`Clip`] for why, and note that this is matched on
@@ -1468,6 +1491,9 @@ impl Session {
             body.to_vec()
         };
         out.extend_from_slice(&wire::message(header.object, header.opcode, &out_body));
+        if let Some(m) = injected {
+            out.extend_from_slice(&m);
+        }
         Ok(out)
     }
 

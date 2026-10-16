@@ -2353,12 +2353,21 @@ fn an_empty_app_id_takes_the_launchers_and_a_named_one_is_left_alone() {
     let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
     h.session.set_default_app_id(Some("wc-minecraft".into()));
     let top = toplevel(&mut h);
+    // A client that never calls `set_app_id` (GLFW on libdecor): the default
+    // follows `get_toplevel` at once.
+    let msgs = h.upstream_messages();
+    let (object, opcode, body) = msgs.last().unwrap().clone();
+    assert_eq!((object, opcode, body), (top, 3, encoded("wc-minecraft")));
+    assert_eq!(h.session.take_app_ids(), vec!["wc-minecraft".to_string()]);
     assert_eq!(app_id(&mut h, top, ""), encoded("wc-minecraft"));
     assert_eq!(h.session.take_app_ids(), vec!["wc-minecraft".to_string()]);
     assert_eq!(app_id(&mut h, top, "org.example.Named"), encoded("org.example.Named"));
 
     let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
     let top = toplevel(&mut h);
+    let msgs = h.upstream_messages();
+    assert_eq!(msgs.last().unwrap().1, 1, "with no default, get_toplevel is the last thing sent");
+    assert_ne!(msgs.last().unwrap().0, top, "and nothing was sent on the toplevel");
     assert_eq!(app_id(&mut h, top, ""), encoded(""));
     let _ = std::fs::remove_dir_all(&d);
 }
