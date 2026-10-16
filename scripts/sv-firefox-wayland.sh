@@ -56,7 +56,8 @@ fi
 if [ -n "$KOPPER_MESA" ] && [ "$KOPPER_MESA" != none ]; then
   export __EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json
 fi
-RUN=$(mktemp -d /tmp/svwl-XXXXXX)
+# `SVWL_RUNROOT`: where the run directory goes. Large; keep it off a small /tmp.
+RUN=$(mktemp -d "${SVWL_RUNROOT:-/tmp}/svwl-XXXXXX")
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
@@ -396,6 +397,27 @@ HTML
 <h1 id=h>0</h1><div style="height:3000px;background:linear-gradient(#fff,#f88)"></div>
 <script>let n = 0; setInterval(() => { n++; document.title = 'sv retitle ' + n; h.textContent = n; }, 100);</script>
 HTML
+  # `SVWL_VIDEO=1` (two-windows): the first window plays a 720p H.264 clip in a
+  # loop for the whole run instead of retitling, and says how playback goes in
+  # its title (waycompose-design.md §98: two windows plus a video, the recipe
+  # that made Firefox crash at quit).
+  if [ "${SVWL_VIDEO:-0}" = 1 ]; then
+    ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
+      -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
+      "$RUN/pages/clip.mp4" || { echo "FAIL: ffmpeg could not make the clip"; exit 1; }
+    cat >"$RUN/pages/video.html" <<'HTML'
+<!doctype html><title>sv video</title>
+<video id=v src="clip.mp4" autoplay muted loop width=960></video>
+<script>
+const v = document.getElementById('v');
+setInterval(() => {
+  const q = v.getVideoPlaybackQuality();
+  document.title = `sv video frames ${q.totalVideoFrames} dropped ${q.droppedVideoFrames} err=${v.error ? v.error.code : 'none'}`;
+}, 100);
+</script>
+HTML
+    export SOAK_VIDEO=1
+  fi
   cat >"$RUN/pages/webgl.html" <<'HTML'
 <!doctype html><title>sv webgl</title><canvas id=c width=800 height=600></canvas>
 <div style="height:3000px;background:linear-gradient(#fff,#8f8)"></div>
@@ -424,7 +446,10 @@ try {
 </script>
 HTML
   say "firefox (soak), $SECS s through Marionette on port $MPORT"
-  env HOME="$RUN/home" ${SVWL_EXTRA_ENV:-} \
+  # `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in Firefox's own environment: without
+  # it the crash reporter submits a crash's minidump and deletes it, and the
+  # verdict's count of minidumps below says none (waycompose-design.md §98).
+  env HOME="$RUN/home" MOZ_CRASHREPORTER_NO_DELETE_DUMP=1 ${SVWL_EXTRA_ENV:-} \
     "$FIREFOX" --no-remote --marionette -remote-allow-system-access --profile "$RUN/profile" about:blank \
     >"$RUN/ff.log" 2>&1 &
   FF=$!
@@ -496,7 +521,10 @@ HTML
   [ "$ALIVE" -eq 1 ] && ok "Firefox was alive after ${LIVED} s" || bad "Firefox was gone after ${LIVED} s"
   [ "$LIVED" -ge "$SECS" ] && ok "it lived at least the $SECS s asked for" || bad "it lived ${LIVED} s of $SECS"
   if [ -n "$QUIT" ]; then
-    dumps=$(ls "$RUN/profile/minidumps/"*.dmp 2>/dev/null | wc -l)
+    # A crash's minidump is moved out of the profile into the crash reporter's
+    # own directory under `$HOME` (`Crash Reports/pending`), so both are counted
+    # (waycompose-design.md §98).
+    dumps=$(find "$RUN/profile/minidumps" "$RUN/home" -name '*.dmp' 2>/dev/null | wc -l)
     [ "$QUIT" = "exit 0" ] && [ "$dumps" -eq 0 ] \
       && ok "closing the last window quit Firefox cleanly (exit 0, no minidump)" \
       || bad "closing the last window: $QUIT, $dumps minidump(s) in the profile"

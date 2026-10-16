@@ -204,7 +204,10 @@ def two_windows():
     first = m.call("WebDriver:GetWindowHandle")
     first = first.get("value", first) if isinstance(first, dict) else first
     size(1280, 752)
-    m.call("WebDriver:Navigate", {"url": page_uri("retitle.html")})
+    # `SOAK_VIDEO=1`: the first window plays a looping clip for the whole run
+    # (§98: two windows plus a video), and the tour stays in the second.
+    video = os.environ.get("SOAK_VIDEO") == "1"
+    m.call("WebDriver:Navigate", {"url": page_uri("video.html" if video else "retitle.html")})
     second = m.call("WebDriver:NewWindow", {"type": "window"})["handle"]
     m.call("WebDriver:SwitchToWindow", {"handle": second})
     size(1280, 752)
@@ -220,7 +223,7 @@ def two_windows():
         for i, url in enumerate(TOUR + [page_uri("retitle.html")]):
             if time.monotonic() - T0 >= SECS:
                 break
-            h = (first, second)[i % 2]
+            h = second if video else (first, second)[i % 2]
             try:
                 m.call("WebDriver:SwitchToWindow", {"handle": h})
                 t = time.monotonic()
@@ -232,6 +235,13 @@ def two_windows():
                 log("compositor", value=compositor(m))
             except (RuntimeError, socket.timeout) as e:
                 log("step-error", url=url, error=str(e)[:300])
+        if video:
+            try:
+                m.call("WebDriver:SwitchToWindow", {"handle": first})
+                t = m.call("WebDriver:GetTitle")
+                log("video", title=t.get("value", t) if isinstance(t, dict) else t)
+            except (RuntimeError, socket.timeout) as e:
+                log("step-error", url="video.html", error=str(e)[:300])
     log("done", rounds=rounds)
     # Quit as a person does: close one window, then quit from the last one
     # (`Marionette:Quit`; closing the last window over WebDriver leaves this

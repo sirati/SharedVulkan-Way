@@ -29985,3 +29985,205 @@ not capped.
 3. **vsync pacing on the workstation** (96.7).
 4. **The Wine leg cannot drive a pointer**, so the Win32 half of 96.3 is measured
    by Minecraft under Wine, not by WLCS.
+
+## 98. Firefox's crash at quit: a frame shown after its surface was gone
+
+Branch `quit-crash`, from `desktop-checks` 8d8c32b, 2026-10-16. The brief: §95.4
+saw Firefox crash once when its last window closed on the guest, and the
+gpu-arena-dyn agent reproduced a crash at quit on the workstation (two windows
+and a video; not caused by its pool). Find the faulting stack, decide whose it
+is, and fix it if it is ours.
+
+### 98.1 Status in one paragraph
+
+**It was ours.** The pipelined present of §88 shows a frame from the
+swapchain's `sv-present` thread, with `attach`, `damage` and `commit` on the
+application's `wl_surface`, after `vkQueuePresentKHR` has returned. Firefox
+destroys that surface before the swapchain: when it closes a window, and at
+quit, where it never destroys the swapchain at all. A frame still in flight
+then marshals on a freed proxy: SIGSEGV twice, and once SIGABRT from glibc's
+futex check, all three in `present::wayland::Surface::put` on `sv-present`
+(98.3). That broke an invariant Mesa writes down and Firefox builds on: a
+Wayland surface is touched only inside the application's own swap call (98.4).
+**A Wayland swapchain now presents on the calling thread**, as Mesa's own WSI
+does; X11 and headless keep the presenter. With the window widened on purpose
+(a 30 ms sleep before the frame is shown), the old order crashed in 4 of 4 runs and
+the new one in none of 6 (98.6). The price is the present's wait back on the
+renderer thread for Wayland frames: at most a frame in a hundred on the
+workstation, still to be measured on the guest, where §88 put it at 3.3 ms (98.7).
+
+### 98.2 The recipe
+
+From gpu-arena-dyn's harness change, taken here without its pool:
+
+```
+SVWL_VIDEO=1 SVWL_VULKAN_DECODE=1 SVWL_FORCE=wr scripts/sv-firefox-wayland.sh two-windows 120
+```
+
+The first window plays a looping 720p H.264 clip for the whole run, so it is
+presenting at 30 fps when the browser quits; the tour runs in the second. With
+`SVWL_EXTRA_ENV=MOZ_CRASHREPORTER_DISABLE=1` the fault leaves a core for
+`coredumpctl` instead of a minidump. It crashed in
+about one run in five here (98.6), and in 2 of 3 for gpu-arena-dyn.
+
+`SVWL_RUNROOT` puts the run directory somewhere other than `/tmp`. The harness
+now starts Firefox with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, and its verdict
+counts minidumps where the crash reporter keeps them, `$HOME`'s
+`Crash Reports/pending`, as well as in the profile. Before, a crash at quit with
+the reporter on read "exit 11, 0 minidump(s)" with the dump sitting in
+`pending` (checked with the widened window of 98.6), and no core either,
+because the reporter handles the signal.
+
+### 98.3 What the stacks and the protocol say
+
+`docs/quit-crash/stacks.txt` has the crashing thread and the main thread of all
+three cores. The crashing thread is always `sv-present` (abridged, innermost
+first):
+
+```
+arg_count_for_signature        (libwayland-client)  <- in one; __pthread_mutex_lock in the other two
+wl_closure_init, wl_closure_marshal
+wl_proxy_marshal_array_flags   (libwayland-client)
+sv_icd::present::wayland::Surface::put
+sv_icd::wsi::finish_present
+sv_icd::wsi::Presenter::start::{closure}
+```
+
+In two of the three the main thread is deep in shutdown
+(`QuotaManager::Observer::Observe` from `nsXREDirProvider::DoShutdown`); in the
+third it is running JavaScript. In the one core searched for it, no thread was
+in WebRender's renderer or in Zink. Both fault
+sites read through the proxy: the message signature in one, the display's mutex
+in the other. That is what a freed `wl_surface` proxy looks like.
+
+To see the order, a temporary build of the ICD logged swapchain creation and
+destruction, `vkDestroySurfaceKHR`, and each present's queueing, start and end,
+with the thread; `WAYLAND_DEBUG=client` logged every request. Both go to
+Firefox's stderr, so they interleave in time. The run that crashed
+(`docs/quit-crash/protocol-crash.txt`, times UTC):
+
+| time | thread | what |
+|---|---|---|
+| 50.379800–.379852 | Firefox | the toplevel destroyed; `wl_surface#23` (Firefox's surface for EGL) unmapped with `attach(nil)` and committed |
+| 50.413301 | `sv-present` | our attach and commit of the previous frame on `#23` |
+| 50.413858 | renderer | `vkQueuePresentKHR` on swapchain `0xe91`, image 1, returns |
+| 50.413877 | `sv-present` | starts that present: the wait for the copy |
+| 50.415026, .415106 | Firefox | `wp_viewport#26.destroy()`, `wl_surface#23.destroy()` |
+| | `sv-present` | `Surface::put` on `#23`: "The futex facility returned an unexpected error code", SIGABRT |
+
+The run before that frame took 50 ms from start to commit (`.363887` to
+`.413319`), so a present may be in flight for far longer than the 1.2 ms the
+crash needed.
+
+A run that quit cleanly (`docs/quit-crash/protocol-clean.txt`) shows the same
+order without the bad luck, and shows that closing an ordinary window has it
+too: `wl_surface#46.destroy()` at .130606, then `vkDestroySwapchainKHR` for its
+swapchain at .130791. For the last window, `wl_surface#23` is destroyed and
+swapchain `0x1005` never is; the process ends with it alive.
+
+### 98.4 Whose fault, and why only the call itself is safe
+
+Firefox destroying the surface before the swapchain breaks Vulkan's rule that a
+native window outlives its swapchain. But Firefox and Mesa between them
+guarantee something narrower, and both write it down:
+
+- **Firefox** takes `WaylandSurfaceLock` around `SwapBuffers()`
+  (`gfx/webrender_bindings/RenderCompositorEGL.cpp`: "Rendering on Wayland has
+  to be atomic (buffer attach + commit) and wayland surface is also used by
+  main thread so lock it"), and `~WaylandSurface`, which destroys the
+  `wl_surface`, asserts the surface is not locked
+  (`widget/gtk/WaylandSurface.cpp`).
+- **Mesa's Zink** presents synchronously on Wayland, inside the swap
+  (`src/gallium/drivers/zink/zink_kopper.c`, 26.2.4, at `cdt->async`): "Wayland
+  EGL has a driver invariant which requires that any `wl_surface` …
+  calls happen inside the client's call to eglSwapBuffers(). Submitting surface
+  messages after eglSwapBuffers() returns causes serialization issues with the
+  Wayland surface protocol and can lead to the compositor booting the app. This
+  means we can't do async submit on Wayland."
+
+So `vkQueuePresentKHR` runs inside `eglSwapBuffers`, which runs inside
+Firefox's lock, and nothing may touch the surface after it returns. §88's
+presenter was the one link that did.
+
+**No later check can make an asynchronous frame safe.** Libwayland gives a
+client no notice that another part of the program destroyed a proxy. A proxy
+*wrapper*, made while the surface is alive, would stop the use-after-free,
+because marshalling through it never reads the application's proxy. But the
+request would still name object id 23 after the compositor had deleted it:
+`invalid object`, a protocol error that ends the connection. Or, once the id
+is reused, the request goes to whatever object now has it. Either is worse
+than the crash.
+
+### 98.5 The fix
+
+`crate::wsi::pipelines(target, SV_PRESENT_SYNC)` decides whether a new
+swapchain gets a presenter: not on a Wayland surface; yes on X11, whose frames
+go out on a connection of our own by a window id whose death is an error that
+connection ignores (`present::x11`), and on headless. `SV_PRESENT_SYNC=1` still
+presents everything on the calling thread. `SV_PRESENT_SYNC=0` now also
+pipelines Wayland, to measure what that is worth, and brings the crash back.
+
+Regression test: `wsi::tests::a_wayland_present_is_finished_before_vk_queue_present_returns`.
+It fails on the old rule (Wayland pipelined), which was checked by putting the
+old rule back. Two more tests pin X11, headless and `SV_PRESENT_SYNC`. Nothing
+else changed: the synchronous path is the one §88 kept for comparison.
+
+### 98.6 The runs
+
+Every run is the recipe of 98.2, 120 s. A run counts only if Firefox stayed on
+hardware WebRender to the end. Seven did not: the harness's 64 MiB arena ran out
+(§95.4) and Firefox logged `Fallback WR to SW-WR`, after which its frames no
+longer go through this ICD's present. All seven quit cleanly, and every crash
+came from a run that had not fallen back.
+
+| build | runs that count | crashed at quit |
+|---|---|---|
+| before, as deployed | 4 | **2** (SIGSEGV, SIGSEGV) |
+| before, with the logging of 98.3 | 8 | **1** (SIGABRT, run p) |
+| before, by `SV_PRESENT_SYNC=0`, crash reporter on | 2 | 0 |
+| **after** | 9 | **0** |
+| before, by `SV_PRESENT_SYNC=0`, and a 30 ms sleep before the frame is shown | 4 (2 on a 64 MiB arena, 2 on 256 MiB) | **4** (SIGSEGV, SIGSEGV, SIGABRT, SIGSEGV) |
+| **after**, and the same 30 ms sleep, which now happens inside `vkQueuePresentKHR` | 6 (2 on 64 MiB, 4 on 256 MiB) | **0** |
+
+The first three rows say the crash comes in about one run in five (3 of 14), so
+9 clean runs after the fix would still happen by luck about one time in eight.
+The last two rows settle it. The sleep (a temporary build, not committed) holds
+each frame back before its `attach` and `commit`. Pipelined, that only widens
+the window between `vkQueuePresentKHR` returning and the frame reaching the
+surface, and Firefox crashed in `Surface::put` on `sv-present`, the same stack
+as 98.3. After the fix the same sleep runs inside Firefox's swap, under its
+lock, so Firefox waits for it before destroying the surface.
+
+### 98.7 What it costs
+
+On the workstation, `scroll` mode (40 wheel steps, three rounds), Firefox on
+Zink on this ICD on RADV:
+
+| | after (synchronous) | before (`SV_PRESENT_SYNC=0`) |
+|---|---|---|
+| scroll fps, no frame trace | 60.3, 60.2, 60.3 (p99 17.7, 17.7, 17.4 ms) | 60.2, 60.1, 60.2 (p99 18.9, 18.7, 18.9 ms) |
+| scroll fps, frame trace on | 59.6, 59.5, 59.5 (p99 20.4, 20.5, 20.4 ms) | 60.3, 60.0, 60.2 (p99 18.2, 18.7, 18.2 ms) |
+| present on the renderer thread, median | 5.2 ms (fence wait 4.96, `wl_shm` put 0.28) | 0.01 ms |
+| Firefox between presents, median | 11.1 ms | 16.7 ms |
+
+Here the renderer thread's 11 ms of its own work plus the 5 ms wait still fit in
+a 16.7 ms frame, so the rate holds; with the trace on (more work per frame) it
+slips by about one frame in a hundred. On the guest §88 measured the wait and
+the copy at 2.0 and 1.2 ms, and the scroll there reached 60 fps only with every
+change of §88 in place. **The guest's number has to be measured** (ssh was down
+while this was written): `wc-launch.sh` deploys with `SV_PRESENT_SYNC` unset,
+and the same scroll run with and without `SV_PRESENT_SYNC=0` in `gpu.env` is
+the comparison. If it costs frames there, the way to win them back without the
+crash is to make the wait shorter, not to move it off the calling thread: for
+example, a `wl_shm` pool on the arena itself, which removes the 1.2 ms copy.
+
+### 98.8 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 102 binaries, 2946 passed, 8 ignored; the one failure was the citation check, run before this section existed |
+| `cargo test -p sv-icd` after the last change | 34 passed, 0 failed |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in `wsi.rs` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| the citation check (`design_citations`) | passes: 0 missing, §98's included |
+| the recipe, 120 s, after the fix | 9 runs that count, 0 crashes; 6 more with the window widened, 0 crashes (98.6) |
