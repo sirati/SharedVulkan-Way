@@ -30769,7 +30769,7 @@ needed there.
 ### 99.2 The hub
 
 `sv-hostd bell-hub --port UPSTREAM=HUB …`, the user unit
-`wc-bell-hub.service` (`Restart=always`), started by `wc-launch.sh deploy`
+`wc-bell-hub.service` (`Restart=always`), started (never restarted) by `wc-launch.sh deploy`
 and by `wc-session` if a session finds it down. It runs as the user and
 refuses to run as root.
 
@@ -30789,6 +30789,13 @@ refuses to run as root.
   bounded queue of its own (256 writes), and so does the upstream. A full
   queue drops the byte and counts it; a client that stops reading, crashes
   or hangs costs only its own bells, and a client that leaves is forgotten.
+
+**A hub restart costs running sessions their bells.** Clients (an ICD's
+doorman, a proxy's ring wake) do not reconnect, so after a restart every
+session then running waits out its slices until it ends: slower, never
+wrong. So `wc-launch.sh deploy` starts the hub when none runs and never
+restarts a running one; a new binary takes effect at its next start.
+Reconnecting clients would remove even that, and are left as follow-up.
 
 Without the hub, a session falls back to holding the port itself and says
 so in capitals (`NO SHARED DOORBELL HUB`), which is the pre-§99 behaviour.
