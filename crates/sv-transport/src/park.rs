@@ -614,7 +614,14 @@ impl Parker for Futex {
             if deadline.expired(now) {
                 break ParkOutcome::TimedOut;
             }
-            sys::wait(bell.wake, seen, slice.min(deadline.remaining(now)));
+            let rung = slice.min(deadline.remaining(now));
+            if sleep_the_rung(rung, cfg!(windows), cross_wake().is_some()) {
+                // See `sleep_the_rung`: nothing can end this wait early, and
+                // `WaitOnAddress` would make the rung a whole timer tick.
+                std::thread::sleep(rung);
+            } else {
+                sys::wait(bell.wake, seen, rung);
+            }
             // **Did the bell release us, or did the slice expire?** Observable,
             // and not by a stopwatch: `wake` is bumped only by `Bell::ring` or
             // `Bell::ring_local`, so a value that differs from the one this wait
@@ -644,6 +651,37 @@ impl Parker for Futex {
         }
         outcome
     }
+}
+
+/// Windows' default timer period, which is what a `WaitOnAddress` timeout is
+/// rounded up to in a process that has not raised the resolution (and none of
+/// ours does: `wc-compositor/src/tick.rs` says why not).
+const WINDOWS_TICK: Duration = Duration::from_micros(15_625);
+
+/// Whether a ladder rung of length `rung` should be a plain high-resolution
+/// sleep rather than a wait on the doorbell word.
+///
+/// # A guest without a doorbell paid a timer tick a rung (waycompose-design.md §91.3)
+///
+/// [`Futex::first_slice`] says the guest's first rung is 1 ms. **Measured on
+/// testhost's guest it is 16:** `WaitOnAddress` with a 1 ms timeout returned
+/// after p10 15.51, p50 15.98, p90 16.22 ms, and 2 ms and 8 ms timeouts after
+/// the same, because the timeout is rounded up to the 15.625 ms tick. With a
+/// doorbell that never shows: a delivered wake ends the wait at once. Without
+/// one, which is a medium-integrity launch before §91's port descriptor, every
+/// rung of every wait was a whole tick, a guest round trip ran 16–32 ms, and
+/// Firefox's GPU process took minutes to come up.
+///
+/// A rung shorter than a tick, on Windows, in a process with **no cross-VM
+/// doorbell installed**, is therefore a `std::thread::sleep`, which on Windows
+/// 10 1803 and later is a high-resolution waitable timer (0.57 ms for a 100 µs
+/// request, 1.58 ms for 1 ms, on the same guest). Nothing is lost by not
+/// waiting on the word: without a `Doorman` nobody on this kernel rings it for
+/// a cross-VM peer, and a same-kernel producer's wake is seen at the end of the
+/// rung, which the ladder already bounds at twice the wait. With a doorbell the
+/// word is waited on as before, so a delivered wake still ends the wait at once.
+fn sleep_the_rung(rung: Duration, windows: bool, have_cross_wake: bool) -> bool {
+    windows && !have_cross_wake && rung < WINDOWS_TICK
 }
 
 /// The one syscall each side of the doorbell needs.
@@ -1117,6 +1155,21 @@ mod tests {
     /// Linux timer slack whatever `initial_sleep` says — which is the whole
     /// reason [`Futex`] exists.
     ///
+    /// §91.3: only a Windows process with no cross-VM doorbell sleeps its short
+    /// rungs; with a doorbell, a long rung, or on Linux (whose futex timeout is
+    /// honoured to the microsecond) the rung is a wait a wake can end.
+    #[test]
+    fn only_a_windows_wait_with_no_doorbell_sleeps_its_short_rungs() {
+        let short = Duration::from_micros(25);
+        let tick = WINDOWS_TICK;
+        assert!(sleep_the_rung(short, true, false));
+        assert!(sleep_the_rung(Duration::from_millis(8), true, false));
+        assert!(!sleep_the_rung(tick, true, false), "a tick or longer costs nothing extra as a wait");
+        assert!(!sleep_the_rung(Duration::from_millis(20), true, false));
+        assert!(!sleep_the_rung(short, true, true), "a delivered doorbell must still end the wait");
+        assert!(!sleep_the_rung(short, false, false), "Linux's futex timeout is honoured");
+    }
+
     /// The threshold is 5 ms rather than 50 µs because this runs on a shared
     /// machine and under Miri's siblings; what it is protecting against is the
     /// doorbell not being rung *at all*, which is a wait to the 20 ms slice.

@@ -697,6 +697,56 @@ run)
       fi
       ;;
   esac
+  # THE GTK SHEET, FOR THE DIALOGS -- docs/waycompose-design.md §91.8.
+  #
+  # The seventh word is a gtk.css that pads every GTK header bar's end by the
+  # width of Windows' caption buttons, because the compositor folds the caption
+  # of GTK's dialogs (the file chooser, Save As, Print) just as it does
+  # Firefox's main window, and without it the file chooser's Open button sat
+  # under Windows' close button. GTK reads gtk.css and settings.ini from
+  # $XDG_CONFIG_HOME/gtk-{3,4}.0 and nowhere else a launcher can reach, and the
+  # user's real ~/.config is not ours to write. So the application gets a
+  # session-private XDG_CONFIG_HOME that is an overlay of the real one: every
+  # entry of it is a symbolic link back to the user's, so user-dirs.dirs, the
+  # file chooser's bookmarks, dconf (the icon theme), fontconfig, mimeapps.list
+  # and ~/.config/mozilla behave as before -- measured: a bare private
+  # directory lost the sidebar's folders and the icon theme. Only gtk.css and
+  # settings.ini are replaced: gtk.css imports the user's own first, and
+  # settings.ini is the user's with gtk-decoration-layout set to none, so a GTK
+  # window with a header bar draws no second set of window buttons. A file an
+  # application creates at the top of the directory lands in the overlay and
+  # goes with the session; one written through a link lands in the user's.
+  GTKCSS=$(unb64 "${7:-}")
+  CONFIG_ENV=()
+  if [ -n "$GTKCSS" ]; then
+    REAL="${XDG_CONFIG_HOME:-$HOME/.config}"
+    C="$D/xdg-config"
+    rm -rf "$C"; mkdir -p "$C"
+    for e in "$REAL"/* "$REAL"/.[!.]*; do
+      [ -e "$e" ] || [ -L "$e" ] || continue
+      case "${e##*/}" in gtk-3.0|gtk-4.0) ;; *) ln -s "$e" "$C/${e##*/}" ;; esac
+    done
+    for v in gtk-3.0 gtk-4.0; do
+      mkdir -p "$C/$v"
+      for e in "$REAL/$v"/*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in gtk.css|settings.ini) ;; *) ln -s "$e" "$C/$v/${e##*/}" ;; esac
+      done
+      {
+        [ -f "$REAL/$v/gtk.css" ] && printf '@import url("file://%s");\n' "$REAL/$v/gtk.css"
+        printf '%s\n' "$GTKCSS"
+      } > "$C/$v/gtk.css"
+      {
+        if [ -f "$REAL/$v/settings.ini" ]; then
+          grep -v '^[[:space:]]*gtk-decoration-layout[[:space:]]*=' "$REAL/$v/settings.ini"
+        else
+          echo '[Settings]'
+        fi
+        echo 'gtk-decoration-layout=:'
+      } > "$C/$v/settings.ini"
+    done
+    CONFIG_ENV=(XDG_CONFIG_HOME="$C")
+  fi
   DBUS=""
   [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
   # shellcheck disable=SC2086
@@ -705,6 +755,7 @@ run)
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
+    "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
     $CMD >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*}"
