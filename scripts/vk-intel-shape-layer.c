@@ -1,8 +1,9 @@
 /*
  * VK_LAYER_SV_intel_shape: make a local driver answer the video queries the
- * way the testhost guest's Intel driver (igvk64.dll 101.7076) answers them,
+ * way the testhost guest's Intel driver (igvk64.dll 101.7076, and 101.7092,
+ * which answers every video query the same, §7.13) answers them,
  * so that an application on top takes the code path it takes on the guest.
- * docs/video-decode.md §7.10, §7.12.
+ * docs/video-decode.md §7.10, §7.12, §7.13.
  *
  * Only *answers* change, and only toward less: the driver underneath still has
  * every capability the application is told about, so whatever the application
@@ -35,6 +36,11 @@
  *   - SV_SHAPE_SEPARATE_REFS=0 also clears SEPARATE_REFERENCE_IMAGES, which
  *     makes ffmpeg's dedicated DPB one layered image instead of one image per
  *     picture.
+ *   - SV_SHAPE_HIDE_EXT names further device extensions to hide (§7.13.5
+ *     hid VK_EXT_external_memory_host from ffmpeg this way).
+ *   - SV_SHAPE_DECODE_FLAGS=N replaces the decode capability flags outright
+ *     (1 COINCIDE, 2 DISTINCT, 3 both). Over the forwarded Intel device this
+ *     is how §7.13.5 told the two output modes apart.
  *
  * Build, inside `nix develop` for the Vulkan headers, into a directory beside
  * the manifest scripts/VkLayer_sv_intel_shape.json:
@@ -68,6 +74,9 @@ static int is_hidden(const char *name) {
     const char *keep = getenv("SV_SHAPE_KEEP_EXT");
     if (keep && strstr(keep, name))
         return 0;
+    const char *hide = getenv("SV_SHAPE_HIDE_EXT");
+    if (hide && strstr(hide, name))
+        return 1;
     for (size_t i = 0; i < sizeof hidden / sizeof hidden[0]; i++)
         if (!strcmp(name, hidden[i]))
             return 1;
@@ -210,6 +219,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL shape_GetPhysicalDeviceVideoCapabilitiesKH
                     codec_name(profile->videoCodecOperation), before, caps->flags, d->flags,
                     d->flags & ~VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR, caps->maxDpbSlots);
             d->flags &= ~VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR;
+            const char *df = getenv("SV_SHAPE_DECODE_FLAGS");
+            if (df && *df) {
+                d->flags = (VkVideoDecodeCapabilityFlagsKHR)strtoul(df, NULL, 0);
+                fprintf(stderr, "[intel-shape] decode flags replaced: 0x%x (SV_SHAPE_DECODE_FLAGS)\n", d->flags);
+            }
         }
     }
     return r;
