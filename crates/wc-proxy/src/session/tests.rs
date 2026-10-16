@@ -2110,6 +2110,46 @@ fn a_selection_too_big_for_the_compositor_keeps_its_text() {
     assert_eq!(dropped.len(), 2);
 }
 
+/// §93. A client that writes more than the compositor can hold is not read
+/// past the cap — the buffer does not grow without end — and nothing is
+/// published: the system clipboard is left as it was.
+#[test]
+fn a_copy_larger_than_the_cap_stops_being_read_and_publishes_nothing() {
+    let (mut h, manager, device) = clipboard_harness();
+    let source = h.id();
+    h.send_words(manager, rq("wl_data_device_manager", "create_data_source"), &[source]);
+    let body = string_body("text/plain");
+    h.send(source, rq("wl_data_source", "offer"), &body, &mut VecDeque::new());
+    h.send_words(device, rq("wl_data_device", "set_selection"), &[source, 1]);
+    let (_, fds) = h.session.take_client_messages();
+    let pipe = std::fs::File::from(fds.into_iter().next().unwrap());
+    let writer = std::thread::spawn(move || {
+        use std::io::Write as _;
+        let block = vec![b'a'; 1 << 20];
+        let mut sent = 0usize;
+        // Until the reader stops: an EPIPE once the proxy has let go.
+        while (&pipe).write_all(&block).is_ok() {
+            sent += block.len();
+            if sent > 2 * MAX_SELECTION_BYTES {
+                break;
+            }
+        }
+        sent
+    });
+    let started = std::time::Instant::now();
+    while h.session.clip_busy() && started.elapsed() < std::time::Duration::from_secs(20) {
+        h.session.pump_transfers();
+    }
+    assert!(!h.session.clip_busy(), "the pull ended at the cap");
+    assert!(h.session.take_selection().is_none(), "nothing that large is published");
+    let sent = writer.join().unwrap();
+    assert!(sent <= MAX_SELECTION_BYTES + (2 << 20), "the reader stopped near the cap ({sent})");
+    assert!(
+        h.session.take_notes().iter().any(|n| n.contains("larger than the compositor holds")),
+        "and says so"
+    );
+}
+
 /// §93. The cap is the compositor's, written down on both sides; this pins
 /// the two to each other.
 #[test]

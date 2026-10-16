@@ -28745,7 +28745,8 @@ Firefox lives ("CSMALL:true" after the refusal). With both halves new, the
 A smaller fault in the same path: the copy deadline (2 s) counted from the
 start of the pull. A client still writing a long selection after 2 s was
 published cut off in the middle. The deadline now counts from the last byte
-received.
+received. Past the cap it stops reading, so a client that never goes quiet
+cannot grow the buffer without end.
 
 **Pictures did not cross.** The proxy pulled only text and HTML, and the
 compositor knew only `CF_UNICODETEXT`, `"HTML Format"` and `CF_HDROP`. The
@@ -28837,7 +28838,7 @@ after 06:38 ran without input.
 
 | gate | result |
 |---|---|
-| `cargo test --workspace` (master `ab9f6d1` merged) | **2867 passed, 0 failed**, 8 ignored (master 2852). New: `held_loss` (5), `the_selection_cap_is_thirty_two_mebibytes`, five picture tests in `clipboard.rs`, `a_copy_still_being_written_past_the_deadline_is_published_whole`, `a_selection_too_big_for_the_compositor_keeps_its_text`, `the_selection_cap_is_the_compositors`, `a_dead_feed_answers_its_pastes_and_writes_nothing_more` |
+| `cargo test --workspace` (master `ab9f6d1` merged) | **2868 passed, 0 failed**, 8 ignored (master 2852). New: `held_loss` (5), `the_selection_cap_is_thirty_two_mebibytes`, five picture tests in `clipboard.rs`, `a_copy_still_being_written_past_the_deadline_is_published_whole`, `a_selection_too_big_for_the_compositor_keeps_its_text`, `a_copy_larger_than_the_cap_stops_being_read_and_publishes_nothing`, `the_selection_cap_is_the_compositors`, `a_dead_feed_answers_its_pastes_and_writes_nothing_more` |
 | `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 | `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
