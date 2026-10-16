@@ -28599,3 +28599,272 @@ windows that would. The measurement on the guest is in 91.7.
 | changed | `wc-launch.exe` `22c7fdf1…` to `91a62e28…`, `sv-guest.exe` `b458eb1b…` to `9f62c1c9…`, `wc-session`, `wc-proxy`, `wc-arena-host`, `sv-hostd`, and `libsv_icd.so` `e71f5a89…` to `53632f4e…` (the same ICD source as master, built in this worktree); `runint.ps1`; new `wc-port-access.ps1` |
 | unchanged | `wc-desk.exe`, `probe-relay.exe`, `click.ps1`; the ini and `gpu.env` byte-identical |
 | the test install `wcmil` | left installed and stopped (`C:\Users\<guest-user>\wcmil`, `~/wc-launch-mil`, profile `~/.wc-launch/firefox-mil`), with no desktop shortcut; its agent and scheduled tasks are removed |
+
+## 93. Two bugs from real use: the clipboard, and a menu that closes instead of opening
+
+Branch `clip-submenu`, 2026-10-16. The user reported both from the guest's
+desktop. First, the clipboard is not shared between Windows and Linux
+programs ("last time i tried this didnt work"). Second, in Firefox's menu,
+choosing an item that opens a submenu, such as Help on the way to About
+Firefox, closes the whole menu. The evidence is in `docs/clip-submenu/`.
+
+### 93.1 Status in one paragraph
+
+**The menu** is found and fixed. Clicking a menu item moved Windows'
+activation and keyboard focus to the popup's HWND. Firefox heard its window
+lose focus and rolled its menus up, so the click landed on a menu that was
+already closing. Popups now refuse activation, and the compositor no longer
+passes a focus move between a window and its own popups on to the client
+(93.2). This is proven under Wine, where it reproduced, for three cases:
+Help → About Firefox, a nested bookmarks folder, and a `<select>`. **The
+clipboard**: the paths §90 tested work on the guest, including the real
+double-click route, and Unicode, emoji, line breaks and HTML arrive intact
+(93.4). Three defects were found that a person meets and a test does not
+(93.3):
+- whatever was on the Windows clipboard before a session started was never
+  offered;
+- **a copy over 4 MiB ended Firefox's connection**, so Firefox showed its
+  crash reporter and the clipboard died;
+- pictures did not cross at all.
+
+All three are fixed and tested under Wine; `scripts/wc-clip.sh` covers
+pictures, 17 passed. The guest checks with real Windows programs (Notepad,
+Word, the Run box) did not run. A bug in this branch's test agent locked
+<guest-user>'s session at 06:38 (93.6), and input on the guest stopped there.
+Nothing is deployed to `wcivs` (93.8).
+
+### 93.2 The menu: a click activated the popup
+
+Under Wine with `wc-compositor.exe` from master, the first click opened the
+hamburger menu as window 2. The click on "Help and Report" then produced
+this (`wine-menu-logs.txt`):
+
+```
+wc-compositor: window 1 lost keyboard focus
+wc-compositor: window 2 has keyboard focus
+wc-compositor: window 2 pointer button 0x110 pressed
+wc-compositor: window 2 pointer button 0x110 released
+wc-compositor: xdg_popup destroyed -> window 2
+```
+
+The compositor sent no `popup_done`; Firefox closed the menu itself. Its
+popups are created `WS_EX_NOACTIVATE`. That style keeps a window from
+becoming the *foreground* window, and that is all it promises. Under Wine
+a click on it still activated it and gave it focus within the active
+thread, so window 1 got `WM_ACTIVATE(WA_INACTIVE)` and `WM_KILLFOCUS`.
+Whether real Windows does the same was not measured (93.8). The client
+heard `wl_keyboard.leave` and lost `activated`, and Firefox rolls every
+menu up when its window loses focus (§85.4 found that Firefox never grabs
+its popups, so nothing on the Wayland side held them open either).
+`keyboard_target`'s comment said the focused HWND "is always a toplevel
+because a popup is `WS_EX_NOACTIVATE`", and that was the false premise.
+
+A menu in the menu bar opens its submenu on hover, so it never showed
+this. Only a click inside a popup does. Hamburger items such as Help,
+Bookmarks and More Tools need a click, and so does any item in a nested
+popup.
+
+The fix has two halves. Each one alone fixes the reproduction
+(`wine-menu-logs.txt`):
+- **The platform.** A popup answers `WM_MOUSEACTIVATE` with `MA_NOACTIVATE`.
+  That is what Windows' own menus and tooltips do: the click is delivered,
+  and neither activation nor focus moves.
+- **The compositor.** It no longer trusts the platform here. A popup that
+  gets focus or activation anyway hands it to its toplevel; in Wayland a
+  popup without a grab never has the keyboard. A loss of focus or
+  activation is held for 30 ms (`HeldLoss`, `FOCUS_MOVE_GRACE`). If the
+  same window, or one of its popups, takes it back in that time, the
+  client hears nothing. A real move to another window is told as before,
+  the held loss first.
+
+After the fix, under Wine, with this branch's binaries:
+
+| gesture | result |
+|---|---|
+| hamburger → "Help and Report" | the panel stays open on the Help subview (`wine-after-help-panel.png`; before: `wine-before-after-help-click.png`, no menu) |
+| → "About Firefox" | `window 3 title -> "About Mozilla Firefox"` |
+| Bookmarks (Alt+B) → hover "Mozilla Firefox" → click the first item of the nested popup | both popups open (`wine-after-bookmarks-nested.png`); the click navigated to "Firefox Help" (`wine-after-bookmarks-item-clicked.png`) |
+| a `<select>`: open, click "gamma" | `title -> "SEL:gamma"` (`wine-select-open.png`) |
+
+The About window is black under Wine. That is §85.7's second window, which
+§90.7 showed is Wine's: the same Firefox renders it on the guest. WLCS
+headless gives the same result as master (93.7), so the protocol's grab
+behaviour is unchanged. Context-menu submenus such as "Send to device"
+appear only with a signed-in account and were not exercised.
+
+### 93.3 The clipboard: three defects
+
+**The clipboard as it was at start-up was never offered.** The compositor
+announced the Windows clipboard to Wayland only on `WM_CLIPBOARDUPDATE`,
+which reports a *change*. Take the ordinary sequence: copy a URL in another
+program, double-click the shortcut, paste into Firefox's address bar. It
+pasted nothing until something was copied again. The same happened to
+every window opened after a session ended; a session ends 60 s after its
+last window closes. The platform now announces the clipboard once, after
+it registers its listener:
+
+```
+wc-compositor: at start-up, the clipboard already holds: [CF_UNICODETEXT] -> 5 mime type(s)
+```
+
+That line is from the guest (`guest-clipboard.txt`). The paste that should
+follow it was not made there (93.6).
+
+**A copy over 4 MiB ended Firefox.** This reproduced under Wine with master's
+binaries. The test page's button runs `execCommand('copy')` on 6,291,488
+characters (`wine-clipboard-logs.txt`):
+
+```
+[proxy] client 2: the client's selection is 7077924 byte(s) across 1 mime type(s): text/plain;charset=utf-8
+wc-compositor: client ... disconnected: ProtocolError(... "more staged bytes than the compositor holds")
+[proxy] client 2 failed: Broken pipe (os error 32)
+wc-compositor: window 2 title -> "Firefox Crash Reporter"
+```
+
+Three faults are in line here:
+1. `wc_clipboard_manager_v1.chunk` past `MAX_SELECTION_BYTES` (4 MiB) was a
+   protocol error, which ended the feed.
+2. The proxy went on writing the queued chunks into the closed socket.
+3. The pump's `?` turned that EPIPE into the end of Firefox's own Wayland
+   connection, and Firefox reports a lost display as a crash (§85.3).
+
+4 MiB is a long page selected with Ctrl+A once its HTML comes along. Fixes:
+- The cap is 32 MiB on both sides, and a test pins the two numbers to each
+  other.
+- The proxy leaves out what does not fit, HTML before text (`fit_selection`).
+- The compositor refuses an oversize selection without ending the feed
+  (`Staging::overflowed`).
+- `ClipLink` stops writing once it gives up.
+- The pump drops a failed feed and answers every open paste; the icon feed
+  gets the same treatment. The client goes on.
+
+With the new proxy against the old compositor, the feed is dropped and
+Firefox lives ("CSMALL:true" after the refusal). With both halves new, the
+7 MB selection is published and the next small copy works.
+
+A smaller fault in the same path: the copy deadline (2 s) counted from the
+start of the pull. A client still writing a long selection after 2 s was
+published cut off in the middle. The deadline now counts from the last byte
+received.
+
+**Pictures did not cross.** The proxy pulled only text and HTML, and the
+compositor knew only `CF_UNICODETEXT`, `"HTML Format"` and `CF_HDROP`. The
+proxy dropped Firefox's "Copy Image" as "none of which this clipboard
+carries", and a screenshot copied in Windows was offered to no one. Now:
+- `image/png` goes on as the registered `"PNG"` (browsers, Office and the
+  Snipping Tool read it) and as `CF_DIB`: 32-bit BGRA, bottom-up, for Paint
+  and everything else.
+- A `"PNG"` or a `CF_DIB` on the Windows clipboard is offered as
+  `image/png`.
+- The DIB reader takes the shapes Windows hands out: a 40-byte header or a
+  V4/V5 one; 32-bit `BI_RGB` or `BI_BITFIELDS`; 24-bit; and 1-, 4- or 8-bit
+  with a palette; top-down or bottom-up. An all-zero fourth byte means
+  opaque.
+- A paste now reads only the formats that can answer its type. Before, a
+  request for `text/html` also read `CF_UNICODETEXT`, and `GetClipboardData`
+  on a program that renders late (Word) makes that program render.
+
+Under Wine: the page's "copy image" button (`navigator.clipboard.write`)
+published `[PNG 280 bytes, CF_DIB 12328 bytes]`. A `CF_DIB` put there by
+`probe-clip.exe` was pasted into a contenteditable as `image/png(104)`.
+`wc-clip.sh` checks both directions with `wl-copy` and `wl-paste`.
+
+### 93.4 On the guest
+
+The test install is `C:\Users\<guest-user>\wcclip`, session `wcc`, port 57521, with
+the host half in `~/wc-launch-clip`. It was launched as a double-click is: a
+ShellExecute of its `.lnk` from a process at the Limited run level. The
+launcher ran at integrity `0x2000`, and §91's port access gave it the rings
+and both doorbells (`guest-clipboard.txt`). Input came from the session-1
+agent of §90 (`SendInput`, guarded to our windows).
+
+| check | result |
+|---|---|
+| Windows → Firefox, `Set-Clipboard` then Ctrl+V in a textarea | `Grüße ✓ 漢字 😀`, LF, `https://example.org/?q=1&r=ü`: every code point |
+| Firefox → Windows, Ctrl+A Ctrl+C in the textarea | the same text with CRLF; owner `sv-guest.exe`; `CF_TEXT`, `CF_OEMTEXT` and `CF_LOCALE` synthesised by Windows |
+| Firefox page selection → Windows | `CF_UNICODETEXT` and `"HTML Format"` |
+| start-up announcement (second deploy) | the line above; no paste (93.6) |
+| Notepad, Word, the Run box, images, a big copy, the menu, the ssh fallback route | **not run** (93.6) |
+
+Two facts about the guest bear on what the user saw:
+- **One session at a time.** The ivshmem device allows one mapping, and the
+  doorbell port one opener. A second install's double-click while another
+  install's session is up gets `ERROR_ACCESS_DENIED` on the port and error
+  548 on the device, and no window. Within one install the launcher's mutex
+  prevents this; across installs nothing does. The coordinator's guest
+  lease exists for this.
+- The clipboard feeds still cross ssh in every arrangement (§89.12).
+  Nothing in this run showed them slow.
+
+### 93.5 What the user probably met
+
+It cannot be known which of these it was. The ones a person meets in
+normal use:
+1. Copying before opening Firefox, then pasting (93.3, the first defect).
+2. Before §91, a real double-click gave a session whose window came minutes
+   late, rendered in software, with everything on ssh (§90.3).
+3. Copying a large selection: Firefox ended and showed its crash reporter
+   (93.3, the second defect).
+4. Copying or pasting a picture (93.3, the third defect).
+
+Short text in a running session worked before this branch, and still does.
+
+### 93.6 Incident: <guest-user>'s session locked
+
+From 06:34 to 06:38 the test agent in session 1 ran one command batch in a
+loop. A command had overwritten the variable that held the batch's file,
+so the batch was never removed. The batch held a Win+R chord sent as
+non-extended scancodes, and Ctrl+L. At 06:38:14 LogonUI and LockApp
+started: <guest-user>'s session was locked, most likely by a stuck Win key plus
+L. Locking ends nothing (<guest-user>'s programs keep running), but <guest-user> has to
+unlock it. Three more consequences:
+- The loop's copies filled the Windows clipboard history (25 entries) and
+  pushed <guest-user>'s older entries out.
+- The text that was on <guest-user>'s clipboard at 06:19 was saved only in the
+  agent's memory, and was lost when the agent was stopped.
+- Clipboard access is denied while the session is locked, so the test text
+  left on it (`PRE-SESSION ü 42 wcc-pre`) could not be cleared.
+
+The 25 history entries, all this branch's, were deleted through the WinRT
+`Clipboard` history API from a non-interactive process; the history is now
+empty. The agent is fixed: the loop variable is its own, a command file is
+removed before it runs, and the Win key goes out extended. But no chord with
+a Win key, and no input loop, belongs on a person's desktop at all. Those
+rules are now in `visual-check-instructions.md`. Everything on the guest
+after 06:38 ran without input.
+
+### 93.7 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` (master `ab9f6d1` merged) | **2867 passed, 0 failed**, 8 ignored (master 2852). New: `held_loss` (5), `the_selection_cap_is_thirty_two_mebibytes`, five picture tests in `clipboard.rs`, `a_copy_still_being_written_past_the_deadline_is_published_whole`, `a_selection_too_big_for_the_compositor_keeps_its_text`, `the_selection_cap_is_the_compositors`, `a_dead_feed_answers_its_pastes_and_writes_nothing_more` |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-clip.sh wine` | **17 passed, 0 failed**: §29's 15, and pictures in both directions |
+| `scripts/wc-wlcs.sh headless` | **429 passed, 37 failed, 759 skipped**: master's (§91.9) |
+| `scripts/wc-xref.sh --list` | 1207 citations resolve, 0 missing |
+
+### 93.8 What is deployed, and what remains
+
+Nothing is deployed to `wcivs`. The fixes are proven under Wine and, for the
+clipboard's basic paths, on the guest. The menu and the real-program checks
+need an unlocked session. The test install `wcclip` holds this branch's
+build (the second deploy, before the master merge). The way to deploy, once
+the guest checks below pass, is §91.10's: back up to `wcivs-backup-93`, then
+run `wc-launch.sh deploy` from the merged branch with §88.6's variables, and
+expect 13 passed.
+
+To run on the guest once <guest-user>'s session is unlocked, through the lease,
+with the session-1 agent and no Win-key chords:
+1. Hamburger → Help and Report → About Firefox; Bookmarks → a folder → an
+   item; a `<select>`. The question is whether real Windows activates a
+   clicked `WS_EX_NOACTIVATE` popup as Wine does. The fix covers both cases.
+2. Copy in a fresh Notepad window on a scratch file, a Word document opened
+   through COM, and the Run box; paste into each from Firefox.
+3. Copy text in Windows, then double-click, then paste (the start-up
+   announcement).
+4. The 6 MB copy, then a small one; "copy image" pasted into Paint or Word;
+   a Snipping Tool picture pasted into the page's paste zone.
+5. The ssh fallback, with `wayland-bell =` empty in `wcclip`'s ini.
+6. Clear the test text from the clipboard (`clear.ps1`).
