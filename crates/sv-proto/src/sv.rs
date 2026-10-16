@@ -318,6 +318,261 @@ impl DriverVersionsReply {
     }
 }
 
+
+/// `svArenaInfo`: how this session's arena is provided (waycompose-design.md
+/// §97). Asked once, at attach, on the instance ring.
+///
+/// The answer is either **fixed** — the arena is one window the app side was
+/// handed at attach and allocates from with `svImportArenaSlab`, as every path
+/// did before §97 — or **leased**: the arena is the GPU side's pool, and the
+/// app side asks for ranges of it with [`SV_LEASE_ARENA`] and gives them back
+/// with [`SV_RELEASE_ARENA`]. The question carries the application's name,
+/// which is only ever used in the GPU side's log of who holds what.
+pub const SV_ARENA_INFO: u32 = PROTOCOL_BASE + 3;
+
+/// `svLeaseArena`: lease a range of the pool, imported for this session's
+/// device, with the memory type it was imported as (§97).
+pub const SV_LEASE_ARENA: u32 = PROTOCOL_BASE + 4;
+
+/// `svReleaseArena`: give a lease back (§97). The GPU side frees its import
+/// first, so a range is never in another session's hands while this
+/// session's device still has it.
+pub const SV_RELEASE_ARENA: u32 = PROTOCOL_BASE + 5;
+
+/// The application name an [`ArenaInfo`] carries: 32 bytes, NUL-padded.
+pub const ARENA_NAME_LEN: usize = 32;
+
+/// [`ArenaInfoReply::mode`]: the arena is a fixed window.
+pub const ARENA_MODE_FIXED: u32 = 0;
+/// [`ArenaInfoReply::mode`]: the arena is leased from the GPU side's pool.
+pub const ARENA_MODE_LEASED: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArenaInfo {
+    pub name: [u8; ARENA_NAME_LEN],
+}
+
+impl ArenaInfo {
+    /// The name, cut to fit.
+    pub fn named(name: &str) -> ArenaInfo {
+        let mut n = [0u8; ARENA_NAME_LEN];
+        let b = name.as_bytes();
+        let len = b.len().min(ARENA_NAME_LEN);
+        n[..len].copy_from_slice(&b[..len]);
+        ArenaInfo { name: n }
+    }
+
+    /// The name as text, lossily, without its padding.
+    pub fn name_str(&self) -> String {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(ARENA_NAME_LEN);
+        String::from_utf8_lossy(&self.name[..end]).into_owned()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArenaInfoReply {
+    /// [`ARENA_MODE_FIXED`] or [`ARENA_MODE_LEASED`].
+    pub mode: u32,
+    /// Every lease's length and alignment is a multiple of this.
+    pub lease_granule: u64,
+    /// The most this session may lease, control region excepted.
+    pub session_cap: u64,
+    /// The pool's size now, and the most it can grow to.
+    pub capacity: u64,
+    pub max_capacity: u64,
+}
+
+/// What a lease is for; [`LeaseArena::purpose`]. The same numbers as
+/// `sv_arena::pool::Purpose`.
+pub const LEASE_BLOBS: u32 = 1;
+pub const LEASE_CHUNK: u32 = 2;
+pub const LEASE_DEDICATED: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeaseArena {
+    pub len: u64,
+    pub purpose: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeaseArenaReply {
+    /// `VK_SUCCESS`, or `VK_ERROR_OUT_OF_DEVICE_MEMORY` (-2) when the pool
+    /// cannot serve it, even after growing.
+    pub result: i32,
+    pub memory_type: u32,
+    /// The pool offset of the lease.
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReleaseArena {
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReleaseArenaReply {
+    pub result: i32,
+}
+
+const INFO_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + ARENA_NAME_LEN;
+const INFO_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8 + 32;
+const LEASE_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 16;
+const LEASE_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8 + 16;
+const RELEASE_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 8;
+const RELEASE_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8;
+
+fn command(out: &mut Vec<u8>, cmd_type: u32, size: usize) -> Result<Encoder<'_>> {
+    out.clear();
+    out.resize(size, 0);
+    let mut enc = Encoder::new(out);
+    CommandHeader { cmd_type, cmd_flags: sv_wire::CMD_FLAG_GENERATE_REPLY, cmd_size: size as u32 }
+        .encode(&mut enc)?;
+    Ok(enc)
+}
+
+fn reply(out: &mut Vec<u8>, cmd_type: u32, size: usize) -> Result<Encoder<'_>> {
+    out.clear();
+    out.resize(size, 0);
+    let mut enc = Encoder::new(out);
+    sv_wire::ReplyHeader { cmd_type, reply_size: size as u32 }.encode(&mut enc)?;
+    Ok(enc)
+}
+
+fn expect_command<'a>(payload: &'a [u8], cmd_type: u32) -> Result<Decoder<'a>> {
+    let mut dec = Decoder::new(payload);
+    let h = CommandHeader::decode(&mut dec)?;
+    if h.cmd_type != cmd_type {
+        return Err(WireError::UnknownCommand { opcode: h.cmd_type });
+    }
+    Ok(dec)
+}
+
+fn expect_reply<'a>(payload: &'a [u8], cmd_type: u32) -> Result<Decoder<'a>> {
+    let mut dec = Decoder::new(payload);
+    let h = sv_wire::ReplyHeader::decode(&mut dec)?;
+    if h.cmd_type != cmd_type {
+        return Err(WireError::UnknownCommand { opcode: h.cmd_type });
+    }
+    Ok(dec)
+}
+
+impl ArenaInfo {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_ARENA_INFO, INFO_SIZE)?;
+        enc.u32(0)?;
+        for w in self.name.chunks_exact(4) {
+            enc.u32(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))?;
+        }
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ArenaInfo> {
+        let mut dec = expect_command(payload, SV_ARENA_INFO)?;
+        let _pad = dec.u32()?;
+        let mut name = [0u8; ARENA_NAME_LEN];
+        for w in name.chunks_exact_mut(4) {
+            w.copy_from_slice(&dec.u32()?.to_le_bytes());
+        }
+        Ok(ArenaInfo { name })
+    }
+}
+
+impl ArenaInfoReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_ARENA_INFO, INFO_REPLY_SIZE)?;
+        enc.u32(self.mode)?;
+        enc.u32(0)?;
+        enc.u64(self.lease_granule)?;
+        enc.u64(self.session_cap)?;
+        enc.u64(self.capacity)?;
+        enc.u64(self.max_capacity)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ArenaInfoReply> {
+        let mut dec = expect_reply(payload, SV_ARENA_INFO)?;
+        let mode = dec.u32()?;
+        let _pad = dec.u32()?;
+        Ok(ArenaInfoReply {
+            mode,
+            lease_granule: dec.u64()?,
+            session_cap: dec.u64()?,
+            capacity: dec.u64()?,
+            max_capacity: dec.u64()?,
+        })
+    }
+}
+
+impl LeaseArena {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_LEASE_ARENA, LEASE_SIZE)?;
+        enc.u32(self.purpose)?;
+        enc.u64(self.len)?;
+        enc.u64(0)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<LeaseArena> {
+        let mut dec = expect_command(payload, SV_LEASE_ARENA)?;
+        let purpose = dec.u32()?;
+        let len = dec.u64()?;
+        let _pad = dec.u64()?;
+        Ok(LeaseArena { len, purpose })
+    }
+}
+
+impl LeaseArenaReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_LEASE_ARENA, LEASE_REPLY_SIZE)?;
+        enc.i32(self.result)?;
+        enc.u32(self.memory_type)?;
+        enc.u64(self.offset)?;
+        enc.u64(self.len)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<LeaseArenaReply> {
+        let mut dec = expect_reply(payload, SV_LEASE_ARENA)?;
+        Ok(LeaseArenaReply { result: dec.i32()?, memory_type: dec.u32()?, offset: dec.u64()?, len: dec.u64()? })
+    }
+}
+
+impl ReleaseArena {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_RELEASE_ARENA, RELEASE_SIZE)?;
+        enc.u32(0)?;
+        enc.u64(self.offset)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ReleaseArena> {
+        let mut dec = expect_command(payload, SV_RELEASE_ARENA)?;
+        let _pad = dec.u32()?;
+        Ok(ReleaseArena { offset: dec.u64()? })
+    }
+}
+
+impl ReleaseArenaReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_RELEASE_ARENA, RELEASE_REPLY_SIZE)?;
+        enc.i32(self.result)?;
+        enc.u32(0)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ReleaseArenaReply> {
+        let mut dec = expect_reply(payload, SV_RELEASE_ARENA)?;
+        Ok(ReleaseArenaReply { result: dec.i32()? })
+    }
+}
+
 /// A printable name for any opcode on a ring, ours or Vulkan's, for
 /// instruments (`WC_FRAME_TRACE`, docs/waycompose-design.md §88).
 pub fn opcode_name(op: u32) -> std::borrow::Cow<'static, str> {
@@ -325,6 +580,9 @@ pub fn opcode_name(op: u32) -> std::borrow::Cow<'static, str> {
         SV_EXECUTE_COMMAND_BLOB => "svExecuteCommandBlob".into(),
         SV_IMPORT_ARENA_SLAB => "svImportArenaSlab".into(),
         SV_DRIVER_VERSIONS => "svDriverVersions".into(),
+        SV_ARENA_INFO => "svArenaInfo".into(),
+        SV_LEASE_ARENA => "svLeaseArena".into(),
+        SV_RELEASE_ARENA => "svReleaseArena".into(),
         _ => match crate::Opcode::from_u32(op) {
             Some(o) => o.name().into(),
             None => format!("op{op:#x}").into(),
@@ -383,6 +641,51 @@ mod tests {
         // The patch digits must survive: they are the only part of the number
         // that distinguishes two drivers of the same minor version.
         assert_eq!(DriverVersionsReply::decode(&buf).unwrap().device_api_version & 0xfff, 323);
+    }
+
+    /// §97's three commands, each with its reply. Every one asks for a reply,
+    /// and every one puts its length where the ring looks for it.
+    #[test]
+    fn the_lease_commands_and_their_replies_round_trip() {
+        let mut buf = Vec::new();
+        let info = ArenaInfo::named("firefox-bin-with-a-name-longer-than-32");
+        info.encode(&mut buf).unwrap();
+        assert_eq!(ArenaInfo::decode(&buf).unwrap(), info);
+        assert_eq!(info.name_str(), "firefox-bin-with-a-name-longer-t");
+        assert!(wants_reply(&buf));
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize, buf.len());
+        let r = ArenaInfoReply {
+            mode: ARENA_MODE_LEASED,
+            lease_granule: 64 << 10,
+            session_cap: 720 << 20,
+            capacity: 256 << 20,
+            max_capacity: 768 << 20,
+        };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(ArenaInfoReply::decode(&buf).unwrap(), r);
+
+        let l = LeaseArena { len: 8 << 20, purpose: LEASE_CHUNK };
+        l.encode(&mut buf).unwrap();
+        assert_eq!(LeaseArena::decode(&buf).unwrap(), l);
+        assert!(wants_reply(&buf));
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize, buf.len());
+        let r = LeaseArenaReply { result: 0, memory_type: 1, offset: (1 << 32) | (24 << 20), len: 8 << 20 };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(LeaseArenaReply::decode(&buf).unwrap(), r);
+
+        let x = ReleaseArena { offset: (1 << 32) | (24 << 20) };
+        x.encode(&mut buf).unwrap();
+        assert_eq!(ReleaseArena::decode(&buf).unwrap(), x);
+        assert!(wants_reply(&buf));
+        let r = ReleaseArenaReply { result: -2 };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(ReleaseArenaReply::decode(&buf).unwrap(), r);
+        // One command's reply is not another's.
+        assert!(LeaseArenaReply::decode(&buf).is_err());
+        for op in [SV_ARENA_INFO, SV_LEASE_ARENA, SV_RELEASE_ARENA] {
+            assert!(crate::Opcode::from_u32(op).is_none());
+            assert!(is_protocol(op));
+        }
     }
 
     /// The one property that makes the two namespaces safe to share a `u32`.
