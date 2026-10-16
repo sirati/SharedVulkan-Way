@@ -80,6 +80,8 @@ use std::sync::OnceLock;
 
 pub mod local;
 pub mod lowering_context;
+// §96: hand-written writebacks for output links the generator refuses.
+mod writeback;
 
 // The generated crate body: the C ABI types, the lowering, the writeback, the
 // stubs, the `Icd` trait and the proc-address tables.

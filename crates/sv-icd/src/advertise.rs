@@ -366,6 +366,16 @@ pub const INSTANCE_EXTENSIONS: &[(&str, u32)] = &[
     // `wl_surface` has no id a second connection could name. See
     // `crate::present::wayland`.
     ("VK_KHR_wayland_surface", 6),
+    // §96. **Zink on Wayland creates every swapchain with
+    // `VK_COLOR_SPACE_PASS_THROUGH_EXT`**, unconditionally since Mesa 26.2
+    // (`zink_kopper.c`), and that colour space belongs to this extension: without
+    // it the request is invalid usage, which the validation layer in Minecraft
+    // reported on every swapchain (`VUID-VkSwapchainCreateInfoKHR-imageColorSpace-
+    // parameter`, `-imageFormat-01273`). It is also the true description of
+    // this WSI: the present copies the image's bytes into the window untouched,
+    // which is what "pass-through" means. An instance extension with no
+    // commands; `crate::wsi::surface_formats` lists the colour space.
+    ("VK_EXT_swapchain_colorspace", 5),
     // **Wine asks for these three on every instance it creates**, whatever the
     // application asked for, and `vkCreateInstance` fails with
     // `VK_ERROR_EXTENSION_NOT_PRESENT` if the host ICD does not have them. That
