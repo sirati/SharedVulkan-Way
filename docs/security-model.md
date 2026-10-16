@@ -1037,3 +1037,65 @@ descriptor above on both ports and removes the PnP property;
 `-Action uninstall` also removes the task and the Program Files copy. A port
 some process holds open cannot be opened to change it (it is exclusive), so run
 either with no session up.
+
+### R33 — Jump lists put a command on the guest that reaches the host
+Added 2026-10-16 with `waycompose-design.md` §92. A pinned Linux application's
+jump list has tasks ("Open new private window") and pages (the profile's most
+visited sites). Each entry is a Windows shortcut that runs
+`wc-launch.exe firefox --action new-private-window` or
+`wc-launch.exe firefox --url https://…`, and every entry on that list is written
+by the guest. So anyone who can write the guest user's jump-list files, or who
+can run `wc-launch.exe` with arguments of their choice, can ask the VM host to
+do something. This entry is the argument that what they can ask for is no more
+than what the launcher could already ask for.
+
+**What crosses is an id or a URL, never a command.** The guest sends:
+
+* `wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME]`.
+  `APPID` is a desktop id (`[A-Za-z0-9._+-]`, no leading dot, no `..`), checked
+  by `wc-session` and again by `wc-proxy desktop`, which looks it up as a file
+  name under `applications/` in the host's own data directories. `ACTION` is
+  an action id (`[A-Za-z0-9-]`, at most 64) and must be one the desktop entry
+  lists in `Actions=` with a `[Desktop Action …]` group, or the one action the
+  host defines in code (Firefox's `new-tab`, `--new-tab about:newtab`). Any
+  other id is refused (`desktop::tests::only_the_entry_s_own_action_ids_run`).
+* `wc-session open ID APPID B64URL B64EXE …`. The URL must be `http://`,
+  `https://` or `file:///`, so it can never begin with `-` and be read as an
+  option. It must have no whitespace, control character, quote, backslash or
+  non-ASCII byte, and be at most 4096 bytes
+  (`desktop::tests::urls_are_checked_strictly`). It becomes one argument, in
+  the slot the entry's own `Exec=` marks with `%u` (or `%U`, `%f`, `%F`). An
+  entry whose `Exec=` takes no URL cannot be asked to open one.
+
+**The argv is the host's.** `wc-proxy desktop action|open` builds the argument
+list from the desktop entry on the host. It follows the specification's quoting
+and field codes, refuses an action whose program differs from the entry's own,
+and refuses one whose arguments are not single words. `wc-session` then checks
+that the executable the launcher names (`B64EXE`, the `[app.*]` section's
+program) has the basename of the entry's program. It adds `--profile` only for
+a directory under `~/.wc-launch/`, as `run` always has, and hands the result to
+`run`. `run` now executes its command as an array split on whitespace with no
+pathname expansion (a URL's `?`, `*` and `[` are characters, not patterns), and
+nothing on this path is `eval`ed.
+
+**What this does not close: `run` itself.** `wc-session run ID CMD …` has
+carried a base64'd command line from the guest since §28, and `run` resolves
+its first word with `resolve_exec` and runs the rest as given. So a holder of
+the guest's key can already run any program on the VM host as `sirati`, under
+the forced command: name it as the first word. §28.5's "the guest cannot run
+anything on the VM host except the verbs" is true of the verbs and not of
+`run`'s argument. The new verbs do not widen this, and they could not narrow it
+alone. Closing it means `run` naming an application by desktop id, as `action`
+does, with the command line moved to the host. That would move the deployment's
+`--profile` and the readback Firefox's path out of `wc-launch.ini` into a file
+on the host, and it is recorded as §92's next step, not done here.
+
+**The jump list's pages are history.** `wc-session frequent` reads the launcher
+profile's `places.sqlite` and `favicons.sqlite`, from copies in a 0700 directory
+that are removed before it exits. It sends URLs, titles and favicons to the
+guest, as Windows' Firefox shows its own history in its own jump list. On the
+guest they are written to `%LOCALAPPDATA%\waycompose\jumplist` (favicons, and
+the URLs the user removed from the list) and to Windows' own jump-list file for
+the identity. Nothing on either side logs a URL or a title. Firefox's
+`browser.taskbar.lists.enabled` and `…frequent.enabled` turn the pages off.
+Private windows record no history, so nothing from one can appear.

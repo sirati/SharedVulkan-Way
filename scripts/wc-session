@@ -30,6 +30,13 @@
 #                                             session's ICDs, as this user, on ivshmem (§86, §87)
 #   wc-session audio ID                       the session's sound as raw PCM on stdout (§86)
 #   wc-session icon APPID                     the app's icon from this machine's theme
+#   wc-session app  APPID B64EXE THEME        the app's desktop entry: name, actions, task
+#                                             icons and icon, for the guest's pin and jump list (§92)
+#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#                                             run one of the desktop entry's actions, by id (§92)
+#   wc-session open ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#                                             open an http(s)/file URL in the slot its %u marks (§92)
+#   wc-session frequent B64PROFILE            the jump list's frequent pages and their favicons (§92)
 #   wc-session down ID                        stop the proxy and remove the run directory
 #   wc-session status ID
 #
@@ -157,6 +164,100 @@ resolve_exec() {
   return 1
 }
 
+
+# ------------------------------------------------------------ APPLICATIONS ---
+# docs/waycompose-design.md §92: the guest's pinned button, Start menu entry
+# and jump list are built from the application's desktop entry, which is on
+# this machine. These helpers find it and the tools that read it.
+
+# A tool from a package: the deploy step's GC-rooted link `$BIN/<pkg>` first
+# (WC_LAUNCH_SQLITE, WC_LAUNCH_RSVG), then PATH, then the newest
+# `/nix/store/*-<pkg>-<version>*/bin/<tool>`, sorted by what follows the hash.
+store_tool() {
+  local pkg="$1" tool="$2" p
+  if [ -x "$BIN/$pkg/bin/$tool" ]; then echo "$BIN/$pkg/bin/$tool"; return 0; fi
+  p=$(command -v "$tool" 2>/dev/null) && [ -n "$p" ] && { echo "$p"; return 0; }
+  p=$(ls -d /nix/store/*-"$pkg"-[0-9]*/bin/"$tool" 2>/dev/null \
+        | sed 's|^/nix/store/[^-]*-\(.*\)$|\1\t&|' | sort -V | tail -1 | cut -f2)
+  [ -n "$p" ] && [ -x "$p" ] && { echo "$p"; return 0; }
+  return 1
+}
+
+# The data directories an application's desktop entry may be in, most specific
+# first, `:`-separated, for `wc-proxy desktop --dirs`:
+#   1. `share` beside the executable the launcher runs, walking up as the icon
+#      resolver does (icons::client_prefix_dirs);
+#   2. the package of the same name in the store, newest version first -- the
+#      readback Firefox has no `share/` at all (§90.4), and the stock package
+#      of the same version carries the same firefox.desktop;
+#   3. the user's and the system's data directories.
+app_dirs() {
+  local exe real d out="" pkg
+  exe=$(resolve_exec "$1" 2>/dev/null || true)
+  if [ -n "$exe" ]; then
+    real=$(readlink -f "$exe")
+    d=$(dirname "$real")
+    for _ in 1 2 3 4; do
+      [ "$d" = / ] && break
+      [ -d "$d/share" ] && out="$out:$d/share"
+      d=$(dirname "$d")
+    done
+    for pkg in $(ls -d /nix/store/*-"$(basename "$exe")"-[0-9]*/share 2>/dev/null \
+                   | sed 's|^/nix/store/[^-]*-\(.*\)$|\1\t&|' | sort -rV | cut -f2 | head -3); do
+      out="$out:$pkg"
+    done
+  fi
+  out="$out:${XDG_DATA_HOME:-$HOME/.local/share}:$HOME/.nix-profile/share"
+  out="$out:/etc/profiles/per-user/$(id -un)/share:/run/current-system/sw/share:/usr/local/share:/usr/share"
+  echo "${out#:}"
+}
+
+# An application id as the guest names it: the desktop id. wc-proxy checks it
+# again; this keeps a bad word out of every command line below.
+check_app() {
+  case "$1" in
+    .*|*..*|*[!A-Za-z0-9_.+-]*|"") die "bad app id" ;;
+  esac
+}
+
+# The profile word of `run`, `action` and `open`: `-`, or a directory under
+# ~/.wc-launch, base64'd. Echoes the directory or nothing.
+profile_of() {
+  local p
+  [ "${1:-}" = - ] && return 0
+  p=$(printf '%s' "${1:-}" | base64 -d 2>/dev/null) || die "bad profile"
+  case "$p" in
+    "") ;;
+    *..*|*[[:space:]]*) die "profile $p is not a plain directory under ~/.wc-launch" ;;
+    "$HOME"/.wc-launch/*) echo "$p" ;;
+    *) die "profile outside ~/.wc-launch" ;;
+  esac
+}
+
+# launch_desktop KIND ARG ID APPID B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#
+# `action` and `open`: ask wc-proxy for the argv the desktop entry gives KIND
+# and ARG (an action id, or a URL), check that the launcher's executable is the
+# entry's program, and hand the result to `run`. Nothing the guest sent becomes
+# a command: it named an id or a URL, wc-proxy built the argument list from
+# this machine's file, and `run` executes it as an array (security-model.md R33).
+launch_desktop() {
+  local KIND="$1" ARG="$2" ID="$3" APPID="$4" B64EXE="$5" B64PROFILE="$6" OUT PROG ARGS WANT RES PROFILE CMD
+  check_id "$ID"; check_app "$APPID"
+  [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
+  WANT=$(printf '%s' "$B64EXE" | base64 -d 2>/dev/null) || die "$KIND: bad base64"
+  case "$WANT" in ""|*[[:space:]]*) die "$KIND: bad executable" ;; esac
+  RES=$(resolve_exec "$WANT") || die "$KIND: cannot find $WANT on this machine"
+  OUT=$("$BIN/wc-proxy" desktop "$KIND" "$APPID" "$ARG" --dirs "$(app_dirs "$WANT")" 2>&1) \
+    || die "$KIND $APPID: $OUT"
+  PROG=$(sed -n 's/^program //p' <<<"$OUT"); ARGS=$(sed -n 's/^args //p' <<<"$OUT")
+  [ "$(basename "$RES")" = "$PROG" ] \
+    || die "$KIND: the launcher runs $(basename "$RES") and $APPID.desktop runs $PROG"
+  PROFILE=$(profile_of "$B64PROFILE") || exit 1
+  CMD="$RES${PROFILE:+ --profile $PROFILE}${ARGS:+ $ARGS}"
+  shift 6
+  exec env -u SSH_ORIGINAL_COMMAND bash "$0" run "$ID" "$(printf '%s' "$CMD" | base64 -w0)" "$B64PROFILE" "$@"
+}
 # ------------------------------------------------------------------- AUDIO ---
 # docs/waycompose-design.md §86. Where Firefox's sound goes.
 #
@@ -222,6 +323,25 @@ audio_up() {
     echo "none: $PA did not open its socket: $(tail -2 "$D/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
   fi
 }
+
+# §92. THE TWO VERBS WHOSE ANSWER IS WRITTEN IN PIECES ARE SENT IN ONE.
+#
+# Windows' own ssh.exe, with its standard output on a file (§28.6's
+# arrangement), took the first 1417 bytes of `app` and then waited for ever:
+# the host had finished, nothing of ours was running on either side, and the
+# MSYS ssh on the same guest received all 20520 bytes. `icon`, which prints
+# its 18 KB at once, has never had the problem; `app` writes its desktop entry
+# first and its task icons a rasteriser later. So `app` and `frequent` run
+# again under a command substitution and their answer leaves in one write.
+case "$VERB" in
+  app|frequent)
+    if [ -z "${WC_SESSION_BUFFERED:-}" ]; then
+      OUT=$(WC_SESSION_BUFFERED=1 env -u SSH_ORIGINAL_COMMAND bash "$0" "$VERB" "$@"); RC=$?
+      printf '%s\n' "$OUT"
+      exit "$RC"
+    fi
+    ;;
+esac
 
 case "$VERB" in
 
@@ -508,6 +628,10 @@ run)
   WANT=${CMD%% *}; REST=${CMD#"$WANT"}
   EXE=$(resolve_exec "$WANT") || die "run: cannot find $WANT on this machine"
   CMD="$EXE$REST"
+  # §92. Split into an array once, on whitespace and **without globbing**: a URL
+  # from a jump list (`open`) carries `?`, `*` and `[` as ordinary characters,
+  # and an unquoted `$CMD` would have offered each of them to pathname expansion.
+  read -r -a CMDV <<<"$CMD"
   # An application's data directory, created on demand -- and *only* under this
   # launcher's own tree, so this can never be asked to make a directory
   # somewhere else.
@@ -517,7 +641,7 @@ run)
   # names a directory Firefox will not create, and a modal dialog is a mapped
   # toplevel like any other. Every number in that run was real and measured the
   # wrong window, which is why §28 has a photograph next to every one of them.
-  for w in $REST; do
+  for w in "${CMDV[@]:1}"; do
     case "$w" in
       "$HOME"/.wc-launch/*) mkdir -p "$w" 2>/dev/null ;;
     esac
@@ -757,8 +881,157 @@ run)
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS \
     "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
-    $CMD >>"$D/app.log" 2>&1 &
+    "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*}"
+  ;;
+
+# --------------------------------------------------------------------- app ---
+# docs/waycompose-design.md §92. Everything the guest needs to build the
+# application's Start menu entry, its pinned button's name and icon, and its
+# jump list's tasks: `wc-proxy desktop info` (name, actions, localised names),
+# one icon per Firefox task, and the application's icon as `icon` prints it.
+#
+#   wc-session app APPID B64EXE THEME      THEME is light or dark: the colour the
+#                                          task glyphs are drawn in
+app)
+  APPID="${1:-}"; check_app "$APPID"
+  WANT=$(printf '%s' "${2:-}" | base64 -d 2>/dev/null) || die "app: bad base64"
+  case "$WANT" in ""|*[[:space:]]*) die "app: bad executable" ;; esac
+  THEME="${3:-light}"; case "$THEME" in light|dark) ;; *) die "app: theme is light or dark" ;; esac
+  [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
+  INFO=$("$BIN/wc-proxy" desktop info "$APPID" --dirs "$(app_dirs "$WANT")" 2>&1) || die "app $APPID: $INFO"
+  printf '%s\n' "$INFO"
+  # THE TASKS' OWN ICONS. Windows' Firefox draws "new tab", "new window" and
+  # "new private window" with three icons of its own; the Linux package has the
+  # same glyphs as SVGs in its chrome skin, drawn with `context-fill`, which is
+  # Firefox's "the colour of the text around me". So they are filled here in
+  # the colour of the jump list's text and rasterised at 32 px. Only for
+  # Firefox, only from an unpacked chrome directory (the readback package has
+  # one; a stock package keeps it in omni.ja and its tasks wear the app icon),
+  # and only with rsvg-convert -- without it the tasks wear the app icon too.
+  if [ "$(sed -n 's/^program //p' <<<"$INFO")" = firefox ] && RSVG=$(store_tool librsvg rsvg-convert); then
+    EXE=$(resolve_exec "$WANT" 2>/dev/null || true)
+    SKIN="$(dirname "$(dirname "$(readlink -f "$EXE")")")/lib/firefox/browser/chrome/browser/skin/classic/browser"
+    if [ "$THEME" = dark ]; then INK='#fbfbfe'; PRIV='#c689ff'; else INK='#15141a'; PRIV='#8000d7'; fi
+    for pair in new-tab:new-tab.svg:"$INK" new-window:window.svg:"$INK" new-private-window:privateBrowsing.svg:"$PRIV"; do
+      IFS=: read -r ACT FILE COLOUR <<<"$pair"
+      [ -f "$SKIN/$FILE" ] || continue
+      PNG=$(sed -e "s/context-fill-opacity/1/g; s/context-stroke-opacity/1/g" \
+                -e "s/context-fill/$COLOUR/g; s/context-stroke/$COLOUR/g" "$SKIN/$FILE" \
+              | "$RSVG" -w 32 -h 32 -f png 2>/dev/null | base64 -w0)
+      [ -n "$PNG" ] && echo "taskicon $ACT $PNG"
+    done
+  fi
+  # The application's icon, as the install step has always fetched it.
+  env -u SSH_ORIGINAL_COMMAND bash "$0" icon "$APPID" "$WANT" || true
+  ;;
+
+# ------------------------------------------------------------ action, open ---
+# §92. A jump-list task, or a frequent page, through the session's proxy:
+#
+#   wc-session action ID APPID ACTION B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#   wc-session open   ID APPID B64URL B64EXE PROFILE PREFS TITLEBAR [CHROME [GTK]]
+#
+# The guest names an action id or a URL; the argv is the desktop entry's
+# (`launch_desktop`). The last five words are `run`'s, so a task that starts
+# the application cold gives it the profile, preferences and title bar a click
+# on the shortcut would.
+action)
+  ACT="${3:-}"; case "$ACT" in *[!A-Za-z0-9-]*|"") die "bad action id" ;; esac
+  launch_desktop action "$ACT" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
+  ;;
+open)
+  URL=$(printf '%s' "${3:-}" | base64 -d 2>/dev/null) || die "open: bad base64"
+  launch_desktop open "$URL" "${1:-}" "${2:-}" "${4:-}" "${5:--}" "${6:--}" "${7:--}" "${8:--}" "${9:--}"
+  ;;
+
+# ---------------------------------------------------------------- frequent ---
+# §92. The jump list's "Frequent" (and, if the profile asks, "Recent") pages,
+# from the launcher's own Firefox profile, the way Windows' Firefox builds its
+# own: history sorted by visit count (frequent) or by last visit (recent), as
+# many as `browser.taskbar.lists.maxListItemCount` says, each with its favicon.
+#
+#   wc-session frequent B64PROFILE
+#
+# Prints `prefs ...` and then `item KIND B64URL B64TITLE B64ICON` lines (`-` for
+# no title or icon). Firefox's own switches are respected: with
+# `browser.taskbar.lists.enabled` or `…frequent.enabled` false there are no
+# frequent items, and `…tasks.enabled` is passed on for the guest's tasks.
+#
+# PRIVACY. This is the user's browsing history, crossing to the Windows side
+# exactly as Windows' Firefox puts its own in its jump list. It is read from
+# copies made in a 0700 directory and removed before this exits, and nothing
+# here logs a URL or a title: they go to the guest on stdout and nowhere else.
+# Private windows write no history, so nothing from one can appear.
+frequent)
+  PROFILE=$(profile_of "${1:--}") || exit 1
+  [ -n "$PROFILE" ] && [ -f "$PROFILE/places.sqlite" ] || { echo "prefs none"; exit 0; }
+  SQLITE=$(store_tool sqlite sqlite3) || die "frequent: no sqlite3 on this host (WC_LAUNCH_SQLITE)"
+  pref() {  # NAME DEFAULT: user.js wins over prefs.js, as Firefox reads them
+    local v
+    v=$(grep -h "^user_pref(\"$1\"," "$PROFILE/prefs.js" "$PROFILE/user.js" 2>/dev/null | tail -1 \
+          | sed 's/^user_pref("[^"]*", *\(.*\));.*$/\1/')
+    echo "${v:-$2}"
+  }
+  LISTS=$(pref browser.taskbar.lists.enabled true)
+  FREQ=$(pref browser.taskbar.lists.frequent.enabled true)
+  RECENT=$(pref browser.taskbar.lists.recent.enabled false)
+  TASKS=$(pref browser.taskbar.lists.tasks.enabled true)
+  MAX=$(pref browser.taskbar.lists.maxListItemCount 7)
+  REFRESH=$(pref browser.taskbar.lists.refreshInSeconds 120)
+  case "$REFRESH" in *[!0-9]*|"") REFRESH=120 ;; esac
+  case "$MAX" in *[!0-9]*|"") MAX=7 ;; esac
+  [ "$MAX" -gt 20 ] && MAX=20
+  echo "prefs lists=$LISTS frequent=$FREQ recent=$RECENT tasks=$TASKS max=$MAX refresh=$REFRESH"
+  [ "$LISTS" = true ] || exit 0
+  T=$(mktemp -d "${TMPDIR:-/tmp}/wc-frequent-XXXXXX") || die "frequent: mktemp"
+  chmod 700 "$T"
+  trap 'rm -rf "$T"' EXIT
+  # Copies, because Firefox holds the databases open; with their write-ahead
+  # logs, so the copy has the visits of the last few minutes too.
+  for f in places.sqlite places.sqlite-wal favicons.sqlite favicons.sqlite-wal; do
+    [ -f "$PROFILE/$f" ] && cp "$PROFILE/$f" "$T/$f" 2>/dev/null
+  done
+  q() { "$SQLITE" -batch -noheader -separator $'\t' "$1" "$2" 2>/dev/null; }
+  # The guest drops items the user removed from the list, and items whose URL
+  # it cannot carry, so twice the count is asked for.
+  N=$((MAX * 2))
+  SCHEMES="(url LIKE 'http://%' OR url LIKE 'https://%' OR url LIKE 'file:///%')"
+  {
+    [ "$FREQ" = true ] && q "$T/places.sqlite" \
+      "SELECT 'frequent', replace(base64(CAST(url AS BLOB)), char(10), ''), replace(base64(CAST(coalesce(title, '') AS BLOB)), char(10), '') FROM moz_places WHERE hidden = 0 AND visit_count > 0 AND $SCHEMES ORDER BY visit_count DESC, last_visit_date DESC LIMIT $N;"
+    [ "$RECENT" = true ] && q "$T/places.sqlite" \
+      "SELECT 'recent', replace(base64(CAST(url AS BLOB)), char(10), ''), replace(base64(CAST(coalesce(title, '') AS BLOB)), char(10), '') FROM moz_places WHERE hidden = 0 AND last_visit_date IS NOT NULL AND $SCHEMES ORDER BY last_visit_date DESC LIMIT $N;"
+  } | while IFS=$'\t' read -r KIND B64URL B64TITLE; do
+    [ -n "$B64URL" ] || continue
+    URL=$(printf '%s' "$B64URL" | base64 -d 2>/dev/null)
+    ICON=""
+    if [ -f "$T/favicons.sqlite" ]; then
+      U=${URL//\'/\'\'}
+      # The page's own icon nearest 32 px, raster before SVG (width 65535);
+      # then the site's root /favicon.ico, which Firefox keeps unlinked.
+      ICON=$(q "$T/favicons.sqlite" \
+        "SELECT replace(base64(i.data), char(10), '') FROM moz_pages_w_icons p JOIN moz_icons_to_pages ip ON ip.page_id = p.id JOIN moz_icons i ON i.id = ip.icon_id WHERE p.page_url = '$U' ORDER BY (i.width = 65535), abs(i.width - 32) LIMIT 1;")
+      if [ -z "$ICON" ]; then
+        ORIGIN=$(sed -n 's|^\(https\{0,1\}://[^/]*\).*$|\1|p' <<<"$URL")
+        [ -n "$ORIGIN" ] && ICON=$(q "$T/favicons.sqlite" \
+          "SELECT replace(base64(data), char(10), '') FROM moz_icons WHERE root = 1 AND icon_url = '${ORIGIN//\'/\'\'}/favicon.ico' ORDER BY abs(width - 32) LIMIT 1;")
+      fi
+      ICON=$(tr -d '\n' <<<"$ICON")
+      # An SVG favicon, rasterised when this host can; otherwise none.
+      printf '%s' "$ICON" | base64 -d >"$T/icon.svg" 2>/dev/null
+      HEAD=$(head -c 256 "$T/icon.svg" | tr -d '\0')
+      if [ -n "$ICON" ] && case "$HEAD" in *"<svg"*|*"<?xml"*) true ;; *) false ;; esac; then
+        ICON=""
+        RSVG=$(store_tool librsvg rsvg-convert) \
+          && ICON=$("$RSVG" -w 32 -h 32 -f png "$T/icon.svg" 2>/dev/null | base64 -w0)
+      fi
+    fi
+    echo "item $KIND $B64URL ${B64TITLE:--} ${ICON:--}"
+  done
+  # The pipeline's status is whatever its last test said (pipefail), and a
+  # list that ended on a page without a favicon is still a list.
+  exit 0
   ;;
 
 # -------------------------------------------------------------------- icon ---
@@ -914,6 +1187,6 @@ logs)
   ;;
 
 *)
-  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|gpu|run|audio|icon|down|status|logs"
+  die "unknown verb ${VERB:-<none>}; try ping|up|proxy|gpu|run|action|open|app|frequent|audio|icon|down|status|logs"
   ;;
 esac

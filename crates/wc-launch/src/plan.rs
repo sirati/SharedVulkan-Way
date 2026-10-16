@@ -88,6 +88,14 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     a
 }
 
+/// §92. The compositor's `--relaunch-dir`: the directory this installation
+/// writes each application's relaunch file into (`taskbar::Relaunch`). A
+/// window whose identity has one there can be pinned as that application; any
+/// other window still cannot.
+pub fn relaunch_argv(dir: &str) -> Vec<String> {
+    vec!["--relaunch-dir".into(), dir.into()]
+}
+
 /// The byte pipe from the guest's loopback into the compositor's AF_UNIX
 /// socket. `--timeout 0` is "for as long as the session lasts"; every other
 /// caller of this program is a test with a deadline.

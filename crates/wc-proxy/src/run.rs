@@ -394,6 +394,13 @@ fn parse_args() -> Result<Args, String> {
 }
 
 pub fn main() -> std::process::ExitCode {
+    // §92. `wc-proxy desktop …` answers questions about a desktop entry for
+    // `wc-session` and exits; it is a verb of this binary because the icon
+    // resolver it sits beside is here, and the VM host already has the binary.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("desktop") {
+        return wc_proxy::desktop::cli(&argv[2..]);
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(msg) => {

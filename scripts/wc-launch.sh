@@ -107,6 +107,13 @@ PORT="${WC_LAUNCH_PORT:-57431}"
 # it there); deploy pins it with a GC root at $HOSTDIR/bin/pulse. Unset or absent,
 # sessions have no audio server and Firefox gets a null audio context.
 PULSE="${WC_LAUNCH_PULSE:-}"
+# §92. sqlite3 (the jump list's frequent pages, read from the profile's
+# places.sqlite) and rsvg-convert (Firefox's task glyphs), as store paths that
+# must already be on the host; deploy pins each with a GC root under $HOSTDIR/bin.
+# Unset, wc-session looks for them in the host's store, where a garbage
+# collection can take them.
+SQLITE="${WC_LAUNCH_SQLITE:-}"
+RSVG="${WC_LAUNCH_RSVG:-}"
 AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # §86. The forwarded GPU, **off unless asked for**. WC_LAUNCH_GPU_SESSIONS=N
 # (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
@@ -476,6 +483,9 @@ wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 
 [app.firefox]
 title = $TITLE
+# §92: the desktop entry on the VM host whose name, icon and actions become the
+# Start menu entry, the pin and the jump list.
+desktop = firefox
 icon  = firefox
 exec  = $FIREFOX --profile ${WC_LAUNCH_PROFILE:-~/.wc-launch/firefox}
 prefs = middlemouse.paste=false${WC_LAUNCH_EXTRA_PREFS:+;$WC_LAUNCH_EXTRA_PREFS}
@@ -573,6 +583,17 @@ VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
       printf '%b\n' "$genv" | sed 's/^/          /'
     fi
   fi
+  # §92. The jump list's two tools, GC-rooted where wc-session looks first.
+  local tool
+  for tool in "sqlite:$SQLITE:sqlite3" "librsvg:$RSVG:rsvg-convert"; do
+    IFS=: read -r pkg path bin <<<"$tool"
+    [ -n "$path" ] || { note "WC_LAUNCH_$(echo "${pkg#lib}" | tr a-z A-Z) unset: wc-session finds $bin in the host's store, unrooted"; continue; }
+    if h "nix-store -r $path --add-root $HOSTDIR/bin/$pkg --indirect >/dev/null && test -x $HOSTDIR/bin/$pkg/bin/$bin"; then
+      echo "  $bin from $path (GC root $HOSTDIR/bin/$pkg)"
+    else
+      bad "$path is not on $HOST, or has no bin/$bin: the jump list goes without it"
+    fi
+  done
   if [ -n "$PULSE" ]; then
     if h "nix-store -r $PULSE --add-root $HOSTDIR/bin/pulse --indirect >/dev/null && test -x $HOSTDIR/bin/pulse/bin/pulseaudio"; then
       echo "  sessions get a PulseAudio null sink from $PULSE (GC root $HOSTDIR/bin/pulse)"
@@ -615,11 +636,19 @@ do_install() {
     g "tail -6 $APPDATA_MSYS/wc-launch-$SESSION.log" | sed 's/^/        /'
     return
   fi
-  local iconline
-  iconline=$(g "tail -20 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '^\[.*\] icon: ' | tail -1)
-  case "$iconline" in
-    *"icon firefox"*) ok "the shortcut wears Firefox's own icon, resolved on the VM host: ${iconline#*icon: }" ;;
-    *) bad "the icon did not come across: ${iconline:-<nothing>}" ;;
+  # §92. Since the shortcuts are written through IShellLinkW, the install also
+  # wrote the icon, the relaunch file, the Start menu entry and the jump list,
+  # and logged one `pins:` line per step that went wrong and one for the list.
+  local pins
+  pins=$(g "tail -30 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '\] pins: ')
+  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
+    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
+  else
+    bad "no icon or no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+  fi
+  case "$pins" in
+    *"jump list "*" task(s)"*) ok "$(printf '%s\n' "$pins" | grep 'jump list ' | tail -1 | sed 's/^.*pins: //')" ;;
+    *) bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
   esac
 }
 

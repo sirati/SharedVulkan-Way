@@ -32,4 +32,12 @@ windows-sys = { workspace = true, features = [
   # the right size here: one fixed PCM format, a bounded queue, no callbacks.
   "Win32_Media",
   "Win32_Media_Audio",
+  # §92. The shell: shortcuts that carry the application's identity
+  # (`IShellLinkW`, `IPropertyStore`), its jump list (`ICustomDestinationList`),
+  # the Start menu and desktop folders, the UI language for the tasks' names,
+  # and the taskbar's theme for their glyphs. See `src/shell.rs`.
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_Globalization",
+  "Win32_System_Registry",
 ] }

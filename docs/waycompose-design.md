@@ -28600,6 +28600,279 @@ windows that would. The measurement on the guest is in 91.7.
 | unchanged | `wc-desk.exe`, `probe-relay.exe`, `click.ps1`; the ini and `gpu.env` byte-identical |
 | the test install `wcmil` | left installed and stopped (`C:\Users\<guest-user>\wcmil`, `~/wc-launch-mil`, profile `~/.wc-launch/firefox-mil`), with no desktop shortcut; its agent and scheduled tasks are removed |
 
+## 92. Pinning Linux applications to the taskbar, and their jump lists
+
+Branch `taskbar-pins`, 2026-10-16. The brief: a Linux application can be
+pinned to the Windows taskbar, from its running button or from a Start menu
+entry; the pinned button and the running windows are one button; right-clicking
+it shows the application's own actions, and for Firefox the same jump list
+Windows' Firefox shows (Frequent pages, then Open new tab, Open new window and
+Open new private window); all of it survives the session ending and a reboot.
+The evidence is in `docs/taskbar-pins/`.
+
+**Status.** It works on the guest's real desktop, through clicks on the real
+taskbar:
+- the running button wears Firefox's name and icon (`Firefox (Linux) – 1 aktives
+  Fenster`);
+- "An Taskleiste anheften" from the running window's jump list pins it, and
+  the pin and the window are one button;
+- the jump list matches Windows' Firefox's: Häufig with the profile's pages and
+  their favicons, then Neuen Tab öffnen, Neues Fenster öffnen and Neues privates
+  Fenster öffnen with Firefox's glyphs. Each task works, and the private window
+  is private (`Mozilla Firefox Private Browsing`);
+- after the session ends, a click on the pin starts it cold (3.1 s, 4.0 s
+  deployed) and the window lands on the pin;
+- the Start menu entry pins to the same button.
+
+The user's taskbar has exactly one Linux pin, the deployed `Firefox (Linux)`
+(92.9).
+
+### 92.1 One identity for the pin, the shortcuts and every window
+
+Windows puts a window on a pinned button when the window's
+`PKEY_AppUserModel_ID` equals the pinned shortcut's `System.AppUserModel.ID`.
+Stage 32 already gave every window an identity derived from its Wayland app id,
+`Waycompose.app.firefox` for Firefox, and that string is the same in every
+session, so it is the right key for a pin. (`Waycompose.unnamed.c1` is what a
+window carries between its creation and the client's `set_app_id`; Firefox's
+windows move to their real identity before they are first shown.)
+
+What was missing was the other half: nothing on the Windows side carried the
+same string. The desktop shortcut was written by PowerShell's `WScript.Shell`,
+which cannot set `System.AppUserModel.ID`, so a pin of it (the user had made
+one, `Firefox (Linux, ivshmem)`) was a button of its own, grouped by
+`wc-launch.exe`'s path, beside the windows' button.
+
+So `wc-launch` now writes its shortcuts through `IShellLinkW` and sets the
+identity on them (`src/shell.rs`, hand-written COM like the compositor's), and
+it derives that identity with the compositor's own function: `taskbar.rs` is
+compiled into `wc-launch` with `#[path]`. The app id it feeds in is the one
+the windows will carry: `app-id` in the `[app.*]` section if set, else the
+desktop entry's `StartupWMClass` (which exists to say exactly that), else the
+desktop id. For Firefox all three are `firefox`.
+
+### 92.2 Pinning from a window: the relaunch properties
+
+`win32.rs` used to set `PKEY_AppUserModel_PreventPinning` on every window, on
+the reasoning that a pin made from a window runs whatever the shell can work
+out about it, which is `sv-guest.exe`. That reasoning stands; what changed is
+that the launcher can now say what a pin should run. For each application it
+writes `<exe dir>\apps\<identity>.relaunch`:
+
+```
+command=C:\Users\<guest-user>\wcivs\wc-launch.exe firefox
+name=Firefox (Linux)
+icon=C:\Users\<guest-user>\wcivs\firefox.ico,0
+```
+
+and passes the directory as `--relaunch-dir`. When the compositor stamps an
+identity on a window it reads that file. If the file is there, the window gets
+`PKEY_AppUserModel_RelaunchCommand`, `…RelaunchDisplayNameResource` and
+`…RelaunchIconResource`, and `PreventPinning` is cleared. If not, the three
+are removed and `PreventPinning` is set, as before. A window of a client the
+launcher did not start (a harness's `weston-terminal`) still cannot be pinned.
+The first launch of an application writes its file before starting it, so its
+first window is pinnable. Every later launch refreshes the file after the
+window is up.
+
+### 92.3 The Start menu entry
+
+Every launch (and `--install`, and `wc-launch.exe --refresh <app>`) writes
+`Programs\<title>.lnk` with the identity, the icon and `wc-launch.exe <app>`.
+"Pin to taskbar" on it pins a shortcut with the same identity, which is the
+same button as the windows'.
+
+### 92.4 Where the facts come from: the host's desktop entry
+
+The application's name, icon and actions are in its desktop entry, on the VM
+host. On NixOS that is the package's own store path, or for the readback Firefox
+(which has no `share/`, §90.4) the stock package of the same name.
+`wc-proxy desktop` (`crates/wc-proxy/src/desktop.rs`) reads it by the
+specification: localised names, `Actions=` in order, `Exec=` quoting, and the
+field codes. `wc-session app APPID B64EXE THEME` returns it with the icon and,
+for Firefox, three task glyphs. The glyphs are the Linux package's own SVGs
+(`new-tab.svg`, `window.svg`, `privateBrowsing.svg`), drawn in `context-fill`.
+The host fills them in the colour of the jump list's text (the guest sends the
+taskbar's theme) and rasterises them with `rsvg-convert`.
+
+The guest keeps the answer (`apps\<app>.meta`) and refreshes it on every
+launch, so a pin made today and an updated Firefox tomorrow agree.
+
+### 92.5 The jump list
+
+`ICustomDestinationList` under the same identity. For Firefox the list follows
+Windows' Firefox:
+
+* **Häufig / Frequent**: the launcher profile's most visited pages, read by
+  `wc-session frequent` from copies of `places.sqlite` and `favicons.sqlite`,
+  sorted by visit count as Windows' Firefox sorts its own (`SORT_BY_VISITCOUNT_
+  DESCENDING` in `WindowsJumpLists.sys.mjs`), with their favicons (an SVG
+  favicon is rasterised). Firefox's own prefs are respected: `browser.taskbar.
+  lists.enabled`, `…frequent.enabled`, `…recent.enabled` (a Recent category),
+  `…tasks.enabled`, `…maxListItemCount` (7) and `…refreshInSeconds` (120). A
+  page the user removes from the list is remembered and not put back.
+* **Aufgaben / Tasks**: Open new tab, Open new window, Open new private window,
+  named as Windows' Firefox names them in the UI's language (German here) and
+  wearing Firefox's own glyphs. Windows' Firefox's strings are not in the Linux
+  package (they are built for Windows only), so the launcher carries English
+  and German. The desktop entry's Profile Manager is not offered: the launcher
+  pins the profile with `--profile`, so a profile manager could only start a
+  second Firefox beside the session.
+* Windows adds its own footer: the application, and Pin/Unpin.
+
+Any other application gets its desktop entry's actions, by `Name[<lang>]`.
+
+Each entry runs `wc-launch.exe <app> --action <id>` or `--url <URL>`. A warm
+click is one ssh exec (`wc-session action|open`); a cold one starts the
+session first and then runs the action, with the profile, preferences and title
+bar the shortcut would have given it. While a session runs, its owner rebuilds
+the list every `refreshInSeconds`, so the Frequent pages follow the history.
+
+### 92.6 The security argument
+
+docs/security-model.md R33, in short: the guest names a desktop id and an
+action id, or a URL, and never a command. The host builds the argv from its
+own desktop entry, checks the program against the entry's and the launcher's,
+and runs it as an array. URLs are `http`, `https` or `file:///` only, one
+word, and go into the slot the entry's `%u` marks. **What it does not close is
+`run`**, which has carried a whole command line from the guest since §28. A
+holder of the guest's key could already run any program as `sirati`. R33
+records it, and what closing it would take.
+
+### 92.7 Found on the way
+
+- **Windows' `ssh.exe` stalls on a reply written in pieces.** With its standard
+  output on a file (§28.6's arrangement), `app` delivered its first 1417 bytes
+  and then hung for ever: the host side had finished, no process of ours was
+  left on either machine, and the MSYS `ssh` on the same guest received all
+  20520 bytes. `icon`, which prints 18 KB at once, never had the problem. So
+  `app` and `frequent` now run again under a command substitution and answer in
+  one write (`wc-session`, before its `case`).
+- **`frequent` exited 1** on a list whose last page had no favicon: the
+  pipeline's status under `pipefail`. The launcher took it as a failed reply
+  and the session-0 run's jump lists had no pages until it exited 0.
+- **This guest's Start button opens Open-Shell**, which UI Automation cannot
+  see into. Its program list is the Start menu's Programs folder, and its
+  right-click menu is the shell's. So the Start menu route was driven through
+  a File Explorer window on `shell:Programs`: Windows 11's context menu, then
+  "Weitere Optionen anzeigen", then "An Taskleiste anheften". The classic menu
+  shows UI Automation none of its items from another process, so the agent
+  reads them from the menu (`MN_GETHMENU`, `GetMenuString`, `GetMenuItemRect`).
+- **Windows builds a pin from the Start menu shortcut when one carries the
+  window's identity.** The pin made from the running window's jump list is a
+  copy of `Programs\Firefox (Linux).lnk` (target `wc-launch.exe firefox`,
+  identity `Waycompose.app.firefox`), not the window's relaunch command. The
+  relaunch properties are what make the window pinnable at all, and what a
+  pin would be built from if the Start menu entry were deleted.
+- **The user's earlier pin `Firefox (Linux, ivshmem)` was already gone** by the
+  first session-1 run (09:53). It was in `User Pinned\TaskBar` at 06:24 and
+  absent at 09:53. Nothing of this branch touched it.
+- **The screen locked twice during the work**, once for three hours. The agent
+  now refuses every command while LockApp has the foreground (`LOCKED: … no
+  command of this file was run`). It also never sends the Win key, and it
+  refuses a shell click whose point another process's window covers.
+
+### 92.8 The guest runs
+
+All under the guest lease, with ssh and ping health checks before and after
+each, all fine. Session 0 first (`session0-actions.txt`), with the test
+install `wcpins` (`~/wc-launch-pins`, profile `~/.wc-launch/firefox-pins`, no
+GPU, no sound):
+
+| step | result |
+|---|---|
+| cold `wc-launch.exe firefox` | window in 3289 ms; `wc-desk windows`: `aumid="Waycompose.app.firefox" relaunch="C:\Users\<guest-user>\wcpins\wc-launch.exe firefox"` |
+| warm `--action new-private-window` | new window `Mozilla Firefox Private Browsing` in 794 ms |
+| warm `--action new-window`, `new-tab` | a new window in 612 ms; a tab, no window |
+| warm `--url https://example.org/` and two more | the title follows the page |
+| `--refresh` (after the exit-status fix) | `jump list 3 task(s), Häufig: 4 page(s)` |
+| cold `--action new-private-window` | the private window in 2191 ms |
+
+Then session 1, on the desktop the user uses, each clicking or looking step
+done by a separate Sonnet agent through the session-1 agent
+(`session1-pins-agent.ps1`), at the medium integrity a double-click has
+(`token: medium integrity`). The Wayland rings and doorbells were up, from
+§91's port access:
+
+| check | result | evidence |
+|---|---|---|
+| running button | `Firefox (Linux, pins test) – 1 aktives Fenster`, Firefox's icon | `A1-running.png` |
+| jump list, running | Häufig: 4 pages with favicons (Example Domain wears the app's icon, having none); Aufgaben: the three tasks with Firefox's glyphs; footer: app, An Taskleiste anheften, Fenster schließen | `B1-jumplist-running.png` |
+| pin from the window | `… – 1 aktives Fenster angeheftet`, one button | `B2-pinned.png`; `B3-jumplist-pinned.png` (Von Taskleiste lösen) |
+| Neues privates Fenster öffnen | new window `Mozilla Firefox Private Browsing`, the private page drawn | `C1-private.png` |
+| Neues Fenster öffnen; Neuen Tab öffnen | a third window; a second New Tab in it, no window | `C3-example.png` |
+| a Häufig page | `Example Domain — Mozilla Firefox` | `C3-example.png` |
+| three windows | one button, `– 3 aktive Fenster angeheftet` | `C4-taskbar.png` |
+| Alle Fenster schließen, 60 s | `session down`; the pin stays, `… angeheftet` | — |
+| click on the pin | cold start 1901 ms, window in 3106 ms, `– 1 aktives Fenster angeheftet` | `D1-relaunched.png`, `D2-window.png` |
+| periodic refresh | the owner rebuilt the list every 120 s (`[3248] pins: …` six times) | launcher log |
+| unpin, then pin the Start menu entry | `– 1 aktives Fenster angeheftet`, one button with the running window | `P1-pinned-from-start.png` |
+
+Then the deployed launcher (92.9), with the user's own profile. Its captures
+mask the history (`R3-jumplist-masked.png`, the entries covered). The checking
+agent was told to describe the layout only.
+
+| check | result | evidence |
+|---|---|---|
+| button | `Firefox (Linux) – 1 aktives Fenster` | `R1-running.png` |
+| jump list | Häufig: 7 pages, each with an icon; the three tasks; footer as above | `R3-jumplist-masked.png` |
+| pin from the window | `Firefox (Linux) – 1 aktives Fenster angeheftet` | `R4-pinned.png` |
+| close, session end, click on the pin | `session down`; cold start 2348 ms, window in 3996 ms with the GPU sessions, on the pin | `T1-relaunched.png` |
+
+Afterwards the window was closed through the jump list. The test install was
+unpinned, its desktop and Start menu shortcuts removed, and the session-1
+agent and its directory deleted. Every committed capture is a taskbar crop
+with the strip above it cut off, a jump list, or a test-profile window. A
+separate check found nothing personal in them.
+
+### 92.9 What is deployed
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-92` and `~/wc-launch-ivs-backup-92`, then `wc-launch.sh deploy` from this branch (master merged) with §88.6's variables, `WC_LAUNCH_TITLE="Firefox (Linux)"` and the two new ones: **13 passed, 0 failed** (`deploy-92.txt`); `install`: 3 passed (`install-92.txt`) |
+| the ini | `title = Firefox (Linux)` (was `Firefox (Linux, ivshmem)`) and `desktop = firefox`; otherwise byte-identical. `gpu.env` byte-identical |
+| new on the host | `~/wc-launch-ivs/bin/sqlite` and `bin/librsvg`, GC roots (`WC_LAUNCH_SQLITE`, `WC_LAUNCH_RSVG`) |
+| the user's desktop | `Firefox (Linux).lnk` now points at `wcivs` and carries the identity. It had pointed at the old `wclaunch` install. `Firefox (Linux, ivshmem).lnk` is left as it was: it works, and its windows land on the pin |
+| Start menu | `Programs\Firefox (Linux).lnk` (new) |
+| taskbar | **one Linux pin, `Firefox (Linux)`**: `wc-launch.exe firefox` in `wcivs`, identity `Waycompose.app.firefox` |
+| the test install `wcpins` | left installed and stopped (`C:\Users\<guest-user>\wcpins`, `~/wc-launch-pins`, profile `~/.wc-launch/firefox-pins`), unpinned, no shortcuts |
+
+### 92.10 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` (master merged) | **101 binaries, 2892 passed, 0 failed**, 8 ignored. New: `desktop` 12, `appmeta` 10, relaunch 4 (in both crates that compile `taskbar.rs`), config 1 |
+| `cargo clippy --workspace --all-targets` | no warning in a line this branch wrote |
+| `cargo clippy -p wc-launch -p wc-compositor -p wc-desk --all-targets --target x86_64-pc-windows-gnu` | no warning in a line this branch wrote (`--workspace --all-targets` on Windows stops in `wayland-backend`'s tests, on master too) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `cargo test -p sv-testkit --test design_citations` | passes |
+| Wine: compositor with `--relaunch-dir` | `weston-terminal` (has a relaunch file): `can be pinned`; `weston-flower`: `cannot be pinned`; Wine's property store takes the values and does not read them back (`wine-relaunch-compositor.log`) |
+| Wine: `wc-launch --refresh` | relaunch file and Start menu link written; Wine's `ICustomDestinationList::SetAppID` is `E_NOTIMPL` |
+
+### 92.11 What is not proven, and what is next
+
+1. **A reboot.** Everything a pin needs is a file: the pin's `.lnk`, the Start
+   menu entry, the relaunch file, the icon. The jump list is Windows' own
+   `CustomDestinations` file for the identity. Nothing depends on a session,
+   and the relaunch after the session ended is the run that shows it. The VM
+   was not rebooted (guest-safety rules).
+2. **`run` still carries a command line** (security-model.md R33). The next
+   step is `run` naming an application by desktop id, with the deployment's
+   profile and executable in a file on the host.
+3. **Removed pages and the Recent category** are implemented and unit-tested,
+   but were not exercised on the guest: nobody removed a page, and
+   `browser.taskbar.lists.recent.enabled` is off by default.
+4. **Languages.** The jump list's Firefox strings are German and English. Other
+   UI languages get English task names; a desktop entry's own `Name[<lang>]`
+   is used for other applications.
+5. **A second application** would get its own identity, pin and jump list from
+   its desktop entry. Only Firefox has been run.
+6. **Multiple installations share an identity.** `wcivs`, `wcpins` and `wcmil`
+   all launch `firefox`, so they all write `Waycompose.app.firefox`'s jump list,
+   and the last one to refresh wins. That is right for one installation per
+   user, which is the product.
+
 ## 93. Two bugs from real use: the clipboard, and a menu that closes instead of opening
 
 Branch `clip-submenu`, 2026-10-16. The user reported both from the guest's

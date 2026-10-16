@@ -30,10 +30,28 @@
 //! mutex rather than a happy accident of it.
 
 mod floor;
+mod appmeta;
 mod audio;
 mod config;
 mod ico;
 mod plan;
+#[cfg(windows)]
+mod shell;
+/// §92. The compositor's own taskbar-identity module, compiled in here too, so
+/// that the identity on a pinned shortcut and the identity on the
+/// application's windows come from one function and cannot drift apart.
+#[path = "../../wc-compositor/src/taskbar.rs"]
+#[allow(dead_code)]
+mod taskbar;
+
+/// §92. What a click asks the host for: the application as configured, one of
+/// its desktop entry's actions (a jump-list task), or a URL (a frequent page).
+#[derive(Debug, Clone, Copy)]
+pub enum Request<'a> {
+    Run,
+    Action(&'a str),
+    Open(&'a str),
+}
 mod token;
 
 use std::path::{Path, PathBuf};
@@ -118,6 +136,15 @@ struct Paths {
     state: PathBuf,
     comp_log: PathBuf,
     known_hosts: PathBuf,
+    /// §92. `<exe dir>\apps`: the relaunch files the compositor reads
+    /// (`--relaunch-dir`) and the host's last answer about each application.
+    /// Beside the executable, because a relaunch command names this
+    /// installation's `wc-launch.exe`.
+    apps: PathBuf,
+    /// §92. `%LOCALAPPDATA%\waycompose\jumplist`: favicons, task icons and the
+    /// list of pages the user removed. History-derived, so in the user's own
+    /// app data and never beside the program.
+    jump: PathBuf,
 }
 
 fn paths(session: &str) -> Result<Paths, String> {
@@ -136,6 +163,8 @@ fn paths(session: &str) -> Result<Paths, String> {
         state: state_dir.join(format!("wc-launch-{session}.state")),
         comp_log: state_dir.join(format!("wc-launch-{session}-comp.log")),
         known_hosts: exe_dir.join("known_hosts"),
+        apps: exe_dir.join("apps"),
+        jump: state_dir.join("jumplist"),
         state_dir,
         exe_dir,
     })
@@ -271,6 +300,8 @@ fn run(
     let mut stop = false;
     let mut status = false;
     let mut ping = false;
+    let mut request = Request::Run;
+    let mut refresh_only: Option<&str> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -279,6 +310,26 @@ fn run(
             "--status" => status = true,
             "--ping" => ping = true,
             "--install" => install = Some(it.next().map(String::as_str).unwrap_or("")),
+            // §92. Rebuild an application's Start menu entry, relaunch file and
+            // jump list from the host's answer, without launching anything.
+            "--refresh" => refresh_only = Some(it.next().map(String::as_str).unwrap_or("")),
+            // §92. A jump-list task names an action of the desktop entry, and a
+            // frequent page a URL. Both are checked again on the VM host, where
+            // the check is the one that counts (security-model.md R33).
+            "--action" => {
+                let id = it.next().map(String::as_str).unwrap_or("");
+                if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    return Err(format!("--action {id:?} is not an action id"));
+                }
+                request = Request::Action(id);
+            }
+            "--url" => {
+                let url = it.next().map(String::as_str).unwrap_or("");
+                if url.is_empty() || url.len() > 4096 || url.contains(char::is_whitespace) {
+                    return Err("--url wants one URL".into());
+                }
+                request = Request::Open(url);
+            }
             "--session-name" => {
                 it.next();
             }
@@ -299,23 +350,28 @@ fn run(
     if let Some(id) = install {
         return win::install(cfg, p, log, id);
     }
+    if let Some(id) = refresh_only {
+        cfg.app(id)?;
+        win::refresh(cfg, p, log, id, win::Refresh::Full);
+        return Ok(());
+    }
 
-    let app = match (app, session_only) {
-        (Some(a), _) => Some(cfg.app(a)?),
-        (None, true) => None,
+    let (app, section) = match (app, session_only) {
+        (Some(a), _) => (Some(cfg.app(a)?), a),
+        (None, true) => (None, ""),
         (None, false) => return Err("no application named, and no --session".into()),
     };
     // §91: which route this launch came by. A double-click from Explorer is
     // medium and not elevated; a harness task at `-RunLevel Highest` is high.
     log.say(&format!("token: {}", token::describe()));
-    win::launch(cfg, p, log, app, t0)
+    win::launch(cfg, p, log, app.map(|a| (section, a)), request, t0)
 }
 
 // ------------------------------------------------------------------ Win32 ---
 
 #[cfg(windows)]
 mod win {
-    use super::{Config, Log, Paths, State, ico, plan};
+    use super::{Config, Log, Paths, State, appmeta, ico, plan};
     use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
@@ -575,9 +631,20 @@ mod win {
         cfg: &Config,
         p: &Paths,
         log: &mut Log,
-        app: Option<&crate::config::App>,
+        app: Option<(&str, &crate::config::App)>,
+        req: crate::Request,
         t0: Instant,
     ) -> Result<(), String> {
+        // §92. The first launch of an application on this installation, before
+        // anything else: its relaunch file must exist before its first window
+        // does, because the compositor stamps a window's relaunch command when
+        // it stamps its identity. Every later launch refreshes after its window
+        // is up, where the user does not wait for it.
+        if let Some((section, a)) = app
+            && !relaunch_file(p, section, a).exists()
+        {
+            refresh(cfg, p, log, section, Refresh::Full);
+        }
         // §85. A session now ends `linger-secs` after its last window, so a
         // click can land in the seconds while one is winding down: it joins,
         // and the session goes from under it. That click starts a new session
@@ -585,7 +652,7 @@ mod win {
         let mut owned = claim(&cfg.session)?;
         if owned.is_none() {
             log.say("a session is already up; joining it");
-            match join_and_start(cfg, p, log, app, t0) {
+            match join_and_start(cfg, p, log, app, req, t0) {
                 Ok(()) => return Ok(()),
                 Err(e) if !p.state.exists() => {
                     log.say(&format!("the session ended under this click ({e}); starting a new one"));
@@ -620,11 +687,16 @@ mod win {
                     }
                 };
                 log.say(&format!("session up in {} ms", t0.elapsed().as_millis()));
-                if let Some(app) = app {
+                if let Some((section, a)) = app {
                     let before = count_mapped(&p.comp_log);
-                    start_app(cfg, p, log, &s.id, app)?;
-                    let _ = report(log, &p.comp_log, before, t0, "cold");
+                    start_app(cfg, p, log, &s.id, a, req)?;
+                    let _ = report(log, &p.comp_log, before, t0, "cold", req);
+                    refresh(cfg, p, log, section, Refresh::Full);
                 }
+                // §92. While the session runs, its jump lists follow the
+                // history the way Windows' Firefox's do: every
+                // `browser.taskbar.lists.refreshInSeconds`.
+                start_list_refresher(cfg, &cfg.session);
                 supervise(cfg, p, log, s)
             }
         }
@@ -636,17 +708,20 @@ mod win {
         cfg: &Config,
         p: &Paths,
         log: &mut Log,
-        app: Option<&crate::config::App>,
+        app: Option<(&str, &crate::config::App)>,
+        req: crate::Request,
         t0: Instant,
     ) -> Result<(), String> {
         let s = join(p, 60)?;
-        let Some(app) = app else {
+        let Some((section, a)) = app else {
             log.say("--session with a session already up: nothing to do");
             return Ok(());
         };
         let before = count_mapped(Path::new(&s.comp_log));
-        start_app(cfg, p, log, &s.id, app)?;
-        report(log, Path::new(&s.comp_log), before, t0, "warm")
+        start_app(cfg, p, log, &s.id, a, req)?;
+        let shown = report(log, Path::new(&s.comp_log), before, t0, "warm", req);
+        refresh(cfg, p, log, section, Refresh::Full);
+        shown
     }
 
     /// Everything that has to happen once. Timed line by line in the log,
@@ -669,7 +744,10 @@ mod win {
             .map_err(|e| format!("state file: {e}"))?;
 
         // 1. The compositor, here, on the desktop the user is looking at.
-        let argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
+        let mut argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
+        // §92. Where this installation keeps each application's relaunch
+        // file, so its windows can be pinned as the application.
+        argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
         // IVSHMEM ARENA (§83). The arena is BAR2 of the VM's ivshmem device, so
         // its size is the device's, set on the VM host, and `arena-mib` decides
         // nothing. Said once per session so that a log read later cannot
@@ -952,6 +1030,7 @@ mod win {
         log: &mut Log,
         id: &str,
         app: &crate::config::App,
+        req: crate::Request,
     ) -> Result<(), String> {
         let t = Instant::now();
         // Six things cross, all base64'd because they go through
@@ -980,23 +1059,39 @@ mod win {
         }
         let word = |s: &str| if s.is_empty() { "-".to_string() } else { plan::b64(s.as_bytes()) };
         let profile = plan::profile_dir(&app.exec).unwrap_or_default();
-        let said = ssh(
-            cfg,
-            p,
-            &[
-                "run",
-                id,
-                &word(&app.exec),
-                &word(&profile),
-                &word(&plan::app_user_js(titlebar, &app.prefs)),
-                &word(titlebar.moz_env()),
-                &word(&chrome),
-                // §91.8: the GTK sheet, for the dialogs. A `wc-session` older
-                // than §91 ignores a seventh word.
-                &word(&plan::gtk_css(titlebar, fit).unwrap_or_default()),
-            ],
-        )?;
-        log.say(&format!("run {}: {said} ({} ms)", app.title, t.elapsed().as_millis()));
+        // §92. A task or a page names the desktop entry and the action or URL,
+        // and the executable the host should run it with; the host builds the
+        // argv from its own desktop entry. The last five words are the same
+        // as `run`'s, so a task that starts the application cold gives it this
+        // installation's profile, preferences, title bar and GTK sheet.
+        let program = app.exec.split_whitespace().next().unwrap_or_default();
+        let mut verb: Vec<String> = match req {
+            crate::Request::Run => vec!["run".into(), id.into(), word(&app.exec)],
+            crate::Request::Action(a) => {
+                vec!["action".into(), id.into(), app.desktop.clone(), a.into(), word(program)]
+            }
+            crate::Request::Open(u) => {
+                vec!["open".into(), id.into(), app.desktop.clone(), word(u), word(program)]
+            }
+        };
+        verb.extend([
+            word(&profile),
+            word(&plan::app_user_js(titlebar, &app.prefs)),
+            word(titlebar.moz_env()),
+            word(&chrome),
+            // §91.8: the GTK sheet, for the dialogs. A `wc-session` older
+            // than §91 ignores a seventh word of `run`.
+            word(&plan::gtk_css(titlebar, fit).unwrap_or_default()),
+        ]);
+        let words: Vec<&str> = verb.iter().map(String::as_str).collect();
+        let said = ssh(cfg, p, &words)?;
+        // A page's URL is the user's history and is not written to this log.
+        let what = match req {
+            crate::Request::Run => "run".to_string(),
+            crate::Request::Action(a) => format!("action {a}"),
+            crate::Request::Open(_) => "open (a page from the jump list)".to_string(),
+        };
+        log.say(&format!("{what} {}: {said} ({} ms)", app.title, t.elapsed().as_millis()));
         Ok(())
     }
 
@@ -1065,9 +1160,14 @@ mod win {
         before: usize,
         t0: Instant,
         kind: &str,
+        req: crate::Request,
     ) -> Result<(), String> {
         let path = comp_log.to_path_buf();
-        let deadline = Instant::now() + Duration::from_secs(120);
+        // §92. A task or a page may open a tab in a window that is already
+        // there, and then no window is mapped at all. That is not a failure,
+        // so it waits briefly and says what it saw.
+        let optional = !matches!(req, crate::Request::Run);
+        let deadline = Instant::now() + Duration::from_secs(if optional { 15 } else { 120 });
         loop {
             if count_mapped(&path) > before {
                 log.say(&format!(
@@ -1075,6 +1175,10 @@ mod win {
                     t0.elapsed().as_millis(),
                     before
                 ));
+                return Ok(());
+            }
+            if optional && Instant::now() > deadline {
+                log.say(&format!("no new window in 15 s ({kind}); the application may have opened a tab"));
                 return Ok(());
             }
             if Instant::now() > deadline {
@@ -1106,73 +1210,291 @@ mod win {
 
     // ------------------------------------------------------------ install ---
 
-    /// Put a shortcut on the desktop, wearing the application's own icon.
+    /// Put a shortcut on the desktop and in the Start menu, wearing the
+    /// application's own icon and carrying its taskbar identity.
     ///
-    /// The icon comes from the VM host's theme, because that is the only
-    /// machine that has one — the same fact §16 is about, arriving at install
-    /// time instead of at run time.
+    /// The icon comes from the VM host, because that is the only machine that
+    /// has one: the same fact §16 is about, arriving at install time instead
+    /// of at run time. Since §92 both shortcuts are written through
+    /// `IShellLinkW` rather than PowerShell's `WScript.Shell`, because that
+    /// object cannot set `System.AppUserModel.ID`, and a shortcut without it
+    /// pins as a button of its own beside the application's windows.
     pub fn install(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Result<(), String> {
         let app = cfg.app(id)?;
-        // The executable goes with the request, because the icon that is
-        // certainly right is the one inside the package this launcher is about
-        // to run — see `wc-session icon`, and §28.6 for what that says about
-        // stage 11's `0 image(s)`.
-        let exec = app.exec.split_whitespace().next().unwrap_or_default().to_string();
-        let icon = match ssh(cfg, p, &["icon", &app.icon, &exec]) {
-            Ok(out) => {
-                let mut lines = out.lines();
-                let head = lines.next().unwrap_or("").to_string();
-                let png = plan::unb64(&lines.collect::<String>())?;
-                let ico = ico::wrap_png(&png)?;
-                let path = p.exe_dir.join(format!("{id}.ico"));
-                std::fs::write(&path, &ico).map_err(|e| format!("{}: {e}", path.display()))?;
-                log.say(&format!("icon: {head}, {} bytes -> {}", ico.len(), path.display()));
-                Some(path)
-            }
-            Err(e) => {
-                // A shortcut with the launcher's own icon is a working
-                // shortcut; §16.7's rule is that a missing icon costs a picture
-                // and not a window.
-                log.say(&format!("icon: {e}; the shortcut will wear the launcher's"));
-                None
-            }
-        };
-
-        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        let icon_line = match &icon {
-            Some(i) => format!("$s.IconLocation = '{},0'", i.display()),
-            None => String::new(),
-        };
-        // PowerShell, because a .lnk is a COM object and this runs once. The
-        // desktop is asked for rather than assumed: on this guest it is
+        refresh(cfg, p, log, id, Refresh::Full);
+        // The desktop is asked for rather than assumed: on this guest it is
         // redirected into OneDrive, and a file written to C:\Users\<guest-user>\Desktop
         // is a file nobody sees.
-        let ps = format!(
-            "$d = [Environment]::GetFolderPath('Desktop')\n\
-             $w = New-Object -ComObject WScript.Shell\n\
-             $s = $w.CreateShortcut((Join-Path $d '{title}.lnk'))\n\
-             $s.TargetPath = '{exe}'\n\
-             $s.Arguments = '{id}'\n\
-             $s.WorkingDirectory = '{dir}'\n\
-             $s.Description = '{title}, running on the Linux host'\n\
-             {icon_line}\n\
-             $s.Save()\n\
-             Write-Output (Join-Path $d '{title}.lnk')\n",
-            title = app.title.replace('\'', "''"),
-            exe = exe.display(),
-            dir = p.exe_dir.display(),
-        );
-        let out = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("powershell: {e}"))?;
-        let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !out.status.success() {
-            return Err(format!("powershell: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        log.say(&format!("installed {so}"));
+        let desktop = crate::shell::known_folder(&crate::shell::FOLDER_DESKTOP)?;
+        let path = desktop.join(format!("{}.lnk", file_name(&app.title)));
+        crate::shell::save_link(&shortcut(p, id, app), &path)?;
+        log.say(&format!("installed {}", path.display()));
         Ok(())
+    }
+
+    // ------------------------------------------------------------ §92 pins ---
+
+    /// How much of [`refresh`] to do.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Refresh {
+        /// Ask the host about the application, and rewrite its icon, its
+        /// relaunch file, its Start menu entry and its jump list.
+        Full,
+        /// The jump list only: the owner's periodic pass, which follows the
+        /// history and does not rewrite shortcuts every two minutes.
+        ListOnly,
+    }
+
+    fn file_name(title: &str) -> String {
+        title.chars().map(|c| if "<>:\"/\\|?*".contains(c) || c.is_control() { '_' } else { c }).collect()
+    }
+
+    fn exe_path() -> String {
+        std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_default()
+    }
+
+    fn cached_meta(p: &Paths, section: &str) -> Option<appmeta::Meta> {
+        std::fs::read_to_string(p.apps.join(format!("{section}.meta")))
+            .ok()
+            .and_then(|t| appmeta::Meta::parse(&t).ok())
+    }
+
+    fn app_aumid(p: &Paths, section: &str, app: &crate::config::App) -> String {
+        appmeta::aumid(&app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    }
+
+    /// The relaunch file the compositor will look for for this application.
+    pub fn relaunch_file(p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
+        let aumid = app_aumid(p, section, app);
+        p.apps.join(crate::taskbar::relaunch_file_name(&aumid).unwrap_or_default())
+    }
+
+    fn icon_path(p: &Paths, section: &str) -> Option<String> {
+        let i = p.exe_dir.join(format!("{section}.ico"));
+        i.exists().then(|| i.display().to_string())
+    }
+
+    /// The shortcut a click, the Start menu or a pin runs: `wc-launch.exe <section>`.
+    fn shortcut(p: &Paths, section: &str, app: &crate::config::App) -> crate::shell::LinkSpec {
+        crate::shell::LinkSpec {
+            target: exe_path(),
+            args: appmeta::quote_arg(section),
+            workdir: p.exe_dir.display().to_string(),
+            description: format!("{}, running on the Linux host", app.title),
+            icon: icon_path(p, section),
+            aumid: Some(app_aumid(p, section, app)),
+            title: None,
+        }
+    }
+
+    /// An `.ico` from the host's PNG (or ICO) bytes; `None` if they are neither.
+    fn to_ico(bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.starts_with(&[0, 0, 1, 0]) {
+            return Some(bytes.to_vec());
+        }
+        ico::wrap_png(bytes).ok()
+    }
+
+    /// §92. Make `[app.<section>]` pinnable, and bring its jump list up to date.
+    ///
+    /// Never fatal: every step that fails is logged and the next one runs, so
+    /// a host that cannot be reached costs a stale jump list and not a window.
+    /// Logged by counts only, because the jump list's pages are the user's
+    /// browsing history.
+    pub fn refresh(cfg: &Config, p: &Paths, log: &mut Log, section: &str, what: Refresh) {
+        let Ok(app) = cfg.app(section) else { return };
+        crate::shell::init();
+        let t = Instant::now();
+        let _ = std::fs::create_dir_all(&p.apps);
+        let jump = p.jump.join(section);
+        let _ = std::fs::create_dir_all(&jump);
+        let program = app.exec.split_whitespace().next().unwrap_or_default();
+        let dark = crate::shell::taskbar_is_dark();
+
+        // 1. What the host says about the application, kept for the next
+        //    launch and the periodic pass.
+        let meta_path = p.apps.join(format!("{section}.meta"));
+        if what == Refresh::Full {
+            let theme = if dark { "dark" } else { "light" };
+            match ssh(cfg, p, &["app", &app.desktop, &plan::b64(program.as_bytes()), theme]) {
+                Ok(out) => match appmeta::Meta::parse(&out) {
+                    Ok(_) => {
+                        let _ = std::fs::write(&meta_path, &out);
+                    }
+                    Err(e) => log.say(&format!("pins: the host's answer about {}: {e}", app.desktop)),
+                },
+                Err(e) => log.say(&format!("pins: app {}: {}; using what was cached", app.desktop, first_line(&e))),
+            }
+        }
+        let meta = cached_meta(p, section);
+        let aumid = appmeta::aumid(&app.app_id, &app.desktop, meta.as_ref());
+
+        if what == Refresh::Full {
+            // 2. The icon, the relaunch file and the Start menu entry.
+            let ico_path = p.exe_dir.join(format!("{section}.ico"));
+            match meta.as_ref().and_then(|m| m.icon_png.as_deref()).map(to_ico) {
+                Some(Some(ico)) => {
+                    if let Err(e) = std::fs::write(&ico_path, &ico) {
+                        log.say(&format!("pins: {}: {e}", ico_path.display()));
+                    }
+                }
+                _ => log.say("pins: no icon from the host; the pin wears the last one written, or the launcher's"),
+            }
+            let relaunch = appmeta::relaunch(&exe_path(), section, &app.title, icon_path(p, section).as_deref());
+            if let Some(name) = crate::taskbar::relaunch_file_name(&aumid)
+                && let Err(e) = std::fs::write(p.apps.join(&name), relaunch.render())
+            {
+                log.say(&format!("pins: {name}: {e}"));
+            }
+            match crate::shell::known_folder(&crate::shell::FOLDER_PROGRAMS) {
+                Ok(dir) => {
+                    let lnk = dir.join(format!("{}.lnk", file_name(&app.title)));
+                    if let Err(e) = crate::shell::save_link(&shortcut(p, section, app), &lnk) {
+                        log.say(&format!("pins: Start menu {}: {e}", lnk.display()));
+                    }
+                }
+                Err(e) => log.say(&format!("pins: {e}")),
+            }
+        }
+
+        // 3. The jump list. Pages only for an application whose Exec= takes a
+        //    URL and whose profile the launcher names; the host answers
+        //    `prefs none` otherwise.
+        let Some(meta) = meta else {
+            log.say(&format!("pins: {aumid}: no desktop entry known yet, so no jump list"));
+            return;
+        };
+        let profile = plan::profile_dir(&app.exec).unwrap_or_default();
+        let (prefs, pages) = if meta.takes_url && !profile.is_empty() {
+            match ssh(cfg, p, &["frequent", &plan::b64(profile.as_bytes())]) {
+                Ok(out) => appmeta::parse_frequent(&out),
+                Err(e) => {
+                    // First line only: a failed reply can carry the pages after it.
+                    log.say(&format!("pins: frequent: {}", first_line(&e)));
+                    (appmeta::JumpPrefs::default(), Vec::new())
+                }
+            }
+        } else {
+            (appmeta::JumpPrefs::default(), Vec::new())
+        };
+        let _ = std::fs::write(jump.join("refresh-secs"), prefs.refresh_secs.to_string());
+        // Icons: the tasks' as `task-<id>.ico`, the pages' as
+        // `page-<hash of the URL>.ico`, so a link keeps its file across
+        // refreshes and Explorer's icon cache stays right. Old pages' icons
+        // are removed.
+        let mut task_icons = std::collections::BTreeMap::new();
+        for a in &meta.actions {
+            if let Some(ico) = a.icon_png.as_deref().and_then(to_ico) {
+                let f = jump.join(format!("task-{}.ico", a.id));
+                if std::fs::write(&f, ico).is_ok() {
+                    task_icons.insert(a.id.clone(), f.display().to_string());
+                }
+            }
+        }
+        let mut page_icons = std::collections::BTreeMap::new();
+        for (i, page) in pages.iter().enumerate() {
+            if let Some(ico) = page.icon.as_deref().and_then(to_ico) {
+                let f = jump.join(format!("page-{:016x}.ico", fnv(page.url.as_bytes())));
+                if std::fs::write(&f, ico).is_ok() {
+                    page_icons.insert(i, f.display().to_string());
+                }
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(&jump) {
+            let keep: std::collections::BTreeSet<String> = page_icons.values().cloned().collect();
+            for e in rd.flatten() {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("page-") && !keep.contains(&path.display().to_string()) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let removed_path = jump.join("removed.txt");
+        let mut removed = appmeta::parse_removed(&std::fs::read_to_string(&removed_path).unwrap_or_default());
+        let langs = appmeta::lang_candidates(&crate::shell::ui_languages());
+        let app_icon = icon_path(p, section);
+        let exe = exe_path();
+        let workdir = p.exe_dir.display().to_string();
+        let committed = crate::shell::serialised("Local\\waycompose-jumplist", || {
+            crate::shell::commit_jump_list(&aumid, |gone| {
+                for args in gone {
+                    if let Some(u) = appmeta::url_of_args(args) {
+                        removed.insert(u);
+                    }
+                }
+                let plan = appmeta::plan(section, &meta, &prefs, &pages, &langs, &removed);
+                let spec = |l: &appmeta::Link| crate::shell::LinkSpec {
+                    target: exe.clone(),
+                    args: appmeta::command_line(&l.args),
+                    workdir: workdir.clone(),
+                    description: l.description.clone(),
+                    icon: match &l.icon {
+                        appmeta::IconRef::App => app_icon.clone(),
+                        appmeta::IconRef::Task(id) => task_icons.get(id).cloned().or_else(|| app_icon.clone()),
+                        appmeta::IconRef::Page(i) => page_icons.get(i).cloned().or_else(|| app_icon.clone()),
+                    },
+                    aumid: None,
+                    title: Some(l.title.clone()),
+                };
+                let cats = plan.categories.iter().map(|(n, ls)| (n.clone(), ls.iter().map(spec).collect())).collect();
+                (cats, plan.tasks.iter().map(spec).collect())
+            })
+        });
+        let _ = std::fs::write(&removed_path, removed.iter().map(|u| format!("{u}\n")).collect::<String>());
+        match committed {
+            Ok(c) => log.say(&format!(
+                "pins: {aumid}: jump list {} task(s), {} ({} slot(s)){}; {} page(s) removed by the user; {} ms",
+                c.tasks,
+                if c.categories.is_empty() {
+                    "no pages".to_string()
+                } else {
+                    c.categories.iter().map(|(n, k)| format!("{n}: {k} page(s)")).collect::<Vec<_>>().join(", ")
+                },
+                c.slots,
+                if c.warnings.is_empty() { String::new() } else { format!(", {}", c.warnings.join(", ")) },
+                removed.len(),
+                t.elapsed().as_millis()
+            )),
+            Err(e) => log.say(&format!("pins: {aumid}: jump list not committed: {e}")),
+        }
+    }
+
+    fn first_line(s: &str) -> String {
+        s.lines().next().unwrap_or("").chars().take(160).collect()
+    }
+
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+
+    /// §92. The owner's periodic pass: every application with a cached host
+    /// answer gets its jump list rebuilt every `refreshInSeconds`, so the
+    /// frequent pages follow the history while the session runs. A thread of
+    /// its own, with its own log handle and its own COM apartment; it ends
+    /// with the owner's process.
+    fn start_list_refresher(cfg: &Config, session: &str) {
+        let cfg = cfg.clone();
+        let session = session.to_string();
+        std::thread::spawn(move || {
+            let Ok(p) = crate::paths(&session) else { return };
+            let mut log = Log::open(&p.log);
+            loop {
+                let secs = cfg
+                    .apps
+                    .keys()
+                    .filter_map(|s| std::fs::read_to_string(p.jump.join(s).join("refresh-secs")).ok())
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .min()
+                    .unwrap_or(120)
+                    .clamp(30, 3600);
+                std::thread::sleep(Duration::from_secs(secs));
+                for section in cfg.apps.keys() {
+                    if p.apps.join(format!("{section}.meta")).exists() {
+                        refresh(&cfg, &p, &mut log, section, Refresh::ListOnly);
+                    }
+                }
+            }
+        });
     }
 }

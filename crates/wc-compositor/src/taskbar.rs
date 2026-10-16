@@ -146,6 +146,170 @@ pub fn identity(app_id: &str, client: u32) -> String {
     format!("{PREFIX}{NAMED}{body}")
 }
 
+// ---------------------------------------------------------------------------
+// Relaunch, §92
+// ---------------------------------------------------------------------------
+//
+// Until §92 every window carried `PKEY_AppUserModel_PreventPinning`, because
+// a pin made from a window is a shortcut to whatever the shell can work out
+// about it, and here that is `sv-guest.exe` rather than the Linux program the
+// button stands for. A window can say what a pin should run instead
+// (`PKEY_AppUserModel_RelaunchCommand`, with a display name and an icon), but
+// the compositor does not know that command: the application was started on
+// another machine by somebody else.
+//
+// The launcher does know it. It started the application and knows its own
+// executable, the `[app.<id>]` section and the icon it wrote. So the launcher
+// writes one small file per application into a directory it names with
+// `--relaunch-dir`, keyed by the identity this module derives, and the
+// compositor reads it when it stamps an identity on a window. A window with no
+// file keeps `PreventPinning`, so a pin that would start the wrong program is
+// still never offered.
+//
+// This file is compiled into `wc-launch` as well (`#[path]` in its `main.rs`),
+// so the identity the launcher stamps on its shortcuts and jump list and the
+// one the compositor stamps on its windows come from one function. If they
+// came from two, a pinned button and its window could stop sharing a slot
+// without any test failing.
+
+/// The extension of a relaunch file: `<identity>.relaunch`.
+pub const RELAUNCH_EXT: &str = "relaunch";
+
+/// What a pin made from a window of one application should run, and wear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relaunch {
+    /// The whole command line, `"C:\…\wc-launch.exe" firefox`:
+    /// `PKEY_AppUserModel_RelaunchCommand`.
+    pub command: String,
+    /// What the pin is called: `PKEY_AppUserModel_RelaunchDisplayNameResource`.
+    /// Windows ignores a relaunch command without one.
+    pub name: String,
+    /// `path,index` of the pin's icon: `PKEY_AppUserModel_RelaunchIconResource`.
+    /// May be empty, and the pin then wears the target's icon.
+    pub icon: String,
+}
+
+impl Relaunch {
+    /// One `key=value` per line. Anything else is ignored, so a later
+    /// launcher may add keys an older compositor does not read.
+    ///
+    /// `None` unless both the command and the name are there: a relaunch
+    /// command without a display name is one Windows ignores, and the window
+    /// then pins as `sv-guest.exe`, which is exactly the pin this exists to
+    /// prevent.
+    pub fn parse(text: &str) -> Option<Relaunch> {
+        let mut r = Relaunch { command: String::new(), name: String::new(), icon: String::new() };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k.trim() {
+                "command" => r.command = v.trim().to_string(),
+                "name" => r.name = v.trim().to_string(),
+                "icon" => r.icon = v.trim().to_string(),
+                _ => {}
+            }
+        }
+        (!r.command.is_empty() && !r.name.is_empty()).then_some(r)
+    }
+
+    /// The file's text. A value cannot contain a line break, so one that does
+    /// is cut at it rather than allowed to start a second key.
+    ///
+    /// Written by `wc-launch`, which compiles this file too; the compositor only
+    /// reads.
+    #[allow(dead_code)]
+    pub fn render(&self) -> String {
+        let one = |s: &str| s.lines().next().unwrap_or("").trim().to_string();
+        format!(
+            "command={}\nname={}\nicon={}\n",
+            one(&self.command),
+            one(&self.name),
+            one(&self.icon)
+        )
+    }
+}
+
+/// The relaunch file's name for an identity, or `None` for an identity this
+/// module could not have produced.
+///
+/// An identity is ASCII from [`keep`]'s alphabet under [`PREFIX`] by
+/// construction, which is also a safe file name; the check is here so that
+/// the rule is stated where the path is built rather than inherited from
+/// another function.
+pub fn relaunch_file_name(aumid: &str) -> Option<String> {
+    let ok = aumid.starts_with(PREFIX)
+        && aumid.len() <= MAX_LEN
+        && aumid.chars().all(keep);
+    ok.then(|| format!("{aumid}.{RELAUNCH_EXT}"))
+}
+
+static RELAUNCH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// `--relaunch-dir`: where the launcher keeps the files above. Set once, at
+/// argument parsing; a second call is ignored.
+pub fn set_relaunch_dir(dir: std::path::PathBuf) {
+    let _ = RELAUNCH_DIR.set(dir);
+}
+
+/// The relaunch details for a window's identity, if a launcher left any.
+///
+/// Read at each stamp rather than cached, so a launcher that refreshes the
+/// file between two windows is seen by the second. It is a few hundred bytes,
+/// read when a window is created or renamed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn relaunch_for(aumid: &str) -> Option<Relaunch> {
+    let dir = RELAUNCH_DIR.get()?;
+    let name = relaunch_file_name(aumid)?;
+    Relaunch::parse(&std::fs::read_to_string(dir.join(name)).ok()?)
+}
+
+#[cfg(test)]
+mod relaunch_tests {
+    use super::*;
+
+    #[test]
+    fn a_relaunch_file_round_trips() {
+        let r = Relaunch {
+            command: r#""C:\Users\u\wcivs\wc-launch.exe" firefox"#.into(),
+            name: "Firefox (Linux)".into(),
+            icon: r"C:\Users\u\wcivs\firefox.ico,0".into(),
+        };
+        assert_eq!(Relaunch::parse(&r.render()), Some(r));
+    }
+
+    /// Windows ignores a relaunch command with no display name, and the pin
+    /// would then be `sv-guest.exe`: no file is better than half of one.
+    #[test]
+    fn a_relaunch_without_a_name_or_command_is_none() {
+        assert_eq!(Relaunch::parse("command=x.exe\nicon=a.ico,0\n"), None);
+        assert_eq!(Relaunch::parse("name=X\n"), None);
+        assert_eq!(Relaunch::parse(""), None);
+    }
+
+    #[test]
+    fn a_line_break_cannot_add_a_key() {
+        let r = Relaunch { command: "a.exe\nname=evil".into(), name: "N".into(), icon: String::new() };
+        let back = Relaunch::parse(&r.render()).unwrap();
+        assert_eq!(back.command, "a.exe");
+        assert_eq!(back.name, "N");
+    }
+
+    #[test]
+    fn only_our_identities_name_a_file() {
+        assert_eq!(
+            relaunch_file_name(&identity("firefox", 1)).as_deref(),
+            Some("Waycompose.app.firefox.relaunch")
+        );
+        assert!(relaunch_file_name(&identity("", 4)).is_some());
+        assert_eq!(relaunch_file_name("Microsoft.Windows.Explorer"), None);
+        assert_eq!(relaunch_file_name("Waycompose.app/../x"), None);
+        // Whatever a client calls itself, the file name stays in the directory.
+        for c in ["../../evil", "a\\b", "C:x", "☃"] {
+            let f = relaunch_file_name(&identity(c, 1)).unwrap();
+            assert!(!f.contains(['/', '\\', ':']), "{f}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

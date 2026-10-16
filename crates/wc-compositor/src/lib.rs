@@ -609,6 +609,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                     }
                 }
             }
+            // §92. Where the launcher leaves what a pin of each application
+            // should run; see `taskbar::Relaunch`. Without it every window
+            // keeps `PreventPinning`, as before §92.
+            "--relaunch-dir" => {
+                let Some(dir) = it.next() else {
+                    eprintln!("wc-compositor: --relaunch-dir wants a directory");
+                    return Err(2);
+                };
+                taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
+            }
             // §85. 0 means "as soon as the last window is gone".
             "--exit-when-empty" => {
                 let Some(secs) = it.next().and_then(|s| s.parse::<u64>().ok()) else {
