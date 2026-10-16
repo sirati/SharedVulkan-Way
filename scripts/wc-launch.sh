@@ -148,8 +148,9 @@ PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-<guest-user>}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 # §95. Each session slot of the GPU device is 16 MiB of control and this much
-# arena (`gpu-arena-mib`, default 64). Firefox with two windows needs about
-# 53 MiB of arena and 64 MiB leaves it 56: testhost runs 2 sessions of 112.
+# arena (`gpu-arena-mib`, the launcher's default 64). §95 measured Firefox
+# with two windows at about 53 MiB; testhost keeps 3 x 64 until the arena is
+# allocated dynamically.
 GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
