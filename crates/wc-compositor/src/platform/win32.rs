@@ -191,6 +191,12 @@ use windows_sys::Win32::System::Power::{
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
+// §96: a fullscreen window's placement, so a restore from the taskbar comes back
+// over the monitor (`set_fullscreen`).
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetWindowPlacement, SetWindowPlacement, GWL_EXSTYLE, SW_SHOWMINIMIZED, WINDOWPLACEMENT,
+    WPF_RESTORETOMAXIMIZED,
+};
 use windows_sys::Win32::Foundation::{GlobalFree, POINT, PROPERTYKEY, SIZE};
 use windows_sys::core::{GUID, HRESULT};
 // ADDED FOR THE CLIPBOARD. The clipboard lives in `DataExchange` rather than with
@@ -374,8 +380,8 @@ struct WindowState {
     /// §91: the client asked to be maximised before the window was shown;
     /// `map_window` shows it maximised.
     maximize_at_map: Cell<bool>,
-    /// §96: while fullscreen, the style and the outer rectangle to go back to.
-    fullscreen: Cell<Option<(isize, RECT)>>,
+    /// §96: while fullscreen, the style and the placement to go back to.
+    fullscreen: Cell<Option<(isize, WINDOWPLACEMENT)>>,
     /// §91: inside `WM_ENTERSIZEMOVE` … `WM_EXITSIZEMOVE`, when the user owns
     /// the window's size and a client commit must not resize it.
     user_sizing: Cell<bool>,
@@ -4736,7 +4742,22 @@ fn present(w: &Rc<WindowState>, damage: &[Rect]) {
 /// the monitor, not its work area, so the taskbar is under it — and the size
 /// reaches the client through the `WM_SIZE` that `SetWindowPos` sends, as a
 /// configure carrying the fullscreen state the Wayland side has already set.
-/// Leaving puts back the style and the outer rectangle it had.
+/// Leaving puts back the style and the placement it had.
+///
+/// **The placement, not the rectangle.** The first version saved
+/// `GetWindowRect` and moved the window over the monitor with `SetWindowPos`,
+/// which is only what the window looks like *now*. Windows keeps a second
+/// answer, `WINDOWPLACEMENT`: the normal rectangle and whether the window is
+/// maximised, and a restore from the taskbar uses that one. GLFW minimises a
+/// fullscreen window when it loses focus (`GLFW_AUTO_ICONIFY`, on Wayland as
+/// on Win32), so a fullscreen game is restored from the taskbar all the time.
+/// On the guest, a game made fullscreen from a maximised window came back
+/// maximised: a 1296x768 borderless window at -8,-8, 8 px cut off at the left
+/// and top and the taskbar showing below it. One made fullscreen from a normal
+/// window would have come back at its windowed size. So for as long as the
+/// window is fullscreen its normal placement is the monitor
+/// ([`fullscreen_placement`]), which also takes it out of the maximised state,
+/// and the saved placement goes back on the way out, maximised or not.
 fn set_fullscreen(w: &Rc<WindowState>, on: bool) {
     let hwnd = w.hwnd();
     if on == w.fullscreen.get().is_some() {
@@ -4749,20 +4770,29 @@ fn set_fullscreen(w: &Rc<WindowState>, on: bool) {
             rcWork: RECT { left: 0, top: 0, right: 0, bottom: 0 },
             dwFlags: 0,
         };
-        let mut was = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a plain C struct, for which all-zero is a valid value;
+        // `length` is set before the call that reads it.
+        let mut was: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+        was.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
         // SAFETY: a live window handle on its own thread; every out-parameter
-        // is written in place, and `cbSize` is set.
+        // is written in place, and `cbSize` and `length` are set.
         unsafe {
             let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
                 println!("wc-compositor: window {} cannot go fullscreen: no monitor", w.id);
                 return;
             }
-            GetWindowRect(hwnd, &mut was);
+            if GetWindowPlacement(hwnd, &mut was) == 0 {
+                println!("wc-compositor: window {} cannot go fullscreen: no placement", w.id);
+                return;
+            }
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             w.fullscreen.set(Some((style, was)));
             let bare = (style as u32 & !WS_OVERLAPPEDWINDOW) | WS_POPUP;
             SetWindowLongPtrW(hwnd, GWL_STYLE, bare as isize);
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let full = fullscreen_placement(&was, info.rcMonitor, info.rcWork, ex);
+            SetWindowPlacement(hwnd, &full);
             let m = info.rcMonitor;
             SetWindowPos(
                 hwnd,
@@ -4775,30 +4805,82 @@ fn set_fullscreen(w: &Rc<WindowState>, on: bool) {
             );
         }
         println!(
-            "wc-compositor: window {} fullscreen on its monitor ({}x{} at {},{})",
+            "wc-compositor: window {} fullscreen on its monitor ({}x{} at {},{}){}",
             w.id,
             info.rcMonitor.right - info.rcMonitor.left,
             info.rcMonitor.bottom - info.rcMonitor.top,
             info.rcMonitor.left,
-            info.rcMonitor.top
+            info.rcMonitor.top,
+            if was.showCmd == SW_SHOWMAXIMIZED as u32 { ", from maximised" } else { "" }
         );
-    } else if let Some((style, was)) = w.fullscreen.take() {
-        // SAFETY: a live window handle; the style and rectangle are the ones
+    } else if let Some((style, mut was)) = w.fullscreen.take() {
+        // SAFETY: a live window handle; the style and placement are the ones
         // read from this window when it went fullscreen.
         unsafe {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            // A minimised window stays minimised: leaving fullscreen while on
+            // the taskbar must not pop the window up behind the user's back.
+            was.showCmd = show_cmd(super::fullscreen::leave_show(
+                show_of(was.showCmd),
+                IsIconic(hwnd) != 0,
+            ));
+            SetWindowPlacement(hwnd, &was);
             SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
-                was.left,
-                was.top,
-                was.right - was.left,
-                was.bottom - was.top,
-                SWP_FRAMECHANGED | SWP_NOZORDER,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
-        println!("wc-compositor: window {} left fullscreen", w.id);
+        println!(
+            "wc-compositor: window {} left fullscreen{}",
+            w.id,
+            if was.showCmd == SW_SHOWMAXIMIZED as u32 { ", maximised again" } else { "" }
+        );
     }
+}
+
+/// §96: the placement a fullscreen window keeps, decided by
+/// `platform::fullscreen` (pure, tested on every target): the saved one with
+/// the monitor as its normal rectangle, normal rather than maximised, and no
+/// `WPF_RESTORETOMAXIMIZED`.
+fn fullscreen_placement(
+    was: &WINDOWPLACEMENT,
+    monitor: RECT,
+    work: RECT,
+    ex_style: u32,
+) -> WINDOWPLACEMENT {
+    use super::fullscreen as fs;
+    let r = |r: RECT| fs::Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    let n = fs::normal_rect(r(monitor), r(work), ex_style & WS_EX_TOOLWINDOW != 0);
+    let mut p = *was;
+    p.rcNormalPosition = RECT { left: n.left, top: n.top, right: n.right, bottom: n.bottom };
+    p.showCmd = show_cmd(fs::fullscreen_show(show_of(was.showCmd)));
+    p.flags &= !WPF_RESTORETOMAXIMIZED;
+    p
+}
+
+fn show_of(cmd: u32) -> super::fullscreen::Show {
+    use super::fullscreen::Show;
+    if cmd == SW_SHOWMAXIMIZED as u32 {
+        Show::Maximized
+    } else if cmd == SW_SHOWMINIMIZED as u32 {
+        Show::Minimized
+    } else {
+        Show::Normal
+    }
+}
+
+fn show_cmd(show: super::fullscreen::Show) -> u32 {
+    use super::fullscreen::Show;
+    (match show {
+        Show::Normal => SW_SHOWNORMAL,
+        Show::Maximized => SW_SHOWMAXIMIZED,
+        Show::Minimized => SW_SHOWMINIMIZED,
+    }) as u32
 }
 
 fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Option<bool>) {

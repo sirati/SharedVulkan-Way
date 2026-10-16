@@ -218,6 +218,63 @@ pub fn dirs_for_pid(pid: i32) -> Vec<PathBuf> {
     }
 }
 
+/// What a client's launcher said about it in its environment (§96,
+/// docs/waycompose-design.md 96.11).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ClientEnv {
+    /// `WC_APP_ID`: the app id for a toplevel whose client sets an empty one
+    /// (GLFW without `GLFW_WAYLAND_APP_ID`, which is every Minecraft). Only a
+    /// valid desktop id is taken ([`app_id_ok`]).
+    pub app_id: Option<String>,
+    /// `XDG_DATA_DIRS`: where the client's own desktop entry and icons are.
+    /// An application installed into a home directory (`~/wc-mc/share`) is
+    /// on no system path and in no package prefix the executable shows,
+    /// because the executable is Java's.
+    pub data_dirs: Vec<PathBuf>,
+}
+
+/// The rule for an app id taken from a client's environment: a letter or
+/// digit, then letters, digits and `. _ + -`, no `..`, at most 64 bytes. The
+/// same rule `wc-session` and the launcher apply to an application id.
+pub fn app_id_ok(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(c))
+        && !id.contains("..")
+}
+
+/// [`ClientEnv`] from the bytes of a `/proc/<pid>/environ`.
+pub fn parse_environ(raw: &[u8]) -> ClientEnv {
+    let mut env = ClientEnv::default();
+    for kv in raw.split(|&c| c == 0) {
+        let Ok(kv) = std::str::from_utf8(kv) else { continue };
+        if let Some(v) = kv.strip_prefix("WC_APP_ID=") {
+            env.app_id = app_id_ok(v).then(|| v.to_owned());
+        } else if let Some(v) = kv.strip_prefix("XDG_DATA_DIRS=") {
+            env.data_dirs = v
+                .split(':')
+                .filter(|d| d.starts_with('/'))
+                .map(PathBuf::from)
+                .collect();
+        }
+    }
+    env
+}
+
+/// [`ClientEnv`] for a live process id. `/proc/<pid>/environ` is the
+/// environment the process was started with, readable for a process of the
+/// proxy's own user and nobody else's, and as trustworthy as the client:
+/// what it can choose here is the name of its own icon and where to look
+/// for it, which it could already choose by calling `set_app_id`.
+#[cfg(unix)]
+pub fn client_env(pid: i32) -> ClientEnv {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|raw| parse_environ(&raw))
+        .unwrap_or_default()
+}
+
 /// Icons an application ships **beside its executable**, as (size, path).
 ///
 /// ADDED FOR §90 (docs/waycompose-design.md). The launcher's Firefox is a
@@ -776,6 +833,28 @@ mod tests {
         assert_eq!(bundled_icons(&tb.join("thunderbird")).len(), 1);
         assert!(bundled_icons(&empty.join("nothing")).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_client_environment_names_its_app_and_its_data() {
+        let env = parse_environ(
+            b"PATH=/bin\0WC_APP_ID=wc-minecraft\0XDG_DATA_DIRS=/home/u/wc-mc/share:relative:/usr/share\0",
+        );
+        assert_eq!(env.app_id.as_deref(), Some("wc-minecraft"));
+        assert_eq!(
+            env.data_dirs,
+            vec![PathBuf::from("/home/u/wc-mc/share"), PathBuf::from("/usr/share")]
+        );
+    }
+
+    #[test]
+    fn an_app_id_from_the_environment_must_be_a_desktop_id() {
+        for bad in ["", "../x", "a/b", "-x", "a..b", "x y", &"a".repeat(65)] {
+            let raw = format!("WC_APP_ID={bad}\0");
+            assert_eq!(parse_environ(raw.as_bytes()).app_id, None, "{bad:?}");
+        }
+        assert!(app_id_ok("org.prismlauncher.PrismLauncher"));
+        assert_eq!(parse_environ(b"OTHER=1\0").app_id, None);
     }
 
     fn tiny_png() -> Vec<u8> {

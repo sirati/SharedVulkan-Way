@@ -17,6 +17,11 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   # The capture: CreateDIBSection, BitBlt, the DIB headers, EnumDisplayMonitors.
   "Win32_Graphics_Gdi",
+  # §96: DWMWA_EXTENDED_FRAME_BOUNDS, for `shot --visible`.
+  "Win32_Graphics_Dwm",
+  # §96: GetStdHandle, SetStdHandle and AttachConsole for a program with no
+  # console of its own (`--stdout`).
+  "Win32_System_Console",
   # PrintWindow lives in the XPS module, which is where the printing-era API
   # it grew out of was filed. It is a user32 export like any other.
   "Win32_Storage_Xps",

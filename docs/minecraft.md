@@ -164,4 +164,23 @@ world loading. The first is Zink's own: it reproduces with Zink on this RADV
 
 ## Phase 2
 
-Recorded in waycompose-design.md §96 when it is done.
+waycompose-design.md §96.10 and §96.11 record it. The user's view:
+
+* **Three shortcuts** on the guest's desktop and in the Start menu, each
+  pinnable: *Minecraft Demo (Linux)*, *Minecraft Demo VulkanMod (Linux)*, and
+  *Prism Launcher (Linux)*.
+* **Minecraft's window has Minecraft's icon** and the same taskbar button as
+  its shortcut, however it was started.
+* **Prism Launcher** opens on the guest with Windows' title bar and lists both
+  instances. Without an account, Prism first shows its "Add Microsoft account"
+  page: click **Finish**. Then select an instance, **Play**, and answer the
+  three questions: **No** (no account), **Play Demo**, **OK** (the player's
+  name). A Microsoft account of your own can be added in Prism at any time.
+* **Fullscreen** is F11. A fullscreen game minimises itself when another
+  window takes focus, as games do on Windows. Click its taskbar button to bring
+  it back.
+
+To install it on a VM host and the guest: `scripts/sv-minecraft.sh ship HOST`,
+then `scripts/wc-launch.sh deploy` and `install` with `WC_LAUNCH_EXTRA_APPS`,
+`WC_LAUNCH_EXTRA_APP_BLOCKS` and `WC_LAUNCH_INSTALL_APPS="minecraft
+minecraft-vulkanmod prism"`.

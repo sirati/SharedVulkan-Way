@@ -566,6 +566,14 @@ bundle() {
     grep '^LD_LIBRARY_PATH=' "$CAP/$v/env" >"$B/capture/$v/env"
     sed -i -e '/^WrapperCommand=/d' -e 's/^OverrideCommands=true/OverrideCommands=false/' \
       "$B/prism/instances/mc-$v/instance.cfg"
+    # The names and icons a person sees in Prism's instance list (§96.11).
+    local name icon
+    case $v in
+      stock) name="Minecraft $MC_VERSION"; icon=grass ;;
+      vulkanmod) name="Minecraft $MC_VERSION (VulkanMod)"; icon=diamond ;;
+    esac
+    sed -i -e "s/^name=.*/name=$name/" -e "s/^iconKey=.*/iconKey=$icon/" \
+      "$B/prism/instances/mc-$v/instance.cfg"
     local O="$B/prism/instances/mc-$v/minecraft/options.txt"
     for kv in narrator:0 narratorHotkey:false onboardAccessibility:false renderDistance:6 \
               simulationDistance:6 enableVsync:true maxFps:120 soundCategory_master:1.0 \
@@ -575,8 +583,13 @@ bundle() {
     done
   done
   sed -i -e "s/^LastHostname=.*/LastHostname=$host/" -e 's/^MaxMemAlloc=.*/MaxMemAlloc=1024/' \
-    -e 's/^MinMemAlloc=.*/MinMemAlloc=256/' "$B/prism/prismlauncher.cfg"
+    -e 's/^MinMemAlloc=.*/MinMemAlloc=256/' -e '/^WrapperCommand=/d' "$B/prism/prismlauncher.cfg"
+  # §96.11: Prism's wrapper for every instance (the global setting, so an
+  # instance the person adds later has it too): the game's taskbar identity
+  # and icon, the same as the desktop shortcut's.
+  echo "WrapperCommand=$HOST_DIR/bin/minecraft-prism-wrap" >>"$B/prism/prismlauncher.cfg"
   install -m 755 "$ROOT/scripts/minecraft-demo" "$B/bin/minecraft-demo"
+  install -m 755 "$ROOT/scripts/minecraft-prism-wrap" "$B/bin/minecraft-prism-wrap"
   # Minecraft's own icon, from the game's assets (`icons/icon_*.png`).
   local idx="$PRISM_DIR/assets/indexes/29.json" sz h
   for sz in 256x256 128x128 48x48; do
@@ -601,7 +614,16 @@ ship() {
   local host; host=$(ssh -o BatchMode=yes "$target" hostname) || die "cannot reach $target"
   bundle "$host"
   nix copy --no-check-sigs --to "ssh-ng://$target" "$PRISM" "$JDK" "$GLFW" || die "nix copy to $target"
-  rsync -a --delete "$DATA/bundle/wc-mc/" "$target:$HOST_DIR/" || die "rsync to $target"
+  # What the person playing on the host owns is never replaced or deleted: the
+  # worlds, the game's options, Prism's accounts (a Microsoft login is theirs
+  # to add), servers, logs and screenshots. An excluded path is also kept from
+  # `--delete`. The bundle's options.txt (narrator off) then goes only where
+  # an instance has none yet.
+  rsync -a --delete --exclude 'saves/' --exclude 'options.txt' --exclude 'servers.dat' \
+    --exclude 'accounts.json' --exclude 'logs/' --exclude 'screenshots/' \
+    "$DATA/bundle/wc-mc/" "$target:$HOST_DIR/" || die "rsync to $target"
+  rsync -a --ignore-existing --include '*/' --include 'options.txt' --exclude '*' \
+    "$DATA/bundle/wc-mc/" "$target:$HOST_DIR/" || die "rsync of options.txt to $target"
   ssh "$target" "bash -n $HOST_DIR/bin/minecraft-demo && test -x $(head -1 "$CAP/stock/argv")" \
     || die "the launcher or its Java is not usable on $target"
   say "shipped to $target:$HOST_DIR"
