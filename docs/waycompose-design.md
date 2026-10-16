@@ -30346,6 +30346,14 @@ from Prism, and Minecraft's icon on the guest's taskbar. Both need one short
 slot: open Prism from its shortcut, Finish, select an instance, Play, then the
 three dialogs, then a look at the taskbar.
 
+Gates on `ed365b4` (master 86a6261 merged): `cargo test --workspace
+--no-fail-fast` **102 binaries, 2986 passed, 0 failed**, 8 ignored (new:
+`platform::fullscreen`'s 6, `icons`' 2 environment tests, and the session test
+of the app id on the wire); `cargo clippy --workspace --all-targets` exit 0,
+no warning in a line this branch wrote; `cargo check --workspace --target
+x86_64-pc-windows-gnu` exit 0; `scripts/sv-minecraft.sh run stock 150` with
+`WC_APP_ID` PASS.
+
 ## 97. The GPU arena becomes one pool: leases instead of slots, and a device carved out of the guest's RAM
 
 Branch `gpu-arena-dyn`, from master `2982bdd` with `gpu-oom` (§95) and
