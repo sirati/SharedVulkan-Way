@@ -89,6 +89,9 @@ const R8G8B8A8_UNORM: i32 = 37;
 const R8G8B8A8_SRGB: i32 = 43;
 /// `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`, the only colour space that is core.
 const SRGB_NONLINEAR: i32 = 0;
+/// `VK_COLOR_SPACE_PASS_THROUGH_EXT` (`VK_EXT_swapchain_colorspace`): the bytes go
+/// to the window as they are, which is what this WSI does for every format.
+const PASS_THROUGH: i32 = 1_000_104_013;
 
 /// Bytes per pixel, for every format this implementation offers.
 const BPP: u64 = 4;
@@ -168,7 +171,7 @@ pub fn surface_capabilities(target: PresentTarget) -> IcdResult<SurfaceCaps> {
 
 /// `vkGetPhysicalDeviceSurfaceFormatsKHR`.
 ///
-/// Four formats and one colour space, and the list is the app side's alone: the
+/// Four formats in two colour spaces, and the list is the app side's alone: the
 /// GPU-side driver's own surface formats describe a window system it is not
 /// attached to. What constrains this list is not the driver but the *blit* —
 /// every entry has to be something [`crate::present`] can put in a window, which
@@ -180,6 +183,12 @@ pub fn surface_formats(_target: PresentTarget) -> Vec<(i32, i32)> {
         (B8G8R8A8_SRGB, SRGB_NONLINEAR),
         (R8G8B8A8_UNORM, SRGB_NONLINEAR),
         (R8G8B8A8_SRGB, SRGB_NONLINEAR),
+        // §96: the same four again, pass-through, which Zink asks for on
+        // Wayland. sRGB-nonlinear stays first: it is what everything else picks.
+        (B8G8R8A8_UNORM, PASS_THROUGH),
+        (B8G8R8A8_SRGB, PASS_THROUGH),
+        (R8G8B8A8_UNORM, PASS_THROUGH),
+        (R8G8B8A8_SRGB, PASS_THROUGH),
     ]
 }
 

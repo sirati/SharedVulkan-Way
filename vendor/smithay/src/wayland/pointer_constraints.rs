@@ -48,6 +48,18 @@ pub trait PointerConstraintsHandler: SeatHandler {
         pointer: &PointerHandle<Self>,
         location: Point<f64, Logical>,
     );
+
+    /// The constraint for `pointer` on `surface` is gone: the client destroyed
+    /// its `zwp_locked_pointer_v1` or `zwp_confined_pointer_v1`, or the client
+    /// itself went away.
+    ///
+    /// Added in this fork (waycompose-design.md §96). Upstream removes the
+    /// constraint silently, and a compositor that enforces a lock outside the
+    /// protocol — a clipped system cursor, say — has no other way to learn
+    /// that the thing it is enforcing no longer exists. The default does
+    /// nothing, so a compositor that enforces nothing outside smithay is
+    /// unchanged.
+    fn constraint_removed(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 }
 
 /// Constraint confining pointer to a region of the surface
@@ -456,6 +468,7 @@ impl<D> Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>, D> for Poin
 where
     D: Dispatch<ZwpConfinedPointerV1, PointerConstraintUserData<D>>,
     D: SeatHandler,
+    D: PointerConstraintsHandler,
     D: 'static,
 {
     fn request(
@@ -487,7 +500,7 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpConfinedPointerV1,
         data: &PointerConstraintUserData<D>,
@@ -497,6 +510,7 @@ where
         };
 
         remove_constraint(&data.surface, pointer);
+        state.constraint_removed(&data.surface, pointer);
     }
 }
 
@@ -504,6 +518,7 @@ impl<D> Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>, D> for Pointe
 where
     D: Dispatch<ZwpLockedPointerV1, PointerConstraintUserData<D>>,
     D: SeatHandler,
+    D: PointerConstraintsHandler,
     D: 'static,
 {
     fn request(
@@ -540,7 +555,7 @@ where
     }
 
     fn destroyed(
-        _state: &mut D,
+        state: &mut D,
         _client: wayland_server::backend::ClientId,
         _resource: &ZwpLockedPointerV1,
         data: &PointerConstraintUserData<D>,
@@ -550,6 +565,7 @@ where
         };
 
         remove_constraint(&data.surface, pointer);
+        state.constraint_removed(&data.surface, pointer);
     }
 }
 

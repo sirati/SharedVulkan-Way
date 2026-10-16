@@ -173,6 +173,9 @@ const DEFAULT_EXTENSIONS: &[(&str, u32)] = &[
     ("zwp_idle_inhibit_manager_v1", 1),
     ("xdg_activation_v1", 1),
     ("zwp_keyboard_shortcuts_inhibit_manager_v1", 1),
+    // §96.
+    ("zwp_pointer_constraints_v1", 1),
+    ("zwp_relative_pointer_manager_v1", 1),
 ];
 
 /// Parse the `name version` file `WC_WLCS_EXTENSIONS` points at.
@@ -436,8 +439,11 @@ unsafe extern "C" fn pointer_move_relative(raw: *mut WlcsPointer, dx: i32, dy: i
     let p = unsafe { pointer(raw) };
     p.x += from_fixed(dx);
     p.y += from_fixed(dy);
-    let (px, py) = (p.x, p.y);
-    unsafe { &mut *p.server }.request_ok(&format!("pointer-move {px} {py}"));
+    // §96: sent as a distance, not as `p.x + dx`. The two agree until a
+    // window holds the pointer: then the server's pointer is clipped or locked
+    // and only it knows where a relative move starts from.
+    let (dx, dy) = (from_fixed(dx), from_fixed(dy));
+    unsafe { &mut *p.server }.request_ok(&format!("pointer-move-by {dx} {dy}"));
 }
 
 unsafe extern "C" fn pointer_button_down(raw: *mut WlcsPointer, button: c_int) {
@@ -875,8 +881,6 @@ mod tests {
     fn the_table_claims_nothing_from_the_excluded_list() {
         for absent in [
             "zwlr_layer_shell_v1",
-            "zwp_pointer_constraints_v1",
-            "zwp_relative_pointer_manager_v1",
             "zwp_linux_dmabuf_v1",
             "wp_presentation",
             "wp_viewporter",

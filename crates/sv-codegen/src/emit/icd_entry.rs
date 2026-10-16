@@ -3254,7 +3254,12 @@ fn emit_pnext_walkers(lower_cx: &Ctx<'_>, store_cx: &Ctx<'_>) -> TokenStream {
                     unsafe {
                         match (__s_type, __link) {
                             #(#store_arms)*
-                            _ => {}
+                            // §96: the links the generator could not write back
+                            // itself (a pointer-valued member of unknown
+                            // capacity) get a hand-written writeback, or are left
+                            // as the application left them. See
+                            // `sv-icd-entry/src/writeback.rs`.
+                            _ => crate::writeback::store_refused_link(__link, __p),
                         }
                     }
                 }
