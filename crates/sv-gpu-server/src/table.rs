@@ -39,8 +39,23 @@ use ash::vk;
 // in scope for the one-map design to work at all: the map stores the 64-bit
 // handle and hands back a typed one.
 use ash::vk::Handle as _;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use sv_proto::HandleType;
+
+/// One lease of the pool, as this session's device holds it
+/// (waycompose-design.md §97).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseMem {
+    pub len: u64,
+    /// The driver memory the lease's bytes are in.
+    pub memory: vk::DeviceMemory,
+    /// Where the lease's first byte is in `memory`: 0 for a lease imported on
+    /// its own, the lease's offset in its region when `memory` is the whole
+    /// region.
+    pub base: u64,
+    /// Whether `memory` is this lease's own import, freed with it.
+    pub owned: bool,
+}
 
 /// One live object.
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +144,12 @@ pub struct Objects {
     /// One entry per slab; `None` until `svImportArenaSlab` names it (§5.2).
     slabs: Vec<Option<vk::DeviceMemory>>,
     slab_size: u64,
+    /// The leases this session holds, by pool offset (§97). When the session
+    /// is pooled these replace the slabs: an arena offset is a pool offset, and
+    /// it resolves to the lease it falls in.
+    leases: BTreeMap<u64, LeaseMem>,
+    /// The pool and this session's account in it, on a pooled session.
+    pub pool: Option<crate::pool::PoolBinding>,
     /// Driver views of video images kept until their image goes
     /// (`crate::video_views`, docs/video-decode.md §7.11).
     pub video_views: crate::video_views::VideoViews,
@@ -148,6 +169,8 @@ impl Objects {
             arena: None,
             slabs: Vec::new(),
             slab_size: 1,
+            leases: BTreeMap::new(),
+            pool: None,
             video_views: Default::default(),
         }
     }
@@ -168,6 +191,16 @@ impl Objects {
         self.memory.insert(crate::ARENA_MEMORY_ID, r);
     }
 
+    /// Make this a pooled session (waycompose-design.md §97): the arena is the
+    /// pool, its offsets are pool offsets, and each resolves inside one of
+    /// this session's leases or not at all.
+    pub fn set_pooled(&mut self, binding: crate::pool::PoolBinding) {
+        let r = MemoryRange { memory: vk::DeviceMemory::null(), base: 0, len: u64::MAX >> 1 };
+        self.arena = Some(r);
+        self.memory.insert(crate::ARENA_MEMORY_ID, r);
+        self.pool = Some(binding);
+    }
+
     /// Publish an arena whose slabs will arrive one `svImportArenaSlab` at a
     /// time (docs/design.md §5.2).
     ///
@@ -182,6 +215,35 @@ impl Objects {
             crate::ARENA_MEMORY_ID,
             MemoryRange { memory: vk::DeviceMemory::null(), base: 0, len },
         );
+    }
+
+    /// The lease `offset` falls in, and its start.
+    pub fn lease_at(&self, offset: u64) -> Option<(u64, LeaseMem)> {
+        let (&start, l) = self.leases.range(..=offset).next_back()?;
+        (offset - start < l.len).then_some((start, *l))
+    }
+
+    /// Does `[offset, offset+len)` lie inside one of this session's leases?
+    /// What a command blob's range must do before the GPU side reads it.
+    pub fn leased_range(&self, offset: u64, len: u64) -> bool {
+        self.lease_at(offset).is_some_and(|(start, l)| offset.checked_add(len).is_some_and(|e| e <= start + l.len))
+    }
+
+    pub fn add_lease(&mut self, offset: u64, lease: LeaseMem) {
+        self.leases.insert(offset, lease);
+    }
+
+    pub fn remove_lease(&mut self, offset: u64) -> Option<LeaseMem> {
+        self.leases.remove(&offset)
+    }
+
+    /// Every lease, for the session's end.
+    pub fn take_leases(&mut self) -> Vec<(u64, LeaseMem)> {
+        std::mem::take(&mut self.leases).into_iter().collect()
+    }
+
+    pub fn lease_count(&self) -> usize {
+        self.leases.len()
     }
 
     /// Has any slab been imported yet? The first one is where the arena's
@@ -203,6 +265,9 @@ impl Objects {
     /// rather than a resource shortage: the app side must not use a slab it has
     /// not asked for.
     pub fn arena_slab(&self, offset: u64) -> Option<(vk::DeviceMemory, u64)> {
+        if self.pool.is_some() {
+            return self.lease_at(offset).map(|(start, l)| (l.memory, l.base + (offset - start)));
+        }
         let slab = (offset / self.slab_size) as usize;
         let m = (*self.slabs.get(slab)?)?;
         Some((m, offset % self.slab_size))
@@ -217,6 +282,13 @@ impl Objects {
     /// [`Objects::arena_slab`], for `sv_gpu_server::video_log`, which has a
     /// driver handle and wants the bytes behind it.
     pub fn arena_offset_of(&self, memory: u64, offset: u64) -> Option<u64> {
+        if self.pool.is_some() {
+            return self
+                .leases
+                .iter()
+                .find(|(_, l)| l.memory.as_raw() == memory && offset >= l.base && offset < l.base + l.len)
+                .map(|(&start, l)| start + (offset - l.base));
+        }
         if memory == 0 || offset >= self.slab_size {
             return None;
         }
