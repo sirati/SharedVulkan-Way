@@ -28230,3 +28230,125 @@ the topology assertion, both passing again.
 | `scripts/wc-xref.sh --list` | 1206 citations resolve, 0 missing |
 | `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
 | privacy | the full-screen captures are cropped above the taskbar, cut down to the taskbar button or the Alt-Tab panel, or masked grey outside Firefox (`H-two-redacted.png`); a separate check of every committed image: 33 of 34 images clean on the first pass; the Alt-Tab crops then lost 10 rows of cut-off desktop text under the panel |
+
+## 92. Pinning Linux applications to the taskbar, and their jump lists
+
+Branch `taskbar-pins`, 2026-10-16. The brief: a Linux application can be
+pinned to the Windows taskbar, from its running button or from a Start menu
+entry; the pinned button and the running windows are one button; right-clicking
+it shows the application's own actions, and for Firefox the same jump list
+Windows' Firefox shows (Frequent pages, then Open new tab, Open new window and
+Open new private window); all of it survives the session ending and a reboot.
+The evidence is in `docs/taskbar-pins/`.
+
+### 92.1 One identity for the pin, the shortcuts and every window
+
+Windows puts a window on a pinned button when the window's
+`PKEY_AppUserModel_ID` equals the pinned shortcut's `System.AppUserModel.ID`.
+Stage 32 already gave every window an identity derived from its Wayland app id,
+`Waycompose.app.firefox` for Firefox, and that string is the same in every
+session, so it is the right key for a pin. (`Waycompose.unnamed.c1` is what a
+window carries between its creation and the client's `set_app_id`; Firefox's
+windows move to their real identity before they are first shown.)
+
+What was missing was the other half: nothing on the Windows side carried the
+same string. The desktop shortcut was written by PowerShell's `WScript.Shell`,
+which cannot set `System.AppUserModel.ID`, so a pin of it (the user had made
+one, `Firefox (Linux, ivshmem)`) was a button of its own, grouped by
+`wc-launch.exe`'s path, beside the windows' button.
+
+So `wc-launch` now writes its shortcuts through `IShellLinkW` and sets the
+identity on them (`src/shell.rs`, hand-written COM like the compositor's), and
+it derives that identity with the compositor's own function: `taskbar.rs` is
+compiled into `wc-launch` with `#[path]`. The app id it feeds in is the one
+the windows will carry: `app-id` in the `[app.*]` section if set, else the
+desktop entry's `StartupWMClass` (which exists to say exactly that), else the
+desktop id. For Firefox all three are `firefox`.
+
+### 92.2 Pinning from a window: the relaunch properties
+
+`win32.rs` used to set `PKEY_AppUserModel_PreventPinning` on every window, on
+the reasoning that a pin made from a window runs whatever the shell can work
+out about it, which is `sv-guest.exe`. That reasoning stands; what changed is
+that the launcher can now say what a pin should run. For each application it
+writes `<exe dir>\apps\<identity>.relaunch`:
+
+```
+command="C:\Users\<guest-user>\wcivs\wc-launch.exe" firefox
+name=Firefox (Linux)
+icon=C:\Users\<guest-user>\wcivs\firefox.ico,0
+```
+
+and passes the directory as `--relaunch-dir`. When the compositor stamps an
+identity on a window it reads that file. If the file is there, the window gets
+`PKEY_AppUserModel_RelaunchCommand`, `…RelaunchDisplayNameResource` and
+`…RelaunchIconResource`, and `PreventPinning` is cleared. If not, the three
+are removed and `PreventPinning` is set, as before. A window of a client the
+launcher did not start (a harness's `weston-terminal`) still cannot be pinned.
+The first launch of an application writes its file before starting it, so its
+first window is pinnable. Every later launch refreshes the file after the
+window is up.
+
+### 92.3 The Start menu entry
+
+Every launch (and `--install`, and `wc-launch.exe --refresh <app>`) writes
+`Programs\<title>.lnk` with the identity, the icon and `wc-launch.exe <app>`.
+"Pin to taskbar" on it pins a shortcut with the same identity, which is the
+same button as the windows'.
+
+### 92.4 Where the facts come from: the host's desktop entry
+
+The application's name, icon and actions are in its desktop entry, on the VM
+host. On NixOS that is the package's own store path, or for the readback Firefox
+(which has no `share/`, §90.4) the stock package of the same name.
+`wc-proxy desktop` (`crates/wc-proxy/src/desktop.rs`) reads it by the
+specification: localised names, `Actions=` in order, `Exec=` quoting, and the
+field codes. `wc-session app APPID B64EXE THEME` returns it with the icon and,
+for Firefox, three task glyphs. The glyphs are the Linux package's own SVGs
+(`new-tab.svg`, `window.svg`, `privateBrowsing.svg`), drawn in `context-fill`.
+The host fills them in the colour of the jump list's text (the guest sends the
+taskbar's theme) and rasterises them with `rsvg-convert`.
+
+The guest keeps the answer (`apps\<app>.meta`) and refreshes it on every
+launch, so a pin made today and an updated Firefox tomorrow agree.
+
+### 92.5 The jump list
+
+`ICustomDestinationList` under the same identity. For Firefox the list follows
+Windows' Firefox:
+
+* **Häufig / Frequent**: the launcher profile's most visited pages, read by
+  `wc-session frequent` from copies of `places.sqlite` and `favicons.sqlite`,
+  sorted by visit count as Windows' Firefox sorts its own (`SORT_BY_VISITCOUNT_
+  DESCENDING` in `WindowsJumpLists.sys.mjs`), with their favicons (an SVG
+  favicon is rasterised). Firefox's own prefs are respected: `browser.taskbar.
+  lists.enabled`, `…frequent.enabled`, `…recent.enabled` (a Recent category),
+  `…tasks.enabled`, `…maxListItemCount` (7) and `…refreshInSeconds` (120). A
+  page the user removes from the list is remembered and not put back.
+* **Aufgaben / Tasks**: Open new tab, Open new window, Open new private window,
+  named as Windows' Firefox names them in the UI's language (German here) and
+  wearing Firefox's own glyphs. Windows' Firefox's strings are not in the Linux
+  package (they are built for Windows only), so the launcher carries English
+  and German. The desktop entry's Profile Manager is not offered: the launcher
+  pins the profile with `--profile`, so a profile manager could only start a
+  second Firefox beside the session.
+* Windows adds its own footer: the application, and Pin/Unpin.
+
+Any other application gets its desktop entry's actions, by `Name[<lang>]`.
+
+Each entry runs `wc-launch.exe <app> --action <id>` or `--url <URL>`. A warm
+click is one ssh exec (`wc-session action|open`); a cold one starts the
+session first and then runs the action, with the profile, preferences and title
+bar the shortcut would have given it. While a session runs, its owner rebuilds
+the list every `refreshInSeconds`, so the Frequent pages follow the history.
+
+### 92.6 The security argument
+
+docs/security-model.md R32, in short: the guest names a desktop id and an
+action id, or a URL, and never a command. The host builds the argv from its
+own desktop entry, checks the program against the entry's and the launcher's,
+and runs it as an array. URLs are `http`, `https` or `file:///` only, one
+word, and go into the slot the entry's `%u` marks. **What it does not close is
+`run`**, which has carried a whole command line from the guest since §28. A
+holder of the guest's key could already run any program as `sirati`. R32
+records it, and what closing it would take.
