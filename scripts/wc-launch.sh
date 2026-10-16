@@ -155,6 +155,11 @@ esac
 PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-<guest-user>}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
+# §95. Each session slot of the GPU device is 16 MiB of control and this much
+# arena (`gpu-arena-mib`, the launcher's default 64). §95 measured Firefox
+# with two windows at about 53 MiB; testhost keeps 3 x 64 until the arena is
+# allocated dynamically.
+GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
 REL_WIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/release"
@@ -495,6 +500,7 @@ audio      = ${WC_LAUNCH_AUDIO:-on}
 audio-port = $((PORT + 1))
 audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
+gpu-arena-mib = $GPU_ARENA_MIB
 # §97: one pool over the whole GPU device, leased as each session needs it;
 # `slots` is §87's fixed slots of gpu-arena-mib.
 gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
