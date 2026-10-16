@@ -1791,10 +1791,10 @@ impl State {
                 self.set_state(id, |s| toggle(s, xdg_state::Activated, true));
             }
         } else if window == id {
-            if let Some(held) = self.deactivation.take() {
-                if held != id {
-                    self.deactivate(held);
-                }
+            if let Some(held) = self.deactivation.take()
+                && held != id
+            {
+                self.deactivate(held);
             }
             self.deactivation.hold(id, Instant::now());
         }

@@ -742,7 +742,9 @@ pub fn png_from_dib(dib: &[u8]) -> Option<Vec<u8>> {
 /// Whether [`from_system`] can answer `mime` out of `format` at all, so a
 /// paste reads only the formats that can answer it. Reading one is
 /// `GetClipboardData`, and for a program that renders late (Word) that makes
-/// the program produce it.
+/// the program produce it. Read only by the Win32 paste path, so off Windows
+/// nothing uses it, as with [`SystemFormat::ALL`].
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn can_answer(mime: &str, format: SystemFormat) -> bool {
     matches!(
         (format_for(mime), format),
