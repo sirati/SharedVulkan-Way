@@ -838,11 +838,29 @@ impl GpuHost for GpuServer {
             ded.image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
             ded.buffer = vk::Buffer::from_raw(self.map_handle(HandleType::VkBuffer, buffer)?);
         }
+        // **And the allocate flags** (waycompose-design.md §96). Since buffers
+        // may live in type 0, a buffer created for `SHADER_DEVICE_ADDRESS` can
+        // be bound here, and its memory must have been allocated with
+        // `DEVICE_ADDRESS` (`VUID-vkBindBufferMemory-bufferDeviceAddress-03339`,
+        // reported for Zink's buffers the first time they left the arena).
+        // The flags are the application's; the device mask is meaningful only
+        // with `DEVICE_MASK`, which a single-device GPU side keeps as given.
+        let flags = info.p_next.iter().find_map(|l| match l {
+            p::PNextLink::VkMemoryAllocateFlagsInfo(f) => Some((f.flags.0, f.device_mask)),
+            _ => None,
+        });
+        let mut fl = vk::MemoryAllocateFlagsInfo::default();
+        if let Some((bits, mask)) = flags {
+            fl = fl.flags(vk::MemoryAllocateFlags::from_raw(bits)).device_mask(mask);
+        }
         let mut ai = vk::MemoryAllocateInfo::default()
             .allocation_size(info.allocation_size)
             .memory_type_index(ti);
         if dedicated.is_some() {
             ai = ai.push_next(&mut ded);
+        }
+        if flags.is_some() {
+            ai = ai.push_next(&mut fl);
         }
         match unsafe { self.d().allocate_memory(&ai, None) } {
             Ok(m) => {

@@ -979,9 +979,7 @@ impl Icd for SharedVulkan {
         if let Some(t) = self.wire() {
             let mut reply = forward::get_buffer_memory_requirements(t, args)?;
             if let Some(r) = reply.p_memory_requirements.as_mut() {
-                r.alignment = r.alignment.max(crate::arena::GRANULARITY);
-                r.size = crate::arena::round_up(r.size.max(1));
-                r.memory_type_bits = advertise::ARENA_MEMORY_TYPE_BITS;
+                buffer_requirements(r);
             }
             return Ok(reply);
         }
@@ -995,6 +993,40 @@ impl Icd for SharedVulkan {
         r.alignment = crate::arena::GRANULARITY;
         r.memory_type_bits = advertise::ARENA_MEMORY_TYPE_BITS;
         Ok(p::VkGetBufferMemoryRequirementsReply { p_memory_requirements: Some(Box::new(r)) })
+    }
+
+    /// The `2` form, patched the same way. §96: it was forwarded verbatim, so
+    /// an application that asked this way read the *driver's* `memoryTypeBits`
+    /// against our four-entry table — the exact mistake the plain form's
+    /// comment above exists to prevent, one entry point over.
+    fn get_buffer_memory_requirements2(
+        &self,
+        args: p::VkGetBufferMemoryRequirements2Args,
+    ) -> IcdResult<p::VkGetBufferMemoryRequirements2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetBufferMemoryRequirements2"));
+        };
+        let mut reply = forward::get_buffer_memory_requirements2(t, args)?;
+        if let Some(r) = reply.p_memory_requirements.as_mut() {
+            buffer_requirements(&mut r.memory_requirements);
+        }
+        Ok(reply)
+    }
+
+    /// As the `2` form, for a buffer that does not exist yet
+    /// (`VK_KHR_maintenance4`, core in 1.3).
+    fn get_device_buffer_memory_requirements(
+        &self,
+        args: p::VkGetDeviceBufferMemoryRequirementsArgs,
+    ) -> IcdResult<p::VkGetDeviceBufferMemoryRequirementsReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetDeviceBufferMemoryRequirements"));
+        };
+        let mut reply = forward::get_device_buffer_memory_requirements(t, args)?;
+        if let Some(r) = reply.p_memory_requirements.as_mut() {
+            buffer_requirements(&mut r.memory_requirements);
+        }
+        Ok(reply)
     }
 
     fn create_buffer(&self, args: p::VkCreateBufferArgs) -> IcdResult<p::VkCreateBufferReply> {
@@ -2033,6 +2065,15 @@ impl SharedVulkan {
     }
 }
 
+/// A buffer's requirements with a GPU side: the driver's size and alignment,
+/// rounded to the arena's granularity (an arena type may be chosen), and
+/// docs/design.md §9.1's mask — [`advertise::BUFFER_MEMORY_TYPE_BITS`].
+fn buffer_requirements(r: &mut p::VkMemoryRequirements) {
+    r.alignment = r.alignment.max(crate::arena::GRANULARITY);
+    r.size = crate::arena::round_up(r.size.max(1));
+    r.memory_type_bits = advertise::BUFFER_MEMORY_TYPE_BITS;
+}
+
 fn memory_properties(icd: &SharedVulkan) -> p::VkPhysicalDeviceMemoryProperties {
     let c = advertise::memory_properties(icd.arena_len);
     let mut w = p::VkPhysicalDeviceMemoryProperties::default();
@@ -2088,6 +2129,21 @@ mod tests {
         info.image_view = p::VkImageView(12);
         w.p_image_info = vec![info];
         w
+    }
+
+    /// §96: a buffer may be put in any of the four types, type 0 included —
+    /// a GPU-side allocation for a buffer the application never maps — and its
+    /// size and alignment still fit the arena's granularity, because an arena
+    /// type may be the one chosen.
+    #[test]
+    fn a_buffer_may_live_outside_the_arena() {
+        let mut r = p::VkMemoryRequirements { size: 100, alignment: 16, memory_type_bits: 0x7ff };
+        buffer_requirements(&mut r);
+        assert_eq!(r.memory_type_bits, 0b1111);
+        assert!(r.memory_type_bits & (1 << advertise::memory_type::DEVICE_LOCAL) != 0);
+        assert_eq!(r.alignment, crate::arena::GRANULARITY);
+        assert_eq!(r.size, crate::arena::GRANULARITY);
+        assert!(!advertise::is_arena_backed(advertise::memory_type::DEVICE_LOCAL));
     }
 
     fn samplers(writes: &[p::VkWriteDescriptorSet]) -> Vec<u64> {
