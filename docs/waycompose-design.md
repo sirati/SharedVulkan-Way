@@ -30234,3 +30234,36 @@ On the branch at the commit that adds this section (master `2982bdd` with
 | Miri, the allocator, the pool and the heap | 18 passed, no undefined behaviour |
 | `sv-testkit`'s citation check (`wc-xref.sh`) | 0 missing, 0 without a directory |
 | `scripts/sv-pool-e2e.sh 256` | PASS (97.6) |
+
+### 97.9 On the guest, today's 256 MiB device
+
+2026-10-16, 16:55–16:59, with the guest lease, in session 0 only (someone may
+have been at the desktop). `wcgpu` updated in place, every replaced file kept
+as `*.pre-pool`: `sv-guest.exe` and `wc-launch.exe` on the guest, with
+`gpu-arena = pool` in its ini; `libsv_icd.so`, `sv-hostd` and `wc-proxy` on the
+host. `sv-guest.exe gpu guest --pool --port 57491 --ivshmem-slot 0x1d
+--sessions 3 --bell org.sirati.svbell.0` started from ssh (session 0); the cold
+path through two ssh forwards; `sv-hostd ivshmem-serve` with the doorbell on
+the host; clients on the host. No Firefox: the host had 1.1 GB available, and
+an out-of-memory host kills QEMU first (97.3).
+
+| check | result |
+|---|---|
+| the device | mapped in 13 ms, 256 MiB, region 0; nonce published; doorbell attached |
+| `vulkaninfo --summary` through the pool | "Intel(R) UHD Graphics", exit 0 |
+| two processes fill the pool at once (8 MiB blocks held 8 s; 2 MiB blocks) | 23 × 8 MiB and 11 × 2 MiB, each then `-2`; nothing either mapped was touched; half freed, half came back at once |
+| a fill after both | 23 × 8 MiB again |
+| every session's leases and control region given back | yes; the pool at its header, `pool 0.1/256.0 MiB`, after the last |
+| VM faults in the journal, lost devices | none |
+
+The numbers are this workstation's to the block (97.6): the cap is 192 MiB
+and the start-up reserve on the guest is one session's start, 16.1 MiB. Two
+log lines were wrong and are fixed: the pool's refusal said "no region has
+2048 KiB free in one block (largest 17984 KiB)" when what refused it was the
+reserve, and `sv-hostd` counted the whole device as "pages checked" for a
+pooled session, where it checks the control region's 2064. The deployed
+binaries still print the old wording.
+
+Not yet run on the guest: Firefox with two windows and a video, and
+Minecraft. Both need the desktop session, and VulkanMod needs the 1024 MiB
+device (97.6).

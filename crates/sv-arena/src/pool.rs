@@ -168,9 +168,11 @@ pub enum PoolError {
     /// The session holds `held` and asked for `asked` more; it may hold `cap`.
     /// Growth would not help: this is the session's limit, not the pool's.
     OverQuota { session: u64, held: u64, asked: u64, cap: u64 },
-    /// No region has a free block this large. `largest_free` is the largest
-    /// one any region has, `free` the total. Growth would help.
-    NoSpace { asked: u64, largest_free: u64, free: u64 },
+    /// No region has a free block this large that it may give. `largest_free`
+    /// is the largest one any region has, `free` the total, and `reserved`
+    /// the room kept for a session that has not started, which this lease
+    /// could not use. Growth would help.
+    NoSpace { asked: u64, largest_free: u64, free: u64, reserved: u64 },
     /// A zero-length request, or one that no region could ever hold.
     BadSize(u64),
     /// No lease starts at this offset.
@@ -190,7 +192,16 @@ impl std::fmt::Display for PoolError {
                 asked >> 10,
                 cap >> 10
             ),
-            PoolError::NoSpace { asked, largest_free, free } => write!(
+            PoolError::NoSpace { asked, largest_free, free, reserved } if *largest_free >= *asked => write!(
+                f,
+                "{} KiB is free ({} KiB in one block), but {} KiB of it is kept for a session that has not \
+                 started, and the rest is less than the {} KiB asked for",
+                free >> 10,
+                largest_free >> 10,
+                reserved >> 10,
+                asked >> 10
+            ),
+            PoolError::NoSpace { asked, largest_free, free, .. } => write!(
                 f,
                 "no region has {} KiB free in one block (largest {} KiB, {} KiB free in all)",
                 asked >> 10,
@@ -398,7 +409,12 @@ impl Pool {
             if let Some(a) = self.sessions.get_mut(&session) {
                 a.refused += 1;
             }
-            return Err(PoolError::NoSpace { asked: len, largest_free: self.largest_free(), free: self.free() });
+            return Err(PoolError::NoSpace {
+                asked: len,
+                largest_free: self.largest_free(),
+                free: self.free(),
+                reserved: reserve,
+            });
         };
         let lease = Lease { offset, len, session, purpose };
         self.leases.insert(offset, lease);
@@ -622,6 +638,11 @@ mod tests {
         let mut p = Pool::new(PoolConfig { session_cap: u64::MAX, ..PoolConfig::for_capacity(256 * M) }, 256 * M).unwrap();
         while p.lease(1, 2 * M, Purpose::Chunk).is_ok() {}
         assert!(p.free() >= p.config().reserve);
+        // What refuses the next ordinary lease is the reserve, and the refusal
+        // says so (measured on the guest: the first wording said no block was
+        // large enough beside a free 17.6 MiB one).
+        let e = p.lease(3, 2 * M, Purpose::Chunk).unwrap_err();
+        assert!(e.to_string().contains("kept for a session that has not started"), "{e}");
         p.lease(2, 16 * M, Purpose::Control).unwrap();
         p.lease(2, 8 * M, Purpose::Blobs).unwrap();
         // The reserve is spent on that start; nothing ordinary gets it.
