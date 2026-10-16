@@ -27929,7 +27929,7 @@ unchanged. No descriptor can cross: the ring takes `&[u8]` and the doorbell a
 
 | gate | result |
 |---|---|
-| `cargo test --workspace --no-fail-fast` | **101 binaries, 2847 passed, 0 failed**, 8 ignored (master: 2832; new: the monotonic clock, five ring tests in `wlbytes`, three header tests, the ivshmem attach with rings, the waker, four proxy ring tests, two launcher tests) |
+| `cargo test --workspace --no-fail-fast` | **101 binaries, 2847 passed, 0 failed**, 8 ignored (master: 2832; 15 new: the monotonic clock, five ring tests in `wlbytes`, three header tests, the waker, three proxy ring tests, two launcher tests; the ivshmem attach test now attaches with rings) |
 | `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 | `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
