@@ -171,6 +171,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // toplevel's size: the client's own, its min and max, and a user's drag.
     WM_SETTEXT, WM_NCACTIVATE, WS_VISIBLE, WM_GETMINMAXINFO, MINMAXINFO, WM_ENTERSIZEMOVE,
     WM_EXITSIZEMOVE, IsZoomed, SW_SHOWMAXIMIZED,
+    // §95: the fourth, and the one every frame repaint goes through.
+    WM_NCPAINT,
 };
 // ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
 // rather than anywhere near the window APIs, because it is not about a window:
@@ -1501,6 +1503,21 @@ unsafe extern "system" fn toplevel_proc(
                 // does exactly this, for exactly this frame).
                 // SAFETY: a live window handle on its own thread.
                 let r = unsafe { DefWindowProcW(hwnd, msg, wparam, -1) };
+                state.invalidate_button_strip();
+                return r;
+            }
+            // §95. The buttons still went, with neither a title nor an
+            // activation change: after a page load, the strip held one flat
+            // colour, Firefox's own tab-strip pixel and not DWM's caption
+            // colour, so something outside `WM_PAINT` had painted the caption
+            // background over it. `WM_NCPAINT` is the general form of what
+            // §91 handled for three messages: the default handler draws the
+            // caption it believes in, and it does not stay out of the band
+            // that `WM_NCCALCSIZE` gave to the client. The frame still needs
+            // the default handler, so the strip is re-cleared after it.
+            WM_NCPAINT => {
+                // SAFETY: a live window handle on its own thread.
+                let r = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
                 state.invalidate_button_strip();
                 return r;
             }
@@ -4642,6 +4659,14 @@ fn present(w: &Rc<WindowState>, damage: &[Rect]) {
         unsafe {
             InvalidateRect(w.hwnd(), &rc, 0);
         }
+    }
+    // §95: and the caption-button strip with every frame, so whatever painted
+    // over it outside `WM_PAINT` (see `WM_NCPAINT` in `toplevel_proc`) lasts
+    // until the client's next frame at most. 146x31 pixels at 100%: one small
+    // `SetDIBitsToDevice` and one `FillRect` per frame, inside a paint that is
+    // happening anyway.
+    if !damage.is_empty() {
+        w.invalidate_button_strip();
     }
 }
 
