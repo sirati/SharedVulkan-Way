@@ -28230,3 +28230,199 @@ the topology assertion, both passing again.
 | `scripts/wc-xref.sh --list` | 1206 citations resolve, 0 missing |
 | `wc-launch.sh deploy` (`wcivs`) | 12 passed, 0 failed |
 | privacy | the full-screen captures are cropped above the taskbar, cut down to the taskbar button or the Alt-Tab panel, or masked grey outside Firefox (`H-two-redacted.png`); a separate check of every committed image: 33 of 34 images clean on the first pass; the Alt-Tab crops then lost 10 rows of cut-off desktop text under the panel |
+
+## 91. A double-click gets the doorbells, the fallback takes seconds, and two window bugs
+
+Branch `medium-il`, 2026-10-16. The three bugs §90 left open that are not the
+video decode: a real double-click ran without the ring and GPU doorbells
+(§90.3), Windows' caption buttons vanished from maximised windows (§90.6), and a
+second window opened at 252x304 in the screen's corner (§90.7).
+
+### 91.1 Status in one paragraph
+
+All three are fixed.
+- **Bug 1.** The two virtio-serial ports carried vioser's admin-only descriptor.
+  They now admit the interactive user at medium integrity (91.2,
+  security-model.md R32). The first real double-click after the change,
+  <guest-user>'s own at 05:48, had rings, both doorbells and a window in 3173 ms.
+- **The slow fallback.** The guest's waits cost a 15.6 ms timer tick per rung
+  when no doorbell was attached, and the port open retried access denied for
+  10 s. Both are fixed (91.3).
+- **The harness** now clicks with a double-click's token by default and checks
+  the route from the launcher's own `token:` line (91.4).
+- **Bug 2.** `DefWindowProc` painted the caption over the button strip on every
+  title change (91.5).
+- **Bug 3.** The map echoed the client's first size back as a configure, which
+  Firefox obeyed, and read the window's position before Windows had chosen it
+  (91.6).
+
+### 91.2 Bug 1: the ports' descriptor
+
+**Measured.** `QueryDosDevice("Global\org.sirati.wcbell.0")` is `\Device\00000042`,
+the PDO of `{6FDE7547-…}\VIOSERIALPORT\4&34687BC8&0&05`, and `svbell.0` is
+`…&0&04` (`\Device\00000041`). Both device objects had
+`D:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(ML;;NW;;;LW)` and no PnP `Security` property.
+That is vioser's `WdfDeviceInitAssignSDDLString(…, SDDL_DEVOBJ_SYS_ALL_ADM_ALL)`
+for its raw port PDOs (vioserial `Port.c`). The `Global\` alias is not a
+different object with a different descriptor, as `winpipe.rs` had guessed; it is
+a link to the PDO. The ivshmem devices, by contrast, admit Everyone (R32 quotes
+their descriptor), which is why §90.3 saw them open at medium.
+
+**The options.**
+
+| option | verdict |
+|---|---|
+| descriptor on the two port PDOs | **chosen**: no resident component, one account, medium and up, survives reboots through the PnP property |
+| doorbell on the ivshmem device (`ivshmem-doorbell`; the Looking Glass driver has `IOCTL_IVSHMEM_RING_DOORBELL` and event registration) | needs the VM reconfigured and restarted and an `ivshmem-server` on the host |
+| a guest service owning the ports, relaying over an ACL'd pipe | a new resident component, a hop per wake, and the same grant as a pipe ACL |
+| an elevated launcher | a UAC prompt per click, and an administrator token for the session |
+
+**The fix**, `scripts/wc-port-access.ps1` (`show`, `apply`, `revert`, `install`,
+`uninstall`). It sets
+`D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;<SID>)S:(ML;;NWNR;;;ME)` both as the
+device's PnP property (`SPDRP_SECURITY_SDS`, applied by PnP at every device
+start) and on the live device object (`SetSecurityInfo` on a handle). `install`
+also copies itself to `C:\Program Files\waycompose` and registers the SYSTEM
+task `waycompose port access`, which runs `apply` at every startup and finds the
+ports by name. `wc-launch.sh deploy` runs `install -User <guest-user>`
+(`WC_LAUNCH_PORT_ACCESS=skip` leaves the guest alone). R32 is the security
+argument.
+
+**Applied on testhost's guest at 05:34** (`docs/medium-il/port-access.txt`):
+both live descriptors and both PnP properties read back as the new one, with
+<guest-user>'s SID `S-1-5-21-2794265523-3702185664-1359551570-1001`. Then, from
+`docs/medium-il/probe.txt`:
+
+| token | `CreateFileW(GENERIC_READ\|GENERIC_WRITE)` on each port |
+|---|---|
+| session 1, scheduler `Limited` run level: `S-1-16-8192`, not elevated | opened |
+| a Low-integrity copy of that token | error 5 |
+| ssh, the administrator's token | opened |
+| a Low-integrity copy of the administrator's token | error 5 |
+
+**What was not tested:** a reboot, and a vioser update. The PnP property is the
+documented mechanism for both (the PnP manager applies a device's `Security`
+property to its device objects when it starts the device), and the startup task
+applies the descriptor whatever PnP does. Restarting a port's device to prove it
+was not done: vioser creates a port's symbolic link from a work item when the
+host names the port, and a restarted PDO might come back without it until the
+next boot.
+
+**A worry, tested and retired.** vioser's create handler answers a second open
+of a held port with `STATUS_OBJECT_NAME_EXISTS`, which is a success code, and its
+close handler then clears `GuestConnected` and tells QEMU the guest closed the
+port. If a second open reached it, opening a held port even for `READ_CONTROL`
+would cut the holder's host-to-guest wakes. It cannot reach it: vioser also sets
+`WdfDeviceInitSetExclusive`, and the I/O manager refuses the second open. A
+process that held `wcbell.0` and asked vioser (`IOCTL_GET_INFORMATION`) before
+and after another process's `READ_CONTROL` open read `guest_connected=1` both
+times, and the second open failed with error 5. So `wc-port-access.ps1` can run
+beside a session. A held port keeps its live descriptor until it is free, and
+the tool says so.
+
+### 91.3 The fallback that took minutes
+
+§90.3's medium-integrity session had its window 4.5 minutes after the click. Two
+causes, both fixed.
+
+**A timer tick per rung.** `Futex::first_slice` says the guest's first rung is
+1 ms. Measured on the guest with a 40-sample loop: `WaitOnAddress` with a 1 ms
+timeout returns after p10 15.51, p50 15.98, p90 16.22 ms; 2 ms and 8 ms timeouts
+return after the same. The timeout is rounded up to the 15.625 ms tick in a
+process that has not raised the timer resolution, and none of ours does
+(`tick.rs`). With a doorbell this is invisible, because a delivered wake ends the
+wait. Without one, every rung of every guest wait was a tick, a forwarded call
+cost two ladders of 16-31 ms, and Firefox's GPU process came up so slowly that
+its EGL setup failed and WebRender fell back to software. The fix is
+`park::sleep_the_rung`. On Windows, in a process with no cross-VM doorbell, a
+rung shorter than a tick is a `std::thread::sleep`, which is a high-resolution
+waitable timer since Windows 10 1803 (0.57 ms for a 100 µs request and 1.58 ms
+for 1 ms, on the same guest). Nothing on that kernel would have rung the word
+anyway. With a doorbell nothing changes.
+
+**Ten seconds of retrying access denied.** `open_virtio_port` retried every
+failure for 10 s, because a hot-added port appears a moment after QEMU adds it.
+That port is `ERROR_FILE_NOT_FOUND`. Access denied is a descriptor or a holder,
+and neither changes in 10 s, so it now retries for 1 s, and the error names both
+causes and the script. §90.3's `gpu ok … (10378 ms)` and most of its 12.7 s cold
+start were this.
+
+The measurement of the fallback after the fix is in 91.7.
+
+### 91.4 The harness clicks like a double-click
+
+`runint.ps1` takes `-RunLevel`. `wc-launch.sh`'s clicks (and the native
+Firefox measurement) use `Limited` unless `WC_LAUNCH_CLICK=elevated`. That is
+the filtered medium token in session 1 that Explorer uses. `wc-launch.exe` logs
+`token: medium integrity (S-1-16-8192), not elevated` (or what it got) once per
+launch, and the cold leg checks three things: that the token is a double-click's,
+that the Wayland connections are on the rings (`transport rings:`, no
+`SSH FALLBACK`), and with a GPU that the GPU side has its doorbell.
+
+Two harness bugs turned up while running a second installation beside the
+deployed one. `--stop`, `--ping` and `--install` were sent without
+`--session-name`, so they acted on the default session `wcl`, which is the
+deployed installation a person uses. `kill_host_firefox` killed every process
+matching `wc-launch/firefox`, which includes the deployed profile, and
+`WC_LAUNCH_FRESH` deleted `~/.wc-launch/firefox` whatever profile the run used.
+All of them now use the installation's own session and profile.
+
+### 91.5 Bug 2: the caption buttons
+
+The window extends DWM's frame into its client area, makes the caption-button
+strip transparent in `WM_PAINT`, and lets DWM draw the buttons behind it (§82).
+`DefWindowProc` answers `WM_SETTEXT`, `WM_SETICON` and `WM_NCACTIVATE` by painting
+the caption it believes the window has, synchronously and outside `WM_PAINT`,
+into that strip. The strip turns opaque, the buttons behind it disappear, and
+hit testing still finds them. They come back when a later paint's damage covers
+the strip, which is why navigations brought them back. Every capture in §90.6
+that lost them was of a page that retitles itself several times a second (the
+scroll counter, the video clock), and the compositor forwards each title with
+`SetWindowTextW`. That the losses were all maximised follows from the order of
+§90's run: every retitling page was shown after the window was maximised.
+
+The fix is what WPF's `WindowChrome` does for this frame. For a folded window,
+`WM_SETTEXT` and `WM_SETICON` go to `DefWindowProc` with `WS_VISIBLE` cleared for
+the call (`defproc_without_caption_paint`), and `WM_NCACTIVATE` goes with
+`lParam` -1, which tells it not to repaint the non-client area. After each, the
+strip is invalidated, so the next `WM_PAINT` clears it again whatever drew there.
+
+### 91.6 Bug 3: the second window's size and place
+
+**The size.** `map_window` shows the window and then sizes it to the client's
+first commit. `ShowWindow` on a `CW_USEDEFAULT` window sends a `WM_SIZE` with the
+cascade's default size, and the `SetWindowPos` sends one with the committed
+size. `on_size` turned each into an `xdg_toplevel.configure` with that size.
+A configure with a size is an instruction. Firefox commits a first geometry
+before it has read its saved one (252x304 for the second window, 516x128 for the
+medium session's first), was told that size back, and kept it. Nothing on the
+Win32 side followed a later commit either. This is also the "configured twice at
+map" that the stage-38 comment in `map_window` could not explain.
+
+Now `placing` covers the map's `ShowWindow` and `SetWindowPos`, `on_size` reports
+nothing inside it, and `settle_placement` decides afterwards: a client that got
+what it committed hears nothing, and one the work area shrank gets one configure
+with the size it got. While a toplevel has never been configured with a size
+(no user resize, maximise or fullscreen), a commit at a new window geometry is
+the client choosing again. `state.rs` sends `ToUi::Resize` and the window
+follows (`follow_client_size`), except during the user's own move or size loop
+and while maximised or minimised. `xdg_toplevel.set_min_size` and `set_max_size`
+reach Win32 as `ToUi::SizeHints` and are answered in `WM_GETMINMAXINFO`, before
+the first placement.
+
+The maximise configure used to inherit its size from the configure every window
+got at map. It now carries the size of where the window's popups may go (the
+monitor's work area on Windows, the output headless), and the `WM_SIZE` that
+follows corrects it.
+
+**The place.** The origin was read before `ShowWindow`, when a `CW_USEDEFAULT`
+window has no position yet, and the work-area fit clamped that placeholder to the
+work area's top-left corner. The `SetWindowPos` then moved the window there, over
+the cascade position Windows had just chosen. It is now read after `ShowWindow`,
+so a new window opens where Windows' cascade puts it, fitted to the work area.
+
+**Tests.** The headless stand-in sent a `Resized` at map to mirror win32 and no
+longer does (`showing_a_window_does_not_tell_it_its_own_size_back`).
+WLCS headless: `XdgToplevelStableConfigurationTest.defaults`, which expects no
+size in the first configure and failed on both legs before (the old comment in `control.rs` said so), now passes, and
+`window_can_maximize_itself` still passes.

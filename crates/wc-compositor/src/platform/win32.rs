@@ -164,6 +164,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // The five DWM cares about. `WM_NCHITTEST` is handled on its own path
     // because it has an answer to fall back to; these five are pure forwarding.
     WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_NCRBUTTONUP,
+    // §91: the three messages `DefWindowProc` answers by painting a caption
+    // over the folded one (see `defproc_without_caption_paint`), and a new
+    // toplevel's size: the client's own, its min and max, and a user's drag.
+    WM_SETTEXT, WM_NCACTIVATE, WS_VISIBLE, WM_GETMINMAXINFO, MINMAXINFO, WM_ENTERSIZEMOVE,
+    WM_EXITSIZEMOVE, IsZoomed,
 };
 // ADDED FOR STAGE 21. `SetThreadExecutionState` is filed under System::Power
 // rather than anywhere near the window APIs, because it is not about a window:
@@ -348,6 +353,20 @@ struct WindowState {
     /// it, a client asking to be maximised receives its own request as an
     /// event and toolkits that resend on change oscillate.
     self_driven: Cell<bool>,
+    /// §91: set while this process places the window itself (`map_window`,
+    /// `follow_client_size`). Every `WM_SIZE` in that span is the size the
+    /// client asked for, or one Windows passed through on the way to it
+    /// (`ShowWindow` on a `CW_USEDEFAULT` window sizes it to the cascade
+    /// first), and none of them is news to the client. What the client is
+    /// told is decided once, after the placement: nothing if it got what it
+    /// committed, a configure if the work area made it smaller.
+    placing: Cell<bool>,
+    /// §91: inside `WM_ENTERSIZEMOVE` … `WM_EXITSIZEMOVE`, when the user owns
+    /// the window's size and a client commit must not resize it.
+    user_sizing: Cell<bool>,
+    /// §91: `xdg_toplevel.set_min_size` and `set_max_size`, client pixels,
+    /// 0 for unset. Answered in `WM_GETMINMAXINFO`.
+    size_hints: Cell<((i32, i32), (i32, i32))>,
     icon_big: Cell<isize>,
     /// How many frames this window has presented, for the dump filenames.
     frames: Cell<u32>,
@@ -930,6 +949,10 @@ impl WindowState {
         // the caption folded in, `WM_NCCALCSIZE` grew the client rectangle
         // rather than shifting the content inside it. See `FrameStyle`.
         let (w, h) = (client_w.max(0), client_h.max(0));
+        if self.placing.get() {
+            // §91. See `placing`: the caller decides what the client hears.
+            return;
+        }
         if w <= 0 || h <= 0 || (w, h) == self.last_configured.get() {
             return;
         }
@@ -1448,8 +1471,63 @@ unsafe extern "system" fn toplevel_proc(
     {
         return r;
     }
+    // §91, the caption buttons that vanished (§90.6). `DefWindowProc` answers
+    // `WM_SETTEXT`, `WM_SETICON` and `WM_NCACTIVATE` by painting the caption it
+    // thinks this window has — synchronously, outside `WM_PAINT`, into the band
+    // `WM_NCCALCSIZE` gave to the client and `uncover_caption_buttons` made
+    // transparent for DWM's buttons. The strip turns opaque, the buttons behind
+    // it disappear and still work, and they come back only when a later
+    // `WM_PAINT` happens to cover the strip. Every page §90 lost them on retitles
+    // itself several times a second (an fps counter, a video clock), and the
+    // compositor forwards each title with `SetWindowTextW`.
+    if state.frame.get().extend_top && !matches!(state.kind, WindowKind::Popup { .. }) {
+        match msg {
+            WM_SETTEXT | WM_SETICON => {
+                let r = defproc_without_caption_paint(hwnd, msg, wparam, lparam);
+                state.invalidate_button_strip();
+                return r;
+            }
+            WM_NCACTIVATE => {
+                // -1: "do not repaint the non-client area" (WPF's WindowChrome
+                // does exactly this, for exactly this frame).
+                // SAFETY: a live window handle on its own thread.
+                let r = unsafe { DefWindowProcW(hwnd, msg, wparam, -1) };
+                state.invalidate_button_strip();
+                return r;
+            }
+            _ => {}
+        }
+    }
 
     match msg {
+        // §91: the client's `set_min_size`/`set_max_size`, as the frame's
+        // track sizes. `DefWindowProc` applies these to every user resize and
+        // to every `SetWindowPos` through `WM_WINDOWPOSCHANGING`.
+        WM_GETMINMAXINFO if !matches!(state.kind, WindowKind::Popup { .. }) => {
+            let r = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            // SAFETY: `lparam` is the MINMAXINFO Windows passes with this message.
+            let mmi = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+            let ((minw, minh), (maxw, maxh)) = state.size_hints.get();
+            if minw > 0 || minh > 0 {
+                let (ow, oh) = outer_size(state, minw.max(1), minh.max(1));
+                if minw > 0 { mmi.ptMinTrackSize.x = mmi.ptMinTrackSize.x.max(ow); }
+                if minh > 0 { mmi.ptMinTrackSize.y = mmi.ptMinTrackSize.y.max(oh); }
+            }
+            if maxw > 0 || maxh > 0 {
+                let (ow, oh) = outer_size(state, maxw.max(1), maxh.max(1));
+                if maxw > 0 { mmi.ptMaxTrackSize.x = ow; }
+                if maxh > 0 { mmi.ptMaxTrackSize.y = oh; }
+            }
+            r
+        }
+        WM_ENTERSIZEMOVE => {
+            state.user_sizing.set(true);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_EXITSIZEMOVE => {
+            state.user_sizing.set(false);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_PAINT => {
             state.paint();
             0
@@ -2547,6 +2625,20 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 map_window(&w, width, height, fold_caption);
             }
         }
+        ToUi::Resize { id, width, height } => {
+            if let Some(w) = window(ui, id) {
+                follow_client_size(&w, width, height);
+            }
+        }
+        ToUi::SizeHints { id, min, max } => {
+            if let Some(w) = window(ui, id) {
+                w.size_hints.set((min, max));
+                println!(
+                    "wc-compositor: window {id} size hints: min {}x{}, max {}x{} (0 = none)",
+                    min.0, min.1, max.0, max.1
+                );
+            }
+        }
         // ADDED FOR STAGE 13. `SWP_NOACTIVATE` and no `ShowWindow`: the window
         // is already up, and re-showing it would flicker.
         ToUi::MovePopup { id, x, y, width, height } => {
@@ -2912,6 +3004,9 @@ fn create_window(
         mapped: Cell::new(false),
         unpainted_since: Cell::new(None),
         self_driven: Cell::new(false),
+        placing: Cell::new(false),
+        user_sizing: Cell::new(false),
+        size_hints: Cell::new(((0, 0), (0, 0))),
         icon_big: Cell::new(0),
         frames: Cell::new(0),
         icon_small: Cell::new(0),
@@ -3702,6 +3797,128 @@ fn begin_sysmenu_gesture(w: &Rc<WindowState>, command: u32, what: &str) {
 }
 
 /// Show the window for the first time, at the size the client chose.
+/// `DefWindowProc` for a message it would answer by repainting the caption,
+/// with `WS_VISIBLE` cleared for the call so that it paints nothing. §91.
+///
+/// The style bit is cleared with `SetWindowLongPtrW` and put back the same
+/// way, with no `SetWindowPos`, so the window is never actually hidden: the
+/// default handler only reads the bit to decide whether to draw. This is the
+/// `_HandleSetTextOrIcon` of WPF's `WindowChrome`, which keeps DWM's caption
+/// buttons over a client area extended into the frame, as this window does.
+fn defproc_without_caption_paint(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: a live window handle on its own thread; only the style word is
+    // touched, and it is restored before returning.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let visible = style & WS_VISIBLE as isize != 0;
+        if visible {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_VISIBLE as isize));
+        }
+        let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+        if visible {
+            // Re-read: the default handler may have changed other bits.
+            let now = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, now | WS_VISIBLE as isize);
+        }
+        r
+    }
+}
+
+impl WindowState {
+    /// Re-clear the caption-button strip on the next `WM_PAINT`, whatever drew
+    /// over it. §91: one small paint per title change.
+    fn invalidate_button_strip(&self) {
+        if let Some((mut rc, _)) = self.button_strip() {
+            rc.bottom = rc.bottom.max(self.nc_top.get());
+            // SAFETY: a live window; the rectangle is read, not written.
+            unsafe { InvalidateRect(self.hwnd(), &rc, 0) };
+        }
+    }
+}
+
+/// The outer (frame-included) size of a toplevel whose client area is
+/// `width` x `height`, with this window's live style and caption fold.
+fn outer_size(w: &WindowState, width: i32, height: i32) -> (i32, i32) {
+    let mut rc = RECT { left: 0, top: 0, right: width, bottom: height };
+    // SAFETY: a live window handle; `rc` is written in place.
+    unsafe {
+        let style = GetWindowLongPtrW(w.hwnd(), GWL_STYLE) as u32;
+        AdjustWindowRectEx(&mut rc, style, 0, 0);
+    }
+    // See `map_window`: a folded caption gives the whole top inset back to the
+    // client, so the window is not taller than its client by a caption.
+    if w.frame.get().extend_top {
+        rc.top = 0;
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
+
+fn client_size(hwnd: HWND) -> (i32, i32) {
+    let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: a live window handle; written in place.
+    unsafe { GetClientRect(hwnd, &mut cr) };
+    (cr.right - cr.left, cr.bottom - cr.top)
+}
+
+/// After this process has placed a toplevel (`placing` was set across it),
+/// decide what the client hears: nothing if it got the size it committed, and
+/// one configure with the size it did get if not. §91.
+fn settle_placement(w: &WindowState, width: i32, height: i32) {
+    let got = client_size(w.hwnd());
+    if got == (width, height) || got.0 <= 0 || got.1 <= 0 {
+        w.last_configured.set((width, height));
+        return;
+    }
+    w.last_configured.set(got);
+    let _ = w.events.send(FromUi::Resized { id: w.id, width: got.0, height: got.1 });
+}
+
+/// §91. The client changed its own size while it is the one choosing it (it
+/// has never been sent a size), so the window follows, as a native window
+/// follows its own `SetWindowPos`. Not while the user is dragging a border,
+/// nor while the window is maximised or minimised, whose size is Windows'.
+fn follow_client_size(w: &Rc<WindowState>, width: i32, height: i32) {
+    if !w.mapped.get() || w.user_sizing.get() || matches!(w.kind, WindowKind::Popup { .. }) {
+        return;
+    }
+    // SAFETY: live window handle; plain queries.
+    if unsafe { IsZoomed(w.hwnd()) != 0 || IsIconic(w.hwnd()) != 0 } {
+        return;
+    }
+    if client_size(w.hwnd()) == (width, height) {
+        w.last_configured.set((width, height));
+        return;
+    }
+    let (ow, oh) = outer_size(w, width, height);
+    let (ox, oy) = window_origin(w.hwnd());
+    let mut got = (ox, oy, ow, oh);
+    if let Some(work) = work_area_of(w.hwnd()) {
+        got = crate::platform::fit_to_work_area(got, (work.left, work.top, work.right, work.bottom));
+    }
+    w.placing.set(true);
+    w.self_driven.set(true);
+    // SAFETY: live window handle; `WM_SIZE` arrives synchronously and is held
+    // back by `placing`.
+    unsafe {
+        SetWindowPos(
+            w.hwnd(),
+            std::ptr::null_mut(),
+            got.0,
+            got.1,
+            got.2,
+            got.3,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    w.self_driven.set(false);
+    w.placing.set(false);
+    settle_placement(w, width, height);
+    println!(
+        "wc-compositor: window {} follows its client to {width}x{height} (window {}x{} at {},{})",
+        w.id, got.2, got.3, got.0, got.1
+    );
+}
+
 fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) {
     // §46, and it has to be here rather than at creation: the fact it is
     // derived from is `xdg_surface.set_window_geometry`, which a toplevel sends
@@ -3828,6 +4045,33 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
     // cascade is not wrong — it is simply unbounded, and a few windows into it
     // the next one is off the bottom right. So the position is *bounded* here
     // rather than replaced: a window that already fits is not moved at all.
+    //
+    // §91: **and it is read after `ShowWindow`, which is where it is decided.**
+    // Read before, on a hidden `CW_USEDEFAULT` window, it was a placeholder that
+    // the fit below clamped to the work area's corner, and the `SetWindowPos`
+    // after `ShowWindow` then moved the window there over the cascade Windows
+    // had just chosen: §90.7's second window, at 0,0.
+    //
+    // **`placing` covers both calls, and the client hears once, afterwards.**
+    // `ShowWindow` on a `CW_USEDEFAULT` window sizes it to the cascade's default
+    // and sends that `WM_SIZE`; the `SetWindowPos` sends the committed size.
+    // Each went out as a configure, so the client was told the cascade size and
+    // then its own size back — and a configure with a size is an instruction:
+    // Firefox's second window committed 252x304 before reading its saved
+    // geometry, was configured to 252x304, and obeyed for the rest of its life
+    // (§90.7). This is the "configured twice at map" noted below, found. Now a
+    // client that gets what it committed is told nothing, which leaves it free
+    // to choose again (`follow_client_size`), and one the work area shrank is
+    // told the size it got.
+    // SAFETY: live window handle; both calls send messages to `toplevel_proc`
+    // on this thread before returning.
+    w.placing.set(true);
+    w.self_driven.set(true);
+    unsafe {
+        if !w.mapped.replace(true) {
+            ShowWindow(w.hwnd(), SW_SHOWNORMAL);
+        }
+    }
     let (ox, oy) = window_origin(w.hwnd());
     let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
     let mut got = asked;
@@ -3857,47 +4101,8 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
         }
     }
     let (x, y, ww, wh) = got;
-    let fitted = got != asked;
-    // The client is told, and this is the half that is easy to miss. If the
-    // window was made smaller than the client asked for, `self_driven` must
-    // **not** suppress the `WM_SIZE` that `SetWindowPos` provokes: the whole
-    // point of an `xdg_toplevel.configure` is that the client lays out for the
-    // size it actually got. It is only suppressed when nothing changed, which
-    // is the original reason it was here — a client being told its own request
-    // back is noise that makes toolkits resend.
-    // **`ShowWindow` first, then place it, and that order was measured.**
-    //
-    // Until stage 38 this was the other way round, and it worked because the
-    // `SetWindowPos` kept `SWP_NOMOVE`: only the size was being set, and a
-    // window created with `CW_USEDEFAULT` keeps a size somebody has given it.
-    // Setting a *position* as well does not survive the first `ShowWindow`.
-    // `CW_USEDEFAULT` for x and y means "decide when it is first shown", and
-    // `SW_SHOWNORMAL` decides — for the whole placement, size included. The
-    // first guest run of this stage has it in the log: the window was fitted
-    // to `1220x752 at 0,0` and appeared at `960x543 at 104,104`, which is the
-    // cascade, and the client was configured twice for its trouble.
-    //
-    // So: show it, then place it. The window is only shown at all once its
-    // shadow has pixels, and the placement lands before the first `WM_PAINT`.
-    //
-    // `self_driven` covers the `SetWindowPos`: the `WM_SIZE` it produces is
-    // the client's own request unless the work area forced a change, and then
-    // it is exactly what the client has to be told.
-    //
-    // **A client is still configured twice at map, and it is not this.** The
-    // guest's logs show `1280x729`, then the cascade size, then the fitted one
-    // — the last is right and the middle one is noise. A flag that dropped
-    // every `WM_SIZE` across `ShowWindow` was tried and changed the sequence by
-    // nothing at all, so whatever sends it is not this call, and guessing again
-    // would be shipping a fix with no measurement behind it. Written down here
-    // rather than left for the next reader to rediscover.
-    // SAFETY: live window handle; both calls send messages to `toplevel_proc`
-    // on this thread before returning.
+    // SAFETY: as above.
     unsafe {
-        if !w.mapped.replace(true) {
-            ShowWindow(w.hwnd(), SW_SHOWNORMAL);
-        }
-        w.self_driven.set(!fitted);
         SetWindowPos(
             w.hwnd(),
             std::ptr::null_mut(),
@@ -3916,15 +4121,8 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
         );
     }
     w.self_driven.set(false);
-    // The size we just imposed is the size the client already has, so recording
-    // it here stops the `WM_SIZE` above from being echoed back as a configure —
-    // unless it is *not* the size the client asked for, in which case the
-    // `WM_SIZE` has already gone out as a configure and the recorded value has
-    // to be that one, or the next resize would be compared against a size this
-    // window never had.
-    if !fitted {
-        w.last_configured.set((width, height));
-    }
+    w.placing.set(false);
+    settle_placement(w, width, height);
     // What the window actually turned out to be, once, in the log — because
     // the placement above is the one thing here that Windows is entitled to
     // overrule, and a line that says so is the difference between finding that

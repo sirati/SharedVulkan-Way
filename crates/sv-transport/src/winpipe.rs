@@ -234,6 +234,12 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
     // A `Global\` failure is therefore not reported unless the plain form fails
     // too, and the error that surfaces is the plain form's — which is the one
     // that says something about the port rather than about the alias.
+    //
+    // §91 corrects the reason, not the order. On testhost's guest `Global\<name>`
+    // is a symbolic link to the port's PDO itself (`QueryDosDevice` gives
+    // `\Device\000000NN`), and that device object carries vioser's raw-PDO
+    // default, `D:P(A;;FA;;;SY)(A;;FA;;;BA)`: the refusal of an unprivileged
+    // process is the device's own descriptor, under either spelling.
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout_ms));
     // A `name` that is already a device path is used verbatim, so a caller that
@@ -247,6 +253,17 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
     } else {
         vec![format!("\\\\.\\Global\\{name}"), format!("\\\\.\\{name}")]
     };
+    // **Access denied is not a port that has not appeared yet** (§91.3). A
+    // hot-added port that vioser has not bound is ERROR_FILE_NOT_FOUND, and that
+    // is what the ten seconds are for. ERROR_ACCESS_DENIED is one of two
+    // things: the port's descriptor refuses this token (vioser's default admits
+    // only SYSTEM and Administrators, so a medium-integrity launch from Explorer
+    // is refused until `scripts/wc-port-access.ps1` has run), or another process
+    // holds it (a port has one opener). Neither goes away in ten seconds, and
+    // retrying for ten made every such launch ten seconds slower: §90.3's
+    // `gpu ok … (10378 ms)`. One second covers a previous session that is still
+    // closing its handle.
+    let denied_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
     let mut last = 0i32;
     loop {
         for path in &paths {
@@ -268,7 +285,18 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
             }
             last = unsafe { sys::GetLastError() } as i32;
         }
-        if std::time::Instant::now() >= deadline {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let now = std::time::Instant::now();
+        if last == ERROR_ACCESS_DENIED && now >= denied_deadline.min(deadline) {
+            return Err(Error::Os {
+                call: "CreateFileW (virtio-serial port: access denied, so either this token may \
+                       not open it -- vioser admits only Administrators until \
+                       scripts/wc-port-access.ps1 has granted the user, waycompose-design.md §91 -- \
+                       or another process holds it)",
+                errno: last,
+            });
+        }
+        if now >= deadline {
             return Err(Error::Os { call: "CreateFileW (virtio-serial port)", errno: last });
         }
         std::thread::sleep(std::time::Duration::from_millis(20));

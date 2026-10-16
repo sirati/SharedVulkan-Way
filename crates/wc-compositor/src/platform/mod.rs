@@ -455,6 +455,16 @@ pub enum ToUi {
         height: i32,
         fold_caption: bool,
     },
+    /// §91. A mapped toplevel's client changed its own window geometry while it
+    /// is the one choosing its size: it has never been configured with a size,
+    /// because the user has not resized it and it is not maximised. The window
+    /// follows, as a native window follows its own `SetWindowPos`. Firefox
+    /// commits a first size before it has read its saved geometry and its real
+    /// one a few frames later (§90.7).
+    Resize { id: WindowId, width: i32, height: i32 },
+    /// §91. `xdg_toplevel.set_min_size` / `set_max_size`, surface pixels, 0 for
+    /// unset, as committed.
+    SizeHints { id: WindowId, min: (i32, i32), max: (i32, i32) },
     /// The client asked to be maximised, unmaximised or minimised.
     SetWindowState {
         id: WindowId,

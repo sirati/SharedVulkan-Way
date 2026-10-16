@@ -34,6 +34,7 @@ mod audio;
 mod config;
 mod ico;
 mod plan;
+mod token;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -304,6 +305,9 @@ fn run(
         (None, true) => None,
         (None, false) => return Err("no application named, and no --session".into()),
     };
+    // §91: which route this launch came by. A double-click from Explorer is
+    // medium and not elevated; a harness task at `-RunLevel Highest` is high.
+    log.say(&format!("token: {}", token::describe()));
     win::launch(cfg, p, log, app, t0)
 }
 
