@@ -1315,7 +1315,7 @@ mod win {
                     }
                     Err(e) => log.say(&format!("pins: the host's answer about {}: {e}", app.desktop)),
                 },
-                Err(e) => log.say(&format!("pins: app {}: {e}; using what was cached", app.desktop)),
+                Err(e) => log.say(&format!("pins: app {}: {}; using what was cached", app.desktop, first_line(&e))),
             }
         }
         let meta = cached_meta(p, section);
@@ -1361,7 +1361,8 @@ mod win {
             match ssh(cfg, p, &["frequent", &plan::b64(profile.as_bytes())]) {
                 Ok(out) => appmeta::parse_frequent(&out),
                 Err(e) => {
-                    log.say(&format!("pins: frequent: {e}"));
+                    // First line only: a failed reply can carry the pages after it.
+                    log.say(&format!("pins: frequent: {}", first_line(&e)));
                     (appmeta::JumpPrefs::default(), Vec::new())
                 }
             }
@@ -1449,6 +1450,10 @@ mod win {
             )),
             Err(e) => log.say(&format!("pins: {aumid}: jump list not committed: {e}")),
         }
+    }
+
+    fn first_line(s: &str) -> String {
+        s.lines().next().unwrap_or("").chars().take(160).collect()
     }
 
     fn fnv(bytes: &[u8]) -> u64 {

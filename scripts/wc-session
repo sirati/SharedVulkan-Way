@@ -978,6 +978,9 @@ frequent)
     fi
     echo "item $KIND $B64URL ${B64TITLE:--} ${ICON:--}"
   done
+  # The pipeline's status is whatever its last test said (pipefail), and a
+  # list that ended on a page without a favicon is still a list.
+  exit 0
   ;;
 
 # -------------------------------------------------------------------- icon ---
