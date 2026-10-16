@@ -29425,6 +29425,236 @@ fault.
    who creates it first. That is a host-local concern, not one the guest can
    reach beyond the session ids, and is unchanged.
 
+## 95. Firefox on the forwarded GPU: an arena too small, and a guest pause taken for a dead peer
+
+Branch `gpu-oom`, from master `ab009e9`, 2026-10-16. The brief was two Firefox
+crashes on the deployed `wcivs` install. Crash 2 (session 12:34:29 to 12:45:02)
+printed 120 `ZINK: vkCreateBuffer failed`, then `wr_renderer_render:
+OutOfMemory` at t=208.8 s and `Fallback WR to SW-WR`, and at about t=630 s
+`zink: DEVICE LOST!`, `vkCreateSampler failed (VK_ERROR_DEVICE_LOST)` and a
+SIGSEGV in the parent. Crash 1 was an idle Firefox during a screen lock:
+`DEVICE LOST!` and `vkCreateBufferView failed (VK_ERROR_DEVICE_LOST)` 2.3 s after
+the iGPU went from D3 to D0. The GPU side logged nothing either time. Two more
+sessions arrived during the work: wcl-1332 fell back to SW-WR with **no**
+`vkCreateBuffer` failure but ten `zink: couldn't allocate memory: heap=3
+size=2097152`, and later died of the same `vkCreateSampler` DEVICE_LOST while an
+image was pasted.
+
+**Status.** Two causes, both reproduced on this workstation's RADV and both
+ours. The OOM is the 64 MiB arena: Firefox with two windows has a working set
+that fills the application's 56 MiB of it, and the free space fragments below
+one 2 MiB slab (95.2). The lost device is the ICD declaring the GPU side gone
+after 150 ms without a heartbeat, which a guest that is not scheduled for that
+long produces with nothing wrong on either side (95.3). The ICD now waits five
+seconds, drops a late reply instead of handing it to the next call, frees a
+half-built swapchain, and says once, whatever `SV_DEBUG` says, why it failed a
+call. The GPU side says when its driver returns a lost device or an
+out-of-memory. What the 120 `vkCreateBuffer` failures of crash 2 were is **not
+established** (95.4); the next one will say. The arena fix is an ini change on
+the guest (95.6); nothing here ran on the guest or on testhost.
+
+### 95.1 Where "ZINK: vkCreateBuffer failed" comes from
+
+Mesa 26.2.4 (the deployed kopper build's source,
+`/nix/store/9s209y4515mm50m7kpxlqc6nji1rw13v-source`) prints it in one place,
+`zink_resource.c:1295`, `create_buffer()`, when `vkCreateBuffer` itself returns
+anything but `VK_SUCCESS`. It is the first Vulkan call of a buffer resource:
+there is no requirements query before it, the result is not printed, and
+`zink_screen_handle_vkresult` is not called, so a `VK_ERROR_DEVICE_LOST` there
+does not even mark the device lost. The memory comes after it, in
+`zink_bo_create`, whose failure prints `zink: couldn't allocate memory: heap=N
+size=M` instead (`zink_bo.c:269`; `heap` is Zink's own heap enum, not a Vulkan
+heap index), after one retry with its slab and BO caches emptied.
+
+So crash 2's 120 lines are a non-success from our `vkCreateBuffer`, and arena
+exhaustion cannot produce them: the ICD's `create_buffer` never touches the
+allocator. They are either the GPU side's forwarded result or a `LowerError`
+(a transport failure, or a lowering error such as `ChainTooLong`), and before
+this section both were silent without `SV_DEBUG`. wcl-1332's
+`couldn't allocate memory` lines are the other path, and that is the one the
+local runs reproduce.
+
+### 95.2 The arena: a working set, not a leak
+
+`scripts/sv-firefox-wayland.sh two-windows SECS` is a new mode of the existing
+harness: weston (pixman, `wl_shm` only), `sv-gpu-server` on RADV, Firefox 157.0.1
+through the ICD and the deployed kopper Mesa, `SVWL_FORCE=wr` (the deployed
+`gfx.webrender.all`). `sv-firefox-soak.py` opens a page that retitles itself ten
+times a second, a second window, sets both to 1280x752 and then 1296x768, and
+tours local pages and three real sites in both windows. At the end it closes
+one window and quits from the other. `SV_DEBUG` now prints the arena's use, with
+the time, whenever it moves by 2 MiB.
+
+| run | arena | result |
+|---|---|---|
+| 300 s, `SV_DEBUG` | 64 MiB (56 MiB to the application, 8 MiB blob reserve) | `the arena is exhausted: 2162688 bytes asked for, arena 48928 KiB of 57344 KiB in use`, `zink: couldn't allocate memory: heap=5 size=2162688` twice, `wr_renderer_render: OutOfMemory`, `Fallback WR to SW-WR`; 25 of 63 compositor samples `WebRender (Software)` |
+| 300 s, `SV_DEBUG` | 64 MiB | no failure; largest free run down to **2048 KiB** at t=276 s, against the 2112 KiB the first run failed on |
+| 240 s, no `SV_DEBUG` | 64 MiB | `vkAllocateMemory: the arena is exhausted: 2097152 bytes asked for, arena 51040 KiB of 57344 KiB in use in 21 allocation(s), largest free run 1936 KiB, high water 51040 KiB`, then the same fallback |
+| 600 s, `SV_DEBUG` | 256 MiB | no failure, 129 page loads; in use between 42 and 51 MiB for the whole run, high water **53152 KiB** at about 120 s and never higher |
+| 300 s, `SV_DEBUG`, this branch with master 2982bdd merged in (a trial merge, not committed) | 112 MiB, the size 95.6 recommends (98 MiB to the application) | no failure, WebRender throughout, high water 53088 KiB, largest free run never below the 34 MiB of the end; the same run at 64 MiB exhausted again (`53024 KiB of 57344 KiB in use … largest free run 1876 KiB`) and fell back |
+
+At 256 MiB the use rises to a plateau within two minutes and stays there for
+ten, so nothing leaks over this workload; Zink's BO cache gives memory back
+(the use falls by 6 MiB at a time) and its retry empties it before failing. The
+working set is about 21 allocations: Zink's 2 MiB slabs, and the ICD's own
+swapchain readback buffers, one per swapchain image at the window's full size
+(kopper asks for two, so 1296x768 costs 7.6 MiB a window). At 64 MiB the
+high-water mark is 95 % of what the application gets, and readback buffers of
+several window sizes (4.4 MiB, 3.3 MiB) leave holes no 2 MiB slab fits, so whether
+a run fails is a matter of fragmentation timing: one of two 300 s runs did.
+
+`vkAllocateMemory` used to fail this silently (R11 calls exhaustion "a normal
+condition an application handles", which is true and was the whole of the
+diagnosis). It now says so once with the request, the use, the largest free run
+and the high-water mark. Two leaks on the failure path are also closed: a
+swapchain whose second image could not get its readback buffer kept the first
+one's for the life of the process, and an allocation whose slab the GPU side did
+not import stayed allocated with no handle anyone could free.
+
+### 95.3 The lost device: 150 ms of silence
+
+Every wait the ICD makes on a ring passed a 50 ms liveness interval to
+`wait_until`, which builds its peer-gone window as three intervals. So a GPU side
+whose heartbeat did not move for 150 ms of the ICD's running time was gone, and
+the call returned `VK_ERROR_DEVICE_LOST`. The GPU side beats every 20 ms from a
+thread of its own, but when the guest is not scheduled every one of its threads
+stops, and the ICD, which kept running, has no stall of its own to credit. The
+GPU side's ring threads poll at 200 ms (a 600 ms window) for the same reason
+and judge the app side gone only after `APP_GONE_AFTER`, five seconds (`session.rs`).
+
+`SVWL_STALL_MS=N` makes the harness `SIGSTOP` the GPU side for N ms every
+`SVWL_STALL_EVERY` seconds (default 20) from 30 s on, which is what a paused
+guest looks like from the host.
+
+| build | stalls | result |
+|---|---|---|
+| master (plus the diagnostics) | 400 ms | the second stall, t=51 s: `transport: peer of ring 2 is gone; returning VK_ERROR_DEVICE_LOST`, three `zink: DEVICE LOST!`, `swapchain killed`, `vkCreateImage failed (VK_ERROR_DEVICE_LOST)`, a minidump. The signature of crashes 1, 2 and 3 |
+| this branch | 12 x 400 ms | alive at 243 s, WebRender throughout, no failure line |
+| this branch | 12 x 2000 ms | alive at 245 s, WebRender throughout, no failure line |
+| this branch | 25 x 1000 ms, every 10 s | alive at 302 s, WebRender throughout, no failure line, then a clean quit |
+
+The window is now `PEER_GONE_AFTER`, five seconds, for every ICD wait, through one
+helper (`wait_for_peer`) and a new `sv_transport::park::wait_until_gone_after`
+that takes the window separately from the poll interval.
+
+A second defect made a lost device worse than it had to be. A call that gave up
+left its command on the ring, and a GPU side that was only slow answered it
+later. The next call read that reply, saw the wrong sequence number and failed
+with `Shape("a reply arrived out of order")`, leaving its own reply for the call
+after it, so every later call on that ring failed for the rest of the process.
+A reply older than the call's own sequence number is now dropped.
+`transport::abandoned_calls` stops a fake GPU side's heartbeat for twice the
+window before it answers: the first call is `DeviceLost`, the second gets its own
+reply. Without the fix the second call fails.
+
+### 95.4 What crash 2's vkCreateBuffer failures were
+
+Not established. By 95.1 they were a failed `vkCreateBuffer` from the ICD, and
+three things could produce it: the Intel driver's own result (forwarded
+unchanged, and until now not logged by the GPU side), a transport failure
+(printed only under `SV_DEBUG`), or a lowering error. The ring desynchronisation
+of 95.3 would fail every call on the device ring, `vkCreateImage` and
+`vkCreateSampler` with it, and crash 2's log has only `vkCreateBuffer` failures
+until t≈630 s, so it is the least likely of the three. The next occurrence will
+name its layer:
+
+* the ICD says the first `vkCreateBuffer` result the GPU side refused, with the
+  size, the usage and the arena's use;
+* the ICD says the first transport failure of each kind and the first lowering
+  failure of each kind (`a call failed in this ICD: …`), unconditionally;
+* the GPU side says, once per command and result, when its driver returns
+  `VK_ERROR_DEVICE_LOST`, `VK_ERROR_OUT_OF_DEVICE_MEMORY` or
+  `VK_ERROR_OUT_OF_HOST_MEMORY` (`sv-gpu-server: the driver returned … from …`).
+  The generated dispatch calls a new `GpuHost::note_driver_error` after every
+  driver call that returns a `VkResult`; the hand-written `vkCreateBuffer`,
+  `vkCreateImage` and `vkAllocateMemory` call it too.
+
+### 95.5 Crash 1: what can be said
+
+The old ICD returned `VK_ERROR_DEVICE_LOST` for a ring wait that saw 150 ms of
+heartbeat silence, a call that took over 10 s (`CALL_TIMEOUT`), a ring the GPU
+side marked fatal, or a GPU side that restarted. The last two leave a line in
+the GPU side's log, and it had none. The driver itself could also have returned
+it, and the old GPU side would have forwarded that silently. 95.3 shows that the
+first produces this exact signature, and a guest that stalls while its
+passed-through iGPU changes power state, 2.3 s before the failure, is the kind of
+pause that triggers it. So the likeliest reading is the ICD's window, which this
+branch widens to five seconds. If the next occurrence instead logs `the driver
+returned VK_ERROR_DEVICE_LOST`, Intel's driver lost the device across D3, and
+neither side can repair that: a lost `VkDevice` stays lost, its objects with it.
+Surviving it would be Firefox's job (a robust context and a renderer reset; it
+crashed instead), and avoiding it would mean keeping the iGPU out of D3 while a
+GPU session is open, either by a power setting on the guest or by
+`disable_idle_d3` on the host's vfio-pci. Neither was tried.
+
+### 95.6 The geometry, and what it costs
+
+The GPU arena is a 256 MiB ivshmem device cut into `gpu-sessions` slots of
+16 MiB control plus `gpu-arena-mib` arena (§87.2). `sv-hostd` takes each slot's
+geometry from the guest's extent, so the split is the guest's ini alone.
+
+| ini | slots | arena a session | application's share | against the 53 MiB measured |
+|---|---|---|---|---|
+| `gpu-sessions = 3`, `gpu-arena-mib = 64` (deployed) | 3 x 80 MiB | 64 MiB | 56 MiB | 95 %, fails |
+| `gpu-sessions = 3`, `gpu-arena-mib = 69` | 3 x 85 MiB | 69 MiB | 61 MiB | 87 % |
+| `gpu-sessions = 2`, `gpu-arena-mib = 112` | 2 x 128 MiB | 112 MiB | 98 MiB | 54 % |
+| a 384 MiB device, `gpu-sessions = 3`, `gpu-arena-mib = 112` | 3 x 128 MiB | 112 MiB | 98 MiB | 54 %, and 128 MiB more host RAM |
+
+The second row is not a fix. The third is the one this section recommends: it
+costs no host memory and gives up the third concurrent session, which §87.2 kept
+for `glxtest`, the browser and an RDD or a restart. `glxtest` exits before the
+browser asks for its slot, and a slot comes back when its session ends, so two
+cover the browser and its video decoder. The fourth row needs memory testhost
+does not have (244 MB available at crash 2, 412 MB and 723 MB later). Two things
+about the third row are unverified on the guest: that Intel's driver imports a
+112 MiB host pointer as it does a 64 MiB one (§87.3), and that a Firefox start
+never needs a third slot at once.
+
+### 95.7 The quit crash
+
+A session on the deployed build (wcl-2652) crashed when its last window closed,
+in `xpcom-shutdown-threads`, and the crash reporter deleted the minidump. Here, a
+two-window session that ends by closing one window and quitting from the other
+exited 0 with no minidump in three 60 s runs and in a 300 s run at 64 MiB
+and in a 300 s run with 25 one-second stops of the GPU side. It is not
+reproduced. Closing the *last* window over WebDriver
+leaves this Firefox running with no window, so the harness quits through
+`Marionette:Quit`, which takes the same shutdown path but not the same click.
+`MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in the launcher's environment would keep the
+next dump.
+
+### 95.8 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --release -p sv-transport -p sv-arena -p sv-icd -p sv-icd-entry` | all pass; new: `park::a_silence_shorter_than_gone_after_is_slow_not_gone`, `transport::abandoned_calls::a_late_reply_to_an_abandoned_call_is_not_the_next_calls_answer` (fails without the fix) |
+| `cargo test --release -p sv-gpu-server -p sv-codegen -p sv-gpu-entry` | all pass |
+| `cargo clippy --release` on the touched crates | no new warnings |
+| `sv-firefox-wayland.sh two-windows`, the runs of 95.2, 95.3 and 95.7 | as tabled |
+| the same on a trial merge with master 2982bdd (not committed; the only conflict is this file's tail) | builds; the tests above pass; 25 x 1 s stalls survived and quit cleanly, 112 MiB passed, 64 MiB exhausted |
+
+The protocol hash is unchanged (`0x403720e574aa9434`), so the ICD and the GPU
+side can be deployed separately.
+
+### 95.9 What to deploy, and what to check
+
+1. **testhost, `~/wc-launch-ivs/bin/libsv_icd.so`**: this branch's release
+   build. It is the liveness window, the stale-reply fix, the swapchain cleanup
+   and the ICD's diagnostics, and needs nothing on the guest.
+2. **The guest, `sv-guest.exe`**: this branch's release build for
+   `x86_64-pc-windows-gnu`, for the GPU side's driver-error lines. It changes no
+   behaviour.
+3. **The guest's `wc-launch.ini`**: `gpu-sessions = 2` and `gpu-arena-mib = 112`
+   (95.6).
+4. Then check, in this order: the GPU process's first line says `2 session
+   slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`; Firefox starts on the
+   GPU (about:support `Compositing: WebRender`, a `sv-icd: connected` line in
+   `app.log`); a video plays, so that the RDD process has its session beside the
+   browser's; the crash-2 workload (two windows, a retitling page, a maximise,
+   ten minutes of use) leaves `app.log` with no `couldn't allocate memory`, no
+   `OutOfMemory` and no `sv-icd: … returning` line; and a screen lock of an hour
+   with Firefox open ends with Firefox alive. If anything fails, the lines of
+   95.4 say which layer.
 ## 96. Minecraft: a pointer that holds still, a window that follows, and three forwarder gaps a game found
 
 Branch `minecraft`, from master `59a6e8e` with `ab009e9` (§94) merged in,

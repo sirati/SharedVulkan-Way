@@ -300,6 +300,10 @@ pub struct State {
     /// makes a WebGL context per page (docs/design.md §0.28).
     pub command_buffers: HashMap<u64, u64>,
     pub allocator: Box<dyn Backing>,
+    /// Most arena bytes ever in use at once, and the value `SV_DEBUG` last
+    /// reported ([`State::note_arena_use`]).
+    pub arena_high_water: u64,
+    pub arena_reported: u64,
 }
 
 impl State {
@@ -317,6 +321,8 @@ impl State {
             descriptor_sets: HashMap::new(),
             command_buffers: HashMap::new(),
             allocator,
+            arena_high_water: 0,
+            arena_reported: 0,
         }
     }
 
@@ -324,6 +330,66 @@ impl State {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// What the arena holds, as one clause for a diagnostic line: bytes in
+    /// use of the application's share, in how many `VkDeviceMemory`, and the
+    /// high-water mark.
+    pub fn arena_use(&self) -> String {
+        let len = self.allocator.arena_len();
+        let used = len - self.allocator.free_bytes().min(len);
+        let live = self.memories.values().filter(|m| m.allocation.is_some()).count();
+        format!(
+            "arena {} KiB of {} KiB in use in {live} allocation(s), largest free run {} KiB, \
+             high water {} KiB",
+            used >> 10,
+            len >> 10,
+            self.allocator.largest_free_run() >> 10,
+            self.arena_high_water.max(used) >> 10
+        )
+    }
+
+    /// Track the arena's high-water mark after an allocation or a free, and
+    /// under `SV_DEBUG` print the use, with the seconds since the first arena
+    /// allocation, whenever it has moved by 2 MiB either way since the last
+    /// line. That series is what tells a working set that fits from one that
+    /// grows until it does not.
+    pub fn note_arena_use(&mut self) {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        let t0 = *T0.get_or_init(std::time::Instant::now);
+        let len = self.allocator.arena_len();
+        let used = len - self.allocator.free_bytes().min(len);
+        self.arena_high_water = self.arena_high_water.max(used);
+        if used.abs_diff(self.arena_reported) >= 2 << 20 {
+            self.arena_reported = used;
+            if sv_icd_entry::debug_enabled() {
+                eprintln!("sv-icd: t={:.1}s {}", t0.elapsed().as_secs_f64(), self.arena_use());
+            }
+        }
+    }
+}
+
+/// The first of each of these failures is said unconditionally, once.
+///
+/// Each one ends, two layers up, in a `GL_OUT_OF_MEMORY` or a lost device with
+/// nothing in the log that names this ICD (waycompose-design.md §95): Zink's
+/// "vkCreateBuffer failed" carries no result, and the GPU side never learns
+/// that an arena allocation was refused because it never sees one. Once, not
+/// per occurrence, so that a failure in a loop cannot become the output; and
+/// a flag per kind rather than `report_always`'s per-message set, because each
+/// message carries numbers and would otherwise never repeat.
+pub static ARENA_EXHAUSTED_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static SLAB_IMPORT_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static CREATE_BUFFER_FAILED_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Print `msg` the first time `flag` is seen clear.
+pub fn say_once(flag: &std::sync::atomic::AtomicBool, msg: &dyn std::fmt::Display) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("sv-icd: {msg}");
     }
 }
 
