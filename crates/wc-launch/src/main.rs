@@ -709,6 +709,11 @@ mod win {
                 Some(l) => log.say(&format!("rings: {}", l.trim())),
                 None => log.say("SSH FALLBACK: the compositor said nothing about Wayland rings (an older sv-guest.exe?)"),
             }
+        } else {
+            log.say(
+                "SSH FALLBACK: wayland-bell is empty in wc-launch.ini, so the compositor was not asked \
+                 for Wayland rings; the Wayland connections cross the ssh tunnel this session",
+            );
         }
 
         // 3. The host checks the header against the run id. No locate, no root:
