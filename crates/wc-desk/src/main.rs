@@ -54,6 +54,20 @@
 //! It is **not** evidence about the screen: z-order, whether anything is on top,
 //! and whether the monitor is even on are outside it. Where that distinction
 //! matters below, it is stated.
+//!
+//! # No console, so no focus taken (§96)
+//!
+//! A GUI-subsystem program. Started on the interactive desktop by a scheduled
+//! task, a console program gets a console, and on Windows 11 that console is a
+//! Windows Terminal window, which takes the foreground. A fullscreen game
+//! minimises itself when it loses focus (GLFW's `GLFW_AUTO_ICONIFY`), so every
+//! look at a fullscreen Minecraft minimised it, and every test of it measured a
+//! window on the taskbar. Without a console nothing is shown and nothing is
+//! activated. Output still reaches whoever asked: a handle the parent passed
+//! (ssh, `cmd /c ... > file`), the parent's console if it has one, or the file
+//! named by `--stdout FILE`, which is the form for a scheduled task.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() -> std::process::ExitCode {
     imp::main()
@@ -82,6 +96,12 @@ mod imp {
     };
     use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows_sys::Win32::Storage::Xps::PrintWindow;
+    // §96: no console of its own (see the crate's documentation).
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::Win32::System::Performance::{
         QueryPerformanceCounter, QueryPerformanceFrequency,
@@ -153,22 +173,63 @@ usage: wc-desk <command> [options]
                            real input through SendInput, the window rectangle
                            printed before and after each gesture
 
+  --stdout FILE            write both output streams to FILE: wc-desk has no
+                           console (it must not take the foreground from a
+                           fullscreen game, §96), so a scheduled task names one
   --unaware                do NOT ask for per-monitor DPI awareness first.
                            Every command takes it; it is how a capture in real
                            pixels and one in virtualised pixels are told apart.
 "
     }
 
+    /// §96: where this console-less program's output goes. `--stdout FILE`
+    /// takes both streams to FILE (a scheduled task has no other way to hand
+    /// one back). Otherwise a handle the parent passed is used as it is, and
+    /// with none, the parent's console if it has one (a person typing
+    /// `wc-desk windows` into cmd). Rust's standard streams look the handle up
+    /// on every write, so `SetStdHandle` is all it takes.
+    fn output_to(file: Option<&str>) -> std::io::Result<()> {
+        use std::os::windows::io::IntoRawHandle;
+        if let Some(path) = file {
+            let f = std::fs::File::create(path)?;
+            let h = f.into_raw_handle();
+            // SAFETY: a handle this process owns and now never closes.
+            unsafe {
+                SetStdHandle(STD_OUTPUT_HANDLE, h as HANDLE);
+                SetStdHandle(STD_ERROR_HANDLE, h as HANDLE);
+            }
+            return Ok(());
+        }
+        // SAFETY: plain queries; attaching to a console that is not there
+        // fails and changes nothing.
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+        Ok(())
+    }
+
     pub fn main() -> std::process::ExitCode {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut aware = true;
         let mut args: Vec<String> = Vec::new();
-        for a in argv {
+        let mut stdout_file: Option<String> = None;
+        let mut it = argv.into_iter();
+        while let Some(a) = it.next() {
             if a == "--unaware" {
                 aware = false;
+            } else if a == "--stdout" {
+                stdout_file = it.next();
             } else {
                 args.push(a);
             }
+        }
+        if let Err(e) = output_to(stdout_file.as_deref()) {
+            // Nowhere to say it but the exit status.
+            let _ = e;
+            return std::process::ExitCode::from(3);
         }
         let Some(cmd) = args.first().cloned() else {
             eprint!("{}", usage());

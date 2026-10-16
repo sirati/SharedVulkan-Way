@@ -30093,6 +30093,8 @@ configure with the output's size. On Win32 that is the borderless fullscreen
 games use: the style and outer rectangle saved, `WS_POPUP`, the window over the
 monitor's `rcMonitor` (not the work area, so the taskbar is under it), the size
 reaching the client through `WM_SIZE`; `unset_fullscreen` puts both back.
+(96.10: the *placement* is saved and replaced too, since a restore from the
+taskbar goes back to it.)
 Measured: `fullscreen on its monitor (1600x1000 at 0,0)`, F3 `Display:
 1600x1000`, and back to 854x480.
 
@@ -30201,6 +30203,58 @@ not capped.
 3. **vsync pacing on the workstation** (96.7).
 4. **The Wine leg cannot drive a pointer**, so the Win32 half of 96.3 is measured
    by Minecraft under Wine, not by WLCS.
+
+### 96.10 On the guest: a fullscreen game minimises when it loses focus, and the test helper took focus
+
+The user played both games from the deployed launcher. Two reports came back:
+a fullscreen VulkanMod "went to the taskbar and could not be restored", and
+stock Minecraft did the same earlier.
+
+**The minimising is GLFW's, and it is right.** GLFW's `GLFW_AUTO_ICONIFY`
+(default on) minimises a fullscreen window when it loses focus: on Wayland
+`xdgSurfaceHandleConfigure` calls `xdg_toplevel_set_minimized` when a configure
+clears `activated` while the window has a monitor (glfw3-minecraft 3.4,
+`wl_window.c:636`), and GLFW's Win32 backend does the same on Windows. What
+took focus was the test helper: a scheduled task in session 1 starting
+`powershell.exe -WindowStyle Hidden`, which Windows 11 hosts in Windows Terminal
+regardless, so a terminal window came up and took the foreground. Every look at
+a fullscreen game minimised it.
+
+**A real click restores it.** `wc-desk mouse` (SendInput, real input) on the
+game's taskbar button brought the window back and focused. The helper's own
+`ShowWindow(SW_RESTORE)` + `SetForegroundWindow` from a background process
+cannot, because Windows' foreground lock refuses `SetForegroundWindow` from a
+process the user did not just interact with. That is not something to fix.
+
+**What was wrong: the placement.** The restored window came back 1296x768 at
+-8,-8, borderless, with the taskbar showing beneath it: the maximised placement
+it had before F11. `set_fullscreen` had saved and moved only the window's
+rectangle (`GetWindowRect`, `SetWindowPos`). Windows keeps a second answer,
+`WINDOWPLACEMENT` (the normal rectangle and whether the window is maximised),
+and a restore from the taskbar uses that one. Now `set_fullscreen` saves the
+placement and, for as long as the window is fullscreen, sets it to normal (not
+maximised; minimised stays minimised) with the monitor as its normal rectangle
+and without `WPF_RESTORETOMAXIMIZED`. Leaving puts the saved placement back,
+maximised if it was, and a window that is on the taskbar at that moment stays
+there. `rcNormalPosition` is in workspace coordinates unless the window is a
+tool window. That arithmetic is `platform/fullscreen.rs`, pure and tested on
+every target (6 tests: taskbar at the bottom, top and left, a tool window, a
+second monitor, the show states).
+
+**The helpers, for anyone testing a fullscreen application on the guest:**
+
+* **Keys**: `/tmp/wcrun/guest-keys.sh f11 esc e shift+w …` injects through
+  QEMU's virtual keyboard (QMP `input-send-event`). No guest process starts, so
+  nothing takes focus. It refuses the Windows key. The VM has only a PS/2
+  mouse (relative motion), so avoid clicks while a game is fullscreen.
+* **Looking**: `wc-desk` is now a GUI-subsystem program, with no console, so
+  started by a scheduled task it shows no window and takes no foreground.
+  `--stdout FILE` takes its output to a file, which is how a scheduled task
+  gets it back. Started from ssh or `cmd /c … > file` it writes to the handles
+  it was given, and from an interactive console it attaches to that console.
+  Measured on the guest: `wc-desk windows` from the scheduled task with a
+  restored fullscreen Minecraft in front, and the game stayed in front and was
+  not minimised. With the old helper, every run minimised it.
 
 ## 97. The GPU arena becomes one pool: leases instead of slots, and a device carved out of the guest's RAM
 
