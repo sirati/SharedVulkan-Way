@@ -29491,6 +29491,7 @@ the time, whenever it moves by 2 MiB.
 | 300 s, `SV_DEBUG` | 64 MiB | no failure; largest free run down to **2048 KiB** at t=276 s, against the 2112 KiB the first run failed on |
 | 240 s, no `SV_DEBUG` | 64 MiB | `vkAllocateMemory: the arena is exhausted: 2097152 bytes asked for, arena 51040 KiB of 57344 KiB in use in 21 allocation(s), largest free run 1936 KiB, high water 51040 KiB`, then the same fallback |
 | 600 s, `SV_DEBUG` | 256 MiB | no failure, 129 page loads; in use between 42 and 51 MiB for the whole run, high water **53152 KiB** at about 120 s and never higher |
+| 300 s, `SV_DEBUG`, this branch with master 2982bdd merged in (a trial merge, not committed) | 112 MiB, the size 95.6 recommends (98 MiB to the application) | no failure, WebRender throughout, high water 53088 KiB, largest free run never below the 34 MiB of the end; the same run at 64 MiB exhausted again (`53024 KiB of 57344 KiB in use … largest free run 1876 KiB`) and fell back |
 
 At 256 MiB the use rises to a plateau within two minutes and stays there for
 ten, so nothing leaks over this workload; Zink's BO cache gives memory back
@@ -29630,6 +29631,7 @@ next dump.
 | `cargo test --release -p sv-gpu-server -p sv-codegen -p sv-gpu-entry` | all pass |
 | `cargo clippy --release` on the touched crates | no new warnings |
 | `sv-firefox-wayland.sh two-windows`, the runs of 95.2, 95.3 and 95.7 | as tabled |
+| the same on a trial merge with master 2982bdd (not committed; the only conflict is this file's tail) | builds; the tests above pass; 25 x 1 s stalls survived and quit cleanly, 112 MiB passed, 64 MiB exhausted |
 
 The protocol hash is unchanged (`0x403720e574aa9434`), so the ICD and the GPU
 side can be deployed separately.
