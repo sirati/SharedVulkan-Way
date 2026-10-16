@@ -18511,7 +18511,7 @@ without a check the 113 would be back after a few merges.
   reference cannot be followed. This is what fails the check.
 * **ambiguous** — the section number exists twice in the named document, so the
   citation resolves to two places.
-* **unqualified** — `design.md §N` with no directory. In a tree with two design
+* **unqualified** — `docs/design.md §N` with no directory. In a tree with two design
   documents whose names both end in `design.md`, the bare form names neither.
   **748 citations are this**, which is why it is reported and not failed on: a
   check nobody can pass gets disabled, which is §42's other defect.
@@ -18606,7 +18606,7 @@ term  0 of 2   -> FAIL        pres   0 of 500 -> FAIL
 
 ### 48.6 What is not done
 
-1. **The 748 unqualified `design.md §N` citations are untouched.** Mechanically
+1. **The 748 unqualified `docs/design.md §N` citations are untouched.** Mechanically
    resolvable in most cases — the checker prints which document each section
    exists in — but rewriting 748 comments across a tree a dozen agents are
    editing would conflict with all of them. The check reports the count so it
@@ -20595,7 +20595,7 @@ must not hang the run), and a number in a log survives all three.
 ### 58.1 Status in one paragraph
 
 §54.3 left two pieces of residue. Both are closed. The **762 unqualified
-`design.md §N` citations** — the bare form that names neither document in a tree
+`docs/design.md §N` citations** — the bare form that names neither document in a tree
 with two of them — are all qualified, and the checker now **fails** on the form,
 which is the "one line in one place" §54.3 promised. Doing it surfaced something
 the bare form had been hiding: **103 citations name a section their document
@@ -20606,7 +20606,7 @@ citation.
 
 ### 58.2 The rule was the file's own side, and it was right 755 times out of 762
 
-A bare `design.md §N` could mean either document, so the question was whether
+A bare `docs/design.md §N` could mean either document, so the question was whether
 there is a rule that decides it without reading 762 comments. There is, and it
 was checked before anything was rewritten:
 
@@ -29425,6 +29425,514 @@ fault.
    who creates it first. That is a host-local concern, not one the guest can
    reach beyond the session ids, and is unchanged.
 
+## 95. The desktop checks: menus, the clipboard, dialogs and a day's use, on the deployed launcher
+
+Branch `desktop-checks`, 2026-10-16, 11:10–15:11, continued after the VM restart. The checks §91 and §93.8
+left pending, run against the deployed `wcivs` on <guest-user>'s desktop (session 1)
+the way a person starts it: a click on the pinned `Firefox (Linux)` taskbar
+button, at medium integrity. The evidence is in `docs/desktop-checks/`.
+
+### 95.1 Status in one paragraph
+
+**Every multi-step menu works on real Windows.** That includes the one the
+user asked about: Hamburger, Help and Report, About Firefox. So do the clipboard
+in every direction asked for, the GTK dialogs, a second window from a
+maximised one, the pin, a typed URL, scrolling, H.264 video with sound, and
+the ssh fallback. Five bugs were found:
+- **Firefox crashed four times in two hours of ordinary use.** Two causes,
+  found and reproduced locally by a background agent (95.4):
+  - **The lost device:** a short stall of the guest made the ICD declare the
+    GPU side gone. Fixed: the ICD waits 5 s, drops late replies, and gives
+    a slot back when its process exits.
+  - **The arena:** the 64 MiB arena of a GPU session ran out with two
+    windows open. Not fixed here. Larger fixed slots (2 x 112 MiB) were
+    tried on the guest and starved Firefox's parent of a slot at start-up
+    (95.4.10). The user ruled for dynamic allocation on the ivshmem device,
+    which another agent now owns, so the guest keeps 3 x 64 MiB.
+- **A `<select>` dropdown wore a thick black frame**: a translucent
+  subsurface was copied over the page instead of blended. Fixed (95.5).
+- **Windows' caption buttons still vanished after page loads** in a new
+  window: `WM_NCPAINT` painted the caption over the strip §91 clears.
+  Fixed (95.6).
+- **Closing the last window crashed Firefox once**, during shutdown (95.4).
+  Reproduced locally later the same day and found to be ours: the ICD's
+  pipelined present (§88) can still attach a frame to Firefox's `wl_surface`
+  after Firefox has destroyed it. The fix is on branch `quit-crash`.
+- Two harmless log oddities: the audio player's drop counter while the stream
+  is silent, and Firefox's `Broken pipe` warnings on a selection (95.8).
+
+**Still open, waiting on the VM restart:** the last redeploy (3 x 64 MiB with gpu-oom c744796), its desktop check, putting <guest-user>'s clipboard back and deleting this run's history entries. 95.7 and 95.9 say what is deployed until then.
+
+### 95.2 The checks
+
+| check | result | evidence |
+|---|---|---|
+| pin click, cold | window in 4.3 s (CLICK-TO-WINDOW 4269 ms, §94's), 7–13 s on later clicks that restored a crashed session; one button, `– 1 aktives Fenster angeheftet` | `actions.txt` g0, g1b, g4, g5 |
+| start-up clipboard | text copied before the click pasted into the address bar, rings and ssh fallback alike | `guest/g6-paste.png`, g0, g4 |
+| Hamburger → Help and Report → About Firefox | the panel switches to the Help subview; `About Mozilla Firefox` 746x427 opens | `guest/g1b-8b.png` |
+| Hamburger → More tools → Task Manager | the More tools subview; `Process Manager` opens in a tab | `guest/g1b-1b.png` |
+| Bookmarks (menu bar) → a nested folder → an item | the nested popup opens on hover; the item navigates | `guest/g1b-2c.png` |
+| History (menu bar) → Recently Closed Tabs → an item | the submenu opens; the tab comes back | `guest/g1b-3b.png` (history rows masked) |
+| Hamburger → History → Recently closed tabs → an item | the subview; the tab comes back | `guest/g1b-4b.png` |
+| tab context menu → Move Tab → Move to New Window | the submenu; a new window | `guest/g1b-5c.png` |
+| link context menu → Open Link in New Container Tab → Personal | the submenu; a container tab opens (`about:robots` from `about:about`) | `guest/g1b-7c.png` |
+| `<select>` | the list opens, `gamma` sets `SEL:gamma`; **black frame** round the list (95.5) | `guest/g1b-6a.png` |
+| Word → Firefox (COM, `Content.Copy()`) | `TA:` the exact text with ü, ß, ✓; the paste zone saw `text/html,text/plain` | `actions.txt` g2 A |
+| Firefox → Word | `wcdc Word->FF Grüße ✓ 42` in the document; owner `sv-guest` | g2 B |
+| Notepad → Firefox, Firefox → Notepad | both exact; a new Notepad window on a scratch file, closed without saving, the user's restored tab untouched | g2 C |
+| the 6 MB copy, then a small one | `CBIG:true 6291489`, Windows text length 6,401,866 (CRLF); then `wcdc-small after big ✓`; Firefox lived | g2 D |
+| Firefox Copy Image → Windows → Word | `PNG`, `DeviceIndependentBitmap`, `Bitmap`; 128x96 red/blue/white exact; one inline shape in Word | `guest/ffimg.png`, g2 E |
+| Windows picture → Firefox | a .NET `Clipboard.SetImage` bitmap: `image/png` 160x120; Word's picture copy: `image/png` 200x150, colours right | `guest/g5-pasted.png`, g5 B; a first try crashed Firefox (95.4) |
+| ssh fallback (`wayland-bell =` emptied for one session, the ini restored byte for byte) | `SSH FALLBACK: wayland-bell is empty…`, window in 4057 ms; start-up paste, Firefox → Windows, Windows → Firefox all exact | `guest/g6-paste.png`, g6 |
+| caption buttons, maximised and restored, page retitling 10 Hz | visible in 24 of 24 captures | g3a |
+| caption buttons after page loads in a new window | **lost** in 3 of 5 sessions until a later paint (95.6) | `guest/caption-lost-*.png` |
+| GTK dialogs: Open File, Save As, Print | every header-bar button left of Windows' buttons; one close button; dragged by the header bar (138,73 for a 150,80 drag, the move threshold) | `guest/g5-dlg-*-corner.png` |
+| second window from a maximised one | `Ctrl+N` opened maximised, 1296x768 at −8,−8 | `guest/g5-second-top.png` |
+| type a URL, scroll | the long page loaded; 15 notches scrolled cleanly | `guest/g4-scrolled.png` |
+| H.264 with sound | 20 s, 600 frames, 0 dropped; a correct colour test pattern; the launcher's player: `20.0 s of it not silent`, 0 drops and 0 underruns while audible | `guest/g4-video.png` |
+| close everything, session end | `session down` 60 s after the last close, 6 times; once the close crashed Firefox (95.4) | — |
+| Wine, the same menu paths | all pass (tab Move submenu, More tools, History submenus, link submenus, Help → About) | — |
+
+### 95.3 The leftover test string, and the clipboard history
+
+The clipboard did not hold §93's `PRE-SESSION ü 42 wcc-pre` at the start of
+this run: it held 22 characters of something else. It was kept for the run
+(in the agent's memory and DPAPI-encrypted for <guest-user>) and put back at the end
+(pending: the restore waits on the redeploy). Clipboard history is on
+(`EnableClipboardHistory 1`); the entries this run created (16 since 11:10)
+are to be deleted through the WinRT API, and only those, at the end of the
+run (pending).
+
+### 95.4 Firefox on the forwarded GPU: an arena too small, and a guest pause taken for a dead peer
+
+This is the record of the background agent this branch started for the
+crashes (branch `gpu-oom`, merged here). Where it proposes larger fixed
+slots as the arena fix (95.4.6, 95.4.9), that was overtaken: the 2 x 112 MiB
+geometry starved Firefox's parent of a slot on the guest (95.4.10, 95.7), and
+the user ruled that GPU memory be allocated dynamically on the ivshmem device
+instead, which another agent now owns. The ICD and GPU-side fixes stand.
+
+Branch `gpu-oom`, from master `ab009e9`, 2026-10-16. The brief was two Firefox
+crashes on the deployed `wcivs` install. Crash 2 (session 12:34:29 to 12:45:02)
+printed 120 `ZINK: vkCreateBuffer failed`, then `wr_renderer_render:
+OutOfMemory` at t=208.8 s and `Fallback WR to SW-WR`, and at about t=630 s
+`zink: DEVICE LOST!`, `vkCreateSampler failed (VK_ERROR_DEVICE_LOST)` and a
+SIGSEGV in the parent. Crash 1 was an idle Firefox during a screen lock:
+`DEVICE LOST!` and `vkCreateBufferView failed (VK_ERROR_DEVICE_LOST)` 2.3 s after
+the iGPU went from D3 to D0. The GPU side logged nothing either time. Two more
+sessions arrived during the work: wcl-1332 fell back to SW-WR with **no**
+`vkCreateBuffer` failure but ten `zink: couldn't allocate memory: heap=3
+size=2097152`, and later died of the same `vkCreateSampler` DEVICE_LOST while an
+image was pasted.
+
+**Status.** Two causes, both reproduced on this workstation's RADV and both
+ours. The OOM is the 64 MiB arena: Firefox with two windows has a working set
+that fills the application's 56 MiB of it, and the free space fragments below
+one 2 MiB slab (95.4.2). The lost device is the ICD declaring the GPU side gone
+after 150 ms without a heartbeat, which a guest that is not scheduled for that
+long produces with nothing wrong on either side (95.4.3). The ICD now waits five
+seconds, drops a late reply instead of handing it to the next call, frees a
+half-built swapchain, and says once, whatever `SV_DEBUG` says, why it failed a
+call. The GPU side says when its driver returns a lost device or an
+out-of-memory. What the 120 `vkCreateBuffer` failures of crash 2 were is **not
+established** (95.4.4); the next one will say. The arena fix is an ini change on
+the guest (95.4.6); nothing here ran on the guest or on testhost.
+
+#### 95.4.1 Where "ZINK: vkCreateBuffer failed" comes from
+
+Mesa 26.2.4 (the deployed kopper build's source,
+`/nix/store/9s209y4515mm50m7kpxlqc6nji1rw13v-source`) prints it in one place,
+`zink_resource.c:1295`, `create_buffer()`, when `vkCreateBuffer` itself returns
+anything but `VK_SUCCESS`. It is the first Vulkan call of a buffer resource:
+there is no requirements query before it, the result is not printed, and
+`zink_screen_handle_vkresult` is not called, so a `VK_ERROR_DEVICE_LOST` there
+does not even mark the device lost. The memory comes after it, in
+`zink_bo_create`, whose failure prints `zink: couldn't allocate memory: heap=N
+size=M` instead (`zink_bo.c:269`; `heap` is Zink's own heap enum, not a Vulkan
+heap index), after one retry with its slab and BO caches emptied.
+
+So crash 2's 120 lines are a non-success from our `vkCreateBuffer`, and arena
+exhaustion cannot produce them: the ICD's `create_buffer` never touches the
+allocator. They are either the GPU side's forwarded result or a `LowerError`
+(a transport failure, or a lowering error such as `ChainTooLong`), and before
+this section both were silent without `SV_DEBUG`. wcl-1332's
+`couldn't allocate memory` lines are the other path, and that is the one the
+local runs reproduce.
+
+#### 95.4.2 The arena: a working set, not a leak
+
+`scripts/sv-firefox-wayland.sh two-windows SECS` is a new mode of the existing
+harness: weston (pixman, `wl_shm` only), `sv-gpu-server` on RADV, Firefox 157.0.1
+through the ICD and the deployed kopper Mesa, `SVWL_FORCE=wr` (the deployed
+`gfx.webrender.all`). `sv-firefox-soak.py` opens a page that retitles itself ten
+times a second, a second window, sets both to 1280x752 and then 1296x768, and
+tours local pages and three real sites in both windows. At the end it closes
+one window and quits from the other. `SV_DEBUG` now prints the arena's use, with
+the time, whenever it moves by 2 MiB.
+
+| run | arena | result |
+|---|---|---|
+| 300 s, `SV_DEBUG` | 64 MiB (56 MiB to the application, 8 MiB blob reserve) | `the arena is exhausted: 2162688 bytes asked for, arena 48928 KiB of 57344 KiB in use`, `zink: couldn't allocate memory: heap=5 size=2162688` twice, `wr_renderer_render: OutOfMemory`, `Fallback WR to SW-WR`; 25 of 63 compositor samples `WebRender (Software)` |
+| 300 s, `SV_DEBUG` | 64 MiB | no failure; largest free run down to **2048 KiB** at t=276 s, against the 2112 KiB the first run failed on |
+| 240 s, no `SV_DEBUG` | 64 MiB | `vkAllocateMemory: the arena is exhausted: 2097152 bytes asked for, arena 51040 KiB of 57344 KiB in use in 21 allocation(s), largest free run 1936 KiB, high water 51040 KiB`, then the same fallback |
+| 600 s, `SV_DEBUG` | 256 MiB | no failure, 129 page loads; in use between 42 and 51 MiB for the whole run, high water **53152 KiB** at about 120 s and never higher |
+| 300 s, `SV_DEBUG`, this branch with master 2982bdd merged in (a trial merge, not committed) | 112 MiB, the size 95.4.6 recommends (98 MiB to the application) | no failure, WebRender throughout, high water 53088 KiB, largest free run never below the 34 MiB of the end; the same run at 64 MiB exhausted again (`53024 KiB of 57344 KiB in use … largest free run 1876 KiB`) and fell back |
+
+At 256 MiB the use rises to a plateau within two minutes and stays there for
+ten, so nothing leaks over this workload; Zink's BO cache gives memory back
+(the use falls by 6 MiB at a time) and its retry empties it before failing. The
+working set is about 21 allocations: Zink's 2 MiB slabs, and the ICD's own
+swapchain readback buffers, one per swapchain image at the window's full size
+(kopper asks for two, so 1296x768 costs 7.6 MiB a window). At 64 MiB the
+high-water mark is 95 % of what the application gets, and readback buffers of
+several window sizes (4.4 MiB, 3.3 MiB) leave holes no 2 MiB slab fits, so whether
+a run fails is a matter of fragmentation timing: one of two 300 s runs did.
+
+`vkAllocateMemory` used to fail this silently (R11 calls exhaustion "a normal
+condition an application handles", which is true and was the whole of the
+diagnosis). It now says so once with the request, the use, the largest free run
+and the high-water mark. Two leaks on the failure path are also closed: a
+swapchain whose second image could not get its readback buffer kept the first
+one's for the life of the process, and an allocation whose slab the GPU side did
+not import stayed allocated with no handle anyone could free.
+
+#### 95.4.3 The lost device: 150 ms of silence
+
+Every wait the ICD makes on a ring passed a 50 ms liveness interval to
+`wait_until`, which builds its peer-gone window as three intervals. So a GPU side
+whose heartbeat did not move for 150 ms of the ICD's running time was gone, and
+the call returned `VK_ERROR_DEVICE_LOST`. The GPU side beats every 20 ms from a
+thread of its own, but when the guest is not scheduled every one of its threads
+stops, and the ICD, which kept running, has no stall of its own to credit. The
+GPU side's ring threads poll at 200 ms (a 600 ms window) for the same reason
+and judge the app side gone only after `APP_GONE_AFTER`, five seconds (`session.rs`).
+
+`SVWL_STALL_MS=N` makes the harness `SIGSTOP` the GPU side for N ms every
+`SVWL_STALL_EVERY` seconds (default 20) from 30 s on, which is what a paused
+guest looks like from the host.
+
+| build | stalls | result |
+|---|---|---|
+| master (plus the diagnostics) | 400 ms | the second stall, t=51 s: `transport: peer of ring 2 is gone; returning VK_ERROR_DEVICE_LOST`, three `zink: DEVICE LOST!`, `swapchain killed`, `vkCreateImage failed (VK_ERROR_DEVICE_LOST)`, a minidump. The signature of crashes 1, 2 and 3 |
+| this branch | 12 x 400 ms | alive at 243 s, WebRender throughout, no failure line |
+| this branch | 12 x 2000 ms | alive at 245 s, WebRender throughout, no failure line |
+| this branch | 25 x 1000 ms, every 10 s | alive at 302 s, WebRender throughout, no failure line, then a clean quit |
+
+The window is now `PEER_GONE_AFTER`, five seconds, for every ICD wait, through one
+helper (`wait_for_peer`) and a new `sv_transport::park::wait_until_gone_after`
+that takes the window separately from the poll interval.
+
+A second defect made a lost device worse than it had to be. A call that gave up
+left its command on the ring, and a GPU side that was only slow answered it
+later. The next call read that reply, saw the wrong sequence number and failed
+with `Shape("a reply arrived out of order")`, leaving its own reply for the call
+after it, so every later call on that ring failed for the rest of the process.
+A reply older than the call's own sequence number is now dropped.
+`transport::abandoned_calls` stops a fake GPU side's heartbeat for twice the
+window before it answers: the first call is `DeviceLost`, the second gets its own
+reply. Without the fix the second call fails.
+
+#### 95.4.4 What crash 2's vkCreateBuffer failures were
+
+Not established. By 95.4.1 they were a failed `vkCreateBuffer` from the ICD, and
+three things could produce it: the Intel driver's own result (forwarded
+unchanged, and until now not logged by the GPU side), a transport failure
+(printed only under `SV_DEBUG`), or a lowering error. The ring desynchronisation
+of 95.4.3 would fail every call on the device ring, `vkCreateImage` and
+`vkCreateSampler` with it, and crash 2's log has only `vkCreateBuffer` failures
+until t≈630 s, so it is the least likely of the three. The next occurrence will
+name its layer:
+
+* the ICD says the first `vkCreateBuffer` result the GPU side refused, with the
+  size, the usage and the arena's use;
+* the ICD says the first transport failure of each kind and the first lowering
+  failure of each kind (`a call failed in this ICD: …`), unconditionally;
+* the GPU side says, once per command and result, when its driver returns
+  `VK_ERROR_DEVICE_LOST`, `VK_ERROR_OUT_OF_DEVICE_MEMORY` or
+  `VK_ERROR_OUT_OF_HOST_MEMORY` (`sv-gpu-server: the driver returned … from …`).
+  The generated dispatch calls a new `GpuHost::note_driver_error` after every
+  driver call that returns a `VkResult`; the hand-written `vkCreateBuffer`,
+  `vkCreateImage` and `vkAllocateMemory` call it too.
+
+#### 95.4.5 Crash 1: what can be said
+
+The old ICD returned `VK_ERROR_DEVICE_LOST` for a ring wait that saw 150 ms of
+heartbeat silence, a call that took over 10 s (`CALL_TIMEOUT`), a ring the GPU
+side marked fatal, or a GPU side that restarted. The last two leave a line in
+the GPU side's log, and it had none. The driver itself could also have returned
+it, and the old GPU side would have forwarded that silently. 95.4.3 shows that the
+first produces this exact signature, and a guest that stalls while its
+passed-through iGPU changes power state, 2.3 s before the failure, is the kind of
+pause that triggers it. So the likeliest reading is the ICD's window, which this
+branch widens to five seconds. If the next occurrence instead logs `the driver
+returned VK_ERROR_DEVICE_LOST`, Intel's driver lost the device across D3, and
+neither side can repair that: a lost `VkDevice` stays lost, its objects with it.
+Surviving it would be Firefox's job (a robust context and a renderer reset; it
+crashed instead), and avoiding it would mean keeping the iGPU out of D3 while a
+GPU session is open, either by a power setting on the guest or by
+`disable_idle_d3` on the host's vfio-pci. Neither was tried.
+
+#### 95.4.6 The geometry, and what it costs
+
+The GPU arena is a 256 MiB ivshmem device cut into `gpu-sessions` slots of
+16 MiB control plus `gpu-arena-mib` arena (§87.2). `sv-hostd` takes each slot's
+geometry from the guest's extent, so the split is the guest's ini alone.
+
+| ini | slots | arena a session | application's share | against the 53 MiB measured |
+|---|---|---|---|---|
+| `gpu-sessions = 3`, `gpu-arena-mib = 64` (deployed) | 3 x 80 MiB | 64 MiB | 56 MiB | 95 %, fails |
+| `gpu-sessions = 3`, `gpu-arena-mib = 69` | 3 x 85 MiB | 69 MiB | 61 MiB | 87 % |
+| `gpu-sessions = 2`, `gpu-arena-mib = 112` | 2 x 128 MiB | 112 MiB | 98 MiB | 54 % |
+| a 384 MiB device, `gpu-sessions = 3`, `gpu-arena-mib = 112` | 3 x 128 MiB | 112 MiB | 98 MiB | 54 %, and 128 MiB more host RAM |
+
+The second row is not a fix. The third is the one this section recommends: it
+costs no host memory and gives up the third concurrent session, which §87.2 kept
+for `glxtest`, the browser and an RDD or a restart. `glxtest` exits before the
+browser asks for its slot, and a slot comes back when its session ends, so two
+cover the browser and its video decoder. The fourth row needs memory testhost
+does not have (244 MB available at crash 2, 412 MB and 723 MB later). Two things
+about the third row are unverified on the guest: that Intel's driver imports a
+112 MiB host pointer as it does a 64 MiB one (§87.3), and that a Firefox start
+never needs a third slot at once.
+
+#### 95.4.7 The quit crash
+
+A session on the deployed build (wcl-2652) crashed when its last window closed,
+in `xpcom-shutdown-threads`, and the crash reporter deleted the minidump. Here, a
+two-window session that ends by closing one window and quitting from the other
+exited 0 with no minidump in three 60 s runs and in a 300 s run at 64 MiB
+and in a 300 s run with 25 one-second stops of the GPU side. It is not
+reproduced. Closing the *last* window over WebDriver
+leaves this Firefox running with no window, so the harness quits through
+`Marionette:Quit`, which takes the same shutdown path but not the same click.
+`MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in the launcher's environment would keep the
+next dump.
+
+#### 95.4.8 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --release -p sv-transport -p sv-arena -p sv-icd -p sv-icd-entry` | all pass; new: `park::a_silence_shorter_than_gone_after_is_slow_not_gone`, `transport::abandoned_calls::a_late_reply_to_an_abandoned_call_is_not_the_next_calls_answer` (fails without the fix) |
+| `cargo test --release -p sv-gpu-server -p sv-codegen -p sv-gpu-entry` | all pass |
+| `cargo clippy --release` on the touched crates | no new warnings |
+| `sv-firefox-wayland.sh two-windows`, the runs of 95.4.2, 95.4.3 and 95.4.7 | as tabled |
+| the same on a trial merge with master 2982bdd (not committed; the only conflict is this file's tail) | builds; the tests above pass; 25 x 1 s stalls survived and quit cleanly, 112 MiB passed, 64 MiB exhausted |
+
+The protocol hash is unchanged (`0x403720e574aa9434`), so the ICD and the GPU
+side can be deployed separately.
+
+#### 95.4.9 What to deploy, and what to check
+
+1. **testhost, `~/wc-launch-ivs/bin/libsv_icd.so`**: this branch's release
+   build. It is the liveness window, the stale-reply fix, the swapchain cleanup
+   and the ICD's diagnostics, and needs nothing on the guest.
+2. **The guest, `sv-guest.exe`**: this branch's release build for
+   `x86_64-pc-windows-gnu`, for the GPU side's driver-error lines. It changes no
+   behaviour.
+3. **The guest's `wc-launch.ini`**: `gpu-sessions = 2` and `gpu-arena-mib = 112`
+   (95.4.6).
+4. Then check, in this order: the GPU process's first line says `2 session
+   slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`; Firefox starts on the
+   GPU (about:support `Compositing: WebRender`, a `sv-icd: connected` line in
+   `app.log`); a video plays, so that the RDD process has its session beside the
+   browser's; the crash-2 workload (two windows, a retitling page, a maximise,
+   ten minutes of use) leaves `app.log` with no `couldn't allocate memory`, no
+   `OutOfMemory` and no `sv-icd: … returning` line; and a screen lock of an hour
+   with Firefox open ends with Firefox alive. If anything fails, the lines of
+   95.4.4 say which layer.
+
+#### 95.4.10 Two slots and Firefox's start: a slot held five seconds after its process exits
+
+The deploy of 95.4.9 (gpu-oom merged with master, `gpu-sessions = 2`,
+`gpu-arena-mib = 112`) showed that Intel's driver takes the 112 MiB import
+(`2 session slot(s) of 128 MiB (16 MiB control + 112 MiB arena)`), and that two
+slots broke Firefox's start. Sessions 1 and 2 (367 and 11 commands) held both
+slots. Clients 3 to 6 were refused (`all 2 GPU session slots are taken`). The
+browser process was among them, so it had no `libsv_icd.so` mapped and drew on
+llvmpipe.
+
+**A slot outlived its process by five seconds.** `RingTransport::shutdown`
+sets the control region's `SHUTDOWN` flag, which the GPU side's ring threads
+check every 50 ms, and nothing called it. So the GPU side learned that a
+session was over only when its heartbeat had been silent for `APP_GONE_AFTER`.
+Measured with `scripts/sv-slot-release.sh`: `vulkaninfo` exits and its session
+ends 5156 ms later. Firefox's `glxtest` exits and the browser asks for its slot
+well inside that time. **And a refused ICD gave up at once**, for the life of
+the process.
+
+Two changes, both in the ICD:
+
+* At exit the ICD sets `SHUTDOWN` on every control region it attached (an
+  `atexit` handler, `transport::arm_goodbye`). The same measurement: the
+  session ends 67 ms after `vulkaninfo` exits.
+* A connection refused because every slot is taken waits for one, retrying
+  every 250 ms. The budget is 10 s for the process as a whole, kept in
+  `$TMPDIR/sv-icd-slot-wait-<pid>`, because the loader loads the ICD up to
+  three times in one process and a refused load leaves nothing loaded to
+  remember the wait. The refusal reaches the ICD only as text through
+  `sv-hostd`, so it is matched by the guest's words
+  `GPU session slots are taken`. Any other refusal fails at once, as before.
+
+`sv-gpu-server serve --slots N` refuses past N concurrent sessions with the
+guest's message. It reads the client's `AttachRequest` first, as `sv-hostd`
+does, so that the refusal does not race the client's write. This is how the
+fixed slots were measured here.
+
+| `scripts/sv-slot-release.sh` (one slot) | before | after |
+|---|---|---|
+| `vulkaninfo` exits; its session ends | 5156 ms later | 67 ms later |
+| a holder is SIGKILLed (no `atexit`); a second client asks at once | refused at once, no GPU | served after 5.3 s (`sv-icd: got a GPU session slot after 5.3s`) |
+| the holder stays; a second client asks | refused at once | refused after 10070 ms in total |
+
+| `sv-firefox-wayland.sh two-windows`, `SVWL_SLOTS=1`, 112 MiB | result |
+|---|---|
+| before | the guest's failure exactly: four `sv-icd: refusing to load rather than answering locally`, the browser with `libsv_icd.so` unmapped, `ZINK: vkCreateInstance failed (VK_ERROR_INCOMPATIBLE_DRIVER)`, no GPU-side submission after `glxtest` |
+| after, 3 runs | the browser connected at the first attempt (`glxtest`'s slot was already back); submissions in every window, a clean quit |
+
+Locally Firefox 157 opens two sessions at start (`glxtest`, then the browser),
+with or without the deployed Vulkan-decode prefs (`SVWL_VULKAN_DECODE=1`). The
+guest's 11-command session is not reproduced here. If it belongs to a process
+that stays alive, two slots leave nothing for a third (a video decoder, or a
+restart that overlaps), and that process waits 10 s and then runs without the
+GPU.
+
+**The 69 MiB alternative.** Three slots of 16 + 69 MiB fill 255 of the 256 MiB.
+Four 300 s two-window runs at a 69 MiB arena passed with no allocation failure.
+The application's share is 60.4 MiB against the 53 MiB high water of 95.4.2, so
+88 %, against 95 % at 64 MiB, where one run in two failed. That is less margin
+than four runs can prove.
+
+### 95.5 Bug, fixed: the `<select>` dropdown's black frame
+
+On the guest the open list of a `<select>` had a thick black frame with black
+showing outside its rounded corners (`guest/g1b-6a.png`). The compositor's
+log had no popup for it, only `wl_surface created`. Traced against the Linux
+build with `WAYLAND_DEBUG`: GTK makes the dropdown a `wl_subsurface` of the
+window (`wl_subcompositor.get_subsurface` after the click), not an `xdg_popup`
+as every menu is. Its buffer has a transparent margin for the shadow.
+
+`Shadow::compose` copied every surface of a window's tree onto the canvas. Its
+own note (stage 9) said a copy was right until a translucent subsurface
+arrived, and that it would then show as a hard edge. That is what happened: the
+margin's premultiplied (0,0,0,0) replaced the page under it.
+
+**The fix.** The root of a tree is still copied. Every later surface goes
+through `Shadow::compose_over`, a premultiplied "over"
+(`dst = src + dst·(1 − α)`):
+- an `Xrgb8888` source is copied, since its fourth byte is padding;
+- a row that is all opaque is copied, which is every row of Firefox's content
+  subsurface, so the common frame costs one scan of the alpha bytes more than
+  before;
+- a tree whose bounds reach past the root starts from transparent, not from
+  the last frame.
+
+**Proof.** The same page and click against the Linux compositor, before and
+after (`select-linux-before.png`, `select-linux-after.png`, `select-run.sh`):
+the black frame is gone and the page shows round the corners. Three unit tests
+pin the blend, the XRGB copy and the opaque case. Under Wine the dropdown has
+no frame and `gamma` still sets the value. On the guest: 95.7.
+
+### 95.6 Bug, fixed: the caption buttons, a third time
+
+§91.5 stopped `DefWindowProc` painting the caption over the folded button strip
+on `WM_SETTEXT`, `WM_SETICON` and `WM_NCACTIVATE`. In this run the glyphs still
+vanished, but differently:
+- **Not on title changes.** 24 captures with the page retitling 10 times a
+  second, restored and maximised: all visible.
+- **Not on activation or caption-colour changes.** 8 captures while switching
+  the foreground between two windows, with the colour animating: all visible.
+- **After a page load in a window that had just been created**, in three
+  sessions (`caption-lost-g0-test.png`, `caption-lost-g4-long.png`), and back
+  after a later scroll (`caption-back-g4-scrolled.png`). The same loads in an
+  older window: 20 captures, all visible.
+
+The pixels say who painted. Where the glyphs should be, a lost capture holds
+one colour, (40,29,68): Firefox's own tab-strip pixel. A good capture shows
+DWM's caption colour (41,30,69) behind the glyphs. So the strip had been
+painted opaque from outside `WM_PAINT`, whose blit always clears it inside its
+update region.
+
+**The fix.** `WM_NCPAINT` is the general form of what §91 handled for three
+messages. A folded toplevel still needs the default handler for its frame, so
+after it the strip is invalidated again. `present()` also adds the strip to
+every frame's invalidation, so anything else that paints there lasts until the
+client's next frame at most. That is one 146x31 blit and fill per frame,
+inside a paint that is happening anyway. Under Wine (fallback buttons) the
+window and its buttons are unchanged. On the guest: 95.7.
+
+### 95.7 On the guest after the deploys
+
+Two deploys of `wcivs` from this branch, and a third pending, each `wc-launch.sh deploy` with
+§94's variables after a backup to `C:\Users\<guest-user>\wcivs-backup-95` and
+`~/wc-launch-ivs-backup-95`:
+
+| deploy | what changed | result |
+|---|---|---|
+| 13:47 (`deploy-95.txt`) | the two compositor fixes, with master (§96's ICD and `wc-proxy`); 3 x 64 MiB | 16 passed, 0 failed. Not checked on the desktop: <guest-user>'s session had locked at 13:39 from inactivity |
+| 14:00 (`deploy-95b.txt`) | gpu-oom's ICD and GPU-side fixes (50c5571); `gpu-sessions = 2`, `gpu-arena-mib = 112` | 16 passed, 0 failed; checked below |
+| pending | gpu-oom's slot release (c744796); back to 3 x 64 MiB | waits on the VM restart |
+
+**After the second deploy** (14:02–14:07, a fresh Sonnet agent, `v1` in
+`actions.txt`):
+- **The GPU device:** `2 session slot(s) of 128 MiB (16 MiB control +
+  112 MiB arena)`, so Intel's driver imports a 112 MiB host pointer.
+- **The pin's jump list:** 7 Häufig pages and the three tasks. "Neues
+  privates Fenster öffnen" opened a private window in 6–15 s.
+- **The `<select>`:** no black frame, page round the corners
+  (`guest/v1-select.png`).
+- **The caption glyphs, after page loads in three new windows:** visible in
+  11 of 12 captures. The twelfth, 3.4 s after a load, had lost them, and a
+  capture 50 ms later had them again. Before the fix a loss lasted until
+  something repainted the strip: seconds, and once over a minute.
+- **about:support said Compositing `WebRender`, and WebGL `llvmpipe`.** The
+  parent process had Mesa loaded and not `libsv_icd.so`, so WebRender was
+  drawing on llvmpipe. The GPU side's log explains it: clients 3 to 6 were
+  `refused: all 2 GPU session slots are taken`. That is 95.4.10, fixed in the
+  ICD by gpu-oom c744796, and it is why the geometry went back to three
+  slots.
+
+### 95.8 Two log oddities, not defects
+
+- **The audio player's drop counter.** Every session logs about 434 dropped
+  chunks and 62 underruns per 10 s played. That happens only while the stream
+  is silent: the null sink's monitor then delivers about 15 chunks per burst,
+  the queue holds 8, and the rest are dropped. While the H.264 clip played, the
+  10 s that were all sound had 0 drops and 0 underruns. The counter misleads,
+  and the sound is fine.
+- **`Error writing selection data: Broken pipe`** in Firefox's log, once per
+  copy. A reader closed a selection pipe before Firefox finished writing to it.
+  Every copy arrived whole (95.2).
+
+The grey patch that is in every capture near (104,141) is the capture tool's
+privacy mask over some other process's transparent window that sits above
+ours; `WindowFromPoint` there answers our window.
+
+### 95.9 What is deployed, and the way back
+
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-95` and `~/wc-launch-ivs-backup-95` (the state §94 left), then the two deploys of 95.7; the third is pending |
+| what each deploy copies | `wc-launch.exe`, `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe` and the ini to `C:\Users\<guest-user>\wcivs`; `wc-session`, `wc-proxy`, `wc-arena-host` and `wc-launch` to `~/wc-launch-ivs` (`deploy-95.txt`, `deploy-95b.txt`). Which of them differ from the backup byte for byte is to be hashed at the final redeploy (pending) |
+| `wc-session` | starts applications with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, so a dismissed crash reporter keeps its minidump |
+| deployed now, to be reverted | the 2 x 112 MiB geometry of the 14:00 deploy (95.4.6), which leaves Firefox's parent without a GPU slot (95.4.10). The pending redeploy goes back to 3 x 64 MiB; by the user's ruling the arena is to be allocated dynamically on the ivshmem device instead, by another agent |
+| the guest otherwise | the session-1 agent quit at 14:29. `C:\Users\<guest-user>\wcdc` (its scratch file, captures, and the clipboard kept for the run) stays until the clipboard is put back (pending); the ini's `wayland-bell` restored byte for byte after the fallback session (SHA-256 `2660a039…` before and after) |
+
+**Way back:** copy `wcivs-backup-95` over `wcivs`, and
+`~/wc-launch-ivs-backup-95` over `~/wc-launch-ivs`, with no session up.
+
+### 95.10 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` (master 2982bdd and gpu-oom c744796 merged) | **102 binaries, 2944 passed, 0 failed**, 8 ignored. New here: `a_translucent_subsurface_is_drawn_over_its_parent_not_instead_of_it`, `an_xrgb_subsurface_is_copied_whatever_its_padding_byte_says`, `an_opaque_subsurface_draws_exactly_as_the_copy_did`; gpu-oom's in 95.4.8 |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | 1234 citations resolve to one section |
+| the select, Linux build | `select-run.sh` before and after (95.5) |
+| Wine | the menu paths of 95.2; after the fixes: the window, the fallback caption buttons through a navigation, the select without a frame |
+| `wc-launch.sh deploy` (`wcivs`) | 16 passed, 0 failed, both times (95.7) |
+| privacy | every committed capture is of a private window, a test page, a menu of Firefox's own, a caption corner or a dialog's header bar; a separate check of all 22 found one with two history rows (masked) and slivers of the desktop at the edges (masked) |
+
 ## 96. Minecraft: a pointer that holds still, a window that follows, and three forwarder gaps a game found
 
 Branch `minecraft`, from master `59a6e8e` with `ab009e9` (§94) merged in,
@@ -29693,3 +30201,487 @@ not capped.
 3. **vsync pacing on the workstation** (96.7).
 4. **The Wine leg cannot drive a pointer**, so the Win32 half of 96.3 is measured
    by Minecraft under Wine, not by WLCS.
+
+## 97. The GPU arena becomes one pool: leases instead of slots, and a device carved out of the guest's RAM
+
+Branch `gpu-arena-dyn`, from master `2982bdd` with `gpu-oom` (§95) and
+`minecraft` (§96) merged in, 2026-10-16. The brief: two Firefox windows, or
+Firefox and Minecraft, must fit on the forwarded GPU whenever their total does;
+memory a session frees must be another session's at once; running out must be
+an ordinary `VK_ERROR_OUT_OF_DEVICE_MEMORY` and never a lost device; and every
+byte shared between host and guest stays on the ivshmem device, never a file
+path and never a copy.
+
+### 97.1 Status in one paragraph
+
+The GPU ivshmem device is now **one pool** that every session of the guest's
+GPU process leases from: a control region when a session starts, a blob
+reserve, 4 MiB chunks for small allocations and a lease of its own for
+anything of 1 MiB or more, each lease its own host-pointer import, each given
+back the moment it empties. Fixed slots are gone (`gpu-arena = slots` keeps
+§87's path for a rollback). The device does **not** grow at run time: vfio
+pins every byte of an ivshmem BAR, the host has no RAM to spare, and adding a
+device takes QEMU's monitor, which is root's. Instead the device grows from 256
+to 1024 MiB at the VM's next start, carved out of the guest's RAM (13312 →
+12544 MiB), so the host pins exactly what it pinned before (97.3). Locally, two
+Firefox windows ran on a 256 MiB pool with hardware WebRender throughout, and
+the guest's own code path ran end to end on lavapipe with two applications
+filling the pool at once (97.6). Not yet run on the guest (97.8).
+
+### 97.2 What ran out, measured
+
+§95 measured the crash: the arena (memory types 1–3), not the blob space and
+not device-local memory. Firefox's two-window working set was 42–53 MiB in a
+56 MiB share, and fragmentation finished it: the largest free run fell to
+1.9 MiB, below Zink's 2 MiB slab, with 6 MiB free. §96 then moved every buffer
+an application never maps out of the arena (type 0), which roughly halved
+Firefox's arena use, and measured VulkanMod at more than 240 MiB of mappable
+memory: two 64 MiB staging buffers and its host-coherent pools.
+
+What the pool's own accounting says about the same two-window Firefox on this
+branch (RADV, `serve --pool 256M`, 120 s, the lines `[gpu] pool high water`):
+
+| | |
+|---|---|
+| sessions at start | `glxtest` (2 leases, given back at its end), then the browser |
+| browser, first 30 s | 32.9 MiB leased: blob reserve 8, 2 chunks, 2 dedicated (8.9) |
+| browser, high water | 68.0 MiB leased, of which 24–26 MiB in allocations (`SV_DEBUG`) |
+| largest free block at the high water | 186.6 MiB of 188 MiB free (3 free blocks) |
+
+The gap between 68 MiB leased and 26 MiB used was the first chunk policy
+(8 MiB chunks, a lease of its own from 4 MiB): Zink's slabs here are
+2,310,144 bytes, three fill a chunk and leave 1.4 MiB of it unusable. From
+1 MiB up an allocation now gets its own lease, rounded to the pool's 64 KiB, so
+the waste is at most 64 KiB a slab (97.5).
+
+### 97.3 Growth: decided by what vfio pins, and by the host's RAM
+
+The brief offered three ways to grow past the device; each was measured or
+read before it was chosen or refused.
+
+* **Lazily populated host pages: impossible.** On testhost QEMU's `VmLck` is
+  14024576 kB, which is 13312 + 128 + 256 MiB exactly — the guest's RAM and both
+  ivshmem devices — with `-overcommit mem-lock=off`. That is vfio's type-1
+  accounting: it maps every RAM-backed region into the IOMMU, ivshmem BARs
+  included, and pins every page. Both backing files are fully allocated
+  (`stat` blocks = size). A sparse file buys nothing here. The VM's
+  virtio-balloon is inhibited by vfio for the same reason.
+* **Hot-plugged regions: rejected.** QMP `device_add` works (slots 0x10–0x19,
+  0x1b and 0x1e were free), but each added region is pinned host RAM for as
+  long as it is plugged, and driving QMP takes root on the host. The user
+  rejected a root helper in the launch path. The host's RAM decides it anyway:
+  MemAvailable was 636 MB at 14:27 and **186 MB** at 14:50, because the
+  applications the guest runs live on the host (the minecraft agent's Java was
+  1057 MiB RSS; Firefox is the same kind of process). The host's own baseline is
+  about 1 GB: 280 MiB of service RSS, 450 MiB of kernel (slab 268, page tables
+  42 + 80, stacks) and 230 MiB of page cache. A pinned region would come out of
+  the applications' RAM, and an out-of-memory host kills QEMU first, by size, and
+  QEMU is <guest-user>'s VM. The pool code keeps a regions table (a pool offset is
+  `region << 32 | offset`), so a second device configured at boot needs no
+  change of format; nothing grows while the VM runs.
+* **A larger device at the next VM start: chosen, at no host cost.** The guest
+  had 7.3 GiB of its 12.9 GiB free and 8.7 GiB committed of a 13.75 GiB commit
+  limit. 768 MiB moves from the guest to the device: `memoryMB` 13312 → 12544,
+  `waycomposeArena.gpu.sizeMiB` 256 → 1024 (a BAR is a power of two). QEMU pins
+  13696 MiB before and after. The 1 GiB BAR fits OVMF's 64-bit window, which is
+  at 448 GiB, 2 GiB long, and holds the iGPU's 256 MiB aperture, the GPU device
+  and the arena today; QEMU widens the window to cover what is mapped.
+
+The demand it is sized for: Firefox's three sessions and two windows, about
+130 MiB with today's per-session costs; VulkanMod, more than 240 MiB of
+mappable memory plus a session's start; together about 430 MiB. 512 MiB is the
+smallest device that holds both with almost no room; 1024 leaves room for a
+larger window, video, or a second game.
+
+The change is nix-config branch `testhost-wc-gpu-pool` (56bda9b, on
+6511e8a): system `y0yxfch0…`. Its only difference from the running system
+(`k77fwidz…`, which building 6511e8a here reproduces exactly) is
+`windows-vm.service`'s arguments. It takes effect at the VM's next start, and
+that start must be a planned cold restart right after the switch: a
+hibernation written with 13312 MiB that resumes onto 12544 MiB is discarded by
+Windows. `windows-vm-shutdown` asks qemu-ga for `guest-shutdown` (a full
+power-off) on a plain `systemctl restart windows-vm`, and hibernates only while
+`switch-to-configuration` is running, so the restart goes after the switch has
+exited.
+
+### 97.4 The design: one owner, leases, and a session heap
+
+**The pool** (`sv_arena::pool`) lives in the guest's GPU process, the one
+process that maps the device (its driver gives the BAR to one handle, §87.2).
+It hands out leases at a 64 KiB granule from a TLSF allocator per region and
+keeps an account per session: what it holds, its high water, its refusals.
+Two rules keep one application from stopping the others:
+
+* **A cap per session**: three quarters of the pool, control region excepted
+  (192 of 256 MiB, 768 of 1024). With the cap at the pool less 48 MiB, a second
+  process beside a full one started and then could allocate nothing (97.6).
+* **A reserve for starting**: the last `control + blob reserve` bytes of region
+  0 only take the two leases a session cannot start without. With only the
+  control region allowed in, a process started beside a full one got its rings,
+  was refused its blob reserve, and its ICD refused to load.
+
+**The protocol** is three commands on the existing rings, hand-written in
+`sv_proto::sv` like `svImportArenaSlab`: `svArenaInfo` (asked once at attach,
+carrying the process name for the pool's log; answers fixed or leased),
+`svLeaseArena` (a length and a purpose; answers a pool offset and the memory
+type the lease was imported as, or `VK_ERROR_OUT_OF_DEVICE_MEMORY`) and
+`svReleaseArena`. `WIRE_VERSION` went 2 → 3, so a stale peer is refused at
+attach rather than on its first allocation. The GPU side imports each lease on
+its own (`VK_EXT_external_memory_host`, the same call §87.3 measured on Intel)
+into the session's device, records it in the session's object table, and
+resolves every `(memory, offset)` the application names only inside leases of
+its own. A command blob is read only if it lies in one of the session's
+leases. A release frees the import before the range goes back, so no range is
+another session's while this device still holds it.
+
+**The host** (`sv-hostd ivshmem-serve`) checks a pooled session's control
+region by its stamps as before, and the pool header's nonce (the first 64 KiB
+of the device, `sv_transport::poolhdr`) against the one the `Hello` carries
+(`Locator::IvshmemPool`): a GPU process that restarted, or the wrong file, is
+refused by name. The ICD is handed the device's file **by name** and the
+control region's offset, as §87 did; it reserves the pool's address space and
+maps the file at offset 0, so a pool offset is an offset into one mapping. No
+descriptor crosses (docs/design.md §1a), and nothing is copied: a mapped
+`VkDeviceMemory` is a pointer into the device's pages, as before.
+
+**The session heap** (`sv_arena::heap`) is the app side's allocator, as
+docs/design.md §5.2 always had it. It asks for a lease when nothing it holds fits,
+with the state lock dropped across the round trip, and gives a lease back when
+its last allocation is freed. A dedicated lease goes back at once, a chunk once
+another chunk is already empty. The arena heap the ICD advertises is what the
+session may lease (the cap, or the pool if smaller); the first build advertised
+the address space it reserves, which took the whole size away from the
+device-local heap, and Zink refused every device-local allocation ("can't
+allocate … from heap that's only 0 bytes").
+
+A session's control region is now the layout's size, 8.06 MiB, not §87's
+16 MiB: sixteen rings of two 256 KiB lanes are 8 MiB, and the other half was
+never written. On a pool, a byte a control region does not use is a byte no
+session can lease.
+
+### 97.5 The allocator, and its tests
+
+`sv_arena::tlsf` is a two-level segregated-fit allocator: classes by the top
+set bit of the size and sixteen subdivisions of each, a bitmap per level, free
+lists of physical blocks that merge with both neighbours the moment they are
+freed. A search rounds the request up to the next class, so any block found
+fits. One step the textbook leaves out: when that finds nothing, the request's
+own class is walked, because on a nearly full pool an exact fit just below the
+rounded class is the memory a refusal would leave on the table. Everything is
+in private memory: the allocator never touches the range it manages.
+
+| test | what it holds |
+|---|---|
+| `tlsf::random_sequences_never_overlap_never_leak_and_coalesce` | 40 seeds × 4000 random allocations and frees, 4 KiB and 64 KiB granules: no two live blocks overlap, the used bytes always equal the sum of the live blocks, every invariant (`Tlsf::check`: the blocks tile the range, links agree both ways, no two free blocks touch, every free block is in its class's list and the bitmaps say so) after every step, and one free block of the whole range once everything is freed |
+| `tlsf::firefoxs_churn_keeps_a_two_mib_run_free` | §95's workload replayed (2 MiB slabs and three readback sizes churning at 46 of 64 MiB), and a 2 MiB request always fits |
+| `tlsf::an_exact_fit_below_the_rounded_class_is_found` | the fallback |
+| `pool::random_pool_traffic_never_overlaps_or_leaks` | 20 seeds × 3000 steps of five sessions leasing, releasing and closing while regions are added and removed: no overlap within a region, accounts that balance, a cap never exceeded, and every region one free block at the end |
+| `pool::firefox_and_minecraft_fit_when_the_total_does`, `a_session_cannot_take_the_reserve_or_more_than_its_cap`, `a_draining_region_…`, `closing_a_session_…` | the policies |
+| `heap::random_heap_traffic_through_a_pool_balances` | 16 seeds × 3000 steps of every size through a real pool: allocations inside their lease, never overlapping, and the pool gets every byte back |
+| `heap::two_windows_resizing_never_run_out_and_give_memory_back` | two windows' readback buffers resized every 500 steps among 1280×752, 1296×768 and 1920×1080 while 2 MiB slabs churn, 20000 steps on a 256 MiB pool: never refused, and never more slack than two chunks and a granule a lease |
+| `sv_gpu_server::pool::a_refused_lease_returns_instead_of_hanging` | the first build logged a refusal by re-locking the pool it held (a guard in a `match` scrutinee lives to the end of the `match`) and hung the GPU process on the first full pool; found by 97.6 |
+| Miri, `cargo miri test -p sv-arena --lib -- tlsf pool heap` | 18 passed, no undefined behaviour (the random tests at 1–2 seeds and 250–600 steps under Miri; 3716 s) |
+
+### 97.6 Measured on this workstation
+
+**The guest's code path, end to end** (`scripts/sv-pool-e2e.sh 256`):
+`sv-gpu-server pool-guest` on lavapipe with a 256 MiB file for the BAR (lavapipe
+imports a host pointer into a shared mapping as Intel does; RADV refuses one,
+docs/design.md §5.4), `socat` for the tunnel, `sv-hostd ivshmem-serve`, and the ICD
+mapping the file by name:
+
+| check | result |
+|---|---|
+| two `vulkaninfo` and two `gl-probe` frames on Zink, at once | pass |
+| one process fills the pool with 8 MiB blocks and holds them 8 s | 23 blocks, then `-2` (`VK_ERROR_OUT_OF_DEVICE_MEMORY`); 23 × 8 + the 8 MiB blob lease = the 192 MiB cap |
+| a second process, started beside it, fills with 2 MiB blocks | 11 blocks (22 MiB), then `-2`; neither saw a word of its memory change |
+| each frees half and allocates again | 12 and 6 come back at once |
+| a third process after both | 23 blocks again: the pool came back |
+| lost devices | none |
+| every session's leases and control region given back; the pool at its 64 KiB header at the end | yes |
+
+The same harness found three of this branch's bugs before the guest could:
+the hang above, the reserve that let a session start but not run, and the cap
+that let one session take everything.
+
+**Firefox, two windows, on RADV** (`SVWL_POOL=268435456 sv-firefox-wayland.sh
+two-windows`): 120 s, 26 page loads, WebRender in every compositor sample, no
+failed Vulkan call, a clean quit, `glxtest`'s session given back before the
+browser's started.
+
+| run (this workstation, RADV) | pool | result |
+|---|---|---|
+| Firefox, two windows, 1800 s (`two-windows 1800`) | 256 MiB | **PASS**: 379 page loads, WebRender in all 379 compositor samples, alive at 1801 s, a clean quit, no failed Vulkan call. The browser's leases reached 64.0 MiB within five minutes and stayed there (8 blob reserve, one 4 MiB chunk, 22 dedicated); in use 44–57 MiB; never more than 4 MiB leased and unused (the one spare chunk); 0 refusals |
+| Minecraft 1.21.11 stock (`sv-minecraft.sh run stock`) | 256 MiB | **PASS**; 65.2 MiB leased at most (23 dedicated, the blob reserve), no `couldn't allocate`. On the guest it died after 12 min with `GL_OUT_OF_MEMORY` in a 56 MiB share (§96) |
+| Minecraft with VulkanMod (`run vulkanmod`) | 1024 MiB | **PASS**, 1873 frames; 240.9 MiB leased at most: three 64 MiB buffers, 41 MiB of smaller ones, the blob reserve |
+| Firefox, two windows, one playing a 720p H.264 loop (`SVWL_VIDEO=1`, new), 120 s, three runs | 256 MiB (2), fixed 256 MiB (1) | the video played throughout (`err=none`), WebRender throughout. Quitting crashed (signal 11) in one pooled run and in the fixed-arena run, and was clean in the other pooled run: §95.7's quit crash, which this mode now reproduces here, and which is not the pool's |
+
+So the demands of 97.3 are now measured rather than quoted: a Firefox
+browser session 72 MiB with its control region, stock Minecraft 73, VulkanMod
+249. Firefox and stock Minecraft together fit today's 256 MiB device; VulkanMod
+needs the 1024 MiB one (on 256 MiB it would be refused at its cap, 192 MiB,
+cleanly).
+
+### 97.7 What changed where
+
+| | |
+|---|---|
+| `sv-arena` | `tlsf`, `pool`, `heap` (new) |
+| `sv-proto` | `svArenaInfo`, `svLeaseArena`, `svReleaseArena` |
+| `sv-transport` | `Locator::IvshmemPool`; `poolhdr`; `SharedRegion::reserve`, `map_fixed`, `unmap_fixed` |
+| `sv-gpu-server` | `pool` (the owner, per-lease import), `pool_guest` (the guest's pool path, on Windows and, with a file, on Linux), the three handlers, leases in `Objects`, `serve --pool` for the export path on RADV, `pool-guest` |
+| `sv-hostd` | `check_slot` takes a pooled session |
+| `sv-icd` | `Leased` behind `Backing`, lease on demand in `vkAllocateMemory`, release in `vkFreeMemory`, the pool view, `heap_len` |
+| `wc-launch` | `gpu-arena = pool` (default) or `slots` |
+| scripts | `sv-pool-e2e.sh`, `sv-pool-stress.c`; `SVWL_POOL`, `SVWL_RUNROOT`, `SVMC_GPU_POOL_MIB`, `WC_LAUNCH_GPU_ARENA` |
+| testhost | nix-config `testhost-wc-gpu-pool` (97.3), built, not switched |
+
+### 97.8 The gates
+
+On the branch at the commit that adds this section (master `2982bdd` with
+`gpu-oom` and `minecraft` merged):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 102 binaries, **2967 passed**, 0 failed, 8 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this branch wrote (the remaining ones are `vk-registry`, `wc-handle`, `wc-proxy`, `sv-hostd/qemu.rs`, the generated crates, and `sv-icd/src/state.rs:965` from §95) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | `wc-pool: OK`, `wc-keymap: OK` |
+| Miri, the allocator, the pool and the heap | 18 passed, no undefined behaviour |
+| `sv-testkit`'s citation check (`wc-xref.sh`) | 0 missing, 0 without a directory |
+| `scripts/sv-pool-e2e.sh 256` | PASS (97.6) |
+
+### 97.9 On the guest, today's 256 MiB device
+
+2026-10-16, 16:55–16:59, with the guest lease, in session 0 only (someone may
+have been at the desktop). `wcgpu` updated in place, every replaced file kept
+as `*.pre-pool`: `sv-guest.exe` and `wc-launch.exe` on the guest, with
+`gpu-arena = pool` in its ini; `libsv_icd.so`, `sv-hostd` and `wc-proxy` on the
+host. `sv-guest.exe gpu guest --pool --port 57491 --ivshmem-slot 0x1d
+--sessions 3 --bell org.sirati.svbell.0` started from ssh (session 0); the cold
+path through two ssh forwards; `sv-hostd ivshmem-serve` with the doorbell on
+the host; clients on the host. No Firefox: the host had 1.1 GB available, and
+an out-of-memory host kills QEMU first (97.3).
+
+| check | result |
+|---|---|
+| the device | mapped in 13 ms, 256 MiB, region 0; nonce published; doorbell attached |
+| `vulkaninfo --summary` through the pool | "Intel(R) UHD Graphics", exit 0 |
+| two processes fill the pool at once (8 MiB blocks held 8 s; 2 MiB blocks) | 23 × 8 MiB and 11 × 2 MiB, each then `-2`; nothing either mapped was touched; half freed, half came back at once |
+| a fill after both | 23 × 8 MiB again |
+| every session's leases and control region given back | yes; the pool at its header, `pool 0.1/256.0 MiB`, after the last |
+| VM faults in the journal, lost devices | none |
+
+The numbers are this workstation's to the block (97.6): the cap is 192 MiB
+and the start-up reserve on the guest is one session's start, 16.1 MiB. Two
+log lines were wrong and are fixed: the pool's refusal said "no region has
+2048 KiB free in one block (largest 17984 KiB)" when what refused it was the
+reserve, and `sv-hostd` counted the whole device as "pages checked" for a
+pooled session, where it checks the control region's 2064. The deployed
+binaries still print the old wording.
+
+Not yet run on the guest: Firefox with two windows and a video, and
+Minecraft. Both need the desktop session, and VulkanMod needs the 1024 MiB
+device (97.6).
+
+## 98. Firefox's crash at quit: a frame shown after its surface was gone
+
+Branch `quit-crash`, from `desktop-checks` 8d8c32b, 2026-10-16. The brief: §95.4
+saw Firefox crash once when its last window closed on the guest, and the
+gpu-arena-dyn agent reproduced a crash at quit on the workstation (two windows
+and a video; not caused by its pool). Find the faulting stack, decide whose it
+is, and fix it if it is ours.
+
+### 98.1 Status in one paragraph
+
+**It was ours.** The pipelined present of §88 shows a frame from the
+swapchain's `sv-present` thread, with `attach`, `damage` and `commit` on the
+application's `wl_surface`, after `vkQueuePresentKHR` has returned. Firefox
+destroys that surface before the swapchain: when it closes a window, and at
+quit, where it never destroys the swapchain at all. A frame still in flight
+then marshals on a freed proxy: SIGSEGV twice, and once SIGABRT from glibc's
+futex check, all three in `present::wayland::Surface::put` on `sv-present`
+(98.3). That broke an invariant Mesa writes down and Firefox builds on: a
+Wayland surface is touched only inside the application's own swap call (98.4).
+**A Wayland swapchain now presents on the calling thread**, as Mesa's own WSI
+does; X11 and headless keep the presenter. With the window widened on purpose
+(a 30 ms sleep before the frame is shown), the old order crashed in 4 of 4 runs and
+the new one in none of 6 (98.6). The price is the present's wait back on the
+renderer thread for Wayland frames: at most a frame in a hundred on the
+workstation, still to be measured on the guest, where §88 put it at 3.3 ms (98.7).
+
+### 98.2 The recipe
+
+From gpu-arena-dyn's harness change, taken here without its pool:
+
+```
+SVWL_VIDEO=1 SVWL_VULKAN_DECODE=1 SVWL_FORCE=wr scripts/sv-firefox-wayland.sh two-windows 120
+```
+
+The first window plays a looping 720p H.264 clip for the whole run, so it is
+presenting at 30 fps when the browser quits; the tour runs in the second. With
+`SVWL_EXTRA_ENV=MOZ_CRASHREPORTER_DISABLE=1` the fault leaves a core for
+`coredumpctl` instead of a minidump. It crashed in
+about one run in five here (98.6), and in 2 of 3 for gpu-arena-dyn.
+
+`SVWL_RUNROOT` puts the run directory somewhere other than `/tmp`. The harness
+now starts Firefox with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, and its verdict
+counts minidumps where the crash reporter keeps them, `$HOME`'s
+`Crash Reports/pending`, as well as in the profile. Before, a crash at quit with
+the reporter on read "exit 11, 0 minidump(s)" with the dump sitting in
+`pending` (checked with the widened window of 98.6), and no core either,
+because the reporter handles the signal.
+
+### 98.3 What the stacks and the protocol say
+
+`docs/quit-crash/stacks.txt` has the crashing thread and the main thread of all
+three cores. The crashing thread is always `sv-present` (abridged, innermost
+first):
+
+```
+arg_count_for_signature        (libwayland-client)  <- in one; __pthread_mutex_lock in the other two
+wl_closure_init, wl_closure_marshal
+wl_proxy_marshal_array_flags   (libwayland-client)
+sv_icd::present::wayland::Surface::put
+sv_icd::wsi::finish_present
+sv_icd::wsi::Presenter::start::{closure}
+```
+
+In two of the three the main thread is deep in shutdown
+(`QuotaManager::Observer::Observe` from `nsXREDirProvider::DoShutdown`); in the
+third it is running JavaScript. In the one core searched for it, no thread was
+in WebRender's renderer or in Zink. Both fault
+sites read through the proxy: the message signature in one, the display's mutex
+in the other. That is what a freed `wl_surface` proxy looks like.
+
+To see the order, a temporary build of the ICD logged swapchain creation and
+destruction, `vkDestroySurfaceKHR`, and each present's queueing, start and end,
+with the thread; `WAYLAND_DEBUG=client` logged every request. Both go to
+Firefox's stderr, so they interleave in time. The run that crashed
+(`docs/quit-crash/protocol-crash.txt`, times UTC):
+
+| time | thread | what |
+|---|---|---|
+| 50.379800–.379852 | Firefox | the toplevel destroyed; `wl_surface#23` (Firefox's surface for EGL) unmapped with `attach(nil)` and committed |
+| 50.413301 | `sv-present` | our attach and commit of the previous frame on `#23` |
+| 50.413858 | renderer | `vkQueuePresentKHR` on swapchain `0xe91`, image 1, returns |
+| 50.413877 | `sv-present` | starts that present: the wait for the copy |
+| 50.415026, .415106 | Firefox | `wp_viewport#26.destroy()`, `wl_surface#23.destroy()` |
+| | `sv-present` | `Surface::put` on `#23`: "The futex facility returned an unexpected error code", SIGABRT |
+
+The run before that frame took 50 ms from start to commit (`.363887` to
+`.413319`), so a present may be in flight for far longer than the 1.2 ms the
+crash needed.
+
+A run that quit cleanly (`docs/quit-crash/protocol-clean.txt`) shows the same
+order without the bad luck, and shows that closing an ordinary window has it
+too: `wl_surface#46.destroy()` at .130606, then `vkDestroySwapchainKHR` for its
+swapchain at .130791. For the last window, `wl_surface#23` is destroyed and
+swapchain `0x1005` never is; the process ends with it alive.
+
+### 98.4 Whose fault, and why only the call itself is safe
+
+Firefox destroying the surface before the swapchain breaks Vulkan's rule that a
+native window outlives its swapchain. But Firefox and Mesa between them
+guarantee something narrower, and both write it down:
+
+- **Firefox** takes `WaylandSurfaceLock` around `SwapBuffers()`
+  (`gfx/webrender_bindings/RenderCompositorEGL.cpp`: "Rendering on Wayland has
+  to be atomic (buffer attach + commit) and wayland surface is also used by
+  main thread so lock it"), and `~WaylandSurface`, which destroys the
+  `wl_surface`, asserts the surface is not locked
+  (`widget/gtk/WaylandSurface.cpp`).
+- **Mesa's Zink** presents synchronously on Wayland, inside the swap
+  (`src/gallium/drivers/zink/zink_kopper.c`, 26.2.4, at `cdt->async`): "Wayland
+  EGL has a driver invariant which requires that any `wl_surface` …
+  calls happen inside the client's call to eglSwapBuffers(). Submitting surface
+  messages after eglSwapBuffers() returns causes serialization issues with the
+  Wayland surface protocol and can lead to the compositor booting the app. This
+  means we can't do async submit on Wayland."
+
+So `vkQueuePresentKHR` runs inside `eglSwapBuffers`, which runs inside
+Firefox's lock, and nothing may touch the surface after it returns. §88's
+presenter was the one link that did.
+
+**No later check can make an asynchronous frame safe.** Libwayland gives a
+client no notice that another part of the program destroyed a proxy. A proxy
+*wrapper*, made while the surface is alive, would stop the use-after-free,
+because marshalling through it never reads the application's proxy. But the
+request would still name object id 23 after the compositor had deleted it:
+`invalid object`, a protocol error that ends the connection. Or, once the id
+is reused, the request goes to whatever object now has it. Either is worse
+than the crash.
+
+### 98.5 The fix
+
+`crate::wsi::pipelines(target, SV_PRESENT_SYNC)` decides whether a new
+swapchain gets a presenter: not on a Wayland surface; yes on X11, whose frames
+go out on a connection of our own by a window id whose death is an error that
+connection ignores (`present::x11`), and on headless. `SV_PRESENT_SYNC=1` still
+presents everything on the calling thread. `SV_PRESENT_SYNC=0` now also
+pipelines Wayland, to measure what that is worth, and brings the crash back.
+
+Regression test: `wsi::tests::a_wayland_present_is_finished_before_vk_queue_present_returns`.
+It fails on the old rule (Wayland pipelined), which was checked by putting the
+old rule back. Two more tests pin X11, headless and `SV_PRESENT_SYNC`. Nothing
+else changed: the synchronous path is the one §88 kept for comparison.
+
+### 98.6 The runs
+
+Every run is the recipe of 98.2, 120 s. A run counts only if Firefox stayed on
+hardware WebRender to the end. Seven did not: the harness's 64 MiB arena ran out
+(§95.4) and Firefox logged `Fallback WR to SW-WR`, after which its frames no
+longer go through this ICD's present. All seven quit cleanly, and every crash
+came from a run that had not fallen back.
+
+| build | runs that count | crashed at quit |
+|---|---|---|
+| before, as deployed | 4 | **2** (SIGSEGV, SIGSEGV) |
+| before, with the logging of 98.3 | 8 | **1** (SIGABRT, run p) |
+| before, by `SV_PRESENT_SYNC=0`, crash reporter on | 2 | 0 |
+| **after** | 9 | **0** |
+| before, by `SV_PRESENT_SYNC=0`, and a 30 ms sleep before the frame is shown | 4 (2 on a 64 MiB arena, 2 on 256 MiB) | **4** (SIGSEGV, SIGSEGV, SIGABRT, SIGSEGV) |
+| **after**, and the same 30 ms sleep, which now happens inside `vkQueuePresentKHR` | 6 (2 on 64 MiB, 4 on 256 MiB) | **0** |
+
+The first three rows say the crash comes in about one run in five (3 of 14), so
+9 clean runs after the fix would still happen by luck about one time in eight.
+The last two rows settle it. The sleep (a temporary build, not committed) holds
+each frame back before its `attach` and `commit`. Pipelined, that only widens
+the window between `vkQueuePresentKHR` returning and the frame reaching the
+surface, and Firefox crashed in `Surface::put` on `sv-present`, the same stack
+as 98.3. After the fix the same sleep runs inside Firefox's swap, under its
+lock, so Firefox waits for it before destroying the surface.
+
+### 98.7 What it costs
+
+On the workstation, `scroll` mode (40 wheel steps, three rounds), Firefox on
+Zink on this ICD on RADV:
+
+| | after (synchronous) | before (`SV_PRESENT_SYNC=0`) |
+|---|---|---|
+| scroll fps, no frame trace | 60.3, 60.2, 60.3 (p99 17.7, 17.7, 17.4 ms) | 60.2, 60.1, 60.2 (p99 18.9, 18.7, 18.9 ms) |
+| scroll fps, frame trace on | 59.6, 59.5, 59.5 (p99 20.4, 20.5, 20.4 ms) | 60.3, 60.0, 60.2 (p99 18.2, 18.7, 18.2 ms) |
+| present on the renderer thread, median | 5.2 ms (fence wait 4.96, `wl_shm` put 0.28) | 0.01 ms |
+| Firefox between presents, median | 11.1 ms | 16.7 ms |
+
+Here the renderer thread's 11 ms of its own work plus the 5 ms wait still fit in
+a 16.7 ms frame, so the rate holds; with the trace on (more work per frame) it
+slips by about one frame in a hundred. On the guest §88 measured the wait and
+the copy at 2.0 and 1.2 ms, and the scroll there reached 60 fps only with every
+change of §88 in place. **The guest's number has to be measured** (ssh was down
+while this was written): `wc-launch.sh` deploys with `SV_PRESENT_SYNC` unset,
+and the same scroll run with and without `SV_PRESENT_SYNC=0` in `gpu.env` is
+the comparison. If it costs frames there, the way to win them back without the
+crash is to make the wait shorter, not to move it off the calling thread: for
+example, a `wl_shm` pool on the arena itself, which removes the 1.2 ms copy.
+
+### 98.8 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 102 binaries, 2946 passed, 8 ignored; the one failure was the citation check, run before this section existed |
+| `cargo test -p sv-icd` after the last change | 34 passed, 0 failed |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in `wsi.rs` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| the citation check (`design_citations`) | passes: 0 missing, §98's included |
+| the recipe, 120 s, after the fix | 9 runs that count, 0 crashes; 6 more with the window widened, 0 crashes (98.6) |

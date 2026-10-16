@@ -47,7 +47,7 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/shar
 # nixpkgs, which is the one the system Firefox comes from, so both load one
 # libwayland-client. `SVWL_KOPPER_MESA=none` measures stock Mesa instead.
 KOPPER_MESA=${SVWL_KOPPER_MESA:-}
-if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = probe ]; }; then
+if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = two-windows ] || [ "$MODE" = probe ]; }; then
   KOPPER_MESA=$(nix build --no-link --print-out-paths --impure --expr \
     "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
@@ -56,7 +56,8 @@ fi
 if [ -n "$KOPPER_MESA" ] && [ "$KOPPER_MESA" != none ]; then
   export __EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json
 fi
-RUN=$(mktemp -d /tmp/svwl-XXXXXX)
+# `SVWL_RUNROOT`: where the run directory goes. Large; keep it off a small /tmp.
+RUN=$(mktemp -d "${SVWL_RUNROOT:-/tmp}/svwl-XXXXXX")
 FIREFOX=${SVWL_FIREFOX:-$(command -v firefox)}
 EGLINFO=${SVWL_EGLINFO:-/nix/store/29kh8r89yqgg1ndmfybh1wafjzichp2g-mesa-demos-9.0.0/bin/eglinfo}
 DPPX=${SVWL_DPPX:-0.4}
@@ -64,6 +65,8 @@ DPPX=${SVWL_DPPX:-0.4}
 # what this harness always ran with; Firefox in use outgrows it (docs/design.md
 # §0.27), and 256 MiB is `sv-icd`'s default and `sv-cts.sh`'s.
 ARENA=${SVWL_ARENA:-$((64 << 20))}
+# `SVWL_POOL=BYTES`: every GPU session leases from one pool of this size instead
+# of getting `ARENA` of its own (waycompose-design.md §97), as on the guest.
 XDISPLAY=${SVWL_XDISPLAY:-:78}
 # This machine has Mesa and its ICDs in `/run/opengl-driver` but no
 # `libvulkan.so.1` on the default search path, so both the GPU side and Zink
@@ -116,6 +119,16 @@ user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("toolkit.telemetry.enabled", false);
 user_pref("layout.css.devPixelsPerPx", "$DPPX");
 PREFS
+# `SVWL_VULKAN_DECODE=1`: the three prefs `wc-session` writes on the deployed
+# install (waycompose-design.md §95.10). With them Firefox starts more processes
+# that open a GPU session at start-up, which is what two slots ran out of.
+if [ "${SVWL_VULKAN_DECODE:-0}" = 1 ]; then
+  cat >>"$RUN/profile/user.js" <<PREFS
+user_pref("media.hardware-video-decoding-vulkan.enabled", true);
+user_pref("media.hardware-video-decoding-vulkan.force-enabled", true);
+user_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);
+PREFS
+fi
 
 # ------------------------------------------------------------- compositor ---
 # Two servers, one socket name. `weston` is the control this file was written
@@ -213,14 +226,14 @@ say "sv-gpu-server on this machine's RADV"
 # (docs/design.md §0.29 ran `VK_LAYER_LUNARG_api_dump` this way). Word-split,
 # never evaluated.
 read -r -a GPU_ENV <<<"${SVWL_GPU_ENV:-}"
-if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = two-windows ]; then
   # **What the GPU side executed, per half minute.** `SV_TRACE` prints every
   # command; a five-minute browser run is millions of lines, so they are
   # counted here rather than kept. A window with queue submissions in it is a
   # window in which something in Firefox rendered through this driver, which
   # about:support cannot say: its GPU rows come from the `glxtest` probe, not
   # from the context WebRender actually made.
-  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 \
+  ( env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" SV_TRACE=1 "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} ${SVWL_POOL:+--pool $SVWL_POOL} \
       --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 240)) 2>&1 &
     echo $! >"$RUN/gpu.pid"; wait ) \
     | gawk -v out="$RUN/gpu-trace.txt" '
@@ -243,7 +256,7 @@ if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ]; then
   for _ in $(seq 1 40); do [ -s "$RUN/gpu.pid" ] && break; sleep 0.25; done
   KIDS+=($(cat "$RUN/gpu.pid"))
 else
-env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
+env "${GPU_ENV[@]}" VK_DRIVER_FILES="$GPU_ICD" "$BIN/sv-gpu-server" serve --clients 16 ${SVWL_SLOTS:+--slots $SVWL_SLOTS} ${SVWL_POOL:+--pool $SVWL_POOL} --arena "$ARENA" --socket "$RUN/gpu.sock" --idle $((SECS + 60)) \
   >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 fi
@@ -332,7 +345,7 @@ if [ "$MODE" != x11 ] && [ "$MODE" != soak-x11 ]; then
   say "Mesa for the Wayland platform: ${KOPPER_MESA:-none} (LIBGL_KOPPER_DRI2=${LIBGL_KOPPER_DRI2:-unset})"
 fi
 
-if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = scroll ]; then
+if [ "$MODE" = soak ] || [ "$MODE" = soak-x11 ] || [ "$MODE" = scroll ] || [ "$MODE" = two-windows ]; then
   # **Firefox in use, for SECS, on the forwarded driver** (docs/design.md
   # §0.27). `sv-firefox-soak.py` drives it through Marionette: a tour of local
   # pages and real sites, wheel-scrolled, with a WebGL page whose frames are
@@ -378,6 +391,35 @@ const x = c.getContext('2d'); let t = 0;
   x.fillStyle='hsl('+((i*7+t)%360)+',80%,50%)'; x.fill(); } requestAnimationFrame(f); })();
 </script>
 HTML
+  # The page from the guest session that ran out of buffers (waycompose-design.md
+  # §95): its title changes ten times a second, so the tab strip and the window
+  # title redraw continuously, and a little text below it does too.
+  cat >"$RUN/pages/retitle.html" <<'HTML'
+<!doctype html><title>sv retitle</title><style>body{font:16px sans-serif;margin:2em}</style>
+<h1 id=h>0</h1><div style="height:3000px;background:linear-gradient(#fff,#f88)"></div>
+<script>let n = 0; setInterval(() => { n++; document.title = 'sv retitle ' + n; h.textContent = n; }, 100);</script>
+HTML
+  # `SVWL_VIDEO=1` (two-windows): the first window plays a 720p H.264 clip in a
+  # loop for the whole run instead of retitling, and says how playback goes in
+  # its title (waycompose-design.md §97: two windows plus a video; §98: the
+  # recipe that made Firefox crash at quit).
+  if [ "${SVWL_VIDEO:-0}" = 1 ]; then
+    ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
+      -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
+      "$RUN/pages/clip.mp4" || { echo "FAIL: ffmpeg could not make the clip"; exit 1; }
+    cat >"$RUN/pages/video.html" <<'HTML'
+<!doctype html><title>sv video</title>
+<video id=v src="clip.mp4" autoplay muted loop width=960></video>
+<script>
+const v = document.getElementById('v');
+setInterval(() => {
+  const q = v.getVideoPlaybackQuality();
+  document.title = `sv video frames ${q.totalVideoFrames} dropped ${q.droppedVideoFrames} err=${v.error ? v.error.code : 'none'}`;
+}, 100);
+</script>
+HTML
+    export SOAK_VIDEO=1
+  fi
   cat >"$RUN/pages/webgl.html" <<'HTML'
 <!doctype html><title>sv webgl</title><canvas id=c width=800 height=600></canvas>
 <div style="height:3000px;background:linear-gradient(#fff,#8f8)"></div>
@@ -406,7 +448,10 @@ try {
 </script>
 HTML
   say "firefox (soak), $SECS s through Marionette on port $MPORT"
-  env HOME="$RUN/home" ${SVWL_EXTRA_ENV:-} \
+  # `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in Firefox's own environment: without
+  # it the crash reporter submits a crash's minidump and deletes it, and the
+  # verdict's count of minidumps below says none (waycompose-design.md §98).
+  env HOME="$RUN/home" MOZ_CRASHREPORTER_NO_DELETE_DUMP=1 ${SVWL_EXTRA_ENV:-} \
     "$FIREFOX" --no-remote --marionette -remote-allow-system-access --profile "$RUN/profile" about:blank \
     >"$RUN/ff.log" 2>&1 &
   FF=$!
@@ -418,7 +463,22 @@ HTML
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
     done ) &
   KIDS+=($!)
+  # `SVWL_STALL_MS=N`: stop the GPU side for N ms every `SVWL_STALL_EVERY`
+  # seconds (default 20), from 30 s on. A `SIGSTOP` stops every thread of it,
+  # its heartbeat too, which is what a guest VM that is not scheduled looks
+  # like from the host (waycompose-design.md §95: the iGPU's D3->D0, a host
+  # with 244 MB free). Each stall is a line in stalls.txt.
+  if [ -n "${SVWL_STALL_MS:-}" ] && [ -s "$RUN/gpu.pid" ]; then
+    ( GP=$(cat "$RUN/gpu.pid"); sleep 30
+      while kill -0 $FF 2>/dev/null; do
+        kill -STOP "$GP"; sleep "$(printf '%d.%03d' $((SVWL_STALL_MS / 1000)) $((SVWL_STALL_MS % 1000)))"; kill -CONT "$GP"
+        echo "t=$(( $(date +%s) - STARTED ))s stopped the GPU side for ${SVWL_STALL_MS} ms" >>"$RUN/stalls.txt"
+        sleep "${SVWL_STALL_EVERY:-20}"
+      done ) &
+    KIDS+=($!)
+  fi
   [ "$MODE" = scroll ] && export SOAK_MODE=scroll
+  [ "$MODE" = two-windows ] && export SOAK_MODE=two-windows
   if [ "$MODE" = scroll ]; then
     CPUFILE="$RUN/cpu.txt"
     ( sleep 25; "$PY" "$ROOT/scripts/wc-cpu-sample.py" "${SVWL_CPU_SECS:-20}" "$CPUFILE" >/dev/null 2>&1 ) &
@@ -440,6 +500,15 @@ HTML
   fi
   ALIVE=0; kill -0 $FF 2>/dev/null && ALIVE=1
   LIVED=$(( $(date +%s) - STARTED ))
+  # `two-windows` ends by closing both windows (§95), so the browser should
+  # now be quitting on its own: give it 30 s, and keep its exit status.
+  QUIT=
+  if [ "$MODE" = two-windows ] && grep -q '"kind": "closed"' "$RUN/soak.jsonl"; then
+    for _ in $(seq 1 $(( ${SVWL_QUIT_WAIT:-30} * 2 ))); do kill -0 $FF 2>/dev/null || break; sleep 0.5; done
+    if kill -0 $FF 2>/dev/null; then QUIT="still running ${SVWL_QUIT_WAIT:-30} s after its last window closed"
+    else wait $FF; QUIT="exit $?"; fi
+    ALIVE=1
+  fi
   shot
   kill $FF 2>/dev/null; wait $FF 2>/dev/null
 
@@ -453,6 +522,15 @@ HTML
     || bad "the driver stopped early (exit $DRIVER): $(grep '"kind": "fatal"' "$J" | tail -1)"
   [ "$ALIVE" -eq 1 ] && ok "Firefox was alive after ${LIVED} s" || bad "Firefox was gone after ${LIVED} s"
   [ "$LIVED" -ge "$SECS" ] && ok "it lived at least the $SECS s asked for" || bad "it lived ${LIVED} s of $SECS"
+  if [ -n "$QUIT" ]; then
+    # A crash's minidump is moved out of the profile into the crash reporter's
+    # own directory under `$HOME` (`Crash Reports/pending`), so both are counted
+    # (waycompose-design.md §98).
+    dumps=$(find "$RUN/profile/minidumps" "$RUN/home" -name '*.dmp' 2>/dev/null | wc -l)
+    [ "$QUIT" = "exit 0" ] && [ "$dumps" -eq 0 ] \
+      && ok "closing the last window quit Firefox cleanly (exit 0, no minidump)" \
+      || bad "closing the last window: $QUIT, $dumps minidump(s) in the profile"
+  fi
   if coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -qi firefox; then
     bad "a Firefox process dumped core during the run: $(coredumpctl list --no-legend --since "@$STARTED" 2>/dev/null | grep -i firefox | head -3)"
   else
@@ -479,12 +557,24 @@ HTML
   echo "$mapped" | grep -q "mappings=0" || [ -z "$mapped" ] \
     && bad "the parent process did not have libsv_icd.so mapped at every sample: ${mapped:-no samples}" \
     || ok "libsv_icd.so mapped in the parent process at every sample: $mapped"
-  wg=$(grep '"kind": "webgl"' "$J" | tail -1)
-  if echo "$wg" | grep -qi 'zink' && echo "$wg" | grep -q '"frames": [1-9]'; then
-    ok "WebGL drew on Zink: $wg"
-  else
-    bad "WebGL did not draw on Zink: ${wg:-no sample}"
+  if [ "$MODE" != two-windows ]; then
+    wg=$(grep '"kind": "webgl"' "$J" | tail -1)
+    if echo "$wg" | grep -qi 'zink' && echo "$wg" | grep -q '"frames": [1-9]'; then
+      ok "WebGL drew on Zink: $wg"
+    else
+      bad "WebGL did not draw on Zink: ${wg:-no sample}"
+    fi
   fi
+  # waycompose-design.md §95: what the guest session printed before WebRender
+  # gave up, and what this ICD now says about it whatever SV_DEBUG says.
+  FAILS="ZINK: vk[A-Za-z]+ failed|couldn't allocate memory|OutOfMemory|DEVICE LOST"
+  SAID="^sv-icd: (vkAllocateMemory: |vkCreateBuffer: the GPU|transport: .*; returning|blob reserve exhausted|a call failed in this ICD)"
+  fails=$(grep -cE "$FAILS" "$RUN/ff.log")
+  [ "$fails" -eq 0 ] && ok "no Vulkan call failed in Firefox's log" \
+    || bad "$fails Vulkan failure line(s) in Firefox's log: $(grep -E "$FAILS|$SAID" "$RUN/ff.log" | sort | uniq -c | sort -rn | head -6 | tr -s ' ' | tr '\n' ';')"
+  last=$(grep -E "^sv-icd: t=[0-9.]+s arena" "$RUN/ff.log" | tail -1)
+  [ -n "$last" ] && echo "  arena, last SV_DEBUG line: ${last#sv-icd: }"
+  [ -s "$RUN/stalls.txt" ] && echo "  GPU side stopped $(wc -l <"$RUN/stalls.txt") time(s) for ${SVWL_STALL_MS} ms"
   say "---- about:support ----"; grep '"kind": "about-support"' "$J" | tail -1
   echo "run dir: $RUN"
   [ "$fail" -eq 0 ] && say "sv-firefox-wayland soak: PASS" || say "sv-firefox-wayland soak: FAIL"

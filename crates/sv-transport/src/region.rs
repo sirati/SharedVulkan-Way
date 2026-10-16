@@ -264,6 +264,101 @@ impl SharedRegion {
         Ok(region)
     }
 
+    /// Reserve `len` bytes of address space, mapped to nothing: the app side's
+    /// view of a pool whose regions arrive one at a time
+    /// (waycompose-design.md §97).
+    ///
+    /// Every byte is `PROT_NONE` until [`SharedRegion::map_fixed`] puts a
+    /// region's file there, so a pool offset in a region this process has not
+    /// mapped faults at once rather than reading zeroes. Nothing is committed:
+    /// eight 4 GiB strides cost 32 GiB of address space and no memory.
+    #[cfg(target_os = "linux")]
+    pub fn reserve(len: usize) -> Result<Self> {
+        if len == 0 || !len.is_multiple_of(PAGE) {
+            return Err(Error::BadGeometry("a reservation must be whole, non-zero pages"));
+        }
+        // SAFETY: a null hint lets the kernel choose; an anonymous PROT_NONE
+        // mapping reads and writes nothing.
+        let base = unsafe {
+            sys::mmap(
+                core::ptr::null_mut(),
+                len,
+                0,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base as isize == -1 {
+            return Err(Error::Os { call: "mmap(reserve)", errno: sys::errno() });
+        }
+        Ok(SharedRegion { base: base as *mut u8, len, backing: Backing::Mapped })
+    }
+
+    /// Map `len` bytes of `fd`, from `file_offset`, at byte `at` of this
+    /// region, shared. The region must be a [`SharedRegion::reserve`]d one (or
+    /// any `Mapped` one), and the range must lie inside it.
+    ///
+    /// Replacing part of a reservation is what `MAP_FIXED` is for, and the
+    /// one way it goes wrong is a range outside the reservation, which would
+    /// replace some other mapping of this process. That is checked here.
+    #[cfg(target_os = "linux")]
+    pub fn map_fixed(&self, at: u64, fd: std::os::fd::BorrowedFd<'_>, file_offset: u64, len: u64) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        if !matches!(self.backing, Backing::Mapped) {
+            return Err(Error::BadGeometry("map_fixed into a region this process did not map"));
+        }
+        if !at.is_multiple_of(PAGE as u64) || !file_offset.is_multiple_of(PAGE as u64) || !len.is_multiple_of(PAGE as u64) {
+            return Err(Error::Misaligned { off: at | file_offset | len, align: PAGE as u64 });
+        }
+        let start = self.check(at, len)?;
+        // SAFETY: `[at, at+len)` is inside this region's mapping by the check
+        // above, so MAP_FIXED replaces only pages this region owns.
+        let want = unsafe { self.base.add(start) } as *mut core::ffi::c_void;
+        let got = unsafe {
+            sys::mmap(
+                want,
+                len as usize,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_SHARED | sys::MAP_FIXED,
+                fd.as_raw_fd(),
+                file_offset as i64,
+            )
+        };
+        if got as isize == -1 {
+            return Err(Error::Os { call: "mmap(MAP_FIXED)", errno: sys::errno() });
+        }
+        if got != want {
+            return Err(Error::BadGeometry("MAP_FIXED did not honour the address"));
+        }
+        Ok(())
+    }
+
+    /// Put `[at, at+len)` back to reserved, unmapped address space.
+    #[cfg(target_os = "linux")]
+    pub fn unmap_fixed(&self, at: u64, len: u64) -> Result<()> {
+        if !matches!(self.backing, Backing::Mapped) {
+            return Err(Error::BadGeometry("unmap_fixed in a region this process did not map"));
+        }
+        let start = self.check(at, len)?;
+        // SAFETY: as `map_fixed`: inside this region's own mapping.
+        let want = unsafe { self.base.add(start) } as *mut core::ffi::c_void;
+        let got = unsafe {
+            sys::mmap(
+                want,
+                len as usize,
+                0,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE | sys::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if got as isize == -1 {
+            return Err(Error::Os { call: "mmap(PROT_NONE)", errno: sys::errno() });
+        }
+        Ok(())
+    }
+
     /// A region over memory somebody else owns.
     ///
     /// The one caller is the guest-side arena provider, which commits **one**
@@ -901,5 +996,46 @@ mod tests {
             a.atomic_u64(8).unwrap().load(core::sync::atomic::Ordering::Acquire),
             0x1234_5678_9abc_def0
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(miri)))]
+mod pool_view_tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    /// §97's app-side view: a reservation with two "regions" mapped into it at
+    /// their strides, each seeing its own file's bytes, and a region taken
+    /// out again reads as nothing mapped (here: the write fails to be seen).
+    #[test]
+    fn regions_map_into_a_reservation_at_their_offsets() {
+        let stride = 1u64 << 24;
+        let view = SharedRegion::reserve(4 * stride as usize).unwrap();
+        let a = memfd("pool-a", 2 << 20).unwrap();
+        let b = memfd("pool-b", 1 << 20).unwrap();
+        let ra = SharedRegion::map_fd(a.as_fd(), 0, 2 << 20).unwrap();
+        let rb = SharedRegion::map_fd(b.as_fd(), 0, 1 << 20).unwrap();
+        ra.write_bytes(4096, b"region-a").unwrap();
+        rb.write_bytes(8192, b"region-b").unwrap();
+        view.map_fixed(0, a.as_fd(), 0, 2 << 20).unwrap();
+        view.map_fixed(2 * stride, b.as_fd(), 0, 1 << 20).unwrap();
+        let mut got = [0u8; 8];
+        view.read_bytes(4096, &mut got).unwrap();
+        assert_eq!(&got, b"region-a");
+        view.read_bytes(2 * stride + 8192, &mut got).unwrap();
+        assert_eq!(&got, b"region-b");
+        // Writes through the view reach the file.
+        view.write_bytes(2 * stride + 16, b"from-icd").unwrap();
+        rb.read_bytes(16, &mut got).unwrap();
+        assert_eq!(&got, b"from-icd");
+        // A range outside the reservation is refused, not mapped over
+        // somebody else's memory.
+        assert!(view.map_fixed(4 * stride, b.as_fd(), 0, 1 << 20).is_err());
+        assert!(view.map_fixed(4 * stride - 4096, b.as_fd(), 0, 1 << 20).is_err());
+        view.unmap_fixed(2 * stride, 1 << 20).unwrap();
+        // Mapping it again after the unmap sees the same bytes.
+        view.map_fixed(2 * stride, b.as_fd(), 0, 1 << 20).unwrap();
+        view.read_bytes(2 * stride + 16, &mut got).unwrap();
+        assert_eq!(&got, b"from-icd");
     }
 }

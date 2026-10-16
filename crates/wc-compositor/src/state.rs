@@ -3427,6 +3427,19 @@ impl State {
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(gw, gh, format);
+        // §95: every surface after the first is drawn *over* what is under it
+        // (`Shadow::compose_over`), so what is under it must be this frame's.
+        // The root's copy repaints the whole canvas whenever the canvas lies
+        // inside the root's buffer, which a declared geometry always does; a
+        // tree whose bounds reach past the root (a subsurface overhanging it)
+        // starts from transparent instead of from the last frame's pixels.
+        let root_covers = self.staging.get(root).is_some_and(|s| {
+            gx >= 0 && gy >= 0 && gx + gw <= s.width() && gy + gh <= s.height()
+        });
+        if !root_covers {
+            shadow.clear();
+        }
+        let mut first = true;
         for (surface, (x, y)) in &placed {
             // The same rule as the bounds above and as the hit test: a
             // subsurface of an unmapped surface is not mapped, so it is not
@@ -3439,8 +3452,13 @@ impl State {
                 continue;
             }
             if let Some(src) = self.staging.get(surface) {
-                shadow.compose(src, (x - gx, y - gy));
+                if first {
+                    shadow.compose(src, (x - gx, y - gy));
+                } else {
+                    shadow.compose_over(src, (x - gx, y - gy));
+                }
             }
+            first = false;
         }
         drop(shadow);
 

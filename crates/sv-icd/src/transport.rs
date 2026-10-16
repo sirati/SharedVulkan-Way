@@ -32,7 +32,7 @@
 use std::sync::{Arc, Mutex};
 use sv_icd_entry::{IcdResult, LowerError, RingClass, Transport};
 use sv_transport::control::{Control, Flags};
-use sv_transport::park::{Deadline, Futex, wait_until};
+use sv_transport::park::{Deadline, Futex, wait_until_gone_after};
 use sv_transport::region::SharedRegion;
 use crate::arena::Backing as _;
 use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProducer};
@@ -43,6 +43,43 @@ use sv_transport::ring::{BarrierTracker, Lane, RingConsumer, RingCtrl, RingProdu
 /// peer heartbeat and the generation counter before deciding between 'slow' and
 /// 'gone'." `wait_until` does that check; this is the budget it does it within.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a wait looks at the GPU side's heartbeat.
+const LIVENESS_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long the GPU side's heartbeat may be silent before it is presumed gone
+/// and the call returns `VK_ERROR_DEVICE_LOST`.
+///
+/// It was three polls, 150 ms, which is the default `wait_until` builds, and
+/// that is a window for two processes on one kernel. The GPU side beats every
+/// 20 ms from a thread of its own, but in another VM *all* of its threads stop
+/// while the guest is not scheduled, and this side keeps running, so its stall
+/// credit sees nothing to forgive. A 400 ms stop of the GPU side was enough to
+/// lose Firefox's device (waycompose-design.md §95), and on the guest the iGPU
+/// coming out of D3 and a host with 244 MB free are the likely stops. Five
+/// seconds is what the GPU side allows the app side (`APP_GONE_AFTER`): long
+/// enough that only a stopped or exited peer is silent that long, and still
+/// inside [`CALL_TIMEOUT`].
+///
+/// A test build waits 400 ms instead, so that `abandoned_calls` can outlast it.
+const PEER_GONE_AFTER: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(400)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// Every wait this transport makes on the GPU side: [`LIVENESS_POLL`] and
+/// [`PEER_GONE_AFTER`], so that no site can pick its own window again.
+fn wait_for_peer(
+    control: &Control,
+    ctrl: &RingCtrl,
+    lane: Option<Lane>,
+    parker: &dyn sv_transport::park::Parker,
+    ready: &dyn Fn() -> bool,
+    overall: Deadline,
+) -> sv_transport::Result<()> {
+    wait_until_gone_after(control, ctrl, lane, parker, ready, overall, LIVENESS_POLL, PEER_GONE_AFTER)
+}
 
 /// How much of the arena is set aside for command blobs.
 ///
@@ -374,6 +411,9 @@ pub struct RingTransport {
     /// pointer `vkMapMemory` handed out, and this is the only thing that lives
     /// as long as the process.
     pub arena: Arc<SharedRegion>,
+    /// The pool this session leases its arena from, when it does
+    /// (waycompose-design.md §97). `None` on a fixed arena.
+    pub pool: Option<PoolView>,
     /// Clearing this stops the heartbeat thread.
     beating: Arc<std::sync::atomic::AtomicBool>,
     /// The cross-VM doorbell reader thread (§36.6). Held so it lives as long as
@@ -422,7 +462,18 @@ pub struct Attached {
 /// reports `NotConnected` for every ring problem, which is true and useless:
 /// the first run of the end-to-end test said exactly that and the real answer
 /// was a packet larger than the ring.
+///
+/// **The first of each kind is said unconditionally** (waycompose-design.md
+/// §95). A Firefox on the deployed install died twice with `zink: DEVICE
+/// LOST!` and nothing from either side to say whether the GPU side's driver
+/// had lost its device or this transport had declared the peer gone; the
+/// reason existed only here, behind `SV_DEBUG`, which nobody runs a desktop
+/// session with. Once per kind, because after the first every outstanding
+/// call reports the same thing.
 fn lower(e: sv_transport::Error) -> LowerError {
+    use std::sync::atomic::AtomicBool;
+    static LOST_SAID: AtomicBool = AtomicBool::new(false);
+    static OTHER_SAID: AtomicBool = AtomicBool::new(false);
     sv_icd_entry::report_transport_failure(&e);
     match e {
         // §4.3: "the app side turns that into `VK_ERROR_DEVICE_LOST` on every
@@ -431,8 +482,23 @@ fn lower(e: sv_transport::Error) -> LowerError {
         sv_transport::Error::PeerRestarted { .. }
         | sv_transport::Error::PeerGone { .. }
         | sv_transport::Error::TimedOut { .. }
-        | sv_transport::Error::RingFatal { .. } => LowerError::DeviceLost,
-        _ => LowerError::NotConnected,
+        | sv_transport::Error::RingFatal { .. } => {
+            crate::state::say_once(
+                &LOST_SAID,
+                &format_args!(
+                    "transport: {e}; returning VK_ERROR_DEVICE_LOST (the GPU side is \
+                     taken to be gone, not its driver's device)"
+                ),
+            );
+            LowerError::DeviceLost
+        }
+        _ => {
+            crate::state::say_once(
+                &OTHER_SAID,
+                &format_args!("transport: {e}; returning VK_ERROR_INITIALIZATION_FAILED"),
+            );
+            LowerError::NotConnected
+        }
     }
 }
 
@@ -539,7 +605,20 @@ impl RingTransport {
         // Acknowledge, so a daemon that created the name may release it. Sent
         // after both mappings exist, which is what makes it mean anything.
         let _ = send(&sock, &ColdMessage::Accept { generation: at.generation });
-        RingTransport::finish_attach(control_region, arena, at.arena_len)
+        // What the pool's regions are mapped from, should the GPU side say the
+        // arena is leased: the named file (region 0, and the files beside it),
+        // or on the development export path the one descriptor.
+        let source = if at.arena_object.is_empty() {
+            match fds.first().map(|f| f.try_clone()) {
+                Some(Ok(fd)) => PoolSource::Fd(fd),
+                _ => PoolSource::None,
+            }
+        } else {
+            PoolSource::Path(at.arena_object.clone())
+        };
+        let mut attached = RingTransport::finish_attach(control_region, arena, at.arena_len)?;
+        attached.enter_pool(source, at.arena_offset, at.arena_len)?;
+        Ok(attached)
     }
 
     /// Connect to a Windows GPU side over a named pipe and two named sections.
@@ -799,6 +878,7 @@ impl RingTransport {
         let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         arm_park_report();
+        arm_goodbye(Arc::clone(&control));
 
         let beating = Arc::new(std::sync::atomic::AtomicBool::new(true));
         {
@@ -835,6 +915,7 @@ impl RingTransport {
                 parker: Futex::default(),
                 blobs: Mutex::new(Blobs::new(arena_len, reserve)),
                 arena,
+                pool: None,
                 beating,
                 _doorman: doorman,
             },
@@ -972,14 +1053,13 @@ impl RingTransport {
                     // that only arises under a burst.
                     let has_room =
                         || ring.producer.free_bytes().map(|f| f >= want).unwrap_or(true);
-                    wait_until(
+                    wait_for_peer(
                         &self.control,
                         &ring.ctrl,
                         None,
                         &self.parker,
                         &has_room,
                         deadline,
-                        std::time::Duration::from_millis(50),
                     )
                     .map_err(lower)?;
                 }
@@ -1187,7 +1267,8 @@ impl RingTransport {
             return Ok(());
         }
         let blobs = self.blobs.lock().unwrap_or_else(|e| e.into_inner());
-        sv_icd_entry::report_transport_failure(&format_args!(
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::state::say_once(&SAID, &format_args!(
             "blob reserve exhausted for a {need}-byte command after {RECLAIM_ROUNDS} reclaims: \
              {} KiB held in {} block(s) and {} retiring",
             blobs.held >> 10,
@@ -1266,14 +1347,13 @@ impl RingTransport {
         if ctrl.completed_seqno().map_err(lower)? >= in_flight {
             return Ok(());
         }
-        wait_until(
+        wait_for_peer(
             &self.control,
             &ctrl,
             None,
             &self.parker,
             &|| ctrl.completed_seqno().map(|c| c >= in_flight).unwrap_or(false),
             Deadline::after(CALL_TIMEOUT),
-            std::time::Duration::from_millis(50),
         )
         .map_err(lower)
     }
@@ -1295,24 +1375,37 @@ impl RingTransport {
         // application is waiting for an answer to.
         let seqno = self.push_into(class, ring, command, deadline)?;
         loop {
-            wait_until(
+            wait_for_peer(
                 &self.control,
                 &ring.ctrl,
                 Some(Lane::Reply),
                 &self.parker,
                 &|| !ring.replies.is_empty().unwrap_or(false),
                 deadline,
-                std::time::Duration::from_millis(50),
             )
             .map_err(lower)?;
             let got = ring.replies.next().map_err(lower)?.map(|p| (p.seqno, p.payload.to_vec()));
             let Some((got_seqno, payload)) = got else { continue };
             ring.replies.advance().map_err(lower)?;
+            if got_seqno < seqno {
+                // **The answer to an earlier call that stopped waiting for it.**
+                // A call that times out, or that decides the peer is gone,
+                // leaves its command on the ring, and the GPU side, if it was
+                // only slow, still answers it. This used to be the error below,
+                // and it was not one error: the call that met the late reply
+                // left its *own* reply behind for the next call, and so on, so
+                // every later call on the ring failed, and Zink would report each
+                // `vkCreateBuffer` after that as failed, for the rest of the process
+                // (waycompose-design.md §95). Sequence numbers only grow, so an
+                // older one is exactly an abandoned call's, and it is dropped.
+                continue;
+            }
             if got_seqno != seqno {
-                // A ring is SPSC and this call holds the producer, so this
-                // cannot happen — which is exactly why it is checked. If it ever
-                // does, a reply has been matched to the wrong command and the
-                // application would get another call's answer.
+                // A ring is SPSC and this call holds the producer, so a reply
+                // *newer* than the command cannot happen, which is exactly why
+                // it is checked. If it ever does, a reply has been matched to
+                // the wrong command and the application would get another
+                // call's answer.
                 return Err(LowerError::Shape("a reply arrived out of order"));
             }
             reply.clear();
@@ -1622,6 +1715,48 @@ pub(crate) fn arm_park_report() {
     }
 }
 
+/// Every control region this process attached, for [`goodbye_atexit`].
+static GOODBYE: Mutex<Vec<Arc<Control>>> = Mutex::new(Vec::new());
+
+/// Tell the GPU side this process is done, when it exits.
+///
+/// `RingTransport::shutdown` existed and nothing called it, so the GPU side
+/// learned that an application had gone only from its heartbeat going quiet,
+/// `APP_GONE_AFTER` (5 s) later, and held the session's slot until then. On
+/// the guest that is a slot of a fixed few: Firefox's `glxtest` exits and the
+/// browser asks for its own slot within those five seconds, and with two slots
+/// the browser was refused and drew on llvmpipe (waycompose-design.md §95.10).
+/// With the flag set at exit the GPU side's ring threads stop at their next
+/// 50 ms slice, it destroys what the session left and gives the slot back.
+///
+/// At exit and not at the last `vkDestroyInstance`, because an application may
+/// make another instance after that and this process has one connection.
+/// A process that dies without running `atexit` handlers still costs the five
+/// seconds; `connect_waiting_for_slot` is the other half for that case.
+fn arm_goodbye(control: Arc<Control>) {
+    GOODBYE.lock().unwrap_or_else(|e| e.into_inner()).push(control);
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(|| {
+            // SAFETY: `goodbye_atexit` is a plain `extern "C"` function with no
+            // arguments that sets one flag word in each mapped control region.
+            unsafe { libc::atexit(goodbye_atexit) };
+        });
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn goodbye_atexit() {
+    // `try_lock`: a thread that held the lock when `exit` was called will
+    // never release it, and an exit must not hang on it.
+    if let Ok(all) = GOODBYE.try_lock() {
+        for c in all.iter() {
+            let _ = c.set_flag(Flags::SHUTDOWN);
+        }
+    }
+}
+
 /// `SV_SEND_TRACE=1`: print every packet this side pushes, with its ring and
 /// seqno.
 ///
@@ -1829,5 +1964,255 @@ mod blob_race {
         assert_eq!(seen, BUFFERS * u64::from(PER_BUFFER));
         let blobs = t.blobs.lock().unwrap();
         assert!(blobs.held <= 2 << 20, "{} bytes held", blobs.held);
+    }
+}
+
+/// waycompose-design.md §95: a call that gives up on a GPU side that was only
+/// stopped, and the call after it.
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod abandoned_calls {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use sv_transport::control::{Geometry, RingKind};
+
+    /// A `RingTransport` on heap regions and a GPU side that answers every
+    /// `DriverVersions` with its own sequence number. Before answering the
+    /// first, it stops beating for twice [`PEER_GONE_AFTER`], which is what a
+    /// guest VM that is not scheduled looks like from here.
+    #[test]
+    fn a_late_reply_to_an_abandoned_call_is_not_the_next_calls_answer() {
+        let g = Geometry::small();
+        let control_region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let arena = Arc::new(SharedRegion::heap(g.arena_size as usize).unwrap());
+        let owner = Arc::new(
+            Control::create(Arc::clone(&control_region), g, crate::protocol_ids(), 1).unwrap(),
+        );
+        let t = RingTransport::finish_attach(control_region, arena, g.arena_size)
+            .unwrap()
+            .transport;
+        let device = (0..g.ring_slot_count)
+            .find(|s| matches!(owner.ring_kind(*s), Ok(RingKind::Device)))
+            .expect("the app side claimed a device ring");
+
+        let beating = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let heart = {
+            let (owner, beating, stop) = (Arc::clone(&owner), Arc::clone(&beating), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if beating.load(Ordering::Acquire) {
+                        let _ = owner.beat_now();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        };
+        let gpu = {
+            let (owner, beating) = (Arc::clone(&owner), Arc::clone(&beating));
+            std::thread::spawn(move || {
+                let mut cons = RingConsumer::open(&owner, device, Lane::Command).unwrap();
+                let mut replies = RingProducer::open(&owner, device, Lane::Reply).unwrap();
+                for n in 0..2 {
+                    let seqno = loop {
+                        if let Some(p) = cons.next().unwrap() {
+                            break p.seqno;
+                        }
+                        std::thread::yield_now();
+                    };
+                    cons.advance().unwrap();
+                    if n == 0 {
+                        beating.store(false, Ordering::Release);
+                        std::thread::sleep(PEER_GONE_AFTER * 2);
+                        beating.store(true, Ordering::Release);
+                    }
+                    let mut out = Vec::new();
+                    sv_proto::sv::DriverVersionsReply {
+                        instance_api_version: seqno as u32,
+                        device_api_version: 0,
+                    }
+                    .encode(&mut out)
+                    .unwrap();
+                    replies.push_seq(seqno, &out, None).unwrap();
+                }
+            })
+        };
+
+        let mut cmd = Vec::new();
+        sv_proto::sv::DriverVersions.encode(&mut cmd).unwrap();
+        let mut reply = Vec::new();
+        let first = t.call(RingClass::Device, 0, &cmd, &mut reply);
+        assert_eq!(first, Err(LowerError::DeviceLost), "the silence outlasted PEER_GONE_AFTER");
+        // Before the fix this was `Shape("a reply arrived out of order")`, and
+        // so was every call after it.
+        t.call(RingClass::Device, 0, &cmd, &mut reply).expect("the second call is answered");
+        let got = sv_proto::sv::DriverVersionsReply::decode(&reply).unwrap();
+        gpu.join().unwrap();
+        stop.store(true, Ordering::Release);
+        heart.join().unwrap();
+        assert_eq!(got.instance_api_version, 2, "with its own reply, not the first call's");
+    }
+}
+
+/// Where a leased pool's regions are mapped from (waycompose-design.md §97).
+pub enum PoolSource {
+    /// Region 0 is this file, and region `k` the file
+    /// `sv_transport::poolhdr::region_path` names beside it: the GPU ivshmem
+    /// device's backing file on the VM host, opened by name (docs/design.md §1a).
+    Path(String),
+    /// The development export path's one descriptor: region 0 only.
+    #[cfg(target_os = "linux")]
+    Fd(std::os::fd::OwnedFd),
+    None,
+}
+
+/// A leased arena as this process sees it: one reserved range with each
+/// region's file mapped at its stride, so a pool offset is an offset into
+/// [`RingTransport::arena`] whichever region it is in.
+pub struct PoolView {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    source: PoolSource,
+    /// `(region, bytes mapped)`.
+    mapped: Mutex<Vec<(u32, u64)>>,
+    pub granule: u64,
+    pub session_cap: u64,
+    pub capacity: u64,
+}
+
+
+/// This process's name, for the GPU side's log of who holds what.
+#[cfg(target_os = "linux")]
+fn process_name() -> String {
+    std::fs::read_to_string("/proc/self/comm")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| format!("pid {}", std::process::id()))
+}
+
+impl Attached {
+    /// Ask the GPU side how the arena is provided, and if it is leased, make
+    /// [`RingTransport::arena`] the pool view and lease the blob reserve
+    /// (waycompose-design.md §97). On a fixed arena nothing changes.
+    #[cfg(target_os = "linux")]
+    pub fn enter_pool(&mut self, source: PoolSource, arena_offset: u64, arena_len: u64) -> Result<(), String> {
+        use std::os::fd::AsFd;
+        use sv_arena::pool::{MAX_REGIONS, REGION_STRIDE};
+        let t = &mut self.transport;
+        let Some(info) = t.arena_info(&process_name()) else { return Ok(()) };
+        if info.mode != sv_proto::sv::ARENA_MODE_LEASED {
+            return Ok(());
+        }
+        let view = SharedRegion::reserve((REGION_STRIDE as usize) * MAX_REGIONS)
+            .map_err(|e| format!("reserving the pool's address space: {e}"))?;
+        match &source {
+            PoolSource::Path(p) => {
+                let f = sv_transport::region::open_named(p).map_err(|e| format!("{p}: {e}"))?;
+                view.map_fixed(0, f.as_fd(), arena_offset, arena_len).map_err(|e| format!("{p}: {e}"))?;
+            }
+            PoolSource::Fd(fd) => {
+                view.map_fixed(0, fd.as_fd(), arena_offset, arena_len).map_err(|e| format!("the pool descriptor: {e}"))?;
+            }
+            PoolSource::None => return Err("the arena is leased and nothing names the pool to map".into()),
+        }
+        t.arena = Arc::new(view);
+        t.pool = Some(PoolView {
+            source,
+            mapped: Mutex::new(vec![(0, arena_len)]),
+            granule: info.lease_granule,
+            session_cap: info.session_cap,
+            capacity: info.capacity,
+        });
+        let (off, len, _) = t
+            .lease_arena(sv_arena::pool::BLOB_LEASE, sv_proto::sv::LEASE_BLOBS)
+            .map_err(|e| format!("leasing the command-blob reserve: {e:?}"))?;
+        *t.blobs.lock().unwrap_or_else(|e| e.into_inner()) = Blobs::new(off, len);
+        self.arena_len = (REGION_STRIDE as usize * MAX_REGIONS) as u64;
+        self.slab_size = self.arena_len;
+        crate::state::say_once(
+            &crate::state::POOL_SAID,
+            &format_args!(
+                "the arena is leased from the GPU side's {} MiB pool; this process may lease {} MiB",
+                info.capacity >> 20,
+                info.session_cap >> 20
+            ),
+        );
+        Ok(())
+    }
+}
+
+impl RingTransport {
+    pub fn is_pooled(&self) -> bool {
+        self.pool.is_some()
+    }
+
+    /// `svArenaInfo`, on the instance ring. `None` for any failure, which is
+    /// a fixed arena: a GPU side too old to know the question is refused at
+    /// attach by `WIRE_VERSION` before it gets here.
+    #[cfg(target_os = "linux")]
+    fn arena_info(&self, name: &str) -> Option<sv_proto::sv::ArenaInfoReply> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::ArenaInfo::named(name).encode(&mut cmd).ok()?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Instance, sv_proto::sv::SV_ARENA_INFO, &cmd, &mut reply).ok()?;
+        sv_proto::sv::ArenaInfoReply::decode(&reply).ok()
+    }
+
+    /// `svLeaseArena`: `(pool offset, length, memory type)`. The lease's
+    /// region is mapped here first if it is not yet. A refusal is
+    /// `LowerError::Result(VK_ERROR_OUT_OF_DEVICE_MEMORY)`.
+    pub fn lease_arena(&self, len: u64, purpose: u32) -> IcdResult<(u64, u64, u32)> {
+        let pool = self.pool.as_ref().ok_or(LowerError::Shape("a lease on a fixed arena"))?;
+        let mut cmd = Vec::new();
+        sv_proto::sv::LeaseArena { len, purpose }.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_LEASE_ARENA, &cmd, &mut reply)?;
+        let r = sv_proto::sv::LeaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Err(LowerError::Result(r.result));
+        }
+        let (region, local) = sv_arena::pool::split(r.offset);
+        let covered = pool
+            .mapped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(k, n)| k == region && local + r.len <= n);
+        if !covered {
+            self.map_region(pool, region)?;
+        }
+        Ok((r.offset, r.len, r.memory_type))
+    }
+
+    /// Map region `k`'s file into the view, whole.
+    #[cfg(target_os = "linux")]
+    fn map_region(&self, pool: &PoolView, k: u32) -> IcdResult<()> {
+        use std::os::fd::AsFd;
+        let PoolSource::Path(boot) = &pool.source else {
+            return Err(LowerError::Shape("a lease in a region this process has no name for"));
+        };
+        let path = sv_transport::poolhdr::region_path(boot, k);
+        let f = sv_transport::region::open_named(&path).map_err(lower)?;
+        let len = f.metadata().map_err(|_| LowerError::Shape("a pool region with no size"))?.len();
+        self.arena
+            .map_fixed(u64::from(k) * sv_arena::pool::REGION_STRIDE, f.as_fd(), 0, len)
+            .map_err(lower)?;
+        pool.mapped.lock().unwrap_or_else(|e| e.into_inner()).push((k, len));
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn map_region(&self, _pool: &PoolView, _k: u32) -> IcdResult<()> {
+        Err(LowerError::Shape("a pooled arena on this system"))
+    }
+
+    /// `svReleaseArena`.
+    pub fn release_arena(&self, offset: u64) -> IcdResult<()> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::ReleaseArena { offset }.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_RELEASE_ARENA, &cmd, &mut reply)?;
+        let r = sv_proto::sv::ReleaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Err(LowerError::Result(r.result));
+        }
+        Ok(())
     }
 }

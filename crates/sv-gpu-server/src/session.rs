@@ -25,7 +25,8 @@ use sv_transport::park::{Deadline, Futex, wait_until};
 use sv_transport::ring::{Lane, RingConsumer, RingCtrl, RingProducer, barrier_satisfied};
 
 /// How long a ring thread will sit with nothing arriving before it concludes the
-/// app side is gone. R4 says every wait has a deadline and there is no API for an
+/// app side is gone. Only while the app side's heartbeat is not seen
+/// moving: a live heartbeat resets it (§97.10). R4 says every wait has a deadline and there is no API for an
 /// infinite one; this is the session's.
 pub const IDLE_LIMIT: Duration = Duration::from_secs(120);
 
@@ -273,19 +274,37 @@ fn protocol_command(
     match sv_proto::sv::peek_opcode(payload) {
         Some(sv_proto::sv::SV_EXECUTE_COMMAND_BLOB) => {
             let d = sv_proto::sv::ExecuteCommandBlob::decode(payload).map_err(err)?;
-            let arena = Arc::clone(&srv.host().shared.arena.region);
             let end = d.arena_offset.checked_add(d.len).ok_or("a blob whose range overflows")?;
-            if end > arena.len() as u64 || d.len == 0 {
-                return Err(format!(
-                    "a blob at {}+{} is outside the {}-byte arena",
-                    d.arena_offset,
-                    d.len,
-                    arena.len()
-                ));
-            }
+            // A pooled session's blobs are in a lease of its own, and are read
+            // only if they are: a blob offset is a pool offset, and the pool
+            // holds every other session's memory too (§97).
+            let pooled = {
+                let o = srv.host().shared.objects();
+                o.pool.as_ref().map(|b| (Arc::clone(&b.server), o.leased_range(d.arena_offset, d.len)))
+            };
             blob.clear();
             blob.resize(d.len as usize, 0);
-            arena.read_bytes(d.arena_offset, blob).map_err(err)?;
+            match pooled {
+                Some((_, false)) => {
+                    return Err(format!(
+                        "a blob at {:#x}+{} is in no lease this session holds",
+                        d.arena_offset, d.len
+                    ));
+                }
+                Some((server, true)) => server.read_bytes(d.arena_offset, blob)?,
+                None => {
+                    let arena = Arc::clone(&srv.host().shared.arena.region);
+                    if end > arena.len() as u64 || d.len == 0 {
+                        return Err(format!(
+                            "a blob at {}+{} is outside the {}-byte arena",
+                            d.arena_offset,
+                            d.len,
+                            arena.len()
+                        ));
+                    }
+                    arena.read_bytes(d.arena_offset, blob).map_err(err)?;
+                }
+            }
             let mut dec = sv_wire::Decoder::new(blob);
             // **The command-pool lock, held across the whole replay** — not per
             // command (docs/design.md §0.23).
@@ -398,6 +417,105 @@ fn protocol_command(
             sv_proto::sv::ImportArenaSlabReply { result, memory_type }
                 .encode(reply)
                 .map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_ARENA_INFO) => {
+            let d = sv_proto::sv::ArenaInfo::decode(payload).map_err(err)?;
+            let shared = &srv.host().shared;
+            let binding = shared.objects().pool.clone();
+            let r = match binding {
+                Some(b) => {
+                    let name = d.name_str();
+                    b.server.set_name(b.session, &name);
+                    let cfg = b.server.config();
+                    eprintln!("[gpu] pool session {} is {name:?}; {}", b.session, b.server.report());
+                    sv_proto::sv::ArenaInfoReply {
+                        mode: sv_proto::sv::ARENA_MODE_LEASED,
+                        lease_granule: cfg.granule,
+                        session_cap: cfg.session_cap,
+                        capacity: b.server.capacity(),
+                        max_capacity: b.server.capacity(),
+                    }
+                }
+                None => sv_proto::sv::ArenaInfoReply {
+                    mode: sv_proto::sv::ARENA_MODE_FIXED,
+                    capacity: shared.arena.len,
+                    max_capacity: shared.arena.len,
+                    ..Default::default()
+                },
+            };
+            r.encode(reply).map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_LEASE_ARENA) => {
+            let d = sv_proto::sv::LeaseArena::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            let binding = shared.objects().pool.clone();
+            let purpose = sv_arena::pool::Purpose::from_u32(d.purpose)
+                .filter(|p| *p != sv_arena::pool::Purpose::Control);
+            // A refusal is a reply, as a failed slab import is: the app side
+            // turns it into VK_ERROR_OUT_OF_DEVICE_MEMORY for the allocation
+            // that needed it, and the session goes on.
+            let r = match (binding, purpose) {
+                (Some(b), Some(purpose)) => match b.lease(d.len, purpose, &shared.driver) {
+                    Ok(g) => {
+                        let first = {
+                            let mut o = shared.objects();
+                            let first = o.lease_count() == 0;
+                            o.add_lease(
+                                g.lease.offset,
+                                crate::table::LeaseMem { len: g.lease.len, memory: g.memory, base: g.base, owned: g.owned },
+                            );
+                            first
+                        };
+                        if first {
+                            // §0.5 item 3's check, at the first moment this
+                            // session's arena memory type exists.
+                            crate::arena::check_external_buffers(&shared.driver, shared.arena.external_handle_type, g.memory_type)
+                                .map_err(|e| format!("{e}"))?;
+                        }
+                        sv_proto::sv::LeaseArenaReply { result: 0, memory_type: g.memory_type, offset: g.lease.offset, len: g.lease.len }
+                    }
+                    Err(_) => sv_proto::sv::LeaseArenaReply { result: -2, ..Default::default() },
+                },
+                (None, _) => return Err("svLeaseArena on a session whose arena is not leased".into()),
+                (Some(_), None) => return Err(format!("svLeaseArena for purpose {}", d.purpose)),
+            };
+            r.encode(reply).map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_RELEASE_ARENA) => {
+            let d = sv_proto::sv::ReleaseArena::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            let (binding, held) = {
+                let mut o = shared.objects();
+                let b = o.pool.clone();
+                (b, o.remove_lease(d.offset))
+            };
+            let Some(b) = binding else {
+                return Err("svReleaseArena on a session whose arena is not leased".into());
+            };
+            let result = match held {
+                Some(l) => {
+                    // The import goes before the range does: once the pool has
+                    // it back it may be another session's on the next call.
+                    if l.owned {
+                        unsafe { shared.driver.device.free_memory(l.memory, None) };
+                    }
+                    match b.server.release(d.offset) {
+                        Ok(_) => 0,
+                        Err(e) => {
+                            eprintln!("[gpu] pool session {}: release of {:#x}: {e}", b.session, d.offset);
+                            -3
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("[gpu] pool session {} released {:#x}, which it does not hold", b.session, d.offset);
+                    -3
+                }
+            };
+            sv_proto::sv::ReleaseArenaReply { result }.encode(reply).map_err(err)?;
             Ok(0)
         }
         Some(sv_proto::sv::SV_DRIVER_VERSIONS) => {
@@ -513,6 +631,17 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
                     sv_transport::control::Liveness::Gone => break,
                     sv_transport::control::Liveness::Restarted { generation } => {
                         return Err(format!("ring {slot}: the app side restarted as generation {generation}"));
+                    }
+                    // A quiet ring of a live application is not a gone one: the
+                    // heartbeat is the test of that (APP_GONE_AFTER), and
+                    // IDLE_LIMIT is only for an app side that never beats.
+                    // Measured on the guest (waycompose-design.md §97.10): Firefox
+                    // left alone for two minutes lost its session to the limit,
+                    // its control region went to the next session, and the
+                    // browser crashed on DEVICE_LOST.
+                    sv_transport::control::Liveness::Alive => {
+                        idle_since = Instant::now();
+                        continue;
                     }
                     _ => continue,
                 }

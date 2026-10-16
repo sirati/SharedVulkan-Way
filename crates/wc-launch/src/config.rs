@@ -118,8 +118,15 @@ pub struct Config {
     pub gpu_sessions: u32,
     /// §86. The GPU process's loopback port. 0 means `port + 10`.
     pub gpu_port: u16,
-    /// §86. Each GPU session's arena, MiB of its slot of the BAR.
+    /// §86. Each GPU session's arena, MiB of its slot of the BAR. Only for
+    /// `gpu-arena = slots`.
     pub gpu_arena_mib: u64,
+    /// §97. `true` (`gpu-arena = pool`, the default): the GPU process serves
+    /// every session from one pool over the whole device, leased as each
+    /// needs and given back as each frees, and `gpu-sessions` bounds how many
+    /// run at once. `false` (`gpu-arena = slots`): §87's fixed slots of
+    /// `gpu-arena-mib`.
+    pub gpu_pool: bool,
     /// §87. The root-bus PCI slot of the GPU arena's ivshmem device, as the
     /// VM's configuration pins it (`waycomposeArena.gpu.pciAddress`).
     pub gpu_ivshmem_slot: u8,
@@ -154,6 +161,7 @@ impl Default for Config {
             gpu_sessions: 0,
             gpu_port: 0,
             gpu_arena_mib: 64,
+            gpu_pool: true,
             gpu_ivshmem_slot: 0x1d,
             gpu_bell: "org.sirati.svbell.0".into(),
             wayland_bell: "org.sirati.wcbell.0".into(),
@@ -253,6 +261,13 @@ impl Config {
                     cfg.gpu_port = v.parse().map_err(|e| format!("line {}: gpu-port: {e}", n + 1))?
                 }
                 ("session", "gpu-arena-mib") => cfg.gpu_arena_mib = num("gpu-arena-mib")?,
+                ("session", "gpu-arena") => {
+                    cfg.gpu_pool = match v {
+                        "pool" => true,
+                        "slots" => false,
+                        _ => return Err(format!("line {}: gpu-arena is pool or slots, not {v}", n + 1)),
+                    }
+                }
                 ("session", "gpu-ivshmem-slot") => {
                     let s = match v.strip_prefix("0x") {
                         Some(h) => u8::from_str_radix(h, 16).ok(),
@@ -560,6 +575,10 @@ mod gpu_tests {
         assert_eq!(p("gpu-sessions = 4\ngpu-port = 50000\n").unwrap().gpu_port(), 50000);
         assert!(p("gpu-sessions = 9\n").is_err());
         assert_eq!(c.gpu_arena_mib, 64);
+        assert!(c.gpu_pool, "the pool is the default (§97)");
+        assert!(!p("gpu-arena = slots\n").unwrap().gpu_pool);
+        assert!(p("gpu-arena = pool\n").unwrap().gpu_pool);
+        assert!(p("gpu-arena = fixed\n").is_err());
         assert_eq!((c.gpu_ivshmem_slot, c.gpu_bell.as_str()), (0x1d, "org.sirati.svbell.0"));
         let o = p("gpu-ivshmem-slot = 0x1e\ngpu-bell =\n").unwrap();
         assert_eq!((o.gpu_ivshmem_slot, o.gpu_bell.as_str()), (0x1e, ""));

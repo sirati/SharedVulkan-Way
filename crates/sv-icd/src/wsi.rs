@@ -259,31 +259,43 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
     alloc.command_buffer_count = count;
     let cmds = IcdLocal::allocate_command_buffers(icd, device, &alloc)?;
 
-    let mut images = Vec::with_capacity(count as usize);
+    // **A swapchain that cannot be made whole gives back what it took**
+    // (waycompose-design.md §95). Each image holds a readback buffer of the
+    // whole window in the arena, so a creation that failed on the second
+    // image (the arena full, which is exactly when a resize asks for a new
+    // swapchain beside the old one) used to keep the first image's buffer
+    // for the rest of the process, and make the next attempt fail sooner.
+    let mut images: Vec<SwapImage> = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
-        let img = create_image(icd, device, desc)?;
-        let (buffer, buffer_memory, pixels) = create_readback(icd, device, desc)?;
-        let fence = {
+        let mut part = SwapImage {
+            image: 0,
+            memory: 0,
+            buffer: 0,
+            buffer_memory: 0,
+            command_buffer: cmds.get(i).copied().unwrap_or(0),
+            fence: 0,
+            pixels: 0,
+        };
+        let made = (|| -> IcdResult<()> {
+            (part.image, part.memory) = create_image(icd, device, desc)?;
+            (part.buffer, part.buffer_memory, part.pixels) = create_readback(icd, device, desc)?;
             let r = icd.create_fence(p::VkCreateFenceArgs {
                 device: p::VkDevice(device),
                 p_create_info: Some(Box::new(p::VkFenceCreateInfo::default())),
                 p_fence: None,
             })?;
             result_ok(r.result)?;
-            r.p_fence.ok_or(LowerError::Shape("vkCreateFence: no fence"))?.0
-        };
-        let command_buffer =
-            *cmds.get(i).ok_or(LowerError::Shape("vkAllocateCommandBuffers: short"))?;
-        record_copy(icd, command_buffer, img.0, buffer, desc.width, desc.height)?;
-        images.push(SwapImage {
-            image: img.0,
-            memory: img.1,
-            buffer,
-            buffer_memory,
-            command_buffer,
-            fence,
-            pixels,
-        });
+            part.fence = r.p_fence.ok_or(LowerError::Shape("vkCreateFence: no fence"))?.0;
+            if part.command_buffer == 0 {
+                return Err(LowerError::Shape("vkAllocateCommandBuffers: short"));
+            }
+            record_copy(icd, part.command_buffer, part.image, part.buffer, desc.width, desc.height)
+        })();
+        images.push(part);
+        if let Err(e) = made {
+            release_images(icd, device, &images, pool, &cmds);
+            return Err(e);
+        }
     }
 
     let id = IcdLocal::mint_id(icd);
@@ -297,7 +309,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
                 desc.width,
                 desc.height,
             ))),
-            presenter: Presenter::start(icd, images.len()),
+            presenter: Presenter::start(icd, images.len(), &desc.target),
             present_target: desc.target,
             width: desc.width,
             height: desc.height,
@@ -629,6 +641,10 @@ pub fn acquire_next_image(
 /// the next frame. The reset before it is on the device ring, and the queue
 /// ring's barrier puts the wait after it.
 ///
+/// **Not on a Wayland surface** (docs/waycompose-design.md §98): there the
+/// frame is shown with requests on the application's own `wl_surface`, and
+/// those may only be made inside the application's call. See [`pipelines`].
+///
 /// `SV_PRESENT_SYNC=1` keeps the old order, everything on the calling thread,
 /// so the two can be compared in one binary.
 pub fn queue_present(
@@ -752,12 +768,42 @@ pub(crate) struct Presenter {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Whether a swapchain on `target` may finish its presents on a presenter
+/// thread, after `vkQueuePresentKHR` has returned. `sync` is `SV_PRESENT_SYNC`.
+///
+/// # Never on Wayland unless asked (docs/waycompose-design.md §98)
+///
+/// A Wayland frame is shown with `attach`, `damage` and `commit` on the
+/// application's `wl_surface`, a proxy the application owns and frees. Firefox
+/// destroys that surface *before* the swapchain, on closing a window and on
+/// quitting, and at quit it never destroys the swapchain at all; Mesa's own
+/// WSI survives this because it touches the surface only inside the
+/// application's calls. A presenter that shows a frame a few milliseconds after
+/// `vkQueuePresentKHR` returned marshals on a freed proxy: Firefox's crash at
+/// quit, about one run in five with a video playing. No later check can make
+/// it safe. Even through a proxy wrapper the request would name an object id
+/// the compositor has deleted or given to another object, a protocol error
+/// that ends the application's connection.
+///
+/// X11 and headless keep the presenter: an X11 frame goes out on a connection
+/// of our own, by a window id whose death is an error that connection ignores.
+/// `SV_PRESENT_SYNC=0` pipelines Wayland as well, which is the old behaviour
+/// and its crash; it exists to measure what the synchronous present costs.
+fn pipelines(target: &PresentTarget, sync: Option<&std::ffi::OsStr>) -> bool {
+    match sync {
+        Some(v) if v == "0" => true,
+        Some(_) => false,
+        None => !matches!(target, PresentTarget::Wayland { .. }),
+    }
+}
+
 impl Presenter {
     /// Only for the process's one ICD: the thread outlives the call that made
     /// it and needs an ICD that lives as long. `None` means present on the
-    /// calling thread, which is also what `SV_PRESENT_SYNC=1` asks for.
-    fn start(icd: &SharedVulkan, images: usize) -> Option<Presenter> {
-        if std::env::var_os("SV_PRESENT_SYNC").is_some_and(|v| v != "0") {
+    /// calling thread, which is what [`pipelines`] says for a Wayland surface
+    /// and `SV_PRESENT_SYNC=1` asks for everywhere.
+    fn start(icd: &SharedVulkan, images: usize, target: &PresentTarget) -> Option<Presenter> {
+        if !pipelines(target, std::env::var_os("SV_PRESENT_SYNC").as_deref()) {
             return None;
         }
         let global = crate::instance().filter(|g| std::ptr::eq(*g, icd))?;
@@ -1021,20 +1067,14 @@ fn frame_note(
     }
 }
 
-/// `vkDestroySwapchainKHR`.
-pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
-    let Some(mut sc) = icd.swapchains().remove(&swapchain) else { return };
-    // Every queued present is finished first: they read this swapchain's
-    // buffers and show on its target.
-    if let Some(p) = sc.presenter.take() {
-        p.stop();
-    }
-    // Everything below is best-effort: `vkDestroySwapchainKHR` returns void, and
-    // an application that destroys a swapchain while a present is in flight has
-    // already been told not to. A failed teardown leaks a GPU-side object rather
-    // than corrupting one.
-    let _ = icd.device_wait_idle(p::VkDeviceWaitIdleArgs { device: p::VkDevice(device) });
-    for i in &sc.images {
+/// Destroy a swapchain's images, their readback buffers, the command buffers
+/// and the pool: the half of [`destroy_swapchain`] that a creation which
+/// failed part-way needs too.
+///
+/// Best-effort, for the reason `destroy_swapchain` gives. A handle that was
+/// never created is 0, which every destroy here takes as `VK_NULL_HANDLE`.
+fn release_images(icd: &SharedVulkan, device: u64, images: &[SwapImage], pool: u64, cmds: &[u64]) {
+    for i in images {
         let _ = icd.destroy_fence(p::VkDestroyFenceArgs {
             device: p::VkDevice(device),
             fence: p::VkFence(i.fence),
@@ -1056,15 +1096,67 @@ pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
             memory: p::VkDeviceMemory(i.buffer_memory),
         });
     }
-    let cmds: Vec<u64> = sc.images.iter().map(|i| i.command_buffer).collect();
-    IcdLocal::free_command_buffers(icd, device, sc.pool, &cmds);
+    IcdLocal::free_command_buffers(icd, device, pool, cmds);
     let _ = icd.destroy_command_pool(p::VkDestroyCommandPoolArgs {
         device: p::VkDevice(device),
-        command_pool: p::VkCommandPool(sc.pool),
+        command_pool: p::VkCommandPool(pool),
     });
+}
+
+/// `vkDestroySwapchainKHR`.
+pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
+    let Some(mut sc) = icd.swapchains().remove(&swapchain) else { return };
+    // Every queued present is finished first: they read this swapchain's
+    // buffers and show on its target.
+    if let Some(p) = sc.presenter.take() {
+        p.stop();
+    }
+    // Everything below is best-effort: `vkDestroySwapchainKHR` returns void, and
+    // an application that destroys a swapchain while a present is in flight has
+    // already been told not to. A failed teardown leaks a GPU-side object rather
+    // than corrupting one.
+    let _ = icd.device_wait_idle(p::VkDeviceWaitIdleArgs { device: p::VkDevice(device) });
+    let cmds: Vec<u64> = sc.images.iter().map(|i| i.command_buffer).collect();
+    release_images(icd, device, &sc.images, sc.pool, &cmds);
     let _ = sc.present_target;
 }
 
 fn result_ok(r: p::VkResult) -> IcdResult<()> {
     if r.0 == 0 { Ok(()) } else { Err(LowerError::Result(r.0)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    const WAYLAND: PresentTarget = PresentTarget::Wayland { display: 0x1000, surface: 0x2000 };
+
+    /// docs/waycompose-design.md §98. A pipelined Wayland present shows its
+    /// frame on the application's `wl_surface` after `vkQueuePresentKHR` has
+    /// returned, and Firefox destroys that surface before the swapchain: its
+    /// crash at quit.
+    #[test]
+    fn a_wayland_present_is_finished_before_vk_queue_present_returns() {
+        assert!(
+            !pipelines(&WAYLAND, None),
+            "a Wayland swapchain must not get a presenter: its frames are shown with \
+             requests on the application's wl_surface, which the application may free \
+             as soon as vkQueuePresentKHR returns"
+        );
+    }
+
+    #[test]
+    fn x11_and_headless_keep_the_presenter() {
+        assert!(pipelines(&PresentTarget::X11 { window: 7 }, None));
+        assert!(pipelines(&PresentTarget::Headless, None));
+    }
+
+    #[test]
+    fn sv_present_sync_still_chooses_for_every_target() {
+        for t in [WAYLAND, PresentTarget::X11 { window: 7 }, PresentTarget::Headless] {
+            assert!(!pipelines(&t, Some(OsStr::new("1"))), "{t:?}");
+            assert!(pipelines(&t, Some(OsStr::new("0"))), "{t:?}");
+        }
+    }
 }

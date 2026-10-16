@@ -252,6 +252,9 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// per session that it costs there.
 #[cfg(windows)]
 fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.iter().any(|a| a == "--pool") {
+        return win_guest_pool(args);
+    }
     if args.iter().any(|a| a == "--ivshmem-slot") {
         return win_guest_ivshmem(args);
     }
@@ -863,6 +866,9 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     let mode = args.get(1).cloned().unwrap_or_default();
+    if mode == "pool-guest" {
+        return linux_pool_guest(&args);
+    }
     let socket = arg("--socket").ok_or("--socket is required")?;
     let device: usize = arg("--device").map_or(Ok(0), |s| s.parse())?;
 
@@ -878,7 +884,16 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "serve" => {
             let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
             let clients: usize = arg("--clients").map_or(Ok(1), |s| s.parse())?;
-            serve(driver, &socket, arena_size, clients)
+            // `--slots N`: at most N sessions at once, the rest refused in the
+            // guest's words, so that the ivshmem path's fixed slots can be
+            // measured on this machine (waycompose-design.md §95.10).
+            let slots: usize = arg("--slots").map_or(Ok(0), |s| s.parse())?;
+            // `--pool BYTES`: every session leases from one exported allocation
+            // of this size instead of getting an arena of its own
+            // (waycompose-design.md §97), as the guest's sessions lease from the
+            // GPU ivshmem device.
+            let pool: Option<u64> = arg("--pool").map(|s| s.parse()).transpose()?;
+            serve(driver, &socket, arena_size, clients, slots, pool)
         }
         "attach" => attach(driver, &socket),
         "guest" => {
@@ -890,7 +905,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             eprintln!(
                 "usage: sv-gpu-server <serve|attach|guest> --socket <path> \
-                 [--device N] [--arena BYTES] [--clients N] [--huge] [--bell PORT]"
+                 [--device N] [--arena BYTES] [--clients N] [--slots N] [--pool BYTES] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())
         }
@@ -904,6 +919,8 @@ fn serve(
     socket: &str,
     arena_size: u64,
     clients: usize,
+    slots: usize,
+    pool: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixListener;
@@ -972,9 +989,48 @@ fn serve(
     // partitioned arena, which is otherwise the tidier answer. **The cost is
     // real and is stated rather than hidden**: `N` × `--arena` bytes of device
     // memory, so `--clients 8 --arena 256M` is 2 GiB. `--arena` is the knob.
+    // The pool, when asked for: one allocation, exported once, which every
+    // session's descriptor names and every session leases from. Isolation
+    // between clients is then the lease table's (`Objects::arena_slab` resolves
+    // only inside a session's own leases) and not the descriptor's: this is the
+    // development stand-in for the guest's ivshmem device, which every session
+    // shares in the same way.
+    let pool = match pool {
+        None => None,
+        Some(bytes) => {
+            let a = arena::allocate_and_export(&driver, bytes)?;
+            arena::check_external_buffers_keep_the_arena(&driver, &a)?;
+            sv_transport::poolhdr::PoolHeader::new(&a.region)?.publish(sv_gpu_server::pool_guest::nonce());
+            let mut whole = vec![None; sv_arena::pool::MAX_REGIONS];
+            whole[0] = Some((a.memory, a.memory_type));
+            let server = sv_gpu_server::pool::PoolServer::new(
+                sv_arena::pool::PoolConfig::for_capacity(bytes),
+                Arc::clone(&a.region),
+                sv_gpu_server::pool::Importer::Whole(whole),
+            )?;
+            eprintln!("[gpu] a pool of {} MiB from the driver, memory type {}, every session leasing from it; {}", bytes >> 20, a.memory_type, server.report());
+            Some((a, server))
+        }
+    };
     let mut sessions: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    for i in 0..clients {
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut i = 0;
+    while i < clients {
         let (sock, _) = listener.accept()?;
+        let busy = live.load(std::sync::atomic::Ordering::Acquire);
+        if slots != 0 && busy >= slots {
+            let reason = format!(
+                "all {slots} GPU session slots are taken ({busy} busy, 0 quarantined, 0 free)"
+            );
+            eprintln!("[gpu] a client: refused: {reason}");
+            // After its `AttachRequest`, as `sv-hostd` answers: a refusal
+            // written before the client has written anything races its write,
+            // which then fails with EPIPE instead of reading the reason.
+            let _ = sv_transport::cold::recv(&sock);
+            let _ = sv_transport::cold::send(&sock, &sv_transport::cold::ColdMessage::Refuse { code: 4, reason });
+            continue;
+        }
+        live.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         // Everything below is per session, and it is built *after* the accept so
         // that a client that never comes costs nothing.
@@ -985,19 +1041,35 @@ fn serve(
             0,
             geometry.control_size as usize,
         )?);
-        let arena = arena::allocate_and_export(&driver, arena_size)?;
-        eprintln!(
-            "[gpu] session {i}: arena {} MiB from the driver, memory type {}, exported as a \
-             descriptor",
-            arena.len >> 20,
-            arena.memory_type
-        );
-        arena::check_external_buffers_keep_the_arena(&driver, &arena)?;
-        let arena_fd = arena
-            .exported_fd
-            .as_ref()
-            .ok_or("the export path produced no descriptor")?
-            .as_fd();
+        let arena = match &pool {
+            Some((p, _)) => arena::Arena {
+                provider: p.provider,
+                region: Arc::clone(&p.region),
+                memory: p.memory,
+                len: p.len,
+                memory_type: p.memory_type,
+                external_handle_type: p.external_handle_type,
+                exported_fd: None,
+            },
+            None => {
+                let a = arena::allocate_and_export(&driver, arena_size)?;
+                eprintln!(
+                    "[gpu] session {i}: arena {} MiB from the driver, memory type {}, exported as a \
+                     descriptor",
+                    a.len >> 20,
+                    a.memory_type
+                );
+                arena::check_external_buffers_keep_the_arena(&driver, &a)?;
+                a
+            }
+        };
+        let arena_fd = match &pool {
+            Some((p, _)) => p.exported_fd.as_ref(),
+            None => arena.exported_fd.as_ref(),
+        }
+        .ok_or("the export path produced no descriptor")?
+        .as_fd();
+        let arena_len = arena.len;
 
         let generation = 1u32;
         let control = Control::create(
@@ -1021,7 +1093,7 @@ fn serve(
             // regions are one object and the arena begins after the control
             // region.
             arena_offset: 0,
-            arena_len: arena_size,
+            arena_len,
             generation,
             run_count: 0,
         };
@@ -1083,7 +1155,11 @@ fn serve(
         shm_unlink(&control_name);
 
         let mut objects = Objects::new();
-        objects.set_arena(arena.memory, arena.len);
+        let binding = pool.as_ref().map(|(_, s)| s.open_session("?"));
+        match &binding {
+            Some(b) => objects.set_pooled(b.clone()),
+            None => objects.set_arena(arena.memory, arena.len),
+        }
         let shared = Arc::new(Shared {
             driver: Arc::clone(&driver),
             arena,
@@ -1100,6 +1176,7 @@ fn serve(
         // here: closing it is how the client learns the GPU side is gone, and a
         // client whose cold path closed under it while its rings were live would
         // read that as a crash.
+        let live = Arc::clone(&live);
         sessions.push(std::thread::spawn(move || {
             let _sock = sock;
             let _region = control_region;
@@ -1131,7 +1208,17 @@ fn serve(
                     }
                 }
             }
+            // A pooled session's leases go back to the pool now: its account
+            // closes, and the next session of any process can have the room.
+            // Nothing was imported per lease on this path, so nothing is freed.
+            if let Some(b) = binding {
+                let leases = shared.objects.lock().map(|mut o| o.take_leases()).unwrap_or_default();
+                let n = unsafe { sv_gpu_server::pool::end_session(&b, &shared.driver.device, leases) };
+                eprintln!("[gpu] session {i}: {n} lease(s) given back; {}", b.server.report());
+            }
+            live.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }));
+        i += 1;
     }
 
     for s in sessions {
@@ -1466,4 +1553,80 @@ fn report_missing(fns: &sv_gpu_entry::DriverFns) {
 #[cfg(any(target_os = "linux", windows))]
 fn geometry_for(arena_size: u64) -> sv_transport::control::Geometry {
     sv_transport::control::Geometry::for_arena(arena_size)
+}
+
+/// `report_missing`, for the pool path in `pool_guest`.
+pub fn report_missing_pub(fns: &sv_gpu_entry::DriverFns) {
+    report_missing(fns);
+}
+
+/// The settings both pool entries take.
+fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolServe, Box<dyn std::error::Error>> {
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    Ok(sv_gpu_server::pool_guest::PoolServe {
+        port: arg("--port").ok_or("--port is required")?.parse()?,
+        device: arg("--device").map_or(Ok(0), |s| s.parse())?,
+        idle: std::time::Duration::from_secs(arg("--idle").map_or(Ok(30), |s| s.parse())?),
+        max_sessions: arg("--sessions").map_or(Ok(8), |s| s.parse())?,
+    })
+}
+
+/// The Windows guest serving every GPU session from one pool on the ivshmem
+/// device at `--ivshmem-slot` (waycompose-design.md §97).
+///
+/// ```text
+/// sv-gpu-server guest --pool --port <tcp> --ivshmem-slot <pci slot> [--device N]
+///                     [--sessions N] [--idle SECS] [--bell PORT]
+/// ```
+#[cfg(windows)]
+fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    crate::fault::install();
+    use std::sync::Arc;
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let cfg = pool_serve_args(args)?;
+    let pci = arg("--ivshmem-slot").ok_or("--ivshmem-slot is required")?;
+    let pci: u8 = match pci.strip_prefix("0x") {
+        Some(h) => u8::from_str_radix(h, 16)?,
+        None => pci.parse()?,
+    };
+    let started = std::time::Instant::now();
+    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    eprintln!("[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, the pool's region 0", started.elapsed(), size >> 20);
+    // SAFETY: the view lives until this function returns, which is never
+    // while a session runs: `serve_pool` returns only if the listener fails,
+    // and the process ends with it.
+    let boot = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(view.ptr().cast_mut(), size as usize) });
+    let r = sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"));
+    drop(view);
+    Ok(r?)
+}
+
+/// The same pool path on Linux, for the development loop: `--pool-file` is
+/// region 0, and region `k` is the file `sv_transport::poolhdr::region_path`
+/// names beside it — exactly what the host side opens. The import is a host
+/// pointer into a shared file mapping, which lavapipe takes and RADV refuses
+/// (docs/design.md §5.4).
+///
+/// ```text
+/// sv-gpu-server pool-guest --pool-file <path> --port <tcp> [--device N]
+///                          [--sessions N] [--idle SECS]
+/// ```
+#[cfg(target_os = "linux")]
+fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+    use std::sync::Arc;
+    let arg = |k: &str| -> Option<String> {
+        args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
+    };
+    let cfg = pool_serve_args(args)?;
+    let path = arg("--pool-file").ok_or("--pool-file is required")?;
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    let len = f.metadata()?.len();
+    let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
+    eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);
+    Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, None)?)
 }
