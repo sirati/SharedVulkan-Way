@@ -28616,7 +28616,9 @@ lose focus and rolled its menus up, so the click landed on a menu that was
 already closing. Popups now refuse activation, and the compositor no longer
 passes a focus move between a window and its own popups on to the client
 (93.2). This is proven under Wine, where it reproduced, for three cases:
-Help → About Firefox, a nested bookmarks folder, and a `<select>`. **The
+Help → About Firefox, a nested bookmarks folder, and a `<select>`. On the
+guest, after <guest-user> unlocked the session, the same three work with this
+branch's build (93.4). **The
 clipboard**: the paths §90 tested work on the guest, including the real
 double-click route, and Unicode, emoji, line breaks and HTML arrive intact
 (93.4). Three defects were found that a person meets and a test does not
@@ -28628,10 +28630,11 @@ double-click route, and Unicode, emoji, line breaks and HTML arrive intact
 - pictures did not cross at all.
 
 All three are fixed and tested under Wine; `scripts/wc-clip.sh` covers
-pictures, 17 passed. The guest checks with real Windows programs (Notepad,
-Word, the Run box) did not run. A bug in this branch's test agent locked
-<guest-user>'s session at 06:38 (93.6), and input on the guest stopped there.
-Nothing is deployed to `wcivs` (93.8).
+pictures, 17 passed. On the guest the start-up paste and Firefox → Word
+work; Word → Firefox, Notepad, the big copy, pictures and the ssh fallback
+were cut off when TeamViewer locked <guest-user>'s session at the end of a remote
+session, at 06:38 and again at 09:28 (93.6). Deployed to `wcivs`, 13 passed
+(93.8).
 
 ### 93.2 The menu: a click activated the popup
 
@@ -28784,8 +28787,13 @@ agent of §90 (`SendInput`, guarded to our windows).
 | Windows → Firefox, `Set-Clipboard` then Ctrl+V in a textarea | `Grüße ✓ 漢字 😀`, LF, `https://example.org/?q=1&r=ü`: every code point |
 | Firefox → Windows, Ctrl+A Ctrl+C in the textarea | the same text with CRLF; owner `sv-guest.exe`; `CF_TEXT`, `CF_OEMTEXT` and `CF_LOCALE` synthesised by Windows |
 | Firefox page selection → Windows | `CF_UNICODETEXT` and `"HTML Format"` |
-| start-up announcement (second deploy) | the line above; no paste (93.6) |
-| Notepad, Word, the Run box, images, a big copy, the menu, the ssh fallback route | **not run** (93.6) |
+| start-up paste (09:24, after the unlock) | text on the clipboard before the double-click pasted into the textarea: `TA:PRE-SESSION ü 42 wcc-pre` |
+| hamburger → "Help and Report" | the popup stays and shows the Help subview (`guest-menu-popup.png`, `guest-help-popup.png`); the compositor logged only the press and release, no focus or activation change |
+| → "About Firefox" | `About Mozilla Firefox`, 746x427 (`guest-about.png`) |
+| Bookmarks (Alt+B) → "Mozilla Firefox" → first item | the nested popup opened on hover (`guest-bm.png`, `guest-bm-nested.png`); the click opened "Firefox Help" |
+| a `<select>` | an option clicked in its list became the value (`SEL:beta`) |
+| Firefox → Word (a document opened through COM, `Content.Paste()`) | `wcc-ff2word Gruesse ok` |
+| Word → Firefox, Notepad, the 6 MB copy, pictures, master's compositor for the before, the ssh fallback | **not run**: the session locked at 09:28:48 (93.6) |
 
 Two facts about the guest bear on what the user saw:
 - **One session at a time.** The ivshmem device allows one mapping, and the
@@ -28810,29 +28818,55 @@ normal use:
 
 Short text in a running session worked before this branch, and still does.
 
-### 93.6 Incident: <guest-user>'s session locked
+### 93.6 Incident: <guest-user>'s session locked, twice, and the clipboard history
 
-From 06:34 to 06:38 the test agent in session 1 ran one command batch in a
-loop. A command had overwritten the variable that held the batch's file,
-so the batch was never removed. The batch held a Win+R chord sent as
-non-extended scancodes, and Ctrl+L. At 06:38:14 LogonUI and LockApp
-started: <guest-user>'s session was locked, most likely by a stuck Win key plus
-L. Locking ends nothing (<guest-user>'s programs keep running), but <guest-user> has to
-unlock it. Three more consequences:
-- The loop's copies filled the Windows clipboard history (25 entries) and
-  pushed <guest-user>'s older entries out.
-- The text that was on <guest-user>'s clipboard at 06:19 was saved only in the
+**The locks were TeamViewer's.** <guest-user>'s session locked at 06:38:14 and
+again at 09:28:48. TeamViewer's own log on the guest
+(`C:\Program Files\TeamViewer\TeamViewer15_Logfile.log`) records both:
+
+```
+06:38:14.966  Carrier[95]::CmdEndSession(): Received CMD_ENDSESSION with reason: PartnerDisconnected_WithError
+06:38:14.994  tvdesktop::WorkstationLocker::LockWorkstation: Start locking workstation ...
+06:38:15.086  SERVICE_CONTROL_SESSIONCHANGE session=1, statusCode=WTS_SESSION_LOCK, console=1
+09:20:27.296  WorkstationLockerWin::ShouldAutoLockWorkstation: Autolock: yes, ...
+09:28:48.625  tvdesktop::WorkstationLocker::LockWorkstation: Start locking workstation ...
+09:28:48.710  SERVICE_CONTROL_SESSIONCHANGE session=1, statusCode=WTS_SESSION_LOCK, console=1
+```
+
+TeamViewer is set to lock the computer when a remote session to it ends.
+The first session ended because the partner's connection dropped and the
+reconnect failed. This branch's first report blamed the 06:38 lock on its
+test agent, which was replaying an input batch with a malformed Win+R chord
+at that moment. The log shows otherwise, and that report is withdrawn. The
+second lock came 12 s after the agent's last keystroke (Ctrl+C in its own
+Firefox window at 09:28:36). The agent refused its next batch because of the
+lock screen. Practical consequence: while TeamViewer's autolock is on, a
+dropped remote session locks the desktop and ends every test that needs
+input until someone unlocks it. Turning the option off is <guest-user>'s choice,
+and nothing here changed it.
+
+**The agent's loop was real**, 06:34–06:38. A command had overwritten the
+variable that held the batch's file, so the batch was never removed and ran
+39 times. What it did:
+- **Clipboard history.** Each run copied, so the copies filled the Windows
+  clipboard history (25 entries) and pushed <guest-user>'s older entries out. The
+  25 entries, all this branch's, were then deleted through the WinRT
+  `Clipboard` history API from a non-interactive process.
+- **<guest-user>'s clipboard.** The text on it at 06:19 was saved only in the
   agent's memory, and was lost when the agent was stopped.
-- Clipboard access is denied while the session is locked, so the test text
-  left on it (`PRE-SESSION ü 42 wcc-pre`) could not be cleared.
+- **The clipboard now.** It still holds this branch's test string
+  (`PRE-SESSION ü 42 wcc-pre`). It cannot be cleared while the session is
+  locked, and it is to be cleared only if it still holds exactly that.
 
-The 25 history entries, all this branch's, were deleted through the WinRT
-`Clipboard` history API from a non-interactive process; the history is now
-empty. The agent is fixed: the loop variable is its own, a command file is
-removed before it runs, and the Win key goes out extended. But no chord with
-a Win key, and no input loop, belongs on a person's desktop at all. Those
-rules are now in `visual-check-instructions.md`. Everything on the guest
-after 06:38 ran without input.
+The agent is fixed:
+- The loop variable is its own, and a command file is removed before it
+  runs.
+- It never sends the Win key, and drops the chords that needed one.
+- It refuses input while LogonUI is up.
+- It sends a click or a key only while the foreground window and the point
+  belong to a process the test started.
+
+The rules for every agent are in `visual-check-instructions.md`.
 
 ### 93.7 Gates
 
@@ -28848,28 +28882,24 @@ after 06:38 ran without input.
 
 ### 93.8 What is deployed, and what remains
 
-Nothing is deployed to `wcivs`. The fixes are proven under Wine and, for the
-clipboard's basic paths, on the guest. The menu and the real-program checks
-need an unlocked session. The test install `wcclip` holds this branch's
-build with master merged (the third deploy, 13 passed). The way to deploy, once
-the guest checks below pass, is §91.10's: back up to `wcivs-backup-93`, then
-run `wc-launch.sh deploy` from the merged branch with §88.6's variables, and
-expect 13 passed.
+| where | what |
+|---|---|
+| `wcivs` | backed up to `C:\Users\<guest-user>\wcivs-backup-93` and `~/wc-launch-ivs-backup-93`, then `wc-launch.sh deploy` from master `14baa7c` (this branch merged) with §91.10's variables: **13 passed, 0 failed** (`deploy-93.txt`) |
+| changed | `sv-guest.exe` `9f62c1c9…` to `3e552f23…`, `wc-proxy` `a165e270…` to `d77542a8…`, `libsv_icd.so` `53632f4e…` to `e66fbc71…` (the same ICD source, built in this worktree) |
+| unchanged | `wc-launch.exe`, `wc-desk.exe`, `probe-relay.exe`, `wc-arena-host`, `sv-hostd`, `wc-session`; the ini and `gpu.env` byte-identical |
+| the test install `wcclip` | left installed and stopped (`C:\Users\<guest-user>\wcclip`, `~/wc-launch-clip`, profile `~/.wc-launch/firefox-clip`), with no desktop shortcut; its agent, its files and its scheduled tasks are removed |
+| the clipboard | still holds this branch's test string (93.6) |
 
-To run on the guest once <guest-user>'s session is unlocked, through the lease,
-with the session-1 agent and no Win-key chords:
-1. Hamburger → Help and Report → About Firefox; Bookmarks → a folder → an
-   item; a `<select>`. The question is whether real Windows activates a
-   clicked `WS_EX_NOACTIVATE` popup as Wine does. The fix covers both cases;
-   the same clicks with an `sv-guest.exe` built from master's compositor
-   (`/tmp/cs/sv-guest-master-compositor.exe`) say whether the bug was this
-   one on the guest too.
-2. Copy in a fresh Notepad window on a scratch file and in a Word document
-   opened through COM, and paste into each from Firefox. The Run box is left
-   out: it opens only with Win+R, which no agent sends any more.
-3. Copy text in Windows, then double-click, then paste (the start-up
-   announcement).
-4. The 6 MB copy, then a small one; "copy image" pasted into Paint or Word;
-   a Snipping Tool picture pasted into the page's paste zone.
-5. The ssh fallback, with `wayland-bell =` empty in `wcclip`'s ini.
-6. Clear the test text from the clipboard (`clear.ps1`).
+**Pending**, all needing input in an unlocked session, through the lease and
+under the rules of 93.6:
+1. The menu clicks with an `sv-guest.exe` built from master's compositor
+   (`/tmp/cs/sv-guest-master-compositor.exe`). With the fix nothing moved;
+   this run says whether real Windows moves the focus as Wine did, and
+   therefore whether this was the user's bug.
+2. Word → Firefox (a document opened through COM), and a fresh Notepad
+   window on a scratch file, both ways. The Run box is left out: it opens
+   only with Win+R, which no agent sends any more.
+3. The 6 MB copy and then a small one; "copy image" pasted into Word; a
+   picture from Windows pasted into the page's paste zone.
+4. The ssh fallback, with `wayland-bell =` empty in `wcclip`'s ini.
+5. Clear the test string from the clipboard, if it still holds exactly that.
