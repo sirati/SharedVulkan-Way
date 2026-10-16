@@ -644,6 +644,28 @@ pub mod dnd_action {
     }
 }
 
+/// The Wayland thread's [`crate::tick::Waker`], for the UI thread to end its
+/// turn's wait with when it has queued an event (waycompose-design.md §89).
+///
+/// A global because the UI side is reached from a window procedure, which has
+/// no way to be handed anything; set once, by the Wayland thread, when its
+/// ticker exists. Unset — before that, or in a build that never sets it — the
+/// event simply waits for the turn, which is what every event did before.
+static UI_WAKER: std::sync::OnceLock<crate::tick::Waker> = std::sync::OnceLock::new();
+
+pub fn set_ui_waker(w: crate::tick::Waker) {
+    let _ = UI_WAKER.set(w);
+}
+
+/// End the Wayland thread's wait: an event is queued for it. Called by the
+/// Win32 platform's input; the headless one has no input to hurry.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn wake_wayland() {
+    if let Some(w) = UI_WAKER.get() {
+        w.wake();
+    }
+}
+
 /// `WC_FRAME_TRACE` (docs/waycompose-design.md §89): one line for an input
 /// event at a named stage of its way to the client — `wc.in` when the UI thread
 /// has it from Windows, `wc.in_tx` when the Wayland thread hands it to smithay.

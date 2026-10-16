@@ -39,6 +39,13 @@ struct Args {
     /// §36, cross-VM. The `sv-hostd` socket to attach through, when the
     /// compositor published its control region out of the guest's own RAM.
     upstream_ring_attach: Option<PathBuf>,
+    /// §89. Carry the Wayland connections on the rings the compositor kept at
+    /// the tail of the `--arena-ivshmem` region, woken through `--wayland-bell`.
+    /// `--upstream` stays: the icon and clipboard feeds use it, and so does any
+    /// connection that cannot have a ring — each such fallback is logged.
+    wayland_rings: bool,
+    /// §89. QEMU's socket for the rings' virtio-serial port.
+    wayland_bell: Option<PathBuf>,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -151,6 +158,13 @@ usage: wc-proxy --upstream <path> [options]
                          client claims a ring of RingKind::Wayland in it and the
                          bytes cross as shared memory -- no socket, no TCP and
                          no ssh in the data path. --upstream is then unused.
+  --wayland-rings        §89: carry each client's connection on a ring in the
+                         tail of the --arena-ivshmem region (the header says
+                         where), woken through --wayland-bell. --upstream is
+                         still needed: the icon and clipboard feeds use it, and
+                         a connection that cannot have a ring falls back to it,
+                         loudly
+  --wayland-bell PATH    §89: QEMU's socket for the rings' virtio-serial port
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -238,6 +252,8 @@ fn parse_args() -> Result<Args, String> {
         upstream: PathBuf::new(),
         upstream_ring: None,
         upstream_ring_attach: None,
+        wayland_rings: false,
+        wayland_bell: None,
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -279,6 +295,8 @@ fn parse_args() -> Result<Args, String> {
             "--upstream" => a.upstream = next()?.into(),
             "--upstream-ring" => a.upstream_ring = Some(next()?.into()),
             "--upstream-ring-attach" => a.upstream_ring_attach = Some(next()?.into()),
+            "--wayland-rings" => a.wayland_rings = true,
+            "--wayland-bell" => a.wayland_bell = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -351,6 +369,20 @@ fn parse_args() -> Result<Args, String> {
         && a.upstream_ring_attach.is_none()
     {
         return Err("--upstream, --upstream-ring or --upstream-ring-attach is required".into());
+    }
+    if a.wayland_rings {
+        if a.arena_ivshmem.as_os_str().is_empty() || a.arena_run.is_none() {
+            return Err("--wayland-rings needs --arena-ivshmem and --arena-run: the rings are in that region".into());
+        }
+        if a.wayland_bell.is_none() {
+            return Err("--wayland-rings needs --wayland-bell: a ring nobody can wake is a poll".into());
+        }
+        if a.upstream.as_os_str().is_empty() {
+            return Err("--wayland-rings needs --upstream, for the feeds and for a connection that falls back".into());
+        }
+        if a.upstream_ring.is_some() || a.upstream_ring_attach.is_some() {
+            return Err("--wayland-rings and --upstream-ring/--upstream-ring-attach each name the ring region".into());
+        }
     }
     if a.pool_dir.as_os_str().is_empty() {
         a.pool_dir = a.runtime_dir.join("wc-pools");
@@ -767,6 +799,49 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // §89. The launcher's rings: the tail of the ivshmem region, found by the
+    // header whose run id `--arena-run` names, woken through a virtio-serial
+    // port. Every way this can fail ends in the same place — the socket, which
+    // is ssh — and says so in capitals, because a session that silently went
+    // back to ssh looks exactly like one that did not, until somebody measures.
+    let mut doorbell: Option<wc_proxy::rings::Doorbell> = None;
+    let ring = if args.wayland_rings {
+        let up = args.upstream.display();
+        let run = args.arena_run.unwrap_or(0);
+        let bell = args.wayland_bell.clone().unwrap_or_default();
+        match wc_proxy::rings::attach_ivshmem(&args.arena_ivshmem, run) {
+            Ok(Some(control)) => match wc_proxy::rings::Doorbell::connect(&bell) {
+                Ok(d) => {
+                    println!(
+                        "[proxy] wayland rings: {} slots at the tail of {}, doorbell {} -- the \
+                         Wayland connections cross as shared memory, not through ssh",
+                        control.layout().geometry.ring_slot_count,
+                        args.arena_ivshmem.display(),
+                        bell.display()
+                    );
+                    doorbell = Some(d);
+                    Some(control)
+                }
+                Err(e) => {
+                    println!("[proxy] SSH FALLBACK: the rings' doorbell: {e}; every connection uses {up}");
+                    None
+                }
+            },
+            Ok(None) => {
+                println!(
+                    "[proxy] SSH FALLBACK: the compositor kept no Wayland rings (its log says why); \
+                     every connection uses {up}"
+                );
+                None
+            }
+            Err(e) => {
+                println!("[proxy] SSH FALLBACK: the Wayland rings: {e}; every connection uses {up}");
+                None
+            }
+        }
+    } else {
+        ring
+    };
     let mut served: usize = 0;
     let deadline = std::time::Instant::now() + args.accept_timeout;
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -895,22 +970,52 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // already mapped. The `bind`/`listen` window this grace exists for is a
         // property of sockets, and a ring has no equivalent — which is one small
         // way the design is simpler than the thing it replaces.
-        let upstream = match ring.as_ref() {
-            Some(control) => match sv_transport::wlbytes::ByteChannel::claim(control, n as u64) {
-                Ok(ch) => {
+        // §89: a ring when there is one to be had, else the socket — and on the
+        // launcher's rings the socket is ssh, so that is said loudly.
+        let claimed = ring.as_ref().map(|control| {
+            sv_transport::wlbytes::ByteChannel::claim(control, n as u64).map(|ch| (control, ch))
+        });
+        let upstream = match claimed {
+            Some(Ok((control, ch))) => {
+                let slot = ch.slot();
+                let wake = doorbell.as_ref().and_then(|d| {
+                    wc_proxy::rings::RingWake::new(&d.hub, slot)
+                        .map_err(|e| {
+                            println!("[proxy] client {n}: no eventfd for ring {slot} ({e}); it polls instead")
+                        })
+                        .ok()
+                });
+                if wake.is_some() {
+                    // The compositor accepts a ring on its next turn; a byte on
+                    // the port makes that turn now rather than at the end of
+                    // its wait.
+                    if let Some(cw) = sv_transport::park::cross_wake() {
+                        cw.poke(sv_transport::park::lane_token(slot, sv_transport::ring::Lane::Command));
+                    }
+                }
+                println!(
+                    "[proxy] client {n} connected, upstream ring slot {slot} \
+                     (no socket, no TCP, no ssh{})",
+                    if wake.is_some() { "; woken by the doorbell" } else { "" }
+                );
+                proxy::Upstream::Ring(Box::new(proxy::RingUpstream::new(
+                    ch,
+                    std::sync::Arc::clone(control),
+                    wake,
+                )))
+            }
+            Some(Err(e)) if !args.wayland_rings => {
+                println!("[proxy] client {n}: no free Wayland ring: {e}");
+                continue;
+            }
+            claimed => {
+                if let Some(Err(e)) = claimed {
                     println!(
-                        "[proxy] client {n} connected, upstream ring slot {} \
-                         (no socket, no TCP, no ssh)",
-                        ch.slot()
+                        "[proxy] client {n}: SSH FALLBACK: no Wayland ring for this connection \
+                         ({e}); it uses {}",
+                        args.upstream.display()
                     );
-                    proxy::Upstream::Ring(Box::new(ch))
                 }
-                Err(e) => {
-                    println!("[proxy] client {n}: no free Wayland ring: {e}");
-                    continue;
-                }
-            },
-            None => {
                 match proxy::connect_upstream(&args.upstream, |refusals, ms| {
                     println!(
                         "[proxy] client {n}: the compositor refused {refusals} connect(s) over \
@@ -961,7 +1066,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // client's icons with it and nobody else's.
         let (want_icons, icon_theme, upstream_path) =
             (args.icons, args.icon_theme.clone(), args.upstream.clone());
-        let on_ring = ring.is_some();
+        // The feeds need a socket; on §89's rings `--upstream` is still one.
+        let on_ring = ring.is_some() && args.upstream.as_os_str().is_empty();
         // STAGE 13. Where *this* client's application is installed, asked of
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the
@@ -1126,6 +1232,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             grow_nanos as f64 / 1e6,
             mib(released_bytes),
         );
+    }
+    if let Some(d) = &doorbell {
+        let (delivered, stray) = d.hub.stats();
+        println!("[proxy] wayland rings' doorbell: {delivered} wake(s) delivered, {stray} stray byte(s)");
     }
     println!("[proxy] stopped: {served} client(s) served");
     Ok(())

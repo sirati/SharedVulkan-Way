@@ -952,6 +952,8 @@ impl WindowState {
             super::trace_input("wc.in", &e);
         }
         let _ = self.events.send(e);
+        // §89: and the loop handles it now, not at the end of its wait.
+        super::wake_wayland();
     }
 
     /// A client-area point, in the surface's own coordinates.

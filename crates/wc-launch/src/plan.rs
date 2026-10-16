@@ -51,7 +51,7 @@ pub fn remote_upstream(id: &str) -> String {
 /// the product path has no root in it. `--arena-frames` went with the locate it
 /// fed. The developer harnesses keep `--arena-guest-ram`; this launcher does not.
 pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
-    vec![
+    let mut a: Vec<String> = vec![
         // `sv-guest` is one binary with two halves and the first argument picks
         // one; `sv-guest wayland …` takes exactly the arguments the old
         // `wc-compositor.exe` took (docs/one-binary.md). It is written here
@@ -78,7 +78,14 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
         "0".into(),
         "--arena-outbound".into(),
         format!("0:{}", cfg.outbound),
-    ]
+    ];
+    // §89. The Wayland connections as rings in the region's tail, woken
+    // through this port. The compositor decides whether it can (the port may
+    // not exist) and says which in its log; the launcher reads that line.
+    if !cfg.wayland_bell.is_empty() {
+        a.extend(["--wayland-rings".into(), cfg.wayland_bell.clone()]);
+    }
+    a
 }
 
 /// The byte pipe from the guest's loopback into the compositor's AF_UNIX
@@ -477,6 +484,21 @@ mod tests {
         for forbidden in ["shared-file", "arena-path", "arena-provide", "shared-dir", "arena-guest-ram"] {
             assert!(!code.contains(forbidden), "{forbidden} appears in plan.rs's code");
         }
+    }
+
+    /// §89. The rings' port goes to the compositor as `--wayland-rings`, and
+    /// an empty one sends nothing — the ssh path, with nothing to fall from.
+    #[test]
+    fn the_compositor_is_asked_for_rings_on_the_configured_port() {
+        let mut c = cfg();
+        let argv = compositor_argv(&c, "wl-x", "log");
+        let i = argv.iter().position(|a| a == "--wayland-rings").expect("no --wayland-rings");
+        assert_eq!(argv[i + 1], "org.sirati.wcbell.0");
+        c.wayland_bell.clear();
+        assert!(!compositor_argv(&c, "wl-x", "log").iter().any(|a| a == "--wayland-rings"));
+        // The tunnel is unchanged by it: the feeds, a fallback, the GPU's cold
+        // path and the sound still need it.
+        assert_eq!(tunnel_argv(&c, "kh", "wcl-1"), tunnel_argv(&cfg(), "kh", "wcl-1"));
     }
 
     #[test]

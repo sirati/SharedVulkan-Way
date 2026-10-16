@@ -382,6 +382,18 @@ mod win {
         Ok(Some(Owner { handle: h as isize }))
     }
 
+    /// §89. A reply from the host that says the Wayland connections went back
+    /// to ssh gets a line of its own, in capitals, so that a log read later
+    /// cannot mistake a session on the tunnel for one on the rings.
+    fn loud_fallback(log: &mut Log, who: &str, said: &str) {
+        for l in said.lines().filter(|l| l.contains("SSH FALLBACK")) {
+            let why = l.split_once("SSH FALLBACK:").map_or(l, |(_, w)| w).trim();
+            log.say(&format!(
+                "SSH FALLBACK: the Wayland connections cross the ssh tunnel this session, as {who} says: {why}"
+            ));
+        }
+    }
+
     fn kill(pid: u32) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
@@ -684,6 +696,20 @@ mod win {
             "the compositor never published an ivshmem arena".to_string()
         })?;
         log.say(&format!("arena: run {run_id}, {} ms", t.elapsed().as_millis()));
+        // §89. Whether the compositor kept the region's tail for the Wayland
+        // rings, in its own words: both lines come before the header line this
+        // waited for, so they are in the log now.
+        if !cfg.wayland_bell.is_empty() {
+            let text = std::fs::read_to_string(&p.comp_log).unwrap_or_default();
+            match text.lines().find(|l| l.contains("wayland rings:") || l.contains("WAYLAND RINGS UNAVAILABLE")) {
+                Some(l) if l.contains("UNAVAILABLE") => log.say(&format!(
+                    "SSH FALLBACK: the Wayland connections will cross the ssh tunnel this session -- {}",
+                    l.trim()
+                )),
+                Some(l) => log.say(&format!("rings: {}", l.trim())),
+                None => log.say("SSH FALLBACK: the compositor said nothing about Wayland rings (an older sv-guest.exe?)"),
+            }
+        }
 
         // 3. The host checks the header against the run id. No locate, no root:
         //    it opens a file its group may open. What used to be §12.5's 2.4 s
@@ -697,19 +723,36 @@ mod win {
             }
         };
         log.say(&format!("up: {} ({} ms)", said.replace('\n', " | "), t_locate.elapsed().as_millis()));
+        loud_fallback(log, "the host", &said);
 
-        // 4. The relay, and the tunnel that gives the host an end of it.
-        let relay = quiet(
+        // 4. The relay, and the tunnel that gives the host an end of it. The
+        //    tunnel is opened whatever the Wayland connections ride (§89): the
+        //    icon and clipboard feeds, a connection that falls back, the GPU's
+        //    cold path and the sound all use it.
+        let mut relay = match quiet(
             Command::new(&cfg.relay).args(plan::relay_argv(cfg, &socket_path.to_string_lossy())),
         )
         .spawn()
-        .map_err(|e| format!("{}: {e}", cfg.relay))?;
-        let tunnel = quiet(
+        {
+            Ok(c) => c,
+            Err(e) => {
+                kill(comp_pid);
+                return Err(format!("{}: {e}", cfg.relay));
+            }
+        };
+        let mut tunnel = match quiet(
             Command::new(&cfg.ssh)
                 .args(plan::tunnel_argv(cfg, &p.known_hosts.to_string_lossy(), &id)),
         )
         .spawn()
-        .map_err(|e| format!("{}: {e}", cfg.ssh))?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = relay.kill();
+                kill(comp_pid);
+                return Err(format!("{}: {e}", cfg.ssh));
+            }
+        };
 
         // 5. The proxy, on the plan. Retried, because the tunnel's socket
         //    appears on the *other* machine and there is nothing here to watch
@@ -720,7 +763,8 @@ mod win {
         for _ in 0..60 {
             match ssh(cfg, p, &["proxy", &id]) {
                 Ok(s) => {
-                    log.say(&format!("proxy: {s} ({} ms)", t_proxy.elapsed().as_millis()));
+                    log.say(&format!("proxy: {} ({} ms)", s.replace('\n', " | "), t_proxy.elapsed().as_millis()));
+                    loud_fallback(log, "the proxy", &s);
                     ok = true;
                     break;
                 }
@@ -731,6 +775,12 @@ mod win {
             }
         }
         if !ok {
+            // The relay and the tunnel too: before §89 a failure here left both
+            // running, and a tunnel left holding its loopback forwards is one
+            // the next session's tunnel binds beside (Windows' ssh.exe allows
+            // it) and loses connections to.
+            let _ = relay.kill();
+            let _ = tunnel.kill();
             kill(comp_pid);
             return Err(format!("the host would not start its proxy: {last}"));
         }

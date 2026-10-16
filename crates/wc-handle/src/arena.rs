@@ -454,8 +454,11 @@ pub struct IvshmemRegion {
     pub generation: u64,
     /// The whole device, header page included.
     pub region_len: u64,
-    /// The arena: the device less [`crate::ivshmem::HEADER_BYTES`].
+    /// The arena: the device less [`crate::ivshmem::HEADER_BYTES`] and the rings.
     pub arena_len: u64,
+    /// The Wayland rings' region, `(offset, len)` in region offsets, or
+    /// `(0, 0)` (waycompose-design.md §89).
+    pub rings: (u64, u64),
     /// The device path it was reached by, for the log.
     pub device: String,
 }
@@ -466,6 +469,9 @@ struct IvshmemState {
     run_id: u64,
     generation: u64,
     region_len: u64,
+    /// Bytes at the region's tail kept out of the arena for the Wayland
+    /// rings (§89); 0 for none.
+    rings_len: u64,
 }
 
 fn ivshmem_slot() -> &'static Mutex<Option<IvshmemState>> {
@@ -502,9 +508,51 @@ fn ivshmem_slot() -> &'static Mutex<Option<IvshmemState>> {
 /// as describing this one. The new header is written by [`publish_ivshmem`],
 /// later, once the outbound window it has to describe exists.
 pub fn attach_ivshmem(id: u32, device: u32) -> io::Result<IvshmemRegion> {
+    attach_ivshmem_with_rings(id, device, 0)
+}
+
+/// [`attach_ivshmem`], keeping the region's last `rings_len` bytes out of the
+/// arena for the session's Wayland rings (waycompose-design.md §89).
+///
+/// The rings are not arena: nothing is allocated in them and no
+/// `Descriptor::ArenaSlice` names them. They are the tail so that the arena's
+/// offset 0 stays where §83 put it and only its length changes, and the header
+/// says where they are ([`crate::ivshmem::Header::rings`]) so that the proxy's
+/// allocator, which places pools by offset, is never told they are its own.
+/// [`ivshmem_rings`] hands the compositor their address.
+pub fn attach_ivshmem_with_rings(id: u32, device: u32, rings_len: u64) -> io::Result<IvshmemRegion> {
     refuse_if_outbound(id)?;
     let (view, size, path) = platform::map_ivshmem(device)?;
-    attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"))
+    attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"), rings_len)
+}
+
+/// The Wayland rings' region of arena `id`, as `(base, len)`: the tail
+/// [`attach_ivshmem_with_rings`] kept out of the arena, or an error when none
+/// was kept.
+///
+/// The pointer is valid for the life of the process: an ivshmem region is
+/// `fixed`, so its registry entry — and the mapping it holds — is never
+/// replaced or removed. Writing through it is the caller's business, and the
+/// caller is `sv_transport::control::Control`, whose region is exactly this
+/// pointer and length.
+pub fn ivshmem_rings(id: u32) -> io::Result<(*mut u8, usize)> {
+    let state = ivshmem_slot().lock().map_err(|_| io::Error::other("ivshmem slot poisoned"))?;
+    let Some(s) = state.as_ref().filter(|s| s.arena == id && s.rings_len > 0) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("arena {id} is not an ivshmem region with rings in this process"),
+        ));
+    };
+    let guard = registry().read().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let a = guard.get(&id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not attached"))
+    })?;
+    let off = usize::try_from(s.region_len - s.rings_len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "region too large"))?;
+    // SAFETY: `off + rings_len == region_len`, the length of the view, checked
+    // at attach; `add` stays inside it.
+    let base = unsafe { a.view.ptr().cast_mut().add(off) };
+    Ok((base, s.rings_len as usize))
 }
 
 /// Everything [`attach_ivshmem`] does after the device is mapped — split out so
@@ -515,6 +563,7 @@ fn attach_ivshmem_view(
     view: platform::MappedView,
     size: u64,
     origin: String,
+    rings_len: u64,
 ) -> io::Result<IvshmemRegion> {
     use crate::ivshmem::HEADER_BYTES;
     if size <= HEADER_BYTES || !size.is_multiple_of(REGION_PAGE as u64) {
@@ -523,6 +572,18 @@ fn attach_ivshmem_view(
             format!(
                 "a {size}-byte ivshmem region cannot hold a {HEADER_BYTES}-byte header and a \
                  whole number of {REGION_PAGE}-byte pages after it"
+            ),
+        ));
+    }
+    // The rings must be whole pages and must leave an arena of at least the
+    // same size behind them: a region that is mostly rings is a mistake in the
+    // caller's arithmetic, not a configuration.
+    if !rings_len.is_multiple_of(REGION_PAGE as u64) || rings_len > (size - HEADER_BYTES) / 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{rings_len} bytes of rings in a {size}-byte ivshmem region: they must be whole \
+                 {REGION_PAGE}-byte pages and leave at least as much arena as they take"
             ),
         ));
     }
@@ -543,7 +604,7 @@ fn attach_ivshmem_view(
     let previous = unsafe { crate::ivshmem::invalidate(view.ptr().cast_mut()) };
     let generation = previous.map_or(1, |g| g.wrapping_add(1).max(1));
     let run_id = random_run_id();
-    let arena_len = size - HEADER_BYTES;
+    let arena_len = size - HEADER_BYTES - rings_len;
     let len = usize::try_from(arena_len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
     registry()
@@ -560,12 +621,13 @@ fn attach_ivshmem_view(
                 fixed: true,
             },
         );
-    *slot = Some(IvshmemState { arena: id, run_id, generation, region_len: size });
+    *slot = Some(IvshmemState { arena: id, run_id, generation, region_len: size, rings_len });
     Ok(IvshmemRegion {
         run_id,
         generation,
         region_len: size,
         arena_len,
+        rings: if rings_len == 0 { (0, 0) } else { (size - rings_len, rings_len) },
         device: origin,
     })
 }
@@ -601,6 +663,10 @@ pub fn publish_ivshmem(id: u32) -> io::Result<crate::ivshmem::Header> {
         region_len: s.region_len,
         arena_id: id,
         outbound,
+        // Published whenever they were kept, used or not: the arena ends where
+        // they begin either way, and a header that left them out would hand
+        // the proxy's allocator bytes the compositor never registered.
+        rings: if s.rings_len == 0 { (0, 0) } else { (s.region_len - s.rings_len, s.rings_len) },
     };
     let guard = registry().read().map_err(|_| io::Error::other("arena registry poisoned"))?;
     let a = guard.get(&id).ok_or_else(|| {
@@ -2030,6 +2096,7 @@ mod tests {
     fn an_ivshmem_region_puts_the_header_first_and_the_arena_after_it() {
         use crate::ivshmem::{HEADER_BYTES, Header};
         const IV: u32 = 9200;
+        const RINGS: u64 = 8 * REGION_PAGE as u64;
         let size = 64 * REGION_PAGE as u64;
         let path = format!("{}/wc-ivshmem-test-{}", std::env::temp_dir().display(), std::process::id());
         let _ = std::fs::remove_file(&path);
@@ -2041,15 +2108,28 @@ mod tests {
             region_len: size,
             arena_id: IV,
             outbound: (0, 0),
+            rings: (0, 0),
         };
         let mut bytes = vec![0u8; size as usize];
         bytes[..crate::ivshmem::ENCODED_LEN].copy_from_slice(&stale.encode());
         std::fs::write(&path, &bytes).unwrap();
 
+        // §89: rings that are not whole pages, or that would leave less arena
+        // than they take, are refused before anything is touched.
+        let bad = platform::map_file_mut(&path, size as usize).unwrap();
+        assert_eq!(
+            attach_ivshmem_view(IV, bad, size, "odd".into(), 100).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let bad = platform::map_file_mut(&path, size as usize).unwrap();
+        assert!(attach_ivshmem_view(IV, bad, size, "greedy".into(), size / 2 + RINGS).is_err());
+        assert!(Header::decode(&std::fs::read(&path).unwrap()).is_ok(), "a refusal touched the region");
+
         let view = platform::map_file_mut(&path, size as usize).unwrap();
-        let r = attach_ivshmem_view(IV, view, size, "test file".into()).unwrap();
+        let r = attach_ivshmem_view(IV, view, size, "test file".into(), RINGS).unwrap();
         assert_eq!(r.generation, 8, "one more than the header it replaced");
-        assert_eq!(r.arena_len, size - HEADER_BYTES);
+        assert_eq!(r.arena_len, size - HEADER_BYTES - RINGS);
+        assert_eq!(r.rings, (size - RINGS, RINGS));
         assert_ne!(r.run_id, stale.run_id);
         assert!(is_ivshmem(IV));
         // Cleared, not merely about to be overwritten: between attach and
@@ -2061,7 +2141,7 @@ mod tests {
         // one mapping per device and this process already holds it.
         let view2 = platform::map_file_mut(&path, size as usize).unwrap();
         assert_eq!(
-            attach_ivshmem_view(IV + 1, view2, size, "again".into()).unwrap_err().kind(),
+            attach_ivshmem_view(IV + 1, view2, size, "again".into(), 0).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
 
@@ -2073,8 +2153,16 @@ mod tests {
             .map()
             .unwrap();
         assert_eq!(m.as_slice(), b"ARENA0");
-        // And the end of the arena is the end of the region, not 4 KiB past it.
-        assert!(guest_write(IV, size - HEADER_BYTES, b"x").is_err());
+        // And the end of the arena is where the rings begin, not 4 KiB past it.
+        assert!(guest_write(IV, size - HEADER_BYTES - RINGS, b"x").is_err());
+        guest_write(IV, size - HEADER_BYTES - RINGS - 1, b"x").unwrap();
+        // The rings are the region's tail, reached by their own pointer.
+        let (base, len) = ivshmem_rings(IV).unwrap();
+        assert_eq!(len as u64, RINGS);
+        // SAFETY: `base` covers `len` bytes of a live mapping (ivshmem_rings).
+        unsafe { std::ptr::copy_nonoverlapping(b"RINGS!".as_ptr(), base, 6) };
+        assert_eq!(&std::fs::read(&path).unwrap()[(size - RINGS) as usize..][..6], b"RINGS!");
+        assert!(ivshmem_rings(IV + 1).is_err());
 
         // Published: what the host will read, magic last.
         let h = publish_ivshmem(IV).unwrap();
@@ -2082,6 +2170,8 @@ mod tests {
         assert_eq!(read, h);
         assert_eq!((read.run_id, read.generation, read.arena_id), (r.run_id, 8, IV));
         assert_eq!(read.outbound, (0, 0), "no window was reserved in this arena");
+        assert_eq!(read.rings, (size - RINGS, RINGS), "the header must say where the rings are");
+        assert_eq!(read.arena_len(), r.arena_len);
 
         // A device region is never released: there is nothing to give back.
         assert_eq!(release_guest_ram(IV).unwrap_err().kind(), io::ErrorKind::PermissionDenied);

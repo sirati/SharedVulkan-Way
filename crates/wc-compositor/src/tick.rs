@@ -64,6 +64,26 @@ pub struct Ticker {
     imp: imp::Inner,
 }
 
+/// Ends a [`Ticker::wait`] early, from any thread (waycompose-design.md §89).
+///
+/// The turn's wait was the one wait in the input path that nothing could end:
+/// a key or a pointer event the UI thread had already queued sat out the rest
+/// of a 5 ms wait, p50 2.9 ms and p99 7.1 ms of a measured path whose crossing
+/// was by then 0.6 ms. Now the UI thread wakes the loop when it queues an
+/// event, and so does the Wayland rings' doorbell when the proxy writes. A
+/// wake that arrives while the loop is busy is kept for the next wait, which
+/// then returns at once — one turn early, never one late.
+#[derive(Clone)]
+pub struct Waker {
+    imp: imp::Signal,
+}
+
+impl Waker {
+    pub fn wake(&self) {
+        self.imp.raise();
+    }
+}
+
 impl Ticker {
     pub fn new() -> Self {
         Self { imp: imp::Inner::new() }
@@ -81,9 +101,15 @@ impl Ticker {
         Self { imp: imp::Inner::coarse() }
     }
 
-    /// Wait approximately `d`, as precisely as the platform allows.
+    /// Wait approximately `d`, as precisely as the platform allows, or until a
+    /// [`Waker`] of this ticker is woken.
     pub fn wait(&self, d: Duration) {
         self.imp.wait(d);
+    }
+
+    /// Something another thread can end the wait with.
+    pub fn waker(&self) -> Waker {
+        Waker { imp: self.imp.signal() }
     }
 
     /// What this ticker actually is, for the startup line. A run whose cadence
@@ -103,17 +129,54 @@ impl Default for Ticker {
 
 #[cfg(windows)]
 mod imp {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{
-        CreateWaitableTimerExW, SetWaitableTimer, Sleep, WaitForSingleObject,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+        CreateEventW, CreateWaitableTimerExW, SetEvent, SetWaitableTimer, WaitForMultipleObjects,
+        WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
     };
+
+    /// An auto-reset event: one wake ends one wait, and a wake with nobody
+    /// waiting stays set until the next. Shared by `Arc` so the handle is
+    /// closed by whichever of the ticker and its wakers goes last, and never
+    /// while a UI thread could still be setting it.
+    struct Event(HANDLE);
+
+    // SAFETY: an event handle is a kernel object usable from any thread.
+    unsafe impl Send for Event {}
+    unsafe impl Sync for Event {}
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: created by `CreateEventW`, closed exactly once.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct Signal(Arc<Event>);
+
+    impl Signal {
+        pub fn raise(&self) {
+            if !self.0.0.is_null() {
+                // SAFETY: a live event handle, kept alive by the `Arc`.
+                unsafe {
+                    SetEvent(self.0.0);
+                }
+            }
+        }
+    }
 
     pub struct Inner {
         /// Null when the high-resolution flag was refused; see the module docs.
         timer: HANDLE,
+        event: Arc<Event>,
     }
 
     // SAFETY: a waitable timer handle is a kernel object usable from any thread,
@@ -121,12 +184,18 @@ mod imp {
     // exist so that a `Ticker` can live in a struct that is `Send`.
     unsafe impl Send for Inner {}
 
+    fn event() -> Arc<Event> {
+        // SAFETY: null attributes and name: an unnamed auto-reset event,
+        // initially clear. A null result is handled by every user.
+        Arc::new(Event(unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }))
+    }
+
     impl Inner {
         /// Deliberately a null handle, which is the same state a Windows too
         /// old for the flag lands in, so the fallback path is the one being
         /// measured rather than a second imitation of it.
         pub fn coarse() -> Self {
-            Self { timer: std::ptr::null_mut() }
+            Self { timer: std::ptr::null_mut(), event: event() }
         }
 
         pub fn new() -> Self {
@@ -141,15 +210,22 @@ mod imp {
                     TIMER_ALL_ACCESS,
                 )
             };
-            Self { timer }
+            Self { timer, event: event() }
+        }
+
+        pub fn signal(&self) -> Signal {
+            Signal(Arc::clone(&self.event))
         }
 
         pub fn wait(&self, d: Duration) {
+            let ms = d.as_millis().min(u32::MAX as u128 - 1) as u32;
             if self.timer.is_null() {
-                // SAFETY: `Sleep` has no failure mode. Saturating because a
-                // duration longer than 49 days is not a poll interval.
+                // The coarse wait: the 15.6 ms quantum `Sleep` has, which a
+                // timed wait on the event shares, and which a wake can now cut
+                // short.
+                // SAFETY: a live (or null, which fails at once) event handle.
                 unsafe {
-                    Sleep(d.as_millis().min(u32::MAX as u128) as u32);
+                    WaitForSingleObject(self.event.0, ms);
                 }
                 return;
             }
@@ -158,10 +234,16 @@ mod imp {
             // if this were imprecise it would not be the clock's fault.
             let due = -(d.as_nanos().min(i64::MAX as u128 * 100) as i64 / 100);
             // SAFETY: a live timer handle, a live due time, no completion
-            // routine, and an infinite wait on a timer that is certain to fire.
+            // routine; then a wait on the timer and the event together, either
+            // of which ends it. A null event (creation failed) is left out.
             unsafe {
                 SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0);
-                WaitForSingleObject(self.timer, 0xFFFF_FFFF);
+                if self.event.0.is_null() {
+                    WaitForSingleObject(self.timer, 0xFFFF_FFFF);
+                } else {
+                    let both = [self.timer, self.event.0];
+                    WaitForMultipleObjects(2, both.as_ptr(), 0, 0xFFFF_FFFF);
+                }
             }
         }
 
@@ -188,21 +270,44 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
-    pub struct Inner;
+    #[derive(Clone)]
+    pub struct Signal(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Signal {
+        pub fn raise(&self) {
+            let (m, c) = &*self.0;
+            *m.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            c.notify_one();
+        }
+    }
+
+    pub struct Inner(Signal);
 
     impl Inner {
         pub fn new() -> Self {
-            Inner
+            Inner(Signal(Arc::new((Mutex::new(false), Condvar::new()))))
         }
 
         pub fn coarse() -> Self {
-            Inner
+            Self::new()
         }
 
+        pub fn signal(&self) -> Signal {
+            self.0.clone()
+        }
+
+        /// The same contract as the Windows event: a raise ends the wait, and a
+        /// raise with nobody waiting ends the next one at once.
         pub fn wait(&self, d: Duration) {
-            std::thread::sleep(d);
+            let (m, c) = &*self.0.0;
+            let g = m.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut g, _) = c
+                .wait_timeout_while(g, d, |raised| !*raised)
+                .unwrap_or_else(|e| e.into_inner());
+            *g = false;
         }
 
         pub fn describe(&self) -> &'static str {
@@ -352,6 +457,33 @@ mod imp_vblank {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// §89. A wake from another thread ends a wait long before its time, and
+    /// a wake nobody was waiting for is kept for the next wait — the input
+    /// event that arrived while the loop was busy must not wait a whole turn.
+    #[test]
+    fn a_wake_ends_the_wait_and_an_early_wake_is_kept() {
+        let t = Ticker::new();
+        let w = t.waker();
+        let start = Instant::now();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            w.wake();
+        });
+        t.wait(Duration::from_secs(10));
+        h.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "the wake did not end a 10 s wait");
+
+        t.waker().wake();
+        let start = Instant::now();
+        t.wait(Duration::from_secs(10));
+        assert!(start.elapsed() < Duration::from_secs(5), "an early wake was lost");
+
+        // And it is used up: the next wait waits.
+        let start = Instant::now();
+        t.wait(Duration::from_millis(30));
+        assert!(start.elapsed() >= Duration::from_millis(25), "one wake ended two waits");
+    }
 
     /// The one thing worth asserting on the platform that runs `cargo test`:
     /// that a wait waits, and that it is not the 15.6 ms quantum this module

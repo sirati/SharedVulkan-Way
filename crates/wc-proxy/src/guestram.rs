@@ -326,31 +326,9 @@ impl Plan {
     /// `mmap`, the allocator, the outbound window — is the guest-RAM path's,
     /// unchanged.
     pub fn from_ivshmem(id: u32, path: &Path, expected_run: u64) -> io::Result<Plan> {
-        use std::io::Read;
-        use wc_handle::ivshmem::{ENCODED_LEN, HEADER_BYTES, Header};
-        let mut f = std::fs::File::open(path).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "{}: {e} (no ivshmem arena: the VM has no wc-arena device, or this user \
-                     is not in the group that may open it)",
-                    path.display()
-                ),
-            )
-        })?;
-        let file_len = f.metadata()?.len();
-        let mut b = [0u8; ENCODED_LEN];
-        f.read_exact(&mut b)?;
+        use wc_handle::ivshmem::HEADER_BYTES;
+        let (h, file_len) = read_ivshmem_header(path, expected_run)?;
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
-        let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
-        if h.run_id != expected_run {
-            return Err(bad(format!(
-                "the header is run 0x{:016x} (generation {}) and the compositor said \
-                 0x{expected_run:016x}: this is another compositor's region, or this one has \
-                 not published yet",
-                h.run_id, h.generation
-            )));
-        }
         if h.arena_id != id {
             return Err(bad(format!(
                 "the header says arena {} and --arena-id says {id}",
@@ -373,6 +351,44 @@ impl Plan {
             runs: vec![Run { arena_offset: 0, file_offset: HEADER_BYTES, len }],
         })
     }
+}
+
+/// The header of the ivshmem region at `path`, checked against the run id the
+/// compositor printed (§83), and the file's length. [`Plan::from_ivshmem`]'s
+/// first half, and what the Wayland rings are found by (§89): they are in the
+/// same file, so the same run-id check is what keeps a proxy off a previous
+/// compositor's rings.
+pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::ivshmem::Header> {
+    read_ivshmem_header(path, expected_run).map(|(h, _)| h)
+}
+
+fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle::ivshmem::Header, u64)> {
+    use std::io::Read;
+    use wc_handle::ivshmem::{ENCODED_LEN, Header};
+    let mut f = std::fs::File::open(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{}: {e} (no ivshmem arena: the VM has no wc-arena device, or this user \
+                 is not in the group that may open it)",
+                path.display()
+            ),
+        )
+    })?;
+    let file_len = f.metadata()?.len();
+    let mut b = [0u8; ENCODED_LEN];
+    f.read_exact(&mut b)?;
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
+    let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
+    if h.run_id != expected_run {
+        return Err(bad(format!(
+            "the header is run 0x{:016x} (generation {}) and the compositor said \
+             0x{expected_run:016x}: this is another compositor's region, or this one has \
+             not published yet",
+            h.run_id, h.generation
+        )));
+    }
+    Ok((h, file_len))
 }
 
 /// The guest's arena, scattered through QEMU's backing object, stitched into
@@ -703,12 +719,15 @@ mod tests {
         let dir = tempdir::Guard::new();
         let path = dir.path().join("arena");
         let region = 64 * 4096u64;
+        // §89: with rings at the tail, which shorten the arena and nothing else.
+        const RINGS: u64 = 8 * 4096;
         let h = Header {
             run_id: 0xfeed_0000_0000_0001,
             generation: 2,
             region_len: region,
             arena_id: 0,
-            outbound: (region - HEADER_BYTES - 8192, 8192),
+            outbound: (region - HEADER_BYTES - 8192 - RINGS, 8192),
+            rings: (region - RINGS, RINGS),
         };
         let mut bytes = vec![0u8; region as usize];
         // SAFETY: a live buffer of a whole region.
@@ -717,7 +736,8 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let plan = Plan::from_ivshmem(0, &path, h.run_id).unwrap();
-        assert_eq!(plan.len, region - HEADER_BYTES);
+        assert_eq!(plan.len, region - HEADER_BYTES - RINGS);
+        assert_eq!(ivshmem_header(&path, h.run_id).unwrap().rings, (region - RINGS, RINGS));
         assert_eq!(plan.runs, vec![Run { arena_offset: 0, file_offset: HEADER_BYTES, len: plan.len }]);
         assert_eq!(plan.outbound, Some(h.outbound));
         let mut r = StitchedRegion::attach(&plan).unwrap();
