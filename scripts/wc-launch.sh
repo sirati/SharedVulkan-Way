@@ -662,6 +662,37 @@ APPS
       || { echo "error: scp of the GPU half to the VM host"; exit 1; }
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
+    # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
+    # installation: it, not a session, holds QEMU's two doorbell sockets.
+    # Its own copy of sv-hostd, so that redeploying one installation never
+    # swaps the binary under another's running hub; restarted only when that
+    # copy or the unit changed (a restart costs running sessions their bells
+    # for a moment: their waits fall back to the slice, nothing fails).
+    local hubbin=~/wc-bell/sv-hostd hubunit=.config/systemd/user/wc-bell-hub.service
+    h "mkdir -p ~/wc-bell \$HOME/.config/systemd/user" >/dev/null
+    local before; before=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$HOST:$hubbin.new" >/dev/null \
+      && h "cmp -s $hubbin.new $hubbin && rm -f $hubbin.new || mv -f $hubbin.new $hubbin" >/dev/null \
+      || { echo "error: scp of the doorbell hub to the VM host"; exit 1; }
+    h "cat >\$HOME/$hubunit" <<UNIT
+[Unit]
+Description=waycompose shared doorbell hub (docs/waycompose-design.md §99)
+
+[Service]
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+    local after; after=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+    h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; if [ '$before' != '$after' ]; then systemctl --user restart wc-bell-hub.service; else systemctl --user start wc-bell-hub.service; fi" >/dev/null 2>&1
+    local hs; hs=$(h "sleep 1; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service; ls /run/user/\$(id -u)/wc-bell/ 2>/dev/null | tr '\n' ' '")
+    case "$hs" in
+      active*sv.sock*wl.sock*) ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
+      *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;
+    esac
     local genv
     genv="MESA_LOADER_DRIVER_OVERRIDE=zink
 LIBGL_KOPPER_DRI2=1

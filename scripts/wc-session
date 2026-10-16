@@ -113,6 +113,23 @@ BELL="${WC_LAUNCH_BELL:-/run/windows-vm/wc-arena/svbell.sock}"
 # The Wayland rings' doorbell (§89): QEMU's socket for the virtio-serial port
 # org.sirati.wcbell.0, made by the VM's unit for the same group.
 WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
+# THE SHARED DOORBELL HUB (docs/waycompose-design.md §99). QEMU serves each
+# doorbell socket above to one connection, so no session may hold one: the
+# user unit wc-bell-hub.service (`sv-hostd bell-hub`, installed by deploy)
+# holds both for every session of every installation and serves them here.
+# Without it a session falls back to holding the port itself, said loudly.
+HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
+hub_up() {
+  [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
+  XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start wc-bell-hub.service >/dev/null 2>&1 || return 1
+  for _ in $(seq 1 40); do
+    [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+# The Wayland doorbell a proxy connects to: the hub's, or QEMU's own socket.
+wcbell_use() { if hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -563,7 +580,11 @@ start_app() {
       GPUENV+=("SV_SOCKET=$D/icd.sock")
       # The doorbell (§87): every ICD shares the one port through the hub
       # `gpu` started, if the port was there to hold.
-      [ -S "$D/bell.sock" ] && GPUENV+=("SV_BELL=$D/bell.sock")
+      if [ -s "$D/bell.path" ]; then
+        GPUENV+=("SV_BELL=$(cat "$D/bell.path")")
+      elif [ -S "$D/bell.sock" ]; then
+        GPUENV+=("SV_BELL=$D/bell.sock")
+      fi
       GPU_ON=1
     else
       echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2
@@ -823,7 +844,7 @@ up)
     if [ -z "$WHY" ]; then
       ROFF=$(od -A n -t u8 -j 64 -N 8 "$ARENA" | tr -d ' ')
       echo "rings" >"$D/transport"
-      echo "transport rings: $RLEN bytes at $ROFF, doorbell $WCBELL"
+      echo "transport rings: $RLEN bytes at $ROFF, doorbell $(wcbell_use)"
     else
       echo "ssh: $WHY" >"$D/transport"
       echo "transport SSH FALLBACK: $WHY"
@@ -965,7 +986,7 @@ proxy)
       # feeds use it, and so does a connection that cannot have a ring.
       RINGARGS=""
       [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
-        && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$WCBELL")
+        && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
       printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
@@ -1316,7 +1337,12 @@ gpu)
   [ -S "$D/cold.sock" ] || die "no cold socket $D/cold.sock: the guest's tunnel did not forward the GPU process"
   UNIT="wc-launch-gpu-$ID"
   BELLARGS=""
-  if [ -S "$BELL" ] && [ -w "$BELL" ]; then
+  rm -f "$D/bell.path"
+  if hub_up; then
+    # §99: the shared hub holds the port; this session's ICDs connect to it.
+    printf '%s\n' "$HUBDIR/sv.sock" >"$D/bell.path"
+  elif [ -S "$BELL" ] && [ -w "$BELL" ]; then
+    echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
   fi
   {
@@ -1338,7 +1364,7 @@ gpu)
     exit 1
   fi
   grep -E 'doorbell' "$D/hostd.log" | sed 's/^sv-hostd: /gpu /'
-  echo "gpu ok up to $N session(s) at $D/icd.sock (as $(id -un), ivshmem $GPUREGION$([ -S "$D/bell.sock" ] && echo ', doorbell'))"
+  echo "gpu ok up to $N session(s) at $D/icd.sock (as $(id -un), ivshmem $GPUREGION$([ -s "$D/bell.path" ] && echo ", doorbell via the shared hub $(cat "$D/bell.path")")$([ -S "$D/bell.sock" ] && echo ', doorbell held by this session'))"
   ;;
 
 # ------------------------------------------------------------------- audio ---
