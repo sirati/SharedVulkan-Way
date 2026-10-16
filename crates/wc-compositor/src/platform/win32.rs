@@ -148,6 +148,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // ADDED FOR STAGE 9, for popups.
     GetWindow, GW_OWNER, HWND_TOPMOST, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_POPUP,
+    // §93: a click on a popup activates nothing. See `WM_MOUSEACTIVATE`.
+    MA_NOACTIVATE, WM_MOUSEACTIVATE,
     // ADDED FOR STAGE 21: `xdg_activation_v1` (raise a window) and the
     // screensaver half of `zwp_idle_inhibit_manager_v1`.
     FlashWindowEx, GetForegroundWindow, IsIconic, SetForegroundWindow, FLASHWINFO, FLASHW_TIMERNOFG,
@@ -1499,6 +1501,18 @@ unsafe extern "system" fn toplevel_proc(
                 follow_owner(&ui, state.id, hwnd);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // §93. A click on a menu must not take the focus. `WS_EX_NOACTIVATE`
+        // keeps a popup from becoming the *foreground* window, and that is
+        // all its documentation promises: Wine gave the clicked popup
+        // `WM_SETFOCUS` (and took it from the toplevel), the client heard
+        // `wl_keyboard.leave` on its window, and Firefox rolls its menus up
+        // on focus-out, so clicking "Help" in its menu closed the menu
+        // instead of opening the Help panel. `MA_NOACTIVATE` is the answer
+        // menus and tooltips give: the click is delivered, and neither
+        // activation nor focus moves.
+        WM_MOUSEACTIVATE if matches!(state.kind, WindowKind::Popup { .. }) => {
+            MA_NOACTIVATE as LRESULT
         }
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;

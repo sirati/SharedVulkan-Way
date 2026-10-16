@@ -466,6 +466,11 @@ pub struct State {
     /// all at once, for one click outside. See [`XdgShellHandler::grab`] and
     /// [`Self::dismiss_grabs_for_click`].
     popup_grabs: Vec<WindowId>,
+    /// §93. A keyboard-focus loss and a deactivation not yet told to the
+    /// client, in case the platform's focus only moved to one of the window's
+    /// own popups. See [`HeldLoss`].
+    focus_loss: HeldLoss,
+    deactivation: HeldLoss,
     /// §85. The last `xdg_toplevel.move`/`resize` handed to the platform, for
     /// the one platform that has to run the gesture itself: the conformance
     /// stand-in (`crate::control`). Win32 runs it in `SC_MOVE`'s modal loop
@@ -897,6 +902,8 @@ impl State {
             cursor_pixels: None,
             cursor_surface: None,
             popup_grabs: Vec::new(),
+            focus_loss: HeldLoss::default(),
+            deactivation: HeldLoss::default(),
             gesture_request: std::cell::Cell::new(None),
             buttons_down: Vec::new(),
             locks: (false, false),
@@ -1143,25 +1150,12 @@ impl State {
                         toggle(s, xdg_state::Suspended, on)
                     });
                 }
-                FromUi::Activated { id, on } => {
-                    // §85. A menu does not outlive its window losing the
-                    // foreground: on Windows that is a click in another
-                    // application, which this compositor never sees as a
-                    // click, and a Firefox menu stayed open over whatever the
-                    // user had switched to.
-                    if !on
-                        && self
-                            .popup_grabs
-                            .first()
-                            .is_some_and(|&g| self.popup_chain(g).last() == Some(&id))
-                    {
-                        self.dismiss_grabs_above(0, &format!("window {id} was deactivated"));
-                    }
-                    self.set_state(id, |s| toggle(s, xdg_state::Activated, on))
-                }
+                FromUi::Activated { id, on } => self.on_activated(id, on),
                 FromUi::KeyboardFocus { id, on, caps, num } => {
-                    self.locks = (caps, num);
-                    self.set_keyboard_focus(id, on)
+                    if on {
+                        self.locks = (caps, num);
+                    }
+                    self.on_keyboard_focus(id, on)
                 }
                 FromUi::Key { id, keycode, pressed, time } => {
                     self.key(id, keycode, pressed, time)
@@ -1216,6 +1210,14 @@ impl State {
                     }
                 }
             }
+        }
+        // §93. A loss nothing took back within the grace is real.
+        let now = Instant::now();
+        if let Some(id) = self.focus_loss.due(now) {
+            self.set_keyboard_focus(id, false);
+        }
+        if let Some(id) = self.deactivation.due(now) {
+            self.deactivate(id);
         }
         // §85. After the events, because a move is one of them: on Win32 the
         // parent's `WM_WINDOWPOSCHANGED` has just rewritten its bounds.
@@ -1728,6 +1730,83 @@ impl State {
     // Input
     // -----------------------------------------------------------------------
 
+    /// §93. The toplevel a window belongs to: itself, or the window at the end
+    /// of its popup chain.
+    fn owning_toplevel(&self, id: WindowId) -> WindowId {
+        self.popup_chain(id).last().copied().unwrap_or(id)
+    }
+
+    /// §93. The platform's `WM_SETFOCUS`/`WM_KILLFOCUS`, with a loss held
+    /// back for [`FOCUS_MOVE_GRACE`] in case the focus only moved to a popup
+    /// of the same window (or back from one). See [`HeldLoss`].
+    fn on_keyboard_focus(&mut self, id: WindowId, on: bool) {
+        if on {
+            let gaining = self.owning_toplevel(id);
+            let same = self.focus_loss.held().is_some_and(|h| self.owning_toplevel(h) == gaining);
+            match self.focus_loss.regained(same) {
+                Regained::Cancelled => {
+                    println!(
+                        "wc-compositor: window {id} has keyboard focus; it moved within window \
+                         {gaining}, so the client is told nothing"
+                    );
+                    self.keyboard_focus = Some(id);
+                    self.refocus_keyboard();
+                    return;
+                }
+                Regained::Settle(held) => self.set_keyboard_focus(held, false),
+                Regained::Nothing => {}
+            }
+            self.set_keyboard_focus(id, true);
+        } else if self.keyboard_focus == Some(id) {
+            self.focus_loss.hold(id, Instant::now());
+        }
+    }
+
+    /// §93. `WM_ACTIVATE`, held back the same way as the keyboard focus.
+    ///
+    /// A popup's own activation is not a fact about anything the client can be
+    /// told (`activated` is a toplevel state), so it only ever takes a held
+    /// deactivation of its window back.
+    fn on_activated(&mut self, id: WindowId, on: bool) {
+        let window = self.owning_toplevel(id);
+        if on {
+            let same = self.deactivation.held() == Some(window);
+            match self.deactivation.regained(same) {
+                Regained::Cancelled => {
+                    println!(
+                        "wc-compositor: window {id} activated; the activation stayed within \
+                         window {window}, so the client is told nothing"
+                    );
+                    return;
+                }
+                Regained::Settle(held) => self.deactivate(held),
+                Regained::Nothing => {}
+            }
+            if window == id {
+                self.set_state(id, |s| toggle(s, xdg_state::Activated, true));
+            }
+        } else if window == id {
+            if let Some(held) = self.deactivation.take() {
+                if held != id {
+                    self.deactivate(held);
+                }
+            }
+            self.deactivation.hold(id, Instant::now());
+        }
+    }
+
+    /// A toplevel lost activation, for real.
+    fn deactivate(&mut self, id: WindowId) {
+        // §85. A menu does not outlive its window losing the foreground: on
+        // Windows that is a click in another application, which this
+        // compositor never sees as a click, and a Firefox menu stayed open
+        // over whatever the user had switched to.
+        if self.popup_grabs.first().is_some_and(|&g| self.popup_chain(g).last() == Some(&id)) {
+            self.dismiss_grabs_above(0, &format!("window {id} was deactivated"));
+        }
+        self.set_state(id, |s| toggle(s, xdg_state::Activated, false))
+    }
+
     /// Keyboard focus follows the **foreground window**, because the user's
     /// window manager is Windows.
     ///
@@ -1742,7 +1821,9 @@ impl State {
     fn set_keyboard_focus(&mut self, id: WindowId, on: bool) {
         let Some(keyboard) = self.keyboard.clone() else { return };
         if on {
-            let Some(surface) = self.surface_of(id) else { return };
+            // §93: a popup that took the platform's focus anyway hands it to its
+            // window; in Wayland a popup without a grab never has the keyboard.
+            let Some(surface) = self.surface_of(self.owning_toplevel(id)) else { return };
             self.keyboard_focus = Some(id);
             println!("wc-compositor: window {id} has keyboard focus");
             // §85: a grabbing popup of this window takes the keys instead.
@@ -1781,6 +1862,9 @@ impl State {
             // the old window and `WM_SETFOCUS` to the new one, and clearing on
             // a stale kill would take the focus away from a window that had
             // just been given it.
+            if self.focus_loss.is(id) {
+                self.focus_loss.take();
+            }
             if self.keyboard_focus != Some(id) {
                 return;
             }
@@ -2178,12 +2262,13 @@ impl State {
     /// window Windows has focused; otherwise that window.
     ///
     /// `keyboard_focus` stays the *platform's* answer — the `HWND` with
-    /// `WM_SETFOCUS`, which is always a toplevel because a popup is
-    /// `WS_EX_NOACTIVATE` — and this is the surface smithay is told. The two
-    /// had been the same thing, which is why a grabbed menu could not be driven
+    /// `WM_SETFOCUS`, which should be a toplevel because a popup is
+    /// `WS_EX_NOACTIVATE` and answers `MA_NOACTIVATE`, and is mapped to its
+    /// toplevel when it is not (§93: Wine focused a clicked popup) — and this
+    /// is the surface smithay is told. The two had been the same thing, which is why a grabbed menu could not be driven
     /// with the arrow keys (WLCS `grabbed_popup_gets_keyboard_focus`).
     fn keyboard_target(&self) -> Option<WlSurface> {
-        let focused = self.keyboard_focus?;
+        let focused = self.owning_toplevel(self.keyboard_focus?);
         let grab = self
             .popup_grabs
             .iter()
@@ -3334,6 +3419,74 @@ fn toggle(states: &mut ToplevelState, which: XdgState, on: bool) {
     }
 }
 
+/// §93. How long a lost focus or activation is held back to see whether it
+/// only moved to a popup of the same window. Windows sends the loss and the
+/// gain from inside one `SetFocus`/`SetActiveWindow`, microseconds apart, but
+/// the Wayland thread can wake between the two messages; one loop turn is
+/// 5 ms, so this is a few turns and well under anything a person sees.
+const FOCUS_MOVE_GRACE: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// §93. A focus (or activation) loss that has not been told to the client
+/// yet.
+///
+/// The client must not hear `wl_keyboard.leave` (or lose `activated`) when
+/// the platform's focus only moved from a window to one of that window's own
+/// popups: in Wayland a popup without a grab never has the keyboard, and
+/// Firefox rolls every menu up the moment its window loses focus, so a click
+/// on a menu item that moved the focus closed the menu instead of acting.
+/// `WM_MOUSEACTIVATE` is the platform's half of the fix; this is the half
+/// that holds whatever the platform does.
+#[derive(Debug, Default)]
+struct HeldLoss(Option<(WindowId, Instant)>);
+
+/// What a gain does to a held loss.
+#[derive(Debug, PartialEq, Eq)]
+enum Regained {
+    /// Nothing was held.
+    Nothing,
+    /// The focus came back to the same window (or a popup of it): the loss is
+    /// dropped and the client is told nothing.
+    Cancelled,
+    /// The focus went to another window: the held loss is real and must be
+    /// told first, so the old window's keys are released before the new one
+    /// is entered.
+    Settle(WindowId),
+}
+
+impl HeldLoss {
+    fn hold(&mut self, id: WindowId, now: Instant) {
+        self.0 = Some((id, now));
+    }
+    fn held(&self) -> Option<WindowId> {
+        self.0.map(|(id, _)| id)
+    }
+    /// `same_window` says whether the held window and the gaining one are the
+    /// same toplevel.
+    fn regained(&mut self, same_window: bool) -> Regained {
+        match self.0.take() {
+            None => Regained::Nothing,
+            Some(_) if same_window => Regained::Cancelled,
+            Some((held, _)) => Regained::Settle(held),
+        }
+    }
+    /// The held loss, if it has waited out the grace.
+    fn due(&mut self, now: Instant) -> Option<WindowId> {
+        match self.0 {
+            Some((id, at)) if now.duration_since(at) >= FOCUS_MOVE_GRACE => {
+                self.0 = None;
+                Some(id)
+            }
+            _ => None,
+        }
+    }
+    fn take(&mut self) -> Option<WindowId> {
+        self.0.take().map(|(id, _)| id)
+    }
+    fn is(&self, id: WindowId) -> bool {
+        self.0.is_some_and(|(held, _)| held == id)
+    }
+}
+
 /// A recognisable icon, so the platform's icon path runs under `--debug-icon`.
 ///
 /// Four quadrants in flat colours, one of them white, chosen by the window id —
@@ -4081,8 +4234,15 @@ impl XdgShellHandler for State {
         // happens when a client exits — never produces one.
         if let Some(window) = self.windows.get(surface.wl_surface()) {
             let id = window.id;
-            if self.keyboard_focus == Some(id) {
-                self.set_keyboard_focus(id, false);
+            // §93: the platform's focus may sit on one of this window's
+            // popups, and the client's is on this window either way.
+            if let Some(f) = self.keyboard_focus
+                && self.owning_toplevel(f) == id
+            {
+                self.set_keyboard_focus(f, false);
+            }
+            if self.deactivation.is(id) {
+                self.deactivation.take();
             }
             if self.pointer_focus == Some(id) {
                 self.pointer_motion(None, 0.0, 0.0, self.now_ms());
@@ -4236,8 +4396,19 @@ impl XdgShellHandler for State {
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         if let Some(window) = self.windows.get(surface.wl_surface()) {
             let id = window.id;
+            // §93: a popup that held the platform's focus gives it back to
+            // its window, which is where the client's focus has been all
+            // along, and the loss is held for the grace: Windows hands the
+            // focus to the owner when the popup goes, and if it does not,
+            // the loss is told then.
             if self.keyboard_focus == Some(id) {
-                self.set_keyboard_focus(id, false);
+                let window = self.owning_toplevel(id);
+                if window == id {
+                    self.set_keyboard_focus(id, false);
+                } else {
+                    self.keyboard_focus = Some(window);
+                    self.focus_loss.hold(window, Instant::now());
+                }
             }
             if self.pointer_focus == Some(id) {
                 self.pointer_motion(None, 0.0, 0.0, self.now_ms());
@@ -5389,5 +5560,69 @@ mod tests {
             assert!(accepts_input_at((100, 100), Some(&r), (85.0, 85.0)));
             assert!(!accepts_input_at((100, 100), Some(&r), (50.0, 50.0)));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §93: a focus that only moved to a popup of the same window is not a loss
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod held_loss {
+    use super::{HeldLoss, Regained, FOCUS_MOVE_GRACE};
+    use std::time::{Duration, Instant};
+
+    /// Wine's order for a click on a menu: `WM_KILLFOCUS` to the window, then
+    /// `WM_SETFOCUS` to its popup. The client must hear nothing.
+    #[test]
+    fn a_loss_taken_back_by_the_same_window_is_dropped() {
+        let t = Instant::now();
+        let mut h = HeldLoss::default();
+        h.hold(1, t);
+        assert_eq!(h.held(), Some(1));
+        assert_eq!(h.regained(true), Regained::Cancelled);
+        assert_eq!(h.held(), None);
+        assert_eq!(h.due(t + FOCUS_MOVE_GRACE * 4), None, "nothing is left to settle");
+    }
+
+    /// Alt-Tab to another of our windows: the old one's loss is real and is
+    /// told before the new one is entered.
+    #[test]
+    fn a_loss_followed_by_another_window_is_settled_first() {
+        let t = Instant::now();
+        let mut h = HeldLoss::default();
+        h.hold(1, t);
+        assert_eq!(h.regained(false), Regained::Settle(1));
+        assert_eq!(h.held(), None);
+    }
+
+    #[test]
+    fn a_gain_with_nothing_held_is_just_a_gain() {
+        let mut h = HeldLoss::default();
+        assert_eq!(h.regained(true), Regained::Nothing);
+        assert_eq!(h.regained(false), Regained::Nothing);
+    }
+
+    /// A click in another application: nothing of ours gains, and the loss
+    /// is told once the grace has passed — not before, and only once.
+    #[test]
+    fn a_loss_nobody_takes_back_is_due_after_the_grace() {
+        let t = Instant::now();
+        let mut h = HeldLoss::default();
+        h.hold(7, t);
+        assert_eq!(h.due(t), None);
+        assert_eq!(h.due(t + FOCUS_MOVE_GRACE - Duration::from_millis(1)), None);
+        assert!(h.is(7));
+        assert_eq!(h.due(t + FOCUS_MOVE_GRACE), Some(7));
+        assert_eq!(h.due(t + FOCUS_MOVE_GRACE * 2), None);
+        assert!(!h.is(7));
+    }
+
+    /// The grace is short enough that a person never sees a stale
+    /// `activated` state, and longer than the compositor's 5 ms turn.
+    #[test]
+    fn the_grace_is_a_few_turns() {
+        assert!(FOCUS_MOVE_GRACE >= Duration::from_millis(10));
+        assert!(FOCUS_MOVE_GRACE <= Duration::from_millis(100));
     }
 }
