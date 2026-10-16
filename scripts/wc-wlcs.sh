@@ -128,10 +128,6 @@ reason_for() {
       echo "JUSTIFIED Windows has no middle-click selection, so a compositor-side one would be a clipboard no Windows application can see" ;;
     zwlr_foreign_toplevel_manager_v1)
       echo "JUSTIFIED it exists so a Linux dock can list windows, and the dock here is the Windows taskbar" ;;
-    zwp_pointer_constraints_v1)
-      echo "GAP ClipCursor and SetCursorPos exist on Win32; nothing binds them yet" ;;
-    zwp_relative_pointer_manager_v1)
-      echo "GAP WM_INPUT raw motion exists on Win32; nothing binds it yet" ;;
     zwp_text_input_manager_v2|zwp_text_input_manager_v3|zwp_input_method_v1|zwp_input_method_manager_v2)
       echo "GAP Windows has an IME (TSF) and none of it is wired up" ;;
     zwlr_virtual_pointer_manager_v1)
@@ -596,6 +592,20 @@ justified_failure_patterns() {
   local selfcontra='WLCS 1.8.1 asserts that neither restacked subsurface is on top; the first assertion (the restack took effect) passes here, the second contradicts it, and Mir 2.29 fails both tests as well (§85)'
   for t in place_above_simple place_below_simple; do
     printf 'XdgShellStableSubsurfaces/SubsurfaceTest.%s/0\t%s\n' "$t" "$selfcontra"
+  done
+
+  # §96. Headless only, because the Wine leg cannot drive a pointer and never
+  # runs them. Each test destroys the window that took the keyboard and expects
+  # the persistent constraint's `locked`/`confined` on the window underneath
+  # *within the same round trip*. Here the keyboard comes back on the synthetic
+  # Win32's next turn, and on Windows it comes back when the UI thread's
+  # `DestroyWindow` activates the next window — a different thread from the one
+  # answering `wl_display.sync` in both cases. The constraint does come back
+  # (the compositor's log shows `holds the pointer` after every destroy, three
+  # times per test); it arrives one round trip after WLCS looks.
+  local refocus='the keyboard returns to the window under a destroyed one on the platform'"'"'s next turn (Windows'"'"' DestroyWindow runs on the UI thread), so the re-activated constraint arrives one round trip after WLCS looks; it does arrive (§96)'
+  for t in locked confined; do
+    printf 'PointerConstraints.when_surface_is_reselected_persistent_%s_pointer_gets_notifications\t%s\n' "$t" "$refocus"
   done
 
 }

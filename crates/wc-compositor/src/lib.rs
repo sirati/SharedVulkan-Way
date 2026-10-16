@@ -50,6 +50,9 @@ mod clipboard;
 mod control;
 mod cursor;
 pub mod grow;
+/// docs/waycompose-design.md §96: pointer locks, confinement and relative motion,
+/// the part of them that is arithmetic.
+mod hold;
 mod icon;
 mod input;
 mod platform;

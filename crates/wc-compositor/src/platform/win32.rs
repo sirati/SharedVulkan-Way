@@ -55,6 +55,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use super::caption;
+// §96: `ClipCursor` and raw input, the Win32 half of `zwp_pointer_constraints_v1`.
+#[path = "win32_hold.rs"]
+mod hold;
+
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, ExcludeClipRect, FillRect,
@@ -133,7 +137,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     // `begin_sysmenu_gesture`.
     GetCursorPos,
     SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WA_INACTIVE, WHEEL_DELTA, WM_ACTIVATE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_INPUT, WM_INPUTLANGCHANGE, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
@@ -368,6 +372,8 @@ struct WindowState {
     /// §91: the client asked to be maximised before the window was shown;
     /// `map_window` shows it maximised.
     maximize_at_map: Cell<bool>,
+    /// §96: while fullscreen, the style and the outer rectangle to go back to.
+    fullscreen: Cell<Option<(isize, RECT)>>,
     /// §91: inside `WM_ENTERSIZEMOVE` … `WM_EXITSIZEMOVE`, when the user owns
     /// the window's size and a client commit must not resize it.
     user_sizing: Cell<bool>,
@@ -1125,7 +1131,12 @@ impl WindowState {
         // the client places the click wherever the last motion was, and a click
         // on a control the pointer reached in the same event would otherwise
         // land at the previous position.
-        self.send(FromUi::PointerMotion { id: self.id, x: sx, y: sy, time });
+        //
+        // §96: except under a lock, where the pointer has not moved and the
+        // click happens where the client already believes it is.
+        if !ui().is_some_and(|ui| hold::locked(&ui, self.id)) {
+            self.send(FromUi::PointerMotion { id: self.id, x: sx, y: sy, time });
+        }
 
         if pressed {
             if self.buttons_down.replace(self.buttons_down.get() + 1) == 0 {
@@ -1356,6 +1367,9 @@ pub(crate) struct Ui {
     /// has no seat, so the nearest thing that exists — the thread that pumps
     /// every window — owns it. See `crate::input::touch::Slots`.
     slots: RefCell<crate::input::touch::Slots>,
+    /// §96. What the pointer is held to, if anything. One per process: there is
+    /// one system pointer. See `win32_hold.rs`.
+    hold: hold::HoldState,
 }
 
 thread_local! {
@@ -1580,6 +1594,10 @@ unsafe extern "system" fn toplevel_proc(
         // negotiation with it.
         WM_WINDOWPOSCHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
             state.publish_popup_bounds();
+            // §96: a clip is in screen pixels and follows the window.
+            if let Some(ui) = ui() {
+                hold::on_moved(&ui, state);
+            }
             if msg == WM_WINDOWPOSCHANGED
                 && let Some(ui) = ui()
             {
@@ -1601,6 +1619,12 @@ unsafe extern "system" fn toplevel_proc(
         }
         WM_ACTIVATE => {
             let on = (wparam & 0xffff) as u32 != WA_INACTIVE;
+            // §96: losing the foreground lets go of a held pointer here and now.
+            if !on
+                && let Some(ui) = ui()
+            {
+                hold::on_focus(&ui, state, false);
+            }
             let _ = state.events.send(FromUi::Activated { id: state.id, on });
             0
         }
@@ -1690,9 +1714,17 @@ unsafe extern "system" fn toplevel_proc(
         // its own keyboard focus would be fighting it.
         WM_SETFOCUS => {
             state.send(FromUi::KeyboardFocus { id: state.id, on: true, caps: lock_on(VK_CAPITAL), num: lock_on(VK_NUMLOCK) });
+            // §96: a hold the window had before it lost the keyboard comes back.
+            if let Some(ui) = ui() {
+                hold::on_focus(&ui, state, true);
+            }
             0
         }
         WM_KILLFOCUS => {
+            // §96: first, so the pointer is free before anything else runs.
+            if let Some(ui) = ui() {
+                hold::on_focus(&ui, state, false);
+            }
             state.send(FromUi::KeyboardFocus { id: state.id, on: false, caps: false, num: false });
             0
         }
@@ -1727,8 +1759,21 @@ unsafe extern "system" fn toplevel_proc(
 
 
         WM_MOUSEMOVE => {
+            // §96: a locked pointer does not move; its motion is `WM_INPUT`.
+            if ui().is_some_and(|ui| hold::locked(&ui, state.id)) {
+                return 0;
+            }
             state.on_mouse_move(lparam, message_time());
             0
+        }
+        // §96. Raw mouse motion, registered only while a lock is held. Passed
+        // on to `DefWindowProc` afterwards, which the documentation requires
+        // for the system to release the input.
+        WM_INPUT => {
+            if let Some(ui) = ui() {
+                hold::on_input(&ui, state, lparam);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSELEAVE => {
             state.on_mouse_leave(message_time());
@@ -2747,6 +2792,12 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 set_window_state(&w, maximized, minimized);
             }
         }
+        // §96.
+        ToUi::Fullscreen { id, on } => {
+            if let Some(w) = window(ui, id) {
+                set_fullscreen(&w, on);
+            }
+        }
         // ADDED FOR STAGE 17. All three **post** rather than send, and that is
         // the only interesting thing about them.
         //
@@ -2809,6 +2860,8 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         }
         // ADDED FOR STAGE 21.
         ToUi::IdleInhibit { on } => set_idle_inhibit(ui, on),
+        // §96.
+        ToUi::PointerHold { id, hold: h } => hold::set(ui, id, h),
         ToUi::Activate { id } => {
             if let Some(w) = window(ui, id) {
                 activate_window(&w);
@@ -2825,6 +2878,8 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
         // synchronously and cannot wait for this — has something true to say.
         ToUi::DragFeedback { accepted, action } => super::drag::feedback(accepted, action),
         ToUi::Destroy { id } => {
+            // §96: a clip on a window that is going away is let go first.
+            hold::on_destroy(ui, id);
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
                 // The window is about to go and the `HICON`s belong to this
@@ -3042,6 +3097,7 @@ fn create_window(
         self_driven: Cell::new(false),
         placing: Cell::new(false),
         maximize_at_map: Cell::new(false),
+        fullscreen: Cell::new(None),
         user_sizing: Cell::new(false),
         size_hints: Cell::new(((0, 0), (0, 0))),
         icon_big: Cell::new(0),
@@ -4645,6 +4701,81 @@ fn present(w: &Rc<WindowState>, damage: &[Rect]) {
     }
 }
 
+/// §96. `xdg_toplevel.set_fullscreen` and `unset_fullscreen`: the borderless
+/// window over the whole monitor that every Windows game calls fullscreen.
+///
+/// **Not exclusive fullscreen**, which does not exist for a window that is
+/// drawn with `SetDIBitsToDevice`; this is the "borderless fullscreen" Windows
+/// itself has used for games since DWM made the two indistinguishable. The
+/// caption and the frame go (`WS_POPUP`), the window covers `rcMonitor` —
+/// the monitor, not its work area, so the taskbar is under it — and the size
+/// reaches the client through the `WM_SIZE` that `SetWindowPos` sends, as a
+/// configure carrying the fullscreen state the Wayland side has already set.
+/// Leaving puts back the style and the outer rectangle it had.
+fn set_fullscreen(w: &Rc<WindowState>, on: bool) {
+    let hwnd = w.hwnd();
+    if on == w.fullscreen.get().is_some() {
+        return;
+    }
+    if on {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            rcWork: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            dwFlags: 0,
+        };
+        let mut was = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: a live window handle on its own thread; every out-parameter
+        // is written in place, and `cbSize` is set.
+        unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() || GetMonitorInfoW(monitor, &mut info) == 0 {
+                println!("wc-compositor: window {} cannot go fullscreen: no monitor", w.id);
+                return;
+            }
+            GetWindowRect(hwnd, &mut was);
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            w.fullscreen.set(Some((style, was)));
+            let bare = (style as u32 & !WS_OVERLAPPEDWINDOW) | WS_POPUP;
+            SetWindowLongPtrW(hwnd, GWL_STYLE, bare as isize);
+            let m = info.rcMonitor;
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                m.left,
+                m.top,
+                m.right - m.left,
+                m.bottom - m.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER,
+            );
+        }
+        println!(
+            "wc-compositor: window {} fullscreen on its monitor ({}x{} at {},{})",
+            w.id,
+            info.rcMonitor.right - info.rcMonitor.left,
+            info.rcMonitor.bottom - info.rcMonitor.top,
+            info.rcMonitor.left,
+            info.rcMonitor.top
+        );
+    } else if let Some((style, was)) = w.fullscreen.take() {
+        // SAFETY: a live window handle; the style and rectangle are the ones
+        // read from this window when it went fullscreen.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                was.left,
+                was.top,
+                was.right - was.left,
+                was.bottom - was.top,
+                SWP_FRAMECHANGED | SWP_NOZORDER,
+            );
+        }
+        println!("wc-compositor: window {} left fullscreen", w.id);
+    }
+}
+
 fn set_window_state(w: &Rc<WindowState>, maximized: Option<bool>, minimized: Option<bool>) {
     // §91: a window that has not been shown has nothing to maximise yet.
     // `ShowWindow(SW_MAXIMIZE)` here would show it with no pixels, and the map
@@ -5710,6 +5841,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         owned_cursor: Cell::new(0),
         pointer_inside: Cell::new(false),
         slots: RefCell::new(crate::input::touch::Slots::new()),
+        hold: hold::HoldState::default(),
     });
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 

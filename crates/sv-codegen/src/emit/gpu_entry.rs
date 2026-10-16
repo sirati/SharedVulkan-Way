@@ -1180,18 +1180,35 @@ fn emit_forward_command(
                     }
                     None => quote!(#id.len()),
                 };
+                // §96. **An element the driver left `VK_NULL_HANDLE` goes back
+                // as `VK_NULL_HANDLE`**, not as the id the app side minted for
+                // it. A batch create can fail per element, and one way is not a
+                // failure at all: `vkCreateGraphicsPipelines` with
+                // `FAIL_ON_PIPELINE_COMPILE_REQUIRED` answers
+                // `VK_PIPELINE_COMPILE_REQUIRED` and a null pipeline, and the
+                // caller tests the *handle* to decide whether to compile. Zink's
+                // fast-link path does exactly that; given the minted id back it
+                // bound a pipeline that existed nowhere, this side translated it
+                // to a null handle, and RADV dereferenced it in
+                // `vkCmdBindPipeline` (waycompose-design.md §96).
+                let out = naming::ident(&format!("__out_{}", f.rust_name));
                 post.push(quote! {
+                    let mut #out = a.#id.clone();
                     for __i in 0..#n {
                         if let Some(__id) = a.#id.get(__i) {
-                            __b.bind(
-                                __id.0,
-                                sv_proto::HandleType::#ht,
-                                #id[__i] as usize as u64,
-                            );
+                            if #id[__i] as usize as u64 == 0 {
+                                #out[__i].0 = 0;
+                            } else {
+                                __b.bind(
+                                    __id.0,
+                                    sv_proto::HandleType::#ht,
+                                    #id[__i] as usize as u64,
+                                );
+                            }
                         }
                     }
                 });
-                reply_fields.push(quote!(#id: a.#id.clone(),));
+                reply_fields.push(quote!(#id: #out,));
             }
             // **An output array of plain scalars**, which this arm used to
             // refuse with "an output that is not a struct".

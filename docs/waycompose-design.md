@@ -29424,3 +29424,272 @@ fault.
 3. **`/tmp/wc-launch` is shared by every installation** and by any local user
    who creates it first. That is a host-local concern, not one the guest can
    reach beyond the session ids, and is unchanged.
+
+## 96. Minecraft: a pointer that holds still, a window that follows, and three forwarder gaps a game found
+
+Branch `minecraft`, from master `59a6e8e` with `ab009e9` (§94) merged in,
+2026-10-16. The brief: run Minecraft on the VM host and play it on the guest —
+the window through waycompose, the rendering on the guest's Intel iGPU through
+shared_vulkan — once **stock**, whose OpenGL is Zink on our ICD, and once with
+**VulkanMod**, which renders Vulkan on our ICD directly; demo mode only, no
+Microsoft account. Phase 1 is the workstation: the deployed topology with the
+VM taken out (Wine for Windows, RADV for the GPU). `docs/minecraft.md` is the
+procedure and the user's view; this section is the engineering.
+
+### 96.1 Status in one paragraph
+
+**Both forms play on the workstation, through the whole stack**: the game as a
+native Wayland client of `wc-proxy`, `wc-compositor.exe` under Wine drawing its
+window, the frames rendered by `sv-gpu-server` on the AMD iGPU. Keyboard,
+**mouse-look**, F3 (renderer `… (RADV RAPHAEL_MENDOCINO) (MESA_RADV)` for stock,
+`Vulkan 1.4.0`/`VulkanMod 0.6.8+1.21.11` for the mod), F2, fullscreen and back,
+sound to PulseAudio and a clean quit from the close button, every run of
+`scripts/sv-minecraft.sh`. Four things had to change, and each is a general
+defect a game happened to be the first to reach: the compositor had **no pointer
+lock and no relative motion** (96.3), a window did not follow a size its client
+declared **by geometry alone** (96.4), **fullscreen** was declined (96.5), and the
+forwarder **lost three output structs and returned ids for pipelines that do not
+exist** — the last of which crashed the GPU side inside RADV once Zink knew which
+driver it was on (96.6).
+
+### 96.2 The setup
+
+Prism Launcher 11.1.1 and OpenJDK 21 from nixpkgs; Minecraft 1.21.11, Fabric
+loader 0.19.5 and VulkanMod 0.6.8+1.21.11 (Modrinth, sha1 checked); a data dir
+of its own under `/tmp/svmc`. Demo mode is Prism's own path with no account —
+setup wizard *Finish* without logging in, *No Accounts* → No, *Play demo?* →
+Play Demo, a player name — after which Prism launches with `--demo` and an
+access token of `0`. `scripts/sv-minecraft.sh setup` clicks those buttons on an
+Xvfb by position, never by key: the wizard's focused widget is "Add Microsoft
+account", and the keyboard version of this script started Microsoft's
+device-code login twice. Nothing was entered and no account exists; the script
+now also gives Prism a refusing `xdg-open`, no session bus, and a watchdog that
+kills it if its log ever mentions a Microsoft login.
+
+Prism's *wrapper command* records each launch (argv, environment, the launch
+script it writes to the game's stdin), and `run` replays it in the session's
+environment: the same `NewLaunch.jar`, classpath, `--demo` and
+`-Dorg.lwjgl.glfw.libname`. That last is Prism's "use system GLFW"
+(`UseNativeGLFW`), which on nixpkgs is `glfw3-minecraft`; LWJGL's own GLFW
+crashes in `glfwInit` on a compositor without a `wl_seat`, which rules out a
+headless pixman weston as the control (GLFW 3.4 dereferences the missing seat).
+GLFW picks Wayland by itself when `WAYLAND_DISPLAY` is set and `DISPLAY` is not.
+
+The GL environment is Firefox's (§87's `gpu.env`): our ICD alone in
+`VK_DRIVER_FILES`, `nix/mesa-kopper-wayland.nix`'s EGL, Zink forced,
+`LIBGL_KOPPER_DRI2=1`. The game runs under `bwrap` with an empty `/dev/dri`:
+Mesa's EGL probes every DRM device before it settles on kopper, and on this
+workstation the first is the NVIDIA card (`pci id for fd 16: 10de:2b85`). It
+found no driver and let go; the harness must not open it at all, and an empty
+`/dev/dri` is what testhost has anyway.
+
+### 96.3 Holding the pointer
+
+A first-person game turns the view by how far the mouse moved. On Wayland it
+asks for a **lock** (`zwp_locked_pointer_v1`: the pointer stops, and cannot leave
+the window) and for **relative motion** (`zwp_relative_pointer_v1`: the distance,
+while the pointer stands still). GLFW does both for `GLFW_CURSOR_DISABLED`, which
+is Minecraft's mouse-look, and without the globals it logs `65548: Wayland: The
+compositor does not support pointer locking` and the view never turns. WLCS had
+both protocols in its GAP list: "ClipCursor and SetCursorPos exist on Win32;
+nothing binds them yet", "WM_INPUT raw motion exists on Win32; nothing binds it
+yet". Now:
+
+* **The globals** are smithay's (`PointerConstraintsState`,
+  `RelativePointerManagerState`). The fork (`vendor/smithay`) gains one hook,
+  `PointerConstraintsHandler::constraint_removed`: upstream drops a constraint
+  silently when its object is destroyed, and a compositor that enforces it
+  outside the protocol — a clipped system pointer — had no way to hear that
+  GLFW had let go (it does, on every pause menu and inventory).
+* **The policy** (`State::update_pointer_hold`): a constraint is active while
+  its surface is the one under the pointer, **in the window with the keyboard**,
+  and the pointer is in its region. The keyboard half is the safety property:
+  Windows moves the keyboard on Alt-Tab, a taskbar click, the Start menu, a
+  toast — and the lock ends with it, `oneshot` constraints gone. It is
+  re-evaluated on pointer motion, keyboard focus (one wrapper around
+  `set_keyboard_focus`, so a sixth caller cannot forget), constraint creation
+  and removal, commits of the held surface and window destruction, and the
+  platform hears only a change: `ToUi::PointerHold { id, Some(Locked |
+  Confined(rect)) | None }`.
+* **Motion**: platform motion now carries its distance. While locked the
+  pointer does not move and only `relative_motion` is sent; while confined the
+  position is clamped (`crate::hold::clamp_into`, last pixel inclusive, the
+  number WLCS asks for); otherwise `relative_motion` rides in the same
+  `wl_pointer.frame` as the absolute motion.
+* **Win32** (`platform/win32_hold.rs`): a lock is `ClipCursor` to one pixel at
+  the window's centre plus `RegisterRawInputDevices` for the mouse; `WM_INPUT`
+  becomes `FromUi::PointerRelative`, and `WM_MOUSEMOVE` (and the motion before a
+  click) is not forwarded while locked. A confinement is `ClipCursor` to the
+  region's bounding box (`crate::hold::region_bounds`; a region with holes is
+  bounded, not shaped, and says so). Raw input that reports **positions** — a
+  tablet, a VM's absolute pointer, remote-desktop injection — is turned into
+  distances (`AbsoluteMotion`, scaled from `0..65535` to the screen or the
+  virtual desktop). The clip is let go **by the UI thread itself** on
+  `WM_KILLFOCUS`, `WM_ACTIVATE(WA_INACTIVE)` and destruction, before the
+  Wayland thread has heard, and put back on `WM_SETFOCUS` if the Wayland side
+  still holds it (§93's focus grace); it follows the window on
+  `WM_WINDOWPOSCHANGED`, and is re-asserted from `WM_INPUT` if something else
+  changed it. A pointer left clipped to a window the user has left is the one
+  failure this must not have, so it does not depend on one thread's message.
+* **The synthetic Win32** (`control.rs`) now does what `ClipCursor` and raw
+  input do to the suite's moves: a new verb `pointer-move-by` (the shim's
+  `move_relative`, which until now was turned into an absolute move from the
+  shim's own idea of where the pointer was) moves from where the pointer *is*,
+  clipped; under a lock it produces `PointerRelative` and moves nothing. And it
+  **raises and activates on a click**, before delivering it — `WM_MOUSEACTIVATE`,
+  `WM_ACTIVATE` and `WM_SETFOCUS` precede `WM_LBUTTONDOWN` on Windows — with a
+  Z order of its own (`Control::stack`: new windows on top, clicked ones on top,
+  popups with their owner). Until §96 a click on a background window did nothing
+  here.
+
+`wc-proxy` learns both XML files (`wayland-protocols` 0.32.12, as the
+compositor's smithay), and its table test grows to 47 interfaces.
+
+**WLCS, headless**: the two suites now run (they were skips): 18 tests, 16 pass.
+The other two are the `persistent` ones: they destroy the window that took the
+keyboard and expect the constraint back on the window underneath within the
+same round trip; here the keyboard comes back on the platform's next turn, as on
+Windows (the UI thread's `DestroyWindow` activates the next window), and the
+constraint does come back — the log shows it after each of the three cycles —
+one round trip after WLCS looks. Both are in the expected-failure table with
+that reason. Click-to-activate also fixed
+`XdgToplevelStableConfigurationTest.activated_state_follows_pointer`, and the
+whole suite went from master's **429 passed, 37 failed, 759 skipped** to **448
+passed, 36 failed, 741 skipped**, 30 of the failures expected (master 28).
+
+**Minecraft**: every run locks, takes 30 raw-input motions while locked and turns
+the view by them (F3's `Facing` from `-37.8 / -17.9` to `2.7 / -17.9` after 300 px
+right, to `2.7 / -40.4` after 150 px up), and releases the clip on Escape, on
+F11 and when the window closes. Wine reports `xdotool`'s XTEST motion as raw
+input, so this is the Win32 path end to end, minus the hardware.
+
+### 96.4 A window that follows a size declared by geometry alone
+
+GLFW with libdecor maps its first frame *with* client-side decorations — 854x480
+of game inside 902x552 of frame and shadow subsurfaces — learns a moment later
+that the decorations are the server's, destroys the frame and declares
+`set_window_geometry(0, 0, 854, 480)` **with no new buffer**, because its content
+did not change. §91 made a window follow a client that is still choosing its
+size, but only on the buffer path; the geometry-only commit path (§37's crop fix)
+moved the crop and left the `HWND` at 902x552, with a band of background under
+the game for as long as it ran. That path now follows too, by the same rule
+(`client_chooses`, the window mapped, a different size): `window 1 client chose
+854x480 by its geometry alone; the window follows`.
+
+### 96.5 Fullscreen
+
+`xdg_toplevel.set_fullscreen` was smithay's default — a bare configure, which
+declines the request — so Minecraft's F11 did nothing. It is now honoured like a
+maximise (§45): `ToUi::Fullscreen` and the `Fullscreen` state in the same
+configure with the output's size. On Win32 that is the borderless fullscreen
+games use: the style and outer rectangle saved, `WS_POPUP`, the window over the
+monitor's `rcMonitor` (not the work area, so the taskbar is under it), the size
+reaching the client through `WM_SIZE`; `unset_fullscreen` puts both back.
+Measured: `fullscreen on its monitor (1600x1000 at 0,0)`, F3 `Display:
+1600x1000`, and back to 854x480.
+
+### 96.6 Three forwarder gaps, and a GPU-side crash they were hiding
+
+With the validation layer inside the game (`SVMC_APP_VALIDATE=1`) the stock
+game reported, on every start:
+
+* `VUID-VkSwapchainCreateInfoKHR-imageColorSpace-parameter` and
+  `-imageFormat-01273`: **Zink on Wayland creates every swapchain with
+  `VK_COLOR_SPACE_PASS_THROUGH_EXT`**, unconditionally since Mesa 26.2
+  (`zink_kopper.c`), and that colour space belongs to `VK_EXT_swapchain_colorspace`,
+  which our ICD did not have. It is also the true description of our WSI — the
+  present copies the bytes as they are — so the ICD now advertises the instance
+  extension and lists the pass-through colour space beside sRGB for all four
+  formats (sRGB first, so nothing else changes its choice).
+* `VUID-VkDescriptorSetLayoutCreateInfo-flags-00281`: push-descriptor layouts with
+  `maxPushDescriptors (0)`. vulkaninfo through the forwarder showed the whole of
+  `VkPhysicalDeviceVulkan14Properties` zero (`maxPushDescriptors`,
+  `defaultRobustness*`, `copySrcLayoutCount`, …) against RADV's real values.
+  **The generator refuses a writeback for a struct with a pointer-valued member**
+  — it cannot know the caller's capacity — and a refused link was left as the
+  application left it. Three such links matter: the 1.4 properties,
+  `VkPhysicalDeviceHostImageCopyProperties`, and
+  `VkPhysicalDeviceLayeredApiPropertiesListKHR`, which is how **Zink identifies
+  the driver**: it passes a capacity of one, an untouched link says "one layered
+  API, all zeros", and Zink takes the zero as the driver id — `zink Vulkan
+  1.4(… (Driver Unknown))` — and applies **none of its per-driver workarounds**,
+  RADV's or Intel's. The generated `store_pnext` now hands a refused link to
+  `sv-icd-entry/src/writeback.rs`, which writes those three by hand: every scalar,
+  the layered list's count and entries up to the caller's capacity, and the copy
+  layouts' counts as zero (the arrays are not carried, and `hostImageCopy` is not
+  advertised). F3 now says `(MESA_RADV)`.
+
+Knowing it was on RADV, Zink took its RADV paths, and **the GPU side died in
+`radv_CmdBindPipeline`** (SIGSEGV, `coredumpctl`), with the GPU-side layer's
+`VUID-vkCmdBindPipeline-pipeline-parameter: Invalid VkPipeline Object 0x0` just
+before. The cause is in the generated GPU side: a batch create answered the app
+side's minted ids **whether or not the driver made the object**. Zink's
+fast-link path calls `vkCreateGraphicsPipelines` with
+`FAIL_ON_PIPELINE_COMPILE_REQUIRED`, RADV answers `VK_PIPELINE_COMPILE_REQUIRED`
+(`[trace] vkCreateGraphicsPipelines -> VkResult(1000297000)`) and a null pipeline,
+and Zink tests the *handle* to decide whether to compile; given an id back it
+bound a pipeline that existed nowhere, the GPU side translated it to null, and
+RADV dereferenced it. The generator now returns `VK_NULL_HANDLE` for every
+element the driver left null and binds only the rest (`Out::Array` in
+`emit/gpu_entry.rs`). This is not a RADV matter: on the guest, Zink identifies
+Intel's driver the same way and takes Intel's paths.
+
+The VUIDs that remain on the GPU side, for stock only and around F2, F11 and
+world loading, are `VUID-vkCmdBeginRendering-pRenderingInfo-09592` (an internal
+image or a swapchain image used as an attachment while in
+`SHADER_READ_ONLY`/`PRESENT_SRC`) and the related
+`VUID-vkCmdDrawMultiEXT-imageLayout-00344`. **The first is Zink's own**: with Zink
+on this RADV *without* the forwarder — sway headless on the iGPU as the
+compositor, a virtual keyboard from `wtype`, the layer inside the game, F2 and
+F11 pressed the same way — it appears in both forms, `SHADER_READ_ONLY` and
+`PRESENT_SRC`. The second did not appear in the 120 s native run. VulkanMod's
+runs have no VUID on the GPU side. (The layer *inside* the game crashes Zink
+eventually on native RADV as well, in `zink_gfx_program_update_optimal` or
+`check_pool_alloc`; it is a diagnostic, not a gate.)
+
+### 96.7 Measurements
+
+The workstation, the AMD iGPU (RADV, Mesa 26.2.0 on the GPU side), 854x480
+windowed, render distance 8, the 30 s steady window of a run, the rate from our
+ICD's `icd.present` trace:
+
+| | vsync | frames/s | present interval p50 / p95 / p99 |
+|---|---|---|---|
+| stock (Zink, MESA_RADV) | off | 238 | 3.0 / 8.7 / 17.1 ms |
+| VulkanMod | off | 347 | 2.0 / 8.1 / 11.7 ms |
+| stock | on | 32 | 19.4 / 71.2 / 114.8 ms |
+| VulkanMod | on | 195 | 3.1 / 17.8 / 37.2 ms |
+
+Before 96.6 (Zink not knowing its driver) stock ran at 317 frames/s: RADV's
+workarounds include turning push descriptors off. With vsync on, stock is paced
+by Mesa's Wayland swap interval — it waits for `wl_surface.frame` — and runs at
+half the 60 Hz frame clock with a long tail: the timeline (§88) puts 17 ms of
+each frame in `vkWaitSemaphores` round trips and 14 ms in the present fence,
+against well under 5 ms of each with vsync off. That points at the iGPU's clocks
+under a light load rather than at the path, and it is the number to measure
+again on the guest, where the frame clock is DWM's. VulkanMod's vsync is a
+present mode, and our ICD's `FIFO` is not tied to a display (`wsi.rs`), so it is
+not capped.
+
+### 96.8 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | **102 binaries, 2939 passed, 0 failed**, 8 ignored (master 2924). New: `hold` (10: region bounds, the last-pixel clamp, absolute raw input), `control` (5: a click activates before it is delivered, a click on the foreground window changes nothing else, a new window goes on top of a raised one, a locked pointer reports the distance and does not move, a confined one stops at the last pixel and moves from there); `wc-proxy`'s protocol table at 47 interfaces and 468 messages |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` (`WINEPREFIX=/tmp/svwl-wineprefix-1000`) | `wc-pool: OK`, `wc-keymap: OK` |
+| `scripts/wc-xref.sh --list` (and `design_citations`) | 1216 citations resolve, 0 missing |
+| `scripts/wc-wlcs.sh headless` | **448 passed, 36 failed, 741 skipped** (master 429, 37, 759); 30 of the failures expected (96.3) |
+| `scripts/sv-minecraft.sh run stock` and `run vulkanmod` | PASS, every check above (96.1) |
+
+### 96.9 What is not done
+
+1. **Phase 2**: the guest, its Intel iGPU, a launcher app and the session's
+   sound. Recorded here when it is done.
+2. **Absolute pointers**: mouse-look from a remote desktop (TeamViewer injects
+   absolute positions) is implemented (`AbsoluteMotion`) and not measured; it
+   stops at the edge of the remote screen by construction.
+3. **vsync pacing on the workstation** (96.7).
+4. **The Wine leg cannot drive a pointer**, so the Win32 half of 96.3 is measured
+   by Minecraft under Wine, not by WLCS.

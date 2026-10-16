@@ -11,8 +11,19 @@ use std::time::Instant;
 
 use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle,
+    AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle, RelativeMotionEvent,
 };
+// ADDED FOR §96: pointer locks, confinement and relative motion, which is what
+// a game's mouse-look is made of. See `crate::hold` for the arithmetic and
+// `State::update_pointer_hold` for the policy.
+use smithay::wayland::pointer_constraints::{
+    with_pointer_constraint, PointerConstraint, PointerConstraintsHandler,
+    PointerConstraintsState,
+};
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::{delegate_pointer_constraints, delegate_relative_pointer};
+
+use crate::hold::PointerHold;
 // ADDED FOR STAGE 20. smithay's touch handle is the same shape as the pointer
 // one — it owns the per-contact focus map and the `frame` bookkeeping, so this
 // file supplies events and never a `WlTouch`.
@@ -566,6 +577,21 @@ pub struct State {
     xdg_activation: XdgActivationState,
     /// `zwp_keyboard_shortcuts_inhibit_manager_v1`'s inhibitor list.
     shortcuts_inhibit: KeyboardShortcutsInhibitState,
+    /// §96. `zwp_pointer_constraints_v1` and `zwp_relative_pointer_manager_v1`,
+    /// held so the globals live. smithay keeps the constraints themselves on
+    /// the surfaces they were made for.
+    _pointer_constraints: PointerConstraintsState,
+    _relative_pointer: RelativePointerManagerState,
+    /// §96. The constraint this compositor activated and is enforcing, and
+    /// what the platform was last told about it. At most one: there is one
+    /// pointer, and only the surface under it, in the window with the
+    /// keyboard, can hold it.
+    held: Option<Held>,
+    /// §96. Where the *platform* last said the pointer was, which is not
+    /// always where the client was told it is: a confined position has been
+    /// clamped, and a locked one has not moved at all. The difference between
+    /// two of these is the motion `zwp_relative_pointer_v1` reports.
+    platform_at: Option<(WindowId, f64, f64)>,
     /// Icons this compositor has actually put on a window, and how many were
     /// asked for and had nothing to answer with. Printed at shutdown, because
     /// "the icon is generic" is otherwise indistinguishable from "the icon
@@ -936,6 +962,10 @@ impl State {
             idle_inhibited: false,
             xdg_activation: XdgActivationState::new::<State>(dh),
             shortcuts_inhibit: KeyboardShortcutsInhibitState::new::<State>(dh),
+            _pointer_constraints: PointerConstraintsState::new::<State>(dh),
+            _relative_pointer: RelativePointerManagerState::new::<State>(dh),
+            held: None,
+            platform_at: None,
             icons_applied: 0,
             icons_missing: 0,
             _clipboard_manager: clipboard_manager,
@@ -1165,12 +1195,19 @@ impl State {
                 FromUi::Key { id, keycode, pressed, time } => {
                     self.key(id, keycode, pressed, time)
                 }
-                FromUi::PointerEnter { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
-                FromUi::PointerMotion { id, x, y, time } => self.pointer_motion(Some(id), x, y, time),
+                FromUi::PointerEnter { id, x, y, time } => self.platform_motion(id, x, y, time),
+                FromUi::PointerMotion { id, x, y, time } => self.platform_motion(id, x, y, time),
                 FromUi::PointerLeave { id, time } => {
+                    if self.platform_at.is_some_and(|(p, ..)| p == id) {
+                        self.platform_at = None;
+                    }
                     if self.pointer_focus == Some(id) {
                         self.pointer_motion(None, 0.0, 0.0, time);
+                        self.update_pointer_hold();
                     }
+                }
+                FromUi::PointerRelative { id, dx, dy, time } => {
+                    self.locked_motion(id, dx, dy, time)
                 }
                 FromUi::PointerButton { id, button, pressed, time } => {
                     self.pointer_button(id, button, pressed, time)
@@ -1812,6 +1849,16 @@ impl State {
         self.set_state(id, |s| toggle(s, xdg_state::Activated, false))
     }
 
+    /// [`Self::set_keyboard_focus_now`], and then §96's question again: a
+    /// pointer hold belongs to the window with the keyboard, so every change
+    /// of keyboard focus can start or end one. One wrapper rather than a call
+    /// after each of the five places that move the focus, so that a sixth
+    /// cannot forget it.
+    fn set_keyboard_focus(&mut self, id: WindowId, on: bool) {
+        self.set_keyboard_focus_now(id, on);
+        self.update_pointer_hold();
+    }
+
     /// Keyboard focus follows the **foreground window**, because the user's
     /// window manager is Windows.
     ///
@@ -1823,7 +1870,7 @@ impl State {
     /// activation is about which top-level window is frontmost and focus is
     /// about where a keystroke goes, and `xdg_toplevel`'s `activated` state
     /// wants the first while `wl_keyboard.enter` wants the second.
-    fn set_keyboard_focus(&mut self, id: WindowId, on: bool) {
+    fn set_keyboard_focus_now(&mut self, id: WindowId, on: bool) {
         let Some(keyboard) = self.keyboard.clone() else { return };
         if on {
             // §93: a popup that took the platform's focus anyway hands it to its
@@ -1993,6 +2040,86 @@ impl State {
     /// enter/leave bookkeeping the protocol requires is smithay's rather than
     /// something this file could get subtly wrong.
     fn pointer_motion(&mut self, id: Option<WindowId>, x: f64, y: f64, time: u32) {
+        self.pointer_motion_by(id, x, y, time, None);
+    }
+
+    /// §96. The pointer moved because the *platform* said so — the user moved
+    /// the mouse — as opposed to the scene changing under a pointer that stood
+    /// still, which also goes through [`Self::pointer_motion`].
+    ///
+    /// Only this kind of motion is motion `zwp_relative_pointer_v1` reports,
+    /// and only this kind is subject to a hold:
+    ///
+    /// * **locked**: the pointer does not move and the client hears only the
+    ///   distance. On Win32 the platform reports nothing at all while a lock is
+    ///   held — the system pointer is clipped and raw input carries the motion
+    ///   as [`FromUi::PointerRelative`] — so this branch is the headless
+    ///   platform's, where positions are all a test can produce.
+    /// * **confined**: the position is clamped into the region before anybody
+    ///   sees it. On Win32 `ClipCursor` has already done that, and the clamp
+    ///   is then a no-op; here it is the whole enforcement.
+    fn platform_motion(&mut self, id: WindowId, x: f64, y: f64, time: u32) {
+        let delta = match self.platform_at.replace((id, x, y)) {
+            Some((was, px, py)) if was == id => (x - px, y - py),
+            _ => (0.0, 0.0),
+        };
+        let (mut x, mut y) = (x, y);
+        if let Some(held) = self.held.as_ref().filter(|h| h.id == id) {
+            match held.hold {
+                PointerHold::Locked => {
+                    self.locked_motion(id, delta.0, delta.1, time);
+                    return;
+                }
+                PointerHold::Confined(r) => (x, y) = crate::hold::clamp_into(r, x, y),
+            }
+        }
+        let moved = (delta != (0.0, 0.0)).then_some(delta);
+        self.pointer_motion_by(Some(id), x, y, time, moved);
+        // The pointer may just have entered a surface that holds a constraint
+        // waiting for it, or left the one that was holding it.
+        self.update_pointer_hold();
+    }
+
+    /// §96. Motion of a locked pointer: relative motion and a frame, and
+    /// nothing else. The pointer does not move, so there is no `motion` event
+    /// and no hit test — the surface that locked it keeps it.
+    fn locked_motion(&mut self, id: WindowId, dx: f64, dy: f64, time: u32) {
+        let Some(held) = self.held.as_ref().filter(|h| h.id == id && h.hold == PointerHold::Locked)
+        else {
+            // Raw motion for a window that no longer holds the pointer: the
+            // platform has not caught up with a release yet. Nothing to say.
+            return;
+        };
+        let surface = held.surface.clone();
+        let origin = self.surface_under(id, self.pointer_at.0, self.pointer_at.1)
+            .filter(|(s, _)| *s == surface)
+            .map(|(_, o)| o)
+            .unwrap_or((0.0, 0.0));
+        let pointer = self.pointer.clone();
+        pointer.relative_motion(
+            self,
+            Some((surface, origin.into())),
+            &RelativeMotionEvent {
+                delta: (dx, dy).into(),
+                delta_unaccel: (dx, dy).into(),
+                utime: u64::from(time) * 1000,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// [`Self::pointer_motion`], with the distance the mouse moved when the
+    /// motion came from the mouse. The relative event goes in the same
+    /// `wl_pointer.frame` as the absolute one, which is what the protocol means
+    /// by them describing one motion.
+    fn pointer_motion_by(
+        &mut self,
+        id: Option<WindowId>,
+        x: f64,
+        y: f64,
+        time: u32,
+        moved: Option<(f64, f64)>,
+    ) {
         let pointer = self.pointer.clone();
         // **The scene lookup, and the window bookkeeping, are deliberately
         // separate.** `pointer_focus` answers "which window is the pointer
@@ -2017,13 +2144,24 @@ impl State {
             // pixels, and smithay subtracts it from `location` to get the
             // surface-local point the client is sent. See `surface_under` for
             // the three coordinate spaces and which one this is.
-            focus.map(|(s, origin)| (s, origin.into())),
+            focus.clone().map(|(s, origin)| (s, origin.into())),
             &MotionEvent {
                 location: (x, y).into(),
                 serial: SERIAL_COUNTER.next_serial(),
                 time,
             },
         );
+        if let (Some((dx, dy)), Some((s, origin))) = (moved, focus) {
+            pointer.relative_motion(
+                self,
+                Some((s, origin.into())),
+                &RelativeMotionEvent {
+                    delta: (dx, dy).into(),
+                    delta_unaccel: (dx, dy).into(),
+                    utime: u64::from(time) * 1000,
+                },
+            );
+        }
         // Every logical group of pointer events ends in a `frame`. `wl_pointer`
         // version 5 made it required, clients batch on it, and omitting it
         // leaves a client holding a half-delivered event until the next one
@@ -3890,6 +4028,36 @@ impl CompositorHandler for State {
                             id,
                             damage: vec![Rect::new(0, 0, w, h)],
                         });
+                        // §96, found by Minecraft: **a client still choosing
+                        // its size has chosen this one**, and the window
+                        // follows — the rule §91 made for the buffer path,
+                        // which a geometry-only commit never reached. GLFW
+                        // with libdecor maps its window *with* client-side
+                        // decorations (854x480 inside 902x552 of frame and
+                        // shadow), learns a moment later that the decorations
+                        // are the server's, destroys the frame and declares
+                        // 854x480 — with no new buffer, because its content
+                        // did not change. The `HWND` stayed 902x552 and showed
+                        // a band of background under the game for as long as
+                        // it ran.
+                        let window = &self.windows[surface];
+                        let client_chooses = window.role.toplevel().is_some_and(|t| {
+                            t.with_pending_state(|s| {
+                                s.size.is_none()
+                                    && !s.states.contains(xdg_state::Maximized)
+                                    && !s.states.contains(xdg_state::Fullscreen)
+                            })
+                        });
+                        if window.mapped && client_chooses && window.shown_size != (w, h) {
+                            if let Some(window) = self.windows.get_mut(surface) {
+                                window.shown_size = (w, h);
+                            }
+                            println!(
+                                "wc-compositor: window {id} client chose {w}x{h} by its geometry \
+                                 alone; the window follows"
+                            );
+                            self.ui.send(ToUi::Resize { id, width: w, height: h });
+                        }
                     }
                 }
             }
@@ -3931,6 +4099,11 @@ impl CompositorHandler for State {
         {
             let (x, y) = self.pointer_at;
             self.pointer_motion(Some(over), x, y, self.now_ms());
+        }
+        // §96: a commit can move or unmap the held surface, or change the
+        // constraint's region; and a held pointer's hold is re-checked.
+        if self.held.is_some() {
+            self.update_pointer_hold();
         }
     }
 }
@@ -4329,6 +4502,43 @@ impl XdgShellHandler for State {
         }
     }
 
+    /// §96: `xdg_toplevel.set_fullscreen`, which is Minecraft's F11.
+    ///
+    /// Until §96 this was smithay's default — a bare configure — so the request
+    /// was declined in the protocol's own terms and F11 did nothing. It is now
+    /// honoured the way `maximize_request` honours a maximise: the platform is
+    /// asked (borderless over the monitor, on Win32) and the state is adopted
+    /// in the same configure, with the output's size; the `WM_SIZE` that
+    /// follows corrects the size if the monitor is not the output.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<wl_output::WlOutput>) {
+        let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.ui.send(ToUi::Fullscreen { id, on: true });
+        let size = self.output.current_mode().map(|m| (m.size.w, m.size.h));
+        println!("wc-compositor: window {id} asked for fullscreen ({size:?})");
+        self.set_state(id, |s| {
+            toggle(s, xdg_state::Fullscreen, true);
+            if let Some((w, h)) = size.filter(|&(w, h)| w > 0 && h > 0) {
+                s.size = Some((w, h).into());
+            }
+        })
+    }
+
+    /// §96: and back. The size is the platform's to say — the window goes back
+    /// to the rectangle it had — so the configure carries the state alone and
+    /// the `WM_SIZE` brings the size.
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let Some(id) = self.windows.get(surface.wl_surface()).map(|w| w.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.ui.send(ToUi::Fullscreen { id, on: false });
+        println!("wc-compositor: window {id} left fullscreen");
+        self.set_state(id, |s| toggle(s, xdg_state::Fullscreen, false))
+    }
+
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         if let Some(window) = self.windows.get(surface.wl_surface()) {
             self.ui.send(ToUi::SetWindowState {
@@ -4369,6 +4579,8 @@ impl XdgShellHandler for State {
                 window.id, window.presented
             );
             self.ui.send(ToUi::Destroy { id: window.id });
+            // §96: if it held the pointer, the platform is told to let go.
+            self.update_pointer_hold();
         }
     }
 
@@ -5374,6 +5586,179 @@ impl KeyboardShortcutsInhibitHandler for State {
 }
 
 delegate_keyboard_shortcuts_inhibit!(State);
+
+// ---------------------------------------------------------------------------
+// §96: holding the pointer
+// ---------------------------------------------------------------------------
+
+/// The constraint this compositor activated, and what it told the platform.
+#[derive(Debug)]
+struct Held {
+    /// The window the platform was told about, so the release names it.
+    id: WindowId,
+    surface: WlSurface,
+    hold: PointerHold,
+}
+
+/// `zwp_pointer_constraints_v1`.
+///
+/// smithay keeps the constraints and sends `locked`/`confined` when told to
+/// activate one; **when** is the compositor's policy, and this is it:
+///
+/// > A constraint is active while its surface is the one under the pointer,
+/// > in the window that has the keyboard, and the pointer is inside its
+/// > region.
+///
+/// The keyboard half is what makes this safe on Windows. A game that locks the
+/// pointer has it only while it is the window the user is typing into; the
+/// moment Windows gives the keyboard to anything else — Alt-Tab, a click on the
+/// taskbar, the Start menu, a notification — the lock ends, and a `oneshot`
+/// constraint is gone with it. It is also what WLCS asks: a constraint on a
+/// surface that has not been selected stays inactive, and one on a surface
+/// that loses the keyboard to a new window is released
+/// (`PointerConstraints.when_surface_is_unselected_*`).
+///
+/// The pointer half is the protocol's: "the lock … will be activated once the
+/// pointer enters the region". smithay ends a constraint itself when the
+/// pointer leaves its surface.
+impl PointerConstraintsHandler for State {
+    fn new_constraint(&mut self, surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        println!(
+            "wc-compositor: a client asked to {} the pointer",
+            match with_pointer_constraint(surface, &self.pointer, |c| {
+                c.map(|c| matches!(*c, PointerConstraint::Locked(_)))
+            }) {
+                Some(true) => "lock",
+                Some(false) => "confine",
+                None => "constrain (and smithay refused)",
+            }
+        );
+        self.update_pointer_hold();
+    }
+
+    /// Where the client is drawing a pointer while it is locked. Not used: when
+    /// the lock ends the system pointer is still where it was locked, which is
+    /// where the client last saw it, and moving it to the hint would be moving
+    /// the user's pointer on a client's say-so.
+    fn cursor_position_hint(
+        &mut self,
+        _surface: &WlSurface,
+        _pointer: &PointerHandle<Self>,
+        _location: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) {
+    }
+
+    /// The fork's hook (vendor/smithay): the client destroyed the constraint,
+    /// which is how GLFW ends a lock — Minecraft opening its pause menu or its
+    /// inventory. Without this the platform would go on clipping a pointer the
+    /// client has already let go of.
+    fn constraint_removed(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {
+        self.update_pointer_hold();
+    }
+}
+
+delegate_pointer_constraints!(State);
+// `zwp_relative_pointer_manager_v1` needs no handler: smithay sends
+// `relative_motion` to every relative pointer of the focused client when
+// `PointerHandle::relative_motion` is called, which `pointer_motion_by` and
+// `locked_motion` do.
+delegate_relative_pointer!(State);
+
+impl State {
+    /// §96. The window holding the pointer, and how: what the platform was last
+    /// told. Read by the synthetic Win32 in `crate::control`, which has to clip
+    /// its own pointer the way `ClipCursor` clips the real one.
+    #[cfg(unix)]
+    pub fn held_pointer(&self) -> Option<(WindowId, PointerHold)> {
+        self.held.as_ref().map(|h| (h.id, h.hold))
+    }
+
+    /// Bring the active constraint, and the platform, into line with the
+    /// policy on [`PointerConstraintsHandler for State`](State). Called after
+    /// anything that can change the answer — the pointer moving, the keyboard
+    /// moving, a constraint appearing or going away, a commit of the held
+    /// surface — and cheap when nothing changed, because the platform is told
+    /// only about a difference.
+    fn update_pointer_hold(&mut self) {
+        let pointer = self.pointer.clone();
+        let keyboard_window = self.keyboard_focus.map(|k| self.owning_toplevel(k));
+        // The surface that may hold the pointer: smithay's pointer focus, if
+        // its window has the keyboard.
+        let candidate = pointer.current_focus().filter(|s| s.is_alive()).and_then(|s| {
+            let id = self.windows.get(&root_of(&s)).map(|w| w.id)?;
+            (Some(self.owning_toplevel(id)) == keyboard_window).then_some((id, s))
+        });
+
+        // 1. Let go of the one that is held, if it should not be any more —
+        //    or if it already isn't (smithay ends it on a pointer leave, and a
+        //    client can destroy it).
+        if let Some(held) = self.held.take() {
+            let still = held.surface.is_alive()
+                && with_pointer_constraint(&held.surface, &pointer, |c| {
+                    c.is_some_and(|c| c.is_active())
+                });
+            let keep = still && candidate.as_ref().is_some_and(|(_, s)| *s == held.surface);
+            if keep {
+                self.held = Some(held);
+            } else {
+                if still {
+                    with_pointer_constraint(&held.surface, &pointer, |c| {
+                        if let Some(c) = c {
+                            c.deactivate();
+                        }
+                    });
+                }
+                println!("wc-compositor: window {} let go of the pointer", held.id);
+                self.ui.send(ToUi::PointerHold { id: held.id, hold: None });
+            }
+        }
+
+        // 2. Take hold for the candidate, if it has a constraint waiting and
+        //    the pointer is inside its region.
+        if self.held.is_some() {
+            return;
+        }
+        let Some((id, surface)) = candidate else { return };
+        let (x, y) = self.pointer_at;
+        let Some((under, origin)) = self.surface_under(id, x, y) else { return };
+        if under != surface {
+            return;
+        }
+        let Some(size) = self.staging.get(&surface).map(|s| (s.width(), s.height())) else {
+            return;
+        };
+        let local = (x - origin.0, y - origin.1);
+        let hold = with_pointer_constraint(&surface, &pointer, |c| {
+            let c = c?;
+            if c.is_active() {
+                return None;
+            }
+            if !accepts_input_at(size, c.region(), local) {
+                return None;
+            }
+            let hold = match &*c {
+                PointerConstraint::Locked(_) => PointerHold::Locked,
+                PointerConstraint::Confined(_) => {
+                    let r = crate::hold::region_bounds(size, c.region())?;
+                    // Into the window's coordinates, which are the
+                    // platform's.
+                    PointerHold::Confined(Rect::new(
+                        r.x + origin.0.round() as i32,
+                        r.y + origin.1.round() as i32,
+                        r.w,
+                        r.h,
+                    ))
+                }
+            };
+            c.activate();
+            Some(hold)
+        });
+        let Some(hold) = hold else { return };
+        println!("wc-compositor: window {id} holds the pointer: {hold:?}");
+        self.ui.send(ToUi::PointerHold { id, hold: Some(hold) });
+        self.held = Some(Held { id, surface, hold });
+    }
+}
 
 delegate_compositor!(State);
 delegate_shm!(State);

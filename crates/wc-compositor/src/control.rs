@@ -61,6 +61,8 @@
 //!                                           ok
 //!   position <client> <surface> <x> <y>  -> ok | err unknown-surface
 //!   pointer-move <x> <y>                 -> ok          (absolute, f64)
+//!   pointer-move-by <dx> <dy>            -> ok          (relative; §96, how a held
+//!                                                       pointer is driven)
 //!   pointer-button <evdev-code> <0|1>    -> ok
 //!   pointer-leave                        -> ok
 //!   touch-down <x> <y>                   -> ok | ok no-window
@@ -150,6 +152,12 @@ pub trait Windows {
     fn take_gesture(&self) -> Option<(WindowId, Option<Edge>)> {
         None
     }
+    /// §96. The window holding the pointer and how, which on Win32 is a
+    /// `ClipCursor` rectangle and a raw-input registration. The stand-in
+    /// applies both to the moves the suite makes: see `Control::move_by`.
+    fn pointer_hold(&self) -> Option<(WindowId, crate::hold::PointerHold)> {
+        None
+    }
 }
 
 impl Windows for crate::state::State {
@@ -163,6 +171,10 @@ impl Windows for crate::state::State {
 
     fn take_gesture(&self) -> Option<(WindowId, Option<Edge>)> {
         self.take_gesture_request()
+    }
+
+    fn pointer_hold(&self) -> Option<(WindowId, crate::hold::PointerHold)> {
+        self.held_pointer()
     }
 }
 
@@ -255,6 +267,10 @@ pub struct Control {
     output: (i32, i32),
     /// §85. The move or resize being run, if any. See [`Gesture`].
     gesture: Option<Gesture>,
+    /// §96. The toplevels in Windows' Z order, bottom first: a window that
+    /// appears goes on top, and so does one that is clicked. See
+    /// [`Control::stack`].
+    raised: Vec<WindowId>,
 }
 
 impl Control {
@@ -288,6 +304,7 @@ impl Control {
             started: std::time::Instant::now(),
             output,
             gesture: None,
+            raised: Vec::new(),
         })
     }
 
@@ -337,8 +354,88 @@ impl Control {
     /// **A popup does not take it.** `xdg_popup` is `WS_POPUP` with an owner
     /// and no activation (docs/waycompose-design.md §15.6); a menu that stole the focus
     /// would dismiss itself on the way up.
-    fn follow_focus(&mut self, windows: &impl Windows) {
+    /// §96. The mapped windows in Windows' Z order, bottom first.
+    ///
+    /// Until §96 the stack was creation order and nothing could change it, so
+    /// the synthetic Win32 had no answer to a click on a window that was not
+    /// the newest: Windows raises it and makes it the foreground window
+    /// (`WM_MOUSEACTIVATE`, then `WM_ACTIVATE` and `WM_SETFOCUS`, all before
+    /// the `WM_LBUTTONDOWN`), and here nothing happened. WLCS asks for that
+    /// directly — `PointerConstraints.when_surface_is_selected_*` clicks a
+    /// window to give it the keyboard, and a constraint activates only on the
+    /// window with the keyboard (`State::update_pointer_hold`).
+    ///
+    /// A toplevel's rank is its place in [`Control::raised`]; one not there
+    /// yet has just appeared and is on top, in creation order. A popup goes
+    /// with the toplevel it hangs off, above it — an owned `WS_POPUP` is
+    /// always above its owner and is raised with it.
+    fn stack(&self, windows: &impl Windows) -> Vec<Rect> {
         let mapped = windows.mapped();
+        let owner = |r: &Rect| -> WindowId {
+            let mut cur = r;
+            for _ in 0..mapped.len() {
+                match cur.popup_at.and_then(|(p, ..)| mapped.iter().find(|m| m.id == p)) {
+                    Some(parent) => cur = parent,
+                    None => break,
+                }
+            }
+            cur.id
+        };
+        let rank = |id: WindowId| -> usize {
+            match self.raised.iter().position(|r| *r == id) {
+                Some(i) => i,
+                None => self.raised.len() + mapped.iter().position(|r| r.id == id).unwrap_or(0),
+            }
+        };
+        let mut out: Vec<(usize, bool, usize, Rect)> = mapped
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let o = owner(r);
+                (rank(o), o != r.id, i, *r)
+            })
+            .collect();
+        out.sort_by_key(|(rank, popup, i, _)| (*rank, *popup, *i));
+        out.into_iter().map(|(.., r)| r).collect()
+    }
+
+    /// §96: keep [`Control::raised`] to the toplevels that exist, with every
+    /// one that has appeared since the last turn on top.
+    fn track_stack(&mut self, windows: &impl Windows) {
+        let mapped = windows.mapped();
+        self.raised.retain(|id| mapped.iter().any(|r| r.id == *id && r.toplevel));
+        for r in mapped.iter().filter(|r| r.toplevel) {
+            if !self.raised.contains(&r.id) {
+                self.raised.push(r.id);
+            }
+        }
+    }
+
+    /// §96: a press on a window that is not the foreground one raises it and
+    /// gives it the activation and the keyboard, before the press itself is
+    /// delivered — the order Win32's messages arrive in.
+    fn click_to_activate(&mut self, over: WindowId, windows: &impl Windows) {
+        self.track_stack(windows);
+        let mapped = windows.mapped();
+        let mut top = over;
+        for _ in 0..mapped.len() {
+            match mapped.iter().find(|m| m.id == top).and_then(|m| m.popup_at) {
+                Some((p, ..)) => top = p,
+                None => break,
+            }
+        }
+        if !mapped.iter().any(|r| r.id == top && r.toplevel) || self.raised.last() == Some(&top) {
+            return;
+        }
+        self.raised.retain(|id| *id != top);
+        self.raised.push(top);
+        println!("wc-compositor: [control] window {top} raised and activated by a click");
+        self.follow_focus(windows);
+    }
+
+    fn follow_focus(&mut self, windows: &impl Windows) {
+        self.track_stack(windows);
+        let mapped = self.stack(windows);
         // Topmost first, popups skipped: the foreground window is the last
         // toplevel to have appeared.
         let want = mapped.iter().rev().find(|r| r.toplevel).map(|r| r.id);
@@ -395,7 +492,7 @@ impl Control {
     /// can be unplugged — so a cache that is only refreshed on a move would be
     /// a promise this stand-in could not keep either.
     fn publish_bounds(&self, windows: &impl Windows) {
-        let mapped = windows.mapped();
+        let mapped = self.stack(windows);
         let (ow, oh) = self.output;
         for r in &mapped {
             let (x, y) = self.origin(r, &mapped);
@@ -415,7 +512,7 @@ impl Control {
             println!("wc-compositor: [control] window {id} gesture ignored: no button held");
             return;
         };
-        let mapped = windows.mapped();
+        let mapped = self.stack(windows);
         let Some(r) = mapped.iter().find(|r| r.id == id && r.toplevel) else { return };
         let key = (r.client, r.surface);
         self.gesture = Some(Gesture {
@@ -531,7 +628,7 @@ impl Control {
             "ping" => "ok\n".to_owned(),
             "windows" => {
                 let mut out = String::new();
-                let mapped = windows.mapped();
+                let mapped = self.stack(windows);
                 for r in &mapped {
                     let (x, y) = self.origin(r, &mapped);
                     out.push_str(&format!(
@@ -587,9 +684,26 @@ impl Control {
                 self.refresh(windows);
                 "ok\n".to_owned()
             }
+            // §96. The mouse moved by this much, rather than to somewhere.
+            // On a held pointer the two are different questions: a locked
+            // pointer does not move at all and the distance arrives as raw
+            // input, and a confined one moves from where it *is* — clipped —
+            // not from where the suite last asked for it.
+            "pointer-move-by" => {
+                let (Some(dx), Some(dy)) = (num(), num()) else {
+                    return "err pointer-move-by wants <dx> <dy>\n".to_owned();
+                };
+                self.move_by(dx, dy, windows);
+                "ok\n".to_owned()
+            }
             "pointer-move" => {
                 let (Some(x), Some(y)) = (num(), num()) else {
                     return "err pointer-move wants <x> <y>\n".to_owned();
+                };
+                // §96: `SetCursorPos` under a `ClipCursor` lands inside the
+                // clip, and moves nothing at all under a lock.
+                let Some((x, y)) = self.clip_to_hold(x, y, windows) else {
+                    return "ok\n".to_owned();
                 };
                 self.at = Some((x, y));
                 if self.gesture.is_some() {
@@ -630,6 +744,10 @@ impl Control {
                     return "ok no-window\n".to_owned();
                 };
                 if down {
+                    // §96: Windows activates on the press, before delivering it.
+                    if self.held.is_empty() {
+                        self.click_to_activate(id, windows);
+                    }
                     if !self.held.contains(&code) {
                         self.held.push(code);
                     }
@@ -671,7 +789,7 @@ impl Control {
                 // The between-windows hit test, done once, here — a contact is
                 // captured to the window it lands on from this moment, so
                 // unlike the pointer there is no `refresh` to re-run later.
-                let mapped = windows.mapped();
+                let mapped = self.stack(windows);
                 let hit = mapped.iter().rev().find(|r| {
                     let (wx, wy) = self.origin(r, &mapped);
                     x >= wx as f64
@@ -715,7 +833,7 @@ impl Control {
                 // window it landed on. A move that leaves that window sends
                 // coordinates outside it, which is what `wl_touch` says and
                 // what Win32 does for a captured contact.
-                let mapped = windows.mapped();
+                let mapped = self.stack(windows);
                 let Some(r) = mapped.iter().find(|r| r.id == id) else {
                     // The window went away under the finger. `touch_up` will
                     // find nothing either; the contact is simply over.
@@ -761,6 +879,47 @@ impl Control {
         }
     }
 
+    /// §96. Where a pointer sent to `(x, y)` actually ends up while a window
+    /// holds it, in compositor coordinates: inside the confinement rectangle,
+    /// or — for a lock — nowhere new, which is `None`. What `ClipCursor` does
+    /// to `SetCursorPos` and to the mouse, on the synthetic Win32.
+    fn clip_to_hold(&self, x: f64, y: f64, windows: &impl Windows) -> Option<(f64, f64)> {
+        let Some((id, hold)) = windows.pointer_hold() else { return Some((x, y)) };
+        let mapped = self.stack(windows);
+        let Some(r) = mapped.iter().find(|r| r.id == id) else { return Some((x, y)) };
+        let (wx, wy) = self.origin(r, &mapped);
+        match hold {
+            crate::hold::PointerHold::Locked => None,
+            crate::hold::PointerHold::Confined(c) => Some(crate::hold::clamp_into(
+                crate::surface::Rect::new(wx + c.x, wy + c.y, c.w, c.h),
+                x,
+                y,
+            )),
+        }
+    }
+
+    /// §96. The mouse moved by `(dx, dy)`.
+    ///
+    /// Free or confined, it is a move from where the pointer is to wherever
+    /// the clip lets it go. Locked, the pointer stays put and the distance is
+    /// raw input — [`FromUi::PointerRelative`], the message `win32.rs` makes
+    /// of `WM_INPUT` — which is the only way a locked client hears anything.
+    fn move_by(&mut self, dx: f64, dy: f64, windows: &impl Windows) {
+        if let Some((id, crate::hold::PointerHold::Locked)) = windows.pointer_hold() {
+            let time = self.now_ms();
+            let _ = self.events.send(FromUi::PointerRelative { id, dx, dy, time });
+            return;
+        }
+        let (ax, ay) = self.at.unwrap_or((0.0, 0.0));
+        let Some((x, y)) = self.clip_to_hold(ax + dx, ay + dy, windows) else { return };
+        self.at = Some((x, y));
+        if self.gesture.is_some() {
+            self.step_gesture(x, y);
+        } else {
+            self.refresh(windows);
+        }
+    }
+
     fn position_of(&self, client: u32, surface: u32) -> (i32, i32) {
         self.positions
             .iter()
@@ -777,7 +936,7 @@ impl Control {
     /// held button pinning the answer the way `SetCapture` does.
     fn refresh(&mut self, windows: &impl Windows) {
         let Some((px, py)) = self.at else { return };
-        let mapped = windows.mapped();
+        let mapped = self.stack(windows);
         let time = self.now_ms();
 
         // A held button captures: the events keep going to the window the
@@ -865,10 +1024,14 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
 
-    struct Fake(Vec<Rect>, std::cell::RefCell<Vec<(WindowId, crate::surface::Rect)>>);
+    struct Fake(
+        Vec<Rect>,
+        std::cell::RefCell<Vec<(WindowId, crate::surface::Rect)>>,
+        std::cell::Cell<Option<(WindowId, crate::hold::PointerHold)>>,
+    );
     impl Fake {
         fn new(windows: Vec<Rect>) -> Fake {
-            Fake(windows, std::cell::RefCell::new(Vec::new()))
+            Fake(windows, std::cell::RefCell::new(Vec::new()), std::cell::Cell::new(None))
         }
     }
     impl Windows for Fake {
@@ -877,6 +1040,9 @@ mod tests {
         }
         fn set_popup_bounds(&self, id: WindowId, bounds: crate::surface::Rect) {
             self.1.borrow_mut().push((id, bounds));
+        }
+        fn pointer_hold(&self) -> Option<(WindowId, crate::hold::PointerHold)> {
+            self.2.get()
         }
     }
 
@@ -896,6 +1062,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 output: (800, 600),
                 gesture: None,
+                raised: Vec::new(),
             },
             rx,
         )
@@ -1068,6 +1235,92 @@ mod tests {
         c.handle("pointer-move 50 50", &f);
         c.begin_gesture(1, None, &f);
         assert!(c.gesture.is_none());
+    }
+
+    /// §96: under a lock the pointer stays where it is and the mouse's motion
+    /// is raw input, which is what `ClipCursor` and `WM_INPUT` make of it.
+    #[test]
+    fn a_locked_pointer_does_not_move_and_reports_the_distance() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
+        c.handle("pointer-move 50 50", &f);
+        while rx.try_recv().is_ok() {}
+        f.2.set(Some((1, crate::hold::PointerHold::Locked)));
+        c.handle("pointer-move-by 7 -3", &f);
+        c.handle("pointer-move 90 90", &f);
+        let got: Vec<FromUi> = rx.try_iter().collect();
+        assert!(
+            matches!(got.as_slice(), [FromUi::PointerRelative { id: 1, dx, dy, .. }] if *dx == 7.0 && *dy == -3.0),
+            "{got:?}"
+        );
+        assert_eq!(c.at, Some((50.0, 50.0)));
+    }
+
+    /// §96: a confined pointer moves from where it is to the edge of the clip
+    /// and no further, and a relative move starts from the clipped position.
+    #[test]
+    fn a_confined_pointer_stops_at_the_last_pixel_and_moves_from_there() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 300, 300)]);
+        c.handle("pointer-move 150 150", &f);
+        f.2.set(Some((1, crate::hold::PointerHold::Confined(crate::surface::Rect::new(0, 0, 300, 300)))));
+        c.handle("pointer-move-by 600 600", &f);
+        assert_eq!(c.at, Some((299.0, 299.0)));
+        c.handle("pointer-move-by -600 0", &f);
+        assert_eq!(c.at, Some((0.0, 299.0)));
+        let last = rx.try_iter().last();
+        assert!(matches!(last, Some(FromUi::PointerMotion { id: 1, x, y, .. }) if x == 0.0 && y == 299.0));
+    }
+
+    /// §96: a press on the window that is not the foreground one raises it and
+    /// moves the activation and the keyboard to it, before the press arrives.
+    #[test]
+    fn a_click_on_a_background_window_activates_it_first() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100), win(2, 1, 4, 100, 100)]);
+        c.handle("position 1 4 200 0", &f);
+        c.follow_focus(&f);
+        while rx.try_recv().is_ok() {}
+        c.handle("pointer-move 50 50", &f);
+        c.handle("pointer-button 272 1", &f);
+        let got: Vec<FromUi> = rx.try_iter().collect();
+        let pos = |p: &dyn Fn(&FromUi) -> bool| got.iter().position(p);
+        let focus = pos(&|e| matches!(e, FromUi::KeyboardFocus { id: 1, on: true, .. }));
+        let press = pos(&|e| matches!(e, FromUi::PointerButton { id: 1, pressed: true, .. }));
+        assert!(focus.is_some() && press.is_some() && focus < press, "{got:?}");
+        assert!(got.iter().any(|e| matches!(e, FromUi::KeyboardFocus { id: 2, on: false, .. })));
+        assert_eq!(c.stack(&f).last().map(|r| r.id), Some(1));
+    }
+
+    #[test]
+    fn a_click_on_the_foreground_window_changes_nothing_else() {
+        let (mut c, rx) = control();
+        let f = Fake::new(vec![win(1, 1, 3, 100, 100)]);
+        c.follow_focus(&f);
+        while rx.try_recv().is_ok() {}
+        c.handle("pointer-move 50 50", &f);
+        c.handle("pointer-button 272 1", &f);
+        let got: Vec<FromUi> = rx.try_iter().collect();
+        assert!(!got.iter().any(|e| matches!(e, FromUi::KeyboardFocus { .. })), "{got:?}");
+    }
+
+    /// §96: a newly mapped window goes on top of one the user raised earlier,
+    /// as `ShowWindow` puts it there.
+    #[test]
+    fn a_new_window_goes_on_top_of_a_raised_one() {
+        let (mut c, _rx) = control();
+        let two = Fake::new(vec![win(1, 1, 3, 100, 100), win(2, 1, 4, 100, 100)]);
+        c.follow_focus(&two);
+        c.click_to_activate(1, &two);
+        assert_eq!(c.stack(&two).last().map(|r| r.id), Some(1));
+        let three = Fake::new(vec![
+            win(1, 1, 3, 100, 100),
+            win(2, 1, 4, 100, 100),
+            win(3, 1, 5, 100, 100),
+        ]);
+        c.follow_focus(&three);
+        let order: Vec<WindowId> = c.stack(&three).iter().map(|r| r.id).collect();
+        assert_eq!(order, vec![2, 1, 3]);
     }
 
     #[test]
