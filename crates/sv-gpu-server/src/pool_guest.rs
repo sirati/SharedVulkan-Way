@@ -299,6 +299,14 @@ fn pool_session(
     // knows how; otherwise keep the device and its leases for ever.
     let leftovers = shared.objects.lock().map(|o| o.leftovers()).unwrap_or_default();
     let mut clean = Arc::strong_count(&shared) == 1;
+    // A session this side ended with an error may still have its application:
+    // its ICD still maps the control region. Giving the region to the next
+    // session would re-create a live session's rings under it (§97.10), so it
+    // is kept, with its leases, until this process ends.
+    if let Err(e) = &served {
+        eprintln!("[gpu] session {session} ended by this side ({e}); its control region and leases are kept");
+        clean = false;
+    }
     if clean && !leftovers.is_empty() {
         let destroyed = shared.objects.lock().map_err(|_| vec!["poisoned".to_string()]).and_then(|mut o| unsafe {
             let _ = shared.driver.device.device_wait_idle();
