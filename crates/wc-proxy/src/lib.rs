@@ -43,6 +43,7 @@
 //! | module | what it is | testable without |
 //! |---|---|---|
 //! | [`icons`] | an app id, a desktop entry and an icon theme become pixels | anything |
+//! | [`desktop`] | a desktop entry becomes a name, actions and the argv each runs (§92) | anything |
 //! | [`iconlink`] | a second connection, on which those pixels are published | a compositor |
 //! | [`spec`] | the protocol's argument signatures, read from the vendored XML | anything |
 //! | [`wire`] | walking and rebuilding a message body in either dialect | anything |
@@ -76,6 +77,10 @@ pub mod clip;
 /// channel, and then going and finding it. `cfg(unix)` for the same reason
 /// `guestram` is: it maps QEMU's backing object and forks the locator, neither
 /// of which is a thing on the other side of the boundary.
+/// §92. A desktop entry, its actions, and the argv each one runs: what the
+/// guest's pinned button and jump list are built from.
+#[cfg(unix)]
+pub mod desktop;
 #[cfg(unix)]
 pub mod guestgrow;
 #[cfg(unix)]

@@ -527,6 +527,17 @@ usage: wc-desk <command> [options]
     /// property, or a shell that refused the question. All three leave the
     /// window grouped by its process, which is the state this stage is about.
     fn aumid(hwnd: HWND) -> Option<String> {
+        window_string(hwnd, 5)
+    }
+
+    /// §92. `PKEY_AppUserModel_RelaunchCommand`: what a pin made from this
+    /// window would run. Present only on a window the launcher made pinnable.
+    fn relaunch(hwnd: HWND) -> Option<String> {
+        window_string(hwnd, 2)
+    }
+
+    /// One `PKEY_AppUserModel_*` string off a window's property store.
+    fn window_string(hwnd: HWND, pid: u32) -> Option<String> {
         // Once per process, on this thread; `wc-desk` is a one-shot command and
         // never uninitialises.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -552,7 +563,8 @@ usage: wc-desk <command> [options]
         unsafe {
             let vtbl = &*(*store).vtbl;
             let mut pv = PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] };
-            let hr = (vtbl.get_value)(store, &PKEY_APP_USER_MODEL_ID, &mut pv);
+            let key = PROPERTYKEY { fmtid: PKEY_APP_USER_MODEL_ID.fmtid, pid };
+            let hr = (vtbl.get_value)(store, &key, &mut pv);
             let out = if hr < 0 || pv.vt != VT_LPWSTR || pv.value[0] == 0 {
                 None
             } else {
@@ -597,7 +609,7 @@ usage: wc-desk <command> [options]
                 continue;
             }
             println!(
-                "0x{:<10x} {:<5} {:<26} {:<20} {:?}{}{}",
+                "0x{:<10x} {:<5} {:<26} {:<20} {:?}{}{}{}",
                 w.hwnd as usize,
                 if taskbar_entry(w) { "yes" } else { "no" },
                 w.class,
@@ -614,6 +626,11 @@ usage: wc-desk <command> [options]
                 // every harness already grepping this table keeps working.
                 match aumid(w.hwnd) {
                     Some(id) => format!(" aumid={id:?}"),
+                    None => String::new(),
+                },
+                // §92: what a pin of this window would run.
+                match relaunch(w.hwnd) {
+                    Some(r) => format!(" relaunch={r:?}"),
                     None => String::new(),
                 }
             );

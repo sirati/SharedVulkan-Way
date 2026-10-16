@@ -52,6 +52,16 @@ pub struct App {
     /// value, because the comment here said the compositor's half "does not
     /// exist yet"; it had existed for months.
     pub titlebar: String,
+    /// §92. The application's desktop entry on the VM host, by id: `firefox`
+    /// for `firefox.desktop`. Its name, icon and `Actions=` become the Start
+    /// menu entry, the pin and the jump list. The section's id by default.
+    pub desktop: String,
+    /// §92. The Wayland app id the application's windows carry, which is what
+    /// their taskbar identity is derived from (`taskbar::identity`). Empty by
+    /// default, meaning the desktop entry's `StartupWMClass`, else `desktop`:
+    /// the pin and the windows must agree, or a running window gets a button
+    /// of its own beside its pin.
+    pub app_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +204,8 @@ impl Config {
                         exec: String::new(),
                         prefs: String::new(),
                         titlebar: "tabs".into(),
+                        desktop: id.to_string(),
+                        app_id: String::new(),
                     });
                 }
                 continue;
@@ -213,6 +225,8 @@ impl Config {
                     "exec" => app.exec = v.into(),
                     "prefs" => app.prefs = v.into(),
                     "titlebar" => app.titlebar = v.into(),
+                    "desktop" => app.desktop = v.into(),
+                    "app-id" => app.app_id = v.into(),
                     other => return Err(format!("line {}: [app.{id}] has no {other}", n + 1)),
                 }
                 continue;
@@ -316,6 +330,20 @@ impl Config {
             // environment variable Firefox does not recognise, and Firefox
             // answers an unknown value by decorating itself — a window that
             // looks almost right, which is the worst kind.
+            // §92. The desktop id becomes a file name on the VM host and a word in
+            // $SSH_ORIGINAL_COMMAND; the host refuses anything else, and saying so
+            // here names the line.
+            let id_ok = |s: &str| {
+                !s.starts_with('.')
+                    && !s.contains("..")
+                    && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+            };
+            if app.desktop.is_empty() || !id_ok(&app.desktop) || !id_ok(&app.app_id) {
+                return Err(format!(
+                    "[app.{id}] desktop = {} and app-id = {} must be desktop ids (letters, digits, . _ - +)",
+                    app.desktop, app.app_id
+                ));
+            }
             if crate::plan::Titlebar::parse(&app.titlebar).is_none() {
                 return Err(format!(
                     "[app.{id}] titlebar = {} is not one of tabs, none, client",
@@ -466,6 +494,24 @@ mod tests {
         assert_eq!(cfg.app("firefox").unwrap().titlebar, "tabs");
         assert_eq!(cfg.app("other").unwrap().titlebar, "none");
         assert_eq!(Config::parse(EXAMPLE).unwrap().app("firefox").unwrap().titlebar, "tabs");
+    }
+
+    /// §92. The desktop id defaults to the section's, the app id to nothing
+    /// (meaning the entry's StartupWMClass), and neither may leave the
+    /// alphabet the host accepts.
+    #[test]
+    fn the_desktop_id_and_app_id_default_and_are_checked() {
+        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.firefox]\nexec=firefox\n";
+        let c = Config::parse(base).unwrap();
+        let a = c.app("firefox").unwrap();
+        assert_eq!((a.desktop.as_str(), a.app_id.as_str()), ("firefox", ""));
+        let c = Config::parse(&format!("{base}desktop=org.mozilla.firefox\napp-id=firefox-esr\n")).unwrap();
+        let a = c.app("firefox").unwrap();
+        assert_eq!((a.desktop.as_str(), a.app_id.as_str()), ("org.mozilla.firefox", "firefox-esr"));
+        for bad in ["../x", "a b", "a/b", ".x", "a;b"] {
+            assert!(Config::parse(&format!("{base}desktop={bad}\n")).is_err(), "{bad}");
+            assert!(Config::parse(&format!("{base}app-id={bad}\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]

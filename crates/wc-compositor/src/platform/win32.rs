@@ -4426,20 +4426,38 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
 
 /// `PKEY_AppUserModel_PreventPinning`: no "Pin to taskbar" on this button.
 ///
-/// **Set, deliberately, and this is a decision rather than caution.** Pinning
+/// **Set unless the launcher has said what a pin should run** (§92). Pinning
 /// writes a shortcut whose target is what the shell can work out about the
-/// window, and relaunching it would start `wc-compositor.exe` — not the Wayland
-/// client the button appears to be. The three properties that would make
-/// pinning honest (`PKEY_AppUserModel_RelaunchCommand`, `…IconResource`,
-/// `…DisplayNameResource`) cannot be filled in truthfully from here either: the
-/// application is a process on **another machine**, started by a person or a
-/// script that this compositor knows nothing about, and there is no command
-/// line on this side that would bring it back. A pinned button that silently
-/// does the wrong thing is worse than an absent affordance, so the affordance
-/// is removed and the reason is written down.
+/// window, and relaunching it would start `sv-guest.exe`, not the Wayland
+/// client the button appears to be. The application is a process on another
+/// machine, and this compositor has no command line that would bring it back.
+/// The launcher that started it does: it writes a [`crate::taskbar::Relaunch`]
+/// per application into `--relaunch-dir`, and a window whose identity has one
+/// gets the three properties below instead of this one. A window without one
+/// still cannot be pinned, because a pin that silently does the wrong thing is
+/// worse than an absent affordance.
 const PKEY_PREVENT_PINNING: PROPERTYKEY = PROPERTYKEY {
     fmtid: FMTID_APP_USER_MODEL,
     pid: 9,
+};
+
+/// `PKEY_AppUserModel_RelaunchCommand`: what a pin of this window runs. §92.
+const PKEY_RELAUNCH_COMMAND: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 2,
+};
+
+/// `PKEY_AppUserModel_RelaunchIconResource`: `path,index` of the pin's icon.
+const PKEY_RELAUNCH_ICON: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 3,
+};
+
+/// `PKEY_AppUserModel_RelaunchDisplayNameResource`: the pin's name. Windows
+/// ignores a relaunch command that has none.
+const PKEY_RELAUNCH_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: FMTID_APP_USER_MODEL,
+    pid: 4,
 };
 
 /// `VT_LPWSTR`.
@@ -4608,11 +4626,54 @@ fn set_taskbar_identity(w: &Rc<WindowState>, aumid: &str) -> Result<String, (&'s
         if hr < 0 {
             result = Err(("SetValue(PKEY_AppUserModel_ID)", hr));
         }
+        // §92. Pinnable when the launcher said what a pin runs, and not
+        // otherwise. Every key is written on every stamp, so a window that
+        // moves from one identity to another cannot keep the old one's
+        // relaunch command: an absent value is written as `VT_EMPTY`, which
+        // removes it.
+        let relaunch = crate::taskbar::relaunch_for(aumid);
+        let wides = relaunch.as_ref().map(|r| (wide(&r.command), wide(&r.name), wide(&r.icon)));
         if result.is_ok() {
-            let hr =
-                (vtbl.set_value)(store, &PKEY_PREVENT_PINNING, &PropVariant::boolean(true));
-            if hr < 0 {
-                result = Err(("SetValue(PKEY_AppUserModel_PreventPinning)", hr));
+            let keys: [(&PROPERTYKEY, PropVariant, &'static str); 4] = match &wides {
+                Some((command, name, icon)) => [
+                    (&PKEY_RELAUNCH_COMMAND, PropVariant::lpwstr(command.as_ptr()), "RelaunchCommand"),
+                    (&PKEY_RELAUNCH_NAME, PropVariant::lpwstr(name.as_ptr()), "RelaunchDisplayNameResource"),
+                    (
+                        &PKEY_RELAUNCH_ICON,
+                        if icon.len() > 1 { PropVariant::lpwstr(icon.as_ptr()) } else { PropVariant::empty() },
+                        "RelaunchIconResource",
+                    ),
+                    (&PKEY_PREVENT_PINNING, PropVariant::boolean(false), "PreventPinning"),
+                ],
+                None => [
+                    (&PKEY_RELAUNCH_COMMAND, PropVariant::empty(), "RelaunchCommand"),
+                    (&PKEY_RELAUNCH_NAME, PropVariant::empty(), "RelaunchDisplayNameResource"),
+                    (&PKEY_RELAUNCH_ICON, PropVariant::empty(), "RelaunchIconResource"),
+                    (&PKEY_PREVENT_PINNING, PropVariant::boolean(true), "PreventPinning"),
+                ],
+            };
+            for (key, value, what) in keys {
+                let hr = (vtbl.set_value)(store, key, &value);
+                if hr < 0 {
+                    eprintln!(
+                        "wc-compositor: window {} SetValue(PKEY_AppUserModel_{what}) returned 0x{:08x}",
+                        w.id, hr as u32
+                    );
+                    if what == "PreventPinning" || relaunch.is_some() {
+                        result = Err(("SetValue(a PKEY_AppUserModel_Relaunch* key)", hr));
+                        break;
+                    }
+                }
+            }
+            match &relaunch {
+                Some(r) => println!(
+                    "wc-compositor: window {} can be pinned: relaunch {:?} as {:?}, icon {:?}",
+                    w.id, r.command, r.name, r.icon
+                ),
+                None => println!(
+                    "wc-compositor: window {} cannot be pinned: no relaunch file for {aumid:?}",
+                    w.id
+                ),
             }
         }
         if result.is_ok() {
