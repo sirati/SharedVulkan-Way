@@ -1181,3 +1181,27 @@ at run time would be host RAM taken from the host's applications, and adding
 one takes QEMU's monitor, which is root's. Nothing on the launch path asks for
 either. The device's size is set in the VM's configuration, beside the guest's
 RAM, by whoever can change the VM.
+
+### R35 — The shared doorbell hub
+Added 2026-10-16 with `waycompose-design.md` §99. One process per user on the
+VM host, `sv-hostd bell-hub` in the user unit `wc-bell-hub.service`, holds
+QEMU's two doorbell sockets (`svbell.sock` and `wcbell.sock`, R29's group or
+ACL) and serves them on `/run/user/<uid>/wc-bell/{sv,wl}.sock`: each socket
+0600 in a directory the hub makes 0700, so only this user's processes reach
+it. It runs as the user and refuses to run as root; it carries bytes and
+nothing else, so no descriptor and no memory crosses through it.
+
+**What a client can do.** Send bytes toward the guest, which wake rings in
+the guest's GPU process or compositor: spurious wakes, at one syscall each,
+which R31 already prices. Read every byte from the guest, which says which
+ring lanes were written and when, the same timing information R31 records
+for the port itself. Fail to read: its own queue fills and its own bytes are
+dropped, and no other client is affected.
+
+**What it changes.** Before §99 the first session to start held the port and
+any later session was silently without bells; a crashed session's leftover
+`sv-hostd` could hang the next session's application (§97.10). Now no session
+can hold the port. *What this does not cover:* a process of this user that
+connects to QEMU's socket directly, before the hub does, holds the port as
+before; nothing but the hub should, and every installation's `wc-session`
+since §99 does not.
