@@ -205,7 +205,8 @@ def two_windows():
     first = first.get("value", first) if isinstance(first, dict) else first
     size(1280, 752)
     # `SOAK_VIDEO=1`: the first window plays a looping clip for the whole run
-    # (§97: two windows plus a video), and the tour stays in the second.
+    # (§97: two windows plus a video; §98: the recipe of the crash at quit),
+    # and the tour stays in the second.
     video = os.environ.get("SOAK_VIDEO") == "1"
     m.call("WebDriver:Navigate", {"url": page_uri("video.html" if video else "retitle.html")})
     second = m.call("WebDriver:NewWindow", {"type": "window"})["handle"]

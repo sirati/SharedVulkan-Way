@@ -401,7 +401,8 @@ HTML
 HTML
   # `SVWL_VIDEO=1` (two-windows): the first window plays a 720p H.264 clip in a
   # loop for the whole run instead of retitling, and says how playback goes in
-  # its title (waycompose-design.md §97: two windows plus a video).
+  # its title (waycompose-design.md §97: two windows plus a video; §98: the
+  # recipe that made Firefox crash at quit).
   if [ "${SVWL_VIDEO:-0}" = 1 ]; then
     ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=10" \
       -c:v libx264 -profile:v high -preset fast -b:v 3M -pix_fmt yuv420p -movflags +faststart \
@@ -447,7 +448,10 @@ try {
 </script>
 HTML
   say "firefox (soak), $SECS s through Marionette on port $MPORT"
-  env HOME="$RUN/home" ${SVWL_EXTRA_ENV:-} \
+  # `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in Firefox's own environment: without
+  # it the crash reporter submits a crash's minidump and deletes it, and the
+  # verdict's count of minidumps below says none (waycompose-design.md §98).
+  env HOME="$RUN/home" MOZ_CRASHREPORTER_NO_DELETE_DUMP=1 ${SVWL_EXTRA_ENV:-} \
     "$FIREFOX" --no-remote --marionette -remote-allow-system-access --profile "$RUN/profile" about:blank \
     >"$RUN/ff.log" 2>&1 &
   FF=$!
@@ -519,7 +523,10 @@ HTML
   [ "$ALIVE" -eq 1 ] && ok "Firefox was alive after ${LIVED} s" || bad "Firefox was gone after ${LIVED} s"
   [ "$LIVED" -ge "$SECS" ] && ok "it lived at least the $SECS s asked for" || bad "it lived ${LIVED} s of $SECS"
   if [ -n "$QUIT" ]; then
-    dumps=$(ls "$RUN/profile/minidumps/"*.dmp 2>/dev/null | wc -l)
+    # A crash's minidump is moved out of the profile into the crash reporter's
+    # own directory under `$HOME` (`Crash Reports/pending`), so both are counted
+    # (waycompose-design.md §98).
+    dumps=$(find "$RUN/profile/minidumps" "$RUN/home" -name '*.dmp' 2>/dev/null | wc -l)
     [ "$QUIT" = "exit 0" ] && [ "$dumps" -eq 0 ] \
       && ok "closing the last window quit Firefox cleanly (exit 0, no minidump)" \
       || bad "closing the last window: $QUIT, $dumps minidump(s) in the profile"
