@@ -31481,3 +31481,52 @@ Mesa make, so a fault in it is a Firefox that does not start.
 | `scripts/wc-xref.sh --list` | 1294 resolve to one section, 0 missing |
 | the recipe, locally | 18 runs with the shim, 0 crashes (100.5) |
 | the guest | **open** (100.6) |
+
+## 101. The desktop is the user's first: an activity sentinel, and a lease that waits for it
+
+2026-10-17, branch `present-async`. The user's rule, for every agent: the
+Windows guest's desktop is ours when there has been no real keyboard or mouse
+input for two minutes; while there is, wait. It came out of §100.6, where
+somebody at the desktop closed the windows of an A/B run, twice. What this
+section builds is the measurement that makes "real" mean something.
+
+### 101.1 What counts as the user
+
+Every agent's input on the guest goes through `SendInput`: the session agent
+of §95, `wc-desk`. Windows flags all of it as injected, and a low-level hook
+sees the flag (`LLKHF_INJECTED`, `LLMHF_INJECTED` and their `LOWER_IL`
+variants). So the rule is decidable inside the guest, with one exception. Keys
+injected through QEMU (QMP `input-send-event`: `guest-keys.sh`, and
+`unlock-guest.sh`, which has to reach the secure desktop) arrive as
+hardware.
+
+### 101.2 The pieces
+
+| piece | where | what |
+|---|---|---|
+| `wc-activity.exe` | `scripts/wc-activity.c`, built with mingw; on the guest in `%LOCALAPPDATA%\waycompose\tools` | No window, no focus. `WH_KEYBOARD_LL` and `WH_MOUSE_LL` on one thread. Injected events are skipped, and so is a mouse move under 2 px from the last one counted. A second thread writes `%LOCALAPPDATA%\waycompose\activity.txt` every 2 s, replaced atomically: a heartbeat, whether the hooks are installed, the start time, and the last 64 real inputs, coalesced to 250 ms, newest first. The hooks never wait on the disk (Windows silently drops a slow low-level hook) and are reinstalled every minute. One per session (a named mutex). |
+| scheduled task `wc-activity` | `scripts/wc-activity-install.sh` | Starts it at <guest-user>'s logon, interactive, limited, no time limit, restarted on failure; the script also starts it at once. Safe to run while somebody uses the desktop |
+| `guest-idle.sh` | `scripts/wc-guest-idle.sh`, installed as `/tmp/wcrun/guest-idle.sh` | Reads the file and the guest's clock over ssh. Exit 0 `idle N s` at 120 s or more (`GUEST_IDLE_SECS`). Exit 2 `active N s ago`. Exit 1 unknown (no file, a heartbeat over 15 s old, no hooks), which counts as not idle. Input from 0.5 s before to 2 s after a line of `/tmp/wcrun/qmp-inject.log` is ours: the clocks are matched through the middle of the ssh round trip. If every input kept is ours, the last real one is older: the sentinel's start, or the oldest entry when all 64 slots are full |
+| QMP injection log | `/tmp/wcrun/guest-keys.sh`, `/tmp/wcrun/unlock-guest.sh` | A line before and after each injection, host milliseconds first |
+| `guest-lease.sh take` | `/tmp/wcrun/guest-lease.sh` | Takes a free lease only once the desktop is idle. Renewing does not wait. `GUEST_LEASE_NO_IDLE=1` is for work that opens no window and sends no input |
+| the instructions | `/mnt/datasets/builds/visual-check-instructions.md` | Every agent rechecks before each input step, and pauses until two idle minutes if the user comes back |
+
+### 101.3 Checked
+
+- **On the guest**, installed 13:42. Running in session 1, both hooks in place,
+  a heartbeat every 2 s. In the first 40 s it recorded 15 real mouse inputs and
+  no keyboard. No agent drives the VM's pointer: nothing of ours sends QMP
+  pointer events, and no automation process was running. So somebody was moving
+  the mouse at that moment, which is also what §100.6 suspected.
+- **The check's logic**, against canned files (`GUEST_ACTIVITY_TEXT`):
+  - a real input 30 s ago reads `active 30 s ago`, exit 2;
+  - the same input inside a logged injection, with a real one 200 s before
+    it, reads `idle 200 s`, exit 0;
+  - a heartbeat 60 s old reads unknown, exit 1;
+  - no input since a start 600 s ago reads `idle 600 s`;
+  - only our injection in the ring reads idle since the start.
+- **A run under the rule:** `/tmp/dc/ab4-block.sh` waits for an idle desktop
+  before each run. During a run it checks every 10 s, and if the desktop is
+  used it aborts the run, ends its session, and repeats it after two idle
+  minutes. The soak drives Firefox through Marionette, which is not OS input,
+  so activity during a run is the user's.
