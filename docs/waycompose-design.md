@@ -30095,6 +30095,8 @@ configure with the output's size. On Win32 that is the borderless fullscreen
 games use: the style and outer rectangle saved, `WS_POPUP`, the window over the
 monitor's `rcMonitor` (not the work area, so the taskbar is under it), the size
 reaching the client through `WM_SIZE`; `unset_fullscreen` puts both back.
+(96.10: the *placement* is saved and replaced too, since a restore from the
+taskbar goes back to it.)
 Measured: `fullscreen on its monitor (1600x1000 at 0,0)`, F3 `Display:
 1600x1000`, and back to 854x480.
 
@@ -30196,13 +30198,163 @@ not capped.
 ### 96.9 What is not done
 
 1. **Phase 2**: the guest, its Intel iGPU, a launcher app and the session's
-   sound. Recorded here when it is done.
+   sound. Played by the user on the guest, both renderers, with sound; what
+   that found is 96.10 and 96.11, and what is still to be seen there is at the
+   end of 96.11.
 2. **Absolute pointers**: mouse-look from a remote desktop (TeamViewer injects
    absolute positions) is implemented (`AbsoluteMotion`) and not measured; it
    stops at the edge of the remote screen by construction.
 3. **vsync pacing on the workstation** (96.7).
 4. **The Wine leg cannot drive a pointer**, so the Win32 half of 96.3 is measured
    by Minecraft under Wine, not by WLCS.
+
+### 96.10 On the guest: a fullscreen game minimises when it loses focus, and the test helper took focus
+
+The user played both games from the deployed launcher. Two reports came back:
+a fullscreen VulkanMod "went to the taskbar and could not be restored", and
+stock Minecraft did the same earlier.
+
+**The minimising is GLFW's, and it is right.** GLFW's `GLFW_AUTO_ICONIFY`
+(default on) minimises a fullscreen window when it loses focus: on Wayland
+`xdgSurfaceHandleConfigure` calls `xdg_toplevel_set_minimized` when a configure
+clears `activated` while the window has a monitor (glfw3-minecraft 3.4,
+`wl_window.c:636`), and GLFW's Win32 backend does the same on Windows. What
+took focus was the test helper: a scheduled task in session 1 starting
+`powershell.exe -WindowStyle Hidden`, which Windows 11 hosts in Windows Terminal
+regardless, so a terminal window came up and took the foreground. Every look at
+a fullscreen game minimised it.
+
+**A real click restores it.** `wc-desk mouse` (SendInput, real input) on the
+game's taskbar button brought the window back and focused. The helper's own
+`ShowWindow(SW_RESTORE)` + `SetForegroundWindow` from a background process
+cannot, because Windows' foreground lock refuses `SetForegroundWindow` from a
+process the user did not just interact with. That is not something to fix.
+
+**What was wrong: the placement.** The restored window came back 1296x768 at
+-8,-8, borderless, with the taskbar showing beneath it: the maximised placement
+it had before F11. `set_fullscreen` had saved and moved only the window's
+rectangle (`GetWindowRect`, `SetWindowPos`). Windows keeps a second answer,
+`WINDOWPLACEMENT` (the normal rectangle and whether the window is maximised),
+and a restore from the taskbar uses that one. Now `set_fullscreen` saves the
+placement and, for as long as the window is fullscreen, sets it to normal (not
+maximised; minimised stays minimised) with the monitor as its normal rectangle
+and without `WPF_RESTORETOMAXIMIZED`. Leaving puts the saved placement back,
+maximised if it was, and a window that is on the taskbar at that moment stays
+there. `rcNormalPosition` is in workspace coordinates unless the window is a
+tool window. That arithmetic is `platform/fullscreen.rs`, pure and tested on
+every target (6 tests: taskbar at the bottom, top and left, a tool window, a
+second monitor, the show states).
+
+**The helpers, for anyone testing a fullscreen application on the guest:**
+
+* **Keys**: `/tmp/wcrun/guest-keys.sh f11 esc e shift+w …` injects through
+  QEMU's virtual keyboard (QMP `input-send-event`). No guest process starts, so
+  nothing takes focus. It refuses the Windows key. The VM has only a PS/2
+  mouse (relative motion), so avoid clicks while a game is fullscreen.
+* **Looking**: `wc-desk` is now a GUI-subsystem program, with no console, so
+  started by a scheduled task it shows no window and takes no foreground.
+  `--stdout FILE` takes its output to a file, which is how a scheduled task
+  gets it back. Started from ssh or `cmd /c … > file` it writes to the handles
+  it was given, and from an interactive console it attaches to that console.
+  Measured on the guest: `wc-desk windows` from the scheduled task with a
+  restored fullscreen Minecraft in front, and the game stayed in front and was
+  not minimised. With the old helper, every run minimised it.
+
+### 96.11 Minecraft's icon, and Prism Launcher from Windows
+
+**Minecraft names no app id.** On the guest its window was
+`Waycompose.unnamed.c4`: the generic icon, a taskbar button of its own,
+nothing to pin. GLFW 3.4 takes its Wayland app id from the
+`GLFW_WAYLAND_APP_ID` hint, and Minecraft does not set it. On plain
+`xdg_toplevel` GLFW then sends `set_app_id("")`. On libdecor, which
+glfw3-minecraft uses when libdecor is there, it sends nothing at all
+(`libdecor_frame_set_app_id` only `if (strlen(appId))`, `wl_window.c:822`).
+The local run showed the second: the proxy saw no `set_app_id`.
+
+**The launcher says it in the environment, and the proxy acts on it.** The
+proxy already reads `/proc/<pid>/exe` of each client (§18.5). It now also
+reads `/proc/<pid>/environ` for two variables (`icons::client_env`):
+
+* `WC_APP_ID`: a toplevel of that client starts with this app id, sent right
+  after `xdg_surface.get_toplevel`, and an empty `set_app_id` is replaced by
+  it. A client that names itself is never overruled: its own non-empty
+  `set_app_id` follows and replaces the default, as any second one does. The
+  value must be a desktop id (`icons::app_id_ok`, the launcher's rule).
+* `XDG_DATA_DIRS`: joins the icon search after the proxy's own directories and
+  before the executable's prefix. An application installed under a home
+  directory and run by an interpreter (`~/wc-mc`, Java) is found nowhere else.
+
+What a client can choose this way is the name of its own icon and where its
+own desktop entry is, which it could already choose with `set_app_id`.
+
+`minecraft-demo` sets `WC_APP_ID` to the desktop id of its shortcut
+(`wc-minecraft`, `wc-minecraft-vulkanmod`) and puts the installation's
+`share/` first in `XDG_DATA_DIRS`. Since the launcher derives the shortcut's
+identity from that same desktop id (§92.1), window and pin are one button.
+Measured locally (Phase 1 harness, `SVMC_GAME_ENV` with the two variables):
+`xdg_toplevel@28 starts with app id "wc-minecraft"`, the icon resolved from
+the bundle's `48x48/apps/wc-minecraft.png` (Minecraft's own, from the game's
+assets), `window 1 icon <- 1 image(s) published for "wc-minecraft"`, and the
+window moved to `Waycompose.app.wc-minecraft`. Every other check of the run
+passed, including a clean quit.
+
+**Prism Launcher from Windows.** `prism` is an application like the others
+(`scripts/sv-minecraft-apps.ini`): Prism 11.1.1 from nixpkgs on Prism's data
+in `~/wc-mc/prism`, with both instances, named "Minecraft 1.21.11" and
+"Minecraft 1.21.11 (VulkanMod)". It gets a desktop shortcut, a Start menu
+entry and a pinnable identity like Firefox's.
+
+* **Qt on Wayland, Windows' caption.** `env = QT_QPA_PLATFORM=wayland` (never
+  X11) and `QT_WAYLAND_DISABLE_WINDOWDECORATION=1`, so Qt draws no frame of its
+  own and the compositor gives the window Windows' caption (`titlebar = none`,
+  §82). On the guest: Windows' caption with Prism's icon and three buttons, and
+  nothing of Qt's above the page.
+* **One identity.** Qt's app id is the desktop file's name,
+  `org.prismlauncher.PrismLauncher`. The launcher would have derived the
+  shortcut's identity from the entry's `StartupWMClass` (`PrismLauncher`),
+  making window and pin two buttons, so the guest block sets
+  `app-id = org.prismlauncher.PrismLauncher`. On the guest:
+  `aumid="Waycompose.app.org.prismlauncher.PrismLauncher"`, a relaunch command
+  (`wc-launch.exe prism`), and Prism's own 256 px icon resolved by the proxy
+  from its package.
+* **The game Prism starts** inherits everything from Prism, which has it from
+  `wc-session`: the session's Wayland display (GLFW picks Wayland by itself
+  with no `DISPLAY`), its sound (`$XDG_RUNTIME_DIR/pulse/native`), the GPU
+  environment (`gpu.env` and the session's `SV_SOCKET`). From the instances it
+  gets system GLFW (`UseNativeGLFW`), the narrator off and Prism's 1 GiB heap.
+  The one thing Prism cannot pass on is the identity. Prism's global wrapper
+  command, `bin/minecraft-prism-wrap`, sets `WC_APP_ID` by instance (`INST_ID`)
+  and the data directory, then `exec`s the game. It is a global setting, so an
+  instance the person adds later has it too. A game from Prism and the same
+  game from its shortcut are the same taskbar button with Minecraft's icon,
+  separate from Prism's: that is how Windows shows a launcher and the game it
+  started.
+* **No account, and none prevented.** With no valid account Prism opens its
+  Quick Setup page ("Add Microsoft account") at every start
+  (`Application::createSetupWizard`: `login = !anyAccountIsValid() &&
+  SupportsMSA`); **Finish** goes on without one. Play then asks "No
+  Accounts" (No), "Play demo?" (Play Demo) and a player name (OK), and the game
+  starts with `--demo`. A person who wants their own Microsoft account adds it
+  in Prism. Nothing here stops that, and the automation never enters
+  credentials. The login watchdog and the refusing `xdg-open` of 96.2 belong to
+  `sv-minecraft.sh setup` and are not in the deployed path.
+* **`ship` keeps what the player owns**: worlds, `options.txt`,
+  `servers.dat`, `accounts.json`, logs and screenshots are excluded from the
+  copy and from `--delete`. The bundle's `options.txt` goes only where an
+  instance has none.
+
+**Not yet seen on the guest** (the desktop was the user's): a game started
+from Prism, and Minecraft's icon on the guest's taskbar. Both need one short
+slot: open Prism from its shortcut, Finish, select an instance, Play, then the
+three dialogs, then a look at the taskbar.
+
+Gates on `ed365b4` (master 86a6261 merged): `cargo test --workspace
+--no-fail-fast` **102 binaries, 2986 passed, 0 failed**, 8 ignored (new:
+`platform::fullscreen`'s 6, `icons`' 2 environment tests, and the session test
+of the app id on the wire); `cargo clippy --workspace --all-targets` exit 0,
+no warning in a line this branch wrote; `cargo check --workspace --target
+x86_64-pc-windows-gnu` exit 0; `scripts/sv-minecraft.sh run stock 150` with
+`WC_APP_ID` PASS.
 
 ## 97. The GPU arena becomes one pool: leases instead of slots, and a device carved out of the guest's RAM
 
@@ -30797,7 +30949,7 @@ doorman, a proxy's ring wake) do not reconnect, so after a restart every
 session then running waits out its slices until it ends: slower, never
 wrong. So `wc-launch.sh deploy` starts the hub when none runs and never
 restarts a running one; a new binary takes effect at its next start.
-Reconnecting clients would remove even that, and are left as follow-up.
+Clients since 99.4 reconnect, which removes even that for new sessions.
 
 Without the hub, a session falls back to holding the port itself and says
 so in capitals (`NO SHARED DOORBELL HUB`), which is the pre-§99 behaviour.
@@ -30812,3 +30964,19 @@ old one would take QEMU's socket away from the hub.
 | `bellhub::clients_survive_the_upstream_reconnecting` | the upstream closes (the VM stops): the hub reconnects by itself and a client connected before carries on both ways |
 | `bellhub::a_client_leaving_affects_no_other` | a client leaving is forgotten, the rest still get the guest's bytes; the socket is 0600 |
 | `vdoorbell::a_doorbell_nobody_reads_never_blocks_the_poker` (`8b68865`) | the ICD's side: two million pokes into a socket nobody reads return at once |
+
+### 99.4 Clients reconnect to a restarted hub
+
+An ICD's doorman and a proxy's ring wake now attach through
+`vdoorbell::attach_host_reconnecting`: the installed writer is a
+`SwapWriter`, and when the hub's socket closes the doorman reconnects every
+500 ms and swaps the new socket in. In the gap pokes are dropped and waits
+use their slices; nothing fails and nothing waits for the hub. An ICD whose
+hub is not up yet at bring-up now keeps trying instead of giving up.
+`vdoorbell::a_client_reconnects_to_a_restarted_hub`: the hub's socket closes
+and is bound again on the same path, and the client's pokes reach the new
+hub and the new hub's bytes ring its target.
+
+Sessions started by a build before this one do not reconnect, so deploy
+restarts a changed hub only while no `wc-launch-*` unit is active, and
+otherwise says the change waits for the hub's next start.

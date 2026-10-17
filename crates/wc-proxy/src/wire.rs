@@ -244,6 +244,16 @@ pub fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend(std::iter::repeat_n(0u8, pad4(bytes.len()) - bytes.len()));
 }
 
+/// Append a Wayland `string`: its length counting the terminating NUL, the
+/// bytes and the NUL, padded to a word. §96's rewritten `set_app_id` is the
+/// one string this proxy writes rather than copies.
+pub fn push_string(out: &mut Vec<u8>, s: &str) {
+    let mut v = Vec::with_capacity(s.len() + 1);
+    v.extend_from_slice(s.as_bytes());
+    v.push(0);
+    push_bytes(out, &v);
+}
+
 /// Rebuild `body` with every `h` argument re-encoded in the other dialect.
 ///
 /// `replacements` supplies one payload per `h`, in order. Going

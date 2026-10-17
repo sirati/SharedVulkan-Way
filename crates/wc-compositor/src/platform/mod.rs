@@ -59,6 +59,8 @@ use crate::surface::{Rect, Shadow};
 // machine that builds them. Only `win32.rs` calls it.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod caption;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod fullscreen;
 #[cfg(windows)]
 mod drag;
 #[cfg(windows)]

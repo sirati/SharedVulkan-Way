@@ -30,6 +30,11 @@ done
 QP=()
 [ -d "$G/saves/Demo_World" ] && QP=(--quickPlaySingleplayer Demo_World)
 LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$C/env")
+# §96.11: the game's window sets an empty app id (GLFW), so wc-proxy gives it
+# WC_APP_ID, the desktop id of this launch's shortcut, and finds that desktop
+# entry and Minecraft's icon in this installation's share/.
+case "$V" in stock) APPID=wc-minecraft ;; vulkanmod) APPID=wc-minecraft-vulkanmod ;; esac
 cd "$G" || exit 1
-exec env LD_LIBRARY_PATH="$LDP" __GLX_VENDOR_LIBRARY_NAME=mesa "${ARGV[@]}" \
+exec env LD_LIBRARY_PATH="$LDP" __GLX_VENDOR_LIBRARY_NAME=mesa \
+  WC_APP_ID="$APPID" XDG_DATA_DIRS="$H/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" "${ARGV[@]}" \
   < <(grep -v '^launch$' "$C/stdin"; for a in "${QP[@]}"; do echo "param $a"; done; echo launch)
