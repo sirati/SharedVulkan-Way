@@ -30999,3 +30999,60 @@ hub and the new hub's bytes ring its target.
 Sessions started by a build before this one do not reconnect, so deploy
 restarts a changed hub only while no `wc-launch-*` unit is active, and
 otherwise says the change waits for the hub's next start.
+
+### 99.5 One application killed stopped every session: the guest's port write
+
+2026-10-17, 07:39–08:01, `wcmc` on master `6bd5cac`, on the hub. Firefox
+(two windows, one playing the 720p clip) and stock Minecraft ran together,
+each with its GPU session's doorbell on the hub and the proxy's Wayland
+doorbell beside them. The hub was restarted under them at 07:40:53, and all
+three clients reconnected within a second (99.4); pages kept loading. Then
+Minecraft's `java` was killed with SIGKILL at 07:41:06.
+
+From that moment the guest's GPU process served no session at all. Firefox's
+next page load waited 30 s, its ICD timed out ("wait on ring 2 timed out")
+and Zink crashed the browser on `DEVICE_LOST`. The GPU process logged nothing
+after 07:40:27, not even the end of Minecraft's session, which its 5 s
+heartbeat check should have noticed. `Stop-Process` left it half-exited with
+one thread in a kernel `Executive` wait and one in `ExecutionDelay`. That is
+Windows' I/O-cancel loop. At 08:00:43 the guest logged **VirtioSerial event
+54, `0x80040036`, `IO_DRIVER_CANCEL_TIMEOUT`** ("failed to complete a
+cancelled I/O request in the allotted time"), and only then did the process
+finish exiting. There was no TDR or display event, and DWM stayed responsive.
+The Intel driver was not involved.
+
+**What stopped every session** was the one thing they all share and can block
+on: the process's doorbell writer. Every ring thread pokes it after
+publishing a reply. On Windows it was an overlapped `WriteFile` waited for
+with no timeout, under one mutex. One write that never completed held the
+mutex, and every session's ring threads queued behind it. Why the virtio-serial
+port stopped draining at the kill is not known: the hub kept reading its
+upstream, and QEMU's side showed nothing queued. Whatever the trigger, the
+writer must never be able to stop a serving thread.
+
+**While the process cannot exit, it keeps the GPU device's one mapping**
+(`map_ivshmem`: "the driver allows one per device and keeps it until the
+handle that made it closes"). For those 8 minutes a new GPU process of any
+installation would have been refused the device and its applications would
+have rendered in software. It was not a reboot's worth, but it was not
+harmless either.
+
+Fixed:
+
+* The guest's port writer is now the detached writer the host side got in
+  `8b68865`: a thread of its own and a bounded queue that drops on overflow.
+  A ring thread never waits on the port again.
+* An overlapped write waits at most 500 ms, is then cancelled
+  (`CancelIoEx`), and is waited for, since its buffer must outlive it. The
+  driver may not complete the cancel for minutes (the event above), and then
+  only the writer thread waits; bells are dropped meanwhile.
+
+Measured locally on both drivers the guest path can be stood in for: two
+survivors rendering frames continuously while a third client was killed
+with SIGKILL five times. Survivors had 0 failures on lavapipe through
+`pool-guest` and 0 on RADV through `serve --pool`. Neither path has a
+virtio-serial port, so neither could reproduce the stall itself. The guest
+confirmation is the multi-app run again.
+
+Not fixed: a process with a pending virtio-serial request still takes up to
+the I/O-cancel timeout to exit, and holds the GPU device until then.
