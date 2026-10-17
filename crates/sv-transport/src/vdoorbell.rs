@@ -527,6 +527,45 @@ pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
     Ok((Doorman { stop, woken, handle: Some(handle) }, connected, wake))
 }
 
+/// The host's doorbell writer since §99.9: each byte is sent with
+/// `MSG_DONTWAIT`, so a full socket is `WouldBlock` (counted as dropped by
+/// [`PortWake::poke`]) and the call never waits, without a thread in between.
+/// Per call, not `O_NONBLOCK`: that flag belongs to the open file
+/// description, which the doorbell's reader shares through `try_clone`, and
+/// would turn its blocking read into a poll.
+#[cfg(target_os = "linux")]
+pub struct DontWaitWriter(pub std::os::unix::net::UnixStream);
+
+#[cfg(target_os = "linux")]
+mod dontwait_sys {
+    unsafe extern "C" {
+        pub fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    }
+    pub const MSG_DONTWAIT: i32 = 0x40;
+    pub const MSG_NOSIGNAL: i32 = 0x4000;
+}
+
+#[cfg(target_os = "linux")]
+impl Write for DontWaitWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `buf` is valid for `buf.len()` bytes and the descriptor is
+        // owned by `self.0` for the duration of the call.
+        let n = unsafe {
+            dontwait_sys::send(
+                self.0.as_raw_fd(),
+                buf.as_ptr(),
+                buf.len(),
+                dontwait_sys::MSG_DONTWAIT | dontwait_sys::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A `Write` that hands each write to a thread of its own and never blocks.
 ///
 /// A doorbell byte means "look at your rings", and a lost one costs a wait its
@@ -632,7 +671,11 @@ impl PortHandle {
             #[cfg(unix)]
             PortHandle::Unix(s) => {
                 let w = s.try_clone()?;
-                (Box::new(s), Box::new(DetachedWriter::spawn(w)?))
+                #[cfg(target_os = "linux")]
+                let w: Box<dyn Write + Send> = Box::new(DontWaitWriter(w));
+                #[cfg(not(target_os = "linux"))]
+                let w: Box<dyn Write + Send> = Box::new(DetachedWriter::spawn(w)?);
+                (Box::new(s), w)
             }
             // One handle, shared, rather than a `DuplicateHandle`: a
             // virtio-serial port permits one opener and the point of the `Arc`

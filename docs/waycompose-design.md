@@ -31246,3 +31246,43 @@ itself. B3 and B4 then turned out to be hub runs after all: `systemctl
 --user mask --runtime` does not override a unit file in
 `~/.config/systemd/user`, so `wc-session` started the hub. That is why the
 direct runs use a drop-in.
+
+### 99.9 Where the video frames went: the doorbell's writer thread, and §98's synchronous present
+
+2026-10-17, 09:52–11:36. The setup was `wcgpu` (the readback Firefox build),
+two windows with the 720p clip, 4-minute runs, start-up sample excluded.
+Absolute rates drift with the host's load over an hour (the same build gave
+1.75% at 10:00 and 3.9% at 11:20), so every comparison below alternates its
+two arms and compares only within one block.
+
+**The host's doorbell writer thread, then inline (`7467cdc`).** Through the
+hub, alternating T, I, T, I: thread 2.65% and 2.22%, inline (`MSG_DONTWAIT`
+on the socket, no thread) 1.75% and 1.78%. Kept.
+
+**The build behind 97.10's 0.34%** (`efb7b03`), run direct with the hub
+held off: 0.90%, 0.33%, 1.01%. Bisecting over the merges since then, also
+direct: `883e70e` 3.14%, `9076288` 3.09%, `6873327` 2.57%. `6873327` is
+`efb7b03` merged into a master that already had `4fe941b` (desktop-checks).
+In `crates/`, that adds only `sv-icd/src/wsi.rs` (§98) and three compositor
+files. `6873327` with the compositor files reverted: 3.12%, so not those.
+`6873327` with `SV_PRESENT_SYNC=0`, which restores the pipelined Wayland
+present §98 removed: 1.36%.
+
+**§98's synchronous present, today's build, alternating S, P, S, P:**
+
+| run | present | dropped |
+|---|---|---|
+| S5 | synchronous (default since §98) | 3.96% |
+| P5 | pipelined (`SV_PRESENT_SYNC=0`) | 2.27% |
+| S6 | synchronous | 3.87% |
+| P6 | pipelined | 2.22% |
+
+So most of the gap to 0.34% is §98: presenting a Wayland frame inside
+`vkQueuePresentKHR`, which the quit crash required, costs the clip about
+1.7 points of its frames. The host's writer thread cost about 0.7, and is
+gone. The hub costs at most a few tenths (99.8). The pipelined present cannot
+come back as it was: it marshalled on a `wl_surface` the application may
+already have freed. What would keep both is to pipeline everything up to the
+surface requests and make only `attach`, `damage` and `commit` inside the
+application's next call, since Mesa's own WSI touches the surface only
+there. That is §98's owner's to decide.
