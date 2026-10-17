@@ -29427,7 +29427,8 @@ fault.
 
 ## 95. The desktop checks: menus, the clipboard, dialogs and a day's use, on the deployed launcher
 
-Branch `desktop-checks`, 2026-10-16, 11:10–15:11, continued after the VM restart. The checks §91 and §93.8
+Branch `desktop-checks`, 2026-10-16 11:10–15:11 and, after the VM restart and the
+third deploy, 2026-10-17 07:04–07:31. The checks §91 and §93.8
 left pending, run against the deployed `wcivs` on <guest-user>'s desktop (session 1)
 the way a person starts it: a click on the pinned `Firefox (Linux)` taskbar
 button, at medium integrity. The evidence is in `docs/desktop-checks/`.
@@ -29461,7 +29462,11 @@ the ssh fallback. Five bugs were found:
 - Two harmless log oddities: the audio player's drop counter while the stream
   is silent, and Firefox's `Broken pipe` warnings on a selection (95.8).
 
-**Still open, waiting on the VM restart:** the last redeploy (3 x 64 MiB with gpu-oom c744796), its desktop check, putting <guest-user>'s clipboard back and deleting this run's history entries. 95.7 and 95.9 say what is deployed until then.
+**The third deploy, checked on the desktop** (95.7): §97's GPU pool, §99's
+doorbell hub and §98's fix for the crash at quit. Every check passed: hardware
+WebRender on the Intel GPU, the select, the caption glyphs 8 of 8, video with
+sound, and four quits with frames still being presented, none of which crashed.
+60 fps on the guest with and without §98's synchronous present.
 
 ### 95.2 The checks
 
@@ -29498,10 +29503,13 @@ the ssh fallback. Five bugs were found:
 The clipboard did not hold §93's `PRE-SESSION ü 42 wcc-pre` at the start of
 this run: it held 22 characters of something else. It was kept for the run
 (in the agent's memory and DPAPI-encrypted for <guest-user>) and put back at the end
-(pending: the restore waits on the redeploy). Clipboard history is on
-(`EnableClipboardHistory 1`); the entries this run created (16 since 11:10)
-are to be deleted through the WinRT API, and only those, at the end of the
-run (pending).
+on 2026-10-17 at 07:30. Restored, it read `wcc-ff2word Gruesse ok`: a test
+string an earlier run left, not something <guest-user> had copied; it is what was
+there, so it is what was put back. Clipboard history is on
+(`EnableClipboardHistory 1`), and the 16 entries this run created since 11:10
+were to be deleted through the WinRT API. The VM's restart at 18:20 had
+already cleared the history: it held 0 items at 07:30, so there was nothing
+to delete.
 
 ### 95.4 Firefox on the forwarded GPU: an arena too small, and a guest pause taken for a dead peer
 
@@ -29889,8 +29897,38 @@ and `~/wc-launch-ivs-backup-95`, the third after one to `wcivs-backup-98` and
   parent process had Mesa loaded and not `libsv_icd.so`, so WebRender was
   drawing on llvmpipe. The GPU side's log explains it: clients 3 to 6 were
   `refused: all 2 GPU session slots are taken`. That is 95.4.10, fixed in the
-  ICD by gpu-oom c744796, and it is why the geometry went back to three
-  slots.
+  ICD by gpu-oom c744796, and it is why the third deploy left fixed slots
+  for §97's pool.
+
+**After the third deploy** (2026-10-17 07:07–07:29, a fresh Sonnet agent and
+then by hand, `v3` in `actions.txt`; the screen is 1280x800 since the restart):
+- **The pin:** a window 7.3–12.5 s after the click in the five clicks that
+  were timed, and within the 9 s waited in the three that were not.
+- **The jump list:** 7 Häufig pages and the three tasks.
+- **about:support:** Compositing `WebRender`; WebGL 1 renderer `Mesa -- zink
+  Vulkan 1.4(Intel(R) UHD Graphics (INTEL_PROPRIETARY_WINDOWS))`.
+- **The `<select>`:** no black frame (`guest/v3-select.png`).
+- **The caption glyphs after page loads in two new windows:** visible in all 8
+  captures, 0.3 to 3.4 s after the load (`guest/v3-r1-a.png` … `v3-r2-d.png`).
+- **Video with sound:** 142 frames in 4.8 s, 0 dropped, `err=none`.
+- **Quitting** (§98), no crash reporter and no minidump in
+  `Crash Reports/pending` newer than the deploy, after each: the private
+  window closed while its video played, then the main one; the main window
+  closed first while the video played (no prompt), then the private one;
+  Ctrl+Q and "Quit Firefox" in its prompt, twice, the second time while a page
+  drew a frame every vsync (`guest/v3-8c3-prompt.png`). Ctrl+Shift+Q, which
+  the task first asked for, is Firefox's quit key on Windows, not on Linux, and
+  did nothing.
+- **The doorbell:** the session's GPU doorbell is the hub's
+  (`bell.path` → `/run/user/1000/wc-bell/sv.sock`), the proxy's is the hub's
+  `wl.sock`, the session holds no bell socket of its own, and no log has the
+  fallback line.
+- **The frame rate,** a page scrolling 12 px each animation frame, three 5 s
+  rounds: 60.0, 60.0, 60.0 fps, p50 17, p99 18 ms, as deployed (Wayland
+  presents synchronous, §98); 60.2, 60.0, 60.2 fps, p50 17, p99 18 ms in a
+  session with `SV_PRESENT_SYNC=0` in `gpu.env`, which was then put back byte
+  for byte (SHA-256 `0641239f…`). §98's synchronous present costs nothing
+  measurable here.
 
 ### 95.8 Two log oddities, not defects
 
@@ -29916,7 +29954,7 @@ ours; `WindowFromPoint` there answers our window.
 | what each deploy copies | `wc-launch.exe`, `sv-guest.exe`, `wc-desk.exe`, `probe-relay.exe` and the ini to `C:\Users\<guest-user>\wcivs`; `wc-session`, `wc-proxy`, `wc-arena-host` and `wc-launch` to `~/wc-launch-ivs` (`deploy-95.txt`, `deploy-95b.txt`, `deploy-98.txt`). Changed by the third against `-backup-98`: `sv-guest.exe`, `wc-desk.exe`, `wc-launch.exe` and the ini on the guest; `libsv_icd.so`, `sv-hostd`, `wc-arena-host`, `wc-launch`, `wc-proxy` and `wc-session` on the host. It also installs `wc-bell-hub.service` (§99), which was already running and was not restarted |
 | `wc-session` | starts applications with `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1`, so a dismissed crash reporter keeps its minidump |
 | replaced | the 2 x 112 MiB geometry of the 14:00 deploy (95.4.6), which left Firefox's parent without a GPU slot (95.4.10): the third deploy has §97's pool, the dynamic allocation on the ivshmem device the user asked for |
-| the guest otherwise | the session-1 agent quit at 14:29. `C:\Users\<guest-user>\wcdc` (its scratch file, captures, and the clipboard kept for the run) stays until the clipboard is put back (pending); the ini's `wayland-bell` restored byte for byte after the fallback session (SHA-256 `2660a039…` before and after) |
+| the guest otherwise | the session-1 agent quit at 07:30 on 2026-10-17 and `C:\Users\<guest-user>\wcdc` (its scratch file, captures, and the kept clipboard) is removed; every window of this run closed; the host's `/tmp/dc-pages` removed; `gpu.env` as deployed; the ini's `wayland-bell` restored byte for byte after the fallback session (SHA-256 `2660a039…` before and after) |
 
 **Way back:** copy `wcivs-backup-98` over `wcivs`, and
 `~/wc-launch-ivs-backup-98` over `~/wc-launch-ivs`, for the state before the
@@ -30737,7 +30775,8 @@ does; X11 and headless keep the presenter. With the window widened on purpose
 (a 30 ms sleep before the frame is shown), the old order crashed in 4 of 4 runs and
 the new one in none of 6 (98.6). The price is the present's wait back on the
 renderer thread for Wayland frames: at most a frame in a hundred on the
-workstation, still to be measured on the guest, where §88 put it at 3.3 ms (98.7).
+workstation, and nothing measurable on the guest, where §88 had put the
+wait at 3.3 ms (98.7).
 
 ### 98.2 The recipe
 
@@ -30897,10 +30936,12 @@ Here the renderer thread's 11 ms of its own work plus the 5 ms wait still fit in
 a 16.7 ms frame, so the rate holds; with the trace on (more work per frame) it
 slips by about one frame in a hundred. On the guest §88 measured the wait and
 the copy at 2.0 and 1.2 ms, and the scroll there reached 60 fps only with every
-change of §88 in place. **The guest's number has to be measured** (ssh was down
-while this was written): `wc-launch.sh` deploys with `SV_PRESENT_SYNC` unset,
-and the same scroll run with and without `SV_PRESENT_SYNC=0` in `gpu.env` is
-the comparison. If it costs frames there, the way to win them back without the
+change of §88 in place. **On the guest** (2026-10-17, deployed `wcivs` with §97's
+pool, §95.7): a page scrolling 12 px each animation frame, three 5 s rounds,
+made 60.0, 60.0, 60.0 fps (p50 17, p99 18 ms) as deployed, and 60.2, 60.0,
+60.2 fps (p50 17, p99 18 ms) in a session with `SV_PRESENT_SYNC=0` in `gpu.env`.
+One session each, so a cost under a frame in a hundred would not show; nothing
+larger does. If it ever costs frames, the way to win them back without the
 crash is to make the wait shorter, not to move it off the calling thread: for
 example, a `wl_shm` pool on the arena itself, which removes the 1.2 ms copy.
 
