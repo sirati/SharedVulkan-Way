@@ -119,21 +119,18 @@ impl Doorbell {
     /// what `Bell::ring` pokes when the compositor is parked on a lane this
     /// process writes.
     pub fn connect(path: &Path) -> io::Result<Doorbell> {
-        let port = PortHandle::host_socket(&path.to_string_lossy()).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "{}: {e} (the VM has no Wayland rings' port, or this user is not in its group)",
-                    path.display()
-                ),
-            )
-        })?;
-        let (reader, writer) = port.split()?;
-        sv_transport::park::install_cross_wake(Some(
-            Arc::new(PortWake::new(writer)) as Arc<dyn sv_transport::park::CrossWake>
-        ));
+        // §99: reconnecting, so a restarted doorbell hub costs this proxy
+        // only the wakes in the gap. The first connect must succeed: a path
+        // nothing listens on is a configuration error, said at once.
+        let p = path.to_string_lossy();
         let hub = Arc::new(BellHub::default());
-        let doorman = Doorman::spawn_target(reader, Arc::clone(&hub));
+        let (doorman, connected) = sv_transport::vdoorbell::attach_host_reconnecting(&p, Arc::clone(&hub))?;
+        if !connected {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{p}: nothing listens (the VM has no Wayland rings' port, no doorbell hub runs, or this user is not in its group)"),
+            ));
+        }
         Ok(Doorbell { hub, _doorman: doorman })
     }
 }

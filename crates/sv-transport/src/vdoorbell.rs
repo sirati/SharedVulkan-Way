@@ -418,6 +418,115 @@ pub fn attach_set(port: PortHandle, set: Arc<ControlSet>) -> std::io::Result<Doo
     Ok(Doorman::spawn_target(reader, set))
 }
 
+
+/// A writer whose socket can be swapped while it is installed as the
+/// process's [`CrossWake`]: empty while the hub is unreachable, in which case
+/// a write is `NotConnected` (counted as dropped by [`PortWake::poke`]).
+#[cfg(unix)]
+#[derive(Clone, Default)]
+pub struct SwapWriter(Arc<std::sync::Mutex<Option<Box<dyn Write + Send>>>>);
+
+#[cfg(unix)]
+impl SwapWriter {
+    fn set(&self, w: Option<Box<dyn Write + Send>>) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = w;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Write for SwapWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock().ok().as_mut().and_then(|g| g.as_mut()) {
+            Some(w) => w.write(buf),
+            None => Err(std::io::ErrorKind::NotConnected.into()),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How often a lost hub socket is tried again.
+#[cfg(unix)]
+pub const RECONNECT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// [`attach`] for a host-side client of the shared doorbell hub
+/// (waycompose-design.md §99), **reconnecting**: when the hub's socket closes
+/// (the hub was restarted to install a new binary, or crashed and systemd
+/// started it again) the doorman connects again by itself, every
+/// [`RECONNECT_EVERY`], and swaps the new socket under the installed writer.
+/// Between the two, pokes are dropped and waits run out their slices; nothing
+/// fails and nothing waits for the hub. Also used when the hub is not there
+/// yet at bring-up. Returns whether the first connect succeeded, for the log.
+#[cfg(unix)]
+pub fn attach_host_reconnecting<T: BellTarget + ?Sized + 'static>(
+    path: &str,
+    target: Arc<T>,
+) -> std::io::Result<(Doorman, bool)> {
+    let (d, ok, wake) = connect_host_reconnecting(path, target)?;
+    crate::park::install_cross_wake(Some(wake as Arc<dyn CrossWake>));
+    Ok((d, ok))
+}
+
+/// [`attach_host_reconnecting`] without installing the writer: the caller
+/// gets the wake to install or poke itself.
+#[cfg(unix)]
+pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
+    path: &str,
+    target: Arc<T>,
+) -> std::io::Result<(Doorman, bool, Arc<PortWake<SwapWriter>>)> {
+    let writer = SwapWriter::default();
+    let wake = Arc::new(PortWake::new(writer.clone()));
+    let first = PortHandle::host_socket(path).ok();
+    let connected = first.is_some();
+    let stop = Arc::new(AtomicBool::new(false));
+    let woken = Arc::new(AtomicU64::new(0));
+    let path = path.to_string();
+    let handle = {
+        let stop = Arc::clone(&stop);
+        let woken = Arc::clone(&woken);
+        std::thread::Builder::new().name("sv-doorbell".into()).spawn(move || {
+            let mut next = first;
+            let mut reconnects = 0u64;
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    writer.set(None);
+                    return ServeEnd::Stopped;
+                }
+                let port = match next.take() {
+                    Some(p) => p,
+                    None => match PortHandle::host_socket(&path) {
+                        Ok(p) => {
+                            reconnects += 1;
+                            eprintln!("[doorbell] reconnected to {path} (reconnect {reconnects})");
+                            p
+                        }
+                        Err(_) => {
+                            std::thread::sleep(RECONNECT_EVERY);
+                            continue;
+                        }
+                    },
+                };
+                let Ok((reader, w)) = port.split() else {
+                    std::thread::sleep(RECONNECT_EVERY);
+                    continue;
+                };
+                writer.set(Some(w));
+                let end = serve_port(reader, &*target, &stop, &woken);
+                writer.set(None);
+                if end == ServeEnd::Stopped {
+                    return end;
+                }
+                eprintln!("[doorbell] {path} closed ({end:?}); waits use their slices until it is back");
+                std::thread::sleep(RECONNECT_EVERY);
+            }
+        })?
+    };
+    Ok((Doorman { stop, woken, handle: Some(handle) }, connected, wake))
+}
+
 /// A `Write` that hands each write to a thread of its own and never blocks.
 ///
 /// A doorbell byte means "look at your rings", and a lost one costs a wait its
@@ -573,6 +682,58 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// §97.10: a hub that never reads must not stop the application. The
+
+    /// §99: a hub restart is invisible to a client but for the bells in the
+    /// gap. The hub's socket closes and comes back on the same path; the
+    /// client reconnects by itself, its pokes reach the new hub, and bytes
+    /// from the new hub ring its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_client_reconnects_to_a_restarted_hub() {
+        use std::os::unix::net::UnixListener;
+        struct Count(AtomicU64);
+        impl BellTarget for Count {
+            fn ring_token(&self, _t: u8, _w: &AtomicU64) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("sv-reconnect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hub.sock");
+        let target = Arc::new(Count(AtomicU64::new(0)));
+        let l1 = UnixListener::bind(&path).unwrap();
+        let (_doorman, first, wake) = connect_host_reconnecting(path.to_str().unwrap(), Arc::clone(&target)).unwrap();
+        assert!(first);
+        let (c1, _) = l1.accept().unwrap();
+        // The hub "restarts": its socket closes and the path is bound again.
+        drop(c1);
+        drop(l1);
+        std::fs::remove_file(&path).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let l2 = UnixListener::bind(&path).unwrap();
+        l2.set_nonblocking(false).unwrap();
+        let (mut c2, _) = l2.accept().unwrap();
+        // Up: a poke reaches the new hub.
+        let t = Instant::now();
+        let mut got = [0u8; 1];
+        c2.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut up = false;
+        while !up && t.elapsed() < Duration::from_secs(5) {
+            wake.poke(5);
+            up = std::io::Read::read(&mut c2, &mut got).map(|n| n == 1).unwrap_or(false);
+        }
+        assert!(up, "a poke after the restart did not reach the new hub");
+        // Down: a byte from the new hub rings the target.
+        std::io::Write::write_all(&mut c2, &[3]).unwrap();
+        let t = Instant::now();
+        while target.0.load(Ordering::Relaxed) == 0 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(target.0.load(Ordering::Relaxed) > 0, "the new hub's byte rang nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     /// socket fills, the queue fills, and every poke after that returns at
     /// once as dropped; the first ones still arrive.
     #[cfg(unix)]
