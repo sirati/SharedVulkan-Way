@@ -25,6 +25,9 @@
  * seconds.
  */
 #include <windows.h>
+/* What our injected input carries in dwExtraInfo, so the guest's activity
+ * sentinel (wc-activity.c) does not take it for the person (design §101). */
+#define WC_AGENT_TAG ((ULONG_PTR)0x57434147454E5431ULL)
 #include <stdio.h>
 #include <string.h>
 
@@ -162,6 +165,7 @@ static void move_to(int x, int y)
 	in.mi.dx = (LONG)((x * 65535) / GetSystemMetrics(SM_CXSCREEN));
 	in.mi.dy = (LONG)((y * 65535) / GetSystemMetrics(SM_CYSCREEN));
 	in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+	in.mi.dwExtraInfo = WC_AGENT_TAG;
 	if (SendInput(1, &in, sizeof in) != 1)
 		printf("probe-scroll: WARNING the pointer move was refused (%lu); "
 		       "if the session is locked, SendInput cannot reach it\n",
@@ -198,6 +202,7 @@ static void wheel(int notches)
 	memset(&in, 0, sizeof in);
 	in.type = INPUT_MOUSE;
 	in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+	in.mi.dwExtraInfo = WC_AGENT_TAG;
 	in.mi.mouseData = (DWORD)(notches * WHEEL_DELTA);
 	if (SendInput(1, &in, sizeof in) != 1)
 		refused++;

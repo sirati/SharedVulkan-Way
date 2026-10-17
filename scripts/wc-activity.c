@@ -4,13 +4,16 @@
  *
  * The rule for using <guest-user>'s desktop: it is ours when nobody has used the
  * keyboard or mouse for two minutes. This program answers "when did somebody
- * last", and only for real input. It runs in the interactive session without a
- * window or focus, installs WH_KEYBOARD_LL and WH_MOUSE_LL, and ignores every
- * event Windows flags as injected (LLKHF_INJECTED, LLMHF_INJECTED and their
- * LOWER_IL variants): that is SendInput, i.e. every agent's input. Mouse moves
- * of under 2 px from the last counted position are jitter and do not count.
- * Input QEMU injects (QMP input-send-event) looks like hardware here; the
- * host-side check discounts it against /tmp/wcrun/qmp-inject.log.
+ * last". It runs in the interactive session without a window or focus and
+ * installs WH_KEYBOARD_LL and WH_MOUSE_LL. Every event counts, injected or not:
+ * a person working through TeamViewer arrives as SendInput, flagged injected
+ * exactly like an agent's input. What does not count is OUR input: every agent
+ * tool that calls SendInput puts WC_AGENT_TAG in dwExtraInfo, which a low-level
+ * hook receives as it was sent, and those events are skipped (and counted, as
+ * `ours`). Mouse moves of under 2 px from the last counted position are jitter.
+ * The kind letter says which path an input came by: `k`/`m` hardware (QEMU's
+ * virtual devices included, whose injections the host-side check discounts
+ * against /tmp/wcrun/qmp-inject.log), `K`/`M` injected by something not ours.
  *
  * Every 2 s a second thread writes %LOCALAPPDATA%\waycompose\activity.txt
  * (replaced atomically): a heartbeat, and the times of the last real inputs,
@@ -29,6 +32,8 @@
 
 #define RING 64
 #define COALESCE_MS 250
+/* "WCAGENT1": what our tools put in dwExtraInfo (docs/waycompose-design.md §101). */
+#define WC_AGENT_TAG ((ULONG_PTR)0x57434147454E5431ULL)
 
 static CRITICAL_SECTION cs;
 static ULONGLONG ring_wall[RING]; /* Unix ms, newest at ring_head-1 */
@@ -38,6 +43,7 @@ static ULONGLONG started_wall;
 static POINT anchor;
 static int have_anchor;
 static HHOOK kb_hook, ms_hook;
+static volatile LONG ours;
 
 static ULONGLONG wall_ms(void) {
     FILETIME ft;
@@ -67,7 +73,8 @@ static void mark(char kind) {
 static LRESULT CALLBACK on_key(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)l;
-        if (!(k->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))) mark('k');
+        if (k->dwExtraInfo == WC_AGENT_TAG) InterlockedIncrement(&ours);
+        else mark((k->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) ? 'K' : 'k');
     }
     return CallNextHookEx(NULL, code, w, l);
 }
@@ -75,16 +82,19 @@ static LRESULT CALLBACK on_key(int code, WPARAM w, LPARAM l) {
 static LRESULT CALLBACK on_mouse(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)l;
-        if (!(m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED))) {
-            if (w == WM_MOUSEMOVE) {
-                if (!have_anchor || labs(m->pt.x - anchor.x) > 1 || labs(m->pt.y - anchor.y) > 1) {
-                    if (have_anchor) mark('m');
-                    anchor = m->pt;
-                    have_anchor = 1;
-                }
-            } else {
-                mark('m');
+        char kind = (m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) ? 'M' : 'm';
+        if (m->dwExtraInfo == WC_AGENT_TAG) {
+            InterlockedIncrement(&ours);
+            /* Our move is where the pointer now is: not the person's jitter. */
+            if (w == WM_MOUSEMOVE) { anchor = m->pt; have_anchor = 1; }
+        } else if (w == WM_MOUSEMOVE) {
+            if (!have_anchor || labs(m->pt.x - anchor.x) > 1 || labs(m->pt.y - anchor.y) > 1) {
+                if (have_anchor) mark(kind);
+                anchor = m->pt;
+                have_anchor = 1;
             }
+        } else {
+            mark(kind);
         }
     }
     return CallNextHookEx(NULL, code, w, l);
@@ -109,10 +119,10 @@ static DWORD WINAPI writer(LPVOID unused) {
         int n = 0;
         EnterCriticalSection(&cs);
         n += snprintf(buf + n, sizeof buf - n,
-                      "wc-activity 1\r\npid %lu\r\nsession %lu\r\nhooks %d\r\nstarted_wall_ms %llu\r\n"
-                      "heartbeat_wall_ms %llu\r\ninputs %d\r\n",
+                      "wc-activity 2\r\npid %lu\r\nsession %lu\r\nhooks %d\r\nstarted_wall_ms %llu\r\n"
+                      "heartbeat_wall_ms %llu\r\nours %ld\r\ninputs %d\r\n",
                       GetCurrentProcessId(), session, (kb_hook && ms_hook) ? 1 : 0, started_wall, wall_ms(),
-                      ring_count);
+                      ours, ring_count);
         for (int i = 0; i < ring_count && n < (int)sizeof buf - 64; i++) {
             int j = (ring_head + RING - 1 - i) % RING;
             n += snprintf(buf + n, sizeof buf - n, "input %llu %c\r\n", ring_wall[j], ring_kind[j]);

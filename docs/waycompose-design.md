@@ -31556,3 +31556,49 @@ ended. No QMP injection was logged. Both times it came about two minutes after
 the run's Firefox windows appeared on the desktop, so the person at it reacts
 to them. The block was stopped rather than repeated every few minutes, and
 `wcgpu` restored.
+
+### 101.4 Remote use: injected input counts, ours is tagged, and TeamViewer is asked
+
+The first sentinel had it backwards for one case the user pointed out. Working
+through TeamViewer arrives as `SendInput`, flagged injected, and the sentinel
+skipped exactly that, so remote use read as idle. TeamViewer's log for the day
+shows a remote-control session from 10:20:13 to 13:20:14. That covers A1, A3
+and S3 of 100.6, the runs whose windows were closed.
+
+- **Every input counts** (sentinel version 2). The kind letter keeps the path:
+  `k`/`m` arrived as hardware (QEMU's virtual devices included), `K`/`M` were
+  injected by something that is not ours.
+- **Ours is tagged, not timed.** Every tool of ours that calls `SendInput` puts
+  `WC_AGENT_TAG` ("WCAGENT1", `0x57434147454E5431`) in `dwExtraInfo`, which a
+  low-level hook receives unchanged. The sentinel skips those events and counts
+  them (`ours N`). That is `wc-desk` (`send_mouse`, `send_rel`, `send_key`),
+  `probe-cursor.c`, `probe-scroll.c`, and §95's session agent
+  (`docs/desktop-checks/session1-agent.ps1`). `click.ps1` sends no input (it
+  starts the shortcut). A tag is exact where a time window is a guess. For a
+  tool of ours that cannot tag, the guest-side `%LOCALAPPDATA%\waycompose\inject.log`
+  (`<unix ms> <who>` per line) is discounted with the QMP rule. That rule now
+  applies only to injected-kind input, and the QMP log only to hardware-kind.
+- **TeamViewer is a second signal.** `guest-idle.sh` reads the last
+  `ConnectionGuard:` line of `TeamViewer15_Logfile.log`, or of `_OLD.log` after
+  a rotation. TeamViewer writes "incoming remote control in sessions: N" when a
+  session starts and "no restrictions" when the last one ends; the pairs match
+  `Connections_incoming.txt` for the day (UTC there, local in the log). While
+  the line says a session runs, the desktop is in use (exit 2) whatever the
+  input says.
+- **An old sentinel reads as unknown**, since it cannot see remote input.
+
+Checked against canned files:
+
+| case | answer |
+|---|---|
+| TeamViewer session running, no input for 10 min | `in use: TeamViewer remote control since 2026/10/17 13:37:20`, exit 2 |
+| the session ended ("no restrictions"), no input for 10 min | `idle 600 s`, exit 0 |
+| injected mouse input 30 s ago, not ours | `active 30 s ago`, exit 2 |
+| injected input inside a guest-logged injection, real input 200 s before | `idle 200 s`, exit 0 |
+| hardware-kind input inside a QMP injection, real input 300 s before | `idle 300 s`, exit 0 |
+| injected-kind input inside a QMP window (not discounted) | `active 39 s ago`, exit 2 |
+| sentinel version 1 | unknown, exit 1 |
+
+Live after the update (14:33): version 2 running in session 1. It showed
+hardware keyboard input seconds old, and TeamViewer's last line was "no
+restrictions", so somebody was at the VM's own console.

@@ -3,16 +3,24 @@
 # Installed as /tmp/wcrun/guest-idle.sh.
 #
 # The rule: the desktop is ours when nobody has touched the keyboard or mouse for
-# GUEST_IDLE_SECS (default 120) seconds. The answer comes from wc-activity.exe in
-# the guest's session (scripts/wc-activity.c), which records only input Windows
-# does not flag as injected, so an agent's SendInput never counts. Input injected
-# through QEMU (guest-keys.sh, unlock-guest.sh) does look real there; those
-# scripts log each injection to /tmp/wcrun/qmp-inject.log, and input from half a
-# second before to two seconds after a logged injection is ours too.
+# GUEST_IDLE_SECS (default 120) seconds, and nobody is connected to it through
+# TeamViewer. Two signals:
+#
+# - Input, from wc-activity.exe (v2) in the guest's session (scripts/wc-activity.c).
+#   Every input counts, injected or not, because a person working through
+#   TeamViewer arrives as injected input. Not counted: what our tools inject
+#   (they tag it, and the sentinel skips it); input from half a second before to
+#   two seconds after an injection logged on the host (/tmp/wcrun/qmp-inject.log:
+#   QEMU's keys look like hardware) or on the guest
+#   (%LOCALAPPDATA%\waycompose\inject.log: for a tool of ours that cannot tag).
+# - TeamViewer's own log: while its last `ConnectionGuard:` line says "incoming
+#   remote control in sessions", somebody is connected, whatever the input says.
+#   Only "no restrictions" after it counts as the session gone.
 #
 #   exit 0  idle for at least GUEST_IDLE_SECS; prints "idle N s"
-#   exit 2  somebody used it N s ago;           prints "active N s ago"
-#   exit 1  unknown: no sentinel, or its heartbeat is stale. Counts as NOT idle.
+#   exit 2  in use: "active N s ago", or "in use: TeamViewer remote control ..."
+#   exit 1  unknown: no sentinel (or an old one), or its heartbeat is stale.
+#           Counts as NOT idle.
 set -u
 LIMIT=${GUEST_IDLE_SECS:-120}
 LOG=${GUEST_INJECT_LOG:-/tmp/wcrun/qmp-inject.log}
@@ -20,7 +28,15 @@ G="ssh -o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR <guest-user>@<gues
 t0=$(date +%s%3N)
 # GUEST_ACTIVITY_TEXT: the sentinel's file and a `guest_now` line, for testing.
 if [ -n "${GUEST_ACTIVITY_TEXT:-}" ]; then out=$GUEST_ACTIVITY_TEXT
-else out=$($G 'cat /c/Users/<guest-user>/AppData/Local/waycompose/activity.txt 2>/dev/null; echo "guest_now $(date +%s%3N)"' 2>/dev/null | tr -d '\r'); fi
+else out=$($G 'W=/c/Users/<guest-user>/AppData/Local/waycompose; cat $W/activity.txt 2>/dev/null
+  tail -n 200 $W/inject.log 2>/dev/null | sed "s/^/inj /"
+  T="/c/Program Files/TeamViewer"
+  if [ -d "$T" ]; then
+    l=$(grep -a "ConnectionGuard:" "$T/TeamViewer15_Logfile.log" 2>/dev/null | tail -1)
+    [ -n "$l" ] || l=$(grep -a "ConnectionGuard:" "$T/TeamViewer15_Logfile_OLD.log" 2>/dev/null | tail -1)
+    echo "tv ${l:-none}"
+  fi
+  echo "guest_now $(date +%s%3N)"' 2>/dev/null | tr -d '\r'); fi
 t1=$(date +%s%3N)
 [ -n "$out" ] || { echo "unknown: cannot reach the guest"; exit 1; }
 now=$(awk '$1=="guest_now"{print $2}' <<<"$out")
@@ -30,14 +46,27 @@ started=$(awk '$1=="started_wall_ms"{print $2}' <<<"$out")
 [ -n "$hb" ] && [ -n "$now" ] || { echo "unknown: wc-activity is not running (no activity.txt)"; exit 1; }
 [ $(( now - hb )) -le 15000 ] || { echo "unknown: wc-activity's heartbeat is $(( (now - hb) / 1000 )) s old"; exit 1; }
 [ "${hooks:-0}" = 1 ] || { echo "unknown: wc-activity has no hooks"; exit 1; }
+# v1 dropped injected input, which is how TeamViewer's arrives.
+ver=$(awk '$1=="wc-activity"{print $2}' <<<"$out")
+[ "${ver:-0}" -ge 2 ] || { echo "unknown: wc-activity is version ${ver:-?}, which cannot see remote input"; exit 1; }
+tv=$(awk '$1=="tv"{sub(/^tv /,""); print}' <<<"$out")
+case "$tv" in
+  *"incoming remote control in sessions"*)
+    echo "in use: TeamViewer remote control since $(cut -c1-19 <<<"$tv")"; exit 2 ;;
+esac
 # The guest's clock against this one, from the middle of the ssh round trip.
 off=$(( now - (t0 + t1) / 2 ))
-# Injections, as guest milliseconds.
-inj=$( [ -f "$LOG" ] && awk -v off="$off" '{print $1 + off}' "$LOG" | tail -200 )
+# Injections, as guest milliseconds: QEMU's (host clock, hardware-kind input)
+# and the guest's own log (guest clock, injected-kind input).
+qinj=$( [ -f "$LOG" ] && awk -v off="$off" '{print $1 + off}' "$LOG" | tail -200 )
+ginj=$(awk '$1=="inj"{print $2}' <<<"$out")
 # The newest input that is not ours. The sentinel keeps the last 64 (coalesced
-# to 250 ms); if every one of them is ours, the last real input is older than
-# the oldest, and that is the conservative answer.
-last=$(awk -v inj="$inj" 'BEGIN{n=split(inj, I, "\n")} $1=="input"{t=$2; ours=0; for(i=1;i<=n;i++) if (I[i]!="" && t>=I[i]-500 && t<=I[i]+2000) ours=1; if(!ours){print t; exit} oldest=t} END{}' <<<"$out")
+# to 250 ms); if every one of them is ours, see below.
+last=$(awk -v q="$qinj" -v g="$ginj" 'BEGIN{nq=split(q, Q, "\n"); ng=split(g, J, "\n")}
+  $1=="input"{t=$2; k=$3; ours=0
+    if (k=="k" || k=="m") { for(i=1;i<=nq;i++) if (Q[i]!="" && t>=Q[i]-500 && t<=Q[i]+2000) ours=1 }
+    else { for(i=1;i<=ng;i++) if (J[i]!="" && t>=J[i]-500 && t<=J[i]+2000) ours=1 }
+    if(!ours){print t; exit}}' <<<"$out")
 if [ -z "$last" ]; then
   # No real input in the ring. Not full (64): none since the sentinel started,
   # which is the conservative answer, since it cannot know what came before it ran.
