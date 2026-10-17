@@ -30381,6 +30381,25 @@ entry and a pinnable identity like Firefox's.
   copy and from `--delete`. The bundle's `options.txt` goes only where an
   instance has none.
 
+**Prism's main window died, and the fault was smithay's.** On the guest Prism's
+setup page worked, and its main window broke the connection the moment it
+appeared ("The Wayland connection broke"). Reproduced under Wine
+(`scripts/wc-prism-icon.sh`), the compositor said: `ProtocolError { code: 3,
+xdg_toplevel_icon_v1, "The provided buffer has been destroyed before the
+toplevel icon" }`. Qt gives every window with an icon three shm buffers on an
+`xdg_toplevel_icon_v1`, calls `set_icon`, destroys the icon, then the pools and
+buffers. That is the protocol's order. The setup page had sent
+`set_icon(nil)`, so it never hit this. smithay registers a destruction hook on
+each icon buffer and removes them when the icon is destroyed, but its
+`ShmBufferUserData::remove_destruction_hook` compared with `!=`: it removed the
+first hook that was *not* the one asked for, so a buffer's only hook was never
+removed. The vendored smithay now compares with `==` (a `WAYCOMPOSE FORK` note
+in `wayland/shm/mod.rs`). With it Prism's main window opens, lists both
+instances, and wears its own icon from its three buffers (`icon <- 3
+buffer(s) from the client's own xdg_toplevel_icon_v1`). `wc-prism-icon.sh` is
+the gate: PASS. It should go upstream: any smithay compositor kills a Qt 6
+window with an icon this way.
+
 **Not yet seen on the guest** (the desktop was the user's): a game started
 from Prism, and Minecraft's icon on the guest's taskbar. Both need one short
 slot: open Prism from its shortcut, Finish, select an instance, Play, then the
@@ -31021,3 +31040,249 @@ hub and the new hub's bytes ring its target.
 Sessions started by a build before this one do not reconnect, so deploy
 restarts a changed hub only while no `wc-launch-*` unit is active, and
 otherwise says the change waits for the hub's next start.
+
+### 99.5 One application killed stopped every session: the guest's port write
+
+2026-10-17, 07:39–08:01, `wcmc` on master `6bd5cac`, on the hub. Firefox
+(two windows, one playing the 720p clip) and stock Minecraft ran together,
+each with its GPU session's doorbell on the hub and the proxy's Wayland
+doorbell beside them. The hub was restarted under them at 07:40:53, and all
+three clients reconnected within a second (99.4); pages kept loading. Then
+Minecraft's `java` was killed with SIGKILL at 07:41:06.
+
+From that moment the guest's GPU process served no session at all. Firefox's
+next page load waited 30 s, its ICD timed out ("wait on ring 2 timed out")
+and Zink crashed the browser on `DEVICE_LOST`. The GPU process logged nothing
+after 07:40:27, not even the end of Minecraft's session, which its 5 s
+heartbeat check should have noticed. `Stop-Process` left it half-exited with
+one thread in a kernel `Executive` wait and one in `ExecutionDelay`. That is
+Windows' I/O-cancel loop. At 08:00:43 the guest logged **VirtioSerial event
+54, `0x80040036`, `IO_DRIVER_CANCEL_TIMEOUT`** ("failed to complete a
+cancelled I/O request in the allotted time"), and only then did the process
+finish exiting. There was no TDR or display event, and DWM stayed responsive.
+The Intel driver was not involved.
+
+**What stopped every session** was the one thing they all share and can block
+on: the process's doorbell writer. Every ring thread pokes it after
+publishing a reply. On Windows it was an overlapped `WriteFile` waited for
+with no timeout, under one mutex. One write that never completed held the
+mutex, and every session's ring threads queued behind it. Why the virtio-serial
+port stopped draining at the kill is not known: the hub kept reading its
+upstream, and QEMU's side showed nothing queued. Whatever the trigger, the
+writer must never be able to stop a serving thread.
+
+**While the process cannot exit, it keeps the GPU device's one mapping**
+(`map_ivshmem`: "the driver allows one per device and keeps it until the
+handle that made it closes"). For those 8 minutes a new GPU process of any
+installation would have been refused the device and its applications would
+have rendered in software. It was not a reboot's worth, but it was not
+harmless either.
+
+Fixed:
+
+* The guest's port writer is now the detached writer the host side got in
+  `8b68865`: a thread of its own and a bounded queue that drops on overflow.
+  A ring thread never waits on the port again.
+* An overlapped write waits at most 500 ms, is then cancelled
+  (`CancelIoEx`), and is waited for, since its buffer must outlive it. The
+  driver may not complete the cancel for minutes (the event above), and then
+  only the writer thread waits; bells are dropped meanwhile.
+
+Measured locally on both drivers the guest path can be stood in for: two
+survivors rendering frames continuously while a third client was killed
+with SIGKILL five times. Survivors had 0 failures on lavapipe through
+`pool-guest` and 0 on RADV through `serve --pool`. Neither path has a
+virtio-serial port, so neither could reproduce the stall itself. The guest
+confirmation is the multi-app run again.
+
+Not fixed: a process with a pending virtio-serial request still takes up to
+the I/O-cancel timeout to exit, and holds the GPU device until then.
+
+### 99.6 The confirmation, a port the driver leaked, and a hub that never closes QEMU's connection
+
+**The kill, again** (2026-10-17, 08:09–08:20, `wcmc` and `wcivs` on master
+`558b2bd`). Firefox (two windows, one playing the clip) and stock Minecraft
+ran together. The hub was restarted at 08:11:19, and both GPU doorbells and
+the proxy's Wayland doorbell reconnected. Minecraft was killed with SIGKILL
+at 08:11:35. The guest ended its session within about 5 to 8 seconds
+("27 lease(s) and the control region given back"), and Firefox ran the full
+10 minutes: 110 page loads, WebRender in all of them, 0 errors, a clean quit.
+
+**The stale session.** A `wcgpu` session's guest side was killed, and its
+host units and Firefox were left running with their hub connections. A new
+`wcmc` session started beside it in 10 s, attached to the hub, and ran 21
+page loads with 0 errors. The same hub process held both QEMU ports
+throughout.
+
+**But that run had no GPU doorbell on the guest.** The GPU process logged
+"no doorbell on org.sirati.svbell.0 (… access denied … or another process
+holds it)". At 08:08 `wc-port-access`, running as SYSTEM, opened `wcbell`
+and got error 5 on `svbell`. Vioser ports are exclusive, so that means held,
+and no process of ours existed. Since 99.5's process finished exiting on
+`IO_DRIVER_CANCEL_TIMEOUT`, the port has stayed open with nobody behind it:
+the driver leaked the open it failed to cancel. QEMU's `svbell` socket held
+543 host-to-guest bytes with nobody to read them, for as long as it was
+watched. So the run proved that a kill no longer stops other sessions, but
+not yet the detached writer under a kill. Without the doorbell, the clip
+dropped 43% of its frames, against 0.34% with it (97.10).
+
+`pnputil /disable-device` on that port answered "the system must be
+restarted" (3010) and left the device marked disabled for the next boot
+(`ConfigFlags` 0x1), with the enable refused until then. No reboot was made.
+The boot task now defuses that (`wc-port-access.ps1`, `6ccd1b2`):
+
+* every run records our ports by name in `ports.json`, since a port's name
+  exists only while it is started;
+* the SYSTEM boot task re-enables a recorded port that is disabled, with
+  `pnputil /enable-device`, before it applies the ACLs, and logs to
+  `wc-port-access.log`. Run once as at boot, it found `svbell` disabled and
+  was refused only because the restart is still pending;
+* the boot task had applied nothing since §91. Through `powershell -File`,
+  `-Ports a,b` is one string, so it looked for a port named "a,b". The
+  script now splits it.
+
+**What started 99.5's stall is still not proven.** The best-supported
+reading: the hub's restart, 13 s before the kill, closed and reopened
+QEMU's chardev connection, and after that the Windows port stopped
+completing the GPU process's writes. It is the same driver that then could
+not complete the cancel. Rather than wait for proof, the hub no longer
+closes that connection.
+
+**QEMU's connections in systemd's store.** `wc-bell-hub.service` is
+`Type=notify` with `FileDescriptorStoreMax=8` and
+`FileDescriptorStorePreserve=yes`. The hub gives systemd a copy of each
+upstream connection (`FDSTORE=1`, `FDNAME=svbell-up`) and each listening
+socket (`svbell-listen`), replacing an entry when it reconnects and removing
+it when QEMU closes. A restarted hub takes them back (`LISTEN_FDS`,
+`LISTEN_FDNAMES`, `sdfd::take`). systemd holds a copy while the old process
+exits, so QEMU never sees a disconnect, and clients reconnect to the same
+listening socket at once. Measured on this workstation under systemd 261,
+with a stand-in for QEMU that logs every connection: two restarts of the
+service, **one connection, never closed**, bytes from the hub to QEMU until
+the end, and two descriptors in the store throughout.
+
+The first restart that installs this unit still closes the connection once,
+because the old process has nothing stored.
+
+### 99.7 The missing test, with the doorbell back
+
+2026-10-17, after the guest restarted at 08:43:48. The boot task re-enabled
+`svbell` ("was disabled … pnputil /enable-device exit 0") and applied both
+ACLs. `wcmc` was deployed from master `33d86be`, which installed the
+fd-store unit; that one restart closed QEMU's connection once, as intended,
+with no session running. The guest's GPU process then logged "doorbell
+attached on org.sirati.svbell.0".
+
+**Hub restart mid-run with the fd store** (08:49:28, Firefox with two
+windows and the clip, plus stock Minecraft): the new hub "inherited 4
+descriptor(s) … [svbell-listen, svbell-up, wcbell-listen, wcbell-up]" and
+"kept … open across the restart" for both ports. QEMU's two connections were
+the same sockets before and after (`ss`: unchanged inodes), so QEMU saw no
+disconnect. Both GPU clients and the proxy reconnected.
+
+**SIGKILL of Minecraft** at 08:49:46: the guest ended its session 6 s later,
+polling included. Firefox ran the full 10 minutes: 119 page loads, WebRender
+in all of them, 0 errors, a clean quit, no `DEVICE_LOST`. This time the GPU
+process held `svbell` throughout, so the detached writer was on the path.
+
+**The doorbell is used.** `sv-pool-stress` through the same session, run
+twice:
+
+| | ring waits | parked | mean | under 1 ms | 10–100 ms |
+|---|---|---|---|---|---|
+| with the doorbell (the hub) | 583 | 534 ms | **0.92 ms** | 381 | 1 |
+| without (`SV_BELL` unset) | 583 | 1750 ms | 3.0 ms | 310 | 58 |
+
+**Video drops.** On `wcmc` (stock Firefox) the drop rate was 4–5% alone,
+15–29% while Minecraft loaded and ran, and 3.5% after the kill. On `wcgpu`
+alone (the readback Firefox build, as in 97.10), over 4 minutes, it was
+**2.84%** (2–3% per interval), against 0.34% in 97.10's 31-minute soak and
+43% with no doorbell (99.6). What makes up the rest of the difference to
+97.10 is not measured. Candidates: the hub's extra socket hop on each wake,
+and the host's state, with 1.1 GB available. An A/B with the session holding
+QEMU's socket directly would separate the two.
+
+### 99.8 Hub or direct: the video drop rate, and a session that trusted a dead socket
+
+2026-10-17, 09:04–09:50, with no user session running. The setup was
+`wcgpu` (the readback Firefox build, as in 97.10), two windows with the 720p
+clip, 4 minutes per run. Each figure excludes the first sample (start-up).
+**Hub**: the session's clients on `wc-bell-hub`. **Direct**: the hub held
+off by a runtime drop-in (`ConditionPathExists=` a path that does not exist)
+with its descriptor store cleared, so the session's own `sv-hostd` and proxy
+hold QEMU's sockets, as before §99.
+
+| run | path | frames | dropped | rate | host available | swap used |
+|---|---|---|---|---|---|---|
+| A1 | hub | 6090 | 173 | 2.84% | 594–732 MB | 181 MB, flat |
+| A2 | hub | 6093 | 146 | 2.40% | 587–716 MB | 177 MB, flat |
+| A3 | hub | 5952 | 131 | 2.20% | 558–667 MB | 176 MB, flat |
+| (B3, B4) | hub, see below | 6076, 6107 | 141, 186 | 2.32%, 3.05% | 541–707 MB | 175 MB, flat |
+| A4 | hub | 6087 | 124 | 2.04% | 547–653 MB | 175 MB, flat |
+| D1 | **direct** | 6067 | 132 | **2.18%** | 575–678 MB | 175 MB, flat |
+| D2 | **direct** | 6030 | 113 | **1.87%** | 541–544 MB | 175 MB, flat |
+
+Hub runs: 2.04–3.05%, mean 2.48%. Direct: 1.87 and 2.18%, mean 2.03%. The
+hub may cost a few tenths of a point, inside the spread of its own runs, so
+it is not what separates today from 97.10's 0.34%. Neither is the host's
+memory. Available memory stayed at 540–730 MB, swap flat at 175–181 MB, and
+swap-ins were 3–75 pages per 4-minute run. The host's load was 3–5. What
+does separate them is not measured. The plain difference in code is that
+since 97.10 every doorbell write goes through a writer thread, on the host
+(`8b68865`) and on the guest (`495802e`): one more thread handoff per wake.
+A non-blocking inline write on the host socket would remove that handoff
+without giving back the guarantee. The guest's Windows port cannot do that
+without the thread.
+
+**Found on the way: `wc-session` trusted a dead hub socket.** Its `hub_up`
+checked that `/run/user/<uid>/wc-bell/{sv,wl}.sock` existed. They outlive
+the hub, and with the fd store they are meant to. With the hub stopped (the
+first two "direct" runs, B1 and B2), a session pointed its ICDs at a dead
+socket (no GPU doorbell) and its proxy at a dead `wl.sock`. That sent every
+Wayland connection over ssh ("SSH FALLBACK"), and the clip dropped 96–100% of
+its frames. `e9a168e`: `hub_up` asks systemd whether the hub is active,
+starts it if it can, and otherwise falls back to holding QEMU's ports
+itself. B3 and B4 then turned out to be hub runs after all: `systemctl
+--user mask --runtime` does not override a unit file in
+`~/.config/systemd/user`, so `wc-session` started the hub. That is why the
+direct runs use a drop-in.
+
+### 99.9 Where the video frames went: the doorbell's writer thread, and §98's synchronous present
+
+2026-10-17, 09:52–11:36. The setup was `wcgpu` (the readback Firefox build),
+two windows with the 720p clip, 4-minute runs, start-up sample excluded.
+Absolute rates drift with the host's load over an hour (the same build gave
+1.75% at 10:00 and 3.9% at 11:20), so every comparison below alternates its
+two arms and compares only within one block.
+
+**The host's doorbell writer thread, then inline (`7467cdc`).** Through the
+hub, alternating T, I, T, I: thread 2.65% and 2.22%, inline (`MSG_DONTWAIT`
+on the socket, no thread) 1.75% and 1.78%. Kept.
+
+**The build behind 97.10's 0.34%** (`efb7b03`), run direct with the hub
+held off: 0.90%, 0.33%, 1.01%. Bisecting over the merges since then, also
+direct: `883e70e` 3.14%, `9076288` 3.09%, `6873327` 2.57%. `6873327` is
+`efb7b03` merged into a master that already had `4fe941b` (desktop-checks).
+In `crates/`, that adds only `sv-icd/src/wsi.rs` (§98) and three compositor
+files. `6873327` with the compositor files reverted: 3.12%, so not those.
+`6873327` with `SV_PRESENT_SYNC=0`, which restores the pipelined Wayland
+present §98 removed: 1.36%.
+
+**§98's synchronous present, today's build, alternating S, P, S, P:**
+
+| run | present | dropped |
+|---|---|---|
+| S5 | synchronous (default since §98) | 3.96% |
+| P5 | pipelined (`SV_PRESENT_SYNC=0`) | 2.27% |
+| S6 | synchronous | 3.87% |
+| P6 | pipelined | 2.22% |
+
+So most of the gap to 0.34% is §98: presenting a Wayland frame inside
+`vkQueuePresentKHR`, which the quit crash required, costs the clip about
+1.7 points of its frames. The host's writer thread cost about 0.7, and is
+gone. The hub costs at most a few tenths (99.8). The pipelined present cannot
+come back as it was: it marshalled on a `wl_surface` the application may
+already have freed. What would keep both is to pipeline everything up to the
+surface requests and make only `attach`, `damage` and `commit` inside the
+application's next call, since Mesa's own WSI touches the surface only
+there. That is §98's owner's to decide.

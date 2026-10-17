@@ -493,7 +493,15 @@ impl ShmBufferUserData {
 
     pub(crate) fn remove_destruction_hook(&self, hook_id: HookId) {
         let mut guard = self.destruction_hooks.lock().unwrap();
-        if let Some(id) = guard.iter().position(|hook| hook.id != hook_id) {
+        // WAYCOMPOSE FORK (waycompose-design.md §96.11): `==`, not `!=`. With
+        // `!=` this removed the first hook that was *not* the one asked for, so
+        // a hook was never removed when it was the buffer's only one. An
+        // xdg_toplevel_icon_v1 registers one per buffer and removes it when the
+        // icon is destroyed; with the hook left behind, a client that destroyed
+        // the icon and then its buffers (the protocol's order, and Qt's for
+        // every window with an icon) was killed with `no_buffer`. Prism
+        // Launcher's main window died that way.
+        if let Some(id) = guard.iter().position(|hook| hook.id == hook_id) {
             guard.remove(id);
         }
     }

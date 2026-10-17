@@ -119,11 +119,14 @@ WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
 # holds both for every session of every installation and serves them here.
 # Without it a session falls back to holding the port itself, said loudly.
 HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
+# Whether the hub RUNS, not whether its socket files exist: they outlive it
+# (with the fd store they are meant to), and a session that trusted a stale
+# file had no GPU doorbell and sent its Wayland connections over ssh (§99.8).
 hub_up() {
-  [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
-  XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user start wc-bell-hub.service >/dev/null 2>&1 || return 1
+  local sd="env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user"
+  $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
-    [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
+    $sd is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
     sleep 0.05
   done
   return 1

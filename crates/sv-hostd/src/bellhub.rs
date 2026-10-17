@@ -195,6 +195,21 @@ pub fn bind_private(path: &std::path::Path) -> std::io::Result<UnixListener> {
 /// or is absent (the VM is stopped or restarting). Clients stay connected
 /// across upstream reconnects. Spawns its threads and returns the hub.
 pub fn run(name: &str, upstream: std::path::PathBuf, listener: UnixListener) -> std::io::Result<Arc<Hub>> {
+    run_kept(name, upstream, listener, None, false)
+}
+
+/// [`run`], starting from an upstream connection a previous hub process left
+/// open (§99.6), and, with `keep`, giving systemd a copy of every upstream
+/// connection it makes (`{name}-up` in the unit's file-descriptor store) so
+/// that the next restart of the hub inherits it and QEMU never sees the
+/// connection close. A connection QEMU closed is taken out of the store.
+pub fn run_kept(
+    name: &str,
+    upstream: std::path::PathBuf,
+    listener: UnixListener,
+    inherited: Option<UnixStream>,
+    keep: bool,
+) -> std::io::Result<Arc<Hub>> {
     let hub = Hub::new(name);
     {
         let hub = Arc::clone(&hub);
@@ -218,8 +233,21 @@ pub fn run(name: &str, upstream: std::path::PathBuf, listener: UnixListener) -> 
         let hub = Arc::clone(&hub);
         std::thread::Builder::new().name(format!("bell-{name}-upstream")).spawn(move || {
             let mut said_absent = false;
+            let mut next = inherited;
+            let key = format!("{}-up", hub.name);
             loop {
-                match UnixStream::connect(&upstream) {
+                let got = match next.take() {
+                    Some(s) => {
+                        eprintln!("bell-hub {}: kept {} open across the restart", hub.name, upstream.display());
+                        Ok(s)
+                    }
+                    None => UnixStream::connect(&upstream).inspect(|s| {
+                        if keep && let Err(e) = crate::sdfd::store(&key, s) {
+                            eprintln!("bell-hub {}: could not keep the connection in systemd's store: {e}", hub.name);
+                        }
+                    }),
+                };
+                match got {
                     Ok(s) => {
                         said_absent = false;
                         eprintln!(
@@ -229,6 +257,9 @@ pub fn run(name: &str, upstream: std::path::PathBuf, listener: UnixListener) -> 
                             hub.client_count()
                         );
                         let _ = hub.serve_upstream(s);
+                        if keep {
+                            let _ = crate::sdfd::remove(&key);
+                        }
                         eprintln!(
                             "bell-hub {}: {} closed (the VM stopped?); {} byte(s) down ({} dropped), {} up ({} \
                              dropped); reconnecting",

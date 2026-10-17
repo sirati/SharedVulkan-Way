@@ -680,6 +680,13 @@ APPS
 Description=waycompose shared doorbell hub (docs/waycompose-design.md §99)
 
 [Service]
+# §99.6: QEMU's chardev connections live in systemd's file-descriptor
+# store, so restarting the hub never closes them and QEMU never sees a
+# disconnect.
+Type=notify
+NotifyAccess=main
+FileDescriptorStoreMax=8
+FileDescriptorStorePreserve=yes
 ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
 Restart=always
 RestartSec=2
