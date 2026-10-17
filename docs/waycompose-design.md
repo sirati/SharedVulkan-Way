@@ -31599,6 +31599,6 @@ Checked against canned files:
 | injected-kind input inside a QMP window (not discounted) | `active 39 s ago`, exit 2 |
 | sentinel version 1 | unknown, exit 1 |
 
-Live after the update (14:33): version 2 running in session 1. It showed
+Live after the update (14:25): version 2 running in session 1. It showed
 hardware keyboard input seconds old, and TeamViewer's last line was "no
 restrictions", so somebody was at the VM's own console.
