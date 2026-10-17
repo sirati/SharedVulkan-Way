@@ -56,6 +56,9 @@
  * real-guest question.
  */
 #include <windows.h>
+/* What our injected input carries in dwExtraInfo, so the guest's activity
+ * sentinel (wc-activity.c) does not take it for the person (design §101). */
+#define WC_AGENT_TAG ((ULONG_PTR)0x57434147454E5431ULL)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +188,7 @@ static void move_to(int x, int y)
 	in.mi.dx = (LONG)((double)x * 65535.0 / (double)(w - 1));
 	in.mi.dy = (LONG)((double)y * 65535.0 / (double)(h - 1));
 	in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+	in.mi.dwExtraInfo = WC_AGENT_TAG;
 	/* **The return value is checked, and docs/waycompose-design.md §57 is why.**
 	 * `SendInput` can return 0 with `ERROR_ACCESS_DENIED` without blocking,
 	 * throwing or logging. §57 found `probe-scroll.c` discarding exactly this

@@ -1280,6 +1280,11 @@ usage: wc-desk <command> [options]
         Ok(())
     }
 
+    /// What every event this program injects carries in `dwExtraInfo`, so the
+    /// guest's activity sentinel (`scripts/wc-activity.c`) knows it is ours and
+    /// not the person's (docs/waycompose-design.md §101). "WCAGENT1".
+    const WC_AGENT_TAG: usize = 0x5743_4147_454E_5431;
+
     /// One mouse event through `SendInput`, at a screen point.
     fn send_mouse(x: i32, y: i32, flags: u32) {
         // SAFETY: plain metric reads.
@@ -1295,7 +1300,7 @@ usage: wc-desk <command> [options]
                     mouseData: 0,
                     dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: WC_AGENT_TAG,
                 },
             },
         };
@@ -1309,7 +1314,7 @@ usage: wc-desk <command> [options]
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
-                mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 },
+                mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: WC_AGENT_TAG },
             },
         };
         // SAFETY: one well-formed `INPUT`, its size passed with it.
@@ -1326,7 +1331,7 @@ usage: wc-desk <command> [options]
                     wScan: scan,
                     dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 },
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: WC_AGENT_TAG,
                 },
             },
         };
