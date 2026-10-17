@@ -31163,3 +31163,41 @@ the end, and two descriptors in the store throughout.
 
 The first restart that installs this unit still closes the connection once,
 because the old process has nothing stored.
+
+### 99.7 The missing test, with the doorbell back
+
+2026-10-17, after the guest restarted at 08:43:48. The boot task re-enabled
+`svbell` ("was disabled … pnputil /enable-device exit 0") and applied both
+ACLs. `wcmc` was deployed from master `33d86be`, which installed the
+fd-store unit; that one restart closed QEMU's connection once, as intended,
+with no session running. The guest's GPU process then logged "doorbell
+attached on org.sirati.svbell.0".
+
+**Hub restart mid-run with the fd store** (08:49:28, Firefox with two
+windows and the clip, plus stock Minecraft): the new hub "inherited 4
+descriptor(s) … [svbell-listen, svbell-up, wcbell-listen, wcbell-up]" and
+"kept … open across the restart" for both ports. QEMU's two connections were
+the same sockets before and after (`ss`: unchanged inodes), so QEMU saw no
+disconnect. Both GPU clients and the proxy reconnected.
+
+**SIGKILL of Minecraft** at 08:49:46: the guest ended its session 6 s later,
+polling included. Firefox ran the full 10 minutes: 119 page loads, WebRender
+in all of them, 0 errors, a clean quit, no `DEVICE_LOST`. This time the GPU
+process held `svbell` throughout, so the detached writer was on the path.
+
+**The doorbell is used.** `sv-pool-stress` through the same session, run
+twice:
+
+| | ring waits | parked | mean | under 1 ms | 10–100 ms |
+|---|---|---|---|---|---|
+| with the doorbell (the hub) | 583 | 534 ms | **0.92 ms** | 381 | 1 |
+| without (`SV_BELL` unset) | 583 | 1750 ms | 3.0 ms | 310 | 58 |
+
+**Video drops.** On `wcmc` (stock Firefox) the drop rate was 4–5% alone,
+15–29% while Minecraft loaded and ran, and 3.5% after the kill. On `wcgpu`
+alone (the readback Firefox build, as in 97.10), over 4 minutes, it was
+**2.84%** (2–3% per interval), against 0.34% in 97.10's 31-minute soak and
+43% with no doorbell (99.6). What makes up the rest of the difference to
+97.10 is not measured. Candidates: the hub's extra socket hop on each wake,
+and the host's state, with 1.1 GB available. An A/B with the session holding
+QEMU's socket directly would separate the two.
