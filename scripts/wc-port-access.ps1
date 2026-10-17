@@ -50,6 +50,10 @@ param(
   [string]$User = "",
   [string[]]$Ports = @("org.sirati.wcbell.0", "org.sirati.svbell.0")
 )
+# Through `powershell -File` (the boot task) `-Ports a,b` arrives as ONE
+# string; split it here, or the task looks for a port named "a,b" and does
+# nothing (§99.6: it had done nothing at every startup since §91).
+$Ports = @($Ports | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
@@ -151,7 +155,15 @@ public static class WcPorts {
 
 # Write-Host, not Write-Output: the lines must not become a function's return
 # value (Apply-All returns a count).
-function Say($s) { Write-Host ("[wc-port-access] " + $s) }
+function Say($s) {
+  $line = "[wc-port-access] " + $s
+  Write-Host $line
+  # §99.6: the boot task's lines go to a log beside the installed script,
+  # because a SYSTEM task at startup has nobody to print to.
+  if ($Action -eq "apply" -and (Test-Path $InstallDir)) {
+    Add-Content -Path (Join-Path $InstallDir "wc-port-access.log") -Value ((Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " " + $line) -ErrorAction SilentlyContinue
+  }
+}
 
 # Find a port's devnode by its name: the symbolic link's target is the PDO's
 # name, and exactly one present device reports that PDO name.
@@ -163,6 +175,52 @@ function Find-Port([string]$Name) {
     if ($p -eq $pdo) { return [pscustomobject]@{ Name = $Name; Pdo = $pdo; Instance = $d.InstanceId } }
   }
   return $null
+}
+
+# §99.6. A port's name exists only while it is started (it is the target of
+# \.\Global\<name>), so a port that is disabled cannot be found by name. Every
+# run records, for each of our ports it can see, which device it is; the boot
+# task re-enables a recorded port that is disabled before it applies anything.
+# A disable that waited for a reboot (`pnputil /disable-device` answering
+# 3010, as on 2026-10-17) would otherwise come up as no doorbell at all.
+$PortMap = Join-Path $InstallDir "ports.json"
+
+function Record-Ports {
+  $map = @{}
+  if (Test-Path $PortMap) {
+    (Get-Content -Raw $PortMap | ConvertFrom-Json).psobject.Properties | ForEach-Object { $map[$_.Name] = $_.Value }
+  }
+  $changed = $false
+  foreach ($n in $Ports) {
+    try { $p = Find-Port $n } catch { Say "${n}: could not be looked up ($_)"; continue }
+    if ($p -and $map[$n] -ne $p.Instance) { $map[$n] = $p.Instance; $changed = $true }
+  }
+  if ($changed -and (Test-Path $InstallDir)) {
+    ($map | ConvertTo-Json) | Set-Content -Path $PortMap -Encoding ASCII
+    Say ("recorded our ports: " + (($map.GetEnumerator() | ForEach-Object { $_.Key + " = " + $_.Value }) -join "; "))
+  }
+}
+
+function Enable-Ours {
+  if (-not (Test-Path $PortMap)) { Say "no record of our ports yet ($PortMap); nothing to re-enable"; return }
+  $map = Get-Content -Raw $PortMap | ConvertFrom-Json
+  foreach ($n in $Ports) {
+    $inst = $map.$n
+    if (-not $inst) { Say "${n}: not recorded; not re-enabled"; continue }
+    $flags = (Get-ItemProperty -Path ("HKLM:\SYSTEM\CurrentControlSet\Enum\" + $inst) -Name ConfigFlags -ErrorAction SilentlyContinue).ConfigFlags
+    $d = Get-PnpDevice -InstanceId $inst -ErrorAction SilentlyContinue
+    if (-not $d) { Say "${n}: recorded device $inst is not present; skipped"; continue }
+    if ((($flags -band 1) -eq 0) -and $d.Problem -ne 22) { Say "${n}: enabled ($inst)"; continue }
+    # Not under "Stop": Windows PowerShell 5 turns a native command's stderr
+    # into a terminating error there, and this step died silently on the one
+    # port it exists for.
+    $eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    try {
+      $out = (& pnputil.exe /enable-device "$inst" 2>&1 | ForEach-Object { "$_" } | Out-String).Trim() -replace "\s+", " "
+      $code = $LASTEXITCODE
+    } catch { $out = "$_"; $code = -1 } finally { $ErrorActionPreference = $eap }
+    Say ("${n}: was disabled (" + $inst + ", ConfigFlags 0x" + ("{0:x}" -f [int]$flags) + ", problem " + $d.Problem + "); pnputil /enable-device exit " + $code + ": " + $out)
+  }
 }
 
 function Resolve-Sid([string]$U) {
@@ -189,6 +247,10 @@ function Apply-All([string]$Sddl, [bool]$DropProperty) {
   return [int]$bad
 }
 
+# Recorded first, on every action, so that a port whose descriptor cannot be
+# changed (held open) is still known by device for the next boot.
+if (Test-Path $InstallDir) { Record-Ports }
+
 switch ($Action) {
   "show" {
     foreach ($n in $Ports) {
@@ -204,6 +266,7 @@ switch ($Action) {
   }
   "apply" {
     $sid = Resolve-Sid $User
+    try { Enable-Ours } catch { Say "re-enabling our ports failed: $_" }
     Say "granting read and write on $($Ports -join ', ') to $sid (medium integrity and up)"
     exit (Apply-All (Granted $sid) $false)
   }
@@ -213,8 +276,8 @@ switch ($Action) {
   }
   "install" {
     $sid = Resolve-Sid $User
-    $bad = Apply-All (Granted $sid) $false
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $bad = Apply-All (Granted $sid) $false
     # Administrators and SYSTEM may write it, everybody else may only read it:
     # the task below runs this file as SYSTEM.
     icacls $InstallDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
