@@ -31201,3 +31201,48 @@ alone (the readback Firefox build, as in 97.10), over 4 minutes, it was
 97.10 is not measured. Candidates: the hub's extra socket hop on each wake,
 and the host's state, with 1.1 GB available. An A/B with the session holding
 QEMU's socket directly would separate the two.
+
+### 99.8 Hub or direct: the video drop rate, and a session that trusted a dead socket
+
+2026-10-17, 09:04–09:50, with no user session running. The setup was
+`wcgpu` (the readback Firefox build, as in 97.10), two windows with the 720p
+clip, 4 minutes per run. Each figure excludes the first sample (start-up).
+**Hub**: the session's clients on `wc-bell-hub`. **Direct**: the hub held
+off by a runtime drop-in (`ConditionPathExists=` a path that does not exist)
+with its descriptor store cleared, so the session's own `sv-hostd` and proxy
+hold QEMU's sockets, as before §99.
+
+| run | path | frames | dropped | rate | host available | swap used |
+|---|---|---|---|---|---|---|
+| A1 | hub | 6090 | 173 | 2.84% | 594–732 MB | 181 MB, flat |
+| A2 | hub | 6093 | 146 | 2.40% | 587–716 MB | 177 MB, flat |
+| A3 | hub | 5952 | 131 | 2.20% | 558–667 MB | 176 MB, flat |
+| (B3, B4) | hub, see below | 6076, 6107 | 141, 186 | 2.32%, 3.05% | 541–707 MB | 175 MB, flat |
+| A4 | hub | 6087 | 124 | 2.04% | 547–653 MB | 175 MB, flat |
+| D1 | **direct** | 6067 | 132 | **2.18%** | 575–678 MB | 175 MB, flat |
+| D2 | **direct** | 6030 | 113 | **1.87%** | 541–544 MB | 175 MB, flat |
+
+Hub runs: 2.04–3.05%, mean 2.48%. Direct: 1.87 and 2.18%, mean 2.03%. The
+hub may cost a few tenths of a point, inside the spread of its own runs, so
+it is not what separates today from 97.10's 0.34%. Neither is the host's
+memory. Available memory stayed at 540–730 MB, swap flat at 175–181 MB, and
+swap-ins were 3–75 pages per 4-minute run. The host's load was 3–5. What
+does separate them is not measured. The plain difference in code is that
+since 97.10 every doorbell write goes through a writer thread, on the host
+(`8b68865`) and on the guest (`495802e`): one more thread handoff per wake.
+A non-blocking inline write on the host socket would remove that handoff
+without giving back the guarantee. The guest's Windows port cannot do that
+without the thread.
+
+**Found on the way: `wc-session` trusted a dead hub socket.** Its `hub_up`
+checked that `/run/user/<uid>/wc-bell/{sv,wl}.sock` existed. They outlive
+the hub, and with the fd store they are meant to. With the hub stopped (the
+first two "direct" runs, B1 and B2), a session pointed its ICDs at a dead
+socket (no GPU doorbell) and its proxy at a dead `wl.sock`. That sent every
+Wayland connection over ssh ("SSH FALLBACK"), and the clip dropped 96–100% of
+its frames. `e9a168e`: `hub_up` asks systemd whether the hub is active,
+starts it if it can, and otherwise falls back to holding QEMU's ports
+itself. B3 and B4 then turned out to be hub runs after all: `systemctl
+--user mask --runtime` does not override a unit file in
+`~/.config/systemd/user`, so `wc-session` started the hub. That is why the
+direct runs use a drop-in.
