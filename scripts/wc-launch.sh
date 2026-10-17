@@ -665,12 +665,9 @@ APPS
     # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
     # installation: it, not a session, holds QEMU's two doorbell sockets.
     # Its own copy of sv-hostd, so that redeploying one installation never
-    # swaps the binary under another's running hub. A RUNNING HUB IS NEVER
-    # RESTARTED HERE: its clients (every session's ICDs and proxies) do not
-    # reconnect, so a restart would leave every running session of every
-    # installation on the slice until it ends. A changed binary or unit is
-    # installed and takes effect at the hub's next start (the next VM host
-    # boot, or `systemctl --user restart wc-bell-hub` when nothing runs).
+    # swaps the binary under another's running hub. A changed binary or unit
+    # restarts the hub only when no session runs (below); otherwise it takes
+    # effect at the hub's next start.
     local hubbin=~/wc-bell/sv-hostd hubunit=.config/systemd/user/wc-bell-hub.service
     h "mkdir -p ~/wc-bell \$HOME/.config/systemd/user" >/dev/null
     local before; before=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
@@ -691,11 +688,21 @@ WantedBy=default.target
 UNIT
     local after; after=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
     h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; systemctl --user start wc-bell-hub.service" >/dev/null 2>&1
+    # A changed hub is restarted only while no session runs: clients since
+    # §99.4 reconnect to a restarted hub, but a session started by an older
+    # build does not, and would lose its bells until it ends.
+    local live; live=$(h "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user list-units --state=active --no-legend --plain 'wc-launch-*' 2>/dev/null | wc -l")
+    local restarted=""
+    if [ -n "$before" ] && [ "$before" != "$after" ] && [ "${live:-1}" = 0 ]; then
+      h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user restart wc-bell-hub.service" >/dev/null 2>&1 && restarted=1
+    fi
     local hs; hs=$(h "sleep 1; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service; ls /run/user/\$(id -u)/wc-bell/ 2>/dev/null | tr '\n' ' '")
     case "$hs" in
       active*sv.sock*wl.sock*)
-        if [ "$before" != "$after" ] && [ -n "$before" ]; then
-          note "the doorbell hub was already running and was NOT restarted; the new binary or unit takes effect at its next start"
+        if [ -n "$restarted" ]; then
+          note "the doorbell hub changed and was restarted (no session was running)"
+        elif [ "$before" != "$after" ] && [ -n "$before" ]; then
+          note "the doorbell hub changed and was NOT restarted: $live session unit(s) run; the new binary takes effect at its next start"
         fi
         ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
       *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;

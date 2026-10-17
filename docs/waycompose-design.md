@@ -30968,7 +30968,7 @@ doorman, a proxy's ring wake) do not reconnect, so after a restart every
 session then running waits out its slices until it ends: slower, never
 wrong. So `wc-launch.sh deploy` starts the hub when none runs and never
 restarts a running one; a new binary takes effect at its next start.
-Reconnecting clients would remove even that, and are left as follow-up.
+Clients since 99.4 reconnect, which removes even that for new sessions.
 
 Without the hub, a session falls back to holding the port itself and says
 so in capitals (`NO SHARED DOORBELL HUB`), which is the pre-§99 behaviour.
@@ -30983,3 +30983,19 @@ old one would take QEMU's socket away from the hub.
 | `bellhub::clients_survive_the_upstream_reconnecting` | the upstream closes (the VM stops): the hub reconnects by itself and a client connected before carries on both ways |
 | `bellhub::a_client_leaving_affects_no_other` | a client leaving is forgotten, the rest still get the guest's bytes; the socket is 0600 |
 | `vdoorbell::a_doorbell_nobody_reads_never_blocks_the_poker` (`8b68865`) | the ICD's side: two million pokes into a socket nobody reads return at once |
+
+### 99.4 Clients reconnect to a restarted hub
+
+An ICD's doorman and a proxy's ring wake now attach through
+`vdoorbell::attach_host_reconnecting`: the installed writer is a
+`SwapWriter`, and when the hub's socket closes the doorman reconnects every
+500 ms and swaps the new socket in. In the gap pokes are dropped and waits
+use their slices; nothing fails and nothing waits for the hub. An ICD whose
+hub is not up yet at bring-up now keeps trying instead of giving up.
+`vdoorbell::a_client_reconnects_to_a_restarted_hub`: the hub's socket closes
+and is bound again on the same path, and the client's pokes reach the new
+hub and the new hub's bytes ring its target.
+
+Sessions started by a build before this one do not reconnect, so deploy
+restarts a changed hub only while no `wc-launch-*` unit is active, and
+otherwise says the change waits for the hub's next start.

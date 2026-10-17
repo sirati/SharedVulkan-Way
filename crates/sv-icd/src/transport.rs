@@ -857,14 +857,17 @@ impl RingTransport {
         #[cfg(unix)]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
-            Ok(path) => match sv_transport::vdoorbell::PortHandle::host_socket(&path)
+            // §99: reconnecting, so a restarted hub costs this session only
+            // the bells in the gap.
+            Ok(path) => match sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
                 .map_err(|e| e.to_string())
-                .and_then(|p| {
-                    sv_transport::vdoorbell::attach(p, Arc::clone(&control))
-                        .map_err(|e| e.to_string())
-                }) {
-                Ok(d) => {
+            {
+                Ok((d, true)) => {
                     eprintln!("[icd] doorbell attached on {path}");
+                    Some(d)
+                }
+                Ok((d, false)) => {
+                    eprintln!("[icd] no doorbell on {path} yet; it is tried every 500 ms, and waits run out their slice until then");
                     Some(d)
                 }
                 Err(e) => {
