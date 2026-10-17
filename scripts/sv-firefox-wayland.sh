@@ -468,7 +468,7 @@ HTML
   # whether the parent process has our ICD mapped at that moment.
   ( while kill -0 $FF 2>/dev/null; do sleep 60; shot
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
-      grep -c "libsv_wlshim\.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s shim-mappings=/" >>"$RUN/icd-mapped.txt"
+      grep -c "libsv_wlshim\.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s shim-mappings=/" >>"$RUN/shim-mapped.txt"
     done ) &
   KIDS+=($!)
   # `SVWL_STALL_MS=N`: stop the GPU side for N ms every `SVWL_STALL_EVERY`

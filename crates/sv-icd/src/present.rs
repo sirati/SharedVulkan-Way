@@ -1535,6 +1535,8 @@ pub mod wayland {
             end: unsafe extern "C" fn(),
         }
 
+        // The `sym!` transmutes name their target by the field they fill.
+        #[allow(clippy::missing_transmute_annotations)]
         fn shim() -> Option<&'static Shim> {
             static SHIM: OnceLock<Option<Shim>> = OnceLock::new();
             SHIM.get_or_init(|| {
@@ -1569,11 +1571,16 @@ pub mod wayland {
             shim().is_some()
         }
 
-        /// Register `surface`, which must be alive: call it inside the
-        /// application's Vulkan call. `None` without the shim or a free slot.
-        pub fn track(surface: *mut c_void) -> Option<i32> {
+        /// Register `surface`. `None` without the shim or a free slot.
+        ///
+        /// # Safety
+        ///
+        /// `surface` must be a live `wl_surface` proxy: call it inside the
+        /// application's Vulkan call. The shim stores the pointer and only
+        /// ever compares it.
+        pub unsafe fn track(surface: *mut c_void) -> Option<i32> {
             let s = shim()?;
-            // SAFETY: the shim only stores the pointer and compares it.
+            // SAFETY: as this function's contract.
             let slot = unsafe { (s.track)(surface) };
             (slot >= 0).then_some(slot)
         }

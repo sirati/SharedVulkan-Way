@@ -30753,6 +30753,9 @@ a fullscreen window) minimised the window to (-32000,-32000), and neither
 
 ## 98. Firefox's crash at quit: a frame shown after its surface was gone
 
+**Superseded in part by §100:** with `libsv_wlshim.so` preloaded, a Wayland
+swapchain pipelines again, safely; without it, everything below still holds.
+
 Branch `quit-crash`, from `desktop-checks` 8d8c32b, 2026-10-16. The brief: §95.4
 saw Firefox crash once when its last window closed on the guest, and the
 gpu-arena-dyn agent reproduced a crash at quit on the workstation (two windows
@@ -31286,3 +31289,195 @@ already have freed. What would keep both is to pipeline everything up to the
 surface requests and make only `attach`, `damage` and `commit` inside the
 application's next call, since Mesa's own WSI touches the surface only
 there. That is §98's owner's to decide.
+
+## 100. The pipelined Wayland present comes back, guarded: `libsv_wlshim.so`
+
+Branch `present-async`, from `desktop-checks` b173cfa with master bfac0ce merged,
+2026-10-17. The brief (from §99.9): §98's synchronous Wayland present costs
+the 720p clip about 1.7 points of its frames on the guest. Keep §98's crash
+fixed and get the frames back. The coordinator proposed pipelining everything up to the
+surface requests and making `attach`, `damage` and `commit` inside the
+application's next call. The answer here is a different design, for the
+reasons in 100.2.
+
+### 100.1 Status in one paragraph
+
+**The present is pipelined again on Wayland, and it is safe.** A small C
+library, `libsv_wlshim.so`, preloaded into the application by `wc-session` (and
+by `sv-firefox-wayland.sh`), stands in front of libwayland's request entry
+points. For a surface the ICD registers, it marks the surface dead before the
+application's `destroy` is forwarded, and counts the application's unmaps
+(`attach` of a NULL buffer). Both happen under the lock the ICD's present thread
+holds around its own `attach`, `damage` and `commit`. A frame whose surface died or was
+unmapped after the application presented it is dropped. Without the shim the
+ICD presents inside the call, exactly as §98 left it. Locally, with each frame held back 30 ms (the window §98's crash needed), 8
+of 8 runs quit cleanly, against 4 of 4 crashes for the unguarded order. The
+guard dropped 4 to 7 frames at each quit, so the race was caught, not missed.
+**The guest's video A/B is still open (100.6).**
+
+### 100.2 Why not the next call
+
+The proposal was to keep the GPU wait and the readback copy on the present
+thread, and make the three surface requests inside the application's next
+`vkQueuePresentKHR`, where Mesa's WSI touches the surface. Two things rule it out.
+
+- **The last frame would not be shown.** A frame's commit would wait for the
+  application's next present, and an application presents only when something
+  changed: Firefox's WebRender after a page or a key press, GTK 4 after a
+  redraw. The frame that ends a burst — the letter just typed, the last scroll
+  position, a page that has finished loading — would stay on the screen's
+  previous frame until something else changed. It works for a video playing
+  and fails for everything that stops.
+- **The other calls are not safe points either.** The application's lock covers
+  `eglSwapBuffers` only (98.4). `vkAcquireNextImageKHR` is called by Zink while
+  it builds the next frame, outside that lock, and `vkDestroySwapchainKHR`
+  comes after the surface is already gone: in §98's protocol log `wl_surface#46`
+  was destroyed at .130606 and its swapchain at .130791, and at quit the
+  swapchain is never destroyed at all.
+
+So no point inside the application's own calls both comes soon enough and is
+safe. The alternative suggested with it, committing from a frame callback dispatched on the
+application's event queue, has the race of §98 in another place. Firefox
+destroys the surface on its main thread, the thread that dispatches that queue,
+but a `done` event already read from the socket is still dispatched after a
+destroy the same thread made a moment before.
+
+### 100.3 The shim
+
+What the ICD cannot see — that the application has destroyed its surface — is
+visible to anything between the application and libwayland, because the
+destroy is a request the application makes. `crates/sv-icd/shim/sv_wlshim.c`
+defines `wl_proxy_marshal_flags`, `wl_proxy_marshal`,
+`wl_proxy_marshal_array_flags`, `wl_proxy_marshal_array` and `wl_proxy_destroy`.
+Preloaded, it takes those calls from libxul and GTK before libwayland does.
+
+- **Every call is forwarded.** The variadic ones are turned into a
+  `wl_argument` array from the request's signature in the proxy's interface,
+  exactly as libwayland's own `wl_argument_from_va_list` does, and passed to
+  the real `wl_proxy_marshal_array_flags`. The real functions come from the
+  `libwayland-client.so.0` the process has loaded, by its handle. They never
+  come from `RTLD_NEXT`, because in Firefox that finds `libmozwayland.so`'s
+  link-time stubs (libxul is linked against them, `NEEDED libmozwayland.so`).
+- **For a registered surface**, under one mutex: `wl_surface.destroy` (opcode
+  0, or any request with `WL_MARSHAL_FLAG_DESTROY`) and `wl_proxy_destroy` mark
+  it dead *before* forwarding; `attach` with a NULL buffer bumps its
+  generation. The forwarded call is made with the mutex held, so it cannot fall
+  between the present thread's checks and its requests.
+- **The ICD's side** (`svwl_shim_v1_track`, `_untrack`, `_generation`,
+  `_begin`, `_end`) is found with `dlsym(RTLD_DEFAULT)`. The ICD registers the
+  surface inside `vkCreateSwapchainKHR`, reads its generation inside each
+  `vkQueuePresentKHR` (so a frame carries the generation it was presented at),
+  and on the present thread wraps its `attach`, `damage` and `commit` in
+  `begin`/`end`. `begin` fails if the surface is dead or the generation moved,
+  and the frame is dropped. The ICD's own libwayland calls go through its own
+  `dlopen` handle, not through the shim, so it never re-enters it.
+- **No `DT_NEEDED` on libwayland**, and the ICD-facing names carry a version.
+  In a process that never uses Wayland the shim does nothing. An ICD without
+  the shim, or with an older one, finds no `svwl_shim_v1_*` and presents in
+  the call (`pipelines(target, SV_PRESENT_SYNC, guarded)`).
+
+Two things it does not do, on purpose. It does not order the present thread's
+`commit` against the application's own pending state on that surface (a
+viewport change and its commit). Neither did §88's present, and a frame
+committed between the two takes the new viewport one frame early. And it is
+an `LD_PRELOAD`: an application started some other way gets §98's
+synchronous present, which is correct and only slower.
+
+### 100.4 Built, shipped, started
+
+- `crates/sv-icd/build.rs` compiles the shim with the Linux compiler
+  (`CC_x86_64_unknown_linux_gnu`, else `CC_FOR_BUILD`, else `gcc`). It cannot
+  use `CC`, which the dev shell points at mingw. It is built with `-Wall
+  -Wextra -Werror` and put beside `libsv_icd.so` in `target/<profile>/`.
+- `wc-launch.sh deploy` copies it to the host's `bin/` with the ICD and checks
+  it arrived byte for byte.
+- `wc-session` adds `LD_PRELOAD=<base>/bin/libsv_wlshim.so` to the GPU
+  environment of an application that gets the GPU, when the file is there.
+  `ini` and `gpu.env` are unchanged.
+- `sv-firefox-wayland.sh` preloads it unless `SVWL_SHIM=0`, and its
+  per-minute sample says whether Firefox has it mapped (`shim-mappings=`).
+
+### 100.5 The crash, locally
+
+The recipe of 98.2 (two windows, the looping 720p clip, 120 s, quit from the
+last window), with the crash reporter on and core dumps off. A run counts if
+Firefox stayed on hardware WebRender. The harness's 64 MiB arena still runs out
+in some runs (§95.4), and those fall back to software.
+
+| build | runs (that count) | crashed at quit | frames the guard dropped |
+|---|---|---|---|
+| shim, and a 30 ms sleep before each frame is shown (a temporary build) | 8 (7) | **0** | 4–7 per run, all at the quit |
+| shim | 10 (7) | **0** | (not logged) |
+| for comparison, 98.6: unguarded pipelined, the same sleep | 4 (4) | **4** | |
+
+In the delayed runs the dropped frames came in the last second of each run, a
+slot at generation 0 and then a slot at generation 1. That is one surface
+destroyed outright, and one unmapped (`attach(NULL)`) and then destroyed:
+Firefox closing its two windows.
+
+### 100.6 The video frames
+
+**Locally**, alternating synchronous (`SVWL_SHIM=0`) and shim, 120 s each, a
+256 MiB arena so none fell back: synchronous 109, 17 and 13 of about 3600 frames
+dropped (1.28% in all); shim 32, 8 and 29 (0.64%). The workstation's GPU is too
+fast for this to be more than a direction.
+
+**On the guest**, `wcgpu` with the arena agent's 4-minute two-window run
+(`gad-out/ab-run.sh`, as in §99.9). Both arms had the same `libsv_icd.so`,
+`sv-hostd`, `wc-proxy` and `wc-session`; only the shim file was there or not:
+
+| run | arm | frames after the first sample | dropped |
+|---|---|---|---|
+| S1 | synchronous | 5980 | 0.54% |
+| A1 | shim | 1077 (cut short) | 3.90% |
+| S2 | synchronous | 5972 | 0.28% |
+| A2 | shim | 6089 | 0.31% |
+
+Two things make this block inconclusive. The synchronous arm was not regressed
+that day at all: 0.28–0.54%, against §99.9's 3.9% for the same present. And the
+runs were disturbed. A1, and in a second block A3 (shim) and S3 (synchronous,
+26% dropped), lost Firefox's windows a minute in: `no such window` from
+Marionette, then a clean quit (`Stopped listening`). There was no minidump, no
+core and no lost device, and the synchronous arm was hit as well. Our own stack was checked and ruled out:
+
+- **Not a timeout.** The windows went at 54 s (A3), 77 s (A1) and 182 s (S3).
+- **Not the soak driver.** It closes the windows only at the end of its 240 s,
+  and its fatal line was Marionette closing the connection.
+- **Not the compositor on its own.** Its only `xdg_toplevel.close` comes from
+  `FromUi::CloseRequested`, which only the window's `WM_CLOSE` sends
+  (`platform/win32.rs`). The session's 60 s exit-when-empty ends a session
+  after its last window closes; it does not close one.
+- **No automation on the guest.** No agent, `wc-desk` or script was running,
+  and the scheduled tasks were idle.
+- **Not the shim.** S3 had no shim, and nothing was killed, faulted or logged a
+  lost device.
+
+What is left is a `WM_CLOSE` from Windows itself, or Firefox's own close
+button. Either is a person at the desktop, and the 26% drop rate of S3 says the
+guest was busy. The block was stopped and `wcgpu` restored byte for byte.
+**To repeat on a free desktop.**
+
+### 100.7 What is deployed
+
+Nothing yet: `wcivs` keeps §95's third deploy until the guest A/B is done.
+
+### 100.8 Unit tests
+
+`wsi::tests`: `an_unguarded_wayland_present_is_finished_before_vk_queue_present_returns`
+(§98's test, renamed), `a_guarded_wayland_swapchain_gets_its_presenter_back`,
+and the X11, headless and `SV_PRESENT_SYNC` cases for both. The shim itself is
+tested by the runs above: it forwards every Wayland request Firefox, GTK and
+Mesa make, so a fault in it is a Firefox that does not start.
+
+
+### 100.9 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 102 binaries, 2989 passed, 0 failed, 8 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in `present.rs`, `wsi.rs` or `build.rs` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 (no shim for a Windows target) |
+| the shim | `-Wall -Wextra -Werror`; exports the five libwayland entry points and five `svwl_shim_v1_*`; no `DT_NEEDED` on libwayland |
+| `scripts/wc-xref.sh --list` | 1294 resolve to one section, 0 missing |
+| the recipe, locally | 18 runs with the shim, 0 crashes (100.5) |
+| the guest | **open** (100.6) |
