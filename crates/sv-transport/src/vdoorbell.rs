@@ -533,12 +533,12 @@ pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
 /// slice; a blocked writer costs the application every call it is making. So
 /// a write is queued (at most [`DetachedWriter::QUEUE`] at once) and a full
 /// queue is `WouldBlock`, which [`PortWake::poke`] counts as dropped.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct DetachedWriter {
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl DetachedWriter {
     /// Bytes in flight before a write is refused.
     pub const QUEUE: usize = 256;
@@ -557,7 +557,7 @@ impl DetachedWriter {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Write for DetachedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.tx.try_send(buf.to_vec()) {
@@ -640,7 +640,12 @@ impl PortHandle {
             // writer thread. `ReadFile` and `WriteFile` on one handle from two
             // threads are independent operations on a byte-mode device.
             #[cfg(windows)]
-            PortHandle::Pipe(p) => (Box::new(SharedPipe(p.clone())), Box::new(SharedPipe(p))),
+            // The writer is detached for the reason the host's is (§97.10, and
+            // §99.5 on the guest): a port write that does not complete must
+            // never stop a ring thread, and with it every session this process
+            // serves. A session killed mid-run stopped the guest's GPU process
+            // for every other session exactly so.
+            PortHandle::Pipe(p) => (Box::new(SharedPipe(p.clone())), Box::new(DetachedWriter::spawn(SharedPipe(p))?)),
         })
     }
 }
@@ -680,8 +685,6 @@ mod tests {
     use crate::region::SharedRegion;
     use crate::ring::Lane;
     use std::time::{Duration, Instant};
-
-    /// §97.10: a hub that never reads must not stop the application. The
 
     /// §99: a hub restart is invisible to a client but for the bells in the
     /// gap. The hub's socket closes and comes back on the same path; the
@@ -734,6 +737,45 @@ mod tests {
         assert!(target.0.load(Ordering::Relaxed) > 0, "the new hub's byte rang nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// §99.5: the guest's case. A port write that never returns (the host end
+    /// stopped draining a virtio-serial port) must not hold any poker: every
+    /// session's ring threads poke through this one writer.
+    #[test]
+    fn a_port_write_that_never_returns_blocks_no_poker() {
+        struct Stuck;
+        impl std::io::Write for Stuck {
+            fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
+                loop {
+                    std::thread::park();
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let wake = Arc::new(PortWake::new(DetachedWriter::spawn(Stuck).unwrap()));
+        let t = Instant::now();
+        let pokers: Vec<_> = (0..8)
+            .map(|_| {
+                let w = Arc::clone(&wake);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        w.poke(1);
+                    }
+                })
+            })
+            .collect();
+        for p in pokers {
+            p.join().unwrap();
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "pokers blocked: {:?}", t.elapsed());
+        let (poked, dropped) = wake.stats();
+        assert_eq!(poked + dropped, 80_000);
+        assert!(dropped > 0);
+    }
+
+    /// §97.10: a hub that never reads must not stop the application. The
     /// socket fills, the queue fills, and every poke after that returns at
     /// once as dropped; the first ones still arrive.
     #[cfg(unix)]

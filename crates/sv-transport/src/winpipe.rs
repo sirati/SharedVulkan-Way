@@ -93,10 +93,13 @@ mod sys {
         pub fn GetLastError() -> u32;
         pub fn CreateEventW(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> isize;
         pub fn GetOverlappedResult(h: isize, ov: *mut Overlapped, done: *mut u32, wait: i32) -> i32;
+        pub fn GetOverlappedResultEx(h: isize, ov: *mut Overlapped, done: *mut u32, ms: u32, alertable: i32) -> i32;
+        pub fn CancelIoEx(h: isize, ov: *mut Overlapped) -> i32;
     }
 
     pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     pub const ERROR_IO_PENDING: u32 = 997;
+    pub const WAIT_TIMEOUT: u32 = 258;
 
     /// `OVERLAPPED`, x64: two `ULONG_PTR`s, the offset pair, the event.
     #[repr(C)]
@@ -120,6 +123,10 @@ mod sys {
 /// exactly so: the first reply's bell blocked the ring thread behind the
 /// reader, and no command after it was served. Opened overlapped, each call
 /// carries its own `OVERLAPPED` and the two directions are independent.
+/// The longest an overlapped write waits before it is cancelled (§99.5).
+#[cfg(windows)]
+const WRITE_TIMEOUT_MS: u32 = 500;
+
 #[cfg(windows)]
 fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
     // SAFETY: a fresh manual-reset event, closed below on every path.
@@ -155,10 +162,22 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
             Err(e)
         } else {
             let mut n = 0u32;
-            if unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 1) } != 0 {
+            // A write waits at most WRITE_TIMEOUT_MS (§99.5): a port whose host
+            // end stopped draining must not hold even the writer thread for
+            // ever. It is cancelled and then waited for, because the
+            // OVERLAPPED and the buffer must outlive the request.
+            let ms = if write { WRITE_TIMEOUT_MS } else { u32::MAX };
+            if unsafe { sys::GetOverlappedResultEx(handle, &mut ov, &mut n, ms, 0) } != 0 {
                 Ok(n)
             } else {
-                Err(unsafe { sys::GetLastError() })
+                let e = unsafe { sys::GetLastError() };
+                if write && e == sys::WAIT_TIMEOUT {
+                    unsafe { sys::CancelIoEx(handle, &mut ov) };
+                    let _ = unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 1) };
+                    Err(sys::WAIT_TIMEOUT)
+                } else {
+                    Err(e)
+                }
             }
         }
     };
