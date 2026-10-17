@@ -31459,7 +31459,24 @@ guest was busy. The block was stopped and `wcgpu` restored byte for byte.
 
 ### 100.7 What is deployed
 
-Nothing yet: `wcivs` keeps §95's third deploy until the guest A/B is done.
+`wcivs`, 2026-10-17 14:05, from present-async 0904839, with no wcivs session
+running (no `wc-launch-*` unit on the host, no `wcivs` process on the guest).
+The deploy opens no window and sends no input, so it ran under the lease
+without the idle wait (§101). Backed up first to `C:\Users\<guest-user>\wcivs-backup-101`
+and `~/wc-launch-ivs-backup-101`; `wc-launch.sh deploy` with §95's variables
+and `WC_LAUNCH_GPU_ENV=print`: **18 passed, 0 failed** (`docs/present-async/deploy-101.txt`),
+including "libsv_wlshim.so on the far side is byte-identical".
+
+- Changed against the backup: `sv-guest.exe` on the guest; `libsv_icd.so`,
+  `sv-hostd`, `wc-arena-host`, `wc-proxy` and `wc-session` on the host.
+- New: `bin/libsv_wlshim.so`, which `wc-session` now preloads into the session's
+  GPU applications.
+- Unchanged byte for byte: the ini (`78162dee…`), `gpu.env` (`0641239f…`) and
+  `apps.ini` (`c88050e1…`).
+- The doorbell hub was not restarted (active since 11:18, 0 restarts).
+
+**Way back:** copy the two `-backup-101` directories over `wcivs` and
+`~/wc-launch-ivs`, with no session up.
 
 ### 100.8 Unit tests
 
@@ -31530,3 +31547,12 @@ hardware.
   used it aborts the run, ends its session, and repeats it after two idle
   minutes. The soak drives Firefox through Marionette, which is not OS input,
   so activity during a run is the user's.
+
+**First use**, 2026-10-17. The block S5, A5, S6, A6 of 100.6 started S5 twice
+on a desktop idle for 124 s (13:50:08, 14:02:05). Both tries were aborted
+2:23 and 2:30 into the run, on real input. The second time it was keyboard
+input from 14:04:27 to 14:04:51, which went on after the run's session had
+ended. No QMP injection was logged. Both times it came about two minutes after
+the run's Firefox windows appeared on the desktop, so the person at it reacts
+to them. The block was stopped rather than repeated every few minutes, and
+`wcgpu` restored.
