@@ -31097,3 +31097,69 @@ confirmation is the multi-app run again.
 
 Not fixed: a process with a pending virtio-serial request still takes up to
 the I/O-cancel timeout to exit, and holds the GPU device until then.
+
+### 99.6 The confirmation, a port the driver leaked, and a hub that never closes QEMU's connection
+
+**The kill, again** (2026-10-17, 08:09–08:20, `wcmc` and `wcivs` on master
+`558b2bd`). Firefox (two windows, one playing the clip) and stock Minecraft
+ran together. The hub was restarted at 08:11:19, and both GPU doorbells and
+the proxy's Wayland doorbell reconnected. Minecraft was killed with SIGKILL
+at 08:11:35. The guest ended its session within about 5 to 8 seconds
+("27 lease(s) and the control region given back"), and Firefox ran the full
+10 minutes: 110 page loads, WebRender in all of them, 0 errors, a clean quit.
+
+**The stale session.** A `wcgpu` session's guest side was killed, and its
+host units and Firefox were left running with their hub connections. A new
+`wcmc` session started beside it in 10 s, attached to the hub, and ran 21
+page loads with 0 errors. The same hub process held both QEMU ports
+throughout.
+
+**But that run had no GPU doorbell on the guest.** The GPU process logged
+"no doorbell on org.sirati.svbell.0 (… access denied … or another process
+holds it)". At 08:08 `wc-port-access`, running as SYSTEM, opened `wcbell`
+and got error 5 on `svbell`. Vioser ports are exclusive, so that means held,
+and no process of ours existed. Since 99.5's process finished exiting on
+`IO_DRIVER_CANCEL_TIMEOUT`, the port has stayed open with nobody behind it:
+the driver leaked the open it failed to cancel. QEMU's `svbell` socket held
+543 host-to-guest bytes with nobody to read them, for as long as it was
+watched. So the run proved that a kill no longer stops other sessions, but
+not yet the detached writer under a kill. Without the doorbell, the clip
+dropped 43% of its frames, against 0.34% with it (97.10).
+
+`pnputil /disable-device` on that port answered "the system must be
+restarted" (3010) and left the device marked disabled for the next boot
+(`ConfigFlags` 0x1), with the enable refused until then. No reboot was made.
+The boot task now defuses that (`wc-port-access.ps1`, `6ccd1b2`):
+
+* every run records our ports by name in `ports.json`, since a port's name
+  exists only while it is started;
+* the SYSTEM boot task re-enables a recorded port that is disabled, with
+  `pnputil /enable-device`, before it applies the ACLs, and logs to
+  `wc-port-access.log`. Run once as at boot, it found `svbell` disabled and
+  was refused only because the restart is still pending;
+* the boot task had applied nothing since §91. Through `powershell -File`,
+  `-Ports a,b` is one string, so it looked for a port named "a,b". The
+  script now splits it.
+
+**What started 99.5's stall is still not proven.** The best-supported
+reading: the hub's restart, 13 s before the kill, closed and reopened
+QEMU's chardev connection, and after that the Windows port stopped
+completing the GPU process's writes. It is the same driver that then could
+not complete the cancel. Rather than wait for proof, the hub no longer
+closes that connection.
+
+**QEMU's connections in systemd's store.** `wc-bell-hub.service` is
+`Type=notify` with `FileDescriptorStoreMax=8` and
+`FileDescriptorStorePreserve=yes`. The hub gives systemd a copy of each
+upstream connection (`FDSTORE=1`, `FDNAME=svbell-up`) and each listening
+socket (`svbell-listen`), replacing an entry when it reconnects and removing
+it when QEMU closes. A restarted hub takes them back (`LISTEN_FDS`,
+`LISTEN_FDNAMES`, `sdfd::take`). systemd holds a copy while the old process
+exits, so QEMU never sees a disconnect, and clients reconnect to the same
+listening socket at once. Measured on this workstation under systemd 261,
+with a stand-in for QEMU that logs every connection: two restarts of the
+service, **one connection, never closed**, bytes from the hub to QEMU until
+the end, and two descriptors in the store throughout.
+
+The first restart that installs this unit still closes the connection once,
+because the old process has nothing stored.
