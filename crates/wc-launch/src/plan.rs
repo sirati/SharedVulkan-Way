@@ -85,6 +85,11 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     if !cfg.wayland_bell.is_empty() {
         a.extend(["--wayland-rings".into(), cfg.wayland_bell.clone()]);
     }
+    // §102. Only when asked: without it the compositor's globals are exactly
+    // the ones every earlier session was measured with.
+    if cfg.nested_globals {
+        a.push("--nested-compositor-globals".into());
+    }
     a
 }
 
@@ -604,6 +609,17 @@ mod tests {
         // The tunnel is unchanged by it: the feeds, a fallback, the GPU's cold
         // path and the sound still need it.
         assert_eq!(tunnel_argv(&c, "kh", "wcl-1"), tunnel_argv(&cfg(), "kh", "wcl-1"));
+    }
+
+    /// §102. `nested-compositor-globals = on` is the one way the flag reaches
+    /// the compositor; the default argv does not carry it.
+    #[test]
+    fn the_nested_compositor_globals_are_passed_only_when_configured() {
+        let mut c = cfg();
+        let flag = "--nested-compositor-globals";
+        assert!(!compositor_argv(&c, "s", "l").iter().any(|a| a == flag));
+        c.nested_globals = true;
+        assert!(compositor_argv(&c, "s", "l").iter().any(|a| a == flag));
     }
 
     #[test]

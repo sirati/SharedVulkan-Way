@@ -509,6 +509,9 @@ gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
 # §89: the Wayland rings' doorbell port; empty sends the Wayland connections
 # through the ssh tunnel, as a VM without the port does (loudly, either way).
 wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
+# §102: WC_LAUNCH_NESTED_GLOBALS=1 offers wp_single_pixel_buffer_manager_v1,
+# wp_viewporter and wp_presentation, which a nested compositor (KWin) needs.
+nested-compositor-globals = $([ "${WC_LAUNCH_NESTED_GLOBALS:-0}" = 1 ] && echo on || echo off)
 
 [app.firefox]
 title = $TITLE

@@ -207,6 +207,21 @@ impl Spec {
         // walkable or the first `lock_pointer` kills the connection.
         spec.load(include_str!("../protocols/pointer-constraints-unstable-v1.xml"))?;
         spec.load(include_str!("../protocols/relative-pointer-unstable-v1.xml"))?;
+        // §102: what a nested compositor needs from its host — KWin's Wayland
+        // backend will not start without all three. The compositor offers them
+        // only with `--nested-compositor-globals`, but a table that knows an
+        // interface nobody binds costs nothing, and one that does not know an
+        // interface somebody binds ends the connection (stage 21's lesson,
+        // above). Copied from nixpkgs' `wayland-protocols` 1.49; every
+        // interface, message and argument is the same as in the
+        // `wayland-protocols` 0.32.12 crate the compositor's smithay is
+        // generated from (compared when they were vendored). None carries an
+        // `h`. `single-pixel-buffer-v1` makes a `wl_buffer` with no pool, which
+        // `Session::foreign_buffers` is for; `presentation-time`'s two clock
+        // readings are rewritten on the way past (`Session::server_message`).
+        spec.load(include_str!("../protocols/viewporter.xml"))?;
+        spec.load(include_str!("../protocols/single-pixel-buffer-v1.xml"))?;
+        spec.load(include_str!("../protocols/presentation-time.xml"))?;
         Ok(spec)
     }
 
@@ -356,7 +371,9 @@ mod tests {
         // shape and takes it to 42.
         // §96 adds pointer-constraints (three interfaces: the manager, the
         // locked and the confined pointer) and relative-pointer (two): 47.
-        assert_eq!(s.len(), 47, "interfaces: {:?}", s.names());
+        // §102 adds viewporter (two), single-pixel-buffer (one) and
+        // presentation-time (two): 52.
+        assert_eq!(s.len(), 52, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,

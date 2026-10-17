@@ -402,6 +402,9 @@ impl Surface {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     pub commits: u64,
+    /// §102. Commits of a surface showing a buffer with no pool (a
+    /// single-pixel buffer): forwarded, nothing copied.
+    pub foreign_commits: u64,
     /// Commits that actually moved pixels. A commit with no buffer attached is
     /// legal and common.
     pub copies: u64,
@@ -865,6 +868,13 @@ pub struct Session {
     /// requires and which `weston-presentation-shm` depends on.
     pools: HashMap<u32, Pool>,
     buffers: HashMap<u32, BufferInfo>,
+    /// §102. `wl_buffer`s that were not cut from a pool — today only
+    /// `wp_single_pixel_buffer_manager_v1.create_u32_rgba_buffer`'s, which is
+    /// how a nested KWin paints its window's background. They hold no bytes on
+    /// this side, so there is nothing to copy, publish or reclaim: they are
+    /// upstream from the moment they are created and stay so until destroyed,
+    /// and every message naming them is forwarded as it came.
+    foreign_buffers: std::collections::HashSet<u32>,
     surfaces: HashMap<u32, Surface>,
     pub stats: Stats,
     /// Log every message as it is walked. Off by default because it is one line
@@ -1023,6 +1033,7 @@ impl Session {
             pools: HashMap::new(),
 
             buffers: HashMap::new(),
+            foreign_buffers: std::collections::HashSet::new(),
             surfaces: HashMap::new(),
             stats: Stats::default(),
             trace: false,
@@ -1176,6 +1187,21 @@ impl Session {
         }
 
         self.record_new_ids(body, &spans, &msg.args);
+        // §102. A `wl_buffer` made by anything but a pool has no bytes here
+        // (see `foreign_buffers`). Decided by the argument's interface rather
+        // than by the one factory that exists today, so that the next one —
+        // `linux-dmabuf`'s `create_immed`, say — is not silently held back by
+        // the attach rule below.
+        if interface != "wl_shm_pool" {
+            for (span, arg) in spans.iter().zip(&msg.args) {
+                if arg.kind == ArgKind::NewId
+                    && arg.interface.as_deref() == Some("wl_buffer")
+                    && let Some(id) = wire::word_at(body, span)
+                {
+                    self.foreign_buffers.insert(id);
+                }
+            }
+        }
         if sv_transport::frametrace::enabled() {
             trace_request(&interface, &msg.name, header.object, body, &spans);
         }
@@ -1301,6 +1327,7 @@ impl Session {
                     held: false,
                 };
                 let id = wire::word_at(body, &spans[0]).unwrap_or(0);
+                self.foreign_buffers.remove(&id);
                 self.buffers.insert(id, b);
                 self.forget_buffer_arrears(id);
                 if let Some(pool) = self.pools.get_mut(&header.object) {
@@ -1361,6 +1388,7 @@ impl Session {
                 self.release_pool_if_done(header.object);
             }
             ("wl_buffer", op::BUFFER_DESTROY) => {
+                self.foreign_buffers.remove(&header.object);
                 if let Some(b) = self.buffers.remove(&header.object) {
                     if let Some(pool) = self.pools.get_mut(&b.pool) {
                         pool.buffers = pool.buffers.saturating_sub(1);
@@ -2360,6 +2388,34 @@ impl Session {
             }
         }
 
+        // §102. **The presentation clock does not cross machines** (§88's
+        // finding for the frame clock, and the same reason). The compositor's
+        // `presented` timestamp is a reading of the *guest's* clock — Windows'
+        // performance counter, epoch the guest's boot — and a client compares
+        // it with its own `CLOCK_MONOTONIC`: KWin subtracts the time its frame
+        // callback arrived to size its render loop's safety margin, and a
+        // timestamp from another machine's clock makes that margin anything
+        // from hours to negative. So the proxy says what is true on this side:
+        // the frame was shown no later than now, on this machine's monotonic
+        // clock, and `clock_id` names that clock. The delay from the guest's
+        // tick to this moment is one crossing, which is what a presentation
+        // timestamp read off another machine would be wrong by at best anyway.
+        // `refresh`, `seq` and `flags` are the compositor's and pass through.
+        let mut rewritten: Option<Vec<u8>> = None;
+        if interface == "wp_presentation" && msg.name == "clock_id" && body.len() >= 4 {
+            let mut b = body.to_vec();
+            b[0..4].copy_from_slice(&(libc::CLOCK_MONOTONIC as u32).to_ne_bytes());
+            rewritten = Some(b);
+        }
+        if interface == "wp_presentation_feedback" && msg.name == "presented" && body.len() >= 12 {
+            let (secs, nanos) = monotonic_now();
+            let mut b = body.to_vec();
+            b[0..4].copy_from_slice(&((secs >> 32) as u32).to_ne_bytes());
+            b[4..8].copy_from_slice(&(secs as u32).to_ne_bytes());
+            b[8..12].copy_from_slice(&nanos.to_ne_bytes());
+            rewritten = Some(b);
+        }
+
         // STAGE 16. The compositor has released a buffer, which is its own word
         // for "I am no longer reading those bytes" and is the reclaimer's
         // interlock. Forwarded unchanged — the client needs it far more than
@@ -2448,7 +2504,9 @@ impl Session {
             }
         }
 
-        let out_body = if msg.has_fd() {
+        let out_body = if let Some(b) = rewritten {
+            b
+        } else if msg.has_fd() {
             wire::splice_fds(body, &spans, FdEncoding::InBand, &[])
         } else {
             body.to_vec()
@@ -2479,6 +2537,9 @@ impl Session {
     /// acknowledgement came from the compositor or was invented by
     /// [`Session::fabricate_delete_id`].
     fn forget_stale_buffer(&mut self, id: u32, iface: &str) {
+        if iface != "wl_buffer" {
+            self.foreign_buffers.remove(&id);
+        }
         if iface != "wl_buffer"
             && let Some(stale) = self.buffers.remove(&id)
             && let Some(pool) = self.pools.get_mut(&stale.pool)
@@ -2538,7 +2599,8 @@ impl Session {
     /// for one the reclaimer destroyed. Both mean the same thing to every
     /// caller: a message naming it must not be forwarded.
     fn buffer_is_upstream(&self, buffer: u32) -> bool {
-        self.buffers.get(&buffer).is_some_and(|b| b.upstream)
+        // §102: a buffer with no pool is always the compositor's.
+        self.foreign_buffers.contains(&buffer) || self.buffers.get(&buffer).is_some_and(|b| b.upstream)
     }
 
     /// Finish with a pool whose destructor was absorbed.
@@ -2751,6 +2813,14 @@ impl Session {
             self.stats.verify_unreached += 1;
             return;
         };
+        // §102. Nothing to copy for a buffer with no pool, ever; its damage is
+        // the compositor's to read from the forwarded requests, and is dropped
+        // here so it does not pile up across a run of KWin's commits.
+        if self.foreign_buffers.contains(&buffer_id) {
+            surface.damage.clear();
+            self.stats.foreign_commits += 1;
+            return;
+        }
         let Some(info) = self.buffers.get(&buffer_id).cloned() else {
             self.stats.verify_unreached += 1;
             return;
@@ -2960,6 +3030,15 @@ impl Session {
 
 /// `WC_FRAME_TRACE` (docs/waycompose-design.md §88): the requests a frame's
 /// pacing is made of, as they pass on the way to the compositor.
+/// §102. `CLOCK_MONOTONIC` now, as whole seconds and nanoseconds — the shape
+/// of `wp_presentation_feedback.presented`'s timestamp.
+fn monotonic_now() -> (u64, u32) {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock id and a writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)
+}
+
 fn trace_request(interface: &str, name: &str, object: u32, body: &[u8], spans: &[wire::Span]) {
     use sv_transport::frametrace as ft;
     match (interface, name) {

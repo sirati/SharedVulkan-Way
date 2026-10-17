@@ -136,9 +136,17 @@ use crate::platform::{
     CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
 };
 use crate::surface::{
-    bars, decorator, fold_caption, Agreed, Bars, Decorator, PixelError, PixelFormat, PixelSource,
-    Rect, Shadow, ShmSource,
+    bars, decorator, fold_caption, view_of, Agreed, Bars, Decorator, PixelError, PixelFormat,
+    PixelSource, Rect, Shadow, ShmSource, SinglePixelSource, View,
 };
+// §102: the three globals a nested compositor needs from its host.
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind as PresentedKind;
+use smithay::wayland::presentation::{
+    PresentationFeedbackCachedState, PresentationFeedbackCallback, PresentationState, Refresh,
+};
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::{ensure_viewport_valid, ViewportCachedState, ViewporterState};
+use smithay::{delegate_presentation, delegate_single_pixel_buffer, delegate_viewporter};
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
@@ -283,6 +291,22 @@ impl Role {
 }
 
 /// One toplevel or popup, from the Wayland side.
+/// §102. A viewported surface's buffer and the view it was last drawn through;
+/// see `State::viewed`.
+struct Viewed {
+    raw: Shadow,
+    view: View,
+}
+
+/// §102. The globals `--nested-compositor-globals` adds. Held so they live as
+/// long as the compositor; nothing reads them, because smithay's dispatch is
+/// on the types.
+struct NestedGlobals {
+    _viewporter: ViewporterState,
+    _single_pixel: SinglePixelBufferState,
+    _presentation: PresentationState,
+}
+
 struct Window {
     id: WindowId,
     role: Role,
@@ -523,6 +547,18 @@ pub struct State {
     /// `surface.rs`) while still being able to redraw a subsurface that has not
     /// committed this frame.
     staging: HashMap<WlSurface, Shadow>,
+    /// §102: the buffer behind every surface whose viewport makes its picture
+    /// something other than the buffer itself, at the buffer's own size.
+    ///
+    /// For those surfaces `staging` holds the picture at the **surface's** size
+    /// (the viewport's destination), because every reader of `staging` — the
+    /// tree's bounds, the window's size, the hit test, `mapped_windows` —
+    /// wants the surface's size and must not have to know about viewports. The
+    /// buffer is kept beside it so that a commit which changes only the
+    /// viewport (KWin's, when its window is resized: a new destination and no
+    /// new buffer) can redraw the picture, and so that damage can stay
+    /// incremental.
+    viewed: HashMap<WlSurface, Viewed>,
     windows: HashMap<WlSurface, Window>,
     /// Every surface that has created a decoration object, on either protocol.
     ///
@@ -546,6 +582,22 @@ pub struct State {
     /// Callbacks of surfaces that are not windows — subsurfaces and cursors —
     /// waiting for the next tick, with the surface they were asked on.
     pending_callbacks: Vec<(WlCallback, u32)>,
+    /// §102: `wp_presentation_feedback`s whose commit has been applied, with
+    /// the surface they were asked on, waiting for the tick that answers them
+    /// — the same tick that answers frame callbacks, which is the moment this
+    /// compositor calls a frame shown (§88).
+    feedback: Vec<(PresentationFeedbackCallback, WlSurface)>,
+    /// §102: the frame clock's tick count, `presented`'s `seq`.
+    present_seq: u64,
+    /// §102: how many feedbacks were answered each way, for the log line at a
+    /// window's end — the number a nested KWin's frame rate is.
+    feedback_presented: u64,
+    feedback_discarded: u64,
+    feedback_superseded: u64,
+    /// §102: `Some` when `--nested-compositor-globals` was given, and then the
+    /// three globals exist. `None` is every session before §102, with exactly
+    /// the globals it had.
+    nested: Option<NestedGlobals>,
     /// Synthesise an icon at map time, so the platform's icon path is executed
     /// by something rather than merely compiled.
     debug_icon: bool,
@@ -731,6 +783,7 @@ impl State {
         layout: &str,
         output_size: (i32, i32),
         decorations: Decorations,
+        nested_globals: bool,
     ) -> Self {
         let mut seat_state = SeatState::new();
         // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
@@ -904,6 +957,24 @@ impl State {
         // looks like a rendering bug rather than a negotiation one.
         println!("wc-compositor: decorations: manager default is {decorations:?}");
 
+        // §102. A nested compositor's host must offer these three — KWin's
+        // Wayland backend exits at startup without any one of them — and no
+        // session before §102 offered them. They stay behind a flag because a
+        // global that is offered is used: GTK draws through `wp_viewporter`
+        // whenever it exists, and Firefox on that path has not been measured.
+        let nested = nested_globals.then(|| {
+            println!(
+                "wc-compositor: nested-compositor globals: wp_viewporter, \
+                 wp_single_pixel_buffer_manager_v1, wp_presentation (clock {})",
+                crate::tick::PRESENTATION_CLOCK_ID
+            );
+            NestedGlobals {
+                _viewporter: ViewporterState::new::<State>(dh),
+                _single_pixel: SinglePixelBufferState::new::<State>(dh),
+                _presentation: PresentationState::new::<State>(dh, crate::tick::PRESENTATION_CLOCK_ID),
+            }
+        });
+
         State {
             compositor: CompositorState::new::<State>(dh),
             shm: ShmState::new::<State>(dh, Vec::new()),
@@ -942,14 +1013,23 @@ impl State {
             seat,
             ui,
             events,
-            sources: vec![Box::new(ShmSource)],
+            // §102: a single-pixel buffer is "read" like any other, and only
+            // exists when the nested-compositor globals do.
+            sources: vec![Box::new(ShmSource), Box::new(SinglePixelSource)],
             staging: HashMap::new(),
+            viewed: HashMap::new(),
             windows: HashMap::new(),
             negotiated_decoration: HashMap::new(),
             next_id: 1,
             started: Instant::now(),
             frame_clock: crate::tick::FrameClock::new(),
             pending_callbacks: Vec::new(),
+            feedback: Vec::new(),
+            present_seq: 0,
+            feedback_presented: 0,
+            feedback_discarded: 0,
+            feedback_superseded: 0,
+            nested,
             debug_icon,
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
@@ -1018,6 +1098,8 @@ impl State {
         if !self.frame_clock.due(Instant::now()) {
             return;
         }
+        self.present_seq += 1;
+        self.answer_feedback();
         let now = self.now_ms();
         for (root, window) in self.windows.iter_mut() {
             if sv_transport::frametrace::enabled() && !window.frame_callbacks.is_empty() {
@@ -1050,6 +1132,47 @@ impl State {
             }
             for (cb, _) in self.pending_callbacks.drain(..) {
                 cb.done(now);
+            }
+        }
+    }
+
+    /// Answer every presentation feedback waiting for this tick.
+    ///
+    /// ADDED FOR §102. `presented` for a commit whose surface is part of a
+    /// window that is up — mapped and not minimised — and still has a picture;
+    /// `discarded` for anything else (a cursor, a surface of a window that is
+    /// not on screen, one destroyed since), which is the protocol's "the
+    /// content update was never displayed".
+    ///
+    /// **Shown means "on this tick", the same moment frame callbacks are
+    /// answered**, not "after the platform painted it". The paint is the UI
+    /// thread's and happens on `WM_PAINT`, which this thread cannot see; the
+    /// tick is the frame clock §88 put on DWM's vblank where there is one, and
+    /// it is what a client paced by frame callbacks already treats as the
+    /// display's rhythm. KWin's render loop advances on `presented` and with no
+    /// answer at all stalls after its first frame, so a timely approximation is
+    /// the thing that matters; across the proxy the timestamp is replaced by
+    /// the Linux host's own clock anyway (`wc-proxy`, §102).
+    ///
+    /// No flags: this compositor cannot say the frame was tied to a vblank or
+    /// timed by hardware, and zero is the protocol's way of not claiming it.
+    fn answer_feedback(&mut self) {
+        if self.feedback.is_empty() {
+            return;
+        }
+        let time = crate::tick::presentation_now();
+        let refresh = Refresh::fixed(self.frame_clock.period());
+        for (fb, surface) in std::mem::take(&mut self.feedback) {
+            let root = root_of(&surface);
+            let shown = surface.is_alive()
+                && self.staging.contains_key(&surface)
+                && self.windows.get(&root).is_some_and(|w| w.mapped && !w.minimized);
+            if shown {
+                fb.presented(&self.output, time, refresh, self.present_seq, PresentedKind::empty());
+                self.feedback_presented += 1;
+            } else {
+                fb.discarded();
+                self.feedback_discarded += 1;
             }
         }
     }
@@ -2623,8 +2746,115 @@ impl State {
         toplevel.send_pending_configure();
     }
 
+    /// §102: the committed viewport of `surface` — source rectangle and
+    /// destination size, either possibly unset — and its buffer scale.
+    ///
+    /// `None` without the nested-compositor globals, where no viewport can
+    /// exist, so that the cache is not even asked: a session without the flag
+    /// runs exactly the code it ran before §102.
+    #[allow(clippy::type_complexity)]
+    fn viewport_of(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(Option<(f64, f64, f64, f64)>, Option<(i32, i32)>, i32)> {
+        self.nested.as_ref()?;
+        Some(compositor::with_states(surface, |states| {
+            let vp = *states.cached_state.get::<ViewportCachedState>().current();
+            let scale = states.cached_state.get::<SurfaceAttributes>().current().buffer_scale;
+            (
+                vp.src.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
+                vp.dst.map(|d| (d.w, d.h)),
+                scale,
+            )
+        }))
+    }
+
+    /// §102: a commit with no new buffer may still have changed the viewport,
+    /// and then the surface's picture and size have changed.
+    ///
+    /// This is KWin's resize: the window is configured to a new size, KWin
+    /// sets its main surface's viewport destination to it and commits — and
+    /// the buffer, its one black pixel, was attached once at startup and is
+    /// never attached again, so the buffer path never sees the new size.
+    /// Measured under Wine: a 900x600 configure is answered with
+    /// `set_destination(900, 600)` on the main surface and new 900x600 layer
+    /// buffers, and the window's picture is 900x600 from the next frame.
+    ///
+    /// Redraws from the kept buffer (`State::viewed`), or from the surface's
+    /// own pixels when it is gaining a view now, and recomposes the window.
+    fn reapply_view(&mut self, surface: &WlSurface) {
+        let Some((src, dst, scale)) = self.viewport_of(surface) else { return };
+        let changed = if let Some(entry) = self.viewed.get(surface) {
+            match view_of((entry.raw.width(), entry.raw.height()), scale, src, dst) {
+                Some(view) if view == entry.view => false,
+                Some(view) => {
+                    let entry = self.viewed.get_mut(surface).expect("just read");
+                    entry.view = view;
+                    let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+                    staging.scale_from(&entry.raw, &view, None);
+                    true
+                }
+                None => {
+                    let entry = self.viewed.remove(surface).expect("just read");
+                    self.staging.insert(surface.clone(), entry.raw);
+                    true
+                }
+            }
+        } else {
+            let Some(shown) = self.staging.get(surface).filter(|s| !s.is_empty()) else { return };
+            match view_of((shown.width(), shown.height()), scale, src, dst) {
+                None => false,
+                Some(view) => {
+                    let raw = self.staging.remove(surface).expect("just read");
+                    let mut staging = Shadow::empty();
+                    staging.scale_from(&raw, &view, None);
+                    self.staging.insert(surface.clone(), staging);
+                    self.viewed.insert(surface.clone(), Viewed { raw, view });
+                    true
+                }
+            }
+        };
+        if !changed {
+            return;
+        }
+        let root = root_of(surface);
+        if !self.windows.get(&root).is_some_and(|w| w.mapped) {
+            return;
+        }
+        let (_, w, h) = self.compose_tree(&root, surface, &[]);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let window = &self.windows[&root];
+        let id = window.id;
+        // The window follows a client that is still choosing its size, as
+        // §91 and §96 have it on the other two paths; one that was configured
+        // to a size is catching up with it and is not followed.
+        let client_chooses = window.role.toplevel().is_some_and(|t| {
+            t.with_pending_state(|s| {
+                s.size.is_none()
+                    && !s.states.contains(xdg_state::Maximized)
+                    && !s.states.contains(xdg_state::Fullscreen)
+            })
+        });
+        if client_chooses && window.shown_size != (w, h) {
+            if let Some(window) = self.windows.get_mut(&root) {
+                window.shown_size = (w, h);
+            }
+            println!("wc-compositor: window {id} client chose {w}x{h} by its viewport; the window follows");
+            self.ui.send(ToUi::Resize { id, width: w, height: h });
+        }
+        self.ui.send(ToUi::Present { id, damage: vec![Rect::new(0, 0, w, h)] });
+    }
+
     /// Copy a committed buffer into the shadow and tell the platform.
-    fn present(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer, damage: Vec<Rect>) {
+    fn present(
+        &mut self,
+        surface: &WlSurface,
+        buffer: &wl_buffer::WlBuffer,
+        damage: Vec<Rect>,
+        surface_damage: bool,
+    ) {
         // REWRITTEN FOR STAGE 9. Until this stage a window's shadow *was* one
         // client buffer, and every surface that was not a toplevel had its
         // pixels thrown away. That is exactly wrong for the client this project
@@ -2640,7 +2870,11 @@ impl State {
         let is_root_of_a_window = self.windows.contains_key(&root);
 
         let read_started = Instant::now();
+        // §102: the viewport and buffer scale this commit applied, or `None`
+        // when the nested-compositor globals are off and no viewport can exist.
+        let viewport = self.viewport_of(surface);
         let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+        let viewed = &mut self.viewed;
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
         let mut served_by = "";
         // Ask each source in turn. Today there is one; the loop is what lets a
@@ -2648,7 +2882,42 @@ impl State {
         // without this function changing (docs/goal-firefox.md).
         for source in &self.sources {
             let read = source.with_pixels(buffer, &mut |bytes, spec| {
-                result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                let Some((src, dst, scale)) = viewport else {
+                    result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                    return;
+                };
+                // §102. `out_of_buffer` is checked against the buffer the
+                // commit carried, which only now has a size; smithay posts the
+                // error, and the client is gone once this dispatch ends.
+                let logical = (spec.width / scale.max(1), spec.height / scale.max(1));
+                if !compositor::with_states(surface, |st| ensure_viewport_valid(st, logical.into())) {
+                    return;
+                }
+                match view_of((spec.width, spec.height), scale, src, dst) {
+                    None => {
+                        // Leaving a view: the shadow holds the old view's
+                        // picture, so it is started again and the blit below
+                        // copies the whole buffer rather than its damage.
+                        if viewed.remove(surface).is_some() {
+                            *staging = Shadow::empty();
+                        }
+                        result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                    }
+                    Some(view) => {
+                        let entry = viewed
+                            .entry(surface.clone())
+                            .or_insert_with(|| Viewed { raw: Shadow::empty(), view });
+                        // Surface damage is in surface coordinates, which a
+                        // view makes different from the buffer's; rather than
+                        // invert the view, the whole buffer is taken.
+                        let whole = [Rect::new(0, 0, spec.width, spec.height)];
+                        let written = entry.raw.blit(bytes, spec, if surface_damage { &whole } else { &damage });
+                        let rects = (entry.view == view).then(|| view.map_damage(&written));
+                        entry.view = view;
+                        let drawn = staging.scale_from(&entry.raw, &view, rects.as_deref());
+                        result = Some((drawn, view.dst.0, view.dst.1));
+                    }
+                }
             });
             match read {
                 Ok(()) => {
@@ -2691,6 +2960,24 @@ impl State {
             // A subsurface of a window that has not mapped yet, or a cursor
             // surface for a seat that has since been given a different one.
             // The pixels are kept; there is nowhere to put them.
+            return;
+        }
+        // §102. **A subsurface does not map a window whose root has never had
+        // a buffer and which declared no geometry.** The protocol's own rule
+        // ("a sub-surface is mapped when the parent is mapped"), applied where
+        // it used to cost a visible jump: KWin's synchronised subsurfaces are
+        // applied in the same transaction as its main surface and reach this
+        // function first, so the window was mapped at the size of whatever
+        // layer came first — a 32x32 cursor-sized one at (636, 396) — shifted
+        // by that offset, and resized to the main surface's 1280x800 a moment
+        // later. The root's own commit is the next call. A declared geometry
+        // is left as it was: that is Firefox, whose subsurface-first map at
+        // its geometry §9 measured and every later section relies on.
+        if surface != &root
+            && !self.staging.contains_key(&root)
+            && !self.windows[&root].mapped
+            && declared_geometry(&root).is_none()
+        {
             return;
         }
 
@@ -3807,6 +4094,7 @@ impl CompositorHandler for State {
     /// `surface_under` after the surface itself was gone.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.staging.remove(surface);
+        self.viewed.remove(surface);
         let ended: Vec<i32> = self
             .touch_contacts
             .iter()
@@ -3868,6 +4156,28 @@ impl CompositorHandler for State {
                 ),
             );
         }
+        // §102. Presentation feedback rides the same commit, and is answered on
+        // the same tick (`State::answer_feedback`). A feedback still waiting
+        // from an earlier commit of this surface was superseded before any
+        // tick showed it, which the protocol calls discarded.
+        if self.nested.is_some() {
+            let asked = compositor::with_states(surface, |states| {
+                std::mem::take(
+                    &mut states.cached_state.get::<PresentationFeedbackCachedState>().current().callbacks,
+                )
+            });
+            if !asked.is_empty() {
+                let (superseded, kept): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut self.feedback).into_iter().partition(|(_, s)| s == surface);
+                self.feedback = kept;
+                for (fb, _) in superseded {
+                    fb.discarded();
+                    self.feedback_discarded += 1;
+                    self.feedback_superseded += 1;
+                }
+                self.feedback.extend(asked.into_iter().map(|fb| (fb, surface.clone())));
+            }
+        }
         if let Some(window) = self.windows.get_mut(surface) {
             window.frame_callbacks.extend(callbacks);
         } else {
@@ -3883,13 +4193,17 @@ impl CompositorHandler for State {
         // and buffer coordinates and the blit to rotate or subsample, which is
         // a renderer's job and not this stage's. Saying so out loud beats
         // silently drawing the wrong thing.
-        if scale != 1 || transform != wl_output::Transform::Normal {
+        // §102: with a viewport the scale *is* honoured (`surface::view_of`).
+        if (scale != 1 && !self.viewed.contains_key(surface)) || transform != wl_output::Transform::Normal {
             eprintln!(
                 "wc-compositor: buffer scale {scale} / transform {transform:?} is not implemented; \
                  drawing the buffer unscaled"
             );
         }
 
+        // §102. Whether any of it is in surface coordinates, which a viewport
+        // makes different from buffer coordinates (see `present`).
+        let surface_damage = damage.iter().any(|d| matches!(d, Damage::Surface(_)));
         let rects: Vec<Rect> = damage
             .into_iter()
             .map(|d| match d {
@@ -3923,7 +4237,7 @@ impl CompositorHandler for State {
                 if Self::is_cursor_surface(surface) {
                     self.cursor_committed(surface, &buffer);
                 }
-                self.present(surface, &buffer, rects)
+                self.present(surface, &buffer, rects, surface_damage)
             }
             Some(BufferAssignment::Removed) => {
                 // **The staging entry goes with the buffer, and until §40 it
@@ -3938,6 +4252,7 @@ impl CompositorHandler for State {
                 // it is the same leak `cursor_surface` above already guards
                 // against by hand.
                 self.staging.remove(surface);
+                self.viewed.remove(surface);
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
                     // exists, so the window is not destroyed — it has nothing
@@ -4012,6 +4327,7 @@ impl CompositorHandler for State {
             // path, where the tree is settled, and to §40's hit test, which
             // reads subsurface positions live and never caches them.
             None => {
+                self.reapply_view(surface);
                 let declared = declared_geometry(surface)
                     .filter(|r| r.size.w > 0 && r.size.h > 0);
                 if let (true, Some(r)) = (self.windows.contains_key(surface), declared) {
@@ -4596,6 +4912,13 @@ impl XdgShellHandler for State {
                 "wc-compositor: xdg_toplevel destroyed -> window {} ({} frames presented)",
                 window.id, window.presented
             );
+            if self.nested.is_some() {
+                println!(
+                    "wc-compositor: presentation feedback so far: {} presented, {} discarded \
+                     ({} superseded before a tick)",
+                    self.feedback_presented, self.feedback_discarded, self.feedback_superseded
+                );
+            }
             self.ui.send(ToUi::Destroy { id: window.id });
             // §96: if it held the pointer, the platform is told to let go.
             self.update_pointer_hold();
@@ -5788,6 +6111,10 @@ delegate_xdg_decoration!(State);
 delegate_kde_decoration!(State);
 // ADDED FOR STAGE 12. `wp_cursor_shape_manager_v1` and its per-pointer device.
 delegate_cursor_shape!(State);
+// §102. Dispatch only; the globals exist with `--nested-compositor-globals`.
+delegate_viewporter!(State);
+delegate_single_pixel_buffer!(State);
+delegate_presentation!(State);
 
 // ---------------------------------------------------------------------------
 // Tests
