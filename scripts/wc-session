@@ -588,6 +588,12 @@ start_app() {
       elif [ -S "$D/bell.sock" ]; then
         GPUENV+=("SV_BELL=$D/bell.sock")
       fi
+      # §100: the ICD's Wayland present finishes after vkQueuePresentKHR only
+      # with libsv_wlshim.so preloaded (it guards the application's surface);
+      # without it the ICD presents inside the call, correct but slower.
+      if [ -f "$BASE/bin/libsv_wlshim.so" ]; then
+        GPUENV+=("LD_PRELOAD=$BASE/bin/libsv_wlshim.so${LD_PRELOAD:+:$LD_PRELOAD}")
+      fi
       GPU_ON=1
     else
       echo "wc-session: NO GPU for $ID -- $BASE/gpu.env is set and this session has no GPU sessions ($D/icd.sock); Firefox renders in software" | tee -a "$D/app.log" >&2

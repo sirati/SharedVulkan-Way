@@ -107,13 +107,29 @@ impl Target {
     /// One frame. `pixels` is `width * height * 4` bytes read straight out of
     /// the arena; `swap_rb` says the application chose an `R8G8B8A8` format and
     /// the bytes are therefore RGBA rather than the BGRA both targets want.
-    pub fn present(&mut self, pixels: &[u8], width: u32, height: u32, swap_rb: bool) {
+    ///
+    /// `generation` is the Wayland surface's shim generation as it was inside the
+    /// `vkQueuePresentKHR` of this frame ([`Target::wl_slot`], §100), and
+    /// `None` for a frame shown inside that call.
+    pub fn present(&mut self, pixels: &[u8], width: u32, height: u32, swap_rb: bool, generation: Option<u32>) {
+        #[cfg(not(target_os = "linux"))]
+        let _ = generation;
         match self {
             Target::Headless(d) => d.write(pixels, width, height, swap_rb),
             #[cfg(unix)]
             Target::X11(w) => w.put(pixels, width, height, swap_rb),
             #[cfg(target_os = "linux")]
-            Target::Wayland(w) => w.put(pixels, width, height, swap_rb),
+            Target::Wayland(w) => w.put(pixels, width, height, swap_rb, generation),
+        }
+    }
+
+    /// A Wayland target's slot in `libsv_wlshim.so` (§100): `Some` means a
+    /// frame may be shown after `vkQueuePresentKHR` has returned.
+    pub fn wl_slot(&self) -> Option<i32> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Target::Wayland(w) => w.slot(),
+            _ => None,
         }
     }
 
@@ -1069,6 +1085,10 @@ pub mod wayland {
         width: u32,
         height: u32,
         next: usize,
+        /// This surface's slot in `libsv_wlshim.so`, when the application
+        /// was started with it (docs/waycompose-design.md §100). `Some` is
+        /// what makes a present after `vkQueuePresentKHR` safe.
+        slot: Option<i32>,
     }
 
     // SAFETY: every pointer is a libwayland object, and libwayland is
@@ -1302,13 +1322,25 @@ pub mod wayland {
                     width,
                     height,
                     next: 0,
+                    // Registered here, inside the application's
+                    // vkCreateSwapchainKHR, while the surface is known alive.
+                    slot: guard::track(surface),
                 })
             }
         }
 
+        /// This surface's slot in `libsv_wlshim.so`; `None` without it.
+        pub fn slot(&self) -> Option<i32> {
+            self.slot
+        }
+
         /// One frame: copy the arena bytes into a free buffer, attach, damage,
-        /// commit.
-        pub fn put(&mut self, src: &[u8], width: u32, height: u32, swap_rb: bool) {
+        /// commit. `generation` is [`Surface::generation`] as it was inside the
+        /// `vkQueuePresentKHR` that presented it: with the shim, the frame is
+        /// dropped if the application has destroyed or unmapped the surface
+        /// since, and its requests are made under the shim's lock, so the
+        /// application cannot destroy the surface in the middle of them.
+        pub fn put(&mut self, src: &[u8], width: u32, height: u32, swap_rb: bool, generation: Option<u32>) {
             // A resize between swapchain creation and this frame is the
             // application's to notice, and Mesa does — it rebuilds. Dropping
             // the frame is the only thing that is safe here, because the
@@ -1363,6 +1395,21 @@ pub mod wayland {
                 copied = traced.map(|_| std::time::Instant::now());
                 self.buffers[i].busy.store(true, Ordering::Release);
 
+                // From here to the commit, the requests go to the
+                // application's surface. With the shim, under its lock, and
+                // not at all if the surface died or was unmapped after the
+                // application presented this frame (§100).
+                let guarded = match (generation, self.slot) {
+                    (Some(g), Some(slot)) => {
+                        if !guard::begin(slot, g) {
+                            self.buffers[i].busy.store(false, Ordering::Release);
+                            return;
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+
                 let mut args = [arg_o(self.buffers[i].proxy), arg_i(0), arg_i(0)];
                 (l.proxy_marshal_array_flags)(
                     self.surface,
@@ -1401,6 +1448,9 @@ pub mod wayland {
                     0,
                     none.as_mut_ptr(),
                 );
+                if guarded {
+                    guard::end();
+                }
                 (l.display_flush)(self.display);
             }
             if let (Some(t0), Some(picked), Some(copied)) = (traced, picked, copied) {
@@ -1462,6 +1512,103 @@ pub mod wayland {
                 (l.display_flush)(self.display);
                 (l.event_queue_destroy)(self.queue);
                 libc::munmap(self.map as *mut c_void, self.map_len);
+            }
+            if let Some(slot) = self.slot {
+                guard::untrack(slot);
+            }
+        }
+    }
+
+    /// `libsv_wlshim.so`'s side of a present that finishes after
+    /// `vkQueuePresentKHR` (docs/waycompose-design.md §100), found in the
+    /// process with `dlsym(RTLD_DEFAULT)`. Absent, every function says so and
+    /// a Wayland swapchain presents inside the call, as §98 requires.
+    pub mod guard {
+        use std::ffi::c_void;
+        use std::sync::OnceLock;
+
+        struct Shim {
+            track: unsafe extern "C" fn(*mut c_void) -> i32,
+            untrack: unsafe extern "C" fn(i32),
+            generation: unsafe extern "C" fn(i32) -> u32,
+            begin: unsafe extern "C" fn(i32, u32) -> i32,
+            end: unsafe extern "C" fn(),
+        }
+
+        // The `sym!` transmutes name their target by the field they fill.
+        #[allow(clippy::missing_transmute_annotations)]
+        fn shim() -> Option<&'static Shim> {
+            static SHIM: OnceLock<Option<Shim>> = OnceLock::new();
+            SHIM.get_or_init(|| {
+                // SAFETY: `dlsym` with literal NUL-terminated names; each
+                // symbol, when present, is the shim's function of exactly
+                // this signature (crates/sv-icd/shim/sv_wlshim.c, version 1
+                // in the names).
+                unsafe {
+                    macro_rules! sym {
+                        ($n:literal) => {{
+                            let p = libc::dlsym(libc::RTLD_DEFAULT, concat!($n, "\0").as_ptr().cast());
+                            if p.is_null() {
+                                return None;
+                            }
+                            core::mem::transmute(p)
+                        }};
+                    }
+                    Some(Shim {
+                        track: sym!("svwl_shim_v1_track"),
+                        untrack: sym!("svwl_shim_v1_untrack"),
+                        generation: sym!("svwl_shim_v1_generation"),
+                        begin: sym!("svwl_shim_v1_begin"),
+                        end: sym!("svwl_shim_v1_end"),
+                    })
+                }
+            })
+            .as_ref()
+        }
+
+        /// Whether the application runs with the shim.
+        pub fn available() -> bool {
+            shim().is_some()
+        }
+
+        /// Register `surface`. `None` without the shim or a free slot.
+        ///
+        /// # Safety
+        ///
+        /// `surface` must be a live `wl_surface` proxy: call it inside the
+        /// application's Vulkan call. The shim stores the pointer and only
+        /// ever compares it.
+        pub unsafe fn track(surface: *mut c_void) -> Option<i32> {
+            let s = shim()?;
+            // SAFETY: as this function's contract.
+            let slot = unsafe { (s.track)(surface) };
+            (slot >= 0).then_some(slot)
+        }
+
+        pub fn untrack(slot: i32) {
+            if let Some(s) = shim() {
+                // SAFETY: a slot `track` returned.
+                unsafe { (s.untrack)(slot) }
+            }
+        }
+
+        /// The surface's generation now. Read inside `vkQueuePresentKHR`.
+        pub fn generation(slot: i32) -> u32 {
+            // SAFETY: a slot `track` returned.
+            shim().map_or(0, |s| unsafe { (s.generation)(slot) })
+        }
+
+        /// `true` with the shim's lock held: the surface is alive and not
+        /// unmapped since generation `generation`. Pair with [`end`].
+        pub fn begin(slot: i32, generation: u32) -> bool {
+            // SAFETY: a slot `track` returned.
+            shim().is_some_and(|s| unsafe { (s.begin)(slot, generation) } == 1)
+        }
+
+        pub fn end() {
+            if let Some(s) = shim() {
+                // SAFETY: only after a `begin` that returned `true`.
+                unsafe { (s.end)() }
             }
         }
     }

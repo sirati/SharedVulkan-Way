@@ -273,6 +273,13 @@ export MESA_LOADER_DRIVER_OVERRIDE=zink
 ${SVWL_GALLIUM:+export GALLIUM_DRIVER=$SVWL_GALLIUM}
 ${SVWL_FORCE_SW:+export LIBGL_ALWAYS_SOFTWARE=1}
 export VK_DRIVER_FILES="$BIN/sv_icd.json"
+# `libsv_wlshim.so` (waycompose-design.md §100): preloaded into Firefox, it lets
+# the ICD finish a Wayland present after vkQueuePresentKHR, safely. `SVWL_SHIM=0`
+# leaves it out, and the ICD presents inside the call (§98).
+SHIM_ENV=()
+if [ "${SVWL_SHIM:-1}" != 0 ] && [ -f "$BIN/libsv_wlshim.so" ]; then
+  SHIM_ENV=(LD_PRELOAD="$BIN/libsv_wlshim.so${LD_PRELOAD:+:$LD_PRELOAD}")
+fi
 export SV_SOCKET="$RUN/gpu.sock"
 
 if [ "$MODE" = probe ]; then
@@ -451,7 +458,7 @@ HTML
   # `MOZ_CRASHREPORTER_NO_DELETE_DUMP=1` in Firefox's own environment: without
   # it the crash reporter submits a crash's minidump and deletes it, and the
   # verdict's count of minidumps below says none (waycompose-design.md §98).
-  env HOME="$RUN/home" MOZ_CRASHREPORTER_NO_DELETE_DUMP=1 ${SVWL_EXTRA_ENV:-} \
+  env HOME="$RUN/home" MOZ_CRASHREPORTER_NO_DELETE_DUMP=1 "${SHIM_ENV[@]}" ${SVWL_EXTRA_ENV:-} \
     "$FIREFOX" --no-remote --marionette -remote-allow-system-access --profile "$RUN/profile" about:blank \
     >"$RUN/ff.log" 2>&1 &
   FF=$!
@@ -461,6 +468,7 @@ HTML
   # whether the parent process has our ICD mapped at that moment.
   ( while kill -0 $FF 2>/dev/null; do sleep 60; shot
       grep -c "libsv_icd.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s mappings=/" >>"$RUN/icd-mapped.txt"
+      grep -c "libsv_wlshim\.so" "/proc/$FF/maps" 2>/dev/null | sed "s/^/t=$(( $(date +%s) - STARTED ))s shim-mappings=/" >>"$RUN/shim-mapped.txt"
     done ) &
   KIDS+=($!)
   # `SVWL_STALL_MS=N`: stop the GPU side for N ms every `SVWL_STALL_EVERY`
@@ -582,7 +590,7 @@ HTML
 fi
 
 say "firefox ($MODE), $SECS s, about:support at devPixelsPerPx=$DPPX"
-env HOME="$RUN/home" ${SVWL_EXTRA_ENV:-} \
+env HOME="$RUN/home" "${SHIM_ENV[@]}" ${SVWL_EXTRA_ENV:-} \
   timeout "$SECS" "$FIREFOX" --no-remote --profile "$RUN/profile" about:support \
   >"$RUN/ff.log" 2>&1 &
 FF=$!

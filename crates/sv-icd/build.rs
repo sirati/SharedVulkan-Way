@@ -161,6 +161,34 @@ fn main() {
     // says nothing about the code — and because a failing test binary aborts
     // `cargo test --workspace`, it also truncated the reported test total to a
     // fraction of the real one. See `tests/loader.rs`.
+    // `libsv_wlshim.so` (docs/waycompose-design.md §100), the LD_PRELOAD that
+    // lets a Wayland present finish after vkQueuePresentKHR. C, because it
+    // must define libwayland's variadic entry points, which stable Rust
+    // cannot. Linux targets only; beside the ICD, where deploy and the
+    // harnesses look for it.
+    if target_os == "linux" {
+        println!("cargo:rerun-if-changed=shim/sv_wlshim.c");
+        // Not `CC`: the dev shell sets that to the mingw compiler, for the
+        // Windows binaries. This is built for the Linux machine running cargo.
+        println!("cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_gnu");
+        println!("cargo:rerun-if-env-changed=CC_FOR_BUILD");
+        let cc = std::env::var("CC_x86_64_unknown_linux_gnu")
+            .or_else(|_| std::env::var("CC_FOR_BUILD"))
+            .unwrap_or_else(|_| "gcc".into());
+        let shim = profile_dir.join("libsv_wlshim.so");
+        let status = std::process::Command::new(&cc)
+            .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-fvisibility=hidden", "-o"])
+            .arg(&shim)
+            .arg("shim/sv_wlshim.c")
+            .arg("-lpthread")
+            .status();
+        match status {
+            Ok(s) if s.success() => println!("cargo:rustc-env=SV_WLSHIM_PATH={}", shim.display()),
+            Ok(s) => panic!("sv-icd: building {} failed ({s})", shim.display()),
+            Err(e) => panic!("sv-icd: cannot run {cc} to build the Wayland shim: {e}"),
+        }
+    }
+
     println!("cargo:rustc-env=SV_ICD_LIBRARY_PATH={}", lib_path.display());
     println!(
         "cargo:rustc-env=SV_ICD_PROFILE={}",

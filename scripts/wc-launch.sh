@@ -657,11 +657,12 @@ APPS
     *) bad "$HOSTDIR/apps.ini does not check: $apps"; exit 1 ;;
   esac
   if [ "$GPU_SESSIONS" -gt 0 ]; then
-    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so" >/dev/null 2>&1
-    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
+    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so" >/dev/null 2>&1
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
       || { echo "error: scp of the GPU half to the VM host"; exit 1; }
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
+    deployed_is "$REL_LINUX/libsv_wlshim.so" "$HOSTDIR/bin/libsv_wlshim.so" h "re-run $0 deploy" || exit 1
     # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
     # installation: it, not a session, holds QEMU's two doorbell sockets.
     # Its own copy of sv-hostd, so that redeploying one installation never

@@ -131,6 +131,10 @@ pub struct Swapchain {
     target: std::sync::Arc<std::sync::Mutex<crate::present::Target>>,
     /// `None` presents on the calling thread (see [`queue_present`]).
     presenter: Option<Presenter>,
+    /// The Wayland surface's slot in `libsv_wlshim.so` (§100). Read inside
+    /// `vkQueuePresentKHR` for the frame's generation, so that call never
+    /// waits for the target's lock, which the presenter holds while it shows.
+    wl_slot: Option<i32>,
     /// What the surface was when this swapchain was created. Compared against
     /// the surface's size on every acquire, which is how the application is
     /// told to rebuild one (`VK_SUBOPTIMAL_KHR`).
@@ -299,17 +303,16 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
     }
 
     let id = IcdLocal::mint_id(icd);
+    let target = crate::present::Target::open(desc.target, desc.width, desc.height);
+    let wl_slot = target.wl_slot();
     icd.swapchains().insert(
         id,
         Swapchain {
             device,
             queue,
-            target: std::sync::Arc::new(std::sync::Mutex::new(crate::present::Target::open(
-                desc.target,
-                desc.width,
-                desc.height,
-            ))),
-            presenter: Presenter::start(icd, images.len(), &desc.target),
+            target: std::sync::Arc::new(std::sync::Mutex::new(target)),
+            presenter: Presenter::start(icd, images.len(), &desc.target, wl_slot.is_some()),
+            wl_slot,
             present_target: desc.target,
             width: desc.width,
             height: desc.height,
@@ -680,6 +683,9 @@ pub fn queue_present(
                 reset: None,
                 submitted: None,
                 app: None,
+                // Read here, inside the application's call, where the surface
+                // is alive and cannot be unmapped under us (§100).
+                generation: sc.wl_slot.map(wl_generation),
             },
             sc.presenter.as_ref().map(|p| (p.tx.clone(), std::sync::Arc::clone(&p.busy))),
         )
@@ -755,6 +761,9 @@ struct Job {
     reset: Option<std::time::Instant>,
     submitted: Option<std::time::Instant>,
     app: Option<AppInterval>,
+    /// The surface's shim generation inside this frame's `vkQueuePresentKHR`
+    /// (§100); `None` when the target has no shim slot.
+    generation: Option<u32>,
 }
 
 /// The images a presenter has not finished with, and the condition
@@ -769,31 +778,37 @@ pub(crate) struct Presenter {
 }
 
 /// Whether a swapchain on `target` may finish its presents on a presenter
-/// thread, after `vkQueuePresentKHR` has returned. `sync` is `SV_PRESENT_SYNC`.
+/// thread, after `vkQueuePresentKHR` has returned. `sync` is `SV_PRESENT_SYNC`;
+/// `guarded` says the Wayland surface is registered with `libsv_wlshim.so`.
 ///
-/// # Never on Wayland unless asked (docs/waycompose-design.md §98)
+/// # On Wayland only with the shim (docs/waycompose-design.md §98, §100)
 ///
 /// A Wayland frame is shown with `attach`, `damage` and `commit` on the
 /// application's `wl_surface`, a proxy the application owns and frees. Firefox
 /// destroys that surface *before* the swapchain, on closing a window and on
-/// quitting, and at quit it never destroys the swapchain at all; Mesa's own
-/// WSI survives this because it touches the surface only inside the
-/// application's calls. A presenter that shows a frame a few milliseconds after
-/// `vkQueuePresentKHR` returned marshals on a freed proxy: Firefox's crash at
-/// quit, about one run in five with a video playing. No later check can make
-/// it safe. Even through a proxy wrapper the request would name an object id
-/// the compositor has deleted or given to another object, a protocol error
-/// that ends the application's connection.
+/// quitting, and at quit it never destroys the swapchain at all. A presenter
+/// that showed a frame after `vkQueuePresentKHR` returned marshalled on a
+/// freed proxy: Firefox's crash at quit (§98). Nothing the ICD can see tells
+/// it the surface is gone, and a proxy wrapper would only trade the crash for
+/// a request on a deleted object id, a protocol error.
 ///
-/// X11 and headless keep the presenter: an X11 frame goes out on a connection
-/// of our own, by a window id whose death is an error that connection ignores.
-/// `SV_PRESENT_SYNC=0` pipelines Wayland as well, which is the old behaviour
-/// and its crash; it exists to measure what the synchronous present costs.
-fn pipelines(target: &PresentTarget, sync: Option<&std::ffi::OsStr>) -> bool {
+/// What the application does to its surface *is* visible to a library standing
+/// in front of libwayland. `libsv_wlshim.so`, preloaded, marks a registered
+/// surface dead before forwarding its destroy, and counts its unmaps, under
+/// the lock the presenter holds around its own three requests (§100). With
+/// it, a Wayland swapchain pipelines; without it, the frame is shown inside
+/// the call, as Mesa's own WSI does, at the cost §99.9 measured.
+///
+/// X11 and headless always pipeline: an X11 frame goes out on a connection of
+/// our own, by a window id whose death is an error that connection ignores.
+/// `SV_PRESENT_SYNC=1` presents in the call everywhere; `SV_PRESENT_SYNC=0`
+/// pipelines even an unguarded Wayland surface, which is §98's crash, kept to
+/// measure what the synchronous present costs.
+fn pipelines(target: &PresentTarget, sync: Option<&std::ffi::OsStr>, guarded: bool) -> bool {
     match sync {
         Some(v) if v == "0" => true,
         Some(_) => false,
-        None => !matches!(target, PresentTarget::Wayland { .. }),
+        None => guarded || !matches!(target, PresentTarget::Wayland { .. }),
     }
 }
 
@@ -801,9 +816,9 @@ impl Presenter {
     /// Only for the process's one ICD: the thread outlives the call that made
     /// it and needs an ICD that lives as long. `None` means present on the
     /// calling thread, which is what [`pipelines`] says for a Wayland surface
-    /// and `SV_PRESENT_SYNC=1` asks for everywhere.
-    fn start(icd: &SharedVulkan, images: usize, target: &PresentTarget) -> Option<Presenter> {
-        if !pipelines(target, std::env::var_os("SV_PRESENT_SYNC").as_deref()) {
+    /// without the shim and `SV_PRESENT_SYNC=1` asks for everywhere.
+    fn start(icd: &SharedVulkan, images: usize, target: &PresentTarget, guarded: bool) -> Option<Presenter> {
+        if !pipelines(target, std::env::var_os("SV_PRESENT_SYNC").as_deref(), guarded) {
             return None;
         }
         let global = crate::instance().filter(|g| std::ptr::eq(*g, icd))?;
@@ -889,7 +904,7 @@ fn finish_present(icd: &SharedVulkan, job: Job, queue_ring: bool) -> IcdResult<(
     job.target
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .present(bytes, job.width, job.height, job.swap_rb);
+        .present(bytes, job.width, job.height, job.swap_rb, job.generation);
     let shown = std::time::Instant::now();
     let (swapchain, width, height, image_index) = (job.swapchain, job.width, job.height, job.image_index);
     frame_note(swapchain, bytes, width, height, fenced - job.started, shown - fenced);
@@ -1121,6 +1136,19 @@ pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
     let _ = sc.present_target;
 }
 
+/// A Wayland surface's shim generation now (§100).
+fn wl_generation(slot: i32) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        crate::present::wayland::guard::generation(slot)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = slot;
+        0
+    }
+}
+
 fn result_ok(r: p::VkResult) -> IcdResult<()> {
     if r.0 == 0 { Ok(()) } else { Err(LowerError::Result(r.0)) }
 }
@@ -1135,28 +1163,38 @@ mod tests {
     /// docs/waycompose-design.md §98. A pipelined Wayland present shows its
     /// frame on the application's `wl_surface` after `vkQueuePresentKHR` has
     /// returned, and Firefox destroys that surface before the swapchain: its
-    /// crash at quit.
+    /// crash at quit. Without the shim's guard that must not happen.
     #[test]
-    fn a_wayland_present_is_finished_before_vk_queue_present_returns() {
+    fn an_unguarded_wayland_present_is_finished_before_vk_queue_present_returns() {
         assert!(
-            !pipelines(&WAYLAND, None),
-            "a Wayland swapchain must not get a presenter: its frames are shown with \
-             requests on the application's wl_surface, which the application may free \
-             as soon as vkQueuePresentKHR returns"
+            !pipelines(&WAYLAND, None, false),
+            "a Wayland swapchain without libsv_wlshim.so must not get a presenter: its \
+             frames are shown with requests on the application's wl_surface, which the \
+             application may free as soon as vkQueuePresentKHR returns"
         );
+    }
+
+    /// §100: with the shim the presenter is safe, and the frames come back.
+    #[test]
+    fn a_guarded_wayland_swapchain_gets_its_presenter_back() {
+        assert!(pipelines(&WAYLAND, None, true));
     }
 
     #[test]
     fn x11_and_headless_keep_the_presenter() {
-        assert!(pipelines(&PresentTarget::X11 { window: 7 }, None));
-        assert!(pipelines(&PresentTarget::Headless, None));
+        for guarded in [false, true] {
+            assert!(pipelines(&PresentTarget::X11 { window: 7 }, None, guarded));
+            assert!(pipelines(&PresentTarget::Headless, None, guarded));
+        }
     }
 
     #[test]
     fn sv_present_sync_still_chooses_for_every_target() {
         for t in [WAYLAND, PresentTarget::X11 { window: 7 }, PresentTarget::Headless] {
-            assert!(!pipelines(&t, Some(OsStr::new("1"))), "{t:?}");
-            assert!(pipelines(&t, Some(OsStr::new("0"))), "{t:?}");
+            for guarded in [false, true] {
+                assert!(!pipelines(&t, Some(OsStr::new("1")), guarded), "{t:?}");
+                assert!(pipelines(&t, Some(OsStr::new("0")), guarded), "{t:?}");
+            }
         }
     }
 }
