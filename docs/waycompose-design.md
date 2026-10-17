@@ -30343,6 +30343,25 @@ entry and a pinnable identity like Firefox's.
   copy and from `--delete`. The bundle's `options.txt` goes only where an
   instance has none.
 
+**Prism's main window died, and the fault was smithay's.** On the guest Prism's
+setup page worked, and its main window broke the connection the moment it
+appeared ("The Wayland connection broke"). Reproduced under Wine
+(`scripts/wc-prism-icon.sh`), the compositor said: `ProtocolError { code: 3,
+xdg_toplevel_icon_v1, "The provided buffer has been destroyed before the
+toplevel icon" }`. Qt gives every window with an icon three shm buffers on an
+`xdg_toplevel_icon_v1`, calls `set_icon`, destroys the icon, then the pools and
+buffers. That is the protocol's order. The setup page had sent
+`set_icon(nil)`, so it never hit this. smithay registers a destruction hook on
+each icon buffer and removes them when the icon is destroyed, but its
+`ShmBufferUserData::remove_destruction_hook` compared with `!=`: it removed the
+first hook that was *not* the one asked for, so a buffer's only hook was never
+removed. The vendored smithay now compares with `==` (a `WAYCOMPOSE FORK` note
+in `wayland/shm/mod.rs`). With it Prism's main window opens, lists both
+instances, and wears its own icon from its three buffers (`icon <- 3
+buffer(s) from the client's own xdg_toplevel_icon_v1`). `wc-prism-icon.sh` is
+the gate: PASS. It should go upstream: any smithay compositor kills a Qt 6
+window with an icon this way.
+
 **Not yet seen on the guest** (the desktop was the user's): a game started
 from Prism, and Minecraft's icon on the guest's taskbar. Both need one short
 slot: open Prism from its shortcut, Finish, select an instance, Play, then the
