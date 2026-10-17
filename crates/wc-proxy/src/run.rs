@@ -1086,7 +1086,28 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             client_pid.map(wc_proxy::icons::bundled_icons_for_pid).unwrap_or_default();
         // §96: what the client's launcher put in its environment, its app id
         // for a toplevel that sets an empty one and its own data directories.
-        let client_env = client_pid.map(wc_proxy::icons::client_env).unwrap_or_default();
+        let mut client_env = client_pid.map(wc_proxy::icons::client_env).unwrap_or_default();
+        // §102: a client of another user, whose environment is closed to us,
+        // takes its app id from the file its launcher left in our runtime
+        // directory (`icons::foreign_app_id`).
+        #[cfg(unix)]
+        if client_env.app_id.is_none()
+            && let Some(uid) = wc_proxy::proxy::Listener::peer_uid(&client)
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            && uid != unsafe { libc::geteuid() }
+        {
+            client_env.app_id = wc_proxy::icons::foreign_app_id(
+                &args.runtime_dir.join(wc_proxy::icons::FOREIGN_APP_IDS),
+                uid,
+            );
+            match &client_env.app_id {
+                Some(id) => println!(
+                    "[proxy] client {n}: uid {uid}, another user's; {} names it {id}",
+                    wc_proxy::icons::FOREIGN_APP_IDS
+                ),
+                None => println!("[proxy] client {n}: uid {uid}, another user's, with no app id for it"),
+            }
+        }
         if let Some(id) = &client_env.app_id {
             println!("[proxy] client {n}: WC_APP_ID={id} names a toplevel with no app id");
         }

@@ -136,6 +136,37 @@ impl Listener {
         None
     }
 
+    /// The user id on the other end of a connection, from the same
+    /// `SO_PEERCRED` as [`Self::peer_pid`].
+    ///
+    /// ADDED FOR §102 (docs/waycompose-design.md): a client of *another* user
+    /// (the nested Linux desktop's KWin runs as <desktop-user>, its login screen as
+    /// cosmic-greeter, both on the launcher's socket through ACLs) has an
+    /// environment the proxy may not read, so its `WC_APP_ID` comes from a
+    /// file keyed by this uid instead ([`crate::icons::foreign_app_id`]).
+    #[cfg(target_os = "linux")]
+    pub fn peer_uid(s: &UnixStream) -> Option<u32> {
+        use std::os::unix::io::AsRawFd;
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: as in `peer_pid`.
+        let rc = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0 && cred.pid > 0).then_some(cred.uid)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn peer_uid(_s: &UnixStream) -> Option<u32> {
+        None
+    }
+
     /// Wait up to `timeout` for the one client this stage serves.
     pub fn accept_one(&self, timeout: std::time::Duration) -> io::Result<UnixStream> {
         self.inner.set_nonblocking(true)?;

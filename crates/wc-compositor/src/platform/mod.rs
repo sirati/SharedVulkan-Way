@@ -215,6 +215,55 @@ pub fn fit_to_work_area(
     (x, y, w, h)
 }
 
+/// The last toplevel of a named application that went away: where it was, and
+/// when. §102 (docs/waycompose-design.md).
+///
+/// ADDED FOR THE NESTED LINUX DESKTOP. Its window on Windows is two Wayland
+/// clients in turn: the login screen's compositor, which exits when a user
+/// logs in, and the session's KWin, which connects a moment later. Both carry
+/// one app id and so one taskbar identity, but Windows' cascade would put the
+/// second window somewhere else, and a window that jumps across the screen at
+/// login does not read as the same window. So a toplevel's first map takes the
+/// place, and the maximised state, of the last window of **the same named
+/// identity** that closed less than [`SUCCESSION_SECS`] ago.
+///
+/// Only a named identity (`Waycompose.app.*`): an unnamed client has no claim
+/// to anybody's place. And only once: the record is taken by the window that
+/// uses it, so a second new window cascades as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Succession {
+    pub aumid: String,
+    /// The outer window's top left corner, in screen coordinates.
+    pub origin: (i32, i32),
+    pub maximized: bool,
+    pub at: std::time::Instant,
+}
+
+/// How long a closed window's place is kept for its successor.
+pub const SUCCESSION_SECS: u64 = 20;
+
+/// Whether a closing window leaves its place to a successor: a toplevel with a
+/// named identity.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn leaves_succession(aumid: &str) -> bool {
+    aumid.starts_with(&format!("{}{}", crate::taskbar::PREFIX, crate::taskbar::NAMED))
+}
+
+/// The place a toplevel of `aumid`, mapping for the first time at `now`,
+/// takes over from `last`, if it is its successor.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn succession_for(
+    last: Option<&Succession>,
+    aumid: &str,
+    now: std::time::Instant,
+) -> Option<((i32, i32), bool)> {
+    let last = last?;
+    (leaves_succession(aumid)
+        && last.aumid == aumid
+        && now.saturating_duration_since(last.at) < std::time::Duration::from_secs(SUCCESSION_SECS))
+    .then_some((last.origin, last.maximized))
+}
+
 /// Which edge an interactive resize is being driven from.
 ///
 /// ADDED FOR STAGE 17. Spelled out here rather than passing Wayland's
@@ -1083,6 +1132,42 @@ pub(crate) type Commands = Receiver<ToUi>;
 /// project's guest with its taskbar: a 1280x800 screen minus 48 pixels.
 #[cfg(test)]
 mod tests {
+
+    // §102: the nested Linux desktop's login screen hands its place to the
+    // session's window.
+    #[test]
+    fn succession_takes_the_place_of_the_same_named_identity_only() {
+        let t0 = std::time::Instant::now();
+        use super::{leaves_succession, succession_for, Succession, SUCCESSION_SECS};
+        let last = Succession {
+            aumid: "Waycompose.app.atp-nested".into(),
+            origin: (120, 80),
+            maximized: false,
+            at: t0,
+        };
+        let soon = t0 + std::time::Duration::from_secs(3);
+        assert_eq!(
+            succession_for(Some(&last), "Waycompose.app.atp-nested", soon),
+            Some(((120, 80), false))
+        );
+        // Another application, an unnamed client, nothing recorded, or too late.
+        assert_eq!(succession_for(Some(&last), "Waycompose.app.firefox", soon), None);
+        let unnamed = Succession { aumid: "Waycompose.unnamed.c1".into(), ..last.clone() };
+        assert_eq!(succession_for(Some(&unnamed), "Waycompose.unnamed.c1", soon), None);
+        assert_eq!(succession_for(None, "Waycompose.app.atp-nested", soon), None);
+        let late = t0 + std::time::Duration::from_secs(SUCCESSION_SECS);
+        assert_eq!(succession_for(Some(&last), "Waycompose.app.atp-nested", late), None);
+        // Maximised stays maximised.
+        let max = Succession { maximized: true, ..last };
+        assert_eq!(
+            succession_for(Some(&max), "Waycompose.app.atp-nested", soon),
+            Some(((120, 80), true))
+        );
+        assert!(leaves_succession("Waycompose.app.x"));
+        assert!(!leaves_succession("Waycompose.unnamed.c3"));
+        assert!(!leaves_succession(""));
+    }
+
     use super::fit_to_work_area;
 
     /// `(left, top, right, bottom)`, Win32's convention, far edges exclusive.
