@@ -2531,3 +2531,50 @@ fn viewport_requests_walk_and_are_forwarded() {
     assert!(h.session.take_notes().is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// §102 (docs/waycompose-design.md 102.4). A client another user runs for a
+/// launcher of ours (the nested desktop's KWin) carries the launcher's title:
+/// it is set right after `get_toplevel`, next to the app id, and every title
+/// the client sets itself is replaced.
+#[test]
+fn a_forced_title_is_set_at_once_and_replaces_the_clients() {
+    fn toplevel(h: &mut Harness) -> u32 {
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let wm = h.bind(registry, 4, "xdg_wm_base", 6);
+        let surface_id = h.id();
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        h.send_words(compositor, 0, &[surface_id]);
+        let xdg = h.id();
+        h.send_words(wm, 2, &[xdg, surface_id]); // get_xdg_surface
+        let top = h.id();
+        h.send_words(xdg, 1, &[top]); // get_toplevel
+        top
+    }
+    let spec = Spec::builtin().unwrap();
+    assert_eq!(spec.request("xdg_toplevel", 2).unwrap().name, "set_title");
+    let encoded = |s: &str| {
+        let mut b = Vec::new();
+        wire::push_string(&mut b, s);
+        b
+    };
+    let d = tmpdir("p102-title");
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    h.session.set_default_app_id(Some("atp-nested".into()));
+    h.session.set_forced_title(Some("Windows 7 (Linux)".into()));
+    let top = toplevel(&mut h);
+    let msgs = h.upstream_messages();
+    let n = msgs.len();
+    assert_eq!(msgs[n - 2], (top, 2, encoded("Windows 7 (Linux)")), "the title follows get_toplevel");
+    assert_eq!(msgs[n - 1], (top, 3, encoded("atp-nested")), "and the app id after it");
+    h.send(top, 2, &encoded("KDE Wayland Compositor WL-0"), &mut VecDeque::new());
+    let msgs = h.upstream_messages();
+    assert_eq!(msgs.last().unwrap().clone(), (top, 2, encoded("Windows 7 (Linux)")));
+
+    // Without one, the client's own title goes through.
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    let top = toplevel(&mut h);
+    h.send(top, 2, &encoded("Smithay"), &mut VecDeque::new());
+    assert_eq!(h.upstream_messages().last().unwrap().clone(), (top, 2, encoded("Smithay")));
+    let _ = std::fs::remove_dir_all(&d);
+}

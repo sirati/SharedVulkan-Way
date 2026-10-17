@@ -902,6 +902,9 @@ pub struct Session {
     /// client's own `WC_APP_ID` ([`crate::icons::client_env`]). See
     /// [`Session::set_default_app_id`].
     default_app_id: Option<String>,
+    /// §102: the title every toplevel of this client carries, whatever it
+    /// asks for. [`Session::set_forced_title`].
+    forced_title: Option<String>,
     clip: Clip,
     data_ops: DataOps,
     /// STAGE 16. Events this proxy invents for its own client, drained by the
@@ -1042,6 +1045,7 @@ impl Session {
             notes: Vec::new(),
             app_ids: Vec::new(),
             default_app_id: None,
+            forced_title: None,
             clip: Clip { next_token: 1, ..Clip::default() },
             data_ops,
             to_client: Vec::new(),
@@ -1150,6 +1154,19 @@ impl Session {
         self.default_app_id = id;
     }
 
+    /// §102 (docs/waycompose-design.md 102.4). The title for every toplevel
+    /// of this client, in place of what it sets and from its first moment.
+    ///
+    /// For a client its launcher started as another user, whose own title is
+    /// a statement about Linux and not about the window on Windows: the nested
+    /// desktop's KWin calls its window "KDE Wayland Compositor WL-0 — Press
+    /// right control key to grab pointer", and its login screen's cosmic-comp
+    /// says "Smithay". The launcher puts the application's name in
+    /// `wc-foreign-app-ids`, beside the app id.
+    pub fn set_forced_title(&mut self, title: Option<String>) {
+        self.forced_title = title;
+    }
+
     /// The app ids seen since the last call. See the field.
     pub fn take_app_ids(&mut self) -> Vec<String> {
         std::mem::take(&mut self.app_ids)
@@ -1240,6 +1257,14 @@ impl Session {
         // §96: and the one it rewrites, when the string is empty and the
         // client's launcher said what it should be (`set_default_app_id`).
         let mut rewritten: Option<Vec<u8>> = None;
+        // §102: a forced title replaces whatever the client calls its window.
+        if interface == "xdg_toplevel" && msg.name == "set_title"
+            && let Some(title) = self.forced_title.clone()
+        {
+            let mut b = Vec::new();
+            wire::push_string(&mut b, &title);
+            rewritten = Some(b);
+        }
         if interface == "xdg_toplevel" && msg.name == "set_app_id"
             && let Some(app_id) = spans.first().and_then(|s| wire::string_at(body, s)) {
                 match (self.default_app_id.clone(), app_id.is_empty()) {
@@ -1264,7 +1289,19 @@ impl Session {
         // nothing to rewrite. The default follows `get_toplevel` at once; an
         // id the client names later still replaces it, as any second
         // `set_app_id` does.
-        let mut injected: Option<Vec<u8>> = None;
+        let mut injected: Vec<u8> = Vec::new();
+        if interface == "xdg_surface" && msg.name == "get_toplevel"
+            && let Some(title) = self.forced_title.clone()
+            && let Some(top) = spans.first().and_then(|s| wire::word_at(body, s))
+            && let Some(op) = self.spec.interface("xdg_toplevel").and_then(|i| {
+                i.requests.iter().position(|m| m.name == "set_title")
+            })
+        {
+            let mut b = Vec::new();
+            wire::push_string(&mut b, &title);
+            self.note(format!("xdg_toplevel@{top} is titled {title:?}, from its launcher"));
+            injected.extend_from_slice(&wire::message(top, op as u16, &b));
+        }
         if interface == "xdg_surface" && msg.name == "get_toplevel"
             && let Some(id) = self.default_app_id.clone()
             && let Some(top) = spans.first().and_then(|s| wire::word_at(body, s))
@@ -1278,7 +1315,7 @@ impl Session {
                 "xdg_toplevel@{top} starts with app id {id:?}, from the client's WC_APP_ID"
             ));
             self.app_ids.push(id);
-            injected = Some(wire::message(top, op as u16, &b));
+            injected.extend_from_slice(&wire::message(top, op as u16, &b));
         }
 
         // STAGE 13. The one *family* this program answers itself rather than
@@ -1519,9 +1556,7 @@ impl Session {
             body.to_vec()
         };
         out.extend_from_slice(&wire::message(header.object, header.opcode, &out_body));
-        if let Some(m) = injected {
-            out.extend_from_slice(&m);
-        }
+        out.extend_from_slice(&injected);
         Ok(out)
     }
 

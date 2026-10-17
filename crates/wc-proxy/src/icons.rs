@@ -249,16 +249,36 @@ pub fn app_id_ok(id: &str) -> bool {
 /// of other users their app id (§102).
 pub const FOREIGN_APP_IDS: &str = "wc-foreign-app-ids";
 
-/// The app id the file gives `uid`: lines of `<uid> <app id>`, the first line
-/// for that uid wins, and an id that fails [`app_id_ok`] is no answer.
-pub fn parse_foreign_app_ids(text: &str, uid: u32) -> Option<String> {
+/// What `wc-foreign-app-ids` says about one uid (§102.4): its app id, and the
+/// title its toplevels are to carry, if the line has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignName {
+    pub app_id: String,
+    pub title: Option<String>,
+}
+
+/// The entry the file gives `uid`: lines of `<uid> <app id> [title]`, the
+/// first line for that uid wins, an id that fails [`app_id_ok`] is no answer,
+/// and a title is the rest of the line, trimmed, at most 128 bytes and free of
+/// control characters (else the line has no title).
+pub fn parse_foreign_app_ids(text: &str, uid: u32) -> Option<ForeignName> {
     text.lines().find_map(|line| {
-        let mut words = line.split_ascii_whitespace();
-        let (u, id) = (words.next()?, words.next()?);
-        if words.next().is_some() || u.parse::<u32>().ok()? != uid {
+        let line = line.trim();
+        let (u, rest) = line.split_once(' ')?;
+        if u.parse::<u32>().ok()? != uid {
             return None;
         }
-        Some(id).filter(|id| app_id_ok(id)).map(str::to_owned)
+        let rest = rest.trim_start();
+        let (id, title) = match rest.split_once(' ') {
+            Some((id, t)) => (id, t.trim()),
+            None => (rest, ""),
+        };
+        if !app_id_ok(id) {
+            return None;
+        }
+        let title = (!title.is_empty() && title.len() <= 128 && !title.chars().any(char::is_control))
+            .then(|| title.to_owned());
+        Some(ForeignName { app_id: id.to_owned(), title })
     })
 }
 
@@ -279,7 +299,7 @@ pub fn parse_foreign_app_ids(text: &str, uid: u32) -> Option<String> {
 /// name of its own taskbar button and icon, which it could choose itself by
 /// calling `set_app_id`.
 #[cfg(unix)]
-pub fn foreign_app_id(file: &Path, uid: u32) -> Option<String> {
+pub fn foreign_app_id(file: &Path, uid: u32) -> Option<ForeignName> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(file).ok()?;
     // SAFETY: `geteuid` has no preconditions and cannot fail.
@@ -687,15 +707,21 @@ mod tests {
     // §102: the file that names another user's windows.
     #[test]
     fn foreign_app_ids_parse_by_uid() {
+        let id = |t: &str, u| parse_foreign_app_ids(t, u).map(|n| n.app_id);
         let text = "1001 atp-nested\n977 atp-nested-greeter\nbad line here\n1001 second\n";
-        assert_eq!(parse_foreign_app_ids(text, 1001).as_deref(), Some("atp-nested"));
-        assert_eq!(parse_foreign_app_ids(text, 977).as_deref(), Some("atp-nested-greeter"));
-        assert_eq!(parse_foreign_app_ids(text, 1000), None);
-        assert_eq!(parse_foreign_app_ids("1001 ../x\n", 1001), None);
-        assert_eq!(parse_foreign_app_ids("1001 -x\n", 1001), None);
-        assert_eq!(parse_foreign_app_ids("1001 a b\n", 1001), None);
-        assert_eq!(parse_foreign_app_ids("x1001 a\n", 1001), None);
-        assert_eq!(parse_foreign_app_ids("", 1001), None);
+        assert_eq!(id(text, 1001).as_deref(), Some("atp-nested"));
+        assert_eq!(id(text, 977).as_deref(), Some("atp-nested-greeter"));
+        assert_eq!(id(text, 1000), None);
+        assert_eq!(id("1001 ../x\n", 1001), None);
+        assert_eq!(id("1001 -x\n", 1001), None);
+        assert_eq!(id("x1001 a\n", 1001), None);
+        assert_eq!(id("", 1001), None);
+        // The rest of the line is the title.
+        let n = parse_foreign_app_ids("1001 atp-nested Windows 7 (Linux)\n", 1001).unwrap();
+        assert_eq!((n.app_id.as_str(), n.title.as_deref()), ("atp-nested", Some("Windows 7 (Linux)")));
+        assert_eq!(parse_foreign_app_ids("1001 a\n", 1001).unwrap().title, None);
+        assert_eq!(parse_foreign_app_ids(&format!("1001 a {}\n", "x".repeat(129)), 1001).unwrap().title, None);
+        assert_eq!(parse_foreign_app_ids("1001 a ti\u{7}tle\n", 1001).unwrap().title, None);
     }
 
     #[cfg(unix)]
@@ -708,7 +734,7 @@ mod tests {
         let f = dir.join(FOREIGN_APP_IDS);
         std::fs::write(&f, "1001 atp-nested\n").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(foreign_app_id(&f, 1001).as_deref(), Some("atp-nested"));
+        assert_eq!(foreign_app_id(&f, 1001).map(|n| n.app_id).as_deref(), Some("atp-nested"));
         // Writable by the group or by others: not ours alone, so no answer.
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
         assert_eq!(foreign_app_id(&f, 1001), None);

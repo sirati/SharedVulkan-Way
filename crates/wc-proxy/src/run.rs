@@ -1090,22 +1090,29 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // §102: a client of another user, whose environment is closed to us,
         // takes its app id from the file its launcher left in our runtime
         // directory (`icons::foreign_app_id`).
+        let mut forced_title: Option<String> = None;
         #[cfg(unix)]
         if client_env.app_id.is_none()
             && let Some(uid) = wc_proxy::proxy::Listener::peer_uid(&client)
             // SAFETY: `geteuid` has no preconditions and cannot fail.
             && uid != unsafe { libc::geteuid() }
         {
-            client_env.app_id = wc_proxy::icons::foreign_app_id(
+            let named = wc_proxy::icons::foreign_app_id(
                 &args.runtime_dir.join(wc_proxy::icons::FOREIGN_APP_IDS),
                 uid,
             );
-            match &client_env.app_id {
-                Some(id) => println!(
-                    "[proxy] client {n}: uid {uid}, another user's; {} names it {id}",
-                    wc_proxy::icons::FOREIGN_APP_IDS
+            match &named {
+                Some(f) => println!(
+                    "[proxy] client {n}: uid {uid}, another user's; {} names it {}{}",
+                    wc_proxy::icons::FOREIGN_APP_IDS,
+                    f.app_id,
+                    f.title.as_deref().map(|t| format!(", titled {t:?}")).unwrap_or_default()
                 ),
                 None => println!("[proxy] client {n}: uid {uid}, another user's, with no app id for it"),
+            }
+            if let Some(f) = named {
+                client_env.app_id = Some(f.app_id);
+                forced_title = f.title;
             }
         }
         if let Some(id) = &client_env.app_id {
@@ -1212,6 +1219,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut session = Session::new(spec, transport, scope, headroom);
             session.set_default_app_id(client_env.app_id.clone());
+            // §102: and the title its launcher gave it, if any.
+            session.set_forced_title(forced_title.clone());
             session.set_trace(trace);
             session.set_verify(verify);
             session.set_pacing(pace_hz, pace_depth);
