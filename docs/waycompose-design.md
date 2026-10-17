@@ -31530,3 +31530,12 @@ hardware.
   used it aborts the run, ends its session, and repeats it after two idle
   minutes. The soak drives Firefox through Marionette, which is not OS input,
   so activity during a run is the user's.
+
+**First use**, 2026-10-17. The block S5, A5, S6, A6 of 100.6 started S5 twice
+on a desktop idle for 124 s (13:50:08, 14:02:05). Both tries were aborted
+2:23 and 2:30 into the run, on real input. The second time it was keyboard
+input from 14:04:27 to 14:04:51, which went on after the run's session had
+ended. No QMP injection was logged. Both times it came about two minutes after
+the run's Firefox windows appeared on the desktop, so the person at it reacts
+to them. The block was stopped rather than repeated every few minutes, and
+`wcgpu` restored.
