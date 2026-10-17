@@ -1125,6 +1125,14 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::geteuid() } == 0 {
         return Err("bell-hub runs as the user; refusing to run as root".into());
     }
+    // §99.6: what a previous run of this unit left in systemd's store.
+    let mut kept = sv_hostd::sdfd::take();
+    let keep = std::env::var_os("NOTIFY_SOCKET").is_some();
+    if !kept.is_empty() {
+        let mut names: Vec<&String> = kept.keys().collect();
+        names.sort();
+        eprintln!("bell-hub: inherited {} descriptor(s) from the previous run: {names:?}", names.len());
+    }
     let mut hubs = Vec::new();
     for (i, a) in args.iter().enumerate() {
         if a != "--port" {
@@ -1136,13 +1144,27 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "port".into());
-        let l = sv_hostd::bellhub::bind_private(std::path::Path::new(at))?;
+        let listen_key = format!("{name}-listen");
+        let l = match kept.remove(&listen_key) {
+            // The same listening socket as before the restart: a client that
+            // reconnects at once finds it, never ECONNREFUSED.
+            Some(fd) => std::os::unix::net::UnixListener::from(fd),
+            None => {
+                let l = sv_hostd::bellhub::bind_private(std::path::Path::new(at))?;
+                if keep {
+                    sv_hostd::sdfd::store(&listen_key, &l)?;
+                }
+                l
+            }
+        };
+        let inherited = kept.remove(&format!("{name}-up")).map(std::os::unix::net::UnixStream::from);
         eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
-        hubs.push(sv_hostd::bellhub::run(&name, up.into(), l)?);
+        hubs.push(sv_hostd::bellhub::run_kept(&name, up.into(), l, inherited, keep)?);
     }
     if hubs.is_empty() {
         return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());
     }
+    let _ = sv_hostd::sdfd::notify("READY=1");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
         for h in &hubs {

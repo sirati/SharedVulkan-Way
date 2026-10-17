@@ -73,6 +73,8 @@ use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 pub mod bellhub;
+#[cfg(target_os = "linux")]
+pub mod sdfd;
 pub mod broker;
 #[cfg(target_os = "linux")]
 pub mod ivshmem;
