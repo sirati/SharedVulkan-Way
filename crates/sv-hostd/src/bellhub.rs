@@ -147,8 +147,45 @@ impl Hub {
     /// Run one upstream connection until it closes: a reader fanning out and a
     /// writer draining the up queue. Returns when the upstream is gone.
     pub fn serve_upstream(self: &Arc<Self>, up: UnixStream) -> std::io::Result<()> {
+        self.serve_upstream_fresh(up, true)
+    }
+
+    /// [`Self::serve_upstream`]; `fresh` is a connection QEMU has just
+    /// accepted, as opposed to one inherited from a previous hub that QEMU
+    /// never saw close (§99.6). On a fresh one, bytes sent while there was
+    /// none are lost in both directions (a virtio-serial port drops what
+    /// arrives while nobody holds it), so the hub tells the guest to look at
+    /// every ring again too (`park::RESCAN_TOKEN`, waycompose-design.md §105).
+    pub fn serve_upstream_fresh(self: &Arc<Self>, up: UnixStream, fresh: bool) -> std::io::Result<()> {
+        let w = up.try_clone()?;
+        let closer = up.try_clone()?;
+        self.serve_link_fresh(Box::new(up), Box::new(w), move || {
+            let _ = closer.shutdown(std::net::Shutdown::Both);
+        }, fresh)
+    }
+
+    /// [`Hub::serve_upstream`] over any reader and writer: a chardev socket's
+    /// two halves, or a guest port's (role (b)). `close` runs once the reader
+    /// has ended, so a writer stuck on a dead upstream gives up.
+    pub fn serve_link(
+        self: &Arc<Self>,
+        mut r: Box<dyn Read + Send>,
+        mut w: Box<dyn Write + Send>,
+        close: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        self.serve_link_fresh(r, w, close, true)
+    }
+
+    /// [`Self::serve_link`], saying whether the link is fresh (see
+    /// [`Self::serve_upstream_fresh`]): a guest port's open always is.
+    pub fn serve_link_fresh(
+        self: &Arc<Self>,
+        mut r: Box<dyn Read + Send>,
+        mut w: Box<dyn Write + Send>,
+        close: impl FnOnce(),
+        fresh: bool,
+    ) -> std::io::Result<()> {
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(QUEUE);
-        let mut w = up.try_clone()?;
         let writer = std::thread::Builder::new().name(format!("bell-{}-up", self.name)).spawn(move || {
             while let Ok(b) = rx.recv() {
                 if w.write_all(&b).is_err() {
@@ -161,7 +198,11 @@ impl Hub {
         // §103.15: whatever the guest rang while this hub had no upstream is
         // gone, so every client rescans its rings (RESCAN_TOKEN).
         self.fan_out(&[sv_transport::park::RESCAN_TOKEN]);
-        let mut r = up;
+        // §105: and on a connection QEMU has just accepted, the guest too: what
+        // the host rang while there was none was dropped on its way in.
+        if fresh {
+            self.up(&[sv_transport::park::RESCAN_TOKEN]);
+        }
         let mut buf = [0u8; 256];
         loop {
             match r.read(&mut buf) {
@@ -173,7 +214,7 @@ impl Hub {
         if let Ok(mut u) = self.up.lock() {
             *u = None;
         }
-        let _ = r.shutdown(std::net::Shutdown::Both);
+        close();
         let _ = writer.join();
         Ok(())
     }
@@ -193,12 +234,80 @@ pub fn bind_private(path: &std::path::Path) -> std::io::Result<UnixListener> {
     Ok(l)
 }
 
+/// Where a port's bytes come from. On a Linux host that is QEMU's chardev
+/// socket; inside a Linux guest whose host is a Mac running libkrun (role (b),
+/// §103.6) there is no socket to share, only the guest's own
+/// `/dev/virtio-ports/NAME`, which permits one opener, so the hub holds it for
+/// every session there too. Linux discards bytes that reach a port nobody has
+/// open, which is what the rescan after every (re)open covers.
+#[derive(Clone, Debug)]
+pub enum Upstream {
+    Socket(std::path::PathBuf),
+    GuestPort(String),
+}
+
+impl Upstream {
+    /// `dev:NAME` is a guest port; anything else a chardev socket, as before.
+    pub fn parse(spec: &str) -> Upstream {
+        match spec.strip_prefix("dev:") {
+            Some(name) => Upstream::GuestPort(name.to_owned()),
+            None => Upstream::Socket(spec.into()),
+        }
+    }
+
+    /// The name the log and systemd's store know this port by.
+    pub fn name(&self) -> String {
+        match self {
+            Upstream::Socket(p) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "port".into()),
+            Upstream::GuestPort(n) => n.clone(),
+        }
+    }
+
+    fn connect(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        match self {
+            Upstream::Socket(p) => UnixStream::connect(p).map(Into::into),
+            Upstream::GuestPort(n) => match sv_transport::vdoorbell::PortHandle::guest_port(n)? {
+                sv_transport::vdoorbell::PortHandle::File(f) => Ok(f.into()),
+                _ => Err(std::io::Error::other(format!("{n}: not a guest port"))),
+            },
+        }
+    }
+
+    /// Serve `fd` (from [`Upstream::connect`] or systemd's store) on `hub`.
+    fn serve(&self, hub: &Arc<Hub>, fd: std::os::fd::OwnedFd, fresh: bool) -> std::io::Result<()> {
+        match self {
+            Upstream::Socket(_) => hub.serve_upstream_fresh(UnixStream::from(fd), fresh),
+            // A port has no shutdown; the writer ends when its queue does.
+            Upstream::GuestPort(_) => {
+                let r = std::fs::File::from(fd);
+                let w = r.try_clone()?;
+                hub.serve_link_fresh(Box::new(r), Box::new(w), || {}, fresh)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Upstream::Socket(p) => write!(f, "{}", p.display()),
+            Upstream::GuestPort(n) => write!(f, "/dev/virtio-ports/{n}"),
+        }
+    }
+}
+
+impl From<std::path::PathBuf> for Upstream {
+    fn from(p: std::path::PathBuf) -> Upstream {
+        Upstream::Socket(p)
+    }
+}
+
 /// Serve one port for ever: accept clients on `listener`, and keep an upstream
 /// connection to `upstream` (QEMU's chardev), reconnecting whenever it closes
 /// or is absent (the VM is stopped or restarting). Clients stay connected
 /// across upstream reconnects. Spawns its threads and returns the hub.
-pub fn run(name: &str, upstream: std::path::PathBuf, listener: UnixListener) -> std::io::Result<Arc<Hub>> {
-    run_kept(name, upstream, listener, None, false)
+pub fn run(name: &str, upstream: impl Into<Upstream>, listener: UnixListener) -> std::io::Result<Arc<Hub>> {
+    run_kept(name, upstream.into(), listener, None, false)
 }
 
 /// [`run`], starting from an upstream connection a previous hub process left
@@ -208,9 +317,9 @@ pub fn run(name: &str, upstream: std::path::PathBuf, listener: UnixListener) -> 
 /// connection close. A connection QEMU closed is taken out of the store.
 pub fn run_kept(
     name: &str,
-    upstream: std::path::PathBuf,
+    upstream: Upstream,
     listener: UnixListener,
-    inherited: Option<UnixStream>,
+    inherited: Option<std::os::fd::OwnedFd>,
     keep: bool,
 ) -> std::io::Result<Arc<Hub>> {
     let hub = Hub::new(name);
@@ -239,12 +348,13 @@ pub fn run_kept(
             let mut next = inherited;
             let key = format!("{}-up", hub.name);
             loop {
+                let inherited = next.is_some();
                 let got = match next.take() {
                     Some(s) => {
-                        eprintln!("bell-hub {}: kept {} open across the restart", hub.name, upstream.display());
+                        eprintln!("bell-hub {}: kept {} open across the restart", hub.name, upstream);
                         Ok(s)
                     }
-                    None => UnixStream::connect(&upstream).inspect(|s| {
+                    None => upstream.connect().inspect(|s| {
                         if keep && let Err(e) = crate::sdfd::store(&key, s) {
                             eprintln!("bell-hub {}: could not keep the connection in systemd's store: {e}", hub.name);
                         }
@@ -256,10 +366,10 @@ pub fn run_kept(
                         eprintln!(
                             "bell-hub {}: holding {} for {} client(s)",
                             hub.name,
-                            upstream.display(),
+                            upstream,
                             hub.client_count()
                         );
-                        let _ = hub.serve_upstream(s);
+                        let _ = upstream.serve(&hub, s, !inherited);
                         if keep {
                             let _ = crate::sdfd::remove(&key);
                         }
@@ -267,7 +377,7 @@ pub fn run_kept(
                             "bell-hub {}: {} closed (the VM stopped?); {} byte(s) down ({} dropped), {} up ({} \
                              dropped); reconnecting",
                             hub.name,
-                            upstream.display(),
+                            upstream,
                             hub.stats.down.load(Ordering::Relaxed),
                             hub.stats.down_dropped.load(Ordering::Relaxed),
                             hub.stats.up.load(Ordering::Relaxed),
@@ -276,7 +386,7 @@ pub fn run_kept(
                     }
                     Err(e) => {
                         if !said_absent {
-                            eprintln!("bell-hub {}: {} not reachable yet ({e}); retrying", hub.name, upstream.display());
+                            eprintln!("bell-hub {}: {} not reachable yet ({e}); retrying", hub.name, upstream);
                             said_absent = true;
                         }
                     }
@@ -300,7 +410,20 @@ mod tests {
         d
     }
 
+    /// Bytes other than the hub's own `RESCAN_TOKEN`, which it sends on every
+    /// fresh upstream (§105) and which [`a_fresh_upstream_tells_both_sides_to_rescan`]
+    /// checks on its own.
     fn read_some(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
+        let mut v = read_raw(s, want + 1, within.min(Duration::from_millis(300)));
+        v.retain(|b| *b != sv_transport::park::RESCAN_TOKEN);
+        if v.len() >= want {
+            return v;
+        }
+        v.extend(read_raw(s, want - v.len(), within).into_iter().filter(|b| *b != sv_transport::park::RESCAN_TOKEN));
+        v
+    }
+
+    fn read_raw(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let t = Instant::now();
         let mut got = Vec::new();
@@ -385,7 +508,7 @@ mod tests {
         let mut got = Vec::new();
         let t = Instant::now();
         while !got.ends_with(&[9]) && t.elapsed() < Duration::from_secs(5) {
-            got.extend(read_some(&mut a, 1, Duration::from_secs(5)));
+            got.extend(read_raw(&mut a, 1, Duration::from_secs(5)));
         }
         let (last, before) = got.split_last().expect("bytes from the hub");
         assert_eq!(*last, 9);
@@ -393,6 +516,35 @@ mod tests {
         a.write_all(&[3]).unwrap();
         assert_eq!(read_some(&mut g2, 1, Duration::from_secs(5)), vec![3]);
         assert!(hub.stats.upstream_connects.load(Ordering::Relaxed) >= 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §105: a virtio-serial port drops what arrives while nobody holds it, so
+    /// on every fresh upstream connection the hub tells the guest and every
+    /// client to look at all their rings again; on one inherited across its own
+    /// restart (QEMU never saw it close) it does not.
+    #[test]
+    fn a_fresh_upstream_tells_both_sides_to_rescan() {
+        use sv_transport::park::RESCAN_TOKEN;
+        let d = tmpdir("rescan");
+        let qemu = fake_qemu(&d.join("qemu.sock"));
+        let hub = run("t", d.join("qemu.sock"), bind_private(&d.join("hub.sock")).unwrap()).unwrap();
+        let mut g1 = qemu.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(read_raw(&mut g1, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "the guest is told at once");
+        let mut a = UnixStream::connect(d.join("hub.sock")).unwrap();
+        let t = Instant::now();
+        while hub.client_count() < 1 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(g1);
+        let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
+        assert_eq!(read_raw(&mut g2, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN]);
+        assert_eq!(read_raw(&mut a, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "and so is every client");
+        // An inherited connection is not fresh: nothing was lost on it.
+        let (mine, mut theirs) = UnixStream::pair().unwrap();
+        let l = bind_private(&d.join("hub2.sock")).unwrap();
+        let _hub2 = run_kept("t2", Upstream::Socket(d.join("absent.sock")), l, Some(mine.into()), false).unwrap();
+        assert!(read_raw(&mut theirs, 1, Duration::from_millis(300)).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -426,6 +578,67 @@ mod tests {
         // 0600 in a 0700 directory: this user's sessions only.
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(d.join("hub.sock")).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn upstream_spellings() {
+        let p = Upstream::parse("dev:org.sirati.wcbell.0");
+        assert!(matches!(&p, Upstream::GuestPort(n) if n == "org.sirati.wcbell.0"));
+        assert_eq!(p.name(), "org.sirati.wcbell.0");
+        assert_eq!(p.to_string(), "/dev/virtio-ports/org.sirati.wcbell.0");
+        let s = Upstream::parse("/run/vm/wcbell.sock");
+        assert!(matches!(&s, Upstream::Socket(p) if p == std::path::Path::new("/run/vm/wcbell.sock")));
+        assert_eq!(s.name(), "wcbell");
+    }
+
+    /// A guest port is a file, not a socket: the hub serves it the same way,
+    /// rescan token first on every (re)open, bytes both ways.
+    #[test]
+    fn a_link_that_is_not_a_socket_is_served_the_same() {
+        let d = tmpdir("link");
+        let hub = Hub::new("t");
+        let l = bind_private(&d.join("hub.sock")).unwrap();
+        {
+            let hub = Arc::clone(&hub);
+            std::thread::spawn(move || {
+                for c in l.incoming().flatten() {
+                    let _ = hub.add_client(c);
+                }
+            });
+        }
+        let mut a = UnixStream::connect(d.join("hub.sock")).unwrap();
+        let t = Instant::now();
+        while hub.client_count() < 1 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for round in 0..2u8 {
+            let (r, mut guest_w) = std::io::pipe().unwrap();
+            let (mut guest_r, w) = std::io::pipe().unwrap();
+            let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let link = {
+                let (hub, closed) = (Arc::clone(&hub), Arc::clone(&closed));
+                std::thread::spawn(move || {
+                    hub.serve_link(Box::new(r), Box::new(w), move || closed.store(true, Ordering::Relaxed))
+                })
+            };
+            guest_w.write_all(&[10 + round]).unwrap();
+            let mut got = Vec::new();
+            let t = Instant::now();
+            while !got.ends_with(&[10 + round]) && t.elapsed() < Duration::from_secs(5) {
+                got.extend(read_raw(&mut a, 1, Duration::from_secs(5)));
+            }
+            assert_eq!(got, vec![sv_transport::park::RESCAN_TOKEN, 10 + round], "round {round}");
+            a.write_all(&[20 + round]).unwrap();
+            // §105: a fresh link tells the guest to rescan first, then the byte.
+            let mut b = [0u8; 2];
+            guest_r.read_exact(&mut b).unwrap();
+            assert_eq!(b, [sv_transport::park::RESCAN_TOKEN, 20 + round], "round {round}");
+            drop(guest_w); // the guest closed the port
+            let _ = link.join().unwrap();
+            assert!(closed.load(Ordering::Relaxed), "round {round}: close ran");
+        }
+        assert_eq!(hub.stats.upstream_connects.load(Ordering::Relaxed), 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

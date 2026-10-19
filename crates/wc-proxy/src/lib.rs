@@ -107,6 +107,11 @@ pub mod rings;
 #[cfg(unix)]
 pub mod macsvc;
 #[cfg(unix)]
+pub mod ctlfast;
+/// §103.16: the session side of the multi-stream sound ring.
+#[cfg(unix)]
+pub mod sound;
+#[cfg(unix)]
 pub mod session;
 #[cfg(unix)]
 pub mod spec;

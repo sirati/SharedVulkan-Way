@@ -68,12 +68,14 @@ pub fn audible(chunk: &[u8]) -> bool {
 }
 
 #[cfg(windows)]
-pub use win::play;
+#[allow(unused_imports)]
+pub use win::{play, play_credited};
 
 #[cfg(windows)]
 mod win {
     use super::*;
     use std::io::Read;
+    use std::time::Duration;
     use windows_sys::Win32::Media::Audio::{
         CALLBACK_NULL, HWAVEOUT, WAVE_FORMAT_PCM, WAVE_MAPPER, WAVEFORMATEX, WAVEHDR, WHDR_DONE,
         waveOutClose, waveOutOpen, waveOutPrepareHeader, waveOutReset, waveOutSetVolume,
@@ -160,6 +162,111 @@ mod win {
         }
         // SAFETY: stop the device, then give every header back before the
         // boxes go.
+        unsafe {
+            waveOutReset(h);
+            for hd in hdrs.iter_mut() {
+                if hd.dwFlags & WHDR_PREPARED != 0 {
+                    waveOutUnprepareHeader(h, &mut **hd, HDR);
+                }
+            }
+            waveOutClose(h);
+        }
+        say(&format!("{} (the stream ended)", stats.line()));
+        Ok(stats)
+    }
+
+    #[allow(dead_code)]
+    /// §105, the sound ring's device side (§103.16): play what arrives on
+    /// `rx`, in whatever pieces it comes, and give back `credit` for every
+    /// chunk handed to the device. The sender sends no more than it was
+    /// granted, so nothing is ever dropped here: a device that runs slow
+    /// slows the session's sink instead. Ends when `rx` closes.
+    pub fn play_credited(
+        rx: std::sync::mpsc::Receiver<Vec<u8>>,
+        volume_pct: u8,
+        mut say: impl FnMut(&str),
+        mut credit: impl FnMut(u32),
+    ) -> Result<Stats, String> {
+        let fmt = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: CHANNELS,
+            nSamplesPerSec: RATE,
+            nAvgBytesPerSec: RATE * FRAME_BYTES as u32,
+            nBlockAlign: FRAME_BYTES as u16,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        let mut h: HWAVEOUT = std::ptr::null_mut();
+        // SAFETY: as in `play`.
+        let rc = unsafe { waveOutOpen(&mut h, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) };
+        if rc != 0 {
+            return Err(format!("waveOutOpen failed: MMRESULT {rc}"));
+        }
+        // SAFETY: an open handle.
+        unsafe { waveOutSetVolume(h, volume_word(volume_pct)) };
+        say(&format!(
+            "audio: playing the sound ring's output stream, s16le {RATE} Hz stereo, {BUFFERS} x {CHUNK_MS} ms queue, volume {volume_pct}%, paced by credit"
+        ));
+        let mut data: Vec<Box<[u8]>> = (0..BUFFERS).map(|_| vec![0u8; CHUNK_BYTES].into_boxed_slice()).collect();
+        let mut hdrs: Vec<Box<WAVEHDR>> = (0..BUFFERS).map(|_| Box::new(WAVEHDR::default())).collect();
+        let mut stats = Stats::default();
+        let mut pending: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+        let mut next_line = 0u64;
+        let mut open = true;
+        let mut started = false;
+        while open || pending.len() >= CHUNK_BYTES {
+            // Take what has arrived; wait a little only when there is nothing
+            // to hand the device.
+            let wait = if pending.len() >= CHUNK_BYTES { Duration::ZERO } else { Duration::from_millis(5) };
+            match rx.recv_timeout(wait) {
+                Ok(b) => {
+                    pending.extend(b);
+                    while let Ok(b) = rx.try_recv() {
+                        pending.extend(b);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open = false,
+            }
+            let busy = hdrs.iter().filter(|hd| hd.dwFlags & WHDR_PREPARED != 0 && hd.dwFlags & WHDR_DONE == 0).count();
+            if started && busy == 0 && pending.len() < CHUNK_BYTES {
+                stats.underruns += 1;
+                started = false;
+            }
+            while pending.len() >= CHUNK_BYTES {
+                let Some(i) = hdrs.iter().position(|hd| hd.dwFlags & WHDR_PREPARED == 0 || hd.dwFlags & WHDR_DONE != 0) else {
+                    // Every buffer is at the device: wait for one, not drop.
+                    std::thread::sleep(Duration::from_millis(2));
+                    break;
+                };
+                let hd = &mut hdrs[i];
+                if hd.dwFlags & WHDR_PREPARED != 0 {
+                    // SAFETY: a header this device has finished with.
+                    unsafe { waveOutUnprepareHeader(h, &mut **hd, HDR) };
+                }
+                for (d, s) in data[i].iter_mut().zip(pending.drain(..CHUNK_BYTES)) {
+                    *d = s;
+                }
+                let loud = audible(&data[i]);
+                **hd = WAVEHDR { lpData: data[i].as_mut_ptr(), dwBufferLength: CHUNK_BYTES as u32, ..WAVEHDR::default() };
+                // SAFETY: as in `play`.
+                unsafe {
+                    waveOutPrepareHeader(h, &mut **hd, HDR);
+                    waveOutWrite(h, &mut **hd, HDR);
+                }
+                started = true;
+                credit(CHUNK_BYTES as u32);
+                stats.chunks_played += 1;
+                if loud {
+                    stats.chunks_audible += 1;
+                }
+                if stats.chunks_played >= next_line {
+                    say(&stats.line());
+                    next_line = stats.chunks_played + 500;
+                }
+            }
+        }
+        // SAFETY: as in `play`.
         unsafe {
             waveOutReset(h);
             for hd in hdrs.iter_mut() {

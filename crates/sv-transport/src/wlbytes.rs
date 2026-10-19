@@ -181,6 +181,26 @@ pub fn is_service(owner_id: u64) -> bool {
     owner_id >> 56 == SERVICE_TAG >> 56
 }
 
+/// See [`ByteChannel::kicker`].
+pub struct Kicker {
+    word: *const std::sync::atomic::AtomicU32,
+    _control: std::sync::Arc<Control>,
+}
+
+// SAFETY: the word is an atomic in a shared mapping that `_control` keeps
+// mapped; touching it from any thread is what it is for.
+unsafe impl Send for Kicker {}
+unsafe impl Sync for Kicker {}
+
+impl Kicker {
+    pub fn kick(&self) {
+        // SAFETY: see the Send/Sync impls.
+        let w = unsafe { &*self.word };
+        w.fetch_add(1, std::sync::atomic::Ordering::Release);
+        crate::park::sys::wake(w);
+    }
+}
+
 impl ByteChannel {
     /// Claim a free ring slot for a new connection. The host proxy's `connect`.
     ///
@@ -375,6 +395,14 @@ impl ByteChannel {
         self.rx.ctrl().bell(self.endpoint.rx())
     }
 
+    /// A handle another thread can use to end this end's
+    /// [`Self::wait_readable`] early (§103.16): it rings the lane's own word
+    /// locally, as a doorbell byte would. `control` keeps the mapping alive.
+    pub fn kicker(&self, control: &std::sync::Arc<Control>) -> Result<Kicker> {
+        let bell = self.rx_bell()?;
+        Ok(Kicker { word: bell.wake as *const std::sync::atomic::AtomicU32, _control: std::sync::Arc::clone(control) })
+    }
+
     /// Block until this end has something to read, or `timeout` (§103.15).
     ///
     /// [`crate::park::Bell`]'s handshake for a reader whose wait is the
@@ -385,12 +413,26 @@ impl ByteChannel {
     /// a doorbell nothing ends the sleep early, so a caller polling over a
     /// bell-less region passes a short timeout.
     pub fn wait_readable(&self, timeout: std::time::Duration) -> Result<bool> {
+        let epoch = self.wake_epoch()?;
+        self.wait_readable_since(epoch, timeout)
+    }
+
+    /// The lane's wake count now: take it *before* looking at whatever else
+    /// a thread waits for (a queue other threads fill and then [`Kicker::kick`]),
+    /// and pass it to [`Self::wait_readable_since`], so a kick in between is
+    /// not slept through.
+    pub fn wake_epoch(&self) -> Result<u32> {
+        Ok(self.rx_bell()?.wake.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// [`Self::wait_readable`], sleeping only if nothing rang since `epoch`.
+    pub fn wait_readable_since(&self, epoch: u32, timeout: std::time::Duration) -> Result<bool> {
         use std::sync::atomic::Ordering;
         if self.readable()? {
             return Ok(true);
         }
         let bell = self.rx_bell()?;
-        let seen = bell.wake.load(Ordering::Acquire);
+        let seen = epoch;
         bell.parked.fetch_add(1, Ordering::SeqCst);
         if !self.readable()? {
             crate::park::sys::wait(bell.wake, seen, timeout);
@@ -765,5 +807,52 @@ mod tests {
             (0..g.ring_slot_count - 1).map(|i| ByteChannel::claim(&control, u64::from(i)).unwrap()).collect();
         assert_eq!(conns.len() as u32, g.ring_slot_count - 1, "every slot but the reverse ring");
         assert!(ByteChannel::claim(&control, 99).is_err(), "and then the directory is full");
+    }
+
+    /// §103.16: a packet that does not fit before the lane's end makes the
+    /// writer publish a pad, and the reader has to consume the pad before
+    /// there is room. A reader asleep on the lane must be woken by the pad,
+    /// or the writer sees `RingFull` for ever. The first small packet moves
+    /// the tail off zero, so a full-size write needs the pad.
+    #[test]
+    fn a_pad_wakes_a_parked_reader() {
+        let g = Geometry::for_wayland();
+        let mut mem = vec![0u64; g.control_size as usize / 8];
+        // SAFETY: a zeroed, 8-aligned buffer of the geometry's size that
+        // outlives both channels.
+        let region = Arc::new(unsafe { SharedRegion::from_raw(mem.as_mut_ptr().cast(), g.control_size as usize) });
+        let control = Arc::new(Control::create(region, g, ProtocolIds::new(1, 1), 1).unwrap());
+        let mut rx = ByteChannel::claim(&control, 9).unwrap();
+        let mut tx = ByteChannel::open(&control, rx.slot(), Endpoint::Peer).unwrap();
+        assert_eq!(tx.write(&[1; 12]).unwrap(), 12);
+        let mut buf = vec![0u8; 1 << 17];
+        assert!(matches!(rx.read(&mut buf).unwrap(), ReadOutcome::Bytes(12)));
+        let reader = std::thread::spawn(move || {
+            let mut got = 0usize;
+            let t = std::time::Instant::now();
+            while got < 200_000 && t.elapsed() < std::time::Duration::from_secs(20) {
+                match rx.read(&mut buf).unwrap() {
+                    ReadOutcome::Bytes(n) => got += n,
+                    // Long sleeps: only a bell ends them in time.
+                    _ => drop(rx.wait_readable(std::time::Duration::from_secs(20))),
+                }
+            }
+            (got, t.elapsed())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let data = vec![7u8; 200_000];
+        let mut sent = 0;
+        let t = std::time::Instant::now();
+        while sent < data.len() {
+            match tx.write(&data[sent..]).unwrap() {
+                0 => std::thread::sleep(std::time::Duration::from_millis(1)),
+                n => sent += n,
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the writer saw a full ring for ever");
+        }
+        let (got, took) = reader.join().unwrap();
+        assert_eq!(got, 200_000);
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        drop(mem);
     }
 }

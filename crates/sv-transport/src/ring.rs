@@ -512,6 +512,12 @@ impl RingProducer {
             self.region.write_bytes(self.lanes.data_off + pos, &pad)?;
             tail += to_end;
             self.region.atomic_u64(self.lanes.tail_off)?.store(tail, Ordering::Release);
+            // The pad is a publication too (§103.16): if the packet does not
+            // fit after it, the consumer has to read the pad before there is
+            // room, and a consumer asleep on this lane would never be told.
+            // That was a deadlock: a writer of near-capacity packets facing a
+            // parked reader saw RingFull for ever.
+            self.ctrl.bell(self.lanes.lane)?.ring();
             pos = 0;
         }
 

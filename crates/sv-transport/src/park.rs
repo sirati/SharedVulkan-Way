@@ -244,13 +244,24 @@ pub const fn lane_token(slot: u32, lane: Lane) -> u8 {
 pub const HELLO_TOKEN: u8 = 0xFE;
 
 /// Not a lane: "rescan everything" (§103.15). A doorbell hub sends it to
-/// every client after it has (re)opened its port, because a byte that
+/// every client after it has (re)opened its port (and, since §105, to the guest
+/// after it has reconnected to QEMU, for the bytes the guest's side lost), because a byte that
 /// arrived while the port was closed was dropped by the driver (Linux's
 /// virtio_console drops bytes while no process has the port open, measured
 /// on the real Mac): every waiter re-checks its ring rather than trust that
 /// it saw every wake. [`crate::vdoorbell::serve_port`] turns it into
 /// [`crate::vdoorbell::BellTarget::rescan`].
 pub const RESCAN_TOKEN: u8 = 0xFC;
+
+/// Not a lane: "look at the GPU pool's mailboxes" (`crate::poolcold`). The
+/// VM host's `sv-hostd ivshmem-serve` rings it after it has claimed and
+/// answered an offer; the guest's GPU process rings it after it has made an
+/// offer and after it has published an accepted session's control region.
+/// Whoever receives it rescans every mailbox; nothing about which one is in
+/// the byte. Its top bit is set, so it can never be a [`lane_token`]: an ICD's
+/// doorman on the same hub, which does not know it, rings no lane
+/// ([`lane_from_token`] names slot 62, past every directory's end).
+pub const COLD_TOKEN: u8 = 0xFD;
 
 /// Undo [`lane_token`].
 pub fn lane_from_token(token: u8) -> (u32, Lane) {

@@ -42,6 +42,8 @@ mod macbundle;
 mod mac;
 #[cfg(target_os = "macos")]
 mod audio_mac;
+#[cfg(target_os = "macos")]
+mod sound_mac;
 mod plan;
 mod single;
 #[cfg(windows)]
@@ -145,6 +147,12 @@ struct Paths {
     state: PathBuf,
     comp_log: PathBuf,
     known_hosts: PathBuf,
+    /// §105. The compositor's control socket: every launcher of this
+    /// installation sends its requests for the host there, and the compositor
+    /// carries them on the session's control ring.
+    ctl: PathBuf,
+    /// §105. The installation's key, beside the launcher unless the ini says.
+    key: PathBuf,
     /// §92. `<exe dir>\apps`: the relaunch files the compositor reads
     /// (`--relaunch-dir`) and the host's last answer about each application.
     /// Beside the executable, because a relaunch command names this
@@ -172,6 +180,8 @@ fn paths(session: &str) -> Result<Paths, String> {
         state: state_dir.join(format!("wc-launch-{session}.state")),
         comp_log: state_dir.join(format!("wc-launch-{session}-comp.log")),
         known_hosts: exe_dir.join("known_hosts"),
+        ctl: state_dir.join(format!("wc-launch-{session}.ctl")),
+        key: exe_dir.join("session.key"),
         apps: exe_dir.join("apps"),
         jump: state_dir.join("jumplist"),
         state_dir,
@@ -251,6 +261,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // §105: the installation's own name from here on, whatever the command
+    // line said (a shortcut carries none). The log, the state file and the
+    // control socket are the session's, and every launcher of the
+    // installation, and its jump-list thread, must find the same ones: the
+    // first guest run had the click on `wcl`'s and the jump list on `wcns`'s.
+    let (p, mut log) = if cfg.session != session {
+        match paths(&cfg.session) {
+            Ok(q) => {
+                let l = Log::open(&q.log);
+                (q, l)
+            }
+            Err(_) => (p, log),
+        }
+    } else {
+        (p, log)
+    };
     let rc = run(&args, &cfg, &p, &mut log, t0);
     match rc {
         Ok(()) => ExitCode::SUCCESS,
@@ -640,6 +666,90 @@ mod win {
         Ok(so)
     }
 
+    /// §105. One request for the VM host, in `wc-session`'s words with no
+    /// session id: through the compositor's control socket and the session's
+    /// control ring, or, in the opt-in debug transport only, an ssh exec.
+    fn host(cfg: &Config, p: &Paths, words: &[&str]) -> Result<String, String> {
+        if cfg.debug_ssh_transport {
+            return ssh(cfg, p, words);
+        }
+        control(p, &format!("raw {}", words.join(" ")))
+    }
+
+    /// [`host`] for a verb that names the session: the ssh path sends its id
+    /// second, the ring path leaves it to the host, which knows it.
+    fn host_session(cfg: &Config, p: &Paths, id: &str, words: &[&str]) -> Result<String, String> {
+        if cfg.debug_ssh_transport {
+            let mut w = words.to_vec();
+            w.insert(1.min(w.len()), id);
+            return ssh(cfg, p, &w);
+        }
+        host(cfg, p, words)
+    }
+
+    /// §105. The compositor's control socket: one line out, the answer back.
+    /// `ok-raw N` is followed by exactly the verb's output, `ok …` and
+    /// `err …` are one line.
+    pub fn control(p: &Paths, line: &str) -> Result<String, String> {
+        CtlClient::connect(p)?.request(line)
+    }
+
+    /// One connection to the compositor's control socket, for any number of
+    /// requests in turn (§105.13).
+    pub struct CtlClient {
+        s: wc_transport::Stream,
+        buf: Vec<u8>,
+    }
+
+    impl CtlClient {
+        pub fn connect(p: &Paths) -> Result<CtlClient, String> {
+            let s = wc_transport::connect(&p.ctl).map_err(|e| {
+                format!("no session to ask ({}: {e}); the request goes through the session's control ring", p.ctl.display())
+            })?;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(40)));
+            Ok(CtlClient { s, buf: Vec::with_capacity(4096) })
+        }
+
+        fn fill(&mut self) -> Result<(), String> {
+            use std::io::Read;
+            let mut tmp = [0u8; 16 * 1024];
+            match self.s.read(&mut tmp) {
+                Ok(0) => Err("the compositor closed the control socket".into()),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                    Ok(())
+                }
+                Err(e) => Err(format!("control socket: {e}")),
+            }
+        }
+
+        pub fn request(&mut self, line: &str) -> Result<String, String> {
+            use std::io::Write;
+            self.s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("control socket: {e}"))?;
+            let nl = loop {
+                if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
+                    break i;
+                }
+                self.fill()?;
+            };
+            let head = String::from_utf8_lossy(&self.buf[..nl]).into_owned();
+            self.buf.drain(..=nl);
+            if let Some(n) = head.strip_prefix("ok-raw ").and_then(|n| n.trim().parse::<usize>().ok()) {
+                while self.buf.len() < n {
+                    self.fill()?;
+                }
+                let body: Vec<u8> = self.buf.drain(..n).collect();
+                Ok(String::from_utf8_lossy(&body).trim().to_string())
+            } else if let Some(rest) = head.strip_prefix("ok") {
+                Ok(rest.trim().to_string())
+            } else if let Some(rest) = head.strip_prefix("err") {
+                Err(rest.trim().to_string())
+            } else {
+                Err(format!("the compositor answered {head:?}"))
+            }
+        }
+    }
+
     /// Poll a growing log for a line. Everything this launcher waits for is a
     /// line in somebody's log, because the alternative — a second channel back
     /// from a process that already has one — is a second thing to get wrong.
@@ -660,7 +770,7 @@ mod win {
             if Instant::now() > deadline {
                 return Err(format!("{} never said what was expected", path.display()));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -682,8 +792,44 @@ mod win {
     /// runs the same `Command` with the same argv the real path uses.
     pub fn ping(cfg: &Config, p: &Paths, log: &mut Log) -> Result<(), String> {
         let t = Instant::now();
-        let said = ssh(cfg, p, &["ping"])?;
-        log.say(&format!("PING {said} ({} ms)", t.elapsed().as_millis()));
+        // §105: a round trip to the host through the session's control ring;
+        // with no session there is nothing to cross on, which is said.
+        if cfg.debug_ssh_transport {
+            let said = ssh(cfg, p, &["ping"])?;
+            log.say(&format!("PING {said} ({} ms)", t.elapsed().as_millis()));
+            return Ok(());
+        }
+        // §105.13: `WC_PING_N` round trips of `WC_PING_VERB` (default `rtt`,
+        // the host's no-op) on one connection, and their distribution.
+        let n: usize = std::env::var("WC_PING_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let verb = std::env::var("WC_PING_VERB").unwrap_or_else(|_| "rtt".into());
+        // A gap between requests, so each finds the host parked on its lane and
+        // crosses by doorbell, as a click's single request does.
+        let gap = Duration::from_millis(std::env::var("WC_PING_GAP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let mut c = CtlClient::connect(p)?;
+        let mut us: Vec<f64> = Vec::with_capacity(n);
+        let mut said = String::new();
+        for _ in 0..n {
+            if !gap.is_zero() {
+                std::thread::sleep(gap);
+            }
+            let t1 = Instant::now();
+            said = c.request(&format!("raw {verb}"))?;
+            us.push(t1.elapsed().as_secs_f64() * 1e6);
+        }
+        let mut sorted = us.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f).round() as usize];
+        let mean = us.iter().sum::<f64>() / us.len() as f64;
+        log.say(&format!(
+            "PING {verb:?} x{n} (gap {gap:?}) on the control ring: mean {mean:.1} us, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1} us ({} ms in all){}",
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            q(1.0),
+            t.elapsed().as_millis(),
+            if said.is_empty() { String::new() } else { format!("; last answer {} byte(s)", said.len()) }
+        ));
         Ok(())
     }
 
@@ -703,11 +849,13 @@ mod win {
         };
         let s = State::parse(&text);
         log.say(&format!("stop: ending session {} (compositor pid {})", s.id, s.comp_pid));
+        // §105: the host first, while the control ring is still there; its proxy
+        // ends and the host's session service takes the session down. Without
+        // the ring the lease does the same within seconds.
+        let _ = host_session(cfg, p, &s.id, &["down"]);
         // The compositor is the session's life. Ending it makes the owner run
         // its own teardown, which is the only code that knows what to unwind.
         kill(s.comp_pid);
-        // And say so to the host as well, in case the owner is already gone.
-        let _ = ssh(cfg, p, &["down", &s.id]);
         Ok(())
     }
 
@@ -761,11 +909,25 @@ mod win {
         // does, because the compositor stamps a window's relaunch command when
         // it stamps its identity. Every later launch refreshes after its window
         // is up, where the user does not wait for it.
-        if let Some((section, a)) = app
-            && !relaunch_file(p, section, a).exists()
+        //
+        // §105: the host is reached only through a session's control ring, so
+        // with no session up yet this is done once the session is, before the
+        // application is asked for (`first_refresh` below).
+        let first = app.filter(|(section, a)| !relaunch_file(p, section, a).exists()).map(|(s, _)| s);
+        if let Some(section) = first
+            && (cfg.debug_ssh_transport || p.ctl.exists())
         {
             refresh(cfg, p, log, section, Refresh::Full);
         }
+        let first_refresh = |log: &mut Log| {
+            if let Some(section) = first
+                && !cfg.debug_ssh_transport
+                && let Some((_, a)) = app
+                && !relaunch_file(p, section, a).exists()
+            {
+                refresh(cfg, p, log, section, Refresh::Full);
+            }
+        };
         // §85. A session now ends `linger-secs` after its last window, so a
         // click can land in the seconds while one is winding down: it joins,
         // and the session goes from under it. That click starts a new session
@@ -811,6 +973,7 @@ mod win {
                     }
                 };
                 log.say(&format!("session up in {} ms", t0.elapsed().as_millis()));
+                first_refresh(log);
                 if let Some((section, a)) = app {
                     let before = count_mapped(&p.comp_log);
                     start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
@@ -852,7 +1015,122 @@ mod win {
     /// Everything that has to happen once. Timed line by line in the log,
     /// because "is it fast" is a question about which of these is expensive and
     /// the answer moved twice while this was being written.
-    fn cold(cfg: &Config, p: &Paths, log: &mut Log, _owner: &Owner) -> Result<Session, String> {
+    ///
+    /// §105: **no ssh, no relay, no tunnel.** The compositor maps the ivshmem
+    /// device, publishes the arena header and the Wayland rings, and writes a
+    /// boot record signed with this installation's key into the header page;
+    /// the VM host's session service reads it, starts the proxy and the
+    /// session's sound, and answers in the same page. Every later request is
+    /// a line on the compositor's control socket, carried on the session's
+    /// control ring.
+    fn cold(cfg: &Config, p: &Paths, log: &mut Log, owner: &Owner) -> Result<Session, String> {
+        if cfg.debug_ssh_transport {
+            return cold_ssh_debug(cfg, p, log, owner);
+        }
+        let t = Instant::now();
+        let id = plan::run_id(&cfg.session, std::process::id());
+        let socket = format!("wl-{id}");
+        let socket_path = p.state_dir.join(&socket);
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&p.comp_log);
+        let _ = std::fs::remove_file(&p.ctl);
+        let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
+        if !key.exists() {
+            return Err(format!(
+                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+                key.display()
+            ));
+        }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), ..State::default() }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+
+        // The GPU process first, so its driver opens while the compositor
+        // boots (§105.13).
+        let gpu_kid = if cfg.gpu_sessions > 0 { spawn_gpu(cfg, p, log) } else { None };
+        let mut argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
+        argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
+        argv.extend(plan::boot_argv(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy()));
+        if gpu_kid.is_some() {
+            argv.push("--boot-gpu".into());
+        }
+        log.say(&format!(
+            "transport: shared memory only (§105): the ivshmem rings for every byte, the doorbell {}, \
+             installation {}; no ssh",
+            cfg.wayland_bell,
+            cfg.installation()
+        ));
+        log.say(&format!("compositor: {} {}", cfg.compositor, argv.join(" ")));
+        let t_comp = Instant::now();
+        let comp = quiet(Command::new(&cfg.compositor).args(&argv))
+            .spawn()
+            .map_err(|e| format!("{}: {e}", cfg.compositor))?;
+        let comp_pid = comp.id();
+
+        // The host's answer, in the compositor's words. Every failure from here
+        // kills the compositor, for the reasons the debug path gives.
+        let answer = wait_for(&p.comp_log, 100, |l| {
+            if l.contains("boot: located") {
+                Some(Ok(l.to_string()))
+            } else if l.contains("boot: FAILED") || l.contains("could not provide arena") || l.contains("could not publish") {
+                Some(Err(l.to_string()))
+            } else {
+                None
+            }
+        });
+        let gpu_pid = gpu_kid.as_ref().map(Child::id).unwrap_or(0);
+        let fail = |why: String| {
+            kill(comp_pid);
+            kill(gpu_pid);
+            Err::<Session, String>(why)
+        };
+        match answer {
+            Ok(Ok(l)) => log.say(&format!("up: {} ({} ms after the compositor was started)", l.trim(), t_comp.elapsed().as_millis())),
+            Ok(Err(l)) => return fail(format!("the session did not start: {}", l.trim())),
+            Err(e) => return fail(format!("the compositor never said whether the host started the session: {e}")),
+        }
+        let text = std::fs::read_to_string(&p.comp_log).unwrap_or_default();
+        if let Some(run) = text.lines().find_map(|l| Some(l.split_once("header published: run ")?.1.split(',').next()?.trim().to_string())) {
+            log.say(&format!("arena: run {run}"));
+        }
+        for l in text.lines().filter(|l| l.contains("wayland rings:") || l.contains("NO DOORBELL") || l.contains("boot: record")) {
+            log.say(&format!("rings: {}", l.trim()));
+        }
+        // The control socket appears once the host has claimed the control
+        // ring; a request before it would find no session.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !p.ctl.exists() {
+            if Instant::now() > deadline {
+                return fail("the compositor never opened its control socket (the host claimed no control ring)".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // The forwarded GPU (§86, §87): its process started before the
+        // compositor, its host half by the session service at boot, its cold
+        // path a mailbox in the GPU pool's header (§105). What it said so far:
+        let gpus: Vec<Child> = gpu_kid.into_iter().collect();
+        if !gpus.is_empty() {
+            let gl = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
+            let text = std::fs::read_to_string(&gl).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains("ivshmem slot") || l.contains("doorbell") || l.contains("publishing")) {
+                log.say(&format!("gpu: {}", l.trim()));
+            }
+        }
+        if !cfg.audio {
+            log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
+        }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, ready: true }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+        log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
+        Ok(Session { id, comp, relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+    }
+
+    fn cold_ssh_debug(cfg: &Config, p: &Paths, log: &mut Log, _owner: &Owner) -> Result<Session, String> {
+        for _ in 0..3 {
+            log.say("DEBUG SSH TRANSPORT: debug-ssh-transport = on; this session uses ssh, the relay and the tunnel, which no product path does (§105)");
+        }
         let t = Instant::now();
         let pid = std::process::id();
         let id = plan::run_id(&cfg.session, pid);
@@ -1019,14 +1297,15 @@ mod win {
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay, tunnel, gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp, relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
         id: String,
         comp: Child,
-        relay: Child,
-        tunnel: Child,
+        /// The debug transport's relay and tunnel (§105); `None` on the product path.
+        relay: Option<Child>,
+        tunnel: Option<Child>,
         /// The GPU sides this session started (§86); empty without `gpu-sessions`.
         gpus: Vec<Child>,
         comp_log: std::path::PathBuf,
@@ -1042,6 +1321,36 @@ mod win {
     /// Started after the proxy; every failure from here kills what it started
     /// and returns none, and the host then gives Firefox no GPU environment, so
     /// it renders in software rather than failing to start its renderer.
+    /// §105.13: the GPU process, started and not waited for. The host's half
+    /// is started by the session service at boot (the record's `gpu` flag)
+    /// and waits for this process's offers by itself, so the two start side by
+    /// side with the compositor instead of one after the other.
+    fn spawn_gpu(cfg: &Config, p: &Paths, log: &mut Log) -> Option<Child> {
+        let path = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
+        let _ = std::fs::remove_file(&path);
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                return None;
+            }
+        };
+        match Command::new(&cfg.compositor)
+            .args(plan::gpu_argv(cfg))
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
+                None
+            }
+        }
+    }
+
     fn start_gpu(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Vec<Child> {
         let t = Instant::now();
         let path = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
@@ -1084,7 +1393,7 @@ mod win {
             log.say(&format!("gpu: {}", l.trim()));
         }
         let n = cfg.gpu_sessions.to_string();
-        match ssh(cfg, p, &["gpu", id, &n]) {
+        match host_session(cfg, p, id, &["gpu", &n]) {
             Ok(s) => {
                 log.say(&format!("gpu: {} ({} ms)", s.replace('\n', " | "), t.elapsed().as_millis()));
                 vec![kid]
@@ -1170,8 +1479,10 @@ mod win {
         let (dpi, caption) = desktop_metrics();
         log.say(&format!("desktop: {dpi} dpi, caption {} px", caption.unwrap_or(0)));
         let verb = plan::launch_verb(id, &app.host_app, req, dpi, caption);
+        // §105: on the control ring the host puts the session's id in itself.
+        let verb = if cfg.debug_ssh_transport { verb } else { plan::without_id(&verb) };
         let words: Vec<&str> = verb.iter().map(String::as_str).collect();
-        let said = ssh(cfg, p, &words)?;
+        let said = host(cfg, p, &words)?;
         // A page's URL is the user's history and is not written to this log.
         let what = match req {
             crate::Request::Run => "run".to_string(),
@@ -1591,12 +1902,15 @@ mod win {
     fn supervise(cfg: &Config, p: &Paths, log: &mut Log, mut s: Session) -> Result<(), String> {
         let rc = s.comp.wait().map_err(|e| format!("waiting on the compositor: {e}"))?;
         log.say(&format!("the compositor exited: {rc}"));
-        let _ = s.relay.kill();
-        let _ = s.tunnel.kill();
-        for g in s.gpus.iter_mut() {
-            let _ = g.kill();
+        for c in s.relay.iter_mut().chain(s.tunnel.iter_mut()).chain(s.gpus.iter_mut()) {
+            let _ = c.kill();
         }
-        let _ = ssh(cfg, p, &["down", &s.id]);
+        // §105: on the rings the host needs no word: the compositor's pings
+        // stopped with it, its proxy ends five seconds later and the host's
+        // session service takes the session down.
+        if cfg.debug_ssh_transport {
+            let _ = ssh(cfg, p, &["down", &s.id]);
+        }
         let _ = std::fs::remove_file(&p.state);
         let _ = std::fs::remove_file(&s.comp_log);
         log.say("session down");
@@ -1712,7 +2026,7 @@ mod win {
             let theme = if dark { "dark" } else { "light" };
             // §94: by the host's id; the host knows the desktop entry and the
             // executable it belongs to.
-            match ssh(cfg, p, &["app", &app.host_app, theme]) {
+            match host(cfg, p, &["app", &app.host_app, theme]) {
                 Ok(out) => match appmeta::Meta::parse(&out) {
                     Ok(_) => {
                         let _ = std::fs::write(&meta_path, &out);
@@ -1761,7 +2075,7 @@ mod win {
             return;
         };
         let (prefs, pages) = if meta.takes_url {
-            match ssh(cfg, p, &["frequent", &app.host_app]) {
+            match host(cfg, p, &["frequent", &app.host_app]) {
                 Ok(out) => appmeta::parse_frequent(&out),
                 Err(e) => {
                     // First line only: a failed reply can carry the pages after it.

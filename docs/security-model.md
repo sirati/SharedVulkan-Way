@@ -1279,3 +1279,124 @@ on, the seat takes `NAME=value` words after the mode, only from a fixed list,
 each checked for its kind (store paths for libraries and manifests,
 `safe_socket` for `SV_SOCKET` and `SV_BELL`, fixed values for the rest), and
 writes them as plasmashell's environment; anything else is refused.
+
+### R37 — No ssh: the shared-memory device is the boundary, and a key signs the boot
+Added 2026-10-19 with `waycompose-design.md` §105. Until §105 the guest's
+only authority on the VM host was an ssh key in the installation's directory,
+restricted by `authorized_keys` to `wc-session` as a forced command (R33).
+That key started every session, carried every request and held the tunnel
+the sound, the feeds and the GPU's cold path went through. §105 removes ssh
+from the session entirely. What replaced each part of it:
+
+* **Who may start a session.** The compositor writes a boot record into the
+  ivshmem header page (`wc_handle::macboot`, at byte 1024) and an
+  authenticator beside it (byte 1792): the installation's name, a sequence
+  number and HMAC-SHA-256 over every field of the record under the
+  installation's key. The host's session service (`wc-arena-host sessiond
+  --ivshmem`, user unit `wc-sessiond.service`, as the user, refusing root)
+  acts on a record only if the installation is registered
+  (`~/.config/waycompose/installs/<name>` → its directory), the MAC verifies
+  under `<dir>/session.key` (this user's, mode 0600, or refused), and the
+  sequence number is above every one accepted for that installation before
+  (`~/.local/state/waycompose/sessiond/<name>.seq`). The key is 32 random
+  bytes made on the host at the first deploy and kept; it exists in two places,
+  that file and `session.key` beside the launcher in the guest user's profile,
+  whose ACL deploy reduces to that one user reading it.
+* **What a session may ask.** Unchanged in substance. Requests are lines on
+  the session's control ring (`OWNER_CONTROL`); the proxy runs each through
+  that installation's `wc-session` with the words as `SSH_ORIGINAL_COMMAND`,
+  so §94's validation is the same code (R33): application ids, an action id or
+  a URL, two numbers. The proxy refuses any word outside `[A-Za-z0-9 +/=._-]`
+  before `wc-session` sees it and puts the session's own id after the verb,
+  so a guest cannot name another session. `app`, `frequent` and `icon` take
+  no session, as on ssh.
+* **How the guest reaches the host at all.** Only through the ivshmem device
+  and the two virtio-serial ports R29, R31 and R35 describe. Nothing listens
+  on a network. The guest has no ssh key for the host (deploy deletes
+  `id_host`), and the host has no `authorized_keys` line for the installation
+  (deploy removes it). The guest's loopback TCP ports (the relay's, the
+  sound's, the GPU process's) are gone.
+
+**What the guest can do that it could not before.** Start a session without
+an ssh key, if it has the installation's key. That is the same population:
+the ssh key sat in the same directory with the same reader. A process of the
+guest user can read either and is the user. A process of another guest user
+can read neither, and the device alone does not let it in: an unsigned or
+mis-signed record is refused with a reason written back into the page.
+
+**What a process that can map the device can do.** The Windows driver gives
+one mapping per device, and while a session runs the compositor holds it, so
+no other guest process can touch that session's rings or header. With no
+session up, such a process can write a boot record, which is refused without
+the key, or replay one it read earlier, which is refused by the sequence
+number; a record whose fields were changed fails the MAC. It cannot forge a
+session, and a refused record costs the host one page read and a log line.
+
+**What the host's service trusts.** Every field of the record is untrusted
+input: the session id is `wc-session`'s alphabet, the installation name
+`[A-Za-z0-9_-]` up to 32, looked up only as a direct entry of the registry,
+and the record must match the header the device holds (magic and run id) and
+read the same twice. It answers only in the page it read, after checking that
+page still holds the same record.
+
+**What this does not protect.** A guest process running as the user can read
+`session.key` and start sessions, as it could use the ssh key before. The key
+is not rotated; redeploying keeps it, and deleting `<dir>/session.key` on the
+host makes the next deploy issue a new one. A member of `wc-arena` on the host
+can write the device file, so it can write a boot record too, but it can only
+ask this user's service to start this user's installations, with nothing it
+could not already run itself. Deployment itself still uses ssh from the
+developer's workstation to both machines (an administrator's channel, not the
+session's): that is how the key crosses, once.
+
+**The debug transport.** `debug-ssh-transport = on` in `wc-launch.ini`,
+deployed with `WC_LAUNCH_DEBUG_SSH_TRANSPORT=1`, brings back the pre-§105
+path, key and forced command included. It is off by default, says
+`DEBUG SSH TRANSPORT` three times in the session's log, and the harness fails
+a run whose log says it.
+
+### R40 — A macOS guest starts its sessions through a record in its own RAM
+Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
+(role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
+reads QEMU's memory backend (the same descriptor `wc-arena-host`'s locate
+already reads) for boot records, and for each one runs `wc-session up`,
+`rings`, `proxy` and `gpu` with the unit's environment. Before §103.15 the
+guest did this with three ssh execs under a forced-command key; the key and the
+private sshd are gone.
+
+**Who can start a session.** Any process in the guest that can stamp a window
+of its own RAM with the arena's stamp and a boot record, which is any process
+of any macOS user in the VM, not only the one holding a key. What it gets is
+what the key gave: the words reach `wc-session` as `SSH_ORIGINAL_COMMAND`, so
+§94's validation applies unchanged. The session id is `[A-Za-z0-9_-]{1,64}`,
+the run ids and counts are checked again, applications come only from the
+host's `apps.ini`, and no command line or path crosses. A guest process can
+therefore start the configured applications as the host user, and can make the
+host locate and map windows of its own RAM (it cannot name any other memory:
+the sweep finds pages by the guest's own stamps, and the plan maps only them).
+The Windows branch's optional HMAC block in the boot record (per-installation
+key, sequence number) will close this to the launcher that holds the key; macOS
+opts in when it lands. Until then the VM's other users are trusted as much as
+its launcher.
+
+**What the host writes into the guest.** The answer (state word and message) in
+the record's own page, and at the session's end the release word in the same
+page, each only after re-reading the page and finding the record unchanged, so a
+page the guest has freed and reused is never written (tested,
+`a_reused_page_is_not_written`).
+
+**Writes into freed guest memory.** The proxy writes pixels and ring bytes into
+the session's windows. A guest process that dies frees them at once on macOS,
+and the host kept writing for up to its 5 s lease: three guest kernel panics,
+memory corruption in the guest's kernel. Since §103.15 a keeper process holds
+every window (POSIX shared memory, wired) until the release word is written,
+and the main process refuses to start a session without one. *What this does
+not cover:* a keeper killed with SIGKILL, and the GPU server's own extent if
+the GPU server crashes while `sv-hostd` serves it.
+
+**The doorbells** are R35's hub, holding the VM's two legacy virtio-serial
+ports. A guest process can ring `HELLO_TOKEN`, which costs the host one sweep
+of the guest's memory (about 0.45 s of one core for 4 GiB). The service sweeps
+at most once a second however often it is rung, so a guest that rings in a
+loop costs the host about half a core; the guest's own launcher rings once
+every 3 s, and only while its record waits.

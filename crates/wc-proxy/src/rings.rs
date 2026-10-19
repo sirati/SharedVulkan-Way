@@ -109,6 +109,7 @@ impl BellTarget for BellHub {
         }
         true
     }
+
 }
 
 /// The doorbell, held for the life of the proxy.
@@ -190,6 +191,7 @@ impl BellTarget for HubAndControl {
         let b = self.control.ring_token(token, woken);
         a || b
     }
+
 }
 
 /// How long a session service's thread sleeps on its lane before looking

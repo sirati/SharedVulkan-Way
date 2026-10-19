@@ -36,6 +36,9 @@ pub struct Services {
     pub session: Option<PathBuf>,
     pub id: Option<String>,
     pub audio: Option<PathBuf>,
+    /// §103.16: the multi-stream sound ring (`--sound-pactl`, `--sound-server`,
+    /// `--sound-dir`); takes the place of `audio`'s single stream.
+    pub sound: Option<crate::sound::SoundCfg>,
 }
 
 static LAST_PING: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +63,16 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
             Err(e) => println!("[proxy] no session control ring: {e}"),
         }
     }
-    if let Some(sock) = svc.audio.clone() {
+    if let Some(cfg) = svc.sound.clone() {
+        match ByteChannel::claim(control, OWNER_AUDIO) {
+            Ok(ch) => {
+                println!("[proxy] session sound on ring slot {} (§103.16, every device a stream)", ch.slot());
+                let c = Arc::clone(control);
+                std::thread::Builder::new().name("session-sound".into()).spawn(move || crate::sound::serve(&c, ch, cfg)).ok();
+            }
+            Err(e) => println!("[proxy] no session sound ring: {e}"),
+        }
+    } else if let Some(sock) = svc.audio.clone() {
         match ByteChannel::claim(control, OWNER_AUDIO) {
             Ok(ch) => {
                 println!("[proxy] session sound on ring slot {} (no ssh)", ch.slot());
@@ -71,6 +83,9 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
         }
     }
 }
+
+/// How long a control reader looks before it parks (§105.13).
+pub const SPIN: Duration = Duration::from_micros(200);
 
 /// Read lines from a channel, sleeping on its lane when idle: woken by the
 /// doorbell, or after a millisecond when there is none (§103.15).
@@ -91,7 +106,16 @@ impl Lines {
                 Ok(ReadOutcome::Bytes(n)) => self.buf.extend_from_slice(&tmp[..n]),
                 Ok(ReadOutcome::Eof) | Err(_) => return None,
                 Ok(_) => {
-                    let _ = self.ch.wait_readable(crate::rings::service_slice());
+                    // §105.13: a request's next line, or the next request of a
+                    // burst, usually follows within microseconds: look for it a
+                    // little before parking, which costs a doorbell round trip.
+                    let t0 = Instant::now();
+                    while t0.elapsed() < SPIN && !self.ch.readable().unwrap_or(true) {
+                        std::hint::spin_loop();
+                    }
+                    if !self.ch.readable().unwrap_or(true) {
+                        let _ = self.ch.wait_readable(crate::rings::service_slice());
+                    }
                 }
             }
         }
@@ -118,6 +142,8 @@ fn words_ok(line: &str) -> bool {
 }
 
 fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String) {
+    let fast = crate::ctlfast::Fast::new(session.clone(), id.clone());
+    fast.prefetch();
     let mut lines = Lines { ch, buf: Vec::new() };
     while let Some(line) = lines.next() {
         if line == "ping" {
@@ -128,36 +154,79 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
         // service, which runs `wc-session down` once this process (its unit)
         // has ended. Running it from here stopped this process's own unit
         // before the reply went out, and the guest waited a minute for it.
-        if line.split_whitespace().next() == Some("down") {
+        // §105: `raw down` too, which is how the Windows launcher says it.
+        let first = line.split_whitespace().find(|w| *w != "raw");
+        if first == Some("down") {
             println!("[proxy] session control: \"down\": ending; the session service takes the session down");
-            let _ = write_all(&mut lines.ch, b"ok down\n");
+            let reply: &[u8] = if line.starts_with("raw ") { b"ok-raw 0\n" } else { b"ok down\n" };
+            let _ = write_all(&mut lines.ch, reply);
             std::thread::sleep(Duration::from_millis(50));
             std::process::exit(0);
         }
-        let reply = if !words_ok(&line) {
-            "err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string()
+        let (raw, line) = match line.strip_prefix("raw ") {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, line),
+        };
+        let (reply, body): (String, Vec<u8>) = if !words_ok(&line) {
+            ("err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string(), Vec::new())
         } else {
-            // The verb and this session's id, then the guest's words: the
-            // guest cannot name another session.
-            let mut w = line.split_whitespace();
-            let verb = w.next().unwrap_or("");
-            let rest: Vec<&str> = w.collect();
-            let cmd = std::iter::once(verb).chain(std::iter::once(id.as_str())).chain(rest).collect::<Vec<_>>().join(" ");
-            let t0 = Instant::now();
-            match std::process::Command::new("bash").arg(&session).env("SSH_ORIGINAL_COMMAND", &cmd).output() {
-                Ok(o) if o.status.success() => {
-                    format!("ok {} ({} ms)", String::from_utf8_lossy(&o.stdout).trim().replace('\n', "; "), t0.elapsed().as_millis())
+            // §105.13: what this process can answer itself, it answers now.
+            let fast_answer = fast.answer(&line);
+            match fast_answer {
+                crate::ctlfast::Answer::Now(b) if raw => (format!("ok-raw {}", b.len()), b),
+                crate::ctlfast::Answer::Now(b) => (format!("ok {}", String::from_utf8_lossy(&b).trim().replace('\n', "; ")), Vec::new()),
+                crate::ctlfast::Answer::Refused(e) => (format!("err {e}"), Vec::new()),
+                crate::ctlfast::Answer::Slow => {
+                    let t0 = Instant::now();
+                    match fast.run_sync(&line) {
+                        Ok(out) => {
+                            if matches!(line.split_whitespace().next(), Some("app" | "icon" | "frequent")) {
+                                fast.store(&line, out.clone());
+                            }
+                            // §105: `raw` asks for the verb's standard output
+                            // exactly, as the jump list's `app` and `frequent`
+                            // print several lines.
+                            if raw {
+                                (format!("ok-raw {}", out.len()), out)
+                            } else {
+                                (format!("ok {} ({} ms)", String::from_utf8_lossy(&out).trim().replace('\n', "; "), t0.elapsed().as_millis()), Vec::new())
+                            }
+                        }
+                        Err(e) => (format!("err {e}"), Vec::new()),
+                    }
                 }
-                Ok(o) => format!("err {}", String::from_utf8_lossy(&o.stderr).trim().replace('\n', "; ")),
-                Err(e) => format!("err {e}"),
             }
         };
-        println!("[proxy] session control: {line:?} -> {reply}");
-        if !write_all(&mut lines.ch, format!("{reply}\n").as_bytes()) {
+        // A page's URL is the user's history: `open` is logged by its verb.
+        // The launcher's `rtt` is not logged at all: it comes ten thousand at a time.
+        if line != "rtt" {
+            println!("[proxy] session control: {:?} -> {reply}", crate::ctlfast::shown(&line));
+        }
+        let mut out = format!("{reply}\n").into_bytes();
+        out.extend_from_slice(&body);
+        if !write_all(&mut lines.ch, &out) {
             break;
         }
     }
 }
+
+/// The verbs that name no session (§92's jump-list data, an icon): the
+/// guest's words go to `wc-session` as they are. Every other verb gets this
+/// session's id put after it, so the guest cannot name another session.
+const SESSIONLESS: &[&str] = &["app", "frequent", "icon", "ping"];
+
+/// The `SSH_ORIGINAL_COMMAND` a request becomes.
+pub fn command_words(line: &str, id: &str) -> String {
+    let mut w = line.split_whitespace();
+    let verb = w.next().unwrap_or("");
+    let rest: Vec<&str> = w.collect();
+    if SESSIONLESS.contains(&verb) {
+        std::iter::once(verb).chain(rest).collect::<Vec<_>>().join(" ")
+    } else {
+        std::iter::once(verb).chain(std::iter::once(id)).chain(rest).collect::<Vec<_>>().join(" ")
+    }
+}
+
 
 /// Five seconds without a ping, once pings have started, end the process:
 /// the guest's pages are no longer the session's.
@@ -204,5 +273,29 @@ fn serve_audio(_control: Arc<Control>, mut ch: ByteChannel, sock: PathBuf) {
             }
         }
         let _ = r.fill_buf();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_gets_this_sessions_id_and_jump_list_verbs_do_not() {
+        assert_eq!(command_words("run firefox 96 30", "wcns-1"), "run wcns-1 firefox 96 30");
+        assert_eq!(command_words("gpu", "wcns-1"), "gpu wcns-1");
+        assert_eq!(command_words("app firefox light", "wcns-1"), "app firefox light");
+        assert_eq!(command_words("frequent firefox", "wcns-1"), "frequent firefox");
+        // A guest that puts another id first only adds a word after its own.
+        assert_eq!(command_words("down other-1", "wcns-1"), "down wcns-1 other-1");
+    }
+
+    #[test]
+    fn only_plain_words_are_requests() {
+        assert!(words_ok("run firefox 96 30"));
+        assert!(words_ok("open firefox aHR0cHM6Ly9leGFtcGxlLm9yZy8= 96 30"));
+        assert!(!words_ok("run firefox; rm -rf ~"));
+        assert!(!words_ok("run $(id)"));
+        assert!(!words_ok(""));
     }
 }

@@ -330,6 +330,12 @@ fn parse_args() -> Result<Args, String> {
             "--session-control" => a.services.session = Some(next()?.into()),
             "--session-id" => a.services.id = Some(next()?),
             "--audio-socket" => a.services.audio = Some(next()?.into()),
+            "--sound-pactl" => a.services.sound.get_or_insert_with(Default::default).pactl = next()?.into(),
+            "--sound-server" => {
+                let v = next()?;
+                a.services.sound.get_or_insert_with(Default::default).server = (!v.is_empty()).then_some(v);
+            }
+            "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -402,19 +408,19 @@ fn parse_args() -> Result<Args, String> {
         && a.upstream_ring.is_none()
         && a.upstream_ring_attach.is_none()
         && a.wayland_rings_plan.is_none()
+        && !a.wayland_rings
     {
-        return Err("--upstream, --upstream-ring or --upstream-ring-attach is required".into());
+        return Err("--upstream, --upstream-ring, --upstream-ring-attach or --wayland-rings is required".into());
     }
     if a.wayland_rings && a.wayland_rings_plan.is_none() {
         if a.arena_ivshmem.as_os_str().is_empty() || a.arena_run.is_none() {
             return Err("--wayland-rings needs --arena-ivshmem and --arena-run: the rings are in that region".into());
         }
         if a.wayland_bell.is_none() {
-            return Err("--wayland-rings needs --wayland-bell: a ring nobody can wake is a poll".into());
+            return Err("--wayland-rings needs --wayland-bell: the hub's socket, or `poll` (a ring nobody can wake is polled)".into());
         }
-        if a.upstream.as_os_str().is_empty() {
-            return Err("--wayland-rings needs --upstream, for the feeds and for a connection that falls back".into());
-        }
+        // §105: without --upstream nothing falls back to a socket: the feeds
+        // claim ring slots and a connection with no free slot is refused.
         if a.upstream_ring.is_some() || a.upstream_ring_attach.is_some() {
             return Err("--wayland-rings and --upstream-ring/--upstream-ring-attach each name the ring region".into());
         }
@@ -885,6 +891,41 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
         wc_proxy::macsvc::start(&control, &args.services);
         Some(control)
+    } else if args.wayland_rings && args.upstream.as_os_str().is_empty() {
+        // §105: the Windows guest's rings with no socket at all. Every
+        // connection, both feeds, the session's control and its sound are ring
+        // slots of the ivshmem region's tail; nothing falls back to a socket,
+        // so anything that cannot have a ring fails here, closed and said.
+        let run = args.arena_run.unwrap_or(0);
+        let bell = args.wayland_bell.clone().unwrap_or_else(|| "poll".into());
+        let control = match wc_proxy::rings::attach_ivshmem(&args.arena_ivshmem, run) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Err("the compositor kept no Wayland rings (its log says why), and with no \
+                            --upstream there is no other way in: refusing to start"
+                    .into());
+            }
+            Err(e) => return Err(format!("the Wayland rings: {e}; refusing to start").into()),
+        };
+        doorbell = Some(if bell.as_os_str() == "poll" {
+            println!(
+                "[proxy] NO DOORBELL: the rings are polled every millisecond (the VM has no \
+                 org.sirati.wcbell.0 port, or no hub runs); this costs CPU while the session lives"
+            );
+            wc_proxy::rings::Doorbell::polling(std::time::Duration::from_millis(1))
+        } else {
+            wc_proxy::rings::set_service_slice(std::time::Duration::from_millis(500));
+            wc_proxy::rings::Doorbell::connect_with(&bell, &control)?
+        });
+        println!(
+            "[proxy] wayland rings: {} slots at the tail of {}, doorbell {} -- every connection, \
+             the feeds, the control and the sound on shared memory; no socket, no TCP, no ssh",
+            control.layout().geometry.ring_slot_count,
+            args.arena_ivshmem.display(),
+            if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
+        );
+        wc_proxy::macsvc::start(&control, &args.services);
+        Some(control)
     } else if args.wayland_rings {
         let up = args.upstream.display();
         let run = args.arena_run.unwrap_or(0);
@@ -1084,8 +1125,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     wake,
                 )))
             }
-            Some(Err(e)) if !args.wayland_rings => {
-                println!("[proxy] client {n}: no free Wayland ring: {e}");
+            Some(Err(e)) if !args.wayland_rings || args.upstream.as_os_str().is_empty() => {
+                // §105: with no socket there is nothing to fall back to.
+                println!("[proxy] client {n}: no free Wayland ring: {e}; refused");
                 continue;
             }
             claimed => {
