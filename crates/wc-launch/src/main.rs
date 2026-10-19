@@ -718,17 +718,19 @@ mod win {
         }
 
         /// How long a request looks for its answer before it blocks
-        /// (§105.14): an answer comes back in tens of microseconds, and a
-        /// thread that blocked must be woken, which on an idle guest is a
-        /// halted vCPU's wake on the host. Only while a request is
-        /// outstanding; `WC_LAUNCH_SPIN_US` overrides it, 0 turns it off.
+        /// (§105.14). **Off**: measured on the guest, it saved ~15 µs on an
+        /// idle machine and cost 10–25 ms outliers on a loaded one, where it
+        /// and the compositor's own wait for the host shared a vCPU and lost
+        /// it to the load for a quantum. A blocked thread woken by the answer
+        /// gets the wake's priority boost, a spinning one does not.
+        /// `WC_LAUNCH_SPIN_US` turns it on, for measuring.
         fn spin() -> Duration {
             static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
             *S.get_or_init(|| {
                 std::env::var("WC_LAUNCH_SPIN_US")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .map_or(Duration::from_micros(3000), Duration::from_micros)
+                    .map_or(Duration::ZERO, Duration::from_micros)
             })
         }
 
