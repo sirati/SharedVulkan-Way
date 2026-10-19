@@ -644,4 +644,10 @@ impl Session {
     pub(super) fn is_dmabuf_buffer(&self, buffer: u32) -> bool {
         self.dmabuf.as_ref().is_some_and(|d| d.buffers.contains(&buffer))
     }
+
+    /// Whether `buffer` is a failed `create_immed`'s placeholder, which the
+    /// compositor has as no `wl_buffer` at all: an attach of it is held back.
+    pub(super) fn is_placeholder_buffer(&self, buffer: u32) -> bool {
+        self.dmabuf.as_ref().is_some_and(|d| d.dead_buffers.contains(&buffer))
+    }
 }

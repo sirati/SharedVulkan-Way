@@ -88,6 +88,8 @@
       libxkbcommonMingw = pkgsUnsupported.callPackage ./nix/libxkbcommon-mingw.nix {};
     in {
       packages.libxkbcommon-mingw = libxkbcommonMingw;
+      # §106.3: the session PipeWire's native nodes for the sound ring.
+      packages.wc-pw-node = pkgs.callPackage ./nix/wc-pw-node.nix {};
 
       devShells.miri = pkgs.mkShell {
         packages = [miriToolchain pkgs.vulkan-headers];

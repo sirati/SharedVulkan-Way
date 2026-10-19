@@ -267,6 +267,25 @@ runs the host side and the Linux compositor on one machine.
 scripts/wc-no-ssh.sh                      # boot, control, sound ring, hub restart, lease, wrong key, replay, no port
 scripts/wc-launch.sh deploy               # also: the installation key, the registration, wc-sessiond
 wc-arena-host sessiond --ivshmem /run/windows-vm/wc-arena/arena --bell $XDG_RUNTIME_DIR/wc-bell/wl.sock
+
+**Host integration (`docs/waycompose-design.md` §106).** Every audio device
+of the host (Windows or macOS) is its own sink or source in Linux, named after
+it, and Linux's defaults follow the host's. A Linux application's link opens in
+the host's browser (`xdg-open` and `BROWSER` are `wc-host-open`), the host's
+applications appear in Linux's "Open with" ("Notepad (Windows)", "TextEdit
+(macOS)"), and the Linux applications are registered on the host for the types
+their desktop entries name: Explorer's and Finder's "Open with", `open -a`. All
+of it crosses on the session's rings (`OWNER_HOSTINT`, the sound ring), and the
+host checks every request Linux makes (`docs/security-model.md` R38). Under
+PipeWire each device is a native node, `wc-pw-node`, paced by the ring's credit.
+
+```
+scripts/wc-hostint-local.sh [--mode pipewire|on]  # the Linux end without a VM: devices, defaults, credit, links
+wc-launch.exe --install APP                # also registers APP's types (HKCU), with a manifest
+wc-launch.exe --uninstall-assoc [APP]      # removes exactly what the manifest lists
+wc-hostint-probe.exe [--get-defaults]      # the host's endpoints, handlers and defaults
+WC_LAUNCH_AUDIO=on|pipewire|system|user-pipewire   # the session's sound server (wc-session)
+WC_LAUNCH_TEST_HOME=DIR                    # tests: the applications get a throwaway HOME and XDG dirs
 ```
 
 ## Layout
@@ -293,6 +312,10 @@ crates/
                  `PrintWindow` captures that work through a lock screen. Also
                  what `Sleep` costs against a high-resolution waitable timer
   wc-xkb-probe   proves the xkbcommon crate links and runs as a Windows binary
+  wc-hostint     §106, pure: the open-URL boundary, device names, MIME/UTI/
+                 extension tables, registry and Info.plist entries, the wire
+  wc-hostplat    §106: the host's calls (WASAPI, the shell, the registry;
+                 CoreAudio, Launch Services) for host integration
   wc-launch      stage 14, **Windows only**: the launcher a desktop shortcut
                  points at. A named mutex is the session, one owner starts the
                  compositor and the tunnel, every later click is one ssh exec.

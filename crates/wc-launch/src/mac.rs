@@ -69,6 +69,10 @@ fn load_config() -> Result<Config, String> {
 }
 
 pub fn main(args: Vec<String>) -> ExitCode {
+    // §106: --hostint-probe, --render-test, --capture-test (mac_hostint.rs).
+    if let Some(code) = crate::mac_hostint::cli(&args) {
+        return code;
+    }
     let _ = std::fs::create_dir_all(support_dir());
     let _ = std::fs::create_dir_all(log_dir());
     let cfg = match load_config() {
@@ -149,7 +153,8 @@ fn install(cfg: &Config, section: &str, pin: bool, meta_dir: &Path) -> Result<Pa
     let contents = bundle.join("Contents");
     std::fs::create_dir_all(contents.join("MacOS")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(contents.join("Resources")).map_err(|e| e.to_string())?;
-    std::fs::write(contents.join("Info.plist"), macbundle::info_plist(section, &name)).map_err(|e| e.to_string())?;
+    // §106: with the desktop entry's document and URL types.
+    std::fs::write(contents.join("Info.plist"), macbundle::info_plist_for(section, &name, &meta.mimes)).map_err(|e| e.to_string())?;
     // The host's answer, kept so the Dock menu exists before the first
     // session has asked again.
     std::fs::write(contents.join("Resources/meta.txt"), &raw).map_err(|e| e.to_string())?;
@@ -167,6 +172,8 @@ fn install(cfg: &Config, section: &str, pin: bool, meta_dir: &Path) -> Result<Pa
     let tmp = target.with_extension("new");
     std::fs::copy(&exe, &tmp).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
+    // §106: the main process's own bundle, org.waycompose.host (TCC rule 1).
+    crate::mac_hostint::install_host_bundle(&exe)?;
     // LaunchServices learns the bundle now rather than at the next login.
     let _ = Command::new(
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
@@ -627,7 +634,15 @@ fn request(cfg: &Config, s: &Arc<Session>, log: &Log, section: &str, key: &str) 
         }
     };
     let (s, log, key, section) = (s.clone(), log.clone(), key.to_string(), section.to_string());
+    let cfg = cfg.clone();
     std::thread::spawn(move || {
+        // §106: a document from the Mac goes to Linux by its Linux path; a
+        // copy into the drop folder, if it is outside the share, is made
+        // here rather than on the router's thread.
+        let key = match crate::mac_hostint::map_open_key(&cfg, &key) {
+            Ok(k) => k,
+            Err(e) => return log.say(&format!("{section}: cannot open in Linux: {e}")),
+        };
         // The words wc-session takes, less the session id, which the host's
         // end of the channel puts in itself (macsvc.rs).
         let verb = plan::launch_verb("ID", &host_app, macbundle::request_for(&key), 96, None);
@@ -770,6 +785,10 @@ fn run_face_mode(cfg: &Config, section: &str) -> ExitCode {
             Err(_) if !started => {
                 started = true;
                 log.say("no main process; starting one");
+                // §106: from its own bundle, through Launch Services (TCC rule 1).
+                if crate::mac_hostint::start_main_in_host_bundle(&log_dir().join("main.stderr.log"), &|m| log.say(m)) {
+                    continue;
+                }
                 let out = std::fs::OpenOptions::new().create(true).append(true).open(log_dir().join("main.stderr.log"));
                 let mut c = Command::new(installed_exe());
                 c.arg("--main").stdin(Stdio::null());
@@ -845,6 +864,18 @@ fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
             }
         }).ok();
     }
+    // §106 host integration: BEGIN (the rest is in mac_hostint.rs). Both
+    // roles: the slot is the proxy's to claim, here as on the guest-RAM path.
+    {
+        let (cfg2, log2) = (cfg.clone(), log.clone());
+        std::thread::Builder::new().name("hostint-open".into()).spawn(move || {
+            match service_channel(sv_transport::wlbytes::OWNER_HOSTINT, Duration::from_secs(20)) {
+                Some(ch) => crate::mac_hostint::start(ch, &cfg2, Box::new(move |m: &str| log2.say(m))),
+                None => log2.say("hostint: the host opened no host-integration ring"),
+            }
+        }).ok();
+    }
+    // §106 host integration: END
     log.say(&format!("session up {:?} after start", t0.elapsed()));
     Ok(())
 }

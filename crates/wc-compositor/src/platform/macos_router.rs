@@ -70,6 +70,20 @@ enum In {
     Face(FaceId, FromFace),
     Gone(FaceId),
     Port(u64, u32),
+    /// §106: let `bundle_id` come to the front (from the hostint thread).
+    Yield(String),
+}
+
+/// The router's inbox, for [`yield_activation_to`].
+static INBOX: Mutex<Option<std::sync::mpsc::Sender<In>>> = Mutex::new(None);
+
+/// §106: before the main process opens a URL or file in another application
+/// for Linux, the face the user is working in yields the foreground to it
+/// (macOS 14's cooperative activation: only the active application may
+/// hand it on, and the main process never is one). False if there is no
+/// router (not the main process).
+pub fn yield_activation_to(bundle_id: &str) -> bool {
+    INBOX.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|tx| tx.send(In::Yield(bundle_id.to_string())).is_ok())
 }
 
 struct Face {
@@ -548,6 +562,18 @@ impl R {
                     (h.on_request)(&section, &key);
                 }
             }
+            // §106: what macOS asked the face's application to open. Each
+            // becomes the request a Dock-menu page is (`open:<url>`); the
+            // launcher maps a file to its Linux path before it is sent.
+            FromFace::Open { urls } => {
+                self.last_request = Some((fid, Instant::now()));
+                let section = self.faces.get(&fid).map(|f| f.section.clone()).unwrap_or_default();
+                if let Some(h) = HOOKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    for u in urls.iter().take(super::faceproto::MAX_OPEN) {
+                        (h.on_request)(&section, &format!("open:{u}"));
+                    }
+                }
+            }
             FromFace::Bye => {
                 if let Some(f) = self.faces.get_mut(&fid) {
                     f.bye = true;
@@ -675,6 +701,7 @@ impl Router {
         let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
         println!("wc-compositor: main process: faces on {} and mach service {SERVICE}", path.display());
 
+        *INBOX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
         {
             let tx = tx.clone();
             std::thread::spawn(move || {
@@ -772,6 +799,14 @@ impl Router {
                         f.port = Some(port);
                     } else {
                         r.ports.insert(token, port);
+                    }
+                }
+                Ok(In::Yield(bid)) => {
+                    // The focused face, else the one that last asked for something.
+                    let fid = r.focus_face.or(r.last_request.map(|(f, _)| f)).filter(|f| r.faces.contains_key(f));
+                    match fid {
+                        Some(fid) => r.send(fid, &ToFace::Yield { bundle_id: bid }),
+                        None => println!("wc-compositor: no face to yield the foreground to {bid}"),
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}

@@ -49,7 +49,7 @@ use objc2_app_kit::{
     NSWindowButton, NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOrderingMode,
     NSWindowStyleMask, NSWindowTitleVisibility,
 };
-use objc2_foundation::{NSData, NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{NSArray, NSData, NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL};
 
 use super::mac_keys::{self, CmdKey, KeyFold};
 use super::{assemble, CursorSpec, Edge, FromUi, IconImage, PlatformConfig, PopupBounds, Started, ToUi, WindowId, WindowKind};
@@ -161,6 +161,29 @@ pub fn set_dock_menu(items: Vec<DockItem>, on_pick: DockPick) {
     *DOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some((items, on_pick));
 }
 
+// §106: what macOS asks this application to open (`application:openURLs:`).
+// A face forwards it to the main process; URLs that arrive before the face
+// has its socket (a document that launched the application) wait here.
+type OpenSink = Box<dyn Fn(Vec<String>) + Send + Sync>;
+static OPEN_SINK: Mutex<(Option<OpenSink>, Vec<String>)> = Mutex::new((None, Vec::new()));
+
+fn open_urls(urls: Vec<String>) {
+    let mut g = OPEN_SINK.lock().unwrap_or_else(|e| e.into_inner());
+    match &g.0 {
+        Some(sink) => sink(urls),
+        None => g.1.extend(urls),
+    }
+}
+
+fn set_open_sink(sink: OpenSink) {
+    let mut g = OPEN_SINK.lock().unwrap_or_else(|e| e.into_inner());
+    let early = std::mem::take(&mut g.1);
+    if !early.is_empty() {
+        sink(early);
+    }
+    g.0 = Some(sink);
+}
+
 fn dock_pick(key: &str) {
     if let Some((_, pick)) = DOCK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         pick(key);
@@ -269,6 +292,11 @@ pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<
                 let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Request { key: key.to_string() });
             }),
         );
+        // §106: documents and URLs for this application, to the main process.
+        let out = Mutex::new(out_tx.clone());
+        set_open_sink(Box::new(move |urls: Vec<String>| {
+            let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Open { urls });
+        }));
         let out = Mutex::new(out_tx.clone());
         *FACE_EXIT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
             let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Bye);
@@ -286,6 +314,10 @@ pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<
             let Ok(m) = ToFace::decode(&body) else { break };
             let cmd = match m {
                 ToFace::Bye => break,
+                ToFace::Yield { bundle_id } => {
+                    face_yield(bundle_id);
+                    continue;
+                }
                 ToFace::Surface { id, generation, alpha, .. } => {
                     let mut pair = early.remove(&(id, generation));
                     let t0 = std::time::Instant::now();
@@ -1066,6 +1098,20 @@ define_class!(
                 dock_pick("");
             }
             true
+        }
+
+        /// §106: Finder's Open With, a double-click, `open -a`, or a URL
+        /// whose scheme the bundle claims. Files arrive as `file://` URLs.
+        /// Only a face forwards them; elsewhere they are ignored.
+        #[unsafe(method(application:openURLs:))]
+        fn application_open_urls(&self, _app: &NSApplication, urls: &NSArray<NSURL>) {
+            if !FACE.load(Ordering::Relaxed) {
+                return;
+            }
+            let v: Vec<String> = urls.iter().filter_map(|u| u.absoluteString().map(|s| s.to_string())).collect();
+            if !v.is_empty() {
+                open_urls(v);
+            }
         }
 
         #[unsafe(method_id(applicationDockMenu:))]
@@ -2178,3 +2224,32 @@ pub(super) fn idle_assert(on: bool, current: &mut Option<u32>) {
     }
 }
 
+
+// §106: the foreground for an application the main process opens for Linux.
+
+/// On the main thread: let `bundle_id` activate itself
+/// (`-[NSApplication yieldActivationToApplicationWithBundleIdentifier:]`,
+/// macOS 14). This face is the active application while the user works in
+/// its Linux windows, and under cooperative activation only the active
+/// application can hand the foreground on; the main process, which opens the
+/// URL or file right after, never is the active one. Older macOS has no
+/// cooperative activation and needs nothing.
+fn face_yield(bundle_id: String) {
+    extern "C" fn on_main(ctx: *mut c_void) {
+        // SAFETY: the box leaked by `face_yield`, taken back once.
+        let bid = unsafe { Box::from_raw(ctx.cast::<String>()) };
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        let sel = sel!(yieldActivationToApplicationWithBundleIdentifier:);
+        let can: bool = unsafe { msg_send![&*app, respondsToSelector: sel] };
+        if can {
+            let s = NSString::from_str(&bid);
+            // SAFETY: the selector exists (checked) and takes an NSString.
+            let _: () = unsafe { msg_send![&*app, yieldActivationToApplicationWithBundleIdentifier: &*s] };
+        }
+    }
+    let ctx = Box::into_raw(Box::new(bundle_id)).cast::<c_void>();
+    // SAFETY: the main queue lives as long as the process; `on_main` takes
+    // the context back exactly once.
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, ctx, on_main) };
+}
