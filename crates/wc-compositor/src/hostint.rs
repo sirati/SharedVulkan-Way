@@ -196,6 +196,40 @@ pub fn start_windows(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
     }
 }
 
+/// TEST FIXTURE ONLY (`scripts/wc-hostint-win-local.sh`): the Linux build
+/// of the compositor standing in for the Windows guest. It serves the slot
+/// exactly as [`start_windows`] does, with the same `Service` (so every
+/// check that decides what may open is the real one, Windows paths
+/// included), and an opener that opens nothing: it logs what Windows would
+/// have opened and answers `ok`. No handlers are offered.
+#[cfg(not(windows))]
+pub fn start_logging(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
+    struct LogOpener(fn(&str));
+    impl Opener for LogOpener {
+        fn open_url(&mut self, url: &str) -> Result<(), String> {
+            (self.0)(&format!("hostint: would open url {url}"));
+            Ok(())
+        }
+        fn open_path(&mut self, path: &str) -> Result<(), String> {
+            (self.0)(&format!("hostint: would open path {path}"));
+            Ok(())
+        }
+        fn open_with(&mut self, app: &str, target: &wc_hostint::wire::Target) -> Result<(), String> {
+            (self.0)(&format!("hostint: would open with {app}: {target:?}"));
+            Ok(())
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(Event::Handlers(Vec::new()));
+    // The service ends when every sender is gone; this one lives as long as
+    // the process, as `start_windows`' handlers thread does.
+    std::mem::forget(tx);
+    let svc = service("windows", &cfg, true);
+    if let Err(e) = spawn(ch, doorbell_wait(), svc, Box::new(LogOpener(say)), rx, Box::new(move |l: &str| say(l))) {
+        say(&format!("hostint: no thread: {e}"));
+    }
+}
+
 #[cfg(test)]
 mod flag_tests {
     use super::*;

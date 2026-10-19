@@ -956,6 +956,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
         );
         wc_proxy::macsvc::start(&control, &args.services);
+        // §106: host integration on its slot; the compositor opens it.
+        if !args.hostint.dir.as_os_str().is_empty() {
+            let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+        }
         Some(control)
     } else if args.wayland_rings {
         let up = args.upstream.display();
