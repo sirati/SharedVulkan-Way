@@ -47,6 +47,8 @@ members = [
   "crates/wc-arena-host",
   "crates/wc-shmclient",
   "crates/wc-proxy",
+  # §105: host integration, per-device audio and opening links and files both ways. Pure.
+  "crates/wc-hostint",
   # §104: the userspace render node and the dma-buf tokens.
   "crates/sv-drm",
   # The WLCS integration module (docs/waycompose-design.md §26). A member so that the
@@ -167,6 +169,7 @@ sv-drm = { path = "crates/sv-drm" }
 
 wc-transport = { path = "crates/wc-transport" }
 wc-handle = { path = "crates/wc-handle" }
+wc-hostint = { path = "crates/wc-hostint" }
 
 wayland-backend = { path = "vendor/wayland-backend" }
 wayland-server = { path = "vendor/wayland-server" }
