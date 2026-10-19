@@ -1205,3 +1205,77 @@ can hold the port. *What this does not cover:* a process of this user that
 connects to QEMU's socket directly, before the hub does, holds the port as
 before; nothing but the hub should, and every installation's `wc-session`
 since §99 does not.
+
+### R36 — The guest can start a login screen and a desktop session on the VM host
+Added 2026-10-17 with `waycompose-design.md` §102. The installation `wclinux` (VM host `~/wc-launch-linux`)
+defines one application, `linux-desktop`, whose `exec` is nix-config's
+`atp-nested` with fixed arguments (`login 1280x800 guest`). What reaches the
+VM host from the guest is still only §94's: an application id, a session id,
+two numbers. What the definition does with them is new, because it is the
+first application whose start goes through root.
+
+**The path to root, and its width.** `atp-nested` (as `sirati`, the session's
+user) runs `sudo -n atp-nested-seat STYLE SOCKET W H PULSE guest`, the one
+command the module's sudo rule allows `sirati` without a password. Nothing the
+guest sends is in that line: the style and size come from `apps.ini`, the two
+socket paths from the session's directory (`/tmp/wc-launch/<id>/wl-proxy` and
+`.../xdg/pulse/native`), whose id `wc-session` has already reduced to
+`[A-Za-z0-9_-]`. `atp-nested-seat` checks every argument itself, as if it came
+from anywhere:
+
+* the style and mode against fixed words, the size against digits and a range;
+* each socket path (`safe_socket`): absolute; only `[A-Za-z0-9/._-]`, no `//`,
+  `.` or `..` component, at most 200 bytes; equal to its own `realpath -e`, so
+  no link anywhere along it; a socket owned by `$SUDO_UID`; and every directory
+  from its parent up to `/` owned by root or `$SUDO_UID` and writable by
+  nobody else, except root's sticky directories (`/tmp`). So nobody but the
+  caller or root can make the name point at something else between the check
+  and its use, and the name is safe to write into greetd's config and the
+  session files (no quote, space or newline can be in it).
+
+Until §102 the rule was "a socket in `/run/user/$SUDO_UID`". The new rule
+admits the waycompose session's directory and no less safe place; it was
+tested with a socket of the caller inside another user's world-writable
+directory and with a `;` in the name (both refused, and nothing loaded).
+
+**What root then does.** Loads `vkms`, starts greetd on the nested seat with
+the patched greeter as `cosmic-greeter`, and on a login the chosen session as
+`<desktop-user>`; root never opens the sockets. In `guest` mode the "Start Windows"
+button is gone and the seat ends with the session. A one-shot autologin exists
+for tests only, and only through a file in `/run/atp-nested-autologin` that root
+must create (sudokey); it adds no way in.
+
+**What a guest that holds the launcher's key can do with it**, then:
+* show <desktop-user>'s login screen in a window on the guest, and start it again
+  after it ends. It cannot log in without <desktop-user>'s password (face login is
+  off: the host has no camera; both USB controllers are the guest's).
+  Repeated wrong passwords are PAM's to throttle, as at any login screen.
+* use memory and CPU on the VM host: the nested desktop is 1–2 GB and runs on
+  the host's two CPUs (14–15), which `user.slice` is confined to so it cannot
+  take the VM's. `nestedTest.memoryMax = "2G"` caps the <desktop-user> and greeter
+  slices while a nested session runs, so the host's last memory stays the
+  host's. One nested session at a time; a second start is refused.
+
+**What the nested session's users can reach.** The launcher gives `<desktop-user>`
+and `cosmic-greeter` ACL entries for exactly the session's Wayland socket, its
+PulseAudio socket, and search (`x`) on the directories on the way that are
+`sirati`'s and closed to others (`/tmp/wc-launch/<id>`, its `xdg`, `xdg/pulse`);
+they are taken back when the seat ends (and the directory goes with the session).
+Through that socket the nested KWin is a client of `wc-proxy` like any
+application: it can draw windows and read the input given to them. The proxy
+names the two windows from `wc-foreign-app-ids`, a file `sirati` writes in the
+session directory and the proxy reads only if it is its own and writable by
+nobody else (§102.4); a forged one could only choose a window's taskbar
+button and icon, which a client can do by itself with `set_app_id`.
+
+**The reverse direction.** `sirati` is the compositor of <desktop-user>'s session
+here: it sees what <desktop-user> types into that window and could inject input,
+exactly as the owner's GNOME does on laptop, where this module came from.
+That is the design of a nested session and is not new with §102; it is why the
+sudo rule names only the owner.
+
+**The GPU environment** (`nestedTest.gpuForwarding`, off on testhost): if
+on, the seat takes `NAME=value` words after the mode, only from a fixed list,
+each checked for its kind (store paths for libraries and manifests,
+`safe_socket` for `SV_SOCKET` and `SV_BELL`, fixed values for the rest), and
+writes them as plasmashell's environment; anything else is refused.

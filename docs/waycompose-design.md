@@ -31602,3 +31602,202 @@ Checked against canned files:
 Live after the update (14:25): version 2 running in session 1. It showed
 hardware keyboard input seconds old, and TeamViewer's last line was "no
 restrictions", so somebody was at the VM's own console.
+
+## 102. The future Linux desktop as one window on Windows: a nested login screen and KWin, clients of the proxy
+
+2026-10-17 to 19, branch `nested-linux`, and nix-config branch
+`testhost-win7-nested`. The user's goal: one click on the Windows desktop
+shows testhost's future native Linux desktop as one window. First the nested
+login screen that nix-config's `win7-desktop.nix` already runs on the
+user's laptop (`atp-nested login`: the patched COSMIC greeter on a seat of its
+own, `seat-atp`, with greetd), then <desktop-user>'s AeroThemePlasma or Windows 11
+style Plasma session as a nested KWin. Input, sound, resizing, a taskbar
+identity of its own, and everything gone when the window is closed.
+
+### 102.1 Status in one paragraph
+
+Built, and proven locally end to end in a NixOS VM test whose host compositor
+is this project's own: `wc-compositor.exe` under Wine on an Xvfb, `wc-proxy` in
+front, a session directory laid out as `wc-session` lays it out, and the VM
+has no GPU, as testhost's host has none. The login screen appears in the
+Windows window, a password login starts Aero in the same place, both windows
+carry one identity and the title "Windows 7 (Linux)", the session's sound
+reaches the waycompose session's PulseAudio, the nested output follows a
+resize, and closing the window ends KWin, the session, greetd and the seat,
+unloads `vkms` and takes the ACLs back. KWin needed three globals the
+compositor did not offer (102.3); they are behind a session flag. On
+testhost the system is switched and the VM runs with 2 GiB less RAM (102.8);
+the run on the real guest is in 102.9.
+
+### 102.2 The path
+
+| step | where | what |
+|---|---|---|
+| shortcut | guest, installation `wclinux` | `wc-launch.exe linux-desktop`: desktop shortcut and Start menu entry "Windows 7 (Linux)", identity `Waycompose.app.atp-nested` (§92) |
+| session | VM host, `~/wc-launch-linux` | `wc-session` as for any application (§94): the ivshmem arena, the rings, the proxy, the session's PulseAudio (§86); the compositor with `--nested-compositor-globals` |
+| `run` | `apps.ini [linux-desktop]` (`scripts/wc-linux-desktop-apps.ini`) | `exec = /run/current-system/sw/bin/atp-nested`, `args = login 1280x800 guest`, `env = WC_APP_ID=atp-nested`, `gpu = off`, `titlebar = none` |
+| launcher | `atp-nested`, as `sirati` | ACLs for <desktop-user> and cosmic-greeter on the session's Wayland and PulseAudio sockets and on the closed directories on the way; `wc-foreign-app-ids` for the proxy (102.4); `sudo -n atp-nested-seat … guest` |
+| seat | `atp-nested-seat`, root | checks every argument (security-model.md R36), caps the two users' slices at 2 GiB, loads `vkms`, starts greetd on `seat-atp`; the greeter is cosmic-comp in winit mode on the proxy's socket |
+| login | greetd, PAM `atp-nested-login` | <desktop-user>'s password. No face login: both USB controllers, the cameras on them, are the guest's |
+| session | `atp-nested-session`, as <desktop-user> | `PULSE_SERVER` = the session's PulseAudio; `plasma-kwin_wayland` pointed at the proxy's socket by a runtime drop-in; `startatp-wayland` |
+| end | the window's close button | `xdg_toplevel.close` → KWin quits → Plasma's session ends → in `guest` mode the greeter runs only once, so greetd gives up → the seat's cleanup |
+
+`guest` is new in the module: no "Start Windows" button (the window is on
+Windows already), and the seat ends with the session instead of showing the
+login screen again in a new window.
+
+### 102.3 KWin's Wayland backend, and what it needs from the host
+
+KWin 6.7.4's nested backend refuses a host without `wl_compositor` ≥ 4,
+`wl_subcompositor`, `xdg_wm_base`, `wp_single_pixel_buffer_manager_v1`,
+`wp_viewporter`, `wl_seat`, `zwp_pointer_constraints_v1` and `wp_presentation`
+(`wayland_display.cpp`). The first local run ended right there: "wp_single_pixel_buffer_manager_v1
+isn't supported by the host compositor", and KWin restarted until Plasma gave up.
+Its window is a 1×1 single-pixel buffer viewported to the output's size; the
+picture is in synchronized subsurfaces with viewports; the render loop advances
+on presentation feedback.
+
+`wc-compositor --nested-compositor-globals` (launcher `[session]
+nested-compositor-globals = on`, deploy `WC_LAUNCH_NESTED_GLOBALS=1`) offers
+the three. Off, a session sees exactly the globals it saw before: GTK binds
+`wp_viewporter` whenever it is offered, and Firefox's path has not been
+through §95's checks with it.
+
+* single-pixel buffers are read as one-pixel buffers, alpha kept;
+* a viewported surface is held at its destination size everywhere (sizing,
+  layout, hit tests, damage); the source rectangle is scaled nearest-neighbour,
+  and a 1:1 viewport keeps the old fast path; a commit that only changes the
+  viewport recomposes, which is how KWin resizes;
+* presentation feedback is answered on the frame tick: `presented`, or
+  `discarded` for a frame replaced before it. `wc-proxy` rewrites `clock_id`
+  and every `presented` timestamp to its own `CLOCK_MONOTONIC` when it forwards
+  them: the guest's clock is not the client's (§88).
+* not behind the flag: a subsurface no longer maps a window whose root has
+  never had a buffer and declares no geometry. KWin's window first appeared at
+  32×32 and jumped; Firefox declares a geometry and keeps the old path.
+
+**Compositing: QPainter, and why.** KWin's backend offers OpenGL only with a
+render node and `linux-dmabuf` from the host (`supportedCompositors`).
+testhost's host has no render node (the iGPU is the guest's) and the proxy
+has no dmabuf; so KWin composites in software, as it reported locally. The cost
+is the Aero glass: KWin's blur and contrast effects need OpenGL, so the
+taskbar is transparent rather than frosted. Running KWin on the forwarded GPU
+would need a render node, or KWin's Vulkan or EGL device paths without one, and
+dmabuf from the proxy to the guest; neither exists. The module can hand
+plasmashell the forwarded GPU (`nestedTest.gpuForwarding`, 102.10); it is off.
+
+Locally (Wine, `weston-presentation-shm` inside KWin): 3330 frames presented
+and 73 discarded in 62 s, a resize followed, close quits KWin.
+
+### 102.4 Two Wayland clients of other users, named as one application
+
+The window on Windows is two Wayland clients in turn, of two users: the login
+screen's cosmic-comp as `cosmic-greeter`, then KWin as `<desktop-user>`. §96 named a
+client by its `WC_APP_ID`, read from `/proc/<pid>/environ`, which is closed to
+the proxy for another user's process. So `atp-nested` writes
+`wc-foreign-app-ids` into the session's directory: `<uid> <app id> <title>`
+per user. `wc-proxy` reads it only for a client whose `SO_PEERCRED` uid is
+not its own, only if the file is a regular file of its own user that nobody
+else can write, at most 4 KiB. The app id names the window (`set_app_id` after
+`get_toplevel`, as §96); the title replaces every title the client sets
+("KDE Wayland Compositor WL-0 — Press right control key to grab pointer",
+"Smithay"). Both windows are `Waycompose.app.atp-nested`, "Windows 7 (Linux)",
+with the icon of the module's desktop entry `atp-nested` (ATP's start orb).
+
+### 102.5 One window: the successor takes the place
+
+The session's window is a new toplevel of a new client, and Windows' cascade
+would open it somewhere else. A toplevel's first map now takes the place, and
+the maximised state, of the last window of the same named identity that closed
+less than 20 s before (`platform::Succession`). Only named identities, and
+only once. The identity matched is the one the compositor meant to give the
+window, not what the shell's property store took (Wine's has none).
+
+### 102.6 Sound
+
+The session's PulseAudio (§86) is `$XDG_RUNTIME_DIR/pulse/native` of the
+application `run` starts; `atp-nested` passes it to the seat as a socket
+path, the seat checks it like the Wayland socket, and `atp-nested-session`
+sets `PULSE_SERVER` in <desktop-user>'s user manager, so every application of the
+session plays there; the launcher plays its monitor on Windows as for Firefox.
+testhost's host has no sound server of its own, and must not get one: Plasma
+would turn PipeWire on, which would open the sound card QEMU plays the guest's
+sound into. `linux-desktop.nix` forces it off and adds Plasma's volume applet.
+
+### 102.7 The NixOS side
+
+nix-config branch `testhost-win7-nested`, on `56bda9b` (generation of
+2026-10-16):
+
+* `win7-desktop.nix` and its directory from master; the aerothemeplasma-nix and
+  gaze inputs; testhost's nixpkgs is two months older, so the patched greeter
+  is built from a vendored cosmic-greeter 1.9.1 package (the patch does not
+  apply to 1.5).
+* the module: the seat takes any socket of the caller at a path only it or root
+  controls (R36), a PulseAudio socket argument, `guest` mode, a one-shot
+  autologin root can arm for tests, `nestedTest.memoryMax`, sessions named
+  so that Aero sorts first (the greeter preselects the first name until a user
+  has chosen), the `atp-nested` desktop entry and icon, and the greeter's user
+  and daemon on a machine without COSMIC's login screen.
+* `testhost/linux-desktop.nix`: the module for <desktop-user> (password from
+  laptop's config, set once by activation because `mutableUsers` keeps an
+  existing locked entry), no face login, no "Start Windows", PipeWire,
+  power-profiles-daemon and fwupd off, `memoryMax = 2G`.
+* the VM's RAM 12544 → 10496 MiB; the GPU ivshmem device stays 1024 MiB.
+
+`nix store diff-closures` against the running system: only additions (Plasma,
+ATP, the greeter, Steam from the module), no version changes; QEMU's
+derivation unchanged. `dry-activate`: windows-vm not restarted.
+
+### 102.8 Checked locally: `win7-desktop/tests/nested-waycompose.nix`
+
+A NixOS test with testhost's packages and no GPU device. Nine subtests,
+all passing (2026-10-19):
+
+| subtest | checks |
+|---|---|
+| Windows side | `wc-compositor.exe --nested-compositor-globals` under Wine on Xvfb |
+| session | `wc-proxy` on `/tmp/wc-launch/wct/wl-proxy`, PulseAudio at `xdg/pulse/native`, as `wc-session` makes them |
+| seat refuses | a socket of the caller in another user's world-writable directory, and a `;` in the path: refused, `vkms` not loaded |
+| login screen | greeter on `seat-atp`, no `COSMIC_GREETER_WINDOWS_UNIT`, the ACLs |
+| password login | <desktop-user>'s session on `seat-atp`, plasmashell, `PULSE_SERVER` set, AeroThemePlasma's shell |
+| identity | both users' clients named `atp-nested`, "Windows 7 (Linux)"; two windows with the identity; the second took the first's place |
+| sound | a stream of <desktop-user>'s session appears in the waycompose PulseAudio |
+| resize | maximise → `configure 1600x974`, then `configure 1000x700`; KWin answers with buffers of the new size |
+| close | `WM_CLOSE` → seat gone, no session on `seat-atp`, greetd stopped, `vkms` unloaded, no ACL entries, no `wc-foreign-app-ids`, no `/run/atp-nested`, no KWin, no cosmic-comp, in 3 s |
+
+Pictures, judged by a separate agent: the greeter with <desktop-user>'s tile, the
+password prompt, Aero's taskbar with the start orb at the bottom of the
+1280×800 window. After the resize KWin drew a correct 1000×700 desktop, but
+the X window under Wine without a window manager kept its old size, with
+stale pixels around it: a property of the harness (an unmanaged X window), not
+of the compositor, which logged the configure and the new buffers; the real
+guest is the check for that.
+
+### 102.9 On testhost
+
+### 102.10 The GPU
+
+`nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU
+environment (`wc-session run` with `gpu = on`) to plasmashell only, word by
+word: a fixed list of names, store paths for the libraries and manifests, the
+caller's sockets for `SV_SOCKET` and `SV_BELL`. KWin stays on QPainter
+(102.3), so a GPU-rendered plasmashell would be read back and composited in
+software. Not enabled and not measured on the guest: `gpu = off` in the
+definition.
+
+### 102.11 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 3007 passed, 0 failed, 8 ignored (master 2989) |
+| `cargo clippy --workspace --all-targets` | no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | OK, OK |
+| NixOS test `nested-waycompose` | 9 of 9 subtests |
+
+### 102.12 What is not done
+
+1. Face login: no camera on the host. The password is the way in.
+2. Aero glass: QPainter has no blur (102.3).
+3. KWin and Plasma on the forwarded GPU (102.10).

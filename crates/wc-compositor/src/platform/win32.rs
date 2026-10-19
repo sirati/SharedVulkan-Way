@@ -420,6 +420,11 @@ struct WindowState {
     /// to be *read* to answer that; it is borrowed only for the comparison and
     /// never across a Win32 call, which is this module's rule.
     aumid: RefCell<String>,
+    /// §102: the identity this window is meant to have, whether or not the
+    /// shell's property store took it (Wine's does not implement it). What
+    /// `super::Succession` matches on: which application a window belongs to
+    /// is a fact about the client, not about the taskbar.
+    identity: RefCell<String>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -2914,7 +2919,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                 if !matches!(w.kind, WindowKind::Popup { .. })
                     && w.mapped.get()
                     && !w.hwnd().is_null()
-                    && super::leaves_succession(&w.aumid.borrow())
+                    && super::leaves_succession(&w.identity.borrow())
                 {
                     // SAFETY: a live window handle, not yet destroyed.
                     let (iconic, zoomed) =
@@ -2923,7 +2928,7 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
                         let origin = window_origin(w.hwnd());
                         SUCCESSION.with(|s| {
                             s.replace(Some(super::Succession {
-                                aumid: w.aumid.borrow().clone(),
+                                aumid: w.identity.borrow().clone(),
                                 origin,
                                 maximized: zoomed,
                                 at: std::time::Instant::now(),
@@ -3161,6 +3166,7 @@ fn create_window(
             WindowKind::Toplevel => (0, 0),
         }),
         aumid: RefCell::new(String::new()),
+        identity: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -4235,7 +4241,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
         SUCCESSION.with(|s| {
             let found = super::succession_for(
                 s.borrow().as_ref(),
-                &w.aumid.borrow(),
+                &w.identity.borrow(),
                 std::time::Instant::now(),
             );
             if found.is_some() {
@@ -4248,7 +4254,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
         println!(
             "wc-compositor: window {} takes the place of the last {} window to close: {},{}{}",
             w.id,
-            w.aumid.borrow(),
+            w.identity.borrow(),
             origin.0,
             origin.1,
             if max { ", maximised" } else { "" }
@@ -5298,6 +5304,7 @@ fn apply_identity(w: &Rc<WindowState>, aumid: &str) {
         // all, so there is nothing to group and nothing to say.
         return;
     }
+    w.identity.replace(aumid.to_string());
     if *w.aumid.borrow() == aumid {
         return;
     }
