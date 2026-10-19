@@ -44,6 +44,11 @@ pub struct App {
     /// the pin and the windows must agree, or a running window gets a button
     /// of its own beside its pin.
     pub app_id: String,
+    /// §102.14. `single = on`: the application has one window at most. A
+    /// click while it is up brings it to the front instead of asking the host
+    /// for another `run`, a click while it is starting waits for it, and a
+    /// launch that fails says so in a message box. Off by default.
+    pub single: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +216,7 @@ impl Config {
                         host_app: id.to_string(),
                         desktop: id.to_string(),
                         app_id: String::new(),
+                        single: false,
                     });
                 }
                 continue;
@@ -239,6 +245,13 @@ impl Config {
                     }
                     "desktop" => app.desktop = v.into(),
                     "app-id" => app.app_id = v.into(),
+                    "single" => {
+                        app.single = match v {
+                            "on" => true,
+                            "off" => false,
+                            _ => return Err(format!("line {}: [app.{id}] single is on or off, not {v}", n + 1)),
+                        }
+                    }
                     other => return Err(format!("line {}: [app.{id}] has no {other}", n + 1)),
                 }
                 continue;
@@ -566,6 +579,29 @@ mod tests {
         for bad in ["../x", "a b", "a/b", ".x", "a;b"] {
             assert!(Config::parse(&format!("{base}desktop={bad}\n")).is_err(), "{bad}");
             assert!(Config::parse(&format!("{base}app-id={bad}\n")).is_err(), "{bad}");
+        }
+    }
+
+    /// §102.14. One window at most: off unless said, and only on or off.
+    #[test]
+    fn single_is_off_by_default_and_on_or_off() {
+        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[app.linux-desktop]\n";
+        let single = |t: &str| Config::parse(t).map(|c| c.app("linux-desktop").unwrap().single);
+        assert_eq!(single(base), Ok(false));
+        assert_eq!(single(&format!("{base}single = on\n")), Ok(true));
+        assert_eq!(single(&format!("{base}single=off\n")), Ok(false));
+        assert!(single(&format!("{base}single=yes\n")).is_err());
+    }
+
+    /// The guest's block for the nested desktop (§102) parses, and both of its
+    /// applications are single.
+    #[test]
+    fn the_nested_desktops_are_single() {
+        let base = "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n";
+        let blocks = include_str!("../../../scripts/wc-linux-desktop-apps-guest.ini");
+        let c = Config::parse(&format!("{base}{blocks}")).unwrap();
+        for id in ["linux-desktop", "linux-desktop-win11"] {
+            assert!(c.app(id).unwrap().single, "{id}");
         }
     }
 }
