@@ -654,7 +654,7 @@ mod win {
         let mut s = wc_transport::connect(&p.ctl).map_err(|e| {
             format!("no session to ask ({}: {e}); the request goes through the session's control ring", p.ctl.display())
         })?;
-        let _ = s.set_read_timeout(Some(Duration::from_secs(130)));
+        let _ = s.set_read_timeout(Some(Duration::from_secs(40)));
         s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("control socket: {e}"))?;
         let mut out = Vec::new();
         s.read_to_end(&mut out).map_err(|e| format!("control socket: {e}"))?;

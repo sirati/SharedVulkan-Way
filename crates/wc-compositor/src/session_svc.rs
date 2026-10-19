@@ -267,7 +267,9 @@ impl Ctl {
     fn request(&self, line: &str) -> Result<Vec<u8>, String> {
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
         self.write_all(format!("{line}\n").as_bytes())?;
-        let deadline = Instant::now() + Duration::from_secs(120);
+        // Every verb answers in seconds; a proxy that ended without answering
+        // (its lease, a crash) must not hold the launcher for minutes.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut got = Vec::new();
         let nl = loop {
             if let Some(i) = got.iter().position(|b| *b == b'\n') {

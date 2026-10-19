@@ -128,9 +128,12 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
         // service, which runs `wc-session down` once this process (its unit)
         // has ended. Running it from here stopped this process's own unit
         // before the reply went out, and the guest waited a minute for it.
-        if line.split_whitespace().next() == Some("down") {
+        // §105: `raw down` too, which is how the Windows launcher says it.
+        let first = line.split_whitespace().find(|w| *w != "raw");
+        if first == Some("down") {
             println!("[proxy] session control: \"down\": ending; the session service takes the session down");
-            let _ = write_all(&mut lines.ch, b"ok down\n");
+            let reply: &[u8] = if line.starts_with("raw ") { b"ok-raw 0\n" } else { b"ok down\n" };
+            let _ = write_all(&mut lines.ch, reply);
             std::thread::sleep(Duration::from_millis(50));
             std::process::exit(0);
         }
