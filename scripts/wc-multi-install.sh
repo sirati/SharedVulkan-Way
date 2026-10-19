@@ -302,7 +302,7 @@ wait_line "$D/comp-4.log" 'session [0-9]'"'"'s [0-9]* region' 10
 ok "after down: $(grep -c 'back in the pool' "$D/comp-4.log") session(s) returned their regions; $(grep -o 'back in the pool ([0-9]* MiB free' "$D/comp-4.log" | tail -1)"
 
 if [ -n "$INFO" ]; then
-  say "leg 8 (§107.12): short-lived clients and their feeds; the session ends by its linger, nothing left connected"
+  say "leg 8 (§107.10): short-lived clients and their feeds; the session ends by its linger, nothing left connected"
   sleep $((LINGER + 1))
   kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
   kill "$PORT" 2>/dev/null; start_port

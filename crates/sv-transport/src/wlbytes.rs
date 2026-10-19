@@ -193,7 +193,7 @@ pub fn is_service(owner_id: u64) -> bool {
 /// [`CLIP_FEED`] too, the clipboard feed). The low bits are the ordinal of the
 /// client connection the feed serves. A feed is a Wayland client to the
 /// compositor, but not an application: it must not keep a session alive, and
-/// it has no business outliving the connection it serves (§107.12).
+/// it has no business outliving the connection it serves (§107.10).
 pub const FEED_TAG: u64 = 1 << 40;
 /// With [`FEED_TAG`]: the clipboard feed rather than the icon feed.
 pub const CLIP_FEED: u64 = 1 << 39;
@@ -255,7 +255,7 @@ mod session_tag_tests {
                 assert_eq!(is_service(o), is_service(base), "the service tag survives the index");
             }
         }
-        // §107.12: a feed knows whose it is, in any session.
+        // §107.10: a feed knows whose it is, in any session.
         for idx in [0u8, 3] {
             let app = with_session(42, idx);
             let icons = with_session(feed_owner(42, false), idx);
