@@ -1341,6 +1341,7 @@ dependencies = [
  "png",
  "quick-xml",
  "sv-arena",
+ "sv-drm",
  "sv-proto",
  "sv-transport",
  "wc-handle",

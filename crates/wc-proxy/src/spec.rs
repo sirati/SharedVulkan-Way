@@ -222,6 +222,13 @@ impl Spec {
         spec.load(include_str!("../protocols/viewporter.xml"))?;
         spec.load(include_str!("../protocols/single-pixel-buffer-v1.xml"))?;
         spec.load(include_str!("../protocols/presentation-time.xml"))?;
+        // §104: `zwp_linux_dmabuf_v1`, which this proxy answers itself with
+        // `--dmabuf-node` (`session/dmabuf.rs`); the compositor never sees it.
+        // From `wayland-protocols` 0.32.12 (the stable XML, version 5; the
+        // proxy advertises 4). Two `h`s: `zwp_linux_buffer_params_v1.add`,
+        // whose fd is an `sv_drm` token read and closed here, and the feedback's
+        // `format_table`, a memfd this proxy makes.
+        spec.load(include_str!("../protocols/linux-dmabuf-v1.xml"))?;
         Ok(spec)
     }
 
@@ -373,7 +380,9 @@ mod tests {
         // locked and the confined pointer) and relative-pointer (two): 47.
         // §102 adds viewporter (two), single-pixel-buffer (one) and
         // presentation-time (two): 52.
-        assert_eq!(s.len(), 52, "interfaces: {:?}", s.names());
+        // §104 adds linux-dmabuf (three: the global, the params and the
+        // feedback): 55.
+        assert_eq!(s.len(), 55, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,
@@ -442,6 +451,10 @@ mod tests {
                 "wl_data_source.send (event)",
                 "wl_keyboard.keymap (event)",
                 "wl_shm.create_pool (request)",
+                // §104: both answered in this process (`session/dmabuf.rs`),
+                // neither crosses.
+                "zwp_linux_buffer_params_v1.add (request)",
+                "zwp_linux_dmabuf_feedback_v1.format_table (event)",
             ],
             "the set of messages carrying an h changed"
         );
