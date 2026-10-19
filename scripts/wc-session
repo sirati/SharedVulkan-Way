@@ -1116,6 +1116,13 @@ start_app() {
   # documents and a browser opens no real profile. Production sessions leave it
   # unset: there the application is the user's, with the user's state.
   TESTENV=()
+  # The same setting for one installation only: `$BASE/test-home` (its first
+  # line), written by the operator beside this script, for a test
+  # installation started by the shared session service, whose environment
+  # every installation shares.
+  if [ -z "${WC_LAUNCH_TEST_HOME:-}" ] && [ -s "$BASE/test-home" ]; then
+    WC_LAUNCH_TEST_HOME=$(head -1 "$BASE/test-home")
+  fi
   if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then
     case "$WC_LAUNCH_TEST_HOME" in /*) ;; *) die "WC_LAUNCH_TEST_HOME must be absolute" ;; esac
     [[ "$WC_LAUNCH_TEST_HOME" =~ ^[A-Za-z0-9/._-]+$ ]] || die "WC_LAUNCH_TEST_HOME: only [A-Za-z0-9/._-]"

@@ -868,7 +868,18 @@ VK_DRIVER_FILES=$icd_json"
     fi
   fi
   # §99, §105: the hub and the session service, for every installation.
-  install_services "$locator"
+  # WC_LAUNCH_SERVICES=keep (a test installation beside production ones):
+  # the running hub and session service are left exactly as they are, binary
+  # and unit, and only checked.
+  if [ "${WC_LAUNCH_SERVICES:-install}" = keep ]; then
+    local ks; ks=$(h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service wc-sessiond.service | tr '\n' ' '")
+    case "$ks" in
+      "active active "*) ok "WC_LAUNCH_SERVICES=keep: the shared hub and session service run, untouched" ;;
+      *) bad "WC_LAUNCH_SERVICES=keep, and the shared services are not both running: $ks"; exit 1 ;;
+    esac
+  else
+    install_services "$locator"
+  fi
   # §92. The jump list's two tools, GC-rooted where wc-session looks first.
   local tool
   for tool in "sqlite:$SQLITE:sqlite3" "librsvg:$RSVG:rsvg-convert"; do
