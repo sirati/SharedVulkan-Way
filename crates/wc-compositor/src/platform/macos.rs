@@ -311,6 +311,10 @@ pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<
             let Ok(m) = ToFace::decode(&body) else { break };
             let cmd = match m {
                 ToFace::Bye => break,
+                ToFace::Yield { bundle_id } => {
+                    face_yield(bundle_id);
+                    continue;
+                }
                 ToFace::Surface { id, generation, alpha, .. } => {
                     let mut pair = early.remove(&(id, generation));
                     let t0 = std::time::Instant::now();
@@ -2215,3 +2219,32 @@ pub(super) fn idle_assert(on: bool, current: &mut Option<u32>) {
     }
 }
 
+
+// §106: the foreground for an application the main process opens for Linux.
+
+/// On the main thread: let `bundle_id` activate itself
+/// (`-[NSApplication yieldActivationToApplicationWithBundleIdentifier:]`,
+/// macOS 14). This face is the active application while the user works in
+/// its Linux windows, and under cooperative activation only the active
+/// application can hand the foreground on; the main process, which opens the
+/// URL or file right after, never is the active one. Older macOS has no
+/// cooperative activation and needs nothing.
+fn face_yield(bundle_id: String) {
+    extern "C" fn on_main(ctx: *mut c_void) {
+        // SAFETY: the box leaked by `face_yield`, taken back once.
+        let bid = unsafe { Box::from_raw(ctx.cast::<String>()) };
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        let sel = sel!(yieldActivationToApplicationWithBundleIdentifier:);
+        let can: bool = unsafe { msg_send![&*app, respondsToSelector: sel] };
+        if can {
+            let s = NSString::from_str(&bid);
+            // SAFETY: the selector exists (checked) and takes an NSString.
+            let _: () = unsafe { msg_send![&*app, yieldActivationToApplicationWithBundleIdentifier: &*s] };
+        }
+    }
+    let ctx = Box::into_raw(Box::new(bundle_id)).cast::<c_void>();
+    // SAFETY: the main queue lives as long as the process; `on_main` takes
+    // the context back exactly once.
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, ctx, on_main) };
+}

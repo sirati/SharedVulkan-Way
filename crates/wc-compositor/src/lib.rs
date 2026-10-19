@@ -100,7 +100,7 @@ pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_bo
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
 /// §103.13: the main process's socket, service and the launcher's hooks.
 #[cfg(target_os = "macos")]
-pub use platform::macos_router::{set_face_hooks, socket_path, FaceHooks, SERVICE as FACE_SERVICE};
+pub use platform::macos_router::{set_face_hooks, socket_path, yield_activation_to, FaceHooks, SERVICE as FACE_SERVICE};
 #[cfg(target_os = "macos")]
 pub use platform::faceproto::face_ids;
 use smithay::utils::os::FdEncoding;

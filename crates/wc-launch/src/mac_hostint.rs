@@ -56,7 +56,13 @@ pub fn start(ch: ByteChannel, cfg: &Config, mut say: Say) {
         paths: path_map(cfg),
         windows_paths: false,
     });
-    let opener = MacOpener { browser: browser(cfg) };
+    // The face the user works in yields the foreground to what is opened.
+    let opener = MacOpener {
+        browser: browser(cfg),
+        before_open: Some(std::sync::Arc::new(|bid: &str| {
+            wc_compositor::yield_activation_to(bid);
+        })),
+    };
     let (tx, rx) = channel::<Event>();
     // The handlers now and every minute; ends with the channel. The audio
     // devices are the sound ring's (sound_mac.rs, §103.16), not this channel's.

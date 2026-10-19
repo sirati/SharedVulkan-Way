@@ -40,18 +40,37 @@ unsafe extern "C" {
 
 const ROLES_ALL: u32 = 0xFFFF_FFFF;
 
+/// Called with the bundle id of the application about to be opened, before
+/// it is: the main process asks the active face to yield the foreground to
+/// it (macOS 14's cooperative activation).
+pub type BeforeOpen = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Opens on this Mac's desktop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MacOpener {
     /// The application `url` requests open in, by name, as `open -a` takes
     /// it ("Firefox", "Safari").
     pub browser: String,
+    pub before_open: Option<BeforeOpen>,
 }
 
 impl Default for MacOpener {
     fn default() -> Self {
-        MacOpener { browser: DEFAULT_BROWSER.into() }
+        MacOpener { browser: DEFAULT_BROWSER.into(), before_open: None }
     }
+}
+
+/// Where `open -a NAME` finds the application, in the usual folders.
+pub fn installed_app_path(name: &str) -> Option<String> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    ["/Applications", "/System/Applications", &format!("{home}/Applications")]
+        .iter()
+        .map(|d| Path::new(d).join(format!("{name}.app")))
+        .find(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Whether `open -a NAME` would find an application: one of the usual
@@ -121,19 +140,35 @@ fn run_open(argv: &[String]) -> Result<(), String> {
     }
 }
 
+impl MacOpener {
+    /// Let `bundle_id` come to the front, then give the yield a moment to
+    /// reach the face before `open` asks for the activation.
+    fn yield_to(&self, bundle_id: Option<String>) {
+        if let (Some(f), Some(b)) = (&self.before_open, bundle_id) {
+            f(&b);
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        }
+    }
+}
+
 impl Opener for MacOpener {
     fn open_url(&mut self, url: &str) -> Result<(), String> {
         let browser = Some(self.browser.as_str()).filter(|b| app_installed(b));
         let argv = open_url_argv(url, browser);
-        if argv.first().map(String::as_str) == Some("--") {
+        let target = if argv.first().map(String::as_str) == Some("--") {
             refuse_own_default(cf::url(url))?;
-        }
+            cf::url(url).as_ref().and_then(default_app_for)
+        } else {
+            browser.and_then(installed_app_path).and_then(|p| cf::bundle_id_at(&p))
+        };
+        self.yield_to(target);
         run_open(&argv)
     }
 
     fn open_path(&mut self, path: &str) -> Result<(), String> {
         check_path(path)?;
         refuse_own_default(cf::file_url(path, Path::new(path).is_dir()))?;
+        self.yield_to(cf::file_url(path, Path::new(path).is_dir()).as_ref().and_then(default_app_for));
         run_open(&open_path_argv(path))
     }
 
@@ -144,6 +179,7 @@ impl Opener for MacOpener {
         if let Target::HostPath(p) = target {
             check_path(p)?;
         }
+        self.yield_to(Some(app.to_string()));
         run_open(&open_with_argv(app, target))
     }
 }

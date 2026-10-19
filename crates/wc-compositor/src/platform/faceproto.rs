@@ -49,6 +49,12 @@ pub enum ToFace {
     Activate { id: WindowId },
     /// The main process is ending; the face quits.
     Bye,
+    /// §106: the main process is about to open something in another
+    /// application (`bundle_id`) for Linux; the active face lets it come to
+    /// the front (`yieldActivationToApplicationWithBundleIdentifier:`,
+    /// macOS 14), since cooperative activation lets only the active app
+    /// hand the foreground on.
+    Yield { bundle_id: String },
 }
 
 /// Face to main process.
@@ -299,6 +305,9 @@ impl ToFace {
             ToFace::Bye => {
                 w.u8(21);
             }
+            ToFace::Yield { bundle_id } => {
+                w.u8(22).str(bundle_id);
+            }
         }
         w.0
     }
@@ -354,6 +363,7 @@ impl ToFace {
             19 => ToFace::Destroy { id: r.u64()? },
             20 => ToFace::Activate { id: r.u64()? },
             21 => ToFace::Bye,
+            22 => ToFace::Yield { bundle_id: r.str()? },
             t => return Err(bad(&format!("to-face tag {t}"))),
         })
     }
@@ -561,6 +571,7 @@ mod tests {
         round(ToFace::BeginResize { id: 7, edge: Edge::BottomRight });
         round(ToFace::SizeHints { id: 7, min: (500, 120), max: (0, 0) });
         round(ToFace::Bye);
+        round(ToFace::Yield { bundle_id: "com.apple.Safari".into() });
     }
 
     #[test]
