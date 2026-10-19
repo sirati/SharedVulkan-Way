@@ -108,11 +108,8 @@ pub fn map_open_key(cfg: &Config, key: &str) -> Result<String, String> {
 ///
 /// ```text
 /// wc-launch --hostint-probe            devices, defaults, nodes, handlers
-/// wc-launch --render-test UID|- MS     play a 440 Hz tone to one device
 /// wc-launch --bundle-test DIR [--keep] a Linux bundle registers for .txt/.html/https
 /// wc-launch --host-bundle-test DIR    the main process's bundle, in DIR
-/// wc-launch --capture-test UID|- MS    record from one (only in the host
-///                                      bundle: turns a microphone on)
 /// ```
 pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
     use std::process::ExitCode;
@@ -170,20 +167,7 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
             }
         });
     }
-    let i = args.iter().position(|a| a == "--render-test" || a == "--capture-test")?;
-    let render = args[i] == "--render-test";
-    let uid = args.get(i + 1).filter(|u| *u != "-").map(String::as_str);
-    let ms: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(1000);
-    Some(match stream_test(render, uid, ms) {
-        Ok(line) => {
-            println!("{line}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("wc-launch: {e}");
-            ExitCode::from(1)
-        }
-    })
+    None
 }
 
 /// Linux's requests as the ring would carry them, through the same
@@ -277,49 +261,6 @@ fn bundle_test(dir: &Path, keep: bool) -> Result<(), String> {
     if ok && !offered { Ok(()) } else { Err("the bundle test failed".into()) }
 }
 
-fn stream_test(render: bool, uid: Option<&str>, ms: u64) -> Result<String, String> {
-    use std::io::{Read, Write};
-    use wc_hostplat::mac::stream::{Capture, Format, Render, Sizing};
-    let fmt = Format { rate: 48_000, channels: 2 };
-    let t = std::time::Instant::now();
-    let end = t + Duration::from_millis(ms);
-    if render {
-        let r = Render::start(uid, fmt, Sizing::default())?;
-        let mut w = r.writer();
-        let mut n: u64 = 0;
-        // 10 ms at a time, paced by the clock: what a ring would deliver.
-        while std::time::Instant::now() < end && r.running() {
-            let mut buf = Vec::with_capacity(480 * 4);
-            for _ in 0..480 {
-                let v = ((n as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 8000.0) as i16;
-                buf.extend_from_slice(&v.to_le_bytes());
-                buf.extend_from_slice(&v.to_le_bytes());
-                n += 1;
-            }
-            let _ = w.write_all(&buf);
-            let due = t + Duration::from_micros(n * 1_000_000 / 48_000);
-            if let Some(d) = due.checked_duration_since(std::time::Instant::now()) {
-                std::thread::sleep(d);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(150));
-        Ok(format!("render {uid:?}: {} ({:?})", r.stats().line(fmt.rate), t.elapsed()))
-    } else {
-        let c = Capture::start(uid, fmt, Sizing::default())?;
-        let mut rd = c.reader();
-        rd.set_timeout(Some(Duration::from_millis(200)));
-        let mut buf = vec![0u8; 4800];
-        let (mut bytes, mut peak) = (0usize, 0i32);
-        while std::time::Instant::now() < end && c.running() {
-            let n = rd.read(&mut buf).unwrap_or(0);
-            bytes += n;
-            for s in buf[..n].chunks_exact(2) {
-                peak = peak.max(i32::from(i16::from_le_bytes([s[0], s[1]])).abs());
-            }
-        }
-        Ok(format!("capture {uid:?}: {} bytes, peak {peak}, {}", bytes, c.stats().line(fmt.rate)))
-    }
-}
 
 fn support_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp")).join("Library/Application Support/waycompose")

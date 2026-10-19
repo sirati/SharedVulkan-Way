@@ -6,15 +6,14 @@
 //! defaults. A device with output streams is an output, one with input
 //! streams an input, and one with both (a USB headset) is both.
 //!
-//! [`watch`] listens to the device list and both defaults and sends the new
-//! state as the `State` once a burst of changes is over, within a second
-//! of its start (`crate::debounce`). The listeners run on CoreAudio's own
+//! [`listen`] tells its caller (`wc-launch`'s `sound_mac.rs`, the sound
+//! ring's device end) when the device list or a default changed. The
+//! listeners run on CoreAudio's own
 //! notification thread, not the main run loop (`kAudioHardwarePropertyRunLoop`
 //! is set to none), so this works in a process that never runs one.
 
 use std::ffi::c_void;
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
-use std::time::Instant;
+use std::sync::mpsc::Sender;
 
 use wc_hostint::audio::{Device, Dir, State};
 
@@ -161,10 +160,10 @@ extern "C" fn changed(_: AudioObjectID, _: u32, _: *const Address, client: *mut 
 
 const WATCHED: [u32; 3] = [DEVICES, DEFAULT_OUTPUT, DEFAULT_INPUT];
 
-/// The listeners, removed on drop. The thread that sends the states ends
-/// when they are gone or when nobody receives the events any more.
+/// The listeners, removed on drop.
 pub struct Watch {
     client: *mut Client,
+    added: usize,
 }
 
 // SAFETY: the pointer is only used to unregister and free, once, in drop.
@@ -176,7 +175,7 @@ impl Drop for Watch {
         // after removal CoreAudio calls the listener no more, so the box can
         // go.
         unsafe {
-            for s in WATCHED {
+            for s in WATCHED.into_iter().take(self.added) {
                 AudioObjectRemovePropertyListener(SYSTEM, &addr(s, GLOBAL), changed, self.client.cast());
             }
             drop(Box::from_raw(self.client));
@@ -184,50 +183,35 @@ impl Drop for Watch {
     }
 }
 
-/// Send the current state now, and again after every burst of device or
-/// default changes, as the `State` on `events`.
-pub fn watch(events: Sender<State>) -> Result<Watch, String> {
+/// Send `()` on `changed` whenever the device list or either default
+/// changes, from CoreAudio's own notification thread (several in a burst:
+/// a headset plugged in is a device added and two default changes). The
+/// listeners stay until the `Watch` is dropped.
+pub fn listen(changed_tx: Sender<()>) -> Result<Watch, String> {
     // Notifications on CoreAudio's own thread rather than the main run loop.
     let none: *const c_void = std::ptr::null();
     // SAFETY: the property is a CFRunLoopRef; null means "the HAL's own".
     unsafe {
         AudioObjectSetPropertyData(SYSTEM, &addr(RUN_LOOP, GLOBAL), 0, std::ptr::null(), std::mem::size_of_val(&none) as u32, (&raw const none).cast());
     }
-    let (tx, rx) = channel::<()>();
-    let client = Box::into_raw(Box::new(Client(tx)));
+    let client = Box::into_raw(Box::new(Client(changed_tx)));
+    let mut added = 0;
     for s in WATCHED {
         // SAFETY: a static listener and a client that lives until `Watch`
         // removes the listeners.
         let st = unsafe { AudioObjectAddPropertyListener(SYSTEM, &addr(s, GLOBAL), changed, client.cast()) };
         if st != 0 {
             // SAFETY: as in drop: remove what was added, then free.
-            drop(Watch { client });
+            drop(Watch { client, added });
             return Err(format!("AudioObjectAddPropertyListener: OSStatus {st}"));
         }
+        added += 1;
     }
-    std::thread::Builder::new()
-        .name("hostint-audio".into())
-        .spawn(move || {
-            if events.send(state()).is_err() {
-                return;
-            }
-            // The first change of a burst; wait for the burst to end.
-            while rx.recv().is_ok() {
-                let first = Instant::now();
-                let mut last = first;
-                loop {
-                    let Some(left) = crate::debounce::wait_left(first, last, Instant::now()) else { break };
-                    match rx.recv_timeout(left) {
-                        Ok(()) => last = Instant::now(),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-                if events.send(state()).is_err() {
-                    return;
-                }
-            }
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(Watch { client })
+    Ok(Watch { client, added })
+}
+
+/// Whether CoreAudio marks a device hidden (`kAudioDevicePropertyIsHidden`):
+/// a device no application should offer, such as an aggregate's parts.
+pub fn is_hidden(device: u32) -> bool {
+    get::<u32>(device, addr(IS_HIDDEN, GLOBAL)).unwrap_or(0) != 0
 }

@@ -2,9 +2,10 @@
 //! (docs/waycompose-design.md §106, the macOS host).
 //!
 //! * [`audio`]: the devices (UID, name, channels, rate) and the defaults,
-//!   and a watcher that sends the `State` after every burst of changes.
-//! * [`stream`]: AudioQueue render and capture on one device by UID;
-//!   capture only in the main process (`org.waycompose.host`), on demand.
+//!   and a listener that says when either changed.
+//! * [`may_capture`]: the microphone only in the main process
+//!   (`org.waycompose.host`, TCC rule 1); the sound ring's recorder
+//!   (`wc-launch` `sound_mac.rs`) asks before it opens one.
 //! * [`open`]: the `Opener`, `/usr/bin/open` with an argv.
 //! * [`handlers`]: Launch Services' applications per type, as offers.
 //! * [`plan`]: what all of them decide, pure; compiled and tested on every
@@ -23,8 +24,23 @@ pub mod cf;
 pub mod handlers;
 #[cfg(target_os = "macos")]
 pub mod open;
+
+/// Whether this process may open a microphone: only the main process,
+/// whose bundle is `org.waycompose.host` (TCC rule 1). Started any other
+/// way (the launcher's fallback direct spawn, a face) it may not, and
+/// macOS would otherwise ask about, and keep the grant under, whichever
+/// process it takes as responsible.
 #[cfg(target_os = "macos")]
-pub mod stream;
+pub fn may_capture() -> Result<(), String> {
+    match cf::main_bundle_id() {
+        Some(id) if id == plan::HOST_BUNDLE_ID => Ok(()),
+        other => Err(format!(
+            "the microphone is opened only by the main process ({}); this process is {}",
+            plan::HOST_BUNDLE_ID,
+            other.as_deref().unwrap_or("not a bundle")
+        )),
+    }
+}
 
 /// A plain-text report of what this Mac offers: its audio devices and
 /// defaults, this process's bundle and whether it may capture, the browser,
@@ -45,7 +61,7 @@ pub fn probe() -> String {
     for n in &nodes {
         let _ = writeln!(s, "  node {} stream {} ({} ch, {} Hz)", n.node_name, n.stream, n.channels, n.rate);
     }
-    let _ = writeln!(s, "bundle: {:?}; capture: {:?}", cf::main_bundle_id(), stream::may_capture());
+    let _ = writeln!(s, "bundle: {:?}; capture: {:?}", cf::main_bundle_id(), may_capture());
     let _ = writeln!(s, "browser {:?} installed: {}", plan::DEFAULT_BROWSER, open::app_installed(plan::DEFAULT_BROWSER));
     let hs = handlers::handlers();
     let _ = writeln!(s, "handlers: {}", hs.len());
