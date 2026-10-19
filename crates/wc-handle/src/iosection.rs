@@ -98,6 +98,7 @@ unsafe extern "C" {
     static kIOSurfaceHeight: CFTypeRef;
     static kIOSurfaceBytesPerElement: CFTypeRef;
     static kIOSurfacePixelFormat: CFTypeRef;
+    static kIOSurfaceBytesPerRow: CFTypeRef;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -125,8 +126,9 @@ unsafe impl Sync for Surface {}
 
 impl Surface {
     /// A new IOSurface of `width`×`height` elements of `bytes_per_element`,
-    /// pixel format `fourcc` (e.g. `'BGRA'`).
-    pub fn new(width: u32, height: u32, bytes_per_element: u32, fourcc: u32) -> Option<Surface> {
+    /// `bytes_per_row` apart, pixel format `fourcc` (e.g. `'BGRA'`). The pitch is
+    /// the caller's, so that the app side can be told it before the surface exists.
+    pub fn new(width: u32, height: u32, bytes_per_element: u32, bytes_per_row: u32, fourcc: u32) -> Option<Surface> {
         // SAFETY: CF calls with valid arguments; every object made here is
         // released here except the surface, which this value owns.
         unsafe {
@@ -139,8 +141,8 @@ impl Surface {
             if d.is_null() {
                 return None;
             }
-            let values = [width as i32, height as i32, bytes_per_element as i32, fourcc as i32];
-            for (k, v) in [kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat]
+            let values = [width as i32, height as i32, bytes_per_element as i32, bytes_per_row as i32, fourcc as i32];
+            for (k, v) in [kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow, kIOSurfacePixelFormat]
                 .into_iter()
                 .zip(values)
             {
@@ -158,6 +160,13 @@ impl Surface {
     /// The `IOSurfaceRef`, still owned by this value.
     pub fn as_ptr(&self) -> *mut c_void {
         self.0
+    }
+
+    /// Another reference to the same surface.
+    pub fn retain(&self) -> Surface {
+        // SAFETY: a live surface; the +1 is the returned value's.
+        unsafe { CFRetain(self.0) };
+        Surface(self.0)
     }
 
     pub fn bytes_per_row(&self) -> usize {

@@ -1002,7 +1002,9 @@ impl GpuHost for GpuServer {
             _ => None,
         });
         let shared_image = if let Some(x) = host_alloc {
-            x.handle_types.0 = crate::shared::HOST_ALLOCATION;
+            // §103.19: on the Mac the image's memory is an imported IOSurface
+            // texture, not host memory.
+            x.handle_types.0 = crate::shared::shared_handle_type();
             info.tiling = p::VkImageTiling(vk::ImageTiling::LINEAR.as_raw());
             if let Err(why) = crate::shared::image_importable(&self.shared.driver, info) {
                 eprintln!(
@@ -1041,6 +1043,13 @@ impl GpuHost for GpuServer {
             self.shared.objects().video_views.image_created(image as usize as u64, ci.usage.0);
             if shared_image {
                 self.shared.objects().shared_images.insert(image as usize as u64);
+                #[cfg(target_os = "macos")]
+                crate::iosurface::remember(
+                    vk::Handle::from_raw(image as usize as u64),
+                    vk::Format::from_raw(ci.format.0),
+                    ci.extent.width,
+                    ci.extent.height,
+                );
             }
         }
         if let Some(id) = a.p_image {
@@ -1122,6 +1131,8 @@ impl GpuHost for GpuServer {
             return Ok(());
         }
         self.shared.objects().shared_images.remove(&image);
+        #[cfg(target_os = "macos")]
+        crate::iosurface::forget(vk::Handle::from_raw(image));
         let kept = self.shared.objects().video_views.image_destroyed(image);
         for view in kept {
             self.destroy_view_on_driver(device, view);

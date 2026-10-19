@@ -33,6 +33,9 @@ struct Entry {
     size: u64,
     /// Views of it this process holds: the creator's and every import's.
     refs: usize,
+    /// §103.19: an IOSurface section's surface, for imports of its token.
+    #[cfg(target_os = "macos")]
+    surface: Option<wc_handle::iosection::Surface>,
 }
 
 static REGISTRY: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
@@ -90,8 +93,14 @@ fn hex(b: &[u8]) -> String {
 
 /// A mapped view of a section this process holds.
 pub struct View {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     region: sv_transport::region::SharedRegion,
+    /// §103.19: a POSIX shared memory object's mapping, or, for an image, an
+    /// IOSurface the GPU renders into (`iosurface.rs`).
+    #[cfg(target_os = "macos")]
+    region: Option<sv_transport::region::SharedRegion>,
+    #[cfg(target_os = "macos")]
+    _ios: Option<crate::iosurface::Section>,
     #[cfg(windows)]
     section: sv_transport::winshm::Section,
     len: u64,
@@ -100,10 +109,16 @@ pub struct View {
 // The pointer is handed to the driver as an import, never dereferenced here
 // (I3 of `SharedRegion`).
 impl View {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn base(&self) -> *mut u8 {
         // SAFETY: as above.
         unsafe { self.region.base_ptr() }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn base(&self) -> *mut u8 {
+        // SAFETY: as above.
+        self.region.as_ref().map_or(std::ptr::null_mut(), |r| unsafe { r.base_ptr() })
     }
 
     #[cfg(windows)]
@@ -176,7 +191,9 @@ fn remove_name(name: &str) {
     #[cfg(target_os = "linux")]
     let _ = std::fs::remove_file(name);
     #[cfg(target_os = "macos")]
-    if let Ok(c) = std::ffi::CString::new(name) {
+    if name.starts_with(wc_handle::iosection::PREFIX) {
+        crate::iosurface::retire(name);
+    } else if let Ok(c) = std::ffi::CString::new(name) {
         // SAFETY: a NUL-terminated name.
         unsafe { libc::shm_unlink(c.as_ptr()) };
     }
@@ -191,7 +208,7 @@ fn create_section(name: &str, len: u64) -> Result<View, String> {
         f.set_len(len).map_err(|e| format!("ftruncate {name}: {e}"))?;
         let region = sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)
             .map_err(|e| format!("mmap {name}: {e:?}"))?;
-        Ok(View { region, len })
+        Ok(View { region: Some(region), _ios: None, len })
     })();
     if made.is_err() {
         remove_name(name);
@@ -209,7 +226,7 @@ fn open_section(name: &str, len: u64) -> Result<View, String> {
     }
     let region = sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)
         .map_err(|e| format!("mmap {name}: {e:?}"))?;
-    Ok(View { region, len })
+    Ok(View { region: Some(region), _ios: None, len })
 }
 
 #[cfg(windows)]
@@ -284,6 +301,16 @@ impl Drop for SharedImport {
     }
 }
 
+/// The external memory handle type a shared image is created with: host
+/// memory (a section's view), or on the Mac an IOSurface's Metal texture
+/// (§103.19).
+pub fn shared_handle_type() -> u32 {
+    #[cfg(target_os = "macos")]
+    return crate::iosurface::MTLTEXTURE;
+    #[cfg(not(target_os = "macos"))]
+    HOST_ALLOCATION
+}
+
 /// The driver's `minImportedHostPointerAlignment`, at least a page.
 fn import_alignment(driver: &Driver) -> u64 {
     let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
@@ -356,6 +383,11 @@ fn image_needs(driver: &Driver, image: Option<vk::Image>) -> (u64, u64, u32) {
 /// Returns the import and the nonce.
 pub fn alloc(driver: &Driver, size: u64, image: Option<vk::Image>) -> Result<(SharedImport, [u8; 16]), String> {
     let (need, align, want) = image_needs(driver, image);
+    // §103.19: on the Mac a shared image renders into an IOSurface.
+    #[cfg(target_os = "macos")]
+    if let Some(img) = image.filter(|&i| crate::iosurface::is_shared(i)) {
+        return alloc_iosurface(driver, img, want);
+    }
     let a = import_alignment(driver).max(align);
     let len = round_up(size.max(need).max(1), a);
     let name = new_name();
@@ -367,7 +399,7 @@ pub fn alloc(driver: &Driver, size: u64, image: Option<vk::Image>) -> Result<(Sh
     }
     let nonce = random_bytes::<16>();
     // Registered before the import so that the drop of a failed one finds it.
-    registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1 }));
+    registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1, #[cfg(target_os = "macos")] surface: None }));
     match import(driver, &view, want) {
         Ok((memory, memory_type)) => Ok((SharedImport { name, memory, memory_type, view }, nonce)),
         Err(e) => {
@@ -387,6 +419,10 @@ pub fn open(
 ) -> Result<SharedImport, String> {
     if !name_ok(name) {
         return Err(format!("{name:?} is not a section name"));
+    }
+    #[cfg(target_os = "macos")]
+    if name.starts_with(wc_handle::iosection::PREFIX) {
+        return open_iosurface(driver, name, size, nonce, image);
     }
     let len = registry(|r| match r.get_mut(name) {
         None => Err(format!("{name} is not a section this GPU process made")),
@@ -424,6 +460,61 @@ pub fn open(
     }
 }
 
+/// §103.19: `alloc` for a shared image on the Mac: an IOSurface section the
+/// compositor is sent at once.
+#[cfg(target_os = "macos")]
+fn alloc_iosurface(driver: &Driver, image: vk::Image, want: u32) -> Result<(SharedImport, [u8; 16]), String> {
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{}{}.{n}.{}", wc_handle::iosection::PREFIX, std::process::id(), hex(&random_bytes::<8>()));
+    let (section, memory, memory_type) = crate::iosurface::make(driver, image, want)?;
+    let len = section.surface.len() as u64;
+    let nonce = random_bytes::<16>();
+    let kept = section.surface.retain();
+    registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1, surface: Some(kept) }));
+    crate::iosurface::announce(&name, &section.surface);
+    Ok((SharedImport { name, memory, memory_type, view: View { region: None, _ios: Some(section), len } }, nonce))
+}
+
+/// §103.19: `open` of an IOSurface section this process made, for another
+/// image (an app importing its own token).
+#[cfg(target_os = "macos")]
+fn open_iosurface(
+    driver: &Driver,
+    name: &str,
+    size: u64,
+    nonce: &[u8; 16],
+    image: Option<vk::Image>,
+) -> Result<SharedImport, String> {
+    let image = image.filter(|&i| crate::iosurface::is_shared(i)).ok_or_else(|| {
+        format!("{name} is an IOSurface and can only be imported by a shared image")
+    })?;
+    let (len, surface) = registry(|r| match r.get_mut(name) {
+        None => Err(format!("{name} is not a section this GPU process made")),
+        Some(e) if &e.nonce != nonce => Err(format!("{name}: the nonce does not match")),
+        Some(e) if size > e.size => Err(format!("{name} is {} bytes, {size} asked for", e.size)),
+        Some(e) => match &e.surface {
+            Some(s) => {
+                e.refs += 1;
+                Ok((e.size, s.retain()))
+            }
+            None => Err(format!("{name} has no IOSurface")),
+        },
+    })?;
+    let (_, _, want) = image_needs(driver, Some(image));
+    match crate::iosurface::import(driver, image, want, surface) {
+        Ok((section, memory, memory_type)) => Ok(SharedImport {
+            name: name.to_string(),
+            memory,
+            memory_type,
+            view: View { region: None, _ios: Some(section), len },
+        }),
+        Err(e) => {
+            release_ref(name);
+            Err(e)
+        }
+    }
+}
+
 fn release_ref(name: &str) {
     let last = registry(|r| match r.get_mut(name) {
         Some(e) => {
@@ -442,8 +533,12 @@ fn release_ref(name: &str) {
 /// target is Intel's Windows driver inside a VM, where a driver fault stops the
 /// VM, so it is never handed a combination it said it does not support.
 pub fn image_importable(driver: &Driver, ci: &sv_proto::VkImageCreateInfo) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if !crate::iosurface::format_ok(vk::Format::from_raw(ci.format.0)) {
+        return Err(format!("format {} cannot be an IOSurface", ci.format.0));
+    }
     let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::from_raw(shared_handle_type()));
     let info = vk::PhysicalDeviceImageFormatInfo2::default()
         .format(vk::Format::from_raw(ci.format.0))
         .ty(vk::ImageType::from_raw(ci.image_type.0))
@@ -463,7 +558,8 @@ pub fn image_importable(driver: &Driver, ci: &sv_proto::VkImageCreateInfo) -> Re
     if feats & IMPORTABLE == 0 {
         return Err(format!("the driver cannot import host memory for it (features {feats:#x})"));
     }
-    if feats & DEDICATED_ONLY != 0 {
+    // An IOSurface texture is always a dedicated import (§103.19).
+    if feats & DEDICATED_ONLY != 0 && shared_handle_type() == HOST_ALLOCATION {
         return Err("the driver wants a dedicated import, which a host pointer is not".into());
     }
     let e = &ci.extent;
@@ -569,7 +665,7 @@ mod tests {
 
     #[test]
     fn an_unknown_name_or_a_wrong_nonce_is_refused_before_anything_is_opened() {
-        registry(|r| r.insert("/dev/shm/sv-shared-test-x".into(), Entry { nonce: [1; 16], size: 8192, refs: 1 }));
+        registry(|r| r.insert("/dev/shm/sv-shared-test-x".into(), Entry { nonce: [1; 16], size: 8192, refs: 1, #[cfg(target_os = "macos")] surface: None }));
         let check = |name: &str, nonce: [u8; 16], size: u64| {
             registry(|r| match r.get(name) {
                 None => Err("unknown"),
