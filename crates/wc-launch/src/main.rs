@@ -992,6 +992,7 @@ mod win {
             cfg.installation()
         ));
         log.say(&format!("compositor: {} {}", cfg.compositor, argv.join(" ")));
+        let t_comp = Instant::now();
         let comp = quiet(Command::new(&cfg.compositor).args(&argv))
             .spawn()
             .map_err(|e| format!("{}: {e}", cfg.compositor))?;
@@ -1015,7 +1016,7 @@ mod win {
             Err::<Session, String>(why)
         };
         match answer {
-            Ok(Ok(l)) => log.say(&format!("up: {} ({} ms)", l.trim(), t.elapsed().as_millis())),
+            Ok(Ok(l)) => log.say(&format!("up: {} ({} ms after the compositor was started)", l.trim(), t_comp.elapsed().as_millis())),
             Ok(Err(l)) => return fail(format!("the session did not start: {}", l.trim())),
             Err(e) => return fail(format!("the compositor never said whether the host started the session: {e}")),
         }

@@ -33505,6 +33505,52 @@ installations' sessions still cannot run at the same moment (§93.4). That is
 unchanged by this section and not an ssh matter. Any number of applications in
 one installation run together.
 
+**Any file, any bell.** The ivshmem front end is not tied to QEMU: it reads
+page 0 of whatever file it is given, so it serves any guest whose shared memory
+is a file with an ivshmem-style header at its front. One example is the real
+Mac's role (b) (§103.5): a Linux guest under libkrun, with the arena a shared
+file at `/run/host-shm/arena` in the guest, a RAM-disk file on the Mac. The
+bell is any of `vdoorbell::PortHandle::open`'s spellings: a hub's socket (a
+path, or `socket:PATH`), `fd:R,W` that a parent passed down, or `dev:NAME`, a
+port of the machine the service runs on. An `fd:` pair cannot be reopened, so
+when it closes the service goes on with its timer only.
+
+```
+wc-arena-host sessiond --arena-file FILE      # or --ivshmem FILE; the same
+                       [--installs DIR]       # default ~/.config/waycompose/installs
+                       [--state DIR]          # default ~/.local/state/waycompose/sessiond
+                       [--bell SPEC]          # a hub socket, socket:PATH, fd:R,W or dev:NAME
+                       [--poll-ms N]          # default 1000
+```
+
+Environment: none of its own. It refuses to run as root, sets
+`WC_LAUNCH_SERVICE=1` for every `wc-session` it runs, and keeps its live
+sessions in `$XDG_RUNTIME_DIR/wc-sessiond/live`. Each installation is
+`DIR/NAME` → a directory holding `wc-session`, `apps.ini` and `session.key`
+(0600). The user unit deploy writes for the Windows VM:
+
+```ini
+[Unit]
+Description=waycompose session service: guest sessions from the shared memory, no ssh
+Wants=wc-bell-hub.service
+After=wc-bell-hub.service
+
+[Service]
+Environment=PATH=/run/current-system/sw/bin:/run/wrappers/bin
+ExecStart=%h/wc-bell/wc-arena-host sessiond --ivshmem /run/windows-vm/wc-arena/arena --installs %h/.config/waycompose/installs --bell %t/wc-bell/wl.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+For role (b) the line becomes `--arena-file /run/host-shm/arena --bell
+dev:org.sirati.wcbell.0` (the guest's own end of the port, read by the
+service), or `--bell fd:R,W` from a launcher that holds the port. The guest
+side writes its record with `wc_handle::macboot::publish` and an `Auth` under
+the installation's key, exactly as `session_svc.rs` does on Windows.
+
 ### 105.5 After the boot
 
 **The control ring.** `macsvc` (§103.14) serves it, unchanged except:
