@@ -150,13 +150,16 @@ fn verb(session: &PathBuf, words: &[&str]) -> Result<String, String> {
 /// still holds its record.
 fn release(qmp: &std::path::Path, vm: &str, f: &Found) -> Result<(), String> {
     let t = sv_hostd::qemu::QemuTarget::discover(qmp, vm).map_err(|e| e.to_string())?;
+    release_in(&t.file, f)
+}
+
+fn release_in(file: &std::fs::File, f: &Found) -> Result<(), String> {
     let mut pg = vec![0u8; wc_handle::arena::REGION_PAGE];
-    sv_hostd::qemu::read_at(&t.file, f.offset, &mut pg).map_err(|e| e.to_string())?;
+    sv_hostd::qemu::read_at(file, f.offset, &mut pg).map_err(|e| e.to_string())?;
     if macboot::Record::read(&pg).as_ref() != Some(&f.rec) {
         return Err("its boot page no longer holds its record".into());
     }
-    t.file
-        .write_all_at(&macboot::RELEASED.to_le_bytes(), f.offset + macboot::OFF_RELEASED as u64)
+    file.write_all_at(&macboot::RELEASED.to_le_bytes(), f.offset + macboot::OFF_RELEASED as u64)
         .map_err(|e| e.to_string())
 }
 
@@ -401,5 +404,88 @@ fn serve(args: &Args, live: &mut HashMap<String, Option<Found>>, served: &mut Ha
                 let _ = release(&args.qmp, &args.vm, &f);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in for QEMU's memory backend: pages of fill, one of them the
+    /// boot page of a ring window, as the guest writes it.
+    fn backend(pages: usize, boot_at: usize, rec: &macboot::Record) -> (std::fs::File, PathBuf) {
+        let page = wc_handle::arena::REGION_PAGE;
+        let mut mem = vec![0x5Au8; pages * page];
+        let pg = &mut mem[boot_at * page..(boot_at + 1) * page];
+        pg.fill(wc_handle::arena::STAMP_FILL);
+        pg[..8].copy_from_slice(&wc_handle::arena::STAMP_MAGIC);
+        let r = wc_handle::arena::STAMP_OFF_RUN_ID;
+        pg[r..r + 8].copy_from_slice(&rec.rings_run.to_le_bytes());
+        let i = wc_handle::arena::STAMP_OFF_PAGE_INDEX;
+        pg[i..i + 4].copy_from_slice(&0u32.to_le_bytes());
+        rec.write(pg);
+        // A second window's page 1 (index 1): not a boot page.
+        let other = &mut mem[(boot_at + 1) * page..(boot_at + 2) * page];
+        other[..8].copy_from_slice(&wc_handle::arena::STAMP_MAGIC);
+        other[i..i + 4].copy_from_slice(&1u32.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("wc-sessiond-{}-{boot_at}", std::process::id()));
+        std::fs::write(&path, &mem).unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        (f, path)
+    }
+
+    fn record() -> macboot::Record {
+        macboot::Record {
+            session: "wcm-4242".into(),
+            arena_run: 0xA1,
+            arena_pages: 16384,
+            outbound: 1 << 20,
+            rings_run: 0xB2,
+            rings_pages: 1537,
+            gpu: true,
+        }
+    }
+
+    /// The sweep finds a waiting record (and only boot pages), the answer
+    /// lands in the guest's page with the message before the state, and the
+    /// release word is written once the session is over. A located record is
+    /// not found again.
+    #[test]
+    fn sweep_answer_release() {
+        let rec = record();
+        let (f, path) = backend(64, 37, &rec);
+        let len = f.metadata().unwrap().len();
+        let found = sweep(&f, len).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].offset, 37 * wc_handle::arena::REGION_PAGE as u64);
+        assert_eq!(found[0].rec, rec);
+        assert!(answer(&f, &found[0], macboot::State::Located, "located 16384 of 16384").unwrap());
+        let mut pg = vec![0u8; wc_handle::arena::REGION_PAGE];
+        sv_hostd::qemu::read_at(&f, found[0].offset, &mut pg).unwrap();
+        assert_eq!(macboot::state(&pg), macboot::State::Located);
+        assert_eq!(macboot::message(&pg), "located 16384 of 16384");
+        assert!(sweep(&f, len).unwrap().is_empty(), "a located record is not served twice");
+        release_in(&f, &found[0]).unwrap();
+        sv_hostd::qemu::read_at(&f, found[0].offset, &mut pg).unwrap();
+        // SAFETY: a page-sized, 8-aligned-enough buffer (Vec<u8> from the
+        // global allocator) holding the boot page.
+        assert!(unsafe { macboot::load_released(pg.as_ptr()) });
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A page that no longer holds the record (the guest freed and reused it)
+    /// gets neither an answer nor a release.
+    #[test]
+    fn a_reused_page_is_not_written() {
+        let rec = record();
+        let (f, path) = backend(8, 3, &rec);
+        let found = sweep(&f, f.metadata().unwrap().len()).unwrap().remove(0);
+        f.write_all_at(&[0u8; 4096], found.offset).unwrap();
+        assert!(!answer(&f, &found, macboot::State::Failed, "x").unwrap());
+        assert!(release_in(&f, &found).is_err());
+        let mut pg = vec![0u8; 4096];
+        sv_hostd::qemu::read_at(&f, found.offset, &mut pg).unwrap();
+        assert!(pg.iter().all(|b| *b == 0), "the reused page was written");
+        let _ = std::fs::remove_file(path);
     }
 }
