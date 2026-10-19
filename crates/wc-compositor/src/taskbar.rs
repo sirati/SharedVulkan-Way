@@ -242,12 +242,28 @@ pub fn relaunch_file_name(aumid: &str) -> Option<String> {
     ok.then(|| format!("{aumid}.{RELAUNCH_EXT}"))
 }
 
-static RELAUNCH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+/// Where launchers keep the files above: `--relaunch-dir`, and since §107 one
+/// per installation a shared compositor serves, in the order they came.
+static RELAUNCH_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 
-/// `--relaunch-dir`: where the launcher keeps the files above. Set once, at
-/// argument parsing; a second call is ignored.
+/// `--relaunch-dir`: where the launcher keeps the files above.
 pub fn set_relaunch_dir(dir: std::path::PathBuf) {
-    let _ = RELAUNCH_DIR.set(dir);
+    add_relaunch_dir(dir);
+}
+
+/// §107: an installation's directory, for as long as its session runs. An
+/// identity names one application, and its file is in the directory of the
+/// installation that has it, so the directories are searched in turn.
+pub fn add_relaunch_dir(dir: std::path::PathBuf) {
+    let mut d = RELAUNCH_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if !d.contains(&dir) {
+        d.push(dir);
+    }
+}
+
+/// §107: the installation's session ended.
+pub fn remove_relaunch_dir(dir: &std::path::Path) {
+    RELAUNCH_DIRS.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| d != dir);
 }
 
 /// The relaunch details for a window's identity, if a launcher left any.
@@ -257,9 +273,9 @@ pub fn set_relaunch_dir(dir: std::path::PathBuf) {
 /// read when a window is created or renamed.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn relaunch_for(aumid: &str) -> Option<Relaunch> {
-    let dir = RELAUNCH_DIR.get()?;
     let name = relaunch_file_name(aumid)?;
-    Relaunch::parse(&std::fs::read_to_string(dir.join(name)).ok()?)
+    let dirs = RELAUNCH_DIRS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    dirs.iter().find_map(|d| Relaunch::parse(&std::fs::read_to_string(d.join(&name)).ok()?))
 }
 
 #[cfg(test)]

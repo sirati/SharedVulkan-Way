@@ -1300,7 +1300,9 @@ dependencies = [
 name = "sv-guest"
 version = "0.1.0"
 dependencies = [
+ "sv-arena",
  "sv-gpu-server",
+ "sv-transport",
  "wc-compositor",
 ]
 

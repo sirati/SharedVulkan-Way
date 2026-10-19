@@ -134,7 +134,13 @@ impl Handle {
 /// Claim the slot and start the service. Never fatal: a session without host
 /// integration is still a session.
 pub fn start(control: &Arc<Control>, cfg: Config) -> Option<Handle> {
-    match ByteChannel::claim(control, OWNER_HOSTINT) {
+    start_indexed(control, cfg, 0)
+}
+
+/// §107: [`start`] for session `index` of a shared compositor, whose slot
+/// carries the index in its owner id.
+pub fn start_indexed(control: &Arc<Control>, cfg: Config, index: u8) -> Option<Handle> {
+    match ByteChannel::claim(control, sv_transport::wlbytes::with_session(OWNER_HOSTINT, index)) {
         Ok(ch) => {
             println!("[proxy] host integration on ring slot {} (no ssh)", ch.slot());
             match start_on(ch, cfg) {

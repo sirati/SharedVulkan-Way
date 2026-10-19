@@ -289,6 +289,16 @@ pub struct Config {
     /// default and said in capitals on every step. `host`, `key`, `relay` and
     /// `port` are read only for it.
     pub debug_ssh_transport: bool,
+    /// §107. `shared-compositor = on` (the default): every installation of
+    /// this user is served by one compositor and one GPU process, so any
+    /// number of them run at once. `off` is §105's compositor per
+    /// installation, which the ivshmem driver lets run one at a time.
+    pub shared_compositor: bool,
+    /// §110. `one-pool = on` (the default): the shared compositor also runs
+    /// the GPU pool, in its own process, so Wayland buffers can lease from the
+    /// GPU device when the arena's BAR is full. `off`: the GPU pool is §107's
+    /// separate per-user process.
+    pub one_pool: bool,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -325,6 +335,8 @@ impl Default for Config {
             installation: String::new(),
             session_key: String::new(),
             debug_ssh_transport: false,
+            shared_compositor: true,
+            one_pool: true,
             apps: BTreeMap::new(),
         }
     }
@@ -449,6 +461,20 @@ impl Config {
                         "on" => true,
                         "off" => false,
                         _ => return Err(format!("line {}: debug-ssh-transport is on or off, not {v}", n + 1)),
+                    }
+                }
+                ("session", "one-pool") => {
+                    cfg.one_pool = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: one-pool is on or off, not {v}", n + 1)),
+                    }
+                }
+                ("session", "shared-compositor") => {
+                    cfg.shared_compositor = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: shared-compositor is on or off, not {v}", n + 1)),
                     }
                 }
                 ("session", "nested-compositor-globals") => {
@@ -834,6 +860,11 @@ mod gpu_tests {
     fn nested_compositor_globals_are_off_by_default() {
         let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
         assert!(!p("").unwrap().nested_globals);
+        assert!(p("").unwrap().shared_compositor, "§107: one compositor per user by default");
+        assert!(!p("shared-compositor = off\n").unwrap().shared_compositor);
+        assert!(p("shared-compositor = maybe\n").is_err());
+        assert!(p("").unwrap().one_pool, "§110: one pool by default");
+        assert!(!p("one-pool = off\n").unwrap().one_pool);
         assert!(p("nested-compositor-globals = on\n").unwrap().nested_globals);
         assert!(!p("nested-compositor-globals = off\n").unwrap().nested_globals);
         assert!(p("nested-compositor-globals = yes\n").is_err());
