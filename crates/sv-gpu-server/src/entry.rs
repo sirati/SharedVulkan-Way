@@ -1535,7 +1535,7 @@ fn guest(
 /// the normal case on a modern driver and prints nothing.
 // Both platforms: a driver missing part of the profile is worth saying out
 // loud wherever the GPU side runs.
-#[cfg(any(target_os = "linux", windows))]
+// Unconditional: `report_missing_pub` is public on every target (§103).
 fn report_missing(fns: &sv_gpu_entry::DriverFns) {
     let missing = fns.missing();
     if missing.is_empty() {

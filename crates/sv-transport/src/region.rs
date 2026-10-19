@@ -97,7 +97,7 @@ enum Backing {
     /// step 2 use.
     Heap(std::alloc::Layout),
     /// `mmap(MAP_SHARED)` of a file descriptor. The real one.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Mapped,
     /// A slice of memory somebody else owns and will free — the guest-side
     /// provider's one pinned window, sliced into the control region and the
@@ -149,7 +149,7 @@ impl SharedRegion {
     ///
     /// `offset` must be page-aligned, which `mmap` requires and which the
     /// caller's extent geometry gives for free.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn map_fd(fd: std::os::fd::BorrowedFd<'_>, offset: u64, len: usize) -> Result<Self> {
         use std::os::fd::AsRawFd;
         if !offset.is_multiple_of(PAGE as u64) {
@@ -530,7 +530,7 @@ impl Drop for SharedRegion {
             // SAFETY: `layout` is the one `heap` allocated with, and I1 says
             // nothing else has freed it.
             Backing::Heap(layout) => unsafe { std::alloc::dealloc(self.base, layout) },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             // SAFETY: `base`/`len` are the mapping `map_fd` established. One
             // `munmap` releases every VMA inside the range, which is also why
             // detaching a stitched arena is cheap however many runs built it
@@ -1037,5 +1037,38 @@ mod pool_view_tests {
         view.map_fixed(2 * stride, b.as_fd(), 0, 1 << 20).unwrap();
         view.read_bytes(2 * stride + 16, &mut got).unwrap();
         assert_eq!(&got, b"from-icd");
+    }
+}
+
+/// §103: the macOS twin of [`sys`], holding only what [`SharedRegion::map_fd`]
+/// and its `Drop` need. Separate rather than shared because the constants are
+/// not Linux's (`MAP_ANON` is `0x1000`, errno is `__error()`), and a shared
+/// module with per-OS numbers is how a wrong flag ships silently.
+#[cfg(target_os = "macos")]
+pub(crate) mod sys {
+    use core::ffi::{c_int, c_void};
+
+    pub const PROT_READ: i32 = 1;
+    pub const PROT_WRITE: i32 = 2;
+    pub const MAP_SHARED: i32 = 1;
+
+    unsafe extern "C" {
+        pub fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        #[link_name = "__error"]
+        fn errno_location() -> *mut c_int;
+    }
+
+    pub fn errno() -> i32 {
+        // SAFETY: `__error` returns a pointer to this thread's errno, valid for
+        // the life of the thread.
+        unsafe { *errno_location() }
     }
 }

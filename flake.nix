@@ -56,7 +56,10 @@
         # interpreter and no store path in it at all, so it runs wherever it is
         # copied. It is also what makes the app side deployable to the target at
         # all without putting a Rust toolchain on somebody's daily laptop.
-        targets = ["x86_64-pc-windows-gnu" "x86_64-unknown-linux-musl"];
+        # x86_64-apple-darwin (§103): `cargo check` of the macOS host half from
+        # this machine, which is the macOS gate; linking needs the SDK and
+        # happens in the macOS VM.
+        targets = ["x86_64-pc-windows-gnu" "x86_64-unknown-linux-musl" "x86_64-apple-darwin"];
       };
       # Miri needs nightly, and nothing else here does. Keeping it in a separate
       # shell means the default shell stays on the pinned stable toolchain —
@@ -456,7 +459,7 @@
 
           echo "shared_vulkan + waycompose dev shell — one binary per side"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
-          echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl"
+          echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl, x86_64-apple-darwin (check only)"
           echo "  vk.xml   $VK_XML"
           echo "  wlcs     ${pkgs.wlcs.version}"
           echo "  wine     $(wine --version 2>/dev/null || echo 'unavailable')"

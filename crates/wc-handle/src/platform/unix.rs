@@ -225,6 +225,19 @@ pub fn alloc_locked_region(
             format!("a guest-RAM region must be a non-zero multiple of {REGION_PAGE} bytes"),
         ));
     }
+    // §103.3: macOS's large pages are XNU superpages. On x86_64 they are 2 MiB,
+    // physically contiguous and always wired, so they are this function's
+    // `MEM_LARGE_PAGES` with no privilege needed, and the host's sweep finds a
+    // whole superpage per stamp run. There is no Apple Silicon equivalent
+    // (VM_FLAGS_SUPERPAGE_SIZE_2MB is x86_64-only), which is fine: an Apple
+    // Silicon Mac is the VM *host* in §103's role (b), never a guest.
+    #[cfg(target_os = "macos")]
+    if !small_pages_diagnostic {
+        return alloc_superpages(len, stamp);
+    }
+    #[cfg(target_os = "macos")]
+    let (len, flags) = (len, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS);
+    #[cfg(not(target_os = "macos"))]
     let (len, flags) = if small_pages_diagnostic {
         (len, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS)
     } else {
@@ -272,6 +285,55 @@ pub fn alloc_locked_region(
     // SAFETY: the mapping is live and `len` bytes long.
     let locked = unsafe { libc::mlock(ptr, len) } == 0;
     Ok(LockedRegion { view, len, locked, pinning: if locked { "mlock" } else { "none" } })
+}
+
+/// §103.3. The macOS twin of the hugetlb path: `mmap` with
+/// `VM_FLAGS_SUPERPAGE_SIZE_2MB` in the descriptor argument, which is XNU's
+/// documented spelling for an anonymous superpage mapping. The kernel either
+/// returns physically contiguous, wired 2 MiB pages or fails; it never falls
+/// back to small pages, so "superpages" in the report is a fact about the
+/// memory rather than a request. Measured in the Sonoma VM on 2026-10-19:
+/// 1 GiB in one call, wired-page count up by exactly the mapping.
+#[cfg(target_os = "macos")]
+fn alloc_superpages(len: usize, stamp: &dyn Fn(u32, &mut [u8])) -> io::Result<LockedRegion> {
+    /// `SUPERPAGE_SIZE_2MB << VM_FLAGS_SUPERPAGE_SHIFT`, from
+    /// `<mach/vm_statistics.h>`; spelled out so no libc version has to have it.
+    const VM_FLAGS_SUPERPAGE_SIZE_2MB: libc::c_int = 2 << 16;
+    const SUPERPAGE: usize = 2 << 20;
+    let len = len
+        .div_ceil(SUPERPAGE)
+        .checked_mul(SUPERPAGE)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
+    // SAFETY: an anonymous private mapping with a null hint; the "descriptor"
+    // is XNU's superpage selector, not a file. The result is checked.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            VM_FLAGS_SUPERPAGE_SIZE_2MB,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::arena::refusal_text(&format!(
+                "mmap(VM_FLAGS_SUPERPAGE_SIZE_2MB, {len} bytes) failed: {e} (superpages exist on \
+                 x86_64 macOS only and need {} physically contiguous free 2 MiB frames)",
+                len / SUPERPAGE
+            )),
+        ));
+    }
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+    for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+        stamp(i as u32, page);
+    }
+    Ok(LockedRegion { view, len, locked: true, pinning: "superpages" })
 }
 
 /// `Hugepagesize:` from `/proc/meminfo`, which is the size `MAP_HUGETLB` with
