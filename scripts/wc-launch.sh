@@ -445,7 +445,7 @@ Type=notify
 NotifyAccess=main
 FileDescriptorStoreMax=8
 FileDescriptorStorePreserve=yes
-ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena
 Restart=always
 RestartSec=2
 

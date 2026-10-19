@@ -1127,6 +1127,7 @@ dependencies = [
  "sv-arena",
  "sv-transport",
  "sv-wire",
+ "wc-handle",
 ]
 
 [[package]]
