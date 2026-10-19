@@ -315,11 +315,16 @@ impl<P: Platform> Broker<P> {
                     }
                 },
             },
-            Request::Open { id: rid } => match st.core.open(id, *rid) {
+            Request::Open { .. } | Request::Find { .. } => match match req {
+                Request::Find { pool } => st.core.find(id, pool),
+                Request::Open { id: rid } => st.core.open(id, *rid),
+                _ => unreachable!(),
+            } {
                 Err(r) => refused(w, r),
                 Ok(info) => {
-                    let Some(held) = st.objs.get(rid) else {
-                        let _ = st.core.close(id, *rid);
+                    let rid = info.id;
+                    let Some(held) = st.objs.get(&rid) else {
+                        let _ = st.core.close(id, rid);
                         return p.push(w, &format!("err region {rid} has no object here"));
                     };
                     let pieces: Vec<(u64, u64)> = held.iter().flat_map(|h| h.pieces.iter().copied()).collect();
@@ -337,7 +342,7 @@ impl<P: Platform> Broker<P> {
                         give,
                     );
                     if r.is_err() {
-                        let _ = st.core.close(id, *rid);
+                        let _ = st.core.close(id, rid);
                     }
                     r
                 }
