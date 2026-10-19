@@ -253,7 +253,7 @@ impl LargeView {
         self.base
     }
 
-    /// Write the §108.9 stamp at the start of every 2 MiB unit.
+    /// Write the §108.8 stamp at the start of every 2 MiB unit.
     pub fn stamp_units(&self, nonce: &[u8; 16]) {
         let units = (self.len as u64 / crate::lpstamp::UNIT) as u32;
         for i in 0..units {

@@ -1,5 +1,5 @@
 //! `Locator::Probe`: one stamp per 2 MiB unit, and the host's probe for it
-//! (waycompose-design.md §108.9).
+//! (waycompose-design.md §108.8).
 //!
 //! A Windows large page is 2 MiB, physically contiguous and aligned to 2 MiB
 //! in guest-physical memory. QEMU maps guest RAM into its backend linearly per
@@ -93,8 +93,8 @@ pub fn probe(len: u64, wanted: &[Wanted], mut read: impl FnMut(u64, &mut [u8; ST
     let mut off = 0u64;
     while off + UNIT <= len {
         stats.probes += 1;
-        if read(off, &mut buf) && buf[..8] == MAGIC {
-            if let Some((nonce, index, units)) = decode(&buf) {
+        if read(off, &mut buf) && buf[..8] == MAGIC
+            && let Some((nonce, index, units)) = decode(&buf) {
                 stats.stamps_seen += 1;
                 if let Some(w) = wanted.iter().position(|w| w.nonce == nonce) {
                     if units != wanted[w].units || index >= units {
@@ -106,7 +106,6 @@ pub fn probe(len: u64, wanted: &[Wanted], mut read: impl FnMut(u64, &mut [u8; ST
                     }
                 }
             }
-        }
         off += UNIT;
     }
     let found = slots

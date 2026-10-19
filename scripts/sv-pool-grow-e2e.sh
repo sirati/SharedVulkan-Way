@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The GPU pool grows past its boot device and gives memory back
-# (waycompose-design.md §108.12), end to end on one Linux machine:
+# (waycompose-design.md §108.13), end to end on one Linux machine:
 #
 #   sv-gpu-server pool-guest   lavapipe, a 64 MiB boot pool, growing from a
 #                              file that stands in for the Windows guest's RAM

@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn on_demand_covers_the_request_and_respects_the_budget() {
         let p = Policy::default();
-        let u = Usage { used: 300 * MIB, free: 1 * MIB, budget: 4 * GIB };
+        let u = Usage { used: 300 * MIB, free: MIB, budget: 4 * GIB };
         assert_eq!(p.on_demand(5 * MIB, u), Some(150 * MIB));
         assert_eq!(p.on_demand(700 * MIB, u), Some(700 * MIB));
         // a budget smaller than the step still serves the request

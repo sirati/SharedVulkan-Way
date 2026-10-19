@@ -1,4 +1,4 @@
-//! How the §108.11 instruments use a region once it is `MAPPED`: one
+//! How the §108.12 instruments use a region once it is `MAPPED`: one
 //! definition for the guest's `sv-guest ram test` and the host's
 //! `wc-arena-host ram-peer`, so the two cannot disagree about an offset.
 //!

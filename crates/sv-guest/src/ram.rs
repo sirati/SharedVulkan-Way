@@ -1,6 +1,6 @@
 //! `sv-guest ram …`: the keeper, and the instruments that proved guest-RAM
 //! regions on a Windows test VM before any real guest saw them
-//! (waycompose-design.md §108.11).
+//! (waycompose-design.md §108.12).
 //!
 //! ```text
 //! sv-guest ram keeper                      the SYSTEM keeper (§108.10)

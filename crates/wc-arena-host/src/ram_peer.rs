@@ -1,5 +1,5 @@
 //! `wc-arena-host ram-peer`: the host's half of a region table (§108.4), with
-//! the §108.11 instrument on top: every region it maps is filled with a
+//! the §108.12 instrument on top: every region it maps is filled with a
 //! pattern, its counters are written for as long as it is mapped (the
 //! stand-in for a proxy writing pixels), and the guest's answer is checked.
 //!
@@ -33,11 +33,10 @@ fn find_memfd(pid: u32) -> Result<std::path::PathBuf, String> {
     let dir = format!("/proc/{pid}/fd");
     for e in std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))? {
         let p = e.map_err(|e| e.to_string())?.path();
-        if let Ok(l) = std::fs::read_link(&p) {
-            if l.to_string_lossy().contains("memfd:memory-backend") {
+        if let Ok(l) = std::fs::read_link(&p)
+            && l.to_string_lossy().contains("memfd:memory-backend") {
                 return Ok(p);
             }
-        }
     }
     Err(format!("no memfd:memory-backend among {dir}"))
 }
@@ -195,11 +194,10 @@ fn run(a: &[String]) -> Result<(), String> {
                 PeerEvent::ProviderRun { run } => println!("[peer] {} provider run {run:016x}", ts()),
             }
         }
-        if answered {
-            if let Some(b) = bell_w.as_mut() {
+        if answered
+            && let Some(b) = bell_w.as_mut() {
                 let _ = b.write_all(&[REGION_TOKEN]);
             }
-        }
         if last_beat.elapsed() >= Duration::from_millis(BEAT_MS) {
             peer.beat();
             if auto {

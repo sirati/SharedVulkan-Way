@@ -210,15 +210,14 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
                     }
                 }
             }
-            if let Some((k, entry)) = retire {
-                if self.server.remove_region(k).is_ok() {
+            if let Some((k, entry)) = retire
+                && self.server.remove_region(k).is_ok() {
                     if let Some(l) = self.live.lock().unwrap().get_mut(&k) {
                         l.mapped = false;
                     }
                     prov.retire(entry);
                     eprintln!("[gpu] regions: region {k} idle for {} s, retired; {}", self.policy.idle_ms / 1000, self.server.report());
                 }
-            }
             let u = self.usage();
             if u.used > 0 {
                 ahead = self.policy.ahead(u);

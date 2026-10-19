@@ -58,6 +58,9 @@ pub struct Granted {
     pub memory_type: u32,
 }
 
+/// §108: called with the pool unlocked when a lease does not fit.
+pub type Grower = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 /// The pool, shared by every session of this process.
 pub struct PoolServer {
     pool: Mutex<Pool>,
@@ -69,7 +72,7 @@ pub struct PoolServer {
     next_session: std::sync::atomic::AtomicU64,
     /// §108: called with the pool unlocked when a lease does not fit; true
     /// means a region was added and the lease is worth trying again.
-    grower: std::sync::OnceLock<Box<dyn Fn(u64) -> bool + Send + Sync>>,
+    grower: std::sync::OnceLock<Grower>,
 }
 
 /// A session's handle on the pool.
@@ -102,7 +105,7 @@ impl PoolServer {
     }
 
     /// Grow on demand from now on (§108).
-    pub fn set_grower(&self, g: Box<dyn Fn(u64) -> bool + Send + Sync>) {
+    pub fn set_grower(&self, g: Grower) {
         let _ = self.grower.set(g);
     }
 
@@ -241,12 +244,12 @@ impl PoolServer {
         let mut leased = self.pool().lease(session, len, purpose);
         // §108: the pool, not the session, ran out. Grow (with the pool
         // unlocked) and try once more.
-        if matches!(leased, Err(PoolError::NoSpace { .. })) && purpose != Purpose::Control {
-            if let Some(grow) = self.grower.get() {
-                if grow(len) {
-                    leased = self.pool().lease(session, len, purpose);
-                }
-            }
+        if matches!(leased, Err(PoolError::NoSpace { .. }))
+            && purpose != Purpose::Control
+            && let Some(grow) = self.grower.get()
+            && grow(len)
+        {
+            leased = self.pool().lease(session, len, purpose);
         }
         let lease = match leased {
             Ok(l) => l,

@@ -192,11 +192,10 @@ impl Peer {
                     if e.answer() == QState::Unmapped {
                         continue;
                     }
-                    if let Some(m) = self.maps.get(&e.index) {
-                        if m.epoch != e.epoch {
+                    if let Some(m) = self.maps.get(&e.index)
+                        && m.epoch != e.epoch {
                             eprintln!("[peer] entry {}: retiring epoch {} but we map {}", e.index, e.epoch, m.epoch);
                         }
-                    }
                     if let Some(m) = self.maps.remove(&e.index) {
                         before_unmap(&m);
                         drop(m); // munmap

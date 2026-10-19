@@ -203,11 +203,11 @@ mod one_pool {
             // §108: a full pool grows, for a Wayland buffer as for a GPU one.
             let l = self.server.lease_growing(s, len, sv_arena::pool::Purpose::Dedicated)?;
             let (region, offset) = sv_arena::pool::split(l.offset);
-            if region != 0 {
-                if let Err(e) = self.register(region) {
-                    let _ = self.server.release(l.offset);
-                    return Err(e);
-                }
+            if region != 0
+                && let Err(e) = self.register(region)
+            {
+                let _ = self.server.release(l.offset);
+                return Err(e);
             }
             Ok((region, offset, l.len))
         }

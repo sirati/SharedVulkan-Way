@@ -51,7 +51,7 @@ impl Substrate for SimGuestRam {
     fn alloc(&mut self, len: u64) -> Result<Alloc, String> {
         let t = std::time::Instant::now();
         let n = (len / UNIT) as usize;
-        if len % UNIT != 0 || n == 0 {
+        if !len.is_multiple_of(UNIT) || n == 0 {
             return Err("a region is a whole number of 2 MiB units".into());
         }
         if (self.free_bytes() / UNIT) < n as u64 {
@@ -67,7 +67,7 @@ impl Substrate for SimGuestRam {
                 self.used[at as usize] = true;
                 pick.push(at);
             }
-            at = (at + 1 + if self.rnd() % 4 == 0 { self.rnd() % 8 } else { 0 }) % total;
+            at = (at + 1 + if self.rnd().is_multiple_of(4) { self.rnd() % 8 } else { 0 }) % total;
         }
         let nonce = (self.rnd() as u128 | ((self.rnd() as u128) << 64)).to_le_bytes();
         for (i, &u) in pick.iter().enumerate() {

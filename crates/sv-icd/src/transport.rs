@@ -2181,9 +2181,9 @@ impl RingTransport {
         // §108: a region in the guest's RAM, published by the host's peer.
         if region > 0 && self.ram_region_published(pool, region) {
             let mut ram = pool.ram.lock().unwrap_or_else(|e| e.into_inner());
-            if !ram.contains_key(&region) {
+            if let std::collections::btree_map::Entry::Vacant(e) = ram.entry(region) {
                 let hold = self.map_ram_region(pool, region)?;
-                ram.insert(region, hold);
+                e.insert(hold);
             }
             let h = ram.get_mut(&region).expect("inserted above");
             if local + r.len > h.len {
@@ -2271,6 +2271,7 @@ impl RingTransport {
                 h.leases = h.leases.saturating_sub(1);
                 if h.leases == 0 {
                     let h = ram.remove(&region).expect("present");
+                    #[cfg(target_os = "linux")]
                     let _ = self.arena.unmap_fixed(u64::from(region) * sv_arena::pool::REGION_STRIDE, h.len);
                     drop(h);
                 }

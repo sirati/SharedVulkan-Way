@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stress legs for guest-RAM regions (waycompose-design.md §108.11), run against
+# Stress legs for guest-RAM regions (waycompose-design.md §108.12), run against
 # a LOCAL Windows test VM only (winvm instance, default "wcram"), never a real
 # guest. The VM runs the keeper as a SYSTEM task; the host runs
 # `wc-arena-host ram-peer` against the VM's bootstrap file and RAM memfd.
@@ -66,8 +66,8 @@ leg_gib() {
 
 leg_pressure() {
   local secs=${1:-300} log=$EV/pressure-$(stamp).log
-  gs "schtasks /create /tn wcram-hog /tr 'cmd /c $EXE ram hog --mib 2048 --secs $secs > C:\\wcram\\hog.log 2>&1' /sc once /st 00:00 /ru SYSTEM /f; schtasks /run /tn wcram-hog" >/dev/null
-  run_test "$log" --sessions 3 --secs "$secs" --sizes 256M,512M,1G --hold-ms 2000
+  gs "schtasks /create /tn wcram-hog /tr 'cmd /c $EXE ram hog --mib ${WC_RAM_HOG_MIB:-4096} --secs $secs > C:\\wcram\\hog.log 2>&1' /sc once /st 00:00 /ru SYSTEM /f; schtasks /run /tn wcram-hog" >/dev/null
+  run_test "$log" --sessions 3 --cycles 0 --secs "$secs" --sizes 256M,512M,1G --hold-ms 2000
   check_test "$log" pressure
   echo "      hog: $(gs 'Get-Content C:\wcram\hog.log -Tail 1')"
   echo "      grows refused for the budget: $(grep -c 'failed: budget' "$log"), for no large pages (1450): $(grep -c 'errno 1450' "$log")"
