@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn a_client_reconnects_to_a_restarted_hub() {
         use std::os::unix::net::UnixListener;
-        struct Count(AtomicU64, AtomicU64);
+        struct Count(AtomicU64);
         impl BellTarget for Count {
             fn ring_token(&self, _t: u8, _w: &AtomicU64) -> bool {
                 self.0.fetch_add(1, Ordering::Relaxed);
@@ -940,7 +940,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hub.sock");
-        let target = Arc::new(Count(AtomicU64::new(0), AtomicU64::new(0)));
+        let target = Arc::new(Count(AtomicU64::new(0)));
         let l1 = UnixListener::bind(&path).unwrap();
         let (_doorman, first, wake) = connect_host_reconnecting(path.to_str().unwrap(), Arc::clone(&target)).unwrap();
         assert!(first);
