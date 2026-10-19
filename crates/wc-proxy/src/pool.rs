@@ -186,6 +186,12 @@ pub trait PoolTransport {
     /// a failure: `--transport shared-file` never sees an arena slice unless the
     /// compositor was configured against a region this proxy does not have, and
     /// that misconfiguration should say so in those words.
+    /// §109: free bytes and the longest free run, for an error that has
+    /// to say why a buffer did not fit. `None` for a transport with no arena.
+    fn free_bytes(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     fn peer_slice(&self, _arena: u32, _offset: u64, _len: u64) -> Option<&[u8]> {
         None
     }
@@ -1797,6 +1803,10 @@ impl Alloc {
 }
 
 impl PoolTransport for Arena {
+    fn free_bytes(&self) -> Option<(u64, u64)> {
+        Some(Arena::free_bytes(self))
+    }
+
     fn name(&self) -> &'static str {
         "arena"
     }
