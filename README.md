@@ -239,6 +239,20 @@ scripts/mac-pinning.sh                    # do wired pages stay put? (§103.3)
 scripts/mac-shot.sh OUT.png; scripts/mac-input.sh click X Y | type TEXT | key meta_l+c
 ```
 
+**The nested KWin on the guest's GPU (`docs/waycompose-design.md` §104).** The
+future Linux desktop of §102 composites with OpenGL on Zink over sv-icd, on the
+guest's Intel GPU, with Aero glass. Its render node is userspace: `sv-drm
+serve` is a CUSE device, and `sv-drm ns` runs KWin in a namespace where libdrm
+sees it. KWin's buffers are LINEAR images in named guest sections that the
+compositor maps, so no frame is copied on either side.
+
+```
+sv-drm serve --owner U --group G --mode 0660 --state FILE   # root: /dev/dri/renderD128
+sv-drm ns --state FILE -- kwin_wayland ...                  # the user: libdrm sees it
+wc-proxy ... --dmabuf-node /dev/dri/renderD128              # zwp_linux_dmabuf_v1, zero copy
+scripts/sv-dmabuf-e2e.sh; scripts/wc-dmabuf.sh              # the ICD and the proxy halves, locally
+```
+
 ## Layout
 
 ```

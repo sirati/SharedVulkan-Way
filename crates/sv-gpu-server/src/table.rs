@@ -153,6 +153,13 @@ pub struct Objects {
     /// Driver views of video images kept until their image goes
     /// (`crate::video_views`, docs/video-decode.md §7.11).
     pub video_views: crate::video_views::VideoViews,
+    /// Shared sections imported under an app-side memory id (§104). The
+    /// `VkDeviceMemory` is also in `memory`; it is freed before the entry here
+    /// is dropped, which unmaps the view.
+    pub shared_imports: HashMap<u64, crate::shared::SharedImport>,
+    /// Driver images created to be bound to a shared section, whose
+    /// requirements offer the application type 0 only.
+    pub shared_images: std::collections::HashSet<u64>,
 }
 
 impl Default for Objects {
@@ -172,6 +179,8 @@ impl Objects {
             leases: BTreeMap::new(),
             pool: None,
             video_views: Default::default(),
+            shared_imports: HashMap::new(),
+            shared_images: Default::default(),
         }
     }
 
@@ -510,6 +519,10 @@ impl Objects {
         }
         self.map.retain(|_, o| OWNED_ELSEWHERE.contains(&o.ty));
         self.memory.retain(|id, _| *id == crate::ARENA_MEMORY_ID);
+        // Their imports were freed with the other memory above; the views go
+        // now (§104).
+        self.shared_imports.clear();
+        self.shared_images.clear();
         Ok(n)
     }
 

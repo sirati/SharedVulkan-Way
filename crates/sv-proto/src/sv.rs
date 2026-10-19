@@ -573,10 +573,198 @@ impl ReleaseArenaReply {
     }
 }
 
+/// `svAllocShared`: a `VkDeviceMemory` whose pages are a named shared section
+/// the GPU side creates, maps and imports as a host pointer (the dma-buf path
+/// of waycompose-design.md §104). The app-side memory id is chosen by the app
+/// side, as for every object (§6.4); the GPU side registers its import under it.
+pub const SV_ALLOC_SHARED: u32 = PROTOCOL_BASE + 6;
+
+/// `svImportShared`: import a section this GPU process created earlier, named
+/// by a token's name and nonce, under a new app-side memory id.
+pub const SV_IMPORT_SHARED: u32 = PROTOCOL_BASE + 7;
+
+/// The longest section name either command carries; `sv_drm::token::MAX_NAME`.
+pub const SHARED_NAME_LEN: usize = 200;
+
+/// A section name on the wire: its length, then [`SHARED_NAME_LEN`] bytes,
+/// NUL-padded, as `u32` words (the [`ArenaInfo::name`] precedent).
+fn put_name(enc: &mut Encoder<'_>, name: &str) -> Result<()> {
+    let b = name.as_bytes();
+    if b.len() > SHARED_NAME_LEN {
+        return Err(WireError::Truncated { need: b.len(), have: SHARED_NAME_LEN });
+    }
+    let mut buf = [0u8; SHARED_NAME_LEN];
+    buf[..b.len()].copy_from_slice(b);
+    enc.u32(b.len() as u32)?;
+    for w in buf.chunks_exact(4) {
+        enc.u32(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))?;
+    }
+    Ok(())
+}
+
+fn get_name(dec: &mut Decoder<'_>) -> Result<String> {
+    let len = dec.u32()? as usize;
+    let mut buf = [0u8; SHARED_NAME_LEN];
+    for w in buf.chunks_exact_mut(4) {
+        w.copy_from_slice(&dec.u32()?.to_le_bytes());
+    }
+    if len > SHARED_NAME_LEN {
+        return Err(WireError::Truncated { need: len, have: SHARED_NAME_LEN });
+    }
+    // A name that is not UTF-8 is refused by whoever checks names; carrying it
+    // lossily would make two different names compare equal.
+    String::from_utf8(buf[..len].to_vec()).map_err(|_| WireError::Truncated { need: len, have: 0 })
+}
+
+fn put_nonce(enc: &mut Encoder<'_>, n: &[u8; 16]) -> Result<()> {
+    for w in n.chunks_exact(4) {
+        enc.u32(u32::from_le_bytes([w[0], w[1], w[2], w[3]]))?;
+    }
+    Ok(())
+}
+
+fn get_nonce(dec: &mut Decoder<'_>) -> Result<[u8; 16]> {
+    let mut n = [0u8; 16];
+    for w in n.chunks_exact_mut(4) {
+        w.copy_from_slice(&dec.u32()?.to_le_bytes());
+    }
+    Ok(n)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllocShared {
+    /// The app-side `VkDeviceMemory` id the import is registered under.
+    pub memory: u64,
+    /// `allocationSize`; the GPU side rounds it up to what an import needs.
+    pub size: u64,
+    /// The app-side `VkImage` the allocation is dedicated to, or 0: its
+    /// requirements narrow the memory type and bound the size.
+    pub image: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AllocSharedReply {
+    /// `VK_SUCCESS`, or the `VkResult` the allocation failed with.
+    pub result: i32,
+    /// The driver memory type of the import, for logs.
+    pub memory_type: u32,
+    /// The section's size, a multiple of the import alignment.
+    pub size: u64,
+    pub nonce: [u8; 16],
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImportShared {
+    pub memory: u64,
+    pub size: u64,
+    pub image: u64,
+    pub nonce: [u8; 16],
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImportSharedReply {
+    pub result: i32,
+    pub memory_type: u32,
+    pub size: u64,
+}
+
+const ALLOC_SHARED_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 24;
+const ALLOC_SHARED_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8 + 8 + 16 + 4 + SHARED_NAME_LEN + 4;
+const IMPORT_SHARED_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 24 + 16 + 4 + SHARED_NAME_LEN;
+const IMPORT_SHARED_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 8 + 8;
+
+impl AllocShared {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_ALLOC_SHARED, ALLOC_SHARED_SIZE)?;
+        enc.u32(0)?;
+        enc.u64(self.memory)?;
+        enc.u64(self.size)?;
+        enc.u64(self.image)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<AllocShared> {
+        let mut dec = expect_command(payload, SV_ALLOC_SHARED)?;
+        let _pad = dec.u32()?;
+        Ok(AllocShared { memory: dec.u64()?, size: dec.u64()?, image: dec.u64()? })
+    }
+}
+
+impl AllocSharedReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_ALLOC_SHARED, ALLOC_SHARED_REPLY_SIZE)?;
+        enc.i32(self.result)?;
+        enc.u32(self.memory_type)?;
+        enc.u64(self.size)?;
+        put_nonce(&mut enc, &self.nonce)?;
+        put_name(&mut enc, &self.name)?;
+        enc.u32(0)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<AllocSharedReply> {
+        let mut dec = expect_reply(payload, SV_ALLOC_SHARED)?;
+        let result = dec.i32()?;
+        let memory_type = dec.u32()?;
+        let size = dec.u64()?;
+        let nonce = get_nonce(&mut dec)?;
+        let name = get_name(&mut dec)?;
+        let _pad = dec.u32()?;
+        Ok(AllocSharedReply { result, memory_type, size, nonce, name })
+    }
+}
+
+impl ImportShared {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_IMPORT_SHARED, IMPORT_SHARED_SIZE)?;
+        enc.u32(0)?;
+        enc.u64(self.memory)?;
+        enc.u64(self.size)?;
+        enc.u64(self.image)?;
+        put_nonce(&mut enc, &self.nonce)?;
+        put_name(&mut enc, &self.name)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ImportShared> {
+        let mut dec = expect_command(payload, SV_IMPORT_SHARED)?;
+        let _pad = dec.u32()?;
+        let memory = dec.u64()?;
+        let size = dec.u64()?;
+        let image = dec.u64()?;
+        let nonce = get_nonce(&mut dec)?;
+        let name = get_name(&mut dec)?;
+        Ok(ImportShared { memory, size, image, nonce, name })
+    }
+}
+
+impl ImportSharedReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_IMPORT_SHARED, IMPORT_SHARED_REPLY_SIZE)?;
+        enc.i32(self.result)?;
+        enc.u32(self.memory_type)?;
+        enc.u64(self.size)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<ImportSharedReply> {
+        let mut dec = expect_reply(payload, SV_IMPORT_SHARED)?;
+        Ok(ImportSharedReply { result: dec.i32()?, memory_type: dec.u32()?, size: dec.u64()? })
+    }
+}
+
 /// A printable name for any opcode on a ring, ours or Vulkan's, for
 /// instruments (`WC_FRAME_TRACE`, docs/waycompose-design.md §88).
 pub fn opcode_name(op: u32) -> std::borrow::Cow<'static, str> {
     match op {
+        SV_ALLOC_SHARED => "svAllocShared".into(),
+        SV_IMPORT_SHARED => "svImportShared".into(),
         SV_EXECUTE_COMMAND_BLOB => "svExecuteCommandBlob".into(),
         SV_IMPORT_ARENA_SLAB => "svImportArenaSlab".into(),
         SV_DRIVER_VERSIONS => "svDriverVersions".into(),
@@ -683,6 +871,45 @@ mod tests {
         // One command's reply is not another's.
         assert!(LeaseArenaReply::decode(&buf).is_err());
         for op in [SV_ARENA_INFO, SV_LEASE_ARENA, SV_RELEASE_ARENA] {
+            assert!(crate::Opcode::from_u32(op).is_none());
+            assert!(is_protocol(op));
+        }
+    }
+
+    /// §104's two commands: the name and the nonce survive both directions,
+    /// the ring finds each length where it looks, and a name too long for the
+    /// wire is refused at encode rather than cut.
+    #[test]
+    fn the_shared_section_commands_round_trip() {
+        let mut buf = Vec::new();
+        let a = AllocShared { memory: 77, size: 4 << 20, image: 76 };
+        a.encode(&mut buf).unwrap();
+        assert_eq!(AllocShared::decode(&buf).unwrap(), a);
+        assert!(wants_reply(&buf));
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize, buf.len());
+
+        let name = r"Local\sv-shared-412-3-a1b2c3d4e5f60718".to_string();
+        let r = AllocSharedReply { result: 0, memory_type: 2, size: 4 << 20, nonce: [9; 16], name: name.clone() };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(AllocSharedReply::decode(&buf).unwrap(), r);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize, buf.len());
+
+        let i = ImportShared { memory: 90, size: 4 << 20, image: 89, nonce: [3; 16], name: "/dev/shm/sv-shared-1-2-0011223344556677".into() };
+        i.encode(&mut buf).unwrap();
+        assert_eq!(ImportShared::decode(&buf).unwrap(), i);
+        assert!(wants_reply(&buf));
+        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize, buf.len());
+        let r = ImportSharedReply { result: -1_000_072_003, memory_type: 1, size: 4 << 20 };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(ImportSharedReply::decode(&buf).unwrap(), r);
+        assert!(AllocSharedReply::decode(&buf).is_err());
+
+        let long = ImportShared { name: "a".repeat(SHARED_NAME_LEN + 1), ..Default::default() };
+        assert!(long.encode(&mut buf).is_err());
+        let full = ImportShared { name: "b".repeat(SHARED_NAME_LEN), ..Default::default() };
+        full.encode(&mut buf).unwrap();
+        assert_eq!(ImportShared::decode(&buf).unwrap().name.len(), SHARED_NAME_LEN);
+        for op in [SV_ALLOC_SHARED, SV_IMPORT_SHARED] {
             assert!(crate::Opcode::from_u32(op).is_none());
             assert!(is_protocol(op));
         }

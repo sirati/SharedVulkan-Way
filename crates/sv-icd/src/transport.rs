@@ -2206,6 +2206,33 @@ impl RingTransport {
         Err(LowerError::Shape("a pooled arena on this system"))
     }
 
+    /// `svAllocShared` (waycompose-design.md §104): a section of at least
+    /// `size` bytes, imported on the GPU side under `memory`. The inner `Err`
+    /// is the GPU side's refusal, a `VkResult`.
+    pub fn alloc_shared(&self, memory: u64, size: u64, image: u64) -> IcdResult<Result<crate::dmabuf::SharedToken, i32>> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::AllocShared { memory, size, image }.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_ALLOC_SHARED, &cmd, &mut reply)?;
+        let r = sv_proto::sv::AllocSharedReply::decode(&reply).map_err(LowerError::Wire)?;
+        if r.result != 0 {
+            return Ok(Err(r.result));
+        }
+        Ok(Ok(crate::dmabuf::SharedToken { size: r.size, nonce: r.nonce, name: r.name }))
+    }
+
+    /// `svImportShared` (§104): the section a token names, imported under
+    /// `memory`. Returns the GPU side's `VkResult`.
+    pub fn import_shared(&self, memory: u64, size: u64, image: u64, t: &crate::dmabuf::SharedToken) -> IcdResult<i32> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::ImportShared { memory, size, image, nonce: t.nonce, name: t.name.clone() }
+            .encode(&mut cmd)
+            .map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_IMPORT_SHARED, &cmd, &mut reply)?;
+        Ok(sv_proto::sv::ImportSharedReply::decode(&reply).map_err(LowerError::Wire)?.result)
+    }
+
     /// `svReleaseArena`.
     pub fn release_arena(&self, offset: u64) -> IcdResult<()> {
         let mut cmd = Vec::new();

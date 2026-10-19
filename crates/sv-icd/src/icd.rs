@@ -156,6 +156,11 @@ impl IcdLocal for SharedVulkan {
                 sv_icd_entry::local::sv_vk_get_instance_proc_addr as *const core::ffi::c_void,
             );
         }
+        // The dma-buf path's one C-side entry point (`crate::dmabuf`), which
+        // exists only while `SV_DRM_NODE` is set.
+        if let Some(p) = crate::dmabuf::proc_override(name) {
+            return Some(p);
+        }
         sv_icd_entry::lookup(sv_icd_entry::GLOBAL_COMMANDS, name)
             .or_else(|| sv_icd_entry::lookup(sv_icd_entry::INSTANCE_COMMANDS, name))
             // A non-NULL instance may also be asked for device-level commands;
@@ -290,11 +295,22 @@ impl IcdLocal for SharedVulkan {
         drop(s);
 
         if let Some(t) = self.wire() {
+            let mut info = info.clone();
+            // The dma-buf path's extensions are this side's (`crate::dmabuf`);
+            // the driver behind the GPU side need not have heard of them.
+            if crate::dmabuf::enabled() {
+                info.pp_enabled_extension_names.retain(|n| {
+                    let n = String::from_utf8_lossy(n);
+                    let n = n.trim_end_matches('\0');
+                    !crate::dmabuf::EXTENSIONS.iter().any(|(e, _)| *e == n)
+                });
+                info.enabled_extension_count = info.pp_enabled_extension_names.len() as u32;
+            }
             let reply = forward::create_device(
                 t,
                 p::VkCreateDeviceArgs {
                     physical_device: p::VkPhysicalDevice(physical_device),
-                    p_create_info: Some(Box::new(info.clone())),
+                    p_create_info: Some(Box::new(info)),
                     p_device: Some(p::VkDevice(id)),
                 },
             )?;
@@ -306,6 +322,10 @@ impl IcdLocal for SharedVulkan {
     }
 
     fn destroy_device(&self, device: u64) {
+        let fence = self.state().sync_fences.remove(&device);
+        if let (Some(f), Some(t)) = (fence, self.wire()) {
+            let _ = forward::destroy_fence(t, p::VkDestroyFenceArgs { device: p::VkDevice(device), fence: p::VkFence(f) });
+        }
         if let Some(t) = self.wire() {
             let _ =
                 forward::destroy_device(t, p::VkDestroyDeviceArgs { device: p::VkDevice(device) });
@@ -449,6 +469,11 @@ impl IcdLocal for SharedVulkan {
         let Some(alloc) = s.memories.get(&memory).map(|m| m.allocation) else {
             return Err(LowerError::Shape("vkMapMemory: unknown memory"));
         };
+        if s.shared_memories.contains_key(&memory) {
+            // A dma-buf's pages are a section on the GPU side's machine, which
+            // this process does not map (waycompose-design.md §104).
+            return Err(LowerError::Result(crate::dmabuf::VK_ERROR_MEMORY_MAP_FAILED));
+        }
         let Some(alloc) = alloc else {
             // Heap 0 is never host-visible, so this cannot be reached through a
             // legal call — the application would have had to allocate from a
@@ -577,6 +602,9 @@ impl Icd for SharedVulkan {
             let mut reply = forward::get_physical_device_properties(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
                 clamp_api_version(self, &mut p.api_version);
+                if let Some(ty) = crate::dmabuf::device_type_override() {
+                    p.device_type = p::VkPhysicalDeviceType(ty);
+                }
             }
             return Ok(reply);
         }
@@ -590,9 +618,28 @@ impl Icd for SharedVulkan {
         args: p::VkGetPhysicalDeviceProperties2Args,
     ) -> IcdResult<p::VkGetPhysicalDeviceProperties2Reply> {
         if let Some(t) = self.wire() {
+            let mut args = args;
+            let node = crate::dmabuf::node();
+            // §104: the render node is this side's answer, and the driver
+            // behind the GPU side (Intel's, on Windows) has no such struct.
+            let drm_asked = node.is_some()
+                && args.p_properties.as_mut().is_some_and(|p| {
+                    let before = p.p_next.len();
+                    p.p_next.retain(|l| !matches!(l, p::PNextLink::VkPhysicalDeviceDrmPropertiesEXT(_)));
+                    p.p_next.len() != before
+                });
             let mut reply = forward::get_physical_device_properties2(t, args)?;
             if let Some(p) = reply.p_properties.as_mut() {
                 clamp_api_version(self, &mut p.properties.api_version);
+                if let Some(ty) = crate::dmabuf::device_type_override() {
+                    p.properties.device_type = p::VkPhysicalDeviceType(ty);
+                }
+                if let (true, Some((major, minor))) = (drm_asked, node) {
+                    p.p_next.retain(|l| !matches!(l, p::PNextLink::VkPhysicalDeviceDrmPropertiesEXT(_)));
+                    p.p_next.push(p::PNextLink::VkPhysicalDeviceDrmPropertiesEXT(Box::new(
+                        crate::dmabuf::drm_properties(major, minor),
+                    )));
+                }
             }
             return Ok(reply);
         }
@@ -720,12 +767,23 @@ impl Icd for SharedVulkan {
         })
     }
 
+    /// All zero, except a sync fd on the dma-buf path (§104): exported as
+    /// "already signalled" once the work behind it is done, imported as a wait
+    /// that is dropped. See `get_semaphore_fd_khr`.
     fn get_physical_device_external_semaphore_properties(
         &self,
-        _args: p::VkGetPhysicalDeviceExternalSemaphorePropertiesArgs,
+        args: p::VkGetPhysicalDeviceExternalSemaphorePropertiesArgs,
     ) -> IcdResult<p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply> {
+        let mut out = p::VkExternalSemaphoreProperties::default();
+        let ty = args.p_external_semaphore_info.as_ref().map_or(0, |i| i.handle_type.0 as u32);
+        if crate::dmabuf::enabled() && ty == crate::dmabuf::SYNC_FD {
+            out.export_from_imported_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
+            out.compatible_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
+            // EXPORTABLE | IMPORTABLE.
+            out.external_semaphore_features = p::VkExternalSemaphoreFeatureFlags(0x3);
+        }
         Ok(p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply {
-            p_external_semaphore_properties: Some(Box::default()),
+            p_external_semaphore_properties: Some(Box::new(out)),
         })
     }
 
@@ -755,35 +813,99 @@ impl Icd for SharedVulkan {
     ///
     /// `VK_ERROR_TOO_MANY_OBJECTS` is one of the two results the specification
     /// allows the getters; `VK_ERROR_INVALID_EXTERNAL_HANDLE` is the importers'.
-    fn get_memory_fd_khr(&self, _args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
-        Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+    ///
+    /// **The one exception is the dma-buf path** (waycompose-design.md §104):
+    /// a shared allocation's fd is not a descriptor of the GPU side at all but
+    /// a sealed memfd token made here, naming the section — a new one each
+    /// call, as the specification requires.
+    fn get_memory_fd_khr(&self, args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
+        let refuse = Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None });
+        let Some(info) = args.p_get_fd_info.as_ref() else { return refuse };
+        if !crate::dmabuf::enabled() || info.handle_type.0 as u32 != crate::dmabuf::DMA_BUF {
+            return refuse;
+        }
+        let token = self.state().shared_memories.get(&info.memory.0).cloned();
+        match token.as_ref().and_then(crate::dmabuf::token_fd) {
+            Some(fd) => Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(0), p_fd: Some(fd) }),
+            None => {
+                sv_icd_entry::report_always(&format_args!(
+                    "vkGetMemoryFdKHR(DMA_BUF) of memory {} which was not allocated exportable",
+                    info.memory.0
+                ));
+                refuse
+            }
+        }
     }
 
+    /// A sync fd on the dma-buf path (§104): the semaphore's pending signal is
+    /// consumed here — a submit on the queue that signalled it, waiting on it,
+    /// with a fence this side then waits for — and the fd is -1, "already
+    /// signalled". That is the implicit sync KWin expects: when Zink's flush
+    /// returns, the frame is finished. Anything else is refused as before.
     fn get_semaphore_fd_khr(
         &self,
-        _args: p::VkGetSemaphoreFdKHRArgs,
+        args: p::VkGetSemaphoreFdKHRArgs,
     ) -> IcdResult<p::VkGetSemaphoreFdKHRReply> {
-        Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
+        let refuse = Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None });
+        let Some(info) = args.p_get_fd_info.as_ref() else { return refuse };
+        if !crate::dmabuf::enabled() || info.handle_type.0 as u32 != crate::dmabuf::SYNC_FD {
+            return refuse;
+        }
+        let sem = info.semaphore.0;
+        let queue = self.state().semaphores.get_mut(&sem).and_then(|x| x.signal_queue.take());
+        if let Some(queue) = queue {
+            let r = self.consume_signal(args.device.0, queue, sem)?;
+            if r != 0 {
+                return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(r), p_fd: None });
+            }
+        }
+        Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) })
     }
 
     fn get_fence_fd_khr(&self, _args: p::VkGetFenceFdKHRArgs) -> IcdResult<p::VkGetFenceFdKHRReply> {
         Ok(p::VkGetFenceFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None })
     }
 
+    /// A dma-buf token (§104) is memory type 0, our `DEVICE_LOCAL` type, which
+    /// is what `svImportShared` imports as.
     fn get_memory_fd_properties_khr(
         &self,
-        _args: p::VkGetMemoryFdPropertiesKHRArgs,
+        args: p::VkGetMemoryFdPropertiesKHRArgs,
     ) -> IcdResult<p::VkGetMemoryFdPropertiesKHRReply> {
+        if crate::dmabuf::enabled()
+            && args.handle_type.0 as u32 == crate::dmabuf::DMA_BUF
+            && crate::dmabuf::read_token(args.fd).is_some()
+        {
+            let mut out = p::VkMemoryFdPropertiesKHR::default();
+            out.memory_type_bits = 1;
+            return Ok(p::VkGetMemoryFdPropertiesKHRReply {
+                result: p::VkResult(0),
+                p_memory_fd_properties: Some(Box::new(out)),
+            });
+        }
         Ok(p::VkGetMemoryFdPropertiesKHRReply {
             result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE),
             p_memory_fd_properties: None,
         })
     }
 
+    /// A sync fd on the dma-buf path (§104) is accepted and closed, and the
+    /// semaphore's next wait is dropped rather than forwarded: nothing on the
+    /// GPU side would ever signal it, and a wait nobody signals hangs the
+    /// guest's GPU. The fd is -1 from this ICD's own exports, and whatever a
+    /// foreign one guarded happened on this process's side already.
     fn import_semaphore_fd_khr(
         &self,
-        _args: p::VkImportSemaphoreFdKHRArgs,
+        args: p::VkImportSemaphoreFdKHRArgs,
     ) -> IcdResult<p::VkImportSemaphoreFdKHRReply> {
+        if let Some(info) = args.p_import_semaphore_fd_info.as_ref()
+            && crate::dmabuf::enabled()
+            && info.handle_type.0 as u32 == crate::dmabuf::SYNC_FD
+        {
+            crate::dmabuf::close_fd(info.fd);
+            self.state().semaphores.entry(info.semaphore.0).or_default().presignalled = true;
+            return Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(0) });
+        }
         Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
     }
 
@@ -820,6 +942,11 @@ impl Icd for SharedVulkan {
         let Some(info) = args.p_allocate_info.as_ref() else {
             return Err(LowerError::Shape("vkAllocateMemory: no VkMemoryAllocateInfo"));
         };
+        if crate::dmabuf::enabled()
+            && let Some(reply) = self.allocate_shared(info)?
+        {
+            return Ok(reply);
+        }
         let mut s = self.state();
         let id = s.mint();
         let type_index = info.memory_type_index;
@@ -1008,6 +1135,7 @@ impl Icd for SharedVulkan {
             _ => Ok(()),
         };
         let mut s = self.state();
+        s.shared_memories.remove(&id);
         let mut back = None;
         if let Some(Memory { allocation: Some(a), .. }) = s.memories.remove(&id) {
             // docs/design.md §5.5 defers this until the timelines an
@@ -1725,6 +1853,10 @@ impl Icd for SharedVulkan {
         let Some(t) = self.wire() else {
             return Ok(p::VkQueueSubmitReply { result: p::VkResult(0) });
         };
+        let mut args = args;
+        if crate::dmabuf::enabled() {
+            self.track_sync_fd_semaphores(args.queue.0, &mut args.p_submits);
+        }
         let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&args)];
         {
             let mut enc = sv_wire::Encoder::new(&mut buf);
@@ -1833,7 +1965,24 @@ impl Icd for SharedVulkan {
         args: p::VkCreateSemaphoreArgs,
     ) -> IcdResult<p::VkCreateSemaphoreReply> {
         let id = self.state().mint();
-        let args = p::VkCreateSemaphoreArgs { p_semaphore: Some(p::VkSemaphore(id)), ..args };
+        let mut args = p::VkCreateSemaphoreArgs { p_semaphore: Some(p::VkSemaphore(id)), ..args };
+        // §104: an exportable sync-fd semaphore is an ordinary one to the GPU
+        // side, and this side remembers which queue last signalled it.
+        if crate::dmabuf::enabled()
+            && let Some(ci) = args.p_create_info.as_mut()
+        {
+            let mut sync_fd = false;
+            ci.p_next.retain(|l| match l {
+                p::PNextLink::VkExportSemaphoreCreateInfo(x) => {
+                    sync_fd |= x.handle_types.0 & crate::dmabuf::SYNC_FD != 0;
+                    false
+                }
+                _ => true,
+            });
+            if sync_fd {
+                self.state().semaphores.insert(id, crate::dmabuf::Semaphore::default());
+            }
+        }
         forwarded!(self, create_semaphore, args, {
             Ok(p::VkCreateSemaphoreReply {
                 result: p::VkResult(0),
@@ -1843,7 +1992,255 @@ impl Icd for SharedVulkan {
     }
 
     fn destroy_semaphore(&self, args: p::VkDestroySemaphoreArgs) -> IcdResult<()> {
+        self.state().semaphores.remove(&args.semaphore.0);
         forwarded!(self, destroy_semaphore, args, { Ok(()) })
+    }
+
+    // -- the dma-buf path (waycompose-design.md §104, `crate::dmabuf`) ------
+    //
+    // Each of these forwards exactly as the generated default did unless
+    // `SV_DRM_NODE` is set, and refuses by name with no GPU side, as the
+    // default does — so the audit still sorts them as "forwards".
+
+    /// The modifier lists are filled on the C side
+    /// (`dmabuf::get_physical_device_format_properties2`); they are taken out
+    /// of the request so the driver behind the GPU side never sees them.
+    fn get_physical_device_format_properties2(
+        &self,
+        mut args: p::VkGetPhysicalDeviceFormatProperties2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceFormatProperties2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetPhysicalDeviceFormatProperties2"));
+        };
+        if crate::dmabuf::enabled()
+            && let Some(out) = args.p_format_properties.as_mut()
+        {
+            crate::dmabuf::strip_modifier_lists(out);
+        }
+        forward::get_physical_device_format_properties2(t, args)
+    }
+
+    /// A modifier query is a LINEAR query, and a `DMA_BUF` query is asked as
+    /// `HOST_ALLOCATION` — the driver's answer for what will actually be
+    /// created — and answered as `DMA_BUF`.
+    fn get_physical_device_image_format_properties2(
+        &self,
+        mut args: p::VkGetPhysicalDeviceImageFormatProperties2Args,
+    ) -> IcdResult<p::VkGetPhysicalDeviceImageFormatProperties2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetPhysicalDeviceImageFormatProperties2"));
+        };
+        if !crate::dmabuf::enabled() {
+            return forward::get_physical_device_image_format_properties2(t, args);
+        }
+        let refused = |r: i32| {
+            Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply { result: p::VkResult(r), p_image_format_properties: None })
+        };
+        let q = match args.p_image_format_info.as_mut().map(|i| crate::dmabuf::rewrite_image_format_info(i)) {
+            Some(Ok(q)) => q,
+            Some(Err(r)) => return refused(r),
+            None => crate::dmabuf::FormatQuery::default(),
+        };
+        if q.dma_buf
+            && let Some(out) = args.p_image_format_properties.as_mut()
+        {
+            crate::dmabuf::want_external_answer(out);
+        }
+        let mut reply = forward::get_physical_device_image_format_properties2(t, args)?;
+        if q.dma_buf && reply.result.0 == 0 {
+            let ok = reply
+                .p_image_format_properties
+                .as_mut()
+                .is_some_and(|o| crate::dmabuf::answer_image_format(o).is_ok());
+            if !ok {
+                return refused(crate::dmabuf::VK_ERROR_FORMAT_NOT_SUPPORTED);
+            }
+        }
+        Ok(reply)
+    }
+
+    /// A modifier image is LINEAR to the GPU side and a dma-buf image a
+    /// host-allocation one (`dmabuf::rewrite_image_create_info`). An import's
+    /// explicit plane layout must be what the driver lays the LINEAR image out
+    /// as; one that is not is the specification's
+    /// `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+    fn create_image(&self, mut args: p::VkCreateImageArgs) -> IcdResult<p::VkCreateImageReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkCreateImage"));
+        };
+        let id = IcdLocal::mint_id(self);
+        args.p_image = Some(p::VkImage(id));
+        if !crate::dmabuf::enabled() {
+            return forward::create_image(t, args);
+        }
+        let img = match args.p_create_info.as_mut().map(|ci| crate::dmabuf::rewrite_image_create_info(ci)) {
+            Some(Ok(img)) => img,
+            Some(Err(r)) => return Ok(p::VkCreateImageReply { result: p::VkResult(r), p_image: None }),
+            None => None,
+        };
+        let device = args.device;
+        let reply = forward::create_image(t, args)?;
+        let Some(img) = img else { return Ok(reply) };
+        if reply.result.0 != 0 {
+            return Ok(reply);
+        }
+        if let Some((offset, pitch)) = img.explicit {
+            let mut sub = p::VkImageSubresource::default();
+            sub.aspect_mask = p::VkImageAspectFlags(crate::dmabuf::ASPECT_COLOR);
+            let got = forward::get_image_subresource_layout(
+                t,
+                p::VkGetImageSubresourceLayoutArgs {
+                    device,
+                    image: p::VkImage(id),
+                    p_subresource: Some(Box::new(sub)),
+                    p_layout: Some(Box::default()),
+                },
+            )?;
+            let have = got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default();
+            if have != (offset, pitch) {
+                sv_icd_entry::report_always(&format_args!(
+                    "vkCreateImage: a dma-buf import asks for offset {offset} and row pitch {pitch}, the \
+                     GPU side lays the LINEAR image out at offset {} pitch {}; refused",
+                    have.0, have.1
+                ));
+                forward::destroy_image(t, p::VkDestroyImageArgs { device, image: p::VkImage(id) })?;
+                return Ok(p::VkCreateImageReply {
+                    result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT),
+                    p_image: None,
+                });
+            }
+        }
+        self.state().dmabuf_images.insert(id, img);
+        Ok(reply)
+    }
+
+    fn destroy_image(&self, args: p::VkDestroyImageArgs) -> IcdResult<()> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkDestroyImage"));
+        };
+        self.state().dmabuf_images.remove(&args.image.0);
+        forward::destroy_image(t, args)
+    }
+
+    /// As `create_image`, for an image that does not exist yet.
+    fn get_device_image_memory_requirements(
+        &self,
+        mut args: p::VkGetDeviceImageMemoryRequirementsArgs,
+    ) -> IcdResult<p::VkGetDeviceImageMemoryRequirementsReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetDeviceImageMemoryRequirements"));
+        };
+        if crate::dmabuf::enabled()
+            && let Some(ci) = args.p_info.as_mut().and_then(|i| i.p_create_info.as_mut())
+            && let Err(r) = crate::dmabuf::rewrite_image_create_info(ci)
+        {
+            sv_icd_entry::report_always(&format_args!(
+                "vkGetDeviceImageMemoryRequirements: an image this driver cannot create ({r})"
+            ));
+            return Err(LowerError::Result(r));
+        }
+        forward::get_device_image_memory_requirements(t, args)
+    }
+
+    /// Every image this path makes has the one modifier.
+    fn get_image_drm_format_modifier_properties_ext(
+        &self,
+        args: p::VkGetImageDrmFormatModifierPropertiesEXTArgs,
+    ) -> IcdResult<p::VkGetImageDrmFormatModifierPropertiesEXTReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetImageDrmFormatModifierPropertiesEXT"));
+        };
+        if !crate::dmabuf::enabled() {
+            return forward::get_image_drm_format_modifier_properties_ext(t, args);
+        }
+        let mut out = p::VkImageDrmFormatModifierPropertiesEXT::default();
+        out.drm_format_modifier = crate::dmabuf::DRM_FORMAT_MOD_LINEAR;
+        Ok(p::VkGetImageDrmFormatModifierPropertiesEXTReply { result: p::VkResult(0), p_properties: Some(Box::new(out)) })
+    }
+
+    /// Plane 0 of a LINEAR modifier image is its colour aspect to the driver.
+    fn get_image_subresource_layout(
+        &self,
+        mut args: p::VkGetImageSubresourceLayoutArgs,
+    ) -> IcdResult<p::VkGetImageSubresourceLayoutReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetImageSubresourceLayout"));
+        };
+        if crate::dmabuf::enabled()
+            && let Some(sub) = args.p_subresource.as_mut()
+        {
+            self.plane_to_colour(args.image.0, &mut sub.aspect_mask);
+        }
+        forward::get_image_subresource_layout(t, args)
+    }
+
+    fn get_image_subresource_layout2(
+        &self,
+        mut args: p::VkGetImageSubresourceLayout2Args,
+    ) -> IcdResult<p::VkGetImageSubresourceLayout2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetImageSubresourceLayout2"));
+        };
+        if crate::dmabuf::enabled()
+            && let Some(sub) = args.p_subresource.as_mut()
+        {
+            self.plane_to_colour(args.image.0, &mut sub.image_subresource.aspect_mask);
+        }
+        forward::get_image_subresource_layout2(t, args)
+    }
+
+    fn cmd_pipeline_barrier(&self, mut args: p::VkCmdPipelineBarrierArgs) -> IcdResult<()> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkCmdPipelineBarrier"));
+        };
+        if crate::dmabuf::enabled() {
+            for b in args.p_image_memory_barriers.iter_mut() {
+                crate::dmabuf::rewrite_families(&mut b.src_queue_family_index, &mut b.dst_queue_family_index);
+            }
+            for b in args.p_buffer_memory_barriers.iter_mut() {
+                crate::dmabuf::rewrite_families(&mut b.src_queue_family_index, &mut b.dst_queue_family_index);
+            }
+        }
+        forward::cmd_pipeline_barrier(t, args)
+    }
+
+    fn cmd_pipeline_barrier2(&self, mut args: p::VkCmdPipelineBarrier2Args) -> IcdResult<()> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkCmdPipelineBarrier2"));
+        };
+        if crate::dmabuf::enabled()
+            && let Some(d) = args.p_dependency_info.as_mut()
+        {
+            for b in d.p_image_memory_barriers.iter_mut() {
+                crate::dmabuf::rewrite_families(&mut b.src_queue_family_index, &mut b.dst_queue_family_index);
+            }
+            for b in d.p_buffer_memory_barriers.iter_mut() {
+                crate::dmabuf::rewrite_families(&mut b.src_queue_family_index, &mut b.dst_queue_family_index);
+            }
+        }
+        forward::cmd_pipeline_barrier2(t, args)
+    }
+
+    /// As `queue_submit`, for the sync-fd semaphores.
+    fn queue_submit2(&self, mut args: p::VkQueueSubmit2Args) -> IcdResult<p::VkQueueSubmit2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkQueueSubmit2"));
+        };
+        if crate::dmabuf::enabled() {
+            let mut s = self.state();
+            for b in args.p_submits.iter_mut() {
+                b.p_wait_semaphore_infos.retain(|w| {
+                    !s.semaphores.get_mut(&w.semaphore.0).is_some_and(|x| std::mem::take(&mut x.presignalled))
+                });
+                b.wait_semaphore_info_count = b.p_wait_semaphore_infos.len() as u32;
+                for sig in &b.p_signal_semaphore_infos {
+                    if let Some(x) = s.semaphores.get_mut(&sig.semaphore.0) {
+                        x.signal_queue = Some(args.queue.0);
+                    }
+                }
+            }
+        }
+        forward::queue_submit2(t, args)
     }
 }
 
@@ -2004,6 +2401,167 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
 }
 
 impl SharedVulkan {
+    /// `MEMORY_PLANE_0` of a LINEAR modifier image is the colour aspect to the
+    /// driver behind the GPU side, which never saw a modifier (§104).
+    /// (The aspect is valid only for a modifier image, so the image is not
+    /// looked up: whichever image names it was made through this path.)
+    fn plane_to_colour(&self, _image: u64, aspect: &mut p::VkImageAspectFlags) {
+        if aspect.0 == crate::dmabuf::ASPECT_MEMORY_PLANE_0 {
+            aspect.0 = crate::dmabuf::ASPECT_COLOR;
+        }
+    }
+
+    /// `vkAllocateMemory` on the dma-buf path (§104): an import of a token, or
+    /// an exportable allocation. `None` when the allocation is neither, and
+    /// goes the ordinary way.
+    fn allocate_shared(&self, info: &p::VkMemoryAllocateInfo) -> IcdResult<Option<p::VkAllocateMemoryReply>> {
+        let refused = |r: i32| Ok(Some(p::VkAllocateMemoryReply { result: p::VkResult(r), p_memory: None }));
+        let import = info.p_next.iter().find_map(|l| match l {
+            p::PNextLink::VkImportMemoryFdInfoKHR(x) if x.handle_type.0 != 0 => Some((x.handle_type.0 as u32, x.fd)),
+            _ => None,
+        });
+        let export = info.p_next.iter().any(|l| {
+            matches!(l, p::PNextLink::VkExportMemoryAllocateInfo(x) if x.handle_types.0 & crate::dmabuf::DMA_BUF != 0)
+        });
+        if import.is_none() && !export {
+            return Ok(None);
+        }
+        let image = info
+            .p_next
+            .iter()
+            .find_map(|l| match l {
+                p::PNextLink::VkMemoryDedicatedAllocateInfo(d) => Some(d.image.0),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let Some(t) = self.ring_transport() else {
+            return refused(crate::dmabuf::VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        };
+        if info.memory_type_index != 0 {
+            sv_icd_entry::report_always(&format_args!(
+                "vkAllocateMemory: a dma-buf allocation in memory type {}; only type 0 can be shared",
+                info.memory_type_index
+            ));
+            return refused(match import {
+                Some(_) => crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                None => crate::dmabuf::VK_ERROR_OUT_OF_DEVICE_MEMORY,
+            });
+        }
+        let id = IcdLocal::mint_id(self);
+        let (token, fd) = match import {
+            Some((ty, fd)) => {
+                if ty != crate::dmabuf::DMA_BUF {
+                    return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
+                }
+                let Some(tok) = crate::dmabuf::read_token(fd) else {
+                    return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
+                };
+                if info.allocation_size > tok.size {
+                    sv_icd_entry::report_always(&format_args!(
+                        "vkAllocateMemory: a {}-byte import of a {}-byte dma-buf",
+                        info.allocation_size, tok.size
+                    ));
+                    return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
+                }
+                let r = t.import_shared(id, tok.size, image, &tok)?;
+                if r != 0 {
+                    return refused(r);
+                }
+                (tok, Some(fd))
+            }
+            None => match t.alloc_shared(id, info.allocation_size, image)? {
+                Ok(tok) => (tok, None),
+                Err(r) => return refused(r),
+            },
+        };
+        // The specification hands the descriptor to the implementation on a
+        // successful import.
+        if let Some(fd) = fd {
+            crate::dmabuf::close_fd(fd);
+        }
+        let size = token.size;
+        {
+            let mut s = self.state();
+            s.memories.insert(id, Memory { memory_type_index: 0, allocation: None, size, mapped: false });
+            s.shared_memories.insert(id, token);
+        }
+        Ok(Some(p::VkAllocateMemoryReply { result: p::VkResult(0), p_memory: Some(p::VkDeviceMemory(id)) }))
+    }
+
+    /// Before a submit on the dma-buf path (§104): drop the waits on
+    /// pre-signalled semaphores, and note which queue signals each sync-fd
+    /// semaphore.
+    fn track_sync_fd_semaphores(&self, queue: u64, submits: &mut [p::VkSubmitInfo]) {
+        let mut s = self.state();
+        if s.semaphores.is_empty() {
+            return;
+        }
+        for b in submits.iter_mut() {
+            crate::dmabuf::drop_presignalled_waits(b, |sem| {
+                s.semaphores.get_mut(&sem).is_some_and(|x| std::mem::take(&mut x.presignalled))
+            });
+            for sig in &b.p_signal_semaphores {
+                if let Some(x) = s.semaphores.get_mut(&sig.0) {
+                    x.signal_queue = Some(queue);
+                }
+            }
+        }
+    }
+
+    /// Consume `sem`'s pending signal on `queue` and wait for it: a submit
+    /// with no work that waits on it, and a fence (one per device, reused).
+    /// Returns the `VkResult` of the wait.
+    fn consume_signal(&self, device: u64, queue: u64, sem: u64) -> IcdResult<i32> {
+        let Some(t) = self.wire() else { return Ok(0) };
+        let fence = self.state().sync_fences.get(&device).copied();
+        let fence = match fence {
+            Some(f) => f,
+            None => {
+                let id = IcdLocal::mint_id(self);
+                let r = forward::create_fence(
+                    t,
+                    p::VkCreateFenceArgs {
+                        device: p::VkDevice(device),
+                        p_create_info: Some(Box::default()),
+                        p_fence: Some(p::VkFence(id)),
+                    },
+                )?;
+                if r.result.0 != 0 {
+                    return Ok(r.result.0);
+                }
+                self.state().sync_fences.insert(device, id);
+                id
+            }
+        };
+        let mut si = p::VkSubmitInfo::default();
+        si.wait_semaphore_count = 1;
+        si.p_wait_semaphores = vec![p::VkSemaphore(sem)];
+        si.p_wait_dst_stage_mask = vec![p::VkPipelineStageFlags(crate::dmabuf::STAGE_ALL_COMMANDS)];
+        let submit = p::VkQueueSubmitArgs { queue: p::VkQueue(queue), submit_count: 1, p_submits: vec![si], fence: p::VkFence(fence) };
+        let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&submit)];
+        {
+            let mut enc = sv_wire::Encoder::new(&mut buf);
+            p::encode_cmd_vk_queue_submit(&mut enc, 0, &submit).map_err(LowerError::Wire)?;
+            enc.finish().map_err(LowerError::Wire)?;
+        }
+        t.send(sv_icd_entry::RingClass::Queue, p::Opcode::VkQueueSubmit as u32, &buf)?;
+        let w = forward::wait_for_fences(
+            t,
+            p::VkWaitForFencesArgs {
+                device: p::VkDevice(device),
+                fence_count: 1,
+                p_fences: vec![p::VkFence(fence)],
+                wait_all: true,
+                timeout: u64::MAX,
+            },
+        )?;
+        let reset = p::VkResetFencesArgs { device: p::VkDevice(device), fence_count: 1, p_fences: vec![p::VkFence(fence)] };
+        send_unanswered(t, p::Opcode::VkResetFences, p::size_cmd_vk_reset_fences(&reset), |enc| {
+            p::encode_cmd_vk_reset_fences(enc, 0, &reset)
+        })?;
+        Ok(w.result.0)
+    }
+
     /// Forget every descriptor set that came out of `pool`.
     ///
     /// `vkResetDescriptorPool` and `vkDestroyDescriptorPool` free all of a

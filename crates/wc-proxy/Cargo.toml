@@ -47,3 +47,5 @@ libc = "0.2"
 # the proxy's idea of the wire format and the compositor's cannot drift apart.
 quick-xml = "0.41"
 png = "0.18"
+# §104: the dma-buf token format (`--dmabuf-node`).
+sv-drm = { path = "../sv-drm" }

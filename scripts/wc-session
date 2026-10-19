@@ -159,6 +159,22 @@ if [ -f "$BASE/copy-scope" ]; then
   esac
 fi
 
+# §104. The render node the proxy offers zwp_linux_dmabuf_v1 for, from
+# `$BASE/dmabuf-node` (one path, written by the deploy step like copy-scope):
+# a nested KWin then renders with OpenGL into shared sections and the proxy
+# copies nothing. Only a /dev/dri/renderD<N> path is taken. The node need not
+# exist yet -- sv-drm's CUSE device appears when the nested seat starts it,
+# and the proxy looks for it again for every client.
+DMABUF_ARGS=""
+if [ -f "$BASE/dmabuf-node" ]; then
+  DMABUF_NODE=$(head -c 64 "$BASE/dmabuf-node" | tr -d '[:space:]')
+  if [[ "$DMABUF_NODE" =~ ^/dev/dri/renderD[0-9]+$ ]]; then
+    DMABUF_ARGS="--dmabuf-node $DMABUF_NODE"
+  elif [ -n "$DMABUF_NODE" ]; then
+    echo "wc-session: $BASE/dmabuf-node is not a /dev/dri/renderD<N> path; no dma-buf" >&2
+  fi
+fi
+
 die() { echo "wc-session: $*" >&2; exit 1; }
 
 # THE REQUEST (§94). The forced command puts it in $SSH_ORIGINAL_COMMAND; argv
@@ -1046,8 +1062,8 @@ proxy)
       RINGARGS=""
       [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
         && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
-        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" \
+      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
@@ -1106,7 +1122,7 @@ export PATH=/run/current-system/sw/bin:/run/wrappers/bin
 $(env | grep '^WC_LAUNCH_' | sed 's/^/export /; s/=\(.*\)$/="\1"/')
 rm -f "$D/wl-proxy"
 "$BIN/wc-proxy" $UPSTREAM_ARGS --socket wl-proxy --runtime-dir "$D" \\
-  --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage --pace-frames 60 \\
+  --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage $DMABUF_ARGS --pace-frames 60 \\
   --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
   --arena-locator "$BIN/wc-arena-host" --arena-qmp "$QMP" --arena-vm "$VM_HINT" \\
   --accept-timeout ${WC_LAUNCH_SESSION_SECS:-43200} --timeout ${WC_LAUNCH_SESSION_SECS:-43200} \\

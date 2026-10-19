@@ -420,6 +420,19 @@ fn app_image_memory_type_bits(shared: &Shared, driver_bits: u32) -> u32 {
     dl | arena
 }
 
+/// The requirements of an image bound to a shared section (§104): our type 0
+/// only, which is what `svAllocShared` imports as, and a dedicated allocation —
+/// one section per image, which is what makes it one dma-buf.
+fn shared_image_requirements(r: &mut p::VkMemoryRequirements2) {
+    r.memory_requirements.memory_type_bits = 1;
+    for l in r.p_next.iter_mut() {
+        if let p::PNextLink::VkMemoryDedicatedRequirements(d) = l {
+            d.prefers_dedicated_allocation = true;
+            d.requires_dedicated_allocation = true;
+        }
+    }
+}
+
 /// `VK_SUCCESS`.
 const OK: p::VkResult = p::VkResult(0);
 
@@ -976,6 +989,35 @@ impl GpuHost for GpuServer {
             let m: &mut dyn p::HandleMapper = &mut ad;
             p::handle_map_vk_image_create_info(info, m)?;
         }
+        // §104: the app side marks an image it will bind to a shared section
+        // (its dma-buf) with `VkExternalMemoryImageCreateInfo{HOST_ALLOCATION}`.
+        // It is LINEAR, names that one handle type, and is created only if the
+        // driver said such an image can be bound to imported host memory: on
+        // the guest a driver fault can stop the VM, so a combination the
+        // driver did not promise is never sent.
+        let host_alloc = info.p_next.iter_mut().find_map(|l| match l {
+            p::PNextLink::VkExternalMemoryImageCreateInfo(x) if x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0 => {
+                Some(x)
+            }
+            _ => None,
+        });
+        let shared_image = if let Some(x) = host_alloc {
+            x.handle_types.0 = crate::shared::HOST_ALLOCATION;
+            info.tiling = p::VkImageTiling(vk::ImageTiling::LINEAR.as_raw());
+            if let Err(why) = crate::shared::image_importable(&self.shared.driver, info) {
+                eprintln!(
+                    "sv-gpu-server: vkCreateImage of a shared image refused, format {} {}x{} usage {:#x}: {why}",
+                    info.format.0, info.extent.width, info.extent.height, info.usage.0
+                );
+                return Ok(p::VkCreateImageReply {
+                    result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED),
+                    p_image: None,
+                });
+            }
+            true
+        } else {
+            false
+        };
         let Some(f) = self.fns().vk_create_image else {
             self.note_missing("vkCreateImage");
             return Ok(p::VkCreateImageReply { result: p::VkResult(-3), p_image: None });
@@ -997,6 +1039,9 @@ impl GpuHost for GpuServer {
         }
         if r.0 == 0 {
             self.shared.objects().video_views.image_created(image as usize as u64, ci.usage.0);
+            if shared_image {
+                self.shared.objects().shared_images.insert(image as usize as u64);
+            }
         }
         if let Some(id) = a.p_image {
             self.bind(id.0, HandleType::VkImage, image as usize as u64);
@@ -1076,6 +1121,7 @@ impl GpuHost for GpuServer {
         if image == 0 {
             return Ok(());
         }
+        self.shared.objects().shared_images.remove(&image);
         let kept = self.shared.objects().video_views.image_destroyed(image);
         for view in kept {
             self.destroy_view_on_driver(device, view);
@@ -1263,7 +1309,13 @@ impl GpuHost for GpuServer {
         if let Some(r) = r {
             unsafe { self.d().free_memory(r.memory, None) };
         }
-        self.shared.objects().remove(id);
+        // A shared section's view goes after its import (§104).
+        let section = {
+            let mut o = self.shared.objects();
+            o.remove(id);
+            o.shared_imports.remove(&id)
+        };
+        drop(section);
         Ok(())
     }
 
@@ -1581,6 +1633,11 @@ impl GpuHost for GpuServer {
         w.size = r.size;
         w.alignment = r.alignment;
         w.memory_type_bits = app_image_memory_type_bits(&self.shared, r.memory_type_bits);
+        // §104: an image bound to a shared section takes our type 0, which is
+        // what `svAllocShared` imports as.
+        if self.shared.objects().shared_images.contains(&image.as_raw()) {
+            w.memory_type_bits = 1;
+        }
         Ok(p::VkGetImageMemoryRequirementsReply { p_memory_requirements: Some(Box::new(w)) })
     }
 
@@ -1623,6 +1680,10 @@ impl GpuHost for GpuServer {
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
         let bits = &mut reply.memory_requirements.memory_type_bits;
         *bits = app_image_memory_type_bits(&self.shared, *bits);
+        let image = a.p_info.as_ref().map_or(0, |i| i.image.0);
+        if self.shared.objects().shared_images.contains(&image) {
+            shared_image_requirements(&mut reply);
+        }
         Ok(p::VkGetImageMemoryRequirements2Reply { p_memory_requirements: Some(Box::new(reply)) })
     }
 
@@ -1662,6 +1723,15 @@ impl GpuHost for GpuServer {
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
         let bits = &mut reply.memory_requirements.memory_type_bits;
         *bits = app_image_memory_type_bits(&self.shared, *bits);
+        let host_alloc = a.p_info.as_ref().and_then(|i| i.p_create_info.as_ref()).is_some_and(|ci| {
+            ci.p_next.iter().any(|l| {
+                matches!(l, p::PNextLink::VkExternalMemoryImageCreateInfo(x)
+                    if x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0)
+            })
+        });
+        if host_alloc {
+            shared_image_requirements(&mut reply);
+        }
         Ok(p::VkGetDeviceImageMemoryRequirementsReply {
             p_memory_requirements: Some(Box::new(reply)),
         })

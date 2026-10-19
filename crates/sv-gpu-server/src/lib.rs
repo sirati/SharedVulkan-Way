@@ -31,6 +31,7 @@ pub mod convert;
 pub mod driver;
 pub mod server;
 pub mod session;
+pub mod shared;
 pub mod set_layout;
 pub mod table;
 pub mod video_log;
@@ -67,7 +68,10 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 /// `svReleaseArena`, the leased arena. An app side that leases from a GPU side
 /// built before them would be refused on its first allocation; this refuses it
 /// at attach instead, by name.
-pub const WIRE_VERSION: u32 = 3;
+///
+/// **4** since waycompose-design.md §104: `svAllocShared` and `svImportShared`,
+/// the shared sections behind a dma-buf token.
+pub const WIRE_VERSION: u32 = 4;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///

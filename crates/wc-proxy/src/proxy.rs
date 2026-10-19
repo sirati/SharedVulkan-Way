@@ -602,7 +602,18 @@ pub fn pump(
             // or whose destructor it absorbed. They ride the ordinary client
             // write path and never carry a descriptor — see
             // `Session::take_client_bytes`.
-            to_client.extend_from_slice(&session.take_client_bytes());
+            // §104: and their descriptors, taken in the same breath. The fd
+            // queue is positional across the whole stream, so a descriptor
+            // must join it where its event joins the bytes — before any the
+            // compositor's events bring this turn. The dma-buf feedback's
+            // `format_table` is one; the clipboard's `wl_data_source.send`
+            // pipe, made while a request is translated, was the other and
+            // used to be queued only after the compositor's.
+            {
+                let (bytes, mut new_fds) = session.take_client_messages();
+                to_client.extend_from_slice(&bytes);
+                to_client_fds.append(&mut new_fds);
+            }
             for note in session.take_notes() {
                 log(&note);
             }

@@ -33016,3 +33016,256 @@ Evidence: `/mnt/datasets/builds/evidence/macos-zero-copy/` (`rtt-*.txt`,
   pipelined headless present, the frame dump for frame N holds frame N+1's
   pixels. It reproduces on Linux with RADV and no VM.
 
+
+## 104. KWin composites on the guest's GPU: a userspace render node, and frames that are never copied
+
+2026-10-19, branch `kwin-gpu` (with `kwin-gpu-drm`, `kwin-gpu-proxy` and
+`kwin-gpu-icd` merged into it), and nix-config branch `testhost-kwin-gpu`
+(from `testhost-win7-nested`). The goal: the nested KWin of §102 composites
+with OpenGL on the forwarded GPU instead of QPainter, so that Aero glass works
+and the frames stop being drawn by the host's CPU.
+
+### 104.1 Status in one paragraph
+
+**Works on the real guest.** KWin reports `Compositing Type: OpenGL` with
+`OpenGL renderer string: zink Vulkan 1.4(Intel(R) UHD Graphics
+(INTEL_PROPRIETARY_WINDOWS))`, and the Aero glass blur effect (`aeroglassblur`)
+is loaded and visible: the taskbar's view of the wallpaper is blurred under
+OpenGL and sharp under QPainter (104.8). KWin renders into LINEAR images that
+live in named sections the guest's GPU process creates; the compositor maps
+those sections and reads KWin's pixels from them. **Nothing copies a frame:**
+1200 of 1200 commits in 20 s reached the compositor this way, and the proxy
+copied 0 bytes, against 300 MB in the same 20 s under QPainter. Both paths
+hold 60 frames a second. The CPU cost is not lower yet: with these light
+workloads KWin takes 16–17 % of a host core against 6–8 %, and the guest's
+compositor and GPU side together take about 55 % of a guest core against
+16–20 % (104.8). No driver fault on the guest. Locally, two NixOS VM tests
+pass on lavapipe.
+
+### 104.2 The decision: a userspace render node, sections, no kernel driver
+
+KWin 6.7's nested backend offers OpenGL only when the host compositor names a
+render node in `zwp_linux_dmabuf_v1` feedback and KWin can open it
+(`WaylandBackend::supportedCompositors`, `wayland_backend.cpp`). It then
+allocates its output buffers with GBM on that node, imports them as EGLImages,
+and hands them to the host as dma-bufs. KWin has no Vulkan renderer, and its
+EGL backend has no path without GBM (`wayland_egl_backend.cpp`).
+
+The brief listed three ways; the user chose the second and ruled out kernel
+drivers (no vgem, no udmabuf) and any copy:
+
+| option | what | why not / why |
+|---|---|---|
+| (a) vgem + Mesa GBM | a real kernel render node, shmem dma-bufs | a kernel driver; and the dma-buf's pages are host shmem, so every frame would be copied from the guest's GPU memory into them and again into the compositor's arena |
+| (b) userspace node | a CUSE character device answering the DRM ioctls Mesa and KWin issue; the "dma-bufs" are tokens naming guest-side memory | **chosen**: no kernel code, and the memory can be anything we choose |
+| (c) a KWin patch | `wl_egl_window` and kopper, or a readback to `wl_shm` | a downstream KWin; and both paths read the frame back to the host |
+
+**Where the frames live is decided by one fact of the guest.** The GPU
+process and the compositor are separate processes, and each ivshmem device's
+driver gives its BAR to one handle (§83.5, §87.2): the GPU process holds the
+GPU pool, the compositor the arena. So KWin's buffers cannot be pool memory the
+compositor reads. Both processes are children of `wc-launch.exe` in the same
+Windows session, though, so they can share a **named, pagefile-backed
+section**: the GPU process creates it, maps it and imports the view with
+`VK_EXT_external_memory_host`; the compositor opens it by name. Nothing
+crosses the VM boundary but the name (docs/design.md §1a); the host never maps
+these pages, and they are not on any ivshmem device, which the rule for GPU
+memory (dynamic, on ivshmem) is about memory the two sides share. Locally the
+GPU side is a Linux process and the "section" is a file in `/dev/shm`, which
+the compositor under Wine maps by its path.
+
+Before any of it was built, `sv-extimg-probe` asked the guest's Intel driver
+(Windows, 0x195ba4) the one question the design rests on, query first and each
+riskier step opt-in: B8G8R8A8/R8G8B8A8 LINEAR with `HOST_ALLOCATION` is
+IMPORTABLE; a section view imports as a host pointer (memory type bits 0x6);
+a 1280×800 external LINEAR image needs type bits 0x7, row pitch 5120; a clear
+and a render-pass clear land in the section exactly as the CPU reads them back.
+(Output: `/mnt/datasets/builds/evidence/kwin-gpu/extimg-probe-guest.txt`.)
+
+### 104.3 The render node: `sv-drm`
+
+`crates/sv-drm`, one binary with two halves.
+
+* **`sv-drm serve`** (root): a CUSE device (`/dev/cuse`, the FUSE kernel
+  protocol, libc only), `DEVNAME=dri/renderD128`, dynamic major, minor 128, so
+  devtmpfs creates `/dev/dri/renderD128`; then owner, group and mode as told.
+  It answers `VERSION` (`svdrm`, with CUSE's retry dance for the string
+  buffers), `GET_CAP` (PRIME import and export, no syncobj, no dumb buffers),
+  `PRIME_FD_TO_HANDLE` (reads the caller's fd through `/proc/<pid>/fd`, only
+  a regular tmpfs file, so a FIFO or this node cannot stall it; one GEM handle
+  per token nonce per open), `GEM_CLOSE`, `GET_UNIQUE`; `PRIME_HANDLE_TO_FD`
+  cannot work through CUSE (a server cannot put an fd into its caller), and
+  nothing on this path needs it. KMS ioctls get `EOPNOTSUPP`.
+* **`sv-drm ns`** (the user): a user and mount namespace in which libdrm sees
+  that device as a render node on bus `faux`. libdrm checks
+  `/sys/dev/char/M:m/device/drm`, the `subsystem` link's basename and
+  `access("/dev/dri/renderD<minor>")`; a read-only tmpfs over
+  `/sys/dev/char` holds every original link plus a small fake device tree.
+  The process then drops back to its real ids in a nested user namespace and
+  execs. It also mounts a private `/tmp/.X11-unix`: in the namespace the
+  host's root-owned directory shows as the overflow uid, and
+  `kwin_wayland_wrapper` refused to start Xwayland there.
+  A device node bound into a tmpfs made inside a user namespace cannot be
+  opened (measured: `EACCES`), which is why the node itself is the real
+  `/dev/dri/renderD128` and only sysfs is faked.
+
+**The dma-buf is a sealed memfd** (`sv_drm::token`): a header (magic, size,
+the GPU side's 16-byte nonce, the section's name), the file sized to the
+allocation, all four seals. Readers `pread` the header and refuse anything
+unsealed; nothing maps it. Mesa's implicit-sync ioctls on it fail with ENOTTY,
+which release builds ignore.
+
+### 104.4 sv-icd and the GPU side
+
+Only with `SV_DRM_NODE` set (the nested KWin's environment); everything else
+is unchanged.
+
+* **The ICD** advertises `VK_KHR_external_memory_fd`,
+  `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier` (LINEAR
+  only), `VK_EXT_queue_family_foreign`, `VK_EXT_physical_device_drm` (the
+  node's major and minor, which is how Zink matches the device to the fd) and
+  `VK_KHR_external_semaphore_fd`, implements them itself and strips them from
+  what the GPU side sees. A modifier image becomes a LINEAR one, a DMA_BUF image
+  a HOST_ALLOCATION one; an exportable allocation is `svAllocShared`, an
+  imported token `svImportShared`; `vkGetMemoryFdKHR` makes a new token.
+  FOREIGN and EXTERNAL queue families become IGNORED in barriers.
+* **Implicit sync, emulated:** Zink exports a SYNC_FD semaphore after every
+  flush that touched an exported image; exporting submits a wait on it with a
+  fence and waits for the fence, then returns -1 ("already signalled"). So when
+  KWin's frame reaches the proxy, the GPU has finished it. An imported SYNC_FD
+  drops the next wait on that semaphore, so the guest's GPU never waits on a
+  semaphore nobody signals.
+* **The GPU side** creates the section (`CreateFileMappingW`, named
+  `Local\sv-shared-<pid>-<n>-<nonce>`; a `/dev/shm` file on Linux), imports the
+  view into the session's device with the memory type the image and the host
+  pointer have in common (type 1 on Intel), and only opens names it created,
+  with the nonce checked. Before creating a HOST_ALLOCATION image it asks the
+  driver whether that LINEAR image is importable, and refuses with
+  `VK_ERROR_FORMAT_NOT_SUPPORTED` otherwise: Intel is never sent a combination
+  it said it does not support.
+* `SV_DEVICE_TYPE` (tests): the device type the ICD reports, because Mesa
+  26.2's Zink rejects a CPU device (the ICD over lavapipe) unless
+  `LIBGL_ALWAYS_SOFTWARE`, which would also put EGL on swrast.
+
+### 104.5 The proxy: dma-bufs become sections, with nothing copied
+
+`wc-proxy --dmabuf-node PATH` (wc-session: `$BASE/dmabuf-node`, written by
+the deploy step from `WC_LAUNCH_DMABUF_NODE`). The node is checked per client,
+because the seat creates it after the proxy started. The proxy itself owns a
+`zwp_linux_dmabuf_v1` v4 global: feedback (ARGB/XRGB8888 LINEAR, main device
+the node), params, `create_immed`. A buffer is checked against its token and
+sent upstream as a `wl_shm` pool whose descriptor is `Section{name}` (or
+`SharedFile{path}` locally) plus `create_buffer`. The compositor already maps
+both, so it needed no change for the buffers. Every commit of such a buffer is
+traced as `px.commit … copied=0 zero_copy=1`. Non-immediate `create` answers
+`failed` (KWin and Mesa use `create_immed`).
+
+Two fixes the OpenGL backend needed elsewhere: the compositor refused KWin's
+second `place_above` (its five layer subsurfaces are stacked before one
+commit, and §68's staged order was a snapshot that did not know the new
+sibling); and the GPU side called `vkGetCalibratedTimestampsKHR` through the
+loader's trampoline on a driver that has only the EXT entry point.
+
+### 104.6 The NixOS side
+
+nix-config `testhost-kwin-gpu`:
+
+* `nestedTest.kwinGpu`: with a GPU offered by the launcher, the seat runs
+  `sv-drm serve` (vendored as `win7-desktop/sv-drm`, built in the system, so
+  root runs the system's binary) for group `users`, mode 0660, and KWin's
+  drop-in runs `kwin_wayland_wrapper` inside `sv-drm ns` with the ICD's
+  environment only (`VK_DRIVER_FILES`, `SV_SOCKET`, `SV_BELL`), `SV_DRM_NODE`,
+  `KWIN_RENDER_NODES`, `MESA_LOADER_DRIVER_OVERRIDE=zink`,
+  `KWIN_DISABLE_VULKAN=1` and `KWIN_NO_TIMER_QUERY=1` (a render-time query
+  per frame is a GPU round trip, and its query copy took lavapipe down).
+* The seat accepts `SV_DEVICE_TYPE`; `atp-nested` leaves out wc-session's
+  preloaded Wayland shim, which is not in the store and would end the seat.
+* `windows-vm`'s `waycomposeArena.gpu.users`: a named ACL on the GPU region
+  alone (not the arena, not the doorbells) for users whose own processes load
+  sv-icd; testhost sets `<desktop-user>`. Applied live once with `setfacl`; the VM's
+  next start applies it from the configuration.
+* testhost: `gpuForwarding` and `kwinGpu` on. Switched after `dry-activate`
+  (polkit and home-manager-<desktop-user> restarted, windows-vm not).
+* The deploy step: `WC_LAUNCH_ICD_STORE=1` puts the ICD with a manifest that
+  names it relatively into the host's store (the seat passes only store paths
+  to another user), `WC_LAUNCH_DMABUF_NODE`; `linux-desktop` has `gpu = on`.
+
+### 104.7 Checked locally
+
+| test | result |
+|---|---|
+| `win7-desktop/tests/nested-kwin-gpu.nix` (KWin alone, lavapipe, Wine, 2 GiB) | CUSE node `243:128`; EGL on GBM inside the namespace: `zink Vulkan 1.4(llvmpipe …)`; KWin "OpenGL compositing has been successfully initialized"; 1200 zero-copy commits in 20 s (60/s) with an animating client, 0 copied |
+| `win7-desktop/tests/nested-waycompose-gpu.nix` (the Aero session through `atp-nested` with `kwinGpu`, 3 GiB; 1.7 GiB used at the peak) | `Compositing Type: OpenGL`, renderer `zink … (MESA_LLVMPIPE)`, `aeroglassblur` loaded; 102 zero-copy commits in 20 s of pointer motion, 0 copied |
+| `scripts/sv-dmabuf-e2e.sh` (lavapipe) | export, import, render and SYNC_FD through the ICD; all 32768 pixels correct in the `/dev/shm` section; EGL dma-buf import on Zink matches `glReadPixels` |
+| `scripts/wc-dmabuf.sh` (Wine) | 327 dma-buf commits, 0 copies, the client's pixels in the compositor's frames |
+| `sv-drm` | 30 unit tests (the CUSE protocol over a socket pair, the ioctls); the namespace run for real; libdrm `drmGetDeviceFromDevId` returns bus faux, `/dev/dri/renderD128` |
+
+Logs: `/mnt/datasets/builds/evidence/kwin-gpu/local/`.
+
+### 104.8 On the guest
+
+2026-10-19, 12:28–12:55, under the lease, the desktop idle (it had been
+locked for hours; unlocked once with the PIN and locked again at the end).
+Installation `wclinux` deployed with `WC_LAUNCH_GPU_SESSIONS=4` (all passed:
+`/mnt/datasets/builds/evidence/kwin-gpu/deploy-104.txt`); the session started
+in the interactive session as the shortcut does (`wc-launch.exe
+linux-desktop`), autologin armed by root. The animating client was
+`weston-presentation-shm` (and `eglgears_wayland -fullscreen` on llvmpipe as a
+second), started in <desktop-user>'s session; each run 20 s.
+
+| | QPainter (gpu off) | OpenGL on Zink (gpu on) |
+|---|---|---|
+| KWin's `supportInformation` | `Compositing Type: QPainter` | `Compositing Type: OpenGL`, renderer `zink Vulkan 1.4(Intel(R) UHD Graphics (INTEL_PROPRIETARY_WINDOWS))`, OpenGL 4.3 core, Driver Intel |
+| commits reaching the compositor | 59/s | 59–60/s, every one zero-copy |
+| bytes the proxy copied in 20 s | 300 MB (presentation-shm), 479 MB (gears) | **0** |
+| host CPU, % of one core: KWin / proxy / sv-hostd | 6–8 / 3 / 0 | 16–17 / 1 / 0 |
+| host CPU, all cores busy | 7–8 % | 12–14 % |
+| guest: compositor / GPU side, % of one core | 16–20 / 0 | 34–35 / 20–25 |
+| <desktop-user>'s slice / host available | 1.14–1.19 GB / 2.16–2.19 GiB | 1.39–1.45 GB / 1.86–1.92 GiB |
+| Aero glass (taskbar) | tinted, wallpaper behind it sharp | frosted: wallpaper blurred (neighbour-pixel difference 0.77 against 3.0) |
+
+The pictures were judged by a separate agent (`gl.png`, `qp.png` in
+`/mnt/datasets/builds/evidence/kwin-gpu/guest/`): both drawn correctly, no
+artifacts, the blur present only under OpenGL. Xwayland runs in the OpenGL
+session (after the `/tmp/.X11-unix` fix). The GPU process's log shows the
+sections (`Local\sv-shared-8056-1-…`, 3536 KiB, type 1); no `igvk64.dll`
+fault, no Display or dxgkrnl event.
+
+**Why the CPU is higher, as far as measured.** These workloads repaint little:
+QPainter redraws only the damaged rectangle and the proxy copies only that.
+Under OpenGL, KWin's thread pays Zink and the ICD's encoding for every frame
+and waits, once per frame, for the guest's GPU (the SYNC_FD export); the
+compositor reads the whole 1264×713 section at every commit instead of a
+damaged slice; and the GPU side now has work. A heavy repaint (a maximised
+window moving, effects across the screen) is where the GPU should win, and it
+was not measured.
+
+### 104.9 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 3092 passed, 0 failed, 8 ignored |
+| `cargo clippy -p sv-drm -p wc-proxy -p sv-icd -p sv-gpu-server --all-targets` | no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/sv-pool-e2e.sh`, `scripts/sv-dmabuf-e2e.sh`, `scripts/wc-dmabuf.sh` | PASS, PASS (7 of 7), 13 passed |
+| NixOS tests `nested-kwin-gpu`, `nested-waycompose-gpu` | pass |
+| `wc-launch.sh deploy` (`wclinux`, GPU) | all passed |
+
+### 104.10 What is not done
+
+1. **CPU.** The compositor's blit from a section is not damage-scoped, and the
+   per-frame SYNC_FD wait is synchronous on KWin's thread. Both are the next
+   steps; a heavy-repaint workload is the measurement that should decide.
+2. **Plasma's clients** still hand KWin `wl_shm` (llvmpipe) or kopper frames.
+   Clients inside the namespace could use dma-bufs too; that needs the GPU side
+   to import a section into another session's device, which the registry
+   already allows by name.
+3. **`zwp_linux_buffer_params_v1.create`** (not immediate) answers `failed`.
+4. **Two installations with the GPU at once**: the GPU device has one mapping,
+   so a Firefox session with the GPU and this one exclude each other (as
+   before §104).
+5. **A crashed GPU process on Linux** leaves its `/dev/shm` files behind
+   (Windows frees sections itself).
+6. **The seat's node is for group `users`**: whichever of the login screen's
+   users logs in gets it; any member of the group can open it, which gives
+   access to nothing but the fake ioctls.

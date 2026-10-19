@@ -2579,6 +2579,497 @@ fn a_forced_title_is_set_at_once_and_replaces_the_clients() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+// ---------------------------------------------------------------------------
+// §104: `zwp_linux_dmabuf_v1`, answered here (`session/dmabuf.rs`)
+// ---------------------------------------------------------------------------
+
+mod dmabuf_tests {
+    use super::*;
+    use crate::session::dmabuf::{ops, GLOBAL_NAME, MOD_LINEAR};
+    use std::os::fd::FromRawFd as _;
+
+    /// A character device every machine has, standing in for the render node.
+    const NODE: &str = "/dev/null";
+    const SHM_NAME: u32 = 7;
+    const W: u32 = 64;
+    const H: u32 = 32;
+
+    struct Dm {
+        h: Harness,
+        d: std::path::PathBuf,
+        registry: u32,
+        dmabuf: u32,
+        surface: u32,
+        compositor: u32,
+    }
+
+    fn global_body(name: u32, iface: &str, version: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&name.to_ne_bytes());
+        wire::push_string(&mut b, iface);
+        b.extend_from_slice(&version.to_ne_bytes());
+        b
+    }
+
+    fn event(h: &mut Harness, object: u32, opcode: u16, body: &[u8]) -> (Vec<u8>, Vec<OwnedFd>) {
+        h.session
+            .server_message(Header { object, opcode, size: 8 + body.len() }, body)
+            .unwrap_or_else(|e| panic!("event {object}.{opcode}: {e}"))
+    }
+
+    fn messages(bytes: &[u8]) -> Vec<(u32, u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(hd) = Header::parse(&bytes[at..]) {
+            out.push((hd.object, hd.opcode, bytes[at + 8..at + hd.size].to_vec()));
+            at += hd.size;
+        }
+        assert_eq!(at, bytes.len());
+        out
+    }
+
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect()
+    }
+
+    /// A client that has its registry, the compositor's `wl_shm` announced
+    /// (and the private global after it), the dma-buf global bound and a
+    /// surface.
+    fn setup(tag: &str, on: bool) -> (Dm, Vec<u8>) {
+        let d = tmpdir(tag);
+        let t = SharedFile::new(&d, "Z:\\pools\\").unwrap();
+        let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+        if on {
+            h.session.set_dmabuf_node(Some(NODE.into()));
+        }
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let (announced, fds) = event(&mut h, registry, 0, &global_body(SHM_NAME, "wl_shm", 1));
+        assert!(fds.is_empty());
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        let surface = h.id();
+        h.send_words(compositor, 0, &[surface]);
+        let dmabuf = if on { h.bind(registry, GLOBAL_NAME, "zwp_linux_dmabuf_v1", 4) } else { 0 };
+        (Dm { h, d, registry, dmabuf, surface, compositor }, announced)
+    }
+
+    impl Drop for Dm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.d);
+        }
+    }
+
+    fn token(name: &str, size: u64) -> OwnedFd {
+        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into() };
+        sv_drm::token::create(&t).unwrap()
+    }
+
+    /// The same bytes in a memfd nobody sealed.
+    fn unsealed_token(name: &str, size: u64) -> OwnedFd {
+        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into() };
+        let bytes = t.encode();
+        // SAFETY: a literal name and valid flags.
+        let raw = unsafe { libc::memfd_create(c"unsealed".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: just returned.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: a live fd and a slice.
+        let n = unsafe { libc::pwrite(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
+        assert_eq!(n as usize, bytes.len());
+        fd
+    }
+
+    impl Dm {
+        fn params(&mut self) -> u32 {
+            let p = self.h.id();
+            self.h.send_words(self.dmabuf, ops::DMABUF_CREATE_PARAMS, &[p]);
+            p
+        }
+
+        fn add(&mut self, params: u32, fd: OwnedFd, offset: u32, stride: u32, modifier: u64) {
+            let body: Vec<u8> = [0, offset, stride, (modifier >> 32) as u32, modifier as u32]
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect();
+            let mut fds = VecDeque::from([fd]);
+            self.h.send(params, ops::PARAMS_ADD, &body, &mut fds);
+            assert!(fds.is_empty(), "add takes its descriptor");
+        }
+
+        /// `create_immed`; the new buffer's id.
+        fn create_immed(&mut self, params: u32, w: u32, h: u32, format: u32) -> u32 {
+            let b = self.h.id();
+            self.h.send_words(params, ops::PARAMS_CREATE_IMMED, &[b, w, h, format, 0]);
+            b
+        }
+
+        fn upstream_since(&self, n: usize) -> Vec<(u32, u16, Vec<u8>)> {
+            self.h.upstream_messages()[n..].to_vec()
+        }
+    }
+
+    /// Off, the registry is the compositor's, byte for byte.
+    #[test]
+    fn without_the_flag_nothing_is_announced() {
+        let (dm, announced) = setup("p104-off", false);
+        assert_eq!(announced, wire::message(dm.registry, 0, &global_body(SHM_NAME, "wl_shm", 1)));
+    }
+
+    #[test]
+    fn the_global_follows_wl_shm_and_its_bind_becomes_a_wl_shm_upstream() {
+        let (dm, announced) = setup("p104-bind", true);
+        let msgs = messages(&announced);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], (dm.registry, 0, global_body(SHM_NAME, "wl_shm", 1)));
+        assert_eq!(msgs[1], (dm.registry, 0, global_body(GLOBAL_NAME, "zwp_linux_dmabuf_v1", 4)));
+        // The bind upstream names the compositor's wl_shm, at the same id.
+        let (o, op, b) = dm.h.upstream_messages().last().unwrap().clone();
+        assert_eq!((o, op), (dm.registry, 0));
+        let mut want = Vec::new();
+        want.extend_from_slice(&SHM_NAME.to_ne_bytes());
+        wire::push_string(&mut want, "wl_shm");
+        want.extend_from_slice(&1u32.to_ne_bytes());
+        want.extend_from_slice(&dm.dmabuf.to_ne_bytes());
+        assert_eq!(b, want);
+    }
+
+    #[test]
+    fn the_default_feedback_names_the_node_and_the_linear_formats() {
+        let (mut dm, _) = setup("p104-fb", true);
+        let _ = dm.h.session.take_client_messages();
+        let n = dm.h.upstream_messages().len();
+        let fb = dm.h.id();
+        dm.h.send_words(dm.dmabuf, ops::DMABUF_GET_DEFAULT_FEEDBACK, &[fb]);
+        // Upstream: only the placeholder that fills the id.
+        assert_eq!(dm.upstream_since(n), vec![(1, ops::DISPLAY_SYNC, fb.to_ne_bytes().to_vec())]);
+
+        let (bytes, fds) = dm.h.session.take_client_messages();
+        assert_eq!(fds.len(), 1, "the format table");
+        let msgs = messages(&bytes);
+        let order: Vec<u16> = msgs.iter().map(|m| m.1).collect();
+        assert_eq!(
+            order,
+            [
+                ev("zwp_linux_dmabuf_feedback_v1", "format_table"),
+                ev("zwp_linux_dmabuf_feedback_v1", "main_device"),
+                ev("zwp_linux_dmabuf_feedback_v1", "tranche_target_device"),
+                ev("zwp_linux_dmabuf_feedback_v1", "tranche_flags"),
+                ev("zwp_linux_dmabuf_feedback_v1", "tranche_formats"),
+                ev("zwp_linux_dmabuf_feedback_v1", "tranche_done"),
+                ev("zwp_linux_dmabuf_feedback_v1", "done"),
+            ]
+        );
+        assert!(msgs.iter().all(|m| m.0 == fb));
+        assert_eq!(words(&msgs[0].2), [32], "two 16-byte entries");
+        let mut dev = 8u32.to_ne_bytes().to_vec();
+        dev.extend_from_slice(&crate::session::render_node(NODE.as_ref()).unwrap().to_ne_bytes());
+        assert_eq!(msgs[1].2, dev, "main_device: st_rdev, 8 bytes, native endian");
+        assert_eq!(msgs[2].2, dev);
+        assert_eq!(words(&msgs[3].2), [0]);
+        let mut idx = 4u32.to_ne_bytes().to_vec();
+        idx.extend_from_slice(&0u16.to_ne_bytes());
+        idx.extend_from_slice(&1u16.to_ne_bytes());
+        assert_eq!(msgs[4].2, idx);
+
+        let mut table = [0u8; 32];
+        // SAFETY: a live fd and a buffer of that size.
+        let n = unsafe { libc::pread(fds[0].as_raw_fd(), table.as_mut_ptr().cast(), 32, 0) };
+        assert_eq!(n, 32);
+        let entry = |i: usize| {
+            let e = &table[i * 16..i * 16 + 16];
+            (
+                u32::from_ne_bytes(e[..4].try_into().unwrap()),
+                u64::from_ne_bytes(e[8..].try_into().unwrap()),
+            )
+        };
+        assert_eq!(entry(0), (u32::from_le_bytes(*b"AR24"), MOD_LINEAR));
+        assert_eq!(entry(1), (u32::from_le_bytes(*b"XR24"), MOD_LINEAR));
+        // SAFETY: a live fd.
+        let seals = unsafe { libc::fcntl(fds[0].as_raw_fd(), libc::F_GET_SEALS) };
+        assert_ne!(seals & libc::F_SEAL_WRITE, 0);
+
+        // Destroying it is acknowledged here; the placeholder's answers from
+        // the compositor never reach the client.
+        dm.h.send_words(fb, ops::FEEDBACK_DESTROY, &[]);
+        let (bytes, _) = dm.h.session.take_client_messages();
+        assert_eq!(bytes, wire::message(1, 1, &fb.to_ne_bytes()));
+        assert!(event(&mut dm.h, fb, 0, &[0, 0, 0, 0]).0.is_empty(), "the sync's done");
+        assert!(event(&mut dm.h, 1, 1, &fb.to_ne_bytes()).0.is_empty(), "the sync's delete_id");
+    }
+
+    #[test]
+    fn a_token_becomes_a_section_pool_and_commits_copy_nothing() {
+        let (mut dm, _) = setup("p104-zero", true);
+        let name = "Local\\sv-shared-42-1-0123456789abcdef";
+        let size = u64::from(W * H * 4);
+        let p = dm.params();
+        let n = dm.h.upstream_messages().len();
+        dm.add(p, token(name, size), 0, W * 4, MOD_LINEAR);
+        assert_eq!(dm.upstream_since(n), vec![], "add stays here");
+        let b = dm.create_immed(p, W, H, crate::session::DRM_FORMAT_XRGB8888);
+
+        let up = dm.upstream_since(n);
+        assert_eq!(up.len(), 3, "{up:?}");
+        // wl_shm.create_pool(pool = the params id, Section{name}, size) on the
+        // dma-buf object's id, which upstream is a wl_shm.
+        assert_eq!((up[0].0, up[0].1), (dm.dmabuf, 0));
+        let spec = Spec::builtin().unwrap();
+        let spans = wire::walk(&up[0].2, &spec.request("wl_shm", 0).unwrap().args, FdEncoding::InBand)
+            .unwrap();
+        assert_eq!(wire::word_at(&up[0].2, &spans[0]), Some(p));
+        assert_eq!(
+            Descriptor::decode(wire::bytes_at(&up[0].2, &spans[1]).unwrap()).unwrap(),
+            Descriptor::Section { name: name.into(), size }
+        );
+        assert_eq!(wire::word_at(&up[0].2, &spans[2]), Some(size as u32));
+        // create_buffer(buffer, offset, w, h, stride, wl_shm xrgb8888 = 1)
+        assert_eq!((up[1].0, up[1].1), (p, 0));
+        assert_eq!(words(&up[1].2), [b, 0, W, H, W * 4, 1]);
+        assert_eq!((up[2].0, up[2].1, up[2].2.len()), (p, 1, 0), "the pool is destroyed at once");
+        assert!(dm.h.session.take_client_messages().0.is_empty(), "no failed event");
+
+        // attach + damage + commit go through, and nothing is copied.
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(dm.surface, 1, &[b, 0, 0]);
+        dm.h.send_words(dm.surface, 9, &[0, 0, W, H]);
+        dm.h.send_words(dm.surface, 6, &[]);
+        dm.h.send_words(dm.surface, 6, &[]);
+        let up = dm.upstream_since(n);
+        assert_eq!(up.iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+                   [(dm.surface, 1), (dm.surface, 9), (dm.surface, 6), (dm.surface, 6)]);
+        let s = dm.h.session.stats;
+        assert_eq!((s.copies, s.bytes_copied), (0, 0));
+        assert_eq!((s.dmabuf_buffers, s.dmabuf_commits, s.dmabuf_failed), (1, 2, 0));
+        assert!(s.summary().contains("dmabuf_buffers=1 dmabuf_commits=2"), "{}", s.summary());
+
+        // The release is the compositor's and passes unchanged.
+        let (rel, _) = event(&mut dm.h, b, 0, &[]);
+        assert_eq!(rel, wire::message(b, 0, &[]));
+
+        // The compositor's answers to what was done on the client's behalf
+        // are dropped: the params placeholder's done and delete_id, the
+        // pool's delete_id, and wl_shm.format on the dma-buf object.
+        assert!(event(&mut dm.h, p, 0, &[0, 0, 0, 0]).0.is_empty());
+        assert!(event(&mut dm.h, 1, 1, &p.to_ne_bytes()).0.is_empty());
+        assert!(event(&mut dm.h, 1, 1, &p.to_ne_bytes()).0.is_empty());
+        assert!(event(&mut dm.h, dm.dmabuf, 0, &1u32.to_ne_bytes()).0.is_empty());
+        // ...and nothing more than that: a third delete_id is the client's.
+        dm.h.send_words(p, ops::PARAMS_DESTROY, &[]);
+        assert_eq!(dm.h.session.take_client_messages().0, wire::message(1, 1, &p.to_ne_bytes()));
+
+        // The buffer's destroy is forwarded, and so is its delete_id.
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(b, 0, &[]);
+        assert_eq!(dm.upstream_since(n), vec![(b, 0, vec![])]);
+        assert_eq!(event(&mut dm.h, 1, 1, &b.to_ne_bytes()).0, wire::message(1, 1, &b.to_ne_bytes()));
+    }
+
+    #[test]
+    fn a_path_name_is_a_shared_file() {
+        let (mut dm, _) = setup("p104-path", true);
+        let p = dm.params();
+        dm.add(p, token("/dev/shm/sv-shared-1-2-0123456789abcdef", 1 << 20), 4096, 1024, MOD_LINEAR);
+        let n = dm.h.upstream_messages().len();
+        let _ = dm.create_immed(p, 256, 100, crate::session::DRM_FORMAT_ARGB8888);
+        let up = dm.upstream_since(n);
+        let spec = Spec::builtin().unwrap();
+        let spans = wire::walk(&up[0].2, &spec.request("wl_shm", 0).unwrap().args, FdEncoding::InBand)
+            .unwrap();
+        assert_eq!(
+            Descriptor::decode(wire::bytes_at(&up[0].2, &spans[1]).unwrap()).unwrap(),
+            Descriptor::SharedFile { path: "/dev/shm/sv-shared-1-2-0123456789abcdef".into(), size: 1 << 20 }
+        );
+        assert_eq!(words(&up[1].2)[1..], [4096, 256, 100, 1024, 0], "argb8888 is wl_shm 0");
+    }
+
+    /// Each failure is a `failed` event, a placeholder for the buffer id, no
+    /// pool, and a buffer whose destroy is answered here.
+    #[allow(clippy::too_many_arguments)]
+    fn fails(tag: &str, fd: OwnedFd, offset: u32, stride: u32, modifier: u64, w: u32, h: u32, format: u32) {
+        let (mut dm, _) = setup(tag, true);
+        let p = dm.params();
+        dm.add(p, fd, offset, stride, modifier);
+        let _ = dm.h.session.take_client_messages();
+        let n = dm.h.upstream_messages().len();
+        let b = dm.create_immed(p, w, h, format);
+        assert_eq!(dm.upstream_since(n), vec![(1, ops::DISPLAY_SYNC, b.to_ne_bytes().to_vec())]);
+        let (bytes, _) = dm.h.session.take_client_messages();
+        assert_eq!(bytes, wire::message(p, ev("zwp_linux_buffer_params_v1", "failed"), &[]));
+        assert_eq!(dm.h.session.stats.dmabuf_failed, 1);
+        assert_eq!(dm.h.session.stats.dmabuf_buffers, 0);
+        assert!(dm.h.session.take_notes().iter().any(|l| l.contains("create_immed failed")));
+        // An attach of it is held back, never forwarded.
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(dm.surface, 1, &[b, 0, 0]);
+        assert!(dm.upstream_since(n).is_empty());
+        // Its destroy is absorbed and acknowledged here.
+        dm.h.send_words(b, 0, &[]);
+        assert!(dm.upstream_since(n).is_empty());
+        assert_eq!(dm.h.session.take_client_messages().0, wire::message(1, 1, &b.to_ne_bytes()));
+    }
+
+    #[test]
+    fn an_unsealed_fd_fails() {
+        fails("p104-unsealed", unsealed_token("Local\\x", 1 << 20), 0, W * 4, 0, W, H, crate::session::DRM_FORMAT_XRGB8888);
+    }
+
+    #[test]
+    fn a_tiled_modifier_fails() {
+        fails("p104-mod", token("Local\\x", 1 << 20), 0, W * 4, 0x0100_0000_0000_0001, W, H, crate::session::DRM_FORMAT_XRGB8888);
+    }
+
+    #[test]
+    fn a_buffer_past_the_allocation_fails() {
+        // One byte short of the last row.
+        let size = u64::from(W * 4 * (H - 1) + W * 4 - 1);
+        fails("p104-oob", token("Local\\x", size), 0, W * 4, 0, W, H, crate::session::DRM_FORMAT_XRGB8888);
+    }
+
+    #[test]
+    fn a_stride_narrower_than_a_row_fails() {
+        fails("p104-stride", token("Local\\x", 1 << 20), 0, W * 4 - 4, 0, W, H, crate::session::DRM_FORMAT_XRGB8888);
+    }
+
+    #[test]
+    fn a_format_not_in_the_table_fails() {
+        fails("p104-fmt", token("Local\\x", 1 << 20), 0, W * 4, 0, W, H, u32::from_le_bytes(*b"AB24"));
+    }
+
+    #[test]
+    fn the_last_row_needs_only_its_pixels() {
+        // Exactly offset + stride * (h - 1) + w * 4: accepted.
+        let (mut dm, _) = setup("p104-exact", true);
+        let p = dm.params();
+        let stride = W * 4 + 64;
+        dm.add(p, token("Local\\x", u64::from(16 + stride * (H - 1) + W * 4)), 16, stride, 0);
+        let _ = dm.create_immed(p, W, H, crate::session::DRM_FORMAT_XRGB8888);
+        assert_eq!(dm.h.session.stats.dmabuf_buffers, 1);
+    }
+
+    /// `create` (the server-allocated id) is not supported and says so.
+    #[test]
+    fn create_without_immed_fails_with_a_reason() {
+        let (mut dm, _) = setup("p104-create", true);
+        let p = dm.params();
+        dm.add(p, token("Local\\x", 1 << 20), 0, W * 4, 0);
+        let _ = dm.h.session.take_client_messages();
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(p, ops::PARAMS_CREATE, &[W, H, crate::session::DRM_FORMAT_XRGB8888, 0]);
+        assert!(dm.upstream_since(n).is_empty());
+        assert_eq!(dm.h.session.take_client_messages().0, wire::message(p, 1, &[]));
+        assert!(dm.h.session.take_notes().iter().any(|l| l.contains("use create_immed")));
+    }
+
+    /// The node is looked at when a registry is filled, not at startup: a
+    /// client whose registry came while it was missing is not offered the
+    /// global (and is told nothing else), one after it appeared is, and
+    /// each gets one line saying which.
+    #[test]
+    fn the_node_is_asked_for_each_registry() {
+        let d = tmpdir("p104-late");
+        let link = d.join("renderD128");
+        std::os::unix::fs::symlink(d.join("absent"), &link).unwrap();
+        let t = SharedFile::new(&d, "Z:\\pools\\").unwrap();
+        let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+        h.session.set_dmabuf_node(Some(link.clone()));
+        let r1 = h.id();
+        h.send_words(1, 1, &[r1]);
+        let (out, _) = event(&mut h, r1, 0, &global_body(SHM_NAME, "wl_shm", 1));
+        assert_eq!(out, wire::message(r1, 0, &global_body(SHM_NAME, "wl_shm", 1)));
+        let notes = h.session.take_notes();
+        assert!(notes.iter().any(|l| l.starts_with("not offered zwp_linux_dmabuf_v1")), "{notes:?}");
+
+        // The node appears (root made it); the next registry is offered it.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(NODE, &link).unwrap();
+        let r2 = h.id();
+        h.send_words(1, 1, &[r2]);
+        let (out, _) = event(&mut h, r2, 0, &global_body(SHM_NAME, "wl_shm", 1));
+        assert_eq!(messages(&out).len(), 2, "wl_shm and the dma-buf global");
+        let dev = crate::session::render_node(NODE.as_ref()).unwrap();
+        let want = format!(
+            "offered zwp_linux_dmabuf_v1 v4, main device {}:{}",
+            crate::session::dev_major(dev),
+            crate::session::dev_minor(dev)
+        );
+        let notes = h.session.take_notes();
+        assert!(notes.iter().any(|l| l.starts_with(&want)), "{notes:?}");
+        // A third registry with the same answer says nothing more.
+        let r3 = h.id();
+        h.send_words(1, 1, &[r3]);
+        let _ = event(&mut h, r3, 0, &global_body(SHM_NAME, "wl_shm", 1));
+        assert!(h.session.take_notes().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dev_t_splits_like_glibc() {
+        let dev = crate::session::render_node(NODE.as_ref()).unwrap();
+        assert_eq!((crate::session::dev_major(dev), crate::session::dev_minor(dev)), (1, 3));
+        assert_eq!((crate::session::dev_major(0xe280), crate::session::dev_minor(0xe280)), (226, 128));
+    }
+
+    /// The opcodes `session/dmabuf.rs` hard-codes, against the XML.
+    #[test]
+    fn the_dmabuf_opcodes_are_the_xmls() {
+        assert_eq!(ops::DMABUF_DESTROY, rq("zwp_linux_dmabuf_v1", "destroy"));
+        assert_eq!(ops::DMABUF_CREATE_PARAMS, rq("zwp_linux_dmabuf_v1", "create_params"));
+        assert_eq!(ops::DMABUF_GET_DEFAULT_FEEDBACK, rq("zwp_linux_dmabuf_v1", "get_default_feedback"));
+        assert_eq!(ops::DMABUF_GET_SURFACE_FEEDBACK, rq("zwp_linux_dmabuf_v1", "get_surface_feedback"));
+        assert_eq!(ops::DMABUF_FORMAT, ev("zwp_linux_dmabuf_v1", "format"));
+        assert_eq!(ops::DMABUF_MODIFIER, ev("zwp_linux_dmabuf_v1", "modifier"));
+        assert_eq!(ops::PARAMS_DESTROY, rq("zwp_linux_buffer_params_v1", "destroy"));
+        assert_eq!(ops::PARAMS_ADD, rq("zwp_linux_buffer_params_v1", "add"));
+        assert_eq!(ops::PARAMS_CREATE, rq("zwp_linux_buffer_params_v1", "create"));
+        assert_eq!(ops::PARAMS_CREATE_IMMED, rq("zwp_linux_buffer_params_v1", "create_immed"));
+        assert_eq!(ops::PARAMS_FAILED, ev("zwp_linux_buffer_params_v1", "failed"));
+        assert_eq!(ops::FEEDBACK_DESTROY, rq("zwp_linux_dmabuf_feedback_v1", "destroy"));
+        let fb = |n| ev("zwp_linux_dmabuf_feedback_v1", n);
+        assert_eq!(ops::FB_DONE, fb("done"));
+        assert_eq!(ops::FB_FORMAT_TABLE, fb("format_table"));
+        assert_eq!(ops::FB_MAIN_DEVICE, fb("main_device"));
+        assert_eq!(ops::FB_TRANCHE_DONE, fb("tranche_done"));
+        assert_eq!(ops::FB_TRANCHE_TARGET_DEVICE, fb("tranche_target_device"));
+        assert_eq!(ops::FB_TRANCHE_FORMATS, fb("tranche_formats"));
+        assert_eq!(ops::FB_TRANCHE_FLAGS, fb("tranche_flags"));
+        assert_eq!(ops::DISPLAY_SYNC, rq("wl_display", "sync"));
+        assert_eq!(ops::REGISTRY_BIND, rq("wl_registry", "bind"));
+    }
+
+    /// Every client id reaches the compositor in creation order with no gap,
+    /// which is what `wayland-backend` insists on: the dma-buf objects are
+    /// filled by a `wl_shm` bind and `wl_display.sync`s.
+    #[test]
+    fn no_client_id_leaves_a_hole_upstream() {
+        let (mut dm, _) = setup("p104-ids", true);
+        let fb = dm.h.id();
+        dm.h.send_words(dm.dmabuf, ops::DMABUF_GET_SURFACE_FEEDBACK, &[fb, dm.surface]);
+        let p = dm.params();
+        dm.add(p, token("Local\\x", 1 << 20), 0, W * 4, 0);
+        let b = dm.create_immed(p, W, H, crate::session::DRM_FORMAT_XRGB8888);
+        let p2 = dm.params();
+        dm.add(p2, token("Local\\y", 16), 0, W * 4, 0);
+        let b2 = dm.create_immed(p2, W, H, crate::session::DRM_FORMAT_XRGB8888); // fails
+        let after = dm.h.id();
+        dm.h.send_words(dm.compositor, 0, &[after]);
+        // The first message upstream that names each new id.
+        let up = dm.h.upstream_messages();
+        let first = |id: u32| {
+            up.iter().position(|(o, op, body)| {
+                let w = words(&body[..body.len() & !3]);
+                (*o == 1 && *op == ops::DISPLAY_SYNC && w == [id])
+                    || (*op == 0 && w.last() == Some(&id) && *o == dm.registry)
+                    || (*op == 0 && *o != dm.registry && w.first() == Some(&id))
+            })
+        };
+        let order: Vec<usize> = [dm.dmabuf, fb, p, b, p2, b2, after]
+            .iter()
+            .map(|id| first(*id).unwrap_or_else(|| panic!("{id} never reached the compositor")))
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+}
+
 /// §102.9. KWin's Wayland backend imports each swapchain buffer as its own
 /// pool and destroys the pool object at once (`WaylandBackend::importBuffer`,
 /// `wayland_backend.cpp`: `wl_shm_create_pool`, `wl_shm_pool_create_buffer`,
