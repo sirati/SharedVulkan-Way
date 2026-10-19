@@ -99,3 +99,117 @@ pub fn doorbell_wait() -> Wait {
         let _ = ch.wait_readable(t.min(crate::ring_wait_slice()));
     })
 }
+
+// ------------------------------------------------- the Windows host's half --
+
+/// What the launcher tells the compositor about host integration, on its
+/// command line: `--hostint` turns it on, `--hostint-share HOST=LINUX` and
+/// `--hostint-drop HOST=LINUX` are the path map (wc-launch's `[hostint]`),
+/// `--hostint-browser EXE` the browser for Linux's links (the user's
+/// default when absent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostCfg {
+    pub on: bool,
+    pub paths: wc_hostint::wire::PathMap,
+    pub browser: Option<String>,
+}
+
+static HOSTCFG: std::sync::Mutex<Option<HostCfg>> = std::sync::Mutex::new(None);
+
+fn pair(v: &str) -> Result<(String, String), String> {
+    let (h, l) = v.split_once('=').ok_or("wants HOST=LINUX")?;
+    if h.is_empty() || !l.starts_with('/') || v.chars().any(char::is_control) {
+        return Err(format!("{v:?} is not HOST=LINUX with an absolute Linux path"));
+    }
+    Ok((h.to_string(), l.to_string()))
+}
+
+/// One of the `--hostint*` flags. Returns whether `flag` was one.
+pub fn parse_flag(flag: &str, value: &mut dyn FnMut() -> Option<String>) -> Result<bool, String> {
+    let mut g = HOSTCFG.lock().unwrap_or_else(|e| e.into_inner());
+    let c = g.get_or_insert_with(HostCfg::default);
+    let mut need = || value().ok_or(format!("{flag} needs a value"));
+    match flag {
+        "--hostint" => c.on = true,
+        "--hostint-share" => c.paths.shares.push(pair(&need()?)?),
+        "--hostint-drop" => c.paths.drop = Some(pair(&need()?)?),
+        "--hostint-browser" => c.browser = Some(need()?),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The configuration, if `--hostint` was given.
+pub fn configured() -> Option<HostCfg> {
+    HOSTCFG.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|c| c.on)
+}
+
+/// The host's service: http and https for links, the configured shares.
+pub fn service(platform: &'static str, cfg: &HostCfg, windows_paths: bool) -> Service {
+    Service::new(wc_hostint::host::Config {
+        platform,
+        schemes: wc_hostint::openurl::default_schemes(),
+        paths: cfg.paths.clone(),
+        windows_paths,
+    })
+}
+
+/// How often the host's applications are enumerated again: installing one
+/// is rare, and enumerating takes about two seconds.
+#[cfg(windows)]
+const HANDLERS_EVERY: Duration = Duration::from_secs(600);
+
+/// Windows: serve the `OWNER_HOSTINT` slot (already opened by the caller,
+/// `session_svc`'s service channel) with the shell opener, the endpoint
+/// watch and the association handlers. Returns once the thread runs.
+#[cfg(windows)]
+pub fn start_windows(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
+    use wc_hostplat::win;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // The endpoint watch lives as long as the service: it is moved into the
+    // handlers thread below, which ends when the service's receiver is gone.
+    let watch = match win::audio::watch(tx.clone(), say) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            say(&format!("hostint: no audio device list: {e}"));
+            None
+        }
+    };
+    let htx = tx.clone();
+    let _ = std::thread::Builder::new().name("hostint-handlers".into()).spawn(move || {
+        let _watch = watch;
+        loop {
+            if htx.send(Event::Handlers(win::handlers::handlers())).is_err() {
+                return;
+            }
+            std::thread::sleep(HANDLERS_EVERY);
+        }
+    });
+    drop(tx);
+    let svc = service("windows", &cfg, true);
+    let opener = win::open::WinOpener { browser: cfg.browser.clone() };
+    if let Err(e) = spawn(ch, doorbell_wait(), svc, Box::new(opener), rx, Box::new(move |l: &str| say(l))) {
+        say(&format!("hostint: no thread: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn flags_make_the_path_map() {
+        let mut vals = vec!["Z:\\=/srv/winshare".to_string(), "Z:\\waycompose-open=/srv/winshare/waycompose-open".into()].into_iter();
+        let mut next = || vals.next();
+        assert!(!parse_flag("--other", &mut next).unwrap());
+        assert!(configured().is_none(), "off until --hostint");
+        assert!(parse_flag("--hostint-share", &mut next).unwrap());
+        assert!(parse_flag("--hostint-drop", &mut next).unwrap());
+        assert!(parse_flag("--hostint", &mut || None).unwrap());
+        let c = configured().unwrap();
+        assert_eq!(c.paths.shares, [("Z:\\".to_string(), "/srv/winshare".to_string())]);
+        assert_eq!(c.paths.drop.as_ref().unwrap().1, "/srv/winshare/waycompose-open");
+        assert!(parse_flag("--hostint-share", &mut || Some("Z:\\=relative".into())).is_err());
+        assert!(parse_flag("--hostint-browser", &mut || None).is_err());
+    }
+}
