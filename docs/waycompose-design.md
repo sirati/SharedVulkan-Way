@@ -31625,11 +31625,15 @@ sound from the session plays on Windows, the window resizes and maximises and
 KWin's output follows (1000×600, 1280×729), and the close button ends KWin,
 the session, greetd and the seat, unloads `vkms` and lifts the memory cap.
 About 31 frames a second with an animating client at 1280×729, KWin
-compositing in software. The guest run found four bugs, all fixed: KWin's
-frames stopped after the first map with damage-scoped copies (102.9),
-clicks were delivered at a frozen origin during a click (102.9), the nested
-Plasma locked itself after five minutes, and the login screen outlived a
-session ended under it. Locally the NixOS test passes 10 of 10. The VM runs
+compositing in software. A border drag and a caption double-click resize and
+maximise it; a wrong password is rejected by PAM with the greeter's message,
+and a real password login (a throwaway user, removed again) starts a session.
+The guest runs found eight bugs, all fixed (102.9, 102.13): a recycled pool id
+froze KWin's frames, clicks were delivered at a frozen origin, the nested
+Plasma locked itself, the login screen outlived a session ended under it, a
+second login user had no socket, the greeter typed y and z swapped on the
+German keyboard, wc-desk's combined move-and-button input never started
+Windows' size loop, and the activity sentinel never recognised our tag. Locally the NixOS test passes 10 of 10. The VM runs
 with 2 GiB less RAM (10496 MiB) since 2026-10-17.
 
 ### 102.2 The path
@@ -31811,16 +31815,23 @@ time; captures of our window only, judged by separate agents):
 | E | `copy-scope = buffer` | Dolphin appears (139 000 pixels changed); sound: a tone in the session played on Windows (2.6 s not silent of 5 s); resize through `SetWindowPos` → KWin output 1000×600, maximise → 1280×729; ~31 fps (63 commits/s, two per frame) with `weston-presentation-shm`; 1.3–1.6 GB in <desktop-user>'s slice, 2.0–2.3 GiB available on the host |
 | F | the pointer fix, `copy-scope = buffer` | the start menu opens on a click, "sea" typed into its search finds nine applications; close button → seat, session, `vkms`, ACLs, cap all gone; 486 frames presented |
 
-**Frames with damage-scoped copies.** With the default `--copy damage` the
-guest's window kept KWin's first frame. The trace shows every frame
-composited and painted from the arena slice, so the slice held stale pixels:
-KWin's QPainter swapchain republished its 3.6 MB pool into a second slice
-(`pool 29 … slice 0`, then `slice 3608576`), and the damage-scoped copy did
-not bring the new slice up to date. Locally (file arena under Wine) the same
-KWin updates correctly, so the exact sequence was not reproduced. Whole-buffer
-copies fix it on the guest at 3.6 MB per frame of host memory bandwidth, so
-the installation uses them (`$BASE/copy-scope`). The cause in the arrears
-logic is open.
+**Frames frozen after the first map: a recycled pool id.** The guest's window
+kept KWin's first frame. The trace showed every frame composited and painted
+from the arena slice, so the slice held stale pixels. The cause was not the
+damage arrears but the proxy's pool table: KWin imports each swapchain slot as
+`create_pool`, `create_buffer`, `pool.destroy`. When the compositor's
+`delete_id` for the first pool came back before that buffer's release,
+libwayland gave the same id (29) to the second slot's pool, and `create_pool`
+overwrote the zombie entry. From then on the first buffer's commits copied the
+second pool's memory into the second slice, and the slice the compositor read
+for the first buffer (`slice 0`) kept frame 1. The guest's late releases over
+the rings made the reuse likely; Wine's prompt ones did not. Fixed in
+`f48a63c` (`retire_pool_id`, test `a_recycled_pool_id_does_not_steal_a_live_buffer`,
+which fails at frame 3 without it); live under Wine with a forced late release
+the animation advances with the id reused. On the guest with `--copy damage`
+again: Dolphin appears (138 600 pixels changed), the start menu opens and
+closes without remnants. `$BASE/copy-scope` stays as an option; `wclinux` no
+longer sets it.
 
 **Clicks inside KWin.** `wl_pointer` coordinates on KWin's layer subsurface
 were frozen at the origin they had when the button went down (smithay's
@@ -31832,9 +31843,47 @@ surface tree at every event, on one input clock (five tests).
 guest in the window of the runs; GPU forwarding was not used (`gpu = off`).
 
 **Our input counted as the user's.** The activity sentinel recorded
-`wc-desk`'s clicks as injected input that was not ours (`ours 0`), so one run
-stopped itself. The helper now writes each step's span into the guest's
-`inject.log`; why the WCAGENT1 tag was not seen is open.
+`wc-desk`'s clicks as injected input that was not ours. A hook probe on the
+guest showed why: a low-level hook receives `dwExtraInfo` truncated to its low
+32 bits (`extra=00000000454e5431` for every tagged move). `wc-activity`
+accepts the low half since `a7a1daa`; redeployed, a tagged hover counts as
+ours (`ours 2`) and the desktop stays idle.
+
+### 102.13 Demo gaps closed on 2026-10-19
+
+**Border drag and caption double-click.** Not the compositor: `wc-desk` sent
+each press as one `MOVE|ABSOLUTE|LEFTDOWN` input, and Windows did not start its
+modal size loop from that. Moves and presses are now separate (tagged) inputs,
+and `wc-desk` prints where each press lands. On the guest: a drag of the
+bottom-right corner (`HTBOTTOMRIGHT`) took the window from 1280×752 to 980×552
+and KWin followed to 964×513; a double-click on the caption (`HTCAPTION`)
+maximised it (KWin 1280×729) and a second one restored it. Locally the
+harness can show it only with Wine drawing the frame itself (`Decorated=N`):
+without a window manager Wine gives a frame press nothing.
+
+**The login path.** A wrong password for <desktop-user>: `pam_unix(atp-nested-login:auth):
+authentication failure … user=<desktop-user>`, `AUTH_ERR`, and the greeter shows
+"Incorrect password. Please check your keyboard layout and try again." with the
+field cleared. A real login: a throwaway user `nestedtest` with a known
+password, added on the branch for the check and removed again (account, home,
+files): it logged in and its Aero session ran in the window; the close button
+ended it cleanly. Two bugs found on the way: the launcher's ACLs, the cap and
+the user-manager clean-up covered only `nestedTest.user`, so a second user's
+session had no socket (now every user the login screen offers); and
+cosmic-comp keeps its own keymap, US, so on the German Windows keyboard a y and
+a z were swapped in the password (`nestedTest.login.keyboardLayout = "de"` on
+testhost; with it the login typed as labelled succeeded).
+
+**A UAC prompt after every PIN unlock.** Twice, right after `unlock-guest.sh`,
+`consent.exe` came up on the secure desktop, requested through the Appinfo
+service, not by our tools (they run at the Limited level). While it is up,
+`SendInput` reaches nothing. It went away by itself after 2–4.5 minutes; we
+never answered it. Which application asks for elevation at unlock is
+<guest-user>'s to look at.
+
+**Test VMs.** The user's rule: no more RAM than the test needs. The NixOS
+tests now record the peak of `MemTotal - MemAvailable`: `nested-waycompose`
+1426 MiB → 2048 (was 8192), `nested-login` 1194 MiB → 1792 (was 6144).
 
 ### 102.10 The GPU
 
@@ -31850,7 +31899,7 @@ definition.
 
 | gate | result |
 |---|---|
-| `cargo test --workspace --no-fail-fast` | 3012 passed, 0 failed, 8 ignored (master 2989) |
+| `cargo test --workspace --no-fail-fast` | 3013 passed, 0 failed, 8 ignored (master 2989) |
 | `cargo clippy --workspace --all-targets` | no warning in a line this branch wrote |
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 | `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | OK, OK |
@@ -31863,12 +31912,7 @@ definition.
    guest's). The password logs in.
 2. **Aero glass**: KWin composites with QPainter, which has no blur (102.3).
 3. **KWin and Plasma on the forwarded GPU** (102.10): not enabled, not measured.
-4. **Damage-scoped copies** for KWin on the guest (102.9): worked around per
-   installation; the cause is open.
-5. **An interactive drag of the window's border** through `wc-desk` did not
-   resize (a double click on the caption neither); `SetWindowPos` and maximise
-   did, and KWin followed. A person's drag was not tried.
-6. **The login screen with a real password** was shown up to its prompt;
-   <desktop-user>'s password is not known here, so the session runs used root's
-   one-shot autologin. The password path is covered by the local VM test.
-7. **The activity sentinel and `wc-desk`'s tag** (102.9).
+4. **<desktop-user>'s own password** was not typed (it is not known here); the path is
+   proven by the rejection and by the throwaway user's login (102.13).
+5. **The local harness and the NixOS test** do not yet set Wine's
+   `Decorated=N`, so they cannot exercise a frame drag (102.13).
