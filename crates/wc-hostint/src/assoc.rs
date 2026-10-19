@@ -87,7 +87,10 @@ fn quote_arg(s: &str) -> String {
 
 /// The registration for one application. `launcher` is the absolute path of
 /// `wc-launch.exe`, `icon` that of the application's `.ico`, and `install`
-/// the installation's name (so two installations register apart).
+/// the installation's name (so two installations register apart): its
+/// session name, which the command passes back as `--session-name` (each
+/// installation's `wc-launch.exe` reads its own ini; `--install` is the
+/// launcher's shortcut verb and must not appear here).
 /// `scheme_exists` says whether the system already defines a URL scheme
 /// (`HKEY_CLASSES_ROOT\<scheme>` with `URL Protocol`); such a scheme is only
 /// offered through Capabilities, never shadowed in HKCU.
@@ -111,13 +114,13 @@ pub fn windows_plan(
     // the `open` verb of the control channel (the section is the only name
     // Linux acts on, §94).
     let file_cmd = format!(
-        "{} --install {} {} --file \"%1\"",
+        "{} --session-name {} {} --file \"%1\"",
         quote_arg(launcher),
         quote_arg(install),
         quote_arg(&app.section)
     );
     let url_cmd = format!(
-        "{} --install {} {} --url \"%1\"",
+        "{} --session-name {} {} --url \"%1\"",
         quote_arg(launcher),
         quote_arg(install),
         quote_arg(&app.section)
@@ -330,7 +333,7 @@ mod tests {
         assert_eq!(
             find(&format!("Software\\Classes\\{pid}\\shell\\open\\command"), ""),
             Some(RegData::Str(
-                "\"C:\\wc\\wc-launch.exe\" --install \"wc\" \"firefox\" --file \"%1\"".into()
+                "\"C:\\wc\\wc-launch.exe\" --session-name \"wc\" \"firefox\" --file \"%1\"".into()
             ))
         );
         assert_eq!(find("Software\\Classes\\.html\\OpenWithProgids", pid), Some(RegData::Empty));
