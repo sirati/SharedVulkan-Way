@@ -17,26 +17,34 @@
 //! a region is free. It cannot free a region early, and a region it cannot
 //! free costs memory, never correctness.
 //!
+//! **Sections are unnamed.** No other process can open one; the keeper hands
+//! each to the process that asked for it with `DuplicateHandle`, and a pool is
+//! the pair (the caller's user SID, its pool name), so a process of another
+//! Windows user can neither get a region nor adopt one (§108.10, R43). The
+//! first build named them `Global\waycompose-ram-*` with an SDDL admitting
+//! every interactive user, which would have let user B map user A's memory.
+//!
 //! Protocol: lines on `\\.\pipe\waycompose-ram`, one request and one answer:
 //!
 //! ```text
-//! hello POOL            -> ok RUN [ID:LEN:NAME ...]   orphans of POOL, now this client's
-//! alloc BYTES           -> ok ID NAME NONCE32HEX US   the section is created, stamped, held
+//! hello POOL            -> ok RUN [ID:LEN:HANDLE ...] orphans of (SID, POOL), now this client's;
+//!                                                     HANDLE: the section, duplicated into the client
+//! alloc BYTES           -> ok ID HANDLE NONCE32HEX US the section is created, stamped, held, duplicated
 //!                       |  err WHY
 //! free ID               -> ok | err WHY               only after UNMAPPED (the caller's duty)
 //! stats                 -> ok HELD BYTES ORPHANED ORPHAN-BYTES AVAIL TOTAL
 //! ```
+//!
+//! This is the stand-in until the shared broker crate's Windows service hosts
+//! the same four operations (§108.10).
 
 pub const PIPE: &str = r"\\.\pipe\waycompose-ram";
 
-/// Who may use the keeper and its sections: SYSTEM, administrators and
-/// interactive users. A product install narrows this to the user's SID.
-pub const SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
-
-/// The kernel object name of region `id` of keeper run `run`.
-pub fn section_name(run: u64, id: u32) -> String {
-    format!("Global\\waycompose-ram-{run:016x}-{id}")
-}
+/// Who may *talk to* the keeper: SYSTEM, administrators and every authenticated
+/// user (a batch or service logon is a Windows user too).
+/// The sections themselves have no name and no one but their owner's process
+/// ever gets a handle.
+pub const SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)";
 
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -68,10 +76,10 @@ mod imp {
 
     struct Held {
         section: LargeSection,
+        /// `SID|pool`: a pool is per Windows user.
         pool: String,
         /// The connection that owns it; `None`: an orphan.
         owner: Option<u64>,
-        name: String,
     }
 
     #[derive(Default)]
@@ -112,6 +120,10 @@ mod imp {
     }
 
     fn client(pipe: std::fs::File, run: u64, me: u64, st: &Mutex<State>) -> std::io::Result<()> {
+        // Who is asking: the process at the pipe's other end, and its user.
+        let pid = winsys::pipe_client_pid(&pipe)?;
+        let sid = winsys::process_sid(pid)?;
+        eprintln!("[keeper] client {me}: pid {pid}, user {sid}");
         let mut out = pipe.try_clone()?;
         let mut rd = BufReader::new(pipe);
         let mut pool = String::new();
@@ -124,19 +136,24 @@ mod imp {
             let w: Vec<&str> = line.split_whitespace().collect();
             let ans = match w.as_slice() {
                 ["hello", p] => {
-                    pool = p.to_string();
+                    pool = format!("{sid}|{p}");
                     let mut s = st.lock().unwrap();
                     let mut list = String::new();
                     for (id, h) in s.held.iter_mut() {
                         if h.owner.is_none() && h.pool == pool {
-                            h.owner = Some(me);
-                            list.push_str(&format!(" {id}:{}:{}", h.section.len(), h.name));
+                            match winsys::duplicate_into(pid, h.section.raw_handle()) {
+                                Ok(hd) => {
+                                    h.owner = Some(me);
+                                    list.push_str(&format!(" {id}:{}:{hd}", h.section.len()));
+                                }
+                                Err(e) => eprintln!("[keeper] orphan {id} could not be handed to pid {pid}: {e}"),
+                            }
                         }
                     }
                     format!("ok {run:016x}{list}")
                 }
                 ["alloc", bytes] if !pool.is_empty() => match bytes.parse::<u64>() {
-                    Ok(len) => alloc(run, me, &pool, len, st),
+                    Ok(len) => alloc(me, pid, &pool, len, st),
                     Err(e) => format!("err bad length: {e}"),
                 },
                 ["free", id] => match id.parse::<u32>() {
@@ -184,7 +201,7 @@ mod imp {
         (1u64 << 30).max(total / 100 * 15)
     }
 
-    fn alloc(run: u64, me: u64, pool: &str, len: u64, st: &Mutex<State>) -> String {
+    fn alloc(me: u64, pid: u32, pool: &str, len: u64, st: &Mutex<State>) -> String {
         let (total, avail) = memory_status();
         if avail < len.saturating_add(reserve(total)) {
             return format!("err budget: {} MiB asked, {} MiB available, {} MiB kept for Windows", len >> 20, avail >> 20, reserve(total) >> 20);
@@ -195,10 +212,10 @@ mod imp {
             s.next_id += 1;
             id
         };
-        let name = section_name(run, id);
         let nonce = winsys::random::<16>();
         let t = Instant::now();
-        let section = match LargeSection::create(Some(&name), len, Some(SDDL)) {
+        // Unnamed: the only way in is the handle duplicated below.
+        let section = match LargeSection::create(None, len, None) {
             Ok(s) => s,
             Err(e) => return format!("err {e}"),
         };
@@ -207,9 +224,13 @@ mod imp {
             Ok(v) => v.stamp_units(&nonce),
             Err(e) => return format!("err stamping: {e}"),
         }
+        let handle = match winsys::duplicate_into(pid, section.raw_handle()) {
+            Ok(h) => h,
+            Err(e) => return format!("err handing the section to pid {pid}: {e}"),
+        };
         let us = t.elapsed().as_micros();
-        st.lock().unwrap().held.insert(id, Held { section, pool: pool.to_string(), owner: Some(me), name: name.clone() });
-        format!("ok {id} {name} {} {us}", hex(&nonce))
+        st.lock().unwrap().held.insert(id, Held { section, pool: pool.to_string(), owner: Some(me) });
+        format!("ok {id} {handle} {} {us}", hex(&nonce))
     }
 
     /// The provider's side of the keeper.
@@ -222,15 +243,17 @@ mod imp {
     /// One region the keeper made for us.
     pub struct Granted {
         pub id: u32,
-        pub name: String,
+        /// The section, duplicated into this process by the keeper.
+        pub handle: isize,
         pub nonce: [u8; 16],
         pub keeper_us: u64,
     }
 
     impl KeeperClient {
         /// Connect and say which pool we are. Returns the orphans of that pool
-        /// a previous provider left: `(id, len, name)`.
-        pub fn connect(pool: &str) -> Result<(KeeperClient, Vec<(u32, u64, String)>), String> {
+        /// a previous provider of this user left: `(id, len, handle)`, each
+        /// section duplicated into this process.
+        pub fn connect(pool: &str) -> Result<(KeeperClient, Vec<(u32, u64, isize)>), String> {
             let f = winsys::pipe_connect(PIPE, 5000).map_err(|e| format!("keeper: {e}"))?;
             let wr = f.try_clone().map_err(|e| e.to_string())?;
             let mut c = KeeperClient { rd: BufReader::new(f), wr, run: 0 };
@@ -240,7 +263,7 @@ mod imp {
             let orphans = w
                 .filter_map(|x| {
                     let mut p = x.splitn(3, ':');
-                    Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?, p.next()?.to_string()))
+                    Some((p.next()?.parse().ok()?, p.next()?.parse().ok()?, p.next()?.parse().ok()?))
                 })
                 .collect();
             Ok((c, orphans))
@@ -267,7 +290,7 @@ mod imp {
             }
             Ok(Granted {
                 id: w[0].parse().map_err(|_| "bad id")?,
-                name: w[1].to_string(),
+                handle: w[1].parse().map_err(|_| "bad handle")?,
                 nonce: unhex16(w[2]).ok_or("bad nonce")?,
                 keeper_us: w[3].parse().map_err(|_| "bad time")?,
             })

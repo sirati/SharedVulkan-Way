@@ -19,3 +19,5 @@ pub mod peer;
 pub mod winsub;
 #[cfg(windows)]
 pub mod winsys;
+#[cfg(target_os = "linux")]
+pub mod udma;

@@ -391,6 +391,9 @@ mod tests {
             self.freed.push(id);
             Ok(())
         }
+        fn orphans(&mut self) -> Vec<(u32, u64)> {
+            self.regions.iter().map(|(&id, u)| (id, u.len() as u64 * lpstamp::UNIT)).collect()
+        }
     }
 
     fn boot() -> (std::fs::File, SharedRegion) {
@@ -464,6 +467,68 @@ mod tests {
         let ev = p2.poll().unwrap();
         assert!(matches!(ev[0], Event::Freed { k: 1, .. }), "{ev:?}");
         assert_eq!(p2.substrate.freed, vec![1]);
+    }
+
+    /// §108 address stability on the host: a mapped region keeps its address
+    /// (and its content) while other regions are mapped and retired; nothing
+    /// remaps it until its own retire.
+    #[test]
+    fn a_mapped_region_stays_at_its_address_while_others_come_and_go() {
+        let (bf, b1) = boot();
+        let sim = SimRam::new(256);
+        let ram = sim.file.try_clone().unwrap();
+        let mut p = Provider::start(b1, 4096, sim, 1).unwrap();
+        let b2 = SharedRegion::map_fd(bf.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap();
+        let mut peer = Peer::attach(b2, 4096, ram, 9).unwrap();
+        let keep = p.announce(1, 32 << 20).unwrap();
+        peer.scan(|_| {});
+        p.poll().unwrap();
+        let base = unsafe { peer.maps[&keep].view.base_ptr() } as usize;
+        peer.maps[&keep].view.write_bytes(lpstamp::UNIT + 8, b"pinned").unwrap();
+        for round in 0..5u32 {
+            let others: Vec<u32> = (0..3).map(|i| p.announce(10 + round * 3 + i, (2 + 2 * i as u64) << 20).unwrap()).collect();
+            peer.scan(|_| {});
+            p.poll().unwrap();
+            for e in others {
+                p.retire(e);
+            }
+            peer.scan(|_| {});
+            p.poll().unwrap();
+            assert_eq!(unsafe { peer.maps[&keep].view.base_ptr() } as usize, base, "round {round}");
+        }
+        let mut got = [0u8; 6];
+        peer.maps[&keep].view.read_bytes(lpstamp::UNIT + 8, &mut got).unwrap();
+        assert_eq!(&got, b"pinned");
+        assert_eq!(peer.maps.len(), 1);
+    }
+
+    /// Another Windows user's provider maps the bootstrap after the owner died:
+    /// the keeper gives it none of the owner's orphans, so it lets the host go
+    /// of them and clears the entries, and never frees them.
+    #[test]
+    fn a_provider_without_the_keepers_orphans_frees_nothing() {
+        let (bf, b1) = boot();
+        let sim = SimRam::new(64);
+        let ram = sim.file.try_clone().unwrap();
+        let mut p = Provider::start(b1, 4096, sim, 1).unwrap();
+        let b2 = SharedRegion::map_fd(bf.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap();
+        let mut peer = Peer::attach(b2, 4096, ram, 9).unwrap();
+        let e = p.announce(1, 4 << 20).unwrap();
+        peer.scan(|_| {});
+        p.poll().unwrap();
+        // The owner dies. Someone else's provider: a substrate with no orphans.
+        let other = SimRam::new(8);
+        let b3 = SharedRegion::map_fd(bf.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap();
+        let mut q = Provider::start(b3, 4096, other, 2).unwrap();
+        assert!(q.regions[&e].foreign);
+        let ev = peer.scan(|_| {});
+        assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 1 }));
+        let ev = q.poll().unwrap();
+        assert!(matches!(ev[0], Event::Freed { k: 1, .. }));
+        assert!(q.substrate.freed.is_empty(), "a foreign region is never freed by this provider");
+        assert_eq!(q.table().entry(e).pstate, sv_transport::regiontab::PState::Empty);
+        // The owner's memory is still held by its substrate (the keeper).
+        assert!(p.substrate.regions.contains_key(&1));
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub struct Region {
     pub phase: Phase,
     /// `None` for an adopted orphan: this run never mapped it.
     pub view: Option<SharedRegion>,
+    /// Adopted from the table but not this provider's to free: the keeper
+    /// gave it no such orphan (another Windows user's pool, §108.10). The
+    /// host lets go of it and the entry is cleared; its owner frees it.
+    pub foreign: bool,
     pub announced: Instant,
     pub alloc_us: u64,
 }
@@ -82,6 +86,7 @@ impl<S: Substrate> Provider<S> {
     /// freed in the substrate when the peer answers `UNMAPPED`.
     pub fn start(boot: SharedRegion, table_off: u64, mut substrate: S, run: u64) -> Result<Provider<S>, String> {
         let orphan_ids = substrate.orphans();
+        let mine: Vec<u32> = orphan_ids.iter().map(|o| o.0).collect();
         let mut regions = BTreeMap::new();
         {
             let t = Table::new(&boot, table_off).map_err(|e| e.to_string())?;
@@ -95,7 +100,7 @@ impl<S: Substrate> Provider<S> {
                     };
                     regions.insert(
                         e.index,
-                        Region { entry: e.index, k: e.region, id, len: e.len, epoch: e.epoch, phase: Phase::Retiring, view: None, announced: Instant::now(), alloc_us: 0 },
+                        Region { entry: e.index, k: e.region, id, len: e.len, epoch: e.epoch, phase: Phase::Retiring, view: None, foreign: !mine.contains(&id), announced: Instant::now(), alloc_us: 0 },
                     );
                 }
             } else {
@@ -136,7 +141,7 @@ impl<S: Substrate> Provider<S> {
         let epoch = self.table().announce(entry, kind, k, len, &a.handle);
         self.regions.insert(
             entry,
-            Region { entry, k, id: a.id, len, epoch, phase: Phase::Announced, view: Some(a.view), announced: Instant::now(), alloc_us: a.alloc_us },
+            Region { entry, k, id: a.id, len, epoch, phase: Phase::Announced, view: Some(a.view), foreign: false, announced: Instant::now(), alloc_us: a.alloc_us },
         );
         Ok(entry)
     }
@@ -177,7 +182,9 @@ impl<S: Substrate> Provider<S> {
                 (Phase::Retiring, QState::Unmapped) if e.pstate == PState::Retiring => {
                     // Rule 3: the only path to `free`.
                     r.view = None;
-                    self.substrate.free(r.id)?;
+                    if !r.foreign {
+                        self.substrate.free(r.id)?;
+                    }
                     t.clear(entry);
                     gone.push(entry);
                     let wait = self.retired_at.get(&entry).map_or(0, |t| t.elapsed().as_micros() as u64);

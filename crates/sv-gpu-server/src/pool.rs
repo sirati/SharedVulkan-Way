@@ -349,6 +349,62 @@ mod tests {
 
     const M: u64 = 1 << 20;
 
+    /// §108, address stability: a region's base and every lease's place in
+    /// it stay where they are while other regions are added and retired; a
+    /// region is refused retirement while any lease (and so any driver import,
+    /// which is per lease) lives in it; and a control region never leaves
+    /// region 0.
+    #[test]
+    fn regions_stay_put_while_others_come_and_go_and_a_leased_region_cannot_retire() {
+        let boot = Arc::new(SharedRegion::heap((64 * M) as usize).unwrap());
+        let s = PoolServer::new(PoolConfig::for_capacity(1024 * M), boot, Importer::HostPointer).unwrap();
+        let b = s.open_session("app");
+        // Fill region 0 so that the next leases land in added regions.
+        let mut fill = Vec::new();
+        while let Ok(l) = s.lease_raw(b.session, 8 * M, Purpose::Dedicated) {
+            if pool::split(l.offset).0 != 0 {
+                let _ = s.release(l.offset);
+                break;
+            }
+            fill.push(l);
+        }
+        let r1 = Arc::new(SharedRegion::heap((64 * M) as usize).unwrap());
+        s.add_region(1, Arc::clone(&r1)).unwrap();
+        let base1 = unsafe { s.region(1).unwrap().base_ptr() } as usize;
+        let l1 = s.lease_raw(b.session, 16 * M, Purpose::Dedicated).unwrap();
+        assert_eq!(pool::split(l1.offset).0, 1);
+        s.region(1).unwrap().write_bytes(pool::split(l1.offset).1, b"imported").unwrap();
+        // Other regions come and go.
+        for k in 2..6 {
+            s.add_region(k, Arc::new(SharedRegion::heap((32 * M) as usize).unwrap())).unwrap();
+        }
+        for k in [3, 5, 2] {
+            s.remove_region(k).unwrap();
+        }
+        s.add_region(3, Arc::new(SharedRegion::heap((128 * M) as usize).unwrap())).unwrap();
+        // Region 1 is where it was, and so is the lease's content.
+        assert_eq!(unsafe { s.region(1).unwrap().base_ptr() } as usize, base1);
+        let mut got = [0u8; 8];
+        s.read_bytes(l1.offset, &mut got).unwrap();
+        assert_eq!(&got, b"imported");
+        // While the lease lives, region 1 cannot be retired, and it still
+        // takes no new lease after the refused attempt is undone.
+        assert!(s.remove_region(1).is_err(), "a region with a live lease must not retire");
+        assert_eq!(unsafe { s.region(1).unwrap().base_ptr() } as usize, base1);
+        // A control region never lands outside region 0.
+        let c = s.lease_raw(b.session, 64 * 1024, Purpose::Control);
+        if let Ok(c) = c {
+            assert_eq!(pool::split(c.offset).0, 0);
+        }
+        // Released, it retires.
+        s.release(l1.offset).unwrap();
+        s.remove_region(1).unwrap();
+        assert!(s.region(1).is_none());
+        for l in fill {
+            s.release(l.offset).unwrap();
+        }
+    }
+
     /// The pool logic without a driver: a control lease, a read through the
     /// region, a release, and an account that closes to nothing.
     #[test]

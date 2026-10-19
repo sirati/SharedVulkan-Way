@@ -194,6 +194,20 @@ impl LargeSection {
         Ok(LargeSection { handle, len })
     }
 
+    /// A section handle another process duplicated into this one.
+    ///
+    /// # Safety
+    /// `handle` must be a section handle this process owns and no one else
+    /// will close.
+    pub unsafe fn from_raw_handle(handle: isize, len: u64) -> LargeSection {
+        LargeSection { handle, len }
+    }
+
+    /// The handle, for `DuplicateHandle`.
+    pub fn raw_handle(&self) -> isize {
+        self.handle
+    }
+
     pub fn len(&self) -> u64 {
         self.len
     }

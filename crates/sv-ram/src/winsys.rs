@@ -137,3 +137,76 @@ pub fn kill(pid: u32) -> std::io::Result<()> {
     unsafe { CloseHandle(h) };
     if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetNamedPipeClientProcessId(pipe: isize, pid: *mut u32) -> i32;
+    fn DuplicateHandle(src_proc: isize, src: isize, dst_proc: isize, dst: *mut isize, access: u32, inherit: i32, options: u32) -> i32;
+    fn GetCurrentProcess() -> isize;
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn OpenProcessToken(p: isize, access: u32, tok: *mut isize) -> i32;
+    fn GetTokenInformation(tok: isize, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
+}
+
+/// The process at the other end of a pipe this process serves.
+pub fn pipe_client_pid(pipe: &std::fs::File) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut pid = 0u32;
+    if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle() as isize, &mut pid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pid)
+}
+
+/// The user SID of process `pid`, as a string (`S-1-5-21-…`).
+pub fn process_sid(pid: u32) -> std::io::Result<String> {
+    // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000, TOKEN_QUERY = 8, TokenUser = 1
+    let p = unsafe { OpenProcess(0x1000, 0, pid) };
+    if p == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut tok = 0isize;
+    let ok = unsafe { OpenProcessToken(p, 8, &mut tok) };
+    unsafe { CloseHandle(p) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u64; 64];
+    let mut ret = 0u32;
+    let ok = unsafe { GetTokenInformation(tok, 1, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut ret) };
+    unsafe { CloseHandle(tok) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // TOKEN_USER { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }
+    let sid = buf[0] as *mut c_void;
+    let mut s: *mut u16 = core::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut s) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut n = 0;
+    while unsafe { *s.add(n) } != 0 {
+        n += 1;
+    }
+    let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n) });
+    unsafe { LocalFree(s.cast()) };
+    Ok(out)
+}
+
+/// Duplicate `handle` (of this process) into process `pid`, with the same
+/// access; returns the handle's value in that process. Nothing else can open
+/// an unnamed section, so this is the only way into it.
+pub fn duplicate_into(pid: u32, handle: isize) -> std::io::Result<isize> {
+    // PROCESS_DUP_HANDLE = 0x40, DUPLICATE_SAME_ACCESS = 2
+    let p = unsafe { OpenProcess(0x40, 0, pid) };
+    if p == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut out = 0isize;
+    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), handle, p, &mut out, 0, 0, 2) };
+    unsafe { CloseHandle(p) };
+    if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(out) }
+}
