@@ -1,6 +1,6 @@
 # Handover: branch `windows-guest-ram` (§108, R43)
 
-State at commit d736475 (master f0b85c3 and `broker` 1f48b47 merged in).
+State at commit 73133db (master f0b85c3 and `broker` 1f48b47 merged in).
 Do NOT merge into master: the whole-RAM-file stand-in (`.ram` run lists +
 lease files that name QEMU's memfd path) must not be deployable.
 
@@ -46,11 +46,11 @@ lease files that name QEMU's memfd path) must not be deployable.
    (DuplicateHandle from the holder's process), and respawns it if it dies.
    Remaining risk: keeper + holder + providers all killed. In the wc-broker
    world this is the Windows service's region backend.
-3. Allocation tails (up to 3.1 s for 2 GiB): lower `max_step` (e.g. 256 MiB)
-   and raise the low-water floor so growth happens ahead on the tick thread;
-   instrument `PoolServer::take` to log how long a lease waited for a grow;
-   compare old vs new policy in sv-pool-grow-e2e (counts of waiting leases)
-   and on the test VM (alloc latency by size).
+3. Allocation tails: DONE in 73133db (256 MiB steps, 64 MiB low water,
+   every lease wakes the region manager; sv-pool-grow-e2e: leases that
+   waited for a grow 10 -> 2, total 31 -> 5.8 ms; §108.6). Not re-measured on
+   the Windows test VM (needs a Windows GPU process; the keeper latency by
+   size is already in §108.7).
 4. wc-broker integration (broker API at 1f48b47, merged):
    - Host: embed in the broker-host daemon (another agent builds it): a
      `sv_ram::brokered` module that runs the Peer loop and, per MAPPED region,
