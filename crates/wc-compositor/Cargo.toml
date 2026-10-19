@@ -91,6 +91,9 @@ awe-probe = { path = "../awe-probe" }
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  # §105: the session's sound is played here (waveOut), from its ring.
+  "Win32_Media",
+  "Win32_Media_Audio",
   # §88: the frame clock lays its grid on DWM's vblank when there is one.
   "Win32_Graphics_Dwm",
   "Win32_System_Performance",

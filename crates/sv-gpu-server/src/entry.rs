@@ -1899,7 +1899,9 @@ fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolSer
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     Ok(sv_gpu_server::pool_guest::PoolServe {
-        port: arg("--port").ok_or("--port is required")?.parse()?,
+        // Optional, and a debug mode when given: the cold path is the pool's
+        // mailboxes (sv_transport::poolcold).
+        port: arg("--port").map(|s| s.parse()).transpose()?,
         device: arg("--device").map_or(Ok(0), |s| s.parse())?,
         idle: std::time::Duration::from_secs(arg("--idle").map_or(Ok(30), |s| s.parse())?),
         max_sessions: arg("--sessions").map_or(Ok(8), |s| s.parse())?,
@@ -1910,8 +1912,8 @@ fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolSer
 /// device at `--ivshmem-slot` (waycompose-design.md §97).
 ///
 /// ```text
-/// sv-gpu-server guest --pool --port <tcp> --ivshmem-slot <pci slot> [--device N]
-///                     [--sessions N] [--idle SECS] [--bell PORT]
+/// sv-gpu-server guest --pool --ivshmem-slot <pci slot> [--device N]
+///                     [--sessions N] [--idle SECS] [--bell PORT] [--port <tcp>: debug only]
 /// ```
 #[cfg(windows)]
 fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1930,7 +1932,7 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
     eprintln!("[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, the pool's region 0", started.elapsed(), size >> 20);
     // SAFETY: the view lives until this function returns, which is never
-    // while a session runs: `serve_pool` returns only if the listener fails,
+    // while a session runs: `serve_pool` does not return while it serves,
     // and the process ends with it.
     let boot = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(view.ptr().cast_mut(), size as usize) });
     let r = sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"));
@@ -1945,8 +1947,8 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// (docs/design.md §5.4).
 ///
 /// ```text
-/// sv-gpu-server pool-guest --pool-file <path> --port <tcp> [--device N]
-///                          [--sessions N] [--idle SECS]
+/// sv-gpu-server pool-guest --pool-file <path> [--device N] [--bell socket:PATH]
+///                          [--sessions N] [--idle SECS] [--port <tcp>: debug only]
 /// ```
 #[cfg(target_os = "linux")]
 fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1961,5 +1963,5 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let len = f.metadata()?.len();
     let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
     eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);
-    Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, None)?)
+    Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"))?)
 }

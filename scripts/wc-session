@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # wc-session -- the VM host's half of the launcher. Stage 14.
 #
+# §105: NO GUEST REACHES THIS SCRIPT OVER SSH ANY MORE. The verbs below are run
+# by the host's session service (`wc-arena-host sessiond`, which starts a
+# session from the boot record the guest writes into shared memory, with
+# WC_LAUNCH_SERVICE=1) and by the proxy for each line on the session's control
+# ring (`wc_proxy::macsvc`). Both hand the words over in $SSH_ORIGINAL_COMMAND,
+# exactly as the forced command did, so the validation below is the same code
+# whichever way a request arrived. The forced-command key described next is
+# installed only for the opt-in debug transport (WC_LAUNCH_DEBUG_SSH_TRANSPORT=1).
+#
 # It is installed on the VM host at ~/wc-launch/wc-session and is the **forced
 # command** of the guest's key in ~/.ssh/authorized_keys:
 #
@@ -126,6 +135,10 @@ HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
 # (with the fd store they are meant to), and a session that trusted a stale
 # file had no GPU doorbell and sent its Wayland connections over ssh (§99.8).
 hub_up() {
+  # A harness that runs its own hub, outside systemd (scripts/wc-no-ssh.sh).
+  if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
+    [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
+  fi
   local sd="env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user"
   $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
@@ -509,7 +522,10 @@ audio_up() {
     # second session running at the same time (macOS runs one per application)
     # failed with "D-Bus name org.PulseAudio1 already taken" and had no sound.
     # The null sink and the monitor socket need no D-Bus at all.
-    echo 'unset DBUS_SESSION_BUS_ADDRESS'
+    # §105: and not unset but pointed nowhere: unset, libdbus falls back to
+    # $XDG_RUNTIME_DIR/bus, which a user unit has, and the second PulseAudio
+    # on that bus still lost the name (seen with another program's server).
+    echo 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/wc-no-bus'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     # §103.16: WC_LAUNCH_AUDIO_NULL_SINK=off leaves the null sink and its
     # monitor out: a sound ring's devices are then the session's only ones.
@@ -532,7 +548,7 @@ audio_up() {
   fi
   local NULLSINK=1
   [ "${WC_LAUNCH_AUDIO_NULL_SINK:-on}" = off ] && NULLSINK=""
-  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && { [ -z "$NULLSINK" ] || [ -S "$D/audio.sock" ]; } && break; sleep 0.05; done
+  for _ in $(seq 1 500); do [ -S "$D/xdg/pulse/native" ] && { [ -z "$NULLSINK" ] || [ -S "$D/audio.sock" ]; } && break; sleep 0.01; done
   if [ -S "$D/xdg/pulse/native" ] && [ -z "$NULLSINK" ]; then
     echo "pulse $D/xdg/pulse/native (no null sink: the sound ring's devices only)" >"$D/audio.state"
   elif [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
@@ -920,6 +936,14 @@ up)
       ROFF=$(od -A n -t u8 -j 64 -N 8 "$ARENA" | tr -d ' ')
       echo "rings" >"$D/transport"
       echo "transport rings: $RLEN bytes at $ROFF, doorbell $(wcbell_use)"
+    elif [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && [ "${RLEN:-0}" != 0 ]; then
+      # §105: started by the session service, so there is no ssh tunnel to
+      # fall back to. Rings with no doorbell are polled, said loudly; rings
+      # that do not exist fail the session, closed.
+      echo "rings-poll" >"$D/transport"
+      echo "transport rings, NO DOORBELL ($WHY): polled every millisecond"
+    elif [ "${WC_LAUNCH_SERVICE:-}" = 1 ]; then
+      die "no Wayland rings in $ARENA ($WHY) and no ssh to fall back to: refusing the session (§105)"
     else
       echo "ssh: $WHY" >"$D/transport"
       echo "transport SSH FALLBACK: $WHY"
@@ -1067,13 +1091,22 @@ proxy)
   # its journal is a record. It needs this user's manager to outlive logins
   # (`loginctl enable-linger`), and says so if it does not.
   if [ -f "$D/arena.run" ]; then
-    [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    # §105: started by the session service (WC_LAUNCH_SERVICE=1), the
+    # session has no ssh tunnel and so no upstream socket: every connection,
+    # both feeds, the control and the sound are ring slots.
+    SERVICE=0
+    [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && SERVICE=1
+    [ $SERVICE = 1 ] || [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    [ $SERVICE = 1 ] && audio_up "$D" "$ID"
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
     RUN=$(cat "$D/arena.run")
     {
       echo '#!/usr/bin/env bash'
       echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
+      # §105: this host's settings, for the wc-session the control ring runs
+      # (as §103.14 does): the unit does not inherit this process's environment.
+      [ $SERVICE = 1 ] && env | grep '^WC_LAUNCH_' | grep -v '^WC_LAUNCH_SERVICE=' | while IFS= read -r kv; do printf 'export %q\n' "$kv"; done
       # §88. A `WC_FRAME_TRACE=` line in gpu.env traces the proxy as well:
       # the frame timeline has a proxy half, and gpu.env is where a measured
       # run already says what the session's frame should record.
@@ -1088,10 +1121,24 @@ proxy)
       # tunnel's socket stays the upstream either way: the icon and clipboard
       # feeds use it, and so does a connection that cannot have a ring.
       RINGARGS=""
+      UPARGS=$(printf -- '--upstream %q' "$D/up.sock")
       [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
         && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
-        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
+      if [ $SERVICE = 1 ]; then
+        UPARGS=""
+        BELLUSE=poll
+        [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
+        RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
+        # §103.16 on Windows (§105): the sound ring, the guest's default output
+        # a pipe sink on the session's server, paced by the guest's credit.
+        PACTL=$(pulse_bin pactl 2>/dev/null)
+        case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+          pulse) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
+          system) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
+        esac
+      fi
+      printf 'exec %q %s --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$UPARGS" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
@@ -1099,21 +1146,28 @@ proxy)
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
-    for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
+    for _ in $(seq 1 1000); do [ -S "$D/wl-proxy" ] && break; sleep 0.01; done
     if [ ! -S "$D/wl-proxy" ]; then
       echo "wc-session: the proxy never bound its socket" >&2
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
-    audio_up "$D" "$ID"
-    echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem)"
+    [ $SERVICE = 1 ] || audio_up "$D" "$ID"
+    echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
     # §89: what the proxy made of the rings, in its own words. It attaches
     # them after it binds its socket, so the line is waited for briefly.
-    if [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
+    if [ $SERVICE = 1 ]; then
       T=""
-      for _ in $(seq 1 40); do
+      for _ in $(seq 1 200); do
+        T=$(grep -m1 -oE 'wayland rings: .*' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
+        sleep 0.01
+      done
+      echo "transport ${T:-the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
+    elif [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
+      T=""
+      for _ in $(seq 1 200); do
         T=$(grep -m1 -oE '(wayland rings: .*|SSH FALLBACK: .*)' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
-        sleep 0.05
+        sleep 0.01
       done
       echo "transport ${T:-SSH FALLBACK: the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
     else
@@ -1456,14 +1510,16 @@ down)
   ;;
 
 # --------------------------------------------------------------------- gpu ---
-# The forwarded GPU for one session (§86, §87). The guest's launcher has
-# started one GPU process on the GPU arena's ivshmem device and its tunnel has
-# put that process's port at $D/cold.sock. This starts `sv-hostd
-# ivshmem-serve` in a user unit, **as this user**: it opens $GPUREGION -- the
-# file QEMU backs the device's BAR with, 0660 root:wc-arena -- and serves every
-# ICD that connects to $D/icd.sock a session of its own, in a slot of the BAR it
-# checks before handing it over. With $BELL present it also holds the
-# doorbell's port and shares it with every ICD on $D/bell.sock. No root, no
+# The forwarded GPU for one session (§86, §87, §97). The guest's launcher has
+# started one GPU process on the GPU arena's ivshmem device, which keeps an
+# offer in the pool's mailboxes (the device's header granule). This starts
+# `sv-hostd ivshmem-serve --cold pool` in a user unit, **as this user**: it
+# opens $GPUREGION read-write -- the file QEMU backs the device's BAR with,
+# 0660 root:wc-arena -- and serves every ICD that connects to $D/icd.sock a
+# session of its own, claimed from a mailbox and checked before handing it
+# over; no socket reaches the guest. Its wakes go through the shared hub
+# (--cold-bell). Without the hub, with $BELL present, it holds the doorbell's
+# port itself and shares it with every ICD on $D/bell.sock. No root, no
 # broker, nothing that can read guest RAM: security-model.md R30.
 #
 # N is the guest's own cap on concurrent sessions and is only checked here.
@@ -1512,14 +1568,13 @@ gpu)
   fi
   [ -r "$GPUREGION" ] && [ -w "$GPUREGION" ] \
     || die "cannot open the GPU arena $GPUREGION as $(id -un) (is the VM's GPU ivshmem device configured, and this user in its group?)"
-  for _ in $(seq 1 100); do [ -S "$D/cold.sock" ] && break; sleep 0.05; done
-  [ -S "$D/cold.sock" ] || die "no cold socket $D/cold.sock: the guest's tunnel did not forward the GPU process"
   UNIT="wc-launch-gpu-$ID"
   BELLARGS=""
   rm -f "$D/bell.path"
   if hub_up; then
     # §99: the shared hub holds the port; this session's ICDs connect to it.
     printf '%s\n' "$HUBDIR/sv.sock" >"$D/bell.path"
+    BELLARGS=$(printf -- '--cold-bell %q' "$HUBDIR/sv.sock")
   elif [ -S "$BELL" ] && [ -w "$BELL" ]; then
     echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
@@ -1528,15 +1583,15 @@ gpu)
     echo '#!/usr/bin/env bash'
     echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
     printf 'rm -f %q %q\n' "$D/icd.sock" "$D/bell.sock"
-    printf 'exec %q ivshmem-serve --region %q --cold %q --socket %q %s >%q 2>&1\n' \
-      "$BIN/sv-hostd" "$GPUREGION" "$D/cold.sock" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
+    printf 'exec %q ivshmem-serve --region %q --cold pool --socket %q %s >%q 2>&1\n' \
+      "$BIN/sv-hostd" "$GPUREGION" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
   } >"$D/gpu.sh"
   chmod 755 "$D/gpu.sh"
   export XDG_RUNTIME_DIR="/run/user/$UID_"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
     || die "systemd-run --user could not start $UNIT"
-  for _ in $(seq 1 100); do [ -S "$D/icd.sock" ] && break; sleep 0.05; done
+  for _ in $(seq 1 500); do [ -S "$D/icd.sock" ] && break; sleep 0.01; done
   if [ ! -S "$D/icd.sock" ]; then
     echo "wc-session: sv-hostd ivshmem-serve never listened:" >&2
     tail -6 "$D/hostd.log" 2>/dev/null | sed 's/^/  /' >&2

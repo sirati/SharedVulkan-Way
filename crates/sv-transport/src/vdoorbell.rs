@@ -293,6 +293,7 @@ impl BellTarget for Control {
             true
         }
     }
+
 }
 
 /// Every live session's control region, for a process that serves several
@@ -356,6 +357,7 @@ impl BellTarget for ControlSet {
         }
         any
     }
+
 }
 
 /// The reader thread, owned.
@@ -1252,6 +1254,14 @@ mod tests {
         // released by a `wake` change rather than by its slice. A 2 s slice that
         // had expired would have taken 2 s; but the assertion does not need to
         // say that, because it can say the stronger thing directly.
+        // Since §103.15 the doorman rescans every lane when its port opens,
+        // and under load that rescan can be what releases a waiter that
+        // parked before the doorman thread ran; the byte is then counted a
+        // moment later. So the count is waited for, boundedly.
+        let t_count = Instant::now();
+        while doorman.woken() == 0 && t_count.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(doorman.woken() >= 1, "the doorman delivered no wakes at all");
         assert!(
             took < Duration::from_secs(5),
@@ -1442,5 +1452,60 @@ mod tests {
 
         assert_eq!(wake.stats(), (0, 0), "a byte was sent for a lane nobody was waiting on");
         drop(guest_end);
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::*;
+    use crate::control::{Control, Geometry, ProtocolIds};
+    use crate::region::SharedRegion;
+    use crate::wlbytes::{ByteChannel, Endpoint};
+    use std::time::{Duration, Instant};
+
+    /// §105: `rescan` wakes a reader parked on its lane with nothing
+    /// written, so a wake lost while the port was closed costs a look, not
+    /// the waiter's whole slice.
+    #[test]
+    fn rescan_wakes_every_parked_lane() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let control = Arc::new(Control::create(region, g, ProtocolIds::new(7, 1), 1).unwrap());
+        let host = ByteChannel::claim(&control, 7).unwrap();
+        let guest = ByteChannel::open(&control, host.slot(), Endpoint::Peer).unwrap();
+        let t = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let _ = guest.wait_readable(Duration::from_secs(20));
+            t0.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.is_finished() && Instant::now() < deadline {
+            control.rescan(&AtomicU64::new(0));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let took = t.join().unwrap();
+        assert!(took < Duration::from_secs(10), "the parked reader slept {took:?}: rescan() woke nothing");
+    }
+
+    /// §105: the hub's rescan byte is not a lane; the doorman turns it into
+    /// `rescan` (as it does the open itself), and rings the lane bytes around it.
+    #[test]
+    fn a_rescan_byte_reopens_and_lane_bytes_still_ring() {
+        struct T(AtomicU64, AtomicU64);
+        impl BellTarget for T {
+            fn ring_token(&self, _t: u8, _w: &AtomicU64) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            fn rescan(&self, _w: &AtomicU64) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let t = T(AtomicU64::new(0), AtomicU64::new(0));
+        let bytes: &[u8] = &[5, crate::park::RESCAN_TOKEN, 9];
+        let end = serve_port(bytes, &t, &AtomicBool::new(false), &AtomicU64::new(0));
+        assert_eq!(end, ServeEnd::Closed);
+        assert_eq!((t.0.load(Ordering::Relaxed), t.1.load(Ordering::Relaxed)), (2, 2), "the open and the token");
     }
 }

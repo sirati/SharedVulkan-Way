@@ -106,6 +106,8 @@ pub mod rings;
 /// §103.14: the macOS session's control and sound channels on the rings.
 #[cfg(unix)]
 pub mod macsvc;
+#[cfg(unix)]
+pub mod ctlfast;
 /// §103.16: the session side of the multi-stream sound ring.
 #[cfg(unix)]
 pub mod sound;
