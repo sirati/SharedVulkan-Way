@@ -102,7 +102,7 @@ pub fn create(memfd: BorrowedFd<'_>, runs: &[(u64, u64)], l: Limits) -> std::io:
                 *list.add(i) = CreateItem { memfd: memfd.as_raw_fd() as u32, pad: 0, offset: o, size: n };
             }
         }
-        let fd = unsafe { libc::ioctl(dev.as_raw_fd(), UDMABUF_CREATE_LIST, buf.as_ptr()) };
+        let fd = unsafe { libc::ioctl(dev.as_raw_fd(), UDMABUF_CREATE_LIST as _, buf.as_ptr()) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
