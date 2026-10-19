@@ -400,6 +400,15 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
+        // §106: host integration's path map and browser.
+        match hostint::parse_flag(&arg, &mut || it.next()) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("wc-compositor: {e}");
+                return Err(2);
+            }
+        }
         match arg.as_str() {
             "--once" => args.once = true,
             "--in-band" => args.in_band = true,
