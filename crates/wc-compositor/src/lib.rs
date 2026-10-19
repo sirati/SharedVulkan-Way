@@ -1892,11 +1892,10 @@ fn wayland_thread(
                 println!("wc-compositor: session {s} ended: {n} connection(s) closed");
                 session_svc::dropped(s);
             }
-            for (slot, stream, session) in rl.accept() {
+            for (slot, stream, session, feed) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
-                match display
-                    .handle()
-                    .insert_client(stream, Arc::new(ClientState::in_session(index, session)))
+                let data = if feed { ClientState::feed_in_session(index, session) } else { ClientState::in_session(index, session) };
+                match display.handle().insert_client(stream, Arc::new(data))
                 {
                     Ok(client) => {
                         // §79. **A ring slot is the proxy by construction**, so this
@@ -1914,9 +1913,10 @@ fn wayland_thread(
                         }
                         state.clients_seen += 1;
                         println!(
-                            "wc-compositor: client {index} accepted on ring slot {slot}{} \
+                            "wc-compositor: client {index} accepted on ring slot {slot}{}{} \
                              (no socket crossed the VM boundary, h in band)",
-                            if session == 0 { String::new() } else { format!(" of session {session}") }
+                            if session == 0 { String::new() } else { format!(" of session {session}") },
+                            if feed { ", a feed" } else { "" }
                         );
                         let _ = std::io::stdout().flush();
                         // §72. **The same two calls as the socket accept, and
@@ -2080,16 +2080,29 @@ fn wayland_thread(
             state.trace_commits = 0;
         }
 
-        let mut live = 0;
-        display
-            .handle()
-            .backend_handle()
-            .with_all_clients(|_| live += 1);
+        let mut ids = Vec::new();
+        display.handle().backend_handle().with_all_clients(|id| ids.push(id));
+        let live = ids.len() as u32;
+        // §107.10: the clients that keep a session up are the applications.
+        // A proxy's icon and clipboard feeds are clients to smithay and no
+        // reason to stay: one its proxy failed to close kept the wcns session
+        // of 2026-10-19 up for eight minutes past its linger, until `--stop`.
+        let apps = ids
+            .into_iter()
+            .filter(|id| {
+                display
+                    .handle()
+                    .backend_handle()
+                    .get_client_data(id.clone())
+                    .ok()
+                    .is_none_or(|d| d.downcast_ref::<ClientState>().is_none_or(|c| !c.feed))
+            })
+            .count();
         // STAGE 54. Carried out of the loop so the exit report can say whether
         // the windows still standing have clients behind them.
         live_at_exit = live;
 
-        if once && state.clients_seen > 0 && live == 0 {
+        if once && state.clients_seen > 0 && apps == 0 {
             println!(
                 "wc-compositor: --once and the last client has gone; {} toplevel(s), {} frame(s) presented",
                 state.toplevels, state.presents
@@ -2111,14 +2124,14 @@ fn wayland_thread(
 
         // §107: a shared compositor ends once its last session has, not when
         // one installation's last window closes.
-        if session_svc::multi() && live == 0 && session_svc::shared_compositor_idle() {
+        if session_svc::multi() && apps == 0 && session_svc::shared_compositor_idle() {
             println!("wc-compositor: no session has been up for the linger and no client is connected; ending");
             code = 0;
             break;
         }
         if let Some(w) = empty_watch.as_mut().filter(|_| !session_svc::multi())
             && w.tick(Instant::now(), state.live_toplevels(), state.toplevels > 0, state.clients_seen)
-            && live == 0
+            && apps == 0
         {
             println!(
                 "wc-compositor: the session's last window closed {} s ago, no client has \
@@ -2137,10 +2150,10 @@ fn wayland_thread(
         // live browser was a crash report with our name on it. Under
         // `--exit-when-empty` (the launcher's sessions) the deadline waits for
         // the clients to go; everything else keeps the hard deadline it had.
-        if Instant::now() > deadline && empty_watch.is_some() && live > 0 {
+        if Instant::now() > deadline && empty_watch.is_some() && apps > 0 {
             if !deadline_deferred {
                 println!(
-                    "wc-compositor: the session deadline has passed with {live} client(s) \
+                    "wc-compositor: the session deadline has passed with {apps} client(s) \
                      connected; it ends when they have gone"
                 );
                 deadline_deferred = true;

@@ -303,6 +303,24 @@ wait_line "$D/comp-4.log" 'installation wcmc\) ENDED' 15
 wait_line "$D/comp-4.log" 'session [0-9]'"'"'s [0-9]* region' 10
 ok "after down: $(grep -c 'back in the pool' "$D/comp-4.log") session(s) returned their regions; $(grep -o 'back in the pool ([0-9]* MiB free' "$D/comp-4.log" | tail -1)"
 
+if [ -n "$INFO" ]; then
+  say "leg 8 (§107.10): short-lived clients and their feeds; the session ends by its linger, nothing left connected"
+  sleep $((LINGER + 1))
+  kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+  kill "$PORT" 2>/dev/null; start_port
+  start_compositor 5
+  R=$(boot l wcma "$D/guest-wcma.key"); case "$R" in ok\ located*) IDX_L=$(echo "$R" | awk '{print $3}') ;; *) bad "linger boot: $R" ;; esac
+  # wayland-info connects, reads the globals and leaves at once: the race
+  # that left a feed behind, with whatever the compositor had sent it unread.
+  for i in 1 2 3 4 5; do request l "raw run info 96 30" >/dev/null; sleep 0.3; done
+  wait_line "$D/comp-5.log" "accepted on ring slot [0-9]* of session ${IDX_L:-x}, a feed" 15 && ok "feeds are known as feeds: $(grep -c "of session ${IDX_L:-x}, a feed" "$D/comp-5.log") of $(grep -c "of session ${IDX_L:-x}" "$D/comp-5.log") connections" || bad "no feed was marked as one"
+  T0=$(date +%s%N)
+  wait_line "$D/comp-5.log" "index ${IDX_L:-x}, installation wcma\) ENDED.*last client left" $((LINGER + 20)) \
+    && ok "session ${IDX_L:-x} ended by its linger $(ms "$T0") ms after the last run: $(grep -m1 -o "index ${IDX_L:-x}, installation wcma) ENDED.*" "$D/comp-5.log" | cut -c1-100)" \
+    || bad "session ${IDX_L:-x} did not end by its linger ($(sessions))"
+  grep -q 'outlived it; closed' "$D/comp-5.log" && ok "a feed the proxy left behind was closed: $(grep -m1 -o 'ring slot [0-9]*: a feed.*' "$D/comp-5.log")"
+fi
+
 if [ -n "${WC_MULTI_EVIDENCE:-}" ]; then mkdir -p "$WC_MULTI_EVIDENCE" && cp "$D"/*.log "$WC_MULTI_EVIDENCE"/ 2>/dev/null; fi
 echo "logs: $D"
 [ "$FAIL" = 0 ] && { echo "wc-multi-install: OK"; rm -rf "$D"; exit 0; }
