@@ -449,13 +449,14 @@ mod imp {
                 say(&format!("hold {hold_ms} ms: the server inserted {inserted} bytes of silence into the signal"));
             }
             // The application waits for the credit: pacat takes about the hold
-            // longer than with no hold at all.
+            // longer than with no hold at all. The upper bound only catches a
+            // stall: under PulseAudio the baseline itself varies by ~150 ms.
             match baseline {
                 None => baseline = Some(took),
                 Some(b) => {
                     let extra = took.saturating_sub(b);
                     check(
-                        extra >= Duration::from_millis(hold_ms * 8 / 10) && extra <= Duration::from_millis(hold_ms + 300),
+                        extra >= Duration::from_millis(hold_ms * 8 / 10) && extra <= Duration::from_millis(hold_ms + 500),
                         &format!("hold {hold_ms} ms: the application waited instead of dropping: pacat took {} ms, {} ms more than with no hold", took.as_millis(), extra.as_millis()),
                     );
                 }
