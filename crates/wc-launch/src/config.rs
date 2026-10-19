@@ -46,6 +46,103 @@ pub struct App {
     pub app_id: String,
 }
 
+/// §105. `[hostint]`: how a file on this machine reaches Linux, and which
+/// browser opens Linux's links here. The same keys on both hosts, checked
+/// by the host's rules ([`HostInt::check_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInt {
+    /// The folder both machines see: (this side, the VM host's side).
+    /// Windows: `Z:\` and `/srv/winshare` by default, the VM's virtio-fs
+    /// share. macOS: none unless configured.
+    pub share: (String, String),
+    /// Where a file from outside the share is copied before Linux opens
+    /// it, inside the share: (this side, the VM host's side).
+    pub drop: (String, String),
+    /// Windows: an executable to open links from Linux with; empty is the
+    /// user's default browser. macOS: an application name as `open -a`
+    /// takes it, "Firefox" by default.
+    pub browser: String,
+}
+
+impl Default for HostInt {
+    fn default() -> Self {
+        HostInt::for_platform(!cfg!(target_os = "macos"))
+    }
+}
+
+impl HostInt {
+    /// The defaults of a Windows host (`windows`) or a macOS one.
+    pub fn for_platform(windows: bool) -> Self {
+        if windows {
+            HostInt {
+                share: (r"Z:\".into(), "/srv/winshare".into()),
+                drop: (r"Z:\waycompose-open".into(), "/srv/winshare/waycompose-open".into()),
+                browser: String::new(),
+            }
+        } else {
+            HostInt { share: Default::default(), drop: Default::default(), browser: "Firefox".into() }
+        }
+    }
+
+    /// As `wc_hostint`'s path map. No share configured is no share.
+    pub fn path_map(&self) -> wc_hostint::wire::PathMap {
+        let set = |p: &(String, String)| !p.0.is_empty() && !p.1.is_empty();
+        wc_hostint::wire::PathMap {
+            shares: if set(&self.share) { vec![self.share.clone()] } else { vec![] },
+            drop: set(&self.drop).then(|| self.drop.clone()),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        self.check_for(!cfg!(target_os = "macos"))
+    }
+
+    /// Check by a Windows host's rules (`windows`) or a macOS host's.
+    pub fn check_for(&self, windows: bool) -> Result<(), String> {
+        let host_path = |s: &str| {
+            if windows {
+                let b = s.as_bytes();
+                b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && !s.split('\\').any(|c| c == "..")
+            } else {
+                s.starts_with('/') && !s.split('/').any(|c| c == "..")
+            }
+        };
+        let linux = |s: &str| s.starts_with('/') && !s.split('/').any(|c| c == "..");
+        let what = if windows { "a drive path (X:\\...)" } else { "an absolute path" };
+        let share_set = !self.share.0.is_empty() || !self.share.1.is_empty();
+        if share_set && (!host_path(&self.share.0) || !linux(&self.share.1)) {
+            return Err(format!("[hostint] share-host must be {what} and share-linux an absolute path"));
+        }
+        if !self.drop.0.is_empty() || !self.drop.1.is_empty() {
+            let hsep = if windows { '\\' } else { '/' };
+            let inside = |p: &str, root: &str, sep: char| {
+                let r = root.trim_end_matches(sep);
+                if windows && sep == '\\' {
+                    p.to_ascii_lowercase().starts_with(&format!("{}{sep}", r.to_ascii_lowercase()))
+                } else {
+                    p.starts_with(&format!("{r}{sep}"))
+                }
+            };
+            if !share_set
+                || !host_path(&self.drop.0)
+                || !linux(&self.drop.1)
+                || !inside(&self.drop.0, &self.share.0, hsep)
+                || !inside(&self.drop.1, &self.share.1, '/')
+            {
+                return Err("[hostint] drop-host and drop-linux must be directories inside the share".into());
+            }
+        }
+        if windows {
+            if !self.browser.is_empty() && !self.browser.to_ascii_lowercase().ends_with(".exe") {
+                return Err("[hostint] browser must be an .exe".into());
+            }
+        } else if self.browser.is_empty() || self.browser.contains('/') || self.browser.chars().any(char::is_control) {
+            return Err("[hostint] browser must be an application's name, as `open -a` takes it".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// ssh target of the VM host, over the host-only virtio-net link.
@@ -145,6 +242,9 @@ pub struct Config {
     /// with: GTK uses `wp_viewporter` whenever it is offered, and that path has
     /// not been through §95's desktop checks.
     pub nested_globals: bool,
+    /// §105. Host integration: the shared folder and its drop directory,
+    /// and the browser for links from Linux. `[hostint]`.
+    pub hostint: HostInt,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -174,6 +274,7 @@ impl Default for Config {
             gpu_bell: "org.sirati.svbell.0".into(),
             wayland_bell: "org.sirati.wcbell.0".into(),
             nested_globals: false,
+            hostint: HostInt::default(),
             apps: BTreeMap::new(),
         }
     }
@@ -306,6 +407,12 @@ impl Config {
                         .filter(|v| *v <= 100)
                         .ok_or_else(|| format!("line {}: audio-volume is 0..=100", n + 1))?
                 }
+                ("hostint", "share-host") => cfg.hostint.share.0 = v.into(),
+                ("hostint", "share-linux") => cfg.hostint.share.1 = v.into(),
+                ("hostint", "drop-host") => cfg.hostint.drop.0 = v.into(),
+                ("hostint", "drop-linux") => cfg.hostint.drop.1 = v.into(),
+                ("hostint", "browser") => cfg.hostint.browser = v.into(),
+                ("hostint", other) => return Err(format!("line {}: [hostint] has no {other}", n + 1)),
                 ("session", other) => {
                     return Err(format!("line {}: [session] has no {other}", n + 1));
                 }
@@ -336,6 +443,7 @@ impl Config {
                 return Err(format!("[session] {what} is required"));
             }
         }
+        self.hostint.check()?;
         if self.arena_mib == 0 {
             return Err("[session] arena-mib must not be zero".into());
         }
@@ -430,6 +538,17 @@ audio        = on
 audio-volume = 100
 # The loopback port the tunnel forwards to it; default port + 1.
 # audio-port = 57432
+
+# Host integration (§105). A file opened here with a Linux application is
+# sent by its path in the shared folder; one from elsewhere is copied into the
+# drop directory first. Links from Linux open in the default browser unless
+# `browser` names one. The defaults:
+# [hostint]
+# share-host  = Z:\
+# share-linux = /srv/winshare
+# drop-host   = Z:\waycompose-open
+# drop-linux  = /srv/winshare/waycompose-open
+# browser     = C:\Program Files\<browser>\<browser>.exe
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
@@ -625,5 +744,50 @@ mod gpu_tests {
         assert!(p("nested-compositor-globals = on\n").unwrap().nested_globals);
         assert!(!p("nested-compositor-globals = off\n").unwrap().nested_globals);
         assert!(p("nested-compositor-globals = yes\n").is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn hostint_paths_default_to_the_share_and_are_checked() {
+        let ok = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}")).expect("should parse");
+        let c = ok("");
+        let m = c.hostint.path_map();
+        assert_eq!(m.shares, [(r"Z:\".to_string(), "/srv/winshare".to_string())]);
+        assert_eq!(m.drop.as_ref().map(|d| d.0.as_str()), Some(r"Z:\waycompose-open"));
+        let c = ok("[hostint]\nshare-host = Y:\\\nshare-linux = /srv/s\ndrop-host = Y:\\in\ndrop-linux = /srv/s/in\nbrowser = C:\\b\\b.exe\n");
+        assert_eq!(c.hostint.share.0, "Y:\\");
+        assert_eq!(c.hostint.browser, "C:\\b\\b.exe");
+        let bad = |extra: &str| {
+            Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[hostint]\n{extra}")).is_err()
+        };
+        assert!(bad("drop-host = C:\\elsewhere\n"), "the drop directory is inside the share");
+        assert!(bad("share-linux = srv\n"));
+        assert!(bad("browser = C:\\x\\b.bat\n"));
+        assert!(bad("colour = red\n"));
+    }
+
+    /// The macOS rules, checked here too: POSIX paths, an application name.
+    #[test]
+    fn hostint_on_a_mac_host() {
+        let d = HostInt::for_platform(false);
+        assert_eq!(d.check_for(false), Ok(()));
+        assert!(d.path_map().shares.is_empty(), "no share unless configured");
+        assert_eq!(d.browser, "Firefox");
+        let h = |s: (&str, &str), dr: (&str, &str), b: &str| HostInt {
+            share: (s.0.into(), s.1.into()),
+            drop: (dr.0.into(), dr.1.into()),
+            browser: b.into(),
+        };
+        let good = h(("/Users/u", "/Users/u"), ("/Users/u/.wc-open", "/Users/u/.wc-open"), "Safari");
+        assert_eq!(good.check_for(false), Ok(()));
+        assert_eq!(good.path_map().shares.len(), 1);
+        assert!(good.check_for(true).is_err(), "not a Windows configuration");
+        assert!(h(("/Users/u", "/Users/u"), ("/tmp/x", "/Users/u/x"), "Firefox").check_for(false).is_err());
+        assert!(h(("/Users/u/../v", "/Users/u"), ("", ""), "Firefox").check_for(false).is_err());
+        assert!(h(("", ""), ("", ""), "/Applications/Firefox.app").check_for(false).is_err());
+        assert!(h(("", ""), ("", ""), "").check_for(false).is_err());
+        assert!(h(("", ""), ("/a/b", "/a/b"), "Firefox").check_for(false).is_err(), "a drop needs a share");
+        // And the Windows defaults pass the Windows rules.
+        assert_eq!(HostInt::for_platform(true).check_for(true), Ok(()));
     }
 }
