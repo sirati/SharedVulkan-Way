@@ -139,6 +139,12 @@ mod unix_client {
             self.region(&Request::Open { id })
         }
 
+        /// A lease on the live region of `pool` (a published place such as
+        /// `gpu.<k>`), and its fds.
+        pub fn find(&mut self, pool: &str) -> io::Result<(RegionReply, Vec<OwnedFd>)> {
+            self.region(&Request::Find { pool: pool.into() })
+        }
+
         pub fn close(&mut self, id: u64) -> io::Result<()> {
             self.call(&Request::Close { id }).map(|_| ())
         }
