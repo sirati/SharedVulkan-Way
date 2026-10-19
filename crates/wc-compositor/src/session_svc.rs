@@ -218,7 +218,6 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
 /// host waking from its park and answering takes 0.1–1.5 ms on an idle
 /// guest, and an answer seen here needs no doorbell back (§105.14). A
 /// yielding wait, and only while a request is outstanding.
-
 /// `WC_CTL_SPIN_US` overrides it, for measuring (§105.14).
 fn spin() -> Duration {
     static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
