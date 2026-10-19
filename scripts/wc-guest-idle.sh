@@ -21,13 +21,21 @@
 #   exit 2  in use: "active N s ago", or "in use: TeamViewer remote control ..."
 #   exit 1  unknown: no sentinel (or an old one), or its heartbeat is stale.
 #           Counts as NOT idle.
+#
+# A sentinel that is not running (no file, or a heartbeat over 15 s old) is
+# started once through its scheduled task (`schtasks /Run`: no window, no
+# input), and the file is read again. Something outside can end it: on
+# 2026-10-19 an Office update's Restart Manager did. Still stale after that:
+# unknown, as before. GUEST_IDLE_NO_RESTART=1 skips the restart.
 . "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -u
 LIMIT=${GUEST_IDLE_SECS:-120}
 LOG=${GUEST_INJECT_LOG:-/tmp/wcrun/qmp-inject.log}
 G="ssh -o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR $SITE_GUEST"
-t0=$(date +%s%3N)
 # GUEST_ACTIVITY_TEXT: the sentinel's file and a `guest_now` line, for testing.
+# GUEST_ACTIVITY_TEXT_AFTER: what the second read returns after a restart.
+fetch() {
+t0=$(date +%s%3N)
 if [ -n "${GUEST_ACTIVITY_TEXT:-}" ]; then out=$GUEST_ACTIVITY_TEXT
 else out=$($G 'W=/c/Users/'"$SITE_GUEST_USER"'/AppData/Local/waycompose; cat $W/activity.txt 2>/dev/null
   tail -n 200 $W/inject.log 2>/dev/null | sed "s/^/inj /"
@@ -39,7 +47,23 @@ else out=$($G 'W=/c/Users/'"$SITE_GUEST_USER"'/AppData/Local/waycompose; cat $W/
   fi
   echo "guest_now $(date +%s%3N)"' 2>/dev/null | tr -d '\r'); fi
 t1=$(date +%s%3N)
+}
+fetch
 [ -n "$out" ] || { echo "unknown: cannot reach the guest"; exit 1; }
+# Not running: start its task once, then read again.
+hb0=$(awk '$1=="heartbeat_wall_ms"{print $2}' <<<"$out")
+now0=$(awk '$1=="guest_now"{print $2}' <<<"$out")
+if [ "${GUEST_IDLE_NO_RESTART:-0}" != 1 ] && [ -n "$now0" ] && { [ -z "$hb0" ] || [ $(( now0 - hb0 )) -gt 15000 ]; }; then
+  if [ -n "${GUEST_ACTIVITY_TEXT:-}" ]; then
+    GUEST_ACTIVITY_TEXT=${GUEST_ACTIVITY_TEXT_AFTER:-$GUEST_ACTIVITY_TEXT}
+  else
+    $G 'MSYS2_ARG_CONV_EXCL="*" schtasks /Run /TN wc-activity' >/dev/null 2>&1
+    sleep 4
+  fi
+  echo "wc-activity was not running; started its task once" >&2
+  fetch
+  [ -n "$out" ] || { echo "unknown: cannot reach the guest"; exit 1; }
+fi
 now=$(awk '$1=="guest_now"{print $2}' <<<"$out")
 hb=$(awk '$1=="heartbeat_wall_ms"{print $2}' <<<"$out")
 hooks=$(awk '$1=="hooks"{print $2}' <<<"$out")

@@ -159,6 +159,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show) {
     CreateDirectoryW(dir, NULL);
     swprintf(path, MAX_PATH, L"%ls\\activity.txt", dir);
     swprintf(tmp, MAX_PATH, L"%ls\\activity.txt.tmp", dir);
+    /* An installer's Restart Manager may end this process (an Office update did,
+     * 2026-10-19, and nothing started it again). Registered, it is restarted when
+     * the installer is done; a reboot is the logon trigger's job. */
+    RegisterApplicationRestart(L"", RESTART_NO_REBOOT);
     InitializeCriticalSection(&cs);
     started_wall = wall_ms();
     install_hooks();

@@ -205,8 +205,8 @@ OLD_B=$(grep -o "arena: session $IDX_B granted region [^:]*: [0-9]* MiB at [0-9]
 P=$(proxy_pid "wcmb-$$-b")
 CLIENTS_BEFORE=$(grep -c 'disconnected' "$D/comp-1.log")
 T0=$(date +%s%N)
-# MainPID is 0 for a unit that is not there, and `kill -9 0` is this whole
-# process group: the harness itself and whatever started it.
+# A unit that is not there shows MainPID 0, and `kill -9 0` is this script's
+# whole process group: the harness and whatever started it.
 [ "${P:-0}" -gt 0 ] && kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
 wait_line "$D/comp-1.log" "index $IDX_B, installation wcmb\) ENDED" 20 && ok "compositor ended session $IDX_B in $(ms "$T0") ms: $(grep -m1 -o "index $IDX_B, installation wcmb) ENDED.*" "$D/comp-1.log" | cut -c1-90)" || bad "session $IDX_B was never ended"
 wait_line "$D/comp-1.log" "arena: session $IDX_B's [0-9]* region" 10 && ok "$(grep -m1 -o "arena: session $IDX_B's.*" "$D/comp-1.log")" || bad "its regions did not come back"
