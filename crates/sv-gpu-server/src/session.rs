@@ -537,6 +537,20 @@ fn protocol_command(
             .map_err(err)?;
             Ok(0)
         }
+        // §104: a refusal is a reply, as a refused lease is; the app side turns
+        // it into the `VkResult` of the `vkAllocateMemory` that asked.
+        Some(sv_proto::sv::SV_ALLOC_SHARED) => {
+            let d = sv_proto::sv::AllocShared::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            crate::shared::serve_alloc(&shared, d).encode(reply).map_err(err)?;
+            Ok(0)
+        }
+        Some(sv_proto::sv::SV_IMPORT_SHARED) => {
+            let d = sv_proto::sv::ImportShared::decode(payload).map_err(err)?;
+            let shared = Arc::clone(&srv.host().shared);
+            crate::shared::serve_import(&shared, d).encode(reply).map_err(err)?;
+            Ok(0)
+        }
         Some(other) => Err(format!("unknown protocol command {other:#x}")),
         None => Err("a packet too short to carry an opcode".to_string()),
     }

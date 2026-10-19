@@ -929,6 +929,7 @@ dependencies = [
  "awe-probe",
  "libc",
  "sv-arena",
+ "sv-drm",
  "sv-gpu-entry",
  "sv-hostd",
  "sv-icd",
@@ -963,6 +964,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sv-arena",
+ "sv-drm",
  "sv-icd-entry",
  "sv-proto",
  "sv-transport",

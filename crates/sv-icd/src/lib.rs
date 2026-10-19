@@ -37,6 +37,7 @@
 
 pub mod advertise;
 pub mod arena;
+pub mod dmabuf;
 pub mod icd;
 pub mod present;
 pub mod state;
@@ -52,8 +53,8 @@ pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
 }
 
-/// See `sv_gpu_server::WIRE_VERSION`, which says why this is 3.
-pub const WIRE_VERSION: u32 = 3;
+/// See `sv_gpu_server::WIRE_VERSION`, which says why this is 4.
+pub const WIRE_VERSION: u32 = 4;
 
 /// The environment variable that points at a GPU side.
 ///
@@ -247,6 +248,9 @@ pub unsafe extern "system" fn vk_icdGetPhysicalDeviceProcAddr(
     }
     // SAFETY: the loader passes a NUL-terminated string.
     let name = unsafe { sv_icd_entry::proc_name(p_name) }?;
+    if let Some(p) = dmabuf::proc_override(name) {
+        return sv_icd_entry::as_pfn(Some(p));
+    }
     sv_icd_entry::as_pfn(sv_icd_entry::lookup(sv_icd_entry::PHYSICAL_DEVICE_COMMANDS, name))
 }
 
