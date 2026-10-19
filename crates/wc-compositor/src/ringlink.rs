@@ -57,6 +57,8 @@ struct Link {
     /// Which directory slot this is: the number both ends use for it, and
     /// since §89 what `RingLink::reap` checks before giving a slot back.
     slot: u32,
+    /// §107: the session the proxy that claimed it said it is (0: none).
+    session: u8,
     channel: ByteChannel,
     /// Our end of the pair. smithay holds the other.
     local: wc_transport::Stream,
@@ -296,6 +298,8 @@ impl RingLink {
             if self.control.ring_state(slot).ok() != Some(RingState::Dead)
                 || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
                 || self.links.iter().any(|l| l.slot == slot)
+                || quarantined(slot)
+                || !crate::session_svc::may_recycle(self.control.ring_owner(slot).unwrap_or(0))
             {
                 continue;
             }
@@ -313,7 +317,7 @@ impl RingLink {
     /// ever accepted once; `seen` is not pruned, because a `Dead` slot is never
     /// reused within a generation (`Control::kill_ring`'s own rule) and so a
     /// slot number cannot come back meaning something else.
-    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream)> {
+    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream, u8)> {
         let live = match ByteChannel::live_connections(&self.control) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
@@ -325,7 +329,29 @@ impl RingLink {
             }
             // §103.14: a session service's channel (control, sound) is not a
             // client; the launcher opens it.
-            if self.control.ring_owner(slot).is_ok_and(sv_transport::wlbytes::is_service) {
+            let owner = self.control.ring_owner(slot).unwrap_or(0);
+            if sv_transport::wlbytes::is_service(owner) {
+                continue;
+            }
+            // §107: a claim of a session this compositor does not serve (one
+            // that has ended, or never booted) is not a client: closed, so its
+            // proxy sees the end, and its slot comes back after a quarantine.
+            let session = sv_transport::wlbytes::session_of(owner);
+            if !crate::session_svc::accepts(session) {
+                println!("wc-compositor: ring slot {slot} claimed for session {session}, which is not being served; closed");
+                let _ = self.control.kill_ring(slot);
+                quarantine(slot);
+                continue;
+            }
+            // §107: one session's connections may not take the slots every
+            // other installation needs; a proxy past its share is refused a
+            // connection, never given another session's.
+            if session != 0 && self.links.iter().filter(|l| l.session == session && !l.dead).count() >= SLOTS_PER_SESSION {
+                println!(
+                    "wc-compositor: ring slot {slot}: session {session} already has {SLOTS_PER_SESSION} connections; refused"
+                );
+                let _ = self.control.kill_ring(slot);
+                quarantine(slot);
                 continue;
             }
             let Ok(channel) = ByteChannel::open(&self.control, slot, Endpoint::Peer) else {
@@ -338,6 +364,7 @@ impl RingLink {
             self.seen.push(slot);
             self.links.push(Link {
                 slot,
+                session,
                 channel,
                 local,
                 to_local: Vec::new(),
@@ -345,7 +372,7 @@ impl RingLink {
                 ring_eof: false,
                 dead: false,
             });
-            out.push((slot, theirs));
+            out.push((slot, theirs, session));
         }
         out
     }
@@ -362,6 +389,32 @@ impl RingLink {
             link.pump();
         }
         self.links.retain(|l| !l.dead);
+    }
+
+    /// §107: end every connection of `session`: its clients are disconnected
+    /// (smithay sees their sockets close, after what they had already sent),
+    /// and their slots are closed and quarantined so that a proxy still
+    /// running cannot write into a slot somebody else has claimed since.
+    /// Returns how many there were.
+    pub fn drop_session(&mut self, session: u8) -> usize {
+        let mut n = 0;
+        for link in self.links.iter_mut().filter(|l| l.session == session && !l.dead) {
+            let _ = self.control.kill_ring(link.slot);
+            quarantine(link.slot);
+            link.dead = true;
+            n += 1;
+        }
+        self.links.retain(|l| !l.dead);
+        n
+    }
+
+    /// §107: how many connections each session has now.
+    pub fn connections_by_session(&self) -> std::collections::HashMap<u8, usize> {
+        let mut m = std::collections::HashMap::new();
+        for l in self.links.iter().filter(|l| !l.dead) {
+            *m.entry(l.session).or_insert(0) += 1;
+        }
+        m
     }
 
 }
@@ -724,6 +777,11 @@ impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
 /// seconds of a user's click. A port another process holds is refused at once
 /// by the driver (one opener per port), which is the same answer.
 pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::PortHandle> {
+    // §105.4's spellings: `fd:R,W` is how a parent passes a port it opened
+    // (the macOS launcher in role (b), §103.17: the hypervisor's FIFO pair).
+    if ["fd:", "dev:", "socket:"].iter().any(|p| name.starts_with(p)) {
+        return sv_transport::vdoorbell::PortHandle::open(name);
+    }
     #[cfg(unix)]
     if name.contains('/') {
         return sv_transport::vdoorbell::PortHandle::host_socket(name);
@@ -755,7 +813,7 @@ pub fn over_ivshmem(id: u32, port: Option<sv_transport::vdoorbell::PortHandle>) 
     // arena registry keeps mapped for the life of the process, `len` bytes
     // long; nothing else in this process uses those bytes.
     let region = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base, len) });
-    let geometry = Geometry::for_wayland();
+    let geometry = ivshmem_geometry();
     let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
     let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
     control.stamp_epoch().map_err(|e| e.to_string())?;
@@ -870,5 +928,55 @@ mod platform_flag_tests {
         if !cfg!(windows) {
             let _ = std::fs::remove_file(&name);
         }
+    }
+}
+
+// ------------------------------------------- §107: slots of ended sessions ---
+
+/// How long a slot this side closed stays out of [`RingLink::reap`]: longer
+/// than a proxy's lease (five seconds without a ping end it), so a proxy that
+/// was still running when its session was ended has stopped before its slot
+/// can mean somebody else's connection.
+/// §107: the most connections one session of a shared compositor may hold:
+/// a little under half of the 63 slots, so that one installation's flood
+/// leaves room for the others. A Firefox session is twelve to fifteen.
+pub const SLOTS_PER_SESSION: usize = 28;
+
+pub const QUARANTINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+static QUARANTINED: std::sync::Mutex<Vec<(u32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Keep `slot` from being recycled for [`QUARANTINE`].
+pub fn quarantine(slot: u32) {
+    let mut q = QUARANTINED.lock().unwrap_or_else(|e| e.into_inner());
+    q.retain(|(s, _)| *s != slot);
+    q.push((slot, std::time::Instant::now() + QUARANTINE));
+}
+
+/// Whether `slot` is still in quarantine (expired entries are dropped).
+pub fn quarantined(slot: u32) -> bool {
+    let mut q = QUARANTINED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    q.retain(|(_, until)| *until > now);
+    q.iter().any(|(s, _)| *s == slot)
+}
+
+/// The ring region's geometry for the ivshmem tail: §107's 64 slots when this
+/// compositor serves several installations, §89's 32 otherwise.
+pub fn ivshmem_geometry() -> Geometry {
+    if crate::session_svc::multi() {
+        Geometry::for_wayland_shared()
+    } else {
+        Geometry::for_wayland()
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    #[test]
+    fn a_quarantined_slot_is_held_and_others_are_not() {
+        super::quarantine(61);
+        assert!(super::quarantined(61));
+        assert!(!super::quarantined(62));
     }
 }

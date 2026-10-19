@@ -51,6 +51,126 @@ pub struct App {
     pub single: bool,
 }
 
+/// §106. `[hostint]`: how a file on this machine reaches Linux, and which
+/// browser opens Linux's links here. The same keys on both hosts, checked
+/// by the host's rules ([`HostInt::check_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInt {
+    /// The folder both machines see: (this side, the VM host's side).
+    /// Windows: `Z:\` and `/srv/winshare` by default, the VM's virtio-fs
+    /// share. macOS: none unless configured.
+    pub share: (String, String),
+    /// Where a file from outside the share is copied before Linux opens
+    /// it, inside the share: (this side, the VM host's side).
+    pub drop: (String, String),
+    /// Windows: an executable to open links from Linux with; empty is the
+    /// user's default browser. macOS: an application name as `open -a`
+    /// takes it, "Firefox" by default.
+    pub browser: String,
+    /// Windows: fixed arguments for `browser`, before the URL, one argv
+    /// element each (`browser-arg`, repeated; at most [`MAX_BROWSER_ARGS`]).
+    /// macOS: none (`open -a` takes no arguments for the application).
+    pub browser_args: Vec<String>,
+}
+
+/// At most this many `browser-arg` lines.
+pub const MAX_BROWSER_ARGS: usize = 16;
+/// The longest `browser-arg`, in bytes.
+pub const MAX_BROWSER_ARG_LEN: usize = 1024;
+
+impl Default for HostInt {
+    fn default() -> Self {
+        HostInt::for_platform(!cfg!(target_os = "macos"))
+    }
+}
+
+impl HostInt {
+    /// The defaults of a Windows host (`windows`) or a macOS one.
+    pub fn for_platform(windows: bool) -> Self {
+        if windows {
+            HostInt {
+                share: (r"Z:\".into(), "/srv/winshare".into()),
+                drop: (r"Z:\waycompose-open".into(), "/srv/winshare/waycompose-open".into()),
+                browser: String::new(),
+                browser_args: Vec::new(),
+            }
+        } else {
+            HostInt { share: Default::default(), drop: Default::default(), browser: "Firefox".into(), browser_args: Vec::new() }
+        }
+    }
+
+    /// As `wc_hostint`'s path map. No share configured is no share.
+    pub fn path_map(&self) -> wc_hostint::wire::PathMap {
+        let set = |p: &(String, String)| !p.0.is_empty() && !p.1.is_empty();
+        wc_hostint::wire::PathMap {
+            shares: if set(&self.share) { vec![self.share.clone()] } else { vec![] },
+            drop: set(&self.drop).then(|| self.drop.clone()),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        self.check_for(!cfg!(target_os = "macos"))
+    }
+
+    /// Check by a Windows host's rules (`windows`) or a macOS host's.
+    pub fn check_for(&self, windows: bool) -> Result<(), String> {
+        let host_path = |s: &str| {
+            if windows {
+                let b = s.as_bytes();
+                b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && !s.split('\\').any(|c| c == "..")
+            } else {
+                s.starts_with('/') && !s.split('/').any(|c| c == "..")
+            }
+        };
+        let linux = |s: &str| s.starts_with('/') && !s.split('/').any(|c| c == "..");
+        let what = if windows { "a drive path (X:\\...)" } else { "an absolute path" };
+        let share_set = !self.share.0.is_empty() || !self.share.1.is_empty();
+        if share_set && (!host_path(&self.share.0) || !linux(&self.share.1)) {
+            return Err(format!("[hostint] share-host must be {what} and share-linux an absolute path"));
+        }
+        if !self.drop.0.is_empty() || !self.drop.1.is_empty() {
+            let hsep = if windows { '\\' } else { '/' };
+            let inside = |p: &str, root: &str, sep: char| {
+                let r = root.trim_end_matches(sep);
+                if windows && sep == '\\' {
+                    p.to_ascii_lowercase().starts_with(&format!("{}{sep}", r.to_ascii_lowercase()))
+                } else {
+                    p.starts_with(&format!("{r}{sep}"))
+                }
+            };
+            if !share_set
+                || !host_path(&self.drop.0)
+                || !linux(&self.drop.1)
+                || !inside(&self.drop.0, &self.share.0, hsep)
+                || !inside(&self.drop.1, &self.share.1, '/')
+            {
+                return Err("[hostint] drop-host and drop-linux must be directories inside the share".into());
+            }
+        }
+        if windows {
+            if !self.browser.is_empty() && !self.browser.to_ascii_lowercase().ends_with(".exe") {
+                return Err("[hostint] browser must be an .exe".into());
+            }
+            if !self.browser_args.is_empty() && self.browser.is_empty() {
+                return Err("[hostint] browser-arg needs a browser".into());
+            }
+            if self.browser_args.len() > MAX_BROWSER_ARGS {
+                return Err(format!("[hostint] at most {MAX_BROWSER_ARGS} browser-arg lines"));
+            }
+            if self.browser_args.iter().any(|a| a.is_empty() || a.len() > MAX_BROWSER_ARG_LEN || a.chars().any(char::is_control)) {
+                return Err(format!(
+                    "[hostint] a browser-arg must be 1..={MAX_BROWSER_ARG_LEN} bytes without control characters"
+                ));
+            }
+        } else if !self.browser_args.is_empty() {
+            return Err("[hostint] browser-arg is for a Windows host only: `open -a` takes no arguments".into());
+        } else if self.browser.is_empty() || self.browser.contains('/') || self.browser.chars().any(char::is_control) {
+            return Err("[hostint] browser must be an application's name, as `open -a` takes it".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// ssh target of the VM host, over the host-only virtio-net link.
@@ -148,6 +268,10 @@ pub struct Config {
     /// and they cross as shared memory; empty, or a VM without the port, and
     /// they cross the ssh tunnel as before, which the log says loudly.
     pub wayland_bell: String,
+    /// §103.17, macOS role (b): the shared arena file (a RAM-disk file the
+    /// Linux guest maps through virtio-fs DAX); empty is role (a), guest RAM.
+    /// `WC_MAC_ARENA_STANDIN` overrides it.
+    pub arena_file: String,
     /// §102. `nested-compositor-globals = on` asks the compositor for the three
     /// globals a nested compositor needs from its host —
     /// `wp_single_pixel_buffer_manager_v1`, `wp_viewporter` and `wp_presentation`
@@ -156,6 +280,9 @@ pub struct Config {
     /// with: GTK uses `wp_viewporter` whenever it is offered, and that path has
     /// not been through §95's desktop checks.
     pub nested_globals: bool,
+    /// §106. Host integration: the shared folder and its drop directory,
+    /// and the browser for links from Linux. `[hostint]`.
+    pub hostint: HostInt,
     /// §105. The installation's name, as the VM host's session service knows
     /// it (`~/.config/waycompose/installs/<name>`). Empty: the session name.
     pub installation: String,
@@ -167,6 +294,16 @@ pub struct Config {
     /// default and said in capitals on every step. `host`, `key`, `relay` and
     /// `port` are read only for it.
     pub debug_ssh_transport: bool,
+    /// §107. `shared-compositor = on` (the default): every installation of
+    /// this user is served by one compositor and one GPU process, so any
+    /// number of them run at once. `off` is §105's compositor per
+    /// installation, which the ivshmem driver lets run one at a time.
+    pub shared_compositor: bool,
+    /// §110. `one-pool = on` (the default): the shared compositor also runs
+    /// the GPU pool, in its own process, so Wayland buffers can lease from the
+    /// GPU device when the arena's BAR is full. `off`: the GPU pool is §107's
+    /// separate per-user process.
+    pub one_pool: bool,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -197,10 +334,14 @@ impl Default for Config {
             gpu_server: String::new(),
             gpu_icd: String::new(),
             wayland_bell: "org.sirati.wcbell.0".into(),
+            arena_file: String::new(),
             nested_globals: false,
+            hostint: HostInt::default(),
             installation: String::new(),
             session_key: String::new(),
             debug_ssh_transport: false,
+            shared_compositor: true,
+            one_pool: true,
             apps: BTreeMap::new(),
         }
     }
@@ -325,6 +466,7 @@ impl Config {
                 }
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
+                ("session", "arena-file") => cfg.arena_file = v.into(),
                 ("session", "installation") => cfg.installation = v.into(),
                 ("session", "session-key") => cfg.session_key = v.into(),
                 ("session", "debug-ssh-transport") => {
@@ -332,6 +474,20 @@ impl Config {
                         "on" => true,
                         "off" => false,
                         _ => return Err(format!("line {}: debug-ssh-transport is on or off, not {v}", n + 1)),
+                    }
+                }
+                ("session", "one-pool") => {
+                    cfg.one_pool = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: one-pool is on or off, not {v}", n + 1)),
+                    }
+                }
+                ("session", "shared-compositor") => {
+                    cfg.shared_compositor = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: shared-compositor is on or off, not {v}", n + 1)),
                     }
                 }
                 ("session", "nested-compositor-globals") => {
@@ -352,6 +508,14 @@ impl Config {
                         .filter(|v| *v <= 100)
                         .ok_or_else(|| format!("line {}: audio-volume is 0..=100", n + 1))?
                 }
+                ("hostint", "share-host") => cfg.hostint.share.0 = v.into(),
+                ("hostint", "share-linux") => cfg.hostint.share.1 = v.into(),
+                ("hostint", "drop-host") => cfg.hostint.drop.0 = v.into(),
+                ("hostint", "drop-linux") => cfg.hostint.drop.1 = v.into(),
+                ("hostint", "browser") => cfg.hostint.browser = v.into(),
+                // Repeated: one argv element per line, in order.
+                ("hostint", "browser-arg") => cfg.hostint.browser_args.push(v.into()),
+                ("hostint", other) => return Err(format!("line {}: [hostint] has no {other}", n + 1)),
                 ("session", other) => {
                     return Err(format!("line {}: [session] has no {other}", n + 1));
                 }
@@ -388,6 +552,7 @@ impl Config {
                 return Err(format!("[session] {what} is required"));
             }
         }
+        self.hostint.check()?;
         if !self.debug_ssh_transport && !cfg!(target_os = "macos") && self.wayland_bell.is_empty() {
             return Err("[session] wayland-bell is empty: since §105 every byte crosses on the Wayland rings, which need it (debug-ssh-transport = on is the only way without)".into());
         }
@@ -493,6 +658,18 @@ audio        = on
 audio-volume = 100
 # The loopback port the tunnel forwards to it; default port + 1.
 # audio-port = 57432
+
+# Host integration (§106). A file opened here with a Linux application is
+# sent by its path in the shared folder; one from elsewhere is copied into the
+# drop directory first. Links from Linux open in the default browser unless
+# `browser` names one. The defaults:
+# [hostint]
+# share-host  = Z:\
+# share-linux = /srv/winshare
+# drop-host   = Z:\waycompose-open
+# drop-linux  = /srv/winshare/waycompose-open
+# browser     = C:\Program Files\<browser>\<browser>.exe
+# browser-arg = --new-window      (repeatable: one argument per line, before the URL)
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
@@ -710,6 +887,8 @@ mod gpu_tests {
         assert!(p("wayland-bell =\n").unwrap_err().contains("wayland-bell"));
         assert_eq!(p("wayland-bell =\ndebug-ssh-transport = on\n").unwrap().wayland_bell, "");
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
+        assert_eq!(p("").unwrap().arena_file, "");
+        assert_eq!(p("arena-file = /Volumes/shm/arena\n").unwrap().arena_file, "/Volumes/shm/arena");
     }
 
     /// §102. The nested-compositor globals are off unless the ini asks.
@@ -717,9 +896,96 @@ mod gpu_tests {
     fn nested_compositor_globals_are_off_by_default() {
         let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
         assert!(!p("").unwrap().nested_globals);
+        assert!(p("").unwrap().shared_compositor, "§107: one compositor per user by default");
+        assert!(!p("shared-compositor = off\n").unwrap().shared_compositor);
+        assert!(p("shared-compositor = maybe\n").is_err());
+        assert!(p("").unwrap().one_pool, "§110: one pool by default");
+        assert!(!p("one-pool = off\n").unwrap().one_pool);
         assert!(p("nested-compositor-globals = on\n").unwrap().nested_globals);
         assert!(!p("nested-compositor-globals = off\n").unwrap().nested_globals);
         assert!(p("nested-compositor-globals = yes\n").is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn hostint_paths_default_to_the_share_and_are_checked() {
+        let ok = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}")).expect("should parse");
+        let c = ok("");
+        let m = c.hostint.path_map();
+        assert_eq!(m.shares, [(r"Z:\".to_string(), "/srv/winshare".to_string())]);
+        assert_eq!(m.drop.as_ref().map(|d| d.0.as_str()), Some(r"Z:\waycompose-open"));
+        let c = ok("[hostint]\nshare-host = Y:\\\nshare-linux = /srv/s\ndrop-host = Y:\\in\ndrop-linux = /srv/s/in\nbrowser = C:\\b\\b.exe\n");
+        assert_eq!(c.hostint.share.0, "Y:\\");
+        assert_eq!(c.hostint.browser, "C:\\b\\b.exe");
+        let bad = |extra: &str| {
+            Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[hostint]\n{extra}")).is_err()
+        };
+        assert!(bad("drop-host = C:\\elsewhere\n"), "the drop directory is inside the share");
+        assert!(bad("share-linux = srv\n"));
+        assert!(bad("browser = C:\\x\\b.bat\n"));
+        assert!(bad("colour = red\n"));
+    }
+
+    /// The macOS rules, checked here too: POSIX paths, an application name.
+    #[test]
+    fn hostint_on_a_mac_host() {
+        let d = HostInt::for_platform(false);
+        assert_eq!(d.check_for(false), Ok(()));
+        assert!(d.path_map().shares.is_empty(), "no share unless configured");
+        assert_eq!(d.browser, "Firefox");
+        let h = |s: (&str, &str), dr: (&str, &str), b: &str| HostInt {
+            share: (s.0.into(), s.1.into()),
+            drop: (dr.0.into(), dr.1.into()),
+            browser: b.into(),
+            browser_args: vec![],
+        };
+        let good = h(("/Users/u", "/Users/u"), ("/Users/u/.wc-open", "/Users/u/.wc-open"), "Safari");
+        assert_eq!(good.check_for(false), Ok(()));
+        assert_eq!(good.path_map().shares.len(), 1);
+        assert!(good.check_for(true).is_err(), "not a Windows configuration");
+        assert!(h(("/Users/u", "/Users/u"), ("/tmp/x", "/Users/u/x"), "Firefox").check_for(false).is_err());
+        assert!(h(("/Users/u/../v", "/Users/u"), ("", ""), "Firefox").check_for(false).is_err());
+        assert!(h(("", ""), ("", ""), "/Applications/Firefox.app").check_for(false).is_err());
+        assert!(h(("", ""), ("", ""), "").check_for(false).is_err());
+        assert!(h(("", ""), ("/a/b", "/a/b"), "Firefox").check_for(false).is_err(), "a drop needs a share");
+        // And the Windows defaults pass the Windows rules.
+        assert_eq!(HostInt::for_platform(true).check_for(true), Ok(()));
+    }
+
+    /// `browser-arg`: repeated, in order, Windows only, and bounded.
+    #[test]
+    fn browser_args_are_ordered_bounded_and_windows_only() {
+        let mut h = HostInt::for_platform(true);
+        h.browser = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".into();
+        h.browser_args = vec!["--user-data-dir=C:\\Temp\\wc edge".into(), "--no-first-run".into(), "--new-window".into()];
+        assert_eq!(h.check_for(true), Ok(()));
+        let mut bad = h.clone();
+        bad.browser_args.push("a\nb".into());
+        assert!(bad.check_for(true).is_err(), "a control character");
+        let mut bad = h.clone();
+        bad.browser_args = vec!["x".into(); MAX_BROWSER_ARGS + 1];
+        assert!(bad.check_for(true).is_err(), "too many");
+        let mut bad = h.clone();
+        bad.browser_args = vec!["x".repeat(MAX_BROWSER_ARG_LEN + 1)];
+        assert!(bad.check_for(true).is_err(), "too long");
+        let mut bad = h.clone();
+        bad.browser.clear();
+        assert!(bad.check_for(true).is_err(), "arguments for no browser");
+        let mut mac = HostInt::for_platform(false);
+        assert_eq!(mac.check_for(false), Ok(()));
+        mac.browser_args = vec!["--new-window".into()];
+        assert!(mac.check_for(false).is_err(), "not on macOS");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn browser_arg_lines_are_parsed_in_order() {
+        let c = Config::parse(
+            "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[hostint]\nbrowser = C:\\e\\msedge.exe\n\
+             browser-arg = --user-data-dir=C:\\Temp\\p q\nbrowser-arg = --no-first-run\n",
+        )
+        .unwrap();
+        assert_eq!(c.hostint.browser_args, ["--user-data-dir=C:\\Temp\\p q", "--no-first-run"]);
     }
 }
 

@@ -62,6 +62,13 @@ impl MappedView {
     pub fn ptr(&self) -> *const u8 {
         self.ptr
     }
+
+    /// §110: a view of memory somebody else mapped and keeps mapped for the
+    /// life of the process (the GPU device's BAR in the shared compositor).
+    /// Its length is 0, so dropping it unmaps nothing.
+    pub(crate) fn borrowed(ptr: *const u8) -> MappedView {
+        MappedView { ptr, len: 0 }
+    }
 }
 
 impl Drop for MappedView {

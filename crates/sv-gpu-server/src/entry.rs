@@ -1905,6 +1905,7 @@ fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolSer
         device: arg("--device").map_or(Ok(0), |s| s.parse())?,
         idle: std::time::Duration::from_secs(arg("--idle").map_or(Ok(30), |s| s.parse())?),
         max_sessions: arg("--sessions").map_or(Ok(8), |s| s.parse())?,
+        exit_idle: arg("--exit-idle").map(|s| s.parse().map(std::time::Duration::from_secs)).transpose()?,
     })
 }
 
@@ -1923,6 +1924,11 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     let cfg = pool_serve_args(args)?;
+    // §107: the user's one GPU process, before the device is mapped: the
+    // driver gives one mapping per device, and a second process must say why.
+    if let Some(name) = arg("--singleton") {
+        claim_singleton(&name)?;
+    }
     let pci = arg("--ivshmem-slot").ok_or("--ivshmem-slot is required")?;
     let pci: u8 = match pci.strip_prefix("0x") {
         Some(h) => u8::from_str_radix(h, 16)?,
@@ -1938,6 +1944,36 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let r = sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"));
     drop(view);
     Ok(r?)
+}
+
+/// §107: hold the named mutex `Local\NAME` for the life of the process, or
+/// fail if another process holds it. The kernel releases it when this process
+/// ends, crash included.
+#[cfg(windows)]
+fn claim_singleton(name: &str) -> Result<(), String> {
+    unsafe extern "system" {
+        fn CreateMutexW(attrs: *const std::ffi::c_void, owner: i32, name: *const u16) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(h: *mut std::ffi::c_void) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!("--singleton {name:?}: [A-Za-z0-9_-]"));
+    }
+    let wide: Vec<u16> = format!("Local\\{name}").encode_utf16().chain(Some(0)).collect();
+    // SAFETY: a null security descriptor and a NUL-terminated name.
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+    if h.is_null() {
+        return Err(format!("CreateMutexW: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: straight after the call above.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        // SAFETY: our own handle to somebody else's mutex.
+        unsafe { CloseHandle(h) };
+        return Err(format!("another GPU process of this user holds Local\\{name}"));
+    }
+    // Held, deliberately never closed: the process's life is the claim.
+    Ok(())
 }
 
 /// The same pool path on Linux, for the development loop: `--pool-file` is

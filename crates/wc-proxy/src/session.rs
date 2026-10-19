@@ -162,97 +162,48 @@ impl Drop for ClientMap {
     }
 }
 
+/// A client's `wl_shm_pool`.
+///
+/// §109: **lazy pools.** A pool is the client's fd and its size, mapped on
+/// this side, and nothing else: no arena bytes are reserved for it, whatever
+/// size it says. Foot asks for 512 MiB and uses a few MiB of it; until §109
+/// that pool was "held back" for want of a 512 MiB run and every request
+/// naming it was absorbed, the compositor's ids fell behind the client's, and
+/// the client died with `Invalid new_id`. Now the arena holds only what the
+/// pool's **buffers** cover, each its own extent, and only once a buffer is
+/// attached ([`BufferInfo::backing`]).
+///
+/// Upstream, the compositor has a `wl_shm_pool` with the client's id from the
+/// first message, always. It is backed by whatever this proxy last pointed it
+/// at: the session's 4 KiB stub, or the extent of the buffer most recently
+/// created through it. Re-pointing is `destroy` and `create_pool` again with
+/// the same id (the compositor frees an id at `destroy`, and this proxy keeps
+/// the `delete_id` that answers its own destroy from the client); see
+/// [`Session::repoint`].
 struct Pool {
     client: ClientMap,
-    /// `None` until the pool is *materialised*. See [`Session::flush_deferred`]
-    /// for what that means and why it is worth doing.
-    region: Option<Region>,
-    /// The `wl_shm` this pool was created from, so that the deferred
-    /// `create_pool` can be addressed to the right object.
+    /// The `wl_shm` this pool was created from: where a re-pointed pool is
+    /// created again.
     shm: u32,
-    /// What the client says the pool is. May be less than the region, which is
-    /// over-allocated by `headroom` so that a later `resize` has somewhere to
-    /// go.
+    /// What the client says the pool is.
     size: usize,
     /// The client has destroyed the `wl_shm_pool` object.
     zombie: bool,
-    /// The compositor has sent `wl_display.delete_id` for the pool, so it has
-    /// certainly finished opening the name.
-    acked: bool,
     /// How many `wl_buffer`s cut from this pool the client still has.
     buffers: u32,
-    /// STAGE 16. **This proxy** has sent `wl_shm_pool.destroy` upstream on the
-    /// client's behalf and is waiting for the compositor's `delete_id` before
-    /// it dares hand the bytes to anybody else. See [`Session::reclaim_for`].
-    ///
-    /// The wait is docs/waycompose-design.md §2.5's rule and not caution: the compositor
-    /// may be mid-render out of the region, and the acknowledgement is the only
-    /// moment at which it provably is not.
-    teardown: bool,
-    /// STAGE 16. When a commit last copied pixels out of this pool. The
-    /// reclaimer takes the coldest first, and refuses anything younger than
-    /// [`RECLAIM_FLOOR`].
-    last_used: Instant,
-    /// STAGE 16. Whether the "could not publish" note has already been made.
-    /// Without it a wedged pool writes one line per message, thousands a
-    /// second, and buries the line that matters.
-    warned: bool,
-    /// STAGE 16. Whether anything actually wants this pool to exist upstream.
-    ///
-    /// **Without this the reclaimer does nothing at all**, and it took writing
-    /// the test to see it: [`Session::flush_deferred`] publishes every pool
-    /// that has no region, so a pool whose bytes had just been reclaimed was
-    /// rebuilt by the very next message the client sent, whatever that message
-    /// was about. The memory came back and left again before anyone could use
-    /// it.
-    ///
-    /// So publication is demand-driven. It is set when the pool is created —
-    /// a pool the client has just handed over is wanted by definition — and
-    /// whenever a request names the pool or one of its buffers
-    /// ([`Session::note_demand`]). It is cleared when the reclaimer takes the
-    /// pool apart. A cold pool therefore stays cold until the client comes
-    /// back for it, which is the whole point of reclaiming it.
-    wanted: bool,
-    /// STAGE 16. The compositor has had a `wl_shm_pool` for this id at some
-    /// point. Distinguishes a pool being *rebuilt* from one being announced for
-    /// the first time, which is the whole difference between the `republished`
-    /// and `created` counters — and those two numbers are how a reader of the
-    /// log tells a healthy reclaim cycle from a thrashing one.
-    ever_published: bool,
+    /// §109. The size of the compositor's pool of this id now: 4096 on the
+    /// stub, a buffer's extent after a re-point. A client's `resize` is
+    /// forwarded with this number, which the compositor accepts as no change.
+    upstream_len: u32,
+    /// §109. The compositor's pool of this id is backed by the stub.
+    on_stub: bool,
 }
 
 impl Pool {
-    /// Whether the region may be released.
-    ///
-    /// All three conditions, and each was learned the hard way against a real
-    /// client — see the note on `POOL_DESTROY` in `client_message`:
-    ///
-    /// * `zombie`: the client has finished with the pool object.
-    /// * `buffers == 0`: the `wl_shm` spec is explicit that "the mmapped memory
-    ///   will be released when all buffers that have been created from this
-    ///   pool are gone", and `weston-presentation-shm` destroys its pool
-    ///   immediately and then draws 784 frames from buffers cut out of it.
-    /// * `acked`: the compositor has confirmed it processed the destructor, so
-    ///   it cannot still be about to open the name.
+    /// Whether the client's mapping may go: it has destroyed the pool and no
+    /// buffer cut from it is left to copy from.
     fn releasable(&self) -> bool {
-        self.zombie && self.acked && self.buffers == 0
-    }
-
-    /// Whether the compositor has a `wl_shm_pool` with this id **right now**.
-    ///
-    /// STAGE 16, and it is the single question the whole of this file's pool
-    /// handling now turns on. Before this stage `region.is_some()` answered it,
-    /// because a region was published once and never taken away. It is now
-    /// taken away — by [`Session::reclaim_for`], which destroys the upstream
-    /// object to get the guest's memory back — so "we have bytes for it" and
-    /// "the compositor knows about it" have come apart, and every message that
-    /// names a pool has to ask the second question rather than the first.
-    ///
-    /// Getting this wrong is exactly the bug this stage exists to fix: a
-    /// message forwarded to a compositor that has no such object is a protocol
-    /// error, and a protocol error is a dead client.
-    fn upstream(&self) -> bool {
-        self.region.is_some() && !self.teardown
+        self.zombie && self.buffers == 0
     }
 }
 
@@ -263,24 +214,24 @@ struct BufferInfo {
     width: i32,
     height: i32,
     stride: i32,
-    /// STAGE 16. The client's own `wl_shm_pool.create_buffer` body, kept
-    /// verbatim so the request can be made again.
+    /// `wl_shm.format`, the last word of `create_buffer`.
+    format: u32,
+    /// §109. This buffer's own extent in the arena, or `None`.
     ///
-    /// **Verbatim rather than rebuilt from the fields above**, and that is the
-    /// point: re-encoding would mean this file owning a second opinion about
-    /// `create_buffer`'s argument list, which is somebody else's XML and has a
-    /// `format` argument nothing here has ever needed to understand. The body
-    /// carries no descriptor and no string, so keeping it is thirty bytes and
-    /// no lifetime question.
-    create_body: Vec<u8>,
-    /// STAGE 16. The compositor has a `wl_buffer` with this id right now.
-    /// False for one absorbed while its pool had no region, and for one this
-    /// proxy destroyed to reclaim the pool.
-    upstream: bool,
-    /// STAGE 16. Committed and not yet released, so the compositor may still be
-    /// reading it. `wl_buffer.release` is the signal and it is the compositor's
-    /// own word for "I am finished with these bytes".
+    /// `None` is a buffer the compositor has as a **1x1 stub** on the
+    /// session's stub pool: created at the client's `create_buffer` (its id
+    /// must reach the compositor then, in the client's sequence), never
+    /// attached yet, or reclaimed since. The first `attach` backs it: the
+    /// stub is destroyed and the buffer created again under the same id with
+    /// the client's geometry, on an extent of exactly its size. The proxy
+    /// keeps the `delete_id` that answers its own destroy.
+    backing: Option<Region>,
+    /// Committed and not yet released, so the compositor may still be
+    /// reading it. `wl_buffer.release` is the signal.
     held: bool,
+    /// When it was last attached or copied into: the reclaimer takes the
+    /// coldest first, and nothing younger than [`RECLAIM_FLOOR`].
+    last_used: Instant,
 }
 
 impl BufferInfo {
@@ -297,6 +248,20 @@ impl BufferInfo {
             .ok()?
             .checked_add(stride.checked_mul(rows)?)?
             .checked_add(last)
+    }
+
+    /// §109. The bytes its own extent needs: the client's view of it from its
+    /// offset on, and at least `stride * height`, which is what a compositor
+    /// checks a `create_buffer` against.
+    fn extent_len(&self) -> Option<u64> {
+        let tail = self.end()?.checked_sub(usize::try_from(self.offset).ok()?)?;
+        let rows = usize::try_from(self.stride).ok()?.checked_mul(usize::try_from(self.height).ok()?)?;
+        Some(tail.max(rows) as u64)
+    }
+
+    /// The same buffer, placed at offset 0 of its own extent.
+    fn at_zero(&self) -> BufferInfo {
+        BufferInfo { offset: 0, backing: None, ..self.clone() }
     }
 }
 
@@ -335,24 +300,6 @@ struct Surface {
     pending_attached: bool,
     current: Option<u32>,
     damage: Vec<Rect>,
-    /// STAGE 16. A `wl_surface.attach` that could not be forwarded, because the
-    /// buffer it names has no `wl_buffer` upstream and could not be given one.
-    ///
-    /// Held rather than dropped, because a client is entitled to attach once
-    /// and then commit forever — a video does not, but a static page does, and
-    /// dropping the attach outright would freeze such a surface permanently
-    /// rather than until there was room. The next commit retries it.
-    dropped_attach: Option<Vec<u8>>,
-    /// STAGE 16. The next copy must be the buffer's whole extent rather than
-    /// the damage the client declared.
-    ///
-    /// Set whenever an attach is dropped or a pool is republished, and it is
-    /// required for correctness rather than being belt and braces: the client
-    /// declares damage against what it believes the compositor already has, and
-    /// after a gap in which nothing was copied that belief is wrong. A
-    /// damage-scoped copy would leave the rows nobody damaged holding whatever
-    /// the previous tenant of those arena bytes wrote.
-    needs_full_copy: bool,
     /// Per-buffer arrears, and the fix for docs/waycompose-design.md §27.
     ///
     /// `wl_surface.damage` is defined against the **surface**: it is what
@@ -447,6 +394,18 @@ pub struct Stats {
     /// object. Each one is a frame the client drew and the compositor did not
     /// show, which is the visible cost of degrading instead of dying.
     pub attaches_deferred: u64,
+    /// §109. Buffers given an extent of their own (at their first attach, or
+    /// again after a reclaim), and the arena bytes all of them hold now and
+    /// at most.
+    pub buffers_backed: u64,
+    pub backed_bytes_now: u64,
+    pub backed_bytes_peak: u64,
+    /// §109. Buffers the compositor was given as a 1x1 stub (at
+    /// `create_buffer`, or when reclaimed).
+    pub buffers_stubbed: u64,
+    /// §109. Buffers that could not have an extent even after reclaiming,
+    /// answered with `wl_display.error(no_memory)`, which ends the client.
+    pub no_memory_errors: u64,
     pub pool_resizes: u64,
     /// Resizes that could not be satisfied because the region had no headroom
     /// left. Should be zero; if it is not, the number is the argument for a
@@ -583,7 +542,7 @@ impl Stats {
             "{} commits, {} copies, {mb:.2} MiB in {ms:.1} ms ({per}); \
              {} pools ({} released, {} reclaimed, {} republished, {} resizes, {} overflows, \
              {} refusals, {} attaches deferred); {} fds in, {} out{}; \
-             {} client msgs, {} server msgs{verify}{clip}{dmabuf}",
+             {} client msgs, {} server msgs; buffers: {} backed ({:.1} MiB now, {:.1} MiB peak), {} stubs, {} no-memory{verify}{clip}{dmabuf}",
             self.commits,
             self.copies,
             self.pools_created,
@@ -603,6 +562,11 @@ impl Stats {
             },
             self.messages_client,
             self.messages_server,
+            self.buffers_backed,
+            self.backed_bytes_now as f64 / (1024.0 * 1024.0),
+            self.backed_bytes_peak as f64 / (1024.0 * 1024.0),
+            self.buffers_stubbed,
+            self.no_memory_errors,
         )
     }
 }
@@ -667,6 +631,10 @@ impl From<io::Error> for Error {
 /// one would fail the build's tests rather than the demo.
 mod op {
     pub const SHM_CREATE_POOL: u16 = 0;
+    /// `wl_shm.release`, version 2.
+    pub const SHM_RELEASE: u16 = 1;
+    /// `wl_display.error`, an event.
+    pub const DISPLAY_ERROR: u16 = 0;
     pub const POOL_CREATE_BUFFER: u16 = 0;
     pub const POOL_DESTROY: u16 = 1;
     pub const POOL_RESIZE: u16 = 2;
@@ -883,7 +851,6 @@ pub struct Session {
     objects: Objects,
     transport: Box<dyn PoolTransport>,
     scope: CopyScope,
-    headroom: u64,
     /// Every pool, including the ones the client has destroyed. A destroyed
     /// pool stays here, with `zombie` set, until the compositor acknowledges
     /// the destructor — see the note on `POOL_DESTROY` in `client_message`, and
@@ -948,13 +915,26 @@ pub struct Session {
     /// the connection. Inventing the acknowledgement is one message and it is
     /// the truthful one: the object really is gone.
     to_client: Vec<u8>,
-    /// STAGE 16. Ids **this proxy** destroyed upstream without the client
-    /// asking. Their `delete_id` is the compositor answering us, not the
-    /// client, and forwarding it would tell libwayland-client to recycle an id
-    /// its own application still holds — which is the same desynchronisation
-    /// this file's header is about, arriving from the one direction nothing had
-    /// ever produced it from.
-    proxy_destroyed: std::collections::HashSet<u32>,
+    /// Ids **this proxy** destroyed upstream without the client asking, and
+    /// how many of their `delete_id`s are still to come. Each is the
+    /// compositor answering this proxy, not the client: forwarding it would
+    /// tell libwayland-client to recycle an id its application still holds.
+    /// A count, because §109 destroys and re-creates the same id (a pool
+    /// re-pointed, a buffer backed or reclaimed) many times over, and the
+    /// answers come back in the order the destroys went.
+    swallow: HashMap<u32, u32>,
+    /// §109. The session's 4 KiB stub extent: what a pool is backed by when it
+    /// is not carrying a buffer, and a 1x1 stub buffer is cut from.
+    stub: Option<Region>,
+    /// §109. Extents of buffers the client destroyed, freed when the
+    /// compositor's `delete_id` says it has finished with them.
+    pending_free: HashMap<u32, Region>,
+    /// §109. `wl_shm.release`s held until no pool of the client needs the
+    /// `wl_shm` to be re-created on.
+    shm_release_held: Vec<u32>,
+    /// §109. A fatal `wl_display.error` has been sent to the client; it is
+    /// dying, and nothing more of it is forwarded.
+    dead: bool,
     /// STAGE 16. Whether the "nothing could be reclaimed" line has been said
     /// since the last time something was. See [`Session::reclaim_for`].
     pressure_noted: bool,
@@ -1032,21 +1012,23 @@ impl Drop for Session {
     fn drop(&mut self) {
         let mut n = 0u64;
         let mut bytes = 0u64;
-        for (_, pool) in self.pools.iter_mut() {
-            if let Some(region) = pool.region.take() {
-                bytes += region.size;
-                self.transport.destroy(&region);
-                n += 1;
-            }
+        // §109: the arena holds buffers' extents, the stub, and the extents of
+        // buffers whose `delete_id` never came.
+        let mut regions: Vec<Region> = self.buffers.values_mut().filter_map(|b| b.backing.take()).collect();
+        regions.extend(self.pending_free.drain().map(|(_, r)| r));
+        regions.extend(self.stub.take());
+        for region in regions {
+            bytes += region.size;
+            self.transport.destroy(&region);
+            n += 1;
         }
         if n > 0 {
-            self.stats.pools_released += n;
             // Said out loud, because "the client left holding pools" is normal
             // and "the client left holding *all* of them" is a client that
             // crashed — and the two are worth telling apart in a log after the
             // fact.
             println!(
-                "[proxy] session ended holding {n} pool(s), {bytes} bytes returned to the arena"
+                "[proxy] session ended holding {n} extent(s), {bytes} bytes returned to the arena"
             );
         }
     }
@@ -1060,12 +1042,14 @@ impl Session {
         headroom: u64,
     ) -> Session {
         let data_ops = DataOps::from(&spec);
+        let _ = headroom;
         Session {
             spec,
             objects: Objects::new(),
             transport,
             scope,
-            headroom: headroom.max(1),
+            // §109: a pool holds no arena bytes, so there is nothing for
+            // `--pool-headroom` to over-allocate; kept for the command line.
             pools: HashMap::new(),
             next_retired_pool: RETIRED_POOL_KEYS,
             buffers: HashMap::new(),
@@ -1082,7 +1066,11 @@ impl Session {
             clip: Clip { next_token: 1, ..Clip::default() },
             data_ops,
             to_client: Vec::new(),
-            proxy_destroyed: std::collections::HashSet::new(),
+            swallow: HashMap::new(),
+            stub: None,
+            pending_free: HashMap::new(),
+            shm_release_held: Vec::new(),
+            dead: false,
             pressure_noted: false,
             verify: false,
             dmabuf: None,
@@ -1218,6 +1206,11 @@ impl Session {
         fds: &mut std::collections::VecDeque<std::os::fd::OwnedFd>,
     ) -> Result<Vec<u8>, Error> {
         self.stats.messages_client += 1;
+        // §109: a client told `wl_display.error` is dying, and libwayland-client
+        // sends nothing after it; anything already queued is not forwarded.
+        if self.dead {
+            return Ok(Vec::new());
+        }
         let interface = self
             .objects
             .interface(header.object)
@@ -1264,22 +1257,7 @@ impl Session {
             p.requested(cb, header.object);
         }
 
-        // Materialise any pool still being sized, unless *this* message is one
-        // of the two that a pool is allowed to be deferred through. Doing it
-        // here — before the message is handled and before anything is emitted —
-        // is what keeps the upstream ordering identical to the client's, except
-        // for the resizes that were absorbed.
-        let deferrable = matches!(
-            (interface.as_str(), header.opcode),
-            ("wl_shm", op::SHM_CREATE_POOL)
-        ) || (interface == "wl_shm_pool"
-            && header.opcode == op::POOL_RESIZE
-            && self.pools.get(&header.object).is_some_and(|p| !p.upstream()));
-        // STAGE 16. Which pools this message needs, decided before any of them
-        // is published, so that `flush_deferred` publishes those and not every
-        // pool that happens to be without a region. See [`Pool::wanted`].
-        self.note_demand(&interface, header.opcode, header.object, body, &spans);
-        let mut out = if deferrable { Vec::new() } else { self.flush_deferred() };
+        let mut out = Vec::new();
 
         // §104. `zwp_linux_dmabuf_v1` and its objects are answered here, with
         // `--dmabuf-node`; a no-op without it.
@@ -1376,6 +1354,9 @@ impl Session {
         // merely carry.
         let descriptors: Vec<Vec<u8>> = Vec::new();
         match (interface.as_str(), header.opcode) {
+            // §109. Every request about a pool or a buffer reaches the
+            // compositor, in the client's order and with the client's ids. What
+            // changes is what backs them: see `Pool` and `BufferInfo::backing`.
             ("wl_shm", op::SHM_CREATE_POOL) => {
                 let pool_id = wire::word_at(body, &spans[0]).unwrap_or(0);
                 let size = wire::word_at(body, &spans[2]).unwrap_or(0) as i32;
@@ -1385,87 +1366,110 @@ impl Session {
                 })?;
                 self.stats.fds_received += 1;
                 self.create_pool(pool_id, header.object, fd, size)?;
-                // Emitted later, by `flush_deferred`, at whatever size the
-                // client has settled on. See that function.
+                // Upstream, on the stub, whatever size the client asked for.
+                let Some(stub) = self.ensure_stub() else {
+                    self.no_memory(pool_id, "its pool's 4 KiB stub".into());
+                    return Ok(out);
+                };
+                out.extend_from_slice(&create_pool_message(header.object, pool_id, &stub.descriptor, STUB_LEN));
+                self.stats.pools_created += 1;
+                self.note(format!(
+                    "pool {pool_id}: {size} bytes from the client; nothing of the arena is held for it \
+                     until a buffer cut from it is attached (§109)"
+                ));
                 return Ok(out);
             }
+            ("wl_shm", op::SHM_RELEASE) => {
+                // A pool may still have to be re-created on this `wl_shm`; the
+                // destructor goes when none can be (`release_held_shm`).
+                if self.pools.values().any(|p| p.shm == header.object && !p.zombie) {
+                    self.shm_release_held.push(header.object);
+                    return Ok(out);
+                }
+            }
             ("wl_shm_pool", op::POOL_CREATE_BUFFER) => {
-                // STAGE 16. `upstream` is decided here and it decides whether
-                // the message is forwarded at all: a `create_buffer` on a pool
-                // the compositor does not have is the exact message that killed
-                // Firefox. `flush_deferred` ran above, so this is the answer
-                // after every attempt to give the pool a region has been made.
-                let live = self.pools.get(&header.object).is_some_and(Pool::upstream);
+                let id = wire::word_at(body, &spans[0]).unwrap_or(0);
                 let b = BufferInfo {
                     pool: header.object,
                     offset: wire::word_at(body, &spans[1]).unwrap_or(0) as i32,
                     width: wire::word_at(body, &spans[2]).unwrap_or(0) as i32,
                     height: wire::word_at(body, &spans[3]).unwrap_or(0) as i32,
                     stride: wire::word_at(body, &spans[4]).unwrap_or(0) as i32,
-                    create_body: body.to_vec(),
-                    upstream: live,
+                    format: wire::word_at(body, &spans[5]).unwrap_or(0),
+                    backing: None,
                     held: false,
+                    last_used: Instant::now(),
                 };
-                let id = wire::word_at(body, &spans[0]).unwrap_or(0);
+                // The compositor would check the buffer against the pool; its
+                // pool is the stub, so the check is made here, with its words.
+                let size = self.pools.get(&header.object).map_or(0, |p| p.size);
+                if b.width <= 0 || b.height <= 0 || b.stride <= 0 || b.end().is_none_or(|e| e > size) {
+                    self.client_error(
+                        header.object,
+                        SHM_ERROR_INVALID_STRIDE,
+                        format!(
+                            "buffer {id}: {}x{} stride {} at offset {} is outside the {size}-byte pool",
+                            b.width, b.height, b.stride, b.offset
+                        ),
+                    );
+                    return Ok(out);
+                }
                 self.foreign_buffers.remove(&id);
                 self.buffers.insert(id, b);
                 self.forget_buffer_arrears(id);
                 if let Some(pool) = self.pools.get_mut(&header.object) {
                     pool.buffers += 1;
                 }
-                if !live {
-                    // Absorbed, exactly as a resize of an unannounced pool is.
-                    // The request is not lost — it is kept verbatim in
-                    // `create_body` and replayed by `flush_deferred` the moment
-                    // the pool has bytes again.
-                    return Ok(out);
-                }
+                // A 1x1 stub until it is attached: the id reaches the
+                // compositor now, the bytes when they are needed.
+                out.extend_from_slice(&self.stub_buffer(header.object, id));
+                return Ok(out);
             }
             ("wl_shm_pool", op::POOL_RESIZE) => {
                 let size = wire::word_at(body, &spans[0]).unwrap_or(0) as i32;
-                if self.resize_pool(header.object, size) {
-                    // Absorbed: the pool has not been announced yet, so there
-                    // is nothing upstream to resize.
-                    return Ok(out);
-                }
+                // The client's mapping follows; the compositor's pool is as
+                // big as what it carries, so its resize is to that same size,
+                // which is no change. Forwarded, so the stream stays the
+                // client's.
+                let len = self.resize_pool(header.object, size);
+                out.extend_from_slice(&wire::message(header.object, op::POOL_RESIZE, &len.to_ne_bytes()));
+                return Ok(out);
             }
-            // **Do not free the region here**, and this is docs/waycompose-design.md
-            // §2.5's lifetime rule arriving from the direction it warns about:
-            //
-            // > "Sending a descriptor transfers nothing… a sender that drops
-            // > its handle immediately after `send` — which is legal on Unix —
-            // > leaves the receiver with a name for an object that no longer
-            // > exists."
-            //
-            // `weston-presentation-shm` does exactly that. It creates a pool,
-            // creates its buffers, and destroys the `wl_shm_pool` at once,
-            // which is not only legal but idiomatic: the `wl_shm` spec says the
-            // memory lives until the buffers are gone. All three requests
-            // reached this proxy before the compositor had read any of them, so
-            // freeing on `destroy` unlinked the file *first* and the compositor
-            // opened a path with nothing behind it — `File not found`, reported
-            // to the client as a `wl_shm` protocol error, 0 frames presented.
-            //
-            // So the pool becomes a zombie and is freed when the compositor
-            // says it has processed the destructor, which it does with
-            // `wl_display.delete_id`. That is a real acknowledgement rather than
-            // a delay, and it is the receiver-side eagerness §2.5 asks for,
-            // implemented on the side that can actually observe it.
+            // **The client's mapping is not dropped here.** `weston-presentation-
+            // shm` creates a pool, its buffers, and destroys the pool at once,
+            // which the `wl_shm` spec allows: the memory lives until the
+            // buffers are gone. The mapping goes when the last buffer cut from
+            // it does (`release_pool_if_done`).
             ("wl_shm_pool", op::POOL_DESTROY) => {
-                let live = self.pools.get(&header.object).is_some_and(Pool::upstream);
+                // §109. A stub buffer is backed through a live pool. If this was
+                // the client's last one, back its stubs now, while there is a
+                // pool to do it through.
+                let last = !self.pools.iter().any(|(id, p)| *id != header.object && !p.zombie);
+                if last {
+                    let stubs: Vec<u32> = self
+                        .buffers
+                        .iter()
+                        .filter(|(_, b)| b.backing.is_none())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    let mut stubs = stubs;
+                    stubs.sort_unstable();
+                    for id in stubs {
+                        match self.back_buffer(header.object, id) {
+                            Ok(bytes) => out.extend_from_slice(&bytes),
+                            Err(why) => {
+                                self.no_memory(id, why);
+                                return Ok(out);
+                            }
+                        }
+                    }
+                }
                 if let Some(pool) = self.pools.get_mut(&header.object) {
                     pool.zombie = true;
                 }
-                if !live && self.pools.contains_key(&header.object) {
-                    // STAGE 16. The compositor has no such object — either this
-                    // proxy destroyed it to reclaim the bytes, or it was never
-                    // announced — so the destructor must not be forwarded. The
-                    // client is owed the acknowledgement libwayland waits for
-                    // before it recycles the id, and only this side can send it.
-                    self.dispose_absorbed_pool(header.object);
-                    return Ok(out);
-                }
-                self.release_pool_if_done(header.object);
+                out.extend_from_slice(&wire::message(header.object, op::POOL_DESTROY, &[]));
+                out.extend_from_slice(&self.release_held_shm());
+                return Ok(out);
             }
             ("wl_buffer", op::BUFFER_DESTROY) => {
                 self.foreign_buffers.remove(&header.object);
@@ -1473,15 +1477,10 @@ impl Session {
                     if let Some(pool) = self.pools.get_mut(&b.pool) {
                         pool.buffers = pool.buffers.saturating_sub(1);
                     }
-                    if !b.upstream {
-                        // Same absorption, same reason. Note the ordering: the
-                        // buffer is out of `self.buffers` before this, so a
-                        // later republish of its pool will not resurrect a
-                        // buffer the client has finished with.
-                        self.fabricate_delete_id(header.object);
-                        self.dispose_absorbed_pool(b.pool);
-                        self.release_pool_if_done(b.pool);
-                        return Ok(out);
+                    // Its extent goes when the compositor's `delete_id` says
+                    // it has finished with it.
+                    if let Some(r) = b.backing {
+                        self.pending_free.insert(header.object, r);
                     }
                     self.release_pool_if_done(b.pool);
                 }
@@ -1495,23 +1494,30 @@ impl Session {
             }
             ("wl_surface", op::SURFACE_ATTACH) => {
                 let buffer = wire::word_at(body, &spans[0]).unwrap_or(0);
-                let s = self.surfaces.entry(header.object).or_default();
-                s.pending_attached = true;
-                s.pending_buffer = (buffer != 0).then_some(buffer);
-                // STAGE 16. An attach naming a buffer the compositor does not
-                // have is the second message that could desynchronise the
-                // stream, and unlike `create_buffer` it cannot simply be
-                // absorbed and replayed later from a table — the client may
-                // never send another one. So it is held on the surface and
-                // retried at every commit.
-                if buffer != 0 && !self.buffer_is_upstream(buffer) {
-                    let s = self.surfaces.entry(header.object).or_default();
-                    s.dropped_attach = Some(body.to_vec());
-                    s.needs_full_copy = true;
+                // §104: a failed dma-buf's placeholder is no `wl_buffer` upstream;
+                // its attach is held back, as that module's header says.
+                if buffer != 0 && self.is_placeholder_buffer(buffer) {
                     self.stats.attaches_deferred += 1;
                     return Ok(out);
                 }
-                self.surfaces.entry(header.object).or_default().dropped_attach = None;
+                // §109. The buffer's first attach (or its first since it was
+                // reclaimed) gives it its own extent, before the attach.
+                if buffer != 0 && self.buffers.get(&buffer).is_some_and(|b| b.backing.is_none()) {
+                    let pool = self.buffers[&buffer].pool;
+                    match self.back_buffer(pool, buffer) {
+                        Ok(bytes) => out.extend_from_slice(&bytes),
+                        Err(why) => {
+                            self.no_memory(buffer, why);
+                            return Ok(out);
+                        }
+                    }
+                }
+                if let Some(b) = self.buffers.get_mut(&buffer) {
+                    b.last_used = Instant::now();
+                }
+                let s = self.surfaces.entry(header.object).or_default();
+                s.pending_attached = true;
+                s.pending_buffer = (buffer != 0).then_some(buffer);
             }
             ("wl_surface", op::SURFACE_DAMAGE | op::SURFACE_DAMAGE_BUFFER) => {
                 let r = Rect {
@@ -1523,29 +1529,6 @@ impl Session {
                 self.surfaces.entry(header.object).or_default().damage.push(r);
             }
             ("wl_surface", op::SURFACE_COMMIT) => {
-                // STAGE 16. The retry point. `flush_deferred` ran at the top of
-                // this call, so if the pool found room the held attach can go
-                // now — ahead of the commit, which is where the client put it.
-                if let Some(held) = self
-                    .surfaces
-                    .get(&header.object)
-                    .and_then(|s| s.dropped_attach.clone())
-                {
-                    let buffer = held
-                        .get(..4)
-                        .and_then(|b| b.try_into().ok())
-                        .map_or(0, u32::from_ne_bytes);
-                    if self.buffer_is_upstream(buffer) {
-                        out.extend_from_slice(&wire::message(
-                            header.object,
-                            op::SURFACE_ATTACH,
-                            &held,
-                        ));
-                        if let Some(s) = self.surfaces.get_mut(&header.object) {
-                            s.dropped_attach = None;
-                        }
-                    }
-                }
                 self.commit(header.object);
             }
             _ => {}
@@ -2057,305 +2040,243 @@ impl Session {
         )
     }
 
-    /// Announce every pool that has finished being sized, and return the
-    /// `wl_shm.create_pool` messages that do it.
-    ///
-    /// # Why `create_pool` is delayed at all
-    ///
-    /// Because of a measurement, and it is worth recording what was measured
-    /// because the obvious design is wrong.
-    ///
-    /// A shared region cannot grow once the peer has mapped it. A Windows
-    /// section's size is fixed at `CreateFileMappingW` time (docs/waycompose-design.md
-    /// §2.5) and an arena slice's neighbours are already allocated, so the only
-    /// ways to honour `wl_shm_pool.resize` are to over-allocate up front, or to
-    /// re-key the pool onto a new object — which the protocol gives no way to
-    /// express, because the pool's id belongs to the client.
-    ///
-    /// Over-allocation needs a factor, and the factor turned out to be
-    /// unguessable. **`weston-terminal` creates a 4096-byte pool and then grows
-    /// it nine times, by doubling, to 4190208 bytes — a factor of 1023.** No
-    /// headroom anyone would write down covers that.
-    ///
-    /// What the same trace showed is the way out: all nine resizes arrive
-    /// **back to back, before any other request**, because toytoolkit sizes its
-    /// pool during `display_create()` and only then makes a surface. So the
-    /// proxy holds `create_pool` until the client does something that is not a
-    /// resize, and announces the pool once, at the size the client settled on.
-    /// Zero over-allocation and zero failed resizes for the measured client,
-    /// and `--pool-headroom` remains for a client that resizes *later*, which
-    /// this one does not but a window that is dragged bigger will.
-    ///
-    /// This is a delay, not a reordering: nothing else is emitted while a pool
-    /// is deferred, because any other message flushes first.
-    /// # STAGE 16: what happens when there is no room, which used to be death
-    ///
-    /// The old version of this function noted the failure and moved on, and
-    /// docs/waycompose-design.md §17.8 described the consequence as "the client's window
-    /// stops updating". **That was wrong, and §20.2 is the correction.** An
-    /// unannounced pool is an object the compositor does not have; the very
-    /// next `wl_shm_pool.create_buffer` was forwarded to it anyway, and a
-    /// request on an unknown object is a protocol error. The compositor dropped
-    /// the connection and Firefox exited with `channel error`. The allocation
-    /// failure was survivable; forwarding past it was not.
-    ///
-    /// So there are now three answers in order, and only the third is visible
-    /// to a user:
-    ///
-    /// 1. **Ask for the memory back.** [`Session::reclaim_for`] destroys the
-    ///    upstream objects of pools nothing is using and returns their bytes.
-    ///    This is where the guest's RAM comes from, and it is demand-driven —
-    ///    nothing is taken while there is room.
-    /// 2. **Try again.** Reclamation cannot complete synchronously (the
-    ///    compositor has to acknowledge first), so the retry that matters is
-    ///    the next message's, and there is always a next message.
-    /// 3. **Leave the pool unannounced, and make sure nothing is ever said
-    ///    about it.** Every request naming a pool with no upstream object is
-    ///    absorbed by `client_message` rather than forwarded, so the stream
-    ///    stays valid and the connection stays open. The surface freezes; the
-    ///    client lives.
-    fn flush_deferred(&mut self) -> Vec<u8> {
-        let pending: Vec<u32> = self
-            .pools
-            .iter()
-            .filter(|(_, p)| p.region.is_none() && !p.teardown && p.wanted && !p.zombie)
-            .map(|(id, _)| *id)
-            .collect();
-        let mut out = Vec::new();
-        for pool_id in pending {
-            let (size, shm, republish) = {
-                let p = &self.pools[&pool_id];
-                // A pool the compositor has had before is one this proxy took
-                // apart, not a new one. "Has buffers it does not know about"
-                // was the first spelling of this and it was wrong: a pool
-                // refused for want of room collects absorbed buffers too, and
-                // counting those as rebuilds made a full arena look like a
-                // thrashing reclaimer.
-                (p.size, p.shm, p.ever_published)
-            };
-            let region_size = (size as u64).saturating_mul(self.headroom);
-            let region = match self.transport.create(region_size) {
-                Ok(r) => r,
-                Err(first) => {
-                    self.stats.alloc_refusals += 1;
-                    out.extend_from_slice(&self.reclaim_for(region_size));
-                    match self.transport.create(region_size) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // Once per pool, not once per message: a wedged pool
-                            // is touched thousands of times a second and the
-                            // line that matters is the first one.
-                            let p = self.pools.get_mut(&pool_id).expect("just read");
-                            if !p.warned {
-                                p.warned = true;
-                                self.note(format!(
-                                    "pool {pool_id}: could not publish {region_size} bytes: {e} \
-                                     -- the pool is held back and every request naming it is \
-                                     absorbed, so this surface stops updating until there is \
-                                     room. The connection is not affected."
-                                ));
-                            }
-                            let _ = first;
-                            continue;
-                        }
-                    }
-                }
-            };
-            let p = self.pools.get_mut(&pool_id).expect("just read");
-            p.warned = false;
-            p.last_used = Instant::now();
-            p.ever_published = true;
-            if republish {
-                self.stats.pools_republished += 1;
-            } else {
-                self.stats.pools_created += 1;
-            }
-            self.note(format!(
-                "pool {pool_id}: {size} bytes from the client -> {}{}",
-                region.describe(),
-                if republish { " (rebuilt)" } else { "" }
-            ));
-            let mut body = Vec::new();
-            body.extend_from_slice(&pool_id.to_ne_bytes());
-            wire::push_bytes(&mut body, &region.descriptor.encode());
-            body.extend_from_slice(&(size as u32).to_ne_bytes());
-            out.extend_from_slice(&wire::message(shm, op::SHM_CREATE_POOL, &body));
-            self.pools.get_mut(&pool_id).expect("just read").region = Some(region);
+    // -----------------------------------------------------------------------
+    // §109: lazy pools, a backing per buffer
+    // -----------------------------------------------------------------------
 
-            // And every buffer of it the compositor does not have. Two kinds
-            // arrive here and they are deliberately not distinguished: one the
-            // client created while there was no room, and one this proxy
-            // destroyed to reclaim the pool. Both are "the client believes this
-            // buffer exists and the compositor does not", and the cure is the
-            // client's own request, replayed.
-            let mut rebuilt: Vec<(u32, Vec<u8>)> = self
-                .buffers
-                .iter()
-                .filter(|(_, b)| b.pool == pool_id && !b.upstream)
-                .map(|(id, b)| (*id, b.create_body.clone()))
-                .collect();
-            // In id order, which is creation order for a libwayland client, so
-            // the compositor sees them in the order it would have.
-            rebuilt.sort_by_key(|(id, _)| *id);
-            for (buffer_id, create_body) in rebuilt {
-                out.extend_from_slice(&wire::message(
-                    pool_id,
-                    op::POOL_CREATE_BUFFER,
-                    &create_body,
-                ));
-                if let Some(b) = self.buffers.get_mut(&buffer_id) {
-                    b.upstream = true;
+    /// The session's stub extent, made the first time a pool needs it.
+    fn ensure_stub(&mut self) -> Option<Region> {
+        if self.stub.is_none() {
+            match self.transport.create(u64::from(STUB_LEN)) {
+                Ok(r) => self.stub = Some(r),
+                Err(e) => {
+                    self.note(format!("could not publish the session's {STUB_LEN}-byte stub: {e}"));
+                    return None;
                 }
-                if self.trace {
-                    self.note(format!("re-created buffer {buffer_id} in pool {pool_id}"));
-                }
+            }
+        }
+        self.stub.clone()
+    }
+
+    /// A live pool to create through: `prefer` if the client still owns it,
+    /// else any of the client's live pools. Its `wl_shm` must be live too,
+    /// which `shm_release_held` sees to.
+    fn carrier(&self, prefer: u32) -> Option<u32> {
+        if self.pools.get(&prefer).is_some_and(|p| !p.zombie) {
+            return Some(prefer);
+        }
+        let mut live: Vec<u32> = self.pools.iter().filter(|(_, p)| !p.zombie).map(|(id, _)| *id).collect();
+        live.sort_unstable();
+        live.first().copied()
+    }
+
+    /// Point the compositor's pool `carrier` at `descriptor`: its destroy
+    /// (whose `delete_id` this proxy keeps) and `create_pool` again under the
+    /// same id. The compositor frees an id at `destroy`, so the same id is
+    /// legal at once, and it is still the client's: the client never hears of
+    /// either.
+    fn repoint(&mut self, carrier: u32, descriptor: &Descriptor, len: u32, stub: bool) -> Vec<u8> {
+        let Some(shm) = self.pools.get(&carrier).map(|p| p.shm) else { return Vec::new() };
+        *self.swallow.entry(carrier).or_insert(0) += 1;
+        let mut out = wire::message(carrier, op::POOL_DESTROY, &[]);
+        out.extend_from_slice(&create_pool_message(shm, carrier, descriptor, len));
+        if let Some(p) = self.pools.get_mut(&carrier) {
+            p.upstream_len = len;
+            p.on_stub = stub;
+        }
+        out
+    }
+
+    /// `buffer` as a 1x1 stub on the stub pool, through `carrier`: what the
+    /// compositor has for a buffer that is not backed.
+    fn stub_buffer(&mut self, carrier: u32, buffer: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let Some(format) = self.buffers.get(&buffer).map(|b| b.format) else { return out };
+        let Some(carrier) = self.carrier(carrier) else { return out };
+        if !self.pools.get(&carrier).is_some_and(|p| p.on_stub) {
+            let Some(stub) = self.ensure_stub() else { return out };
+            out.extend_from_slice(&self.repoint(carrier, &stub.descriptor, STUB_LEN, true));
+        }
+        out.extend_from_slice(&create_buffer_message(carrier, buffer, 0, 1, 1, 4, format));
+        self.stats.buffers_stubbed += 1;
+        out
+    }
+
+    /// Give `buffer` an extent of its own and the compositor the buffer at
+    /// its real geometry on it, in place of its stub: destroy the stub (its
+    /// `delete_id` kept), re-point a pool at the extent, create the buffer
+    /// again under its id. `Err` says why there was no room even after
+    /// reclaiming.
+    fn back_buffer(&mut self, prefer: u32, buffer: u32) -> Result<Vec<u8>, String> {
+        let Some(info) = self.buffers.get(&buffer).cloned() else { return Ok(Vec::new()) };
+        if info.backing.is_some() {
+            return Ok(Vec::new());
+        }
+        let Some(carrier) = self.carrier(prefer) else {
+            return Err(format!(
+                "buffer {buffer}: the client has destroyed every pool, so there is none to create its \
+                 extent through"
+            ));
+        };
+        let len = info.extent_len().ok_or_else(|| format!("buffer {buffer}: a geometry with no size"))?;
+        let mut out = Vec::new();
+        let region = self.allocate(len, &mut out).map_err(|e| format!("buffer {buffer}: {len} bytes: {e}"))?;
+        let len32 = u32::try_from(len).map_err(|_| format!("buffer {buffer}: {len} bytes is over 4 GiB"))?;
+        *self.swallow.entry(buffer).or_insert(0) += 1;
+        out.extend_from_slice(&wire::message(buffer, op::BUFFER_DESTROY, &[]));
+        out.extend_from_slice(&self.repoint(carrier, &region.descriptor, len32, false));
+        out.extend_from_slice(&create_buffer_message(
+            carrier,
+            buffer,
+            0,
+            info.width,
+            info.height,
+            info.stride,
+            info.format,
+        ));
+        self.stats.buffers_backed += 1;
+        self.stats.backed_bytes_now += region.size;
+        self.stats.backed_bytes_peak = self.stats.backed_bytes_peak.max(self.stats.backed_bytes_now);
+        if self.trace {
+            self.note(format!("buffer {buffer}: backed by {}", region.describe()));
+        }
+        if let Some(b) = self.buffers.get_mut(&buffer) {
+            b.backing = Some(region);
+            b.last_used = Instant::now();
+        }
+        // Whatever these arena bytes last held is not this buffer: its first
+        // copy is its whole extent.
+        self.forget_buffer_arrears(buffer);
+        Ok(out)
+    }
+
+    /// `len` bytes of the arena, reclaiming cold buffers' extents if there is
+    /// no room. The reclaim emits its own messages into `out`, ahead of the
+    /// ones that use the bytes.
+    fn allocate(&mut self, len: u64, out: &mut Vec<u8>) -> io::Result<Region> {
+        match self.transport.create(len) {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                self.stats.alloc_refusals += 1;
+                out.extend_from_slice(&self.reclaim_for(len));
+                self.transport.create(len)
+            }
+        }
+    }
+
+    fn free_backing(&mut self, region: &Region) {
+        self.stats.backed_bytes_now = self.stats.backed_bytes_now.saturating_sub(region.size);
+        self.transport.destroy(region);
+    }
+
+    /// Give the arena back the extents of buffers nothing is using, until
+    /// `needed` bytes are free.
+    ///
+    /// A buffer's extent is a **copy**: the client's own pool, mapped here,
+    /// has the bytes. So a cold buffer can lose its extent and get it back
+    /// later, which is what the reclaimer does: the compositor's buffer is
+    /// destroyed (the `delete_id` kept) and created again under the same id as
+    /// a 1x1 stub, the extent is freed, and the next attach backs it again
+    /// ([`Session::back_buffer`]), with a full copy.
+    ///
+    /// Only a buffer that is **not attached** to any surface (current or
+    /// pending), **released** by the compositor (`wl_buffer.release`: it reads
+    /// those bytes no longer) and older than [`RECLAIM_FLOOR`]; and only while
+    /// the client has a live pool to re-create its stub through. The extent is
+    /// freed at once: the compositor holds the buffer released and its destroy
+    /// is ahead, in the same stream, of anything that uses the bytes again.
+    fn reclaim_for(&mut self, needed: u64) -> Vec<u8> {
+        let mut pinned: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for s in self.surfaces.values() {
+            pinned.extend(s.current);
+            pinned.extend(s.pending_buffer);
+        }
+        let now = Instant::now();
+        let mut cold: Vec<(Duration, u32, u64, u32)> = self
+            .buffers
+            .iter()
+            .filter(|(id, b)| {
+                b.backing.is_some() && !b.held && !pinned.contains(*id) && now.duration_since(b.last_used) >= RECLAIM_FLOOR
+            })
+            .map(|(id, b)| (now.duration_since(b.last_used), *id, b.backing.as_ref().map_or(0, |r| r.size), b.pool))
+            .collect();
+        cold.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut out = Vec::new();
+        let mut freed = 0u64;
+        for (idle, id, size, pool) in cold {
+            if freed >= needed {
+                break;
+            }
+            let Some(carrier) = self.carrier(pool) else { break };
+            *self.swallow.entry(id).or_insert(0) += 1;
+            out.extend_from_slice(&wire::message(id, op::BUFFER_DESTROY, &[]));
+            out.extend_from_slice(&self.stub_buffer(carrier, id));
+            if let Some(region) = self.buffers.get_mut(&id).and_then(|b| b.backing.take()) {
+                self.free_backing(&region);
+            }
+            self.forget_buffer_arrears(id);
+            freed += size;
+            self.stats.pools_reclaimed += 1;
+            self.note(format!(
+                "buffer {id}: reclaiming its {size}-byte extent, idle {} ms -- the arena needs {needed}",
+                idle.as_millis()
+            ));
+        }
+        if freed < needed && !self.pressure_noted {
+            self.pressure_noted = true;
+            self.note(format!(
+                "arena pressure: {freed} of {needed} bytes could be reclaimed; the rest is in buffers that \
+                 are attached, unreleased or newer than {} ms",
+                RECLAIM_FLOOR.as_millis()
+            ));
+        }
+        if freed > 0 {
+            self.pressure_noted = false;
+        }
+        out
+    }
+
+    /// The client's `wl_shm.release`s held back for pools that are gone now.
+    fn release_held_shm(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let held = std::mem::take(&mut self.shm_release_held);
+        for shm in held {
+            if self.pools.values().any(|p| p.shm == shm && !p.zombie) {
+                self.shm_release_held.push(shm);
+            } else {
+                out.extend_from_slice(&wire::message(shm, op::SHM_RELEASE, &[]));
             }
         }
         out
     }
 
-    /// Take back the guest's memory from pools nothing is using, until `needed`
-    /// bytes have been promised.
-    ///
-    /// # STAGE 16, and it is the answer to docs/waycompose-design.md §17.10 item 1
-    ///
-    /// §15.11 proposed releasing a pool when its last buffer dies. §17.8 then
-    /// measured what that would be worth against the client it was designed
-    /// for: Firefox destroys **one buffer in three and no pools at all**, so
-    /// the proposal would free one pool of four in a 25-second run and none of
-    /// the 88 in a startup. The plan was much weaker than it looked, and the
-    /// reason is that it waits for a signal a real client does not send.
-    ///
-    /// **So this does not wait for a signal.** A `wl_shm` pool's bytes in the
-    /// arena are a *copy*; the original is the client's own object, which this
-    /// proxy still holds mapped (`Pool::client`). Nothing is lost by throwing
-    /// the copy away, which means the compositor's `wl_shm_pool` is not a
-    /// resource the client owns at all — it is a cache this proxy chose to
-    /// populate, and a cache may be evicted. What the protocol lacks is a way
-    /// to re-point an existing pool at new bytes, and that is worked around
-    /// rather than defeated: destroy the objects, and rebuild them from the
-    /// client's own requests the moment it touches the pool again
-    /// ([`Session::flush_deferred`]).
-    ///
-    /// # The three conditions, each ruling out a specific wrong answer
-    ///
-    /// * **Not `zombie`.** The client must still own the pool's id. If it has
-    ///   destroyed the object, the id may already have been recycled and a
-    ///   rebuilt `create_pool` would collide with whatever now holds it. This
-    ///   is also why `weston-presentation-shm` is untouched by any of this: it
-    ///   destroys its pool immediately and draws 784 frames from the buffers,
-    ///   so its pool is a zombie from the first frame and never a candidate.
-    /// * **No buffer attached, and none `held`.** A buffer that is a surface's
-    ///   current or pending contents is being displayed, and one the compositor
-    ///   has not `release`d may be being read this instant. Destroying either
-    ///   would blank a window or tear a frame. `wl_buffer.release` is the
-    ///   compositor's own statement that it is finished.
-    /// * **Colder than [`RECLAIM_FLOOR`].** Against thrash, not against error.
-    ///
-    /// # What it costs, stated plainly
-    ///
-    /// A rebuilt pool is one `create_pool` plus one `create_buffer` per live
-    /// buffer, and a full-extent copy on the next commit instead of a damage
-    /// copy. For the pools this targets — cold ones — that is paid once, if
-    /// ever. The number to watch is `republished` in the stats line: if it
-    /// approaches `reclaimed`, the floor is too low or the arena is too small,
-    /// and both are visible without a debugger.
-    fn reclaim_for(&mut self, needed: u64) -> Vec<u8> {
-        // Buffers that must not lose their upstream object, by the two
-        // conditions above. Collected once rather than asked per pool.
-        let mut pinned: std::collections::HashSet<u32> = self
-            .buffers
-            .iter()
-            .filter(|(_, b)| b.held)
-            .map(|(id, _)| *id)
-            .collect();
-        for s in self.surfaces.values() {
-            pinned.extend(s.current);
-            pinned.extend(s.pending_buffer);
-        }
-        let pinned_pools: std::collections::HashSet<u32> = pinned
-            .iter()
-            .filter_map(|id| self.buffers.get(id))
-            .map(|b| b.pool)
-            .collect();
+    /// A fatal protocol error for the client, said in the compositor's place:
+    /// `wl_display.error`, after which libwayland-client sends nothing and
+    /// the connection ends. The stream to the compositor stays in step,
+    /// because nothing more is forwarded.
+    fn client_error(&mut self, object: u32, code: u32, message: String) {
+        self.note(format!("wl_display.error to the client: object {object}, code {code}: {message}"));
+        let mut b = Vec::new();
+        b.extend_from_slice(&object.to_ne_bytes());
+        b.extend_from_slice(&code.to_ne_bytes());
+        wire::push_string(&mut b, &message);
+        self.to_client.extend_from_slice(&wire::message(1, op::DISPLAY_ERROR, &b));
+        self.dead = true;
+    }
 
-        let now = Instant::now();
-        let mut cold: Vec<(std::time::Duration, u32, u64)> = self
-            .pools
-            .iter()
-            .filter(|(id, p)| {
-                p.upstream()
-                    && !p.zombie
-                    && !pinned_pools.contains(*id)
-                    && now.duration_since(p.last_used) >= RECLAIM_FLOOR
-            })
-            .map(|(id, p)| {
-                (
-                    now.duration_since(p.last_used),
-                    *id,
-                    p.region.as_ref().map_or(0, |r| r.size),
-                )
-            })
-            .collect();
-        // Coldest first. The tie-break is the id, so that a session which
-        // reclaims twice in one run does the same thing both times.
-        cold.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-
-        let mut out = Vec::new();
-        let mut promised = 0u64;
-        for (idle, pool_id, size) in cold {
-            if promised >= needed {
-                break;
-            }
-            // The buffers first, then the pool. The compositor processes a
-            // stream in order, so its `delete_id` for the pool is proof it has
-            // finished with every buffer named before it — which is what lets
-            // one acknowledgement stand for the whole teardown.
-            let mut ids: Vec<u32> = self
-                .buffers
-                .iter()
-                .filter(|(_, b)| b.pool == pool_id && b.upstream)
-                .map(|(id, _)| *id)
-                .collect();
-            ids.sort_unstable();
-            for buffer_id in ids {
-                out.extend_from_slice(&wire::message(buffer_id, op::BUFFER_DESTROY, &[]));
-                self.buffers.get_mut(&buffer_id).expect("just listed").upstream = false;
-                self.proxy_destroyed.insert(buffer_id);
-            }
-            out.extend_from_slice(&wire::message(pool_id, op::POOL_DESTROY, &[]));
-            self.proxy_destroyed.insert(pool_id);
-            let p = self.pools.get_mut(&pool_id).expect("just listed");
-            p.teardown = true;
-            // And it stays gone until the client asks for it again. See
-            // `Pool::wanted`: without this the next message rebuilds it.
-            p.wanted = false;
-            promised += size;
-            self.note(format!(
-                "pool {pool_id}: reclaiming {size} bytes, idle {} ms -- the client never asked \
-                 for them back and the arena needs {needed}",
-                idle.as_millis()
-            ));
-        }
-        // Said once, not once per message. A wedged pool asks on every message
-        // the client sends, which for Firefox is thousands a second, and the
-        // first run of this harness produced a log that was 90% this line —
-        // burying the three lines that said what had actually happened. Same
-        // reasoning as `Pool::warned`, and the same lesson as §17.8's: a
-        // diagnostic nobody can read is not a diagnostic.
-        if promised < needed && !self.pressure_noted {
-            self.pressure_noted = true;
-            self.note(format!(
-                "arena pressure: {promised} of {needed} bytes could be reclaimed; the rest is \
-                 in pools that are attached, unreleased or newer than {} ms. Further shortfalls \
-                 are counted in `refusals` rather than logged.",
-                RECLAIM_FLOOR.as_millis()
-            ));
-        }
-        if promised > 0 {
-            self.pressure_noted = false;
-        }
-        out
+    /// A buffer that cannot have an extent even after reclaiming: a clean
+    /// `no_memory`, naming it, rather than a stream out of step.
+    fn no_memory(&mut self, object: u32, why: String) {
+        self.stats.no_memory_errors += 1;
+        let (free, largest) = self.transport.free_bytes().unwrap_or((0, 0));
+        self.client_error(
+            object,
+            DISPLAY_ERROR_NO_MEMORY,
+            format!(
+                "could not publish {why} -- the shared arena has {free} bytes free, the largest run {largest} \
+                 (wc-proxy, §109)"
+            ),
+        );
     }
 
     /// Translate one event from the compositor. Returns the bytes for the local
@@ -2514,44 +2435,32 @@ impl Session {
             && header.opcode == op::DISPLAY_DELETE_ID
             && let Some(id) = wire::word_at(body, &spans[0])
         {
-            // STAGE 16. Whose destructor was this the answer to?
-            //
-            // If this proxy sent the destructor, the answer is addressed to
-            // this proxy and **must not be forwarded**: the client still owns
-            // that id, and telling libwayland-client to recycle an id its
-            // application is still holding is a desynchronisation of exactly
-            // the kind this file's header is about. It is also the moment the
-            // arena bytes finally become safe to hand to somebody else, which
-            // is why the whole teardown waits for it.
-            if self.proxy_destroyed.remove(&id) {
-                if let Some(pool) = self.pools.get_mut(&id)
-                    && pool.teardown
-                {
-                    pool.teardown = false;
-                    if let Some(region) = pool.region.take() {
-                        self.transport.destroy(&region);
-                        self.stats.pools_reclaimed += 1;
-                    }
-                    // The client may have destroyed it while the teardown was
-                    // in flight, in which case there is nothing to rebuild and
-                    // it is owed its acknowledgement.
-                    self.dispose_absorbed_pool(id);
+            // Whose destructor was this the answer to? If this proxy sent it
+            // (§109: a pool re-pointed, a buffer backed or reclaimed), the answer
+            // is this proxy's and **must not be forwarded**: the client still owns
+            // that id. The answers come back in the order the destroys went, so
+            // a count per id is exact.
+            if let Some(n) = self.swallow.get_mut(&id)
+                && *n > 0
+            {
+                *n -= 1;
+                if *n == 0 {
+                    self.swallow.remove(&id);
                 }
                 return Ok((Vec::new(), Vec::new()));
             }
             self.objects.forget(id);
             self.clip.drag_offers.remove(&id);
             self.clip.dropped_offers.remove(&id);
-            // The compositor has finished with this object. For a pool that
-            // means it has certainly opened the region by now, so one of the
-            // three conditions on releasing it is met. See the note on
-            // `POOL_DESTROY`.
-            if let Some(pool) = self.pools.get_mut(&id) {
-                pool.acked = true;
+            // §109: a buffer the client destroyed: the compositor has finished
+            // with its extent.
+            if let Some(r) = self.pending_free.remove(&id) {
+                self.free_backing(&r);
             }
+            // A pool the client destroyed: its mapping goes with its last
+            // buffer, and while buffers cut from it live on, the id is the
+            // client's to reuse from this message on (§102.9).
             self.release_pool_if_done(id);
-            // §102.9. Still here means buffers cut from it live on, and the id
-            // is the client's to reuse from this message on.
             if self.pools.get(&id).is_some_and(|p| p.zombie) {
                 self.retire_pool_id(id);
             }
@@ -2685,48 +2594,13 @@ impl Session {
         }
     }
 
-    /// Whether the compositor has a `wl_buffer` with this id right now.
-    ///
-    /// STAGE 16. `false` for a buffer whose `create_buffer` was absorbed, and
-    /// for one the reclaimer destroyed. Both mean the same thing to every
-    /// caller: a message naming it must not be forwarded.
-    fn buffer_is_upstream(&self, buffer: u32) -> bool {
-        // §102: a buffer with no pool is always the compositor's.
-        self.foreign_buffers.contains(&buffer) || self.buffers.get(&buffer).is_some_and(|b| b.upstream)
-    }
-
-    /// Finish with a pool whose destructor was absorbed.
-    ///
-    /// STAGE 16. The client has destroyed a pool the compositor does not have,
-    /// so nothing was forwarded and nothing will acknowledge it. This is where
-    /// the acknowledgement is invented — but **only once the last buffer has
-    /// gone**, because sending it is what frees the id in the client, and an id
-    /// freed while buffers still refer to the pool could be reused for another
-    /// object while this proxy still has the pool in its table.
-    ///
-    /// A no-op for a pool that is not in that state, so that the two call sites
-    /// which cannot easily tell may both call it.
-    fn dispose_absorbed_pool(&mut self, pool_id: u32) {
-        let ready = self
-            .pools
-            .get(&pool_id)
-            .is_some_and(|p| p.zombie && !p.upstream() && !p.teardown && p.buffers == 0);
-        if ready {
-            self.pools.remove(&pool_id);
-            self.fabricate_delete_id(pool_id);
-        }
-    }
-
     /// Release a pool's region once every condition in [`Pool::releasable`] is
     /// met. Called from all three places that can make one true.
     fn release_pool_if_done(&mut self, pool_id: u32) {
         if !self.pools.get(&pool_id).is_some_and(Pool::releasable) {
             return;
         }
-        if let Some(pool) = self.pools.remove(&pool_id)
-            && let Some(region) = &pool.region
-        {
-            self.transport.destroy(region);
+        if self.pools.remove(&pool_id).is_some() {
             self.stats.pools_released += 1;
         }
     }
@@ -2793,101 +2667,35 @@ impl Session {
             pool_id,
             Pool {
                 client,
-                region: None,
                 shm,
                 size,
                 zombie: false,
-                acked: false,
                 buffers: 0,
-                teardown: false,
-                last_used: Instant::now(),
-                warned: false,
-                wanted: true,
-                ever_published: false,
+                upstream_len: STUB_LEN,
+                on_stub: true,
             },
         );
         Ok(())
     }
 
-    /// Note that this message wants a pool to exist upstream, before anything
-    /// is published. See [`Pool::wanted`].
-    ///
-    /// Peeking at the message before handling it, the same way `deferrable`
-    /// does, is what lets `flush_deferred` run once at the top of
-    /// `client_message` and still know which pools this particular message
-    /// needs — rather than publishing every pool that happens to lack a region,
-    /// which is the bug this exists to fix.
-    fn note_demand(&mut self, interface: &str, opcode: u16, object: u32, body: &[u8], spans: &[Span]) {
-        let pool = match interface {
-            // **Only `create_buffer`**, and the exclusions are the point.
-            //
-            // `destroy` must never mark a pool wanted: republishing a pool in
-            // order to forward its destructor is not merely wasteful, it is
-            // wrong — the pool would be built and torn down in the same batch,
-            // and it was doing exactly that until a test caught it.
-            //
-            // `resize` need not, because a resize of a pool with no upstream
-            // object is absorbed and recorded in `Pool::size`, so a later
-            // rebuild already happens at the size the client settled on.
-            "wl_shm_pool" if opcode == op::POOL_CREATE_BUFFER => Some(object),
-            // An attach names a buffer, and a buffer names a pool. A commit
-            // carries no buffer of its own, so it asks after the attach that
-            // was held back for want of one.
-            "wl_surface" if opcode == op::SURFACE_ATTACH => spans
-                .first()
-                .and_then(|s| wire::word_at(body, s))
-                .filter(|b| *b != 0)
-                .and_then(|b| self.buffers.get(&b))
-                .map(|b| b.pool),
-            "wl_surface" if opcode == op::SURFACE_COMMIT => self
-                .surfaces
-                .get(&object)
-                .and_then(|s| s.dropped_attach.as_ref())
-                .and_then(|held| held.get(..4))
-                .and_then(|b| b.try_into().ok())
-                .map(u32::from_ne_bytes)
-                .and_then(|b| self.buffers.get(&b))
-                .map(|b| b.pool),
-            _ => None,
-        };
-        if let Some(p) = pool.and_then(|p| self.pools.get_mut(&p)) {
-            p.wanted = true;
-        }
-    }
-
-    /// Returns true if the resize was **absorbed** — the pool has not been
-    /// announced yet, so the request must not be forwarded.
-    fn resize_pool(&mut self, pool_id: u32, size: i32) -> bool {
+    /// The client's pool has grown: its mapping follows. Returns the size to
+    /// forward, which is the compositor's pool's own (`Pool::upstream_len`).
+    fn resize_pool(&mut self, pool_id: u32, size: i32) -> u32 {
         self.stats.pool_resizes += 1;
-        let Ok(size) = usize::try_from(size) else {
-            return false;
-        };
         let Some(pool) = self.pools.get_mut(&pool_id) else {
-            return false;
+            return STUB_LEN;
         };
-        // STAGE 16: `!upstream()` rather than `region.is_none()`. A resize
-        // forwarded to a pool the compositor is in the middle of destroying is
-        // a request on an object that may already be gone, which is the same
-        // fatal shape as the `create_buffer` in §20.2.
-        let deferred = !pool.upstream();
-        if pool.upstream()
-            && let Some(region) = &pool.region
-            && size as u64 > region.size
+        let have = pool.upstream_len;
+        if let Ok(size) = usize::try_from(size)
+            && size > pool.size
         {
-            self.stats.resize_overflows += 1;
-            let have = region.size;
-            self.note(format!(
-                "pool {pool_id}: resize to {size} exceeds the {have}-byte region; \
-                 raise --pool-headroom. The compositor will keep the old size."
-            ));
-            return false;
+            if let Err(e) = pool.client.remap(size) {
+                self.note(format!("pool {pool_id}: could not remap the client's pool: {e}"));
+                return have;
+            }
+            pool.size = size;
         }
-        if let Err(e) = pool.client.remap(size) {
-            self.note(format!("pool {pool_id}: could not remap the client's pool: {e}"));
-            return deferred;
-        }
-        pool.size = size;
-        deferred
+        have
     }
 
     /// Drop every surface's record of what buffer `id` owes.
@@ -2942,10 +2750,6 @@ impl Session {
             surface.current = surface.pending_buffer;
             surface.pending_attached = false;
         }
-        // STAGE 16: taken, not drained, until it is known that a copy will
-        // happen. A commit that copies nothing must leave the client's damage
-        // where it is, or the rows it named are never copied by anybody.
-        let full = surface.needs_full_copy;
         let Some(buffer_id) = surface.current else {
             surface.damage.clear();
             self.stats.verify_unreached += 1;
@@ -2973,42 +2777,41 @@ impl Session {
             }
             return;
         }
-        let Some(info) = self.buffers.get(&buffer_id).cloned() else {
+        let Some(full_info) = self.buffers.get(&buffer_id).cloned() else {
             self.stats.verify_unreached += 1;
             return;
         };
-        let Some(pool) = self.pools.get_mut(&info.pool) else {
+        // §109: the buffer's own extent. An attach always backs it first, so
+        // one with none is a commit naming a buffer this proxy never saw
+        // attached; the damage stays for the commit that can copy it.
+        let Some(region) = full_info.backing.clone() else {
             self.stats.verify_unreached += 1;
             return;
         };
-
-        let Some(region) = pool.region.clone().filter(|_| pool.upstream()) else {
-            // A commit against a pool the compositor does not have: refused for
-            // want of room, or mid-teardown. Already noted, and the surface
-            // keeps whatever it last showed. The damage list is deliberately
-            // **not** consumed on the way out — see `needs_full_copy`.
+        if !self.pools.contains_key(&full_info.pool) {
             self.stats.verify_unreached += 1;
             return;
-        };
-        pool.last_used = Instant::now();
-        // The copy is going to happen, so the damage really is consumed and the
-        // "everything, once" flag really is discharged.
-        let damage = std::mem::take(&mut self.surfaces.get_mut(&surface_id).expect("just read").damage);
-        if full && let Some(s) = self.surfaces.get_mut(&surface_id) {
-            s.needs_full_copy = false;
         }
+        let damage = std::mem::take(&mut self.surfaces.get_mut(&surface_id).expect("just read").damage);
         if let Some(b) = self.buffers.get_mut(&buffer_id) {
             // The compositor is about to be told to read these bytes, and until
             // it says `release` it may be doing so. The reclaimer reads this.
             b.held = true;
+            b.last_used = Instant::now();
         }
-        let pool = self.pools.get_mut(&info.pool).expect("just read");
-        let src = pool.client.as_slice();
+        // The client's copy starts at the buffer's offset in its pool; this
+        // side's at 0 of the buffer's extent. `info` is the buffer at 0, and
+        // `src` the client's pool from the buffer's offset, so every copy
+        // below lines the two up.
+        let info = full_info.at_zero();
+        let pool = self.pools.get(&full_info.pool).expect("just read");
+        let src_all = pool.client.as_slice();
+        let src = &src_all[usize::try_from(full_info.offset).unwrap_or(0).min(src_all.len())..];
         let Some(dst) = self.transport.bytes_mut(&region) else {
             self.stats.verify_unreached += 1;
             return;
         };
-        let usable = src.len().min(dst.len()).min(pool.size);
+        let usable = src.len().min(dst.len());
 
         // Deliberately after every early return above: settling this buffer's
         // arrears is only honest if the copy that settles them actually
@@ -3044,11 +2847,9 @@ impl Session {
             .flatten();
         let started = Instant::now();
         let copied = match self.scope {
-            CopyScope::Pool => {
-                dst[..usable].copy_from_slice(&src[..usable]);
-                usable
-            }
-            CopyScope::Buffer => copy_extent(src, dst, &info, usable),
+            // §109: a buffer is its own extent, so the pool scope is the
+            // buffer's.
+            CopyScope::Pool | CopyScope::Buffer => copy_extent(src, dst, &info, usable),
             CopyScope::Damage => {
                 // Not `damage` — what *this buffer's* copy owes, which is this
                 // frame's damage plus every frame's since it was last on
@@ -3069,7 +2870,6 @@ impl Session {
                 // after such a gap is the whole extent. See
                 // `Surface::needs_full_copy`.
                 match owed {
-                    _ if full => copy_extent(src, dst, &info, usable),
                     Stale::Everything => copy_extent(src, dst, &info, usable),
                     Stale::Rects(rects) if rects.is_empty() => 0,
                     // **Never pay more than the extent.** `copy_damage` copies
@@ -3663,3 +3463,29 @@ pub use dmabuf::{
 
 #[cfg(test)]
 mod tests;
+
+/// §109. The stub extent every pool is created on and every unbacked buffer
+/// is cut from: one page.
+const STUB_LEN: u32 = 4096;
+/// `wl_shm.error.invalid_stride`.
+const SHM_ERROR_INVALID_STRIDE: u32 = 1;
+/// `wl_display.error.no_memory`.
+const DISPLAY_ERROR_NO_MEMORY: u32 = 2;
+
+/// `wl_shm.create_pool(new_id, fd, size)`, the fd in band as the descriptor.
+fn create_pool_message(shm: u32, pool: u32, descriptor: &Descriptor, len: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&pool.to_ne_bytes());
+    wire::push_bytes(&mut body, &descriptor.encode());
+    body.extend_from_slice(&len.to_ne_bytes());
+    wire::message(shm, op::SHM_CREATE_POOL, &body)
+}
+
+/// `wl_shm_pool.create_buffer(new_id, offset, width, height, stride, format)`.
+fn create_buffer_message(pool: u32, buffer: u32, offset: i32, width: i32, height: i32, stride: i32, format: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    for w in [buffer, offset as u32, width as u32, height as u32, stride as u32, format] {
+        body.extend_from_slice(&w.to_ne_bytes());
+    }
+    wire::message(pool, op::POOL_CREATE_BUFFER, &body)
+}

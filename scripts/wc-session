@@ -64,6 +64,7 @@
 #
 #   wc-session apps                           check $APPS and print each definition
 #   wc-session resolve NAME                   where a program name resolves here
+#   wc-session pw-stack DIR                   write a private PipeWire stack for DIR (§106.3)
 #
 # THE ARENA IS NEVER A FILE ARENA, AND SINCE §83 THE PRODUCT PATH HAS NO ROOT
 #
@@ -148,7 +149,15 @@ hub_up() {
   return 1
 }
 # The Wayland doorbell a proxy connects to: the hub's, or QEMU's own socket.
-wcbell_use() { if hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
+# The hub's Wayland socket, when a hub runs and serves it. A guest that
+# hosts the sessions itself (§103.17, role b) has only that: its hub holds the
+# guest's own port, and there is no QEMU socket at $WCBELL.
+wl_hub() {
+  [ -S "$HUBDIR/wl.sock" ] || return 1
+  [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
+  env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet wc-bell-hub.service
+}
+wcbell_use() { if wl_hub || hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -448,7 +457,13 @@ launch() {
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     # The options first: `wc-proxy desktop` reads none after its first word,
     # so the id and the URL can only ever be words (§94).
-    OUT=$("$BIN/wc-proxy" desktop --dirs "$(app_dirs "$EXE")" "$KIND" "$DEF_DESKTOP" "$ARG" 2>&1) \
+    # §106: in a session with host integration, a file:/// URL from the host
+    # opens only inside the shares the host told the proxy about
+    # ($D/hostint/roots, written by the proxy; empty until it has been told,
+    # which refuses every file URL).
+    local ROOTARGS=()
+    [ -f "$D/hostint/roots" ] && ROOTARGS=(--file-roots "$(tr '\n' ':' <"$D/hostint/roots")")
+    OUT=$("$BIN/wc-proxy" desktop --dirs "$(app_dirs "$EXE")" "${ROOTARGS[@]}" "$KIND" "$DEF_DESKTOP" "$ARG" 2>&1) \
       || die "$KIND $APP: $OUT"
     PROG=$(sed -n 's/^program //p' <<<"$OUT"); ARGS=$(sed -n 's/^args //p' <<<"$OUT")
     [ "$(basename "$EXE")" = "$PROG" ] \
@@ -485,9 +500,11 @@ launch() {
 AUDIO_RATE=48000
 pulse_bin() {
   # 1. `$BIN/pulse`, a GC-rooted link to the package the deploy step chose;
-  # 2. this machine's own, by `resolve_exec`.
+  # 2. this machine's own, by `resolve_exec`;
+  # 3. the newest pulseaudio package in the store, which is where pactl is
+  #    (§106.3: a host whose own sound server is PipeWire has no other).
   if [ -x "$BIN/pulse/bin/$1" ]; then echo "$BIN/pulse/bin/$1"; return 0; fi
-  resolve_exec "$1"
+  resolve_exec "$1" || store_tool pulseaudio "$1"
 }
 
 # audio_up D ID: start the session's PulseAudio as a user unit beside the
@@ -511,6 +528,11 @@ audio_up() {
     fi
     return 0
   fi
+  # §106: a PipeWire for the host's devices, the session's own or the
+  # desktop user's (pw_up, below). `on` stays §86's PulseAudio.
+  case "${WC_LAUNCH_AUDIO:-on}" in
+    pipewire|user-pipewire) pw_up "$D" "$ID"; return 0 ;;
+  esac
   if ! PA=$(pulse_bin pulseaudio); then
     echo "none: no pulseaudio on this host (no $BIN/pulse, none in the store)" >"$D/audio.state"; return 0
   fi
@@ -556,6 +578,264 @@ audio_up() {
   else
     echo "none: $PA did not open its socket: $(tail -2 "$D/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
   fi
+}
+
+# ---------------------------------------------------------------- PIPEWIRE ---
+# docs/waycompose-design.md §106.3, §103.16. The host's audio devices arrive
+# on the sound ring, one stream each, and wc-proxy (sound.rs) makes each a pipe
+# sink or source with `pactl` on the session's pulse server, and follows the
+# host's defaults with set-default-sink/source. Two servers besides §86's
+# PulseAudio (`on`, still the default) and `system`:
+#
+#   WC_LAUNCH_AUDIO=pipewire       a PRIVATE pipewire, wireplumber and
+#       pipewire-pulse for this session, as the user unit wc-launch-audio-ID,
+#       everything under $D/pw: its socket $D/pw/pipewire-0, its state, its
+#       configuration. The pulse socket is $D/xdg/pulse/native, where §86's
+#       was, so an application finds it with no configuration and the sound
+#       ring's pactl drives it like the session's PulseAudio. WirePlumber runs
+#       a profile with no ALSA, Bluetooth, camera, D-Bus, logind or device
+#       reservation, so it can never claim this machine's own sound hardware
+#       or ask the user's desktop PipeWire to release a card. This is the mode
+#       for a machine whose user has a desktop PipeWire of their own (the
+#       workstation): their daemon is never touched, no node is added to it
+#       and none of its defaults change. One null sink, `wc`, gives the
+#       applications an output before the host's devices arrive.
+#   WC_LAUNCH_AUDIO=user-pipewire  the session user's OWN PipeWire, like
+#       `system` (/run/user/UID/pulse/native, the sound ring's devices added
+#       to it and unloaded by `down`), for a user whose desktop IS the session
+#       (a dedicated Linux VM's user). Refused unless the session user is
+#       WC_LAUNCH_AUDIO_USER, ConditionUser-style: a mistake in this setting
+#       would otherwise put the host's devices into somebody's real desktop.
+#
+# The binaries, like pulse_bin: `$BIN/pipewire` and `$BIN/wireplumber`
+# (GC-rooted links the deploy step chose), then PATH, then the store.
+pw_bin() { store_tool pipewire "$1"; }
+# §106.3: the sound ring's native nodes under PipeWire (nix/wc-pw-node.nix):
+# `$BIN/wc-pw-node`, the GC root the deploy step makes, then the store.
+pw_node_bin() {
+  if [ -x "$BIN/wc-pw-node/bin/wc-pw-node" ]; then echo "$BIN/wc-pw-node/bin/wc-pw-node"; return 0; fi
+  store_tool wc-pw-node wc-pw-node
+}
+wp_bin() {
+  if [ -x "$BIN/wireplumber/bin/wireplumber" ]; then echo "$BIN/wireplumber/bin/wireplumber"; return 0; fi
+  store_tool wireplumber wireplumber
+}
+# pw_remote D: the session's PipeWire socket for the configured mode, or
+# nothing (and status 1) if the mode has none.
+pw_remote() {
+  case "${WC_LAUNCH_AUDIO:-on}" in
+    pipewire) echo "$1/pw/pipewire-0" ;;
+    user-pipewire) [ "$(id -un)" = "${WC_LAUNCH_AUDIO_USER:-}" ] && echo "/run/user/$UID_/pipewire-0" || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# pw_stack_write D: write the private stack's configuration and
+# $D/pipewire.sh, which runs it in the foreground until one of its processes
+# ends. Prints why on stdout and fails if a binary is missing.
+pw_stack_write() {
+  local D="$1" PWX WPX PW="$1/pw"
+  PWX=$(pw_bin pipewire) || { echo "no pipewire on this host (no $BIN/pipewire, none in the store)"; return 1; }
+  WPX=$(wp_bin) || { echo "no wireplumber on this host"; return 1; }
+  mkdir -p "$PW/home" "$PW/state" "$PW/config/wireplumber/wireplumber.conf.d" "$D/xdg/pulse"
+  chmod 700 "$PW"
+  local SPA='context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}'
+  # The daemon: the stock one without portal, X11 bell or D-Bus, and with one
+  # null sink so an application has an output before the host's devices
+  # arrive (and with none at all from the host).
+  cat >"$PW/wc-daemon.conf" <<EOF
+# Generated by wc-session (§106.3). The session's private PipeWire.
+context.properties = {
+    core.daemon = true
+    core.name = pipewire-0
+    support.dbus = false
+    default.clock.rate = 48000
+    default.clock.allowed-rates = [ 44100 48000 ]
+    mem.warn-mlock = false
+    log.level = 2
+}
+$SPA
+context.modules = [
+    { name = libpipewire-module-rt args = { nice.level = -11 rtportal.enabled = false } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-metadata }
+    { name = libpipewire-module-spa-device-factory }
+    { name = libpipewire-module-spa-node-factory }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-client-device }
+    # Grants a client its permissions: without it no client is ever answered.
+    { name = libpipewire-module-access args = { } }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-link-factory }
+    { name = libpipewire-module-session-manager }
+]
+context.objects = [
+    { factory = spa-node-factory args = { factory.name = support.node.driver node.name = Dummy-Driver
+        node.group = pipewire.dummy node.sync-group = sync.dummy priority.driver = 200000 } }
+    { factory = spa-node-factory args = { factory.name = support.node.driver node.name = Freewheel-Driver
+        priority.driver = 190000 node.group = pipewire.freewheel node.sync-group = sync.dummy node.freewheel = true } }
+    { factory = adapter args = { factory.name = support.null-audio-sink node.name = wc
+        node.description = "waycompose" media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000
+        monitor.channel-volumes = true priority.session = 100 object.linger = true } }
+]
+EOF
+  cat >"$PW/wc-pulse.conf" <<EOF
+# Generated by wc-session (§106.3). pipewire-pulse for the session's
+# applications and for the sound ring's pactl.
+context.properties = { support.dbus = false log.level = 2 }
+$SPA
+context.modules = [
+    { name = libpipewire-module-rt args = { nice.level = -11 rtportal.enabled = false } flags = [ ifexists nofail ] }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-metadata }
+    { name = libpipewire-module-protocol-pulse args = { } }
+]
+pulse.properties = { server.address = [ "unix:$D/xdg/pulse/native" ] }
+EOF
+  # WirePlumber's policy and metadata only: no hardware monitor of any kind.
+  cat >"$PW/config/wireplumber/wireplumber.conf.d/wc-session.conf" <<'EOF'
+# Generated by wc-session (§106.3). Policy only: this WirePlumber never touches
+# this machine's sound hardware, its D-Bus or its seat.
+wireplumber.profiles = {
+  wc-session = {
+    inherits = [ policy, mixin.systemwide-session ]
+    support.dbus = disabled
+    support.reserve-device = disabled
+    monitor.alsa = disabled
+    monitor.alsa-midi = disabled
+    monitor.bluez = disabled
+    monitor.bluez-midi = disabled
+    monitor.v4l2 = disabled
+    monitor.libcamera = disabled
+  }
+}
+EOF
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'set -u'
+    printf 'D=%q PW=%q PWX=%q WPX=%q\n' "$D" "$PW" "$PWX" "$WPX"
+    cat <<'EOF'
+# Nothing inherited may point at another PipeWire, PulseAudio or bus.
+unset DBUS_SESSION_BUS_ADDRESS PIPEWIRE_REMOTE PIPEWIRE_CORE PULSE_SERVER PULSE_RUNTIME_PATH
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
+export HOME="$PW/home" XDG_STATE_HOME="$PW/state" XDG_CONFIG_HOME="$PW/config"
+export XDG_RUNTIME_DIR="$PW" PIPEWIRE_RUNTIME_DIR="$PW"
+pids=()
+trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'exit 0' TERM INT
+rm -f "$PW/pipewire-0" "$PW/pipewire-0.lock" "$PW/pipewire-0-manager" "$PW/pipewire-0-manager.lock" "$D/xdg/pulse/native"
+"$PWX" -c "$PW/wc-daemon.conf" >>"$PW/daemon.log" 2>&1 & pids+=($!)
+for _ in $(seq 1 100); do [ -S "$PW/pipewire-0" ] && break; sleep 0.05; done
+[ -S "$PW/pipewire-0" ] || { echo "no PipeWire socket at $PW/pipewire-0" >&2; exit 1; }
+"$WPX" -p wc-session >>"$PW/wireplumber.log" 2>&1 & pids+=($!)
+"$PWX" -c "$PW/wc-pulse.conf" >>"$PW/pulse.log" 2>&1 & pids+=($!)
+wait -n
+echo "a process of the stack ended; stopping the rest" >&2
+exit 1
+EOF
+  } >"$D/pipewire.sh"
+  chmod 755 "$D/pipewire.sh"
+}
+
+# pw_up D ID: the §106.3 modes' audio_up. Never fatal, like audio_up.
+pw_up() {
+  local D="$1" ID="$2" UNIT="wc-launch-audio-$2" WHY SOCK
+  if [ "$WC_LAUNCH_AUDIO" = user-pipewire ]; then
+    if [ -z "${WC_LAUNCH_AUDIO_USER:-}" ] || [ "$(id -un)" != "$WC_LAUNCH_AUDIO_USER" ]; then
+      echo "none: WC_LAUNCH_AUDIO=user-pipewire is only for the desktop user WC_LAUNCH_AUDIO_USER (${WC_LAUNCH_AUDIO_USER:-unset}), not $(id -un)" >"$D/audio.state"
+      return 0
+    fi
+    SOCK="/run/user/$UID_/pulse/native"
+    if [ -S "$SOCK" ]; then
+      echo "user-pipewire $SOCK (the desktop user's own PipeWire; the sound ring's devices are added to it)" >"$D/audio.state"
+    else
+      echo "none: WC_LAUNCH_AUDIO=user-pipewire and no pulse server at $SOCK" >"$D/audio.state"
+    fi
+    return 0
+  fi
+  if ! WHY=$(pw_stack_write "$D"); then
+    echo "none: $WHY" >"$D/audio.state"; return 0
+  fi
+  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pipewire.sh" >/dev/null 2>&1; then
+    echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
+  fi
+  SOCK="$D/xdg/pulse/native"
+  for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.05; done
+  if [ -S "$SOCK" ]; then
+    echo "pipewire $SOCK (private PipeWire $D/pw/pipewire-0; the sound ring's devices are its sinks and sources)" >"$D/audio.state"
+  else
+    echo "none: the private PipeWire did not come up: $(tail -2 "$D/pw/daemon.log" "$D/pw/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
+  fi
+}
+
+# §106.4. Host integration for the session's applications, when the proxy
+# serves it ($D/hostint.sock): xdg-open is wc-host-open, BROWSER is xdg-open,
+# and the host's applications and defaults come first in the XDG directories.
+# Sets HOSTINT_ENV (an array of NAME=value).
+hostint_env() {
+  local D="$1" SHIM
+  HOSTINT_ENV=()
+  [ -S "$D/hostint.sock" ] || return 0
+  # The shim: the deployed scripts/wc-hostint, or one written here.
+  SHIM="$BASE/wc-hostint"
+  if [ ! -x "$SHIM/xdg-open" ]; then
+    SHIM="$D/hostint/bin"
+    mkdir -p "$SHIM"
+    printf '#!/bin/sh\n# wc-session (§106.4): xdg-open opens on the host.\nexec "${WC_HOST_OPEN:-wc-host-open}" "$@"\n' >"$SHIM/xdg-open"
+    chmod 755 "$SHIM/xdg-open"
+  fi
+  HOSTINT_ENV=(
+    "PATH=$SHIM:$PATH"
+    "XDG_DATA_DIRS=$D/hostint/xdg-data:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    "XDG_CONFIG_DIRS=$D/hostint/xdg-config:${XDG_CONFIG_DIRS:-/etc/xdg}"
+    "BROWSER=xdg-open"
+    "WC_HOSTINT_SOCK=$D/hostint.sock"
+    "WC_HOST_OPEN=$BIN/wc-host-open"
+  )
+}
+
+# hostint_args D: the proxy's §106 flags, for a session with rings.
+hostint_args() {
+  local D="$1"
+  printf -- '--hostint %q --hostint-opener %q' "$D" "$BIN/wc-host-open"
+}
+
+# sound_ring_args D PREFIX: the proxy's §103.16 flags for the session's server,
+# with the device side's platform ("mac", "win") as the node names' prefix
+# (§106.3). Under PipeWire every device is a native node of wc-pw-node, paced
+# by the ring's credit (a pipe module there drops); the proxy asks the server
+# what it is and uses the pipe modules on a PulseAudio. Nothing without pactl.
+sound_ring_args() {
+  # KIND (optional): the server the session will have, when it is still
+  # starting beside the proxy (§105.13); otherwise audio.state says.
+  local D="$1" PREFIX="$2" KIND="${3:-}" GIVEN="${3:-}" PACTL PWNODE PWSOCK SRV
+  PACTL=$(pulse_bin pactl 2>/dev/null) || return 0
+  [ -n "$PACTL" ] || return 0
+  [ -n "$KIND" ] || KIND=$(cut -d" " -f1 "$D/audio.state" 2>/dev/null)
+  case "$KIND" in
+    pulse|pipewire) SRV="unix:$D/xdg/pulse/native" ;;
+    system|user-pipewire) SRV="unix:/run/user/$UID_/pulse/native" ;;
+    *) return 0 ;;
+  esac
+  printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix %q' "$PACTL" "$SRV" "$D" "$PREFIX"
+  PWNODE=$(pw_node_bin 2>/dev/null)
+  case "$KIND" in
+    pipewire) PWSOCK="$D/pw/pipewire-0" ;;
+    system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
+    *) PWSOCK="" ;;
+  esac
+  # The socket may not exist yet when the server starts beside the proxy;
+  # the proxy asks the server what it is when the first device arrives.
+  [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && { [ -n "$GIVEN" ] || [ -S "$PWSOCK" ]; } \
+    && printf -- ' --sound-pw-node %q --sound-pipewire %q' "$PWNODE" "$PWSOCK"
+  return 0
 }
 
 # --------------------------------------------------------------- start_app ---
@@ -691,7 +971,7 @@ start_app() {
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in
-    pulse*|system*) ;;
+    pulse*|pipewire*|user-pipewire*|system*) ;;
     *)
       # Loudly, in both places a person looks: the application's log on this
       # machine and the launcher's log on the guest (it logs what `run` says).
@@ -723,7 +1003,7 @@ start_app() {
       # AUDIO (§86): no server means Firefox's own null context, never a
       # Firefox that waits on an audio process for ever.
       case "$AUDIO" in
-        pulse*) ;;
+        pulse*|pipewire*|user-pipewire*|system*) ;;
         *)
           printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
             >> "$PROFILE/user.js"
@@ -827,19 +1107,54 @@ start_app() {
   # §95: a crash reporter that is dismissed deletes its minidump, and four of
   # §95's crashes left nothing to read. Kept in the profile's minidumps/.
   KEEP_DUMPS="MOZ_CRASHREPORTER_NO_DELETE_DUMP=1"
+  # §106: the session's PipeWire by path (its sockets are not under the
+  # application's XDG_RUNTIME_DIR), and host integration if the proxy serves it.
+  AUDIOENV=()
+  case "$AUDIO" in
+    pipewire*|user-pipewire*)
+      AUDIOENV=("PULSE_SERVER=unix:$(sed -n 's/^[a-z-]* \([^ ]*\) .*/\1/p' "$D/audio.state")")
+      PWR=$(pw_remote "$D") && AUDIOENV+=("PIPEWIRE_REMOTE=$PWR")
+      ;;
+  esac
+  hostint_env "$D"
   # shellcheck disable=SC2086
   # §103.16: with the user's own sound server, the applications are told
   # where it is (their runtime directory is the session's).
   PULSEENV=""
   case "$AUDIO" in system*) PULSEENV="PULSE_SERVER=unix:/run/user/$UID_/pulse/native" ;; esac
+  # §106.7: TEST SESSIONS NEVER SEE THE USER'S APPLICATION STATE. An operator
+  # setting of this machine (never a word from the guest): with
+  # WC_LAUNCH_TEST_HOME=DIR the application gets DIR/{home,config,data,state,cache}
+  # as its HOME and XDG base directories, so an editor restores no real
+  # documents and a browser opens no real profile. Production sessions leave it
+  # unset: there the application is the user's, with the user's state.
+  TESTENV=()
+  # The same setting for one installation only: `$BASE/test-home` (its first
+  # line), written by the operator beside this script, for a test
+  # installation started by the shared session service, whose environment
+  # every installation shares.
+  if [ -z "${WC_LAUNCH_TEST_HOME:-}" ] && [ -s "$BASE/test-home" ]; then
+    WC_LAUNCH_TEST_HOME=$(head -1 "$BASE/test-home")
+  fi
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then
+    case "$WC_LAUNCH_TEST_HOME" in /*) ;; *) die "WC_LAUNCH_TEST_HOME must be absolute" ;; esac
+    [[ "$WC_LAUNCH_TEST_HOME" =~ ^[A-Za-z0-9/._-]+$ ]] || die "WC_LAUNCH_TEST_HOME: only [A-Za-z0-9/._-]"
+    mkdir -p "$WC_LAUNCH_TEST_HOME"/{home,config,data,state,cache}
+    TESTENV=(HOME="$WC_LAUNCH_TEST_HOME/home" XDG_CONFIG_HOME="$WC_LAUNCH_TEST_HOME/config"
+      XDG_DATA_HOME="$WC_LAUNCH_TEST_HOME/data" XDG_STATE_HOME="$WC_LAUNCH_TEST_HOME/state"
+      XDG_CACHE_HOME="$WC_LAUNCH_TEST_HOME/cache")
+    echo "wc-session: test session: HOME and XDG_* under $WC_LAUNCH_TEST_HOME" >>"$D/app.log"
+  fi
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$D/xdg" $PULSEENV \
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS $KEEP_DUMPS \
+    "${AUDIOENV[@]}" "${HOSTINT_ENV[@]}" \
     "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
     "${DEF_ENV[@]}" \
+    "${TESTENV[@]}" \
     "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*} titlebar=$DEF_TITLEBAR"
 }
@@ -925,6 +1240,8 @@ up)
     [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$ARENA" | tr -d ' ')
     if [ "${RLEN:-0}" = 0 ]; then
       WHY="the compositor kept no rings (header version $VER; its log says why)"
+    elif wl_hub; then
+      WHY=""
     elif [ ! -S "$WCBELL" ]; then
       WHY="no doorbell socket at $WCBELL: the VM has no org.sirati.wcbell.0 port"
     elif [ ! -r "$WCBELL" ] || [ ! -w "$WCBELL" ]; then
@@ -948,6 +1265,15 @@ up)
       echo "ssh: $WHY" >"$D/transport"
       echo "transport SSH FALLBACK: $WHY"
     fi
+    # §107: the session's index in the guest's shared compositor, from its
+    # boot record, which the session service passes; every ring claim of the
+    # proxy carries it and its arena is the BAR windows it is granted.
+    case "${WC_LAUNCH_SESSION_INDEX:-0}" in
+      0) rm -f "$D/session.index" ;;
+      [1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5]) echo "$WC_LAUNCH_SESSION_INDEX" >"$D/session.index"
+         echo "session index $WC_LAUNCH_SESSION_INDEX of a shared compositor" ;;
+      *) die "WC_LAUNCH_SESSION_INDEX=$WC_LAUNCH_SESSION_INDEX is not 0..255" ;;
+    esac
     echo "up ok $D"
     exit 0
   fi
@@ -1105,6 +1431,8 @@ proxy)
     if [ $SERVICE = 1 ]; then
       audio_up "$D" "$ID" & APID=$!
       if [ "${WC_LAUNCH_AUDIO:-on}" = system ]; then AUDIO_EXPECT=system
+      elif [ "${WC_LAUNCH_AUDIO:-on}" = user-pipewire ]; then AUDIO_EXPECT=user-pipewire
+      elif [ "${WC_LAUNCH_AUDIO:-on}" = pipewire ] && pw_bin pipewire >/dev/null 2>&1; then AUDIO_EXPECT=pipewire
       elif [ "${WC_LAUNCH_AUDIO:-on}" != off ] && pulse_bin pulseaudio >/dev/null 2>&1; then AUDIO_EXPECT=pulse; fi
     fi
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
@@ -1138,13 +1466,17 @@ proxy)
         BELLUSE=poll
         [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
         RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
-        # §103.16 on Windows (§105): the sound ring, the guest's default output
-        # a pipe sink on the session's server, paced by the guest's credit.
-        PACTL=$(pulse_bin pactl 2>/dev/null)
-        case "$AUDIO_EXPECT" in
-          pulse) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
-          system) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
-        esac
+        # §107: a session of the guest's shared compositor.
+        IDX=$(cat "$D/session.index" 2>/dev/null)
+        [ -n "$IDX" ] && RINGARGS="$RINGARGS --session-index $IDX"
+        # §110: the GPU device is region 1 of the one pool the shared
+        # compositor leases Wayland buffers from when its BAR is full.
+        [ -n "$IDX" ] && [ -r "$GPUREGION" ] && RINGARGS="$RINGARGS $(printf -- '--arena-region 1=%q' "$GPUREGION")"
+        # §106: host integration, and every Windows endpoint a stream of the
+        # sound ring with stable names (§103.16, §106.3).
+        # The session's server starts beside the proxy (§105.13), so its kind
+        # is the expected one, not audio.state.
+        RINGARGS="$RINGARGS $(hostint_args "$D") $(sound_ring_args "$D" win "$AUDIO_EXPECT")"
       fi
       printf 'exec %q %s --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$UPARGS" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
@@ -1198,13 +1530,9 @@ proxy)
     MACBELL=poll
     [ -n "${WC_LAUNCH_MAC_BELL:-}" ] && [ -S "$WC_LAUNCH_MAC_BELL" ] && MACBELL=$WC_LAUNCH_MAC_BELL
     UPSTREAM_ARGS=$(printf -- '--wayland-rings-plan %q --wayland-bell %q --session-control %q --session-id %q' "$D/rings.plan" "$MACBELL" "$BASE/wc-session" "$ID")
-    # §103.16: the sound ring, every device of the guest's a stream, made a
-    # sink or source on the session's server (or the user's, `system`).
-    PACTL=$(pulse_bin pactl 2>/dev/null)
-    case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
-      pulse) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
-      system) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
-    esac
+    # §106: host integration on the same rings.
+    UPSTREAM_ARGS="$UPSTREAM_ARGS $(hostint_args "$D")"
+    UPSTREAM_ARGS="$UPSTREAM_ARGS $(sound_ring_args "$D" mac)"
   else
     [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
     UPSTREAM_ARGS=$(printf -- '--upstream %q' "$D/up.sock")
@@ -1502,7 +1830,7 @@ down)
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
   # §103.16: a sound ring's devices on the user's own server outlive the
   # proxy that made them; the session's own server goes with its unit.
-  if [ -s "$D/sound.modules" ] && [ "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" = system ] && PACTL=$(pulse_bin pactl 2>/dev/null); then
+  if [ -s "$D/sound.modules" ] && [[ "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" =~ ^(system|user-pipewire)$ ]] && PACTL=$(pulse_bin pactl 2>/dev/null); then
     while read -r m; do
       [[ "$m" =~ ^[0-9]+$ ]] && PULSE_SERVER="unix:/run/user/$UID_/pulse/native" "$PACTL" unload-module "$m" 2>/dev/null
     done <"$D/sound.modules"
@@ -1621,8 +1949,16 @@ audio)
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no session $ID")
-  case "$AUDIO" in pulse*) ;; *) die "no audio for $ID: $AUDIO" ;; esac
+  case "$AUDIO" in pulse*|pipewire*|user-pipewire*) ;; *) die "no audio for $ID: $AUDIO" ;; esac
   PAREC=$(pulse_bin parec) || die "no parec on this host"
+  # §106.3: through the session PipeWire's pulse socket, from whatever the
+  # default output is (a host device's node, or the fallback null sink).
+  case "$AUDIO" in
+    pipewire*|user-pipewire*)
+      exec env PULSE_SERVER="unix:$(sed -n 's/^[a-z-]* \([^ ]*\) .*/\1/p' "$D/audio.state")" \
+        "$PAREC" --device=@DEFAULT_MONITOR@ --format=s16le --rate=$AUDIO_RATE --channels=2 --latency-msec=20 --raw 2>>"$D/parec.log"
+      ;;
+  esac
   exec env PULSE_SERVER="unix:$D/xdg/pulse/native" PULSE_RUNTIME_PATH="$D/xdg/pulse" HOME="$D/pulse-home" \
     "$PAREC" --device=wc.monitor --format=s16le --rate=$AUDIO_RATE --channels=2 --latency-msec=20 --raw 2>>"$D/parec.log"
   ;;
@@ -1666,6 +2002,16 @@ resolve)
   [ -z "$GUEST" ] || die "resolve is an operator verb, not served to the guest"
   [ -n "${1:-}" ] || die "resolve NAME"
   resolve_exec "$1" || die "cannot find $1 on this machine"
+  ;;
+# §106.3: write a private PipeWire stack for DIR, as `WC_LAUNCH_AUDIO=pipewire`
+# would for a session, and print the script that runs it in the foreground.
+# For scripts/wc-hostint-local.sh, which tests the same configuration.
+pw-stack)
+  [ -z "$GUEST" ] || die "pw-stack is an operator verb, not served to the guest"
+  [ -n "${1:-}" ] && [ -d "$1" ] || die "pw-stack DIR (an existing directory)"
+  PSD=$(cd "$1" && pwd)
+  WHY=$(pw_stack_write "$PSD") || die "pw-stack: $WHY"
+  echo "$PSD/pipewire.sh"
   ;;
 
 *)
