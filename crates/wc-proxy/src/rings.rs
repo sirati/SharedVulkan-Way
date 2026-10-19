@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use sv_transport::control::{Control, Geometry, ProtocolIds};
 use sv_transport::ring::Lane;
-use sv_transport::vdoorbell::{BellTarget, Doorman, PortHandle, PortWake};
+use sv_transport::vdoorbell::{BellTarget, Doorman};
 use sv_transport::wlbytes::ByteChannel;
 
 /// Who is waiting on which slot. The doorbell thread's half.
@@ -134,6 +134,21 @@ impl Doorbell {
         Ok(Doorbell { hub, _doorman: Some(doorman) })
     }
 
+    /// §103.15: [`Self::connect`] for the guest-RAM rings, whose session
+    /// services (control, sound, the feeds' bridges) wait on their lanes'
+    /// own words rather than an eventfd: a byte also rings the lane it names
+    /// in `control`, which is what [`ByteChannel::wait_readable`] sleeps on.
+    pub fn connect_with(path: &Path, control: &Arc<Control>) -> io::Result<Doorbell> {
+        let p = path.to_string_lossy();
+        let hub = Arc::new(BellHub::default());
+        let target = Arc::new(HubAndControl { hub: Arc::clone(&hub), control: Arc::clone(control) });
+        let (doorman, connected) = sv_transport::vdoorbell::attach_host_reconnecting(&p, target)?;
+        if !connected {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{p}: nothing listens (no doorbell hub runs for this VM)")));
+        }
+        Ok(Doorbell { hub, _doorman: Some(doorman) })
+    }
+
     /// §103.14: no doorbell port (the macOS guest under QEMU has none yet):
     /// every waiting pump is woken on a fixed period and looks at its ring.
     /// The deadline is the period; the cost is one `write` per waiting
@@ -152,6 +167,33 @@ impl Doorbell {
             .ok();
         Doorbell { hub, _doorman: None }
     }
+}
+
+/// A doorbell byte, for both kinds of waiter (§103.15).
+struct HubAndControl {
+    hub: Arc<BellHub>,
+    control: Arc<Control>,
+}
+
+impl BellTarget for HubAndControl {
+    fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
+        let a = self.hub.ring_token(token, woken);
+        let b = self.control.ring_token(token, woken);
+        a || b
+    }
+}
+
+/// How long a session service's thread sleeps on its lane before looking
+/// again: long with a doorbell, which ends the sleep; a millisecond without
+/// one, which is the polling the doorbell replaces (§103.14).
+static SERVICE_SLICE_US: AtomicU64 = AtomicU64::new(1000);
+
+pub fn set_service_slice(d: std::time::Duration) {
+    SERVICE_SLICE_US.store(d.as_micros() as u64, Ordering::Relaxed);
+}
+
+pub fn service_slice() -> std::time::Duration {
+    std::time::Duration::from_micros(SERVICE_SLICE_US.load(Ordering::Relaxed))
 }
 
 impl BellHub {
@@ -233,7 +275,9 @@ pub fn bridge(control: Arc<Control>, owner: u64) -> io::Result<std::os::unix::ne
                 }
             }
             if idle {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // The ring's side wakes this at once; the socket's is looked
+                // at once a slice (the feeds are small and rare).
+                let _ = ch.wait_readable(service_slice().min(std::time::Duration::from_millis(20)));
             }
         }
     })?;
