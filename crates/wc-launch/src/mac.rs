@@ -370,6 +370,9 @@ struct Session {
     up: Mutex<bool>,
     /// Requests that arrived before the session was up: `(section, key)`.
     pending: Mutex<Vec<(String, String)>>,
+    /// Role (b) (§103.17): the compositor's session service holds the control
+    /// ring and the lease, and takes requests on this socket.
+    socket: Option<PathBuf>,
 }
 
 /// §103.13: the installed launcher, which the main process runs from: not a
@@ -405,11 +408,24 @@ fn run_main(cfg: Config) -> ExitCode {
     }
     let comp_log = log_dir().join("main.compositor.log");
     let _ = std::fs::remove_file(&comp_log);
+    // The arena backend (§103.13): one arena per main process, so one per
+    // user session, shared by every application. Guest RAM when macOS is the
+    // VM (role (a)); with WC_MAC_ARENA_STANDIN=<file>, a file the Linux guest
+    // maps too (role (b), §103.17: a Mac hosting the Linux VM, the file on a
+    // RAM disk the hypervisor shares through virtio-fs DAX), which the
+    // compositor maps as its ivshmem device and boots as the Windows guest
+    // does (§105).
+    let standin = std::env::var("WC_MAC_ARENA_STANDIN")
+        .ok()
+        .or_else(|| Some(cfg.arena_file.clone()))
+        .filter(|s| !s.is_empty());
+    let control_socket = rt.join("control.sock");
     let session = Arc::new(Session {
         id: id.clone(),
         ctl: Mutex::new(None),
         up: Mutex::new(false),
         pending: Mutex::new(Vec::new()),
+        socket: standin.as_ref().map(|_| control_socket.clone()),
     });
     {
         let (c1, s1, l1) = (cfg.clone(), session.clone(), log.clone());
@@ -456,24 +472,31 @@ fn run_main(cfg: Config) -> ExitCode {
         log.say(&format!("could not start the session thread: {e}"));
         return ExitCode::from(1);
     }
-    // The arena backend (§103.13): one arena per main process, so one per
-    // user session, shared by every application. Guest RAM when macOS is the
-    // VM (role (a)); with WC_MAC_ARENA_STANDIN=<file>, a file the Linux guest
-    // maps too (role (b): a Mac hosting the Linux VM, the file on a RAM disk
-    // the hypervisor shares), which the compositor maps as its "ivshmem"
-    // device and the host side checks with `up ID RUNID ivshmem`.
-    let standin = std::env::var("WC_MAC_ARENA_STANDIN").ok().filter(|s| !s.is_empty());
     let arena = cfg.arena_mib.max(32) * 1024 * 1024;
+    let mut argv: Vec<String> = vec!["wc-launch".into(), "--socket".into(), socket, "--in-band".into()];
     // §103.14: the Wayland connections, the feeds, the control and the sound
-    // ride rings in a second window of this process's RAM.
-    let mut argv: Vec<String> =
-        vec!["wc-launch".into(), "--socket".into(), socket, "--in-band".into(), "--wayland-rings-guest-ram".into()];
+    // ride rings in a second window of this process's RAM. In role (b) they
+    // are the shared file's tail (§89).
+    if standin.is_none() {
+        argv.push("--wayland-rings-guest-ram".into());
+    }
     // §103.15: the rings' doorbell, a legacy virtio-serial port's `cu.*` node
     // (or an `fd:R,W` pair a parent opened). Without one the rings are polled
     // and the host's service finds the boot record by its periodic sweep.
+    // Role (b): the hypervisor's FIFO pair for the port (§103.17).
     let bell = std::env::var("WC_MAC_BELL").ok().unwrap_or_else(|| cfg.wayland_bell.clone());
     if !bell.is_empty() {
-        argv.extend(["--wayland-rings".into(), bell]);
+        let spec = match &standin {
+            Some(_) => match fifo_bell(&bell) {
+                Ok(s) => s,
+                Err(e) => {
+                    log.say(&format!("NO DOORBELL, NO RINGS: {e}"));
+                    return ExitCode::from(1);
+                }
+            },
+            None => bell,
+        };
+        argv.extend(["--wayland-rings".into(), spec]);
     }
     // §103.15: the session's GPU server, started here rather than by a
     // harness's ssh. Its cold page carries the session's label; the host's
@@ -484,14 +507,25 @@ fn run_main(cfg: Config) -> ExitCode {
         let mut k = keeper.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(k.0, "gpu {}", g.id()).and_then(|()| k.0.flush());
     }
-    wc_compositor::set_boot_session(&id, cfg.outbound, gpu.is_some());
     match &standin {
         Some(file) => {
             // SAFETY: before the compositor's threads exist.
             unsafe { std::env::set_var("WC_IVSHMEM_STANDIN", file) };
             argv.extend(["--arena-ivshmem".into(), "0".into()]);
+            // §105: the compositor writes the signed record into the header
+            // page, rings hello, and holds control and the lease. The sound
+            // ring stays this process's (CoreAudio, every device, §103.16).
+            let key = if cfg.session_key.is_empty() { support_dir().join("session.key") } else { cfg.session_key.clone().into() };
+            let quiet = Config { audio: false, ..cfg.clone() };
+            argv.extend(plan::boot_argv(&quiet, &id, &key.to_string_lossy(), &control_socket.to_string_lossy()));
+            if gpu.is_some() {
+                argv.push("--boot-gpu".into());
+            }
         }
-        None => argv.extend(["--arena-guest-ram".into(), format!("0:{arena}")]),
+        None => {
+            wc_compositor::set_boot_session(&id, cfg.outbound, gpu.is_some());
+            argv.extend(["--arena-guest-ram".into(), format!("0:{arena}")]);
+        }
     }
     argv.extend([
         "--arena-outbound".into(),
@@ -609,6 +643,9 @@ fn request(cfg: &Config, s: &Arc<Session>, log: &Log, section: &str, key: &str) 
 /// Send one request on the control ring and wait for its reply line.
 fn control_request(s: &Session, line: &str) -> Result<String, String> {
     use sv_transport::wlbytes::ReadOutcome;
+    if let Some(path) = &s.socket {
+        return socket_request(path, line);
+    }
     let mut g = s.ctl.lock().unwrap_or_else(|e| e.into_inner());
     let ch = g.as_mut().ok_or("no control channel")?;
     let t0 = Instant::now();
@@ -637,6 +674,41 @@ fn control_request(s: &Session, line: &str) -> Result<String, String> {
         }
     }
     Ok(format!("{} ({:.1} ms round trip)", String::from_utf8_lossy(&reply).trim(), t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// Role (b): one request to the compositor's session service, which passes it
+/// over the control ring (§105) and answers with one line.
+fn socket_request(path: &Path, line: &str) -> Result<String, String> {
+    use std::io::Read;
+    let t0 = Instant::now();
+    let mut c = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    c.set_read_timeout(Some(Duration::from_secs(60))).map_err(|e| e.to_string())?;
+    c.write_all(format!("{line}\n").as_bytes()).map_err(|e| e.to_string())?;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !reply.ends_with(b"\n") {
+        match c.read(&mut buf) {
+            Ok(0) => return Err("the session service closed the request without an answer".into()),
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(format!("no reply from the session service: {e}")),
+        }
+    }
+    Ok(format!("{} ({:.1} ms round trip)", String::from_utf8_lossy(&reply).trim(), t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// Role (b): the hypervisor's FIFO pair for a bell port (`PREFIX.to-guest`,
+/// `PREFIX.from-guest`) as the `fd:R,W` doorbell spelling. Both are opened
+/// read-write so neither open waits for, nor ends with, the other side; the
+/// descriptors live as long as this process.
+fn fifo_bell(prefix: &str) -> Result<String, String> {
+    use std::os::fd::IntoRawFd;
+    let open = |end: &str| {
+        let p = format!("{prefix}.{end}");
+        std::fs::OpenOptions::new().read(true).write(true).open(&p).map_err(|e| format!("{p}: {e}"))
+    };
+    let r = open("from-guest")?.into_raw_fd();
+    let w = open("to-guest")?.into_raw_fd();
+    Ok(format!("fd:{r},{w}"))
 }
 
 /// The ring slot the host claimed for a session service, once it has.
@@ -753,10 +825,54 @@ fn run_face_mode(cfg: &Config, section: &str) -> ExitCode {
 /// sound. Nothing here reaches the host but through guest RAM.
 fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
     let t0 = Instant::now();
-    if std::env::var_os("WC_IVSHMEM_STANDIN").is_some() {
-        // Role (b)'s boot (a shared-file arena) is the real Mac's launcher's.
-        return Err("WC_MAC_ARENA_STANDIN: this launcher boots guest-RAM sessions only (§103.15)".into());
+    match &s.socket {
+        Some(path) => bring_up_shared(path, s, log, t0)?,
+        None => bring_up_guest_ram(s, log, t0)?,
     }
+    if cfg.audio {
+        let (vol, log2) = (cfg.audio_volume, log.clone());
+        std::thread::Builder::new().name("audio".into()).spawn(move || {
+            // §103.16: every CoreAudio device a stream, both directions, on
+            // the sound ring.
+            match (service_channel(sv_transport::wlbytes::OWNER_AUDIO, Duration::from_secs(20)), wc_compositor::shared_control()) {
+                (Some(ch), Some(control)) => {
+                    let l3 = log2.clone();
+                    if let Err(e) = crate::sound_mac::run(ch, &control, vol, move |m: &str| l3.say(m)) {
+                        log2.say(&format!("sound: {e}"));
+                    }
+                }
+                _ => log2.say("sound: the host opened no sound ring"),
+            }
+        }).ok();
+    }
+    log.say(&format!("session up {:?} after start", t0.elapsed()));
+    Ok(())
+}
+
+/// Role (b) (§103.17): the compositor's session service boots (§105) and
+/// holds the lease; the session is up once it takes requests.
+fn bring_up_shared(path: &Path, s: &Session, log: &Log, t0: Instant) -> Result<(), String> {
+    // The service waits 90 s for the host's answer and 20 s for the control
+    // ring, and says why in the compositor's log if either never comes.
+    let wait = Duration::from_secs(115);
+    while std::os::unix::net::UnixStream::connect(path).is_err() {
+        if t0.elapsed() > wait {
+            return Err(format!(
+                "session {}: no session service on {} after {wait:?}: the guest's wc-sessiond did not \
+                 answer the boot record (see main.compositor.log)",
+                s.id,
+                path.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    log.say(&format!("session {} located and started by the guest in {:?}", s.id, t0.elapsed()));
+    Ok(())
+}
+
+/// §103.15: the host's session service finds the boot record in this
+/// process's RAM; this process opens the control ring and holds the lease.
+fn bring_up_guest_ram(s: &Arc<Session>, log: &Log, t0: Instant) -> Result<(), String> {
     let wait = Duration::from_secs(std::env::var("WC_MAC_BOOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60));
     loop {
         match wc_compositor::boot_status() {
@@ -788,23 +904,6 @@ fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
             }
         }).ok();
     }
-    if cfg.audio {
-        let (vol, log2) = (cfg.audio_volume, log.clone());
-        std::thread::Builder::new().name("audio".into()).spawn(move || {
-            // §103.16: every CoreAudio device a stream, both directions, on
-            // the sound ring.
-            match (service_channel(sv_transport::wlbytes::OWNER_AUDIO, Duration::from_secs(20)), wc_compositor::shared_control()) {
-                (Some(ch), Some(control)) => {
-                    let l3 = log2.clone();
-                    if let Err(e) = crate::sound_mac::run(ch, &control, vol, move |m: &str| l3.say(m)) {
-                        log2.say(&format!("sound: {e}"));
-                    }
-                }
-                _ => log2.say("sound: the host opened no sound ring"),
-            }
-        }).ok();
-    }
-    log.say(&format!("session up {:?} after start", t0.elapsed()));
     Ok(())
 }
 
