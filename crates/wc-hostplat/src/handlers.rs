@@ -50,10 +50,16 @@ fn same(a: &str, b: &str) -> bool {
 pub fn collect(found: &[Found]) -> Vec<HostHandler> {
     let mut out: Vec<HostHandler> = Vec::new();
     let entry = |out: &mut Vec<HostHandler>, app: &App| -> usize {
-        if let Some(i) = out.iter().position(|h| same(&h.app, &app.id)) {
+        // One application, also when the shell knows it by two paths
+        // (Notepad is both `C:\Windows\notepad.exe` and the one in System32):
+        // the same name and the same file name are the same application.
+        let base = |p: &str| p.rsplit(['\\', '/']).next().unwrap_or(p).to_ascii_lowercase();
+        let name = field(app.name.trim());
+        if let Some(i) = out.iter().position(|h| {
+            same(&h.app, &app.id) || (!name.is_empty() && h.offer.name == name && base(&h.app) == base(&app.id))
+        }) {
             return i;
         }
-        let name = field(app.name.trim());
         out.push(HostHandler {
             offer: Handler {
                 token: token(&app.id),
@@ -127,6 +133,12 @@ mod tests {
                 default: Some(ff.into()),
             },
             Found { key: Key::Scheme("https".into()), apps: vec![app(ff, "Firefox")], default: Some(ff.into()) },
+            // Notepad again, by its other path: the same application.
+            Found {
+                key: Key::Mime("text/css".into()),
+                apps: vec![app("C:\\Windows\\NOTEPAD.EXE", "Notepad")],
+                default: Some("C:\\Windows\\NOTEPAD.EXE".into()),
+            },
             // The default is not among the recommended: it is added.
             Found { key: Key::Scheme("mailto".into()), apps: vec![], default: Some("C:\\Mail\\mail.exe".into()) },
         ];
@@ -138,8 +150,8 @@ mod tests {
         assert_eq!(f.schemes, ["https"]);
         assert_eq!(f.default_for, ["text/html", "x-scheme-handler/https"]);
         let n = &hs[2];
-        assert_eq!(n.offer.mimes, ["text/plain", "text/html"], "case-insensitive identity: one Notepad");
-        assert_eq!(n.offer.default_for, ["text/plain"]);
+        assert_eq!(n.offer.mimes, ["text/plain", "text/html", "text/css"], "one Notepad, by either path");
+        assert_eq!(n.offer.default_for, ["text/plain", "text/css"]);
         assert_eq!(n.app, np);
         assert_eq!(hs[1].offer.default_for, ["x-scheme-handler/mailto"]);
         // The identity never crosses: the offer has the token only.
