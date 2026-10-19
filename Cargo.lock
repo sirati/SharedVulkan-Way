@@ -1490,6 +1490,8 @@ dependencies = [
 name = "wc-launch"
 version = "0.1.0"
 dependencies = [
+ "png",
+ "wc-compositor",
  "windows-sys",
 ]
 

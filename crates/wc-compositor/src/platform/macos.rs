@@ -137,6 +137,33 @@ const BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
 const ALPHA_PREMULTIPLIED_FIRST: u32 = 2;
 const ALPHA_NONE_SKIP_FIRST: u32 = 6;
 
+// ------------------------------------------------------------- the Dock ---
+
+/// One entry of the application's Dock menu (§103.8): the macOS form of a
+/// jump-list task. `key` is what the launcher gets back when it is picked.
+#[derive(Clone, Debug)]
+pub struct DockItem {
+    pub title: String,
+    pub key: String,
+}
+
+type DockPick = Box<dyn Fn(&str) + Send + Sync>;
+
+static DOCK: Mutex<Option<(Vec<DockItem>, DockPick)>> = Mutex::new(None);
+
+/// Set the Dock menu and what a pick (or a click on the tile while no window
+/// is open, with the key `""`) does. The launcher calls this; the compositor
+/// itself has no idea what an application's actions are.
+pub fn set_dock_menu(items: Vec<DockItem>, on_pick: DockPick) {
+    *DOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some((items, on_pick));
+}
+
+fn dock_pick(key: &str) {
+    if let Some((_, pick)) = DOCK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        pick(key);
+    }
+}
+
 // ------------------------------------------------------------- the wake ---
 
 /// The Wayland thread's way to make [`drain`] run on the main thread.
@@ -187,6 +214,8 @@ struct WinShared {
     bounds: PopupBounds,
     /// `zwp_locked_pointer`/`confined_pointer` for this window.
     hold: Cell<Option<crate::hold::PointerHold>>,
+    /// AppKit's zoom state as last reported, so a change is said once.
+    zoomed: Cell<bool>,
 }
 
 impl WinShared {
@@ -207,6 +236,10 @@ struct MacWin {
     mapped: bool,
     icons: Vec<IconImage>,
     fold: bool,
+    /// Maximise, minimise and fullscreen asked for before `Map`. AppKit
+    /// ignores `zoom:` on a window that is not on screen, and Firefox asks to
+    /// be maximised (its saved state) before its first commit.
+    pending: (Option<bool>, Option<bool>, Option<bool>),
 }
 
 struct State {
@@ -601,6 +634,12 @@ define_class!(
             if w.quiet.get() {
                 return;
             }
+            // Win32 says SIZE_MAXIMIZED in WM_SIZE; AppKit's equivalent is the
+            // zoom state, read here because zooming is a resize.
+            let zoomed = window.isZoomed();
+            if zoomed != w.zoomed.replace(zoomed) {
+                w.send(FromUi::Maximized { id: w.id, on: zoomed });
+            }
             let content = window.contentRectForFrameRect(window.frame());
             let size = (content.size.width.round() as i32, content.size.height.round() as i32);
             if size != w.size.get() && size.0 > 0 && size.1 > 0 {
@@ -685,6 +724,31 @@ impl WcDelegate {
     }
 }
 
+/// The Dock menu, outside the class macro, which cannot take an early return.
+fn dock_menu(mtm: MainThreadMarker, target: &WcAppDelegate, items: &[DockItem]) -> Option<Retained<NSMenu>> {
+    if items.is_empty() {
+        return None;
+    }
+    let menu = NSMenu::new(mtm);
+    for (tag, item) in items.iter().enumerate() {
+        // SAFETY: a plain menu item whose action is the delegate's `dockPick:`.
+        let mi = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(&item.title),
+                Some(sel!(dockPick:)),
+                &NSString::from_str(""),
+            )
+        };
+        // SAFETY: the target is the app delegate, retained for the process's
+        // life in APP_DELEGATE.
+        unsafe { mi.setTarget(Some(target)) };
+        mi.setTag(tag as isize);
+        menu.addItem(&mi);
+    }
+    Some(menu)
+}
+
 fn notification_window(n: &NSNotification) -> Option<Retained<NSWindow>> {
     let obj = n.object()?;
     obj.downcast::<NSWindow>().ok()
@@ -749,9 +813,43 @@ define_class!(
             NSApplicationTerminateReply::TerminateCancel
         }
 
+        /// A click on the tile of a running application with no window open
+        /// starts it again (`run`), which is what a Mac user expects of a
+        /// Dock tile and what a Linux application without windows needs.
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
-        fn application_should_handle_reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
+        fn application_should_handle_reopen(&self, _app: &NSApplication, visible: bool) -> bool {
+            if !visible {
+                dock_pick("");
+            }
             true
+        }
+
+        #[unsafe(method_id(applicationDockMenu:))]
+        fn application_dock_menu(&self, _app: &NSApplication) -> Option<Retained<NSMenu>> {
+            let mtm = self.mtm();
+            let items: Vec<DockItem> = DOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(i, _)| i.clone())
+                .unwrap_or_default();
+            dock_menu(mtm, self, &items)
+        }
+    }
+
+
+    impl WcAppDelegate {
+        #[unsafe(method(dockPick:))]
+        fn dock_pick_item(&self, sender: &NSMenuItem) {
+            let tag = sender.tag();
+            let key = DOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|(items, _)| items.get(tag as usize).map(|i| i.key.clone()));
+            if let Some(key) = key {
+                dock_pick(&key);
+            }
         }
     }
 
@@ -1294,6 +1392,16 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
             }
         }
         ToUi::SetWindowState { id, maximized, minimized } => {
+            let early = with_win(id, |w| {
+                if !w.mapped {
+                    w.pending.0 = maximized.or(w.pending.0);
+                    w.pending.1 = minimized.or(w.pending.1);
+                }
+                !w.mapped
+            });
+            if early == Some(true) {
+                return;
+            }
             if let Some((window, _, _)) = handles(id) {
                 if let Some(m) = maximized {
                     if window.isZoomed() != m {
@@ -1308,6 +1416,15 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
             }
         }
         ToUi::Fullscreen { id, on } => {
+            let early = with_win(id, |w| {
+                if !w.mapped {
+                    w.pending.2 = Some(on);
+                }
+                !w.mapped
+            });
+            if early == Some(true) {
+                return;
+            }
             if let Some((window, _, _)) = handles(id) {
                 let is = window.styleMask().contains(NSWindowStyleMask::FullScreen);
                 if is != on {
@@ -1427,6 +1544,20 @@ fn create(
 ) {
     let events = EVENTS.with(|e| e.borrow().clone()).expect("events");
     let is_popup = matches!(kind, WindowKind::Popup { .. });
+    // The work area before the window has a place on screen: the compositor
+    // sizes a client that committed only its minimum (Firefox's first commit)
+    // from this cell's width and height (state.rs §91.6), and it asks at the
+    // first commit, before `Map`. The origin is corrected once the window is
+    // placed (`publish_bounds`).
+    if !is_popup {
+        if let Some(screen) = NSScreen::mainScreen(mtm) {
+            let v = screen.visibleFrame();
+            let mut cell = bounds.lock().unwrap_or_else(|e| e.into_inner());
+            if cell.is_none() {
+                *cell = Some(Rect::new(0, 0, v.size.width as i32, v.size.height as i32));
+            }
+        }
+    }
     let shared = Rc::new(WinShared {
         id,
         events,
@@ -1440,6 +1571,7 @@ fn create(
         is_popup,
         bounds,
         hold: Cell::new(None),
+        zoomed: Cell::new(false),
     });
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 240.0));
     let style = if is_popup {
@@ -1508,7 +1640,18 @@ fn create(
             st.made += 1;
             st.windows.insert(
                 id,
-                MacWin { window, view, shared, _delegate: delegate, shadow, kind, mapped: false, icons: Vec::new(), fold: false },
+                MacWin {
+                    window,
+                    view,
+                    shared,
+                    _delegate: delegate,
+                    shadow,
+                    kind,
+                    mapped: false,
+                    icons: Vec::new(),
+                    fold: false,
+                    pending: (None, None, None),
+                },
             );
         }
     });
@@ -1556,9 +1699,16 @@ fn map(mtm: MainThreadMarker, id: WindowId, width: i32, height: i32, fold: bool)
                 window.setStyleMask(mask);
                 window.setTitlebarAppearsTransparent(true);
                 window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-                for b in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
-                    if let Some(button) = window.standardWindowButton(b) {
-                        button.setHidden(true);
+                // The traffic lights stay, drawn by AppKit over the client's
+                // own title bar, as Windows keeps its caption buttons (§82):
+                // the host's `mac-tabs` arrangement leaves their corner empty.
+                // WC_MAC_FOLD_BUTTONS=off hides them for a client that draws
+                // buttons of its own and was not told to leave room.
+                if std::env::var("WC_MAC_FOLD_BUTTONS").as_deref() == Ok("off") {
+                    for b in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+                        if let Some(button) = window.standardWindowButton(b) {
+                            button.setHidden(true);
+                        }
                     }
                 }
             }
@@ -1591,6 +1741,15 @@ fn map(mtm: MainThreadMarker, id: WindowId, width: i32, height: i32, fold: bool)
     }
     println!("wc-compositor: window {id} mapped {width}x{height} fold_caption={fold}");
     present(id, &[]);
+    // What was asked for before the window existed on screen, now that it does.
+    let (max, min, full) = with_win(id, |w| std::mem::take(&mut w.pending)).unwrap_or_default();
+    if max.is_some() || min.is_some() {
+        println!("wc-compositor: window {id} applies its pre-map state: maximized={max:?} minimized={min:?}");
+        handle(mtm, ToUi::SetWindowState { id, maximized: max, minimized: min });
+    }
+    if let Some(on) = full {
+        handle(mtm, ToUi::Fullscreen { id, on });
+    }
 }
 
 /// Stage 38's rule on macOS: a window opens where it can be grabbed.

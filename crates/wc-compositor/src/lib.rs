@@ -87,6 +87,9 @@ use std::time::{Duration, Instant};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
 use platform::{FrameStyle, PlatformConfig};
+/// §103.8: the Dock menu, which the macOS launcher fills.
+#[cfg(target_os = "macos")]
+pub use platform::{set_dock_menu, DockItem};
 use smithay::utils::os::FdEncoding;
 use state::{ClientState, Decorations, State};
 

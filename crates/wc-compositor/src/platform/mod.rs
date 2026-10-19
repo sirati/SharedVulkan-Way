@@ -75,6 +75,9 @@ pub(crate) mod mac_keys;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{current_layout, has_touch, keyboard_repeat, start};
+/// §103.8: the launcher's way to fill the application's Dock menu.
+#[cfg(target_os = "macos")]
+pub use macos::{set_dock_menu, DockItem};
 
 // On macOS only `Click`, which `PlatformConfig` names on every Unix.
 #[cfg(not(windows))]

@@ -31888,28 +31888,32 @@ process.** A tile is a running `NSRunningApplication`, and its name and icon
 come from the process's bundle. `NSApp.applicationIconImage` and `NSDockTile`
 change only the calling process's own tile. No per-window identity exists. So:
 
-* **The session process** (the compositor, transports and Wayland state, one per
-  user, as on Windows) runs with `NSApplicationActivationPolicyAccessory`: no
-  Dock tile of its own.
-* **One tile process per Linux application id**, started from a generated
-  bundle, `~/Applications/Linux/<Name>.app`. The bundle has its own
-  `CFBundleIdentifier` (`org.waycompose.linux.<app_id>`), `CFBundleName`, an
-  `.icns` built from the host's icon (§16, §94), and an executable that is the
-  macOS launcher with the app id baked into `Info.plist`. This is the macOS
-  form of wc-launch's shortcuts: **"Keep in Dock" on the tile pins the bundle**,
-  and clicking a pinned tile starts the launcher, which asks the session to run
-  the application (§94's "the guest names an application, never a command
-  line").
-* The tile process **owns the application's NSWindows**. The session routes
-  each toplevel's `ToUi` to the tile for its app id once the app id is known.
-  A window that maps before `set_app_id` goes to the tile of the application
-  that was launched. Each window's pixels are a shared buffer between the two
-  processes inside the Mac, and **fd passing inside one machine is allowed**
-  (design.md §1a forbids descriptors only across the VM boundary). The tile
-  copies damage into its IOSurface. Input and window events go back as
-  `FromUi`. The AppKit code is the same either way: in phase 1 it runs inside
-  the session process (all windows under one tile), and in phase 2 the same
-  pump is fed from the session's socket.
+* **One compositor per Linux application, inside that application's bundle.**
+  The first version of this section split one session process (the compositor)
+  from one tile process per application, with every window's `ToUi` and pixels
+  crossing between them. That was revised before it was built. A tile has to
+  *own* the NSWindows, so the split would put a second copy of the whole
+  `ToUi`/`FromUi` protocol and a second pixel copy between two processes on the
+  Mac, and its only gain would be one arena and one proxy for all applications
+  instead of one per running application. So `wc-launch` on macOS **is** the
+  application: the bundle's executable is a hard link to it, it reads its
+  `[app.*]` section from the bundle's `Info.plist`, runs the compositor on its
+  main thread (`wc_compositor::run_from`), and in a second thread does what the
+  Windows launcher does over the forced-command key: `up` (locate the arena),
+  an ssh reverse **Unix-socket** forward of the Wayland socket, `proxy`, and
+  `run`. Each application therefore has its own wired arena (64 MiB) and its
+  own `wc-proxy`, and one application's crash takes no other with it.
+  LaunchServices allows one process per bundle, so a second click on a running
+  application's tile reaches the running one (`applicationShouldHandleReopen`).
+  With no window open, that sends `run` again, which is the warm path.
+* **The bundle**, `~/Applications/Linux/<Name>.app`, is written by
+  `wc-launch --install SECTION [--pin]`, from the host's `app` answer (§92):
+  `CFBundleIdentifier` `org.waycompose.linux.<section>`, the desktop entry's
+  name, an `.icns` built from the host's icon (resampled to an exact 256x256
+  `ic08` entry), and the answer itself in `Resources/meta.txt` for the Dock
+  menu. `--pin` writes the Dock's own `persistent-apps` entry, which is what
+  "Keep in Dock" writes. The menu bar's application name and the Dock tile's
+  name and icon come from the bundle with no code at all.
 * **The Dock menu** is the jump list: `applicationDockMenu:` returns the
   `.desktop` actions (`Action(name)`) and the frequent list (`Open(url)`),
   which wc-session already provides for §92. A click is a `Request` to the
@@ -31918,9 +31922,25 @@ change only the calling process's own tile. No per-window identity exists. So:
   the closing semantics above) and a Window menu that AppKit fills itself.
   Linux applications' own menus are not exported in this stage (there is no
   `dbusmenu` across the boundary).
-* A window whose client later sets a *different* app id stays with the tile it
-  was given. Moving an NSWindow between processes is impossible, so the window
-  would have to be re-created. This is the one place macOS cannot match §92.
+* A window of a *different* application, opened by a client of this one (a
+  Linux program that starts another on the same `WAYLAND_DISPLAY`), shows under
+  the first application's tile. NSWindows cannot move between processes. This
+  is the one place macOS cannot match §92's per-window identity.
+* **Title bars.** Firefox and GTK header bars draw their own title bar (the
+  caption is folded, §46), and **AppKit's traffic lights stay**, over the
+  client's strip at the top left. That is the macOS form of Windows keeping its
+  caption buttons (§82). The host's `apps.ini` chooses the arrangement
+  `titlebar = mac-tabs`, as §94 requires: Firefox gets `user.js` prefs that
+  remove GTK's own buttons and a `userChrome.css` that starts the tab strip
+  78 px in, and GTK applications get a `gtk.css` that pads the header bar the
+  same way and hides its buttons.
+* **Quit** (Cmd+Q, the Dock's Quit, AppleScript `quit`) asks each of the
+  application's windows to close. When the last one has closed and the linger
+  has passed, the process takes the session down (`down`) and exits, so the
+  tile's running dot goes out the way a Mac application's does.
+* **Icons the host cannot render** (SVG-only themes, GNOME Console and Text
+  Editor) leave the bundle with the generic icon. `wc-proxy`'s resolver has no
+  SVG renderer (`icons.rs`), which is the same limitation on Windows.
 
 ### 103.9 Building for macOS
 
@@ -32001,4 +32021,5 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | superpages at 4 GiB | 4 GiB VM | none, even one at a time, after `purge`, with 1.8 GB free |
 | first window at 4 GiB, compositor cross-linked on Linux | 4 GiB VM | `pinning=wired`, located, mapped 742x427 |
 | keyboard: `scripts/mac-input.sh` types through QEMU's USB keyboard (QMP), into weston-terminal on Linux | 4 GiB VM | `echo mac-input-ok_42` ran and printed `mac-input-ok_42`; before the `sealed_file.rs` fix below, no key reached the client (`0 out` descriptors at the proxy: no keymap) |
+| **Firefox from its Dock tile**: `scripts/mac-launch-install.sh` (host: wc-session with a private sshd on 127.0.0.1:22422 that holds only the guest's forced-command key; guest: three bundles, pinned), then `open Firefox.app` | 4 GiB VM, Firefox on this workstation in software GL (Mesa only, never the RTX 5090) | compositor up 0.38 s after the click, arena located 0.43 s (16384/16384), proxy and PulseAudio null sink, `run ok` 1.2 to 1.4 s after the click; menu bar "Firefox", the fox in the Dock with its running dot; maximised to the work area, fully drawn, traffic lights in the corner the tab strip leaves (Sonnet checks of five screenshots); Quit closes the window, the session goes `down ok` and the process exits |
 | **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |

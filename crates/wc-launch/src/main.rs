@@ -34,6 +34,12 @@ mod appmeta;
 mod audio;
 mod config;
 mod ico;
+// §103.8: the macOS bundle's contents (pure, tested everywhere) and the macOS
+// launcher itself.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macbundle;
+#[cfg(target_os = "macos")]
+mod mac;
 mod plan;
 #[cfg(windows)]
 mod shell;
@@ -172,6 +178,8 @@ fn paths(session: &str) -> Result<Paths, String> {
 
 // ------------------------------------------------------------------- main ---
 
+// §103.8: on macOS `main` hands over to `mac::main` before the Windows path.
+#[cfg_attr(target_os = "macos", allow(unreachable_code, unused_variables))]
 fn main() -> ExitCode {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -195,6 +203,10 @@ fn main() -> ExitCode {
     if let Some(i) = args.iter().position(|a| a == "--render-app-files") {
         return render_app_files(&args[i + 1..]);
     }
+    // §103.8: on a Mac this process is the Linux application's own (its
+    // bundle's executable), and everything below is the Windows launcher.
+    #[cfg(target_os = "macos")]
+    return mac::main(args);
 
     // The session name is needed before the configuration can be read, because
     // the log the configuration's errors go into is named after it. It is the

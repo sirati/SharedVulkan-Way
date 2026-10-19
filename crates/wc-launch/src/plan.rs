@@ -251,6 +251,11 @@ pub enum Titlebar {
     /// §31's picture with Firefox's close button under Windows'. Kept as the
     /// control leg, as `--decorations client` is.
     Client,
+    /// §103.8: tabs in a macOS window's title bar, the Mac way round: AppKit
+    /// keeps its own close, minimise and zoom buttons at the top *left* (as
+    /// Windows keeps its caption buttons with [`Titlebar::Tabs`]), so the tab
+    /// strip leaves that corner empty and GTK draws no buttons of its own.
+    MacTabs,
 }
 
 impl Titlebar {
@@ -261,6 +266,7 @@ impl Titlebar {
             "tabs" => Some(Self::Tabs),
             "none" | "server" => Some(Self::None),
             "client" => Some(Self::Client),
+            "mac-tabs" => Some(Self::MacTabs),
             _ => None,
         }
     }
@@ -268,7 +274,7 @@ impl Titlebar {
     /// `MOZ_GTK_TITLEBAR_DECORATION`.
     pub fn moz_env(self) -> &'static str {
         match self {
-            Self::Tabs | Self::Client => "client",
+            Self::Tabs | Self::Client | Self::MacTabs => "client",
             Self::None => "none",
         }
     }
@@ -278,7 +284,7 @@ impl Titlebar {
     /// that wants to override one of these can.
     pub fn prefs(self) -> &'static str {
         match self {
-            Self::Tabs => {
+            Self::Tabs | Self::MacTabs => {
                 "ui.GtkCSDMinimizeButton=0;ui.GtkCSDMaximizeButton=0;ui.GtkCSDCloseButton=0;\
                  toolkit.legacyUserProfileCustomizations.stylesheets=true"
             }
@@ -354,7 +360,32 @@ pub const USER_CHROME_MARK: &str = "/* wc-launch: tabs in the title bar.";
 ///   only*. The navigation bar has a button box of its own that Firefox hides
 ///   while tabs are shown, and a selector without `#TabsToolbar` brings it back
 ///   and pushes the hamburger menu left — which the first version of this did.
+/// The traffic lights' corner at 1x: three 12 pt buttons, 8 pt apart, 20 pt
+/// in from the edge, and a margin before the first tab.
+pub const MAC_BUTTONS_AT_1X: i32 = 78;
+
 pub fn user_chrome_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
+    if t == Titlebar::MacTabs {
+        let tab = (fit.height - 2).max(1);
+        return Some(format!(
+            "{USER_CHROME_MARK} Written on every start; edits are lost.\n\
+             \x20  See docs/waycompose-design.md §103.8. macOS draws close, minimise and zoom\n\
+             \x20  in the top-left {r} px; the tab strip starts after them and has the\n\
+             \x20  caption's height ({h} px). */\n\
+             :root {{\n\
+             \x20 --tab-min-height: {tab}px !important;\n\
+             \x20 --tab-margin-block: 1px !important;\n\
+             }}\n\
+             #TabsToolbar {{\n\
+             \x20 padding-inline-start: {r}px !important;\n\
+             }}\n\
+             #TabsToolbar .titlebar-buttonbox-container {{\n\
+             \x20 display: none !important;\n\
+             }}\n",
+            h = fit.height,
+            r = MAC_BUTTONS_AT_1X,
+        ));
+    }
     if t != Titlebar::Tabs {
         return None;
     }
@@ -397,6 +428,23 @@ pub const GTK_CSS_MARK: &str = "/* wc-launch: GTK windows under Windows' caption
 /// bar hold Search and Open; with it, Open ends 146 px from the edge and those
 /// columns are header-bar background.
 pub fn gtk_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
+    if t == Titlebar::MacTabs {
+        return Some(format!(
+            "{GTK_CSS_MARK} Written on every start; edits are lost.\n\
+             \x20  See docs/waycompose-design.md §103.8. macOS draws close, minimise and zoom\n\
+             \x20  in the leftmost {r} px of a folded title bar; a header bar leaves them empty\n\
+             \x20  and draws no buttons of its own. */\n\
+             headerbar {{\n\
+             \x20 padding-left: {r}px;\n\
+             \x20 border-top-left-radius: 0;\n\
+             \x20 border-top-right-radius: 0;\n\
+             }}\n\
+             headerbar windowcontrols, headerbar .titlebutton {{\n\
+             \x20 opacity: 0;\n\
+             }}\n",
+            r = MAC_BUTTONS_AT_1X,
+        ));
+    }
     if t != Titlebar::Tabs {
         return None;
     }
@@ -796,6 +844,13 @@ mod tests {
         assert_eq!(Titlebar::parse("client"), Some(Titlebar::Client));
         assert_eq!(Titlebar::parse("Tabs"), None);
         assert_eq!(Titlebar::Tabs.moz_env(), "client");
+        assert_eq!(Titlebar::parse("mac-tabs"), Some(Titlebar::MacTabs));
+        assert_eq!(Titlebar::MacTabs.moz_env(), "client");
+        let mac = user_chrome_css(Titlebar::MacTabs, TitlebarFit::at(96, None)).unwrap();
+        assert!(mac.contains("padding-inline-start: 78px"), "{mac}");
+        assert!(mac.contains("display: none"), "{mac}");
+        assert!(gtk_css(Titlebar::MacTabs, TitlebarFit::at(96, None)).unwrap().contains("padding-left: 78px"));
+        assert!(Titlebar::MacTabs.prefs().contains("GtkCSDCloseButton=0"));
         assert_eq!(Titlebar::None.moz_env(), "none");
     }
 
