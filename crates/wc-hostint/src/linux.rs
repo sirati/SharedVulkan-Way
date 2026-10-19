@@ -222,14 +222,13 @@ pub fn classify(arg: &str) -> Given {
     if let Some(p) = file_url_path(arg) {
         return Given::Path(p);
     }
-    if let Some((s, _)) = arg.split_once(':') {
-        if s.len() >= 2
+    if let Some((s, _)) = arg.split_once(':')
+        && s.len() >= 2
             && s.starts_with(|c: char| c.is_ascii_alphabetic())
             && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
         {
             return Given::Url(arg.to_string());
         }
-    }
     Given::Path(arg.to_string())
 }
 

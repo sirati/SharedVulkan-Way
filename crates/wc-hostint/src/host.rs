@@ -184,11 +184,10 @@ pub fn serve(link: &mut dyn Link, svc: &mut Service, opener: &mut dyn Opener, ev
                 Ok(Event::Stop) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             };
-            if let Some(l) = line {
-                if !link.send_line(&l) {
+            if let Some(l) = line
+                && !link.send_line(&l) {
                     return;
                 }
-            }
         }
         match link.poll_line(tick) {
             Poll::Closed => return,
@@ -205,11 +204,10 @@ pub fn serve(link: &mut dyn Link, svc: &mut Service, opener: &mut dyn Opener, ev
                 let reply = svc.on_line(&l, opener, Instant::now());
                 // Debug-format so control characters cannot forge log lines.
                 log(&format!("hostint: {:?} -> {:?}", l.chars().take(200).collect::<String>(), reply));
-                if let Some(r) = reply {
-                    if !link.send_line(&r) {
+                if let Some(r) = reply
+                    && !link.send_line(&r) {
                         return;
                     }
-                }
             }
         }
     }
