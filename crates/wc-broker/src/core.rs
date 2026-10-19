@@ -528,6 +528,13 @@ impl Core {
         }
     }
 
+    /// The processes with a lease on region `id`, each once.
+    pub fn holders(&self, id: ObjId) -> Vec<Pid> {
+        let Some(r) = self.regions.get(&id) else { return Vec::new() };
+        let pids: BTreeSet<Pid> = r.leases.keys().filter_map(|c| self.conns.get(c)).map(|c| c.peer.pid).collect();
+        pids.into_iter().collect()
+    }
+
     pub fn region(&self, id: ObjId) -> Option<&RegionInfo> {
         self.regions.get(&id).map(|r| &r.info)
     }
@@ -711,6 +718,7 @@ mod tests {
         c.connect(1, peer(100, 1000));
         c.connect(2, peer(200, 1002));
         assert_eq!(c.find(1, "gpu.3").unwrap(), a);
+        assert_eq!(c.holders(a.id), vec![100]);
         assert!(c.find(2, "gpu.3").unwrap_err().0.contains("no live region"));
         assert!(c.find(1, "gpu.4").is_err());
         c.retire(a.id);
