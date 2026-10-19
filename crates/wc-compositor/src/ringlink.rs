@@ -323,6 +323,11 @@ impl RingLink {
             if self.seen.contains(&slot) {
                 continue;
             }
+            // §103.14: a session service's channel (control, sound) is not a
+            // client; the launcher opens it.
+            if self.control.ring_owner(slot).is_ok_and(sv_transport::wlbytes::is_service) {
+                continue;
+            }
             let Ok(channel) = ByteChannel::open(&self.control, slot, Endpoint::Peer) else {
                 continue;
             };
@@ -432,6 +437,78 @@ impl Link {
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------------- §103.14: guest-RAM rings ---
+
+static WANT_GUEST_RAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOCATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHARED: std::sync::Mutex<Option<Arc<Control>>> = std::sync::Mutex::new(None);
+
+/// `--wayland-rings-guest-ram`: the session's ring region is a window of this
+/// process's own RAM that the host locates (§103.14), for a guest with no
+/// shared-memory device (the macOS VM). The same region carries the Wayland
+/// connections, their feeds, and the session's control and sound channels.
+pub fn want_guest_ram_rings() {
+    WANT_GUEST_RAM.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn wants_guest_ram_rings() -> bool {
+    WANT_GUEST_RAM.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The launcher, once the host has located the ring region: the stamps may
+/// now be overwritten by the control region.
+pub fn guest_ram_rings_located() {
+    LOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The ring region, once made: the launcher's control and sound channels are
+/// ring slots of it.
+pub fn shared_control() -> Option<Arc<Control>> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// A ring region of guest RAM, stamped and waiting for the host to locate it.
+pub struct PendingRings {
+    window: wc_handle::arena::GuestRamWindow,
+    geometry: Geometry,
+}
+
+impl PendingRings {
+    pub fn alloc() -> Result<PendingRings, String> {
+        let geometry = Geometry::for_wayland();
+        let (window, run, pages) =
+            wc_handle::arena::stamped_guest_ram_window(geometry.control_size).map_err(|e| e.to_string())?;
+        println!(
+            "wc-compositor: wayland rings in guest RAM: run 0x{run:016x}, {pages} rings pages, {} bytes, pinning={}",
+            window.len, window.pinning
+        );
+        Ok(PendingRings { window, geometry })
+    }
+
+    pub fn located() -> bool {
+        LOCATED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Make the control region in the located window.
+    pub fn into_link(self) -> Result<RingLink, String> {
+        // SAFETY: the window is leaked below, so the region outlives every
+        // user of it; its length is at least the geometry's control size.
+        let region = Arc::new(unsafe {
+            sv_transport::region::SharedRegion::from_raw(self.window.base(), self.geometry.control_size as usize)
+        });
+        std::mem::forget(self.window);
+        let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+        let control = Arc::new(Control::create(region, self.geometry, ids, 1).map_err(|e| e.to_string())?);
+        control.stamp_epoch().map_err(|e| e.to_string())?;
+        *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+        println!(
+            "wc-compositor: wayland rings created in guest RAM ({} slots); no doorbell, polled every millisecond",
+            self.geometry.ring_slot_count
+        );
+        Ok(RingLink::over(control))
     }
 }
 

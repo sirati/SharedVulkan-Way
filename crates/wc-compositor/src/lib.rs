@@ -87,6 +87,9 @@ use std::time::{Duration, Instant};
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 
 use platform::{FrameStyle, PlatformConfig};
+/// §103.14: the guest-RAM ring region, for the macOS launcher's control and
+/// sound channels and its bootstrap.
+pub use ringlink::{guest_ram_rings_located, shared_control};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -421,6 +424,9 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--wayland-ring" => args.wayland_ring = it.next(),
             "--wayland-cold" => args.wayland_cold = it.next(),
             "--wayland-rings" => args.wayland_rings = it.next(),
+            // §103.14: the ring region in this process's own RAM, located by
+            // the host (the macOS guest, which has no shared-memory device).
+            "--wayland-rings-guest-ram" => ringlink::want_guest_ram_rings(),
             "--dump-frames" => args.dump_frames = it.next().map(Into::into),
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
@@ -1743,7 +1749,35 @@ fn wayland_thread(
         }
     };
 
+    // §103.14: the guest-RAM ring region, stamped now and made into a control
+    // region once the launcher says the host has located it.
+    let mut pending_rings = if ring_link.is_none() && ringlink::wants_guest_ram_rings() {
+        match ringlink::PendingRings::alloc() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("wc-compositor: no guest-RAM ring region: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Without a doorbell the rings are polled: a turn at least every millisecond.
+    let mut ring_poll = false;
+    let _ = std::io::stdout().flush();
+
     loop {
+        if pending_rings.is_some() && ringlink::PendingRings::located() {
+            match pending_rings.take().map(ringlink::PendingRings::into_link) {
+                Some(Ok(rl)) => {
+                    ring_link = Some(rl);
+                    ring_poll = true;
+                }
+                Some(Err(e)) => eprintln!("wc-compositor: the guest-RAM ring region: {e}"),
+                None => {}
+            }
+            let _ = std::io::stdout().flush();
+        }
         // The ring's accept, first, so a connection that arrived between turns
         // is dispatched in the same turn as one that arrived on the socket.
         if let Some(rl) = ring_link.as_mut() {
@@ -2005,7 +2039,8 @@ fn wayland_thread(
         // has something, which the park's last look is for.
         let parked_ready = ring_link.as_ref().is_some_and(|rl| rl.park());
         if !parked_ready {
-            ticker.wait(POLL.min(state.until_frame()).max(Duration::from_micros(200)));
+            let most = if ring_poll { Duration::from_millis(1) } else { POLL };
+            ticker.wait(most.min(state.until_frame()).max(Duration::from_micros(200)));
         }
         if let Some(rl) = ring_link.as_ref() {
             rl.unpark();

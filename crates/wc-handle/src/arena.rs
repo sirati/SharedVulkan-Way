@@ -466,6 +466,24 @@ impl GuestRamWindow {
     }
 }
 
+/// §103.14: a window of guest RAM stamped exactly like an arena (magic, a
+/// fresh run id, page indices), outside the arena registry, for a region the
+/// host locates once and the two sides then share: the macOS session's ring
+/// region. Returns the window, its run id and its page count. The caller must
+/// not write it before the host has located it, since the stamps are what the
+/// host finds it by.
+pub fn stamped_guest_ram_window(len: u64) -> io::Result<(GuestRamWindow, u64, u32)> {
+    let run_id = random_run_id();
+    let w = alloc_guest_ram_window(len, page_policy()?, &|index, page| {
+        page.fill(STAMP_FILL);
+        page[STAMP_OFF_MAGIC..STAMP_OFF_MAGIC + 8].copy_from_slice(&STAMP_MAGIC);
+        page[STAMP_OFF_RUN_ID..STAMP_OFF_RUN_ID + 8].copy_from_slice(&run_id.to_le_bytes());
+        page[STAMP_OFF_PAGE_INDEX..STAMP_OFF_PAGE_INDEX + 4].copy_from_slice(&index.to_le_bytes());
+    })?;
+    let pages = (w.len / REGION_PAGE) as u32;
+    Ok((w, run_id, pages))
+}
+
 /// Make a [`GuestRamWindow`] of at least `len` bytes under `policy`, calling
 /// `stamp(index, page)` on every [`REGION_PAGE`] of it after it is pinned.
 pub fn alloc_guest_ram_window(

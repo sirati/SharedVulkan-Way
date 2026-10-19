@@ -941,6 +941,34 @@ up)
   echo "up ok $D"
   ;;
 
+# ------------------------------------------------------------------- rings ---
+# §103.14: the ring region of a guest with no shared-memory device (the macOS
+# guest): a second window of its own RAM, stamped like the arena, located here
+# once. Its Wayland connections, their feeds, and the session's control and
+# sound then cross as shared memory; `proxy` uses the plan this writes, with no
+# upstream socket. Same permission as the guest-RAM `up`, and after it (`up`
+# makes the run directory).
+rings)
+  words 3 3 "ID RUNID PAGES" "$@"
+  ID="${1:-}"; RUNID="${2:-}"; PAGES="${3:-}"
+  check_id "$ID"
+  [[ "$RUNID" =~ ^0x[0-9a-fA-F]{1,16}$ ]] || die "bad run id"
+  [[ "$PAGES" =~ ^[1-9][0-9]{0,7}$ ]] || die "bad page count"
+  [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ] || die "guest-RAM rings are not served on this host (§94)"
+  D=$(dir_of "$ID")
+  [ -d "$D" ] || die "no session $ID: call up first"
+  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\n%q --qmp %q --vm %q --run %q --pages %q --outbound 0 --plan %q >%q 2>&1\necho "rc=$?" >>%q\ntrue\n' \
+    "$BIN/wc-arena-host" "$QMP" "$VM_HINT" "$RUNID" "$PAGES" "$D/rings.plan" "$D/rings.log" "$D/rings.log" \
+    | eval "$ROOTC" >/dev/null 2>&1
+  if ! grep -q '^rc=0$' "$D/rings.log" 2>/dev/null; then
+    echo "wc-session: the ring region was not located" >&2
+    sed 's/^/  /' "$D/rings.log" 2>/dev/null >&2
+    exit 1
+  fi
+  grep -o 'located [0-9]* of [0-9]* pages[^$]*' "$D/rings.log" | tail -1
+  echo "rings ok $D/rings.plan"
+  ;;
+
 # ------------------------------------------------------------------- proxy ---
 # wc-proxy, on the plan, in a root transient unit -- root because it opens the
 # arena's backing object at /proc/<qemu-pid>/fd/<n>, and a transient unit rather
@@ -1053,14 +1081,27 @@ proxy)
   [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
   # §94: the root unit only where `up` was allowed to write a plan.
   [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ] || die "the guest-RAM proxy (as root) is not served on this host (§94)"
-  [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+  # §103.14: with a located ring region there is no upstream socket at all.
+  UPSTREAM_ARGS=""
+  if [ -f "$D/rings.plan" ]; then
+    audio_up "$D" "$ID"
+    UPSTREAM_ARGS=$(printf -- '--wayland-rings-plan %q --wayland-bell poll --session-control %q --session-id %q' "$D/rings.plan" "$BASE/wc-session" "$ID")
+    if [ "$(cut -d: -f1 "$D/audio.state" 2>/dev/null | cut -d' ' -f1)" = pulse ]; then
+      UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--audio-socket %q' "$D/audio.sock")"
+    fi
+  else
+    [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    UPSTREAM_ARGS=$(printf -- '--upstream %q' "$D/up.sock")
+  fi
   [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
   UNIT="wc-launch-$ID"
   cat >"$D/proxy.sh" <<EOF
 #!/usr/bin/env bash
 export PATH=/run/current-system/sw/bin:/run/wrappers/bin
+# §103.14: this host's settings, for the wc-session the control channel runs.
+$(env | grep '^WC_LAUNCH_' | sed 's/^/export /; s/=\(.*\)$/="\1"/')
 rm -f "$D/wl-proxy"
-"$BIN/wc-proxy" --upstream "$D/up.sock" --socket wl-proxy --runtime-dir "$D" \\
+"$BIN/wc-proxy" $UPSTREAM_ARGS --socket wl-proxy --runtime-dir "$D" \\
   --transport arena --arena-plan "$D/arena.plan" --arena-id 0 --copy damage --pace-frames 60 \\
   --arena-grow --arena-grow-step ${WC_LAUNCH_GROW_STEP:-16777216} \\
   --arena-locator "$BIN/wc-arena-host" --arena-qmp "$QMP" --arena-vm "$VM_HINT" \\
@@ -1092,7 +1133,8 @@ EOF
     tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
     exit 1
   fi
-  audio_up "$D" "$ID"
+  # On rings (§103.14) the sound was started before the proxy, which plays it.
+  [ -f "$D/rings.plan" ] || audio_up "$D" "$ID"
   echo "proxy ok $D/wl-proxy"
   echo "audio $(cat "$D/audio.state")"
   ;;

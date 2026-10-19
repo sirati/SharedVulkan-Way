@@ -32517,11 +32517,115 @@ agent:
 Known: GNOME Console shows a native title bar *and* GTK 4's header bar, which
 is GTK 4 negotiating server-side decorations under the compositor's `Auto`.
 
-**Still on ssh at this commit, and therefore open (103.14 replaces it):**
+**Still on ssh at this commit, and therefore open (103.14 then replaced it):**
 the Wayland bytes (an ssh Unix-socket forward), the session control (`up`,
 `proxy`, `run`, `down` as ssh exec), the sound (an ssh `-L` forward of the
 PulseAudio monitor), and the icon and clipboard feeds, which ride the Wayland
 upstream.
+
+### 103.14 Nothing on ssh: the session's channels on rings in guest RAM
+
+The user's rule: on macOS nothing travels over ssh, TCP or a socket forward.
+The premise is shared memory, and an ssh path is a defect, not a milestone.
+103.4's Unix-socket forward, the sound's `-L` forward and the session control
+by ssh exec are gone from the steady state.
+
+**The ring region.** With `--wayland-rings-guest-ram`, the main process's
+compositor keeps a second window of its own RAM, `Geometry::for_wayland()`
+(6 MiB, 32 slots). It is stamped like the arena (`stamped_guest_ram_window`)
+and located once by the host (`wc-session rings`, which runs `wc-arena-host`).
+After the locate, the launcher signals `guest_ram_rings_located`, and the
+compositor makes the shared_vulkan control region in it. The proxy attaches it
+from the plan (`--wayland-rings-plan`, retrying until the region is made).
+Separate from the arena, so the arena's allocator is untouched. The same
+`Control`/`ByteChannel` code runs over any region, which is what keeps the
+transport independent of the backend: role (b) attaches the same control region
+in its shared DAX file, by name.
+
+**Its slots.**
+* Every Wayland connection is a slot.
+* The **icon and clipboard feeds**, which until now always used the upstream
+  socket (§36.8: "a second ring claim, not built"), now claim slots of their
+  own. A local socket pair is bridged to each slot (`rings::bridge`), so the
+  feed code is unchanged.
+* The **control** channel (`OWNER_CONTROL`) carries `run`/`action`/`open`/`down`
+  as the words `wc-session` takes. The proxy runs `wc-session` itself on them
+  (`macsvc.rs`), with the session id put first by the host, so §94's
+  validation is the same code as on the ssh path.
+* The **sound** channel (`OWNER_AUDIO`) carries the session's PulseAudio
+  monitor.
+* Service slots carry an owner-id tag (`wlbytes::SERVICE_TAG`) that the
+  compositor's accept skips. These additions to sv-transport (`ring_owner`, the
+  tags) are additive.
+
+**Liveness.** The guest's RAM is the guest's. When the main process dies, macOS
+frees those pages and reuses them, so a proxy still writing pixels or ring bytes
+would corrupt them. The main process sends `ping` on the control channel every
+500 ms. After the first ping, 5 s without one ends the proxy before it touches
+the region again. Measured: `kill -9` of the main process; the proxy logged
+`LEASE LOST` and was gone about 4 s later.
+
+**Doorbells.** This VM has no doorbell port yet, so both sides poll the rings
+every millisecond: the compositor's wait is capped at 1 ms, and the proxy's
+`Doorbell::polling` wakes each waiting pump every millisecond. The endpoint stays
+pluggable for the real doorbell: `--wayland-bell` takes a QEMU chardev socket
+(the §99 hub, Linux/Windows hosts), the macOS guest opens a `/dev/cu.*` node
+(`PortHandle::guest_port`), and a fd pair (role (b), libkrun's virtio-console
+ports) is the third. The fd pair is not built. Measured cost of polling with
+Firefox idle: the main process 11% of one vCPU, the proxy 2.8%.
+
+**What ssh still does, once per main process: the bootstrap.** Three ssh execs
+under the forced command: `up` (locate the arena), `rings` (locate the ring
+region), `proxy` (start the proxy on them). After a main process that crashed,
+the next one also sends `down` for the stale session. Nothing is forwarded, and
+nothing goes over ssh afterwards. A bootstrap with no ssh at all would need the
+host to find a new session's stamps by itself (a rendezvous magic in the sweep),
+or a doorbell port to carry the hello as the Linux guest's cold path does. That
+is open (103.12).
+
+**Measured: rings against the old ssh path.** The same proxy and a C client
+(`wl_display_roundtrip` 500 times, client to proxy to compositor and back).
+The ssh leg is `scripts/mac-window.sh`, whose upstream is the ssh Unix-socket
+forward and which is kept as the comparison leg:
+
+| path | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| ssh Unix-socket forward | 5.72 ms | 6.44 ms | 6.81 ms | 10.1 ms |
+| rings in guest RAM, polled every 1 ms | **1.06 ms** | 2.12 ms | 2.14 ms | 2.15 ms |
+
+The control channel's round trip for `run firefox` is 106 ms, of which 104 ms is
+`wc-session` itself.
+
+**Every channel, how it crosses, and its copies** (role (a), this VM):
+
+| channel | crosses as | copies per transfer |
+|---|---|---|
+| Wayland bytes | ring slots in the guest-RAM ring region; no fds cross (in-band names, §79) | client socket to proxy (kernel); proxy into the ring (1); the compositor out of the ring into its local socket pair (1); smithay reads it (kernel) |
+| `wl_shm` buffers, frames | the arena (guest RAM, located once) | proxy copies the client's damage into an arena slice (1, the only write across the boundary); compositor composes the slice into the window's shadow (1); main process copies the shadow into the back IOSurface (1, full frame); face and Core Animation show the IOSurface (0) |
+| Vulkan | 103.6 (the GPU agent's section): its arena is guest RAM; its cold path is being moved off ssh in parallel | see 103.6 |
+| control (`run`, `action`, `open`, `down`, lease) | the control ring slot | a line into the ring and back |
+| sound | the sound ring slot | the monitor socket to proxy (kernel); proxy into the ring (1); main process out of the ring into its play queue (1); into an AudioQueue buffer (1) |
+| clipboard | the clipboard feed's ring slot; NSPasteboard in the main process | bytes through the feed's socket pair and ring (2) |
+| icons | the icon feed's ring slot | as the clipboard |
+| face to main IPC | inside macOS: a 0600 Unix socket for messages; IOSurfaces by mach port for pixels | message bytes (kernel); pixels 0 |
+| bootstrap | three ssh execs per main process (above) | not a data path |
+
+Re-tested on rings, each image judged by a fresh Sonnet agent:
+* Firefox from its tile, fully drawn.
+* Clipboard both ways: `mac-to-linux-on-rings-55` pasted exactly into
+  Firefox, and `linux-to-mac-on-rings-66` read back with `pbpaste`.
+* The Dock menu's New Window routed back to Firefox's face (227 ms control
+  round trip).
+* The context menu, a separate child window, fully drawn.
+* Console as a second application on the same rings.
+* Sound: 6 s of ~431 Hz tone with 90 ms of gaps. The proxy dropped a few
+  chunks on a full ring, most likely before the guest's player started.
+* The lease.
+
+**Still not on shared memory, so open:** the bootstrap's three ssh execs (and
+the stale-session `down`), the doorbell (polled), the fd-pair doorbell for
+role (b), and, per 103.6, any part of the GPU path the parallel work has not
+moved yet.
 
 ### 103.12 Not built, and not proven
 

@@ -1491,6 +1491,7 @@ name = "wc-launch"
 version = "0.1.0"
 dependencies = [
  "png",
+ "sv-transport",
  "wc-compositor",
  "windows-sys",
 ]

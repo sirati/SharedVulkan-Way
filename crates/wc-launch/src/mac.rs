@@ -22,7 +22,7 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -221,9 +221,8 @@ fn pin_in_dock(bundle: &Path) -> Result<(), String> {
 
 struct Session {
     id: String,
-    /// This session's loopback port for its sound (one per main process).
-    audio_port: u16,
-    tunnel: Mutex<Option<Child>>,
+    /// The control channel (§103.14), once the rings are up.
+    ctl: Mutex<Option<sv_transport::wlbytes::ByteChannel>>,
     up: Mutex<bool>,
     /// Requests that arrived before the session was up: `(section, key)`.
     pending: Mutex<Vec<(String, String)>>,
@@ -284,14 +283,9 @@ fn run_main(cfg: Config) -> ExitCode {
     }
     let comp_log = log_dir().join("main.compositor.log");
     let _ = std::fs::remove_file(&comp_log);
-    let audio_port = std::net::TcpListener::bind(("127.0.0.1", 0))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or_else(|_| cfg.audio_port());
     let session = Arc::new(Session {
         id: id.clone(),
-        audio_port,
-        tunnel: Mutex::new(None),
+        ctl: Mutex::new(None),
         up: Mutex::new(false),
         pending: Mutex::new(Vec::new()),
     });
@@ -349,7 +343,10 @@ fn run_main(cfg: Config) -> ExitCode {
     // device and the host side checks with `up ID RUNID ivshmem`.
     let standin = std::env::var("WC_MAC_ARENA_STANDIN").ok().filter(|s| !s.is_empty());
     let arena = cfg.arena_mib.max(32) * 1024 * 1024;
-    let mut argv: Vec<String> = vec!["wc-launch".into(), "--socket".into(), socket, "--in-band".into()];
+    // §103.14: the Wayland connections, the feeds, the control and the sound
+    // ride rings in a second window of this process's RAM.
+    let mut argv: Vec<String> =
+        vec!["wc-launch".into(), "--socket".into(), socket, "--in-band".into(), "--wayland-rings-guest-ram".into()];
     match &standin {
         Some(file) => {
             // SAFETY: before the compositor's threads exist.
@@ -368,14 +365,10 @@ fn run_main(cfg: Config) -> ExitCode {
     ]);
     let code = wc_compositor::run_from(argv);
     log.say("the compositor has ended; taking the session down");
-    if let Some(mut t) = session.tunnel.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = t.kill();
-        let _ = t.wait();
-    }
     if *session.up.lock().unwrap_or_else(|e| e.into_inner()) {
-        match ssh_verb(&cfg, &["down", &session.id]) {
-            Ok(_) => log.say("down ok"),
-            Err(e) => log.say(&e),
+        match control_request(&session, "down") {
+            Ok(r) => log.say(&format!("down over the control ring: {r}")),
+            Err(e) => log.say(&format!("down: {e}")),
         }
     }
     let _ = std::fs::remove_dir_all(&rt);
@@ -398,15 +391,87 @@ fn request(cfg: &Config, s: &Arc<Session>, log: &Log, section: &str, key: &str) 
             return;
         }
     };
-    let (cfg, s, log, key, section) = (cfg.clone(), s.clone(), log.clone(), key.to_string(), section.to_string());
+    let (s, log, key, section) = (s.clone(), log.clone(), key.to_string(), section.to_string());
     std::thread::spawn(move || {
-        let verb = plan::launch_verb(&s.id, &host_app, macbundle::request_for(&key), 96, None);
-        let words: Vec<&str> = verb.iter().map(String::as_str).collect();
-        match ssh_verb(&cfg, &words) {
-            Ok(o) => log.say(&format!("{section} {:?}: {}", if key.is_empty() { "run" } else { &key }, o.trim())),
+        // The words wc-session takes, less the session id, which the host's
+        // end of the channel puts in itself (macsvc.rs).
+        let verb = plan::launch_verb("ID", &host_app, macbundle::request_for(&key), 96, None);
+        let words: Vec<&str> = verb.iter().map(String::as_str).filter(|w| *w != "ID").collect();
+        let line = words.join(" ");
+        match control_request(&s, &line) {
+            Ok(r) => log.say(&format!("{section} {:?}: {r}", if key.is_empty() { "run" } else { &key })),
             Err(e) => log.say(&e),
         }
     });
+}
+
+/// Send one request on the control ring and wait for its reply line.
+fn control_request(s: &Session, line: &str) -> Result<String, String> {
+    use sv_transport::wlbytes::ReadOutcome;
+    let mut g = s.ctl.lock().unwrap_or_else(|e| e.into_inner());
+    let ch = g.as_mut().ok_or("no control channel")?;
+    let t0 = Instant::now();
+    let mut out = format!("{line}\n").into_bytes();
+    while !out.is_empty() {
+        match ch.write(&out) {
+            Ok(n) if n > 0 => {
+                out.drain(..n);
+            }
+            Ok(_) if t0.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(_) => return Err("the control ring is full".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !reply.ends_with(b"\n") {
+        match ch.read(&mut buf) {
+            Ok(ReadOutcome::Bytes(n)) => reply.extend_from_slice(&buf[..n]),
+            Ok(ReadOutcome::Eof) => return Err("the control ring ended".into()),
+            Ok(_) if t0.elapsed() < Duration::from_secs(60) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(_) => return Err("no reply on the control ring".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(format!("{} ({:.1} ms round trip)", String::from_utf8_lossy(&reply).trim(), t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+/// The ring slot the host claimed for a session service, once it has.
+fn service_channel(owner: u64, wait: Duration) -> Option<sv_transport::wlbytes::ByteChannel> {
+    use sv_transport::wlbytes::{ByteChannel, Endpoint};
+    let t0 = Instant::now();
+    while t0.elapsed() < wait {
+        if let Some(c) = wc_compositor::shared_control() {
+            if let Ok(live) = ByteChannel::live_connections(&c) {
+                for slot in live {
+                    if c.ring_owner(slot).ok() == Some(owner)
+                        && let Ok(ch) = ByteChannel::open(&c, slot, Endpoint::Peer)
+                    {
+                        return Some(ch);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// The sound channel as a `Read`, for the CoreAudio player.
+struct RingReader(sv_transport::wlbytes::ByteChannel);
+
+impl std::io::Read for RingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sv_transport::wlbytes::ReadOutcome;
+        loop {
+            match self.0.read(buf) {
+                Ok(ReadOutcome::Bytes(n)) => return Ok(n),
+                Ok(ReadOutcome::Eof) => return Ok(0),
+                Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            }
+        }
+    }
 }
 
 /// A face (§103.13): the application's Dock tile, menu bar and windows, as a
@@ -519,7 +584,7 @@ fn start_audio(port: u16, vol: u8, log: &Log) {
     });
 }
 
-fn bring_up(cfg: &Config, s: &Session, log: &Log, comp_log: &Path, socket_path: &Path) -> Result<(), String> {
+fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log, comp_log: &Path, _socket_path: &Path) -> Result<(), String> {
     let t0 = Instant::now();
     let up = if std::env::var_os("WC_IVSHMEM_STANDIN").is_some() {
         let line = wait_line(comp_log, "header published: run", Duration::from_secs(30))
@@ -537,60 +602,54 @@ fn bring_up(cfg: &Config, s: &Session, log: &Log, comp_log: &Path, socket_path: 
         let out = cfg.outbound.to_string();
         ssh_verb(cfg, &["up", &s.id, &run, &pages, &out])?
     };
-    *s.up.lock().unwrap_or_else(|e| e.into_inner()) = true;
     log.say(&format!("up: {}", up.trim().replace('\n', "; ")));
+    // For the next main process, should this one die without its goodbye.
+    let _ = std::fs::write(session_record(), format!("{}\n", s.id));
 
-    // The Wayland socket, forwarded to the host's run directory: a reverse
-    // Unix-socket forward, so nothing listens on a TCP port in either machine.
-    let mut a = plan::ssh_options(cfg, &known_hosts());
-    a.extend([
-        "-N".into(),
-        "-T".into(),
-        "-o".into(),
-        "ExitOnForwardFailure=yes".into(),
-        "-o".into(),
-        "StreamLocalBindUnlink=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-R".into(),
-        format!("{}:{}", plan::remote_upstream(&s.id), socket_path.to_string_lossy()),
-    ]);
-    // §86's sound, the other way: a loopback port here that reaches the
-    // PulseAudio monitor `wc-session proxy` makes for this session.
+    // §103.14: the ring region, located once (the bootstrap's second and last
+    // locate), then made into the control region; then the proxy, which
+    // attaches it. These three ssh execs are the whole of ssh's part: no
+    // tunnel, no forward, nothing after them.
+    let rings = wait_line(comp_log, "wayland rings in guest RAM: run", Duration::from_secs(30))
+        .ok_or("the compositor kept no guest-RAM rings")?;
+    let rrun = rings.split("run ").nth(1).and_then(|r| r.split(',').next()).unwrap_or("").to_string();
+    let rpages = rings.split(", ").nth(1).and_then(|p| p.split(' ').next()).unwrap_or("").to_string();
+    let r = ssh_verb(cfg, &["rings", &s.id, &rrun, &rpages])?;
+    log.say(&format!("rings: {}", r.trim().replace('\n', "; ")));
+    wc_compositor::guest_ram_rings_located();
+    let o = ssh_verb(cfg, &["proxy", &s.id])?;
+    log.say(&format!("proxy: {}", o.trim().replace('\n', "; ")));
+
+    let ctl = service_channel(sv_transport::wlbytes::OWNER_CONTROL, Duration::from_secs(20))
+        .ok_or("the host never opened the control ring")?;
+    *s.ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctl);
+    {
+        // The lease the host's proxy holds this process to (macsvc.rs): a
+        // ping every half second, or it stops touching this RAM.
+        let s2 = Arc::clone(s);
+        std::thread::Builder::new().name("lease".into()).spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let mut g = s2.ctl.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(ch) = g.as_mut() else { return };
+            if ch.write(b"ping\n").is_err() {
+                return;
+            }
+        }).ok();
+    }
     if cfg.audio {
-        a.extend(["-L".into(), format!("127.0.0.1:{}:{}/audio.sock", s.audio_port, plan::remote_dir(&s.id))]);
-    }
-    a.push(cfg.host.clone());
-    let child = Command::new(&cfg.ssh)
-        .args(&a)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("tunnel: {e}"))?;
-    let _ = std::fs::write(session_record(), format!("{} {}\n", s.id, child.id()));
-    *s.tunnel.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-
-    let mut last = String::new();
-    let mut proxied = false;
-    for _ in 0..60 {
-        match ssh_verb(cfg, &["proxy", &s.id]) {
-            Ok(o) => {
-                log.say(&format!("proxy: {}", o.trim().replace('\n', "; ")));
-                proxied = true;
-                if cfg.audio && o.contains("audio pulse") {
-                    start_audio(s.audio_port, cfg.audio_volume, log);
+        let (vol, log2) = (cfg.audio_volume, log.clone());
+        std::thread::Builder::new().name("audio".into()).spawn(move || {
+            match service_channel(sv_transport::wlbytes::OWNER_AUDIO, Duration::from_secs(20)) {
+                Some(ch) => {
+                    log2.say("audio: playing the session's sound from its ring through CoreAudio");
+                    match crate::audio_mac::play(RingReader(ch), vol) {
+                        Ok(st) => log2.say(&st.line()),
+                        Err(e) => log2.say(&format!("audio: {e}")),
+                    }
                 }
-                break;
+                None => log2.say("audio: the host opened no sound ring"),
             }
-            Err(e) => {
-                last = e;
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
-    if !proxied {
-        return Err(format!("the proxy did not start: {last}"));
+        }).ok();
     }
     log.say(&format!("session up {:?} after start", t0.elapsed()));
     Ok(())

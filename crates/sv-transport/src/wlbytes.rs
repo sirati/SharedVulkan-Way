@@ -165,6 +165,22 @@ pub struct ByteChannel {
     tx_eof: bool,
 }
 
+/// §103.14: owner-id tags for byte channels that carry a session service
+/// instead of a Wayland client. A compositor accepting connections skips any
+/// slot whose owner id has [`SERVICE_TAG`] in its top byte; the macOS main
+/// process opens them by their tag.
+pub const SERVICE_TAG: u64 = 0x5C << 56;
+/// The session's control channel: launch requests, replies and the liveness
+/// heartbeat.
+pub const OWNER_CONTROL: u64 = SERVICE_TAG | 1;
+/// The session's sound: raw s16le 48 kHz stereo PCM, host to guest.
+pub const OWNER_AUDIO: u64 = SERVICE_TAG | 2;
+
+/// Whether an owner id names a session service rather than a client.
+pub fn is_service(owner_id: u64) -> bool {
+    owner_id >> 56 == SERVICE_TAG >> 56
+}
+
 impl ByteChannel {
     /// Claim a free ring slot for a new connection. The host proxy's `connect`.
     ///
