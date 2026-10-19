@@ -147,11 +147,21 @@ impl Hub {
     /// Run one upstream connection until it closes: a reader fanning out and a
     /// writer draining the up queue. Returns when the upstream is gone.
     pub fn serve_upstream(self: &Arc<Self>, up: UnixStream) -> std::io::Result<()> {
+        self.serve_upstream_fresh(up, true)
+    }
+
+    /// [`Self::serve_upstream`]; `fresh` is a connection QEMU has just
+    /// accepted, as opposed to one inherited from a previous hub that QEMU
+    /// never saw close (§99.6). On a fresh one, bytes sent while there was
+    /// none are lost in both directions (a virtio-serial port drops what
+    /// arrives while nobody holds it), so the hub tells the guest to look at
+    /// every ring again too (`park::RESCAN_TOKEN`, waycompose-design.md §105).
+    pub fn serve_upstream_fresh(self: &Arc<Self>, up: UnixStream, fresh: bool) -> std::io::Result<()> {
         let w = up.try_clone()?;
         let closer = up.try_clone()?;
-        self.serve_link(Box::new(up), Box::new(w), move || {
+        self.serve_link_fresh(Box::new(up), Box::new(w), move || {
             let _ = closer.shutdown(std::net::Shutdown::Both);
-        })
+        }, fresh)
     }
 
     /// [`Hub::serve_upstream`] over any reader and writer: a chardev socket's
@@ -162,6 +172,18 @@ impl Hub {
         mut r: Box<dyn Read + Send>,
         mut w: Box<dyn Write + Send>,
         close: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        self.serve_link_fresh(r, w, close, true)
+    }
+
+    /// [`Self::serve_link`], saying whether the link is fresh (see
+    /// [`Self::serve_upstream_fresh`]): a guest port's open always is.
+    pub fn serve_link_fresh(
+        self: &Arc<Self>,
+        mut r: Box<dyn Read + Send>,
+        mut w: Box<dyn Write + Send>,
+        close: impl FnOnce(),
+        fresh: bool,
     ) -> std::io::Result<()> {
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(QUEUE);
         let writer = std::thread::Builder::new().name(format!("bell-{}-up", self.name)).spawn(move || {
@@ -176,6 +198,11 @@ impl Hub {
         // §103.15: whatever the guest rang while this hub had no upstream is
         // gone, so every client rescans its rings (RESCAN_TOKEN).
         self.fan_out(&[sv_transport::park::RESCAN_TOKEN]);
+        // §105: and on a connection QEMU has just accepted, the guest too: what
+        // the host rang while there was none was dropped on its way in.
+        if fresh {
+            self.up(&[sv_transport::park::RESCAN_TOKEN]);
+        }
         let mut buf = [0u8; 256];
         loop {
             match r.read(&mut buf) {
@@ -247,14 +274,14 @@ impl Upstream {
     }
 
     /// Serve `fd` (from [`Upstream::connect`] or systemd's store) on `hub`.
-    fn serve(&self, hub: &Arc<Hub>, fd: std::os::fd::OwnedFd) -> std::io::Result<()> {
+    fn serve(&self, hub: &Arc<Hub>, fd: std::os::fd::OwnedFd, fresh: bool) -> std::io::Result<()> {
         match self {
-            Upstream::Socket(_) => hub.serve_upstream(UnixStream::from(fd)),
+            Upstream::Socket(_) => hub.serve_upstream_fresh(UnixStream::from(fd), fresh),
             // A port has no shutdown; the writer ends when its queue does.
             Upstream::GuestPort(_) => {
                 let r = std::fs::File::from(fd);
                 let w = r.try_clone()?;
-                hub.serve_link(Box::new(r), Box::new(w), || {})
+                hub.serve_link_fresh(Box::new(r), Box::new(w), || {}, fresh)
             }
         }
     }
@@ -321,6 +348,7 @@ pub fn run_kept(
             let mut next = inherited;
             let key = format!("{}-up", hub.name);
             loop {
+                let inherited = next.is_some();
                 let got = match next.take() {
                     Some(s) => {
                         eprintln!("bell-hub {}: kept {} open across the restart", hub.name, upstream);
@@ -341,7 +369,7 @@ pub fn run_kept(
                             upstream,
                             hub.client_count()
                         );
-                        let _ = upstream.serve(&hub, s);
+                        let _ = upstream.serve(&hub, s, !inherited);
                         if keep {
                             let _ = crate::sdfd::remove(&key);
                         }
@@ -382,7 +410,20 @@ mod tests {
         d
     }
 
+    /// Bytes other than the hub's own `RESCAN_TOKEN`, which it sends on every
+    /// fresh upstream (§105) and which [`a_fresh_upstream_tells_both_sides_to_rescan`]
+    /// checks on its own.
     fn read_some(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
+        let mut v = read_raw(s, want + 1, within.min(Duration::from_millis(300)));
+        v.retain(|b| *b != sv_transport::park::RESCAN_TOKEN);
+        if v.len() >= want {
+            return v;
+        }
+        v.extend(read_raw(s, want - v.len(), within).into_iter().filter(|b| *b != sv_transport::park::RESCAN_TOKEN));
+        v
+    }
+
+    fn read_raw(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let t = Instant::now();
         let mut got = Vec::new();
@@ -467,7 +508,7 @@ mod tests {
         let mut got = Vec::new();
         let t = Instant::now();
         while !got.ends_with(&[9]) && t.elapsed() < Duration::from_secs(5) {
-            got.extend(read_some(&mut a, 1, Duration::from_secs(5)));
+            got.extend(read_raw(&mut a, 1, Duration::from_secs(5)));
         }
         let (last, before) = got.split_last().expect("bytes from the hub");
         assert_eq!(*last, 9);
@@ -475,6 +516,35 @@ mod tests {
         a.write_all(&[3]).unwrap();
         assert_eq!(read_some(&mut g2, 1, Duration::from_secs(5)), vec![3]);
         assert!(hub.stats.upstream_connects.load(Ordering::Relaxed) >= 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §105: a virtio-serial port drops what arrives while nobody holds it, so
+    /// on every fresh upstream connection the hub tells the guest and every
+    /// client to look at all their rings again; on one inherited across its own
+    /// restart (QEMU never saw it close) it does not.
+    #[test]
+    fn a_fresh_upstream_tells_both_sides_to_rescan() {
+        use sv_transport::park::RESCAN_TOKEN;
+        let d = tmpdir("rescan");
+        let qemu = fake_qemu(&d.join("qemu.sock"));
+        let hub = run("t", d.join("qemu.sock"), bind_private(&d.join("hub.sock")).unwrap()).unwrap();
+        let mut g1 = qemu.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(read_raw(&mut g1, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "the guest is told at once");
+        let mut a = UnixStream::connect(d.join("hub.sock")).unwrap();
+        let t = Instant::now();
+        while hub.client_count() < 1 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(g1);
+        let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
+        assert_eq!(read_raw(&mut g2, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN]);
+        assert_eq!(read_raw(&mut a, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "and so is every client");
+        // An inherited connection is not fresh: nothing was lost on it.
+        let (mine, mut theirs) = UnixStream::pair().unwrap();
+        let l = bind_private(&d.join("hub2.sock")).unwrap();
+        let _hub2 = run_kept("t2", Upstream::Socket(d.join("absent.sock")), l, Some(mine.into()), false).unwrap();
+        assert!(read_raw(&mut theirs, 1, Duration::from_millis(300)).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -556,13 +626,14 @@ mod tests {
             let mut got = Vec::new();
             let t = Instant::now();
             while !got.ends_with(&[10 + round]) && t.elapsed() < Duration::from_secs(5) {
-                got.extend(read_some(&mut a, 1, Duration::from_secs(5)));
+                got.extend(read_raw(&mut a, 1, Duration::from_secs(5)));
             }
             assert_eq!(got, vec![sv_transport::park::RESCAN_TOKEN, 10 + round], "round {round}");
             a.write_all(&[20 + round]).unwrap();
-            let mut b = [0u8; 1];
+            // §105: a fresh link tells the guest to rescan first, then the byte.
+            let mut b = [0u8; 2];
             guest_r.read_exact(&mut b).unwrap();
-            assert_eq!(b[0], 20 + round);
+            assert_eq!(b, [sv_transport::park::RESCAN_TOKEN, 20 + round], "round {round}");
             drop(guest_w); // the guest closed the port
             let _ = link.join().unwrap();
             assert!(closed.load(Ordering::Relaxed), "round {round}: close ran");

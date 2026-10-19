@@ -275,3 +275,233 @@ mod tests {
         assert!(message_bytes(&"x".repeat(2000)).len() == MESSAGE_MAX);
     }
 }
+
+// ------------------------------------------------ §105: the record's authenticator ---
+//
+// The boot record says which session to start; this block says who may ask.
+// On ssh the guest proved itself with its key, and the forced command bounded
+// what it could ask. Without ssh the shared-memory device is the boundary,
+// and any process in the guest that can open it can write a record. So the
+// record carries an HMAC-SHA-256 under a key that deploy wrote to two places
+// only: the installation's directory on the host and the installation's
+// directory in the guest user's profile. The host's service refuses a record
+// for an installation that has a key unless the MAC verifies and the sequence
+// number is above every one it accepted before, so a record read out of the
+// device and written back later is refused as a replay. A torn read (the
+// host's timer read the page while the guest was writing it) fails the MAC
+// too, and is looked at again on the next pass, not answered.
+//
+// ```text
+//   page 0, from AUTH_OFF
+//   0    WCAUTH01
+//   8    installation name, 32 bytes, NUL-padded ([A-Za-z0-9_-])
+//   40   sequence number (u64): strictly increasing per installation
+//   48   HMAC-SHA-256 (32 bytes) over auth_message()
+//   80   end
+// ```
+
+/// Where the authenticator sits in page 0: past the host's message and the
+/// release word.
+pub const AUTH_OFF: usize = 1792;
+pub const AUTH_MAGIC: [u8; 8] = *b"WCAUTH01";
+/// Longest installation name.
+pub const INSTALL_MAX: usize = 32;
+/// The key's length, in bytes. Deploy writes it as 64 hex digits.
+pub const KEY_LEN: usize = 32;
+const AUTH_LEN: usize = 80;
+
+/// The authenticator, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Auth {
+    pub installation: String,
+    pub seq: u64,
+    pub mac: [u8; 32],
+}
+
+/// Whether an installation name is one the host will look up.
+pub fn valid_installation(name: &str) -> bool {
+    !name.is_empty() && name.len() <= INSTALL_MAX && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// What the MAC covers: every field of the record the host acts on, the
+/// installation and the sequence number, each length-delimited.
+pub fn auth_message(rec: &Record, installation: &str, seq: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(160);
+    m.extend_from_slice(b"wcboot-auth-v1\0");
+    for s in [installation, rec.session.as_str()] {
+        m.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        m.extend_from_slice(s.as_bytes());
+    }
+    for v in [rec.arena_run, u64::from(rec.arena_pages), rec.outbound, rec.rings_run, u64::from(rec.rings_pages), u64::from(rec.gpu), seq] {
+        m.extend_from_slice(&v.to_le_bytes());
+    }
+    m
+}
+
+/// HMAC-SHA-256 (RFC 2104).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(k.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let ih = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(k.map(|b| b ^ 0x5c));
+    outer.update(ih);
+    outer.finalize().into()
+}
+
+/// A key as deploy writes it: 64 hex digits, whitespace around them ignored.
+pub fn parse_key(text: &str) -> Option<[u8; KEY_LEN]> {
+    let t = text.trim();
+    if t.len() != KEY_LEN * 2 {
+        return None;
+    }
+    let mut k = [0u8; KEY_LEN];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = u8::from_str_radix(t.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(k)
+}
+
+/// Equal in time independent of where the two differ.
+pub fn mac_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+impl Auth {
+    /// The guest's authenticator for `rec`.
+    pub fn sign(rec: &Record, installation: &str, seq: u64, key: &[u8; KEY_LEN]) -> Auth {
+        Auth { installation: installation.to_string(), seq, mac: hmac_sha256(key, &auth_message(rec, installation, seq)) }
+    }
+
+    /// Whether this authenticator is `rec`'s under `key`.
+    pub fn verifies(&self, rec: &Record, key: &[u8; KEY_LEN]) -> bool {
+        mac_eq(&self.mac, &hmac_sha256(key, &auth_message(rec, &self.installation, self.seq)))
+    }
+
+    pub fn write(&self, page: &mut [u8]) {
+        let a = &mut page[AUTH_OFF..AUTH_OFF + AUTH_LEN];
+        a.fill(0);
+        a[0..8].copy_from_slice(&AUTH_MAGIC);
+        let n = self.installation.len().min(INSTALL_MAX);
+        a[8..8 + n].copy_from_slice(&self.installation.as_bytes()[..n]);
+        a[40..48].copy_from_slice(&self.seq.to_le_bytes());
+        a[48..80].copy_from_slice(&self.mac);
+    }
+
+    /// The authenticator in page 0, or `None` for none or a malformed one.
+    pub fn read(page: &[u8]) -> Option<Auth> {
+        let a = page.get(AUTH_OFF..AUTH_OFF + AUTH_LEN)?;
+        if a[0..8] != AUTH_MAGIC {
+            return None;
+        }
+        let name = &a[8..8 + INSTALL_MAX];
+        let end = name.iter().position(|b| *b == 0).unwrap_or(INSTALL_MAX);
+        let installation = std::str::from_utf8(&name[..end]).ok()?.to_string();
+        if !valid_installation(&installation) {
+            return None;
+        }
+        Some(Auth { installation, seq: u64::from_le_bytes(a[40..48].try_into().ok()?), mac: a[48..80].try_into().ok()? })
+    }
+}
+
+/// Write a record and its authenticator into page 0 **of live shared memory**,
+/// which a host may read at any moment: the record's magic is cleared first and
+/// written last, after a release fence, so a reader sees the old record, no
+/// record, or the whole new one. The host's fields (state and message) are
+/// cleared with the record.
+///
+/// # Safety
+/// `page0` must point at a mapped, writable page of at least 4096 bytes that
+/// nothing else in this process writes concurrently.
+pub unsafe fn publish(page0: *mut u8, rec: &Record, auth: Option<&Auth>) {
+    use std::sync::atomic::{AtomicU64, Ordering, fence};
+    let mut page = vec![0u8; 4096];
+    rec.write(&mut page);
+    if let Some(a) = auth {
+        a.write(&mut page);
+    }
+    // SAFETY: the caller's contract. The magic word is 8-aligned (OFF is).
+    unsafe {
+        let magic = &*(page0.add(OFF) as *const AtomicU64);
+        magic.store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        std::ptr::copy_nonoverlapping(page.as_ptr().add(OFF + 8), page0.add(OFF + 8), OFF_RELEASED + 8 - OFF - 8);
+        std::ptr::copy_nonoverlapping(page.as_ptr().add(AUTH_OFF), page0.add(AUTH_OFF), AUTH_LEN);
+        fence(Ordering::Release);
+        magic.store(u64::from_le_bytes(MAGIC), Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn rec() -> Record {
+        Record { session: "wcns-77".into(), arena_run: 0xAB, arena_pages: 32768, outbound: 1 << 20, rings_run: 0xAB, rings_pages: 1536, gpu: true }
+    }
+
+    #[test]
+    fn hmac_matches_rfc4231_case_2() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let want = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        let got: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_signed_record_verifies_and_any_change_does_not() {
+        let key = [7u8; KEY_LEN];
+        let r = rec();
+        let a = Auth::sign(&r, "wcns", 42, &key);
+        let mut p = vec![0u8; 4096];
+        r.write(&mut p);
+        a.write(&mut p);
+        let (r2, a2) = (Record::read(&p).unwrap(), Auth::read(&p).unwrap());
+        assert!(a2.verifies(&r2, &key));
+        assert!(!a2.verifies(&r2, &[8u8; KEY_LEN]), "another installation's key");
+        let mut r3 = r2.clone();
+        r3.gpu = false;
+        assert!(!a2.verifies(&r3, &key), "a flipped field");
+        let mut a3 = a2.clone();
+        a3.seq += 1;
+        assert!(!a3.verifies(&r2, &key), "a bumped sequence number");
+        a3 = a2.clone();
+        a3.installation = "wcother".into();
+        assert!(!a3.verifies(&r2, &key), "another installation's name");
+    }
+
+    #[test]
+    fn the_authenticator_does_not_overlap_the_hosts_fields() {
+        const { assert!(AUTH_OFF >= OFF_MESSAGE + MESSAGE_MAX && AUTH_OFF >= OFF_RELEASED + 8) };
+        const { assert!(AUTH_OFF + AUTH_LEN <= 4096) };
+    }
+
+    #[test]
+    fn keys_parse_from_hex_only() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF\n";
+        assert_eq!(parse_key(hex).unwrap()[15], 0xff);
+        assert!(parse_key("abc").is_none());
+        assert!(parse_key(&"zz".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn publish_writes_a_whole_record_with_the_magic_last() {
+        let mut p = vec![0x55u8; 4096];
+        let r = rec();
+        let a = Auth::sign(&r, "wcns", 1, &[1; KEY_LEN]);
+        // SAFETY: a 4096-byte buffer this test owns.
+        unsafe { publish(p.as_mut_ptr(), &r, Some(&a)) };
+        assert_eq!(Record::read(&p), Some(r));
+        assert_eq!(Auth::read(&p), Some(a));
+        assert_eq!(state(&p), State::Waiting);
+        assert!(p[..OFF].iter().all(|b| *b == 0x55), "the header before the record is untouched");
+    }
+}

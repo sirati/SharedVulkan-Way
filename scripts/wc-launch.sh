@@ -167,6 +167,10 @@ esac
 PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
+# §105: the pre-§105 transport (ssh exec, relay, tunnel) as an opt-in debug
+# mode, off by default. With it the guest's ssh key and its forced command are
+# installed as before; without it this installation's key line is removed.
+DEBUG_SSH="${WC_LAUNCH_DEBUG_SSH_TRANSPORT:-0}"
 # §95. Each session slot of the GPU device is 16 MiB of control and this much
 # arena (`gpu-arena-mib`, the launcher's default 64). §95 measured Firefox
 # with two windows at about 53 MiB; testhost keeps 3 x 64 until the arena is
@@ -421,6 +425,97 @@ PS3
   site_fill "$1"
 }
 
+# §99, §105. The two per-user services every installation shares on the VM host:
+# the doorbell hub, and the session service that starts sessions from the
+# shared memory (no ssh). Each runs its own copy of its binary, so that
+# redeploying one installation never swaps a binary under another.
+install_services() {
+  # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
+  # installation: it, not a session, holds QEMU's two doorbell sockets.
+  # Its own copy of sv-hostd, so that redeploying one installation never
+  # swaps the binary under another's running hub. A changed binary or unit
+  # restarts the hub only when no session runs (below); otherwise it takes
+  # effect at the hub's next start.
+  local hubbin=${SITE_HOST_HOME}/wc-bell/sv-hostd hubunit=.config/systemd/user/wc-bell-hub.service
+  h "mkdir -p ${SITE_HOST_HOME}/wc-bell \$HOME/.config/systemd/user" >/dev/null
+  local before; before=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+  scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$HOST:$hubbin.new" >/dev/null \
+    && h "cmp -s $hubbin.new $hubbin && rm -f $hubbin.new || mv -f $hubbin.new $hubbin" >/dev/null \
+    || { echo "error: scp of the doorbell hub to the VM host"; exit 1; }
+  h "cat >\$HOME/$hubunit" <<UNIT
+[Unit]
+Description=waycompose shared doorbell hub (docs/waycompose-design.md §99)
+
+[Service]
+# §99.6: QEMU's chardev connections live in systemd's file-descriptor
+# store, so restarting the hub never closes them and QEMU never sees a
+# disconnect.
+Type=notify
+NotifyAccess=main
+FileDescriptorStoreMax=8
+FileDescriptorStorePreserve=yes
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  local after; after=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+  h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; systemctl --user start wc-bell-hub.service" >/dev/null 2>&1
+  # A changed hub is restarted only while no session runs: clients since
+  # §99.4 reconnect to a restarted hub, but a session started by an older
+  # build does not, and would lose its bells until it ends.
+  local live; live=$(h "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user list-units --state=active --no-legend --plain 'wc-launch-*' 2>/dev/null | wc -l")
+  local restarted=""
+  if [ -n "$before" ] && [ "$before" != "$after" ] && [ "${live:-1}" = 0 ]; then
+    h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user restart wc-bell-hub.service" >/dev/null 2>&1 && restarted=1
+  fi
+  local hs; hs=$(h "sleep 1; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service; ls /run/user/\$(id -u)/wc-bell/ 2>/dev/null | tr '\n' ' '")
+  case "$hs" in
+    active*sv.sock*wl.sock*)
+      if [ -n "$restarted" ]; then
+        note "the doorbell hub changed and was restarted (no session was running)"
+      elif [ "$before" != "$after" ] && [ -n "$before" ]; then
+        note "the doorbell hub changed and was NOT restarted: $live session unit(s) run; the new binary takes effect at its next start"
+      fi
+      ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
+    *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;
+  esac
+  # §105: THE SESSION SERVICE. It reads the ivshmem header page for boot
+  # records, checks each against the installation's key, and runs that
+  # installation's wc-session (`up`, `proxy`, `down`). It adopts the sessions
+  # it started across a restart, so a changed one is simply restarted.
+  local sdbin=${SITE_HOST_HOME}/wc-bell/wc-arena-host sdunit=.config/systemd/user/wc-sessiond.service
+  local sbefore; sbefore=$(h "sha256sum $sdbin \$HOME/$sdunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+  scp "${SSHOPT[@]}" "$1" "$HOST:$sdbin.new" >/dev/null \
+    && h "cmp -s $sdbin.new $sdbin && rm -f $sdbin.new || mv -f $sdbin.new $sdbin" >/dev/null \
+    || { echo "error: scp of the session service to the VM host"; exit 1; }
+  h "cat >\$HOME/$sdunit" <<UNIT
+[Unit]
+Description=waycompose session service: guest sessions from the shared memory, no ssh (docs/waycompose-design.md §105)
+Wants=wc-bell-hub.service
+After=wc-bell-hub.service
+
+[Service]
+Environment=PATH=/run/current-system/sw/bin:/run/wrappers/bin
+ExecStart=$sdbin sessiond --ivshmem /run/windows-vm/wc-arena/arena --installs %h/.config/waycompose/installs --bell %t/wc-bell/wl.sock
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+UNIT
+  local safter; safter=$(h "sha256sum $sdbin \$HOME/$sdunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
+  h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-sessiond.service >/dev/null 2>&1; \
+     if [ '$sbefore' != '$safter' ]; then systemctl --user restart wc-sessiond.service; else systemctl --user start wc-sessiond.service; fi" >/dev/null 2>&1
+  local ss; ss=$(h "sleep 1; XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user is-active wc-sessiond.service")
+  case "$ss" in
+    active*) ok "the session service runs for every installation ($sdbin, wc-sessiond.service$([ "$sbefore" != "$safter" ] && echo ', restarted: changed'))" ;;
+    *) bad "the session service is not running: $ss"; exit 1 ;;
+  esac
+}
+
 # ---------------------------------------------------------------- deploy -----
 do_deploy() {
   echo "== deploy =="
@@ -471,6 +566,10 @@ do_deploy() {
   # and the two numbers the guest sends, instead of taking the files as text.
   cargo build --release -p wc-launch 2>&1 | grep -E '^error' | head -5
   built_ok "${PIPESTATUS[0]}" "wc-launch for the VM host (release)" || exit 1
+  # §99, §105: the doorbell hub, which every session needs since nothing
+  # crosses but on rings.
+  cargo build --release -p sv-hostd 2>&1 | grep -E '^error' | head -5
+  built_ok "${PIPESTATUS[0]}" "sv-hostd for the doorbell hub (release)" || exit 1
   local locator="$LINUX_BIN/wc-arena-host"
   local proxy="$REL_LINUX/wc-proxy"
   local render="$REL_LINUX/wc-launch"
@@ -513,11 +612,14 @@ do_deploy() {
   cat >"$stage/wc-launch.ini" <<INI
 # Generated by scripts/wc-launch.sh. See docs/waycompose-design.md §28.
 [session]
-host       = $HOSTLINK
-key        = $DIR_WIN\\id_host
 compositor = $DIR_WIN\\sv-guest.exe
-relay      = $DIR_WIN\\probe-relay.exe
 name       = $SESSION
+# §105: no ssh. The session starts from a boot record signed with this
+# installation's key (session.key beside this file), which the VM host's
+# session service checks; every request after that is on the session's rings.
+installation = $SESSION
+debug-ssh-transport = $([ "$DEBUG_SSH" = 1 ] && echo on || echo off)
+$([ "$DEBUG_SSH" = 1 ] && printf 'host       = %s\nkey        = %s\\id_host\nrelay      = %s\\probe-relay.exe\n' "$HOSTLINK" "$DIR_WIN" "$DIR_WIN")
 arena-mib  = $ARENA_MIB
 outbound   = 1048576
 output     = $OUTPUT
@@ -532,8 +634,8 @@ gpu-arena-mib = $GPU_ARENA_MIB
 gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
-# §89: the Wayland rings' doorbell port; empty sends the Wayland connections
-# through the ssh tunnel, as a VM without the port does (loudly, either way).
+# §89, §105: the Wayland rings' doorbell port. Every byte of the session crosses
+# on those rings; a VM without the port polls them, loudly.
 wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 # §102: WC_LAUNCH_NESTED_GLOBALS=1 offers wp_single_pixel_buffer_manager_v1,
 # wp_viewporter and wp_presentation, which a nested compositor (KWin) needs.
@@ -631,13 +733,37 @@ APPS
     note "WC_LAUNCH_PORT_ACCESS=$PORT_ACCESS: the guest's port security is left alone"
   fi
 
-  # The guest's key for the VM host, generated on the guest so the private half
-  # never leaves it, and restricted on the host to wc-session's verbs.
-  local pub
-  pub=$(g "export MSYS_NO_PATHCONV=1; test -f $DIR_MSYS/id_host || \
-        ssh-keygen -t ed25519 -N '' -C wc-launch-guest -f $DIR_MSYS/id_host >/dev/null; \
-        cat $DIR_MSYS/id_host.pub" | grep '^ssh-ed25519')
-  [ -n "$pub" ] || { echo "error: the guest produced no key"; exit 1; }
+  # §105. THE INSTALLATION'S KEY, which replaced the guest's ssh key: 32 random
+  # bytes as 64 hex digits, in two places only, the installation's directory
+  # on the VM host (0600) and its directory in the guest user's profile
+  # (readable by that user alone). The guest signs its boot record with it and
+  # the host's session service checks the signature. Made on the host the
+  # first time, kept across deploys; it crosses to the guest once, over this
+  # deploy channel, which is an administrator's and not the session's.
+  local key
+  key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
+           (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
+           chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
+  printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
+      icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
+  key=""
+  local kchk
+  kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
+  [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
+    || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  # §105: the installation, registered with the host's session service by name.
+  h "mkdir -p \$HOME/.config/waycompose/installs && ln -sfn $HOSTDIR \$HOME/.config/waycompose/installs/$SESSION" >/dev/null
+
+  # The guest's ssh key for the VM host: only for the opt-in debug transport.
+  local pub=""
+  if [ "$DEBUG_SSH" = 1 ]; then
+    note "WC_LAUNCH_DEBUG_SSH_TRANSPORT=1: installing the guest's ssh key and forced command for the DEBUG transport"
+    pub=$(g "export MSYS_NO_PATHCONV=1; test -f $DIR_MSYS/id_host || \
+          ssh-keygen -t ed25519 -N '' -C wc-launch-guest -f $DIR_MSYS/id_host >/dev/null; \
+          cat $DIR_MSYS/id_host.pub" | grep '^ssh-ed25519')
+    [ -n "$pub" ] || { echo "error: the guest produced no key"; exit 1; }
+  fi
 
   # `scp` over a running binary is ETXTBSY on Linux and a held file handle on
   # Windows, and a session left up from the last run is running exactly these
@@ -657,12 +783,21 @@ APPS
   # §106: the xdg-open shim directory, put first on the applications' PATH.
   h "mkdir -p $HOSTDIR/wc-hostint" && scp "${SSHOPT[@]}" "$ROOT/scripts/wc-hostint/xdg-open" "$HOST:$HOSTDIR/wc-hostint/" >/dev/null \
     && h "chmod 755 $HOSTDIR/wc-hostint/xdg-open" || { echo "error: scp of the xdg-open shim"; exit 1; }
-  h "chmod 755 $HOSTDIR/wc-session $HOSTDIR/bin/*; \
-     mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; \
-     grep -q '$(echo "$pub" | awk '{print $2}')' ~/.ssh/authorized_keys || \
-       echo 'restrict,port-forwarding,command=\"$HOSTDIR/wc-session\" $pub' >> ~/.ssh/authorized_keys; \
-     grep -c wc-launch-guest ~/.ssh/authorized_keys" >/dev/null
-  echo "  copied wc-session, wc-proxy, wc-arena-host and wc-launch to $HOST:$HOSTDIR, and restricted the guest's key to it"
+  h "chmod 755 $HOSTDIR/wc-session $HOSTDIR/bin/*" >/dev/null
+  if [ "$DEBUG_SSH" = 1 ]; then
+    h "mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; \
+       grep -q '$(echo "$pub" | awk '{print $2}')' ~/.ssh/authorized_keys || \
+         echo 'restrict,port-forwarding,command=\"$HOSTDIR/wc-session\" $pub' >> ~/.ssh/authorized_keys" >/dev/null
+    echo "  copied wc-session, wc-proxy, wc-arena-host and wc-launch to $HOST:$HOSTDIR; DEBUG: the guest's ssh key is restricted to it"
+  else
+    # §105: this installation's forced-command key, if an earlier deploy put
+    # one there, is removed: nothing of the session uses ssh, so nothing may.
+    local removed
+    removed=$(h "f=\$HOME/.ssh/authorized_keys; [ -f \$f ] || { echo 0; exit; }; \
+      n=\$(grep -cF 'command=\"$HOSTDIR/wc-session\"' \$f); \
+      [ \"\$n\" = 0 ] || { grep -vF 'command=\"$HOSTDIR/wc-session\"' \$f >\$f.wcnew && chmod 600 \$f.wcnew && mv \$f.wcnew \$f; }; echo \$n")
+    echo "  copied wc-session, wc-proxy, wc-arena-host and wc-launch to $HOST:$HOSTDIR; the guest has no ssh key for it (removed ${removed:-0} old forced-command line(s))"
+  fi
 
   # §94. The application's executable, as an absolute path on the host, and
   # then the definitions checked by the script that will read them.
@@ -709,58 +844,6 @@ APPS
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
     deployed_is "$REL_LINUX/libsv_wlshim.so" "$HOSTDIR/bin/libsv_wlshim.so" h "re-run $0 deploy" || exit 1
-    # §99: THE SHARED DOORBELL HUB. One per user on the VM host, for every
-    # installation: it, not a session, holds QEMU's two doorbell sockets.
-    # Its own copy of sv-hostd, so that redeploying one installation never
-    # swaps the binary under another's running hub. A changed binary or unit
-    # restarts the hub only when no session runs (below); otherwise it takes
-    # effect at the hub's next start.
-    local hubbin=${SITE_HOST_HOME}/wc-bell/sv-hostd hubunit=.config/systemd/user/wc-bell-hub.service
-    h "mkdir -p ${SITE_HOST_HOME}/wc-bell \$HOME/.config/systemd/user" >/dev/null
-    local before; before=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
-    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$HOST:$hubbin.new" >/dev/null \
-      && h "cmp -s $hubbin.new $hubbin && rm -f $hubbin.new || mv -f $hubbin.new $hubbin" >/dev/null \
-      || { echo "error: scp of the doorbell hub to the VM host"; exit 1; }
-    h "cat >\$HOME/$hubunit" <<UNIT
-[Unit]
-Description=waycompose shared doorbell hub (docs/waycompose-design.md §99)
-
-[Service]
-# §99.6: QEMU's chardev connections live in systemd's file-descriptor
-# store, so restarting the hub never closes them and QEMU never sees a
-# disconnect.
-Type=notify
-NotifyAccess=main
-FileDescriptorStoreMax=8
-FileDescriptorStorePreserve=yes
-ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-UNIT
-    local after; after=$(h "sha256sum $hubbin \$HOME/$hubunit 2>/dev/null | cut -c1-16 | tr -d '\n'")
-    h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user daemon-reload && systemctl --user enable wc-bell-hub.service >/dev/null 2>&1; systemctl --user start wc-bell-hub.service" >/dev/null 2>&1
-    # A changed hub is restarted only while no session runs: clients since
-    # §99.4 reconnect to a restarted hub, but a session started by an older
-    # build does not, and would lose its bells until it ends.
-    local live; live=$(h "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user list-units --state=active --no-legend --plain 'wc-launch-*' 2>/dev/null | wc -l")
-    local restarted=""
-    if [ -n "$before" ] && [ "$before" != "$after" ] && [ "${live:-1}" = 0 ]; then
-      h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user restart wc-bell-hub.service" >/dev/null 2>&1 && restarted=1
-    fi
-    local hs; hs=$(h "sleep 1; export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service; ls /run/user/\$(id -u)/wc-bell/ 2>/dev/null | tr '\n' ' '")
-    case "$hs" in
-      active*sv.sock*wl.sock*)
-        if [ -n "$restarted" ]; then
-          note "the doorbell hub changed and was restarted (no session was running)"
-        elif [ "$before" != "$after" ] && [ -n "$before" ]; then
-          note "the doorbell hub changed and was NOT restarted: $live session unit(s) run; the new binary takes effect at its next start"
-        fi
-        ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
-      *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;
-    esac
     local icd_json=$HOSTDIR/bin/sv_icd.json
     if [ -n "$ICD_STORE" ]; then
       # One store path holding the library and a manifest that names it
@@ -784,6 +867,8 @@ VK_DRIVER_FILES=$icd_json"
       printf '%b\n' "$genv" | sed 's/^/          /'
     fi
   fi
+  # §99, §105: the hub and the session service, for every installation.
+  install_services "$locator"
   # §92. The jump list's two tools, GC-rooted where wc-session looks first.
   local tool
   for tool in "sqlite:$SQLITE:sqlite3" "librsvg:$RSVG:rsvg-convert"; do
@@ -830,13 +915,25 @@ VK_DRIVER_FILES=$icd_json"
   # of this check went through two shells, lost every backslash of the key's
   # path, and reported "Permission denied (publickey)" for a file it had never
   # opened.
-  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --ping" >/dev/null
-  local said
-  said=$(read_clock | grep 'PING' | tail -1)
-  case "$said" in
-    *"wc-session ok"*) ok "the guest reaches the VM host on its own key: ${said#*PING }" ;;
-    *) bad "the guest cannot reach the VM host"; read_clock | tail -5 | sed 's/^/        /' ;;
-  esac
+  #
+  # §105: since there is no ssh, the guest reaches the host only through a
+  # session's rings, so that check is the cold start itself (`cold`). What is
+  # checked here is that nothing of ssh is left for the guest to use.
+  if [ "$DEBUG_SSH" = 1 ]; then
+    g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --ping" >/dev/null
+    local said
+    said=$(read_clock | grep 'PING' | tail -1)
+    case "$said" in
+      *"wc-session ok"*) ok "DEBUG: the guest reaches the VM host on its ssh key: ${said#*PING }" ;;
+      *) bad "the guest cannot reach the VM host"; read_clock | tail -5 | sed 's/^/        /' ;;
+    esac
+  else
+    g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/id_host $DIR_MSYS/id_host.pub $DIR_MSYS/known_hosts $DIR_MSYS/probe-relay.exe" >/dev/null
+    local left
+    left=$(h "grep -cF 'command=\"$HOSTDIR/wc-session\"' \$HOME/.ssh/authorized_keys 2>/dev/null")
+    [ "${left:-0}" = 0 ] && ok "no ssh key of this installation on either side (guest key files and host forced command gone)" \
+      || bad "the host still has $left forced-command line(s) for $HOSTDIR"
+  fi
 }
 
 # --------------------------------------------------------------- install -----
@@ -1009,8 +1106,11 @@ do_click() {
   case "$kind" in
     cold|warm-first)
       local clock; clock=$(read_clock)
-      if echo "$clock" | grep -q 'SSH FALLBACK'; then
-        bad "$kind: the Wayland connections fell back to ssh: $(echo "$clock" | grep -m1 'SSH FALLBACK' | cut -c1-240)"
+      if echo "$clock" | grep -q 'SSH FALLBACK\|DEBUG SSH TRANSPORT'; then
+        bad "$kind: the session used ssh: $(echo "$clock" | grep -m1 'SSH FALLBACK\|DEBUG SSH' | cut -c1-240)"
+      elif echo "$clock" | grep -q 'boot: located' && echo "$clock" | grep -q 'shared memory only'; then
+        ok "$kind: no ssh: the session booted from the header page and every byte is on the ivshmem rings"
+        echo "$clock" | grep -q 'NO DOORBELL' && bad "$kind: the rings have no doorbell and are polled"
       elif echo "$clock" | grep -q 'transport rings:'; then
         ok "$kind: the Wayland connections are on the ivshmem rings, with their doorbell"
       else

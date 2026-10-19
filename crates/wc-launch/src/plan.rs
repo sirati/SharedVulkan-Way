@@ -119,6 +119,38 @@ pub fn hostint_argv(h: &crate::config::HostInt) -> Vec<String> {
 /// writes each application's relaunch file into (`taskbar::Relaunch`). A
 /// window whose identity has one there can be pinned as that application; any
 /// other window still cannot.
+/// §105. What asks the VM host for the session, now that no ssh does: the
+/// compositor writes a boot record for run `id` of `installation`, signed with
+/// the key in `key_file`, into the ivshmem header page, and serves this
+/// launcher's requests on `control` once the host has answered. With `audio`
+/// it also plays the session's sound ring.
+pub fn boot_argv(cfg: &Config, id: &str, key_file: &str, control: &str) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "--boot-session".into(),
+        id.into(),
+        "--boot-install".into(),
+        cfg.installation().into(),
+        "--boot-key".into(),
+        key_file.into(),
+        "--control-socket".into(),
+        control.into(),
+    ];
+    if cfg.audio {
+        a.extend(["--session-audio".into(), cfg.audio_volume.to_string()]);
+    }
+    a
+}
+
+/// §105. A request as the control ring takes it: the host puts this session's
+/// id after the verb itself, so the id the ssh path sent second is dropped.
+pub fn without_id(verb: &[String]) -> Vec<String> {
+    let mut v = verb.to_vec();
+    if v.len() > 1 {
+        v.remove(1);
+    }
+    v
+}
+
 pub fn relaunch_argv(dir: &str) -> Vec<String> {
     vec!["--relaunch-dir".into(), dir.into()]
 }
@@ -186,12 +218,8 @@ pub fn tunnel_argv(cfg: &Config, known_hosts: &str, id: &str) -> Vec<String> {
         "-R".into(),
         format!("{}:127.0.0.1:{}", remote_upstream(id), cfg.port),
     ]);
-    // §86, §87. One reverse forward for the GPU process: `$D/cold.sock` on the
-    // VM host reaches its port here. Each connection the host's
-    // `sv-hostd ivshmem-serve` makes through it is one session, in its own slot.
-    if cfg.gpu_sessions > 0 {
-        a.extend(["-R".into(), format!("{}/cold.sock:127.0.0.1:{}", remote_dir(id), cfg.gpu_port())]);
-    }
+    // No forward for the GPU process: its cold path is the pool's mailboxes
+    // (`sv_transport::poolcold`), read by the VM host through the device.
     // §86. The session's sound, the other way: a loopback port here that
     // reaches the PulseAudio monitor socket `wc-session` made for this session.
     if cfg.audio {
@@ -989,25 +1017,30 @@ mod audio_tests {
 }
 
 /// §86, §87, §97. The GPU process: `sv-guest.exe gpu guest` on the GPU arena's
-/// ivshmem device, one port, up to `gpu-sessions` sessions at once — leasing
-/// from one pool over the whole device (`gpu-arena = pool`, the default) or in
-/// §87's fixed slots of the BAR — and the doorbell port if the ini names one. `--idle` is how long a
-/// session waits for its application to claim its rings once the host has
-/// asked for it, which is seconds, not the session's life: the process lives
-/// as long as the launcher session, which kills it.
+/// ivshmem device, up to `gpu-sessions` sessions at once — leasing from one
+/// pool over the whole device (`gpu-arena = pool`, the default) or in §87's
+/// fixed slots of the BAR — and the doorbell port if the ini names one.
+/// `--idle` is how long a session waits for its application to claim its
+/// rings once the host has asked for it, which is seconds, not the session's
+/// life: the process lives as long as the launcher session, which kills it.
+///
+/// A pool has no port: its cold path is the mailboxes in the pool's header
+/// granule (`sv_transport::poolcold`), which the VM host's
+/// `sv-hostd ivshmem-serve --cold pool` reads through the same device. §87's
+/// slots still speak TCP (`--port`), and nothing forwards it any more.
 pub fn gpu_argv(cfg: &Config) -> Vec<String> {
-    let mut a: Vec<String> = vec![
-        "gpu".into(),
-        "guest".into(),
-        "--port".into(),
-        cfg.gpu_port().to_string(),
-        "--ivshmem-slot".into(),
-        format!("{:#04x}", cfg.gpu_ivshmem_slot),
-    ];
+    let mut a: Vec<String> = vec!["gpu".into(), "guest".into()];
     if cfg.gpu_pool {
-        a.push("--pool".into());
+        a.extend(["--ivshmem-slot".into(), format!("{:#04x}", cfg.gpu_ivshmem_slot), "--pool".into()]);
     } else {
-        a.extend(["--arena".into(), (cfg.gpu_arena_mib << 20).to_string()]);
+        a.extend([
+            "--port".into(),
+            cfg.gpu_port().to_string(),
+            "--ivshmem-slot".into(),
+            format!("{:#04x}", cfg.gpu_ivshmem_slot),
+            "--arena".into(),
+            (cfg.gpu_arena_mib << 20).to_string(),
+        ]);
     }
     a.extend([
         "--sessions".into(),
@@ -1026,15 +1059,14 @@ mod gpu_tests {
     use super::*;
 
     #[test]
-    fn the_gpu_process_has_one_port_one_forward_and_its_device() {
+    fn the_gpu_process_has_no_port_no_forward_and_its_device() {
         let mut c = Config { host: "u@h".into(), ..Config::default() };
-        assert!(!tunnel_argv(&c, "kh", "wcl-1").iter().any(|x| x.contains("cold")));
         c.gpu_sessions = 3;
         let a = tunnel_argv(&c, "kh", "wcl-1");
-        let colds: Vec<&String> = a.iter().filter(|x| x.contains("/cold")).collect();
-        assert_eq!(colds, [&format!("/tmp/wc-launch/wcl-1/cold.sock:127.0.0.1:{}", c.port + 10)]);
+        assert!(!a.iter().any(|x| x.contains("cold")), "no forward for the GPU cold path: {a:?}");
         let g = gpu_argv(&c);
-        assert_eq!(&g[..6], ["gpu", "guest", "--port", &(c.port + 10).to_string(), "--ivshmem-slot", "0x1d"]);
+        assert_eq!(&g[..5], ["gpu", "guest", "--ivshmem-slot", "0x1d", "--pool"]);
+        assert!(!g.iter().any(|x| x == "--port"), "the pool's cold path is its mailboxes: {g:?}");
         let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
         assert_eq!(after("--sessions"), Some("3"));
         assert!(g.iter().any(|x| x == "--pool") && !g.iter().any(|x| x == "--arena"), "the pool by default (§97)");
@@ -1048,5 +1080,39 @@ mod gpu_tests {
         c.gpu_bell.clear();
         assert!(!gpu_argv(&c).iter().any(|x| x == "--bell"));
         assert_eq!(a.last().unwrap(), "u@h");
+    }
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    #[test]
+    fn the_compositor_is_asked_to_boot_the_session_with_no_ssh() {
+        let mut c = Config { session: "wcns".into(), ..Config::default() };
+        let a = boot_argv(&c, "wcns-42", r"C:\w\session.key", r"C:\s\wc-launch-wcns.ctl");
+        let after = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());
+        assert_eq!(after("--boot-session"), Some("wcns-42"));
+        assert_eq!(after("--boot-install"), Some("wcns"), "the session name by default");
+        assert_eq!(after("--boot-key"), Some(r"C:\w\session.key"));
+        assert_eq!(after("--control-socket"), Some(r"C:\s\wc-launch-wcns.ctl"));
+        assert_eq!(after("--session-audio"), Some("100"));
+        c.installation = "wclinux".into();
+        c.audio = false;
+        let a = boot_argv(&c, "wcns-42", "k", "s");
+        assert!(a.iter().any(|x| x == "wclinux"));
+        assert!(!a.iter().any(|x| x == "--session-audio"));
+        // Nothing of ssh anywhere in what starts a session.
+        assert!(!compositor_argv(&c, "wl-x", "log").iter().chain(&a).any(|x| x.contains("ssh")));
+    }
+
+    #[test]
+    fn a_request_on_the_ring_carries_no_session_id() {
+        let v = launch_verb("wcns-42", "firefox", crate::Request::Run, 96, Some(30));
+        assert_eq!(v[1], "wcns-42");
+        let w = without_id(&v);
+        assert_eq!(w[0], "run");
+        assert!(!w.iter().any(|x| x == "wcns-42"));
+        assert_eq!(&w[1..], &v[2..]);
     }
 }

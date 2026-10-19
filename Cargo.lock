@@ -1680,6 +1680,7 @@ name = "wc-arena-host"
 version = "0.1.0"
 dependencies = [
  "arena-record",
+ "libc",
  "sv-arena",
  "sv-hostd",
  "sv-transport",
@@ -1723,6 +1724,7 @@ name = "wc-handle"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sha2",
  "sv-arena",
  "sv-transport",
  "windows-sys",
@@ -1753,6 +1755,7 @@ dependencies = [
  "wc-handle",
  "wc-hostint",
  "wc-hostplat",
+ "wc-transport",
  "windows-sys",
 ]
 
