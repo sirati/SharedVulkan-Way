@@ -166,6 +166,12 @@ pub fn shared_compositor_argv(cfg: &Config, log: &str, user_ctl: &str) -> Vec<St
     a
 }
 
+/// §107: the shared compositor's pid from its answer to `ping`
+/// (`compositor <pid>`); 0 when the answer does not name one.
+pub fn compositor_pid(answer: &str) -> u32 {
+    answer.trim().strip_prefix("compositor ").and_then(|p| p.trim().parse().ok()).unwrap_or(0)
+}
+
 /// §110: whether the shared compositor runs the GPU pool itself.
 pub fn one_pool_gpu(cfg: &Config) -> bool {
     cfg.shared_compositor && cfg.one_pool && cfg.gpu_sessions > 0 && cfg.gpu_pool
@@ -703,6 +709,14 @@ pub fn unb64(text: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_shared_compositors_pid_comes_from_its_ping() {
+        assert_eq!(super::compositor_pid("compositor 4321"), 4321);
+        assert_eq!(super::compositor_pid(" compositor 7\n"), 7);
+        assert_eq!(super::compositor_pid("session up"), 0);
+        assert_eq!(super::compositor_pid("compositor x"), 0);
+    }
+
     use super::*;
     use crate::config::{Config, EXAMPLE};
 

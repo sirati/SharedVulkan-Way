@@ -52,6 +52,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -x "$SHM" ] || { echo "no weston-presentation-shm"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -201,7 +207,9 @@ OLD_B=$(grep -o "arena: session $IDX_B granted region [^:]*: [0-9]* MiB at [0-9]
 P=$(proxy_pid "wcmb-$$-b")
 CLIENTS_BEFORE=$(grep -c 'disconnected' "$D/comp-1.log")
 T0=$(date +%s%N)
-kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
+# A unit that is not there shows MainPID 0, and `kill -9 0` is this script's
+# whole process group: the harness and whatever started it.
+[ "${P:-0}" -gt 0 ] && kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
 wait_line "$D/comp-1.log" "index $IDX_B, installation wcmb\) ENDED" 20 && ok "compositor ended session $IDX_B in $(ms "$T0") ms: $(grep -m1 -o "index $IDX_B, installation wcmb) ENDED.*" "$D/comp-1.log" | cut -c1-90)" || bad "session $IDX_B was never ended"
 wait_line "$D/comp-1.log" "arena: session $IDX_B's [0-9]* region" 10 && ok "$(grep -m1 -o "arena: session $IDX_B's.*" "$D/comp-1.log")" || bad "its regions did not come back"
 for t in a c; do R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "after b's death, status $t: $R" ;; esac; done
@@ -303,7 +311,25 @@ wait_line "$D/comp-4.log" 'installation wcmc\) ENDED' 15
 wait_line "$D/comp-4.log" 'session [0-9]'"'"'s [0-9]* region' 10
 ok "after down: $(grep -c 'back in the pool' "$D/comp-4.log") session(s) returned their regions; $(grep -o 'back in the pool ([0-9]* MiB free' "$D/comp-4.log" | tail -1)"
 
-say "leg 8: host integration (§106) on beside the arena: every session's service slots are its own"
+if [ -n "$INFO" ]; then
+  say "leg 8 (§107.10): short-lived clients and their feeds; the session ends by its linger, nothing left connected"
+  sleep $((LINGER + 1))
+  kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+  kill "$PORT" 2>/dev/null; start_port
+  start_compositor 5
+  R=$(boot l wcma "$D/guest-wcma.key"); case "$R" in ok\ located*) IDX_L=$(echo "$R" | awk '{print $3}') ;; *) bad "linger boot: $R" ;; esac
+  # wayland-info connects, reads the globals and leaves at once: the race
+  # that left a feed behind, with whatever the compositor had sent it unread.
+  for i in 1 2 3 4 5; do request l "raw run info 96 30" >/dev/null; sleep 0.3; done
+  wait_line "$D/comp-5.log" "accepted on ring slot [0-9]* of session ${IDX_L:-x}, a feed" 15 && ok "feeds are known as feeds: $(grep -c "of session ${IDX_L:-x}, a feed" "$D/comp-5.log") of $(grep -c "of session ${IDX_L:-x}" "$D/comp-5.log") connections" || bad "no feed was marked as one"
+  T0=$(date +%s%N)
+  wait_line "$D/comp-5.log" "index ${IDX_L:-x}, installation wcma\) ENDED.*last client left" $((LINGER + 20)) \
+    && ok "session ${IDX_L:-x} ended by its linger $(ms "$T0") ms after the last run: $(grep -m1 -o "index ${IDX_L:-x}, installation wcma) ENDED.*" "$D/comp-5.log" | cut -c1-100)" \
+    || bad "session ${IDX_L:-x} did not end by its linger ($(sessions))"
+  grep -q 'outlived it; closed' "$D/comp-5.log" && ok "a feed the proxy left behind was closed: $(grep -m1 -o 'ring slot [0-9]*: a feed.*' "$D/comp-5.log")"
+fi
+
+say "leg 9: host integration (§106) on beside the arena: every session's service slots are its own"
 # The guest's compositor runs with --hostint (wc-launch.exe passes it), so each
 # session has an OWNER_HOSTINT slot beside its OWNER_ARENA slot. On the guest the
 # two once had one owner id, and a session's `grow` was answered with hostint's
@@ -311,7 +337,7 @@ say "leg 8: host integration (§106) on beside the arena: every session's servic
 sleep $((LINGER + 1))
 kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
 kill "$PORT" 2>/dev/null; start_port
-COMP_EXTRA=--hostint start_compositor 5
+COMP_EXTRA=--hostint start_compositor 6
 for t in a b c; do
   R=$(boot "${t}h" "wcm$t" "$D/guest-wcm$t.key"); case "$R" in ok\ located*) ;; *) bad "hostint boot $t: $R" ;; esac
   echo "$R" | awk '{print $3}' >"$D/idx-${t}h"
@@ -323,12 +349,12 @@ done
 sleep 5
 for t in a b c; do
   I=$(cat "$D/idx-${t}h")
-  wait_line "$D/comp-5.log" "arena: session $I granted region" 15 && ok "session $I (wcm$t) got its region with hostint on" || bad "session $I (wcm$t) got no region with hostint on"
+  wait_line "$D/comp-6.log" "arena: session $I granted region" 15 && ok "session $I (wcm$t) got its region with hostint on" || bad "session $I (wcm$t) got no region with hostint on"
   grep -q 'not a grant' "$D/proxy-${t}h.log" && bad "proxy ${t}h: $(grep -m1 -o 'not a grant.*' "$D/proxy-${t}h.log" | cut -c1-100)"
 done
-HS=$(grep -c 'hostint: on ring slot' "$D/comp-5.log")
-[ "$HS" -ge 3 ] && ok "hostint served on $HS slot(s): $(grep -o 'hostint: on ring slot [0-9]*' "$D/comp-5.log" | awk '{print $5}' | tr '\n' ' ')" || bad "hostint on only $HS slot(s)"
-MAPPED=$(grep -c ' mapped ' "$D/comp-5.log")
+HS=$(grep -c 'hostint: on ring slot' "$D/comp-6.log")
+[ "$HS" -ge 3 ] && ok "hostint served on $HS slot(s): $(grep -o 'hostint: on ring slot [0-9]*' "$D/comp-6.log" | awk '{print $5}' | tr '\n' ' ')" || bad "hostint on only $HS slot(s)"
+MAPPED=$(grep -c ' mapped ' "$D/comp-6.log")
 [ "$MAPPED" -ge 3 ] && ok "$MAPPED window(s) mapped with hostint on" || bad "only $MAPPED window(s) mapped with hostint on"
 for t in a b c; do request "${t}h" "raw down" >/dev/null; done
 

@@ -1276,7 +1276,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // slot of its own (a client, as far as the compositor knows) and
         // speaks through a local socket pair bridged to it.
         let feed_ring = if on_ring { ring.clone() } else { None };
-        let feed_owner = sv_transport::wlbytes::with_session((1u64 << 40) | n as u64, args.services.index);
+        let feed_owner = |clip| sv_transport::wlbytes::with_session(sv_transport::wlbytes::feed_owner(n as u64, clip), args.services.index);
+        let (icon_owner, clip_owner) = (feed_owner(false), feed_owner(true));
         // STAGE 13. Where *this* client's application is installed, asked of
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the
@@ -1370,7 +1371,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 // skipped silently, because a generic icon looks like a bug in
                 // the icon code.
                 if let Some(c) = feed_ring.as_ref() {
-                    match wc_proxy::rings::bridge(std::sync::Arc::clone(c), feed_owner)
+                    match wc_proxy::rings::bridge(std::sync::Arc::clone(c), icon_owner)
                         .map_err(|e| e.to_string())
                         .and_then(|sock| wc_proxy::iconlink::IconLink::connect_stream(sock, &spec, search))
                     {
@@ -1409,7 +1410,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // `--no-icons` exists, and an icon resolver that cannot reach the
             // theme must not be the reason copy and paste stop working.
             let mut clip = if want_clipboard && let Some(c) = feed_ring.as_ref() {
-                match wc_proxy::rings::bridge(std::sync::Arc::clone(c), feed_owner | (1 << 39))
+                match wc_proxy::rings::bridge(std::sync::Arc::clone(c), clip_owner)
                     .map_err(|e| e.to_string())
                     .and_then(|sock| wc_proxy::clip::ClipLink::connect_stream(sock, &spec))
                 {

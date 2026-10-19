@@ -31885,6 +31885,88 @@ never answered it. Which application asks for elevation at unlock is
 tests now record the peak of `MemTotal - MemAvailable`: `nested-waycompose`
 1426 MiB → 2048 (was 8192), `nested-login` 1194 MiB → 1792 (was 6144).
 
+### 102.14 One window per application: clicks that wait, and a launch that says it failed
+
+**The bug, 2026-10-19 on the guest.** Nothing appeared at once after a click
+on "Windows 7 (Linux)", so the user clicked several more times within a second.
+Each click was a `run` on the host, six seats started at once and tore each
+other down, and the user got no window and no message. The host now takes a
+lock (a second `run` fails with "a nested session is already running"). The
+launcher stops sending those runs.
+
+**`single = on`** in an `[app.*]` block (set for `linux-desktop` and
+`linux-desktop-win11` in `scripts/wc-linux-desktop-apps-guest.ini`) applies to
+a plain click (`Request::Run`). Jump-list tasks and pages are unchanged.
+
+1. **A window is up.** The launcher looks for a visible, unowned top-level
+   window of the session's compositor. The compositor's pid comes from the
+   state file, and only counts while the session's mutex exists, which is the
+   same test that makes a click warm (`session_alive`, `OpenMutexW`, never
+   creating it). The window must carry the application's identity
+   (`PKEY_AppUserModel_ID` = `appmeta::aumid`, §92). If the identity cannot be
+   read (Wine), the window's exact title must equal the block's `title`, which
+   is also the title `wc-proxy` gives both nested windows (102.4). If such a
+   window exists, the launcher restores it when minimised (`ShowWindowAsync`),
+   calls `SetForegroundWindow` (the click's own process may take the
+   foreground), logs one line and exits 0 without contacting the host.
+2. **A launch is in progress.** The launching click holds
+   `Local\waycompose-single-<session>-<section>` from the gate until its window
+   is found, or for at most 90 s. A click that finds the lock held waits (95 s
+   at most) for that window and then does 1. If the lock is let go with no
+   window, the first launch failed and has told the user, so this click exits
+   quietly. A lock left by a crashed launcher (`WAIT_ABANDONED`) counts as free.
+3. **A failed launch says so.** The cases are: the session could not start,
+   the host refused the `run`, or no window appeared within 90 s. The launcher
+   lets the lock go first, then shows a `MessageBoxW` captioned with the
+   application's title. The text is German when the UI language is
+   (`GetUserPreferredUILanguages`, as for the jump list), otherwise English.
+   The host's "already running" becomes "läuft bereits oder wird gerade
+   beendet … versuchen Sie es dann erneut". The dialog runs on a thread of its
+   own, so a session owner keeps supervising while the dialog is open. The
+   process waits for the dialog before it exits.
+
+The decisions (`crates/wc-launch/src/single.rs`) are pure functions with unit
+tests. The Win32 half in `main.rs` enumerates windows, waits on the mutex and
+focuses the window.
+
+**Under Wine** (`scripts/wc-launch-single-wine.sh`, 20 checks; the 90 s case
+with `WC_SINGLE_SLOW=1`), the real `wc-launch.exe` runs with
+`scripts/wc-launch-single-fake.rs` standing in for `ssh.exe`, the compositor
+and the relay:
+
+| case | result |
+|---|---|
+| a cold click | one `run`; the lock is taken and let go when the window appears |
+| a click on a minimised window | restored and foreground; exit 0; still one `run` |
+| five clicks 150 ms apart | one `run`, one window; four clicks waited and focused it |
+| the host refuses, three clicks | one `run`, one dialog ("already running"); the two others exit 0 quietly |
+| the session cannot start, `LANG=de_DE` | the German dialog |
+| accepted, no window in 90 s, plus a second click | one dialog; the second click exits 0 quietly |
+
+Wine has no window property store, so these runs exercise the title path
+only. The identity path is checked on the guest. Log lines on the guest
+(`%LOCALAPPDATA%\waycompose\wc-launch-<session>.log`):
+`single: <section>: a window is already up (hwnd …, by identity); …; no run sent`,
+`… another click is launching it; waiting up to 95 s …`,
+`… the other click's window is up after N ms …`,
+`… the other click's launch ended without a window …`,
+`CLICK-TO-WINDOW N ms (cold|warm, single; …)` and
+`single: <section>: FAILED after N ms (…); lock released; telling the user: …`.
+
+**With §107's shared compositor.** The installation has no compositor of its
+own then, and its state file says `comp-pid=0` so that `--stop` never kills
+the compositor every other installation's windows are in. The window lookup
+needs a process all the same: the launcher keeps the shared compositor's pid
+from its answer to `ping` (`compositor <pid>`) as `shared-pid` in the state
+file, and looks among that process's windows (`single::window_pid`). Several
+installations' windows share that process; they are told apart by identity
+(the AUMID from the app id), so two installations that give a `single`
+application the same app id would also share one taskbar button, and the
+lock (`Local\waycompose-single-<session>-<app>`) stays per installation.
+Checked on the guest when the shared compositor is deployed there; before
+that, by unit tests (`a_shared_compositors_windows_are_looked_for_…`,
+`the_shared_compositors_pid_comes_from_its_ping`).
+
 ### 102.10 The GPU
 
 `nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU
@@ -34499,7 +34581,7 @@ service tag (top byte `0x5C`) and the low bits are unchanged.
 the guest showed it: 3 is `OWNER_HOSTINT`'s, reserved since §103.14, so with host
 integration on a session's `grow` was answered with hostint's `hello` and no client
 got a buffer. `SERVICE_OWNERS` lists every service id and a test keeps them apart;
-`wc-multi-install.sh` leg 8 runs the compositor with `--hostint`.)
+`wc-multi-install.sh` leg 9 runs the compositor with `--hostint`.)
 
 **The arena slot** (proxy: `wc_proxy::barwin`; compositor:
 `session_svc::serve_arena`), one line each way:
@@ -34630,6 +34712,74 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
 * **The output** is one for every session (107.4).
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.
+
+### 107.10 A feed that outlived its client kept a session up
+
+Branch `session-fixes`, 2026-10-19, from master `07fda85`. Found by the guest
+e2e of the same day (evidence in `/mnt/datasets/builds/evidence/guest-e2e/`,
+`wcns-no-idle-exit.txt`).
+
+**What was seen.** The installation `wcns` (Firefox, one-session compositor,
+`linger-secs = 60`) was still running eight minutes after every host
+application had exited. One guest-side client, accepted on ring slot 14 while
+Firefox started, never disconnected; the session ended only by `--stop`.
+Other installations exited normally.
+
+**The cause.** Each client connection of the proxy claims three ring slots:
+the connection itself, its icon feed and its clipboard feed (§103.14). The
+feeds are local socket pairs bridged to a ring slot by one thread each
+(`wc_proxy::rings::bridge`). That thread ended its ring (the zero-length
+packet) only when the feed's end of the pair closed cleanly. On any error it
+returned and wrote nothing: no end of stream, no `DEAD`. The usual error is
+`ECONNRESET`. Linux reports it to the peer when a unix socket is closed with
+unread bytes in its queue, and that is what a short-lived Firefox connection
+does: the compositor sends the new clipboard feed the current selection, and
+the connection ends before the feed reads it. The compositor then kept the
+feed as a connected client for ever. A one-session compositor ends only when
+no client is connected (`EmptyWatch` plus `live == 0`), and a shared one
+counts a session's connections for its linger (`note_connections`), so in
+both modes one lost feed held the session, its arena and its slots. The
+slot-14 client was, by the order of the claims, the clipboard feed of the
+proxy's fourth connection (slot 11). It was not a dead process, so watching processes would not have
+caught it.
+
+**The fixes**, each enough for this case:
+
+1. **The bridge ends its ring on every way out** (`rings::end_ring`): the
+   zero-length packet, retried for up to 500 ms when the lane is full, then
+   `DEAD`, the order `RingUpstream`'s drop uses. `DEAD` also lets the
+   compositor recycle the slot (§89), which a clean close never did before.
+2. **The compositor knows a feed when it accepts one.** Feed owner ids carry
+   `FEED_TAG` (bit 40, and `CLIP_FEED`, bit 39, for the clipboard) and the
+   ordinal of the connection they serve (`wlbytes::feed_owner`, `is_feed`,
+   `client_ordinal`). The ids are the ones proxies have claimed with since
+   §103.14, so an older proxy's feeds are recognised too. A feed's client is
+   `ClientState::feed`. It is never counted as a reason to keep a session up:
+   neither by the one-session linger, `--once`, the deferred deadline, nor
+   `connections_by_session`.
+3. **A feed does not outlive its connection.** `RingLink::pump` closes a feed
+   (end of stream, `DEAD`, quarantine) once no connection of its session with
+   its ordinal is left, after `ORPHAN_GRACE` (2 s; the proxy claims the
+   connection before its feeds). It logs `ring slot N: a feed of client
+   connection M outlived it; closed`.
+
+**Tests.**
+* `rings::tests::a_feed_dropped_with_unread_bytes_still_ends_its_ring`: the
+  reproduction. A guest end writes into a bridged feed, the feed is dropped
+  unread, and the guest must see the end or `DEAD` within 2 s. It failed
+  before fix 1 ("the compositor still thinks the feed is connected") and
+  passes after it. `a_feed_closed_cleanly_marks_its_slot_dead` covers the
+  clean close.
+* `ringlink::feed_tests`: a feed is accepted as one and not counted; it is
+  closed after the grace once its connection has gone, and its proxy end sees
+  the end of stream and `DEAD`; a feed of a live connection stays.
+* `wlbytes` session-tag test: the feed tags survive the session index.
+* `scripts/wc-multi-install.sh` leg 8: a fresh shared compositor, one session,
+  five `wayland-info` runs (connect, read the globals, leave at once), each
+  with its feeds. The feeds are logged as feeds (10 of 15 connections), and
+  the session ends by its linger ("its last client left 4 s ago"). The race
+  that left a feed behind did not happen on this machine in the run without
+  the fix either; the unit test is the reproduction.
 
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
