@@ -129,6 +129,12 @@ mod imp {
         KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MOVE, MOUSEINPUT,
     };
+    // §102: what is under a gesture's press point (`what_is_at`), and why a
+    // `SendInput` injected nothing.
+    use windows_sys::Win32::Foundation::{GetLastError, POINT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetCursorPos, WindowFromPoint, GA_ROOT,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
@@ -1285,40 +1291,106 @@ usage: wc-desk <command> [options]
     /// not the person's (docs/waycompose-design.md §101). "WCAGENT1".
     const WC_AGENT_TAG: usize = 0x5743_4147_454E_5431;
 
-    /// One mouse event through `SendInput`, at a screen point.
-    fn send_mouse(x: i32, y: i32, flags: u32) {
-        // SAFETY: plain metric reads.
-        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-        let nx = (i64::from(x) * 65535 / i64::from((w - 1).max(1))) as i32;
-        let ny = (i64::from(y) * 65535 / i64::from((h - 1).max(1))) as i32;
+    /// §102: `SendInput` calls that injected nothing. Its documentation says a
+    /// call blocked by UIPI, or made while another desktop (the lock screen, a
+    /// UAC prompt) has the input, returns 0 or silently does nothing; a gesture
+    /// that "did not resize" is then a gesture that never happened, and the
+    /// output has to say which.
+    static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// One mouse `INPUT`, tagged, and its refusal counted.
+    fn inject_mouse(dx: i32, dy: i32, flags: u32) {
         let input = INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
-                    dx: nx,
-                    dy: ny,
+                    dx,
+                    dy,
                     mouseData: 0,
-                    dwFlags: flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: WC_AGENT_TAG,
                 },
             },
         };
         // SAFETY: one well-formed `INPUT`, its size passed with it.
-        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: a plain read of this thread's last error.
+            let e = unsafe { GetLastError() };
+            eprintln!("wc-desk: SendInput(flags {flags:#x}) injected nothing (error {e})");
+        }
+    }
+
+    /// Move the pointer to a screen point: one absolute move, tagged.
+    fn move_to(x: i32, y: i32) {
+        // SAFETY: plain metric reads.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        let nx = (i64::from(x) * 65535 / i64::from((w - 1).max(1))) as i32;
+        let ny = (i64::from(y) * 65535 / i64::from((h - 1).max(1))) as i32;
+        inject_mouse(nx, ny, MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE);
+    }
+
+    /// A button transition where the pointer is, as an `INPUT` of its own.
+    ///
+    /// §101.4/§102: until §102 the press and the release rode in the same
+    /// `INPUT` as an absolute move (`MOVE | ABSOLUTE | LEFTDOWN`). Windows
+    /// handles that as a move and a button event, and on the guest the activity
+    /// sentinel's `WH_MOUSE_LL` hook counted wc-desk's input as a person's
+    /// (`ours 0`). A mouse never sends both in one report, so neither does
+    /// this: the move is `move_to`, the button is a bare `LEFTDOWN`/`LEFTUP`
+    /// with no coordinates, and each carries `WC_AGENT_TAG` on its own.
+    fn button(flags: u32) {
+        inject_mouse(0, 0, flags);
+    }
+
+    /// What is under a screen point, as Windows will route a click there: the
+    /// top-level window `WindowFromPoint` finds and the `WM_NCHITTEST` answer
+    /// of the window it found. §102: a press that lands on another window (a
+    /// terminal a scheduled task opened, a topmost tool window) or on
+    /// `HTCLIENT` instead of a border is not a resize, and before this the
+    /// output could not tell that apart from a window that refused to resize.
+    fn what_is_at(x: i32, y: i32, want: HWND) -> String {
+        // SAFETY: plain queries on a point and on whatever window is there.
+        let (root, hit) = unsafe {
+            let h = WindowFromPoint(POINT { x, y });
+            let root = if h.is_null() { h } else { GetAncestor(h, GA_ROOT) };
+            let lp = ((y as u32 & 0xffff) << 16 | (x as u32 & 0xffff)) as LPARAM;
+            let mut result: usize = 0;
+            let ok = !root.is_null()
+                && SendMessageTimeoutW(root, WM_NCHITTEST, 0, lp, SMTO_ABORTIFHUNG, 2000, &mut result) != 0;
+            (root, if ok { Some(result as isize) } else { None })
+        };
+        let whose = if root == want {
+            "this window".to_string()
+        } else if root.is_null() {
+            "no window".to_string()
+        } else {
+            let mut cls = [0u16; 128];
+            // SAFETY: a live window handle; the buffer's length is passed.
+            let n = unsafe { GetClassNameW(root, cls.as_mut_ptr(), cls.len() as i32) };
+            format!(
+                "ANOTHER window {root:p} (class {:?}, pid {})",
+                String::from_utf16_lossy(&cls[..n.max(0) as usize]),
+                pid_of(root)
+            )
+        };
+        let mut at = POINT { x: 0, y: 0 };
+        // SAFETY: written in place.
+        unsafe { GetCursorPos(&mut at) };
+        format!(
+            "{x},{y}: {whose}, {} (pointer at {},{})",
+            hit.map_or("no hit-test answer".to_string(), |v| ht_name(v).to_string()),
+            at.x,
+            at.y
+        )
     }
 
     /// §96: relative motion, which `SendInput` without `MOUSEEVENTF_ABSOLUTE`
     /// produces exactly as a mouse would, raw input included.
     fn send_rel(dx: i32, dy: i32) {
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT { dx, dy, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: WC_AGENT_TAG },
-            },
-        };
-        // SAFETY: one well-formed `INPUT`, its size passed with it.
-        unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        inject_mouse(dx, dy, MOUSEEVENTF_MOVE);
     }
 
     /// §96: one key transition, by scan code.
@@ -1395,6 +1467,10 @@ usage: wc-desk <command> [options]
         // foreground on some desktops, which the printed rectangles will show.
         unsafe { SetForegroundWindow(hwnd) };
         pause(300);
+        // §102: which wc-desk this is, in its own output. On the guest the
+        // sentinel saw none of a run's input as ours, and a binary from before
+        // the tag would have looked exactly the same.
+        println!("mouse.tag        WCAGENT1 on every event; move and button as separate INPUTs");
         let mut i = 0;
         while i < args.len() {
             let r = rect();
@@ -1403,19 +1479,20 @@ usage: wc-desk <command> [options]
                     let (x0, y0) = at(&args[i + 1], &r)?;
                     let (x1, y1) = at(&args[i + 2], &r)?;
                     say("before", &r);
-                    send_mouse(x0, y0, 0);
+                    move_to(x0, y0);
                     pause(step_ms * 4);
-                    send_mouse(x0, y0, MOUSEEVENTF_LEFTDOWN);
+                    println!("mouse.press-at  {}", what_is_at(x0, y0, hwnd));
+                    button(MOUSEEVENTF_LEFTDOWN);
                     pause(step_ms * 4);
                     let n = 24;
                     for s in 1..=n {
                         let x = x0 + (x1 - x0) * s / n;
                         let y = y0 + (y1 - y0) * s / n;
-                        send_mouse(x, y, 0);
+                        move_to(x, y);
                         pause(step_ms);
                     }
                     pause(step_ms * 4);
-                    send_mouse(x1, y1, MOUSEEVENTF_LEFTUP);
+                    button(MOUSEEVENTF_LEFTUP);
                     pause(600);
                     say("after-drag", &rect());
                     i += 3;
@@ -1424,12 +1501,16 @@ usage: wc-desk <command> [options]
                     let (x, y) = at(&args[i + 1], &r)?;
                     say("before", &r);
                     let times = if args[i] == "--dblclick" { 2 } else { 1 };
-                    send_mouse(x, y, 0);
+                    move_to(x, y);
                     pause(step_ms * 4);
+                    println!("mouse.press-at  {}", what_is_at(x, y, hwnd));
+                    // The two clicks of a double-click must fall inside the
+                    // system's double-click time, press to press; 30 + 60 ms
+                    // is far inside the default 500.
                     for _ in 0..times {
-                        send_mouse(x, y, MOUSEEVENTF_LEFTDOWN);
+                        button(MOUSEEVENTF_LEFTDOWN);
                         pause(30);
-                        send_mouse(x, y, MOUSEEVENTF_LEFTUP);
+                        button(MOUSEEVENTF_LEFTUP);
                         pause(60);
                     }
                     pause(1200);
@@ -1482,13 +1563,20 @@ usage: wc-desk <command> [options]
                 "--hover" if i + 2 < args.len() => {
                     let (x, y) = at(&args[i + 1], &r)?;
                     let ms: u64 = args[i + 2].parse().unwrap_or(1500);
-                    send_mouse(x, y, 0);
+                    move_to(x, y);
                     println!("mouse.hover      {},{} for {ms} ms", x, y);
                     pause(ms);
                     i += 3;
                 }
                 _ => i += 1,
             }
+        }
+        let refused = REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+        if refused > 0 {
+            println!(
+                "mouse.refused    {refused} SendInput call(s) injected nothing \
+                 (a locked or other input desktop, or UIPI)"
+            );
         }
         Ok(())
     }
