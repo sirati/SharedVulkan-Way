@@ -9,6 +9,7 @@
 //! device NAME                   -> ok device NAME HANDLE
 //! alloc POOL BYTES [large]      -> ok region ID POOL LEN EPOCH PIECES
 //! open ID                       -> ok region ID POOL LEN EPOCH PIECES
+//! find POOL                     -> ok region ...   (the live region of that pool, e.g. gpu.3)
 //! close ID                      -> ok
 //! free ID                       -> ok
 //! adopt POOL                    -> ok adopted [ID:LEN ...]
@@ -38,6 +39,7 @@ pub enum Request {
     Device { name: String },
     Alloc { pool: String, len: u64, large: bool },
     Open { id: u64 },
+    Find { pool: String },
     Close { id: u64 },
     Free { id: u64 },
     Adopt { pool: String },
@@ -107,6 +109,10 @@ impl Request {
                 arity(2)?;
                 Request::Open { id: num(1)? }
             }
+            "find" => {
+                arity(2)?;
+                Request::Find { pool: name(1)? }
+            }
             "close" => {
                 arity(2)?;
                 Request::Close { id: num(1)? }
@@ -163,6 +169,7 @@ impl Request {
             Request::Device { name } => format!("device {name}"),
             Request::Alloc { pool, len, large } => format!("alloc {pool} {len}{}", if *large { " large" } else { "" }),
             Request::Open { id } => format!("open {id}"),
+            Request::Find { pool } => format!("find {pool}"),
             Request::Close { id } => format!("close {id}"),
             Request::Free { id } => format!("free {id}"),
             Request::Adopt { pool } => format!("adopt {pool}"),
@@ -254,6 +261,7 @@ mod tests {
             Request::Alloc { pool: "gpu".into(), len: 64 << 20, large: true },
             Request::Alloc { pool: "ring".into(), len: 4096, large: false },
             Request::Open { id: 7 },
+            Request::Find { pool: "gpu.3".into() },
             Request::Close { id: 7 },
             Request::Free { id: 7 },
             Request::Adopt { pool: "gpu".into() },

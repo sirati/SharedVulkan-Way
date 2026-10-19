@@ -35011,6 +35011,7 @@ hello ROLE                    -> ok hello RUN USER PID
 device NAME                   -> ok device NAME HANDLE        (moved)
 alloc POOL BYTES [large]      -> ok region ID POOL LEN EPOCH PIECES
 open ID                       -> ok region ID POOL LEN EPOCH PIECES
+find POOL                     -> ok region ...   (the live region of a published place, e.g. gpu.3)
 close ID | free ID            -> ok
 adopt POOL                    -> ok adopted [ID:LEN ...]
 connect NAME                  -> ok connect NAME HANDLE       (a fresh connection to a local service)
