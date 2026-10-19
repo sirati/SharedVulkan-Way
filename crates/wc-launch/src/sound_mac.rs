@@ -362,59 +362,117 @@ struct Recorder {
     name: String,
     inp: Arc<In>,
     q: Option<Aq>,
+    /// A start is in progress on its own thread (`opening`), the n-th one.
+    /// A Stop while it runs bumps `generation`, and the opener then closes
+    /// what it opened instead of keeping it.
+    opening: bool,
+    generation: u64,
 }
 
 // SAFETY: as `Player`.
 unsafe impl Send for Recorder {}
 
+/// An input queue made on an opener thread, handed to the state.
+struct OpenedQueue(Aq);
+// SAFETY: an AudioQueueRef may be used from any thread.
+unsafe impl Send for OpenedQueue {}
+
+/// Make and start an input queue on device `uid`. This is where macOS asks
+/// for the microphone the first time: AudioQueueStart blocks until the user
+/// answers the TCC dialog, so it never runs on the ring's thread (§106).
+fn open_input(uid: &str, name: &str, inp: &Arc<In>) -> Result<OpenedQueue, String> {
+    // §106, TCC rule 1: only the main process in its own bundle. Started
+    // by the launcher's fallback (no host bundle), it is refused here
+    // rather than have macOS attribute the microphone to a face.
+    wc_hostplat::mac::may_capture()?;
+    let user = Arc::into_raw(Arc::clone(inp)) as *mut c_void;
+    let mut q: Aq = std::ptr::null_mut();
+    let f = format();
+    // SAFETY: as in `Player::new`.
+    let st = unsafe { AudioQueueNewInput(&f, captured, user, std::ptr::null(), std::ptr::null(), 0, &mut q) };
+    if st != 0 {
+        return Err(format!("AudioQueueNewInput: OSStatus {st}"));
+    }
+    let st = set_device(q, uid);
+    if st != 0 {
+        // SAFETY: the queue made above, not started.
+        unsafe { AudioQueueDispose(q, 1) };
+        return Err(format!("the input queue would not take device {name}: OSStatus {st}"));
+    }
+    // SAFETY: the queue made above.
+    unsafe {
+        for _ in 0..3 {
+            let mut b: *mut AqBuffer = std::ptr::null_mut();
+            if AudioQueueAllocateBuffer(q, CHUNK_BYTES as u32, &mut b) == 0 {
+                AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
+            }
+        }
+        let st = AudioQueueStart(q, std::ptr::null());
+        if st != 0 {
+            AudioQueueDispose(q, 1);
+            return Err(format!("AudioQueueStart (input): OSStatus {st} (no microphone permission?)"));
+        }
+    }
+    Ok(OpenedQueue(q))
+}
+
+fn close_input(q: Aq) {
+    // SAFETY: a queue made by `open_input`.
+    unsafe {
+        AudioQueueStop(q, 1);
+        AudioQueueDispose(q, 1);
+    }
+}
+
 impl Recorder {
-    /// Open the microphone (macOS asks the user the first time: TCC, and
-    /// `NSMicrophoneUsageDescription` in the application's bundle).
-    fn start(&mut self) -> Result<(), String> {
-        if self.q.is_some() {
-            return Ok(());
+    /// Open the microphone, on a thread of its own: the ring's thread keeps
+    /// serving the outputs and the control while macOS asks the user. Until
+    /// the queue runs, the input is silent (no Data, no credit taken). The
+    /// outcome is logged when it is known.
+    fn start(&mut self, stream: u16, state: &Arc<Mutex<State>>, say: impl Fn(&str) + Send + 'static) {
+        if self.q.is_some() || self.opening {
+            return;
         }
-        // §106, TCC rule 1: only the main process in its own bundle. Started
-        // by the launcher's fallback (no host bundle), it is refused here
-        // rather than have macOS attribute the microphone to a face.
-        wc_hostplat::mac::may_capture()?;
-        let user = Arc::into_raw(Arc::clone(&self.inp)) as *mut c_void;
-        let mut q: Aq = std::ptr::null_mut();
-        let f = format();
-        // SAFETY: as in `Player::new`.
-        let st = unsafe { AudioQueueNewInput(&f, captured, user, std::ptr::null(), std::ptr::null(), 0, &mut q) };
-        if st != 0 {
-            return Err(format!("AudioQueueNewInput: OSStatus {st}"));
-        }
-        let st = set_device(q, &self.uid);
-        if st != 0 {
-            return Err(format!("the input queue would not take device {}: OSStatus {st}", self.name));
-        }
-        // SAFETY: the queue made above.
-        unsafe {
-            for _ in 0..3 {
-                let mut b: *mut AqBuffer = std::ptr::null_mut();
-                if AudioQueueAllocateBuffer(q, CHUNK_BYTES as u32, &mut b) == 0 {
-                    AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
+        self.opening = true;
+        self.generation += 1;
+        let (generation, uid, name, inp, state) =
+            (self.generation, self.uid.clone(), self.name.clone(), Arc::clone(&self.inp), Arc::clone(state));
+        let spawned = std::thread::Builder::new().name(format!("mic-{stream}")).spawn(move || {
+            let opened = open_input(&uid, &name, &inp);
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let current = st.recorders.get_mut(&stream).filter(|r| r.opening && r.generation == generation);
+            match (opened, current) {
+                (Ok(q), Some(r)) => {
+                    r.opening = false;
+                    r.q = Some(q.0);
+                    say(&format!("sound: recording {name} for the session"));
+                }
+                (Ok(q), None) => {
+                    // Stopped (or gone) while macOS was asking.
+                    close_input(q.0);
+                    say(&format!("sound: {name}: opened after the session stopped recording; closed again"));
+                }
+                (Err(e), r) => {
+                    if let Some(r) = r {
+                        r.opening = false;
+                    }
+                    say(&format!("sound: {name}: {e}"));
                 }
             }
-            let st = AudioQueueStart(q, std::ptr::null());
-            if st != 0 {
-                AudioQueueDispose(q, 1);
-                return Err(format!("AudioQueueStart (input): OSStatus {st} (no microphone permission?)"));
-            }
+        });
+        if let Err(e) = spawned {
+            self.opening = false;
+            eprintln!("wc-launch: sound: no thread to open the microphone: {e}");
         }
-        self.q = Some(q);
-        Ok(())
     }
 
     fn stop(&mut self) {
+        // A start still waiting on macOS is cancelled: its thread closes
+        // what it opens.
+        self.opening = false;
+        self.generation += 1;
         if let Some(q) = self.q.take() {
-            // SAFETY: the queue made in `start`.
-            unsafe {
-                AudioQueueStop(q, 1);
-                AudioQueueDispose(q, 1);
-            }
+            close_input(q);
         }
     }
 }
@@ -439,6 +497,7 @@ pub fn run(
     let state = Arc::new(Mutex::new(State::default()));
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (s1, say1) = (Arc::clone(&state), say.clone());
+    let s0 = Arc::clone(&state);
     let e1 = Arc::clone(&ended);
     let say2 = say.clone();
     let link = sv_transport::soundring::spawn(
@@ -460,10 +519,9 @@ pub fn run(
                 }
                 Msg::Start { stream } => {
                     if let Some(r) = st.recorders.get_mut(&stream) {
-                        match r.start() {
-                            Ok(()) => say1(&format!("sound: recording {} for the session", r.name)),
-                            Err(e) => say1(&format!("sound: {}: {e}", r.name)),
-                        }
+                        // On a thread of its own (§106): this is the ring's
+                        // thread, and macOS may hold the start for a dialog.
+                        r.start(stream, &s0, say1.clone());
                     }
                 }
                 Msg::Stop { stream } => {
@@ -550,7 +608,7 @@ fn sync_devices(state: &Arc<Mutex<State>>, link: &Link, volume: u8, say: &impl F
                         },
                         Dir::In => {
                             let inp = Arc::new(In { link: link.clone(), stream: id, credit: Mutex::new(0), count: Mutex::new(Count::default()) });
-                            st.recorders.insert(id, Recorder { uid: d.uid.clone(), name: d.name.clone(), inp, q: None });
+                            st.recorders.insert(id, Recorder { uid: d.uid.clone(), name: d.name.clone(), inp, q: None, opening: false, generation: 0 });
                             link.send(Msg::Device { stream: id, dir, channels: CHANNELS as u8, rate: RATE, name: d.name.clone() });
                         }
                     }
