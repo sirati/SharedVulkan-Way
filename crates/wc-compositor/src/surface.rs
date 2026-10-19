@@ -66,6 +66,24 @@ impl Rect {
     pub fn is_empty(self) -> bool {
         self.w <= 0 || self.h <= 0
     }
+
+    /// §103.18: this rectangle in a space `num / den` times as dense, rounded
+    /// outwards, so that a damaged pixel is never lost to rounding. Surface
+    /// damage into buffer pixels is `(B, 1)`, a logical offset or size into a
+    /// shadow at scale S is `(S, 1)`, and buffer damage into that shadow is
+    /// `(S, B)`. `(1, 1)` is the identity.
+    pub fn scaled(self, num: i32, den: i32) -> Self {
+        let (num, den) = (i64::from(num.max(1)), i64::from(den.max(1)));
+        if num == den {
+            return self;
+        }
+        let lo = |v: i32| (i64::from(v) * num).div_euclid(den);
+        let hi = |v: i32| -(-(i64::from(v) * num)).div_euclid(den);
+        let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let (x0, y0) = (lo(self.x), lo(self.y));
+        let (x1, y1) = (hi(self.x.saturating_add(self.w)), hi(self.y.saturating_add(self.h)));
+        Rect::new(clamp(x0), clamp(y0), clamp(x1 - x0), clamp(y1 - y0))
+    }
 }
 
 /// The pixel layouts this compositor can blit without conversion.
@@ -168,6 +186,10 @@ pub struct Shadow {
     /// removed on the way in so the Win32 side never has to think about it,
     /// and so a `BITMAPINFOHEADER` describes it with no extra fields.
     pixels: Vec<u8>,
+    /// §103.18: device pixels per logical unit. A window's shadow is drawn at
+    /// its output's scale, and the platform shows it at `width / scale`
+    /// points. 1 for every staging shadow, and on every output of scale 1.
+    scale: i32,
 }
 
 impl fmt::Debug for Shadow {
@@ -191,6 +213,7 @@ impl Shadow {
                 format: PixelFormat::Xrgb8888,
             },
             pixels: Vec::new(),
+            scale: 1,
         }
     }
 
@@ -204,6 +227,15 @@ impl Shadow {
 
     pub fn format(&self) -> PixelFormat {
         self.spec.format
+    }
+
+    /// §103.18: device pixels per logical unit (see the field).
+    pub fn scale(&self) -> i32 {
+        self.scale
+    }
+
+    pub fn set_scale(&mut self, scale: i32) {
+        self.scale = scale.max(1);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -635,18 +667,35 @@ pub struct View {
 /// buffer pixel per surface pixel is `None` too — KWin's primary layer is
 /// exactly that, a 1280x800 source shown at 1280x800 — so the common case
 /// costs nothing beyond what an ordinary `wl_shm` surface costs.
+///
+/// §103.18: `output` is the scale S of the output the surface is drawn for,
+/// and the view's destination is in **device pixels**: the surface's logical
+/// size times S. At S = 1 everything above holds unchanged. At S > 1 a buffer
+/// with no viewport is a view too unless its scale B is S: the whole buffer,
+/// shown at its logical size (buffer / B) times S, which is ×2 for a B = 1
+/// client on a Retina screen.
 pub fn view_of(
     buffer: (i32, i32),
     scale: i32,
     src: Option<(f64, f64, f64, f64)>,
     dst: Option<(i32, i32)>,
+    output: i32,
 ) -> Option<View> {
-    if src.is_none() && dst.is_none() {
-        return None;
-    }
     let (bw, bh) = buffer;
     if bw <= 0 || bh <= 0 {
         return None;
+    }
+    let out = output.max(1);
+    if src.is_none() && dst.is_none() {
+        let b = scale.max(1);
+        if out == 1 || b == out {
+            return None;
+        }
+        let dst = (bw / b * out, bh / b * out);
+        if dst.0 <= 0 || dst.1 <= 0 {
+            return None;
+        }
+        return Some(View { src: (0.0, 0.0, f64::from(bw), f64::from(bh)), dst });
     }
     let s = f64::from(scale.max(1));
     let src_buf = match src {
@@ -661,6 +710,7 @@ pub fn view_of(
         (None, Some((_, _, w, h))) => (w as i32, h as i32),
         (None, None) => unreachable!("returned above"),
     };
+    let dst = (dst.0.saturating_mul(out), dst.1.saturating_mul(out));
     if dst.0 <= 0 || dst.1 <= 0 || src_buf.2 <= 0.0 || src_buf.3 <= 0.0 {
         return None;
     }
@@ -738,10 +788,20 @@ impl Shadow {
         let mut written = Vec::with_capacity(rects.len());
         for r in rects {
             let Some(r) = r.clip(dw, dh) else { continue };
+            let mut last = None;
             for y in r.y..r.y + r.h {
                 let sy = sample(y, dh, vy, vh, sh);
-                let row = &src.pixels[sy * src_stride..sy * src_stride + sw as usize * bpp];
                 let d0 = y as usize * dst_stride;
+                // §103.18: a row that samples the same source row as the one
+                // above it (every second row at ×2) is a copy of that row.
+                if last == Some(sy) {
+                    let (x0, x1) = (r.x as usize * bpp, (r.x + r.w) as usize * bpp);
+                    let above = d0 - dst_stride;
+                    self.pixels.copy_within(above + x0..above + x1, d0 + x0);
+                    continue;
+                }
+                last = Some(sy);
+                let row = &src.pixels[sy * src_stride..sy * src_stride + sw as usize * bpp];
                 for x in r.x..r.x + r.w {
                     let s = cols[x as usize] * bpp;
                     let d = d0 + x as usize * bpp;
@@ -776,7 +836,7 @@ mod view_tests {
     #[test]
     fn a_single_pixel_stretched_by_a_viewport_fills_the_destination() {
         let one = filled(1, 1, PixelFormat::Xrgb8888, |_, _| single_pixel_bgra([0, 0, 0, 255]));
-        let view = view_of((1, 1), 1, None, Some((1280, 800))).expect("not the identity");
+        let view = view_of((1, 1), 1, None, Some((1280, 800)), 1).expect("not the identity");
         let mut out = Shadow::empty();
         let written = out.scale_from(&one, &view, None);
         assert_eq!(written, vec![Rect::new(0, 0, 1280, 800)]);
@@ -790,7 +850,7 @@ mod view_tests {
     fn a_translucent_single_pixel_keeps_its_alpha() {
         assert_eq!(single_pixel_bgra([0x80, 0x10, 0x20, 0x80]), [0x20, 0x10, 0x80, 0x80]);
         let half = filled(1, 1, PixelFormat::Argb8888, |_, _| [0, 0, 0x80, 0x80]);
-        let view = view_of((1, 1), 1, None, Some((2, 1))).unwrap();
+        let view = view_of((1, 1), 1, None, Some((2, 1)), 1).unwrap();
         let mut over = Shadow::empty();
         over.scale_from(&half, &view, None);
         let mut canvas = filled(2, 1, PixelFormat::Xrgb8888, |_, _| [0xFF, 0, 0, 0xFF]);
@@ -803,11 +863,11 @@ mod view_tests {
     /// No viewport, or one that shows the buffer as it is, is the old path.
     #[test]
     fn the_identity_is_not_a_view() {
-        assert_eq!(view_of((64, 32), 1, None, None), None);
-        assert_eq!(view_of((64, 32), 2, None, None), None, "scale alone changes nothing");
-        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), Some((64, 32))), None);
-        assert_eq!(view_of((64, 32), 1, None, Some((64, 32))), None);
-        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), None), None);
+        assert_eq!(view_of((64, 32), 1, None, None, 1), None);
+        assert_eq!(view_of((64, 32), 2, None, None, 1), None, "scale alone changes nothing at S = 1");
+        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), Some((64, 32)), 1), None);
+        assert_eq!(view_of((64, 32), 1, None, Some((64, 32)), 1), None);
+        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), None, 1), None);
     }
 
     /// A source rectangle without a destination crops; the surface is the
@@ -815,7 +875,7 @@ mod view_tests {
     #[test]
     fn a_source_alone_crops() {
         let src = filled(4, 4, PixelFormat::Xrgb8888, |x, y| [x as u8, y as u8, 0, 255]);
-        let view = view_of((4, 4), 1, Some((1.0, 2.0, 2.0, 2.0)), None).unwrap();
+        let view = view_of((4, 4), 1, Some((1.0, 2.0, 2.0, 2.0)), None, 1).unwrap();
         assert_eq!(view.dst, (2, 2));
         let mut out = Shadow::empty();
         out.scale_from(&src, &view, None);
@@ -827,7 +887,7 @@ mod view_tests {
     /// multiplies it into buffer pixels.
     #[test]
     fn the_source_is_scaled_into_buffer_pixels() {
-        let view = view_of((8, 8), 2, Some((1.0, 1.0, 2.0, 2.0)), Some((2, 2))).unwrap();
+        let view = view_of((8, 8), 2, Some((1.0, 1.0, 2.0, 2.0)), Some((2, 2)), 1).unwrap();
         assert_eq!(view.src, (2.0, 2.0, 4.0, 4.0));
     }
 
@@ -835,7 +895,7 @@ mod view_tests {
     #[test]
     fn a_destination_twice_the_source_doubles_each_pixel() {
         let src = filled(2, 1, PixelFormat::Xrgb8888, |x, _| [x as u8 * 100, 0, 0, 255]);
-        let view = view_of((2, 1), 1, None, Some((4, 2))).unwrap();
+        let view = view_of((2, 1), 1, None, Some((4, 2)), 1).unwrap();
         let mut out = Shadow::empty();
         out.scale_from(&src, &view, None);
         let firsts: Vec<u8> = out.pixels().chunks_exact(4).map(|p| p[0]).collect();
@@ -846,7 +906,7 @@ mod view_tests {
     /// covers; and only those are redrawn.
     #[test]
     fn damage_is_mapped_and_limits_the_redraw() {
-        let view = view_of((10, 10), 1, None, Some((20, 20))).unwrap();
+        let view = view_of((10, 10), 1, None, Some((20, 20)), 1).unwrap();
         assert_eq!(view.map_damage(&[Rect::new(2, 2, 1, 1)]), vec![Rect::new(3, 3, 4, 4)]);
         assert_eq!(view.map_damage(&[Rect::new(50, 50, 1, 1)]), vec![]);
 
@@ -858,6 +918,138 @@ mod view_tests {
         assert_eq!(w, vec![Rect::new(0, 0, 2, 2)]);
         assert_eq!(&out.pixels()[0..4], &[9, 9, 9, 255]);
         assert_eq!(&out.pixels()[8..12], &[1, 1, 1, 255], "outside the damage");
+    }
+
+    // --- §103.18: the output's scale ----------------------------------------
+
+    /// On an output of scale 1 nothing is a view that was not one before:
+    /// a buffer of scale 2 is still drawn as it is, and a viewport's
+    /// destination is not multiplied.
+    #[test]
+    fn at_output_scale_one_views_are_what_they_were() {
+        assert_eq!(view_of((64, 32), 2, None, None, 1), None);
+        assert_eq!(view_of((64, 32), 1, None, None, 1), None);
+        let v = view_of((10, 10), 1, None, Some((20, 20)), 1).unwrap();
+        assert_eq!(v.dst, (20, 20));
+        assert_eq!(Rect::new(3, 4, 5, 6).scaled(1, 1), Rect::new(3, 4, 5, 6));
+    }
+
+    /// B = S: the buffer is already in device pixels and is copied 1:1.
+    #[test]
+    fn a_buffer_at_the_output_scale_is_not_a_view() {
+        assert_eq!(view_of((1600, 1200), 2, None, None, 2), None);
+        assert_eq!(view_of((300, 300), 3, None, None, 3), None);
+    }
+
+    /// B = 1 on S = 2 (Xwayland, an old client): the whole buffer at twice its
+    /// size, each pixel a 2x2 block.
+    #[test]
+    fn a_scale_one_buffer_on_a_scale_two_output_is_doubled() {
+        let view = view_of((3, 2), 1, None, None, 2).unwrap();
+        assert_eq!(view, View { src: (0.0, 0.0, 3.0, 2.0), dst: (6, 4) });
+        let src = filled(3, 2, PixelFormat::Xrgb8888, |x, y| [x as u8, y as u8, 7, 255]);
+        let mut out = Shadow::empty();
+        assert_eq!(out.scale_from(&src, &view, None), vec![Rect::new(0, 0, 6, 4)]);
+        assert_eq!((out.width(), out.height()), (6, 4));
+        for y in 0..4 {
+            for x in 0..6 {
+                let o = ((y * 6 + x) * 4) as usize;
+                assert_eq!(&out.pixels()[o..o + 4], &[(x / 2) as u8, (y / 2) as u8, 7, 255], "({x}, {y})");
+            }
+        }
+    }
+
+    /// B that does not divide S: the logical size is buffer / B, the shadow
+    /// that times S.
+    #[test]
+    fn other_buffer_scales_are_resampled_to_the_output() {
+        let v = view_of((300, 150), 3, None, None, 2).unwrap();
+        assert_eq!(v.dst, (200, 100));
+        let v = view_of((400, 200), 2, None, None, 3).unwrap();
+        assert_eq!(v.dst, (600, 300));
+        assert_eq!(view_of((2, 2), 3, None, None, 2), None, "less than one logical pixel");
+    }
+
+    /// A viewport's destination is logical, so on S = 2 the picture is twice
+    /// it; and a B = 2 buffer viewported to its own logical size is the
+    /// identity again.
+    #[test]
+    fn a_viewport_destination_is_multiplied_by_the_output_scale() {
+        let v = view_of((1, 1), 1, None, Some((640, 400)), 2).unwrap();
+        assert_eq!(v.dst, (1280, 800));
+        assert_eq!(view_of((200, 100), 2, None, Some((100, 50)), 2), None);
+        let v = view_of((200, 100), 1, Some((0.0, 0.0, 100.0, 50.0)), None, 2).unwrap();
+        assert_eq!(v.src, (0.0, 0.0, 100.0, 50.0));
+        assert_eq!(v.dst, (200, 100));
+    }
+
+    /// Buffer damage of a B = 1 buffer on S = 2 lands on the doubled pixels,
+    /// widened by one so that rounding never leaves a stale edge.
+    #[test]
+    fn buffer_damage_maps_by_s_over_b() {
+        let v = view_of((10, 10), 1, None, None, 2).unwrap();
+        assert_eq!(v.map_damage(&[Rect::new(2, 3, 1, 1)]), vec![Rect::new(3, 5, 4, 4)]);
+        assert_eq!(Rect::new(2, 3, 1, 1).scaled(2, 1), Rect::new(4, 6, 2, 2));
+    }
+
+    /// The pure arithmetic: rounded outwards, so damage is never lost.
+    #[test]
+    fn rects_scale_outwards() {
+        // Surface damage into buffer pixels, B = 2.
+        assert_eq!(Rect::new(1, 2, 3, 4).scaled(2, 1), Rect::new(2, 4, 6, 8));
+        // Buffer damage of a B = 3 buffer onto S = 2: 3..7 is 2..4.67, so 2..5.
+        assert_eq!(Rect::new(3, 3, 4, 4).scaled(2, 3), Rect::new(2, 2, 3, 3));
+        // Negative offsets (a subsurface above and left of its parent).
+        assert_eq!(Rect::new(-3, -1, 2, 2).scaled(2, 1), Rect::new(-6, -2, 4, 4));
+        assert_eq!(Rect::new(-3, -3, 2, 2).scaled(1, 2), Rect::new(-2, -2, 2, 2));
+        // A client's "everything" does not overflow.
+        let all = Rect::new(0, 0, i32::MAX, i32::MAX).scaled(2, 1);
+        assert_eq!((all.x, all.y, all.w, all.h), (0, 0, i32::MAX, i32::MAX));
+    }
+
+    /// The shadow of a window at S = 2: a logical subsurface offset of (3, 1)
+    /// is drawn at (6, 2) device pixels, over a canvas twice the logical size.
+    #[test]
+    fn subsurface_offsets_are_multiplied_into_the_shadow() {
+        let k = 2;
+        let mut canvas = Shadow::empty();
+        canvas.reset(8 * k, 4 * k, PixelFormat::Xrgb8888);
+        canvas.set_scale(k);
+        let child = filled(2 * k, 2 * k, PixelFormat::Xrgb8888, |_, _| [5, 5, 5, 255]);
+        let at = Rect::new(3, 1, 0, 0).scaled(k, 1);
+        canvas.compose(&child, (at.x, at.y));
+        let px = |x: i32, y: i32| canvas.pixels()[((y * 8 * k + x) * 4) as usize];
+        assert_eq!(px(5, 2), 0);
+        assert_eq!(px(6, 2), 5);
+        assert_eq!(px(9, 5), 5);
+        assert_eq!(px(10, 5), 0);
+        assert_eq!(canvas.scale(), 2);
+        assert_eq!(Shadow::empty().scale(), 1);
+    }
+
+    /// The copied-row shortcut in `scale_from` draws what sampling every row
+    /// would: a damage rectangle redrawn at ×2 and at ×1.5.
+    #[test]
+    fn copied_rows_match_sampled_rows() {
+        let src = filled(4, 4, PixelFormat::Xrgb8888, |x, y| [x as u8 * 10 + y as u8, 0, 0, 255]);
+        for dst in [(8, 8), (6, 6)] {
+            let view = View { src: (0.0, 0.0, 4.0, 4.0), dst };
+            let mut out = Shadow::empty();
+            out.scale_from(&src, &view, None);
+            let mut part = Shadow::empty();
+            part.scale_from(&filled(4, 4, PixelFormat::Xrgb8888, |_, _| [0, 0, 0, 255]), &view, None);
+            part.scale_from(&src, &view, Some(&[Rect::new(1, 1, dst.0 - 2, dst.1 - 2)]));
+            for y in 1..dst.1 - 1 {
+                for x in 1..dst.0 - 1 {
+                    let o = ((y * dst.0 + x) * 4) as usize;
+                    let sx = (f64::from(x) + 0.5) * 4.0 / f64::from(dst.0);
+                    let sy = (f64::from(y) + 0.5) * 4.0 / f64::from(dst.1);
+                    let want = sx.floor() as u8 * 10 + sy.floor() as u8;
+                    assert_eq!(out.pixels()[o], want, "{dst:?} ({x}, {y})");
+                    assert_eq!(part.pixels()[o], want, "{dst:?} damaged ({x}, {y})");
+                }
+            }
+        }
     }
 }
 

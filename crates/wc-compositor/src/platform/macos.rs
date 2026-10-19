@@ -23,13 +23,12 @@
 //! # Coordinates
 //!
 //! The content view is flipped, so a point in it is a point in the surface's
-//! own coordinates with the origin at the top left. One surface pixel is one
-//! point: the compositor supports buffer scale 1 only (`state.rs`), so on a
-//! Retina screen AppKit scales the layer up, which is correct and soft
-//! (§103.7 records the scale work as later). That needs the layer's
-//! `contentsScale` at 1, set with every buffer: AppKit gives a layer-backed
-//! view the screen's backing scale (2 on Retina), and with the gravity below,
-//! which never scales, a buffer then filled a quarter of its window.
+//! own coordinates with the origin at the top left. One surface unit is one
+//! point, and a window's image has the output scale's pixels per point
+//! (§103.18): the layer's `contentsScale` is set to the image's scale with
+//! every buffer, since AppKit resets it to the screen's backing scale, and the
+//! gravity below never scales, so a wrong value draws the image at the wrong
+//! size (a 1x image at 2 filled a quarter of its window).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -51,7 +50,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSData, NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL};
 
-use super::mac_keys::{self, CmdKey, KeyFold};
+use super::mac_keys::{self, backing_scale, CmdKey, KeyFold};
 use super::{assemble, CursorSpec, Edge, FromUi, IconImage, PlatformConfig, PopupBounds, Started, ToUi, WindowId, WindowKind};
 use crate::surface::{PixelFormat, Rect, Shadow};
 
@@ -194,9 +193,9 @@ fn dock_pick(key: &str) {
 
 /// §103.13: this process is an application's face, not a whole compositor.
 static FACE: AtomicBool = AtomicBool::new(false);
-/// The window's IOSurface pair from the main process, the one to show, and
-/// whether it carries alpha.
-type FaceSurfaces = HashMap<WindowId, ([super::macmach::Surface; 2], u8, bool)>;
+/// The window's IOSurface pair from the main process, the one to show,
+/// whether it carries alpha, and its pixels per point (§103.18).
+type FaceSurfaces = HashMap<WindowId, ([super::macmach::Surface; 2], u8, bool, i32)>;
 static FACE_SURFACES: Mutex<Option<FaceSurfaces>> = Mutex::new(None);
 type BoundsSink = Box<dyn Fn(WindowId, Option<Rect>) + Send + Sync>;
 static BOUNDS_SINK: Mutex<Option<BoundsSink>> = Mutex::new(None);
@@ -318,7 +317,7 @@ pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<
                     face_yield(bundle_id);
                     continue;
                 }
-                ToFace::Surface { id, generation, alpha, .. } => {
+                ToFace::Surface { id, generation, alpha, scale, .. } => {
                     let mut pair = early.remove(&(id, generation));
                     let t0 = std::time::Instant::now();
                     while pair.is_none() && t0.elapsed() < std::time::Duration::from_secs(2) {
@@ -332,7 +331,7 @@ pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<
                     }
                     match pair {
                         Some(p) => face_surfaces(|m| {
-                            m.insert(id, (p, 0, alpha));
+                            m.insert(id, (p, 0, alpha, scale.max(1)));
                         }),
                         None => eprintln!("wc-launch: face: window {id}'s surfaces never arrived"),
                     }
@@ -1281,8 +1280,10 @@ fn cursor_for(spec: &CursorSpec) -> Option<Retained<NSCursor>> {
             let c: Option<Retained<NSCursor>> = unsafe { msg_send![cls, performSelector: sel] };
             c.or_else(|| Some(NSCursor::arrowCursor()))
         }
-        CursorSpec::Image { image, hotspot_x, hotspot_y } => {
-            let ns = nsimage(image)?;
+        CursorSpec::Image { image, hotspot_x, hotspot_y, scale } => {
+            // §103.18: in points, so a scale-2 cursor is not shown doubled;
+            // the hotspot is logical, which is points already.
+            let ns = nsimage(image, (*scale).max(1))?;
             let hot = NSPoint::new(f64::from(*hotspot_x), f64::from(*hotspot_y));
             Some(NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &ns, hot))
         }
@@ -1329,9 +1330,11 @@ fn cgimage(width: i32, height: i32, pixels: Vec<u8>, alpha: bool) -> Option<*mut
     }
 }
 
-fn nsimage(icon: &IconImage) -> Option<Retained<NSImage>> {
+/// `scale` pixels per point: the image is `width / scale` points wide.
+fn nsimage(icon: &IconImage, scale: i32) -> Option<Retained<NSImage>> {
     let img = cgimage(icon.width, icon.height, icon.pixels.clone(), true)?;
-    let size = NSSize::new(f64::from(icon.width), f64::from(icon.height));
+    let k = f64::from(scale.max(1));
+    let size = NSSize::new(f64::from(icon.width) / k, f64::from(icon.height) / k);
     // SAFETY: `initWithCGImage:size:` retains the image, released after.
     unsafe {
         let ns: Retained<NSImage> = msg_send![NSImage::alloc(), initWithCGImage: CGImageRef(img), size: size];
@@ -1504,10 +1507,15 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         _ => NSApplicationActivationPolicy::Regular,
     };
     app.setActivationPolicy(policy);
-    let work_area = NSScreen::mainScreen(mtm).map(|s| {
+    let screen = NSScreen::mainScreen(mtm);
+    let work_area = screen.as_ref().map(|s| {
         let v = s.visibleFrame();
         (v.size.width as i32, v.size.height as i32)
     });
+    // §103.18: the output's scale, read once. A Retina screen is 2; a
+    // fractional factor is rounded (fractional scale is not built), and no
+    // screen at all is 1.
+    let scale = screen.as_ref().map_or(1, |s| backing_scale(s.backingScaleFactor()));
     Ok(assemble(
         tx,
         Wake,
@@ -1517,6 +1525,7 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
             PumpInner::AppKit { commands: rx, events: config.events }
         },
         work_area,
+        scale,
     ))
 }
 
@@ -2125,28 +2134,33 @@ fn present(id: WindowId, _damage: &[Rect]) {
     let Some((shadow, view)) = with_win(id, |w| (w.shadow.clone(), w.view.clone())) else { return };
     // §103.13: a face shows the main process's IOSurface itself. Core
     // Animation reads the surface directly, so nothing is copied here.
-    let surf = face_surfaces(|m| m.get(&id).map(|(p, front, alpha)| (p[*front as usize].as_ptr(), *alpha)));
+    let surf = face_surfaces(|m| {
+        m.get(&id).map(|(p, front, alpha, scale)| (p[*front as usize].as_ptr(), *alpha, *scale))
+    });
+    // §103.18: the contents are `scale` pixels per point. Set with every
+    // present, because AppKit resets a backing layer's `contentsScale` when
+    // the window changes screen.
     if FACE.load(Ordering::Relaxed) {
-        if let (Some((ptr, alpha)), Some(layer)) = (surf, view_layer(&view)) {
+        if let (Some((ptr, alpha, scale)), Some(layer)) = (surf, view_layer(&view)) {
             // SAFETY: an IOSurfaceRef is a valid `contents`; the layer retains
             // it, and the map keeps our reference until the window goes.
             unsafe {
                 let _: () = msg_send![&*layer, setOpaque: !alpha];
-                let _: () = msg_send![&*layer, setContentsScale: 1.0f64];
+                let _: () = msg_send![&*layer, setContentsScale: f64::from(scale)];
                 let _: () = msg_send![&*layer, setContents: ptr.cast::<AnyObject>()];
             }
         }
         return;
     }
-    let (w, h, alpha, pixels) = {
+    let (w, h, alpha, scale, pixels) = {
         let s = shadow.lock().unwrap_or_else(|e| e.into_inner());
-        (s.width(), s.height(), s.format() == PixelFormat::Argb8888, s.pixels().to_vec())
+        (s.width(), s.height(), s.format() == PixelFormat::Argb8888, s.scale(), s.pixels().to_vec())
     };
     let Some(img) = cgimage(w, h, pixels, alpha) else { return };
     if let Some(layer) = view_layer(&view) {
         // SAFETY: a CGImage is a valid `contents`; the layer retains it.
         unsafe {
-            let _: () = msg_send![&*layer, setContentsScale: 1.0f64];
+            let _: () = msg_send![&*layer, setContentsScale: f64::from(scale)];
             let _: () = msg_send![&*layer, setContents: img.cast::<AnyObject>()];
         }
     }
@@ -2188,7 +2202,7 @@ fn set_app_icon(mtm: MainThreadMarker, icons: &[IconImage]) {
     // icon of the application that last sent one. The tile processes of
     // phase 2 each wear their own.
     let Some(best) = icons.iter().max_by_key(|i| i.width * i.height) else { return };
-    if let Some(img) = nsimage(best) {
+    if let Some(img) = nsimage(best, 1) {
         // SAFETY: a property setter on the shared application.
         unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&img)) };
     }
