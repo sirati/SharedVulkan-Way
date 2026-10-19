@@ -114,7 +114,9 @@ impl Lines {
                     // little before parking, which costs a doorbell round trip.
                     let t0 = Instant::now();
                     while t0.elapsed() < SPIN && !self.ch.readable().unwrap_or(true) {
-                        std::hint::spin_loop();
+                        // §105.14: yielding: the host side has two cores for
+                        // the hub, the proxy and the rest.
+                        std::thread::yield_now();
                     }
                     if !self.ch.readable().unwrap_or(true) {
                         sv_transport::frametrace::hop("P.park");

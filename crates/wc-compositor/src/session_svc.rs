@@ -214,9 +214,11 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
     None
 }
 
-/// How long a request waits for its answer before it parks (§105.13): a
-/// millisecond covers the host waking from its park and answering, so the
-/// answer needs no doorbell back. Only while a request is outstanding.
+/// How long a request waits for its answer before it parks (§105.13): the
+/// host waking from its park and answering takes 0.1–1.5 ms on an idle
+/// guest, and an answer seen here needs no doorbell back (§105.14). A
+/// yielding wait, and only while a request is outstanding.
+
 /// `WC_CTL_SPIN_US` overrides it, for measuring (§105.14).
 fn spin() -> Duration {
     static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
@@ -224,7 +226,7 @@ fn spin() -> Duration {
         std::env::var("WC_CTL_SPIN_US")
             .ok()
             .and_then(|v| v.parse().ok())
-            .map_or(Duration::from_millis(1), Duration::from_micros)
+            .map_or(Duration::from_millis(2), Duration::from_micros)
     })
 }
 
@@ -279,7 +281,11 @@ impl Ctl {
                 // would add a doorbell round trip.
                 let t0 = Instant::now();
                 while t0.elapsed() < spin() && !ch.readable().unwrap_or(true) {
-                    std::hint::spin_loop();
+                    // §105.14: a yielding spin. A busy one held its vCPU
+                    // against the launcher on the guest, and both lost a
+                    // 15.6 ms tick to it (Windows does not move a woken
+                    // thread to a parked core).
+                    std::thread::yield_now();
                 }
                 if ch.readable().unwrap_or(true) {
                     continue;

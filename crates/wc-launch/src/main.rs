@@ -698,7 +698,7 @@ mod win {
                 std::env::var("WC_LAUNCH_SPIN_US")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .map_or(Duration::from_micros(1500), Duration::from_micros)
+                    .map_or(Duration::from_micros(3000), Duration::from_micros)
             })
         }
 
@@ -711,7 +711,9 @@ mod win {
                 let got = loop {
                     match self.s.read(&mut tmp) {
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && t0.elapsed() < spin => {
-                            std::hint::spin_loop();
+                            // §105.14: yielding, so the compositor thread this
+                            // request woke may run on this processor.
+                            std::thread::yield_now();
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break None,
                         r => break Some(r),
