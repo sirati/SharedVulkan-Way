@@ -1699,11 +1699,83 @@ impl GpuHost for GpuServer {
     }
 
     /// As the `2` form, for an image that does not exist yet.
+    /// Forwarded, except that on a Mac a shared image's question (the
+    /// dma-buf path asks it as `HOST_ALLOCATION`) is asked as `MTLTEXTURE`,
+    /// which is how such an image is made there (§103.19). Elsewhere the two
+    /// are the same type and nothing changes.
+    fn get_physical_device_image_format_properties2(
+        &mut self,
+        a: p::VkGetPhysicalDeviceImageFormatProperties2Args,
+    ) -> WireResult<p::VkGetPhysicalDeviceImageFormatProperties2Reply> {
+        let mut a = a;
+        a.physical_device.0 = self.map_handle(HandleType::VkPhysicalDevice, a.physical_device.0)?;
+        let shared = crate::shared::shared_handle_type();
+        let mut asked = false;
+        if let Some(info) = &mut a.p_image_format_info {
+            for l in &mut info.p_next {
+                if let p::PNextLink::VkPhysicalDeviceExternalImageFormatInfo(x) = l
+                    && x.handle_type.0 as u32 == crate::shared::HOST_ALLOCATION
+                    && shared != crate::shared::HOST_ALLOCATION
+                {
+                    x.handle_type.0 = shared as i32;
+                    asked = true;
+                }
+            }
+        }
+        let Some(f) = self.fns().vk_get_physical_device_image_format_properties2 else {
+            self.note_missing("vkGetPhysicalDeviceImageFormatProperties2");
+            return Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply { result: p::VkResult(-3), ..Default::default() });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let info: *const sv_gpu_entry::VkPhysicalDeviceImageFormatInfo2 = match &a.p_image_format_info {
+            Some(x) => {
+                let v = sv_gpu_entry::raise_vk_physical_device_image_format_info2(x, &mut pool)?;
+                pool.one(v)
+            }
+            None => std::ptr::null(),
+        };
+        let mut out = match &a.p_image_format_properties {
+            Some(v) => sv_gpu_entry::raise_vk_image_format_properties2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: `info` and `out`'s chain live in `pool`; the physical
+        // device is the driver's own.
+        let r = unsafe { f(a.physical_device.0 as usize as _, info, &mut out) };
+        note_driver_error("vkGetPhysicalDeviceImageFormatProperties2", r.0);
+        // SAFETY: the driver filled `out` and its chain, which `pool` owns.
+        let mut props = unsafe { sv_gpu_entry::lower_full_vk_image_format_properties2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        if asked {
+            // The caller asked about host allocations: answer in its terms.
+            for l in &mut props.p_next {
+                if let p::PNextLink::VkExternalImageFormatProperties(x) = l {
+                    let m = &mut x.external_memory_properties;
+                    m.compatible_handle_types.0 = crate::shared::HOST_ALLOCATION;
+                    m.export_from_imported_handle_types.0 = 0;
+                }
+            }
+        }
+        Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply {
+            result: p::VkResult(r.0),
+            p_image_format_properties: Some(Box::new(props)),
+        })
+    }
+
     fn get_device_image_memory_requirements(
         &mut self,
         a: p::VkGetDeviceImageMemoryRequirementsArgs,
     ) -> WireResult<p::VkGetDeviceImageMemoryRequirementsReply> {
         let mut a = a;
+        // §103.19: a shared image is measured as the Mac makes it.
+        if let Some(ci) = a.p_info.as_mut().and_then(|i| i.p_create_info.as_mut()) {
+            for l in &mut ci.p_next {
+                if let p::PNextLink::VkExternalMemoryImageCreateInfo(x) = l
+                    && x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0
+                {
+                    x.handle_types.0 = crate::shared::shared_handle_type();
+                }
+            }
+        }
         {
             let mut ad = sv_gpu_entry::Mapping(&mut *self);
             let m: &mut dyn p::HandleMapper = &mut ad;
@@ -1737,7 +1809,7 @@ impl GpuHost for GpuServer {
         let host_alloc = a.p_info.as_ref().and_then(|i| i.p_create_info.as_ref()).is_some_and(|ci| {
             ci.p_next.iter().any(|l| {
                 matches!(l, p::PNextLink::VkExternalMemoryImageCreateInfo(x)
-                    if x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0)
+                    if x.handle_types.0 & (crate::shared::HOST_ALLOCATION | crate::shared::shared_handle_type()) != 0)
             })
         });
         if host_alloc {
