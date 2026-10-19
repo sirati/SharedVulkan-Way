@@ -2021,7 +2021,12 @@ mod win {
                 }
             }
             if app.taskbar_id == crate::config::TaskbarId::Install {
-                let _ = std::fs::remove_dir_all(jump_dir(cfg, p, section, app));
+                let dir = jump_dir(cfg, p, section, app);
+                let _ = std::fs::remove_dir_all(&dir);
+                // `jumplist\<installation>`, once its last application is gone.
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
             }
         }
         if !dry {

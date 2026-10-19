@@ -29037,6 +29037,31 @@ and left `wcivs`'s three. Wine's shell links do not implement
 every identity read as unreadable, which is the path the rule above takes
 for that; `DeleteList` is `E_NOTIMPL` too.
 
+On a real Windows 11 (a throwaway clone of the local test image, 24H2,
+build 26100; `/mnt/datasets/builds/evidence/session-fixes/aumid/vm/`), the
+same scenario with two throwaway installations whose shortcuts our
+`--install` wrote, `wcivs`'s copied into `User Pinned\TaskBar`, and a cached
+host answer for Firefox:
+
+| step | result |
+|---|---|
+| the property store read | every shortcut read `[Waycompose.app.firefox]`, the same as the shell's own `System.AppUserModel.ID` column; nothing unreadable |
+| `--taskbar-ids`, `wcpins` first | `wcpins`: `install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe"), its desktop and Start menu shortcuts rewritten, the shell then reads `Waycompose.install.wcpins.firefox`; `wcivs`: `legacy`, claim written |
+| `--taskbar-ids`, `wcivs` first | `wcivs`: `legacy`, claim written; `wcpins`: `install` ("…\wcivs\wc-launch.exe holds the claim") |
+| the pinned `.lnk` | SHA-256 the same before and after, in both orders |
+| `--refresh` for both | `SetAppID` and `CommitList` succeeded for both identities (`jump list 3 task(s)`, 10 slots); two `customDestinations-ms` files, one whose links run `wcivs`, one `wcpins`; relaunch files `Waycompose.app.firefox.relaunch` in `wcivs\apps` and `Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps` |
+| `--uninstall-taskbar` of `wcpins` | its list file gone (`DeleteList` succeeded), `wcivs`'s list unchanged; its two shortcuts and its relaunch file gone, `wcivs`'s three shortcuts and relaunch file still there; `jumplist\wcpins` removed |
+
+The first run left an empty `jumplist\wcpins` after the removal; the removal
+now takes the installation's directory too once it is empty.
+
+**Not run:** per-session identities on window properties in a shared
+compositor. A session's clients reach the compositor only through the
+ivshmem rings that the VM host's session service serves; a socket client is
+always session 0. That path is covered by the registry's and the boot line's
+unit tests above, and the code that writes the property (`win32.rs`,
+`set_taskbar_identity`) is §92's, unchanged.
+
 **Gates.** `cargo test --workspace --no-fail-fast`: 114 binaries, 3291
 passed, 0 failed, 9 ignored. `cargo clippy --workspace --all-targets`, and
 `-p wc-launch -p wc-compositor --all-targets` for Windows: no warning in a
