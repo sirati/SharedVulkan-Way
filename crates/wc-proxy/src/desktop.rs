@@ -60,6 +60,8 @@ pub struct Entry {
     pub exec: String,
     /// In `Actions=` order; an id with no group is skipped.
     pub actions: Vec<Action>,
+    /// §105. `MimeType=`, as listed (file types and `x-scheme-handler/...`).
+    pub mime_types: Vec<String>,
 }
 
 /// What `wc-session` runs: a program, named by basename, and its arguments.
@@ -176,6 +178,13 @@ pub fn parse(path: &Path, text: &str) -> Result<Entry, String> {
         wm_class: get(main, "StartupWMClass"),
         exec,
         actions,
+        mime_types: get(main, "MimeType")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect(),
     })
 }
 
@@ -431,6 +440,7 @@ fn b64(bytes: &[u8]) -> String {
 /// action-l new-private-window de …
 /// action-icon new-private-window <Icon=>
 /// unsupported profile-manager-window <reason, base64>
+/// mime text/html
 /// ```
 pub fn info_lines(e: &Entry) -> Vec<String> {
     let mut out = vec![format!("desktop {}", e.path.display())];
@@ -448,6 +458,11 @@ pub fn info_lines(e: &Entry) -> Vec<String> {
     }
     if let Some(w) = e.wm_class.as_ref().filter(|w| safe_arg(w)) {
         out.push(format!("wmclass {w}"));
+    }
+    // §105: what the guest registers the application for. One word each,
+    // printable ASCII; the guest checks each again.
+    for t in e.mime_types.iter().filter(|t| t.len() <= 255 && t.contains('/') && safe_arg(t)) {
+        out.push(format!("mime {t}"));
     }
     for a in &e.actions {
         if let Err(why) = action_command(e, &a.id) {
@@ -545,6 +560,7 @@ Categories=Network;WebBrowser
 Exec=firefox --name firefox %U
 GenericName=Web Browser
 Icon=firefox
+MimeType=text/html;text/xml;x-scheme-handler/https;bad type;
 Name=Firefox
 Name[de]=Firefox
 StartupWMClass=firefox
@@ -707,6 +723,9 @@ Name=Profile Manager
         assert!(info.contains(&format!("action new-window {}", b64(b"New Window"))));
         assert!(info.contains(&format!("action-l new-private-window de {}", b64("Neues privates Fenster".as_bytes()))));
         assert!(info.contains(&format!("action new-tab {}", b64(b"New Tab"))));
+        // §105: the types, one per line; one with a space is not passed on.
+        let mimes: Vec<&String> = info.iter().filter(|l| l.starts_with("mime ")).collect();
+        assert_eq!(mimes, ["mime text/html", "mime text/xml", "mime x-scheme-handler/https"]);
     }
 
     #[test]
