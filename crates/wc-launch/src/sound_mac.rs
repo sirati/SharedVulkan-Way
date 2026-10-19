@@ -1,10 +1,10 @@
 //! §103.16: the Mac end of the sound ring (`sv_transport::soundring`): one
 //! stream per CoreAudio device and direction, the defaults announced as they
-//! change, PCM played through an AudioQueue on its own device, and microphones
+//! change, PCM played through a HAL output unit (AUHAL) on its own device, and microphones
 //! recorded only between the session side's `Start` and `Stop`.
 //!
 //! Credit, not drops: each output stream grants the session side what its
-//! queue holds (`CREDIT_INIT`) and gives back what the AudioQueue has played,
+//! queue holds (`CREDIT_INIT`) and gives back what the output unit has played,
 //! so the session side's pipe sink, and with it the Linux application, waits
 //! for the Mac rather than the Mac discarding. An input stream sends no more
 //! than the session side granted; what a microphone delivers beyond that is
@@ -51,20 +51,16 @@ struct Addr {
 }
 
 type Aq = *mut c_void;
-type OutCb = extern "C" fn(*mut c_void, Aq, *mut AqBuffer);
 type InCb = extern "C" fn(*mut c_void, Aq, *mut AqBuffer, *const c_void, u32, *const c_void);
 
 #[link(name = "AudioToolbox", kind = "framework")]
 unsafe extern "C" {
-    fn AudioQueueNewOutput(f: *const Asbd, cb: OutCb, user: *mut c_void, rl: *const c_void, m: *const c_void, fl: u32, out: *mut Aq) -> i32;
     fn AudioQueueNewInput(f: *const Asbd, cb: InCb, user: *mut c_void, rl: *const c_void, m: *const c_void, fl: u32, out: *mut Aq) -> i32;
     fn AudioQueueAllocateBuffer(q: Aq, size: u32, out: *mut *mut AqBuffer) -> i32;
     fn AudioQueueEnqueueBuffer(q: Aq, b: *mut AqBuffer, n: u32, d: *const c_void) -> i32;
     fn AudioQueueStart(q: Aq, at: *const c_void) -> i32;
-    fn AudioQueuePause(q: Aq) -> i32;
     fn AudioQueueStop(q: Aq, immediate: u8) -> i32;
     fn AudioQueueDispose(q: Aq, immediate: u8) -> i32;
-    fn AudioQueueSetParameter(q: Aq, p: u32, v: f32) -> i32;
     fn AudioQueueSetProperty(q: Aq, id: u32, data: *const c_void, size: u32) -> i32;
 }
 
@@ -98,12 +94,9 @@ const CURRENT_DEVICE: u32 = fc(b"aqcd");
 const UTF8: u32 = 0x0800_0100;
 const LPCM: u32 = fc(b"lpcm");
 const S16_PACKED: u32 = 0x4 | 0x8;
-const PARAM_VOLUME: u32 = 1;
 
 /// What an output stream's queue holds, granted up front: 240 ms.
 const CREDIT_INIT: u32 = (CHUNK_BYTES * 12) as u32;
-/// AudioQueue buffers per output: 6 x 20 ms.
-const AQ_BUFFERS: usize = 6;
 /// Queued before a stopped output starts: 60 ms.
 const PREBUFFER: usize = CHUNK_BYTES * 3;
 /// An output with nothing to play for this long is paused.
@@ -219,53 +212,178 @@ struct Out {
     count: Mutex<Count>,
 }
 
-extern "C" fn refill(user: *mut c_void, q: Aq, b: *mut AqBuffer) {
-    // SAFETY: `user` is an `Arc<Out>` leaked for the queue's life; `b` is
-    // this queue's buffer until it is enqueued again.
-    unsafe {
-        let o = &*(user as *const Out);
-        let b = &mut *b;
-        let dst = std::slice::from_raw_parts_mut(b.data.cast::<u8>(), b.capacity as usize);
-        let n = {
-            let mut src = o.buf.lock().unwrap_or_else(|e| e.into_inner());
-            let n = src.len().min(dst.len()) & !3;
-            for (d, s) in dst.iter_mut().zip(src.drain(..n)) {
-                *d = s;
-            }
-            n
-        };
-        dst[n..].fill(0);
-        {
-            let mut c = o.count.lock().unwrap_or_else(|e| e.into_inner());
-            c.bytes += n as u64;
-            if n < dst.len() {
-                c.underruns += 1;
-            }
+/// Move what is queued into `dst`, silence for the rest; give the session
+/// side back, as credit, what was taken. Called by the output's render
+/// callback on CoreAudio's I/O thread.
+fn fill(o: &Out, dst: &mut [u8]) {
+    let n = {
+        let mut src = o.buf.lock().unwrap_or_else(|e| e.into_inner());
+        let n = src.len().min(dst.len()) & !3;
+        for (d, s) in dst.iter_mut().zip(src.drain(..n)) {
+            *d = s;
         }
-        if n > 0 {
-            o.link.send(Msg::Credit { stream: o.stream, bytes: n as u32 });
+        n
+    };
+    dst[n..].fill(0);
+    {
+        let mut c = o.count.lock().unwrap_or_else(|e| e.into_inner());
+        c.bytes += n as u64;
+        if n < dst.len() {
+            c.underruns += 1;
         }
-        b.size = b.capacity;
-        AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
+    }
+    if n > 0 {
+        o.link.send(Msg::Credit { stream: o.stream, bytes: n as u32 });
     }
 }
 
-/// The commands an output's queue worker takes.
+// ------------------------------------------------- AUHAL (the outputs) ---
+//
+// §106: the outputs are HAL output units, not AudioQueues. An AudioQueue
+// start goes through AudioToolbox's queue server (`AudioQueueXPC_Bridge`),
+// and that waits for as long as a microphone TCC dialog of this application
+// is on screen, for every device (measured on the Sonoma VM). An AUHAL unit
+// renders on the device's own I/O thread through the HAL.
+
+type AudioUnit = *mut c_void;
+
+#[repr(C)]
+struct ComponentDescription {
+    kind: u32,
+    subtype: u32,
+    manufacturer: u32,
+    flags: u32,
+    flags_mask: u32,
+}
+
+#[repr(C)]
+struct AudioBuffer {
+    channels: u32,
+    size: u32,
+    data: *mut c_void,
+}
+
+#[repr(C)]
+struct AudioBufferList {
+    count: u32,
+    buffers: [AudioBuffer; 1],
+}
+
+type RenderProc = extern "C" fn(*mut c_void, *mut u32, *const c_void, u32, u32, *mut AudioBufferList) -> i32;
+
+#[repr(C)]
+struct RenderCallback {
+    proc_: RenderProc,
+    ref_con: *mut c_void,
+}
+
+#[link(name = "AudioUnit", kind = "framework")]
+unsafe extern "C" {
+    fn AudioComponentFindNext(after: *mut c_void, desc: *const ComponentDescription) -> *mut c_void;
+    fn AudioComponentInstanceNew(c: *mut c_void, out: *mut AudioUnit) -> i32;
+    fn AudioComponentInstanceDispose(u: AudioUnit) -> i32;
+    fn AudioUnitSetProperty(u: AudioUnit, id: u32, scope: u32, element: u32, data: *const c_void, size: u32) -> i32;
+    fn AudioUnitSetParameter(u: AudioUnit, id: u32, scope: u32, element: u32, value: f32, frames: u32) -> i32;
+    fn AudioUnitInitialize(u: AudioUnit) -> i32;
+    fn AudioUnitUninitialize(u: AudioUnit) -> i32;
+    fn AudioOutputUnitStart(u: AudioUnit) -> i32;
+    fn AudioOutputUnitStop(u: AudioUnit) -> i32;
+}
+
+const OUTPUT_UNIT: u32 = fc(b"auou");
+const HAL_OUTPUT: u32 = fc(b"ahal");
+const APPLE: u32 = fc(b"appl");
+const SCOPE_GLOBAL: u32 = 0;
+const SCOPE_INPUT: u32 = 1;
+/// `kAudioOutputUnitProperty_CurrentDevice`.
+const PROP_CURRENT_DEVICE: u32 = 2000;
+/// `kAudioUnitProperty_StreamFormat`.
+const PROP_STREAM_FORMAT: u32 = 8;
+/// `kAudioUnitProperty_SetRenderCallback`.
+const PROP_RENDER_CALLBACK: u32 = 23;
+/// `kHALOutputParam_Volume`.
+const PARAM_HAL_VOLUME: u32 = 14;
+
+extern "C" fn render(ref_con: *mut c_void, _flags: *mut u32, _ts: *const c_void, _bus: u32, _frames: u32, io: *mut AudioBufferList) -> i32 {
+    // SAFETY: `ref_con` is the output's `Out`, alive until the unit is
+    // disposed (the worker takes it back only after that); `io` is the unit's
+    // one interleaved buffer for this cycle.
+    unsafe {
+        let o = &*(ref_con as *const Out);
+        let list = &mut *io;
+        for i in 0..list.count as usize {
+            let b = &mut *list.buffers.as_mut_ptr().add(i);
+            if !b.data.is_null() {
+                fill(o, std::slice::from_raw_parts_mut(b.data.cast::<u8>(), b.size as usize));
+            }
+        }
+    }
+    0
+}
+
+/// An output unit, as its worker holds it.
+struct OutUnit(AudioUnit, *const Out);
+// SAFETY: an AudioUnit may be driven from any thread; `Out` is Sync.
+unsafe impl Send for OutUnit {}
+
+/// Make and initialize the HAL output unit for device `id`; the worker's
+/// first step. Not started: that is `Ctl::Start`.
+fn new_output(id: u32, name: &str, out: &Arc<Out>, volume: u8) -> Result<OutUnit, String> {
+    let desc = ComponentDescription { kind: OUTPUT_UNIT, subtype: HAL_OUTPUT, manufacturer: APPLE, flags: 0, flags_mask: 0 };
+    // SAFETY: (all below) a valid description; the unit is ours and every
+    // property value has the documented type and size.
+    let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), &desc) };
+    if comp.is_null() {
+        return Err("no HAL output unit".into());
+    }
+    let mut u: AudioUnit = std::ptr::null_mut();
+    let st = unsafe { AudioComponentInstanceNew(comp, &mut u) };
+    if st != 0 {
+        return Err(format!("AudioComponentInstanceNew: OSStatus {st}"));
+    }
+    let ref_con = Arc::into_raw(Arc::clone(out));
+    let fail = |what: &str, st: i32| -> String {
+        // SAFETY: the unit made above; the Arc leaked just above.
+        unsafe {
+            AudioComponentInstanceDispose(u);
+            drop(Arc::from_raw(ref_con));
+        }
+        format!("{name}: {what}: OSStatus {st}")
+    };
+    let st = unsafe { AudioUnitSetProperty(u, PROP_CURRENT_DEVICE, SCOPE_GLOBAL, 0, (&raw const id).cast(), 4) };
+    if st != 0 {
+        return Err(fail("the unit would not take the device", st));
+    }
+    let f = format();
+    let st = unsafe { AudioUnitSetProperty(u, PROP_STREAM_FORMAT, SCOPE_INPUT, 0, (&raw const f).cast(), std::mem::size_of::<Asbd>() as u32) };
+    if st != 0 {
+        return Err(fail("stream format", st));
+    }
+    let cb = RenderCallback { proc_: render, ref_con: ref_con as *mut c_void };
+    let st = unsafe { AudioUnitSetProperty(u, PROP_RENDER_CALLBACK, SCOPE_INPUT, 0, (&raw const cb).cast(), std::mem::size_of::<RenderCallback>() as u32) };
+    if st != 0 {
+        return Err(fail("render callback", st));
+    }
+    let st = unsafe { AudioUnitInitialize(u) };
+    if st != 0 {
+        return Err(fail("AudioUnitInitialize", st));
+    }
+    unsafe { AudioUnitSetParameter(u, PARAM_HAL_VOLUME, SCOPE_GLOBAL, 0, f32::from(volume.min(100)) / 100.0, 0) };
+    Ok(OutUnit(u, ref_con))
+}
+
+/// The commands an output's worker takes.
 enum Ctl {
     Start,
     Pause,
 }
 
-/// An output queue, as its worker holds it.
-struct OutQueue(Aq);
-// SAFETY: an AudioQueueRef may be used from any thread.
-unsafe impl Send for OutQueue {}
-
-/// One output device. Its AudioQueue belongs to a worker thread of its own
-/// (§106): making, starting, pausing and disposing of a queue can each be
-/// held by CoreAudio (for as long as a microphone dialog is up, measured),
-/// and none of that may stop the sound ring's thread or hold the state lock.
-/// Data meanwhile waits in `out.buf`, which the session's credit bounds.
+/// One output device. Its unit belongs to a worker thread of its own
+/// (§106): making, starting, stopping and disposing of it may each wait in
+/// CoreAudio, and none of that may stop the sound ring's thread or hold the
+/// state lock. Data meanwhile waits in `out.buf`, which the session's credit
+/// bounds: credit is given back only as the render callback plays it, so
+/// nothing is dropped.
 struct Player {
     name: String,
     out: Arc<Out>,
@@ -275,66 +393,38 @@ struct Player {
     last: Instant,
 }
 
-/// Make the queue for device `uid`; the worker's first step.
-fn new_output(uid: &str, name: &str, out: &Arc<Out>, volume: u8) -> Result<OutQueue, String> {
-    let user = Arc::into_raw(Arc::clone(out)) as *mut c_void;
-    let mut q: Aq = std::ptr::null_mut();
-    let f = format();
-    // SAFETY: a valid format and callback; `user` leaked for the queue's life.
-    let st = unsafe { AudioQueueNewOutput(&f, refill, user, std::ptr::null(), std::ptr::null(), 0, &mut q) };
-    if st != 0 {
-        return Err(format!("AudioQueueNewOutput: OSStatus {st}"));
-    }
-    let st = set_device(q, uid);
-    if st != 0 {
-        // SAFETY: the queue made above, never started.
-        unsafe { AudioQueueDispose(q, 1) };
-        return Err(format!("the queue would not take device {name}: OSStatus {st}"));
-    }
-    // SAFETY: the queue made above.
-    unsafe {
-        AudioQueueSetParameter(q, PARAM_VOLUME, f32::from(volume.min(100)) / 100.0);
-        for _ in 0..AQ_BUFFERS {
-            let mut b: *mut AqBuffer = std::ptr::null_mut();
-            if AudioQueueAllocateBuffer(q, CHUNK_BYTES as u32, &mut b) == 0 {
-                (*b).size = (*b).capacity;
-                std::ptr::write_bytes((*b).data.cast::<u8>(), 0, (*b).capacity as usize);
-                AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
-            }
-        }
-    }
-    Ok(OutQueue(q))
-}
-
 impl Player {
     fn new(stream: u16, d: &Device, link: &Link, volume: u8) -> Result<Player, String> {
         let out = Arc::new(Out { buf: Mutex::new(VecDeque::new()), link: link.clone(), stream, count: Mutex::new(Count::default()) });
         let (tx, rx) = std::sync::mpsc::channel::<Ctl>();
-        let (uid, name, o2) = (d.uid.clone(), d.name.clone(), Arc::clone(&out));
+        let (id, name, o2) = (d.id, d.name.clone(), Arc::clone(&out));
         std::thread::Builder::new()
             .name(format!("out-{stream}"))
             .spawn(move || {
-                let q = match new_output(&uid, &name, &o2, volume) {
-                    Ok(q) => q,
-                    Err(e) => return eprintln!("wc-launch: sound: {name}: {e}"),
+                let u = match new_output(id, &name, &o2, volume) {
+                    Ok(u) => u,
+                    Err(e) => return eprintln!("wc-launch: sound: {e}"),
                 };
                 // Until the Player goes (the channel ends).
                 while let Ok(c) = rx.recv() {
-                    // SAFETY: the queue this worker made and alone uses.
+                    // SAFETY: the unit this worker made and alone drives.
                     let st = unsafe {
                         match c {
-                            Ctl::Start => AudioQueueStart(q.0, std::ptr::null()),
-                            Ctl::Pause => AudioQueuePause(q.0),
+                            Ctl::Start => AudioOutputUnitStart(u.0),
+                            Ctl::Pause => AudioOutputUnitStop(u.0),
                         }
                     };
                     if st != 0 {
-                        eprintln!("wc-launch: sound: {name}: queue command failed: OSStatus {st}");
+                        eprintln!("wc-launch: sound: {name}: unit command failed: OSStatus {st}");
                     }
                 }
-                // SAFETY: as above; the leaked `Arc<Out>` stays, small.
+                // SAFETY: as above; once disposed, the unit calls `render`
+                // no more, so its `Out` reference can go.
                 unsafe {
-                    AudioQueueStop(q.0, 1);
-                    AudioQueueDispose(q.0, 1);
+                    AudioOutputUnitStop(u.0);
+                    AudioUnitUninitialize(u.0);
+                    AudioComponentInstanceDispose(u.0);
+                    drop(Arc::from_raw(u.1));
                 }
             })
             .map_err(|e| format!("no thread for {}: {e}", d.name))?;
