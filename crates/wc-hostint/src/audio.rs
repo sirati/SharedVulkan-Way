@@ -384,6 +384,10 @@ mod tests {
     fn slugs() {
         assert_eq!(slugify("WH-1000XM5"), "wh-1000xm5");
         assert_eq!(slugify("MacBook Neo Speakers"), "macbook_neo_speakers");
+        // The Sonoma VM's only device, QEMU's usb-audio, as CoreAudio names it
+        // (kAudioObjectPropertyName), with UID
+        // "AppleUSBAudioEngine:QEMU:QEMU USB Audio:1-0000:00:01.0-3:1".
+        assert_eq!(slugify("Audio Output - Disabled"), "audio_output_-_disabled");
         assert_eq!(slugify("  Ünïcode  / weird!! "), "n_code_weird");
         assert_eq!(slugify("***"), "device");
         assert_eq!(slugify("a.b\"c"), "a_b_c");
