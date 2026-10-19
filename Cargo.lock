@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "wayland-backend"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "cc",
  "concat-idents",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "wayland-server"
-version = "0.31.13"
+version = "0.31.14"
 dependencies = [
  "bitflags 2.13.1",
  "downcast-rs",
@@ -1579,7 +1579,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xkbcommon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "memmap2",

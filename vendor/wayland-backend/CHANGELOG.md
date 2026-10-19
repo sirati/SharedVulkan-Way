@@ -1,5 +1,12 @@
 # CHANGELOG: wayland-backend
 
+## 0.3.17 -- 2026-08-14
+
+Backport from `master`.
+
+#### Bugfixes
+- client/sys: Make `ReadEventsGuard` impl `Send+Sync`, like `rs` backend
+
 ## 0.3.16 -- 2026-07-22
 
 Backport from `master`.
