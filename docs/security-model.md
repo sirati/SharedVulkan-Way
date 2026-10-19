@@ -1355,6 +1355,39 @@ path, key and forced command included. It is off by default, says
 `DEBUG SSH TRANSPORT` three times in the session's log, and the harness fails
 a run whose log says it.
 
+### R39 — A userspace render node, and guest sections named by tokens
+Added 2026-10-19 with `waycompose-design.md` §104. The nested KWin composites on
+the forwarded GPU through pieces that each widen something a little.
+
+**`sv-drm serve` runs as root** (started by `atp-nested-seat`, only with
+`kwinGpu` and a GPU offered). It is a CUSE device answering a fixed list of DRM
+ioctls; nothing it does touches a kernel driver or memory. The one ioctl that
+reads anything is `PRIME_FD_TO_HANDLE`: it opens `/proc/<pid>/fd/<fd>` of the
+pid that issued the ioctl, and only if that is a regular file on tmpfs (a
+memfd), so a client cannot make it block on a FIFO or reopen the node; it then
+reads at most the token header. The node is `root:users` 0660: any member of
+`users` can open it and gets only those answers.
+
+**`sv-drm ns` is unprivileged**: a user and mount namespace that hides nothing
+and grants nothing; it overlays `/sys/dev/char` and `/tmp/.X11-unix` with
+tmpfs files of its own and drops back to the real ids before exec.
+
+**The desktop user may map the GPU region** (`waycomposeArena.gpu.users`, a
+named ACL on `/run/windows-vm/wc-arena/gpu` only): that user's sv-icd maps the
+pool like the session user's does. It can read and write every GPU session's
+pool memory, as the session user always could; the compositor's arena and the
+doorbells stay the session user's.
+
+**Tokens and sections.** A dma-buf here is a sealed memfd naming a section; a
+reader refuses an unsealed one, an unknown version, a name outside
+`[A-Za-z0-9_-./\\]` or with `..`. The GPU process opens only names it
+created itself, with the nonce it gave them, so one session can import
+another's buffer only by holding its token (the dma-buf the producer handed
+over). The compositor opens a section by the name the proxy passes, read and
+write for GDI's `CreateDIBSection`, and only reads it. The fence record
+(§104.11) is a page per GPU session that the compositor and other sessions only
+read.
+
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
