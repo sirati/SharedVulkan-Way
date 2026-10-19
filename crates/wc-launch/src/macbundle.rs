@@ -72,6 +72,8 @@ pub fn info_plist(section: &str, name: &str) -> String {
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A Linux application in this session is recording from a microphone.</string>
 	<key>{key}</key>
 	<string>{section}</string>
 </dict>

@@ -32985,8 +32985,102 @@ its 5 s lease. This was 103.14's design and is fixed here:
 | GPU server start | the main process, flagged in the boot record; `sv-hostd` started by the session service | none |
 
 Evidence: `/mnt/datasets/builds/evidence/macos-zero-copy/` (`rtt-*.txt`,
-`*-cpu-*.txt`, `gpu-bell-ab.txt`, `copy-ab.txt`, `macgpu-last/`,
-`text-editor.png`), outside the repository.
+`*-cpu-*.txt`, `gpu-bell-ab.txt`, `copy-ab.txt`, `sound-tone.txt`,
+`macgpu-last/`, `text-editor.png`), outside the repository.
+
+### 103.16 The sound ring: every device a stream, both directions, credit not drops
+
+103.14's sound was one stream, Linux to Mac, and the proxy dropped a chunk
+whenever the ring was full. It is now a general transport
+(`sv_transport::soundring`), meant to replace the real Mac's system-wide
+PulseAudio tunnels over vsock and to carry Windows' sound too. It runs on the
+`OWNER_AUDIO` slot, one byte channel for every stream.
+
+**The stream protocol** (version 1). Frames, little-endian: an 8-byte header
+(`type u8`, `flags u8` = 0, `stream u16`, `len u32`) and `len` bytes, at most
+64 KiB.
+
+| type | from | payload |
+|---|---|---|
+| `0x01 Hello` | both | `u32 version` |
+| `0x10 Device` | device side | `u8 dir` (0 output, 1 input), `u8 channels`, `u8 format` (1 = s16le), `u8 0`, `u32 rate`, the device's name (UTF-8) |
+| `0x11 Gone` | device side | none |
+| `0x12 Default` | device side | `u8 dir`; `stream` is now that direction's default |
+| `0x20 Data` | both | PCM, interleaved, the stream's format: output streams session to device, input streams device to session |
+| `0x21 Credit` | both | `u32` bytes more the `Data` sender may send on `stream` |
+| `0x22 Start` | session side | capture this input stream (something records from it) |
+| `0x23 Stop` | session side | stop capturing it |
+
+The **device side** is the machine with the speakers and microphones (the
+Mac); the **session side** is the Linux applications' sound server. A stream
+id names one device and one direction for as long as that device exists; ids
+are not reused. After a `Device` for an output, the device side grants what its
+queue holds (`Credit`) and grants again as it plays; after a `Device` for an
+input, the session side grants. `Data` beyond the credit is a protocol error.
+An unknown type is skipped by its length, so a later version can add messages.
+Capture runs only between `Start` and `Stop`, so a microphone is open only
+while something records. `soundring::spawn` is the one thread that owns the
+channel on either side: it writes what other threads queue in order, waits out
+a full ring without dropping and without ceasing to read (so credit still
+arrives), and is woken by `Link::send` through the lane's own word (a
+`Kicker`).
+
+**Backpressure, end to end.** On the session side an output stream is
+`module-pipe-sink` writing into a FIFO the proxy reads. A pipe sink is paced
+by its reader. When the Mac has granted nothing, the proxy does not read, the
+FIFO fills, the sink stops, and the Linux application's stream waits. Nothing
+is dropped anywhere between the application and the speaker. An input stream is
+`module-pipe-source` reading from a FIFO the proxy writes the Mac's recording
+into; the proxy grants 32 KiB at a time, as the FIFO takes it. A microphone
+cannot wait, so what the Mac records beyond its credit is counted as an
+overrun, never queued.
+
+**Devices and defaults.** The Mac side (`wc-launch/src/sound_mac.rs`) lists
+CoreAudio's devices once a second. Each output gets its own AudioQueue bound to
+the device's UID (`kAudioQueueProperty_CurrentDevice`); each input gets a
+recorder started on `Start`. It announces the default output and input as they
+change, and the proxy makes them the session's (`pactl set-default-sink`,
+`set-default-source`), so the Linux applications follow the Mac's choice. The
+sinks are named `wc_mac_out_<n>` and `wc_mac_in_<n>`, described by the Mac's
+device names. An output idle for 3 s is paused.
+
+**The session's server.**
+* `WC_LAUNCH_AUDIO=on` (the default): a PulseAudio of the session's own, as
+  before. Its pipe sinks suspend on idle (`module-suspend-on-idle`), so no
+  silence crosses the ring.
+* `WC_LAUNCH_AUDIO_NULL_SINK=off`: no null sink and no monitor socket; the
+  ring's devices are the session's only ones.
+* `WC_LAUNCH_AUDIO=system`: no server of the session's own. The applications
+  use this user's PipeWire or PulseAudio and its default sink
+  (`PULSE_SERVER` points at it), and the proxy adds the Mac's devices to that
+  server; `wc-session down` unloads them (`sound.modules`). This is the mode for
+  a guest whose PipeWire already provides devices.
+* The single-stream path (`--audio-socket`, raw PCM on `OWNER_AUDIO`) remains
+  for the Windows launcher until it adopts this protocol.
+
+**The microphone and TCC.** Recording needs the user's permission, which macOS
+asks for on the first `AudioQueueStart` of an input. The main process is started
+by a face, so TCC attributes it to that application's bundle, and every bundle's
+`Info.plist` now carries `NSMicrophoneUsageDescription`. **Not tested:** this
+VM's only sound device is QEMU's `usb-audio`, which has no input, so no input
+stream exists here, and no capture or permission prompt was seen.
+
+**Measured** (the VM, Console's session, QEMU's `wav` audiodev recording the
+VM's output): 5.000 s of a 440 Hz tone played with `pacat` into
+`wc_mac_out_1` came out as 5.000 s at 439.9 Hz with no gap of 5 ms or more.
+103.14's single stream lost 90 ms in 6 s and dropped chunks on a full ring.
+
+**A ring bug found on the way** (`sv_transport::ring`). A packet that does not
+fit before the lane's end makes the producer publish a pad to the end and start
+over at zero. If the packet still did not fit, the producer returned `RingFull`
+having published the pad without ringing the bell, so a consumer asleep on the
+lane never read the pad, and the producer saw `RingFull` for ever. Any writer
+of near-capacity packets facing a parked reader could hit it; the sound ring's
+64 KiB frames did at once. The pad now rings the bell
+(`a_pad_wakes_a_parked_reader` fails without it). In the same work, a channel
+thread's sleep now compares against the lane's wake count taken before it
+looked at its queue (`ByteChannel::wake_epoch`, `wait_readable_since`), so a
+`Kicker::kick` between the two is not slept through.
 
 ### 103.12 Not built, and not proven
 

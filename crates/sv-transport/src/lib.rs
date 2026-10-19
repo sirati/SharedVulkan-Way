@@ -66,6 +66,7 @@ pub mod winpipe;
 pub mod winshm;
 /// The Wayland byte stream, on the same rings as everything else (§36).
 pub mod wlbytes;
+pub mod soundring;
 /// A doorbell the hypervisor carries, over virtio-serial.
 pub mod vdoorbell;
 

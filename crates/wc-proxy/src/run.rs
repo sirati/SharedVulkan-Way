@@ -346,6 +346,12 @@ fn parse_args() -> Result<Args, String> {
             "--hostint-pipewire" => a.hostint.pipewire = Some(next()?.into()),
             "--hostint-pw-bin" => a.hostint.pw_bin = Some(next()?.into()),
             "--hostint-opener" => a.hostint.opener = Some(next()?.into()),
+            "--sound-pactl" => a.services.sound.get_or_insert_with(Default::default).pactl = next()?.into(),
+            "--sound-server" => {
+                let v = next()?;
+                a.services.sound.get_or_insert_with(Default::default).server = (!v.is_empty()).then_some(v);
+            }
+            "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,

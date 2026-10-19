@@ -111,6 +111,9 @@ pub mod macsvc;
 /// `wc-host-open`.
 #[cfg(unix)]
 pub mod hostint;
+/// §103.16: the session side of the multi-stream sound ring.
+#[cfg(unix)]
+pub mod sound;
 #[cfg(unix)]
 pub mod session;
 #[cfg(unix)]
