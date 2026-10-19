@@ -198,6 +198,97 @@ pub fn flush() {
     }
 }
 
+/// The machine's monotonic counter in nanoseconds: `QueryPerformanceCounter`
+/// on Windows, `CLOCK_MONOTONIC` on Linux (the clock bpftrace's `nsecs` reads,
+/// so a hop trace lines up with a kernel trace of the same run).
+#[cfg(windows)]
+pub fn mono_ns() -> u64 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(count: *mut i64) -> i32;
+        fn QueryPerformanceFrequency(freq: *mut i64) -> i32;
+    }
+    static FREQ: OnceLock<u64> = OnceLock::new();
+    let f = *FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        // SAFETY: an out-parameter on this stack frame.
+        unsafe { QueryPerformanceFrequency(&mut f) };
+        f.max(1) as u64
+    });
+    let mut c = 0i64;
+    // SAFETY: as above.
+    unsafe { QueryPerformanceCounter(&mut c) };
+    (c as u128 * 1_000_000_000 / f as u128) as u64
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn mono_ns() -> u64 {
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: as in `mono_us`.
+    unsafe { clock_gettime(1, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+pub fn mono_ns() -> u64 {
+    mono_us().unwrap_or(0) * 1000
+}
+
+/// `WC_HOP_TRACE` (waycompose-design.md §105.14): one stamp per hop of a
+/// control request, so the round trip can be cut into its pieces across both
+/// machines and lined up with a kernel trace of the host.
+///
+/// Off, a relaxed load. On, the stamp is a counter read and a push under an
+/// uncontended mutex; a thread of its own writes the lines (`<ns> <hop>`) to
+/// the file every half second, so no hop ever pays for the write.
+struct Hops {
+    buf: Mutex<Vec<(u64, &'static str)>>,
+}
+
+fn hops() -> Option<&'static Hops> {
+    static H: OnceLock<Option<&'static Hops>> = OnceLock::new();
+    *H.get_or_init(|| {
+        let path = std::env::var("WC_HOP_TRACE").ok().filter(|p| !p.is_empty())?;
+        let path = path.replace("%p", &std::process::id().to_string());
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        let h: &'static Hops = Box::leak(Box::new(Hops { buf: Mutex::new(Vec::with_capacity(1 << 16)) }));
+        let _ = std::thread::Builder::new().name("hop-trace".into()).spawn(move || {
+            let mut out = String::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let taken = std::mem::take(&mut *h.buf.lock().unwrap_or_else(|e| e.into_inner()));
+                if taken.is_empty() {
+                    continue;
+                }
+                out.clear();
+                for (ns, name) in taken {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(out, "{ns} {name}");
+                }
+                let _ = file.write_all(out.as_bytes());
+            }
+        });
+        Some(h)
+    })
+}
+
+/// Stamp hop `name` now. Nothing when `WC_HOP_TRACE` is unset.
+#[inline]
+pub fn hop(name: &'static str) {
+    if let Some(h) = hops() {
+        let ns = mono_ns();
+        h.buf.lock().unwrap_or_else(|e| e.into_inner()).push((ns, name));
+    }
+}
+
 /// Microseconds in a `Duration`, saturating, for the fields of a line.
 pub fn us(d: Duration) -> u64 {
     d.as_micros().min(u64::MAX as u128) as u64

@@ -205,11 +205,38 @@ fn forget(id: &str) {
     let _ = std::fs::remove_file(state_dir().join(id));
 }
 
+/// What the user's service manager says of a session's proxy unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitState {
+    Running,
+    Gone,
+    /// The manager did not answer (§105.14): it re-executes during a NixOS
+    /// switch, and `systemctl` then fails. Not a reason to end anything.
+    Unknown,
+}
+
+/// `systemctl --user is-active`'s first line of output, classified. A unit
+/// the manager no longer knows is `inactive`; no line at all is a manager
+/// that did not answer.
+pub(crate) fn classify_is_active(stdout: &str) -> UnitState {
+    match stdout.lines().next().map(str::trim) {
+        Some("inactive" | "failed") => UnitState::Gone,
+        Some("active" | "activating" | "deactivating" | "reloading" | "refreshing") => UnitState::Running,
+        _ => UnitState::Unknown,
+    }
+}
+
+pub(crate) fn unit_state(id: &str) -> UnitState {
+    match Command::new("systemctl").args(["--user", "is-active", &format!("wc-launch-{id}")]).output() {
+        Ok(out) => classify_is_active(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => UnitState::Unknown,
+    }
+}
+
+/// Whether the session's proxy unit may still be running: only a manager
+/// that says it is gone makes this false.
 pub(crate) fn unit_active(id: &str) -> bool {
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", &format!("wc-launch-{id}")])
-        .status()
-        .is_ok_and(|s| s.success())
+    unit_state(id) != UnitState::Gone
 }
 
 /// Sessions whose proxy units are running now: a restarted service adopts
@@ -326,7 +353,12 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
             }
             match verb(&args.session, &["down", id]) {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
-                Err(e) => say(&format!("session {id} ended; {e}")),
+                // §105.14: a `down` that could not stop the units keeps the
+                // session, and nothing is released while they may still write.
+                Err(e) => {
+                    say(&format!("session {id} ended, but {e}; trying again"));
+                    return true;
+                }
             }
             // Only now, with its proxy and GPU units gone, may the guest
             // free the session's windows.

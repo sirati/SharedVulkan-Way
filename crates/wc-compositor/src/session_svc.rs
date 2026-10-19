@@ -217,7 +217,16 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
 /// How long a request waits for its answer before it parks (§105.13): a
 /// millisecond covers the host waking from its park and answering, so the
 /// answer needs no doorbell back. Only while a request is outstanding.
-const SPIN: Duration = Duration::from_millis(1);
+/// `WC_CTL_SPIN_US` overrides it, for measuring (§105.14).
+fn spin() -> Duration {
+    static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("WC_CTL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(Duration::from_millis(1), Duration::from_micros)
+    })
+}
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
@@ -255,6 +264,7 @@ impl Ctl {
                 let mut ch = self.ch.lock().unwrap_or_else(|e| e.into_inner());
                 match ch.read(&mut buf).map_err(|e| e.to_string())? {
                     ReadOutcome::Bytes(n) => {
+                        sv_transport::frametrace::hop("C.reply");
                         out.extend_from_slice(&buf[..n]);
                         return Ok(());
                     }
@@ -268,14 +278,16 @@ impl Ctl {
                 // tens of microseconds; look for it before parking, which
                 // would add a doorbell round trip.
                 let t0 = Instant::now();
-                while t0.elapsed() < SPIN && !ch.readable().unwrap_or(true) {
+                while t0.elapsed() < spin() && !ch.readable().unwrap_or(true) {
                     std::hint::spin_loop();
                 }
                 if ch.readable().unwrap_or(true) {
                     continue;
                 }
                 // Short, so the lease never waits long behind this lock.
+                sv_transport::frametrace::hop("C.park");
                 let _ = ch.wait_readable(crate::ringlink::ring_wait_slice().min(Duration::from_millis(20)));
+                sv_transport::frametrace::hop("C.unpark");
             }
         }
     }
@@ -284,7 +296,9 @@ impl Ctl {
     /// `ok-raw N` line announces.
     fn request(&self, line: &str) -> Result<Vec<u8>, String> {
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        sv_transport::frametrace::hop("C.ringtx0");
         self.write_all(format!("{line}\n").as_bytes())?;
+        sv_transport::frametrace::hop("C.ringtx1");
         // Every verb answers in seconds; a proxy that ended without answering
         // (its lease, a crash) must not hold the launcher for minutes.
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -471,6 +485,7 @@ fn answer(mut conn: wc_transport::Stream, ctl: &Ctl) {
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         };
+        sv_transport::frametrace::hop("C.line");
         // `ping` is the lease's word on the ring; a launcher's bare `ping` is
         // answered here, from this side. `rtt` crosses (§105.13).
         let out = if line == "ping" {
@@ -484,5 +499,6 @@ fn answer(mut conn: wc_transport::Stream, ctl: &Ctl) {
         if conn.write_all(&out).is_err() {
             return;
         }
+        sv_transport::frametrace::hop("C.socktx");
     }
 }

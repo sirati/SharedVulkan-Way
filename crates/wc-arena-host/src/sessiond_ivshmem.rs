@@ -213,12 +213,24 @@ impl Live {
 
     /// End every session whose proxy unit is gone.
     fn reap(&mut self) {
+        self.reap_with(crate::sessiond::unit_active, |base, id| crate::sessiond::verb(&base.join("wc-session"), &["down", id]));
+    }
+
+    /// [`Live::reap`], with the two questions it asks the system passed in.
+    /// §105.14: a session is forgotten only once its `down` succeeded; until
+    /// then it is tried again on every pass. An unanswered manager is not an
+    /// ended session (`unit_active`), and a `down` that could not stop the
+    /// units leaves them named here, never orphaned.
+    fn reap_with(&mut self, active: impl Fn(&str) -> bool, down: impl Fn(&Path, &str) -> Result<String, String>) {
         let gone: Vec<(String, PathBuf)> =
-            self.map.iter().filter(|(id, _)| !crate::sessiond::unit_active(id)).map(|(i, b)| (i.clone(), b.clone())).collect();
+            self.map.iter().filter(|(id, _)| !active(id)).map(|(i, b)| (i.clone(), b.clone())).collect();
         for (id, base) in gone {
-            match crate::sessiond::verb(&base.join("wc-session"), &["down", &id]) {
+            match down(&base, &id) {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
-                Err(e) => say(&format!("session {id} ended; {e}")),
+                Err(e) => {
+                    say(&format!("session {id} ended, but {e}; trying again"));
+                    continue;
+                }
             }
             let _ = std::fs::remove_file(self.dir.join(&id));
             self.map.remove(&id);
@@ -489,6 +501,40 @@ mod tests {
         let mut p = page(0x77, &r, Some(&a));
         p[..8].fill(0);
         assert_eq!(check(&p, &inst, &st), Ok(None));
+    }
+
+    /// §105.14: wcl-12128. The user's manager re-executed during a NixOS
+    /// switch, `is-active` failed, and the session was taken for ended; its
+    /// `down` could not stop anything either, said "down ok", and the service
+    /// forgot the session with its sound and GPU units still running.
+    #[test]
+    fn a_session_is_forgotten_only_after_a_down_that_worked() {
+        use crate::sessiond::{UnitState, classify_is_active};
+        assert_eq!(classify_is_active(""), UnitState::Unknown, "no answer from the manager is not an ended unit");
+        assert_eq!(classify_is_active("inactive\n"), UnitState::Gone);
+        assert_eq!(classify_is_active("failed\n"), UnitState::Gone);
+        assert_eq!(classify_is_active("active\n"), UnitState::Running);
+        assert_eq!(classify_is_active("deactivating\n"), UnitState::Running);
+
+        let t = tmp("reap");
+        let mut live = Live { dir: t.0.join("live"), map: HashMap::new() };
+        live.insert("wcl-1", &t.0);
+        live.insert("wcl-2", &t.0);
+        let tries = std::cell::Cell::new(0);
+        // wcl-1 is gone, and its first two downs cannot stop its units.
+        let down = |_: &Path, id: &str| {
+            assert_eq!(id, "wcl-1", "a running session was taken down");
+            tries.set(tries.get() + 1);
+            if tries.get() < 3 { Err("down failed: wc-launch-audio-wcl-1 is still unknown".into()) } else { Ok("down ok".into()) }
+        };
+        let active = |id: &str| id == "wcl-2";
+        live.reap_with(active, down);
+        live.reap_with(active, down);
+        assert!(live.map.contains_key("wcl-1") && t.0.join("live/wcl-1").exists(), "forgotten after a failed down");
+        live.reap_with(active, down);
+        assert_eq!(tries.get(), 3);
+        assert!(!live.map.contains_key("wcl-1") && !t.0.join("live/wcl-1").exists());
+        assert!(live.map.contains_key("wcl-2"));
     }
 
     #[test]

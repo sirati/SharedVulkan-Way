@@ -103,7 +103,10 @@ impl Lines {
                 return Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
             }
             match self.ch.read(&mut tmp) {
-                Ok(ReadOutcome::Bytes(n)) => self.buf.extend_from_slice(&tmp[..n]),
+                Ok(ReadOutcome::Bytes(n)) => {
+                    sv_transport::frametrace::hop("P.rx");
+                    self.buf.extend_from_slice(&tmp[..n]);
+                }
                 Ok(ReadOutcome::Eof) | Err(_) => return None,
                 Ok(_) => {
                     // §105.13: a request's next line, or the next request of a
@@ -114,7 +117,9 @@ impl Lines {
                         std::hint::spin_loop();
                     }
                     if !self.ch.readable().unwrap_or(true) {
+                        sv_transport::frametrace::hop("P.park");
                         let _ = self.ch.wait_readable(crate::rings::service_slice());
+                        sv_transport::frametrace::hop("P.unpark");
                     }
                 }
             }
@@ -219,7 +224,9 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
         }
         let mut out = format!("{reply}\n").into_bytes();
         out.extend_from_slice(&body);
-        if !write_all(&mut lines.ch, &out) {
+        let ok = write_all(&mut lines.ch, &out);
+        sv_transport::frametrace::hop("P.tx");
+        if !ok {
             break;
         }
     }

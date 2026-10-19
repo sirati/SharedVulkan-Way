@@ -250,6 +250,30 @@ check_metrics() {
 
 dir_of() { echo "$RUNROOT/$1"; }
 
+# §105.14: stop one of a session's user units and KNOW that it stopped.
+# `systemctl --user` fails while the user's manager re-executes (a NixOS
+# switch does that), and `down` used to ignore the failure, remove the
+# session's directory and say "down ok": its PulseAudio and GPU units ran on
+# with nobody left who knew their names. So a unit counts as stopped only
+# when the manager says `inactive` or `failed` (a collected unit is
+# `inactive`); an unreachable manager is asked again, for up to
+# WC_LAUNCH_STOP_TRIES tenths of a second.
+sd_user() { XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user "$@"; }
+unit_state() { local s; s=$(sd_user is-active "$1" 2>/dev/null | head -n 1); echo "${s:-unknown}"; }
+stop_unit() {
+  local U="$1" st=unknown i
+  for ((i = 0; i < ${WC_LAUNCH_STOP_TRIES:-100}; i++)); do
+    sd_user stop "$U" 2>/dev/null
+    st=$(unit_state "$U")
+    case "$st" in
+      inactive|failed) sd_user reset-failed "$U" 2>/dev/null; return 0 ;;
+    esac
+    sleep 0.1
+  done
+  echo "wc-session: $U is still $st (the user's service manager did not answer, or would not stop it)" >&2
+  return 1
+}
+
 # WHERE AN APPLICATION ACTUALLY IS, WHICH IS NOT A CONSTANT
 #
 # The brief for this stage named Firefox at
@@ -1135,6 +1159,9 @@ proxy)
       # the machine's monotonic counter like the compositor's.
       ft=$(grep -m1 '^WC_FRAME_TRACE_CLOCK=' "$BASE/gpu.env" 2>/dev/null)
       [ -n "$ft" ] && printf 'export %q\n' "$ft"
+      # §105.14: the control round trip's hops, on the same clock.
+      ft=$(grep -m1 '^WC_HOP_TRACE=' "$BASE/gpu.env" 2>/dev/null)
+      [ -n "$ft" ] && printf 'export %q\n' "$ft"
       printf 'rm -f %q\n' "$D/wl-proxy"
       # §89: the rings, when `up` found both them and their doorbell. The
       # tunnel's socket stays the upstream either way: the icon and clipboard
@@ -1508,8 +1535,8 @@ down)
   # The user unit first, always: stopping one that does not exist costs
   # nothing. Root only for a guest-RAM session, which is the kind that wrote a
   # plan; an ivshmem session never had a root unit to stop (§83).
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
+  STUCK=""
+  stop_unit "wc-launch-$ID" || STUCK="$STUCK wc-launch-$ID"
   # §103.16: a sound ring's devices on the user's own server outlive the
   # proxy that made them; the session's own server goes with its unit.
   if [ -s "$D/sound.modules" ] && [ "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" = system ] && PACTL=$(pulse_bin pactl 2>/dev/null); then
@@ -1517,10 +1544,10 @@ down)
       [[ "$m" =~ ^[0-9]+$ ]] && PULSE_SERVER="unix:/run/user/$UID_/pulse/native" "$PACTL" unload-module "$m" 2>/dev/null
     done <"$D/sound.modules"
   fi
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-audio-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-gpu-$ID" 2>/dev/null
-  XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-gpu-$ID" 2>/dev/null
+  stop_unit "wc-launch-audio-$ID" || STUCK="$STUCK wc-launch-audio-$ID"
+  stop_unit "wc-launch-gpu-$ID" || STUCK="$STUCK wc-launch-gpu-$ID"
+  # The directory names the units; it goes only once they have.
+  [ -z "$STUCK" ] || die "down $ID: could not stop$STUCK; the session stays for the next down"
   if [ -f "$D/arena.plan" ] && [ "${WC_LAUNCH_GUEST_RAM:-}" = 1 ]; then
     printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl stop %q 2>/dev/null\nsystemctl reset-failed %q 2>/dev/null\ntrue\n' \
       "wc-launch-$ID" "wc-launch-$ID" | eval "$ROOTC" >/dev/null 2>&1
