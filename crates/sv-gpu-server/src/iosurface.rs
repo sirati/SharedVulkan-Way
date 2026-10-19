@@ -142,8 +142,9 @@ fn texture(surface: &Surface, mtl_format: u64, width: u32, height: u32) -> Optio
             return None;
         }
         let set: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) = std::mem::transmute(objc_msgSend as *const ());
-        // MTLTextureUsageShaderRead | ShaderWrite | RenderTarget.
-        set(desc, sel_registerName(c"setUsage:".as_ptr()), 1 | 2 | 4);
+        // MTLTextureUsageShaderRead | ShaderWrite | RenderTarget | PixelFormatView
+        // (an SRGB or UNORM view of the other, which Zink makes).
+        set(desc, sel_registerName(c"setUsage:".as_ptr()), 1 | 2 | 4 | 0x10);
         // MTLStorageModeShared: an IOSurface's memory is the CPU's too.
         set(desc, sel_registerName(c"setStorageMode:".as_ptr()), 0);
         let new: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, u64) -> *mut c_void =
