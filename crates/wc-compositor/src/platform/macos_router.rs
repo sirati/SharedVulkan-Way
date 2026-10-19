@@ -147,6 +147,19 @@ struct R {
     copies: CopyStats,
 }
 
+/// WC_FACE_FULL_COPY, or a file `face-full-copy` in the launcher's support
+/// directory (a face-started main process has launchd's environment): copy
+/// whole windows, as before §103.15, for the comparison. Read once.
+fn full_copy() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        std::env::var_os("WC_FACE_FULL_COPY").is_some()
+            || std::env::var_os("HOME").is_some_and(|h| {
+                PathBuf::from(h).join("Library/Application Support/waycompose/face-full-copy").exists()
+            })
+    })
+}
+
 /// Milliseconds of `CLOCK_UPTIME_RAW` and its sub-millisecond rest in µs:
 /// `NSEvent.timestamp`'s clock, so a face's input can be timed here.
 fn uptime_us() -> u64 {
@@ -365,7 +378,7 @@ impl R {
             // WC_FACE_FULL_COPY=1: every present copies the whole window, as
             // before §103.15, for the comparison.
             ToUi::Present { id, damage } => {
-                let full = std::env::var_os("WC_FACE_FULL_COPY").is_some();
+                let full = full_copy();
                 if std::env::var_os("WC_FACE_DAMAGE_DEBUG").is_some() {
                     println!("wc-compositor: present {id}: damage {:?}", damage.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>());
                 }
