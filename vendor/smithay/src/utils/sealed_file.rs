@@ -1,7 +1,9 @@
 use std::ffi::CStr;
 
 #[cfg(unix)]
-use std::{fs::File, io::Write};
+use std::fs::File;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "android"))]
+use std::io::Write;
 
 use crate::utils::os::{AsFd, BorrowedFd};
 
@@ -34,6 +36,10 @@ pub struct SealedFile {
     /// compositor started without one should not have the first keymap poison
     /// every later attempt.
     named: std::sync::Mutex<Option<crate::utils::os::Handle>>,
+    /// The contents, kept where the file cannot be read back: a POSIX shm
+    /// object on macOS supports neither `read(2)` nor `write(2)` (waycompose
+    /// §103.11). `None` where the file is a memfd.
+    bytes: Option<Vec<u8>>,
 }
 
 /// See the Unix definition above.
@@ -80,6 +86,7 @@ impl SealedFile {
             file,
             size: data.len(),
             named: std::sync::Mutex::new(None),
+            bytes: None,
         })
     }
 
@@ -122,13 +129,33 @@ impl SealedFile {
         // Unlink so another process can't open shm file.
         let _ = shm::unlink(shm_name.as_slice());
 
-        file.write_all(data)?;
-        file.flush()?;
+        // waycompose §103.11: macOS shm objects take no `write(2)`; they are
+        // sized once with `ftruncate` and filled through a mapping. That is
+        // also correct on the BSDs, so it is not conditional.
+        let _ = &mut file;
+        file.set_len(data.len().max(1) as u64)?;
+        if !data.is_empty() {
+            // SAFETY: a fresh shared mapping of an object this function just
+            // sized to `data.len()`, written once and unmapped before return.
+            unsafe {
+                let ptr = rustix::mm::mmap(
+                    std::ptr::null_mut(),
+                    data.len(),
+                    rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+                    rustix::mm::MapFlags::SHARED,
+                    &file,
+                    0,
+                )?;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len());
+                let _ = rustix::mm::munmap(ptr, data.len());
+            }
+        }
 
         Ok(Self {
             file: file_rdonly,
             size: data.len(),
             named: std::sync::Mutex::new(None),
+            bytes: Some(data.to_vec()),
         })
     }
 
@@ -278,11 +305,16 @@ impl SealedFile {
             // Read the bytes back out of the sealed file rather than keeping a
             // second copy alive for the lifetime of every keymap: this runs once
             // per keymap per compositor, and a keymap is tens of kilobytes.
-            let mut file = &self.file;
-            let mut bytes = Vec::with_capacity(self.size);
-            file.seek(std::io::SeekFrom::Start(0))?;
-            file.read_to_end(&mut bytes)?;
-            file.seek(std::io::SeekFrom::Start(0))?;
+            let bytes = if let Some(b) = &self.bytes {
+                b.clone()
+            } else {
+                let mut file = &self.file;
+                let mut bytes = Vec::with_capacity(self.size);
+                file.seek(std::io::SeekFrom::Start(0))?;
+                file.read_to_end(&mut bytes)?;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                bytes
+            };
             let handle = crate::utils::os::Handle::create_shared(bytes.len() as u64)?;
             handle.write_at(0, &bytes)?;
             *slot = Some(handle.clone());

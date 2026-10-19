@@ -114,6 +114,23 @@ unsafe extern "C" {
     fn IOPMAssertionRelease(id: u32) -> i32;
 }
 
+/// A `CGImageRef` as an Objective-C argument: objc2's debug builds check
+/// argument encodings, and `initWithCGImage:size:` declares `^{CGImage=}`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct CGImageRef(*mut c_void);
+
+// SAFETY: a pointer to the opaque CGImage struct, which is what the encoding says.
+unsafe impl objc2::encode::Encode for CGImageRef {
+    const ENCODING: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&objc2::encode::Encoding::Struct("CGImage", &[]));
+}
+// SAFETY: as above.
+unsafe impl objc2::encode::RefEncode for CGImageRef {
+    const ENCODING_REF: objc2::encode::Encoding =
+        objc2::encode::Encoding::Pointer(&<Self as objc2::encode::Encode>::ENCODING);
+}
+
 /// `kCGBitmapByteOrder32Little`: the shadow is BGRA in memory, which is a
 /// little-endian 32-bit ARGB word.
 const BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
@@ -762,7 +779,15 @@ impl WcAppDelegate {
 
 // ----------------------------------------------------------------- keys ---
 
+fn trace_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WC_MAC_TRACE").is_some())
+}
+
 fn key_event(id: WindowId, kvk: u16, pressed: bool, time: u32) {
+    if trace_keys() {
+        println!("wc-compositor: macos key kVK {kvk:#04x} {} for window {id}", if pressed { "down" } else { "up" });
+    }
     let send = with_input(|i| {
         let code = mac_keys::evdev_keycode(kvk, i.cmd)?;
         i.fold.apply(kvk, code, pressed).map(|p| (code, p))
@@ -910,7 +935,7 @@ fn nsimage(icon: &IconImage) -> Option<Retained<NSImage>> {
     let size = NSSize::new(f64::from(icon.width), f64::from(icon.height));
     // SAFETY: `initWithCGImage:size:` retains the image, released after.
     unsafe {
-        let ns: Retained<NSImage> = msg_send![NSImage::alloc(), initWithCGImage: img, size: size];
+        let ns: Retained<NSImage> = msg_send![NSImage::alloc(), initWithCGImage: CGImageRef(img), size: size];
         CGImageRelease(img);
         Some(ns)
     }

@@ -13,6 +13,7 @@
 #   * an OpenSSH Unix-socket forward carries the Wayland bytes (§103.4);
 #   * wc-proxy maps the plan and serves the client.
 # Env: MACVM_INSTANCE (wayland-host), WC_SECS (run length, 120), WC_ARENA_MIB (64),
+#      WC_SHOT_AFTER (seconds, then a QMP screenshot), WC_DURING (a command before it),
 #      WC_MAC_BIN (the compositor in the VM), WC_KEEP=1 keeps the run dir.
 set -uo pipefail
 ulimit -c 0
@@ -53,7 +54,7 @@ rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" c3r@127.0.0.1:wc/bin/wc-compositor
 vm 'pkill -f "wc-compositor --socket wl-mac" 2>/dev/null; rm -rf /tmp/wcrt; mkdir -m 700 /tmp/wcrt'
 # The GUI session: a process started by sshd is outside the user's Aqua
 # bootstrap namespace and cannot reach the WindowServer.
-vm "sudo -n launchctl asuser 501 sudo -n -u c3r env XDG_RUNTIME_DIR=/tmp/wcrt WC_MAC_CMD_KEY=\${WC_MAC_CMD_KEY:-control} \
+vm "sudo -n launchctl asuser 501 sudo -n -u c3r env XDG_RUNTIME_DIR=/tmp/wcrt WC_MAC_TRACE=${WC_MAC_TRACE:-1} WC_MAC_CMD_KEY=\${WC_MAC_CMD_KEY:-control} \
   $bin --socket wl-mac --in-band --timeout $((secs + 30)) --exit-when-empty 20 \
   --arena-guest-ram 0:$arena --arena-outbound 0:$out > /tmp/wcrt/comp.log 2>&1 &"
 for i in $(seq 1 60); do vm 'grep -q "listening on" /tmp/wcrt/comp.log 2>/dev/null' && break; sleep 0.5; done
@@ -88,6 +89,9 @@ XDG_RUNTIME_DIR="$run/rt" WAYLAND_DISPLAY=wl-proxy timeout "$secs" "${client[@]}
 pids+=($!)
 if [ -n "${WC_SHOT_AFTER:-}" ]; then
   sleep "$WC_SHOT_AFTER"
+  # WC_DURING: a command run once the window is up, before the screenshot
+  # (input through scripts/mac-input.sh, a clipboard check, ...).
+  if [ -n "${WC_DURING:-}" ]; then say "during: $WC_DURING"; bash -c "$WC_DURING" > "$run/during.log" 2>&1; sleep 1; fi
   "$root/scripts/mac-shot.sh" "$run/shot.png" && cp "$run/shot.png" /mnt/datasets/builds/wcrun/mac-last/shot.png \
     && say "screenshot: /mnt/datasets/builds/wcrun/mac-last/shot.png"
 fi

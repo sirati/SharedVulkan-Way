@@ -31977,6 +31977,18 @@ stopped whenever no test is running.
 
 ### 103.11 What has been run, and where
 
+**Two macOS bugs the first runs found, both outside the platform code.**
+smithay's non-Linux `SealedFile` wrote the keymap into a POSIX shm object with
+`write(2)` and read it back with `read(2)`, and macOS shm objects support
+neither. So no keymap object existed, an in-band peer was sent no
+`wl_keyboard.keymap`, and every key reached a client that could not decode it.
+The proxy's counter said so (`2 fds in, 0 out`). The vendored arm now sizes the
+object with `ftruncate`, fills it through `mmap`, and keeps the bytes for the
+named twin (vendor/PATCHES.md). The second was `sv-hostd`'s memfd choice
+(103.3). Both are now fixed. objc2's debug builds also check message encodings,
+which caught a `CGImageRef` passed as `void *` (a typed wrapper fixes it).
+
+
 Filled in as the stages land; nothing below is a claim beyond its row.
 
 | what | where | result |
@@ -31988,4 +32000,5 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | wired 4 KiB arena, located 10 times across 2 sessions with 2.5 to 3.5 GB of pressure between locates (`scripts/mac-pinning.sh`) | 4 GiB VM | every plan identical, every verify 16128/16128; ~12,000 runs per 64 MiB |
 | superpages at 4 GiB | 4 GiB VM | none, even one at a time, after `purge`, with 1.8 GB free |
 | first window at 4 GiB, compositor cross-linked on Linux | 4 GiB VM | `pinning=wired`, located, mapped 742x427 |
+| keyboard: `scripts/mac-input.sh` types through QEMU's USB keyboard (QMP), into weston-terminal on Linux | 4 GiB VM | `echo mac-input-ok_42` ran and printed `mac-input-ok_42`; before the `sealed_file.rs` fix below, no key reached the client (`0 out` descriptors at the proxy: no keymap) |
 | **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |
