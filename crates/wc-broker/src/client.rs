@@ -5,7 +5,9 @@
 //! belongs to. Every call is one line out and one line back; lines the broker
 //! pushes (`!…`) are put aside for [`Client::next_event`].
 
+#[cfg(unix)]
 use crate::proto;
+#[cfg(unix)]
 use std::io;
 
 /// Where the broker listens unless `WC_BROKER` says otherwise.
