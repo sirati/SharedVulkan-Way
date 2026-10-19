@@ -17,5 +17,7 @@ pub mod token;
 #[cfg(windows)]
 pub mod win;
 
-#[cfg(target_os = "macos")]
+// On every target under test, for its pure `mac::plan`; the FFI inside is
+// macOS-only.
+#[cfg(any(target_os = "macos", test))]
 pub mod mac;
