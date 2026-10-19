@@ -148,7 +148,7 @@ fn verb(session: &PathBuf, words: &[&str]) -> Result<String, String> {
 /// §103.15: tell the guest's keeper that nothing of the host will touch this
 /// session's windows again: the release word in its boot page, if the page
 /// still holds its record.
-fn release(qmp: &PathBuf, vm: &str, f: &Found) -> Result<(), String> {
+fn release(qmp: &std::path::Path, vm: &str, f: &Found) -> Result<(), String> {
     let t = sv_hostd::qemu::QemuTarget::discover(qmp, vm).map_err(|e| e.to_string())?;
     let mut pg = vec![0u8; wc_handle::arena::REGION_PAGE];
     sv_hostd::qemu::read_at(&t.file, f.offset, &mut pg).map_err(|e| e.to_string())?;

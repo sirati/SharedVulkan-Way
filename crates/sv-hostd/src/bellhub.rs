@@ -379,10 +379,17 @@ mod tests {
         drop(g1); // the VM went away
         let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
         // §103.15: the client is told to rescan (bells in the gap are lost),
-        // and then gets the new upstream's bytes.
-        assert_eq!(read_some(&mut a, 1, Duration::from_secs(5)), vec![sv_transport::park::RESCAN_TOKEN]);
+        // and then gets the new upstream's bytes. One token per upstream
+        // connect it was there for: the first connect's may also reach it.
         g2.write_all(&[9]).unwrap();
-        assert_eq!(read_some(&mut a, 1, Duration::from_secs(5)), vec![9]);
+        let mut got = Vec::new();
+        let t = Instant::now();
+        while !got.ends_with(&[9]) && t.elapsed() < Duration::from_secs(5) {
+            got.extend(read_some(&mut a, 1, Duration::from_secs(5)));
+        }
+        let (last, before) = got.split_last().expect("bytes from the hub");
+        assert_eq!(*last, 9);
+        assert!(!before.is_empty() && before.iter().all(|b| *b == sv_transport::park::RESCAN_TOKEN), "{got:?}");
         a.write_all(&[3]).unwrap();
         assert_eq!(read_some(&mut g2, 1, Duration::from_secs(5)), vec![3]);
         assert!(hub.stats.upstream_connects.load(Ordering::Relaxed) >= 2);
