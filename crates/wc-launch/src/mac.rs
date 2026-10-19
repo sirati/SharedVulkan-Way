@@ -398,13 +398,16 @@ fn request(cfg: &Config, s: &Arc<Session>, log: &Log, section: &str, key: &str) 
             return;
         }
     };
-    // §105: a document from the Mac goes to Linux by its Linux path.
-    let key = match crate::mac_hostint::map_open_key(cfg, key) {
-        Ok(k) => k,
-        Err(e) => return log.say(&format!("{section}: cannot open in Linux: {e}")),
-    };
     let (s, log, key, section) = (s.clone(), log.clone(), key.to_string(), section.to_string());
+    let cfg = cfg.clone();
     std::thread::spawn(move || {
+        // §105: a document from the Mac goes to Linux by its Linux path; a
+        // copy into the drop folder, if it is outside the share, is made
+        // here rather than on the router's thread.
+        let key = match crate::mac_hostint::map_open_key(&cfg, &key) {
+            Ok(k) => k,
+            Err(e) => return log.say(&format!("{section}: cannot open in Linux: {e}")),
+        };
         // The words wc-session takes, less the session id, which the host's
         // end of the channel puts in itself (macsvc.rs).
         let verb = plan::launch_verb("ID", &host_app, macbundle::request_for(&key), 96, None);
