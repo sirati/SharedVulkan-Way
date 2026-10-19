@@ -11,3 +11,7 @@ sv-transport = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# `brokered`: the regions are handed to clients by the broker daemon (§111).
+[target.'cfg(target_os = "linux")'.dependencies]
+wc-broker = { workspace = true }

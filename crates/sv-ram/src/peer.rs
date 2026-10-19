@@ -34,6 +34,33 @@ pub enum PeerEvent {
     ProviderRun { run: u64 },
 }
 
+/// The host processes that map a region besides the peer (§108.4 rule 4):
+/// what the peer tells when a region is mapped, and asks before it answers
+/// `UNMAPPED`. The broker is one ([`crate::brokered`]); a peer that is the
+/// only mapper has [`NoMappers`].
+pub trait Mappers {
+    /// Region `m` is mapped and verified, and not yet answered: make it
+    /// reachable for the host's other mappers. An error refuses the region
+    /// (`MAP`), so nothing is leased in it.
+    fn publish(&mut self, m: &Mapped, ram: std::os::fd::BorrowedFd<'_>) -> Result<(), String>;
+    /// Region `k` of `epoch` is retiring and the peer's own view is gone.
+    /// True once no other host process maps it (or none ever did); asked
+    /// again on every scan until then.
+    fn let_go(&mut self, k: u32, epoch: u64) -> bool;
+}
+
+/// No other host process maps the regions.
+pub struct NoMappers;
+
+impl Mappers for NoMappers {
+    fn publish(&mut self, _: &Mapped, _: std::os::fd::BorrowedFd<'_>) -> Result<(), String> {
+        Ok(())
+    }
+    fn let_go(&mut self, _: u32, _: u64) -> bool {
+        true
+    }
+}
+
 pub struct Peer {
     boot: SharedRegion,
     table_off: u64,
@@ -43,13 +70,10 @@ pub struct Peer {
     provider_run: u64,
     pub run: u64,
     t0: Instant,
-    /// Publish each mapped region for the host's other mappers (the ICDs):
-    /// `{prefix}-{k}.ram` holds its runs, `{prefix}-{k}-{epoch}.lease` is
-    /// the file a mapper holds a shared `flock` on while it maps the region.
-    publish: Option<String>,
-    ram_path: String,
-    /// Retires waiting for a mapper to let go: entry -> since.
-    waiting: BTreeMap<u32, Instant>,
+    /// The host's other mappers of each region (the broker's clients).
+    mappers: Box<dyn Mappers + Send>,
+    /// Retires waiting for a mapper to let go: entry -> (since, last log).
+    waiting: BTreeMap<u32, (Instant, u64)>,
 }
 
 impl Peer {
@@ -66,19 +90,16 @@ impl Peer {
             provider_run: 0,
             run,
             t0: Instant::now(),
-            publish: None,
-            ram_path: String::new(),
+            mappers: Box::new(NoMappers),
             waiting: BTreeMap::new(),
         };
         p.table().peer_attach(run);
         Ok(p)
     }
 
-    /// Publish mapped regions to other host processes under `prefix` (the
-    /// boot device's path), naming the RAM backend as `ram_path`.
-    pub fn publish_to(&mut self, prefix: &str, ram_path: &str) {
-        self.publish = Some(prefix.to_string());
-        self.ram_path = ram_path.to_string();
+    /// Who else maps the regions (§108.4 rule 4).
+    pub fn set_mappers(&mut self, m: Box<dyn Mappers + Send>) {
+        self.mappers = m;
     }
 
     /// The table moved (a new provider run leased it elsewhere).
@@ -97,48 +118,24 @@ impl Peer {
         &self.boot
     }
 
-    fn ram_file(prefix: &str, k: u32) -> String {
-        format!("{prefix}-{k}.ram")
-    }
-    fn lease_file(prefix: &str, k: u32, epoch: u64) -> String {
-        format!("{prefix}-{k}-{epoch}.lease")
-    }
-
-    /// Write `{prefix}-{k}.ram` (atomically) and create the lease file.
-    fn publish_region(&self, m: &Mapped) {
-        let Some(prefix) = &self.publish else { return };
-        let mut s = format!("epoch {}\nram {}\nlen {}\n", m.epoch, self.ram_path, m.len);
-        let mut at = 0;
-        for &(off, len) in &m.runs {
-            s.push_str(&format!("run {off} {at} {len}\n"));
-            at += len;
-        }
-        let path = Self::ram_file(prefix, m.k);
-        let tmp = format!("{path}.tmp");
-        let _ = std::fs::File::create(Self::lease_file(prefix, m.k, m.epoch));
-        if std::fs::write(&tmp, s).and_then(|_| std::fs::rename(&tmp, &path)).is_err() {
-            eprintln!("[peer] could not publish {path}");
-        }
+    /// The guest RAM backend this peer reads.
+    pub fn ram(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.ram.as_fd()
     }
 
     /// May the region be answered `UNMAPPED`? Only when no other host
-    /// process holds its lease file (§108.4 rule 4). A process that died
-    /// let go with it.
+    /// process maps it (§108.4 rule 4). A process that died let go with it.
+    /// A holder past 30 s is logged every 30 s; nothing is ever forced.
     fn mappers_gone(&mut self, k: u32, epoch: u64, entry: u32) -> bool {
-        let Some(prefix) = &self.publish else { return true };
-        let _ = std::fs::remove_file(Self::ram_file(prefix, k));
-        let lf = Self::lease_file(prefix, k, epoch);
-        let Ok(f) = std::fs::OpenOptions::new().read(true).open(&lf) else { return true };
-        use std::os::fd::AsRawFd;
-        // LOCK_EX | LOCK_NB
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            let _ = std::fs::remove_file(&lf);
+        if self.mappers.let_go(k, epoch) {
             self.waiting.remove(&entry);
             return true;
         }
-        let since = *self.waiting.entry(entry).or_insert_with(Instant::now);
-        if since.elapsed().as_secs() >= 30 && since.elapsed().as_millis() % 30_000 < 300 {
-            eprintln!("[peer] region {k}: a host process still maps it after {} s; the guest keeps it until it lets go", since.elapsed().as_secs());
+        let w = self.waiting.entry(entry).or_insert_with(|| (Instant::now(), 0));
+        let s = w.0.elapsed().as_secs();
+        if s / 30 > w.1 {
+            w.1 = s / 30;
+            eprintln!("[peer] region {k}: a host process still maps it after {s} s; the guest keeps it until it lets go");
         }
         false
     }
@@ -299,7 +296,11 @@ impl Peer {
             let map_us = t.elapsed().as_micros() as u64;
             let m = Mapped { entry: e.index, k: e.region, epoch: e.epoch, len: e.len, view, runs };
             // Published before the answer: a lease in it can only follow MAPPED.
-            self.publish_region(&m);
+            if let Err(why) = self.mappers.publish(&m, self.ram.as_fd()) {
+                drop(m);
+                ev.push(self.refuse(e, Reason::Map, format!("publishing it for the host's mappers: {why}")));
+                continue;
+            }
             let now = self.now_us();
             self.table().answer(e.index, e.epoch, QState::Mapped, Reason::None, now);
             ev.push(PeerEvent::Mapped { entry: e.index, k: e.region, len: e.len, runs: m.runs.len(), locate_us, map_us });
@@ -531,6 +532,23 @@ mod tests {
         assert!(p.substrate.regions.contains_key(&1));
     }
 
+    /// A stand-in for the broker: it records what was published, and holds a
+    /// retire for as long as a "client" holds the region.
+    #[derive(Clone, Default)]
+    struct FakeMappers(std::sync::Arc<std::sync::Mutex<(Vec<(u32, u64, usize)>, bool, Vec<(u32, u64)>)>>);
+
+    impl Mappers for FakeMappers {
+        fn publish(&mut self, m: &Mapped, _: std::os::fd::BorrowedFd<'_>) -> Result<(), String> {
+            self.0.lock().unwrap().0.push((m.k, m.epoch, m.runs.len()));
+            Ok(())
+        }
+        fn let_go(&mut self, k: u32, epoch: u64) -> bool {
+            let mut g = self.0.lock().unwrap();
+            g.2.push((k, epoch));
+            !g.1
+        }
+    }
+
     #[test]
     fn a_host_process_that_still_maps_a_region_holds_its_retire() {
         let (bf, b1) = boot();
@@ -539,30 +557,53 @@ mod tests {
         let mut p = Provider::start(b1, 4096, sim, 1).unwrap();
         let b2 = SharedRegion::map_fd(bf.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap();
         let mut peer = Peer::attach(b2, 4096, ram, 9).unwrap();
-        let dir = std::env::temp_dir().join(format!("sv-ram-pub-{}-{}", std::process::id(), rand_u64()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let prefix = dir.join("gpu").to_string_lossy().into_owned();
-        peer.publish_to(&prefix, "/proc/self/fd/0");
+        let fake = FakeMappers::default();
+        peer.set_mappers(Box::new(fake.clone()));
         let e = p.announce(3, 4 << 20).unwrap();
         peer.scan(|_| {});
         p.poll().unwrap();
-        let ram_file = std::fs::read_to_string(format!("{prefix}-3.ram")).unwrap();
-        assert!(ram_file.starts_with(&format!("epoch {}\n", p.regions[&e].epoch)), "{ram_file}");
-        assert_eq!(ram_file.lines().filter(|l| l.starts_with("run ")).count(), peer.maps[&e].runs.len());
-        // An ICD maps it: a shared lock on the lease file.
-        let lf = std::fs::File::open(format!("{prefix}-3-{}.lease", p.regions[&e].epoch)).unwrap();
-        use std::os::fd::AsRawFd;
-        assert_eq!(unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+        let epoch = p.regions[&e].epoch;
+        assert_eq!(fake.0.lock().unwrap().0, vec![(3, epoch, peer.maps[&e].runs.len())], "published before MAPPED");
+        // A client maps it.
+        fake.0.lock().unwrap().1 = true;
         p.retire(e);
         let ev = peer.scan(|_| {});
         assert!(!ev.contains(&PeerEvent::Unmapped { entry: e, k: 3 }), "answered while a mapper held it: {ev:?}");
+        assert!(!peer.maps.contains_key(&e), "the peer's own view goes at once");
         assert!(p.poll().unwrap().is_empty());
-        drop(lf); // the ICD unmapped (or died)
+        assert!(p.substrate.freed.is_empty(), "rule 3: not freed while a host mapper holds it");
+        fake.0.lock().unwrap().1 = false; // the client unmapped (or died)
         let ev = peer.scan(|_| {});
         assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 3 }), "{ev:?}");
         assert!(matches!(p.poll().unwrap()[0], Event::Freed { k: 3, .. }));
-        assert!(std::fs::metadata(format!("{prefix}-3.ram")).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(fake.0.lock().unwrap().2.iter().all(|&(k, ep)| k == 3 && ep == epoch));
+    }
+
+    /// A mapper that cannot publish refuses the region: nothing is leased in
+    /// memory no client could reach.
+    #[test]
+    fn a_region_the_mappers_cannot_publish_is_refused() {
+        struct Broken;
+        impl Mappers for Broken {
+            fn publish(&mut self, _: &Mapped, _: std::os::fd::BorrowedFd<'_>) -> Result<(), String> {
+                Err("no udmabuf".into())
+            }
+            fn let_go(&mut self, _: u32, _: u64) -> bool {
+                true
+            }
+        }
+        let (bf, b1) = boot();
+        let sim = SimRam::new(16);
+        let ram = sim.file.try_clone().unwrap();
+        let mut p = Provider::start(b1, 4096, sim, 1).unwrap();
+        let b2 = SharedRegion::map_fd(bf.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap();
+        let mut peer = Peer::attach(b2, 4096, ram, 9).unwrap();
+        peer.set_mappers(Box::new(Broken));
+        let e = p.announce(1, 4 << 20).unwrap();
+        let ev = peer.scan(|_| {});
+        assert!(matches!(ev.last(), Some(PeerEvent::Refused { reason: Reason::Map, .. })), "{ev:?}");
+        assert!(!peer.maps.contains_key(&e));
+        assert_eq!(p.poll().unwrap(), vec![Event::Refused { k: 1, reason: Reason::Map }]);
     }
 
     #[test]
