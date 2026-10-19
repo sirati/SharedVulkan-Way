@@ -26,7 +26,10 @@
 //! own coordinates with the origin at the top left. One surface pixel is one
 //! point: the compositor supports buffer scale 1 only (`state.rs`), so on a
 //! Retina screen AppKit scales the layer up, which is correct and soft
-//! (§103.7 records the scale work as later).
+//! (§103.7 records the scale work as later). That needs the layer's
+//! `contentsScale` at 1, set with every buffer: AppKit gives a layer-backed
+//! view the screen's backing scale (2 on Retina), and with the gravity below,
+//! which never scales, a buffer then filled a quarter of its window.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -2079,6 +2082,7 @@ fn present(id: WindowId, _damage: &[Rect]) {
             // it, and the map keeps our reference until the window goes.
             unsafe {
                 let _: () = msg_send![&*layer, setOpaque: !alpha];
+                let _: () = msg_send![&*layer, setContentsScale: 1.0f64];
                 let _: () = msg_send![&*layer, setContents: ptr.cast::<AnyObject>()];
             }
         }
@@ -2092,6 +2096,7 @@ fn present(id: WindowId, _damage: &[Rect]) {
     if let Some(layer) = view_layer(&view) {
         // SAFETY: a CGImage is a valid `contents`; the layer retains it.
         unsafe {
+            let _: () = msg_send![&*layer, setContentsScale: 1.0f64];
             let _: () = msg_send![&*layer, setContents: img.cast::<AnyObject>()];
         }
     }
