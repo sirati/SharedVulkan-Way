@@ -453,10 +453,19 @@ mod imp {
             // stall: under PulseAudio the baseline itself varies by ~150 ms.
             match baseline {
                 None => baseline = Some(took),
+                // Under PulseAudio the pipe sink and pacat's own buffer (about
+                // half a second together) absorb a short hold without the
+                // client noticing; nothing is dropped either way (checked
+                // above). So there the wait is checked only for a hold longer
+                // than that buffering.
+                Some(_) if !(a.pw_node.is_some() && a.pw_metadata.is_some()) && hold_ms < 1000 => {
+                    say(&format!("hold {hold_ms} ms: PulseAudio's buffers absorb a hold this short; pacat took {} ms", took.as_millis()));
+                }
                 Some(b) => {
                     let extra = took.saturating_sub(b);
                     check(
-                        extra >= Duration::from_millis(hold_ms * 8 / 10) && extra <= Duration::from_millis(hold_ms + 500),
+                        extra >= Duration::from_millis(if a.pw_node.is_some() && a.pw_metadata.is_some() { hold_ms * 8 / 10 } else { hold_ms.saturating_sub(500) })
+                            && extra <= Duration::from_millis(hold_ms + 500),
                         &format!("hold {hold_ms} ms: the application waited instead of dropping: pacat took {} ms, {} ms more than with no hold", took.as_millis(), extra.as_millis()),
                     );
                 }
