@@ -227,7 +227,7 @@ pub fn up_in(runroot: &Path, arena: &Path, hubdir: &Path, id: &str, run: u64, in
     if let Err(e) = mk.and_then(|()| std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))) {
         return Some(Err(format!("up failed: {}: {e}", d.display())));
     }
-    let f = match std::fs::OpenOptions::new().read(true).write(true).open(&arena) {
+    let f = match std::fs::OpenOptions::new().read(true).write(true).open(arena) {
         Ok(f) => f,
         Err(e) => {
             return Some(Err(format!(
