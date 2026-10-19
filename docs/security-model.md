@@ -1279,3 +1279,91 @@ on, the seat takes `NAME=value` words after the mode, only from a fixed list,
 each checked for its kind (store paths for libraries and manifests,
 `safe_socket` for `SV_SOCKET` and `SV_BELL`, fixed values for the rest), and
 writes them as plasmashell's environment; anything else is refused.
+
+### R37 — Linux asks the host to open links and files, and the host offers Linux its applications
+Added 2026-10-19 with `waycompose-design.md` §105. Until §105 every request
+went one way: the host (Windows, macOS) asked Linux to run one of its
+applications (§94, R33). Host integration adds the other direction. A Linux
+application that calls `xdg-open https://…`, or a person who picks "Notepad
+(Windows)" in a Linux "Open with" dialog, makes the Linux side ask the host
+to open something. **Linux is the less trusted side here**: anything that
+runs as the session's user on Linux can write to the session's
+`hostint.sock`, and the proxy forwards each request to the host over the
+`OWNER_HOSTINT` ring slot. So the host is the boundary, and it checks every
+request as if it came from an attacker (`wc_hostint::host::Service`,
+`wc_hostint::openurl`).
+
+**What Linux can ask for, and nothing else.** Three requests, each naming a
+thing and never carrying a command (§94's rule, in the other direction):
+* `url`: a URL for the host's browser;
+* `path`: a host path for the host's default application for that file;
+* `with`: a URL or host path for one host application, named by an opaque
+  token that the host chose when it offered the application
+  (`[a-z0-9]{1,32}`). The host keeps the token's executable path or bundle
+  id, and nothing Linux sends is ever used as a program.
+
+**The checks, all on the host, before anything runs.**
+* The line is at most 256 KiB, and free text crosses only as base64 inside
+  one word, so a value cannot add a word, a request or a line.
+* A URL is at most 8 KiB. It must not contain any C0, C1 or DEL character,
+  checked *before* parsing, because the parser drops tabs and newlines
+  without a word. It is parsed by a real URL parser (the `url` crate) and
+  **re-serialised**: the host opens its own spelling. Its scheme must be on
+  the allowlist, compared case-insensitively. The default allowlist is
+  `http` and `https`. For `with`, the scheme must also be one the chosen
+  application registered, and `file`, `javascript`, `vbscript`, `data`,
+  `ms-*`, `search-ms` and `x-apple-systempreferences` are never allowed.
+* A host path must be absolute, inside a share that the host itself
+  exported to Linux (Windows `Z:\` = the VM's virtio-fs share; macOS the
+  user's home), at most 8 KiB, with no `..` component and no control
+  character. On Windows it must be a drive path: no UNC path, no `\\?\` or
+  `\\.\` device path, and no second `:` (no alternate data stream).
+* At most 10 opens in any 10 s. Refused requests do not count, so a flood
+  of junk cannot starve real clicks, but a flood of valid URLs cannot open
+  more than ten browser tabs.
+
+**How the host opens.** macOS: `/usr/bin/open -a <browser> -- <url>`,
+`/usr/bin/open -- <path>`, `/usr/bin/open -b <bundle id> -- <target>`.
+These are argv entries, never a shell, and `--` ends option parsing. Windows:
+`ShellExecuteW` with the explicit verb `open` on the URL or path, or
+`CreateProcessW` of the chosen handler's own executable with the target as
+one quoted argument. Never `cmd.exe`.
+
+**What a hostile Linux side can still do.** Open up to ten http(s) pages a
+minute in the host's browser, so a Linux program can show the user any web
+page. That is what a browser link does, and it is the feature. Open a file in
+the share with the host's default application for its type. That is a real
+lever: a share-writable `.html` opens in the host's browser, and on Windows
+a share-writable file of an *executable* type would run. **Hence a deny
+list for `path` and `with` on Windows:** extensions that `ShellExecute`
+would execute or install are refused, and the check is the one Windows
+itself uses for "unsafe" files: `AssocIsDangerous`, plus a fixed list for
+`.exe .com .bat .cmd .ps1 .vbs .js .jse .wsf .wsh .msi .msp .lnk .url
+.scr .hta .cpl .reg .inf .appref-ms .msc .jar .library-ms .settingcontent-ms`.
+On macOS, `open` of an app bundle, `.command`, `.terminal`, `.tool`, `.pkg`,
+`.mpkg`, `.workflow`, `.scpt` or `.app` path is refused. Gatekeeper's
+quarantine does not apply to files written through a share, so the list is
+needed there too.
+
+**The other direction (host to Linux) adds little.** A double-click in
+Explorer or Finder on a file that a Linux application registered for becomes
+the existing `open ID APP B64URL` control verb, with a `file:///` URL of the
+file's Linux path. §94 already checks that verb. §105 adds one check on the
+Linux side: a `file:///` URL must lie under a share root. Otherwise a holder
+of the host's control channel could make a Linux application display any
+Linux file (`~/.ssh/...`) in a window on the host. What the host registers
+is per user and per installation. It is a ProgID, `OpenWithProgids` entries,
+Capabilities, and a URL protocol only for a scheme that nothing on the
+system defines. Uninstall removes exactly what install wrote, as listed in a
+manifest whose entries are checked against the key shapes install writes.
+Defaults are never taken. Windows protects `UserChoice` and so do we. On
+macOS the bundles declare their types at rank `Alternate`.
+
+**Audio** crosses only as PCM on the sound ring and as a device list on the
+channel. The host chooses which devices exist, and Linux names its nodes
+after them (slugged). A hostile host could name a device anything; the name
+reaches PipeWire only as a quoted SPA string with control characters
+replaced. The microphone is captured only by the host's long-lived main
+process (macOS: bundle `org.waycompose.host`, after the user grants the TCC
+prompt once), never by a per-application process, and only while the
+session has a source node that a Linux client records from.
