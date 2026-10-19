@@ -1070,6 +1070,22 @@ start_app() {
   # where it is (their runtime directory is the session's).
   PULSEENV=""
   case "$AUDIO" in system*) PULSEENV="PULSE_SERVER=unix:/run/user/$UID_/pulse/native" ;; esac
+  # §106.7: TEST SESSIONS NEVER SEE THE USER'S APPLICATION STATE. An operator
+  # setting of this machine (never a word from the guest): with
+  # WC_LAUNCH_TEST_HOME=DIR the application gets DIR/{home,config,data,state,cache}
+  # as its HOME and XDG base directories, so an editor restores no real
+  # documents and a browser opens no real profile. Production sessions leave it
+  # unset: there the application is the user's, with the user's state.
+  TESTENV=()
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then
+    case "$WC_LAUNCH_TEST_HOME" in /*) ;; *) die "WC_LAUNCH_TEST_HOME must be absolute" ;; esac
+    [[ "$WC_LAUNCH_TEST_HOME" =~ ^[A-Za-z0-9/._-]+$ ]] || die "WC_LAUNCH_TEST_HOME: only [A-Za-z0-9/._-]"
+    mkdir -p "$WC_LAUNCH_TEST_HOME"/{home,config,data,state,cache}
+    TESTENV=(HOME="$WC_LAUNCH_TEST_HOME/home" XDG_CONFIG_HOME="$WC_LAUNCH_TEST_HOME/config"
+      XDG_DATA_HOME="$WC_LAUNCH_TEST_HOME/data" XDG_STATE_HOME="$WC_LAUNCH_TEST_HOME/state"
+      XDG_CACHE_HOME="$WC_LAUNCH_TEST_HOME/cache")
+    echo "wc-session: test session: HOME and XDG_* under $WC_LAUNCH_TEST_HOME" >>"$D/app.log"
+  fi
   setsid env -u DISPLAY \
     XDG_RUNTIME_DIR="$D/xdg" $PULSEENV \
     WAYLAND_DISPLAY="$D/wl-proxy" \
@@ -1079,6 +1095,7 @@ start_app() {
     "${CONFIG_ENV[@]}" \
     "${GPUENV[@]}" \
     "${DEF_ENV[@]}" \
+    "${TESTENV[@]}" \
     "${CMDV[@]}" >>"$D/app.log" 2>&1 &
   echo "run ok $! audio=${AUDIO%%[: ]*} titlebar=$DEF_TITLEBAR"
 }
