@@ -169,12 +169,22 @@ fn main() {
     if target_os == "linux" {
         println!("cargo:rerun-if-changed=shim/sv_wlshim.c");
         // Not `CC`: the dev shell sets that to the mingw compiler, for the
-        // Windows binaries. This is built for the Linux machine running cargo.
-        println!("cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_gnu");
+        // Windows binaries. This is built for the Linux target being compiled,
+        // which is the machine running cargo unless this is a cross build (an
+        // aarch64-linux guest built on x86_64): `CC_<target>` names its
+        // compiler, and the build machine's own only serves a native build.
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let host = std::env::var("HOST").unwrap_or_default();
+        let target_cc = format!("CC_{}", target.replace('-', "_"));
+        println!("cargo:rerun-if-env-changed={target_cc}");
         println!("cargo:rerun-if-env-changed=CC_FOR_BUILD");
-        let cc = std::env::var("CC_x86_64_unknown_linux_gnu")
-            .or_else(|_| std::env::var("CC_FOR_BUILD"))
-            .unwrap_or_else(|_| "gcc".into());
+        let cc = std::env::var(&target_cc).unwrap_or_else(|_| {
+            if target == host {
+                std::env::var("CC_FOR_BUILD").unwrap_or_else(|_| "gcc".into())
+            } else {
+                format!("{target}-gcc")
+            }
+        });
         let shim = profile_dir.join("libsv_wlshim.so");
         let status = std::process::Command::new(&cc)
             .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", "-fvisibility=hidden", "-o"])
