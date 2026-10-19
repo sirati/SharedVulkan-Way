@@ -2,7 +2,7 @@
 # §103.6, §103.11: a Linux Vulkan client on this workstation, rendered by
 # sv-gpu-server inside the macOS VM, frames back through guest RAM.
 #
-#   scripts/mac-gpu.sh [probe|present|compute|both]     (default: both)
+#   scripts/mac-gpu.sh [probe|present|compute|window|both]     (default: both)
 #
 #   probe   : in the VM, `sv-guest gpu probe` against lavapipe, against MoltenVK
 #             alone (no Metal: the server must say so and exit 1, not crash),
@@ -19,6 +19,11 @@
 #   compute : the same path with sv-compute-e2e as the client: a compute shader
 #             dispatched over the rings, run by lavapipe in the VM, its output
 #             read back on this side through the arena and checked.
+#   window  : the same GPU session, and vkcube --wsi wayland as the client of
+#             scripts/mac-window.sh: drawn by lavapipe in the VM, presented by
+#             sv-icd as Wayland buffers through wc-proxy's arena to the macOS
+#             compositor, a window on the VM's desktop. WC_SECS (40),
+#             WC_SHOT_AFTER (15) and MAC_GPU_CUBE_FRAMES (vkcube --c, 400) apply.
 #
 # Env: MACVM_INSTANCE (wayland-host), MAC_GPU_PORT (57460), MAC_GPU_ARENA_MIB (64),
 #      VK_PRESENT_PROBE_FRAMES / _W / _H (passed through; 3 frames of 256x256),
@@ -86,8 +91,16 @@ if [ "$what" = probe ] || [ "$what" = both ]; then
   grep -q 'rc=0' "$run/probe-both.log" || fail=1
 fi
 
-if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ]; then
-  if [ "$what" = compute ]; then
+if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$what" = window ]; then
+  idle=30
+  if [ "$what" = window ]; then
+    # vkcube dlopens libwayland-client; mac-window.sh runs its client outside
+    # the dev shell, so the library's directory is passed along.
+    read -r probe wllib < <(cd "$root" && nix develop -c bash -c \
+      'echo "$(command -v vkcube) $(pkg-config --variable=libdir wayland-client)"' 2>/dev/null | tail -1)
+    [ -x "$probe" ] || { say "no vkcube in the dev shell"; exit 2; }
+    dump=0; idle=120
+  elif [ "$what" = compute ]; then
     probe="$root/target/debug/sv-compute-e2e"; dump=0
     [ -x "$probe" ] || { say "build first: cargo build -p sv-gpu-server --bin sv-compute-e2e"; exit 2; }
   else
@@ -96,7 +109,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ]; then
       > "$run/cc.log" 2>&1 || { say "vk-present-probe did not build"; tail -5 "$run/cc.log"; exit 1; }
   fi
   vm "pkill -f 'sv-guest gpu guest --port' 2>/dev/null; rm -rf /tmp/wcgpu; mkdir -m 700 /tmp/wcgpu; cd /tmp/wcgpu; ulimit -c 0; \
-      VK_DRIVER_FILES=$LVP nohup ~/wc/bin/sv-guest gpu guest --port $gport --arena $arena --idle 30 \
+      VK_DRIVER_FILES=$LVP nohup ~/wc/bin/sv-guest gpu guest --port $gport --arena $arena --idle $idle \
       > /tmp/wcgpu/gpu.log 2>&1 < /dev/null &"
   for _ in $(seq 1 60); do vm 'grep -q "publishing the extent" /tmp/wcgpu/gpu.log 2>/dev/null' && break; sleep 0.5; done
   vm 'cat /tmp/wcgpu/gpu.log' > "$run/gpu.log"
@@ -114,9 +127,19 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ]; then
   t0=$(date +%s.%N)
   dumpenv=()
   [ "$dump" = 1 ] && dumpenv=(SV_PRESENT_DUMP="$run/f/got-" VK_PRESENT_PROBE_EXPECT="$run/f/want-")
-  ( cd "$run" && nix develop "$root" -c env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" \
-      "${dumpenv[@]}" timeout 180 "$probe" ) > "$run/app.log" 2>&1
-  rc=$?
+  if [ "$what" = window ]; then
+    WC_SECS=${WC_SECS:-40} WC_SHOT_AFTER=${WC_SHOT_AFTER:-15} "$root/scripts/mac-window.sh" \
+      env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" LD_LIBRARY_PATH="$wllib" \
+      "$probe" --wsi wayland --width 400 --height 300 --c "${MAC_GPU_CUBE_FRAMES:-400}" > "$run/app.log" 2>&1
+    rc=$?
+    cp /mnt/datasets/builds/wcrun/mac-last/client.log "$run/client.log" 2>/dev/null
+    sed 's/^/  /' "$run/app.log"
+    grep -E '^\[icd\]|sv-icd:|rror' "$run/client.log" 2>/dev/null | head -8 | sed 's/^/  client: /'
+  else
+    ( cd "$run" && nix develop "$root" -c env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" \
+        "${dumpenv[@]}" timeout 180 "$probe" ) > "$run/app.log" 2>&1
+    rc=$?
+  fi
   t1=$(date +%s.%N)
   grep -E '^\[icd\]|^swapchain|^frame|^timing|PASS|FAIL|pass|fail|device|words|checked' "$run/app.log" | head -20 | sed 's/^/  /'
   same=0; differ=0

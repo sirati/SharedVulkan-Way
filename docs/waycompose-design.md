@@ -31821,6 +31821,48 @@ reserved for ML work and has no macOS driver anyway. So, for the VM:
   in software, and its `wl_shm` frames reach macOS through the arena. That is
   the same pixel path every client without a forwarded GPU already takes.
 
+**The server on macOS, as built.** `sv-gpu-server guest --port P` (the same
+arguments through `sv-guest gpu`) is the Windows guest path (`win_guest`) with
+one change: the extent comes from `wc_handle::arena::alloc_guest_ram_window`,
+the compositor's allocator. That means superpages where XNU has them and wired
+4 KiB pages where it does not (103.3), stamped with `arena_record`'s page. The
+cold path is a TCP listener on 127.0.0.1. On Linux, an ssh forward turns it into
+the Unix socket that `sv-hostd qemu-serve --cold` reads, and `sv-hostd` locates
+the extent in QEMU's memfd over QMP. After the host's `Accept`, the server
+imports the arena with `VK_EXT_external_memory_host` and serves one session.
+The Windows guest's pool path (§97) is not ported, because it needs an ivshmem
+BAR as region 0. A session per process is what macOS has.
+
+* **Portability.** `Driver::open` enables `VK_KHR_portability_enumeration` and
+  sets `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR` whenever the loader
+  offers the extension. Without them, the loader hides every ICD whose manifest
+  says `is_portability_driver`, and MoltenVK and KosmicKrisp both do.
+  `VK_KHR_portability_subset` is enabled on any device that lists it, as the
+  specification requires. An `INCOMPATIBLE_DRIVER` from `vkCreateInstance` is
+  reported in words: on a Mac VM, the cause is no Metal.
+* **The loader.** On macOS it is found without `DYLD_LIBRARY_PATH`:
+  `SV_VULKAN_LOADER`, then the dynamic linker's search, then `/usr/local`,
+  MacPorts' `/opt/local` and Homebrew's `/opt/homebrew`. `VK_DRIVER_FILES`
+  still chooses the ICD.
+* **The device order.** Without `--device`, the macOS entry takes KosmicKrisp,
+  then MoltenVK, then any other discrete, integrated or virtual GPU, and a CPU
+  device (lavapipe) last. With `SV_GPU_PREFER=cpu`, the CPU device comes first.
+  The order is `driver::device_rank`, and it is unit-tested. Linux and Windows
+  keep `--device N`, default 0.
+* **Waiting.** `sv_transport::park`'s fallback on macOS is a sleep of at most
+  200 µs, and it stays that way. A real address wait (`__ulock_wait`,
+  `os_sync_wait_on_address`) would be cheap to write. But the producer on this
+  path is the Linux host, across the VM boundary, and its wake cannot reach a
+  ulock in the guest. A real wait would therefore run out every slice, which
+  is the 216.9 ms §36.6 measured on a Linux guest without a doorbell. The poll
+  costs up to 200 µs of latency per wait. It also wakes a parked thread about
+  5,000 times a second, but only while that thread is inside a wait with a
+  deadline. The fix is §103.4's doorbell (`--bell`, a legacy virtio-serial
+  port), not a different sleep.
+* **MoltenVK on real Metal** imports host memory for buffers only (see above).
+  The server's arena is a buffer import, so the same code should work there.
+  That is unproven: there is no Metal here.
+
 ### 103.7 Wayland onto AppKit, and what cocoa-way contributes
 
 cocoa-way (J-x-Z/cocoa-way, 2.1.0, last commit 2026-10-14) is a smithay
@@ -32023,3 +32065,8 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | keyboard: `scripts/mac-input.sh` types through QEMU's USB keyboard (QMP), into weston-terminal on Linux | 4 GiB VM | `echo mac-input-ok_42` ran and printed `mac-input-ok_42`; before the `sealed_file.rs` fix below, no key reached the client (`0 out` descriptors at the proxy: no keymap) |
 | **Firefox from its Dock tile**: `scripts/mac-launch-install.sh` (host: wc-session with a private sshd on 127.0.0.1:22422 that holds only the guest's forced-command key; guest: three bundles, pinned), then `open Firefox.app` | 4 GiB VM, Firefox on this workstation in software GL (Mesa only, never the RTX 5090) | compositor up 0.38 s after the click, arena located 0.43 s (16384/16384), proxy and PulseAudio null sink, `run ok` 1.2 to 1.4 s after the click; menu bar "Firefox", the fox in the Dock with its running dot; maximised to the work area, fully drawn, traffic lights in the corner the tab strip leaves (Sonnet checks of five screenshots); Quit closes the window, the session goes `down ok` and the process exits |
 | **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |
+| GPU: `scripts/mac-gpu.sh probe`, `sv-guest gpu probe` in the VM | 4 GiB VM | lavapipe (Mesa 26.2.3, driverID 13): opened with host-pointer import. MoltenVK alone: the loader enumerates it with the portability bit, MoltenVK says "requires Metal", and the server exits 1 with the reason (no crash). Both together: the loader skips MoltenVK (-9) and the server takes lavapipe. The loader was found without `DYLD_LIBRARY_PATH` |
+| GPU: `scripts/mac-gpu.sh present`, `vk-present-probe` on this workstation through `sv-icd`, the server in the VM on lavapipe | 4 GiB VM | extent of 80 MiB, `pinning=wired`, located in 0.41 to 0.55 s (20480/20480 pages, 4,152 to 16,492 runs); 3 frames of 256x256 byte-identical to what the probe drew. 120 frames of 1280x720: 2.03 ms a frame with the present in the call, 1.10 ms pipelined. Ring waits mean 0.39 ms |
+| GPU: `scripts/mac-gpu.sh compute`, `sv-compute-e2e` | 4 GiB VM | a compute dispatch by lavapipe in the VM; 245,760 payload words read back through the arena, 0 wrong |
+| GPU: `scripts/mac-gpu.sh window`, `vkcube --wsi wayland` 400x300 through `sv-icd`, rendered by lavapipe in the VM, presented as arena slices to the macOS compositor (`scripts/mac-window.sh`) | the VM's desktop | 400 and 2000 frames ran to completion; about 350 frames/s marginal (1600 more frames took 4.5 s more session time). A Sonnet check of the QMP screendump: a "vkcube" window of about 400x300 with a textured, upright cube, correct colours, content filling the window |
+| GPU: pipelined headless present (`SV_PRESENT_SYNC` unset) | the VM, and this workstation with RADV and no VM | the dump of frame N holds frame N+1's pixels, and the last frame is right. This is the same on Linux, so it is an `sv-icd` headless-dump matter, not this path's. `mac-gpu.sh` presents in the call by default |
