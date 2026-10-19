@@ -1,4 +1,4 @@
-//! §105 on macOS: the main process's host integration, kept out of `mac.rs`
+//! §106 on macOS: the main process's host integration, kept out of `mac.rs`
 //! so that file only calls in.
 //!
 //! * [`start`]: once the host has claimed the `OWNER_HOSTINT` ring slot, serve
@@ -74,9 +74,8 @@ pub fn start(ch: ByteChannel, cfg: &Config, mut say: Say) {
         }
     });
     say(&format!("hostint: serving, browser {:?}, share {:?}", opener.browser, path_map(cfg)));
-    // Until the rings have a doorbell this side can sleep on (macos-zero-copy),
-    // a short sleep: the channel carries a few lines a minute.
-    let wait: wc_compositor::hostint::Wait = Box::new(|_ch, t| std::thread::sleep(t.min(Duration::from_millis(20))));
+    // Sleeps on the lane's doorbell (macos-zero-copy), not a poll.
+    let wait = wc_compositor::hostint::doorbell_wait();
     if let Err(e) = wc_compositor::hostint::spawn(ch, wait, svc, Box::new(opener), rx, say) {
         eprintln!("wc-launch: hostint: {e}");
     }
@@ -119,6 +118,7 @@ pub fn map_open_key(cfg: &Config, key: &str) -> Result<String, String> {
 /// wc-launch --hostint-probe            devices, defaults, nodes, handlers
 /// wc-launch --render-test UID|- MS     play a 440 Hz tone to one device
 /// wc-launch --bundle-test DIR [--keep] a Linux bundle registers for .txt/.html/https
+/// wc-launch --host-bundle-test DIR    the main process's bundle, in DIR
 /// wc-launch --capture-test UID|- MS    record from one (only in the host
 ///                                      bundle: turns a microphone on)
 /// ```
@@ -127,6 +127,28 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
     if args.iter().any(|a| a == "--hostint-probe") {
         print!("{}", wc_hostplat::mac::probe());
         return Some(ExitCode::SUCCESS);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--open-test") {
+        let root = args.get(i + 1).cloned().unwrap_or_default();
+        for l in open_test(&root, &args[(i + 2).min(args.len())..]) {
+            println!("{l}");
+        }
+        return Some(ExitCode::SUCCESS);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--host-bundle-test") {
+        // The main process's bundle in a scratch folder, for a TCC test.
+        let dir = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp/wc-bundle-test"));
+        let r = std::env::current_exe().map_err(|e| e.to_string()).and_then(|e| install_host_bundle_at(&dir.join(HOST_BUNDLE), &e));
+        return Some(match r {
+            Ok(b) => {
+                println!("{}", b.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("wc-launch: {e}");
+                ExitCode::from(1)
+            }
+        });
     }
     if let Some(i) = args.iter().position(|a| a == "--bundle-test") {
         let dir = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp/wc-bundle-test"));
@@ -153,6 +175,49 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
             ExitCode::from(1)
         }
     })
+}
+
+/// Linux's requests as the ring would carry them, through the same
+/// `Service` and `MacOpener` the main process uses, with `root` as the only
+/// share. Each argument is `url:<url>`, `path:<host path>` or
+/// `with:<bundle id>:<url or host path>` (the bundle id is turned into the
+/// token the host offers it under, as Linux would name it). Returns the
+/// request and reply lines.
+fn open_test(root: &str, reqs: &[String]) -> Vec<String> {
+    use wc_hostint::host::Opener;
+    use wc_hostint::wire::{Msg, Req, Target};
+    let mut svc = Service::new(SvcConfig {
+        platform: "macos",
+        schemes: wc_hostint::openurl::default_schemes(),
+        paths: PathMap { shares: vec![(root.to_string(), "/linux/share".into())], drop: None },
+        windows_paths: false,
+    });
+    let hs = wc_hostplat::mac::handlers::handlers();
+    let token_of = |bid: &str| hs.iter().find(|h| h.app.eq_ignore_ascii_case(bid)).map(|h| h.offer.token.clone());
+    svc.handlers(hs.clone());
+    let mut opener = MacOpener::default();
+    let mut out = vec![format!("browser {:?} installed: {}", opener.browser, wc_hostplat::mac::open::app_installed(&opener.browser))];
+    for (n, r) in reqs.iter().enumerate() {
+        let target = |t: &str| if t.starts_with('/') { Target::HostPath(t.into()) } else { Target::Url(t.into()) };
+        let req = if let Some(u) = r.strip_prefix("url:") {
+            Req::Url(u.into())
+        } else if let Some(p) = r.strip_prefix("path:") {
+            Req::Path(p.into())
+        } else if let Some((bid, t)) = r.strip_prefix("with:").and_then(|x| x.split_once(':')) {
+            Req::With { token: token_of(bid).unwrap_or_else(|| "nosuchtoken".into()), target: target(t) }
+        } else {
+            out.push(format!("{r}: not url:, path: or with:"));
+            continue;
+        };
+        let line = Msg::Req { n: n as u64 + 1, req }.encode();
+        let reply = svc.on_line(&line, &mut opener as &mut dyn Opener, std::time::Instant::now());
+        let shown = match reply.as_deref().map(Msg::decode) {
+            Some(Ok(Msg::Rep { result, .. })) => format!("{result:?}"),
+            other => format!("{other:?}"),
+        };
+        out.push(format!("{r} -> {shown}"));
+    }
+    out
 }
 
 const LSREGISTER: &str =
@@ -262,7 +327,12 @@ pub fn host_bundle() -> PathBuf {
 /// is a new identity to TCC and the microphone is asked for again; a signed
 /// deployment (the real Mac's Nix activation) keeps the grant.
 pub fn install_host_bundle(exe: &Path) -> Result<PathBuf, String> {
-    let b = host_bundle();
+    install_host_bundle_at(&host_bundle(), exe)
+}
+
+/// [`install_host_bundle`] at another place (`--host-bundle-test`).
+pub fn install_host_bundle_at(b: &Path, exe: &Path) -> Result<PathBuf, String> {
+    let b = b.to_path_buf();
     let macos = b.join("Contents/MacOS");
     std::fs::create_dir_all(&macos).map_err(|e| e.to_string())?;
     std::fs::write(b.join("Contents/Info.plist"), host_info_plist()).map_err(|e| e.to_string())?;
