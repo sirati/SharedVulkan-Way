@@ -33554,3 +33554,126 @@ a `file:///` URL. Opening for Linux uses `ShellExecuteW` with the verb
 `application:openURLs:` hands each URL to the main process, which sends the
 `open` verb. Opening for Linux uses `/usr/bin/open -a <browser> -- <url>`,
 `/usr/bin/open -- <path>`, or `/usr/bin/open -b <bundle id> -- <target>`.
+
+### 106.5 Under PipeWire, a node that drives its own graph
+
+§103.16's pipe sink is paced by its reader under a real PulseAudio. Under
+PipeWire's pulse server it is not. The module's stream is clocked by
+whatever drives the graph, normally the dummy driver, and when the proxy
+stops reading because the device side has granted no credit, the FIFO fills
+and the module drops what does not fit. So under PipeWire each host device
+is a node of `wc-pw-node`, a small C program (`crates/wc-proxy/pw-node`,
+built by the flake as `.#wc-pw-node`; its RUNPATH is the store's
+libpipewire, so the VM host needs its closure and not an installed
+PipeWire). It hosts all of a session's devices. Each one is a `pw_stream`
+with `PW_STREAM_FLAG_DRIVER`, as `Audio/Sink` or `Audio/Source`. A timer at
+the quantum's period calls `pw_stream_trigger_process` only when the
+output's credit covers a cycle, or when an input has a cycle of the
+microphone's samples. While credit is held, no cycle runs, and the
+application's stream waits as it would on a real device that is behind.
+`sound.rs` starts it when `pactl info` names a PipeWire server and talks to
+it on its stdin and stdout, in the sound ring's own frames. Start and Stop
+of a microphone follow the node's state (streaming or paused). On a real
+PulseAudio, `sound.rs` keeps §103.16's pipe modules.
+
+Measured (scripts/wc-hostint-local.sh, a private PipeWire 1.6.9, a fake
+device side that plays in real time from a 250 ms queue, a 1.5 s signal of
+288,000 bytes with no zero frame, credit held in the middle):
+
+| credit held | lost, pipe modules under PipeWire | lost, `wc-pw-node` | pacat longer than without a hold |
+|---|---|---|---|
+| 0.1 s | 0 | 0 | +127 ms |
+| 0.4 s | 45,056 B (15.6%) | 0 | +427 ms |
+| 1 s | 159,744 B (55%) | 0 | +1024 ms |
+
+With `wc-pw-node` the bytes that arrive are the bytes played, contiguous,
+with nothing inserted. Under `on` (PulseAudio 17) nothing is lost either,
+and pacat waits for the hold. PulseAudio inserts 12,288 bytes of silence
+near the start of every stream (its own start-up underrun), so there the
+check is that every frame arrives, in order.
+
+Two bugs in shared code were found by these runs. PulseAudio 17's
+`module-pipe-source` refuses a FIFO that exists, and `sound.rs` made it
+first, so no microphone loaded under `on`. The session's PulseAudio also
+reached the user's session bus through `$XDG_RUNTIME_DIR/bus`, even with
+`DBUS_SESSION_BUS_ADDRESS` unset. A second session's PulseAudio then died
+with "org.PulseAudio1 already taken", so `pulse.sh` now names a bus that
+does not exist.
+
+### 106.6 The macOS VM's share
+
+On the real Mac the Linux VM mounts the Mac user's home at the same path
+over libkrun's virtio-fs. In the macOS VM of role (a), Linux runs QEMU, so
+the share goes the other way: a Linux directory
+(`/mnt/datasets/macvm/shares/<instance>`) is exported to macOS by
+`virtiofsd` (vhost-user-fs) and mounted at `~/LinuxShare`. §103.3 says that
+Sonoma under QEMU binds only legacy virtio devices. That is wrong: modern
+virtio-fs, 9p and virtio-sound all bind. What it takes:
+
+* `virtiofsd --sandbox=namespace --uid-map :0:$UID:1: --gid-map :0:$GID:1:
+  --translate-uid map:501:0:1 --translate-gid map:20:0:1`, unprivileged.
+  `--inode-file-handles` needs a capability it does not have and is left off,
+  with no problem seen.
+* `mount_virtiofs -u 501 -g 20 <tag> ~/LinuxShare`. Without `-u`/`-g`, every
+  create fails with EINVAL; with `--sandbox=none`, with EPERM.
+* `--xattr --xattrmap ":prefix:all::user.virtiofs.::bad:all:::"`. Without
+  xattrs, every Launch Services open of a file in the share fails with -4:
+  its `Getxattr` is answered ENOSYS.
+* macOS treats the mount as a network volume. TCC never lets a process of
+  an ssh session in, and asks once for `org.waycompose.host`.
+* `std::fs::copy` on macOS is `fcopyfile`, which the share does not support
+  (ENOSYS), so the copy into the drop directory is a plain read and write.
+
+9p mounts only as root (`/Volumes/...`), and its access fails.
+
+### 106.7 What was run
+
+**Linux, without a VM** (`scripts/wc-hostint-local.sh`, a private
+PipeWire stack and a private PulseAudio, never the desktop's): a fake device
+side announcing two outputs and a microphone with real names. 49 checks pass
+under PipeWire and 44 under PulseAudio:
+* the names are the slugs, and the descriptions the names (ö and ®
+  included);
+* a host default change is the session's default 25 ms later;
+* hot-plug adds and removes nodes, and a second device of the same name gets
+  `_2`;
+* the credit holds above;
+* a recorder on the source starts capture about 0.3 s later and stops it
+  when it ends;
+* `wc-host-open https://…` arrives as `req N url`, and the host's refusal is
+  printed with exit 1;
+* a Linux-only file is refused before anything is sent (exit 2);
+* `--with` on a Linux-only file copies it into the drop directory and sends
+  the host path.
+
+Evidence: `/mnt/datasets/builds/evidence/host-integration/linux-local/`.
+
+**The macOS VM** (Sonoma, 4 GiB, a real Linux session from the workstation,
+with a temporary QEMU usb-audio, virtio-sound and virtio-fs). Each image was
+judged by a fresh Sonnet agent; evidence is in
+`/mnt/datasets/builds/evidence/host-integration/mac-e2e/`:
+* **Audio.** Two sinks and a source,
+  `mac.sink.apple_virtual_sound_device`, `mac.sink.audio_output_-_disabled`
+  and `mac.source.apple_virtual_sound_device`, described by the Mac's
+  names. When the Mac's default output changed, the session's default sink
+  followed 66 ms later, and 106 ms later on the change back. A 3 s tone
+  played. `parec` from the source started the Mac's recorder and got
+  794,880 bytes in 5 s. TCC asked "“Waycompose Host” would like to access
+  the microphone".
+* **Linux to Mac.** `xdg-open https://example.org` opened Safari (this VM
+  has no Firefox, so the opener fell back to the default browser).
+  `xdg-open file:///etc/passwd` and a Linux-only file were refused: "… is
+  not in a folder the macOS desktop can see (…); only files there open on
+  macOS. Move it there, or use "Open with" and a macOS application, which
+  opens a copy."
+* **Mac to Linux.** A Mac file opened with the Linux Text Editor's bundle
+  reached the face's `application:openURLs:`. It was copied into the share's
+  drop directory and opened in the Linux Text Editor at its Linux path,
+  with no extra empty window.
+* **Linux "Open with" a Mac application.** `wc-host-open --with <TextEdit's
+  token>` on a file in the share opened it in TextEdit.
+* The generated bundle is in Finder's "Open With" for `.txt` and `.html`. It
+  is never offered back to Linux, and it is gone after unregistering. The
+  opener refused `javascript:`, `/etc/hosts`, an `.app`, a renamed bundle
+  and a symlink to a bundle. A `.txt` whose Mac default is a Linux bundle was
+  refused, so a file cannot bounce back to Linux.
