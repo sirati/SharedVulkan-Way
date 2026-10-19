@@ -32271,9 +32271,12 @@ The frames did not get faster, and they could not: no frame ever crossed ssh.
 The cold path lost the forward's ~0.2 s. Every result passed: `present`
 (3 frames byte-identical, nine runs), `compute` (245,760 words, 0 wrong) and
 `window` (vkcube 400x300 mapped through the compositor's arena slice, 7,051
-commands). The visual check of the window was not done: from about 12:29 on,
-every QMP screendump of the VM is entirely black, including one taken with
-nothing of this run alive.
+commands). A Sonnet check of the QMP screendump passed: a "vkcube" window with
+about 400x300 of content, the textured LunarG cube shaded per face and upright,
+the clear colour edge to edge, and no stripes or channel swap. The first two
+screendumps were entirely black. The cause was the VM's idle screen saver,
+whose Aerial content this GPU-less WindowServer cannot composite; it is now
+disabled for the user.
 
 **How the GPU path crosses the boundary, per channel, and its copies per
 frame:**
