@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 
 /// Where libdrm looks.
 pub const SYS_DEV_CHAR: &str = "/sys/dev/char";
+/// X11's socket directory, made ours inside the namespace (Xwayland).
+pub const X11_UNIX: &str = "/tmp/.X11-unix";
 /// The faux device's name, which libdrm reports in `businfo.faux->name`.
 pub const FAUX_NAME: &str = "svdrm";
 
@@ -201,6 +203,17 @@ pub fn setup(cfg: &NsConfig) -> io::Result<()> {
     overlay(SYS_DEV_CHAR, &plan)?;
     if let Some(n) = &cfg.test_node {
         test_node(n, cfg.minor)?;
+    }
+    // 2b: X11's socket directory, ours. In this namespace the host's
+    // root-owned /tmp/.X11-unix shows as the overflow uid, and
+    // kwin_wayland_wrapper refuses to make Xwayland's sockets in a directory
+    // "not owned by root or us" — the nested session had no X11 at all
+    // (waycompose-design.md §104). A tmpfs made here belongs to us; X11
+    // clients outside the namespace still reach Xwayland through its abstract
+    // socket, which the mount namespace does not hide. Skipped when there is
+    // no such directory.
+    if Path::new(X11_UNIX).is_dir() {
+        mount(Some("svdrm-x11"), X11_UNIX, Some("tmpfs"), TMPFS_FLAGS, Some("mode=1777,size=64k"))?;
     }
 
     // 3: back to the real ids, in a user namespace nested in the first. We are

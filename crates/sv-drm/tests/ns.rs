@@ -39,6 +39,8 @@ test "$(realpath /sys/dev/char/1:3)" = /sys/devices/virtual/mem/null
 test "$(ls /sys/dev/char | wc -l)" -gt 10
 if touch /sys/dev/char/x 2>/dev/null; then echo writable; exit 1; fi
 grep -q '^CapEff:\s*0000000000000000$' /proc/self/status
+# Xwayland's wrapper wants /tmp/.X11-unix "owned by root or us".
+if [ -d /tmp/.X11-unix ]; then test "$(stat -c %u /tmp/.X11-unix)" = "$(id -u)"; fi
 echo "ids $(id -u) $(id -g)"
 "#
     );
