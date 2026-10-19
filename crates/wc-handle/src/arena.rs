@@ -765,6 +765,39 @@ pub fn attach_ivshmem_window(id: u32, base: u32, offset: u64, len: u64) -> io::R
     Ok(())
 }
 
+/// §110: register memory this process already maps, and keeps mapped for its
+/// life, as arena `id`: a base that [`attach_ivshmem_window`] can cut windows
+/// of. The shared compositor that also runs the GPU pool registers the GPU
+/// device's BAR this way, so that a Wayland buffer leased from that pool is a
+/// window of it like any window of its own BAR. No new mapping (the driver
+/// gives one per device, and the GPU pool holds it), nothing unmapped at the
+/// end.
+///
+/// # Safety
+/// `ptr` must be valid for reads of `len` bytes for the rest of the process.
+pub unsafe fn register_borrowed_base(id: u32, ptr: *const u8, len: usize, origin: String) -> io::Result<()> {
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    if guard.contains_key(&id) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("arena {id} is already attached")));
+    }
+    guard.insert(
+        id,
+        Attached { view: Arc::new(platform::MappedView::borrowed(ptr)), len, origin, provided: false, base: 0, fixed: true },
+    );
+    Ok(())
+}
+
+/// §110: map the file at `path` read-write for the rest of the process and
+/// return its address: a file standing in for another device's BAR in a
+/// harness, made a pool region with [`register_borrowed_base`].
+pub fn map_file_for_region(path: &std::path::Path, len: u64) -> io::Result<*const u8> {
+    let len = usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too large"))?;
+    let view = platform::map_file_mut(&path.to_string_lossy(), len)?;
+    let ptr = view.ptr();
+    std::mem::forget(view);
+    Ok(ptr)
+}
+
 /// §107: forget a window [`attach_ivshmem_window`] registered. Refuses
 /// anything that is not one.
 pub fn detach_ivshmem_window(id: u32) -> io::Result<()> {
@@ -2238,6 +2271,24 @@ mod tests {
     // the header's placement and order, that the arena starts after it, and
     // the refusals; what it cannot is that a driver maps anything, which is a
     // guest's claim (docs/waycompose-design.md §83).
+
+    /// §110: memory another part of the process maps (the GPU device's BAR)
+    /// is a base windows are cut from, with no mapping of its own.
+    #[test]
+    fn a_borrowed_base_is_windowed_without_a_mapping_of_its_own() {
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 3 * 4096].into_boxed_slice());
+        buf[4096..4100].copy_from_slice(b"GPU!");
+        // SAFETY: a leaked buffer, valid for the rest of the process.
+        unsafe { register_borrowed_base(9400, buf.as_ptr(), buf.len(), "test".into()) }.unwrap();
+        // SAFETY: as above.
+        assert!(unsafe { register_borrowed_base(9400, buf.as_ptr(), buf.len(), "again".into()) }.is_err());
+        attach_ivshmem_window(9401, 9400, 4096, 4096).unwrap();
+        let m = Handle::from_descriptor(Descriptor::ArenaSlice { arena: 9401, offset: 0, len: 4 }).map().unwrap();
+        assert_eq!(m.as_slice(), b"GPU!");
+        assert!(attach_ivshmem_window(9402, 9400, 8192, 8192).is_err(), "past the base");
+        detach_ivshmem_window(9401).unwrap();
+        assert!(detach_ivshmem_window(9400).is_err(), "the base itself is never detached");
+    }
 
     #[test]
     fn an_ivshmem_region_puts_the_header_first_and_the_arena_after_it() {

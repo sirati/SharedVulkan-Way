@@ -86,6 +86,9 @@ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$D/wrong.key"
 
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
 export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=600
+# §110: the file leg 7 makes as the GPU device; wc-session passes it to the
+# proxy as region 1 once it exists.
+export WC_LAUNCH_GPU_REGION="$D/gpu"
 PACAT=$(ls /nix/store/*-pulseaudio-1*/bin/pacat 2>/dev/null | head -1)
 [ -n "$PACAT" ] || export WC_LAUNCH_AUDIO=off
 
@@ -109,13 +112,13 @@ start_service() {
 }
 # compositor TAG [MIB]: the user's one compositor, with no session of its own.
 start_compositor() {
-  local tag=$1 mib=${2:-128}
+  local tag=$1 mib=${2:-128} region=${3:-}
   rm -f "$D/arena" "$D/user.ctl"
   truncate -s $((mib << 20)) "$D/arena"
   XDG_RUNTIME_DIR="$D/crt" WC_IVSHMEM_STANDIN="$D/arena" "$BIN/wc-compositor" \
     --arena-ivshmem 0 --arena-outbound 0:1048576 --wayland-rings "$D/guest.sock" \
     --socket "wcm$$-$tag" --in-band --timeout 600 --exit-when-empty $LINGER \
-    --user-control "$D/user.ctl" --singleton "wc-multi-$$" >"$D/comp-$tag.log" 2>&1 &
+    --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
   wait_line "$D/comp-$tag.log" 'user control socket' 20 || bad "compositor $tag: no user control socket"
 }
@@ -136,6 +139,9 @@ held_by() { # COMPLOG INDEX: MiB granted to session INDEX, as the compositor log
   grep -o "arena: session $2 granted region [^:]*: [0-9]* MiB at [0-9]* MiB" "$1" | awk '{s+=$7} END {print s+0}'
 }
 
+if [ -n "${WC_MULTI_ONLY_ONE_POOL:-}" ]; then start_port; start_hub; start_service; COMP=; fi
+
+if [ -z "${WC_MULTI_ONLY_ONE_POOL:-}" ]; then
 say "leg 1: one compositor, three installations booted at once"
 start_port; start_hub; start_service
 start_compositor 1
@@ -265,6 +271,35 @@ ok "regions: $(grep -o 'granted region [^(]*' "$D/comp-3.log" | tr '\n' ';')"
 for t in a b; do R=$(request "${t}s" "raw status"); case "$R" in ok-raw*) ;; *) bad "small BAR, status $t: $R" ;; esac; done
 ok "the sessions that have regions still answer: $(sessions)"
 for t in a b c; do request "${t}s" "raw down" >/dev/null; done
+
+fi
+say "leg 7: one pool (§110): a 32 MiB BAR with a 256 MiB region beside it standing in for the GPU device"
+sleep $((LINGER + 1))
+kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+kill "$PORT" 2>/dev/null; start_port
+truncate -s $((256 << 20)) "$D/gpu"
+start_compositor 4 32 "$D/gpu"
+wait_line "$D/comp-4.log" 'pool region 1 ' 10 && ok "$(grep -m1 -o 'sessions: pool region 1.*' "$D/comp-4.log" | cut -c1-120)" || bad "no pool region 1"
+BEFORE=$(grep -c ' mapped ' "$D/comp-4.log")
+for t in a b c; do
+  R=$(boot "${t}p" "wcm$t" "$D/guest-wcm$t.key"); case "$R" in ok\ located*) ;; *) bad "one-pool boot $t: $R" ;; esac
+  request "${t}p" "raw run shm 96 30" >/dev/null
+  keep_log "$D/run/wcm$t-$$-${t}p/proxy.log" "$D/proxy-${t}p.log"
+  keep_log "$D/run/wcm$t-$$-${t}p/app.log" "$D/app-${t}p.log"
+done
+sleep 5
+G0=$(grep -c 'granted region .* at [0-9]* MiB (it holds' "$D/comp-4.log"); G1=$(grep -c 'of pool region 1' "$D/comp-4.log")
+MAPPED=$(( $(grep -c ' mapped ' "$D/comp-4.log") - BEFORE ))
+[ "$G1" -ge 1 ] && ok "BAR grants $G0, pool-region-1 grants $G1: $(grep -m1 -o 'granted region [^ ]*: [0-9]* MiB at [0-9]* MiB of pool region 1' "$D/comp-4.log")" || bad "nothing was leased from region 1 (BAR $G0)"
+OFFS=$(grep -o 'MiB at [0-9]* MiB of pool region 1' "$D/comp-4.log" | sort | uniq -d)
+[ -z "$OFFS" ] && ok "region 1 grants at $(grep -o 'at [0-9]* MiB of pool region 1' "$D/comp-4.log" | awk '{print $2}' | tr '\n' ' ')MiB: no two sessions share a byte" || bad "two live grants at one offset: $OFFS"
+[ "$MAPPED" -ge 3 ] && ok "$MAPPED window(s) mapped, three installations on a 32 MiB BAR" || bad "only $MAPPED window(s) mapped"
+grep -q 'REFUSED [0-9]* bytes' "$D/comp-4.log" && bad "a refusal with region 1 beside: $(grep -m1 -o 'REFUSED [0-9]* bytes.*' "$D/comp-4.log" | cut -c1-150)"
+for t in a b c; do R=$(request "${t}p" "raw status"); case "$R" in ok-raw*) ;; *) bad "one pool, status $t: $R" ;; esac; done
+for t in a b c; do request "${t}p" "raw down" >/dev/null; done
+wait_line "$D/comp-4.log" 'installation wcmc\) ENDED' 15
+wait_line "$D/comp-4.log" 'session [0-9]'"'"'s [0-9]* region' 10
+ok "after down: $(grep -c 'back in the pool' "$D/comp-4.log") session(s) returned their regions; $(grep -o 'back in the pool ([0-9]* MiB free' "$D/comp-4.log" | tail -1)"
 
 if [ -n "${WC_MULTI_EVIDENCE:-}" ]; then mkdir -p "$WC_MULTI_EVIDENCE" && cp "$D"/*.log "$WC_MULTI_EVIDENCE"/ 2>/dev/null; fi
 echo "logs: $D"

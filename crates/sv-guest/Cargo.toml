@@ -29,3 +29,6 @@ wayland = ["dep:wc-compositor"]
 [dependencies]
 sv-gpu-server = { path = "../sv-gpu-server", optional = true }
 wc-compositor = { path = "../wc-compositor", optional = true }
+# §110: the one pool, when both halves run in one process (`--with-gpu`).
+sv-arena = { workspace = true }
+sv-transport = { workspace = true }

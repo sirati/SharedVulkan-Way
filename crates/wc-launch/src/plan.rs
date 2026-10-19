@@ -157,7 +157,18 @@ pub fn shared_compositor_argv(cfg: &Config, log: &str, user_ctl: &str) -> Vec<St
     let mut a = compositor_argv(cfg, "wl-shared", log);
     a.retain(|x| x != "--nested-compositor-globals");
     a.extend(["--user-control".into(), user_ctl.into(), "--singleton".into(), COMPOSITOR_MUTEX.into()]);
+    // §110: the GPU pool in the same process, so the arena and the GPU device
+    // are one pool. Everything after `--with-gpu` is the GPU half's.
+    if one_pool_gpu(cfg) {
+        a.push("--with-gpu".into());
+        a.extend(gpu_argv(cfg).into_iter().skip(1));
+    }
     a
+}
+
+/// §110: whether the shared compositor runs the GPU pool itself.
+pub fn one_pool_gpu(cfg: &Config) -> bool {
+    cfg.shared_compositor && cfg.one_pool && cfg.gpu_sessions > 0 && cfg.gpu_pool
 }
 
 /// §107. The `boot` line for the user's compositor: tab-separated `key=value`
@@ -741,6 +752,13 @@ mod tests {
         let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
         assert_eq!(after("--singleton"), Some(GPU_MUTEX));
         assert_eq!(after("--exit-idle"), Some("120"));
+        // §110: with GPU sessions, the GPU pool runs in the compositor.
+        c.gpu_sessions = 2;
+        let a = shared_compositor_argv(&c, "L", "C");
+        let i = a.iter().position(|x| x == "--with-gpu").expect("--with-gpu");
+        assert_eq!(&a[i + 1..i + 3], ["guest", "--ivshmem-slot"]);
+        c.one_pool = false;
+        assert!(!shared_compositor_argv(&c, "L", "C").iter().any(|x| x == "--with-gpu"));
     }
 
     /// The hard requirement, as a test rather than as a paragraph. Every

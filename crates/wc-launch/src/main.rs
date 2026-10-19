@@ -1203,7 +1203,9 @@ mod win {
         // The user's GPU process, first, so its driver opens while the
         // session boots (§105.13); never this launcher's to end.
         let gpu = cfg.gpu_sessions > 0;
-        if gpu {
+        if gpu && plan::one_pool_gpu(cfg) {
+            log.say("gpu: the GPU pool runs in the user's compositor, one pool with the arena (§110)");
+        } else if gpu {
             if held(plan::GPU_MUTEX) {
                 log.say("gpu: the user's GPU process is up; this session leases from it");
             } else {

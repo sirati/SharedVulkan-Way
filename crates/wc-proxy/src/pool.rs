@@ -892,6 +892,30 @@ impl ProvidedRegion {
         Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
     }
 
+    /// §110: a range of another region of the one pool, `[offset, offset +
+    /// len)` of the file at `path` (the GPU device's, whose pool offsets are
+    /// file offsets), granted to this session as region `id`.
+    pub fn region_window(path: &Path, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
+        let file_len = std::fs::metadata(path)?.len();
+        if len == 0 || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || offset.checked_add(len).is_none_or(|e| e > file_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: a window at {offset}+{len} is not whole pages inside the {file_len}-byte file", path.display()),
+            ));
+        }
+        let plan = crate::guestram::Plan {
+            id,
+            object: path.to_path_buf(),
+            len,
+            run_id: 0,
+            outbound: None,
+            runs: vec![crate::guestram::Run { arena_offset: 0, file_offset: offset, len }],
+        };
+        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let origin = format!("pool region window {offset}+{len} of {}", path.display());
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
+    }
+
     /// A region backed by a file on this machine.
     ///
     /// **The Wine fixture, and only ever the Wine fixture.** docs/waycompose-design.md §5.1 is

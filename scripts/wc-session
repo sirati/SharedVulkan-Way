@@ -1469,6 +1469,9 @@ proxy)
         # §107: a session of the guest's shared compositor.
         IDX=$(cat "$D/session.index" 2>/dev/null)
         [ -n "$IDX" ] && RINGARGS="$RINGARGS --session-index $IDX"
+        # §110: the GPU device is region 1 of the one pool the shared
+        # compositor leases Wayland buffers from when its BAR is full.
+        [ -n "$IDX" ] && [ -r "$GPUREGION" ] && RINGARGS="$RINGARGS $(printf -- '--arena-region 1=%q' "$GPUREGION")"
         # §106: host integration, and every Windows endpoint a stream of the
         # sound ring with stable names (§103.16, §106.3).
         # The session's server starts beside the proxy (§105.13), so its kind

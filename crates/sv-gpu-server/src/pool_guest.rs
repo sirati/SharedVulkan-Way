@@ -68,8 +68,24 @@ pub struct PoolServe {
     pub exit_idle: Option<Duration>,
 }
 
+/// §110: called once the pool exists, with the pool and its region 0, by a
+/// process that also leases from it for something else: the shared
+/// compositor, which makes it a region of its Wayland arena (`sv-guest
+/// wayland … --with-gpu …`).
+pub type PoolHook = Box<dyn Fn(&Arc<PoolServer>, &Arc<SharedRegion>) + Send + Sync>;
+
+static POOL_HOOK: std::sync::OnceLock<PoolHook> = std::sync::OnceLock::new();
+
+/// Install the [`PoolHook`]; the first call wins.
+pub fn set_pool_hook(hook: PoolHook) {
+    let _ = POOL_HOOK.set(hook);
+}
+
 /// Serve sessions from a pool over `boot`, for the life of the process.
 pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>) -> Result<(), String> {
+    // SAFETY: only the address is taken, to name the pool's range for its
+    // doorbell (§110); nothing is read or written through it here.
+    let boot_base = unsafe { boot.base_ptr() } as usize;
     let pool_nonce = nonce();
     let mailboxes = Arc::new(Mailboxes::new(Arc::clone(&boot)).map_err(|e| format!("the pool cannot hold its header: {e}"))?);
     // A previous owner's offers are forgotten before the new nonce is out.
@@ -82,6 +98,9 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
         ..PoolConfig::for_capacity(boot.len() as u64)
     };
     let server = PoolServer::new(pcfg, Arc::clone(&boot), Importer::HostPointer).map_err(|e| format!("{e}"))?;
+    if let Some(hook) = POOL_HOOK.get() {
+        hook(&server, &boot);
+    }
     eprintln!(
         "[gpu] pool of {} MiB, nonce {pool_nonce:#018x}; a session may lease {} MiB besides its control \
          region, and {} MiB are kept for a session that has not started; {}",
@@ -115,7 +134,7 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
     let _doorman = match &bell {
         None => None,
         Some(name) => match sv_transport::vdoorbell::PortHandle::open(name)
-            .and_then(|p| poolcold::attach_guest_bell(p, Arc::clone(&set), Arc::clone(&cold)))
+            .and_then(|p| poolcold::attach_guest_bell_for(p, Arc::clone(&set), Arc::clone(&cold), boot_base, boot.len()))
         {
             Ok(d) => {
                 eprintln!("[gpu] doorbell attached on {name}, shared by every session and the pool's mailboxes");
@@ -161,7 +180,7 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
         if _doorman.is_some() { "by doorbell" } else { "polled: no doorbell" }
     );
     let mut offers = Offers { server, pool_nonce, cfg, set, live, cold: Arc::clone(&cold), n: 0, short: None };
-    let poke: poolcold::Poke = Arc::new(poolcold::poke_cross);
+    let poke: poolcold::Poke = Arc::new(move || poolcold::poke_cross_at(boot_base));
     poolcold::serve_offers(
         &mailboxes,
         &cold,

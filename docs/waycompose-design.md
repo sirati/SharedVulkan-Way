@@ -34722,3 +34722,132 @@ accepted and unused.
   doublings) through the whole no-ssh path in a **64 MiB** BAR: both map a
   window and keep running; foot's buffers held 2.7 MiB at peak, weston-
   terminal's 3.0 MiB; no `Invalid new_id`, no protocol error.
+
+## 110. One pool: the Wayland arena and the GPU device
+
+Written 2026-10-19, branch `windows-multi-install`, after §107 and §109. The
+brief (user, through the coordinator): 128 MiB is not enough, because the GPU
+must be usable properly; stop treating the 128 MiB arena as the Wayland
+buffer space. Make the Wayland arena and the GPU pool **one** sub-allocated
+pool, so Wayland buffers can lease from the 1 GiB GPU device too, with no
+device-size change, and keep the pool and its regions open for regions that
+are not BARs (§108).
+
+### 110.1 Status in one paragraph
+
+The shared compositor's arena is now a pool of **regions**: region 0 is its
+own BAR (§107's `BarPool`, unchanged), and region 1 is the GPU device, leased
+from the **same** allocator the GPU sessions lease from (`sv_arena::pool`,
+§97), so a byte is a GPU session's or a Wayland buffer's and never both. A
+session asks for memory as before (`grow N` on its arena slot); the BAR is
+tried first, then the other regions in turn, and a grant from region K is
+answered in §108.6's form, `ok ID region K OFFSET LEN`. The proxy maps it
+from the file it was given for region K (`--arena-region 1=PATH`, the GPU
+device's backing file, whose pool offsets are file offsets). Because the
+ivshmem driver gives one mapping per device, only a process that maps the GPU
+device can read a buffer there, so **the shared compositor runs the GPU pool
+itself**: `sv-guest wayland … --with-gpu guest --pool …`, the GPU half on a
+thread, the compositor on the main thread. Locally (`wc-multi-install.sh`
+leg 7) three installations ran on a 32 MiB BAR whose own pool could not hold
+one session's first region, every buffer leased from a 256 MiB file standing
+in for the GPU device, three windows mapped, no two grants overlapping.
+**Not run on the Windows guest** (110.6).
+
+### 110.2 The pool, the regions, and who owns what
+
+| region | memory | allocator | grants |
+|---|---|---|---|
+| 0 | the arena's BAR (device 0x1c), less the header page, the outbound window, the rings and the first MiB (kept for §108.2's table, 110.4) | the compositor's `BarPool` (§107): 1 MiB granules, ¾ cap per session | `ok ID OFFSET LEN`, arena offsets, as in §107 |
+| 1 | the GPU device (0x1d, 1 GiB on the guest), region 0 of the GPU pool | the GPU pool's `sv_arena::pool` (§97): 64 KiB granules, a `Dedicated` lease on an account per Wayland session (`wayland <install> (session N)`), never the reserve kept for a GPU session's start, the pool's own ¾ cap | `ok ID region 1 OFFSET LEN`, device offsets |
+| 2 … | §108's runtime regions (guest RAM, a Mac's chunks) | whoever announces them | `ok ID region K OFFSET LEN` |
+
+Every grant, whatever its region, is one entry of the compositor's grant
+table (`BarPool::adopt` for regions other than 0): one id space, ids never
+reused in a run, the session's for `pool_check`, given back by `release ID`
+or at the session's end, and then back to its own allocator
+(`PoolRegion::release`). A region is two things and nothing more
+(`session_svc::PoolRegion`): a mapping this process keeps, and an allocator
+that leases ranges of it. `add_pool_region(K, ptr, len, src)` registers the
+mapping as arena id `0xF000_0000 + K` (`wc_handle::arena::
+register_borrowed_base`, no new mapping) so a grant is a window of it like
+any BAR window. Nothing in the table says "BAR": a §108 region is another
+`PoolRegion`.
+
+### 110.3 Why the GPU pool runs in the compositor
+
+The alternative was a guest-local protocol between the compositor and a
+separate GPU process (the compositor asks it for a lease). It fails on the
+reading side: the compositor has to read a Wayland buffer's pixels, and only
+the process holding the GPU device's one mapping can. So both halves are one
+process (`sv-guest` was always one binary with both). What that needed:
+
+* **Two doorbell ports in one process.** The cross-VM wake was process-wide;
+  the GPU rings ring `svbell` and the Wayland rings `wcbell`. A bell now looks
+  its port up by the address of its lane (`park::cross_wake_at`): the GPU pool
+  installs its port for its device's address range
+  (`poolcold::attach_guest_bell_for`, `install_cross_wake_for`), and that
+  install becomes the process-wide one only if there is none, so a separate
+  GPU process behaves exactly as before.
+* **A hook when the pool exists** (`pool_guest::set_pool_hook`): `sv-guest`
+  makes the pool's region 0 the arena's region 1 (`one_pool::GpuRegion`).
+* **The launcher** passes `--with-gpu` and the GPU half's arguments to the
+  user's compositor and starts no GPU process of its own (`one-pool = on`, the
+  default; `off` is §107's separate per-user GPU process).
+
+What this costs: a GPU driver fault now ends the compositor too, and with it
+every installation's windows, where before it ended the GPU sessions only.
+
+### 110.4 The region table's place (§108.2), decided
+
+§108.6 proposed the arena's region table in the first 64 KiB after the
+header page, announced by a word in the header page. Accepted: a shared
+compositor's `BarPool` starts at the arena's first MiB (`with_front`, the
+granule above the table's 64 KiB), so no buffer ever lands there. The
+announcement word is proposed at **byte 2048 of the header page** (after the
+boot record's authenticator, which ends at 1872): `"WCRGNTB1"`, then the
+table's arena offset (u64, 0) and its length (u32, 65536). It is not written
+yet: the table itself is §108's to build.
+
+### 110.5 Tested
+
+* `barpool::another_regions_range_is_owned_like_a_bar_grant`,
+  `the_front_is_never_granted`; `arena::a_borrowed_base_is_windowed_
+  without_a_mapping_of_its_own`; `park::ranged_wake_tests`;
+  `barwin::a_grant_parses…` (both answer forms).
+* `sv-guest one_pool::wayland_and_gpu_leases_share_one_allocator`: a GPU
+  session's leases and two Wayland sessions' through the real
+  `PoolServer` interleave without a byte in common.
+* `scripts/wc-multi-install.sh` leg 7: a 32 MiB BAR (rings 10, outbound 1,
+  table 1: a 20 MiB pool, 15 MiB cap per session) beside a 256 MiB file as
+  region 1 (`--pool-region-file`, a `FileRegion` over the same lease allocator,
+  the harness's stand-in for the GPU pool). Three installations' sessions:
+  every first region refused by the BAR's cap and granted from region 1, at 0,
+  16 and 32 MiB; three windows mapped; every session answers; every region
+  given back at `down`.
+
+### 110.6 Not done, and on the guest
+
+* **Not run on Windows.** On the guest, with `one-pool = on` (default) and
+  `gpu-sessions` > 0: the compositor's log must say `pool region 1 (1024 MiB,
+  the GPU device's pool…)`, a Firefox session must keep running when the
+  arena's BAR is full (`granted region … of pool region 1`), the GPU sessions
+  must still attach (the `svbell` port is now the GPU device range's, and the
+  `wcbell` the process's), and the GPU pool's report must list `wayland …`
+  accounts beside the GPU ones.
+* **The BAR is not shrunk.** §108.6 says the arena's BAR can shrink to its
+  bootstrap once regions grow; that is a device-size change, which this brief
+  excludes.
+* **§108's table** is reserved, not written (110.4); regions 2 and up come with
+  it.
+* **A Wayland grant in the GPU pool's region K > 0** (once §108 grows the GPU
+  pool) is refused for now: this process maps only its region 0.
+
+### 110.7 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 114 binaries, **3250 passed, 0 failed**, 9 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section touched |
+| `cargo check --workspace --target x86_64-pc-windows-gnu`; `-p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 |
+| `scripts/wc-xref.sh --list` | no missing citation |
+| `scripts/wc-multi-install.sh` (legs 1–7), `scripts/wc-no-ssh.sh`, `scripts/wc-lazy-pools.sh` | OK, OK, OK |

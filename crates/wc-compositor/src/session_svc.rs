@@ -154,6 +154,7 @@ impl Config {
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 static USER_CONTROL: Mutex<Option<PathBuf>> = Mutex::new(None);
 static SINGLETON: Mutex<Option<String>> = Mutex::new(None);
+static REGION_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// §107: the process-wide `--nested-compositor-globals`, for clients that are
 /// no session's (a socket client).
 static LEGACY_NESTED: AtomicBool = AtomicBool::new(false);
@@ -200,6 +201,12 @@ pub fn parse_flag(flag: &str, value: &mut dyn FnMut() -> Option<String>) -> Resu
         "--user-control" => {
             let v = need(flag)?;
             *USER_CONTROL.lock().unwrap_or_else(|e| e.into_inner()) = Some(v.into());
+        }
+        // §110: a file standing in for the GPU device, as pool region 1 (the
+        // harness; on the guest `sv-guest` adds the GPU pool itself).
+        "--pool-region-file" => {
+            let v = need(flag)?;
+            *REGION_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(v.into());
         }
         // §107: a name only one compositor of the user may hold.
         "--singleton" => {
@@ -389,7 +396,9 @@ pub fn init(arena: u32, linger: Option<Duration>) -> Result<(), String> {
     let (_, region_len, rings_len) = wc_handle::arena::ivshmem_identity(arena).map_err(|e| e.to_string())?;
     let arena_len = region_len - wc_handle::ivshmem::HEADER_BYTES - rings_len;
     let limit = wc_handle::arena::outbound().filter(|w| w.arena == arena).map_or(arena_len, |w| w.offset);
-    let pool = BarPool::new(limit);
+    // §110: the first 64 KiB of the arena are kept for the region table of
+    // §108.6 (a whole granule, so the first MiB), on a shared compositor.
+    let pool = if multi() { BarPool::with_front(limit, REGION_TABLE_BYTES) } else { BarPool::new(limit) };
     if multi() {
         say(&format!(
             "sessions: one compositor for every installation (§107): {} MiB of the BAR in {} KiB granules for the \
@@ -400,6 +409,11 @@ pub fn init(arena: u32, linger: Option<Duration>) -> Result<(), String> {
         ));
         smithay::wayland::shm::set_pool_check(pool_check);
         smithay::wayland::set_nested_filter(nested_visible);
+        if let Some(p) = REGION_FILE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            && let Err(e) = FileRegion::add(1, &p)
+        {
+            say(&format!("sessions: NO POOL REGION 1 from {}: {e}", p.display()));
+        }
     }
     HUB.set(Hub {
         arena,
@@ -993,6 +1007,7 @@ fn end(sess: &Arc<Sess>, why: &str) {
         let gone = h.pool.lock().unwrap_or_else(|e| e.into_inner()).reclaim(sess.index);
         for g in &gone {
             let _ = wc_handle::arena::detach_ivshmem_window(g.id);
+            release_external(g);
         }
         if !gone.is_empty() {
             let (free, largest) = h.pool.lock().unwrap_or_else(|e| e.into_inner()).free();
@@ -1137,11 +1152,25 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
                     format!("ok {} {} {}", g.id, g.offset, g.len)
                 }
                 Err(e) => {
+                    // §110: the BAR is full for this session; the pool's other
+                    // regions (the GPU device's, when this process runs the GPU
+                    // pool) are asked in turn.
+                    drop(pool);
+                    let mut why = e.to_string();
+                    for (region, base, src) in pool_regions() {
+                        match src.lease(sess.index, &sess.cfg.install, min) {
+                            Ok((off, len)) => match grant_external(h, sess, region, base, &src, off, len) {
+                                Ok(reply) => return reply,
+                                Err(e) => why = format!("{why}; region {region}: {e}"),
+                            },
+                            Err(e) => why = format!("{why}; region {region} ({}): {e}", src.describe()),
+                        }
+                    }
                     let n = sess.refused.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
-                        say(&format!("arena: session {} REFUSED {min} bytes: {e} (refusal {n})", sess.index));
+                        say(&format!("arena: session {} REFUSED {min} bytes: {why} (refusal {n})", sess.index));
                     }
-                    format!("err {e}")
+                    format!("err {why}")
                 }
             }
         }
@@ -1151,6 +1180,7 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
             match pool.release(sess.index, id) {
                 Ok(g) => {
                     let _ = wc_handle::arena::detach_ivshmem_window(g.id);
+                    release_external(&g);
                     say(&format!(
                         "arena: session {} gave back region {:#x} ({} MiB); it holds {} MiB",
                         sess.index,
@@ -1168,6 +1198,136 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
             format!("ok {} {}", pool.regions_of(sess.index).len(), pool.held(sess.index))
         }
         _ => format!("err unknown arena request {line:?}"),
+    }
+}
+
+/// A range another region's allocator leased to `sess`, recorded in the
+/// pool's table under a new id and registered as a window of that region.
+fn grant_external(h: &Hub, sess: &Sess, region: u32, base: u32, src: &Arc<dyn PoolRegion>, off: u64, len: u64) -> Result<String, String> {
+    let mut pool = h.pool.lock().unwrap_or_else(|e| e.into_inner());
+    let g = pool.adopt(sess.index, region, off, len).map_err(|e| {
+        src.release(off);
+        e.to_string()
+    })?;
+    if let Err(e) = wc_handle::arena::attach_ivshmem_window(g.id, base, off, len) {
+        let _ = pool.release(sess.index, g.id);
+        src.release(off);
+        return Err(format!("the window could not be registered: {e}"));
+    }
+    say(&format!(
+        "arena: session {} granted region {:#x}: {} MiB at {} MiB of pool region {region} ({})",
+        sess.index,
+        g.id,
+        g.len >> 20,
+        g.offset >> 20,
+        src.describe()
+    ));
+    Ok(format!("ok {} region {region} {} {}", g.id, g.offset, g.len))
+}
+
+/// Give a grant of another region back to its allocator.
+fn release_external(g: &wc_handle::barpool::Grant) {
+    if g.region == 0 {
+        return;
+    }
+    if let Some((_, _, src)) = pool_regions().into_iter().find(|(r, _, _)| *r == g.region) {
+        src.release(g.offset);
+    }
+}
+
+// ------------------------------------------------ §110: one pool, many regions ---
+
+/// §110: the first bytes of the shared compositor's arena kept for §108.6's
+/// region table (`BarPool::with_front`).
+pub const REGION_TABLE_BYTES: u64 = 64 << 10;
+
+/// The arena id a pool region's base is registered under, so that its grants
+/// are windows of it (`wc_handle::arena::attach_ivshmem_window`).
+pub const REGION_BASE_ID: u32 = 0xF000_0000;
+
+/// §110: a region of the one pool that is not this BAR: another allocator's
+/// memory this process maps, from which the shared compositor leases a
+/// session's Wayland buffers when its BAR is full. The GPU device's pool is
+/// the one there is (`sv-guest`, when this process also runs the GPU pool);
+/// a guest-RAM region announced in the region table (§108) is the next.
+/// Substrate-agnostic: a region is a mapping and an allocator, nothing more.
+pub trait PoolRegion: Send + Sync {
+    /// `len` bytes for session `session` of installation `install`, as
+    /// `(offset, len)` within this region's mapping.
+    fn lease(&self, session: u8, install: &str, len: u64) -> Result<(u64, u64), String>;
+    /// The range at `offset` goes back.
+    fn release(&self, offset: u64);
+    /// For the log: what the region is.
+    fn describe(&self) -> String;
+}
+
+type Regions = Vec<(u32, u32, Arc<dyn PoolRegion>)>;
+static POOL_REGIONS: Mutex<Regions> = Mutex::new(Vec::new());
+
+fn pool_regions() -> Regions {
+    POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// §110: add region `region` (1 and up; 0 is this BAR) of the one pool: the
+/// memory at `[ptr, ptr + len)`, which this process keeps mapped for its life,
+/// with `src` its allocator. A proxy is told its grants as `ok ID region K
+/// OFFSET LEN`, and maps region K by its own configuration (`--arena-region`).
+///
+/// # Safety
+/// `ptr` must be valid for reads of `len` bytes for the rest of the process.
+pub unsafe fn add_pool_region(region: u32, ptr: *const u8, len: usize, src: Arc<dyn PoolRegion>) -> Result<(), String> {
+    if region == 0 {
+        return Err("region 0 is the BAR".into());
+    }
+    let base = REGION_BASE_ID + region;
+    let origin = format!("pool region {region}: {}", src.describe());
+    // SAFETY: the caller's contract.
+    unsafe { wc_handle::arena::register_borrowed_base(base, ptr, len, origin) }.map_err(|e| e.to_string())?;
+    say(&format!("sessions: pool region {region} ({} MiB, {}) serves Wayland buffers when a session's BAR is full", len >> 20, src.describe()));
+    POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).push((region, base, src));
+    Ok(())
+}
+
+/// §110, for the harness and for a machine with no GPU pool in this process:
+/// a plain file standing in for the GPU device, sub-allocated by the same
+/// lease allocator the GPU pool uses (`sv_arena::pool`).
+pub struct FileRegion {
+    pool: Mutex<sv_arena::pool::Pool>,
+    sessions: Mutex<std::collections::HashMap<u8, u64>>,
+    path: PathBuf,
+}
+
+impl FileRegion {
+    /// Map `path` read-write (it must exist) and make it region `region`.
+    pub fn add(region: u32, path: &std::path::Path) -> Result<(), String> {
+        let len = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len();
+        let view = wc_handle::arena::map_file_for_region(path, len).map_err(|e| format!("{}: {e}", path.display()))?;
+        let cfg = sv_arena::pool::PoolConfig { reserve: 0, ..sv_arena::pool::PoolConfig::for_capacity(len) };
+        let pool = sv_arena::pool::Pool::new(cfg, len).map_err(|e| e.to_string())?;
+        let src = Arc::new(FileRegion { pool: Mutex::new(pool), sessions: Mutex::new(Default::default()), path: path.to_path_buf() });
+        // SAFETY: `map_file_for_region` keeps the mapping for the process.
+        unsafe { add_pool_region(region, view, len as usize, src) }
+    }
+}
+
+impl PoolRegion for FileRegion {
+    fn lease(&self, session: u8, install: &str, len: u64) -> Result<(u64, u64), String> {
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let s = *self.sessions.lock().unwrap_or_else(|e| e.into_inner()).entry(session).or_insert_with(|| {
+            let s = 1000 + u64::from(session);
+            pool.open_session(s, &format!("wayland {install}"));
+            s
+        });
+        let l = pool.lease(s, len, sv_arena::pool::Purpose::Dedicated).map_err(|e| e.to_string())?;
+        Ok((sv_arena::pool::split(l.offset).1, l.len))
+    }
+
+    fn release(&self, offset: u64) {
+        let _ = self.pool.lock().unwrap_or_else(|e| e.into_inner()).release(offset);
+    }
+
+    fn describe(&self) -> String {
+        format!("the lease pool over {}", self.path.display())
     }
 }
 

@@ -47,6 +47,11 @@ pub const FIRST_ID: u32 = 0x100;
 pub struct Grant {
     pub id: u32,
     pub session: u8,
+    /// §110: which region of the one pool: 0 is this BAR (its offsets are
+    /// arena offsets); any other is a region another allocator owns (the GPU
+    /// device's pool, a §108 region), recorded here with that allocator's
+    /// offset so that ids, ownership and a session's end stay in one table.
+    pub region: u32,
     pub offset: u64,
     pub len: u64,
 }
@@ -89,6 +94,8 @@ impl std::fmt::Display for Refusal {
 #[derive(Debug, Clone)]
 pub struct BarPool {
     limit: u64,
+    /// Bytes at the front never granted (`with_front`).
+    front: u64,
     /// Sorted, coalesced `(offset, len)` runs.
     free: Vec<(u64, u64)>,
     grants: BTreeMap<u32, Grant>,
@@ -104,11 +111,24 @@ impl BarPool {
         let limit = limit / GRANULE * GRANULE;
         BarPool {
             limit,
+            front: 0,
             free: if limit == 0 { Vec::new() } else { vec![(0, limit)] },
             grants: BTreeMap::new(),
             next_id: FIRST_ID,
             cap: (limit / 4 * 3) / GRANULE * GRANULE,
         }
+    }
+
+    /// §110: a pool over `[front, limit)`: the first `front` bytes (rounded
+    /// up to the granule) are kept for the arena's region table (§108.6), which
+    /// lives in the BAR's first 64 KiB and is never anybody's buffer.
+    pub fn with_front(limit: u64, front: u64) -> BarPool {
+        let mut p = BarPool::new(limit);
+        let front = front.div_ceil(GRANULE).saturating_mul(GRANULE).min(p.limit);
+        p.front = front;
+        p.free = if p.limit > front { vec![(front, p.limit - front)] } else { Vec::new() };
+        p.cap = ((p.limit - front) / 4 * 3) / GRANULE * GRANULE;
+        p
     }
 
     /// The bytes the pool covers.
@@ -126,9 +146,10 @@ impl BarPool {
         self.cap = (cap / GRANULE * GRANULE).max(GRANULE).min(self.limit);
     }
 
-    /// Bytes `session` holds now.
+    /// Bytes `session` holds now in this BAR (region 0), which is what its cap
+    /// bounds; other regions have their own allocator's caps.
     pub fn held(&self, session: u8) -> u64 {
-        self.grants.values().filter(|g| g.session == session).map(|g| g.len).sum()
+        self.grants.values().filter(|g| g.session == session && g.region == 0).map(|g| g.len).sum()
     }
 
     /// The regions `session` holds now, in id order.
@@ -175,7 +196,23 @@ impl BarPool {
         } else {
             self.free[i] = (off + len, run - len);
         }
-        let g = Grant { id: self.next_id, session, offset: off, len };
+        let g = Grant { id: self.next_id, session, region: 0, offset: off, len };
+        self.next_id = self.next_id.checked_add(1).unwrap_or(FIRST_ID);
+        self.grants.insert(g.id, g);
+        Ok(g)
+    }
+
+    /// §110: record a range another allocator leased to `session` in
+    /// `region` (not 0), under a new id of this table. Nothing of the BAR's free
+    /// list changes.
+    pub fn adopt(&mut self, session: u8, region: u32, offset: u64, len: u64) -> Result<Grant, Refusal> {
+        if session == 0 {
+            return Err(Refusal::NoSession);
+        }
+        if region == 0 || len == 0 {
+            return Err(Refusal::Empty);
+        }
+        let g = Grant { id: self.next_id, session, region, offset, len };
         self.next_id = self.next_id.checked_add(1).unwrap_or(FIRST_ID);
         self.grants.insert(g.id, g);
         Ok(g)
@@ -189,7 +226,9 @@ impl BarPool {
             _ => return Err(Refusal::NotYours { session, id }),
         }
         let g = self.grants.remove(&id).expect("checked above");
-        self.put_back(g.offset, g.len);
+        if g.region == 0 {
+            self.put_back(g.offset, g.len);
+        }
         Ok(g)
     }
 
@@ -199,7 +238,9 @@ impl BarPool {
         let gone: Vec<Grant> = self.regions_of(session);
         for g in &gone {
             self.grants.remove(&g.id);
-            self.put_back(g.offset, g.len);
+            if g.region == 0 {
+                self.put_back(g.offset, g.len);
+            }
         }
         gone
     }
@@ -222,9 +263,9 @@ impl BarPool {
     /// `[0, limit)` with no overlap. For tests and for a debug assertion.
     pub fn consistent(&self) -> bool {
         let mut runs: Vec<(u64, u64)> = self.free.clone();
-        runs.extend(self.grants.values().map(|g| (g.offset, g.len)));
+        runs.extend(self.grants.values().filter(|g| g.region == 0).map(|g| (g.offset, g.len)));
         runs.sort();
-        let mut at = 0;
+        let mut at = self.front;
         for (o, l) in runs {
             if o != at || l == 0 {
                 return false;
@@ -339,6 +380,41 @@ mod tests {
         }
         assert_eq!(p.free(), (16 * MIB, 16 * MIB), "one run again");
         assert_eq!(p.granted(), 0);
+    }
+
+    /// §110: a range of another region is recorded beside the BAR's grants:
+    /// a new id, the session's, given back and reclaimed with the rest, and
+    /// never touching the BAR's free list or its cap.
+    #[test]
+    fn the_front_is_never_granted() {
+        let mut p = BarPool::with_front(16 * MIB, 64 << 10);
+        assert_eq!(p.free(), (15 * MIB, 15 * MIB), "the table's 64 KiB keep the first granule");
+        let a = p.grant(1, MIB).unwrap();
+        assert_eq!(a.offset, MIB);
+        assert!(p.consistent());
+        p.reclaim(1);
+        assert_eq!(p.free(), (15 * MIB, 15 * MIB));
+    }
+
+    #[test]
+    fn another_regions_range_is_owned_like_a_bar_grant() {
+        let mut p = BarPool::new(16 * MIB);
+        let a = p.grant(1, 4 * MIB).unwrap();
+        let x = p.adopt(1, 1, 64 << 20, 32 * MIB).unwrap();
+        let y = p.adopt(2, 1, 96 << 20, MIB).unwrap();
+        assert!(x.id > a.id && y.id > x.id);
+        assert_eq!((x.region, x.offset), (1, 64 << 20));
+        assert_eq!(p.held(1), 4 * MIB, "the cap is the BAR's");
+        assert_eq!(p.free(), (12 * MIB, 12 * MIB));
+        assert!(p.consistent());
+        assert_eq!(p.release(1, y.id), Err(Refusal::NotYours { session: 1, id: y.id }));
+        assert_eq!(p.release(2, y.id).unwrap(), y);
+        let gone = p.reclaim(1);
+        assert_eq!(gone, vec![a, x]);
+        assert_eq!(p.free(), (16 * MIB, 16 * MIB));
+        assert!(p.consistent());
+        assert_eq!(p.adopt(0, 1, 0, MIB), Err(Refusal::NoSession));
+        assert_eq!(p.adopt(1, 0, 0, MIB), Err(Refusal::Empty), "region 0 is granted, not adopted");
     }
 
     #[test]

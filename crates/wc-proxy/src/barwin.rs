@@ -82,12 +82,19 @@ pub fn request(line: &str) -> io::Result<String> {
     }
 }
 
-/// `ok ID OFFSET LEN`, as the compositor grants a window.
-pub fn parse_grant(reply: &str) -> io::Result<(u32, u64, u64)> {
+/// A grant, as the compositor answers `grow`: `ok ID OFFSET LEN` (a window of
+/// its BAR, region 0) or, since §110 (§108.6's form), `ok ID region K OFFSET
+/// LEN` (a range of the one pool's region K). Returns `(id, region, offset,
+/// len)`.
+pub fn parse_grant(reply: &str) -> io::Result<(u32, u32, u64, u64)> {
     let w: Vec<&str> = reply.split_whitespace().collect();
     match w.as_slice() {
+        ["ok", id, "region", k, off, len] => match (id.parse(), k.parse(), off.parse(), len.parse()) {
+            (Ok(id), Ok(k), Ok(off), Ok(len)) => Ok((id, k, off, len)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("a grant that is not numbers: {reply:?}"))),
+        },
         ["ok", id, off, len] => match (id.parse(), off.parse(), len.parse()) {
-            (Ok(id), Ok(off), Ok(len)) => Ok((id, off, len)),
+            (Ok(id), Ok(off), Ok(len)) => Ok((id, 0, off, len)),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("a grant that is not numbers: {reply:?}"))),
         },
         ["err", ..] => Err(io::Error::new(io::ErrorKind::OutOfMemory, reply.trim_start_matches("err ").to_string())),
@@ -101,21 +108,40 @@ pub struct BarWindows {
     path: PathBuf,
     run: u64,
     index: u8,
+    /// §110: the files the one pool's other regions are (`--arena-region
+    /// K=PATH`), by region.
+    regions: std::collections::HashMap<u32, PathBuf>,
 }
 
 impl BarWindows {
     pub fn new(path: &Path, run: u64, index: u8) -> BarWindows {
-        BarWindows { path: path.to_path_buf(), run, index }
+        BarWindows { path: path.to_path_buf(), run, index, regions: Default::default() }
+    }
+
+    /// §110: region `k` of the one pool is the file at `path`.
+    pub fn with_region(mut self, k: u32, path: &Path) -> BarWindows {
+        self.regions.insert(k, path.to_path_buf());
+        self
     }
 }
 
 impl RegionSource for BarWindows {
     fn provide(&mut self, _id: u32, min_len: u64) -> io::Result<ProvidedRegion> {
         let reply = request(&format!("grow {min_len}"))?;
-        let (id, off, len) = parse_grant(&reply).map_err(|e| {
+        let (id, region, off, len) = parse_grant(&reply).map_err(|e| {
             io::Error::new(e.kind(), format!("session {}: {min_len} bytes of the shared arena refused: {e}", self.index))
         })?;
-        match ProvidedRegion::ivshmem_window(&self.path, self.run, id, off, len) {
+        let mapped = match region {
+            0 => ProvidedRegion::ivshmem_window(&self.path, self.run, id, off, len),
+            k => match self.regions.get(&k) {
+                Some(p) => ProvidedRegion::region_window(p, id, off, len),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("region {k} of the pool was granted, and this proxy was given no file for it (--arena-region)"),
+                )),
+            },
+        };
+        match mapped {
             Ok(r) => Ok(r),
             Err(e) => {
                 // Not mappable here: the window goes straight back.
@@ -144,7 +170,9 @@ mod tests {
 
     #[test]
     fn a_grant_parses_and_a_refusal_carries_its_reason() {
-        assert_eq!(parse_grant("ok 256 16777216 8388608").unwrap(), (256, 16 << 20, 8 << 20));
+        assert_eq!(parse_grant("ok 256 16777216 8388608").unwrap(), (256, 0, 16 << 20, 8 << 20));
+        assert_eq!(parse_grant("ok 257 region 1 1048576 2097152").unwrap(), (257, 1, 1 << 20, 2 << 20));
+        assert!(parse_grant("ok 257 region x 1 2").is_err());
         let e = parse_grant("err the shared arena has no 8388608-byte run").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
         assert!(e.to_string().contains("no 8388608-byte run"));

@@ -102,6 +102,8 @@ use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
 pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
+/// §110: the one pool's other regions (the GPU device's, from `sv-guest`).
+pub use session_svc::{add_pool_region, PoolRegion};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};

@@ -73,6 +73,8 @@ struct Args {
     /// Required with `--arena-ivshmem`: without it a header left by a previous
     /// compositor would be indistinguishable from this one's.
     arena_run: Option<u64>,
+    /// §110: `--arena-region K=PATH`, the one pool's other regions.
+    arena_regions: Vec<(u32, PathBuf)>,
     /// GROWTH. `wc-arena-host`, and the two things it needs to reach QEMU.
     ///
     /// Empty means this proxy cannot cause a region to exist and falls back to
@@ -214,6 +216,9 @@ usage: wc-proxy --upstream <path> [options]
                          several installations: N goes into every ring claim, and
                          the arena is the BAR windows the compositor grants on the
                          session's arena slot, never the whole BAR
+  --arena-region K=PATH  §110: region K of the one pool is the file PATH (the GPU
+                         device's, whose pool offsets are file offsets): a grant
+                         `ok ID region K OFFSET LEN` is mapped from it
   --arena-locator PATH   arena: wc-arena-host, so that --arena-grow can ask the
                          compositor for a region and then locate it. Without it
                          growth only watches the plan for a region somebody else
@@ -313,6 +318,7 @@ fn parse_args() -> Result<Args, String> {
         arena_plan: PathBuf::new(),
         arena_ivshmem: PathBuf::new(),
         arena_run: None,
+        arena_regions: Vec::new(),
         arena_locator: PathBuf::new(),
         arena_qmp: "/run/windows-vm/qmp.sock".into(),
         arena_vm: "windows-vm".into(),
@@ -353,6 +359,13 @@ fn parse_args() -> Result<Args, String> {
             // §107: this session's index in a compositor shared by several
             // installations; every ring claim carries it, and the arena is
             // the windows of the BAR the compositor grants.
+            // §110: region K of the one pool is this file (the GPU device's).
+            "--arena-region" => {
+                let v = next()?;
+                let (k, p) = v.split_once('=').ok_or_else(|| format!("--arena-region {v}: K=PATH"))?;
+                let k: u32 = k.parse().map_err(|_| format!("--arena-region {v}: K is a region number"))?;
+                a.arena_regions.push((k, p.into()));
+            }
             "--session-index" => {
                 let v = next()?;
                 a.services.index = v.parse().map_err(|_| format!("--session-index {v}: 0..255"))?;
@@ -600,7 +613,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let mut t = if index == 0 {
                 Arena::from_ivshmem(args.arena_id, &args.arena_ivshmem, run)?
             } else {
-                let src = wc_proxy::barwin::BarWindows::new(&args.arena_ivshmem, run, index);
+                let mut src = wc_proxy::barwin::BarWindows::new(&args.arena_ivshmem, run, index);
+                for (k, p) in &args.arena_regions {
+                    src = src.with_region(*k, p);
+                }
                 println!("[proxy] arena {}: session {index} of a shared compositor; it grows by {}", args.arena_id, src.describe());
                 Arena::from_ivshmem_shared(args.arena_id, &args.arena_ivshmem, run, Box::new(src), args.arena_grow_idle)?
             };
