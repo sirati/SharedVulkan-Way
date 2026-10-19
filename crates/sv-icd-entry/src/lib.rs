@@ -801,6 +801,11 @@ pub struct SwapchainDesc {
     pub image_usage: u32,
     pub present_mode: i32,
     pub old_swapchain: u64,
+    /// `compositeAlpha`: `true` for `PRE_MULTIPLIED`, which only a Wayland
+    /// surface offers. The frame then keeps its alpha channel on the way to
+    /// the compositor (a GTK4 window's client-side shadow); otherwise the
+    /// window is opaque.
+    pub premultiplied_alpha: bool,
 }
 
 /// The implementation of last resort: every method is the trait's default.

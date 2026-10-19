@@ -31885,6 +31885,88 @@ never answered it. Which application asks for elevation at unlock is
 tests now record the peak of `MemTotal - MemAvailable`: `nested-waycompose`
 1426 MiB → 2048 (was 8192), `nested-login` 1194 MiB → 1792 (was 6144).
 
+### 102.14 One window per application: clicks that wait, and a launch that says it failed
+
+**The bug, 2026-10-19 on the guest.** Nothing appeared at once after a click
+on "Windows 7 (Linux)", so the user clicked several more times within a second.
+Each click was a `run` on the host, six seats started at once and tore each
+other down, and the user got no window and no message. The host now takes a
+lock (a second `run` fails with "a nested session is already running"). The
+launcher stops sending those runs.
+
+**`single = on`** in an `[app.*]` block (set for `linux-desktop` and
+`linux-desktop-win11` in `scripts/wc-linux-desktop-apps-guest.ini`) applies to
+a plain click (`Request::Run`). Jump-list tasks and pages are unchanged.
+
+1. **A window is up.** The launcher looks for a visible, unowned top-level
+   window of the session's compositor. The compositor's pid comes from the
+   state file, and only counts while the session's mutex exists, which is the
+   same test that makes a click warm (`session_alive`, `OpenMutexW`, never
+   creating it). The window must carry the application's identity
+   (`PKEY_AppUserModel_ID` = `appmeta::aumid`, §92). If the identity cannot be
+   read (Wine), the window's exact title must equal the block's `title`, which
+   is also the title `wc-proxy` gives both nested windows (102.4). If such a
+   window exists, the launcher restores it when minimised (`ShowWindowAsync`),
+   calls `SetForegroundWindow` (the click's own process may take the
+   foreground), logs one line and exits 0 without contacting the host.
+2. **A launch is in progress.** The launching click holds
+   `Local\waycompose-single-<session>-<section>` from the gate until its window
+   is found, or for at most 90 s. A click that finds the lock held waits (95 s
+   at most) for that window and then does 1. If the lock is let go with no
+   window, the first launch failed and has told the user, so this click exits
+   quietly. A lock left by a crashed launcher (`WAIT_ABANDONED`) counts as free.
+3. **A failed launch says so.** The cases are: the session could not start,
+   the host refused the `run`, or no window appeared within 90 s. The launcher
+   lets the lock go first, then shows a `MessageBoxW` captioned with the
+   application's title. The text is German when the UI language is
+   (`GetUserPreferredUILanguages`, as for the jump list), otherwise English.
+   The host's "already running" becomes "läuft bereits oder wird gerade
+   beendet … versuchen Sie es dann erneut". The dialog runs on a thread of its
+   own, so a session owner keeps supervising while the dialog is open. The
+   process waits for the dialog before it exits.
+
+The decisions (`crates/wc-launch/src/single.rs`) are pure functions with unit
+tests. The Win32 half in `main.rs` enumerates windows, waits on the mutex and
+focuses the window.
+
+**Under Wine** (`scripts/wc-launch-single-wine.sh`, 20 checks; the 90 s case
+with `WC_SINGLE_SLOW=1`), the real `wc-launch.exe` runs with
+`scripts/wc-launch-single-fake.rs` standing in for `ssh.exe`, the compositor
+and the relay:
+
+| case | result |
+|---|---|
+| a cold click | one `run`; the lock is taken and let go when the window appears |
+| a click on a minimised window | restored and foreground; exit 0; still one `run` |
+| five clicks 150 ms apart | one `run`, one window; four clicks waited and focused it |
+| the host refuses, three clicks | one `run`, one dialog ("already running"); the two others exit 0 quietly |
+| the session cannot start, `LANG=de_DE` | the German dialog |
+| accepted, no window in 90 s, plus a second click | one dialog; the second click exits 0 quietly |
+
+Wine has no window property store, so these runs exercise the title path
+only. The identity path is checked on the guest. Log lines on the guest
+(`%LOCALAPPDATA%\waycompose\wc-launch-<session>.log`):
+`single: <section>: a window is already up (hwnd …, by identity); …; no run sent`,
+`… another click is launching it; waiting up to 95 s …`,
+`… the other click's window is up after N ms …`,
+`… the other click's launch ended without a window …`,
+`CLICK-TO-WINDOW N ms (cold|warm, single; …)` and
+`single: <section>: FAILED after N ms (…); lock released; telling the user: …`.
+
+**With §107's shared compositor.** The installation has no compositor of its
+own then, and its state file says `comp-pid=0` so that `--stop` never kills
+the compositor every other installation's windows are in. The window lookup
+needs a process all the same: the launcher keeps the shared compositor's pid
+from its answer to `ping` (`compositor <pid>`) as `shared-pid` in the state
+file, and looks among that process's windows (`single::window_pid`). Several
+installations' windows share that process; they are told apart by identity
+(the AUMID from the app id), so two installations that give a `single`
+application the same app id would also share one taskbar button, and the
+lock (`Local\waycompose-single-<session>-<app>`) stays per installation.
+Checked on the guest when the shared compositor is deployed there; before
+that, by unit tests (`a_shared_compositors_windows_are_looked_for_…`,
+`the_shared_compositors_pid_comes_from_its_ping`).
+
 ### 102.10 The GPU
 
 `nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU
