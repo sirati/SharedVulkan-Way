@@ -56,10 +56,11 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
         match ByteChannel::claim(control, sv_transport::wlbytes::with_session(OWNER_CONTROL, svc.index)) {
             Ok(ch) => {
                 println!("[proxy] session control on ring slot {} (no ssh)", ch.slot());
+                let index = svc.index;
                 let c = Arc::clone(control);
                 std::thread::Builder::new()
                     .name("session-control".into())
-                    .spawn(move || serve_control(c, ch, session.clone(), id.clone()))
+                    .spawn(move || serve_control(c, ch, session.clone(), id.clone(), index))
                     .ok();
                 std::thread::Builder::new().name("lease".into()).spawn(watch_lease).ok();
             }
@@ -144,7 +145,7 @@ fn words_ok(line: &str) -> bool {
         && line.chars().all(|c| c.is_ascii_alphanumeric() || " +/=._-".contains(c))
 }
 
-fn serve_control(control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String) {
+fn serve_control(control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String, index: u8) {
     let fast = crate::ctlfast::Fast::new(session.clone(), id.clone());
     fast.prefetch();
     let mut lines = Lines { ch, buf: Vec::new() };
@@ -166,7 +167,11 @@ fn serve_control(control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: S
             std::thread::sleep(Duration::from_millis(50));
             // §107: and the slot is closed, so a compositor shared by other
             // sessions sees this one end now rather than when it stops answering.
-            let _ = control.kill_ring(lines.ch.slot());
+            // Only there: a one-session guest keeps pinging its slot until it
+            // ends, and nothing of its own quarantines the slot.
+            if index != 0 {
+                let _ = control.kill_ring(lines.ch.slot());
+            }
             std::process::exit(0);
         }
         let (raw, line) = match line.strip_prefix("raw ") {
