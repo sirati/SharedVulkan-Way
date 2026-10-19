@@ -8,6 +8,17 @@
 //! the handful of DRM ioctls Mesa's GBM, Zink and KWin issue, and the buffers
 //! KWin allocates on it are `sv-icd` allocations in guest-side shared sections,
 //! named by [`token`]s.
+//!
+//! * [`cuse`]: the FUSE kernel protocol over `/dev/cuse`.
+//! * [`drm`]: the DRM ioctls, and per-open GEM handles for imported tokens.
+//! * [`ns`]: `sv-drm ns`, the namespace in which libdrm sees the node as a
+//!   render node on bus "faux".
 
+#[cfg(target_os = "linux")]
+pub mod cuse;
+#[cfg(target_os = "linux")]
+pub mod drm;
+#[cfg(target_os = "linux")]
+pub mod ns;
 #[cfg(target_os = "linux")]
 pub mod token;
