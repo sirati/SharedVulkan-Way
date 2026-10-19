@@ -6,5 +6,6 @@ pub mod audio;
 pub mod com;
 pub mod handlers;
 pub mod open;
+pub mod policy;
 pub mod registry;
 pub mod stream;

@@ -12,6 +12,12 @@
 //!                                          check that nothing is left
 //!   wc-hostint-probe --render-test ID MS   play SILENCE to one endpoint
 //!   wc-hostint-probe --capture-test ID MS  record from one (turns a mic on)
+//!   wc-hostint-probe --get-defaults        every default endpoint, per
+//!                                          direction and role (saveable)
+//!   wc-hostint-probe --set-default <render|capture> <role|all> ID
+//!                                          make ID the default (IPolicyConfig)
+//!   wc-hostint-probe --restore-defaults F  reapply a --get-defaults file
+//!                                          and check every role
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
@@ -56,6 +62,24 @@ mod win {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if let Some(i) = args.iter().position(|a| a == "--reg-test") {
             return reg_test(args.get(i + 1).map(String::as_str).unwrap_or("."));
+        }
+        if args.first().map(String::as_str) == Some("--get-defaults") {
+            return match wc_hostplat::win::policy::get_defaults() {
+                Ok(ds) => {
+                    print!("{}", wc_hostplat::defaults::format(&ds));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("get-defaults: {e}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+        if args.first().map(String::as_str) == Some("--set-default") {
+            return set_default(&args[1..]);
+        }
+        if args.first().map(String::as_str) == Some("--restore-defaults") {
+            return restore_defaults(args.get(1).map(String::as_str).unwrap_or(""));
         }
         if let Some(i) = args.iter().position(|a| a == "--render-test" || a == "--capture-test") {
             let id = args.get(i + 1).cloned().unwrap_or_default();
@@ -161,6 +185,71 @@ mod win {
             println!("capture: {got} bytes read; {}", c.stats().line(fmt.rate));
         }
         ExitCode::SUCCESS
+    }
+
+    /// `--set-default <render|capture> <role|all> <endpoint-id>`.
+    fn set_default(a: &[String]) -> ExitCode {
+        use wc_hostplat::defaults::{Flow, Role};
+        let (Some(flow), Some(roles), Some(id)) =
+            (a.first().and_then(|s| Flow::parse(s)), a.get(1).and_then(|s| Role::parse_many(s)), a.get(2))
+        else {
+            eprintln!("usage: --set-default <render|capture> <console|multimedia|communications|all> <endpoint-id>");
+            return ExitCode::from(2);
+        };
+        let mut ok = true;
+        for r in roles {
+            match wc_hostplat::win::policy::set_default(flow, r, id) {
+                Ok(via) => println!("{} {} {} (via {via})", flow.word(), r.word(), id),
+                Err(e) => {
+                    eprintln!("set-default {} {}: {e}", flow.word(), r.word());
+                    ok = false;
+                }
+            }
+        }
+        if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    }
+
+    /// `--restore-defaults FILE`: put back every default a `--get-defaults`
+    /// recorded, then check that they are what the file says. A direction
+    /// that had no device (`-`) is left alone.
+    fn restore_defaults(path: &str) -> ExitCode {
+        use wc_hostplat::defaults::parse;
+        use wc_hostplat::win::policy;
+        let want = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| parse(&t)) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("restore-defaults {path:?}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut ok = true;
+        // Only what differs is set: a role already right is not touched.
+        let before = policy::get_defaults().unwrap_or_default();
+        for d in &want {
+            let Some(id) = &d.id else { continue };
+            if before.iter().any(|b| b.flow == d.flow && b.role == d.role && b.id.as_deref() == Some(id.as_str())) {
+                continue;
+            }
+            if let Err(e) = policy::set_default(d.flow, d.role, id) {
+                eprintln!("restore {} {}: {e}", d.flow.word(), d.role.word());
+                ok = false;
+            }
+        }
+        match policy::get_defaults() {
+            Ok(now) => {
+                for d in &want {
+                    let got = now.iter().find(|n| n.flow == d.flow && n.role == d.role).and_then(|n| n.id.clone());
+                    let same = d.id.is_none() || got == d.id;
+                    println!("{} {} {} {}", d.flow.word(), d.role.word(), got.as_deref().unwrap_or("-"), if same { "ok" } else { "DIFFERS" });
+                    ok &= same;
+                }
+            }
+            Err(e) => {
+                eprintln!("get-defaults: {e}");
+                ok = false;
+            }
+        }
+        if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
     }
 
     fn reg_test(dir: &str) -> ExitCode {

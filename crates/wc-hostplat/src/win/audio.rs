@@ -51,7 +51,7 @@ pub(crate) fn device(e: &Enumerator, id: &str) -> Result<MmDevice, String> {
     unsafe { out("IMMDeviceEnumerator::GetDevice", |p| (e.v().get_device)(e.as_raw(), w.as_ptr(), p)) }
 }
 
-fn device_id(d: &MmDevice) -> Result<String, String> {
+pub(crate) fn device_id(d: &MmDevice) -> Result<String, String> {
     let mut p: *mut u16 = std::ptr::null_mut();
     // SAFETY: a live device; the id is CoTaskMemAlloc'ed.
     let hr = unsafe { (d.v().get_id)(d.as_raw(), &mut p) };
@@ -362,3 +362,33 @@ fn run(e: &Enumerator, rx: &Receiver<Ping>, on_state: &mut dyn FnMut(State) -> b
 
 /// How long [`watch`] may take from a change to its event.
 pub const LATENCY: Duration = debounce::MAX;
+
+const IID_MM_ENDPOINT: GUID = GUID::from_u128(0x1be09788_6894_4089_8586_9a2a6c265ac5);
+
+/// `IMMEndpoint`.
+#[repr(C)]
+struct EndpointVtbl {
+    base: UnknownVtbl,
+    get_data_flow: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
+}
+
+/// An active endpoint's `EDataFlow` (0 render, 1 capture); an error if it
+/// is not active.
+pub(crate) fn flow_of(d: &MmDevice) -> Result<i32, String> {
+    let mut state = 0u32;
+    // SAFETY: a live device.
+    unsafe { (d.v().get_state)(d.as_raw(), &mut state) };
+    if state != DEVICE_STATE_ACTIVE {
+        return Err(format!("the endpoint is not active (state {state})"));
+    }
+    // SAFETY: QueryInterface into an IMMEndpoint, released on drop.
+    let ep: Com<EndpointVtbl> =
+        unsafe { out("QueryInterface(IMMEndpoint)", |p| (d.v().base.query_interface)(d.as_raw(), &IID_MM_ENDPOINT, p))? };
+    let mut flow = -1;
+    // SAFETY: a live IMMEndpoint.
+    let hr = unsafe { (ep.v().get_data_flow)(ep.as_raw(), &mut flow) };
+    if hr < 0 {
+        return Err(format!("IMMEndpoint::GetDataFlow: {}", hr_text(hr)));
+    }
+    Ok(flow)
+}

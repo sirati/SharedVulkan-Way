@@ -9,6 +9,7 @@
 //! is built.
 
 pub mod debounce;
+pub mod defaults;
 pub mod handlers;
 pub mod pcm;
 pub mod share;
