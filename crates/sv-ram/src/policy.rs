@@ -17,11 +17,14 @@ pub struct Policy {
     pub idle_ms: u64,
     /// No retire within this long of a grow.
     pub calm_ms: u64,
+    /// A region empty this long is retired even inside the low-water
+    /// margin: an idle pool gives everything back in the end.
+    pub deep_idle_ms: u64,
 }
 
 impl Default for Policy {
     fn default() -> Policy {
-        Policy { unit: 2 * MIB, min_step: 64 * MIB, max_step: GIB, low_water_floor: 32 * MIB, idle_ms: 30_000, calm_ms: 10_000 }
+        Policy { unit: 2 * MIB, min_step: 64 * MIB, max_step: GIB, low_water_floor: 32 * MIB, idle_ms: 30_000, calm_ms: 10_000, deep_idle_ms: 300_000 }
     }
 }
 
@@ -34,6 +37,22 @@ pub struct Usage {
     pub free: u64,
     /// Bytes the provider may still add (its budget).
     pub budget: u64,
+}
+
+impl Policy {
+    /// The defaults, with `SV_RAM_IDLE_MS`, `SV_RAM_DEEP_IDLE_MS` and
+    /// `SV_RAM_CALM_MS` overriding the times (harnesses that cannot wait
+    /// five minutes).
+    pub fn from_env() -> Policy {
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
+        let d = Policy::default();
+        Policy {
+            idle_ms: env("SV_RAM_IDLE_MS").unwrap_or(d.idle_ms),
+            deep_idle_ms: env("SV_RAM_DEEP_IDLE_MS").unwrap_or(d.deep_idle_ms),
+            calm_ms: env("SV_RAM_CALM_MS").unwrap_or(d.calm_ms),
+            ..d
+        }
+    }
 }
 
 fn round_up(x: u64, unit: u64) -> u64 {
@@ -74,9 +93,8 @@ impl Policy {
     /// May a region of `len` bytes, empty for `idle_ms`, be retired now?
     pub fn may_retire(&self, len: u64, idle_ms: u64, since_grow_ms: u64, retiring: bool, u: Usage) -> bool {
         !retiring
-            && idle_ms >= self.idle_ms
             && since_grow_ms >= self.calm_ms
-            && u.free.saturating_sub(len) >= 2 * self.low_water(u.used)
+            && ((idle_ms >= self.idle_ms && u.free.saturating_sub(len) >= 2 * self.low_water(u.used)) || idle_ms >= self.deep_idle_ms)
     }
 }
 
@@ -125,5 +143,8 @@ mod tests {
         assert!(!p.may_retire(64 * MIB, 30_000, 10_000, true, u));
         // without the region, free would fall below twice the low water mark
         assert!(!p.may_retire(160 * MIB, 30_000, 10_000, false, u));
+        // ... until it has been idle for the deep-idle time: an idle pool
+        // gives everything back.
+        assert!(p.may_retire(160 * MIB, 300_000, 10_000, false, u));
     }
 }

@@ -64,11 +64,12 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
         let m = Arc::new(RegionManager {
             prov: Mutex::new(prov),
             server: Arc::clone(&server),
-            policy: Policy::default(),
+            policy: Policy::from_env(),
             budget,
             live: Mutex::new(BTreeMap::new()),
             last_grow: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         });
+        MANAGERS.lock().unwrap().push(Arc::clone(&m) as Arc<dyn RetireAll>);
         let g = Arc::clone(&m);
         server.set_grower(Box::new(move |need| g.grow(need)));
         let t = Arc::clone(&m);
@@ -197,6 +198,9 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
                         continue;
                     }
                     if empty.contains(&k) {
+                        if l.idle_since.is_none() {
+                            eprintln!("[gpu] regions: region {k} holds no lease; it goes back after {} s idle ({} s inside the low-water margin)", self.policy.idle_ms / 1000, self.policy.deep_idle_ms / 1000);
+                        }
                         let since = *l.idle_since.get_or_insert_with(Instant::now);
                         if retire.is_none() && self.policy.may_retire(l.len, now_ms(since), since_grow, retiring, usage) {
                             retire = Some((k, l.entry));
@@ -234,4 +238,54 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
 
 fn live_len(live: &BTreeMap<u32, Live>) -> u64 {
     live.values().map(|l| l.len).sum()
+}
+
+/// Something whose regions can all be given back at once.
+trait RetireAll: Send + Sync {
+    fn retire_everything(&self, timeout: Duration);
+}
+
+static MANAGERS: Mutex<Vec<Arc<dyn RetireAll>>> = Mutex::new(Vec::new());
+
+/// An orderly exit (§108.5): every region that holds no lease is retired and,
+/// once the host lets go, freed, waiting at most `timeout`. A region still
+/// leased, or one the host does not answer for in time, stays with the
+/// keeper, and the next GPU process adopts it.
+pub fn retire_all(timeout: Duration) {
+    let ms: Vec<Arc<dyn RetireAll>> = MANAGERS.lock().unwrap().clone();
+    for m in ms {
+        m.retire_everything(timeout);
+    }
+}
+
+impl<S: Substrate + Send + 'static> RetireAll for RegionManager<S> {
+    fn retire_everything(&self, timeout: Duration) {
+        let mut prov = self.prov.lock().unwrap();
+        let ks: Vec<(u32, u32)> = self.live.lock().unwrap().iter().filter(|(_, l)| l.mapped).map(|(&k, l)| (k, l.entry)).collect();
+        let mut n = 0;
+        for (k, entry) in ks {
+            if self.server.remove_region(k).is_ok() {
+                if let Some(l) = self.live.lock().unwrap().get_mut(&k) {
+                    l.mapped = false;
+                }
+                prov.retire(entry);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return;
+        }
+        eprintln!("[gpu] regions: exiting; {n} region(s) retired, waiting up to {} s for the host to let go", timeout.as_secs());
+        let t = Instant::now();
+        while t.elapsed() < timeout && prov.regions.values().any(|r| r.phase == sv_ram::provider::Phase::Retiring) {
+            match prov.poll() {
+                Ok(evs) => self.absorb(&mut prov, evs),
+                Err(e) => {
+                    eprintln!("[gpu] regions: {e}");
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }

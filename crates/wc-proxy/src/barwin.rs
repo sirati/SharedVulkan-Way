@@ -135,6 +135,18 @@ impl RegionSource for BarWindows {
             0 => ProvidedRegion::ivshmem_window(&self.path, self.run, id, off, len),
             k => match self.regions.get(&k) {
                 Some(p) => ProvidedRegion::region_window(p, id, off, len),
+                // §108: arena region K ≥ 2 is the GPU pool's region K - 1,
+                // grown from guest RAM; the host's region peer describes it
+                // beside the GPU device's file (region 1).
+                #[cfg(target_os = "linux")]
+                None if k >= 2 && self.regions.contains_key(&1) => {
+                    let desc = format!("{}-{}.ram", self.regions[&1].display(), k - 1);
+                    let r = ProvidedRegion::ram_window(Path::new(&desc), id, off, len);
+                    if r.is_ok() {
+                        println!("[proxy] arena region {id:#x}: guest-RAM window {off}+{len} of pool region {k} ({desc}, §108)");
+                    }
+                    r
+                }
                 None => Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("region {k} of the pool was granted, and this proxy was given no file for it (--arena-region)"),

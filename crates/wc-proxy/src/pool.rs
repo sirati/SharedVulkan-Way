@@ -359,6 +359,10 @@ enum Backing {
     /// The guest's own RAM, found in QEMU's memory backend and stitched into
     /// one view. Not a file, and therefore not subject to a mount's caching.
     GuestRam(crate::guestram::StitchedRegion),
+    /// §108: a window of a guest-RAM region of the GPU pool, and the lease
+    /// file this process holds a shared lock on while it maps it: the
+    /// host's peer answers the guest `UNMAPPED` only once nobody holds it.
+    GuestRamLeased(crate::guestram::StitchedRegion, #[allow(dead_code)] std::fs::File),
 }
 
 impl Backing {
@@ -366,6 +370,7 @@ impl Backing {
         match self {
             Backing::File { view, .. } => view.as_mut_slice(),
             Backing::GuestRam(r) => r.as_mut_slice(),
+            Backing::GuestRamLeased(r, _) => r.as_mut_slice(),
         }
     }
 }
@@ -914,6 +919,48 @@ impl ProvidedRegion {
         let region = crate::guestram::StitchedRegion::attach(&plan)?;
         let origin = format!("pool region window {offset}+{len} of {}", path.display());
         Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
+    }
+
+    /// §108: a window `[offset, offset+len)` of a guest-RAM region of the GPU
+    /// pool, from the run list the host's region peer published at `desc`
+    /// (`{gpu device}-{k}.ram`). Holds the region's lease file shared while
+    /// the window is mapped.
+    #[cfg(target_os = "linux")]
+    pub fn ram_window(desc: &Path, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
+        use std::os::fd::AsRawFd;
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", desc.display()));
+        let text = std::fs::read_to_string(desc)?;
+        let (mut epoch, mut ram, mut total, mut runs) = (0u64, String::new(), 0u64, Vec::new());
+        for l in text.lines() {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            match w.as_slice() {
+                ["epoch", e] => epoch = e.parse().unwrap_or(0),
+                ["ram", p] => ram = p.to_string(),
+                ["len", n] => total = n.parse().unwrap_or(0),
+                ["run", f, x, n] => runs.push((f.parse::<u64>().unwrap_or(0), x.parse::<u64>().unwrap_or(0), n.parse::<u64>().unwrap_or(0))),
+                _ => {}
+            }
+        }
+        if epoch == 0 || ram.is_empty() || len == 0 || offset.checked_add(len).is_none_or(|e| e > total) || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+            return Err(bad(format!("no window {offset}+{len} in a {total}-byte region")));
+        }
+        let lease_path = desc.to_string_lossy().trim_end_matches(".ram").to_string() + &format!("-{epoch}.lease");
+        let lock = std::fs::File::open(&lease_path)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return Err(bad("the region is being retired".into()));
+        }
+        // The runs that cover the window, cut to it.
+        let mut wruns = Vec::new();
+        for (file_off, at, n) in runs {
+            let (s, e) = (at.max(offset), (at + n).min(offset + len));
+            if s < e {
+                wruns.push(crate::guestram::Run { arena_offset: s - offset, file_offset: file_off + (s - at), len: e - s });
+            }
+        }
+        let plan = crate::guestram::Plan { id, object: PathBuf::from(&ram), len, run_id: 0, outbound: None, runs: wruns };
+        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let origin = format!("guest-RAM window {offset}+{len} of {} (§108)", desc.display());
+        Ok(ProvidedRegion { backing: Backing::GuestRamLeased(region, lock), origin, len, id: Some(id) })
     }
 
     /// A region backed by a file on this machine.

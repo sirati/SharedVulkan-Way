@@ -198,6 +198,12 @@ impl PoolServer {
         Ok(l)
     }
 
+    /// Lease without importing, growing the pool if it is full (§108): what a
+    /// Wayland buffer in the one pool needs (§110).
+    pub fn lease_growing(&self, session: u64, len: u64, purpose: Purpose) -> Result<Lease, String> {
+        self.take(session, len, purpose)
+    }
+
     fn note_lease(&self) {
         let used = {
             let p = self.pool();
