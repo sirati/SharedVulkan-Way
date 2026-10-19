@@ -35247,6 +35247,24 @@ R43 accepts that: one host user is one trust domain.
   `UNMAPPED` once their leases are free, which is correct only because the
   peer itself never writes into a region.
 
+### 108.17 Gates
+
+At the commit that adds this subsection (master `f0b85c3` merged in):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 116 binaries, **3272 passed, 0 failed**, 9 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section wrote or changed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | every citation resolves |
+| `scripts/sv-pool-grow-e2e.sh` | PASS (108.13) |
+| `scripts/wc-multi-install.sh` (legs 1–8) | `wc-multi-install: OK`; leg 8 is this section's |
+| `scripts/wc-guestram-stress.sh` on the test VM | 65-min long run and the 10-min pressure leg OK (108.12); the cross-user leg by hand (108.10) |
+| `sv_ram::udma` tests as root and as uid 1000 in a minimal VM | pass, and refused, as they should be (108.15) |
+
+Evidence (logs only, outside the repository):
+`/mnt/datasets/builds/evidence/windows-guest-ram/`.
+
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same
