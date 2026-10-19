@@ -32348,7 +32348,7 @@ is added to the common modes. The mapping:
 | `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
 | `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
 | `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
-| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x. Superseded by 103.18: the output's scale is the screen's, and the layer's `contentsScale` follows |
 | `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
 
 **The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
@@ -33144,11 +33144,71 @@ the bell port: no ssh, socket, TCP or vsock in the session's path.
 * The proxy's microphone source failed to load (`mkfifo sound-2.fifo: File
   exists`) once the Mac's devices were re-announced.
 
+### 103.18 Output scale: Retina without blur
+
+Until this section every surface pixel was one Mac point, and on a Retina
+screen AppKit doubled the layer: correct and soft (103.7's table). Now the one
+output has an integer scale S, which the platform gives (`Started::scale`):
+the main screen's `backingScaleFactor`, rounded, at least 1, on macOS; 1 on
+Win32 and headless. `--output-scale N` overrides it, for a harness. It is read
+through `State::scale_for(surface)`, so a platform with a scale per monitor
+(Windows' per-monitor DPI) changes that function and the output setup, not the
+readers.
+
+**Logical stays logical.** Configure sizes, window geometry, input, pointer
+constraints, popup placement, `ToUi::Map`/`Resize`/`MovePopup` and the
+control socket's rectangles are in surface units, which are Mac points. Only
+pixels are in device pixels.
+
+**What a client sees at S > 1:**
+
+| | S = 1 (unchanged) | S > 1 |
+|---|---|---|
+| `wl_output.mode` | logical size | logical size × S |
+| `wl_output.scale` | not sent (1) | S |
+| `wl_compositor` | version 5 | version 6 |
+| `wl_surface.preferred_buffer_scale` | never | S, at `new_surface` |
+| a buffer of scale B ≠ 1 | drawn unscaled, and logged | honoured |
+
+**Pixels.** A surface's staging shadow, and so a window's shadow, is its
+logical size × S. A buffer with B = S is copied 1:1. Any other B is a view
+(`surface::view_of`, §102's path): the whole buffer resampled, nearest
+neighbour, to (buffer / B) × S, which is ×2 for an Xwayland or other B = 1
+client on S = 2. A viewport's destination is logical, so it is × S as well.
+Surface damage is mapped into buffer pixels (× B), buffer damage into the
+shadow by the view (S / B, widened by a pixel), and subsurface offsets (× S)
+when the tree is composed. Readers that want a size (bounds, hit test,
+pointer holds, the geometry-only commit, `mapped_windows`) divide by S
+(`State::surface_size`). The shadow carries its scale (`Shadow::scale`), so
+the platform knows how many points it is.
+
+**macOS.** The layer's `contentsScale` is set to the shadow's scale on every
+present, since AppKit resets it when a window changes screen; window and popup
+frames already come from logical sizes. The face's IOSurface pair is the
+shadow's size in pixels, and `ToFace::Surface` carries the scale. A client
+cursor's `NSImage` is sized in points (`image / B`, `CursorSpec::Image.scale`),
+with the hotspot in points; Win32 ignores the scale, as before.
+
+**Checked here (Linux, headless, `--output-scale 2`).** weston-terminal
+(version 5, told by `wl_output.scale` and `enter`) drew at B = 2 into a
+1484x854 shadow for a 742x427 window, after a first B = 1 frame that was
+doubled; foot (version 6) read `preferred_buffer_scale(2)` before its first
+frame; weston-presentation-shm stayed at B = 1 and was doubled. At S = 1
+weston-terminal's frame hashes were those of the binary before this section.
+The macOS half (`contentsScale`, the cursor's size, popup frames on a Retina
+screen) was compiled, not run.
+
+**Not built.** Fractional scale (`wp_fractional_scale_v1` with viewporter,
+for 125 % and 150 %), which this does not design out: the scale is per output
+and the view path already resamples. A scale that changes while running (a
+window moved to a screen of another scale): S is read once at start. Windows'
+per-monitor DPI. A filter better than nearest neighbour for B ≠ S.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
   what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
-  Retina scale above 1. SVG icons (the host's resolver
+  Fractional scale (integer Retina scale is 103.18). SVG icons (the host's resolver
   has no renderer, as on Windows). A frequent-pages section in the Dock menu
   (`macbundle::dock_items` takes them, and the launcher does not fetch
   `frequent` yet).
