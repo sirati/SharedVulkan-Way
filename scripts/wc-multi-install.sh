@@ -16,7 +16,8 @@
 #   session; the nested-compositor globals for one session only; a wrong key refused while the others run; one session's proxy
 #   killed, the others unaffected, its regions reused by the next boot; the
 #   compositor killed and started again; `down` for all and the compositor's
-#   own end; a BAR too small for a third session's region, refused cleanly.
+#   own end; a BAR too small for a third session's region, refused cleanly; one pool over a
+#   second region (§110); host integration on beside the arena (§106).
 #
 # Run from inside `nix develop` after
 # `cargo build -p wc-compositor -p wc-proxy -p wc-arena-host -p sv-hostd -p wc-launch`.
@@ -118,7 +119,8 @@ start_compositor() {
   XDG_RUNTIME_DIR="$D/crt" WC_IVSHMEM_STANDIN="$D/arena" "$BIN/wc-compositor" \
     --arena-ivshmem 0 --arena-outbound 0:1048576 --wayland-rings "$D/guest.sock" \
     --socket "wcm$$-$tag" --in-band --timeout 600 --exit-when-empty $LINGER \
-    --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} >"$D/comp-$tag.log" 2>&1 &
+    --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} \
+    ${COMP_EXTRA:-} >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
   wait_line "$D/comp-$tag.log" 'user control socket' 20 || bad "compositor $tag: no user control socket"
 }
@@ -300,6 +302,35 @@ for t in a b c; do request "${t}p" "raw down" >/dev/null; done
 wait_line "$D/comp-4.log" 'installation wcmc\) ENDED' 15
 wait_line "$D/comp-4.log" 'session [0-9]'"'"'s [0-9]* region' 10
 ok "after down: $(grep -c 'back in the pool' "$D/comp-4.log") session(s) returned their regions; $(grep -o 'back in the pool ([0-9]* MiB free' "$D/comp-4.log" | tail -1)"
+
+say "leg 8: host integration (§106) on beside the arena: every session's service slots are its own"
+# The guest's compositor runs with --hostint (wc-launch.exe passes it), so each
+# session has an OWNER_HOSTINT slot beside its OWNER_ARENA slot. On the guest the
+# two once had one owner id, and a session's `grow` was answered with hostint's
+# hello (`not a grant: "hello 1 windows"`): no client got a buffer.
+sleep $((LINGER + 1))
+kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+kill "$PORT" 2>/dev/null; start_port
+COMP_EXTRA=--hostint start_compositor 5
+for t in a b c; do
+  R=$(boot "${t}h" "wcm$t" "$D/guest-wcm$t.key"); case "$R" in ok\ located*) ;; *) bad "hostint boot $t: $R" ;; esac
+  echo "$R" | awk '{print $3}' >"$D/idx-${t}h"
+done
+for t in a b c; do
+  R=$(request "${t}h" "raw run shm 96 30"); case "$R" in ok-raw*'run accepted'*) ;; *) bad "hostint run ${t}h: $R" ;; esac
+  keep_log "$D/run/wcm$t-$$-${t}h/proxy.log" "$D/proxy-${t}h.log"
+done
+sleep 5
+for t in a b c; do
+  I=$(cat "$D/idx-${t}h")
+  wait_line "$D/comp-5.log" "arena: session $I granted region" 15 && ok "session $I (wcm$t) got its region with hostint on" || bad "session $I (wcm$t) got no region with hostint on"
+  grep -q 'not a grant' "$D/proxy-${t}h.log" && bad "proxy ${t}h: $(grep -m1 -o 'not a grant.*' "$D/proxy-${t}h.log" | cut -c1-100)"
+done
+HS=$(grep -c 'hostint: on ring slot' "$D/comp-5.log")
+[ "$HS" -ge 3 ] && ok "hostint served on $HS slot(s): $(grep -o 'hostint: on ring slot [0-9]*' "$D/comp-5.log" | awk '{print $5}' | tr '\n' ' ')" || bad "hostint on only $HS slot(s)"
+MAPPED=$(grep -c ' mapped ' "$D/comp-5.log")
+[ "$MAPPED" -ge 3 ] && ok "$MAPPED window(s) mapped with hostint on" || bad "only $MAPPED window(s) mapped with hostint on"
+for t in a b c; do request "${t}h" "raw down" >/dev/null; done
 
 if [ -n "${WC_MULTI_EVIDENCE:-}" ]; then mkdir -p "$WC_MULTI_EVIDENCE" && cp "$D"/*.log "$WC_MULTI_EVIDENCE"/ 2>/dev/null; fi
 echo "logs: $D"
