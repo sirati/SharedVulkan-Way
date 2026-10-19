@@ -299,6 +299,13 @@ pub struct State {
     /// never given back — Zink destroys a pool with every context, and Firefox
     /// makes a WebGL context per page (docs/design.md §0.28).
     pub command_buffers: HashMap<u64, u64>,
+    /// The dma-buf path (waycompose-design.md §104, [`crate::dmabuf`]): the
+    /// token of each shared `VkDeviceMemory`, the images made through it, the
+    /// sync-fd semaphores, and one fence per device for consuming a signal.
+    pub shared_memories: HashMap<u64, crate::dmabuf::SharedToken>,
+    pub dmabuf_images: HashMap<u64, crate::dmabuf::DmabufImage>,
+    pub semaphores: HashMap<u64, crate::dmabuf::Semaphore>,
+    pub sync_fences: HashMap<u64, u64>,
     pub allocator: Box<dyn Backing>,
     /// Most arena bytes ever in use at once, and the value `SV_DEBUG` last
     /// reported ([`State::note_arena_use`]).
@@ -320,6 +327,10 @@ impl State {
             set_layouts: HashMap::new(),
             descriptor_sets: HashMap::new(),
             command_buffers: HashMap::new(),
+            shared_memories: HashMap::new(),
+            dmabuf_images: HashMap::new(),
+            semaphores: HashMap::new(),
+            sync_fences: HashMap::new(),
             allocator,
             arena_high_water: 0,
             arena_reported: 0,
@@ -751,6 +762,19 @@ impl SharedVulkan {
         // different questions about different code.
         if !out.iter().any(|(n, _)| *n == "VK_KHR_swapchain") {
             out.push(("VK_KHR_swapchain", 70));
+        }
+
+        // The dma-buf path's six (waycompose-design.md §104), implemented in
+        // `crate::dmabuf` like the swapchain above is in `crate::wsi`, and only
+        // with `SV_DRM_NODE` set. Before the `depends=` closure, which they
+        // must pass like any other.
+        if crate::dmabuf::enabled() {
+            for (n, v) in crate::dmabuf::EXTENSIONS {
+                match out.iter_mut().find(|(o, _)| o == n) {
+                    Some(e) => e.1 = *v,
+                    None => out.push((n, *v)),
+                }
+            }
         }
 
         // Close the set under `depends=`.

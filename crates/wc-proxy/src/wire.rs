@@ -557,7 +557,10 @@ mod tests {
         // single-pixel buffer manager (two) and `wp_presentation` (two
         // requests, four events), thirteen messages a nested KWin sends or
         // is sent.
-        assert_eq!(checked, 494, "the vendored protocols changed shape");
+        //
+        // 494 to 534 in §104: `linux-dmabuf-v1`, nine requests and eleven
+        // events over three interfaces, twenty messages.
+        assert_eq!(checked, 534, "the vendored protocols changed shape");
     }
 }
 

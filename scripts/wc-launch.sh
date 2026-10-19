@@ -163,6 +163,14 @@ GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
+# §104. WC_LAUNCH_DMABUF_NODE=/dev/dri/renderD128: the proxy offers
+# zwp_linux_dmabuf_v1 on that node ($HOSTDIR/dmabuf-node, read by wc-session)
+# — the nested KWin's userspace render node. WC_LAUNCH_ICD_STORE=1: the ICD
+# goes into the host's Nix store (manifest beside it, a relative library
+# path) and gpu.env names it there, because another user's session (the
+# nested KWin's, <desktop-user>'s) only takes a GPU environment of store paths.
+DMABUF_NODE="${WC_LAUNCH_DMABUF_NODE:-}"
+ICD_STORE="${WC_LAUNCH_ICD_STORE:-}"
 REL_WIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/release"
 REL_LINUX="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 
@@ -658,6 +666,11 @@ APPS
   sed -i "s|@EXEC@|$exe|" "$hstage/apps.ini"
   # §102: the proxy's copy scope for this installation (wc-session reads
   # $HOSTDIR/copy-scope). Unset: damage, and no file.
+  case "$DMABUF_NODE" in
+    /dev/dri/renderD[0-9]*) h "printf '%s' $DMABUF_NODE > $HOSTDIR/dmabuf-node" >/dev/null ;;
+    "") h "rm -f $HOSTDIR/dmabuf-node" >/dev/null ;;
+    *) echo "error: WC_LAUNCH_DMABUF_NODE is a /dev/dri/renderD<N> path"; exit 1 ;;
+  esac
   case "${WC_LAUNCH_COPY_SCOPE:-}" in
     buffer) h "printf buffer > $HOSTDIR/copy-scope" >/dev/null ;;
     ""|damage) h "rm -f $HOSTDIR/copy-scope" >/dev/null ;;
@@ -731,12 +744,21 @@ UNIT
         ok "the shared doorbell hub runs for every installation ($hubbin, wc-bell-hub.service: $hs)" ;;
       *) bad "the shared doorbell hub is not running: $hs"; exit 1 ;;
     esac
+    local icd_json=$HOSTDIR/bin/sv_icd.json
+    if [ -n "$ICD_STORE" ]; then
+      # One store path holding the library and a manifest that names it
+      # relatively, GC-rooted beside the binaries.
+      icd_json=$(h "set -e; t=\$(mktemp -d); cp $HOSTDIR/bin/libsv_icd.so \$t/; \
+        printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"./libsv_icd.so\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' >\$t/sv_icd.json; \
+        p=\$(nix-store --add \$t); rm -rf \$t; nix-store -r \$p --add-root $HOSTDIR/bin/icd-store --indirect >/dev/null; echo \$p/sv_icd.json" | tail -1)
+      case "$icd_json" in /nix/store/*/sv_icd.json) ok "the ICD in the host's store: $icd_json" ;; *) bad "the ICD did not go into the store: $icd_json"; exit 1 ;; esac
+    fi
     local genv
     genv="MESA_LOADER_DRIVER_OVERRIDE=zink
 LIBGL_KOPPER_DRI2=1
 __EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
 LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
-VK_DRIVER_FILES=$HOSTDIR/bin/sv_icd.json"
+VK_DRIVER_FILES=$icd_json"
     if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
       printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
       echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"
