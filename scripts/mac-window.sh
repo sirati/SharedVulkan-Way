@@ -20,13 +20,15 @@ ulimit -c 0
 inst=${MACVM_INSTANCE:-wayland-host}
 root=$(cd "$(dirname "$0")/.." && pwd)
 idir=/mnt/datasets/macvm/instances/$inst
+# The VM's account comes from the VM store, not from this repository.
+VMUSER=$(sed -n 's/.*"user": "\([^"]*\)".*/\1/p' "$idir/instance.json")
 mvm=/mnt/datasets/macvm/bin/macos-vm
 secs=${WC_SECS:-120}
 arena_mib=${WC_ARENA_MIB:-64}
 arena=$((arena_mib * 1024 * 1024))
 out=$((1024 * 1024))
 # The compositor is cross-built here (scripts/macos-linker.sh) and copied in.
-bin=/Users/c3r/wc/bin/wc-compositor
+bin=/Users/$VMUSER/wc/bin/wc-compositor
 local_bin=${WC_MAC_BIN:-$root/target/x86_64-apple-darwin/debug/wc-compositor}
 run=/mnt/datasets/builds/wcrun/mac-$(date +%Y%m%d-%H%M%S)
 # This run's socket in the VM, which is also the only thing it may kill there
@@ -42,9 +44,9 @@ pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   vm "pkill -f 'wc-compositor --socket $sock ' 2>/dev/null; true" >/dev/null 2>&1
-  [ "${WC_KEEP:-0}" = 1 ] || { cp "$run"/*.log /mnt/datasets/builds/wcrun/mac-last/ 2>/dev/null; rm -rf "$run"; }
+  [ "${WC_KEEP:-0}" = 1 ] || { cp "$run"/*.log ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last/ 2>/dev/null; rm -rf "$run"; }
 }
-mkdir -p /mnt/datasets/builds/wcrun/mac-last
+mkdir -p ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last
 trap cleanup EXIT
 
 bh="$root/target/debug"
@@ -53,11 +55,11 @@ for b in wc-arena-host wc-proxy; do [ -x "$bh/$b" ] || { say "build $b first (ca
 say "run dir $run"
 [ -x "$local_bin" ] || { say "no macOS build at $local_bin (cargo build --target x86_64-apple-darwin -p wc-compositor)"; exit 2; }
 vm 'mkdir -p ~/wc/bin'
-rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" c3r@127.0.0.1:wc/bin/wc-compositor
+rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" $VMUSER@127.0.0.1:wc/bin/wc-compositor
 vm 'mkdir -p -m 700 /tmp/wcrt; rm -f /tmp/wcrt/comp.log'
 # The GUI session: a process started by sshd is outside the user's Aqua
 # bootstrap namespace and cannot reach the WindowServer.
-vm "sudo -n launchctl asuser 501 sudo -n -u c3r env XDG_RUNTIME_DIR=/tmp/wcrt WC_MAC_TRACE=${WC_MAC_TRACE:-1} WC_MAC_CMD_KEY=\${WC_MAC_CMD_KEY:-control} \
+vm "sudo -n launchctl asuser 501 sudo -n -u $VMUSER env XDG_RUNTIME_DIR=/tmp/wcrt WC_MAC_TRACE=${WC_MAC_TRACE:-1} WC_MAC_CMD_KEY=\${WC_MAC_CMD_KEY:-control} \
   $bin --socket $sock --in-band --timeout $((secs + 30)) --exit-when-empty 20 \
   --arena-guest-ram 0:$arena --arena-outbound 0:$out > /tmp/wcrt/comp.log 2>&1 &"
 for i in $(seq 1 60); do vm 'grep -q "listening on" /tmp/wcrt/comp.log 2>/dev/null' && break; sleep 0.5; done
@@ -74,7 +76,7 @@ t1=$(date +%s.%N)
 [ -s "$run/arena.plan" ] || { say "the arena was not located"; tail -8 "$run/locate.log"; exit 1; }
 say "located in $(awk "BEGIN{printf \"%.2f\", $t1 - $t0}") s: $(grep -o 'verify: [0-9]*/[0-9]* pages' "$run/locate.log" | tail -1), $(grep -c '^run' "$run/arena.plan" 2>/dev/null) runs"
 
-ssh "${ssh_opts[@]}" -N -o StreamLocalBindUnlink=yes -L "$run/up.sock:/tmp/wcrt/$sock" c3r@127.0.0.1 &
+ssh "${ssh_opts[@]}" -N -o StreamLocalBindUnlink=yes -L "$run/up.sock:/tmp/wcrt/$sock" $VMUSER@127.0.0.1 &
 pids+=($!)
 for i in $(seq 1 40); do [ -S "$run/up.sock" ] && break; sleep 0.25; done
 
@@ -95,8 +97,8 @@ if [ -n "${WC_SHOT_AFTER:-}" ]; then
   # WC_DURING: a command run once the window is up, before the screenshot
   # (input through scripts/mac-input.sh, a clipboard check, ...).
   if [ -n "${WC_DURING:-}" ]; then say "during: $WC_DURING"; bash -c "$WC_DURING" > "$run/during.log" 2>&1; sleep 1; fi
-  "$root/scripts/mac-shot.sh" "$run/shot.png" && cp "$run/shot.png" /mnt/datasets/builds/wcrun/mac-last/shot.png \
-    && say "screenshot: /mnt/datasets/builds/wcrun/mac-last/shot.png"
+  "$root/scripts/mac-shot.sh" "$run/shot.png" && cp "$run/shot.png" ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last/shot.png \
+    && say "screenshot: ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last/shot.png"
 fi
 wait "${pids[-1]}"
 vm 'cat /tmp/wcrt/comp.log' > "$run/comp.log"

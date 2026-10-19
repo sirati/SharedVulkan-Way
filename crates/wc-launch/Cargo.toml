@@ -22,6 +22,8 @@ png = "0.18"
 # application's windows and its Dock tile are one process's.
 [target.'cfg(target_os = "macos")'.dependencies]
 wc-compositor = { path = "../wc-compositor" }
+# §103.14: the session's control and sound channels are ring slots.
+sv-transport = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

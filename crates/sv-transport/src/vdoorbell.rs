@@ -625,9 +625,100 @@ pub enum PortHandle {
     /// `\\.\Global\<name>`, from [`crate::winpipe::open_virtio_port`].
     #[cfg(windows)]
     Pipe(std::sync::Arc<crate::winpipe::Pipe>),
+    /// Two inherited descriptors, a reader and a writer (§103.6): a port a
+    /// parent process opened, such as a libkrun virtio-console port's host
+    /// end on a Mac running a Linux VM. One descriptor for both is
+    /// [`PortHandle::File`].
+    #[cfg(unix)]
+    Fds(std::fs::File, std::fs::File),
 }
 
 impl PortHandle {
+    /// Open a doorbell endpoint from one spelling (§103.6), so a caller's
+    /// `--bell` takes every kind:
+    ///
+    /// * `fd:R,W` or `fd:N`: descriptors this process inherited (Unix);
+    /// * `socket:PATH`: the host end of a QEMU chardev socket (Unix);
+    /// * `dev:NAME`: the guest's port by name ([`PortHandle::guest_port`]:
+    ///   `/dev/virtio-ports/NAME` on Linux, `/dev/NAME` on macOS,
+    ///   `\\.\Global\NAME` on Windows);
+    /// * anything else: a socket if it contains `/`, a guest port if not,
+    ///   which is `wc_compositor::ringlink::open_bell_port`'s convention.
+    pub fn open(spec: &str) -> std::io::Result<PortHandle> {
+        if let Some(fds) = spec.strip_prefix("fd:") {
+            #[cfg(unix)]
+            return PortHandle::from_fd_spec(fds);
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("fd:{fds}: inherited descriptors are a Unix doorbell"),
+            ));
+        }
+        if let Some(path) = spec.strip_prefix("socket:") {
+            #[cfg(unix)]
+            return PortHandle::host_socket(path);
+            #[cfg(not(unix))]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("socket:{path}: a chardev socket is a Unix host's"),
+            ));
+        }
+        if let Some(name) = spec.strip_prefix("dev:") {
+            return PortHandle::open_guest(name);
+        }
+        #[cfg(unix)]
+        if spec.contains('/') {
+            return PortHandle::host_socket(spec);
+        }
+        PortHandle::open_guest(spec)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn open_guest(name: &str) -> std::io::Result<PortHandle> {
+        PortHandle::guest_port(name)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    fn open_guest(name: &str) -> std::io::Result<PortHandle> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{name}: no guest port on this system"),
+        ))
+    }
+
+    /// `R,W` or `N`: take ownership of inherited descriptors.
+    #[cfg(unix)]
+    fn from_fd_spec(fds: &str) -> std::io::Result<PortHandle> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let bad = || std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("fd:{fds}: expected fd:N or fd:R,W"));
+        let parse = |s: &str| -> std::io::Result<i32> { s.trim().parse::<i32>().ok().filter(|n| *n >= 0).ok_or_else(bad) };
+        let (r, w) = match fds.split_once(',') {
+            Some((r, w)) => (parse(r)?, parse(w)?),
+            None => {
+                let n = parse(fds)?;
+                (n, n)
+            }
+        };
+        // An fd number that is not open is refused here rather than adopted:
+        // `from_raw_fd` on a closed number would later close whatever the
+        // process opened under it.
+        for n in [r, w] {
+            if std::fs::metadata(format!("/dev/fd/{n}")).is_err() {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("fd:{fds}: descriptor {n} is not open")));
+            }
+        }
+        // SAFETY: the spec names descriptors this process inherited for the
+        // doorbell and uses for nothing else; they were just checked to be
+        // open, and each is adopted exactly once (a shared `N` is adopted once
+        // and cloned).
+        let rf = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(r) });
+        if r == w {
+            return Ok(PortHandle::File(rf));
+        }
+        let wf = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(w) });
+        Ok(PortHandle::Fds(rf, wf))
+    }
+
     /// Open the guest end by port name. Linux guest.
     #[cfg(target_os = "linux")]
     pub fn guest_port(name: &str) -> std::io::Result<PortHandle> {
@@ -696,6 +787,8 @@ impl PortHandle {
                 let w = f.try_clone()?;
                 (Box::new(f), Box::new(w))
             }
+            #[cfg(unix)]
+            PortHandle::Fds(r, w) => (Box::new(r), Box::new(w)),
             // The writer never blocks its caller (waycompose-design.md §97.10):
             // a hub that stops reading — on the guest, a stale session's
             // `sv-hostd` held QEMU's one connection and the next hub's sat
@@ -762,6 +855,28 @@ mod tests {
     use crate::region::SharedRegion;
     use crate::ring::Lane;
     use std::time::{Duration, Instant};
+
+    /// §103.6: an inherited descriptor pair is a doorbell like any other port,
+    /// and a closed descriptor number is refused rather than adopted.
+    #[cfg(unix)]
+    #[test]
+    fn an_fd_pair_spec_is_a_port() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        let (ours_r, theirs_w) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (theirs_r, ours_w) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (r, w) = (ours_r.into_raw_fd(), ours_w.into_raw_fd());
+        let (mut reader, mut writer) = PortHandle::open(&format!("fd:{r},{w}")).unwrap().split().unwrap();
+        writer.write_all(&[7]).unwrap();
+        let mut b = [0u8; 1];
+        (&theirs_r).read_exact(&mut b).unwrap();
+        assert_eq!(b[0], 7);
+        (&theirs_w).write_all(&[9]).unwrap();
+        reader.read_exact(&mut b).unwrap();
+        assert_eq!(b[0], 9);
+        assert!(PortHandle::open("fd:999999").is_err());
+        assert!(PortHandle::open("fd:x").is_err());
+    }
 
     /// §99: a hub restart is invisible to a client but for the bells in the
     /// gap. The hub's socket closes and comes back on the same path; the

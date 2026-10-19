@@ -158,11 +158,16 @@ impl IconLink {
     /// uses; this is a second connection to it, so the compositor sees two
     /// clients.
     pub fn connect(upstream: &Path, spec: &Spec, search: Search) -> Result<IconLink, String> {
+        let sock = UnixStream::connect(upstream)
+            .map_err(|e| format!("second connection to the compositor: {e}"))?;
+        Self::connect_stream(sock, spec, search)
+    }
+
+    /// §103.14: the same, over a stream the caller made (a ring bridge).
+    pub fn connect_stream(sock: UnixStream, spec: &Spec, search: Search) -> Result<IconLink, String> {
         let mut spec = spec.clone();
         spec.load(ICON_XML).map_err(|e| format!("{e}"))?;
         let ops = Opcodes::from(&spec)?;
-        let sock = UnixStream::connect(upstream)
-            .map_err(|e| format!("second connection to the compositor: {e}"))?;
         sock.set_nonblocking(true).map_err(|e| format!("{e}"))?;
         let mut link = IconLink {
             sock,

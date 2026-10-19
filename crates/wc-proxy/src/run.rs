@@ -46,6 +46,11 @@ struct Args {
     wayland_rings: bool,
     /// §89. QEMU's socket for the rings' virtio-serial port.
     wayland_bell: Option<PathBuf>,
+    /// §103.14: the rings are a region of the guest's own RAM, located into
+    /// this plan (`wc-session rings`). Implies `--wayland-rings`.
+    wayland_rings_plan: Option<PathBuf>,
+    /// §103.14: the session's control and sound channels on those rings.
+    services: wc_proxy::macsvc::Services,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -272,6 +277,8 @@ fn parse_args() -> Result<Args, String> {
         upstream_ring_attach: None,
         wayland_rings: false,
         wayland_bell: None,
+        wayland_rings_plan: None,
+        services: Default::default(),
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -316,6 +323,13 @@ fn parse_args() -> Result<Args, String> {
             "--upstream-ring-attach" => a.upstream_ring_attach = Some(next()?.into()),
             "--wayland-rings" => a.wayland_rings = true,
             "--wayland-bell" => a.wayland_bell = Some(next()?.into()),
+            "--wayland-rings-plan" => {
+                a.wayland_rings_plan = Some(next()?.into());
+                a.wayland_rings = true;
+            }
+            "--session-control" => a.services.session = Some(next()?.into()),
+            "--session-id" => a.services.id = Some(next()?),
+            "--audio-socket" => a.services.audio = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -387,10 +401,11 @@ fn parse_args() -> Result<Args, String> {
     if a.upstream.as_os_str().is_empty()
         && a.upstream_ring.is_none()
         && a.upstream_ring_attach.is_none()
+        && a.wayland_rings_plan.is_none()
     {
         return Err("--upstream, --upstream-ring or --upstream-ring-attach is required".into());
     }
-    if a.wayland_rings {
+    if a.wayland_rings && a.wayland_rings_plan.is_none() {
         if a.arena_ivshmem.as_os_str().is_empty() || a.arena_run.is_none() {
             return Err("--wayland-rings needs --arena-ivshmem and --arena-run: the rings are in that region".into());
         }
@@ -847,7 +862,27 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // is ssh — and says so in capitals, because a session that silently went
     // back to ssh looks exactly like one that did not, until somebody measures.
     let mut doorbell: Option<wc_proxy::rings::Doorbell> = None;
-    let ring = if args.wayland_rings {
+    let ring = if let Some(plan) = args.wayland_rings_plan.as_ref() {
+        // §103.14: the macOS guest's rings, in its own RAM. Every connection
+        // goes on them, the feeds included; the session's control and sound
+        // have channels of their own; nothing goes through ssh.
+        let control = wc_proxy::rings::attach_plan(plan, std::time::Duration::from_secs(60))?;
+        let bell = args.wayland_bell.clone().unwrap_or_else(|| "poll".into());
+        doorbell = Some(if bell.as_os_str() == "poll" {
+            wc_proxy::rings::Doorbell::polling(std::time::Duration::from_millis(1))
+        } else {
+            wc_proxy::rings::Doorbell::connect(&bell)?
+        });
+        println!(
+            "[proxy] wayland rings: {} slots in the guest's own RAM ({}), doorbell {} -- no \
+             socket, no TCP, no ssh",
+            control.layout().geometry.ring_slot_count,
+            plan.display(),
+            if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
+        );
+        wc_proxy::macsvc::start(&control, &args.services);
+        Some(control)
+    } else if args.wayland_rings {
         let up = args.upstream.display();
         let run = args.arena_run.unwrap_or(0);
         let bell = args.wayland_bell.clone().unwrap_or_default();
@@ -1111,6 +1146,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             (args.icons, args.icon_theme.clone(), args.upstream.clone());
         // The feeds need a socket; on §89's rings `--upstream` is still one.
         let on_ring = ring.is_some() && args.upstream.as_os_str().is_empty();
+        // §103.14: on rings with no socket at all, each feed claims a ring
+        // slot of its own (a client, as far as the compositor knows) and
+        // speaks through a local socket pair bridged to it.
+        let feed_ring = if on_ring { ring.clone() } else { None };
+        let feed_owner = (1u64 << 40) | n as u64;
         // STAGE 13. Where *this* client's application is installed, asked of
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the
@@ -1203,7 +1243,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 // which is right and is not built. Said out loud rather than
                 // skipped silently, because a generic icon looks like a bug in
                 // the icon code.
-                if on_ring {
+                if let Some(c) = feed_ring.as_ref() {
+                    match wc_proxy::rings::bridge(std::sync::Arc::clone(c), feed_owner)
+                        .map_err(|e| e.to_string())
+                        .and_then(|sock| wc_proxy::iconlink::IconLink::connect_stream(sock, &spec, search))
+                    {
+                        Ok(link) => Some(link),
+                        Err(e) => {
+                            println!("[proxy] client {n}: no icon feed on a ring ({e}); icons will be generic");
+                            None
+                        }
+                    }
+                } else if on_ring {
                     println!(
                         "[proxy] client {n}: no icon feed on the ring upstream (§36.8); \
                          icons will be generic"
@@ -1231,7 +1282,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // **A separate connection from the icon feed on purpose.**
             // `--no-icons` exists, and an icon resolver that cannot reach the
             // theme must not be the reason copy and paste stop working.
-            let mut clip = if want_clipboard && !on_ring {
+            let mut clip = if want_clipboard && let Some(c) = feed_ring.as_ref() {
+                match wc_proxy::rings::bridge(std::sync::Arc::clone(c), feed_owner | (1 << 39))
+                    .map_err(|e| e.to_string())
+                    .and_then(|sock| wc_proxy::clip::ClipLink::connect_stream(sock, &spec))
+                {
+                    Ok(link) => Some(link),
+                    Err(e) => {
+                        println!("[proxy] client {n}: no clipboard feed on a ring ({e})");
+                        None
+                    }
+                }
+            } else if want_clipboard && !on_ring {
                 match wc_proxy::clip::ClipLink::connect(&upstream_path, &spec) {
                     Ok(link) => Some(link),
                     Err(e) => {

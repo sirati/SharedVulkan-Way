@@ -48,6 +48,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cold;
+/// The cold path in the extent's first page (waycompose-design.md §103.6).
+pub mod coldpage;
 pub mod control;
 /// `WC_FRAME_TRACE`: per-event timestamps for one cross-process frame timeline.
 pub mod frametrace;

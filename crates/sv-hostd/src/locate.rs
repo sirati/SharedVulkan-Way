@@ -286,6 +286,178 @@ pub fn scan(
 }
 
 // ---------------------------------------------------------------------------
+// the sweep for an offer (waycompose-design.md §103.6)
+// ---------------------------------------------------------------------------
+
+/// A page-0 mailbox offer ([`sv_transport::coldpage`]) seen during a sweep.
+#[derive(Debug, Clone)]
+pub struct SeenOffer {
+    /// Where page 0 is in the backing object.
+    pub file_offset: u64,
+    pub offer: sv_transport::coldpage::Offer,
+}
+
+/// What one sweep for offers found: the offers, and every stamped page in RAM
+/// by run id, so the extent an offer describes is located by the same pass.
+#[derive(Debug, Default)]
+pub struct OfferSweep {
+    pub offers: Vec<SeenOffer>,
+    pub pages: std::collections::HashMap<u64, Vec<(u32, u64)>>,
+    pub bytes_swept: u64,
+}
+
+/// Sweep the backing object once for stamped pages and for the offers in
+/// their first pages.
+///
+/// This is [`scan`] for a host that has not been told a run id: the cold path
+/// in guest RAM (§103.6) has no channel to tell it one, so the run id comes
+/// out of the offer, and the pages were collected on the way. One pass, the
+/// same cost as [`scan`].
+pub fn sweep_offers(file: &std::fs::File, file_len: u64, regions: &RegionTable) -> Result<OfferSweep, LocateError> {
+    const CHUNK: usize = 32 << 20;
+    let mut buf = vec![0u8; CHUNK];
+    let mut out = OfferSweep::default();
+    let mut base = 0u64;
+    while base < file_len {
+        let want = CHUNK.min((file_len - base) as usize);
+        let got = read_at(file, base, &mut buf[..want])?;
+        if got == 0 {
+            break;
+        }
+        out.bytes_swept += got as u64;
+        for p in (0..got).step_by(rec::PAGE) {
+            if p + rec::PAGE > got {
+                break;
+            }
+            let page = &buf[p..p + rec::PAGE];
+            if &rec::tag_at(page, rec::OFF_MAGIC) != rec::MAGIC {
+                continue;
+            }
+            let off = base + p as u64;
+            if !regions.is_ram_offset(off) {
+                continue;
+            }
+            let run = rec::get_u64(page, rec::OFF_RUN_ID);
+            let index = rec::get_u32(page, rec::OFF_PAGE_INDEX);
+            out.pages.entry(run).or_default().push((index, off));
+            if index == 0
+                && let Some(offer) = sv_transport::coldpage::parse_offer(page)
+                && offer.hello.extent.run_id == run
+            {
+                out.offers.push(SeenOffer { file_offset: off, offer });
+            }
+        }
+        base += got as u64;
+    }
+    Ok(out)
+}
+
+/// The page map of `desc`'s extent out of a sweep, with [`scan`]'s checks:
+/// an index past the extent or claimed twice is fatal, a missing page is
+/// [`LocateError::Incomplete`] (the sweep can pass a page before the guest
+/// stamped it: [`map_from_sweep_completing`]).
+pub fn map_from_sweep(sweep: &OfferSweep, desc: &ExtentDesc) -> Result<(PageMap, ScanReport), LocateError> {
+    let (offsets, report) = offsets_from_sweep(sweep, desc)?;
+    if report.pages_found != report.pages_expected {
+        return Err(LocateError::Incomplete(Box::new(report)));
+    }
+    Ok((PageMap::new(offsets), report))
+}
+
+fn offsets_from_sweep(sweep: &OfferSweep, desc: &ExtentDesc) -> Result<(Vec<u64>, ScanReport), LocateError> {
+    let pages = (desc.control_pages + desc.arena_pages) as usize;
+    let mut offsets = vec![u64::MAX; pages];
+    let mut report = ScanReport {
+        bytes_swept: sweep.bytes_swept,
+        pages_expected: pages,
+        pages_found: 0,
+        other_runs: sweep.pages.iter().filter(|(r, _)| **r != desc.run_id).map(|(_, v)| v.len()).sum(),
+        duplicates: 0,
+        outside_ram: 0,
+    };
+    for &(index, off) in sweep.pages.get(&desc.run_id).map(Vec::as_slice).unwrap_or(&[]) {
+        let i = index as usize;
+        if i >= pages {
+            return Err(LocateError::IndexOutOfRange { index, pages });
+        }
+        if offsets[i] != u64::MAX {
+            report.duplicates += 1;
+            continue;
+        }
+        offsets[i] = off;
+        report.pages_found += 1;
+    }
+    if report.duplicates > 0 {
+        return Err(LocateError::Duplicate(Box::new(report)));
+    }
+    Ok((offsets, report))
+}
+
+/// [`map_from_sweep`], completed when the sweep overtook the guest's stamping.
+///
+/// The guest offers only after every page is stamped, and one `pread` copies
+/// a chunk front to back, so every page the sweep read after the offer's page
+/// (any offset above `offer_at`) was read stamped. What can be missing lies
+/// below `offer_at`, and only that range is read again: on average half a
+/// sweep rather than a whole one. Returns the bytes read again.
+pub fn map_from_sweep_completing(
+    file: &std::fs::File,
+    regions: &RegionTable,
+    sweep: &OfferSweep,
+    desc: &ExtentDesc,
+    offer_at: u64,
+) -> Result<(PageMap, ScanReport, u64), LocateError> {
+    let (mut offsets, mut report) = offsets_from_sweep(sweep, desc)?;
+    let mut reread = 0u64;
+    if report.pages_found != report.pages_expected {
+        const CHUNK: usize = 32 << 20;
+        let mut buf = vec![0u8; CHUNK];
+        let mut base = 0u64;
+        while base < offer_at && report.pages_found != report.pages_expected {
+            let want = CHUNK.min((offer_at - base) as usize);
+            let got = read_at(file, base, &mut buf[..want])?;
+            if got == 0 {
+                break;
+            }
+            reread += got as u64;
+            for p in (0..got).step_by(rec::PAGE) {
+                if p + rec::PAGE > got {
+                    break;
+                }
+                let page = &buf[p..p + rec::PAGE];
+                if &rec::tag_at(page, rec::OFF_MAGIC) != rec::MAGIC || rec::get_u64(page, rec::OFF_RUN_ID) != desc.run_id {
+                    continue;
+                }
+                let off = base + p as u64;
+                if !regions.is_ram_offset(off) {
+                    continue;
+                }
+                let index = rec::get_u32(page, rec::OFF_PAGE_INDEX);
+                let i = index as usize;
+                if i >= offsets.len() {
+                    return Err(LocateError::IndexOutOfRange { index, pages: offsets.len() });
+                }
+                if offsets[i] == u64::MAX {
+                    offsets[i] = off;
+                    report.pages_found += 1;
+                } else if offsets[i] != off {
+                    report.duplicates += 1;
+                }
+            }
+            base += got as u64;
+        }
+        report.bytes_swept += reread;
+        if report.duplicates > 0 {
+            return Err(LocateError::Duplicate(Box::new(report)));
+        }
+        if report.pages_found != report.pages_expected {
+            return Err(LocateError::Incomplete(Box::new(report)));
+        }
+    }
+    Ok((PageMap::new(offsets), report, reread))
+}
+
+// ---------------------------------------------------------------------------
 // the frame-list locator (docs/design.md §5.1's `PfnLocator` / `SuperfetchPfnLocator`)
 // ---------------------------------------------------------------------------
 

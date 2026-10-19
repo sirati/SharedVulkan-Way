@@ -103,6 +103,9 @@ pub mod proxy;
 /// the doorbell that wakes a pump parked on one (docs/waycompose-design.md §89).
 #[cfg(unix)]
 pub mod rings;
+/// §103.14: the macOS session's control and sound channels on the rings.
+#[cfg(unix)]
+pub mod macsvc;
 #[cfg(unix)]
 pub mod session;
 #[cfg(unix)]
