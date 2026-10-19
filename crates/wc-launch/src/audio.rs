@@ -175,6 +175,7 @@ mod win {
         Ok(stats)
     }
 
+    #[allow(dead_code)]
     /// §105, the sound ring's device side (§103.16): play what arrives on
     /// `rx`, in whatever pieces it comes, and give back `credit` for every
     /// chunk handed to the device. The sender sends no more than it was

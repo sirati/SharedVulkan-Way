@@ -668,25 +668,62 @@ mod win {
     /// `ok-raw N` is followed by exactly the verb's output, `ok …` and
     /// `err …` are one line.
     pub fn control(p: &Paths, line: &str) -> Result<String, String> {
-        use std::io::{Read, Write};
-        let mut s = wc_transport::connect(&p.ctl).map_err(|e| {
-            format!("no session to ask ({}: {e}); the request goes through the session's control ring", p.ctl.display())
-        })?;
-        let _ = s.set_read_timeout(Some(Duration::from_secs(40)));
-        s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("control socket: {e}"))?;
-        let mut out = Vec::new();
-        s.read_to_end(&mut out).map_err(|e| format!("control socket: {e}"))?;
-        let nl = out.iter().position(|b| *b == b'\n').unwrap_or(out.len());
-        let head = String::from_utf8_lossy(&out[..nl]).into_owned();
-        let body = out.get(nl + 1..).unwrap_or(&[]);
-        if head.starts_with("ok-raw ") {
-            Ok(String::from_utf8_lossy(body).trim().to_string())
-        } else if let Some(rest) = head.strip_prefix("ok") {
-            Ok(rest.trim().to_string())
-        } else if let Some(rest) = head.strip_prefix("err") {
-            Err(rest.trim().to_string())
-        } else {
-            Err(format!("the compositor answered {head:?}"))
+        CtlClient::connect(p)?.request(line)
+    }
+
+    /// One connection to the compositor's control socket, for any number of
+    /// requests in turn (§105.13).
+    pub struct CtlClient {
+        s: wc_transport::Stream,
+        buf: Vec<u8>,
+    }
+
+    impl CtlClient {
+        pub fn connect(p: &Paths) -> Result<CtlClient, String> {
+            let s = wc_transport::connect(&p.ctl).map_err(|e| {
+                format!("no session to ask ({}: {e}); the request goes through the session's control ring", p.ctl.display())
+            })?;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(40)));
+            Ok(CtlClient { s, buf: Vec::with_capacity(4096) })
+        }
+
+        fn fill(&mut self) -> Result<(), String> {
+            use std::io::Read;
+            let mut tmp = [0u8; 16 * 1024];
+            match self.s.read(&mut tmp) {
+                Ok(0) => Err("the compositor closed the control socket".into()),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                    Ok(())
+                }
+                Err(e) => Err(format!("control socket: {e}")),
+            }
+        }
+
+        pub fn request(&mut self, line: &str) -> Result<String, String> {
+            use std::io::Write;
+            self.s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("control socket: {e}"))?;
+            let nl = loop {
+                if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
+                    break i;
+                }
+                self.fill()?;
+            };
+            let head = String::from_utf8_lossy(&self.buf[..nl]).into_owned();
+            self.buf.drain(..=nl);
+            if let Some(n) = head.strip_prefix("ok-raw ").and_then(|n| n.trim().parse::<usize>().ok()) {
+                while self.buf.len() < n {
+                    self.fill()?;
+                }
+                let body: Vec<u8> = self.buf.drain(..n).collect();
+                Ok(String::from_utf8_lossy(&body).trim().to_string())
+            } else if let Some(rest) = head.strip_prefix("ok") {
+                Ok(rest.trim().to_string())
+            } else if let Some(rest) = head.strip_prefix("err") {
+                Err(rest.trim().to_string())
+            } else {
+                Err(format!("the compositor answered {head:?}"))
+            }
         }
     }
 
@@ -710,7 +747,7 @@ mod win {
             if Instant::now() > deadline {
                 return Err(format!("{} never said what was expected", path.display()));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -734,16 +771,36 @@ mod win {
         let t = Instant::now();
         // §105: a round trip to the host through the session's control ring;
         // with no session there is nothing to cross on, which is said.
-        let said = if cfg.debug_ssh_transport {
-            ssh(cfg, p, &["ping"])?
-        } else {
-            let s = std::fs::read_to_string(&p.state).map(|t| State::parse(&t)).unwrap_or_default();
-            if s.id.is_empty() {
-                return Err("no session is up, and since §105 the host is reached only through a session's rings".into());
-            }
-            host_session(cfg, p, &s.id, &["status"])?
-        };
-        log.say(&format!("PING {said} ({} ms)", t.elapsed().as_millis()));
+        if cfg.debug_ssh_transport {
+            let said = ssh(cfg, p, &["ping"])?;
+            log.say(&format!("PING {said} ({} ms)", t.elapsed().as_millis()));
+            return Ok(());
+        }
+        // §105.13: `WC_PING_N` round trips of `WC_PING_VERB` (default `rtt`,
+        // the host's no-op) on one connection, and their distribution.
+        let n: usize = std::env::var("WC_PING_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let verb = std::env::var("WC_PING_VERB").unwrap_or_else(|_| "rtt".into());
+        let mut c = CtlClient::connect(p)?;
+        let mut us: Vec<f64> = Vec::with_capacity(n);
+        let mut said = String::new();
+        for _ in 0..n {
+            let t1 = Instant::now();
+            said = c.request(&format!("raw {verb}"))?;
+            us.push(t1.elapsed().as_secs_f64() * 1e6);
+        }
+        let mut sorted = us.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f).round() as usize];
+        let mean = us.iter().sum::<f64>() / us.len() as f64;
+        log.say(&format!(
+            "PING {verb:?} x{n} on the control ring: mean {mean:.1} us, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1} us ({} ms in all){}",
+            q(0.5),
+            q(0.9),
+            q(0.99),
+            q(1.0),
+            t.elapsed().as_millis(),
+            if said.is_empty() { String::new() } else { format!("; last answer {} byte(s)", said.len()) }
+        ));
         Ok(())
     }
 
@@ -919,9 +976,15 @@ mod win {
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
 
+        // The GPU process first, so its driver opens while the compositor
+        // boots (§105.13).
+        let gpu_kid = if cfg.gpu_sessions > 0 { spawn_gpu(cfg, p, log) } else { None };
         let mut argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
         argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
         argv.extend(plan::boot_argv(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy()));
+        if gpu_kid.is_some() {
+            argv.push("--boot-gpu".into());
+        }
         log.say(&format!(
             "transport: shared memory only (§105): the ivshmem rings for every byte, the doorbell {}, \
              installation {}; no ssh",
@@ -945,8 +1008,10 @@ mod win {
                 None
             }
         });
+        let gpu_pid = gpu_kid.as_ref().map(Child::id).unwrap_or(0);
         let fail = |why: String| {
             kill(comp_pid);
+            kill(gpu_pid);
             Err::<Session, String>(why)
         };
         match answer {
@@ -968,13 +1033,20 @@ mod win {
             if Instant::now() > deadline {
                 return fail("the compositor never opened its control socket (the host claimed no control ring)".into());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
 
-        // The forwarded GPU (§86, §87), only when the ini asks for sessions.
-        // Its cold path is a mailbox in the GPU pool's header (§105), so the
-        // host only has to be told to serve it.
-        let gpus = if cfg.gpu_sessions > 0 { start_gpu(cfg, p, log, &id) } else { Vec::new() };
+        // The forwarded GPU (§86, §87): its process started before the
+        // compositor, its host half by the session service at boot, its cold
+        // path a mailbox in the GPU pool's header (§105). What it said so far:
+        let gpus: Vec<Child> = gpu_kid.into_iter().collect();
+        if !gpus.is_empty() {
+            let gl = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
+            let text = std::fs::read_to_string(&gl).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains("ivshmem slot") || l.contains("doorbell") || l.contains("publishing")) {
+                log.say(&format!("gpu: {}", l.trim()));
+            }
+        }
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
@@ -1179,6 +1251,36 @@ mod win {
     /// Started after the proxy; every failure from here kills what it started
     /// and returns none, and the host then gives Firefox no GPU environment, so
     /// it renders in software rather than failing to start its renderer.
+    /// §105.13: the GPU process, started and not waited for. The host's half
+    /// is started by the session service at boot (the record's `gpu` flag)
+    /// and waits for this process's offers by itself, so the two start side by
+    /// side with the compositor instead of one after the other.
+    fn spawn_gpu(cfg: &Config, p: &Paths, log: &mut Log) -> Option<Child> {
+        let path = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));
+        let _ = std::fs::remove_file(&path);
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                return None;
+            }
+        };
+        match Command::new(&cfg.compositor)
+            .args(plan::gpu_argv(cfg))
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(file))
+            .spawn()
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor));
+                None
+            }
+        }
+    }
+
     fn start_gpu(cfg: &Config, p: &Paths, log: &mut Log, id: &str) -> Vec<Child> {
         let t = Instant::now();
         let path = p.state_dir.join(format!("wc-launch-{}-gpu.log", cfg.session));

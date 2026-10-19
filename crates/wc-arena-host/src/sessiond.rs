@@ -236,8 +236,11 @@ pub(crate) fn spawn_bell(spec: String, tx: mpsc::Sender<()>) {
         .spawn(move || {
             let mut said = false;
             loop {
-                match std::os::unix::net::UnixStream::connect(&spec) {
-                    Ok(mut s) => {
+                // §105: any of `vdoorbell::PortHandle::open`'s spellings: a hub's
+                // socket (a path, or `socket:PATH`), `fd:R,W` a parent passed
+                // down, or `dev:NAME`, a port this machine has itself.
+                match sv_transport::vdoorbell::PortHandle::open(&spec).and_then(|p| p.split()) {
+                    Ok((mut s, _w)) => {
                         say(&format!("listening for hellos on {spec}"));
                         said = false;
                         // §105: a virtio-serial port drops what arrives while
@@ -256,6 +259,10 @@ pub(crate) fn spawn_bell(spec: String, tx: mpsc::Sender<()>) {
                                     }
                                 }
                             }
+                        }
+                        if spec.starts_with("fd:") {
+                            say(&format!("{spec} closed; an inherited descriptor cannot be reopened, sweeping on the timer"));
+                            return;
                         }
                         say(&format!("{spec} closed; reconnecting"));
                     }

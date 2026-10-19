@@ -84,6 +84,9 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
     }
 }
 
+/// How long a control reader looks before it parks (§105.13).
+pub const SPIN: Duration = Duration::from_micros(200);
+
 /// Read lines from a channel, sleeping on its lane when idle: woken by the
 /// doorbell, or after a millisecond when there is none (§103.15).
 struct Lines {
@@ -103,7 +106,16 @@ impl Lines {
                 Ok(ReadOutcome::Bytes(n)) => self.buf.extend_from_slice(&tmp[..n]),
                 Ok(ReadOutcome::Eof) | Err(_) => return None,
                 Ok(_) => {
-                    let _ = self.ch.wait_readable(crate::rings::service_slice());
+                    // §105.13: a request's next line, or the next request of a
+                    // burst, usually follows within microseconds: look for it a
+                    // little before parking, which costs a doorbell round trip.
+                    let t0 = Instant::now();
+                    while t0.elapsed() < SPIN && !self.ch.readable().unwrap_or(true) {
+                        std::hint::spin_loop();
+                    }
+                    if !self.ch.readable().unwrap_or(true) {
+                        let _ = self.ch.wait_readable(crate::rings::service_slice());
+                    }
                 }
             }
         }
@@ -130,6 +142,8 @@ fn words_ok(line: &str) -> bool {
 }
 
 fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String) {
+    let fast = crate::ctlfast::Fast::new(session.clone(), id.clone());
+    fast.prefetch();
     let mut lines = Lines { ch, buf: Vec::new() };
     while let Some(line) = lines.next() {
         if line == "ping" {
@@ -156,23 +170,38 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
         let (reply, body): (String, Vec<u8>) = if !words_ok(&line) {
             ("err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string(), Vec::new())
         } else {
-            let cmd = command_words(&line, &id);
-            let t0 = Instant::now();
-            match std::process::Command::new("bash").arg(&session).env("SSH_ORIGINAL_COMMAND", &cmd).output() {
-                // §105: `raw` asks for the verb's standard output exactly, as
-                // the jump list's `app` and `frequent` print several lines.
-                Ok(o) if o.status.success() && raw => (format!("ok-raw {}", o.stdout.len()), o.stdout),
-                Ok(o) if o.status.success() => (
-                    format!("ok {} ({} ms)", String::from_utf8_lossy(&o.stdout).trim().replace('\n', "; "), t0.elapsed().as_millis()),
-                    Vec::new(),
-                ),
-                Ok(o) => (format!("err {}", String::from_utf8_lossy(&o.stderr).trim().replace('\n', "; ")), Vec::new()),
-                Err(e) => (format!("err {e}"), Vec::new()),
+            // §105.13: what this process can answer itself, it answers now.
+            let fast_answer = fast.answer(&line);
+            match fast_answer {
+                crate::ctlfast::Answer::Now(b) if raw => (format!("ok-raw {}", b.len()), b),
+                crate::ctlfast::Answer::Now(b) => (format!("ok {}", String::from_utf8_lossy(&b).trim().replace('\n', "; ")), Vec::new()),
+                crate::ctlfast::Answer::Refused(e) => (format!("err {e}"), Vec::new()),
+                crate::ctlfast::Answer::Slow => {
+                    let t0 = Instant::now();
+                    match fast.run_sync(&line) {
+                        Ok(out) => {
+                            if matches!(line.split_whitespace().next(), Some("app" | "icon" | "frequent")) {
+                                fast.store(&line, out.clone());
+                            }
+                            // §105: `raw` asks for the verb's standard output
+                            // exactly, as the jump list's `app` and `frequent`
+                            // print several lines.
+                            if raw {
+                                (format!("ok-raw {}", out.len()), out)
+                            } else {
+                                (format!("ok {} ({} ms)", String::from_utf8_lossy(&out).trim().replace('\n', "; "), t0.elapsed().as_millis()), Vec::new())
+                            }
+                        }
+                        Err(e) => (format!("err {e}"), Vec::new()),
+                    }
+                }
             }
         };
         // A page's URL is the user's history: `open` is logged by its verb.
-        let shown = if line.starts_with("open ") { "open …".to_string() } else { line.clone() };
-        println!("[proxy] session control: {shown:?} -> {reply}");
+        // The launcher's `rtt` is not logged at all: it comes ten thousand at a time.
+        if line != "rtt" {
+            println!("[proxy] session control: {:?} -> {reply}", crate::ctlfast::shown(&line));
+        }
         let mut out = format!("{reply}\n").into_bytes();
         out.extend_from_slice(&body);
         if !write_all(&mut lines.ch, &out) {

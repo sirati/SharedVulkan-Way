@@ -214,6 +214,9 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
     None
 }
 
+/// How long a request waits for its answer before it parks (§105.13).
+const SPIN: Duration = Duration::from_micros(300);
+
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
 /// the lease's ping is never late behind a slow `wc-session` verb.
@@ -255,6 +258,16 @@ impl Ctl {
                 }
                 if Instant::now() > deadline {
                     return Err("no answer on the control ring".into());
+                }
+                // §105.13: an answer the host makes in-process comes back in
+                // tens of microseconds; look for it before parking, which
+                // would add a doorbell round trip.
+                let t0 = Instant::now();
+                while t0.elapsed() < SPIN && !ch.readable().unwrap_or(true) {
+                    std::hint::spin_loop();
+                }
+                if ch.readable().unwrap_or(true) {
+                    continue;
                 }
                 // Short, so the lease never waits long behind this lock.
                 let _ = ch.wait_readable(crate::ringlink::ring_wait_slice().min(Duration::from_millis(20)));
@@ -432,29 +445,39 @@ fn serve_socket(path: PathBuf, ctl: Arc<Ctl>) {
     }
 }
 
+/// One connection of a launcher: request lines, each answered in order, until
+/// it closes. A launcher sends one; `--ping N` sends N on one connection.
 fn answer(mut conn: wc_transport::Stream, ctl: &Ctl) {
     let _ = conn.set_nonblocking(false);
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut line = Vec::new();
-    let mut b = [0u8; 1];
-    while line.len() < 16 * 1024 {
-        match conn.read(&mut b) {
-            Ok(1) if b[0] == b'\n' => break,
-            Ok(1) => line.push(b[0]),
-            _ => return,
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut buf = Vec::with_capacity(256);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let line = loop {
+            if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+                let l: Vec<u8> = buf.drain(..=i).collect();
+                break String::from_utf8_lossy(&l[..l.len() - 1]).trim().to_string();
+            }
+            if buf.len() > 16 * 1024 {
+                return;
+            }
+            match conn.read(&mut tmp) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            }
+        };
+        // `ping` is the lease's word on the ring; a launcher's bare `ping` is
+        // answered here, from this side. `rtt` crosses (§105.13).
+        let out = if line == "ping" {
+            b"ok session up\n".to_vec()
+        } else {
+            match ctl.request(&line) {
+                Ok(v) => v,
+                Err(e) => format!("err {e}\n").into_bytes(),
+            }
+        };
+        if conn.write_all(&out).is_err() {
+            return;
         }
     }
-    let line = String::from_utf8_lossy(&line).trim().to_string();
-    // `ping` is the lease's word on the ring; the launcher's own check is
-    // answered here, from this side, with what this side knows.
-    let out = if line == "ping" {
-        b"ok session up\n".to_vec()
-    } else {
-        match ctl.request(&line) {
-            Ok(v) => v,
-            Err(e) => format!("err {e}\n").into_bytes(),
-        }
-    };
-    let _ = conn.write_all(&out);
-    let _ = conn.flush();
 }

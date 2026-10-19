@@ -705,7 +705,7 @@ fn main() -> std::process::ExitCode {
     // §105: one service, two substrates. `--ivshmem` is a guest with a
     // shared-memory device (Windows); without it, guest RAM swept (macOS).
     if matches!(argv.get(1).map(String::as_str), Some("mac-sessiond" | "sessiond")) {
-        if argv.iter().any(|a| a == "--ivshmem") {
+        if argv.iter().any(|a| a == "--ivshmem" || a == "--arena-file") {
             return sessiond_ivshmem::main(&argv[2..]);
         }
         return sessiond::main(&argv[2..]);

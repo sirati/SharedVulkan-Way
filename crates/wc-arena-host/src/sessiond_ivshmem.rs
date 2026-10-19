@@ -59,7 +59,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     while let Some(k) = it.next() {
         let mut v = || it.next().cloned().ok_or(format!("{k} needs a value"));
         match k.as_str() {
-            "--ivshmem" => a.arena = v()?.into(),
+            // Any file whose page 0 is an ivshmem-style header: QEMU's ivshmem
+            // backing file, or a shared file standing in for one (a Mac's
+            // RAM-disk file seen through virtio-fs DAX, §103.5's role (b)).
+            "--ivshmem" | "--arena-file" => a.arena = v()?.into(),
             "--installs" => a.installs = v()?.into(),
             "--state" => a.state = v()?.into(),
             "--bell" => a.bell = Some(v()?),
@@ -340,11 +343,26 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<u64>, why: &str) {
         req.install.name, rec.arena_run, rec.arena_pages, rec.gpu
     ));
     let run = format!("0x{:016x}", rec.arena_run);
+    // §105.13: timed per verb, and the GPU's host side started beside the
+    // proxy rather than after it: it waits for the guest's offers by itself.
+    let t_up = Instant::now();
     let up = crate::sessiond::verb(&ws, &["up", &id, &run, "ivshmem"]);
+    let d_up = t_up.elapsed();
+    let gpu = (rec.gpu && up.is_ok()).then(|| {
+        let (ws, id) = (ws.clone(), id.clone());
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let r = crate::sessiond::verb(&ws, &["gpu", &id]);
+            (r, t.elapsed())
+        })
+    });
+    let t_proxy = Instant::now();
     let started = up.and_then(|u| {
         let p = crate::sessiond::verb(&ws, &["proxy", &id])?;
         Ok(format!("{u}; {p}"))
     });
+    let d_proxy = t_proxy.elapsed();
+    let gpu = gpu.and_then(|h| h.join().ok());
     let text = match started {
         Ok(t) => t,
         Err(e) => {
@@ -356,13 +374,16 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<u64>, why: &str) {
     };
     live.insert(&id, &req.install.base);
     let mut msg = text;
-    if rec.gpu {
-        match crate::sessiond::verb(&ws, &["gpu", &id]) {
+    let mut d_gpu = Duration::ZERO;
+    if let Some((r, d)) = gpu {
+        d_gpu = d;
+        match r {
             Ok(g) => msg = format!("{msg}; {g}"),
             // Not fatal, as on every path: the application renders in software.
             Err(e) => msg = format!("{msg}; NO GPU: {e}"),
         }
     }
+    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?}, gpu {d_gpu:?} (beside the proxy)"));
     match answer(&file, &rec, macboot::State::Located, &msg) {
         Ok(true) => say(&format!("session {id}: started in {:?} ({why}): {msg}", t0.elapsed())),
         Ok(false) => say(&format!("session {id}: started, but the guest replaced its record before the answer; its lease will end it")),

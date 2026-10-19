@@ -545,7 +545,7 @@ audio_up() {
   fi
   local NULLSINK=1
   [ "${WC_LAUNCH_AUDIO_NULL_SINK:-on}" = off ] && NULLSINK=""
-  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && { [ -z "$NULLSINK" ] || [ -S "$D/audio.sock" ]; } && break; sleep 0.05; done
+  for _ in $(seq 1 500); do [ -S "$D/xdg/pulse/native" ] && { [ -z "$NULLSINK" ] || [ -S "$D/audio.sock" ]; } && break; sleep 0.01; done
   if [ -S "$D/xdg/pulse/native" ] && [ -z "$NULLSINK" ]; then
     echo "pulse $D/xdg/pulse/native (no null sink: the sound ring's devices only)" >"$D/audio.state"
   elif [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
@@ -1143,7 +1143,7 @@ proxy)
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
-    for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
+    for _ in $(seq 1 1000); do [ -S "$D/wl-proxy" ] && break; sleep 0.01; done
     if [ ! -S "$D/wl-proxy" ]; then
       echo "wc-session: the proxy never bound its socket" >&2
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
@@ -1155,16 +1155,16 @@ proxy)
     # them after it binds its socket, so the line is waited for briefly.
     if [ $SERVICE = 1 ]; then
       T=""
-      for _ in $(seq 1 40); do
+      for _ in $(seq 1 200); do
         T=$(grep -m1 -oE 'wayland rings: .*' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
-        sleep 0.05
+        sleep 0.01
       done
       echo "transport ${T:-the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
     elif [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
       T=""
-      for _ in $(seq 1 40); do
+      for _ in $(seq 1 200); do
         T=$(grep -m1 -oE '(wayland rings: .*|SSH FALLBACK: .*)' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
-        sleep 0.05
+        sleep 0.01
       done
       echo "transport ${T:-SSH FALLBACK: the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
     else
@@ -1588,7 +1588,7 @@ gpu)
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
     || die "systemd-run --user could not start $UNIT"
-  for _ in $(seq 1 100); do [ -S "$D/icd.sock" ] && break; sleep 0.05; done
+  for _ in $(seq 1 500); do [ -S "$D/icd.sock" ] && break; sleep 0.01; done
   if [ ! -S "$D/icd.sock" ]; then
     echo "wc-session: sv-hostd ivshmem-serve never listened:" >&2
     tail -6 "$D/hostd.log" 2>/dev/null | sed 's/^/  /' >&2

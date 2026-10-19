@@ -130,7 +130,7 @@ else
 fi
 wait_line "$D/comp-a.log" 'control socket' 20 || bad "no control socket"
 R=$(request a "raw run probe 96 30")
-case "$R" in ok-raw*'run ok'*) ok "run over the control ring: $(echo "$R" | tail -1)" ;; *) bad "run: $R" ;; esac
+case "$R" in ok-raw*'run accepted'*) ok "run over the control ring, answered before the start: $(echo "$R" | tail -1)" ;; *) bad "run: $R" ;; esac
 sleep 2
 PLOG="$D/run/wcns-$$-a/proxy.log"
 keep_log "$PLOG" "$D/proxy-a.log"
@@ -142,6 +142,14 @@ R=$(request a "raw status")
 case "$R" in ok-raw*) ok "status round trip" ;; *) bad "status: $R" ;; esac
 R=$(request a "run probe; rm -rf ~ 96 30")
 case "$R" in err*refused*) ok "a request with shell words is refused: ${R:0:60}" ;; *) bad "not refused: $R" ;; esac
+# §105.13: the control ring's round trip, in-process on both ends.
+cc -O2 -o "$D/probe-ctl-rtt" "$ROOT/scripts/probe-ctl-rtt.c" && {
+  sleep 2 # the prefetch
+  for spec in "10000 rtt" "1000 status" "1000 frequent probe"; do
+    set -- $spec
+    R=$("$D/probe-ctl-rtt" "$D/ctl-a.sock" "$1" "$2 ${3:-}" 2>&1) && ok "control round trip: $R" || bad "rtt probe: $R"
+  done
+}
 # Timing: 20 status round trips.
 T0=$(date +%s%N); for _ in $(seq 1 20); do request a "raw status" >/dev/null; done; T1=$(date +%s%N)
 ok "control round trip (status verb included) $(( (T1 - T0) / 20000000 )) ms mean"
@@ -197,8 +205,8 @@ if wait_line "$D/comp-d.log" 'boot: located' 30; then
   grep -q 'NO DOORBELL' "$D/comp-d.log" && ok "compositor: $(grep -m1 -o 'NO DOORBELL.*' "$D/comp-d.log" | cut -c1-80)"
   wait_line "$D/comp-d.log" 'control socket' 20
   R=$(request d "raw run probe 96 30")
-  case "$R" in ok-raw*'run ok'*) ok "run on polled rings" ;; *) bad "run polled: $R" ;; esac
-  grep -q 'NO DOORBELL' "$D/run/wcns-$$-d/proxy.log" && ok "proxy: polled, said so" || bad "the proxy did not say it polls"
+  case "$R" in ok-raw*'run accepted'*) ok "run on polled rings" ;; *) bad "run polled: $R" ;; esac
+  wait_line "$D/run/wcns-$$-d/proxy.log" "NO DOORBELL" 5 && ok "proxy: polled, said so" || { bad "the proxy did not say it polls"; cp "$D/run/wcns-$$-d/proxy.log" "$D/proxy-d.log" 2>/dev/null; }
 else
   bad "polled boot: $(grep boot: "$D/comp-d.log")"
 fi
