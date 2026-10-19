@@ -268,6 +268,12 @@ pub fn spawn(
     let kick = std::sync::Arc::new(ch.kicker(control).map_err(|e| e.to_string())?);
     let link = Link { tx, kick };
     let l2 = link.clone();
+    // The channel points into the control region; the thread keeps the region
+    // alive for as long as it may touch it. Without this a caller that dropped
+    // its `Control` while the thread still ran left it reading freed memory
+    // (`two_links_talk_both_ways` crashed with SIGSEGV in `wake_epoch` under load).
+    let keep = std::sync::Arc::clone(control);
+    // (Captured by the thread below, which also reads its ring's state.)
     std::thread::Builder::new()
         .name(format!("sound-ring-{}", ch.slot()))
         .spawn(move || {
@@ -275,6 +281,11 @@ pub fn spawn(
             let mut dec = Decoder::default();
             let mut buf = vec![0u8; 16 * 1024];
             let why = 'run: loop {
+                // §107: a ring this side's owner closed (its session ended) is
+                // not written again, whatever is still queued.
+                if keep.ring_state(ch.slot()).ok() == Some(crate::control::RingState::Dead) {
+                    break 'run "the ring was closed".into();
+                }
                 // Before the queue is looked at: a send after this is a kick
                 // the wait below will not sleep through.
                 let epoch = match ch.wake_epoch() {
@@ -420,11 +431,11 @@ mod tests {
         use crate::control::{Control, Geometry, ProtocolIds};
         use crate::wlbytes::Endpoint;
         let g = Geometry::for_wayland();
-        let mut mem = vec![0u64; g.control_size as usize / 8];
-        // SAFETY: as in the test below.
-        let region = std::sync::Arc::new(unsafe {
-            crate::region::SharedRegion::from_raw(mem.as_mut_ptr().cast(), g.control_size as usize)
-        });
+        // An owned region: the links' threads keep it alive (through the
+        // `Control`) for as long as they run, which a borrowed `Vec` dropped at
+        // the test's end did not, and under load a thread still running then
+        // read freed memory (SIGSEGV in `wake_epoch`).
+        let region = std::sync::Arc::new(crate::region::SharedRegion::heap(g.control_size as usize).unwrap());
         let control = std::sync::Arc::new(Control::create(region, g, ProtocolIds::new(1, 1), 1).unwrap());
         let a = ByteChannel::claim(&control, 9).unwrap();
         let b = ByteChannel::open(&control, a.slot(), Endpoint::Peer).unwrap();
@@ -450,7 +461,6 @@ mod tests {
         for i in 0..N_DATA {
             assert_eq!(at_a.recv_timeout(Duration::from_secs(5)).unwrap(), Msg::Data { stream: 1, pcm: vec![i as u8; 3840] });
         }
-        drop(mem);
     }
 
     /// Backpressure, not drops: a writer facing a full ring waits for the

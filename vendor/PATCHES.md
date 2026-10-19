@@ -752,3 +752,15 @@ committed-buffer case following once the record's shape is agreed.
   existed, an in-band peer was sent no `wl_keyboard.keymap`, and every key a
   macOS user typed reached a client that could not decode it. The BSDs accept
   the same sequence, so the arm is not split further.
+
+* **§107: two process-wide hooks for a compositor shared by several sessions**
+  (waycompose-design.md §107). `wayland::shm::set_pool_check` installs a check
+  every `wl_shm.create_pool` passes before its memory is mapped; the
+  compositor refuses a pool whose arena slice is not the client's own
+  session's, with `wl_shm.error.invalid_fd`. `wayland::set_nested_filter`
+  gives `wp_viewporter`, `wp_single_pixel_buffer_manager_v1` and
+  `wp_presentation` a `can_view`, so those globals are offered only to the
+  sessions that asked for them. Both are no-ops until set, so every other
+  user of the fork sees upstream's behaviour. Upstream would want a filter
+  argument on each `State::new` instead of a global; the global keeps this a
+  handful of lines.

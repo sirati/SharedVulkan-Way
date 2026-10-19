@@ -182,6 +182,26 @@ impl Record {
     }
 }
 
+/// §107: where a shared compositor puts the session's index, inside the
+/// record (byte 116 of it, which every writer before §107 left zero). Written
+/// after [`Record::write`], which clears the record, by [`set_session_index`];
+/// read by [`session_index`]. A one-session writer never touches it, so its
+/// pages, its MAC and the host's reading of them are what they always were.
+pub const OFF_SESSION_INDEX: usize = OFF + 116;
+
+/// §107: put session `index` into a page that holds a record (0 is "none").
+pub fn set_session_index(page: &mut [u8], index: u8) {
+    page[OFF_SESSION_INDEX..OFF_SESSION_INDEX + 4].copy_from_slice(&u32::from(index).to_le_bytes());
+}
+
+/// §107: the session index of the record in `page`: `Some(0)` for a
+/// one-session record, `None` for a word that is not an index (no host acts
+/// on such a page).
+pub fn session_index(page: &[u8]) -> Option<u8> {
+    let w = u32::from_le_bytes(page.get(OFF_SESSION_INDEX..OFF_SESSION_INDEX + 4)?.try_into().ok()?);
+    u8::try_from(w).ok()
+}
+
 /// The state word of page 0, read by the host's sweep.
 pub fn state(page: &[u8]) -> State {
     page.get(OFF_STATE..OFF_STATE + 8)
@@ -338,6 +358,18 @@ pub fn auth_message(rec: &Record, installation: &str, seq: u64) -> Vec<u8> {
     m
 }
 
+/// §107: [`auth_message`] for a record of session `index` of a shared
+/// compositor. The index is covered, so a record cannot be replayed under
+/// another session's index; for index 0 this is exactly [`auth_message`].
+pub fn auth_message_indexed(rec: &Record, index: u8, installation: &str, seq: u64) -> Vec<u8> {
+    let mut m = auth_message(rec, installation, seq);
+    if index != 0 {
+        m.extend_from_slice(b"wcboot-session-v1\0");
+        m.push(index);
+    }
+    m
+}
+
 /// HMAC-SHA-256 (RFC 2104).
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -386,6 +418,20 @@ impl Auth {
         mac_eq(&self.mac, &hmac_sha256(key, &auth_message(rec, &self.installation, self.seq)))
     }
 
+    /// §107: [`Auth::sign`] for session `index` of a shared compositor.
+    pub fn sign_indexed(rec: &Record, index: u8, installation: &str, seq: u64, key: &[u8; KEY_LEN]) -> Auth {
+        Auth {
+            installation: installation.to_string(),
+            seq,
+            mac: hmac_sha256(key, &auth_message_indexed(rec, index, installation, seq)),
+        }
+    }
+
+    /// §107: [`Auth::verifies`] for session `index`; index 0 is `verifies`.
+    pub fn verifies_indexed(&self, rec: &Record, index: u8, key: &[u8; KEY_LEN]) -> bool {
+        mac_eq(&self.mac, &hmac_sha256(key, &auth_message_indexed(rec, index, &self.installation, self.seq)))
+    }
+
     pub fn write(&self, page: &mut [u8]) {
         let a = &mut page[AUTH_OFF..AUTH_OFF + AUTH_LEN];
         a.fill(0);
@@ -422,9 +468,20 @@ impl Auth {
 /// `page0` must point at a mapped, writable page of at least 4096 bytes that
 /// nothing else in this process writes concurrently.
 pub unsafe fn publish(page0: *mut u8, rec: &Record, auth: Option<&Auth>) {
+    // SAFETY: the caller's contract, passed on.
+    unsafe { publish_indexed(page0, rec, 0, auth) }
+}
+
+/// §107: [`publish`] for session `index` of a shared compositor; `auth` must
+/// be [`Auth::sign_indexed`]'s for the same index.
+///
+/// # Safety
+/// As [`publish`].
+pub unsafe fn publish_indexed(page0: *mut u8, rec: &Record, index: u8, auth: Option<&Auth>) {
     use std::sync::atomic::{AtomicU64, Ordering, fence};
     let mut page = vec![0u8; 4096];
     rec.write(&mut page);
+    set_session_index(&mut page, index);
     if let Some(a) = auth {
         a.write(&mut page);
     }
@@ -476,6 +533,37 @@ mod auth_tests {
         a3 = a2.clone();
         a3.installation = "wcother".into();
         assert!(!a3.verifies(&r2, &key), "another installation's name");
+    }
+
+    /// §107. A shared compositor's record carries the session's index beside
+    /// the record's fields, covered by the MAC; index 0 is the pre-§107 page
+    /// and message, byte for byte, so a one-session writer is unaffected.
+    #[test]
+    fn the_session_index_reads_back_and_is_covered_by_the_mac() {
+        let key = [7u8; KEY_LEN];
+        let r = rec();
+        let mut one = vec![0u8; 4096];
+        // SAFETY: a 4096-byte buffer this test owns.
+        unsafe { publish(one.as_mut_ptr(), &r, Some(&Auth::sign(&r, "wcns", 1, &key))) };
+        let mut zero = vec![0u8; 4096];
+        // SAFETY: as above.
+        unsafe { publish_indexed(zero.as_mut_ptr(), &r, 0, Some(&Auth::sign_indexed(&r, 0, "wcns", 1, &key))) };
+        assert_eq!(one, zero, "index 0 is the one-session page, byte for byte");
+        assert_eq!(session_index(&one), Some(0));
+
+        let a = Auth::sign_indexed(&r, 3, "wcns", 1, &key);
+        let mut p = vec![0u8; 4096];
+        // SAFETY: as above.
+        unsafe { publish_indexed(p.as_mut_ptr(), &r, 3, Some(&a)) };
+        assert_eq!(Record::read(&p), Some(r.clone()), "the record itself reads as before");
+        assert_eq!(session_index(&p), Some(3));
+        let back = Auth::read(&p).unwrap();
+        assert!(back.verifies_indexed(&r, 3, &key));
+        assert!(!back.verifies_indexed(&r, 4, &key), "another session's index");
+        assert!(!back.verifies(&r, &key), "the index dropped");
+        assert!(!back.verifies_indexed(&r, 3, &[8u8; KEY_LEN]), "another installation's key");
+        p[OFF_SESSION_INDEX..OFF_SESSION_INDEX + 4].copy_from_slice(&300u32.to_le_bytes());
+        assert_eq!(session_index(&p), None, "a word that is not an index");
     }
 
     #[test]

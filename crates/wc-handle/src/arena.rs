@@ -718,6 +718,100 @@ pub fn ivshmem_header_page(id: u32) -> io::Result<*mut u8> {
     Ok(a.view.ptr().cast_mut())
 }
 
+/// §107: register `[offset, offset + len)` of ivshmem arena `base` — arena
+/// offsets, from [`crate::barpool`] — as arena `id` of its own, so that a
+/// session's `Descriptor::ArenaSlice { arena: id, .. }` resolves into the BAR
+/// at that window and nowhere else. **No new mapping**: the driver gives one
+/// per device and this process holds it; the window is the same view at
+/// another base. Read-only for this process, as every peer's region is
+/// (`provided: false`), and never released through [`release_guest_ram`].
+///
+/// A live [`crate::Mapping`] of the window keeps the view alive after
+/// [`detach_ivshmem_window`], so a client's last frame is never read from
+/// unmapped memory; what it reads after the window is granted to another
+/// session is that session's bytes, which is why a window is only ever given
+/// back once its session's clients are gone or its proxy has emptied it.
+pub fn attach_ivshmem_window(id: u32, base: u32, offset: u64, len: u64) -> io::Result<()> {
+    if id == base {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a window cannot be its own arena"));
+    }
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let a = guard.get(&base).filter(|a| a.fixed).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("arena {base} is not an ivshmem region of this process"))
+    })?;
+    let (o, l) = (usize::try_from(offset), usize::try_from(len));
+    let (Ok(o), Ok(l)) = (o, l) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "window too large"));
+    };
+    if l == 0 || o.checked_add(l).is_none_or(|end| end > a.len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a window at {offset}+{len} does not fit in arena {base}'s {} bytes", a.len),
+        ));
+    }
+    if guard.get(&id).is_some() {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("arena {id} is already attached")));
+    }
+    let a = guard.get(&base).expect("checked above");
+    let w = Attached {
+        view: Arc::clone(&a.view),
+        len: l,
+        origin: format!("window {offset}+{len} of arena {base}"),
+        provided: false,
+        base: a.base + o,
+        fixed: false,
+    };
+    guard.insert(id, w);
+    Ok(())
+}
+
+/// §110: register memory this process already maps, and keeps mapped for its
+/// life, as arena `id`: a base that [`attach_ivshmem_window`] can cut windows
+/// of. The shared compositor that also runs the GPU pool registers the GPU
+/// device's BAR this way, so that a Wayland buffer leased from that pool is a
+/// window of it like any window of its own BAR. No new mapping (the driver
+/// gives one per device, and the GPU pool holds it), nothing unmapped at the
+/// end.
+///
+/// # Safety
+/// `ptr` must be valid for reads of `len` bytes for the rest of the process.
+pub unsafe fn register_borrowed_base(id: u32, ptr: *const u8, len: usize, origin: String) -> io::Result<()> {
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    if guard.contains_key(&id) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("arena {id} is already attached")));
+    }
+    guard.insert(
+        id,
+        Attached { view: Arc::new(platform::MappedView::borrowed(ptr)), len, origin, provided: false, base: 0, fixed: true },
+    );
+    Ok(())
+}
+
+/// §110: map the file at `path` read-write for the rest of the process and
+/// return its address: a file standing in for another device's BAR in a
+/// harness, made a pool region with [`register_borrowed_base`].
+pub fn map_file_for_region(path: &std::path::Path, len: u64) -> io::Result<*const u8> {
+    let len = usize::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too large"))?;
+    let view = platform::map_file_mut(&path.to_string_lossy(), len)?;
+    let ptr = view.ptr();
+    std::mem::forget(view);
+    Ok(ptr)
+}
+
+/// §107: forget a window [`attach_ivshmem_window`] registered. Refuses
+/// anything that is not one.
+pub fn detach_ivshmem_window(id: u32) -> io::Result<()> {
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    match guard.get(&id) {
+        Some(a) if !a.fixed && !a.provided && a.origin.starts_with("window ") => {
+            guard.remove(&id);
+            Ok(())
+        }
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("arena {id} is not an ivshmem window"))),
+        None => Err(io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not attached"))),
+    }
+}
+
 /// Whether arena `id` is this process's ivshmem region.
 pub fn is_ivshmem(id: u32) -> bool {
     ivshmem_slot().lock().ok().is_some_and(|s| s.as_ref().is_some_and(|s| s.arena == id))
@@ -2178,6 +2272,24 @@ mod tests {
     // the refusals; what it cannot is that a driver maps anything, which is a
     // guest's claim (docs/waycompose-design.md §83).
 
+    /// §110: memory another part of the process maps (the GPU device's BAR)
+    /// is a base windows are cut from, with no mapping of its own.
+    #[test]
+    fn a_borrowed_base_is_windowed_without_a_mapping_of_its_own() {
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 3 * 4096].into_boxed_slice());
+        buf[4096..4100].copy_from_slice(b"GPU!");
+        // SAFETY: a leaked buffer, valid for the rest of the process.
+        unsafe { register_borrowed_base(9400, buf.as_ptr(), buf.len(), "test".into()) }.unwrap();
+        // SAFETY: as above.
+        assert!(unsafe { register_borrowed_base(9400, buf.as_ptr(), buf.len(), "again".into()) }.is_err());
+        attach_ivshmem_window(9401, 9400, 4096, 4096).unwrap();
+        let m = Handle::from_descriptor(Descriptor::ArenaSlice { arena: 9401, offset: 0, len: 4 }).map().unwrap();
+        assert_eq!(m.as_slice(), b"GPU!");
+        assert!(attach_ivshmem_window(9402, 9400, 8192, 8192).is_err(), "past the base");
+        detach_ivshmem_window(9401).unwrap();
+        assert!(detach_ivshmem_window(9400).is_err(), "the base itself is never detached");
+    }
+
     #[test]
     fn an_ivshmem_region_puts_the_header_first_and_the_arena_after_it() {
         use crate::ivshmem::{HEADER_BYTES, Header};
@@ -2262,6 +2374,30 @@ mod tests {
         // A device region is never released: there is nothing to give back.
         assert_eq!(release_guest_ram(IV).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert!(publish_ivshmem(IV + 1).is_err());
+
+        // §107: a window of the BAR as an arena of its own. Offset 0 of the
+        // window is the arena's offset `W`, and nothing outside it is named.
+        const WIN: u32 = 9300;
+        const W: u64 = 2 * REGION_PAGE as u64;
+        guest_write(IV, W, b"WINDOW").unwrap();
+        attach_ivshmem_window(WIN, IV, W, REGION_PAGE as u64).unwrap();
+        let m = Handle::from_descriptor(Descriptor::ArenaSlice { arena: WIN, offset: 0, len: 6 }).map().unwrap();
+        assert_eq!(m.as_slice(), b"WINDOW");
+        assert!(
+            Handle::from_descriptor(Descriptor::ArenaSlice { arena: WIN, offset: REGION_PAGE as u64 - 2, len: 6 })
+                .map()
+                .is_err(),
+            "a slice past the window's end is refused"
+        );
+        assert_eq!(attach_ivshmem_window(WIN, IV, 0, 4096).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(attach_ivshmem_window(WIN + 1, IV, r.arena_len - 4096, 8192).is_err(), "past the arena");
+        assert!(attach_ivshmem_window(WIN + 1, IV + 7, 0, 4096).is_err(), "not an ivshmem arena");
+        assert!(guest_write(WIN, 0, b"x").is_err(), "a window is the peer's, read-only here");
+        assert!(detach_ivshmem_window(IV).is_err(), "the BAR itself is never detached");
+        detach_ivshmem_window(WIN).unwrap();
+        assert_eq!(m.as_slice(), b"WINDOW", "a live mapping outlives the window's registration");
+        assert!(Handle::from_descriptor(Descriptor::ArenaSlice { arena: WIN, offset: 0, len: 6 }).map().is_err());
+        assert_eq!(detach_ivshmem_window(WIN).unwrap_err().kind(), io::ErrorKind::NotFound);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -826,12 +826,34 @@ pub struct ClientState {
     /// `Debug` spelling is an implementation detail — so it is counted here.
     /// Costs one `u32` per client and is otherwise inert.
     pub index: u32,
+    /// §107: which session of a shared compositor this client belongs to, from
+    /// the session index in its ring slot's owner id. 0 for a socket client and
+    /// for every client of a single-session compositor.
+    pub session: u8,
+    /// §107.10: a proxy's icon or clipboard feed rather than an application.
+    /// Counted as a client by smithay, never as a reason to keep a session up.
+    pub feed: bool,
 }
 
 impl ClientState {
     pub fn new(index: u32) -> ClientState {
         ClientState { index, ..Default::default() }
     }
+
+    /// §107: a client of session `session`.
+    pub fn in_session(index: u32, session: u8) -> ClientState {
+        ClientState { index, session, ..Default::default() }
+    }
+
+    /// §107.10: a feed of session `session`.
+    pub fn feed_in_session(index: u32, session: u8) -> ClientState {
+        ClientState { index, session, feed: true, ..Default::default() }
+    }
+}
+
+/// §107: the session index of a client, 0 when it has none (or is not ours).
+pub fn client_session(client: &wayland_server::Client) -> u8 {
+    client.get_data::<ClientState>().map_or(0, |c| c.session)
 }
 
 impl ClientData for ClientState {

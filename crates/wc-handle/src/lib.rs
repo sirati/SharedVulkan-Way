@@ -119,6 +119,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod arena;
+/// §107: the shared BAR cut into per-session regions.
+pub mod barpool;
 /// GROWTH. The host→guest channel that asks for another region, as a message
 /// on shared_vulkan's existing control region and rings rather than as a
 /// mechanism of its own.

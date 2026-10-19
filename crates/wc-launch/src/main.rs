@@ -33,6 +33,8 @@ mod floor;
 mod appmeta;
 mod audio;
 mod config;
+// §106: types registered with Windows, and `--file`.
+mod hostint;
 mod ico;
 // §103.8: the macOS bundle's contents (pure, tested everywhere) and the macOS
 // launcher itself.
@@ -40,11 +42,13 @@ mod ico;
 mod macbundle;
 #[cfg(target_os = "macos")]
 mod mac;
+// §106: the macOS main process's host integration.
 #[cfg(target_os = "macos")]
-mod audio_mac;
+mod mac_hostint;
 #[cfg(target_os = "macos")]
 mod sound_mac;
 mod plan;
+mod single;
 #[cfg(windows)]
 mod shell;
 /// §92. The compositor's own taskbar-identity module, compiled in here too, so
@@ -100,6 +104,10 @@ struct State {
     id: String,
     comp_log: String,
     comp_pid: u32,
+    /// §107: the shared compositor's pid, whose windows this session's are.
+    /// Never this installation's to kill (`--stop` reads `comp_pid` only);
+    /// [`find_window`] looks among its windows.
+    shared_pid: u32,
     ready: bool,
 }
 
@@ -112,6 +120,7 @@ impl State {
                 "id" => s.id = v.into(),
                 "comp-log" => s.comp_log = v.into(),
                 "comp-pid" => s.comp_pid = v.parse().unwrap_or(0),
+                "shared-pid" => s.shared_pid = v.parse().unwrap_or(0),
                 "ready" => s.ready = v == "1",
                 _ => {}
             }
@@ -120,10 +129,11 @@ impl State {
     }
     fn render(&self) -> String {
         format!(
-            "id={}\ncomp-log={}\ncomp-pid={}\nready={}\n",
+            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nready={}\n",
             self.id,
             self.comp_log,
             self.comp_pid,
+            self.shared_pid,
             u8::from(self.ready)
         )
     }
@@ -390,6 +400,11 @@ fn run(
     let mut ping = false;
     let mut request = Request::Run;
     let mut refresh_only: Option<&str> = None;
+    // §106 (begin): a file to open with the application, and uninstalling
+    // the registration of types.
+    let mut file: Option<&str> = None;
+    let mut uninstall_assoc: Option<Option<&str>> = None;
+    // §106 (end)
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -421,6 +436,18 @@ fn run(
             "--session-name" => {
                 it.next();
             }
+            // §106 (begin). What the registration's command line runs for a
+            // file of a registered type: `<section> --file "%1"`.
+            "--file" => file = Some(it.next().map(String::as_str).unwrap_or("")),
+            // `--uninstall-assoc [SECTION]`: this installation's registrations.
+            "--uninstall-assoc" => {
+                let next = it.clone().next().filter(|n| !n.starts_with("--"));
+                if next.is_some() {
+                    it.next();
+                }
+                uninstall_assoc = Some(next.map(String::as_str));
+            }
+            // §106 (end)
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => app = Some(other),
         }
@@ -438,6 +465,16 @@ fn run(
     if let Some(id) = install {
         return win::install(cfg, p, log, id);
     }
+    // §106 (begin)
+    if let Some(section) = uninstall_assoc {
+        return hostint::uninstall(&p.apps, section, log);
+    }
+    let file_url;
+    if let Some(f) = file {
+        file_url = hostint::file_url(cfg, f, log)?;
+        request = Request::Open(&file_url);
+    }
+    // §106 (end)
     if let Some(id) = refresh_only {
         cfg.app(id)?;
         win::refresh(cfg, p, log, id, win::Refresh::Full);
@@ -509,13 +546,35 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    fn session_mutex(session: &str) -> String {
+        format!("Local\\waycompose-launch-{session}")
+    }
+
+    /// The question [`claim`] answers — is a session up, so that this click
+    /// is warm — asked without becoming the owner when none is: `OpenMutexW`
+    /// opens the owner's mutex and never creates one (§102.14).
+    fn session_alive(session: &str) -> bool {
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let name = wide(&session_mutex(session));
+        // SAFETY: a NUL-terminated name; the handle is closed at once.
+        unsafe {
+            let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+            if h.is_null() {
+                return false;
+            }
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+        true
+    }
+
     /// `Ok(Some)` — we are the owner. `Ok(None)` — somebody else is.
     fn claim(session: &str) -> Result<Option<Owner>, String> {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
         // `Local\` — per logon session, which is the right scope: the desktop
         // this compositor draws on belongs to one.
-        let name = wide(&format!("Local\\waycompose-launch-{session}"));
+        let name = wide(&session_mutex(session));
         // SAFETY: a null security descriptor and a NUL-terminated name.
         let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if h.is_null() {
@@ -832,11 +891,19 @@ mod win {
         let _ = host_session(cfg, p, &s.id, &["down"]);
         // The compositor is the session's life. Ending it makes the owner run
         // its own teardown, which is the only code that knows what to unwind.
-        kill(s.comp_pid);
+        // §107: unless it is the user's shared compositor (pid 0 in the
+        // state), which other installations' windows are in; `down` is enough.
+        if s.comp_pid != 0 {
+            kill(s.comp_pid);
+        }
         Ok(())
     }
 
     /// The whole of it: make sure a session exists, then run the application.
+    ///
+    /// §102.14: a `single` application's plain run goes through
+    /// [`single_gate`] first, and only a click that holds its launch lock
+    /// gets past it.
     pub fn launch(
         cfg: &Config,
         p: &Paths,
@@ -844,6 +911,38 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+    ) -> Result<(), String> {
+        let Some((section, a)) = app.filter(|(_, a)| a.single && matches!(req, crate::Request::Run)) else {
+            return launch_as(cfg, p, log, app, req, t0, &mut None);
+        };
+        let Some(lock) = single_gate(cfg, p, log, section, a)? else {
+            return Ok(());
+        };
+        let mut one = Some(Single { section, app: a, lock: Some(lock), since: Instant::now(), failure: None, notice: None });
+        let r = launch_as(cfg, p, log, app, req, t0, &mut one);
+        let mut one = one.expect("never taken");
+        if let Err(e) = &r
+            && one.notice.is_none()
+        {
+            let f = one.failure.take().unwrap_or_else(|| crate::single::Failure::Session(e.clone()));
+            one.fail(log, f);
+        }
+        drop(one.lock.take());
+        // The process must outlive the dialog it opened.
+        if let Some(n) = one.notice.take() {
+            let _ = n.join();
+        }
+        r
+    }
+
+    fn launch_as(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        app: Option<(&str, &crate::config::App)>,
+        req: crate::Request,
+        t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         // §92. The first launch of an application on this installation, before
         // anything else: its relaunch file must exist before its first window
@@ -876,10 +975,13 @@ mod win {
         let mut owned = claim(&cfg.session)?;
         if owned.is_none() {
             log.say("a session is already up; joining it");
-            match join_and_start(cfg, p, log, app, req, t0) {
+            match join_and_start(cfg, p, log, app, req, t0, one) {
                 Ok(()) => return Ok(()),
                 Err(e) if !p.state.exists() => {
                     log.say(&format!("the session ended under this click ({e}); starting a new one"));
+                    if let Some(o) = one.as_mut() {
+                        o.failure = None;
+                    }
                     let deadline = Instant::now() + Duration::from_secs(30);
                     loop {
                         owned = claim(&cfg.session)?;
@@ -914,8 +1016,8 @@ mod win {
                 first_refresh(log);
                 if let Some((section, a)) = app {
                     let before = count_mapped(&p.comp_log);
-                    start_app(cfg, p, log, &s.id, a, req)?;
-                    let _ = report(log, &p.comp_log, before, t0, "cold", req);
+                    start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+                    let _ = shown(cfg, p, log, one, &p.comp_log, before, t0, "cold", req);
                     refresh(cfg, p, log, section, Refresh::Full);
                 }
                 // §92. While the session runs, its jump lists follow the
@@ -936,6 +1038,7 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         let s = join(p, 60)?;
         let Some((section, a)) = app else {
@@ -943,8 +1046,8 @@ mod win {
             return Ok(());
         };
         let before = count_mapped(Path::new(&s.comp_log));
-        start_app(cfg, p, log, &s.id, a, req)?;
-        let shown = report(log, Path::new(&s.comp_log), before, t0, "warm", req);
+        start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+        let shown = shown(cfg, p, log, one, Path::new(&s.comp_log), before, t0, "warm", req);
         refresh(cfg, p, log, section, Refresh::Full);
         shown
     }
@@ -963,6 +1066,9 @@ mod win {
     fn cold(cfg: &Config, p: &Paths, log: &mut Log, owner: &Owner) -> Result<Session, String> {
         if cfg.debug_ssh_transport {
             return cold_ssh_debug(cfg, p, log, owner);
+        }
+        if cfg.shared_compositor {
+            return cold_shared(cfg, p, log);
         }
         let t = Instant::now();
         let id = plan::run_id(&cfg.session, std::process::id());
@@ -1057,11 +1163,181 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, ready: true }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+    }
+
+    // ---------------------------------------- §107: the user's compositor ---
+
+    fn user_ctl(p: &Paths) -> std::path::PathBuf {
+        p.state_dir.join("wc-compositor.ctl")
+    }
+
+    fn shared_log(p: &Paths) -> std::path::PathBuf {
+        p.state_dir.join("wc-compositor.log")
+    }
+
+    /// Whether some process holds the named mutex `Local\NAME`.
+    fn held(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        let w = wide(&format!("Local\\{name}"));
+        // SAFETY: a NUL-terminated name; the handle is closed at once.
+        let h = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, w.as_ptr()) };
+        if h.is_null() {
+            return false;
+        }
+        // SAFETY: the handle just opened.
+        unsafe { CloseHandle(h) };
+        true
+    }
+
+    /// One line to the user's compositor and its one-line answer. `wait`
+    /// requests block until their session ends, so they get no timeout.
+    fn user_request(p: &Paths, line: &str, timeout: Option<Duration>) -> Result<String, String> {
+        use std::io::{Read, Write};
+        let mut s = wc_transport::connect(&user_ctl(p)).map_err(|e| format!("the user's compositor ({}): {e}", user_ctl(p).display()))?;
+        let _ = s.set_read_timeout(timeout);
+        s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("the user's compositor: {e}"))?;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.contains(&b'\n') {
+            match s.read(&mut tmp) {
+                Ok(0) => return Err("the compositor closed its socket".into()),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(format!("the user's compositor: {e}")),
+            }
+        }
+        let line = String::from_utf8_lossy(&buf).lines().next().unwrap_or("").to_string();
+        match line.strip_prefix("ok") {
+            Some(rest) => Ok(rest.trim().to_string()),
+            None => Err(line.strip_prefix("err").unwrap_or(&line).trim().to_string()),
+        }
+    }
+
+    /// §107: the user's one compositor, started if nobody holds its mutex.
+    /// Two launchers that both start one race for the mutex before either
+    /// maps the device; the loser exits and both use the winner's socket.
+    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<u32, String> {
+        let t = Instant::now();
+        let mut kid: Option<Child> = None;
+        if held(plan::COMPOSITOR_MUTEX) {
+            log.say("compositor: the user's compositor is up; this installation's session joins it (§107)");
+        } else {
+            let argv = plan::shared_compositor_argv(cfg, &shared_log(p).to_string_lossy(), &user_ctl(p).to_string_lossy());
+            log.say(&format!("compositor: starting the user's compositor: {} {}", cfg.compositor, argv.join(" ")));
+            kid = Some(spawn_outliving(quiet(Command::new(&cfg.compositor).args(&argv)), CREATE_NO_WINDOW).map_err(|e| format!("{}: {e}", cfg.compositor))?);
+        }
+        loop {
+            if let Ok(r) = user_request(p, "ping", Some(Duration::from_secs(5))) {
+                log.say(&format!("compositor: {r} answers ({} ms)", t.elapsed().as_millis()));
+                return Ok(plan::compositor_pid(&r));
+            }
+            if let Some(k) = kid.as_mut()
+                && let Ok(Some(rc)) = k.try_wait()
+            {
+                // Lost the race (exit 5): another launcher's compositor holds
+                // the mutex; wait for its socket like everybody else.
+                kid = None;
+                log.say(&format!("compositor: the one this launcher started exited ({rc}); waiting for the user's"));
+            }
+            if t.elapsed() > Duration::from_secs(30) {
+                return Err(format!("the user's compositor never answered on {}", user_ctl(p).display()));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// §107: this installation's session in the user's compositor. No
+    /// compositor of its own and no GPU process of its own: the session is a
+    /// `boot` line, and what it is told is the host's answer to its record.
+    fn cold_shared(cfg: &Config, p: &Paths, log: &mut Log) -> Result<Session, String> {
+        let t = Instant::now();
+        let id = plan::run_id(&cfg.session, std::process::id());
+        let _ = std::fs::remove_file(&p.ctl);
+        let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
+        if !key.exists() {
+            return Err(format!(
+                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+                key.display()
+            ));
+        }
+        let comp_log = shared_log(p).display().to_string();
+        State { id: id.clone(), comp_log: comp_log.clone(), ..State::default() }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+        // The user's GPU process, first, so its driver opens while the
+        // session boots (§105.13); never this launcher's to end.
+        let gpu = cfg.gpu_sessions > 0;
+        if gpu && plan::one_pool_gpu(cfg) {
+            log.say("gpu: the GPU pool runs in the user's compositor, one pool with the arena (§110)");
+        } else if gpu {
+            if held(plan::GPU_MUTEX) {
+                log.say("gpu: the user's GPU process is up; this session leases from it");
+            } else {
+                spawn_shared_gpu(cfg, p, log);
+            }
+        }
+        let shared_pid = ensure_compositor(cfg, p, log)?;
+        let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
+        log.say(&format!(
+            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
+            cfg.installation()
+        ));
+        let t_boot = Instant::now();
+        let said = user_request(p, &line, Some(Duration::from_secs(120))).map_err(|e| format!("the session did not start: {e}"))?;
+        log.say(&format!("up: {said} ({} ms)", t_boot.elapsed().as_millis()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !p.ctl.exists() {
+            if Instant::now() > deadline {
+                return Err("the compositor never opened this session's control socket (the host claimed no control ring)".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if !cfg.audio {
+            log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
+        }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, ready: true }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+        log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
+        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into() })
+    }
+
+    /// §107: start a process that must outlive this launcher: the user's
+    /// compositor and GPU process serve other installations after this one's
+    /// session ends. Out of this launcher's job when the job allows it (a
+    /// task the scheduler started may be one that ends its whole tree), else
+    /// as an ordinary child, which is what every launcher before §107 did.
+    fn spawn_outliving(cmd: &mut Command, flags: u32) -> std::io::Result<Child> {
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        match cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
+            Ok(c) => Ok(c),
+            Err(_) => cmd.creation_flags(flags).spawn(),
+        }
+    }
+
+    /// §107: the user's GPU process, held by its mutex and ending by itself
+    /// when no session has leased from it for a while.
+    fn spawn_shared_gpu(cfg: &Config, p: &Paths, log: &mut Log) {
+        let path = p.state_dir.join("wc-gpu.log");
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                return;
+            }
+        };
+        let mut cmd = Command::new(&cfg.compositor);
+        cmd.args(plan::shared_gpu_argv(cfg)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(file));
+        match spawn_outliving(&mut cmd, CREATE_NO_WINDOW)
+        {
+            Ok(_) => log.say("gpu: started the user's GPU process (§107)"),
+            Err(e) => log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor)),
+        }
     }
 
     fn cold_ssh_debug(cfg: &Config, p: &Paths, log: &mut Log, _owner: &Owner) -> Result<Session, String> {
@@ -1230,16 +1506,19 @@ mod win {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
             comp_pid,
+            shared_pid: 0,
             ready: true,
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
         id: String,
-        comp: Child,
+        /// The compositor, when this launcher started it for its session
+        /// alone; `None` for §107's shared compositor, which is nobody's child.
+        comp: Option<Child>,
         /// The debug transport's relay and tunnel (§105); `None` on the product path.
         relay: Option<Child>,
         tunnel: Option<Child>,
@@ -1525,13 +1804,333 @@ mod win {
         }
     }
 
+    // ------------------------------------------------- §102.14 single apps ---
+
+    /// A launch of a `single` application by the click that holds its launch
+    /// lock.
+    pub struct Single<'a> {
+        section: &'a str,
+        app: &'a crate::config::App,
+        /// Held from the gate until the window appears or the launch fails.
+        lock: Option<LaunchLock>,
+        since: Instant,
+        /// Why the launch failed, where the failure was seen; the outer
+        /// `launch` tells the user only if the launch ends in an error.
+        failure: Option<crate::single::Failure>,
+        /// The dialog's thread, joined before the process exits.
+        notice: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Single<'_> {
+        /// Let the lock go first — a second click must not wait on a dialog —
+        /// then tell the user, on a thread of its own, so an owner keeps
+        /// supervising its session while the dialog is up.
+        fn fail(&mut self, log: &mut Log, f: crate::single::Failure) {
+            drop(self.lock.take());
+            let langs = crate::appmeta::lang_candidates(&crate::shell::ui_languages());
+            let text = crate::single::message(&f, &self.app.title, crate::single::german(&langs));
+            log.say(&format!(
+                "single: {}: FAILED after {} ms ({f:?}); lock released; telling the user: {}",
+                self.section,
+                self.since.elapsed().as_millis(),
+                text.lines().next().unwrap_or("")
+            ));
+            let caption = self.app.title.clone();
+            self.notice = Some(std::thread::spawn(move || message_box(&caption, &text)));
+        }
+    }
+
+    fn refused(one: &mut Option<Single>, e: &str) {
+        if let Some(o) = one.as_mut() {
+            o.failure = Some(crate::single::Failure::Refused(e.to_string()));
+        }
+    }
+
+    /// After the host accepted the run: a plain application waits for the
+    /// compositor's `mapped` line ([`report`]); a single one for its own
+    /// window, so that the lock is let go exactly when a second click can
+    /// find what it is looking for.
+    #[allow(clippy::too_many_arguments)]
+    fn shown(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        one: &mut Option<Single>,
+        comp_log: &Path,
+        before: usize,
+        t0: Instant,
+        kind: &str,
+        req: crate::Request,
+    ) -> Result<(), String> {
+        use crate::single::{Launching, launching};
+        let Some(o) = one.as_mut() else { return report(log, comp_log, before, t0, kind, req) };
+        loop {
+            let w = find_window(cfg, p, o.section, o.app);
+            match launching(w.is_some(), o.since.elapsed()) {
+                Launching::Up => {
+                    drop(o.lock.take());
+                    log.say(&format!(
+                        "CLICK-TO-WINDOW {} ms ({kind}, single; its window is up, launch lock released)",
+                        t0.elapsed().as_millis()
+                    ));
+                    return Ok(());
+                }
+                Launching::NoWindow => {
+                    o.fail(log, crate::single::Failure::NoWindow);
+                    return Err("no window appeared".into());
+                }
+                Launching::Again => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// The launch lock, a named mutex this process owns.
+    pub struct LaunchLock(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LaunchLock {
+        fn drop(&mut self) {
+            // SAFETY: a mutex this thread owns (taken by the wait that made
+            // this value) and a handle this process has not closed.
+            unsafe {
+                windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// A handle to the launch lock that does not own it yet, closed on drop.
+    struct LockHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LockHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle this process opened and has not closed.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
+    }
+
+    impl LockHandle {
+        fn open(name: &str) -> Result<LockHandle, String> {
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+            let n = wide(name);
+            // SAFETY: a null security descriptor and a NUL-terminated name;
+            // not initially owned, so this creates or opens and nothing more.
+            let h = unsafe { CreateMutexW(std::ptr::null(), 0, n.as_ptr()) };
+            if h.is_null() {
+                return Err(format!("CreateMutexW({name}): {}", std::io::Error::last_os_error()));
+            }
+            Ok(LockHandle(h))
+        }
+        fn wait(&self, ms: u32) -> crate::single::Lock {
+            // SAFETY: our handle.
+            crate::single::Lock::from_wait(unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, ms)
+            })
+        }
+        /// The lock, now owned: its handle moves into the guard.
+        fn owned(mut self) -> LaunchLock {
+            LaunchLock(std::mem::replace(&mut self.0, std::ptr::null_mut()))
+        }
+    }
+
+    /// §102.14, before anything is sent to the host. `Ok(None)`: this click
+    /// is done (it focused the window, or went quietly). `Ok(Some)`: this
+    /// click launches, holding the lock.
+    fn single_gate(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Result<Option<LaunchLock>, String> {
+        use crate::single::{First, Lock, Waiting, first, waiting};
+        let t = Instant::now();
+        let window = find_window(cfg, p, section, app);
+        let name = crate::single::lock_name(&cfg.session, section);
+        let handle = LockHandle::open(&name)?;
+        let mut taken = Lock::Held;
+        match first(window.is_some(), || {
+            taken = handle.wait(0);
+            taken
+        }) {
+            First::Focus => {
+                let (hwnd, by) = window.expect("Focus only with a window");
+                focus(log, section, hwnd, by, "a window is already up");
+                return Ok(None);
+            }
+            First::Launch => {
+                log.say(&format!(
+                    "single: {section}: no window, nobody launching; launching, holding {name}{}",
+                    if taken == Lock::Abandoned { " (its last holder exited without letting go)" } else { "" }
+                ));
+                return Ok(Some(handle.owned()));
+            }
+            First::Wait => log.say(&format!(
+                "single: {section}: another click is launching it; waiting up to {} s for its window, no run sent",
+                crate::single::WAIT_BOUND.as_secs()
+            )),
+        }
+        let mut released = false;
+        loop {
+            let window = find_window(cfg, p, section, app);
+            match waiting(window.is_some(), released, t.elapsed()) {
+                Waiting::Focus => {
+                    let (hwnd, by) = window.expect("Focus only with a window");
+                    focus(log, section, hwnd, by, &format!("the other click's window is up after {} ms", t.elapsed().as_millis()));
+                    return Ok(None);
+                }
+                Waiting::FirstFailed => {
+                    log.say(&format!(
+                        "single: {section}: the other click's launch ended without a window (it tells the user); this click does nothing"
+                    ));
+                    return Ok(None);
+                }
+                Waiting::GaveUp => {
+                    log.say(&format!(
+                        "single: {section}: no window and no release in {} s; this click does nothing",
+                        crate::single::WAIT_BOUND.as_secs()
+                    ));
+                    return Ok(None);
+                }
+                Waiting::Again => {
+                    // Taken here means let go there. Let go at once (dropping
+                    // the guard), and look for the window once more.
+                    if handle.wait(250).ours() {
+                        released = true;
+                        // SAFETY: owned by this thread from the wait above.
+                        unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(handle.0) };
+                    }
+                }
+            }
+        }
+    }
+
+    /// The application's window in this installation's session, if it has
+    /// one: a visible, unowned top-level window of the session's compositor
+    /// with the application's identity, or its exact title where the identity
+    /// cannot be read. The compositor's pid is the state file's, and only
+    /// while the session's own mutex says the session is up — the same test
+    /// that makes a click warm.
+    fn find_window(
+        cfg: &Config,
+        p: &Paths,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Option<(windows_sys::Win32::Foundation::HWND, crate::single::By)> {
+        if !session_alive(&cfg.session) {
+            return None;
+        }
+        let s = std::fs::read_to_string(&p.state).map(|t| State::parse(&t)).ok()?;
+        // §107: with the shared compositor the windows are its process's.
+        let pid = crate::single::window_pid(s.comp_pid, s.shared_pid);
+        if pid == 0 {
+            return None;
+        }
+        let (hwnds, ws) = windows_of(pid);
+        let aumid = app_aumid(p, section, app);
+        crate::single::find(&ws, pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
+    }
+
+    /// Every top-level window of process `pid`, as [`crate::single::Window`]s.
+    fn windows_of(pid: u32) -> (Vec<windows_sys::Win32::Foundation::HWND>, Vec<crate::single::Window>) {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, InternalGetWindowText, IsWindowVisible,
+        };
+        unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> windows_sys::core::BOOL {
+            // SAFETY: `l` is the `Vec` below, alive for the whole enumeration.
+            unsafe { (*(l as *mut Vec<HWND>)).push(hwnd) };
+            1
+        }
+        let mut all: Vec<HWND> = Vec::new();
+        // SAFETY: the callback only pushes into `all`, which outlives the call.
+        unsafe { EnumWindows(Some(each), &mut all as *mut Vec<HWND> as LPARAM) };
+        crate::shell::init();
+        let mut hwnds = Vec::new();
+        let mut ws = Vec::new();
+        for h in all {
+            let mut owner_pid = 0u32;
+            // SAFETY: a handle from EnumWindows; a stale one answers 0.
+            unsafe { GetWindowThreadProcessId(h, &mut owner_pid) };
+            if owner_pid != pid {
+                continue;
+            }
+            let mut buf = [0u16; 512];
+            // SAFETY: as above. `InternalGetWindowText` reads the title
+            // without sending the window a message, so a busy compositor
+            // cannot hang this click.
+            let (visible, owned, n) = unsafe {
+                (
+                    IsWindowVisible(h) != 0,
+                    !GetWindow(h, GW_OWNER).is_null(),
+                    InternalGetWindowText(h, buf.as_mut_ptr(), buf.len() as i32),
+                )
+            };
+            let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            let aumid = if visible && !owned { crate::shell::window_aumid(h) } else { None };
+            hwnds.push(h);
+            ws.push(crate::single::Window { pid: owner_pid, visible, owned, aumid, title });
+        }
+        (hwnds, ws)
+    }
+
+    /// Restore the window if it is minimised, then bring it to the front.
+    /// This process is the one the user's click started, so Windows lets it
+    /// take the foreground; if it refuses, the taskbar button flashes.
+    fn focus(
+        log: &mut Log,
+        section: &str,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        by: crate::single::By,
+        what: &str,
+    ) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync};
+        // SAFETY: a window handle just found; a stale one fails each call.
+        let (restored, front) = unsafe {
+            let iconic = IsIconic(hwnd) != 0;
+            if iconic {
+                ShowWindowAsync(hwnd, SW_RESTORE);
+            }
+            (iconic, SetForegroundWindow(hwnd) != 0)
+        };
+        log.say(&format!(
+            "single: {section}: {what} (hwnd 0x{:x}, by {}); {}{}; no run sent",
+            hwnd as usize,
+            match by {
+                crate::single::By::Identity => "identity",
+                crate::single::By::Title => "title",
+            },
+            if restored { "restored it, " } else { "" },
+            if front { "brought it to the front" } else { "SetForegroundWindow refused (the button flashes)" },
+        ));
+    }
+
+    fn message_box(caption: &str, text: &str) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+        let (c, t) = (wide(caption), wide(text));
+        // SAFETY: NUL-terminated strings that outlive the modal call.
+        unsafe { MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND) };
+    }
+
     /// The owner stays for the session's life so that the mutex does, and so
     /// that there is something to unwind it. It waits on the compositor because
     /// the compositor is the session: when its window closes, or its own
     /// deadline passes, the rest has nothing left to carry.
     fn supervise(cfg: &Config, p: &Paths, log: &mut Log, mut s: Session) -> Result<(), String> {
-        let rc = s.comp.wait().map_err(|e| format!("waiting on the compositor: {e}"))?;
-        log.say(&format!("the compositor exited: {rc}"));
+        match s.comp.as_mut() {
+            Some(c) => {
+                let rc = c.wait().map_err(|e| format!("waiting on the compositor: {e}"))?;
+                log.say(&format!("the compositor exited: {rc}"));
+            }
+            // §107: the shared compositor says when this session has ended
+            // (its proxy ended, its last window closed a linger ago, or the
+            // compositor itself ended, which closes the socket).
+            None => match user_request(p, &format!("wait {}", s.id), None) {
+                Ok(why) => log.say(&format!("the session ended: {why}")),
+                Err(e) => log.say(&format!("the session ended with the compositor: {e}")),
+            },
+        }
         for c in s.relay.iter_mut().chain(s.tunnel.iter_mut()).chain(s.gpus.iter_mut()) {
             let _ = c.kill();
         }
@@ -1542,7 +2141,9 @@ mod win {
             let _ = ssh(cfg, p, &["down", &s.id]);
         }
         let _ = std::fs::remove_file(&p.state);
-        let _ = std::fs::remove_file(&s.comp_log);
+        if s.comp.is_some() {
+            let _ = std::fs::remove_file(&s.comp_log);
+        }
         log.say("session down");
         Ok(())
     }
@@ -1568,6 +2169,9 @@ mod win {
         let path = desktop.join(format!("{}.lnk", file_name(&app.title)));
         crate::shell::save_link(&shortcut(p, id, app), &path)?;
         log.say(&format!("installed {}", path.display()));
+        // §106: the types its desktop entry opens, from the host's answer
+        // that `refresh` just cached. `--uninstall-assoc` takes them back.
+        crate::hostint::deploy(cfg, &p.apps, &exe_path(), icon_path(p, id).as_deref(), id, cached_meta(p, id).as_ref(), log);
         Ok(())
     }
 

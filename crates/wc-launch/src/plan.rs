@@ -90,6 +90,28 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     if cfg.nested_globals {
         a.push("--nested-compositor-globals".into());
     }
+    // §106. Host integration: the compositor serves the `OWNER_HOSTINT`
+    // slot with this path map and browser once the session service opens it.
+    a.extend(hostint_argv(&cfg.hostint));
+    a
+}
+
+/// §106. The compositor's `--hostint*` flags for `[hostint]`.
+pub fn hostint_argv(h: &crate::config::HostInt) -> Vec<String> {
+    let mut a = vec!["--hostint".to_string()];
+    let map = h.path_map();
+    for (host, linux) in &map.shares {
+        a.extend(["--hostint-share".into(), format!("{host}={linux}")]);
+    }
+    if let Some((host, linux)) = &map.drop {
+        a.extend(["--hostint-drop".into(), format!("{host}={linux}")]);
+    }
+    if !h.browser.is_empty() {
+        a.extend(["--hostint-browser".into(), h.browser.clone()]);
+        for x in &h.browser_args {
+            a.extend(["--hostint-browser-arg".into(), x.clone()]);
+        }
+    }
     a
 }
 
@@ -116,6 +138,75 @@ pub fn boot_argv(cfg: &Config, id: &str, key_file: &str, control: &str) -> Vec<S
     if cfg.audio {
         a.extend(["--session-audio".into(), cfg.audio_volume.to_string()]);
     }
+    a
+}
+
+/// §107. The named mutexes (`Local\…`) the user's one compositor and one GPU
+/// process hold for their lives: a launcher that finds one held uses that
+/// process instead of starting its own.
+pub const COMPOSITOR_MUTEX: &str = "waycompose-compositor";
+pub const GPU_MUTEX: &str = "waycompose-gpu";
+/// §107. How long the user's GPU process lives with no session leasing from it.
+pub const GPU_IDLE_SECS: u64 = 120;
+
+/// §107. The user's compositor, which serves every installation: §105's
+/// arguments with no session of its own, its socket for the launchers' `boot`
+/// lines, and the mutex that makes it the only one. The nested-compositor
+/// globals are asked for per session, in the boot (`boot_request`).
+pub fn shared_compositor_argv(cfg: &Config, log: &str, user_ctl: &str) -> Vec<String> {
+    let mut a = compositor_argv(cfg, "wl-shared", log);
+    a.retain(|x| x != "--nested-compositor-globals");
+    a.extend(["--user-control".into(), user_ctl.into(), "--singleton".into(), COMPOSITOR_MUTEX.into()]);
+    // §110: the GPU pool in the same process, so the arena and the GPU device
+    // are one pool. Everything after `--with-gpu` is the GPU half's.
+    if one_pool_gpu(cfg) {
+        a.push("--with-gpu".into());
+        a.extend(gpu_argv(cfg).into_iter().skip(1));
+    }
+    a
+}
+
+/// §107: the shared compositor's pid from its answer to `ping`
+/// (`compositor <pid>`); 0 when the answer does not name one.
+pub fn compositor_pid(answer: &str) -> u32 {
+    answer.trim().strip_prefix("compositor ").and_then(|p| p.trim().parse().ok()).unwrap_or(0)
+}
+
+/// §110: whether the shared compositor runs the GPU pool itself.
+pub fn one_pool_gpu(cfg: &Config) -> bool {
+    cfg.shared_compositor && cfg.one_pool && cfg.gpu_sessions > 0 && cfg.gpu_pool
+}
+
+/// §107. The `boot` line for the user's compositor: tab-separated `key=value`
+/// (a Windows path may hold spaces and never a tab). The compositor's
+/// `session_svc::Config::parse_request` reads it; the test below pins the
+/// line both sides agree on.
+pub fn boot_request(cfg: &Config, id: &str, key_file: &str, control: &str, gpu: bool, relaunch: &str) -> String {
+    let mut f = vec![
+        "boot".to_string(),
+        format!("session={id}"),
+        format!("install={}", cfg.installation()),
+        format!("key={key_file}"),
+        format!("control={control}"),
+    ];
+    if gpu {
+        f.push("gpu=1".into());
+    }
+    if cfg.audio {
+        f.push(format!("audio={}", cfg.audio_volume));
+    }
+    if cfg.nested_globals {
+        f.push("nested=1".into());
+    }
+    f.push(format!("relaunch={relaunch}"));
+    f.join("\t")
+}
+
+/// §107. The user's GPU process: §97's pool, held by its mutex, ending after
+/// [`GPU_IDLE_SECS`] with no session rather than with any installation's.
+pub fn shared_gpu_argv(cfg: &Config) -> Vec<String> {
+    let mut a = gpu_argv(cfg);
+    a.extend(["--singleton".into(), GPU_MUTEX.into(), "--exit-idle".into(), GPU_IDLE_SECS.to_string()]);
     a
 }
 
@@ -618,11 +709,70 @@ pub fn unb64(text: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_shared_compositors_pid_comes_from_its_ping() {
+        assert_eq!(super::compositor_pid("compositor 4321"), 4321);
+        assert_eq!(super::compositor_pid(" compositor 7\n"), 7);
+        assert_eq!(super::compositor_pid("session up"), 0);
+        assert_eq!(super::compositor_pid("compositor x"), 0);
+    }
+
     use super::*;
     use crate::config::{Config, EXAMPLE};
 
+    #[test]
+    fn the_compositor_gets_the_hostint_path_map() {
+        let h = crate::config::HostInt::for_platform(true);
+        assert_eq!(
+            hostint_argv(&h),
+            ["--hostint", "--hostint-share", r"Z:\=/srv/winshare", "--hostint-drop", r"Z:\waycompose-open=/srv/winshare/waycompose-open"]
+        );
+        let mut b = h.clone();
+        b.browser = r"C:\b\browser.exe".into();
+        assert_eq!(hostint_argv(&b).last().map(String::as_str), Some(r"C:\b\browser.exe"));
+        b.browser_args = vec!["--new-window".into(), "--user-data-dir=C:\\T\\p q".into()];
+        assert_eq!(
+            hostint_argv(&b)[5..],
+            ["--hostint-browser", r"C:\b\browser.exe", "--hostint-browser-arg", "--new-window", "--hostint-browser-arg", r"--user-data-dir=C:\T\p q"]
+        );
+    }
+
     fn cfg() -> Config {
         Config::parse(EXAMPLE).unwrap()
+    }
+
+    /// §107. The user's compositor: no session of its own, the user's socket,
+    /// the mutex; the nested globals go per session in the boot line.
+    #[test]
+    fn the_shared_compositor_boots_sessions_on_its_socket() {
+        let mut c = cfg();
+        c.nested_globals = true;
+        let a = shared_compositor_argv(&c, r"C:\L\wc-compositor.log", r"C:\L\wc-compositor.ctl");
+        let after = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());
+        assert_eq!(after("--user-control"), Some(r"C:\L\wc-compositor.ctl"));
+        assert_eq!(after("--singleton"), Some(COMPOSITOR_MUTEX));
+        assert!(!a.iter().any(|x| x.starts_with("--boot-") || x == "--control-socket" || x == "--nested-compositor-globals"), "{a:?}");
+        assert_eq!(after("--arena-ivshmem"), Some("0"));
+        // The line the compositor's `Config::parse_request` reads (its test
+        // pins the same shape): tabs between fields, spaces kept in paths.
+        let line = boot_request(&c, "wcl-42", r"C:\U\First Last\session.key", r"C:\L\wc-launch-wcl.ctl", true, r"C:\U\First Last\apps");
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f[0], "boot");
+        assert!(f.contains(&"session=wcl-42") && f.contains(&r"key=C:\U\First Last\session.key"));
+        assert!(f.contains(&"gpu=1") && f.contains(&"nested=1") && f.contains(&r"relaunch=C:\U\First Last\apps"));
+        assert!(f.iter().any(|x| x.starts_with("install=")));
+        assert!(!line.contains('\n'));
+        let g = shared_gpu_argv(&c);
+        let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
+        assert_eq!(after("--singleton"), Some(GPU_MUTEX));
+        assert_eq!(after("--exit-idle"), Some("120"));
+        // §110: with GPU sessions, the GPU pool runs in the compositor.
+        c.gpu_sessions = 2;
+        let a = shared_compositor_argv(&c, "L", "C");
+        let i = a.iter().position(|x| x == "--with-gpu").expect("--with-gpu");
+        assert_eq!(&a[i + 1..i + 3], ["guest", "--ivshmem-slot"]);
+        c.one_pool = false;
+        assert!(!shared_compositor_argv(&c, "L", "C").iter().any(|x| x == "--with-gpu"));
     }
 
     /// The hard requirement, as a test rather than as a paragraph. Every

@@ -726,4 +726,10 @@ impl Session {
         self.stats.dmabuf_fence_waits += 1;
         out
     }
+
+    /// Whether `buffer` is a failed `create_immed`'s placeholder, which the
+    /// compositor has as no `wl_buffer` at all: an attach of it is held back.
+    pub(super) fn is_placeholder_buffer(&self, buffer: u32) -> bool {
+        self.dmabuf.as_ref().is_some_and(|d| d.dead_buffers.contains(&buffer))
+    }
 }

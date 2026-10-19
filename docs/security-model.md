@@ -1355,6 +1355,99 @@ path, key and forced command included. It is off by default, says
 `DEBUG SSH TRANSPORT` three times in the session's log, and the harness fails
 a run whose log says it.
 
+### R38 — Linux asks the host to open links and files, and the host offers Linux its applications
+Added 2026-10-19 with `waycompose-design.md` §106. Until §106 every request
+went one way: the host (Windows, macOS) asked Linux to run one of its
+applications (§94, R33). Host integration adds the other direction. A Linux
+application that calls `xdg-open https://…`, or a person who picks "Notepad
+(Windows)" in a Linux "Open with" dialog, makes the Linux side ask the host
+to open something. **Linux is the less trusted side here**: anything that
+runs as the session's user on Linux can write to the session's
+`hostint.sock`, and the proxy forwards each request to the host over the
+`OWNER_HOSTINT` ring slot. So the host is the boundary, and it checks every
+request as if it came from an attacker (`wc_hostint::host::Service`,
+`wc_hostint::openurl`).
+
+**What Linux can ask for, and nothing else.** Three requests, each naming a
+thing and never carrying a command (§94's rule, in the other direction):
+* `url`: a URL for the host's browser;
+* `path`: a host path for the host's default application for that file;
+* `with`: a URL or host path for one host application, named by an opaque
+  token that the host chose when it offered the application
+  (`[a-z0-9]{1,32}`). The host keeps the token's executable path or bundle
+  id, and nothing Linux sends is ever used as a program.
+
+**The checks, all on the host, before anything runs.**
+* The line is at most 256 KiB, and free text crosses only as base64 inside
+  one word, so a value cannot add a word, a request or a line.
+* A URL is at most 8 KiB. It must not contain any C0, C1 or DEL character,
+  checked *before* parsing, because the parser drops tabs and newlines
+  without a word. It is parsed by a real URL parser (the `url` crate) and
+  **re-serialised**: the host opens its own spelling. Its scheme must be on
+  the allowlist, compared case-insensitively. The default allowlist is
+  `http` and `https`. For `with`, the scheme must also be one the chosen
+  application registered, and `file`, `javascript`, `vbscript`, `data`,
+  `ms-*`, `search-ms` and `x-apple-systempreferences` are never allowed.
+* A host path must be absolute, inside a share that the host itself
+  exported to Linux (Windows `Z:\` = the VM's virtio-fs share; macOS the
+  user's home), at most 8 KiB, with no `..` component and no control
+  character. On Windows it must be a drive path: no UNC path, no `\\?\` or
+  `\\.\` device path, and no second `:` (no alternate data stream).
+* At most 10 opens in any 10 s. Refused requests do not count, so a flood
+  of junk cannot starve real clicks, but a flood of valid URLs cannot open
+  more than ten browser tabs.
+
+**How the host opens.** macOS: `/usr/bin/open -a <browser> -- <url>`,
+`/usr/bin/open -- <path>`, `/usr/bin/open -b <bundle id> -- <target>`.
+These are argv entries, never a shell, and `--` ends option parsing. Windows:
+`ShellExecuteW` with the explicit verb `open` on the URL or path, or
+`CreateProcessW` of the chosen handler's own executable with the target as
+one quoted argument. Never `cmd.exe`, and never a `.bat` or `.cmd` (which
+`CreateProcess` would hand to `cmd.exe`): a handler must be an `.exe`. A
+browser configured by the host's operator (`[hostint] browser`) gets its
+fixed arguments from that configuration only, and the URL after them as one
+argument of its own.
+
+**What a hostile Linux side can still do.** Open up to ten http(s) pages a
+minute in the host's browser, so a Linux program can show the user any web
+page. That is what a browser link does, and it is the feature. Open a file in
+the share with the host's default application for its type. That is a real
+lever: a share-writable `.html` opens in the host's browser, and on Windows
+a share-writable file of an *executable* type would run. **Hence a deny
+list for `path` and `with` on Windows:** extensions that `ShellExecute`
+would execute or install are refused, and the check is the one Windows
+itself uses for "unsafe" files: `AssocIsDangerous`, plus a fixed list for
+`.exe .com .bat .cmd .ps1 .vbs .js .jse .wsf .wsh .msi .msp .lnk .url
+.scr .hta .cpl .reg .inf .appref-ms .msc .jar .library-ms .settingcontent-ms`.
+On macOS, `open` of an app bundle, `.command`, `.terminal`, `.tool`, `.pkg`,
+`.mpkg`, `.workflow`, `.scpt` or `.app` path is refused. Gatekeeper's
+quarantine does not apply to files written through a share, so the list is
+needed there too.
+
+**The other direction (host to Linux) adds little.** A double-click in
+Explorer or Finder on a file that a Linux application registered for becomes
+the existing `open ID APP B64URL` control verb, with a `file:///` URL of the
+file's Linux path. §94 already checks that verb. §106 adds one check on the
+Linux side: a `file:///` URL must lie under a share root. Otherwise a holder
+of the host's control channel could make a Linux application display any
+Linux file (`~/.ssh/...`) in a window on the host. What the host registers
+is per user and per installation. It is a ProgID, `OpenWithProgids` entries,
+Capabilities, and a URL protocol only for a scheme that nothing on the
+system defines. Uninstall removes exactly what install wrote, as listed in a
+manifest whose entries are checked against the key shapes install writes.
+Defaults are never taken. Windows protects `UserChoice` and so do we. On
+macOS the bundles declare their types at rank `Alternate`.
+
+**Audio** crosses only on the sound ring (§103.16), which carries the device
+announcements as well as the PCM. The host chooses which devices exist, and
+Linux names its sinks and sources after them. A hostile host could name a
+device anything. The node name is its slug, only `[a-z0-9_-]`. The
+description reaches the sound server as a module argument with quotes,
+backslashes and line breaks removed, so it cannot add an argument. The microphone is captured only by the host's long-lived main
+process (macOS: bundle `org.waycompose.host`, after the user grants the TCC
+prompt once), never by a per-application process, and only while the
+session has a source node that a Linux client records from.
+
 ### R39 — A userspace render node, and guest sections named by tokens
 Added 2026-10-19 with `waycompose-design.md` §104. The nested KWin composites on
 the forwarded GPU through pieces that each widen something a little.
@@ -1387,7 +1480,6 @@ over). The compositor opens a section by the name the proxy passes, read and
 write for GDI's `CreateDIBSection`, and only reads it. The fence record
 (§104.11) is a page per GPU session that the compositor and other sessions only
 read.
-
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
@@ -1433,3 +1525,48 @@ of the guest's memory (about 0.45 s of one core for 4 GiB). The service sweeps
 at most once a second however often it is rung, so a guest that rings in a
 loop costs the host about half a core; the guest's own launcher rings once
 every 3 s, and only while its record waits.
+
+### R41 — One compositor serves every installation of the user
+Added 2026-10-19 with `waycompose-design.md` §107. Until §107 each
+installation had its own guest compositor and GPU process, and the ivshmem
+driver's one mapping per device meant one installation's session at a time.
+Now one compositor (and one GPU process) per Windows user serves all of them,
+which puts several installations' sessions in one process and one device.
+What keeps them apart:
+
+* **Who may start each session.** Unchanged from R37, per installation: each
+  boot record is signed with *its* installation's key, and the MAC now also
+  covers the session's index, so a record cannot be moved to another index or
+  passed off as another installation's (`a_shared_compositors_record_carries_
+  its_index_under_its_own_key`). A launcher asks for a boot on the user's
+  socket (`%LOCALAPPDATA%\waycompose\wc-compositor.ctl`, in the user's
+  profile like the launchers' own sockets), naming the key file it holds; the
+  compositor signs with the key it reads there. A process that can reach that
+  socket is the user, who can read every installation's key anyway (R37).
+* **What each session may name.** A session's clients may name only arena
+  regions granted to their own session (`slice_allowed`, enforced in
+  `wl_shm.create_pool`); arena 0 (the whole BAR), another session's region
+  and a region given back are protocol errors. The guest compositor is the
+  one allocator of the BAR, so two proxies can no longer hand out the same
+  bytes. A ring claim of a session the compositor does not serve is closed.
+* **What the host's proxies are.** Every installation's proxy runs on the VM
+  host **as the same user** and maps the same device file, so on the host the
+  sessions are one trust domain, as they were when they ran one after another:
+  a proxy could write into any region of the file. The boundary §107 adds is
+  against mistakes and crashes, not against the host user: a proxy only
+  allocates in its own windows, and the guest compositor will not show one
+  session's region in another session's window.
+* **Fault isolation.** One session can hold at most three quarters of the
+  arena and 28 of the 63 ring slots; its control requests wait only on its own
+  channel; when its proxy dies or goes silent the session is ended within
+  about 5 s, its slots are closed and quarantined for 10 s (longer than a
+  proxy's 5 s lease) before anybody may claim them again, and its regions are
+  returned only after its clients have been disconnected. Region ids and
+  session indices are not reused within a compositor's run.
+
+**What this does not protect.** One process holds every installation's
+windows: a crash of the compositor (or of the GPU process) ends every
+installation's session at once, where before it ended one. The next click
+starts a new compositor with a new run id, which voids every old record,
+region and slot (`waycompose-design.md` §107.6). The host side is one user,
+as above.

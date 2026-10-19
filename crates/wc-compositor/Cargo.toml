@@ -45,6 +45,8 @@ wc-transport = { workspace = true }
 # §36: the Wayland byte stream rides shared_vulkan's rings, so the compositor
 # accepts connections from the same control region the GPU half uses.
 sv-transport = { workspace = true }
+# §106: host integration (open links and files, per-device audio), served on a ring slot.
+wc-hostint = { workspace = true }
 # §93: pictures on the clipboard. Windows' applications read a copied image as
 # `CF_DIB`, and Wayland's as `image/png`; this converts between the two. The
 # same crate and version wc-proxy already decodes icons with.
@@ -73,6 +75,8 @@ objc2-app-kit = "0.3"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
+# §106: the host's platform calls for host integration (endpoints, the shell opener, handlers).
+wc-hostplat = { workspace = true }
 # GROWTH. `SuperfetchPfnQuery`, which is how a region this process has just
 # committed says *where its pages are* without the host having to search 13 GiB
 # of backing object for stamps. ~330 ms of guest CPU whatever the window, and

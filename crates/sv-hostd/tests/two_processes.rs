@@ -101,11 +101,21 @@ fn finish(mut child: Child, within: Duration) -> (bool, String) {
 ///
 /// Changed from outside this crate's usual owner for that reason, and recorded
 /// here rather than only in a commit message.
-fn wait_for_socket(path: &str, within: Duration) {
-    let deadline = Instant::now() + within;
+fn wait_for_socket(path: &str, within: Duration, hostd: &mut Child) {
+    let t0 = Instant::now();
+    let deadline = t0 + within;
     while Instant::now() < deadline {
         if std::path::Path::new(path).exists() {
             return;
+        }
+        // A daemon that exited never binds; say why now, rather than
+        // waiting out the budget and blaming the machine's load.
+        if let Ok(Some(status)) = hostd.try_wait() {
+            let mut err = String::new();
+            if let Some(mut e) = hostd.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut e, &mut err);
+            }
+            panic!("sv-hostd exited ({status}) after {:?} without binding {path}:\n{err}", t0.elapsed());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -126,8 +136,8 @@ fn wait_for_socket(path: &str, within: Duration) {
 fn the_arena_crosses_a_process_boundary_and_both_sides_agree() {
     let sock = Sock::new("loop");
     let path = sock.path();
-    let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(30));
+    let mut hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
+    wait_for_socket(&path, Duration::from_secs(30), &mut hostd);
 
     let gpu = spawn(LOOPBACK, &["gpu", "--socket", &path]);
     let app = spawn(LOOPBACK, &["app", "--socket", &path]);
@@ -177,8 +187,8 @@ fn the_arena_crosses_a_process_boundary_and_both_sides_agree() {
 fn a_peer_that_goes_away_mid_session_is_detected_rather_than_waited_on() {
     let sock = Sock::new("chaos");
     let path = sock.path();
-    let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(30));
+    let mut hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
+    wait_for_socket(&path, Duration::from_secs(30), &mut hostd);
 
     // Three device packets expected; the app side sends two and then leaves.
     let gpu = spawn(LOOPBACK, &["gpu", "--socket", &path, "--expect-device", "3"]);
@@ -226,8 +236,8 @@ fn a_peer_that_goes_away_mid_session_is_detected_rather_than_waited_on() {
 fn a_client_that_arrives_before_the_owner_waits_rather_than_reading_garbage() {
     let sock = Sock::new("early");
     let path = sock.path();
-    let hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
-    wait_for_socket(&path, Duration::from_secs(30));
+    let mut hostd = spawn(HOSTD, &["serve", "--socket", &path, "--clients", "2"]);
+    wait_for_socket(&path, Duration::from_secs(30), &mut hostd);
 
     // The app side first, deliberately: it attaches to a region whose `magic` is
     // still zero and must spin on `NotReady` rather than proceed. This is the
