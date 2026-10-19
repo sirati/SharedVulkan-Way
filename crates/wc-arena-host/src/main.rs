@@ -694,7 +694,15 @@ mod host {
 }
 
 #[cfg(unix)]
+mod sessiond;
+
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
+    // §103.15: the macOS guest's session service.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("mac-sessiond") {
+        return sessiond::main(&argv[2..]);
+    }
     host::main()
 }
 

@@ -132,6 +132,12 @@ pub struct Config {
     pub gpu_ivshmem_slot: u8,
     /// §87. The doorbell's virtio-serial port name; empty is no doorbell.
     pub gpu_bell: String,
+    /// §103.15, macOS: the session's GPU server (`sv-guest`), which the main
+    /// process starts and the host's session service serves; empty is none.
+    pub gpu_server: String,
+    /// §103.15, macOS: `VK_DRIVER_FILES` for that server (lavapipe in a VM
+    /// without Metal); empty leaves the loader's own search.
+    pub gpu_icd: String,
     /// §89. The Wayland rings' virtio-serial port: with it the compositor
     /// keeps the ivshmem region's tail for the session's Wayland connections
     /// and they cross as shared memory; empty, or a VM without the port, and
@@ -172,6 +178,8 @@ impl Default for Config {
             gpu_pool: true,
             gpu_ivshmem_slot: 0x1d,
             gpu_bell: "org.sirati.svbell.0".into(),
+            gpu_server: String::new(),
+            gpu_icd: String::new(),
             wayland_bell: "org.sirati.wcbell.0".into(),
             nested_globals: false,
             apps: BTreeMap::new(),
@@ -266,6 +274,8 @@ impl Config {
                         .filter(|v| *v <= 8)
                         .ok_or_else(|| format!("line {}: gpu-sessions is 0..=8", n + 1))?
                 }
+                ("session", "gpu-server") => cfg.gpu_server = v.into(),
+                ("session", "gpu-icd") => cfg.gpu_icd = v.into(),
                 ("session", "gpu-port") => {
                     cfg.gpu_port = v.parse().map_err(|e| format!("line {}: gpu-port: {e}", n + 1))?
                 }
@@ -332,6 +342,11 @@ impl Config {
             ("compositor", &self.compositor),
             ("relay", &self.relay),
         ] {
+            // §103.15: a Mac reaches its host through guest RAM only; it has
+            // no ssh host or key to name.
+            if cfg!(target_os = "macos") && (what == "host" || what == "key") {
+                continue;
+            }
             if v.is_empty() {
                 return Err(format!("[session] {what} is required"));
             }

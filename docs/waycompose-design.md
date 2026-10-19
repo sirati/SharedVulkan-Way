@@ -32692,9 +32692,11 @@ frees those pages and reuses them, so a proxy still writing pixels or ring bytes
 would corrupt them. The main process sends `ping` on the control channel every
 500 ms. After the first ping, 5 s without one ends the proxy before it touches
 the region again. Measured: `kill -9` of the main process; the proxy logged
-`LEASE LOST` and was gone about 4 s later.
+`LEASE LOST` and was gone about 4 s later. **The lease was not enough**: in
+those seconds the proxy wrote into pages macOS had already reused, and the
+guest kernel panicked (103.15, which adds the keeper).
 
-**Doorbells.** This VM has no doorbell port yet, so both sides poll the rings
+**Doorbells** (attached since 103.15). This VM had no doorbell port yet, so both sides polled the rings
 every millisecond: the compositor's wait is capped at 1 ms, and the proxy's
 `Doorbell::polling` wakes each waiting pump every millisecond. The endpoint stays
 pluggable for the real doorbell: `--wayland-bell` takes a QEMU chardev socket
@@ -32703,7 +32705,7 @@ pluggable for the real doorbell: `--wayland-bell` takes a QEMU chardev socket
 ports) is the third. The fd pair is not built. Measured cost of polling with
 Firefox idle: the main process 11% of one vCPU, the proxy 2.8%.
 
-**What ssh still does, once per main process: the bootstrap.** Three ssh execs
+**What ssh still did, once per main process: the bootstrap (gone since 103.15).** Three ssh execs
 under the forced command: `up` (locate the arena), `rings` (locate the ring
 region), `proxy` (start the proxy on them). After a main process that crashed,
 the next one also sends `down` for the stale session. Nothing is forwarded, and
@@ -32751,7 +32753,7 @@ Re-tested on rings, each image judged by a fresh Sonnet agent:
   chunks on a full ring, most likely before the guest's player started.
 * The lease.
 
-**Still not on shared memory, so open:** the bootstrap's three ssh execs (and
+**Still not on shared memory when 103.14 was written (all closed in 103.15):** the bootstrap's three ssh execs (and
 the stale-session `down`), the GPU server's launch (`mac-gpu.sh` starts it over
 ssh; a deployment would start it from `wc-launch` with a fixed label, 103.6.1),
 and the doorbell (polled). The fd-pair doorbell exists in sv-transport
@@ -32763,12 +32765,234 @@ committed. Screenshots, run logs and captures are under
 `mac-pin-*/`, `rtt/`), outside the repository, and this section states their
 results in text. The harnesses write there (`WC_EVIDENCE` overrides it).
 
+#### 103.14.1 The shared interfaces, for every platform
+
+These are the pieces other platforms reuse (the Windows path without ssh,
+host integration). None of them is macOS-specific code; the module names
+`macsvc.rs`, `macboot.rs` and `mac-sessiond` are historical.
+
+**Service slots** (`sv_transport::wlbytes`). A ring slot whose owner id has
+`SERVICE_TAG` (`0x5C << 56`) in its top byte is a session service, not a
+Wayland client, and the compositor's accept skips it (`is_service`). The host
+claims each one; the guest opens it with `ByteChannel::open(.., Endpoint::Peer)`
+once `ring_owner(slot)` names it. Allocated: `OWNER_CONTROL = SERVICE_TAG | 1`,
+`OWNER_AUDIO = SERVICE_TAG | 2` (and the sound ring's further streams, if it
+takes a slot per stream, as `SERVICE_TAG | 2 | n << 8`), `SERVICE_TAG | 3`
+reserved for host integration (`OWNER_HOSTINT`).
+
+**The control ring** (`OWNER_CONTROL`, host side `wc-proxy/src/macsvc.rs`).
+Lines of UTF-8 ending in `\n`, one request and one reply each, in order:
+
+| guest sends | host does | reply |
+|---|---|---|
+| `ping` | records the lease (no reply) | none |
+| `run APP …`, `action APP KEY …`, `open APP URL …` | runs `wc-session` with the verb, then this session's id, then the guest's words, as `SSH_ORIGINAL_COMMAND`, so §94's validation is the forced command's | `ok <wc-session's stdout, newlines as "; "> (<n> ms)` or `err <stderr>` |
+| `down` | replies, then the proxy exits; the session service runs `wc-session down` once the proxy's unit has ended (103.15) | `ok down` |
+
+Requests are words of `[A-Za-z0-9 +/=._-]`, at most 16 KiB; anything else is
+refused with `err refused: …`. The lease: after the first `ping`, 5 s without
+one ends the proxy (exit 4). The guest pings every 500 ms.
+
+**The boot record and the release word** (`wc_handle::macboot`, 103.15): page
+0 of the guest's ring window, at offset 1024. The guest writes `WCMBOOT1`, the
+version, a flags word (bit 0: the guest started a GPU server labelled with the
+session id, cut to 16 bytes), the session id (64 bytes), the arena's run id,
+page count and outbound bytes, and the ring window's run id and page count. The
+host answers in the same page: a message (offset 1160, 512 bytes) and then the
+state word (offset 1152: `Waiting`, `Located` or `Failed`), and at the end of
+the session the release word (offset 1728). The control region starts at the
+window's second page, so the boot page lives as long as the session.
+
+**The session service** (`wc-arena-host mac-sessiond --qmp SOCK --vm HINT
+--session WC-SESSION [--bell HUB-SOCKET] [--sweep-secs N]`, a user unit beside
+the VM). It finds boot records, runs `up`, `rings`, `proxy` and (with the GPU
+flag) `gpu` through `wc-session` with its unit's environment, answers in the
+boot page, and when a session's proxy unit has ended runs `down` and writes the
+release word. Its environment is what the forced command's `env` was
+(`WC_LAUNCH_GUEST_RAM=1`, `WC_LAUNCH_QMP`, `WC_LAUNCH_VM`, `WC_LAUNCH_APPS`,
+`WC_LAUNCH_MAC_BELL`, `WC_LAUNCH_MAC_GPU_BELL`, …). It remembers each live
+session's boot page in `$XDG_RUNTIME_DIR/wc-mac-sessiond/<id>`, so a restarted
+service adopts running sessions and still releases them.
+
+**Doorbells** (`sv_transport::vdoorbell`, `park`). An endpoint is one spelling
+(`PortHandle::open`): `dev:NAME` (the guest's port: `/dev/virtio-ports/NAME` on
+Linux, `/dev/NAME` on macOS, `\\.\Global\NAME` on Windows), `socket:PATH` (a
+QEMU chardev or a hub's socket), `fd:R,W` (two inherited descriptors, role
+(b)'s FIFO pair). A byte is a token:
+
+| byte | meaning |
+|---|---|
+| `0x00`–`0x7F` | a lane: `slot << 1 \| lane` (`park::lane_token`) |
+| `0xFC` `RESCAN_TOKEN` | rescan everything: a hub sends it to every client after (re)opening its port |
+| `0xFD` | the Windows GPU pool's cold-path token (`COLD_TOKEN`, Windows branch) |
+| `0xFE` `HELLO_TOKEN` | a guest's main process says a boot record waits (103.15) |
+
+`BellTarget` has two required methods: `ring_token` and `rescan`. **The rescan
+rule:** a byte sent while a port is closed is lost (Linux's `virtio_console`
+drops bytes that arrive while no process has the port open; a hub's socket
+drops what arrives while it restarts), so `serve_port` calls `rescan` on every
+open and reopen and on `RESCAN_TOKEN`, and every waiter looks at its ring
+again instead of trusting that it saw every wake. Tested
+(`every_reopen_and_every_rescan_token_rescans`,
+`a_rescan_ends_a_wait_whose_wake_was_lost`, the hub's
+`clients_survive_the_upstream_reconnecting`). Waiting is
+`ByteChannel::wait_readable(slice)`: the `Bell` handshake on the lane's own
+word, which on macOS is `os_sync_wait_on_address` (public since 14.4, looked up
+at run time).
+
+**Clocks shared across sides.** On macOS a timestamp another side compares is
+`mach_absolute_time()` scaled by `mach_timebase_info` (`frametrace::mono_us`),
+never the raw counter: on Apple Silicon `cntfrq_el0` reads 1 GHz from user
+space and `cntvct_el0` is not the 24 MHz counter, while `mach_absolute_time`
+ticks at 24 MHz with timebase 125/3 and a Linux guest's counter tracks it to a
+few hundred ticks (measured on the real Mac). Until 103.15, `mono_us` used
+Linux's `CLOCK_MONOTONIC` id on every Unix, which is not a clock on macOS.
+
+**Measured on the real Mac (role (b), libkrun, `wcbell`/`svbell`):** round trip
+p50 46–57 µs, p99 114–170 µs, max 0.3–2.1 ms; one way, Mac to guest about
+35–43 µs and guest to Mac about 5–17 µs; both bells passed 100 of 100 reopen
+cycles.
+
+The sound ring's stream protocol is 103.16.
+
+### 103.15 No ssh at all, doorbells, damage-only surfaces, and the keeper
+
+**(a) The bootstrap without ssh.** 103.14 left three ssh execs per main
+process. They are gone, and so is the private sshd. The main process's
+compositor writes a boot record into page 0 of its ring window (103.14.1) and
+rings `HELLO_TOKEN` on the rings' doorbell, every 3 s until answered. On the
+host, `wc-arena-host mac-sessiond` (user unit `wc-mac-sessiond`, installed by
+`scripts/mac-launch-install.sh`) wakes on the hello, sweeps QEMU's memory
+backend for page-0 stamps carrying a waiting record, runs `wc-session up`,
+`rings` and `proxy`, and answers `Located` in the same page; the guest then
+makes its control region. A refusal is `Failed` with `wc-session`'s reason,
+which the launcher logs. The words reach `wc-session` as
+`SSH_ORIGINAL_COMMAND`, so a record's fields meet exactly the forced command's
+validation. Installing needs no channel either: the harness asks `wc-session
+app` on the host and passes the answers to `wc-launch --install --meta DIR`.
+
+* Measured: hello to record found 0.44–0.49 s (one 4 GiB sweep), both locates
+  0.92–1.10 s, proxy started 1.5–1.8 s after the hello; the launcher's
+  "session up" 2.0–2.3 s after the main process started (2.9–3.1 s with the GPU
+  server). Without a doorbell the service sweeps on a timer (`--sweep-secs`),
+  and a 2 s timer costs 17% of a host core: the hello is what makes the sweep
+  rare.
+* `down`: the proxy answers `ok down` (0.3 ms round trip) and exits; the
+  service runs `wc-session down` when the unit has ended. A main process killed
+  with `kill -9`: the lease ended the proxy in 6 s and the service took the
+  session down.
+* The GPU server starts the same way. With `gpu-server` (and `gpu-icd`,
+  `gpu-bell`) in `wc-launch.ini`, the main process starts `sv-guest gpu guest
+  --label <session>` and sets the record's GPU flag; the service runs
+  `wc-session gpu`, whose guest-RAM branch starts `sv-hostd qemu-serve --cold
+  mem:<label>` in the session's unit. `scripts/mac-gpu.sh` (default
+  `MAC_GPU_VIA=session`) uses this path: main process opened to GPU served in
+  2.9–3.1 s, three frames identical, no network socket on either side.
+  `MAC_GPU_VIA=ssh` keeps 103.6's harness bootstrap for comparison.
+
+**(b) Doorbells.** The VM has a legacy virtio-serial controller
+(`disable-modern=on`) with two ports, `org.sirati.wcbell.0` and
+`org.sirati.svbell.0`. macOS names them `/dev/cu.org.sirati.wcbell.0` and
+`/dev/cu.org.sirati.svbell.0` (AppleVirtIOConsole's `IOTTYBaseName` is the
+port's name). One hub on the host (`sv-hostd bell-hub`, user unit
+`wc-mac-bell-hub`) holds both chardevs and serves `wl.sock` (the proxy and the
+session service) and `sv.sock` (the session's ICDs). In the guest the main
+process opens the Wayland port (`--wayland-rings` with the guest-RAM rings
+names it) and a doorman thread turns its bytes into the compositor loop's wake
+and the lanes' own words, so the launcher's control and sound threads sleep on
+their lanes; the GPU server opens the other (`--bell dev:…`).
+
+| idle Text Editor/Console, 30 s | polled (1 ms) | doorbell |
+|---|---|---|
+| Wayland round trip, 2000 × `wl_display_roundtrip` | p50 2.07 ms, p99 2.14 ms | **p50 0.248 ms, p99 0.322 ms** |
+| main process in the VM | 8.1% of a vCPU | **3.0%** |
+| proxy on the host | 1.9% of a core | **0.47%** |
+| GPU present, 300 frames 256×256 (sv-icd park mean) | 0.54 ms/frame (0.223 ms) | 0.56 ms/frame (0.167 ms) |
+
+(103.14's polled p50 of 1.06 ms was measured with Firefox open; the polled
+row here is the same idle session as the doorbell row.) The GPU present is
+bound by other costs at this size; the doorbell shortens the ICD's waits and
+not the frame.
+
+**(c) The copy into the IOSurface.** What public API allows:
+
+* *Aliasing an IOSurface to the arena's pages:* not possible. `IOSurfaceCreate`
+  allocates its own memory and has no property for an existing address (the
+  14.5 SDK's keys were checked); `CVPixelBufferCreateWithBytes` wraps memory
+  but such a buffer has no IOSurface (`CVPixelBufferGetIOSurface` is NULL);
+  Metal's `newBufferWithBytesNoCopy` wraps it as a GPU buffer, which needs Metal
+  (absent in this VM) and still ends in a blit into the layer's drawable.
+* *The reverse, client buffers living in IOSurfaces:* each buffer would be its
+  own region the host locates (a 4 GiB sweep, 0.45 s, per buffer), whose stride
+  the client chose, and IOSurface memory is not documented as wired, which the
+  locate needs. Not done.
+* *Damage-only copies:* done. Each IOSurface of a window's pair keeps the damage
+  it missed since it was last the back buffer (every present's damage goes to
+  both); a present copies the back surface's list, or the whole window when
+  that is more than half of it.
+
+Measured, Console 1280×681 (`face-full-copy` in the support directory forces
+whole copies for the comparison):
+
+| 100 presents | whole window | damage only |
+|---|---|---|
+| typing | 349 MB, 0.21–0.23 ms per present | **19 MB (5.5%), 0.025 ms** |
+| `seq 1 20000` scrolling | 370 MB, 0.335 ms | **78 MB (21%), 0.164 ms** |
+
+GTK 4's GL renderer, through EGL on `wl_shm`, damages the whole window every
+frame, so the Mac's GTK applications run with `GSK_RENDERER=cairo` (and Mesa's
+EGL, never the RTX 5090) in `apps.ini`. The copy chain is now damage-only at
+every step: client buffer to arena (proxy), arena to shadow (compositor), shadow
+to IOSurface (main process).
+
+**The keeper: a guest kernel panic, and its fix.** Killing the main process
+three times while Console scrolled panicked the guest kernel three times:
+`[data.kalloc.4096]: element modified after free`, the page full of
+`0xff1c1c1e`, Console's background colour. macOS frees a dead process's wired
+pages at once and reuses them; the proxy wrote pixels into them for the rest of
+its 5 s lease. This was 103.14's design and is fixed here:
+
+* While a keeper is installed (`wc_handle::arena::set_region_keeper`), every
+  guest-RAM window the main process makes is a POSIX shared-memory object,
+  wired by the main process and, before the host hears of it, mapped and wired
+  by `wc-launch --keeper` too. The name is then unlinked. The keeper is not in
+  the main process's process group and ignores SIGTERM and SIGHUP.
+* When its stdin ends (the main process exited, however), the keeper waits for
+  the release word in the boot page. The session service writes it after the
+  proxy's and the GPU server's units have ended and `down` has run. Then the
+  keeper kills the session's GPU server and exits, and only then are the pages
+  free. With no release in 10 minutes it frees anyway.
+* No keeper, no session: the main process refuses to start without one.
+* Measured: five kills under the same scrolling load, no panic (the panic count
+  stayed at 3); each time the keeper held 70 MiB for about 6 s until the
+  release.
+* Not covered: the GPU server's own extent, if the GPU server itself crashes
+  while `sv-hostd` serves it (it is killed only after the release in every
+  other case), and a keeper killed with SIGKILL.
+
+**The channels now** (role (a), this VM):
+
+| channel | crosses as | copies |
+|---|---|---|
+| bootstrap | the boot record in page 0 of the ring window, found by the host's sweep after a hello on the doorbell | none; no ssh, no socket |
+| Wayland bytes | ring slots in guest RAM, woken by the `wcbell` doorbell | proxy into the ring (1); compositor out of the ring into its local socket pair (1) |
+| `wl_shm` frames | the arena in guest RAM | client damage into an arena slice (1); slice to shadow, damage (1); shadow to IOSurface, damage (1); face and Core Animation (0) |
+| Vulkan | the GPU extent in guest RAM, cold path in its first page, `svbell` doorbell | as 103.6 |
+| control, lease, `down` | the control slot, woken by the doorbell | a line each way |
+| sound | the sound slot | 103.16 |
+| clipboard, icons | their feed slots | as 103.14 |
+| face to main | 0600 Unix socket inside macOS; IOSurfaces by mach port | pixels 0 |
+| GPU server start | the main process, flagged in the boot record; `sv-hostd` started by the session service | none |
+
+Evidence: `/mnt/datasets/builds/evidence/macos-zero-copy/` (`rtt-*.txt`,
+`*-cpu-*.txt`, `gpu-bell-ab.txt`, `copy-ab.txt`, `macgpu-last/`,
+`text-editor.png`), outside the repository.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
   what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
-  Retina scale above 1. The §89 rings on macOS: the Wayland bytes ride the ssh
-  forward, and nobody measured the latency. SVG icons (the host's resolver
+  Retina scale above 1. SVG icons (the host's resolver
   has no renderer, as on Windows). A frequent-pages section in the Dock menu
   (`macbundle::dock_items` takes them, and the launcher does not fetch
   `frequent` yet).
@@ -32777,9 +33001,8 @@ results in text. The harnesses write there (`WC_EVIDENCE` overrides it).
   BAR2, and the Virtualization.framework variant.
 * **Real Metal.** Nothing here ran on a Metal device. MoltenVK was shown to
   refuse cleanly without one. KosmicKrisp needs Apple Silicon and macOS 26.
-* **Doorbells on macOS.** Legacy virtio-serial into a `/dev/cu.*` node is coded
-  (`PortHandle::guest_port`) and was never attached to the VM. Without it the
-  GPU rings fall back to polling, which is 103.6's sleep-poll cost.
+* **Doorbells on macOS** are attached since 103.15 (two legacy virtio-serial
+  ports, a hub on the host). A VM without them polls, at 103.15's measured cost.
 * **Firefox's own sound.** The route was proven with a tone played into the
   session's sink. A tone Firefox opened from `file://` did not play. Firefox
   appears to want a gesture for a media document, and this was not chased.

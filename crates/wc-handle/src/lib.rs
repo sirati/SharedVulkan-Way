@@ -128,6 +128,7 @@ pub mod grow;
 pub mod ivshmem;
 mod platform;
 pub mod publish;
+pub mod macboot;
 
 /// An ivshmem device by root-bus slot, mapped read-write and cached, for the
 /// GPU sessions' arena (waycompose-design.md §87). The view owns the device

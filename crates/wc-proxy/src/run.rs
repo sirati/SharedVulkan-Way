@@ -871,7 +871,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         doorbell = Some(if bell.as_os_str() == "poll" {
             wc_proxy::rings::Doorbell::polling(std::time::Duration::from_millis(1))
         } else {
-            wc_proxy::rings::Doorbell::connect(&bell)?
+            // §103.15: the VM's doorbell hub. The session services then
+            // sleep on their lanes until a byte wakes them.
+            wc_proxy::rings::set_service_slice(std::time::Duration::from_millis(500));
+            wc_proxy::rings::Doorbell::connect_with(&bell, &control)?
         });
         println!(
             "[proxy] wayland rings: {} slots in the guest's own RAM ({}), doorbell {} -- no \
