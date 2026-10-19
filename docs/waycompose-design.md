@@ -32407,6 +32407,122 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | GPU: `scripts/mac-gpu.sh window`, `vkcube --wsi wayland` 400x300 through `sv-icd`, rendered by lavapipe in the VM, presented as arena slices to the macOS compositor (`scripts/mac-window.sh`) | the VM's desktop | 400 and 2000 frames ran to completion; about 350 frames/s marginal (1600 more frames took 4.5 s more session time). A Sonnet check of the QMP screendump: a "vkcube" window of about 400x300 with a textured, upright cube, correct colours, content filling the window |
 | GPU: pipelined headless present (`SV_PRESENT_SYNC` unset) | the VM, and this workstation with RADV and no VM | the dump of frame N holds frame N+1's pixels, and the last frame is right. This is the same on Linux, so it is an `sv-icd` headless-dump matter, not this path's. `mac-gpu.sh` presents in the call by default |
 
+### 103.13 One main process and a face per application (supersedes 103.8's "one compositor per application")
+
+The user replaced 103.8's per-application compositors. Now **one main
+process per user** holds everything there is one of: the smithay/Wayland
+state, the arena, the session with the host, the clipboard, the keyboard
+layout, idle inhibition and the policy. **One small face process per Linux
+application** exists only because a Dock tile is a process. It owns that
+application's `NSApplication` (the tile, the Dock menu, the menu bar,
+activation) and its `NSWindow`s, and it forwards input and window events.
+The faces have no arena, no proxy and no session of their own.
+
+**Pixels: IOSurfaces sent by mach port.** Measured first, on the Sonoma VM,
+between two processes of the user's GUI session:
+
+| way to share an IOSurface | result |
+|---|---|
+| `kIOSurfaceIsGlobal` + `IOSurfaceLookup(id)` | works; rejected, because any process that guesses a 32-bit id maps the pixels, and Apple deprecated it |
+| `IOSurfaceCreateMachPort` sent through `bootstrap_check_in` of an undeclared name, `IOSurfaceLookupFromMachPort` | works (`check_in ok`, same bytes on both sides); **chosen**. The name exists only in this user's GUI bootstrap namespace, and the port is a capability only the receiving face holds |
+| a full 1280x720 copy into an IOSurface | 0.054 ms |
+
+The main process keeps a **ping-pong pair** of IOSurfaces per window. On each
+present it copies the compositor's shadow into the back surface (one CPU copy,
+the 0.054 ms above for a full frame) and tells the face which surface to show.
+The face sets that IOSurface as its layer's `contents`, and Core Animation and
+WindowServer read it directly: **no copy in the face, none in Core
+Animation**. The pair means the main process never writes the surface on
+screen. Composing straight into the IOSurface, rather than into the shadow,
+would remove the last copy; that is not built. A face mapping the arena itself
+was rejected: a `CALayer` cannot show raw memory without a `CGImage`, and
+that is a copy per frame in Core Animation.
+
+**IPC.** A Unix socket at `$TMPDIR/waycompose/main.sock`: `$TMPDIR` is per
+user, the directory is 0700, the socket 0600, and every connection's peer uid
+is checked with `getpeereid`. The messages are `faceproto.rs` (window commands
+one way, input, window events, popup bounds, Dock-menu requests and a goodbye
+the other), length-prefixed, with one writer thread per side, so input stays in
+order. A surface pair's mach message is sent **before** the socket message that
+names it, so the face finds the ports already queued and ordering needs no
+second protocol. Measured from AppKit's event timestamp in the face to arrival
+in the main process: 100 events, **p50 1.7 ms, p90 7.2 ms, max 33 ms** (the
+timestamp has 1 ms resolution, and the VM is running Firefox in software
+alongside).
+
+**Routing.** A window goes to a face when it maps: the face whose ids
+(`faceproto::face_ids`: the section, the host's id, the desktop entry's name,
+its `StartupWMClass`) match its `app_id`. Failing that, the face that most
+recently asked to run something, then the focused face. Popups go to their
+parent's face. The main process keeps every window's state (title, icons, size
+hints, map, maximise, fullscreen), so a face can be given its windows again.
+
+**Lifecycle.**
+* A bundle launch starts a face. The face connects to the socket, and if
+  nothing listens it starts the main process (`wc-launch --main`, from the
+  installed binary, in its own process group). It then says hello with its
+  ids and a token, sends its own mach port to the main process's service with
+  the same token, and asks to run its application. The main process brings the
+  session up once and queues requests until it is up.
+* **A face that crashes** (no goodbye) has its windows kept. The main process
+  starts it again (`open -g -b`, with retries) and replays its windows when it
+  says hello. Measured: `kill -9` of Firefox's face, face 3 came back, window 1
+  was routed to it, and Firefox showed its window again fully drawn, while
+  Console was untouched. If the face does not come back within 15 s, the
+  windows' clients are asked to close.
+* **A main process that crashes** takes the faces down: their sockets end and
+  they quit (measured: both faces gone within 1 s of `kill -9`). Its ssh
+  tunnel and the host's proxy outlive it, so the next main process kills the
+  recorded tunnel pid (only if it is still an `ssh`) and sends `down` for the
+  recorded session. Measured: the stale session disappeared from the host.
+* **Quit** (Cmd+Q, AppleScript, the Dock) closes the face's windows, and the
+  face leaves as soon as they are gone (measured: 1 s). The main process ends
+  when its last client has gone, or after 60 s with no face.
+* The main process uses `NSApplicationActivationPolicyProhibited`: no tile
+  and no menu bar of its own. A face registers as a regular application before
+  it does anything else. A face that waited for the main process first was
+  left behind Finder: the activation that LaunchServices sends with the launch
+  found no application yet, and macOS 14's cooperative activation refused the
+  later request. The face's first window also calls
+  `activateIgnoringOtherApps`.
+
+**Each bundle has its own copy of the launcher, not a hard link.** Measured:
+with every bundle's executable the same inode, LaunchServices took a second
+application for the first one already running. Console did not start while
+Firefox ran. A relaunch of Firefox's face failed with `procNotFound`, because
+the main process, running from the same inode, was taken for Firefox. 103.8's
+earlier "two applications at once" row was therefore wrong, as written: Console
+had started only after Firefox had quit. With copies, Firefox and Console run
+side by side (two faces, two tiles, one session).
+
+**Arena per session, pluggable.** There is one arena per main process,
+shared by every application. Guest RAM by default (role (a)); with
+`WC_MAC_ARENA_STANDIN=<file>`, a shared file that the compositor maps as its
+"ivshmem" device, with `up ID RUNID ivshmem` on the host. That is role (b)'s
+hook: on the real Mac, the RAM-disk file shared with the Linux guest through
+virtio-fs DAX. The role (b) path was not run here.
+
+Re-tested under the split, in the 4 GiB VM, each image judged by a fresh Sonnet
+agent:
+* Firefox from its tile, maximised, fully drawn from the IOSurfaces, with the
+  traffic lights beside the tabs.
+* Console as a second application alongside it.
+* The Dock menu's New Window routed back to Firefox's face.
+* The clipboard both ways: 24 bytes exact to Linux, and the string back
+  through `pbpaste`.
+* A context menu routed to the parent's face, fully drawn.
+* Sound played by the main process: 4.7 s of 438 Hz tone with one 10 ms gap.
+* The crash cases above.
+
+Known: GNOME Console shows a native title bar *and* GTK 4's header bar, which
+is GTK 4 negotiating server-side decorations under the compositor's `Auto`.
+
+**Still on ssh at this commit, and therefore open (103.14 replaces it):**
+the Wayland bytes (an ssh Unix-socket forward), the session control (`up`,
+`proxy`, `run`, `down` as ssh exec), the sound (an ssh `-L` forward of the
+PulseAudio monitor), and the icon and clipboard feeds, which ride the Wayland
+upstream.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond

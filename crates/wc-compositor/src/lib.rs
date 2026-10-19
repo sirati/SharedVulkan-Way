@@ -89,7 +89,12 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
-pub use platform::{set_dock_menu, DockItem};
+pub use platform::{face_early, run_face, set_dock_menu, DockItem};
+/// §103.13: the main process's socket, service and the launcher's hooks.
+#[cfg(target_os = "macos")]
+pub use platform::macos_router::{set_face_hooks, socket_path, FaceHooks, SERVICE as FACE_SERVICE};
+#[cfg(target_os = "macos")]
+pub use platform::faceproto::face_ids;
 use smithay::utils::os::FdEncoding;
 use state::{ClientState, Decorations, State};
 

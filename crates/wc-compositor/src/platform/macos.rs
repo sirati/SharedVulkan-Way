@@ -164,6 +164,243 @@ fn dock_pick(key: &str) {
     }
 }
 
+// ------------------------------------------------------------ face mode ---
+
+/// §103.13: this process is an application's face, not a whole compositor.
+static FACE: AtomicBool = AtomicBool::new(false);
+/// The window's IOSurface pair from the main process, the one to show, and
+/// whether it carries alpha.
+type FaceSurfaces = HashMap<WindowId, ([super::macmach::Surface; 2], u8, bool)>;
+static FACE_SURFACES: Mutex<Option<FaceSurfaces>> = Mutex::new(None);
+type BoundsSink = Box<dyn Fn(WindowId, Option<Rect>) + Send + Sync>;
+static BOUNDS_SINK: Mutex<Option<BoundsSink>> = Mutex::new(None);
+/// Set when the user quit the face: it leaves as soon as its windows are gone.
+static FACE_QUITTING: AtomicBool = AtomicBool::new(false);
+type FaceExit = Box<dyn Fn() + Send + Sync>;
+static FACE_EXIT: Mutex<Option<FaceExit>> = Mutex::new(None);
+
+fn face_surfaces<R>(f: impl FnOnce(&mut FaceSurfaces) -> R) -> R {
+    let mut g = FACE_SURFACES.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(HashMap::new))
+}
+
+/// The first thing a face does, before it has reached the main process: be
+/// a regular application, so the activation LaunchServices sends with the
+/// launch (a Dock click, `open`) finds one and the face comes to the front.
+/// Measured: a face that waited for the main process first stayed behind
+/// Finder, and macOS 14's cooperative activation then refused it later.
+pub fn face_early() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.finishLaunching();
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+}
+
+/// Run this process as the face of one application (§103.13): the AppKit
+/// platform, fed from the main process's socket rather than a Wayland thread
+/// in this process. Returns when the main process says goodbye, the socket
+/// ends, or the application has had no window for a while.
+pub fn run_face(stream: std::os::unix::net::UnixStream, section: &str, ids: Vec<String>, dock: Vec<DockItem>) -> i32 {
+    use super::faceproto::{read_frame, write_frame, FromFace, ToFace};
+    let Some(mtm) = MainThreadMarker::new() else { return 2 };
+    FACE.store(true, Ordering::Relaxed);
+    let token: u64 = (std::process::id() as u64) << 32 ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(7, |d| d.as_nanos() as u64);
+    let Some(port) = super::macmach::receive_port() else { return 2 };
+    match super::macmach::look_up(super::macos_router::SERVICE) {
+        Ok(service) => {
+            let kr = super::macmach::send_hello(service, port, token);
+            super::macmach::release(service);
+            if kr != 0 {
+                eprintln!("wc-launch: face: the main process's mach service refused the hello ({kr:#x})");
+                return 1;
+            }
+        }
+        Err(kr) => {
+            eprintln!("wc-launch: face: no main process service ({kr})");
+            return 1;
+        }
+    }
+    let Ok(writer) = stream.try_clone() else { return 1 };
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<FromFace>();
+    let _ = out_tx.send(FromFace::Hello { section: section.to_string(), ids, token, pid: std::process::id() });
+    std::thread::spawn(move || {
+        let mut w = std::io::BufWriter::new(writer);
+        while let Ok(m) = out_rx.recv() {
+            let bye = matches!(m, FromFace::Bye);
+            if let Some(b) = m.encode() {
+                if write_frame(&mut w, &b).is_err() {
+                    break;
+                }
+                // Flush everything queued now, then wait again: input stays
+                // in order and is never held back behind a buffer.
+                use std::io::Write;
+                if w.flush().is_err() || bye {
+                    break;
+                }
+            }
+        }
+    });
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel::<FromUi>();
+    {
+        let out = out_tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(e) = ev_rx.recv() {
+                if out.send(FromFace::Ui(e)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let out = Mutex::new(out_tx.clone());
+        *BOUNDS_SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move |id, rect| {
+            let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Bounds { id, rect });
+        }));
+        let out = Mutex::new(out_tx.clone());
+        set_dock_menu(
+            dock,
+            Box::new(move |key: &str| {
+                let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Request { key: key.to_string() });
+            }),
+        );
+        let out = Mutex::new(out_tx.clone());
+        *FACE_EXIT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            let _ = out.lock().unwrap_or_else(|e| e.into_inner()).send(FromFace::Bye);
+        }));
+    }
+    // Start the application now that the main process knows this face.
+    let _ = out_tx.send(FromFace::Request { key: String::new() });
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ToUi>();
+    std::thread::spawn(move || {
+        let mut r = std::io::BufReader::new(stream);
+        // Surface pairs that arrived by mach before the message naming them.
+        let mut early: HashMap<(WindowId, u32), [super::macmach::Surface; 2]> = HashMap::new();
+        while let Ok(Some(body)) = read_frame(&mut r) {
+            let Ok(m) = ToFace::decode(&body) else { break };
+            let cmd = match m {
+                ToFace::Bye => break,
+                ToFace::Surface { id, generation, alpha, .. } => {
+                    let mut pair = early.remove(&(id, generation));
+                    let t0 = std::time::Instant::now();
+                    while pair.is_none() && t0.elapsed() < std::time::Duration::from_secs(2) {
+                        match super::macmach::recv_surfaces(port, 500) {
+                            Some((i, g, p)) if (i, g) == (id, generation) => pair = Some(p),
+                            Some((i, g, p)) => {
+                                early.insert((i, g), p);
+                            }
+                            None => {}
+                        }
+                    }
+                    match pair {
+                        Some(p) => face_surfaces(|m| {
+                            m.insert(id, (p, 0, alpha));
+                        }),
+                        None => eprintln!("wc-launch: face: window {id}'s surfaces never arrived"),
+                    }
+                    continue;
+                }
+                ToFace::Present { id, buffer } => {
+                    face_surfaces(|m| {
+                        if let Some(e) = m.get_mut(&id) {
+                            e.1 = buffer.min(1);
+                        }
+                    });
+                    ToUi::Present { id, damage: Vec::new() }
+                }
+                ToFace::Create { id, title, app_id, popup } => ToUi::Create {
+                    id,
+                    title,
+                    app_id,
+                    aumid: String::new(),
+                    shadow: Arc::new(Mutex::new(Shadow::empty())),
+                    kind: match popup {
+                        Some((parent, x, y)) => WindowKind::Popup { parent, x, y },
+                        None => WindowKind::Toplevel,
+                    },
+                    bounds: Arc::new(Mutex::new(None)),
+                },
+                ToFace::Title { id, title } => ToUi::Title { id, title },
+                ToFace::AppId { id, app_id } => ToUi::AppId { id, app_id, aumid: String::new() },
+                ToFace::Icon { id, icons } => ToUi::Icon { id, icons },
+                ToFace::MovePopup { id, x, y, w, h } => ToUi::MovePopup { id, x, y, width: w, height: h },
+                ToFace::ShiftOrigin { id, dx, dy } => ToUi::ShiftOrigin { id, dx, dy },
+                ToFace::Map { id, w, h, fold } => ToUi::Map { id, width: w, height: h, fold_caption: fold },
+                ToFace::Resize { id, w, h } => ToUi::Resize { id, width: w, height: h },
+                ToFace::SizeHints { id, min, max } => ToUi::SizeHints { id, min, max },
+                ToFace::SetWindowState { id, maximized, minimized } => ToUi::SetWindowState { id, maximized, minimized },
+                ToFace::Fullscreen { id, on } => ToUi::Fullscreen { id, on },
+                ToFace::Cursor { spec } => ToUi::Cursor { spec },
+                ToFace::PointerHold { id, hold } => ToUi::PointerHold { id, hold },
+                ToFace::BeginMove { id } => ToUi::BeginMove { id },
+                ToFace::BeginResize { id, edge } => ToUi::BeginResize { id, edge },
+                ToFace::WindowMenu { id, x, y } => ToUi::WindowMenu { id, x, y },
+                ToFace::Destroy { id } => {
+                    face_surfaces(|m| {
+                        m.remove(&id);
+                    });
+                    ToUi::Destroy { id }
+                }
+                ToFace::Activate { id } => ToUi::Activate { id },
+            };
+            if cmd_tx.send(cmd).is_err() {
+                return;
+            }
+            Wake.wake();
+        }
+        // The main process has gone or said goodbye: the face goes with it.
+        let _ = cmd_tx.send(ToUi::Quit { clients: 0 });
+        Wake.wake();
+    });
+
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    PumpInner::AppKit { commands: cmd_rx, events: ev_tx }.run();
+    if let Some(f) = FACE_EXIT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        f();
+    }
+    // Let the writer send the goodbye.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    0
+}
+
+/// The face's lifetime rule, checked on the timer: a face whose windows are
+/// all gone leaves (at once after a Quit, after a linger otherwise), and so
+/// does one whose application never showed a window.
+fn face_tick() {
+    use std::sync::atomic::AtomicU64;
+    static STARTED: AtomicU64 = AtomicU64::new(0);
+    static EMPTY_SINCE: AtomicU64 = AtomicU64::new(0);
+    static HAD: AtomicBool = AtomicBool::new(false);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    if STARTED.load(Ordering::Relaxed) == 0 {
+        STARTED.store(now, Ordering::Relaxed);
+    }
+    let n = STATE.with(|s| s.borrow().as_ref().map_or(0, |st| st.windows.len()));
+    if n > 0 {
+        HAD.store(true, Ordering::Relaxed);
+        EMPTY_SINCE.store(0, Ordering::Relaxed);
+        return;
+    }
+    if EMPTY_SINCE.load(Ordering::Relaxed) == 0 {
+        EMPTY_SINCE.store(now, Ordering::Relaxed);
+    }
+    let empty = now - EMPTY_SINCE.load(Ordering::Relaxed);
+    let leave = if HAD.load(Ordering::Relaxed) {
+        FACE_QUITTING.load(Ordering::Relaxed) || empty > 10_000
+    } else {
+        now - STARTED.load(Ordering::Relaxed) > 120_000
+    };
+    if leave && let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.stop(None);
+        post_wakeup_event(&app);
+    }
+}
+
 // ------------------------------------------------------------- the wake ---
 
 /// The Wayland thread's way to make [`drain`] run on the main thread.
@@ -769,6 +1006,9 @@ fn publish_bounds(window: &NSWindow, w: &WinShared) {
     let mut cell = w.bounds.lock().unwrap_or_else(|e| e.into_inner());
     if *cell != Some(rect) {
         *cell = Some(rect);
+        if let Some(sink) = BOUNDS_SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            sink(w.id, Some(rect));
+        }
     }
 }
 
@@ -792,6 +1032,7 @@ define_class!(
         /// takes every client with it.
         #[unsafe(method(applicationShouldTerminate:))]
         fn application_should_terminate(&self, _app: &NSApplication) -> NSApplicationTerminateReply {
+            FACE_QUITTING.store(true, Ordering::Relaxed);
             let ids: Vec<WindowId> = STATE.with(|s| {
                 s.try_borrow()
                     .ok()
@@ -858,6 +1099,10 @@ define_class!(
         /// notification, so `changeCount` is compared on a timer.
         #[unsafe(method(tick:))]
         fn tick(&self, _t: &NSTimer) {
+            if FACE.load(Ordering::Relaxed) {
+                face_tick();
+                return;
+            }
             poll_clipboard();
             check_layout();
         }
@@ -939,6 +1184,9 @@ fn tis_layout() -> &'static str {
 }
 
 fn check_layout() {
+    if FACE.load(Ordering::Relaxed) {
+        return; // the main process follows the layout (§103.13)
+    }
     let now = tis_layout();
     let changed = with_input(|i| {
         let c = i.layout != now;
@@ -1070,18 +1318,35 @@ fn pasteboard(drag: bool) -> Retained<NSPasteboard> {
 }
 
 fn poll_clipboard() {
+    if FACE.load(Ordering::Relaxed) {
+        return; // the main process has the clipboard (§103.13)
+    }
+    let mut seen = STATE.with(|s| s.borrow().as_ref().map(|st| st.clip_seen)).unwrap_or(0);
+    let fresh = clipboard_poll(&mut seen);
+    STATE.with(|s| {
+        if let Ok(mut g) = s.try_borrow_mut()
+            && let Some(st) = g.as_mut()
+        {
+            st.clip_seen = seen;
+        }
+    });
+    if let Some(mimes) = fresh {
+        send_global(FromUi::ClipboardChanged { mimes });
+    }
+}
+
+pub(super) fn pasteboard_count() -> isize {
+    pasteboard(false).changeCount()
+}
+
+/// The pasteboard's offer as Wayland mime types, if it changed since `seen`.
+pub(super) fn clipboard_poll(seen: &mut isize) -> Option<Vec<String>> {
     let pb = pasteboard(false);
     let count = pb.changeCount();
-    let fresh = STATE.with(|s| {
-        let Ok(mut g) = s.try_borrow_mut() else { return false };
-        let Some(st) = g.as_mut() else { return false };
-        let f = st.clip_seen != count;
-        st.clip_seen = count;
-        f
-    });
-    if !fresh {
-        return;
+    if count == *seen {
+        return None;
     }
+    *seen = count;
     let mut mimes: Vec<String> = Vec::new();
     if let Some(types) = pb.types() {
         let has = |uti: &str| types.iter().any(|t| t.to_string() == uti);
@@ -1098,10 +1363,10 @@ fn poll_clipboard() {
             mimes.push("text/uri-list".into());
         }
     }
-    send_global(FromUi::ClipboardChanged { mimes });
+    Some(mimes)
 }
 
-fn read_pasteboard(drag: bool, mime: &str) -> Option<Vec<u8>> {
+pub(super) fn read_pasteboard(drag: bool, mime: &str) -> Option<Vec<u8>> {
     let pb = pasteboard(drag);
     let uti = uti_for_mime(mime)?;
     if uti == UTI_TEXT {
@@ -1123,7 +1388,7 @@ fn read_pasteboard(drag: bool, mime: &str) -> Option<Vec<u8>> {
     Some(data.to_vec())
 }
 
-fn write_pasteboard(payloads: &[(String, Vec<u8>)]) -> isize {
+pub(super) fn write_pasteboard(payloads: &[(String, Vec<u8>)]) -> isize {
     let pb = pasteboard(false);
     pb.clearContents();
     let mut wrote_text = false;
@@ -1147,9 +1412,11 @@ fn write_pasteboard(payloads: &[(String, Vec<u8>)]) -> isize {
 
 // ------------------------------------------------------------- the pump ---
 
-pub(crate) struct PumpInner {
-    commands: Receiver<ToUi>,
-    events: Sender<FromUi>,
+/// The in-process AppKit pump, or (with `WC_MAC_ROLE=main`) the main
+/// process's router to its faces (§103.13).
+pub(crate) enum PumpInner {
+    AppKit { commands: Receiver<ToUi>, events: Sender<FromUi> },
+    Router(super::macos_router::Router),
 }
 
 pub fn current_layout() -> &'static str {
@@ -1174,9 +1441,12 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| std::io::Error::other("the macOS platform must start on the main thread"))?;
     let (tx, rx) = std::sync::mpsc::channel();
+    let main_role = std::env::var("WC_MAC_ROLE").as_deref() == Ok("main");
     // NSApplication exists before anything asks about screens.
     let app = NSApplication::sharedApplication(mtm);
     let policy = match std::env::var("WC_MAC_ACTIVATION").as_deref() {
+        // The main process has no Dock tile and no menu bar: its faces do.
+        _ if main_role => NSApplicationActivationPolicy::Prohibited,
         Ok("accessory") => NSApplicationActivationPolicy::Accessory,
         _ => NSApplicationActivationPolicy::Regular,
     };
@@ -1188,17 +1458,25 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     Ok(assemble(
         tx,
         Wake,
-        PumpInner { commands: rx, events: config.events },
+        if main_role {
+            PumpInner::Router(super::macos_router::Router { commands: rx, events: config.events })
+        } else {
+            PumpInner::AppKit { commands: rx, events: config.events }
+        },
         work_area,
     ))
 }
 
 impl PumpInner {
     pub(crate) fn run(self) {
+        let (commands, events) = match self {
+            PumpInner::Router(r) => return r.run(),
+            PumpInner::AppKit { commands, events } => (commands, events),
+        };
         let mtm = MainThreadMarker::new().expect("the pump runs on the main thread");
         let cmd = std::env::var("WC_MAC_CMD_KEY").ok().and_then(|s| CmdKey::parse(&s)).unwrap_or_default();
         println!("wc-compositor: macOS platform, Cmd sends {cmd:?}");
-        EVENTS.with(|e| *e.borrow_mut() = Some(self.events.clone()));
+        EVENTS.with(|e| *e.borrow_mut() = Some(events.clone()));
         INPUT.with(|i| {
             *i.borrow_mut() = Some(Input {
                 cmd,
@@ -1211,7 +1489,7 @@ impl PumpInner {
         });
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
-                commands: self.commands,
+                commands,
                 windows: HashMap::new(),
                 made: 0,
                 gone: 0,
@@ -1222,7 +1500,7 @@ impl PumpInner {
             })
         });
         let app = NSApplication::sharedApplication(mtm);
-        let delegate = WcAppDelegate::new(mtm, self.events.clone());
+        let delegate = WcAppDelegate::new(mtm, events.clone());
         app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         install_menu(mtm, &app);
         install_cmd_keyup_monitor();
@@ -1251,7 +1529,7 @@ impl PumpInner {
             "wc-compositor: windows at exit: {made} created, {gone} destroyed, \
              {live} still held, {live} still alive, {clients} client(s) still connected"
         );
-        let _ = self.events.send(FromUi::Stopped);
+        let _ = events.send(FromUi::Stopped);
     }
 }
 
@@ -1733,7 +2011,14 @@ fn map(mtm: MainThreadMarker, id: WindowId, width: i32, height: i32, fold: bool)
             }
             window.makeKeyAndOrderFront(None);
             window.makeFirstResponder(Some(&view));
-            NSApplication::sharedApplication(mtm).activate();
+            let app = NSApplication::sharedApplication(mtm);
+            app.activate();
+            if FACE.load(Ordering::Relaxed) && !already {
+                // The application's first window, seconds after its launch
+                // (§103.13): the launch's own activation is long spent.
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+            }
             publish_bounds(&window, &shared);
         }
     }
@@ -1785,6 +2070,20 @@ fn place_popup(id: WindowId, parent: WindowId, x: i32, y: i32, width: i32, heigh
 
 fn present(id: WindowId, _damage: &[Rect]) {
     let Some((shadow, view)) = with_win(id, |w| (w.shadow.clone(), w.view.clone())) else { return };
+    // §103.13: a face shows the main process's IOSurface itself. Core
+    // Animation reads the surface directly, so nothing is copied here.
+    let surf = face_surfaces(|m| m.get(&id).map(|(p, front, alpha)| (p[*front as usize].as_ptr(), *alpha)));
+    if FACE.load(Ordering::Relaxed) {
+        if let (Some((ptr, alpha)), Some(layer)) = (surf, view_layer(&view)) {
+            // SAFETY: an IOSurfaceRef is a valid `contents`; the layer retains
+            // it, and the map keeps our reference until the window goes.
+            unsafe {
+                let _: () = msg_send![&*layer, setOpaque: !alpha];
+                let _: () = msg_send![&*layer, setContents: ptr.cast::<AnyObject>()];
+            }
+        }
+        return;
+    }
     let (w, h, alpha, pixels) = {
         let s = shadow.lock().unwrap_or_else(|e| e.into_inner());
         (s.width(), s.height(), s.format() == PixelFormat::Argb8888, s.pixels().to_vec())
@@ -1841,37 +2140,34 @@ fn set_app_icon(mtm: MainThreadMarker, icons: &[IconImage]) {
 }
 
 fn idle_inhibit(on: bool) {
-    let current = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.idle_assertion));
-    match (on, current) {
+    let mut current = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.idle_assertion));
+    idle_assert(on, &mut current);
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.idle_assertion = current;
+        }
+    });
+}
+
+/// Hold or release the display-sleep assertion recorded in `current`.
+pub(super) fn idle_assert(on: bool, current: &mut Option<u32>) {
+    match (on, *current) {
         (true, None) => {
             let kind = NSString::from_str("PreventUserIdleDisplaySleep");
             let name = NSString::from_str("A Linux application asked the display to stay on");
             let mut id = 0u32;
             // SAFETY: CFStrings by toll-free bridging; `id` is an out-parameter.
             let ok = unsafe {
-                IOPMAssertionCreateWithName(
-                    Retained::as_ptr(&kind).cast(),
-                    255,
-                    Retained::as_ptr(&name).cast(),
-                    &mut id,
-                )
+                IOPMAssertionCreateWithName(Retained::as_ptr(&kind).cast(), 255, Retained::as_ptr(&name).cast(), &mut id)
             } == 0;
             if ok {
-                STATE.with(|s| {
-                    if let Some(st) = s.borrow_mut().as_mut() {
-                        st.idle_assertion = Some(id);
-                    }
-                });
+                *current = Some(id);
             }
         }
         (false, Some(id)) => {
             // SAFETY: an assertion id this process created.
             unsafe { IOPMAssertionRelease(id) };
-            STATE.with(|s| {
-                if let Some(st) = s.borrow_mut().as_mut() {
-                    st.idle_assertion = None;
-                }
-            });
+            *current = None;
         }
         _ => {}
     }

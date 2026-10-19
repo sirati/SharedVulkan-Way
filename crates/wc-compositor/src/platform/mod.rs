@@ -71,13 +71,20 @@ pub use win32::{current_layout, has_touch, keyboard_repeat, start};
 // §103.7. The macOS platform's pure half, on every target so the gate tests it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod mac_keys;
+// §103.13. The main-process/face wire protocol, pure, on every target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod faceproto;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macmach;
+#[cfg(target_os = "macos")]
+pub mod macos_router;
 #[cfg(target_os = "macos")]
 pub use macos::{current_layout, has_touch, keyboard_repeat, start};
 /// §103.8: the launcher's way to fill the application's Dock menu.
 #[cfg(target_os = "macos")]
-pub use macos::{set_dock_menu, DockItem};
+pub use macos::{face_early, run_face, set_dock_menu, DockItem};
 
 // On macOS only `Click`, which `PlatformConfig` names on every Unix.
 #[cfg(not(windows))]
@@ -315,7 +322,7 @@ pub enum Edge {
 /// Stage 11 is where something started sending it: `xdg-toplevel-icon-v1` from
 /// a client that implements it, or `wc_icon_manager_v1` from a resolver on the
 /// Linux side for one that does not (docs/waycompose-design.md §15).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IconImage {
     pub width: i32,
     pub height: i32,
@@ -338,7 +345,7 @@ pub struct IconImage {
 /// to a window would need a policy for what happens when the pointer is over a
 /// window whose client last spoke about a different one, and there is no such
 /// moment: only one surface has pointer focus at a time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CursorSpec {
     /// `wl_pointer.set_cursor` with a null surface. The pointer is invisible
     /// over this client's windows and reappears everywhere else, which is what
