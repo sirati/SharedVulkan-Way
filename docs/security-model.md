@@ -1359,11 +1359,12 @@ manifest whose entries are checked against the key shapes install writes.
 Defaults are never taken. Windows protects `UserChoice` and so do we. On
 macOS the bundles declare their types at rank `Alternate`.
 
-**Audio** crosses only as PCM on the sound ring and as a device list on the
-channel. The host chooses which devices exist, and Linux names its nodes
-after them (slugged). A hostile host could name a device anything; the name
-reaches PipeWire only as a quoted SPA string with control characters
-replaced. The microphone is captured only by the host's long-lived main
+**Audio** crosses only on the sound ring (§103.16), which carries the device
+announcements as well as the PCM. The host chooses which devices exist, and
+Linux names its sinks and sources after them. A hostile host could name a
+device anything. The node name is its slug, only `[a-z0-9_-]`. The
+description reaches the sound server as a module argument with quotes,
+backslashes and line breaks removed, so it cannot add an argument. The microphone is captured only by the host's long-lived main
 process (macOS: bundle `org.waycompose.host`, after the user grants the TCC
 prompt once), never by a per-application process, and only while the
 session has a source node that a Linux client records from.

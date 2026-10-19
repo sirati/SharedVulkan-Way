@@ -33404,7 +33404,7 @@ has.
 ### 106.2 The channel: one ring slot, either side asks
 
 The control channel (§103.14, §103.15) is a request from the host and a
-reply from Linux. Opening a link is the reverse, and the audio and handler
+reply from Linux. Opening a link is the reverse, and the handler
 lists are pushes. So host integration has a service slot of its own,
 `OWNER_HOSTINT = SERVICE_TAG | 3` (sv-transport `wlbytes`). Like control
 and sound, the proxy claims it. On macOS the main process opens it; on
@@ -33423,7 +33423,6 @@ crosses only as base64 inside one word:
 | Linux → host | `req N path B64` | open a host file with its default application |
 | Linux → host | `req N with TOKEN B64` | open a URL or host file with one host application |
 | host → Linux | `rep N ok` / `rep N err B64` | the result, with the host's reason |
-| host → Linux | `audio B64` | devices (id, name, channels, rate) and the two defaults |
 | host → Linux | `handlers B64` | host applications: token, name, types, defaults, schemes |
 | host → Linux | `paths B64` | the share map, and the drop directory for copies |
 
