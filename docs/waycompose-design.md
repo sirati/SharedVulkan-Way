@@ -33434,49 +33434,78 @@ other way round). The host's checks are in `docs/security-model.md` R38.
 
 ### 106.3 Audio
 
-**On the host.** Windows enumerates endpoints with `IMMDeviceEnumerator`
-and is told about changes by an `IMMNotificationClient`
-(`OnDefaultDeviceChanged`, state changes, added and removed). macOS
-enumerates CoreAudio devices and listens on
-`kAudioHardwarePropertyDevices`,
-`kAudioHardwarePropertyDefaultOutputDevice` and
-`…DefaultInputDevice`. Both debounce bursts and push the whole state as
-`audio`. The host's long-lived process renders each output stream to its
-own device: WASAPI shared mode on Windows, a device-bound AudioQueue or
-AudioUnit on macOS. It captures a microphone only while a Linux client
-records from that microphone's node. On macOS capture happens only in the
-main process, whose bundle id is fixed (`org.waycompose.host`) and whose
-`Info.plist` has `NSMicrophoneUsageDescription`. That gives one TCC prompt,
-not one per Linux application. Signing is the Nix activation's job, with a
-stable local certificate, so that TCC does not ask again after every
-rebuild. wc-launch never signs anything.
+**The transport is §103.16's sound ring.** The first plan pushed the device
+list on this channel and gave Linux a child `pipewire` hosting one
+pipe-tunnel node per device. The sound ring landed while this was being
+built, and it already carries every device as a stream (`Device`, `Gone`,
+`Default`, credit, capture `Start`/`Stop`) on `OWNER_AUDIO`. So that is the
+one path, and the `audio` message is gone from this channel. What host
+integration adds is:
 
-**On Linux.** `wc_hostint::audio::plan` turns the state into nodes:
-`<win|mac>.sink.<slug>` and `.source.<slug>`. The slug is the host's
-description, lowercased, with every run of other characters as one `_`, and
-`_2`, `_3` for repeats. The nodes are sorted by description and id, so the
-names do not depend on the host's enumeration order. They are hosted by one
-child `pipewire -c <generated.conf>`. That is a client-only instance whose
-modules are one `libpipewire-module-pipe-tunnel` per device, on a FIFO in
-the session's run directory. The proxy copies between each FIFO and that
-device's stream on the sound ring. A FIFO never leaves Linux.
-`Reconciler` restarts the child only when the set of devices changes. A
-default that changes runs only `pw-metadata -n default 0
-default.configured.audio.sink '{"name":"<node>"}' Spa:String:JSON`, or the
-`.source` one.
+* **The Windows device side** (`wc_compositor::sound_win`, in the
+  compositor, which owns the rings). Endpoints are enumerated with
+  `IMMDeviceEnumerator`. An `IMMNotificationClient`
+  (`OnDefaultDeviceChanged`, state changes, added, removed) reports changes,
+  debounced to at most 800 ms. Each active endpoint is a stream with its own
+  mix rate and channel count. Each output stream is rendered by WASAPI in
+  shared mode on that endpoint, from a 240 ms queue that is granted as
+  credit and granted again exactly as WASAPI drains it. An output idle for
+  3 s releases its endpoint. Each input is captured only between `Start`
+  and `Stop`. Whatever the microphone records beyond the session's credit
+  is counted as an overrun and never queued. Stream ids are never reused,
+  and a format change makes a new stream. The macOS device side is
+  `wc-launch/src/sound_mac.rs` (§103.16). Host integration makes it react
+  to CoreAudio's property listeners instead of waiting for the next
+  one-second poll, and refuses capture unless the process is the
+  `org.waycompose.host` bundle (TCC, below).
+* **Names.** A Linux sink or source is `<win|mac>.<sink|source>.<slug>`. The
+  slug is the host's device name lowercased, with every run of other
+  characters as one `_`. A second device with the same name gets `_2`, and a
+  name already in use gets the next free number
+  (`wc_hostint::audio::node_name`). The description is the host's name
+  unchanged. So "Lautsprecher (2- High Definition Audio Device)" is
+  `win.sink.lautsprecher_2-_high_definition_audio_device`, described as
+  itself. §103.16's `wc_mac_out_<n>` names are replaced by these: a name
+  that depends on a stream number is not stable from one session to the
+  next.
+* **Defaults** follow the host's within a second. The proxy sets the
+  session's configured default (`pactl set-default-sink`/`-source`; under
+  PipeWire that is `default.configured.audio.sink`/`.source` in the
+  `default` metadata, the same key the prototype set with `pw-metadata`).
+* **The session's server**, chosen by `wc-session` (`WC_LAUNCH_AUDIO`):
+  `on` is §86's PulseAudio of the session's own (the default). `pipewire` is
+  a private pipewire, WirePlumber and pipewire-pulse for the session under
+  its run directory; WirePlumber's profile has no ALSA, Bluetooth, camera,
+  D-Bus or logind, so it can never take real hardware. `system` is the
+  user's own server (§103.16). `user-pipewire` is the same for a dedicated
+  desktop user only: it is refused unless the session's user is
+  `WC_LAUNCH_AUDIO_USER`, the `ConditionUser` of the prototype's units. The
+  workstation that runs the macOS VM must never use `system` or
+  `user-pipewire`: the VM's devices would become the desktop's.
+* **Under PulseAudio** a stream is §103.16's `module-pipe-sink` or
+  `module-pipe-source` on a FIFO the proxy serves, paced by its reader.
+  **Under PipeWire that pacing does not exist.** pipewire-pulse's pipe sink
+  runs on the graph's clock and drops what does not fit in the FIFO. With a
+  1.5 s tone and the device side holding credit for 0.4 s, 4% of the samples
+  were lost; at 1 s, 44%. So under PipeWire each stream is a node of its
+  own, a graph driver that starts a cycle only when the ring's credit covers
+  it (106.6).
 
-**Which PipeWire.** The nodes need a session daemon with a session manager
-(WirePlumber honours `default.configured.*`). The VM host on Windows has no
-PipeWire of its own: §86 gave each session a PulseAudio. The workstation
-that runs the macOS VM has the user's own desktop PipeWire, and putting the
-VM's devices into it would take over the user's audio. So `wc-session` has
-three modes: `WC_LAUNCH_AUDIO=on` (§86's PulseAudio with one null sink,
-unchanged and still the default), `pipewire` (a private pipewire,
-WirePlumber and pipewire-pulse for the session, under its run directory),
-and `user-pipewire` (the user's own daemon, only for a dedicated desktop
-user, like the real Mac's Linux VM, whose units carry
-`ConditionUser=<desktop user>`). The per-session null sink is unnecessary
-once the host's devices are nodes.
+**The microphone.** macOS: capture happens only in the long-lived main
+process, started through Launch Services as the bundle
+`org.waycompose.host` (`Waycompose Host.app`, written by `--install`, with
+`LSUIElement` and `NSMicrophoneUsageDescription`), so TCC asks once, for
+that bundle, and never for a per-application face. Measured in the VM with
+a virtio-sound input: the dialog named "Waycompose Host" with our usage
+text. TCC's log named `org.waycompose.host` as responsible for itself.
+After Allow, 368,640 bytes were captured in 2 s. A capture attempted from
+any other process (an ssh shell) is refused by our own check before
+CoreAudio is asked. Signing with a stable local certificate, so that TCC
+does not ask again after a rebuild, is the Nix activation's job on the real
+Mac (the prototype's `stable-codesign.nix`). In the VM the binary is
+unsigned, and TCC logs "Failed to copy signing info". Windows has no
+per-application microphone prompt for desktop applications beyond the
+global privacy switch.
 
 ### 106.4 Links and files
 
