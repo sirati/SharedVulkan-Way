@@ -43,7 +43,7 @@ cleanup() {
     systemctl --user stop "$u" 2>/dev/null
   done
   pkill -f "UNIX-LISTEN:$D/host.sock" 2>/dev/null
-  pkill -f "tail -n +1 -F $D/run" 2>/dev/null
+  pkill -f "tail -n [+]1 -F $D/run" 2>/dev/null
   pkill -f "UNIX-LISTEN:$D/guest.sock" 2>/dev/null
   wait 2>/dev/null
 }
