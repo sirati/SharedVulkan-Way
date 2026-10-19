@@ -192,23 +192,24 @@ pub fn serve(control: &Arc<Control>, ch: ByteChannel, cfg: SoundCfg) {
 
 fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
     match m {
-        Msg::Hello { version } => println!("[proxy] session sound: the device side speaks version {version}"),
-        Msg::Device { stream, dir, channels, rate, name } => add(sh, link, stream, dir, channels, rate, &name),
-        Msg::Gone { stream } => {
-            let s = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream);
-            if let Some(s) = s {
-                s.gone.store(true, std::sync::atomic::Ordering::SeqCst);
-                sh.credit_cv.notify_all();
-                if let Some(m) = s.module {
-                    let _ = pactl(&sh.cfg, &["unload-module", &m.to_string()]);
-                }
-                println!("[proxy] session sound: {} is gone", s.name);
+        Msg::Hello { version } => {
+            println!("[proxy] session sound: the device side speaks version {version}");
+            // A device side that (re)started numbers its streams afresh: what
+            // the last one announced is gone, its modules included.
+            let old: Vec<u16> = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+            for stream in old {
+                remove(sh, stream);
             }
-            if let Some(n) = &sh.native {
-                n.send(&Msg::Gone { stream });
-            }
-            sh.credits.lock().unwrap_or_else(|e| e.into_inner()).forget(stream);
         }
+        Msg::Device { stream, dir, channels, rate, name } => {
+            // The same id announced again without a Gone replaces the old
+            // stream, so its module and FIFO never linger under a second name.
+            if sh.streams.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&stream) {
+                remove(sh, stream);
+            }
+            add(sh, link, stream, dir, channels, rate, &name)
+        }
+        Msg::Gone { stream } => remove(sh, stream),
         Msg::Default { stream, dir } => {
             let name = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream).map(|s| s.source.clone());
             if let Some(n) = name {
@@ -238,6 +239,24 @@ fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
         }
         Msg::Start { .. } | Msg::Stop { .. } => {}
     }
+}
+
+/// A stream the device side no longer has: its module unloaded, its pump
+/// ended, its credit forgotten.
+fn remove(sh: &Arc<Shared>, stream: u16) {
+    let s = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream);
+    if let Some(s) = s {
+        s.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        sh.credit_cv.notify_all();
+        if let Some(m) = s.module {
+            let _ = pactl(&sh.cfg, &["unload-module", &m.to_string()]);
+        }
+        println!("[proxy] session sound: {} is gone", s.name);
+    }
+    if let Some(n) = &sh.native {
+        n.send(&Msg::Gone { stream });
+    }
+    sh.credits.lock().unwrap_or_else(|e| e.into_inner()).forget(stream);
 }
 
 fn add(sh: &Arc<Shared>, link: &Link, stream: u16, dir: Dir, channels: u8, rate: u32, name: &str) {
