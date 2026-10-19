@@ -381,20 +381,43 @@ impl Brokered {
     }
 }
 
+/// §111.10: the components this daemon hosts beside its broker
+/// (`wc_broker::host::Embedded`). The guest-RAM substrate (§108,
+/// `sv_ram::brokered`) is added here; each is attached once at start and told
+/// of every session that starts and ends, with the user it runs as.
+fn embedded(_args: &Args) -> Vec<Box<dyn wc_broker::host::Embedded>> {
+    Vec::new()
+}
+
 /// Everything a pass of [`serve`] needs besides the page.
 struct Host {
     mapped: Option<Mapped>,
     broker: Option<Brokered>,
     /// Regions published per session, unpublished when it ends.
     published: std::sync::Mutex<HashMap<String, Vec<u64>>>,
+    /// The live sessions and their owners, for the embedded components.
+    sessions: wc_broker::host::SessionsView,
+    components: Vec<Box<dyn wc_broker::host::Embedded>>,
 }
 
 impl Host {
+    fn started(&self, s: wc_broker::host::HostSession) {
+        self.sessions.insert(s.clone());
+        for c in &self.components {
+            c.session_up(&s);
+        }
+    }
+
     fn ended(&self, id: &str) {
         let ids = self.published.lock().unwrap_or_else(|e| e.into_inner()).remove(id).unwrap_or_default();
         if let Some(b) = &self.broker {
             for r in ids {
                 b.broker.unpublish(r);
+            }
+        }
+        if let Some(s) = self.sessions.remove(id) {
+            for c in &self.components {
+                c.session_down(&s);
             }
         }
     }
@@ -478,7 +501,22 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     // SAFETY: single-threaded so far but for the broker's threads, which
     // never read the environment.
     unsafe { std::env::set_var("WC_LAUNCH_SERVICE", "1") };
-    let host = std::sync::Arc::new(Host { mapped, broker, published: Default::default() });
+    let sessions = wc_broker::host::SessionsView::default();
+    let mut components = embedded(&args);
+    match &broker {
+        Some(b) => {
+            for c in &components {
+                say(&format!("attaching {} to the broker", c.name()));
+                c.attach(&b.broker, &sessions);
+            }
+        }
+        None if !components.is_empty() => {
+            say("NO BROKER: the embedded components are not attached");
+            components.clear();
+        }
+        None => {}
+    }
+    let host = std::sync::Arc::new(Host { mapped, broker, published: Default::default(), sessions, components });
     let (tx, rx) = mpsc::channel();
     if let Some(b) = &args.bell {
         crate::sessiond::spawn_bell(b.clone(), tx.clone());
@@ -666,6 +704,15 @@ fn serve(args: &Args, host: &std::sync::Arc<Host>, live: &mut Live, done: &mut H
             return;
         }
     };
+    host.started(wc_broker::host::HostSession {
+        id: id.clone(),
+        install: req.install.name.clone(),
+        index: req.index,
+        run: rec.arena_run,
+        user: wc_broker::User::uid(uid),
+        uid,
+        linux_user: user.clone(),
+    });
     match answer(&file, &rec, macboot::State::Located, &msg) {
         Ok(true) => say(&format!("session {id}: started in {:?} ({why}): {msg}", t0.elapsed())),
         Ok(false) => say(&format!("session {id}: started, but the guest replaced its record before the answer; its lease will end it")),
