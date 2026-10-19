@@ -33826,3 +33826,57 @@ by unsetting `DBUS_SESSION_BUS_ADDRESS`. Under a user unit, libdbus then falls
 back to `$XDG_RUNTIME_DIR/bus`, and a second PulseAudio on that bus (here, an
 unrelated program's) still took the name `org.PulseAudio1`, so the session had
 no sound. The address now points nowhere.
+
+**After the guest measurement** (master `a27ca12`, installation `wcns`,
+session 0, the real virtio-serial crossing):
+
+| request | n | mean | p50 | p90 | p99 |
+|---|---|---|---|---|---|
+| `rtt` | 10000 | **20.9 µs** | 19.8 | 21.9 | 45.5 |
+| `status` | 1000 | 27.1 µs | 25.1 | 29.5 | 58.7 |
+| `frequent firefox` (cached, 601 bytes) | 1000 | 29.9 µs | 27.6 | 32.0 | 66.5 |
+| `icon firefox` (18 KB) | 1000 | 198.6 µs | 174.0 | 250.6 | 439.1 |
+| `app firefox light` (20.5 KB) | 1000 | 213.9 µs | 193.5 | 277.0 | 423.8 |
+| `rtt`, 20 ms between requests (each crosses by doorbell) | 200 | 24.3 µs | 20.6 | 23.5 | 43.9 |
+
+The bound is met for every request without a payload. The two that carry an
+icon were not slow on the ring: a 20 KB packet through a lane costs 0.7 µs
+(`wlbytes::throughput_probe`). They were slow in the launcher and the
+compositor's copy of the answer, which deploy built in **debug**. Locally, the
+same path in release takes 8–14 µs for 20 KB. A 256 KiB answer took 5.2 ms,
+because a writer facing a full lane slept 1 ms at a time. It now spins, then
+yields, then sleeps 200 µs, and takes 0.11 ms. Deploy now builds the
+Windows binaries in release. The guest's icon and app answers are to be
+measured again with that build.
+
+**The cold start's 303 ms from the record to the host's answer** was the
+service's three verbs. On the guest: `up` 66 ms (a `bash wc-session` and its
+`od`s), `proxy` 233 ms (PulseAudio started as a unit and waited for, then the
+proxy as a unit and waited for), and `gpu` 108 ms (beside them). PulseAudio
+now starts beside the proxy instead of before it. The remaining cost is two
+`systemd-run`s and the proxy attaching; `up` in-process is the next cut if it
+is needed.
+
+**Two tests that failed under load, and why.** They were run 200 times each,
+with full suites alongside as load.
+
+* `poolcold::a_ring_lost_across_a_reopen_is_recovered_by_the_rescan` failed
+  63 times in 208. Its premise is that nothing wakes the guest between a
+  silent reply and the port's reopen. The open-rescan that §103.15 put on the
+  doorman's own thread could arrive inside that window, so the guest
+  answered early. That is right for the product and wrong for the test, which
+  now waits for the open's wakes before it replies: 0 failures in 208.
+  `guest_doorman` also marks the bell before it returns again, so a waiter
+  never takes the bell-less slice while the doorman thread has not run yet.
+* `two_processes` failed 3 times in 200 with "never created hostd.sock within
+  30s". The daemon had **exited** at once with `O_CREAT|O_EXCL … errno 17`:
+  two daemons started in the same instant had chosen the same run id, the
+  clock's nanoseconds alone, for the name of their shared object. The pid is
+  now part of the id, and the test now reports a daemon that exited, with its
+  stderr, instead of waiting out its 30 s budget: 0 failures in 200.
+* On the way, the load also found a **use-after-free in a test**.
+  `soundring::two_links_talk_both_ways` dropped the memory under its region
+  while the links' threads still ran (SIGSEGV in `wake_epoch`, 1 run in 18 of
+  the whole suite at 32 threads). The test now uses an owned region, and
+  `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
+  parallel suite runs, 0 failures.
