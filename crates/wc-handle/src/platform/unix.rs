@@ -233,6 +233,12 @@ pub fn alloc_locked_region(
     // Silicon Mac is the VM *host* in §103's role (b), never a guest.
     #[cfg(target_os = "macos")]
     if !small_pages_diagnostic {
+        // §103.15: with a keeper, every window is a shared object the keeper
+        // holds too, so the host never writes into pages this process's death
+        // gave back to macOS. Superpages cannot be shared that way.
+        if let Some(k) = KEEPER.get() {
+            return alloc_kept(len, stamp, k.as_ref());
+        }
         return alloc_superpages(len, stamp);
     }
     #[cfg(target_os = "macos")]
@@ -285,6 +291,79 @@ pub fn alloc_locked_region(
     // SAFETY: the mapping is live and `len` bytes long.
     let locked = unsafe { libc::mlock(ptr, len) } == 0;
     Ok(LockedRegion { view, len, locked, pinning: if locked { "mlock" } else { "none" } })
+}
+
+/// §103.15: who else holds this process's guest-RAM windows. Called with a
+/// POSIX shared-memory name and a length once the window is wired and
+/// stamped; returns once that process has mapped and wired the same object
+/// too (an error refuses the window).
+#[cfg(target_os = "macos")]
+pub type RegionKeeper = Box<dyn Fn(&str, usize) -> io::Result<()> + Send + Sync>;
+
+#[cfg(target_os = "macos")]
+static KEEPER: std::sync::OnceLock<RegionKeeper> = std::sync::OnceLock::new();
+
+/// §103.15: install the keeper, before the first window is made.
+#[cfg(target_os = "macos")]
+pub fn set_region_keeper(k: RegionKeeper) -> bool {
+    KEEPER.set(k).is_ok()
+}
+
+/// §103.15. A window that outlives this process until the host is done with
+/// it. The host writes into guest RAM it located; when a process dies, macOS
+/// frees its wired pages at once and reuses them, and a proxy that wrote
+/// pixels into them for the rest of its lease corrupted kernel memory (three
+/// panics, "element modified after free", the payload Console's background).
+/// So the window is a POSIX shared-memory object, wired here and by a keeper
+/// process, which lets go only once the host says it has stopped. The name
+/// is unlinked as soon as the keeper holds it, so nothing else can open it.
+#[cfg(target_os = "macos")]
+fn alloc_kept(len: usize, stamp: &dyn Fn(u32, &mut [u8]), keeper: &(dyn Fn(&str, usize) -> io::Result<()> + Send + Sync)) -> io::Result<LockedRegion> {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // PSHMNAMLEN is 31.
+    let name = format!("/wck{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let cname = std::ffi::CString::new(name.clone()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: a NUL-terminated name; O_EXCL, so a stale object is never reused.
+    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let unlink = || unsafe { libc::shm_unlink(cname.as_ptr()) };
+    // SAFETY: our descriptor; macOS sizes a shm object once.
+    let sized = unsafe { libc::ftruncate(fd, len as libc::off_t) } == 0;
+    let ptr = if sized {
+        // SAFETY: a shared mapping of the object just sized; checked below.
+        unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) }
+    } else {
+        libc::MAP_FAILED
+    };
+    let e = io::Error::last_os_error();
+    // SAFETY: our descriptor; the mapping (if any) keeps the object.
+    unsafe { libc::close(fd) };
+    if ptr == libc::MAP_FAILED {
+        unlink();
+        return Err(e);
+    }
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    // Wire, then stamp, as alloc_wired does.
+    // SAFETY: the mapping is live and `len` bytes long.
+    if unsafe { libc::mlock(ptr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        unlink();
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::arena::refusal_text(&format!("wired pages (mlock: {e}) for {len} bytes; check vm.user_wire_limit")),
+        ));
+    }
+    // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+    for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+        stamp(i as u32, page);
+    }
+    let held = keeper(&name, len);
+    unlink();
+    held.map_err(|e| io::Error::new(e.kind(), format!("the region keeper did not take {name}: {e}")))?;
+    Ok(LockedRegion { view, len, locked: true, pinning: "wired+kept" })
 }
 
 /// §103.3. The macOS twin of the hugetlb path: `mmap` with

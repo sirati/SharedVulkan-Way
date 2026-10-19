@@ -226,6 +226,10 @@ CoreAudio, and the pixels and the GPU path's memory are in the VM's own RAM,
 wired by the macOS process and found by the host. No macOS kernel driver is
 involved. Vulkan from Linux renders in the VM on lavapipe, because the VM has
 no Metal; on a real Mac the same server uses MoltenVK or KosmicKrisp.
+Nothing between the Mac and Linux uses ssh or a socket (§103.15): a session
+boots through a record in its own guest RAM that the host's session service
+(`wc-mac-sessiond`) finds, and both sides wake each other through legacy
+virtio-serial doorbells (`wc-mac-bell-hub`).
 
 ```
 scripts/mac-launch-install.sh             # both ends of the launcher, bundles pinned in the Dock
@@ -247,6 +251,22 @@ sv-drm serve --owner U --group G --mode 0660 --state FILE   # root: /dev/dri/ren
 sv-drm ns --state FILE -- kwin_wayland ...                  # the user: libdrm sees it
 wc-proxy ... --dmabuf-node /dev/dri/renderD128              # zwp_linux_dmabuf_v1, zero copy
 scripts/sv-dmabuf-e2e.sh; scripts/wc-dmabuf.sh              # the ICD and the proxy halves, locally
+```
+
+**Windows without ssh (`docs/waycompose-design.md` §105).** A Windows session
+boots from a record the compositor signs with the installation's key and
+writes into the ivshmem device's header page. The VM host's session service
+(`wc-sessiond.service`, the same `wc-arena-host sessiond` the macOS guest
+uses) reads it and starts the session. After that, every request, the sound
+(§103.16's ring), the clipboard and icon feeds and the GPU's cold path cross
+as ring slots and mailboxes in shared memory, with doorbells. No ssh key, relay,
+tunnel or forced command is left; deploy removes them. `scripts/wc-no-ssh.sh`
+runs the host side and the Linux compositor on one machine.
+
+```
+scripts/wc-no-ssh.sh                      # boot, control, sound ring, hub restart, lease, wrong key, replay, no port
+scripts/wc-launch.sh deploy               # also: the installation key, the registration, wc-sessiond
+wc-arena-host sessiond --ivshmem /run/windows-vm/wc-arena/arena --bell $XDG_RUNTIME_DIR/wc-bell/wl.sock
 ```
 
 ## Layout

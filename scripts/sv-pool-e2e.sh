@@ -15,17 +15,21 @@
 # Zink is told to take a CPU device (`ZINK_DEBUG=cpu`): the forwarded device
 # is lavapipe here, which Zink otherwise skips ("failed to choose pdev").
 #
-#   socat                      the tunnel's forward of the GPU process's port
-#   sv-hostd ivshmem-serve     the VM host's side: checks each session's stamps
-#                              and the pool header's nonce, hands the ICD the
-#                              file by name
+#   sv-hostd ivshmem-serve     the VM host's side: claims each session's offer
+#                              in the pool's mailboxes (--cold pool), checks its
+#                              stamps and the pool header's nonce, hands the ICD
+#                              the file by name. No socket joins the two sides
+#                              (SVPE_COLD=tcp: the TCP debug path through socat)
+#   sv-hostd bell-hub, socat   with SVPE_BELL=1: the doorbell, socat standing in
+#                              for QEMU's chardev
 #   clients                    two vulkaninfo, two gl-probe frames on Zink,
 #                              and two sv-pool-stress fills of the pool at once
 #
 # It passes when every client passes, the stress fills end in
 # VK_ERROR_OUT_OF_DEVICE_MEMORY (never a lost device), nothing a process mapped
-# was touched by the other, and the pool is back to empty (its header granule
-# only) when every session has ended.
+# was touched by the other, and the pool is back to empty (its header granule,
+# and the offer waiting in a mailbox, whose control region it holds) when
+# every session has ended.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -44,15 +48,40 @@ cleanup() { kill "${KIDS[@]}" 2>/dev/null; wait 2>/dev/null; }
 trap cleanup EXIT
 
 truncate -s "${POOL_MIB}M" "$RUN/gpu"
-say "pool-guest on lavapipe, a ${POOL_MIB} MiB pool in $RUN/gpu, port $PORT"
-VK_DRIVER_FILES="$LVP" "$BIN/sv-gpu-server" pool-guest --pool-file "$RUN/gpu" --port "$PORT" \
+# SVPE_COLD=pool (the default, the deployed path): the cold path is the pool's
+# mailboxes, and nothing but the pool file joins the two sides.
+# SVPE_COLD=tcp: the TCP debug path, with socat for the old ssh forward.
+COLD=${SVPE_COLD:-pool}
+GUESTARGS=(); HOSTARGS=(--cold pool)
+if [ "$COLD" = tcp ]; then
+  GUESTARGS=(--port "$PORT"); HOSTARGS=(--cold "$RUN/cold.sock")
+fi
+# SVPE_BELL=1: a doorbell, as deployed: socat stands in for QEMU's chardev (the
+# hub's end and the guest's end of one port), `sv-hostd bell-hub` holds it,
+# and every ICD and sv-hostd are its clients.
+if [ "${SVPE_BELL:-0}" = 1 ]; then
+  mkdir -p "$RUN/hub"
+  socat "UNIX-LISTEN:$RUN/svbell.sock" "UNIX-LISTEN:$RUN/guestbell.sock" 2>"$RUN/socat-bell.log" &
+  KIDS+=($!)
+  for _ in $(seq 1 50); do [ -S "$RUN/svbell.sock" ] && break; sleep 0.1; done
+  "$BIN/sv-hostd" bell-hub --port "$RUN/svbell.sock=$RUN/hub/sv.sock" >"$RUN/hub.log" 2>&1 &
+  KIDS+=($!)
+  for _ in $(seq 1 50); do [ -S "$RUN/guestbell.sock" ] && [ -S "$RUN/hub/sv.sock" ] && break; sleep 0.1; done
+  GUESTARGS+=(--bell "socket:$RUN/guestbell.sock")
+  HOSTARGS+=(--cold-bell "$RUN/hub/sv.sock")
+  export SV_BELL="$RUN/hub/sv.sock"
+fi
+say "pool-guest on lavapipe, a ${POOL_MIB} MiB pool in $RUN/gpu, cold path $COLD, bell ${SVPE_BELL:-0}"
+VK_DRIVER_FILES="$LVP" "$BIN/sv-gpu-server" pool-guest --pool-file "$RUN/gpu" "${GUESTARGS[@]}" \
   --sessions 8 --idle 20 >"$RUN/gpu.log" 2>&1 &
 KIDS+=($!)
 for _ in $(seq 1 100); do grep -q "publishing the extent" "$RUN/gpu.log" && break; sleep 0.1; done
-grep -q "publishing the extent" "$RUN/gpu.log" || { echo "FAIL: the GPU side never listened"; cat "$RUN/gpu.log"; exit 1; }
-socat "UNIX-LISTEN:$RUN/cold.sock,fork,reuseaddr" "TCP:127.0.0.1:$PORT" 2>"$RUN/socat.log" &
-KIDS+=($!)
-"$BIN/sv-hostd" ivshmem-serve --region "$RUN/gpu" --cold "$RUN/cold.sock" --socket "$RUN/icd.sock" \
+grep -q "publishing the extent" "$RUN/gpu.log" || { echo "FAIL: the GPU side never published"; cat "$RUN/gpu.log"; exit 1; }
+if [ "$COLD" = tcp ]; then
+  socat "UNIX-LISTEN:$RUN/cold.sock,fork,reuseaddr" "TCP:127.0.0.1:$PORT" 2>"$RUN/socat.log" &
+  KIDS+=($!)
+fi
+"$BIN/sv-hostd" ivshmem-serve --region "$RUN/gpu" "${HOSTARGS[@]}" --socket "$RUN/icd.sock" \
   >"$RUN/hostd.log" 2>&1 &
 KIDS+=($!)
 for _ in $(seq 1 50); do [ -S "$RUN/icd.sock" ] && break; sleep 0.1; done
@@ -89,7 +118,15 @@ check "the 2 MiB fill beside it did too (exit $rf)" '[ $rf = 0 ] && grep -q "ok=
 check "a fill after both got the pool back (exit $rg)" '[ $rg = 0 ] && grep -q "ok=1" "$RUN/stress-after.log"'
 check "no lost device anywhere" '! grep -qi "DEVICE_LOST\|lost device" "$RUN"/*.log'
 check "every session gave its leases back" '[ "$(grep -c "lease(s) and the control region given back" "$RUN/gpu.log")" -ge 7 ]'
-check "the pool ended empty" 'grep "finished\|ended" "$RUN/gpu.log" | tail -1 | grep -q "pool 0.1/"'
+if [ "$COLD" = tcp ]; then
+  check "the pool ended empty" 'grep "finished\|ended" "$RUN/gpu.log" | tail -1 | grep -q "pool 0.1/"'
+else
+  # The one account left is the waiting offer's, holding its control region only.
+  check "the pool ended empty but for the waiting offer" 'L=$(grep "finished\|ended" "$RUN/gpu.log" | tail -1); [ "$(grep -o "; session " <<<"$L" | wc -l)" = 1 ] && grep -q "\[1 control [0-9.]*\]" <<<"$L"'
+  check "no socket to the guest: every ICD attached through a mailbox" '[ "$(grep -c "attached:.*(mailbox" "$RUN/hostd.log")" -ge 7 ] && ! grep -q "TCP" "$RUN/hostd.log" "$RUN/gpu.log"'
+fi
+echo "---- the cold path, per ICD (sv-hostd) ----"
+grep -o "attached: .*" "$RUN/hostd.log" | sed 's/.*run 0x[0-9a-f]*, //' | cut -c1-200
 echo "---- the pool's own account ----"
 grep -E "pool (of|high water)|refused|finished|given back" "$RUN/gpu.log" | cut -c1-400 | tail -25
 grep RESULT "$RUN"/stress-*.log

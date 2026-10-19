@@ -236,6 +236,33 @@ pub const fn lane_token(slot: u32, lane: Lane) -> u8 {
     ((slot as u8) << 1 | l) & 0x7f
 }
 
+/// Not a lane: a macOS session's main process announcing that page 0 of its
+/// ring window holds a boot record for the host's session service to find
+/// (waycompose-design.md §103.15). Its top bit is set, so it can never be a
+/// [`lane_token`]; a target that does not know it rings no lane
+/// ([`lane_from_token`] names a slot past every directory's end).
+pub const HELLO_TOKEN: u8 = 0xFE;
+
+/// Not a lane: "rescan everything" (§103.15). A doorbell hub sends it to
+/// every client after it has (re)opened its port (and, since §105, to the guest
+/// after it has reconnected to QEMU, for the bytes the guest's side lost), because a byte that
+/// arrived while the port was closed was dropped by the driver (Linux's
+/// virtio_console drops bytes while no process has the port open, measured
+/// on the real Mac): every waiter re-checks its ring rather than trust that
+/// it saw every wake. [`crate::vdoorbell::serve_port`] turns it into
+/// [`crate::vdoorbell::BellTarget::rescan`].
+pub const RESCAN_TOKEN: u8 = 0xFC;
+
+/// Not a lane: "look at the GPU pool's mailboxes" (`crate::poolcold`). The
+/// VM host's `sv-hostd ivshmem-serve` rings it after it has claimed and
+/// answered an offer; the guest's GPU process rings it after it has made an
+/// offer and after it has published an accepted session's control region.
+/// Whoever receives it rescans every mailbox; nothing about which one is in
+/// the byte. Its top bit is set, so it can never be a [`lane_token`]: an ICD's
+/// doorman on the same hub, which does not know it, rings no lane
+/// ([`lane_from_token`] names slot 62, past every directory's end).
+pub const COLD_TOKEN: u8 = 0xFD;
+
 /// Undo [`lane_token`].
 pub fn lane_from_token(token: u8) -> (u32, Lane) {
     let t = token & 0x7f;
@@ -690,7 +717,7 @@ fn sleep_the_rung(rung: Duration, windows: bool, have_cross_wake: bool) -> bool 
 /// `Futex` parker safe to use unconditionally: on a platform with neither
 /// primitive `wait` sleeps for the slice and `wake` does nothing, which is
 /// exactly [`SpinYield`]'s behaviour and no worse than what was there before.
-mod sys {
+pub(crate) mod sys {
     use core::sync::atomic::AtomicU32;
     use std::time::Duration;
 
@@ -782,8 +809,72 @@ mod sys {
         }
     }
 
+    /// macOS (waycompose-design.md §103.15): `os_sync_wait_on_address`, the
+    /// public address wait since macOS 14.4, looked up at run time because
+    /// the deployment target is 14.0. `SHARED`, because the word is in memory
+    /// another process (or the host's proxy, through the doorbell's reader
+    /// thread) rings. Without it (14.0 to 14.3) the sleep below is what is
+    /// left, and says so once.
+    #[cfg(target_os = "macos")]
+    mod imp {
+        use core::ffi::{c_char, c_int, c_void};
+        use core::sync::atomic::AtomicU32;
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        type WaitFn = unsafe extern "C" fn(*mut c_void, u64, usize, u32, u32, u64) -> c_int;
+        type WakeFn = unsafe extern "C" fn(*mut c_void, usize, u32) -> c_int;
+        const SHARED: u32 = 1;
+        /// `OS_CLOCK_MACH_ABSOLUTE_TIME`. The timeout is in nanoseconds
+        /// whatever the clock.
+        const CLOCK: u32 = 32;
+        const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+        unsafe extern "C" {
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        fn fns() -> Option<(WaitFn, WakeFn)> {
+            static F: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+            let (w, k) = (*F.get_or_init(|| {
+                // SAFETY: dlsym with NUL-terminated names.
+                let w = unsafe { dlsym(RTLD_DEFAULT, c"os_sync_wait_on_address_with_timeout".as_ptr()) };
+                let k = unsafe { dlsym(RTLD_DEFAULT, c"os_sync_wake_by_address_all".as_ptr()) };
+                if w.is_null() || k.is_null() {
+                    eprintln!("sv-transport: no os_sync_wait_on_address (macOS before 14.4): waits sleep in 200 us steps");
+                    None
+                } else {
+                    Some((w as usize, k as usize))
+                }
+            }))?;
+            // SAFETY: the two symbols have these signatures (os/os_sync_wait_on_address.h).
+            Some(unsafe { (core::mem::transmute::<usize, WaitFn>(w), core::mem::transmute::<usize, WakeFn>(k)) })
+        }
+
+        pub fn wait(word: &AtomicU32, expect: u32, timeout: Duration) {
+            match fns() {
+                Some((w, _)) => {
+                    let ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX).max(1);
+                    // SAFETY: a live 4-byte word; returns on a wake, a
+                    // changed value, the timeout or a signal, all of which
+                    // the caller re-checks.
+                    unsafe { w(word as *const AtomicU32 as *mut c_void, u64::from(expect), 4, SHARED, CLOCK, ns) };
+                }
+                None => std::thread::sleep(timeout.min(Duration::from_micros(200))),
+            }
+        }
+
+        pub fn wake(word: &AtomicU32) {
+            if let Some((_, k)) = fns() {
+                // SAFETY: a live 4-byte word.
+                unsafe { k(word as *const AtomicU32 as *mut c_void, 4, SHARED) };
+            }
+        }
+    }
+
     #[cfg(not(any(
         windows,
+        target_os = "macos",
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
     )))]
     mod imp {

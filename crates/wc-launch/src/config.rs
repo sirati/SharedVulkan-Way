@@ -132,6 +132,12 @@ pub struct Config {
     pub gpu_ivshmem_slot: u8,
     /// §87. The doorbell's virtio-serial port name; empty is no doorbell.
     pub gpu_bell: String,
+    /// §103.15, macOS: the session's GPU server (`sv-guest`), which the main
+    /// process starts and the host's session service serves; empty is none.
+    pub gpu_server: String,
+    /// §103.15, macOS: `VK_DRIVER_FILES` for that server (lavapipe in a VM
+    /// without Metal); empty leaves the loader's own search.
+    pub gpu_icd: String,
     /// §89. The Wayland rings' virtio-serial port: with it the compositor
     /// keeps the ivshmem region's tail for the session's Wayland connections
     /// and they cross as shared memory; empty, or a VM without the port, and
@@ -145,6 +151,17 @@ pub struct Config {
     /// with: GTK uses `wp_viewporter` whenever it is offered, and that path has
     /// not been through §95's desktop checks.
     pub nested_globals: bool,
+    /// §105. The installation's name, as the VM host's session service knows
+    /// it (`~/.config/waycompose/installs/<name>`). Empty: the session name.
+    pub installation: String,
+    /// §105. The installation's key, 64 hex digits, written by deploy and
+    /// readable by this user only; empty: `session.key` beside the launcher.
+    pub session_key: String,
+    /// §105. `debug-ssh-transport = on`: the pre-§105 path (ssh exec of the
+    /// forced command, the relay and the tunnel), for debugging only, off by
+    /// default and said in capitals on every step. `host`, `key`, `relay` and
+    /// `port` are read only for it.
+    pub debug_ssh_transport: bool,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -172,8 +189,13 @@ impl Default for Config {
             gpu_pool: true,
             gpu_ivshmem_slot: 0x1d,
             gpu_bell: "org.sirati.svbell.0".into(),
+            gpu_server: String::new(),
+            gpu_icd: String::new(),
             wayland_bell: "org.sirati.wcbell.0".into(),
             nested_globals: false,
+            installation: String::new(),
+            session_key: String::new(),
+            debug_ssh_transport: false,
             apps: BTreeMap::new(),
         }
     }
@@ -266,6 +288,8 @@ impl Config {
                         .filter(|v| *v <= 8)
                         .ok_or_else(|| format!("line {}: gpu-sessions is 0..=8", n + 1))?
                 }
+                ("session", "gpu-server") => cfg.gpu_server = v.into(),
+                ("session", "gpu-icd") => cfg.gpu_icd = v.into(),
                 ("session", "gpu-port") => {
                     cfg.gpu_port = v.parse().map_err(|e| format!("line {}: gpu-port: {e}", n + 1))?
                 }
@@ -288,6 +312,15 @@ impl Config {
                 }
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
+                ("session", "installation") => cfg.installation = v.into(),
+                ("session", "session-key") => cfg.session_key = v.into(),
+                ("session", "debug-ssh-transport") => {
+                    cfg.debug_ssh_transport = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("line {}: debug-ssh-transport is on or off, not {v}", n + 1)),
+                    }
+                }
                 ("session", "nested-compositor-globals") => {
                     cfg.nested_globals = match v {
                         "on" => true,
@@ -332,9 +365,21 @@ impl Config {
             ("compositor", &self.compositor),
             ("relay", &self.relay),
         ] {
+            // §103.15, §105: a session reaches its host through shared memory
+            // only; the ssh host, key and relay are read for the opt-in debug
+            // transport alone.
+            if (cfg!(target_os = "macos") || !self.debug_ssh_transport) && matches!(what, "host" | "key" | "relay") {
+                continue;
+            }
             if v.is_empty() {
                 return Err(format!("[session] {what} is required"));
             }
+        }
+        if !self.debug_ssh_transport && !cfg!(target_os = "macos") && self.wayland_bell.is_empty() {
+            return Err("[session] wayland-bell is empty: since §105 every byte crosses on the Wayland rings, which need it (debug-ssh-transport = on is the only way without)".into());
+        }
+        if !self.installation.is_empty() && !installation_ok(&self.installation) {
+            return Err(format!("[session] installation = {} is not a name (letters, digits, - _, at most 32)", self.installation));
         }
         if self.arena_mib == 0 {
             return Err("[session] arena-mib must not be zero".into());
@@ -377,6 +422,11 @@ impl Config {
     /// §86, §87. The GPU process's loopback port.
     pub fn gpu_port(&self) -> u16 {
         if self.gpu_port != 0 { self.gpu_port } else { self.port.wrapping_add(10) }
+    }
+
+    /// §105. The installation's name for the host's session service.
+    pub fn installation(&self) -> &str {
+        if self.installation.is_empty() { &self.session } else { &self.installation }
     }
 
     /// §86. Where the tunnel puts the session's sound on this machine.
@@ -483,7 +533,14 @@ mod tests {
     #[test]
     fn a_missing_required_field_is_named() {
         let e = Config::parse("[session]\nhost=u@h\n").unwrap_err();
-        assert!(e.contains("key"), "{e}");
+        assert!(e.contains("compositor"), "{e}");
+        // §105: the ssh host and key are required only by the opt-in debug transport.
+        let e = Config::parse("[session]\ncompositor=C\ndebug-ssh-transport=on\n").unwrap_err();
+        assert!(e.contains("host"), "{e}");
+        let c = Config::parse("[session]\ncompositor=C\n").unwrap();
+        assert!(!c.debug_ssh_transport && c.host.is_empty() && c.key.is_empty(), "no ssh by default");
+        assert_eq!(c.installation(), "wcl");
+        assert!(Config::parse("[session]\ncompositor=C\ninstallation=a b\n").is_err());
     }
 
     #[test]
@@ -613,7 +670,9 @@ mod gpu_tests {
     fn the_wayland_rings_port_is_on_by_default_and_can_be_turned_off() {
         let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
         assert_eq!(p("").unwrap().wayland_bell, "org.sirati.wcbell.0");
-        assert_eq!(p("wayland-bell =\n").unwrap().wayland_bell, "");
+        // §105: empty only with the debug transport; the rings are the only way.
+        assert!(p("wayland-bell =\n").unwrap_err().contains("wayland-bell"));
+        assert_eq!(p("wayland-bell =\ndebug-ssh-transport = on\n").unwrap().wayland_bell, "");
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
     }
 
@@ -626,4 +685,11 @@ mod gpu_tests {
         assert!(!p("nested-compositor-globals = off\n").unwrap().nested_globals);
         assert!(p("nested-compositor-globals = yes\n").is_err());
     }
+}
+
+/// §105. An installation name as the VM host's session service accepts it
+/// (`wc_handle::macboot::valid_installation`, which is not a dependency of
+/// this crate on Linux): 1 to 32 of letters, digits, `-` and `_`.
+pub fn installation_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }

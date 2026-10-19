@@ -59,6 +59,13 @@ mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
 mod ringlink;
+// §105: the session's boot, control, lease and sound on the ivshmem rings.
+mod session_svc;
+// §105: the session's sound is played by this process, which holds its ring.
+#[cfg(windows)]
+#[path = "../../wc-launch/src/audio.rs"]
+#[allow(dead_code)]
+mod audio;
 mod state;
 mod surface;
 /// Which taskbar button a window belongs to. See its header, and
@@ -90,7 +97,7 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
-pub use ringlink::{guest_ram_rings_located, shared_control};
+pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -399,6 +406,15 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
+        // §105: the boot record, the launcher's control socket and the sound.
+        match session_svc::parse_flag(&arg, &mut || it.next()) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("wc-compositor: {e}");
+                return Err(2);
+            }
+        }
         match arg.as_str() {
             "--once" => args.once = true,
             "--in-band" => args.in_band = true,
@@ -679,7 +695,9 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     }
     // §89. The rings are the ivshmem region's tail; without the region there
     // is nowhere to put them, and the other two ring flags name other regions.
-    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() {
+    // §103.15: with --wayland-rings-guest-ram the region is this process's
+    // RAM and --wayland-rings names only its doorbell.
+    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() && !ringlink::wants_guest_ram_rings() {
         eprintln!("wc-compositor: --wayland-rings keeps the tail of the --arena-ivshmem region, and there is none");
         return Err(2);
     }
@@ -1124,6 +1142,9 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 // id, and it should not have to *guess* whether a frame list
                 // exists. A harness greps one line and gets both.
                 let note = publish_frames(&args, *id, r.pages, &mut frames_written);
+                if *id == 0 {
+                    ringlink::note_guest_ram_arena(r.run_id, r.pages);
+                }
                 println!(
                     "wc-compositor: arena {id} provided from guest RAM: \
                      run 0x{:016x}, {} bytes, {} pages, locked={}{note}, pinning={}",
@@ -1146,20 +1167,34 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // §89. The Wayland rings' doorbell is opened first, because whether the
     // region keeps a tail for rings depends on it: rings nobody can wake are a
     // poll, and the socket path is the honest fallback for that.
+    // §103.15: the guest-RAM rings' doorbell, opened now and kept for them.
+    if let (Some(port), None) = (&args.wayland_rings, args.ivshmem_arena)
+        && ringlink::wants_guest_ram_rings()
+    {
+        match ringlink::open_bell_port(port).and_then(|h| ringlink::GuestRamBell::new(port, h)) {
+            Ok(b) => ringlink::keep_guest_ram_bell(b),
+            Err(e) => println!(
+                "wc-compositor: NO DOORBELL for the guest-RAM rings: {port} did not open ({e}); \
+                 they are polled every millisecond"
+            ),
+        }
+    }
+    // §105: the rings are kept whether or not the port opens. Without it they
+    // are polled, said loudly; there is no socket path to fall back to.
     let mut bell_port = match (&args.wayland_rings, args.ivshmem_arena) {
         (Some(port), Some(_)) => match ringlink::open_bell_port(port) {
-            Ok(p) => Some((port.clone(), p)),
+            Ok(p) => Some((port.clone(), Some(p))),
             Err(e) => {
                 println!(
-                    "wc-compositor: WAYLAND RINGS UNAVAILABLE: the doorbell port {port} did not \
-                     open ({e}); no rings are kept and every connection uses the socket"
+                    "wc-compositor: NO DOORBELL: the port {port} did not open ({e}); the Wayland \
+                     rings are kept and polled every millisecond, which costs CPU while the session lives"
                 );
-                None
+                Some((port.clone(), None))
             }
         },
         _ => None,
     };
-    let mut ivshmem_rings: Option<(ringlink::RingLink, Box<dyn std::io::Read + Send>)> = None;
+    let mut ivshmem_rings: Option<(ringlink::RingLink, Option<Box<dyn std::io::Read + Send>>)> = None;
     if let Some((id, dev)) = args.ivshmem_arena {
         if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
             eprintln!("wc-compositor: arena {id} is named by both --arena-guest-ram and --arena-ivshmem");
@@ -1189,7 +1224,8 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 Ok((link, reader, slots)) => {
                     println!(
                         "wc-compositor: wayland rings: {slots} connection slots in the last {rings_len} \
-                         bytes of the region (offset {rings_at}), doorbell {port}"
+                         bytes of the region (offset {rings_at}), doorbell {}",
+                        if reader.is_some() { port.clone() } else { format!("NONE ({port} did not open): polled") }
                     );
                     ivshmem_rings = Some((link, reader));
                 }
@@ -1342,11 +1378,24 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // a release fence, then the magic (`wc_handle::ivshmem::write_into`).
     if let Some((id, _)) = args.ivshmem_arena {
         match wc_handle::arena::publish_ivshmem(id) {
-            Ok(h) => println!(
-                "wc-compositor: arena {id} header published: run 0x{:016x}, generation {}, \
-                 outbound {}+{}",
-                h.run_id, h.generation, h.outbound.0, h.outbound.1
-            ),
+            Ok(h) => {
+                println!(
+                    "wc-compositor: arena {id} header published: run 0x{:016x}, generation {}, \
+                     outbound {}+{}",
+                    h.run_id, h.generation, h.outbound.0, h.outbound.1
+                );
+                // §105: with --boot-*, ask the host's session service for the
+                // session through the header page, instead of the launcher
+                // asking over ssh.
+                match session_svc::configured() {
+                    Ok(Some(cfg)) => session_svc::start(cfg, id),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("wc-compositor: {e}");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("wc-compositor: could not publish arena {id}'s header: {e}");
                 return std::process::ExitCode::from(2);
@@ -1586,7 +1635,7 @@ fn wayland_thread(
     wayland_cold: Option<String>,
     // §89: the ivshmem region's rings and their doorbell's reader, when the
     // compositor made them.
-    ivshmem_rings: Option<(ringlink::RingLink, Box<dyn std::io::Read + Send>)>,
+    ivshmem_rings: Option<(ringlink::RingLink, Option<Box<dyn std::io::Read + Send>>)>,
     idle_timeout: Duration,
     debug_icon: bool,
     expect_presents: usize,
@@ -1672,14 +1721,22 @@ fn wayland_thread(
     let mut grow: Option<crate::grow::Service> = None;
     let ticker = if poll_coarse { tick::Ticker::coarse() } else { tick::Ticker::new() };
     let (ivshmem_link, bell_reader) = match ivshmem_rings {
-        Some((link, reader)) => (Some(link), Some(reader)),
+        Some((link, reader)) => (Some(link), reader),
         None => (None, None),
     };
+    // §105: rings with no port are polled: a turn at least every millisecond.
+    let ivshmem_polled = ivshmem_link.is_some() && bell_reader.is_none();
     // §89: a byte on the rings' port is the proxy saying it wrote to a lane
     // this loop had parked on; it ends the wait like input does. The thread
     // blocks on the port and costs nothing between bytes.
-    let _doorman = bell_reader.map(|r| {
-        sv_transport::vdoorbell::Doorman::spawn_target(r, Arc::new(ringlink::WakeOnBell(ticker.waker())))
+    // §105: and every service thread (control, sound) parked on a lane, when
+    // the region is shared with them.
+    let _doorman = bell_reader.map(|r| match ringlink::shared_control() {
+        Some(control) => sv_transport::vdoorbell::Doorman::spawn_target(
+            r,
+            Arc::new(ringlink::GuestRamWake { waker: ticker.waker(), control }),
+        ),
+        None => sv_transport::vdoorbell::Doorman::spawn_target(r, Arc::new(ringlink::WakeOnBell(ticker.waker()))),
     });
     // §89: the UI thread ends the wait when it queues input, so a key or a
     // pointer event is handled on arrival rather than at the end of the turn.
@@ -1764,15 +1821,25 @@ fn wayland_thread(
         None
     };
     // Without a doorbell the rings are polled: a turn at least every millisecond.
-    let mut ring_poll = false;
+    let mut ring_poll = ivshmem_polled;
+    // §103.15: the guest-RAM rings' doorman, once they exist.
+    let mut _guest_ram_doorman: Option<sv_transport::vdoorbell::Doorman> = None;
     let _ = std::io::stdout().flush();
 
     loop {
-        if pending_rings.is_some() && ringlink::PendingRings::located() {
+        if pending_rings.as_mut().is_some_and(ringlink::PendingRings::poll) {
             match pending_rings.take().map(ringlink::PendingRings::into_link) {
-                Some(Ok(rl)) => {
+                Some(Ok((rl, reader))) => {
+                    match (reader, ringlink::shared_control()) {
+                        (Some(r), Some(control)) => {
+                            _guest_ram_doorman = Some(sv_transport::vdoorbell::Doorman::spawn_target(
+                                r,
+                                Arc::new(ringlink::GuestRamWake { waker: ticker.waker(), control }),
+                            ));
+                        }
+                        _ => ring_poll = true,
+                    }
                     ring_link = Some(rl);
-                    ring_poll = true;
                 }
                 Some(Err(e)) => eprintln!("wc-compositor: the guest-RAM ring region: {e}"),
                 None => {}
