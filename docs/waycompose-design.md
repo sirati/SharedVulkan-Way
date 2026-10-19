@@ -33701,3 +33701,30 @@ restarted under the session and the next request answered in 8–12 ms; the
 compositor killed and the proxy's lease lost after 5 s, then `down` by the
 service; a wrong key refused; a replayed sequence number refused; no port at
 all, polled and said by both sides; `down` over the ring.
+
+### 105.12 What is not done, and what is left on ssh
+
+* **Nothing of a session is left on ssh.** What ssh still does on these
+  machines: the developer's deploy and harness channel, workstation to guest
+  and workstation to host. The installations that have not been redeployed
+  since §105 still use their old forced-command keys until they are (105.10
+  lists them).
+* **Two installations' sessions at the same moment** remain impossible. The
+  ivshmem driver gives one mapping per device (§93.4). Every installation
+  shares the one service and the one hub, one after another.
+* **A microphone.** The sound ring carries input streams (§103.16). The
+  Windows side announces none, because there is no `waveIn` capture yet.
+* **A start answered before it runs** (105.13) means a `run` that the host's
+  `wc-session` refuses after the answer reaches the launcher only as "no
+  window". The refusal is in the proxy's log with the request. Everything
+  `wc-session` would refuse for the words themselves is checked before the
+  answer.
+* **The jump list's answers can be up to 30 s old** (`ctlfast::STALE`). That
+  is the price of answering in microseconds, and it is below the jump list's
+  own refresh period (at least 30 s, §92).
+* **`gpu-arena = slots`** (§87's fixed slots) still has only the TCP cold
+  path, and the forward that reached it is gone, so that mode no longer
+  works. The pool (§97) is the default and is what every installation uses.
+* **The installation key is not rotated.** Delete `$HOSTDIR/session.key` and
+  redeploy to replace it.
+* **The debug transport** (105.7) is kept on purpose, off by default.
