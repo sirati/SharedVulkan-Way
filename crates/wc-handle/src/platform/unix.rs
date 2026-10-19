@@ -50,6 +50,10 @@ impl Drop for OwnedObject {
 pub struct MappedView {
     ptr: *const u8,
     len: usize,
+    /// §103.19: an IOSurface section, held while mapped (`len` is then 0:
+    /// nothing was `mmap`ed, the surface's own memory is the view).
+    #[cfg(target_os = "macos")]
+    _owner: Option<crate::iosection::Surface>,
 }
 
 // SAFETY: the pointer is a private read-only mapping owned solely by this
@@ -67,7 +71,7 @@ impl MappedView {
     /// life of the process (the GPU device's BAR in the shared compositor).
     /// Its length is 0, so dropping it unmaps nothing.
     pub(crate) fn borrowed(ptr: *const u8) -> MappedView {
-        MappedView { ptr, len: 0 }
+        MappedView { ptr, len: 0, #[cfg(target_os = "macos")] _owner: None }
     }
 }
 
@@ -179,9 +183,18 @@ fn open_object(name: &str) -> io::Result<File> {
 
 /// Open the object by name and map it read-only.
 pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
+    #[cfg(target_os = "macos")]
+    if name.starts_with(crate::iosection::PREFIX) {
+        let (owner, ptr, have) = crate::iosection::lookup(name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no IOSurface section {name}")))?;
+        if have < len {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is {have} bytes, not {len}")));
+        }
+        return Ok(MappedView { ptr, len: 0, _owner: Some(owner) });
+    }
     let file = open_object(name)?;
     if len == 0 {
-        return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+        return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0, #[cfg(target_os = "macos")] _owner: None });
     }
     // SAFETY: a fresh anonymous-address request (`addr = null`) with a length
     // we checked is non-zero, against a file we just opened and hold open for
@@ -200,7 +213,7 @@ pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
+    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None })
 }
 
 /// The granularity every stamp and every locate step works in. Not a host page
@@ -304,7 +317,7 @@ pub fn alloc_locked_region(
         ));
     }
     // Owns the mapping from here, so every early return unmaps it.
-    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None };
     // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`, and
     // no other reference to it exists yet.
     let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
@@ -373,7 +386,7 @@ fn alloc_kept(len: usize, stamp: &dyn Fn(u32, &mut [u8]), keeper: &(dyn Fn(&str,
         unlink();
         return Err(e);
     }
-    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None };
     // Wire, then stamp, as alloc_wired does.
     // SAFETY: the mapping is live and `len` bytes long.
     if unsafe { libc::mlock(ptr, len) } != 0 {
@@ -432,7 +445,7 @@ fn alloc_superpages(len: usize, stamp: &dyn Fn(u32, &mut [u8])) -> io::Result<Lo
         );
         return alloc_wired(len, stamp, e);
     }
-    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None };
     // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`.
     let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
     for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
@@ -460,7 +473,7 @@ fn alloc_wired(len: usize, stamp: &dyn Fn(u32, &mut [u8]), superpage_error: io::
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None };
     // Wire before stamping, the order §84.5 found matters: a page stamped and
     // then moved by the wiring would carry its stamp to the wrong frame.
     // SAFETY: the mapping is live and `len` bytes long.
@@ -541,7 +554,7 @@ pub fn map_file_mut(path: &str, len: usize) -> io::Result<MappedView> {
         ));
     }
     if len == 0 {
-        return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
+        return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0, #[cfg(target_os = "macos")] _owner: None });
     }
     // SAFETY: as `map_section`, with write access added. `MAP_SHARED` because
     // the entire point is that the peer sees these stores; `MAP_PRIVATE` would
@@ -559,7 +572,7 @@ pub fn map_file_mut(path: &str, len: usize) -> io::Result<MappedView> {
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
+    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None })
 }
 
 /// Write into an object this process owns.

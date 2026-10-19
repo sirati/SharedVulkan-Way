@@ -595,6 +595,18 @@ fn start_gpu_server(cfg: &Config, id: &str, log: &Log) -> Option<std::process::C
     let mut c = Command::new(&cfg.gpu_server);
     c.stdin(Stdio::null());
     if !cfg.gpu_file.is_empty() {
+        // §103.19: the images an application exports (its dma-bufs) are
+        // IOSurfaces the GPU server renders into; it sends each to this
+        // process's service as a mach port, and the compositor maps it by the
+        // section name the application's token carries.
+        let service = format!("org.waycompose.sections.{}", std::process::id());
+        match wc_handle::iosection::check_in(&service) {
+            Ok(port) => {
+                std::thread::Builder::new().name("sections".into()).spawn(move || wc_handle::iosection::serve(port)).ok();
+                c.env("WC_GPU_SECTIONS", &service);
+            }
+            Err(kr) => log.say(&format!("GPU SECTIONS: bootstrap_check_in {service}: {kr}; applications' buffers cannot be shown")),
+        }
         // §103.19, role (b): one pool in the file beside the arena, for every
         // GPU session of this main process; the guest's `wc-session gpu`
         // attaches each session to it (`ivshmem-serve --cold pool`).
