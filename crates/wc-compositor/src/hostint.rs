@@ -160,24 +160,16 @@ pub fn service(platform: &'static str, cfg: &HostCfg, windows_paths: bool) -> Se
 const HANDLERS_EVERY: Duration = Duration::from_secs(600);
 
 /// Windows: serve the `OWNER_HOSTINT` slot (already opened by the caller,
-/// `session_svc`'s service channel) with the shell opener, the endpoint
-/// watch and the association handlers. Returns once the thread runs.
+/// `session_svc`'s service channel) with the shell opener and the
+/// association handlers. Returns once the thread runs.
 #[cfg(windows)]
 pub fn start_windows(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
     use wc_hostplat::win;
     let (tx, rx) = std::sync::mpsc::channel();
-    // The endpoint watch lives as long as the service: it is moved into the
-    // handlers thread below, which ends when the service's receiver is gone.
-    let watch = match win::audio::watch(tx.clone(), say) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            say(&format!("hostint: no audio device list: {e}"));
-            None
-        }
-    };
+    // The audio endpoints are not this channel's: they are the sound ring's
+    // device side (§103.16).
     let htx = tx.clone();
     let _ = std::thread::Builder::new().name("hostint-handlers".into()).spawn(move || {
-        let _watch = watch;
         loop {
             if htx.send(Event::Handlers(win::handlers::handlers())).is_err() {
                 return;

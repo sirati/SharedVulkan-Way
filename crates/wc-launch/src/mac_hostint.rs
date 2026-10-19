@@ -58,17 +58,9 @@ pub fn start(ch: ByteChannel, cfg: &Config, mut say: Say) {
     });
     let opener = MacOpener { browser: browser(cfg) };
     let (tx, rx) = channel::<Event>();
-    let watch = match wc_hostplat::mac::audio::watch(tx.clone()) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            say(&format!("hostint: no audio device watch: {e}"));
-            None
-        }
-    };
-    // The handlers now and every minute; ends with the channel, and the
-    // audio watch with it.
+    // The handlers now and every minute; ends with the channel. The audio
+    // devices are the sound ring's (sound_mac.rs, §103.16), not this channel's.
     let _ = std::thread::Builder::new().name("hostint-handlers".into()).spawn(move || {
-        let _watch = watch;
         while tx.send(Event::Handlers(wc_hostplat::mac::handlers::handlers())).is_ok() {
             std::thread::sleep(HANDLERS_EVERY);
         }

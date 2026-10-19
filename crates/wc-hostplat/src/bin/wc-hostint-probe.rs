@@ -96,7 +96,7 @@ mod win {
                 Ok(_w) => {
                     let end = Instant::now() + Duration::from_secs(secs);
                     while let Some(left) = end.checked_duration_since(Instant::now()) {
-                        if let Ok(wc_hostint::host::Event::Audio(s)) = rx.recv_timeout(left) {
+                        if let Ok(s) = rx.recv_timeout(left) {
                             println!("-- audio state at {} ms", t.elapsed().as_millis());
                             print_state(&s);
                         }

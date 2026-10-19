@@ -11,7 +11,6 @@
 //!   hello 1 PLATFORM              "windows" or "macos"
 //!   rep N ok
 //!   rep N err B64REASON
-//!   audio B64STATE                the host's devices and defaults (audio.rs)
 //!   handlers B64LIST              host applications per type (handlers.rs)
 //!   paths B64MAP                  how host paths and Linux paths correspond
 //! ```
@@ -25,8 +24,6 @@
 //! Requests name things and never carry commands (§94, security-model R33):
 //! a URL, a host path, or the opaque token the host gave a handler. The host
 //! checks all of them before it opens anything.
-
-use crate::audio::{Device, Dir, State};
 
 pub const VERSION: u32 = 1;
 /// The longest line either side accepts.
@@ -96,7 +93,6 @@ pub enum Msg {
     Req { n: u64, req: Req },
     /// Host to Linux.
     Rep { n: u64, result: Result<(), String> },
-    Audio(State),
     Handlers(Vec<Handler>),
     Paths(PathMap),
 }
@@ -158,7 +154,6 @@ impl Msg {
             },
             Msg::Rep { n, result: Ok(()) } => format!("rep {n} ok"),
             Msg::Rep { n, result: Err(e) } => format!("rep {n} err {}", b64(e.as_bytes())),
-            Msg::Audio(s) => format!("audio {}", b64(encode_state(s).as_bytes())),
             Msg::Handlers(h) => format!("handlers {}", b64(encode_handlers(h).as_bytes())),
             Msg::Paths(p) => format!("paths {}", b64(encode_paths(p).as_bytes())),
         }
@@ -192,47 +187,11 @@ impl Msg {
             }
             ["rep", n, "ok"] => Msg::Rep { n: num(n)?, result: Ok(()) },
             ["rep", n, "err", e] => Msg::Rep { n: num(n)?, result: Err(text(e)?) },
-            ["audio", s] => Msg::Audio(decode_state(&text(s)?).ok_or_else(bad)?),
             ["handlers", h] => Msg::Handlers(decode_handlers(&text(h)?)),
             ["paths", p] => Msg::Paths(decode_paths(&text(p)?)),
             _ => return Err(bad()),
         })
     }
-}
-
-fn encode_state(s: &State) -> String {
-    let mut o = String::new();
-    for d in &s.devices {
-        o.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", d.dir.wire(), field(&d.id), field(&d.description), d.channels, d.rate));
-    }
-    if let Some(d) = &s.default_output {
-        o.push_str(&format!("default-out\t{}\n", field(d)));
-    }
-    if let Some(d) = &s.default_input {
-        o.push_str(&format!("default-in\t{}\n", field(d)));
-    }
-    o
-}
-
-fn decode_state(t: &str) -> Option<State> {
-    let mut s = State::default();
-    for l in t.lines() {
-        let f: Vec<&str> = l.split('\t').collect();
-        match f.as_slice() {
-            ["default-out", id] => s.default_output = Some((*id).into()),
-            ["default-in", id] => s.default_input = Some((*id).into()),
-            [dir, id, desc, ch, rate] => s.devices.push(Device {
-                dir: Dir::from_wire(dir)?,
-                id: (*id).into(),
-                description: (*desc).into(),
-                channels: ch.parse().ok()?,
-                rate: rate.parse().ok()?,
-            }),
-            _ => return None,
-        }
-    }
-    // A host with hundreds of devices is not one this protocol serves.
-    (s.devices.len() <= 64).then_some(s)
 }
 
 fn encode_handlers(hs: &[Handler]) -> String {
@@ -380,11 +339,6 @@ mod tests {
         rt(Msg::Req { n: 9, req: Req::With { token: "h3".into(), target: Target::Url("https://x/".into()) } });
         rt(Msg::Rep { n: 7, result: Ok(()) });
         rt(Msg::Rep { n: 7, result: Err("scheme 'file' is not allowed".into()) });
-        rt(Msg::Audio(State {
-            devices: vec![Device { dir: Dir::Output, id: "{0.0.0.00000000}.{x}".into(), description: "Speakers (Realtek(R) Audio)".into(), channels: 2, rate: 48000 }],
-            default_output: Some("{0.0.0.00000000}.{x}".into()),
-            default_input: None,
-        }));
         rt(Msg::Handlers(vec![Handler {
             token: "n0".into(),
             name: "Notepad".into(),

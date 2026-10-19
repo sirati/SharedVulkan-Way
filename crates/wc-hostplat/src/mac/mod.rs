@@ -2,7 +2,7 @@
 //! (docs/waycompose-design.md §106, the macOS host).
 //!
 //! * [`audio`]: the devices (UID, name, channels, rate) and the defaults,
-//!   and a watcher that sends `Event::Audio` after every burst of changes.
+//!   and a watcher that sends the `State` after every burst of changes.
 //! * [`stream`]: AudioQueue render and capture on one device by UID;
 //!   capture only in the main process (`org.waycompose.host`), on demand.
 //! * [`open`]: the `Opener`, `/usr/bin/open` with an argv.

@@ -7,7 +7,7 @@
 //! streams an input, and one with both (a USB headset) is both.
 //!
 //! [`watch`] listens to the device list and both defaults and sends the new
-//! state as `Event::Audio` once a burst of changes is over, within a second
+//! state as the `State` once a burst of changes is over, within a second
 //! of its start (`crate::debounce`). The listeners run on CoreAudio's own
 //! notification thread, not the main run loop (`kAudioHardwarePropertyRunLoop`
 //! is set to none), so this works in a process that never runs one.
@@ -17,7 +17,6 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::time::Instant;
 
 use wc_hostint::audio::{Device, Dir, State};
-use wc_hostint::host::Event;
 
 use super::cf;
 use super::plan::channels_of_buffer_list;
@@ -186,8 +185,8 @@ impl Drop for Watch {
 }
 
 /// Send the current state now, and again after every burst of device or
-/// default changes, as `Event::Audio` on `events`.
-pub fn watch(events: Sender<Event>) -> Result<Watch, String> {
+/// default changes, as the `State` on `events`.
+pub fn watch(events: Sender<State>) -> Result<Watch, String> {
     // Notifications on CoreAudio's own thread rather than the main run loop.
     let none: *const c_void = std::ptr::null();
     // SAFETY: the property is a CFRunLoopRef; null means "the HAL's own".
@@ -209,7 +208,7 @@ pub fn watch(events: Sender<Event>) -> Result<Watch, String> {
     std::thread::Builder::new()
         .name("hostint-audio".into())
         .spawn(move || {
-            if events.send(Event::Audio(state())).is_err() {
+            if events.send(state()).is_err() {
                 return;
             }
             // The first change of a burst; wait for the burst to end.
@@ -224,7 +223,7 @@ pub fn watch(events: Sender<Event>) -> Result<Watch, String> {
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                if events.send(Event::Audio(state())).is_err() {
+                if events.send(state()).is_err() {
                     return;
                 }
             }

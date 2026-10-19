@@ -15,6 +15,9 @@
 //!   Capture is asked for (`Start`) only while something records from it
 //!   (`pactl list short source-outputs`, once a second while there are input
 //!   streams), and stopped (`Stop`) when nothing does;
+//! * each is named `<prefix>.<sink|source>.<slug>` after the device
+//!   (`wc_hostint::audio::node_name`), the prefix being the device side's
+//!   platform (`--sound-prefix`, "win" or "mac"), and described by its name;
 //! * `Default` makes the Mac's default the session's (`set-default-sink`,
 //!   `set-default-source`).
 //!
@@ -40,6 +43,9 @@ pub struct SoundCfg {
     pub server: Option<String>,
     /// The session's directory, for the FIFOs and the module list.
     pub dir: PathBuf,
+    /// The device side's platform, the first word of every sink and source
+    /// name: "win" or "mac" (`--sound-prefix`; "mac" if empty).
+    pub prefix: String,
 }
 
 /// What an input stream's FIFO is granted at a time.
@@ -208,7 +214,12 @@ fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
 }
 
 fn add(sh: &Arc<Shared>, link: &Link, stream: u16, dir: Dir, channels: u8, rate: u32, name: &str) {
-    let tag = format!("wc_mac_{}_{stream}", if dir == Dir::Out { "out" } else { "in" });
+    // `<prefix>.<sink|source>.<slug of the device's name>`, `_2`, `_3` for
+    // a name already in use (wc_hostint::audio::node_name).
+    let prefix = if sh.cfg.prefix.is_empty() { "mac" } else { sh.cfg.prefix.as_str() };
+    let taken: Vec<String> = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| s.source.clone()).collect();
+    let hdir = if dir == Dir::Out { wc_hostint::audio::Dir::Output } else { wc_hostint::audio::Dir::Input };
+    let tag = wc_hostint::audio::node_name(prefix, hdir, name, &taken);
     let fifo = sh.cfg.dir.join(format!("sound-{stream}.fifo"));
     if let Err(e) = mkfifo(&fifo) {
         println!("[proxy] session sound: {e}");

@@ -4,7 +4,7 @@
 //! (`IMMDeviceEnumerator::EnumAudioEndpoints`, `DEVICE_STATE_ACTIVE`): its id,
 //! its friendly name and its shared-mode mix format, plus the two defaults
 //! for the console role. [`watch`] registers an `IMMNotificationClient`
-//! and sends `Event::Audio` with the new state after every burst of changes
+//! and sends the `State` with the new state after every burst of changes
 //! (debounced, [`crate::debounce`]), and once at the start.
 //!
 //! Nothing here changes a default or opens a stream: activating an
@@ -20,7 +20,6 @@ use windows_sys::Win32::System::Com::StructuredStorage::PropVariantClear;
 use windows_sys::core::{GUID, HRESULT};
 
 use wc_hostint::audio::{Device, Dir, State};
-use wc_hostint::host::Event;
 
 use super::com::*;
 use crate::debounce;
@@ -264,8 +263,8 @@ impl Drop for Watch {
 /// Send the host's audio state on `events` now and after every change,
 /// within a second of the change. `log` gets a line on failures. Ends when
 /// the [`Watch`] is dropped or `events`' receiver is gone.
-pub fn watch(events: Sender<Event>, log: impl FnMut(&str) + Send + 'static) -> Result<Watch, String> {
-    watch_states(move |s| events.send(Event::Audio(s)).is_ok(), log)
+pub fn watch(events: Sender<State>, log: impl FnMut(&str) + Send + 'static) -> Result<Watch, String> {
+    watch_states(move |s| events.send(s).is_ok(), log)
 }
 
 /// [`watch`] with a callback: `on_state` gets the state now and after every

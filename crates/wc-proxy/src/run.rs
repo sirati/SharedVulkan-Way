@@ -183,11 +183,11 @@ usage: wc-proxy --upstream <path> [options]
                          slot, with the session's run directory DIR (desktop
                          entries, mimeapps.list, DIR/hostint.sock for
                          wc-host-open). Only with rings; ignored otherwise
-  --hostint-pipewire P   §106: the session PipeWire's socket; the host's audio
-                         devices become nodes in it. Without it they do not
-  --hostint-pw-bin DIR   §106: where pipewire, pw-dump and pw-metadata are
   --hostint-opener PATH  §106: wc-host-open, for the desktop entries' Exec=
                          (default: beside this executable)
+  --sound-prefix P       §103.16: the sound ring's device side, win or mac
+                         (default mac): sinks and sources are P.sink.<slug> and
+                         P.source.<slug> of the host's device names
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -343,8 +343,6 @@ fn parse_args() -> Result<Args, String> {
             "--session-id" => a.services.id = Some(next()?),
             "--audio-socket" => a.services.audio = Some(next()?.into()),
             "--hostint" => a.hostint.dir = next()?.into(),
-            "--hostint-pipewire" => a.hostint.pipewire = Some(next()?.into()),
-            "--hostint-pw-bin" => a.hostint.pw_bin = Some(next()?.into()),
             "--hostint-opener" => a.hostint.opener = Some(next()?.into()),
             "--sound-pactl" => a.services.sound.get_or_insert_with(Default::default).pactl = next()?.into(),
             "--sound-server" => {
@@ -352,6 +350,7 @@ fn parse_args() -> Result<Args, String> {
                 a.services.sound.get_or_insert_with(Default::default).server = (!v.is_empty()).then_some(v);
             }
             "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
+            "--sound-prefix" => a.services.sound.get_or_insert_with(Default::default).prefix = next()?,
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -458,11 +457,7 @@ pub fn main() -> std::process::ExitCode {
     if argv.get(1).map(String::as_str) == Some("desktop") {
         return wc_proxy::desktop::cli(&argv[2..]);
     }
-    // §106: the session PipeWire's monitor PCM as `audio.sock` (wc-session's
-    // pipewire modes), and `wc-host-open` under this binary's name too.
-    if argv.get(1).map(String::as_str) == Some("pcm-serve") {
-        return wc_proxy::hostint::pcm_serve_cli(&argv[2..]);
-    }
+    // §106: `wc-host-open` under this binary's name too.
     if argv.get(1).map(String::as_str) == Some("host-open") {
         return wc_proxy::hostint::open_cli(&argv[2..]);
     }

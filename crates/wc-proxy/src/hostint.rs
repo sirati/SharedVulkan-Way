@@ -13,47 +13,31 @@
 //!   `DIR/hostint/xdg-config`, which `wc-session` puts first in the
 //!   applications' `XDG_DATA_DIRS` and `XDG_CONFIG_DIRS`. Never the user's
 //!   own `~/.config` or `~/.local`.
-//! * **audio**: the host's devices, as one PipeWire node each, hosted by one
-//!   child `pipewire -c DIR/hostint/audio/nodes.conf` that connects to the
-//!   session's PipeWire daemon (`--hostint-pipewire`, never inherited from the
-//!   environment). Defaults follow the host through `pw-metadata`.
 //! * **requests**: `wc-host-open` connects to `DIR/hostint.sock` (0600, the
 //!   peer's uid checked), sends one `req`, and gets the host's answer. The
 //!   proxy numbers the request, forwards it on the ring and waits up to 5 s
 //!   for `rep N`.
 //!
-//! Nothing here is a socket to the host. `hostint.sock` and the FIFOs are
-//! local to Linux; everything that reaches the host crosses on the ring slot.
-//!
-//! # The sound ring has not landed
-//!
-//! Each node's samples pass through a FIFO (`wc_hostint::audio::fifo_path`)
-//! and a bridge thread copies between that FIFO and a [`SoundRing`] stream.
-//! The generic multi-stream sound ring is not in this tree yet, so the only
-//! implementation is [`NullRing`]: an output's samples are drained and
-//! dropped, an input gets silence at the device's rate. The session's default
-//! output still reaches the host on the existing single `OWNER_AUDIO` channel
-//! (`macsvc`), from the session sound server's monitor on `audio.sock`. When
-//! the sound ring lands, it implements [`SoundRing`] and nothing else here
-//! changes.
+//! Nothing here is a socket to the host. `hostint.sock` is local to Linux;
+//! everything that reaches the host crosses on the ring slot. The host's audio
+//! devices are not this channel's: they are streams on the sound ring
+//! (§103.16, `sound.rs`).
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sv_transport::control::Control;
 use sv_transport::wlbytes::{ByteChannel, ReadOutcome, OWNER_HOSTINT};
-use wc_hostint::audio::{self, Dir, Node, Reconciler, State};
 use wc_hostint::linux::{self, Given, Plan};
 use wc_hostint::wire::{self, Handler, LineBuf, Msg, PathMap, Req, Target, VERSION};
 
@@ -68,12 +52,6 @@ pub struct Config {
     /// The session's run directory (`--hostint DIR`). Everything this service
     /// writes is under it.
     pub dir: PathBuf,
-    /// The session's PipeWire socket (`--hostint-pipewire PATH`). Without it
-    /// the host's devices are not made into nodes, and it says so.
-    pub pipewire: Option<PathBuf>,
-    /// Where `pipewire`, `pw-dump` and `pw-metadata` are (`--hostint-pw-bin`);
-    /// `PATH` if unset.
-    pub pw_bin: Option<PathBuf>,
     /// `wc-host-open`, for the desktop entries' `Exec=` (`--hostint-opener`);
     /// beside this executable if unset.
     pub opener: Option<PathBuf>,
@@ -141,7 +119,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// End every thread, the PipeWire child with them, and remove the socket.
+    /// End every thread and remove the socket.
     pub fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         // Wake the accept loop.
@@ -177,14 +155,13 @@ pub fn start(control: &Arc<Control>, cfg: Config) -> Option<Handle> {
 /// The service on a channel already claimed.
 pub fn start_on(ch: ByteChannel, cfg: Config) -> std::io::Result<Handle> {
     let h = cfg.hdir();
-    for d in [h.clone(), h.join("xdg-data/applications"), h.join("xdg-config"), h.join("audio")] {
+    for d in [h.clone(), h.join("xdg-data/applications"), h.join("xdg-config")] {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d)?;
     }
     write_atomic(&h.join("roots"), "")?;
     let shared = Arc::new(Mutex::new(Shared::default()));
     let stop = Arc::new(AtomicBool::new(false));
     let (out_tx, out_rx) = mpsc::channel::<String>();
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioCmd>();
 
     let listener = bind_socket(&cfg)?;
     let mut threads = Vec::new();
@@ -193,15 +170,7 @@ pub fn start_on(ch: ByteChannel, cfg: Config) -> std::io::Result<Handle> {
         threads.push(
             std::thread::Builder::new()
                 .name("hostint-ring".into())
-                .spawn(move || ring_loop(ch, &cfg, &shared, &out_rx, &audio_tx, &stop))?,
-        );
-    }
-    {
-        let (cfg, stop) = (cfg.clone(), Arc::clone(&stop));
-        threads.push(
-            std::thread::Builder::new()
-                .name("hostint-audio".into())
-                .spawn(move || audio_loop(&cfg, &audio_rx, &stop, &NullRing))?,
+                .spawn(move || ring_loop(ch, &cfg, &shared, &out_rx, &stop))?,
         );
     }
     {
@@ -239,7 +208,6 @@ fn ring_loop(
     cfg: &Config,
     shared: &Mutex<Shared>,
     out: &Receiver<String>,
-    audio: &Sender<AudioCmd>,
     stop: &AtomicBool,
 ) {
     let mut lines = LineBuf::default();
@@ -261,7 +229,7 @@ fn ring_loop(
                 busy = true;
                 lines.push(&tmp[..n]);
                 while let Some(l) = lines.next_line() {
-                    on_host_line(&l, cfg, shared, audio);
+                    on_host_line(&l, cfg, shared);
                 }
             }
             Ok(ReadOutcome::Eof) | Err(_) => break,
@@ -277,10 +245,9 @@ fn ring_loop(
     for (_, tx) in s.pending.drain() {
         let _ = tx.send(Err("the host-integration channel ended".into()));
     }
-    let _ = audio.send(AudioCmd::Stop);
 }
 
-fn on_host_line(line: &str, cfg: &Config, shared: &Mutex<Shared>, audio: &Sender<AudioCmd>) {
+fn on_host_line(line: &str, cfg: &Config, shared: &Mutex<Shared>) {
     let msg = match Msg::decode(line) {
         Ok(m) => m,
         Err(e) => {
@@ -296,7 +263,6 @@ fn on_host_line(line: &str, cfg: &Config, shared: &Mutex<Shared>, audio: &Sender
                 s.platform = platform.clone();
                 s.handlers.clone()
             };
-            let _ = audio.send(AudioCmd::Prefix(host_names(platform.as_deref()).1.into()));
             if let Err(e) = write_handlers(cfg, &handlers, platform.as_deref()) {
                 log(&format!("desktop entries: {e}"));
             }
@@ -324,9 +290,6 @@ fn on_host_line(line: &str, cfg: &Config, shared: &Mutex<Shared>, audio: &Sender
                 Ok(()) => log(&format!("{} host application(s) as desktop entries", h.len())),
                 Err(e) => log(&format!("desktop entries: {e}")),
             }
-        }
-        Msg::Audio(st) => {
-            let _ = audio.send(AudioCmd::State(st));
         }
         Msg::Rep { n, result } => {
             let tx = shared.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&n);
@@ -503,361 +466,6 @@ fn forward(req: Req, shared: &Mutex<Shared>, out: &Sender<String>) -> Result<(),
     shared.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&n);
     log(&format!("rep {n}: {r:?}"));
     r
-}
-
-// ---------------------------------------------------------------- audio --
-
-/// A node's stream on the sound ring, Linux to host (an output).
-pub trait StreamSink: Send {
-    fn play(&mut self, pcm: &[u8]);
-}
-
-/// A node's stream on the sound ring, host to Linux (an input). Fills `buf`
-/// with the next samples and returns how many bytes it filled.
-pub trait StreamSource: Send {
-    fn capture(&mut self, buf: &mut [u8]) -> usize;
-}
-
-/// The sound ring's per-node streams. See the module documentation: only
-/// [`NullRing`] exists until the multi-stream sound ring lands.
-pub trait SoundRing: Sync {
-    fn sink(&self, node: &Node) -> Box<dyn StreamSink>;
-    fn source(&self, node: &Node) -> Box<dyn StreamSource>;
-}
-
-/// Drops what an output plays; gives an input silence.
-pub struct NullRing;
-
-struct NullSink;
-impl StreamSink for NullSink {
-    fn play(&mut self, _: &[u8]) {}
-}
-struct Silence;
-impl StreamSource for Silence {
-    fn capture(&mut self, buf: &mut [u8]) -> usize {
-        buf.fill(0);
-        buf.len()
-    }
-}
-
-impl SoundRing for NullRing {
-    fn sink(&self, _: &Node) -> Box<dyn StreamSink> {
-        Box::new(NullSink)
-    }
-    fn source(&self, _: &Node) -> Box<dyn StreamSource> {
-        Box::new(Silence)
-    }
-}
-
-enum AudioCmd {
-    Prefix(String),
-    State(State),
-    Stop,
-}
-
-/// A `pw-*` command aimed at exactly `remote`'s daemon: its socket, runtime
-/// directory and `XDG_RUNTIME_DIR` are set from `remote`, never inherited, so
-/// no command here can reach a PipeWire the session was not given.
-pub fn pw_command(bin: Option<&Path>, name: &str, remote: &Path) -> Command {
-    let prog = bin.map_or_else(|| PathBuf::from(name), |b| b.join(name));
-    let mut c = Command::new(prog);
-    let rt = remote.parent().unwrap_or(Path::new("/nonexistent"));
-    c.env("PIPEWIRE_REMOTE", remote)
-        .env("PIPEWIRE_RUNTIME_DIR", rt)
-        .env("XDG_RUNTIME_DIR", rt)
-        .env_remove("PULSE_SERVER")
-        .env_remove("PIPEWIRE_CORE")
-        .stdin(Stdio::null());
-    c
-}
-
-/// The node names the daemon has, by `pw-dump`.
-pub fn pw_nodes(bin: Option<&Path>, remote: &Path) -> std::collections::HashSet<String> {
-    pw_command(bin, "pw-dump", remote)
-        .stderr(Stdio::null())
-        .output()
-        .map(|o| audio::pw_dump_node_names(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
-}
-
-/// One node's FIFO, copied to or from its stream until `stop`.
-struct Bridge {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for Bridge {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-fn open_fifo(path: &Path) -> std::io::Result<OwnedFd> {
-    let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
-    // O_RDWR: neither end ever sees EOF or blocks in open while the other end
-    // restarts, which is the PipeWire child on every device change.
-    // SAFETY: a valid C string; the fd is owned from here on.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: just opened, nobody else owns it.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn bridge(node: &Node, fifo: &Path, ring: &dyn SoundRing) -> std::io::Result<Bridge> {
-    let fd = open_fifo(fifo)?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let s2 = Arc::clone(&stop);
-    let name = format!("hostint-{}", node.stream);
-    let thread = match node.dir {
-        Dir::Output => {
-            let mut sink = ring.sink(node);
-            std::thread::Builder::new().name(name).spawn(move || {
-                let mut buf = vec![0u8; 16384];
-                while !s2.load(Ordering::SeqCst) {
-                    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-                    // SAFETY: one live pollfd.
-                    if unsafe { libc::poll(&mut p, 1, 100) } <= 0 {
-                        continue;
-                    }
-                    // SAFETY: a live fd and a buffer of the length we pass.
-                    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-                    if n > 0 {
-                        sink.play(&buf[..n as usize]);
-                    }
-                }
-            })?
-        }
-        Dir::Input => {
-            let mut src = ring.source(node);
-            // 10 ms of the device's format, s16le.
-            let chunk = (node.rate as usize / 100) * node.channels as usize * 2;
-            std::thread::Builder::new().name(name).spawn(move || {
-                let mut buf = vec![0u8; chunk.max(4)];
-                let mut next = Instant::now();
-                while !s2.load(Ordering::SeqCst) {
-                    let n = src.capture(&mut buf);
-                    // A full FIFO is a source nobody reads: drop, as a
-                    // microphone does.
-                    // SAFETY: a live fd and a buffer of at least n bytes.
-                    unsafe { libc::write(fd.as_raw_fd(), buf.as_ptr().cast(), n.min(buf.len())) };
-                    next += Duration::from_millis(10);
-                    let now = Instant::now();
-                    if next > now {
-                        std::thread::sleep(next - now);
-                    } else {
-                        next = now;
-                    }
-                }
-            })?
-        }
-    };
-    Ok(Bridge { stop, thread: Some(thread) })
-}
-
-fn mkfifo(path: &Path) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(path);
-    let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
-    // SAFETY: a valid C string.
-    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The child PipeWire and the bridges of one device set.
-struct Nodes {
-    child: Option<Child>,
-    _bridges: Vec<Bridge>,
-    started: Instant,
-}
-
-impl Drop for Nodes {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-struct Supervisor<'a> {
-    cfg: &'a Config,
-    remote: PathBuf,
-    ring: &'a dyn SoundRing,
-    recon: Reconciler,
-    last: Option<State>,
-    running: Option<Nodes>,
-    /// The set to bring back if the child dies.
-    want: Vec<Node>,
-    retry_at: Option<Instant>,
-}
-
-impl Supervisor<'_> {
-    fn update(&mut self, st: &State) {
-        self.last = Some(st.clone());
-        let d = self.recon.update(st);
-        if let Some(nodes) = d.restart {
-            log(&format!("device set: {} node(s); restarting the node host", nodes.len()));
-            self.want = nodes;
-            self.restart();
-        } else if d.apply_defaults {
-            self.apply_defaults();
-        }
-    }
-
-    fn restart(&mut self) {
-        self.running = None;
-        self.retry_at = None;
-        let adir = self.cfg.hdir().join("audio");
-        let conf = adir.join("nodes.conf");
-        if self.want.is_empty() {
-            let _ = std::fs::remove_file(&conf);
-            return;
-        }
-        match self.spawn(&adir, &conf) {
-            Ok(n) => {
-                self.running = Some(n);
-                self.wait_nodes_then_defaults();
-            }
-            Err(e) => {
-                log(&format!("the node host did not start: {e}"));
-                self.retry_at = Some(Instant::now() + Duration::from_secs(2));
-            }
-        }
-    }
-
-    fn spawn(&self, adir: &Path, conf: &Path) -> std::io::Result<Nodes> {
-        let fdir = adir.to_string_lossy().into_owned();
-        let mut bridges = Vec::new();
-        for n in &self.want {
-            let f = PathBuf::from(audio::fifo_path(&fdir, n));
-            mkfifo(&f)?;
-            bridges.push(bridge(n, &f, self.ring)?);
-        }
-        write_atomic(conf, &audio::render_config(&self.want, &fdir))?;
-        let logf = std::fs::File::create(adir.join("nodes.log"))?;
-        let mut cmd = pw_command(self.cfg.pw_bin.as_deref(), "pipewire", &self.remote);
-        cmd.arg("-c").arg(conf).stdout(logf.try_clone()?).stderr(logf);
-        // SAFETY: async-signal-safe prctl between fork and exec: the node host
-        // dies with this process, never outlives it holding nodes.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-                Ok(())
-            });
-        }
-        let child = cmd.spawn()?;
-        log(&format!("node host pid {} ({})", child.id(), conf.display()));
-        Ok(Nodes { child: Some(child), _bridges: bridges, started: Instant::now() })
-    }
-
-    /// The defaults are set once the nodes exist, at most 5 s later.
-    fn wait_nodes_then_defaults(&mut self) {
-        let want: Vec<String> = self.want.iter().map(|n| n.node_name.clone()).collect();
-        let t0 = Instant::now();
-        loop {
-            let have = pw_nodes(self.cfg.pw_bin.as_deref(), &self.remote);
-            if want.iter().all(|w| have.contains(w)) {
-                log(&format!("{} node(s) up in {} ms", want.len(), t0.elapsed().as_millis()));
-                break;
-            }
-            if t0.elapsed() > Duration::from_secs(5) {
-                let missing: Vec<&String> = want.iter().filter(|w| !have.contains(*w)).collect();
-                log(&format!("nodes missing after 5 s: {missing:?}"));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        self.apply_defaults();
-    }
-
-    fn apply_defaults(&self) {
-        let d = self.recon.defaults().clone();
-        for (dir, name) in [(Dir::Output, d.sink), (Dir::Input, d.source)] {
-            let Some(name) = name else { continue };
-            let st = pw_command(self.cfg.pw_bin.as_deref(), "pw-metadata", &self.remote)
-                .args(audio::metadata_args(dir, &name))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match st {
-                Ok(s) if s.success() => log(&format!("default {} -> {name}", dir.pw())),
-                other => log(&format!("pw-metadata for {name}: {other:?}")),
-            }
-        }
-    }
-
-    fn check_child(&mut self) {
-        if let Some(n) = &mut self.running
-            && let Some(c) = &mut n.child
-            && let Ok(Some(st)) = c.try_wait()
-        {
-            log(&format!(
-                "the node host exited ({st}) after {} ms; again in 2 s",
-                n.started.elapsed().as_millis()
-            ));
-            self.running = None;
-            self.retry_at = Some(Instant::now() + Duration::from_secs(2));
-        }
-        if self.retry_at.is_some_and(|t| Instant::now() >= t) {
-            self.restart();
-        }
-    }
-}
-
-fn audio_loop(cfg: &Config, rx: &Receiver<AudioCmd>, stop: &AtomicBool, ring: &dyn SoundRing) {
-    let Some(remote) = cfg.pipewire.clone() else {
-        // Drain, saying once why the devices are not nodes.
-        let mut said = false;
-        loop {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(AudioCmd::State(s)) if !said => {
-                    said = true;
-                    log(&format!(
-                        "the host has {} audio device(s), and this session has no PipeWire of its own \
-                         (WC_LAUNCH_AUDIO=pipewire or user-pipewire): they do not become nodes",
-                        s.devices.len()
-                    ));
-                }
-                Ok(AudioCmd::Stop) | Err(RecvTimeoutError::Disconnected) => return,
-                _ if stop.load(Ordering::SeqCst) => return,
-                _ => {}
-            }
-        }
-    };
-    let mut sup = Supervisor {
-        cfg,
-        remote,
-        ring,
-        recon: Reconciler::new("host"),
-        last: None,
-        running: None,
-        want: Vec::new(),
-        retry_at: None,
-    };
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(AudioCmd::Prefix(p)) => {
-                sup.recon = Reconciler::new(&p);
-                if let Some(s) = sup.last.clone() {
-                    sup.update(&s);
-                }
-            }
-            Ok(AudioCmd::State(s)) => sup.update(&s),
-            Ok(AudioCmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        sup.check_child();
-    }
-    sup.running = None;
 }
 
 // --------------------------------------------------------- wc-host-open --
@@ -1042,69 +650,12 @@ pub fn open_cli(args: &[String]) -> std::process::ExitCode {
     ExitCode::from(code)
 }
 
-// ------------------------------------------------------------ pcm-serve --
-
-/// `wc-proxy pcm-serve FIFO SOCKET`: the PCM written into FIFO (by the
-/// session PipeWire's monitor tunnel) to whoever is connected to SOCKET, which
-/// is what PulseAudio's simple protocol gave §86's `audio.sock`. With nobody
-/// connected the PCM is read and dropped, so the tunnel never stalls.
-pub fn pcm_serve_cli(args: &[String]) -> std::process::ExitCode {
-    let [fifo, sock] = args else {
-        eprintln!("usage: wc-proxy pcm-serve FIFO SOCKET");
-        return std::process::ExitCode::from(2);
-    };
-    match pcm_serve(Path::new(fifo), Path::new(sock)) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("wc-proxy pcm-serve: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-fn pcm_serve(fifo: &Path, sock: &Path) -> std::io::Result<()> {
-    if !fifo.exists() {
-        mkfifo(fifo)?;
-    }
-    let fd = open_fifo(fifo)?;
-    let _ = std::fs::remove_file(sock);
-    let l = UnixListener::bind(sock)?;
-    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
-    l.set_nonblocking(true)?;
-    let mut client: Option<UnixStream> = None;
-    let mut buf = vec![0u8; 3840];
-    loop {
-        if let Ok((c, _)) = l.accept() {
-            let _ = c.set_nonblocking(false);
-            let _ = c.set_write_timeout(Some(Duration::from_millis(500)));
-            client = Some(c);
-        }
-        let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: one live pollfd.
-        if unsafe { libc::poll(&mut p, 1, 50) } <= 0 {
-            continue;
-        }
-        // SAFETY: a live fd and a buffer of the length we pass.
-        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if n <= 0 {
-            continue;
-        }
-        if let Some(c) = &mut client
-            && c.write_all(&buf[..n as usize]).is_err()
-        {
-            client = None;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use sv_transport::control::{Geometry, ProtocolIds};
     use sv_transport::region::SharedRegion;
     use sv_transport::wlbytes::Endpoint;
-    use wc_hostint::audio::Device;
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wc-hostint-{tag}-{}-{}", std::process::id(), random_name()));
@@ -1184,7 +735,7 @@ mod tests {
     fn hello_paths_handlers_and_a_request_round_trip() {
         let (owner, linux) = region();
         let dir = tmpdir("svc");
-        let cfg = Config { dir: dir.clone(), opener: Some("/opt/wc/wc-host-open".into()), ..Config::default() };
+        let cfg = Config { dir: dir.clone(), opener: Some("/opt/wc/wc-host-open".into()) };
         let h = start(&linux, cfg.clone()).expect("started");
         let mut host = FakeHost::find(&owner);
         assert_eq!(host.recv(), "hello 1");
@@ -1268,73 +819,6 @@ mod tests {
         assert!(copy_to_drop(dir.to_str().unwrap(), drop.to_str().unwrap()).is_err(), "a directory is refused");
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    struct Counting(Arc<AtomicUsize>);
-    impl StreamSink for Counting {
-        fn play(&mut self, pcm: &[u8]) {
-            self.0.fetch_add(pcm.len(), Ordering::SeqCst);
-        }
-    }
-    struct CountRing(Arc<AtomicUsize>);
-    impl SoundRing for CountRing {
-        fn sink(&self, _: &Node) -> Box<dyn StreamSink> {
-            Box::new(Counting(Arc::clone(&self.0)))
-        }
-        fn source(&self, _: &Node) -> Box<dyn StreamSource> {
-            Box::new(Silence)
-        }
-    }
-
-    /// An output's FIFO is drained into its stream; an input's FIFO gets the
-    /// stream's samples at the device's rate.
-    #[test]
-    fn bridges_move_samples_between_fifos_and_streams() {
-        let dir = tmpdir("bridge");
-        let st = State {
-            devices: vec![
-                Device { dir: Dir::Output, id: "o".into(), description: "Speakers".into(), channels: 2, rate: 48_000 },
-                Device { dir: Dir::Input, id: "i".into(), description: "Mic".into(), channels: 1, rate: 16_000 },
-            ],
-            ..State::default()
-        };
-        let nodes = audio::plan(&st, "win");
-        let d = dir.to_string_lossy().into_owned();
-        let count = Arc::new(AtomicUsize::new(0));
-        let ring = CountRing(Arc::clone(&count));
-        let fo = PathBuf::from(audio::fifo_path(&d, &nodes[0]));
-        let fi = PathBuf::from(audio::fifo_path(&d, &nodes[1]));
-        mkfifo(&fo).unwrap();
-        mkfifo(&fi).unwrap();
-        let b1 = bridge(&nodes[0], &fo, &ring).unwrap();
-        let b2 = bridge(&nodes[1], &fi, &ring).unwrap();
-        // PipeWire's end of the output FIFO.
-        let w = open_fifo(&fo).unwrap();
-        // SAFETY: a live fd and a 1000-byte buffer.
-        unsafe { libc::write(w.as_raw_fd(), [7u8; 1000].as_ptr().cast(), 1000) };
-        wait_for("output drained", || count.load(Ordering::SeqCst) == 1000);
-        // PipeWire's end of the input FIFO: 100 ms of 16 kHz mono is 3200 bytes.
-        std::thread::sleep(Duration::from_millis(100));
-        let r = open_fifo(&fi).unwrap();
-        let mut buf = vec![1u8; 65536];
-        // SAFETY: as above.
-        let n = unsafe { libc::read(r.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        assert!(n >= 2 * 320, "silence arrives in 10 ms chunks ({n})");
-        assert!(buf[..n as usize].iter().all(|b| *b == 0));
-        drop((b1, b2));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn pw_commands_never_inherit_the_session_s_pipewire() {
-        let c = pw_command(Some(Path::new("/pw/bin")), "pw-dump", Path::new("/run/wc/s1/pw/pipewire-0"));
-        assert_eq!(c.get_program(), "/pw/bin/pw-dump");
-        let envs: HashMap<_, _> = c.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
-        assert_eq!(envs["PIPEWIRE_REMOTE"].as_deref(), Some("/run/wc/s1/pw/pipewire-0"));
-        assert_eq!(envs["PIPEWIRE_RUNTIME_DIR"].as_deref(), Some("/run/wc/s1/pw"));
-        assert_eq!(envs["XDG_RUNTIME_DIR"].as_deref(), Some("/run/wc/s1/pw"));
-        assert_eq!(envs["PULSE_SERVER"], None, "removed, not inherited");
-    }
-
     #[test]
     fn host_names_follow_hello() {
         assert_eq!(host_names(Some("windows")), ("Windows", "win"));

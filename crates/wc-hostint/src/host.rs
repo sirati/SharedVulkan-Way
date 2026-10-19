@@ -1,6 +1,6 @@
 //! The host's side of the channel: the security boundary for everything
-//! Linux asks the host to open, and the pushes of the host's audio devices,
-//! handlers and path map.
+//! Linux asks the host to open, and the pushes of the host's handlers and
+//! path map. (The audio devices are the sound ring's, design §103.16.)
 //!
 //! [`Service`] is the decision logic, pure and tested. [`serve`] is the loop
 //! the host's long-lived process runs on its own thread (the Windows
@@ -11,7 +11,6 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::assoc::NEVER_CLAIMED;
-use crate::audio::State;
 use crate::openurl::{dangerous_path, validate_host_path, validate_url, RateLimiter};
 use crate::wire::{Handler, Msg, PathMap, Req, Target, VERSION};
 
@@ -50,13 +49,12 @@ pub struct Service {
     cfg: Config,
     limiter: RateLimiter,
     handlers: Vec<HostHandler>,
-    last_audio: Option<String>,
     last_handlers: Option<String>,
 }
 
 impl Service {
     pub fn new(cfg: Config) -> Self {
-        Self { cfg, limiter: RateLimiter::for_open(), handlers: Vec::new(), last_audio: None, last_handlers: None }
+        Self { cfg, limiter: RateLimiter::for_open(), handlers: Vec::new(), last_handlers: None }
     }
 
     /// The lines that open the conversation: hello, the path map.
@@ -132,15 +130,6 @@ impl Service {
         }
     }
 
-    /// The audio state as a line, or `None` if Linux already has it.
-    pub fn audio(&mut self, s: &State) -> Option<String> {
-        let l = Msg::Audio(s.clone()).encode();
-        (self.last_audio.as_ref() != Some(&l)).then(|| {
-            self.last_audio = Some(l.clone());
-            l
-        })
-    }
-
     /// New handlers: kept for `with` requests, and the offer as a line if it
     /// changed.
     pub fn handlers(&mut self, hs: Vec<HostHandler>) -> Option<String> {
@@ -154,7 +143,6 @@ impl Service {
 
     /// Forget what was sent, so a reconnecting Linux side gets it all again.
     pub fn resend_all(&mut self) {
-        self.last_audio = None;
         self.last_handlers = None;
     }
 }
@@ -177,7 +165,6 @@ pub trait Link {
 
 /// Something the host's other threads tell the service.
 pub enum Event {
-    Audio(State),
     Handlers(Vec<HostHandler>),
     Stop,
 }
@@ -193,7 +180,6 @@ pub fn serve(link: &mut dyn Link, svc: &mut Service, opener: &mut dyn Opener, ev
     loop {
         loop {
             let line = match events.try_recv() {
-                Ok(Event::Audio(s)) => svc.audio(&s),
                 Ok(Event::Handlers(h)) => svc.handlers(h),
                 Ok(Event::Stop) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
@@ -315,11 +301,14 @@ mod tests {
     #[test]
     fn pushes_are_deduplicated() {
         let mut s = win();
-        let st = State::default();
-        assert!(s.audio(&st).is_some());
-        assert!(s.audio(&st).is_none());
+        let hs = vec![HostHandler {
+            offer: Handler { token: "t1".into(), name: "T".into(), mimes: vec![], default_for: vec![], schemes: vec![] },
+            app: "t.exe".into(),
+        }];
+        assert!(s.handlers(hs.clone()).is_some());
+        assert!(s.handlers(hs.clone()).is_none());
         s.resend_all();
-        assert!(s.audio(&st).is_some());
+        assert!(s.handlers(hs).is_some());
     }
 
     struct Script {
@@ -341,7 +330,7 @@ mod tests {
         let mut s = win();
         let mut o = Rec::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(Event::Audio(State::default())).unwrap();
+        tx.send(Event::Handlers(vec![])).unwrap();
         let mut link = Script {
             input: vec![Poll::Idle, Poll::Line(req(1, Req::Url("https://a/".into()))), Poll::Line("hello 1".into())],
             out: vec![],
@@ -349,7 +338,7 @@ mod tests {
         serve(&mut link, &mut s, &mut o, &rx, Duration::from_millis(1), &mut |_| {});
         assert!(link.out[0].starts_with("hello 1 windows"));
         assert!(link.out[1].starts_with("paths "));
-        assert!(link.out[2].starts_with("audio "));
+        assert!(link.out[2].starts_with("handlers "));
         assert_eq!(link.out[3], "rep 1 ok");
         assert!(link.out[4].starts_with("hello 1 windows"), "a Linux hello gets the greeting again");
     }
