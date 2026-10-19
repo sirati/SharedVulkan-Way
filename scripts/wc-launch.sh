@@ -131,6 +131,11 @@ RSVG="${WC_LAUNCH_RSVG:-}"
 # wc-session looks first. Unset, wc-session searches the store.
 PIPEWIRE="${WC_LAUNCH_PIPEWIRE:-}"
 WIREPLUMBER="${WC_LAUNCH_WIREPLUMBER:-}"
+# §106.3: wc-pw-node, the sound ring's native nodes under PipeWire (a pipe
+# module there drops what the ring's credit holds back). A store path on the
+# host, GC-rooted at $HOSTDIR/bin/wc-pw-node; unset and with WC_LAUNCH_PIPEWIRE
+# set, deploy builds `.#wc-pw-node` here and `nix copy`s it to the host.
+PW_NODE="${WC_LAUNCH_PW_NODE:-}"
 AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # §86. The forwarded GPU, **off unless asked for**. WC_LAUNCH_GPU_SESSIONS=N
 # (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
@@ -800,7 +805,16 @@ VK_DRIVER_FILES=$icd_json"
     note "WC_LAUNCH_PULSE unset: wc-session looks for pulseaudio in the host's store, and without one Firefox gets a null audio context"
   fi
   # §106: the session's own PipeWire, for WC_LAUNCH_AUDIO=pipewire.
-  for tool in "pipewire:$PIPEWIRE:pipewire" "wireplumber:$WIREPLUMBER:wireplumber"; do
+  if [ -z "$PW_NODE" ] && [ -n "$PIPEWIRE" ]; then
+    if PW_NODE=$(cd "$ROOT" && nix build --no-link --print-out-paths .#wc-pw-node) \
+        && NIX_SSHOPTS="${SSHOPT[*]}" nix copy --to "ssh://$HOST" "$PW_NODE"; then
+      echo "  wc-pw-node built and copied: $PW_NODE"
+    else
+      bad "wc-pw-node did not build or copy: under PipeWire the sound ring falls back to pipe modules, which drop"
+      PW_NODE=""
+    fi
+  fi
+  for tool in "pipewire:$PIPEWIRE:pipewire" "wireplumber:$WIREPLUMBER:wireplumber" "wc-pw-node:$PW_NODE:wc-pw-node"; do
     IFS=: read -r pkg path bin <<<"$tool"
     [ -n "$path" ] || continue
     if h "nix-store -r $path --add-root $HOSTDIR/bin/$pkg --indirect >/dev/null && test -x $HOSTDIR/bin/$pkg/bin/$bin"; then

@@ -523,7 +523,10 @@ audio_up() {
     # second session running at the same time (macOS runs one per application)
     # failed with "D-Bus name org.PulseAudio1 already taken" and had no sound.
     # The null sink and the monitor socket need no D-Bus at all.
-    echo 'unset DBUS_SESSION_BUS_ADDRESS'
+    # Unset is not enough: libdbus then finds $XDG_RUNTIME_DIR/bus, the
+    # user's own session bus (measured: a second session failed with the same
+    # "already taken" while another's PulseAudio held the name). No bus at all.
+    echo 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     # §103.16: WC_LAUNCH_AUDIO_NULL_SINK=off leaves the null sink and its
     # monitor out: a sound ring's devices are then the session's only ones.
@@ -586,6 +589,12 @@ audio_up() {
 # The binaries, like pulse_bin: `$BIN/pipewire` and `$BIN/wireplumber`
 # (GC-rooted links the deploy step chose), then PATH, then the store.
 pw_bin() { store_tool pipewire "$1"; }
+# §106.3: the sound ring's native nodes under PipeWire (nix/wc-pw-node.nix):
+# `$BIN/wc-pw-node`, the GC root the deploy step makes, then the store.
+pw_node_bin() {
+  if [ -x "$BIN/wc-pw-node/bin/wc-pw-node" ]; then echo "$BIN/wc-pw-node/bin/wc-pw-node"; return 0; fi
+  store_tool wc-pw-node wc-pw-node
+}
 wp_bin() {
   if [ -x "$BIN/wireplumber/bin/wireplumber" ]; then echo "$BIN/wireplumber/bin/wireplumber"; return 0; fi
   store_tool wireplumber wireplumber
@@ -1392,6 +1401,17 @@ proxy)
       pulse|pipewire) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix mac' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
       system|user-pipewire) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix mac' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
     esac
+    # §106.3: under PipeWire every device is a native node of wc-pw-node,
+    # paced by the ring's credit (a pipe module there drops). The proxy asks
+    # the server what it is and uses the pipe modules on a PulseAudio.
+    PWNODE=$(pw_node_bin 2>/dev/null)
+    case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+      pipewire) PWSOCK="$D/pw/pipewire-0" ;;
+      system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
+      *) PWSOCK="" ;;
+    esac
+    [ -n "$PACTL" ] && [ -n "$PWNODE" ] && [ -S "$PWSOCK" ] \
+      && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pw-node %q --sound-pipewire %q' "$PWNODE" "$PWSOCK")"
   else
     [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
     UPSTREAM_ARGS=$(printf -- '--upstream %q' "$D/up.sock")
