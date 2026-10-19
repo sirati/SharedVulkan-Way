@@ -185,6 +185,8 @@ mod tests {
         // (kAudioObjectPropertyName), with UID
         // "AppleUSBAudioEngine:QEMU:QEMU USB Audio:1-0000:00:01.0-3:1".
         assert_eq!(slugify("Audio Output - Disabled"), "audio_output_-_disabled");
+        // With a virtio-sound-pci device (input and output, UID "AVIODevice").
+        assert_eq!(slugify("Apple Virtual Sound Device"), "apple_virtual_sound_device");
         assert_eq!(slugify("  Ünïcode  / weird!! "), "n_code_weird");
         assert_eq!(slugify("***"), "device");
         assert_eq!(slugify("a.b\"c"), "a_b_c");
