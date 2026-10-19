@@ -194,6 +194,7 @@ mod tests {
             desktop: "firefox".into(),
             app_id: String::new(),
             taskbar_id: crate::config::TaskbarId::Install,
+            single: false,
         }
     }
 

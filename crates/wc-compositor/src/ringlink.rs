@@ -60,7 +60,7 @@ struct Link {
     /// §107: the session the proxy that claimed it said it is (0: none).
     session: u8,
     /// The owner id it was claimed with: which client connection it is, or
-    /// which one it is a feed for (§107.12).
+    /// which one it is a feed for (§107.10).
     owner: u64,
     accepted_at: std::time::Instant,
     channel: ByteChannel,
@@ -398,7 +398,7 @@ impl RingLink {
         self.close_orphan_feeds();
     }
 
-    /// §107.12: a feed whose client connection has gone is closed, in case
+    /// §107.10: a feed whose client connection has gone is closed, in case
     /// its proxy did not close it. A proxy's icon and clipboard feeds live
     /// and die with the connection they serve; one left behind is a Wayland
     /// client that is no application, and it used to keep its session up for
@@ -450,7 +450,7 @@ impl RingLink {
     }
 
     /// §107: how many application connections each session has now. Feeds
-    /// are not counted (§107.12): they keep no session alive.
+    /// are not counted (§107.10): they keep no session alive.
     pub fn connections_by_session(&self) -> std::collections::HashMap<u8, usize> {
         let mut m = std::collections::HashMap::new();
         for l in self.links.iter().filter(|l| !l.dead && !sv_transport::wlbytes::is_feed(l.owner)) {
@@ -986,7 +986,7 @@ pub const SLOTS_PER_SESSION: usize = 28;
 
 pub const QUARANTINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// §107.12: how long a feed may be connected without the client connection
+/// §107.10: how long a feed may be connected without the client connection
 /// it serves before [`RingLink::pump`] closes it.
 pub const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -1040,7 +1040,7 @@ mod feed_tests {
         (RingLink::over(Arc::new(owner)), Control::attach(r, ids).unwrap())
     }
 
-    /// §107.12: a feed is a client to smithay and nothing more. It does not
+    /// §107.10: a feed is a client to smithay and nothing more. It does not
     /// count as a session's connection, and once the connection it serves
     /// has gone it is closed even if its proxy never closes it -- the wcns
     /// session of 2026-10-19 that stayed up past its linger for ever.

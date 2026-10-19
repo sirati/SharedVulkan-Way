@@ -229,7 +229,7 @@ impl BellHub {
 /// thread copies both ways and polls when idle; the feeds are small and rare.
 /// Returns this process's end.
 ///
-/// **Every way out ends the ring** (§107.12). The compositor counts a feed as
+/// **Every way out ends the ring** (§107.10). The compositor counts a feed as
 /// connected until it sees the end of the stream or the slot marked dead, so
 /// a bridge that returned on an error with neither kept its session alive for
 /// ever. The usual such error is `ECONNRESET`: a feed dropped while bytes the
@@ -526,7 +526,7 @@ mod tests {
         false
     }
 
-    /// The 2026-10-19 wcns session that never ended (§107.12): a feed dropped
+    /// The 2026-10-19 wcns session that never ended (§107.10): a feed dropped
     /// with bytes it had not read yet gets `ECONNRESET` on the bridge's side
     /// of the pair, not end of file. The bridge used to return on that with
     /// no word to the ring, so the compositor kept the feed as a connected

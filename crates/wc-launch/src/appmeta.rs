@@ -258,7 +258,7 @@ pub fn lang_candidates(ui: &str) -> Vec<String> {
 /// does not ship: they are in `browser/taskbar.ftl`, built only for Windows.
 /// English and German; any other language gets the English.
 pub fn mozilla_label(key: &str, langs: &[String]) -> &'static str {
-    let de = langs.iter().any(|l| l == "de" || l.starts_with("de-") || l.starts_with("de_"));
+    let de = crate::single::german(langs);
     let pick = |en: &'static str, de_s: &'static str| if de { de_s } else { en };
     match key {
         "frequent" => pick("Frequent", "Häufig"),

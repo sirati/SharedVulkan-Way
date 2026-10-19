@@ -739,7 +739,7 @@ pub struct ClientState {
     /// the session index in its ring slot's owner id. 0 for a socket client and
     /// for every client of a single-session compositor.
     pub session: u8,
-    /// §107.12: a proxy's icon or clipboard feed rather than an application.
+    /// §107.10: a proxy's icon or clipboard feed rather than an application.
     /// Counted as a client by smithay, never as a reason to keep a session up.
     pub feed: bool,
 }
@@ -754,7 +754,7 @@ impl ClientState {
         ClientState { index, session, ..Default::default() }
     }
 
-    /// §107.12: a feed of session `session`.
+    /// §107.10: a feed of session `session`.
     pub fn feed_in_session(index: u32, session: u8) -> ClientState {
         ClientState { index, session, feed: true, ..Default::default() }
     }

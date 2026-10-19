@@ -2100,7 +2100,7 @@ fn wayland_thread(
         let mut ids = Vec::new();
         display.handle().backend_handle().with_all_clients(|id| ids.push(id));
         let live = ids.len() as u32;
-        // §107.12: the clients that keep a session up are the applications.
+        // §107.10: the clients that keep a session up are the applications.
         // A proxy's icon and clipboard feeds are clients to smithay and no
         // reason to stay: one its proxy failed to close kept the wcns session
         // of 2026-10-19 up for eight minutes past its linger, until `--stop`.
