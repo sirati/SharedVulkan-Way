@@ -57,7 +57,7 @@ pub fn parse_signed(line: &str, install: &str) -> Result<(wc_handle::macboot::Au
 #[cfg(unix)]
 pub use unix_client::Client;
 #[cfg(unix)]
-pub use process::{install_hooks, open_path, region_spec};
+pub use process::{close_region, find_region, install_hooks, open_path, open_region, own_connection, region_spec};
 
 /// §111.10: what a session's process on the client role's host uses in place
 /// of opening the raw devices itself. A path `broker:ID` is region `ID`, which
@@ -140,6 +140,36 @@ mod process {
     /// broker connection. Harmless to call more than once.
     pub fn install_hooks() {
         sv_transport::brokered::install(connect_service);
+    }
+
+    /// A lease on the live region of this user's pool `pool` (`find`, e.g.
+    /// `gpu.<k>`), on this process's one connection. It ends with
+    /// [`close_region`], or with the process.
+    pub fn find_region(pool: &str) -> io::Result<(crate::proto::RegionReply, Vec<OwnedFd>)> {
+        with_client(|c| c.find(pool))
+    }
+
+    /// A lease on region `id`, on this process's one connection.
+    pub fn open_region(id: u64) -> io::Result<(crate::proto::RegionReply, Vec<OwnedFd>)> {
+        with_client(|c| c.open(id))
+    }
+
+    /// One lease of this process's connection on region `id` ends.
+    pub fn close_region(id: u64) -> io::Result<()> {
+        with_client(|c| c.close(id))
+    }
+
+    /// A connection of its own, for leases held on behalf of one of several
+    /// clients this process serves (the proxy's Wayland clients, each a
+    /// sandboxed process that reaches only the Wayland socket, §112): every
+    /// lease taken on it ends when it is dropped, whatever else this process
+    /// holds. Leases for the process itself go on the shared connection
+    /// ([`find_region`], [`open_region`], [`open_path`]); the broker watches
+    /// the process through both.
+    pub fn own_connection(role: &str) -> io::Result<Client> {
+        let mut c = Client::connect(&super::path())?;
+        c.hello(role)?;
+        Ok(c)
     }
 }
 
