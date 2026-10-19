@@ -74,6 +74,13 @@ pub fn start(ch: ByteChannel, cfg: &Config, mut say: Say) {
     say(&format!("hostint: serving, browser {:?}, share {:?}", opener.browser, path_map(cfg)));
     // Sleeps on the lane's doorbell (macos-zero-copy), not a poll.
     let wait = wc_compositor::hostint::doorbell_wait();
+    // Each open on a worker, at most 2 s before the loop answers without
+    // it: a TCC dialog must not stop the channel (bounded.rs).
+    use wc_hostplat::mac::bounded::{Bounded, ASKING, WAIT};
+    let asking: wc_hostplat::mac::bounded::OnTimeout = std::sync::Arc::new(|| {
+        if wc_hostplat::mac::open::permission_dialog_up() { Err(ASKING.into()) } else { Ok(()) }
+    });
+    let opener = Bounded::new(opener, WAIT, asking);
     if let Err(e) = wc_compositor::hostint::spawn(ch, wait, svc, Box::new(opener), rx, say) {
         eprintln!("wc-launch: hostint: {e}");
     }

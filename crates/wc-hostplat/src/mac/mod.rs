@@ -14,6 +14,7 @@
 //! The main process wires them to the `OWNER_HOSTINT` ring slot
 //! (`wc-launch`'s `mac_hostint.rs`).
 
+pub mod bounded;
 pub mod plan;
 
 #[cfg(target_os = "macos")]

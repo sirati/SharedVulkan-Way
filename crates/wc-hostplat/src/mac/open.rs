@@ -183,3 +183,18 @@ impl Opener for MacOpener {
         run_open(&open_with_argv(app, target))
     }
 }
+
+/// Whether macOS is showing a permission dialog now. On Sonoma the TCC
+/// prompts ("would like to access the microphone", "… files on a network
+/// volume") are drawn by `UserNotificationCenter`, which runs only while
+/// such a dialog is up (seen on the VM: present with every prompt, absent
+/// otherwise). Used only to word the reply to an open that has not finished
+/// in time (`bounded::Bounded`), never to decide whether to open.
+pub fn permission_dialog_up() -> bool {
+    std::process::Command::new("/usr/bin/pgrep")
+        .args(["-x", "UserNotificationCenter"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
