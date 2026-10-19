@@ -34157,3 +34157,38 @@ agent:
   nothing, playback blocks and an open times out after 5 s, because the
   microphone's start and the open block the threads they run on. 106.8 has
   the fix.
+
+### 106.8 Not done, not proven, and known defects
+
+* **The real Mac (role (b)) has not run any of this.** The Linux side is the
+  same code. The Mac side is §103.13's main process and faces with the
+  pieces above. Signing the host bundle with a stable local certificate is
+  the Nix activation's job (the prototype's `stable-codesign.nix`). Until
+  then TCC asks for the microphone again after every rebuild. In the VM the
+  binary is unsigned.
+* **The fix for the session stalling while a TCC dialog waits** is code- and
+  unit-tested (the microphone opens on a thread of its own per input; an
+  open for Linux runs on a worker and is answered within 2 s), and has not
+  been re-run in the VM. Its check: reset both grants, then record and play
+  while the dialog is up.
+* **Windows never has a Linux application as a default by itself.**
+  `UserChoice` is protected, so the registration offers the application in
+  "Open with" and in Settings' Default apps, and the user chooses. The same
+  holds on macOS, where the bundles claim their types at rank `Alternate`.
+* **Copies are not cleaned up, and edits to them do not go back.** A host
+  file outside the share, or a Linux file outside it opened with a host
+  application, is copied into the drop directory. Nothing deletes those
+  copies yet, and what an application saves goes into the copy.
+* **Handlers are enumerated again on a timer** (Windows every 10 minutes,
+  macOS every minute), not when an application is installed.
+* **The macOS VM's share** needs the virtiofsd flags of 106.6. The
+  `macos-vm` manager does not add them by itself; the test added them to
+  `qemu_extra` and took them out again.
+* **`user-pipewire`** was tested only for its refusal of the wrong user. It
+  is meant for the real Mac's Linux VM, whose desktop user's PipeWire
+  provides the devices.
+* **`wc-pw-node`'s closure** is PipeWire's own, about 754 MB. A VM host
+  that runs `pipewire` mode needs it anyway.
+* **Windows' default-browser path** (`ShellExecuteW` with the URL) ran only
+  under Wine. On the guest the run opened links in a configured browser
+  with a throwaway profile, so that nothing touched the user's own.
