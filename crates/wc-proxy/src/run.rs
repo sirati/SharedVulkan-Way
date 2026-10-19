@@ -51,6 +51,8 @@ struct Args {
     wayland_rings_plan: Option<PathBuf>,
     /// §103.14: the session's control and sound channels on those rings.
     services: wc_proxy::macsvc::Services,
+    /// §106: host integration on the rings, when `--hostint DIR` is given.
+    hostint: wc_proxy::hostint::Config,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -177,6 +179,20 @@ usage: wc-proxy --upstream <path> [options]
                          a connection that cannot have a ring falls back to it,
                          loudly
   --wayland-bell PATH    §89: QEMU's socket for the rings' virtio-serial port
+  --hostint DIR          §106: serve host integration on the rings' OWNER_HOSTINT
+                         slot, with the session's run directory DIR (desktop
+                         entries, mimeapps.list, DIR/hostint.sock for
+                         wc-host-open). Only with rings; ignored otherwise
+  --hostint-opener PATH  §106: wc-host-open, for the desktop entries' Exec=
+                         (default: beside this executable)
+  --sound-prefix P       §103.16: the sound ring's device side, win or mac
+                         (default mac): sinks and sources are P.sink.<slug> and
+                         P.source.<slug> of the host's device names
+  --sound-pw-node PATH   §106.3: wc-pw-node, and
+  --sound-pipewire SOCK  the session PipeWire's socket: if the pulse server is
+                         PipeWire, every device is a native node that drives
+                         its graph at the pace of the ring's credit, instead of
+                         a pipe module (which drops under PipeWire)
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -283,6 +299,7 @@ fn parse_args() -> Result<Args, String> {
         wayland_bell: None,
         wayland_rings_plan: None,
         services: Default::default(),
+        hostint: Default::default(),
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -341,12 +358,17 @@ fn parse_args() -> Result<Args, String> {
                 a.services.index = v.parse().map_err(|_| format!("--session-index {v}: 0..255"))?;
             }
             "--audio-socket" => a.services.audio = Some(next()?.into()),
+            "--hostint" => a.hostint.dir = next()?.into(),
+            "--hostint-opener" => a.hostint.opener = Some(next()?.into()),
             "--sound-pactl" => a.services.sound.get_or_insert_with(Default::default).pactl = next()?.into(),
             "--sound-server" => {
                 let v = next()?;
                 a.services.sound.get_or_insert_with(Default::default).server = (!v.is_empty()).then_some(v);
             }
             "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
+            "--sound-prefix" => a.services.sound.get_or_insert_with(Default::default).prefix = next()?,
+            "--sound-pw-node" => a.services.sound.get_or_insert_with(Default::default).pw_node = Some(next()?.into()),
+            "--sound-pipewire" => a.services.sound.get_or_insert_with(Default::default).pipewire = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -452,6 +474,10 @@ pub fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("desktop") {
         return wc_proxy::desktop::cli(&argv[2..]);
+    }
+    // §106: `wc-host-open` under this binary's name too.
+    if argv.get(1).map(String::as_str) == Some("host-open") {
+        return wc_proxy::hostint::open_cli(&argv[2..]);
     }
     let args = match parse_args() {
         Ok(a) => a,
@@ -908,6 +934,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
         );
         wc_proxy::macsvc::start(&control, &args.services);
+        // §106: host integration, for the life of the process (dropping the
+        // handle detaches its threads).
+        if !args.hostint.dir.as_os_str().is_empty() {
+            let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+        }
         Some(control)
     } else if args.wayland_rings && args.upstream.as_os_str().is_empty() {
         // §105: the Windows guest's rings with no socket at all. Every
@@ -950,6 +981,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => println!("[proxy] session {}: NO ARENA SLOT ({e}); every pool will be refused", args.services.index),
             }
         }
+        // §106: host integration on its slot; the compositor opens it.
+        if !args.hostint.dir.as_os_str().is_empty() {
+            let _ = wc_proxy::hostint::start_indexed(&control, args.hostint.clone(), args.services.index);
+        }
         Some(control)
     } else if args.wayland_rings {
         let up = args.upstream.display();
@@ -966,6 +1001,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         bell.display()
                     );
                     doorbell = Some(d);
+                    // §106: the compositor opens this slot once windows-no-ssh
+                    // lands; until then it is claimed and waits.
+                    if !args.hostint.dir.as_os_str().is_empty() {
+                        let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+                    }
                     Some(control)
                 }
                 Err(e) => {

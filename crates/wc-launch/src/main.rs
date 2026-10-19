@@ -33,6 +33,8 @@ mod floor;
 mod appmeta;
 mod audio;
 mod config;
+// §106: types registered with Windows, and `--file`.
+mod hostint;
 mod ico;
 // §103.8: the macOS bundle's contents (pure, tested everywhere) and the macOS
 // launcher itself.
@@ -40,8 +42,9 @@ mod ico;
 mod macbundle;
 #[cfg(target_os = "macos")]
 mod mac;
+// §106: the macOS main process's host integration.
 #[cfg(target_os = "macos")]
-mod audio_mac;
+mod mac_hostint;
 #[cfg(target_os = "macos")]
 mod sound_mac;
 mod plan;
@@ -390,6 +393,11 @@ fn run(
     let mut ping = false;
     let mut request = Request::Run;
     let mut refresh_only: Option<&str> = None;
+    // §106 (begin): a file to open with the application, and uninstalling
+    // the registration of types.
+    let mut file: Option<&str> = None;
+    let mut uninstall_assoc: Option<Option<&str>> = None;
+    // §106 (end)
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -421,6 +429,18 @@ fn run(
             "--session-name" => {
                 it.next();
             }
+            // §106 (begin). What the registration's command line runs for a
+            // file of a registered type: `<section> --file "%1"`.
+            "--file" => file = Some(it.next().map(String::as_str).unwrap_or("")),
+            // `--uninstall-assoc [SECTION]`: this installation's registrations.
+            "--uninstall-assoc" => {
+                let next = it.clone().next().filter(|n| !n.starts_with("--"));
+                if next.is_some() {
+                    it.next();
+                }
+                uninstall_assoc = Some(next.map(String::as_str));
+            }
+            // §106 (end)
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => app = Some(other),
         }
@@ -438,6 +458,16 @@ fn run(
     if let Some(id) = install {
         return win::install(cfg, p, log, id);
     }
+    // §106 (begin)
+    if let Some(section) = uninstall_assoc {
+        return hostint::uninstall(&p.apps, section, log);
+    }
+    let file_url;
+    if let Some(f) = file {
+        file_url = hostint::file_url(cfg, f, log)?;
+        request = Request::Open(&file_url);
+    }
+    // §106 (end)
     if let Some(id) = refresh_only {
         cfg.app(id)?;
         win::refresh(cfg, p, log, id, win::Refresh::Full);
@@ -1758,6 +1788,9 @@ mod win {
         let path = desktop.join(format!("{}.lnk", file_name(&app.title)));
         crate::shell::save_link(&shortcut(p, id, app), &path)?;
         log.say(&format!("installed {}", path.display()));
+        // §106: the types its desktop entry opens, from the host's answer
+        // that `refresh` just cached. `--uninstall-assoc` takes them back.
+        crate::hostint::deploy(cfg, &p.apps, &exe_path(), icon_path(p, id).as_deref(), id, cached_meta(p, id).as_ref(), log);
         Ok(())
     }
 

@@ -893,6 +893,22 @@ fn services(sess: Arc<Sess>) {
             match session_channel(&s, OWNER_AUDIO, Duration::from_secs(20)) {
                 Some(ch) => {
                     say(&format!("audio: the session's sound ring is slot {} (§103.16, no ssh){}", ch.slot(), index_note(&s)));
+                    // §106.3: every endpoint a stream, both directions, the
+                    // defaults following Windows'. The single default-output
+                    // player stays for the Linux test fixture.
+                    #[cfg(windows)]
+                    {
+                        let _ = vol;
+                        match crate::ringlink::shared_control() {
+                            Some(control) => {
+                                if let Err(e) = crate::sound_win::serve(ch, &control, say) {
+                                    say(&format!("audio: the sound ring: {e}; no sound this session"));
+                                }
+                            }
+                            None => say("audio: no control region; no sound this session"),
+                        }
+                    }
+                    #[cfg(not(windows))]
                     sound_ring(ch, vol);
                 }
                 None => say("audio: the host opened no sound ring; no sound this session"),
@@ -904,6 +920,27 @@ fn services(sess: Arc<Sess>) {
         let _ = std::thread::Builder::new().name("session-arena".into()).spawn(move || serve_arena(s));
         let (ctl, s) = (Arc::clone(&ctl), Arc::clone(&sess));
         let _ = std::thread::Builder::new().name("session-watch".into()).spawn(move || watch(ctl, s));
+    }
+    // §106: host integration (links and files both ways) on its own slot and
+    // thread, when the launcher passed `--hostint`. Not on macOS: there the
+    // main process serves the slot itself (wc-launch mac_hostint.rs), in
+    // both roles.
+    #[cfg(not(target_os = "macos"))]
+    if let Some(hcfg) = crate::hostint::configured() {
+        // §107: the session's own slot, its index in the owner id.
+        let hs = Arc::clone(&sess);
+        let _ = std::thread::Builder::new().name("session-hostint".into()).spawn(move || {
+            match session_channel(&hs, sv_transport::wlbytes::OWNER_HOSTINT, Duration::from_secs(20)) {
+                Some(ch) => {
+                    say(&format!("hostint: on ring slot {} (no ssh)", ch.slot()));
+                    #[cfg(windows)]
+                    crate::hostint::start_windows(ch, hcfg, say);
+                    #[cfg(target_os = "linux")]
+                    crate::hostint::start_logging(ch, hcfg, say);
+                }
+                None => say("hostint: the host opened no host-integration slot; links and files stay on their side"),
+            }
+        });
     }
     // [hostint hook] A further service channel (e.g. OWNER_HOSTINT) is opened
     // here, on a thread of its own, with `session_channel(&sess, owner, wait)`
@@ -1135,9 +1172,11 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
 }
 
 /// The output stream this side announces: Windows' default output device.
+#[cfg(not(windows))]
 const OUT_STREAM: u16 = 1;
 /// What the session may send before the device has played anything: 80 ms.
 /// With the device's own queue (`audio::BUFFERS`) that bounds the delay.
+#[cfg(not(windows))]
 const CREDIT_INIT: u32 = 4 * 3840;
 
 /// §103.16 on Windows: this side is the **device side** of the sound ring.
@@ -1146,6 +1185,7 @@ const CREDIT_INIT: u32 = 4 * 3840;
 /// credit), plays what arrives through waveOut, and gives the credit back as
 /// it hands each chunk to the device. Nothing is dropped on the way: a device
 /// that is slow slows the sink. Microphones are not announced (see §105).
+#[cfg(not(windows))]
 fn sound_ring(ch: ByteChannel, vol: u8) {
     use sv_transport::soundring::{Dir, Msg, VERSION};
     let Some(control) = crate::ringlink::shared_control() else { return };
@@ -1184,18 +1224,6 @@ fn sound_ring(ch: ByteChannel, vol: u8) {
     link.send(Msg::Default { stream: OUT_STREAM, dir: Dir::Out });
     link.send(Msg::Credit { stream: OUT_STREAM, bytes: CREDIT_INIT });
     play(rx, vol, link);
-}
-
-#[cfg(windows)]
-fn play(rx: std::sync::mpsc::Receiver<Vec<u8>>, vol: u8, link: sv_transport::soundring::Link) {
-    use sv_transport::soundring::Msg;
-    let credit = |n: u32| {
-        link.send(Msg::Credit { stream: OUT_STREAM, bytes: n });
-    };
-    match crate::audio::play_credited(rx, vol, say, credit) {
-        Ok(st) => say(&st.line()),
-        Err(e) => say(&format!("audio: {e}; no sound this session")),
-    }
 }
 
 #[cfg(not(windows))]

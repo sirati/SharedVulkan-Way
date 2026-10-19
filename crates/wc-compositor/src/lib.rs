@@ -53,11 +53,16 @@ pub mod grow;
 /// docs/waycompose-design.md §96: pointer locks, confinement and relative motion,
 /// the part of them that is arithmetic.
 mod hold;
+/// §106: the host-integration channel, served by the process that owns the rings.
+pub mod hostint;
 mod icon;
 mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
 mod ringlink;
+/// §103.16: the Windows device end of the sound ring (every endpoint a
+/// stream). Its diffing is pure and tested everywhere.
+pub mod sound_win;
 // §105: the session's boot, control, lease and sound on the ivshmem rings.
 mod session_svc;
 // §105: the session's sound is played by this process, which holds its ring.
@@ -102,7 +107,7 @@ pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_bo
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
 /// §103.13: the main process's socket, service and the launcher's hooks.
 #[cfg(target_os = "macos")]
-pub use platform::macos_router::{set_face_hooks, socket_path, FaceHooks, SERVICE as FACE_SERVICE};
+pub use platform::macos_router::{set_face_hooks, socket_path, yield_activation_to, FaceHooks, SERVICE as FACE_SERVICE};
 #[cfg(target_os = "macos")]
 pub use platform::faceproto::face_ids;
 use smithay::utils::os::FdEncoding;
@@ -405,6 +410,15 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
+        // §106: host integration's path map and browser.
+        match hostint::parse_flag(&arg, &mut || it.next()) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("wc-compositor: {e}");
+                return Err(2);
+            }
+        }
         // §105: the boot record, the launcher's control socket and the sound.
         match session_svc::parse_flag(&arg, &mut || it.next()) {
             Ok(true) => continue,
