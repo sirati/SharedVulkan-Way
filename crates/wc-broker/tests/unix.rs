@@ -31,7 +31,8 @@ fn start(d: &Path, other_only: bool) -> String {
             DevicePath { name: "port".into(), path: d.join("port") },
         ],
     )
-    .unwrap();
+    .unwrap()
+    .with_services(vec![DevicePath { name: "hub".into(), path: d.join("hub.sock") }]);
     let devices = vec![
         DeviceSpec { name: "arena".into(), allow: Allow::AnyUser },
         DeviceSpec {
@@ -39,7 +40,10 @@ fn start(d: &Path, other_only: bool) -> String {
             allow: if other_only { Allow::Users(vec![User::uid(4_000_000)]) } else { Allow::AnyUser },
         },
     ];
-    let b = Broker::new(unix, Config { devices, release: Release::OwnerFree, budget: Some(64 << 20), run: 7 });
+    std::fs::create_dir_all(d.join("keys")).unwrap();
+    let services = vec![DeviceSpec { name: "hub".into(), allow: Allow::AnyUser }];
+    let config = Config { devices, services, keys: Some(d.join("keys")), release: Release::OwnerFree, budget: Some(64 << 20), run: 7 };
+    let b = Broker::new(unix, config);
     std::thread::spawn(move || b.serve());
     sock.to_string_lossy().into_owned()
 }
@@ -171,5 +175,71 @@ fn a_region_is_shared_kept_after_its_owner_and_adopted() {
     assert_eq!(c.adopt("gpu").unwrap(), vec![(r.id, 1 << 20)]);
     c.free(r.id).unwrap();
     assert!(c.stats().unwrap().contains("regions=0"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §111.6: the broker signs a boot record with the key only it can read and
+/// the identity the kernel gave it; the caller names neither.
+#[test]
+fn a_record_is_signed_for_the_caller_and_only_with_a_key() {
+    use wc_broker::proto::SignReq;
+    use wc_handle::macboot::{Record, parse_key};
+    let d = dir("sign");
+    let sock = start(&d, false);
+    let mut me = Client::connect(&sock).unwrap();
+    let req = SignReq {
+        install: "wcivs".into(),
+        session: "wcivs-1".into(),
+        index: 2,
+        arena_run: 0xABCD,
+        arena_pages: 32768,
+        outbound: 1 << 20,
+        rings_run: 0xABCD,
+        rings_pages: 1536,
+        gpu: false,
+        seq: 4,
+    };
+    assert!(me.sign(&req).unwrap_err().to_string().contains("no key for installation wcivs"));
+    let hex = "11".repeat(32);
+    std::fs::write(d.join("keys/wcivs.key"), &hex).unwrap();
+    let (auth, id) = me.sign(&req).unwrap();
+    // SAFETY: no arguments.
+    let uid = unsafe { libc::geteuid() };
+    assert_eq!(id.id, uid.to_string());
+    assert_eq!(id.os, if cfg!(target_os = "macos") { "macos" } else { "linux" });
+    let rec = Record {
+        session: req.session.clone(),
+        arena_run: req.arena_run,
+        arena_pages: req.arena_pages,
+        outbound: req.outbound,
+        rings_run: req.rings_run,
+        rings_pages: req.rings_pages,
+        gpu: req.gpu,
+    };
+    let key = parse_key(&hex).unwrap();
+    assert!(auth.verifies_identity(&rec, 2, Some(&id), &key));
+    let other = wc_handle::macboot::Identity { user: "someone-else".into(), ..id.clone() };
+    assert!(!auth.verifies_identity(&rec, 2, Some(&other), &key));
+    assert!(me.sign(&SignReq { install: "../x".into(), ..req }).is_err());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `connect` gives a fresh connection to a local service each time.
+#[test]
+fn a_service_is_reached_through_the_broker() {
+    let d = dir("connect");
+    let sock = start(&d, false);
+    let hub = std::os::unix::net::UnixListener::bind(d.join("hub.sock")).unwrap();
+    let mut me = Client::connect(&sock).unwrap();
+    for i in 0..2u8 {
+        let fd = me.connect_service("hub").unwrap();
+        let (mut s, _) = hub.accept().unwrap();
+        let mut c = std::os::unix::net::UnixStream::from(fd);
+        c.write_all(&[i]).unwrap();
+        let mut b = [9u8];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(b[0], i);
+    }
+    assert!(me.connect_service("nope").unwrap_err().to_string().contains("no service"));
     let _ = std::fs::remove_dir_all(&d);
 }

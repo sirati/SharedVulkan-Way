@@ -37,6 +37,23 @@ fn refused(line: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, proto::reply_error(line))
 }
 
+/// An `ok signed SEQ MAC IDENTITY...` reply, for any platform's client.
+pub fn parse_signed(line: &str, install: &str) -> Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String> {
+    let rest = line.strip_prefix("ok signed ").ok_or_else(|| crate::proto::reply_error(line))?;
+    let mut w = rest.splitn(3, ' ');
+    let seq: u64 = w.next().and_then(|s| s.parse().ok()).ok_or("seq")?;
+    let hex = w.next().ok_or("mac")?;
+    let identity = wc_handle::macboot::Identity::parse(w.next().ok_or("identity")?).ok_or("identity")?;
+    if hex.len() != 64 {
+        return Err("mac".into());
+    }
+    let mut mac = [0u8; 32];
+    for (i, b) in mac.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| "mac")?;
+    }
+    Ok((wc_handle::macboot::Auth { installation: install.to_string(), seq, mac }, identity))
+}
+
 #[cfg(unix)]
 pub use unix_client::Client;
 
@@ -140,6 +157,22 @@ mod unix_client {
                     Some((a.parse().ok()?, b.parse().ok()?))
                 })
                 .collect())
+        }
+
+        /// A fresh connection to local service `name`, made by the broker.
+        pub fn connect_service(&mut self, name: &str) -> io::Result<OwnedFd> {
+            let (l, mut fds) = self.call(&Request::Connect { name: name.into() })?;
+            if !l.starts_with("ok connect") || fds.len() != 1 {
+                return Err(io::Error::other(format!("connect {name}: {l} with {} fd(s)", fds.len())));
+            }
+            Ok(fds.remove(0))
+        }
+
+        /// The broker's signature over a boot record, and the identity it
+        /// signed it for (§111.6).
+        pub fn sign(&mut self, req: &crate::proto::SignReq) -> io::Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity)> {
+            let (l, _) = self.call(&Request::Sign(req.clone()))?;
+            super::parse_signed(&l, &req.install).map_err(io::Error::other)
         }
 
         pub fn subscribe(&mut self) -> io::Result<()> {

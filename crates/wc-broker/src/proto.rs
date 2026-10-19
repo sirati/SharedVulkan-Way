@@ -12,8 +12,11 @@
 //! close ID                      -> ok
 //! free ID                       -> ok
 //! adopt POOL                    -> ok adopted [ID:LEN ...]
+//! connect NAME                  -> ok connect NAME HANDLE   (a fresh connection to a local service)
+//! sign INSTALL SESSION INDEX ARUN APAGES OUTBOUND RRUN RPAGES GPU SEQ
+//!                               -> ok signed SEQ MAC IDENTITY...
 //! subscribe                     -> ok
-//! stats                         -> ok stats K=V ...
+//! stats                        -> ok stats K=V ...
 //! anything refused              -> err WHY
 //! ```
 //!
@@ -38,8 +41,26 @@ pub enum Request {
     Close { id: u64 },
     Free { id: u64 },
     Adopt { pool: String },
+    Connect { name: String },
+    Sign(SignReq),
     Subscribe,
     Stats,
+}
+
+/// `sign`: the boot record a compositor is about to publish (§111.6). The
+/// identity is never in the request: the broker reads it from the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignReq {
+    pub install: String,
+    pub session: String,
+    pub index: u8,
+    pub arena_run: u64,
+    pub arena_pages: u32,
+    pub outbound: u64,
+    pub rings_run: u64,
+    pub rings_pages: u32,
+    pub gpu: bool,
+    pub seq: u64,
 }
 
 /// The longest line either side accepts.
@@ -98,6 +119,32 @@ impl Request {
                 arity(2)?;
                 Request::Adopt { pool: name(1)? }
             }
+            "connect" => {
+                arity(2)?;
+                Request::Connect { name: name(1)? }
+            }
+            "sign" => {
+                arity(11)?;
+                let small = |i: usize| -> Result<u32, String> {
+                    u32::try_from(num(i)?).map_err(|_| format!("{} is too large", w[i]))
+                };
+                Request::Sign(SignReq {
+                    install: name(1)?,
+                    session: name(2)?,
+                    index: u8::try_from(num(3)?).map_err(|_| "the index is 0..=255".to_string())?,
+                    arena_run: num(4)?,
+                    arena_pages: small(5)?,
+                    outbound: num(6)?,
+                    rings_run: num(7)?,
+                    rings_pages: small(8)?,
+                    gpu: match num(9)? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("gpu is 0 or 1".into()),
+                    },
+                    seq: num(10)?,
+                })
+            }
             "subscribe" => {
                 arity(1)?;
                 Request::Subscribe
@@ -119,6 +166,20 @@ impl Request {
             Request::Close { id } => format!("close {id}"),
             Request::Free { id } => format!("free {id}"),
             Request::Adopt { pool } => format!("adopt {pool}"),
+            Request::Connect { name } => format!("connect {name}"),
+            Request::Sign(s) => format!(
+                "sign {} {} {} {} {} {} {} {} {} {}",
+                s.install,
+                s.session,
+                s.index,
+                s.arena_run,
+                s.arena_pages,
+                s.outbound,
+                s.rings_run,
+                s.rings_pages,
+                u8::from(s.gpu),
+                s.seq
+            ),
             Request::Subscribe => "subscribe".into(),
             Request::Stats => "stats".into(),
         }
@@ -196,6 +257,19 @@ mod tests {
             Request::Close { id: 7 },
             Request::Free { id: 7 },
             Request::Adopt { pool: "gpu".into() },
+            Request::Connect { name: "wl-hub".into() },
+            Request::Sign(SignReq {
+                install: "wcivs".into(),
+                session: "wcivs-77".into(),
+                index: 3,
+                arena_run: u64::MAX,
+                arena_pages: 32768,
+                outbound: 1 << 20,
+                rings_run: 9,
+                rings_pages: 1536,
+                gpu: true,
+                seq: 12,
+            }),
             Request::Subscribe,
             Request::Stats,
         ] {

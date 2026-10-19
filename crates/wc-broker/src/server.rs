@@ -53,11 +53,27 @@ pub trait Platform: Send + Sync + 'static {
     fn released(&self, _obj: &Self::Object) -> bool {
         false
     }
+    /// Who the caller is, as the boot record's identity (§111.6): the
+    /// platform reads it from the kernel's credentials or token, never from
+    /// anything the caller sent. `None`: this platform does not sign.
+    fn identity(&self, _peer: &Peer) -> Option<wc_handle::macboot::Identity> {
+        None
+    }
+    /// A fresh connection to local service `name` (the doorbell hub), for
+    /// `connect`. Unlike a device, any number may be open at once.
+    fn open_service(&self, name: &str) -> io::Result<Self::Object> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("no service {name} on this platform")))
+    }
 }
 
 /// How the broker is configured.
 pub struct Config {
     pub devices: Vec<DeviceSpec>,
+    /// Local services `connect` may open, and for whom.
+    pub services: Vec<DeviceSpec>,
+    /// Where the installations' boot-record keys are (`<dir>/<install>.key`),
+    /// readable by the broker's account only. `None`: `sign` is refused.
+    pub keys: Option<std::path::PathBuf>,
     /// The release rule of every region a client allocates.
     pub release: Release,
     pub budget: Option<u64>,
@@ -86,6 +102,8 @@ pub struct Broker<P: Platform> {
     next_conn: Arc<AtomicU64>,
     release: Release,
     run: u64,
+    services: Arc<Vec<DeviceSpec>>,
+    keys: Option<Arc<std::path::PathBuf>>,
 }
 
 impl<P: Platform> Clone for Broker<P> {
@@ -96,6 +114,8 @@ impl<P: Platform> Clone for Broker<P> {
             next_conn: Arc::clone(&self.next_conn),
             release: self.release,
             run: self.run,
+            services: Arc::clone(&self.services),
+            keys: self.keys.clone(),
         }
     }
 }
@@ -119,6 +139,8 @@ impl<P: Platform> Broker<P> {
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
             run: config.run,
+            services: Arc::new(config.services),
+            keys: config.keys.map(Arc::new),
         }
     }
 
@@ -338,6 +360,33 @@ impl<P: Platform> Broker<P> {
                 }
                 Err(r) => refused(w, r),
             },
+            Request::Connect { name } => {
+                let allowed = self.services.iter().find(|s| s.name == *name).map(|s| match &s.allow {
+                    crate::core::Allow::AnyUser => true,
+                    crate::core::Allow::Users(u) => u.contains(&peer.user) || peer.admin,
+                });
+                match allowed {
+                    None => p.push(w, &format!("err no service {name} here")),
+                    Some(false) => p.push(w, &format!("err service {name} is not for {}", peer.user)),
+                    Some(true) => match p.open_service(name) {
+                        Ok(obj) => {
+                            let n = name.clone();
+                            p.send(w, &|h| format!("ok connect {n} {}", h[0]), vec![Give::Move(obj)])
+                        }
+                        Err(e) => p.push(w, &format!("err cannot connect to {name}: {e}")),
+                    },
+                }
+            }
+            Request::Sign(s) => match self.sign(peer, s) {
+                Ok(line) => {
+                    log(&format!("signed session {} of {} for process {} of {}", s.session, s.install, peer.pid, peer.user));
+                    p.push(w, &line)
+                }
+                Err(e) => {
+                    log(&format!("sign refused to process {} of {}: {e}", peer.pid, peer.user));
+                    p.push(w, &format!("err {e}"))
+                }
+            },
             Request::Subscribe => match st.core.subscribe(id) {
                 Ok(()) => p.push(w, "ok"),
                 Err(r) => refused(w, r),
@@ -355,6 +404,32 @@ impl<P: Platform> Broker<P> {
         };
         self.settle(&mut st);
         out
+    }
+
+    /// `sign` (§111.6): the installation's key never leaves the broker, and
+    /// the identity is the caller's as the platform read it.
+    fn sign(&self, peer: &Peer, s: &proto::SignReq) -> Result<String, String> {
+        use wc_handle::macboot::{Auth, Record, parse_key, valid_id, valid_installation};
+        let dir = self.keys.as_ref().ok_or("this broker holds no installation keys")?;
+        if !valid_installation(&s.install) || !valid_id(&s.session) {
+            return Err(format!("bad installation {:?} or session {:?}", s.install, s.session));
+        }
+        let identity = self.platform.identity(peer).ok_or("this broker cannot tell who the caller is")?;
+        let path = dir.join(format!("{}.key", s.install));
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("no key for installation {}: {e}", s.install))?;
+        let key = parse_key(&text).ok_or_else(|| format!("the key of installation {} is malformed", s.install))?;
+        let rec = Record {
+            session: s.session.clone(),
+            arena_run: s.arena_run,
+            arena_pages: s.arena_pages,
+            outbound: s.outbound,
+            rings_run: s.rings_run,
+            rings_pages: s.rings_pages,
+            gpu: s.gpu,
+        };
+        let auth = Auth::sign_identity(&rec, s.index, Some(&identity), &s.install, s.seq, &key);
+        let mac: String = auth.mac.iter().map(|b| format!("{b:02x}")).collect();
+        Ok(format!("ok signed {} {mac} {}", s.seq, identity.text()))
     }
 
     // ------------------------------------------- the embedding process's own

@@ -78,6 +78,7 @@ impl Object {
 pub struct Unix {
     listener: UnixListener,
     devices: Vec<DevicePath>,
+    services: Vec<DevicePath>,
     /// Users with admin rights besides root: the broker's own account.
     admins: Vec<u32>,
     /// macOS: map and wire every region, and watch this word for its release.
@@ -100,11 +101,18 @@ impl Unix {
         Ok(Unix {
             listener,
             devices,
+            services: Vec::new(),
             admins: vec![0, me],
             wire: cfg!(target_os = "macos"),
             release_word: None,
             watcher: Watcher::start()?,
         })
+    }
+
+    /// The local services `connect` reaches: a socket path each.
+    pub fn with_services(mut self, services: Vec<DevicePath>) -> Unix {
+        self.services = services;
+        self
     }
 
     /// Regions are mapped and wired by the broker for their whole life, and
@@ -239,6 +247,24 @@ impl Platform for Unix {
         w.write_all(l.as_bytes())
     }
 
+    fn identity(&self, peer: &Peer) -> Option<wc_handle::macboot::Identity> {
+        let uid: u32 = peer.user.0.strip_prefix("uid:")?.parse().ok()?;
+        Some(wc_handle::macboot::Identity {
+            os: if cfg!(target_os = "macos") { "macos" } else { "linux" }.into(),
+            user: user_name(uid)?,
+            id: uid.to_string(),
+        })
+    }
+
+    fn open_service(&self, name: &str) -> io::Result<Object> {
+        let s = self
+            .services
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("service {name} has no socket")))?;
+        Ok(Object::Device(OwnedFd::from(UnixStream::connect(&s.path)?)))
+    }
+
     fn released(&self, obj: &Object) -> bool {
         match obj {
             Object::Region(Region { map: Some((addr, len)), release_word: Some(off), .. }) if off + 4 <= *len => {
@@ -249,6 +275,21 @@ impl Platform for Unix {
             _ => false,
         }
     }
+}
+
+/// The account name of `uid`, from the password database.
+pub fn user_name(uid: u32) -> Option<String> {
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: live out-parameters and a live, sized buffer.
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() {
+        return None;
+    }
+    // SAFETY: getpwuid_r set pw_name to a NUL-terminated string in `buf`.
+    let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) };
+    name.to_str().ok().map(str::to_string)
 }
 
 #[cfg(target_os = "linux")]

@@ -12,6 +12,8 @@ description = "The one privileged component per machine: who may hold which devi
 # DuplicateHandle on Windows.
 
 [dependencies]
+# The boot record and its HMAC (§105, §111.6): the `sign` request.
+wc-handle = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
