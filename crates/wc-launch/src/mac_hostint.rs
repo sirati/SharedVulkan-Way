@@ -98,7 +98,11 @@ pub fn map_open_key(cfg: &Config, key: &str) -> Result<String, String> {
         FilePlan::Shared { url } => Ok(format!("open:{url}")),
         FilePlan::Copy { host_dir, host_dest, url } => {
             std::fs::create_dir_all(&host_dir).map_err(|e| format!("{host_dir}: {e}"))?;
-            std::fs::copy(real, &host_dest).map_err(|e| format!("{host_dest}: {e}"))?;
+            // Plain bytes, not std::fs::copy: on macOS that is fcopyfile,
+            // which the virtio-fs share does not implement (measured: ENOSYS).
+            let copied = std::fs::File::open(real)
+                .and_then(|mut from| std::fs::File::create(&host_dest).and_then(|mut to| std::io::copy(&mut from, &mut to)));
+            copied.map_err(|e| format!("{host_dest}: {e}"))?;
             Ok(format!("open:{url}"))
         }
     }
