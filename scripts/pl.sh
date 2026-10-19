@@ -8,6 +8,7 @@
 #   pl.sh guest <cmd...>        run <cmd> in the Windows guest (git-bash)
 #   pl.sh push <file>...        scp files to the host's /tmp
 #   pl.sh pull <remote> <local> scp a file back from the host
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 # **The local 1Password agent, not a forwarded one.**
@@ -28,7 +29,7 @@ set -uo pipefail
 # The local agent has none of that: one socket, no forwarding, no staleness.
 # `SV_AGENT` overrides it for the case where somebody really does want a
 # forwarded one.
-AGENT_SOCK=~/.1password/agent.sock
+AGENT_SOCK=$SITE_AGENT_SOCK
 KEY=/tmp/sv-k1.pub
 
 AG=${SV_AGENT:-$AGENT_SOCK}
@@ -42,7 +43,7 @@ if ! timeout 10 ssh-add -l >/dev/null 2>&1; then
   exit 1
 fi
 
-HOST_OPTS=(-o IdentityAgent="$AG" -o HostKeyAlias=testhost.lan
+HOST_OPTS=(-o IdentityAgent="$AG" -o HostKeyAlias=$SITE_HOST_KEYALIAS
            -o HostKeyAlgorithms=rsa-sha2-512,rsa-sha2-256 -o BatchMode=yes
            -o LogLevel=ERROR)
 # The guest's sshd caps at six authentication attempts and the agent offers six
@@ -51,8 +52,8 @@ if [ ! -s "$KEY" ]; then ssh-add -L | head -1 > "$KEY"; fi
 GUEST_OPTS=(-o IdentityAgent="$AG" -o IdentitiesOnly=yes -i "$KEY"
             -o BatchMode=yes -o LogLevel=ERROR)
 
-HOST=<host-user>@<host-ip>
-GUEST=<guest-user>@<guest-ip>
+HOST=$SITE_HOST
+GUEST=$SITE_GUEST
 
 cmd=${1:?usage: pl.sh agent|host|root|guest|push|pull ...}; shift
 

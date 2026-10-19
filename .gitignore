@@ -23,3 +23,22 @@ shadercache.bin
 .kache-store/
 # worktrees live inside the project so they share the kache store above
 .claude/worktrees/
+
+# Evidence stays out of the repository: screenshots, logs, captured output and
+# the one-off helpers that produced them. Docs may name such files as text.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.log
+*.moz_log
+*.jsonl
+*.gz
+/docs/**
+!/docs/**/
+!/docs/**/*.md
+# Machine-specific values (guest user, addresses, ssh aliases); see
+# scripts/site.env.example.
+/scripts/site.env

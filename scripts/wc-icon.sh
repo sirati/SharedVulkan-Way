@@ -71,6 +71,7 @@
 # line in a log. The old pictures are **not** re-taken here — that is somebody
 # else's measurement to make, and §16.11 records what is on the fixture so the
 # choice is an informed one.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -79,7 +80,7 @@ WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage11"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
@@ -107,9 +108,9 @@ GUESTNAME="${WC_GUESTNAME:-wcicon}"
 # kills, the whole class of problem goes away, and §13.9's "an image name is
 # not an identity on this guest" gets its second demonstration.
 COMP_EXE="${WC_COMP_EXE:-wc-s11-compositor.exe}"
-DESKDIR="/c/Users/<guest-user>/$GUESTNAME"
-DESKDIR_WIN="C:\\Users\\<guest-user>\\$GUESTNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+DESKDIR="$SITE_GUEST_MSYS_HOME/$GUESTNAME"
+DESKDIR_WIN="$SITE_GUEST_WIN_HOME\\$GUESTNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 # A DIFFERENT PORT EVERY RUN, WHICH IS §13.10'S SECOND LESSON ARRIVING AGAIN.
 #
 # Two back-to-back runs on one TCP port leave the second's listener in
@@ -123,7 +124,7 @@ HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage11}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc11}"
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc11}"
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"
 HOST_WESTON="${WC_HOST_WESTON:-}"
 # Where the host's icon theme is. Not guessed from the host's environment: this
@@ -256,7 +257,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [string]$Arguments = "",
   [string]$Name = "wcicon",
-  [string]$WorkDir = "C:\Users\<guest-user>\wcicon",
+  [string]$WorkDir = "C:\Users\@GUEST_USER@\wcicon",
   [switch]$Wait,
   [int]$TimeoutSec = 120
 )
@@ -283,6 +284,7 @@ if ($Wait) {
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false
 }
 PS1
+  site_fill "$1"
 }
 
 # Pull a BMP off the guest and convert it.

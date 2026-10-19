@@ -58,6 +58,8 @@ dump=${MAC_GPU_DUMP:-1}
 inst=${MACVM_INSTANCE:-wayland-host}
 root=$(cd "$(dirname "$0")/.." && pwd)
 idir=/mnt/datasets/macvm/instances/$inst
+# The VM's account comes from the VM store, not from this repository.
+VMUSER=$(sed -n 's/.*"user": "\([^"]*\)".*/\1/p' "$idir/instance.json")
 mvm=/mnt/datasets/macvm/bin/macos-vm
 arena=$(( ${MAC_GPU_ARENA_MIB:-64} * 1024 * 1024 ))
 local_bin=${MAC_GPU_BIN:-$root/target/x86_64-apple-darwin/debug/sv-guest}
@@ -74,12 +76,12 @@ say() { echo "[mac-gpu] $*"; }
 now() { date +%s.%N; }
 dt() { awk "BEGIN{printf \"%.3f\", $2 - $1}"; }
 run=/mnt/datasets/builds/wcrun/macgpu-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$run/f" /mnt/datasets/builds/wcrun/macgpu-last
+mkdir -p "$run/f" ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/macgpu-last
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
   vm "pkill -f 'sv-guest gpu guest --label $label ' 2>/dev/null; true" >/dev/null 2>&1
-  cp "$run"/*.log /mnt/datasets/builds/wcrun/macgpu-last/ 2>/dev/null
+  cp "$run"/*.log ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/macgpu-last/ 2>/dev/null
   [ "${WC_KEEP:-0}" = 1 ] || rm -rf "$run"
 }
 trap cleanup EXIT
@@ -89,7 +91,7 @@ for b in sv-hostd libsv_icd.so sv_icd.json; do
   [ -e "$root/target/debug/$b" ] || { say "build first: cargo build -p sv-icd -p sv-hostd"; exit 2; }
 done
 vm 'mkdir -p ~/wc/gpu'
-rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" c3r@127.0.0.1:wc/gpu/sv-guest || exit 1
+rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" $VMUSER@127.0.0.1:wc/gpu/sv-guest || exit 1
 fail=0
 
 if [ "$what" = probe ] || [ "$what" = both ]; then
@@ -137,7 +139,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
     for _ in $(seq 1 60); do vm 'grep -q "offered the extent" /tmp/wcgpu/gpu.log 2>/dev/null' && break; sleep 0.2; done
   fi
   th0=$(now)
-  "$root/target/debug/sv-hostd" qemu-serve --qmp "$idir/qmp.sock" --vm "c3r-macos-$inst" \
+  "$root/target/debug/sv-hostd" qemu-serve --qmp "$idir/qmp.sock" --vm "$idir" \
     --cold "mem:$label" --socket "$run/icd.sock" --clients 1 > "$run/hostd.log" 2>&1 &
   hostd=$!
   pids+=($hostd)
@@ -178,7 +180,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
       env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" LD_LIBRARY_PATH="$wllib" \
       "$probe" --wsi wayland --width 400 --height 300 --c "${MAC_GPU_CUBE_FRAMES:-400}" > "$run/app.log" 2>&1
     rc=$?
-    cp /mnt/datasets/builds/wcrun/mac-last/client.log "$run/client.log" 2>/dev/null
+    cp ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last/client.log "$run/client.log" 2>/dev/null
     sed 's/^/  /' "$run/app.log"
     grep -E '^\[icd\]|sv-icd:|rror' "$run/client.log" 2>/dev/null | head -8 | sed 's/^/  client: /'
   else

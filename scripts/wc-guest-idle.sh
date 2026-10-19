@@ -21,14 +21,15 @@
 #   exit 2  in use: "active N s ago", or "in use: TeamViewer remote control ..."
 #   exit 1  unknown: no sentinel (or an old one), or its heartbeat is stale.
 #           Counts as NOT idle.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -u
 LIMIT=${GUEST_IDLE_SECS:-120}
 LOG=${GUEST_INJECT_LOG:-/tmp/wcrun/qmp-inject.log}
-G="ssh -o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR <guest-user>@<guest-ip>"
+G="ssh -o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR $SITE_GUEST"
 t0=$(date +%s%3N)
 # GUEST_ACTIVITY_TEXT: the sentinel's file and a `guest_now` line, for testing.
 if [ -n "${GUEST_ACTIVITY_TEXT:-}" ]; then out=$GUEST_ACTIVITY_TEXT
-else out=$($G 'W=/c/Users/<guest-user>/AppData/Local/waycompose; cat $W/activity.txt 2>/dev/null
+else out=$($G 'W=/c/Users/'"$SITE_GUEST_USER"'/AppData/Local/waycompose; cat $W/activity.txt 2>/dev/null
   tail -n 200 $W/inject.log 2>/dev/null | sed "s/^/inj /"
   T="/c/Program Files/TeamViewer"
   if [ -d "$T" ]; then

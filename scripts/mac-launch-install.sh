@@ -16,10 +16,13 @@
 # GUEST (the VM): the macOS wc-launch in ~/Library/Application Support/waycompose,
 #   its key, its wc-launch.ini, an ssh alias `wchost`, and one .app per APP in
 #   ~/Applications/Linux, kept in the Dock.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -euo pipefail
 inst=${MACVM_INSTANCE:-wayland-host}
 root=$(cd "$(dirname "$0")/.." && pwd)
 idir=/mnt/datasets/macvm/instances/$inst
+# The VM's account comes from the VM store, not from this repository.
+VMUSER=$(sed -n 's/.*"user": "\([^"]*\)".*/\1/p' "$idir/instance.json")
 BASE=${WC_MAC_LAUNCH_BASE:-/mnt/datasets/builds/wcrun/mac-launch}
 PORT=${WC_MAC_SSHD_PORT:-22422}
 apps=("$@")
@@ -103,12 +106,12 @@ systemd-run --user --unit=wc-mac-sshd --collect "$sshd_bin" -D -e -f "$BASE/sshd
 sleep 1
 ss -ltnH | grep -q "127.0.0.1:$PORT" || { echo "the private sshd did not listen"; journalctl --user -u wc-mac-sshd -n 20 --no-pager; exit 1; }
 
-vm "grep -q '^Host wchost' ~/.ssh/config 2>/dev/null || printf 'Host wchost\n  HostName <vm-gateway-ip>\n  Port $PORT\n  User $(id -un)\n' >> ~/.ssh/config; chmod 600 ~/.ssh/config"
+vm "grep -q '^Host wchost' ~/.ssh/config 2>/dev/null || printf 'Host wchost\n  HostName $SITE_VM_GATEWAY_IP\n  Port $PORT\n  User $(id -un)\n' >> ~/.ssh/config; chmod 600 ~/.ssh/config"
 {
   echo "# §103.8, written by scripts/mac-launch-install.sh"
   echo "[session]"
   echo "host = wchost"
-  echo "key = /Users/c3r/$G/id_ed25519"
+  echo "key = /Users/$VMUSER/$G/id_ed25519"
   echo "name = wcm"
   echo "# On macOS the compositor runs inside each application bundle and there is no relay."
   echo "compositor = in-process"
@@ -117,7 +120,7 @@ vm "grep -q '^Host wchost' ~/.ssh/config 2>/dev/null || printf 'Host wchost\n  H
   echo "linger-secs = 20"
   echo "audio = ${WC_LAUNCH_AUDIO:-on}"
   for a in "${apps[@]}"; do echo; echo "[app.$a]"; echo "host-app = $a"; done
-} | $vssh c3r@127.0.0.1 "cat > \"$G/wc-launch.ini\""
-rsync -a -e "$vssh" "$root/target/x86_64-apple-darwin/debug/wc-launch" "c3r@127.0.0.1:$G/bin/wc-launch"
+} | $vssh $VMUSER@127.0.0.1 "cat > \"$G/wc-launch.ini\""
+rsync -a -e "$vssh" "$root/target/x86_64-apple-darwin/debug/wc-launch" "$VMUSER@127.0.0.1:$G/bin/wc-launch"
 vm "cd \"$G\" && ./bin/wc-launch --install ${apps[*]} --pin"
 echo "installed: host $BASE (sshd 127.0.0.1:$PORT), guest ~/Applications/Linux"

@@ -75,6 +75,7 @@
 #   opens the backing object has to be root too (§12.9). Both go through
 #   `~/rootc`, and the long-lived half goes through `systemd-run --collect`
 #   because a root call that blocks for a minute frequently returns nothing.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-both}"
@@ -84,7 +85,7 @@ LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage17"
 OUTTB="$ROOT/docs/tabs-in-titlebar"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
@@ -92,16 +93,16 @@ export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # Everything this run owns is named from this. See the header.
 TBNAME="${WC_TBNAME:-wcs17tb}"
-GDIR="/c/Users/<guest-user>/$TBNAME"
-GDIR_WIN="C:\\Users\\<guest-user>\\$TBNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+GDIR="$SITE_GUEST_MSYS_HOME/$TBNAME"
+GDIR_WIN="$SITE_GUEST_WIN_HOME\\$TBNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 
 HOST="${WC_HOST:-}"                                   # the machine QEMU runs on
 HOST_DIR="${WC_HOST_DIR:-/tmp/$TBNAME}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/$TBNAME}"       # the export, as the host spells it
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\$TBNAME}"            # and as the guest spells it
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"        # how the host reaches the guest
-HOST_KEY="${WC_HOST_KEY:-~/.ssh/wc_guest}" # absolute: the unit is root
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"        # how the host reaches the guest
+HOST_KEY="${WC_HOST_KEY:-${SITE_HOST_HOME}/.ssh/wc_guest}" # absolute: the unit is root
 HOST_FIREFOX="${WC_HOST_FIREFOX:-}"                   # absolute path; no guessing
 QMP="${WC_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_VM_HINT:-windows-vm}"
@@ -167,7 +168,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [string]$Arguments = "",
   [string]$Name = "wctb",
-  [string]$WorkDir = "C:\Users\<guest-user>",
+  [string]$WorkDir = "C:\Users\@GUEST_USER@",
   [switch]$Wait,
   [int]$TimeoutSec = 120
 )
@@ -194,6 +195,7 @@ if ($Wait) {
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false
 }
 PS1
+  site_fill "$1"
 }
 
 write_killours() { cat >"$1" <<'PS2'

@@ -34,6 +34,7 @@
 # One monitor, one DPI, one taskbar position. This project has no multi-monitor
 # support and no scaling (§38.6), and a run on a second screen would be
 # measuring something nobody has built.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-menu}"
@@ -41,21 +42,21 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage38"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
 export WC_GUEST="$GUEST"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 DESKNAME="${WC_DESKNAME:-wcdesk38}"
-DESKDIR="/c/Users/<guest-user>/$DESKNAME"
-DESKDIR_WIN="C:\\Users\\<guest-user>\\$DESKNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+DESKDIR="$SITE_GUEST_MSYS_HOME/$DESKNAME"
+DESKDIR_WIN="$SITE_GUEST_WIN_HOME\\$DESKNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 PORT="${WC_PORT_BASE:-57471}"
 
 HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage38}"
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"
 HOST_WESTON="${WC_HOST_WESTON:-}"
 CLIENT="${WC_CLIENT:-weston-terminal}"

@@ -56,6 +56,7 @@
 # reason it is also written here is that this project has twice read a stale
 # deployed binary as a transport fault and lost an afternoon to it.
 # ---------------------------------------------------------------------------
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 SESSIONS=${1:-4}
@@ -73,7 +74,7 @@ DIR=${SVFF_DIR:-/tmp/svff-int}
 GDIR=${SVFF_GDIR:-svffint}
 SHARE=${SVFF_SHARE:-/srv/winshare/svff}
 SHARE_WIN=${SVFF_SHARE_WIN:-'Z:\svff'}
-G=${SVFF_GUEST:-<guest-user>@<guest-nat-ip>}
+G=${SVFF_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}
 GK=(-i "$HOME/.ssh/wc_guest" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 # Root, for sv-hostd's locate and nothing else (waycompose-design.md §86). The
 # old default, ~/rootc, is gone from testhost; `sudokey` is how root is
@@ -130,7 +131,7 @@ cleanup() {
   # lived on to their own timeouts after every run — up to four minutes of
   # pinned large pages and a held ivshmem mapping on a machine somebody uses.
   ssh "${GK[@]}" "$G" "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -Command \
-     \"\\\$p = 'C:\\\\Users\\\\<guest-user>\\\\$GDIR\\\\'; Get-CimInstance Win32_Process | \
+     \"\\\$p = 'C:\\\\Users\\\\${SITE_GUEST_USER}\\\\$GDIR\\\\'; Get-CimInstance Win32_Process | \
       Where-Object { \\\$_.ExecutablePath -and \\\$_.ExecutablePath.StartsWith(\\\$p) } | \
       ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
     >/dev/null 2>&1
@@ -191,7 +192,7 @@ rm -f $DIR/icd.sock
 true" | eval "$ROOTC" >/dev/null 2>&1
 rm -f "$DIR"/cold*.sock "$DIR"/*.log
 # Only sockets this experiment made. §17's rule: identity is a path, not a name.
-ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/$UNITPFX-* 2>/dev/null; true" >/dev/null 2>&1
+ssh "${GK[@]}" "$G" "rm -f /c/Users/${SITE_GUEST_USER}/AppData/Local/waycompose/$UNITPFX-* 2>/dev/null; true" >/dev/null 2>&1
 
 # **Kill this experiment's own leftovers in the guest, by executable path.**
 #
@@ -205,7 +206,7 @@ ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/$UNITP
 # `taskkill /IM sv-gpu-server.exe` would take out any other experiment's GPU
 # side, and the symptom would land in their run rather than in this one.
 ssh "${GK[@]}" "$G" "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -Command \
-   \"\\\$p = 'C:\\\\Users\\\\<guest-user>\\\\$GDIR\\\\'; Get-CimInstance Win32_Process | \
+   \"\\\$p = 'C:\\\\Users\\\\${SITE_GUEST_USER}\\\\$GDIR\\\\'; Get-CimInstance Win32_Process | \
     Where-Object { \\\$_.ExecutablePath -and \\\$_.ExecutablePath.StartsWith(\\\$p) } | \
     ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
   >/dev/null 2>&1
@@ -301,7 +302,7 @@ fi
 # ------------------------------------------------ the Wayland byte channel ---
 say "relay + ssh -L for the Wayland socket"
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./probe-relay.exe $WLPORT \
-  'C:\\Users\\<guest-user>\\AppData\\Local\\waycompose\\$SOCK' --timeout $((SECS + 90))" \
+  'C:\\Users\\${SITE_GUEST_USER}\\AppData\\Local\\waycompose\\$SOCK' --timeout $((SECS + 90))" \
   >"$DIR/relay.out" 2>&1 &
 KIDS+=($!)
 sleep 4

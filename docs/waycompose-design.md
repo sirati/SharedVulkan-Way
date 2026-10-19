@@ -32759,8 +32759,9 @@ and the doorbell (polled). The fd-pair doorbell exists in sv-transport
 
 **Evidence stays out of git.** No screenshot, image or log of this work is
 committed. Screenshots, run logs and captures are under
-`/mnt/datasets/builds/wcrun/` and `/mnt/datasets/builds/evidence/macos-host/`
-on this workstation, and this section states their results in text.
+`/mnt/datasets/builds/evidence/macos-host/` (`mac-last/`, `macgpu-last/`,
+`mac-pin-*/`, `rtt/`), outside the repository, and this section states their
+results in text. The harnesses write there (`WC_EVIDENCE` overrides it).
 
 ### 103.12 Not built, and not proven
 
