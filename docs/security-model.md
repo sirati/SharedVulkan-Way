@@ -1402,7 +1402,11 @@ thing and never carrying a command (§94's rule, in the other direction):
 These are argv entries, never a shell, and `--` ends option parsing. Windows:
 `ShellExecuteW` with the explicit verb `open` on the URL or path, or
 `CreateProcessW` of the chosen handler's own executable with the target as
-one quoted argument. Never `cmd.exe`.
+one quoted argument. Never `cmd.exe`, and never a `.bat` or `.cmd` (which
+`CreateProcess` would hand to `cmd.exe`): a handler must be an `.exe`. A
+browser configured by the host's operator (`[hostint] browser`) gets its
+fixed arguments from that configuration only, and the URL after them as one
+argument of its own.
 
 **What a hostile Linux side can still do.** Open up to ten http(s) pages a
 minute in the host's browser, so a Linux program can show the user any web
