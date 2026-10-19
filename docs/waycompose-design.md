@@ -34171,3 +34171,99 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
 * **The output** is one for every session (107.4).
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.
+
+## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
+
+Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same
+proxy code on every platform (Windows guest, macOS, the Linux harnesses).
+
+### 109.1 The bug
+
+A client pool larger than the arena's largest free run — foot's default
+512 MiB pool against a 128 MiB arena — was "held back": stage 16's
+`flush_deferred` could not publish it, and every request naming the pool or a
+buffer cut from it was absorbed, `create_pool` and `create_buffer` included.
+The compositor never saw those ids, so the client's next new id was past the
+end of the compositor's id table and the client died with `Invalid new_id:
+29`. The log said "The connection is not affected", which was untrue.
+
+### 109.2 The rules (the user's)
+
+* Any pool size is accepted. Only what is used is backed: the byte range of
+  each `wl_buffer` cut from a pool, and only once it is attached.
+* No request is swallowed or absorbed; every one reaches the compositor in the
+  client's order, with the client's ids. `wl_shm_pool.resize` updates the
+  size.
+* Arena space is per buffer, allocated on demand and released when the buffer
+  is destroyed or the reclaimer takes it.
+* A buffer that cannot fit even after reclaiming gets a clean protocol error,
+  `wl_display.error(no_memory)` naming the buffer, logged truthfully.
+
+### 109.3 The design, and why this shape
+
+The proxy cannot invent ids in the client's id space: the compositor accepts a
+client's new id only at the end of its table or in a freed slot, so an
+invented one shifts every later id of the client. So everything the
+compositor holds is under the client's own ids, and what changes is what backs
+them:
+
+* **A pool** is created upstream at once, under its id, on the session's
+  **stub**: one 4 KiB arena extent. A `resize` is forwarded with the stub's
+  (or the pool's current upstream) size, which the compositor takes as no
+  change; the proxy remaps the client's fd to the new size.
+* **A buffer** is created upstream at once, under its id, as a **1x1 stub** on
+  the stub pool (`width 1, height 1, stride 4`, the client's format). It holds
+  no arena bytes.
+* **The first attach backs it**: the stub buffer is destroyed, the pool
+  **re-pointed** (destroyed and created again under the same id) at an extent
+  of exactly the buffer's size (`stride * height`), and the buffer created
+  again under its id at its real geometry at offset 0 of that extent; then the
+  attach is forwarded. The commit copies from the client's pool at the
+  buffer's offset into offset 0 of its extent. Every buffer is its own extent,
+  so the pool's size never matters.
+* The compositor frees an id at a destructor, so re-creating under the same id
+  is legal at once; the `delete_id` that answers the proxy's own destroy is
+  kept (a count per id, since one id may be destroyed by the proxy many
+  times, and the answers come in order); the client's own destroys are
+  answered to the client as always.
+* **Reclaim**: when the arena has no room, buffers that are not attached to a
+  surface (current or pending), released by the compositor, and older than
+  250 ms lose their extent: the buffer is destroyed and re-created as a stub
+  under its id, the extent freed at once (the compositor has released it and
+  the destroy is ahead of any reuse in the same stream). The next attach backs
+  it again with a full copy.
+* **A buffer outlives its pool** (`weston-presentation-shm` destroys its pool
+  at once). Re-pointing needs a live pool of the client, so when the client
+  destroys its last live pool, its stub buffers are backed first.
+  `wl_shm.release` is held until no live pool can need its `wl_shm`.
+* **No room even after reclaiming**: `wl_display.error(no_memory)` on the
+  buffer, with the arena's free bytes and largest run in the message; the
+  client ends, and nothing more of it is forwarded, so the compositor's stream
+  stays in step to its last byte.
+* §104's failed dma-buf buffers are not `wl_buffer`s upstream (a placeholder);
+  an attach of one is still held back, as §104 says.
+
+What a pool costs now is one stub per session and the bytes of its attached
+buffers. The pool-level machinery of stage 16 (deferral, `wanted`,
+publication, pool reclaim, `--pool-headroom`) is gone; `--pool-headroom` is
+accepted and unused.
+
+### 109.4 Tested
+
+* `a_pool_is_the_stub_at_once_and_every_resize_is_forwarded`: weston-terminal's
+  nine doublings, each forwarded; no arena bytes until attach, then exactly
+  800x600x4.
+* `a_512_mib_pool_runs_in_a_32_mib_arena`: a 512 MiB pool, buffers created,
+  attached, destroyed, the pool resized; the pixels arrive at offset 0 of the
+  buffer's extent; ten 3 MiB buffers through a 32 MiB arena reclaim the cold
+  ones (peak under 32 MiB, no `no_memory`), and a reclaimed buffer shown again
+  is backed again.
+* `a_buffer_bigger_than_the_arena_is_no_memory_naming_it`,
+  `the_proxys_own_destroys_are_answered_to_it`, `buffers_outlive_their_pool`.
+* Every one of them replays the compositor's object map over everything that
+  crossed (`assert_in_step`): each message names a live object, every new id
+  is the next slot or a freed one.
+* `scripts/wc-lazy-pools.sh`: foot (512 MiB pool) and weston-terminal (nine
+  doublings) through the whole no-ssh path in a **64 MiB** BAR: both map a
+  window and keep running; foot's buffers held 2.7 MiB at peak, weston-
+  terminal's 3.0 MiB; no `Invalid new_id`, no protocol error.
