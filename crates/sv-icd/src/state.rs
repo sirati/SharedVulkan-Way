@@ -302,10 +302,13 @@ pub struct State {
     /// The dma-buf path (waycompose-design.md §104, [`crate::dmabuf`]): the
     /// token of each shared `VkDeviceMemory`, the images made through it, the
     /// sync-fd semaphores, and one fence per device for consuming a signal.
-    pub shared_memories: HashMap<u64, crate::dmabuf::SharedToken>,
+    pub shared_memories: HashMap<u64, crate::dmabuf::SharedMem>,
     pub dmabuf_images: HashMap<u64, crate::dmabuf::DmabufImage>,
     pub semaphores: HashMap<u64, crate::dmabuf::Semaphore>,
     pub sync_fences: HashMap<u64, u64>,
+    /// The fence record, its numbers and what the next submit waits for
+    /// (§104.11).
+    pub fences: crate::dmabuf::Fences,
     pub allocator: Box<dyn Backing>,
     /// Most arena bytes ever in use at once, and the value `SV_DEBUG` last
     /// reported ([`State::note_arena_use`]).
@@ -331,6 +334,7 @@ impl State {
             dmabuf_images: HashMap::new(),
             semaphores: HashMap::new(),
             sync_fences: HashMap::new(),
+            fences: Default::default(),
             allocator,
             arena_high_water: 0,
             arena_reported: 0,

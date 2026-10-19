@@ -2218,7 +2218,18 @@ impl RingTransport {
         if r.result != 0 {
             return Ok(Err(r.result));
         }
-        Ok(Ok(crate::dmabuf::SharedToken { size: r.size, nonce: r.nonce, name: r.name }))
+        Ok(Ok(crate::dmabuf::SharedToken { size: r.size, nonce: r.nonce, name: r.name, record: String::new() }))
+    }
+
+    /// `svFenceRecord` (§104.11): the session's fence record, or the GPU
+    /// side's refusal.
+    pub fn fence_record(&self) -> IcdResult<Result<String, i32>> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::FenceRecord.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_FENCE_RECORD, &cmd, &mut reply)?;
+        let r = sv_proto::sv::FenceRecordReply::decode(&reply).map_err(LowerError::Wire)?;
+        Ok(if r.result == 0 { Ok(r.name) } else { Err(r.result) })
     }
 
     /// `svImportShared` (§104): the section a token names, imported under

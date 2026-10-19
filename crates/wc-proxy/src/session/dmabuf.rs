@@ -111,7 +111,13 @@ pub(super) mod ops {
     pub const REGISTRY_GLOBAL: u16 = 0;
     // wl_display
     pub const DISPLAY_SYNC: u16 = 0;
+    // wc_gpu_fence_v1 (wc-compositor/protocols/wc-gpu-fence-v1.xml)
+    pub const FENCE_DESTROY: u16 = 0;
+    pub const FENCE_WAIT: u16 = 1;
 }
+
+/// The compositor's fence interface (§104.11).
+pub const FENCE_INTERFACE: &str = "wc_gpu_fence_v1";
 
 /// One `zwp_linux_buffer_params_v1`.
 #[derive(Default)]
@@ -129,6 +135,9 @@ struct Params {
 
 struct Plane {
     token: sv_drm::token::Token,
+    /// The token's sync page (§104.11), mapped read-only while the fd was
+    /// here; `None` for a version-1 token.
+    sync: Option<std::sync::Arc<sv_drm::token::SyncPage>>,
     offset: u32,
     stride: u32,
     modifier: u64,
@@ -166,6 +175,13 @@ pub(super) struct Dmabuf {
     pub(super) buffers: HashSet<u32>,
     /// `wl_buffer`s whose `create_immed` failed: a placeholder upstream.
     dead_buffers: HashSet<u32>,
+    /// §104.11: each dma-buf `wl_buffer`'s fence record and sync page.
+    syncs: HashMap<u32, (String, std::sync::Arc<sv_drm::token::SyncPage>)>,
+    /// The compositor's `wc_gpu_fence_v1` global: `(registry, name)`.
+    fence_global: Option<(u32, u32)>,
+    /// The highest number the compositor was told to wait for, per record:
+    /// its waits are monotonic, so a smaller one is already satisfied.
+    fence_sent: HashMap<String, u64>,
 }
 
 impl Dmabuf {
@@ -182,6 +198,9 @@ impl Dmabuf {
             params: HashMap::new(),
             buffers: HashSet::new(),
             dead_buffers: HashSet::new(),
+            syncs: HashMap::new(),
+            fence_global: None,
+            fence_sent: HashMap::new(),
         }
     }
 }
@@ -440,12 +459,17 @@ impl Session {
                 let (plane_idx, offset, stride) = (word(1), word(2), word(3));
                 let modifier = (u64::from(word(4)) << 32) | u64::from(word(5));
                 let read = sv_drm::token::read(fd.as_fd());
-                drop(fd); // the token is read; the fd is not kept
+                // §104.11: the sync page stays mapped; the fd is not kept.
+                let sync = match sv_drm::token::SyncPage::open(fd.as_fd()) {
+                    Ok(p) => p.map(std::sync::Arc::new),
+                    Err(_) => None,
+                };
+                drop(fd);
                 let d = self.dmabuf.as_mut().expect("dmabuf on");
                 let Some(p) = d.params.get_mut(&object) else { return Ok(Some(out)) };
                 match (plane_idx, read) {
                     (0, Ok(token)) if p.plane.is_none() => {
-                        p.plane = Some(Plane { token, offset, stride, modifier });
+                        p.plane = Some(Plane { token, sync, offset, stride, modifier });
                     }
                     (0, Ok(_)) => p.broken = Some("plane_set: plane 0 added twice".into()),
                     (0, Err(e)) => p.broken = Some(format!("invalid_wl_buffer: {e}")),
@@ -479,6 +503,7 @@ impl Session {
                 let verdict = validate(p, w, h, format, flags);
                 p.used = true;
                 let shm = p.shm;
+                let sync = p.plane.as_ref().and_then(|pl| pl.sync.clone().map(|s| (pl.token.record.clone(), s)));
                 match verdict {
                     Ok((desc, size, offset, stride, shm_format)) => {
                         let described = format!("{desc:?}");
@@ -493,6 +518,10 @@ impl Session {
                         out.extend_from_slice(&wire::message(object, op::POOL_DESTROY, &[]));
                         bump(&mut d.swallow_delete, object);
                         d.buffers.insert(buffer);
+                        match sync {
+                            Some(s) => d.syncs.insert(buffer, s),
+                            None => d.syncs.remove(&buffer),
+                        };
                         self.foreign_buffers.insert(buffer);
                         self.stats.dmabuf_buffers += 1;
                         self.note(format!(
@@ -524,6 +553,7 @@ impl Session {
             }
             ("wl_buffer", op::BUFFER_DESTROY) => {
                 d.buffers.remove(&object);
+                d.syncs.remove(&object);
                 Ok(None)
             }
             _ => Ok(None),
@@ -602,6 +632,12 @@ impl Session {
             return;
         }
         match iface.as_str() {
+            // §104.11: the compositor's fence global is the proxy's to bind,
+            // never the client's.
+            FENCE_INTERFACE => {
+                d.fence_global = Some((object, name));
+                out.clear();
+            }
             "wl_shm" => {
                 d.shm_global = Some(name);
                 // Asked now, for this client, and not at startup: see `node`.
@@ -643,5 +679,51 @@ impl Session {
     /// Whether `buffer` is a shared allocation, for the commit path.
     pub(super) fn is_dmabuf_buffer(&self, buffer: u32) -> bool {
         self.dmabuf.as_ref().is_some_and(|d| d.buffers.contains(&buffer))
+    }
+
+    /// §104.11: what goes upstream *before* a commit of dma-buf `buffer`, so
+    /// that the compositor does not read the section before the GPU has
+    /// written it: `wc_gpu_fence_v1.wait(record, seq)` on an object bound for
+    /// this one message and destroyed with it.
+    ///
+    /// `seq` is what the client's ICD stored in the token's sync page when it
+    /// exported the frame's sync fd, which it did before the client could
+    /// commit, so it is the right number even if the GPU process has not yet
+    /// seen the work. Nothing is sent for a version-1 token, a number already
+    /// sent (the compositor's waits on a record only grow), or a compositor
+    /// without the global.
+    ///
+    /// The object borrows the id one past the client's highest: free on both
+    /// sides and acceptable to the compositor, and destroyed before the
+    /// client's next request can create it. Its `delete_id` is dropped by
+    /// count, as the placeholders' are.
+    pub(super) fn dmabuf_fence(&mut self, buffer: u32) -> Vec<u8> {
+        let id = self.objects.next_client_id();
+        let Some(d) = self.dmabuf.as_mut() else { return Vec::new() };
+        let (Some((registry, name)), Some((record, page))) = (d.fence_global, d.syncs.get(&buffer)) else {
+            return Vec::new();
+        };
+        let seq = page.load();
+        if seq == 0 || d.fence_sent.get(record).is_some_and(|s| *s >= seq) {
+            return Vec::new();
+        }
+        let record = record.clone();
+        d.fence_sent.insert(record.clone(), seq);
+        bump(&mut d.swallow_delete, id);
+        let mut out = Vec::new();
+        let mut b = Vec::new();
+        b.extend_from_slice(&name.to_ne_bytes());
+        wire::push_string(&mut b, FENCE_INTERFACE);
+        b.extend_from_slice(&1u32.to_ne_bytes());
+        b.extend_from_slice(&id.to_ne_bytes());
+        out.extend_from_slice(&wire::message(registry, ops::REGISTRY_BIND, &b));
+        let mut w = Vec::new();
+        wire::push_string(&mut w, &record);
+        w.extend_from_slice(&((seq >> 32) as u32).to_ne_bytes());
+        w.extend_from_slice(&(seq as u32).to_ne_bytes());
+        out.extend_from_slice(&wire::message(id, ops::FENCE_WAIT, &w));
+        out.extend_from_slice(&wire::message(id, ops::FENCE_DESTROY, &[]));
+        self.stats.dmabuf_fence_waits += 1;
+        out
     }
 }

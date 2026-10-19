@@ -921,6 +921,8 @@ impl State {
                 1,
                 (),
             );
+        // §104.11: wc-proxy holds a dma-buf commit here until its GPU frame is done.
+        crate::gpu_fence::register(dh);
         let mut toplevel_icon =
             smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager::new::<State>(dh);
         // The sizes Windows will ask for, told to the client at bind time:

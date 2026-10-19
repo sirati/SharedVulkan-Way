@@ -522,6 +522,8 @@ pub struct Stats {
     pub dmabuf_commits: u64,
     /// §104. `create`/`create_immed` answered with `failed`.
     pub dmabuf_failed: u64,
+    /// §104.11. `wc_gpu_fence_v1.wait`s sent ahead of those commits.
+    pub dmabuf_fence_waits: u64,
 }
 
 impl Stats {
@@ -573,8 +575,8 @@ impl Stats {
         // prints the line it always printed.
         let dmabuf = if self.dmabuf_buffers > 0 || self.dmabuf_commits > 0 || self.dmabuf_failed > 0 {
             format!(
-                "; dmabuf_buffers={} dmabuf_commits={} dmabuf_failed={} (zero copy)",
-                self.dmabuf_buffers, self.dmabuf_commits, self.dmabuf_failed
+                "; dmabuf_buffers={} dmabuf_commits={} dmabuf_failed={} (zero copy) fence_waits={}",
+                self.dmabuf_buffers, self.dmabuf_commits, self.dmabuf_failed, self.dmabuf_fence_waits
             )
         } else {
             String::new()
@@ -1547,6 +1549,13 @@ impl Session {
                     }
                 }
                 self.commit(header.object);
+                // §104.11: the compositor waits for the GPU's frame, not KWin.
+                if let Some(b) = self.surfaces.get(&header.object).and_then(|s| s.current)
+                    && self.is_dmabuf_buffer(b)
+                {
+                    let fence = self.dmabuf_fence(b);
+                    out.extend_from_slice(&fence);
+                }
             }
             _ => {}
         }
