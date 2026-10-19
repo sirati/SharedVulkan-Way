@@ -1735,6 +1735,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-hostplat"
+version = "0.1.0"
+dependencies = [
+ "wc-hostint",
+ "windows-sys",
+]
+
+[[package]]
 name = "wc-launch"
 version = "0.1.0"
 dependencies = [
