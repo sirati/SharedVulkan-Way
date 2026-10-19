@@ -163,6 +163,7 @@ arena-record = { path = "crates/arena-record" }
 sv-icd-entry = { path = "crates/sv-icd-entry" }
 sv-gpu-entry = { path = "crates/sv-gpu-entry" }
 sv-hostd = { path = "crates/sv-hostd" }
+sv-drm = { path = "crates/sv-drm" }
 
 wc-transport = { path = "crates/wc-transport" }
 wc-handle = { path = "crates/wc-handle" }
