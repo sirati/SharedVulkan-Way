@@ -158,7 +158,12 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
     gpulog='~/Library/Logs/waycompose/gpu.log'
     # The main process, as a face would start it. No face connects in this
     # test, so the bootstrap namespace it registers in does not matter.
-    vm "pkill -f 'wc-launch --main' 2>/dev/null; rm -f ~/Library/Logs/waycompose/main.log; \
+    # One main process per user: an application's main process in the VM
+    # would be this test's. Not killed by pattern (scripts/wc-killcheck.sh).
+    if vm "pgrep -qf 'waycompose/bin/wc-launch --main'"; then
+      say "a main process already runs in the VM; quit its applications first"; exit 2
+    fi
+    vm "rm -f ~/Library/Logs/waycompose/main.log; \
         nohup \"\$HOME/$G/bin/wc-launch\" --main >/dev/null 2>&1 < /dev/null &"
     tv=$(now); th0=$tv
     sid=""
@@ -177,7 +182,8 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
     # The main process goes (its lease ends the session on the host), and
     # the ini is what it was.
     cleanup_session() {
-      vm "pkill -f 'wc-launch --main'; true" >/dev/null 2>&1
+      # This run's main process: its pid is the session id's suffix.
+      [ -n "$sid" ] && vm "kill ${sid#wcm-} 2>/dev/null; true" >/dev/null 2>&1
       vm "cat > \"\$HOME/$G/wc-launch.ini\"" < "$run/ini.orig" >/dev/null 2>&1
     }
     trap 'cleanup_session; cleanup' EXIT

@@ -68,6 +68,7 @@ fn say(msg: &str) {
 }
 
 /// A boot record found by a sweep: where page 0 is in the backing file.
+#[derive(Clone)]
 struct Found {
     rec: macboot::Record,
     offset: u64,
@@ -142,6 +143,63 @@ pub(crate) fn verb(session: &std::path::Path, words: &[&str]) -> Result<String, 
         let err: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
         Err(format!("{} failed: {}", words[0], err.iter().rev().take(4).rev().copied().collect::<Vec<_>>().join(" / ")))
     }
+}
+
+/// §103.15: tell the guest's keeper that nothing of the host will touch this
+/// session's windows again: the release word in its boot page, if the page
+/// still holds its record.
+fn release(qmp: &std::path::Path, vm: &str, f: &Found) -> Result<(), String> {
+    let t = sv_hostd::qemu::QemuTarget::discover(qmp, vm).map_err(|e| e.to_string())?;
+    let mut pg = vec![0u8; wc_handle::arena::REGION_PAGE];
+    sv_hostd::qemu::read_at(&t.file, f.offset, &mut pg).map_err(|e| e.to_string())?;
+    if macboot::Record::read(&pg).as_ref() != Some(&f.rec) {
+        return Err("its boot page no longer holds its record".into());
+    }
+    t.file
+        .write_all_at(&macboot::RELEASED.to_le_bytes(), f.offset + macboot::OFF_RELEASED as u64)
+        .map_err(|e| e.to_string())
+}
+
+/// Where this service keeps each live session's boot page, so a restarted
+/// service can still release it.
+fn state_dir() -> PathBuf {
+    let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    rt.join("wc-mac-sessiond")
+}
+
+fn remember(f: &Found) {
+    let d = state_dir();
+    let _ = std::fs::create_dir_all(&d);
+    let r = &f.rec;
+    let _ = std::fs::write(
+        d.join(&r.session),
+        format!(
+            "{} {} {} {} {} {} {}\n",
+            f.offset, r.arena_run, r.arena_pages, r.outbound, r.rings_run, r.rings_pages, u8::from(r.gpu)
+        ),
+    );
+}
+
+fn recall(id: &str) -> Option<Found> {
+    let text = std::fs::read_to_string(state_dir().join(id)).ok()?;
+    let v: Vec<u64> = text.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    let [offset, arena_run, arena_pages, outbound, rings_run, rings_pages, gpu] = v[..] else { return None };
+    Some(Found {
+        rec: macboot::Record {
+            session: id.to_string(),
+            arena_run,
+            arena_pages: u32::try_from(arena_pages).ok()?,
+            outbound,
+            rings_run,
+            rings_pages: u32::try_from(rings_pages).ok()?,
+            gpu: gpu != 0,
+        },
+        offset,
+    })
+}
+
+fn forget(id: &str) {
+    let _ = std::fs::remove_file(state_dir().join(id));
 }
 
 pub(crate) fn unit_active(id: &str) -> bool {
@@ -222,7 +280,8 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     if let Some(b) = &args.bell {
         spawn_bell(b.clone(), tx.clone());
     }
-    let mut live: HashMap<String, u64> = running_sessions().into_iter().map(|id| (id, 0)).collect();
+    let mut live: HashMap<String, Option<Found>> =
+        running_sessions().into_iter().map(|id| { let f = recall(&id); (id, f) }).collect();
     if !live.is_empty() {
         say(&format!("adopted running session(s): {:?}", live.keys().collect::<Vec<_>>()));
     }
@@ -245,7 +304,7 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
             last_sweep = Some(Instant::now());
             serve(&args, &mut live, &mut served, if woke { "hello" } else { "timer" });
         }
-        live.retain(|id, _| {
+        live.retain(|id, found| {
             if unit_active(id) {
                 return true;
             }
@@ -253,12 +312,20 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
                 Err(e) => say(&format!("session {id} ended; {e}")),
             }
+            // Only now, with its proxy and GPU units gone, may the guest
+            // free the session's windows.
+            match found.as_ref().map(|f| release(&args.qmp, &args.vm, f)) {
+                Some(Ok(())) => say(&format!("session {id}: released to the guest")),
+                Some(Err(e)) => say(&format!("session {id}: not released ({e}); the guest's keeper waits out its limit")),
+                None => say(&format!("session {id}: no boot page known; the guest's keeper waits out its limit")),
+            }
+            forget(id);
             false
         });
     }
 }
 
-fn serve(args: &Args, live: &mut HashMap<String, u64>, served: &mut HashSet<u64>, why: &str) {
+fn serve(args: &Args, live: &mut HashMap<String, Option<Found>>, served: &mut HashSet<u64>, why: &str) {
     let t0 = Instant::now();
     let target = match sv_hostd::qemu::QemuTarget::discover(&args.qmp, &args.vm) {
         Ok(t) => t,
@@ -307,12 +374,14 @@ fn serve(args: &Args, live: &mut HashMap<String, u64>, served: &mut HashSet<u64>
                 say(&format!("session {}: located in {:?}: {text} (answered: {ok:?})", r.session, t1.elapsed()));
                 if !matches!(ok, Ok(true)) {
                     let _ = verb(&args.session, &["down", &r.session]);
+                    let _ = release(&args.qmp, &args.vm, &f);
                     continue;
                 }
                 match verb(&args.session, &["proxy", &r.session]) {
                     Ok(p) => {
                         say(&format!("session {}: started in {:?} after the hello's sweep: {p}", r.session, t0.elapsed()));
-                        live.insert(r.session.clone(), r.rings_run);
+                        remember(&f);
+                        live.insert(r.session.clone(), Some(f.clone()));
                         // The session's GPU server, which the main process
                         // started in the guest and which offers its cold page
                         // under the session's label (§103.15).
@@ -327,6 +396,7 @@ fn serve(args: &Args, live: &mut HashMap<String, u64>, served: &mut HashSet<u64>
                     Err(e) => {
                         say(&format!("session {}: {e}", r.session));
                         let _ = verb(&args.session, &["down", &r.session]);
+                        let _ = release(&args.qmp, &args.vm, &f);
                     }
                 }
             }
@@ -334,6 +404,7 @@ fn serve(args: &Args, live: &mut HashMap<String, u64>, served: &mut HashSet<u64>
                 let _ = answer(&target.file, &f, macboot::State::Failed, &e);
                 say(&format!("session {}: refused: {e}", r.session));
                 let _ = verb(&args.session, &["down", &r.session]);
+                let _ = release(&args.qmp, &args.vm, &f);
             }
         }
     }

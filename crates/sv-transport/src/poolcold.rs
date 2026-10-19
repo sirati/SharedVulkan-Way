@@ -244,7 +244,7 @@ impl BellTarget for ColdEvent {
         true
     }
 
-    fn reopened(&self) {
+    fn rescan(&self, _woken: &AtomicU64) {
         ColdEvent::reopened(self);
     }
 }
@@ -266,9 +266,9 @@ impl<T: BellTarget + ?Sized> BellTarget for WithCold<T> {
 
     /// The port was (re)opened, or the hub said so (`RESCAN_TOKEN`, §105):
     /// the mailbox waiter and every session's lanes look again.
-    fn reopened(&self) {
+    fn rescan(&self, woken: &AtomicU64) {
         ColdEvent::reopened(&self.cold);
-        self.lanes.reopened();
+        self.lanes.rescan(woken);
     }
 }
 
@@ -296,9 +296,9 @@ pub fn guest_doorman<R: std::io::Read + Send + 'static, T: BellTarget + ?Sized +
     cold: Arc<ColdEvent>,
 ) -> crate::vdoorbell::Doorman {
     let target = Arc::new(WithCold { cold, lanes });
-    let d = crate::vdoorbell::Doorman::spawn_target(reader, Arc::clone(&target));
-    target.reopened();
-    d
+    // The open is a wake: `serve_port` rescans the target first thing
+    // (§103.15's rule), which sets `has_bell` and rings the mailbox waiter.
+    crate::vdoorbell::Doorman::spawn_target(reader, target)
 }
 
 /// Guest: ring [`COLD_TOKEN`] on the process's cross wake, if it has one.
@@ -1173,6 +1173,7 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 true
             }
+            fn rescan(&self, _w: &AtomicU64) {}
         }
         let ev = ColdEvent::new();
         let t = WithCold { cold: Arc::clone(&ev), lanes: Arc::new(Lanes(AtomicU32::new(0))) };

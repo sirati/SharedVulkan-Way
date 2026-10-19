@@ -187,6 +187,41 @@ impl Surface {
     }
 }
 
+impl Surface {
+    /// Copy only `rects` (clipped to both sizes) of tightly packed BGRA rows
+    /// into the surface (§103.15). Returns the bytes copied.
+    pub fn copy_rects(&self, src: &[u8], w: i32, h: i32, rects: &[(i32, i32, i32, i32)]) -> usize {
+        let (sw, sh) = self.size();
+        let (cw, ch) = (w.min(sw).max(0), h.min(sh).max(0));
+        if src.len() < (w.max(0) * h.max(0) * 4) as usize {
+            return 0;
+        }
+        let mut copied = 0usize;
+        // SAFETY: the surface is locked for the copy; every row is clipped to
+        // the surface's size and stride and to `src`'s `w * h * 4`.
+        unsafe {
+            IOSurfaceLock(self.0, 0, std::ptr::null_mut());
+            let base = IOSurfaceGetBaseAddress(self.0).cast::<u8>();
+            let bpr = IOSurfaceGetBytesPerRow(self.0);
+            for &(x, y, rw, rh) in rects {
+                let (x0, y0) = (x.clamp(0, cw), y.clamp(0, ch));
+                let (x1, y1) = ((x + rw).clamp(0, cw), (y + rh).clamp(0, ch));
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let n = (x1 - x0) as usize * 4;
+                for row in y0 as usize..y1 as usize {
+                    let s = (row * w as usize + x0 as usize) * 4;
+                    std::ptr::copy_nonoverlapping(src.as_ptr().add(s), base.add(row * bpr + x0 as usize * 4), n);
+                }
+                copied += n * (y1 - y0) as usize;
+            }
+            IOSurfaceUnlock(self.0, 0, std::ptr::null_mut());
+        }
+        copied
+    }
+}
+
 /// Check in (or create) the main process's service. `Err` if another main
 /// process of this user's session already holds it.
 pub fn check_in(name: &str) -> Result<Port, Kr> {

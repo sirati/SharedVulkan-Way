@@ -102,7 +102,35 @@ pub fn mono_us() -> Option<u64> {
     (ok && f > 0).then(|| (c as u128 * 1_000_000 / f as u128) as u64)
 }
 
-#[cfg(unix)]
+/// macOS (§103.15, "the clock trap"): `mach_absolute_time` scaled by
+/// `mach_timebase_info`, which is the counter `Instant` reads there. Never
+/// the raw `cntvct_el0` or `cntfrq_el0` from user space: on Apple Silicon
+/// `cntfrq_el0` reads 1 GHz and the raw counter is not the 24 MHz one, while
+/// `mach_absolute_time` ticks at 24 MHz with timebase 125/3 (measured on the
+/// real Mac), and a Linux guest's counter tracks it within a few hundred
+/// ticks. Linux's `CLOCK_MONOTONIC` id (1) is not a valid clock on macOS.
+#[cfg(target_os = "macos")]
+pub fn mono_us() -> Option<u64> {
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let mut tb = Timebase { numer: 0, denom: 0 };
+    // SAFETY: an out-parameter on this stack frame; the call has no other effect.
+    if unsafe { mach_timebase_info(&mut tb) } != 0 || tb.denom == 0 {
+        return None;
+    }
+    // SAFETY: no arguments, no effect.
+    let t = unsafe { mach_absolute_time() };
+    Some((t as u128 * tb.numer as u128 / tb.denom as u128 / 1000) as u64)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn mono_us() -> Option<u64> {
     #[repr(C)]
     struct Timespec {

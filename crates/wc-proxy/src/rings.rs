@@ -77,6 +77,10 @@ impl BellHub {
 }
 
 impl BellTarget for BellHub {
+    fn rescan(&self, _woken: &AtomicU64) {
+        self.poke_all();
+    }
+
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
         let (slot, lane) = sv_transport::park::lane_from_token(token);
         // The compositor writes the reply lane; that is the one this side
@@ -106,10 +110,6 @@ impl BellTarget for BellHub {
         true
     }
 
-    // §105: the port was reopened; every waiting pump looks at its ring again.
-    fn reopened(&self) {
-        self.poke_all();
-    }
 }
 
 /// The doorbell, held for the life of the proxy.
@@ -181,16 +181,17 @@ struct HubAndControl {
 }
 
 impl BellTarget for HubAndControl {
+    fn rescan(&self, woken: &AtomicU64) {
+        self.hub.rescan(woken);
+        self.control.rescan(woken);
+    }
+
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
         let a = self.hub.ring_token(token, woken);
         let b = self.control.ring_token(token, woken);
         a || b
     }
 
-    fn reopened(&self) {
-        self.hub.reopened();
-        self.control.reopened();
-    }
 }
 
 /// How long a session service's thread sleeps on its lane before looking
@@ -307,8 +308,14 @@ pub fn attach_plan(plan: &Path, wait: std::time::Duration) -> io::Result<Arc<Con
     // The stitched mapping lives as long as the process: the rings are the
     // session's, and every client thread holds the control region.
     std::mem::forget(region);
-    // SAFETY: a live mapping of `len` bytes, never unmapped (above).
-    let shared = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base, len) });
+    // §103.15: page 0 is the boot page; the control region starts at page 1.
+    let page = wc_handle::arena::REGION_PAGE;
+    if len <= page {
+        return Err(io::Error::other(format!("{}: a ring window of {len} bytes has no control region", plan.display())));
+    }
+    // SAFETY: a live mapping of `len` bytes, never unmapped (above); the
+    // control region is its tail past the boot page.
+    let shared = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base.add(page), len - page) });
     let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
     let t0 = std::time::Instant::now();
     loop {

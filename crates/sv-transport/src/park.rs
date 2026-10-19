@@ -243,14 +243,15 @@ pub const fn lane_token(slot: u32, lane: Lane) -> u8 {
 /// ([`lane_from_token`] names a slot past every directory's end).
 pub const HELLO_TOKEN: u8 = 0xFE;
 
-/// Not a lane: "look at every ring again" (waycompose-design.md §105). A
-/// virtio-serial port drops what arrives while nobody on that side holds it,
-/// and a hub whose upstream was down took the bytes sent meanwhile with it.
-/// So the doorbell hub sends this to the guest and to every client each time
-/// it (re)connects to QEMU, and a doorman that reads it calls
-/// `BellTarget::reopened` instead of ringing a lane. Top bit set, so never a
-/// [`lane_token`].
-pub const RESCAN_TOKEN: u8 = 0xFF;
+/// Not a lane: "rescan everything" (§103.15). A doorbell hub sends it to
+/// every client after it has (re)opened its port (and, since §105, to the guest
+/// after it has reconnected to QEMU, for the bytes the guest's side lost), because a byte that
+/// arrived while the port was closed was dropped by the driver (Linux's
+/// virtio_console drops bytes while no process has the port open, measured
+/// on the real Mac): every waiter re-checks its ring rather than trust that
+/// it saw every wake. [`crate::vdoorbell::serve_port`] turns it into
+/// [`crate::vdoorbell::BellTarget::rescan`].
+pub const RESCAN_TOKEN: u8 = 0xFC;
 
 /// Not a lane: "look at the GPU pool's mailboxes" (`crate::poolcold`). The
 /// VM host's `sv-hostd ivshmem-serve` rings it after it has claimed and

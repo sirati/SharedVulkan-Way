@@ -552,8 +552,12 @@ impl PendingRings {
     pub fn alloc() -> Result<PendingRings, String> {
         let bell = GUEST_RAM_BELL.lock().unwrap_or_else(|e| e.into_inner()).take();
         let geometry = Geometry::for_wayland();
+        // §103.15: one page more than the control region. Page 0 is the boot
+        // page (the boot record, the host's answer and its release word) for
+        // the whole session; the control region starts at page 1.
         let (window, run, pages) =
-            wc_handle::arena::stamped_guest_ram_window(geometry.control_size).map_err(|e| e.to_string())?;
+            wc_handle::arena::stamped_guest_ram_window(geometry.control_size + wc_handle::arena::REGION_PAGE as u64)
+                .map_err(|e| e.to_string())?;
         println!(
             "wc-compositor: wayland rings in guest RAM: run 0x{run:016x}, {pages} rings pages, {} bytes, pinning={}",
             window.len, window.pinning
@@ -635,7 +639,10 @@ impl PendingRings {
         // SAFETY: the window is leaked below, so the region outlives every
         // user of it; its length is at least the geometry's control size.
         let region = Arc::new(unsafe {
-            sv_transport::region::SharedRegion::from_raw(self.window.base(), self.geometry.control_size as usize)
+            sv_transport::region::SharedRegion::from_raw(
+                self.window.base().add(wc_handle::arena::REGION_PAGE),
+                self.geometry.control_size as usize,
+            )
         });
         std::mem::forget(self.window);
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
@@ -674,6 +681,11 @@ pub struct GuestRamWake {
 }
 
 impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
+    fn rescan(&self, woken: &std::sync::atomic::AtomicU64) {
+        self.waker.wake();
+        sv_transport::vdoorbell::BellTarget::rescan(&*self.control, woken);
+    }
+
     fn ring_token(&self, token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
         self.waker.wake();
         sv_transport::vdoorbell::BellTarget::ring_token(&*self.control, token, woken);
@@ -681,11 +693,6 @@ impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
         true
     }
 
-    // §105: wake the turn, which pumps every ring, and every service thread.
-    fn reopened(&self) {
-        self.waker.wake();
-        sv_transport::vdoorbell::BellTarget::reopened(&*self.control);
-    }
 }
 
 /// What a byte on the rings' port does in the compositor (§89): end the
@@ -694,16 +701,17 @@ impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
 pub struct WakeOnBell(pub crate::tick::Waker);
 
 impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
+    /// The loop's turn pumps every ring, so one wake is a rescan.
+    fn rescan(&self, _woken: &std::sync::atomic::AtomicU64) {
+        self.0.wake();
+    }
+
     fn ring_token(&self, _token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
         woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.0.wake();
         true
     }
 
-    // §105: the turn this starts pumps every ring.
-    fn reopened(&self) {
-        self.0.wake();
-    }
 }
 
 /// Open the Wayland rings' doorbell (waycompose-design.md §89): the

@@ -254,6 +254,9 @@ pub const STAMP_FILL: u8 = 0xAB;
 
 /// The page size the stamps and the host's sweep both work in.
 pub use crate::platform::REGION_PAGE;
+/// §103.15: the macOS region keeper (`platform::unix::alloc_kept`).
+#[cfg(target_os = "macos")]
+pub use crate::platform::{set_region_keeper, RegionKeeper};
 
 /// §85. The compositor flag that lets a guest-RAM arena be made of small,
 /// `VirtualLock`ed pages. Its name is the warning: §84.5 measured such pages
