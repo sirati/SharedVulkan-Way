@@ -40,6 +40,8 @@ mod ico;
 mod macbundle;
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+mod audio_mac;
 mod plan;
 #[cfg(windows)]
 mod shell;

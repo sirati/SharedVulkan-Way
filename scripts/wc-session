@@ -462,6 +462,11 @@ audio_up() {
   {
     echo '#!/usr/bin/env bash'
     printf 'export HOME=%q PULSE_RUNTIME_PATH=%q PULSE_STATE_PATH=%q\n' "$D/pulse-home" "$D/xdg/pulse" "$D/pulse-state"
+    # §103.8: no session bus. A PulseAudio claims org.PulseAudio1 on it, so a
+    # second session running at the same time (macOS runs one per application)
+    # failed with "D-Bus name org.PulseAudio1 already taken" and had no sound.
+    # The null sink and the monitor socket need no D-Bus at all.
+    echo 'unset DBUS_SESSION_BUS_ADDRESS'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
     printf '  -L %q \\\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1"

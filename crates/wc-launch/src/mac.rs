@@ -217,6 +217,11 @@ fn pin_in_dock(bundle: &Path) -> Result<(), String> {
 
 struct Session {
     id: String,
+    /// This session's loopback port for its sound. Not the ini's fixed one:
+    /// every running application has a session and a tunnel of its own, and a
+    /// second tunnel that cannot bind the first one's port fails whole
+    /// (ExitOnForwardFailure), Wayland socket included.
+    audio_port: u16,
     host_app: String,
     tunnel: Mutex<Option<Child>>,
     up: Mutex<bool>,
@@ -250,7 +255,17 @@ fn run_app(cfg: Config, section: &str) -> ExitCode {
     let comp_log = log_dir().join(format!("{section}.compositor.log"));
     let _ = std::fs::remove_file(&comp_log);
 
-    let session = Arc::new(Session { id: id.clone(), host_app: host_app.clone(), tunnel: Mutex::new(None), up: Mutex::new(false) });
+    let audio_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or_else(|_| cfg.audio_port());
+    let session = Arc::new(Session {
+        id: id.clone(),
+        audio_port,
+        host_app: host_app.clone(),
+        tunnel: Mutex::new(None),
+        up: Mutex::new(false),
+    });
 
     // The Dock menu, from the answer the installer kept, and what a pick does.
     let cached = section_of_bundle()
@@ -353,6 +368,31 @@ fn wait_line(path: &Path, needle: &str, timeout: Duration) -> Option<String> {
     None
 }
 
+/// Play the session's sound (§86) through CoreAudio, for as long as the
+/// forward delivers it.
+fn start_audio(port: u16, vol: u8, log: &Log) {
+    let log = log.clone();
+    let _ = std::thread::Builder::new().name("audio".into()).spawn(move || {
+        let mut conn = None;
+        for _ in 0..40 {
+            if let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                conn = Some(c);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let Some(c) = conn else {
+            log.say(&format!("audio: nothing on 127.0.0.1:{port}"));
+            return;
+        };
+        log.say(&format!("audio: playing s16le 48000 Hz stereo through CoreAudio, from 127.0.0.1:{port}"));
+        match crate::audio_mac::play(c, vol) {
+            Ok(st) => log.say(&st.line()),
+            Err(e) => log.say(&format!("audio: {e}")),
+        }
+    });
+}
+
 fn bring_up(cfg: &Config, s: &Session, log: &Log, comp_log: &Path, socket_path: &Path) -> Result<(), String> {
     let t0 = Instant::now();
     let arena = wait_line(comp_log, "provided from guest RAM: run", Duration::from_secs(30))
@@ -380,8 +420,13 @@ fn bring_up(cfg: &Config, s: &Session, log: &Log, comp_log: &Path, socket_path: 
         "ServerAliveInterval=30".into(),
         "-R".into(),
         format!("{}:{}", plan::remote_upstream(&s.id), socket_path.to_string_lossy()),
-        cfg.host.clone(),
     ]);
+    // §86's sound, the other way: a loopback port here that reaches the
+    // PulseAudio monitor `wc-session proxy` makes for this session.
+    if cfg.audio {
+        a.extend(["-L".into(), format!("127.0.0.1:{}:{}/audio.sock", s.audio_port, plan::remote_dir(&s.id))]);
+    }
+    a.push(cfg.host.clone());
     let child = Command::new(&cfg.ssh)
         .args(&a)
         .stdin(Stdio::null())
@@ -398,6 +443,9 @@ fn bring_up(cfg: &Config, s: &Session, log: &Log, comp_log: &Path, socket_path: 
             Ok(o) => {
                 log.say(&format!("proxy: {}", o.trim().replace('\n', "; ")));
                 proxied = true;
+                if cfg.audio && o.contains("audio pulse") {
+                    start_audio(s.audio_port, cfg.audio_volume, log);
+                }
                 break;
             }
             Err(e) => {

@@ -50,7 +50,7 @@ gpu      = off
 [firefox]
 exec     = $(readlink -f "$(command -v firefox)")
 profile  = $HOME/.wc-launch/mac-firefox
-prefs    = middlemouse.paste=false
+prefs    = middlemouse.paste=false;media.autoplay.default=0
 titlebar = mac-tabs
 desktop  = firefox
 gpu      = off
