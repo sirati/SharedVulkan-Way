@@ -902,6 +902,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sv-drm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "sv-gpu-entry"
 version = "0.1.0"
 dependencies = [

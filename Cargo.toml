@@ -47,6 +47,8 @@ members = [
   "crates/wc-arena-host",
   "crates/wc-shmclient",
   "crates/wc-proxy",
+  # §104: the userspace render node and the dma-buf tokens.
+  "crates/sv-drm",
   # The WLCS integration module (docs/waycompose-design.md §26). A member so that the
   # Windows cross gate and clippy see it; its body is `#[cfg(unix)]`, so on
   # Windows it compiles to an empty library rather than to a linker error
