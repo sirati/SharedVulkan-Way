@@ -33933,3 +33933,252 @@ with full suites alongside as load.
   the whole suite at 32 threads). The test now uses an owned region, and
   `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
   parallel suite runs, 0 failures.
+
+## 108. Shared memory that grows and shrinks: one region protocol, and a Windows guest that lends its own RAM
+
+Branch `windows-guest-ram`, from master `3955922`, 2026-10-19. The brief
+(user, 2026-10-19): "it's rather important that the shared memory can be
+dynamically allocated and deallocated as needed and that we are not fixed at a
+specific size", and "128 MB are not enough. We need to be able to use the GPU
+properly." Any number of applications must fit together. A client that asks
+for more than exists gets a lazy yes (the proxy backs `wl_shm` pools on
+demand, another branch). §97.3 already showed that the ivshmem devices cannot
+grow at run time without pinning more host RAM, which the host does not have.
+
+This section has two halves:
+
+* **108.1–108.6, the region protocol.** It is substrate-independent: the
+  GPU pool (§97) and the Wayland arena (§107) both grow and shrink through it,
+  whatever backs the memory: a BAR, the Windows guest's RAM, or a real Mac's
+  POSIX shm chunks (§103.17, role (b)).
+* **108.7 onwards, the Windows substrate.** Large-page sections in the guest's
+  RAM, held by a keeper, and located by the host with one probe per 2 MiB.
+
+The protocol was written first so that the other substrates can be built
+against it in parallel. Everything marked *measured* below has a number from a
+run; the rest is the specification.
+
+### 108.1 Words
+
+* **Pool**: an allocator that hands out ranges to sessions. Today there are two:
+  `sv_arena::pool` (the GPU pool, §97) and the compositor's `BarPool` (the
+  Wayland arena, §107). A pool offset is `region << 32 | offset` (§97.4).
+  Region 0 is the **bootstrap**: memory both sides have from the start (an
+  ivshmem BAR on Windows, the arena file in role (b), the guest-RAM window on
+  macOS role (a)).
+* **Region K** (K ≥ 1): memory added to a pool at run time and removed again.
+  One region is one substrate allocation, freed only as a whole.
+* **Provider**: the side that owns the region's memory and frees it. It is
+  always the pool's owner: the guest's GPU process or compositor on Windows,
+  and the Mac's GPU server or main process in role (b).
+* **Peer**: the side that maps the region from across the VM boundary. It is
+  one service per pool, the only writer of the peer half of the table (108.2).
+  Every other process on the peer's side that maps any byte of a region holds a
+  **mapping lease** from that service.
+* **Substrate**: what backs a region, and how the peer finds it. One `kind`
+  per substrate (108.3).
+
+### 108.2 The region table
+
+A 32 KiB block in the pool's bootstrap memory, at an offset each pool
+publishes (108.6). Every field is little-endian. Each half of each entry has
+exactly one writer, so no word is written from both sides of the boundary.
+
+```text
+table header, 128 bytes
+  0   magic "SVRGN001"                       provider, written last at start
+  8   u32 version (1)                        provider
+  12  u32 entries (255)                      provider
+  16  u64 provider run id                    provider; a new owner, a new id
+  24  u64 provider beat                      provider, +1 at least every 250 ms
+  32  u64 peer run id                        peer
+  40  u64 peer beat                          peer, +1 at least every 250 ms
+  48  u64 want bytes                         peer: "a host-side caller is short"
+  56  u64 want seq                           peer, +1 per new want
+  64  u64 budget bytes                       provider: what it may still add
+  72  u64 epoch counter                      provider (the last epoch it used)
+  80  48 bytes reserved, zero
+
+entry i (1..=255), 128 bytes, at 128 * i
+  provider half
+    0   u32 pstate   0 EMPTY, 1 ANNOUNCED, 2 RETIRING      written last
+    4   u32 kind     108.3
+    8   u64 epoch    unique per announce in this provider run, never 0
+    16  u32 region   K, the pool's region index (1..)
+    20  u32 flags    bit 0: an orphan adopted from a dead provider run (108.5)
+    24  u64 len      bytes, a multiple of the kind's unit
+    32  64 bytes     the kind's handle (108.3)
+  peer half
+    96  u32 qstate   0 NONE, 1 MAPPED, 2 REFUSED, 3 UNMAPPED  written last
+    100 u32 reason   a code from 108.4 when REFUSED
+    104 u64 epoch    the provider epoch this answer is for
+    112 u64 peer time of the answer, µs (frametrace::mono_us)
+    120 u64 reserved
+```
+
+A table is valid only while the header's magic, version and provider run id
+match the ones the peer saw at attach. A changed run id is a provider restart
+(108.5).
+
+**Wakes.** Any write that the other side must act on is followed by one bell
+token, `0xFB` `REGION_TOKEN` ("a region table changed"), on the pool's own
+doorbell: `svbell` for the GPU pool and `wcbell` for the Wayland arena. The
+rescan rule of §103.14 applies. Every open, reopen, `RESCAN_TOKEN` and every
+beat timer tick (250 ms) rereads the whole table, so a lost token costs at
+most 250 ms and never a stuck region. The table is 32 KiB, so a reread costs
+microseconds.
+
+### 108.3 Kinds and handles
+
+| kind | substrate | handle (64 bytes) | unit | how the peer finds it |
+|---|---|---|---|---|
+| 1 `BAR` | a range of an ivshmem BAR beyond the bootstrap | u64 offset into the device's file | 1 MiB | opens the device's file by name and maps `offset` (§107's `ivshmem_window`); stamps checked once |
+| 2 `WIN_LARGE` | a Windows large-page section in guest RAM (108.7) | 16-byte nonce, u32 units, u32 keeper id, u64 0 | 2 MiB | **`Locator::Probe`**: reads one 64-byte stamp every 2 MiB of the RAM backend (108.9); every unit found exactly once, or REFUSED |
+| 3 `WIN_AWE` | AWE frames (reserved, not built: 108.8) | u64 offset and u64 length of an out-of-line frame list in the bootstrap | 4 KiB | translates the frames through the flat view (`PfnLocator`) and checks each stamp |
+| 4 `MAC_SHM` | role (b): a POSIX shm chunk of the Mac, placed in the guest's fixed IPA window | 40-byte NUL-padded shm name, u64 window offset, u64 0 | the chunk (64 MiB) | the Linux guest maps its window at `offset`; the Mac maps the chunk by name |
+| 5 `FILE` | a range of a plain shared file (tests; the Linux guest of §71) | u64 offset | 4 KiB | maps the file at `offset` |
+
+A kind the peer does not know is answered `REFUSED`/`KIND`. New substrates
+add a kind; the table does not change.
+
+### 108.4 The life of a region
+
+```text
+ provider                                  peer
+ ────────                                  ────
+ allocate the substrate, stamp it
+ fill the entry, epoch = ++counter,
+ pstate = ANNOUNCED            ── 0xFB ──▶ locate, map, verify the stamps
+                                           qstate = MAPPED (or REFUSED + reason),
+                               ◀── 0xFB ── epoch echoed
+ pool.add_region(K, len)
+ ... leases in K ...
+ K empty for the shrink delay:
+ pool.drain(K); pool.remove_region(K)
+ pstate = RETIRING             ── 0xFB ──▶ every mapping lease of K returned
+                                           (or its process dead), its own view
+                                           unmapped
+                               ◀── 0xFB ── qstate = UNMAPPED, epoch echoed
+ free the substrate
+ pstate = EMPTY
+```
+
+Rules, each one there for a failure it prevents:
+
+1. **Nothing is leased in K before `MAPPED` for K's epoch.** A lease the peer
+   cannot reach would be a session that hangs on its first write.
+2. **A region is retired only when it holds no lease.** The pool's `drain`
+   stops new leases in K first. Nothing live is ever moved: the pool does not
+   copy, so a region that never empties is simply never retired.
+3. **The keeper rule: the provider frees the substrate only after `UNMAPPED`
+   for that epoch.** No timeout replaces the acknowledgement. A peer that never
+   answers keeps the memory allocated, which wastes memory and corrupts
+   nothing. §103.15 shows what a timeout costs: the macOS guest panicked
+   three times out of three when the proxy wrote for its 5 s lease into pages
+   the guest had already reused.
+4. **The peer answers `UNMAPPED` only when no process on its side can touch
+   K.** Every process that maps a byte of K holds a mapping lease from the
+   peer service: a connection whose end means "unmapped or dead". A process
+   that unmaps replaces the range with an inaccessible reservation
+   (`PROT_NONE`), never with nothing, so a stale pointer faults in its own
+   process instead of reaching a page the guest has reused. The peer waits
+   for every lease. If one is held past 30 s, it logs the holder's pid and
+   keeps waiting; it never kills a process to finish a retire.
+5. **Epochs are never reused in a provider run**, and every answer echoes the
+   epoch, so an answer meant for an earlier occupant of entry i (or of region
+   K) is never taken for the current one.
+6. **REFUSED is final for that epoch.** The provider frees the substrate at
+   once (the peer mapped nothing) and may try again with a new epoch. Reasons:
+   1 `KIND`, 2 `NOT_FOUND` (units missing), 3 `DUPLICATE` (a unit found twice),
+   4 `LIMIT` (the peer's own limit, e.g. map count), 5 `MAP` (the mapping
+   failed), 6 `BUDGET` (larger than the peer allows).
+
+The peer never writes the provider half, and the provider never writes the peer
+half. A peer that restarts reads every entry again: it maps `ANNOUNCED`
+entries it has no record of and answers `MAPPED` again with the same epoch,
+and it answers `RETIRING` ones directly with `UNMAPPED` once its previous run's
+mapping leases have ended. It keeps those records in `$XDG_RUNTIME_DIR`, so a
+restart within one boot still knows the old run's leases.
+
+### 108.5 When a side dies
+
+* **The provider dies.** The provider beat stops (no beat for 2 s), or the run
+  id changes. The peer then treats every entry of that run as `RETIRING`. It
+  revokes all mapping leases (the sessions of that pool ended with their owner
+  anyway), unmaps, and writes `UNMAPPED` with each epoch. The memory itself must
+  outlive the provider until then. On Windows a keeper holds it (108.10), and
+  on the Mac whatever holds the chunk's name does. The next provider run
+  **adopts** the dead run's entries: it rewrites them under its own run id,
+  with `flags` bit 0 and the old epoch, as `RETIRING`, and frees each one when
+  `UNMAPPED` arrives. A substrate whose memory the provider's death frees at
+  once (Windows AWE, private `VirtualAlloc`) cannot satisfy rule 3 and is not
+  allowed as a region's kind.
+* **The peer dies.** Nothing is freed while its acknowledgements are
+  outstanding. A new peer run reads the table and answers everything (108.4).
+  The provider keeps running and keeps leasing in regions that are `MAPPED`.
+  A host process that still maps them (a proxy) holds them alive, which is
+  correct.
+
+### 108.6 Policy, and the hooks in the two pools
+
+**Grow.**
+* **On demand.** A lease that does not fit in any region asks for a region of
+  `max(request rounded up to the unit, step)`. The lease waits for the answer
+  (one round trip plus the locate, 108.11) instead of failing. It fails with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` (GPU) or `err` (arena slot) only if the
+  provider is past its budget or the peer refuses.
+* **Ahead of demand (high water).** After any lease, when free bytes across
+  all regions fall below `low_water = max(32 MiB, used / 4)`, one region of
+  `step` is announced in the background. The next lease then usually fits
+  without waiting.
+* **The step** is geometric: `step = clamp(used / 2, 64 MiB, 1 GiB)`. Two
+  small Firefox sessions cost one or two 64 MiB regions, and VulkanMod's
+  several hundred MiB cost two or three regions instead of fifty.
+* **The budget**, set by the provider and published in the header so the
+  peer can show it. On Windows, `min(the configured cap, available guest RAM −
+  reserve)`, with `reserve = max(1 GiB, 15% of guest RAM)`, read from
+  `GlobalMemoryStatusEx` at each grow. Windows itself never runs out because
+  of us. A grow that would cross it is refused, and the pool answers out of
+  memory as §97 does.
+* **The peer's want.** The peer (for example a host-side heap of the ICD, or
+  the proxy's lazy `wl_shm` backing) bumps `want bytes`/`want seq` when it
+  needs room the provider cannot see. The provider treats a new want like a
+  failed lease of that size.
+
+**Shrink.**
+* A region that has held no lease for **30 s** is retired. It must also be
+  that, without it, free bytes stay above `2 × low_water`, so a region is
+  not retired just to be announced again a second later (hysteresis).
+* At most one retire is in flight per pool, and none within 10 s of a grow.
+* **Packing.** New leases go to the lowest-numbered non-draining region with
+  room. Region 0 first, then the oldest regions, so the newest regions empty
+  first and are the ones given back.
+
+**The GPU pool (`sv_arena::pool`, §97).** The table sits at offset 4096 of the
+pool header (the 64 KiB that are never leased, `poolhdr`, version 2). The
+provider is the guest's GPU process and the peer is `sv-hostd`. The ICD's
+lease mappings are its mapping leases, and `vkFreeMemory` unmaps to `PROT_NONE`
+before `svReleaseArena` goes out. `MAX_REGIONS` grows from 8 to 64. The ICD
+reserves a region's 4 GiB of address space when the region is first used,
+not up front.
+
+**The Wayland arena (the compositor's `BarPool`, §107).** The compositor is
+the provider. Its BAR is region 0, and guest-RAM regions are added beside it.
+The arena slot's answer gains a form, and the existing form is unchanged:
+
+```text
+  grow MIN  -> ok ID OFFSET LEN              (§107: a range of the BAR)
+            |  ok ID region K OFFSET LEN     (new: a range of table region K)
+```
+
+The proxy maps such a grant through the peer service's mapping lease for K.
+The table's place in the arena's bootstrap is a proposal to
+`windows-multi-install`, which owns that layout: its first 64 KiB after
+`HEADER_BYTES`, announced by a word in the header page. The BAR shrinks to
+what the bootstrap needs: the header, the rings (10 MiB, §107.3) and a
+first region for the first window.
+
+**Role (b) (the real Mac).** The Mac's process is the provider with kind
+`MAC_SHM`. The Linux guest's ICD and proxy are peers, and the IPA window is
+their view. The guest acknowledges `UNMAPPED` before the Mac calls
+`shm_unlink` and unmaps for the last time.
