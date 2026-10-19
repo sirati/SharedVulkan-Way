@@ -1,4 +1,4 @@
-//! §105: the host-integration channel on the host. The `OWNER_HOSTINT` ring
+//! §106: the host-integration channel on the host. The `OWNER_HOSTINT` ring
 //! slot, as a [`wc_hostint::host::Link`], and the thread that serves it.
 //!
 //! The process that owns the session's rings calls [`spawn`] once it has the

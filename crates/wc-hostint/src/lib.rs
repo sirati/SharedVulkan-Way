@@ -1,4 +1,4 @@
-//! Host integration for waycompose (docs/waycompose-design.md §105): every
+//! Host integration for waycompose (docs/waycompose-design.md §106): every
 //! host audio device as its own PipeWire node in Linux with the defaults
 //! following the host, and opening links and files across the boundary in
 //! both directions, by type.

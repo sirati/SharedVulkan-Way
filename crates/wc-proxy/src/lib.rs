@@ -106,7 +106,7 @@ pub mod rings;
 /// §103.14: the macOS session's control and sound channels on the rings.
 #[cfg(unix)]
 pub mod macsvc;
-/// §105: host integration's Linux end: the `OWNER_HOSTINT` slot, the host's
+/// §106: host integration's Linux end: the `OWNER_HOSTINT` slot, the host's
 /// devices as PipeWire nodes, its applications as desktop entries, and
 /// `wc-host-open`.
 #[cfg(unix)]

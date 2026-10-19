@@ -69,7 +69,7 @@ fn load_config() -> Result<Config, String> {
 }
 
 pub fn main(args: Vec<String>) -> ExitCode {
-    // §105: --hostint-probe, --render-test, --capture-test (mac_hostint.rs).
+    // §106: --hostint-probe, --render-test, --capture-test (mac_hostint.rs).
     if let Some(code) = crate::mac_hostint::cli(&args) {
         return code;
     }
@@ -153,7 +153,7 @@ fn install(cfg: &Config, section: &str, pin: bool, meta_dir: &Path) -> Result<Pa
     let contents = bundle.join("Contents");
     std::fs::create_dir_all(contents.join("MacOS")).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(contents.join("Resources")).map_err(|e| e.to_string())?;
-    // §105: with the desktop entry's document and URL types.
+    // §106: with the desktop entry's document and URL types.
     std::fs::write(contents.join("Info.plist"), macbundle::info_plist_for(section, &name, &meta.mimes)).map_err(|e| e.to_string())?;
     // The host's answer, kept so the Dock menu exists before the first
     // session has asked again.
@@ -172,7 +172,7 @@ fn install(cfg: &Config, section: &str, pin: bool, meta_dir: &Path) -> Result<Pa
     let tmp = target.with_extension("new");
     std::fs::copy(&exe, &tmp).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &target).map_err(|e| e.to_string())?;
-    // §105: the main process's own bundle, org.waycompose.host (TCC rule 1).
+    // §106: the main process's own bundle, org.waycompose.host (TCC rule 1).
     crate::mac_hostint::install_host_bundle(&exe)?;
     // LaunchServices learns the bundle now rather than at the next login.
     let _ = Command::new(
@@ -562,7 +562,7 @@ fn request(cfg: &Config, s: &Arc<Session>, log: &Log, section: &str, key: &str) 
     let (s, log, key, section) = (s.clone(), log.clone(), key.to_string(), section.to_string());
     let cfg = cfg.clone();
     std::thread::spawn(move || {
-        // §105: a document from the Mac goes to Linux by its Linux path; a
+        // §106: a document from the Mac goes to Linux by its Linux path; a
         // copy into the drop folder, if it is outside the share, is made
         // here rather than on the router's thread.
         let key = match crate::mac_hostint::map_open_key(&cfg, &key) {
@@ -673,7 +673,7 @@ fn run_face_mode(cfg: &Config, section: &str) -> ExitCode {
             Err(_) if !started => {
                 started = true;
                 log.say("no main process; starting one");
-                // §105: from its own bundle, through Launch Services (TCC rule 1).
+                // §106: from its own bundle, through Launch Services (TCC rule 1).
                 if crate::mac_hostint::start_main_in_host_bundle(&log_dir().join("main.stderr.log"), &|m| log.say(m)) {
                     continue;
                 }
@@ -782,7 +782,7 @@ fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
             }
         }).ok();
     }
-    // §105 host integration: BEGIN (the rest is in mac_hostint.rs)
+    // §106 host integration: BEGIN (the rest is in mac_hostint.rs)
     {
         let (cfg2, log2) = (cfg.clone(), log.clone());
         std::thread::Builder::new().name("hostint-open".into()).spawn(move || {
@@ -792,7 +792,7 @@ fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
             }
         }).ok();
     }
-    // §105 host integration: END
+    // §106 host integration: END
     log.say(&format!("session up {:?} after start", t0.elapsed()));
     Ok(())
 }

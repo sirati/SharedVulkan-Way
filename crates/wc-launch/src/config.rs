@@ -46,7 +46,7 @@ pub struct App {
     pub app_id: String,
 }
 
-/// §105. `[hostint]`: how a file on this machine reaches Linux, and which
+/// §106. `[hostint]`: how a file on this machine reaches Linux, and which
 /// browser opens Linux's links here. The same keys on both hosts, checked
 /// by the host's rules ([`HostInt::check_for`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +248,7 @@ pub struct Config {
     /// with: GTK uses `wp_viewporter` whenever it is offered, and that path has
     /// not been through §95's desktop checks.
     pub nested_globals: bool,
-    /// §105. Host integration: the shared folder and its drop directory,
+    /// §106. Host integration: the shared folder and its drop directory,
     /// and the browser for links from Linux. `[hostint]`.
     pub hostint: HostInt,
     pub apps: BTreeMap<String, App>,
@@ -554,7 +554,7 @@ audio-volume = 100
 # The loopback port the tunnel forwards to it; default port + 1.
 # audio-port = 57432
 
-# Host integration (§105). A file opened here with a Linux application is
+# Host integration (§106). A file opened here with a Linux application is
 # sent by its path in the shared folder; one from elsewhere is copied into the
 # drop directory first. Links from Linux open in the default browser unless
 # `browser` names one. The defaults:

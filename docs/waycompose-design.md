@@ -33271,7 +33271,7 @@ was not measured.
    access to nothing but the fake ioctls.
 
 
-## 105. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
+## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 
 2026-10-19, branch `host-integration`, crate `wc-hostint`. The model is the
 one the real-Mac prototype proved over vsock (github sirati/
@@ -33282,7 +33282,7 @@ the boundary except through the session's shared memory: one ring slot for
 messages, the sound ring for samples, and a file share that the VM already
 has.
 
-### 105.1 What it does
+### 106.1 What it does
 
 * **Audio per device.** Every host output (speakers, headphones, a display's
   audio) is its own PipeWire sink in Linux, and every host input (a
@@ -33307,7 +33307,7 @@ has.
   "TextEdit (macOS)", in every "Open with" dialog. The host's default for a
   type is Linux's default for it.
 
-### 105.2 The channel: one ring slot, either side asks
+### 106.2 The channel: one ring slot, either side asks
 
 The control channel (§103.14, §103.15) is a request from the host and a
 reply from Linux. Opening a link is the reverse, and the audio and handler
@@ -33336,9 +33336,9 @@ crosses only as base64 inside one word:
 A host application crosses only as an opaque token
 (`[a-z0-9]{1,32}`). Its executable path or bundle id stays on the host,
 so Linux names an application and never sends a command (§94's rule, the
-other way round). The host's checks are in `docs/security-model.md` R37.
+other way round). The host's checks are in `docs/security-model.md` R38.
 
-### 105.3 Audio
+### 106.3 Audio
 
 **On the host.** Windows enumerates endpoints with `IMMDeviceEnumerator`
 and is told about changes by an `IMMNotificationClient`
@@ -33384,7 +33384,7 @@ user, like the real Mac's Linux VM, whose units carry
 `ConditionUser=<desktop user>`). The per-session null sink is unnecessary
 once the host's devices are nodes.
 
-### 105.4 Links and files
+### 106.4 Links and files
 
 **Linux side.** The session's applications get `wc-host-open` as a
 high-priority `xdg-open` on `PATH` and `BROWSER=xdg-open`. Their
@@ -33408,7 +33408,7 @@ the guest over virtio-fs, as `Z:`. That is the share, both ways, and
 is opened with a Linux application is copied there first, so the Linux
 application edits the copy. macOS on a real Mac: the Linux VM mounts the
 Mac user's home over virtio-fs at the same path, so the map is the identity.
-The macOS VM is §105.6.
+The macOS VM is §106.6.
 
 **Host side, Windows.** `wc-launch`'s deploy registers each application's
 types under HKCU (`wc_hostint::assoc::windows_plan`). It writes a manifest,

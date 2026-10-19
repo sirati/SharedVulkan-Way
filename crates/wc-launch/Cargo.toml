@@ -17,7 +17,7 @@ description = "Double-click a Windows shortcut and a Linux application appears, 
 # §103.8: the icon of a macOS bundle is resampled to an exact .icns size. The
 # version the compositor already uses for the clipboard and icons.
 png = "0.18"
-# §105: host integration. The decisions (path map, registry plan, MIME table)
+# §106: host integration. The decisions (path map, registry plan, MIME table)
 # and the host's platform calls (registry, file URLs for the share).
 wc-hostint = { workspace = true }
 wc-hostplat = { workspace = true }

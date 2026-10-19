@@ -11,7 +11,7 @@
 //!   from its own handler enumeration (`handlers.rs`), never Linux's.
 //!
 //! Two checks of this platform's own, on top of the Service's
-//! (security-model R37):
+//! (security-model R38):
 //! * **No application bundle is ever opened as a document.** The Service
 //!   refuses `.app` and the other dangerous extensions; a directory is
 //!   checked again here, after symlinks are resolved, by extension and by
@@ -93,7 +93,7 @@ fn refuse_own_default(url: Option<cf::Owned>) -> Result<(), String> {
     Ok(())
 }
 
-/// The R37 check for a host path: no application bundle, before or after
+/// The R38 check for a host path: no application bundle, before or after
 /// following symlinks.
 pub fn check_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);

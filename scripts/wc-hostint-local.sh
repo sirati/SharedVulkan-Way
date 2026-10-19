@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §105: host integration's Linux end, end to end on this machine, no VM.
+# §106: host integration's Linux end, end to end on this machine, no VM.
 #
 #   scripts/wc-hostint-local.sh [--no-build]
 #

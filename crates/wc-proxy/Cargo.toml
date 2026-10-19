@@ -29,7 +29,7 @@ path = "src/lib.rs"
 name = "wc-proxy"
 path = "src/main.rs"
 
-# §105: `xdg-open` for the session's applications, and the `Exec=` of the host
+# §106: `xdg-open` for the session's applications, and the `Exec=` of the host
 # applications' desktop entries. One request to the proxy's local socket.
 [[bin]]
 name = "wc-host-open"
@@ -55,5 +55,5 @@ quick-xml = "0.41"
 png = "0.18"
 # §104: the dma-buf token format (`--dmabuf-node`).
 sv-drm = { path = "../sv-drm" }
-# §105: host integration's pure core (wire format, audio plan, desktop entries).
+# §106: host integration's pure core (wire format, audio plan, desktop entries).
 wc-hostint = { workspace = true }

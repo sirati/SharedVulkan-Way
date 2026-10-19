@@ -85,7 +85,7 @@ pub fn info_plist(section: &str, name: &str) -> String {
     )
 }
 
-/// §105: what a Linux application claims on the Mac, from its desktop
+/// §106: what a Linux application claims on the Mac, from its desktop
 /// entry's `MimeType=` list as the host sent it (`appmeta::Meta::mimes`):
 /// file types and, from `x-scheme-handler/...`, URL schemes. Each is
 /// checked again (`wc_hostint::mime`): the list is Linux's, and it ends up in
@@ -121,7 +121,7 @@ pub fn info_plist_for(section: &str, name: &str, mimes: &[String]) -> String {
     }
 }
 
-/// §105, TCC rule 1: the main process's own bundle. The microphone is opened
+/// §106, TCC rule 1: the main process's own bundle. The microphone is opened
 /// only by the main process, so macOS asks once, names "Waycompose Host",
 /// and keeps the grant under this identity, never under an application's
 /// face. `LSUIElement`: no Dock tile and no menu bar (the main process also

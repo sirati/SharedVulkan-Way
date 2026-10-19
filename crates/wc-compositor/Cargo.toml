@@ -45,7 +45,7 @@ wc-transport = { workspace = true }
 # §36: the Wayland byte stream rides shared_vulkan's rings, so the compositor
 # accepts connections from the same control region the GPU half uses.
 sv-transport = { workspace = true }
-# §105: host integration (open links and files, per-device audio), served on a ring slot.
+# §106: host integration (open links and files, per-device audio), served on a ring slot.
 wc-hostint = { workspace = true }
 # §93: pictures on the clipboard. Windows' applications read a copied image as
 # `CF_DIB`, and Wayland's as `image/png`; this converts between the two. The

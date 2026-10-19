@@ -1280,8 +1280,8 @@ each checked for its kind (store paths for libraries and manifests,
 `safe_socket` for `SV_SOCKET` and `SV_BELL`, fixed values for the rest), and
 writes them as plasmashell's environment; anything else is refused.
 
-### R37 — Linux asks the host to open links and files, and the host offers Linux its applications
-Added 2026-10-19 with `waycompose-design.md` §105. Until §105 every request
+### R38 — Linux asks the host to open links and files, and the host offers Linux its applications
+Added 2026-10-19 with `waycompose-design.md` §106. Until §106 every request
 went one way: the host (Windows, macOS) asked Linux to run one of its
 applications (§94, R33). Host integration adds the other direction. A Linux
 application that calls `xdg-open https://…`, or a person who picks "Notepad
@@ -1348,7 +1348,7 @@ needed there too.
 **The other direction (host to Linux) adds little.** A double-click in
 Explorer or Finder on a file that a Linux application registered for becomes
 the existing `open ID APP B64URL` control verb, with a `file:///` URL of the
-file's Linux path. §94 already checks that verb. §105 adds one check on the
+file's Linux path. §94 already checks that verb. §106 adds one check on the
 Linux side: a `file:///` URL must lie under a share root. Otherwise a holder
 of the host's control channel could make a Linux application display any
 Linux file (`~/.ssh/...`) in a window on the host. What the host registers

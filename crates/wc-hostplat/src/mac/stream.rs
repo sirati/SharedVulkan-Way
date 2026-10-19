@@ -12,7 +12,7 @@
 //! process.** A [`Capture`] holds the device from [`Capture::start`] until it
 //! is dropped: the sound-ring wiring starts one when a Linux client starts
 //! recording from the source node and drops it when the last one stops
-//! (security-model R37), so the menu bar's microphone indicator is on
+//! (security-model R38), so the menu bar's microphone indicator is on
 //! exactly while Linux records. `start` refuses unless this process's
 //! bundle is `org.waycompose.host` (TCC rule 1): the grant belongs to that
 //! identity, and a face must never be the one macOS asks about.

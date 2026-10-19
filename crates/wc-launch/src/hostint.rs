@@ -1,4 +1,4 @@
-//! §105 in the launcher: a Linux application registered with Windows for
+//! §106 in the launcher: a Linux application registered with Windows for
 //! the types its desktop entry opens (`--install` writes it, and
 //! `--uninstall-assoc` removes it through the manifest), and a file this
 //! machine asks Linux to open (`<app> --file PATH`, which the registration's

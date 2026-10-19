@@ -545,7 +545,7 @@ impl R {
                     (h.on_request)(&section, &key);
                 }
             }
-            // §105: what macOS asked the face's application to open. Each
+            // §106: what macOS asked the face's application to open. Each
             // becomes the request a Dock-menu page is (`open:<url>`); the
             // launcher maps a file to its Linux path before it is sent.
             FromFace::Open { urls } => {

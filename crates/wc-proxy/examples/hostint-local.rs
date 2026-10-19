@@ -1,4 +1,4 @@
-//! §105: the Linux end of host integration, end to end on one machine with no
+//! §106: the Linux end of host integration, end to end on one machine with no
 //! VM. Run by `scripts/wc-hostint-local.sh`, which starts a private PipeWire
 //! stack (`wc-session pw-stack`) and passes its socket.
 //!

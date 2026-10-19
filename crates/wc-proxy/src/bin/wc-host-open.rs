@@ -1,5 +1,5 @@
 //! `wc-host-open [--with TOKEN] TARGET...`: open URLs and files on the host
-//! desktop (docs/waycompose-design.md §105.4). The session's `xdg-open` and
+//! desktop (docs/waycompose-design.md §106.4). The session's `xdg-open` and
 //! the `Exec=` of its host-application desktop entries. It asks the proxy
 //! over `$WC_HOSTINT_SOCK`, a local socket; the proxy carries the request on
 //! the session's ring slot. See `wc_proxy::hostint::open_cli`.

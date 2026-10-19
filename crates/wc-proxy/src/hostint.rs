@@ -1,4 +1,4 @@
-//! §105: the Linux end of host integration. The proxy claims the
+//! §106: the Linux end of host integration. The proxy claims the
 //! `OWNER_HOSTINT` ring slot when the session has rings, as it claims the
 //! control and sound slots (`macsvc`), and serves it on threads of its own:
 //!

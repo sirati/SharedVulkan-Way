@@ -65,7 +65,7 @@ pub enum FromFace {
     Request { key: String },
     /// The face is quitting on purpose; do not restart it.
     Bye,
-    /// §105: documents or URLs macOS asked this application to open
+    /// §106: documents or URLs macOS asked this application to open
     /// (`application:openURLs:`: Finder's Open With, a double-click, `open
     /// -a`, a link whose scheme the bundle claims). The main process makes
     /// each one a request to open it in the application (`open:<url>`), a

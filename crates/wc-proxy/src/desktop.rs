@@ -60,7 +60,7 @@ pub struct Entry {
     pub exec: String,
     /// In `Actions=` order; an id with no group is skipped.
     pub actions: Vec<Action>,
-    /// §105. `MimeType=`, as listed (file types and `x-scheme-handler/...`).
+    /// §106. `MimeType=`, as listed (file types and `x-scheme-handler/...`).
     pub mime_types: Vec<String>,
 }
 
@@ -294,7 +294,7 @@ pub fn expand(words: &[String], entry: &Entry, url: Option<&str>) -> Result<Vec<
                 if let Some(u) = url
                     && !url_used
                 {
-                    // §105: `%f` is a local file, so a `file:` URL in its slot
+                    // §106: `%f` is a local file, so a `file:` URL in its slot
                     // is the decoded path; `%u` keeps the URL.
                     let file_slot = matches!(w.as_str(), "%f" | "%F");
                     if file_slot && u.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("file://")) {
@@ -391,7 +391,7 @@ pub fn open_command(entry: &Entry, url: &str) -> Result<Command, String> {
     open_command_in(entry, url, None)
 }
 
-/// [`open_command`], and with `roots` (§105: the Linux sides of the host's
+/// [`open_command`], and with `roots` (§106: the Linux sides of the host's
 /// shares, `--file-roots`) a `file:` URL must name an existing file under
 /// one of them once symbolic links are resolved. The host is the less
 /// trusted side for Linux's files: a session with host integration opens
@@ -507,7 +507,7 @@ pub fn info_lines(e: &Entry) -> Vec<String> {
     if let Some(w) = e.wm_class.as_ref().filter(|w| safe_arg(w)) {
         out.push(format!("wmclass {w}"));
     }
-    // §105: what the guest registers the application for. One word each,
+    // §106: what the guest registers the application for. One word each,
     // printable ASCII; the guest checks each again.
     for t in e.mime_types.iter().filter(|t| t.len() <= 255 && t.contains('/') && safe_arg(t)) {
         out.push(format!("mime {t}"));
@@ -543,7 +543,7 @@ pub fn split_args(args: &[String]) -> Result<(Vec<PathBuf>, Vec<String>), String
     split_opts(args).map(|o| (o.dirs, o.words))
 }
 
-/// What [`split_opts`] found: `--dirs`, `--file-roots` (§105) and the words.
+/// What [`split_opts`] found: `--dirs`, `--file-roots` (§106) and the words.
 pub struct Opts {
     pub dirs: Vec<PathBuf>,
     /// `Some` (possibly empty) when `--file-roots` was given: then a `file:`
@@ -793,7 +793,7 @@ Name=Profile Manager
         assert!(info.contains(&format!("action new-window {}", b64(b"New Window"))));
         assert!(info.contains(&format!("action-l new-private-window de {}", b64("Neues privates Fenster".as_bytes()))));
         assert!(info.contains(&format!("action new-tab {}", b64(b"New Tab"))));
-        // §105: the types, one per line; one with a space is not passed on.
+        // §106: the types, one per line; one with a space is not passed on.
         let mimes: Vec<&String> = info.iter().filter(|l| l.starts_with("mime ")).collect();
         assert_eq!(mimes, ["mime text/html", "mime text/xml", "mime x-scheme-handler/https"]);
     }
@@ -836,7 +836,7 @@ Name=Profile Manager
         assert!(v(&["--dirs"]).is_err());
     }
 
-    /// §105: a `file:` URL in a `%f` slot is the decoded local path; in `%u`
+    /// §106: a `file:` URL in a `%f` slot is the decoded local path; in `%u`
     /// it stays a URL.
     #[test]
     fn a_file_url_in_a_file_slot_is_its_path() {
@@ -848,7 +848,7 @@ Name=Profile Manager
         assert_eq!(open_command(&firefox(), "file:///srv/a%2Bb.txt").unwrap().args[2], "file:///srv/a%2Bb.txt");
     }
 
-    /// §105: with `--file-roots`, a `file:` URL opens only inside a share,
+    /// §106: with `--file-roots`, a `file:` URL opens only inside a share,
     /// after symbolic links are resolved; `http(s)` is unaffected.
     #[test]
     fn file_urls_from_the_host_stay_inside_the_shares() {

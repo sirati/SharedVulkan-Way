@@ -52,7 +52,7 @@ pub struct Meta {
     /// `icon NAME SIZE` and the PNG on the line after it.
     pub icon_name: String,
     pub icon_png: Option<Vec<u8>>,
-    /// §105. The entry's `MimeType=` list, one `mime TYPE` line each (file
+    /// §106. The entry's `MimeType=` list, one `mime TYPE` line each (file
     /// types and `x-scheme-handler/...`), each checked with
     /// `wc_hostint::mime::is_mime`: what the application is registered for
     /// on this machine.
@@ -485,10 +485,10 @@ mod tests {
         assert_eq!(m.icon_name, "firefox");
         assert_eq!(m.icon_png.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
         assert!(Meta::parse("program x\n").is_err());
-        assert!(m.mimes.is_empty(), "a host without §105 says nothing about types");
+        assert!(m.mimes.is_empty(), "a host without §106 says nothing about types");
     }
 
-    /// §105: the types the host's desktop entry opens, checked and deduplicated.
+    /// §106: the types the host's desktop entry opens, checked and deduplicated.
     #[test]
     fn the_host_s_mime_types_parse() {
         let m = Meta::parse(

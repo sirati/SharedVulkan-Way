@@ -10,7 +10,7 @@
 //! given `.exe` files only, so it never goes through `cmd.exe` either).
 //!
 //! Before a path is opened, Windows' own `AssocIsDangerous` is asked too
-//! (security-model R37): the Service's list is the floor, the system's list
+//! (security-model R38): the Service's list is the floor, the system's list
 //! (which administrators extend by policy) is added on top.
 
 use windows_sys::Win32::UI::Shell::{AssocIsDangerous, ShellExecuteW};

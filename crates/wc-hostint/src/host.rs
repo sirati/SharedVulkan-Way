@@ -72,7 +72,7 @@ impl Service {
     }
 
     /// A host path Linux may have opened: inside a share, and not of a type
-    /// whose opening runs or installs something (security-model R37).
+    /// whose opening runs or installs something (security-model R38).
     fn check_path(&self, p: &str) -> Result<String, String> {
         let p = validate_host_path(p, &self.roots(), self.cfg.windows_paths)?;
         if dangerous_path(&p, self.cfg.windows_paths) {

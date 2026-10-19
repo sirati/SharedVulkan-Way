@@ -1,6 +1,6 @@
 #!/bin/sh
 # xdg-open for an application in a waycompose session with host integration
-# (docs/waycompose-design.md §105.4): URLs open in the host's browser, files in
+# (docs/waycompose-design.md §106.4): URLs open in the host's browser, files in
 # a shared folder with the host's default for them. wc-session puts this
 # directory first in the application's PATH and sets WC_HOST_OPEN to the
 # deployed wc-host-open.

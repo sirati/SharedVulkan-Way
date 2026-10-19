@@ -1,5 +1,5 @@
 //! macOS: CoreAudio devices and streams, Launch Services handlers, `open`
-//! (docs/waycompose-design.md §105, the macOS host).
+//! (docs/waycompose-design.md §106, the macOS host).
 //!
 //! * [`audio`]: the devices (UID, name, channels, rate) and the defaults,
 //!   and a watcher that sends `Event::Audio` after every burst of changes.

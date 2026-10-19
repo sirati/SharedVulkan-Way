@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::handlers::{App, Found, Key};
 use wc_hostint::wire::Target;
 
-/// The main process's bundle identifier (§105, TCC rule 1): the only
+/// The main process's bundle identifier (§106, TCC rule 1): the only
 /// process that ever opens a microphone, and the identity the user's grant
 /// is kept under.
 pub const HOST_BUNDLE_ID: &str = "org.waycompose.host";
@@ -64,7 +64,7 @@ pub fn open_with_argv(bundle_id: &str, target: &Target) -> Vec<String> {
 
 /// Extensions of directories that macOS runs or loads rather than shows.
 /// A directory with one of them, or with `Contents/Info.plist` or
-/// `Contents/MacOS` inside, is never opened (security-model R37): `open`
+/// `Contents/MacOS` inside, is never opened (security-model R38): `open`
 /// on an `.app` starts it.
 pub const BUNDLE_EXTENSIONS: &[&str] = &[
     "app", "bundle", "framework", "plugin", "kext", "prefpane", "appex", "xpc", "workflow", "action", "service",
