@@ -706,3 +706,11 @@ prefer a private field on `PrivateSurfaceData`, or may prefer that the
 compositor not consume the buffer at all. The two `post_error` calls are
 uncontroversial on their own and could go upstream first, with the
 committed-buffer case following once the record's shape is agreed.
+
+* **`utils/sealed_file.rs`: the non-Linux Unix arm sizes the shm object with
+  `ftruncate` and fills it through `mmap`, and keeps a copy of the bytes for
+  `named()`** (waycompose-design.md §103.11). macOS POSIX shm objects support
+  neither `write(2)` nor `read(2)`: `write_all` failed, so no keymap object
+  existed, an in-band peer was sent no `wl_keyboard.keymap`, and every key a
+  macOS user typed reached a client that could not decode it. The BSDs accept
+  the same sequence, so the arm is not split further.

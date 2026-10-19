@@ -13,6 +13,16 @@ description = "Double-click a Windows shortcut and a Linux application appears, 
 # the machine that builds this, which is not the machine that runs it. What is
 # left for Windows is a named mutex and `CreateProcess`, and std does the second
 # one.
+[dependencies]
+# §103.8: the icon of a macOS bundle is resampled to an exact .icns size. The
+# version the compositor already uses for the clipboard and icons.
+png = "0.18"
+
+# §103.8: on macOS the launcher runs the compositor in its own process, so the
+# application's windows and its Dock tile are one process's.
+[target.'cfg(target_os = "macos")'.dependencies]
+wc-compositor = { path = "../wc-compositor" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
   # CloseHandle, GetLastError, ERROR_ALREADY_EXISTS.

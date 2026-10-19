@@ -31916,3 +31916,524 @@ definition.
    proven by the rejection and by the throwaway user's login (102.13).
 5. **The local harness and the NixOS test** do not yet set Wine's
    `Decorated=N`, so they cannot exercise a frame drag (102.13).
+## 103. macOS as the Wayland host: shared memory without a driver, Vulkan without Metal, and a Dock tile per Linux application
+
+### 103.1 Status in one paragraph
+
+A macOS machine now takes the place Windows has had since stage 1. In the Intel
+Sonoma VM on this workstation (role (a), 103.2), Linux Firefox, GNOME Console and
+Text Editor run as Mac applications. Each has its own `.app` bundle, its own Dock
+tile with its own name, icon and Dock menu (the desktop entry's actions), and can
+be kept in the Dock. Each runs in its own process, which holds that
+application's compositor (103.8). Windows are `NSWindow`s, menus are child
+windows, Firefox's tabs sit beside AppKit's traffic lights, and Cmd acts as
+Control. The clipboard goes both ways, sound plays through CoreAudio, and native
+edge resize, maximise and Quit behave as a Mac user expects. The pixels, and the
+GPU path's memory, are in the VM's own RAM. The macOS process wires the memory
+and the Linux host finds it, so no macOS kernel driver exists anywhere in the
+design (103.3). The VM has no Metal: Vulkan from Linux renders in it on
+lavapipe (vkcube at about 350 frames per second through `sv-icd`), and on a Mac
+with a GPU the same server takes KosmicKrisp or MoltenVK (103.6). The decisions
+are as before, with one revision: one compositor per application rather than
+one per user (103.8). cocoa-way was read for ideas only, because it is
+GPL-3.0-only. 103.11 is what was run and where. 103.12 is what is not built and
+what is not proven, including all of role (b) and everything on real Metal.
+
+### 103.2 Two roles, and why the code does not care which one it is in
+
+The user's goal names two arrangements, and the code is structured for both:
+
+* **(a) macOS as a guest of Linux.** Today's test rig: an Intel Sonoma VM on
+  QEMU/KVM on this workstation (`/mnt/datasets/macvm`, instance `wayland-host`).
+  The macOS side is inside a VM, so it is in exactly the Windows guest's position:
+  it must provide memory the Linux host can find.
+* **(b) macOS as the host of a Linux VM.** The target: a real Apple Silicon Mac,
+  its GPU providing Metal, running an arm64 NixOS VM whose applications appear as
+  macOS applications. Here the shared memory is ordinary host memory. Only the
+  Linux guest touches a PCI BAR, and Linux maps one from sysfs
+  (`/sys/bus/pci/devices/…/resource2`) or through `uio`, with no extra driver.
+
+The roles differ in **who owns the shared region**. They do not differ in **which
+side has the windows** (always macOS) or **which side has the applications**
+(always Linux). The code is therefore split along the second line, not the
+first:
+
+| piece | runs on | role (a) | role (b) |
+|---|---|---|---|
+| compositor + AppKit platform (`wc-compositor`, `platform/macos`) | macOS | VM guest | VM host |
+| each application's bundle process, which holds its compositor (103.8) | macOS | VM guest | VM host |
+| `sv-gpu-server` on MoltenVK/KosmicKrisp | macOS | VM guest (no Metal here, 103.6) | VM host, real GPU |
+| `wc-proxy`, `wc-session`, `sv-icd`, applications | Linux | VM host | VM guest |
+| region owner | — | macOS (superpages in guest RAM) | macOS (a POSIX shm object QEMU exposes as ivshmem) |
+| region locator | — | Linux (`wc-arena-host` sweep of QEMU's memfd) | Linux (maps BAR2 by name) |
+
+Every arena is already reached **by name** (§1a of design.md: no descriptor
+crosses the boundary), and the names are already the right kinds: a guest-RAM
+run id for (a), and a mapped file or device for (b). So role (b) does not need a
+second architecture. It needs the compositor's `--arena-ivshmem`-style "map this
+named region and write the header" pointed at a shm object, and the proxy's
+`--arena-ivshmem` pointed at `resource2` inside the Linux guest. Neither is built
+in this stage (there is no Apple Silicon Mac here). Both use the code that already
+exists, with the direction flipped, and 103.5 records what was checked so that
+(b) is not a guess.
+
+### 103.3 Shared memory in role (a): superpages, and why not a driver
+
+QEMU's ivshmem is a PCI BAR, and macOS has no ivshmem driver. The options, with
+the evidence for each:
+
+| option | what it needs on macOS | verdict |
+|---|---|---|
+| IOKit kext exposing BAR2 through an `IOUserClient` (the one existing open driver, camr0/IVSHMEM-macOS, AGPL-3.0, last commit 2022, interrupts stubbed) | loaded via OpenCore `Kernel→Add` (works with SIP on, as Hackintosh kexts do), or SIP off and `kmutil`; buildable with MacKernelSDK and the CLT | works in a QA VM only; a real Mac would need a Developer ID kext signing grant, and Apple is retiring kexts. **Not chosen** |
+| DriverKit / PCIDriverKit dext | `com.apple.developer.driverkit.transport.pci`, granted by Apple per team; full Xcode for `iig` | **not available without an Apple account** |
+| `/dev/mem` from a root process | does not exist on modern macOS | impossible |
+| virtio shared memory (virtio-fs DAX, virtio-gpu blobs, vsock) | Sonoma under QEMU binds only legacy virtio-net/blk/console/9p (`AppleVirtIO.kext`); the rest is Virtualization.framework-only | not available under QEMU |
+| **guest RAM**: the macOS process allocates and wires memory, stamps it, and the Linux host finds the pages in QEMU's RAM backend | `mmap` with `VM_FLAGS_SUPERPAGE_SIZE_2MB`, no privilege; QEMU's RAM as `memory-backend-memfd,share=on` | **chosen** |
+
+The guest-RAM path is §12's and §84's design. The guest stamps every 4 KiB page
+with a magic number, the run id and the page index. `wc-arena-host` (which links
+`sv-hostd`'s locator) sweeps QEMU's RAM memfd through `/proc/<qemu-pid>/fd`. It
+produces a plan of runs, which `wc-proxy --arena-plan` maps contiguously. §84.5
+showed what kills this design on Windows: `VirtualLock` keeps a page resident
+but not at one address. §85.2 therefore made the path **large pages or
+nothing**. macOS has the same two tiers:
+
+* `mlock` wires 4 KiB pages. XNU does not migrate wired pages on x86, but that is
+  a reading of the source, not a measurement. It is the diagnostic tier, as
+  `mlock` is on Linux, and is only taken under
+  `--arena-small-pages-may-corrupt-guest-memory`.
+* **Superpages** (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, x86_64 only) are 2 MiB,
+  physically contiguous and always wired. The call fails rather than falling
+  back to small pages. This is `MEM_LARGE_PAGES` without the privilege. Each
+  superpage is one 2 MiB run in guest-physical memory, so a 256 MiB arena is at
+  most 128 runs (Windows' large pages gave 28 to 31 per 64 MiB).
+  `alloc_locked_region` now takes this path on macOS and reports
+  `pinning=superpages`. In the VM, 1 GiB came back from one call and the
+  wired-page count rose by exactly the mapping (103.11).
+
+**Superpages need a VM with spare RAM; wired pages are the measured second
+tier.** At 8 and 12 GiB, superpages came back at once (the 8 GiB first window
+was 20 runs for 64 MiB). At 4 GiB, which is all this VM may have (103.10), not
+one 2 MiB superpage could be allocated, even one at a time, even after `purge`
+and with 1.8 GB free. XNU's contiguous allocator finds no free 2 MiB frame in a
+small guest. So on macOS, `alloc_locked_region` falls back to `mlock`. On XNU
+that *wires* the pages: wired pages are never paged, compressed or migrated,
+and the contiguous search skips them. That was measured, not assumed.
+`scripts/mac-pinning.sh` located one 64 MiB wired arena ten times across two
+sessions on the 4 GiB VM. Between the locates, a 2.5 GB and then a 3.5 GB
+allocation pushed up to 150 MB into the compressor. Every plan was identical,
+page for page, and every verify was complete (16128/16128). Windows'
+`VirtualLock` failed the same test (§84.5), which is why the tier exists on
+macOS only. It reports `pinning=wired`, and the arena is scattered: about
+12,000 runs per 64 MiB instead of 20. That costs nothing per frame (`wc-proxy`
+stitches the runs once into one view), but the locate is a full sweep.
+
+`vm.user_wire_limit` was 9.4 GB of 12 GiB and is 3.0 GB of 4 GiB, and `ulimit
+-l` is unlimited, so wiring is not a limit for a session's arena.
+
+**A latent `sv-hostd` bug, found here.** `QemuTarget::discover` took the
+sorted-first descriptor whose link contained `memfd:`. QEMU with a VNC display
+also holds `memfd:displaysurface`, and on the 4 GiB start that descriptor
+(fd 12) sorted before the RAM backend (fd 22). The sweep read 1 MiB and reported
+every page missing. It now asks for `memfd:memory-backend` first. No Windows
+guest showed it, because the fd numbers fell the other way there or there was
+no display memfd. Any VM with a VNC display could have. Dynamic growth
+(§97's pool, the user's rule that GPU memory is allocated and freed dynamically)
+uses the existing outbound/grow protocol: a grown region is another superpage
+allocation, stamped and located like the first. On macOS it is freed with
+`munmap`, which returns superpages to the free pool at once.
+
+**What the QEMU side needs:** guest RAM backed by a shareable memfd. The macOS
+VM manager gained an optional, backward-compatible per-instance setting for this
+(103.10). With it, the region lives in RAM QEMU already has. Nothing is
+file-backed, and nothing on the guest needs root.
+
+The rule that GPU memory is ivshmem was made for the Windows path, where a driver
+exists. For macOS role (a), the user chose the opposite trade (no Apple-signed
+driver anywhere in the design), and superpage guest RAM is the measured
+equivalent of the ivshmem arena's two properties that matter: fixed physical
+frames and no file.
+
+### 103.4 Doorbells and the Wayland byte stream in role (a)
+
+* **The Wayland bytes** cross on an OpenSSH Unix-socket forward: the
+  compositor listens on a socket (`--socket`), and `wc-proxy --upstream`
+  connects to the forwarded end. The compositor runs `--in-band`. On macOS, as on
+  any Unix, the vendored `wayland-backend` would otherwise expect descriptors in
+  `SCM_RIGHTS`, and nothing carries one across a forward (§1a). `--in-band`
+  selects the descriptor dialect only. **Pixels never travel in the stream**:
+  `wc-proxy` has exactly two pixel transports, a shared file per pool and the
+  arena. So even the first window needs the arena.
+* **Pixels are in the arena from the first window on:** `--arena-guest-ram` on
+  the compositor, and `wc-arena-host` plus `wc-proxy --arena-plan` on the host.
+  This is the same code as on Windows and in §71's Linux guest, with
+  superpages underneath. `scripts/mac-window.sh` is the whole path as one
+  command.
+* **Doorbells.** §99's hub multiplexes QEMU `virtio-serial` ports. Sonoma's
+  `AppleVirtIOConsole` binds only *legacy* virtio-serial, so the port is added
+  with `disable-modern=on`, and the guest opens the `/dev/cu.*` node.
+  `PortHandle::guest_port` on macOS takes a name relative to `/dev` and puts the
+  tty into raw mode. Whether the node appears is measured, not assumed (103.11).
+  Without a doorbell the rings fall back to polling, as they do on Windows when
+  the port is absent.
+* **The §89 rings** live in the ivshmem tail on Windows. On macOS they need a
+  region the host has located, which means the guest-RAM arena. Until the ring
+  directory can sit in a located guest-RAM region, the Wayland bytes ride the
+  ssh forward. That costs latency (§89 measured ssh at milliseconds and rings at
+  under one). It does not affect correctness.
+
+### 103.5 Role (b), checked against what exists
+
+* **QEMU with HVF on macOS** supports `ivshmem-plain` backed by
+  `memory-backend-shm` (QEMU 9.1 added it, aimed at macOS hosts, where memfd does
+  not exist) or by `memory-backend-file`. The macOS processes `shm_open` and
+  `mmap` the same object with no driver. The Linux guest sees an ordinary ivshmem
+  device, and the existing Linux ivshmem paths map its BAR2 through sysfs.
+* **Apple's Virtualization.framework** has no ivshmem and no shared-memory
+  device. It offers virtio-fs (without DAX), vsock and virtio-gpu 2D.
+  **krunkit/libkrun** is the prior art for Vulkan from a Linux guest on Metal:
+  virtio-gpu with Venus and blob resources, rendered by virglrenderer on
+  MoltenVK. That design competes with `sv-icd`, it does not complement it. The
+  recommendation for (b) is QEMU+HVF with ivshmem, which keeps one architecture
+  for every host. A VZ variant would have to carry Wayland bytes over vsock and
+  pixels through virtio-gpu blobs.
+* `apple-gfx-pci` (QEMU 10, ParavirtualizedGraphics.framework) gives a *macOS
+  guest* Metal on a *macOS host*. It is irrelevant to (b), whose guest is Linux,
+  and it cannot run on a Linux/KVM host, so it cannot help (a).
+
+### 103.6 The GPU path
+
+| | MoltenVK | KosmicKrisp |
+|---|---|---|
+| what | Vulkan on Metal, Khronos, now community-maintained (deprecated by Khronos on 2026-10-13, "recommended for Intel Macs") | Mesa's Vulkan on Metal (LunarG), in the Vulkan SDK since 1.4.335 |
+| version | 1.4.2 (2026-07), Vulkan 1.4, not conformant | Vulkan 1.4 conformant (2026-09) |
+| hardware | Intel and Apple Silicon, macOS 12+ | **Apple Silicon only, Metal 4, macOS 26+** |
+| host-memory import | `VK_EXT_external_memory_host` (buffers, page-aligned: MTLBuffer `newBufferWithBytesNoCopy`) | Mesa's common host-pointer import |
+| Zink on top | shipped by MacPorts/Homebrew | unverified |
+
+**Decision:** `sv-gpu-server`'s macOS backend loads whichever ICD the Vulkan
+loader offers, and prefers KosmicKrisp when it is present. On an Intel Mac that
+is MoltenVK; on Apple Silicon with macOS 26 it is KosmicKrisp. The server's
+arena import uses `VK_EXT_external_memory_host` on the region's page-aligned
+runs, which both drivers provide. That is the same contract the server has on
+Linux, with no fd and no Win32 handle. MoltenVK imports host memory for
+**buffers only**, so on MoltenVK images live in device memory. Frames reach the
+arena by a copy into an imported buffer, which is the §97 pool's readback
+arrangement. Zero-copy images on Metal would need
+`VK_EXT_external_memory_metal` with an IOSurface, which is a later step.
+
+**This VM has no Metal.** QEMU's VMware SVGA is a 2D framebuffer. MoltenVK 1.4.2
+in the VM reports `VK_ERROR_INCOMPATIBLE_DRIVER: … MoltenVK requires Metal,
+which is not available on this device` (103.11). No software Metal
+implementation exists. `apple-gfx-pci` needs a macOS host. Real Metal under KVM
+would need a passed-through AMD Navi 21 or 23 (or older) card, and this machine
+has neither: its AMD iGPU is not a macOS-supported GPU, and the RTX 5090 is
+reserved for ML work and has no macOS driver anyway. So, for the VM:
+
+* **Lavapipe** (Mesa's CPU Vulkan) is the only Vulkan device the VM can have.
+  MacPorts' mesa does not build it, so it is built in the VM from Mesa 26.2.3
+  with `-Dvulkan-drivers=swrast` against MacPorts' LLVM 22. It proves the
+  forwarder protocol, the server's macOS build and host-pointer import on
+  macOS. It does not prove MoltenVK.
+* **The demo's frames are rendered on Linux.** Firefox draws with its own GL
+  on this workstation's AMD iGPU (RADV, `renderD129`; never the RTX 5090), or
+  in software, and its `wl_shm` frames reach macOS through the arena. That is
+  the same pixel path every client without a forwarded GPU already takes.
+
+**The server on macOS, as built.** `sv-gpu-server guest --port P` (the same
+arguments through `sv-guest gpu`) is the Windows guest path (`win_guest`) with
+one change: the extent comes from `wc_handle::arena::alloc_guest_ram_window`,
+the compositor's allocator. That means superpages where XNU has them and wired
+4 KiB pages where it does not (103.3), stamped with `arena_record`'s page. The
+cold path is a TCP listener on 127.0.0.1. On Linux, an ssh forward turns it into
+the Unix socket that `sv-hostd qemu-serve --cold` reads, and `sv-hostd` locates
+the extent in QEMU's memfd over QMP. After the host's `Accept`, the server
+imports the arena with `VK_EXT_external_memory_host` and serves one session.
+The Windows guest's pool path (§97) is not ported, because it needs an ivshmem
+BAR as region 0. A session per process is what macOS has.
+
+* **Portability.** `Driver::open` enables `VK_KHR_portability_enumeration` and
+  sets `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR` whenever the loader
+  offers the extension. Without them, the loader hides every ICD whose manifest
+  says `is_portability_driver`, and MoltenVK and KosmicKrisp both do.
+  `VK_KHR_portability_subset` is enabled on any device that lists it, as the
+  specification requires. An `INCOMPATIBLE_DRIVER` from `vkCreateInstance` is
+  reported in words: on a Mac VM, the cause is no Metal.
+* **The loader.** On macOS it is found without `DYLD_LIBRARY_PATH`:
+  `SV_VULKAN_LOADER`, then the dynamic linker's search, then `/usr/local`,
+  MacPorts' `/opt/local` and Homebrew's `/opt/homebrew`. `VK_DRIVER_FILES`
+  still chooses the ICD.
+* **The device order.** Without `--device`, the macOS entry takes KosmicKrisp,
+  then MoltenVK, then any other discrete, integrated or virtual GPU, and a CPU
+  device (lavapipe) last. With `SV_GPU_PREFER=cpu`, the CPU device comes first.
+  The order is `driver::device_rank`, and it is unit-tested. Linux and Windows
+  keep `--device N`, default 0.
+* **Waiting.** `sv_transport::park`'s fallback on macOS is a sleep of at most
+  200 µs, and it stays that way. A real address wait (`__ulock_wait`,
+  `os_sync_wait_on_address`) would be cheap to write. But the producer on this
+  path is the Linux host, across the VM boundary, and its wake cannot reach a
+  ulock in the guest. A real wait would therefore run out every slice, which
+  is the 216.9 ms §36.6 measured on a Linux guest without a doorbell. The poll
+  costs up to 200 µs of latency per wait. It also wakes a parked thread about
+  5,000 times a second, but only while that thread is inside a wait with a
+  deadline. The fix is §103.4's doorbell (`--bell`, a legacy virtio-serial
+  port), not a different sleep.
+* **MoltenVK on real Metal** imports host memory for buffers only (see above).
+  The server's arena is a buffer import, so the same code should work there.
+  That is unproven: there is no Metal here.
+
+### 103.7 Wayland onto AppKit, and what cocoa-way contributes
+
+cocoa-way (J-x-Z/cocoa-way, 2.1.0, last commit 2026-10-14) is a smithay
+compositor whose windows are native macOS windows. **Its licence is
+GPL-3.0-only, and this workspace is MIT OR Apache-2.0, so no code is taken.**
+Its source was read for ideas, and these are the ones used:
+
+* a client that never negotiated server-side decorations keeps a *titled*
+  NSWindow with a transparent, hidden title bar and a full-size content view,
+  because a borderless NSWindow cannot be resized from its edges. This is the
+  macOS form of §82's caption fold;
+* scroll conversion: line deltas become `v120` steps, and precise (trackpad)
+  deltas become finger-source pixels with an axis stop at the end of the phase.
+  AppKit's momentum events are dropped, so a Linux toolkit's own kinetic
+  scrolling is not applied twice;
+* on focus loss, release exactly the keys that were held, and drop orphaned
+  key-ups;
+* pointer lock is `CGAssociateMouseAndMouseCursorPosition(false)` plus
+  `deltaX/deltaY` from mouse events, and confinement is enforced by warping;
+* `NSCursor` from cursor-shape names, and client cursor surfaces through
+  `NSImage` with the hotspot in points.
+
+These are cocoa-way's weak spots, which this design covers itself: it renders
+popups into the parent's drawable, so a menu cannot leave its parent window, and
+it has no popup grabs, no drag and drop, no keyboard-layout tracking, no Dock
+identity per application, no lazy clipboard, and it lets Cmd+Q quit every
+client.
+
+Our two-thread split stays: smithay on the Wayland thread, and AppKit on the main
+thread as the UI pump. `ToUi` wakes the main thread through a `CFRunLoopSource`
+signalled from the Wayland thread, which is the macOS form of the hidden-window
+`PostMessage` (§3): it keeps firing during a live resize, because the source
+is added to the common modes. The mapping:
+
+| `ToUi` / `FromUi` | AppKit |
+|---|---|
+| `Create`/`Map` toplevel | `NSWindow` (titled, closable, miniaturizable, resizable), shown on `Map` only, as on Windows, so nothing flashes empty |
+| popup | borderless `NSWindow` (never key, so the toplevel keeps the keyboard), `addChildWindow:ordered:` on the parent, positioned in screen points, so a menu can leave its parent's frame |
+| `Present` | the window's shadow as a `CGImage`, set as the view layer's `contents` (gravity at the visual top left). A full copy per present; damage-limited copies into an `IOSurface` are the next step and not built |
+| `Title`, `SizeHints`, `SetWindowState`, `Fullscreen` | `setTitle:`, `setContentMinSize:`/`setContentMaxSize:`, `zoom:`/`miniaturize:`, `toggleFullScreen:` (native Spaces fullscreen) |
+| `BeginMove`, `BeginResize` | `performWindowDragWithEvent:`; resize from the native edges (AppKit owns them) |
+| `Cursor`, `PointerHold` | `NSCursor`; `CGAssociateMouseAndMouseCursorPosition` and `CGWarpMouseCursorPosition` |
+| `SetClipboard`/`FetchClipboard`, `ClipboardChanged` | `NSPasteboard` (`changeCount` polled on activation and on a 250 ms timer, since macOS has no change notification); text, HTML, PNG and file URLs |
+| `StartDrag`, `DragEnter…` | **not built** (103.12): a drag out of a Linux window ends at once with no action, and drops onto one are refused |
+| `Icon` | `NSApp.applicationIconImage` of the application's own process; the Dock tile of a bundle that is not running wears the bundle's `.icns` |
+| `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
+| `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
+| `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
+| `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
+
+**The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
+listens for Ctrl+C. The default is therefore **Cmd sends Control** to the client
+and Control stays Control. Cmd+Q, Cmd+H, Cmd+M and Cmd+Tab stay macOS's own:
+Cmd+Q asks every window of *that application's* tile to close. It does not quit
+the compositor, which is cocoa-way's bug. `--cmd-key super` gives the literal
+mapping for users who want Super. Option stays Alt. The decision lives in one
+pure function, which is tested on Linux.
+
+### 103.8 The Dock: one tile per Linux application
+
+Windows groups taskbar buttons by a per-window AUMID, so one compositor process
+can show any number of applications (§16, §92). **macOS groups Dock tiles by
+process.** A tile is a running `NSRunningApplication`, and its name and icon
+come from the process's bundle. `NSApp.applicationIconImage` and `NSDockTile`
+change only the calling process's own tile. No per-window identity exists. So:
+
+* **One compositor per Linux application, inside that application's bundle.**
+  The first version of this section split one session process (the compositor)
+  from one tile process per application, with every window's `ToUi` and pixels
+  crossing between them. That was revised before it was built. A tile has to
+  *own* the NSWindows, so the split would put a second copy of the whole
+  `ToUi`/`FromUi` protocol and a second pixel copy between two processes on the
+  Mac, and its only gain would be one arena and one proxy for all applications
+  instead of one per running application. So `wc-launch` on macOS **is** the
+  application: the bundle's executable is a hard link to it, it reads its
+  `[app.*]` section from the bundle's `Info.plist`, runs the compositor on its
+  main thread (`wc_compositor::run_from`), and in a second thread does what the
+  Windows launcher does over the forced-command key: `up` (locate the arena),
+  an ssh reverse **Unix-socket** forward of the Wayland socket, `proxy`, and
+  `run`. Each application therefore has its own wired arena (64 MiB) and its
+  own `wc-proxy`, and one application's crash takes no other with it.
+  LaunchServices allows one process per bundle, so a second click on a running
+  application's tile reaches the running one (`applicationShouldHandleReopen`).
+  With no window open, that sends `run` again, which is the warm path.
+* **The bundle**, `~/Applications/Linux/<Name>.app`, is written by
+  `wc-launch --install SECTION [--pin]`, from the host's `app` answer (§92):
+  `CFBundleIdentifier` `org.waycompose.linux.<section>`, the desktop entry's
+  name, an `.icns` built from the host's icon (resampled to an exact 256x256
+  `ic08` entry), and the answer itself in `Resources/meta.txt` for the Dock
+  menu. `--pin` writes the Dock's own `persistent-apps` entry, which is what
+  "Keep in Dock" writes. The menu bar's application name and the Dock tile's
+  name and icon come from the bundle with no code at all.
+* **The Dock menu** is the jump list: `applicationDockMenu:` returns the
+  `.desktop` actions (`Action(name)`) and the frequent list (`Open(url)`),
+  which wc-session already provides for §92. A click is a `Request` to the
+  session, exactly as a jump-list click is.
+* **The menu bar** shows the tile's application menu (About, Hide, Quit with
+  the closing semantics above) and a Window menu that AppKit fills itself.
+  Linux applications' own menus are not exported in this stage (there is no
+  `dbusmenu` across the boundary).
+* A window of a *different* application, opened by a client of this one (a
+  Linux program that starts another on the same `WAYLAND_DISPLAY`), shows under
+  the first application's tile. NSWindows cannot move between processes. This
+  is the one place macOS cannot match §92's per-window identity.
+* **Title bars.** Firefox and GTK header bars draw their own title bar (the
+  caption is folded, §46), and **AppKit's traffic lights stay**, over the
+  client's strip at the top left. That is the macOS form of Windows keeping its
+  caption buttons (§82). The host's `apps.ini` chooses the arrangement
+  `titlebar = mac-tabs`, as §94 requires: Firefox gets `user.js` prefs that
+  remove GTK's own buttons and a `userChrome.css` that starts the tab strip
+  78 px in, and GTK applications get a `gtk.css` that pads the header bar the
+  same way and hides its buttons.
+* **Quit** (Cmd+Q, the Dock's Quit, AppleScript `quit`) asks each of the
+  application's windows to close. When the last one has closed and the linger
+  has passed, the process takes the session down (`down`) and exits, so the
+  tile's running dot goes out the way a Mac application's does.
+* **Icons the host cannot render** (SVG-only themes, GNOME Console and Text
+  Editor) leave the bundle with the generic icon. `wc-proxy`'s resolver has no
+  SVG renderer (`icons.rs`), which is the same limitation on Windows.
+
+### 103.9 Building for macOS
+
+* **Linux gate:** the flake's toolchain now carries `x86_64-apple-darwin`, and
+  `cargo check --target x86_64-apple-darwin -p wc-compositor -p sv-guest -p
+  wc-launch -p sv-gpu-server` runs on this workstation without an SDK. It is
+  the macOS counterpart of the Windows check. `wc-proxy`, `wc-arena-host` and
+  `sv-hostd` are Linux-host programs in both roles and are not built for macOS.
+* **Linking happens on this workstation too.** `scripts/macos-sdk.sh` copies
+  the SDK (MacOSX14.5.sdk, Apple's, never committed) and MacPorts' static
+  libxkbcommon out of the VM. The flake names clang and lld (`WC_MACOS_CLANG`,
+  `WC_MACOS_LLD_BIN`; not on PATH, so no other build meets a second C
+  compiler) and sets `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` to
+  `scripts/macos-linker.sh`. `cargo build --target x86_64-apple-darwin -p
+  wc-compositor` then produces a Mach-O binary here in under a minute, and the
+  harnesses copy it into the VM. This is what makes a 4 GiB VM enough: the
+  generated sv-proto crates need 5 to 7 GB per compile and never build in the VM.
+* **The VM's toolchain** is kept for checking native builds: Xcode Command Line Tools 16.2
+  (clang 16, SDKs 14.5 and 15.2, installed headless with `softwareupdate`),
+  rustup stable (1.99.1), and **MacPorts** for libxkbcommon 1.7, MoltenVK 1.4.2
+  and the Vulkan loader. MacPorts is used because Homebrew 7 refuses Intel Macs:
+  its installer prints "Homebrew on macOS is only supported on Apple Silicon
+  processors!". libxkbcommon is the only native library the compositor links.
+  Keymaps reach it as strings (§7.2, §80), so no xkeyboard-config tree is needed.
+* The prepared VM state is saved as the template `wayland-dev`
+  (`macos-vm snapshot`), so a fresh clone has the toolchain.
+* AppKit is reached through the `objc2` family (`objc2`, `objc2-foundation`,
+  `objc2-app-kit`, `objc2-quartz-core`, `objc2-io-surface`, `block2`), MIT, as
+  target-gated dependencies of `wc-compositor`, so nothing changes for the
+  Linux and Windows builds.
+
+### 103.10 The macOS VM manager
+
+`/mnt/datasets/macvm/bin/macos-vm.py` gained `configure NAME [--ram-mib N]
+[--shared-ram on|off] [--qemu-extra JSON]`, which works on a stopped instance
+only. `shared_ram` puts guest RAM in `memory-backend-memfd,share=on` and makes
+it the machine's memory backend. `qemu_extra` is appended to the command line
+and may not override the manager's own process options. Manifests without the
+new keys produce byte-identical QEMU command lines: this was checked for all five
+existing instances against the previous script, which is kept beside it as
+`macos-vm.py.bak-20261019-before-shared-ram`. The other session's `work`
+instance was not touched. The other session later reinstalled the manager from
+its own source, which dropped the change once. It was re-applied on top, and a
+patch and a note are in the store for that source.
+
+**RAM.** The user's rule is that a VM gets the least RAM its tests need. The
+manager now also enforces a shared 10 GB cap across its VMs, charging each one
+its RAM plus 1 GiB. With `work` at 3 GiB, that leaves about 4.3 GiB.
+`wayland-host` runs at **4096 MiB** with `shared_ram`: macOS boots to the
+desktop with 85% of memory free, and the window tests pass. 3072 MiB was not
+tried, because at 4096 MiB the guest already has no superpages, and a smaller
+guest only makes its wired arena share less room with Firefox. The VM is
+stopped whenever no test is running.
+
+`wayland-host`'s `qemu_extra` adds a USB audio device (UAC1, which macOS
+supports natively) on QEMU's `wav` audiodev. Whatever the Mac plays lands in
+`/mnt/datasets/builds/wcrun/mac-audio.wav` on this host, which is how the sound
+was measured (103.11). The prepared guest is saved as the template
+**`wayland-dev`**: Command Line Tools 16.2, rustup, MacPorts with libxkbcommon,
+MoltenVK and the Vulkan loader, lavapipe in `~/lvp`, auto-login, no sleep, no
+crash dialogs, and the launcher with its three bundles. Clone it with
+`macos-vm clone NAME --template wayland-dev`, and run
+`macos-vm configure NAME --ram-mib 4096 --shared-ram on` before the first
+start.
+
+### 103.11 What has been run, and where
+
+**Two macOS bugs the first runs found, both outside the platform code.**
+smithay's non-Linux `SealedFile` wrote the keymap into a POSIX shm object with
+`write(2)` and read it back with `read(2)`, and macOS shm objects support
+neither. So no keymap object existed, an in-band peer was sent no
+`wl_keyboard.keymap`, and every key reached a client that could not decode it.
+The proxy's counter said so (`2 fds in, 0 out`). The vendored arm now sizes the
+object with `ftruncate`, fills it through `mmap`, and keeps the bytes for the
+named twin (vendor/PATCHES.md). The second was `sv-hostd`'s memfd choice
+(103.3). Both are now fixed. objc2's debug builds also check message encodings,
+which caught a `CGImageRef` passed as `void *` (a typed wrapper fixes it).
+
+
+Filled in as the stages land; nothing below is a claim beyond its row.
+
+| what | where | result |
+|---|---|---|
+| superpages: `mmap(VM_FLAGS_SUPERPAGE_SIZE_2MB)`, 32 MiB and 1 GiB | Sonoma 14.8.9 VM (`wayland-host`) | allocated, `mlock` 0, wired pages up by the mapping |
+| MoltenVK 1.4.2 `vulkaninfo` | same VM | `VK_ERROR_INCOMPATIBLE_DRIVER`, "MoltenVK requires Metal, which is not available on this device" |
+| `cargo check --target x86_64-apple-darwin` (compositor, sv-guest, wc-launch, gpu server) | this workstation | passes after the cfg changes in this section |
+| native build of `wc-compositor` with the AppKit platform | the VM (CLT 16.2, rustup 1.99.1) | links against system frameworks only (`otool -L`); libxkbcommon 1.7 is linked statically from MacPorts' `.a` |
+| wired 4 KiB arena, located 10 times across 2 sessions with 2.5 to 3.5 GB of pressure between locates (`scripts/mac-pinning.sh`) | 4 GiB VM | every plan identical, every verify 16128/16128; ~12,000 runs per 64 MiB |
+| superpages at 4 GiB | 4 GiB VM | none, even one at a time, after `purge`, with 1.8 GB free |
+| first window at 4 GiB, compositor cross-linked on Linux | 4 GiB VM | `pinning=wired`, located, mapped 742x427 |
+| keyboard: `scripts/mac-input.sh` types through QEMU's USB keyboard (QMP), into weston-terminal on Linux | 4 GiB VM | `echo mac-input-ok_42` ran and printed `mac-input-ok_42`; before the `sealed_file.rs` fix below, no key reached the client (`0 out` descriptors at the proxy: no keymap) |
+| **Firefox from its Dock tile**: `scripts/mac-launch-install.sh` (host: wc-session with a private sshd on 127.0.0.1:22422 that holds only the guest's forced-command key; guest: three bundles, pinned), then `open Firefox.app` | 4 GiB VM, Firefox on this workstation in software GL (Mesa only, never the RTX 5090) | compositor up 0.38 s after the click, arena located 0.43 s (16384/16384), proxy and PulseAudio null sink, `run ok` 1.2 to 1.4 s after the click; menu bar "Firefox", the fox in the Dock with its running dot; maximised to the work area, fully drawn, traffic lights in the corner the tab strip leaves (Sonnet checks of five screenshots); Quit closes the window, the session goes `down ok` and the process exits |
+| Dock menu: right-click the Firefox tile | 4 GiB VM | New Private Window, New Window, Profile Manager, New Tab (the desktop entry's actions) above macOS's own items; "New Window" sent `action ... new-window` and a second window mapped |
+| clipboard, both ways, with Cmd as Control | 4 GiB VM | `pbcopy` text pasted into Firefox's address bar with Cmd+V (27 bytes, exact); text typed in Firefox, Cmd+A, Cmd+C, read back with `pbpaste` exactly |
+| user resize: an AppKit edge drag of weston-terminal's corner by 100 px each way | 4 GiB VM | window 842x528, the client re-wrapped its text at the new width (not scaled), resize cursor at the corner |
+| context menu (xdg_popup) | 4 GiB VM | a separate child window at the click point, flipped upward by the positioner's constraints because it did not fit below, fully drawn |
+| sound: the session's PulseAudio monitor, an ssh `-L` forward, an AudioQueue on the VM's USB audio device (UAC1, recorded by QEMU's `wav` audiodev) | 4 GiB VM | a 440 Hz tone played into the session's sink came out of the Mac continuous (7.2 s, ~430 Hz measured after the 48 to 44.1 kHz resample); with a 160 ms queue it came out 170 ms on, 130 ms off, because the null sink's monitor arrives in ~300 ms bursts: the Mac queue holds 600 ms |
+| two applications at once (Firefox and Console) | 4 GiB VM | two processes, two Dock tiles, two sessions; the second's PulseAudio failed on the session bus's `org.PulseAudio1` until wc-session started it without one |
+| **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |
+| GPU: `scripts/mac-gpu.sh probe`, `sv-guest gpu probe` in the VM | 4 GiB VM | lavapipe (Mesa 26.2.3, driverID 13): opened with host-pointer import. MoltenVK alone: the loader enumerates it with the portability bit, MoltenVK says "requires Metal", and the server exits 1 with the reason (no crash). Both together: the loader skips MoltenVK (-9) and the server takes lavapipe. The loader was found without `DYLD_LIBRARY_PATH` |
+| GPU: `scripts/mac-gpu.sh present`, `vk-present-probe` on this workstation through `sv-icd`, the server in the VM on lavapipe | 4 GiB VM | extent of 80 MiB, `pinning=wired`, located in 0.41 to 0.55 s (20480/20480 pages, 4,152 to 16,492 runs); 3 frames of 256x256 byte-identical to what the probe drew. 120 frames of 1280x720: 2.03 ms a frame with the present in the call, 1.10 ms pipelined. Ring waits mean 0.39 ms |
+| GPU: `scripts/mac-gpu.sh compute`, `sv-compute-e2e` | 4 GiB VM | a compute dispatch by lavapipe in the VM; 245,760 payload words read back through the arena, 0 wrong |
+| GPU: `scripts/mac-gpu.sh window`, `vkcube --wsi wayland` 400x300 through `sv-icd`, rendered by lavapipe in the VM, presented as arena slices to the macOS compositor (`scripts/mac-window.sh`) | the VM's desktop | 400 and 2000 frames ran to completion; about 350 frames/s marginal (1600 more frames took 4.5 s more session time). A Sonnet check of the QMP screendump: a "vkcube" window of about 400x300 with a textured, upright cube, correct colours, content filling the window |
+| GPU: pipelined headless present (`SV_PRESENT_SYNC` unset) | the VM, and this workstation with RADV and no VM | the dump of frame N holds frame N+1's pixels, and the last frame is right. This is the same on Linux, so it is an `sv-icd` headless-dump matter, not this path's. `mac-gpu.sh` presents in the call by default |
+
+### 103.12 Not built, and not proven
+
+* **Not built.** Drag and drop in either direction. IME and dead keys beyond
+  what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
+  Retina scale above 1. The §89 rings on macOS: the Wayland bytes ride the ssh
+  forward, and nobody measured the latency. SVG icons (the host's resolver
+  has no renderer, as on Windows). A frequent-pages section in the Dock menu
+  (`macbundle::dock_items` takes them, and the launcher does not fetch
+  `frequent` yet).
+* **Role (b), a Mac hosting a Linux VM, is designed and not built.** That
+  covers 103.5's QEMU+HVF `memory-backend-shm` arena, the Linux guest mapping
+  BAR2, and the Virtualization.framework variant.
+* **Real Metal.** Nothing here ran on a Metal device. MoltenVK was shown to
+  refuse cleanly without one. KosmicKrisp needs Apple Silicon and macOS 26.
+* **Doorbells on macOS.** Legacy virtio-serial into a `/dev/cu.*` node is coded
+  (`PortHandle::guest_port`) and was never attached to the VM. Without it the
+  GPU rings fall back to polling, which is 103.6's sleep-poll cost.
+* **Firefox's own sound.** The route was proven with a tone played into the
+  session's sink. A tone Firefox opened from `file://` did not play. Firefox
+  appears to want a gesture for a media document, and this was not chased.
+* **Superpages at 4 GiB.** A 4 GiB macOS guest has none (103.3). Every result
+  above is on wired 4 KiB pages. Superpages were only seen at 8 and 12 GiB.
+* **Cooperative activation.** macOS 14 does not let a process that started
+  outside LaunchServices take the foreground from the active application. A
+  bundle opened from the Dock or with `open` is activated; `mac-window.sh`'s
+  bare compositor can open behind the frontmost window.
+* **One known `sv-icd` bug**, found here and not macOS's: with the default
+  pipelined headless present, the frame dump for frame N holds frame N+1's
+  pixels. It reproduces on Linux with RADV and no VM.
+

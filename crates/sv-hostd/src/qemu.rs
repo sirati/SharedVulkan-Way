@@ -512,8 +512,14 @@ impl QemuTarget {
             ))
         })?;
 
-        let fd_path = find_backend_fd(pid, "memfd:")
-            .or_else(|_| find_backend_fd(pid, &backend_id))?;
+        // `memfd:memory-backend` first (§103.11). A bare `memfd:` also matches
+        // QEMU's own `memfd:displaysurface` (a VNC framebuffer of a few MiB),
+        // and the sorted-first descriptor was that one on a macOS guest whose
+        // display memfd happened to get the lower number: the sweep read 1 MiB
+        // and reported every page missing.
+        let fd_path = find_backend_fd(pid, "memfd:memory-backend")
+            .or_else(|_| find_backend_fd(pid, &backend_id))
+            .or_else(|_| find_backend_fd(pid, "memfd:"))?;
         let file = open_backend(&fd_path)?;
         let file_len = backend_len(&file)?;
         Ok(QemuTarget { pid, fd_path, file, file_len, backend_id, regions })

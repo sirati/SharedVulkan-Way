@@ -351,6 +351,111 @@ fn driver_id(instance: &ash::Instance, pd: vk::PhysicalDevice, api_version: u32)
     dp.driver_id.as_raw()
 }
 
+/// Load the Vulkan loader (waycompose-design.md §103.6).
+///
+/// `ash::Entry::load` asks the dynamic linker for `libvulkan.so.1`, or on macOS
+/// for `libvulkan.dylib`. On macOS the loader is not on the default search path
+/// when it comes from MacPorts (`/opt/local/lib`) or Homebrew
+/// (`/opt/homebrew/lib`), and a process started by `sshd` or `launchd` has no
+/// `DYLD_LIBRARY_PATH` unless it was given one. So, in order: `SV_VULKAN_LOADER`
+/// if set (a path, used alone); then the linker's own search with both names;
+/// then the three install prefixes. The loader itself still honours
+/// `VK_DRIVER_FILES` / `VK_ICD_FILENAMES`, which is how a run picks lavapipe.
+fn load_entry() -> Result<ash::Entry> {
+    if let Some(path) = std::env::var_os("SV_VULKAN_LOADER") {
+        return unsafe { ash::Entry::load_from(&path) }
+            .map_err(|e| DriverError::NoLoader(format!("SV_VULKAN_LOADER={}: {e}", path.to_string_lossy())));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tried = Vec::new();
+        for path in [
+            "libvulkan.dylib",
+            "libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+            "/opt/local/lib/libvulkan.1.dylib",
+            "/opt/homebrew/lib/libvulkan.1.dylib",
+        ] {
+            match unsafe { ash::Entry::load_from(path) } {
+                Ok(e) => return Ok(e),
+                Err(e) => tried.push(format!("{path}: {e}")),
+            }
+        }
+        Err(DriverError::NoLoader(tried.join("; ")))
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe { ash::Entry::load() }.map_err(|e| DriverError::NoLoader(e.to_string()))
+}
+
+/// The instance extensions this side enables when the loader has them, in the
+/// order they are passed. One list, read by [`Driver::open`] to create the
+/// instance and by the device's `depends=` closure, so the two cannot disagree.
+///
+/// * `VK_EXT_debug_utils`: Zink names every object (see `Driver::open`).
+/// * `VK_KHR_surface`: makes `VK_KHR_swapchain`'s layout legal (same).
+/// * `VK_KHR_portability_enumeration` (§103.6): a loader hides every ICD whose
+///   manifest says `is_portability_driver` (MoltenVK, KosmicKrisp) from an
+///   instance that does not enable this and set
+///   `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR`. Without it, a Mac
+///   with only MoltenVK reports `VK_ERROR_INCOMPATIBLE_DRIVER` from
+///   `vkCreateInstance` even on real Metal.
+pub fn wanted_instance_extensions(entry: &ash::Entry) -> Vec<&'static CStr> {
+    let avail = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let has = |want: &CStr| avail.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == want);
+    [c"VK_EXT_debug_utils", c"VK_KHR_surface", c"VK_KHR_portability_enumeration"]
+        .into_iter()
+        .filter(|w| has(w))
+        .collect()
+}
+
+/// `VK_DRIVER_ID_MESA_KOSMICKRISP`, newer than ash's registry (vk.xml 1.4.350).
+pub const DRIVER_ID_MESA_KOSMICKRISP: i32 = 28;
+/// `VK_DRIVER_ID_MOLTENVK`.
+pub const DRIVER_ID_MOLTENVK: i32 = 14;
+
+/// Which physical device [`Driver::open_choice`] opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceChoice {
+    /// By its index in `vkEnumeratePhysicalDevices`, as `--device N` says.
+    Index(usize),
+    /// The best by [`device_rank`]: what the macOS entry uses when no
+    /// `--device` is given.
+    Preferred,
+}
+
+/// The order [`DeviceChoice::Preferred`] takes, lower first (§103.6):
+///
+/// 1. KosmicKrisp (Mesa on Metal; Apple Silicon, macOS 26), conformant;
+/// 2. MoltenVK (Metal; every Mac, the only one on Intel);
+/// 3. any other discrete, 4. integrated, 5. virtual or other GPU;
+/// 6. a CPU device (lavapipe, SwiftShader), the fallback.
+///
+/// `prefer_cpu` (`SV_GPU_PREFER=cpu`) ranks the CPU device 0, ahead of all,
+/// for a test that wants lavapipe on a machine that also has a GPU. Ties keep
+/// the loader's order.
+pub fn device_rank(device_type: vk::PhysicalDeviceType, driver_id: i32, prefer_cpu: bool) -> u32 {
+    if device_type == vk::PhysicalDeviceType::CPU {
+        return if prefer_cpu { 0 } else { 6 };
+    }
+    match (driver_id, device_type) {
+        (DRIVER_ID_MESA_KOSMICKRISP, _) => 1,
+        (DRIVER_ID_MOLTENVK, _) => 2,
+        (_, vk::PhysicalDeviceType::DISCRETE_GPU) => 3,
+        (_, vk::PhysicalDeviceType::INTEGRATED_GPU) => 4,
+        _ => 5,
+    }
+}
+
+/// The index [`device_rank`] picks among `devices`, `(type, driverID)` each.
+pub fn preferred_device(devices: &[(vk::PhysicalDeviceType, i32)], prefer_cpu: bool) -> Option<usize> {
+    (0..devices.len()).min_by_key(|&i| (device_rank(devices[i].0, devices[i].1, prefer_cpu), i))
+}
+
+/// Whether `SV_GPU_PREFER=cpu` asked for the CPU device first.
+pub fn prefer_cpu_by_environment() -> bool {
+    std::env::var("SV_GPU_PREFER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))
+}
+
 /// One open driver: instance, physical device, device, queue.
 pub struct Driver {
     /// Held rather than read: it owns the loaded `libvulkan.so`, and dropping it
@@ -430,9 +535,13 @@ pub struct Driver {
 impl Driver {
     /// Open device `index`, or the first one, and enable whatever it offers.
     pub fn open(index: usize) -> Result<Driver> {
+        Driver::open_choice(DeviceChoice::Index(index))
+    }
+
+    /// Open the device `choice` names, and enable whatever it offers.
+    pub fn open_choice(choice: DeviceChoice) -> Result<Driver> {
         let _one = OPEN_CLOSE.lock().unwrap_or_else(|p| p.into_inner());
-        let entry =
-            unsafe { ash::Entry::load() }.map_err(|e| DriverError::NoLoader(e.to_string()))?;
+        let entry = load_entry()?;
         // 1.1 was the floor the arena needed and it is **not** enough for Zink:
         // `scalarBlockLayout` and `timelineSemaphore` live in
         // `VkPhysicalDeviceVulkan12Features` and `dynamicRendering` in the 1.3
@@ -463,14 +572,9 @@ impl Driver {
         // one of those calls is a forwarded command with nothing behind it.
         // It is an *instance* extension whose device entry points the loader
         // itself provides, so enabling it costs one string and nothing else.
-        let have_debug_utils = unsafe { entry.enumerate_instance_extension_properties(None) }
-            .map(|v| {
-                v.iter().any(|e| {
-                    let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-                    name == c"VK_EXT_debug_utils"
-                })
-            })
-            .unwrap_or(false);
+        //
+        // (The rest of the list, and `VK_KHR_portability_enumeration`, are in
+        // [`wanted_instance_extensions`].)
         // `VK_KHR_surface`, if the loader has it, for one reason and not for
         // presentation: `VK_KHR_swapchain` is in the profile (docs/design.md §10) so
         // that the device enables it and
@@ -479,28 +583,38 @@ impl Driver {
         // creates no surface and never will — the window is on the *other* side
         // of the boundary — so the extension is enabled purely to make the
         // layout legal.
-        let have_surface = unsafe { entry.enumerate_instance_extension_properties(None) }
-            .map(|v| {
-                v.iter().any(|e| {
-                    let name = unsafe { CStr::from_ptr(e.extension_name.as_ptr()) };
-                    name == c"VK_KHR_surface"
-                })
-            })
-            .unwrap_or(false);
-        let mut inst_exts: Vec<*const std::ffi::c_char> = Vec::new();
-        if have_debug_utils {
-            inst_exts.push(c"VK_EXT_debug_utils".as_ptr());
-        }
-        if have_surface {
-            inst_exts.push(c"VK_KHR_surface".as_ptr());
-        }
+        let wanted = wanted_instance_extensions(&entry);
+        let portability = wanted.contains(&c"VK_KHR_portability_enumeration");
+        let inst_exts: Vec<*const std::ffi::c_char> = wanted.iter().map(|c| c.as_ptr()).collect();
         let ci = vk::InstanceCreateInfo::default()
             .application_info(&app)
-            .enabled_extension_names(&inst_exts);
-        let instance =
-            unsafe { entry.create_instance(&ci, None) }.map_err(vkerr("vkCreateInstance"))?;
+            .enabled_extension_names(&inst_exts)
+            .flags(if portability {
+                vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+            } else {
+                vk::InstanceCreateFlags::empty()
+            });
+        let instance = unsafe { entry.create_instance(&ci, None) }.map_err(|e| {
+            // §103.6: the one failure a Mac without Metal (a VM) always has,
+            // said in words rather than as a code three layers up.
+            if e == vk::Result::ERROR_INCOMPATIBLE_DRIVER {
+                let hint = if cfg!(target_os = "macos") {
+                    "; MoltenVK and KosmicKrisp need Metal, so a Mac VM without a Metal GPU \
+                     has none: set VK_DRIVER_FILES to lavapipe's manifest"
+                } else {
+                    "; VK_LOADER_DEBUG=driver says why each manifest was skipped"
+                };
+                DriverError::Other(format!(
+                    "vkCreateInstance: {e:?}: the loader found no usable Vulkan driver \
+                     (portability enumeration {}{hint})",
+                    if portability { "enabled" } else { "not offered by this loader" }
+                ))
+            } else {
+                DriverError::Vk("vkCreateInstance", e)
+            }
+        })?;
 
-        let opened = Driver::open_on(entry, instance, index, available);
+        let opened = Driver::open_on(entry, instance, choice, available);
         if opened.is_err() {
             // Nothing else holds the instance if device creation failed, and
             // leaking it would keep the driver's own threads alive for the life
@@ -515,10 +629,10 @@ impl Driver {
     fn open_on(
         entry: ash::Entry,
         instance: ash::Instance,
-        index: usize,
+        choice: DeviceChoice,
         instance_api_version: u32,
     ) -> Result<Driver> {
-        let r = Driver::open_inner(&entry, &instance, index);
+        let r = Driver::open_inner(&entry, &instance, choice);
         match r {
             Ok(Opened {
                 pd,
@@ -586,10 +700,33 @@ impl Driver {
         crate::set_layout::refuses_push_binding_flags(self.props.vendor_id, self.driver_id)
     }
 
-    fn open_inner(entry: &ash::Entry, instance: &ash::Instance, index: usize) -> Result<Opened> {
+    fn open_inner(entry: &ash::Entry, instance: &ash::Instance, choice: DeviceChoice) -> Result<Opened> {
 
         let pds =
             unsafe { instance.enumerate_physical_devices() }.map_err(vkerr("vkEnumeratePhysicalDevices"))?;
+        let index = match choice {
+            DeviceChoice::Index(i) => i,
+            DeviceChoice::Preferred => {
+                let traits: Vec<(vk::PhysicalDeviceType, i32)> = pds
+                    .iter()
+                    .map(|&pd| {
+                        let p = unsafe { instance.get_physical_device_properties(pd) };
+                        (p.device_type, driver_id(instance, pd, p.api_version))
+                    })
+                    .collect();
+                let prefer_cpu = prefer_cpu_by_environment();
+                let i = preferred_device(&traits, prefer_cpu)
+                    .ok_or_else(|| DriverError::Other("no physical device (0 present)".into()))?;
+                if pds.len() > 1 {
+                    eprintln!(
+                        "sv-gpu-server: {} devices {traits:?}; chose {i} by the §103.6 order{}",
+                        pds.len(),
+                        if prefer_cpu { " with SV_GPU_PREFER=cpu" } else { "" }
+                    );
+                }
+                i
+            }
+        };
         let &pd = pds.get(index).ok_or_else(|| {
             DriverError::Other(format!("no physical device {index} ({} present)", pds.len()))
         })?;
@@ -602,7 +739,6 @@ impl Driver {
         let has_fd = has(c"VK_KHR_external_memory_fd");
         let has_dma_buf = has_fd && has(c"VK_EXT_external_memory_dma_buf");
         let has_host = has(c"VK_EXT_external_memory_host");
-        let _ = &has;
 
         let qfams = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         // The video half of the family table, asked only of a driver that has
@@ -709,23 +845,8 @@ impl Driver {
         // The two `Driver::open` enables, re-derived by the same rule it used —
         // "available on this loader" — rather than threaded through, so the two
         // places cannot say different things about one instance.
-        let instance_enabled: Vec<&str> = {
-            let avail = unsafe { entry.enumerate_instance_extension_properties(None) }
-                .unwrap_or_default();
-            let has_inst = |want: &CStr| {
-                avail
-                    .iter()
-                    .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == want)
-            };
-            let mut v = Vec::new();
-            if has_inst(c"VK_EXT_debug_utils") {
-                v.push("VK_EXT_debug_utils");
-            }
-            if has_inst(c"VK_KHR_surface") {
-                v.push("VK_KHR_surface");
-            }
-            v
-        };
+        let instance_enabled: Vec<&str> =
+            wanted_instance_extensions(entry).iter().filter_map(|c| c.to_str().ok()).collect();
         loop {
             let present: Vec<String> =
                 owned.iter().filter_map(|c| c.to_str().ok().map(str::to_string)).collect();
@@ -797,6 +918,15 @@ impl Driver {
         } else {
             Vec::new()
         };
+        // §103.6: a portability implementation (MoltenVK, KosmicKrisp) lists
+        // `VK_KHR_portability_subset`, and the specification requires it be
+        // enabled whenever it is listed (`VUID-VkDeviceCreateInfo-pProperties-04451`).
+        // Not a profile extension, so nothing forwards it; it is enabled for the
+        // device's own validity only. Its one dependency,
+        // `VK_KHR_get_physical_device_properties2`, is core in this 1.1+ instance.
+        if has(c"VK_KHR_portability_subset") && !owned.iter().any(|o| o.as_c_str() == c"VK_KHR_portability_subset") {
+            owned.push(c"VK_KHR_portability_subset".to_owned());
+        }
         let names: Vec<*const std::ffi::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
 
         // The features: every feature struct the device may be created with
@@ -1008,6 +1138,32 @@ mod tests {
     const H265: &str = "VK_KHR_video_decode_h265";
     const AV1: &str = "VK_KHR_video_decode_av1";
     const VP9: &str = "VK_KHR_video_decode_vp9";
+
+    use vk::PhysicalDeviceType as T;
+    const LVP: (T, i32) = (T::CPU, 13);
+    const MVK: (T, i32) = (T::INTEGRATED_GPU, DRIVER_ID_MOLTENVK);
+    const KK: (T, i32) = (T::INTEGRATED_GPU, DRIVER_ID_MESA_KOSMICKRISP);
+    const RADV: (T, i32) = (T::INTEGRATED_GPU, 3);
+    const NV: (T, i32) = (T::DISCRETE_GPU, 4);
+
+    /// §103.6's order: KosmicKrisp, MoltenVK, other GPUs, the CPU last.
+    #[test]
+    fn a_real_gpu_driver_is_preferred_and_lavapipe_is_the_fallback() {
+        assert_eq!(preferred_device(&[LVP, MVK], false), Some(1));
+        assert_eq!(preferred_device(&[LVP, MVK, KK], false), Some(2));
+        assert_eq!(preferred_device(&[MVK, KK], false), Some(1));
+        assert_eq!(preferred_device(&[LVP, RADV, NV], false), Some(2));
+        assert_eq!(preferred_device(&[LVP], false), Some(0));
+        assert_eq!(preferred_device(&[], false), None);
+        // Ties keep the loader's order.
+        assert_eq!(preferred_device(&[RADV, RADV], false), Some(0));
+    }
+
+    #[test]
+    fn sv_gpu_prefer_cpu_puts_lavapipe_first() {
+        assert_eq!(preferred_device(&[MVK, KK, LVP], true), Some(2));
+        assert_eq!(preferred_device(&[MVK, KK], true), Some(1));
+    }
 
     fn names(w: &[(String, String)]) -> Vec<&str> {
         w.iter().map(|(n, _)| n.as_str()).collect()

@@ -27,7 +27,10 @@
 #                                             root and no locate: the product path (§83).
 #   wc-session up   ID RUNID PAGES OUTBOUND [frames]
 #                                             locate the guest-RAM arena, as root. Refused
-#                                             unless this host set WC_LAUNCH_GUEST_RAM=1 (§94)
+#                                             unless this host set WC_LAUNCH_GUEST_RAM=1 (§94).
+#                                             With WC_LAUNCH_GUEST_RAM_USER=1 and
+#                                             WC_LAUNCH_ROOTC=bash, as this user: a QEMU that
+#                                             runs as this user, the macOS guest of §103
 #   wc-session proxy ID                       start wc-proxy: as this user on an
 #                                             ivshmem session, as root on a guest-RAM one
 #   wc-session run    ID APP DPI CAPTION      start the application APP of $APPS against
@@ -382,7 +385,7 @@ load_app() {
     [[ "${DEF_PROFILE#"$HOME"/.wc-launch/}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [[ "$DEF_PROFILE" != *..* ]] \
       || die "$APPS [$want]: profile must be one plain directory name under $HOME/.wc-launch"
   fi
-  case "$DEF_TITLEBAR" in tabs|none|server|client) ;; *) die "$APPS [$want]: titlebar is tabs, none or client" ;; esac
+  case "$DEF_TITLEBAR" in tabs|mac-tabs|none|server|client) ;; *) die "$APPS [$want]: titlebar is tabs, mac-tabs, none or client" ;; esac
   case "$DEF_GPU" in on|off) ;; *) die "$APPS [$want]: gpu is on or off" ;; esac
   ( check_app "$DEF_DESKTOP" ) 2>/dev/null || die "$APPS [$want]: desktop $DEF_DESKTOP is not a desktop id"
   local e
@@ -473,6 +476,11 @@ audio_up() {
   {
     echo '#!/usr/bin/env bash'
     printf 'export HOME=%q PULSE_RUNTIME_PATH=%q PULSE_STATE_PATH=%q\n' "$D/pulse-home" "$D/xdg/pulse" "$D/pulse-state"
+    # §103.8: no session bus. A PulseAudio claims org.PulseAudio1 on it, so a
+    # second session running at the same time (macOS runs one per application)
+    # failed with "D-Bus name org.PulseAudio1 already taken" and had no sound.
+    # The null sink and the monitor socket need no D-Bus at all.
+    echo 'unset DBUS_SESSION_BUS_ADDRESS'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
     printf '  -L %q \\\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1"
@@ -1065,8 +1073,19 @@ wait \$P
 EOF
   chmod 755 "$D/proxy.sh"
   BASH=$(command -v bash)
-  printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl reset-failed %q 2>/dev/null\nsystemd-run --unit=%q --collect %q %q >/dev/null 2>&1\necho started\n' \
-    "$UNIT" "$UNIT" "$BASH" "$D/proxy.sh" | eval "$ROOTC" >/dev/null 2>&1
+  if [ "${WC_LAUNCH_GUEST_RAM_USER:-}" = 1 ]; then
+    # §103: QEMU runs as this user (the macOS test VM on devhost), so its QMP
+    # socket and /proc/<pid>/fd are this user's and neither the locate nor the
+    # proxy needs root: a user unit, as on the ivshmem path. Pair it with
+    # WC_LAUNCH_ROOTC=bash so `up` runs the locate as this user too.
+    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    systemctl --user reset-failed "$UNIT" 2>/dev/null
+    systemd-run --user --unit="$UNIT" --collect "$BASH" "$D/proxy.sh" >/dev/null 2>&1 \
+      || die "systemd-run --user could not start $UNIT"
+  else
+    printf 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin\nsystemctl reset-failed %q 2>/dev/null\nsystemd-run --unit=%q --collect %q %q >/dev/null 2>&1\necho started\n' \
+      "$UNIT" "$UNIT" "$BASH" "$D/proxy.sh" | eval "$ROOTC" >/dev/null 2>&1
+  fi
   for _ in $(seq 1 200); do [ -S "$D/wl-proxy" ] && break; sleep 0.05; done
   if [ ! -S "$D/wl-proxy" ]; then
     echo "wc-session: the proxy never bound its socket" >&2

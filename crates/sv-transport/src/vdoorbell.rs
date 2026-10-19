@@ -634,6 +634,40 @@ impl PortHandle {
         crate::stream::open_virtio_port(name).map(PortHandle::File)
     }
 
+    /// Open the guest end by device name. macOS guest (§103.4).
+    ///
+    /// macOS has no `/dev/virtio-ports`; a doorbell there is a serial device
+    /// (`AppleVirtIOConsole`'s or a 16550's `cu.*` node), named relative to
+    /// `/dev` because a name containing `/` is the *host* end's socket path in
+    /// `wc_compositor::ringlink::open_bell_port`. Raw mode, so the byte-per-bell
+    /// protocol is not line-disciplined into silence.
+    #[cfg(target_os = "macos")]
+    pub fn guest_port(name: &str) -> std::io::Result<PortHandle> {
+        use std::os::fd::AsRawFd;
+        let path = format!("/dev/{name}");
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("{path}: {e} — the guest has no such serial device"))
+        })?;
+        // `struct termios` is 72 bytes on x86_64 macOS (and arm64); an opaque,
+        // larger, aligned buffer is all three calls need, and keeps this crate
+        // free of a libc dependency, which is its convention.
+        unsafe extern "C" {
+            fn tcgetattr(fd: i32, t: *mut u64) -> i32;
+            fn cfmakeraw(t: *mut u64);
+            fn tcsetattr(fd: i32, action: i32, t: *const u64) -> i32;
+        }
+        let mut t = [0u64; 16];
+        // SAFETY: `t` is larger than `struct termios` and 8-aligned; the
+        // descriptor is open for the whole call. TCSANOW is 0.
+        unsafe {
+            if tcgetattr(f.as_raw_fd(), t.as_mut_ptr()) == 0 {
+                cfmakeraw(t.as_mut_ptr());
+                tcsetattr(f.as_raw_fd(), 0, t.as_ptr());
+            }
+        }
+        Ok(PortHandle::File(f))
+    }
+
     /// Open the guest end by port name. Windows guest.
     ///
     /// Ten seconds, because on a *hot-added* port the device object appears when

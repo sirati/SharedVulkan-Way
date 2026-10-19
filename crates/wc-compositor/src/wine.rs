@@ -230,8 +230,8 @@ pub fn announce() -> Result<(), u8> {
         // Said in full rather than as a tag, because this line is the one a
         // person reads after wondering why a Windows assertion did not fire.
         Win32::None => println!(
-            "wc-compositor: win32 is none -- this is the Linux build and nothing here is \
-             evidence about Windows{forced_note}"
+            "wc-compositor: win32 is none -- this is the {} build and nothing here is \
+             evidence about Windows{forced_note}", std::env::consts::OS
         ),
     }
     Ok(())
