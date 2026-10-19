@@ -34728,7 +34728,7 @@ microseconds.
 | 1 `BAR` | a range of an ivshmem BAR beyond the bootstrap | u64 offset into the device's file | 1 MiB | opens the device's file by name and maps `offset` (§107's `ivshmem_window`); stamps checked once |
 | 2 `WIN_LARGE` | a Windows large-page section in guest RAM (108.7) | 16-byte nonce, u32 units, u32 keeper id, u64 0 | 2 MiB | **`Locator::Probe`**: reads one 64-byte stamp every 2 MiB of the RAM backend (108.9); every unit found exactly once, or REFUSED |
 | 3 `WIN_AWE` | AWE frames (reserved, not built: 108.8) | u64 offset and u64 length of an out-of-line frame list in the bootstrap | 4 KiB | translates the frames through the flat view (`PfnLocator`) and checks each stamp |
-| 4 `MAC_SHM` | role (b): a POSIX shm chunk of the Mac, placed in the guest's fixed IPA window | 40-byte NUL-padded shm name, u64 window offset, u64 0 | the chunk (64 MiB) | the Linux guest maps its window at `offset`; the Mac maps the chunk by name |
+| 4 `MAC_SHM` | role (b): a POSIX shm object of the Mac, which libkrun maps into the guest as the DAX range of a tag file in the virtio-fs share (xattr `user.krun.shm=/krun.NAME`), cacheable and coherent | 32 bytes: the shm name (`/krun.NAME`, NUL-padded); 32 bytes: the tag file's name in the share (NUL-padded). No window offset: the guest finds the region by path | the object (64 MiB chunks) | the Linux guest opens and maps the tag file; the Mac maps the object by name |
 | 5 `FILE` | a range of a plain shared file (tests; the Linux guest of §71) | u64 offset | 4 KiB | maps the file at `offset` |
 
 A kind the peer does not know is answered `REFUSED`/`KIND`. New substrates
@@ -34884,9 +34884,14 @@ provider, and one budget for both.
   108.14's, not this branch's.
 
 **Role (b) (the real Mac).** The Mac's process is the provider with kind
-`MAC_SHM`. The Linux guest's ICD and proxy are peers, and the IPA window is
-their view. The guest acknowledges `UNMAPPED` before the Mac calls
-`shm_unlink` and unmaps for the last time.
+`MAC_SHM`, and the Linux guest's ICD and proxy are peers. The release order
+(corrected by the real-Mac session, 2026-10-19):
+1. the guest munmaps and closes the region;
+2. the guest **unlinks the tag file**, which is required, because virtio-fs
+   otherwise keeps the DAX range cached;
+3. libkrun unmaps the range;
+4. the guest acknowledges `UNMAPPED`;
+5. the Mac calls `shm_unlink` and unmaps for the last time.
 
 **Shrink, one more rule (built).** A region idle for 5 minutes (`deep_idle_ms`)
 is retired even inside the low-water margin, so an idle pool gives back
