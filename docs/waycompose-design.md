@@ -31712,15 +31712,19 @@ frames and no file.
 
 ### 103.4 Doorbells and the Wayland byte stream in role (a)
 
-* **The first window needs no shared memory at all.** The compositor listens on
-  a Unix socket (`--socket`). The macOS launcher's session ssh carries it to the
-  Linux host as an OpenSSH Unix-socket remote forward. `wc-proxy --upstream`
-  connects to the forwarded socket, and `--in-band` carries `wl_shm` pixels in
-  the stream. This is §28's arrangement minus the Windows loopback relay, and
-  it is what is brought up first.
-* **Pixels then move to the arena:** `--arena-guest-ram` on the compositor, and
-  `wc-arena-host` plus `wc-proxy --arena-plan` on the host. This is the same
-  code as on Windows, with superpages underneath.
+* **The Wayland bytes** cross on an OpenSSH Unix-socket forward: the
+  compositor listens on a socket (`--socket`), and `wc-proxy --upstream`
+  connects to the forwarded end. The compositor runs `--in-band`. On macOS, as on
+  any Unix, the vendored `wayland-backend` would otherwise expect descriptors in
+  `SCM_RIGHTS`, and nothing carries one across a forward (§1a). `--in-band`
+  selects the descriptor dialect only. **Pixels never travel in the stream**:
+  `wc-proxy` has exactly two pixel transports, a shared file per pool and the
+  arena. So even the first window needs the arena.
+* **Pixels are in the arena from the first window on:** `--arena-guest-ram` on
+  the compositor, and `wc-arena-host` plus `wc-proxy --arena-plan` on the host.
+  This is the same code as on Windows and in §71's Linux guest, with
+  superpages underneath. `scripts/mac-window.sh` is the whole path as one
+  command.
 * **Doorbells.** §99's hub multiplexes QEMU `virtio-serial` ports. Sonoma's
   `AppleVirtIOConsole` binds only *legacy* virtio-serial, so the port is added
   with `disable-modern=on`, and the guest opens the `/dev/cu.*` node.
@@ -31935,3 +31939,5 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | superpages: `mmap(VM_FLAGS_SUPERPAGE_SIZE_2MB)`, 32 MiB and 1 GiB | Sonoma 14.8.9 VM (`wayland-host`) | allocated, `mlock` 0, wired pages up by the mapping |
 | MoltenVK 1.4.2 `vulkaninfo` | same VM | `VK_ERROR_INCOMPATIBLE_DRIVER`, "MoltenVK requires Metal, which is not available on this device" |
 | `cargo check --target x86_64-apple-darwin` (compositor, sv-guest, wc-launch, gpu server) | this workstation | passes after the cfg changes in this section |
+| native build of `wc-compositor` with the AppKit platform | the VM (CLT 16.2, rustup 1.99.1) | links against system frameworks only (`otool -L`); libxkbcommon 1.7 is linked statically from MacPorts' `.a` |
+| **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |
