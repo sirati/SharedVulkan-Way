@@ -246,7 +246,7 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     } else {
         say("NO DOORBELL HUB given: the arena's header page is read every poll interval only");
     }
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir());
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let mut live = Live::load(runtime.join("wc-sessiond/live"));
     if !live.map.is_empty() {
         say(&format!("adopted running session(s): {:?}", live.map.keys().collect::<Vec<_>>()));

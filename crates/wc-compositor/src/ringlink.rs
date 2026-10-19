@@ -730,6 +730,9 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
     sv_transport::vdoorbell::PortHandle::guest_port(name)
 }
 
+/// The port's reader, when there is a port (§105: the rings are polled without).
+pub type BellReader = Option<Box<dyn Read + Send>>;
+
 /// The ring region at the tail of ivshmem arena `id` (§89): create the control
 /// region there, install the port's writer as this process's cross-VM
 /// doorbell, and hand back the listener, the port's reader — which the
@@ -738,10 +741,7 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
 /// The region is the compositor's to create, as every ring region has been
 /// (this module's header): it zeroes the tail and publishes a control header
 /// the proxy attaches to after it has checked the arena header's run id.
-pub fn over_ivshmem(
-    id: u32,
-    port: Option<sv_transport::vdoorbell::PortHandle>,
-) -> Result<(RingLink, Option<Box<dyn Read + Send>>, u32), String> {
+pub fn over_ivshmem(id: u32, port: Option<sv_transport::vdoorbell::PortHandle>) -> Result<(RingLink, BellReader, u32), String> {
     let (base, len) = wc_handle::arena::ivshmem_rings(id).map_err(|e| e.to_string())?;
     // SAFETY: `ivshmem_rings` returns the tail of the ivshmem view, which the
     // arena registry keeps mapped for the life of the process, `len` bytes

@@ -1279,3 +1279,78 @@ on, the seat takes `NAME=value` words after the mode, only from a fixed list,
 each checked for its kind (store paths for libraries and manifests,
 `safe_socket` for `SV_SOCKET` and `SV_BELL`, fixed values for the rest), and
 writes them as plasmashell's environment; anything else is refused.
+
+### R37 — No ssh: the shared-memory device is the boundary, and a key signs the boot
+Added 2026-10-19 with `waycompose-design.md` §105. Until §105 the guest's
+only authority on the VM host was an ssh key in the installation's directory,
+restricted by `authorized_keys` to `wc-session` as a forced command (R33).
+That key started every session, carried every request and held the tunnel
+the sound, the feeds and the GPU's cold path went through. §105 removes ssh
+from the session entirely. What replaced each part of it:
+
+* **Who may start a session.** The compositor writes a boot record into the
+  ivshmem header page (`wc_handle::macboot`, at byte 1024) and an
+  authenticator beside it (byte 1792): the installation's name, a sequence
+  number and HMAC-SHA-256 over every field of the record under the
+  installation's key. The host's session service (`wc-arena-host sessiond
+  --ivshmem`, user unit `wc-sessiond.service`, as the user, refusing root)
+  acts on a record only if the installation is registered
+  (`~/.config/waycompose/installs/<name>` → its directory), the MAC verifies
+  under `<dir>/session.key` (this user's, mode 0600, or refused), and the
+  sequence number is above every one accepted for that installation before
+  (`~/.local/state/waycompose/sessiond/<name>.seq`). The key is 32 random
+  bytes made on the host at the first deploy and kept; it exists in two places,
+  that file and `session.key` beside the launcher in the guest user's profile,
+  whose ACL deploy reduces to that one user reading it.
+* **What a session may ask.** Unchanged in substance. Requests are lines on
+  the session's control ring (`OWNER_CONTROL`); the proxy runs each through
+  that installation's `wc-session` with the words as `SSH_ORIGINAL_COMMAND`,
+  so §94's validation is the same code (R33): application ids, an action id or
+  a URL, two numbers. The proxy refuses any word outside `[A-Za-z0-9 +/=._-]`
+  before `wc-session` sees it and puts the session's own id after the verb,
+  so a guest cannot name another session. `app`, `frequent` and `icon` take
+  no session, as on ssh.
+* **How the guest reaches the host at all.** Only through the ivshmem device
+  and the two virtio-serial ports R29, R31 and R35 describe. Nothing listens
+  on a network. The guest has no ssh key for the host (deploy deletes
+  `id_host`), and the host has no `authorized_keys` line for the installation
+  (deploy removes it). The guest's loopback TCP ports (the relay's, the
+  sound's, the GPU process's) are gone.
+
+**What the guest can do that it could not before.** Start a session without
+an ssh key, if it has the installation's key. That is the same population:
+the ssh key sat in the same directory with the same reader. A process of the
+guest user can read either and is the user. A process of another guest user
+can read neither, and the device alone does not let it in: an unsigned or
+mis-signed record is refused with a reason written back into the page.
+
+**What a process that can map the device can do.** The Windows driver gives
+one mapping per device, and while a session runs the compositor holds it, so
+no other guest process can touch that session's rings or header. With no
+session up, such a process can write a boot record, which is refused without
+the key, or replay one it read earlier, which is refused by the sequence
+number; a record whose fields were changed fails the MAC. It cannot forge a
+session, and a refused record costs the host one page read and a log line.
+
+**What the host's service trusts.** Every field of the record is untrusted
+input: the session id is `wc-session`'s alphabet, the installation name
+`[A-Za-z0-9_-]` up to 32, looked up only as a direct entry of the registry,
+and the record must match the header the device holds (magic and run id) and
+read the same twice. It answers only in the page it read, after checking that
+page still holds the same record.
+
+**What this does not protect.** A guest process running as the user can read
+`session.key` and start sessions, as it could use the ssh key before. The key
+is not rotated; redeploying keeps it, and deleting `<dir>/session.key` on the
+host makes the next deploy issue a new one. A member of `wc-arena` on the host
+can write the device file, so it can write a boot record too, but it can only
+ask this user's service to start this user's installations, with nothing it
+could not already run itself. Deployment itself still uses ssh from the
+developer's workstation to both machines (an administrator's channel, not the
+session's): that is how the key crosses, once.
+
+**The debug transport.** `debug-ssh-transport = on` in `wc-launch.ini`,
+deployed with `WC_LAUNCH_DEBUG_SSH_TRANSPORT=1`, brings back the pre-§105
+path, key and forced command included. It is off by default, says
+`DEBUG SSH TRANSPORT` three times in the session's log, and the harness fails
+a run whose log says it.

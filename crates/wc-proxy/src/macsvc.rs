@@ -183,29 +183,6 @@ pub fn command_words(line: &str, id: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_request_gets_this_sessions_id_and_jump_list_verbs_do_not() {
-        assert_eq!(command_words("run firefox 96 30", "wcns-1"), "run wcns-1 firefox 96 30");
-        assert_eq!(command_words("gpu", "wcns-1"), "gpu wcns-1");
-        assert_eq!(command_words("app firefox light", "wcns-1"), "app firefox light");
-        assert_eq!(command_words("frequent firefox", "wcns-1"), "frequent firefox");
-        // A guest that puts another id first only adds a word after its own.
-        assert_eq!(command_words("down other-1", "wcns-1"), "down wcns-1 other-1");
-    }
-
-    #[test]
-    fn only_plain_words_are_requests() {
-        assert!(words_ok("run firefox 96 30"));
-        assert!(words_ok("open firefox aHR0cHM6Ly9leGFtcGxlLm9yZy8= 96 30"));
-        assert!(!words_ok("run firefox; rm -rf ~"));
-        assert!(!words_ok("run $(id)"));
-        assert!(!words_ok(""));
-    }
-}
 
 /// Five seconds without a ping, once pings have started, end the process:
 /// the guest's pages are no longer the session's.
@@ -252,5 +229,29 @@ fn serve_audio(_control: Arc<Control>, mut ch: ByteChannel, sock: PathBuf) {
             }
         }
         let _ = r.fill_buf();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_gets_this_sessions_id_and_jump_list_verbs_do_not() {
+        assert_eq!(command_words("run firefox 96 30", "wcns-1"), "run wcns-1 firefox 96 30");
+        assert_eq!(command_words("gpu", "wcns-1"), "gpu wcns-1");
+        assert_eq!(command_words("app firefox light", "wcns-1"), "app firefox light");
+        assert_eq!(command_words("frequent firefox", "wcns-1"), "frequent firefox");
+        // A guest that puts another id first only adds a word after its own.
+        assert_eq!(command_words("down other-1", "wcns-1"), "down wcns-1 other-1");
+    }
+
+    #[test]
+    fn only_plain_words_are_requests() {
+        assert!(words_ok("run firefox 96 30"));
+        assert!(words_ok("open firefox aHR0cHM6Ly9leGFtcGxlLm9yZy8= 96 30"));
+        assert!(!words_ok("run firefox; rm -rf ~"));
+        assert!(!words_ok("run $(id)"));
+        assert!(!words_ok(""));
     }
 }

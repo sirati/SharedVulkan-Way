@@ -450,8 +450,8 @@ mod auth_tests {
 
     #[test]
     fn the_authenticator_does_not_overlap_the_hosts_fields() {
-        assert!(AUTH_OFF >= OFF_MESSAGE + MESSAGE_MAX);
-        assert!(AUTH_OFF + AUTH_LEN <= 4096);
+        const { assert!(AUTH_OFF >= OFF_MESSAGE + MESSAGE_MAX) };
+        const { assert!(AUTH_OFF + AUTH_LEN <= 4096) };
     }
 
     #[test]
