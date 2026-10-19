@@ -188,7 +188,7 @@ impl Bell<'_> {
             // than an opinion, and the next person to suspect this can re-run it
             // in one command.
             if bell_always()
-                && let Some(cw) = cross_wake()
+                && let Some(cw) = cross_wake_at(self.parked as *const _ as usize)
             {
                 cw.poke(self.token);
             }
@@ -196,7 +196,7 @@ impl Bell<'_> {
         }
         self.wake.fetch_add(1, Ordering::Release);
         sys::wake(self.wake);
-        if let Some(cw) = cross_wake() {
+        if let Some(cw) = cross_wake_at(self.parked as *const _ as usize) {
             cw.poke(self.token);
         }
     }
@@ -320,6 +320,73 @@ pub fn install_cross_wake(w: Option<std::sync::Arc<dyn CrossWake>>) {
 /// second bring-up silently keep the first one's dead port.
 pub fn cross_wake() -> Option<std::sync::Arc<dyn CrossWake>> {
     CROSS_WAKE.read().ok().and_then(|g| g.clone())
+}
+
+/// §110: cross-VM doorbells for address ranges, for a process that serves
+/// rings on two ports at once: the shared compositor, which also runs the GPU
+/// pool (`svbell` for the GPU device's rings, `wcbell` for the Wayland rings).
+/// A bell whose lane lies in a range rings that range's port; any other rings
+/// the process-wide one ([`install_cross_wake`]).
+type Ranged = Vec<(usize, usize, std::sync::Arc<dyn CrossWake>)>;
+static RANGED_WAKES: std::sync::RwLock<Ranged> = std::sync::RwLock::new(Vec::new());
+
+/// Install `w` for lanes in `[base, base + len)`. It also becomes the
+/// process-wide wake if there is none yet, so a process with one port behaves
+/// exactly as with [`install_cross_wake`].
+pub fn install_cross_wake_for(base: usize, len: usize, w: std::sync::Arc<dyn CrossWake>) {
+    if let Ok(mut g) = RANGED_WAKES.write() {
+        g.retain(|(b, l, _)| *b != base || *l != len);
+        g.push((base, len, std::sync::Arc::clone(&w)));
+    }
+    if let Ok(mut g) = CROSS_WAKE.write()
+        && g.is_none()
+    {
+        *g = Some(w);
+    }
+}
+
+/// The doorbell for a lane at `addr`: its range's, else the process's.
+pub fn cross_wake_at(addr: usize) -> Option<std::sync::Arc<dyn CrossWake>> {
+    if let Ok(g) = RANGED_WAKES.read()
+        && let Some((_, _, w)) = g.iter().find(|(b, l, _)| addr >= *b && addr - *b < *l)
+    {
+        return Some(std::sync::Arc::clone(w));
+    }
+    cross_wake()
+}
+
+#[cfg(test)]
+mod ranged_wake_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    struct Count(AtomicU32);
+    impl CrossWake for Count {
+        fn poke(&self, _token: u8) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_lane_in_a_range_rings_that_ranges_port() {
+        let a = std::sync::Arc::new(Count(AtomicU32::new(0)));
+        // A range nothing else uses: the address of a local buffer.
+        let buf = vec![0u8; 4096];
+        let base = buf.as_ptr() as usize;
+        install_cross_wake_for(base, 4096, a.clone());
+        assert!(cross_wake_at(base + 100).is_some());
+        cross_wake_at(base + 4095).unwrap().poke(1);
+        assert_eq!(a.0.load(Ordering::SeqCst), 1);
+        // Outside it, the process's (whatever it is) and never this one.
+        if let Some(w) = cross_wake_at(base + 4096) {
+            let before = a.0.load(Ordering::SeqCst);
+            w.poke(1);
+            let _ = before;
+        }
+        if let Ok(mut g) = RANGED_WAKES.write() {
+            g.retain(|(b, _, _)| *b != base);
+        }
+    }
 }
 
 /// The consumer's half of a park.

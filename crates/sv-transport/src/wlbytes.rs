@@ -180,9 +180,61 @@ pub const OWNER_AUDIO: u64 = SERVICE_TAG | 2;
 /// and file-type handlers, pushed to Linux. One line per message.
 pub const OWNER_HOSTINT: u64 = SERVICE_TAG | 3;
 
+/// §107: the session's arena: the proxy asks the compositor for regions of
+/// the shared BAR (`grow`) and gives them back (`release`).
+pub const OWNER_ARENA: u64 = SERVICE_TAG | 3;
+
 /// Whether an owner id names a session service rather than a client.
 pub fn is_service(owner_id: u64) -> bool {
     owner_id >> 56 == SERVICE_TAG >> 56
+}
+
+/// §107: where a claim says which session of a shared compositor it is.
+/// Bits 48..56 of every owner id a proxy claims with: the session index the
+/// compositor gave the session in its boot record. Zero is "no index", the
+/// single-session compositor every guest had before §107, so an owner id
+/// from an older proxy reads as session 0 and nothing changes for it.
+pub const SESSION_SHIFT: u32 = 48;
+/// The bits [`SESSION_SHIFT`] names.
+pub const SESSION_MASK: u64 = 0xFF << SESSION_SHIFT;
+
+/// `owner` tagged with session `index`. The bits are cleared first, so a
+/// caller's own numbering never leaks into them.
+pub fn with_session(owner: u64, index: u8) -> u64 {
+    (owner & !SESSION_MASK) | (u64::from(index) << SESSION_SHIFT)
+}
+
+/// The session index an owner id carries (0 for none).
+pub fn session_of(owner: u64) -> u8 {
+    ((owner & SESSION_MASK) >> SESSION_SHIFT) as u8
+}
+
+/// The owner id with its session index taken out: what the claim is
+/// (a client's ordinal, a feed, [`OWNER_CONTROL`] ...).
+pub fn without_session(owner: u64) -> u64 {
+    owner & !SESSION_MASK
+}
+
+#[cfg(test)]
+mod session_tag_tests {
+    use super::*;
+
+    #[test]
+    fn a_session_index_rides_in_the_owner_id_and_leaves_the_rest_alone() {
+        for base in [1u64, 7, (1 << 40) | 3, (1 << 40) | (1 << 39) | 3, OWNER_CONTROL, OWNER_AUDIO, OWNER_ARENA] {
+            for idx in [0u8, 1, 2, 200, 255] {
+                let o = with_session(base, idx);
+                assert_eq!(session_of(o), idx);
+                assert_eq!(without_session(o), base);
+                assert_eq!(is_service(o), is_service(base), "the service tag survives the index");
+            }
+        }
+        // An untagged id is session 0: every proxy from before §107.
+        assert_eq!(session_of(OWNER_CONTROL), 0);
+        assert_eq!(session_of(5), 0);
+        // Re-tagging replaces, never ORs two sessions together.
+        assert_eq!(session_of(with_session(with_session(9, 3), 4)), 4);
+    }
 }
 
 /// See [`ByteChannel::kicker`].

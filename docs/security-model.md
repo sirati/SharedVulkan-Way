@@ -1493,3 +1493,48 @@ of the guest's memory (about 0.45 s of one core for 4 GiB). The service sweeps
 at most once a second however often it is rung, so a guest that rings in a
 loop costs the host about half a core; the guest's own launcher rings once
 every 3 s, and only while its record waits.
+
+### R41 — One compositor serves every installation of the user
+Added 2026-10-19 with `waycompose-design.md` §107. Until §107 each
+installation had its own guest compositor and GPU process, and the ivshmem
+driver's one mapping per device meant one installation's session at a time.
+Now one compositor (and one GPU process) per Windows user serves all of them,
+which puts several installations' sessions in one process and one device.
+What keeps them apart:
+
+* **Who may start each session.** Unchanged from R37, per installation: each
+  boot record is signed with *its* installation's key, and the MAC now also
+  covers the session's index, so a record cannot be moved to another index or
+  passed off as another installation's (`a_shared_compositors_record_carries_
+  its_index_under_its_own_key`). A launcher asks for a boot on the user's
+  socket (`%LOCALAPPDATA%\waycompose\wc-compositor.ctl`, in the user's
+  profile like the launchers' own sockets), naming the key file it holds; the
+  compositor signs with the key it reads there. A process that can reach that
+  socket is the user, who can read every installation's key anyway (R37).
+* **What each session may name.** A session's clients may name only arena
+  regions granted to their own session (`slice_allowed`, enforced in
+  `wl_shm.create_pool`); arena 0 (the whole BAR), another session's region
+  and a region given back are protocol errors. The guest compositor is the
+  one allocator of the BAR, so two proxies can no longer hand out the same
+  bytes. A ring claim of a session the compositor does not serve is closed.
+* **What the host's proxies are.** Every installation's proxy runs on the VM
+  host **as the same user** and maps the same device file, so on the host the
+  sessions are one trust domain, as they were when they ran one after another:
+  a proxy could write into any region of the file. The boundary §107 adds is
+  against mistakes and crashes, not against the host user: a proxy only
+  allocates in its own windows, and the guest compositor will not show one
+  session's region in another session's window.
+* **Fault isolation.** One session can hold at most three quarters of the
+  arena and 28 of the 63 ring slots; its control requests wait only on its own
+  channel; when its proxy dies or goes silent the session is ended within
+  about 5 s, its slots are closed and quarantined for 10 s (longer than a
+  proxy's 5 s lease) before anybody may claim them again, and its regions are
+  returned only after its clients have been disconnected. Region ids and
+  session indices are not reused within a compositor's run.
+
+**What this does not protect.** One process holds every installation's
+windows: a crash of the compositor (or of the GPU process) ends every
+installation's session at once, where before it ended one. The next click
+starts a new compositor with a new run id, which voids every old record,
+region and slot (`waycompose-design.md` §107.6). The host side is one user,
+as above.

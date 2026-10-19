@@ -273,14 +273,19 @@ pub fn spawn(
     // its `Control` while the thread still ran left it reading freed memory
     // (`two_links_talk_both_ways` crashed with SIGSEGV in `wake_epoch` under load).
     let keep = std::sync::Arc::clone(control);
+    // (Captured by the thread below, which also reads its ring's state.)
     std::thread::Builder::new()
         .name(format!("sound-ring-{}", ch.slot()))
         .spawn(move || {
-            let _keep = keep;
             let mut pending: Vec<u8> = Vec::new();
             let mut dec = Decoder::default();
             let mut buf = vec![0u8; 16 * 1024];
             let why = 'run: loop {
+                // §107: a ring this side's owner closed (its session ended) is
+                // not written again, whatever is still queued.
+                if keep.ring_state(ch.slot()).ok() == Some(crate::control::RingState::Dead) {
+                    break 'run "the ring was closed".into();
+                }
                 // Before the queue is looked at: a send after this is a kick
                 // the wait below will not sleep through.
                 let epoch = match ch.wake_epoch() {

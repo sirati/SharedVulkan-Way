@@ -15,12 +15,23 @@ $G 'powershell -NoProfile -Command "Get-Process wc-activity -ErrorAction Silentl
 $G "cat > $DIR/wc-activity.exe" < "$OUT/wc-activity.exe"
 ps='$exe = "$env:LOCALAPPDATA\waycompose\tools\wc-activity.exe"
 $a = New-ScheduledTaskAction -Execute $exe
-$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+# At logon, at unlock and at a console or remote connect, and every 5 minutes:
+# something outside may end it (an Office update did, 2026-10-19), and the
+# restart settings below only retry a start that failed. IgnoreNew keeps it one.
+$t = @(New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+$cls = Get-CimClass -Namespace Root/Microsoft/Windows/TaskScheduler -ClassName MSFT_TaskSessionStateChangeTrigger
+foreach ($sc in 8, 1, 3) {  # SessionUnlock, ConsoleConnect, RemoteConnect
+  $x = New-CimInstance -CimClass $cls -ClientOnly; $x.StateChange = $sc; $x.UserId = $user; $x.Enabled = $true; $t += $x }
+$r = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+$r.Repetition.Duration = ""  # for ever
+$t += $r
 $p = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName "wc-activity" -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null
 Start-ScheduledTask -TaskName "wc-activity"
 Start-Sleep -Seconds 4
+(Get-ScheduledTask -TaskName "wc-activity").Triggers | ForEach-Object { "trigger " + $_.CimClass.CimClassName + $(if ($_.StateChange) { " state " + $_.StateChange } else { "" }) + $(if ($_.Repetition.Interval) { " every " + $_.Repetition.Interval } else { "" }) }
 Get-Process wc-activity -ErrorAction SilentlyContinue | ForEach-Object { "running pid " + $_.Id + " session " + $_.SessionId }
 Get-Content "$env:LOCALAPPDATA\waycompose\activity.txt" -TotalCount 7 -ErrorAction SilentlyContinue'
 enc=$(printf '%s' "$ps" | iconv -t UTF-16LE | base64 -w0)

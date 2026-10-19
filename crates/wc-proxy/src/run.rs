@@ -73,6 +73,8 @@ struct Args {
     /// Required with `--arena-ivshmem`: without it a header left by a previous
     /// compositor would be indistinguishable from this one's.
     arena_run: Option<u64>,
+    /// §110: `--arena-region K=PATH`, the one pool's other regions.
+    arena_regions: Vec<(u32, PathBuf)>,
     /// GROWTH. `wc-arena-host`, and the two things it needs to reach QEMU.
     ///
     /// Empty means this proxy cannot cause a region to exist and falls back to
@@ -210,6 +212,13 @@ usage: wc-proxy --upstream <path> [options]
                          root. Fixed size: --arena-grow is refused.
   --arena-run 0xHEX      arena: the run id the compositor printed; a header with
                          any other is refused
+  --session-index N      §107: this proxy's session in a guest compositor shared by
+                         several installations: N goes into every ring claim, and
+                         the arena is the BAR windows the compositor grants on the
+                         session's arena slot, never the whole BAR
+  --arena-region K=PATH  §110: region K of the one pool is the file PATH (the GPU
+                         device's, whose pool offsets are file offsets): a grant
+                         `ok ID region K OFFSET LEN` is mapped from it
   --arena-locator PATH   arena: wc-arena-host, so that --arena-grow can ask the
                          compositor for a region and then locate it. Without it
                          growth only watches the plan for a region somebody else
@@ -309,6 +318,7 @@ fn parse_args() -> Result<Args, String> {
         arena_plan: PathBuf::new(),
         arena_ivshmem: PathBuf::new(),
         arena_run: None,
+        arena_regions: Vec::new(),
         arena_locator: PathBuf::new(),
         arena_qmp: "/run/windows-vm/qmp.sock".into(),
         arena_vm: "windows-vm".into(),
@@ -346,6 +356,20 @@ fn parse_args() -> Result<Args, String> {
             }
             "--session-control" => a.services.session = Some(next()?.into()),
             "--session-id" => a.services.id = Some(next()?),
+            // §107: this session's index in a compositor shared by several
+            // installations; every ring claim carries it, and the arena is
+            // the windows of the BAR the compositor grants.
+            // §110: region K of the one pool is this file (the GPU device's).
+            "--arena-region" => {
+                let v = next()?;
+                let (k, p) = v.split_once('=').ok_or_else(|| format!("--arena-region {v}: K=PATH"))?;
+                let k: u32 = k.parse().map_err(|_| format!("--arena-region {v}: K is a region number"))?;
+                a.arena_regions.push((k, p.into()));
+            }
+            "--session-index" => {
+                let v = next()?;
+                a.services.index = v.parse().map_err(|_| format!("--session-index {v}: 0..255"))?;
+            }
             "--audio-socket" => a.services.audio = Some(next()?.into()),
             "--hostint" => a.hostint.dir = next()?.into(),
             "--hostint-opener" => a.hostint.opener = Some(next()?.into()),
@@ -585,7 +609,17 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             };
-            let mut t = Arena::from_ivshmem(args.arena_id, &args.arena_ivshmem, run)?;
+            let index = args.services.index;
+            let mut t = if index == 0 {
+                Arena::from_ivshmem(args.arena_id, &args.arena_ivshmem, run)?
+            } else {
+                let mut src = wc_proxy::barwin::BarWindows::new(&args.arena_ivshmem, run, index);
+                for (k, p) in &args.arena_regions {
+                    src = src.with_region(*k, p);
+                }
+                println!("[proxy] arena {}: session {index} of a shared compositor; it grows by {}", args.arena_id, src.describe());
+                Arena::from_ivshmem_shared(args.arena_id, &args.arena_ivshmem, run, Box::new(src), args.arena_grow_idle)?
+            };
             t.set_policy(args.arena_policy)?;
             println!(
                 "[proxy] transport arena {}: {} bytes of {} (nothing located, nothing \
@@ -956,9 +990,16 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
         );
         wc_proxy::macsvc::start(&control, &args.services);
+        // §107: the session's arena slot, claimed now, before any client.
+        if args.services.index != 0 {
+            match wc_proxy::barwin::start(&control, args.services.index) {
+                Ok(slot) => println!("[proxy] session {}: arena requests on ring slot {slot}", args.services.index),
+                Err(e) => println!("[proxy] session {}: NO ARENA SLOT ({e}); every pool will be refused", args.services.index),
+            }
+        }
         // §106: host integration on its slot; the compositor opens it.
         if !args.hostint.dir.as_os_str().is_empty() {
-            let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+            let _ = wc_proxy::hostint::start_indexed(&control, args.hostint.clone(), args.services.index);
         }
         Some(control)
     } else if args.wayland_rings {
@@ -1134,7 +1175,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // §89: a ring when there is one to be had, else the socket — and on the
         // launcher's rings the socket is ssh, so that is said loudly.
         let claimed = ring.as_ref().map(|control| {
-            sv_transport::wlbytes::ByteChannel::claim(control, n as u64).map(|ch| (control, ch))
+            sv_transport::wlbytes::ByteChannel::claim(control, sv_transport::wlbytes::with_session(n as u64, args.services.index)).map(|ch| (control, ch))
         });
         let upstream = match claimed {
             Some(Ok((control, ch))) => {
@@ -1235,7 +1276,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // slot of its own (a client, as far as the compositor knows) and
         // speaks through a local socket pair bridged to it.
         let feed_ring = if on_ring { ring.clone() } else { None };
-        let feed_owner = (1u64 << 40) | n as u64;
+        let feed_owner = sv_transport::wlbytes::with_session((1u64 << 40) | n as u64, args.services.index);
         // STAGE 13. Where *this* client's application is installed, asked of
         // the kernel before the socket is moved into the thread. Read here
         // rather than inside the thread only because the answer is about the

@@ -129,6 +129,11 @@ where
         let interface = data_init.init(resource, *global_data);
         interface.clock_id(*global_data);
     }
+
+    // WAYCOMPOSE FORK (waycompose-design.md §107): only the sessions that asked.
+    fn can_view(client: wayland_server::Client, _global_data: &u32) -> bool {
+        crate::wayland::nested_visible(&client)
+    }
 }
 
 impl<D> Dispatch<wp_presentation::WpPresentation, u32, D> for PresentationState

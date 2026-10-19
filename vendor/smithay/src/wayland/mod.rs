@@ -102,3 +102,20 @@ pub mod xdg_toplevel_tag;
 pub mod xwayland_keyboard_grab;
 #[cfg(feature = "xwayland")]
 pub mod xwayland_shell;
+
+/// WAYCOMPOSE FORK (waycompose-design.md §107): which clients see the globals
+/// a nested compositor needs (`wp_viewporter`, `wp_single_pixel_buffer_manager_v1`,
+/// `wp_presentation`). A compositor shared by several sessions offers them only
+/// to the sessions that asked; unset, every client sees them, as upstream.
+pub type NestedFilter = fn(&wayland_server::Client) -> bool;
+
+static NESTED_FILTER: std::sync::OnceLock<NestedFilter> = std::sync::OnceLock::new();
+
+/// Install the [`NestedFilter`]; the first call wins, as it is process-wide.
+pub fn set_nested_filter(filter: NestedFilter) {
+    let _ = NESTED_FILTER.set(filter);
+}
+
+pub(crate) fn nested_visible(client: &wayland_server::Client) -> bool {
+    NESTED_FILTER.get().map_or(true, |f| f(client))
+}
