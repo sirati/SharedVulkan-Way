@@ -225,6 +225,7 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
+    fn dup2(from: i32, to: i32) -> i32;
 }
 
 /// §103.15: start the keeper and make it the holder of every guest-RAM
@@ -592,15 +593,44 @@ fn start_gpu_server(cfg: &Config, id: &str, log: &Log) -> Option<std::process::C
     let label = wc_handle::macboot::gpu_label(id);
     let out = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_dir().join("gpu.log"));
     let mut c = Command::new(&cfg.gpu_server);
-    c.args(["gpu", "guest", "--label", label, "--arena"])
-        .arg((cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string())
-        .args(["--idle", "43200"])
-        .stdin(Stdio::null());
-    // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
-    // when the VM has it; without it the GPU rings poll.
-    let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
-    if let Some(dev) = bell.as_deref().filter(|d| Path::new(d).exists()) {
-        c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+    c.stdin(Stdio::null());
+    if !cfg.gpu_file.is_empty() {
+        // §103.19, role (b): one pool in the file beside the arena, for every
+        // GPU session of this main process; the guest's `wc-session gpu`
+        // attaches each session to it (`ivshmem-serve --cold pool`).
+        c.args(["gpu", "pool-guest", "--pool-file", &cfg.gpu_file, "--sessions"])
+            .arg(cfg.gpu_sessions.max(1).to_string())
+            .args(["--idle", "60"]);
+        // The doorbell: the hypervisor's FIFO pair for the GPU's port, at
+        // fixed numbers in the child (ours are close-on-exec).
+        if !cfg.gpu_bell.is_empty() {
+            match fifo_fds(&cfg.gpu_bell) {
+                Ok((r, w)) => {
+                    c.args(["--bell", "fd:30,31"]);
+                    // SAFETY: only dup2, which is async-signal-safe, between
+                    // fork and exec.
+                    unsafe {
+                        std::os::unix::process::CommandExt::pre_exec(&mut c, move || {
+                            if dup2(r, 30) < 0 || dup2(w, 31) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                Err(e) => log.say(&format!("GPU DOORBELL: {e}; the GPU rings are polled")),
+            }
+        }
+    } else {
+        c.args(["gpu", "guest", "--label", label, "--arena"])
+            .arg((cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string())
+            .args(["--idle", "43200"]);
+        // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
+        // when the VM has it; without it the GPU rings poll.
+        let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
+        if let Some(dev) = bell.as_deref().filter(|d| Path::new(d).exists()) {
+            c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+        }
     }
     if !cfg.gpu_icd.is_empty() {
         c.env("VK_DRIVER_FILES", &cfg.gpu_icd);
@@ -721,6 +751,12 @@ fn socket_request(path: &Path, line: &str) -> Result<String, String> {
 /// read-write so neither open waits for, nor ends with, the other side; the
 /// descriptors live as long as this process.
 fn fifo_bell(prefix: &str) -> Result<String, String> {
+    let (r, w) = fifo_fds(prefix)?;
+    Ok(format!("fd:{r},{w}"))
+}
+
+/// [`fifo_bell`]'s two descriptors, close-on-exec, for this process's life.
+fn fifo_fds(prefix: &str) -> Result<(i32, i32), String> {
     use std::os::fd::IntoRawFd;
     let open = |end: &str| {
         let p = format!("{prefix}.{end}");
@@ -728,7 +764,7 @@ fn fifo_bell(prefix: &str) -> Result<String, String> {
     };
     let r = open("from-guest")?.into_raw_fd();
     let w = open("to-guest")?.into_raw_fd();
-    Ok(format!("fd:{r},{w}"))
+    Ok((r, w))
 }
 
 /// The ring slot the host claimed for a session service, once it has.

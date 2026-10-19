@@ -879,11 +879,16 @@ pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
 pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
     let r = match argv.get(1).map(String::as_str) {
         Some("guest" | "mem-guest") => mem_guest(&argv),
+        // §103.19: a Mac hosting the Linux VM serves every GPU session from
+        // one pool in a file both sides map (a RAM-disk file the VM sees
+        // through virtio-fs DAX), as the Linux development loop does.
+        Some("pool-guest") => linux_pool_guest(&argv),
         Some("probe") => mac_probe(&argv),
         _ => {
             eprintln!(
                 "usage:\n  \
                  sv-gpu-server guest [--label NAME] [--region FILE] [--device N] [--arena BYTES] [--idle SECS] [--cold-wait SECS] [--bell SPEC]\n  \
+                 sv-gpu-server pool-guest --pool-file FILE [--device N] [--sessions N] [--idle SECS] [--bell SPEC]\n  \
                  sv-gpu-server probe [--device N]"
             );
             Err("no subcommand".into())
@@ -1893,7 +1898,7 @@ pub fn report_missing_pub(fns: &sv_gpu_entry::DriverFns) {
 }
 
 /// The settings both pool entries take.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn pool_serve_args(args: &[String]) -> Result<sv_gpu_server::pool_guest::PoolServe, Box<dyn std::error::Error>> {
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
@@ -1986,7 +1991,7 @@ fn claim_singleton(name: &str) -> Result<(), String> {
 /// sv-gpu-server pool-guest --pool-file <path> [--device N] [--bell socket:PATH]
 ///                          [--sessions N] [--idle SECS] [--port <tcp>: debug only]
 /// ```
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::os::fd::AsFd;
     use std::sync::Arc;
