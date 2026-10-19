@@ -226,6 +226,10 @@ CoreAudio, and the pixels and the GPU path's memory are in the VM's own RAM,
 wired by the macOS process and found by the host. No macOS kernel driver is
 involved. Vulkan from Linux renders in the VM on lavapipe, because the VM has
 no Metal; on a real Mac the same server uses MoltenVK or KosmicKrisp.
+Nothing between the Mac and Linux uses ssh or a socket (§103.15): a session
+boots through a record in its own guest RAM that the host's session service
+(`wc-mac-sessiond`) finds, and both sides wake each other through legacy
+virtio-serial doorbells (`wc-mac-bell-hub`).
 
 ```
 scripts/mac-launch-install.sh             # both ends of the launcher, bundles pinned in the Dock
