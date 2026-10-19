@@ -937,6 +937,9 @@ mod win {
             Err(e) => return fail(format!("the compositor never said whether the host started the session: {e}")),
         }
         let text = std::fs::read_to_string(&p.comp_log).unwrap_or_default();
+        if let Some(run) = text.lines().find_map(|l| Some(l.split_once("header published: run ")?.1.split(',').next()?.trim().to_string())) {
+            log.say(&format!("arena: run {run}"));
+        }
         for l in text.lines().filter(|l| l.contains("wayland rings:") || l.contains("NO DOORBELL") || l.contains("boot: record")) {
             log.say(&format!("rings: {}", l.trim()));
         }
