@@ -34577,7 +34577,11 @@ locally 0.2–0.95 s each.
 proxy claims with are the session index (`with_session`, `session_of`);
 0 is the one-session proxy, so an older proxy's ids read as session 0. The
 service tag (top byte `0x5C`) and the low bits are unchanged.
-`OWNER_ARENA = SERVICE_TAG | 3` is new: the session's arena slot.
+`OWNER_ARENA = SERVICE_TAG | 4` is new: the session's arena slot. (It was `| 3` until
+the guest showed it: 3 is `OWNER_HOSTINT`'s, reserved since §103.14, so with host
+integration on a session's `grow` was answered with hostint's `hello` and no client
+got a buffer. `SERVICE_OWNERS` lists every service id and a test keeps them apart;
+`wc-multi-install.sh` leg 9 runs the compositor with `--hostint`.)
 
 **The arena slot** (proxy: `wc_proxy::barwin`; compositor:
 `session_svc::serve_arena`), one line each way:

@@ -181,8 +181,14 @@ pub const OWNER_AUDIO: u64 = SERVICE_TAG | 2;
 pub const OWNER_HOSTINT: u64 = SERVICE_TAG | 3;
 
 /// §107: the session's arena: the proxy asks the compositor for regions of
-/// the shared BAR (`grow`) and gives them back (`release`).
-pub const OWNER_ARENA: u64 = SERVICE_TAG | 3;
+/// the shared BAR (`grow`) and gives them back (`release`). Its own number:
+/// §107 and §106 were written apart and both took 3, so on a guest with host
+/// integration on, a session's `grow` was answered with hostint's hello.
+pub const OWNER_ARENA: u64 = SERVICE_TAG | 4;
+
+/// Every session service's owner id, each claimed once per session. A new
+/// service goes here, and the test below keeps the numbers apart.
+pub const SERVICE_OWNERS: [u64; 4] = [OWNER_CONTROL, OWNER_AUDIO, OWNER_HOSTINT, OWNER_ARENA];
 
 /// Whether an owner id names a session service rather than a client.
 pub fn is_service(owner_id: u64) -> bool {
@@ -247,7 +253,7 @@ mod session_tag_tests {
 
     #[test]
     fn a_session_index_rides_in_the_owner_id_and_leaves_the_rest_alone() {
-        for base in [1u64, 7, (1 << 40) | 3, (1 << 40) | (1 << 39) | 3, OWNER_CONTROL, OWNER_AUDIO, OWNER_ARENA] {
+        for base in [1u64, 7, (1 << 40) | 3, (1 << 40) | (1 << 39) | 3, OWNER_CONTROL, OWNER_AUDIO, OWNER_HOSTINT, OWNER_ARENA] {
             for idx in [0u8, 1, 2, 200, 255] {
                 let o = with_session(base, idx);
                 assert_eq!(session_of(o), idx);
@@ -271,6 +277,19 @@ mod session_tag_tests {
         assert_eq!(session_of(5), 0);
         // Re-tagging replaces, never ORs two sessions together.
         assert_eq!(session_of(with_session(with_session(9, 3), 4)), 4);
+    }
+
+    /// A compositor finds a session's service slot by its owner id alone, so
+    /// two services with one number share whichever slot is found first.
+    #[test]
+    fn every_session_service_has_its_own_owner_id() {
+        for (i, a) in SERVICE_OWNERS.iter().enumerate() {
+            assert!(is_service(*a));
+            assert_eq!(session_of(*a), 0, "a service id carries no session index of its own");
+            for b in &SERVICE_OWNERS[i + 1..] {
+                assert_ne!(a, b, "two session services share owner id {a:#x}");
+            }
+        }
     }
 }
 
