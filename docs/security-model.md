@@ -1538,3 +1538,62 @@ installation's session at once, where before it ended one. The next click
 starts a new compositor with a new run id, which voids every old record,
 region and slot (`waycompose-design.md` §107.6). The host side is one user,
 as above.
+
+### R43 — The host maps the Windows guest's own RAM, and the guest lends it on request
+Added 2026-10-19 with `waycompose-design.md` §108. The GPU pool, and through
+§110 the Wayland arena, grow into **regions of the guest's RAM**. These are
+large-page sections that a SYSTEM keeper in the guest creates and holds, and
+the host finds them by a 2 MiB probe of QEMU's RAM backend. Before §108 the
+host touched only the two ivshmem devices; now it maps pages that Windows
+lent and will reuse. What can go wrong, and what holds it:
+
+* **A host write into memory Windows has reused.** This is the failure that
+  panicked the macOS guest (§103.15). Here it would corrupt the Windows
+  kernel or another process: the worst outcome in this document. It is held
+  by §108.4's rules and nothing else:
+  * the provider frees a region only after the peer's `UNMAPPED` for that
+    region's epoch, never on a timeout;
+  * the peer answers only after its own mapping is gone and no host process
+    holds the region's lease file (`flock`, released by the kernel when a
+    process dies);
+  * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
+    own process;
+  * the memory has two holders in the guest (the keeper's handle and the
+    provider's view), so a crashed GPU process or compositor does not free it.
+
+  Tested on a test VM (§108.12): 86 provider kills under host writes, a
+  canary in reused memory, 0 corrupt words. **Residual:** the keeper and
+  every provider of a pool killed together before the host lets go (108.10).
+  An administrator can do that; a user's logoff cannot, because the keeper is
+  SYSTEM.
+* **The host user can read and write all of the guest's RAM.** Mapping a
+  region needs the RAM backend open, and that file is the whole guest. On
+  testhost it is root's today (QEMU runs as root). The deployment
+  (§108.14) must not simply hand the file to the user's processes:
+  * only the peer service should hold it;
+  * the ICDs and proxies should receive **udmabufs** of exactly their
+    region's runs. QEMU's memfd carries the seals udmabuf requires, which was
+    checked; that hand-out is not built.
+
+  Until it is, every process that maps a region can reach every page of the
+  guest. That is a host-side widening the user must accept explicitly, or
+  wait for.
+* **A forged or stale stamp points the host at the wrong pages.** The nonce
+  is 128 random bits per region and comes from the keeper (a guest process
+  can only stamp its own memory, which is its own business). The peer
+  refuses a region whose unit appears twice (`DUPLICATE`). It checks every
+  stamp again through its own mapping before answering, and it never
+  translates a guest-physical address, so R21's silent wrong offset cannot
+  occur. The table lives in the pool's bootstrap device, which only the
+  pool's owner maps (one mapping per device), so another guest process
+  cannot rewrite an entry.
+* **The guest starves itself.** The keeper refuses any region that would
+  leave Windows less than `max(1 GiB, 15% of RAM)` available, and a pool's
+  budget caps what it may add. Large pages are never paged, so what is lent
+  is unavailable to Windows until it is given back. The pool gives back
+  idle regions after 30 s (5 min inside the low-water margin) and everything
+  on an orderly exit.
+* **Who may ask the keeper.** Its pipe and its sections carry an SDDL of
+  SYSTEM, administrators and interactive users. A product install narrows it
+  to the user's SID. The user's account needs **no** `SeLockMemoryPrivilege`;
+  only the SYSTEM keeper creates large-page sections.
