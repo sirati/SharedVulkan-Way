@@ -60,6 +60,9 @@ mod input;
 mod platform;
 /// §36: `accept()` on the ring directory, and the bridge to smithay's socket.
 mod ringlink;
+/// §103.16: the Windows device end of the sound ring (every endpoint a
+/// stream). Its diffing is pure and tested everywhere.
+pub mod sound_win;
 mod state;
 mod surface;
 /// Which taskbar button a window belongs to. See its header, and

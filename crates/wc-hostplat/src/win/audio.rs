@@ -264,7 +264,18 @@ impl Drop for Watch {
 /// Send the host's audio state on `events` now and after every change,
 /// within a second of the change. `log` gets a line on failures. Ends when
 /// the [`Watch`] is dropped or `events`' receiver is gone.
-pub fn watch(events: Sender<Event>, mut log: impl FnMut(&str) + Send + 'static) -> Result<Watch, String> {
+pub fn watch(events: Sender<Event>, log: impl FnMut(&str) + Send + 'static) -> Result<Watch, String> {
+    watch_states(move |s| events.send(Event::Audio(s)).is_ok(), log)
+}
+
+/// [`watch`] with a callback: `on_state` gets the state now and after every
+/// burst of changes (only when it differs from the last), on the watch's own
+/// thread; returning `false` ends the watch. The sound ring's device side
+/// (wc-compositor `sound_win`) uses this.
+pub fn watch_states(
+    mut on_state: impl FnMut(State) -> bool + Send + 'static,
+    mut log: impl FnMut(&str) + Send + 'static,
+) -> Result<Watch, String> {
     let (tx, rx) = mpsc::channel::<Ping>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let client_tx = tx.clone();
@@ -294,7 +305,7 @@ pub fn watch(events: Sender<Event>, mut log: impl FnMut(&str) + Send + 'static) 
                 return;
             }
             let _ = ready_tx.send(Ok(()));
-            run(&e, &rx, &events, &mut log);
+            run(&e, &rx, &mut on_state, &mut log);
             // SAFETY: unregister before the last reference goes.
             unsafe {
                 (e.v().unregister_endpoint_notification_callback)(e.as_raw(), client.cast());
@@ -310,14 +321,14 @@ pub fn watch(events: Sender<Event>, mut log: impl FnMut(&str) + Send + 'static) 
     }
 }
 
-fn run(e: &Enumerator, rx: &Receiver<Ping>, events: &Sender<Event>, log: &mut dyn FnMut(&str)) {
+fn run(e: &Enumerator, rx: &Receiver<Ping>, on_state: &mut dyn FnMut(State) -> bool, log: &mut dyn FnMut(&str)) {
     let mut last: Option<State> = None;
     let mut send = |last: &mut Option<State>| -> bool {
         match enumerate_with(e) {
             Ok(s) => {
                 if last.as_ref() != Some(&s) {
                     *last = Some(s.clone());
-                    return events.send(Event::Audio(s)).is_ok();
+                    return on_state(s);
                 }
                 true
             }

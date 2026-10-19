@@ -82,9 +82,26 @@ impl Default for Sizing {
     }
 }
 
+/// Called on the device thread with the bytes of real samples the device
+/// just took from the queue (render).
+pub type OnDrain = Box<dyn FnMut(usize) + Send>;
+/// Called on the device thread with every packet the device recorded
+/// (capture), instead of queueing it.
+pub type OnData = Box<dyn FnMut(&[u8]) + Send>;
+
+#[derive(Default)]
+struct Hooks {
+    /// The queue is the caller's: it outlives the stream and is not closed.
+    shared: bool,
+    on_drain: Option<OnDrain>,
+    on_data: Option<OnData>,
+}
+
 struct Running {
     pipe: Pipe,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    shared: bool,
     thread: Option<std::thread::JoinHandle<()>>,
     fmt: Format,
 }
@@ -95,7 +112,9 @@ impl Running {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        self.pipe.close();
+        if !self.shared {
+            self.pipe.close();
+        }
     }
 }
 
@@ -117,7 +136,22 @@ enum Way {
 impl Render {
     /// Open endpoint `id` and start playing (silence until written to).
     pub fn start(id: &str, fmt: Format, sizing: Sizing, log: impl FnMut(&str) + Send + 'static) -> Result<Render, String> {
-        start(Way::Render, id, fmt, sizing, Box::new(log)).map(Render)
+        start(Way::Render, id, fmt, sizing, None, Hooks::default(), Box::new(log)).map(Render)
+    }
+    /// Play from `pipe`, the caller's queue, which outlives this stream (so
+    /// a stream can be stopped while idle and started again on the same
+    /// queue), and report every take from it with `on_drain`: the sound
+    /// ring grants that much credit back. `pipe`'s frame must be `fmt`'s.
+    pub fn start_shared(
+        id: &str,
+        fmt: Format,
+        sizing: Sizing,
+        pipe: Pipe,
+        on_drain: OnDrain,
+        log: impl FnMut(&str) + Send + 'static,
+    ) -> Result<Render, String> {
+        let h = Hooks { shared: true, on_drain: Some(on_drain), on_data: None };
+        start(Way::Render, id, fmt, sizing, Some(pipe), h, Box::new(log)).map(Render)
     }
     pub fn writer(&self) -> PcmWriter {
         PcmWriter::new(self.0.pipe.clone())
@@ -130,7 +164,7 @@ impl Render {
     }
     /// False once the device went away.
     pub fn running(&self) -> bool {
-        !self.0.pipe.is_closed()
+        self.0.alive.load(Ordering::Acquire)
     }
 }
 
@@ -138,7 +172,21 @@ impl Capture {
     /// Open endpoint `id` and start recording. Call only while Linux
     /// records; drop it when Linux stops.
     pub fn start(id: &str, fmt: Format, sizing: Sizing, log: impl FnMut(&str) + Send + 'static) -> Result<Capture, String> {
-        start(Way::Capture, id, fmt, sizing, Box::new(log)).map(Capture)
+        start(Way::Capture, id, fmt, sizing, None, Hooks::default(), Box::new(log)).map(Capture)
+    }
+    /// Record and hand every packet to `on_data` on the device thread
+    /// rather than queueing it (the sound ring decides, by its credit, what
+    /// is sent and what is an overrun). [`Capture::reader`] then reads
+    /// nothing.
+    pub fn start_to(
+        id: &str,
+        fmt: Format,
+        sizing: Sizing,
+        on_data: OnData,
+        log: impl FnMut(&str) + Send + 'static,
+    ) -> Result<Capture, String> {
+        let h = Hooks { shared: false, on_drain: None, on_data: Some(on_data) };
+        start(Way::Capture, id, fmt, sizing, None, h, Box::new(log)).map(Capture)
     }
     pub fn reader(&self) -> PcmReader {
         PcmReader::new(self.0.pipe.clone())
@@ -150,7 +198,7 @@ impl Capture {
         self.0.pipe.stats()
     }
     pub fn running(&self) -> bool {
-        !self.0.pipe.is_closed()
+        self.0.alive.load(Ordering::Acquire)
     }
 }
 
@@ -168,19 +216,25 @@ impl Drop for Capture {
 
 type Log = Box<dyn FnMut(&str) + Send>;
 
-fn start(way: Way, id: &str, fmt: Format, sizing: Sizing, log: Log) -> Result<Running, String> {
+fn start(way: Way, id: &str, fmt: Format, sizing: Sizing, pipe: Option<Pipe>, hooks: Hooks, log: Log) -> Result<Running, String> {
     if fmt.channels == 0 || fmt.channels > 8 || !(8_000..=192_000).contains(&fmt.rate) {
         return Err(format!("unsupported format {fmt:?}"));
     }
-    let pipe = Pipe::new(fmt.frame_bytes(), fmt.frames_in(sizing.queue).max(1));
+    let pipe = pipe.unwrap_or_else(|| Pipe::new(fmt.frame_bytes(), fmt.frames_in(sizing.queue).max(1)));
+    if pipe.frame_bytes() != fmt.frame_bytes() {
+        return Err("the queue's frame is not the format's".into());
+    }
     let stop = Arc::new(AtomicBool::new(false));
+    let alive = Arc::new(AtomicBool::new(true));
+    let shared = hooks.shared;
     let (ready_tx, ready_rx) = mpsc::channel();
-    let (p2, s2, id2) = (pipe.clone(), stop.clone(), id.to_string());
+    let (p2, s2, a2, id2) = (pipe.clone(), stop.clone(), alive.clone(), id.to_string());
     let thread = std::thread::Builder::new()
         .name(if way == Way::Render { "wasapi-render" } else { "wasapi-capture" }.into())
         .spawn(move || {
             let mut log = log;
-            let r = device_thread(way, &id2, fmt, sizing, &p2, &s2, &ready_tx, &mut log);
+            let mut hooks = hooks;
+            let r = device_thread(way, &id2, fmt, sizing, &p2, &s2, &ready_tx, &mut hooks, &mut log);
             if let Err(e) = &r {
                 // Before readiness, the error goes back to `start`; after it,
                 // to the log.
@@ -188,10 +242,13 @@ fn start(way: Way, id: &str, fmt: Format, sizing: Sizing, log: Log) -> Result<Ru
                     log(&format!("wasapi: {e}"));
                 }
             }
-            p2.close();
+            a2.store(false, Ordering::Release);
+            if !hooks.shared {
+                p2.close();
+            }
         })
         .map_err(|e| format!("spawn: {e}"))?;
-    let mut running = Running { pipe, stop, thread: Some(thread), fmt };
+    let mut running = Running { pipe, stop, alive, shared, thread: Some(thread), fmt };
     match ready_rx.recv() {
         Ok(Ok(())) => Ok(running),
         Ok(Err(e)) => {
@@ -222,6 +279,7 @@ fn device_thread(
     pipe: &Pipe,
     stop: &AtomicBool,
     ready: &mpsc::Sender<Result<(), String>>,
+    hooks: &mut Hooks,
     log: &mut Log,
 ) -> Result<(), String> {
     let _com = Apartment::mta();
@@ -297,7 +355,12 @@ fn device_thread(
                 }
                 // SAFETY: GetBuffer gave n frames of our format at `data`.
                 let out = unsafe { std::slice::from_raw_parts_mut(data, n as usize * fb) };
-                pipe.pop_or_silence(out);
+                let took = pipe.pop_or_silence(out);
+                if took > 0
+                    && let Some(f) = hooks.on_drain.as_mut()
+                {
+                    f(took);
+                }
                 // SAFETY: releasing exactly what was got.
                 unsafe { (rc.v().release_buffer)(rc.as_raw(), n, 0) };
             }
@@ -341,12 +404,18 @@ fn device_thread(
                         return Err(gone("IAudioCaptureClient::GetBuffer", hr));
                     }
                     let bytes = frames as usize * fb;
-                    if fl & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
+                    let pcm: &[u8] = if fl & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data.is_null() {
                         silence.resize(bytes, 0);
-                        pipe.push(&silence);
+                        &silence
                     } else {
-                        // SAFETY: `frames` frames of our format at `data`.
-                        pipe.push(unsafe { std::slice::from_raw_parts(data, bytes) });
+                        // SAFETY: `frames` frames of our format at `data`, until released.
+                        unsafe { std::slice::from_raw_parts(data, bytes) }
+                    };
+                    match hooks.on_data.as_mut() {
+                        Some(f) => f(pcm),
+                        None => {
+                            pipe.push(pcm);
+                        }
                     }
                     // SAFETY: releasing exactly what was got.
                     unsafe { (cc.v().release_buffer)(cc.as_raw(), frames) };
