@@ -146,6 +146,51 @@ pub fn utis() -> Vec<&'static str> {
 /// The URL schemes whose handlers are offered.
 pub const SCHEMES: &[&str] = &["http", "https", "mailto"];
 
+/// The microphone permission, as AVFoundation reports it
+/// (`AVAuthorizationStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicAuth {
+    /// Never asked: asking shows the dialog.
+    Undetermined,
+    /// Refused by the user, or restricted by policy: the input stays silent.
+    Denied,
+    Granted,
+}
+
+impl MicAuth {
+    /// From `AVAuthorizationStatus`: 0 not determined, 1 restricted,
+    /// 2 denied, 3 authorized. Anything else is taken as a refusal.
+    pub fn from_status(s: isize) -> MicAuth {
+        match s {
+            0 => MicAuth::Undetermined,
+            3 => MicAuth::Granted,
+            _ => MicAuth::Denied,
+        }
+    }
+}
+
+/// What an output's queue worker is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutCtl {
+    Start,
+    Pause,
+}
+
+/// An output's next queue command, if any: start once `prebuffer` bytes are
+/// queued, pause once it has had nothing to play for `idle_pause`. The
+/// command itself runs on the output's own worker, never on the ring's
+/// thread or under the state lock: CoreAudio can hold an AudioQueue start
+/// for as long as a TCC dialog is up.
+pub fn output_control(running: bool, queued: usize, prebuffer: usize, idle_for: std::time::Duration, idle_pause: std::time::Duration) -> Option<OutCtl> {
+    if !running && queued >= prebuffer {
+        Some(OutCtl::Start)
+    } else if running && queued == 0 && idle_for > idle_pause {
+        Some(OutCtl::Pause)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +295,23 @@ mod tests {
             assert!(wc_hostint::wire::token_ok(&h.offer.token));
             assert!(!h.offer.token.contains("apple"));
         }
+    }
+
+    #[test]
+    fn the_microphone_status_and_the_output_commands() {
+        use std::time::Duration;
+        assert_eq!(MicAuth::from_status(0), MicAuth::Undetermined);
+        assert_eq!(MicAuth::from_status(1), MicAuth::Denied);
+        assert_eq!(MicAuth::from_status(2), MicAuth::Denied);
+        assert_eq!(MicAuth::from_status(3), MicAuth::Granted);
+        assert_eq!(MicAuth::from_status(7), MicAuth::Denied);
+        let (s, idle) = (Duration::from_millis(10), Duration::from_secs(3));
+        assert_eq!(output_control(false, 100, 200, s, idle), None, "prebuffering");
+        assert_eq!(output_control(false, 200, 200, s, idle), Some(OutCtl::Start));
+        assert_eq!(output_control(true, 500, 200, s, idle), None, "playing");
+        assert_eq!(output_control(true, 0, 200, s, idle), None, "a short gap is not idle");
+        assert_eq!(output_control(true, 0, 200, Duration::from_secs(4), idle), Some(OutCtl::Pause));
+        assert_eq!(output_control(true, 1, 200, Duration::from_secs(4), idle), None, "still draining");
     }
 
     #[test]

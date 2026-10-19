@@ -38,6 +38,14 @@ windows-sys = { workspace = true, features = [
   "Win32_System_Registry",
 ] }
 
+# §106, macOS: the microphone permission is asked through AVFoundation
+# (`mac::mic`), never by opening an AudioQueue: a pending TCC dialog for an
+# input queue holds every AudioQueue start in the process. The objc2 family
+# the compositor already uses for AppKit.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+
 [[bin]]
 name = "wc-hostint-probe"
 path = "src/bin/wc-hostint-probe.rs"

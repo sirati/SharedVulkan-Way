@@ -24,6 +24,8 @@ pub mod cf;
 #[cfg(target_os = "macos")]
 pub mod handlers;
 #[cfg(target_os = "macos")]
+pub mod mic;
+#[cfg(target_os = "macos")]
 pub mod open;
 
 /// Whether this process may open a microphone: only the main process,
