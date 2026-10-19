@@ -16,7 +16,7 @@
 //! `wc-launch --session SECTION` runs a face without a bundle, for the
 //! harnesses.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -101,6 +101,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
             }
         }
         return if ok && !sections.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+    if args.iter().any(|a| a == "--keeper") {
+        return run_keeper();
     }
     if args.iter().any(|a| a == "--main") {
         return run_main(cfg);
@@ -202,6 +205,145 @@ fn pin_in_dock(bundle: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// -------------------------------------------------------------- keeper ---
+
+/// The pipe to the keeper, shared by the region hook and the GPU server's
+/// registration.
+type KeeperPipe = Arc<Mutex<(std::process::ChildStdin, std::io::BufReader<std::process::ChildStdout>)>>;
+
+unsafe extern "C" {
+    fn shm_open(name: *const std::ffi::c_char, oflag: i32, ...) -> i32;
+    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+    fn close(fd: i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
+}
+
+/// §103.15: start the keeper and make it the holder of every guest-RAM
+/// window this process makes from now on. Without one the session is
+/// refused: the host would write into pages this process's death frees.
+fn start_keeper(log: &Log) -> Result<KeeperPipe, String> {
+    let mut c = Command::new(installed_exe());
+    c.arg("--keeper").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    // Not in this process's group: a signal for the main process's group
+    // must not take the keeper with it.
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    let mut child = c.spawn().map_err(|e| format!("could not start the keeper: {e}"))?;
+    let (Some(i), Some(o)) = (child.stdin.take(), child.stdout.take()) else {
+        return Err("the keeper has no pipes".into());
+    };
+    log.say(&format!("keeper {} holds this session's windows until the host releases them", child.id()));
+    // Never waited for: it outlives this process by design.
+    std::mem::forget(child);
+    let pipe: KeeperPipe = Arc::new(Mutex::new((i, std::io::BufReader::new(o))));
+    let p2 = Arc::clone(&pipe);
+    let installed = wc_handle::arena::set_region_keeper(Box::new(move |name: &str, len: usize| {
+        let mut g = p2.lock().unwrap_or_else(|e| e.into_inner());
+        writeln!(g.0, "hold {name} {len}")?;
+        g.0.flush()?;
+        let mut line = String::new();
+        g.1.read_line(&mut line)?;
+        if line.trim() == format!("held {name}") {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!("the keeper said {:?}", line.trim())))
+        }
+    }));
+    if !installed {
+        return Err("a region keeper was already installed".into());
+    }
+    Ok(pipe)
+}
+
+/// `wc-launch --keeper` (§103.15): map and wire every window the main
+/// process names on stdin, and keep them until the host's session service
+/// writes the release word in the ring window's boot page, which it does once
+/// the session's proxy and GPU units have ended. Stdin's end is the main
+/// process's end, however it came. Then the session's GPU servers go, and
+/// with this process the last hold on the pages.
+fn run_keeper() -> ExitCode {
+    let log = Log::open(&log_dir().join("keeper.log"));
+    // SAFETY: SIG_IGN for SIGHUP (1) and SIGTERM (15): a `pkill` aimed at the
+    // session must not free memory the host may still write.
+    unsafe {
+        signal(1, 1);
+        signal(15, 1);
+    }
+    let mut held: Vec<(usize, usize)> = Vec::new();
+    let mut gpus: Vec<i32> = Vec::new();
+    let mut out = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        let w: Vec<&str> = line.split_whitespace().collect();
+        match w.as_slice() {
+            ["hold", name, len] => {
+                let reply = match (std::ffi::CString::new(*name), len.parse::<usize>()) {
+                    (Ok(c), Ok(len)) => {
+                        // SAFETY: a NUL-terminated name; O_RDWR (2) of an
+                        // object the main process created a moment ago.
+                        let fd = unsafe { shm_open(c.as_ptr(), 2) };
+                        // PROT_READ|PROT_WRITE, MAP_SHARED.
+                        let p = if fd >= 0 { unsafe { mmap(std::ptr::null_mut(), len, 3, 1, fd, 0) } } else { usize::MAX as *mut _ };
+                        if fd >= 0 {
+                            // SAFETY: our descriptor; the mapping keeps the object.
+                            unsafe { close(fd) };
+                        }
+                        // SAFETY: a live mapping of `len` bytes.
+                        if p as usize != usize::MAX && unsafe { mlock(p, len) } == 0 {
+                            held.push((p as usize, len));
+                            format!("held {name}")
+                        } else {
+                            format!("err {name}: {}", std::io::Error::last_os_error())
+                        }
+                    }
+                    _ => format!("err {line}"),
+                };
+                if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
+                    break;
+                }
+            }
+            ["gpu", pid] => {
+                if let Ok(p) = pid.parse() {
+                    gpus.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mb = held.iter().map(|h| h.1).sum::<usize>() >> 20;
+    log.say(&format!("the main process is gone; holding {} window(s), {mb} MiB, until the host releases them", held.len()));
+    // The ring window's first page is the boot page.
+    let boot = held.iter().map(|h| h.0 as *const u8).find(|p| {
+        // SAFETY: a held mapping of at least one page.
+        wc_handle::macboot::is_boot_page(unsafe { std::slice::from_raw_parts(*p, wc_handle::arena::REGION_PAGE) })
+    });
+    let limit = Duration::from_secs(600);
+    let t0 = Instant::now();
+    let released = loop {
+        // SAFETY: the boot page, held.
+        if boot.is_some_and(|p| unsafe { wc_handle::macboot::load_released(p) }) {
+            break true;
+        }
+        if t0.elapsed() > limit {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for pid in gpus {
+        // SAFETY: SIGKILL (9) to a GPU server this session started.
+        unsafe { kill(pid, 9) };
+    }
+    log.say(&if released {
+        format!("released by the host after {:?}; freeing", t0.elapsed())
+    } else if boot.is_none() {
+        format!("no boot page among the windows; freeing after {limit:?}")
+    } else {
+        format!("NO RELEASE from the host in {limit:?}; freeing anyway")
+    });
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------------- session ---
 
 struct Session {
@@ -226,6 +368,13 @@ fn run_main(cfg: Config) -> ExitCode {
     let id = plan::run_id(&cfg.session, std::process::id());
     let log = Log::open(&log_dir().join("main.log"));
     log.say(&format!("main process: session {id}"));
+    let keeper = match start_keeper(&log) {
+        Ok(k) => k,
+        Err(e) => {
+            log.say(&format!("NO KEEPER, NO SESSION: {e}"));
+            return ExitCode::from(1);
+        }
+    };
     let tmp = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
     let rt = tmp.join(format!("wc-{id}"));
     let _ = std::fs::create_dir_all(&rt);
@@ -313,6 +462,11 @@ fn run_main(cfg: Config) -> ExitCode {
     // harness's ssh. Its cold page carries the session's label; the host's
     // session service serves it once the boot record says so.
     let gpu = start_gpu_server(&cfg, &id, &log);
+    if let Some(g) = &gpu {
+        // The keeper ends it, once the host has stopped serving it.
+        let mut k = keeper.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(k.0, "gpu {}", g.id()).and_then(|()| k.0.flush());
+    }
     wc_compositor::set_boot_session(&id, cfg.outbound, gpu.is_some());
     match &standin {
         Some(file) => {
@@ -338,10 +492,8 @@ fn run_main(cfg: Config) -> ExitCode {
             Err(e) => log.say(&format!("down: {e}")),
         }
     }
-    if let Some(mut g) = gpu {
-        let _ = g.kill();
-        let _ = g.wait();
-    }
+    // The GPU server is the keeper's to end (above), after the host's release.
+    drop(gpu);
     let _ = std::fs::remove_dir_all(&rt);
     code
 }

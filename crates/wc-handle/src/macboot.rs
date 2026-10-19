@@ -12,7 +12,12 @@
 //!   1024  WCMBOOT1 ...                        this record, written by the guest
 //!   1152  state                               written by the host, last
 //!   1160  host message (512 bytes)            written by the host, first
+//!   1728  released                            written by the host, at the end
 //! ```
+//!
+//! The page outlives the boot: the ring window is one page longer than the
+//! control region, which starts at its second page, so the release word is
+//! still there when the session ends.
 //!
 //! The host's session service (`wc-arena-host mac-sessiond`) sweeps guest RAM
 //! for stamps with page index 0 and this magic, locates the two windows,
@@ -39,6 +44,30 @@ pub const OFF_STATE: usize = OFF + 128;
 pub const OFF_MESSAGE: usize = OFF + 136;
 /// Bytes of host message.
 pub const MESSAGE_MAX: usize = 512;
+/// Offset of the host's release word (§103.15): written once the session's
+/// proxy and GPU server on the host have ended, so nothing of the host will
+/// touch the session's windows again. The guest's keeper frees them then.
+pub const OFF_RELEASED: usize = OFF + 704;
+/// The release word's value.
+pub const RELEASED: u64 = 0x5245_4C45_4153_4544;
+
+/// The release word, as the keeper reads it (acquire).
+///
+/// # Safety
+/// `page0` must point at the mapped boot page, 8-aligned at [`OFF_RELEASED`].
+pub unsafe fn load_released(page0: *const u8) -> bool {
+    // SAFETY: the caller's contract.
+    let w = unsafe { &*(page0.add(OFF_RELEASED) as *const std::sync::atomic::AtomicU64) };
+    w.load(std::sync::atomic::Ordering::Acquire) == RELEASED
+}
+
+/// Whether a page is a boot page: the stamp's magic and index 0, and a record.
+pub fn is_boot_page(page: &[u8]) -> bool {
+    page.len() >= OFF_RELEASED + 8
+        && page[..8] == crate::arena::STAMP_MAGIC
+        && page[crate::arena::STAMP_OFF_PAGE_INDEX..crate::arena::STAMP_OFF_PAGE_INDEX + 4] == [0; 4]
+        && page[OFF..OFF + 8] == MAGIC
+}
 
 /// The host's answer, in the state word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +139,7 @@ impl Record {
     /// Write the record into page 0 (`page` is the whole page) and clear the
     /// host's fields.
     pub fn write(&self, page: &mut [u8]) {
-        let r = &mut page[OFF..OFF_MESSAGE + MESSAGE_MAX];
+        let r = &mut page[OFF..OFF_RELEASED + 8];
         r.fill(0);
         r[0..8].copy_from_slice(&MAGIC);
         r[8..12].copy_from_slice(&VERSION.to_le_bytes());

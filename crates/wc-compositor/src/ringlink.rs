@@ -552,8 +552,12 @@ impl PendingRings {
     pub fn alloc() -> Result<PendingRings, String> {
         let bell = GUEST_RAM_BELL.lock().unwrap_or_else(|e| e.into_inner()).take();
         let geometry = Geometry::for_wayland();
+        // §103.15: one page more than the control region. Page 0 is the boot
+        // page (the boot record, the host's answer and its release word) for
+        // the whole session; the control region starts at page 1.
         let (window, run, pages) =
-            wc_handle::arena::stamped_guest_ram_window(geometry.control_size).map_err(|e| e.to_string())?;
+            wc_handle::arena::stamped_guest_ram_window(geometry.control_size + wc_handle::arena::REGION_PAGE as u64)
+                .map_err(|e| e.to_string())?;
         println!(
             "wc-compositor: wayland rings in guest RAM: run 0x{run:016x}, {pages} rings pages, {} bytes, pinning={}",
             window.len, window.pinning
@@ -635,7 +639,10 @@ impl PendingRings {
         // SAFETY: the window is leaked below, so the region outlives every
         // user of it; its length is at least the geometry's control size.
         let region = Arc::new(unsafe {
-            sv_transport::region::SharedRegion::from_raw(self.window.base(), self.geometry.control_size as usize)
+            sv_transport::region::SharedRegion::from_raw(
+                self.window.base().add(wc_handle::arena::REGION_PAGE),
+                self.geometry.control_size as usize,
+            )
         });
         std::mem::forget(self.window);
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);

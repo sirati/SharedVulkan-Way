@@ -297,8 +297,14 @@ pub fn attach_plan(plan: &Path, wait: std::time::Duration) -> io::Result<Arc<Con
     // The stitched mapping lives as long as the process: the rings are the
     // session's, and every client thread holds the control region.
     std::mem::forget(region);
-    // SAFETY: a live mapping of `len` bytes, never unmapped (above).
-    let shared = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base, len) });
+    // §103.15: page 0 is the boot page; the control region starts at page 1.
+    let page = wc_handle::arena::REGION_PAGE;
+    if len <= page {
+        return Err(io::Error::other(format!("{}: a ring window of {len} bytes has no control region", plan.display())));
+    }
+    // SAFETY: a live mapping of `len` bytes, never unmapped (above); the
+    // control region is its tail past the boot page.
+    let shared = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base.add(page), len - page) });
     let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
     let t0 = std::time::Instant::now();
     loop {

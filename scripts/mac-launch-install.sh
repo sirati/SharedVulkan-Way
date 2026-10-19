@@ -51,6 +51,12 @@ exec     = $(command -v kgx)
 titlebar = mac-tabs
 desktop  = org.gnome.Console
 gpu      = off
+# GTK's own software renderer, which reports the damage it drew (its GL
+# renderer through EGL on wl_shm damages the whole window every frame,
+# §103.15), and never the RTX 5090.
+env      = GSK_RENDERER=cairo
+env      = __EGL_VENDOR_LIBRARY_FILENAMES=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
+env      = CUDA_VISIBLE_DEVICES=
 
 [firefox]
 exec     = $(readlink -f "$(command -v firefox)")
@@ -72,6 +78,12 @@ exec     = $(command -v gnome-text-editor)
 titlebar = mac-tabs
 desktop  = org.gnome.TextEditor
 gpu      = off
+# GTK's own software renderer, which reports the damage it drew (its GL
+# renderer through EGL on wl_shm damages the whole window every frame,
+# §103.15), and never the RTX 5090.
+env      = GSK_RENDERER=cairo
+env      = __EGL_VENDOR_LIBRARY_FILENAMES=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
+env      = CUDA_VISIBLE_DEVICES=
 EOF
 # The settings wc-session runs with, for the session service and every verb
 # it runs (it used to be the forced command's `env`).
