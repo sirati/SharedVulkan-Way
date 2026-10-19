@@ -780,10 +780,16 @@ mod win {
         // the host's no-op) on one connection, and their distribution.
         let n: usize = std::env::var("WC_PING_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
         let verb = std::env::var("WC_PING_VERB").unwrap_or_else(|_| "rtt".into());
+        // A gap between requests, so each finds the host parked on its lane and
+        // crosses by doorbell, as a click's single request does.
+        let gap = Duration::from_millis(std::env::var("WC_PING_GAP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         let mut c = CtlClient::connect(p)?;
         let mut us: Vec<f64> = Vec::with_capacity(n);
         let mut said = String::new();
         for _ in 0..n {
+            if !gap.is_zero() {
+                std::thread::sleep(gap);
+            }
             let t1 = Instant::now();
             said = c.request(&format!("raw {verb}"))?;
             us.push(t1.elapsed().as_secs_f64() * 1e6);
@@ -793,7 +799,7 @@ mod win {
         let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f).round() as usize];
         let mean = us.iter().sum::<f64>() / us.len() as f64;
         log.say(&format!(
-            "PING {verb:?} x{n} on the control ring: mean {mean:.1} us, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1} us ({} ms in all){}",
+            "PING {verb:?} x{n} (gap {gap:?}) on the control ring: mean {mean:.1} us, p50 {:.1}, p90 {:.1}, p99 {:.1}, max {:.1} us ({} ms in all){}",
             q(0.5),
             q(0.9),
             q(0.99),

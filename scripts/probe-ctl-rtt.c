@@ -19,6 +19,7 @@ static int cmp(const void *a, const void *b) {
   double x = *(const double *)a, y = *(const double *)b;
   return x < y ? -1 : x > y;
 }
+static long gap_ms(void) { const char *g = getenv("GAP_MS"); return g ? atol(g) : 0; }
 int main(int argc, char **argv) {
   if (argc < 3) { fprintf(stderr, "usage: %s SOCKET N [WORDS]\n", argv[0]); return 2; }
   int n = atoi(argv[2]);
@@ -31,7 +32,9 @@ int main(int argc, char **argv) {
   int rl = snprintf(req, sizeof req, "raw %s\n", words);
   double *us = malloc(sizeof(double) * n);
   static char buf[1 << 20];
+  long gap = gap_ms();
   for (int i = 0; i < n; i++) {
+    if (gap) usleep(gap * 1000);
     double t0 = now_us();
     if (write(fd, req, rl) != rl) { perror("write"); return 1; }
     size_t have = 0;
