@@ -126,6 +126,10 @@ HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
 # (with the fd store they are meant to), and a session that trusted a stale
 # file had no GPU doorbell and sent its Wayland connections over ssh (§99.8).
 hub_up() {
+  # A harness that runs its own hub, outside systemd (scripts/wc-no-ssh.sh).
+  if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
+    [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
+  fi
   local sd="env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user"
   $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
@@ -892,6 +896,14 @@ up)
       ROFF=$(od -A n -t u8 -j 64 -N 8 "$ARENA" | tr -d ' ')
       echo "rings" >"$D/transport"
       echo "transport rings: $RLEN bytes at $ROFF, doorbell $(wcbell_use)"
+    elif [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && [ "${RLEN:-0}" != 0 ]; then
+      # §105: started by the session service, so there is no ssh tunnel to
+      # fall back to. Rings with no doorbell are polled, said loudly; rings
+      # that do not exist fail the session, closed.
+      echo "rings-poll" >"$D/transport"
+      echo "transport rings, NO DOORBELL ($WHY): polled every millisecond"
+    elif [ "${WC_LAUNCH_SERVICE:-}" = 1 ]; then
+      die "no Wayland rings in $ARENA ($WHY) and no ssh to fall back to: refusing the session (§105)"
     else
       echo "ssh: $WHY" >"$D/transport"
       echo "transport SSH FALLBACK: $WHY"
@@ -1039,13 +1051,22 @@ proxy)
   # its journal is a record. It needs this user's manager to outlive logins
   # (`loginctl enable-linger`), and says so if it does not.
   if [ -f "$D/arena.run" ]; then
-    [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    # §105: started by the session service (WC_LAUNCH_SERVICE=1), the
+    # session has no ssh tunnel and so no upstream socket: every connection,
+    # both feeds, the control and the sound are ring slots.
+    SERVICE=0
+    [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && SERVICE=1
+    [ $SERVICE = 1 ] || [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
+    [ $SERVICE = 1 ] && audio_up "$D" "$ID"
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
     RUN=$(cat "$D/arena.run")
     {
       echo '#!/usr/bin/env bash'
       echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
+      # §105: this host's settings, for the wc-session the control ring runs
+      # (as §103.14 does): the unit does not inherit this process's environment.
+      [ $SERVICE = 1 ] && env | grep '^WC_LAUNCH_' | grep -v '^WC_LAUNCH_SERVICE=' | while IFS= read -r kv; do printf 'export %q\n' "$kv"; done
       # §88. A `WC_FRAME_TRACE=` line in gpu.env traces the proxy as well:
       # the frame timeline has a proxy half, and gpu.env is where a measured
       # run already says what the session's frame should record.
@@ -1060,10 +1081,20 @@ proxy)
       # tunnel's socket stays the upstream either way: the icon and clipboard
       # feeds use it, and so does a connection that cannot have a ring.
       RINGARGS=""
+      UPARGS=$(printf -- '--upstream %q' "$D/up.sock")
       [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
         && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
-        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
+      if [ $SERVICE = 1 ]; then
+        UPARGS=""
+        BELLUSE=poll
+        [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
+        RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
+        if [ "$(cut -d: -f1 "$D/audio.state" 2>/dev/null | cut -d' ' -f1)" = pulse ]; then
+          RINGARGS="$RINGARGS $(printf -- '--audio-socket %q' "$D/audio.sock")"
+        fi
+      fi
+      printf 'exec %q %s --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$UPARGS" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
@@ -1077,11 +1108,18 @@ proxy)
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
-    audio_up "$D" "$ID"
-    echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem)"
+    [ $SERVICE = 1 ] || audio_up "$D" "$ID"
+    echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
     # §89: what the proxy made of the rings, in its own words. It attaches
     # them after it binds its socket, so the line is waited for briefly.
-    if [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
+    if [ $SERVICE = 1 ]; then
+      T=""
+      for _ in $(seq 1 40); do
+        T=$(grep -m1 -oE 'wayland rings: .*' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break
+        sleep 0.05
+      done
+      echo "transport ${T:-the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
+    elif [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
       T=""
       for _ in $(seq 1 40); do
         T=$(grep -m1 -oE '(wayland rings: .*|SSH FALLBACK: .*)' "$D/proxy.log" 2>/dev/null) && [ -n "$T" ] && break

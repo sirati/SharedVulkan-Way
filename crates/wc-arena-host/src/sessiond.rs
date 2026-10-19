@@ -128,7 +128,7 @@ fn answer(file: &std::fs::File, f: &Found, state: macboot::State, msg: &str) -> 
 /// `SSH_ORIGINAL_COMMAND`, as the forced-command key sent them, so they meet
 /// the validation `wc-session` gives a guest's request (§94): some of them
 /// came out of guest RAM.
-fn verb(session: &PathBuf, words: &[&str]) -> Result<String, String> {
+pub(crate) fn verb(session: &std::path::Path, words: &[&str]) -> Result<String, String> {
     let out = Command::new("bash")
         .arg(session)
         .env("SSH_ORIGINAL_COMMAND", words.join(" "))
@@ -144,7 +144,7 @@ fn verb(session: &PathBuf, words: &[&str]) -> Result<String, String> {
     }
 }
 
-fn unit_active(id: &str) -> bool {
+pub(crate) fn unit_active(id: &str) -> bool {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", &format!("wc-launch-{id}")])
         .status()
@@ -169,7 +169,7 @@ fn running_sessions() -> Vec<String> {
 
 /// The hello reader: a thread on the doorbell hub, reconnecting, which sends
 /// one message per hello byte.
-fn spawn_bell(spec: String, tx: mpsc::Sender<()>) {
+pub(crate) fn spawn_bell(spec: String, tx: mpsc::Sender<()>) {
     std::thread::Builder::new()
         .name("bell".into())
         .spawn(move || {
@@ -179,6 +179,12 @@ fn spawn_bell(spec: String, tx: mpsc::Sender<()>) {
                     Ok(mut s) => {
                         say(&format!("listening for hellos on {spec}"));
                         said = false;
+                        // §105: a virtio-serial port drops what arrives while
+                        // nobody holds it, so a hello rung while this was not
+                        // connected is gone. Every (re)connect is a reason to look.
+                        if tx.send(()).is_err() {
+                            return;
+                        }
                         let mut buf = [0u8; 256];
                         loop {
                             match s.read(&mut buf) {

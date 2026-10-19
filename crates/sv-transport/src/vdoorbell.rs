@@ -203,7 +203,11 @@ pub fn serve_port<R: Read, T: BellTarget + ?Sized>(
         // Several bytes may arrive in one read when the peer rang more than one
         // lane before this thread was scheduled. Each is independent.
         for &token in &buf[..n] {
-            target.ring_token(token, woken);
+            if token == crate::park::RESCAN_TOKEN {
+                target.reopened();
+            } else {
+                target.ring_token(token, woken);
+            }
         }
     }
 }
@@ -221,6 +225,14 @@ pub trait BellTarget: Send + Sync {
     /// Ring the lane `token` names, counting each delivery in `woken` before
     /// making it. Returns whether anything was rung.
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool;
+
+    /// The port was (re)opened (waycompose-design.md §105). A virtio-serial
+    /// port drops what arrives while nobody on that side holds it open, and a
+    /// hub or QEMU socket that was down took what was sent meanwhile with it,
+    /// so a wake may have been lost. Wake every waiter, so each looks at its
+    /// ring again instead of trusting that it got every byte. The default
+    /// does nothing, for a target whose every wait has a short slice anyway.
+    fn reopened(&self) {}
 }
 
 impl BellTarget for Control {
@@ -261,6 +273,19 @@ impl BellTarget for Control {
             woken.fetch_add(1, Ordering::Relaxed);
             bell.ring_local();
             true
+        }
+    }
+
+    fn reopened(&self) {
+        // Both lanes of every slot: a spurious wake costs a look at an empty
+        // ring, a missing one costs a slice.
+        for slot in 0..self.layout().geometry.ring_slot_count {
+            let Ok(ctrl) = RingCtrl::open(self, slot) else { continue };
+            for lane in [crate::ring::Lane::Command, crate::ring::Lane::Reply] {
+                if let Ok(bell) = ctrl.bell(lane) {
+                    bell.ring_local();
+                }
+            }
         }
     }
 }
@@ -315,6 +340,16 @@ impl BellTarget for ControlSet {
             any |= c.ring_token(token, woken);
         }
         any
+    }
+
+    fn reopened(&self) {
+        let live: Vec<Arc<Control>> = match self.members.lock() {
+            Ok(m) => m.iter().filter_map(std::sync::Weak::upgrade).collect(),
+            Err(_) => return,
+        };
+        for c in &live {
+            c.reopened();
+        }
     }
 }
 
@@ -514,6 +549,10 @@ pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
                     continue;
                 };
                 writer.set(Some(w));
+                // §105: what was rung while this was not connected is lost.
+                if reconnects > 0 {
+                    target.reopened();
+                }
                 let end = serve_port(reader, &*target, &stop, &woken);
                 writer.set(None);
                 if end == ServeEnd::Stopped {
@@ -886,18 +925,21 @@ mod tests {
     #[test]
     fn a_client_reconnects_to_a_restarted_hub() {
         use std::os::unix::net::UnixListener;
-        struct Count(AtomicU64);
+        struct Count(AtomicU64, AtomicU64);
         impl BellTarget for Count {
             fn ring_token(&self, _t: u8, _w: &AtomicU64) -> bool {
                 self.0.fetch_add(1, Ordering::Relaxed);
                 true
+            }
+            fn reopened(&self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
             }
         }
         let dir = std::env::temp_dir().join(format!("sv-reconnect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hub.sock");
-        let target = Arc::new(Count(AtomicU64::new(0)));
+        let target = Arc::new(Count(AtomicU64::new(0), AtomicU64::new(0)));
         let l1 = UnixListener::bind(&path).unwrap();
         let (_doorman, first, wake) = connect_host_reconnecting(path.to_str().unwrap(), Arc::clone(&target)).unwrap();
         assert!(first);
@@ -927,6 +969,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(target.0.load(Ordering::Relaxed) > 0, "the new hub's byte rang nothing");
+        // §105: and the reconnect itself told the target to look again,
+        // because whatever was rung in the gap is gone.
+        assert!(target.1.load(Ordering::Relaxed) >= 1, "a reconnect did not reopen the target");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1316,5 +1361,60 @@ mod tests {
 
         assert_eq!(wake.stats(), (0, 0), "a byte was sent for a lane nobody was waiting on");
         drop(guest_end);
+    }
+}
+
+#[cfg(test)]
+mod rescan_tests {
+    use super::*;
+    use crate::control::{Control, Geometry, ProtocolIds};
+    use crate::region::SharedRegion;
+    use crate::wlbytes::{ByteChannel, Endpoint};
+    use std::time::{Duration, Instant};
+
+    /// §105: `reopened` wakes a reader parked on its lane with nothing
+    /// written, so a wake lost while the port was closed costs a look, not
+    /// the waiter's whole slice.
+    #[test]
+    fn reopened_wakes_every_parked_lane() {
+        let g = Geometry::small();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let control = Arc::new(Control::create(region, g, ProtocolIds::new(7, 1), 1).unwrap());
+        let host = ByteChannel::claim(&control, 7).unwrap();
+        let guest = ByteChannel::open(&control, host.slot(), Endpoint::Peer).unwrap();
+        let t = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let _ = guest.wait_readable(Duration::from_secs(20));
+            t0.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !t.is_finished() && Instant::now() < deadline {
+            control.reopened();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let took = t.join().unwrap();
+        assert!(took < Duration::from_secs(10), "the parked reader slept {took:?}: reopened() woke nothing");
+    }
+
+    /// §105: the hub's rescan byte is not a lane; the doorman turns it into
+    /// `reopened`, and rings the lane bytes around it as before.
+    #[test]
+    fn a_rescan_byte_reopens_and_lane_bytes_still_ring() {
+        struct T(AtomicU64, AtomicU64);
+        impl BellTarget for T {
+            fn ring_token(&self, _t: u8, _w: &AtomicU64) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            fn reopened(&self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let t = T(AtomicU64::new(0), AtomicU64::new(0));
+        let bytes: &[u8] = &[5, crate::park::RESCAN_TOKEN, 9];
+        let end = serve_port(bytes, &t, &AtomicBool::new(false), &AtomicU64::new(0));
+        assert_eq!(end, ServeEnd::Closed);
+        assert_eq!((t.0.load(Ordering::Relaxed), t.1.load(Ordering::Relaxed)), (2, 1));
     }
 }

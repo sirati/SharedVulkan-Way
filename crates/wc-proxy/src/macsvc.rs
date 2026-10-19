@@ -134,28 +134,76 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
             std::thread::sleep(Duration::from_millis(50));
             std::process::exit(0);
         }
-        let reply = if !words_ok(&line) {
-            "err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string()
+        let (raw, line) = match line.strip_prefix("raw ") {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, line),
+        };
+        let (reply, body): (String, Vec<u8>) = if !words_ok(&line) {
+            ("err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string(), Vec::new())
         } else {
-            // The verb and this session's id, then the guest's words: the
-            // guest cannot name another session.
-            let mut w = line.split_whitespace();
-            let verb = w.next().unwrap_or("");
-            let rest: Vec<&str> = w.collect();
-            let cmd = std::iter::once(verb).chain(std::iter::once(id.as_str())).chain(rest).collect::<Vec<_>>().join(" ");
+            let cmd = command_words(&line, &id);
             let t0 = Instant::now();
             match std::process::Command::new("bash").arg(&session).env("SSH_ORIGINAL_COMMAND", &cmd).output() {
-                Ok(o) if o.status.success() => {
-                    format!("ok {} ({} ms)", String::from_utf8_lossy(&o.stdout).trim().replace('\n', "; "), t0.elapsed().as_millis())
-                }
-                Ok(o) => format!("err {}", String::from_utf8_lossy(&o.stderr).trim().replace('\n', "; ")),
-                Err(e) => format!("err {e}"),
+                // §105: `raw` asks for the verb's standard output exactly, as
+                // the jump list's `app` and `frequent` print several lines.
+                Ok(o) if o.status.success() && raw => (format!("ok-raw {}", o.stdout.len()), o.stdout),
+                Ok(o) if o.status.success() => (
+                    format!("ok {} ({} ms)", String::from_utf8_lossy(&o.stdout).trim().replace('\n', "; "), t0.elapsed().as_millis()),
+                    Vec::new(),
+                ),
+                Ok(o) => (format!("err {}", String::from_utf8_lossy(&o.stderr).trim().replace('\n', "; ")), Vec::new()),
+                Err(e) => (format!("err {e}"), Vec::new()),
             }
         };
-        println!("[proxy] session control: {line:?} -> {reply}");
-        if !write_all(&mut lines.ch, format!("{reply}\n").as_bytes()) {
+        // A page's URL is the user's history: `open` is logged by its verb.
+        let shown = if line.starts_with("open ") { "open …".to_string() } else { line.clone() };
+        println!("[proxy] session control: {shown:?} -> {reply}");
+        let mut out = format!("{reply}\n").into_bytes();
+        out.extend_from_slice(&body);
+        if !write_all(&mut lines.ch, &out) {
             break;
         }
+    }
+}
+
+/// The verbs that name no session (§92's jump-list data, an icon): the
+/// guest's words go to `wc-session` as they are. Every other verb gets this
+/// session's id put after it, so the guest cannot name another session.
+const SESSIONLESS: &[&str] = &["app", "frequent", "icon", "ping"];
+
+/// The `SSH_ORIGINAL_COMMAND` a request becomes.
+pub fn command_words(line: &str, id: &str) -> String {
+    let mut w = line.split_whitespace();
+    let verb = w.next().unwrap_or("");
+    let rest: Vec<&str> = w.collect();
+    if SESSIONLESS.contains(&verb) {
+        std::iter::once(verb).chain(rest).collect::<Vec<_>>().join(" ")
+    } else {
+        std::iter::once(verb).chain(std::iter::once(id)).chain(rest).collect::<Vec<_>>().join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_gets_this_sessions_id_and_jump_list_verbs_do_not() {
+        assert_eq!(command_words("run firefox 96 30", "wcns-1"), "run wcns-1 firefox 96 30");
+        assert_eq!(command_words("gpu", "wcns-1"), "gpu wcns-1");
+        assert_eq!(command_words("app firefox light", "wcns-1"), "app firefox light");
+        assert_eq!(command_words("frequent firefox", "wcns-1"), "frequent firefox");
+        // A guest that puts another id first only adds a word after its own.
+        assert_eq!(command_words("down other-1", "wcns-1"), "down wcns-1 other-1");
+    }
+
+    #[test]
+    fn only_plain_words_are_requests() {
+        assert!(words_ok("run firefox 96 30"));
+        assert!(words_ok("open firefox aHR0cHM6Ly9leGFtcGxlLm9yZy8= 96 30"));
+        assert!(!words_ok("run firefox; rm -rf ~"));
+        assert!(!words_ok("run $(id)"));
+        assert!(!words_ok(""));
     }
 }
 

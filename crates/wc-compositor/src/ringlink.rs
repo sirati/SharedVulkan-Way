@@ -680,6 +680,12 @@ impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
         woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
+
+    // §105: wake the turn, which pumps every ring, and every service thread.
+    fn reopened(&self) {
+        self.waker.wake();
+        sv_transport::vdoorbell::BellTarget::reopened(&*self.control);
+    }
 }
 
 /// What a byte on the rings' port does in the compositor (§89): end the
@@ -692,6 +698,11 @@ impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
         woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.0.wake();
         true
+    }
+
+    // §105: the turn this starts pumps every ring.
+    fn reopened(&self) {
+        self.0.wake();
     }
 }
 
@@ -729,8 +740,8 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
 /// the proxy attaches to after it has checked the arena header's run id.
 pub fn over_ivshmem(
     id: u32,
-    port: sv_transport::vdoorbell::PortHandle,
-) -> Result<(RingLink, Box<dyn Read + Send>, u32), String> {
+    port: Option<sv_transport::vdoorbell::PortHandle>,
+) -> Result<(RingLink, Option<Box<dyn Read + Send>>, u32), String> {
     let (base, len) = wc_handle::arena::ivshmem_rings(id).map_err(|e| e.to_string())?;
     // SAFETY: `ivshmem_rings` returns the tail of the ivshmem view, which the
     // arena registry keeps mapped for the life of the process, `len` bytes
@@ -740,14 +751,24 @@ pub fn over_ivshmem(
     let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
     let control = Control::create(region, geometry, ids, 1).map_err(|e| e.to_string())?;
     control.stamp_epoch().map_err(|e| e.to_string())?;
-    let (reader, writer) = port.split().map_err(|e| e.to_string())?;
-    // The writer is what `Bell::ring` pokes when the proxy is parked on a lane
-    // this process writes. One per process, and this process has no other
-    // rings.
-    sv_transport::park::install_cross_wake(Some(
-        Arc::new(sv_transport::vdoorbell::PortWake::new(writer)) as Arc<dyn sv_transport::park::CrossWake>,
-    ));
-    Ok((RingLink::over(Arc::new(control)), reader, geometry.ring_slot_count))
+    let control = Arc::new(control);
+    // §105: the session's service threads (control, sound) use the same region.
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+    let reader = match port {
+        Some(port) => {
+            let (reader, writer) = port.split().map_err(|e| e.to_string())?;
+            // The writer is what `Bell::ring` pokes when the proxy is parked on a lane
+            // this process writes. One per process, and this process has no other
+            // rings.
+            sv_transport::park::install_cross_wake(Some(
+                Arc::new(sv_transport::vdoorbell::PortWake::new(writer)) as Arc<dyn sv_transport::park::CrossWake>,
+            ));
+            BELL_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some(reader)
+        }
+        None => None,
+    };
+    Ok((RingLink::over(control), reader, geometry.ring_slot_count))
 }
 
 /// Why `--wayland-cold` is Linux-only, in one place.

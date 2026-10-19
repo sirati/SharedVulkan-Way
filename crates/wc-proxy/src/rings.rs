@@ -105,6 +105,11 @@ impl BellTarget for BellHub {
         }
         true
     }
+
+    // §105: the port was reopened; every waiting pump looks at its ring again.
+    fn reopened(&self) {
+        self.poke_all();
+    }
 }
 
 /// The doorbell, held for the life of the proxy.
@@ -180,6 +185,11 @@ impl BellTarget for HubAndControl {
         let a = self.hub.ring_token(token, woken);
         let b = self.control.ring_token(token, woken);
         a || b
+    }
+
+    fn reopened(&self) {
+        self.hub.reopened();
+        self.control.reopened();
     }
 }
 

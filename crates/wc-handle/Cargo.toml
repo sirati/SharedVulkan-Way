@@ -60,3 +60,6 @@ sv-arena = { workspace = true }
 # Waycompose is an addition to shared_vulkan rather than a second system
 # beside it, so a growth request is a message on that channel.
 sv-transport = { workspace = true }
+# The boot record's authenticator (macboot.rs, waycompose-design.md §105):
+# HMAC-SHA-256 under the installation's key. Already in the lockfile.
+sha2 = "0.10"

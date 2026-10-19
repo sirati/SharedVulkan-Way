@@ -692,6 +692,29 @@ fn attach_ivshmem_view(
     })
 }
 
+/// §105: what the boot record says about arena `id`'s ivshmem region, as
+/// `(run id, region length, rings length)`.
+pub fn ivshmem_identity(id: u32) -> io::Result<(u64, u64, u64)> {
+    let state = ivshmem_slot().lock().map_err(|_| io::Error::other("ivshmem slot poisoned"))?;
+    let s = state.as_ref().filter(|s| s.arena == id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not an ivshmem region of this process"))
+    })?;
+    Ok((s.run_id, s.region_len, s.rings_len))
+}
+
+/// §105: the header page of arena `id`'s ivshmem region, where the boot
+/// record goes beside the header (`crate::macboot`, from byte 1024; the header
+/// itself is the first 80 bytes). Valid for the life of the process, as
+/// [`ivshmem_rings`]'s pointer is.
+pub fn ivshmem_header_page(id: u32) -> io::Result<*mut u8> {
+    if !is_ivshmem(id) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not an ivshmem region of this process")));
+    }
+    let guard = registry().read().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    let a = guard.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("arena {id} is not attached")))?;
+    Ok(a.view.ptr().cast_mut())
+}
+
 /// Whether arena `id` is this process's ivshmem region.
 pub fn is_ivshmem(id: u32) -> bool {
     ivshmem_slot().lock().ok().is_some_and(|s| s.as_ref().is_some_and(|s| s.arena == id))

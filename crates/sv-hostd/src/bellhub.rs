@@ -147,6 +147,16 @@ impl Hub {
     /// Run one upstream connection until it closes: a reader fanning out and a
     /// writer draining the up queue. Returns when the upstream is gone.
     pub fn serve_upstream(self: &Arc<Self>, up: UnixStream) -> std::io::Result<()> {
+        self.serve_upstream_fresh(up, true)
+    }
+
+    /// [`Self::serve_upstream`]; `fresh` is a connection QEMU has just
+    /// accepted, as opposed to one inherited from a previous hub that QEMU
+    /// never saw close. On a fresh one, bytes sent while there was none are
+    /// lost in both directions (a virtio-serial port drops what arrives while
+    /// nobody holds it), so the hub tells both sides to look at every ring
+    /// again (`park::RESCAN_TOKEN`, waycompose-design.md §105).
+    pub fn serve_upstream_fresh(self: &Arc<Self>, up: UnixStream, fresh: bool) -> std::io::Result<()> {
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(QUEUE);
         let mut w = up.try_clone()?;
         let writer = std::thread::Builder::new().name(format!("bell-{}-up", self.name)).spawn(move || {
@@ -158,6 +168,10 @@ impl Hub {
         })?;
         *self.up.lock().map_err(|_| std::io::Error::other("poisoned"))? = Some(tx);
         self.stats.upstream_connects.fetch_add(1, Ordering::Relaxed);
+        if fresh {
+            self.up(&[sv_transport::park::RESCAN_TOKEN]);
+            self.fan_out(&[sv_transport::park::RESCAN_TOKEN]);
+        }
         let mut r = up;
         let mut buf = [0u8; 256];
         loop {
@@ -236,6 +250,7 @@ pub fn run_kept(
             let mut next = inherited;
             let key = format!("{}-up", hub.name);
             loop {
+                let inherited = next.is_some();
                 let got = match next.take() {
                     Some(s) => {
                         eprintln!("bell-hub {}: kept {} open across the restart", hub.name, upstream.display());
@@ -256,7 +271,7 @@ pub fn run_kept(
                             upstream.display(),
                             hub.client_count()
                         );
-                        let _ = hub.serve_upstream(s);
+                        let _ = hub.serve_upstream_fresh(s, !inherited);
                         if keep {
                             let _ = crate::sdfd::remove(&key);
                         }
@@ -297,7 +312,20 @@ mod tests {
         d
     }
 
+    /// Bytes other than the hub's own `RESCAN_TOKEN`, which it sends on every
+    /// fresh upstream (§105) and which [`a_fresh_upstream_tells_both_sides_to_rescan`]
+    /// checks on its own.
     fn read_some(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
+        let mut v = read_raw(s, want + 1, within.min(Duration::from_millis(300)));
+        v.retain(|b| *b != sv_transport::park::RESCAN_TOKEN);
+        if v.len() >= want {
+            return v;
+        }
+        v.extend(read_raw(s, want - v.len(), within).into_iter().filter(|b| *b != sv_transport::park::RESCAN_TOKEN));
+        v
+    }
+
+    fn read_raw(s: &mut UnixStream, want: usize, within: Duration) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let t = Instant::now();
         let mut got = Vec::new();
@@ -380,6 +408,35 @@ mod tests {
         a.write_all(&[3]).unwrap();
         assert_eq!(read_some(&mut g2, 1, Duration::from_secs(5)), vec![3]);
         assert!(hub.stats.upstream_connects.load(Ordering::Relaxed) >= 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §105: a virtio-serial port drops what arrives while nobody holds it, so
+    /// on every fresh upstream connection the hub tells the guest and every
+    /// client to look at all their rings again; on one inherited across its own
+    /// restart (QEMU never saw it close) it does not.
+    #[test]
+    fn a_fresh_upstream_tells_both_sides_to_rescan() {
+        use sv_transport::park::RESCAN_TOKEN;
+        let d = tmpdir("rescan");
+        let qemu = fake_qemu(&d.join("qemu.sock"));
+        let hub = run("t", d.join("qemu.sock"), bind_private(&d.join("hub.sock")).unwrap()).unwrap();
+        let mut g1 = qemu.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(read_raw(&mut g1, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "the guest is told at once");
+        let mut a = UnixStream::connect(d.join("hub.sock")).unwrap();
+        let t = Instant::now();
+        while hub.client_count() < 1 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(g1);
+        let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
+        assert_eq!(read_raw(&mut g2, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN]);
+        assert_eq!(read_raw(&mut a, 1, Duration::from_secs(5)), vec![RESCAN_TOKEN], "and so is every client");
+        // An inherited connection is not fresh: nothing was lost on it.
+        let (mine, mut theirs) = UnixStream::pair().unwrap();
+        let l = bind_private(&d.join("hub2.sock")).unwrap();
+        let _hub2 = run_kept("t2", d.join("absent.sock"), l, Some(mine), false).unwrap();
+        assert!(read_raw(&mut theirs, 1, Duration::from_millis(300)).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

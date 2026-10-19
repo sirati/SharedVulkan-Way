@@ -97,6 +97,38 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
 /// writes each application's relaunch file into (`taskbar::Relaunch`). A
 /// window whose identity has one there can be pinned as that application; any
 /// other window still cannot.
+/// §105. What asks the VM host for the session, now that no ssh does: the
+/// compositor writes a boot record for run `id` of `installation`, signed with
+/// the key in `key_file`, into the ivshmem header page, and serves this
+/// launcher's requests on `control` once the host has answered. With `audio`
+/// it also plays the session's sound ring.
+pub fn boot_argv(cfg: &Config, id: &str, key_file: &str, control: &str) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "--boot-session".into(),
+        id.into(),
+        "--boot-install".into(),
+        cfg.installation().into(),
+        "--boot-key".into(),
+        key_file.into(),
+        "--control-socket".into(),
+        control.into(),
+    ];
+    if cfg.audio {
+        a.extend(["--session-audio".into(), cfg.audio_volume.to_string()]);
+    }
+    a
+}
+
+/// §105. A request as the control ring takes it: the host puts this session's
+/// id after the verb itself, so the id the ssh path sent second is dropped.
+pub fn without_id(verb: &[String]) -> Vec<String> {
+    let mut v = verb.to_vec();
+    if v.len() > 1 {
+        v.remove(1);
+    }
+    v
+}
+
 pub fn relaunch_argv(dir: &str) -> Vec<String> {
     vec!["--relaunch-dir".into(), dir.into()]
 }
@@ -1009,5 +1041,39 @@ mod gpu_tests {
         c.gpu_bell.clear();
         assert!(!gpu_argv(&c).iter().any(|x| x == "--bell"));
         assert_eq!(a.last().unwrap(), "u@h");
+    }
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+
+    #[test]
+    fn the_compositor_is_asked_to_boot_the_session_with_no_ssh() {
+        let mut c = Config { session: "wcns".into(), ..Config::default() };
+        let a = boot_argv(&c, "wcns-42", r"C:\w\session.key", r"C:\s\wc-launch-wcns.ctl");
+        let after = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());
+        assert_eq!(after("--boot-session"), Some("wcns-42"));
+        assert_eq!(after("--boot-install"), Some("wcns"), "the session name by default");
+        assert_eq!(after("--boot-key"), Some(r"C:\w\session.key"));
+        assert_eq!(after("--control-socket"), Some(r"C:\s\wc-launch-wcns.ctl"));
+        assert_eq!(after("--session-audio"), Some("100"));
+        c.installation = "wclinux".into();
+        c.audio = false;
+        let a = boot_argv(&c, "wcns-42", "k", "s");
+        assert!(a.iter().any(|x| x == "wclinux"));
+        assert!(!a.iter().any(|x| x == "--session-audio"));
+        // Nothing of ssh anywhere in what starts a session.
+        assert!(!compositor_argv(&c, "wl-x", "log").iter().chain(&a).any(|x| x.contains("ssh")));
+    }
+
+    #[test]
+    fn a_request_on_the_ring_carries_no_session_id() {
+        let v = launch_verb("wcns-42", "firefox", crate::Request::Run, 96, Some(30));
+        assert_eq!(v[1], "wcns-42");
+        let w = without_id(&v);
+        assert_eq!(w[0], "run");
+        assert!(!w.iter().any(|x| x == "wcns-42"));
+        assert_eq!(&w[1..], &v[2..]);
     }
 }

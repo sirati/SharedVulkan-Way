@@ -695,12 +695,19 @@ mod host {
 
 #[cfg(unix)]
 mod sessiond;
+#[cfg(unix)]
+mod sessiond_ivshmem;
 
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
     // §103.15: the macOS guest's session service.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(String::as_str) == Some("mac-sessiond") {
+    // §105: one service, two substrates. `--ivshmem` is a guest with a
+    // shared-memory device (Windows); without it, guest RAM swept (macOS).
+    if matches!(argv.get(1).map(String::as_str), Some("mac-sessiond" | "sessiond")) {
+        if argv.iter().any(|a| a == "--ivshmem") {
+            return sessiond_ivshmem::main(&argv[2..]);
+        }
         return sessiond::main(&argv[2..]);
     }
     host::main()
