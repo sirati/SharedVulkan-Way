@@ -125,6 +125,12 @@ PULSE="${WC_LAUNCH_PULSE:-}"
 # collection can take them.
 SQLITE="${WC_LAUNCH_SQLITE:-}"
 RSVG="${WC_LAUNCH_RSVG:-}"
+# §106. A PipeWire for the session (`WC_LAUNCH_AUDIO=pipewire` on the VM host):
+# pipewire (with pipewire-pulse) and wireplumber, as store paths already on the
+# host, GC-rooted at $HOSTDIR/bin/pipewire and bin/wireplumber, where
+# wc-session looks first. Unset, wc-session searches the store.
+PIPEWIRE="${WC_LAUNCH_PIPEWIRE:-}"
+WIREPLUMBER="${WC_LAUNCH_WIREPLUMBER:-}"
 AUDIO_VOLUME="${WC_LAUNCH_AUDIO_VOLUME:-100}"
 # §86. The forwarded GPU, **off unless asked for**. WC_LAUNCH_GPU_SESSIONS=N
 # (1..8) builds the GPU half into sv-guest.exe (release), copies sv-hostd and the
@@ -463,6 +469,8 @@ do_deploy() {
   local locator="$LINUX_BIN/wc-arena-host"
   local proxy="$REL_LINUX/wc-proxy"
   local render="$REL_LINUX/wc-launch"
+  # §106: the opener the session's applications get as xdg-open.
+  local hostopen="$REL_LINUX/wc-host-open"
   fresh "$proxy" "cargo build --release -p wc-proxy" || exit 1
   fresh "$locator"            "cargo build -p wc-arena-host" || exit 1
   fresh "$render" "cargo build --release -p wc-launch" || exit 1
@@ -630,9 +638,9 @@ APPS
   # Windows, and a session left up from the last run is running exactly these
   # two. Unlinking first replaces the name and leaves the running process on the
   # inode it already has, which is the whole point of the trick.
-  h "rm -f $HOSTDIR/bin/wc-proxy $HOSTDIR/bin/wc-arena-host $HOSTDIR/bin/wc-launch" >/dev/null 2>&1
+  h "rm -f $HOSTDIR/bin/wc-proxy $HOSTDIR/bin/wc-arena-host $HOSTDIR/bin/wc-launch $HOSTDIR/bin/wc-host-open" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$ROOT/scripts/wc-session" "$HOST:$HOSTDIR/" >/dev/null
-  scp "${SSHOPT[@]}" "$proxy" "$locator" "$render" "$HOST:$HOSTDIR/bin/" >/dev/null \
+  scp "${SSHOPT[@]}" "$proxy" "$locator" "$render" "$hostopen" "$HOST:$HOSTDIR/bin/" >/dev/null \
     || { echo "error: scp to the VM host"; exit 1; }
   # STAGE 42, the host boundary. The unlink trick above means `scp` cannot fail
   # on a live binary any more, which removes the loud failure and leaves only
@@ -640,6 +648,10 @@ APPS
   deployed_is "$proxy" "$HOSTDIR/bin/wc-proxy"      h "re-run $0 deploy" || exit 1
   deployed_is "$locator"            "$HOSTDIR/bin/wc-arena-host" h "re-run $0 deploy" || exit 1
   deployed_is "$render" "$HOSTDIR/bin/wc-launch" h "re-run $0 deploy" || exit 1
+  deployed_is "$hostopen" "$HOSTDIR/bin/wc-host-open" h "re-run $0 deploy" || exit 1
+  # §106: the xdg-open shim directory, put first on the applications' PATH.
+  h "mkdir -p $HOSTDIR/wc-hostint" && scp "${SSHOPT[@]}" "$ROOT/scripts/wc-hostint/xdg-open" "$HOST:$HOSTDIR/wc-hostint/" >/dev/null \
+    && h "chmod 755 $HOSTDIR/wc-hostint/xdg-open" || { echo "error: scp of the xdg-open shim"; exit 1; }
   h "chmod 755 $HOSTDIR/wc-session $HOSTDIR/bin/*; \
      mkdir -p ~/.ssh; chmod 700 ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; \
      grep -q '$(echo "$pub" | awk '{print $2}')' ~/.ssh/authorized_keys || \
@@ -787,6 +799,16 @@ VK_DRIVER_FILES=$icd_json"
   else
     note "WC_LAUNCH_PULSE unset: wc-session looks for pulseaudio in the host's store, and without one Firefox gets a null audio context"
   fi
+  # §106: the session's own PipeWire, for WC_LAUNCH_AUDIO=pipewire.
+  for tool in "pipewire:$PIPEWIRE:pipewire" "wireplumber:$WIREPLUMBER:wireplumber"; do
+    IFS=: read -r pkg path bin <<<"$tool"
+    [ -n "$path" ] || continue
+    if h "nix-store -r $path --add-root $HOSTDIR/bin/$pkg --indirect >/dev/null && test -x $HOSTDIR/bin/$pkg/bin/$bin"; then
+      echo "  $bin from $path (GC root $HOSTDIR/bin/$pkg)"
+    else
+      bad "$path is not on $HOST, or has no bin/$bin: nix copy it there first"
+    fi
+  done
 
   # And the one end-to-end check of the path that does not need a compositor.
   # Asked of `wc-launch.exe` itself rather than of a hand-built ssh command
