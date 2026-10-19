@@ -32471,6 +32471,17 @@ tried, because at 4096 MiB the guest already has no superpages, and a smaller
 guest only makes its wired arena share less room with Firefox. The VM is
 stopped whenever no test is running.
 
+**The idle screen saver blacks the VM's screen out.** At 12:28 on 2026-10-19,
+QMP screendumps went all black (every pixel 0), and stayed black with none of
+our processes alive. The cause was loginwindow, 20 minutes after the last
+input: it started Sonoma's default "Aerial" screen saver, which this GPU-less
+VM's software compositor cannot draw. WindowServer then logged `Unsupported sw
+composite destination` about 480,000 times a minute, and the saver locked the
+session. For the QA user, the saver's idle time is now 0 and `askForPassword`
+is 0. The VM was rebooted and unlocked once, and the desktop came back with no
+composite errors. If a screendump goes black, first look for that error with
+`sudo log show --last 1m` and for a lock screen.
+
 `wayland-host`'s `qemu_extra` adds a USB audio device (UAC1, which macOS
 supports natively) on QEMU's `wav` audiodev. Whatever the Mac plays lands in
 `/mnt/datasets/builds/wcrun/mac-audio.wav` on this host, which is how the sound
@@ -32717,7 +32728,7 @@ The control channel's round trip for `run firefox` is 106 ms, of which 104 ms is
 |---|---|---|
 | Wayland bytes | ring slots in the guest-RAM ring region; no fds cross (in-band names, §79) | client socket to proxy (kernel); proxy into the ring (1); the compositor out of the ring into its local socket pair (1); smithay reads it (kernel) |
 | `wl_shm` buffers, frames | the arena (guest RAM, located once) | proxy copies the client's damage into an arena slice (1, the only write across the boundary); compositor composes the slice into the window's shadow (1); main process copies the shadow into the back IOSurface (1, full frame); face and Core Animation show the IOSurface (0) |
-| Vulkan | 103.6 (the GPU agent's section): its arena is guest RAM; its cold path is being moved off ssh in parallel | see 103.6 |
+| Vulkan | the GPU extent, wired guest RAM located once; the cold path (`Hello`, `Accept`) in the extent's first page (103.6.1), its rings in the same extent; no socket, forward or TCP (`lsof` on the server: 0 network and 0 Unix sockets) | frames: lavapipe renders into the imported extent, and the ICD reads them out of the same mapping (103.6) |
 | control (`run`, `action`, `open`, `down`, lease) | the control ring slot | a line into the ring and back |
 | sound | the sound ring slot | the monitor socket to proxy (kernel); proxy into the ring (1); main process out of the ring into its play queue (1); into an AudioQueue buffer (1) |
 | clipboard | the clipboard feed's ring slot; NSPasteboard in the main process | bytes through the feed's socket pair and ring (2) |
@@ -32738,9 +32749,15 @@ Re-tested on rings, each image judged by a fresh Sonnet agent:
 * The lease.
 
 **Still not on shared memory, so open:** the bootstrap's three ssh execs (and
-the stale-session `down`), the doorbell (polled), the fd-pair doorbell for
-role (b), and, per 103.6, any part of the GPU path the parallel work has not
-moved yet.
+the stale-session `down`), the GPU server's launch (`mac-gpu.sh` starts it over
+ssh; a deployment would start it from `wc-launch` with a fixed label, 103.6.1),
+and the doorbell (polled). The fd-pair doorbell exists in sv-transport
+(`PortHandle` `fd:R,W`, 103.6.1) and the Wayland side does not use it yet.
+
+**Evidence stays out of git.** No screenshot, image or log of this work is
+committed. Screenshots, run logs and captures are under
+`/mnt/datasets/builds/wcrun/` and `/mnt/datasets/builds/evidence/macos-host/`
+on this workstation, and this section states their results in text.
 
 ### 103.12 Not built, and not proven
 
