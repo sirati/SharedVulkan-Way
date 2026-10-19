@@ -32182,6 +32182,121 @@ BAR as region 0. A session per process is what macOS has.
   The server's arena is a buffer import, so the same code should work there.
   That is unproven: there is no Metal here.
 
+#### 103.6.1 The cold path moves into the extent's first page
+
+The paragraph above ("The cold path is a TCP listener on 127.0.0.1 … an ssh
+forward") described the first version. On macOS no part of the GPU path may
+cross a socket, an ssh forward or TCP, so that version is gone: `sv-gpu-server
+guest --port` now refuses with the reason. The cold path's two messages,
+`Hello` and `Accept`/`Refuse`, now travel in the extent's own first page. That
+page is guest RAM the host already has to find.
+
+**The mailbox** (`sv_transport::coldpage`) sits at byte 512 of page 0, past
+every `arena_record` slot (0..152). Page 0 keeps its stamp, and the host's
+locate and index check see an ordinary page. It holds a magic (`SVCOLDP1`), a
+state word (empty, offered, claimed, replied), a heartbeat, the host's claim
+nonce, a 16-byte label, the guest's `Hello` at 1024 and the host's reply at
+2560. Both messages are `ColdMessage::encode` bytes, the same serialiser every
+cold path uses.
+
+| step | guest (`sv-gpu-server guest`) | host (`sv-hostd qemu-serve --cold mem:LABEL`) |
+|---|---|---|
+| 1 | stamps the window (as before), writes the offer, then the state | sweeps QEMU's backend once, recording every stamped page by run id and every page 0 that holds an offer (`locate::sweep_offers`) |
+| 2 | beats the heartbeat and polls the state every 1 ms, up to `--cold-wait` (120 s); opens the driver on a second thread meanwhile | takes an offer with its label only once the heartbeat has moved (`is_live`): freed guest pages are not zeroed, so a dead process's offer survives with a frozen heartbeat |
+| 3 | logs the claim | claims it with a compare-and-swap, offered→claimed, through a one-page mapping of the backend |
+| 4 | | builds the page map out of the same sweep (`map_from_sweep_completing`), stitches, checks every page's index, writes `Accept` and then the state |
+| 5 | `Control::create` over the stamps, which zeroes the mailbox | waits for the control magic (`await_control`) before it hands any ICD the region |
+
+Step 5's wait fixes a race the ssh path hid. An ICD that maps the region
+before `Control::create` reads `SVARENA1` and refuses. This was measured in
+the old path itself: with the harness polling every 10 ms instead of every
+500 ms, `sv-icd` failed with "magic is 0x31414e4552415653". The guest now
+publishes 3 µs after the Accept, and the host waits for it.
+
+A sweep that starts while the guest is still stamping can reach page 0 after
+the offer but have passed some pages before their stamps landed. The offer is
+written after every stamp, and one `pread` copies a chunk front to back. So
+only pages below the offer's offset can be missing, and only that range is
+read again. Measured once: 1,504 MiB re-read instead of a second 4 GiB sweep.
+
+**The memory is pluggable, not the protocol.** `coldpage` takes a
+`SharedRegion` whose byte 0 is the extent's first byte. `sv-gpu-server
+mem-guest --region FILE` (Linux and macOS) puts the extent in a file. `sv-hostd
+--cold file:PATH` reads the offer at offset 0 without sweeping, and it hands
+the ICD the path with `run_count = 0`. That is role (b): a Mac's RAM-disk file
+(`/Volumes/linux-vm-shm/arena`), seen in a libkrun Linux VM through virtio-fs
+DAX (`/run/host-shm/arena`). Run on this workstation with `/dev/shm` and Linux
+lavapipe in place of DAX: 3 frames of 256x256 byte-identical, and 5.3 ms from
+`sv-hostd`'s start to serving. The mailbox's exchange over two mappings of one
+file is a unit test.
+
+**The doorbell is pluggable, and this VM has none.** `--bell` takes
+`vdoorbell::PortHandle::open`'s forms. `socket:PATH` is a QEMU chardev's host
+end (Linux and Windows hosts). `dev:NAME` is the guest's port: on macOS,
+`/dev/NAME`, a `cu.*` node. `fd:R,W` is a descriptor pair a parent passed down:
+the Mac host's end of libkrun's `org.sirati.svbell.0`, which is new and
+unit-tested over a socketpair. A bare name keeps `open_bell_port`'s convention.
+The doorbell is attached after the Accept, for the rings. The cold exchange
+itself polls, because it happens once per session and a 1 ms tick is small
+next to a 0.5 s sweep. `wayland-host` has a 16550 (`/dev/cu.serial1`) whose
+host end is a log file, and no virtio-serial port, so its ring waits poll as
+"Waiting" above describes.
+
+**The one bootstrap left is the launch.** `scripts/mac-gpu.sh` uses ssh to
+copy the binary and to start the server with a label it chose (`mg<pid>`).
+The host learns nothing else over it: the run id, geometry and extent come out
+of guest RAM. The script checks this every run. In the VM, `lsof` on the
+serving process shows 0 network sockets and 0 Unix sockets. Here, `sv-hostd`'s
+descriptors are compared against `/proc/net`: 1 Unix socket (the ICD's
+listener) and 0 TCP. QMP is read once for the region table and closed. A
+deployment would start the server from `wc-launch` in the VM with a fixed
+label, which needs no ssh at all.
+
+**Measured** in `wayland-host` (4 GiB, 80 MiB extent of wired 4 KiB pages,
+lavapipe). The ssh rows use the previous binaries, kept from before this
+change, under the same instrumentation.
+
+| | ssh forward + TCP (before) | first page of guest RAM (now) |
+|---|---|---|
+| cold path, server already published: `sv-hostd` start to the ICD socket | 0.631, 0.700, 0.793, 0.723, 0.732 s (forward setup, Hello, sweep, stitch, Accept) | 0.539, 0.569, 0.520, 0.580 s (sweep, claim, stitch, Accept, control header) |
+| of which the sweep | 0.47 to 0.60 s | 0.47 to 0.53 s |
+| guest: Hello/offer claimed to Accept | 0.50 to 0.63 s (Hello written to Accept, sweep included) | 30 to 40 ms (claim to Accept; the sweep came before the claim) |
+| server launched and `sv-hostd` started together | not possible (the forward needs the listener) | 0.85, 0.85, 0.88, 1.11, 1.15, 1.18 s (1 or 2 sweeps, one completion re-read) |
+| first frame after the probe's first line | 10 to 11 ms | 9 to 13 ms |
+| 120 frames 1280x720, present in the call | 2.01 ms/frame | 2.18, 2.22 ms/frame |
+| the same, pipelined | 1.16 ms/frame | 1.03, 1.18 ms/frame |
+| `[icd]` ring waits, mean | 0.39 to 0.40 ms | 0.38 to 0.45 ms |
+
+The frames did not get faster, and they could not: no frame ever crossed ssh.
+The cold path lost the forward's ~0.2 s. Every result passed: `present`
+(3 frames byte-identical, nine runs), `compute` (245,760 words, 0 wrong) and
+`window` (vkcube 400x300 mapped through the compositor's arena slice, 7,051
+commands). The visual check of the window was not done: from about 12:29 on,
+every QMP screendump of the VM is entirely black, including one taken with
+nothing of this run alive.
+
+**How the GPU path crosses the boundary, per channel, and its copies per
+frame:**
+
+| channel | crosses by | copies |
+|---|---|---|
+| cold path (`Hello`, `Accept`) | the mailbox in page 0 of guest RAM: the host reads it through QEMU's memfd and writes the reply the same way | none per frame; once per session |
+| ICD attach (`AttachRequest`, `Attach`, runs) | a Unix socket on this workstation only, between `sv-icd` and `sv-hostd` | none per frame; the ICD then maps guest RAM by name |
+| commands and replies | the rings in the control region (guest RAM), each packet written once by its producer and read in the other's mapping | the ring write itself |
+| wakes | polled (no port in this VM); `--bell` when one exists | none |
+| frame pixels, headless | lavapipe in the VM copies the swapchain image into the arena's readback buffer (`vkCmdCopyImageToBuffer`, recorded at swapchain creation) | **1**, inside the VM |
+| frame pixels, `window` | that copy, then `sv-icd` copies arena → `wl_shm` buffer, which is the compositor's arena slice, also guest RAM | **2** (one per side); then the compositor's own present copies (103.7) |
+| compute results | the shader writes the arena buffer, and the host reads it in place | **0** |
+
+In `window` mode the vkcube's *Wayland* connection still goes through
+`scripts/mac-window.sh`'s ssh forward. That is the Wayland path, not the GPU
+path, and 103.14 replaces it.
+
+**Not proven:** role (b) on a real Mac. The file path ran on Linux over
+`/dev/shm`, not virtio-fs DAX, and the `fd:` doorbell has only run in a unit
+test. A doorbell in this VM was not tried either, since hot-adding a port to a
+running guest that others use was out of bounds.
+
 ### 103.7 Wayland onto AppKit, and what cocoa-way contributes
 
 cocoa-way (J-x-Z/cocoa-way, 2.1.0, last commit 2026-10-14) is a smithay

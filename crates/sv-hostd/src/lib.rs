@@ -151,6 +151,21 @@ pub struct LocateOutcome {
     pub cross_check: Option<locate::CrossCheck>,
 }
 
+/// The offer [`Hostd::qemu_offered`] took (waycompose-design.md §103.6): the
+/// mailbox page to reply in, mapped from QEMU's backend, and how finding it
+/// went.
+#[cfg(target_os = "linux")]
+pub struct Offered {
+    pub page0: SharedRegion,
+    pub hello: sv_transport::cold::Hello,
+    pub label: String,
+    pub report: locate::ScanReport,
+    /// Sweeps it took, the first ones finding no live offer.
+    pub sweeps: u32,
+    /// The last sweep and the page map out of it.
+    pub last_sweep: std::time::Duration,
+}
+
 /// The daemon's view of the one extent it serves.
 #[cfg(target_os = "linux")]
 pub struct Hostd {
@@ -368,6 +383,18 @@ impl Hostd {
                 translated
             }
         };
+        let hostd = Hostd::qemu_from_map(&target, desc, generation, map)?;
+        Ok((hostd, target.regions, outcome))
+    }
+
+    /// The [`Hostd`] for `desc`, once its pages are mapped: coalesce, check,
+    /// and hold the daemon's own descriptor on QEMU's backend.
+    fn qemu_from_map(
+        target: &qemu::QemuTarget,
+        desc: &sv_transport::cold::ExtentDesc,
+        generation: u32,
+        map: sv_arena::extent::PageMap,
+    ) -> Result<Hostd> {
         let runs = map.coalesce();
         let total = (desc.control_pages + desc.arena_pages) * PAGE as u64;
         runs.validate(total)?;
@@ -386,20 +413,107 @@ impl Hostd {
             arena_size: desc.arena_pages * PAGE as u64,
             ..Geometry::default()
         };
-        Ok((
-            Hostd {
-                mode: Mode::Qemu,
-                geometry,
-                extent,
-                runs,
-                fd,
-                object,
-                owns_name: false,
-                generation,
-            },
-            target.regions,
-            outcome,
-        ))
+        Ok(Hostd { mode: Mode::Qemu, geometry, extent, runs, fd, object, owns_name: false, generation })
+    }
+
+    /// [`Hostd::qemu`] for a guest whose cold path is the extent's first page
+    /// (waycompose-design.md §103.6): no Hello arrives on a socket, so the
+    /// daemon sweeps until it finds a live offer whose label matches `label`
+    /// (empty: any), claims it, and locates its extent out of the same sweep.
+    ///
+    /// QMP takes one client: a busy monitor is retried until `deadline`, as
+    /// is a guest that has not offered yet (one sweep every `every`).
+    pub fn qemu_offered(
+        qmp: &std::path::Path,
+        hint: &str,
+        label: &str,
+        nonce: u64,
+        deadline: std::time::Instant,
+    ) -> Result<(Hostd, qemu::RegionTable, Offered)> {
+        use sv_transport::coldpage;
+        use std::os::fd::AsFd;
+        let target = loop {
+            match qemu::QemuTarget::discover(qmp, hint) {
+                Ok(t) => break t,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    eprintln!("sv-hostd: QMP/backend not ready ({e}); retrying");
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(e) => return Err(HostdError::Io(e)),
+            }
+        };
+        let locate_err = |e: locate::LocateError| match e {
+            locate::LocateError::Io(e) => HostdError::Io(e),
+            other => HostdError::Io(std::io::Error::other(other.to_string())),
+        };
+        let mut sweeps = 0u32;
+        loop {
+            let t = std::time::Instant::now();
+            let sweep = locate::sweep_offers(&target.file, target.file_len, &target.regions).map_err(locate_err)?;
+            sweeps += 1;
+            let swept_in = t.elapsed();
+            for seen in &sweep.offers {
+                if !coldpage::label_matches(&seen.offer, label) {
+                    continue;
+                }
+                let page0 = SharedRegion::map_fd(target.file.as_fd(), seen.file_offset, PAGE)?;
+                // A dead process's offer has a frozen heartbeat (coldpage's
+                // header); a live guest beats every millisecond.
+                if !coldpage::is_live(&page0, seen.offer.heartbeat, std::time::Duration::from_millis(100))? {
+                    continue;
+                }
+                if !coldpage::claim(&page0, nonce)? {
+                    continue;
+                }
+                let desc = &seen.offer.hello.extent;
+                let t_map = std::time::Instant::now();
+                let completed =
+                    locate::map_from_sweep_completing(&target.file, &target.regions, &sweep, desc, seen.file_offset);
+                let (map, report) = match completed {
+                    Ok((map, report, reread)) => {
+                        if reread > 0 {
+                            eprintln!(
+                                "sv-hostd: the sweep that found the offer overtook the guest's stamping; \
+                                 {} MiB below the offer's page read again",
+                                reread >> 20
+                            );
+                        }
+                        (map, report)
+                    }
+                    Err(e) => {
+                        let _ = coldpage::reply(
+                            &page0,
+                            &sv_transport::cold::ColdMessage::Refuse { code: 2, reason: e.to_string() },
+                        );
+                        return Err(locate_err(e));
+                    }
+                };
+                let hostd = Hostd::qemu_from_map(&target, desc, seen.offer.hello.generation, map)?;
+                return Ok((
+                    hostd,
+                    target.regions,
+                    Offered {
+                        page0,
+                        hello: seen.offer.hello.clone(),
+                        label: seen.offer.label.clone(),
+                        report,
+                        sweeps,
+                        last_sweep: swept_in + t_map.elapsed(),
+                    },
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(HostdError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no live offer{} in guest RAM after {sweeps} sweep(s) ({} seen)",
+                        if label.is_empty() { String::new() } else { format!(" labelled {label:?}") },
+                        sweep.offers.len()
+                    ),
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     /// The message a client gets. It carries a **name**, not a descriptor.
