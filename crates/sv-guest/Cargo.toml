@@ -31,5 +31,7 @@ sv-gpu-server = { path = "../sv-gpu-server", optional = true }
 wc-compositor = { path = "../wc-compositor", optional = true }
 # §108: the keeper and its instruments (`sv-guest ram …`).
 sv-ram = { path = "../sv-ram" }
-sv-transport = { workspace = true }
 wc-handle = { path = "../wc-handle" }
+# §110: the one pool, when both halves run in one process (`--with-gpu`).
+sv-arena = { workspace = true }
+sv-transport = { workspace = true }

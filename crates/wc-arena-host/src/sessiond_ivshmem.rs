@@ -142,6 +142,9 @@ pub struct Request {
     pub rec: macboot::Record,
     pub install: Install,
     pub seq: u64,
+    /// §107: the session's index in the guest's shared compositor; 0 for a
+    /// compositor serving one session.
+    pub index: u8,
 }
 
 pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Request>, String> {
@@ -155,9 +158,12 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
         return Ok(None);
     }
     let auth = macboot::Auth::read(page).ok_or("the boot record has no authenticator (deploy gives every installation a key)")?;
+    let index = macboot::session_index(page).ok_or("the boot record's session index is not 0..255")?;
     let install = lookup(installs, &auth.installation)?;
     let key = key_of(&install)?;
-    if !auth.verifies(&rec, &key) {
+    // §107: the index is covered by the MAC, so a record cannot be replayed
+    // into another session's place; index 0 is the one-session message.
+    if !auth.verifies_indexed(&rec, index, &key) {
         return Err(format!("the boot record for installation {} does not verify under its key", install.name));
     }
     let last = last_seq(state, &install.name);
@@ -167,7 +173,7 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
             install.name, auth.seq
         ));
     }
-    Ok(Some(Request { rec, install, seq: auth.seq }))
+    Ok(Some(Request { rec, install, seq: auth.seq, index }))
 }
 
 /// Write the answer into page 0, if it still holds the record: the message
@@ -260,10 +266,11 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
         args.installs.display(),
         args.poll
     ));
-    // Records answered or refused by this process, by run id, so a page the
-    // guest has not yet rewritten is never served twice and a refusal is said
-    // once.
-    let mut done: HashSet<u64> = HashSet::new();
+    // Records answered or refused by this process, so a page the guest has not
+    // yet rewritten is never served twice and a refusal is said once. §107:
+    // by run id, session id and sequence number, not by run id alone, because
+    // every session of a shared compositor has its compositor's run id.
+    let mut done: HashSet<Seen> = HashSet::new();
     // Ended sessions are looked for every two seconds whatever the poll is.
     let tick = args.poll.min(Duration::from_secs(2));
     let mut last_read = Instant::now();
@@ -297,7 +304,14 @@ fn stable_page(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
     Ok((a == b).then_some(a))
 }
 
-fn serve(args: &Args, live: &mut Live, done: &mut HashSet<u64>, why: &str) {
+/// §107: which record a page held: run id, session id, sequence number.
+type Seen = (u64, String, u64);
+
+fn seen(rec: &macboot::Record, page: &[u8]) -> Seen {
+    (rec.arena_run, rec.session.clone(), macboot::Auth::read(page).map_or(0, |a| a.seq))
+}
+
+fn serve(args: &Args, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
     let t0 = Instant::now();
     let file = match std::fs::OpenOptions::new().read(true).write(true).open(&args.arena) {
         Ok(f) => f,
@@ -317,20 +331,21 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<u64>, why: &str) {
         }
     };
     let Some(rec) = macboot::Record::read(&page) else { return };
-    if done.contains(&rec.arena_run) {
+    let key = seen(&rec, &page);
+    if done.contains(&key) {
         return;
     }
     let req = match check(&page, &args.installs, &args.state) {
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
-            done.insert(rec.arena_run);
+            done.insert(key);
             say(&format!("session {}: REFUSED: {e}", rec.session));
             let _ = answer(&file, &rec, macboot::State::Failed, &format!("refused: {e}"));
             return;
         }
     };
-    done.insert(rec.arena_run);
+    done.insert(key);
     if let Err(e) = store_seq(&args.state, &req.install.name, req.seq) {
         say(&format!("cannot record installation {}'s sequence number: {e}; refusing", req.install.name));
         let _ = answer(&file, &rec, macboot::State::Failed, "the host cannot record the sequence number");
@@ -339,14 +354,15 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<u64>, why: &str) {
     let id = rec.session.clone();
     let ws = req.install.session();
     say(&format!(
-        "boot record for session {id} of installation {} ({why}): run 0x{:016x}, {} pages, gpu {}",
-        req.install.name, rec.arena_run, rec.arena_pages, rec.gpu
+        "boot record for session {id} of installation {} ({why}): run 0x{:016x}, {} pages, gpu {}, session index {}",
+        req.install.name, rec.arena_run, rec.arena_pages, rec.gpu, req.index
     ));
+    let env = [("WC_LAUNCH_SESSION_INDEX", req.index.to_string())];
     let run = format!("0x{:016x}", rec.arena_run);
     // §105.13: timed per verb, and the GPU's host side started beside the
     // proxy rather than after it: it waits for the guest's offers by itself.
     let t_up = Instant::now();
-    let up = crate::sessiond::verb(&ws, &["up", &id, &run, "ivshmem"]);
+    let up = crate::sessiond::verb_env(&ws, &["up", &id, &run, "ivshmem"], &env);
     let d_up = t_up.elapsed();
     let gpu = (rec.gpu && up.is_ok()).then(|| {
         let (ws, id) = (ws.clone(), id.clone());
@@ -489,6 +505,40 @@ mod tests {
         let mut p = page(0x77, &r, Some(&a));
         p[..8].fill(0);
         assert_eq!(check(&p, &inst, &st), Ok(None));
+    }
+
+    /// §107: a shared compositor's record carries its session's index, which
+    /// the MAC covers; the service takes it to the session's proxy, and a
+    /// record moved to another index, or signed by another installation's
+    /// key, is refused.
+    #[test]
+    fn a_shared_compositors_record_carries_its_index_under_its_own_key() {
+        let t = tmp("indexed");
+        let (k1, k2) = ([3u8; 32], [4u8; 32]);
+        install(&t.0, "wcivs", &k1);
+        install(&t.0, "wclinux", &k2);
+        let (inst, st) = (t.0.join("installs"), t.0.join("state"));
+        let r = rec(0x77);
+        let indexed = |idx: u8, auth: &macboot::Auth| {
+            let mut p = page(0x77, &r, None);
+            // SAFETY: a 4096-byte buffer this test owns.
+            unsafe { macboot::publish_indexed(p.as_mut_ptr(), &r, idx, Some(auth)) };
+            p
+        };
+        let a = macboot::Auth::sign_indexed(&r, 3, "wcivs", 10, &k1);
+        let got = check(&indexed(3, &a), &inst, &st).unwrap().unwrap();
+        assert_eq!((got.index, got.install.name.as_str()), (3, "wcivs"));
+        assert!(check(&indexed(4, &a), &inst, &st).unwrap_err().contains("does not verify"), "moved to index 4");
+        let other = macboot::Auth::sign_indexed(&r, 3, "wclinux", 10, &k1);
+        assert!(check(&indexed(3, &other), &inst, &st).unwrap_err().contains("does not verify"), "one installation's key for another");
+        // Two sessions of one compositor: one run id, two records, two keys.
+        let r2 = macboot::Record { session: "wcns-2".into(), ..r.clone() };
+        let b = macboot::Auth::sign_indexed(&r2, 4, "wclinux", 11, &k2);
+        let mut p = page(0x77, &r2, None);
+        // SAFETY: as above.
+        unsafe { macboot::publish_indexed(p.as_mut_ptr(), &r2, 4, Some(&b)) };
+        assert_eq!(check(&p, &inst, &st).unwrap().unwrap().index, 4);
+        assert_ne!(seen(&r, &indexed(3, &a)), seen(&r2, &p), "the service tells them apart");
     }
 
     #[test]

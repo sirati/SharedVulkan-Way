@@ -123,6 +123,23 @@ use self::pool::Pool;
 
 use super::buffer::BufferHandler;
 
+/// WAYCOMPOSE FORK (waycompose-design.md §107): a check every
+/// `wl_shm.create_pool` passes before its memory is mapped. The compositor
+/// that serves several sessions sets it so that a pool naming another
+/// session's arena region is a protocol error; `Err` is the message posted.
+pub type PoolCheck = fn(&wayland_server::Client, &crate::utils::os::ProtoFd) -> Result<(), String>;
+
+static POOL_CHECK: std::sync::OnceLock<PoolCheck> = std::sync::OnceLock::new();
+
+/// Install the [`PoolCheck`]; the first call wins, as it is process-wide.
+pub fn set_pool_check(check: PoolCheck) {
+    let _ = POOL_CHECK.set(check);
+}
+
+fn pool_check() -> Option<PoolCheck> {
+    POOL_CHECK.get().copied()
+}
+
 /// State of SHM module
 #[derive(Debug)]
 pub struct ShmState {

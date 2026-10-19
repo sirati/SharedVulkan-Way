@@ -49,6 +49,12 @@ pub enum ToFace {
     Activate { id: WindowId },
     /// The main process is ending; the face quits.
     Bye,
+    /// §106: the main process is about to open something in another
+    /// application (`bundle_id`) for Linux; the active face lets it come to
+    /// the front (`yieldActivationToApplicationWithBundleIdentifier:`,
+    /// macOS 14), since cooperative activation lets only the active app
+    /// hand the foreground on.
+    Yield { bundle_id: String },
 }
 
 /// Face to main process.
@@ -65,6 +71,12 @@ pub enum FromFace {
     Request { key: String },
     /// The face is quitting on purpose; do not restart it.
     Bye,
+    /// §106: documents or URLs macOS asked this application to open
+    /// (`application:openURLs:`: Finder's Open With, a double-click, `open
+    /// -a`, a link whose scheme the bundle claims). The main process makes
+    /// each one a request to open it in the application (`open:<url>`), a
+    /// file mapped to its Linux path first.
+    Open { urls: Vec<String> },
 }
 
 // ------------------------------------------------------------- writing ---
@@ -293,6 +305,9 @@ impl ToFace {
             ToFace::Bye => {
                 w.u8(21);
             }
+            ToFace::Yield { bundle_id } => {
+                w.u8(22).str(bundle_id);
+            }
         }
         w.0
     }
@@ -348,6 +363,7 @@ impl ToFace {
             19 => ToFace::Destroy { id: r.u64()? },
             20 => ToFace::Activate { id: r.u64()? },
             21 => ToFace::Bye,
+            22 => ToFace::Yield { bundle_id: r.str()? },
             t => return Err(bad(&format!("to-face tag {t}"))),
         })
     }
@@ -378,6 +394,12 @@ impl FromFace {
             }
             FromFace::Bye => {
                 w.u8(4);
+            }
+            FromFace::Open { urls } => {
+                w.u8(5).u32(urls.len() as u32);
+                for u in urls {
+                    w.str(u);
+                }
             }
             FromFace::Ui(e) => {
                 w.u8(10);
@@ -434,6 +456,14 @@ impl FromFace {
             }
             3 => FromFace::Request { key: r.str()? },
             4 => FromFace::Bye,
+            5 => {
+                let n = r.u32()?.min(MAX_OPEN as u32);
+                let mut urls = Vec::new();
+                for _ in 0..n {
+                    urls.push(r.str()?);
+                }
+                FromFace::Open { urls }
+            }
             10 => FromFace::Ui(match r.u8()? {
                 1 => FromUi::Resized { id: r.u64()?, width: r.i32()?, height: r.i32()? },
                 2 => FromUi::CloseRequested { id: r.u64()? },
@@ -461,6 +491,10 @@ impl FromFace {
         })
     }
 }
+
+/// The most URLs one [`FromFace::Open`] carries; macOS sends a Finder
+/// selection as one call, and nobody opens more at once.
+pub const MAX_OPEN: usize = 64;
 
 /// Write one framed message.
 pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
@@ -537,6 +571,7 @@ mod tests {
         round(ToFace::BeginResize { id: 7, edge: Edge::BottomRight });
         round(ToFace::SizeHints { id: 7, min: (500, 120), max: (0, 0) });
         round(ToFace::Bye);
+        round(ToFace::Yield { bundle_id: "com.apple.Safari".into() });
     }
 
     #[test]
@@ -554,6 +589,11 @@ mod tests {
         assert!(FromFace::Ui(FromUi::Layout { name: "us" }).encode().is_none());
         let h = FromFace::Hello { section: "firefox".into(), ids: vec!["firefox".into()], token: 42, pid: 9 };
         assert!(matches!(FromFace::decode(&h.encode().unwrap()).unwrap(), FromFace::Hello { token: 42, pid: 9, .. }));
+        let o = FromFace::Open { urls: vec!["file:///Users/q/a%20b.txt".into(), "https://example.org/".into()] };
+        match FromFace::decode(&o.encode().unwrap()).unwrap() {
+            FromFace::Open { urls } => assert_eq!(urls, ["file:///Users/q/a%20b.txt", "https://example.org/"]),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

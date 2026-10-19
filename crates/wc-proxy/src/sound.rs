@@ -15,6 +15,9 @@
 //!   Capture is asked for (`Start`) only while something records from it
 //!   (`pactl list short source-outputs`, once a second while there are input
 //!   streams), and stopped (`Stop`) when nothing does;
+//! * each is named `<prefix>.<sink|source>.<slug>` after the device
+//!   (`wc_hostint::audio::node_name`), the prefix being the device side's
+//!   platform (`--sound-prefix`, "win" or "mac"), and described by its name;
 //! * `Default` makes the Mac's default the session's (`set-default-sink`,
 //!   `set-default-source`).
 //!
@@ -40,6 +43,15 @@ pub struct SoundCfg {
     pub server: Option<String>,
     /// The session's directory, for the FIFOs and the module list.
     pub dir: PathBuf,
+    /// The device side's platform, the first word of every sink and source
+    /// name: "win" or "mac" (`--sound-prefix`; "mac" if empty).
+    pub prefix: String,
+    /// §106.3: `wc-pw-node` (`--sound-pw-node`) and the session PipeWire's
+    /// socket (`--sound-pipewire`). With both, and a server that says it is
+    /// PipeWire, every stream is a native PipeWire node that drives its graph
+    /// at the pace of the credit ([`Native`]); otherwise a pipe module.
+    pub pw_node: Option<PathBuf>,
+    pub pipewire: Option<PathBuf>,
 }
 
 /// What an input stream's FIFO is granted at a time.
@@ -58,6 +70,8 @@ struct Stream {
 
 struct Shared {
     cfg: SoundCfg,
+    /// §106.3: the native nodes' host, when the server is PipeWire.
+    native: Option<Native>,
     credits: Mutex<Credits>,
     credit_cv: Condvar,
     streams: Mutex<HashMap<u16, Stream>>,
@@ -94,8 +108,13 @@ fn description(name: &str) -> String {
 
 /// Serve the sound ring until it ends.
 pub fn serve(control: &Arc<Control>, ch: ByteChannel, cfg: SoundCfg) {
+    let (native, from_node) = match Native::start(&cfg) {
+        Some((n, out)) => (Some(n), Some(out)),
+        None => (None, None),
+    };
     let shared = Arc::new(Shared {
         cfg,
+        native,
         credits: Mutex::new(Credits::default()),
         credit_cv: Condvar::new(),
         streams: Mutex::new(HashMap::new()),
@@ -123,6 +142,10 @@ pub fn serve(control: &Arc<Control>, ch: ByteChannel, cfg: SoundCfg) {
         }
     };
     link.send(Msg::Hello { version: VERSION });
+    if let Some(out) = from_node {
+        let (sh, l2) = (Arc::clone(&shared), link.clone());
+        std::thread::Builder::new().name("sound-pw-node".into()).spawn(move || from_native(&sh, &l2, out)).ok();
+    }
     // Capture on demand: Start while something records from an input
     // stream's source, Stop when nothing does.
     let sh = Arc::clone(&shared);
@@ -169,20 +192,24 @@ pub fn serve(control: &Arc<Control>, ch: ByteChannel, cfg: SoundCfg) {
 
 fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
     match m {
-        Msg::Hello { version } => println!("[proxy] session sound: the device side speaks version {version}"),
-        Msg::Device { stream, dir, channels, rate, name } => add(sh, link, stream, dir, channels, rate, &name),
-        Msg::Gone { stream } => {
-            let s = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream);
-            if let Some(s) = s {
-                s.gone.store(true, std::sync::atomic::Ordering::SeqCst);
-                sh.credit_cv.notify_all();
-                if let Some(m) = s.module {
-                    let _ = pactl(&sh.cfg, &["unload-module", &m.to_string()]);
-                }
-                println!("[proxy] session sound: {} is gone", s.name);
+        Msg::Hello { version } => {
+            println!("[proxy] session sound: the device side speaks version {version}");
+            // A device side that (re)started numbers its streams afresh: what
+            // the last one announced is gone, its modules included.
+            let old: Vec<u16> = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+            for stream in old {
+                remove(sh, stream);
             }
-            sh.credits.lock().unwrap_or_else(|e| e.into_inner()).forget(stream);
         }
+        Msg::Device { stream, dir, channels, rate, name } => {
+            // The same id announced again without a Gone replaces the old
+            // stream, so its module and FIFO never linger under a second name.
+            if sh.streams.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&stream) {
+                remove(sh, stream);
+            }
+            add(sh, link, stream, dir, channels, rate, &name)
+        }
+        Msg::Gone { stream } => remove(sh, stream),
         Msg::Default { stream, dir } => {
             let name = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream).map(|s| s.source.clone());
             if let Some(n) = name {
@@ -196,8 +223,15 @@ fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
         Msg::Credit { stream, bytes } => {
             sh.credits.lock().unwrap_or_else(|e| e.into_inner()).grant(stream, bytes);
             sh.credit_cv.notify_all();
+            if let Some(n) = &sh.native {
+                n.send(&Msg::Credit { stream, bytes });
+            }
         }
         Msg::Data { stream, pcm } => {
+            if let Some(n) = &sh.native {
+                n.send(&Msg::Data { stream, pcm });
+                return;
+            }
             let tx = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).get(&stream).and_then(|s| s.to_fifo.clone());
             if let Some(tx) = tx {
                 let _ = tx.send(pcm);
@@ -207,10 +241,57 @@ fn on_msg(sh: &Arc<Shared>, m: Msg, link: &Link) {
     }
 }
 
+/// A stream the device side no longer has: its module unloaded, its pump
+/// ended, its credit forgotten.
+fn remove(sh: &Arc<Shared>, stream: u16) {
+    let s = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&stream);
+    if let Some(s) = s {
+        s.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        sh.credit_cv.notify_all();
+        if let Some(m) = s.module {
+            let _ = pactl(&sh.cfg, &["unload-module", &m.to_string()]);
+        }
+        println!("[proxy] session sound: {} is gone", s.name);
+    }
+    if let Some(n) = &sh.native {
+        n.send(&Msg::Gone { stream });
+    }
+    sh.credits.lock().unwrap_or_else(|e| e.into_inner()).forget(stream);
+}
+
 fn add(sh: &Arc<Shared>, link: &Link, stream: u16, dir: Dir, channels: u8, rate: u32, name: &str) {
-    let tag = format!("wc_mac_{}_{stream}", if dir == Dir::Out { "out" } else { "in" });
+    // `<prefix>.<sink|source>.<slug of the device's name>`, `_2`, `_3` for
+    // a name already in use (wc_hostint::audio::node_name).
+    let prefix = if sh.cfg.prefix.is_empty() { "mac" } else { sh.cfg.prefix.as_str() };
+    let taken: Vec<String> = sh.streams.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| s.source.clone()).collect();
+    let hdir = if dir == Dir::Out { wc_hostint::audio::Dir::Output } else { wc_hostint::audio::Dir::Input };
+    let tag = wc_hostint::audio::node_name(prefix, hdir, name, &taken);
+    if let Some(n) = &sh.native {
+        // §106.3: a native node of wc-pw-node; no FIFO, no module.
+        let desc: String = name.chars().filter(|c| *c != '\0').collect();
+        n.send(&Msg::Device { stream, dir, channels, rate, name: format!("{tag}\0{desc}") });
+        let s = Stream { dir, name: name.to_string(), module: None, source: tag.clone(), capturing: false, gone: Arc::default(), to_fifo: None };
+        sh.streams.lock().unwrap_or_else(|e| e.into_inner()).insert(stream, s);
+        if dir == Dir::In {
+            link.send(Msg::Credit { stream, bytes: IN_CREDIT });
+        }
+        println!(
+            "[proxy] session sound: native {} {tag} for \"{name}\" ({rate} Hz, {channels} ch), driven by the ring's credit",
+            if dir == Dir::Out { "sink" } else { "source" }
+        );
+        return;
+    }
     let fifo = sh.cfg.dir.join(format!("sound-{stream}.fifo"));
-    if let Err(e) = mkfifo(&fifo) {
+    // PulseAudio 17's module-pipe-source refuses a FIFO that exists
+    // (`mkfifo: File exists`, measured), so an input's is made by the module;
+    // an output's is made here, as module-pipe-sink accepts.
+    let made = if dir == Dir::In {
+        let _ = std::fs::remove_file(&fifo);
+        Ok(())
+    } else {
+        mkfifo(&fifo)
+    };
+    if let Err(e) = made {
         println!("[proxy] session sound: {e}");
         return;
     }
@@ -315,3 +396,126 @@ fn pump_in(link: &Link, stream: u16, fifo: &std::path::Path, rx: &std::sync::mps
 
 /// Bytes per read from a pipe sink: 20 ms of s16le stereo at 48 kHz.
 pub const CHUNK: usize = 3840;
+
+/// §106.3: under PipeWire, every stream is a native node of `wc-pw-node`, a
+/// child of this process on the session's PipeWire. A pipe sink there is a
+/// follower of the graph's clock and drops what its reader does not take
+/// (44 % of a tone for a 1 s hold of the credit); a `wc-pw-node` node drives
+/// its own graph and runs a cycle only when the credit covers one, so the
+/// application waits instead. The two talk in the sound ring's own frames on
+/// the child's stdin and stdout: `Device`/`Gone`/`Credit`/input `Data` in,
+/// output `Data`, input `Credit`, `Start`/`Stop` out.
+pub struct Native {
+    stdin: Mutex<std::process::ChildStdin>,
+    _child: Mutex<std::process::Child>,
+}
+
+impl Native {
+    /// The node host, if this session's server is PipeWire and both the
+    /// helper and the PipeWire socket were given.
+    fn start(cfg: &SoundCfg) -> Option<(Native, std::process::ChildStdout)> {
+        let (Some(bin), Some(remote)) = (cfg.pw_node.as_ref(), cfg.pipewire.as_ref()) else { return None };
+        let info = match pactl(cfg, &["info"]) {
+            Ok(i) => i,
+            Err(e) => {
+                println!("[proxy] session sound: {e}; pipe modules");
+                return None;
+            }
+        };
+        let server = info.lines().find_map(|l| l.strip_prefix("Server Name: ")).unwrap_or("").to_string();
+        if !server.contains("PipeWire") {
+            println!("[proxy] session sound: the server is {server:?}, not PipeWire: pipe modules");
+            return None;
+        }
+        let rt = remote.parent().unwrap_or(std::path::Path::new("/nonexistent"));
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(cfg.dir.join("pw-node.log")).ok();
+        let mut c = Command::new(bin);
+        c.env("PIPEWIRE_REMOTE", remote)
+            .env("PIPEWIRE_RUNTIME_DIR", rt)
+            .env("XDG_RUNTIME_DIR", rt)
+            .env_remove("PULSE_SERVER")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(log.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
+        // No PR_SET_PDEATHSIG: it fires when the spawning *thread* ends, and
+        // this one returns at once. The node host ends at EOF on its stdin,
+        // which is when this process is gone.
+        match c.spawn() {
+            Ok(mut ch) => {
+                let (Some(i), Some(o)) = (ch.stdin.take(), ch.stdout.take()) else { return None };
+                println!(
+                    "[proxy] session sound: {server}: native nodes from {} (pid {}) on {}",
+                    bin.display(),
+                    ch.id(),
+                    remote.display()
+                );
+                Some((Native { stdin: Mutex::new(i), _child: Mutex::new(ch) }, o))
+            }
+            Err(e) => {
+                println!("[proxy] session sound: {}: {e}; pipe modules, which DROP under PipeWire", bin.display());
+                None
+            }
+        }
+    }
+
+    fn send(&self, m: &Msg) {
+        let mut b = Vec::new();
+        m.encode(&mut b);
+        if self.stdin.lock().unwrap_or_else(|e| e.into_inner()).write_all(&b).is_err() {
+            println!("[proxy] session sound: wc-pw-node is gone");
+        }
+    }
+}
+
+/// The node host's frames to the ring: an output's samples (within the
+/// device side's credit, which it keeps), an input's consumed bytes as the
+/// session's credit, and capture `Start`/`Stop`.
+fn from_native(sh: &Shared, link: &Link, mut out: std::process::ChildStdout) {
+    let mut dec = sv_transport::soundring::Decoder::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match out.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        dec.push(&buf[..n]);
+        loop {
+            let m = match dec.next_msg() {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(e) => {
+                    println!("[proxy] session sound: wc-pw-node: {}", e.0);
+                    return;
+                }
+            };
+            match m {
+                Msg::Data { stream, pcm } => {
+                    let mut c = sh.credits.lock().unwrap_or_else(|e| e.into_inner());
+                    if c.available(stream, pcm.len()) < pcm.len() {
+                        println!("[proxy] session sound: wc-pw-node sent {} bytes beyond the credit of {stream}", pcm.len());
+                    }
+                    c.spend(stream, pcm.len());
+                    drop(c);
+                    link.send(Msg::Data { stream, pcm });
+                }
+                Msg::Credit { .. } => {
+                    link.send(m);
+                }
+                Msg::Start { stream } | Msg::Stop { stream } => {
+                    let on = matches!(m, Msg::Start { .. });
+                    let name = {
+                        let mut ss = sh.streams.lock().unwrap_or_else(|e| e.into_inner());
+                        ss.get_mut(&stream).map(|s| {
+                            s.capturing = on;
+                            s.source.clone()
+                        })
+                    };
+                    link.send(m);
+                    println!("[proxy] session sound: {} capture {}", name.unwrap_or_default(), if on { "started" } else { "stopped" });
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("[proxy] session sound: wc-pw-node ended (see pw-node.log)");
+}

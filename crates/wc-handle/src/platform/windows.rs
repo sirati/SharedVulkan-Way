@@ -144,6 +144,13 @@ impl MappedView {
     pub fn ptr(&self) -> *const u8 {
         self.address.Value.cast::<u8>().cast_const()
     }
+
+    /// §110: a view of memory somebody else mapped and keeps mapped for the
+    /// life of the process (the GPU device's BAR in the shared compositor).
+    /// Its length is 0, so dropping it unmaps nothing.
+    pub(crate) fn borrowed(ptr: *const u8) -> MappedView {
+        MappedView { address: MEMORY_MAPPED_VIEW_ADDRESS { Value: ptr.cast_mut().cast() }, len: 0, backing: Backing::View }
+    }
 }
 
 impl Drop for MappedView {

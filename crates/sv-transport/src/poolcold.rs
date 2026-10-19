@@ -288,6 +288,33 @@ pub fn attach_guest_bell<T: BellTarget + ?Sized + 'static>(
     Ok(guest_doorman(reader, lanes, cold))
 }
 
+/// §110: [`attach_guest_bell`] for a process that has another port too (the
+/// shared compositor running the GPU pool): the writer rings only for lanes in
+/// the pool's mapping, `[base, base + len)`, and is the process-wide wake only
+/// if there is none. [`poke_cross_at`] is the mailbox's poke to match.
+pub fn attach_guest_bell_for<T: BellTarget + ?Sized + 'static>(
+    port: crate::vdoorbell::PortHandle,
+    lanes: Arc<T>,
+    cold: Arc<ColdEvent>,
+    base: usize,
+    len: usize,
+) -> std::io::Result<crate::vdoorbell::Doorman> {
+    let (reader, writer) = port.split()?;
+    crate::park::install_cross_wake_for(
+        base,
+        len,
+        Arc::new(crate::vdoorbell::PortWake::new(writer)) as Arc<dyn crate::park::CrossWake>,
+    );
+    Ok(guest_doorman(reader, lanes, cold))
+}
+
+/// §110: ring [`COLD_TOKEN`] on the wake of the pool mapped at `base`.
+pub fn poke_cross_at(base: usize) {
+    if let Some(w) = crate::park::cross_wake_at(base) {
+        w.poke(COLD_TOKEN);
+    }
+}
+
 /// [`attach_guest_bell`]'s reader half alone: the doorman, and the wake its
 /// open is.
 pub fn guest_doorman<R: std::io::Read + Send + 'static, T: BellTarget + ?Sized + 'static>(
