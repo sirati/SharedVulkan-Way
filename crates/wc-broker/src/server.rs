@@ -90,7 +90,7 @@ struct State<P: Platform> {
     core: Core,
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
     writers: BTreeMap<ConnId, Arc<Mutex<P::Writer>>>,
-    on_drained: Option<Box<dyn FnMut(ObjId, u64) + Send>>,
+    on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
 }
 
 /// A running broker. Cloned into every connection's thread; also what a
@@ -134,7 +134,7 @@ impl<P: Platform> Broker<P> {
                 core,
                 objs: BTreeMap::new(),
                 writers: BTreeMap::new(),
-                on_drained: None,
+                on_drained: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
@@ -168,7 +168,7 @@ impl<P: Platform> Broker<P> {
                     }
                 }
                 Notice::Drained(id, epoch) => {
-                    if let Some(f) = st.on_drained.as_mut() {
+                    for f in st.on_drained.iter_mut() {
                         f(id, epoch);
                     }
                 }
@@ -463,9 +463,18 @@ impl<P: Platform> Broker<P> {
         self.settle(&mut st);
     }
 
-    /// Called with each retiring region whose last lease has ended.
+    /// Add a callback for each retiring region whose last lease has ended.
+    /// Every callback added is called, in order. **They run under the
+    /// broker's lock**: a callback must only hand the event on (send it on a
+    /// channel), never call back into the broker.
     pub fn on_drained(&self, f: Box<dyn FnMut(ObjId, u64) + Send>) {
-        self.lock().on_drained = Some(f);
+        self.lock().on_drained.push(f);
+    }
+
+    /// The processes holding a lease on region `id` now, so that a
+    /// restarted embedder can watch them again.
+    pub fn holders(&self, id: ObjId) -> Vec<Pid> {
+        self.lock().core.holders(id)
     }
 
     pub fn stats(&self) -> crate::core::Stats {
