@@ -13,7 +13,7 @@
 #                      session on a `boot` line, as every wc-launch.exe will
 #
 #   legs: three boots at once; a client in each, with the arena's regions per
-#   session; a wrong key refused while the others run; one session's proxy
+#   session; the nested-compositor globals for one session only; a wrong key refused while the others run; one session's proxy
 #   killed, the others unaffected, its regions reused by the next boot; the
 #   compositor killed and started again; `down` for all and the compositor's
 #   own end; a BAR too small for a third session's region, refused cleanly.
@@ -125,8 +125,8 @@ wait_line() { # FILE REGEX SECS
 user() { printf '%s\n' "$1" | timeout 100 "$SOCAT" -t 100 - UNIX-CONNECT:"$D/user.ctl" 2>&1; }
 # boot TAG INSTALL KEY: as wc-launch.exe asks, one line on the user's socket.
 boot() {
-  local tag=$1 inst=$2 key=$3
-  user "$(printf 'boot\tsession=%s\tinstall=%s\tkey=%s\tcontrol=%s\taudio=0' "$inst-$$-$tag" "$inst" "$key" "$D/ctl-$tag.sock")"
+  local tag=$1 inst=$2 key=$3 extra=${4:-}
+  user "$(printf 'boot\tsession=%s\tinstall=%s\tkey=%s\tcontrol=%s\taudio=0%s' "$inst-$$-$tag" "$inst" "$key" "$D/ctl-$tag.sock" "$extra")"
 }
 request() { printf '%s\n' "$2" | timeout 30 "$SOCAT" -t 30 - UNIX-CONNECT:"$D/ctl-$1.sock" 2>&1; }
 keep_log() { (tail -n +1 -F "$1" 2>/dev/null >"$2" &) ; }
@@ -141,7 +141,7 @@ start_port; start_hub; start_service
 start_compositor 1
 T0=$(date +%s%N)
 for t in a b c; do
-  ( R=$(boot "$t" "wcm$t" "$D/guest-wcm$t.key"); echo "$R" >"$D/boot-$t.reply"; echo "$(ms "$T0")" >"$D/boot-$t.ms" ) &
+  ( R=$(boot "$t" "wcm$t" "$D/guest-wcm$t.key" "$([ $t = c ] && printf '\tnested=1')"); echo "$R" >"$D/boot-$t.reply"; echo "$(ms "$T0")" >"$D/boot-$t.ms" ) &
 done
 wait $(jobs -p | grep -v -e "$PORT" -e "$HUB" -e "$SVC" -e "$COMP") 2>/dev/null
 for t in a b c; do
@@ -172,6 +172,15 @@ for t in a b c; do
 done
 for t in a b c; do R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "status $t: $R" ;; esac; done
 ok "every session answers its own control ring"
+
+if [ -n "$INFO" ]; then
+  say "leg 1c: the nested-compositor globals only for the session that asked (wcmc booted with nested=1)"
+  for t in a c; do request "$t" "raw run info 96 30" >/dev/null; done
+  for t in a c; do wait_line "$D/run/wcm$t-$$-$t/app.log" 'wl_seat|wl_compositor' 15 || bad "no wayland-info output in $t"; done
+  sleep 1
+  grep -q wp_viewporter "$D/run/wcmc-$$-c/app.log" && ok "wcmc's client sees wp_viewporter" || bad "wcmc's client has no wp_viewporter"
+  grep -q wp_viewporter "$D/run/wcma-$$-a/app.log" && bad "wcma's client sees wp_viewporter" || ok "wcma's client does not ($(grep -c 'interface:' "$D/run/wcma-$$-a/app.log") globals against $(grep -c 'interface:' "$D/run/wcmc-$$-c/app.log"))"
+fi
 
 say "leg 2: a wrong key for a fourth installation is refused while the three run"
 R=$(boot d wcmd "$D/wrong.key")

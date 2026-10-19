@@ -33988,18 +33988,18 @@ The proxy reads the geometry from the region, so the host side needs no flag.
 | fill the arena | at most three quarters of the pool (`BarPool::cap`), so another installation always has room for its first region; exhaustion is `err` with the numbers, nobody else's region is touched |
 | take ring slots | at most 28 connections (`ringlink::SLOTS_PER_SESSION`); the 29th is closed |
 | flood its control ring | its own requests wait for their own turn (one `Ctl` per session) |
-| crash its proxy | the next `rtt` probe (every 2 s) and the one after time out: the session ends in about 5 s (measured 4.8–5.0 s), its clients are disconnected, its slots closed |
+| crash its proxy | the next `rtt` probe (every 2 s) and the one after time out: the session ends in about 5 s (measured 4.8–5.9 s over three runs), its clients are disconnected, its slots closed |
 | leave a proxy running after its session ended | its slots are closed and kept out of reuse for 10 s, longer than its 5 s lease; this process's own service threads stop writing first (the control channel is taken away under its lock, the sound ring ends when its slot is closed) |
 | keep a stale descriptor | region ids and session indices are never reused within a compositor's run |
 
 ### 107.6 When the compositor dies
 
-The proxies lose their lease 5 s later (measured 5.08–5.12 s), the service
+The proxies lose their lease 5 s later (measured 4.8–5.2 s), the service
 runs `down` for each, and the next click starts a new compositor whose header
 has a new run id: every old record, region and slot is void because the host
 refuses a header with another run id, and a window granted by the old run is
 refused by `ivshmem_window`'s run check. The harness kills the compositor
-under three sessions and boots all three again in 0.73–0.80 s each.
+under three sessions and boots all three again in 0.2–0.8 s each.
 
 ### 107.7 Measured (`scripts/wc-multi-install.sh`)
 
@@ -34009,12 +34009,13 @@ session's client (it asks for one 15 MB pool).
 
 | leg | result |
 |---|---|
-| three boots at once | located in 615, 768, 949 ms (served one after the other); indices 1, 2, 3; the service took three records from one header page |
+| three boots at once | located in 0.55–1.26 s over four runs (served one after the other, so the last waits for the first two); three distinct indices; the service took three records from one header page |
 | regions | each session: one region of 16 MiB (the growth step) at 0, 16 and 32 MiB; pool 116 MiB, cap 87 MiB per session |
 | every session's own control ring | `status` answered in each |
+| the nested-compositor globals | the session booted with `nested=1` sees `wp_viewporter` (21 globals), another session's `wayland-info` does not (18) |
 | a wrong key for a fourth installation | `REFUSED … does not verify under its key`; the three others still answer |
-| session b's proxy killed (SIGKILL) | ended in 4.8–5.0 s ("its proxy is silent"); its 3 connections closed; its 16 MiB back; a and c answer; b booted again as index 5 and its first region landed where the dead one's was |
-| compositor killed under three sessions | each proxy `LEASE LOST` after 5.08–5.12 s, the service took all three down; a new compositor (new run id) booted all three again in 0.73–0.80 s and granted three regions |
+| session b's proxy killed (SIGKILL) | ended in 4.8–5.9 s ("its proxy is silent"); its 3 connections closed; its 16 MiB back; a and c answer; b booted again as index 5 and its first region landed where the dead one's was |
+| compositor killed under three sessions | each proxy `LEASE LOST` after 4.8–5.2 s, the service took all three down; a new compositor (new run id) booted all three again in 0.2–0.8 s and granted three regions |
 | `down` for all | each session ended within 4–5 s ("its proxy closed the control ring"); the compositor ended 3.96 s after the last (linger 4 s), all 116 MiB back |
 | a 44 MiB BAR (pool 32 MiB) | two sessions granted 16 MiB each; the third refused the 16 MiB step and then its 15 MB pool ("0 bytes free"); the other two still answer |
 
@@ -34022,7 +34023,15 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
 
 ### 107.8 Gates
 
-See the branch's report; the table is filled in when it merges.
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 108 binaries, **3164 passed, 0 failed**, 8 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section wrote (and none in its Windows build of `wc-launch`, `wc-compositor`, `sv-gpu-server`) |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo check -p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 (the macOS launcher compiles the compositor) |
+| `scripts/wc-xref.sh --list` | exit 0, no missing citation |
+| `scripts/wc-multi-install.sh` | `wc-multi-install: OK` (107.7) |
+| `scripts/wc-no-ssh.sh` (one session, §105's path) | `wc-no-ssh: OK`, unchanged |
 
 ### 107.9 Not done, and what the Windows guest has to show
 
