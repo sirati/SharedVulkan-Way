@@ -1690,6 +1690,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-broker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "wc-compositor"
 version = "0.1.0"
 dependencies = [

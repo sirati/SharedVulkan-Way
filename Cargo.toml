@@ -49,6 +49,8 @@ members = [
   "crates/wc-proxy",
   # §105: host integration, per-device audio and opening links and files both ways. Pure.
   "crates/wc-hostint",
+  # §111: the one privileged component per machine, server and client role alike.
+  "crates/wc-broker",
   # §105: the host side's platform calls for it: WASAPI, the shell, the registry; CoreAudio and Launch Services.
   "crates/wc-hostplat",
   # §104: the userspace render node and the dma-buf tokens.
@@ -172,6 +174,7 @@ sv-drm = { path = "crates/sv-drm" }
 wc-transport = { path = "crates/wc-transport" }
 wc-handle = { path = "crates/wc-handle" }
 wc-hostint = { path = "crates/wc-hostint" }
+wc-broker = { path = "crates/wc-broker" }
 wc-hostplat = { path = "crates/wc-hostplat" }
 
 wayland-backend = { path = "vendor/wayland-backend" }
