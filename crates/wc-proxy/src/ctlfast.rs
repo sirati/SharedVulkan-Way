@@ -159,6 +159,11 @@ impl Fast {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.as_slice() {
             ["rtt"] => Answer::Now(Vec::new()),
+            // A payload of N bytes, for measuring what an answer's size costs.
+            ["rtt", n] => match n.parse::<usize>() {
+                Ok(n) if n <= 1 << 20 => Answer::Now(vec![b'.'; n]),
+                _ => Answer::Refused("rtt N: N is 0..=1048576".into()),
+            },
             ["status"] => {
                 let root = std::env::var_os("WC_LAUNCH_RUN").map(PathBuf::from).unwrap_or_else(|| "/tmp/wc-launch".into());
                 let d = root.join(&self.id);

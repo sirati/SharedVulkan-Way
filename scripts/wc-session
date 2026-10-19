@@ -1097,7 +1097,16 @@ proxy)
     SERVICE=0
     [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && SERVICE=1
     [ $SERVICE = 1 ] || [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
-    [ $SERVICE = 1 ] && audio_up "$D" "$ID"
+    # §105.13: the session's PulseAudio starts beside the proxy, not before it;
+    # what it will be is known now, and the proxy only talks to it once the
+    # guest's sound ring announces a device, after this verb has returned.
+    APID=""
+    AUDIO_EXPECT=none
+    if [ $SERVICE = 1 ]; then
+      audio_up "$D" "$ID" & APID=$!
+      if [ "${WC_LAUNCH_AUDIO:-on}" = system ]; then AUDIO_EXPECT=system
+      elif [ "${WC_LAUNCH_AUDIO:-on}" != off ] && pulse_bin pulseaudio >/dev/null 2>&1; then AUDIO_EXPECT=pulse; fi
+    fi
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
     RUN=$(cat "$D/arena.run")
@@ -1132,7 +1141,7 @@ proxy)
         # §103.16 on Windows (§105): the sound ring, the guest's default output
         # a pipe sink on the session's server, paced by the guest's credit.
         PACTL=$(pulse_bin pactl 2>/dev/null)
-        case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+        case "$AUDIO_EXPECT" in
           pulse) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
           system) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
         esac
@@ -1152,6 +1161,7 @@ proxy)
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
+    [ -n "$APID" ] && wait "$APID"
     [ $SERVICE = 1 ] || audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
     # §89: what the proxy made of the rings, in its own words. It attaches

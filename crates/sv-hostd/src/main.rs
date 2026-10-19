@@ -94,9 +94,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // finishes rather than a daemon a script has to remember to kill.
     let clients: usize = arg("--clients").map_or(Ok(2), |s| s.parse())?;
 
-    let run_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .subsec_nanos() as u64
+    // The run id names the shared object (`arena.<run id>`), created with
+    // O_EXCL, so two daemons started in the same instant must not pick the
+    // same one: the clock's nanoseconds alone collided under load (two
+    // `two_processes` runs in 200 died with EEXIST before binding). The pid
+    // makes it unique among live daemons.
+    let run_id = (u64::from(
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.subsec_nanos(),
+    ) ^ (u64::from(std::process::id()) << 32))
         | 1;
     let hostd = Hostd::local(geometry, run_id, generation)?;
     eprintln!(
