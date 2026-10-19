@@ -188,6 +188,11 @@ usage: wc-proxy --upstream <path> [options]
   --sound-prefix P       §103.16: the sound ring's device side, win or mac
                          (default mac): sinks and sources are P.sink.<slug> and
                          P.source.<slug> of the host's device names
+  --sound-pw-node PATH   §106.3: wc-pw-node, and
+  --sound-pipewire SOCK  the session PipeWire's socket: if the pulse server is
+                         PipeWire, every device is a native node that drives
+                         its graph at the pace of the ring's credit, instead of
+                         a pipe module (which drops under PipeWire)
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -351,6 +356,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
             "--sound-prefix" => a.services.sound.get_or_insert_with(Default::default).prefix = next()?,
+            "--sound-pw-node" => a.services.sound.get_or_insert_with(Default::default).pw_node = Some(next()?.into()),
+            "--sound-pipewire" => a.services.sound.get_or_insert_with(Default::default).pipewire = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
