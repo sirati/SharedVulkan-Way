@@ -1,5 +1,5 @@
 //! Per-region handles over the guest-RAM memfd: udmabufs
-//! (waycompose-design.md §108.16, `security-model.md` R43).
+//! (waycompose-design.md §108.15, `security-model.md` R43).
 //!
 //! The broker is the one process that holds QEMU's RAM memfd. A client (an
 //! ICD, a proxy) must reach the pages of the regions it may use and nothing
@@ -150,7 +150,7 @@ mod tests {
     }
 
     /// The real thing, where `/dev/udmabuf` can be opened (root in the test
-    /// VM of §108.16, or a user in group kvm): a sealed memfd, a udmabuf of two
+    /// VM of §108.15, or a user in group kvm): a sealed memfd, a udmabuf of two
     /// of its ranges, mapped; the bytes are the memfd's and nothing else is
     /// reachable through it.
     #[test]

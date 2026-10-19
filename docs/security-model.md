@@ -1566,18 +1566,25 @@ lent and will reuse. What can go wrong, and what holds it:
   every provider of a pool killed together before the host lets go (108.10).
   An administrator can do that; a user's logoff cannot, because the keeper is
   SYSTEM.
-* **The host user can read and write all of the guest's RAM.** Mapping a
-  region needs the RAM backend open, and that file is the whole guest. On
-  testhost it is root's today (QEMU runs as root). The deployment
-  (§108.14) must not simply hand the file to the user's processes:
-  * only the peer service should hold it;
-  * the ICDs and proxies should receive **udmabufs** of exactly their
-    region's runs. QEMU's memfd carries the seals udmabuf requires, which was
-    checked; that hand-out is not built.
-
-  Until it is, every process that maps a region can reach every page of the
-  guest. That is a host-side widening the user must accept explicitly, or
-  wait for.
+* **Who can reach guest RAM on the host.** Mapping any region needs the RAM
+  backend, which is the whole guest.
+  * **Decided (user, 2026-10-19):** only a broker reaches it. The broker runs
+    as its own system user (the VM's user, `windows-vm`, once QEMU runs as
+    that user instead of root) and alone opens the memfd and `/dev/udmabuf`.
+  * Clients (ICDs, proxies, the desktop user's processes) get **udmabufs of
+    exactly their regions** over the broker's socket. The kernel refuses any
+    mapping beyond them (§108.15, tested as root and as an ordinary user).
+  * **Identity:** `SO_PEERCRED` uid, with no keys and no cryptography (user,
+    2026-10-19). A region belongs to the host user its pool serves; that uid
+    and root get handles, nobody else.
+  * **What still trusts the host user:** every process of that uid is one
+    trust domain. One that keeps a udmabuf past its lease's release can still
+    write the region after the guest has reused it, because a dma-buf cannot
+    be revoked. Revocation is cooperative (the lease); only a process's death
+    is enforced by the kernel.
+  * **Until the broker exists** (it is the shared crate's client role),
+    clients open the whole backend by path (`.ram` run lists, lease files).
+    That is the development stand-in and must not be deployed.
 * **A forged or stale stamp points the host at the wrong pages.** The nonce
   is 128 random bits per region and comes from the keeper (a guest process
   can only stamp its own memory, which is its own business). The peer
@@ -1593,7 +1600,18 @@ lent and will reuse. What can go wrong, and what holds it:
   is unavailable to Windows until it is given back. The pool gives back
   idle regions after 30 s (5 min inside the low-water margin) and everything
   on an orderly exit.
-* **Who may ask the keeper.** Its pipe and its sections carry an SDDL of
-  SYSTEM, administrators and interactive users. A product install narrows it
-  to the user's SID. The user's account needs **no** `SeLockMemoryPrivilege`;
-  only the SYSTEM keeper creates large-page sections.
+* **Windows users against each other.** Sections are **unnamed**. The
+  keeper gives each to the asking process by `DuplicateHandle`, after reading
+  the process's user SID at connect. A pool is (SID, name), so user B can
+  neither open, adopt nor free user A's regions. A provider of B that maps
+  the bootstrap after A's provider died marks A's table entries foreign:
+  the host lets go and they are cleared, but nothing is freed, and A's next
+  run frees them. Tested on the test VM with a second user (§108.10).
+  * The first build had named `Global\` sections with an SDDL admitting
+    every interactive user. That was a cross-user hole, found in review and
+    fixed.
+  * The keeper's pipe admits every authenticated user; that grants nothing
+    by itself.
+  * The user's account needs **no** `SeLockMemoryPrivilege`: only the SYSTEM
+    keeper creates large-page sections. The keeper becomes a module of the
+    one privileged Windows service (§111, R44).
