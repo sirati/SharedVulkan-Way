@@ -751,15 +751,16 @@ fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
     if cfg.audio {
         let (vol, log2) = (cfg.audio_volume, log.clone());
         std::thread::Builder::new().name("audio".into()).spawn(move || {
-            match service_channel(sv_transport::wlbytes::OWNER_AUDIO, Duration::from_secs(20)) {
-                Some(ch) => {
-                    log2.say("audio: playing the session's sound from its ring through CoreAudio");
-                    match crate::audio_mac::play(RingReader(ch), vol) {
-                        Ok(st) => log2.say(&st.line()),
-                        Err(e) => log2.say(&format!("audio: {e}")),
+            // §103.16: every CoreAudio device a stream, both directions, on
+            // the sound ring.
+            match (service_channel(sv_transport::wlbytes::OWNER_AUDIO, Duration::from_secs(20)), wc_compositor::shared_control()) {
+                (Some(ch), Some(control)) => {
+                    let l3 = log2.clone();
+                    if let Err(e) = crate::sound_mac::run(ch, &control, vol, move |m: &str| l3.say(m)) {
+                        log2.say(&format!("sound: {e}"));
                     }
                 }
-                None => log2.say("audio: the host opened no sound ring"),
+                _ => log2.say("sound: the host opened no sound ring"),
             }
         }).ok();
     }
