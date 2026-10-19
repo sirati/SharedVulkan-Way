@@ -182,6 +182,23 @@ impl UserMap {
         }
     }
 
+    /// The first mapping of this identity whatever the installation: for what
+    /// belongs to a guest user and not to an installation (the guest GPU
+    /// process's RAM, §108).
+    pub fn resolve_any(&self, server: &str, asker: Asker<'_>) -> Result<&Mapping, String> {
+        let same_user = |a: &str, b: &str| if asker.os == "windows" { a.eq_ignore_ascii_case(b) } else { a == b };
+        self.mappings
+            .iter()
+            .filter(|m| m.server == server)
+            .find(|m| {
+                m.server_user.as_deref().is_some_and(|su| same_user(su, asker.user))
+                    && m.id.as_deref().is_none_or(|id| id == asker.id)
+            })
+            .ok_or_else(|| {
+                format!("{} user {} ({}) is not mapped to any Linux user on this host (users.conf of {server})", asker.os, asker.user, asker.id)
+            })
+    }
+
     /// The transitional mapping for a record with no identity (`-`).
     pub fn resolve_unidentified(&self, server: &str, install: &str) -> Option<&Mapping> {
         self.mappings
@@ -243,6 +260,10 @@ other guest  admin
     #[test]
     fn the_transitional_line_is_per_installation_and_only_for_no_identity() {
         let m = UserMap::parse(CONF).unwrap();
+        // Whatever the installation: the identity's first line.
+        assert_eq!(m.resolve_any("vm", win("guest", "S-1")).unwrap().linux_user, "desk");
+        assert!(m.resolve_any("vm", win("alice", "S-9")).is_err(), "pinned by id");
+        assert!(m.resolve_any("vm", win("-", "S-1")).is_err(), "`-` is never an identity");
         assert_eq!(m.resolve_unidentified("vm", "wcmc").unwrap().linux_user, "desk");
         assert!(m.resolve_unidentified("vm", "wclinux").is_none());
         assert!(m.resolve_unidentified("other", "wcmc").is_none());
