@@ -256,6 +256,22 @@ where
     }
 }
 
+/// The object the buffer's pool was opened from, when it was a name, and where
+/// in that pool the buffer is — without touching the pixels.
+///
+/// ADDED FOR waycompose (§104's follow-up): a compositor that can hand the
+/// object itself to its platform (a Windows `CreateDIBSection` over a section)
+/// needs the name, which [`with_buffer_contents`] does not give.
+/// `Ok(None)` for a pool that arrived as an open descriptor, which has no name.
+pub fn buffer_pool_handle(
+    buffer: &wl_buffer::WlBuffer,
+) -> Result<Option<(crate::utils::os::Handle, BufferData)>, BufferAccessError> {
+    let data = buffer
+        .data::<ShmBufferUserData>()
+        .ok_or(BufferAccessError::NotManaged)?;
+    Ok(data.pool.handle().map(|h| (h, data.data)))
+}
+
 /// Call given closure with the contents of the given buffer for mutable access
 ///
 /// If the buffer is managed by the provided `ShmGlobal`, its contents are

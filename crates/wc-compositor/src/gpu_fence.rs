@@ -158,6 +158,59 @@ fn wait_with(name: &str, seq: u64, limit: Duration) -> Waited {
     }
 }
 
+
+/// Whether record `name` already says `completed >= seq`, without waiting.
+/// `false` for anything that is not a record.
+pub fn reached(name: &str, seq: u64) -> bool {
+    if !record_name_ok(name) {
+        return false;
+    }
+    let g = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(name))
+        .and_then(Record::completed)
+        .is_some_and(|c| c >= seq)
+}
+
+/// The waits that let a commit go on with its frame unfinished, per client
+/// (`K` is a `ClientId`; anything hashable in the tests).
+///
+/// ADDED WHEN §104.12 MET §104.11. A held commit is processed after its wait
+/// returns, so a wait that was `Done` already orders everything after it,
+/// including a window drawn straight from the buffer (§104.12's direct
+/// present). A wait that gave up (`Late`) or could not wait (`Refused`) lets
+/// the commit go on while the GPU may still be writing the frame; drawing that
+/// buffer directly would let GDI read it at whatever moment `WM_PAINT` comes.
+/// The commit after such a wait is therefore drawn from the shadow, unless the
+/// record has got there by the time the commit is processed.
+pub struct Unfinished<K>(HashMap<K, (String, u64)>);
+
+impl<K> Default for Unfinished<K> {
+    fn default() -> Self {
+        Unfinished(HashMap::new())
+    }
+}
+
+impl<K: std::hash::Hash + Eq> Unfinished<K> {
+    /// What `wait(record, seq)` from `client` found.
+    pub fn note(&mut self, client: K, record: &str, seq: u64, waited: &Waited) {
+        match waited {
+            Waited::Done(_) => {
+                self.0.remove(&client);
+            }
+            Waited::Late | Waited::Refused => {
+                self.0.insert(client, (record.to_string(), seq));
+            }
+        }
+    }
+
+    /// For `client`'s next commit of a buffer: is the frame the last wait was
+    /// about still unfinished? Consumes what the wait left, which was about
+    /// this commit only.
+    pub fn take_open(&mut self, client: &K) -> bool {
+        self.0.remove(client).is_some_and(|(record, seq)| !reached(&record, seq))
+    }
+}
 impl GlobalDispatch<WcGpuFenceV1, ()> for State {
     fn bind(
         _state: &mut State,
@@ -173,8 +226,8 @@ impl GlobalDispatch<WcGpuFenceV1, ()> for State {
 
 impl Dispatch<WcGpuFenceV1, ()> for State {
     fn request(
-        _state: &mut State,
-        _client: &Client,
+        state: &mut State,
+        client: &Client,
         _resource: &WcGpuFenceV1,
         request: wc_gpu_fence_v1::Request,
         _data: &(),
@@ -183,7 +236,9 @@ impl Dispatch<WcGpuFenceV1, ()> for State {
     ) {
         if let wc_gpu_fence_v1::Request::Wait { record, seq_hi, seq_lo } = request {
             let seq = (u64::from(seq_hi) << 32) | u64::from(seq_lo);
-            match wait(&record, seq) {
+            let waited = wait(&record, seq);
+            state.fence_unfinished.note(client.id(), &record, seq, &waited);
+            match waited {
                 Waited::Done(d) if d >= Duration::from_millis(2) => {
                     eprintln!("wc-compositor: a GPU frame ({record} >= {seq}) took {d:.1?} more after its commit");
                 }
@@ -206,6 +261,47 @@ mod tests {
             assert_eq!(wait(bad, 1), Waited::Refused);
         }
         assert!(record_name_ok("Local\\sv-fence-412-0-0011223344556677"));
+    }
+
+    /// §104.12 with §104.11: a commit after a wait that gave up is "open" (not
+    /// to be drawn directly) unless its record got there meanwhile; a wait
+    /// that was done, another client, or a second commit leaves nothing open.
+    #[test]
+    fn a_commit_after_a_wait_that_gave_up_is_not_drawn_directly() {
+        let path = std::env::temp_dir().join(format!("sv-fence-{}-1-8899aabbccddeeff", std::process::id()));
+        let name = path.to_str().unwrap().to_string();
+        let mut page = vec![0u8; RECORD_LEN as usize];
+        page[..8].copy_from_slice(RECORD_MAGIC);
+        page[8..16].copy_from_slice(&7u64.to_le_bytes());
+        std::fs::write(&path, &page).unwrap();
+        let set = |v: u64| {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&v.to_le_bytes(), 8).unwrap();
+        };
+
+        let mut u = Unfinished::<u32>::default();
+        let waited = wait_with(&name, 8, Duration::from_millis(5));
+        assert_eq!(waited, Waited::Late);
+        u.note(1, &name, 8, &waited);
+        assert!(!u.take_open(&2), "another client's commit is not affected");
+        assert!(u.take_open(&1), "the frame is still unfinished at the commit");
+        assert!(!u.take_open(&1), "it was about that one commit");
+
+        // Gave up, and the GPU finished before the commit was processed.
+        u.note(1, &name, 8, &Waited::Late);
+        set(8);
+        assert!(!u.take_open(&1));
+
+        // A wait that was done clears what an earlier one left.
+        u.note(1, &name, 9, &Waited::Late);
+        u.note(1, &name, 9, &Waited::Done(Duration::ZERO));
+        assert!(!u.take_open(&1));
+
+        // Not a record at all: never reached.
+        u.note(3, "/etc/passwd", 1, &Waited::Refused);
+        assert!(u.take_open(&3));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

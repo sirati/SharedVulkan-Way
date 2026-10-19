@@ -583,6 +583,25 @@ pub fn create_file_object(path: &str, size: u64) -> io::Result<OwnedObject> {
     Ok(OwnedObject { section, path: Some(path_w) })
 }
 
+impl OwnedObject {
+    /// The section handle, for a Win32 call that takes the object itself.
+    pub fn raw(&self) -> HANDLE {
+        self.section
+    }
+}
+
+/// Open a named section somebody else created, readable and writable, without
+/// mapping it. See `crate::Handle::open_section_object`.
+pub fn open_section_object(name: &str) -> io::Result<OwnedObject> {
+    let name_w = wide(name);
+    // SAFETY: live NUL-terminated name; the handle is not inherited.
+    let section = unsafe { OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, name_w.as_ptr()) };
+    if section.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedObject { section, path: None })
+}
+
 /// Open a shared-memory object somebody else created, for writing, without
 /// taking on the job of deleting it. See `crate::Handle::open_shared_file`.
 pub fn open_file_object(path: &str, size: u64) -> io::Result<OwnedObject> {

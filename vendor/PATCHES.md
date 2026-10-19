@@ -487,6 +487,16 @@ store. Its only caller is the public `with_buffer_contents_mut`, which nothing
 in this project uses; implementing it needs a writable `wc_handle` mapping and a
 decision about section ownership.
 
+**`shm::buffer_pool_handle` and `Pool::handle` are additions, not a port**
+(waycompose-design.md §104.12). The function returns a refcounted clone of the
+`wc_handle::Handle` a buffer's pool was opened from, with the buffer's
+`BufferData`, without touching the pixels; `None` for a pool that arrived as an
+open fd. wc-compositor hands the section behind it to GDI's `CreateDIBSection`
+and draws the window from the client's buffer without reading it. Upstream has
+no counterpart because an fd has no name; the shape it would take there is an
+accessor for the pool's `OwnedFd`, which is what a compositor wanting to import
+an shm pool into a GPU API (or a scanout) would need too.
+
 ### `wayland/virtual_keyboard` — ported rather than gated
 
 `zwp_virtual_keyboard_v1.keymap` hands over a keymap by fd, and
