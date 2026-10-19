@@ -250,45 +250,109 @@ extern "C" fn refill(user: *mut c_void, q: Aq, b: *mut AqBuffer) {
     }
 }
 
+/// The commands an output's queue worker takes.
+enum Ctl {
+    Start,
+    Pause,
+}
+
+/// An output queue, as its worker holds it.
+struct OutQueue(Aq);
+// SAFETY: an AudioQueueRef may be used from any thread.
+unsafe impl Send for OutQueue {}
+
+/// One output device. Its AudioQueue belongs to a worker thread of its own
+/// (§106): making, starting, pausing and disposing of a queue can each be
+/// held by CoreAudio (for as long as a microphone dialog is up, measured),
+/// and none of that may stop the sound ring's thread or hold the state lock.
+/// Data meanwhile waits in `out.buf`, which the session's credit bounds.
 struct Player {
     name: String,
-    q: Aq,
     out: Arc<Out>,
+    ctl: std::sync::mpsc::Sender<Ctl>,
+    /// What the worker was last told: started or not.
     running: bool,
     last: Instant,
 }
 
-// SAFETY: an AudioQueueRef may be used from any thread.
-unsafe impl Send for Player {}
+/// Make the queue for device `uid`; the worker's first step.
+fn new_output(uid: &str, name: &str, out: &Arc<Out>, volume: u8) -> Result<OutQueue, String> {
+    let user = Arc::into_raw(Arc::clone(out)) as *mut c_void;
+    let mut q: Aq = std::ptr::null_mut();
+    let f = format();
+    // SAFETY: a valid format and callback; `user` leaked for the queue's life.
+    let st = unsafe { AudioQueueNewOutput(&f, refill, user, std::ptr::null(), std::ptr::null(), 0, &mut q) };
+    if st != 0 {
+        return Err(format!("AudioQueueNewOutput: OSStatus {st}"));
+    }
+    let st = set_device(q, uid);
+    if st != 0 {
+        // SAFETY: the queue made above, never started.
+        unsafe { AudioQueueDispose(q, 1) };
+        return Err(format!("the queue would not take device {name}: OSStatus {st}"));
+    }
+    // SAFETY: the queue made above.
+    unsafe {
+        AudioQueueSetParameter(q, PARAM_VOLUME, f32::from(volume.min(100)) / 100.0);
+        for _ in 0..AQ_BUFFERS {
+            let mut b: *mut AqBuffer = std::ptr::null_mut();
+            if AudioQueueAllocateBuffer(q, CHUNK_BYTES as u32, &mut b) == 0 {
+                (*b).size = (*b).capacity;
+                std::ptr::write_bytes((*b).data.cast::<u8>(), 0, (*b).capacity as usize);
+                AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
+            }
+        }
+    }
+    Ok(OutQueue(q))
+}
 
 impl Player {
     fn new(stream: u16, d: &Device, link: &Link, volume: u8) -> Result<Player, String> {
         let out = Arc::new(Out { buf: Mutex::new(VecDeque::new()), link: link.clone(), stream, count: Mutex::new(Count::default()) });
-        let user = Arc::into_raw(Arc::clone(&out)) as *mut c_void;
-        let mut q: Aq = std::ptr::null_mut();
-        let f = format();
-        // SAFETY: a valid format and callback; `user` leaked for the queue's life.
-        let st = unsafe { AudioQueueNewOutput(&f, refill, user, std::ptr::null(), std::ptr::null(), 0, &mut q) };
-        if st != 0 {
-            return Err(format!("AudioQueueNewOutput: OSStatus {st}"));
-        }
-        let st = set_device(q, &d.uid);
-        if st != 0 {
-            return Err(format!("the queue would not take device {}: OSStatus {st}", d.name));
-        }
-        // SAFETY: the queue made above.
-        unsafe {
-            AudioQueueSetParameter(q, PARAM_VOLUME, f32::from(volume.min(100)) / 100.0);
-            for _ in 0..AQ_BUFFERS {
-                let mut b: *mut AqBuffer = std::ptr::null_mut();
-                if AudioQueueAllocateBuffer(q, CHUNK_BYTES as u32, &mut b) == 0 {
-                    (*b).size = (*b).capacity;
-                    std::ptr::write_bytes((*b).data.cast::<u8>(), 0, (*b).capacity as usize);
-                    AudioQueueEnqueueBuffer(q, b, 0, std::ptr::null());
+        let (tx, rx) = std::sync::mpsc::channel::<Ctl>();
+        let (uid, name, o2) = (d.uid.clone(), d.name.clone(), Arc::clone(&out));
+        std::thread::Builder::new()
+            .name(format!("out-{stream}"))
+            .spawn(move || {
+                let q = match new_output(&uid, &name, &o2, volume) {
+                    Ok(q) => q,
+                    Err(e) => return eprintln!("wc-launch: sound: {name}: {e}"),
+                };
+                // Until the Player goes (the channel ends).
+                while let Ok(c) = rx.recv() {
+                    // SAFETY: the queue this worker made and alone uses.
+                    let st = unsafe {
+                        match c {
+                            Ctl::Start => AudioQueueStart(q.0, std::ptr::null()),
+                            Ctl::Pause => AudioQueuePause(q.0),
+                        }
+                    };
+                    if st != 0 {
+                        eprintln!("wc-launch: sound: {name}: queue command failed: OSStatus {st}");
+                    }
                 }
+                // SAFETY: as above; the leaked `Arc<Out>` stays, small.
+                unsafe {
+                    AudioQueueStop(q.0, 1);
+                    AudioQueueDispose(q.0, 1);
+                }
+            })
+            .map_err(|e| format!("no thread for {}: {e}", d.name))?;
+        Ok(Player { name: d.name.clone(), out, ctl: tx, running: false, last: Instant::now() })
+    }
+
+    fn command(&mut self, queued: usize) {
+        let idle_for = self.last.elapsed();
+        match wc_hostplat::mac::plan::output_control(self.running, queued, PREBUFFER, idle_for, IDLE_PAUSE) {
+            Some(wc_hostplat::mac::plan::OutCtl::Start) => {
+                self.running = self.ctl.send(Ctl::Start).is_ok();
             }
+            Some(wc_hostplat::mac::plan::OutCtl::Pause) => {
+                let _ = self.ctl.send(Ctl::Pause);
+                self.running = false;
+            }
+            None => {}
         }
-        Ok(Player { name: d.name.clone(), q, out, running: false, last: Instant::now() })
     }
 
     fn push(&mut self, pcm: &[u8]) {
@@ -298,29 +362,12 @@ impl Player {
             b.len()
         };
         self.last = Instant::now();
-        if !self.running && queued >= PREBUFFER {
-            // SAFETY: the queue made in `new`.
-            self.running = unsafe { AudioQueueStart(self.q, std::ptr::null()) } == 0;
-        }
+        self.command(queued);
     }
 
     fn idle(&mut self) {
-        let empty = self.out.buf.lock().map(|b| b.is_empty()).unwrap_or(true);
-        if self.running && empty && self.last.elapsed() > IDLE_PAUSE {
-            // SAFETY: the queue made in `new`.
-            unsafe { AudioQueuePause(self.q) };
-            self.running = false;
-        }
-    }
-}
-
-impl Drop for Player {
-    fn drop(&mut self) {
-        // SAFETY: the queue made in `new`; the leaked `Arc<Out>` stays, small.
-        unsafe {
-            AudioQueueStop(self.q, 1);
-            AudioQueueDispose(self.q, 1);
-        }
+        let queued = self.out.buf.lock().map(|b| b.len()).unwrap_or(0);
+        self.command(queued);
     }
 }
 
@@ -385,6 +432,19 @@ fn open_input(uid: &str, name: &str, inp: &Arc<In>) -> Result<OpenedQueue, Strin
     // by the launcher's fallback (no host bundle), it is refused here
     // rather than have macOS attribute the microphone to a face.
     wc_hostplat::mac::may_capture()?;
+    // The permission first, through AVFoundation: an input queue opened
+    // while it is undecided makes CoreAudio hold every queue start in the
+    // process, the outputs' too, until the user answers (mic.rs).
+    use wc_hostplat::mac::plan::MicAuth;
+    match wc_hostplat::mac::mic::authorization() {
+        MicAuth::Granted => {}
+        MicAuth::Denied => return Err("no microphone permission (System Settings, Privacy, Microphone); the input stays silent".into()),
+        MicAuth::Undetermined => {
+            if !wc_hostplat::mac::mic::request(Duration::from_secs(600)) {
+                return Err("the microphone was not allowed; the input stays silent".into());
+            }
+        }
+    }
     let user = Arc::into_raw(Arc::clone(inp)) as *mut c_void;
     let mut q: Aq = std::ptr::null_mut();
     let f = format();
@@ -449,6 +509,8 @@ impl Recorder {
                 }
                 (Ok(q), None) => {
                     // Stopped (or gone) while macOS was asking.
+                    // Closed after the lock is released, below.
+                    drop(st);
                     close_input(q.0);
                     say(&format!("sound: {name}: opened after the session stopped recording; closed again"));
                 }
@@ -472,7 +534,12 @@ impl Recorder {
         self.opening = false;
         self.generation += 1;
         if let Some(q) = self.q.take() {
-            close_input(q);
+            // Off this thread: the ring's, holding the state lock.
+            let q = OpenedQueue(q);
+            let _ = std::thread::Builder::new().name("mic-close".into()).spawn(move || {
+                let q = q;
+                close_input(q.0)
+            });
         }
     }
 }
