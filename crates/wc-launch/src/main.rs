@@ -834,6 +834,7 @@ mod win {
             sv_transport::frametrace::hop("L.recv");
             us.push(t1.elapsed().as_secs_f64() * 1e6);
         }
+        sv_transport::frametrace::hop_flush();
         let mut sorted = us.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f).round() as usize];

@@ -251,6 +251,25 @@ pub fn mono_ns() -> u64 {
 /// the file every half second, so no hop ever pays for the write.
 struct Hops {
     buf: Mutex<Vec<(u64, &'static str)>>,
+    file: Mutex<std::fs::File>,
+}
+
+impl Hops {
+    /// Write out what is buffered. The buffer is swapped for an empty one of
+    /// the same capacity under the lock, so a hop never waits for the write.
+    fn flush(&self) {
+        let mut taken = Vec::with_capacity(1 << 16);
+        std::mem::swap(&mut taken, &mut *self.buf.lock().unwrap_or_else(|e| e.into_inner()));
+        if taken.is_empty() {
+            return;
+        }
+        let mut out = String::with_capacity(taken.len() * 24);
+        for (ns, name) in taken {
+            use std::fmt::Write as _;
+            let _ = writeln!(out, "{ns} {name}");
+        }
+        let _ = self.file.lock().unwrap_or_else(|e| e.into_inner()).write_all(out.as_bytes());
+    }
 }
 
 fn hops() -> Option<&'static Hops> {
@@ -258,26 +277,24 @@ fn hops() -> Option<&'static Hops> {
     *H.get_or_init(|| {
         let path = std::env::var("WC_HOP_TRACE").ok().filter(|p| !p.is_empty())?;
         let path = path.replace("%p", &std::process::id().to_string());
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
-        let h: &'static Hops = Box::leak(Box::new(Hops { buf: Mutex::new(Vec::with_capacity(1 << 16)) }));
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        let h: &'static Hops =
+            Box::leak(Box::new(Hops { buf: Mutex::new(Vec::with_capacity(1 << 16)), file: Mutex::new(file) }));
         let _ = std::thread::Builder::new().name("hop-trace".into()).spawn(move || {
-            let mut out = String::new();
             loop {
                 std::thread::sleep(Duration::from_millis(500));
-                let taken = std::mem::take(&mut *h.buf.lock().unwrap_or_else(|e| e.into_inner()));
-                if taken.is_empty() {
-                    continue;
-                }
-                out.clear();
-                for (ns, name) in taken {
-                    use std::fmt::Write as _;
-                    let _ = writeln!(out, "{ns} {name}");
-                }
-                let _ = file.write_all(out.as_bytes());
+                h.flush();
             }
         });
         Some(h)
     })
+}
+
+/// Write out the hops stamped so far: for a process about to exit.
+pub fn hop_flush() {
+    if let Some(h) = hops() {
+        h.flush();
+    }
 }
 
 /// Stamp hop `name` now. Nothing when `WC_HOP_TRACE` is unset.
