@@ -415,7 +415,10 @@ fn run_main(cfg: Config) -> ExitCode {
     // RAM disk the hypervisor shares through virtio-fs DAX), which the
     // compositor maps as its ivshmem device and boots as the Windows guest
     // does (§105).
-    let standin = std::env::var("WC_MAC_ARENA_STANDIN").ok().filter(|s| !s.is_empty());
+    let standin = std::env::var("WC_MAC_ARENA_STANDIN")
+        .ok()
+        .or_else(|| Some(cfg.arena_file.clone()))
+        .filter(|s| !s.is_empty());
     let control_socket = rt.join("control.sock");
     let session = Arc::new(Session {
         id: id.clone(),
