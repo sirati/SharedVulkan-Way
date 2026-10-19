@@ -470,45 +470,227 @@ pub fn shared_control() -> Option<Arc<Control>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// §103.15: what page 0 of the ring window tells the host, beyond the stamp.
+/// The launcher sets the session; the arena is noted when it is provided.
+static BOOT_SESSION: std::sync::Mutex<Option<(String, u64, bool)>> = std::sync::Mutex::new(None);
+static ARENA0: std::sync::Mutex<Option<(u64, u32)>> = std::sync::Mutex::new(None);
+/// The host's answer, for the launcher: `None` until there is one.
+static BOOT_STATUS: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mutex::new(None);
+
+/// The launcher, before the compositor starts (§103.15): put a boot record
+/// for session `id` in page 0 of the ring window, so the host's session
+/// service starts the session with no other channel.
+/// `gpu`: the launcher has started the session's GPU server, labelled
+/// `wc_handle::macboot::gpu_label(id)`, for the host to serve.
+pub fn set_boot_session(id: &str, outbound: u64, gpu: bool) {
+    *BOOT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some((id.to_string(), outbound, gpu));
+}
+
+/// The compositor, as it provides arena 0 from guest RAM.
+pub fn note_guest_ram_arena(run: u64, pages: u32) {
+    let mut g = ARENA0.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        *g = Some((run, pages));
+    }
+}
+
+static BELL_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the launcher's ring threads sleep on a lane before looking again
+/// (§103.15): long once the rings have a doorbell, which ends the sleep; a
+/// millisecond without one.
+pub fn ring_wait_slice() -> std::time::Duration {
+    if BELL_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        std::time::Duration::from_millis(500)
+    } else {
+        std::time::Duration::from_millis(1)
+    }
+}
+
+/// The host service's answer to the boot record: `Some(Ok(()))` once it has
+/// located both windows and started the session, `Some(Err(why))` if it
+/// refused, `None` while it has said nothing.
+pub fn boot_status() -> Option<Result<(), String>> {
+    BOOT_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The rings' doorbell before the control region exists: the reader, kept for
+/// the doorman `into_link` starts, and the writer, which says hello now and
+/// rings lanes later.
+pub struct GuestRamBell {
+    pub name: String,
+    reader: Box<dyn Read + Send>,
+    writer: Arc<sv_transport::vdoorbell::PortWake<Box<dyn Write + Send>>>,
+}
+
+impl GuestRamBell {
+    pub fn new(name: &str, port: sv_transport::vdoorbell::PortHandle) -> std::io::Result<GuestRamBell> {
+        let (reader, writer) = port.split()?;
+        Ok(GuestRamBell { name: name.to_string(), reader, writer: Arc::new(sv_transport::vdoorbell::PortWake::new(writer)) })
+    }
+}
+
+static GUEST_RAM_BELL: std::sync::Mutex<Option<GuestRamBell>> = std::sync::Mutex::new(None);
+
+/// Keep the doorbell, opened at startup, for the ring window made later on
+/// the Wayland thread.
+pub fn keep_guest_ram_bell(bell: GuestRamBell) {
+    *GUEST_RAM_BELL.lock().unwrap_or_else(|e| e.into_inner()) = Some(bell);
+}
+
 /// A ring region of guest RAM, stamped and waiting for the host to locate it.
 pub struct PendingRings {
     window: wc_handle::arena::GuestRamWindow,
     geometry: Geometry,
+    bell: Option<GuestRamBell>,
+    /// Whether page 0 carries a boot record, so the answer is read there.
+    booting: bool,
+    last_hello: Option<std::time::Instant>,
 }
 
 impl PendingRings {
     pub fn alloc() -> Result<PendingRings, String> {
+        let bell = GUEST_RAM_BELL.lock().unwrap_or_else(|e| e.into_inner()).take();
         let geometry = Geometry::for_wayland();
+        // §103.15: one page more than the control region. Page 0 is the boot
+        // page (the boot record, the host's answer and its release word) for
+        // the whole session; the control region starts at page 1.
         let (window, run, pages) =
-            wc_handle::arena::stamped_guest_ram_window(geometry.control_size).map_err(|e| e.to_string())?;
+            wc_handle::arena::stamped_guest_ram_window(geometry.control_size + wc_handle::arena::REGION_PAGE as u64)
+                .map_err(|e| e.to_string())?;
         println!(
             "wc-compositor: wayland rings in guest RAM: run 0x{run:016x}, {pages} rings pages, {} bytes, pinning={}",
             window.len, window.pinning
         );
-        Ok(PendingRings { window, geometry })
+        let session = BOOT_SESSION.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let arena = *ARENA0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut booting = false;
+        match (session, arena) {
+            (Some((id, outbound, gpu)), Some((arena_run, arena_pages))) => {
+                let rec = wc_handle::macboot::Record {
+                    session: id.clone(),
+                    arena_run,
+                    arena_pages,
+                    outbound,
+                    rings_run: run,
+                    rings_pages: pages,
+                    gpu,
+                };
+                // SAFETY: page 0 of the window this value owns, mapped and
+                // pinned, and not yet shared with anything but the host's sweep.
+                let page0 = unsafe { std::slice::from_raw_parts_mut(window.base(), wc_handle::arena::REGION_PAGE) };
+                rec.write(page0);
+                booting = true;
+                println!(
+                    "wc-compositor: boot record for session {id} in page 0 of the ring window (arena run 0x{arena_run:016x}, \
+                     {arena_pages} pages); waiting for the host's session service{}",
+                    match &bell {
+                        Some(b) => format!(", hello on {}", b.name),
+                        None => " (no doorbell: its periodic sweep finds it)".into(),
+                    }
+                );
+            }
+            (Some(_), None) => println!("wc-compositor: no boot record: arena 0 is not in guest RAM"),
+            _ => {}
+        }
+        Ok(PendingRings { window, geometry, bell, booting, last_hello: None })
     }
 
-    pub fn located() -> bool {
-        LOCATED.load(std::sync::atomic::Ordering::SeqCst)
+    /// One look at the host's answer, and a hello at most every three seconds
+    /// until there is one (a hello lost, or sent before the service ran, is
+    /// sent again). Returns whether the window may be made a control region.
+    pub fn poll(&mut self) -> bool {
+        if !self.booting {
+            return LOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        // SAFETY: page 0 of this window, which the host writes the state word of.
+        match unsafe { wc_handle::macboot::load_state(self.window.base()) } {
+            wc_handle::macboot::State::Located => {
+                *BOOT_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(()));
+                LOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
+                return true;
+            }
+            wc_handle::macboot::State::Failed => {
+                // SAFETY: as above; the host wrote the message before the state.
+                let page0 = unsafe { std::slice::from_raw_parts(self.window.base(), wc_handle::arena::REGION_PAGE) };
+                let why = wc_handle::macboot::message(page0);
+                let mut st = BOOT_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+                if st.is_none() {
+                    println!("wc-compositor: the host's session service refused the session: {why}");
+                    *st = Some(Err(why));
+                }
+                return false;
+            }
+            wc_handle::macboot::State::Waiting => {}
+        }
+        if let Some(b) = &self.bell
+            && self.last_hello.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+        {
+            sv_transport::park::CrossWake::poke(&*b.writer, sv_transport::park::HELLO_TOKEN);
+            self.last_hello = Some(std::time::Instant::now());
+        }
+        false
     }
 
-    /// Make the control region in the located window.
-    pub fn into_link(self) -> Result<RingLink, String> {
+    /// Make the control region in the located window. With a doorbell, also
+    /// install its writer as this process's cross-VM wake and hand back its
+    /// reader, for a doorman whose target is [`GuestRamWake`].
+    pub fn into_link(self) -> Result<(RingLink, Option<Box<dyn Read + Send>>), String> {
         // SAFETY: the window is leaked below, so the region outlives every
         // user of it; its length is at least the geometry's control size.
         let region = Arc::new(unsafe {
-            sv_transport::region::SharedRegion::from_raw(self.window.base(), self.geometry.control_size as usize)
+            sv_transport::region::SharedRegion::from_raw(
+                self.window.base().add(wc_handle::arena::REGION_PAGE),
+                self.geometry.control_size as usize,
+            )
         });
         std::mem::forget(self.window);
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
         let control = Arc::new(Control::create(region, self.geometry, ids, 1).map_err(|e| e.to_string())?);
         control.stamp_epoch().map_err(|e| e.to_string())?;
         *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
-        println!(
-            "wc-compositor: wayland rings created in guest RAM ({} slots); no doorbell, polled every millisecond",
-            self.geometry.ring_slot_count
-        );
-        Ok(RingLink::over(control))
+        let reader = match self.bell {
+            Some(b) => {
+                println!(
+                    "wc-compositor: wayland rings created in guest RAM ({} slots), doorbell {}",
+                    self.geometry.ring_slot_count, b.name
+                );
+                sv_transport::park::install_cross_wake(Some(b.writer as Arc<dyn sv_transport::park::CrossWake>));
+                BELL_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(b.reader)
+            }
+            None => {
+                println!(
+                    "wc-compositor: wayland rings created in guest RAM ({} slots); no doorbell, polled every millisecond",
+                    self.geometry.ring_slot_count
+                );
+                None
+            }
+        };
+        Ok((RingLink::over(control), reader))
+    }
+}
+
+/// A byte on the guest-RAM rings' port (§103.15): end the Wayland thread's
+/// wait, as [`WakeOnBell`] does, and also wake whoever in this process is
+/// parked on the lane it names: the launcher's control and sound threads,
+/// which block on their rings' bells rather than polling.
+pub struct GuestRamWake {
+    pub waker: crate::tick::Waker,
+    pub control: Arc<Control>,
+}
+
+impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
+    fn rescan(&self, woken: &std::sync::atomic::AtomicU64) {
+        self.waker.wake();
+        sv_transport::vdoorbell::BellTarget::rescan(&*self.control, woken);
+    }
+
+    fn ring_token(&self, token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
+        self.waker.wake();
+        sv_transport::vdoorbell::BellTarget::ring_token(&*self.control, token, woken);
+        woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 }
 
@@ -518,6 +700,11 @@ impl PendingRings {
 pub struct WakeOnBell(pub crate::tick::Waker);
 
 impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
+    /// The loop's turn pumps every ring, so one wake is a rescan.
+    fn rescan(&self, _woken: &std::sync::atomic::AtomicU64) {
+        self.0.wake();
+    }
+
     fn ring_token(&self, _token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
         woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.0.wake();

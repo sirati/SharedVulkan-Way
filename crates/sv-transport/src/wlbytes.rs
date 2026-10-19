@@ -379,6 +379,30 @@ impl ByteChannel {
         self.rx.ctrl().bell(self.endpoint.rx())
     }
 
+    /// Block until this end has something to read, or `timeout` (§103.15).
+    ///
+    /// [`crate::park::Bell`]'s handshake for a reader whose wait is the
+    /// lane's own word: note the wake count, set `parked` so the writer's
+    /// next publish rings (and, across a VM, pokes the doorbell, whose reader
+    /// thread converts the byte into `ring_local` on this word), look once
+    /// more, then sleep. Returns whether there is something to read. Without
+    /// a doorbell nothing ends the sleep early, so a caller polling over a
+    /// bell-less region passes a short timeout.
+    pub fn wait_readable(&self, timeout: std::time::Duration) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        if self.readable()? {
+            return Ok(true);
+        }
+        let bell = self.rx_bell()?;
+        let seen = bell.wake.load(Ordering::Acquire);
+        bell.parked.fetch_add(1, Ordering::SeqCst);
+        if !self.readable()? {
+            crate::park::sys::wait(bell.wake, seen, timeout);
+        }
+        bell.parked.fetch_sub(1, Ordering::SeqCst);
+        self.readable()
+    }
+
     /// Bytes of ring space available to [`Self::write`] right now. Diagnostics,
     /// and the number to print when a connection stalls.
     pub fn free_bytes(&self) -> Result<u64> {

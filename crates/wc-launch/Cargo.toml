@@ -28,6 +28,8 @@ wc-hostplat = { workspace = true }
 wc-compositor = { path = "../wc-compositor" }
 # §103.14: the session's control and sound channels are ring slots.
 sv-transport = { workspace = true }
+# §103.15: the boot record's GPU label.
+wc-handle = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

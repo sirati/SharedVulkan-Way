@@ -1749,6 +1749,7 @@ dependencies = [
  "png",
  "sv-transport",
  "wc-compositor",
+ "wc-handle",
  "wc-hostint",
  "wc-hostplat",
  "windows-sys",

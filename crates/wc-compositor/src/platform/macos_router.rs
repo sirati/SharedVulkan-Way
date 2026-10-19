@@ -87,6 +87,19 @@ struct Surf {
     back: u8,
     w: i32,
     h: i32,
+    /// §103.15: what each surface of the pair has missed since it was last
+    /// written: every present's damage goes to both, and a surface's list is
+    /// copied and cleared when it becomes the back buffer. `None` is "all".
+    stale: [Option<Vec<(i32, i32, i32, i32)>>; 2],
+}
+
+/// §103.15: what the copies into the surfaces cost, for `WC_FACE_LATENCY`.
+#[derive(Default)]
+struct CopyStats {
+    presents: u64,
+    bytes: u64,
+    full_bytes: u64,
+    nanos: u64,
 }
 
 struct Win {
@@ -131,6 +144,20 @@ struct R {
     no_face_since: Option<Instant>,
     /// `WC_FACE_LATENCY=1`: AppKit's event time to this process, in µs.
     latency: Option<Vec<u64>>,
+    copies: CopyStats,
+}
+
+/// WC_FACE_FULL_COPY, or a file `face-full-copy` in the launcher's support
+/// directory (a face-started main process has launchd's environment): copy
+/// whole windows, as before §103.15, for the comparison. Read once.
+fn full_copy() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        std::env::var_os("WC_FACE_FULL_COPY").is_some()
+            || std::env::var_os("HOME").is_some_and(|h| {
+                PathBuf::from(h).join("Library/Application Support/waycompose/face-full-copy").exists()
+            })
+    })
 }
 
 /// Milliseconds of `CLOCK_UPTIME_RAW` and its sub-millisecond rest in µs:
@@ -215,8 +242,15 @@ impl R {
         println!("wc-compositor: window {id} -> face {fid} ({})", self.faces.get(&fid).map_or("?", |f| f.section.as_str()));
     }
 
-    /// Copy the shadow into the back surface and show it.
+    /// Copy the shadow into the back surface and show it: all of it.
     fn present(&mut self, id: WindowId) {
+        self.present_damage(id, None);
+    }
+
+    /// Copy what the back surface has missed (§103.15): the damage of every
+    /// present since it was last the back buffer, which with a pair is this
+    /// present's and the one before. `None` is the whole window.
+    fn present_damage(&mut self, id: WindowId, damage: Option<&[crate::surface::Rect]>) {
         let Some(w) = self.wins.get_mut(&id) else { return };
         let Some(fid) = w.face else { return };
         let Some(port) = self.faces.get(&fid).and_then(|f| f.port) else { return };
@@ -237,14 +271,49 @@ impl R {
             if macmach::send_surfaces(port, id, generation, [&a, &b]) != 0 {
                 return;
             }
-            w.surf = Some(Surf { s: [a, b], back: 0, w: sw, h: sh });
+            w.surf = Some(Surf { s: [a, b], back: 0, w: sw, h: sh, stale: [None, None] });
             fresh = Some(ToFace::Surface { id, generation, w: sw, h: sh, alpha });
         }
         let surf = w.surf.as_mut().expect("surface pair");
         let back = surf.back;
-        surf.s[back as usize].copy_from(s.pixels(), sw, sh);
+        for st in &mut surf.stale {
+            match (st.as_mut(), damage) {
+                (Some(list), Some(d)) => list.extend(d.iter().map(|r| (r.x, r.y, r.w, r.h))),
+                _ => *st = None,
+            }
+        }
+        let t0 = Instant::now();
+        let full = (sw as u64) * (sh as u64) * 4;
+        let copied = match surf.stale[back as usize].take() {
+            // More than half the window: one pass over all of it costs less
+            // than the rectangles' row-by-row walk, and is never wrong.
+            Some(list) if list.iter().map(|r| (r.2.max(0) as u64) * (r.3.max(0) as u64) * 4).sum::<u64>() * 2 < full => {
+                surf.s[back as usize].copy_rects(s.pixels(), sw, sh, &list) as u64
+            }
+            _ => {
+                surf.s[back as usize].copy_from(s.pixels(), sw, sh);
+                full
+            }
+        };
+        surf.stale[back as usize] = Some(Vec::new());
         surf.back ^= 1;
         drop(s);
+        let c = &mut self.copies;
+        c.presents += 1;
+        c.bytes += copied;
+        c.full_bytes += full;
+        c.nanos += t0.elapsed().as_nanos() as u64;
+        if self.latency.is_some() && c.presents % 100 == 0 {
+            println!(
+                "wc-compositor: surface copies, last {} presents: {:.1} MB copied of {:.1} MB in full ({:.1}%), {:.3} ms per present",
+                c.presents,
+                c.bytes as f64 / 1e6,
+                c.full_bytes as f64 / 1e6,
+                100.0 * c.bytes as f64 / c.full_bytes.max(1) as f64,
+                c.nanos as f64 / 1e6 / c.presents as f64
+            );
+            *c = CopyStats::default();
+        }
         if let Some(m) = fresh {
             self.send(fid, &m);
         }
@@ -306,7 +375,15 @@ impl R {
                 }
                 self.forward(id, ToFace::MovePopup { id, x, y, w: width, h: height });
             }
-            ToUi::Present { id, .. } => self.present(id),
+            // WC_FACE_FULL_COPY=1: every present copies the whole window, as
+            // before §103.15, for the comparison.
+            ToUi::Present { id, damage } => {
+                let full = full_copy();
+                if std::env::var_os("WC_FACE_DAMAGE_DEBUG").is_some() {
+                    println!("wc-compositor: present {id}: damage {:?}", damage.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>());
+                }
+                self.present_damage(id, (!full).then_some(&damage[..]))
+            }
             ToUi::ShiftOrigin { id, dx, dy } => self.forward(id, ToFace::ShiftOrigin { id, dx, dy }),
             ToUi::Map { id, width, height, fold_caption } => {
                 let Some(w) = self.wins.get_mut(&id) else { return true };
@@ -680,6 +757,7 @@ impl Router {
             idle: None,
             no_face_since: None,
             latency: std::env::var_os("WC_FACE_LATENCY").map(|_| Vec::new()),
+            copies: CopyStats::default(),
         };
         let mut last_tick = Instant::now();
         loop {
