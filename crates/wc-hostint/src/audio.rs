@@ -443,6 +443,23 @@ mod tests {
         assert_eq!(p[1].node_name, "win.sink.speakers_usb_audio_device_2");
     }
 
+    /// The test guest's real endpoints (QEMU's HDA, German Windows), as
+    /// `wc-hostint-probe` enumerated them: the friendly names keep the
+    /// "2- " instance prefix Windows adds, and the slug keeps its `-`.
+    #[test]
+    fn the_test_guest_s_real_endpoints() {
+        let s = State {
+            devices: vec![
+                dev(Dir::Output, "{0.0.0.00000000}.{e8cd0507-c75f-49a0-a4eb-0178ba4d06bf}", "Lautsprecher (2- High Definition Audio Device)"),
+                dev(Dir::Input, "{0.0.1.00000000}.{d1580365-c840-42bc-9a5c-a1982d29fd36}", "Eingang (2- High Definition Audio Device)"),
+            ],
+            default_output: Some("{0.0.0.00000000}.{e8cd0507-c75f-49a0-a4eb-0178ba4d06bf}".into()),
+            default_input: Some("{0.0.1.00000000}.{d1580365-c840-42bc-9a5c-a1982d29fd36}".into()),
+        };
+        let names: Vec<String> = plan(&s, "win").into_iter().map(|n| n.node_name).collect();
+        assert_eq!(names, ["win.sink.lautsprecher_2-_high_definition_audio_device", "win.source.eingang_2-_high_definition_audio_device"]);
+    }
+
     #[test]
     fn config_golden() {
         let state = State {
