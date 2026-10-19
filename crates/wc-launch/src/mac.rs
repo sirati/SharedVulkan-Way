@@ -542,6 +542,11 @@ fn run_main(cfg: Config) -> ExitCode {
         "--log".into(),
         comp_log.to_string_lossy().into_owned(),
     ]);
+    // §102, as plan::compositor_argv: wp_viewporter among them, which
+    // Firefox sizes its content subsurface with at an output scale above 1.
+    if cfg.nested_globals {
+        argv.push("--nested-compositor-globals".into());
+    }
     // SIGTERM (a shutdown, a logout, a `kill`): take the session down over
     // the control ring and go, so the host stops and releases at once rather
     // than after its lease, and the keeper is not left waiting.
