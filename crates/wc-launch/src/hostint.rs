@@ -23,9 +23,15 @@ use crate::config::App;
 /// host's desktop entry (the shortcut's title until the host has answered),
 /// its file types and its URL schemes.
 pub fn linux_app(section: &str, app: &App, meta: Option<&Meta>) -> LinuxApp {
-    let name = meta.map(|m| m.name.trim()).filter(|n| !n.is_empty()).unwrap_or_else(|| {
-        app.title.strip_suffix(" (Linux)").unwrap_or(&app.title)
-    });
+    // The shortcut's title is this installation's name for the application
+    // ("Firefox (Linux)", "Firefox (Linux HI test)"), so "Open with" tells two
+    // installations apart; the desktop entry's name only when there is none.
+    let title = app.title.trim();
+    let name = if !title.is_empty() {
+        title
+    } else {
+        meta.map(|m| m.name.trim()).filter(|n| !n.is_empty()).unwrap_or("Linux application")
+    };
     let mut mimes = Vec::new();
     let mut schemes = Vec::new();
     for t in meta.map(|m| m.mimes.as_slice()).unwrap_or_default() {
@@ -197,7 +203,7 @@ mod tests {
         )
         .unwrap();
         let la = linux_app("firefox", &app(), Some(&meta));
-        assert_eq!(la.name, "Firefox");
+        assert_eq!(la.name, "Firefox (Linux)", "the shortcut's title, this installation's name");
         assert_eq!(la.mimes, ["text/html"]);
         assert_eq!(la.schemes, ["https", "http"]);
         let p = wc_hostint::assoc::windows_plan(&la, "C:\\wc\\wc-launch.exe", "C:\\wc\\firefox.ico", "wcl", &|_| true);
@@ -208,7 +214,13 @@ mod tests {
         );
         // Before the host answered: the title, and nothing to register.
         let la = linux_app("firefox", &app(), None);
-        assert_eq!(la.name, "Firefox");
+        assert_eq!(la.name, "Firefox (Linux)");
+        // A second installation's title keeps it apart in "Open with".
+        let mut a2 = app();
+        a2.title = "Firefox (Linux HI test)".into();
+        let la2 = linux_app("ffhi", &a2, Some(&meta));
+        let p2 = wc_hostint::assoc::windows_plan(&la2, "C:\\l.exe", "C:\\i.ico", "wchi", &|_| true);
+        assert!(p2.values.iter().any(|v| v.name.is_empty() && v.data == wc_hostint::assoc::RegData::Str("Firefox (Linux HI test)".into())));
         assert!(la.mimes.is_empty() && la.schemes.is_empty());
     }
 

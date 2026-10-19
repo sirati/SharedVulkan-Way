@@ -105,7 +105,9 @@ pub fn windows_plan(
     let pid = progid(&format!("{install}.{}", app.section));
     let classes = "Software\\Classes";
     let pkey = format!("{classes}\\{pid}");
-    let label = format!("{} (Linux)", app.name);
+    // The installation's own title when it already says Linux ("Firefox (Linux
+    // HI test)"), so two installations stay apart in "Open with".
+    let label = if app.name.contains("(Linux") { app.name.clone() } else { format!("{} (Linux)", app.name) };
     let set = |p: &mut RegPlan, key: &str, name: &str, data: RegData| {
         p.values.push(RegValue { key: key.into(), name: name.into(), data })
     };
