@@ -438,6 +438,48 @@ pub fn attach_guest_ram_with(id: u32, size: u64, policy: PagePolicy) -> io::Resu
     })
 }
 
+/// Guest RAM pinned exactly as [`attach_guest_ram`] pins it, for a caller that
+/// writes its own stamps and keeps the region itself rather than in this
+/// crate's arena registry.
+///
+/// waycompose-design.md §103.6: `sv-gpu-server` on macOS takes its session's
+/// extent here. Its pages carry `arena_record`'s stamp (the same magic, run id
+/// and index layout as [`STAMP_MAGIC`], plus the mode and guest tag `sv-hostd`
+/// reads), and the region is a GPU session's, not a compositor arena, so it is
+/// neither stamped nor registered here. What is shared is the part that was
+/// measured: superpages where XNU has them, wired 4 KiB pages where it does not
+/// (§103.3), and the refusal text when neither works.
+pub struct GuestRamWindow {
+    view: crate::platform::MappedView,
+    /// Bytes. May exceed what was asked for: superpages round up to 2 MiB.
+    pub len: usize,
+    /// Whether the pages are pinned (see [`GuestRegion::locked`]).
+    pub locked: bool,
+    /// `superpages`, `wired`, `hugetlb`, `large-pages`, `mlock`, `virtual-lock` or `none`.
+    pub pinning: &'static str,
+}
+
+impl GuestRamWindow {
+    /// The base of the region: `len` bytes, read-write, owned by `self`.
+    pub fn base(&self) -> *mut u8 {
+        self.view.ptr().cast_mut()
+    }
+}
+
+/// Make a [`GuestRamWindow`] of at least `len` bytes under `policy`, calling
+/// `stamp(index, page)` on every [`REGION_PAGE`] of it after it is pinned.
+pub fn alloc_guest_ram_window(
+    len: u64,
+    policy: PagePolicy,
+    stamp: &dyn Fn(u32, &mut [u8]),
+) -> io::Result<GuestRamWindow> {
+    let len = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "region too large"))?;
+    let small = policy == PagePolicy::SmallPagesMayCorruptGuestMemory;
+    let made = platform::alloc_locked_region(len, small, stamp)?;
+    Ok(GuestRamWindow { view: made.view, len: made.len, locked: made.locked, pinning: made.pinning })
+}
+
 // ---------------------------------------------------------------------------
 // IVSHMEM ARENA: a region that is a device, and needs no root to find
 // ---------------------------------------------------------------------------

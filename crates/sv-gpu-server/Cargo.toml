@@ -43,6 +43,12 @@ awe-probe = { path = "../awe-probe" }
 # would be the drift `awe-probe`'s comment above warns about.
 wc-handle = { path = "../wc-handle" }
 
+# macOS (waycompose-design.md §103.6): the session's extent is guest RAM pinned
+# by `wc_handle::arena::alloc_guest_ram_window`, superpages or wired pages, the
+# allocator §103.3 measured for the compositor's arena.
+[target.'cfg(target_os = "macos")'.dependencies]
+wc-handle = { path = "../wc-handle" }
+
 [dev-dependencies]
 # Only so the two sides' shared constants can be *compared* rather than each
 # asserted against a literal. Neither side may depend on the other at run time —
