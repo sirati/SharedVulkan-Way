@@ -120,6 +120,23 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
         print!("{}", wc_hostplat::mac::probe());
         return Some(ExitCode::SUCCESS);
     }
+    if let Some(i) = args.iter().position(|a| a == "--share-test") {
+        // List DIR, read every file's first line, write one file: what the
+        // main process does to the share when it copies into the drop folder.
+        let dir = PathBuf::from(args.get(i + 1).cloned().unwrap_or_default());
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let first = std::fs::read_to_string(e.path()).map(|t| t.lines().next().unwrap_or("").to_string());
+                    println!("{:?}: {:?}", e.file_name(), first.map_err(|e| e.to_string()));
+                }
+            }
+            Err(e) => println!("read_dir {}: {e}", dir.display()),
+        }
+        let p = dir.join("from-mac-host-bundle.txt");
+        println!("write {}: {:?}", p.display(), std::fs::write(&p, "written by org.waycompose.host\n").map_err(|e| e.to_string()));
+        return Some(ExitCode::SUCCESS);
+    }
     if let Some(i) = args.iter().position(|a| a == "--open-test") {
         let root = args.get(i + 1).cloned().unwrap_or_default();
         for l in open_test(&root, &args[(i + 2).min(args.len())..]) {
