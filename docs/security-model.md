@@ -1321,7 +1321,7 @@ the GPU server crashes while `sv-hostd` serves it.
 
 **The doorbells** are R35's hub, holding the VM's two legacy virtio-serial
 ports. A guest process can ring `HELLO_TOKEN`, which costs the host one sweep
-of the guest's memory (about 0.45 s of one core for 4 GiB) when a record
-waits; one that rings it in a loop costs a sweep per hello. The service sweeps
-again only for a new hello, not per byte, and the guest's own launcher rings
-once every 3 s while it waits.
+of the guest's memory (about 0.45 s of one core for 4 GiB). The service sweeps
+at most once a second however often it is rung, so a guest that rings in a
+loop costs the host about half a core; the guest's own launcher rings once
+every 3 s, and only while its record waits.

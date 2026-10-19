@@ -295,6 +295,12 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     loop {
         let tick = Duration::from_secs(2);
         let woke = rx.recv_timeout(tick).is_ok();
+        // At most one sweep a second, however often the guest rings: a
+        // sweep reads all of guest RAM (R40).
+        if woke && let Some(t) = last_sweep {
+            let gap = Duration::from_secs(1).saturating_sub(t.elapsed());
+            std::thread::sleep(gap);
+        }
         while rx.try_recv().is_ok() {}
         let due = !args.sweep.is_zero() && last_sweep.is_none_or(|t| t.elapsed() >= args.sweep);
         if woke || due {
