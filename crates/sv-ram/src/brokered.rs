@@ -1,44 +1,52 @@
 //! The guest-RAM substrate inside the broker daemon (waycompose-design.md
-//! §108.15, §111; security-model.md R43, R44).
+//! §108.15, §111.10; security-model.md R43, R44).
 //!
-//! The broker daemon runs as its own system user. It is the only process on
-//! the host that holds QEMU's RAM memfd and `/dev/udmabuf`. This module is
-//! what it embeds: the [`Peer`](crate::peer::Peer) loop over a pool's region
-//! table, with the broker as the host's other mappers:
+//! The broker daemon (`wc-arena-host sessiond --broker`) runs as its own
+//! system user, the only one on the host that may open QEMU's RAM memfd and
+//! `/dev/udmabuf`. This module is the component it embeds
+//! ([`GuestRamComponent`], a `wc_broker::host::Embedded`): the
+//! [`Peer`](crate::peer::Peer) loop over the GPU pool's region table, with the
+//! broker as the host's other mappers:
 //!
 //! * a region the guest announces is located, mapped and verified as before;
 //!   then it is cut into udmabufs ([`crate::udma`]), each checked against the
-//!   peer's own view, and published to the broker as pool `{pool}.{k}` for
-//!   the one host user the pool serves. Only then is it answered `MAPPED`;
-//! * a client (an ICD, a proxy) asks the broker for `{pool}.{k}`, gets the
-//!   udmabufs, maps each at its fixed place, and holds a lease until it has
-//!   unmapped them;
-//! * on `RETIRING` the region is retired in the broker (its lease holders
-//!   are told), and `UNMAPPED` is answered only once the broker says the last
-//!   lease has ended ([`Publisher::on_drained`]): a closed lease, a closed
-//!   connection, or the holder's exit;
+//!   peer's own view, and published to the broker as pool `gpu.<k>` for the
+//!   one host user the pool serves. Only then is it answered `MAPPED`;
+//! * a client (an ICD, a proxy) asks the broker for `gpu.<k>` (`find`), gets
+//!   the udmabufs, maps each at its fixed place, and holds the lease until it
+//!   has unmapped them;
+//! * on `RETIRING` the region is retired in the broker (its holders are
+//!   told), and `UNMAPPED` is answered only once the broker reports that the
+//!   last lease has ended ([`Publisher::on_drained`]): a closed lease, a
+//!   closed connection, or the holder's exit;
 //! * then the broker's own udmabufs are closed, and the guest frees the
 //!   region.
 //!
-//! A client never sees the memfd, `/proc/<qemu>` or `/dev/udmabuf`: a
+//! A client never sees the memfd, `/proc/<qemu>` or `/dev/udmabuf`. A
 //! udmabuf reaches exactly its region's pages, and the kernel refuses a
 //! mapping past them.
 //!
 //! **The daemon's own restart.** Its leases die with it, while clients may
 //! still map regions. So every published region is recorded in the daemon's
-//! state directory (its runs, which the stamps no longer prove once the
-//! guest has written over them). A new run publishes the recorded regions
-//! the table still holds, so clients can find them again, and it never
-//! answers `UNMAPPED` for one of them: the old run's holders are unknown.
-//! That keeps guest memory allocated, and corrupts nothing (§108.4 rule 3).
+//! state directory: its runs (the stamps no longer prove them once the guest
+//! has written over them) and the processes that hold it (pid and start
+//! time). The record is written when a region is published and on every
+//! beat in which its holders changed. A new run publishes the recorded
+//! regions that the table still holds, so clients can find them again. It
+//! answers `UNMAPPED` for one only when the new broker's leases have drained
+//! *and* every recorded holder has exited. The one gap is a lease taken in
+//! the last beat (250 ms) before the daemon crashed: the record misses it.
+//! The broker owner was asked for a hook that runs before a lease's fds are
+//! sent; with it, this gap closes.
 
 use crate::peer::{Mapped, Mappers, Peer, PeerEvent};
-use crate::peerloop::{self, Waker};
+use crate::peerloop::{self, Ram, TableOff, Waker};
 use crate::udma::{self, Limits, Part};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use sv_transport::lpstamp::UNIT;
 use sv_transport::regiontab::PState;
 
@@ -52,10 +60,13 @@ pub trait Publisher: Send + Sync + 'static {
     fn retire(&self, id: u64);
     /// The region is gone: the broker's own fds are closed.
     fn unpublish(&self, id: u64);
-    /// `f(id, epoch)` for every retiring region whose last lease has ended.
-    /// It may be called from inside [`Publisher::retire`] and from the
-    /// broker's threads, with the broker's lock held: it must not call back.
+    /// Adds `f(id, epoch)`, called for every retiring region whose last
+    /// lease has ended. It may be called from inside [`Publisher::retire`]
+    /// and from the broker's threads, with the broker's lock held, so it must
+    /// not call back.
     fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>);
+    /// The processes holding a lease on region `id`.
+    fn holders(&self, id: u64) -> Vec<u32>;
 }
 
 impl Publisher for wc_broker::server::Broker<wc_broker::sys::unix::Unix> {
@@ -71,6 +82,9 @@ impl Publisher for wc_broker::server::Broker<wc_broker::sys::unix::Unix> {
     }
     fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>) {
         wc_broker::server::Broker::on_drained(self, f)
+    }
+    fn holders(&self, id: u64) -> Vec<u32> {
+        wc_broker::server::Broker::holders(self, id)
     }
 }
 
@@ -88,20 +102,89 @@ pub fn udmabufs() -> Box<MakeParts> {
     Box::new(move |fd, runs| udma::create(fd, runs, l))
 }
 
+/// Whose the regions are.
+pub enum Owner {
+    /// One fixed uid.
+    Uid(u32),
+    /// The Linux user the live sessions run as: the guest's GPU process and
+    /// its compositor are one guest user, whom users.conf maps to one Linux
+    /// user. A region announced before any session is up waits for one, up
+    /// to [`Owner::WAIT`]; sessions of two different users at once are
+    /// refused, never guessed between.
+    Sessions(Box<dyn Fn() -> Vec<u32> + Send>),
+}
+
+impl Owner {
+    pub const WAIT: Duration = Duration::from_secs(10);
+
+    fn resolve(&self) -> Result<u32, String> {
+        match self {
+            Owner::Uid(u) => Ok(*u),
+            Owner::Sessions(f) => {
+                let t = Instant::now();
+                loop {
+                    let mut uids = f();
+                    uids.sort_unstable();
+                    uids.dedup();
+                    match uids.as_slice() {
+                        [u] => return Ok(*u),
+                        [] if t.elapsed() < Self::WAIT => std::thread::sleep(Duration::from_millis(50)),
+                        [] => return Err(format!("no session is up after {} s: nobody to publish the region for", Self::WAIT.as_secs())),
+                        many => return Err(format!("sessions of uids {many:?} are up at once: whose region this is cannot be told")),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A process, by pid and start time (field 22 of `/proc/PID/stat`), so a
+/// reused pid is not taken for the holder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Proc {
+    pub pid: u32,
+    pub start: u64,
+}
+
+impl Proc {
+    /// `None`: the process is gone.
+    pub fn of(pid: u32) -> Option<Proc> {
+        let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command is in parentheses and may hold spaces; fields follow
+        // the last ')'.
+        let rest = &s[s.rfind(')')? + 1..];
+        let start = rest.split_whitespace().nth(19)?.parse().ok()?;
+        Some(Proc { pid, start })
+    }
+
+    /// Whether this process still runs. A `/proc` that cannot be read at all
+    /// (another user's, under `hidepid`) counts as running: a wrong "gone"
+    /// would answer `UNMAPPED` early, and a wrong "running" only holds memory.
+    pub fn alive(&self) -> bool {
+        match std::fs::read_to_string(format!("/proc/{}/stat", self.pid)) {
+            Ok(_) => Proc::of(self.pid) == Some(*self),
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
+    }
+}
+
 struct Published {
     id: u64,
     epoch: u64,
     runs: Vec<(u64, u64)>,
     retiring: bool,
-    /// Published by a previous run of the daemon: its holders are unknown.
-    inherited: bool,
+    /// The holders as last recorded.
+    holders: BTreeSet<Proc>,
+    /// From a previous run of the daemon: these processes may still map it.
+    inherited: BTreeSet<Proc>,
     held_logged: bool,
 }
 
 /// The broker as the peer's [`Mappers`].
 pub struct BrokerMappers {
     publisher: Arc<dyn Publisher>,
-    uid: u32,
+    owner: Owner,
+    uid: Option<u32>,
     pool: String,
     make: Box<MakeParts>,
     live: BTreeMap<u32, Published>,
@@ -142,30 +225,56 @@ fn verify(p: &Part, view: &sv_transport::region::SharedRegion) -> Result<(), Str
     }
 }
 
+fn procs_text(p: &BTreeSet<Proc>) -> String {
+    if p.is_empty() {
+        return "-".into();
+    }
+    p.iter().map(|p| format!("{}@{}", p.pid, p.start)).collect::<Vec<_>>().join(",")
+}
+
+fn parse_procs(s: &str) -> Option<BTreeSet<Proc>> {
+    if s == "-" {
+        return Some(BTreeSet::new());
+    }
+    s.split(',')
+        .map(|w| w.split_once('@').and_then(|(p, t)| Some(Proc { pid: p.parse().ok()?, start: t.parse().ok()? })))
+        .collect()
+}
+
+/// One record of the state file.
+struct Record {
+    k: u32,
+    epoch: u64,
+    runs: Vec<(u64, u64)>,
+    holders: BTreeSet<Proc>,
+}
+
 impl BrokerMappers {
     /// `state`: the daemon's private directory, where published regions are
     /// recorded across its restarts.
-    pub fn new(publisher: Arc<dyn Publisher>, uid: u32, pool: &str, make: Box<MakeParts>, state: Option<PathBuf>, waker: Waker) -> BrokerMappers {
+    pub fn new(publisher: Arc<dyn Publisher>, owner: Owner, pool: &str, make: Box<MakeParts>, state: Option<PathBuf>, waker: Waker) -> BrokerMappers {
         let drained = Arc::new(Mutex::new(BTreeSet::new()));
         let d = Arc::clone(&drained);
         publisher.on_drained(Box::new(move |id, _epoch| {
             d.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
             waker.wake();
         }));
-        BrokerMappers { publisher, uid, pool: pool.to_string(), make, live: BTreeMap::new(), drained, state }
+        BrokerMappers { publisher, owner, uid: None, pool: pool.to_string(), make, live: BTreeMap::new(), drained, state }
     }
 
     fn state_file(&self) -> Option<PathBuf> {
         self.state.as_ref().map(|d| d.join(format!("{}.regions", self.pool)))
     }
 
-    /// Record what is published (atomically, mode 0600 in a private dir).
+    /// Record what is published and who holds it (atomically, in the daemon's
+    /// private directory).
     fn save(&self) {
         let Some(path) = self.state_file() else { return };
         let mut s = String::new();
         for (k, p) in &self.live {
             let runs: Vec<String> = p.runs.iter().map(|(o, l)| format!("{o}:{l}")).collect();
-            s.push_str(&format!("region {k} {} {}\n", p.epoch, runs.join(",")));
+            let all: BTreeSet<Proc> = p.holders.union(&p.inherited).copied().collect();
+            s.push_str(&format!("region {k} {} {} {}\n", p.epoch, runs.join(","), procs_text(&all)));
         }
         let tmp = path.with_extension("tmp");
         if let Err(e) = std::fs::write(&tmp, s).and_then(|_| std::fs::rename(&tmp, &path)) {
@@ -173,26 +282,41 @@ impl BrokerMappers {
         }
     }
 
-    fn load(&self) -> Vec<(u32, u64, Vec<(u64, u64)>)> {
+    fn load(&self) -> Vec<Record> {
         let Some(path) = self.state_file() else { return Vec::new() };
         let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
         let mut out = Vec::new();
         for l in text.lines() {
             let w: Vec<&str> = l.split(' ').collect();
-            let ["region", k, e, runs] = w.as_slice() else { continue };
-            let (Ok(k), Ok(e)) = (k.parse(), e.parse()) else { continue };
+            let ["region", k, e, runs, holders] = w.as_slice() else {
+                say(&format!("{}: a line this run cannot read: {l:?}", path.display()));
+                continue;
+            };
+            let (Ok(k), Ok(epoch)) = (k.parse(), e.parse()) else { continue };
             let runs: Option<Vec<(u64, u64)>> = runs
                 .split(',')
                 .map(|r| r.split_once(':').and_then(|(o, l)| Some((o.parse().ok()?, l.parse().ok()?))))
                 .collect();
-            if let Some(runs) = runs {
-                out.push((k, e, runs));
+            if let (Some(runs), Some(holders)) = (runs, parse_procs(holders)) {
+                out.push(Record { k, epoch, runs, holders });
             }
         }
         out
     }
 
-    fn publish_parts(&mut self, k: u32, epoch: u64, runs: &[(u64, u64)], ram: BorrowedFd<'_>, view: Option<&sv_transport::region::SharedRegion>) -> Result<u64, String> {
+    fn owner_uid(&mut self) -> Result<u32, String> {
+        let u = self.owner.resolve()?;
+        if let Some(prev) = self.uid
+            && prev != u
+            && !self.live.is_empty()
+        {
+            return Err(format!("the pool's regions are uid {prev}'s, and the sessions now are uid {u}'s"));
+        }
+        self.uid = Some(u);
+        Ok(u)
+    }
+
+    fn publish_parts(&mut self, uid: u32, k: u32, epoch: u64, runs: &[(u64, u64)], ram: BorrowedFd<'_>, view: Option<&sv_transport::region::SharedRegion>) -> Result<u64, String> {
         let parts = (self.make)(ram, runs).map_err(|e| format!("making the udmabufs: {e}"))?;
         if let Some(v) = view {
             for p in &parts {
@@ -202,27 +326,43 @@ impl BrokerMappers {
         let n = parts.len();
         let pieces = parts.into_iter().map(|p| (p.fd, p.offset, p.len)).collect();
         let name = region_pool(&self.pool, k);
-        let id = self.publisher.publish(self.uid, &name, epoch, pieces);
-        say(&format!("region {k} (epoch {epoch}, {} MiB, {n} udmabuf(s)) published as {name}, broker region {id}, for uid {}", runs.iter().map(|r| r.1).sum::<u64>() >> 20, self.uid));
+        let id = self.publisher.publish(uid, &name, epoch, pieces);
+        say(&format!("region {k} (epoch {epoch}, {} MiB, {n} udmabuf(s)) published as {name}, broker region {id}, for uid {uid}", runs.iter().map(|r| r.1).sum::<u64>() >> 20));
         Ok(id)
     }
 
     /// After a restart of the daemon: publish again what the previous run
-    /// published and the table still holds (same region, same epoch).
+    /// published and the table still holds (same region, same epoch), for
+    /// the previous run's holders to find again; it is answered `UNMAPPED`
+    /// only once they have all exited.
     pub fn inherit(&mut self, peer: &Peer) {
-        for (k, epoch, runs) in self.load() {
+        for r in self.load() {
             let live = (1..=sv_transport::regiontab::ENTRIES)
                 .map(|i| peer.table().entry(i))
-                .any(|e| e.region == k && e.epoch == epoch && e.pstate != PState::Empty);
+                .any(|e| e.region == r.k && e.epoch == r.epoch && e.pstate != PState::Empty);
             if !live {
                 continue;
             }
-            match self.publish_parts(k, epoch, &runs, peer.ram(), None) {
-                Ok(id) => {
-                    say(&format!("region {k} (epoch {epoch}): published by the previous run; it is never answered UNMAPPED by this one, whose holders are unknown"));
-                    self.live.insert(k, Published { id, epoch, runs, retiring: false, inherited: true, held_logged: false });
+            let alive: BTreeSet<Proc> = r.holders.iter().copied().filter(Proc::alive).collect();
+            let uid = match self.owner_uid() {
+                Ok(u) => u,
+                Err(e) => {
+                    // Not reachable for anyone now; still never answered
+                    // while its old holders live.
+                    say(&format!("region {} (epoch {}) of the previous run is not published again: {e}", r.k, r.epoch));
+                    if !alive.is_empty() {
+                        say(&format!("region {}: held for the previous run's holders {}", r.k, procs_text(&alive)));
+                    }
+                    self.live.insert(r.k, Published { id: u64::MAX, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
+                    continue;
                 }
-                Err(e) => say(&format!("region {k} (epoch {epoch}) of the previous run: {e}")),
+            };
+            match self.publish_parts(uid, r.k, r.epoch, &r.runs, peer.ram(), None) {
+                Ok(id) => {
+                    say(&format!("region {} (epoch {}): published by the previous run; its holders then: {}, alive now: {}", r.k, r.epoch, procs_text(&r.holders), procs_text(&alive)));
+                    self.live.insert(r.k, Published { id, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
+                }
+                Err(e) => say(&format!("region {} (epoch {}) of the previous run: {e}", r.k, r.epoch)),
             }
         }
         self.save();
@@ -236,12 +376,17 @@ impl BrokerMappers {
 
 impl Mappers for BrokerMappers {
     fn publish(&mut self, m: &Mapped, ram: BorrowedFd<'_>) -> Result<(), String> {
-        if let Some(old) = self.live.remove(&m.k) {
-            say(&format!("region {}: a new epoch {} while epoch {} was published; the old one is retired", m.k, m.epoch, old.epoch));
-            self.publisher.retire(old.id);
+        if let Some(old) = self.live.get(&m.k)
+            && old.epoch != m.epoch
+        {
+            // The peer let the old epoch go only after `let_go` said so, so
+            // a record here is one the table replaced; a host mapper of it
+            // would be a bug elsewhere, so it stays held, never reused.
+            return Err(format!("region {} of epoch {} is still published", m.k, old.epoch));
         }
-        let id = self.publish_parts(m.k, m.epoch, &m.runs, ram, Some(&m.view))?;
-        self.live.insert(m.k, Published { id, epoch: m.epoch, runs: m.runs.clone(), retiring: false, inherited: false, held_logged: false });
+        let uid = self.owner_uid()?;
+        let id = self.publish_parts(uid, m.k, m.epoch, &m.runs, ram, Some(&m.view))?;
+        self.live.insert(m.k, Published { id, epoch: m.epoch, runs: m.runs.clone(), retiring: false, holders: BTreeSet::new(), inherited: BTreeSet::new(), held_logged: false });
         self.save();
         Ok(())
     }
@@ -254,39 +399,61 @@ impl Mappers for BrokerMappers {
         }
         if !p.retiring {
             p.retiring = true;
-            let id = p.id;
-            // May report the drain at once (no lease): the callback only
-            // takes `drained`, which is not held here.
-            self.publisher.retire(id);
+            if p.id != u64::MAX {
+                // May report the drain at once (no lease): the callback only
+                // takes `drained`, which is not held here.
+                self.publisher.retire(p.id);
+            }
             say(&format!("region {k} (epoch {epoch}): retiring; UNMAPPED once its last lease has ended"));
         }
         let p = self.live.get_mut(&k).expect("present");
-        let drained = self.drained.lock().unwrap_or_else(|e| e.into_inner()).contains(&p.id);
+        let drained = p.id == u64::MAX || self.drained.lock().unwrap_or_else(|e| e.into_inner()).contains(&p.id);
         if !drained {
             return false;
         }
-        if p.inherited {
+        p.inherited.retain(Proc::alive);
+        if !p.inherited.is_empty() {
             if !p.held_logged {
                 p.held_logged = true;
-                say(&format!("region {k} (epoch {epoch}): drained, but a previous run of this daemon published it; held"));
+                say(&format!("region {k} (epoch {epoch}): drained here, but held for the previous run's holders {}", procs_text(&p.inherited)));
             }
             return false;
         }
         let id = p.id;
-        self.drained.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-        self.publisher.unpublish(id);
+        if id != u64::MAX {
+            self.drained.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.publisher.unpublish(id);
+        }
         self.live.remove(&k);
         self.save();
         say(&format!("region {k} (epoch {epoch}): drained; the broker's udmabufs are closed"));
         true
+    }
+
+    fn tick(&mut self) {
+        let mut changed = false;
+        for p in self.live.values_mut() {
+            if p.id == u64::MAX {
+                continue;
+            }
+            let now: BTreeSet<Proc> = self.publisher.holders(p.id).into_iter().filter_map(Proc::of).collect();
+            let before = p.inherited.len();
+            p.inherited.retain(Proc::alive);
+            if now != p.holders || p.inherited.len() != before {
+                p.holders = now;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
     }
 }
 
 /// How the daemon serves one pool.
 pub struct Config {
     pub peer: peerloop::Config,
-    /// The host user the pool's regions are for.
-    pub uid: u32,
+    pub owner: Owner,
     /// The pool's name; region `k` is found as `{pool}.{k}`.
     pub pool: String,
     /// The daemon's private state directory.
@@ -294,7 +461,8 @@ pub struct Config {
 }
 
 /// Run the pool's peer in a thread of the daemon, publishing through
-/// `publisher`. Returns once the table is attached; the thread runs for the
+/// `publisher`. Returns once the table is attached (which waits for the GPU
+/// pool to publish it, under [`TableOff::Auto`]); the thread runs for the
 /// daemon's life.
 pub fn spawn(publisher: Arc<dyn Publisher>, cfg: Config) -> Result<std::thread::JoinHandle<()>, String> {
     spawn_with(publisher, cfg, udmabufs())
@@ -304,32 +472,33 @@ pub fn spawn_with(publisher: Arc<dyn Publisher>, cfg: Config, make: Box<MakePart
     if let Some(d) = &cfg.state {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    let (waker, rx) = peerloop::channel();
-    let (tx, ready) = std::sync::mpsc::channel::<Result<(), String>>();
-    let h = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(format!("guest-ram-{}", cfg.pool))
         .spawn(move || {
-            let mut a = match peerloop::attach(&cfg.peer) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
+            // The guest may start its GPU process long after the daemon:
+            // attach waits for the table, and a failure is retried.
+            let mut a = loop {
+                match peerloop::attach(&cfg.peer) {
+                    Ok(a) => break a,
+                    Err(e) => {
+                        say(&format!("pool {}: not attached yet: {e}; again in 5 s", cfg.pool));
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
                 }
             };
             say(&format!(
-                "pool {} for uid {}: bootstrap {} ({} MiB), guest RAM {} ({} MiB), table at +{}",
+                "pool {}: bootstrap {} ({} MiB), guest RAM {} ({} MiB), table at +{}",
                 cfg.pool,
-                cfg.uid,
                 cfg.peer.boot.display(),
                 a.boot_len >> 20,
                 a.ram_path.display(),
                 a.ram_len >> 20,
                 a.peer.table_off()
             ));
-            let mut m = BrokerMappers::new(publisher, cfg.uid, &cfg.pool, make, cfg.state.clone(), waker.clone());
+            let (waker, rx) = peerloop::channel();
+            let mut m = BrokerMappers::new(publisher, cfg.owner, &cfg.pool, make, cfg.state.clone(), waker.clone());
             m.inherit(&a.peer);
             a.peer.set_mappers(Box::new(m));
-            let _ = tx.send(Ok(()));
             let r = peerloop::run(a, &cfg.peer, waker, rx, |_| {}, |_, evs| {
                 for e in evs {
                     match e {
@@ -346,11 +515,78 @@ pub fn spawn_with(publisher: Arc<dyn Publisher>, cfg: Config, make: Box<MakePart
                 say(&format!("pool {}: the peer stopped: {e}", cfg.pool));
             }
         })
-        .map_err(|e| e.to_string())?;
-    match ready.recv() {
-        Ok(Ok(())) => Ok(h),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("the guest-RAM thread ended before attaching".into()),
+        .map_err(|e| e.to_string())
+}
+
+/// The component the broker daemon embeds (`wc_broker::host::Embedded`),
+/// made from its `--guest-ram-*` flags.
+pub struct GuestRamComponent {
+    flags: wc_broker::host::GuestRam,
+    state: Option<PathBuf>,
+    started: Mutex<bool>,
+}
+
+impl GuestRamComponent {
+    /// `None` when the flags do not ask for guest RAM. `state`: the daemon's
+    /// private state directory.
+    pub fn new(flags: wc_broker::host::GuestRam, state: Option<PathBuf>) -> Result<Option<GuestRamComponent>, String> {
+        if !flags.wanted() {
+            return Ok(None);
+        }
+        if flags.boot.is_none() {
+            return Err("guest RAM needs --guest-ram-boot or --gpu-region: the file whose page 0 holds the GPU pool's header".into());
+        }
+        if flags.bell.as_deref().is_some_and(|b| sv_transport::brokered::service(b).is_some()) {
+            return Err("--guest-ram-bell: this daemon is the broker; give the hub's socket path".into());
+        }
+        Ok(Some(GuestRamComponent { flags, state, started: Mutex::new(false) }))
+    }
+
+    fn config(&self, sessions: &wc_broker::host::SessionsView) -> Config {
+        use wc_broker::host::{GuestRamUser, QemuRam};
+        let ram = match self.flags.qemu.clone().expect("wanted") {
+            QemuRam::Pid(p) => Ram::QemuPid(p),
+            QemuRam::PidFile(f) => Ram::QemuPidFile(f),
+            QemuRam::File(f) => Ram::Path(f),
+        };
+        let owner = match self.flags.user {
+            Some(GuestRamUser::Uid(u)) => Owner::Uid(u),
+            // `mapped`, and the default: whom the live sessions run as, which
+            // the daemon already mapped through users.conf.
+            Some(GuestRamUser::Mapped) | None => {
+                let s = sessions.clone();
+                Owner::Sessions(Box::new(move || s.all().into_iter().map(|s| s.uid).collect()))
+            }
+        };
+        Config {
+            peer: peerloop::Config {
+                boot: self.flags.boot.clone().expect("checked in new"),
+                table_off: TableOff::Auto,
+                ram,
+                bell: self.flags.bell.clone().map(PathBuf::from),
+            },
+            owner,
+            pool: "gpu".into(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl wc_broker::host::Embedded for GuestRamComponent {
+    fn name(&self) -> &str {
+        "guest RAM (§108)"
+    }
+
+    fn attach(&self, broker: &wc_broker::server::Broker<wc_broker::sys::unix::Unix>, sessions: &wc_broker::host::SessionsView) {
+        let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
+        if *started {
+            return;
+        }
+        let publisher: Arc<dyn Publisher> = Arc::new(broker.clone());
+        match spawn(publisher, self.config(sessions)) {
+            Ok(_) => *started = true,
+            Err(e) => say(&format!("not started: {e}")),
+        }
     }
 }
 
@@ -391,21 +627,27 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         log: Mutex<Vec<String>>,
-        leases: Mutex<BTreeMap<u64, u32>>,
+        /// id -> lease holders' pids (one entry per lease)
+        leases: Mutex<BTreeMap<u64, Vec<u32>>>,
         retiring: Mutex<BTreeSet<u64>>,
         next: Mutex<u64>,
-        cb: Mutex<Option<Box<dyn FnMut(u64, u64) + Send>>>,
+        cb: Mutex<Vec<Box<dyn FnMut(u64, u64) + Send>>>,
         pieces: Mutex<BTreeMap<u64, Vec<(u64, u64)>>>,
     }
 
     impl Fake {
+        fn open(&self, id: u64, pid: u32) {
+            self.leases.lock().unwrap().get_mut(&id).unwrap().push(pid);
+        }
         fn close(&self, id: u64) {
             let mut l = self.leases.lock().unwrap();
-            let n = l.get_mut(&id).unwrap();
-            *n -= 1;
-            if *n == 0 && self.retiring.lock().unwrap().contains(&id) {
+            let v = l.get_mut(&id).unwrap();
+            v.pop();
+            if v.is_empty() && self.retiring.lock().unwrap().contains(&id) {
                 drop(l);
-                (self.cb.lock().unwrap().as_mut().unwrap())(id, 0);
+                for f in self.cb.lock().unwrap().iter_mut() {
+                    f(id, 0);
+                }
             }
         }
     }
@@ -416,28 +658,42 @@ mod tests {
             *n += 1;
             self.log.lock().unwrap().push(format!("publish {uid} {pool} {epoch} {}", pieces.len()));
             self.pieces.lock().unwrap().insert(*n, pieces.iter().map(|p| (p.1, p.2)).collect());
-            self.leases.lock().unwrap().insert(*n, 0);
+            self.leases.lock().unwrap().insert(*n, Vec::new());
             *n
         }
         fn retire(&self, id: u64) {
             self.log.lock().unwrap().push(format!("retire {id}"));
             self.retiring.lock().unwrap().insert(id);
-            if self.leases.lock().unwrap().get(&id) == Some(&0) {
-                (self.cb.lock().unwrap().as_mut().unwrap())(id, 0);
+            if self.leases.lock().unwrap().get(&id).is_none_or(|v| v.is_empty()) {
+                for f in self.cb.lock().unwrap().iter_mut() {
+                    f(id, 0);
+                }
             }
         }
         fn unpublish(&self, id: u64) {
             self.log.lock().unwrap().push(format!("unpublish {id}"));
         }
         fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>) {
-            *self.cb.lock().unwrap() = Some(f);
+            self.cb.lock().unwrap().push(f);
+        }
+        fn holders(&self, id: u64) -> Vec<u32> {
+            let mut v = self.leases.lock().unwrap().get(&id).cloned().unwrap_or_default();
+            v.sort_unstable();
+            v.dedup();
+            v
         }
     }
 
     struct Rig {
-        _dir: PathBuf,
+        dir: PathBuf,
         boot: std::fs::File,
         ram_path: PathBuf,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn rig(units: u64) -> Rig {
@@ -450,11 +706,11 @@ mod tests {
         let bp = dir.join("boot");
         let boot = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&bp).unwrap();
         boot.set_len(TABLE_LEN + 4096).unwrap();
-        Rig { _dir: dir, boot, ram_path }
+        Rig { dir, boot, ram_path }
     }
 
     fn view(f: &std::fs::File) -> SharedRegion {
-        SharedRegion::map_fd(f.as_fd(), 0, (TABLE_LEN + 4096) as usize).unwrap()
+        SharedRegion::map_fd(std::os::fd::AsFd::as_fd(f), 0, (TABLE_LEN + 4096) as usize).unwrap()
     }
 
     fn peer(r: &Rig) -> Peer {
@@ -462,9 +718,14 @@ mod tests {
         Peer::attach(view(&r.boot), 4096, ram, 7).unwrap()
     }
 
+    fn mappers(fake: &Arc<Fake>, owner: Owner, state: Option<PathBuf>) -> BrokerMappers {
+        let (waker, _rx) = peerloop::channel();
+        BrokerMappers::new(fake.clone(), owner, "gpu", copies(), state, waker)
+    }
+
     /// The whole host side against a broker stand-in: published before
     /// MAPPED, for the pool's user under `gpu.K`; a retire held while a lease
-    /// lives, answered when it ends, and the broker's fds closed before.
+    /// lives, answered when it ends, and the broker's fds closed first.
     #[test]
     fn regions_are_published_for_their_user_and_answered_unmapped_only_when_drained() {
         let r = rig(64);
@@ -472,9 +733,7 @@ mod tests {
         let mut p = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
         let mut peer = peer(&r);
         let fake = Arc::new(Fake::default());
-        let (waker, _rx) = peerloop::channel();
-        let m = BrokerMappers::new(fake.clone(), 1000, "gpu", copies(), None, waker);
-        peer.set_mappers(Box::new(m));
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), None)));
 
         let e = p.announce(3, 20 << 20).unwrap();
         peer.scan(|_| {});
@@ -486,8 +745,7 @@ mod tests {
         let pieces = fake.pieces.lock().unwrap()[&1].clone();
         assert_eq!(pieces, vec![(0, 8 << 20), (8 << 20, 8 << 20), (16 << 20, 4 << 20)]);
 
-        // A client holds a lease.
-        *fake.leases.lock().unwrap().get_mut(&1).unwrap() += 1;
+        fake.open(1, std::process::id());
         p.retire(e);
         for _ in 0..3 {
             let ev = peer.scan(|_| {});
@@ -511,8 +769,7 @@ mod tests {
         let mut p = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
         let mut peer = peer(&r);
         let fake = Arc::new(Fake::default());
-        let (waker, _rx) = peerloop::channel();
-        peer.set_mappers(Box::new(BrokerMappers::new(fake.clone(), 1000, "gpu", copies(), None, waker)));
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), None)));
         let e = p.announce(1, 4 << 20).unwrap();
         peer.scan(|_| {});
         p.poll().unwrap();
@@ -521,31 +778,57 @@ mod tests {
         assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 1 }), "{ev:?}");
     }
 
-    /// A restarted daemon publishes again what its previous run published,
-    /// and holds the retire of such a region even when the new broker has no
-    /// lease on it.
+    /// The owner is whoever the live sessions run as; two users at once are
+    /// refused rather than guessed between.
     #[test]
-    fn a_restarted_daemon_publishes_its_regions_again_and_never_answers_them() {
+    fn the_owner_is_the_sessions_user_and_never_a_guess() {
+        let r = rig(16);
+        let sim = SimGuestRam::open(r.ram_path.to_str().unwrap()).unwrap();
+        let mut p = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
+        let mut peer = peer(&r);
+        let fake = Arc::new(Fake::default());
+        let uids = Arc::new(Mutex::new(vec![1001u32, 1001]));
+        let u2 = Arc::clone(&uids);
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Sessions(Box::new(move || u2.lock().unwrap().clone())), None)));
+        p.announce(1, 2 << 20).unwrap();
+        peer.scan(|_| {});
+        assert!(fake.log.lock().unwrap()[0].starts_with("publish 1001 gpu.1 "));
+        *uids.lock().unwrap() = vec![1001, 1002];
+        p.announce(2, 2 << 20).unwrap();
+        let ev = peer.scan(|_| {});
+        assert!(matches!(ev.last(), Some(PeerEvent::Refused { k: 2, .. })), "{ev:?}");
+        assert_eq!(fake.log.lock().unwrap().len(), 1);
+    }
+
+    /// A restarted daemon publishes again what its previous run published,
+    /// and holds the retire until every holder the previous run recorded has
+    /// exited, though the new broker has no lease on it.
+    #[test]
+    fn a_restarted_daemon_waits_for_the_previous_runs_holders() {
         let r = rig(32);
-        let state = r._dir.join("state");
+        let state = r.dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let sim = SimGuestRam::open(r.ram_path.to_str().unwrap()).unwrap();
         let mut p = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
+        // A process that holds the region and will exit.
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let e = {
             let mut peer = peer(&r);
             let fake = Arc::new(Fake::default());
-            let (waker, _rx) = peerloop::channel();
-            peer.set_mappers(Box::new(BrokerMappers::new(fake, 1000, "gpu", copies(), Some(state.clone()), waker)));
+            peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), Some(state.clone()))));
             let e = p.announce(2, 6 << 20).unwrap();
             peer.scan(|_| {});
             p.poll().unwrap();
+            fake.open(1, child.id());
+            peer.beat(); // records the holder
             e
         };
+        let text = std::fs::read_to_string(state.join("gpu.regions")).unwrap();
+        assert!(text.contains(&format!(" {}@", child.id())), "{text}");
         // The daemon is gone; a new run.
         let mut peer = peer(&r);
         let fake = Arc::new(Fake::default());
-        let (waker, _rx) = peerloop::channel();
-        let mut m = BrokerMappers::new(fake.clone(), 1000, "gpu", copies(), Some(state.clone()), waker);
+        let mut m = mappers(&fake, Owner::Uid(1000), Some(state.clone()));
         m.inherit(&peer);
         assert_eq!(m.published().len(), 1);
         assert!(fake.log.lock().unwrap()[0].starts_with("publish 1000 gpu.2 "), "{:?}", fake.log.lock().unwrap());
@@ -554,7 +837,22 @@ mod tests {
         for _ in 0..3 {
             let ev = peer.scan(|_| {});
             assert!(!ev.iter().any(|e| matches!(e, PeerEvent::Unmapped { .. })), "{ev:?}");
+            peer.beat();
         }
         assert!(p.substrate.free_bytes() < 32 * UNIT, "still held by the guest");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let ev = peer.scan(|_| {});
+        assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 2 }), "{ev:?}");
+        assert!(matches!(p.poll().unwrap()[0], Event::Freed { k: 2, .. }));
+    }
+
+    #[test]
+    fn a_process_is_its_pid_and_start_time() {
+        let me = Proc::of(std::process::id()).unwrap();
+        assert!(me.alive());
+        assert!(!Proc { start: me.start + 1, ..me }.alive(), "a reused pid is another process");
+        assert_eq!(parse_procs(&procs_text(&[me].into())), Some([me].into()));
+        assert_eq!(parse_procs("-"), Some(BTreeSet::new()));
     }
 }

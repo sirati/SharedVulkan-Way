@@ -421,12 +421,12 @@ impl Brokered {
 /// `sv_ram::brokered`) is added here, built from `guest_ram` (the
 /// `--guest-ram-*` flags, with users.conf's map); each is attached once at
 /// start and told of every session that starts and ends, with its user.
-fn embedded(guest_ram: wc_broker::host::GuestRam) -> Vec<Box<dyn wc_broker::host::Embedded>> {
-    let out: Vec<Box<dyn wc_broker::host::Embedded>> = Vec::new();
-    if guest_ram.wanted() {
-        say("the --guest-ram-* flags were given and this build has no guest-RAM component: ignored");
+fn embedded(guest_ram: wc_broker::host::GuestRam, state: &Path) -> Result<Vec<Box<dyn wc_broker::host::Embedded>>, String> {
+    let mut out: Vec<Box<dyn wc_broker::host::Embedded>> = Vec::new();
+    if let Some(c) = sv_ram::brokered::GuestRamComponent::new(guest_ram, Some(state.join("guest-ram")))? {
+        out.push(Box::new(c));
     }
-    out
+    Ok(out)
 }
 
 /// Everything a pass of [`serve`] needs besides the page.
@@ -554,7 +554,13 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
             }
         }));
     }
-    let mut components = embedded(guest_ram);
+    let mut components = match embedded(guest_ram, &args.state) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wc-arena-host sessiond: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
     match &broker {
         Some(b) => {
             for c in &components {

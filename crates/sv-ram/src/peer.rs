@@ -47,6 +47,8 @@ pub trait Mappers {
     /// True once no other host process maps it (or none ever did); asked
     /// again on every scan until then.
     fn let_go(&mut self, k: u32, epoch: u64) -> bool;
+    /// Once a beat (§108.2), from [`Peer::beat`].
+    fn tick(&mut self) {}
 }
 
 /// No other host process maps the regions.
@@ -148,8 +150,9 @@ impl Peer {
         self.t0.elapsed().as_micros() as u64
     }
 
-    pub fn beat(&self) {
+    pub fn beat(&mut self) {
         self.table().peer_beat();
+        self.mappers.tick();
     }
 
     /// One pass over the table. Returns what changed; `mapper` stops any
