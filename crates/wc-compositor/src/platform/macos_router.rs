@@ -82,6 +82,9 @@ struct Face {
     bye: bool,
 }
 
+/// Damage rectangles as `(x, y, w, h)`; `None` is the whole window.
+type Stale = Option<Vec<(i32, i32, i32, i32)>>;
+
 struct Surf {
     s: [Surface; 2],
     back: u8,
@@ -90,7 +93,7 @@ struct Surf {
     /// §103.15: what each surface of the pair has missed since it was last
     /// written: every present's damage goes to both, and a surface's list is
     /// copied and cleared when it becomes the back buffer. `None` is "all".
-    stale: [Option<Vec<(i32, i32, i32, i32)>>; 2],
+    stale: [Stale; 2],
 }
 
 /// §103.15: what the copies into the surfaces cost, for `WC_FACE_LATENCY`.
@@ -303,7 +306,7 @@ impl R {
         c.bytes += copied;
         c.full_bytes += full;
         c.nanos += t0.elapsed().as_nanos() as u64;
-        if self.latency.is_some() && c.presents % 100 == 0 {
+        if self.latency.is_some() && c.presents.is_multiple_of(100) {
             println!(
                 "wc-compositor: surface copies, last {} presents: {:.1} MB copied of {:.1} MB in full ({:.1}%), {:.3} ms per present",
                 c.presents,

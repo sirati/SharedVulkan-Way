@@ -489,6 +489,19 @@ audio_up() {
   if [ "${WC_LAUNCH_AUDIO:-on}" = off ]; then
     echo "none: switched off on this host (WC_LAUNCH_AUDIO=off)" >"$D/audio.state"; return 0
   fi
+  # §103.16: WC_LAUNCH_AUDIO=system. No server of the session's own: its
+  # applications use this user's PipeWire or PulseAudio and its default sink,
+  # and a sound ring adds the device side's devices to that server (and
+  # `down` takes them away again).
+  if [ "${WC_LAUNCH_AUDIO:-on}" = system ]; then
+    local SRV="/run/user/$UID_/pulse/native"
+    if [ -S "$SRV" ]; then
+      echo "system $SRV (this user's own server and its default sink)" >"$D/audio.state"
+    else
+      echo "none: WC_LAUNCH_AUDIO=system and no server at $SRV" >"$D/audio.state"
+    fi
+    return 0
+  fi
   if ! PA=$(pulse_bin pulseaudio); then
     echo "none: no pulseaudio on this host (no $BIN/pulse, none in the store)" >"$D/audio.state"; return 0
   fi
@@ -502,11 +515,18 @@ audio_up() {
     # The null sink and the monitor socket need no D-Bus at all.
     echo 'unset DBUS_SESSION_BUS_ADDRESS'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
-    printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
-    printf '  -L %q \\\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1"
-    # The guest's end: raw PCM of the monitor to whoever connects, which is
-    # the launcher's tunnel (`-L 127.0.0.1:<audio-port>:$D/audio.sock`).
-    printf '  -L %q >%q 2>&1\n' "module-simple-protocol-unix socket=$D/audio.sock record=true playback=false source=wc.monitor rate=$AUDIO_RATE channels=2 format=s16le" "$D/pulse.log"
+    # §103.16: WC_LAUNCH_AUDIO_NULL_SINK=off leaves the null sink and its
+    # monitor out: a sound ring's devices are then the session's only ones.
+    if [ "${WC_LAUNCH_AUDIO_NULL_SINK:-on}" != off ]; then
+      printf '  -L %q \\\n' "module-null-sink sink_name=wc rate=$AUDIO_RATE channels=2 format=s16le sink_properties=device.description=waycompose"
+      # The guest's end: raw PCM of the monitor to whoever connects, which is
+      # the launcher's tunnel (`-L 127.0.0.1:<audio-port>:$D/audio.sock`).
+      printf '  -L %q \\\n' "module-simple-protocol-unix socket=$D/audio.sock record=true playback=false source=wc.monitor rate=$AUDIO_RATE channels=2 format=s16le"
+    fi
+    # A sound ring's pipe sinks are paced by their reader; an idle one is
+    # suspended rather than streaming silence across the ring.
+    printf '  -L %q \\\n' "module-suspend-on-idle timeout=2"
+    printf '  -L %q >%q 2>&1\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1" "$D/pulse.log"
   } >"$D/pulse.sh"
   chmod 755 "$D/pulse.sh"
   export XDG_RUNTIME_DIR="/run/user/$UID_"
@@ -514,8 +534,12 @@ audio_up() {
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pulse.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
   fi
-  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ] && break; sleep 0.05; done
-  if [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
+  local NULLSINK=1
+  [ "${WC_LAUNCH_AUDIO_NULL_SINK:-on}" = off ] && NULLSINK=""
+  for _ in $(seq 1 100); do [ -S "$D/xdg/pulse/native" ] && { [ -z "$NULLSINK" ] || [ -S "$D/audio.sock" ]; } && break; sleep 0.05; done
+  if [ -S "$D/xdg/pulse/native" ] && [ -z "$NULLSINK" ]; then
+    echo "pulse $D/xdg/pulse/native (no null sink: the sound ring's devices only)" >"$D/audio.state"
+  elif [ -S "$D/xdg/pulse/native" ] && [ -S "$D/audio.sock" ]; then
     echo "pulse $D/xdg/pulse/native (null sink wc, s16le ${AUDIO_RATE} Hz stereo; monitor on $D/audio.sock)" >"$D/audio.state"
   else
     echo "none: $PA did not open its socket: $(tail -2 "$D/pulse.log" 2>/dev/null | tr '\n' ' ')" >"$D/audio.state"
@@ -655,7 +679,7 @@ start_app() {
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in
-    pulse*) ;;
+    pulse*|system*) ;;
     *)
       # Loudly, in both places a person looks: the application's log on this
       # machine and the launcher's log on the guest (it logs what `run` says).
@@ -792,8 +816,12 @@ start_app() {
   # §95's crashes left nothing to read. Kept in the profile's minidumps/.
   KEEP_DUMPS="MOZ_CRASHREPORTER_NO_DELETE_DUMP=1"
   # shellcheck disable=SC2086
+  # §103.16: with the user's own sound server, the applications are told
+  # where it is (their runtime directory is the session's).
+  PULSEENV=""
+  case "$AUDIO" in system*) PULSEENV="PULSE_SERVER=unix:/run/user/$UID_/pulse/native" ;; esac
   setsid env -u DISPLAY \
-    XDG_RUNTIME_DIR="$D/xdg" \
+    XDG_RUNTIME_DIR="$D/xdg" $PULSEENV \
     WAYLAND_DISPLAY="$D/wl-proxy" \
     MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland \
     MOZ_GTK_TITLEBAR_DECORATION="$TITLEBAR" $DBUS $KEEP_DUMPS \
@@ -1144,9 +1172,13 @@ proxy)
     MACBELL=poll
     [ -n "${WC_LAUNCH_MAC_BELL:-}" ] && [ -S "$WC_LAUNCH_MAC_BELL" ] && MACBELL=$WC_LAUNCH_MAC_BELL
     UPSTREAM_ARGS=$(printf -- '--wayland-rings-plan %q --wayland-bell %q --session-control %q --session-id %q' "$D/rings.plan" "$MACBELL" "$BASE/wc-session" "$ID")
-    if [ "$(cut -d: -f1 "$D/audio.state" 2>/dev/null | cut -d' ' -f1)" = pulse ]; then
-      UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--audio-socket %q' "$D/audio.sock")"
-    fi
+    # §103.16: the sound ring, every device of the guest's a stream, made a
+    # sink or source on the session's server (or the user's, `system`).
+    PACTL=$(pulse_bin pactl 2>/dev/null)
+    case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+      pulse) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
+      system) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
+    esac
   else
     [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
     UPSTREAM_ARGS=$(printf -- '--upstream %q' "$D/up.sock")
@@ -1442,6 +1474,13 @@ down)
   # plan; an ivshmem session never had a root unit to stop (§83).
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-$ID" 2>/dev/null
+  # §103.16: a sound ring's devices on the user's own server outlive the
+  # proxy that made them; the session's own server goes with its unit.
+  if [ -s "$D/sound.modules" ] && [ "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" = system ] && PACTL=$(pulse_bin pactl 2>/dev/null); then
+    while read -r m; do
+      [[ "$m" =~ ^[0-9]+$ ]] && PULSE_SERVER="unix:/run/user/$UID_/pulse/native" "$PACTL" unload-module "$m" 2>/dev/null
+    done <"$D/sound.modules"
+  fi
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-audio-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user reset-failed "wc-launch-audio-$ID" 2>/dev/null
   XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user stop "wc-launch-gpu-$ID" 2>/dev/null

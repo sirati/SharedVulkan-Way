@@ -1354,3 +1354,49 @@ deployed with `WC_LAUNCH_DEBUG_SSH_TRANSPORT=1`, brings back the pre-§105
 path, key and forced command included. It is off by default, says
 `DEBUG SSH TRANSPORT` three times in the session's log, and the harness fails
 a run whose log says it.
+
+### R40 — A macOS guest starts its sessions through a record in its own RAM
+Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
+(role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
+reads QEMU's memory backend (the same descriptor `wc-arena-host`'s locate
+already reads) for boot records, and for each one runs `wc-session up`,
+`rings`, `proxy` and `gpu` with the unit's environment. Before §103.15 the
+guest did this with three ssh execs under a forced-command key; the key and the
+private sshd are gone.
+
+**Who can start a session.** Any process in the guest that can stamp a window
+of its own RAM with the arena's stamp and a boot record, which is any process
+of any macOS user in the VM, not only the one holding a key. What it gets is
+what the key gave: the words reach `wc-session` as `SSH_ORIGINAL_COMMAND`, so
+§94's validation applies unchanged. The session id is `[A-Za-z0-9_-]{1,64}`,
+the run ids and counts are checked again, applications come only from the
+host's `apps.ini`, and no command line or path crosses. A guest process can
+therefore start the configured applications as the host user, and can make the
+host locate and map windows of its own RAM (it cannot name any other memory:
+the sweep finds pages by the guest's own stamps, and the plan maps only them).
+The Windows branch's optional HMAC block in the boot record (per-installation
+key, sequence number) will close this to the launcher that holds the key; macOS
+opts in when it lands. Until then the VM's other users are trusted as much as
+its launcher.
+
+**What the host writes into the guest.** The answer (state word and message) in
+the record's own page, and at the session's end the release word in the same
+page, each only after re-reading the page and finding the record unchanged, so a
+page the guest has freed and reused is never written (tested,
+`a_reused_page_is_not_written`).
+
+**Writes into freed guest memory.** The proxy writes pixels and ring bytes into
+the session's windows. A guest process that dies frees them at once on macOS,
+and the host kept writing for up to its 5 s lease: three guest kernel panics,
+memory corruption in the guest's kernel. Since §103.15 a keeper process holds
+every window (POSIX shared memory, wired) until the release word is written,
+and the main process refuses to start a session without one. *What this does
+not cover:* a keeper killed with SIGKILL, and the GPU server's own extent if
+the GPU server crashes while `sv-hostd` serves it.
+
+**The doorbells** are R35's hub, holding the VM's two legacy virtio-serial
+ports. A guest process can ring `HELLO_TOKEN`, which costs the host one sweep
+of the guest's memory (about 0.45 s of one core for 4 GiB). The service sweeps
+at most once a second however often it is rung, so a guest that rings in a
+loop costs the host about half a core; the guest's own launcher rings once
+every 3 s, and only while its record waits.
