@@ -338,10 +338,10 @@ mod tests {
     fn the_table_is_injective_apart_from_the_command_keys() {
         let mut seen = std::collections::HashMap::new();
         for kvk in 0u16..0x80 {
-            if let Some(code) = evdev_keycode(kvk, CmdKey::Super) {
-                if let Some(prev) = seen.insert(code, kvk) {
-                    panic!("kVK {prev:#x} and {kvk:#x} both send evdev {code}");
-                }
+            if let Some(code) = evdev_keycode(kvk, CmdKey::Super)
+                && let Some(prev) = seen.insert(code, kvk)
+            {
+                panic!("kVK {prev:#x} and {kvk:#x} both send evdev {code}");
             }
         }
         assert!(seen.len() > 100, "{} keys", seen.len());

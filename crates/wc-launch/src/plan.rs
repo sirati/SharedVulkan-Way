@@ -342,7 +342,11 @@ impl TitlebarFit {
 /// and leaves alone one that does not, because that one is the user's.
 pub const USER_CHROME_MARK: &str = "/* wc-launch: tabs in the title bar.";
 
-/// The `userChrome.css` for [`Titlebar::Tabs`], or `None` for the others.
+/// The traffic lights' corner at 1x: three 12 pt buttons, 8 pt apart, 20 pt
+/// in from the edge, and a margin before the first tab.
+pub const MAC_BUTTONS_AT_1X: i32 = 78;
+
+/// The `userChrome.css` for [`Titlebar::Tabs`] and [`Titlebar::MacTabs`], or `None` for the others.
 ///
 /// **Measured against Firefox 157 on the Linux compositor, frame dumps of the
 /// geometry rectangle** (§82.4): with this sheet at 31/146 the tab strip is 31
@@ -360,10 +364,6 @@ pub const USER_CHROME_MARK: &str = "/* wc-launch: tabs in the title bar.";
 ///   only*. The navigation bar has a button box of its own that Firefox hides
 ///   while tabs are shown, and a selector without `#TabsToolbar` brings it back
 ///   and pushes the hamburger menu left — which the first version of this did.
-/// The traffic lights' corner at 1x: three 12 pt buttons, 8 pt apart, 20 pt
-/// in from the edge, and a margin before the first tab.
-pub const MAC_BUTTONS_AT_1X: i32 = 78;
-
 pub fn user_chrome_css(t: Titlebar, fit: TitlebarFit) -> Option<String> {
     if t == Titlebar::MacTabs {
         let tab = (fit.height - 2).max(1);

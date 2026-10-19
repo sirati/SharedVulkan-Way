@@ -192,10 +192,10 @@ fn install(cfg: &Config, section: &str, pin: bool) -> Result<PathBuf, String> {
 fn pin_in_dock(bundle: &Path) -> Result<(), String> {
     let url = format!("file://{}/", bundle.to_string_lossy().replace(' ', "%20"));
     let have = Command::new("defaults").args(["read", "com.apple.dock", "persistent-apps"]).output();
-    if let Ok(o) = have {
-        if String::from_utf8_lossy(&o.stdout).contains(&url) {
-            return Ok(());
-        }
+    if let Ok(o) = have
+        && String::from_utf8_lossy(&o.stdout).contains(&url)
+    {
+        return Ok(());
     }
     let entry = format!(
         "<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key>\

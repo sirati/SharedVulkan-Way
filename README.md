@@ -60,6 +60,10 @@ cargo build --target x86_64-pc-windows-gnu         # the target that matters
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo check --workspace --target x86_64-pc-windows-gnu
+# macOS (§103.9): the check needs nothing else; the build links with the SDK
+# copied out of the macOS VM once (scripts/macos-sdk.sh).
+cargo check --target x86_64-apple-darwin -p wc-compositor -p sv-guest -p wc-launch -p sv-gpu-server
+cargo build --target x86_64-apple-darwin -p wc-launch -p sv-guest
 ```
 
 ## Proving it works
@@ -209,6 +213,27 @@ H.264 on the forwarded device and about:support lists it as hardware decoding;
 an unpatched Firefox decodes in software, cleanly. `docs/video-decode.md` §7 is
 the account, with what is still unmeasured — NVIDIA and the guest's Intel among
 it.
+
+**macOS as the Wayland host (`docs/waycompose-design.md` §103).** Linux
+applications appear as Mac applications in the Intel Sonoma VM on this
+workstation (`/mnt/datasets/macvm`, instance `wayland-host`, template
+`wayland-dev`). Each has its own `.app` bundle in `~/Applications/Linux`, its
+own Dock tile, name, icon and Dock menu (the desktop entry's actions), and
+"Keep in Dock". Windows are native `NSWindow`s, popups are child windows,
+AppKit's traffic lights sit beside Firefox's tabs, and Cmd acts as Control.
+The clipboard goes both ways through `NSPasteboard`, sound plays through
+CoreAudio, and the pixels and the GPU path's memory are in the VM's own RAM,
+wired by the macOS process and found by the host. No macOS kernel driver is
+involved. Vulkan from Linux renders in the VM on lavapipe, because the VM has
+no Metal; on a real Mac the same server uses MoltenVK or KosmicKrisp.
+
+```
+scripts/mac-launch-install.sh             # both ends of the launcher, bundles pinned in the Dock
+scripts/mac-window.sh [CLIENT]            # one Linux client against the compositor in the VM
+scripts/mac-gpu.sh [probe|present|compute|window]
+scripts/mac-pinning.sh                    # do wired pages stay put? (§103.3)
+scripts/mac-shot.sh OUT.png; scripts/mac-input.sh click X Y | type TEXT | key meta_l+c
+```
 
 ## Layout
 

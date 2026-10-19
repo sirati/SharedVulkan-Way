@@ -7,7 +7,7 @@
 #   * wc-compositor runs in the VM, in the logged-in user's GUI session
 #     (`launchctl asuser`), with its arena in 2 MiB superpages of the VM's RAM
 #     (`--arena-guest-ram`, pinning=superpages) and Wayland on a Unix socket in
-#     the in-band dialect, because no descriptor crosses (design.md §1a);
+#     the in-band dialect, because no descriptor crosses (docs/design.md §1a);
 #   * wc-arena-host finds the arena's stamped pages in QEMU's memfd through QMP
 #     and /proc/<qemu>/fd, as the user; no root, no file;
 #   * an OpenSSH Unix-socket forward carries the Wayland bytes (§103.4);
@@ -29,6 +29,9 @@ out=$((1024 * 1024))
 bin=/Users/c3r/wc/bin/wc-compositor
 local_bin=${WC_MAC_BIN:-$root/target/x86_64-apple-darwin/debug/wc-compositor}
 run=/mnt/datasets/builds/wcrun/mac-$(date +%Y%m%d-%H%M%S)
+# This run's socket in the VM, which is also the only thing it may kill there
+# (scripts/wc-killcheck.sh): two runs never share it.
+sock=wl-mac-$$
 mkdir -p "$run/rt" && chmod 700 "$run/rt"
 port=$(sed -n 's/.*"ssh_port": \([0-9]*\).*/\1/p' "$idir/instance.json")
 ssh_opts=(-i /mnt/datasets/macvm/support/id_ed25519 -p "$port" -o UserKnownHostsFile="$idir/known_hosts"
@@ -38,7 +41,7 @@ say() { echo "[mac-window] $*"; }
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-  vm 'pkill -f "wc-compositor --socket wl-mac" 2>/dev/null; true' >/dev/null 2>&1
+  vm "pkill -f 'wc-compositor --socket $sock ' 2>/dev/null; true" >/dev/null 2>&1
   [ "${WC_KEEP:-0}" = 1 ] || { cp "$run"/*.log /mnt/datasets/builds/wcrun/mac-last/ 2>/dev/null; rm -rf "$run"; }
 }
 mkdir -p /mnt/datasets/builds/wcrun/mac-last
@@ -51,11 +54,11 @@ say "run dir $run"
 [ -x "$local_bin" ] || { say "no macOS build at $local_bin (cargo build --target x86_64-apple-darwin -p wc-compositor)"; exit 2; }
 vm 'mkdir -p ~/wc/bin'
 rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" c3r@127.0.0.1:wc/bin/wc-compositor
-vm 'pkill -f "wc-compositor --socket wl-mac" 2>/dev/null; rm -rf /tmp/wcrt; mkdir -m 700 /tmp/wcrt'
+vm 'mkdir -p -m 700 /tmp/wcrt; rm -f /tmp/wcrt/comp.log'
 # The GUI session: a process started by sshd is outside the user's Aqua
 # bootstrap namespace and cannot reach the WindowServer.
 vm "sudo -n launchctl asuser 501 sudo -n -u c3r env XDG_RUNTIME_DIR=/tmp/wcrt WC_MAC_TRACE=${WC_MAC_TRACE:-1} WC_MAC_CMD_KEY=\${WC_MAC_CMD_KEY:-control} \
-  $bin --socket wl-mac --in-band --timeout $((secs + 30)) --exit-when-empty 20 \
+  $bin --socket $sock --in-band --timeout $((secs + 30)) --exit-when-empty 20 \
   --arena-guest-ram 0:$arena --arena-outbound 0:$out > /tmp/wcrt/comp.log 2>&1 &"
 for i in $(seq 1 60); do vm 'grep -q "listening on" /tmp/wcrt/comp.log 2>/dev/null' && break; sleep 0.5; done
 vm 'cat /tmp/wcrt/comp.log' > "$run/comp.log"
@@ -71,7 +74,7 @@ t1=$(date +%s.%N)
 [ -s "$run/arena.plan" ] || { say "the arena was not located"; tail -8 "$run/locate.log"; exit 1; }
 say "located in $(awk "BEGIN{printf \"%.2f\", $t1 - $t0}") s: $(grep -o 'verify: [0-9]*/[0-9]* pages' "$run/locate.log" | tail -1), $(grep -c '^run' "$run/arena.plan" 2>/dev/null) runs"
 
-ssh "${ssh_opts[@]}" -N -o StreamLocalBindUnlink=yes -L "$run/up.sock:/tmp/wcrt/wl-mac" c3r@127.0.0.1 &
+ssh "${ssh_opts[@]}" -N -o StreamLocalBindUnlink=yes -L "$run/up.sock:/tmp/wcrt/$sock" c3r@127.0.0.1 &
 pids+=($!)
 for i in $(seq 1 40); do [ -S "$run/up.sock" ] && break; sleep 0.25; done
 

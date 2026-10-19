@@ -31607,18 +31607,24 @@ restrictions", so somebody was at the VM's own console.
 
 ### 103.1 Status in one paragraph
 
-This section is the design for a macOS machine taking the place Windows has had
-since stage 1: the side that owns the screen, runs the compositor and shows each
-Linux toplevel as a native window, while Linux runs the applications. It covers
-the shared-memory transport (103.3 to 103.5), the GPU path (103.6), the mapping
-of Wayland onto AppKit (103.7), the Dock (103.8) and the build (103.9). The
-decisions are: **guest RAM in 2 MiB superpages, located by the host as on
-Windows, so that nothing needs a macOS kernel driver**; **MoltenVK as
-`sv-gpu-server`'s Vulkan on an Intel Mac, and KosmicKrisp on Apple Silicon with
-macOS 26**; **one small process per Linux application, started from a generated
-`.app` bundle, so that each application has its own Dock tile**; and cocoa-way
-is read for ideas only, because it is GPL-3.0-only. What has been run and where
-is in 103.11, which is the only place in this section that claims a result.
+A macOS machine now takes the place Windows has had since stage 1. In the Intel
+Sonoma VM on this workstation (role (a), 103.2), Linux Firefox, GNOME Console and
+Text Editor run as Mac applications. Each has its own `.app` bundle, its own Dock
+tile with its own name, icon and Dock menu (the desktop entry's actions), and can
+be kept in the Dock. Each runs in its own process, which holds that
+application's compositor (103.8). Windows are `NSWindow`s, menus are child
+windows, Firefox's tabs sit beside AppKit's traffic lights, and Cmd acts as
+Control. The clipboard goes both ways, sound plays through CoreAudio, and native
+edge resize, maximise and Quit behave as a Mac user expects. The pixels, and the
+GPU path's memory, are in the VM's own RAM. The macOS process wires the memory
+and the Linux host finds it, so no macOS kernel driver exists anywhere in the
+design (103.3). The VM has no Metal: Vulkan from Linux renders in it on
+lavapipe (vkcube at about 350 frames per second through `sv-icd`), and on a Mac
+with a GPU the same server takes KosmicKrisp or MoltenVK (103.6). The decisions
+are as before, with one revision: one compositor per application rather than
+one per user (103.8). cocoa-way was read for ideas only, because it is
+GPL-3.0-only. 103.11 is what was run and where. 103.12 is what is not built and
+what is not proven, including all of role (b) and everything on real Metal.
 
 ### 103.2 Two roles, and why the code does not care which one it is in
 
@@ -31642,7 +31648,7 @@ first:
 | piece | runs on | role (a) | role (b) |
 |---|---|---|---|
 | compositor + AppKit platform (`wc-compositor`, `platform/macos`) | macOS | VM guest | VM host |
-| per-application tile processes (103.8) | macOS | VM guest | VM host |
+| each application's bundle process, which holds its compositor (103.8) | macOS | VM guest | VM host |
 | `sv-gpu-server` on MoltenVK/KosmicKrisp | macOS | VM guest (no Metal here, 103.6) | VM host, real GPU |
 | `wc-proxy`, `wc-session`, `sv-icd`, applications | Linux | VM host | VM guest |
 | region owner | — | macOS (superpages in guest RAM) | macOS (a POSIX shm object QEMU exposes as ivshmem) |
@@ -31900,18 +31906,18 @@ is added to the common modes. The mapping:
 | `ToUi` / `FromUi` | AppKit |
 |---|---|
 | `Create`/`Map` toplevel | `NSWindow` (titled, closable, miniaturizable, resizable), shown on `Map` only, as on Windows, so nothing flashes empty |
-| popup | borderless `NSPanel` (non-activating, cannot become key), `addChildWindow:ordered:` on the parent, positioned in screen points, so it can leave the parent's frame |
-| `Present` | the window's shadow copied (damage only) into an `IOSurface`, set as the content layer's `contents`; the layer's `contentsScale` is the backing scale |
+| popup | borderless `NSWindow` (never key, so the toplevel keeps the keyboard), `addChildWindow:ordered:` on the parent, positioned in screen points, so a menu can leave its parent's frame |
+| `Present` | the window's shadow as a `CGImage`, set as the view layer's `contents` (gravity at the visual top left). A full copy per present; damage-limited copies into an `IOSurface` are the next step and not built |
 | `Title`, `SizeHints`, `SetWindowState`, `Fullscreen` | `setTitle:`, `setContentMinSize:`/`setContentMaxSize:`, `zoom:`/`miniaturize:`, `toggleFullScreen:` (native Spaces fullscreen) |
 | `BeginMove`, `BeginResize` | `performWindowDragWithEvent:`; resize from the native edges (AppKit owns them) |
 | `Cursor`, `PointerHold` | `NSCursor`; `CGAssociateMouseAndMouseCursorPosition` and `CGWarpMouseCursorPosition` |
 | `SetClipboard`/`FetchClipboard`, `ClipboardChanged` | `NSPasteboard` (`changeCount` polled on activation and on a 250 ms timer, since macOS has no change notification); text, HTML, PNG and file URLs |
-| `StartDrag`, `DragEnter…` | `NSDraggingSource` / `NSDraggingDestination` on the content view |
-| `Icon` | the tile process's `NSApp.applicationIconImage` (103.8) |
+| `StartDrag`, `DragEnter…` | **not built** (103.12): a drag out of a Linux window ends at once with no action, and drops onto one are refused |
+| `Icon` | `NSApp.applicationIconImage` of the application's own process; the Dock tile of a bundle that is not running wears the bundle's `.icns` |
 | `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
-| `Layout` | `TISCopyCurrentKeyboardLayoutInputSource` and the distributed notification `com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged` |
+| `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
 | `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
-| scale | `backingScaleFactor`; the compositor's output scale follows it, and `windowDidChangeBackingProperties:` re-sends it |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
 | `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
 
 **The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
@@ -32037,6 +32043,17 @@ tried, because at 4096 MiB the guest already has no superpages, and a smaller
 guest only makes its wired arena share less room with Firefox. The VM is
 stopped whenever no test is running.
 
+`wayland-host`'s `qemu_extra` adds a USB audio device (UAC1, which macOS
+supports natively) on QEMU's `wav` audiodev. Whatever the Mac plays lands in
+`/mnt/datasets/builds/wcrun/mac-audio.wav` on this host, which is how the sound
+was measured (103.11). The prepared guest is saved as the template
+**`wayland-dev`**: Command Line Tools 16.2, rustup, MacPorts with libxkbcommon,
+MoltenVK and the Vulkan loader, lavapipe in `~/lvp`, auto-login, no sleep, no
+crash dialogs, and the launcher with its three bundles. Clone it with
+`macos-vm clone NAME --template wayland-dev`, and run
+`macos-vm configure NAME --ram-mib 4096 --shared-ram on` before the first
+start.
+
 ### 103.11 What has been run, and where
 
 **Two macOS bugs the first runs found, both outside the platform code.**
@@ -32066,6 +32083,7 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | **Firefox from its Dock tile**: `scripts/mac-launch-install.sh` (host: wc-session with a private sshd on 127.0.0.1:22422 that holds only the guest's forced-command key; guest: three bundles, pinned), then `open Firefox.app` | 4 GiB VM, Firefox on this workstation in software GL (Mesa only, never the RTX 5090) | compositor up 0.38 s after the click, arena located 0.43 s (16384/16384), proxy and PulseAudio null sink, `run ok` 1.2 to 1.4 s after the click; menu bar "Firefox", the fox in the Dock with its running dot; maximised to the work area, fully drawn, traffic lights in the corner the tab strip leaves (Sonnet checks of five screenshots); Quit closes the window, the session goes `down ok` and the process exits |
 | Dock menu: right-click the Firefox tile | 4 GiB VM | New Private Window, New Window, Profile Manager, New Tab (the desktop entry's actions) above macOS's own items; "New Window" sent `action ... new-window` and a second window mapped |
 | clipboard, both ways, with Cmd as Control | 4 GiB VM | `pbcopy` text pasted into Firefox's address bar with Cmd+V (27 bytes, exact); text typed in Firefox, Cmd+A, Cmd+C, read back with `pbpaste` exactly |
+| user resize: an AppKit edge drag of weston-terminal's corner by 100 px each way | 4 GiB VM | window 842x528, the client re-wrapped its text at the new width (not scaled), resize cursor at the corner |
 | context menu (xdg_popup) | 4 GiB VM | a separate child window at the click point, flipped upward by the positioner's constraints because it did not fit below, fully drawn |
 | sound: the session's PulseAudio monitor, an ssh `-L` forward, an AudioQueue on the VM's USB audio device (UAC1, recorded by QEMU's `wav` audiodev) | 4 GiB VM | a 440 Hz tone played into the session's sink came out of the Mac continuous (7.2 s, ~430 Hz measured after the 48 to 44.1 kHz resample); with a 160 ms queue it came out 170 ms on, 130 ms off, because the null sink's monitor arrives in ~300 ms bursts: the Mac queue holds 600 ms |
 | two applications at once (Firefox and Console) | 4 GiB VM | two processes, two Dock tiles, two sessions; the second's PulseAudio failed on the session bus's `org.PulseAudio1` until wc-session started it without one |
@@ -32075,3 +32093,34 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | GPU: `scripts/mac-gpu.sh compute`, `sv-compute-e2e` | 4 GiB VM | a compute dispatch by lavapipe in the VM; 245,760 payload words read back through the arena, 0 wrong |
 | GPU: `scripts/mac-gpu.sh window`, `vkcube --wsi wayland` 400x300 through `sv-icd`, rendered by lavapipe in the VM, presented as arena slices to the macOS compositor (`scripts/mac-window.sh`) | the VM's desktop | 400 and 2000 frames ran to completion; about 350 frames/s marginal (1600 more frames took 4.5 s more session time). A Sonnet check of the QMP screendump: a "vkcube" window of about 400x300 with a textured, upright cube, correct colours, content filling the window |
 | GPU: pipelined headless present (`SV_PRESENT_SYNC` unset) | the VM, and this workstation with RADV and no VM | the dump of frame N holds frame N+1's pixels, and the last frame is right. This is the same on Linux, so it is an `sv-icd` headless-dump matter, not this path's. `mac-gpu.sh` presents in the call by default |
+
+### 103.12 Not built, and not proven
+
+* **Not built.** Drag and drop in either direction. IME and dead keys beyond
+  what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
+  Retina scale above 1. The §89 rings on macOS: the Wayland bytes ride the ssh
+  forward, and nobody measured the latency. SVG icons (the host's resolver
+  has no renderer, as on Windows). A frequent-pages section in the Dock menu
+  (`macbundle::dock_items` takes them, and the launcher does not fetch
+  `frequent` yet).
+* **Role (b), a Mac hosting a Linux VM, is designed and not built.** That
+  covers 103.5's QEMU+HVF `memory-backend-shm` arena, the Linux guest mapping
+  BAR2, and the Virtualization.framework variant.
+* **Real Metal.** Nothing here ran on a Metal device. MoltenVK was shown to
+  refuse cleanly without one. KosmicKrisp needs Apple Silicon and macOS 26.
+* **Doorbells on macOS.** Legacy virtio-serial into a `/dev/cu.*` node is coded
+  (`PortHandle::guest_port`) and was never attached to the VM. Without it the
+  GPU rings fall back to polling, which is 103.6's sleep-poll cost.
+* **Firefox's own sound.** The route was proven with a tone played into the
+  session's sink. A tone Firefox opened from `file://` did not play. Firefox
+  appears to want a gesture for a media document, and this was not chased.
+* **Superpages at 4 GiB.** A 4 GiB macOS guest has none (103.3). Every result
+  above is on wired 4 KiB pages. Superpages were only seen at 8 and 12 GiB.
+* **Cooperative activation.** macOS 14 does not let a process that started
+  outside LaunchServices take the foreground from the active application. A
+  bundle opened from the Dock or with `open` is activated; `mac-window.sh`'s
+  bare compositor can open behind the frontmost window.
+* **One known `sv-icd` bug**, found here and not macOS's: with the default
+  pipelined headless present, the frame dump for frame N holds frame N+1's
+  pixels. It reproduces on Linux with RADV and no VM.
+

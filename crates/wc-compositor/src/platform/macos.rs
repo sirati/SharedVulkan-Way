@@ -275,10 +275,10 @@ thread_local! {
 
 fn send_global(e: FromUi) {
     EVENTS.with(|s| {
-        if let Some(tx) = s.borrow().as_ref() {
-            if tx.send(e).is_ok() {
-                super::wake_wayland();
-            }
+        if let Some(tx) = s.borrow().as_ref()
+            && tx.send(e).is_ok()
+        {
+            super::wake_wayland();
         }
     });
 }
@@ -904,11 +904,11 @@ fn install_cmd_keyup_monitor() {
     let block = block2::RcBlock::new(|e: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit passes a live event for the duration of the call.
         let event = unsafe { e.as_ref() };
-        if event.modifierFlags().contains(NSEventModifierFlags::Command) {
-            if let Some(id) = with_input(|i| i.focus).flatten() {
-                key_event(id, event.keyCode(), false, ms(event));
-                return std::ptr::null_mut();
-            }
+        if event.modifierFlags().contains(NSEventModifierFlags::Command)
+            && let Some(id) = with_input(|i| i.focus).flatten()
+        {
+            key_event(id, event.keyCode(), false, ms(event));
+            return std::ptr::null_mut();
         }
         e.as_ptr()
     });
@@ -1403,10 +1403,10 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
                 return;
             }
             if let Some((window, _, _)) = handles(id) {
-                if let Some(m) = maximized {
-                    if window.isZoomed() != m {
-                        window.zoom(None);
-                    }
+                if let Some(m) = maximized
+                    && window.isZoomed() != m
+                {
+                    window.zoom(None);
                 }
                 match minimized {
                     Some(true) if !window.isMiniaturized() => window.miniaturize(None),
@@ -1475,10 +1475,10 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
             }
         }
         ToUi::BeginResize { id, edge } => {
-            if let Some((window, _, shared)) = handles(id) {
-                if edge != Edge::None {
-                    shared.resizing.set(Some((edge, window.frame(), NSEvent::mouseLocation())));
-                }
+            if let Some((window, _, shared)) = handles(id)
+                && edge != Edge::None
+            {
+                shared.resizing.set(Some((edge, window.frame(), NSEvent::mouseLocation())));
             }
         }
         ToUi::WindowMenu { id, x, y } => {
@@ -1549,13 +1549,11 @@ fn create(
     // from this cell's width and height (state.rs §91.6), and it asks at the
     // first commit, before `Map`. The origin is corrected once the window is
     // placed (`publish_bounds`).
-    if !is_popup {
-        if let Some(screen) = NSScreen::mainScreen(mtm) {
-            let v = screen.visibleFrame();
-            let mut cell = bounds.lock().unwrap_or_else(|e| e.into_inner());
-            if cell.is_none() {
-                *cell = Some(Rect::new(0, 0, v.size.width as i32, v.size.height as i32));
-            }
+    if !is_popup && let Some(screen) = NSScreen::mainScreen(mtm) {
+        let v = screen.visibleFrame();
+        let mut cell = bounds.lock().unwrap_or_else(|e| e.into_inner());
+        if cell.is_none() {
+            *cell = Some(Rect::new(0, 0, v.size.width as i32, v.size.height as i32));
         }
     }
     let shared = Rc::new(WinShared {
@@ -1812,10 +1810,10 @@ fn destroy(id: WindowId) {
     }) else {
         return;
     };
-    if let WindowKind::Popup { parent, .. } = w.kind {
-        if let Some((pwin, _, _)) = handles(parent) {
-            pwin.removeChildWindow(&w.window);
-        }
+    if let WindowKind::Popup { parent, .. } = w.kind
+        && let Some((pwin, _, _)) = handles(parent)
+    {
+        pwin.removeChildWindow(&w.window);
     }
     if w.shared.hold.get() == Some(crate::hold::PointerHold::Locked) {
         // SAFETY: a plain value call.

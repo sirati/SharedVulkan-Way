@@ -62,7 +62,7 @@ mkdir -p "$run/f" /mnt/datasets/builds/wcrun/macgpu-last
 pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-  vm 'pkill -f "sv-guest gpu guest --port" 2>/dev/null; true' >/dev/null 2>&1
+  vm "pkill -f 'sv-guest gpu guest --port $gport ' 2>/dev/null; true" >/dev/null 2>&1
   cp "$run"/*.log /mnt/datasets/builds/wcrun/macgpu-last/ 2>/dev/null
   [ "${WC_KEEP:-0}" = 1 ] || rm -rf "$run"
 }
@@ -108,7 +108,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
     ( cd "$root" && nix develop -c bash -c "cc -O1 -o '$probe' scripts/vk-present-probe.c -I\${VULKAN_SDK:-/usr}/include -ldl" ) \
       > "$run/cc.log" 2>&1 || { say "vk-present-probe did not build"; tail -5 "$run/cc.log"; exit 1; }
   fi
-  vm "pkill -f 'sv-guest gpu guest --port' 2>/dev/null; rm -rf /tmp/wcgpu; mkdir -m 700 /tmp/wcgpu; cd /tmp/wcgpu; ulimit -c 0; \
+  vm "pkill -f 'sv-guest gpu guest --port $gport ' 2>/dev/null; rm -rf /tmp/wcgpu; mkdir -m 700 /tmp/wcgpu; cd /tmp/wcgpu; ulimit -c 0; \
       VK_DRIVER_FILES=$LVP nohup ~/wc/bin/sv-guest gpu guest --port $gport --arena $arena --idle $idle \
       > /tmp/wcgpu/gpu.log 2>&1 < /dev/null &"
   for _ in $(seq 1 60); do vm 'grep -q "publishing the extent" /tmp/wcgpu/gpu.log 2>/dev/null' && break; sleep 0.5; done

@@ -20,7 +20,11 @@ run=/mnt/datasets/builds/wcrun/mac-pin-$(date +%Y%m%d-%H%M%S); mkdir -p "$run"
 vm() { "$mvm" ssh "$inst" "$@"; }
 port=$(sed -n 's/.*"ssh_port": \([0-9]*\).*/\1/p' "$idir/instance.json")
 ssh_opts=(-i /mnt/datasets/macvm/support/id_ed25519 -p "$port" -o UserKnownHostsFile="$idir/known_hosts" -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes)
-trap 'vm "pkill -f \"wc-compositor --socket wl-pin\"; pkill -x wc-press" >/dev/null 2>&1' EXIT
+# This run's socket and pressure program are the only things it may kill in
+# the VM (scripts/wc-killcheck.sh).
+sock=wl-pin-$$
+press=/tmp/wc-press-$$
+trap 'vm "pkill -f \"wc-compositor --socket $sock \"; pkill -f \"^$press\"" >/dev/null 2>&1' EXIT
 
 rsync -a -e "ssh ${ssh_opts[*]}" "$root/target/x86_64-apple-darwin/debug/wc-compositor" c3r@127.0.0.1:wc/bin/wc-compositor
 cat > "$run/press.c" <<'E'
@@ -32,8 +36,8 @@ int main(int c, char **v) { size_t n = (size_t)atoi(v[1]) << 20; char *p = mallo
   free(p); return 0; }
 E
 rsync -a -e "ssh ${ssh_opts[*]}" "$run/press.c" c3r@127.0.0.1:/tmp/press.c
-vm 'cd /tmp && clang -O1 -o wc-press press.c && mkdir -p -m 700 /tmp/wcpin && rm -f /tmp/wcpin/*'
-vm "XDG_RUNTIME_DIR=/tmp/wcpin ~/wc/bin/wc-compositor --socket wl-pin --timeout 900 $small \
+vm "cd /tmp && clang -O1 -o $press press.c && mkdir -p -m 700 /tmp/wcpin && rm -f /tmp/wcpin/comp.log"
+vm "XDG_RUNTIME_DIR=/tmp/wcpin ~/wc/bin/wc-compositor --socket $sock --timeout 900 $small \
   --arena-guest-ram 0:$arena --arena-outbound 0:$out > /tmp/wcpin/comp.log 2>&1 &"
 for i in $(seq 1 40); do vm 'grep -q "listening on" /tmp/wcpin/comp.log 2>/dev/null' && break; sleep 0.5; done
 vm 'cat /tmp/wcpin/comp.log' > "$run/comp.log"
@@ -43,7 +47,7 @@ echo "arena: $(grep -o 'pinning=[a-z-]*' "$run/comp.log" | head -1), run $runid,
 [ -n "$runid" ] || { cat "$run/comp.log"; exit 1; }
 for r in $(seq 0 $((rounds - 1))); do
   if [ "$r" -gt 0 ]; then
-    vm "/tmp/wc-press $pressure; vm_stat | grep -E 'Swapouts|Pages stored in compressor'" | tr '\n' ' ' > "$run/press$r.txt"
+    vm "$press $pressure; vm_stat | grep -E 'Swapouts|Pages stored in compressor'" | tr '\n' ' ' > "$run/press$r.txt"
     echo "round $r pressure: $(cat "$run/press$r.txt")"
   fi
   "$root/target/debug/wc-arena-host" --qmp "$idir/qmp.sock" --vm "$idir" --run "$runid" --pages "$pages" \

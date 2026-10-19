@@ -175,10 +175,12 @@ pub fn square_png(png: &[u8], size: u32) -> Result<Vec<u8>, String> {
                 }
             }
             let o = ((oy + y) * n + ox + x) * 4;
-            if acc[3] > 0 {
-                out[o] = (acc[0] / acc[3]) as u8;
-                out[o + 1] = (acc[1] / acc[3]) as u8;
-                out[o + 2] = (acc[2] / acc[3]) as u8;
+            if let (Some(r), Some(g), Some(b)) =
+                (acc[0].checked_div(acc[3]), acc[1].checked_div(acc[3]), acc[2].checked_div(acc[3]))
+            {
+                out[o] = r as u8;
+                out[o + 1] = g as u8;
+                out[o + 2] = b as u8;
             }
             out[o + 3] = (acc[3] / cnt.max(1)) as u8;
         }
