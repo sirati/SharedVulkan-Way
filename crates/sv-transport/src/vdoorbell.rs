@@ -1254,6 +1254,14 @@ mod tests {
         // released by a `wake` change rather than by its slice. A 2 s slice that
         // had expired would have taken 2 s; but the assertion does not need to
         // say that, because it can say the stronger thing directly.
+        // Since §103.15 the doorman rescans every lane when its port opens,
+        // and under load that rescan can be what releases a waiter that
+        // parked before the doorman thread ran; the byte is then counted a
+        // moment later. So the count is waited for, boundedly.
+        let t_count = Instant::now();
+        while doorman.woken() == 0 && t_count.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(doorman.woken() >= 1, "the doorman delivered no wakes at all");
         assert!(
             took < Duration::from_secs(5),
