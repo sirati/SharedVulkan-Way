@@ -41,9 +41,10 @@ pub const REGION_SHIFT: u32 = 32;
 /// The largest region, and the stride between regions in the pool's address
 /// space.
 pub const REGION_STRIDE: u64 = 1 << REGION_SHIFT;
-/// Regions a pool can have: the GPU device and up to seven more, each its own
-/// device configured beside it.
-pub const MAX_REGIONS: usize = 8;
+/// Regions a pool can have: the boot device and up to 63 regions added at run
+/// time (waycompose-design.md §108). Each costs the app side 4 GiB of reserved,
+/// never committed, address space.
+pub const MAX_REGIONS: usize = 64;
 
 /// The command-blob reserve a session leases when it starts. §0.28 measured
 /// the reserve's working set in Firefox's soaks at 2–3 MiB; 8 MiB is §87's
@@ -271,7 +272,8 @@ impl Pool {
             return Err(PoolError::Region("larger than the stride"));
         }
         let mut tlsf = Tlsf::new(len, self.cfg.granule).map_err(PoolError::Region)?;
-        if self.cfg.header > 0 {
+        // The header is region 0's only: a region added later is all lease.
+        if id == 0 && self.cfg.header > 0 {
             let at = tlsf.alloc(self.cfg.header).ok_or(PoolError::Region("the header does not fit"))?;
             debug_assert_eq!(at, 0);
         }
@@ -390,6 +392,11 @@ impl Pool {
         for (id, r) in self.regions.iter_mut().enumerate() {
             let Some(r) = r.as_mut() else { continue };
             if r.draining {
+                continue;
+            }
+            // A control region is read by the host from the boot device by
+            // offset (Locator::IvshmemPool), so it never leaves region 0.
+            if purpose == Purpose::Control && id != 0 {
                 continue;
             }
             if id == 0 && r.tlsf.free_bytes() < len.saturating_add(reserve) {
@@ -548,7 +555,7 @@ impl Pool {
             if r.leases != per_region[id] {
                 return Err(format!("region {id} counts {} leases, the table {}", r.leases, per_region[id]));
             }
-            let header = usize::from(self.cfg.header > 0);
+            let header = usize::from(id == 0 && self.cfg.header > 0);
             if r.tlsf.stats().used_blocks != per_region[id] as usize + header {
                 return Err(format!("region {id} has blocks no lease names"));
             }
@@ -662,7 +669,7 @@ mod tests {
         let back = p.close_session(1);
         assert_eq!(back.len(), 21);
         assert_eq!(p.empty_regions(), vec![1]);
-        assert_eq!(p.free(), p.capacity() - 2 * p.config().header);
+        assert_eq!(p.free(), p.capacity() - p.config().header);
         assert_eq!(p.remove_region(1), Ok(128 * M));
         assert!(p.remove_region(0).is_err());
         p.check().unwrap();
@@ -742,9 +749,10 @@ mod tests {
                 p.close_session(s);
             }
             p.check().unwrap();
-            let n = p.regions().len() as u64;
-            assert_eq!(p.free(), p.capacity() - n * p.config().header, "seed {seed}: leaked");
-            assert_eq!(p.largest_free(), p.regions().iter().map(|r| r.1 - p.config().header).max().unwrap());
+            // Only region 0 has a header.
+            assert_eq!(p.free(), p.capacity() - p.config().header, "seed {seed}: leaked");
+            let hdr = |id: u32| if id == 0 { p.config().header } else { 0 };
+            assert_eq!(p.largest_free(), p.regions().iter().map(|r| r.1 - hdr(r.0)).max().unwrap());
         }
     }
 }

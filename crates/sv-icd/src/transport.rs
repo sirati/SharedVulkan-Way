@@ -2076,6 +2076,11 @@ pub struct PoolView {
     source: PoolSource,
     /// `(region, bytes mapped)`.
     mapped: Mutex<Vec<(u32, u64)>>,
+    /// §108: regions in the guest's RAM this process maps: how many of its
+    /// leases are in each, the bytes mapped, and the lease file it holds a
+    /// shared lock on while it maps the region (the host peer answers
+    /// `UNMAPPED` only once nobody holds it).
+    ram: Mutex<std::collections::BTreeMap<u32, RamHold>>,
     pub granule: u64,
     pub session_cap: u64,
     pub capacity: u64,
@@ -2119,6 +2124,7 @@ impl Attached {
         t.pool = Some(PoolView {
             source,
             mapped: Mutex::new(vec![(0, arena_len)]),
+            ram: Mutex::new(std::collections::BTreeMap::new()),
             granule: info.lease_granule,
             session_cap: info.session_cap,
             capacity: info.capacity,
@@ -2172,6 +2178,20 @@ impl RingTransport {
             return Err(LowerError::Result(r.result));
         }
         let (region, local) = sv_arena::pool::split(r.offset);
+        // §108: a region in the guest's RAM, published by the host's peer.
+        if region > 0 && self.ram_region_published(pool, region) {
+            let mut ram = pool.ram.lock().unwrap_or_else(|e| e.into_inner());
+            if !ram.contains_key(&region) {
+                let hold = self.map_ram_region(pool, region)?;
+                ram.insert(region, hold);
+            }
+            let h = ram.get_mut(&region).expect("inserted above");
+            if local + r.len > h.len {
+                return Err(LowerError::Shape("a lease past the end of its guest-RAM region"));
+            }
+            h.leases += 1;
+            return Ok((r.offset, r.len, r.memory_type));
+        }
         let covered = pool
             .mapped
             .lock()
@@ -2240,9 +2260,90 @@ impl RingTransport {
         let mut reply = Vec::new();
         self.call(RingClass::Device, sv_proto::sv::SV_RELEASE_ARENA, &cmd, &mut reply)?;
         let r = sv_proto::sv::ReleaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        // §108 rule 4: the last lease of a guest-RAM region gone, this
+        // process stops mapping it (the range becomes PROT_NONE, so a stale
+        // pointer faults here instead of reaching the guest) and lets go of
+        // its lease file.
+        if let Some(pool) = self.pool.as_ref() {
+            let (region, _) = sv_arena::pool::split(offset);
+            let mut ram = pool.ram.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = ram.get_mut(&region) {
+                h.leases = h.leases.saturating_sub(1);
+                if h.leases == 0 {
+                    let h = ram.remove(&region).expect("present");
+                    let _ = self.arena.unmap_fixed(u64::from(region) * sv_arena::pool::REGION_STRIDE, h.len);
+                    drop(h);
+                }
+            }
+        }
         if r.result != 0 {
             return Err(LowerError::Result(r.result));
         }
         Ok(())
     }
+
+    #[cfg(target_os = "linux")]
+    fn ram_region_published(&self, pool: &PoolView, k: u32) -> bool {
+        if pool.ram.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&k) {
+            return true;
+        }
+        let PoolSource::Path(boot) = &pool.source else { return false };
+        std::path::Path::new(&format!("{}-{k}.ram", boot)).exists()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ram_region_published(&self, _pool: &PoolView, _k: u32) -> bool {
+        false
+    }
+
+    /// Map guest-RAM region `k` from the runs the host's peer published,
+    /// holding its lease file shared while it is mapped.
+    #[cfg(target_os = "linux")]
+    fn map_ram_region(&self, pool: &PoolView, k: u32) -> IcdResult<RamHold> {
+        use std::os::fd::{AsFd, AsRawFd};
+        let PoolSource::Path(boot) = &pool.source else {
+            return Err(LowerError::Shape("a guest-RAM region with no pool name"));
+        };
+        let text = std::fs::read_to_string(format!("{boot}-{k}.ram")).map_err(|_| LowerError::Shape("the guest-RAM region description is gone"))?;
+        let (mut epoch, mut ram, mut len, mut runs) = (0u64, String::new(), 0u64, Vec::new());
+        for l in text.lines() {
+            let w: Vec<&str> = l.split_whitespace().collect();
+            match w.as_slice() {
+                ["epoch", e] => epoch = e.parse().unwrap_or(0),
+                ["ram", p] => ram = p.to_string(),
+                ["len", n] => len = n.parse().unwrap_or(0),
+                ["run", f, x, n] => runs.push((f.parse::<u64>().unwrap_or(0), x.parse::<u64>().unwrap_or(0), n.parse::<u64>().unwrap_or(0))),
+                _ => {}
+            }
+        }
+        if epoch == 0 || ram.is_empty() || len == 0 || len > sv_arena::pool::REGION_STRIDE || runs.iter().map(|r| r.2).sum::<u64>() != len {
+            return Err(LowerError::Shape("a malformed guest-RAM region description"));
+        }
+        let lock = std::fs::File::open(format!("{boot}-{k}-{epoch}.lease")).map_err(|_| LowerError::Shape("the guest-RAM region lease file is gone"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            return Err(LowerError::Shape("a guest-RAM region that is being retired"));
+        }
+        let f = sv_transport::region::open_named(&ram).map_err(lower)?;
+        let base = u64::from(k) * sv_arena::pool::REGION_STRIDE;
+        for (off, at, n) in runs {
+            if let Err(e) = self.arena.map_fixed(base + at, f.as_fd(), off, n) {
+                let _ = self.arena.unmap_fixed(base, len);
+                return Err(lower(e));
+            }
+        }
+        Ok(RamHold { leases: 0, len, _lock: lock })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn map_ram_region(&self, _pool: &PoolView, _k: u32) -> IcdResult<RamHold> {
+        Err(LowerError::Shape("a guest-RAM region on this system"))
+    }
+}
+
+/// One guest-RAM region this process maps (§108).
+pub struct RamHold {
+    leases: u64,
+    len: u64,
+    /// Held for its shared `flock`; closing it is letting go.
+    _lock: std::fs::File,
 }

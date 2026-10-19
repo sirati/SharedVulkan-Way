@@ -12,6 +12,8 @@ pub mod policy;
 pub mod provider;
 pub mod testlayout;
 #[cfg(target_os = "linux")]
+pub mod simram;
+#[cfg(target_os = "linux")]
 pub mod peer;
 #[cfg(windows)]
 pub mod winsub;

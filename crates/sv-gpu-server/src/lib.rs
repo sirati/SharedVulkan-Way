@@ -27,6 +27,7 @@ pub mod features;
 pub mod ivshmem;
 pub mod pool;
 pub mod pool_guest;
+pub mod regions;
 pub mod convert;
 pub mod driver;
 pub mod server;

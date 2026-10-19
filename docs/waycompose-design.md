@@ -34102,17 +34102,20 @@ restart within one boot still knows the old run's leases.
 
 ### 108.5 When a side dies
 
-* **The provider dies.** The provider beat stops (no beat for 2 s), or the run
-  id changes. The peer then treats every entry of that run as `RETIRING`. It
-  revokes all mapping leases (the sessions of that pool ended with their owner
-  anyway), unmaps, and writes `UNMAPPED` with each epoch. The memory itself must
-  outlive the provider until then. On Windows a keeper holds it (108.10), and
-  on the Mac whatever holds the chunk's name does. The next provider run
-  **adopts** the dead run's entries: it rewrites them under its own run id,
-  with `flags` bit 0 and the old epoch, as `RETIRING`, and frees each one when
-  `UNMAPPED` arrives. A substrate whose memory the provider's death frees at
-  once (Windows AWE, private `VirtualAlloc`) cannot satisfy rule 3 and is not
-  allowed as a region's kind.
+* **The provider dies.** Its memory must outlive it. On Windows the keeper
+  holds it (108.10); on the Mac, whatever holds the chunk's name does. While
+  something holds it, a host write into the region lands in memory the guest
+  has given to no one else, so **the peer does not have to notice the death at
+  all**, and it has no timeout that could fire early on a provider that is only
+  slow. The next provider run of the pool **adopts** the dead run's entries: it
+  publishes its own run id and rewrites every live entry as `RETIRING`, with
+  `flags` bit 0 and the old epoch. The peer then lets go as for any retire, and
+  the new provider frees each region when `UNMAPPED` for its epoch arrives. If
+  no provider of that pool ever starts again, the memory stays held. That
+  costs memory, never correctness. A substrate whose memory the provider's
+  death frees at once (Windows AWE, a private `VirtualAlloc`) cannot satisfy
+  rule 3, so it is not allowed as a region's kind. The provider beat is for
+  the peer's logs and the user's status display only.
 * **The peer dies.** Nothing is freed while its acknowledgements are
   outstanding. A new peer run reads the table and answers everything (108.4).
   The provider keeps running and keeps leasing in regions that are `MAPPED`.

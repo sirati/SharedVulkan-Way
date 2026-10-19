@@ -64,6 +64,7 @@ mod imp {
             Some("test") => test(&args[1..]),
             Some("canary") => canary(&args[1..]),
             Some("hog") => hog(&args[1..]),
+            Some("jitter") => jitter(&args[1..]),
             Some("stats") => {
                 let (mut k, _) = sv_ram::keeper::KeeperClient::connect("stats")?;
                 println!("{}", k.stats()?);
@@ -155,6 +156,7 @@ mod imp {
         let secs: u64 = opt(a, "--secs").map_or(Ok(0), |s| s.parse()).map_err(|e: std::num::ParseIntError| e.to_string())?;
         let sizes: Vec<u64> = opt(a, "--sizes").unwrap_or("64M").split(',').map(size).collect::<Result<_, _>>()?;
         let hold_ms: u64 = opt(a, "--hold-ms").map_or(Ok(500), |s| s.parse()).map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let stride: u64 = opt(a, "--verify-stride").map_or(Ok(8), |s| s.parse()).map_err(|e: std::num::ParseIntError| e.to_string())?;
         let pool = opt(a, "--pool").unwrap_or("test").to_string();
         let bell_name = opt(a, "--bell");
         let leak_pid_file = opt(a, "--pid-file");
@@ -180,7 +182,7 @@ mod imp {
         let mut workers = Vec::new();
         for s in 0..sessions {
             let (tx, stop, totals, sizes) = (tx.clone(), stop.clone(), totals.clone(), sizes.clone());
-            workers.push(std::thread::spawn(move || session(s, tx, stop, totals, &sizes, cycles, hold_ms)));
+            workers.push(std::thread::spawn(move || session(s, tx, stop, totals, &sizes, cycles, hold_ms, stride)));
         }
         drop(tx);
 
@@ -277,8 +279,9 @@ mod imp {
         }
         let k = prov.substrate.keeper.stats().unwrap_or_default();
         println!(
-            "[ram] {} DONE grows={} bytes={} MiB verified={} MiB refused={} errors={} keeper={k}",
+            "[ram] {} DONE large-page views={} grows={} bytes={} MiB verified={} MiB refused={} errors={} keeper={k}",
             ts(),
+            prov.substrate.large_translations,
             totals.grows.load(Ordering::Relaxed),
             totals.bytes.load(Ordering::Relaxed) >> 20,
             totals.verified_bytes.load(Ordering::Relaxed) >> 20,
@@ -298,7 +301,7 @@ mod imp {
     }
 
     /// One session: grow, check what the host wrote, write back, hold, give back.
-    fn session(s: usize, tx: mpsc::Sender<Req>, stop: Arc<AtomicBool>, totals: Arc<Totals>, sizes: &[u64], cycles: u64, hold_ms: u64) {
+    fn session(s: usize, tx: mpsc::Sender<Req>, stop: Arc<AtomicBool>, totals: Arc<Totals>, sizes: &[u64], cycles: u64, hold_ms: u64, stride: u64) {
         let unit = sv_transport::lpstamp::UNIT;
         let mut n = 0u64;
         while !stop.load(Ordering::Relaxed) && (cycles == 0 || n < cycles) {
@@ -342,15 +345,23 @@ mod imp {
                         bad += 1;
                         first_bad.get_or_insert(off);
                     }
-                    off += 8;
+                    off += stride;
                 }
             }
             let verify = t.elapsed();
             totals.verified_bytes.fetch_add(g.len, Ordering::Relaxed);
             // The host's counters must be moving.
             let c0: Vec<u64> = (0..units).map(|u| rd(g.base, u * unit + OFF_COUNTER)).collect();
-            std::thread::sleep(Duration::from_millis(20));
-            let still = (0..units).filter(|&u| rd(g.base, u * unit + OFF_COUNTER) == c0[u as usize]).count();
+            // Every counter must move within 2 s: the host is still writing.
+            let t = Instant::now();
+            let mut still;
+            loop {
+                std::thread::sleep(Duration::from_millis(5));
+                still = (0..units).filter(|&u| rd(g.base, u * unit + OFF_COUNTER) == c0[u as usize]).count();
+                if still == 0 || t.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
             // Our pattern for the host to check.
             for u in 0..units {
                 let mut off = u * unit + GUEST_PAGE;
@@ -394,6 +405,10 @@ mod imp {
     unsafe extern "system" {
         fn VirtualAlloc(a: *mut core::ffi::c_void, n: usize, t: u32, p: u32) -> *mut core::ffi::c_void;
         fn VirtualFree(a: *mut core::ffi::c_void, n: usize, t: u32) -> i32;
+        fn SetPriorityClass(p: isize, c: u32) -> i32;
+        fn SetThreadPriority(t: isize, p: i32) -> i32;
+        fn GetCurrentProcess() -> isize;
+        fn GetCurrentThread() -> isize;
     }
 
     fn valloc(len: usize) -> Result<usize, String> {
@@ -440,6 +455,39 @@ mod imp {
             println!("[canary] {} cycle {cyc}: {checks} checks, {corrupt} corrupt words so far", ts());
         }
         if corrupt > 0 { Err(format!("{corrupt} corrupt words")) } else { Ok(()) }
+    }
+
+    /// A scheduling-stall monitor: sleep 1 ms in a loop and report every
+    /// oversleep past the threshold, and the worst per minute. A guest that
+    /// hangs or stalls during an allocation shows up here before ssh notices.
+    fn jitter(a: &[String]) -> Result<(), String> {
+        let secs: u64 = opt(a, "--secs").unwrap_or("3600").parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let thr = Duration::from_millis(opt(a, "--threshold-ms").unwrap_or("50").parse().map_err(|e: std::num::ParseIntError| e.to_string())?);
+        // Time-critical, so that only a stall of the whole system (a kernel
+        // lock, a DPC storm, the host descheduling the vCPU) delays it, and
+        // not the instruments' own busy threads.
+        unsafe {
+            SetPriorityClass(GetCurrentProcess(), 0x80);
+            SetThreadPriority(GetCurrentThread(), 15);
+        }
+        let end = Instant::now() + Duration::from_secs(secs);
+        let (mut worst, mut minute, mut over) = (Duration::ZERO, Instant::now(), 0u64);
+        while Instant::now() < end {
+            let t = Instant::now();
+            std::thread::sleep(Duration::from_millis(1));
+            let d = t.elapsed();
+            worst = worst.max(d);
+            if d > thr {
+                over += 1;
+                println!("[jitter] {} STALL {:.1} ms", ts(), d.as_secs_f64() * 1e3);
+            }
+            if minute.elapsed() >= Duration::from_secs(60) {
+                println!("[jitter] {} minute: worst sleep(1 ms) {:.1} ms, {over} stall(s) so far", ts(), worst.as_secs_f64() * 1e3);
+                worst = Duration::ZERO;
+                minute = Instant::now();
+            }
+        }
+        Ok(())
     }
 
     fn hog(a: &[String]) -> Result<(), String> {

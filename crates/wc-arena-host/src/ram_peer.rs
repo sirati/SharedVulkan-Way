@@ -16,7 +16,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use sv_ram::peer::{Peer, PeerEvent};
 use sv_ram::testlayout::*;
@@ -41,8 +42,21 @@ fn find_memfd(pid: u32) -> Result<std::path::PathBuf, String> {
     Err(format!("no memfd:memory-backend among {dir}"))
 }
 
-struct Traffic {
+/// One mapped region the writer thread works on. The scan takes `busy` and
+/// sets `stop` before it unmaps, so no write is ever in flight into a region
+/// after its `UNMAPPED` (the in-process form of a mapping lease, §108.4 rule 4).
+struct Job {
+    entry: u32,
+    base: usize,
+    len: u64,
     epoch: u64,
+    stop: AtomicBool,
+    busy: Mutex<JobState>,
+}
+
+#[derive(Default)]
+struct JobState {
+    filled: bool,
     guest_checked: bool,
     counter: u64,
 }
@@ -60,7 +74,8 @@ pub fn main(args: &[String]) -> std::process::ExitCode {
 fn run(a: &[String]) -> Result<(), String> {
     let opt = |k: &str| a.iter().position(|x| x == k).and_then(|i| a.get(i + 1)).cloned();
     let boot_path = opt("--boot").ok_or("--boot FILE is required")?;
-    let table_off: u64 = opt("--table-off").map_or(Ok(4096), |s| s.parse()).map_err(|e| format!("--table-off: {e}"))?;
+    let auto = opt("--table-off").as_deref() == Some("auto");
+    let table_off: u64 = if auto { 0 } else { opt("--table-off").map_or(Ok(4096), |s| s.parse()).map_err(|e| format!("--table-off: {e}"))? };
     let stats_secs: u64 = opt("--stats-secs").map_or(Ok(30), |s| s.parse()).map_err(|e| format!("--stats-secs: {e}"))?;
     let traffic_on = !a.iter().any(|x| x == "--no-traffic");
     let ram_path = match (opt("--ram"), opt("--qemu-pid")) {
@@ -74,7 +89,31 @@ fn run(a: &[String]) -> Result<(), String> {
     let ram = std::fs::OpenOptions::new().read(true).write(true).open(&ram_path).map_err(|e| format!("{}: {e}", ram_path.display()))?;
     let ram_len = ram.metadata().map_err(|e| e.to_string())?.len();
     let run = std::process::id() as u64 ^ (Instant::now().elapsed().as_nanos() as u64) << 20;
+    // `auto`: the GPU pool says where its table is (poolhdr word 32); wait for it.
+    let header_table = |b: &SharedRegion| {
+        let mut h = [0u8; 64];
+        let _ = b.read_bytes(0, &mut h);
+        sv_transport::poolhdr::region_table(&h)
+    };
+    let table_off = if auto {
+        let t = Instant::now();
+        loop {
+            let o = header_table(&boot);
+            if o != 0 {
+                break o;
+            }
+            if t.elapsed() > Duration::from_secs(600) {
+                return Err("no region table published in 600 s".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        table_off
+    };
     let mut peer = Peer::attach(boot, table_off, ram, run)?;
+    if a.iter().any(|x| x == "--publish") {
+        peer.publish_to(&boot_path, &ram_path.to_string_lossy());
+    }
     eprintln!("[peer] {} boot {boot_path} ({} MiB), table at {table_off}, guest RAM {} ({} MiB)", ts(), blen >> 20, ram_path.display(), ram_len >> 20);
 
     // The doorbell: QEMU's chardev socket (or a hub's). A reader thread turns
@@ -98,18 +137,30 @@ fn run(a: &[String]) -> Result<(), String> {
         None => None,
     };
 
-    let mut traffic: BTreeMap<u32, Traffic> = BTreeMap::new();
-    let (mut mapped_n, mut unmapped_n, mut refused_n, mut bad_total) = (0u64, 0u64, 0u64, 0u64);
-    let (mut fill_bytes, mut fill_ns) = (0u64, 0u128);
+
+    let jobs: Arc<Mutex<BTreeMap<u32, Arc<Job>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let bad_total = Arc::new(AtomicU64::new(0));
+    let fill = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    if traffic_on {
+        let (jobs, bad_total, fill) = (jobs.clone(), bad_total.clone(), fill.clone());
+        std::thread::spawn(move || writer(jobs, bad_total, fill));
+    }
+    let (mut mapped_n, mut unmapped_n, mut refused_n) = (0u64, 0u64, 0u64);
     let mut last_beat = Instant::now();
     let mut last_stats = Instant::now();
     loop {
         // Wait for a token or 1 ms, whichever first; drain the rest.
         let _ = wrx.recv_timeout(Duration::from_millis(1));
         while wrx.try_recv().is_ok() {}
+        let mut stopped: BTreeMap<u32, JobState> = BTreeMap::new();
         let evs = peer.scan(|m| {
-            // the writer is this thread: nothing runs on the region after this
-            let _ = m;
+            let job = jobs.lock().unwrap().remove(&m.entry);
+            if let Some(j) = job {
+                j.stop.store(true, Ordering::SeqCst);
+                // Wait out the unit the writer may be in the middle of.
+                let st = std::mem::take(&mut *j.busy.lock().unwrap());
+                stopped.insert(m.entry, st);
+            }
         });
         let mut answered = false;
         for ev in &evs {
@@ -118,27 +169,12 @@ fn run(a: &[String]) -> Result<(), String> {
                     answered = true;
                     mapped_n += 1;
                     let m = &peer.maps[entry];
-                    let mut line = format!("[peer] {} MAPPED entry {entry} k {k} {} MiB, {runs} run(s), locate {locate_us} us, map+verify {map_us} us", ts(), len >> 20);
+                    println!("[peer] {} MAPPED entry {entry} k {k} {} MiB, {runs} run(s), locate {locate_us} us, map+verify {map_us} us", ts(), len >> 20);
                     if traffic_on {
-                        let t = Instant::now();
                         let base = unsafe { m.view.base_ptr() } as usize;
-                        for u in 0..len / UNIT {
-                            let mut off = u * UNIT + HOST_FROM;
-                            let end = (u + 1) * UNIT;
-                            while off < end {
-                                unsafe { std::ptr::write_volatile((base + off as usize) as *mut u64, pattern(m.epoch, off)) };
-                                off += 8;
-                            }
-                        }
-                        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                        unsafe { std::ptr::write_volatile((base + OFF_HOST_FILLED as usize) as *mut u64, m.epoch) };
-                        let ns = t.elapsed().as_nanos();
-                        fill_bytes += len;
-                        fill_ns += ns;
-                        line.push_str(&format!(", filled in {:.1} ms ({:.2} GB/s)", ns as f64 / 1e6, *len as f64 / ns as f64));
-                        traffic.insert(*entry, Traffic { epoch: m.epoch, guest_checked: false, counter: 0 });
+                        let j = Job { entry: *entry, base, len: *len, epoch: m.epoch, stop: AtomicBool::new(false), busy: Mutex::new(JobState::default()) };
+                        jobs.lock().unwrap().insert(*entry, Arc::new(j));
                     }
-                    println!("{line}");
                 }
                 PeerEvent::Refused { entry, k, reason, why } => {
                     answered = true;
@@ -148,12 +184,12 @@ fn run(a: &[String]) -> Result<(), String> {
                 PeerEvent::Unmapped { entry, k } => {
                     answered = true;
                     unmapped_n += 1;
-                    let t = traffic.remove(entry);
+                    let t = stopped.get(entry);
                     println!(
-                        "[peer] {} UNMAPPED entry {entry} k {k} (wrote its counters {} times, guest pattern {})",
+                        "[peer] {} UNMAPPED entry {entry} k {k} (counters written {} times, guest pattern {})",
                         ts(),
-                        t.as_ref().map_or(0, |t| t.counter),
-                        t.as_ref().map_or("n/a", |t| if t.guest_checked { "checked" } else { "never seen" })
+                        t.map_or(0, |t| t.counter),
+                        t.map_or("n/a", |t| if t.guest_checked { "checked" } else { "never seen" })
                     );
                 }
                 PeerEvent::ProviderRun { run } => println!("[peer] {} provider run {run:016x}", ts()),
@@ -164,51 +200,99 @@ fn run(a: &[String]) -> Result<(), String> {
                 let _ = b.write_all(&[REGION_TOKEN]);
             }
         }
-        // The writers: every mapped region's counters, every pass, until the
-        // region is retired. A host that kept writing after the guest freed
-        // the memory would show up in the guest's canary.
-        if traffic_on {
-            for (entry, t) in traffic.iter_mut() {
-                let Some(m) = peer.maps.get(entry) else { continue };
-                let base = unsafe { m.view.base_ptr() } as usize;
-                t.counter += 1;
-                for u in 0..m.len / UNIT {
-                    unsafe { std::ptr::write_volatile((base + (u * UNIT + OFF_COUNTER) as usize) as *mut u64, t.counter) };
-                }
-                if !t.guest_checked && unsafe { std::ptr::read_volatile((base + OFF_GUEST_DONE as usize) as *const u64) } == t.epoch {
-                    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-                    let mut bad = 0u64;
-                    for u in 0..m.len / UNIT {
-                        let mut off = u * UNIT + GUEST_PAGE;
-                        while off < u * UNIT + HOST_FROM {
-                            if unsafe { std::ptr::read_volatile((base + off as usize) as *const u64) } != guest_pattern(t.epoch, off) {
-                                bad += 1;
-                            }
-                            off += 8;
-                        }
-                    }
-                    t.guest_checked = true;
-                    bad_total += bad;
-                    if bad > 0 {
-                        println!("[peer] {} entry {entry}: {bad} word(s) of the guest's pattern wrong", ts());
-                    }
-                }
-            }
-        }
         if last_beat.elapsed() >= Duration::from_millis(BEAT_MS) {
             peer.beat();
+            if auto {
+                let o = header_table(peer.boot());
+                if o != 0 && o != peer.table_off() {
+                    println!("[peer] {} the region table moved to +{o}", ts());
+                    let _ = peer.set_table_off(o);
+                }
+            }
             last_beat = Instant::now();
         }
         if last_stats.elapsed() >= Duration::from_secs(stats_secs) {
             let bytes: u64 = peer.maps.values().map(|m| m.len).sum();
+            let (fb, fns) = (fill.0.load(Ordering::Relaxed), fill.1.load(Ordering::Relaxed));
             println!(
-                "[peer] {} STATS mapped now {} regions {} MiB; total mapped {mapped_n} unmapped {unmapped_n} refused {refused_n}; guest-pattern bad words {bad_total}; fill {:.2} GB/s avg",
+                "[peer] {} STATS mapped now {} regions {} MiB; total mapped {mapped_n} unmapped {unmapped_n} refused {refused_n}; guest-pattern bad words {}; fill {:.2} GB/s avg",
                 ts(),
                 peer.maps.len(),
                 bytes >> 20,
-                if fill_ns > 0 { fill_bytes as f64 / fill_ns as f64 } else { 0.0 }
+                bad_total.load(Ordering::Relaxed),
+                if fns > 0 { fb as f64 / fns as f64 } else { 0.0 }
             );
             last_stats = Instant::now();
         }
+    }
+}
+
+fn w64(base: usize, off: u64, v: u64) {
+    unsafe { std::ptr::write_volatile((base + off as usize) as *mut u64, v) }
+}
+fn r64(base: usize, off: u64) -> u64 {
+    unsafe { std::ptr::read_volatile((base + off as usize) as *const u64) }
+}
+
+/// The stand-in for a proxy writing pixels: fill each new region once, then
+/// write every unit's counter on every pass until the region is retired.
+/// Works one 2 MiB unit at a time and looks at `stop` between units.
+fn writer(jobs: Arc<Mutex<BTreeMap<u32, Arc<Job>>>>, bad_total: Arc<AtomicU64>, fill: Arc<(AtomicU64, AtomicU64)>) {
+    loop {
+        let list: Vec<Arc<Job>> = jobs.lock().unwrap().values().cloned().collect();
+        for j in list {
+            let mut st = j.busy.lock().unwrap();
+            if j.stop.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !st.filled {
+                let t = Instant::now();
+                let mut done = true;
+                for u in 0..j.len / UNIT {
+                    if j.stop.load(Ordering::SeqCst) {
+                        done = false;
+                        break;
+                    }
+                    let mut off = u * UNIT + HOST_FROM;
+                    while off < (u + 1) * UNIT {
+                        w64(j.base, off, pattern(j.epoch, off));
+                        off += 8;
+                    }
+                }
+                if !done {
+                    continue;
+                }
+                std::sync::atomic::fence(Ordering::Release);
+                w64(j.base, OFF_HOST_FILLED, j.epoch);
+                let ns = t.elapsed().as_nanos() as u64;
+                fill.0.fetch_add(j.len, Ordering::Relaxed);
+                fill.1.fetch_add(ns, Ordering::Relaxed);
+                println!("[peer] {} entry {} filled {} MiB in {:.1} ms ({:.2} GB/s)", ts(), j.entry, j.len >> 20, ns as f64 / 1e6, j.len as f64 / ns as f64);
+                st.filled = true;
+            }
+            st.counter += 1;
+            for u in 0..j.len / UNIT {
+                w64(j.base, u * UNIT + OFF_COUNTER, st.counter);
+            }
+            if !st.guest_checked && r64(j.base, OFF_GUEST_DONE) == j.epoch {
+                std::sync::atomic::fence(Ordering::Acquire);
+                let mut bad = 0u64;
+                for u in 0..j.len / UNIT {
+                    let mut off = u * UNIT + GUEST_PAGE;
+                    while off < u * UNIT + HOST_FROM {
+                        if r64(j.base, off) != guest_pattern(j.epoch, off) {
+                            bad += 1;
+                        }
+                        off += 8;
+                    }
+                }
+                st.guest_checked = true;
+                if bad > 0 {
+                    bad_total.fetch_add(bad, Ordering::Relaxed);
+                    println!("[peer] {} entry {}: {bad} word(s) of the guest's pattern wrong", ts(), j.entry);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }

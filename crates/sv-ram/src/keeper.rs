@@ -175,7 +175,20 @@ mod imp {
         }
     }
 
+    /// Windows keeps this much physical memory for itself whatever we ask
+    /// (§108.6): max(1 GiB, 15% of RAM), or `WC_RAM_RESERVE_MIB`.
+    fn reserve(total: u64) -> u64 {
+        if let Some(m) = std::env::var("WC_RAM_RESERVE_MIB").ok().and_then(|s| s.parse::<u64>().ok()) {
+            return m << 20;
+        }
+        (1u64 << 30).max(total / 100 * 15)
+    }
+
     fn alloc(run: u64, me: u64, pool: &str, len: u64, st: &Mutex<State>) -> String {
+        let (total, avail) = memory_status();
+        if avail < len.saturating_add(reserve(total)) {
+            return format!("err budget: {} MiB asked, {} MiB available, {} MiB kept for Windows", len >> 20, avail >> 20, reserve(total) >> 20);
+        }
         let id = {
             let mut s = st.lock().unwrap();
             let id = s.next_id;

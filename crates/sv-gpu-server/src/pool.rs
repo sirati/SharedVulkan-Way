@@ -67,6 +67,9 @@ pub struct PoolServer {
     /// steps.
     logged_high: Mutex<u64>,
     next_session: std::sync::atomic::AtomicU64,
+    /// §108: called with the pool unlocked when a lease does not fit; true
+    /// means a region was added and the lease is worth trying again.
+    grower: std::sync::OnceLock<Box<dyn Fn(u64) -> bool + Send + Sync>>,
 }
 
 /// A session's handle on the pool.
@@ -94,7 +97,57 @@ impl PoolServer {
             importer,
             logged_high: Mutex::new(0),
             next_session: std::sync::atomic::AtomicU64::new(1),
+            grower: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Grow on demand from now on (§108).
+    pub fn set_grower(&self, g: Box<dyn Fn(u64) -> bool + Send + Sync>) {
+        let _ = self.grower.set(g);
+    }
+
+    pub fn capacity_and_free(&self) -> (u64, u64) {
+        let p = self.pool();
+        (p.capacity(), p.free())
+    }
+
+    pub fn largest_free(&self) -> u64 {
+        self.pool().largest_free()
+    }
+
+    pub fn next_region_id(&self) -> Option<u32> {
+        self.pool().next_region_id()
+    }
+
+    pub fn empty_regions(&self) -> Vec<u32> {
+        self.pool().empty_regions()
+    }
+
+    /// Add region `id`, which this process sees as `view`.
+    pub fn add_region(&self, id: u32, view: Arc<SharedRegion>) -> Result<(), String> {
+        let mut regions = self.regions.write().unwrap_or_else(|e| e.into_inner());
+        let slot = regions.get_mut(id as usize).ok_or("region id out of range")?;
+        self.pool().add_region(id, view.len() as u64).map_err(|e| format!("{e}"))?;
+        *slot = Some(view);
+        Ok(())
+    }
+
+    /// Take region `id` out of the pool, if it holds no lease. After this no
+    /// lease can land in it and this process no longer reads it.
+    pub fn remove_region(&self, id: u32) -> Result<(), String> {
+        let mut regions = self.regions.write().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut p = self.pool();
+            p.drain(id);
+            if let Err(e) = p.remove_region(id) {
+                p.undrain(id);
+                return Err(format!("{e}"));
+            }
+        }
+        if let Some(s) = regions.get_mut(id as usize) {
+            *s = None;
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> PoolConfig {
@@ -179,7 +232,16 @@ impl PoolServer {
         // asks for the report: a guard in a `match` scrutinee lives to the end
         // of the `match`, and `report` takes the same lock (measured: the
         // first refused lease hung the whole process).
-        let leased = self.pool().lease(session, len, purpose);
+        let mut leased = self.pool().lease(session, len, purpose);
+        // §108: the pool, not the session, ran out. Grow (with the pool
+        // unlocked) and try once more.
+        if matches!(leased, Err(PoolError::NoSpace { .. })) && purpose != Purpose::Control {
+            if let Some(grow) = self.grower.get() {
+                if grow(len) {
+                    leased = self.pool().lease(session, len, purpose);
+                }
+            }
+        }
         let lease = match leased {
             Ok(l) => l,
             Err(e) => {

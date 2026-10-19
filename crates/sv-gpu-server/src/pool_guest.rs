@@ -64,8 +64,15 @@ pub struct PoolServe {
     pub max_sessions: u32,
 }
 
+/// §108: how the pool grows: the most it may add, and what starts the
+/// region manager once the pool exists.
+pub struct Grow {
+    pub budget: u64,
+    pub start: Box<dyn FnOnce(Arc<SharedRegion>, Arc<crate::pool::PoolServer>) -> Result<(), String> + Send>,
+}
+
 /// Serve sessions from a pool over `boot`, for the life of the process.
-pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>) -> Result<(), String> {
+pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>, grow: Option<Grow>) -> Result<(), String> {
     let pool_nonce = nonce();
     let mailboxes = Arc::new(Mailboxes::new(Arc::clone(&boot)).map_err(|e| format!("the pool cannot hold its header: {e}"))?);
     // A previous owner's offers are forgotten before the new nonce is out.
@@ -75,9 +82,14 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
     // blob reserve. The offer waiting in a mailbox holds the control region.
     let pcfg = PoolConfig {
         reserve: geometry().control_size + sv_arena::pool::BLOB_LEASE,
-        ..PoolConfig::for_capacity(boot.len() as u64)
+        // A pool that grows sets its per-session cap from what it may grow
+        // to, not from the boot device (§108).
+        ..PoolConfig::for_capacity(boot.len() as u64 + grow.as_ref().map_or(0, |g| g.budget))
     };
     let server = PoolServer::new(pcfg, Arc::clone(&boot), Importer::HostPointer).map_err(|e| format!("{e}"))?;
+    if let Some(g) = grow {
+        (g.start)(Arc::clone(&boot), Arc::clone(&server))?;
+    }
     eprintln!(
         "[gpu] pool of {} MiB, nonce {pool_nonce:#018x}; a session may lease {} MiB besides its control \
          region, and {} MiB are kept for a session that has not started; {}",

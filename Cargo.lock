@@ -1105,6 +1105,7 @@ dependencies = [
  "sv-hostd",
  "sv-icd",
  "sv-proto",
+ "sv-ram",
  "sv-transport",
  "sv-wire",
  "wc-handle",
