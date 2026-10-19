@@ -429,6 +429,16 @@
           # now that one binary links the Vulkan side and the Wayland side.
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib -L ${libxkbcommonMingw}/lib"
 
+          # §103.9: linking for macOS on this machine. clang and lld are named
+          # rather than put on PATH, so nothing else in this shell meets a
+          # second C compiler; scripts/macos-linker.sh drives them with the SDK
+          # copied out of the macOS VM (scripts/macos-sdk.sh).
+          export WC_MACOS_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+          export WC_MACOS_LLD_BIN="${pkgs.llvmPackages.lld}/bin"
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$PWD/scripts/macos-linker.sh"
+          export MACOSX_DEPLOYMENT_TARGET=14.0
+          export SDKROOT="''${WC_MACOS_SDK:-/mnt/datasets/builds/macos-sdk/MacOSX14.5.sdk}"
+
           # For the C probe (scripts/probe-xkb.c) and for anything that wants to
           # find the headers without going through cargo.
           export WC_XKB_MINGW="${libxkbcommonMingw}"

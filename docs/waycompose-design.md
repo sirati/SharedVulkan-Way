@@ -31692,8 +31692,33 @@ nothing**. macOS has the same two tiers:
   `pinning=superpages`. In the VM, 1 GiB came back from one call and the
   wired-page count rose by exactly the mapping (103.11).
 
-`vm.user_wire_limit` in the VM is 9.4 GB of 12 GiB and `ulimit -l` is
-unlimited, so wiring is not a limit for a session's arena. Dynamic growth
+**Superpages need a VM with spare RAM; wired pages are the measured second
+tier.** At 8 and 12 GiB, superpages came back at once (the 8 GiB first window
+was 20 runs for 64 MiB). At 4 GiB, which is all this VM may have (103.10), not
+one 2 MiB superpage could be allocated, even one at a time, even after `purge`
+and with 1.8 GB free. XNU's contiguous allocator finds no free 2 MiB frame in a
+small guest. So on macOS, `alloc_locked_region` falls back to `mlock`. On XNU
+that *wires* the pages: wired pages are never paged, compressed or migrated,
+and the contiguous search skips them. That was measured, not assumed.
+`scripts/mac-pinning.sh` located one 64 MiB wired arena ten times across two
+sessions on the 4 GiB VM. Between the locates, a 2.5 GB and then a 3.5 GB
+allocation pushed up to 150 MB into the compressor. Every plan was identical,
+page for page, and every verify was complete (16128/16128). Windows'
+`VirtualLock` failed the same test (§84.5), which is why the tier exists on
+macOS only. It reports `pinning=wired`, and the arena is scattered: about
+12,000 runs per 64 MiB instead of 20. That costs nothing per frame (`wc-proxy`
+stitches the runs once into one view), but the locate is a full sweep.
+
+`vm.user_wire_limit` was 9.4 GB of 12 GiB and is 3.0 GB of 4 GiB, and `ulimit
+-l` is unlimited, so wiring is not a limit for a session's arena.
+
+**A latent `sv-hostd` bug, found here.** `QemuTarget::discover` took the
+sorted-first descriptor whose link contained `memfd:`. QEMU with a VNC display
+also holds `memfd:displaysurface`, and on the 4 GiB start that descriptor
+(fd 12) sorted before the RAM backend (fd 22). The sweep read 1 MiB and reported
+every page missing. It now asks for `memfd:memory-backend` first. No Windows
+guest showed it, because the fd numbers fell the other way there or there was
+no display memfd. Any VM with a VNC display could have. Dynamic growth
 (§97's pool, the user's rule that GPU memory is allocated and freed dynamically)
 uses the existing outbound/grow protocol: a grown region is another superpage
 allocation, stamped and located like the first. On macOS it is freed with
@@ -31904,7 +31929,16 @@ change only the calling process's own tile. No per-window identity exists. So:
   wc-launch -p sv-gpu-server` runs on this workstation without an SDK. It is
   the macOS counterpart of the Windows check. `wc-proxy`, `wc-arena-host` and
   `sv-hostd` are Linux-host programs in both roles and are not built for macOS.
-* **Linking and running** happen in the VM: Xcode Command Line Tools 16.2
+* **Linking happens on this workstation too.** `scripts/macos-sdk.sh` copies
+  the SDK (MacOSX14.5.sdk, Apple's, never committed) and MacPorts' static
+  libxkbcommon out of the VM. The flake names clang and lld (`WC_MACOS_CLANG`,
+  `WC_MACOS_LLD_BIN`; not on PATH, so no other build meets a second C
+  compiler) and sets `CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER` to
+  `scripts/macos-linker.sh`. `cargo build --target x86_64-apple-darwin -p
+  wc-compositor` then produces a Mach-O binary here in under a minute, and the
+  harnesses copy it into the VM. This is what makes a 4 GiB VM enough: the
+  generated sv-proto crates need 5 to 7 GB per compile and never build in the VM.
+* **The VM's toolchain** is kept for checking native builds: Xcode Command Line Tools 16.2
   (clang 16, SDKs 14.5 and 15.2, installed headless with `softwareupdate`),
   rustup stable (1.99.1), and **MacPorts** for libxkbcommon 1.7, MoltenVK 1.4.2
   and the Vulkan loader. MacPorts is used because Homebrew 7 refuses Intel Macs:
@@ -31928,7 +31962,18 @@ and may not override the manager's own process options. Manifests without the
 new keys produce byte-identical QEMU command lines: this was checked for all five
 existing instances against the previous script, which is kept beside it as
 `macos-vm.py.bak-20261019-before-shared-ram`. The other session's `work`
-instance was not touched.
+instance was not touched. The other session later reinstalled the manager from
+its own source, which dropped the change once. It was re-applied on top, and a
+patch and a note are in the store for that source.
+
+**RAM.** The user's rule is that a VM gets the least RAM its tests need. The
+manager now also enforces a shared 10 GB cap across its VMs, charging each one
+its RAM plus 1 GiB. With `work` at 3 GiB, that leaves about 4.3 GiB.
+`wayland-host` runs at **4096 MiB** with `shared_ram`: macOS boots to the
+desktop with 85% of memory free, and the window tests pass. 3072 MiB was not
+tried, because at 4096 MiB the guest already has no superpages, and a smaller
+guest only makes its wired arena share less room with Firefox. The VM is
+stopped whenever no test is running.
 
 ### 103.11 What has been run, and where
 
@@ -31940,4 +31985,7 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | MoltenVK 1.4.2 `vulkaninfo` | same VM | `VK_ERROR_INCOMPATIBLE_DRIVER`, "MoltenVK requires Metal, which is not available on this device" |
 | `cargo check --target x86_64-apple-darwin` (compositor, sv-guest, wc-launch, gpu server) | this workstation | passes after the cfg changes in this section |
 | native build of `wc-compositor` with the AppKit platform | the VM (CLT 16.2, rustup 1.99.1) | links against system frameworks only (`otool -L`); libxkbcommon 1.7 is linked statically from MacPorts' `.a` |
+| wired 4 KiB arena, located 10 times across 2 sessions with 2.5 to 3.5 GB of pressure between locates (`scripts/mac-pinning.sh`) | 4 GiB VM | every plan identical, every verify 16128/16128; ~12,000 runs per 64 MiB |
+| superpages at 4 GiB | 4 GiB VM | none, even one at a time, after `purge`, with 1.8 GB free |
+| first window at 4 GiB, compositor cross-linked on Linux | 4 GiB VM | `pinning=wired`, located, mapped 742x427 |
 | **first window**: `scripts/mac-window.sh`, weston-terminal on this workstation | the VM's desktop | arena of 64 MiB in superpages, located by `wc-arena-host` over QMP (verify 16128/16128 pages, one run), pixels as arena slices, the window mapped 742x427 with its caption folded; a Sonnet check of the QMP screendump: content fills the frame, upright, correct colours, ~80 columns, no doubled frame |

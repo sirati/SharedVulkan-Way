@@ -1762,7 +1762,7 @@ mod tests {
         match attach_guest_ram_with(9020, (3 * REGION_PAGE) as u64, PagePolicy::LargePagesOrRefuse) {
             Ok(r) => {
                 assert!(
-                    r.pinning == "large-pages" || r.pinning == "hugetlb" || r.pinning == "superpages",
+                    r.pinning == "large-pages" || r.pinning == "hugetlb" || r.pinning == "superpages" || r.pinning == "wired",
                     "default policy pinned with {}",
                     r.pinning
                 );

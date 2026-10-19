@@ -318,14 +318,11 @@ fn alloc_superpages(len: usize, stamp: &dyn Fn(u32, &mut [u8])) -> io::Result<Lo
     };
     if ptr == libc::MAP_FAILED {
         let e = io::Error::last_os_error();
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            crate::arena::refusal_text(&format!(
-                "mmap(VM_FLAGS_SUPERPAGE_SIZE_2MB, {len} bytes) failed: {e} (superpages exist on \
-                 x86_64 macOS only and need {} physically contiguous free 2 MiB frames)",
-                len / SUPERPAGE
-            )),
-        ));
+        eprintln!(
+            "wc-handle: no superpages for {len} bytes ({e}); taking wired 4 KiB pages, which \
+             XNU does not move (§103.3 measured it)"
+        );
+        return alloc_wired(len, stamp, e);
     }
     let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
     // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`.
@@ -334,6 +331,47 @@ fn alloc_superpages(len: usize, stamp: &dyn Fn(u32, &mut [u8])) -> io::Result<Lo
         stamp(i as u32, page);
     }
     Ok(LockedRegion { view, len, locked: true, pinning: "superpages" })
+}
+
+/// §103.3. macOS's second tier: `mlock`, which on XNU wires the pages, and a
+/// wired page is never paged, compressed or migrated (XNU has no compaction of
+/// wired memory; the superpage allocator's contiguous search skips them). That
+/// is a reading of the kernel and it was measured, not assumed: on the 4 GiB VM,
+/// where superpages are not available at all, `scripts/mac-pinning.sh` located
+/// one 64 MiB arena ten times across two sessions with up to 150 MB pushed into
+/// the compressor between locates, and every plan was identical and every
+/// verify complete. Windows' `VirtualLock` failed the same test (§84.5), which
+/// is why this tier exists on macOS only; elsewhere small pages remain the
+/// diagnostic.
+#[cfg(target_os = "macos")]
+fn alloc_wired(len: usize, stamp: &dyn Fn(u32, &mut [u8]), superpage_error: io::Error) -> io::Result<LockedRegion> {
+    // SAFETY: an anonymous private mapping with a null hint; checked below.
+    let ptr = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0)
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len };
+    // Wire before stamping, the order §84.5 found matters: a page stamped and
+    // then moved by the wiring would carry its stamp to the wrong frame.
+    // SAFETY: the mapping is live and `len` bytes long.
+    if unsafe { libc::mlock(ptr, len) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::arena::refusal_text(&format!(
+                "neither superpages ({superpage_error}) nor wired pages (mlock: {e}) for {len} bytes; \
+                 check vm.user_wire_limit"
+            )),
+        ));
+    }
+    // SAFETY: `ptr` is a live `len`-byte read-write mapping owned by `view`.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<u8>(), len) };
+    for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
+        stamp(i as u32, page);
+    }
+    Ok(LockedRegion { view, len, locked: true, pinning: "wired" })
 }
 
 /// `Hugepagesize:` from `/proc/meminfo`, which is the size `MAP_HUGETLB` with

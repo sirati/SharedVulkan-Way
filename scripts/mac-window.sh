@@ -24,7 +24,9 @@ secs=${WC_SECS:-120}
 arena_mib=${WC_ARENA_MIB:-64}
 arena=$((arena_mib * 1024 * 1024))
 out=$((1024 * 1024))
-bin=${WC_MAC_BIN:-/Users/c3r/src/svb/target/debug/wc-compositor}
+# The compositor is cross-built here (scripts/macos-linker.sh) and copied in.
+bin=/Users/c3r/wc/bin/wc-compositor
+local_bin=${WC_MAC_BIN:-$root/target/x86_64-apple-darwin/debug/wc-compositor}
 run=/mnt/datasets/builds/wcrun/mac-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$run/rt" && chmod 700 "$run/rt"
 port=$(sed -n 's/.*"ssh_port": \([0-9]*\).*/\1/p' "$idir/instance.json")
@@ -45,6 +47,9 @@ bh="$root/target/debug"
 for b in wc-arena-host wc-proxy; do [ -x "$bh/$b" ] || { say "build $b first (cargo build -p $b)"; exit 2; }; done
 
 say "run dir $run"
+[ -x "$local_bin" ] || { say "no macOS build at $local_bin (cargo build --target x86_64-apple-darwin -p wc-compositor)"; exit 2; }
+vm 'mkdir -p ~/wc/bin'
+rsync -a -e "ssh ${ssh_opts[*]}" "$local_bin" c3r@127.0.0.1:wc/bin/wc-compositor
 vm 'pkill -f "wc-compositor --socket wl-mac" 2>/dev/null; rm -rf /tmp/wcrt; mkdir -m 700 /tmp/wcrt'
 # The GUI session: a process started by sshd is outside the user's Aqua
 # bootstrap namespace and cannot reach the WindowServer.
@@ -55,7 +60,7 @@ for i in $(seq 1 60); do vm 'grep -q "listening on" /tmp/wcrt/comp.log 2>/dev/nu
 vm 'cat /tmp/wcrt/comp.log' > "$run/comp.log"
 grep -q "listening on" "$run/comp.log" || { say "the compositor did not start"; tail -20 "$run/comp.log"; exit 1; }
 runid=$(grep -o "run 0x[0-9a-f]*" "$run/comp.log" | head -1 | cut -d' ' -f2)
-pages=$(grep -o "[0-9]* pages" "$run/comp.log" | head -1 | cut -d' ' -f1)
+pages=$(grep -o "[0-9][0-9]* pages, locked" "$run/comp.log" | head -1 | cut -d' ' -f1)
 say "compositor up: arena run $runid, $pages pages, $(grep -o 'pinning=[a-z-]*' "$run/comp.log" | head -1)"
 
 t0=$(date +%s.%N)
