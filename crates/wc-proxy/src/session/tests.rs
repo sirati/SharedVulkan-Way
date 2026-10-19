@@ -3067,5 +3067,187 @@ mod dmabuf_tests {
             .map(|id| first(*id).unwrap_or_else(|| panic!("{id} never reached the compositor")))
             .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+/// §102.9. KWin's Wayland backend imports each swapchain buffer as its own
+/// pool and destroys the pool object at once (`WaylandBackend::importBuffer`,
+/// `wayland_backend.cpp`: `wl_shm_create_pool`, `wl_shm_pool_create_buffer`,
+/// `wl_shm_pool_destroy`), and it imports lazily, at the first present of each
+/// slot. So the second slot's pool is created after the compositor has
+/// acknowledged the first pool's destructor, and libwayland hands the second
+/// pool **the first pool's id**. The guest's log said so: `pool 29 … slice 0`,
+/// then `pool 29 … slice 3608576`.
+///
+/// Returns, per slot, the client's pixels and the arena slice the compositor
+/// was told to read that slot's buffer from.
+struct KwinSlots {
+    h: Harness,
+    dir: std::path::PathBuf,
+    surface: u32,
+    shm: u32,
+    w: i32,
+    hgt: i32,
+    /// (buffer id, client pixels, the descriptor its `create_pool` carried)
+    slots: Vec<(u32, &'static mut [u8], Descriptor)>,
+    /// The output as it stands after the last present.
+    canvas: Vec<u8>,
+}
+
+impl KwinSlots {
+    fn new(tag: &str, arena_id: u32, scope: CopyScope) -> KwinSlots {
+        let dir = tmpdir(tag);
+        let path = dir.join("arena");
+        let t = Arena::open_or_create(arena_id, &path, 4 << 20).unwrap();
+        wc_handle::arena::attach(arena_id, &path.to_string_lossy(), t.size()).unwrap();
+        let mut h = Harness::new(Box::new(t), scope, 1);
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        let shm = h.bind(registry, 2, "wl_shm", 2);
+        let surface = h.id();
+        h.send_words(compositor, 0, &[surface]);
+        KwinSlots { h, dir, surface, shm, w: 160, hgt: 90, slots: Vec::new(), canvas: Vec::new() }
+    }
+
+    /// `importBuffer` for one slot, with the pool id the client's libwayland
+    /// picked.
+    fn import(&mut self, pool: u32) -> usize {
+        let bytes = (self.w * 4 * self.hgt) as usize;
+        let (fd, ptr) = client_pool(bytes);
+        // SAFETY: what `mmap` returned in `client_pool`; leaked for the test's
+        // length, and this is the only reference to it.
+        let pixels: &'static mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+        let before = self.h.upstream.len();
+        let mut body = Vec::new();
+        body.extend_from_slice(&pool.to_ne_bytes());
+        body.extend_from_slice(&(bytes as u32).to_ne_bytes());
+        self.h.send(self.shm, op::SHM_CREATE_POOL, &body, &mut VecDeque::from([fd]));
+        let buffer = self.h.id();
+        let (w, hgt) = (self.w as u32, self.hgt as u32);
+        self.h.send_words(pool, op::POOL_CREATE_BUFFER, &[buffer, 0, w, hgt, w * 4, 1]);
+        self.h.send_words(pool, op::POOL_DESTROY, &[]);
+        // The descriptor this slot's `create_pool` carried, from the bytes
+        // that crossed after `before`.
+        let spec = Spec::builtin().unwrap();
+        let args = &spec.request("wl_shm", 0).unwrap().args;
+        let mut at = before;
+        let mut found = None;
+        while let Some(hd) = Header::parse(&self.h.upstream[at..]) {
+            let b = &self.h.upstream[at + 8..at + hd.size];
+            if hd.object == self.shm
+                && hd.opcode == op::SHM_CREATE_POOL
+                && let Ok(spans) = wire::walk(b, args, FdEncoding::InBand)
+                && let Some(d) = wire::bytes_at(b, &spans[1]).and_then(|x| Descriptor::decode(x).ok())
+            {
+                found = Some(d);
+            }
+            at += hd.size;
+        }
+        self.slots.push((buffer, pixels, found.expect("the slot's pool was published")));
+        self.slots.len() - 1
+    }
+
+    /// The compositor's `delete_id`, which is what lets the client recycle.
+    fn delete_id(&mut self, id: u32) {
+        let body = id.to_ne_bytes().to_vec();
+        self.h
+            .session
+            .server_message(Header { object: 1, opcode: op::DISPLAY_DELETE_ID, size: 12 }, &body)
+            .unwrap();
+    }
+
+    fn release(&mut self, slot: usize) {
+        let buffer = self.slots[slot].0;
+        self.h
+            .session
+            .server_message(Header { object: buffer, opcode: op::BUFFER_RELEASE, size: 8 }, &[])
+            .unwrap();
+    }
+
+    /// Render frame `tick` into `slot` the way QPainter does — the whole
+    /// picture is in the slot, damage is only what changed on the output — and
+    /// present it.
+    fn present(&mut self, slot: usize, tick: u8, damage: (i32, i32, i32, i32)) {
+        let stride = (self.w * 4) as usize;
+        if self.canvas.is_empty() {
+            self.canvas = vec![0x10; stride * self.hgt as usize];
+        }
+        let (x0, y0, dw, dh) = damage;
+        for y in y0..y0 + dh {
+            for x in x0..x0 + dw {
+                let at = y as usize * stride + x as usize * 4;
+                self.canvas[at..at + 4].copy_from_slice(&[tick, tick.wrapping_mul(3), 0x80, 0xff]);
+            }
+        }
+        // The slot gets the whole output, which is what the protocol asks of
+        // an attached buffer and what KWin's repaint of the slot's age does.
+        self.slots[slot].1.copy_from_slice(&self.canvas);
+        let buffer = self.slots[slot].0;
+        let s = self.surface;
+        self.h.send_words(s, op::SURFACE_ATTACH, &[buffer, 0, 0]);
+        let (x, y, w, hh) = damage;
+        self.h.send_words(s, op::SURFACE_DAMAGE_BUFFER, &[x as u32, y as u32, w as u32, hh as u32]);
+        self.h.send_words(s, op::SURFACE_COMMIT, &[]);
+    }
+
+    /// What the compositor reads for `slot`, against what the client drew.
+    fn slice_matches(&self, slot: usize) -> bool {
+        let (_, px, d) = &self.slots[slot];
+        let peer = wc_handle::Handle::from_descriptor(d.clone());
+        let map = peer.map().unwrap();
+        map.as_slice()[..px.len()] == px[..]
+    }
+}
+
+impl Drop for KwinSlots {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// §102.9, **the bug**: with damage-scoped copies the guest's window kept
+/// KWin's first frame. The sequence, as KWin's swapchain of two produces it:
+///
+/// 1. slot A imported: pool P, buffer A, `destroy` P; A presented.
+/// 2. the compositor acknowledges P's destructor (`delete_id`); P's id is free
+///    in the client, though A still lives on P's memory.
+/// 3. A is not yet released, so the next frame takes slot B: imported as a pool
+///    **with P's id**, buffer B, `destroy`; B presented; A released.
+/// 4. every later frame A: the compositor reads A from P's slice.
+///
+/// Step 3 used to overwrite the proxy's table entry for P with B's pool, so A's
+/// `BufferInfo::pool` named B's pool from then on: A's commits copied B's
+/// client memory into B's slice, and A's slice kept frame 1 for ever. Both
+/// copy scopes, since both trust that map. Whether the id is recycled depends
+/// on when the `delete_id` arrives, which is why a local run usually missed it
+/// and, presumably, why the guest's `--copy buffer` run did not show it.
+#[test]
+fn a_recycled_pool_id_does_not_steal_a_live_buffer() {
+    for (n, scope) in [CopyScope::Damage, CopyScope::Buffer].into_iter().enumerate() {
+        let mut k = KwinSlots::new(&format!("p102-recycle-{n}"), 7600 + n as u32, scope);
+        let pool = k.h.id();
+        let full = (0, 0, k.w, k.hgt);
+        let a = k.import(pool);
+        k.present(a, 1, full);
+        k.delete_id(pool);
+        let b = k.import(pool);
+        k.present(b, 2, full);
+        k.release(a);
+        k.delete_id(pool);
+        for tick in 3..12u8 {
+            let slot = if tick % 2 == 1 { a } else { b };
+            // A small rectangle that moves, as a cursor or a clock does.
+            k.present(slot, tick, (i32::from(tick) * 4, 10, 12, 8));
+            k.release(1 - slot);
+            assert!(
+                k.slice_matches(slot),
+                "{scope:?}: frame {tick}: slot {slot}'s arena slice is not what the client drew"
+            );
+        }
+        // And the first slot's memory is given back with its buffer, not lost
+        // when its id was taken.
+        let (ba, bb) = (k.slots[a].0, k.slots[b].0);
+        k.h.send_words(ba, op::BUFFER_DESTROY, &[]);
+        k.h.send_words(bb, op::BUFFER_DESTROY, &[]);
+        assert_eq!(k.h.session.stats.pools_released, 2, "{scope:?}: a pool's region leaked");
+        assert!(k.h.session.pools.is_empty(), "{scope:?}: a pool outlived its buffers");
     }
 }
