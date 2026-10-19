@@ -158,6 +158,9 @@ impl Hub {
         })?;
         *self.up.lock().map_err(|_| std::io::Error::other("poisoned"))? = Some(tx);
         self.stats.upstream_connects.fetch_add(1, Ordering::Relaxed);
+        // §103.15: whatever the guest rang while this hub had no upstream is
+        // gone, so every client rescans its rings (RESCAN_TOKEN).
+        self.fan_out(&[sv_transport::park::RESCAN_TOKEN]);
         let mut r = up;
         let mut buf = [0u8; 256];
         loop {
@@ -369,12 +372,15 @@ mod tests {
         let hub = run("t", d.join("qemu.sock"), bind_private(&d.join("hub.sock")).unwrap()).unwrap();
         let g1 = qemu.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut a = UnixStream::connect(d.join("hub.sock")).unwrap();
-        drop(g1); // the VM went away
-        let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
         let t = Instant::now();
         while hub.client_count() < 1 && t.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(10));
         }
+        drop(g1); // the VM went away
+        let mut g2 = qemu.recv_timeout(Duration::from_secs(5)).expect("the hub reconnected");
+        // §103.15: the client is told to rescan (bells in the gap are lost),
+        // and then gets the new upstream's bytes.
+        assert_eq!(read_some(&mut a, 1, Duration::from_secs(5)), vec![sv_transport::park::RESCAN_TOKEN]);
         g2.write_all(&[9]).unwrap();
         assert_eq!(read_some(&mut a, 1, Duration::from_secs(5)), vec![9]);
         a.write_all(&[3]).unwrap();

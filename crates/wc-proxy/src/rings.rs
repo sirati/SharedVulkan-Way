@@ -77,6 +77,10 @@ impl BellHub {
 }
 
 impl BellTarget for BellHub {
+    fn rescan(&self, _woken: &AtomicU64) {
+        self.poke_all();
+    }
+
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
         let (slot, lane) = sv_transport::park::lane_from_token(token);
         // The compositor writes the reply lane; that is the one this side
@@ -176,6 +180,11 @@ struct HubAndControl {
 }
 
 impl BellTarget for HubAndControl {
+    fn rescan(&self, woken: &AtomicU64) {
+        self.hub.rescan(woken);
+        self.control.rescan(woken);
+    }
+
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
         let a = self.hub.ring_token(token, woken);
         let b = self.control.ring_token(token, woken);

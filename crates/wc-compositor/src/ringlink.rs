@@ -681,6 +681,11 @@ pub struct GuestRamWake {
 }
 
 impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
+    fn rescan(&self, woken: &std::sync::atomic::AtomicU64) {
+        self.waker.wake();
+        sv_transport::vdoorbell::BellTarget::rescan(&*self.control, woken);
+    }
+
     fn ring_token(&self, token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
         self.waker.wake();
         sv_transport::vdoorbell::BellTarget::ring_token(&*self.control, token, woken);
@@ -695,6 +700,11 @@ impl sv_transport::vdoorbell::BellTarget for GuestRamWake {
 pub struct WakeOnBell(pub crate::tick::Waker);
 
 impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
+    /// The loop's turn pumps every ring, so one wake is a rescan.
+    fn rescan(&self, _woken: &std::sync::atomic::AtomicU64) {
+        self.0.wake();
+    }
+
     fn ring_token(&self, _token: u8, woken: &std::sync::atomic::AtomicU64) -> bool {
         woken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.0.wake();
