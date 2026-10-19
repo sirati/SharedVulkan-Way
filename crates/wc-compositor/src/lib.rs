@@ -676,6 +676,23 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
             }
+            // §92.12. The one-session compositor's installation, so its
+            // windows carry that installation's taskbar identity: `INSTALL`
+            // or `INSTALL:APP,…` (the apps that keep the application-wide
+            // one). A shared compositor learns it per session from `boot`.
+            "--taskbar-scope" => {
+                match it.next().map(|s| taskbar::Scope::parse(&s)) {
+                    Some(Ok(s)) => taskbar::set_default_scope(s),
+                    Some(Err(e)) => {
+                        eprintln!("wc-compositor: --taskbar-scope: {e}");
+                        return Err(2);
+                    }
+                    None => {
+                        eprintln!("wc-compositor: --taskbar-scope wants INSTALL[:APP,…]");
+                        return Err(2);
+                    }
+                }
+            }
             // §102. See `Args::nested_globals`.
             "--nested-compositor-globals" => args.nested_globals = true,
             // §85. 0 means "as soon as the last window is gone".

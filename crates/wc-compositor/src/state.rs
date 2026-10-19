@@ -400,6 +400,9 @@ struct Window {
     /// rather than looked up per use, because a window outlives the moments at
     /// which its surface is convenient to ask.
     client: u32,
+    /// §107, §92.12: which session (so which installation) the client is
+    /// of. The taskbar identity is the installation's.
+    session: u8,
     /// Callbacks the client is waiting on before it draws its next frame.
     ///
     /// Held rather than answered immediately. Answering at once is legal and is
@@ -3276,6 +3279,7 @@ impl State {
         window.mapped = true;
         let (title, app_id) = (window.title.clone(), window.app_id.clone());
         let client = window.client;
+        let session = window.session;
         // ADDED FOR STAGE 32. A popup has no taskbar button — it is
         // `WS_EX_TOOLWINDOW` with an owner — so there is nothing for an
         // identity to group, and stamping one on a menu would be a claim about
@@ -3412,7 +3416,7 @@ impl State {
                 self.ui.send(ToUi::AppId {
                     id,
                     app_id: app_id.clone(),
-                    aumid: crate::taskbar::identity(&app_id, client),
+                    aumid: crate::taskbar::identity_in(&app_id, client, session),
                 });
             }
             // §91.6: a client that chose nothing is shown at its default.
@@ -5369,6 +5373,13 @@ fn metadata(toplevel: &ToplevelSurface) -> (String, String) {
     })
 }
 
+/// §92.12: the session a surface's client belongs to, so the installation
+/// whose taskbar identity its windows carry. 0 for a client that is gone.
+fn surface_session(surface: &WlSurface) -> u8 {
+    use smithay::reexports::wayland_server::Resource as _;
+    surface.client().map_or(0, |c| client_session(&c))
+}
+
 /// Which connection a surface belongs to, counted from 1 in accept order.
 ///
 /// ADDED FOR STAGE 32. [`ClientState::index`] already exists and is already
@@ -5401,6 +5412,7 @@ impl XdgShellHandler for State {
 
         let (title, app_id) = metadata(&surface);
         let client = client_index(surface.wl_surface());
+        let session = surface_session(surface.wl_surface());
         let shadow = Arc::new(Mutex::new(Shadow::empty()));
         let popup_bounds: PopupBounds = Arc::new(Mutex::new(None));
         // §85. A new toplevel ends every popup grab: the grab was a claim on
@@ -5423,7 +5435,7 @@ impl XdgShellHandler for State {
             // identity here and their real one at map; a client that set it
             // before the first round trip — `weston-terminal` does — gets the
             // real one immediately.
-            aumid: crate::taskbar::identity(&app_id, client),
+            aumid: crate::taskbar::identity_in(&app_id, client, session),
             shadow: shadow.clone(),
             kind: WindowKind::Toplevel,
             bounds: popup_bounds.clone(),
@@ -5447,6 +5459,7 @@ impl XdgShellHandler for State {
                 title,
                 app_id,
                 client,
+                session,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 composed: None,
@@ -5488,6 +5501,7 @@ impl XdgShellHandler for State {
         window.app_id = app_id.clone();
         let (id, mapped, own) = (window.id, window.mapped, window.icon_from_client);
         let client = window.client;
+        let session = window.session;
         if mapped {
             self.ui.send(ToUi::AppId {
                 id,
@@ -5497,7 +5511,7 @@ impl XdgShellHandler for State {
                 // for it under the old identity. What that costs is measured in
                 // docs/waycompose-design.md §32.6; the platform is told, and
                 // the platform decides what it can do about it.
-                aumid: crate::taskbar::identity(&app_id, client),
+                aumid: crate::taskbar::identity_in(&app_id, client, session),
             });
             // A new app id is a new answer to "what is this application", so
             // the icon is looked up again — unless the client has said what its
@@ -5831,6 +5845,7 @@ impl XdgShellHandler for State {
         let _ = surface.send_configure();
 
         let client = client_index(surface.wl_surface());
+        let session = surface_session(surface.wl_surface());
         self.windows.insert(
             surface.wl_surface().clone(),
             Window {
@@ -5842,6 +5857,7 @@ impl XdgShellHandler for State {
                 title: String::new(),
                 app_id: String::new(),
                 client,
+                session,
                 frame_callbacks: Vec::new(),
                 presented: 0,
                 composed: None,

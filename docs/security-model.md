@@ -1138,6 +1138,18 @@ the identity. Nothing on either side logs a URL or a title. Firefox's
 `browser.taskbar.lists.enabled` and `…frequent.enabled` turn the pages off.
 Private windows record no history, so nothing from one can appear.
 
+**One installation's history stays in its own jump list** (`waycompose-design.md`
+§92.12). Until then the identity, and so the jump list, was the application's:
+every installation of Firefox wrote `Waycompose.app.firefox`'s list, and a test
+installation's run replaced the user's list with the test profile's pages. Now
+each installation has its own identity (`Waycompose.install.<name>.<app>`) and
+its own jump-list directory; only the one installation deploy found the user's
+pin of keeps the old identity, and a claim file and the compositor keep a
+second from taking it. A session's `taskbar=` boot field must name the
+session's own installation, which the host has already checked against that
+installation's key; it cannot name another's windows. All of it is one Windows
+user's own taskbar.
+
 ### R34 — The GPU sessions share one pool
 Added 2026-10-16 with `waycompose-design.md` §97. The GPU ivshmem device was cut
 into fixed slots, one per session (§87); it is now one pool, and every session

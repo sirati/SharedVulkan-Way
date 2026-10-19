@@ -249,7 +249,8 @@ pub fn fit_to_work_area(
 /// place, and the maximised state, of the last window of **the same named
 /// identity** that closed less than [`SUCCESSION_SECS`] ago.
 ///
-/// Only a named identity (`Waycompose.app.*`): an unnamed client has no claim
+/// Only a named identity (`Waycompose.app.*`, or since §92.12
+/// `Waycompose.install.*`): an unnamed client has no claim
 /// to anybody's place. And only once: the record is taken by the window that
 /// uses it, so a second new window cascades as before.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,7 +269,7 @@ pub const SUCCESSION_SECS: u64 = 20;
 /// named identity.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn leaves_succession(aumid: &str) -> bool {
-    aumid.starts_with(&format!("{}{}", crate::taskbar::PREFIX, crate::taskbar::NAMED))
+    crate::taskbar::is_named(aumid)
 }
 
 /// The place a toplevel of `aumid`, mapping for the first time at `now`,
@@ -1235,6 +1236,7 @@ mod tests {
             Some(((120, 80), true))
         );
         assert!(leaves_succession("Waycompose.app.x"));
+        assert!(leaves_succession("Waycompose.install.wclinux.atp-nested"));
         assert!(!leaves_succession("Waycompose.unnamed.c3"));
         assert!(!leaves_succession(""));
     }

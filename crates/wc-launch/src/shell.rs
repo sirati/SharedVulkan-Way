@@ -79,7 +79,7 @@ struct UnknownVtbl {
 #[repr(C)]
 struct ShellLinkVtbl {
     base: UnknownVtbl,
-    get_path: Fp,
+    get_path: unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut c_void, u32) -> HRESULT,
     get_id_list: Fp,
     set_id_list: Fp,
     get_description: Fp,
@@ -105,7 +105,7 @@ struct PersistFileVtbl {
     base: UnknownVtbl,
     get_class_id: Fp,
     is_dirty: Fp,
-    load: Fp,
+    load: unsafe extern "system" fn(*mut c_void, *const u16, u32) -> HRESULT,
     save: unsafe extern "system" fn(*mut c_void, *const u16, i32) -> HRESULT,
     save_completed: Fp,
     get_cur_file: Fp,
@@ -133,7 +133,7 @@ struct DestinationListVtbl {
     add_user_tasks: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     commit_list: unsafe extern "system" fn(*mut c_void) -> HRESULT,
     get_removed_destinations: Fp,
-    delete_list: Fp,
+    delete_list: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
     abort_list: unsafe extern "system" fn(*mut c_void) -> HRESULT,
 }
 
@@ -300,6 +300,80 @@ pub fn save_link(s: &LinkSpec, path: &Path) -> Result<(), String> {
     let p = wide(&path.to_string_lossy());
     // SAFETY: an IPersistFile; `p` outlives the call.
     unsafe { check((file.vtbl::<PersistFileVtbl>().save)(file.0, p.as_ptr(), 1), "IPersistFile::Save") }
+}
+
+/// §92.12. An existing `.lnk`, loaded: for reading it, or for changing one
+/// property and saving it back with everything else as it was.
+fn load_link(path: &Path, write: bool) -> Result<(Com, Com), String> {
+    // STGM_READ, STGM_READWRITE.
+    let mode = if write { 2 } else { 0 };
+    let link = Com::create(&CLSID_SHELL_LINK, &IID_SHELL_LINK_W)?;
+    let file = link.query(&IID_PERSIST_FILE)?;
+    let p = wide(&path.to_string_lossy());
+    // SAFETY: an IPersistFile; `p` outlives the call.
+    unsafe { check((file.vtbl::<PersistFileVtbl>().load)(file.0, p.as_ptr(), mode), "IPersistFile::Load")? };
+    Ok((link, file))
+}
+
+/// §92.12. What a shortcut runs and the identity it carries (empty if none),
+/// as Explorer would read them. The identity is `None` when the property
+/// store cannot be read (Wine's returns `E_NOTIMPL`).
+pub fn read_link(path: &Path) -> Result<(String, Option<String>), String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    let (link, _file) = load_link(path, false)?;
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: an IShellLinkW; a buffer of the length given; no find data
+    // (the parameter is optional) and SLGP_RAWPATH (4), the path as stored.
+    let target = unsafe {
+        let hr = (link.vtbl::<ShellLinkVtbl>().get_path)(link.0, buf.as_mut_ptr(), buf.len() as i32, std::ptr::null_mut(), 4);
+        if hr < 0 {
+            String::new()
+        } else {
+            let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..n])
+        }
+    };
+    let Ok(store) = link.query(&IID_PROPERTY_STORE) else { return Ok((target, None)) };
+    let mut pv = PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] };
+    // SAFETY: an IPropertyStore and a PROPVARIANT it fills. A `VT_LPWSTR`
+    // (31) is a string the store allocated with the COM allocator, which is
+    // what `PropVariantClear` would free it with; anything else is not an
+    // identity and carries no allocation of a type this reads.
+    let aumid = unsafe {
+        if (store.vtbl::<PropertyStoreVtbl>().get_value)(store.0, &PKEY_APP_USER_MODEL_ID, &mut pv) < 0 {
+            return Ok((target, None));
+        }
+        let p = pv.value[0] as *mut u16;
+        if pv.vt == 31 && !p.is_null() {
+            let mut n = 0;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            CoTaskMemFree(p.cast());
+            s
+        } else {
+            String::new()
+        }
+    };
+    Ok((target, Some(aumid)))
+}
+
+/// §92.12. Give an existing shortcut another identity, keeping everything
+/// else it has: the user may have renamed it, moved it or changed its icon.
+pub fn set_link_aumid(path: &Path, aumid: &str) -> Result<(), String> {
+    let (link, file) = load_link(path, true)?;
+    set_props(&link, &[(&PKEY_APP_USER_MODEL_ID, aumid)])?;
+    // SAFETY: an IPersistFile; a null name saves to the file it loaded.
+    unsafe { check((file.vtbl::<PersistFileVtbl>().save)(file.0, std::ptr::null(), 1), "IPersistFile::Save") }
+}
+
+/// §92.12. Delete `aumid`'s jump list: an installation's removal, for its
+/// own identity only.
+pub fn delete_jump_list(aumid: &str) -> Result<(), String> {
+    let list = Com::create(&CLSID_DESTINATION_LIST, &IID_CUSTOM_DESTINATION_LIST)?;
+    // SAFETY: an ICustomDestinationList; the string outlives the call.
+    unsafe { check((list.vtbl::<DestinationListVtbl>().delete_list)(list.0, wide(aumid).as_ptr()), "ICustomDestinationList::DeleteList") }
 }
 
 fn collection(links: &[LinkSpec]) -> Result<Com, String> {

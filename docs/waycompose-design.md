@@ -28868,10 +28868,207 @@ separate check found nothing personal in them.
    is used for other applications.
 5. **A second application** would get its own identity, pin and jump list from
    its desktop entry. Only Firefox has been run.
-6. **Multiple installations share an identity.** `wcivs`, `wcpins` and `wcmil`
-   all launch `firefox`, so they all write `Waycompose.app.firefox`'s jump list,
-   and the last one to refresh wins. That is right for one installation per
-   user, which is the product.
+6. **Multiple installations shared an identity.** `wcivs`, `wcpins` and `wcmil`
+   all launch `firefox`, so they all wrote `Waycompose.app.firefox`'s jump
+   list, and the last one to refresh won. Fixed in 92.12: the identity is
+   per installation, and only the installation whose pin already carries the
+   old identity keeps it.
+
+### 92.12 One identity per installation
+
+Branch `session-fixes-aumid`, 2026-10-19.
+
+**The cause.** `taskbar::identity` was a function of the app id alone. Every
+installation of Firefox put its windows, shortcuts, pins, jump list and
+relaunch file under `Waycompose.app.firefox`. The test installation "Windows
+7 (Linux, no ssh)" shared `Waycompose.app.atp-nested` with the user's "Windows
+7 (Linux)". `ICustomDestinationList` keys a jump list by that string and the
+last writer wins, so a test run replaced the user's Firefox jump list with
+the test profile's pages. Since §107 one compositor serves every
+installation, so windows of two installations of one application shared one
+button, and a pin made from either relaunched whichever installation's
+relaunch directory came first in boot order.
+
+**The scheme.** An installation's applications carry
+`Waycompose.install.<installation>.<app id>`, for example
+`Waycompose.install.wclinux.atp-nested` (`taskbar::installed_identity`).
+`install.` is a segment of its own beside `app.` and `unnamed.`, so no
+installation name and no client's app id can produce another namespace's
+string. The installation's name has no dot (the session service allows
+letters, digits, `-` and `_`, at most 32), so the segment after it is the
+app. Windows does not document whether it compares AUMIDs with regard to
+case, so the scoped form is lower case only. An upper-case letter is
+lowered, and the name then counts as mapped: it carries the hash of the
+original, as `identity` already did for spaces and long names. Two
+installations, or two app ids, that differ at all get different strings,
+and every string fits Windows' 128 characters with no space
+(`every_scoped_identity_fits_what_windows_documents` checks 30 pairs of
+odd names, all distinct). A client that never set an app id keeps
+`Waycompose.unnamed.c<N>`: the connection number is unique in the
+compositor, and such a window cannot be pinned.
+
+**The one exception: the user's existing pin.** The old identity is in the
+user's pinned shortcuts, desktop shortcuts and Explorer's own copy of the
+pins (the Taskband blob). Two ways were weighed:
+
+* (a) rewrite every shortcut's AUMID at deploy and rebuild the jump list
+  under the new id. Changing a pinned shortcut's identity under a running
+  Explorer splits the pin and its windows into two buttons until Explorer
+  restarts, because Explorer reads its cached copy. That is a visible change
+  to the user's taskbar, or an Explorer restart, and neither is allowed.
+* (b) keep `Waycompose.app.<app>` for the one installation whose pin already
+  carries it. Nothing the user sees changes, by construction: the pin, its
+  windows and its jump list keep the string they have.
+
+So (b), with (a)'s rewrite only where it is invisible. Deploy runs
+`wc-launch.exe --taskbar-ids` on the guest (`taskbar_id::decide`). For each
+`[app.*]` of the installation:
+
+1. A decision an earlier deploy made is kept. Deploy copies the old ini to
+   `wc-launch.ini.prev` before it copies the new one, and the verb reads
+   `taskbar-id` from it. A decision never flips.
+2. A test installation always gets its own identity: `WC_LAUNCH_TEST_HOME`
+   set for the deploy, a `test-home` file beside its `wc-session` on the VM
+   host, or `WC_LAUNCH_TASKBAR_ID=install`.
+3. A claim file, `%LOCALAPPDATA%\waycompose\taskbar\<identity>.owner`, names
+   the `wc-launch.exe` that holds an old identity. If it names another
+   installation that still exists, this one gets its own.
+4. Otherwise the user's shortcuts decide: those in `User Pinned\TaskBar`, on
+   the desktop and in the Start menu's programs, read through `IShellLinkW`
+   and its property store. A pin with the old identity that runs this
+   installation keeps it. A pin that runs another installation gives it to
+   that one. With no pin, a desktop shortcut decides, unless another
+   installation has one too; then neither keeps it. Start menu entries are
+   not evidence, because every launch writes one. A shortcut of a removed
+   installation is not evidence either.
+5. Anything else gets its own identity.
+
+The result is written into the installation's `wc-launch.ini` as
+`[app.<id>] taskbar-id = legacy` or `install` (absent is `install`). A
+`legacy` decision writes the claim file. An `install` decision gives this
+installation's own unpinned desktop and Start menu shortcuts the new
+identity (`shell::set_link_aumid`, which keeps everything else in the
+file), and removes the relaunch file of the form it no longer uses. Its pin,
+if it has one with the old identity (only a test installation can), is left
+alone and the log says so: its windows get their own button until the user
+pins again. A shortcut whose identity cannot be read is taken to carry the
+old one, so it can only keep it where it is, and it is never rewritten.
+`scripts/wc-launch.sh taskbar-plan` is the same verb with `--dry-run`: it
+prints the shortcuts it found and each decision, and changes nothing.
+
+**Two installations never carry one identity.** The claim file is checked
+before any shortcut. The compositor checks again: a session whose boot
+claims an old identity that another live session holds does not get it, and
+the log says `taskbar: session N … asked for the application-wide identity of
+…` (`Registry::add_session`).
+
+**The compositor.** The launcher sends its scope in the boot line,
+`taskbar=INSTALL[:APP,…]` (107.3), where the apps are the window app ids that
+keep the old identity. The scope must name the boot's own installation. A
+one-session compositor gets it as `--taskbar-scope`. Each window remembers its
+client's session, and `taskbar::identity_in(app_id, client, session)` stamps
+the session's installation's identity. A session with no scope (a launcher
+from before §92.12) keeps the old identity, as before. A launcher whose boot
+is refused with `unknown boot field "taskbar"` is talking to a compositor
+from before §92.12 (another installation started it); it boots again without
+the field and logs that its windows carry the old identity until that
+compositor ends.
+
+**Relaunch, per installation.** A window's relaunch file is looked up only in
+the directory of the session whose scope owns the identity
+(`Registry::relaunch_dirs`). Before, every session's directory was searched
+in boot order, and a stale `Waycompose.app.firefox.relaunch` left in a test
+installation's `apps` could give the user's window the test installation's
+command. An identity no scope owns is looked up in the unscoped sessions'
+directories, as before.
+
+**The jump list.** `ICustomDestinationList::SetAppID` gets the same string as
+the windows and shortcuts. The jump list's own files (icons, removed pages,
+refresh period) were in `%LOCALAPPDATA%\waycompose\jumplist\<app>`, shared by
+every installation too. An installation with its own identity now keeps them
+in `jumplist\<installation>\<app>`; the one with the old identity keeps the
+old directory, and with it the pages the user removed.
+
+**Removal.** `wc-launch.exe --uninstall-taskbar` (`scripts/wc-launch.sh
+uninstall-taskbar`) deletes the installation's own jump list
+(`ICustomDestinationList::DeleteList` on its own identity). It deletes the
+old identity's list only while this installation holds the claim, and then
+removes the claim. It removes its desktop and Start menu shortcuts, its
+relaunch files and its jump-list directory. It never touches another
+installation's, and it lists its pins, which only the user can unpin
+(`taskbar_id::plan_removal`).
+
+**What deploy does to the user's installations.** On the next deploy of
+each, with this build, nothing else running:
+
+| installation | expected decision | what the user sees |
+|---|---|---|
+| `wcivs` ("Firefox (Linux)") | `legacy`: the pin `Firefox (Linux)` in `User Pinned\TaskBar` carries `Waycompose.app.firefox` and runs `wcivs\wc-launch.exe` (92.9). Claim written | nothing changes: the pin, its windows and its jump list keep their identity. The list's pages are rebuilt at the next launch from the user's profile, which replaces whatever a test run left in it |
+| `wclinux` ("Windows 7 (Linux)") | `legacy` if its pin or desktop shortcut is the only one with `Waycompose.app.atp-nested`; `install` if the test installation's desktop shortcut carries it too and neither is pinned | `legacy`: nothing. `install`: nothing visible either; the unpinned desktop and Start menu shortcuts get `Waycompose.install.wclinux.atp-nested`, and a pin made afterwards joins its windows |
+| `wcmc` (Minecraft) | `legacy`, from its pin or desktop shortcut | nothing |
+| the test installations | `install` | their windows leave the user's buttons and get their own; their Start menu entries move with them |
+
+The real decisions are in each deploy's log (`taskbar-id: <app> legacy|install
+<identity>: <why>`); `taskbar-plan` shows them before anything is written.
+Not run on the guest from this branch.
+
+**The tests.**
+
+| where | what |
+|---|---|
+| `taskbar.rs` `install_tests` (both crates) | the scheme: legible ids, case and mapping, uniqueness over 30 odd pairs, the 128-character limit, no dot in the installation segment, the scope's parse and render, legacy only where the scope says, a shared compositor naming three sessions' windows by their installations, a second legacy claim refused, the one-session default, relaunch files found only in the owning installation's directory |
+| `session_svc.rs` | the boot line carries `taskbar=`, and a scope of another installation or a bad app id is refused |
+| `taskbar_id.rs` | the decision: the user's situation (pin of `wcivs`, a test installation's Start menu entry), never two `legacy` in either deploy order over six shortcut layouts, test installations, a persisted decision that does not flip, claims (another's, ours, stale), shortcuts of removed installations and Start menu entries are not evidence, unreadable identities, path comparison, removal |
+| `config.rs` | `taskbar-id` parsed, defaulted and refused; read from any ini text; set in place, CRLF kept |
+| `plan.rs`, `appmeta.rs` | the scope the launcher sends, and the launcher's identity equal to the compositor's for the same installation |
+
+Under Wine (`/mnt/datasets/builds/evidence/session-fixes/aumid/wine-taskbar-ids.txt`):
+two installations `wcivs` and `wcpins` of one Firefox, both first configured as
+before §92.12 and `--install`ed, `wcivs`'s shortcut copied into `User
+Pinned\TaskBar`. Then the deploy's step: `wcpins --taskbar-ids` decided
+`install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe") and
+removed its old relaunch file; `wcivs --taskbar-ids` decided `legacy` and wrote
+the claim. A second deploy kept both ("kept from the installation's ini").
+`--refresh` then wrote `Waycompose.app.firefox.relaunch` in `wcivs\apps` and
+`Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps`.
+`wcpins --uninstall-taskbar` removed its two shortcuts and its relaunch file
+and left `wcivs`'s three. Wine's shell links do not implement
+`IPropertyStore::GetValue` (`E_NOTIMPL`) and do not store the identity, so
+every identity read as unreadable, which is the path the rule above takes
+for that; `DeleteList` is `E_NOTIMPL` too.
+
+On a real Windows 11 (a throwaway clone of the local test image, 24H2,
+build 26100; `/mnt/datasets/builds/evidence/session-fixes/aumid/vm/`), the
+same scenario with two throwaway installations whose shortcuts our
+`--install` wrote, `wcivs`'s copied into `User Pinned\TaskBar`, and a cached
+host answer for Firefox:
+
+| step | result |
+|---|---|
+| the property store read | every shortcut read `[Waycompose.app.firefox]`, the same as the shell's own `System.AppUserModel.ID` column; nothing unreadable |
+| `--taskbar-ids`, `wcpins` first | `wcpins`: `install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe"), its desktop and Start menu shortcuts rewritten, the shell then reads `Waycompose.install.wcpins.firefox`; `wcivs`: `legacy`, claim written |
+| `--taskbar-ids`, `wcivs` first | `wcivs`: `legacy`, claim written; `wcpins`: `install` ("…\wcivs\wc-launch.exe holds the claim") |
+| the pinned `.lnk` | SHA-256 the same before and after, in both orders |
+| `--refresh` for both | `SetAppID` and `CommitList` succeeded for both identities (`jump list 3 task(s)`, 10 slots); two `customDestinations-ms` files, one whose links run `wcivs`, one `wcpins`; relaunch files `Waycompose.app.firefox.relaunch` in `wcivs\apps` and `Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps` |
+| `--uninstall-taskbar` of `wcpins` | its list file gone (`DeleteList` succeeded), `wcivs`'s list unchanged; its two shortcuts and its relaunch file gone, `wcivs`'s three shortcuts and relaunch file still there; `jumplist\wcpins` removed |
+
+The first run left an empty `jumplist\wcpins` after the removal; the removal
+now takes the installation's directory too once it is empty.
+
+**Not run:** per-session identities on window properties in a shared
+compositor. A session's clients reach the compositor only through the
+ivshmem rings that the VM host's session service serves; a socket client is
+always session 0. That path is covered by the registry's and the boot line's
+unit tests above, and the code that writes the property (`win32.rs`,
+`set_taskbar_identity`) is §92's, unchanged.
+
+**Gates.** `cargo test --workspace --no-fail-fast`: 114 binaries, 3291
+passed, 0 failed, 9 ignored. `cargo clippy --workspace --all-targets`, and
+`-p wc-launch -p wc-compositor --all-targets` for Windows: no warning in a
+line this section wrote. `cargo check --workspace --target
+x86_64-pc-windows-gnu` and `-p wc-launch -p wc-compositor --target
+x86_64-apple-darwin`: exit 0. `scripts/wc-xref.sh --list` and
+`design_citations`: no missing citation.
 
 ## 93. Two bugs from real use: the clipboard, and a menu that closes instead of opening
 
@@ -34806,6 +35003,7 @@ to wc-proxy. A one-session page is served exactly as before.
 ```text
   boot<TAB>session=ID<TAB>install=NAME<TAB>key=PATH<TAB>control=PATH
       [<TAB>gpu=1][<TAB>audio=VOL][<TAB>nested=1][<TAB>relaunch=DIR]
+      [<TAB>taskbar=NAME[:APP,…]]          (§92.12)
                          -> ok located INDEX MESSAGE  |  err WHY
   wait ID                -> ok ended WHY        (blocks until session ID ends)
   sessions               -> ok INDEX:INSTALL:ID:STATE:MiB/REGIONS ...
@@ -34865,8 +35063,12 @@ The proxy reads the geometry from the region, so the host side needs no flag.
 * **Nested-compositor globals** (§102): created always on a shared
   compositor and offered only to the sessions whose boot said `nested=1`
   (`smithay::wayland::set_nested_filter`, a `can_view` on the three globals).
-* **The relaunch directory** (§92): one per booted session, searched in
-  boot order (`taskbar::add_relaunch_dir`), removed with the session.
+* **The relaunch directory** (§92): one per booted session, removed with the
+  session. Since §92.12 a window's file is looked up only in the directory of
+  the session whose installation owns its identity
+  (`taskbar::Registry::relaunch_dirs`), not in every directory in boot order.
+* **The taskbar identity** (§92.12): the session's installation's, from the
+  boot's `taskbar=` scope (`taskbar::identity_in`).
 * **The output** is the desktop's work area for every session: one desktop,
   one monitor. A per-session `--output` was not needed by any installation.
 * **The linger**: a session whose last connection left `--exit-when-empty`
@@ -34951,8 +35153,11 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
      shared compositor with it (the job breakaway).
 * **Sound** is per session: each session's sound ring opens its own waveOut
   device; Windows mixes them. Not heard on the guest yet.
-* **Pins and jump lists** (§92) of two installations that publish the same
-  application id share one taskbar identity, as they did before.
+* **Pins and jump lists** (§92) are per installation since §92.12: the boot
+  line's `taskbar=` scope names the session's installation, and its windows,
+  shortcuts, relaunch files and jump list carry
+  `Waycompose.install.<installation>.<app>`, except where deploy kept the old
+  identity for the one installation whose pin has it.
 * **The output** is one for every session (107.4).
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.
