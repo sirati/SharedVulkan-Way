@@ -265,8 +265,8 @@ host checks every request Linux makes (`docs/security-model.md` R38). Under
 PipeWire each device is a native node, `wc-pw-node`, paced by the ring's credit.
 
 ```
-scripts/wc-hostint-local.sh [pipewire|on]  # the Linux end without a VM: devices, defaults, credit, links
-wc-launch.exe --install I APP              # also registers APP's types (HKCU), with a manifest
+scripts/wc-hostint-local.sh [--mode pipewire|on]  # the Linux end without a VM: devices, defaults, credit, links
+wc-launch.exe --install APP                # also registers APP's types (HKCU), with a manifest
 wc-launch.exe --uninstall-assoc [APP]      # removes exactly what the manifest lists
 wc-hostint-probe.exe [--get-defaults]      # the host's endpoints, handlers and defaults
 WC_LAUNCH_AUDIO=on|pipewire|system|user-pipewire   # the session's sound server (wc-session)
