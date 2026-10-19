@@ -324,6 +324,11 @@ enum Stale {
 /// then attached once.
 const STALE_RECT_CAP: usize = 64;
 
+/// §102.9. Where [`Session::retire_pool_id`] files pools whose id the client
+/// has reused: the server's half of the id space, which a client's
+/// `wl_shm.create_pool` never names.
+const RETIRED_POOL_KEYS: u32 = 0xff00_0000;
+
 #[derive(Default)]
 struct Surface {
     pending_buffer: Option<u32>,
@@ -866,7 +871,13 @@ pub struct Session {
     /// the destructor — see the note on `POOL_DESTROY` in `client_message`, and
     /// note that its buffers keep working meanwhile, which the `wl_shm` spec
     /// requires and which `weston-presentation-shm` depends on.
+    ///
+    /// Keyed on the client's id **while the client owns that id**, and on a
+    /// key of this proxy's own after: see [`Session::retire_pool_id`].
     pools: HashMap<u32, Pool>,
+    /// §102.9. The next key [`Session::retire_pool_id`] tries. Starts in the
+    /// server's id range, where no `wl_shm_pool` the client creates can land.
+    next_retired_pool: u32,
     buffers: HashMap<u32, BufferInfo>,
     /// §102. `wl_buffer`s that were not cut from a pool — today only
     /// `wp_single_pixel_buffer_manager_v1.create_u32_rgba_buffer`'s, which is
@@ -1034,7 +1045,7 @@ impl Session {
             scope,
             headroom: headroom.max(1),
             pools: HashMap::new(),
-
+            next_retired_pool: RETIRED_POOL_KEYS,
             buffers: HashMap::new(),
             foreign_buffers: std::collections::HashSet::new(),
             surfaces: HashMap::new(),
@@ -2502,6 +2513,11 @@ impl Session {
                 pool.acked = true;
             }
             self.release_pool_if_done(id);
+            // §102.9. Still here means buffers cut from it live on, and the id
+            // is the client's to reuse from this message on.
+            if self.pools.get(&id).is_some_and(|p| p.zombie) {
+                self.retire_pool_id(id);
+            }
         }
 
         // Materialise a real descriptor from the *name* the compositor sent.
@@ -2674,6 +2690,46 @@ impl Session {
         }
     }
 
+    /// Move a pool whose id the client no longer owns to a key of this proxy's
+    /// own, and point its buffers there.
+    ///
+    /// §102.9, and it is why a nested KWin's window kept its first frame on
+    /// the guest. `wl_shm` lets a client destroy a pool and keep drawing from
+    /// its buffers, and once the compositor has answered the destructor with
+    /// `delete_id` the client's libwayland reuses the id. KWin imports every
+    /// swapchain slot as pool, buffer, pool destroy, lazily at the slot's first
+    /// present, so its second slot's pool is often given its first slot's id
+    /// (the guest's log: `pool 29` published twice at 3604928 bytes). Keyed on
+    /// the wire id, that `create_pool` replaced the first pool's entry: the
+    /// first slot's `BufferInfo::pool` then named the second pool, its commits
+    /// copied the second slot's memory into the second slot's slice, and the
+    /// slice the compositor read for the first slot never changed again. The
+    /// replaced entry's region was never returned either.
+    ///
+    /// Safe because nothing addresses a zombie pool on the wire any more:
+    /// `flush_deferred` and `reclaim_for` both skip zombies, and its buffers
+    /// are addressed by their own ids.
+    fn retire_pool_id(&mut self, id: u32) {
+        let Some(pool) = self.pools.remove(&id) else {
+            return;
+        };
+        let mut key = self.next_retired_pool;
+        while self.pools.contains_key(&key) {
+            key = key.checked_add(1).unwrap_or(RETIRED_POOL_KEYS);
+        }
+        self.next_retired_pool = key.checked_add(1).unwrap_or(RETIRED_POOL_KEYS);
+        let live = pool.buffers;
+        self.pools.insert(key, pool);
+        for b in self.buffers.values_mut().filter(|b| b.pool == id) {
+            b.pool = key;
+        }
+        if self.trace {
+            self.note(format!(
+                "pool {id}: id retired by the client with {live} buffer(s) still cut from it"
+            ));
+        }
+    }
+
     /// Take the client's pool fd and map it. The pool is *not* announced yet;
     /// see [`Session::flush_deferred`].
     fn create_pool(
@@ -2686,6 +2742,12 @@ impl Session {
         let size = usize::try_from(size)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative pool size"))?;
         let client = ClientMap::new(fd, size)?;
+        // §102.9. Only reachable if a `delete_id` for the old pool went past
+        // without `retire_pool_id`; overwriting would hand its live buffers to
+        // this pool and leak its region, so it is moved aside here too.
+        if self.pools.contains_key(&pool_id) {
+            self.retire_pool_id(pool_id);
+        }
         self.pools.insert(
             pool_id,
             Pool {
