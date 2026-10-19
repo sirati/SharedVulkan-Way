@@ -39,7 +39,9 @@ pub struct Owned(pub CFTypeRef);
 impl Owned {
     /// `None` for a null result.
     pub fn new(r: CFTypeRef) -> Option<Owned> {
-        (!r.is_null()).then_some(Owned(r))
+        // Not `then_some`: that would build (and drop, so release) an owner
+        // of null.
+        if r.is_null() { None } else { Some(Owned(r)) }
     }
     pub fn get(&self) -> CFTypeRef {
         self.0
