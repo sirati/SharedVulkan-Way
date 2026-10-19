@@ -3067,6 +3067,9 @@ mod dmabuf_tests {
             .map(|id| first(*id).unwrap_or_else(|| panic!("{id} never reached the compositor")))
             .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+}
+
 /// §102.9. KWin's Wayland backend imports each swapchain buffer as its own
 /// pool and destroys the pool object at once (`WaylandBackend::importBuffer`,
 /// `wayland_backend.cpp`: `wl_shm_create_pool`, `wl_shm_pool_create_buffer`,
