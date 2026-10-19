@@ -23,7 +23,7 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN=${CARGO_TARGET_DIR:-$ROOT/target}/debug
+BIN=${CARGO_TARGET_DIR:-$ROOT/target}/${WC_NO_SSH_PROFILE:-debug}
 SOCAT=$(command -v socat || ls /nix/store/*-socat-1.*/bin/socat 2>/dev/null | head -1)
 CLIENT=$(command -v wayland-info || true)
 D=$(mktemp -d /mnt/datasets/builds/wcrun/wc-no-ssh-XXXXXX)
@@ -145,7 +145,7 @@ case "$R" in err*refused*) ok "a request with shell words is refused: ${R:0:60}"
 # §105.13: the control ring's round trip, in-process on both ends.
 cc -O2 -o "$D/probe-ctl-rtt" "$ROOT/scripts/probe-ctl-rtt.c" && {
   sleep 2 # the prefetch
-  for spec in "10000 rtt" "1000 status" "1000 frequent probe"; do
+  for spec in "10000 rtt" "1000 status" "1000 frequent probe" "1000 rtt 4096" "1000 rtt 20000" "200 rtt 262144"; do
     set -- $spec
     R=$("$D/probe-ctl-rtt" "$D/ctl-a.sock" "$1" "$2 ${3:-}" 2>&1) && ok "control round trip: $R" || bad "rtt probe: $R"
   done

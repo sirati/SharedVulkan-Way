@@ -149,7 +149,15 @@ hub_up() {
   return 1
 }
 # The Wayland doorbell a proxy connects to: the hub's, or QEMU's own socket.
-wcbell_use() { if hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
+# The hub's Wayland socket, when a hub runs and serves it. A guest that
+# hosts the sessions itself (§103.17, role b) has only that: its hub holds the
+# guest's own port, and there is no QEMU socket at $WCBELL.
+wl_hub() {
+  [ -S "$HUBDIR/wl.sock" ] || return 1
+  [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
+  env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet wc-bell-hub.service
+}
+wcbell_use() { if wl_hub || hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -805,22 +813,27 @@ hostint_args() {
 # by the ring's credit (a pipe module there drops); the proxy asks the server
 # what it is and uses the pipe modules on a PulseAudio. Nothing without pactl.
 sound_ring_args() {
-  local D="$1" PREFIX="$2" PACTL PWNODE PWSOCK SRV
+  # KIND (optional): the server the session will have, when it is still
+  # starting beside the proxy (§105.13); otherwise audio.state says.
+  local D="$1" PREFIX="$2" KIND="${3:-}" GIVEN="${3:-}" PACTL PWNODE PWSOCK SRV
   PACTL=$(pulse_bin pactl 2>/dev/null) || return 0
   [ -n "$PACTL" ] || return 0
-  case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+  [ -n "$KIND" ] || KIND=$(cut -d" " -f1 "$D/audio.state" 2>/dev/null)
+  case "$KIND" in
     pulse|pipewire) SRV="unix:$D/xdg/pulse/native" ;;
     system|user-pipewire) SRV="unix:/run/user/$UID_/pulse/native" ;;
     *) return 0 ;;
   esac
   printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix %q' "$PACTL" "$SRV" "$D" "$PREFIX"
   PWNODE=$(pw_node_bin 2>/dev/null)
-  case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+  case "$KIND" in
     pipewire) PWSOCK="$D/pw/pipewire-0" ;;
     system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
     *) PWSOCK="" ;;
   esac
-  [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && [ -S "$PWSOCK" ] \
+  # The socket may not exist yet when the server starts beside the proxy;
+  # the proxy asks the server what it is when the first device arrives.
+  [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && { [ -n "$GIVEN" ] || [ -S "$PWSOCK" ]; } \
     && printf -- ' --sound-pw-node %q --sound-pipewire %q' "$PWNODE" "$PWSOCK"
   return 0
 }
@@ -1227,6 +1240,8 @@ up)
     [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$ARENA" | tr -d ' ')
     if [ "${RLEN:-0}" = 0 ]; then
       WHY="the compositor kept no rings (header version $VER; its log says why)"
+    elif wl_hub; then
+      WHY=""
     elif [ ! -S "$WCBELL" ]; then
       WHY="no doorbell socket at $WCBELL: the VM has no org.sirati.wcbell.0 port"
     elif [ ! -r "$WCBELL" ] || [ ! -w "$WCBELL" ]; then
@@ -1399,7 +1414,18 @@ proxy)
     SERVICE=0
     [ "${WC_LAUNCH_SERVICE:-}" = 1 ] && SERVICE=1
     [ $SERVICE = 1 ] || [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
-    [ $SERVICE = 1 ] && audio_up "$D" "$ID"
+    # §105.13: the session's PulseAudio starts beside the proxy, not before it;
+    # what it will be is known now, and the proxy only talks to it once the
+    # guest's sound ring announces a device, after this verb has returned.
+    APID=""
+    AUDIO_EXPECT=none
+    if [ $SERVICE = 1 ]; then
+      audio_up "$D" "$ID" & APID=$!
+      if [ "${WC_LAUNCH_AUDIO:-on}" = system ]; then AUDIO_EXPECT=system
+      elif [ "${WC_LAUNCH_AUDIO:-on}" = user-pipewire ]; then AUDIO_EXPECT=user-pipewire
+      elif [ "${WC_LAUNCH_AUDIO:-on}" = pipewire ] && pw_bin pipewire >/dev/null 2>&1; then AUDIO_EXPECT=pipewire
+      elif [ "${WC_LAUNCH_AUDIO:-on}" != off ] && pulse_bin pulseaudio >/dev/null 2>&1; then AUDIO_EXPECT=pulse; fi
+    fi
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
     RUN=$(cat "$D/arena.run")
@@ -1433,7 +1459,9 @@ proxy)
         RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
         # §106: host integration, and every Windows endpoint a stream of the
         # sound ring with stable names (§103.16, §106.3).
-        RINGARGS="$RINGARGS $(hostint_args "$D") $(sound_ring_args "$D" win)"
+        # The session's server starts beside the proxy (§105.13), so its kind
+        # is the expected one, not audio.state.
+        RINGARGS="$RINGARGS $(hostint_args "$D") $(sound_ring_args "$D" win "$AUDIO_EXPECT")"
       fi
       printf 'exec %q %s --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$UPARGS" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \
@@ -1450,6 +1478,7 @@ proxy)
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
+    [ -n "$APID" ] && wait "$APID"
     [ $SERVICE = 1 ] || audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
     # §89: what the proxy made of the rings, in its own words. It attaches

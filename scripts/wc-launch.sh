@@ -58,7 +58,9 @@ set -uo pipefail
 
 MODE="${1:-all}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
+# §105.13: release. The launcher parses every answer of the control ring and
+# the compositor copies it; a debug build was most of a 20 KB answer's 0.2 ms.
+WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/release"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
 GUEST="${WC_GUEST:-$SITE_GUEST}"
@@ -536,10 +538,10 @@ do_deploy() {
   # pipeline "gives grep's exit status" — true without `pipefail`, and no
   # harness in this tree is without it.
   echo "  building the Windows half"
-  cargo build --target x86_64-pc-windows-gnu \
+  cargo build --release --target x86_64-pc-windows-gnu \
         -p wc-launch -p wc-desk 2>&1 | grep -E "^error" | head -5
   built_ok "${PIPESTATUS[0]}" "wc-launch and wc-desk for Windows" || exit 1
-  cargo build --target x86_64-pc-windows-gnu -p sv-guest --no-default-features -F wayland 2>&1 | grep -E '^error|warning: unused' | head -5
+  cargo build --release --target x86_64-pc-windows-gnu -p sv-guest --no-default-features -F wayland 2>&1 | grep -E '^error|warning: unused' | head -5
   built_ok "${PIPESTATUS[0]}" "sv-guest for Windows" || exit 1
   # And freshness on top, because a build that succeeded without recompiling
   # anything is also possible: `cargo` is content when the tree has not changed,

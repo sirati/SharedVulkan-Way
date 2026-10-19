@@ -860,3 +860,40 @@ mod tests {
         drop(mem);
     }
 }
+
+#[cfg(test)]
+mod throughput_probe {
+    use super::*;
+    use crate::control::{Control, Geometry, ProtocolIds};
+    use crate::region::SharedRegion;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "a stopwatch"]
+    fn twenty_kib_through_a_wayland_lane() {
+        let g = Geometry::for_wayland();
+        let region = Arc::new(SharedRegion::heap(g.control_size as usize).unwrap());
+        let control = Control::create(region, g, ProtocolIds::new(7, 1), 1).unwrap();
+        let mut host = ByteChannel::claim(&control, 7).unwrap();
+        let mut guest = ByteChannel::open(&control, host.slot(), Endpoint::Peer).unwrap();
+        let payload = vec![7u8; 20_000];
+        let mut buf = vec![0u8; 16 * 1024];
+        println!("max_chunk {}", host.max_chunk());
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..1000 {
+                let mut off = 0;
+                let mut got = 0;
+                while got < payload.len() {
+                    if off < payload.len() {
+                        off += host.write(&payload[off..]).unwrap();
+                    }
+                    if let ReadOutcome::Bytes(n) = guest.read(&mut buf).unwrap() {
+                        got += n;
+                    }
+                }
+            }
+            println!("20 KB: {:?} each", t0.elapsed() / 1000);
+        }
+    }
+}

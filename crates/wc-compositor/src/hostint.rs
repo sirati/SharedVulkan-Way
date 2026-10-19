@@ -202,7 +202,7 @@ pub fn start_windows(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
 /// check that decides what may open is the real one, Windows paths
 /// included), and an opener that opens nothing: it logs what Windows would
 /// have opened and answers `ok`. No handlers are offered.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub fn start_logging(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
     struct LogOpener(fn(&str));
     impl Opener for LogOpener {

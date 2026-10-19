@@ -33091,6 +33091,59 @@ thread's sleep now compares against the lane's wake count taken before it
 looked at its queue (`ByteChannel::wake_epoch`, `wait_readable_since`), so a
 `Kicker::kick` between the two is not slept through.
 
+### 103.17 Role (b): a Mac hosting the Linux VM boots as the Windows guest does
+
+In role (b) the Mac runs the compositor and the Linux VM (libkrun on
+Hypervisor.framework) runs the applications. There is no guest RAM to sweep:
+the shared memory is one file on a Mac RAM disk, which the hypervisor shares
+into the guest through a virtio-fs DAX window (`/run/host-shm/arena` there),
+so both sides map the same pages. That is the ivshmem layout of §83 and §89 on
+a different substrate, and the boot is §105's, with the roles of the two
+sides the same as on Windows: the Mac is the side with the compositor.
+
+**Mac (`wc-launch`, `mac.rs`).** `arena-file = PATH` in `wc-launch.ini` (or
+`WC_MAC_ARENA_STANDIN`) selects role (b). The main process then
+
+* maps the file as ivshmem device 0 (`WC_IVSHMEM_STANDIN`, `--arena-ivshmem 0`)
+  and keeps the Wayland rings in its tail, not in a guest-RAM window;
+* opens the hypervisor's FIFO pair for the rings' virtio-serial port
+  (`wayland-bell = PREFIX`: `PREFIX.from-guest`, `PREFIX.to-guest`, both
+  read-write so neither open waits on the other side) and passes it as
+  `fd:R,W` (`ringlink::open_bell_port` takes §105.4's prefixed spellings);
+* passes `--boot-session/--boot-install/--boot-key/--control-socket`
+  (`plan::boot_argv`), so `session_svc` writes the signed record into the
+  header page, rings `HELLO_TOKEN`, and holds the control ring and the lease;
+* sends its requests (`run`, `down`) through that control socket, and plays
+  and records the sound ring itself (§103.16, every CoreAudio device), so
+  `--session-audio` is not passed.
+
+**Guest.** `wc-arena-host sessiond --arena-file /run/host-shm/arena --installs
+DIR --bell HUB/wl.sock`, a user unit beside `sv-hostd bell-hub --port
+dev:org.sirati.wcbell.0=HUB/wl.sock` (§99, the hub holding the guest's own
+port). The installation is a writable directory holding a link to
+`wc-session` and `session.key`, made on the service's first start; deploy
+copies the key to the Mac's support directory (mode 0600). `wc-session`'s
+ivshmem check wants a socket at `$WC_LAUNCH_WCBELL`; in a guest that is the
+hub's `wl.sock` (and `$WC_LAUNCH_BELL` its `sv.sock`).
+
+**Run (an A18 Mac, macOS 26, foot from the guest).** Hello to `located` 0.72 s
+(the guest's `up` 0.21 s, the proxy 0.5 s). Control requests answered in
+1.4–5 ms, which is the verb's own work in `wc-session`, not the ring. The sound
+ring announced both outputs and the microphone and followed the defaults.
+foot's window took focus and pointer input. Nothing crossed but the arena and
+the bell port: no ssh, socket, TCP or vsock in the session's path.
+
+**Found on the way.**
+
+* An application that asks for a `wl_shm` pool larger than the arena's
+  largest run is not refused cleanly. The proxy holds the pool back and
+  absorbs every request naming it, including the `create_pool` itself, so the
+  compositor's object ids fall out of step and the client dies on
+  `Invalid new_id`. foot reserves 512 MiB pools by default (scrolling by
+  offset); `-o tweak.max-shm-pool-size-mb=0` avoids it in a 128 MiB arena.
+* The proxy's microphone source failed to load (`mkfifo sound-2.fifo: File
+  exists`) once the Mac's devices were re-announced.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
@@ -33826,6 +33879,60 @@ by unsetting `DBUS_SESSION_BUS_ADDRESS`. Under a user unit, libdbus then falls
 back to `$XDG_RUNTIME_DIR/bus`, and a second PulseAudio on that bus (here, an
 unrelated program's) still took the name `org.PulseAudio1`, so the session had
 no sound. The address now points nowhere.
+
+**After the guest measurement** (master `a27ca12`, installation `wcns`,
+session 0, the real virtio-serial crossing):
+
+| request | n | mean | p50 | p90 | p99 |
+|---|---|---|---|---|---|
+| `rtt` | 10000 | **20.9 µs** | 19.8 | 21.9 | 45.5 |
+| `status` | 1000 | 27.1 µs | 25.1 | 29.5 | 58.7 |
+| `frequent firefox` (cached, 601 bytes) | 1000 | 29.9 µs | 27.6 | 32.0 | 66.5 |
+| `icon firefox` (18 KB) | 1000 | 198.6 µs | 174.0 | 250.6 | 439.1 |
+| `app firefox light` (20.5 KB) | 1000 | 213.9 µs | 193.5 | 277.0 | 423.8 |
+| `rtt`, 20 ms between requests (each crosses by doorbell) | 200 | 24.3 µs | 20.6 | 23.5 | 43.9 |
+
+The bound is met for every request without a payload. The two that carry an
+icon were not slow on the ring: a 20 KB packet through a lane costs 0.7 µs
+(`wlbytes::throughput_probe`). They were slow in the launcher and the
+compositor's copy of the answer, which deploy built in **debug**. Locally, the
+same path in release takes 8–14 µs for 20 KB. A 256 KiB answer took 5.2 ms,
+because a writer facing a full lane slept 1 ms at a time. It now spins, then
+yields, then sleeps 200 µs, and takes 0.11 ms. Deploy now builds the
+Windows binaries in release. The guest's icon and app answers are to be
+measured again with that build.
+
+**The cold start's 303 ms from the record to the host's answer** was the
+service's three verbs. On the guest: `up` 66 ms (a `bash wc-session` and its
+`od`s), `proxy` 233 ms (PulseAudio started as a unit and waited for, then the
+proxy as a unit and waited for), and `gpu` 108 ms (beside them). PulseAudio
+now starts beside the proxy instead of before it. The remaining cost is two
+`systemd-run`s and the proxy attaching; `up` in-process is the next cut if it
+is needed.
+
+**Two tests that failed under load, and why.** They were run 200 times each,
+with full suites alongside as load.
+
+* `poolcold::a_ring_lost_across_a_reopen_is_recovered_by_the_rescan` failed
+  63 times in 208. Its premise is that nothing wakes the guest between a
+  silent reply and the port's reopen. The open-rescan that §103.15 put on the
+  doorman's own thread could arrive inside that window, so the guest
+  answered early. That is right for the product and wrong for the test, which
+  now waits for the open's wakes before it replies: 0 failures in 208.
+  `guest_doorman` also marks the bell before it returns again, so a waiter
+  never takes the bell-less slice while the doorman thread has not run yet.
+* `two_processes` failed 3 times in 200 with "never created hostd.sock within
+  30s". The daemon had **exited** at once with `O_CREAT|O_EXCL … errno 17`:
+  two daemons started in the same instant had chosen the same run id, the
+  clock's nanoseconds alone, for the name of their shared object. The pid is
+  now part of the id, and the test now reports a daemon that exited, with its
+  stderr, instead of waiting out its 30 s budget: 0 failures in 200.
+* On the way, the load also found a **use-after-free in a test**.
+  `soundring::two_links_talk_both_ways` dropped the memory under its region
+  while the links' threads still ran (SIGSEGV in `wake_epoch`, 1 run in 18 of
+  the whole suite at 32 threads). The test now uses an owned region, and
+  `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
+  parallel suite runs, 0 failures.
 
 ## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 

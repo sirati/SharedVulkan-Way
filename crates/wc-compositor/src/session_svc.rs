@@ -214,8 +214,10 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
     None
 }
 
-/// How long a request waits for its answer before it parks (§105.13).
-const SPIN: Duration = Duration::from_micros(300);
+/// How long a request waits for its answer before it parks (§105.13): a
+/// millisecond covers the host waking from its park and answering, so the
+/// answer needs no doorbell back. Only while a request is outstanding.
+const SPIN: Duration = Duration::from_millis(1);
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
@@ -235,8 +237,11 @@ impl Ctl {
                 b = &b[n..];
             } else if t0.elapsed() > Duration::from_secs(5) {
                 return Err("the control ring stayed full for 5 s".into());
+            } else if t0.elapsed() < Duration::from_millis(5) {
+                // §105.13: the host drains a lane in microseconds.
+                std::thread::yield_now();
             } else {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(200));
             }
         }
         Ok(())
@@ -353,7 +358,10 @@ fn services(cfg: Config) {
         });
     }
     // §106: host integration (links and files both ways) on its own slot and
-    // thread, when the launcher passed `--hostint`.
+    // thread, when the launcher passed `--hostint`. Not on macOS: there the
+    // main process serves the slot itself (wc-launch mac_hostint.rs), in
+    // both roles.
+    #[cfg(not(target_os = "macos"))]
     if let Some(hcfg) = crate::hostint::configured() {
         let _ = std::thread::Builder::new().name("session-hostint".into()).spawn(move || {
             match service_channel(sv_transport::wlbytes::OWNER_HOSTINT, Duration::from_secs(20)) {
@@ -361,7 +369,7 @@ fn services(cfg: Config) {
                     say(&format!("hostint: on ring slot {} (no ssh)", ch.slot()));
                     #[cfg(windows)]
                     crate::hostint::start_windows(ch, hcfg, say);
-                    #[cfg(not(windows))]
+                    #[cfg(target_os = "linux")]
                     crate::hostint::start_logging(ch, hcfg, say);
                 }
                 None => say("hostint: the host opened no host-integration slot; links and files stay on their side"),

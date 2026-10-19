@@ -263,6 +263,10 @@ pub struct Config {
     /// and they cross as shared memory; empty, or a VM without the port, and
     /// they cross the ssh tunnel as before, which the log says loudly.
     pub wayland_bell: String,
+    /// §103.17, macOS role (b): the shared arena file (a RAM-disk file the
+    /// Linux guest maps through virtio-fs DAX); empty is role (a), guest RAM.
+    /// `WC_MAC_ARENA_STANDIN` overrides it.
+    pub arena_file: String,
     /// §102. `nested-compositor-globals = on` asks the compositor for the three
     /// globals a nested compositor needs from its host —
     /// `wp_single_pixel_buffer_manager_v1`, `wp_viewporter` and `wp_presentation`
@@ -315,6 +319,7 @@ impl Default for Config {
             gpu_server: String::new(),
             gpu_icd: String::new(),
             wayland_bell: "org.sirati.wcbell.0".into(),
+            arena_file: String::new(),
             nested_globals: false,
             hostint: HostInt::default(),
             installation: String::new(),
@@ -436,6 +441,7 @@ impl Config {
                 }
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
+                ("session", "arena-file") => cfg.arena_file = v.into(),
                 ("session", "installation") => cfg.installation = v.into(),
                 ("session", "session-key") => cfg.session_key = v.into(),
                 ("session", "debug-ssh-transport") => {
@@ -819,6 +825,8 @@ mod gpu_tests {
         assert!(p("wayland-bell =\n").unwrap_err().contains("wayland-bell"));
         assert_eq!(p("wayland-bell =\ndebug-ssh-transport = on\n").unwrap().wayland_bell, "");
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
+        assert_eq!(p("").unwrap().arena_file, "");
+        assert_eq!(p("arena-file = /Volumes/shm/arena\n").unwrap().arena_file, "/Volumes/shm/arena");
     }
 
     /// §102. The nested-compositor globals are off unless the ini asks.
