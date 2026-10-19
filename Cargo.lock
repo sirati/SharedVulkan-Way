@@ -1764,6 +1764,7 @@ version = "0.1.0"
 dependencies = [
  "png",
  "sv-transport",
+ "wc-broker",
  "wc-compositor",
  "wc-handle",
  "wc-hostint",

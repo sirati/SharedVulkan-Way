@@ -53,6 +53,15 @@ pub trait Platform: Send + Sync + 'static {
     fn released(&self, _obj: &Self::Object) -> bool {
         false
     }
+    /// Whether region `obj`, an orphan, carries its whole pool's release and
+    /// says it is set (core rule 5: the macOS session's boot page, §111.9).
+    /// Asked before [`Platform::released`]. Platforms without one say no.
+    fn released_pool(&self, _obj: &Self::Object) -> bool {
+        false
+    }
+    /// End process `pid`, which tied itself to a pool now released. Only
+    /// called while the broker still watches the process.
+    fn end(&self, _pid: Pid) {}
     /// Who the caller is, as the boot record's identity (§111.6): the
     /// platform reads it from the kernel's credentials or token, never from
     /// anything the caller sent. `None`: this platform does not sign.
@@ -172,6 +181,10 @@ impl<P: Platform> Broker<P> {
                         f(id, epoch);
                     }
                 }
+                Notice::End(pid) => {
+                    log(&format!("process {pid}: its pool is released; ending it"));
+                    self.platform.end(pid);
+                }
             }
         }
     }
@@ -206,13 +219,34 @@ impl<P: Platform> Broker<P> {
         let mut st = self.lock();
         st.core.tick(Instant::now());
         for id in st.core.probe_candidates() {
-            let released = st.objs.get(&id).and_then(|v| v.first()).is_some_and(|h| self.platform.released(&h.obj));
-            if released {
+            // An earlier candidate's pool may have taken this one with it.
+            let Some(obj) = st.objs.get(&id).and_then(|v| v.first()).map(|h| &h.obj) else { continue };
+            if self.platform.released_pool(obj) {
+                let pool = st.core.region(id).map(|r| r.pool.clone()).unwrap_or_default();
+                log(&format!("region {id}: the release word of pool {pool} is set; freeing the pool's orphans"));
+                st.core.pool_released(id);
+            } else if self.platform.released(obj) {
                 log(&format!("region {id}: its release word is set; freed"));
                 st.core.released(id);
             }
         }
         self.settle(&mut st);
+    }
+
+    /// A shutdown (§103.15): keep the release rules running for at most
+    /// `limit` while orphans are held, so a host that is releasing them is
+    /// waited for, and a shutdown never waits longer. Returns the orphans
+    /// still held.
+    pub fn drain_orphans(&self, limit: Duration) -> usize {
+        let t0 = Instant::now();
+        loop {
+            self.tick();
+            let left = self.stats().orphans;
+            if left == 0 || t0.elapsed() >= limit {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Serve one connection until it ends.
@@ -255,7 +289,14 @@ impl<P: Platform> Broker<P> {
 
     fn exited(&self, pid: Pid) {
         let mut st = self.lock();
+        let role = st.core.role(pid).unwrap_or("?").to_string();
+        let before = st.core.stats().orphans;
         st.core.process_exited(pid, Instant::now());
+        let after = st.core.stats().orphans;
+        log(&format!(
+            "process {pid} ({role}) exited{}",
+            if after > before { format!("; {} region(s) of it held as orphans", after - before) } else { String::new() }
+        ));
         self.settle(&mut st);
     }
 
@@ -357,6 +398,13 @@ impl<P: Platform> Broker<P> {
                         log(&format!("pool {pool}: {} orphan(s) adopted by process {}", v.len(), peer.pid));
                     }
                     p.push(w, &format!("ok adopted{}{}", if list.is_empty() { "" } else { " " }, list.join(" ")))
+                }
+                Err(r) => refused(w, r),
+            },
+            Request::Tie { pool } => match st.core.tie(id, pool) {
+                Ok(()) => {
+                    log(&format!("process {} of {} ends with pool {pool}", peer.pid, peer.user));
+                    p.push(w, "ok")
                 }
                 Err(r) => refused(w, r),
             },

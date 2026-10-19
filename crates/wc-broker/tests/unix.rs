@@ -243,3 +243,169 @@ fn a_service_is_reached_through_the_broker() {
     assert!(me.connect_service("nope").unwrap_err().to_string().contains("no service"));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ------------------------------------------------- the keeper (§111.9)
+
+/// A broker set up as the macOS LaunchDaemon's keeper: regions wired by it,
+/// a pool's orphans released by the boot page's word, or after `after`.
+fn start_keeper(d: &Path, after: Duration) -> String {
+    let sock = d.join("broker.sock");
+    let unix = Unix::bind(&sock, vec![]).unwrap().mac_keeper();
+    let config = Config {
+        devices: vec![],
+        services: vec![],
+        keys: None,
+        release: Release::Probe { after: Some(after) },
+        budget: None,
+        run: 9,
+    };
+    let b = Broker::new(unix, config);
+    std::thread::spawn(move || b.serve());
+    sock.to_string_lossy().into_owned()
+}
+
+/// The second process of the keeper test: `main` allocates the session's
+/// arena and ring window in pool `s1` and writes the boot page into the ring
+/// window, as the macOS main process does (`wc_handle::macboot`); `gpu`
+/// ties itself to the pool, as the GPU server does. Both live until killed.
+#[test]
+fn keeper_helper() {
+    let Ok(path) = std::env::var("WC_BROKER_TEST_KEEPER") else { return };
+    let role = std::env::var("WC_BROKER_TEST_ROLE").unwrap();
+    let mut c = Client::connect(&path).unwrap();
+    c.hello(&role).unwrap();
+    if role == "main" {
+        let (arena, _fds) = c.alloc("s1", 4 * 4096, false).unwrap();
+        let (rings, fds) = c.alloc("s1", 2 * 4096, false).unwrap();
+        let p = map(&fds[0], 2 * 4096);
+        // SAFETY: page 0 of the mapping just made.
+        let page = unsafe { std::slice::from_raw_parts_mut(p, 4096) };
+        page[..8].copy_from_slice(&wc_handle::arena::STAMP_MAGIC);
+        page[wc_handle::arena::STAMP_OFF_RUN_ID..wc_handle::arena::STAMP_OFF_RUN_ID + 8].copy_from_slice(&7u64.to_le_bytes());
+        wc_handle::macboot::Record {
+            session: "s1".into(),
+            arena_run: 7,
+            arena_pages: 4,
+            outbound: 0,
+            rings_run: 7,
+            rings_pages: 2,
+            gpu: true,
+        }
+        .write(page);
+        assert!(wc_handle::macboot::is_boot_page(page));
+        page[4096 - 1] = 0x5a;
+        println!("REGIONS {} {}", arena.id, rings.id);
+    } else {
+        c.tie("s1").unwrap();
+        println!("TIED");
+    }
+    let _ = std::io::stdout().flush();
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn spawn_keeper_helper(sock: &str, role: &str) -> (std::process::Child, String) {
+    let mut c = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "keeper_helper", "--nocapture", "--test-threads=1"])
+        .env("WC_BROKER_TEST_KEEPER", sock)
+        .env("WC_BROKER_TEST_ROLE", role)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = c.stdout.take().unwrap();
+    let mut got = Vec::new();
+    let mut b = [0u8; 256];
+    loop {
+        let text = String::from_utf8_lossy(&got).into_owned();
+        // libtest's "test keeper_helper ... " comes first on the same line.
+        if let Some(at) = text.find("REGIONS").or_else(|| text.find("TIED"))
+            && let Some(l) = text[at..].lines().next().filter(|_| text[at..].contains('\n'))
+        {
+            return (c, l.to_string());
+        }
+        let n = out.read(&mut b).unwrap();
+        assert!(n > 0, "the helper ended early: {text}");
+        got.extend_from_slice(&b[..n]);
+    }
+}
+
+fn wait_exit(c: &mut std::process::Child, within: Duration) -> Option<std::process::ExitStatus> {
+    let t = Instant::now();
+    while t.elapsed() < within {
+        if let Some(s) = c.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// §103.15's panic case, folded into the broker: the main process killed
+/// with SIGKILL leaves its regions held (the pages keep what it wrote); the
+/// host's release word in the boot page frees the whole pool and ends the
+/// GPU server tied to it, and nothing before.
+#[test]
+fn a_killed_main_process_leaves_its_pool_held_until_the_release_word() {
+    use std::os::unix::process::ExitStatusExt;
+    let d = dir("keeper");
+    let sock = start_keeper(&d, Duration::from_secs(600));
+    let mut me = Client::connect(&sock).unwrap();
+    me.hello("test").unwrap();
+    me.subscribe().unwrap();
+    let (mut main, line) = spawn_keeper_helper(&sock, "main");
+    let ids: Vec<u64> = line.split(' ').skip(1).map(|w| w.parse().unwrap()).collect();
+    let (mut gpu, _) = spawn_keeper_helper(&sock, "gpu");
+
+    main.kill().unwrap();
+    assert_eq!(main.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert!(wait_for(|| me.stats().unwrap().contains("orphans=2")), "{}", me.stats().unwrap());
+    // The host's view: the ring window, still held, still as written.
+    let (_, fds) = me.open(ids[1]).unwrap();
+    let p = map(&fds[0], 2 * 4096);
+    // SAFETY: inside the mapping.
+    assert_eq!(unsafe { *p.add(4096 - 1) }, 0x5a);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(me.stats().unwrap().contains("orphans=2"), "nothing goes before the word");
+    assert!(gpu.try_wait().unwrap().is_none(), "the GPU server lives until the release");
+
+    // The host's session service writes the release word.
+    // SAFETY: the release word of the boot page, 8-aligned.
+    unsafe {
+        (*(p.add(wc_handle::macboot::OFF_RELEASED) as *const std::sync::atomic::AtomicU64))
+            .store(wc_handle::macboot::RELEASED, std::sync::atomic::Ordering::Release)
+    };
+    let st = wait_exit(&mut gpu, Duration::from_secs(5)).expect("the tied GPU server is ended after the release");
+    assert_eq!(st.signal(), Some(libc::SIGKILL));
+    assert!(wait_for(|| me.stats().unwrap().contains("orphans=0")), "{}", me.stats().unwrap());
+    assert!(me.stats().unwrap().contains("regions=0"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The keeper's limit: with no release word, the pool goes after its time
+/// and its tied process with it; an arena page that merely holds a nonzero
+/// word where the release word would be releases nothing.
+#[test]
+fn a_pool_with_no_release_goes_after_its_limit() {
+    use std::os::unix::process::ExitStatusExt;
+    let d = dir("keeper-limit");
+    let sock = start_keeper(&d, Duration::from_secs(3));
+    let mut me = Client::connect(&sock).unwrap();
+    let (mut main, line) = spawn_keeper_helper(&sock, "main");
+    let ids: Vec<u64> = line.split(' ').skip(1).map(|w| w.parse().unwrap()).collect();
+    let (mut gpu, _) = spawn_keeper_helper(&sock, "gpu");
+    // The arena (no boot page) carries the release value at the offset.
+    let (_, fds) = me.open(ids[0]).unwrap();
+    let p = map(&fds[0], 4 * 4096);
+    // SAFETY: inside the mapping, 8-aligned.
+    unsafe { *(p.add(wc_handle::macboot::OFF_RELEASED) as *mut u64) = wc_handle::macboot::RELEASED };
+    main.kill().unwrap();
+    main.wait().unwrap();
+    assert!(wait_for(|| me.stats().unwrap().contains("orphans=2")));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(me.stats().unwrap().contains("orphans=2"), "an arena page is not a boot page");
+    let st = wait_exit(&mut gpu, Duration::from_secs(6)).expect("ended at the limit");
+    assert_eq!(st.signal(), Some(libc::SIGKILL));
+    assert!(me.stats().unwrap().contains("regions=0"), "{}", me.stats().unwrap());
+    let _ = std::fs::remove_dir_all(&d);
+}
