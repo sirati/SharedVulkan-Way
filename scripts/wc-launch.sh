@@ -4,6 +4,10 @@
 #
 #   scripts/wc-launch.sh deploy    cross-compile, copy both halves, write the ini
 #   scripts/wc-launch.sh install   put the shortcut on the guest's real desktop
+#   scripts/wc-launch.sh taskbar-plan       what deploy would decide for each
+#                                          application's taskbar identity (§92.12)
+#   scripts/wc-launch.sh uninstall-taskbar  this installation's jump lists, shortcuts
+#                                          and relaunch files, never another's
 #   scripts/wc-launch.sh cold      no session; click; time it
 #   scripts/wc-launch.sh warm      session already up; click; time it
 #   scripts/wc-launch.sh native    the same measurement for Windows' own Firefox
@@ -519,6 +523,56 @@ UNIT
 }
 
 # ---------------------------------------------------------------- deploy -----
+# §92.12. Each application's taskbar identity: `Waycompose.install.<name>.<app>`
+# for this installation alone, or the application-wide `Waycompose.app.<app>`
+# where this is the installation whose pin (or, with no pin, whose desktop
+# shortcut) already carries it, so the user's taskbar does not change.
+# `wc-launch.exe --taskbar-ids` decides on the guest from the user's shortcuts
+# and the claim files, keeps any earlier decision (wc-launch.ini.prev), writes
+# `taskbar-id` into the ini, and gives this installation's own unpinned
+# shortcuts its own identity where it does not keep the old one. A test
+# installation (WC_LAUNCH_TEST_HOME set here, or a `test-home` file beside its
+# wc-session on the VM host) and WC_LAUNCH_TASKBAR_ID=install always get their
+# own. `dry` only prints the plan.
+taskbar_ids() {
+  local dry="${1:-}" flags="" why=""
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then why="WC_LAUNCH_TEST_HOME is set"
+  elif [ "${WC_LAUNCH_TASKBAR_ID:-auto}" = install ]; then why="WC_LAUNCH_TASKBAR_ID=install"
+  elif h "test -s $HOSTDIR/test-home"; then why="$HOSTDIR/test-home exists"
+  fi
+  [ -n "$why" ] && flags="--test-install"
+  [ "$dry" = dry ] && flags="$flags --dry-run"
+  local before out
+  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --taskbar-ids $flags" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  [ -n "$why" ] && note "a test installation ($why): its applications get its own taskbar identity"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  [ "$dry" = dry ] && return
+  case "$out" in
+    *"taskbar-id: wrote "*)
+      ok "taskbar identities (§92.12): $(printf '%s\n' "$out" | grep -E '^taskbar-id: [^ ]+ (legacy|install) ' | sed 's/^taskbar-id: //; s/:.*//' | paste -sd ';')" ;;
+    *) bad "wc-launch --taskbar-ids did not write the ini" ;;
+  esac
+}
+
+# §92.12. Take this installation off the taskbar: its own jump lists (and the
+# application-wide one only while it holds the claim), its claim, desktop and
+# Start menu shortcuts, relaunch and jump-list files. Never another
+# installation's. Pins are listed for the user to remove.
+do_uninstall_taskbar() {
+  echo "== uninstall-taskbar =="
+  local before out
+  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --uninstall-taskbar ${1:-}" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  printf '%s\n' "$out" | sed 's/^/        /'
+  case "$out" in
+    *"relaunch file(s)"*|*"dry run"*) ok "this installation's taskbar presence removed${1:+ (dry run)}" ;;
+    *) bad "wc-launch --uninstall-taskbar said nothing" ;;
+  esac
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
@@ -701,6 +755,10 @@ APPS
        ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
     >/dev/null 2>&1
   sleep 1
+  # §92.12: the ini about to be replaced carries each application's taskbar
+  # identity (`taskbar-id`), decided by an earlier deploy; `--taskbar-ids`
+  # below reads it from here, so no decision flips.
+  g "cd $DIR_MSYS && if [ -f wc-launch.ini ]; then cp -f wc-launch.ini wc-launch.ini.prev; else rm -f wc-launch.ini.prev; fi" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DIRNAME/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
   echo "  copied wc-launch.exe, sv-guest.exe, wc-desk.exe, probe-relay.exe and the ini to $DIR_WIN"
   # STAGE 42. `sv-guest.exe` is the GPU side, which is the binary the
@@ -711,6 +769,7 @@ APPS
   # run rather than diagnosed from a handshake failure during it.
   deployed_all "$stage" "$DIR_MSYS" g "re-run $0 deploy with nothing of ours running on the guest" \
     wc-launch.exe sv-guest.exe wc-desk.exe || exit 1
+  taskbar_ids
 
   # §91. The doorbell ports for a medium-integrity launch: the two port devices'
   # descriptor gains read and write for $PORT_USER (and nothing else changes),
@@ -987,8 +1046,18 @@ do_install() {
   # and logged one `pins:` line per step that went wrong and one for the list.
   local pins
   pins=$(g "tail -30 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '\] pins: ')
-  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
-    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
+  # §92.12: the identity is this installation's own, or the application-wide
+  # one where deploy found the user's pin of it (`taskbar-id` in the ini).
+  # A name with capitals also gets a hash suffix, which this check does not
+  # compute; deployed names are lower case.
+  # (A name with capitals also gets a hash suffix, which this check does not
+  # compute; deployed names are lower case.)
+  local tid aumid
+  tid=$(g "awk '/^\\[/{s=\$0} s==\"[app.firefox]\" && /^taskbar-id/{print \$3}' $DIR_MSYS/wc-launch.ini" | tr -d '\r')
+  if [ "$tid" = legacy ]; then aumid=Waycompose.app.firefox
+  else aumid="Waycompose.install.$(printf '%s' "$SESSION" | tr 'A-Z' 'a-z').firefox"; fi
+  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/$aumid.relaunch && echo yes" | grep -q yes; then
+    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\$aumid.relaunch"
   else
     bad "no icon or no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
   fi
@@ -1455,6 +1524,8 @@ case "$MODE" in
        done' | sed 's/^/        /' ;;
   verify)  do_verify ;;
   install) do_install ;;
+  taskbar-plan) echo "== taskbar-plan (dry run) =="; taskbar_ids dry ;;
+  uninstall-taskbar) do_uninstall_taskbar "${WC_LAUNCH_DRY_RUN:+--dry-run}" ;;
   cold)    do_cold ;;
   warm)    do_warm ;;
   native)  do_native ;;
@@ -1462,7 +1533,7 @@ case "$MODE" in
   stop)    do_stop ;;
   clock)   read_clock ;;
   all)     do_deploy; echo; do_install; echo; do_native; echo; do_cold; echo; do_warm; echo; do_shot ;;
-  *) echo "usage: $0 deploy|install|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
+  *) echo "usage: $0 deploy|install|taskbar-plan|uninstall-taskbar|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
 esac
 
 echo

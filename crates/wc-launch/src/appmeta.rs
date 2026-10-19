@@ -9,8 +9,10 @@
 //! The compositor derives the window's from the Wayland app id
 //! (`crate::taskbar::identity`, the compositor's own file compiled in here), so
 //! the launcher derives the shortcut's the same way, from the app id the
-//! application's windows will carry ([`aumid`]). For Firefox both are
-//! `Waycompose.app.firefox`, the same in every session and after a reboot.
+//! application's windows will carry ([`aumid`]). For Firefox in `wcpins` both
+//! are `Waycompose.install.wcpins.firefox` (§92.12), the same in every session
+//! and after a reboot; the one installation that keeps the user's existing
+//! pin has `Waycompose.app.firefox`.
 //!
 //! # Where the facts come from
 //!
@@ -118,20 +120,31 @@ impl Meta {
     }
 }
 
-/// The identity of an application's pin, shortcut, jump list and windows.
-///
-/// The app id is the one its windows will carry: the `[app.<id>]` section's
-/// `app-id` if it names one, else the desktop entry's `StartupWMClass`, which
-/// exists to say exactly that, else the desktop id.
-pub fn aumid(app_id: &str, desktop: &str, meta: Option<&Meta>) -> String {
-    let id = if !app_id.is_empty() {
+/// The app id an application's windows will carry: the `[app.<id>]`
+/// section's `app-id` if it names one, else the desktop entry's
+/// `StartupWMClass`, which exists to say exactly that, else the desktop id.
+pub fn window_app_id<'a>(app_id: &'a str, desktop: &'a str, meta: Option<&'a Meta>) -> &'a str {
+    if !app_id.is_empty() {
         app_id
     } else if let Some(w) = meta.and_then(|m| m.wm_class.as_deref()).filter(|w| !w.is_empty()) {
         w
     } else {
         desktop
-    };
-    taskbar::identity(id, 0)
+    }
+}
+
+/// The identity of an application's pin, shortcut, jump list and windows.
+///
+/// `install` is the installation's name, for its own identity (§92.12);
+/// `None` is the application-wide one, which an installation keeps only where
+/// deploy found the user's pin of it (`taskbar-id = legacy`). The compositor
+/// derives the windows' the same way, from the boot's `taskbar=` scope.
+pub fn aumid(install: Option<&str>, app_id: &str, desktop: &str, meta: Option<&Meta>) -> String {
+    let id = window_app_id(app_id, desktop, meta);
+    match install {
+        Some(i) => taskbar::installed_identity(i, id, 0),
+        None => taskbar::identity(id, 0),
+    }
 }
 
 // ------------------------------------------------------------ frequent ---
@@ -505,13 +518,28 @@ mod tests {
     #[test]
     fn the_pin_s_identity_is_the_window_s() {
         let m = firefox_meta();
-        assert_eq!(aumid("", "firefox", Some(&m)), taskbar::identity("firefox", 1));
-        assert_eq!(aumid("", "firefox", Some(&m)), "Waycompose.app.firefox");
+        assert_eq!(aumid(None, "", "firefox", Some(&m)), taskbar::identity("firefox", 1));
+        assert_eq!(aumid(None, "", "firefox", Some(&m)), "Waycompose.app.firefox");
         // Without the host's answer, the desktop id; with an app-id, that.
-        assert_eq!(aumid("", "firefox", None), "Waycompose.app.firefox");
-        assert_eq!(aumid("org.x.Y", "y", Some(&m)), "Waycompose.app.org.x.Y");
+        assert_eq!(aumid(None, "", "firefox", None), "Waycompose.app.firefox");
+        assert_eq!(aumid(None, "org.x.Y", "y", Some(&m)), "Waycompose.app.org.x.Y");
         // Stable: no session, pid or connection in it.
-        assert_eq!(aumid("", "firefox", Some(&m)), aumid("", "firefox", None));
+        assert_eq!(aumid(None, "", "firefox", Some(&m)), aumid(None, "", "firefox", None));
+    }
+
+    /// §92.12: the same, per installation. The launcher's identity for an
+    /// installation is the compositor's for that installation's windows.
+    #[test]
+    fn the_pin_s_identity_is_the_window_s_per_installation() {
+        let m = firefox_meta();
+        let scope = taskbar::Scope::parse("wcpins").unwrap();
+        assert_eq!(aumid(Some("wcpins"), "", "firefox", Some(&m)), scope.identity("firefox", 1));
+        assert_eq!(aumid(Some("wcpins"), "", "firefox", None), "Waycompose.install.wcpins.firefox");
+        assert_ne!(aumid(Some("wcpins"), "", "firefox", None), aumid(Some("wcivs"), "", "firefox", None));
+        let legacy = taskbar::Scope::parse("wcivs:firefox").unwrap();
+        assert_eq!(aumid(None, "", "firefox", Some(&m)), legacy.identity("firefox", 1));
+        assert_eq!(window_app_id("", "firefox", Some(&m)), "firefox");
+        assert_eq!(window_app_id("x", "firefox", Some(&m)), "x");
     }
 
     /// Windows' Firefox's three tasks, in its order and its words, and not the

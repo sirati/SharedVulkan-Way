@@ -44,6 +44,40 @@ pub struct App {
     /// the pin and the windows must agree, or a running window gets a button
     /// of its own beside its pin.
     pub app_id: String,
+    /// §92.12. `taskbar-id = legacy | install`: whether this application's
+    /// windows, shortcuts, pins and jump list carry the application-wide
+    /// identity (`Waycompose.app.<app id>`, kept for the one installation
+    /// whose existing pin has it) or this installation's own
+    /// (`Waycompose.install.<installation>.<app id>`). Deploy decides once
+    /// (`--taskbar-ids`) and writes it here; absent is `install`.
+    pub taskbar_id: TaskbarId,
+}
+
+/// §92.12. Which form of the taskbar identity an application has here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskbarId {
+    /// `Waycompose.install.<installation>.<app id>`: this installation's.
+    #[default]
+    Install,
+    /// `Waycompose.app.<app id>`: the application-wide identity of §92, for
+    /// the one installation deploy found the user's pin of.
+    Legacy,
+}
+
+impl TaskbarId {
+    pub fn parse(v: &str) -> Option<TaskbarId> {
+        match v {
+            "install" => Some(TaskbarId::Install),
+            "legacy" => Some(TaskbarId::Legacy),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskbarId::Install => "install",
+            TaskbarId::Legacy => "legacy",
+        }
+    }
 }
 
 /// §106. `[hostint]`: how a file on this machine reaches Linux, and which
@@ -366,6 +400,7 @@ impl Config {
                         host_app: id.to_string(),
                         desktop: id.to_string(),
                         app_id: String::new(),
+                        taskbar_id: TaskbarId::Install,
                     });
                 }
                 continue;
@@ -394,6 +429,10 @@ impl Config {
                     }
                     "desktop" => app.desktop = v.into(),
                     "app-id" => app.app_id = v.into(),
+                    "taskbar-id" => {
+                        app.taskbar_id = TaskbarId::parse(v)
+                            .ok_or_else(|| format!("line {}: [app.{id}] taskbar-id is legacy or install, not {v}", n + 1))?
+                    }
                     other => return Err(format!("line {}: [app.{id}] has no {other}", n + 1)),
                 }
                 continue;
@@ -958,4 +997,110 @@ mod gpu_tests {
 /// this crate on Linux): 1 to 32 of letters, digits, `-` and `_`.
 pub fn installation_ok(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+// ------------------------------------------------------------ §92.12 ---
+
+/// §92.12. The `taskbar-id` of each `[app.*]` section that has one, read
+/// from an ini's text without parsing the rest: deploy reads the previous
+/// ini with it, which may be of an older launcher.
+pub fn taskbar_ids(text: &str) -> BTreeMap<String, TaskbarId> {
+    let mut out = BTreeMap::new();
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            section = name.trim().to_string();
+            continue;
+        }
+        if let (Some(id), Some((k, v))) = (section.strip_prefix("app."), line.split_once('='))
+            && k.trim() == "taskbar-id"
+            && let Some(t) = TaskbarId::parse(v.trim())
+        {
+            out.insert(id.to_string(), t);
+        }
+    }
+    out
+}
+
+/// §92.12. `text` with `[app.<section>] taskbar-id = <value>`: the line
+/// replaced where the section has one, else added as the section's first
+/// key. Every other byte is kept, comments and line endings included.
+pub fn set_taskbar_id(text: &str, section: &str, value: TaskbarId) -> Result<String, String> {
+    let header = format!("app.{section}");
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut in_section = false;
+    let mut found_section = false;
+    let mut done = false;
+    for raw in text.split_inclusive('\n') {
+        let eol = if raw.ends_with("\r\n") { "\r\n" } else { "\n" };
+        let line = raw.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            in_section = name.trim() == header;
+            out.push_str(raw);
+            if in_section && !done {
+                found_section = true;
+                if !raw.ends_with('\n') {
+                    out.push_str(eol);
+                }
+                out.push_str(&format!("taskbar-id = {}{eol}", value.as_str()));
+                done = true;
+            }
+            continue;
+        }
+        if in_section && line.split_once('=').is_some_and(|(k, _)| k.trim() == "taskbar-id") {
+            // The value written above under the header replaces this one.
+            continue;
+        }
+        out.push_str(raw);
+    }
+    if !found_section {
+        return Err(format!("no [app.{section}] in the configuration"));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod taskbar_id_tests {
+    use super::*;
+
+    const INI: &str = "[session]\ncompositor=C\n\n[app.firefox]\ntitle = Firefox (Linux)\n# a comment\n\n[app.atp-nested]\ntitle = W\ntaskbar-id = legacy\n";
+
+    #[test]
+    fn taskbar_id_is_parsed_defaults_to_install_and_is_checked() {
+        let c = Config::parse(INI).unwrap();
+        assert_eq!(c.apps["firefox"].taskbar_id, TaskbarId::Install);
+        assert_eq!(c.apps["atp-nested"].taskbar_id, TaskbarId::Legacy);
+        assert!(Config::parse("[session]\ncompositor=C\n[app.x]\ntaskbar-id = mine\n").unwrap_err().contains("legacy or install"));
+    }
+
+    #[test]
+    fn the_ids_are_read_from_any_ini_text() {
+        let ids = taskbar_ids(INI);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids["atp-nested"], TaskbarId::Legacy);
+        // An ini an older launcher would refuse is still read for this.
+        let ids = taskbar_ids("[session]\nnot a line\n[app.f]\nexec = x\ntaskbar-id = install\n");
+        assert_eq!(ids["f"], TaskbarId::Install);
+        assert!(taskbar_ids("[session]\ntaskbar-id = legacy\n").is_empty(), "only [app.*]");
+    }
+
+    #[test]
+    fn setting_an_id_changes_that_line_and_nothing_else() {
+        let t = set_taskbar_id(INI, "firefox", TaskbarId::Legacy).unwrap();
+        assert_eq!(t, INI.replace("[app.firefox]\n", "[app.firefox]\ntaskbar-id = legacy\n"));
+        let t = set_taskbar_id(&t, "atp-nested", TaskbarId::Install).unwrap();
+        assert!(t.ends_with("[app.atp-nested]\ntaskbar-id = install\ntitle = W\n"), "{t}");
+        assert_eq!(taskbar_ids(&t).len(), 2);
+        let c = Config::parse(&t).unwrap();
+        assert_eq!(c.apps["firefox"].taskbar_id, TaskbarId::Legacy);
+        assert_eq!(c.apps["atp-nested"].taskbar_id, TaskbarId::Install);
+        // Twice is once.
+        assert_eq!(set_taskbar_id(&t, "firefox", TaskbarId::Legacy).unwrap(), t);
+        assert!(set_taskbar_id(INI, "thunderbird", TaskbarId::Legacy).is_err());
+        let crlf = INI.replace('\n', "\r\n");
+        let t = set_taskbar_id(&crlf, "firefox", TaskbarId::Legacy).unwrap();
+        assert!(t.contains("[app.firefox]\r\ntaskbar-id = legacy\r\ntitle"), "{t:?}");
+        assert!(!t.replace("\r\n", "").contains('\n'));
+    }
 }
