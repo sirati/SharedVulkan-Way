@@ -63,7 +63,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve --region <file> --cold <sock> --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n  \
-                 sv-hostd bell-hub --port <chardev sock>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
+                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -1295,8 +1295,10 @@ fn broker_request(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `sv-hostd bell-hub` (waycompose-design.md §99): the doorbell ports, held
 /// by no session. Each `--port UPSTREAM=HUB` is QEMU's chardev socket for a
-/// virtio-serial port and the socket every session connects to instead. Runs
-/// until killed; a systemd user unit (`wc-bell-hub.service`) keeps it up.
+/// virtio-serial port, or `dev:NAME` for the guest's own
+/// `/dev/virtio-ports/NAME` (role (b), §103.6), and the socket every session
+/// connects to instead. Runs until killed; a systemd user unit
+/// (`wc-bell-hub.service`) keeps it up.
 #[cfg(target_os = "linux")]
 fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::geteuid() } == 0 {
@@ -1317,10 +1319,8 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         let spec = args.get(i + 1).ok_or("--port wants UPSTREAM=HUB")?;
         let (up, at) = spec.split_once('=').ok_or("--port wants UPSTREAM=HUB")?;
-        let name = std::path::Path::new(up)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "port".into());
+        let up = sv_hostd::bellhub::Upstream::parse(up);
+        let name = up.name();
         let listen_key = format!("{name}-listen");
         let l = match kept.remove(&listen_key) {
             // The same listening socket as before the restart: a client that
@@ -1334,9 +1334,9 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 l
             }
         };
-        let inherited = kept.remove(&format!("{name}-up")).map(std::os::unix::net::UnixStream::from);
+        let inherited = kept.remove(&format!("{name}-up"));
         eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
-        hubs.push(sv_hostd::bellhub::run_kept(&name, up.into(), l, inherited, keep)?);
+        hubs.push(sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?);
     }
     if hubs.is_empty() {
         return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());
