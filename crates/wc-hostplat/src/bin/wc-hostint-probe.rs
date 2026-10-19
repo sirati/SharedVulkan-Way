@@ -10,6 +10,8 @@
 //!                                          HKCU, read it back, uninstall it
 //!                                          through the manifest in DIR, and
 //!                                          check that nothing is left
+//!   wc-hostint-probe --render-test ID MS   play SILENCE to one endpoint
+//!   wc-hostint-probe --capture-test ID MS  record from one (turns a mic on)
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
@@ -54,6 +56,11 @@ mod win {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if let Some(i) = args.iter().position(|a| a == "--reg-test") {
             return reg_test(args.get(i + 1).map(String::as_str).unwrap_or("."));
+        }
+        if let Some(i) = args.iter().position(|a| a == "--render-test" || a == "--capture-test") {
+            let id = args.get(i + 1).cloned().unwrap_or_default();
+            let ms: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+            return stream_test(args[i] == "--render-test", &id, ms);
         }
         let t = Instant::now();
         match audio::enumerate() {
@@ -104,6 +111,56 @@ mod win {
     /// The executable's file name only: paths can carry user names.
     fn base(p: &str) -> &str {
         p.rsplit(['\\', '/']).next().unwrap_or(p)
+    }
+
+    /// Render SILENCE (all-zero samples) to one endpoint, or capture from
+    /// one, for `ms` at 48 kHz stereo, and print the stream's counters.
+    /// Not for a machine somebody is using: a capture turns the microphone
+    /// on.
+    fn stream_test(render: bool, id: &str, ms: u64) -> ExitCode {
+        use std::io::{Read, Write};
+        use wc_hostplat::win::stream::{Capture, Format, Render, Sizing};
+        let fmt = Format { rate: 48_000, channels: 2 };
+        let t = Instant::now();
+        if render {
+            let r = match Render::start(id, fmt, Sizing::default(), |l| println!("{l}")) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("render: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let mut w = r.writer();
+            let chunk = vec![0u8; 480 * 4];
+            while t.elapsed() < Duration::from_millis(ms) {
+                if w.write(&chunk).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            println!("render: {}", r.stats().line(fmt.rate));
+        } else {
+            let c = match Capture::start(id, fmt, Sizing::default(), |l| println!("{l}")) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("capture: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let mut rd = c.reader();
+            rd.set_timeout(Some(Duration::from_millis(200)));
+            let mut buf = vec![0u8; 4096];
+            let mut got = 0usize;
+            while t.elapsed() < Duration::from_millis(ms) {
+                match rd.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got += n,
+                    Err(_) => {}
+                }
+            }
+            println!("capture: {got} bytes read; {}", c.stats().line(fmt.rate));
+        }
+        ExitCode::SUCCESS
     }
 
     fn reg_test(dir: &str) -> ExitCode {

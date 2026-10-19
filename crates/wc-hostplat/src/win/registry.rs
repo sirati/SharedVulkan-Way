@@ -60,7 +60,10 @@ fn set(k: &Key, name: &str, data: &RegData) -> Result<(), String> {
         RegData::Empty => (REG_NONE, Vec::new()),
     };
     // SAFETY: a live key, NUL-terminated name, `bytes` of the stated type.
-    let rc = unsafe { RegSetValueExW(k.0, n.as_ptr(), 0, ty, bytes.as_ptr(), bytes.len() as u32) };
+    // A zero-length value is given a null pointer: an empty Vec's dangling one
+    // is refused (ERROR_NOACCESS).
+    let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr() };
+    let rc = unsafe { RegSetValueExW(k.0, n.as_ptr(), 0, ty, data, bytes.len() as u32) };
     if rc != ERROR_SUCCESS {
         return Err(format!("RegSetValueExW({name:?}): error {rc}"));
     }
@@ -117,6 +120,15 @@ pub fn remove(undo: &[RegUndo]) -> Result<usize, Vec<String>> {
     // empty by the last application's uninstall: remove them then, and
     // only then (a key with any subkey or value is kept).
     for u in undo {
+        // An extension's `OpenWithProgids` that held only our entry, and an
+        // extension key that held only that, carry nothing any more.
+        if let RegUndo::Value { key, .. } = u
+            && let Some(ext) = key.strip_suffix("\\OpenWithProgids")
+            && ext.starts_with("Software\\Classes\\.")
+        {
+            prune_empty(key);
+            prune_empty(ext);
+        }
         if let RegUndo::Tree(k) = u
             && let Some(rest) = k.strip_prefix("Software\\Waycompose\\")
             && let Some((install, _)) = rest.split_once('\\')
