@@ -296,8 +296,12 @@ pub fn guest_doorman<R: std::io::Read + Send + 'static, T: BellTarget + ?Sized +
     cold: Arc<ColdEvent>,
 ) -> crate::vdoorbell::Doorman {
     let target = Arc::new(WithCold { cold, lanes });
-    // The open is a wake: `serve_port` rescans the target first thing
-    // (§103.15's rule), which sets `has_bell` and rings the mailbox waiter.
+    // The open is a wake (§103.15's rule). `serve_port` rescans the target
+    // first thing too, but on the doorman's own thread, which a loaded machine
+    // may not run for a while; until then a waiter would take the bell-less
+    // poll slice. So the bell is marked here, before this returns, and the
+    // doorman's rescan is a second, harmless wake.
+    target.cold.reopened();
     crate::vdoorbell::Doorman::spawn_target(reader, target)
 }
 
@@ -1132,6 +1136,16 @@ mod tests {
         let lanes = crate::vdoorbell::ControlSet::new();
         let (g1, h1) = UnixStream::pair().unwrap();
         let _d1 = guest_doorman(g1, Arc::clone(&lanes), Arc::clone(&event));
+        // The open is two wakes: `guest_doorman` marks it at once, and the
+        // doorman's own thread rescans again when it starts (§103.15). Under
+        // load that second one can come after the silent reply below and wake
+        // the guest early, which is right for a product and wrong for this
+        // test's premise, so it is waited for first.
+        let t_open = Instant::now();
+        while event.opens() < 2 {
+            assert!(t_open.elapsed() < Duration::from_secs(30), "the doorman never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let slow = GuestTiming { bell_slice: Duration::from_secs(60), ..GuestTiming::default() };
         let guest = owner(Arc::clone(&r), 0x31, 4, Duration::from_secs(5), slow, Arc::new(|| {}), Arc::clone(&event));
         let mb = Mailboxes::new(Arc::clone(&r)).unwrap();

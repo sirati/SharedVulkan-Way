@@ -169,8 +169,8 @@ impl Hub {
     /// has ended, so a writer stuck on a dead upstream gives up.
     pub fn serve_link(
         self: &Arc<Self>,
-        mut r: Box<dyn Read + Send>,
-        mut w: Box<dyn Write + Send>,
+        r: Box<dyn Read + Send>,
+        w: Box<dyn Write + Send>,
         close: impl FnOnce(),
     ) -> std::io::Result<()> {
         self.serve_link_fresh(r, w, close, true)
