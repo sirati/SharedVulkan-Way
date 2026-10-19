@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # wc-session -- the VM host's half of the launcher. Stage 14.
 #
+# §105: NO GUEST REACHES THIS SCRIPT OVER SSH ANY MORE. The verbs below are run
+# by the host's session service (`wc-arena-host sessiond`, which starts a
+# session from the boot record the guest writes into shared memory, with
+# WC_LAUNCH_SERVICE=1) and by the proxy for each line on the session's control
+# ring (`wc_proxy::macsvc`). Both hand the words over in $SSH_ORIGINAL_COMMAND,
+# exactly as the forced command did, so the validation below is the same code
+# whichever way a request arrived. The forced-command key described next is
+# installed only for the opt-in debug transport (WC_LAUNCH_DEBUG_SSH_TRANSPORT=1).
+#
 # It is installed on the VM host at ~/wc-launch/wc-session and is the **forced
 # command** of the guest's key in ~/.ssh/authorized_keys:
 #
