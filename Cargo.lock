@@ -1705,6 +1705,7 @@ dependencies = [
  "wayland-scanner",
  "wayland-server",
  "wc-handle",
+ "wc-hostint",
  "wc-transport",
  "windows-sys",
 ]

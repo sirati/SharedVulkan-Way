@@ -295,9 +295,61 @@ fn decode_paths(t: &str) -> PathMap {
     p
 }
 
+/// Bytes from a ring slot, cut into lines. A line longer than [`MAX_LINE`]
+/// is dropped whole (up to its newline) rather than buffered without bound,
+/// since the peer may be hostile.
+#[derive(Default)]
+pub struct LineBuf {
+    buf: Vec<u8>,
+    skipping: bool,
+}
+
+impl LineBuf {
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// The next complete line, without its newline. Invalid UTF-8 becomes
+    /// U+FFFD, which no message decodes.
+    pub fn next_line(&mut self) -> Option<String> {
+        loop {
+            match self.buf.iter().position(|b| *b == b'\n') {
+                Some(i) => {
+                    let line: Vec<u8> = self.buf.drain(..=i).collect();
+                    if std::mem::take(&mut self.skipping) {
+                        continue;
+                    }
+                    return Some(String::from_utf8_lossy(&line[..i]).into_owned());
+                }
+                None => {
+                    if self.buf.len() > MAX_LINE {
+                        self.buf.clear();
+                        self.skipping = true;
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_are_cut_and_bounded() {
+        let mut l = LineBuf::default();
+        l.push(b"hello 1\nrep 2 o");
+        assert_eq!(l.next_line().as_deref(), Some("hello 1"));
+        assert_eq!(l.next_line(), None);
+        l.push(b"k\n");
+        assert_eq!(l.next_line().as_deref(), Some("rep 2 ok"));
+        l.push(&vec![b'x'; MAX_LINE + 10]);
+        assert_eq!(l.next_line(), None);
+        l.push(b"tail of the long one\nnext\n");
+        assert_eq!(l.next_line().as_deref(), Some("next"), "the overlong line is dropped whole");
+    }
 
     #[test]
     fn base64_round_trip_and_rejects() {
