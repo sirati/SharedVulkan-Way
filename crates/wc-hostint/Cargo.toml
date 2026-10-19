@@ -1,0 +1,19 @@
+[package]
+name = "wc-hostint"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Host integration: per-device audio, opening links and files across the VM boundary, both ways"
+
+# PURE BY DESIGN. Everything that decides something lives here and is tested on
+# the machine that builds it: the URL check that is the host's security
+# boundary, the audio device-to-node mapping and the PipeWire configuration,
+# the MIME to UTI and ProgID tables, the registry and Info.plist entries, the
+# Linux desktop entries and the wire format. The calls into Win32, CoreAudio,
+# Launch Services and PipeWire live with the processes that make them
+# (wc-launch, wc-compositor, wc-proxy).
+[dependencies]
+# A real URL parser, so the host re-serialises what it opens instead of
+# trusting the less trusted side's spelling of it.
+url = "2.5"

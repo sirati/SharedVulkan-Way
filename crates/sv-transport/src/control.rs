@@ -391,6 +391,35 @@ impl Geometry {
             timeline_count: 16,
         }
     }
+
+    /// §107: [`Geometry::for_wayland`] for a compositor shared by several
+    /// installations' sessions. Every session takes its control, sound and
+    /// arena slots and each of its connections three (the connection and its
+    /// two feeds), so 31 usable slots are two Firefox sessions at most. 64 is
+    /// [`crate::park::lane_token`]'s limit, so every slot can still ring a
+    /// bell. A proxy reads the geometry from the region it attaches to, so
+    /// nothing on the host has to know which of the two it is.
+    ///
+    /// 10 MiB, which the layout fills to a little under 8.7.
+    pub fn for_wayland_shared() -> Self {
+        Geometry { control_size: 10 << 20, ring_slot_count: 64, ..Geometry::for_wayland() }
+    }
+}
+
+#[cfg(test)]
+mod shared_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn the_shared_wayland_geometry_lays_out_and_every_slot_can_ring() {
+        let g = Geometry::for_wayland_shared();
+        let l = Layout::compute(g).unwrap();
+        assert!(l.used <= g.control_size, "{} > {}", l.used, g.control_size);
+        let last = g.ring_slot_count - 1;
+        for lane in [crate::ring::Lane::Command, crate::ring::Lane::Reply] {
+            assert_eq!(crate::park::lane_from_token(crate::park::lane_token(last, lane)), (last, lane));
+        }
+    }
 }
 
 /// Where everything is. Computed once, published, and read rather than

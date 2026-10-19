@@ -87,6 +87,84 @@ pub fn info_plist(section: &str, name: &str) -> String {
     )
 }
 
+/// §106: what a Linux application claims on the Mac, from its desktop
+/// entry's `MimeType=` list as the host sent it (`appmeta::Meta::mimes`):
+/// file types and, from `x-scheme-handler/...`, URL schemes. Each is
+/// checked again (`wc_hostint::mime`): the list is Linux's, and it ends up in
+/// a plist Launch Services reads.
+pub fn linux_app(section: &str, name: &str, mimes: &[String]) -> wc_hostint::assoc::LinuxApp {
+    let mut app = wc_hostint::assoc::LinuxApp { section: section.into(), name: name.into(), mimes: vec![], schemes: vec![] };
+    for t in mimes {
+        if let Some(s) = wc_hostint::mime::scheme_of(t) {
+            if !app.schemes.contains(&s) {
+                app.schemes.push(s);
+            }
+        } else if wc_hostint::mime::is_mime(t) {
+            let m = t.to_ascii_lowercase();
+            if !app.mimes.contains(&m) {
+                app.mimes.push(m);
+            }
+        }
+    }
+    app
+}
+
+/// [`info_plist`] with the application's document and URL types
+/// (`CFBundleDocumentTypes`, `CFBundleURLTypes`, from
+/// `wc_hostint::assoc::plist_types`), so Finder's "Open With", a
+/// double-click and `open -a` reach it. The face receives what it is asked
+/// to open as `application:openURLs:` and forwards it to the main process.
+pub fn info_plist_for(section: &str, name: &str, mimes: &[String]) -> String {
+    let base = info_plist(section, name);
+    let types = wc_hostint::assoc::plist_types(&linux_app(section, name, mimes), &bundle_id(section));
+    match base.rfind("</dict>") {
+        Some(at) if !types.is_empty() => format!("{}{types}{}", &base[..at], &base[at..]),
+        _ => base,
+    }
+}
+
+/// §106, TCC rule 1: the main process's own bundle. The microphone is opened
+/// only by the main process, so macOS asks once, names "Waycompose Host",
+/// and keeps the grant under this identity, never under an application's
+/// face. `LSUIElement`: no Dock tile and no menu bar (the main process also
+/// sets `NSApplicationActivationPolicyProhibited` itself).
+pub const HOST_BUNDLE_ID: &str = "org.waycompose.host";
+/// Its folder, under `~/Library/Application Support/waycompose`.
+pub const HOST_BUNDLE: &str = "Waycompose Host.app";
+
+pub fn host_info_plist() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>{exe}</string>
+	<key>CFBundleIdentifier</key>
+	<string>{HOST_BUNDLE_ID}</string>
+	<key>CFBundleName</key>
+	<string>Waycompose Host</string>
+	<key>CFBundleDisplayName</key>
+	<string>Waycompose Host</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Linux applications record from this Mac's microphones while you use them to record.</string>
+</dict>
+</plist>
+"#,
+        exe = EXECUTABLE,
+    )
+}
+
 /// The `[app.*]` section a bundle's `Info.plist` names, read back the way
 /// [`info_plist`] wrote it. Not a general plist parser: this launcher wrote
 /// the file, and a bundle it did not write is not one it should start.
@@ -259,6 +337,40 @@ mod tests {
         assert!(p.contains("<key>CFBundleExecutable</key>\n\t<string>wc-launch</string>"));
         assert_eq!(section_from_plist(&p).as_deref(), Some("firefox"));
         assert_eq!(section_from_plist("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn the_bundle_claims_the_entry_s_types_and_schemes() {
+        let mimes: Vec<String> =
+            ["text/html", "TEXT/PLAIN", "x-scheme-handler/https", "x-scheme-handler/javascript", "a b/c", "text/html"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let a = linux_app("firefox", "Firefox", &mimes);
+        assert_eq!(a.mimes, ["text/html", "text/plain"]);
+        assert_eq!(a.schemes, ["https", "javascript"]);
+        let p = info_plist_for("firefox", "Firefox", &mimes);
+        assert!(p.contains("<key>CFBundleDocumentTypes</key>"));
+        assert!(p.contains("<string>public.html</string>") && p.contains("<string>public.plain-text</string>"));
+        assert!(p.contains("<key>CFBundleURLSchemes</key>") && p.contains("<string>https</string>"));
+        assert!(!p.contains("javascript"), "never claimed, whatever the entry says");
+        // Still one well-formed dict, and the section still reads back.
+        assert!(p.trim_end().ends_with("</dict>\n</plist>"));
+        assert_eq!(p.matches("<dict>").count(), p.matches("</dict>").count());
+        assert_eq!(section_from_plist(&p).as_deref(), Some("firefox"));
+        // An entry that opens nothing gives the plain plist.
+        assert_eq!(info_plist_for("kgx", "Console", &[]), info_plist("kgx", "Console"));
+    }
+
+    #[test]
+    fn the_host_bundle_is_the_microphone_s_one_identity() {
+        let p = host_info_plist();
+        assert!(p.contains("<string>org.waycompose.host</string>"));
+        assert!(p.contains("<key>NSMicrophoneUsageDescription</key>"));
+        assert!(p.contains("<key>LSUIElement</key>\n\t<true/>"));
+        assert!(p.contains("<key>CFBundleExecutable</key>\n\t<string>wc-launch</string>"));
+        assert_eq!(section_from_plist(&p), None, "not a Linux application's bundle");
+        assert!(!bundle_id("x").starts_with(HOST_BUNDLE_ID));
     }
 
     fn png_of(w: u32, h: u32) -> Vec<u8> {
