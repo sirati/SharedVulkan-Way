@@ -108,6 +108,9 @@ pub fn hostint_argv(h: &crate::config::HostInt) -> Vec<String> {
     }
     if !h.browser.is_empty() {
         a.extend(["--hostint-browser".into(), h.browser.clone()]);
+        for x in &h.browser_args {
+            a.extend(["--hostint-browser-arg".into(), x.clone()]);
+        }
     }
     a
 }
@@ -622,6 +625,11 @@ mod tests {
         let mut b = h.clone();
         b.browser = r"C:\b\browser.exe".into();
         assert_eq!(hostint_argv(&b).last().map(String::as_str), Some(r"C:\b\browser.exe"));
+        b.browser_args = vec!["--new-window".into(), "--user-data-dir=C:\\T\\p q".into()];
+        assert_eq!(
+            hostint_argv(&b)[5..],
+            ["--hostint-browser", r"C:\b\browser.exe", "--hostint-browser-arg", "--new-window", "--hostint-browser-arg", r"--user-data-dir=C:\T\p q"]
+        );
     }
 
     fn cfg() -> Config {

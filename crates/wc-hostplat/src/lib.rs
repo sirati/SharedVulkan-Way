@@ -11,6 +11,7 @@
 pub mod debounce;
 pub mod defaults;
 pub mod handlers;
+pub mod launch;
 pub mod pcm;
 pub mod share;
 pub mod token;

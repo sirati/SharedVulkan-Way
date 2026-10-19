@@ -106,12 +106,16 @@ pub fn doorbell_wait() -> Wait {
 /// command line: `--hostint` turns it on, `--hostint-share HOST=LINUX` and
 /// `--hostint-drop HOST=LINUX` are the path map (wc-launch's `[hostint]`),
 /// `--hostint-browser EXE` the browser for Linux's links (the user's
-/// default when absent).
+/// default when absent) and `--hostint-browser-arg X`, repeated, its fixed
+/// arguments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostCfg {
     pub on: bool,
     pub paths: wc_hostint::wire::PathMap,
     pub browser: Option<String>,
+    /// `--hostint-browser-arg X`, repeated: the browser's fixed arguments,
+    /// before the URL.
+    pub browser_args: Vec<String>,
 }
 
 static HOSTCFG: std::sync::Mutex<Option<HostCfg>> = std::sync::Mutex::new(None);
@@ -134,6 +138,13 @@ pub fn parse_flag(flag: &str, value: &mut dyn FnMut() -> Option<String>) -> Resu
         "--hostint-share" => c.paths.shares.push(pair(&need()?)?),
         "--hostint-drop" => c.paths.drop = Some(pair(&need()?)?),
         "--hostint-browser" => c.browser = Some(need()?),
+        "--hostint-browser-arg" => {
+            let v = need()?;
+            if v.chars().any(char::is_control) || v.len() > 1024 || c.browser_args.len() >= 16 {
+                return Err(format!("{flag} {v:?}: at most 16, each at most 1024 bytes, no control characters"));
+            }
+            c.browser_args.push(v);
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -179,7 +190,7 @@ pub fn start_windows(ch: ByteChannel, cfg: HostCfg, say: fn(&str)) {
     });
     drop(tx);
     let svc = service("windows", &cfg, true);
-    let opener = win::open::WinOpener { browser: cfg.browser.clone() };
+    let opener = win::open::WinOpener { browser: cfg.browser.clone(), browser_args: cfg.browser_args.clone() };
     if let Err(e) = spawn(ch, doorbell_wait(), svc, Box::new(opener), rx, Box::new(move |l: &str| say(l))) {
         say(&format!("hostint: no thread: {e}"));
     }
@@ -203,5 +214,9 @@ mod flag_tests {
         assert_eq!(c.paths.drop.as_ref().unwrap().1, "/srv/winshare/waycompose-open");
         assert!(parse_flag("--hostint-share", &mut || Some("Z:\\=relative".into())).is_err());
         assert!(parse_flag("--hostint-browser", &mut || None).is_err());
+        assert!(parse_flag("--hostint-browser-arg", &mut || Some("--new-window".into())).unwrap());
+        assert!(parse_flag("--hostint-browser-arg", &mut || Some("--user-data-dir=C:\\T".into())).unwrap());
+        assert!(parse_flag("--hostint-browser-arg", &mut || Some("a\nb".into())).is_err());
+        assert_eq!(configured().unwrap().browser_args, ["--new-window", "--user-data-dir=C:\\T"]);
     }
 }

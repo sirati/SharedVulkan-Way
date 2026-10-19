@@ -62,7 +62,16 @@ pub struct HostInt {
     /// user's default browser. macOS: an application name as `open -a`
     /// takes it, "Firefox" by default.
     pub browser: String,
+    /// Windows: fixed arguments for `browser`, before the URL, one argv
+    /// element each (`browser-arg`, repeated; at most [`MAX_BROWSER_ARGS`]).
+    /// macOS: none (`open -a` takes no arguments for the application).
+    pub browser_args: Vec<String>,
 }
+
+/// At most this many `browser-arg` lines.
+pub const MAX_BROWSER_ARGS: usize = 16;
+/// The longest `browser-arg`, in bytes.
+pub const MAX_BROWSER_ARG_LEN: usize = 1024;
 
 impl Default for HostInt {
     fn default() -> Self {
@@ -78,9 +87,10 @@ impl HostInt {
                 share: (r"Z:\".into(), "/srv/winshare".into()),
                 drop: (r"Z:\waycompose-open".into(), "/srv/winshare/waycompose-open".into()),
                 browser: String::new(),
+                browser_args: Vec::new(),
             }
         } else {
-            HostInt { share: Default::default(), drop: Default::default(), browser: "Firefox".into() }
+            HostInt { share: Default::default(), drop: Default::default(), browser: "Firefox".into(), browser_args: Vec::new() }
         }
     }
 
@@ -136,6 +146,19 @@ impl HostInt {
             if !self.browser.is_empty() && !self.browser.to_ascii_lowercase().ends_with(".exe") {
                 return Err("[hostint] browser must be an .exe".into());
             }
+            if !self.browser_args.is_empty() && self.browser.is_empty() {
+                return Err("[hostint] browser-arg needs a browser".into());
+            }
+            if self.browser_args.len() > MAX_BROWSER_ARGS {
+                return Err(format!("[hostint] at most {MAX_BROWSER_ARGS} browser-arg lines"));
+            }
+            if self.browser_args.iter().any(|a| a.is_empty() || a.len() > MAX_BROWSER_ARG_LEN || a.chars().any(char::is_control)) {
+                return Err(format!(
+                    "[hostint] a browser-arg must be 1..={MAX_BROWSER_ARG_LEN} bytes without control characters"
+                ));
+            }
+        } else if !self.browser_args.is_empty() {
+            return Err("[hostint] browser-arg is for a Windows host only: `open -a` takes no arguments".into());
         } else if self.browser.is_empty() || self.browser.contains('/') || self.browser.chars().any(char::is_control) {
             return Err("[hostint] browser must be an application's name, as `open -a` takes it".into());
         }
@@ -422,6 +445,8 @@ impl Config {
                 ("hostint", "drop-host") => cfg.hostint.drop.0 = v.into(),
                 ("hostint", "drop-linux") => cfg.hostint.drop.1 = v.into(),
                 ("hostint", "browser") => cfg.hostint.browser = v.into(),
+                // Repeated: one argv element per line, in order.
+                ("hostint", "browser-arg") => cfg.hostint.browser_args.push(v.into()),
                 ("hostint", other) => return Err(format!("line {}: [hostint] has no {other}", n + 1)),
                 ("session", other) => {
                     return Err(format!("line {}: [session] has no {other}", n + 1));
@@ -564,6 +589,7 @@ audio-volume = 100
 # drop-host   = Z:\waycompose-open
 # drop-linux  = /srv/winshare/waycompose-open
 # browser     = C:\Program Files\<browser>\<browser>.exe
+# browser-arg = --new-window      (repeatable: one argument per line, before the URL)
 
 # One block per application, and a second application is a second shortcut
 # rather than a second program.
@@ -792,6 +818,7 @@ mod gpu_tests {
             share: (s.0.into(), s.1.into()),
             drop: (dr.0.into(), dr.1.into()),
             browser: b.into(),
+            browser_args: vec![],
         };
         let good = h(("/Users/u", "/Users/u"), ("/Users/u/.wc-open", "/Users/u/.wc-open"), "Safari");
         assert_eq!(good.check_for(false), Ok(()));
@@ -804,5 +831,41 @@ mod gpu_tests {
         assert!(h(("", ""), ("/a/b", "/a/b"), "Firefox").check_for(false).is_err(), "a drop needs a share");
         // And the Windows defaults pass the Windows rules.
         assert_eq!(HostInt::for_platform(true).check_for(true), Ok(()));
+    }
+
+    /// `browser-arg`: repeated, in order, Windows only, and bounded.
+    #[test]
+    fn browser_args_are_ordered_bounded_and_windows_only() {
+        let mut h = HostInt::for_platform(true);
+        h.browser = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".into();
+        h.browser_args = vec!["--user-data-dir=C:\\Temp\\wc edge".into(), "--no-first-run".into(), "--new-window".into()];
+        assert_eq!(h.check_for(true), Ok(()));
+        let mut bad = h.clone();
+        bad.browser_args.push("a\nb".into());
+        assert!(bad.check_for(true).is_err(), "a control character");
+        let mut bad = h.clone();
+        bad.browser_args = vec!["x".into(); MAX_BROWSER_ARGS + 1];
+        assert!(bad.check_for(true).is_err(), "too many");
+        let mut bad = h.clone();
+        bad.browser_args = vec!["x".repeat(MAX_BROWSER_ARG_LEN + 1)];
+        assert!(bad.check_for(true).is_err(), "too long");
+        let mut bad = h.clone();
+        bad.browser.clear();
+        assert!(bad.check_for(true).is_err(), "arguments for no browser");
+        let mut mac = HostInt::for_platform(false);
+        assert_eq!(mac.check_for(false), Ok(()));
+        mac.browser_args = vec!["--new-window".into()];
+        assert!(mac.check_for(false).is_err(), "not on macOS");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn browser_arg_lines_are_parsed_in_order() {
+        let c = Config::parse(
+            "[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n[hostint]\nbrowser = C:\\e\\msedge.exe\n\
+             browser-arg = --user-data-dir=C:\\Temp\\p q\nbrowser-arg = --no-first-run\n",
+        )
+        .unwrap();
+        assert_eq!(c.hostint.browser_args, ["--user-data-dir=C:\\Temp\\p q", "--no-first-run"]);
     }
 }

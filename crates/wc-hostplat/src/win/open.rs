@@ -26,6 +26,8 @@ use super::com::{Apartment, wide};
 #[derive(Debug, Default, Clone)]
 pub struct WinOpener {
     pub browser: Option<String>,
+    /// The browser's fixed arguments, before the URL (`[hostint] browser-arg`).
+    pub browser_args: Vec<String>,
 }
 
 /// Whether `exe` names an executable we would start directly: an absolute
@@ -62,12 +64,12 @@ fn shell_open(file: &str) -> Result<(), String> {
     if code > 32 { Ok(()) } else { Err(format!("ShellExecuteW failed ({code})")) }
 }
 
-fn spawn(exe: &str, arg: &str) -> Result<(), String> {
+fn spawn(exe: &str, args: &[String]) -> Result<(), String> {
     if !is_exe(exe) {
         return Err("the application is not an executable on this machine".into());
     }
     std::process::Command::new(exe)
-        .arg(arg)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -86,7 +88,7 @@ fn check_path(p: &str) -> Result<(), String> {
 impl Opener for WinOpener {
     fn open_url(&mut self, url: &str) -> Result<(), String> {
         match &self.browser {
-            Some(b) => spawn(b, url),
+            Some(b) => spawn(b, &crate::launch::browser_argv(&self.browser_args, url)),
             None => shell_open(url),
         }
     }
@@ -98,10 +100,10 @@ impl Opener for WinOpener {
 
     fn open_with(&mut self, app: &str, target: &Target) -> Result<(), String> {
         match target {
-            Target::Url(u) => spawn(app, u),
+            Target::Url(u) => spawn(app, std::slice::from_ref(u)),
             Target::HostPath(p) => {
                 check_path(p)?;
-                spawn(app, p)
+                spawn(app, std::slice::from_ref(p))
             }
         }
     }
