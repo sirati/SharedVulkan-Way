@@ -20,6 +20,7 @@ use sv_arena::pool::Purpose;
 use sv_ram::policy::{Policy, Usage};
 use sv_ram::provider::{Event, Provider, Substrate};
 use sv_transport::region::SharedRegion;
+use sv_transport::regiontab::wake;
 
 struct Live {
     entry: u32,
@@ -35,6 +36,8 @@ pub struct RegionManager<S: Substrate + Send + 'static> {
     budget: u64,
     live: Mutex<BTreeMap<u32, Live>>,
     last_grow: Mutex<Instant>,
+    /// The pool's boot mapping, which names its doorbell (§110.3).
+    base: usize,
 }
 
 fn now_ms(t: Instant) -> u64 {
@@ -64,6 +67,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
         let m = Arc::new(RegionManager {
             prov: Mutex::new(prov),
             server: Arc::clone(&server),
+            base: unsafe { boot.base_ptr() } as usize,
             policy: Policy::from_env(),
             budget,
             live: Mutex::new(BTreeMap::new()),
@@ -76,13 +80,30 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
         std::thread::Builder::new()
             .name("sv-pool-regions".into())
             .spawn(move || {
+                let mut seen = wake::current();
                 loop {
-                    std::thread::sleep(Duration::from_millis(250));
+                    wake::wait(&mut seen, Duration::from_millis(250));
                     t.tick();
                 }
             })
             .map_err(|e| e.to_string())?;
         Ok(m)
+    }
+
+    /// Ring the host (§108.2): something in the table changed. False: no
+    /// doorbell in this process.
+    fn ring(&self) -> bool {
+        sv_transport::poolcold::poke_region_at(self.base)
+    }
+
+    /// How long to wait for the host between looks at the table: the rescan
+    /// slice with a doorbell, a poll without one.
+    fn slice(&self) -> Duration {
+        if sv_transport::park::cross_wake_at(self.base).or_else(sv_transport::park::cross_wake).is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_micros(200)
+        }
     }
 
     fn usage(&self) -> Usage {
@@ -111,6 +132,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
                         Err(e) => {
                             eprintln!("[gpu] regions: region {k} could not join the pool ({e}); retiring it");
                             prov.retire(entry);
+                            self.ring();
                         }
                     }
                 }
@@ -144,6 +166,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
             return false;
         };
         let t = Instant::now();
+        let mut seen = wake::current();
         let entry = match prov.announce(k, len) {
             Ok(e) => e,
             Err(e) => {
@@ -153,6 +176,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
         };
         self.live.lock().unwrap().insert(k, Live { entry, len, mapped: false, idle_since: None });
         *self.last_grow.lock().unwrap() = Instant::now();
+        self.ring();
         eprintln!("[gpu] regions: region {k} of {} MiB announced for a lease of {} KiB (substrate {:.2} ms)", len >> 20, need >> 10, prov.regions[&entry].alloc_us as f64 / 1e3);
         loop {
             match prov.poll() {
@@ -172,7 +196,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
                 eprintln!("[gpu] regions: no answer for region {k} in 10 s; the lease fails, the region joins when the host answers");
                 return false;
             }
-            std::thread::sleep(Duration::from_micros(200));
+            wake::wait(&mut seen, self.slice());
         }
     }
 
@@ -216,6 +240,7 @@ impl<S: Substrate + Send + 'static> RegionManager<S> {
                         l.mapped = false;
                     }
                     prov.retire(entry);
+                    self.ring();
                     eprintln!("[gpu] regions: region {k} idle for {} s, retired; {}", self.policy.idle_ms / 1000, self.server.report());
                 }
             let u = self.usage();
@@ -276,6 +301,8 @@ impl<S: Substrate + Send + 'static> RetireAll for RegionManager<S> {
         }
         eprintln!("[gpu] regions: exiting; {n} region(s) retired, waiting up to {} s for the host to let go", timeout.as_secs());
         let t = Instant::now();
+        let mut seen = wake::current();
+        self.ring();
         while t.elapsed() < timeout && prov.regions.values().any(|r| r.phase == sv_ram::provider::Phase::Retiring) {
             match prov.poll() {
                 Ok(evs) => self.absorb(&mut prov, evs),
@@ -284,7 +311,7 @@ impl<S: Substrate + Send + 'static> RetireAll for RegionManager<S> {
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_millis(1));
+            wake::wait(&mut seen, self.slice());
         }
     }
 }

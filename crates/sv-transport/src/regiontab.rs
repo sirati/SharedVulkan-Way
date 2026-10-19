@@ -507,3 +507,30 @@ mod tests {
         assert_eq!((h.want_bytes, h.want_seq, h.budget), (123 << 20, 1, 1 << 30));
     }
 }
+
+/// The process's region wake: rung by the doorbell's `REGION_TOKEN` and by
+/// every reopen or `RESCAN_TOKEN` (the rescan rule), waited on by a provider
+/// with a region in flight instead of polling the table.
+pub mod wake {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    static COUNT: Mutex<u64> = Mutex::new(0);
+    static CV: Condvar = Condvar::new();
+
+    pub fn notify() {
+        *COUNT.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        CV.notify_all();
+    }
+
+    /// Wait until a wake newer than `seen`, or `d`; updates `seen`.
+    pub fn wait(seen: &mut u64, d: Duration) {
+        let g = COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = CV.wait_timeout_while(g, d, |n| *n == *seen).unwrap_or_else(|e| e.into_inner());
+        *seen = *g;
+    }
+
+    pub fn current() -> u64 {
+        *COUNT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}

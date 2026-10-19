@@ -117,24 +117,45 @@ fn run(a: &[String]) -> Result<(), String> {
 
     // The doorbell: QEMU's chardev socket (or a hub's). A reader thread turns
     // tokens into wakes; every answer rings back.
+    // The doorbell: QEMU's chardev socket or the bell hub's. A reader thread
+    // turns every byte into a wake; when the socket goes away it reconnects,
+    // and a (re)connect is a wake too (the rescan rule, §103.14): a token sent
+    // while it was away is lost, so the table is read again.
     let (wtx, wrx) = mpsc::channel::<()>();
-    let mut bell_w = match opt("--bell") {
-        Some(p) => {
-            let s = std::os::unix::net::UnixStream::connect(&p).map_err(|e| format!("{p}: {e}"))?;
-            let mut r = s.try_clone().map_err(|e| e.to_string())?;
-            std::thread::spawn(move || {
-                let mut b = [0u8; 256];
+    let bell_path = opt("--bell");
+    let bell_w: Arc<Mutex<Option<std::os::unix::net::UnixStream>>> = Arc::new(Mutex::new(None));
+    if let Some(p) = bell_path.clone() {
+        let s = std::os::unix::net::UnixStream::connect(&p).map_err(|e| format!("{p}: {e}"))?;
+        *bell_w.lock().unwrap() = Some(s.try_clone().map_err(|e| e.to_string())?);
+        let w = Arc::clone(&bell_w);
+        std::thread::spawn(move || {
+            let mut r = s;
+            let mut b = [0u8; 256];
+            loop {
                 while let Ok(n) = r.read(&mut b) {
                     if n == 0 {
                         break;
                     }
                     let _ = wtx.send(());
                 }
-            });
-            Some(s)
-        }
-        None => None,
-    };
+                *w.lock().unwrap() = None;
+                println!("[peer] {} the doorbell closed; reconnecting", ts());
+                r = loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if let Ok(s) = std::os::unix::net::UnixStream::connect(&p) {
+                        break s;
+                    }
+                };
+                if let Ok(c) = r.try_clone() {
+                    *w.lock().unwrap() = Some(c);
+                }
+                let _ = wtx.send(());
+            }
+        });
+    }
+    // With a doorbell, the table is read on every token and at least every
+    // beat; without one it is polled.
+    let slice = if bell_path.is_some() { Duration::from_millis(BEAT_MS) } else { Duration::from_millis(1) };
 
 
     let jobs: Arc<Mutex<BTreeMap<u32, Arc<Job>>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -149,7 +170,7 @@ fn run(a: &[String]) -> Result<(), String> {
     let mut last_stats = Instant::now();
     loop {
         // Wait for a token or 1 ms, whichever first; drain the rest.
-        let _ = wrx.recv_timeout(Duration::from_millis(1));
+        let _ = wrx.recv_timeout(slice);
         while wrx.try_recv().is_ok() {}
         let mut stopped: BTreeMap<u32, JobState> = BTreeMap::new();
         let evs = peer.scan(|m| {
@@ -194,10 +215,9 @@ fn run(a: &[String]) -> Result<(), String> {
                 PeerEvent::ProviderRun { run } => println!("[peer] {} provider run {run:016x}", ts()),
             }
         }
-        if answered
-            && let Some(b) = bell_w.as_mut() {
-                let _ = b.write_all(&[REGION_TOKEN]);
-            }
+        if answered && let Some(b) = bell_w.lock().unwrap().as_mut() {
+            let _ = b.write_all(&[REGION_TOKEN]);
+        }
         if last_beat.elapsed() >= Duration::from_millis(BEAT_MS) {
             peer.beat();
             if auto {
