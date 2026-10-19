@@ -5,6 +5,7 @@
 //! wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--no-default-devices]
 //!                 [--release-after SECS] [--budget-mib N]
 //! wc-broker ctl [--hold] REQUEST...
+//! wc-broker plist BIN                 (the LaunchDaemon's plist, for the installer)
 //! ```
 //!
 //! On macOS `serve` is the LaunchDaemon `org.waycompose.broker` (root, launchd
@@ -231,13 +232,50 @@ pub fn ctl(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The LaunchDaemon's label and where its plist goes (§111.9).
+pub const LAUNCHD_LABEL: &str = "org.waycompose.broker";
+pub const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/org.waycompose.broker.plist";
+
+/// The LaunchDaemon's plist for the program at `bin`: root (a daemon's
+/// default), started at boot, restarted by launchd whenever it ends
+/// (`KeepAlive`), and given 15 s after SIGTERM, more than the
+/// [`TERM_LIMIT`] it waits for the hosts' releases.
+pub fn launchd_plist(bin: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ExitTimeOut</key><integer>15</integer>
+  <key>StandardErrorPath</key><string>/Library/Logs/waycompose/broker.log</string>
+  <key>StandardOutPath</key><string>/Library/Logs/waycompose/broker.log</string>
+</dict>
+</plist>
+"#,
+        esc(bin)
+    )
+}
+
 pub fn main(args: Vec<String>) -> std::process::ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("ctl") => ctl(&args[1..]),
+        Some("plist") => match args.get(1) {
+            Some(bin) => {
+                print!("{}", launchd_plist(bin));
+                Ok(())
+            }
+            None => Err("wc-broker plist BIN".into()),
+        },
         Some("serve") => parse_serve(&args[1..]).and_then(serve),
         None => parse_serve(&[]).and_then(serve),
         Some(_) => Err("usage: wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--no-default-devices] \
-                        [--release-after SECS] [--budget-mib N] | wc-broker ctl [--hold] REQUEST..."
+                        [--release-after SECS] [--budget-mib N] | wc-broker ctl [--hold] REQUEST... | wc-broker plist BIN"
             .into()),
     };
     match r {
@@ -274,5 +312,15 @@ mod tests {
         for bad in [&["--device", "nopath"][..], &["--device", "a b=/x"], &["--release-after", "x"], &["--fly"]] {
             assert!(parse_serve(&s(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_launch_daemon_is_kept_alive_and_outlasts_its_own_shutdown_wait() {
+        let p = launchd_plist("/Library/Application Support/waycompose/bin/wc-broker");
+        assert!(p.contains("<key>KeepAlive</key><true/>"));
+        assert!(p.contains("<string>/Library/Application Support/waycompose/bin/wc-broker</string><string>serve</string>"));
+        let t: u64 = p.split("<key>ExitTimeOut</key><integer>").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
+        assert!(Duration::from_secs(t) > TERM_LIMIT);
+        assert!(launchd_plist("/a<b").contains("/a&lt;b"));
     }
 }

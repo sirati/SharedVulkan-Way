@@ -163,7 +163,9 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
     let key = key_of(&install)?;
     // §107: the index is covered by the MAC, so a record cannot be replayed
     // into another session's place; index 0 is the one-session message.
-    if !auth.verifies_indexed(&rec, index, &key) {
+    // §111.6: a broker-signed record covers who asked too; with no identity
+    // this is §107's check, byte for byte.
+    if !auth.verifies_identity(&rec, index, macboot::Identity::read(page).as_ref(), &key) {
         return Err(format!("the boot record for installation {} does not verify under its key", install.name));
     }
     let last = last_seq(state, &install.name);
