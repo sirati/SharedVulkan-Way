@@ -227,7 +227,14 @@ fn serve(conn: UnixStream, a: &Args) {
         }
     };
     let ws = install.session();
-    let env = session_env(&start, a.broker.as_deref());
+    let mut env = session_env(&start, a.broker.as_deref());
+    // The session's run directories in this user's runtime directory (0700,
+    // theirs), not in a /tmp name another user could have made first.
+    if std::env::var_os("WC_LAUNCH_RUN").is_none()
+        && let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR")
+    {
+        env.push(("WC_LAUNCH_RUN", format!("{}/wc-launch", rt.to_string_lossy())));
+    }
     if a.broker.is_none() || start.arena.is_none() {
         say(&format!("session {}: NO BROKER: its processes open the devices by path", start.id));
     }
