@@ -58,6 +58,9 @@ struct Args {
     gpu_region: Option<PathBuf>,
     hub_wl: Option<PathBuf>,
     hub_sv: Option<PathBuf>,
+    /// §108 through §111.10: the guest-RAM substrate's flags, for the
+    /// embedded component that serves them (`embedded()`).
+    guest_ram: wc_broker::host::GuestRam,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -77,6 +80,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         gpu_region: None,
         hub_wl: None,
         hub_sv: None,
+        guest_ram: Default::default(),
     };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
@@ -98,8 +102,39 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--gpu-region" => a.gpu_region = Some(v()?.into()),
             "--hub-wl" => a.hub_wl = Some(v()?.into()),
             "--hub-sv" => a.hub_sv = Some(v()?.into()),
+            "--guest-ram-boot" => a.guest_ram.boot = Some(v()?.into()),
+            "--guest-ram-qemu-pid" | "--guest-ram-qemu-pidfile" | "--guest-ram" => {
+                use wc_broker::host::QemuRam;
+                if a.guest_ram.qemu.is_some() {
+                    return Err("--guest-ram-qemu-pid, --guest-ram-qemu-pidfile and --guest-ram: one of them".into());
+                }
+                let val = v()?;
+                a.guest_ram.qemu = Some(match k.as_str() {
+                    "--guest-ram-qemu-pid" => QemuRam::Pid(val.parse().map_err(|_| format!("{k}: a pid, not {val:?}"))?),
+                    "--guest-ram-qemu-pidfile" => QemuRam::PidFile(val.into()),
+                    _ => QemuRam::File(val.into()),
+                });
+            }
+            "--guest-ram-bell" => a.guest_ram.bell = Some(v()?),
+            "--guest-ram-user" => {
+                use wc_broker::host::GuestRamUser;
+                let val = v()?;
+                a.guest_ram.user = Some(match val.as_str() {
+                    "mapped" => GuestRamUser::Mapped,
+                    n => GuestRamUser::Uid(n.parse().map_err(|_| format!("{k}: a uid or `mapped`, not {n:?}"))?),
+                });
+            }
             _ => return Err(format!("unknown argument {k}")),
         }
+    }
+    if a.guest_ram.boot.is_none() {
+        a.guest_ram.boot = a.gpu_region.clone();
+    }
+    if a.guest_ram.user == Some(wc_broker::host::GuestRamUser::Mapped) && a.users.is_none() {
+        return Err("--guest-ram-user mapped needs --users".into());
+    }
+    if (a.guest_ram.user.is_some() || a.guest_ram.bell.is_some()) && a.guest_ram.qemu.is_none() {
+        return Err("the --guest-ram-* flags need one of --guest-ram-qemu-pid, --guest-ram-qemu-pidfile, --guest-ram".into());
     }
     if a.arena.as_os_str().is_empty() {
         return Err("usage: wc-arena-host sessiond --ivshmem ARENA-FILE [--installs DIR] [--state DIR] \
@@ -383,10 +418,15 @@ impl Brokered {
 
 /// §111.10: the components this daemon hosts beside its broker
 /// (`wc_broker::host::Embedded`). The guest-RAM substrate (§108,
-/// `sv_ram::brokered`) is added here; each is attached once at start and told
-/// of every session that starts and ends, with the user it runs as.
-fn embedded(_args: &Args) -> Vec<Box<dyn wc_broker::host::Embedded>> {
-    Vec::new()
+/// `sv_ram::brokered`) is added here, built from `guest_ram` (the
+/// `--guest-ram-*` flags, with users.conf's map); each is attached once at
+/// start and told of every session that starts and ends, with its user.
+fn embedded(guest_ram: wc_broker::host::GuestRam) -> Vec<Box<dyn wc_broker::host::Embedded>> {
+    let out: Vec<Box<dyn wc_broker::host::Embedded>> = Vec::new();
+    if guest_ram.wanted() {
+        say("the --guest-ram-* flags were given and this build has no guest-RAM component: ignored");
+    }
+    out
 }
 
 /// Everything a pass of [`serve`] needs besides the page.
@@ -502,7 +542,19 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     // never read the environment.
     unsafe { std::env::set_var("WC_LAUNCH_SERVICE", "1") };
     let sessions = wc_broker::host::SessionsView::default();
-    let mut components = embedded(&args);
+    let mut guest_ram = args.guest_ram.clone();
+    if let Some(m) = &mapped {
+        let (map, server) = (m.map.clone(), m.server.clone());
+        guest_ram.map_user = Some(std::sync::Arc::new(move |os: &str, user: &str, id: &str| {
+            let asker = wc_broker::usermap::Asker { os, user, id };
+            let u = map.resolve_any(&server, asker).map(|m| m.linux_user.clone())?;
+            match crate::agent::uid_of(&u) {
+                Some(0) | None => Err(format!("users.conf maps {os} user {user} to {u}, which is not an account here")),
+                Some(uid) => Ok(uid),
+            }
+        }));
+    }
+    let mut components = embedded(guest_ram);
     match &broker {
         Some(b) => {
             for c in &components {

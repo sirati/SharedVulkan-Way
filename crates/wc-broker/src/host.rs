@@ -23,6 +23,7 @@ use crate::core::User;
 use crate::server::Broker;
 use crate::sys::unix::Unix;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// One live session, as the daemon started it.
@@ -80,6 +81,53 @@ impl SessionsView {
     /// The daemon's: a session has ended.
     pub fn remove(&self, id: &str) -> Option<HostSession> {
         self.lock().remove(id)
+    }
+}
+
+/// Where the guest's RAM is, for the guest-RAM substrate (§108).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QemuRam {
+    /// `--guest-ram-qemu-pid PID`: QEMU's process, whose RAM memfd is found
+    /// in its fds.
+    Pid(u32),
+    /// `--guest-ram-qemu-pidfile FILE`: the same, the pid read from a file.
+    PidFile(PathBuf),
+    /// `--guest-ram FILE`: the RAM's backing file itself.
+    File(PathBuf),
+}
+
+/// Whose the guest-RAM regions are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuestRamUser {
+    /// `--guest-ram-user UID`.
+    Uid(u32),
+    /// `--guest-ram-user mapped`: the Linux user users.conf maps the guest
+    /// GPU process's user to ([`GuestRam::map_user`]).
+    Mapped,
+}
+
+/// Maps a server-side identity (os, user, id) to the uid of the Linux user
+/// users.conf gives it, whatever installation: this daemon's table.
+pub type MapUser = Arc<dyn Fn(&str, &str, &str) -> Result<u32, String> + Send + Sync>;
+
+/// The daemon's guest-RAM flags, handed to the component that serves them.
+#[derive(Clone, Default)]
+pub struct GuestRam {
+    /// `--guest-ram-boot FILE`: where the guest's boot page for it is
+    /// (default: the `--gpu-region` file).
+    pub boot: Option<PathBuf>,
+    pub qemu: Option<QemuRam>,
+    /// `--guest-ram-bell SPEC`: its doorbell (a hub socket, `broker:NAME`).
+    pub bell: Option<String>,
+    pub user: Option<GuestRamUser>,
+    /// users.conf, for [`GuestRamUser::Mapped`]; `None` without `--users`.
+    pub map_user: Option<MapUser>,
+}
+
+impl GuestRam {
+    /// Whether the guest-RAM substrate was asked for (`--guest-ram-*`).
+    pub fn wanted(&self) -> bool {
+        self.qemu.is_some()
     }
 }
 
