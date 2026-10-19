@@ -522,7 +522,10 @@ audio_up() {
     # second session running at the same time (macOS runs one per application)
     # failed with "D-Bus name org.PulseAudio1 already taken" and had no sound.
     # The null sink and the monitor socket need no D-Bus at all.
-    echo 'unset DBUS_SESSION_BUS_ADDRESS'
+    # §105: and not unset but pointed nowhere: unset, libdbus falls back to
+    # $XDG_RUNTIME_DIR/bus, which a user unit has, and the second PulseAudio
+    # on that bus still lost the name (seen with another program's server).
+    echo 'export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/wc-no-bus'
     printf 'exec %q -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \\\n' "$PA"
     # §103.16: WC_LAUNCH_AUDIO_NULL_SINK=off leaves the null sink and its
     # monitor out: a sound ring's devices are then the session's only ones.

@@ -33702,6 +33702,42 @@ compositor killed and the proxy's lease lost after 5 s, then `down` by the
 service; a wrong key refused; a replayed sequence number refused; no port at
 all, polled and said by both sides; `down` over the ring.
 
+### 105.10 On the guest
+
+All of it on the real guest, installation `wcns`, before the fast path of
+105.13, in session 0 unless said otherwise. Evidence is in
+`/mnt/datasets/builds/evidence/windows-no-ssh/`.
+
+| what | result |
+|---|---|
+| the boot | `boot: located by the host in 292–312 ms` from the record's write; the service's log: `started in 291 ms (hello)` |
+| vkcube on the guest's GPU, through the pool's mailboxes | `ICD client 1 attached: … mailbox 0, claimed after 19.19ms, published 192.53ms after the Accept`, client 2 claimed after 12.78 µs; `Selected GPU 0: Intel(R) UHD Graphics`, a window mapped |
+| Firefox with the forwarded GPU, cold and warm | 105.9's table; the GPU process served its sessions from the pool |
+| a shortcut double-click on the interactive desktop (scheduler route, medium integrity) | `CLICK-TO-WINDOW 2843 ms (cold)`; `token: medium integrity, not elevated`; two windows of ours listed by the desktop agent |
+| no ssh while sessions ran | host: no TCP connection from either of the guest's addresses, no `sshd-session` but the capture's own (from the workstation), `wc-launch-ns` not in `authorized_keys`; guest: no `ssh.exe`, no `probe-relay.exe`, no TCP connection to the host and no loopback listener in 57400–57500 (`no-ssh-proof-*.txt`) |
+| the debug transport, for comparison | `DEBUG SSH TRANSPORT` three times in the log; an ESTAB connection <guest-nat-ip> → <host-nat-ip>:22 and the relay process, as expected |
+| `--stop` | the first run found `raw down` going through `wc-session`, which stopped the proxy before it answered; fixed (105.5) |
+
+**Not yet run on the guest, because the guest was in use**: a person was on
+it over TeamViewer from 15:08, with their own nested Linux desktop holding the
+device from 15:24. That covers the desktop end-to-end with Sonnet's visual
+checks (typing, scrolling, the clipboard both ways, a jump-list action,
+Firefox's own sound), "Windows 7 (Linux)" on this path (installation `wcnsl`,
+deployed), two applications at once on the desktop, the sound ring's device
+side on waveOut, and the fast path's guest round trip (105.13). The
+redeployment of the user's installations waits for those (105.12).
+
+### 105.11 Gates
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 108 binaries, **3148 passed, 0 failed**, 8 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | exit 0, no missing citation |
+| `scripts/wc-no-ssh.sh` | `wc-no-ssh: OK` (105.9 and 105.13) |
+| `scripts/sv-pool-e2e.sh` (lavapipe) | PASS over the mailboxes with and without a bell, and over TCP |
+
 ### 105.12 What is not done, and what is left on ssh
 
 * **Nothing of a session is left on ssh.** What ssh still does on these
@@ -33728,3 +33764,65 @@ all, polled and said by both sides; `down` over the ring.
 * **The installation key is not rotated.** Delete `$HOSTDIR/session.key` and
   redeploy to replace it.
 * **The debug transport** (105.7) is kept on purpose, off by default.
+
+### 105.13 The control round trip, below 0.2 ms
+
+The user's bound, after 105.9's 18–27 ms: a mean below 0.2 ms. Those
+milliseconds were not the crossing. They were a `bash wc-session` per request
+(process creation, a shell, its `od`s), the launcher's new connection per
+request, and both ends parking on their lanes between a request and its
+answer. So:
+
+* **The host answers in-process** (`wc_proxy::ctlfast`):
+  * `rtt` (a no-op, for measuring) and `status` at once;
+  * `app`, `icon` and `frequent` from a cache that the proxy fills at its start
+    for every application of the installation and refreshes after serving an
+    answer older than 30 s;
+  * `run`, `action`, `open` and `gpu` checked here (an application of
+    `apps.ini`, an action its desktop entry lists, the two numbers in range),
+    answered, and started on a thread afterwards. Only starting a process
+    still spawns one, and that spawn is out of the reply's round trip;
+* **both ends spin before they park** (200 µs on the host, 300 µs on the
+  guest), so a request's answer, or the next request of a burst, needs no
+  doorbell;
+* **one connection serves many requests** between the launcher and the
+  compositor, and the compositor reads its socket in chunks;
+* `wc-launch.exe --ping` measures it: `WC_PING_N` round trips of
+  `WC_PING_VERB` (default `rtt`), with `WC_PING_GAP_MS` between them so that
+  each one finds the host parked and crosses by doorbell, as a single click's
+  request does. `scripts/probe-ctl-rtt.c` does the same on Linux.
+
+Measured locally (`wc-no-ssh.sh`: the Linux compositor, a file for the
+device, socat for QEMU's port, the real hub, service and proxy):
+
+| request | n | mean | p50 | p90 | p99 |
+|---|---|---|---|---|---|
+| `rtt` | 10000 | 5.6–6.6 µs | 5.1–6.6 | 6.8–7.4 | 11–16 |
+| `status` | 1000 | 9.2–12.1 µs | 8.7–11.1 | 10.2–13.8 | 16–33 |
+| `frequent` (cached) | 1000 | 8.0–10.4 µs | 7.6–9.8 | 8.8–11.2 | 15–28 |
+
+**On the guest this is not measured yet**: the fast path's build is deployed to
+`wcns`, and the guest was in use (105.10). The crossing there is a virtio-serial
+byte each way when a side is parked; §89 measured the Wayland rings' crossing
+at 0.02 ms. Until the guest's mean over 10 000 round trips is below 0.2 ms, the
+user's installations stay on their current build.
+
+**The cold start**, from 105.9's 0.9–1.3 s, stage by stage:
+
+* the GPU process now starts before the compositor, instead of after the
+  session is up;
+* its host half (`wc-session gpu`) is started by the service at boot, beside
+  the proxy, not after it on a request;
+* `wc-session`'s waits for sockets poll every 10 ms instead of 50, and the
+  launcher's waits for the compositor's lines every 5 ms instead of 25.
+
+What remains is the work itself: mapping the device, `up`, starting
+PulseAudio and the proxy as user units, and the proxy attaching. The service
+logs `up`, `proxy` and `gpu` separately for each session, so the next guest
+run gives the breakdown.
+
+**And a fix found on the way.** A session's PulseAudio "had no session bus"
+by unsetting `DBUS_SESSION_BUS_ADDRESS`. Under a user unit, libdbus then falls
+back to `$XDG_RUNTIME_DIR/bus`, and a second PulseAudio on that bus (here, an
+unrelated program's) still took the name `org.PulseAudio1`, so the session had
+no sound. The address now points nowhere.
