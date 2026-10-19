@@ -253,6 +253,22 @@ wc-proxy ... --dmabuf-node /dev/dri/renderD128              # zwp_linux_dmabuf_v
 scripts/sv-dmabuf-e2e.sh; scripts/wc-dmabuf.sh              # the ICD and the proxy halves, locally
 ```
 
+**Windows without ssh (`docs/waycompose-design.md` §105).** A Windows session
+boots from a record the compositor signs with the installation's key and
+writes into the ivshmem device's header page. The VM host's session service
+(`wc-sessiond.service`, the same `wc-arena-host sessiond` the macOS guest
+uses) reads it and starts the session. After that, every request, the sound
+(§103.16's ring), the clipboard and icon feeds and the GPU's cold path cross
+as ring slots and mailboxes in shared memory, with doorbells. No ssh key, relay,
+tunnel or forced command is left; deploy removes them. `scripts/wc-no-ssh.sh`
+runs the host side and the Linux compositor on one machine.
+
+```
+scripts/wc-no-ssh.sh                      # boot, control, sound ring, hub restart, lease, wrong key, replay, no port
+scripts/wc-launch.sh deploy               # also: the installation key, the registration, wc-sessiond
+wc-arena-host sessiond --ivshmem /run/windows-vm/wc-arena/arena --bell $XDG_RUNTIME_DIR/wc-bell/wl.sock
+```
+
 ## Layout
 
 ```

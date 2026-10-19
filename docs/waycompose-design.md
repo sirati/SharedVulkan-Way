@@ -33363,3 +33363,286 @@ was not measured.
 6. **The seat's node is for group `users`**: whichever of the login screen's
    users logs in gets it; any member of the group can open it, which gives
    access to nothing but the fake ioctls.
+
+
+## 105. Windows without ssh: the session boots from the device's header page, and every byte crosses on its rings
+
+Written 2026-10-19, branch `windows-no-ssh`, from master `3f114f7` (merged
+with master twice on the way, last after `macos-zero-copy`). The brief: take
+ssh out of the Linux↔Windows path entirely. Until now §89's rings carried
+the Wayland connections and nothing else; ssh carried the authentication and
+the launch, every request, the sound, the GPU's cold path, the icon and
+clipboard feeds, and a fallback for when the doorbell port was missing. The
+user's rule is the same as for macOS (§103.14): *we are doing shared memory in
+order to get everything zero-copy*, and an ssh path is a defect, not a
+milestone. Use the same ring protocols and the same host service as macOS
+(§103.15, §103.16).
+
+### 105.1 Status in one paragraph
+
+**Nothing of a Windows session uses ssh, TCP or a socket forward.** The
+compositor maps the ivshmem device, publishes its header and the Wayland rings
+(§83, §89), and writes a boot record into the header page, signed with the
+installation's key. The host's session service (`wc-sessiond.service`, the
+same `wc-arena-host sessiond` as macOS's, with an ivshmem substrate) reads
+that page on the record's doorbell hello and starts the session with the
+installation's own `wc-session`. After that, every request is a line on the
+session's control ring, the sound is §103.16's sound ring, the icon and
+clipboard feeds are ring slots, and the GPU's cold path is a mailbox in the
+GPU pool's header. The launcher's relay, its tunnel, its ssh key and the
+host's forced command are gone, and deploy removes them. On the guest a cold
+start fell from 2.9 s to 0.9–1.3 s, a control round trip from 210–310 ms to
+18–27 ms, and the session has no ssh process anywhere. A missing doorbell
+port polls the rings and says so loudly; it never falls back to ssh. The
+pre-§105 path survives only as an opt-in debug transport, off by default and
+refused by the harness.
+
+### 105.2 Every byte path, before and after
+
+Copies are per transfer, one direction: U is a user-space copy and K a kernel
+or hypervisor copy. A socket hop is K=2. "Before" is master at `3f114f7`,
+taken from the code (a reading, not a measurement, except where §88/§89
+measured it).
+
+| channel | before: carrier | before: copies | after: carrier | after: copies |
+|---|---|---|---|---|
+| Wayland bytes | §89 ring slots in the ivshmem tail, woken by `org.sirati.wcbell.0`; a connection with no free slot fell back to the ssh tunnel | ring: U≈5, K=4 (client socket, compositor socketpair); fallback: ssh crypto both ends, relay, ≈U3 K8–10 | the same ring slots; no fallback (no slot: refused, logged) | unchanged on the ring |
+| fds | none cross: in-band names (§79, `WireFd`); outbound objects are arena slices the proxy turns into memfds | keymap U1 + K1 | unchanged | unchanged |
+| buffers (`wl_shm`, cursors) | the arena, BAR2 of ivshmem device 0x1c | proxy damage → arena U1 (the only write across); compositor arena → shadow → window U2; GDI | unchanged | unchanged |
+| GPU, hot | rings in a control region leased from the GPU pool (device 0x1d), doorbell `org.sirati.svbell.0` via the §99 hub | commands U1–2; mapped memory 0 | unchanged | unchanged |
+| GPU, cold (Hello/Accept) | `sv-hostd ivshmem-serve` → `$D/cold.sock` → ssh `-R` → the GPU process's loopback TCP port | ssh path | a `coldpage` mailbox in the GPU pool's first 64 KiB (pages 1..15), `COLD_TOKEN` 0xFD on the GPU doorbell | Hello and Accept U1 each, in place |
+| control: launch, `up`, `proxy`, `gpu`, `run`/`action`/`open`, `down`, `ping` | an ssh exec of the forced command per verb, answer through a file (ssh.exe hangs on pipes) | not a data path; 210–310 ms each | the boot record (start) and the control ring `OWNER_CONTROL` (everything after); the launcher speaks to the compositor's AF_UNIX socket in its own profile | a line into the ring and back, U2 |
+| authentication | the guest's ed25519 key and `authorized_keys`' forced command | — | HMAC-SHA-256 over the boot record under the installation's key (105.3) | — |
+| sound out | the session's null-sink monitor, `$D/audio.sock` → ssh `-L` → loopback TCP → the launcher's waveOut, dropping when full | ≈U3 K6 plus the NIC; drops by design | §103.16's sound ring on `OWNER_AUDIO`: a pipe sink paced by the guest's credit → ring → the compositor's waveOut | FIFO K2, proxy → ring U1, ring → queue U1, → waveOut buffer U1; **nothing dropped** |
+| sound in (microphone) | does not exist | — | does not exist: the ring carries input streams, and Windows announces none yet (105.12) | — |
+| clipboard (both ways) and drag and drop | the `wc_clipboard_v1` feed over `--upstream`, which was the ssh tunnel on Windows | pipe K2, chunk U1, ssh path, GlobalAlloc U1 | the feed claims a ring slot of its own, bridged to a local socket pair (`rings::bridge`, §103.14) | pipe K2, chunk U1, bridge U2 + ring U2, GlobalAlloc U1 |
+| icons at run time | `wc_icon_v1` feed over the ssh tunnel | file K, U1, ssh path | its own ring slot, bridged | file K, U1, bridge and ring U4 |
+| pins and jump lists (`app`, `frequent`, `icon`) | ssh exec, the output base64 in a file | U2–3 | `raw app …` on the control ring; `ok-raw N` and N bytes of the verb's exact output | U2 plus the ring |
+| frame clock, presentation times | none cross (§88) | 0 | unchanged | 0 |
+| liveness | the ssh tunnel's TCP connection | — | `ping` on the control ring every 500 ms; the proxy ends 5 s after the last one, the service then takes the session down | — |
+| deploy | ssh and scp from the developer's workstation to both machines | — | the same, an administrator's channel and not the session's; it now also carries the installation key to the guest, once | — |
+
+What ssh still is on these two machines: the workstation's way in for deploy
+and for the harnesses, and nothing else. No guest process holds a connection
+to the host (105.10).
+
+### 105.3 The boot record and what authenticates it
+
+The record is macOS's (`wc_handle::macboot`, §103.15) at the same offset, byte
+1024 of the header page; the ivshmem header itself is the first 80 bytes of
+that page (§83). On ivshmem the two "windows" are one region: the record's
+arena run and rings run are both the header's run id, its arena pages the
+region's and its rings pages the tail's. The host writes its answer in the
+same page, the message first and the state word last.
+
+What is new is the **authenticator** at byte 1792, past the host's message and
+the release word (§103.15's keeper, 1728):
+
+```text
+  1792  WCAUTH01
+  1800  installation name, 32 bytes, NUL-padded, [A-Za-z0-9_-]
+  1832  sequence number, u64
+  1840  HMAC-SHA-256 (32 bytes) over: "wcboot-auth-v1\0", the installation
+        and the session id (each length-prefixed), arena run, arena pages,
+        outbound, rings run, rings pages, the gpu flag, the sequence number
+```
+
+The compositor writes it with the record, the record's magic cleared first and
+written last after a release fence (`macboot::publish`), so the host reads the
+old record, none, or the whole new one. The host also reads the page twice
+2 ms apart and acts only if both agree. A torn page fails the MAC as well, and
+is looked at again rather than refused. The sequence number is the guest's
+clock in microseconds. The host keeps the last one it accepted per
+installation and refuses any that is not above it, so a record read out of
+the device and written back later is a replay. Every check is in
+`sessiond_ivshmem::check`:
+
+| check | refused with |
+|---|---|
+| no header, or a header whose run id is not the record's | nothing (the record is a previous compositor's) |
+| state not `Waiting` | nothing (answered already) |
+| no authenticator | "the boot record has no authenticator" |
+| installation not in `~/.config/waycompose/installs` | "no installation NAME" |
+| `session.key` not this user's or not 0600 | "must be owned by uid N and mode 0600" |
+| MAC wrong | "does not verify under its key" |
+| sequence number not above the last | "a replayed record" |
+
+A refusal is answered in the page, so the compositor says `boot: FAILED:
+REFUSED by the host's session service: …` and the launcher shows that line as
+the click's failure. security-model.md R37 is the argument for why this is the
+same boundary the ssh key was.
+
+### 105.4 One session service, two substrates
+
+`wc-arena-host sessiond` is macOS's `mac-sessiond` (§103.15) with a second
+front end. `--ivshmem FILE` selects it, and `mac-sessiond` stays as a name.
+Shared: the hello reader on the doorbell hub (`HELLO_TOKEN`), `verb`
+(`wc-session` with the words in `SSH_ORIGINAL_COMMAND`, so §94's validation is
+the same code), and `unit_active`. The ivshmem front end differs in three
+ways.
+
+* **No sweep.** The device is a file at a known path, so a pass is one
+  `pread` of one page: on every hello, on every (re)connect to the hub, and on
+  a 1 s timer (`--poll-ms`). Ended sessions are looked for every 2 s whatever
+  the timer.
+* **Installations.** `--installs DIR`, default
+  `~/.config/waycompose/installs`, maps a name to the installation's
+  directory (a symlink deploy makes). Each installation runs its own
+  `wc-session` with its own `apps.ini`. The service remembers which
+  installation started each session (`$XDG_RUNTIME_DIR/wc-sessiond/live/ID`),
+  so a restarted service still runs the right `down`.
+* **`WC_LAUNCH_SERVICE=1`** in every verb it runs. `wc-session up … ivshmem`
+  then fails closed when the compositor kept no rings ("no ssh to fall back
+  to"). It records `rings-poll` instead of `ssh` when there is no doorbell
+  socket. `proxy` starts wc-proxy with no `--upstream`, with
+  `--session-control`, `--session-id` and the sound ring's `--sound-*`, and
+  exports the host's `WC_LAUNCH_*` settings into the unit for the verbs the
+  control ring runs.
+
+Several installations are served by the one service, and the doorbells are the
+§99 hub's. The ivshmem driver still gives one mapping per device, so two
+installations' sessions still cannot run at the same moment (§93.4). That is
+unchanged by this section and not an ssh matter. Any number of applications in
+one installation run together.
+
+### 105.5 After the boot
+
+**The control ring.** `macsvc` (§103.14) serves it, unchanged except:
+
+* `app`, `frequent` and `icon` take no session id (as on ssh), and every other
+  verb gets the session's id put after it;
+* `raw VERB …` returns the verb's exact output as `ok-raw N` and N bytes, for
+  the jump list's multi-line answers;
+* `raw down` is answered before the proxy exits. The first guest run found
+  that `down` with the prefix went through `wc-session down`, which stopped
+  the proxy's own unit before it could answer, and the launcher waited 120 s.
+
+**The compositor holds the session.** On Windows the launcher and the
+compositor are two processes, and only the compositor can map the device. So
+`session_svc.rs` in the compositor opens the control channel once the boot is
+answered and pings it every 500 ms. It serves the launcher's requests on an
+AF_UNIX socket in the user's profile (`%LOCALAPPDATA%\waycompose\
+wc-launch-<installation>.ctl`), one request per connection, one at a time on
+the ring, never holding the channel across a request so the ping is never
+late. It also plays the sound. Every `wc-launch.exe` of the installation, the
+owner and each later click, talks to that socket.
+
+**The sound ring** (§103.16). The compositor is the device side. It announces
+one output stream, "Windows (default output)", makes it the default, grants
+80 ms of credit, plays `Data` through waveOut and gives the credit back as each
+20 ms chunk goes to the device (`audio::play_credited`). The proxy makes that
+stream a pipe sink on the session's PulseAudio and the session's default,
+paced by the credit. Nothing is dropped on the way, where the ssh path's
+player dropped whatever arrived with its eight buffers full.
+
+**The feeds** claim ring slots of their own (`rings::bridge`, §103.14), which
+on Windows they never did: with no `--upstream` the proxy takes §103.14's
+branch.
+
+**The GPU's cold path** is a mailbox in the pool header (built in branch
+`windows-no-ssh-gpu`). The guest's GPU process keeps one offer up: a control
+region already leased and stamped, its `Hello` in a `coldpage` page (pages
+1..15 of the never-leased 64 KiB). For each ICD, `sv-hostd ivshmem-serve
+--cold pool` claims an offer whose nonce is the pool header's and whose owner
+is alive, checks it, replies, rings `COLD_TOKEN` 0xFD, and waits for the
+control magic before it attaches the ICD. A full house is refused with the
+words `sv-icd` retries on. Locally (lavapipe, `scripts/sv-pool-e2e.sh`) an ICD
+alone attached in 10–11 ms against 13–14 ms over local TCP. On the guest:
+claimed 13 µs–19 ms after the request, published 130–193 ms after the Accept,
+which is the Intel driver opening its device.
+
+### 105.6 Doorbells: the rescan rule
+
+A virtio-serial port drops what arrives while nobody on that side holds it
+open, and a hub that is reconnecting loses what was sent meanwhile. The
+macOS work found this on the real Mac and made it a rule (§103.15):
+`BellTarget::rescan` is required, `serve_port` calls it on every (re)open,
+and the hub sends `RESCAN_TOKEN` (0xFC) to every client when it reconnects
+upstream. This section built the same rule independently and then unified it
+on master's names. What it adds is the other direction: on a **fresh**
+connection to QEMU (not one inherited from the fd store across a hub restart,
+which QEMU never saw close), the hub also sends `RESCAN_TOKEN` *to the guest*,
+because what the host rang while it had no connection was dropped before the
+guest saw it (`bellhub::a_fresh_upstream_tells_both_sides_to_rescan`). The
+guest's targets (the compositor's wake, the GPU process's lanes and its
+mailbox waiter) rescan on it. The Windows port reports "host not attached" as
+`WouldBlock` (§87), so its own writes in that state are lost too; the hub's
+token after the reconnect is what recovers them.
+
+Tests: `vdoorbell::rescan_tests` (a reader parked on its lane with nothing
+written is woken by `rescan`; the token is not a lane), master's
+`every_reopen_and_every_rescan_token_rescans`, the GPU agent's mailbox test
+with a 60 s slice that only the reopen can end, and the local harness's hub
+restart under a live session (105.9).
+
+### 105.7 A missing port, and the debug transport
+
+**No `org.sirati.wcbell.0`.** The compositor keeps the rings anyway and says
+`NO DOORBELL: … polled every millisecond, which costs CPU`. The proxy polls
+with `Doorbell::polling` and says the same, and the service reads the header
+page on its timer instead of waiting for a hello. Nothing falls back to a
+socket, because there is no socket. If the compositor could not keep rings at
+all, `up` refuses the session and says so.
+
+**`debug-ssh-transport = on`** (deploy with `WC_LAUNCH_DEBUG_SSH_TRANSPORT=1`)
+is the pre-§105 path: the forced-command key, the relay and the tunnel. It
+exists to compare against (105.9) and to debug. The launcher logs `DEBUG SSH
+TRANSPORT` three times per session, and `wc-launch.sh`'s click check fails any
+run whose log says it. Without it, `host`, `key` and `relay` are not required
+in the ini, the launcher has no code path that spawns ssh, and deploy deletes
+the guest's `id_host` and the host's forced-command line for the installation.
+
+### 105.8 Deployment
+
+`wc-launch.sh deploy` now, beyond copying binaries:
+
+1. makes the installation key on the host the first time
+   (`$HOSTDIR/session.key`, 0600, 32 random bytes as hex), and copies it to
+   `session.key` beside the guest's launcher with an ACL of one reader, the
+   guest user;
+2. registers the installation (`~/.config/waycompose/installs/<name>` →
+   `$HOSTDIR`);
+3. installs the hub (§99) for every deploy, not only for GPU ones, because
+   every session's rings need its doorbell, plus `wc-sessiond.service` with
+   its own copy of `wc-arena-host` in `~/wc-bell/`. A changed service is
+   restarted (it adopts its sessions); the hub's rule stays (restarted only
+   with no session running);
+4. without the debug transport, removes the installation's forced-command line
+   and the guest's `id_host`, `known_hosts` and `probe-relay.exe`, and checks
+   that neither side still has them.
+
+What deploy uses is ssh and scp from the developer's workstation to both
+machines, as before. It is an administrator's channel, run by hand, and no
+session depends on it.
+
+### 105.9 Measured
+
+The A/B is one build on the real guest in session 0 (installation `wcns`,
+Firefox with the forwarded GPU), deployed once with the debug transport and
+once without, with the same harness
+(`evidence/windows-no-ssh/measure-s0.sh`):
+
+| | ssh (debug transport) | rings (§105) |
+|---|---|---|
+| launcher start to session up (cold start) | 2888 ms | 873, 1234, 1340 ms |
+| of which the host's answer | `up` + `proxy` + `gpu` as three ssh execs | `boot: located by the host in 292–312 ms` |
+| cold click to Firefox's window (session 0) | 5078 ms | 2627, 3920 ms |
+| warm click to window | 722, 765, 748 ms | 532, 586, 659 ms (and 603, 703, 703) |
+| control round trip (`--ping`: an ssh exec of `ping`, or `status` on the ring through `wc-session`) | 210–310 ms (median 223) | 18–27 ms (median 22) |
+| guest CPU, 60 s of idle Firefox (ours) | 3.27 s: ssh.exe 0.53, compositor 0.77, GPU process 1.31, launcher (its player) 0.66 | 2.67 s: compositor (its player now) 1.94, GPU process 0.73 |
+| host CPU, the same 60 s | 0.55 s: wc-proxy 0.37, sshd 0.13, PulseAudio 0.05 | 0.61 s: wc-proxy 0.57, PulseAudio 0.04 |
+| a 30 s tone into the session's sink | played, 10 s "not silent" per 10 s; 43 chunks/s dropped and 6 underruns/s, as §89.7's idle sink | the same before the sound ring; with the sound ring locally, 384000 bytes in, 384000 out, none dropped |
+
+The CPU rows are one minute each and noisy (GPU-side numbers moved by a third
+between runs). They say the guest no longer pays for ssh.exe, and the host
+pays a little more for the proxy's service threads than it saved on sshd.
+
+`scripts/wc-no-ssh.sh` runs the whole host side and the Linux compositor on
+one machine, with a file for the device and socat for QEMU's port. Every leg
+passes: boot by hello in 0.6–0.7 s with the service's timer at 60 s; `run`
+on the control ring with the client on a ring slot; a request with shell
+words refused; the sound ring (384000 bytes through, no drops); the hub
+restarted under the session and the next request answered in 8–12 ms; the
+compositor killed and the proxy's lease lost after 5 s, then `down` by the
+service; a wrong key refused; a replayed sequence number refused; no port at
+all, polled and said by both sides; `down` over the ring.
