@@ -252,6 +252,16 @@ pub const HELLO_TOKEN: u8 = 0xFE;
 /// [`lane_token`].
 pub const RESCAN_TOKEN: u8 = 0xFF;
 
+/// Not a lane: "look at the GPU pool's mailboxes" (`crate::poolcold`). The
+/// VM host's `sv-hostd ivshmem-serve` rings it after it has claimed and
+/// answered an offer; the guest's GPU process rings it after it has made an
+/// offer and after it has published an accepted session's control region.
+/// Whoever receives it rescans every mailbox; nothing about which one is in
+/// the byte. Its top bit is set, so it can never be a [`lane_token`]: an ICD's
+/// doorman on the same hub, which does not know it, rings no lane
+/// ([`lane_from_token`] names slot 62, past every directory's end).
+pub const COLD_TOKEN: u8 = 0xFD;
+
 /// Undo [`lane_token`].
 pub fn lane_from_token(token: u8) -> (u32, Lane) {
     let t = token & 0x7f;

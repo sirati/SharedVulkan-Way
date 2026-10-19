@@ -62,7 +62,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
-                 sv-hostd ivshmem-serve --region <file> --cold <sock> --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n  \
+                 sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n                \
+                 (--cold <sock>: the TCP cold path, debug only)\n  \
                  sv-hostd bell-hub --port <chardev sock>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
@@ -508,33 +509,51 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// `sv-hostd ivshmem-serve` — the app side of the cross-VM topology with the
-/// GPU sessions' arena on an ivshmem device (waycompose-design.md §87), **as the
-/// user, from start to end**.
+/// GPU sessions' arena on an ivshmem device (waycompose-design.md §87, §97),
+/// **as the user, from start to end**.
 ///
-/// For every ICD that connects to `--socket`: connect to the guest's cold path
-/// (`--cold`, the tunnel's forward of the GPU process's port), which gives that
-/// ICD a session of its own in a slot of the BAR; check the slot's stamps in
-/// `--region`, the file QEMU backs the BAR with; tell the guest; and hand the
-/// ICD the file's path and the slot's offsets. The ICD opens the file itself,
-/// by name (docs/design.md §1a), with the same group bit this process used.
+/// For every ICD that connects to `--socket`, one session of the guest's GPU
+/// process, checked in `--region` (the file QEMU backs the BAR with) and
+/// handed to the ICD by the file's path and offsets. The ICD opens the file
+/// itself, by name (docs/design.md §1a), with the same group bit this process
+/// used.
+///
+/// `--cold pool` (what `wc-session` passes): the cold path is the pool's
+/// mailboxes (`sv_transport::poolcold`), in the header granule of the same
+/// file, which is therefore opened read-write. Per ICD: claim a live offer of
+/// this pool by compare-and-swap, `check_slot` it, answer in the page, ring
+/// the guest, and hand the ICD its `Attach` once the guest has published the
+/// control region. No socket reaches the guest. `--cold-bell <hub socket>`
+/// (default: `--bell-hub`) is the doorbell hub this process connects to for
+/// the length of each exchange, only to carry `park::COLD_TOKEN` both ways;
+/// without it every wait is a short poll, and only while an ICD waits.
+///
+/// `--cold <sock>`: the TCP cold path through a socket (formerly the ssh
+/// tunnel's forward of the guest's port), kept as a debug mode and announced
+/// as one.
 ///
 /// Sessions are made on demand rather than located up front, so there is no
 /// count to agree with the guest: Firefox's `glxtest` takes one, ends, and its
-/// slot is the browser's. `--clients N` stops after N (0, the default, never).
+/// place is the browser's. `--clients N` stops after N (0, the default, never).
 ///
 /// With `--bell`, this process also holds the doorbell port's chardev and
 /// serves it to every ICD on `--bell-hub` (`sv_hostd::ivshmem::bell_hub`).
 #[cfg(target_os = "linux")]
 fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::Arc;
     use sv_transport::cold::{ColdMessage, recv, send};
+    use sv_transport::poolcold;
     use sv_transport::stream::{read_message, write_message};
 
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     let region = arg("--region").ok_or("--region is required")?;
-    let cold = arg("--cold").ok_or("--cold is required")?;
+    let cold = arg("--cold").ok_or("--cold is required (pool, or a socket for the TCP debug path)")?;
+    let pooled_cold = cold == "pool";
     let path = arg("--socket").ok_or("--socket is required")?;
     let clients: u64 = arg("--clients").map_or(Ok(0), |s| s.parse())?;
     if unsafe { libc::geteuid() } == 0 {
@@ -544,12 +563,36 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("ivshmem-serve runs as the user; refusing to run as root".into());
     }
 
+    // Read-write for the mailboxes' compare-and-swap and replies; the group
+    // bit that lets this user read the file lets it write too (0660).
     let file = std::fs::OpenOptions::new()
         .read(true)
+        .write(pooled_cold)
         .open(&region)
         .map_err(|e| format!("{region}: {e} (is this user in the region's group?)"))?;
     let region_len = file.metadata()?.len();
-    let file = std::sync::Arc::new(file);
+
+    let mailboxes = if pooled_cold {
+        if region_len < sv_transport::poolhdr::HEADER_LEN {
+            return Err(format!("{region}: {region_len} bytes, smaller than the pool's header granule").into());
+        }
+        let header = sv_transport::region::SharedRegion::map_fd(
+            file.as_fd(),
+            0,
+            sv_transport::poolhdr::HEADER_LEN as usize,
+        )?;
+        let mb = Arc::new(poolcold::Mailboxes::new(Arc::new(header))?);
+        let live = poolcold::Liveness::new();
+        poolcold::spawn_liveness(Arc::clone(&mb), Arc::clone(&live))?;
+        Some((mb, live))
+    } else {
+        eprintln!(
+            "sv-hostd: GPU COLD PATH ON TCP (debug only): --cold {cold} is a socket to the guest's TCP port; the \
+             deployed cold path is --cold pool"
+        );
+        None
+    };
+    let file = Arc::new(file);
 
     if let Some(bell) = arg("--bell") {
         let hub = arg("--bell-hub").ok_or("--bell needs --bell-hub")?;
@@ -565,14 +608,23 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
     }
+    let cold_bell = arg("--cold-bell").or_else(|| arg("--bell-hub"));
 
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     eprintln!(
-        "sv-hostd: listening on {path} (ivshmem, as uid {}): each ICD gets its own slot of {region} \
-         ({} MiB) through {cold}",
+        "sv-hostd: listening on {path} (ivshmem, as uid {}): each ICD gets its own session of {region} \
+         ({} MiB) through {}",
         unsafe { libc::geteuid() },
-        region_len >> 20
+        region_len >> 20,
+        if pooled_cold {
+            format!(
+                "the pool's mailboxes{}",
+                cold_bell.as_deref().map_or(" (no doorbell: polled while an ICD waits)".to_string(), |b| format!(", woken through {b}"))
+            )
+        } else {
+            cold.clone()
+        }
     );
     let mut served = 0u64;
     for conn in listener.incoming() {
@@ -585,7 +637,8 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         };
         served += 1;
         let i = served;
-        let (file, region, cold) = (std::sync::Arc::clone(&file), region.clone(), cold.clone());
+        let (file, region, cold) = (Arc::clone(&file), region.clone(), cold.clone());
+        let (mailboxes, cold_bell) = (mailboxes.clone(), cold_bell.clone());
         std::thread::spawn(move || {
             let t = std::time::Instant::now();
             let result = (|| -> Result<String, String> {
@@ -593,55 +646,50 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     ColdMessage::AttachRequest => {}
                     other => return Err(format!("expected AttachRequest, got {other:?}")),
                 }
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                let mut port = loop {
-                    match UnixStream::connect(&cold) {
-                        Ok(s) => break s,
-                        Err(_) if std::time::Instant::now() < deadline => {
-                            std::thread::sleep(std::time::Duration::from_millis(50))
+                let mut timing = String::new();
+                let (at, hello) = if let Some((mb, live)) = &mailboxes {
+                    // The hub connection is opened first and the mailboxes
+                    // scanned after: a wake that was sent before it is
+                    // covered by the scan (the reopen rule).
+                    let event = poolcold::ColdEvent::new();
+                    let bell = cold_bell.as_deref().and_then(|b| match poolcold::HubBell::connect(b, Arc::clone(&event)) {
+                        Ok(h) => Some(h),
+                        Err(e) => {
+                            eprintln!("sv-hostd: ICD client {i}: no doorbell hub at {b} ({e}); polling");
+                            None
                         }
-                        Err(e) => return Err(format!("cannot reach the guest at {cold}: {e}")),
-                    }
+                    });
+                    let poke = || {
+                        if let Some(b) = &bell {
+                            b.poke();
+                        }
+                    };
+                    let control_ready = |h: &sv_transport::cold::Hello| {
+                        let sv_transport::cold::Locator::IvshmemPool { control_offset, .. } = h.extent.locator else {
+                            return false;
+                        };
+                        let mut m = [0u8; 8];
+                        file.read_exact_at(&mut m, control_offset + sv_transport::control::OFF_MAGIC).is_ok()
+                            && u64::from_le_bytes(m) == sv_transport::control::MAGIC
+                    };
+                    let a = poolcold::host_attach(
+                        mb,
+                        live,
+                        &event,
+                        &poke,
+                        claim_nonce(),
+                        poolcold::HostTiming::default(),
+                        |h| sv_hostd::ivshmem::check_slot(&file, &region, region_len, &h.extent, h.generation),
+                        control_ready,
+                    )?;
+                    timing = format!(
+                        " (mailbox {}, claimed after {:.2?}, published {:.2?} after the Accept)",
+                        a.mailbox, a.claimed_after, a.published_after
+                    );
+                    (a.value, a.hello)
+                } else {
+                    tcp_cold(&cold, &file, &region, region_len)?
                 };
-                port.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
-                let mut scratch = Vec::new();
-                let hello = match read_message(&mut port, &mut scratch)
-                    .map_err(|e| format!("no Hello from the guest: {e}"))?
-                {
-                    ColdMessage::Hello(h) => h,
-                    ColdMessage::Refuse { code, reason } => {
-                        return Err(format!("the guest refused {code}: {reason}"));
-                    }
-                    other => return Err(format!("expected Hello, got {other:?}")),
-                };
-                let at = match sv_hostd::ivshmem::check_slot(
-                    &file,
-                    &region,
-                    region_len,
-                    &hello.extent,
-                    hello.generation,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        let _ = write_message(&mut port, &ColdMessage::Refuse { code: 3, reason: e.clone() });
-                        return Err(e);
-                    }
-                };
-                write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })
-                    .map_err(|e| format!("Accept: {e}"))?;
-                // The guest opens its device, imports the slot's arena and
-                // publishes the control region over the stamps, then says so.
-                // Only then may the ICD map it: before, the control header is
-                // a stamp, which the ICD refuses as a foreign magic.
-                match read_message(&mut port, &mut scratch)
-                    .map_err(|e| format!("the guest never published the session: {e}"))?
-                {
-                    ColdMessage::Ping => {}
-                    ColdMessage::Refuse { code, reason } => {
-                        return Err(format!("the guest could not open the session ({code}): {reason}"));
-                    }
-                    other => return Err(format!("expected the guest's Ping, got {other:?}")),
-                }
                 send(&sock, &ColdMessage::Attach(at.clone())).map_err(|e| format!("Attach: {e}"))?;
                 sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
                 match recv(&sock) {
@@ -654,7 +702,7 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let pooled = matches!(hello.extent.locator, sv_transport::cold::Locator::IvshmemPool { .. });
                 let checked = if pooled { at.control_len } else { at.control_len + at.arena_len };
                 Ok(format!(
-                    "{} at +{} KiB, run 0x{:016x}, {} pages checked",
+                    "{} at +{} KiB, run 0x{:016x}, {} pages checked{timing}",
                     if pooled { "pooled session's control region" } else { "slot" },
                     at.control_offset >> 10,
                     hello.extent.run_id,
@@ -678,7 +726,53 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if clients != 0 {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
-    Ok(())
+    return Ok(());
+
+    /// The TCP debug path's exchange: connect to `cold`, the guest's `Hello`,
+    /// the check, `Accept`, and the guest's `Ping` once published.
+    fn tcp_cold(
+        cold: &str,
+        file: &std::fs::File,
+        region: &str,
+        region_len: u64,
+    ) -> Result<(sv_transport::cold::Attachment, sv_transport::cold::Hello), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut port = loop {
+            match UnixStream::connect(cold) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => return Err(format!("cannot reach the guest at {cold}: {e}")),
+            }
+        };
+        port.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+        let mut scratch = Vec::new();
+        let hello = match read_message(&mut port, &mut scratch).map_err(|e| format!("no Hello from the guest: {e}"))? {
+            ColdMessage::Hello(h) => h,
+            ColdMessage::Refuse { code, reason } => return Err(format!("the guest refused {code}: {reason}")),
+            other => return Err(format!("expected Hello, got {other:?}")),
+        };
+        let at = match sv_hostd::ivshmem::check_slot(file, region, region_len, &hello.extent, hello.generation) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = write_message(&mut port, &ColdMessage::Refuse { code: 3, reason: e.clone() });
+                return Err(e);
+            }
+        };
+        write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })
+            .map_err(|e| format!("Accept: {e}"))?;
+        // The guest opens its device, imports the slot's arena and publishes
+        // the control region over the stamps, then says so. Only then may the
+        // ICD map it: before, the control header is a stamp, which the ICD
+        // refuses as a foreign magic.
+        match read_message(&mut port, &mut scratch).map_err(|e| format!("the guest never published the session: {e}"))? {
+            ColdMessage::Ping => {}
+            ColdMessage::Refuse { code, reason } => {
+                return Err(format!("the guest could not open the session ({code}): {reason}"));
+            }
+            other => return Err(format!("expected the guest's Ping, got {other:?}")),
+        }
+        Ok((at, *hello))
+    }
 }
 
 /// `UID:GID`, both numeric. Names are not resolved: this runs as root, and a

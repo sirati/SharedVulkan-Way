@@ -1455,14 +1455,16 @@ down)
   ;;
 
 # --------------------------------------------------------------------- gpu ---
-# The forwarded GPU for one session (§86, §87). The guest's launcher has
-# started one GPU process on the GPU arena's ivshmem device and its tunnel has
-# put that process's port at $D/cold.sock. This starts `sv-hostd
-# ivshmem-serve` in a user unit, **as this user**: it opens $GPUREGION -- the
-# file QEMU backs the device's BAR with, 0660 root:wc-arena -- and serves every
-# ICD that connects to $D/icd.sock a session of its own, in a slot of the BAR it
-# checks before handing it over. With $BELL present it also holds the
-# doorbell's port and shares it with every ICD on $D/bell.sock. No root, no
+# The forwarded GPU for one session (§86, §87, §97). The guest's launcher has
+# started one GPU process on the GPU arena's ivshmem device, which keeps an
+# offer in the pool's mailboxes (the device's header granule). This starts
+# `sv-hostd ivshmem-serve --cold pool` in a user unit, **as this user**: it
+# opens $GPUREGION read-write -- the file QEMU backs the device's BAR with,
+# 0660 root:wc-arena -- and serves every ICD that connects to $D/icd.sock a
+# session of its own, claimed from a mailbox and checked before handing it
+# over; no socket reaches the guest. Its wakes go through the shared hub
+# (--cold-bell). Without the hub, with $BELL present, it holds the doorbell's
+# port itself and shares it with every ICD on $D/bell.sock. No root, no
 # broker, nothing that can read guest RAM: security-model.md R30.
 #
 # N is the guest's own cap on concurrent sessions and is only checked here.
@@ -1511,14 +1513,13 @@ gpu)
   fi
   [ -r "$GPUREGION" ] && [ -w "$GPUREGION" ] \
     || die "cannot open the GPU arena $GPUREGION as $(id -un) (is the VM's GPU ivshmem device configured, and this user in its group?)"
-  for _ in $(seq 1 100); do [ -S "$D/cold.sock" ] && break; sleep 0.05; done
-  [ -S "$D/cold.sock" ] || die "no cold socket $D/cold.sock: the guest's tunnel did not forward the GPU process"
   UNIT="wc-launch-gpu-$ID"
   BELLARGS=""
   rm -f "$D/bell.path"
   if hub_up; then
     # §99: the shared hub holds the port; this session's ICDs connect to it.
     printf '%s\n' "$HUBDIR/sv.sock" >"$D/bell.path"
+    BELLARGS=$(printf -- '--cold-bell %q' "$HUBDIR/sv.sock")
   elif [ -S "$BELL" ] && [ -w "$BELL" ]; then
     echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
@@ -1527,8 +1528,8 @@ gpu)
     echo '#!/usr/bin/env bash'
     echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
     printf 'rm -f %q %q\n' "$D/icd.sock" "$D/bell.sock"
-    printf 'exec %q ivshmem-serve --region %q --cold %q --socket %q %s >%q 2>&1\n' \
-      "$BIN/sv-hostd" "$GPUREGION" "$D/cold.sock" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
+    printf 'exec %q ivshmem-serve --region %q --cold pool --socket %q %s >%q 2>&1\n' \
+      "$BIN/sv-hostd" "$GPUREGION" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
   } >"$D/gpu.sh"
   chmod 755 "$D/gpu.sh"
   export XDG_RUNTIME_DIR="/run/user/$UID_"

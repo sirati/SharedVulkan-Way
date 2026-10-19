@@ -533,7 +533,14 @@ mod tests {
     #[test]
     fn a_missing_required_field_is_named() {
         let e = Config::parse("[session]\nhost=u@h\n").unwrap_err();
-        assert!(e.contains("key"), "{e}");
+        assert!(e.contains("compositor"), "{e}");
+        // §105: the ssh host and key are required only by the opt-in debug transport.
+        let e = Config::parse("[session]\ncompositor=C\ndebug-ssh-transport=on\n").unwrap_err();
+        assert!(e.contains("host"), "{e}");
+        let c = Config::parse("[session]\ncompositor=C\n").unwrap();
+        assert!(!c.debug_ssh_transport && c.host.is_empty() && c.key.is_empty(), "no ssh by default");
+        assert_eq!(c.installation(), "wcl");
+        assert!(Config::parse("[session]\ncompositor=C\ninstallation=a b\n").is_err());
     }
 
     #[test]
@@ -663,7 +670,9 @@ mod gpu_tests {
     fn the_wayland_rings_port_is_on_by_default_and_can_be_turned_off() {
         let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
         assert_eq!(p("").unwrap().wayland_bell, "org.sirati.wcbell.0");
-        assert_eq!(p("wayland-bell =\n").unwrap().wayland_bell, "");
+        // §105: empty only with the debug transport; the rings are the only way.
+        assert!(p("wayland-bell =\n").unwrap_err().contains("wayland-bell"));
+        assert_eq!(p("wayland-bell =\ndebug-ssh-transport = on\n").unwrap().wayland_bell, "");
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
     }
 

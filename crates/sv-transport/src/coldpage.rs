@@ -314,6 +314,53 @@ pub fn reply(region: &SharedRegion, msg: &ColdMessage) -> Result<()> {
     Ok(())
 }
 
+/// Host: [`claim`] for a mailbox several hosts sweep at once (the GPU pool's,
+/// `crate::poolcold`): the compare-and-swap first and the nonce after it, so
+/// the nonce in the page is always the winner's and [`reply_claimed`] can
+/// check it. ([`claim`] stores the nonce first, and a loser's store can land
+/// after the winner's; its one reader is the guest's log.)
+pub fn claim_signed(region: &SharedRegion, nonce: u64) -> Result<bool> {
+    let won = region
+        .atomic_u32(OFF_STATE)?
+        .compare_exchange(STATE_OFFERED, STATE_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    if won {
+        region.atomic_u64(OFF_CLAIM)?.store(nonce, Ordering::Release);
+    }
+    Ok(won)
+}
+
+/// Host: [`reply`], but only into a mailbox this host still holds: still
+/// `CLAIMED`, under `nonce`. `false` if the owner took the offer back in the
+/// meantime (it does when a claim is never answered), in which case nothing
+/// the owner reads has changed.
+pub fn reply_claimed(region: &SharedRegion, nonce: u64, msg: &ColdMessage) -> Result<bool> {
+    if region.atomic_u64(OFF_CLAIM)?.load(Ordering::Acquire) != nonce {
+        return Ok(false);
+    }
+    let mut body = Vec::new();
+    msg.encode(&mut body)?;
+    if body.len() > MAX_REPLY {
+        if let ColdMessage::Refuse { code, reason } = msg {
+            let mut r = reason.clone();
+            r.truncate(MAX_REPLY / 2);
+            return reply_claimed(region, nonce, &ColdMessage::Refuse { code: *code, reason: r });
+        }
+        return Err(Error::BadColdMessage("the reply does not fit the mailbox"));
+    }
+    region.write_bytes(OFF_REPLY, &body)?;
+    region.atomic_u32(OFF_REPLY_LEN)?.store(body.len() as u32, Ordering::Release);
+    Ok(region
+        .atomic_u32(OFF_STATE)?
+        .compare_exchange(STATE_CLAIMED, STATE_REPLIED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok())
+}
+
+/// Move the state word from `from` to `to` if it is still `from`.
+pub fn transition(region: &SharedRegion, from: u32, to: u32) -> Result<bool> {
+    Ok(region.atomic_u32(OFF_STATE)?.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
 /// Host: wait for the owner to have made the control region, after the
 /// Accept: its magic at offset 0 is the last thing `Control::create` writes
 /// before the header is usable. An ICD handed the region before then reads
