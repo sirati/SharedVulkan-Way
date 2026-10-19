@@ -58,6 +58,7 @@ pub mod frametrace;
 #[cfg(target_os = "linux")]
 pub mod localfd;
 pub mod park;
+pub mod poolcold;
 pub mod poolhdr;
 pub mod region;
 pub mod ring;
