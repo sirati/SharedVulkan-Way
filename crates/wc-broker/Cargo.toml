@@ -1,0 +1,32 @@
+[package]
+name = "wc-broker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The one privileged component per machine: who may hold which device and region, and what is cleaned up when a process dies (waycompose-design.md §111)"
+
+# §111. The core (`core`, `proto`) is pure and has no dependency at all; the
+# platform halves are thin: SO_PEERCRED, pidfd and SCM_RIGHTS on Linux,
+# getpeereid, kqueue and fd passing on macOS, token SIDs, process handles and
+# DuplicateHandle on Windows.
+
+[dependencies]
+# The boot record and its HMAC (§105, §111.6): the `sign` request.
+wc-handle = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_Services",
+  "Win32_System_Threading",
+] }

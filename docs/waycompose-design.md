@@ -31522,8 +31522,8 @@ hardware.
 | piece | where | what |
 |---|---|---|
 | `wc-activity.exe` | `scripts/wc-activity.c`, built with mingw; on the guest in `%LOCALAPPDATA%\waycompose\tools` | No window, no focus. `WH_KEYBOARD_LL` and `WH_MOUSE_LL` on one thread. Injected events are skipped, and so is a mouse move under 2 px from the last one counted. A second thread writes `%LOCALAPPDATA%\waycompose\activity.txt` every 2 s, replaced atomically: a heartbeat, whether the hooks are installed, the start time, and the last 64 real inputs, coalesced to 250 ms, newest first. The hooks never wait on the disk (Windows silently drops a slow low-level hook) and are reinstalled every minute. One per session (a named mutex). |
-| scheduled task `wc-activity` | `scripts/wc-activity-install.sh` | Starts it at <guest-user>'s logon, interactive, limited, no time limit, restarted on failure; the script also starts it at once. Safe to run while somebody uses the desktop |
-| `guest-idle.sh` | `scripts/wc-guest-idle.sh`, installed as `/tmp/wcrun/guest-idle.sh` | Reads the file and the guest's clock over ssh. Exit 0 `idle N s` at 120 s or more (`GUEST_IDLE_SECS`). Exit 2 `active N s ago`. Exit 1 unknown (no file, a heartbeat over 15 s old, no hooks), which counts as not idle. Input from 0.5 s before to 2 s after a line of `/tmp/wcrun/qmp-inject.log` is ours: the clocks are matched through the middle of the ssh round trip. If every input kept is ours, the last real one is older: the sentinel's start, or the oldest entry when all 64 slots are full |
+| scheduled task `wc-activity` | `scripts/wc-activity-install.sh` | Starts it at <guest-user>'s logon, at unlock, at a console or remote connect and every 5 minutes (one copy: `IgnoreNew`), interactive, limited, no time limit; the script also starts it at once. The program registers with `RegisterApplicationRestart`. On 2026-10-19 an Office update's Restart Manager ended it, and with only the logon trigger nothing started it again for 80 minutes. Safe to run while somebody uses the desktop |
+| `guest-idle.sh` | `scripts/wc-guest-idle.sh`, installed as `/tmp/wcrun/guest-idle.sh` | Reads the file and the guest's clock over ssh. Exit 0 `idle N s` at 120 s or more (`GUEST_IDLE_SECS`). Exit 2 `active N s ago`. Exit 1 unknown (no file, a heartbeat over 15 s old, no hooks), which counts as not idle. With no file or a stale heartbeat it first runs the task once (`schtasks /Run`, invisible) and reads again (`GUEST_IDLE_NO_RESTART=1` skips this). Input from 0.5 s before to 2 s after a line of `/tmp/wcrun/qmp-inject.log` is ours: the clocks are matched through the middle of the ssh round trip. If every input kept is ours, the last real one is older: the sentinel's start, or the oldest entry when all 64 slots are full |
 | QMP injection log | `/tmp/wcrun/guest-keys.sh`, `/tmp/wcrun/unlock-guest.sh` | A line before and after each injection, host milliseconds first |
 | `guest-lease.sh take` | `/tmp/wcrun/guest-lease.sh` | Takes a free lease only once the desktop is idle. Renewing does not wait. `GUEST_LEASE_NO_IDLE=1` is for work that opens no window and sends no input |
 | the instructions | `/mnt/datasets/builds/visual-check-instructions.md` | Every agent rechecks before each input step, and pauses until two idle minutes if the user comes back |
@@ -34627,6 +34627,74 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.
 
+### 107.10 A feed that outlived its client kept a session up
+
+Branch `session-fixes`, 2026-10-19, from master `07fda85`. Found by the guest
+e2e of the same day (evidence in `/mnt/datasets/builds/evidence/guest-e2e/`,
+`wcns-no-idle-exit.txt`).
+
+**What was seen.** The installation `wcns` (Firefox, one-session compositor,
+`linger-secs = 60`) was still running eight minutes after every host
+application had exited. One guest-side client, accepted on ring slot 14 while
+Firefox started, never disconnected; the session ended only by `--stop`.
+Other installations exited normally.
+
+**The cause.** Each client connection of the proxy claims three ring slots:
+the connection itself, its icon feed and its clipboard feed (§103.14). The
+feeds are local socket pairs bridged to a ring slot by one thread each
+(`wc_proxy::rings::bridge`). That thread ended its ring (the zero-length
+packet) only when the feed's end of the pair closed cleanly. On any error it
+returned and wrote nothing: no end of stream, no `DEAD`. The usual error is
+`ECONNRESET`. Linux reports it to the peer when a unix socket is closed with
+unread bytes in its queue, and that is what a short-lived Firefox connection
+does: the compositor sends the new clipboard feed the current selection, and
+the connection ends before the feed reads it. The compositor then kept the
+feed as a connected client for ever. A one-session compositor ends only when
+no client is connected (`EmptyWatch` plus `live == 0`), and a shared one
+counts a session's connections for its linger (`note_connections`), so in
+both modes one lost feed held the session, its arena and its slots. The
+slot-14 client was, by the order of the claims, the clipboard feed of the
+proxy's fourth connection (slot 11). It was not a dead process, so watching processes would not have
+caught it.
+
+**The fixes**, each enough for this case:
+
+1. **The bridge ends its ring on every way out** (`rings::end_ring`): the
+   zero-length packet, retried for up to 500 ms when the lane is full, then
+   `DEAD`, the order `RingUpstream`'s drop uses. `DEAD` also lets the
+   compositor recycle the slot (§89), which a clean close never did before.
+2. **The compositor knows a feed when it accepts one.** Feed owner ids carry
+   `FEED_TAG` (bit 40, and `CLIP_FEED`, bit 39, for the clipboard) and the
+   ordinal of the connection they serve (`wlbytes::feed_owner`, `is_feed`,
+   `client_ordinal`). The ids are the ones proxies have claimed with since
+   §103.14, so an older proxy's feeds are recognised too. A feed's client is
+   `ClientState::feed`. It is never counted as a reason to keep a session up:
+   neither by the one-session linger, `--once`, the deferred deadline, nor
+   `connections_by_session`.
+3. **A feed does not outlive its connection.** `RingLink::pump` closes a feed
+   (end of stream, `DEAD`, quarantine) once no connection of its session with
+   its ordinal is left, after `ORPHAN_GRACE` (2 s; the proxy claims the
+   connection before its feeds). It logs `ring slot N: a feed of client
+   connection M outlived it; closed`.
+
+**Tests.**
+* `rings::tests::a_feed_dropped_with_unread_bytes_still_ends_its_ring`: the
+  reproduction. A guest end writes into a bridged feed, the feed is dropped
+  unread, and the guest must see the end or `DEAD` within 2 s. It failed
+  before fix 1 ("the compositor still thinks the feed is connected") and
+  passes after it. `a_feed_closed_cleanly_marks_its_slot_dead` covers the
+  clean close.
+* `ringlink::feed_tests`: a feed is accepted as one and not counted; it is
+  closed after the grace once its connection has gone, and its proxy end sees
+  the end of stream and `DEAD`; a feed of a live connection stays.
+* `wlbytes` session-tag test: the feed tags survive the session index.
+* `scripts/wc-multi-install.sh` leg 8: a fresh shared compositor, one session,
+  five `wayland-info` runs (connect, read the globals, leave at once), each
+  with its feeds. The feeds are logged as feeds (10 of 15 connections), and
+  the session ends by its linger ("its last client left 4 s ago"). The race
+  that left a feed behind did not happen on this machine in the run without
+  the fix either; the unit test is the reproduction.
+
 ## 108. Shared memory that grows and shrinks: one region protocol, and a Windows guest that lends its own RAM
 
 Branch `windows-guest-ram`, from master `3955922`, 2026-10-19. The brief
@@ -35264,7 +35332,6 @@ At the commit that adds this subsection (master `f0b85c3` merged in):
 
 Evidence (logs only, outside the repository):
 `/mnt/datasets/builds/evidence/windows-guest-ram/`.
-
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same
