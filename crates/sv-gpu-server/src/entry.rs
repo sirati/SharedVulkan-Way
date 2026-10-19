@@ -2000,7 +2000,8 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let cfg = pool_serve_args(args)?;
     let path = arg("--pool-file").ok_or("--pool-file is required")?;
-    let f = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    // §103.19: on the Mac a tagged file is the shared memory object it names.
+    let f = sv_transport::region::open_shared(&path)?;
     let len = f.metadata()?.len();
     let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
     eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);

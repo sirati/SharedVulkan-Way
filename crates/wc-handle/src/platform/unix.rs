@@ -509,7 +509,8 @@ pub fn map_file(path: &str, len: usize) -> io::Result<MappedView> {
 /// both sides open is the substrate that leg has, and everything above
 /// `attach` is identical for the two.
 pub fn map_file_mut(path: &str, len: usize) -> io::Result<MappedView> {
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    // §103.19: a tagged file on macOS is the shared memory object it names.
+    let file = sv_transport::region::open_shared(path)?;
     let have = file.metadata()?.len();
     if have < len as u64 {
         return Err(io::Error::new(
