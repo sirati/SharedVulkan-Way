@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # §106: host integration's Linux end, end to end on this machine, no VM.
 #
-#   scripts/wc-hostint-local.sh [--no-build]
+#   scripts/wc-hostint-local.sh [--no-build] [--mode pipewire|on]   (default pipewire)
 #
 # 1. builds wc-proxy, wc-host-open and the example `hostint-local` (in the
 #    10 GB build cgroup, $WC_CG, default /mnt/datasets/builds/wcrun/cg);
@@ -24,13 +24,27 @@ EVID="${WC_EVIDENCE:-/mnt/datasets/builds/evidence/host-integration/linux-local}
 CG="${WC_CG:-/mnt/datasets/builds/wcrun/cg}"
 mkdir -p "$EVID" "$SCRATCH"
 STAMP=$(date +%Y%m%d-%H%M%S)
-LOG="$EVID/run-$STAMP.log"
+BUILD=1 MODE=pipewire
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-build) BUILD="" ;;
+    --mode) MODE="$2"; shift ;;
+    *) echo "usage: $0 [--no-build] [--mode pipewire|on]"; exit 2 ;;
+  esac
+  shift
+done
+case "$MODE" in pipewire|on) ;; *) echo "--mode pipewire or on"; exit 2 ;; esac
+LOG="$EVID/run-$STAMP-$MODE.log"
 exec > >(tee "$LOG") 2>&1
-echo "wc-hostint-local $STAMP, tree $(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet || echo '+dirty')"
+echo "wc-hostint-local $STAMP, mode $MODE, tree $(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet || echo '+dirty')"
 
-if [ "${1:-}" != --no-build ]; then
+if [ -n "$BUILD" ]; then
   (cd "$ROOT" && "$CG" nix develop -c cargo build -q -p wc-proxy --bins --example hostint-local)
 fi
+# §106.3: the native nodes' host, built by the flake (its RUNPATH names the
+# store's libpipewire).
+PWNODE=$(cd "$ROOT" && nix build --no-link --print-out-paths .#wc-pw-node 2>/dev/null)/bin/wc-pw-node
+[ -x "$PWNODE" ] || { echo "no wc-pw-node ($PWNODE)"; exit 1; }
 TD="$ROOT/target/debug"
 for b in "$TD/wc-proxy" "$TD/wc-host-open" "$TD/examples/hostint-local"; do [ -x "$b" ] || { echo "no $b"; exit 1; }; done
 
@@ -83,12 +97,34 @@ pa() {
   env -u PIPEWIRE_REMOTE PULSE_SERVER="unix:$s" XDG_RUNTIME_DIR="$S/pw" timeout -s KILL 5 "$@"
 }
 
-env -u PIPEWIRE_REMOTE -u PULSE_SERVER bash "$SCRIPT" >"$T/stack.out" 2>&1 &
-STACK=$!
-for _ in $(seq 1 100); do [ -S "$S/pw/pipewire-0" ] && [ -S "$S/xdg/pulse/native" ] && break; sleep 0.05; done
-[ -S "$S/pw/pipewire-0" ] && [ -S "$S/xdg/pulse/native" ] || { echo "the stack did not come up"; cat "$T/stack.out"; exit 1; }
-# WirePlumber makes the `default` metadata once it is running.
-for _ in $(seq 1 100); do pw "$PWMD" -n default 2>/dev/null | grep -q 'default.audio.sink' && break; sleep 0.05; done
+if [ "$MODE" = pipewire ]; then
+  env -u PIPEWIRE_REMOTE -u PULSE_SERVER bash "$SCRIPT" >"$T/stack.out" 2>&1 &
+  STACK=$!
+  for _ in $(seq 1 100); do [ -S "$S/pw/pipewire-0" ] && [ -S "$S/xdg/pulse/native" ] && break; sleep 0.05; done
+  [ -S "$S/pw/pipewire-0" ] && [ -S "$S/xdg/pulse/native" ] || { echo "the stack did not come up"; cat "$T/stack.out"; exit 1; }
+  # WirePlumber makes the `default` metadata once it is running.
+  for _ in $(seq 1 100); do pw "$PWMD" -n default 2>/dev/null | grep -q 'default.audio.sink' && break; sleep 0.05; done
+  MODEARGS=(--pw-metadata "$PWMD" --pw-node "$PWNODE")
+  # WC_TEST_NO_NATIVE=1: the pipe modules under PipeWire, for comparison.
+  [ -n "${WC_TEST_NO_NATIVE:-}" ] && MODEARGS=(--pw-metadata "$PWMD")
+else
+  # §86/§103.16's `on`: a PulseAudio of the session's own, as wc-session's
+  # audio_up starts it (null sink, suspend-on-idle, the native socket).
+  PA=$(tool pulseaudio) || { echo "no pulseaudio"; exit 1; }
+  mkdir -p "$S/xdg/pulse" "$S/pulse-state" "$S/pulse-home"
+  env -u PULSE_SERVER DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent XDG_RUNTIME_DIR="$S/pw" \
+    HOME="$S/pulse-home" PULSE_RUNTIME_PATH="$S/xdg/pulse" PULSE_STATE_PATH="$S/pulse-state" \
+    "$PA" -n --daemonize=no --use-pid-file=no --system=no --exit-idle-time=-1 --log-target=stderr \
+    -L "module-null-sink sink_name=wc rate=48000 channels=2 format=s16le sink_properties=device.description=waycompose" \
+    -L "module-suspend-on-idle timeout=2" \
+    -L "module-native-protocol-unix socket=$S/xdg/pulse/native auth-anonymous=1" >"$T/pulse.log" 2>&1 &
+  STACK=$!
+  for _ in $(seq 1 100); do [ -S "$S/xdg/pulse/native" ] && break; sleep 0.05; done
+  [ -S "$S/xdg/pulse/native" ] || { echo "PulseAudio did not come up"; cat "$T/pulse.log"; exit 1; }
+  # The PipeWire node host is offered too: the server says it is PulseAudio,
+  # so sound.rs must choose the pipe modules anyway.
+  MODEARGS=(--pw-node "$PWNODE")
+fi
 echo "--- the private server before the test:"
 pa "$PACTL" info | grep -E "Server Name|Default Sink|Default Source"
 pa "$PACTL" list short sinks
@@ -97,10 +133,11 @@ echo "--- the example:"
 RC=0
 env -u PIPEWIRE_REMOTE -u PULSE_SERVER \
   "$TD/examples/hostint-local" --dir "$S" --pulse "$S/xdg/pulse/native" --pipewire "$S/pw/pipewire-0" \
-  --pactl "$PACTL" --pacat "$PACAT" --parec "$PAREC" --pw-metadata "$PWMD" \
+  --pactl "$PACTL" --pacat "$PACAT" --parec "$PAREC" "${MODEARGS[@]}" \
   --opener "$TD/wc-host-open" --shim "$ROOT/scripts/wc-hostint/xdg-open" || RC=$?
 echo "--- the private server after the test:"
 pa "$PACTL" list short sinks
 pa "$PACTL" list short sources
-echo "RESULT: $([ "$RC" = 0 ] && echo PASS || echo "FAIL ($RC failure(s))") -- log $LOG"
+[ -f "$S/pw-node.log" ] && { echo "--- wc-pw-node:"; cat "$S/pw-node.log"; }
+echo "RESULT ($MODE): $([ "$RC" = 0 ] && echo PASS || echo "FAIL ($RC failure(s))") -- log $LOG"
 exit "$RC"

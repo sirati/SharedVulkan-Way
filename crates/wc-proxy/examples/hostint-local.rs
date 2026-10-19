@@ -50,6 +50,7 @@ mod imp {
         pacat: PathBuf,
         parec: PathBuf,
         pw_metadata: Option<PathBuf>,
+        pw_node: Option<PathBuf>,
         opener: PathBuf,
         shim: Option<PathBuf>,
     }
@@ -63,6 +64,7 @@ mod imp {
             pacat: "pacat".into(),
             parec: "parec".into(),
             pw_metadata: None,
+            pw_node: None,
             opener: PathBuf::new(),
             shim: None,
         };
@@ -77,6 +79,7 @@ mod imp {
                 "--pacat" => a.pacat = v.into(),
                 "--parec" => a.parec = v.into(),
                 "--pw-metadata" => a.pw_metadata = Some(v.into()),
+                "--pw-node" => a.pw_node = Some(v.into()),
                 "--opener" => a.opener = v.into(),
                 "--shim" => a.shim = Some(v.into()),
                 _ => panic!("unknown {k}"),
@@ -92,6 +95,12 @@ mod imp {
         if !ok {
             *FAILS.lock().unwrap() += 1;
         }
+    }
+
+    /// The playing application's buffer (pacat --latency-msec), 200 ms unless
+    /// WC_TEST_PACAT_MS says otherwise.
+    fn pacat_ms() -> u64 {
+        std::env::var("WC_TEST_PACAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(200)
     }
 
     fn t0() -> &'static Instant {
@@ -182,6 +191,12 @@ mod imp {
         granted: HashMap<u16, u64>,
         got: HashMap<u16, u64>,
         nonzero: HashMap<u16, u64>,
+        /// Every output byte, by stream, for the byte-exact comparison.
+        pcm: HashMap<u16, Vec<u8>>,
+        /// Outputs being played: the device queues their Data and plays it
+        /// at 192 kB/s (48 kHz stereo s16), granting what its queue frees.
+        playing: std::collections::HashSet<u16>,
+        queue: HashMap<u16, u64>,
         over: u32,
         /// Credit the session granted for input streams.
         in_credit: HashMap<u16, u64>,
@@ -198,6 +213,23 @@ mod imp {
     const PHONES_N: &str = "win.sink.kopfh_rer_wh-1000xm5_stereo";
     const MIC_N: &str = "win.source.microphone_array_intel_smart_sound_technology_for_digital_microphones";
     const USB_N: &str = "win.sink.usb_headset";
+    /// 250 ms of 48 kHz stereo s16: the first grant, and the fake device's queue.
+    const FIRST: u32 = 48_000;
+    const QUEUE: u32 = FIRST;
+
+    /// A deterministic signal with no zero sample, so that silence the server
+    /// adds around it can be told from it and a comparison is exact.
+    fn noise(secs: f32, channels: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        let n = (48_000.0 * secs) as usize * channels;
+        let mut v = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let s = ((x >> 16) as i16 / 4) | 1;
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
 
     fn tone(secs: f32, channels: usize) -> Vec<u8> {
         let n = (48_000.0 * secs) as usize;
@@ -214,7 +246,11 @@ mod imp {
     fn sound_part(a: &Args, owner: &Arc<Control>, linux: &Arc<Control>) {
         // The proxy's half, exactly as macsvc starts it.
         let ch = ByteChannel::claim(linux, OWNER_AUDIO).expect("claim OWNER_AUDIO");
-        let cfg = SoundCfg { pactl: a.pactl.clone(), server: Some(format!("unix:{}", a.pulse.display())), dir: a.dir.clone(), prefix: "win".into() };
+        let cfg = SoundCfg { pactl: a.pactl.clone(), server: Some(format!("unix:{}", a.pulse.display())), dir: a.dir.clone(),
+            prefix: "win".into(),
+            pw_node: a.pw_node.clone(),
+            pipewire: a.pw_node.as_ref().map(|_| a.pipewire.clone()),
+        };
         guard(a, "the sound ring's pactl", &a.pulse);
         let (l2, c2) = (Arc::clone(linux), cfg);
         std::thread::spawn(move || sound::serve(&l2, ch, c2));
@@ -238,6 +274,10 @@ mod imp {
                     Snd::Hello { .. } => d.hello = true,
                     Snd::Data { stream, pcm } => {
                         *d.got.entry(stream).or_default() += pcm.len() as u64;
+                        d.pcm.entry(stream).or_default().extend_from_slice(&pcm);
+                        if d.playing.contains(&stream) {
+                            *d.queue.entry(stream).or_default() += pcm.len() as u64;
+                        }
                         *d.nonzero.entry(stream).or_default() += pcm.iter().filter(|b| **b != 0).count() as u64;
                         if d.got.get(&stream) > d.granted.get(&stream).or(Some(&0)) {
                             d.over += 1;
@@ -256,6 +296,30 @@ mod imp {
             *dev.lock().unwrap().granted.entry(s).or_default() += u64::from(b);
             link.send(Snd::Credit { stream: s, bytes: b });
         };
+        // The device: a queue of 250 ms per output, played in real time; the
+        // credit outstanding plus the queue never exceed it.
+        {
+            let (d2, l2) = (Arc::clone(&dev), link.clone());
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                for i in 1u64.. {
+                    std::thread::sleep((t0 + Duration::from_millis(10 * i)).saturating_duration_since(Instant::now()));
+                    let mut d = d2.lock().unwrap();
+                    let ids: Vec<u16> = d.playing.iter().copied().collect();
+                    for s in ids {
+                        let q = d.queue.entry(s).or_default();
+                        *q = q.saturating_sub(1920);
+                        let q = *q;
+                        let out = d.granted.get(&s).copied().unwrap_or(0).saturating_sub(d.got.get(&s).copied().unwrap_or(0));
+                        let free = u64::from(QUEUE).saturating_sub(out + q);
+                        if free >= 1920 {
+                            *d.granted.entry(s).or_default() += free;
+                            l2.send(Snd::Credit { stream: s, bytes: free as u32 });
+                        }
+                    }
+                }
+            });
+        }
         link.send(Snd::Hello { version: VERSION });
         let device = |stream: u16, dir: Dir, ch: u8, name: &str| Snd::Device { stream, dir, channels: ch, rate: 48_000, name: name.into() };
         let _ = FORMAT_S16LE;
@@ -297,40 +361,106 @@ mod imp {
             say(&format!("pw-metadata -n default:\n{}", pw_metadata(a)));
         }
 
-        // ---- a tone into a sink arrives as Data, never beyond the credit.
-        const FIRST: u32 = 48_000; // 250 ms of 48 kHz stereo s16
-        grant(PHONES, FIRST);
-        let tonef = a.dir.join("tone.raw");
-        std::fs::write(&tonef, tone(1.5, 2)).unwrap();
-        let mut play: Child = pulse_cmd(a, &a.pacat)
-            .args(["--raw", "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20"])
-            .arg(format!("--device={PHONES_N}"))
-            .arg(&tonef)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("pacat");
-        let first = poll(Duration::from_secs(5), || {
-            let d = dev.lock().unwrap();
-            (d.got.get(&PHONES).copied().unwrap_or(0) >= u64::from(FIRST)).then_some(())
-        });
-        check(first.is_some(), "a tone played by pacat into the sink arrives as Data on its stream");
-        std::thread::sleep(Duration::from_millis(std::env::var("WC_TEST_HOLD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(400)));
-        {
-            let d = dev.lock().unwrap();
-            let got = d.got.get(&PHONES).copied().unwrap_or(0);
-            check(got <= u64::from(FIRST) && d.over == 0, &format!("and no more than its credit: {got} bytes for {FIRST} granted, while nothing more is granted"));
-            check(d.nonzero.get(&PHONES).copied().unwrap_or(0) > u64::from(FIRST) / 2, "the Data is the tone, not silence");
+        // ---- a signal into a sink arrives as Data, never beyond the credit,
+        // and byte for byte: the credit is held for a while mid-signal, and
+        // the application must wait rather than lose anything.
+        let signal = noise(1.5, 2);
+        let tonef = a.dir.join("signal.raw");
+        std::fs::write(&tonef, &signal).unwrap();
+        let mut baseline: Option<Duration> = None;
+        for hold_ms in [0u64, 100, 400, 1000] {
+            let cap;
+            {
+                let mut d = dev.lock().unwrap();
+                d.pcm.remove(&PHONES);
+                let g = d.granted.get(&PHONES).copied().unwrap_or(0);
+                let got = d.got.get(&PHONES).copied().unwrap_or(0);
+                let out = g.saturating_sub(got);
+                drop(d);
+                cap = out.max(u64::from(FIRST));
+                // Exactly 250 ms of credit outstanding, then held.
+                if out < u64::from(FIRST) {
+                    grant(PHONES, FIRST - out as u32);
+                }
+            }
+            let t = Instant::now();
+            let mut play: Child = pulse_cmd(a, &a.pacat)
+                .args(["--raw", "--format=s16le", "--rate=48000", "--channels=2", ]).arg(format!("--latency-msec={}", pacat_ms()))
+                .arg(format!("--device={PHONES_N}"))
+                .arg(&tonef)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("pacat");
+            let pcm_len = |d: &Dev| d.pcm.get(&PHONES).map_or(0, Vec::len) as u64;
+            // The first grant is spent, then nothing moves.
+            let mut last = 0;
+            let mut still = Instant::now();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let n = pcm_len(&dev.lock().unwrap());
+                if n != last {
+                    last = n;
+                    still = Instant::now();
+                } else if n > 0 && still.elapsed() > Duration::from_millis(150) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            check(last > 0, &format!("hold {hold_ms} ms: the signal played by pacat arrives as Data ({last} bytes before the hold)"));
+            std::thread::sleep(Duration::from_millis(hold_ms));
+            let held = pcm_len(&dev.lock().unwrap());
+            check(held <= cap, &format!("hold {hold_ms} ms: nothing beyond the credit while it is held ({held} bytes for {cap} outstanding)"));
+            dev.lock().unwrap().playing.insert(PHONES);
+            let _ = play.wait();
+            let took = t.elapsed();
+            let settled = poll(Duration::from_secs(3), || {
+                let n = pcm_len(&dev.lock().unwrap());
+                std::thread::sleep(Duration::from_millis(200));
+                (pcm_len(&dev.lock().unwrap()) == n).then_some(())
+            });
+            let _ = settled;
+            dev.lock().unwrap().playing.remove(&PHONES);
+            let got = dev.lock().unwrap().pcm.get(&PHONES).cloned().unwrap_or_default();
+            // Silence the server put before and after the signal is not the
+            // signal's; the signal itself has no zero frame.
+            let frames: Vec<&[u8]> = got.chunks(4).collect();
+            let first = frames.iter().position(|f| f.iter().any(|b| *b != 0)).unwrap_or(frames.len());
+            let last_nz = frames.iter().rposition(|f| f.iter().any(|b| *b != 0)).map_or(first, |i| i + 1);
+            let body: Vec<u8> = frames[first..last_nz].concat();
+            let exact = body == signal;
+            let same = body.iter().zip(&signal).take_while(|(x, y)| x == y).count();
+            let lost = signal.len() as i64 - body.len() as i64;
+            say(&format!(
+                "hold {hold_ms} ms: pacat took {} ms for 1500 ms of signal; {} bytes received, {} of signal, first difference at byte {same}, {lost} bytes short",
+                took.as_millis(),
+                got.len(),
+                body.len()
+            ));
+            // Nothing dropped, in either server: the received frames without
+            // the zero ones (silence a server inserted) are the signal.
+            let nonzero: Vec<u8> = frames.iter().filter(|f| f.iter().any(|b| *b != 0)).flat_map(|f| f.iter().copied()).collect();
+            let inserted = body.len().saturating_sub(signal.len());
+            check(nonzero == signal, &format!("hold {hold_ms} ms: nothing dropped: every frame of the signal arrives, in order ({} of {} bytes)", nonzero.len().min(signal.len()), signal.len()));
+            if a.pw_node.is_some() && a.pw_metadata.is_some() {
+                // Native nodes: byte-exact, with no silence inserted either.
+                check(exact, &format!("hold {hold_ms} ms: byte-exact and contiguous, no silence inserted ({} of {} bytes)", body.len(), signal.len()));
+            } else {
+                say(&format!("hold {hold_ms} ms: the server inserted {inserted} bytes of silence into the signal"));
+            }
+            // The application waits for the credit: pacat takes about the hold
+            // longer than with no hold at all.
+            match baseline {
+                None => baseline = Some(took),
+                Some(b) => {
+                    let extra = took.saturating_sub(b);
+                    check(
+                        extra >= Duration::from_millis(hold_ms * 8 / 10) && extra <= Duration::from_millis(hold_ms + 300),
+                        &format!("hold {hold_ms} ms: the application waited instead of dropping: pacat took {} ms, {} ms more than with no hold", took.as_millis(), extra.as_millis()),
+                    );
+                }
+            }
         }
-        // The rest of the tone and then some: every byte pacat wrote must arrive.
-        let total = tone(1.5, 2).len() as u64;
-        grant(PHONES, 8 * FIRST);
-        let all = poll(Duration::from_secs(6), || {
-            (dev.lock().unwrap().got.get(&PHONES).copied().unwrap_or(0) >= total).then_some(())
-        });
-        let got = dev.lock().unwrap().got.get(&PHONES).copied().unwrap_or(0);
-        check(all.is_some(), &format!("with more credit the whole tone arrives, nothing dropped while it waited ({got} of {total} bytes)"));
-        let _ = play.wait();
         check(dev.lock().unwrap().over == 0, "the session never sent Data beyond the device side's credit");
 
         // ---- capture only while something records.
@@ -343,37 +473,43 @@ mod imp {
             .expect("parec");
         let st = poll(Duration::from_secs(4), || dev.lock().unwrap().starts.contains(&MIC).then_some(()));
         check(st.is_some(), &format!("Start for the microphone when parec records from it ({:?})", st.map(|s| s.1)));
-        // The device side records: a tone, within the session's credit.
-        let mic = tone(0.5, 1);
-        let mut sent = 0usize;
-        let end = Instant::now() + Duration::from_secs(3);
-        while sent < mic.len() && Instant::now() < end {
-            let room = (dev.lock().unwrap().in_credit.get(&MIC).copied().unwrap_or(0) as usize).saturating_sub(sent);
-            let n = room.min(1920).min(mic.len() - sent) & !1;
-            if n == 0 {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            link.send(Snd::Data { stream: MIC, pcm: mic[sent..sent + n].to_vec() });
-            sent += n;
-        }
+        // The device side records as a microphone does: 10 ms at a time in
+        // real time, for a second, within the session's credit (what the
+        // credit does not cover is the device's overrun, not queued).
         let mut out = rec.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
             let mut nz = 0usize;
-            let end = Instant::now() + Duration::from_millis(1500);
-            while Instant::now() < end {
-                match out.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => nz += buf[..n].iter().filter(|b| **b != 0).count(),
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
                 }
+                nz += buf[..n].iter().filter(|b| **b != 0).count();
             }
             let _ = tx.send(nz);
         });
-        let nz = rx.recv_timeout(Duration::from_secs(4)).unwrap_or(0);
-        check(sent == mic.len() && nz > 1000, &format!("what the device side records reaches parec ({sent} bytes sent within credit, {nz} non-zero bytes read)"));
+        let mic = tone(1.0, 1);
+        let (mut sent, mut overrun) = (0usize, 0usize);
+        let t = Instant::now();
+        for (i, chunk) in mic.chunks(960).enumerate() {
+            let room = (dev.lock().unwrap().in_credit.get(&MIC).copied().unwrap_or(0) as usize).saturating_sub(sent);
+            if room >= chunk.len() {
+                link.send(Snd::Data { stream: MIC, pcm: chunk.to_vec() });
+                sent += chunk.len();
+            } else {
+                overrun += chunk.len();
+            }
+            let next = t + Duration::from_millis(10 * (i as u64 + 1));
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+        std::thread::sleep(Duration::from_millis(300));
         let _ = rec.kill();
+        let nz = rx.recv_timeout(Duration::from_secs(4)).unwrap_or(0);
+        check(
+            overrun == 0 && nz > mic.len() / 2,
+            &format!("what the device side records reaches parec in real time ({sent} bytes within credit, {overrun} over it, {nz} non-zero bytes read)"),
+        );
         let _ = rec.wait();
         let sp = poll(Duration::from_secs(4), || dev.lock().unwrap().stops.contains(&MIC).then_some(()));
         check(sp.is_some(), "Stop for the microphone once nothing records from it");
