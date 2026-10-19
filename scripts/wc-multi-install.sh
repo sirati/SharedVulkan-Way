@@ -51,6 +51,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -x "$SHM" ] || { echo "no weston-presentation-shm"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -199,7 +205,9 @@ OLD_B=$(grep -o "arena: session $IDX_B granted region [^:]*: [0-9]* MiB at [0-9]
 P=$(proxy_pid "wcmb-$$-b")
 CLIENTS_BEFORE=$(grep -c 'disconnected' "$D/comp-1.log")
 T0=$(date +%s%N)
-kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
+# MainPID is 0 for a unit that is not there, and `kill -9 0` is this whole
+# process group: the harness itself and whatever started it.
+[ "${P:-0}" -gt 0 ] && kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
 wait_line "$D/comp-1.log" "index $IDX_B, installation wcmb\) ENDED" 20 && ok "compositor ended session $IDX_B in $(ms "$T0") ms: $(grep -m1 -o "index $IDX_B, installation wcmb) ENDED.*" "$D/comp-1.log" | cut -c1-90)" || bad "session $IDX_B was never ended"
 wait_line "$D/comp-1.log" "arena: session $IDX_B's [0-9]* region" 10 && ok "$(grep -m1 -o "arena: session $IDX_B's.*" "$D/comp-1.log")" || bad "its regions did not come back"
 for t in a c; do R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "after b's death, status $t: $R" ;; esac; done
