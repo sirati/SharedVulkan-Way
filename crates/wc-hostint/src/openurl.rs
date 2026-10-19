@@ -129,8 +129,49 @@ pub fn validate_host_path(path: &str, roots: &[String], windows: bool) -> Result
     Ok(path.to_string())
 }
 
+/// Extensions the host never opens for Linux, because opening one runs or
+/// installs something. Windows' own list (`AssocIsDangerous`) is checked
+/// too by the Windows opener; this list is the floor on both platforms.
+pub const DANGEROUS_WINDOWS: &[&str] = &[
+    "exe", "com", "bat", "cmd", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msi", "msp", "mst", "lnk",
+    "url", "scr", "hta", "cpl", "reg", "inf", "appref-ms", "msc", "jar", "library-ms", "settingcontent-ms", "pif",
+    "application", "gadget", "msix", "msixbundle", "appx", "appxbundle", "diagcab", "search-ms", "searchconnector-ms",
+    "website", "xll", "dll", "sys", "drv", "ocx", "chm", "iso", "img", "vhd", "vhdx",
+];
+pub const DANGEROUS_MACOS: &[&str] =
+    &["app", "command", "terminal", "tool", "pkg", "mpkg", "workflow", "scpt", "scptd", "applescript", "action", "prefpane", "kext", "dmg", "webloc", "inetloc", "fileloc", "jar"];
+
+/// Whether opening `path` with its default application would run or install
+/// something. A trailing dot or space (which Windows strips) does not hide
+/// the extension. A path ending in a separator names a directory, and on
+/// macOS a directory with a dangerous extension (an `.app` bundle) is
+/// refused the same way.
+pub fn dangerous_path(path: &str, windows: bool) -> bool {
+    let p = path.trim_end_matches(['/', '\\']);
+    let name = p.rsplit(['/', '\\']).next().unwrap_or(p);
+    let name = if windows { name.trim_end_matches(['.', ' ']) } else { name };
+    let Some((_, ext)) = name.rsplit_once('.') else { return false };
+    let ext = ext.to_ascii_lowercase();
+    let list = if windows { DANGEROUS_WINDOWS } else { DANGEROUS_MACOS };
+    list.contains(&ext.as_str())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dangerous_extensions() {
+        use super::dangerous_path as d;
+        assert!(d("Z:\\x\\setup.EXE", true));
+        assert!(d("Z:\\x\\a.txt.lnk", true));
+        assert!(d("Z:\\x\\evil.bat. . ", true), "Windows strips trailing dots and spaces");
+        assert!(!d("Z:\\x\\notes.txt", true));
+        assert!(!d("Z:\\x\\noext", true));
+        assert!(d("/Users/a/Evil.app", false));
+        assert!(d("/Users/a/Evil.app/", false));
+        assert!(d("/Users/a/run.command", false));
+        assert!(!d("/Users/a/page.html", false));
+    }
+
     use super::*;
 
     fn web() -> Vec<String> {

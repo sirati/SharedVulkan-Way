@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::assoc::NEVER_CLAIMED;
 use crate::audio::State;
-use crate::openurl::{validate_host_path, validate_url, RateLimiter};
+use crate::openurl::{dangerous_path, validate_host_path, validate_url, RateLimiter};
 use crate::wire::{Handler, Msg, PathMap, Req, Target, VERSION};
 
 /// What the platform does once a request has passed every check. Each call
@@ -71,6 +71,16 @@ impl Service {
         self.cfg.paths.shares.iter().map(|(h, _)| h.clone()).collect()
     }
 
+    /// A host path Linux may have opened: inside a share, and not of a type
+    /// whose opening runs or installs something (security-model R37).
+    fn check_path(&self, p: &str) -> Result<String, String> {
+        let p = validate_host_path(p, &self.roots(), self.cfg.windows_paths)?;
+        if dangerous_path(&p, self.cfg.windows_paths) {
+            return Err("that type of file runs or installs something, and is never opened for Linux".into());
+        }
+        Ok(p)
+    }
+
     /// Check one request and, if it passes, open it. Refused requests do not
     /// count against the rate limit; the limit is checked last, before the
     /// opener runs.
@@ -82,7 +92,7 @@ impl Service {
         }
         let act = match req {
             Req::Url(u) => Act::Url(validate_url(u, &self.cfg.schemes)?),
-            Req::Path(p) => Act::Path(validate_host_path(p, &self.roots(), self.cfg.windows_paths)?),
+            Req::Path(p) => Act::Path(self.check_path(p)?),
             Req::With { token, target } => {
                 let h = self.handlers.iter().find(|h| h.offer.token == *token).ok_or("no such host application")?;
                 let t = match target {
@@ -92,7 +102,7 @@ impl Service {
                         Target::Url(validate_url(u, &allowed)?)
                     }
                     Target::HostPath(p) => {
-                        Target::HostPath(validate_host_path(p, &self.roots(), self.cfg.windows_paths)?)
+                        Target::HostPath(self.check_path(p)?)
                     }
                 };
                 Act::With(h.app.clone(), t)
@@ -277,6 +287,8 @@ mod tests {
         assert!(s.on_line(&req(6, Req::With { token: "zz".into(), target: Target::HostPath("Z:\\b.txt".into()) }), &mut o, t).unwrap().starts_with("rep 6 err"));
         // Notepad takes no URL scheme, so a URL "with" it is refused.
         assert!(s.on_line(&req(7, Req::With { token: "n0".into(), target: Target::Url("https://x/".into()) }), &mut o, t).unwrap().starts_with("rep 7 err"));
+        let r = s.on_line(&req(8, Req::Path("Z:\\setup.exe".into())), &mut o, t).unwrap();
+        assert!(r.starts_with("rep 8 err"), "{r}");
         assert_eq!(o.0.len(), 3);
         assert_eq!(o.0[2], "with C:\\Windows\\System32\\notepad.exe HostPath(\"Z:\\\\b.txt\")");
         // Lines Linux has no business sending get no answer.
