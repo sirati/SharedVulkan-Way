@@ -33677,3 +33677,30 @@ judged by a fresh Sonnet agent; evidence is in
   opener refused `javascript:`, `/etc/hosts`, an `.app`, a renamed bundle
   and a symlink to a bundle. A `.txt` whose Mac default is a Linux bundle was
   refused, so a file cannot bounce back to Linux.
+
+**The macOS VM, second run** (an isolated session: `WC_LAUNCH_TEST_HOME`
+gave the Linux applications a throwaway home, after the first run's Text
+Editor had restored the workstation user's own documents into every
+screenshot; those screenshots were deleted). Evidence is in
+`…/mac-e2e2/`. Each click was made, and each image judged, by a fresh Sonnet
+agent:
+* **The browser comes to the front.** On macOS 14 an application started
+  by a background process opens behind the active one (cooperative
+  activation), and the first run's Safari did. Now the main process works
+  out which application will receive the open (the configured browser,
+  Firefox when installed; otherwise the Mac's default handler or the chosen
+  "open with" application). It tells the face the user is working in to
+  `yieldActivationToApplicationWithBundleIdentifier:` it, and opens about
+  120 ms later. With the Linux Text Editor active, `xdg-open
+  https://example.org` brought Safari to the front, as both the screenshot
+  and the window order show. The face only yields and the main process
+  opens, so faces still need no permission of their own.
+* **Finder's "Open With" on a file Linux created in the share** opened it
+  in the Linux Text Editor at its Linux path.
+* Audio, the refusals and "open with" TextEdit were as in the first run.
+  The default followed in about 0.1 s, and 779,412 bytes were recorded in 5 s.
+* **Found:** while TCC's dialog for "Waycompose Host" waits for an answer
+  (microphone or network volume), the session stalls. Recording returns
+  nothing, playback blocks and an open times out after 5 s, because the
+  microphone's start and the open block the threads they run on. 106.8 has
+  the fix.
