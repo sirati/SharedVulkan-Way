@@ -60,6 +60,8 @@ pub struct Entry {
     pub exec: String,
     /// In `Actions=` order; an id with no group is skipped.
     pub actions: Vec<Action>,
+    /// §106. `MimeType=`, as listed (file types and `x-scheme-handler/...`).
+    pub mime_types: Vec<String>,
 }
 
 /// What `wc-session` runs: a program, named by basename, and its arguments.
@@ -176,6 +178,13 @@ pub fn parse(path: &Path, text: &str) -> Result<Entry, String> {
         wm_class: get(main, "StartupWMClass"),
         exec,
         actions,
+        mime_types: get(main, "MimeType")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect(),
     })
 }
 
@@ -285,7 +294,16 @@ pub fn expand(words: &[String], entry: &Entry, url: Option<&str>) -> Result<Vec<
                 if let Some(u) = url
                     && !url_used
                 {
-                    out.push(u.to_string());
+                    // §106: `%f` is a local file, so a `file:` URL in its slot
+                    // is the decoded path; `%u` keeps the URL.
+                    let file_slot = matches!(w.as_str(), "%f" | "%F");
+                    if file_slot && u.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("file://")) {
+                        out.push(
+                            wc_hostint::linux::file_url_path(u).ok_or_else(|| format!("{u:?} is not a local file URL"))?,
+                        );
+                    } else {
+                        out.push(u.to_string());
+                    }
                     url_used = true;
                 }
                 continue;
@@ -370,8 +388,47 @@ pub fn action_command(entry: &Entry, id: &str) -> Result<Command, String> {
 /// The argv tail that opens `url`: the entry's main `Exec=`, with the URL in
 /// the slot its `%u` (or `%U`, `%f`, `%F`) marks.
 pub fn open_command(entry: &Entry, url: &str) -> Result<Command, String> {
+    open_command_in(entry, url, None)
+}
+
+/// [`open_command`], and with `roots` (§106: the Linux sides of the host's
+/// shares, `--file-roots`) a `file:` URL must name an existing file under
+/// one of them once symbolic links are resolved. The host is the less
+/// trusted side for Linux's files: a session with host integration opens
+/// what the host can already see, and nothing else of the user's.
+pub fn open_command_in(entry: &Entry, url: &str, roots: Option<&[PathBuf]>) -> Result<Command, String> {
     url_ok(url)?;
+    if let Some(roots) = roots
+        && url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("file://"))
+    {
+        file_in_roots(url, roots)?;
+    }
     command(entry, &entry.exec, Some(url))
+}
+
+/// The resolved path of a `file:///` URL, if it is inside one of `roots`.
+pub fn file_in_roots(url: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let p = wc_hostint::linux::file_url_path(url).ok_or_else(|| format!("{url:?} is not a local file URL"))?;
+    if p.split('/').any(|c| c == "..") {
+        return Err(format!("{p:?} has a '..' in it"));
+    }
+    let real = std::fs::canonicalize(&p).map_err(|e| format!("{p}: {e}"))?;
+    let inside = roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|r| real.starts_with(&r));
+    if inside {
+        Ok(real)
+    } else {
+        Err(format!(
+            "{p} is not in a folder shared with the host ({}); only those are opened from the host",
+            if roots.is_empty() {
+                "none is shared".to_string()
+            } else {
+                roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
+            }
+        ))
+    }
 }
 
 /// Actions the launcher adds to an entry that lacks them.
@@ -431,6 +488,7 @@ fn b64(bytes: &[u8]) -> String {
 /// action-l new-private-window de …
 /// action-icon new-private-window <Icon=>
 /// unsupported profile-manager-window <reason, base64>
+/// mime text/html
 /// ```
 pub fn info_lines(e: &Entry) -> Vec<String> {
     let mut out = vec![format!("desktop {}", e.path.display())];
@@ -448,6 +506,11 @@ pub fn info_lines(e: &Entry) -> Vec<String> {
     }
     if let Some(w) = e.wm_class.as_ref().filter(|w| safe_arg(w)) {
         out.push(format!("wmclass {w}"));
+    }
+    // §106: what the guest registers the application for. One word each,
+    // printable ASCII; the guest checks each again.
+    for t in e.mime_types.iter().filter(|t| t.len() <= 255 && t.contains('/') && safe_arg(t)) {
+        out.push(format!("mime {t}"));
     }
     for a in &e.actions {
         if let Err(why) = action_command(e, &a.id) {
@@ -477,13 +540,35 @@ pub fn info_lines(e: &Entry) -> Vec<String> {
 /// one argument and checks its scheme first, so this was not reachable from
 /// the guest; it is closed here so that it does not depend on that.
 pub fn split_args(args: &[String]) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    split_opts(args).map(|o| (o.dirs, o.words))
+}
+
+/// What [`split_opts`] found: `--dirs`, `--file-roots` (§106) and the words.
+pub struct Opts {
+    pub dirs: Vec<PathBuf>,
+    /// `Some` (possibly empty) when `--file-roots` was given: then a `file:`
+    /// URL opens only inside one of them ([`open_command_in`]).
+    pub file_roots: Option<Vec<PathBuf>>,
+    pub words: Vec<String>,
+}
+
+/// [`split_args`] with `--file-roots A:B` as well, by the same rule.
+pub fn split_opts(args: &[String]) -> Result<Opts, String> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut file_roots: Option<Vec<PathBuf>> = None;
     let mut i = 0;
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "--dirs" => {
                 let v = args.get(i + 1).ok_or("--dirs needs a value")?;
                 dirs.extend(v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+                i += 2;
+            }
+            "--file-roots" => {
+                let v = args.get(i + 1).ok_or("--file-roots needs a value")?;
+                file_roots
+                    .get_or_insert_with(Vec::new)
+                    .extend(v.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
                 i += 2;
             }
             "--" => {
@@ -493,7 +578,7 @@ pub fn split_args(args: &[String]) -> Result<(Vec<PathBuf>, Vec<String>), String
             _ => break,
         }
     }
-    Ok((dirs, args[i..].to_vec()))
+    Ok(Opts { dirs, file_roots, words: args[i..].to_vec() })
 }
 
 /// `wc-proxy desktop --dirs A:B info ID`, `… action ID ACTION` and `… open ID
@@ -503,7 +588,7 @@ pub fn cli(args: &[String]) -> std::process::ExitCode {
         eprintln!("wc-proxy desktop: {m}");
         std::process::ExitCode::from(1)
     };
-    let (dirs, words) = match split_args(args) {
+    let Opts { dirs, file_roots, words } = match split_opts(args) {
         Ok(v) => v,
         Err(e) => return fail(e.to_string()),
     };
@@ -511,7 +596,7 @@ pub fn cli(args: &[String]) -> std::process::ExitCode {
     let entry = match words.get(1).map(|id| find(id, &dirs)) {
         Some(Ok(e)) => e,
         Some(Err(e)) => return fail(e),
-        None => return fail("usage: desktop [--dirs A:B] info|action|open ID [ACTION|URL]".into()),
+        None => return fail("usage: desktop [--dirs A:B] [--file-roots A:B] info|action|open ID [ACTION|URL]".into()),
     };
     let cmd = match (words.first().copied(), words.get(2)) {
         (Some("info"), None) => {
@@ -521,8 +606,8 @@ pub fn cli(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::SUCCESS;
         }
         (Some("action"), Some(id)) => action_command(&entry, id),
-        (Some("open"), Some(url)) => open_command(&entry, url),
-        _ => return fail("usage: desktop [--dirs A:B] info|action|open ID [ACTION|URL]".into()),
+        (Some("open"), Some(url)) => open_command_in(&entry, url, file_roots.as_deref()),
+        _ => return fail("usage: desktop [--dirs A:B] [--file-roots A:B] info|action|open ID [ACTION|URL]".into()),
     };
     match cmd {
         Ok(c) => {
@@ -545,6 +630,7 @@ Categories=Network;WebBrowser
 Exec=firefox --name firefox %U
 GenericName=Web Browser
 Icon=firefox
+MimeType=text/html;text/xml;x-scheme-handler/https;bad type;
 Name=Firefox
 Name[de]=Firefox
 StartupWMClass=firefox
@@ -707,6 +793,9 @@ Name=Profile Manager
         assert!(info.contains(&format!("action new-window {}", b64(b"New Window"))));
         assert!(info.contains(&format!("action-l new-private-window de {}", b64("Neues privates Fenster".as_bytes()))));
         assert!(info.contains(&format!("action new-tab {}", b64(b"New Tab"))));
+        // §106: the types, one per line; one with a space is not passed on.
+        let mimes: Vec<&String> = info.iter().filter(|l| l.starts_with("mime ")).collect();
+        assert_eq!(mimes, ["mime text/html", "mime text/xml", "mime x-scheme-handler/https"]);
     }
 
     #[test]
@@ -745,5 +834,46 @@ Name=Profile Manager
         assert_eq!(w, ["info", "--dirs", "/evil"]);
         assert_eq!(v(&["--dirs", "/a", "--", "--dirs"]).unwrap().1, ["--dirs"]);
         assert!(v(&["--dirs"]).is_err());
+    }
+
+    /// §106: a `file:` URL in a `%f` slot is the decoded local path; in `%u`
+    /// it stays a URL.
+    #[test]
+    fn a_file_url_in_a_file_slot_is_its_path() {
+        let e = parse(Path::new("/x.desktop"), "[Desktop Entry]\nName=Ed\nExec=ed %f\n").unwrap();
+        assert_eq!(open_command(&e, "file:///srv/winshare/a%2Bb.txt").unwrap().args, ["/srv/winshare/a+b.txt"]);
+        // Decoded to a path with a space, it is no longer one word: refused.
+        assert!(open_command(&e, "file:///srv/winshare/a%20b.txt").is_err());
+        assert_eq!(open_command(&e, "https://e.org/x").unwrap().args, ["https://e.org/x"]);
+        assert_eq!(open_command(&firefox(), "file:///srv/a%2Bb.txt").unwrap().args[2], "file:///srv/a%2Bb.txt");
+    }
+
+    /// §106: with `--file-roots`, a `file:` URL opens only inside a share,
+    /// after symbolic links are resolved; `http(s)` is unaffected.
+    #[test]
+    fn file_urls_from_the_host_stay_inside_the_shares() {
+        let root = std::env::temp_dir().join(format!("wc-desktop-roots-{}", std::process::id()));
+        let share = root.join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("a.txt"), b"a").unwrap();
+        std::fs::write(root.join("secret.txt"), b"s").unwrap();
+        let _ = std::os::unix::fs::symlink(root.join("secret.txt"), share.join("link.txt"));
+        let e = parse(Path::new("/x.desktop"), "[Desktop Entry]\nName=Ed\nExec=ed %f\n").unwrap();
+        let roots = [share.clone()];
+        let url = |p: &Path| format!("file://{}", p.display());
+        let ok = open_command_in(&e, &url(&share.join("a.txt")), Some(&roots)).unwrap();
+        assert_eq!(ok.args, [share.join("a.txt").display().to_string()]);
+        let why = open_command_in(&e, &url(&root.join("secret.txt")), Some(&roots)).unwrap_err();
+        assert!(why.contains("not in a folder shared"), "{why}");
+        assert!(open_command_in(&e, &url(&share.join("link.txt")), Some(&roots)).is_err(), "a link out is refused");
+        assert!(open_command_in(&e, &format!("file://{}/../secret.txt", share.display()), Some(&roots)).is_err());
+        assert!(open_command_in(&e, &url(&share.join("missing.txt")), Some(&roots)).is_err());
+        assert!(open_command_in(&e, &url(&share.join("a.txt")), Some(&[])).is_err(), "no shares, no files");
+        assert!(open_command_in(&e, "https://e.org/", Some(&[])).is_ok());
+        assert!(open_command_in(&e, &url(&root.join("secret.txt")), None).is_ok(), "without roots: as before");
+        let o = split_opts(&["--dirs".into(), "/a".into(), "--file-roots".into(), String::new(), "open".into()]).unwrap();
+        assert_eq!(o.file_roots, Some(vec![]));
+        assert_eq!(o.words, ["open"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

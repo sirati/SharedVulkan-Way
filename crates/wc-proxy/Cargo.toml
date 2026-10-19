@@ -29,6 +29,12 @@ path = "src/lib.rs"
 name = "wc-proxy"
 path = "src/main.rs"
 
+# §106: `xdg-open` for the session's applications, and the `Exec=` of the host
+# applications' desktop entries. One request to the proxy's local socket.
+[[bin]]
+name = "wc-host-open"
+path = "src/bin/wc-host-open.rs"
+
 [target.'cfg(unix)'.dependencies]
 wc-handle = { workspace = true }
 # See wc-handle: one definition of the arena's granularity, in the crate that
@@ -49,3 +55,5 @@ quick-xml = "0.41"
 png = "0.18"
 # §104: the dma-buf token format (`--dmabuf-node`).
 sv-drm = { path = "../sv-drm" }
+# §106: host integration's pure core (wire format, audio plan, desktop entries).
+wc-hostint = { workspace = true }

@@ -90,6 +90,28 @@ pub fn compositor_argv(cfg: &Config, socket: &str, log: &str) -> Vec<String> {
     if cfg.nested_globals {
         a.push("--nested-compositor-globals".into());
     }
+    // §106. Host integration: the compositor serves the `OWNER_HOSTINT`
+    // slot with this path map and browser once the session service opens it.
+    a.extend(hostint_argv(&cfg.hostint));
+    a
+}
+
+/// §106. The compositor's `--hostint*` flags for `[hostint]`.
+pub fn hostint_argv(h: &crate::config::HostInt) -> Vec<String> {
+    let mut a = vec!["--hostint".to_string()];
+    let map = h.path_map();
+    for (host, linux) in &map.shares {
+        a.extend(["--hostint-share".into(), format!("{host}={linux}")]);
+    }
+    if let Some((host, linux)) = &map.drop {
+        a.extend(["--hostint-drop".into(), format!("{host}={linux}")]);
+    }
+    if !h.browser.is_empty() {
+        a.extend(["--hostint-browser".into(), h.browser.clone()]);
+        for x in &h.browser_args {
+            a.extend(["--hostint-browser-arg".into(), x.clone()]);
+        }
+    }
     a
 }
 
@@ -620,6 +642,23 @@ pub fn unb64(text: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use crate::config::{Config, EXAMPLE};
+
+    #[test]
+    fn the_compositor_gets_the_hostint_path_map() {
+        let h = crate::config::HostInt::for_platform(true);
+        assert_eq!(
+            hostint_argv(&h),
+            ["--hostint", "--hostint-share", r"Z:\=/srv/winshare", "--hostint-drop", r"Z:\waycompose-open=/srv/winshare/waycompose-open"]
+        );
+        let mut b = h.clone();
+        b.browser = r"C:\b\browser.exe".into();
+        assert_eq!(hostint_argv(&b).last().map(String::as_str), Some(r"C:\b\browser.exe"));
+        b.browser_args = vec!["--new-window".into(), "--user-data-dir=C:\\T\\p q".into()];
+        assert_eq!(
+            hostint_argv(&b)[5..],
+            ["--hostint-browser", r"C:\b\browser.exe", "--hostint-browser-arg", "--new-window", "--hostint-browser-arg", r"--user-data-dir=C:\T\p q"]
+        );
+    }
 
     fn cfg() -> Config {
         Config::parse(EXAMPLE).unwrap()

@@ -175,6 +175,10 @@ pub const SERVICE_TAG: u64 = 0x5C << 56;
 pub const OWNER_CONTROL: u64 = SERVICE_TAG | 1;
 /// The session's sound: raw s16le 48 kHz stereo PCM, host to guest.
 pub const OWNER_AUDIO: u64 = SERVICE_TAG | 2;
+/// Host integration (`wc-hostint`): requests either side may start, such as
+/// opening a URL or a file on the other side, and the host's audio devices
+/// and file-type handlers, pushed to Linux. One line per message.
+pub const OWNER_HOSTINT: u64 = SERVICE_TAG | 3;
 
 /// Whether an owner id names a session service rather than a client.
 pub fn is_service(owner_id: u64) -> bool {

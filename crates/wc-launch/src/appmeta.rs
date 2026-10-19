@@ -52,6 +52,11 @@ pub struct Meta {
     /// `icon NAME SIZE` and the PNG on the line after it.
     pub icon_name: String,
     pub icon_png: Option<Vec<u8>>,
+    /// §106. The entry's `MimeType=` list, one `mime TYPE` line each (file
+    /// types and `x-scheme-handler/...`), each checked with
+    /// `wc_hostint::mime::is_mime`: what the application is registered for
+    /// on this machine.
+    pub mimes: Vec<String>,
 }
 
 fn text(b64: &str) -> Result<String, String> {
@@ -75,6 +80,7 @@ impl Meta {
                     m.names.insert((*l).into(), text(b)?);
                 }
                 ["wmclass", c] => m.wm_class = Some((*c).into()),
+                ["mime", t] if wc_hostint::mime::is_mime(t) && !m.mimes.iter().any(|x| x == t) => m.mimes.push((*t).into()),
                 ["action", id, b] => m.actions.push(Action {
                     id: (*id).into(),
                     name: text(b)?,
@@ -479,6 +485,18 @@ mod tests {
         assert_eq!(m.icon_name, "firefox");
         assert_eq!(m.icon_png.as_deref(), Some(&[0x89, b'P', b'N', b'G'][..]));
         assert!(Meta::parse("program x\n").is_err());
+        assert!(m.mimes.is_empty(), "a host without §106 says nothing about types");
+    }
+
+    /// §106: the types the host's desktop entry opens, checked and deduplicated.
+    #[test]
+    fn the_host_s_mime_types_parse() {
+        let m = Meta::parse(
+            "desktop /d/firefox.desktop\nprogram firefox\nmime text/html\nmime x-scheme-handler/https\n\
+             mime text/html\nmime not a type\nmime ../../etc\n",
+        )
+        .unwrap();
+        assert_eq!(m.mimes, ["text/html", "x-scheme-handler/https"]);
     }
 
     /// The requirement that makes a pin and its window share a slot: the

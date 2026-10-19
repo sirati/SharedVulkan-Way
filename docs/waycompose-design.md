@@ -33933,3 +33933,459 @@ with full suites alongside as load.
   the whole suite at 32 threads). The test now uses an owned region, and
   `soundring::spawn`'s thread keeps the `Control` alive as long as it runs: 24
   parallel suite runs, 0 failures.
+
+## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
+
+2026-10-19, branch `host-integration`, crate `wc-hostint`. The model is the
+one the real-Mac prototype proved over vsock (`nix-darwin-subsystem-linux`,
+`agent/`). Its pure functions and tests were adopted where they still fit
+(the URL check, the rate limiter, the slugs and their deduplication). What
+differs is the transport. Nothing here crosses
+the boundary except through the session's shared memory: one ring slot for
+messages, the sound ring for samples, and a file share that the VM already
+has.
+
+### 106.1 What it does
+
+* **Audio per device.** Every host output (speakers, headphones, a display's
+  audio) is its own PipeWire sink in Linux, and every host input (a
+  microphone) its own source, named after the host device ("Speakers
+  (Realtek(R) Audio)", "WH-1000XM5"). Plugging a device in or out adds or
+  removes its node. When the host's default output or input changes, Linux's
+  configured default follows within about a second.
+* **Linux to host, links.** A Linux application's `xdg-open https://…`, and
+  anything that honours `BROWSER` or the session's `mimeapps.list` for
+  http, https and text/html, opens the link in the host's browser: Firefox
+  by default on macOS (configurable), and the user's default browser on
+  Windows unless one is configured.
+* **Host to Linux, by type.** A Linux application whose desktop entry lists
+  types (`MimeType=`) is registered for them on the host. On Windows that is
+  a per-user ProgID, `OpenWithProgids` and Capabilities. On macOS it is the
+  generated bundle's `CFBundleDocumentTypes` and `CFBundleURLTypes`. So
+  Explorer's and Finder's "Open with", a double-click on a type whose default
+  the user made the Linux application, and `open -a`, all start the Linux
+  application with the file.
+* **Linux to host, by type.** Each host application that opens some of the
+  table's types appears in Linux as an application, "Notepad (Windows)" or
+  "TextEdit (macOS)", in every "Open with" dialog. The host's default for a
+  type is Linux's default for it.
+
+### 106.2 The channel: one ring slot, either side asks
+
+The control channel (§103.14, §103.15) is a request from the host and a
+reply from Linux. Opening a link is the reverse, and the handler
+lists are pushes. So host integration has a service slot of its own,
+`OWNER_HOSTINT = SERVICE_TAG | 3` (sv-transport `wlbytes`). Like control
+and sound, the proxy claims it. On macOS the main process opens it; on
+Windows the compositor does (`sv-guest.exe`, the only process that can map
+the ivshmem device). Each serves it on a thread of its own
+(`wc_compositor::hostint::spawn`), never on the Wayland thread, and the
+thread ends when the ring reaches EOF.
+
+The wire format is `wc_hostint::wire`, one ASCII line per message. Free text
+crosses only as base64 inside one word:
+
+| direction | message | meaning |
+|---|---|---|
+| both | `hello 1 [PLATFORM]` | (re)start; the host answers with everything again |
+| Linux → host | `req N url B64` | open a URL in the host's browser |
+| Linux → host | `req N path B64` | open a host file with its default application |
+| Linux → host | `req N with TOKEN B64` | open a URL or host file with one host application |
+| host → Linux | `rep N ok` / `rep N err B64` | the result, with the host's reason |
+| host → Linux | `handlers B64` | host applications: token, name, types, defaults, schemes |
+| host → Linux | `paths B64` | the share map, and the drop directory for copies |
+
+A host application crosses only as an opaque token
+(`[a-z0-9]{1,32}`). Its executable path or bundle id stays on the host,
+so Linux names an application and never sends a command (§94's rule, the
+other way round). The host's checks are in `docs/security-model.md` R38.
+
+### 106.3 Audio
+
+**The transport is §103.16's sound ring.** The first plan pushed the device
+list on this channel and gave Linux a child `pipewire` hosting one
+pipe-tunnel node per device. The sound ring landed while this was being
+built, and it already carries every device as a stream (`Device`, `Gone`,
+`Default`, credit, capture `Start`/`Stop`) on `OWNER_AUDIO`. So that is the
+one path, and the `audio` message is gone from this channel. What host
+integration adds is:
+
+* **The Windows device side** (`wc_compositor::sound_win`, in the
+  compositor, which owns the rings). Endpoints are enumerated with
+  `IMMDeviceEnumerator`. An `IMMNotificationClient`
+  (`OnDefaultDeviceChanged`, state changes, added, removed) reports changes,
+  debounced to at most 800 ms. Each active endpoint is a stream with its own
+  mix rate and channel count. Each output stream is rendered by WASAPI in
+  shared mode on that endpoint, from a 240 ms queue that is granted as
+  credit and granted again exactly as WASAPI drains it. An output idle for
+  3 s releases its endpoint. Each input is captured only between `Start`
+  and `Stop`. Whatever the microphone records beyond the session's credit
+  is counted as an overrun and never queued. Stream ids are never reused,
+  and a format change makes a new stream. The macOS device side is
+  `wc-launch/src/sound_mac.rs` (§103.16). Host integration makes it react
+  to CoreAudio's property listeners instead of waiting for the next
+  one-second poll, and refuses capture unless the process is the
+  `org.waycompose.host` bundle (TCC, below).
+* **Names.** A Linux sink or source is `<win|mac>.<sink|source>.<slug>`. The
+  slug is the host's device name lowercased, with every run of other
+  characters as one `_`. A second device with the same name gets `_2`, and a
+  name already in use gets the next free number
+  (`wc_hostint::audio::node_name`). The description is the host's name
+  unchanged. So "Lautsprecher (2- High Definition Audio Device)" is
+  `win.sink.lautsprecher_2-_high_definition_audio_device`, described as
+  itself. §103.16's `wc_mac_out_<n>` names are replaced by these: a name
+  that depends on a stream number is not stable from one session to the
+  next.
+* **Defaults** follow the host's within a second. The proxy sets the
+  session's configured default (`pactl set-default-sink`/`-source`; under
+  PipeWire that is `default.configured.audio.sink`/`.source` in the
+  `default` metadata, the same key the prototype set with `pw-metadata`).
+* **The session's server**, chosen by `wc-session` (`WC_LAUNCH_AUDIO`):
+  `on` is §86's PulseAudio of the session's own (the default). `pipewire` is
+  a private pipewire, WirePlumber and pipewire-pulse for the session under
+  its run directory; WirePlumber's profile has no ALSA, Bluetooth, camera,
+  D-Bus or logind, so it can never take real hardware. `system` is the
+  user's own server (§103.16). `user-pipewire` is the same for a dedicated
+  desktop user only: it is refused unless the session's user is
+  `WC_LAUNCH_AUDIO_USER`, the `ConditionUser` of the prototype's units. The
+  workstation that runs the macOS VM must never use `system` or
+  `user-pipewire`: the VM's devices would become the desktop's.
+* **Under PulseAudio** a stream is §103.16's `module-pipe-sink` or
+  `module-pipe-source` on a FIFO the proxy serves, paced by its reader.
+  **Under PipeWire that pacing does not exist.** pipewire-pulse's pipe sink
+  runs on the graph's clock and drops what does not fit in the FIFO. With a
+  1.5 s tone and the device side holding credit for 0.4 s, 4% of the samples
+  were lost; at 1 s, 44%. So under PipeWire each stream is a node of its
+  own, a graph driver that starts a cycle only when the ring's credit covers
+  it (106.6).
+
+**The microphone.** macOS: capture happens only in the long-lived main
+process, started through Launch Services as the bundle
+`org.waycompose.host` (`Waycompose Host.app`, written by `--install`, with
+`LSUIElement` and `NSMicrophoneUsageDescription`), so TCC asks once, for
+that bundle, and never for a per-application face. Measured in the VM with
+a virtio-sound input: the dialog named "Waycompose Host" with our usage
+text. TCC's log named `org.waycompose.host` as responsible for itself.
+After Allow, 368,640 bytes were captured in 2 s. A capture attempted from
+any other process (an ssh shell) is refused by our own check before
+CoreAudio is asked. Signing with a stable local certificate, so that TCC
+does not ask again after a rebuild, is the Nix activation's job on the real
+Mac (the prototype's `stable-codesign.nix`). In the VM the binary is
+unsigned, and TCC logs "Failed to copy signing info". Windows has no
+per-application microphone prompt for desktop applications beyond the
+global privacy switch.
+
+### 106.4 Links and files
+
+**Linux side.** The session's applications get `wc-host-open` as a
+high-priority `xdg-open` on `PATH` and `BROWSER=xdg-open`. Their
+`XDG_DATA_DIRS` starts with the session's own applications directory, and
+`XDG_CONFIG_DIRS` with a directory holding the session's `mimeapps.list`.
+The proxy writes both from the host's `handlers`: `wc-host-browser.desktop`
+for http, https and text/html, `wc-host-<token>.desktop` per host
+application, and the host's defaults as Linux's defaults. Nothing is written
+into the user's own `~/.config` or `~/.local`. `wc-host-open` sends one
+request over a local socket in the session's run directory (0600, with the
+peer's uid checked) to the proxy, which forwards it on the ring and prints
+the host's refusal, if any. For `xdg-open` (no host application named), a
+`file:` URL or local path is refused with a message, unless the file is in a
+share both sides see. "Open with" a host application on a Linux-only file
+copies it into the share's drop directory first, and the host opens the
+copy.
+
+**Paths.** Windows: the VM already shares the VM host's `/srv/winshare` with
+the guest over virtio-fs, as `Z:`. That is the share, both ways, and
+`Z:\waycompose-open` is the drop directory. A Windows file outside `Z:` that
+is opened with a Linux application is copied there first, so the Linux
+application edits the copy. macOS on a real Mac: the Linux VM mounts the
+Mac user's home over virtio-fs at the same path, so the map is the identity.
+The macOS VM is §106.6.
+
+**Host side, Windows.** `wc-launch`'s deploy registers each application's
+types under HKCU (`wc_hostint::assoc::windows_plan`). It writes a manifest,
+and `--uninstall-assoc` removes exactly what the manifest lists. A file
+opened through the registration runs `wc-launch --session-name S APP --file
+"%1"`, which maps or copies the path and sends the existing `open` verb with
+a `file:///` URL. The label in "Open with" is the shortcut's title, so two
+installations stay apart. Opening for Linux uses `ShellExecuteW` with the
+verb `open`, after `AssocIsDangerous` and the extension list, or the
+handler's own executable through `CreateProcessW`. The configured browser
+(`[hostint] browser`, with fixed `browser-arg`s before the URL, which is
+always one argument of its own) replaces the default browser.
+
+**On the compositor.** Only the compositor can map the ivshmem device, so it
+serves both slots. `session_svc` opens `OWNER_HOSTINT` when the launcher
+passed `--hostint` (with the share and browser from `[hostint]`), and runs
+`sound_win` on `OWNER_AUDIO` in place of §105's single default-output
+player.
+
+**Host side, macOS.** The bundle's `Info.plist` lists the types at rank
+`Alternate` (`wc_hostint::assoc::plist_types`). The face's
+`application:openURLs:` hands each URL to the main process, which sends the
+`open` verb. Opening for Linux uses `/usr/bin/open -a <browser> -- <url>`,
+`/usr/bin/open -- <path>`, or `/usr/bin/open -b <bundle id> -- <target>`.
+
+### 106.5 Under PipeWire, a node that drives its own graph
+
+§103.16's pipe sink is paced by its reader under a real PulseAudio. Under
+PipeWire's pulse server it is not. The module's stream is clocked by
+whatever drives the graph, normally the dummy driver, and when the proxy
+stops reading because the device side has granted no credit, the FIFO fills
+and the module drops what does not fit. So under PipeWire each host device
+is a node of `wc-pw-node`, a small C program (`crates/wc-proxy/pw-node`,
+built by the flake as `.#wc-pw-node`; its RUNPATH is the store's
+libpipewire, so the VM host needs its closure and not an installed
+PipeWire). It hosts all of a session's devices. Each one is a `pw_stream`
+with `PW_STREAM_FLAG_DRIVER`, as `Audio/Sink` or `Audio/Source`. A timer at
+the quantum's period calls `pw_stream_trigger_process` only when the
+output's credit covers a cycle, or when an input has a cycle of the
+microphone's samples. While credit is held, no cycle runs, and the
+application's stream waits as it would on a real device that is behind.
+`sound.rs` starts it when `pactl info` names a PipeWire server and talks to
+it on its stdin and stdout, in the sound ring's own frames. Start and Stop
+of a microphone follow the node's state (streaming or paused). On a real
+PulseAudio, `sound.rs` keeps §103.16's pipe modules.
+
+Measured (scripts/wc-hostint-local.sh, a private PipeWire 1.6.9, a fake
+device side that plays in real time from a 250 ms queue, a 1.5 s signal of
+288,000 bytes with no zero frame, credit held in the middle):
+
+| credit held | lost, pipe modules under PipeWire | lost, `wc-pw-node` | pacat longer than without a hold |
+|---|---|---|---|
+| 0.1 s | 0 | 0 | +127 ms |
+| 0.4 s | 45,056 B (15.6%) | 0 | +427 ms |
+| 1 s | 159,744 B (55%) | 0 | +1024 ms |
+
+With `wc-pw-node` the bytes that arrive are the bytes played, contiguous,
+with nothing inserted. Under `on` (PulseAudio 17) nothing is lost either,
+and pacat waits for the hold. PulseAudio inserts 12,288 bytes of silence
+near the start of every stream (its own start-up underrun), so there the
+check is that every frame arrives, in order.
+
+Two bugs in shared code were found by these runs. PulseAudio 17's
+`module-pipe-source` refuses a FIFO that exists, and `sound.rs` made it
+first, so no microphone loaded under `on`. The session's PulseAudio also
+reached the user's session bus through `$XDG_RUNTIME_DIR/bus`, even with
+`DBUS_SESSION_BUS_ADDRESS` unset. A second session's PulseAudio then died
+with "org.PulseAudio1 already taken", so `pulse.sh` now names a bus that
+does not exist.
+
+### 106.6 The macOS VM's share
+
+On the real Mac the Linux VM mounts the Mac user's home at the same path
+over libkrun's virtio-fs. In the macOS VM of role (a), Linux runs QEMU, so
+the share goes the other way: a Linux directory
+(`/mnt/datasets/macvm/shares/<instance>`) is exported to macOS by
+`virtiofsd` (vhost-user-fs) and mounted at `~/LinuxShare`. §103.3 says that
+Sonoma under QEMU binds only legacy virtio devices. That is wrong: modern
+virtio-fs, 9p and virtio-sound all bind. What it takes:
+
+* `virtiofsd --sandbox=namespace --uid-map :0:$UID:1: --gid-map :0:$GID:1:
+  --translate-uid map:501:0:1 --translate-gid map:20:0:1`, unprivileged.
+  `--inode-file-handles` needs a capability it does not have and is left off,
+  with no problem seen.
+* `mount_virtiofs -u 501 -g 20 <tag> ~/LinuxShare`. Without `-u`/`-g`, every
+  create fails with EINVAL; with `--sandbox=none`, with EPERM.
+* `--xattr --xattrmap ":prefix:all::user.virtiofs.::bad:all:::"`. Without
+  xattrs, every Launch Services open of a file in the share fails with -4:
+  its `Getxattr` is answered ENOSYS.
+* macOS treats the mount as a network volume. TCC never lets a process of
+  an ssh session in, and asks once for `org.waycompose.host`.
+* `std::fs::copy` on macOS is `fcopyfile`, which the share does not support
+  (ENOSYS), so the copy into the drop directory is a plain read and write.
+
+9p mounts only as root (`/Volumes/...`), and its access fails.
+
+### 106.7 What was run
+
+**Linux, without a VM** (`scripts/wc-hostint-local.sh`, a private
+PipeWire stack and a private PulseAudio, never the desktop's): a fake device
+side announcing two outputs and a microphone with real names. 49 checks pass
+under PipeWire and 44 under PulseAudio:
+* the names are the slugs, and the descriptions the names (ö and ®
+  included);
+* a host default change is the session's default 25 ms later;
+* hot-plug adds and removes nodes, and a second device of the same name gets
+  `_2`;
+* the credit holds above;
+* a recorder on the source starts capture about 0.3 s later and stops it
+  when it ends;
+* `wc-host-open https://…` arrives as `req N url`, and the host's refusal is
+  printed with exit 1;
+* a Linux-only file is refused before anything is sent (exit 2);
+* `--with` on a Linux-only file copies it into the drop directory and sends
+  the host path.
+
+Evidence: `/mnt/datasets/builds/evidence/host-integration/linux-local/`.
+
+**The macOS VM** (Sonoma, 4 GiB, a real Linux session from the workstation,
+with a temporary QEMU usb-audio, virtio-sound and virtio-fs). Each image was
+judged by a fresh Sonnet agent; evidence is in
+`/mnt/datasets/builds/evidence/host-integration/mac-e2e/`:
+* **Audio.** Two sinks and a source,
+  `mac.sink.apple_virtual_sound_device`, `mac.sink.audio_output_-_disabled`
+  and `mac.source.apple_virtual_sound_device`, described by the Mac's
+  names. When the Mac's default output changed, the session's default sink
+  followed 66 ms later, and 106 ms later on the change back. A 3 s tone
+  played. `parec` from the source started the Mac's recorder and got
+  794,880 bytes in 5 s. TCC asked "“Waycompose Host” would like to access
+  the microphone".
+* **Linux to Mac.** `xdg-open https://example.org` opened Safari (this VM
+  has no Firefox, so the opener fell back to the default browser).
+  `xdg-open file:///etc/passwd` and a Linux-only file were refused: "… is
+  not in a folder the macOS desktop can see (…); only files there open on
+  macOS. Move it there, or use "Open with" and a macOS application, which
+  opens a copy."
+* **Mac to Linux.** A Mac file opened with the Linux Text Editor's bundle
+  reached the face's `application:openURLs:`. It was copied into the share's
+  drop directory and opened in the Linux Text Editor at its Linux path,
+  with no extra empty window.
+* **Linux "Open with" a Mac application.** `wc-host-open --with <TextEdit's
+  token>` on a file in the share opened it in TextEdit.
+* The generated bundle is in Finder's "Open With" for `.txt` and `.html`. It
+  is never offered back to Linux, and it is gone after unregistering. The
+  opener refused `javascript:`, `/etc/hosts`, an `.app`, a renamed bundle
+  and a symlink to a bundle. A `.txt` whose Mac default is a Linux bundle was
+  refused, so a file cannot bounce back to Linux.
+
+**The macOS VM, second run** (an isolated session: `WC_LAUNCH_TEST_HOME`
+gave the Linux applications a throwaway home, after the first run's Text
+Editor had restored the workstation user's own documents into every
+screenshot; those screenshots were deleted). Evidence is in
+`…/mac-e2e2/`. Each click was made, and each image judged, by a fresh Sonnet
+agent:
+* **The browser comes to the front.** On macOS 14 an application started
+  by a background process opens behind the active one (cooperative
+  activation), and the first run's Safari did. Now the main process works
+  out which application will receive the open (the configured browser,
+  Firefox when installed; otherwise the Mac's default handler or the chosen
+  "open with" application). It tells the face the user is working in to
+  `yieldActivationToApplicationWithBundleIdentifier:` it, and opens about
+  120 ms later. With the Linux Text Editor active, `xdg-open
+  https://example.org` brought Safari to the front, as both the screenshot
+  and the window order show. The face only yields and the main process
+  opens, so faces still need no permission of their own.
+* **Finder's "Open With" on a file Linux created in the share** opened it
+  in the Linux Text Editor at its Linux path.
+* Audio, the refusals and "open with" TextEdit were as in the first run.
+  The default followed in about 0.1 s, and 779,412 bytes were recorded in 5 s.
+* **Found:** while TCC's dialog for "Waycompose Host" waits for an answer
+  (microphone or network volume), the session stalls. Recording returns
+  nothing, playback blocks and an open times out after 5 s, because the
+  microphone's start and the open block the threads they run on. 106.8 has
+  the fix.
+
+**The Windows guest** (the test host's VM, while it was idle, under the lease,
+18:14–18:24). This used a separate test installation with its own
+directory, session name, application section ("Firefox (Linux HI test)"),
+ProgID and taskbar identity, and `WC_LAUNCH_TEST_HOME` for its applications,
+through a `test-home` file beside its `wc-session`. Deploy left the shared
+doorbell hub and the session service as they were
+(`WC_LAUNCH_SERVICES=keep`). The session started cold in 4.1 s with no ssh
+in its path. Evidence is in
+`/mnt/datasets/builds/evidence/host-integration/win-e2e/`. Each image was
+judged by a fresh Sonnet agent and checked afterwards for the user's own
+windows or content (none):
+* **Audio.** The guest has one HDA output and one input. A QEMU
+  `usb-audio` on its existing xHCI controller and audio backend,
+  hot-plugged for about 80 s, made a second output. The session's server
+  then had `win.sink.lautsprecher_2-_high_definition_audio_device`,
+  `win.sink.lautsprecher_audio_device` and
+  `win.source.eingang_2-_high_definition_audio_device`, described by
+  Windows' names. Windows made the new device its default when it appeared,
+  and Linux followed. The default was then set to HDA, USB and HDA again
+  (`wc-hostint-probe --set-default render all`, through `IPolicyConfig`),
+  and the Linux default sink followed each time, 0.83 to 0.89 s after the
+  command was sent. 1.5 s of signal crossed with nothing dropped. Recording
+  from the source for 2 s gave 352,800 bytes, with capture started and
+  stopped on both sides. After the unplug, all six default roles (render and
+  capture × console, multimedia, communications) were restored and read back
+  identical to before.
+* **Linux to Windows, a link.** `xdg-open https://example.org` in the Linux
+  application's own environment answered `ok`, and a Windows browser showed
+  "Example Domain". The browser was the configured one (`[hostint]
+  browser`), so that nothing touched the user's own: this guest has no Edge
+  (its directory is an empty file), so it was Windows' Firefox with
+  `-no-remote -profile <test dir> -new-window`. That process tree was closed
+  by its pid and the profile deleted. `xdg-open file:///etc/passwd` was
+  refused (exit 2).
+* **Windows to Linux, by type.** `Z:\waycompose-test\t.html` was opened
+  through the test installation's ProgID with `ShellExecuteEx` (`lpClass`),
+  which is what Explorer's "Open with" invokes, rather than by clicking in
+  Explorer. The Linux Firefox showed it at
+  `file:///srv/winshare/waycompose-test/t.html`. The application is listed
+  among `.html`'s recommended handlers. Windows added no OpenWithList entry.
+* **Linux "Open with" a Windows application.** The session's
+  `wc-host-<token>.desktop` was "Paint (Windows)". `wc-host-open --with
+  <token>` on a PNG in the share opened it in Paint.
+* **Registry.** `--install` wrote 27 values for four types and two schemes,
+  among them the ProgID, `OpenWithProgids` for `.html` and `.xhtml`, and
+  Capabilities with URL associations for http and https. `--uninstall-assoc`
+  removed all of them, the empty keys it had made included.
+* Before the run no other compositor was mapping the device, and afterwards
+  nothing of the test was left. The guest was up and unlocked before and
+  after.
+
+**On one machine, before the guest** (`scripts/wc-hostint-win-local.sh`, on
+`scripts/wc-no-ssh.sh`'s stand-ins for the device, the port and the
+guest): the Windows session path's channel came up, and links, refusals,
+`--with`, a share file sent as `Z:\…`, and `open` of a share file into `%u`
+and `%f` (a file outside the share refused) all passed. This found one bug
+of the merge itself: the proxy's socketless ring branch never claimed the
+slot. `sound_win` against a fake session side under Wine announced four
+streams and both defaults, and returned every byte of 2 s of output as
+credit.
+
+**The Mac's outputs and its microphone dialog.** While macOS asks the user
+for the microphone, a CoreAudio start for the device that also has the
+microphone waits in coreaudiod until the dialog is answered. The outputs are
+therefore AUHAL units started on workers of their own, never on the sound
+ring's thread or under its lock, and the microphone is asked for through
+AVFoundation before any input exists. Measured in the VM with the dialog
+up: the output-only device played (a 3 s tone in 3.37 s), the Linux default
+followed, `xdg-open` was answered in 0.50 s, and an open with TextEdit got
+"the Mac is asking for permission; answer the dialog" in 2.5 s. Output to
+the device that has the microphone still waits until the dialog is answered.
+That is the system audio server, and it happens once, on first use. After
+Allow: 754,948 bytes recorded in 5 s, and both outputs played the tone in
+3.0–3.1 s.
+
+### 106.8 Not done, not proven, and known defects
+
+* **The real Mac (role (b)) has not run any of this.** The Linux side is the
+  same code. The Mac side is §103.13's main process and faces with the
+  pieces above. Signing the host bundle with a stable local certificate is
+  the Nix activation's job (the prototype's `stable-codesign.nix`). Until
+  then TCC asks for the microphone again after every rebuild. In the VM the
+  binary is unsigned.
+* **On first use, output to the Mac device that also has the microphone
+  waits for TCC's dialog.** coreaudiod holds that device's setup until the
+  dialog is answered (106.7). Everything else keeps working meanwhile: other
+  outputs, the defaults and the opens.
+* **Windows never has a Linux application as a default by itself.**
+  `UserChoice` is protected, so the registration offers the application in
+  "Open with" and in Settings' Default apps, and the user chooses. The same
+  holds on macOS, where the bundles claim their types at rank `Alternate`.
+* **Copies are not cleaned up, and edits to them do not go back.** A host
+  file outside the share, or a Linux file outside it opened with a host
+  application, is copied into the drop directory. Nothing deletes those
+  copies yet, and what an application saves goes into the copy.
+* **Handlers are enumerated again on a timer** (Windows every 10 minutes,
+  macOS every minute), not when an application is installed.
+* **The macOS VM's share** needs the virtiofsd flags of 106.6. The
+  `macos-vm` manager does not add them by itself; the test added them to
+  `qemu_extra` and took them out again.
+* **`user-pipewire`** was tested only for its refusal of the wrong user. It
+  is meant for the real Mac's Linux VM, whose desktop user's PipeWire
+  provides the devices.
+* **`wc-pw-node`'s closure** is PipeWire's own, about 754 MB. A VM host
+  that runs `pipewire` mode needs it anyway.
+* **Windows' default-browser path** (`ShellExecuteW` with the URL) ran only
+  under Wine. On the guest the run opened links in a configured browser
+  with a throwaway profile, so that nothing touched the user's own. That
+  was Windows' Firefox, because the guest has no Edge.
+* **Explorer's "Open with" was invoked, not clicked**: `ShellExecuteEx`
+  with the installation's ProgID, which is the call the menu makes.
+* **"Open with" lists one entry per installation**, labelled with the
+  shortcut's title; nothing groups several installations of one
+  application.
