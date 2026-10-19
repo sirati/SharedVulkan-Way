@@ -786,6 +786,32 @@ hostint_args() {
   printf -- '--hostint %q --hostint-opener %q' "$D" "$BIN/wc-host-open"
 }
 
+# sound_ring_args D PREFIX: the proxy's §103.16 flags for the session's server,
+# with the device side's platform ("mac", "win") as the node names' prefix
+# (§106.3). Under PipeWire every device is a native node of wc-pw-node, paced
+# by the ring's credit (a pipe module there drops); the proxy asks the server
+# what it is and uses the pipe modules on a PulseAudio. Nothing without pactl.
+sound_ring_args() {
+  local D="$1" PREFIX="$2" PACTL PWNODE PWSOCK SRV
+  PACTL=$(pulse_bin pactl 2>/dev/null) || return 0
+  [ -n "$PACTL" ] || return 0
+  case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+    pulse|pipewire) SRV="unix:$D/xdg/pulse/native" ;;
+    system|user-pipewire) SRV="unix:/run/user/$UID_/pulse/native" ;;
+    *) return 0 ;;
+  esac
+  printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix %q' "$PACTL" "$SRV" "$D" "$PREFIX"
+  PWNODE=$(pw_node_bin 2>/dev/null)
+  case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+    pipewire) PWSOCK="$D/pw/pipewire-0" ;;
+    system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
+    *) PWSOCK="" ;;
+  esac
+  [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && [ -S "$PWSOCK" ] \
+    && printf -- ' --sound-pw-node %q --sound-pipewire %q' "$PWNODE" "$PWSOCK"
+  return 0
+}
+
 # --------------------------------------------------------------- start_app ---
 # start_app ID DPI CAPTION: one Wayland client, against the session's proxy,
 # with the argv `launch` built in CMDV from the definition `load_app` read
@@ -1411,24 +1437,7 @@ proxy)
     UPSTREAM_ARGS=$(printf -- '--wayland-rings-plan %q --wayland-bell %q --session-control %q --session-id %q' "$D/rings.plan" "$MACBELL" "$BASE/wc-session" "$ID")
     # §106: host integration on the same rings.
     UPSTREAM_ARGS="$UPSTREAM_ARGS $(hostint_args "$D")"
-    # §103.16: the sound ring, every device of the guest's a stream, made a
-    # sink or source on the session's server (or the user's, `system`).
-    PACTL=$(pulse_bin pactl 2>/dev/null)
-    case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
-      pulse|pipewire) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix mac' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
-      system|user-pipewire) [ -n "$PACTL" ] && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix mac' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
-    esac
-    # §106.3: under PipeWire every device is a native node of wc-pw-node,
-    # paced by the ring's credit (a pipe module there drops). The proxy asks
-    # the server what it is and uses the pipe modules on a PulseAudio.
-    PWNODE=$(pw_node_bin 2>/dev/null)
-    case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
-      pipewire) PWSOCK="$D/pw/pipewire-0" ;;
-      system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
-      *) PWSOCK="" ;;
-    esac
-    [ -n "$PACTL" ] && [ -n "$PWNODE" ] && [ -S "$PWSOCK" ] \
-      && UPSTREAM_ARGS="$UPSTREAM_ARGS $(printf -- '--sound-pw-node %q --sound-pipewire %q' "$PWNODE" "$PWSOCK")"
+    UPSTREAM_ARGS="$UPSTREAM_ARGS $(sound_ring_args "$D" mac)"
   else
     [ -S "$D/up.sock" ] || die "no upstream socket for $ID -- the guest's tunnel is not up"
     UPSTREAM_ARGS=$(printf -- '--upstream %q' "$D/up.sock")
