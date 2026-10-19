@@ -453,6 +453,56 @@ mod imp_vblank {
     }
 }
 
+/// The `clockid_t` `wp_presentation.clock_id` names: `CLOCK_MONOTONIC`.
+///
+/// ADDED FOR §102. Linux's number, on both platforms. On Linux it is the truth
+/// and [`presentation_now`] reads that clock. On Windows no client is on this
+/// machine — every one is behind wc-proxy, which rewrites both this event and
+/// every `presented` timestamp to its own `CLOCK_MONOTONIC` as it forwards them
+/// (§88: the frame clock does not cross machines) — so what the compositor
+/// says here is only ever read by the proxy, and saying the id the proxy will
+/// say anyway keeps the two from disagreeing about what kind of clock it is.
+pub const PRESENTATION_CLOCK_ID: u32 = 1;
+
+/// Now, on the clock [`PRESENTATION_CLOCK_ID`] names, for a
+/// `wp_presentation_feedback.presented` timestamp.
+///
+/// ADDED FOR §102. Not [`std::time::Instant`]: a timestamp has to be an
+/// absolute reading a client can compare with its own `clock_gettime`, and an
+/// `Instant` cannot be turned into one. On Windows it is
+/// `QueryPerformanceCounter`, which is what `Instant` reads there and is
+/// monotonic; its epoch is boot, as `CLOCK_MONOTONIC`'s is, but it is the
+/// guest's boot — see [`PRESENTATION_CLOCK_ID`] for why that is never seen.
+pub fn presentation_now() -> Duration {
+    imp_clock::now()
+}
+
+#[cfg(unix)]
+mod imp_clock {
+    pub fn now() -> std::time::Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a writable timespec, and CLOCK_MONOTONIC always
+        // exists on Linux.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        std::time::Duration::new(ts.tv_sec.max(0) as u64, ts.tv_nsec.clamp(0, 999_999_999) as u32)
+    }
+}
+
+#[cfg(windows)]
+mod imp_clock {
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+    pub fn now() -> std::time::Duration {
+        let (mut now, mut freq) = (0i64, 0i64);
+        // SAFETY: each call writes one i64.
+        let ok = unsafe { QueryPerformanceCounter(&mut now) != 0 && QueryPerformanceFrequency(&mut freq) != 0 };
+        if !ok || freq <= 0 || now < 0 {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::from_nanos((now as i128 * 1_000_000_000 / freq as i128) as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +551,16 @@ mod tests {
         // Generous, because this runs on a loaded build machine. It still fails
         // if a turn costs a scheduler tick, which is the regression.
         assert!(each < Duration::from_millis(15), "too slow: {each:?}");
+    }
+
+    /// §102. The presentation clock moves forward, at the rate of real time.
+    #[test]
+    fn the_presentation_clock_is_monotonic_and_absolute() {
+        let a = presentation_now();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = presentation_now();
+        assert!(b > a);
+        assert!(b - a >= Duration::from_millis(2));
     }
 
     #[test]

@@ -552,7 +552,12 @@ mod tests {
         // eight requests and four events) and `zwp_relative_pointer_manager_v1`
         // (two interfaces, three requests and one event): sixteen messages,
         // each walked in both directions, which a game's mouse-look needs.
-        assert_eq!(checked, 468, "the vendored protocols changed shape");
+        //
+        // 468 to 494 in §102: `wp_viewporter` (five requests), the
+        // single-pixel buffer manager (two) and `wp_presentation` (two
+        // requests, four events), thirteen messages a nested KWin sends or
+        // is sent.
+        assert_eq!(checked, 494, "the vendored protocols changed shape");
     }
 }
 

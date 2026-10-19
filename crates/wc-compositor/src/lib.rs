@@ -294,6 +294,12 @@ struct Args {
     /// §85. `--exit-when-empty <secs>`: end the process once it has had a
     /// window and has had none for this long. See [`EmptyWatch`].
     exit_when_empty: Option<Duration>,
+    /// §102. `--nested-compositor-globals`: also offer `wp_viewporter`,
+    /// `wp_single_pixel_buffer_manager_v1` and `wp_presentation`, which a
+    /// nested compositor (KWin's Wayland backend) will not start without. Off
+    /// by default so that every other session keeps the globals it was
+    /// measured with; the launcher's `[session] nested-compositor-globals`.
+    nested_globals: bool,
 }
 
 /// The control socket, where one can exist, and nothing at all where one
@@ -377,6 +383,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         control: None,
         in_band: false,
         exit_when_empty: None,
+        nested_globals: false,
     };
     let mut it = argv.iter().skip(1).cloned();
     while let Some(arg) = it.next() {
@@ -622,6 +629,8 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
             }
+            // §102. See `Args::nested_globals`.
+            "--nested-compositor-globals" => args.nested_globals = true,
             // §85. 0 means "as soon as the last window is gone".
             "--exit-when-empty" => {
                 let Some(secs) = it.next().and_then(|s| s.parse::<u64>().ok()) else {
@@ -1447,7 +1456,8 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty);
+                args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty,
+                args.nested_globals);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -1575,6 +1585,8 @@ fn wayland_thread(
     // §79. See `Args::in_band`.
     in_band: bool,
     exit_when_empty: Option<Duration>,
+    // §102. See `Args::nested_globals`.
+    nested_globals: bool,
 ) -> u8 {
     use std::io::Write as _;
 
@@ -1594,7 +1606,7 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output, decorations);
+    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output, decorations, nested_globals);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),

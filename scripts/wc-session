@@ -141,6 +141,20 @@ GID_=$(id -g)
 # §94. The application definitions. One section per application the guest may
 # start, written by `scripts/wc-launch.sh deploy`; see `load_app`.
 APPS="${WC_LAUNCH_APPS:-$BASE/apps.ini}"
+# §102. How much of a buffer the proxy copies into the arena at each commit:
+# `damage` (the default, §27) or `buffer`, from `$BASE/copy-scope`, which the
+# deploy step writes and nothing the guest sends can change. The nested Linux
+# desktop's installation uses `buffer`: with `damage`, KWin's frames reached
+# the guest's window only at its first map and never after (§102.9), and the
+# cost of `buffer` is one window-sized copy per frame on the host.
+COPY_SCOPE=damage
+if [ -f "$BASE/copy-scope" ]; then
+  case "$(head -c 16 "$BASE/copy-scope" | tr -d '[:space:]')" in
+    buffer) COPY_SCOPE=buffer ;;
+    damage|'') ;;
+    *) echo "wc-session: $BASE/copy-scope is not damage or buffer; using damage" >&2 ;;
+  esac
+fi
 
 die() { echo "wc-session: $*" >&2; exit 1; }
 
@@ -996,8 +1010,8 @@ proxy)
       RINGARGS=""
       [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
         && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
-      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy damage --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
-        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" \
+      printf 'exec %q --upstream %q --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
+        "$BIN/wc-proxy" "$D/up.sock" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" \
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"

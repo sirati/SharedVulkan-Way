@@ -2371,3 +2371,210 @@ fn an_empty_app_id_takes_the_launchers_and_a_named_one_is_left_alone() {
     assert_eq!(app_id(&mut h, top, ""), encoded(""));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ---------------------------------------------------------------------------
+// §102: the globals a nested compositor needs from its host
+// ---------------------------------------------------------------------------
+
+/// A session with a registry, a compositor and one surface, for the §102 tests.
+fn nested_harness(tag: &str) -> (Harness, std::path::PathBuf, u32, u32) {
+    let d = tmpdir(tag);
+    let t = SharedFile::new(&d, "Z:\\pools\\").unwrap();
+    let mut h = Harness::new(Box::new(t), CopyScope::Damage, 1);
+    let registry = h.id();
+    h.send_words(1, 1, &[registry]);
+    let compositor = h.bind(registry, 1, "wl_compositor", 6);
+    let surface = h.id();
+    h.send_words(compositor, 0, &[surface]);
+    (h, d, registry, surface)
+}
+
+/// §102. KWin's background: a `wl_buffer` from the single-pixel manager, which
+/// belongs to no pool. Its attach must not be held back as "not upstream" (the
+/// stage-16 rule for a pool's buffer the compositor does not have), nothing is
+/// copied for it, its `release` and `destroy` pass, and every request reaches
+/// the compositor byte for byte.
+#[test]
+fn a_single_pixel_buffer_passes_through_untouched() {
+    let (mut h, d, registry, surface) = nested_harness("p102-spb");
+    let spb = h.bind(registry, 20, "wp_single_pixel_buffer_manager_v1", 1);
+    let buffer = h.id();
+    let create = rq("wp_single_pixel_buffer_manager_v1", "create_u32_rgba_buffer");
+    h.send_words(spb, create, &[buffer, 0, 0, 0, u32::MAX]);
+    let before = h.upstream_messages().len();
+
+    let attach = rq("wl_surface", "attach");
+    let damage = rq("wl_surface", "damage_buffer");
+    let commit = rq("wl_surface", "commit");
+    for _ in 0..3 {
+        h.send_words(surface, attach, &[buffer, 0, 0]);
+        h.send_words(surface, damage, &[0, 0, 1, 1]);
+        h.send_words(surface, commit, &[]);
+    }
+    // The compositor releases it, and the client destroys it.
+    let (released, fds) = h
+        .session
+        .server_message(Header { object: buffer, opcode: ev("wl_buffer", "release"), size: 8 }, &[])
+        .unwrap();
+    assert!(fds.is_empty());
+    assert_eq!(released, wire::message(buffer, ev("wl_buffer", "release"), &[]));
+    h.send_words(buffer, rq("wl_buffer", "destroy"), &[]);
+
+    let sent = h.upstream_messages();
+    assert_eq!(sent.len() - before, 3 * 3 + 1, "every request was forwarded");
+    let attaches: Vec<_> = sent.iter().filter(|(o, op, _)| *o == surface && *op == attach).collect();
+    assert_eq!(attaches.len(), 3);
+    assert_eq!(attaches[0].2, [buffer, 0, 0].iter().flat_map(|w| w.to_ne_bytes()).collect::<Vec<_>>());
+    let (o, op, b) = &sent[before - 1];
+    assert_eq!((*o, *op), (spb, create));
+    assert_eq!(&b[16..20], &u32::MAX.to_ne_bytes(), "the colour is the client's");
+    assert_eq!(sent.last().map(|m| (m.0, m.1)), Some((buffer, rq("wl_buffer", "destroy"))));
+    assert_eq!(h.session.stats.copies, 0, "a buffer with no pool has nothing to copy");
+    assert_eq!(h.session.stats.foreign_commits, 3);
+    assert_eq!(h.session.stats.attaches_deferred, 0);
+    assert!(h.session.take_client_bytes().is_empty(), "nothing invented for the client");
+    assert!(h.session.surfaces[&surface].damage.is_empty(), "damage does not pile up");
+    assert!(!h.session.foreign_buffers.contains(&buffer), "forgotten once destroyed");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §102. A pool's buffer that reuses a single-pixel buffer's id is a pool's
+/// buffer again: the copy path is not skipped for it.
+#[test]
+fn an_id_reused_by_a_pool_buffer_is_no_longer_foreign() {
+    let (mut h, d, registry, _) = nested_harness("p102-reuse");
+    let spb = h.bind(registry, 20, "wp_single_pixel_buffer_manager_v1", 1);
+    let buffer = h.id();
+    h.send_words(spb, rq("wp_single_pixel_buffer_manager_v1", "create_u32_rgba_buffer"), &[buffer, 1, 2, 3, 4]);
+    assert!(h.session.buffer_is_upstream(buffer));
+    h.send_words(buffer, rq("wl_buffer", "destroy"), &[]);
+    h.session.forget_stale_buffer(buffer, "wl_region");
+    assert!(!h.session.foreign_buffers.contains(&buffer));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §102. The presentation clock does not cross machines: `presented`'s
+/// timestamp leaves the proxy as this machine's `CLOCK_MONOTONIC` at the
+/// moment it was forwarded, `clock_id` names that clock, and refresh, sequence
+/// and flags are the compositor's.
+#[test]
+fn a_presented_timestamp_is_rewritten_to_this_machines_clock() {
+    let (mut h, d, registry, surface) = nested_harness("p102-pres");
+    let presentation = h.bind(registry, 21, "wp_presentation", 2);
+
+    let (clock, _) = h
+        .session
+        .server_message(
+            Header { object: presentation, opcode: ev("wp_presentation", "clock_id"), size: 12 },
+            &4u32.to_ne_bytes(),
+        )
+        .unwrap();
+    assert_eq!(&clock[8..12], &(libc::CLOCK_MONOTONIC as u32).to_ne_bytes());
+
+    let feedback = h.id();
+    h.send_words(presentation, rq("wp_presentation", "feedback"), &[surface, feedback]);
+    // The guest's reading: some other clock entirely.
+    let words = [0xdead_u32, 0xbeef, 123, 16_666_666, 0, 42, 0];
+    let body: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let (lo, _) = monotonic_now();
+    let (out, _) = h
+        .session
+        .server_message(
+            Header {
+                object: feedback,
+                opcode: ev("wp_presentation_feedback", "presented"),
+                size: 8 + body.len(),
+            },
+            &body,
+        )
+        .unwrap();
+    let (hi, _) = monotonic_now();
+    let word = |i: usize| u32::from_ne_bytes(out[8 + 4 * i..12 + 4 * i].try_into().unwrap());
+    let secs = (u64::from(word(0)) << 32) | u64::from(word(1));
+    assert!(lo <= secs && secs <= hi, "{secs} is not between {lo} and {hi}");
+    assert!(word(2) < 1_000_000_000);
+    assert_eq!((word(3), word(4), word(5), word(6)), (16_666_666, 0, 42, 0));
+    assert_eq!(out.len(), 8 + body.len());
+
+    // `discarded` is the compositor's word and passes unchanged.
+    let (gone, _) = h
+        .session
+        .server_message(
+            Header { object: feedback, opcode: ev("wp_presentation_feedback", "discarded"), size: 8 },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(gone, wire::message(feedback, ev("wp_presentation_feedback", "discarded"), &[]));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §102. `wp_viewporter`'s requests walk — two of them are `fixed`, which is a
+/// word on the wire — and reach the compositor byte for byte.
+#[test]
+fn viewport_requests_walk_and_are_forwarded() {
+    let (mut h, d, registry, surface) = nested_harness("p102-vp");
+    let viewporter = h.bind(registry, 22, "wp_viewporter", 1);
+    let viewport = h.id();
+    h.send_words(viewporter, rq("wp_viewporter", "get_viewport"), &[viewport, surface]);
+    let fixed = |v: f64| (v * 256.0) as i32 as u32;
+    h.send_words(viewport, rq("wp_viewport", "set_source"), &[fixed(0.0), fixed(0.0), fixed(1280.0), fixed(800.0)]);
+    h.send_words(viewport, rq("wp_viewport", "set_destination"), &[1280, 800]);
+    h.send_words(surface, rq("wl_surface", "commit"), &[]);
+    h.send_words(viewport, rq("wp_viewport", "destroy"), &[]);
+    h.send_words(viewporter, rq("wp_viewporter", "destroy"), &[]);
+
+    let sent = h.upstream_messages();
+    let (o, op, b) = &sent[sent.len() - 4];
+    assert_eq!((*o, *op), (viewport, rq("wp_viewport", "set_destination")));
+    assert_eq!(b, &[1280u32, 800].iter().flat_map(|w| w.to_ne_bytes()).collect::<Vec<_>>());
+    assert_eq!(sent.last().map(|m| (m.0, m.1)), Some((viewporter, rq("wp_viewporter", "destroy"))));
+    assert!(h.session.take_notes().is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §102 (docs/waycompose-design.md 102.4). A client another user runs for a
+/// launcher of ours (the nested desktop's KWin) carries the launcher's title:
+/// it is set right after `get_toplevel`, next to the app id, and every title
+/// the client sets itself is replaced.
+#[test]
+fn a_forced_title_is_set_at_once_and_replaces_the_clients() {
+    fn toplevel(h: &mut Harness) -> u32 {
+        let registry = h.id();
+        h.send_words(1, 1, &[registry]);
+        let wm = h.bind(registry, 4, "xdg_wm_base", 6);
+        let surface_id = h.id();
+        let compositor = h.bind(registry, 1, "wl_compositor", 6);
+        h.send_words(compositor, 0, &[surface_id]);
+        let xdg = h.id();
+        h.send_words(wm, 2, &[xdg, surface_id]); // get_xdg_surface
+        let top = h.id();
+        h.send_words(xdg, 1, &[top]); // get_toplevel
+        top
+    }
+    let spec = Spec::builtin().unwrap();
+    assert_eq!(spec.request("xdg_toplevel", 2).unwrap().name, "set_title");
+    let encoded = |s: &str| {
+        let mut b = Vec::new();
+        wire::push_string(&mut b, s);
+        b
+    };
+    let d = tmpdir("p102-title");
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    h.session.set_default_app_id(Some("atp-nested".into()));
+    h.session.set_forced_title(Some("Windows 7 (Linux)".into()));
+    let top = toplevel(&mut h);
+    let msgs = h.upstream_messages();
+    let n = msgs.len();
+    assert_eq!(msgs[n - 2], (top, 2, encoded("Windows 7 (Linux)")), "the title follows get_toplevel");
+    assert_eq!(msgs[n - 1], (top, 3, encoded("atp-nested")), "and the app id after it");
+    h.send(top, 2, &encoded("KDE Wayland Compositor WL-0"), &mut VecDeque::new());
+    let msgs = h.upstream_messages();
+    assert_eq!(msgs.last().unwrap().clone(), (top, 2, encoded("Windows 7 (Linux)")));
+
+    // Without one, the client's own title goes through.
+    let mut h = Harness::new(Box::new(SharedFile::new(&d, "Z:\\").unwrap()), CopyScope::Damage, 1);
+    let top = toplevel(&mut h);
+    h.send(top, 2, &encoded("Smithay"), &mut VecDeque::new());
+    assert_eq!(h.upstream_messages().last().unwrap().clone(), (top, 2, encoded("Smithay")));
+    let _ = std::fs::remove_dir_all(&d);
+}

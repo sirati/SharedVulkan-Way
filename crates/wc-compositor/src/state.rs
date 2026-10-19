@@ -13,6 +13,12 @@ use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle, RelativeMotionEvent,
 };
+// §102.3: `TreeClickGrab`, smithay's click grab with an origin that follows.
+use smithay::input::pointer::{
+    ClickGrab, Focus, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+    GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+    GestureSwipeUpdateEvent, GrabStartData, PointerGrab, PointerInnerHandle,
+};
 // ADDED FOR §96: pointer locks, confinement and relative motion, which is what
 // a game's mouse-look is made of. See `crate::hold` for the arithmetic and
 // `State::update_pointer_hold` for the policy.
@@ -136,9 +142,17 @@ use crate::platform::{
     CursorSpec, Edge, FromUi, IconImage, PopupBounds, ToUi, Ui, WindowId, WindowKind,
 };
 use crate::surface::{
-    bars, decorator, fold_caption, Agreed, Bars, Decorator, PixelError, PixelFormat, PixelSource,
-    Rect, Shadow, ShmSource,
+    bars, decorator, fold_caption, view_of, Agreed, Bars, Decorator, PixelError, PixelFormat,
+    PixelSource, Rect, Shadow, ShmSource, SinglePixelSource, View,
 };
+// §102: the three globals a nested compositor needs from its host.
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind as PresentedKind;
+use smithay::wayland::presentation::{
+    PresentationFeedbackCachedState, PresentationFeedbackCallback, PresentationState, Refresh,
+};
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::viewporter::{ensure_viewport_valid, ViewportCachedState, ViewporterState};
+use smithay::{delegate_presentation, delegate_single_pixel_buffer, delegate_viewporter};
 
 /// Which decoration mode the compositor advertises, and answers with.
 ///
@@ -283,6 +297,22 @@ impl Role {
 }
 
 /// One toplevel or popup, from the Wayland side.
+/// §102. A viewported surface's buffer and the view it was last drawn through;
+/// see `State::viewed`.
+struct Viewed {
+    raw: Shadow,
+    view: View,
+}
+
+/// §102. The globals `--nested-compositor-globals` adds. Held so they live as
+/// long as the compositor; nothing reads them, because smithay's dispatch is
+/// on the types.
+struct NestedGlobals {
+    _viewporter: ViewporterState,
+    _single_pixel: SinglePixelBufferState,
+    _presentation: PresentationState,
+}
+
 struct Window {
     id: WindowId,
     role: Role,
@@ -422,6 +452,11 @@ pub struct State {
     /// they happen wherever the last motion was — so the compositor has to
     /// remember.
     pointer_at: (f64, f64),
+    /// §102.3: the timestamp of the last input event the platform stamped,
+    /// which is what an event the compositor makes up itself — a motion
+    /// re-delivered because the scene moved under a still pointer, a `leave`
+    /// for a window that went away — is stamped with. See [`Self::input_ms`].
+    last_input_ms: Option<u32>,
     /// Which surface each live touch contact landed on.
     ///
     /// ADDED FOR §40, to answer one question smithay will not: **when a
@@ -523,6 +558,18 @@ pub struct State {
     /// `surface.rs`) while still being able to redraw a subsurface that has not
     /// committed this frame.
     staging: HashMap<WlSurface, Shadow>,
+    /// §102: the buffer behind every surface whose viewport makes its picture
+    /// something other than the buffer itself, at the buffer's own size.
+    ///
+    /// For those surfaces `staging` holds the picture at the **surface's** size
+    /// (the viewport's destination), because every reader of `staging` — the
+    /// tree's bounds, the window's size, the hit test, `mapped_windows` —
+    /// wants the surface's size and must not have to know about viewports. The
+    /// buffer is kept beside it so that a commit which changes only the
+    /// viewport (KWin's, when its window is resized: a new destination and no
+    /// new buffer) can redraw the picture, and so that damage can stay
+    /// incremental.
+    viewed: HashMap<WlSurface, Viewed>,
     windows: HashMap<WlSurface, Window>,
     /// Every surface that has created a decoration object, on either protocol.
     ///
@@ -546,6 +593,22 @@ pub struct State {
     /// Callbacks of surfaces that are not windows — subsurfaces and cursors —
     /// waiting for the next tick, with the surface they were asked on.
     pending_callbacks: Vec<(WlCallback, u32)>,
+    /// §102: `wp_presentation_feedback`s whose commit has been applied, with
+    /// the surface they were asked on, waiting for the tick that answers them
+    /// — the same tick that answers frame callbacks, which is the moment this
+    /// compositor calls a frame shown (§88).
+    feedback: Vec<(PresentationFeedbackCallback, WlSurface)>,
+    /// §102: the frame clock's tick count, `presented`'s `seq`.
+    present_seq: u64,
+    /// §102: how many feedbacks were answered each way, for the log line at a
+    /// window's end — the number a nested KWin's frame rate is.
+    feedback_presented: u64,
+    feedback_discarded: u64,
+    feedback_superseded: u64,
+    /// §102: `Some` when `--nested-compositor-globals` was given, and then the
+    /// three globals exist. `None` is every session before §102, with exactly
+    /// the globals it had.
+    nested: Option<NestedGlobals>,
     /// Synthesise an icon at map time, so the platform's icon path is executed
     /// by something rather than merely compiled.
     debug_icon: bool,
@@ -731,6 +794,7 @@ impl State {
         layout: &str,
         output_size: (i32, i32),
         decorations: Decorations,
+        nested_globals: bool,
     ) -> Self {
         let mut seat_state = SeatState::new();
         // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
@@ -904,6 +968,24 @@ impl State {
         // looks like a rendering bug rather than a negotiation one.
         println!("wc-compositor: decorations: manager default is {decorations:?}");
 
+        // §102. A nested compositor's host must offer these three — KWin's
+        // Wayland backend exits at startup without any one of them — and no
+        // session before §102 offered them. They stay behind a flag because a
+        // global that is offered is used: GTK draws through `wp_viewporter`
+        // whenever it exists, and Firefox on that path has not been measured.
+        let nested = nested_globals.then(|| {
+            println!(
+                "wc-compositor: nested-compositor globals: wp_viewporter, \
+                 wp_single_pixel_buffer_manager_v1, wp_presentation (clock {})",
+                crate::tick::PRESENTATION_CLOCK_ID
+            );
+            NestedGlobals {
+                _viewporter: ViewporterState::new::<State>(dh),
+                _single_pixel: SinglePixelBufferState::new::<State>(dh),
+                _presentation: PresentationState::new::<State>(dh, crate::tick::PRESENTATION_CLOCK_ID),
+            }
+        });
+
         State {
             compositor: CompositorState::new::<State>(dh),
             shm: ShmState::new::<State>(dh, Vec::new()),
@@ -925,6 +1007,7 @@ impl State {
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
+            last_input_ms: None,
             touch_contacts: Vec::new(),
             // ADDED FOR STAGE 12. Version 2 of the protocol, which is what
             // smithay's global advertises and what adds `dnd_ask` and
@@ -942,14 +1025,23 @@ impl State {
             seat,
             ui,
             events,
-            sources: vec![Box::new(ShmSource)],
+            // §102: a single-pixel buffer is "read" like any other, and only
+            // exists when the nested-compositor globals do.
+            sources: vec![Box::new(ShmSource), Box::new(SinglePixelSource)],
             staging: HashMap::new(),
+            viewed: HashMap::new(),
             windows: HashMap::new(),
             negotiated_decoration: HashMap::new(),
             next_id: 1,
             started: Instant::now(),
             frame_clock: crate::tick::FrameClock::new(),
             pending_callbacks: Vec::new(),
+            feedback: Vec::new(),
+            present_seq: 0,
+            feedback_presented: 0,
+            feedback_discarded: 0,
+            feedback_superseded: 0,
+            nested,
             debug_icon,
             icons: crate::icon::IconStore::default(),
             _icon_manager: icon_manager,
@@ -1002,6 +1094,31 @@ impl State {
         self.started.elapsed().as_millis() as u32
     }
 
+    /// The timestamp for an input event the compositor sends on its own
+    /// account: the last one the platform stamped, or [`Self::now_ms`] before
+    /// there was any.
+    ///
+    /// ADDED FOR §102.3. Input events carry the platform's clock — on Win32
+    /// `GetMessageTime`, milliseconds since the guest booted — and the events
+    /// this side makes up (a motion re-delivered because a commit moved the
+    /// scene under a still pointer, a `leave` for a window that went away)
+    /// carried `now_ms`, milliseconds since this process started. Measured
+    /// with KWin nested under the local harness: `motion(341995977, …)` from
+    /// the mouse, then `motion(342472, …)` from the commit that followed, two
+    /// per KWin frame — the client's clock jumping back by four days and
+    /// forward again sixty times a second. KWin stamps the events it forwards
+    /// to its own clients with these, so every one of them saw it too.
+    /// `wl_pointer` leaves the base undefined but not the order: one seat,
+    /// one clock.
+    ///
+    /// The last stamp rather than an extrapolation from it, because a stamp
+    /// made up here must not be later than the platform's next one — a
+    /// re-delivered motion happens "at" the last real event, which is also
+    /// what it re-states.
+    fn input_ms(&self) -> u32 {
+        self.last_input_ms.unwrap_or_else(|| self.now_ms())
+    }
+
     /// How long the loop may sleep before the next frame tick.
     pub fn until_frame(&self) -> std::time::Duration {
         self.frame_clock.until_next(Instant::now())
@@ -1018,6 +1135,8 @@ impl State {
         if !self.frame_clock.due(Instant::now()) {
             return;
         }
+        self.present_seq += 1;
+        self.answer_feedback();
         let now = self.now_ms();
         for (root, window) in self.windows.iter_mut() {
             if sv_transport::frametrace::enabled() && !window.frame_callbacks.is_empty() {
@@ -1050,6 +1169,47 @@ impl State {
             }
             for (cb, _) in self.pending_callbacks.drain(..) {
                 cb.done(now);
+            }
+        }
+    }
+
+    /// Answer every presentation feedback waiting for this tick.
+    ///
+    /// ADDED FOR §102. `presented` for a commit whose surface is part of a
+    /// window that is up — mapped and not minimised — and still has a picture;
+    /// `discarded` for anything else (a cursor, a surface of a window that is
+    /// not on screen, one destroyed since), which is the protocol's "the
+    /// content update was never displayed".
+    ///
+    /// **Shown means "on this tick", the same moment frame callbacks are
+    /// answered**, not "after the platform painted it". The paint is the UI
+    /// thread's and happens on `WM_PAINT`, which this thread cannot see; the
+    /// tick is the frame clock §88 put on DWM's vblank where there is one, and
+    /// it is what a client paced by frame callbacks already treats as the
+    /// display's rhythm. KWin's render loop advances on `presented` and with no
+    /// answer at all stalls after its first frame, so a timely approximation is
+    /// the thing that matters; across the proxy the timestamp is replaced by
+    /// the Linux host's own clock anyway (`wc-proxy`, §102).
+    ///
+    /// No flags: this compositor cannot say the frame was tied to a vblank or
+    /// timed by hardware, and zero is the protocol's way of not claiming it.
+    fn answer_feedback(&mut self) {
+        if self.feedback.is_empty() {
+            return;
+        }
+        let time = crate::tick::presentation_now();
+        let refresh = Refresh::fixed(self.frame_clock.period());
+        for (fb, surface) in std::mem::take(&mut self.feedback) {
+            let root = root_of(&surface);
+            let shown = surface.is_alive()
+                && self.staging.contains_key(&surface)
+                && self.windows.get(&root).is_some_and(|w| w.mapped && !w.minimized);
+            if shown {
+                fb.presented(&self.output, time, refresh, self.present_seq, PresentedKind::empty());
+                self.feedback_presented += 1;
+            } else {
+                fb.discarded();
+                self.feedback_discarded += 1;
             }
         }
     }
@@ -1134,6 +1294,17 @@ impl State {
                 && crate::platform::trace_input("wc.in_tx", &event)
             {
                 self.trace_inputs += 1;
+            }
+            // §102.3: the clock the made-up events borrow. See `input_ms`.
+            match event {
+                FromUi::Key { time, .. }
+                | FromUi::PointerEnter { time, .. }
+                | FromUi::PointerMotion { time, .. }
+                | FromUi::PointerLeave { time, .. }
+                | FromUi::PointerRelative { time, .. }
+                | FromUi::PointerButton { time, .. }
+                | FromUi::PointerAxis { time, .. } => self.last_input_ms = Some(time),
+                _ => {}
             }
             match event {
                 FromUi::Stopped => self.stopped = true,
@@ -1601,6 +1772,15 @@ impl State {
             });
             accepted.then_some((surface, origin))
         })
+    }
+
+    /// §102.3: where `surface` has its origin in its window's pixels now —
+    /// what `surface_under` would hand smithay for it — or `None` when it is
+    /// in no window's tree. [`TreeClickGrab`]'s question.
+    fn origin_of_surface(&self, surface: &WlSurface) -> Option<(f64, f64)> {
+        let root = root_of(surface);
+        let window = self.windows.get(&root)?;
+        origin_in_placed(window.content_offset, &placed_tree(&root), surface)
     }
 
     /// §85. The toplevels that exist now, mapped or not: a toplevel that has
@@ -2188,7 +2368,7 @@ impl State {
     /// back with the next motion the platform reports after the loop.
     fn hand_pointer_to_platform(&mut self, id: WindowId) {
         let pointer = self.pointer.clone();
-        let time = self.now_ms();
+        let time = self.input_ms();
         if pointer.is_grabbed() {
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
         }
@@ -2262,6 +2442,19 @@ impl State {
                 state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
             },
         );
+        // §102.3: the press installed smithay's `ClickGrab`, whose origin is
+        // frozen at the press; swap in the one whose origin follows the
+        // surface. Same start data, same serial. See `TreeClickGrab`.
+        if pressed {
+            let click = pointer
+                .with_grab(|serial, grab| {
+                    grab.is::<ClickGrab<State>>().then(|| (serial, grab.start_data().clone()))
+                })
+                .flatten();
+            if let Some((serial, start_data)) = click {
+                pointer.set_grab(self, TreeClickGrab { start_data }, serial, Focus::Keep);
+            }
+        }
         pointer.frame(self);
         // **After the button, and that ordering is the protocol's.** §75.
         //
@@ -2623,8 +2816,115 @@ impl State {
         toplevel.send_pending_configure();
     }
 
+    /// §102: the committed viewport of `surface` — source rectangle and
+    /// destination size, either possibly unset — and its buffer scale.
+    ///
+    /// `None` without the nested-compositor globals, where no viewport can
+    /// exist, so that the cache is not even asked: a session without the flag
+    /// runs exactly the code it ran before §102.
+    #[allow(clippy::type_complexity)]
+    fn viewport_of(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(Option<(f64, f64, f64, f64)>, Option<(i32, i32)>, i32)> {
+        self.nested.as_ref()?;
+        Some(compositor::with_states(surface, |states| {
+            let vp = *states.cached_state.get::<ViewportCachedState>().current();
+            let scale = states.cached_state.get::<SurfaceAttributes>().current().buffer_scale;
+            (
+                vp.src.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
+                vp.dst.map(|d| (d.w, d.h)),
+                scale,
+            )
+        }))
+    }
+
+    /// §102: a commit with no new buffer may still have changed the viewport,
+    /// and then the surface's picture and size have changed.
+    ///
+    /// This is KWin's resize: the window is configured to a new size, KWin
+    /// sets its main surface's viewport destination to it and commits — and
+    /// the buffer, its one black pixel, was attached once at startup and is
+    /// never attached again, so the buffer path never sees the new size.
+    /// Measured under Wine: a 900x600 configure is answered with
+    /// `set_destination(900, 600)` on the main surface and new 900x600 layer
+    /// buffers, and the window's picture is 900x600 from the next frame.
+    ///
+    /// Redraws from the kept buffer (`State::viewed`), or from the surface's
+    /// own pixels when it is gaining a view now, and recomposes the window.
+    fn reapply_view(&mut self, surface: &WlSurface) {
+        let Some((src, dst, scale)) = self.viewport_of(surface) else { return };
+        let changed = if let Some(entry) = self.viewed.get(surface) {
+            match view_of((entry.raw.width(), entry.raw.height()), scale, src, dst) {
+                Some(view) if view == entry.view => false,
+                Some(view) => {
+                    let entry = self.viewed.get_mut(surface).expect("just read");
+                    entry.view = view;
+                    let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+                    staging.scale_from(&entry.raw, &view, None);
+                    true
+                }
+                None => {
+                    let entry = self.viewed.remove(surface).expect("just read");
+                    self.staging.insert(surface.clone(), entry.raw);
+                    true
+                }
+            }
+        } else {
+            let Some(shown) = self.staging.get(surface).filter(|s| !s.is_empty()) else { return };
+            match view_of((shown.width(), shown.height()), scale, src, dst) {
+                None => false,
+                Some(view) => {
+                    let raw = self.staging.remove(surface).expect("just read");
+                    let mut staging = Shadow::empty();
+                    staging.scale_from(&raw, &view, None);
+                    self.staging.insert(surface.clone(), staging);
+                    self.viewed.insert(surface.clone(), Viewed { raw, view });
+                    true
+                }
+            }
+        };
+        if !changed {
+            return;
+        }
+        let root = root_of(surface);
+        if !self.windows.get(&root).is_some_and(|w| w.mapped) {
+            return;
+        }
+        let (_, w, h) = self.compose_tree(&root, surface, &[]);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let window = &self.windows[&root];
+        let id = window.id;
+        // The window follows a client that is still choosing its size, as
+        // §91 and §96 have it on the other two paths; one that was configured
+        // to a size is catching up with it and is not followed.
+        let client_chooses = window.role.toplevel().is_some_and(|t| {
+            t.with_pending_state(|s| {
+                s.size.is_none()
+                    && !s.states.contains(xdg_state::Maximized)
+                    && !s.states.contains(xdg_state::Fullscreen)
+            })
+        });
+        if client_chooses && window.shown_size != (w, h) {
+            if let Some(window) = self.windows.get_mut(&root) {
+                window.shown_size = (w, h);
+            }
+            println!("wc-compositor: window {id} client chose {w}x{h} by its viewport; the window follows");
+            self.ui.send(ToUi::Resize { id, width: w, height: h });
+        }
+        self.ui.send(ToUi::Present { id, damage: vec![Rect::new(0, 0, w, h)] });
+    }
+
     /// Copy a committed buffer into the shadow and tell the platform.
-    fn present(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer, damage: Vec<Rect>) {
+    fn present(
+        &mut self,
+        surface: &WlSurface,
+        buffer: &wl_buffer::WlBuffer,
+        damage: Vec<Rect>,
+        surface_damage: bool,
+    ) {
         // REWRITTEN FOR STAGE 9. Until this stage a window's shadow *was* one
         // client buffer, and every surface that was not a toplevel had its
         // pixels thrown away. That is exactly wrong for the client this project
@@ -2640,7 +2940,11 @@ impl State {
         let is_root_of_a_window = self.windows.contains_key(&root);
 
         let read_started = Instant::now();
+        // §102: the viewport and buffer scale this commit applied, or `None`
+        // when the nested-compositor globals are off and no viewport can exist.
+        let viewport = self.viewport_of(surface);
         let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+        let viewed = &mut self.viewed;
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
         let mut served_by = "";
         // Ask each source in turn. Today there is one; the loop is what lets a
@@ -2648,7 +2952,42 @@ impl State {
         // without this function changing (docs/goal-firefox.md).
         for source in &self.sources {
             let read = source.with_pixels(buffer, &mut |bytes, spec| {
-                result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                let Some((src, dst, scale)) = viewport else {
+                    result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                    return;
+                };
+                // §102. `out_of_buffer` is checked against the buffer the
+                // commit carried, which only now has a size; smithay posts the
+                // error, and the client is gone once this dispatch ends.
+                let logical = (spec.width / scale.max(1), spec.height / scale.max(1));
+                if !compositor::with_states(surface, |st| ensure_viewport_valid(st, logical.into())) {
+                    return;
+                }
+                match view_of((spec.width, spec.height), scale, src, dst) {
+                    None => {
+                        // Leaving a view: the shadow holds the old view's
+                        // picture, so it is started again and the blit below
+                        // copies the whole buffer rather than its damage.
+                        if viewed.remove(surface).is_some() {
+                            *staging = Shadow::empty();
+                        }
+                        result = Some((staging.blit(bytes, spec, &damage), spec.width, spec.height));
+                    }
+                    Some(view) => {
+                        let entry = viewed
+                            .entry(surface.clone())
+                            .or_insert_with(|| Viewed { raw: Shadow::empty(), view });
+                        // Surface damage is in surface coordinates, which a
+                        // view makes different from the buffer's; rather than
+                        // invert the view, the whole buffer is taken.
+                        let whole = [Rect::new(0, 0, spec.width, spec.height)];
+                        let written = entry.raw.blit(bytes, spec, if surface_damage { &whole } else { &damage });
+                        let rects = (entry.view == view).then(|| view.map_damage(&written));
+                        entry.view = view;
+                        let drawn = staging.scale_from(&entry.raw, &view, rects.as_deref());
+                        result = Some((drawn, view.dst.0, view.dst.1));
+                    }
+                }
             });
             match read {
                 Ok(()) => {
@@ -2691,6 +3030,24 @@ impl State {
             // A subsurface of a window that has not mapped yet, or a cursor
             // surface for a seat that has since been given a different one.
             // The pixels are kept; there is nowhere to put them.
+            return;
+        }
+        // §102. **A subsurface does not map a window whose root has never had
+        // a buffer and which declared no geometry.** The protocol's own rule
+        // ("a sub-surface is mapped when the parent is mapped"), applied where
+        // it used to cost a visible jump: KWin's synchronised subsurfaces are
+        // applied in the same transaction as its main surface and reach this
+        // function first, so the window was mapped at the size of whatever
+        // layer came first — a 32x32 cursor-sized one at (636, 396) — shifted
+        // by that offset, and resized to the main surface's 1280x800 a moment
+        // later. The root's own commit is the next call. A declared geometry
+        // is left as it was: that is Firefox, whose subsurface-first map at
+        // its geometry §9 measured and every later section relies on.
+        if surface != &root
+            && !self.staging.contains_key(&root)
+            && !self.windows[&root].mapped
+            && declared_geometry(&root).is_none()
+        {
             return;
         }
 
@@ -3644,6 +4001,186 @@ pub(crate) fn surface_origin(content_offset: (i32, i32)) -> (f64, f64) {
     (-f64::from(content_offset.0), -f64::from(content_offset.1))
 }
 
+/// Where `which` has its origin in its window's pixels *now*, given the
+/// window's [`Window::content_offset`] and [`placed_tree`]'s list; `None` when
+/// it is no longer in the tree.
+///
+/// ADDED FOR §102.3, as the arithmetic [`State::surface_under`] does for the
+/// surface it picks — root origin by [`surface_origin`], plus the placement —
+/// for a surface that was picked earlier. Generic over the key so the rule can
+/// be tested without a live display, for the reason `accepts_input_at` gives.
+fn origin_in_placed<K: PartialEq>(
+    content_offset: (i32, i32),
+    placed: &[(K, (i32, i32))],
+    which: &K,
+) -> Option<(f64, f64)> {
+    let (rx, ry) = surface_origin(content_offset);
+    placed
+        .iter()
+        .find(|(k, _)| k == which)
+        .map(|(_, loc)| (rx + f64::from(loc.0), ry + f64::from(loc.1)))
+}
+
+/// smithay's click grab, with one change: the surface a button went down on
+/// is followed when it **moves** while the button is held.
+///
+/// ADDED FOR §102.3. smithay's `ClickGrab` keeps the pressed surface — which
+/// is the protocol's implicit grab — by re-sending the `(surface, origin)` pair
+/// it captured at the press with every motion, and ignores the one the motion
+/// carries. The surface is right; the origin is frozen. Once the client moves
+/// that surface (a `wl_subsurface.set_position` applied by a commit) every
+/// motion reaches it relative to where it *was*.
+///
+/// For most clients that is a rare glitch. For KWin nested on us it is a
+/// runaway, measured under the local harness: KWin with nothing on its
+/// desktop draws its output as a black single-pixel root and puts its cursor
+/// picture in its primary layer — a 32x32 `wl_subsurface` at the pointer
+/// minus the hotspot, moved with `set_position` on every frame — and turns a
+/// `wl_pointer` motion back into a position as *layer position + surface-
+/// local point* (`wayland_backend.cpp`, `Pointer::motion`). Press on the layer
+/// at (316, 316), move the mouse 20 px right: we sent `(24, 4)` against the
+/// frozen origin, KWin read 336 + 24 = 360, moved the layer to 356, the
+/// commit re-delivered `(24, 4)` again, KWin read 380 … one 20 px drag sent
+/// KWin's pointer to the right edge (995) in twenty frames, and the release
+/// landed there. Any click with a pixel of motion in it — every real click —
+/// lands somewhere else. KWin's overlay layers (EGL's `GenericLayer`s, placed
+/// wherever a window is scanned out) are the same shape.
+///
+/// The fix is the arithmetic `surface_under` already does, re-done on every
+/// motion for the surface the press picked rather than the one under the
+/// pointer: the focus stays, the origin follows the tree. A surface that has
+/// left the tree keeps its last origin, which is what smithay did for every
+/// surface.
+///
+/// Installed by [`State::pointer_button`] in place of the `ClickGrab` smithay
+/// sets on a press, with the same start data and serial, so `has_grab(serial)`
+/// (move, resize, `start_drag`) answers exactly as before.
+struct TreeClickGrab {
+    start_data: GrabStartData<State>,
+}
+
+impl PointerGrab<State> for TreeClickGrab {
+    fn motion(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        // The pointer's own lock is held here, so this reads the tree and
+        // never the pointer: `origin_of_surface` touches neither.
+        let focus = self.start_data.focus.as_ref().map(|(surface, was)| {
+            let now = data.origin_of_surface(surface).map(Point::from).unwrap_or(*was);
+            (surface.clone(), now)
+        });
+        handle.motion(data, focus, event);
+    }
+
+    fn relative_motion(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &RelativeMotionEvent,
+    ) {
+        // As smithay's `ClickGrab`: relative motion goes where it was aimed.
+        handle.relative_motion(data, focus, event);
+    }
+
+    fn button(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>, event: &ButtonEvent) {
+        handle.button(data, event);
+        if handle.current_pressed().is_empty() {
+            handle.unset_grab(self, data, event.serial, event.time, false);
+        }
+    }
+
+    fn axis(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>, details: AxisFrame) {
+        handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
+        handle.frame(data);
+    }
+
+    fn gesture_swipe_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeBeginEvent,
+    ) {
+        handle.gesture_swipe_begin(data, event);
+    }
+
+    fn gesture_swipe_update(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeUpdateEvent,
+    ) {
+        handle.gesture_swipe_update(data, event);
+    }
+
+    fn gesture_swipe_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeEndEvent,
+    ) {
+        handle.gesture_swipe_end(data, event);
+    }
+
+    fn gesture_pinch_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchBeginEvent,
+    ) {
+        handle.gesture_pinch_begin(data, event);
+    }
+
+    fn gesture_pinch_update(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchUpdateEvent,
+    ) {
+        handle.gesture_pinch_update(data, event);
+    }
+
+    fn gesture_pinch_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchEndEvent,
+    ) {
+        handle.gesture_pinch_end(data, event);
+    }
+
+    fn gesture_hold_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureHoldBeginEvent,
+    ) {
+        handle.gesture_hold_begin(data, event);
+    }
+
+    fn gesture_hold_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureHoldEndEvent,
+    ) {
+        handle.gesture_hold_end(data, event);
+    }
+
+    fn start_data(&self) -> &GrabStartData<State> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, _data: &mut State) {}
+}
+
 /// The root of `surface`'s subsurface tree — the surface that has the
 /// `xdg_toplevel`, if any.
 ///
@@ -3807,6 +4344,7 @@ impl CompositorHandler for State {
     /// `surface_under` after the surface itself was gone.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.staging.remove(surface);
+        self.viewed.remove(surface);
         let ended: Vec<i32> = self
             .touch_contacts
             .iter()
@@ -3868,6 +4406,28 @@ impl CompositorHandler for State {
                 ),
             );
         }
+        // §102. Presentation feedback rides the same commit, and is answered on
+        // the same tick (`State::answer_feedback`). A feedback still waiting
+        // from an earlier commit of this surface was superseded before any
+        // tick showed it, which the protocol calls discarded.
+        if self.nested.is_some() {
+            let asked = compositor::with_states(surface, |states| {
+                std::mem::take(
+                    &mut states.cached_state.get::<PresentationFeedbackCachedState>().current().callbacks,
+                )
+            });
+            if !asked.is_empty() {
+                let (superseded, kept): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut self.feedback).into_iter().partition(|(_, s)| s == surface);
+                self.feedback = kept;
+                for (fb, _) in superseded {
+                    fb.discarded();
+                    self.feedback_discarded += 1;
+                    self.feedback_superseded += 1;
+                }
+                self.feedback.extend(asked.into_iter().map(|fb| (fb, surface.clone())));
+            }
+        }
         if let Some(window) = self.windows.get_mut(surface) {
             window.frame_callbacks.extend(callbacks);
         } else {
@@ -3883,13 +4443,17 @@ impl CompositorHandler for State {
         // and buffer coordinates and the blit to rotate or subsample, which is
         // a renderer's job and not this stage's. Saying so out loud beats
         // silently drawing the wrong thing.
-        if scale != 1 || transform != wl_output::Transform::Normal {
+        // §102: with a viewport the scale *is* honoured (`surface::view_of`).
+        if (scale != 1 && !self.viewed.contains_key(surface)) || transform != wl_output::Transform::Normal {
             eprintln!(
                 "wc-compositor: buffer scale {scale} / transform {transform:?} is not implemented; \
                  drawing the buffer unscaled"
             );
         }
 
+        // §102. Whether any of it is in surface coordinates, which a viewport
+        // makes different from buffer coordinates (see `present`).
+        let surface_damage = damage.iter().any(|d| matches!(d, Damage::Surface(_)));
         let rects: Vec<Rect> = damage
             .into_iter()
             .map(|d| match d {
@@ -3923,7 +4487,7 @@ impl CompositorHandler for State {
                 if Self::is_cursor_surface(surface) {
                     self.cursor_committed(surface, &buffer);
                 }
-                self.present(surface, &buffer, rects)
+                self.present(surface, &buffer, rects, surface_damage)
             }
             Some(BufferAssignment::Removed) => {
                 // **The staging entry goes with the buffer, and until §40 it
@@ -3938,6 +4502,7 @@ impl CompositorHandler for State {
                 // it is the same leak `cursor_surface` above already guards
                 // against by hand.
                 self.staging.remove(surface);
+                self.viewed.remove(surface);
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
                     // exists, so the window is not destroyed — it has nothing
@@ -4012,6 +4577,7 @@ impl CompositorHandler for State {
             // path, where the tree is settled, and to §40's hit test, which
             // reads subsurface positions live and never caches them.
             None => {
+                self.reapply_view(surface);
                 let declared = declared_geometry(surface)
                     .filter(|r| r.size.w > 0 && r.size.h > 0);
                 if let (true, Some(r)) = (self.windows.contains_key(surface), declared) {
@@ -4116,7 +4682,7 @@ impl CompositorHandler for State {
             && self.by_id(over).map(|w| w.role.surface().clone()) == Some(root_of(surface))
         {
             let (x, y) = self.pointer_at;
-            self.pointer_motion(Some(over), x, y, self.now_ms());
+            self.pointer_motion(Some(over), x, y, self.input_ms());
         }
         // §96: a commit can move or unmap the held surface, or change the
         // constraint's region; and a held pointer's hold is re-checked.
@@ -4588,7 +5154,7 @@ impl XdgShellHandler for State {
                 self.deactivation.take();
             }
             if self.pointer_focus == Some(id) {
-                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+                self.pointer_motion(None, 0.0, 0.0, self.input_ms());
             }
         }
         if let Some(window) = self.windows.remove(surface.wl_surface()) {
@@ -4596,6 +5162,13 @@ impl XdgShellHandler for State {
                 "wc-compositor: xdg_toplevel destroyed -> window {} ({} frames presented)",
                 window.id, window.presented
             );
+            if self.nested.is_some() {
+                println!(
+                    "wc-compositor: presentation feedback so far: {} presented, {} discarded \
+                     ({} superseded before a tick)",
+                    self.feedback_presented, self.feedback_discarded, self.feedback_superseded
+                );
+            }
             self.ui.send(ToUi::Destroy { id: window.id });
             // §96: if it held the pointer, the platform is told to let go.
             self.update_pointer_hold();
@@ -4758,7 +5331,7 @@ impl XdgShellHandler for State {
                 }
             }
             if self.pointer_focus == Some(id) {
-                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+                self.pointer_motion(None, 0.0, 0.0, self.input_ms());
             }
             if let Some(i) = self.popup_grabs.iter().position(|&g| g == id) {
                 // A grab destroyed from the middle takes the ones above it
@@ -5788,6 +6361,10 @@ delegate_xdg_decoration!(State);
 delegate_kde_decoration!(State);
 // ADDED FOR STAGE 12. `wp_cursor_shape_manager_v1` and its per-pointer device.
 delegate_cursor_shape!(State);
+// §102. Dispatch only; the globals exist with `--nested-compositor-globals`.
+delegate_viewporter!(State);
+delegate_single_pixel_buffer!(State);
+delegate_presentation!(State);
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -5980,6 +6557,90 @@ mod tests {
     #[test]
     fn a_negative_inset_shifts_the_other_way() {
         assert_eq!(delivered((-5, -7), (100.0, 100.0)), (95.0, 93.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // §102.3: KWin's layers, and a held surface that moves
+    // -----------------------------------------------------------------------
+
+    mod held_surface {
+        use crate::state::origin_in_placed;
+
+        /// What a client is sent for a pointer at `window_pixel` over a
+        /// surface whose origin is `origin` (smithay's subtraction).
+        fn local(origin: (f64, f64), window_pixel: (f64, f64)) -> (f64, f64) {
+            (window_pixel.0 - origin.0, window_pixel.1 - origin.1)
+        }
+
+        /// What KWin makes of it: layer position + surface-local
+        /// (`wayland_backend.cpp`, the `Pointer::motion` handler).
+        fn kwin_reads(layer_at: (i32, i32), local: (f64, f64)) -> (f64, f64) {
+            (f64::from(layer_at.0) + local.0, f64::from(layer_at.1) + local.1)
+        }
+
+        /// KWin's tree as measured under the harness: the root (a 1x1
+        /// single-pixel buffer viewported to the output, no geometry, so no
+        /// inset) and its primary layer, a viewported subsurface at (0, 0)
+        /// covering the output. Every window pixel reaches KWin as itself,
+        /// corners included.
+        #[test]
+        fn kwins_full_output_layer_is_the_identity() {
+            let placed = [("root", (0, 0)), ("layer", (0, 0))];
+            let origin = origin_in_placed((0, 0), &placed, &"layer").unwrap();
+            for p in [(0.0, 0.0), (999.0, 0.0), (0.0, 699.0), (999.0, 699.0), (500.0, 350.0)] {
+                assert_eq!(kwin_reads((0, 0), local(origin, p)), p);
+            }
+        }
+
+        /// The case the report read as a wrong origin and is not: an empty
+        /// KWin puts its cursor picture in the primary layer, 32x32 at the
+        /// pointer minus the hotspot. `enter(…, 4, 4)` for a pointer at
+        /// (300, 300) is right, because KWin itself put the layer at (296, 296).
+        #[test]
+        fn a_cursor_sized_layer_under_the_pointer_is_entered_at_the_hotspot() {
+            let placed = [("root", (0, 0)), ("layer", (296, 296))];
+            let origin = origin_in_placed((0, 0), &placed, &"layer").unwrap();
+            assert_eq!(local(origin, (300.0, 300.0)), (4.0, 4.0));
+            assert_eq!(kwin_reads((296, 296), local(origin, (320.0, 320.0))), (320.0, 320.0));
+        }
+
+        /// **The runaway.** A button held on that layer, KWin moving it with
+        /// the pointer: the origin must be the layer's position *now*. With
+        /// the one frozen at the press (smithay's `ClickGrab`), KWin reads a
+        /// point one move ahead of the pointer, moves the layer there, and is
+        /// sent the same local point again — measured: a 20 px drag took
+        /// KWin's pointer from 336 to the output's right edge.
+        #[test]
+        fn a_held_layer_that_moves_is_followed() {
+            // Pressed with the layer at (316, 316), pointer at (320, 320).
+            let pressed = [("root", (0, 0)), ("layer", (316, 316))];
+            let frozen = origin_in_placed((0, 0), &pressed, &"layer").unwrap();
+            // The pointer moves to (340, 320); KWin moves its layer to
+            // (336, 316) and the commit applies.
+            let moved = [("root", (0, 0)), ("layer", (336, 316))];
+            let now = origin_in_placed((0, 0), &moved, &"layer").unwrap();
+            assert_eq!(kwin_reads((336, 316), local(now, (340.0, 320.0))), (340.0, 320.0));
+            // What the frozen origin made of the same pointer.
+            assert_eq!(kwin_reads((336, 316), local(frozen, (340.0, 320.0))), (360.0, 320.0));
+        }
+
+        /// Firefox's tree is unchanged by any of this: a GTK CSD root with a
+        /// declared inset and the browser in a subsurface at that inset, no
+        /// viewport. The subsurface's origin is window pixel (0, 0).
+        #[test]
+        fn a_gtk_csd_subsurface_at_the_inset_is_at_the_window_corner() {
+            let placed = [("csd", (0, 0)), ("browser", (26, 23))];
+            assert_eq!(origin_in_placed((26, 23), &placed, &"browser"), Some((0.0, 0.0)));
+            assert_eq!(origin_in_placed((26, 23), &placed, &"csd"), Some((-26.0, -23.0)));
+        }
+
+        /// A surface that has left the tree has no origin to follow; the grab
+        /// keeps the last one.
+        #[test]
+        fn a_surface_out_of_the_tree_has_no_origin() {
+            let placed = [("root", (0, 0))];
+            assert_eq!(origin_in_placed((0, 0), &placed, &"layer"), None);
+        }
     }
 
     // -----------------------------------------------------------------------

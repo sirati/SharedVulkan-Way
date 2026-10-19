@@ -563,6 +563,305 @@ impl PixelSource for ShmSource {
 }
 
 // ---------------------------------------------------------------------------
+// §102: single-pixel buffers and viewports, for a nested compositor
+// ---------------------------------------------------------------------------
+
+/// A `wp_single_pixel_buffer_manager_v1` buffer: one pixel of one colour.
+///
+/// ADDED FOR §102. KWin's Wayland backend gives its window's main surface
+/// exactly one of these — opaque black, stretched by a viewport to the
+/// output's size — and puts the picture in subsurfaces above it. It is a
+/// [`PixelSource`] rather than a special case in the commit path because that
+/// is what the seam was made for: the pixel is "read" like any other buffer,
+/// and the viewport, not this source, makes it the size of the window.
+///
+/// The protocol's channels are premultiplied and span the whole `u32` range;
+/// the byte is the nearest 8-bit value (smithay's `rgba8888`). An opaque colour
+/// becomes `Xrgb8888`, so a window whose root is one is no more "translucent"
+/// to the platform than a client that drew the same black into `wl_shm`.
+pub struct SinglePixelSource;
+
+impl PixelSource for SinglePixelSource {
+    fn name(&self) -> &'static str {
+        "wp_single_pixel_buffer"
+    }
+
+    fn with_pixels(
+        &self,
+        buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+        f: &mut dyn FnMut(&[u8], BufferSpec),
+    ) -> Result<(), PixelError> {
+        let Ok(data) = smithay::wayland::single_pixel_buffer::get_single_pixel_buffer(buffer)
+        else {
+            return Err(PixelError::UnknownSource);
+        };
+        let [r, g, b, a] = data.rgba8888();
+        let format = if data.has_alpha() { PixelFormat::Argb8888 } else { PixelFormat::Xrgb8888 };
+        f(&single_pixel_bgra([r, g, b, a]), BufferSpec { width: 1, height: 1, stride: 4, format });
+        Ok(())
+    }
+}
+
+/// The one pixel in memory order, which is B, G, R, A (this module's header).
+fn single_pixel_bgra([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    [b, g, r, a]
+}
+
+/// How a surface's buffer becomes its picture, when that is not one buffer
+/// pixel per surface pixel.
+///
+/// ADDED FOR §102, for `wp_viewporter`. `src` is the part of the buffer that is
+/// shown, **in buffer pixels** (the protocol's surface-local source rectangle
+/// multiplied by the buffer scale); `dst` is the surface's size, which is what
+/// the surface *is* to everything else in this compositor — window sizing,
+/// subsurface layout, the hit test and damage all read the staging shadow, and
+/// for a viewported surface that shadow is `dst` big.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    pub src: (f64, f64, f64, f64),
+    pub dst: (i32, i32),
+}
+
+/// The view a surface's committed viewport asks for, or `None` when its
+/// buffer is to be drawn as it always was.
+///
+/// `src` and `dst` are the viewport's double-buffered state as smithay keeps it
+/// (`ViewportCachedState`), `scale` the surface's buffer scale.
+///
+/// **No viewport is `None` whatever the scale**, and that is deliberate: this
+/// compositor has always drawn a buffer of scale ≠ 1 unscaled (and said so in
+/// the log), every client measured before §102 is on that path, and §102 is
+/// not the place to change what they see. A viewport that comes out as one
+/// buffer pixel per surface pixel is `None` too — KWin's primary layer is
+/// exactly that, a 1280x800 source shown at 1280x800 — so the common case
+/// costs nothing beyond what an ordinary `wl_shm` surface costs.
+pub fn view_of(
+    buffer: (i32, i32),
+    scale: i32,
+    src: Option<(f64, f64, f64, f64)>,
+    dst: Option<(i32, i32)>,
+) -> Option<View> {
+    if src.is_none() && dst.is_none() {
+        return None;
+    }
+    let (bw, bh) = buffer;
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+    let s = f64::from(scale.max(1));
+    let src_buf = match src {
+        Some((x, y, w, h)) => (x * s, y * s, w * s, h * s),
+        None => (0.0, 0.0, f64::from(bw), f64::from(bh)),
+    };
+    let dst = match (dst, src) {
+        (Some(d), _) => d,
+        // The protocol: with no destination the surface is the source
+        // rectangle's size, which must then be whole (smithay raises
+        // `bad_size` before the state is applied if it is not).
+        (None, Some((_, _, w, h))) => (w as i32, h as i32),
+        (None, None) => unreachable!("returned above"),
+    };
+    if dst.0 <= 0 || dst.1 <= 0 || src_buf.2 <= 0.0 || src_buf.3 <= 0.0 {
+        return None;
+    }
+    let whole = (0.0, 0.0, f64::from(bw), f64::from(bh));
+    if src_buf == whole && dst == (bw, bh) {
+        return None;
+    }
+    Some(View { src: src_buf, dst })
+}
+
+impl View {
+    /// Where buffer-pixel damage lands on the surface: each rectangle scaled
+    /// by the view, widened by a pixel each way so that rounding can never
+    /// leave a stale edge, and clipped to the surface.
+    pub fn map_damage(&self, damage: &[Rect]) -> Vec<Rect> {
+        let (sx, sy, sw, sh) = self.src;
+        let (dw, dh) = self.dst;
+        let kx = f64::from(dw) / sw;
+        let ky = f64::from(dh) / sh;
+        damage
+            .iter()
+            .filter_map(|r| {
+                let x0 = ((f64::from(r.x) - sx) * kx).floor() as i32 - 1;
+                let y0 = ((f64::from(r.y) - sy) * ky).floor() as i32 - 1;
+                let x1 = ((f64::from(r.x + r.w) - sx) * kx).ceil() as i32 + 1;
+                let y1 = ((f64::from(r.y + r.h) - sy) * ky).ceil() as i32 + 1;
+                Rect::new(x0, y0, x1 - x0, y1 - y0).clip(dw, dh)
+            })
+            .collect()
+    }
+}
+
+impl Shadow {
+    /// Draw `src` into this shadow through `view`: the view's source rectangle
+    /// of `src`, scaled to the view's destination size, which this shadow
+    /// becomes.
+    ///
+    /// ADDED FOR §102. **Nearest-neighbour**, sampling each destination pixel's
+    /// centre. Correctness first: the protocol leaves the filter to the
+    /// compositor, the two cases a nested KWin produces are a 1x1 colour (which
+    /// every filter draws identically) and a layer whose source and destination
+    /// match (which never gets here, see [`view_of`]), and a bilinear filter on
+    /// premultiplied pixels is a renderer's worth of code to be right about.
+    ///
+    /// Only `rects` (in destination pixels) are redrawn, unless the shadow
+    /// changes shape, when everything is; returns what was written, which is
+    /// what the caller damages.
+    pub fn scale_from(&mut self, src: &Shadow, view: &View, rects: Option<&[Rect]>) -> Vec<Rect> {
+        let (dw, dh) = view.dst;
+        if src.is_empty() || dw <= 0 || dh <= 0 {
+            return Vec::new();
+        }
+        let full = Rect::new(0, 0, dw, dh);
+        let reshaped = self.reset(dw, dh, src.format());
+        let owned;
+        let rects: &[Rect] = match rects {
+            Some(r) if !reshaped => r,
+            _ => {
+                owned = [full];
+                &owned
+            }
+        };
+        let bpp = PixelFormat::BYTES_PER_PIXEL;
+        let (sw, sh) = (src.width(), src.height());
+        let (vx, vy, vw, vh) = view.src;
+        // One source column per destination column and one source row per
+        // destination row, worked out once rather than per pixel.
+        let sample = |d: i32, n: i32, origin: f64, len: f64, limit: i32| -> usize {
+            let at = origin + (f64::from(d) + 0.5) * len / f64::from(n);
+            (at.floor() as i32).clamp(0, limit - 1) as usize
+        };
+        let cols: Vec<usize> = (0..dw).map(|x| sample(x, dw, vx, vw, sw)).collect();
+        let dst_stride = self.spec.stride as usize;
+        let src_stride = src.spec.stride as usize;
+        let mut written = Vec::with_capacity(rects.len());
+        for r in rects {
+            let Some(r) = r.clip(dw, dh) else { continue };
+            for y in r.y..r.y + r.h {
+                let sy = sample(y, dh, vy, vh, sh);
+                let row = &src.pixels[sy * src_stride..sy * src_stride + sw as usize * bpp];
+                let d0 = y as usize * dst_stride;
+                for x in r.x..r.x + r.w {
+                    let s = cols[x as usize] * bpp;
+                    let d = d0 + x as usize * bpp;
+                    self.pixels[d..d + bpp].copy_from_slice(&row[s..s + bpp]);
+                }
+            }
+            written.push(r);
+        }
+        written
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn filled(w: i32, h: i32, format: PixelFormat, f: impl Fn(i32, i32) -> [u8; 4]) -> Shadow {
+        let mut s = Shadow::empty();
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                px.extend_from_slice(&f(x, y));
+            }
+        }
+        s.blit(&px, BufferSpec { width: w, height: h, stride: w * 4, format }, &[]);
+        s
+    }
+
+    /// KWin's main surface: a 1x1 opaque black buffer with a destination of
+    /// the output's size. Every pixel of the surface is that black, and the
+    /// surface is the destination's size — which is what the window is sized by.
+    #[test]
+    fn a_single_pixel_stretched_by_a_viewport_fills_the_destination() {
+        let one = filled(1, 1, PixelFormat::Xrgb8888, |_, _| single_pixel_bgra([0, 0, 0, 255]));
+        let view = view_of((1, 1), 1, None, Some((1280, 800))).expect("not the identity");
+        let mut out = Shadow::empty();
+        let written = out.scale_from(&one, &view, None);
+        assert_eq!(written, vec![Rect::new(0, 0, 1280, 800)]);
+        assert_eq!((out.width(), out.height()), (1280, 800));
+        assert!(out.pixels().chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+        assert_eq!(out.format(), PixelFormat::Xrgb8888);
+    }
+
+    /// The colour arrives in B, G, R, A order, and alpha is kept for the blend.
+    #[test]
+    fn a_translucent_single_pixel_keeps_its_alpha() {
+        assert_eq!(single_pixel_bgra([0x80, 0x10, 0x20, 0x80]), [0x20, 0x10, 0x80, 0x80]);
+        let half = filled(1, 1, PixelFormat::Argb8888, |_, _| [0, 0, 0x80, 0x80]);
+        let view = view_of((1, 1), 1, None, Some((2, 1))).unwrap();
+        let mut over = Shadow::empty();
+        over.scale_from(&half, &view, None);
+        let mut canvas = filled(2, 1, PixelFormat::Xrgb8888, |_, _| [0xFF, 0, 0, 0xFF]);
+        canvas.compose_over(&over, (0, 0));
+        // Premultiplied half red over opaque blue: half of each (the blue's
+        // 255 * 127/255 rounds to 0x7F).
+        assert_eq!(&canvas.pixels()[0..4], &[0x7F, 0, 0x80, 0xFF]);
+    }
+
+    /// No viewport, or one that shows the buffer as it is, is the old path.
+    #[test]
+    fn the_identity_is_not_a_view() {
+        assert_eq!(view_of((64, 32), 1, None, None), None);
+        assert_eq!(view_of((64, 32), 2, None, None), None, "scale alone changes nothing");
+        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), Some((64, 32))), None);
+        assert_eq!(view_of((64, 32), 1, None, Some((64, 32))), None);
+        assert_eq!(view_of((64, 32), 1, Some((0.0, 0.0, 64.0, 32.0)), None), None);
+    }
+
+    /// A source rectangle without a destination crops; the surface is the
+    /// rectangle's size, and its pixels are the rectangle's.
+    #[test]
+    fn a_source_alone_crops() {
+        let src = filled(4, 4, PixelFormat::Xrgb8888, |x, y| [x as u8, y as u8, 0, 255]);
+        let view = view_of((4, 4), 1, Some((1.0, 2.0, 2.0, 2.0)), None).unwrap();
+        assert_eq!(view.dst, (2, 2));
+        let mut out = Shadow::empty();
+        out.scale_from(&src, &view, None);
+        assert_eq!(&out.pixels()[0..4], &[1, 2, 0, 255]);
+        assert_eq!(&out.pixels()[12..16], &[2, 3, 0, 255]);
+    }
+
+    /// The source rectangle is in surface coordinates, so the buffer scale
+    /// multiplies it into buffer pixels.
+    #[test]
+    fn the_source_is_scaled_into_buffer_pixels() {
+        let view = view_of((8, 8), 2, Some((1.0, 1.0, 2.0, 2.0)), Some((2, 2))).unwrap();
+        assert_eq!(view.src, (2.0, 2.0, 4.0, 4.0));
+    }
+
+    /// Doubling: every source pixel becomes a 2x2 block.
+    #[test]
+    fn a_destination_twice_the_source_doubles_each_pixel() {
+        let src = filled(2, 1, PixelFormat::Xrgb8888, |x, _| [x as u8 * 100, 0, 0, 255]);
+        let view = view_of((2, 1), 1, None, Some((4, 2))).unwrap();
+        let mut out = Shadow::empty();
+        out.scale_from(&src, &view, None);
+        let firsts: Vec<u8> = out.pixels().chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(firsts, vec![0, 0, 100, 100, 0, 0, 100, 100]);
+    }
+
+    /// Damage in buffer pixels lands, widened, on the surface pixels it
+    /// covers; and only those are redrawn.
+    #[test]
+    fn damage_is_mapped_and_limits_the_redraw() {
+        let view = view_of((10, 10), 1, None, Some((20, 20))).unwrap();
+        assert_eq!(view.map_damage(&[Rect::new(2, 2, 1, 1)]), vec![Rect::new(3, 3, 4, 4)]);
+        assert_eq!(view.map_damage(&[Rect::new(50, 50, 1, 1)]), vec![]);
+
+        let a = filled(10, 10, PixelFormat::Xrgb8888, |_, _| [1, 1, 1, 255]);
+        let b = filled(10, 10, PixelFormat::Xrgb8888, |_, _| [9, 9, 9, 255]);
+        let mut out = Shadow::empty();
+        out.scale_from(&a, &view, None);
+        let w = out.scale_from(&b, &view, Some(&[Rect::new(0, 0, 2, 2)]));
+        assert_eq!(w, vec![Rect::new(0, 0, 2, 2)]);
+        assert_eq!(&out.pixels()[0..4], &[9, 9, 9, 255]);
+        assert_eq!(&out.pixels()[8..12], &[1, 1, 1, 255], "outside the damage");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // STAGE 33: telling a client that decorates itself from one that does not
 // ---------------------------------------------------------------------------
 

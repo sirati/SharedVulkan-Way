@@ -137,6 +137,14 @@ pub struct Config {
     /// and they cross as shared memory; empty, or a VM without the port, and
     /// they cross the ssh tunnel as before, which the log says loudly.
     pub wayland_bell: String,
+    /// §102. `nested-compositor-globals = on` asks the compositor for the three
+    /// globals a nested compositor needs from its host —
+    /// `wp_single_pixel_buffer_manager_v1`, `wp_viewporter` and `wp_presentation`
+    /// (KWin's Wayland backend refuses to start without them). Off by default,
+    /// so a session that runs Firefox sees exactly the globals it was measured
+    /// with: GTK uses `wp_viewporter` whenever it is offered, and that path has
+    /// not been through §95's desktop checks.
+    pub nested_globals: bool,
     pub apps: BTreeMap<String, App>,
 }
 
@@ -165,6 +173,7 @@ impl Default for Config {
             gpu_ivshmem_slot: 0x1d,
             gpu_bell: "org.sirati.svbell.0".into(),
             wayland_bell: "org.sirati.wcbell.0".into(),
+            nested_globals: false,
             apps: BTreeMap::new(),
         }
     }
@@ -279,6 +288,18 @@ impl Config {
                 }
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
+                ("session", "nested-compositor-globals") => {
+                    cfg.nested_globals = match v {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(format!(
+                                "line {}: nested-compositor-globals is on or off, not {v}",
+                                n + 1
+                            ));
+                        }
+                    }
+                }
                 ("session", "audio-volume") => {
                     cfg.audio_volume = u8::try_from(num("audio-volume")?)
                         .ok()
@@ -594,5 +615,15 @@ mod gpu_tests {
         assert_eq!(p("").unwrap().wayland_bell, "org.sirati.wcbell.0");
         assert_eq!(p("wayland-bell =\n").unwrap().wayland_bell, "");
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
+    }
+
+    /// §102. The nested-compositor globals are off unless the ini asks.
+    #[test]
+    fn nested_compositor_globals_are_off_by_default() {
+        let p = |e: &str| Config::parse(&format!("[session]\nhost=u@h\nkey=K\ncompositor=C\nrelay=R\n{e}"));
+        assert!(!p("").unwrap().nested_globals);
+        assert!(p("nested-compositor-globals = on\n").unwrap().nested_globals);
+        assert!(!p("nested-compositor-globals = off\n").unwrap().nested_globals);
+        assert!(p("nested-compositor-globals = yes\n").is_err());
     }
 }

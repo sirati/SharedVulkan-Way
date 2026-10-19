@@ -420,6 +420,11 @@ struct WindowState {
     /// to be *read* to answer that; it is borrowed only for the comparison and
     /// never across a Win32 call, which is this module's rule.
     aumid: RefCell<String>,
+    /// §102: the identity this window is meant to have, whether or not the
+    /// shell's property store took it (Wine's does not implement it). What
+    /// `super::Succession` matches on: which application a window belongs to
+    /// is a fact about the client, not about the taskbar.
+    identity: RefCell<String>,
 
     // --- input, stage 6 ---------------------------------------------------
     /// Whether `TrackMouseEvent` is currently armed for this window.
@@ -1382,6 +1387,9 @@ pub(crate) struct Ui {
 
 thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
+    /// §102: the place of the last named toplevel that closed, for a window of
+    /// the same identity that maps soon after (`super::Succession`).
+    static SUCCESSION: RefCell<Option<super::Succession>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn ui() -> Option<Rc<Ui>> {
@@ -2905,6 +2913,29 @@ fn handle(ui: &Rc<Ui>, cmd: ToUi) {
             hold::on_destroy(ui, id);
             let w = ui.windows.borrow_mut().remove(&id);
             if let Some(w) = w {
+                // §102: a named toplevel leaves its place to the next window of
+                // its identity (the nested desktop's session after its login
+                // screen). Not a minimised one: it has no place on screen.
+                if !matches!(w.kind, WindowKind::Popup { .. })
+                    && w.mapped.get()
+                    && !w.hwnd().is_null()
+                    && super::leaves_succession(&w.identity.borrow())
+                {
+                    // SAFETY: a live window handle, not yet destroyed.
+                    let (iconic, zoomed) =
+                        unsafe { (IsIconic(w.hwnd()) != 0, IsZoomed(w.hwnd()) != 0) };
+                    if !iconic {
+                        let origin = window_origin(w.hwnd());
+                        SUCCESSION.with(|s| {
+                            s.replace(Some(super::Succession {
+                                aumid: w.identity.borrow().clone(),
+                                origin,
+                                maximized: zoomed,
+                                at: std::time::Instant::now(),
+                            }))
+                        });
+                    }
+                }
                 // The window is about to go and the `HICON`s belong to this
                 // process rather than to it. Not `set_icon(&w, &[])`: that is
                 // the *client* saying it has no icon, and it says so in the
@@ -3135,6 +3166,7 @@ fn create_window(
             WindowKind::Toplevel => (0, 0),
         }),
         aumid: RefCell::new(String::new()),
+        identity: RefCell::new(String::new()),
         tracking: Cell::new(false),
         buttons_down: Cell::new(0),
         last_pos: Cell::new((0.0, 0.0)),
@@ -4201,7 +4233,35 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
     // `WM_SIZE` that `SW_SHOWMAXIMIZED` sends is the size the client must lay
     // out at, so `placing` is off for it; `self_driven` holds back only the
     // echo of the state the client itself asked for.
-    let maximize = !w.mapped.get() && w.maximize_at_map.replace(false);
+    // §102: a first map that succeeds a closed window of the same identity
+    // takes its place, maximised if it was.
+    let succeeded = if w.mapped.get() {
+        None
+    } else {
+        SUCCESSION.with(|s| {
+            let found = super::succession_for(
+                s.borrow().as_ref(),
+                &w.identity.borrow(),
+                std::time::Instant::now(),
+            );
+            if found.is_some() {
+                s.replace(None);
+            }
+            found
+        })
+    };
+    if let Some((origin, max)) = succeeded {
+        println!(
+            "wc-compositor: window {} takes the place of the last {} window to close: {},{}{}",
+            w.id,
+            w.identity.borrow(),
+            origin.0,
+            origin.1,
+            if max { ", maximised" } else { "" }
+        );
+    }
+    let maximize = !w.mapped.get()
+        && (w.maximize_at_map.replace(false) || succeeded.is_some_and(|(_, max)| max));
     if maximize {
         w.mapped.set(true);
         // SAFETY: live window handle; the messages arrive synchronously.
@@ -4235,7 +4295,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
                 ShowWindow(w.hwnd(), SW_SHOWNORMAL);
             }
         }
-        let (ox, oy) = window_origin(w.hwnd());
+        let (ox, oy) = succeeded.map_or_else(|| window_origin(w.hwnd()), |(origin, _)| origin);
         let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
         let mut got = asked;
         if let Some(work) = work_area_of(w.hwnd()) {
@@ -5244,6 +5304,7 @@ fn apply_identity(w: &Rc<WindowState>, aumid: &str) {
         // all, so there is nothing to group and nothing to say.
         return;
     }
+    w.identity.replace(aumid.to_string());
     if *w.aumid.borrow() == aumid {
         return;
     }

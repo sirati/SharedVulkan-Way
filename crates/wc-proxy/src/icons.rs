@@ -245,6 +245,71 @@ pub fn app_id_ok(id: &str) -> bool {
         && !id.contains("..")
 }
 
+/// The name of the file, in the proxy's `--runtime-dir`, that gives clients
+/// of other users their app id (§102).
+pub const FOREIGN_APP_IDS: &str = "wc-foreign-app-ids";
+
+/// What `wc-foreign-app-ids` says about one uid (§102.4): its app id, and the
+/// title its toplevels are to carry, if the line has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignName {
+    pub app_id: String,
+    pub title: Option<String>,
+}
+
+/// The entry the file gives `uid`: lines of `<uid> <app id> [title]`, the
+/// first line for that uid wins, an id that fails [`app_id_ok`] is no answer,
+/// and a title is the rest of the line, trimmed, at most 128 bytes and free of
+/// control characters (else the line has no title).
+pub fn parse_foreign_app_ids(text: &str, uid: u32) -> Option<ForeignName> {
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let (u, rest) = line.split_once(' ')?;
+        if u.parse::<u32>().ok()? != uid {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let (id, title) = match rest.split_once(' ') {
+            Some((id, t)) => (id, t.trim()),
+            None => (rest, ""),
+        };
+        if !app_id_ok(id) {
+            return None;
+        }
+        let title = (!title.is_empty() && title.len() <= 128 && !title.chars().any(char::is_control))
+            .then(|| title.to_owned());
+        Some(ForeignName { app_id: id.to_owned(), title })
+    })
+}
+
+/// §102 (docs/waycompose-design.md). The `WC_APP_ID` of a client the proxy
+/// cannot read the environment of, because it belongs to another user.
+///
+/// The nested Linux desktop is started by an application of the proxy's own
+/// user (`atp-nested`, through `wc-session run`), but its windows are made by
+/// processes of other users: the login screen's compositor as
+/// `cosmic-greeter`, the session's KWin as `<desktop-user>`. `/proc/<pid>/environ` of
+/// those is closed to the proxy, so the launcher writes `<uid> <app id>`
+/// lines into `wc-foreign-app-ids` in the proxy's runtime directory, which
+/// only the proxy's user can write.
+///
+/// Read only if the file is a regular file (not a link) owned by the proxy's
+/// own user and writable by nobody else, and at most 4 KiB: a file anybody
+/// else could have written is no answer. What a client gets from it is the
+/// name of its own taskbar button and icon, which it could choose itself by
+/// calling `set_app_id`.
+#[cfg(unix)]
+pub fn foreign_app_id(file: &Path, uid: u32) -> Option<ForeignName> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(file).ok()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if !meta.file_type().is_file() || meta.uid() != me || meta.mode() & 0o022 != 0 || meta.len() > 4096 {
+        return None;
+    }
+    parse_foreign_app_ids(&std::fs::read_to_string(file).ok()?, uid)
+}
+
 /// [`ClientEnv`] from the bytes of a `/proc/<pid>/environ`.
 pub fn parse_environ(raw: &[u8]) -> ClientEnv {
     let mut env = ClientEnv::default();
@@ -638,6 +703,55 @@ pub fn decode_png(path: &Path) -> Result<Image, String> {
 
 #[cfg(test)]
 mod tests {
+
+    // §102: the file that names another user's windows.
+    #[test]
+    fn foreign_app_ids_parse_by_uid() {
+        let id = |t: &str, u| parse_foreign_app_ids(t, u).map(|n| n.app_id);
+        let text = "1001 atp-nested\n977 atp-nested-greeter\nbad line here\n1001 second\n";
+        assert_eq!(id(text, 1001).as_deref(), Some("atp-nested"));
+        assert_eq!(id(text, 977).as_deref(), Some("atp-nested-greeter"));
+        assert_eq!(id(text, 1000), None);
+        assert_eq!(id("1001 ../x\n", 1001), None);
+        assert_eq!(id("1001 -x\n", 1001), None);
+        assert_eq!(id("x1001 a\n", 1001), None);
+        assert_eq!(id("", 1001), None);
+        // The rest of the line is the title.
+        let n = parse_foreign_app_ids("1001 atp-nested Windows 7 (Linux)\n", 1001).unwrap();
+        assert_eq!((n.app_id.as_str(), n.title.as_deref()), ("atp-nested", Some("Windows 7 (Linux)")));
+        assert_eq!(parse_foreign_app_ids("1001 a\n", 1001).unwrap().title, None);
+        assert_eq!(parse_foreign_app_ids(&format!("1001 a {}\n", "x".repeat(129)), 1001).unwrap().title, None);
+        assert_eq!(parse_foreign_app_ids("1001 a ti\u{7}tle\n", 1001).unwrap().title, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_app_ids_only_from_a_file_of_our_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wc-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(FOREIGN_APP_IDS);
+        std::fs::write(&f, "1001 atp-nested\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(foreign_app_id(&f, 1001).map(|n| n.app_id).as_deref(), Some("atp-nested"));
+        // Writable by the group or by others: not ours alone, so no answer.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(foreign_app_id(&f, 1001), None);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o646)).unwrap();
+        assert_eq!(foreign_app_id(&f, 1001), None);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A link to it is not it.
+        let l = dir.join("link");
+        std::os::unix::fs::symlink(&f, &l).unwrap();
+        assert_eq!(foreign_app_id(&l, 1001), None);
+        // Too long to be what the launcher writes.
+        std::fs::write(&f, format!("1001 atp-nested\n{}", "#".repeat(5000))).unwrap();
+        assert_eq!(foreign_app_id(&f, 1001), None);
+        assert_eq!(foreign_app_id(&dir.join("missing"), 1001), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
