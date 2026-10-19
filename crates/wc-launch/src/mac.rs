@@ -269,13 +269,26 @@ fn start_keeper(log: &Log) -> Result<KeeperPipe, String> {
 /// the session's proxy and GPU units have ended. Stdin's end is the main
 /// process's end, however it came. Then the session's GPU servers go, and
 /// with this process the last hold on the pages.
+/// SIGTERM seen (§103.15): macOS is shutting down, or someone asked.
+static TERMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term(_sig: i32) {
+    TERMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// After a SIGTERM the keeper waits at most this long for the release: the
+/// main process takes its session down on the same signal (`run_main`), so
+/// the release comes in about 2 s, and a shutdown must not stall on us.
+const TERM_LIMIT: Duration = Duration::from_secs(10);
+
 fn run_keeper() -> ExitCode {
     let log = Log::open(&log_dir().join("keeper.log"));
-    // SAFETY: SIG_IGN for SIGHUP (1) and SIGTERM (15): a `pkill` aimed at the
-    // session must not free memory the host may still write.
+    // SAFETY: SIG_IGN for SIGHUP (1); SIGTERM (15) only shortens the wait.
+    // Ignoring SIGTERM outright stalled every macOS shutdown (launchd waited
+    // for this process until it killed it).
     unsafe {
         signal(1, 1);
-        signal(15, 1);
+        signal(15, on_term as extern "C" fn(i32) as usize);
     }
     let mut held: Vec<(usize, usize)> = Vec::new();
     let mut gpus: Vec<i32> = Vec::new();
@@ -327,12 +340,16 @@ fn run_keeper() -> ExitCode {
     });
     let limit = Duration::from_secs(600);
     let t0 = Instant::now();
+    let mut termed_at: Option<Instant> = None;
     let released = loop {
         // SAFETY: the boot page, held.
         if boot.is_some_and(|p| unsafe { wc_handle::macboot::load_released(p) }) {
             break true;
         }
-        if t0.elapsed() > limit {
+        if TERMED.load(std::sync::atomic::Ordering::SeqCst) && termed_at.is_none() {
+            termed_at = Some(Instant::now());
+        }
+        if t0.elapsed() > limit || termed_at.is_some_and(|t| t.elapsed() > TERM_LIMIT) {
             break false;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -346,7 +363,7 @@ fn run_keeper() -> ExitCode {
     } else if boot.is_none() {
         format!("no boot page among the windows; freeing after {limit:?}")
     } else {
-        format!("NO RELEASE from the host in {limit:?}; freeing anyway")
+        format!("NO RELEASE from the host in {:?}{}; freeing anyway", t0.elapsed(), if termed_at.is_some() { " (SIGTERM)" } else { "" })
     });
     ExitCode::SUCCESS
 }
@@ -491,6 +508,29 @@ fn run_main(cfg: Config) -> ExitCode {
         "--log".into(),
         comp_log.to_string_lossy().into_owned(),
     ]);
+    // SIGTERM (a shutdown, a logout, a `kill`): take the session down over
+    // the control ring and go, so the host stops and releases at once rather
+    // than after its lease, and the keeper is not left waiting.
+    {
+        // SAFETY: the handler only stores an atomic.
+        unsafe { signal(15, on_term as extern "C" fn(i32) as usize) };
+        let (s2, l2) = (Arc::clone(&session), log.clone());
+        std::thread::Builder::new()
+            .name("sigterm".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if TERMED.load(std::sync::atomic::Ordering::SeqCst) {
+                    if *s2.up.lock().unwrap_or_else(|e| e.into_inner()) {
+                        match control_request(&s2, "down") {
+                            Ok(r) => l2.say(&format!("SIGTERM: down over the control ring: {r}")),
+                            Err(e) => l2.say(&format!("SIGTERM: down: {e}")),
+                        }
+                    }
+                    std::process::exit(0);
+                }
+            })
+            .ok();
+    }
     let code = wc_compositor::run_from(argv);
     log.say("the compositor has ended; taking the session down");
     if *session.up.lock().unwrap_or_else(|e| e.into_inner()) {
