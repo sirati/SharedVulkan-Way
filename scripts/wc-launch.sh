@@ -642,6 +642,10 @@ wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 # §102: WC_LAUNCH_NESTED_GLOBALS=1 offers wp_single_pixel_buffer_manager_v1,
 # wp_viewporter and wp_presentation, which a nested compositor (KWin) needs.
 nested-compositor-globals = $([ "${WC_LAUNCH_NESTED_GLOBALS:-0}" = 1 ] && echo on || echo off)
+# §107: one compositor for every installation of the user; off is §105's own
+# compositor per installation (WC_LAUNCH_SHARED_COMPOSITOR=off), for an
+# installation that is not to join the shared one yet.
+shared-compositor = ${WC_LAUNCH_SHARED_COMPOSITOR:-on}
 
 [app.firefox]
 title = $TITLE
