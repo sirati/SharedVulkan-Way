@@ -777,6 +777,11 @@ impl sv_transport::vdoorbell::BellTarget for WakeOnBell {
 /// seconds of a user's click. A port another process holds is refused at once
 /// by the driver (one opener per port), which is the same answer.
 pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::PortHandle> {
+    // §105.4's spellings: `fd:R,W` is how a parent passes a port it opened
+    // (the macOS launcher in role (b), §103.17: the hypervisor's FIFO pair).
+    if ["fd:", "dev:", "socket:"].iter().any(|p| name.starts_with(p)) {
+        return sv_transport::vdoorbell::PortHandle::open(name);
+    }
     #[cfg(unix)]
     if name.contains('/') {
         return sv_transport::vdoorbell::PortHandle::host_socket(name);

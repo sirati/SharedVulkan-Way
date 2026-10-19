@@ -727,8 +727,10 @@ fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<ByteChanne
     Some(ch)
 }
 
-/// How long a request waits for its answer before it parks (§105.13).
-const SPIN: Duration = Duration::from_micros(300);
+/// How long a request waits for its answer before it parks (§105.13): a
+/// millisecond covers the host waking from its park and answering, so the
+/// answer needs no doorbell back. Only while a request is outstanding.
+const SPIN: Duration = Duration::from_millis(1);
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
@@ -758,8 +760,11 @@ impl Ctl {
                 b = &b[n..];
             } else if t0.elapsed() > Duration::from_secs(5) {
                 return Err("the control ring stayed full for 5 s".into());
+            } else if t0.elapsed() < Duration::from_millis(5) {
+                // §105.13: the host drains a lane in microseconds.
+                std::thread::yield_now();
             } else {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_micros(200));
             }
         }
         Ok(())

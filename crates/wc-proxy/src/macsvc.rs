@@ -131,11 +131,26 @@ fn write_all(ch: &mut ByteChannel, mut b: &[u8]) -> bool {
     while !b.is_empty() {
         match ch.write(b) {
             Ok(n) if n > 0 => b = &b[n..],
-            Ok(_) if t0.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(1)),
+            // §105.13: a full lane is the reader draining a big answer; it
+            // frees room in microseconds, so look again at once, then yield,
+            // and only sleep once it is clearly not coming.
+            Ok(_) if t0.elapsed() < Duration::from_secs(2) => backoff(t0.elapsed()),
             _ => return false,
         }
     }
     true
+}
+
+/// How a writer waits for room in a lane its reader is draining: a spin,
+/// then yields, then short sleeps (§105.13).
+pub fn backoff(waited: Duration) {
+    if waited < Duration::from_micros(200) {
+        std::hint::spin_loop();
+    } else if waited < Duration::from_millis(5) {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(Duration::from_micros(200));
+    }
 }
 
 /// The words a request may have, checked again by `wc-session` itself.

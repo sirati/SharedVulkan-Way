@@ -50,6 +50,11 @@ pub struct Stats {
 struct Client {
     id: u64,
     tx: SyncSender<Vec<u8>>,
+    /// §105.13: the client's socket, written directly by the upstream's
+    /// reader when nothing is queued for it, so a wake costs no thread hop;
+    /// the queue and its writer take over only when a write would block.
+    direct: UnixStream,
+    pending: Arc<AtomicU64>,
 }
 
 /// One port: an upstream (QEMU's chardev) and the clients that share it.
@@ -57,6 +62,10 @@ pub struct Hub {
     name: String,
     clients: Mutex<Vec<Client>>,
     up: Mutex<Option<SyncSender<Vec<u8>>>>,
+    /// §105.13: the upstream socket, for the same direct write toward the
+    /// guest; `None` for a guest port (role b), which keeps the queue.
+    up_direct: Mutex<Option<UnixStream>>,
+    up_pending: Arc<AtomicU64>,
     next: AtomicU64,
     pub stats: Stats,
 }
@@ -67,6 +76,8 @@ impl Hub {
             name: name.to_string(),
             clients: Mutex::new(Vec::new()),
             up: Mutex::new(None),
+            up_direct: Mutex::new(None),
+            up_pending: Arc::new(AtomicU64::new(0)),
             next: AtomicU64::new(1),
             stats: Stats::default(),
         })
@@ -76,25 +87,63 @@ impl Hub {
     fn fan_out(&self, b: &[u8]) {
         self.stats.down.fetch_add(b.len() as u64, Ordering::Relaxed);
         let Ok(mut c) = self.clients.lock() else { return };
-        c.retain(|cl| match cl.tx.try_send(b.to_vec()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
-                self.stats.down_dropped.fetch_add(b.len() as u64, Ordering::Relaxed);
-                true
+        c.retain(|cl| {
+            let at = if cl.pending.load(Ordering::Acquire) == 0 {
+                match send_dontwait(&cl.direct, b) {
+                    None => return false,
+                    Some(n) if n == b.len() => return true,
+                    Some(n) => n,
+                }
+            } else {
+                0
+            };
+            cl.pending.fetch_add(1, Ordering::AcqRel);
+            match cl.tx.try_send(b[at..].to_vec()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    cl.pending.fetch_sub(1, Ordering::AcqRel);
+                    self.stats.down_dropped.fetch_add(b.len() as u64, Ordering::Relaxed);
+                    true
+                }
+                Err(TrySendError::Disconnected(_)) => false,
             }
-            Err(TrySendError::Disconnected(_)) => false,
         });
     }
 
     /// Bytes from a client, to the guest. Never blocks; with no upstream
     /// (the VM is down) they are dropped.
     fn up(&self, b: &[u8]) {
+        // One writer at a time, so the direct write and the queue keep order.
+        let direct = self.up_direct.lock().ok();
+        let mut at = 0;
+        if let Some(Some(s)) = direct.as_deref()
+            && self.up_pending.load(Ordering::Acquire) == 0
+        {
+            match send_dontwait(s, b) {
+                Some(n) if n == b.len() => {
+                    self.stats.up.fetch_add(n as u64, Ordering::Relaxed);
+                    return;
+                }
+                Some(n) => at = n,
+                None => {}
+            }
+        }
         let sent = self
             .up
             .lock()
             .ok()
-            .and_then(|u| u.as_ref().map(|tx| tx.try_send(b.to_vec()).is_ok()))
+            .and_then(|u| {
+                u.as_ref().map(|tx| {
+                    self.up_pending.fetch_add(1, Ordering::AcqRel);
+                    let ok = tx.try_send(b[at..].to_vec()).is_ok();
+                    if !ok {
+                        self.up_pending.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    ok
+                })
+            })
             .unwrap_or(false);
+        drop(direct);
         let n = b.len() as u64;
         if sent {
             self.stats.up.fetch_add(n, Ordering::Relaxed);
@@ -109,15 +158,20 @@ impl Hub {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = sync_channel::<Vec<u8>>(QUEUE);
         let mut w = s.try_clone()?;
+        let direct = s.try_clone()?;
+        let pending = Arc::new(AtomicU64::new(0));
+        let p2 = Arc::clone(&pending);
         std::thread::Builder::new().name(format!("bell-{}-w{id}", self.name)).spawn(move || {
             while let Ok(b) = rx.recv() {
-                if w.write_all(&b).is_err() {
+                let ok = w.write_all(&b).is_ok();
+                p2.fetch_sub(1, Ordering::AcqRel);
+                if !ok {
                     break;
                 }
             }
             let _ = w.shutdown(std::net::Shutdown::Both);
         })?;
-        self.clients.lock().map_err(|_| std::io::Error::other("poisoned"))?.push(Client { id, tx });
+        self.clients.lock().map_err(|_| std::io::Error::other("poisoned"))?.push(Client { id, tx, direct, pending });
         self.stats.clients.fetch_add(1, Ordering::Relaxed);
         let hub = Arc::clone(self);
         let mut r = s;
@@ -159,9 +213,14 @@ impl Hub {
     pub fn serve_upstream_fresh(self: &Arc<Self>, up: UnixStream, fresh: bool) -> std::io::Result<()> {
         let w = up.try_clone()?;
         let closer = up.try_clone()?;
-        self.serve_link_fresh(Box::new(up), Box::new(w), move || {
+        *self.up_direct.lock().map_err(|_| std::io::Error::other("poisoned"))? = Some(up.try_clone()?);
+        let r = self.serve_link_fresh(Box::new(up), Box::new(w), move || {
             let _ = closer.shutdown(std::net::Shutdown::Both);
-        }, fresh)
+        }, fresh);
+        if let Ok(mut d) = self.up_direct.lock() {
+            *d = None;
+        }
+        r
     }
 
     /// [`Hub::serve_upstream`] over any reader and writer: a chardev socket's
@@ -169,8 +228,8 @@ impl Hub {
     /// has ended, so a writer stuck on a dead upstream gives up.
     pub fn serve_link(
         self: &Arc<Self>,
-        mut r: Box<dyn Read + Send>,
-        mut w: Box<dyn Write + Send>,
+        r: Box<dyn Read + Send>,
+        w: Box<dyn Write + Send>,
         close: impl FnOnce(),
     ) -> std::io::Result<()> {
         self.serve_link_fresh(r, w, close, true)
@@ -186,9 +245,12 @@ impl Hub {
         fresh: bool,
     ) -> std::io::Result<()> {
         let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) = sync_channel(QUEUE);
+        let up_pending = Arc::clone(&self.up_pending);
         let writer = std::thread::Builder::new().name(format!("bell-{}-up", self.name)).spawn(move || {
             while let Ok(b) = rx.recv() {
-                if w.write_all(&b).is_err() {
+                let ok = w.write_all(&b).is_ok();
+                up_pending.fetch_sub(1, Ordering::AcqRel);
+                if !ok {
                     break;
                 }
             }
@@ -217,6 +279,21 @@ impl Hub {
         close();
         let _ = writer.join();
         Ok(())
+    }
+}
+
+/// §105.13: write what the socket takes now, never waiting. `Some(n)` is
+/// how much was taken (0 if it would block); `None` means the peer is gone.
+fn send_dontwait(s: &UnixStream, b: &[u8]) -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a live socket and a buffer of `b.len()` bytes.
+    let r = unsafe { libc::send(s.as_raw_fd(), b.as_ptr().cast(), b.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if r >= 0 {
+        return Some(r as usize);
+    }
+    match std::io::Error::last_os_error().kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => Some(0),
+        _ => None,
     }
 }
 
