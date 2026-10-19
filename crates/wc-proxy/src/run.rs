@@ -51,6 +51,8 @@ struct Args {
     wayland_rings_plan: Option<PathBuf>,
     /// §103.14: the session's control and sound channels on those rings.
     services: wc_proxy::macsvc::Services,
+    /// §105: host integration on the rings, when `--hostint DIR` is given.
+    hostint: wc_proxy::hostint::Config,
     runtime_dir: PathBuf,
     socket: String,
     transport: String,
@@ -177,6 +179,15 @@ usage: wc-proxy --upstream <path> [options]
                          a connection that cannot have a ring falls back to it,
                          loudly
   --wayland-bell PATH    §89: QEMU's socket for the rings' virtio-serial port
+  --hostint DIR          §105: serve host integration on the rings' OWNER_HOSTINT
+                         slot, with the session's run directory DIR (desktop
+                         entries, mimeapps.list, DIR/hostint.sock for
+                         wc-host-open). Only with rings; ignored otherwise
+  --hostint-pipewire P   §105: the session PipeWire's socket; the host's audio
+                         devices become nodes in it. Without it they do not
+  --hostint-pw-bin DIR   §105: where pipewire, pw-dump and pw-metadata are
+  --hostint-opener PATH  §105: wc-host-open, for the desktop entries' Exec=
+                         (default: beside this executable)
   --runtime-dir DIR      where to put our own socket (default $XDG_RUNTIME_DIR)
   --socket NAME          our socket's name (default wl-proxy)
 
@@ -279,6 +290,7 @@ fn parse_args() -> Result<Args, String> {
         wayland_bell: None,
         wayland_rings_plan: None,
         services: Default::default(),
+        hostint: Default::default(),
         runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir),
@@ -330,6 +342,10 @@ fn parse_args() -> Result<Args, String> {
             "--session-control" => a.services.session = Some(next()?.into()),
             "--session-id" => a.services.id = Some(next()?),
             "--audio-socket" => a.services.audio = Some(next()?.into()),
+            "--hostint" => a.hostint.dir = next()?.into(),
+            "--hostint-pipewire" => a.hostint.pipewire = Some(next()?.into()),
+            "--hostint-pw-bin" => a.hostint.pw_bin = Some(next()?.into()),
+            "--hostint-opener" => a.hostint.opener = Some(next()?.into()),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
@@ -435,6 +451,14 @@ pub fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("desktop") {
         return wc_proxy::desktop::cli(&argv[2..]);
+    }
+    // §105: the session PipeWire's monitor PCM as `audio.sock` (wc-session's
+    // pipewire modes), and `wc-host-open` under this binary's name too.
+    if argv.get(1).map(String::as_str) == Some("pcm-serve") {
+        return wc_proxy::hostint::pcm_serve_cli(&argv[2..]);
+    }
+    if argv.get(1).map(String::as_str) == Some("host-open") {
+        return wc_proxy::hostint::open_cli(&argv[2..]);
     }
     let args = match parse_args() {
         Ok(a) => a,
@@ -881,6 +905,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             if bell.as_os_str() == "poll" { "polled every 1 ms".to_string() } else { bell.display().to_string() }
         );
         wc_proxy::macsvc::start(&control, &args.services);
+        // §105: host integration, for the life of the process (dropping the
+        // handle detaches its threads).
+        if !args.hostint.dir.as_os_str().is_empty() {
+            let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+        }
         Some(control)
     } else if args.wayland_rings {
         let up = args.upstream.display();
@@ -897,6 +926,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         bell.display()
                     );
                     doorbell = Some(d);
+                    // §105: the compositor opens this slot once windows-no-ssh
+                    // lands; until then it is claimed and waits.
+                    if !args.hostint.dir.as_os_str().is_empty() {
+                        let _ = wc_proxy::hostint::start(&control, args.hostint.clone());
+                    }
                     Some(control)
                 }
                 Err(e) => {
