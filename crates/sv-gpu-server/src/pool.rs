@@ -247,7 +247,14 @@ impl PoolServer {
         if matches!(leased, Err(PoolError::NoSpace { .. }))
             && purpose != Purpose::Control
             && let Some(grow) = self.grower.get()
-            && grow(len)
+            && {
+                // §108.7: how long a lease waited for a grow is what ahead-of-
+                // demand growth exists to make rare; logged every time.
+                let t = std::time::Instant::now();
+                let grew = grow(len);
+                eprintln!("[gpu] regions: a lease of {} KiB waited {:.2} ms for a grow ({})", len >> 10, t.elapsed().as_secs_f64() * 1e3, if grew { "grown" } else { "refused" });
+                grew
+            }
         {
             leased = self.pool().lease(session, len, purpose);
         }
@@ -258,6 +265,9 @@ impl PoolServer {
                 return Err(format!("{e}"));
             }
         };
+        // §108.6: the region manager looks at once whether to grow ahead, so a
+        // burst of leases finds room instead of waiting for a grow.
+        sv_transport::regiontab::wake::notify();
         self.note_lease();
         Ok(lease)
     }

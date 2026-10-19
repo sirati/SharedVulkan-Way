@@ -34961,6 +34961,28 @@ provider, and one budget for both.
 4. the guest acknowledges `UNMAPPED`;
 5. the Mac calls `shm_unlink` and unmaps for the last time.
 
+**Growth without waiting (built, after the first measurements).** The test
+VM showed large-page allocation tails of 1.6 s for 1 GiB and 3.1 s for 2 GiB
+(108.7): a lease that waits for such a grow stalls an application's frame.
+* The step is now at most **256 MiB** (`max_step`), and the low-water floor
+  is 64 MiB.
+* **Every lease wakes the region manager** (`regiontab::wake`), so it grows
+  ahead of demand at once rather than at its next 250 ms tick.
+* `PoolServer::take` logs each lease that had to wait for a grow.
+
+Measured with `sv-pool-grow-e2e.sh` (the same 1.9 GiB burst of 64 MiB
+blocks):
+
+| policy | regions | leases that waited for a grow | total wait |
+|---|---|---|---|
+| before (1 GiB steps, 32 MiB low water) | 14 | 10 | 31 ms |
+| 256 MiB steps | 21 | 13 | 40 ms |
+| 256 MiB steps + wake on lease | 22 | **2** (the first two, before anything could be ahead) | 5.8 ms |
+
+On Windows a grow is now at most a 256 MiB section: mean 17 ms, one
+outlier of 0.86 s in 754, against 2 GiB's mean of 381 ms and tail of 3.1 s.
+`SV_RAM_MAX_STEP_MIB` and `SV_RAM_LOW_WATER_MIB` override the sizes.
+
 **Shrink, one more rule (built).** A region idle for 5 minutes (`deep_idle_ms`)
 is retired even inside the low-water margin, so an idle pool gives back
 everything it grew. An orderly exit of the GPU process or the shared

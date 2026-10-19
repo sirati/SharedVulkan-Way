@@ -24,7 +24,7 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Policy {
-        Policy { unit: 2 * MIB, min_step: 64 * MIB, max_step: GIB, low_water_floor: 32 * MIB, idle_ms: 30_000, calm_ms: 10_000, deep_idle_ms: 300_000 }
+        Policy { unit: 2 * MIB, min_step: 64 * MIB, max_step: 256 * MIB, low_water_floor: 64 * MIB, idle_ms: 30_000, calm_ms: 10_000, deep_idle_ms: 300_000 }
     }
 }
 
@@ -41,7 +41,8 @@ pub struct Usage {
 
 impl Policy {
     /// The defaults, with `SV_RAM_IDLE_MS`, `SV_RAM_DEEP_IDLE_MS` and
-    /// `SV_RAM_CALM_MS` overriding the times (harnesses that cannot wait
+    /// `SV_RAM_CALM_MS` overriding the times, and `SV_RAM_MAX_STEP_MIB`,
+    /// `SV_RAM_LOW_WATER_MIB` the sizes (harnesses that cannot wait
     /// five minutes).
     pub fn from_env() -> Policy {
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
@@ -50,6 +51,8 @@ impl Policy {
             idle_ms: env("SV_RAM_IDLE_MS").unwrap_or(d.idle_ms),
             deep_idle_ms: env("SV_RAM_DEEP_IDLE_MS").unwrap_or(d.deep_idle_ms),
             calm_ms: env("SV_RAM_CALM_MS").unwrap_or(d.calm_ms),
+            max_step: env("SV_RAM_MAX_STEP_MIB").map_or(d.max_step, |m| m << 20),
+            low_water_floor: env("SV_RAM_LOW_WATER_MIB").map_or(d.low_water_floor, |m| m << 20),
             ..d
         }
     }
@@ -107,7 +110,7 @@ mod tests {
         let p = Policy::default();
         assert_eq!(p.step(0), 64 * MIB);
         assert_eq!(p.step(300 * MIB), 150 * MIB);
-        assert_eq!(p.step(10 * GIB), GIB);
+        assert_eq!(p.step(10 * GIB), 256 * MIB);
         assert_eq!(p.step(129 * MIB), 66 * MIB);
     }
 
@@ -128,7 +131,7 @@ mod tests {
     #[test]
     fn ahead_of_demand_only_below_low_water() {
         let p = Policy::default();
-        assert_eq!(p.ahead(Usage { used: 100 * MIB, free: 40 * MIB, budget: GIB }), None);
+        assert_eq!(p.ahead(Usage { used: 100 * MIB, free: 70 * MIB, budget: GIB }), None);
         assert_eq!(p.ahead(Usage { used: 100 * MIB, free: 20 * MIB, budget: GIB }), Some(64 * MIB));
         assert_eq!(p.ahead(Usage { used: 100 * MIB, free: 20 * MIB, budget: MIB }), None);
     }
