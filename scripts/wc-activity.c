@@ -34,6 +34,13 @@
 #define COALESCE_MS 250
 /* "WCAGENT1": what our tools put in dwExtraInfo (docs/waycompose-design.md §101). */
 #define WC_AGENT_TAG ((ULONG_PTR)0x57434147454E5431ULL)
+/* §102: Windows 11 hands a low-level hook only the low 32 bits of an injected
+ * event's dwExtraInfo (measured on the guest: extra=00000000454e5431 for every
+ * tagged move), so "ours" is the low half, "T5NE". A person's input does not
+ * carry it: hardware input has 0, and TeamViewer's is not ours either way. */
+static int is_ours(ULONG_PTR extra) {
+    return extra == WC_AGENT_TAG || extra == (ULONG_PTR)(WC_AGENT_TAG & 0xFFFFFFFFu);
+}
 
 static CRITICAL_SECTION cs;
 static ULONGLONG ring_wall[RING]; /* Unix ms, newest at ring_head-1 */
@@ -73,7 +80,7 @@ static void mark(char kind) {
 static LRESULT CALLBACK on_key(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         const KBDLLHOOKSTRUCT *k = (const KBDLLHOOKSTRUCT *)l;
-        if (k->dwExtraInfo == WC_AGENT_TAG) InterlockedIncrement(&ours);
+        if (is_ours(k->dwExtraInfo)) InterlockedIncrement(&ours);
         else mark((k->flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED)) ? 'K' : 'k');
     }
     return CallNextHookEx(NULL, code, w, l);
@@ -83,7 +90,7 @@ static LRESULT CALLBACK on_mouse(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)l;
         char kind = (m->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) ? 'M' : 'm';
-        if (m->dwExtraInfo == WC_AGENT_TAG) {
+        if (is_ours(m->dwExtraInfo)) {
             InterlockedIncrement(&ours);
             /* Our move is where the pointer now is: not the person's jitter. */
             if (w == WM_MOUSEMOVE) { anchor = m->pt; have_anchor = 1; }
