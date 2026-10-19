@@ -304,6 +304,26 @@ struct Viewed {
     view: View,
 }
 
+/// What a window's composite depends on besides the pixels: the canvas, and
+/// each drawn surface in drawing order with its place and its staging
+/// shadow's size and format. See `Window::composed`.
+#[derive(Clone, Debug, PartialEq)]
+struct TreeShape {
+    canvas: (i32, i32, i32, i32),
+    format: PixelFormat,
+    surfaces: Vec<Placed>,
+}
+
+/// One drawn surface of a [`TreeShape`]: where it sits, and its staging
+/// shadow's size and format.
+#[derive(Clone, Debug, PartialEq)]
+struct Placed {
+    surface: WlSurface,
+    at: (i32, i32),
+    size: (i32, i32),
+    format: PixelFormat,
+}
+
 /// §102. The globals `--nested-compositor-globals` adds. Held so they live as
 /// long as the compositor; nothing reads them, because smithay's dispatch is
 /// on the types.
@@ -346,6 +366,15 @@ struct Window {
     /// and a machine that sounds broken.
     frame_callbacks: Vec<WlCallback>,
     presented: u64,
+    /// The shape of the tree the window's shadow was last composited from
+    /// (`State::compose_tree`), or `None` when the shadow is not known to be
+    /// a composite of the current staging pixels and must be redrawn whole.
+    ///
+    /// ADDED FOR §104's follow-up. While the tree keeps this shape — the same
+    /// surfaces at the same places with buffers of the same size and format,
+    /// the same canvas — a commit's damage is all that changed, and only it is
+    /// recomposed.
+    composed: Option<TreeShape>,
     /// The client has set an icon of its own through `xdg-toplevel-icon-v1`.
     ///
     /// Once it has, a publish on `wc_icon_manager_v1` for the same app id must
@@ -2889,6 +2918,9 @@ impl State {
         }
         let root = root_of(surface);
         if !self.windows.get(&root).is_some_and(|w| w.mapped) {
+            if let Some(w) = self.windows.get_mut(&root) {
+                w.composed = None;
+            }
             return;
         }
         let (_, w, h) = self.compose_tree(&root, surface, &[]);
@@ -3048,6 +3080,10 @@ impl State {
             && !self.windows[&root].mapped
             && declared_geometry(&root).is_none()
         {
+            // Its pixels are in staging and not in the window's shadow.
+            if let Some(w) = self.windows.get_mut(&root) {
+                w.composed = None;
+            }
             return;
         }
 
@@ -3735,6 +3771,47 @@ impl State {
             .map(|s| s.format())
             .unwrap_or(PixelFormat::Xrgb8888);
 
+        // The surfaces that are drawn, bottom to top. The same rule as the
+        // bounds above and as the hit test: a subsurface of an unmapped
+        // surface is not mapped, so it is not drawn either. In practice such a
+        // surface usually has no staging entry of its own and this changes
+        // nothing — but "usually" is not a reason for the paint path to use a
+        // different predicate from the two that decide where the window is and
+        // what is under the pointer.
+        let drawn: Vec<(WlSurface, (i32, i32))> = placed
+            .iter()
+            .filter(|(surface, _)| self.ancestors_mapped(surface, root))
+            .map(|(surface, at)| (surface.clone(), *at))
+            .collect();
+        let shape = TreeShape {
+            canvas: (gx, gy, gw, gh),
+            format,
+            surfaces: drawn
+                .iter()
+                .filter_map(|(surface, at)| {
+                    let s = self.staging.get(surface)?;
+                    Some(Placed {
+                        surface: surface.clone(),
+                        at: *at,
+                        size: (s.width(), s.height()),
+                        format: s.format(),
+                    })
+                })
+                .collect(),
+        };
+        // The committing surface's damage, in window coordinates.
+        let (cx, cy) = placed
+            .iter()
+            .find(|(s, _)| s == committed)
+            .map(|(_, l)| *l)
+            .unwrap_or((0, 0));
+        let damage: Vec<Rect> = committed_damage
+            .iter()
+            .filter_map(|r| {
+                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
+            })
+            .collect();
+
         let window = self.windows.get_mut(root).expect("caller checked");
         // The one place this number is decided, for the pixels *and* for the
         // pointer. See `Window::content_offset`.
@@ -3781,59 +3858,49 @@ impl State {
                 dy: gy - was.1,
             });
         }
+        // §104's follow-up: **only the damage is recomposed while the tree
+        // keeps its shape.** Until then every commit recomposed the whole
+        // window — a nested KWin's 1264x713 black root and its 1264x713 layer
+        // over it, per frame, whatever the frame changed — and that, not the
+        // read of the client's buffer (always damage-scoped, `present`), was
+        // the compositor's per-frame cost: 3 % of a core under Wine with a
+        // 64x64 change at 60 fps, 14 % with a translucent layer, whose blend is
+        // per pixel. The window's shadow is a composite of the staging
+        // shadows, which are per surface and hold each surface's current
+        // picture, so pixels outside the committing surface's damage are
+        // already right when nothing else moved. An empty damage list is a
+        // caller that changed something it cannot name (a view, a removed
+        // subsurface, a geometry), and gets everything.
+        let partial = !damage.is_empty() && window.composed.as_ref() == Some(&shape);
+        window.composed = Some(shape);
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(gw, gh, format);
         // §95: every surface after the first is drawn *over* what is under it
         // (`Shadow::compose_over`), so what is under it must be this frame's.
-        // The root's copy repaints the whole canvas whenever the canvas lies
-        // inside the root's buffer, which a declared geometry always does; a
-        // tree whose bounds reach past the root (a subsurface overhanging it)
-        // starts from transparent instead of from the last frame's pixels.
-        let root_covers = self.staging.get(root).is_some_and(|s| {
-            gx >= 0 && gy >= 0 && gx + gw <= s.width() && gy + gh <= s.height()
-        });
-        if !root_covers {
-            shadow.clear();
-        }
-        let mut first = true;
-        for (surface, (x, y)) in &placed {
-            // The same rule as the bounds above and as the hit test: a
-            // subsurface of an unmapped surface is not mapped, so it is not
-            // drawn either. In practice such a surface usually has no staging
-            // entry of its own and this changes nothing — but "usually" is not
-            // a reason for the paint path to use a different predicate from
-            // the two that decide where the window is and what is under the
-            // pointer.
-            if !self.ancestors_mapped(surface, root) {
-                continue;
+        // The first surface's copy repaints the canvas wherever it covers it,
+        // which the root does whenever the canvas lies inside the root's
+        // buffer (a declared geometry always does); what it does not cover (a
+        // subsurface overhanging the root) starts from transparent instead of
+        // from the last frame's pixels. `Shadow::compose_stack` is the one place
+        // that rule is applied, for the whole canvas and a damaged part alike.
+        let full = Rect::new(0, 0, gw, gh);
+        let layers: Vec<(Option<&Shadow>, (i32, i32))> = drawn
+            .iter()
+            .map(|(surface, (x, y))| (self.staging.get(surface), (x - gx, y - gy)))
+            .collect();
+        if partial && !reshaped {
+            for r in &damage {
+                shadow.compose_stack(&layers, *r);
             }
-            if let Some(src) = self.staging.get(surface) {
-                if first {
-                    shadow.compose(src, (x - gx, y - gy));
-                } else {
-                    shadow.compose_over(src, (x - gx, y - gy));
-                }
-            }
-            first = false;
+            return (damage, gw, gh);
         }
+        shadow.compose_stack(&layers, full);
         drop(shadow);
 
         if reshaped {
-            return (vec![Rect::new(0, 0, gw, gh)], gw, gh);
+            return (vec![full], gw, gh);
         }
-        // Translate the committing surface's damage into window coordinates.
-        let (cx, cy) = placed
-            .iter()
-            .find(|(s, _)| s == committed)
-            .map(|(_, l)| *l)
-            .unwrap_or((0, 0));
-        let damage: Vec<Rect> = committed_damage
-            .iter()
-            .filter_map(|r| {
-                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
-            })
-            .collect();
         (damage, gw, gh)
     }
 }
@@ -4510,6 +4577,7 @@ impl CompositorHandler for State {
                     let id = window.id;
                     println!("wc-compositor: window {id} unmapped (null buffer)");
                     window.mapped = false;
+                    window.composed = None;
                     self.ui.send(ToUi::SetWindowState {
                         id,
                         maximized: None,
@@ -4884,6 +4952,7 @@ impl XdgShellHandler for State {
                 client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                composed: None,
                 icon_from_client: false,
                 shown_size: (0, 0),
                 size_hints: ((0, 0), (0, 0)),
@@ -5272,6 +5341,7 @@ impl XdgShellHandler for State {
                 client,
                 frame_callbacks: Vec::new(),
                 presented: 0,
+                composed: None,
                 // A popup has no taskbar button and no caption, so neither of
                 // these can ever be true of one. They are here because `Window`
                 // is one type for both roles, which is stage 9's decision.

@@ -21,13 +21,29 @@
 #   * the compositor counts a shared-file map and no arena slice.
 #
 # Scratch under $WC_DMABUF_SCRATCH (default /mnt/datasets/builds/kwin-gpu-scratch/e2e).
+#
+# WC_DMABUF_BENCH="NBUF FMT SQ" (e.g. "3 xrgb 64") measures instead of
+# checking: the client's KWin-like bench mode (scripts/wc-dmabuf-client.c) on
+# a 1280x720 window, no frame dumps (a PPM per frame would be the cost
+# measured), and the compositor's process CPU (utime + stime of the Wine
+# process, from /proc) over WC_DMABUF_SECS seconds (default 20) after 3 s of
+# warm-up. WC_DMABUF_PROFILE=release uses the release builds;
+# WC_DMABUF_WIN_BIN overrides the compositor's directory (a baseline build).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-LINUX_BIN="$ROOT/target/debug"
-WIN_BIN="$ROOT/target/x86_64-pc-windows-gnu/debug"
+PROFILE=${WC_DMABUF_PROFILE:-debug}
+LINUX_BIN="$ROOT/target/$PROFILE"
+WIN_BIN=${WC_DMABUF_WIN_BIN:-"$ROOT/target/x86_64-pc-windows-gnu/$PROFILE"}
 SCRATCH=${WC_DMABUF_SCRATCH:-/mnt/datasets/builds/kwin-gpu-scratch/e2e}
-SECS=${WC_DMABUF_SECS:-6}
-W=320 H=200
+BENCH=${WC_DMABUF_BENCH:-}
+if [ -n "$BENCH" ]; then
+  MEASURE=${WC_DMABUF_SECS:-20}
+  SECS=$((MEASURE + 5))
+  W=1280 H=720
+else
+  SECS=${WC_DMABUF_SECS:-6}
+  W=320 H=200
+fi
 
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass + 1)); }
@@ -72,13 +88,14 @@ trap cleanup EXIT
 # The client.
 CLI=$RUN/cli
 mkdir -p "$CLI"
-for x in xdg-shell linux-dmabuf-v1; do
+for x in xdg-shell linux-dmabuf-v1 single-pixel-buffer-v1 viewporter; do
   wayland-scanner client-header "$ROOT/crates/wc-proxy/protocols/$x.xml" "$CLI/$x-client-protocol.h" || exit 1
   wayland-scanner private-code "$ROOT/crates/wc-proxy/protocols/$x.xml" "$CLI/$x-protocol.c" || exit 1
 done
 # shellcheck disable=SC2046
 cc -O1 -Wall -o "$CLI/wc-dmabuf-client" "$ROOT/scripts/wc-dmabuf-client.c" \
-  "$CLI/xdg-shell-protocol.c" "$CLI/linux-dmabuf-v1-protocol.c" -I"$CLI" \
+  "$CLI/xdg-shell-protocol.c" "$CLI/linux-dmabuf-v1-protocol.c" \
+  "$CLI/single-pixel-buffer-v1-protocol.c" "$CLI/viewporter-protocol.c" -I"$CLI" \
   $(pkg-config --cflags --libs wayland-client) || exit 1
 
 wait_for() {
@@ -100,9 +117,21 @@ for _ in $(seq 1 100); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
 mkdir -p "$RUN/frames" "$RUN/rt" "$RUN/pools"
 chmod 700 "$RUN/rt"
 SOCK="wcd$$"
+SRV_ARGS=(--dump-frames "$(winepath -w "$RUN/frames" 2>/dev/null)")
+# A bench dumps no frames (unless WC_DMABUF_BENCH_CHECK=1, which compares
+# the last dump with the last buffer the client committed, and makes the CPU
+# number meaningless), and offers the globals its `kwin` shape needs.
+if [ -n "$BENCH" ]; then
+  if [ -n "${WC_DMABUF_BENCH_CHECK:-}" ]; then
+    SRV_ARGS+=(--nested-compositor-globals)
+    export WC_BENCH_FINAL="$RUN/final.ppm"
+  else
+    SRV_ARGS=(--nested-compositor-globals)
+  fi
+fi
 wine explorer "/desktop=wc-dmabuf-$$,1280x1024" \
   "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout $((SECS + 40)) \
-  --dump-frames "$(winepath -w "$RUN/frames" 2>/dev/null)" \
+  "${SRV_ARGS[@]}" \
   --log "$(winepath -w "$RUN/srv.log" 2>/dev/null)" >"$RUN/loader.log" 2>&1 &
 SRV=$!
 NODE_SOCK=""
@@ -121,9 +150,37 @@ WC_FRAME_TRACE="$RUN/proxy-trace.txt" XDG_RUNTIME_DIR="$RUN/rt" "$LINUX_BIN/wc-p
 PROXY=$!
 wait_for "$RUN/proxy.log" '^\[proxy\] listening on' 20 || { bad "proxy did not listen"; cat "$RUN/proxy.log"; exit 1; }
 
-XDG_RUNTIME_DIR="$RUN/rt" WAYLAND_DISPLAY=wl-proxy timeout $((SECS + 20)) \
-  "$CLI/wc-dmabuf-client" "$SECS" "$W" "$H" >"$RUN/cli.log" 2>&1
-RC=$?
+if [ -n "$BENCH" ]; then
+  # shellcheck disable=SC2086
+  XDG_RUNTIME_DIR="$RUN/rt" WAYLAND_DISPLAY=wl-proxy timeout $((SECS + 20)) \
+    "$CLI/wc-dmabuf-client" "$SECS" "$W" "$H" bench $BENCH >"$RUN/cli.log" 2>&1 &
+  CPID=$!
+  ticks() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+  sleep 3
+  # The compositor is the process whose own program (argv[0]) is the exe;
+  # `start.exe` and `explorer.exe` name it only as an argument.
+  CPU_PID=""
+  for p in $(pgrep -f 'wc-compositor'); do
+    a0=$(tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | head -1)
+    case "$a0" in *wc-compositor.exe) CPU_PID=$p ;; esac
+  done
+  [ -n "$CPU_PID" ] && note "measuring pid $CPU_PID: $(tr '\0' ' ' <"/proc/$CPU_PID/cmdline" | cut -c1-80)"
+  if [ -n "$CPU_PID" ]; then
+    t0=$(ticks "$CPU_PID"); x0=$(ticks "$XPID"); s0=$(date +%s.%N)
+    sleep "$MEASURE"
+    t1=$(ticks "$CPU_PID"); x1=$(ticks "$XPID"); s1=$(date +%s.%N)
+    HZ=$(getconf CLK_TCK)
+    CPU=$(awk -v a="$t0" -v b="$t1" -v s="$s0" -v e="$s1" -v hz="$HZ" \
+      'BEGIN { printf "%.1f", (b - a) / hz / (e - s) * 100 }')
+    XCPU=$(awk -v a="$x0" -v b="$x1" -v s="$s0" -v e="$s1" -v hz="$HZ" \
+      'BEGIN { printf "%.1f", (b - a) / hz / (e - s) * 100 }')
+  fi
+  wait "$CPID"; RC=$?
+else
+  XDG_RUNTIME_DIR="$RUN/rt" WAYLAND_DISPLAY=wl-proxy timeout $((SECS + 20)) \
+    "$CLI/wc-dmabuf-client" "$SECS" "$W" "$H" >"$RUN/cli.log" 2>&1
+  RC=$?
+fi
 sleep 1
 kill "$PROXY" 2>/dev/null; wait "$PROXY" 2>/dev/null; PROXY=""
 kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
@@ -160,6 +217,26 @@ case "$maps" in
   "mapped: 0 section, "[1-9]*" shared-file, 0 arena-slice") ok "compositor: $maps" ;;
   *) bad "compositor: ${maps:-no map counts}"; grep -i "error\|fail" "$RUN/srv.log" | head -5 | sed 's/^/        /' ;;
 esac
+
+if [ -n "$BENCH" ]; then
+  frames=$(sed -n 's/^frames //p' "$RUN/cli.log")
+  [ -n "${CPU:-}" ] && ok "compositor CPU over ${MEASURE}s: ${CPU}% of one core, Xvfb ${XCPU:-?}% ($BENCH, ${W}x${H}, $frames frames in ${SECS}s, $(grep -m1 '^released' "$RUN/cli.log"), $(grep -m1 '^release_waits' "$RUN/cli.log"))" \
+    || bad "no compositor process to measure"
+  if [ -n "${WC_DMABUF_BENCH_CHECK:-}" ]; then
+    last=$(find "$RUN/frames" -name '*.ppm' | sort | tail -1)
+    if [ -f "$RUN/final.ppm" ] && [ -n "$last" ]; then
+      ae=$(magick compare -metric AE "$RUN/final.ppm" "$last" null: 2>&1)
+      [ "${ae%% *}" = 0 ] && ok "the compositor's last frame is the client's last buffer, pixel for pixel" \
+        || bad "the last frame differs from the client's last buffer in $ae pixels ($last)"
+    else
+      bad "nothing to compare (final.ppm: $([ -f "$RUN/final.ppm" ] && echo yes || echo no), dumps: ${last:-none})"
+    fi
+  fi
+  grep "path\|direct" "$RUN/srv.log" | grep -v "wl_surface commit" | head -5 | sed 's/^/        /'
+  echo "== $pass passed, $fail failed"
+  [ "$fail" = 0 ]
+  exit
+fi
 
 # The pixels, as the compositor saw them: the quadrants, and the bar moving.
 mapfile -t dumps < <(find "$RUN/frames" -name '*.ppm' | sort)

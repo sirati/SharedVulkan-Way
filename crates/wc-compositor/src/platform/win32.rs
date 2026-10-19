@@ -46,6 +46,10 @@
 //! to GDI. That is the known cost, it is a constant factor on an already-CPU
 //! path, and the fix is the DIB section — which is worth doing when there is a
 //! measurement saying it matters, and not before.
+//!
+//! §104's follow-up narrowed the third without giving up the unambiguous form:
+//! the image handed over is the band of rows the update region spans, as an
+//! image of its own (`WindowState::blit`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -490,7 +494,7 @@ impl WindowState {
         let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
         if !hdc.is_null() {
             let blit_started = std::time::Instant::now();
-            self.blit(hdc);
+            self.blit(hdc, &ps.rcPaint);
             if let Some(since) = self.unpainted_since.take()
                 && sv_transport::frametrace::enabled()
             {
@@ -522,7 +526,7 @@ impl WindowState {
         }
     }
 
-    fn blit(&self, hdc: HDC) {
+    fn blit(&self, hdc: HDC, paint: &RECT) {
         let shadow = match self.shadow.lock() {
             Ok(s) => s,
             // A poisoned lock means the Wayland thread panicked mid-blit. The
@@ -535,6 +539,18 @@ impl WindowState {
             return;
         }
         let (w, h) = (shadow.width(), shadow.height());
+        // §104's follow-up: only the rows the update region spans are handed
+        // to GDI, as an image of their own — still the whole-image form this
+        // module's header argues for (zero source origin, every line), so the
+        // band is unambiguous; the clip `BeginPaint` installed still decides
+        // the columns. A 64x64 change in a 1280x720 window hands GDI 64 rows
+        // instead of 720.
+        let top = paint.top.clamp(0, h);
+        let rows = paint.bottom.clamp(top, h) - top;
+        if rows == 0 {
+            self.uncover_caption_buttons(hdc);
+            return;
+        }
 
         let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -542,34 +558,36 @@ impl WindowState {
             biWidth: w,
             // Negative height means top-down, which is Wayland's origin. A
             // positive value here is the classic upside-down window.
-            biHeight: -h,
+            biHeight: -rows,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB,
-            biSizeImage: (w as u32) * (h as u32) * 4,
+            biSizeImage: (w as u32) * (rows as u32) * 4,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,
             biClrUsed: 0,
             biClrImportant: 0,
         };
+        let band = &shadow.pixels()[top as usize * w as usize * 4..];
 
-        // SAFETY: `bmi` describes exactly `w * h * 4` bytes and the shadow is
-        // packed to that size by `Shadow::blit`; the pointer is valid for the
-        // duration of the call because the lock is still held. The whole image
-        // is passed with a zero source origin, which is the unambiguous form —
-        // see this module's header.
+        // SAFETY: `bmi` describes exactly `w * rows * 4` bytes, and `band`
+        // starts at row `top` of a shadow packed to `w * h * 4` bytes with
+        // `top + rows <= h`; the pointer is valid for the duration of the call
+        // because the lock is still held. The whole band is passed with a zero
+        // source origin, which is the unambiguous form — see this module's
+        // header.
         unsafe {
             SetDIBitsToDevice(
                 hdc,
                 0,
-                0,
+                top,
                 w as u32,
-                h as u32,
+                rows as u32,
                 0,
                 0,
                 0,
-                h as u32,
-                shadow.pixels().as_ptr().cast::<c_void>(),
+                rows as u32,
+                band.as_ptr().cast::<c_void>(),
                 &bmi,
                 DIB_RGB_COLORS,
             );

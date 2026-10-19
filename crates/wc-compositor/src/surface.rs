@@ -68,6 +68,10 @@ impl Rect {
     }
 }
 
+/// A clip that clips nothing, for the tests' calls to [`Shadow::compose`].
+#[cfg(test)]
+const EVERYWHERE: Rect = Rect { x: 0, y: 0, w: i32::MAX, h: i32::MAX };
+
 /// The pixel layouts this compositor can blit without conversion.
 ///
 /// Both are 32 bits per pixel in B, G, R, A byte order. The only difference is
@@ -309,6 +313,28 @@ impl Shadow {
         true
     }
 
+    /// Where `src` placed at `at` lands on this shadow, inside `within`.
+    fn landing(&self, src: &Shadow, at: (i32, i32), within: Rect) -> Option<Rect> {
+        if src.is_empty() || self.is_empty() {
+            return None;
+        }
+        let r = Rect::new(at.0, at.1, src.width(), src.height()).clip(self.spec.width, self.spec.height)?;
+        let x0 = r.x.max(within.x);
+        let y0 = r.y.max(within.y);
+        let x1 = (r.x + r.w).min(within.x.saturating_add(within.w));
+        let y1 = (r.y + r.h).min(within.y.saturating_add(within.h));
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// Whether `src` placed at `at` covers all of `r`.
+    pub fn covers(src: &Shadow, at: (i32, i32), r: Rect) -> bool {
+        !src.is_empty()
+            && at.0 <= r.x
+            && at.1 <= r.y
+            && at.0 + src.width() >= r.x + r.w
+            && at.1 + src.height() >= r.y + r.h
+    }
+
     /// Copy `src` into this shadow with its top-left corner at `at`, clipped to
     /// both.
     ///
@@ -327,14 +353,14 @@ impl Shadow {
     /// §95: that point came (Firefox's `<select>` dropdown). The root of a tree
     /// is still copied with this; every surface drawn after it goes through
     /// [`Shadow::compose_over`].
-    pub fn compose(&mut self, src: &Shadow, at: (i32, i32)) {
-        if src.is_empty() || self.is_empty() {
-            return;
-        }
+    ///
+    /// §104's follow-up: only the pixels inside `within` are written, which is
+    /// how the damage-scoped composite (`State::compose_tree`, through
+    /// [`Shadow::compose_stack`]) recomposes the 64x64 pixels a frame changed
+    /// rather than the 1280x720 window.
+    pub fn compose(&mut self, src: &Shadow, at: (i32, i32), within: Rect) {
         let bpp = PixelFormat::BYTES_PER_PIXEL;
-        let Some(dst) = Rect::new(at.0, at.1, src.width(), src.height())
-            .clip(self.spec.width, self.spec.height)
-        else {
+        let Some(dst) = self.landing(src, at, within) else {
             return;
         };
         // Where in the source the clipped destination starts: non-zero exactly
@@ -369,18 +395,15 @@ impl Shadow {
     /// A row whose pixels are all opaque is copied too, which is every row of
     /// Firefox's content subsurface, so the common frame costs a scan of the
     /// alpha bytes on top of the `memcpy` it always cost.
-    pub fn compose_over(&mut self, src: &Shadow, at: (i32, i32)) {
+    ///
+    /// Only the pixels inside `within` are written, as for [`Shadow::compose`].
+    pub fn compose_over(&mut self, src: &Shadow, at: (i32, i32), within: Rect) {
         if !src.spec.format.has_alpha() {
-            self.compose(src, at);
-            return;
-        }
-        if src.is_empty() || self.is_empty() {
+            self.compose(src, at, within);
             return;
         }
         let bpp = PixelFormat::BYTES_PER_PIXEL;
-        let Some(dst) = Rect::new(at.0, at.1, src.width(), src.height())
-            .clip(self.spec.width, self.spec.height)
-        else {
+        let Some(dst) = self.landing(src, at, within) else {
             return;
         };
         let sx = dst.x - at.0;
@@ -416,9 +439,47 @@ impl Shadow {
         }
     }
 
-    /// Every pixel transparent black, at the current size.
-    pub fn clear(&mut self) {
-        self.pixels.fill(0);
+    /// Recompose the part `r` of this canvas from a stack of surfaces, bottom
+    /// to top, each with where its top-left corner lands on the canvas; `None`
+    /// is a surface of the tree that has no picture.
+    ///
+    /// ADDED FOR §104's follow-up, as the one place a window's composite is
+    /// computed, for the whole canvas and for a damaged part of it alike
+    /// (`State::compose_tree`). Every pixel of `r` is recomputed from the
+    /// stack alone: the first surface is copied, and a part of `r` it does not
+    /// cover is cleared first, so recomposing a pixel twice — two damage
+    /// rectangles that overlap — gives what recomposing it once gives, and a
+    /// part gives exactly what the whole would have given there.
+    pub fn compose_stack(&mut self, layers: &[(Option<&Shadow>, (i32, i32))], r: Rect) {
+        let mut first = true;
+        for (src, at) in layers {
+            match src {
+                Some(src) if first => {
+                    if !Shadow::covers(src, *at, r) {
+                        self.clear_rect(r);
+                    }
+                    self.compose(src, *at, r);
+                }
+                Some(src) => self.compose_over(src, *at, r),
+                None if first => self.clear_rect(r),
+                None => {}
+            }
+            first = false;
+        }
+        if first {
+            self.clear_rect(r);
+        }
+    }
+
+    /// The pixels inside `r` transparent black.
+    pub fn clear_rect(&mut self, r: Rect) {
+        let Some(r) = r.clip(self.spec.width, self.spec.height) else { return };
+        let bpp = PixelFormat::BYTES_PER_PIXEL;
+        let stride = self.spec.stride as usize;
+        for y in r.y as usize..(r.y + r.h) as usize {
+            let d = y * stride + r.x as usize * bpp;
+            self.pixels[d..d + r.w as usize * bpp].fill(0);
+        }
     }
 }
 
@@ -794,7 +855,7 @@ mod view_tests {
         let mut over = Shadow::empty();
         over.scale_from(&half, &view, None);
         let mut canvas = filled(2, 1, PixelFormat::Xrgb8888, |_, _| [0xFF, 0, 0, 0xFF]);
-        canvas.compose_over(&over, (0, 0));
+        canvas.compose_over(&over, (0, 0), EVERYWHERE);
         // Premultiplied half red over opaque blue: half of each (the blue's
         // 255 * 127/255 rounds to 0x7F).
         assert_eq!(&canvas.pixels()[0..4], &[0x7F, 0, 0x80, 0xFF]);
@@ -840,6 +901,63 @@ mod view_tests {
         out.scale_from(&src, &view, None);
         let firsts: Vec<u8> = out.pixels().chunks_exact(4).map(|p| p[0]).collect();
         assert_eq!(firsts, vec![0, 0, 100, 100, 0, 0, 100, 100]);
+    }
+
+    /// §104's follow-up: a stack recomposed in parts — overlapping parts
+    /// included — is the stack recomposed whole, for a nested KWin's shape (a
+    /// black root, a translucent layer over it, a small opaque one over that)
+    /// and for a tree whose first surface does not cover the canvas.
+    #[test]
+    fn a_stack_recomposed_in_parts_is_the_stack_recomposed_whole() {
+        let root = filled(40, 30, PixelFormat::Xrgb8888, |_, _| [0, 0, 0, 255]);
+        let mut layer = filled(40, 30, PixelFormat::Argb8888, |x, y| {
+            let a: u8 = if (x + y) % 3 == 0 { 255 } else { 0x80 };
+            [(x * 3) as u8 % a, (y * 5) as u8 % a, 7 % a, a]
+        });
+        let cursor = filled(6, 6, PixelFormat::Argb8888, |_, _| [9, 9, 9, 255]);
+        let overhang = filled(10, 10, PixelFormat::Argb8888, |_, _| [0, 0x40, 0, 0x40]);
+        for stack in [
+            vec![(Some(&root), (0, 0)), (Some(&layer), (0, 0)), (Some(&cursor), (17, 11))],
+            // The first surface does not reach the canvas's right edge, and a
+            // translucent child hangs over it: those pixels start clear.
+            vec![(Some(&cursor), (0, 0)), (None, (0, 0)), (Some(&overhang), (34, 24))],
+        ] {
+            let stack: Vec<(Option<&Shadow>, (i32, i32))> = stack;
+            let mut whole = Shadow::empty();
+            whole.reset(40, 30, PixelFormat::Xrgb8888);
+            whole.compose_stack(&stack, Rect::new(0, 0, 40, 30));
+            let mut parts = Shadow::empty();
+            parts.reset(40, 30, PixelFormat::Xrgb8888);
+            // Garbage first: a part must not depend on what was there.
+            parts.pixels.fill(0x5A);
+            for r in [Rect::new(0, 0, 25, 30), Rect::new(10, 5, 30, 20), Rect::new(20, 0, 20, 30)] {
+                parts.compose_stack(&stack, r);
+            }
+            assert_eq!(parts.pixels(), whole.pixels());
+        }
+
+        // And after a change in a damaged part, recomposing that part is
+        // recomposing everything.
+        let mut canvas = Shadow::empty();
+        canvas.reset(40, 30, PixelFormat::Xrgb8888);
+        fn stack<'a>(root: &'a Shadow, l: &'a Shadow) -> Vec<(Option<&'a Shadow>, (i32, i32))> {
+            vec![(Some(root), (0, 0)), (Some(l), (0, 0))]
+        }
+        canvas.compose_stack(&stack(&root, &layer), Rect::new(0, 0, 40, 30));
+        let damage = Rect::new(3, 4, 8, 6);
+        let next = filled(8, 6, PixelFormat::Argb8888, |_, _| [0x20, 0, 0, 0x20]);
+        let spec = BufferSpec { width: 40, height: 30, stride: 160, format: PixelFormat::Argb8888 };
+        let mut src = layer.pixels().to_vec();
+        for y in 0..6 {
+            let d = ((4 + y) * 160 + 3 * 4) as usize;
+            src[d..d + 32].copy_from_slice(&next.pixels()[(y * 32) as usize..(y * 32 + 32) as usize]);
+        }
+        layer.blit(&src, spec, &[damage]);
+        canvas.compose_stack(&stack(&root, &layer), damage);
+        let mut fresh = Shadow::empty();
+        fresh.reset(40, 30, PixelFormat::Xrgb8888);
+        fresh.compose_stack(&stack(&root, &layer), Rect::new(0, 0, 40, 30));
+        assert_eq!(canvas.pixels(), fresh.pixels());
     }
 
     /// Damage in buffer pixels lands, widened, on the surface pixels it
@@ -1356,7 +1474,7 @@ mod tests {
         let spec = BufferSpec { width: 3, height: 1, stride: 12, format: PixelFormat::Argb8888 };
         // Transparent, half-covered (premultiplied 50% white), opaque blue.
         child.blit(&[0, 0, 0, 0, 128, 128, 128, 128, 255, 0, 0, 255], spec, &[]);
-        canvas.compose_over(&child, (1, 0));
+        canvas.compose_over(&child, (1, 0), EVERYWHERE);
         assert_eq!(&canvas.pixels()[0..4], &[200, 100, 50, 255], "outside the child");
         assert_eq!(&canvas.pixels()[4..8], &[200, 100, 50, 255], "under a transparent pixel");
         // 128 + 200 * 127/255, and so on: the page shows through at half.
@@ -1369,7 +1487,7 @@ mod tests {
         let mut canvas = shadow_of(2, 1, PixelFormat::Argb8888, [9, 9, 9, 255]);
         // Padding of zero must not read as "transparent".
         let child = shadow_of(2, 1, PixelFormat::Xrgb8888, [1, 2, 3, 0]);
-        canvas.compose_over(&child, (0, 0));
+        canvas.compose_over(&child, (0, 0), EVERYWHERE);
         assert_eq!(canvas.pixels(), &[1, 2, 3, 0, 1, 2, 3, 0]);
     }
 
@@ -1378,8 +1496,8 @@ mod tests {
         let mut a = shadow_of(3, 2, PixelFormat::Argb8888, [5, 6, 7, 255]);
         let mut b = shadow_of(3, 2, PixelFormat::Argb8888, [5, 6, 7, 255]);
         let child = shadow_of(2, 2, PixelFormat::Argb8888, [40, 50, 60, 255]);
-        a.compose(&child, (1, 1));
-        b.compose_over(&child, (1, 1));
+        a.compose(&child, (1, 1), EVERYWHERE);
+        b.compose_over(&child, (1, 1), EVERYWHERE);
         assert_eq!(a.pixels(), b.pixels());
     }
 
