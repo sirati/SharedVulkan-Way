@@ -104,6 +104,10 @@ struct State {
     id: String,
     comp_log: String,
     comp_pid: u32,
+    /// §107: the shared compositor's pid, whose windows this session's are.
+    /// Never this installation's to kill (`--stop` reads `comp_pid` only);
+    /// [`find_window`] looks among its windows.
+    shared_pid: u32,
     ready: bool,
 }
 
@@ -116,6 +120,7 @@ impl State {
                 "id" => s.id = v.into(),
                 "comp-log" => s.comp_log = v.into(),
                 "comp-pid" => s.comp_pid = v.parse().unwrap_or(0),
+                "shared-pid" => s.shared_pid = v.parse().unwrap_or(0),
                 "ready" => s.ready = v == "1",
                 _ => {}
             }
@@ -124,10 +129,11 @@ impl State {
     }
     fn render(&self) -> String {
         format!(
-            "id={}\ncomp-log={}\ncomp-pid={}\nready={}\n",
+            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nready={}\n",
             self.id,
             self.comp_log,
             self.comp_pid,
+            self.shared_pid,
             u8::from(self.ready)
         )
     }
@@ -1157,7 +1163,7 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, ready: true }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
@@ -1215,7 +1221,7 @@ mod win {
     /// §107: the user's one compositor, started if nobody holds its mutex.
     /// Two launchers that both start one race for the mutex before either
     /// maps the device; the loser exits and both use the winner's socket.
-    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<(), String> {
+    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<u32, String> {
         let t = Instant::now();
         let mut kid: Option<Child> = None;
         if held(plan::COMPOSITOR_MUTEX) {
@@ -1228,7 +1234,7 @@ mod win {
         loop {
             if let Ok(r) = user_request(p, "ping", Some(Duration::from_secs(5))) {
                 log.say(&format!("compositor: {r} answers ({} ms)", t.elapsed().as_millis()));
-                return Ok(());
+                return Ok(plan::compositor_pid(&r));
             }
             if let Some(k) = kid.as_mut()
                 && let Ok(Some(rc)) = k.try_wait()
@@ -1275,7 +1281,7 @@ mod win {
                 spawn_shared_gpu(cfg, p, log);
             }
         }
-        ensure_compositor(cfg, p, log)?;
+        let shared_pid = ensure_compositor(cfg, p, log)?;
         let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
         log.say(&format!(
             "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
@@ -1294,7 +1300,7 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, ready: true }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
@@ -1500,6 +1506,7 @@ mod win {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
             comp_pid,
+            shared_pid: 0,
             ready: true,
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
@@ -2015,12 +2022,14 @@ mod win {
             return None;
         }
         let s = std::fs::read_to_string(&p.state).map(|t| State::parse(&t)).ok()?;
-        if s.comp_pid == 0 {
+        // §107: with the shared compositor the windows are its process's.
+        let pid = crate::single::window_pid(s.comp_pid, s.shared_pid);
+        if pid == 0 {
             return None;
         }
-        let (hwnds, ws) = windows_of(s.comp_pid);
+        let (hwnds, ws) = windows_of(pid);
         let aumid = app_aumid(p, section, app);
-        crate::single::find(&ws, s.comp_pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
+        crate::single::find(&ws, pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
     }
 
     /// Every top-level window of process `pid`, as [`crate::single::Window`]s.

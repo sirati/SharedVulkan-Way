@@ -65,6 +65,13 @@ pub fn find(ws: &[Window], comp_pid: u32, aumid: &str, title: &str) -> Option<(u
     ws.iter().enumerate().find_map(|(i, w)| matches(w, comp_pid, aumid, title).map(|b| (i, b)))
 }
 
+/// Whose windows this installation's are: its own compositor's (§105), or
+/// with none of its own (`comp_pid` 0) the user's shared one (§107). 0 is
+/// "no session", which matches nothing.
+pub fn window_pid(comp_pid: u32, shared_pid: u32) -> u32 {
+    if comp_pid != 0 { comp_pid } else { shared_pid }
+}
+
 /// The launch lock's name: `Local\` (per logon session), per installation
 /// session name and application. A kernel object name may not contain `\`
 /// after the namespace, so anything outside a safe alphabet becomes `_`.
@@ -276,6 +283,17 @@ mod tests {
         let mut x = w(7, Some(ID), TITLE);
         x.owned = true;
         assert_eq!(matches(&x, 7, ID, TITLE), None);
+    }
+
+    #[test]
+    fn a_shared_compositors_windows_are_looked_for_when_there_is_no_own_one() {
+        assert_eq!(window_pid(10, 20), 10);
+        assert_eq!(window_pid(0, 20), 20);
+        assert_eq!(window_pid(0, 0), 0);
+        // Another installation's window in the same shared compositor, with
+        // another identity, is not this application's.
+        let ws = [w(20, Some("Waycompose.app.firefox"), "Firefox"), w(20, Some(ID), "x")];
+        assert_eq!(find(&ws, window_pid(0, 20), ID, TITLE).map(|(i, _)| i), Some(1));
     }
 
     #[test]

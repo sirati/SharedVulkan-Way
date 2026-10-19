@@ -31953,6 +31953,20 @@ only. The identity path is checked on the guest. Log lines on the guest
 `CLICK-TO-WINDOW N ms (cold|warm, single; …)` and
 `single: <section>: FAILED after N ms (…); lock released; telling the user: …`.
 
+**With §107's shared compositor.** The installation has no compositor of its
+own then, and its state file says `comp-pid=0` so that `--stop` never kills
+the compositor every other installation's windows are in. The window lookup
+needs a process all the same: the launcher keeps the shared compositor's pid
+from its answer to `ping` (`compositor <pid>`) as `shared-pid` in the state
+file, and looks among that process's windows (`single::window_pid`). Several
+installations' windows share that process; they are told apart by identity
+(the AUMID from the app id), so two installations that give a `single`
+application the same app id would also share one taskbar button, and the
+lock (`Local\waycompose-single-<session>-<app>`) stays per installation.
+Checked on the guest when the shared compositor is deployed there; before
+that, by unit tests (`a_shared_compositors_windows_are_looked_for_…`,
+`the_shared_compositors_pid_comes_from_its_ping`).
+
 ### 102.10 The GPU
 
 `nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU

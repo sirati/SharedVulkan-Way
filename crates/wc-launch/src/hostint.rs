@@ -193,6 +193,7 @@ mod tests {
             host_app: "firefox".into(),
             desktop: "firefox".into(),
             app_id: String::new(),
+            single: false,
         }
     }
 
