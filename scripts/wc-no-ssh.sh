@@ -154,7 +154,7 @@ cc -O2 -o "$D/probe-ctl-rtt" "$ROOT/scripts/probe-ctl-rtt.c" && {
 T0=$(date +%s%N); for _ in $(seq 1 20); do request a "raw status" >/dev/null; done; T1=$(date +%s%N)
 ok "control round trip (status verb included) $(( (T1 - T0) / 20000000 )) ms mean"
 ps -o pid=,comm= --ppid "$SVC" | grep -qw ssh && bad "the service has an ssh child"
-pgrep -u "$(id -u)" -f "ssh .*wc-session" >/dev/null && bad "an ssh wc-session process exists"
+pgrep -x ssh -P "$SVC,$HUB,$COMP" >/dev/null && bad "a process of this run started ssh"
 
 if [ -n "$PACAT" ]; then
   say "leg 1b: the sound ring (§103.16): a tone into the session's default sink reaches the guest side"
