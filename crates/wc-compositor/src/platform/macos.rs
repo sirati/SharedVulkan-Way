@@ -697,9 +697,11 @@ define_class!(
             if e.momentumPhase().0 != 0 {
                 return;
             }
-            let (h, v, h120, v120) =
-                mac_keys::scroll_axes(e.hasPreciseScrollingDeltas(), e.scrollingDeltaX(), e.scrollingDeltaY());
-            if h == 0.0 && v == 0.0 {
+            let precise = e.hasPreciseScrollingDeltas();
+            let (h, v, h120, v120) = mac_keys::scroll_axes(precise, e.scrollingDeltaX(), e.scrollingDeltaY());
+            // NSEventPhaseEnded (8) or Cancelled (16): the fingers lifted.
+            let stop = precise && e.phase().0 & (8 | 16) != 0;
+            if h == 0.0 && v == 0.0 && !stop {
                 return;
             }
             self.ivars().win.send(FromUi::PointerAxis {
@@ -708,6 +710,8 @@ define_class!(
                 vertical: v,
                 v120_h: h120,
                 v120_v: v120,
+                finger: precise,
+                stop,
                 time: ms(e),
             });
         }

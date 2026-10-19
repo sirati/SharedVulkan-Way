@@ -968,6 +968,8 @@ impl PumpInner {
             vertical: -10.0,
             v120_h: 0,
             v120_v: -120,
+            finger: false,
+            stop: false,
             time: t(),
         });
 

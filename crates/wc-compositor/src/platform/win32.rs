@@ -1203,6 +1203,8 @@ impl WindowState {
             vertical: v,
             v120_h,
             v120_v,
+            finger: false,
+            stop: false,
             time,
         });
     }

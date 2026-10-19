@@ -889,6 +889,12 @@ pub enum FromUi {
         /// spoke it.
         v120_h: i32,
         v120_v: i32,
+        /// A trackpad, not a wheel: `axis_source` finger, continuous values
+        /// and no v120, so a client runs its own kinetic scrolling.
+        finger: bool,
+        /// The fingers lifted: `axis_stop` on both axes, which is what starts
+        /// that kinetic scrolling.
+        stop: bool,
         time: u32,
     },
     /// The keyboard layout changed under us (`WM_INPUTLANGCHANGE`), naming one

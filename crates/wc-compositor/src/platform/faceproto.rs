@@ -421,13 +421,15 @@ impl FromFace {
                     FromUi::PointerButton { id, button, pressed, time } => {
                         w.u8(11).u64(*id).u32(*button).bool(*pressed).u32(*time)
                     }
-                    FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, time } => w
+                    FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, finger, stop, time } => w
                         .u8(12)
                         .u64(*id)
                         .f64(*horizontal)
                         .f64(*vertical)
                         .i32(*v120_h)
                         .i32(*v120_v)
+                        .bool(*finger)
+                        .bool(*stop)
                         .u32(*time),
                     FromUi::PointerRelative { id, dx, dy, time } => w.u8(13).u64(*id).f64(*dx).f64(*dy).u32(*time),
                     _ => return None,
@@ -482,6 +484,8 @@ impl FromFace {
                     vertical: r.f64()?,
                     v120_h: r.i32()?,
                     v120_v: r.i32()?,
+                    finger: r.bool()?,
+                    stop: r.bool()?,
                     time: r.u32()?,
                 },
                 13 => FromUi::PointerRelative { id: r.u64()?, dx: r.f64()?, dy: r.f64()?, time: r.u32()? },
@@ -581,10 +585,19 @@ mod tests {
             FromFace::Ui(FromUi::Key { id: 3, keycode: 30, pressed: true, time: 99 }) => {}
             other => panic!("{other:?}"),
         }
-        let a = FromFace::Ui(FromUi::PointerAxis { id: 1, horizontal: 0.5, vertical: -10.0, v120_h: 0, v120_v: -120, time: 5 });
+        let a = FromFace::Ui(FromUi::PointerAxis {
+            id: 1,
+            horizontal: 0.5,
+            vertical: -10.0,
+            v120_h: 0,
+            v120_v: -120,
+            finger: true,
+            stop: true,
+            time: 5,
+        });
         assert!(matches!(
             FromFace::decode(&a.encode().unwrap()).unwrap(),
-            FromFace::Ui(FromUi::PointerAxis { v120_v: -120, .. })
+            FromFace::Ui(FromUi::PointerAxis { v120_v: -120, finger: true, stop: true, .. })
         ));
         assert!(FromFace::Ui(FromUi::Layout { name: "us" }).encode().is_none());
         let h = FromFace::Hello { section: "firefox".into(), ids: vec!["firefox".into()], token: 42, pid: 9 };

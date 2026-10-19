@@ -1383,8 +1383,8 @@ impl State {
                 FromUi::PointerButton { id, button, pressed, time } => {
                     self.pointer_button(id, button, pressed, time)
                 }
-                FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, time } => {
-                    self.pointer_axis(id, horizontal, vertical, v120_h, v120_v, time)
+                FromUi::PointerAxis { id, horizontal, vertical, v120_h, v120_v, finger, stop, time } => {
+                    self.pointer_axis(id, horizontal, vertical, (v120_h, v120_v), (finger, stop), time)
                 }
                 FromUi::Layout { name } => self.set_layout(name),
                 FromUi::ClipboardChanged { mimes } => self.on_clipboard_changed(mimes),
@@ -2483,8 +2483,8 @@ impl State {
         id: WindowId,
         horizontal: f64,
         vertical: f64,
-        v120_h: i32,
-        v120_v: i32,
+        (v120_h, v120_v): (i32, i32),
+        (finger, stop): (bool, bool),
         time: u32,
     ) {
         let pointer = self.pointer.clone();
@@ -2521,12 +2521,24 @@ impl State {
                  delivered to window {over} (pointer focus)"
             );
         }
-        let mut frame = AxisFrame::new(time).source(AxisSource::Wheel);
+        // A trackpad's frames are a finger's: continuous values, no v120 (a
+        // v120 of 0 read as "no detent" scrolled GTK by nothing), and a stop
+        // when the fingers lift, from which the client runs its own inertia.
+        let mut frame = AxisFrame::new(time).source(if finger { AxisSource::Finger } else { AxisSource::Wheel });
         if v120_v != 0 || vertical != 0.0 {
-            frame = frame.value(Axis::Vertical, vertical).v120(Axis::Vertical, v120_v);
+            frame = frame.value(Axis::Vertical, vertical);
+            if !finger {
+                frame = frame.v120(Axis::Vertical, v120_v);
+            }
         }
         if v120_h != 0 || horizontal != 0.0 {
-            frame = frame.value(Axis::Horizontal, horizontal).v120(Axis::Horizontal, v120_h);
+            frame = frame.value(Axis::Horizontal, horizontal);
+            if !finger {
+                frame = frame.v120(Axis::Horizontal, v120_h);
+            }
+        }
+        if stop {
+            frame = frame.stop(Axis::Vertical).stop(Axis::Horizontal);
         }
         pointer.axis(self, frame);
         pointer.frame(self);
