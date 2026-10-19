@@ -53,6 +53,7 @@ pub mod grow;
 /// docs/waycompose-design.md §96: pointer locks, confinement and relative motion,
 /// the part of them that is arithmetic.
 mod hold;
+mod gpu_fence;
 /// §106: the host-integration channel, served by the process that owns the rings.
 pub mod hostint;
 mod icon;

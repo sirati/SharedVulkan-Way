@@ -83,6 +83,8 @@ pub fn set_pool_hook(hook: PoolHook) {
 
 /// Serve sessions from a pool over `boot`, for the life of the process.
 pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>) -> Result<(), String> {
+    // §104.10 item 5: a GPU process that crashed left its sections behind.
+    crate::shared::sweep_stale_once();
     // SAFETY: only the address is taken, to name the pool's range for its
     // doorbell (§110); nothing is read or written through it here.
     let boot_base = unsafe { boot.base_ptr() } as usize;

@@ -33494,20 +33494,264 @@ was not measured.
 1. **CPU.** The compositor's blit from a section is not damage-scoped, and the
    per-frame SYNC_FD wait is synchronous on KWin's thread. Both are the next
    steps; a heavy-repaint workload is the measurement that should decide.
+   *The wait is gone since §104.11; the composite is damage-scoped, and a
+   window whose picture is one section is drawn without reading it, since
+   §104.12.*
 2. **Plasma's clients** still hand KWin `wl_shm` (llvmpipe) or kopper frames.
    Clients inside the namespace could use dma-bufs too; that needs the GPU side
    to import a section into another session's device, which the registry
-   already allows by name.
+   already allows by name. *The GPU side is ready since §104.11; the NixOS side
+   is not.*
 3. **`zwp_linux_buffer_params_v1.create`** (not immediate) answers `failed`.
 4. **Two installations with the GPU at once**: the GPU device has one mapping,
    so a Firefox session with the GPU and this one exclude each other (as
    before §104).
 5. **A crashed GPU process on Linux** leaves its `/dev/shm` files behind
-   (Windows frees sections itself).
+   (Windows frees sections itself). *Swept at the next start since §104.11.*
 6. **The seat's node is for group `users`**: whichever of the login screen's
    users logs in gets it; any member of the group can open it, which gives
    access to nothing but the fake ioctls.
 
+### 104.11 Implicit sync that nobody waits for, and a client's buffer in KWin
+
+Branch `kwin-gpu-zc-icd`. Three changes to the path above: the sync fd export
+no longer waits for the guest's GPU; a buffer one ICD session made can be
+imported into another (a Plasma client's into KWin's); a crashed GPU process's
+`/dev/shm` files are removed.
+
+**The problem.** Zink exports a `SYNC_FD` semaphore after every flush that
+touched an exported image (`zink_screen_import_dmabuf_semaphore`), and §104.4
+answered it by submitting a wait with a fence and waiting for the fence: KWin's
+thread stalled a round trip to the guest's GPU per frame. The export must
+return at once, and still nobody may read a frame the GPU has not finished.
+The difficulty is ordering: KWin's submit reaches the GPU process on the ICD's
+rings, its commit reaches the compositor through wc-proxy, and the commit can
+arrive before the GPU process has even dequeued the submit. Whoever waits
+must therefore be told *which* work to wait for by somebody who knew it before
+the commit was sent — the ICD.
+
+**The options weighed.**
+
+| option | why not / why |
+|---|---|
+| a per-section "submitted/completed" record the GPU side writes, read by the compositor at commit | racy: "submitted" is bumped when the GPU process dequeues the work, which can be after the commit arrives; the compositor would wait for the previous frame |
+| the token as an open file of the `sv-drm` CUSE node, so `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` reaches the daemon | the import direction works, but the consumer side (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, which Zink uses before sampling an imported buffer) must return a new fd, and a CUSE server cannot put an fd into its caller; it also puts every frame through a root daemon |
+| proxy holds the commit until the GPU is done | the host cannot see the guest's completion without another channel, and the frame would wait for a host round trip after the GPU finished |
+| **the ICD numbers the work; the token carries the number; the consumer waits in the guest** | **chosen**: the number exists before the commit, the wait is where the pixels are read, nothing is added to the GPU's work |
+
+**How it works.**
+
+* **Fence records.** Each GPU session has one (`sv_gpu_server::fence`): a
+  4 KiB named section (`Local\sv-fence-<pid>-<n>-<tag>`, a `/dev/shm` file on
+  Linux) holding `"SVFENCE1"` and `completed`, a little-endian u64.
+  `svFenceRecord` (answered, once per session) names it to the ICD.
+* **Tokens, version 2** (`sv_drm::token`): the header also names the
+  session's record, and the second page of the memfd is the **sync page**, the
+  number of the last work that wrote the allocation. The file is sealed with
+  `F_SEAL_FUTURE_WRITE` instead of `F_SEAL_WRITE`: no `write` and no new
+  writable mapping for anybody, but the ICD's mapping of the sync page, made
+  before sealing, stays writable. One token file per allocation;
+  `vkGetMemoryFdKHR` returns a `dup` (as a kernel export returns another fd for
+  the same buffer), so every holder maps the same page.
+* **The export.** `vkGetSemaphoreFdKHR(SYNC_FD)` numbers the semaphore's
+  pending signal (`seq`, from 1 per session) and returns -1 at once. Zink asks
+  for the image's memory fd right after (measured with Mesa 26.2's real path
+  in `sv-dmabuf-e2e.sh`); then the ICD sends `svFenceMark{queue, semaphore,
+  seq, memory}` on the queue ring, unanswered, and stores `seq` in the sync
+  page. The GPU side submits an empty batch waiting on the semaphore with a
+  fence (what the export did before, minus the wait); a watcher thread per
+  session waits for the fences in order and writes `completed = seq`.
+* **KWin → compositor.** wc-proxy maps the sync page of each dma-buf buffer's
+  token. On a commit it reads `seq` and, if it is larger than what it already
+  sent for that record, sends `wc_gpu_fence_v1.wait(record, seq)` before the
+  commit (`crates/wc-compositor/protocols/wc-gpu-fence-v1.xml`), on an object
+  bound at the id one past the client's highest and destroyed right after; its
+  `delete_id` is dropped by count. The compositor (`gpu_fence.rs`, a new module;
+  `surface.rs` is untouched) does not return from the request until the record
+  says `completed >= seq` — usually the first check — or 100 ms passed; a
+  record that ran out its time is not waited on again until it moves.
+* **Client → KWin (another session).** Before Zink samples an imported
+  dma-buf it asks for its memory fd *without* an export in front
+  (`zink_screen_export_dmabuf_semaphore`, whose `EXPORT_SYNC_FILE` then fails
+  on the memfd). The ICD takes that as "the next batch reads this": it reads
+  the producer's record and number from the token and sends `svFenceWait{memory,
+  seq, record}` before the next submit. The GPU side waits on the producer's
+  in-process progress on the consumer's queue-ring thread (not the app's,
+  and no GPU work), up to 2 s. The same message also waits for every mark
+  another session has made on that section that the GPU process has already
+  seen: the reads of a consumer, before the producer writes again.
+* **Fallback.** A GPU side without a record (`svFenceRecord` refused) gets
+  the old behaviour, the export waits; a version-1 token is waited for by
+  nobody, as before §104.11 except that the export no longer blocks.
+
+**Cross-session import.** The registry of sections was already process-wide
+(a static); what changes is that it is now exercised and its lifetime spelled
+out: each import maps its own view (a new mapping of the section, never the
+creator's pointer imported into a second device), the entry counts the views
+of every session, the creator's free does not end the section while another
+session holds a view (Windows: each view's own section handle keeps it; Linux:
+the file is unlinked with the last view), and the nonce is checked as before.
+
+**Crashed GPU processes** (Linux): before its first section a GPU process
+removes `/dev/shm/sv-shared-<pid>-<n>-<16 hex>` and `sv-fence-…` files owned by
+its user whose pid is not a process (`kill(pid, 0)` is `ESRCH`); a reused pid
+keeps its files. Windows has nothing to sweep.
+
+**Checked locally** (logs: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`):
+
+| test | result |
+|---|---|
+| `scripts/sv-dmabuf-e2e.sh` | PASS: the export returns in microseconds, the record reaches the number ~0.3 ms later, all pixels right; Zink's own path (egl-dmabuf) marked its export for its section without waiting |
+| `scripts/sv-dmabuf-xsession-e2e.sh` (new; two processes, one pool-guest) | PASS: the producer hands the token on 40 µs after a submit that keeps lavapipe busy for ~80 ms; the consumer's copy waits for it on the GPU side and reads the producer's colour in every pixel. With `SVX_NO_ACQUIRE=1` (no acquire, so no wait) the same copy finishes in 2 ms and reads 32768 wrong pixels. The consumer's frame back to the producer, and the section outliving the producer's free |
+| `scripts/wc-dmabuf.sh` (Wine; the client draws each frame 15 ms *after* committing it and completes its own record) | 15 passed: 355 `wc_gpu_fence_v1.wait`s, the compositor held all 355 commits until the frame was done, the bar where the last frame put it |
+| `scripts/sv-pool-e2e.sh` | PASS |
+
+**What is not done.** The compositor's wait blocks its thread (bounded); a
+commit held without blocking would need the surface code. Zink's export and
+the memory fd that follows are paired per thread, by order; a Mesa that asked
+for them in another order would leave the sync page at the previous frame.
+The consumer-to-producer ordering (a producer writing again while
+another session still reads) is as good as the order the GPU process sees the
+marks in. Plasma's clients still need the NixOS side (104.6) to run inside
+`sv-drm ns` with the ICD's environment.
+
+### 104.12 What the compositor pays per frame
+
+2026-10-19, branch `kwin-gpu-zc-comp`. 104.8 measured the guest's compositor
+at 34–35 % of a core under OpenGL against 16–20 % under QPainter, and put it
+down to a read of the whole section at every commit.
+
+**It was not the read.** `present` copies only the commit's damage out of the
+client's buffer into the surface's staging shadow, for a section as for every
+pool. The staging shadow is per surface, and a commit's damage is relative to
+the surface's previous content, which is what that shadow holds, so no
+per-buffer arrears are needed here (the proxy needs them, §27.4, because its
+copies are per buffer). KWin damages its layer with `damage_buffer` and the
+frame's damaged region (`wayland_layer.cpp`). The full-frame work came after
+the read: `compose_tree` recomposited the window's whole tree into its shadow
+at every commit (KWin's 1264x713 black root, a single pixel stretched by a
+viewport, and the 1264x713 layer over it), blending a translucent layer pixel
+by pixel, and `WM_PAINT` handed the whole shadow to `SetDIBitsToDevice`.
+Locally, in KWin's shape with a 64x64 change at 60 fps, that cost 3 % of a core
+with opaque frames and 15–17 % with translucent pixels in the layer. An OpenGL
+framebuffer can carry alpha below 1 where QPainter's frames are opaque; that
+would explain the guest's difference, and was not measured there.
+
+**(a1) Only the damage is recomposed.** `Window::composed` keeps the shape the
+shadow was last composited from: the canvas, and each drawn surface's place,
+size and format. While a commit leaves that shape as it was, only the commit's
+damage is recomposed. `Shadow::compose_stack` recomputes each rectangle from
+the staging shadows alone, and it is the same function the whole canvas is
+drawn with, so a part cannot disagree with the whole, and overlapping
+rectangles give the same pixels. A changed shape, or a change with no damage to
+name (a view, a removed subsurface, a geometry), is recomposed whole.
+`WM_PAINT` hands GDI only the band of rows the update region spans.
+
+**(a2) A window whose picture is one buffer is drawn from that buffer.** The
+conditions: the committing surface is the topmost of a mapped toplevel whose
+caption is not folded, covers the canvas exactly, with no viewport, scale or
+transform between buffer and surface; the tree is as it was last composited;
+the buffer is `Xrgb8888`, or `Argb8888` over nothing but opaque black single
+pixels (premultiplied over black is the buffer's own colour, and GDI draws a
+window opaque); its pool is a `Section` or a `SharedFile`, rows and offset
+DWORD-aligned. KWin's primary layer over its black root is that case. Then
+nothing is read. The section is opened once per buffer
+(`wc_handle::Handle::open_section_object`, readable and writable because GDI
+refuses read-only sections; GDI is its only user and only reads it), the UI
+thread makes a DIB section over it (`CreateDIBSection(…, hSection, offset)`,
+`stride / 4` pixels wide so padded rows fit), selects it into a memory DC and
+`BitBlt`s the update region.
+
+Such a buffer is not released at its commit, because `WM_PAINT` can draw from
+it at any time. The buffer it replaced is released when the UI thread answers
+the `ToUi::Direct` that replaced it (`FromUi::DirectShown`; the answers come in
+order). KWin's swapchain keeps two or three buffers and expects the one shown
+to be held. Leaving the path (any other commit, a changed tree, a DIB that
+could not be made) re-reads the surface's staging shadow whole from the buffer
+still held, recomposites the window whole, and only then tells the UI thread to
+draw the shadow, so it never draws a shadow that is not yet the picture.
+Popups (layered windows), folded captions, and every other pool (arena slices,
+memfds) stay on the shadow, and `WC_DIRECT_PRESENT=off` puts every window
+there.
+
+**How to tell which path a window took.** One log line per window whenever
+it changes:
+
+    wc-compositor: window 1 is drawn directly from its client's buffer, which this process does not read (surface 17, 1280x720 Argb8888, stride 5120, offset 0)
+    wc-compositor: window 1 is drawn from its shadow: <why>
+
+`<why>` is the first condition above that failed. The frame trace's
+`wc.present` and `wc.paint` lines carry `direct=1` on the direct path.
+
+**Measured locally**, under Wine on Xvfb, release builds: the compositor
+process's CPU (utime + stime of the Wine process, `/proc`) over 20 s at 60 fps,
+two runs each. `scripts/wc-dmabuf.sh` with `WC_DMABUF_BENCH="NBUF FMT SQ
+SHAPE"` runs it: a 1280x720 window, three buffers in `/dev/shm` sections used
+as KWin's swapchain uses them (reused only after release, each repainting what
+it owes), an SQ x SQ square moving, only it damaged. `kwin` is KWin's shape (a
+black single pixel, the frames in a subsurface over it); `argbt` is
+translucent.
+
+| shape, damage | before | (a1) | (a1) + (a2) |
+|---|---|---|---|
+| one surface, xrgb, 64x64 | 2.3 / 1.9 % | 1.7 / 1.5 % | 1.5 / 1.2 % |
+| kwin, xrgb, 64x64 | 3.1 / 3.1 % | 1.7 / 1.3 % | 1.5 / 1.5 % |
+| kwin, argb, 64x64 | 3.2 / 4.3 % | 1.1 / 1.3 % | 1.8 / 1.4 % |
+| kwin, argbt, 64x64 | 17.5 / 15.0 % | 2.7 / 1.3 % | 1.8 / 1.4 % |
+| kwin, xrgb, 720x720 moving | 5.2 / 5.2 % | 5.8 / 4.7 % | 3.3 / 3.2 % |
+| kwin, argbt, 720x720 moving | 12.4 / 11.8 % | 6.9 / 8.2 % | 3.0 / 3.5 % |
+
+With little damage, (a1) already does what (a2) does; what remains, about
+1.5 %, is the per-commit work around the pixels (the Wayland dispatch, the
+frame callback, a log line per commit). With much damage, (a2) halves (a1),
+because nothing of the frame is copied on this side. Xvfb stayed under 1.1 %.
+Numbers: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`.
+
+**Checked.** A unit test that a stack recomposed in parts, overlapping parts
+included, is the stack recomposed whole. `scripts/wc-dmabuf.sh`: 13 of 13 (it
+now takes the direct path). `WC_DMABUF_BENCH_CHECK=1`: the compositor's last
+frame dump and the screen (Xvfb's root window) are the client's last buffer
+pixel for pixel, on both paths, in both shapes, opaque and translucent; with
+`toggle` (a buffer in the other format every 50th frame and last) the window
+left the direct path and came back 11 times in 4 s, and the last frame, drawn
+right after leaving, was exact on screen too.
+
+**With §104.11's fence.** A commit held for `wc_gpu_fence_v1.wait` is
+processed only after the wait returns, so when the record said done, the
+direct path, which reads the buffer later still (at `WM_PAINT`), never sees an
+unfinished frame. A wait that gave up (`Late`) or could not wait (`Refused`)
+lets the commit go on unfinished; that client's next buffer commit is then
+drawn from the shadow ("drawn from its shadow: its GPU frame was not done when
+it was committed"), unless the record got there meanwhile
+(`gpu_fence::Unfinished`, unit-tested), and the next commit of that surface
+reads the late commit's damage again, from a buffer that is complete there:
+without it, the part of the late frame's change that the next frame does not
+damage stayed stale on screen (measured: a 64x4 strip). `scripts/wc-dmabuf.sh` with
+`WC_DMABUF_FENCE=1 WC_DMABUF_FENCE_LATE=N` and a bench makes every Nth frame
+miss the 100 ms limit and checks that each such commit fell back.
+
+**On the guest, still to see.**
+
+1. The log line for KWin's window. "Drawn from its shadow: …" names the
+   condition that failed.
+2. That `OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE)` on the GPU
+   process's section succeeds (same user, default DACL, so it should), and
+   that `CreateDIBSection` accepts the section the Intel driver imported. If
+   either fails, the log says "its section could not be opened for GDI" or
+   "cannot be drawn from its client's buffer: CreateDIBSection failed", and the
+   window stays on (a1).
+3. The compositor's CPU by 104.8's method, and the picture: correct, no
+   tearing, the caption and frame unchanged.
+4. Whether GDI's reads of those pages are slow: they are imported into the
+   GPU's device as host memory, and whatever cache attribute the driver gave
+   them, the compositor's `BitBlt` now reads them where `present` read them
+   before.
+
+| gate | result |
+|---|---|
+| `cargo test -p wc-compositor -p wc-handle` | 238 and 55 passed, 0 failed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo clippy -p wc-compositor -p wc-handle` (Linux, `--all-targets`, and the Windows target) | no warning in a line this branch wrote |
 
 ## 105. Windows without ssh: the session boots from the device's header page, and every byte crosses on its rings
 
