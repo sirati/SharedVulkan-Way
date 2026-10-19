@@ -31616,18 +31616,21 @@ identity of its own, and everything gone when the window is closed.
 
 ### 102.1 Status in one paragraph
 
-Built, and proven locally end to end in a NixOS VM test whose host compositor
-is this project's own: `wc-compositor.exe` under Wine on an Xvfb, `wc-proxy` in
-front, a session directory laid out as `wc-session` lays it out, and the VM
-has no GPU, as testhost's host has none. The login screen appears in the
-Windows window, a password login starts Aero in the same place, both windows
-carry one identity and the title "Windows 7 (Linux)", the session's sound
-reaches the waycompose session's PulseAudio, the nested output follows a
-resize, and closing the window ends KWin, the session, greetd and the seat,
-unloads `vkms` and takes the ACLs back. KWin needed three globals the
-compositor did not offer (102.3); they are behind a session flag. On
-testhost the system is switched and the VM runs with 2 GiB less RAM (102.8);
-the run on the real guest is in 102.9.
+**Works end to end on the real guest.** A medium-integrity click on the
+desktop shortcut "Windows 7 (Linux)" shows the nested login screen in one
+Windows window in 4.4 s, and the Aero session in 5.3–5.4 s (autologin
+armed by root for the test, 102.9). In that window the start menu opens on a
+click, typing reaches its search field and finds applications, Dolphin opens,
+sound from the session plays on Windows, the window resizes and maximises and
+KWin's output follows (1000×600, 1280×729), and the close button ends KWin,
+the session, greetd and the seat, unloads `vkms` and lifts the memory cap.
+About 31 frames a second with an animating client at 1280×729, KWin
+compositing in software. The guest run found four bugs, all fixed: KWin's
+frames stopped after the first map with damage-scoped copies (102.9),
+clicks were delivered at a frozen origin during a click (102.9), the nested
+Plasma locked itself after five minutes, and the login screen outlived a
+session ended under it. Locally the NixOS test passes 10 of 10. The VM runs
+with 2 GiB less RAM (10496 MiB) since 2026-10-17.
 
 ### 102.2 The path
 
@@ -31776,6 +31779,63 @@ guest is the check for that.
 
 ### 102.9 On testhost
 
+**The system.** testhost runs nix-config `a036e81`'s system
+(`sw708k1…`), switched after `dry-activate` each time; `windows-vm` was never
+restarted by a switch. The RAM change took effect at a clean restart on
+2026-10-17 18:31, made while the guest was idle and locked: `qemu-ga`
+shutdown, "guest powered down cleanly", QMP `base-memory` 11005853696
+(10496 MiB). After it the iGPU, both IVSHMEM devices and the virtio-serial
+ports were started, the boot task re-enabled and re-permitted `svbell` and
+`wcbell` (`wc-port-access.log` 18:31:53), the bell hub reattached to both, and
+the guest's memory reads 10.2 GiB visible, 5.6 GiB free at the desktop. One
+surprise: the guest's LAN adapter came up link-local, and `ipconfig /renew`
+over the host link brought back <guest-ip>. <guest-user> was signed back in with
+one `unlock-guest.sh`. Host memory available went from 1.1 GiB to 3.1 GiB.
+
+**The installation.** `wclinux` (guest `C:\Users\<guest-user>\wclinux`, host
+`~/wc-launch-linux`, port 57541, `nested-compositor-globals = on`,
+`copy-scope = buffer`), deployed with `WC_LAUNCH_EXTRA_APPS`,
+`WC_LAUNCH_EXTRA_APP_BLOCKS` and `WC_LAUNCH_INSTALL_APPS=linux-desktop`: 15
+passed (`docs/nested-linux/deploy-102b.txt`).
+
+**The runs** (2026-10-19, 07:20–08:50, the guest idle per `guest-idle.sh`,
+under the lease; it had been locked overnight and was unlocked once with the
+PIN and locked again after each block; input through `wc-desk`, one step at a
+time; captures of our window only, judged by separate agents):
+
+| run | what | result |
+|---|---|---|
+| A | login screen | the greeter in the window, titled "Windows 7 (Linux)", taskbar identity `Waycompose.app.atp-nested`, pinnable; 376 MB in the greeter's slice |
+| B | autologin to Aero | the desktop drawn at login, but no later frame reached the window |
+| D | frame trace (`WC_FRAME_TRACE`) | the compositor received and painted KWin's frames (`wc.present` 1264×713, `wc.paint`), yet the window's pixels did not change while Dolphin opened |
+| E | `copy-scope = buffer` | Dolphin appears (139 000 pixels changed); sound: a tone in the session played on Windows (2.6 s not silent of 5 s); resize through `SetWindowPos` → KWin output 1000×600, maximise → 1280×729; ~31 fps (63 commits/s, two per frame) with `weston-presentation-shm`; 1.3–1.6 GB in <desktop-user>'s slice, 2.0–2.3 GiB available on the host |
+| F | the pointer fix, `copy-scope = buffer` | the start menu opens on a click, "sea" typed into its search finds nine applications; close button → seat, session, `vkms`, ACLs, cap all gone; 486 frames presented |
+
+**Frames with damage-scoped copies.** With the default `--copy damage` the
+guest's window kept KWin's first frame. The trace shows every frame
+composited and painted from the arena slice, so the slice held stale pixels:
+KWin's QPainter swapchain republished its 3.6 MB pool into a second slice
+(`pool 29 … slice 0`, then `slice 3608576`), and the damage-scoped copy did
+not bring the new slice up to date. Locally (file arena under Wine) the same
+KWin updates correctly, so the exact sequence was not reproduced. Whole-buffer
+copies fix it on the guest at 3.6 MB per frame of host memory bandwidth, so
+the installation uses them (`$BASE/copy-scope`). The cause in the arrears
+logic is open.
+
+**Clicks inside KWin.** `wl_pointer` coordinates on KWin's layer subsurface
+were frozen at the origin they had when the button went down (smithay's
+`ClickGrab`), so with motion during a click KWin saw the pointer elsewhere and
+its start menu did not open. `TreeClickGrab` resolves the origin from the
+surface tree at every event, on one input clock (five tests).
+
+**Faults.** None: no `Display`/`dxgkrnl` events and no application crash on the
+guest in the window of the runs; GPU forwarding was not used (`gpu = off`).
+
+**Our input counted as the user's.** The activity sentinel recorded
+`wc-desk`'s clicks as injected input that was not ours (`ours 0`), so one run
+stopped itself. The helper now writes each step's span into the guest's
+`inject.log`; why the WCAGENT1 tag was not seen is open.
+
 ### 102.10 The GPU
 
 `nestedTest.gpuForwarding` (off) lets the seat pass the session's GPU
@@ -31790,14 +31850,25 @@ definition.
 
 | gate | result |
 |---|---|
-| `cargo test --workspace --no-fail-fast` | 3007 passed, 0 failed, 8 ignored (master 2989) |
+| `cargo test --workspace --no-fail-fast` | 3012 passed, 0 failed, 8 ignored (master 2989) |
 | `cargo clippy --workspace --all-targets` | no warning in a line this branch wrote |
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 | `scripts/wc-pool.sh`, `scripts/wc-keymap.sh` | OK, OK |
-| NixOS test `nested-waycompose` | 9 of 9 subtests |
+| NixOS test `nested-waycompose` | 10 of 10 subtests |
+| `wc-launch.sh deploy` (`wclinux`) | 15 passed |
 
 ### 102.12 What is not done
 
-1. Face login: no camera on the host. The password is the way in.
-2. Aero glass: QPainter has no blur (102.3).
-3. KWin and Plasma on the forwarded GPU (102.10).
+1. **Face login**: the host has no camera (both USB controllers are the
+   guest's). The password logs in.
+2. **Aero glass**: KWin composites with QPainter, which has no blur (102.3).
+3. **KWin and Plasma on the forwarded GPU** (102.10): not enabled, not measured.
+4. **Damage-scoped copies** for KWin on the guest (102.9): worked around per
+   installation; the cause is open.
+5. **An interactive drag of the window's border** through `wc-desk` did not
+   resize (a double click on the caption neither); `SetWindowPos` and maximise
+   did, and KWin followed. A person's drag was not tried.
+6. **The login screen with a real password** was shown up to its prompt;
+   <desktop-user>'s password is not known here, so the session runs used root's
+   one-shot autologin. The password path is covered by the local VM test.
+7. **The activity sentinel and `wc-desk`'s tag** (102.9).
