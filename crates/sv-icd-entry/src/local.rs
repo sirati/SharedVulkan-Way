@@ -991,8 +991,17 @@ pub unsafe extern "system" fn sv_vk_get_physical_device_surface_capabilities_khr
         VkSurfaceTransformFlagsKHR::VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     out.current_transform =
         VkSurfaceTransformFlagBitsKHR::VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    out.supported_composite_alpha =
-        VkCompositeAlphaFlagsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // A Wayland surface also takes premultiplied alpha: `wl_shm`'s ARGB8888
+    // is premultiplied, and a compositor blends it. GTK4 asks for it and
+    // falls back to opaque without it, which turns its client-side shadow
+    // into a black frame. X11 and headless stay opaque.
+    out.supported_composite_alpha = match t {
+        PresentTarget::Wayland { .. } => {
+            VkCompositeAlphaFlagsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                | VkCompositeAlphaFlagsKHR::VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR
+        }
+        _ => VkCompositeAlphaFlagsKHR::VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+    };
     // `TRANSFER_SRC` is not a courtesy to the application: it is what the ICD
     // itself needs, because presenting is `vkCmdCopyImageToBuffer` out of the
     // image the application rendered into.
@@ -1075,6 +1084,9 @@ pub unsafe extern "system" fn sv_vk_create_swapchain_khr(
         image_usage: ci.image_usage.0,
         present_mode: ci.present_mode.0,
         old_swapchain: ci.old_swapchain,
+        premultiplied_alpha: matches!(target, PresentTarget::Wayland { .. })
+            && ci.composite_alpha
+                == VkCompositeAlphaFlagBitsKHR::VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
     };
     match icd().create_swapchain(dev, &desc) {
         Ok(id) => {
