@@ -148,7 +148,15 @@ hub_up() {
   return 1
 }
 # The Wayland doorbell a proxy connects to: the hub's, or QEMU's own socket.
-wcbell_use() { if hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
+# The hub's Wayland socket, when a hub runs and serves it. A guest that
+# hosts the sessions itself (§103.17, role b) has only that: its hub holds the
+# guest's own port, and there is no QEMU socket at $WCBELL.
+wl_hub() {
+  [ -S "$HUBDIR/wl.sock" ] || return 1
+  [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
+  env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet wc-bell-hub.service
+}
+wcbell_use() { if wl_hub || hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
 UID_=$(id -u)
@@ -925,6 +933,8 @@ up)
     [ "$VER" = 2 ] && RLEN=$(od -A n -t u8 -j 72 -N 8 "$ARENA" | tr -d ' ')
     if [ "${RLEN:-0}" = 0 ]; then
       WHY="the compositor kept no rings (header version $VER; its log says why)"
+    elif wl_hub; then
+      WHY=""
     elif [ ! -S "$WCBELL" ]; then
       WHY="no doorbell socket at $WCBELL: the VM has no org.sirati.wcbell.0 port"
     elif [ ! -r "$WCBELL" ] || [ ! -w "$WCBELL" ]; then

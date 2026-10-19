@@ -214,8 +214,10 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
     None
 }
 
-/// How long a request waits for its answer before it parks (§105.13).
-const SPIN: Duration = Duration::from_micros(300);
+/// How long a request waits for its answer before it parks (§105.13): a
+/// millisecond covers the host waking from its park and answering, so the
+/// answer needs no doorbell back. Only while a request is outstanding.
+const SPIN: Duration = Duration::from_millis(1);
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
