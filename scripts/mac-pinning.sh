@@ -11,12 +11,14 @@ ulimit -c 0
 inst=${MACVM_INSTANCE:-wayland-host}
 root=$(cd "$(dirname "$0")/.." && pwd)
 idir=/mnt/datasets/macvm/instances/$inst
+# The VM's account comes from the VM store, not from this repository.
+VMUSER=$(sed -n 's/.*"user": "\([^"]*\)".*/\1/p' "$idir/instance.json")
 mvm=/mnt/datasets/macvm/bin/macos-vm
 rounds=${1:-3}
 pressure=${2:-2560}
 small=${WC_PIN_SMALL:---arena-small-pages-may-corrupt-guest-memory}
 arena=$((64 * 1024 * 1024)); out=$((1024 * 1024))
-run=/mnt/datasets/builds/wcrun/mac-pin-$(date +%Y%m%d-%H%M%S); mkdir -p "$run"
+run=${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-pin-$(date +%Y%m%d-%H%M%S); mkdir -p "$run"
 vm() { "$mvm" ssh "$inst" "$@"; }
 port=$(sed -n 's/.*"ssh_port": \([0-9]*\).*/\1/p' "$idir/instance.json")
 ssh_opts=(-i /mnt/datasets/macvm/support/id_ed25519 -p "$port" -o UserKnownHostsFile="$idir/known_hosts" -o IdentitiesOnly=yes -o IdentityAgent=none -o BatchMode=yes)
@@ -26,7 +28,7 @@ sock=wl-pin-$$
 press=/tmp/wc-press-$$
 trap 'vm "pkill -f \"wc-compositor --socket $sock \"; pkill -f \"^$press\"" >/dev/null 2>&1' EXIT
 
-rsync -a -e "ssh ${ssh_opts[*]}" "$root/target/x86_64-apple-darwin/debug/wc-compositor" c3r@127.0.0.1:wc/bin/wc-compositor
+rsync -a -e "ssh ${ssh_opts[*]}" "$root/target/x86_64-apple-darwin/debug/wc-compositor" $VMUSER@127.0.0.1:wc/bin/wc-compositor
 cat > "$run/press.c" <<'E'
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +37,7 @@ int main(int c, char **v) { size_t n = (size_t)atoi(v[1]) << 20; char *p = mallo
   for (int r = 0; r < 3; r++) { for (size_t i = 0; i < n; i += 4096) p[i] = (char)(i >> 12) + r; sleep(5); }
   free(p); return 0; }
 E
-rsync -a -e "ssh ${ssh_opts[*]}" "$run/press.c" c3r@127.0.0.1:/tmp/press.c
+rsync -a -e "ssh ${ssh_opts[*]}" "$run/press.c" $VMUSER@127.0.0.1:/tmp/press.c
 vm "cd /tmp && clang -O1 -o $press press.c && mkdir -p -m 700 /tmp/wcpin && rm -f /tmp/wcpin/comp.log"
 vm "XDG_RUNTIME_DIR=/tmp/wcpin ~/wc/bin/wc-compositor --socket $sock --timeout 900 $small \
   --arena-guest-ram 0:$arena --arena-outbound 0:$out > /tmp/wcpin/comp.log 2>&1 &"

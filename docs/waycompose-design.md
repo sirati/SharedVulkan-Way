@@ -32182,6 +32182,124 @@ BAR as region 0. A session per process is what macOS has.
   The server's arena is a buffer import, so the same code should work there.
   That is unproven: there is no Metal here.
 
+#### 103.6.1 The cold path moves into the extent's first page
+
+The paragraph above ("The cold path is a TCP listener on 127.0.0.1 … an ssh
+forward") described the first version. On macOS no part of the GPU path may
+cross a socket, an ssh forward or TCP, so that version is gone: `sv-gpu-server
+guest --port` now refuses with the reason. The cold path's two messages,
+`Hello` and `Accept`/`Refuse`, now travel in the extent's own first page. That
+page is guest RAM the host already has to find.
+
+**The mailbox** (`sv_transport::coldpage`) sits at byte 512 of page 0, past
+every `arena_record` slot (0..152). Page 0 keeps its stamp, and the host's
+locate and index check see an ordinary page. It holds a magic (`SVCOLDP1`), a
+state word (empty, offered, claimed, replied), a heartbeat, the host's claim
+nonce, a 16-byte label, the guest's `Hello` at 1024 and the host's reply at
+2560. Both messages are `ColdMessage::encode` bytes, the same serialiser every
+cold path uses.
+
+| step | guest (`sv-gpu-server guest`) | host (`sv-hostd qemu-serve --cold mem:LABEL`) |
+|---|---|---|
+| 1 | stamps the window (as before), writes the offer, then the state | sweeps QEMU's backend once, recording every stamped page by run id and every page 0 that holds an offer (`locate::sweep_offers`) |
+| 2 | beats the heartbeat and polls the state every 1 ms, up to `--cold-wait` (120 s); opens the driver on a second thread meanwhile | takes an offer with its label only once the heartbeat has moved (`is_live`): freed guest pages are not zeroed, so a dead process's offer survives with a frozen heartbeat |
+| 3 | logs the claim | claims it with a compare-and-swap, offered→claimed, through a one-page mapping of the backend |
+| 4 | | builds the page map out of the same sweep (`map_from_sweep_completing`), stitches, checks every page's index, writes `Accept` and then the state |
+| 5 | `Control::create` over the stamps, which zeroes the mailbox | waits for the control magic (`await_control`) before it hands any ICD the region |
+
+Step 5's wait fixes a race the ssh path hid. An ICD that maps the region
+before `Control::create` reads `SVARENA1` and refuses. This was measured in
+the old path itself: with the harness polling every 10 ms instead of every
+500 ms, `sv-icd` failed with "magic is 0x31414e4552415653". The guest now
+publishes 3 µs after the Accept, and the host waits for it.
+
+A sweep that starts while the guest is still stamping can reach page 0 after
+the offer but have passed some pages before their stamps landed. The offer is
+written after every stamp, and one `pread` copies a chunk front to back. So
+only pages below the offer's offset can be missing, and only that range is
+read again. Measured once: 1,504 MiB re-read instead of a second 4 GiB sweep.
+
+**The memory is pluggable, not the protocol.** `coldpage` takes a
+`SharedRegion` whose byte 0 is the extent's first byte. `sv-gpu-server
+mem-guest --region FILE` (Linux and macOS) puts the extent in a file. `sv-hostd
+--cold file:PATH` reads the offer at offset 0 without sweeping, and it hands
+the ICD the path with `run_count = 0`. That is role (b): a Mac's RAM-disk file
+(`/Volumes/linux-vm-shm/arena`), seen in a libkrun Linux VM through virtio-fs
+DAX (`/run/host-shm/arena`). Run on this workstation with `/dev/shm` and Linux
+lavapipe in place of DAX: 3 frames of 256x256 byte-identical, and 5.3 ms from
+`sv-hostd`'s start to serving. The mailbox's exchange over two mappings of one
+file is a unit test.
+
+**The doorbell is pluggable, and this VM has none.** `--bell` takes
+`vdoorbell::PortHandle::open`'s forms. `socket:PATH` is a QEMU chardev's host
+end (Linux and Windows hosts). `dev:NAME` is the guest's port: on macOS,
+`/dev/NAME`, a `cu.*` node. `fd:R,W` is a descriptor pair a parent passed down:
+the Mac host's end of libkrun's `org.sirati.svbell.0`, which is new and
+unit-tested over a socketpair. A bare name keeps `open_bell_port`'s convention.
+The doorbell is attached after the Accept, for the rings. The cold exchange
+itself polls, because it happens once per session and a 1 ms tick is small
+next to a 0.5 s sweep. `wayland-host` has a 16550 (`/dev/cu.serial1`) whose
+host end is a log file, and no virtio-serial port, so its ring waits poll as
+"Waiting" above describes.
+
+**The one bootstrap left is the launch.** `scripts/mac-gpu.sh` uses ssh to
+copy the binary and to start the server with a label it chose (`mg<pid>`).
+The host learns nothing else over it: the run id, geometry and extent come out
+of guest RAM. The script checks this every run. In the VM, `lsof` on the
+serving process shows 0 network sockets and 0 Unix sockets. Here, `sv-hostd`'s
+descriptors are compared against `/proc/net`: 1 Unix socket (the ICD's
+listener) and 0 TCP. QMP is read once for the region table and closed. A
+deployment would start the server from `wc-launch` in the VM with a fixed
+label, which needs no ssh at all.
+
+**Measured** in `wayland-host` (4 GiB, 80 MiB extent of wired 4 KiB pages,
+lavapipe). The ssh rows use the previous binaries, kept from before this
+change, under the same instrumentation.
+
+| | ssh forward + TCP (before) | first page of guest RAM (now) |
+|---|---|---|
+| cold path, server already published: `sv-hostd` start to the ICD socket | 0.631, 0.700, 0.793, 0.723, 0.732 s (forward setup, Hello, sweep, stitch, Accept) | 0.539, 0.569, 0.520, 0.580 s (sweep, claim, stitch, Accept, control header) |
+| of which the sweep | 0.47 to 0.60 s | 0.47 to 0.53 s |
+| guest: Hello/offer claimed to Accept | 0.50 to 0.63 s (Hello written to Accept, sweep included) | 30 to 40 ms (claim to Accept; the sweep came before the claim) |
+| server launched and `sv-hostd` started together | not possible (the forward needs the listener) | 0.85, 0.85, 0.88, 1.11, 1.15, 1.18 s (1 or 2 sweeps, one completion re-read) |
+| first frame after the probe's first line | 10 to 11 ms | 9 to 13 ms |
+| 120 frames 1280x720, present in the call | 2.01 ms/frame | 2.18, 2.22 ms/frame |
+| the same, pipelined | 1.16 ms/frame | 1.03, 1.18 ms/frame |
+| `[icd]` ring waits, mean | 0.39 to 0.40 ms | 0.38 to 0.45 ms |
+
+The frames did not get faster, and they could not: no frame ever crossed ssh.
+The cold path lost the forward's ~0.2 s. Every result passed: `present`
+(3 frames byte-identical, nine runs), `compute` (245,760 words, 0 wrong) and
+`window` (vkcube 400x300 mapped through the compositor's arena slice, 7,051
+commands). A Sonnet check of the QMP screendump passed: a "vkcube" window with
+about 400x300 of content, the textured LunarG cube shaded per face and upright,
+the clear colour edge to edge, and no stripes or channel swap. The first two
+screendumps were entirely black. The cause was the VM's idle screen saver,
+whose Aerial content this GPU-less WindowServer cannot composite; it is now
+disabled for the user.
+
+**How the GPU path crosses the boundary, per channel, and its copies per
+frame:**
+
+| channel | crosses by | copies |
+|---|---|---|
+| cold path (`Hello`, `Accept`) | the mailbox in page 0 of guest RAM: the host reads it through QEMU's memfd and writes the reply the same way | none per frame; once per session |
+| ICD attach (`AttachRequest`, `Attach`, runs) | a Unix socket on this workstation only, between `sv-icd` and `sv-hostd` | none per frame; the ICD then maps guest RAM by name |
+| commands and replies | the rings in the control region (guest RAM), each packet written once by its producer and read in the other's mapping | the ring write itself |
+| wakes | polled (no port in this VM); `--bell` when one exists | none |
+| frame pixels, headless | lavapipe in the VM copies the swapchain image into the arena's readback buffer (`vkCmdCopyImageToBuffer`, recorded at swapchain creation) | **1**, inside the VM |
+| frame pixels, `window` | that copy, then `sv-icd` copies arena → `wl_shm` buffer, which is the compositor's arena slice, also guest RAM | **2** (one per side); then the compositor's own present copies (103.7) |
+| compute results | the shader writes the arena buffer, and the host reads it in place | **0** |
+
+In `window` mode the vkcube's *Wayland* connection still goes through
+`scripts/mac-window.sh`'s ssh forward. That is the Wayland path, not the GPU
+path, and 103.14 replaces it.
+
+**Not proven:** role (b) on a real Mac. The file path ran on Linux over
+`/dev/shm`, not virtio-fs DAX, and the `fd:` doorbell has only run in a unit
+test. A doorbell in this VM was not tried either, since hot-adding a port to a
+running guest that others use was out of bounds.
+
 ### 103.7 Wayland onto AppKit, and what cocoa-way contributes
 
 cocoa-way (J-x-Z/cocoa-way, 2.1.0, last commit 2026-10-14) is a smithay
@@ -32356,6 +32474,17 @@ tried, because at 4096 MiB the guest already has no superpages, and a smaller
 guest only makes its wired arena share less room with Firefox. The VM is
 stopped whenever no test is running.
 
+**The idle screen saver blacks the VM's screen out.** At 12:28 on 2026-10-19,
+QMP screendumps went all black (every pixel 0), and stayed black with none of
+our processes alive. The cause was loginwindow, 20 minutes after the last
+input: it started Sonoma's default "Aerial" screen saver, which this GPU-less
+VM's software compositor cannot draw. WindowServer then logged `Unsupported sw
+composite destination` about 480,000 times a minute, and the saver locked the
+session. For the QA user, the saver's idle time is now 0 and `askForPassword`
+is 0. The VM was rebooted and unlocked once, and the desktop came back with no
+composite errors. If a screendump goes black, first look for that error with
+`sudo log show --last 1m` and for a lock screen.
+
 `wayland-host`'s `qemu_extra` adds a USB audio device (UAC1, which macOS
 supports natively) on QEMU's `wav` audiodev. Whatever the Mac plays lands in
 `/mnt/datasets/builds/wcrun/mac-audio.wav` on this host, which is how the sound
@@ -32406,6 +32535,233 @@ Filled in as the stages land; nothing below is a claim beyond its row.
 | GPU: `scripts/mac-gpu.sh compute`, `sv-compute-e2e` | 4 GiB VM | a compute dispatch by lavapipe in the VM; 245,760 payload words read back through the arena, 0 wrong |
 | GPU: `scripts/mac-gpu.sh window`, `vkcube --wsi wayland` 400x300 through `sv-icd`, rendered by lavapipe in the VM, presented as arena slices to the macOS compositor (`scripts/mac-window.sh`) | the VM's desktop | 400 and 2000 frames ran to completion; about 350 frames/s marginal (1600 more frames took 4.5 s more session time). A Sonnet check of the QMP screendump: a "vkcube" window of about 400x300 with a textured, upright cube, correct colours, content filling the window |
 | GPU: pipelined headless present (`SV_PRESENT_SYNC` unset) | the VM, and this workstation with RADV and no VM | the dump of frame N holds frame N+1's pixels, and the last frame is right. This is the same on Linux, so it is an `sv-icd` headless-dump matter, not this path's. `mac-gpu.sh` presents in the call by default |
+
+### 103.13 One main process and a face per application (supersedes 103.8's "one compositor per application")
+
+The user replaced 103.8's per-application compositors. Now **one main
+process per user** holds everything there is one of: the smithay/Wayland
+state, the arena, the session with the host, the clipboard, the keyboard
+layout, idle inhibition and the policy. **One small face process per Linux
+application** exists only because a Dock tile is a process. It owns that
+application's `NSApplication` (the tile, the Dock menu, the menu bar,
+activation) and its `NSWindow`s, and it forwards input and window events.
+The faces have no arena, no proxy and no session of their own.
+
+**Pixels: IOSurfaces sent by mach port.** Measured first, on the Sonoma VM,
+between two processes of the user's GUI session:
+
+| way to share an IOSurface | result |
+|---|---|
+| `kIOSurfaceIsGlobal` + `IOSurfaceLookup(id)` | works; rejected, because any process that guesses a 32-bit id maps the pixels, and Apple deprecated it |
+| `IOSurfaceCreateMachPort` sent through `bootstrap_check_in` of an undeclared name, `IOSurfaceLookupFromMachPort` | works (`check_in ok`, same bytes on both sides); **chosen**. The name exists only in this user's GUI bootstrap namespace, and the port is a capability only the receiving face holds |
+| a full 1280x720 copy into an IOSurface | 0.054 ms |
+
+The main process keeps a **ping-pong pair** of IOSurfaces per window. On each
+present it copies the compositor's shadow into the back surface (one CPU copy,
+the 0.054 ms above for a full frame) and tells the face which surface to show.
+The face sets that IOSurface as its layer's `contents`, and Core Animation and
+WindowServer read it directly: **no copy in the face, none in Core
+Animation**. The pair means the main process never writes the surface on
+screen. Composing straight into the IOSurface, rather than into the shadow,
+would remove the last copy; that is not built. A face mapping the arena itself
+was rejected: a `CALayer` cannot show raw memory without a `CGImage`, and
+that is a copy per frame in Core Animation.
+
+**IPC.** A Unix socket at `$TMPDIR/waycompose/main.sock`: `$TMPDIR` is per
+user, the directory is 0700, the socket 0600, and every connection's peer uid
+is checked with `getpeereid`. The messages are `faceproto.rs` (window commands
+one way, input, window events, popup bounds, Dock-menu requests and a goodbye
+the other), length-prefixed, with one writer thread per side, so input stays in
+order. A surface pair's mach message is sent **before** the socket message that
+names it, so the face finds the ports already queued and ordering needs no
+second protocol. Measured from AppKit's event timestamp in the face to arrival
+in the main process: 100 events, **p50 1.7 ms, p90 7.2 ms, max 33 ms** (the
+timestamp has 1 ms resolution, and the VM is running Firefox in software
+alongside).
+
+**Routing.** A window goes to a face when it maps: the face whose ids
+(`faceproto::face_ids`: the section, the host's id, the desktop entry's name,
+its `StartupWMClass`) match its `app_id`. Failing that, the face that most
+recently asked to run something, then the focused face. Popups go to their
+parent's face. The main process keeps every window's state (title, icons, size
+hints, map, maximise, fullscreen), so a face can be given its windows again.
+
+**Lifecycle.**
+* A bundle launch starts a face. The face connects to the socket, and if
+  nothing listens it starts the main process (`wc-launch --main`, from the
+  installed binary, in its own process group). It then says hello with its
+  ids and a token, sends its own mach port to the main process's service with
+  the same token, and asks to run its application. The main process brings the
+  session up once and queues requests until it is up.
+* **A face that crashes** (no goodbye) has its windows kept. The main process
+  starts it again (`open -g -b`, with retries) and replays its windows when it
+  says hello. Measured: `kill -9` of Firefox's face, face 3 came back, window 1
+  was routed to it, and Firefox showed its window again fully drawn, while
+  Console was untouched. If the face does not come back within 15 s, the
+  windows' clients are asked to close.
+* **A main process that crashes** takes the faces down: their sockets end and
+  they quit (measured: both faces gone within 1 s of `kill -9`). Its ssh
+  tunnel and the host's proxy outlive it, so the next main process kills the
+  recorded tunnel pid (only if it is still an `ssh`) and sends `down` for the
+  recorded session. Measured: the stale session disappeared from the host.
+* **Quit** (Cmd+Q, AppleScript, the Dock) closes the face's windows, and the
+  face leaves as soon as they are gone (measured: 1 s). The main process ends
+  when its last client has gone, or after 60 s with no face.
+* The main process uses `NSApplicationActivationPolicyProhibited`: no tile
+  and no menu bar of its own. A face registers as a regular application before
+  it does anything else. A face that waited for the main process first was
+  left behind Finder: the activation that LaunchServices sends with the launch
+  found no application yet, and macOS 14's cooperative activation refused the
+  later request. The face's first window also calls
+  `activateIgnoringOtherApps`.
+
+**Each bundle has its own copy of the launcher, not a hard link.** Measured:
+with every bundle's executable the same inode, LaunchServices took a second
+application for the first one already running. Console did not start while
+Firefox ran. A relaunch of Firefox's face failed with `procNotFound`, because
+the main process, running from the same inode, was taken for Firefox. 103.8's
+earlier "two applications at once" row was therefore wrong, as written: Console
+had started only after Firefox had quit. With copies, Firefox and Console run
+side by side (two faces, two tiles, one session).
+
+**Arena per session, pluggable.** There is one arena per main process,
+shared by every application. Guest RAM by default (role (a)); with
+`WC_MAC_ARENA_STANDIN=<file>`, a shared file that the compositor maps as its
+"ivshmem" device, with `up ID RUNID ivshmem` on the host. That is role (b)'s
+hook: on the real Mac, the RAM-disk file shared with the Linux guest through
+virtio-fs DAX. The role (b) path was not run here.
+
+Re-tested under the split, in the 4 GiB VM, each image judged by a fresh Sonnet
+agent:
+* Firefox from its tile, maximised, fully drawn from the IOSurfaces, with the
+  traffic lights beside the tabs.
+* Console as a second application alongside it.
+* The Dock menu's New Window routed back to Firefox's face.
+* The clipboard both ways: 24 bytes exact to Linux, and the string back
+  through `pbpaste`.
+* A context menu routed to the parent's face, fully drawn.
+* Sound played by the main process: 4.7 s of 438 Hz tone with one 10 ms gap.
+* The crash cases above.
+
+Known: GNOME Console shows a native title bar *and* GTK 4's header bar, which
+is GTK 4 negotiating server-side decorations under the compositor's `Auto`.
+
+**Still on ssh at this commit, and therefore open (103.14 then replaced it):**
+the Wayland bytes (an ssh Unix-socket forward), the session control (`up`,
+`proxy`, `run`, `down` as ssh exec), the sound (an ssh `-L` forward of the
+PulseAudio monitor), and the icon and clipboard feeds, which ride the Wayland
+upstream.
+
+### 103.14 Nothing on ssh: the session's channels on rings in guest RAM
+
+The user's rule: on macOS nothing travels over ssh, TCP or a socket forward.
+The premise is shared memory, and an ssh path is a defect, not a milestone.
+103.4's Unix-socket forward, the sound's `-L` forward and the session control
+by ssh exec are gone from the steady state.
+
+**The ring region.** With `--wayland-rings-guest-ram`, the main process's
+compositor keeps a second window of its own RAM, `Geometry::for_wayland()`
+(6 MiB, 32 slots). It is stamped like the arena (`stamped_guest_ram_window`)
+and located once by the host (`wc-session rings`, which runs `wc-arena-host`).
+After the locate, the launcher signals `guest_ram_rings_located`, and the
+compositor makes the shared_vulkan control region in it. The proxy attaches it
+from the plan (`--wayland-rings-plan`, retrying until the region is made).
+Separate from the arena, so the arena's allocator is untouched. The same
+`Control`/`ByteChannel` code runs over any region, which is what keeps the
+transport independent of the backend: role (b) attaches the same control region
+in its shared DAX file, by name.
+
+**Its slots.**
+* Every Wayland connection is a slot.
+* The **icon and clipboard feeds**, which until now always used the upstream
+  socket (§36.8: "a second ring claim, not built"), now claim slots of their
+  own. A local socket pair is bridged to each slot (`rings::bridge`), so the
+  feed code is unchanged.
+* The **control** channel (`OWNER_CONTROL`) carries `run`/`action`/`open`/`down`
+  as the words `wc-session` takes. The proxy runs `wc-session` itself on them
+  (`macsvc.rs`), with the session id put first by the host, so §94's
+  validation is the same code as on the ssh path.
+* The **sound** channel (`OWNER_AUDIO`) carries the session's PulseAudio
+  monitor.
+* Service slots carry an owner-id tag (`wlbytes::SERVICE_TAG`) that the
+  compositor's accept skips. These additions to sv-transport (`ring_owner`, the
+  tags) are additive.
+
+**Liveness.** The guest's RAM is the guest's. When the main process dies, macOS
+frees those pages and reuses them, so a proxy still writing pixels or ring bytes
+would corrupt them. The main process sends `ping` on the control channel every
+500 ms. After the first ping, 5 s without one ends the proxy before it touches
+the region again. Measured: `kill -9` of the main process; the proxy logged
+`LEASE LOST` and was gone about 4 s later.
+
+**Doorbells.** This VM has no doorbell port yet, so both sides poll the rings
+every millisecond: the compositor's wait is capped at 1 ms, and the proxy's
+`Doorbell::polling` wakes each waiting pump every millisecond. The endpoint stays
+pluggable for the real doorbell: `--wayland-bell` takes a QEMU chardev socket
+(the §99 hub, Linux/Windows hosts), the macOS guest opens a `/dev/cu.*` node
+(`PortHandle::guest_port`), and a fd pair (role (b), libkrun's virtio-console
+ports) is the third. The fd pair is not built. Measured cost of polling with
+Firefox idle: the main process 11% of one vCPU, the proxy 2.8%.
+
+**What ssh still does, once per main process: the bootstrap.** Three ssh execs
+under the forced command: `up` (locate the arena), `rings` (locate the ring
+region), `proxy` (start the proxy on them). After a main process that crashed,
+the next one also sends `down` for the stale session. Nothing is forwarded, and
+nothing goes over ssh afterwards. A bootstrap with no ssh at all would need the
+host to find a new session's stamps by itself (a rendezvous magic in the sweep),
+or a doorbell port to carry the hello as the Linux guest's cold path does. That
+is open (103.12).
+
+**Measured: rings against the old ssh path.** The same proxy and a C client
+(`wl_display_roundtrip` 500 times, client to proxy to compositor and back).
+The ssh leg is `scripts/mac-window.sh`, whose upstream is the ssh Unix-socket
+forward and which is kept as the comparison leg:
+
+| path | p50 | p90 | p99 | max |
+|---|---|---|---|---|
+| ssh Unix-socket forward | 5.72 ms | 6.44 ms | 6.81 ms | 10.1 ms |
+| rings in guest RAM, polled every 1 ms | **1.06 ms** | 2.12 ms | 2.14 ms | 2.15 ms |
+
+The control channel's round trip for `run firefox` is 106 ms, of which 104 ms is
+`wc-session` itself.
+
+**Every channel, how it crosses, and its copies** (role (a), this VM):
+
+| channel | crosses as | copies per transfer |
+|---|---|---|
+| Wayland bytes | ring slots in the guest-RAM ring region; no fds cross (in-band names, §79) | client socket to proxy (kernel); proxy into the ring (1); the compositor out of the ring into its local socket pair (1); smithay reads it (kernel) |
+| `wl_shm` buffers, frames | the arena (guest RAM, located once) | proxy copies the client's damage into an arena slice (1, the only write across the boundary); compositor composes the slice into the window's shadow (1); main process copies the shadow into the back IOSurface (1, full frame); face and Core Animation show the IOSurface (0) |
+| Vulkan | the GPU extent, wired guest RAM located once; the cold path (`Hello`, `Accept`) in the extent's first page (103.6.1), its rings in the same extent; no socket, forward or TCP (`lsof` on the server: 0 network and 0 Unix sockets) | frames: lavapipe renders into the imported extent, and the ICD reads them out of the same mapping (103.6) |
+| control (`run`, `action`, `open`, `down`, lease) | the control ring slot | a line into the ring and back |
+| sound | the sound ring slot | the monitor socket to proxy (kernel); proxy into the ring (1); main process out of the ring into its play queue (1); into an AudioQueue buffer (1) |
+| clipboard | the clipboard feed's ring slot; NSPasteboard in the main process | bytes through the feed's socket pair and ring (2) |
+| icons | the icon feed's ring slot | as the clipboard |
+| face to main IPC | inside macOS: a 0600 Unix socket for messages; IOSurfaces by mach port for pixels | message bytes (kernel); pixels 0 |
+| bootstrap | three ssh execs per main process (above) | not a data path |
+
+Re-tested on rings, each image judged by a fresh Sonnet agent:
+* Firefox from its tile, fully drawn.
+* Clipboard both ways: `mac-to-linux-on-rings-55` pasted exactly into
+  Firefox, and `linux-to-mac-on-rings-66` read back with `pbpaste`.
+* The Dock menu's New Window routed back to Firefox's face (227 ms control
+  round trip).
+* The context menu, a separate child window, fully drawn.
+* Console as a second application on the same rings.
+* Sound: 6 s of ~431 Hz tone with 90 ms of gaps. The proxy dropped a few
+  chunks on a full ring, most likely before the guest's player started.
+* The lease.
+
+**Still not on shared memory, so open:** the bootstrap's three ssh execs (and
+the stale-session `down`), the GPU server's launch (`mac-gpu.sh` starts it over
+ssh; a deployment would start it from `wc-launch` with a fixed label, 103.6.1),
+and the doorbell (polled). The fd-pair doorbell exists in sv-transport
+(`PortHandle` `fd:R,W`, 103.6.1) and the Wayland side does not use it yet.
+
+**Evidence stays out of git.** No screenshot, image or log of this work is
+committed. Screenshots, run logs and captures are under
+`/mnt/datasets/builds/evidence/macos-host/` (`mac-last/`, `macgpu-last/`,
+`mac-pin-*/`, `rtt/`), outside the repository, and this section states their
+results in text. The harnesses write there (`WC_EVIDENCE` overrides it).
 
 ### 103.12 Not built, and not proven
 

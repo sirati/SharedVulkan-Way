@@ -110,7 +110,7 @@ impl BellTarget for BellHub {
 /// The doorbell, held for the life of the proxy.
 pub struct Doorbell {
     pub hub: Arc<BellHub>,
-    _doorman: Doorman,
+    _doorman: Option<Doorman>,
 }
 
 impl Doorbell {
@@ -131,7 +131,140 @@ impl Doorbell {
                 format!("{p}: nothing listens (the VM has no Wayland rings' port, no doorbell hub runs, or this user is not in its group)"),
             ));
         }
-        Ok(Doorbell { hub, _doorman: doorman })
+        Ok(Doorbell { hub, _doorman: Some(doorman) })
+    }
+
+    /// §103.14: no doorbell port (the macOS guest under QEMU has none yet):
+    /// every waiting pump is woken on a fixed period and looks at its ring.
+    /// The deadline is the period; the cost is one `write` per waiting
+    /// connection per period. The compositor's side polls on the same period.
+    pub fn polling(every: std::time::Duration) -> Doorbell {
+        let hub = Arc::new(BellHub::default());
+        let h = Arc::clone(&hub);
+        std::thread::Builder::new()
+            .name("ring-poll".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    h.poke_all();
+                }
+            })
+            .ok();
+        Doorbell { hub, _doorman: None }
+    }
+}
+
+impl BellHub {
+    /// Wake every pump parked on a ring (the polling doorbell's tick).
+    fn poke_all(&self) {
+        let fds: Vec<Arc<OwnedFd>> = match self.waiting.lock() {
+            Ok(w) => w.iter().map(|(_, f)| Arc::clone(f)).collect(),
+            Err(_) => return,
+        };
+        for fd in fds {
+            let one: u64 = 1;
+            // SAFETY: an eventfd this hub holds, and an 8-byte value.
+            unsafe {
+                libc::write(fd.as_raw_fd(), (&raw const one).cast(), 8);
+            }
+        }
+    }
+}
+
+/// §103.14: a byte channel of the ring region, presented as a local socket,
+/// for code written against a socket (the icon and clipboard feeds). One
+/// thread copies both ways and polls when idle; the feeds are small and rare.
+/// Returns this process's end.
+pub fn bridge(control: Arc<Control>, owner: u64) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::io::{Read, Write};
+    let mut ch = ByteChannel::claim(&control, owner).map_err(|e| io::Error::other(format!("ring claim: {e}")))?;
+    let (mine, mut theirs) = std::os::unix::net::UnixStream::pair()?;
+    theirs.set_nonblocking(true)?;
+    std::thread::Builder::new().name(format!("ring-bridge-{}", ch.slot())).spawn(move || {
+        let _keep = control;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut to_ring: Vec<u8> = Vec::new();
+        let mut to_sock: Vec<u8> = Vec::new();
+        loop {
+            let mut idle = true;
+            if to_ring.is_empty() {
+                match theirs.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = ch.write_eof();
+                        return;
+                    }
+                    Ok(n) => {
+                        to_ring.extend_from_slice(&buf[..n]);
+                        idle = false;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                }
+            }
+            if !to_ring.is_empty() {
+                match ch.write(&to_ring) {
+                    Ok(n) if n > 0 => {
+                        to_ring.drain(..n);
+                        idle = false;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            if to_sock.is_empty() {
+                match ch.read(&mut buf) {
+                    Ok(sv_transport::wlbytes::ReadOutcome::Bytes(n)) => {
+                        to_sock.extend_from_slice(&buf[..n]);
+                        idle = false;
+                    }
+                    Ok(sv_transport::wlbytes::ReadOutcome::Eof) => return,
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            if !to_sock.is_empty() {
+                match theirs.write(&to_sock) {
+                    Ok(n) => {
+                        to_sock.drain(..n);
+                        idle = false;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                }
+            }
+            if idle {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    })?;
+    Ok(mine)
+}
+
+/// §103.14: attach the ring region a guest made in its own RAM, located by
+/// `wc-arena-host` into `plan`. The compositor makes the control region only
+/// after the host has located the stamps, so this waits for it.
+pub fn attach_plan(plan: &Path, wait: std::time::Duration) -> io::Result<Arc<Control>> {
+    let p = crate::guestram::Plan::read(plan)?;
+    let region = crate::guestram::StitchedRegion::attach(&p)?;
+    let (base, len) = {
+        let s = region.as_slice();
+        (s.as_ptr().cast_mut(), s.len())
+    };
+    // The stitched mapping lives as long as the process: the rings are the
+    // session's, and every client thread holds the control region.
+    std::mem::forget(region);
+    // SAFETY: a live mapping of `len` bytes, never unmapped (above).
+    let shared = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(base, len) });
+    let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+    let t0 = std::time::Instant::now();
+    loop {
+        match Control::attach(Arc::clone(&shared), ids) {
+            Ok(c) => return Ok(Arc::new(c)),
+            Err(e) if t0.elapsed() > wait => {
+                return Err(io::Error::other(format!("{}: no control region after {wait:?}: {e}", plan.display())));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
     }
 }
 

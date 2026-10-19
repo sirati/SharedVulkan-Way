@@ -848,20 +848,22 @@ pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
 /// The macOS GPU side (waycompose-design.md §103.6).
 ///
 /// ```text
-/// sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS] [--bell PORT]
+/// sv-gpu-server guest [--label NAME] [--region FILE] [--device N] [--arena BYTES] [--idle SECS]
+///                     [--cold-wait SECS] [--bell SPEC]
 /// sv-gpu-server probe [--device N]
 /// ```
 ///
-/// `guest` is [`win_guest`] with the window taken from
-/// [`wc_handle::arena::alloc_guest_ram_window`]: XNU superpages where the guest
-/// has them, wired 4 KiB pages where it does not (§103.3 measured that XNU does
-/// not move wired pages; `VirtualLock`'s failure of the same test is why
-/// Windows refuses small pages and macOS does not). Everything else is the
-/// Windows guest's: stamp the extent, publish it on a loopback TCP listener
-/// (an ssh forward on the Linux side, `sv-hostd qemu-serve --cold`), wait for
-/// the host's `Accept`, then write the control header over the stamps and
-/// serve one session. The arena is imported with `VK_EXT_external_memory_host`,
-/// which lavapipe and MoltenVK both have (MoltenVK for buffers only, §103.6).
+/// `guest` is [`mem_guest`]: the window from
+/// [`wc_handle::arena::alloc_guest_ram_window`] (XNU superpages where the guest
+/// has them, wired 4 KiB pages where it does not; §103.3 measured that XNU does
+/// not move wired pages, and `VirtualLock`'s failure of the same test is why
+/// Windows refuses small pages and macOS does not), stamped, with the Hello
+/// offered in its first page; the host sweeps QEMU's memory for it, replies in
+/// the same page, and the guest writes the control header over the stamps and
+/// serves one session. Nothing crosses a socket. The arena is imported with
+/// `VK_EXT_external_memory_host`, which lavapipe and MoltenVK both have
+/// (MoltenVK for buffers only, §103.6). `--region FILE` puts the extent in a
+/// shared file instead (role (b), a Mac host and its Linux VM).
 ///
 /// Without `--device`, the device is chosen by [`Driver::open_choice`]'s
 /// [`DeviceChoice::Preferred`] order: KosmicKrisp, MoltenVK, other GPUs, and a
@@ -876,12 +878,12 @@ pub fn run_main(_argv: Vec<String>) -> std::process::ExitCode {
 #[cfg(target_os = "macos")]
 pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
     let r = match argv.get(1).map(String::as_str) {
-        Some("guest") => mac_guest(&argv),
+        Some("guest" | "mem-guest") => mem_guest(&argv),
         Some("probe") => mac_probe(&argv),
         _ => {
             eprintln!(
                 "usage:\n  \
-                 sv-gpu-server guest --port <tcp> [--device N] [--arena BYTES] [--idle SECS] [--bell PORT]\n  \
+                 sv-gpu-server guest [--label NAME] [--region FILE] [--device N] [--arena BYTES] [--idle SECS] [--cold-wait SECS] [--bell SPEC]\n  \
                  sv-gpu-server probe [--device N]"
             );
             Err("no subcommand".into())
@@ -906,8 +908,8 @@ fn mac_device_choice(args: &[String]) -> Result<sv_gpu_server::driver::DeviceCho
     }
 }
 
-#[cfg(target_os = "macos")]
-fn mac_open(choice: sv_gpu_server::driver::DeviceChoice) -> Result<sv_gpu_server::driver::Driver, Box<dyn std::error::Error>> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mem_open(choice: sv_gpu_server::driver::DeviceChoice) -> Result<sv_gpu_server::driver::Driver, Box<dyn std::error::Error>> {
     let driver = sv_gpu_server::driver::Driver::open_choice(choice)?;
     eprintln!(
         "[gpu] {} ({}, driverID {}, {:?}), queue family {}, host-pointer import {}, portability subset {}",
@@ -924,7 +926,7 @@ fn mac_open(choice: sv_gpu_server::driver::DeviceChoice) -> Result<sv_gpu_server
 
 #[cfg(target_os = "macos")]
 fn mac_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let driver = mac_open(mac_device_choice(args)?)?;
+    let driver = mem_open(mac_device_choice(args)?)?;
     if driver.external_host.is_none() {
         return Err(format!(
             "{} has no VK_EXT_external_memory_host, so it cannot import a guest-RAM arena",
@@ -938,133 +940,211 @@ fn mac_probe(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn mac_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// `mem-guest` (`guest` on macOS): one GPU session whose cold path is the
+/// extent's own first page (waycompose-design.md §103.6).
+///
+/// ```text
+/// sv-gpu-server mem-guest [--region FILE] [--label NAME] [--arena BYTES] [--idle SECS]
+///                         [--cold-wait SECS] [--device N] [--bell SPEC]
+/// ```
+///
+/// The extent is guest RAM (macOS: [`wc_handle::arena::alloc_guest_ram_window`],
+/// stamped for the host's sweep) or, with `--region`, a file both sides map
+/// (role (b): a RAM-disk file a Mac shares with its Linux VM through virtio-fs
+/// DAX; on Linux, only this). Either way the Hello goes into page 0 as a
+/// [`sv_transport::coldpage`] offer, the guest beats a heartbeat and polls
+/// for the reply every millisecond until `--cold-wait` (120 s) runs out, and
+/// on the Accept writes the control header over the stamps and serves one
+/// session. No socket and no TCP port: the host finds the offer by content.
+///
+/// The driver is opened on a second thread while the host locates, so the two
+/// waits overlap rather than add.
+///
+/// `--bell` takes [`PortHandle::open`]'s spellings (`fd:R,W`, `socket:PATH`,
+/// `dev:NAME`, or a bare name) and is attached after the Accept, for the
+/// rings; without one, ring waits poll (§103.6, "Waiting").
+///
+/// [`PortHandle::open`]: sv_transport::vdoorbell::PortHandle::open
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mem_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use sv_gpu_server::{arena, server::Shared, session, table::Objects};
     use sv_transport::cold::{ColdMessage, ExtentDesc, Granularity, Hello, Locator};
+    use sv_transport::coldpage;
     use sv_transport::control::{Control, ENDIAN_MARKER};
     use sv_transport::region::{PAGE, SharedRegion};
-    use sv_transport::stream::{read_message, write_message};
 
+    let started = Instant::now();
+    let at = || format!("+{:.1} ms", started.elapsed().as_secs_f64() * 1e3);
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
-    let port: u16 = arg("--port").ok_or("--port is required")?.parse()?;
+    if arg("--port").is_some() {
+        return Err("--port: the TCP cold path is gone (waycompose-design.md §103.6); \
+                    the cold path is the extent's first page, found by `sv-hostd qemu-serve --cold mem`"
+            .into());
+    }
     let arena_size: u64 = arg("--arena").map_or(Ok(64 << 20), |s| s.parse())?;
     let idle: u64 = arg("--idle").map_or(Ok(30), |s| s.parse())?;
+    let cold_wait: u64 = arg("--cold-wait").map_or(Ok(120), |s| s.parse())?;
+    let label = arg("--label").unwrap_or_else(|| coldpage::DEFAULT_LABEL.into());
+    let region_file = arg("--region");
+    #[cfg(target_os = "macos")]
     let choice = mac_device_choice(args)?;
+    // Linux keeps `--device N`, default 0 (§103.6, "The device order").
+    #[cfg(target_os = "linux")]
+    let choice = sv_gpu_server::driver::DeviceChoice::Index(arg("--device").map_or(Ok(0), |s| s.parse())?);
 
     let geometry = geometry_for(arena_size);
     let total = geometry.control_size + geometry.arena_size;
+    #[cfg(target_os = "macos")]
     let extent_pages = (total / PAGE as u64) as usize;
 
-    // Random per run, never zero: a previous run's stamps can survive in
-    // guest RAM, and sweeping for a reused id would find both.
+    // Random per run, never zero: a previous run's stamps (and offers) can
+    // survive in guest RAM or in the file.
     let run_id = {
         let mut b = [0u8; 8];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
         u64::from_le_bytes(b) | 1
     };
-    // The mode word is informational to the host. The tier (superpages or
-    // wired pages) is known only once the allocator returns, after it has
-    // stamped, so every page says `MODE_LOCKED_VA` and the log says the tier.
-    let policy = wc_handle::arena::page_policy()?;
-    // Stamps cover the extent only: a superpage window is rounded up to 2 MiB,
-    // and a stamped page past the extent's end carries an index the host is
-    // not expecting (see `win_guest`).
-    let window = wc_handle::arena::alloc_guest_ram_window(total, policy, &|i, page| {
-        if (i as usize) < extent_pages {
-            page.copy_from_slice(&arena_record::make_guest_page(run_id, i, arena_record::MODE_LOCKED_VA, 0));
-        } else {
-            page.fill(0);
-        }
-    })?;
-    if window.len < total as usize {
-        return Err(format!("the allocator gave {} bytes of the {total} the geometry needs", window.len).into());
-    }
-    eprintln!(
-        "[gpu] guest-RAM window: {} MiB, pinning={}, extent {} MiB, run 0x{run_id:016x}, stamped {extent_pages} pages",
-        window.len >> 20,
-        window.pinning,
-        total >> 20,
-    );
-    let extent = ExtentDesc {
-        run_id,
-        // Understated, as on Windows and Linux: `Large2M` switches off the R26
-        // canary, and a wired 4 KiB window has not earned that.
-        granularity: Granularity::Small4K,
-        control_pages: geometry.control_size / PAGE as u64,
-        arena_pages: geometry.arena_size / PAGE as u64,
-        // macOS gives a process no way to learn its pages' guest-physical
-        // addresses, so the host sweeps.
-        locator: Locator::Scan,
-    };
 
-    // Bound before the driver is opened, as on Windows: a host waiting on the
-    // port sees it promptly.
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("[gpu] publishing the extent on 127.0.0.1:{port}");
-    let (mut port_stream, _) = listener.accept()?;
-    port_stream.set_nodelay(true)?;
-    write_message(
-        &mut port_stream,
-        &ColdMessage::Hello(Box::new(Hello {
-            ids: sv_gpu_server::protocol_ids(),
-            generation: 1,
-            extent: extent.clone(),
-            geometry,
-            endianness: ENDIAN_MARKER,
-            pointer_width: 64,
-        })),
+    // The extent: the two regions, and whatever keeps their pages alive.
+    let (control_region, arena_region, keep): (Arc<SharedRegion>, Arc<SharedRegion>, Box<dyn std::any::Any>) =
+        match &region_file {
+            Some(path) => {
+                use std::os::fd::AsFd;
+                let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+                if f.metadata()?.len() < total {
+                    f.set_len(total)?;
+                }
+                let c = SharedRegion::map_fd(f.as_fd(), 0, geometry.control_size as usize)?;
+                let a = SharedRegion::map_fd(f.as_fd(), geometry.control_size, geometry.arena_size as usize)?;
+                eprintln!(
+                    "[gpu] {} shared file {path}: extent {} MiB, run 0x{run_id:016x}",
+                    at(),
+                    total >> 20
+                );
+                (Arc::new(c), Arc::new(a), Box::new(f))
+            }
+            #[cfg(target_os = "linux")]
+            None => {
+                return Err("on Linux mem-guest needs --region FILE; a Linux guest's RAM is `guest`'s \
+                            (sv_arena::guestram)"
+                    .into());
+            }
+            #[cfg(target_os = "macos")]
+            None => {
+                // The mode word is informational to the host. The tier is known
+                // only once the allocator returns, after it has stamped.
+                let policy = wc_handle::arena::page_policy()?;
+                // Stamps cover the extent only: a superpage window is rounded
+                // up to 2 MiB, and a stamped page past the extent's end carries
+                // an index the host is not expecting (see `win_guest`).
+                let window = wc_handle::arena::alloc_guest_ram_window(total, policy, &|i, page| {
+                    if (i as usize) < extent_pages {
+                        page.copy_from_slice(&arena_record::make_guest_page(
+                            run_id,
+                            i,
+                            arena_record::MODE_LOCKED_VA,
+                            0,
+                        ));
+                    } else {
+                        page.fill(0);
+                    }
+                })?;
+                if window.len < total as usize {
+                    return Err(format!("the allocator gave {} bytes of the {total} the geometry needs", window.len).into());
+                }
+                eprintln!(
+                    "[gpu] {} guest-RAM window: {} MiB, pinning={}, extent {} MiB, run 0x{run_id:016x}, stamped {extent_pages} pages",
+                    at(),
+                    window.len >> 20,
+                    window.pinning,
+                    total >> 20,
+                );
+                let base = window.base();
+                // SAFETY: the window is at least `total` bytes and is kept
+                // alive (`keep`, then forgotten) for the life of the process.
+                let c = unsafe { SharedRegion::from_raw(base, geometry.control_size as usize) };
+                let a = unsafe {
+                    SharedRegion::from_raw(base.add(geometry.control_size as usize), geometry.arena_size as usize)
+                };
+                (Arc::new(c), Arc::new(a), Box::new(window))
+            }
+        };
+
+    // The driver, on its own thread, while the host locates.
+    let opener = std::thread::Builder::new()
+        .name("sv-gpu-open".into())
+        .spawn(move || mem_open(choice).map_err(|e| e.to_string()))?;
+
+    let hello = Hello {
+        ids: sv_gpu_server::protocol_ids(),
+        generation: 1,
+        extent: ExtentDesc {
+            run_id,
+            // Understated, as on Windows and Linux: `Large2M` switches off the
+            // R26 canary, and a wired 4 KiB window has not earned that.
+            granularity: Granularity::Small4K,
+            control_pages: geometry.control_size / PAGE as u64,
+            arena_pages: geometry.arena_size / PAGE as u64,
+            // macOS gives a process no way to learn its pages' guest-physical
+            // addresses, so the host sweeps; over a file it reads offset 0.
+            locator: Locator::Scan,
+        },
+        geometry,
+        endianness: ENDIAN_MARKER,
+        pointer_width: 64,
+    };
+    coldpage::offer(&control_region, &label, &hello)?;
+    eprintln!(
+        "[gpu] {} offered the extent in its first page (label {label:?}); waiting up to {cold_wait} s for a host",
+        at()
+    );
+    let reply = coldpage::await_reply(
+        &control_region,
+        Duration::from_secs(cold_wait),
+        coldpage::DEFAULT_TICK,
+        |n| eprintln!("[gpu] {} a host claimed the offer (nonce 0x{n:x})", at()),
     )?;
-    let mut scratch = Vec::new();
-    let t_hello = std::time::Instant::now();
-    match read_message(&mut port_stream, &mut scratch)? {
+    match reply {
         ColdMessage::Accept { generation: 1 } => {
-            eprintln!("[gpu] the host located the extent and accepted generation 1 after {:.2?}", t_hello.elapsed());
+            eprintln!("[gpu] {} the host located the extent and accepted generation 1", at());
         }
-        ColdMessage::Refuse { code, reason } => {
-            return Err(format!("the host refused {code}: {reason}").into());
-        }
+        ColdMessage::Refuse { code, reason } => return Err(format!("the host refused {code}: {reason}").into()),
         other => return Err(format!("unexpected cold-path reply {other:?}").into()),
     }
 
-    // After the Accept, never before: `Control::create` zeroes the stamps the
-    // host sweeps for (see `win_guest` and the Linux `guest`).
-    let base = window.base();
-    let control_region = Arc::new(unsafe { SharedRegion::from_raw(base, geometry.control_size as usize) });
-    let arena_region = Arc::new(unsafe {
-        SharedRegion::from_raw(base.add(geometry.control_size as usize), geometry.arena_size as usize)
-    });
-
-    let driver = mac_open(choice)?;
+    let driver = opener.join().map_err(|_| "the driver thread panicked")??;
     let gpu_arena = arena::import_whole(&driver, Arc::clone(&arena_region))?;
     eprintln!(
-        "[gpu] arena {} MiB imported as a host pointer, memory type {}",
+        "[gpu] {} arena {} MiB imported as a host pointer, memory type {}",
+        at(),
         gpu_arena.len >> 20,
         gpu_arena.memory_type
     );
 
+    // After the Accept, never before: `Control::create` zeroes the stamps and
+    // the mailbox, and the host waits for its magic before serving an ICD.
     let control = Control::create(Arc::clone(&control_region), geometry, sv_gpu_server::protocol_ids(), 1)?;
     control.stamp_epoch()?;
-    eprintln!("[gpu] control region published, generation 1");
+    eprintln!("[gpu] {} control region published, generation 1", at());
 
-    // §103.4: the doorbell is a legacy virtio-serial port, `/dev/cu.<name>`.
-    // Optional and warning-only, as everywhere.
+    // §103.4: the doorbell, for the rings. Optional and warning-only.
     let control = Arc::new(control);
     let _doorman = match arg("--bell") {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+        Some(spec) => match sv_transport::vdoorbell::PortHandle::open(&spec)
             .and_then(|p| sv_transport::vdoorbell::attach(p, Arc::clone(&control)))
         {
             Ok(d) => {
-                eprintln!("[gpu] doorbell attached on /dev/{name}");
+                eprintln!("[gpu] doorbell attached on {spec}");
                 Some(d)
             }
             Err(e) => {
-                eprintln!("[gpu] no doorbell on {name} ({e}); waits poll");
+                eprintln!("[gpu] no doorbell on {spec} ({e}); waits poll");
                 None
             }
         },
@@ -1084,12 +1164,12 @@ fn mac_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
-    let started = std::time::Instant::now();
-    let handled = session::serve(control, shared, geometry.ring_slot_count, std::time::Duration::from_secs(idle))?;
-    eprintln!("[gpu] {handled} commands dispatched in {:.2?}", started.elapsed());
+    let serving = Instant::now();
+    let handled = session::serve(control, shared, geometry.ring_slot_count, Duration::from_secs(idle))?;
+    eprintln!("[gpu] {handled} commands dispatched in {:.2?}", serving.elapsed());
     // The two `SharedRegion`s own these pages now; unmapping them while the
     // host still has them mapped would hand frames back to XNU under its writes.
-    std::mem::forget(window);
+    std::mem::forget(keep);
     Ok(())
 }
 
@@ -1114,6 +1194,10 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
     let mode = args.get(1).cloned().unwrap_or_default();
+    // §103.6: the cold path in the extent's first page, over a shared file.
+    if mode == "mem-guest" {
+        return mem_guest(&args);
+    }
     if mode == "pool-guest" {
         return linux_pool_guest(&args);
     }
@@ -1152,7 +1236,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: sv-gpu-server <serve|attach|guest> --socket <path> \
+                "usage: sv-gpu-server <serve|attach|guest|pool-guest|mem-guest> --socket <path> \
                  [--device N] [--arena BYTES] [--clients N] [--slots N] [--pool BYTES] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())

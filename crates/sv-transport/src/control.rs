@@ -947,6 +947,13 @@ impl Control {
 
     /// The device ring a queue ring orders against (docs/design.md §4.4's
     /// `depends_ring`, and the target of every barrier that queue emits).
+    /// The owner id the claimer wrote (§103.14: the tag that says a Wayland
+    /// byte channel is a session service, not a client connection).
+    pub fn ring_owner(&self, slot: u32) -> Result<u64> {
+        let e = self.layout.ring_dir_entry(slot)?;
+        Ok(self.region.atomic_u64(e + RD_OWNER_ID)?.load(Ordering::Acquire))
+    }
+
     pub fn ring_depends(&self, slot: u32) -> Result<Option<u32>> {
         let e = self.layout.ring_dir_entry(slot)?;
         let d = self.region.atomic_u32(e + RD_DEPENDS_RING)?.load(Ordering::Acquire);

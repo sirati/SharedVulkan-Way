@@ -179,11 +179,16 @@ impl ClipLink {
     /// Connect and start the handshake, on the same socket the session uses.
     /// The compositor sees another client.
     pub fn connect(upstream: &Path, spec: &Spec) -> Result<ClipLink, String> {
+        let sock = UnixStream::connect(upstream)
+            .map_err(|e| format!("third connection to the compositor: {e}"))?;
+        Self::connect_stream(sock, spec)
+    }
+
+    /// §103.14: the same, over a stream the caller made (a ring bridge).
+    pub fn connect_stream(sock: UnixStream, spec: &Spec) -> Result<ClipLink, String> {
         let mut spec = spec.clone();
         spec.load(CLIPBOARD_XML).map_err(|e| format!("{e}"))?;
         let ops = Opcodes::from(&spec)?;
-        let sock = UnixStream::connect(upstream)
-            .map_err(|e| format!("third connection to the compositor: {e}"))?;
         sock.set_nonblocking(true).map_err(|e| format!("{e}"))?;
         let mut link = ClipLink {
             sock,

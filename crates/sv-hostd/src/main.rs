@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd serve --socket <path> [--generation <n>] [--arena <bytes>] [--clients <n>] [--live]\n  \
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
-                 sv-hostd qemu-serve --qmp <sock> --cold <sock> [--cold <sock> ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
+                 sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve --region <file> --cold <sock> --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N]\n  \
                  sv-hostd bell-hub --port <chardev sock>=<hub sock> [--port ...]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
@@ -396,7 +396,7 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if colds.is_empty() {
         return Err("--cold is required".into());
     }
-    let qmp = arg("--qmp").ok_or("--qmp is required")?;
+    let qmp = arg("--qmp");
     let path = arg("--socket").ok_or("--socket is required")?;
     let hint = arg("--vm").unwrap_or_else(|| "sv-guest".into());
     // Defaulted from the number of sessions rather than to 1, because asking
@@ -416,7 +416,7 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut sessions = Vec::new();
     for cold in &colds {
-        sessions.push(qemu_session(&qmp, &hint, cold)?);
+        sessions.push(open_session(qmp.as_deref(), &hint, cold)?);
     }
 
     // **Root for the locate, and not one instruction longer** (waycompose-design.md
@@ -432,7 +432,8 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let me = std::process::id();
         for s in &mut sessions {
             use std::os::fd::{AsFd, AsRawFd};
-            let own = format!("/proc/{me}/fd/{}", s.hostd.fd.as_fd().as_raw_fd());
+            let Some(hostd) = s.hostd.as_ref() else { continue };
+            let own = format!("/proc/{me}/fd/{}", hostd.fd.as_fd().as_raw_fd());
             s.attachment.object = own.clone();
             s.attachment.arena_object = own;
         }
@@ -488,7 +489,7 @@ fn qemu_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 eprintln!(
                     "sv-hostd: ICD client {i} attached by name to session {i} ({} run(s))",
-                    session.hostd.runs.len()
+                    session.hostd.as_ref().map_or(0, |h| h.runs.len())
                 );
             }
             other => {
@@ -724,7 +725,7 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>>
 /// stitched into a flat view, with the attachment an ICD client needs to map
 /// the same bytes.
 ///
-/// Held together rather than returned as a tuple because two of the four fields
+/// Held together rather than returned as a tuple because three of the fields
 /// exist only to be kept alive: dropping `hostd` closes the descriptor the
 /// attachment names, and dropping `port` closes the cold path the guest is
 /// still holding its pinned window against.
@@ -732,10 +733,14 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), Box<dyn std::error::Error>>
 struct QemuSession {
     attachment: sv_transport::cold::Attachment,
     runs_for_wire: Vec<sv_transport::cold::AttachRun>,
-    hostd: sv_hostd::Hostd,
-    /// The guest's cold path, kept open for the life of the daemon.
+    /// `None` on a shared-file session, which has no QEMU backend to hold.
+    hostd: Option<sv_hostd::Hostd>,
+    /// The guest's cold path, kept open for the life of the daemon; `None`
+    /// when the cold path is the extent's first page (§103.6).
     #[allow(dead_code)]
-    port: std::os::unix::net::UnixStream,
+    port: Option<std::os::unix::net::UnixStream>,
+    /// A shared-file session's file, kept open for the life of the daemon.
+    _file: Option<std::fs::File>,
 }
 
 /// Connect to one cold path, take the guest's `Hello`, find its pages in QEMU's
@@ -751,11 +756,8 @@ fn qemu_session(
     hint: &str,
     cold: &str,
 ) -> Result<QemuSession, Box<dyn std::error::Error>> {
-    use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
-    use sv_hostd::locate;
-    use sv_transport::cold::{Attachment, ColdMessage};
-    use sv_transport::region::PAGE;
+    use sv_transport::cold::ColdMessage;
     use sv_transport::stream::{read_message, write_message};
 
     // The cold path. QEMU is listening on this socket as the host end of the
@@ -817,6 +819,181 @@ fn qemu_session(
         report.outside_ram,
     );
 
+    let (attachment, runs_for_wire, hostd) =
+        finish_located(hostd, &hello, &mut |m| write_message(&mut port, m).map_err(Into::into))?;
+    Ok(QemuSession { attachment, runs_for_wire, hostd: Some(hostd), port: Some(port), _file: None })
+}
+
+/// What a session's cold path is, from one `--cold` (§103.6):
+///
+/// * `mem` or `mem:LABEL`: the guest's offer in its extent's first page, found
+///   by sweeping QEMU's memory (`--qmp`); no socket at all;
+/// * `file:PATH`: the extent is a file both sides map (role (b): a Mac's RAM
+///   disk shared into this Linux VM through virtio-fs DAX), offer at offset 0;
+/// * anything else: the Unix socket a guest's Hello arrives on (a QEMU
+///   chardev, as before).
+#[cfg(target_os = "linux")]
+fn open_session(qmp: Option<&str>, hint: &str, cold: &str) -> Result<QemuSession, Box<dyn std::error::Error>> {
+    let need_qmp = || qmp.ok_or_else(|| format!("--cold {cold} needs --qmp"));
+    if cold == "mem" {
+        return mem_session(need_qmp()?, hint, "");
+    }
+    if let Some(label) = cold.strip_prefix("mem:") {
+        return mem_session(need_qmp()?, hint, label);
+    }
+    if let Some(path) = cold.strip_prefix("file:") {
+        return file_session(path);
+    }
+    qemu_session(need_qmp()?, hint, cold)
+}
+
+/// A nonce for a claim, so a guest's log can say which host took it.
+#[cfg(target_os = "linux")]
+fn claim_nonce() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    (u64::from(std::process::id()) << 40) ^ t | 1
+}
+
+/// A session whose cold path is the extent's first page (§103.6): sweep for
+/// a live offer, claim it, locate and check the extent, reply `Accept` in the
+/// same page, and wait for the guest's control header before any ICD is
+/// handed the region (an ICD that maps it earlier reads the stamp).
+#[cfg(target_os = "linux")]
+fn mem_session(qmp: &str, hint: &str, label: &str) -> Result<QemuSession, Box<dyn std::error::Error>> {
+    use sv_transport::coldpage;
+    eprintln!(
+        "sv-hostd: sweeping guest RAM for a GPU offer{} (no socket: the cold path is the extent's first page)",
+        if label.is_empty() { String::new() } else { format!(" labelled {label:?}") }
+    );
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(120);
+    let (hostd, regions, offered) =
+        sv_hostd::Hostd::qemu_offered(std::path::Path::new(qmp), hint, label, claim_nonce(), deadline)?;
+    let hello = offered.hello.clone();
+    eprintln!(
+        "sv-hostd: claimed run 0x{:016x} (label {:?}), {} control pages + {} arena pages, after {} sweep(s) in {:.2?}",
+        hello.extent.run_id,
+        offered.label,
+        hello.extent.control_pages,
+        hello.extent.arena_pages,
+        offered.sweeps,
+        started.elapsed(),
+    );
+    eprintln!(
+        "sv-hostd: located {}/{} pages in {:.2?} (the last sweep) over {} MiB of guest RAM; {} run(s), {} outside RAM",
+        offered.report.pages_found,
+        offered.report.pages_expected,
+        offered.last_sweep,
+        regions.total_ram() >> 20,
+        hostd.runs.len(),
+        offered.report.outside_ram,
+    );
+    let page0 = offered.page0;
+    let (attachment, runs_for_wire, hostd) =
+        finish_located(hostd, &hello, &mut |m| coldpage::reply(&page0, m).map_err(Into::into))?;
+    let t = std::time::Instant::now();
+    if !coldpage::await_control(&page0, std::time::Duration::from_secs(60))? {
+        return Err("the guest accepted but never published its control region".into());
+    }
+    eprintln!(
+        "sv-hostd: the guest published its control region {:.2?} after the Accept; cold path {:.2?} in all",
+        t.elapsed(),
+        started.elapsed()
+    );
+    Ok(QemuSession { attachment, runs_for_wire, hostd: Some(hostd), port: None, _file: None })
+}
+
+/// A session over a shared file (§103.6, role (b)): the offer is at offset 0,
+/// so nothing is swept, and the ICD maps the file by its path at the
+/// attachment's offsets. The same mailbox and the same control region as the
+/// guest-RAM path; only the memory under them differs.
+#[cfg(target_os = "linux")]
+fn file_session(path: &str) -> Result<QemuSession, Box<dyn std::error::Error>> {
+    use std::os::fd::AsFd;
+    use sv_transport::cold::{Attachment, ColdMessage};
+    use sv_transport::coldpage;
+    use sv_transport::region::{PAGE, SharedRegion};
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(120);
+    eprintln!("sv-hostd: waiting for an offer at the start of {path}");
+    let (file, page0, offer) = loop {
+        let tried = (|| -> Result<Option<_>, Box<dyn std::error::Error>> {
+            let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            if file.metadata()?.len() < PAGE as u64 {
+                return Ok(None);
+            }
+            let page0 = SharedRegion::map_fd(file.as_fd(), 0, PAGE)?;
+            let Some(offer) = coldpage::read_offer(&page0)? else { return Ok(None) };
+            if !coldpage::is_live(&page0, offer.heartbeat, std::time::Duration::from_millis(100))? {
+                return Ok(None);
+            }
+            if !coldpage::claim(&page0, claim_nonce())? {
+                return Ok(None);
+            }
+            Ok(Some((file, page0, offer)))
+        })();
+        match tried {
+            Ok(Some(v)) => break v,
+            Ok(None) | Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            }
+            Ok(None) => return Err(format!("no live offer at the start of {path} before the deadline").into()),
+            Err(e) => return Err(format!("{path}: {e}").into()),
+        }
+    };
+    let hello = offer.hello;
+    let control_len = hello.extent.control_pages * PAGE as u64;
+    let arena_len = hello.extent.arena_pages * PAGE as u64;
+    let len = file.metadata()?.len();
+    if len < control_len + arena_len {
+        let reason = format!("{path} is {len} bytes and the offer describes {}", control_len + arena_len);
+        let _ = coldpage::reply(&page0, &ColdMessage::Refuse { code: 3, reason: reason.clone() });
+        return Err(reason.into());
+    }
+    eprintln!(
+        "sv-hostd: claimed run 0x{:016x} (label {:?}) in {path} after {:.2?}",
+        hello.extent.run_id,
+        offer.label,
+        started.elapsed()
+    );
+    coldpage::reply(&page0, &ColdMessage::Accept { generation: hello.generation })?;
+    if !coldpage::await_control(&page0, std::time::Duration::from_secs(60))? {
+        return Err("the guest accepted but never published its control region".into());
+    }
+    eprintln!("sv-hostd: control region published; cold path {:.2?} in all", started.elapsed());
+    let object = std::fs::canonicalize(path)?.to_string_lossy().into_owned();
+    let attachment = Attachment {
+        object: object.clone(),
+        arena_object: object,
+        control_offset: 0,
+        control_len,
+        arena_offset: control_len,
+        arena_len,
+        generation: hello.generation,
+        // The file *is* the extent: offset 0 is its first byte, so the
+        // shortcut is true here, as on `Mode::Local`.
+        run_count: 0,
+    };
+    Ok(QemuSession { attachment, runs_for_wire: Vec::new(), hostd: None, port: None, _file: Some(file) })
+}
+
+/// The half of a located session that does not care how the Hello came: stitch
+/// and check the extent, `reply` the verdict, and build what an ICD is given.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+fn finish_located(
+    hostd: sv_hostd::Hostd,
+    hello: &sv_transport::cold::Hello,
+    reply: &mut dyn FnMut(&sv_transport::cold::ColdMessage) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<
+    (sv_transport::cold::Attachment, Vec<sv_transport::cold::AttachRun>, sv_hostd::Hostd),
+    Box<dyn std::error::Error>,
+> {
+    use std::os::fd::AsFd;
+    use sv_hostd::locate;
+    use sv_transport::cold::{Attachment, ColdMessage};
+    use sv_transport::region::PAGE;
+
     // Stitch, and check the §1 invariant before telling the guest anything. A
     // view whose pages are in the wrong order reads as a working arena to
     // everything except an application, so it is checked here, once, where the
@@ -841,7 +1018,7 @@ fn qemu_session(
     }
     if wrong > 0 {
         let reason = format!("{wrong} of {pages} stitched pages are not where the extent says");
-        let _ = write_message(&mut port, &ColdMessage::Refuse { code: 3, reason: reason.clone() });
+        let _ = reply(&ColdMessage::Refuse { code: 3, reason: reason.clone() });
         return Err(reason.into());
     }
     eprintln!(
@@ -852,7 +1029,7 @@ fn qemu_session(
 
     // Accepting is the guest's signal that its memory is reachable, so it is
     // sent only after the check above has passed.
-    write_message(&mut port, &ColdMessage::Accept { generation: hello.generation })?;
+    reply(&ColdMessage::Accept { generation: hello.generation })?;
 
     // Serve the ICD. What it gets is the *name* of QEMU's backing object and the
     // run list; it opens the object and stitches its own flat view, whose
@@ -905,7 +1082,7 @@ fn qemu_session(
         run_count: hostd.runs.len() as u64,
     };
 
-    Ok(QemuSession { attachment, runs_for_wire, hostd, port })
+    Ok((attachment, runs_for_wire, hostd))
 }
 
 
