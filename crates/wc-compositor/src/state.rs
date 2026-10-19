@@ -13,6 +13,12 @@ use smithay::input::keyboard::{FilterResult, KeyboardHandle, XkbConfig};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent, PointerHandle, RelativeMotionEvent,
 };
+// §102.3: `TreeClickGrab`, smithay's click grab with an origin that follows.
+use smithay::input::pointer::{
+    ClickGrab, Focus, GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
+    GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
+    GestureSwipeUpdateEvent, GrabStartData, PointerGrab, PointerInnerHandle,
+};
 // ADDED FOR §96: pointer locks, confinement and relative motion, which is what
 // a game's mouse-look is made of. See `crate::hold` for the arithmetic and
 // `State::update_pointer_hold` for the policy.
@@ -446,6 +452,11 @@ pub struct State {
     /// they happen wherever the last motion was — so the compositor has to
     /// remember.
     pointer_at: (f64, f64),
+    /// §102.3: the timestamp of the last input event the platform stamped,
+    /// which is what an event the compositor makes up itself — a motion
+    /// re-delivered because the scene moved under a still pointer, a `leave`
+    /// for a window that went away — is stamped with. See [`Self::input_ms`].
+    last_input_ms: Option<u32>,
     /// Which surface each live touch contact landed on.
     ///
     /// ADDED FOR §40, to answer one question smithay will not: **when a
@@ -996,6 +1007,7 @@ impl State {
             keyboard_focus: None,
             pointer_focus: None,
             pointer_at: (0.0, 0.0),
+            last_input_ms: None,
             touch_contacts: Vec::new(),
             // ADDED FOR STAGE 12. Version 2 of the protocol, which is what
             // smithay's global advertises and what adds `dnd_ask` and
@@ -1080,6 +1092,31 @@ impl State {
     /// against a clock it did not get from us.
     fn now_ms(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
+    }
+
+    /// The timestamp for an input event the compositor sends on its own
+    /// account: the last one the platform stamped, or [`Self::now_ms`] before
+    /// there was any.
+    ///
+    /// ADDED FOR §102.3. Input events carry the platform's clock — on Win32
+    /// `GetMessageTime`, milliseconds since the guest booted — and the events
+    /// this side makes up (a motion re-delivered because a commit moved the
+    /// scene under a still pointer, a `leave` for a window that went away)
+    /// carried `now_ms`, milliseconds since this process started. Measured
+    /// with KWin nested under the local harness: `motion(341995977, …)` from
+    /// the mouse, then `motion(342472, …)` from the commit that followed, two
+    /// per KWin frame — the client's clock jumping back by four days and
+    /// forward again sixty times a second. KWin stamps the events it forwards
+    /// to its own clients with these, so every one of them saw it too.
+    /// `wl_pointer` leaves the base undefined but not the order: one seat,
+    /// one clock.
+    ///
+    /// The last stamp rather than an extrapolation from it, because a stamp
+    /// made up here must not be later than the platform's next one — a
+    /// re-delivered motion happens "at" the last real event, which is also
+    /// what it re-states.
+    fn input_ms(&self) -> u32 {
+        self.last_input_ms.unwrap_or_else(|| self.now_ms())
     }
 
     /// How long the loop may sleep before the next frame tick.
@@ -1257,6 +1294,17 @@ impl State {
                 && crate::platform::trace_input("wc.in_tx", &event)
             {
                 self.trace_inputs += 1;
+            }
+            // §102.3: the clock the made-up events borrow. See `input_ms`.
+            match event {
+                FromUi::Key { time, .. }
+                | FromUi::PointerEnter { time, .. }
+                | FromUi::PointerMotion { time, .. }
+                | FromUi::PointerLeave { time, .. }
+                | FromUi::PointerRelative { time, .. }
+                | FromUi::PointerButton { time, .. }
+                | FromUi::PointerAxis { time, .. } => self.last_input_ms = Some(time),
+                _ => {}
             }
             match event {
                 FromUi::Stopped => self.stopped = true,
@@ -1724,6 +1772,15 @@ impl State {
             });
             accepted.then_some((surface, origin))
         })
+    }
+
+    /// §102.3: where `surface` has its origin in its window's pixels now —
+    /// what `surface_under` would hand smithay for it — or `None` when it is
+    /// in no window's tree. [`TreeClickGrab`]'s question.
+    fn origin_of_surface(&self, surface: &WlSurface) -> Option<(f64, f64)> {
+        let root = root_of(surface);
+        let window = self.windows.get(&root)?;
+        origin_in_placed(window.content_offset, &placed_tree(&root), surface)
     }
 
     /// §85. The toplevels that exist now, mapped or not: a toplevel that has
@@ -2311,7 +2368,7 @@ impl State {
     /// back with the next motion the platform reports after the loop.
     fn hand_pointer_to_platform(&mut self, id: WindowId) {
         let pointer = self.pointer.clone();
-        let time = self.now_ms();
+        let time = self.input_ms();
         if pointer.is_grabbed() {
             pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
         }
@@ -2385,6 +2442,19 @@ impl State {
                 state: if pressed { ButtonState::Pressed } else { ButtonState::Released },
             },
         );
+        // §102.3: the press installed smithay's `ClickGrab`, whose origin is
+        // frozen at the press; swap in the one whose origin follows the
+        // surface. Same start data, same serial. See `TreeClickGrab`.
+        if pressed {
+            let click = pointer
+                .with_grab(|serial, grab| {
+                    grab.is::<ClickGrab<State>>().then(|| (serial, grab.start_data().clone()))
+                })
+                .flatten();
+            if let Some((serial, start_data)) = click {
+                pointer.set_grab(self, TreeClickGrab { start_data }, serial, Focus::Keep);
+            }
+        }
         pointer.frame(self);
         // **After the button, and that ordering is the protocol's.** §75.
         //
@@ -3931,6 +4001,186 @@ pub(crate) fn surface_origin(content_offset: (i32, i32)) -> (f64, f64) {
     (-f64::from(content_offset.0), -f64::from(content_offset.1))
 }
 
+/// Where `which` has its origin in its window's pixels *now*, given the
+/// window's [`Window::content_offset`] and [`placed_tree`]'s list; `None` when
+/// it is no longer in the tree.
+///
+/// ADDED FOR §102.3, as the arithmetic [`State::surface_under`] does for the
+/// surface it picks — root origin by [`surface_origin`], plus the placement —
+/// for a surface that was picked earlier. Generic over the key so the rule can
+/// be tested without a live display, for the reason `accepts_input_at` gives.
+fn origin_in_placed<K: PartialEq>(
+    content_offset: (i32, i32),
+    placed: &[(K, (i32, i32))],
+    which: &K,
+) -> Option<(f64, f64)> {
+    let (rx, ry) = surface_origin(content_offset);
+    placed
+        .iter()
+        .find(|(k, _)| k == which)
+        .map(|(_, loc)| (rx + f64::from(loc.0), ry + f64::from(loc.1)))
+}
+
+/// smithay's click grab, with one change: the surface a button went down on
+/// is followed when it **moves** while the button is held.
+///
+/// ADDED FOR §102.3. smithay's `ClickGrab` keeps the pressed surface — which
+/// is the protocol's implicit grab — by re-sending the `(surface, origin)` pair
+/// it captured at the press with every motion, and ignores the one the motion
+/// carries. The surface is right; the origin is frozen. Once the client moves
+/// that surface (a `wl_subsurface.set_position` applied by a commit) every
+/// motion reaches it relative to where it *was*.
+///
+/// For most clients that is a rare glitch. For KWin nested on us it is a
+/// runaway, measured under the local harness: KWin with nothing on its
+/// desktop draws its output as a black single-pixel root and puts its cursor
+/// picture in its primary layer — a 32x32 `wl_subsurface` at the pointer
+/// minus the hotspot, moved with `set_position` on every frame — and turns a
+/// `wl_pointer` motion back into a position as *layer position + surface-
+/// local point* (`wayland_backend.cpp`, `Pointer::motion`). Press on the layer
+/// at (316, 316), move the mouse 20 px right: we sent `(24, 4)` against the
+/// frozen origin, KWin read 336 + 24 = 360, moved the layer to 356, the
+/// commit re-delivered `(24, 4)` again, KWin read 380 … one 20 px drag sent
+/// KWin's pointer to the right edge (995) in twenty frames, and the release
+/// landed there. Any click with a pixel of motion in it — every real click —
+/// lands somewhere else. KWin's overlay layers (EGL's `GenericLayer`s, placed
+/// wherever a window is scanned out) are the same shape.
+///
+/// The fix is the arithmetic `surface_under` already does, re-done on every
+/// motion for the surface the press picked rather than the one under the
+/// pointer: the focus stays, the origin follows the tree. A surface that has
+/// left the tree keeps its last origin, which is what smithay did for every
+/// surface.
+///
+/// Installed by [`State::pointer_button`] in place of the `ClickGrab` smithay
+/// sets on a press, with the same start data and serial, so `has_grab(serial)`
+/// (move, resize, `start_drag`) answers exactly as before.
+struct TreeClickGrab {
+    start_data: GrabStartData<State>,
+}
+
+impl PointerGrab<State> for TreeClickGrab {
+    fn motion(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        // The pointer's own lock is held here, so this reads the tree and
+        // never the pointer: `origin_of_surface` touches neither.
+        let focus = self.start_data.focus.as_ref().map(|(surface, was)| {
+            let now = data.origin_of_surface(surface).map(Point::from).unwrap_or(*was);
+            (surface.clone(), now)
+        });
+        handle.motion(data, focus, event);
+    }
+
+    fn relative_motion(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &RelativeMotionEvent,
+    ) {
+        // As smithay's `ClickGrab`: relative motion goes where it was aimed.
+        handle.relative_motion(data, focus, event);
+    }
+
+    fn button(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>, event: &ButtonEvent) {
+        handle.button(data, event);
+        if handle.current_pressed().is_empty() {
+            handle.unset_grab(self, data, event.serial, event.time, false);
+        }
+    }
+
+    fn axis(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>, details: AxisFrame) {
+        handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut State, handle: &mut PointerInnerHandle<'_, State>) {
+        handle.frame(data);
+    }
+
+    fn gesture_swipe_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeBeginEvent,
+    ) {
+        handle.gesture_swipe_begin(data, event);
+    }
+
+    fn gesture_swipe_update(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeUpdateEvent,
+    ) {
+        handle.gesture_swipe_update(data, event);
+    }
+
+    fn gesture_swipe_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureSwipeEndEvent,
+    ) {
+        handle.gesture_swipe_end(data, event);
+    }
+
+    fn gesture_pinch_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchBeginEvent,
+    ) {
+        handle.gesture_pinch_begin(data, event);
+    }
+
+    fn gesture_pinch_update(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchUpdateEvent,
+    ) {
+        handle.gesture_pinch_update(data, event);
+    }
+
+    fn gesture_pinch_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GesturePinchEndEvent,
+    ) {
+        handle.gesture_pinch_end(data, event);
+    }
+
+    fn gesture_hold_begin(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureHoldBeginEvent,
+    ) {
+        handle.gesture_hold_begin(data, event);
+    }
+
+    fn gesture_hold_end(
+        &mut self,
+        data: &mut State,
+        handle: &mut PointerInnerHandle<'_, State>,
+        event: &GestureHoldEndEvent,
+    ) {
+        handle.gesture_hold_end(data, event);
+    }
+
+    fn start_data(&self) -> &GrabStartData<State> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, _data: &mut State) {}
+}
+
 /// The root of `surface`'s subsurface tree — the surface that has the
 /// `xdg_toplevel`, if any.
 ///
@@ -4432,7 +4682,7 @@ impl CompositorHandler for State {
             && self.by_id(over).map(|w| w.role.surface().clone()) == Some(root_of(surface))
         {
             let (x, y) = self.pointer_at;
-            self.pointer_motion(Some(over), x, y, self.now_ms());
+            self.pointer_motion(Some(over), x, y, self.input_ms());
         }
         // §96: a commit can move or unmap the held surface, or change the
         // constraint's region; and a held pointer's hold is re-checked.
@@ -4904,7 +5154,7 @@ impl XdgShellHandler for State {
                 self.deactivation.take();
             }
             if self.pointer_focus == Some(id) {
-                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+                self.pointer_motion(None, 0.0, 0.0, self.input_ms());
             }
         }
         if let Some(window) = self.windows.remove(surface.wl_surface()) {
@@ -5081,7 +5331,7 @@ impl XdgShellHandler for State {
                 }
             }
             if self.pointer_focus == Some(id) {
-                self.pointer_motion(None, 0.0, 0.0, self.now_ms());
+                self.pointer_motion(None, 0.0, 0.0, self.input_ms());
             }
             if let Some(i) = self.popup_grabs.iter().position(|&g| g == id) {
                 // A grab destroyed from the middle takes the ones above it
@@ -6307,6 +6557,90 @@ mod tests {
     #[test]
     fn a_negative_inset_shifts_the_other_way() {
         assert_eq!(delivered((-5, -7), (100.0, 100.0)), (95.0, 93.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // §102.3: KWin's layers, and a held surface that moves
+    // -----------------------------------------------------------------------
+
+    mod held_surface {
+        use crate::state::origin_in_placed;
+
+        /// What a client is sent for a pointer at `window_pixel` over a
+        /// surface whose origin is `origin` (smithay's subtraction).
+        fn local(origin: (f64, f64), window_pixel: (f64, f64)) -> (f64, f64) {
+            (window_pixel.0 - origin.0, window_pixel.1 - origin.1)
+        }
+
+        /// What KWin makes of it: layer position + surface-local
+        /// (`wayland_backend.cpp`, the `Pointer::motion` handler).
+        fn kwin_reads(layer_at: (i32, i32), local: (f64, f64)) -> (f64, f64) {
+            (f64::from(layer_at.0) + local.0, f64::from(layer_at.1) + local.1)
+        }
+
+        /// KWin's tree as measured under the harness: the root (a 1x1
+        /// single-pixel buffer viewported to the output, no geometry, so no
+        /// inset) and its primary layer, a viewported subsurface at (0, 0)
+        /// covering the output. Every window pixel reaches KWin as itself,
+        /// corners included.
+        #[test]
+        fn kwins_full_output_layer_is_the_identity() {
+            let placed = [("root", (0, 0)), ("layer", (0, 0))];
+            let origin = origin_in_placed((0, 0), &placed, &"layer").unwrap();
+            for p in [(0.0, 0.0), (999.0, 0.0), (0.0, 699.0), (999.0, 699.0), (500.0, 350.0)] {
+                assert_eq!(kwin_reads((0, 0), local(origin, p)), p);
+            }
+        }
+
+        /// The case the report read as a wrong origin and is not: an empty
+        /// KWin puts its cursor picture in the primary layer, 32x32 at the
+        /// pointer minus the hotspot. `enter(…, 4, 4)` for a pointer at
+        /// (300, 300) is right, because KWin itself put the layer at (296, 296).
+        #[test]
+        fn a_cursor_sized_layer_under_the_pointer_is_entered_at_the_hotspot() {
+            let placed = [("root", (0, 0)), ("layer", (296, 296))];
+            let origin = origin_in_placed((0, 0), &placed, &"layer").unwrap();
+            assert_eq!(local(origin, (300.0, 300.0)), (4.0, 4.0));
+            assert_eq!(kwin_reads((296, 296), local(origin, (320.0, 320.0))), (320.0, 320.0));
+        }
+
+        /// **The runaway.** A button held on that layer, KWin moving it with
+        /// the pointer: the origin must be the layer's position *now*. With
+        /// the one frozen at the press (smithay's `ClickGrab`), KWin reads a
+        /// point one move ahead of the pointer, moves the layer there, and is
+        /// sent the same local point again — measured: a 20 px drag took
+        /// KWin's pointer from 336 to the output's right edge.
+        #[test]
+        fn a_held_layer_that_moves_is_followed() {
+            // Pressed with the layer at (316, 316), pointer at (320, 320).
+            let pressed = [("root", (0, 0)), ("layer", (316, 316))];
+            let frozen = origin_in_placed((0, 0), &pressed, &"layer").unwrap();
+            // The pointer moves to (340, 320); KWin moves its layer to
+            // (336, 316) and the commit applies.
+            let moved = [("root", (0, 0)), ("layer", (336, 316))];
+            let now = origin_in_placed((0, 0), &moved, &"layer").unwrap();
+            assert_eq!(kwin_reads((336, 316), local(now, (340.0, 320.0))), (340.0, 320.0));
+            // What the frozen origin made of the same pointer.
+            assert_eq!(kwin_reads((336, 316), local(frozen, (340.0, 320.0))), (360.0, 320.0));
+        }
+
+        /// Firefox's tree is unchanged by any of this: a GTK CSD root with a
+        /// declared inset and the browser in a subsurface at that inset, no
+        /// viewport. The subsurface's origin is window pixel (0, 0).
+        #[test]
+        fn a_gtk_csd_subsurface_at_the_inset_is_at_the_window_corner() {
+            let placed = [("csd", (0, 0)), ("browser", (26, 23))];
+            assert_eq!(origin_in_placed((26, 23), &placed, &"browser"), Some((0.0, 0.0)));
+            assert_eq!(origin_in_placed((26, 23), &placed, &"csd"), Some((-26.0, -23.0)));
+        }
+
+        /// A surface that has left the tree has no origin to follow; the grab
+        /// keeps the last one.
+        #[test]
+        fn a_surface_out_of_the_tree_has_no_origin() {
+            let placed = [("root", (0, 0))];
+            assert_eq!(origin_in_placed((0, 0), &placed, &"layer"), None);
+        }
     }
 
     // -----------------------------------------------------------------------

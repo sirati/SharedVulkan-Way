@@ -650,6 +650,13 @@ APPS
       esac ;;
   esac
   sed -i "s|@EXEC@|$exe|" "$hstage/apps.ini"
+  # §102: the proxy's copy scope for this installation (wc-session reads
+  # $HOSTDIR/copy-scope). Unset: damage, and no file.
+  case "${WC_LAUNCH_COPY_SCOPE:-}" in
+    buffer) h "printf buffer > $HOSTDIR/copy-scope" >/dev/null ;;
+    ""|damage) h "rm -f $HOSTDIR/copy-scope" >/dev/null ;;
+    *) echo "error: WC_LAUNCH_COPY_SCOPE is damage or buffer"; exit 1 ;;
+  esac
   scp "${SSHOPT[@]}" "$hstage/apps.ini" "$HOST:$HOSTDIR/apps.ini" >/dev/null \
     || { echo "error: scp of apps.ini to the VM host"; exit 1; }
   rm -rf "$hstage"
