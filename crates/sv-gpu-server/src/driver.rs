@@ -923,16 +923,35 @@ impl Driver {
             let c = std::ffi::CString::new(name).ok()?;
             unsafe { inst_fp(inst_handle, c.as_ptr()) }
         };
-        let by_device = |name: &str| -> Option<unsafe extern "system" fn()> {
+        // A KHR name whose driver has only the EXT original it was promoted
+        // from: the same command, the same signature. lavapipe has
+        // `VK_EXT_calibrated_timestamps` only, the application side advertises
+        // the KHR one, and Zink then calls `vkGetCalibratedTimestampsKHR`. The
+        // device lookup must try the alias before the instance one: the
+        // loader's `vkGetInstanceProcAddr` hands out a trampoline for any
+        // device command it knows, which then jumps through the driver's null
+        // (waycompose-design.md §104).
+        const PROMOTED: [(&str, &str); 2] = [
+            ("vkGetCalibratedTimestampsKHR", "vkGetCalibratedTimestampsEXT"),
+            ("vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"),
+        ];
+        let alias = |name: &str| PROMOTED.iter().find(|(k, _)| *k == name).map(|(_, e)| *e);
+        let dev_only = |name: &str| -> Option<unsafe extern "system" fn()> {
             let c = std::ffi::CString::new(name).ok()?;
+            unsafe { dev_fp(dev_handle, c.as_ptr()) }
+        };
+        let by_device = |name: &str| -> Option<unsafe extern "system" fn()> {
             // A device-level name the driver does not have comes back null from
             // `vkGetDeviceProcAddr`, and so does one whose extension was not
             // enabled — which is the same thing from our point of view, since
             // `open_inner` enables everything the driver offers.
-            match unsafe { dev_fp(dev_handle, c.as_ptr()) } {
-                Some(f) => Some(f),
-                None => by_instance(name),
-            }
+            dev_only(name).or_else(|| alias(name).and_then(dev_only)).or_else(|| by_instance(name))
+        };
+        // The physical-device query of the pair: the loader has a trampoline
+        // for both names, so ask for the EXT original first.
+        let by_instance = |name: &str| match alias(name) {
+            Some(ext) => by_instance(ext).or_else(|| by_instance(name)),
+            None => by_instance(name),
         };
         sv_gpu_entry::DriverFns::load(&by_instance, &by_device)
     }

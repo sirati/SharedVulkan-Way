@@ -559,6 +559,17 @@ impl PrivateSurfaceData {
             .pending_children
             .take()
             .unwrap_or_else(|| parent_guard.children.clone());
+        // §104: a subsurface created after the snapshot above was taken is a
+        // sibling too. KWin's OpenGL backend creates five layer subsurfaces
+        // and stacks each above the one before, all before one commit: the
+        // second `place_above` named a sibling the snapshot had never seen and
+        // was refused as "not a sibling or parent". A child the snapshot
+        // lacks joins it on top, where `add_child` put it.
+        for child in parent_guard.children.iter() {
+            if index_of(child, &order).is_none() {
+                order.push(child.clone());
+            }
+        }
 
         let my_index = match index_of(surface, &order) {
             Some(idx) => idx,
