@@ -48,6 +48,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -n "$CLIENT" ] || { echo "no wayland-info"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $([ "${WC_NO_SSH_PROFILE:-debug}" = release ] && echo --release) $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done

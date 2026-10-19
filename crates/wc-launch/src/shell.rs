@@ -117,7 +117,7 @@ struct PropertyStoreVtbl {
     base: UnknownVtbl,
     get_count: Fp,
     get_at: Fp,
-    get_value: Fp,
+    get_value: unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> HRESULT,
     set_value: unsafe extern "system" fn(*mut c_void, *const PropertyKey, *const PropVariant) -> HRESULT,
     commit: unsafe extern "system" fn(*mut c_void) -> HRESULT,
 }
@@ -466,4 +466,38 @@ pub fn serialised<T>(name: &str, f: impl FnOnce() -> T) -> T {
         CloseHandle(h);
     }
     out
+}
+
+/// §102.14. The `PKEY_AppUserModel_ID` on another process's window: the
+/// identity the compositor stamped on it (§92). `None` for no property, an
+/// empty one, or a shell without window property stores (Wine's).
+pub fn window_aumid(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::PropertiesSystem::SHGetPropertyStoreForWindow;
+    const VT_LPWSTR: u16 = 31;
+    let mut p: *mut c_void = std::ptr::null_mut();
+    // SAFETY: a window handle from `EnumWindows` (a stale one fails the call);
+    // the out pointer is checked.
+    let hr = unsafe { SHGetPropertyStoreForWindow(hwnd, &IID_PROPERTY_STORE, &mut p) };
+    if hr < 0 || p.is_null() {
+        return None;
+    }
+    let store = Com(p);
+    let mut pv = PropVariant { vt: 0, reserved: [0; 3], value: [0; 2] };
+    // SAFETY: an IPropertyStore. The one type read is a `CoTaskMemAlloc`ed
+    // string, freed here, which is what `PropVariantClear` would do for it.
+    unsafe {
+        let v = store.vtbl::<PropertyStoreVtbl>();
+        if (v.get_value)(store.0, &PKEY_APP_USER_MODEL_ID, &mut pv) < 0 || pv.vt != VT_LPWSTR || pv.value[0] == 0 {
+            return None;
+        }
+        let s = pv.value[0] as *mut u16;
+        let mut n = 0usize;
+        while *s.add(n) != 0 {
+            n += 1;
+        }
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
+        CoTaskMemFree(s.cast());
+        (!out.is_empty()).then_some(out)
+    }
 }

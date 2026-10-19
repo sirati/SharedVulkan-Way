@@ -63,4 +63,9 @@ windows-sys = { workspace = true, features = [
   "Win32_UI_Shell",
   "Win32_Globalization",
   "Win32_System_Registry",
+  # §102.14. A single application's window: find it (`EnumWindows`, its
+  # identity through `SHGetPropertyStoreForWindow`), bring it to the front, and
+  # tell the user in a `MessageBoxW` when a launch fails.
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell_PropertiesSystem",
 ] }

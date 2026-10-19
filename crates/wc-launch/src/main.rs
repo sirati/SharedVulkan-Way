@@ -48,6 +48,7 @@ mod mac_hostint;
 #[cfg(target_os = "macos")]
 mod sound_mac;
 mod plan;
+mod single;
 #[cfg(windows)]
 mod shell;
 /// §92. The compositor's own taskbar-identity module, compiled in here too, so
@@ -103,6 +104,10 @@ struct State {
     id: String,
     comp_log: String,
     comp_pid: u32,
+    /// §107: the shared compositor's pid, whose windows this session's are.
+    /// Never this installation's to kill (`--stop` reads `comp_pid` only);
+    /// [`find_window`] looks among its windows.
+    shared_pid: u32,
     ready: bool,
 }
 
@@ -115,6 +120,7 @@ impl State {
                 "id" => s.id = v.into(),
                 "comp-log" => s.comp_log = v.into(),
                 "comp-pid" => s.comp_pid = v.parse().unwrap_or(0),
+                "shared-pid" => s.shared_pid = v.parse().unwrap_or(0),
                 "ready" => s.ready = v == "1",
                 _ => {}
             }
@@ -123,10 +129,11 @@ impl State {
     }
     fn render(&self) -> String {
         format!(
-            "id={}\ncomp-log={}\ncomp-pid={}\nready={}\n",
+            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nready={}\n",
             self.id,
             self.comp_log,
             self.comp_pid,
+            self.shared_pid,
             u8::from(self.ready)
         )
     }
@@ -539,13 +546,35 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    fn session_mutex(session: &str) -> String {
+        format!("Local\\waycompose-launch-{session}")
+    }
+
+    /// The question [`claim`] answers — is a session up, so that this click
+    /// is warm — asked without becoming the owner when none is: `OpenMutexW`
+    /// opens the owner's mutex and never creates one (§102.14).
+    fn session_alive(session: &str) -> bool {
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let name = wide(&session_mutex(session));
+        // SAFETY: a NUL-terminated name; the handle is closed at once.
+        unsafe {
+            let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+            if h.is_null() {
+                return false;
+            }
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+        true
+    }
+
     /// `Ok(Some)` — we are the owner. `Ok(None)` — somebody else is.
     fn claim(session: &str) -> Result<Option<Owner>, String> {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
         // `Local\` — per logon session, which is the right scope: the desktop
         // this compositor draws on belongs to one.
-        let name = wide(&format!("Local\\waycompose-launch-{session}"));
+        let name = wide(&session_mutex(session));
         // SAFETY: a null security descriptor and a NUL-terminated name.
         let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if h.is_null() {
@@ -916,6 +945,10 @@ mod win {
     }
 
     /// The whole of it: make sure a session exists, then run the application.
+    ///
+    /// §102.14: a `single` application's plain run goes through
+    /// [`single_gate`] first, and only a click that holds its launch lock
+    /// gets past it.
     pub fn launch(
         cfg: &Config,
         p: &Paths,
@@ -923,6 +956,38 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+    ) -> Result<(), String> {
+        let Some((section, a)) = app.filter(|(_, a)| a.single && matches!(req, crate::Request::Run)) else {
+            return launch_as(cfg, p, log, app, req, t0, &mut None);
+        };
+        let Some(lock) = single_gate(cfg, p, log, section, a)? else {
+            return Ok(());
+        };
+        let mut one = Some(Single { section, app: a, lock: Some(lock), since: Instant::now(), failure: None, notice: None });
+        let r = launch_as(cfg, p, log, app, req, t0, &mut one);
+        let mut one = one.expect("never taken");
+        if let Err(e) = &r
+            && one.notice.is_none()
+        {
+            let f = one.failure.take().unwrap_or_else(|| crate::single::Failure::Session(e.clone()));
+            one.fail(log, f);
+        }
+        drop(one.lock.take());
+        // The process must outlive the dialog it opened.
+        if let Some(n) = one.notice.take() {
+            let _ = n.join();
+        }
+        r
+    }
+
+    fn launch_as(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        app: Option<(&str, &crate::config::App)>,
+        req: crate::Request,
+        t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         // §92. The first launch of an application on this installation, before
         // anything else: its relaunch file must exist before its first window
@@ -955,10 +1020,13 @@ mod win {
         let mut owned = claim(&cfg.session)?;
         if owned.is_none() {
             log.say("a session is already up; joining it");
-            match join_and_start(cfg, p, log, app, req, t0) {
+            match join_and_start(cfg, p, log, app, req, t0, one) {
                 Ok(()) => return Ok(()),
                 Err(e) if !p.state.exists() => {
                     log.say(&format!("the session ended under this click ({e}); starting a new one"));
+                    if let Some(o) = one.as_mut() {
+                        o.failure = None;
+                    }
                     let deadline = Instant::now() + Duration::from_secs(30);
                     loop {
                         owned = claim(&cfg.session)?;
@@ -993,8 +1061,8 @@ mod win {
                 first_refresh(log);
                 if let Some((section, a)) = app {
                     let before = count_mapped(&p.comp_log);
-                    start_app(cfg, p, log, &s.id, a, req)?;
-                    let _ = report(log, &p.comp_log, before, t0, "cold", req);
+                    start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+                    let _ = shown(cfg, p, log, one, &p.comp_log, before, t0, "cold", req);
                     refresh(cfg, p, log, section, Refresh::Full);
                 }
                 // §92. While the session runs, its jump lists follow the
@@ -1015,6 +1083,7 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         let s = join(p, 60)?;
         let Some((section, a)) = app else {
@@ -1022,8 +1091,8 @@ mod win {
             return Ok(());
         };
         let before = count_mapped(Path::new(&s.comp_log));
-        start_app(cfg, p, log, &s.id, a, req)?;
-        let shown = report(log, Path::new(&s.comp_log), before, t0, "warm", req);
+        start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+        let shown = shown(cfg, p, log, one, Path::new(&s.comp_log), before, t0, "warm", req);
         refresh(cfg, p, log, section, Refresh::Full);
         shown
     }
@@ -1139,7 +1208,7 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, ready: true }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
@@ -1197,7 +1266,7 @@ mod win {
     /// §107: the user's one compositor, started if nobody holds its mutex.
     /// Two launchers that both start one race for the mutex before either
     /// maps the device; the loser exits and both use the winner's socket.
-    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<(), String> {
+    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<u32, String> {
         let t = Instant::now();
         let mut kid: Option<Child> = None;
         if held(plan::COMPOSITOR_MUTEX) {
@@ -1210,7 +1279,7 @@ mod win {
         loop {
             if let Ok(r) = user_request(p, "ping", Some(Duration::from_secs(5))) {
                 log.say(&format!("compositor: {r} answers ({} ms)", t.elapsed().as_millis()));
-                return Ok(());
+                return Ok(plan::compositor_pid(&r));
             }
             if let Some(k) = kid.as_mut()
                 && let Ok(Some(rc)) = k.try_wait()
@@ -1257,7 +1326,7 @@ mod win {
                 spawn_shared_gpu(cfg, p, log);
             }
         }
-        ensure_compositor(cfg, p, log)?;
+        let shared_pid = ensure_compositor(cfg, p, log)?;
         let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
         log.say(&format!(
             "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
@@ -1276,7 +1345,7 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, ready: true }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
@@ -1482,6 +1551,7 @@ mod win {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
             comp_pid,
+            shared_pid: 0,
             ready: true,
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
@@ -1777,6 +1847,315 @@ mod win {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // ------------------------------------------------- §102.14 single apps ---
+
+    /// A launch of a `single` application by the click that holds its launch
+    /// lock.
+    pub struct Single<'a> {
+        section: &'a str,
+        app: &'a crate::config::App,
+        /// Held from the gate until the window appears or the launch fails.
+        lock: Option<LaunchLock>,
+        since: Instant,
+        /// Why the launch failed, where the failure was seen; the outer
+        /// `launch` tells the user only if the launch ends in an error.
+        failure: Option<crate::single::Failure>,
+        /// The dialog's thread, joined before the process exits.
+        notice: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Single<'_> {
+        /// Let the lock go first — a second click must not wait on a dialog —
+        /// then tell the user, on a thread of its own, so an owner keeps
+        /// supervising its session while the dialog is up.
+        fn fail(&mut self, log: &mut Log, f: crate::single::Failure) {
+            drop(self.lock.take());
+            let langs = crate::appmeta::lang_candidates(&crate::shell::ui_languages());
+            let text = crate::single::message(&f, &self.app.title, crate::single::german(&langs));
+            log.say(&format!(
+                "single: {}: FAILED after {} ms ({f:?}); lock released; telling the user: {}",
+                self.section,
+                self.since.elapsed().as_millis(),
+                text.lines().next().unwrap_or("")
+            ));
+            let caption = self.app.title.clone();
+            self.notice = Some(std::thread::spawn(move || message_box(&caption, &text)));
+        }
+    }
+
+    fn refused(one: &mut Option<Single>, e: &str) {
+        if let Some(o) = one.as_mut() {
+            o.failure = Some(crate::single::Failure::Refused(e.to_string()));
+        }
+    }
+
+    /// After the host accepted the run: a plain application waits for the
+    /// compositor's `mapped` line ([`report`]); a single one for its own
+    /// window, so that the lock is let go exactly when a second click can
+    /// find what it is looking for.
+    #[allow(clippy::too_many_arguments)]
+    fn shown(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        one: &mut Option<Single>,
+        comp_log: &Path,
+        before: usize,
+        t0: Instant,
+        kind: &str,
+        req: crate::Request,
+    ) -> Result<(), String> {
+        use crate::single::{Launching, launching};
+        let Some(o) = one.as_mut() else { return report(log, comp_log, before, t0, kind, req) };
+        loop {
+            let w = find_window(cfg, p, o.section, o.app);
+            match launching(w.is_some(), o.since.elapsed()) {
+                Launching::Up => {
+                    drop(o.lock.take());
+                    log.say(&format!(
+                        "CLICK-TO-WINDOW {} ms ({kind}, single; its window is up, launch lock released)",
+                        t0.elapsed().as_millis()
+                    ));
+                    return Ok(());
+                }
+                Launching::NoWindow => {
+                    o.fail(log, crate::single::Failure::NoWindow);
+                    return Err("no window appeared".into());
+                }
+                Launching::Again => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// The launch lock, a named mutex this process owns.
+    pub struct LaunchLock(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LaunchLock {
+        fn drop(&mut self) {
+            // SAFETY: a mutex this thread owns (taken by the wait that made
+            // this value) and a handle this process has not closed.
+            unsafe {
+                windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// A handle to the launch lock that does not own it yet, closed on drop.
+    struct LockHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LockHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle this process opened and has not closed.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
+    }
+
+    impl LockHandle {
+        fn open(name: &str) -> Result<LockHandle, String> {
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+            let n = wide(name);
+            // SAFETY: a null security descriptor and a NUL-terminated name;
+            // not initially owned, so this creates or opens and nothing more.
+            let h = unsafe { CreateMutexW(std::ptr::null(), 0, n.as_ptr()) };
+            if h.is_null() {
+                return Err(format!("CreateMutexW({name}): {}", std::io::Error::last_os_error()));
+            }
+            Ok(LockHandle(h))
+        }
+        fn wait(&self, ms: u32) -> crate::single::Lock {
+            // SAFETY: our handle.
+            crate::single::Lock::from_wait(unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, ms)
+            })
+        }
+        /// The lock, now owned: its handle moves into the guard.
+        fn owned(mut self) -> LaunchLock {
+            LaunchLock(std::mem::replace(&mut self.0, std::ptr::null_mut()))
+        }
+    }
+
+    /// §102.14, before anything is sent to the host. `Ok(None)`: this click
+    /// is done (it focused the window, or went quietly). `Ok(Some)`: this
+    /// click launches, holding the lock.
+    fn single_gate(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Result<Option<LaunchLock>, String> {
+        use crate::single::{First, Lock, Waiting, first, waiting};
+        let t = Instant::now();
+        let window = find_window(cfg, p, section, app);
+        let name = crate::single::lock_name(&cfg.session, section);
+        let handle = LockHandle::open(&name)?;
+        let mut taken = Lock::Held;
+        match first(window.is_some(), || {
+            taken = handle.wait(0);
+            taken
+        }) {
+            First::Focus => {
+                let (hwnd, by) = window.expect("Focus only with a window");
+                focus(log, section, hwnd, by, "a window is already up");
+                return Ok(None);
+            }
+            First::Launch => {
+                log.say(&format!(
+                    "single: {section}: no window, nobody launching; launching, holding {name}{}",
+                    if taken == Lock::Abandoned { " (its last holder exited without letting go)" } else { "" }
+                ));
+                return Ok(Some(handle.owned()));
+            }
+            First::Wait => log.say(&format!(
+                "single: {section}: another click is launching it; waiting up to {} s for its window, no run sent",
+                crate::single::WAIT_BOUND.as_secs()
+            )),
+        }
+        let mut released = false;
+        loop {
+            let window = find_window(cfg, p, section, app);
+            match waiting(window.is_some(), released, t.elapsed()) {
+                Waiting::Focus => {
+                    let (hwnd, by) = window.expect("Focus only with a window");
+                    focus(log, section, hwnd, by, &format!("the other click's window is up after {} ms", t.elapsed().as_millis()));
+                    return Ok(None);
+                }
+                Waiting::FirstFailed => {
+                    log.say(&format!(
+                        "single: {section}: the other click's launch ended without a window (it tells the user); this click does nothing"
+                    ));
+                    return Ok(None);
+                }
+                Waiting::GaveUp => {
+                    log.say(&format!(
+                        "single: {section}: no window and no release in {} s; this click does nothing",
+                        crate::single::WAIT_BOUND.as_secs()
+                    ));
+                    return Ok(None);
+                }
+                Waiting::Again => {
+                    // Taken here means let go there. Let go at once (dropping
+                    // the guard), and look for the window once more.
+                    if handle.wait(250).ours() {
+                        released = true;
+                        // SAFETY: owned by this thread from the wait above.
+                        unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(handle.0) };
+                    }
+                }
+            }
+        }
+    }
+
+    /// The application's window in this installation's session, if it has
+    /// one: a visible, unowned top-level window of the session's compositor
+    /// with the application's identity, or its exact title where the identity
+    /// cannot be read. The compositor's pid is the state file's, and only
+    /// while the session's own mutex says the session is up — the same test
+    /// that makes a click warm.
+    fn find_window(
+        cfg: &Config,
+        p: &Paths,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Option<(windows_sys::Win32::Foundation::HWND, crate::single::By)> {
+        if !session_alive(&cfg.session) {
+            return None;
+        }
+        let s = std::fs::read_to_string(&p.state).map(|t| State::parse(&t)).ok()?;
+        // §107: with the shared compositor the windows are its process's.
+        let pid = crate::single::window_pid(s.comp_pid, s.shared_pid);
+        if pid == 0 {
+            return None;
+        }
+        let (hwnds, ws) = windows_of(pid);
+        let aumid = app_aumid(p, section, app);
+        crate::single::find(&ws, pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
+    }
+
+    /// Every top-level window of process `pid`, as [`crate::single::Window`]s.
+    fn windows_of(pid: u32) -> (Vec<windows_sys::Win32::Foundation::HWND>, Vec<crate::single::Window>) {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, InternalGetWindowText, IsWindowVisible,
+        };
+        unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> windows_sys::core::BOOL {
+            // SAFETY: `l` is the `Vec` below, alive for the whole enumeration.
+            unsafe { (*(l as *mut Vec<HWND>)).push(hwnd) };
+            1
+        }
+        let mut all: Vec<HWND> = Vec::new();
+        // SAFETY: the callback only pushes into `all`, which outlives the call.
+        unsafe { EnumWindows(Some(each), &mut all as *mut Vec<HWND> as LPARAM) };
+        crate::shell::init();
+        let mut hwnds = Vec::new();
+        let mut ws = Vec::new();
+        for h in all {
+            let mut owner_pid = 0u32;
+            // SAFETY: a handle from EnumWindows; a stale one answers 0.
+            unsafe { GetWindowThreadProcessId(h, &mut owner_pid) };
+            if owner_pid != pid {
+                continue;
+            }
+            let mut buf = [0u16; 512];
+            // SAFETY: as above. `InternalGetWindowText` reads the title
+            // without sending the window a message, so a busy compositor
+            // cannot hang this click.
+            let (visible, owned, n) = unsafe {
+                (
+                    IsWindowVisible(h) != 0,
+                    !GetWindow(h, GW_OWNER).is_null(),
+                    InternalGetWindowText(h, buf.as_mut_ptr(), buf.len() as i32),
+                )
+            };
+            let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            let aumid = if visible && !owned { crate::shell::window_aumid(h) } else { None };
+            hwnds.push(h);
+            ws.push(crate::single::Window { pid: owner_pid, visible, owned, aumid, title });
+        }
+        (hwnds, ws)
+    }
+
+    /// Restore the window if it is minimised, then bring it to the front.
+    /// This process is the one the user's click started, so Windows lets it
+    /// take the foreground; if it refuses, the taskbar button flashes.
+    fn focus(
+        log: &mut Log,
+        section: &str,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        by: crate::single::By,
+        what: &str,
+    ) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync};
+        // SAFETY: a window handle just found; a stale one fails each call.
+        let (restored, front) = unsafe {
+            let iconic = IsIconic(hwnd) != 0;
+            if iconic {
+                ShowWindowAsync(hwnd, SW_RESTORE);
+            }
+            (iconic, SetForegroundWindow(hwnd) != 0)
+        };
+        log.say(&format!(
+            "single: {section}: {what} (hwnd 0x{:x}, by {}); {}{}; no run sent",
+            hwnd as usize,
+            match by {
+                crate::single::By::Identity => "identity",
+                crate::single::By::Title => "title",
+            },
+            if restored { "restored it, " } else { "" },
+            if front { "brought it to the front" } else { "SetForegroundWindow refused (the button flashes)" },
+        ));
+    }
+
+    fn message_box(caption: &str, text: &str) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+        let (c, t) = (wide(caption), wide(text));
+        // SAFETY: NUL-terminated strings that outlive the modal call.
+        unsafe { MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND) };
     }
 
     /// The owner stays for the session's life so that the mutex does, and so
