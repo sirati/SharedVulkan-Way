@@ -640,8 +640,6 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
     let cfg = &sess.cfg;
     let id = h.arena;
     let t0 = Instant::now();
-    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
-    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
     let (run, region_len, rings_len) = wc_handle::arena::ivshmem_identity(id).map_err(|e| e.to_string())?;
     if rings_len == 0 {
         return Err("the region kept no Wayland rings, and without them nothing can cross".into());
@@ -656,12 +654,31 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
         rings_pages: (rings_len / 4096) as u32,
         gpu: cfg.gpu,
     };
-    let auth = macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), &key);
+    // §111.6, §111.9: the broker signs with the key only it reads and the
+    // identity it read from this process; without one, the key file, as
+    // before §111.
+    let (auth, who) = match crate::ringlink::broker_sign(&rec, sess.index) {
+        Some(Ok((auth, who))) if auth.installation == cfg.install => (auth, Some(who)),
+        other => {
+            match other {
+                Some(Ok(_)) => say("boot: the broker signed for another installation; signing with the key file"),
+                Some(Err(e)) => say(&format!("boot: the broker did not sign ({e}); signing with the key file")),
+                None => {}
+            }
+            let text = std::fs::read_to_string(&cfg.key_file)
+                .map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
+            let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
+            (macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), &key), None)
+        }
+    };
     let page0 = wc_handle::arena::ivshmem_header_page(id).map_err(|e| e.to_string())?;
     // SAFETY: the header page of the device this process maps, for the life of
     // the process; nothing else in this process writes past the header's 80
     // bytes of it, and the boot turn keeps other boots out.
-    unsafe { macboot::publish_indexed(page0, &rec, sess.index, Some(&auth)) };
+    unsafe { macboot::publish_identity(page0, &rec, sess.index, who.as_ref(), Some(&auth)) };
+    if let Some(w) = &who {
+        say(&format!("boot: the broker signed the record for {}", w.text()));
+    }
     let bell = sv_transport::park::cross_wake();
     say(&format!(
         "boot: record for session {} of installation {} in the header page (run 0x{run:016x}, index {}, gpu {}); {}",

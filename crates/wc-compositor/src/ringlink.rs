@@ -581,6 +581,33 @@ pub fn set_boot_session(id: &str, outbound: u64, gpu: bool) {
     *BOOT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some((id.to_string(), outbound, gpu));
 }
 
+/// §111.6, §111.9: who signs a boot record. Given the record and the
+/// session's index, the privileged broker's authenticator over it and the
+/// identity of the user it read from this process's credentials (the macOS
+/// LaunchDaemon's `sign`). An error is logged and the record goes out as it
+/// did before the broker: unsigned in role (a), signed with the installation's
+/// key file in role (b).
+pub type BootSigner = Box<
+    dyn Fn(&wc_handle::macboot::Record, u8) -> Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>
+        + Send
+        + Sync,
+>;
+
+static BOOT_SIGNER: std::sync::OnceLock<BootSigner> = std::sync::OnceLock::new();
+
+/// The launcher, before the compositor starts: sign boot records with `s`.
+pub fn set_boot_signer(s: BootSigner) -> bool {
+    BOOT_SIGNER.set(s).is_ok()
+}
+
+/// The broker's signature over `rec`, if a signer is installed and it signed.
+pub(crate) fn broker_sign(
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+) -> Option<Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>> {
+    BOOT_SIGNER.get().map(|s| s(rec, index))
+}
+
 /// The compositor, as it provides arena 0 from guest RAM.
 pub fn note_guest_ram_arena(run: u64, pages: u32) {
     let mut g = ARENA0.lock().unwrap_or_else(|e| e.into_inner());
@@ -674,7 +701,19 @@ impl PendingRings {
                 // SAFETY: page 0 of the window this value owns, mapped and
                 // pinned, and not yet shared with anything but the host's sweep.
                 let page0 = unsafe { std::slice::from_raw_parts_mut(window.base(), wc_handle::arena::REGION_PAGE) };
-                rec.write(page0);
+                // §111.6: signed by the broker with who asked, when there is one.
+                match broker_sign(&rec, 0) {
+                    Some(Ok((auth, who))) => {
+                        // SAFETY: as above; nothing else in this process writes the page.
+                        unsafe { wc_handle::macboot::publish_identity(page0.as_mut_ptr(), &rec, 0, Some(&who), Some(&auth)) };
+                        println!("wc-compositor: boot record signed by the broker for {}", who.text());
+                    }
+                    Some(Err(e)) => {
+                        println!("wc-compositor: the broker did not sign the boot record ({e}); it goes out unsigned, as before §111");
+                        rec.write(page0);
+                    }
+                    None => rec.write(page0),
+                }
                 booting = true;
                 println!(
                     "wc-compositor: boot record for session {id} in page 0 of the ring window (arena run 0x{arena_run:016x}, \
