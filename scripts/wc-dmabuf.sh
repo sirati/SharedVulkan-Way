@@ -18,7 +18,12 @@
 #     the shared file, since the proxy never touched the pixels;
 #   * the proxy's stats say 0 copies and dmabuf_commits > 0, and its frame
 #     trace has one `px.commit ... copied=0 zero_copy=1` per commit;
-#   * the compositor counts a shared-file map and no arena slice.
+#   * the compositor counts a shared-file map and no arena slice;
+#   * §104.11: the client's token is version 2 and it draws each frame 15 ms
+#     *after* committing it, completing a fence record it made itself (a
+#     stand-in for the GPU process). The proxy sends wc_gpu_fence_v1.wait
+#     ahead of the commits and the compositor holds them until the record
+#     says the frame is done; the bar still lands where each frame put it.
 #
 # Scratch under $WC_DMABUF_SCRATCH (default /mnt/datasets/builds/kwin-gpu-scratch/e2e).
 set -u
@@ -121,7 +126,7 @@ WC_FRAME_TRACE="$RUN/proxy-trace.txt" XDG_RUNTIME_DIR="$RUN/rt" "$LINUX_BIN/wc-p
 PROXY=$!
 wait_for "$RUN/proxy.log" '^\[proxy\] listening on' 20 || { bad "proxy did not listen"; cat "$RUN/proxy.log"; exit 1; }
 
-XDG_RUNTIME_DIR="$RUN/rt" WAYLAND_DISPLAY=wl-proxy timeout $((SECS + 20)) \
+WC_DMABUF_FENCE=1 XDG_RUNTIME_DIR="$RUN/rt" WAYLAND_DISPLAY=wl-proxy timeout $((SECS + 20)) \
   "$CLI/wc-dmabuf-client" "$SECS" "$W" "$H" >"$RUN/cli.log" 2>&1
 RC=$?
 sleep 1
@@ -149,6 +154,12 @@ copies=$(sed -n 's/^.*[^0-9]\([0-9][0-9]*\) copies,.*/\1/p' <<<"$stats")
 note "proxy: $stats"
 [ "${commits:-0}" -ge 10 ] && ok "dmabuf_commits=$commits" || bad "dmabuf_commits=${commits:-none}"
 [ "${copies:-x}" = 0 ] && ok "the proxy copied nothing (0 copies)" || bad "copies=${copies:-?}"
+fw=$(sed -n 's/.*fence_waits=\([0-9]*\).*/\1/p' <<<"$stats")
+[ "${fw:-0}" -ge 10 ] && ok "§104.11: the proxy sent $fw wc_gpu_fence_v1.wait(s) ahead of the commits" || bad "fence_waits=${fw:-none}"
+held=$(cat "$RUN/srv.log" "$RUN/loader.log" 2>/dev/null | grep -c "a GPU frame (.*) took")
+late=$(cat "$RUN/srv.log" "$RUN/loader.log" 2>/dev/null | grep -c "did not reach\|not a fence record")
+[ "${held:-0}" -ge 1 ] && [ "${late:-0}" = 0 ] && ok "§104.11: the compositor held $held commit(s) until the frame's record said done, never gave up" \
+  || bad "compositor: $held held, $late late or refused"
 zc=$(grep -c "px.commit .*copied=0 zero_copy=1" "$RUN/proxy-trace.txt" 2>/dev/null)
 other=$(grep "px.commit" "$RUN/proxy-trace.txt" 2>/dev/null | grep -vc "zero_copy=1")
 [ "${zc:-0}" -ge 10 ] && [ "${other:-0}" = 0 ] \

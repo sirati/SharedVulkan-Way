@@ -129,11 +129,23 @@ static void paint(unsigned tick) {
 		}
 }
 
-/* sv_drm::token: magic, version, hdr_len, size, nonce, name_len, name; all LE. */
-static int make_token(const char *name, uint64_t size) {
+/* WC_DMABUF_FENCE=1 (§104.11): a version-2 token whose sync page carries
+ * the number of the "GPU work" that writes each frame, and a fence record
+ * this client completes itself, a few milliseconds *after* it committed the
+ * frame and only then draws it -- as a GPU would. The compositor shows the
+ * right frame only if it waits on the record before reading. */
+static int fence;
+static volatile uint64_t *sync_seq, *rec_done;
+static uint64_t seq;
+static char rec_path[128];
+
+/* sv_drm::token: magic, version, hdr_len, size, nonce, name_len, name
+ * [, rec_len, record]; all LE. */
+static int make_token(const char *name, uint64_t size, const char *rec) {
 	int fd = memfd_create("sv-dmabuf", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 	if (fd < 0) return -1;
-	uint32_t nlen = (uint32_t)strlen(name), hdr = 8 + 4 + 4 + 8 + 16 + 4 + nlen, ver = 1;
+	uint32_t nlen = (uint32_t)strlen(name), rlen = rec ? (uint32_t)strlen(rec) : 0;
+	uint32_t hdr = 8 + 4 + 4 + 8 + 16 + 4 + nlen + (rec ? 4 + rlen : 0), ver = rec ? 2 : 1;
 	unsigned char b[512];
 	size_t o = 0;
 	memcpy(b + o, "SVDMABF1", 8); o += 8;
@@ -143,10 +155,29 @@ static int make_token(const char *name, uint64_t size) {
 	for (int i = 0; i < 16; i++) b[o++] = (unsigned char)(rand() & 0xff);
 	memcpy(b + o, &nlen, 4); o += 4;
 	memcpy(b + o, name, nlen); o += nlen;
+	if (rec) { memcpy(b + o, &rlen, 4); o += 4; memcpy(b + o, rec, rlen); o += rlen; }
 	if (pwrite(fd, b, o, 0) != (ssize_t)o) return -1;
-	if (ftruncate(fd, (off_t)(size > o ? size : o)) != 0) return -1;
-	if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0) return -1;
+	uint64_t len = size > o ? size : o;
+	if (rec && len < 8192) len = 8192;
+	if (ftruncate(fd, (off_t)len) != 0) return -1;
+	if (rec) {
+		unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
+		if (p == MAP_FAILED) return -1;
+		memcpy(p, "SVSYNC01", 8);
+		sync_seq = (volatile uint64_t *)(p + 8);
+	}
+	int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL | (rec ? 0x0010 /* F_SEAL_FUTURE_WRITE */ : F_SEAL_WRITE);
+	if (fcntl(fd, F_ADD_SEALS, seals) != 0) return -1;
 	return fd;
+}
+
+/* The "GPU": the commit is already on its way; 15 ms later the frame is
+ * drawn and only then is its work number completed in the record. */
+static void gpu_frame(struct wl_display *dpy, unsigned tick) {
+	wl_display_flush(dpy);
+	usleep(15 * 1000);
+	paint(tick);
+	__atomic_store_n(rec_done, seq, __ATOMIC_RELEASE);
 }
 
 int main(int argc, char **argv) {
@@ -181,7 +212,19 @@ int main(int argc, char **argv) {
 	px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0);
 	if (px == MAP_FAILED) { perror("mmap"); return 1; }
 	paint(0);
-	int tok = make_token(path, size);
+	fence = getenv("WC_DMABUF_FENCE") && atoi(getenv("WC_DMABUF_FENCE"));
+	if (fence) {
+		snprintf(rec_path, sizeof rec_path, "/dev/shm/sv-fence-%d-0-%08x%08x", (int)getpid(), (unsigned)rand(), (unsigned)rand());
+		int rf = open(rec_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (rf < 0 || ftruncate(rf, 4096) != 0) { perror(rec_path); return 1; }
+		unsigned char *r = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rf, 0);
+		if (r == MAP_FAILED) { perror("mmap record"); return 1; }
+		memcpy(r, "SVFENCE1", 8);
+		rec_done = (volatile uint64_t *)(r + 8);
+		close(rf);
+		printf("record %s\n", rec_path);
+	}
+	int tok = make_token(path, size, fence ? rec_path : NULL);
 	if (tok < 0) { perror("token"); unlink(path); return 1; }
 	printf("token name=%s size=%zu\n", path, size);
 
@@ -210,7 +253,8 @@ int main(int argc, char **argv) {
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		if (closed || now.tv_sec - t0.tv_sec >= secs) break;
 		/* Written into the shared file: the compositor sees it by name. */
-		paint(tick);
+		if (!fence) paint(tick);
+		else __atomic_store_n(sync_seq, ++seq, __ATOMIC_RELEASE);
 		struct wl_callback *cb = wl_surface_frame(surf);
 		wl_callback_add_listener(cb, &frame_l, NULL);
 		frame_pending = 1;
@@ -218,13 +262,16 @@ int main(int argc, char **argv) {
 		wl_surface_damage_buffer(surf, 0, 0, W, H);
 		wl_surface_commit(surf);
 		frames++;
+		if (fence) gpu_frame(dpy, tick);
 		while (frame_pending && wl_display_dispatch(dpy) >= 0) {}
 	}
 	/* Leave a still picture behind for the frame dump: the bar at the top. */
-	paint(0);
+	if (!fence) paint(0);
+	else __atomic_store_n(sync_seq, ++seq, __ATOMIC_RELEASE);
 	wl_surface_attach(surf, buf, 0, 0);
 	wl_surface_damage_buffer(surf, 0, 0, W, H);
 	wl_surface_commit(surf);
+	if (fence) gpu_frame(dpy, 0);
 	wl_display_roundtrip(dpy);
 	usleep(500 * 1000);
 	printf("frames %u\n", frames);
@@ -237,5 +284,6 @@ int main(int argc, char **argv) {
 	wl_display_disconnect(dpy);
 	munmap(px, size);
 	unlink(path);
+	if (fence) unlink(rec_path);
 	return 0;
 }
