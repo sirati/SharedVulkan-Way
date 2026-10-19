@@ -307,6 +307,8 @@ impl R {
                 self.forward(id, ToFace::MovePopup { id, x, y, w: width, h: height });
             }
             ToUi::Present { id, .. } => self.present(id),
+            // Never sent off Windows; see its definition.
+            ToUi::Direct { .. } => {}
             ToUi::ShiftOrigin { id, dx, dy } => self.forward(id, ToFace::ShiftOrigin { id, dx, dy }),
             ToUi::Map { id, width, height, fold_caption } => {
                 let Some(w) = self.wins.get_mut(&id) else { return true };

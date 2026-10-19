@@ -33033,6 +33033,9 @@ was not measured.
 1. **CPU.** The compositor's blit from a section is not damage-scoped, and the
    per-frame SYNC_FD wait is synchronous on KWin's thread. Both are the next
    steps; a heavy-repaint workload is the measurement that should decide.
+   (104.11: the read always was damage-scoped and the composite was not; the
+   composite is now, and a window whose picture is one section is drawn
+   without reading it at all.)
 2. **Plasma's clients** still hand KWin `wl_shm` (llvmpipe) or kopper frames.
    Clients inside the namespace could use dma-bufs too; that needs the GPU side
    to import a section into another session's device, which the registry
@@ -33046,3 +33049,127 @@ was not measured.
 6. **The seat's node is for group `users`**: whichever of the login screen's
    users logs in gets it; any member of the group can open it, which gives
    access to nothing but the fake ioctls.
+
+### 104.11 Follow-up: what the compositor pays per frame
+
+2026-10-19, branch `kwin-gpu-zc-comp`. 104.8 measured the guest's compositor
+at 34–35 % of a core under OpenGL against 16–20 % under QPainter, and put it
+down to a read of the whole section at every commit.
+
+**It was not the read.** `present` copies only the commit's damage out of the
+client's buffer into the surface's staging shadow, for a section as for every
+pool. The staging shadow is per surface, and a commit's damage is relative to
+the surface's previous content, which is what that shadow holds, so no
+per-buffer arrears are needed here (the proxy needs them, §27.4, because its
+copies are per buffer). KWin damages its layer with `damage_buffer` and the
+frame's damaged region (`wayland_layer.cpp`). The full-frame work came after
+the read: `compose_tree` recomposited the window's whole tree into its shadow
+at every commit (KWin's 1264x713 black root, a single pixel stretched by a
+viewport, and the 1264x713 layer over it), blending a translucent layer pixel
+by pixel, and `WM_PAINT` handed the whole shadow to `SetDIBitsToDevice`.
+Locally, in KWin's shape with a 64x64 change at 60 fps, that cost 3 % of a core
+with opaque frames and 15–17 % with translucent pixels in the layer. An OpenGL
+framebuffer can carry alpha below 1 where QPainter's frames are opaque; that
+would explain the guest's difference, and was not measured there.
+
+**(a1) Only the damage is recomposed.** `Window::composed` keeps the shape the
+shadow was last composited from: the canvas, and each drawn surface's place,
+size and format. While a commit leaves that shape as it was, only the commit's
+damage is recomposed. `Shadow::compose_stack` recomputes each rectangle from
+the staging shadows alone, and it is the same function the whole canvas is
+drawn with, so a part cannot disagree with the whole, and overlapping
+rectangles give the same pixels. A changed shape, or a change with no damage to
+name (a view, a removed subsurface, a geometry), is recomposed whole.
+`WM_PAINT` hands GDI only the band of rows the update region spans.
+
+**(a2) A window whose picture is one buffer is drawn from that buffer.** The
+conditions: the committing surface is the topmost of a mapped toplevel whose
+caption is not folded, covers the canvas exactly, with no viewport, scale or
+transform between buffer and surface; the tree is as it was last composited;
+the buffer is `Xrgb8888`, or `Argb8888` over nothing but opaque black single
+pixels (premultiplied over black is the buffer's own colour, and GDI draws a
+window opaque); its pool is a `Section` or a `SharedFile`, rows and offset
+DWORD-aligned. KWin's primary layer over its black root is that case. Then
+nothing is read. The section is opened once per buffer
+(`wc_handle::Handle::open_section_object`, readable and writable because GDI
+refuses read-only sections; GDI is its only user and only reads it), the UI
+thread makes a DIB section over it (`CreateDIBSection(…, hSection, offset)`,
+`stride / 4` pixels wide so padded rows fit), selects it into a memory DC and
+`BitBlt`s the update region.
+
+Such a buffer is not released at its commit, because `WM_PAINT` can draw from
+it at any time. The buffer it replaced is released when the UI thread answers
+the `ToUi::Direct` that replaced it (`FromUi::DirectShown`; the answers come in
+order). KWin's swapchain keeps two or three buffers and expects the one shown
+to be held. Leaving the path (any other commit, a changed tree, a DIB that
+could not be made) re-reads the surface's staging shadow whole from the buffer
+still held, recomposites the window whole, and only then tells the UI thread to
+draw the shadow, so it never draws a shadow that is not yet the picture.
+Popups (layered windows), folded captions, and every other pool (arena slices,
+memfds) stay on the shadow, and `WC_DIRECT_PRESENT=off` puts every window
+there.
+
+**How to tell which path a window took.** One log line per window whenever
+it changes:
+
+    wc-compositor: window 1 is drawn directly from its client's buffer, which this process does not read (surface 17, 1280x720 Argb8888, stride 5120, offset 0)
+    wc-compositor: window 1 is drawn from its shadow: <why>
+
+`<why>` is the first condition above that failed. The frame trace's
+`wc.present` and `wc.paint` lines carry `direct=1` on the direct path.
+
+**Measured locally**, under Wine on Xvfb, release builds: the compositor
+process's CPU (utime + stime of the Wine process, `/proc`) over 20 s at 60 fps,
+two runs each. `scripts/wc-dmabuf.sh` with `WC_DMABUF_BENCH="NBUF FMT SQ
+SHAPE"` runs it: a 1280x720 window, three buffers in `/dev/shm` sections used
+as KWin's swapchain uses them (reused only after release, each repainting what
+it owes), an SQ x SQ square moving, only it damaged. `kwin` is KWin's shape (a
+black single pixel, the frames in a subsurface over it); `argbt` is
+translucent.
+
+| shape, damage | before | (a1) | (a1) + (a2) |
+|---|---|---|---|
+| one surface, xrgb, 64x64 | 2.3 / 1.9 % | 1.7 / 1.5 % | 1.5 / 1.2 % |
+| kwin, xrgb, 64x64 | 3.1 / 3.1 % | 1.7 / 1.3 % | 1.5 / 1.5 % |
+| kwin, argb, 64x64 | 3.2 / 4.3 % | 1.1 / 1.3 % | 1.8 / 1.4 % |
+| kwin, argbt, 64x64 | 17.5 / 15.0 % | 2.7 / 1.3 % | 1.8 / 1.4 % |
+| kwin, xrgb, 720x720 moving | 5.2 / 5.2 % | 5.8 / 4.7 % | 3.3 / 3.2 % |
+| kwin, argbt, 720x720 moving | 12.4 / 11.8 % | 6.9 / 8.2 % | 3.0 / 3.5 % |
+
+With little damage, (a1) already does what (a2) does; what remains, about
+1.5 %, is the per-commit work around the pixels (the Wayland dispatch, the
+frame callback, a log line per commit). With much damage, (a2) halves (a1),
+because nothing of the frame is copied on this side. Xvfb stayed under 1.1 %.
+Numbers: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`.
+
+**Checked.** A unit test that a stack recomposed in parts, overlapping parts
+included, is the stack recomposed whole. `scripts/wc-dmabuf.sh`: 13 of 13 (it
+now takes the direct path). `WC_DMABUF_BENCH_CHECK=1`: the compositor's last
+frame dump and the screen (Xvfb's root window) are the client's last buffer
+pixel for pixel, on both paths, in both shapes, opaque and translucent; with
+`toggle` (a buffer in the other format every 50th frame and last) the window
+left the direct path and came back 11 times in 4 s, and the last frame, drawn
+right after leaving, was exact on screen too.
+
+**On the guest, still to see.**
+
+1. The log line for KWin's window. "Drawn from its shadow: …" names the
+   condition that failed.
+2. That `OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE)` on the GPU
+   process's section succeeds (same user, default DACL, so it should), and
+   that `CreateDIBSection` accepts the section the Intel driver imported. If
+   either fails, the log says "its section could not be opened for GDI" or
+   "cannot be drawn from its client's buffer: CreateDIBSection failed", and the
+   window stays on (a1).
+3. The compositor's CPU by 104.8's method, and the picture: correct, no
+   tearing, the caption and frame unchanged.
+4. Whether GDI's reads of those pages are slow: they are imported into the
+   GPU's device as host memory, and whatever cache attribute the driver gave
+   them, the compositor's `BitBlt` now reads them where `present` read them
+   before.
+
+| gate | result |
+|---|---|
+| `cargo test -p wc-compositor -p wc-handle` | 238 and 55 passed, 0 failed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo clippy -p wc-compositor -p wc-handle` (Linux, `--all-targets`, and the Windows target) | no warning in a line this branch wrote |

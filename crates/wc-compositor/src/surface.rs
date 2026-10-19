@@ -498,23 +498,38 @@ impl Shadow {
 /// PPM rather than PNG because it needs no encoder, and `P6` because a text
 /// PPM of a 4 MiB frame is 12 MiB of ASCII. ImageMagick reads both.
 pub fn write_ppm(path: &std::path::Path, shadow: &Shadow) -> std::io::Result<()> {
+    write_ppm_bgra(path, shadow.width(), shadow.height(), shadow.width() * 4, shadow.pixels())
+}
+
+/// [`write_ppm`] for any `w`x`h` BGRA image whose rows are `stride` bytes
+/// apart: §104's follow-up dumps a window drawn directly from a client buffer
+/// from that buffer, which has no shadow and may pad its rows.
+pub fn write_ppm_bgra(
+    path: &std::path::Path,
+    w: i32,
+    h: i32,
+    stride: i32,
+    src: &[u8],
+) -> std::io::Result<()> {
     use std::io::Write as _;
-    let (w, h) = (shadow.width(), shadow.height());
-    if w <= 0 || h <= 0 {
+    let bpp = PixelFormat::BYTES_PER_PIXEL;
+    if w <= 0 || h <= 0 || stride < w * 4 || src.len() < (h as usize - 1) * stride as usize + w as usize * bpp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "nothing committed yet",
         ));
     }
-    let src = shadow.pixels();
-    let mut out = Vec::with_capacity(16 + src.len() / 4 * 3);
+    let mut out = Vec::with_capacity(16 + w as usize * h as usize * 3);
     out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
-    for px in src.chunks_exact(PixelFormat::BYTES_PER_PIXEL) {
-        // B, G, R in memory; R, G, B in the file. The swap is the whole of the
-        // difference between a Wayland `Xrgb8888` buffer and a PPM, and getting
-        // it backwards would make every harness's colour assertion measure the
-        // reader rather than the compositor.
-        out.extend_from_slice(&[px[2], px[1], px[0]]);
+    for row in 0..h as usize {
+        let at = row * stride as usize;
+        for px in src[at..at + w as usize * bpp].chunks_exact(bpp) {
+            // B, G, R in memory; R, G, B in the file. The swap is the whole of
+            // the difference between a Wayland `Xrgb8888` buffer and a PPM, and
+            // getting it backwards would make every harness's colour assertion
+            // measure the reader rather than the compositor.
+            out.extend_from_slice(&[px[2], px[1], px[0]]);
+        }
     }
     std::fs::File::create(path)?.write_all(&out)
 }

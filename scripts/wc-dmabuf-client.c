@@ -19,7 +19,8 @@
  * Exit 0 on success, 2 if the global is not offered, 1 on any failure.
  *
  *   wc-dmabuf-client [SECS] [W] [H]
- *   wc-dmabuf-client SECS W H bench [NBUF] [xrgb|argb|argbt] [SQ] [flat|kwin]
+ *   wc-dmabuf-client SECS W H bench [NBUF] [xrgb|argb|argbt] [SQ] [flat|kwin] [toggle]
+ *   wc-dmabuf-client compare PICTURE.ppm SCREEN.ppm
  *
  * `bench` measures the compositor's CPU rather than its correctness, so it
  * behaves like KWin's swapchain and not like a test pattern: NBUF buffers
@@ -34,7 +35,11 @@
  * (§102): the toplevel's surface is one opaque black single-pixel buffer
  * stretched by a viewport to W x H, and the frames are in a synchronised
  * subsurface at (0, 0) with an identity viewport, committed before the parent
- * every frame.
+ * every frame. `toggle` adds a buffer in the other format (XRGB8888 for
+ * ARGB8888 and back; the picture is the same) and commits it every 50th frame
+ * and as the last one: a compositor that draws such a window straight from its
+ * buffer has to leave that path and come back, and the last frame is drawn
+ * right after leaving it.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -225,10 +230,13 @@ static void paint_rect(uint32_t *p, struct rect r, struct rect sqr, uint32_t alp
 		}
 }
 
-static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, uint32_t alpha) {
+static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, uint32_t alpha, int toggle) {
 	size_t size = (size_t)W * H * 4;
 	struct rect full = { 0, 0, W, H };
-	for (int i = 0; i < nbuf; i++) {
+	/* toggle: one more buffer, in the other format, for every 50th frame
+	 * and the last; the same picture either way. */
+	int nall = nbuf + (toggle ? 1 : 0);
+	for (int i = 0; i < nall; i++) {
 		struct sbuf *b = &bufs[i];
 		snprintf(b->path, sizeof b->path, "/dev/shm/sv-dmabuf-test-%d-%d", (int)getpid(), i);
 		int shm = open(b->path, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -243,7 +251,8 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 		zwp_linux_buffer_params_v1_add_listener(params, &p_l, NULL);
 		zwp_linux_buffer_params_v1_add(params, tok, 0, 0, (uint32_t)W * 4, 0, 0);
 		close(tok);
-		b->wl = zwp_linux_buffer_params_v1_create_immed(params, W, H, fmt, 0);
+		uint32_t f = i < nbuf ? fmt : fmt == FMT_XRGB8888 ? 0x34325241u : FMT_XRGB8888;
+		b->wl = zwp_linux_buffer_params_v1_create_immed(params, W, H, f, 0);
 		zwp_linux_buffer_params_v1_destroy(params);
 		wl_buffer_add_listener(b->wl, &buf_l, b);
 	}
@@ -288,11 +297,18 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 	struct sbuf *last = NULL;
 	for (unsigned tick = 0;; tick++) {
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (closed || now.tv_sec - t0.tv_sec >= secs) break;
+		int ending = closed || now.tv_sec - t0.tv_sec >= secs;
+		if (ending && (closed || !toggle)) break;
+		/* With toggle, the last frame is in the odd buffer too. */
+		int odd = toggle && (ending || tick % 50 == 49);
 		struct sbuf *b = NULL;
 		for (;;) {
-			for (int i = 0; i < nbuf && !b; i++)
-				if (!bufs[(tick + i) % nbuf].busy) b = &bufs[(tick + i) % nbuf];
+			if (odd) {
+				if (!bufs[nbuf].busy) b = &bufs[nbuf];
+			} else {
+				for (int i = 0; i < nbuf && !b; i++)
+					if (!bufs[(tick + i) % nbuf].busy) b = &bufs[(tick + i) % nbuf];
+			}
 			if (b) break;
 			release_waits++;
 			if (wl_display_dispatch(dpy) < 0) return 1;
@@ -300,7 +316,7 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 		struct rect cur = square_at(tick, sq);
 		/* The first frame damages everything; afterwards only the square. */
 		struct rect dmg = tick == 0 ? full : r_union(prev, cur);
-		for (int i = 0; i < nbuf; i++) bufs[i].owed = r_union(bufs[i].owed, dmg);
+		for (int i = 0; i < nall; i++) bufs[i].owed = r_union(bufs[i].owed, dmg);
 		paint_rect(b->px, b->owed, cur, alpha);
 		b->owed.x1 = b->owed.x0;
 		prev = cur;
@@ -316,6 +332,7 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 		frames++;
 		last = b;
 		while (frame_pending && wl_display_dispatch(dpy) >= 0) {}
+		if (ending) break;
 	}
 	/* WC_BENCH_FINAL=path: the last committed buffer as a PPM, as it looks
 	 * over black (premultiplied, so its channels are the colour), for the
@@ -341,7 +358,7 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 	xdg_surface_destroy(xs);
 	if (surf != root) wl_surface_destroy(surf);
 	wl_surface_destroy(root);
-	for (int i = 0; i < nbuf; i++) {
+	for (int i = 0; i < nall; i++) {
 		wl_buffer_destroy(bufs[i].wl);
 		munmap(bufs[i].px, size);
 		unlink(bufs[i].path);
@@ -351,7 +368,75 @@ static int bench(struct wl_display *dpy, int secs, int nbuf, int sq, int kwin, u
 	return 0;
 }
 
+/* --- compare: is picture A on screen B? ---------------------------------- */
+/* One header number of a PPM, past whitespace and `#` comments. */
+static int ppm_int(FILE *f) {
+	int c;
+	while ((c = fgetc(f)) != EOF) {
+		if (c == '#') { while ((c = fgetc(f)) != EOF && c != '\n') {} continue; }
+		if (c >= '0' && c <= '9') break;
+	}
+	int v = 0;
+	for (; c >= '0' && c <= '9'; c = fgetc(f)) v = v * 10 + (c - '0');
+	return v; /* the one whitespace after the last number is consumed here */
+}
+
+static unsigned char *read_ppm(const char *path, int *w, int *h) {
+	FILE *f = fopen(path, "rb");
+	if (!f) return NULL;
+	if (fgetc(f) != 'P' || fgetc(f) != '6') { fclose(f); return NULL; }
+	*w = ppm_int(f);
+	*h = ppm_int(f);
+	if (ppm_int(f) != 255 || *w <= 0 || *h <= 0) { fclose(f); return NULL; }
+	size_t n = (size_t)*w * *h * 3;
+	unsigned char *p = malloc(n);
+	if (p && fread(p, 1, n, f) != n) { free(p); p = NULL; }
+	fclose(f);
+	return p;
+}
+
+/* Finds A in B by an exact match of 64 pixels of a row near A's top (where
+ * the bench's square never is), then counts the pixels of A that differ at
+ * that place, as much of it as is on screen. Prints `at X,Y, WxH of AWxAH on
+ * screen, differing N`, or
+ * `not found`. */
+static int compare(const char *a_path, const char *b_path) {
+	int aw, ah, bw, bh;
+	unsigned char *a = read_ppm(a_path, &aw, &ah), *b = read_ppm(b_path, &bw, &bh);
+	if (!a || !b || aw < 64 || aw > bw || ah > bh) { printf("unreadable\n"); return 1; }
+	int ry = ah / 8, rx = aw / 4;
+	const unsigned char *needle = a + ((size_t)ry * aw + rx) * 3;
+	/* Every place the needle matches is a candidate (the gradient repeats
+	 * over a few rows), and the best of them is the answer. */
+	long best = -1;
+	int bx = 0, by = 0, bvw = 0, bvh = 0;
+	for (int y = 0; y < bh; y++) {
+		const unsigned char *row = b + (size_t)y * bw * 3;
+		for (int x = 0; x + 64 <= bw; x++) {
+			if (memcmp(row + (size_t)x * 3, needle, 64 * 3)) continue;
+			int ox = x - rx, oy = y - ry;
+			if (ox < 0 || oy < 0) continue;
+			/* What of A is on screen B: a window wider than the screen runs
+			 * off its edge. */
+			int vw = aw < bw - ox ? aw : bw - ox, vh = ah < bh - oy ? ah : bh - oy;
+			long diff = 0;
+			for (int j = 0; j < vh; j++)
+				for (int i = 0; i < vw; i++)
+					diff += memcmp(a + ((size_t)j * aw + i) * 3,
+					               b + ((size_t)(oy + j) * bw + ox + i) * 3, 3) != 0;
+			if (best < 0 || diff < best) { best = diff; bx = ox; by = oy; bvw = vw; bvh = vh; }
+		}
+	}
+	if (best >= 0) {
+		printf("at %d,%d, %dx%d of %dx%d on screen, differing %ld\n", bx, by, bvw, bvh, aw, ah, best);
+		return 0;
+	}
+	printf("not found\n");
+	return 1;
+}
+
 int main(int argc, char **argv) {
+	if (argc == 4 && !strcmp(argv[1], "compare")) return compare(argv[2], argv[3]);
 	int secs = argc > 1 ? atoi(argv[1]) : 5;
 	if (argc > 3) { W = atoi(argv[2]); H = atoi(argv[3]); }
 	int is_bench = argc > 4 && !strcmp(argv[4], "bench");
@@ -363,6 +448,8 @@ int main(int argc, char **argv) {
 	int sq = argc > 7 ? atoi(argv[7]) : 64;
 	if (sq < 1 || sq > W || sq > H) sq = W < H ? W : H;
 	int kwin = argc > 8 && !strcmp(argv[8], "kwin");
+	int toggle = argc > 9 && !strcmp(argv[9], "toggle");
+	if (toggle && nbuf >= MAXBUF) nbuf = MAXBUF - 1;
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	srand((unsigned)getpid() ^ (unsigned)time(NULL));
 
@@ -382,7 +469,7 @@ int main(int argc, char **argv) {
 	for (unsigned i = 0; i < table_n && i < 16; i++) printf("%s0x%08x", i ? "," : "", table_fmt[i]);
 	printf("\n");
 	zwp_linux_dmabuf_feedback_v1_destroy(fb);
-	if (is_bench) return bench(dpy, secs, nbuf, sq, kwin, alpha);
+	if (is_bench) return bench(dpy, secs, nbuf, sq, kwin, alpha, toggle);
 
 	/* The shared allocation, as the GPU side would make it locally. */
 	char path[128];

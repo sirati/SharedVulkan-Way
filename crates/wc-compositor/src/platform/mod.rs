@@ -53,7 +53,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use crate::surface::{Rect, Shadow};
+use crate::surface::{PixelFormat, Rect, Shadow};
 
 // §82. Pure, so on every target: the Win32 caption's decisions, tested on the
 // machine that builds them. Only `win32.rs` calls it.
@@ -493,6 +493,22 @@ pub enum ToUi {
     },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
+    /// §104's follow-up: draw the window from this client buffer from now on,
+    /// not from its shadow (`Some`), or go back to the shadow, which is whole
+    /// again (`None`); `damage` is what changed, in window coordinates.
+    ///
+    /// Answered with [`FromUi::DirectShown`] carrying `serial` once the
+    /// platform will no longer draw from whatever it drew from before, which
+    /// is when the Wayland side may release that buffer to its client. Sent
+    /// only on Windows, where a client buffer can be a section GDI can draw
+    /// from (`State::direct_frame`); the other platforms never see it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Direct {
+        id: WindowId,
+        frame: Option<DirectFrame>,
+        damage: Vec<Rect>,
+        serial: u64,
+    },
     /// The window's top-left corner moved by this much, without the surface
     /// under it moving at all.
     ///
@@ -795,9 +811,36 @@ pub fn trace_input(stage: &str, e: &FromUi) -> bool {
     true
 }
 
+/// One client buffer a window is drawn from directly (§104's follow-up): the
+/// section it lives in and where in it, which is everything
+/// `CreateDIBSection` needs. `key` names the buffer for the platform's cache;
+/// the same buffer always has the same key.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct DirectFrame {
+    pub key: u64,
+    #[cfg(windows)]
+    pub section: Arc<wc_handle::SectionObject>,
+    /// Bytes from the start of the section; a multiple of 4.
+    pub offset: u32,
+    pub width: i32,
+    pub height: i32,
+    /// Bytes per row; a multiple of 4, so a DIB `stride / 4` pixels wide has
+    /// exactly these rows.
+    pub stride: i32,
+    pub format: PixelFormat,
+}
+
 /// UI thread -> Wayland thread.
 #[derive(Debug)]
 pub enum FromUi {
+    /// The answer to [`ToUi::Direct`] with this `serial`: the window draws
+    /// only from what that message said, and nothing before it — or, with
+    /// `ok` false, the platform could not draw from that buffer (a DIB could
+    /// not be made over its section) and still draws from what it did before,
+    /// and the window has to go back to its shadow.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    DirectShown { id: WindowId, serial: u64, ok: bool },
     /// The window's client area changed; the numbers are already converted to
     /// surface coordinates by [`FrameStyle::surface_size_for`].
     Resized {

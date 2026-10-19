@@ -40,9 +40,13 @@ if [ -n "$BENCH" ]; then
   MEASURE=${WC_DMABUF_SECS:-20}
   SECS=$((MEASURE + 5))
   W=1280 H=720
+  # Room for the window and its frame: a 1280-wide client on a 1280-wide
+  # desktop is narrowed by the frame, and its edge covers the picture.
+  DESK=1600x1200
 else
   SECS=${WC_DMABUF_SECS:-6}
   W=320 H=200
+  DESK=1280x1024
 fi
 
 pass=0; fail=0
@@ -109,7 +113,7 @@ wait_for() {
 }
 
 DISP=$((100 + RANDOM % 400))
-Xvfb ":$DISP" -screen 0 1280x1024x24 -nolisten tcp >"$RUN/xvfb.log" 2>&1 &
+Xvfb ":$DISP" -screen 0 "${DESK}x24" -nolisten tcp >"$RUN/xvfb.log" 2>&1 &
 XPID=$!
 export DISPLAY=":$DISP"
 for _ in $(seq 1 100); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.1; done
@@ -129,7 +133,7 @@ if [ -n "$BENCH" ]; then
     SRV_ARGS=(--nested-compositor-globals)
   fi
 fi
-wine explorer "/desktop=wc-dmabuf-$$,1280x1024" \
+wine explorer "/desktop=wc-dmabuf-$$,$DESK" \
   "$WIN_BIN/wc-compositor.exe" --socket "$SOCK" --timeout $((SECS + 40)) \
   "${SRV_ARGS[@]}" \
   --log "$(winepath -w "$RUN/srv.log" 2>/dev/null)" >"$RUN/loader.log" 2>&1 &
@@ -174,6 +178,14 @@ if [ -n "$BENCH" ]; then
       'BEGIN { printf "%.1f", (b - a) / hz / (e - s) * 100 }')
     XCPU=$(awk -v a="$x0" -v b="$x1" -v s="$s0" -v e="$s1" -v hz="$HZ" \
       'BEGIN { printf "%.1f", (b - a) / hz / (e - s) * 100 }')
+  fi
+  # The check also photographs the screen while the client holds its last
+  # frame (it waits half a second after writing final.ppm): what GDI drew,
+  # which the frame dumps cannot show.
+  if [ -n "${WC_DMABUF_BENCH_CHECK:-}" ]; then
+    until [ -f "$RUN/final.ppm" ] || ! kill -0 "$CPID" 2>/dev/null; do sleep 0.05; done
+    sleep 0.25
+    xwd -root -silent -display "$DISPLAY" | magick xwd:- "$RUN/screen.ppm" 2>/dev/null
   fi
   wait "$CPID"; RC=$?
 else
@@ -231,6 +243,11 @@ if [ -n "$BENCH" ]; then
     else
       bad "nothing to compare (final.ppm: $([ -f "$RUN/final.ppm" ] && echo yes || echo no), dumps: ${last:-none})"
     fi
+    on_screen=$("$CLI/wc-dmabuf-client" compare "$RUN/final.ppm" "$RUN/screen.ppm" 2>&1)
+    case "$on_screen" in
+      "at "*" differing 0") ok "the screen shows the client's last buffer, pixel for pixel (${on_screen%, differing*})" ;;
+      *) bad "the screen: $on_screen ($RUN/screen.ppm)" ;;
+    esac
   fi
   grep "path\|direct" "$RUN/srv.log" | grep -v "wl_surface commit" | head -5 | sed 's/^/        /'
   echo "== $pass passed, $fail failed"
