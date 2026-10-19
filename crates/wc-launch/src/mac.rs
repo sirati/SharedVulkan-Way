@@ -1,26 +1,22 @@
 //! §103.8. `wc-launch` on macOS: a Linux application as a Mac application.
 //!
 //! Each Linux application is an `.app` bundle in `~/Applications/Linux`
-//! whose executable is a hard link to this program (`macbundle.rs`). Started
-//! from a bundle, this process **is** that application: it runs the
-//! compositor on its main thread, so the application's windows, its Dock tile,
-//! its Dock menu and its menu bar all belong to one process with the
-//! application's bundle identity, and it talks to the Linux host over the
-//! forced-command ssh key exactly as the Windows launcher does (§28, §94):
-//! `up` (locate the guest-RAM arena), a reverse forward of the compositor's
-//! Wayland socket, `proxy`, then `run`, `action` or `open`.
+//! whose executable is a copy of this program (`macbundle.rs`). Started from a
+//! bundle, this process is that application's *face* (§103.13): its Dock
+//! tile, menu bar and windows. One *main* process per user runs the
+//! compositor and the session. The session starts with no ssh and no socket
+//! (§103.15): the compositor writes a boot record into page 0 of its ring
+//! window, the host's session service finds it, locates both windows, starts
+//! the proxy and answers in the same page; everything after that is rings in
+//! guest RAM (§103.14).
 //!
-//! One compositor per application rather than one per user is §103.8's
-//! decision: the Dock knows only processes, so the process that owns an
-//! application's windows has to be that application's. The cost is one arena
-//! and one proxy per running application; the gains are an exact Dock
-//! identity and one application's crash not taking the others with it.
-//!
-//! `wc-launch --install SECTION [--pin]` writes the bundle (and with `--pin`
-//! keeps it in the Dock); `wc-launch --session SECTION` runs one without a
-//! bundle, for the harnesses.
+//! `wc-launch --install SECTION... [--pin] [--meta DIR]` writes the bundles
+//! (with `--pin` keeps them in the Dock) from the host's `wc-session app`
+//! answers, which the install harness puts in DIR as `<host-app>.meta`;
+//! `wc-launch --session SECTION` runs a face without a bundle, for the
+//! harnesses.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -72,29 +68,6 @@ fn load_config() -> Result<Config, String> {
     Ok(cfg)
 }
 
-fn known_hosts() -> String {
-    support_dir().join("known_hosts").to_string_lossy().into_owned()
-}
-
-/// One `wc-session` verb; its stdout, or the reason it failed.
-fn ssh_verb(cfg: &Config, verb: &[&str]) -> Result<String, String> {
-    let out = Command::new(&cfg.ssh)
-        .args(plan::ssh_exec(cfg, &known_hosts(), verb))
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("{}: {e}", cfg.ssh))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(format!(
-            "{} failed ({}): {}",
-            verb.first().copied().unwrap_or("?"),
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
-}
-
 pub fn main(args: Vec<String>) -> ExitCode {
     let _ = std::fs::create_dir_all(support_dir());
     let _ = std::fs::create_dir_all(log_dir());
@@ -107,10 +80,19 @@ pub fn main(args: Vec<String>) -> ExitCode {
     };
     if let Some(i) = args.iter().position(|a| a == "--install") {
         let pin = args.iter().any(|a| a == "--pin");
-        let sections: Vec<String> = args[i + 1..].iter().filter(|a| !a.starts_with("--")).cloned().collect();
+        let meta_dir = args.iter().position(|a| a == "--meta").and_then(|m| args.get(m + 1)).map(PathBuf::from);
+        let sections: Vec<String> = args[i + 1..]
+            .iter()
+            .filter(|a| !a.starts_with("--") && Some(Path::new(a)) != meta_dir.as_deref())
+            .cloned()
+            .collect();
+        let Some(meta_dir) = meta_dir else {
+            eprintln!("wc-launch: --install needs --meta DIR, the host's `wc-session app` answers (§103.15)");
+            return ExitCode::from(2);
+        };
         let mut ok = true;
         for s in &sections {
-            match install(&cfg, s, pin) {
+            match install(&cfg, s, pin, &meta_dir) {
                 Ok(p) => println!("installed {s}: {}", p.display()),
                 Err(e) => {
                     eprintln!("wc-launch: {s}: {e}");
@@ -148,10 +130,13 @@ fn section_of_bundle() -> Option<String> {
 
 // ------------------------------------------------------------- install ---
 
-fn install(cfg: &Config, section: &str, pin: bool) -> Result<PathBuf, String> {
+fn install(cfg: &Config, section: &str, pin: bool, meta_dir: &Path) -> Result<PathBuf, String> {
     let app = cfg.app(section)?;
     let host_app = if app.host_app.is_empty() { section } else { &app.host_app };
-    let raw = ssh_verb(cfg, &["app", host_app, "light"])?;
+    // The host's answer to `wc-session app HOST-APP light`, fetched by the
+    // install harness on the host: installing needs no channel to it.
+    let meta_path = meta_dir.join(format!("{host_app}.meta"));
+    let raw = std::fs::read_to_string(&meta_path).map_err(|e| format!("{}: {e}", meta_path.display()))?;
     let meta = Meta::parse(&raw)?;
     // The host's desktop name, unless the ini gave a title of its own (the
     // parser defaults a missing title to the section id).
@@ -235,46 +220,17 @@ fn installed_exe() -> PathBuf {
     if p.is_file() { p } else { std::env::current_exe().unwrap_or(p) }
 }
 
-/// Where a main process records its session, so the next one can clean up
-/// after a crash: `<session id> <tunnel pid>`.
-fn session_record() -> PathBuf {
-    wc_compositor::socket_path().with_file_name("session")
-}
-
-/// A main process that died without its goodbye (SIGKILL, a panic) leaves
-/// its ssh tunnel running here and its proxy and sound on the host. The next
-/// main process ends both, by the pid and the session id it recorded.
-fn clean_stale_session(cfg: &Config, log: &Log) {
-    let Ok(text) = std::fs::read_to_string(session_record()) else { return };
-    let mut w = text.split_whitespace();
-    let (Some(old), pid) = (w.next(), w.next().and_then(|p| p.parse::<u32>().ok())) else { return };
-    if let Some(pid) = pid {
-        // Only if that pid is still an ssh: pids are reused.
-        let comm = Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "comm="]).output();
-        if comm.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim().ends_with("ssh")) {
-            let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
-        }
-    }
-    match ssh_verb(cfg, &["down", old]) {
-        Ok(_) => log.say(&format!("cleaned up session {old}, left by a main process that did not end cleanly")),
-        Err(e) => log.say(&format!("stale session {old}: {e}")),
-    }
-    let _ = std::fs::remove_file(session_record());
-}
-
 /// The main process (§103.13): the compositor with the router platform, one
 /// session for every application, and the faces' requests.
 fn run_main(cfg: Config) -> ExitCode {
     let id = plan::run_id(&cfg.session, std::process::id());
     let log = Log::open(&log_dir().join("main.log"));
     log.say(&format!("main process: session {id}"));
-    clean_stale_session(&cfg, &log);
     let tmp = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
     let rt = tmp.join(format!("wc-{id}"));
     let _ = std::fs::create_dir_all(&rt);
     let _ = std::fs::set_permissions(&rt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let socket = format!("wl-{id}");
-    let socket_path = rt.join(&socket);
     // SAFETY: before any thread of this process exists.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &rt);
@@ -315,10 +271,9 @@ fn run_main(cfg: Config) -> ExitCode {
         });
     }
     let worker = {
-        let (cfg, session, log, comp_log, socket_path) =
-            (cfg.clone(), session.clone(), log.clone(), comp_log.clone(), socket_path.clone());
+        let (cfg, session, log) = (cfg.clone(), session.clone(), log.clone());
         std::thread::Builder::new().name("session".into()).spawn(move || {
-            match bring_up(&cfg, &session, &log, &comp_log, &socket_path) {
+            match bring_up(&cfg, &session, &log) {
                 Ok(()) => {
                     *session.up.lock().unwrap_or_else(|e| e.into_inner()) = true;
                     let queued: Vec<(String, String)> =
@@ -347,6 +302,18 @@ fn run_main(cfg: Config) -> ExitCode {
     // ride rings in a second window of this process's RAM.
     let mut argv: Vec<String> =
         vec!["wc-launch".into(), "--socket".into(), socket, "--in-band".into(), "--wayland-rings-guest-ram".into()];
+    // §103.15: the rings' doorbell, a legacy virtio-serial port's `cu.*` node
+    // (or an `fd:R,W` pair a parent opened). Without one the rings are polled
+    // and the host's service finds the boot record by its periodic sweep.
+    let bell = std::env::var("WC_MAC_BELL").ok().unwrap_or_else(|| cfg.wayland_bell.clone());
+    if !bell.is_empty() {
+        argv.extend(["--wayland-rings".into(), bell]);
+    }
+    // §103.15: the session's GPU server, started here rather than by a
+    // harness's ssh. Its cold page carries the session's label; the host's
+    // session service serves it once the boot record says so.
+    let gpu = start_gpu_server(&cfg, &id, &log);
+    wc_compositor::set_boot_session(&id, cfg.outbound, gpu.is_some());
     match &standin {
         Some(file) => {
             // SAFETY: before the compositor's threads exist.
@@ -371,9 +338,51 @@ fn run_main(cfg: Config) -> ExitCode {
             Err(e) => log.say(&format!("down: {e}")),
         }
     }
+    if let Some(mut g) = gpu {
+        let _ = g.kill();
+        let _ = g.wait();
+    }
     let _ = std::fs::remove_dir_all(&rt);
-    let _ = std::fs::remove_file(session_record());
     code
+}
+
+/// `sv-guest gpu guest --label <session>`, for the life of the main process.
+fn start_gpu_server(cfg: &Config, id: &str, log: &Log) -> Option<std::process::Child> {
+    if cfg.gpu_server.is_empty() {
+        return None;
+    }
+    let label = wc_handle::macboot::gpu_label(id);
+    let out = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_dir().join("gpu.log"));
+    let mut c = Command::new(&cfg.gpu_server);
+    c.args(["gpu", "guest", "--label", label, "--arena"])
+        .arg((cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string())
+        .args(["--idle", "43200"])
+        .stdin(Stdio::null());
+    // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
+    // when the VM has it; without it the GPU rings poll.
+    let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
+    if let Some(dev) = bell.as_deref().filter(|d| Path::new(d).exists()) {
+        c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+    }
+    if !cfg.gpu_icd.is_empty() {
+        c.env("VK_DRIVER_FILES", &cfg.gpu_icd);
+    }
+    if let Ok(f) = out {
+        if let Ok(f2) = f.try_clone() {
+            c.stdout(f2);
+        }
+        c.stderr(f);
+    }
+    match c.spawn() {
+        Ok(child) => {
+            log.say(&format!("gpu server {} started (label {label})", cfg.gpu_server));
+            Some(child)
+        }
+        Err(e) => {
+            log.say(&format!("NO GPU: {}: {e}", cfg.gpu_server));
+            None
+        }
+    }
 }
 
 /// A face's request (§103.13): run its application, an action or a URL, in
@@ -428,7 +437,9 @@ fn control_request(s: &Session, line: &str) -> Result<String, String> {
         match ch.read(&mut buf) {
             Ok(ReadOutcome::Bytes(n)) => reply.extend_from_slice(&buf[..n]),
             Ok(ReadOutcome::Eof) => return Err("the control ring ended".into()),
-            Ok(_) if t0.elapsed() < Duration::from_secs(60) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(_) if t0.elapsed() < Duration::from_secs(60) => {
+                let _ = ch.wait_readable(wc_compositor::ring_wait_slice());
+            }
             Ok(_) => return Err("no reply on the control ring".into()),
             Err(e) => return Err(e.to_string()),
         }
@@ -441,14 +452,14 @@ fn service_channel(owner: u64, wait: Duration) -> Option<sv_transport::wlbytes::
     use sv_transport::wlbytes::{ByteChannel, Endpoint};
     let t0 = Instant::now();
     while t0.elapsed() < wait {
-        if let Some(c) = wc_compositor::shared_control() {
-            if let Ok(live) = ByteChannel::live_connections(&c) {
-                for slot in live {
-                    if c.ring_owner(slot).ok() == Some(owner)
-                        && let Ok(ch) = ByteChannel::open(&c, slot, Endpoint::Peer)
-                    {
-                        return Some(ch);
-                    }
+        if let Some(c) = wc_compositor::shared_control()
+            && let Ok(live) = ByteChannel::live_connections(&c)
+        {
+            for slot in live {
+                if c.ring_owner(slot).ok() == Some(owner)
+                    && let Ok(ch) = ByteChannel::open(&c, slot, Endpoint::Peer)
+                {
+                    return Some(ch);
                 }
             }
         }
@@ -467,7 +478,9 @@ impl std::io::Read for RingReader {
             match self.0.read(buf) {
                 Ok(ReadOutcome::Bytes(n)) => return Ok(n),
                 Ok(ReadOutcome::Eof) => return Ok(0),
-                Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(_) => {
+                    let _ = self.0.wait_readable(wc_compositor::ring_wait_slice());
+                }
                 Err(e) => return Err(std::io::Error::other(e.to_string())),
             }
         }
@@ -543,83 +556,30 @@ fn run_face_mode(cfg: &Config, section: &str) -> ExitCode {
     ExitCode::from(code as u8)
 }
 
-/// Wait for a line in the compositor's log and return it.
-fn wait_line(path: &Path, needle: &str, timeout: Duration) -> Option<String> {
+/// §103.15: wait for the host's session service to answer the boot record,
+/// then open the control channel it claimed, hold the lease, and play the
+/// sound. Nothing here reaches the host but through guest RAM.
+fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log) -> Result<(), String> {
     let t0 = Instant::now();
-    while t0.elapsed() < timeout {
-        if let Ok(f) = std::fs::File::open(path) {
-            for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-                if line.contains(needle) {
-                    return Some(line);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if std::env::var_os("WC_IVSHMEM_STANDIN").is_some() {
+        // Role (b)'s boot (a shared-file arena) is the real Mac's launcher's.
+        return Err("WC_MAC_ARENA_STANDIN: this launcher boots guest-RAM sessions only (§103.15)".into());
     }
-    None
-}
-
-/// Play the session's sound (§86) through CoreAudio, for as long as the
-/// forward delivers it.
-fn start_audio(port: u16, vol: u8, log: &Log) {
-    let log = log.clone();
-    let _ = std::thread::Builder::new().name("audio".into()).spawn(move || {
-        let mut conn = None;
-        for _ in 0..40 {
-            if let Ok(c) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                conn = Some(c);
-                break;
+    let wait = Duration::from_secs(std::env::var("WC_MAC_BOOT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60));
+    loop {
+        match wc_compositor::boot_status() {
+            Some(Ok(())) => break,
+            Some(Err(why)) => return Err(format!("the host's session service refused session {}: {why}", s.id)),
+            None if t0.elapsed() > wait => {
+                return Err(format!(
+                    "no answer to the boot record in {wait:?}: the host's session service \
+                     (wc-mac-sessiond) is not running, or cannot see this VM"
+                ));
             }
-            std::thread::sleep(Duration::from_millis(250));
+            None => std::thread::sleep(Duration::from_millis(10)),
         }
-        let Some(c) = conn else {
-            log.say(&format!("audio: nothing on 127.0.0.1:{port}"));
-            return;
-        };
-        log.say(&format!("audio: playing s16le 48000 Hz stereo through CoreAudio, from 127.0.0.1:{port}"));
-        match crate::audio_mac::play(c, vol) {
-            Ok(st) => log.say(&st.line()),
-            Err(e) => log.say(&format!("audio: {e}")),
-        }
-    });
-}
-
-fn bring_up(cfg: &Config, s: &Arc<Session>, log: &Log, comp_log: &Path, _socket_path: &Path) -> Result<(), String> {
-    let t0 = Instant::now();
-    let up = if std::env::var_os("WC_IVSHMEM_STANDIN").is_some() {
-        let line = wait_line(comp_log, "header published: run", Duration::from_secs(30))
-            .ok_or("the compositor never published its arena header")?;
-        let run = line.split("run ").nth(1).and_then(|r| r.split(',').next()).unwrap_or("").to_string();
-        wait_line(comp_log, "listening on", Duration::from_secs(30)).ok_or("the compositor never listened")?;
-        log.say(&format!("compositor up in {:?}: shared-file arena, run {run}", t0.elapsed()));
-        ssh_verb(cfg, &["up", &s.id, &run, "ivshmem"])?
-    } else {
-        let arena = wait_line(comp_log, "provided from guest RAM: run", Duration::from_secs(30))
-            .ok_or("the compositor never provided its arena")?;
-        let (run, pages) = macbundle::arena_of(&arena).ok_or_else(|| format!("cannot read the arena line: {arena}"))?;
-        wait_line(comp_log, "listening on", Duration::from_secs(30)).ok_or("the compositor never listened")?;
-        log.say(&format!("compositor up in {:?}: run {run}, {pages} pages", t0.elapsed()));
-        let out = cfg.outbound.to_string();
-        ssh_verb(cfg, &["up", &s.id, &run, &pages, &out])?
-    };
-    log.say(&format!("up: {}", up.trim().replace('\n', "; ")));
-    // For the next main process, should this one die without its goodbye.
-    let _ = std::fs::write(session_record(), format!("{}\n", s.id));
-
-    // §103.14: the ring region, located once (the bootstrap's second and last
-    // locate), then made into the control region; then the proxy, which
-    // attaches it. These three ssh execs are the whole of ssh's part: no
-    // tunnel, no forward, nothing after them.
-    let rings = wait_line(comp_log, "wayland rings in guest RAM: run", Duration::from_secs(30))
-        .ok_or("the compositor kept no guest-RAM rings")?;
-    let rrun = rings.split("run ").nth(1).and_then(|r| r.split(',').next()).unwrap_or("").to_string();
-    let rpages = rings.split(", ").nth(1).and_then(|p| p.split(' ').next()).unwrap_or("").to_string();
-    let r = ssh_verb(cfg, &["rings", &s.id, &rrun, &rpages])?;
-    log.say(&format!("rings: {}", r.trim().replace('\n', "; ")));
-    wc_compositor::guest_ram_rings_located();
-    let o = ssh_verb(cfg, &["proxy", &s.id])?;
-    log.say(&format!("proxy: {}", o.trim().replace('\n', "; ")));
-
+    }
+    log.say(&format!("session {} located and started by the host in {:?}", s.id, t0.elapsed()));
     let ctl = service_channel(sv_transport::wlbytes::OWNER_CONTROL, Duration::from_secs(20))
         .ok_or("the host never opened the control ring")?;
     *s.ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctl);

@@ -1502,6 +1502,7 @@ dependencies = [
  "png",
  "sv-transport",
  "wc-compositor",
+ "wc-handle",
  "windows-sys",
 ]
 

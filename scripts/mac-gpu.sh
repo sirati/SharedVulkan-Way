@@ -40,6 +40,17 @@
 #      (watching its log over ssh), so the cold path is timed alone, as the ssh
 #      path's was; MAC_GPU_BELL (the server's --bell, e.g. dev:cu.NAME),
 #      WC_KEEP=1 keeps the run dir.
+#      MAC_GPU_VIA=session (the default, §103.15): the server is started the
+#      way a session starts it. The harness sets gpu-server/gpu-icd in the
+#      installed launcher's wc-launch.ini (scripts/mac-launch-install.sh first)
+#      and starts its main process in the user's GUI session. The main process
+#      starts `sv-guest gpu guest --label <session>`, its boot record says so,
+#      and the host's wc-mac-sessiond runs `wc-session gpu`, which starts
+#      sv-hostd qemu-serve. The probe uses that session's icd.sock. No ssh
+#      starts anything of the session: the harness's ssh only copies the binary,
+#      edits the ini and opens the main process, as a user would. MAC_GPU_VIA=ssh
+#      is the §103.6 bootstrap (ssh starts the server; this script starts
+#      sv-hostd).
 # Uses /tmp/wcgpu and ~/wc/gpu in the VM, so it does not meet
 # scripts/mac-window.sh's /tmp/wcrt.
 # QMP takes one client: sv-hostd retries while another harness holds it.
@@ -128,9 +139,51 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
   fi
   bell=()
   [ -n "${MAC_GPU_BELL:-}" ] && bell=(--bell "$MAC_GPU_BELL")
+  icd="$run/icd.sock"; gpulog=/tmp/wcgpu/gpu.log
+  tl=$(now)
+  if [ "${MAC_GPU_VIA:-session}" = session ]; then
+    G='Library/Application Support/waycompose'
+    [ "$what" = window ] && { say "window: use MAC_GPU_VIA=ssh (mac-window.sh runs its own compositor)"; exit 2; }
+    systemctl --user is-active --quiet wc-mac-sessiond || { say "no wc-mac-sessiond: run scripts/mac-launch-install.sh first"; exit 2; }
+    vm "cat \"\$HOME/$G/wc-launch.ini\"" > "$run/ini.orig" || exit 1
+    awk -v u="/Users/$VMUSER" -v mib="${MAC_GPU_ARENA_MIB:-64}" '
+      /^gpu-(server|icd|arena-mib) =/ { next }
+      { print }
+      $0 == "[session]" {
+        print "gpu-server = " u "/wc/gpu/sv-guest"
+        print "gpu-icd = " u "/lvp/share/vulkan/icd.d/lvp_icd.x86_64.json"
+        print "gpu-arena-mib = " mib
+      }' "$run/ini.orig" > "$run/ini.new"
+    vm "cat > \"\$HOME/$G/wc-launch.ini\"" < "$run/ini.new" || exit 1
+    gpulog='~/Library/Logs/waycompose/gpu.log'
+    # The main process, as a face would start it. No face connects in this
+    # test, so the bootstrap namespace it registers in does not matter.
+    vm "pkill -f 'wc-launch --main' 2>/dev/null; rm -f ~/Library/Logs/waycompose/main.log; \
+        nohup \"\$HOME/$G/bin/wc-launch\" --main >/dev/null 2>&1 < /dev/null &"
+    tv=$(now); th0=$tv
+    sid=""
+    for _ in $(seq 1 300); do
+      sid=$(vm "sed -n 's/.*main process: session \(wcm-[0-9]*\).*/\1/p' ~/Library/Logs/waycompose/main.log 2>/dev/null | tail -1")
+      [ -n "$sid" ] && [ -S "/tmp/wc-launch/$sid/icd.sock" ] && break
+      sleep 0.1
+    done
+    th1=$(now)
+    icd="/tmp/wc-launch/$sid/icd.sock"
+    [ -s "/tmp/wc-launch/$sid/bell.path" ] && export SV_BELL="$(cat "/tmp/wc-launch/$sid/bell.path")"
+    hostd=$(systemctl --user show -p MainPID --value "wc-launch-gpu-$sid" 2>/dev/null)
+    journalctl --user -u wc-mac-sessiond --since "-60s" --no-pager -o cat | grep -E "$sid" | sed 's/^/  /'
+    [ -S "$icd" ] || { say "the session ($sid) never served a GPU"; vm "cat ~/Library/Logs/waycompose/main.log; tail -5 $gpulog"; exit 1; }
+    say "TIMING main process opened to the session's GPU served: $(dt "$tv" "$th1") s (boot record, locate, proxy, sv-hostd's claim)"
+    # The main process goes (its lease ends the session on the host), and
+    # the ini is what it was.
+    cleanup_session() {
+      vm "pkill -f 'wc-launch --main'; true" >/dev/null 2>&1
+      vm "cat > \"\$HOME/$G/wc-launch.ini\"" < "$run/ini.orig" >/dev/null 2>&1
+    }
+    trap 'cleanup_session; cleanup' EXIT
+  else
   # The bootstrap: start the server with this run's label. Its cold path is
   # its own first page from here on.
-  tl=$(now)
   vm "rm -rf /tmp/wcgpu; mkdir -m 700 /tmp/wcgpu; cd /tmp/wcgpu; ulimit -c 0; \
       VK_DRIVER_FILES=$LVP nohup $BIN gpu guest --label $label --arena $arena --idle $idle ${bell[*]} \
       > /tmp/wcgpu/gpu.log 2>&1 < /dev/null &"
@@ -152,6 +205,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
   else
     say "TIMING server started over ssh in $(dt "$tl" "$tv") s; sv-hostd from start to serving: $(dt "$th0" "$th1") s"
   fi
+  fi
   # Every socket sv-hostd holds, by kind (its descriptors' inodes against
   # /proc/net): QMP was read once for the region table and closed; what is
   # left is the ICD's listening socket. No TCP.
@@ -164,6 +218,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
   say "sv-hostd holds $nunix Unix socket(s) and $ntcp TCP socket(s): $(ls -l /proc/$hostd/fd 2>/dev/null | grep -c socket) socket(s) in all"
   [ "$ntcp" = 0 ] || fail=1
   # The server in the VM, the same question, while it serves.
+  [ "${MAC_GPU_VIA:-session}" = session ] && label=${sid:0:16}
   vm "p=\$(pgrep -f 'sv-guest gpu guest --label $label ' | head -1); echo pid=\$p; lsof -nP -a -p \$p -i 2>/dev/null | tail -n +2 | wc -l | sed 's/^ */inet=/'; lsof -nP -a -p \$p -U 2>/dev/null | tail -n +2 | wc -l | sed 's/^ */unix=/'" > "$run/vmsock.log" 2>&1
   inet=$(sed -n 's/^inet=//p' "$run/vmsock.log"); unix=$(sed -n 's/^unix=//p' "$run/vmsock.log")
   if grep -q '^pid=[0-9]' "$run/vmsock.log"; then
@@ -177,14 +232,14 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
   [ "$dump" = 1 ] && dumpenv=(SV_PRESENT_DUMP="$run/f/got-" VK_PRESENT_PROBE_EXPECT="$run/f/want-")
   if [ "$what" = window ]; then
     WC_SECS=${WC_SECS:-40} WC_SHOT_AFTER=${WC_SHOT_AFTER:-15} "$root/scripts/mac-window.sh" \
-      env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" LD_LIBRARY_PATH="$wllib" \
+      env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$icd" LD_LIBRARY_PATH="$wllib" \
       "$probe" --wsi wayland --width 400 --height 300 --c "${MAC_GPU_CUBE_FRAMES:-400}" > "$run/app.log" 2>&1
     rc=$?
     cp ${WC_EVIDENCE:-/mnt/datasets/builds/evidence/macos-host}/mac-last/client.log "$run/client.log" 2>/dev/null
     sed 's/^/  /' "$run/app.log"
     grep -E '^\[icd\]|sv-icd:|rror' "$run/client.log" 2>/dev/null | head -8 | sed 's/^/  client: /'
   else
-    ( cd "$run" && nix develop "$root" -c env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$run/icd.sock" \
+    ( cd "$run" && nix develop "$root" -c env VK_DRIVER_FILES="$root/target/debug/sv_icd.json" SV_SOCKET="$icd" \
         "${dumpenv[@]}" timeout 180 stdbuf -oL "$probe" ) 2>&1 \
       | while IFS= read -r l; do echo "$(now) $l" >> "$run/app.ts"; echo "$l"; done > "$run/app.log"
     rc=${PIPESTATUS[0]}
@@ -206,7 +261,7 @@ if [ "$what" = present ] || [ "$what" = both ] || [ "$what" = compute ] || [ "$w
     [ "$rc" -eq 0 ] || fail=1
   fi
   sleep 1
-  vm 'cat /tmp/wcgpu/gpu.log' > "$run/gpu.log"
+  vm "cat $gpulog" > "$run/gpu.log"
   grep -E 'offered|claimed|accepted|imported|published|dispatched' "$run/gpu.log" | sed 's/^/  VM: /'
 fi
 [ $fail -eq 0 ] && say PASS || say FAIL

@@ -72,7 +72,8 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
     }
 }
 
-/// Read lines from a channel, polling when idle (the guest has no doorbell).
+/// Read lines from a channel, sleeping on its lane when idle: woken by the
+/// doorbell, or after a millisecond when there is none (§103.15).
 struct Lines {
     ch: ByteChannel,
     buf: Vec<u8>,
@@ -89,7 +90,9 @@ impl Lines {
             match self.ch.read(&mut tmp) {
                 Ok(ReadOutcome::Bytes(n)) => self.buf.extend_from_slice(&tmp[..n]),
                 Ok(ReadOutcome::Eof) | Err(_) => return None,
-                Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(_) => {
+                    let _ = self.ch.wait_readable(crate::rings::service_slice());
+                }
             }
         }
     }
@@ -121,6 +124,16 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
             LAST_PING.store(now_ms(), Ordering::Relaxed);
             continue;
         }
+        // §103.15: `down` is answered here and done by the host's session
+        // service, which runs `wc-session down` once this process (its unit)
+        // has ended. Running it from here stopped this process's own unit
+        // before the reply went out, and the guest waited a minute for it.
+        if line.split_whitespace().next() == Some("down") {
+            println!("[proxy] session control: \"down\": ending; the session service takes the session down");
+            let _ = write_all(&mut lines.ch, b"ok down\n");
+            std::thread::sleep(Duration::from_millis(50));
+            std::process::exit(0);
+        }
         let reply = if !words_ok(&line) {
             "err refused: a request is words of [A-Za-z0-9 +/=._-]".to_string()
         } else {
@@ -141,9 +154,6 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
         };
         println!("[proxy] session control: {line:?} -> {reply}");
         if !write_all(&mut lines.ch, format!("{reply}\n").as_bytes()) {
-            break;
-        }
-        if line.starts_with("down") {
             break;
         }
     }

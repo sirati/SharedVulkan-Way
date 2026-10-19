@@ -89,7 +89,7 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
-pub use ringlink::{guest_ram_rings_located, shared_control};
+pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -678,7 +678,9 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     }
     // §89. The rings are the ivshmem region's tail; without the region there
     // is nowhere to put them, and the other two ring flags name other regions.
-    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() {
+    // §103.15: with --wayland-rings-guest-ram the region is this process's
+    // RAM and --wayland-rings names only its doorbell.
+    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() && !ringlink::wants_guest_ram_rings() {
         eprintln!("wc-compositor: --wayland-rings keeps the tail of the --arena-ivshmem region, and there is none");
         return Err(2);
     }
@@ -1123,6 +1125,9 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 // id, and it should not have to *guess* whether a frame list
                 // exists. A harness greps one line and gets both.
                 let note = publish_frames(&args, *id, r.pages, &mut frames_written);
+                if *id == 0 {
+                    ringlink::note_guest_ram_arena(r.run_id, r.pages);
+                }
                 println!(
                     "wc-compositor: arena {id} provided from guest RAM: \
                      run 0x{:016x}, {} bytes, {} pages, locked={}{note}, pinning={}",
@@ -1145,6 +1150,18 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // §89. The Wayland rings' doorbell is opened first, because whether the
     // region keeps a tail for rings depends on it: rings nobody can wake are a
     // poll, and the socket path is the honest fallback for that.
+    // §103.15: the guest-RAM rings' doorbell, opened now and kept for them.
+    if let (Some(port), None) = (&args.wayland_rings, args.ivshmem_arena)
+        && ringlink::wants_guest_ram_rings()
+    {
+        match ringlink::open_bell_port(port).and_then(|h| ringlink::GuestRamBell::new(port, h)) {
+            Ok(b) => ringlink::keep_guest_ram_bell(b),
+            Err(e) => println!(
+                "wc-compositor: NO DOORBELL for the guest-RAM rings: {port} did not open ({e}); \
+                 they are polled every millisecond"
+            ),
+        }
+    }
     let mut bell_port = match (&args.wayland_rings, args.ivshmem_arena) {
         (Some(port), Some(_)) => match ringlink::open_bell_port(port) {
             Ok(p) => Some((port.clone(), p)),
@@ -1764,14 +1781,24 @@ fn wayland_thread(
     };
     // Without a doorbell the rings are polled: a turn at least every millisecond.
     let mut ring_poll = false;
+    // §103.15: the guest-RAM rings' doorman, once they exist.
+    let mut _guest_ram_doorman: Option<sv_transport::vdoorbell::Doorman> = None;
     let _ = std::io::stdout().flush();
 
     loop {
-        if pending_rings.is_some() && ringlink::PendingRings::located() {
+        if pending_rings.as_mut().is_some_and(ringlink::PendingRings::poll) {
             match pending_rings.take().map(ringlink::PendingRings::into_link) {
-                Some(Ok(rl)) => {
+                Some(Ok((rl, reader))) => {
+                    match (reader, ringlink::shared_control()) {
+                        (Some(r), Some(control)) => {
+                            _guest_ram_doorman = Some(sv_transport::vdoorbell::Doorman::spawn_target(
+                                r,
+                                Arc::new(ringlink::GuestRamWake { waker: ticker.waker(), control }),
+                            ));
+                        }
+                        _ => ring_poll = true,
+                    }
                     ring_link = Some(rl);
-                    ring_poll = true;
                 }
                 Some(Err(e)) => eprintln!("wc-compositor: the guest-RAM ring region: {e}"),
                 None => {}
