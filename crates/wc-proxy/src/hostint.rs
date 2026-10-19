@@ -114,11 +114,10 @@ pub fn host_names(platform: Option<&str>) -> (&'static str, &'static str) {
 
 /// Sleep until the ring may have bytes, for at most `t`.
 ///
-/// ONE LINE TO CHANGE when macos-zero-copy is merged: the doorbell wait is
-/// `let _ = ch.wait_readable(t.min(crate::rings::service_slice()));`. Until
-/// then the ring is polled every 5 ms, which is what macsvc does too.
-fn wait_ring(_ch: &ByteChannel, t: Duration) {
-    std::thread::sleep(t.min(Duration::from_millis(5)));
+/// Sleep on the lane's doorbell (§103.15), for at most one service slice:
+/// the doorbell ends the sleep early, and without one the slice is short.
+fn wait_ring(ch: &ByteChannel, t: Duration) {
+    let _ = ch.wait_readable(t.min(crate::rings::service_slice()));
 }
 
 // --------------------------------------------------------------- shared --

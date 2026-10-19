@@ -90,3 +90,12 @@ pub fn spawn(
         log("hostint: the channel ended");
     })
 }
+
+/// The wait every caller should pass to [`spawn`]: sleep on the lane's
+/// doorbell (§103.15), at most one `ring_wait_slice`, which is long when the
+/// rings have a doorbell and a millisecond when they do not.
+pub fn doorbell_wait() -> Wait {
+    Box::new(|ch, t| {
+        let _ = ch.wait_readable(t.min(crate::ring_wait_slice()));
+    })
+}
