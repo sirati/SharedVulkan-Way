@@ -856,7 +856,7 @@ pub struct HubBell {
 impl HubBell {
     pub fn connect(path: &str, event: Arc<ColdEvent>) -> std::io::Result<HubBell> {
         use std::io::Read;
-        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        let stream = crate::brokered::connect(path)?;
         let mut reader = stream.try_clone()?;
         let writer = Mutex::new(crate::vdoorbell::DontWaitWriter(stream.try_clone()?));
         event.reopened();

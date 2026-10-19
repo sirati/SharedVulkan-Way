@@ -56,6 +56,92 @@ pub fn parse_signed(line: &str, install: &str) -> Result<(wc_handle::macboot::Au
 
 #[cfg(unix)]
 pub use unix_client::Client;
+#[cfg(unix)]
+pub use process::{install_hooks, open_path, region_spec};
+
+/// §111.10: what a session's process on the client role's host uses in place
+/// of opening the raw devices itself. A path `broker:ID` is region `ID`, which
+/// the daemon published for this process's user (the BAR file today); a hub
+/// spec `broker:NAME` is a fresh connection to the hub's service `NAME`. One
+/// connection per process, kept for the process's life: it is what the lease
+/// on a region belongs to, and how the broker sees the process exit.
+#[cfg(unix)]
+mod process {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::fd::OwnedFd;
+    use std::sync::Mutex;
+
+    struct Shared {
+        client: Option<Client>,
+        regions: BTreeMap<u64, OwnedFd>,
+    }
+
+    static SHARED: Mutex<Shared> = Mutex::new(Shared { client: None, regions: BTreeMap::new() });
+
+    fn role() -> String {
+        std::env::args()
+            .next()
+            .and_then(|a| std::path::Path::new(&a).file_name().map(|f| f.to_string_lossy().into_owned()))
+            .filter(|r| crate::proto::Request::parse(&format!("hello {r}")).is_ok())
+            .unwrap_or_else(|| "client".into())
+    }
+
+    fn with_client<T>(f: impl FnOnce(&mut Client) -> io::Result<T>) -> io::Result<T> {
+        let mut g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        if g.client.is_none() {
+            let mut c = Client::connect(&super::path())?;
+            c.hello(&role())?;
+            g.client = Some(c);
+        }
+        let r = f(g.client.as_mut().expect("just set"));
+        if r.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::UnexpectedEof || e.kind() == io::ErrorKind::BrokenPipe) {
+            // The daemon was restarted: the next call connects again.
+            g.client = None;
+        }
+        r
+    }
+
+    /// The region id of a `broker:ID` path.
+    pub fn region_spec(path: &std::path::Path) -> Option<u64> {
+        path.to_str()?.strip_prefix(sv_transport::brokered::PREFIX)?.parse().ok()
+    }
+
+    /// Open `path` read-write: region `ID` of the broker for `broker:ID`
+    /// (its fd, asked for once and duplicated after), else the file.
+    pub fn open_path(path: &std::path::Path) -> io::Result<std::fs::File> {
+        let Some(id) = region_spec(path) else {
+            return std::fs::OpenOptions::new().read(true).write(true).open(path);
+        };
+        {
+            let g = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fd) = g.regions.get(&id) {
+                return Ok(std::fs::File::from(fd.try_clone()?));
+            }
+        }
+        let (r, mut fds) = with_client(|c| c.open(id)).map_err(|e| {
+            io::Error::new(e.kind(), format!("region {id} from the broker at {}: {e}", super::path()))
+        })?;
+        if r.pieces.len() != 1 || r.pieces[0].offset != 0 {
+            return Err(io::Error::other(format!("region {id} is {} piece(s); a file-like region is one", r.pieces.len())));
+        }
+        let fd = fds.remove(0);
+        let out = std::fs::File::from(fd.try_clone()?);
+        SHARED.lock().unwrap_or_else(|e| e.into_inner()).regions.insert(id, fd);
+        Ok(out)
+    }
+
+    fn connect_service(name: &str) -> io::Result<std::os::unix::net::UnixStream> {
+        let fd = with_client(|c| c.connect_service(name))?;
+        Ok(std::os::unix::net::UnixStream::from(fd))
+    }
+
+    /// Let `sv_transport` reach `broker:NAME` hub specs through this process's
+    /// broker connection. Harmless to call more than once.
+    pub fn install_hooks() {
+        sv_transport::brokered::install(connect_service);
+    }
+}
 
 #[cfg(unix)]
 mod unix_client {
@@ -137,6 +223,12 @@ mod unix_client {
         /// A lease on region `id`, and its fds.
         pub fn open(&mut self, id: u64) -> io::Result<(RegionReply, Vec<OwnedFd>)> {
             self.region(&Request::Open { id })
+        }
+
+        /// A lease on the live region of `pool` (a published place such as
+        /// `gpu.<k>`), and its fds.
+        pub fn find(&mut self, pool: &str) -> io::Result<(RegionReply, Vec<OwnedFd>)> {
+            self.region(&Request::Find { pool: pool.into() })
         }
 
         pub fn close(&mut self, id: u64) -> io::Result<()> {

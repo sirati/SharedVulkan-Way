@@ -257,6 +257,44 @@ fn now_micros() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
+/// §111.6: the record signed by the privileged service at `sock` for this
+/// process's user, and the identity it signed. On a Linux server the broker
+/// (`wc-broker`, which holds `<install>.key`); the Windows service's pipe is
+/// the Windows branch's.
+#[cfg(unix)]
+fn sign_by_broker(
+    sock: &str,
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+    install: &str,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    let mut c = wc_broker::client::Client::connect(sock).map_err(|e| e.to_string())?;
+    let req = wc_broker::proto::SignReq {
+        install: install.to_string(),
+        session: rec.session.clone(),
+        index,
+        arena_run: rec.arena_run,
+        arena_pages: rec.arena_pages,
+        outbound: rec.outbound,
+        rings_run: rec.rings_run,
+        rings_pages: rec.rings_pages,
+        gpu: rec.gpu,
+        seq: now_micros(),
+    };
+    let (auth, id) = c.sign(&req).map_err(|e| format!("the broker at {sock} would not sign: {e}"))?;
+    Ok((auth, Some(id)))
+}
+
+#[cfg(not(unix))]
+fn sign_by_broker(
+    sock: &str,
+    _rec: &wc_handle::macboot::Record,
+    _index: u8,
+    _install: &str,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    Err(format!("broker:{sock}: signing through the Windows service is not in this build"))
+}
+
 // ------------------------------------------------------------ the singleton ---
 
 /// §107: what keeps a second compositor of the user from starting. Held for
@@ -640,8 +678,17 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
     let cfg = &sess.cfg;
     let id = h.arena;
     let t0 = Instant::now();
-    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
-    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
+    // §111.6: `broker:SOCK` is the privileged service that holds the key and
+    // signs the record for this process's user; otherwise the key file.
+    let broker = cfg.key_file.to_str().and_then(|s| s.strip_prefix("broker:")).map(str::to_string);
+    let key = match &broker {
+        Some(_) => None,
+        None => {
+            let text = std::fs::read_to_string(&cfg.key_file)
+                .map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
+            Some(macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?)
+        }
+    };
     let (run, region_len, rings_len) = wc_handle::arena::ivshmem_identity(id).map_err(|e| e.to_string())?;
     if rings_len == 0 {
         return Err("the region kept no Wayland rings, and without them nothing can cross".into());
@@ -656,12 +703,20 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
         rings_pages: (rings_len / 4096) as u32,
         gpu: cfg.gpu,
     };
-    let auth = macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), &key);
+    let (auth, identity) = match (&broker, &key) {
+        (_, Some(key)) => (macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), key), None),
+        (Some(sock), None) => sign_by_broker(sock, &rec, sess.index, &cfg.install)?,
+        (None, None) => unreachable!("a key file or a broker"),
+    };
+    if let Some(i) = &identity {
+        say(&format!("boot: the broker signed the record for {}", i.text()));
+    }
     let page0 = wc_handle::arena::ivshmem_header_page(id).map_err(|e| e.to_string())?;
     // SAFETY: the header page of the device this process maps, for the life of
     // the process; nothing else in this process writes past the header's 80
-    // bytes of it, and the boot turn keeps other boots out.
-    unsafe { macboot::publish_indexed(page0, &rec, sess.index, Some(&auth)) };
+    // bytes of it, and the boot turn keeps other boots out. Without an
+    // identity this clears the area and is `publish_indexed`.
+    unsafe { macboot::publish_identity(page0, &rec, sess.index, identity.as_ref(), Some(&auth)) };
     let bell = sv_transport::park::cross_wake();
     say(&format!(
         "boot: record for session {} of installation {} in the header page (run 0x{run:016x}, index {}, gpu {}); {}",

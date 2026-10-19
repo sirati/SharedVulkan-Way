@@ -35578,3 +35578,183 @@ yet: the table itself is §108's to build.
 | `cargo check --workspace --target x86_64-pc-windows-gnu`; `-p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 |
 | `scripts/wc-xref.sh --list` | no missing citation |
 | `scripts/wc-multi-install.sh` (legs 1–7), `scripts/wc-no-ssh.sh`, `scripts/wc-lazy-pools.sh` | OK, OK, OK |
+
+## 111. One privileged component per machine: who may hold what, and what a dead process leaves behind
+
+Written 2026-10-19, branch `broker` (from `session-fixes`, after §107.10).
+The crate is `crates/wc-broker`; docs/security-model.md R44 is its argument.
+
+### 111.1 Why
+
+Three requests from the user, after the guest e2e of 2026-10-19:
+
+1. **Liveness.** A process that holds a ring slot, a device, a region or a
+   doorbell and dies must not leave it held. The kernel knows when a process
+   exits; something privileged should be told and clean up, instead of idle
+   timers guessing. (§107.10's stuck session was not a dead process, but the
+   rule stands.)
+2. **Isolation between users.** On a machine with several users, one user's
+   processes must never get a mapping, handle, slot or lease of another's.
+   The rule is the user's own: "just look at the user identification and not
+   much more". A user is a uid or a SID. No keys, signatures or integrity
+   levels beyond what §105 already has.
+3. **No slowdown, and no duplication.** The data path stays as it is:
+   zero-copy shared memory, doorbells, GPU pinning and address stability. And
+   one crate does this for every platform and both roles, server (the
+   compositor and GPU server: Windows, macOS, Linux) and client (the Linux
+   side that runs the applications, `wc-proxy` and `sv-icd`).
+
+Pieces that existed and fold into it: the Windows SYSTEM task that set the
+ports' ACLs (`scripts/wc-port-access.ps1`, §91), the macOS keeper
+(`wc-launch --keeper`, §103.15), and the Windows large-page keeper of §108.10.
+
+### 111.2 The shape: a control plane that moves handles
+
+The one fact that decides the design: on the Windows guest each ivshmem device
+allows **one mapping** (the driver ties it to the handle that asked) and each
+virtio-serial port **one opener**. A broker that relayed the data would be a
+copy and a hop on every frame and every doorbell. So the broker never touches
+data. It opens a device and **moves** the handle into the process that asked
+(Windows: `DuplicateHandle` with `DUPLICATE_CLOSE_SOURCE`; Unix: the fd sent
+with `SCM_RIGHTS`, the broker's copy closed). From then on the process maps the
+BAR or reads the port exactly as when it opened it itself: the same code, the
+same mapping, the same wake.
+
+The handle is moved, not shared, for a reason beyond tidiness. If the broker
+kept its own handle to the ivshmem device, the driver's cleanup would not run
+when the holder's process died (the file object would still be open), and the
+mapping it made into the dead process would be torn down later from another
+process's context. Moving it leaves exactly today's lifetime: the device is
+released when the holder's process exits.
+
+A region (a guest-RAM section on Windows, a wired shm object on macOS, a memfd
+on Linux, a dma-buf of guest RAM on the host) is different: the broker keeps a
+handle and gives copies. That is the keeper rule: the memory outlives a
+crashed owner until its pool has let go of it.
+
+### 111.3 The rules, in one state machine (`core.rs`)
+
+`Core` has no operating system in it. The platform halves tell it who
+connected, what was asked and which process exited; it answers and returns
+notices (destroy this object, push this line, this region is drained). So the
+rules are one implementation, unit-tested without any platform.
+
+1. **A user owns what its processes asked for.** Only that user's processes,
+   and the broker's admins (root, SYSTEM, its own account), get a handle to it.
+2. **A device has one holder.** Lent to one process at a time; a request from
+   another user's process is refused while it is held ("one user at a time"),
+   one from the same user's other process too (the device has one opener). It
+   is free again when the holder's **process** exits. Its connection closing
+   is not enough, because the handle lives in the process.
+3. **A region outlives its owner until its pool has let go.** The owner is
+   the connection that allocated it. When that connection or process ends,
+   its regions become **orphans** of their pool, still held. The same user's
+   next process that serves the pool adopts them (`adopt POOL`) and frees each
+   once the host has unmapped it. A region is destroyed only by its owner's
+   `free`, or by its release rule: `OwnerFree` (Windows, §108.10: never on a
+   timeout) or `Probe` (macOS, §103.15: the host's release word, or a time).
+4. **A lease is a holder's claim on one region's epoch** (the client role,
+   §108.4). It ends by `close`, by the connection, or by the process. A
+   retiring region pushes `!retiring ID EPOCH` to its holders and is
+   **drained** when the last lease ends. That is the gate for `UNMAPPED`.
+5. **Exits are told.** A subscribed connection of the same user (and admins)
+   gets `!exited PID ROLE` and `!device-free NAME`.
+
+### 111.4 The protocol (`proto.rs`)
+
+One line each way on a local socket (Unix) or pipe (Windows), the same text
+everywhere:
+
+```text
+hello ROLE                    -> ok hello RUN USER PID
+device NAME                   -> ok device NAME HANDLE        (moved)
+alloc POOL BYTES [large]      -> ok region ID POOL LEN EPOCH PIECES
+open ID                       -> ok region ID POOL LEN EPOCH PIECES
+find POOL                     -> ok region ...   (the live region of a published place, e.g. gpu.3)
+close ID | free ID            -> ok
+adopt POOL                    -> ok adopted [ID:LEN ...]
+connect NAME                  -> ok connect NAME HANDLE       (a fresh connection to a local service)
+sign INSTALL SESSION INDEX ARUN APAGES OUTBOUND RRUN RPAGES GPU SEQ
+                              -> ok signed SEQ MAC IDENTITY...
+subscribe                     -> ok, then !exited PID ROLE | !device-free NAME | !retiring ID EPOCH
+stats                         -> ok stats K=V ...
+refused                       -> err WHY
+```
+
+`HANDLE` is `fd` on Unix (the fds travel with the line, in order) and the
+handle's value on Windows (the broker has already put it into the caller).
+`PIECES` is `HANDLE@OFFSET+LEN,...`: one piece for a region the broker made,
+several for a host region made of dma-bufs. A malformed line is refused by
+name; words are `[A-Za-z0-9-_.:]{1,64}`, lines at most 4096 bytes.
+
+### 111.5 The platforms (`sys/`)
+
+| | identity | liveness | handles | regions |
+|---|---|---|---|---|
+| Linux | `SO_PEERCRED` uid | pidfd (`pidfd_open`), one epoll thread | `SCM_RIGHTS` | sealed memfd; on the host, dma-bufs of guest RAM (§108) |
+| macOS | `getpeereid` + `LOCAL_PEERPID` | kqueue `EVFILT_PROC`/`NOTE_EXIT` | `SCM_RIGHTS` | POSIX shm, unlinked at once, mapped and wired by the broker |
+| Windows | the pipe client's token user SID (`ImpersonateNamedPipeClient`), checked against the process's own token | a wait on the process handle | `DuplicateHandle` into the process | unnamed pagefile sections, large pages when asked (§108.7) |
+
+Each platform half is a `server::Platform`: accept and identify, watch a pid,
+open a device, make a region, send a line with handles, and (§111.6) say who
+the caller is. Everything else is `server.rs`, one serving loop: a thread per
+connection, one lock on the core, notices carried out under it. A session
+asks a handful of questions when it starts; nothing per frame.
+
+### 111.6 The boot record says who asked, and the broker signs it
+
+The host must know which server-side user a session belongs to, to run its
+Linux side as the Linux user mapped to them (111.10). A compositor cannot be
+trusted to say: with the device handle moved into it, it maps the BAR
+read-write and could write any bytes into the header page. So the existing
+§105 HMAC moves to the broker. The installations' keys move from the user's
+install directory into a directory only the broker's account can read, and
+the boot record gains an identity area, covered by the MAC:
+
+```text
+  page 0, from macboot::OFF_IDENTITY (1920)
+  0   "WCIDNT01"
+  8   u16 length, then "os=windows user=NAME id=S-1-5-21-…" (at most 246 bytes)
+```
+
+`sign` takes the record's fields from the compositor and the identity from the
+kernel (the token's SID and account name, or the uid and its name), never from
+the request, and answers the MAC (`Auth::sign_identity`). The compositor
+publishes record, identity and MAC (`publish_identity`). A user process that
+rewrites the identity in the page it can write makes the MAC fail
+(`the_identity_is_covered_by_the_mac_and_none_is_sections_107s`). With no
+identity the message is §107's, byte for byte, so a host that has not been
+updated reads today's records as before. It is the same HMAC, signed by the
+trusted party; no new cryptography.
+
+### 111.7 Tests of the shared parts
+
+* `core::tests` (8): one holder and its return at the holder's exit; named
+  users; a region is its user's only, root may open it; the keeper rule (an
+  owner's death leaves orphans that only the same user's next provider of the
+  pool adopts, never a timeout); the probe rule; leases and drain by close,
+  connection and process; exits told only to the user's subscribers and
+  admins; the budget.
+* `proto::tests` (3): every request survives its own line; malformed lines
+  are refused; a region reply with several pieces round-trips.
+* `tests/unix.rs` (6), on a real socket with a second process (the test binary
+  run again): a device moved into a child, refused to the parent while the
+  child lives, `!exited` and `!device-free` pushed and the device lent again
+  the moment the child exits; a device for another uid refused; a memfd region
+  shared by two connections, its owner's connection closed, the orphan still
+  mapped and readable, adopted by the right pool only and freed; `sign` with
+  and without a key, the MAC verifying for the kernel's identity and not for
+  another; `connect` handing out fresh connections to a local service.
+* `macboot::identity_tests` (2).
+
+### 111.8 Windows
+
+(Written by the Windows half's branch.)
+
+### 111.9 macOS
+
+(Written by the macOS half's branch.)
+
+### 111.10 The Linux host: sessions run as the mapped user
+
+(Written by the host half's branch.)

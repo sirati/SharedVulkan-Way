@@ -694,17 +694,51 @@ mod host {
 }
 
 #[cfg(unix)]
+mod agent;
+#[cfg(unix)]
 mod ram_peer;
 #[cfg(unix)]
 mod sessiond;
 #[cfg(unix)]
 mod sessiond_ivshmem;
 
+/// `wc-arena-host broker-read PATH [BYTES]`: the first BYTES (4096) of a
+/// file, or of region `broker:ID` from the broker (§111.10). What
+/// `wc-session up` reads the ivshmem header with when its user may not open
+/// the BAR file itself.
+#[cfg(unix)]
+fn broker_read(argv: &[String]) -> std::process::ExitCode {
+    use std::io::{Read, Write};
+    let Some(path) = argv.first() else {
+        eprintln!("usage: wc-arena-host broker-read PATH|broker:ID [BYTES]");
+        return std::process::ExitCode::from(2);
+    };
+    let n: u64 = argv.get(1).and_then(|s| s.parse().ok()).unwrap_or(4096).min(1 << 20);
+    let r = wc_broker::client::open_path(std::path::Path::new(path)).and_then(|f| {
+        let mut buf = Vec::new();
+        f.take(n).read_to_end(&mut buf)?;
+        std::io::stdout().write_all(&buf)
+    });
+    match r {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("wc-arena-host broker-read {path}: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
     // §103.15: the macOS guest's session service.
     let argv: Vec<String> = std::env::args().collect();
-    // §108: the host's half of a region table.
+    // §111.10: the mapped user's agent, and the header read through the broker.
+    match argv.get(1).map(String::as_str) {
+        Some("agent") => return agent::main(&argv[2..]),
+        Some("broker-read") => return broker_read(&argv[2..]),
+        _ => {}
+    }
+    // §108: the host's half of a region table (the test VM's instrument).
     if argv.get(1).map(String::as_str) == Some("ram-peer") {
         return ram_peer::main(&argv[2..]);
     }

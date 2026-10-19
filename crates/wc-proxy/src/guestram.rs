@@ -358,6 +358,16 @@ impl Plan {
 /// first half, and what the Wayland rings are found by (§89): they are in the
 /// same file, so the same run-id check is what keeps a proxy off a previous
 /// compositor's rings.
+/// §111.10: the file behind a BAR, by path, or as region `broker:ID` from the
+/// broker (whose fd is read-write). A session that runs as a mapped user
+/// cannot open the BAR file itself: the daemon published it for that user.
+pub fn open_backing(path: &Path, write: bool) -> io::Result<std::fs::File> {
+    if wc_broker::client::region_spec(path).is_some() {
+        return wc_broker::client::open_path(path);
+    }
+    std::fs::OpenOptions::new().read(true).write(write).open(path)
+}
+
 pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::ivshmem::Header> {
     read_ivshmem_header(path, expected_run).map(|(h, _)| h)
 }
@@ -365,7 +375,7 @@ pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::i
 fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle::ivshmem::Header, u64)> {
     use std::io::Read;
     use wc_handle::ivshmem::{ENCODED_LEN, Header};
-    let mut f = std::fs::File::open(path).map_err(|e| {
+    let mut f = open_backing(path, false).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -419,7 +429,7 @@ impl StitchedRegion {
 
         let len = usize::try_from(plan.len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&plan.object)?;
+        let file = open_backing(&plan.object, true)?;
 
         // One reservation first, so the runs land next to each other and the
         // arena's offsets mean something. `PROT_NONE` so that a hole — a run

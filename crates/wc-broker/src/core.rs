@@ -427,6 +427,25 @@ impl Core {
         Ok(r.info.clone())
     }
 
+    /// `find POOL`: a lease on the live region of this user's pool `POOL`,
+    /// for a client that knows a region by its place (`gpu.<k>`, §108) and
+    /// not by the broker's id. A retiring region is never found, so after a
+    /// pool's region is replaced the next `find` gets the new one.
+    pub fn find(&mut self, conn: ConnId, pool: &str) -> Result<RegionInfo, Refusal> {
+        let Some(c) = self.conns.get(&conn) else { return refuse("not connected") };
+        let peer = c.peer.clone();
+        let id = self
+            .regions
+            .values()
+            .filter(|r| r.info.pool == pool && !r.retiring && (r.user == peer.user || peer.admin))
+            .map(|r| r.info.id)
+            .max();
+        match id {
+            Some(id) => self.open(conn, id),
+            None => refuse(format!("no live region of pool {pool} for {}", peer.user)),
+        }
+    }
+
     /// `close ID`: one lease ends.
     pub fn close(&mut self, conn: ConnId, id: ObjId) -> Result<(), Refusal> {
         let Some(r) = self.regions.get_mut(&id) else { return refuse(format!("no region {id}")) };
@@ -507,6 +526,13 @@ impl Core {
         for id in due {
             self.destroy(id);
         }
+    }
+
+    /// The processes with a lease on region `id`, each once.
+    pub fn holders(&self, id: ObjId) -> Vec<Pid> {
+        let Some(r) = self.regions.get(&id) else { return Vec::new() };
+        let pids: BTreeSet<Pid> = r.leases.keys().filter_map(|c| self.conns.get(c)).map(|c| c.peer.pid).collect();
+        pids.into_iter().collect()
     }
 
     pub fn region(&self, id: ObjId) -> Option<&RegionInfo> {
@@ -679,6 +705,28 @@ mod tests {
         assert!(n.contains(&Notice::Push(1, "!exited 300 ?".into())), "the subscriber hears of the exit too");
         c.unpublish(r.id);
         assert_eq!(c.drain(), vec![Notice::Destroy(r.id)]);
+    }
+
+    /// `find` names a region by its pool: only the caller's user's, never a
+    /// retiring one, the newest when there are two.
+    #[test]
+    fn a_region_is_found_by_its_pool_for_its_user_only() {
+        let mut c = core();
+        let t = Instant::now();
+        let a = c.publish(User::uid(1000), "gpu.3", 64 << 20, 1);
+        c.publish(User::uid(1001), "gpu.3", 64 << 20, 1);
+        c.connect(1, peer(100, 1000));
+        c.connect(2, peer(200, 1002));
+        assert_eq!(c.find(1, "gpu.3").unwrap(), a);
+        assert_eq!(c.holders(a.id), vec![100]);
+        assert!(c.find(2, "gpu.3").unwrap_err().0.contains("no live region"));
+        assert!(c.find(1, "gpu.4").is_err());
+        c.retire(a.id);
+        assert!(c.find(1, "gpu.3").is_err(), "a retiring region is not found");
+        let b = c.publish(User::uid(1000), "gpu.3", 128 << 20, 2);
+        assert_eq!(c.find(1, "gpu.3").unwrap(), b);
+        c.conn_closed(1, t);
+        assert!(c.drain().contains(&Notice::Drained(a.id, 1)), "the find was a lease, and its end drains");
     }
 
     #[test]

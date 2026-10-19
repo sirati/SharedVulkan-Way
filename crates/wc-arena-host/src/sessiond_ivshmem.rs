@@ -43,6 +43,21 @@ struct Args {
     state: PathBuf,
     bell: Option<String>,
     poll: Duration,
+    /// §111.10: the root-owned table that maps a record's identity to a
+    /// Linux user, and the server (VM) this service serves. With it, every
+    /// session runs as its mapped user through that user's agent.
+    users: Option<PathBuf>,
+    server: String,
+    /// Transitional: records without identity map through `-` lines.
+    accept_unidentified: bool,
+    /// Where the users' agents listen: `DIR/<linux-user>/agent.sock`.
+    agents: PathBuf,
+    /// §111.10: serve the client role's broker on this socket, in this
+    /// process, and publish the BAR files for each session's user.
+    broker: Option<PathBuf>,
+    gpu_region: Option<PathBuf>,
+    hub_wl: Option<PathBuf>,
+    hub_sv: Option<PathBuf>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -54,6 +69,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         state: state_home.join("waycompose/sessiond"),
         bell: None,
         poll: Duration::from_millis(1000),
+        users: None,
+        server: String::new(),
+        accept_unidentified: false,
+        agents: "/run/waycompose/agent".into(),
+        broker: None,
+        gpu_region: None,
+        hub_wl: None,
+        hub_sv: None,
     };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
@@ -67,13 +90,28 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--state" => a.state = v()?.into(),
             "--bell" => a.bell = Some(v()?),
             "--poll-ms" => a.poll = Duration::from_millis(v()?.parse().map_err(|e| format!("--poll-ms: {e}"))?),
+            "--users" => a.users = Some(v()?.into()),
+            "--server" => a.server = v()?,
+            "--accept-unidentified" => a.accept_unidentified = true,
+            "--agents" => a.agents = v()?.into(),
+            "--broker" => a.broker = Some(v()?.into()),
+            "--gpu-region" => a.gpu_region = Some(v()?.into()),
+            "--hub-wl" => a.hub_wl = Some(v()?.into()),
+            "--hub-sv" => a.hub_sv = Some(v()?.into()),
             _ => return Err(format!("unknown argument {k}")),
         }
     }
     if a.arena.as_os_str().is_empty() {
         return Err("usage: wc-arena-host sessiond --ivshmem ARENA-FILE [--installs DIR] [--state DIR] \
-                    [--bell HUB-SOCKET] [--poll-ms N]"
+                    [--bell HUB-SOCKET] [--poll-ms N] [--users USERS.CONF --server NAME [--accept-unidentified] \
+                    [--agents DIR]] [--broker SOCK [--gpu-region FILE] [--hub-wl SOCK] [--hub-sv SOCK]]"
             .into());
+    }
+    if a.users.is_some() && a.server.is_empty() {
+        return Err("--users needs --server: the name of the VM this service serves, as users.conf spells it".into());
+    }
+    if a.accept_unidentified && a.users.is_none() {
+        return Err("--accept-unidentified is a users.conf setting; it needs --users".into());
     }
     Ok(a)
 }
@@ -145,6 +183,37 @@ pub struct Request {
     /// §107: the session's index in the guest's shared compositor; 0 for a
     /// compositor serving one session.
     pub index: u8,
+    /// §111.6: who asked, as the server's privileged service signed it.
+    /// `None`: a record without an identity area (§107's).
+    pub identity: Option<macboot::Identity>,
+}
+
+/// §111.10: the Linux user a verified record's session runs as, or why it
+/// runs as nobody. `map` is users.conf, `server` this service's VM.
+pub fn map_user(
+    map: &wc_broker::usermap::UserMap,
+    server: &str,
+    accept_unidentified: bool,
+    req: &Request,
+) -> Result<String, String> {
+    match &req.identity {
+        Some(id) => {
+            let asker = wc_broker::usermap::Asker { os: &id.os, user: &id.user, id: &id.id };
+            map.resolve(server, asker, &req.install.name).map(|m| m.linux_user.clone())
+        }
+        None if !accept_unidentified => Err(format!(
+            "the boot record of installation {} carries no identity, and this host requires one \
+             (the guest's waycompose service signs it)",
+            req.install.name
+        )),
+        None => map.resolve_unidentified(server, &req.install.name).map(|m| m.linux_user.clone()).ok_or_else(|| {
+            format!(
+                "the boot record of installation {} carries no identity, and users.conf of {server} maps no \
+                 user for that installation without one",
+                req.install.name
+            )
+        }),
+    }
 }
 
 pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Request>, String> {
@@ -161,10 +230,21 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
     let index = macboot::session_index(page).ok_or("the boot record's session index is not 0..255")?;
     let install = lookup(installs, &auth.installation)?;
     let key = key_of(&install)?;
+    // §111.6: an identity area that is there is covered by the MAC; one that
+    // does not even parse is refused, never read as "no identity".
+    let identity = if macboot::has_identity(page) {
+        Some(macboot::Identity::read(page).ok_or("the boot record's identity area does not parse")?)
+    } else {
+        None
+    };
     // §107: the index is covered by the MAC, so a record cannot be replayed
     // into another session's place; index 0 is the one-session message.
-    if !auth.verifies_indexed(&rec, index, &key) {
-        return Err(format!("the boot record for installation {} does not verify under its key", install.name));
+    if !auth.verifies_identity(&rec, index, identity.as_ref(), &key) {
+        return Err(format!(
+            "the boot record for installation {} does not verify under its key{}",
+            install.name,
+            if identity.is_some() { " with the identity it carries" } else { "" }
+        ));
     }
     let last = last_seq(state, &install.name);
     if auth.seq <= last {
@@ -173,7 +253,7 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
             install.name, auth.seq
         ));
     }
-    Ok(Some(Request { rec, install, seq: auth.seq, index }))
+    Ok(Some(Request { rec, install, seq: auth.seq, index, identity }))
 }
 
 /// Write the answer into page 0, if it still holds the record: the message
@@ -218,7 +298,7 @@ impl Live {
     }
 
     /// End every session whose proxy unit is gone.
-    fn reap(&mut self) {
+    fn reap(&mut self, host: &Host) {
         let gone: Vec<(String, PathBuf)> =
             self.map.iter().filter(|(id, _)| !crate::sessiond::unit_active(id)).map(|(i, b)| (i.clone(), b.clone())).collect();
         for (id, base) in gone {
@@ -226,8 +306,119 @@ impl Live {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
                 Err(e) => say(&format!("session {id} ended; {e}")),
             }
+            host.ended(&id);
             let _ = std::fs::remove_file(self.dir.join(&id));
             self.map.remove(&id);
+        }
+    }
+}
+
+/// §111.10: what users.conf says, for a service that maps its sessions.
+struct Mapped {
+    map: wc_broker::usermap::UserMap,
+    server: String,
+    accept_unidentified: bool,
+    agents: PathBuf,
+}
+
+/// §111.10: the client role's broker, in this process. It alone opens the
+/// BAR files and the hub's sockets; a session's processes get them from it.
+struct Brokered {
+    broker: wc_broker::server::Broker<wc_broker::sys::unix::Unix>,
+    path: String,
+    arena: PathBuf,
+    gpu: Option<PathBuf>,
+}
+
+impl Brokered {
+    fn start(a: &Args, path: &Path, users: Vec<wc_broker::User>) -> std::io::Result<Brokered> {
+        use wc_broker::sys::unix::{DevicePath, Unix};
+        use wc_broker::{Allow, DeviceSpec};
+        let mut services = Vec::new();
+        let mut specs = Vec::new();
+        for (name, p) in [("wl-hub", &a.hub_wl), ("sv-hub", &a.hub_sv)] {
+            if let Some(p) = p {
+                services.push(DevicePath { name: name.into(), path: p.clone() });
+                specs.push(DeviceSpec { name: name.into(), allow: Allow::Users(users.clone()) });
+            }
+        }
+        let unix = Unix::bind(path, Vec::new())?.with_services(services);
+        let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let config = wc_broker::server::Config {
+            devices: Vec::new(),
+            services: specs,
+            keys: None,
+            release: wc_broker::Release::OwnerFree,
+            budget: None,
+            run,
+        };
+        let broker = wc_broker::server::Broker::new(unix, config);
+        let b = broker.clone();
+        std::thread::Builder::new().name("broker".into()).spawn(move || b.serve())?;
+        Ok(Brokered { broker, path: path.to_string_lossy().into_owned(), arena: a.arena.clone(), gpu: a.gpu_region.clone() })
+    }
+
+    /// The BAR files, published for one session's user: (arena, gpu).
+    fn publish(&self, uid: u32) -> Result<(u64, Option<u64>), String> {
+        let open = |p: &Path, pool: &str| -> Result<u64, String> {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let len = f.metadata().map_err(|e| e.to_string())?.len();
+            let obj = wc_broker::sys::unix::Unix::object(std::os::fd::OwnedFd::from(f));
+            Ok(self.broker.publish(wc_broker::User::uid(uid), pool, 1, vec![(obj, 0, len)]))
+        };
+        let arena = open(&self.arena, "arena")?;
+        let gpu = match &self.gpu {
+            None => None,
+            Some(g) => match open(g, "gpu") {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    say(&format!("NO GPU region for uid {uid}: {e}"));
+                    None
+                }
+            },
+        };
+        Ok((arena, gpu))
+    }
+}
+
+/// §111.10: the components this daemon hosts beside its broker
+/// (`wc_broker::host::Embedded`). The guest-RAM substrate (§108,
+/// `sv_ram::brokered`) is added here; each is attached once at start and told
+/// of every session that starts and ends, with the user it runs as.
+fn embedded(_args: &Args) -> Vec<Box<dyn wc_broker::host::Embedded>> {
+    Vec::new()
+}
+
+/// Everything a pass of [`serve`] needs besides the page.
+struct Host {
+    mapped: Option<Mapped>,
+    broker: Option<Brokered>,
+    /// Regions published per session, unpublished when it ends.
+    published: std::sync::Mutex<HashMap<String, Vec<u64>>>,
+    /// The live sessions and their owners, for the embedded components.
+    sessions: wc_broker::host::SessionsView,
+    components: Vec<Box<dyn wc_broker::host::Embedded>>,
+}
+
+impl Host {
+    fn started(&self, s: wc_broker::host::HostSession) {
+        self.sessions.insert(s.clone());
+        for c in &self.components {
+            c.session_up(&s);
+        }
+    }
+
+    fn ended(&self, id: &str) {
+        let ids = self.published.lock().unwrap_or_else(|e| e.into_inner()).remove(id).unwrap_or_default();
+        if let Some(b) = &self.broker {
+            for r in ids {
+                b.broker.unpublish(r);
+            }
+        }
+        if let Some(s) = self.sessions.remove(id) {
+            for c in &self.components {
+                c.session_down(&s);
+            }
         }
     }
 }
@@ -241,14 +432,91 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
         }
     };
     // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("wc-arena-host sessiond runs as the user whose sessions it starts; refusing to run as root");
+    let me = unsafe { libc::geteuid() };
+    if me == 0 {
+        eprintln!("wc-arena-host sessiond runs as the user whose sessions it starts, or as its own system account; refusing to run as root");
         return std::process::ExitCode::from(2);
+    }
+    // §111.10: the mapping, read once; a changed table is a restart, and a
+    // table that does not parse is no service at all.
+    let mapped = match &args.users {
+        None => None,
+        Some(p) => match wc_broker::usermap::UserMap::load(p) {
+            Ok(map) => Some(Mapped {
+                map,
+                server: args.server.clone(),
+                accept_unidentified: args.accept_unidentified,
+                agents: args.agents.clone(),
+            }),
+            Err(e) => {
+                eprintln!("wc-arena-host sessiond: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        },
+    };
+    let broker = match &args.broker {
+        None => None,
+        Some(p) => {
+            let users: Vec<wc_broker::User> = match &mapped {
+                None => vec![wc_broker::User::uid(me)],
+                Some(m) => m
+                    .map
+                    .linux_users(&m.server)
+                    .into_iter()
+                    .filter_map(|u| match crate::agent::uid_of(u) {
+                        Some(uid) => Some(wc_broker::User::uid(uid)),
+                        None => {
+                            say(&format!("users.conf maps to {u}, which is no account here"));
+                            None
+                        }
+                    })
+                    .collect(),
+            };
+            match Brokered::start(&args, p, users) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    eprintln!("wc-arena-host sessiond: the broker at {}: {e}", p.display());
+                    return std::process::ExitCode::from(1);
+                }
+            }
+        }
+    };
+    match (&mapped, &broker) {
+        (Some(m), _) => say(&format!(
+            "sessions of {} run as the users {} maps them to ({} mapping(s){}), through their agents in {}",
+            m.server,
+            args.users.as_ref().map_or(String::new(), |p| p.display().to_string()),
+            m.map.mappings.iter().filter(|x| x.server == m.server).count(),
+            if m.accept_unidentified { "; TRANSITIONAL: records without identity accepted by `-` lines" } else { "" },
+            m.agents.display()
+        )),
+        (None, _) => say(&format!("sessions run as this service's own user, uid {me} (no --users)")),
+    }
+    match &broker {
+        Some(b) => say(&format!("broker on {}: the BAR files and the hub are reached through it", b.path)),
+        None => say("NO BROKER: each session's processes open the BAR files and the hub's sockets by path"),
     }
     // Every `wc-session` this service runs is in service mode: no ssh tunnel,
     // no upstream socket, the control and sound on rings.
-    // SAFETY: single-threaded here, before any thread is spawned.
+    // SAFETY: single-threaded so far but for the broker's threads, which
+    // never read the environment.
     unsafe { std::env::set_var("WC_LAUNCH_SERVICE", "1") };
+    let sessions = wc_broker::host::SessionsView::default();
+    let mut components = embedded(&args);
+    match &broker {
+        Some(b) => {
+            for c in &components {
+                say(&format!("attaching {} to the broker", c.name()));
+                c.attach(&b.broker, &sessions);
+            }
+        }
+        None if !components.is_empty() => {
+            say("NO BROKER: the embedded components are not attached");
+            components.clear();
+        }
+        None => {}
+    }
+    let host = std::sync::Arc::new(Host { mapped, broker, published: Default::default(), sessions, components });
     let (tx, rx) = mpsc::channel();
     if let Some(b) = &args.bell {
         crate::sessiond::spawn_bell(b.clone(), tx.clone());
@@ -283,9 +551,9 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
         while rx.try_recv().is_ok() {}
         if let Some(why) = why {
             last_read = Instant::now();
-            serve(&args, &mut live, &mut done, why);
+            serve(&args, &host, &mut live, &mut done, why);
         }
-        live.reap();
+        live.reap(&host);
     }
 }
 
@@ -311,7 +579,7 @@ fn seen(rec: &macboot::Record, page: &[u8]) -> Seen {
     (rec.arena_run, rec.session.clone(), macboot::Auth::read(page).map_or(0, |a| a.seq))
 }
 
-fn serve(args: &Args, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
+fn serve(args: &Args, host: &std::sync::Arc<Host>, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
     let t0 = Instant::now();
     let file = match std::fs::OpenOptions::new().read(true).write(true).open(&args.arena) {
         Ok(f) => f,
@@ -335,17 +603,36 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
     if done.contains(&key) {
         return;
     }
+    let refuse = |e: &str| {
+        say(&format!("session {}: REFUSED: {e}", rec.session));
+        let _ = answer(&file, &rec, macboot::State::Failed, &format!("refused: {e}"));
+    };
     let req = match check(&page, &args.installs, &args.state) {
         Ok(Some(r)) => r,
         Ok(None) => return,
         Err(e) => {
             done.insert(key);
-            say(&format!("session {}: REFUSED: {e}", rec.session));
-            let _ = answer(&file, &rec, macboot::State::Failed, &format!("refused: {e}"));
+            refuse(&e);
             return;
         }
     };
     done.insert(key);
+    // §111.10: whose session it is, before anything is recorded or started.
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let (user, uid) = match &host.mapped {
+        None => (None, me),
+        Some(m) => {
+            let u = match map_user(&m.map, &m.server, m.accept_unidentified, &req) {
+                Ok(u) => u,
+                Err(e) => return refuse(&e),
+            };
+            match crate::agent::uid_of(&u) {
+                Some(0) | None => return refuse(&format!("users.conf maps this session to {u}, which is not an account a session may run as here")),
+                Some(uid) => (Some(u), uid),
+            }
+        }
+    };
     if let Err(e) = store_seq(&args.state, &req.install.name, req.seq) {
         say(&format!("cannot record installation {}'s sequence number: {e}; refusing", req.install.name));
         let _ = answer(&file, &rec, macboot::State::Failed, "the host cannot record the sequence number");
@@ -354,52 +641,78 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
     let id = rec.session.clone();
     let ws = req.install.session();
     say(&format!(
-        "boot record for session {id} of installation {} ({why}): run 0x{:016x}, {} pages, gpu {}, session index {}",
-        req.install.name, rec.arena_run, rec.arena_pages, rec.gpu, req.index
+        "boot record for session {id} of installation {} ({why}): run 0x{:016x}, {} pages, gpu {}, session index {}, {}{}",
+        req.install.name,
+        rec.arena_run,
+        rec.arena_pages,
+        rec.gpu,
+        req.index,
+        req.identity.as_ref().map_or_else(|| "no identity".to_string(), |i| format!("asked by {}", i.text())),
+        user.as_ref().map_or_else(String::new, |u| format!(", runs as {u} (uid {uid})"))
     ));
-    let env = [("WC_LAUNCH_SESSION_INDEX", req.index.to_string())];
-    let run = format!("0x{:016x}", rec.arena_run);
-    // §105.13: timed per verb, and the GPU's host side started beside the
-    // proxy rather than after it: it waits for the guest's offers by itself.
-    let t_up = Instant::now();
-    let up = crate::sessiond::verb_env(&ws, &["up", &id, &run, "ivshmem"], &env);
-    let d_up = t_up.elapsed();
-    let gpu = (rec.gpu && up.is_ok()).then(|| {
-        let (ws, id) = (ws.clone(), id.clone());
-        std::thread::spawn(move || {
-            let t = Instant::now();
-            let r = crate::sessiond::verb(&ws, &["gpu", &id]);
-            (r, t.elapsed())
-        })
-    });
-    let t_proxy = Instant::now();
-    let started = up.and_then(|u| {
-        let p = crate::sessiond::verb(&ws, &["proxy", &id])?;
-        Ok(format!("{u}; {p}"))
-    });
-    let d_proxy = t_proxy.elapsed();
-    let gpu = gpu.and_then(|h| h.join().ok());
-    let text = match started {
-        Ok(t) => t,
+    let (arena, gpu_region) = match &host.broker {
+        None => (None, None),
+        Some(b) => match b.publish(uid) {
+            Ok((a, g)) => {
+                host.published.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), [Some(a), g].into_iter().flatten().collect());
+                (Some(a), g)
+            }
+            Err(e) => {
+                say(&format!("session {id}: FAILED: the broker cannot publish the BAR: {e}"));
+                let _ = answer(&file, &rec, macboot::State::Failed, &format!("the host cannot open the shared memory: {e}"));
+                return;
+            }
+        },
+    };
+    let start = crate::agent::Start {
+        install: req.install.name.clone(),
+        id: id.clone(),
+        run: rec.arena_run,
+        index: req.index,
+        gpu: rec.gpu,
+        arena,
+        gpu_region,
+    };
+    let started = match (&user, &host.mapped) {
+        (Some(u), Some(m)) => {
+            let sock = m.agents.join(u).join("agent.sock");
+            crate::agent::call(&sock, uid, &start).map(|(msg, conn)| {
+                // The agent says `ended` when the session's proxy unit has
+                // gone and it ran `down`; then its regions go too.
+                let (host, id) = (std::sync::Arc::clone(host), id.clone());
+                let _ = std::thread::Builder::new().name(format!("agent-{id}")).spawn(move || {
+                    let mut conn = conn;
+                    let mut line = String::new();
+                    let _ = std::io::BufRead::read_line(&mut conn, &mut line);
+                    say(&format!("session {id} ended: {}", line.trim_end().strip_prefix("ended ").unwrap_or("the agent's connection closed")));
+                    host.ended(&id);
+                });
+                msg
+            })
+        }
+        _ => {
+            let env = crate::agent::session_env(&start, host.broker.as_ref().map(|b| b.path.as_str()));
+            crate::agent::start_session(&ws, &start, &env).inspect(|_| live.insert(&id, &req.install.base))
+        }
+    };
+    let msg = match started {
+        Ok(m) => m,
         Err(e) => {
             say(&format!("session {id}: FAILED: {e}"));
+            host.ended(&id);
             let _ = answer(&file, &rec, macboot::State::Failed, &e);
-            let _ = crate::sessiond::verb(&ws, &["down", &id]);
             return;
         }
     };
-    live.insert(&id, &req.install.base);
-    let mut msg = text;
-    let mut d_gpu = Duration::ZERO;
-    if let Some((r, d)) = gpu {
-        d_gpu = d;
-        match r {
-            Ok(g) => msg = format!("{msg}; {g}"),
-            // Not fatal, as on every path: the application renders in software.
-            Err(e) => msg = format!("{msg}; NO GPU: {e}"),
-        }
-    }
-    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?}, gpu {d_gpu:?} (beside the proxy)"));
+    host.started(wc_broker::host::HostSession {
+        id: id.clone(),
+        install: req.install.name.clone(),
+        index: req.index,
+        run: rec.arena_run,
+        user: wc_broker::User::uid(uid),
+        uid,
+        linux_user: user.clone(),
+    });
     match answer(&file, &rec, macboot::State::Located, &msg) {
         Ok(true) => say(&format!("session {id}: started in {:?} ({why}): {msg}", t0.elapsed())),
         Ok(false) => say(&format!("session {id}: started, but the guest replaced its record before the answer; its lease will end it")),
@@ -567,5 +880,75 @@ mod tests {
         let mut other = r.clone();
         other.session = "wcns-2".into();
         assert!(!answer(&file, &other, macboot::State::Located, "yes").unwrap());
+    }
+
+    fn identified(rec: &macboot::Record, index: u8, id: Option<&macboot::Identity>, auth: &macboot::Auth) -> Vec<u8> {
+        let mut p = page(rec.arena_run, rec, None);
+        // SAFETY: a 4096-byte buffer this test owns.
+        unsafe { macboot::publish_identity(p.as_mut_ptr(), rec, index, id, Some(auth)) };
+        p
+    }
+
+    fn win(user: &str) -> macboot::Identity {
+        macboot::Identity { os: "windows".into(), user: user.into(), id: format!("S-1-5-21-1-{user}") }
+    }
+
+    /// §111.6 on the host: an identity is verified with the record, a
+    /// rewritten or unreadable one is refused, and none is §107's record.
+    #[test]
+    fn the_identity_is_verified_with_the_record() {
+        let t = tmp("identity");
+        let key = [3u8; 32];
+        install(&t.0, "wcivs", &key);
+        let (inst, st) = (t.0.join("installs"), t.0.join("state"));
+        let r = rec(0x77);
+        let (guest, other) = (win("guest"), win("mallory"));
+        let a = macboot::Auth::sign_identity(&r, 2, Some(&guest), "wcivs", 10, &key);
+        let got = check(&identified(&r, 2, Some(&guest), &a), &inst, &st).unwrap().unwrap();
+        assert_eq!(got.identity, Some(guest.clone()));
+        // Another user's name written over the signed one.
+        let mut p = identified(&r, 2, Some(&guest), &a);
+        other.write(&mut p);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("with the identity it carries"));
+        // The identity area cleared: the MAC was over an identity.
+        let mut p = identified(&r, 2, Some(&guest), &a);
+        p[macboot::OFF_IDENTITY..macboot::OFF_IDENTITY + 8].fill(0);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not verify"));
+        // An identity area whose text does not parse.
+        let mut p = identified(&r, 2, Some(&guest), &a);
+        p[macboot::OFF_IDENTITY + 10..macboot::OFF_IDENTITY + 12].copy_from_slice(b"xx");
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not parse"));
+        // §107's record, no identity: verifies, with none.
+        let b = macboot::Auth::sign_indexed(&r, 2, "wcivs", 11, &key);
+        assert_eq!(check(&identified(&r, 2, None, &b), &inst, &st).unwrap().unwrap().identity, None);
+    }
+
+    /// §111.10: the mapping, and each refusal the guest is told.
+    #[test]
+    fn a_verified_record_maps_to_its_linux_user_or_is_refused() {
+        let t = tmp("map");
+        let key = [3u8; 32];
+        install(&t.0, "wcivs", &key);
+        install(&t.0, "wcmc", &key);
+        let (inst, st) = (t.0.join("installs"), t.0.join("state"));
+        let map = wc_broker::usermap::UserMap::parse(
+            "vm guest desk installs=wcivs\nvm guest wctest installs=wcmc\nvm - desk installs=wcivs\n",
+        )
+        .unwrap();
+        let r = rec(0x77);
+        let req = |install: &str, id: Option<&macboot::Identity>| {
+            let a = macboot::Auth::sign_identity(&r, 1, id, install, 20, &key);
+            check(&identified(&r, 1, id, &a), &inst, &st).unwrap().unwrap()
+        };
+        let guest = win("guest");
+        assert_eq!(map_user(&map, "vm", false, &req("wcivs", Some(&guest))).unwrap(), "desk");
+        assert_eq!(map_user(&map, "vm", false, &req("wcmc", Some(&guest))).unwrap(), "wctest");
+        let e = map_user(&map, "vm", false, &req("wcivs", Some(&win("mallory")))).unwrap_err();
+        assert!(e.contains("is not mapped to any Linux user"), "{e}");
+        let e = map_user(&map, "vm", false, &req("wcivs", None)).unwrap_err();
+        assert!(e.contains("carries no identity, and this host requires one"), "{e}");
+        assert_eq!(map_user(&map, "vm", true, &req("wcivs", None)).unwrap(), "desk", "transitional");
+        let e = map_user(&map, "vm", true, &req("wcmc", None)).unwrap_err();
+        assert!(e.contains("maps no user for that installation without one"), "{e}");
     }
 }
