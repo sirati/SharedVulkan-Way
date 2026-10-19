@@ -720,6 +720,9 @@ start_app() {
     DECODE=1
     GPUENV+=("MOZ_DISABLE_RDD_SANDBOX=1")
   fi
+  # §105.14: the session service's `proxy` starts the sound beside the proxy
+  # and does not wait for it; an application asked for at once waits here.
+  for _ in $(seq 1 500); do [ -e "$D/audio.pending" ] && [ ! -s "$D/audio.state" ] || break; sleep 0.01; done
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in
@@ -1137,7 +1140,12 @@ proxy)
     APID=""
     AUDIO_EXPECT=none
     if [ $SERVICE = 1 ]; then
-      audio_up "$D" "$ID" & APID=$!
+      # §105.14: and is not waited for. Its stdout is not the verb's, so the
+      # session service that reads the verb's output does not wait for it
+      # either; `run` waits for audio.state if it is not there yet.
+      rm -f "$D/audio.state"
+      : >"$D/audio.pending"
+      { audio_up "$D" "$ID"; rm -f "$D/audio.pending"; } </dev/null >/dev/null 2>&1 & APID=$!
       if [ "${WC_LAUNCH_AUDIO:-on}" = system ]; then AUDIO_EXPECT=system
       elif [ "${WC_LAUNCH_AUDIO:-on}" != off ] && pulse_bin pulseaudio >/dev/null 2>&1; then AUDIO_EXPECT=pulse; fi
     fi
@@ -1198,7 +1206,7 @@ proxy)
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
       exit 1
     fi
-    [ -n "$APID" ] && wait "$APID"
+    [ -n "$APID" ] && [ $SERVICE != 1 ] && wait "$APID"
     [ $SERVICE = 1 ] || audio_up "$D" "$ID"
     echo "proxy ok $D/wl-proxy (as $(id -un), ivshmem$([ $SERVICE = 1 ] && echo ', no ssh: control, sound and feeds on rings'))"
     # §89: what the proxy made of the rings, in its own words. It attaches
@@ -1220,7 +1228,7 @@ proxy)
     else
       echo "transport SSH FALLBACK: $(sed 's/^ssh: //' "$D/transport" 2>/dev/null || echo 'up found no rings')"
     fi
-    echo "audio $(cat "$D/audio.state")"
+    echo "audio $(cat "$D/audio.state" 2>/dev/null || echo "starting beside the proxy")"
     exit 0
   fi
   [ -f "$D/arena.plan" ] || die "no plan for $ID -- call up first"
