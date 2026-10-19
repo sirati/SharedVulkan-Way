@@ -1115,7 +1115,10 @@ name = "sv-guest"
 version = "0.1.0"
 dependencies = [
  "sv-gpu-server",
+ "sv-ram",
+ "sv-transport",
  "wc-compositor",
+ "wc-handle",
 ]
 
 [[package]]
@@ -1161,6 +1164,14 @@ dependencies = [
  "sv-codegen",
  "sv-wire",
  "vk-registry",
+]
+
+[[package]]
+name = "sv-ram"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-transport",
 ]
 
 [[package]]
@@ -1452,6 +1463,7 @@ dependencies = [
  "libc",
  "sv-arena",
  "sv-hostd",
+ "sv-ram",
  "sv-transport",
  "wc-handle",
 ]

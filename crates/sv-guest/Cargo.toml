@@ -29,3 +29,7 @@ wayland = ["dep:wc-compositor"]
 [dependencies]
 sv-gpu-server = { path = "../sv-gpu-server", optional = true }
 wc-compositor = { path = "../wc-compositor", optional = true }
+# §108: the keeper and its instruments (`sv-guest ram …`).
+sv-ram = { path = "../sv-ram" }
+sv-transport = { workspace = true }
+wc-handle = { path = "../wc-handle" }

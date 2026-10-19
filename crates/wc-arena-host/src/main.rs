@@ -694,6 +694,8 @@ mod host {
 }
 
 #[cfg(unix)]
+mod ram_peer;
+#[cfg(unix)]
 mod sessiond;
 #[cfg(unix)]
 mod sessiond_ivshmem;
@@ -702,6 +704,10 @@ mod sessiond_ivshmem;
 fn main() -> std::process::ExitCode {
     // §103.15: the macOS guest's session service.
     let argv: Vec<String> = std::env::args().collect();
+    // §108: the host's half of a region table.
+    if argv.get(1).map(String::as_str) == Some("ram-peer") {
+        return ram_peer::main(&argv[2..]);
+    }
     // §105: one service, two substrates. `--ivshmem` is a guest with a
     // shared-memory device (Windows); without it, guest RAM swept (macOS).
     if matches!(argv.get(1).map(String::as_str), Some("mac-sessiond" | "sessiond")) {

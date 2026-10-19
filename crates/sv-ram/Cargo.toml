@@ -1,0 +1,13 @@
+[package]
+name = "sv-ram"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared memory that grows and shrinks (waycompose-design.md §108): the region provider, the Windows keeper, the host peer"
+
+[dependencies]
+sv-transport = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

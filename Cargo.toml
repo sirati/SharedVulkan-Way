@@ -21,6 +21,8 @@ members = [
   "crates/sv-wire",
   "crates/sv-transport",
   "crates/sv-arena",
+  # §108: regions that grow and shrink (the provider, the keeper, the host peer).
+  "crates/sv-ram",
   "crates/arena-record",
 
   # The Vulkan side.

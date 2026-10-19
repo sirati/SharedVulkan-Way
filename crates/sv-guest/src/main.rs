@@ -26,6 +26,8 @@
 
 use std::process::ExitCode;
 
+mod ram;
+
 /// Which half to run.
 ///
 /// The two halves are separate processes' worth of work and they take different
@@ -84,6 +86,7 @@ fn main() -> ExitCode {
             eprintln!("sv-guest: this binary was built without the `wayland` feature");
             ExitCode::from(2)
         }
+        "ram" => ram::main(args.collect()),
         "-h" | "--help" => {
             println!("{}", usage());
             ExitCode::SUCCESS
