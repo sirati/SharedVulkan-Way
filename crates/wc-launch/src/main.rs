@@ -46,8 +46,6 @@ mod mac;
 #[cfg(target_os = "macos")]
 mod mac_hostint;
 #[cfg(target_os = "macos")]
-mod audio_mac;
-#[cfg(target_os = "macos")]
 mod sound_mac;
 mod plan;
 #[cfg(windows)]

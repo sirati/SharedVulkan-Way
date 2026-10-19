@@ -175,6 +175,8 @@ fn devices() -> Vec<Device> {
     }
     ids.truncate(size as usize / 4);
     ids.into_iter()
+        // Devices CoreAudio hides (an aggregate's parts) are not offered.
+        .filter(|id| !wc_hostplat::mac::audio::is_hidden(*id))
         .filter_map(|id| {
             Some(Device {
                 id,
@@ -372,6 +374,10 @@ impl Recorder {
         if self.q.is_some() {
             return Ok(());
         }
+        // §106, TCC rule 1: only the main process in its own bundle. Started
+        // by the launcher's fallback (no host bundle), it is refused here
+        // rather than have macOS attribute the microphone to a face.
+        wc_hostplat::mac::may_capture()?;
         let user = Arc::into_raw(Arc::clone(&self.inp)) as *mut c_void;
         let mut q: Aq = std::ptr::null_mut();
         let f = format();
@@ -477,9 +483,31 @@ pub fn run(
     )?;
     link.send(Msg::Hello { version: VERSION });
     let mut said = String::new();
+    // §106: CoreAudio says when the device list or a default changed, so a
+    // new default reaches Linux in about QUIET (100 ms) rather than up to a
+    // second. The once-a-second pass stays: it pauses idle outputs, and it
+    // is the fallback should the listeners not register.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let _watch = match wc_hostplat::mac::audio::listen(tx) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            say(&format!("sound: no device listener ({e}); checking once a second"));
+            None
+        }
+    };
     while !ended.load(std::sync::atomic::Ordering::SeqCst) {
         sync_devices(&state, &link, volume, &say, &mut said);
-        std::thread::sleep(Duration::from_secs(1));
+        if rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+            // A burst (a headset is a device and two defaults): take the
+            // state once it has settled, within a second of its start.
+            let first = std::time::Instant::now();
+            let mut last = first;
+            while let Some(left) = wc_hostplat::debounce::wait_left(first, last, std::time::Instant::now()) {
+                if rx.recv_timeout(left).is_ok() {
+                    last = std::time::Instant::now();
+                }
+            }
+        }
     }
     let st = state.lock().unwrap_or_else(|e| e.into_inner());
     for p in st.players.values() {
