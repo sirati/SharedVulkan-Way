@@ -376,8 +376,10 @@ version = "0.13.0"
 features = ["res"]
 optional = true
 
+# Upstream 0.7.0 asks for 0.8.0; vendor/xkbcommon is 0.9.0, the version smithay
+# master already uses, and the API smithay calls is unchanged between the two.
 [dependencies.xkbcommon]
-version = "0.8.0"
+version = "0.9.0"
 features = ["wayland"]
 
 [build-dependencies.cc]

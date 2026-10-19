@@ -73,6 +73,7 @@
 # `--screen` is still run, once, and kept: in the ssh session it *fails*, with
 # `ERROR_ACCESS_DENIED` out of `BitBlt`, and on the desktop it succeeds and
 # returns the lock screen. That pair is the evidence for the paragraph above.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -81,7 +82,7 @@ WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage8"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
@@ -93,9 +94,9 @@ AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 # middle of it — which presents as the other run testing code nobody wrote. The
 # default is what every previous stage used, so nothing that ran before moves.
 DESKNAME="${WC_DESKNAME:-wcdesk}"
-DESKDIR="/c/Users/<guest-user>/$DESKNAME"
-DESKDIR_WIN="C:\\Users\\<guest-user>\\$DESKNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+DESKDIR="$SITE_GUEST_MSYS_HOME/$DESKNAME"
+DESKDIR_WIN="$SITE_GUEST_WIN_HOME\\$DESKNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 PORT="${WC_PORT_BASE:-57271}"
 
 # The stage-4 half: the machine the VM runs on. It used to be described as "the
@@ -106,7 +107,7 @@ HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage8}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc}"
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"
 HOST_WESTON="${WC_HOST_WESTON:-}"
 
@@ -1764,13 +1765,13 @@ param([Parameter(Mandatory=$true)][string]$Dir)
 function T($exe, $argstr) {
   [pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = $exe; Arguments = $argstr }) }
 }
-$dir = 'C:\Users\<guest-user>\wcterm'
+$dir = 'C:\Users\user\wcterm'
 $cases = @(
-  @{ n='the compositor, exe under our directory'; t=(T 'C:\Users\<guest-user>\wcterm\wc-compositor.exe' '--socket wg-s8-1'); want=$true },
-  @{ n='cmd.exe with our path in the arguments';  t=(T 'cmd.exe' '/c C:\Users\<guest-user>\wcterm\wc-desk.exe windows'); want=$true },
-  @{ n='a different case for the same path';      t=(T 'c:\users\<guest-user>\WCTERM\wc-desk.exe' ''); want=$true },
-  @{ n='another worktree entirely';               t=(T 'C:\Users\<guest-user>\wcptr\wc-compositor.exe' '--socket x'); want=$false },
-  @{ n='the prefix collision, wcterm2';           t=(T 'C:\Users\<guest-user>\wcterm2\wc-compositor.exe' ''); want=$false },
+  @{ n='the compositor, exe under our directory'; t=(T 'C:\Users\user\wcterm\wc-compositor.exe' '--socket wg-s8-1'); want=$true },
+  @{ n='cmd.exe with our path in the arguments';  t=(T 'cmd.exe' '/c C:\Users\user\wcterm\wc-desk.exe windows'); want=$true },
+  @{ n='a different case for the same path';      t=(T 'c:\users\user\WCTERM\wc-desk.exe' ''); want=$true },
+  @{ n='another worktree entirely';               t=(T 'C:\Users\user\wcptr\wc-compositor.exe' '--socket x'); want=$false },
+  @{ n='the prefix collision, wcterm2';           t=(T 'C:\Users\user\wcterm2\wc-compositor.exe' ''); want=$false },
   @{ n='cmd.exe running nothing of ours';         t=(T 'cmd.exe' '/c echo hi'); want=$false },
   @{ n='a task with no action at all';            t=([pscustomobject]@{ Actions = @() }); want=$false }
 )

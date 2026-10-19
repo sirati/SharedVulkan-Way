@@ -18,7 +18,7 @@ keycodes, and gets a keymap across the boundary — which is `wl_keyboard.keymap
 `h` argument going the *other* way from a `wl_shm` pool, and is the direction
 stage 4 implemented without ever exercising. `weston-terminal`, unmodified, in a
 window with Windows' own caption, with text typed into it by `SendInput`:
-[`docs/stage6-typing.png`](docs/stage6-typing.png). Under Wine — stage 5 put the
+`docs/stage6-typing.png` (a screenshot, kept outside the repository). Under Wine — stage 5 put the
 earlier stages on the real guest, and no input has run there yet.
 
 **Two known defects of the keyboard, stated here because both are silent**
@@ -60,6 +60,10 @@ cargo build --target x86_64-pc-windows-gnu         # the target that matters
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo check --workspace --target x86_64-pc-windows-gnu
+# macOS (§103.9): the check needs nothing else; the build links with the SDK
+# copied out of the macOS VM once (scripts/macos-sdk.sh).
+cargo check --target x86_64-apple-darwin -p wc-compositor -p sv-guest -p wc-launch -p sv-gpu-server
+cargo build --target x86_64-apple-darwin -p wc-launch -p sv-guest
 ```
 
 ## Proving it works
@@ -210,6 +214,27 @@ an unpatched Firefox decodes in software, cleanly. `docs/video-decode.md` §7 is
 the account, with what is still unmeasured — NVIDIA and the guest's Intel among
 it.
 
+**macOS as the Wayland host (`docs/waycompose-design.md` §103).** Linux
+applications appear as Mac applications in the Intel Sonoma VM on this
+workstation (`/mnt/datasets/macvm`, instance `wayland-host`, template
+`wayland-dev`). Each has its own `.app` bundle in `~/Applications/Linux`, its
+own Dock tile, name, icon and Dock menu (the desktop entry's actions), and
+"Keep in Dock". Windows are native `NSWindow`s, popups are child windows,
+AppKit's traffic lights sit beside Firefox's tabs, and Cmd acts as Control.
+The clipboard goes both ways through `NSPasteboard`, sound plays through
+CoreAudio, and the pixels and the GPU path's memory are in the VM's own RAM,
+wired by the macOS process and found by the host. No macOS kernel driver is
+involved. Vulkan from Linux renders in the VM on lavapipe, because the VM has
+no Metal; on a real Mac the same server uses MoltenVK or KosmicKrisp.
+
+```
+scripts/mac-launch-install.sh             # both ends of the launcher, bundles pinned in the Dock
+scripts/mac-window.sh [CLIENT]            # one Linux client against the compositor in the VM
+scripts/mac-gpu.sh [probe|present|compute|window]
+scripts/mac-pinning.sh                    # do wired pages stay put? (§103.3)
+scripts/mac-shot.sh OUT.png; scripts/mac-input.sh click X Y | type TEXT | key meta_l+c
+```
+
 ## Layout
 
 ```
@@ -344,3 +369,16 @@ btrfs. **Do not share a `CARGO_TARGET_DIR` between them** — the comment at the
 top of `wc-worktree.sh` explains what happened last time, and this project is
 unusually exposed to it because `vendor/` holds path dependencies with the same
 names and versions as the crates.io originals.
+
+### Machine-specific values and evidence
+
+The harness scripts read the guest's user, the host and guest addresses and
+the ssh aliases from `scripts/site.env`, which is not tracked: copy
+`scripts/site.env.example` and fill it in. A worktree without its own copy
+uses the main checkout's (`scripts/site.sh`). The docs write these values as
+placeholders such as `<guest-user>`, `<guest-ip>` and `<host-ip>`, and call
+the Linux machine that runs the Windows VM `testhost`.
+
+Screenshots, logs and captured output are not in the repository; `.gitignore`
+keeps everything under `docs/` except Markdown out. Docs still name such files
+by path, as a record of where a run put them.

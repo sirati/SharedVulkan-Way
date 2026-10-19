@@ -56,7 +56,10 @@
         # interpreter and no store path in it at all, so it runs wherever it is
         # copied. It is also what makes the app side deployable to the target at
         # all without putting a Rust toolchain on somebody's daily laptop.
-        targets = ["x86_64-pc-windows-gnu" "x86_64-unknown-linux-musl"];
+        # x86_64-apple-darwin (§103): `cargo check` of the macOS host half from
+        # this machine, which is the macOS gate; linking needs the SDK and
+        # happens in the macOS VM.
+        targets = ["x86_64-pc-windows-gnu" "x86_64-unknown-linux-musl" "x86_64-apple-darwin"];
       };
       # Miri needs nightly, and nothing else here does. Keeping it in a separate
       # shell means the default shell stays on the pinned stable toolchain —
@@ -426,6 +429,16 @@
           # now that one binary links the Vulkan side and the Wayland side.
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-L ${pkgs.pkgsCross.mingwW64.windows.pthreads}/lib -L ${libxkbcommonMingw}/lib"
 
+          # §103.9: linking for macOS on this machine. clang and lld are named
+          # rather than put on PATH, so nothing else in this shell meets a
+          # second C compiler; scripts/macos-linker.sh drives them with the SDK
+          # copied out of the macOS VM (scripts/macos-sdk.sh).
+          export WC_MACOS_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+          export WC_MACOS_LLD_BIN="${pkgs.llvmPackages.lld}/bin"
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$PWD/scripts/macos-linker.sh"
+          export MACOSX_DEPLOYMENT_TARGET=14.0
+          export SDKROOT="''${WC_MACOS_SDK:-/mnt/datasets/builds/macos-sdk/MacOSX14.5.sdk}"
+
           # For the C probe (scripts/probe-xkb.c) and for anything that wants to
           # find the headers without going through cargo.
           export WC_XKB_MINGW="${libxkbcommonMingw}"
@@ -456,7 +469,7 @@
 
           echo "shared_vulkan + waycompose dev shell — one binary per side"
           echo "  rustc    $(rustc --version 2>/dev/null | cut -d' ' -f2)"
-          echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl"
+          echo "  targets  x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-unknown-linux-musl, x86_64-apple-darwin (check only)"
           echo "  vk.xml   $VK_XML"
           echo "  wlcs     ${pkgs.wlcs.version}"
           echo "  wine     $(wine --version 2>/dev/null || echo 'unavailable')"

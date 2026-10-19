@@ -68,6 +68,7 @@
 # reachable, and turns the substrate into an assertion. The old photographs are
 # **not** re-taken here — that is somebody else's measurement to make, and
 # §32.9 records what is on the fixture so the choice is an informed one.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -76,7 +77,7 @@ WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 OUT="$ROOT/docs/stage32"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
@@ -89,16 +90,16 @@ AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 GUESTNAME="${WC_GUESTNAME:-wctb32}"
 COMP_EXE="${WC_COMP_EXE:-wc-s32-compositor.exe}"
 CLIENT_EXE="${WC_CLIENT_EXE:-wc-s32-shmclient.exe}"
-DESKDIR="/c/Users/<guest-user>/$GUESTNAME"
-DESKDIR_WIN="C:\\Users\\<guest-user>\\$GUESTNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+DESKDIR="$SITE_GUEST_MSYS_HOME/$GUESTNAME"
+DESKDIR_WIN="$SITE_GUEST_WIN_HOME\\$GUESTNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 PORT=$(( ${WC_PORT_BASE:-57332} + ($$ % 60) * 2 ))
 
 HOST="${WC_HOST:-}"
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage32}"
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc32}"
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc32}"
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"
 HOST_WESTON="${WC_HOST_WESTON:-}"
 HOST_ICONS="${WC_HOST_ICONS:-/run/current-system/sw/share}"
@@ -216,7 +217,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [string]$Arguments = "",
   [string]$Name = "wctb32",
-  [string]$WorkDir = "C:\Users\<guest-user>\wctb32",
+  [string]$WorkDir = "C:\Users\@GUEST_USER@\wctb32",
   [switch]$Wait,
   [int]$TimeoutSec = 120
 )
@@ -242,6 +243,7 @@ if ($Wait) {
   Unregister-ScheduledTask -TaskName $Name -Confirm:$false
 }
 PS1
+  site_fill "$1"
 }
 
 # Pull a BMP off the guest and convert it.

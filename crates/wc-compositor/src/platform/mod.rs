@@ -68,9 +68,24 @@ mod win32;
 #[cfg(windows)]
 pub use win32::{current_layout, has_touch, keyboard_repeat, start};
 
+// §103.7. The macOS platform's pure half, on every target so the gate tests it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod mac_keys;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{current_layout, has_touch, keyboard_repeat, start};
+/// §103.8: the launcher's way to fill the application's Dock menu.
+#[cfg(target_os = "macos")]
+pub use macos::{set_dock_menu, DockItem};
+
+// On macOS only `Click`, which `PlatformConfig` names on every Unix.
 #[cfg(not(windows))]
+#[cfg_attr(target_os = "macos", allow(dead_code, unused_imports))]
 mod headless;
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub use headless::Click;
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub use headless::{current_layout, has_touch, keyboard_repeat, start, Click};
 
 /// ADDED FOR STAGE 20. The ellipse a `wl_touch.shape`/`.orientation` pair
@@ -1043,8 +1058,11 @@ impl Pump {
 #[cfg(windows)]
 use win32::{PumpInner, Wake};
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 use headless::{PumpInner, Wake};
+
+#[cfg(target_os = "macos")]
+use macos::{PumpInner, Wake};
 
 /// What every platform's `start` builds, so the two implementations agree on
 /// the plumbing and differ only in what a window is.
@@ -1083,6 +1101,9 @@ pub(crate) fn assemble(
 }
 
 /// The arguments every platform's `start` takes.
+// macOS reads only `events` (§103.7): no frame dumps or simulated window
+// manager there, since AppKit is the window manager.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub struct PlatformConfig {
     /// Where UI events are delivered.
     pub events: Sender<FromUi>,

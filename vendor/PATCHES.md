@@ -5,8 +5,8 @@ Wayland **server** stack builds and runs for `x86_64-pc-windows-gnu`.
 
 | Crate | Upstream version | Lines changed | Files touched |
 |---|---|---|---|
-| `wayland-backend` | 0.3.16 | see below | 12 of 31 |
-| `wayland-server` | 0.31.13 | see below | 5 of 6 |
+| `wayland-backend` | 0.3.17 | see below | 12 of 31 |
+| `wayland-server` | 0.31.14 | see below | 5 of 6 |
 | `wayland-scanner` | 0.31.11 | 5 emission sites + 2 lints | 4 of 10 |
 
 Every changed hunk carries a `WAYCOMPOSE FORK` comment saying what it was and
@@ -15,6 +15,34 @@ same crate versions is the authoritative answer; this file is the map.
 
 **Read `docs/design.md` §2 and §3 first** if you want the reasoning rather than
 the inventory. This file is deliberately mechanical.
+
+## Upstream refresh, 2026-10-19
+
+Each crate was moved to its newest crates.io release by applying the upstream
+release-to-release diff on top of the fork. No fork hunk conflicted, and none
+was absorbed upstream, so every patch below is still carried.
+
+| Crate | Was | Now | What upstream changed |
+|---|---|---|---|
+| `wayland-backend` | 0.3.16 | 0.3.17 | `ReadEventsGuard` of the `sys` client is `Send + Sync` |
+| `wayland-server` | 0.31.13 | 0.31.14 | core protocol 1.26: `wl_shm` v3, `wl_shm_pool` errors, `wl_seat` v11, new formats |
+| `wayland-scanner` | 0.31.11 | 0.31.11 | already the newest release |
+| `xkbcommon` | 0.8.0 | 0.9.0 | `key_get_mods_for_level`; `new_from_string` goes through `from_buffer`; `new_from_fd` no longer drops the last byte |
+| `smithay` | 0.7.0 | 0.7.0 | already the newest release; see below |
+
+`smithay`'s manifest now asks for `xkbcommon` 0.9.0 instead of 0.8.0, which is
+the one new change to it. smithay master already uses 0.9.0 and the API smithay
+calls did not change.
+
+**Why `smithay` stays on the 0.7.0 release and not on git master.** Master
+(`023b78b1`, 2026-10-15) is 486 commits past `v0.7.0`, +24.7k/-9.8k lines in
+`src/`. A trial three-way merge of this fork onto it conflicts in 16 files,
+three of them modify/delete: `selection/data_device/dnd_grab.rs` and
+`server_dnd_grab.rs` are gone (drag-and-drop was rewritten), and so is
+`virtual_keyboard_handle.rs`. Those are the areas carrying our touch, drag and
+keyboard patches. Their Windows behaviour is only proven by the VM gates, so
+the port should be done together with those gates. Until then, the newest
+release is the newest version this fork can vouch for.
 
 ---
 
@@ -37,7 +65,7 @@ the Windows arm of the `h` argument in `rs/wire.rs`, the Windows transport in
 
 ---
 
-## `wayland-backend` 0.3.16
+## `wayland-backend` 0.3.17
 
 ### Added
 
@@ -160,7 +188,7 @@ obligation the `unsafe` block around `Poller::add_with_mode` relies on.
 
 ---
 
-## `wayland-server` 0.31.13
+## `wayland-server` 0.31.14
 
 | File | Change |
 |---|---|
@@ -246,7 +274,7 @@ send most of these patches back (`docs/design.md` §5.3).
 | Crate | Upstream version | Diff | Files touched |
 |---|---|---|---|
 | `smithay` | 0.7.0 | 529 added, 146 removed | 27 changed + 2 new, of 246 |
-| `xkbcommon` | 0.8.0 | 39 added, 11 removed | 3 of 6 |
+| `xkbcommon` | 0.9.0 | 39 added, 11 removed | 3 of 6 |
 | `wayland-backend` (stage 2 addition) | — | `os.rs`: `AsFd` trait, `Mapping` re-export | 2 |
 
 Of smithay's 529 added lines, **293 are code and 236 are comments**; of those
@@ -485,7 +513,7 @@ are not part of the library and their dependency weight is real.
 
 ---
 
-## `xkbcommon` 0.8.0
+## `xkbcommon` 0.9.0
 
 Three sites, as `docs/design.md` §5.4 item 2 predicted, plus one manifest
 consequence.
@@ -706,3 +734,11 @@ prefer a private field on `PrivateSurfaceData`, or may prefer that the
 compositor not consume the buffer at all. The two `post_error` calls are
 uncontroversial on their own and could go upstream first, with the
 committed-buffer case following once the record's shape is agreed.
+
+* **`utils/sealed_file.rs`: the non-Linux Unix arm sizes the shm object with
+  `ftruncate` and fills it through `mmap`, and keeps a copy of the bytes for
+  `named()`** (waycompose-design.md §103.11). macOS POSIX shm objects support
+  neither `write(2)` nor `read(2)`: `write_all` failed, so no keymap object
+  existed, an in-band peer was sent no `wl_keyboard.keymap`, and every key a
+  macOS user typed reached a client that could not decode it. The BSDs accept
+  the same sequence, so the arm is not split further.

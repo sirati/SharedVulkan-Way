@@ -8,7 +8,7 @@
 
 [package]
 name = "wayland-server"
-version = "0.31.13"
+version = "0.31.14"
 authors = ["Elinor Berger <elinor@safaradeg.net>"]
 license = "MIT"
 description = "Server-side Wayland bindings (waycompose fork: builds for Windows)"

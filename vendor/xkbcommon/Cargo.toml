@@ -1,4 +1,4 @@
-# Fork of xkbcommon 0.8.0 (rust-x-bindings/xkbcommon-rs). See vendor/PATCHES.md.
+# Fork of xkbcommon 0.9.0 (rust-x-bindings/xkbcommon-rs). See vendor/PATCHES.md.
 #
 # Two deviations from upstream's manifest, both mechanical:
 #
@@ -14,7 +14,7 @@
 #     library depends on the example.
 [package]
 name = "xkbcommon"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Remi THEBAULT <remi.thebault@gmail.com>"]
 description = "Rust bindings and wrappers for libxkbcommon"
 repository = "https://github.com/rust-x-bindings/xkbcommon-rs"

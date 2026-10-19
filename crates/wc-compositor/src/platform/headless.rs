@@ -282,6 +282,7 @@ pub fn keyboard_repeat() -> (i32, i32) {
     (500, 30)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(dir) = &config.dump_frames {
