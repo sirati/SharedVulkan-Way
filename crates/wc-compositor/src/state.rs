@@ -78,7 +78,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 // `wl_data_device_manager` appears, so a compositor with a perfectly good
 // `wl_seat` and no data device gives a GTK client no keyboard and no pointer
 // at all. §13.4 has the trace.
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::utils::Transform;
 use smithay::wayland::output::OutputHandler;
 use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
@@ -414,6 +414,13 @@ pub struct State {
     /// `wl_surface.enter` for it: a client that is never told which output it
     /// is on does not know its scale, and GTK's is the code that asks.
     output: Output,
+    /// §103.18: that output's integer scale S, from the platform (the main
+    /// screen's backing scale on macOS, 1 everywhere else). Window shadows are
+    /// drawn in device pixels, logical size times S; everything a client or
+    /// the platform sees as a coordinate stays logical. Read through
+    /// [`State::scale_for`], so a second output with its own scale is a
+    /// change there and not at every reader.
+    output_scale: i32,
     /// ADDED FOR STAGE 9. Held only to keep the global alive; nothing reads it.
     /// See the note on the import for why a clipboard is a prerequisite for
     /// input.
@@ -793,9 +800,11 @@ impl State {
         debug_icon: bool,
         layout: &str,
         output_size: (i32, i32),
+        output_scale: i32,
         decorations: Decorations,
         nested_globals: bool,
     ) -> Self {
+        let output_scale = output_scale.max(1);
         let mut seat_state = SeatState::new();
         // `SeatState` keeps every seat it makes and `Seat` is an `Arc` handle
         // rather than the seat itself, so this local used to be dropped here.
@@ -945,9 +954,12 @@ impl State {
         // spelling for "unknown" and is what every headless and virtual
         // compositor sends. Inventing millimetres would make a client compute a
         // DPI that is fiction.
+        // §103.18: the mode is in device pixels and the logical size, which is
+        // what `output_size` is (the work area in points on macOS), is the
+        // mode divided by the scale.
         let (ow, oh) = output_size;
         let mode = Mode {
-            size: (ow, oh).into(),
+            size: (ow.saturating_mul(output_scale), oh.saturating_mul(output_scale)).into(),
             refresh: 60_000,
         };
         let output = Output::new(
@@ -960,9 +972,12 @@ impl State {
             },
         );
         output.create_global::<State>(dh);
-        output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+        // At scale 1 the scale is left unset, as it always was: smithay's
+        // default is 1 and the bytes on the wire are those of every run before.
+        let scale = (output_scale > 1).then_some(Scale::Integer(output_scale));
+        output.change_current_state(Some(mode), Some(Transform::Normal), scale, Some((0, 0).into()));
         output.set_preferred(mode);
-        println!("wc-compositor: output WC-1 {ow}x{oh} at 60 Hz, scale 1");
+        println!("wc-compositor: output WC-1 {ow}x{oh} at 60 Hz, scale {output_scale}");
         // Greppable, because "how many title bars does this window have" is
         // decided here and nowhere else, and a run that answers it wrongly
         // looks like a rendering bug rather than a negotiation one.
@@ -987,10 +1002,18 @@ impl State {
         });
 
         State {
-            compositor: CompositorState::new::<State>(dh),
+            // §103.18: version 6 only on a scaled output, for
+            // `wl_surface.preferred_buffer_scale`; version 5 elsewhere, as
+            // before, so a client at scale 1 binds what it always bound.
+            compositor: if output_scale > 1 {
+                CompositorState::new_v6::<State>(dh)
+            } else {
+                CompositorState::new::<State>(dh)
+            },
             shm: ShmState::new::<State>(dh, Vec::new()),
             xdg_shell: XdgShellState::new::<State>(dh),
             output,
+            output_scale,
             _data_device: DataDeviceState::new::<State>(dh),
             _xdg_decoration: XdgDecorationState::new::<State>(dh),
             // **This one line decides how many title bars the window has**, and
@@ -1641,6 +1664,23 @@ impl State {
         self.by_id(id).map(|w| w.role.surface().clone())
     }
 
+    /// §103.18: the scale of the output `surface` is drawn for. One output
+    /// today, so one answer; the surface is the argument so that a platform
+    /// with a scale per monitor changes this function and not its callers.
+    fn scale_for(&self, _surface: &WlSurface) -> i32 {
+        self.output_scale
+    }
+
+    /// §103.18: a surface's size in **logical** units, from its staging
+    /// shadow, which is in device pixels (logical times [`Self::scale_for`]).
+    /// At scale 1 the two are the same and this is the shadow's size, as every
+    /// reader of `staging` took it before.
+    fn surface_size(&self, surface: &WlSurface) -> Option<(i32, i32)> {
+        let s = self.staging.get(surface)?;
+        let k = self.scale_for(surface);
+        Some((s.width() / k, s.height() / k))
+    }
+
     /// Whether every surface between `surface` and `root` still has a buffer.
     ///
     /// ADDED FOR §45.10 for the hit test, and made a function in §45.11 when it
@@ -1765,7 +1805,7 @@ impl State {
             // The surface's origin in window-content pixels.
             let origin = (rx + f64::from(loc.0), ry + f64::from(loc.1));
             let local = (x - origin.0, y - origin.1);
-            let size = self.staging.get(&surface).map(|s| (s.width(), s.height()))?;
+            let size = self.surface_size(&surface)?;
             let accepted = compositor::with_states(&surface, |states| {
                 let mut attrs = states.cached_state.get::<SurfaceAttributes>();
                 accepts_input_at(size, attrs.current().input_region.as_ref(), local)
@@ -1815,12 +1855,14 @@ impl State {
                     .client()
                     .and_then(|c| c.get_data::<ClientState>().map(|d| d.index))?;
                 let shadow = w.shadow.lock().ok()?;
+                // §103.18: logical, as every other coordinate on the socket.
+                let k = shadow.scale();
                 Some(crate::control::Rect {
                     id: w.id,
                     client,
                     surface: surface.id().protocol_id(),
-                    w: shadow.width(),
-                    h: shadow.height(),
+                    w: shadow.width() / k,
+                    h: shadow.height() / k,
                     toplevel: w.role.toplevel().is_some(),
                     popup_at: w.popup_at,
                     content: w.content_offset,
@@ -2822,15 +2864,25 @@ impl State {
     /// `None` without the nested-compositor globals, where no viewport can
     /// exist, so that the cache is not even asked: a session without the flag
     /// runs exactly the code it ran before §102.
+    ///
+    /// §103.18: also `Some` on a scaled output, where the buffer scale alone
+    /// can make a view (`surface::view_of`); the viewport is then unset
+    /// unless the nested-compositor globals are on.
     #[allow(clippy::type_complexity)]
     fn viewport_of(
         &self,
         surface: &WlSurface,
     ) -> Option<(Option<(f64, f64, f64, f64)>, Option<(i32, i32)>, i32)> {
-        self.nested.as_ref()?;
+        let nested = self.nested.is_some();
+        if !nested && self.scale_for(surface) == 1 {
+            return None;
+        }
         Some(compositor::with_states(surface, |states| {
-            let vp = *states.cached_state.get::<ViewportCachedState>().current();
             let scale = states.cached_state.get::<SurfaceAttributes>().current().buffer_scale;
+            if !nested {
+                return (None, None, scale);
+            }
+            let vp = *states.cached_state.get::<ViewportCachedState>().current();
             (
                 vp.src.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)),
                 vp.dst.map(|d| (d.w, d.h)),
@@ -2854,8 +2906,9 @@ impl State {
     /// own pixels when it is gaining a view now, and recomposes the window.
     fn reapply_view(&mut self, surface: &WlSurface) {
         let Some((src, dst, scale)) = self.viewport_of(surface) else { return };
+        let out = self.scale_for(surface);
         let changed = if let Some(entry) = self.viewed.get(surface) {
-            match view_of((entry.raw.width(), entry.raw.height()), scale, src, dst) {
+            match view_of((entry.raw.width(), entry.raw.height()), scale, src, dst, out) {
                 Some(view) if view == entry.view => false,
                 Some(view) => {
                     let entry = self.viewed.get_mut(surface).expect("just read");
@@ -2872,7 +2925,7 @@ impl State {
             }
         } else {
             let Some(shown) = self.staging.get(surface).filter(|s| !s.is_empty()) else { return };
-            match view_of((shown.width(), shown.height()), scale, src, dst) {
+            match view_of((shown.width(), shown.height()), scale, src, dst, out) {
                 None => false,
                 Some(view) => {
                     let raw = self.staging.remove(surface).expect("just read");
@@ -2914,7 +2967,8 @@ impl State {
             println!("wc-compositor: window {id} client chose {w}x{h} by its viewport; the window follows");
             self.ui.send(ToUi::Resize { id, width: w, height: h });
         }
-        self.ui.send(ToUi::Present { id, damage: vec![Rect::new(0, 0, w, h)] });
+        let damage = vec![Rect::new(0, 0, w, h).scaled(out, 1)];
+        self.ui.send(ToUi::Present { id, damage });
     }
 
     /// Copy a committed buffer into the shadow and tell the platform.
@@ -2943,6 +2997,8 @@ impl State {
         // §102: the viewport and buffer scale this commit applied, or `None`
         // when the nested-compositor globals are off and no viewport can exist.
         let viewport = self.viewport_of(surface);
+        let nested = self.nested.is_some();
+        let out = self.scale_for(surface);
         let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
         let viewed = &mut self.viewed;
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
@@ -2960,10 +3016,10 @@ impl State {
                 // commit carried, which only now has a size; smithay posts the
                 // error, and the client is gone once this dispatch ends.
                 let logical = (spec.width / scale.max(1), spec.height / scale.max(1));
-                if !compositor::with_states(surface, |st| ensure_viewport_valid(st, logical.into())) {
+                if nested && !compositor::with_states(surface, |st| ensure_viewport_valid(st, logical.into())) {
                     return;
                 }
-                match view_of((spec.width, spec.height), scale, src, dst) {
+                match view_of((spec.width, spec.height), scale, src, dst, out) {
                     None => {
                         // Leaving a view: the shadow holds the old view's
                         // picture, so it is started again and the blit below
@@ -2980,8 +3036,13 @@ impl State {
                         // Surface damage is in surface coordinates, which a
                         // view makes different from the buffer's; rather than
                         // invert the view, the whole buffer is taken.
+                        // §103.18: a view made by the buffer scale alone has
+                        // had its surface damage scaled into buffer pixels
+                        // already (`commit`).
                         let whole = [Rect::new(0, 0, spec.width, spec.height)];
-                        let written = entry.raw.blit(bytes, spec, if surface_damage { &whole } else { &damage });
+                        let viewported = src.is_some() || dst.is_some();
+                        let all = surface_damage && viewported;
+                        let written = entry.raw.blit(bytes, spec, if all { &whole } else { &damage });
                         let rects = (entry.view == view).then(|| view.map_damage(&written));
                         entry.view = view;
                         let drawn = staging.scale_from(&entry.raw, &view, rects.as_deref());
@@ -3024,6 +3085,7 @@ impl State {
         // left for a future traversal to find.
         if self.cursor_surface.as_ref() == Some(surface) {
             self.staging.remove(surface);
+            self.viewed.remove(surface);
             return;
         }
         if !is_root_of_a_window {
@@ -3514,9 +3576,15 @@ impl State {
                 // is what `set_cursor` would have written.
                 .unwrap_or((0, 0))
         });
+        // §103.18: the buffer's pixels per logical unit, so a platform that
+        // sizes cursors in points shows a scale-2 cursor at half its pixels.
+        let scale = compositor::with_states(surface, |states| {
+            states.cached_state.get::<SurfaceAttributes>().current().buffer_scale
+        })
+        .max(1);
 
         self.ui.send(ToUi::Cursor {
-            spec: CursorSpec::Image { image, hotspot_x, hotspot_y },
+            spec: CursorSpec::Image { image, hotspot_x, hotspot_y, scale },
         });
     }
 
@@ -3707,13 +3775,15 @@ impl State {
         // This is §40's argument about `placed_tree` arriving where it was
         // always going: painting and hit-testing must not disagree about which
         // surfaces are in the tree, and for one section they did.
+        // §103.18: all of this is logical. Only the canvas below is in device
+        // pixels, `k` of them per logical unit.
+        let k = self.scale_for(root);
         let bounds = placed
             .iter()
             .filter(|(surface, _)| self.ancestors_mapped(surface, root))
             .filter_map(|(surface, (x, y))| {
-                let s = self.staging.get(surface)?;
-                (s.width() > 0 && s.height() > 0)
-                    .then(|| (*x, *y, x + s.width(), y + s.height()))
+                let (w, h) = self.surface_size(surface)?;
+                (w > 0 && h > 0).then(|| (*x, *y, x + w, y + h))
             })
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
         let (gx, gy, gw, gh) = match geometry {
@@ -3783,15 +3853,17 @@ impl State {
         }
         let shadow = window.shadow.clone();
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
-        let reshaped = shadow.reset(gw, gh, format);
+        let (pw, ph) = (gw.saturating_mul(k), gh.saturating_mul(k));
+        let reshaped = shadow.reset(pw, ph, format) || shadow.scale() != k;
+        shadow.set_scale(k);
         // §95: every surface after the first is drawn *over* what is under it
         // (`Shadow::compose_over`), so what is under it must be this frame's.
         // The root's copy repaints the whole canvas whenever the canvas lies
         // inside the root's buffer, which a declared geometry always does; a
         // tree whose bounds reach past the root (a subsurface overhanging it)
         // starts from transparent instead of from the last frame's pixels.
-        let root_covers = self.staging.get(root).is_some_and(|s| {
-            gx >= 0 && gy >= 0 && gx + gw <= s.width() && gy + gh <= s.height()
+        let root_covers = self.surface_size(root).is_some_and(|(w, h)| {
+            gx >= 0 && gy >= 0 && gx + gw <= w && gy + gh <= h
         });
         if !root_covers {
             shadow.clear();
@@ -3809,18 +3881,20 @@ impl State {
                 continue;
             }
             if let Some(src) = self.staging.get(surface) {
+                let at = ((x - gx) * k, (y - gy) * k);
                 if first {
-                    shadow.compose(src, (x - gx, y - gy));
+                    shadow.compose(src, at);
                 } else {
-                    shadow.compose_over(src, (x - gx, y - gy));
+                    shadow.compose_over(src, at);
                 }
             }
             first = false;
         }
         drop(shadow);
 
+        // The damage is in the canvas's device pixels, the size logical.
         if reshaped {
-            return (vec![Rect::new(0, 0, gw, gh)], gw, gh);
+            return (vec![Rect::new(0, 0, pw, ph)], gw, gh);
         }
         // Translate the committing surface's damage into window coordinates.
         let (cx, cy) = placed
@@ -3828,10 +3902,13 @@ impl State {
             .find(|(s, _)| s == committed)
             .map(|(_, l)| *l)
             .unwrap_or((0, 0));
+        // §103.18: `committed_damage` is in the surface's staging pixels,
+        // which are device pixels already; only the logical offset is scaled.
+        let (ox, oy) = ((cx - gx) * k, (cy - gy) * k);
         let damage: Vec<Rect> = committed_damage
             .iter()
             .filter_map(|r| {
-                Rect::new(r.x + cx - gx, r.y + cy - gy, r.w, r.h).clip(gw, gh)
+                Rect::new(r.x + ox, r.y + oy, r.w, r.h).clip(pw, ph)
             })
             .collect();
         (damage, gw, gh)
@@ -4317,8 +4394,17 @@ impl CompositorHandler for State {
         &client.get_data::<ClientState>().unwrap().compositor_state
     }
 
-    fn new_surface(&mut self, _surface: &WlSurface) {
+    fn new_surface(&mut self, surface: &WlSurface) {
         println!("wc-compositor: wl_surface created");
+        // §103.18: before the first buffer, so a client that reads it draws its
+        // first frame at the output's scale. Only a version-6 surface hears
+        // it, and version 6 is offered only on a scaled output.
+        let k = self.scale_for(surface);
+        if k > 1 {
+            compositor::with_states(surface, |data| {
+                compositor::send_surface_state(surface, data, k, Transform::Normal)
+            });
+        }
     }
 
     /// A `wl_surface` went away.
@@ -4444,7 +4530,11 @@ impl CompositorHandler for State {
         // a renderer's job and not this stage's. Saying so out loud beats
         // silently drawing the wrong thing.
         // §102: with a viewport the scale *is* honoured (`surface::view_of`).
-        if (scale != 1 && !self.viewed.contains_key(surface)) || transform != wl_output::Transform::Normal {
+        // §103.18: and on a scaled output it always is.
+        let out = self.scale_for(surface);
+        if (scale != 1 && out == 1 && !self.viewed.contains_key(surface))
+            || transform != wl_output::Transform::Normal
+        {
             eprintln!(
                 "wc-compositor: buffer scale {scale} / transform {transform:?} is not implemented; \
                  drawing the buffer unscaled"
@@ -4454,6 +4544,10 @@ impl CompositorHandler for State {
         // §102. Whether any of it is in surface coordinates, which a viewport
         // makes different from buffer coordinates (see `present`).
         let surface_damage = damage.iter().any(|d| matches!(d, Damage::Surface(_)));
+        // §103.18: on a scaled output surface damage is scaled into buffer
+        // pixels by the buffer scale. On an output of scale 1 the two are
+        // merged as they always were, the buffer scale unread.
+        let to_buffer = if out > 1 { scale.max(1) } else { 1 };
         let rects: Vec<Rect> = damage
             .into_iter()
             .map(|d| match d {
@@ -4461,7 +4555,7 @@ impl CompositorHandler for State {
                 // identical, which is why they can be merged here and could not
                 // be in general.
                 Damage::Buffer(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
-                Damage::Surface(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h),
+                Damage::Surface(r) => Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h).scaled(to_buffer, 1),
             })
             .collect();
 
@@ -4585,7 +4679,7 @@ impl CompositorHandler for State {
                     let before_size = self.windows[surface]
                         .shadow
                         .lock()
-                        .map(|s| (s.width(), s.height()))
+                        .map(|s| (s.width() / s.scale(), s.height() / s.scale()))
                         .unwrap_or((0, 0));
                     // Not an early `return`: the pointer re-evaluation at the
                     // end of this function is §40's, it applies to every
@@ -4610,7 +4704,7 @@ impl CompositorHandler for State {
                         // of it now shows a different part of the buffer.
                         self.ui.send(ToUi::Present {
                             id,
-                            damage: vec![Rect::new(0, 0, w, h)],
+                            damage: vec![Rect::new(0, 0, w, h).scaled(self.scale_for(surface), 1)],
                         });
                         // §96, found by Minecraft: **a client still choosing
                         // its size has chosen this one**, and the window
@@ -5100,7 +5194,8 @@ impl XdgShellHandler for State {
             return;
         };
         self.ui.send(ToUi::Fullscreen { id, on: true });
-        let size = self.output.current_mode().map(|m| (m.size.w, m.size.h));
+        let k = self.scale_for(surface.wl_surface());
+        let size = self.output.current_mode().map(|m| (m.size.w / k, m.size.h / k));
         println!("wc-compositor: window {id} asked for fullscreen ({size:?})");
         self.set_state(id, |s| {
             toggle(s, xdg_state::Fullscreen, true);
@@ -6315,7 +6410,7 @@ impl State {
         if under != surface {
             return;
         }
-        let Some(size) = self.staging.get(&surface).map(|s| (s.width(), s.height())) else {
+        let Some(size) = self.surface_size(&surface) else {
             return;
         };
         let local = (x - origin.0, y - origin.1);

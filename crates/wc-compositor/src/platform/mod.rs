@@ -368,6 +368,11 @@ pub enum CursorSpec {
         image: IconImage,
         hotspot_x: i32,
         hotspot_y: i32,
+        /// §103.18: the cursor surface's buffer scale, at least 1. The image
+        /// is `scale` pixels per logical unit and the hotspot is logical, so a
+        /// platform that sizes a cursor in points (macOS) shows it at
+        /// `image / scale`. Win32 shows the pixels as they are, as before.
+        scale: i32,
     },
 }
 
@@ -1092,6 +1097,12 @@ pub(crate) struct Started {
     /// invent one — `--output` remains the whole answer there, which is what
     /// the conformance suite needs.
     pub work_area: Option<(i32, i32)>,
+    /// §103.18: the integer scale of that monitor, device pixels per logical
+    /// unit: the main screen's `backingScaleFactor` on macOS, rounded, and 1
+    /// on Win32 and headless. One monitor, one output, one scale; a platform
+    /// with a scale per monitor (Windows' per-monitor DPI) would make this a
+    /// list with the outputs.
+    pub scale: i32,
 }
 
 pub(crate) fn assemble(
@@ -1099,11 +1110,13 @@ pub(crate) fn assemble(
     wake: Wake,
     inner: PumpInner,
     work_area: Option<(i32, i32)>,
+    scale: i32,
 ) -> Started {
     Started {
         ui: Ui { tx, wake },
         pump: Pump { inner },
         work_area,
+        scale: scale.max(1),
     }
 }
 

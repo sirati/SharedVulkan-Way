@@ -90,6 +90,7 @@ struct Surf {
     back: u8,
     w: i32,
     h: i32,
+    scale: i32,
     /// §103.15: what each surface of the pair has missed since it was last
     /// written: every present's damage goes to both, and a surface's list is
     /// copied and cleared when it becomes the back buffer. `None` is "all".
@@ -259,13 +260,14 @@ impl R {
         let Some(port) = self.faces.get(&fid).and_then(|f| f.port) else { return };
         let shadow = w.shadow.clone();
         let s = shadow.lock().unwrap_or_else(|e| e.into_inner());
-        let (sw, sh) = (s.width(), s.height());
+        // §103.18: device pixels; the face shows them at `scale` per point.
+        let (sw, sh, scale) = (s.width(), s.height(), s.scale());
         if sw <= 0 || sh <= 0 {
             return;
         }
         let alpha = s.format() == PixelFormat::Argb8888;
         let mut fresh = None;
-        if w.surf.as_ref().is_none_or(|x| (x.w, x.h) != (sw, sh)) {
+        if w.surf.as_ref().is_none_or(|x| (x.w, x.h, x.scale) != (sw, sh, scale)) {
             let (Some(a), Some(b)) = (Surface::new(sw, sh), Surface::new(sw, sh)) else { return };
             w.next_gen += 1;
             let generation = w.next_gen;
@@ -274,8 +276,8 @@ impl R {
             if macmach::send_surfaces(port, id, generation, [&a, &b]) != 0 {
                 return;
             }
-            w.surf = Some(Surf { s: [a, b], back: 0, w: sw, h: sh, stale: [None, None] });
-            fresh = Some(ToFace::Surface { id, generation, w: sw, h: sh, alpha });
+            w.surf = Some(Surf { s: [a, b], back: 0, w: sw, h: sh, scale, stale: [None, None] });
+            fresh = Some(ToFace::Surface { id, generation, w: sw, h: sh, alpha, scale });
         }
         let surf = w.surf.as_mut().expect("surface pair");
         let back = surf.back;
