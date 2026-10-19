@@ -32963,6 +32963,15 @@ its 5 s lease. This was 103.14's design and is fixed here:
   keeper kills the session's GPU server and exits, and only then are the pages
   free. With no release in 10 minutes it frees anyway.
 * No keeper, no session: the main process refuses to start without one.
+* A shutdown does not wait on it. The keeper first ignored SIGTERM, so every
+  macOS shutdown waited until launchd killed it (the main process died on the
+  signal without `down`, and the release came only after the 5 s lease). Now
+  the main process answers SIGTERM with `down` over the control ring and exits,
+  the host releases within about 1–2 s (measured 1.15 s), and a keeper that
+  has seen SIGTERM waits at most 10 s. This VM's stops still leave a
+  `shutdown_stall` report: macOS samples whatever is alive 2 s into the
+  shutdown, Apple's own processes included, before our processes have had
+  their SIGTERM.
 * Measured: five kills under the same scrolling load, no panic (the panic count
   stayed at 3); each time the keeper held 70 MiB for about 6 s until the
   release.
