@@ -141,7 +141,7 @@ impl Decoder {
     }
 
     /// The next whole message, `Ok(None)` if more bytes are needed.
-    pub fn next(&mut self) -> Result<Option<Msg>, BadFrame> {
+    pub fn next_msg(&mut self) -> Result<Option<Msg>, BadFrame> {
         loop {
             if self.buf.len() < HEADER {
                 return Ok(None);
@@ -308,7 +308,7 @@ pub fn spawn(
                     }
                 }
                 loop {
-                    match dec.next() {
+                    match dec.next_msg() {
                         Ok(Some(m)) => on_msg(m, &l2),
                         Ok(None) => break,
                         Err(e) => break 'run e.0,
@@ -383,7 +383,7 @@ mod tests {
             let mut got = Vec::new();
             for chunk in with_future.chunks(split) {
                 d.push(chunk);
-                while let Some(m) = d.next().unwrap() {
+                while let Some(m) = d.next_msg().unwrap() {
                     got.push(m);
                 }
             }
@@ -395,7 +395,7 @@ mod tests {
     fn an_oversized_frame_is_refused() {
         let mut d = Decoder::default();
         d.push(&[0x20, 0, 1, 0, 0xff, 0xff, 0xff, 0x7f]);
-        assert!(d.next().is_err());
+        assert!(d.next_msg().is_err());
     }
 
     #[test]
@@ -483,7 +483,7 @@ mod tests {
         let mut got = Vec::with_capacity(total);
         while got.len() < total {
             assert!(fill(&mut rx, &mut dec, Duration::from_millis(5)).unwrap());
-            while let Some(Msg::Data { pcm, .. }) = dec.next().unwrap() {
+            while let Some(Msg::Data { pcm, .. }) = dec.next_msg().unwrap() {
                 got.extend_from_slice(&pcm);
             }
         }

@@ -36,6 +36,9 @@ pub struct Services {
     pub session: Option<PathBuf>,
     pub id: Option<String>,
     pub audio: Option<PathBuf>,
+    /// §103.16: the multi-stream sound ring (`--sound-pactl`, `--sound-server`,
+    /// `--sound-dir`); takes the place of `audio`'s single stream.
+    pub sound: Option<crate::sound::SoundCfg>,
 }
 
 static LAST_PING: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +63,16 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
             Err(e) => println!("[proxy] no session control ring: {e}"),
         }
     }
-    if let Some(sock) = svc.audio.clone() {
+    if let Some(cfg) = svc.sound.clone() {
+        match ByteChannel::claim(control, OWNER_AUDIO) {
+            Ok(ch) => {
+                println!("[proxy] session sound on ring slot {} (§103.16, every device a stream)", ch.slot());
+                let c = Arc::clone(control);
+                std::thread::Builder::new().name("session-sound".into()).spawn(move || crate::sound::serve(&c, ch, cfg)).ok();
+            }
+            Err(e) => println!("[proxy] no session sound ring: {e}"),
+        }
+    } else if let Some(sock) = svc.audio.clone() {
         match ByteChannel::claim(control, OWNER_AUDIO) {
             Ok(ch) => {
                 println!("[proxy] session sound on ring slot {} (no ssh)", ch.slot());

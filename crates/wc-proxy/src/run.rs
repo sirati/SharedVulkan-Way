@@ -330,6 +330,12 @@ fn parse_args() -> Result<Args, String> {
             "--session-control" => a.services.session = Some(next()?.into()),
             "--session-id" => a.services.id = Some(next()?),
             "--audio-socket" => a.services.audio = Some(next()?.into()),
+            "--sound-pactl" => a.services.sound.get_or_insert_with(Default::default).pactl = next()?.into(),
+            "--sound-server" => {
+                let v = next()?;
+                a.services.sound.get_or_insert_with(Default::default).server = (!v.is_empty()).then_some(v);
+            }
+            "--sound-dir" => a.services.sound.get_or_insert_with(Default::default).dir = next()?.into(),
             "--runtime-dir" => a.runtime_dir = next()?.into(),
             "--socket" => a.socket = next()?,
             "--transport" => a.transport = next()?,
