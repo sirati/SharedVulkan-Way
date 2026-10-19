@@ -509,6 +509,14 @@ pub struct Stats {
     /// Every one of these is a legitimate early return; what was missing was
     /// the arithmetic saying so.
     pub verify_unreached: u64,
+    /// §104. `wl_buffer`s made from a dma-buf token (`--dmabuf-node`): a
+    /// shared allocation the compositor maps by name, nothing copied here.
+    pub dmabuf_buffers: u64,
+    /// §104. Commits of a surface showing one of those. Every one copied zero
+    /// bytes, which is the claim this number exists to make checkable.
+    pub dmabuf_commits: u64,
+    /// §104. `create`/`create_immed` answered with `failed`.
+    pub dmabuf_failed: u64,
 }
 
 impl Stats {
@@ -556,11 +564,21 @@ impl Stats {
         } else {
             String::new()
         };
+        // §104. Only when there was any, so a run without `--dmabuf-node`
+        // prints the line it always printed.
+        let dmabuf = if self.dmabuf_buffers > 0 || self.dmabuf_commits > 0 || self.dmabuf_failed > 0 {
+            format!(
+                "; dmabuf_buffers={} dmabuf_commits={} dmabuf_failed={} (zero copy)",
+                self.dmabuf_buffers, self.dmabuf_commits, self.dmabuf_failed
+            )
+        } else {
+            String::new()
+        };
         format!(
             "{} commits, {} copies, {mb:.2} MiB in {ms:.1} ms ({per}); \
              {} pools ({} released, {} reclaimed, {} republished, {} resizes, {} overflows, \
              {} refusals, {} attaches deferred); {} fds in, {} out{}; \
-             {} client msgs, {} server msgs{verify}{clip}",
+             {} client msgs, {} server msgs{verify}{clip}{dmabuf}",
             self.commits,
             self.copies,
             self.pools_created,
@@ -944,6 +962,10 @@ pub struct Session {
     /// instrument inside the loop being timed produced a 2x that was really
     /// 1.03x. Nothing here may be used to time anything.
     verify: bool,
+    /// §104, `--dmabuf-node`: the `zwp_linux_dmabuf_v1` this proxy answers
+    /// itself. `None` (the default) leaves every message as it was. See
+    /// `session/dmabuf.rs`.
+    dmabuf: Option<dmabuf::Dmabuf>,
 }
 
 ///
@@ -1052,6 +1074,7 @@ impl Session {
             proxy_destroyed: std::collections::HashSet::new(),
             pressure_noted: false,
             verify: false,
+            dmabuf: None,
         }
     }
 
@@ -1246,6 +1269,15 @@ impl Session {
         // pool that happens to be without a region. See [`Pool::wanted`].
         self.note_demand(&interface, header.opcode, header.object, body, &spans);
         let mut out = if deferrable { Vec::new() } else { self.flush_deferred() };
+
+        // §104. `zwp_linux_dmabuf_v1` and its objects are answered here, with
+        // `--dmabuf-node`; a no-op without it.
+        if let Some(bytes) =
+            self.dmabuf_request(&interface, header.opcode, header.object, body, &spans, fds)?
+        {
+            out.extend_from_slice(&bytes);
+            return Ok(out);
+        }
 
         // STAGE 11. The one message this program *watches* rather than
         // understands: it is forwarded unchanged, and a copy of the string goes
@@ -2323,6 +2355,11 @@ impl Session {
         body: &[u8],
     ) -> Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>), Error> {
         self.stats.messages_server += 1;
+        // §104. Answers to objects the dma-buf path made upstream on the
+        // client's behalf are this proxy's, not the client's.
+        if let Some(bytes) = self.dmabuf_event(header.object, header.opcode, body) {
+            return Ok((bytes, Vec::new()));
+        }
         let interface = self
             .objects
             .interface(header.object)
@@ -2546,7 +2583,11 @@ impl Session {
         } else {
             body.to_vec()
         };
-        Ok((wire::message(header.object, header.opcode, &out_body), fds))
+        let mut out = wire::message(header.object, header.opcode, &out_body);
+        // §104. The private `zwp_linux_dmabuf_v1` global rides in after the
+        // compositor's `wl_shm`.
+        self.dmabuf_registry(&interface, header.object, header.opcode, body, &spans, &mut out);
+        Ok((out, fds))
     }
 
     /// An id has just been declared as `iface`. Anything this file remembers
@@ -2854,6 +2895,20 @@ impl Session {
         if self.foreign_buffers.contains(&buffer_id) {
             surface.damage.clear();
             self.stats.foreign_commits += 1;
+            // §104. A dma-buf buffer is the shared allocation itself: the
+            // compositor reads it by name, so this commit moved nothing.
+            if self.is_dmabuf_buffer(buffer_id) {
+                self.stats.dmabuf_commits += 1;
+                if sv_transport::frametrace::enabled() {
+                    sv_transport::frametrace::emit(
+                        "px.commit",
+                        format_args!(
+                            "surf={surface_id} buf={buffer_id} attached={} copied=0 zero_copy=1",
+                            attached_now as u8
+                        ),
+                    );
+                }
+            }
             return;
         }
         let Some(info) = self.buffers.get(&buffer_id).cloned() else {
@@ -3537,6 +3592,12 @@ fn materialise(
         )),
     }
 }
+
+mod dmabuf;
+pub use dmabuf::{
+    dev_major, dev_minor, render_node, DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
+    GLOBAL_NAME as DMABUF_GLOBAL_NAME,
+};
 
 #[cfg(test)]
 mod tests;

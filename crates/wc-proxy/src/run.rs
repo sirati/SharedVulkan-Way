@@ -124,6 +124,13 @@ struct Args {
     /// bytes and count the rows that differ. An instrument rather than a mode:
     /// it reads the whole extent every commit. See `Session::verify`.
     verify: bool,
+    /// §104. `--dmabuf-node PATH`: offer `zwp_linux_dmabuf_v1` v4 with this
+    /// render node's `st_rdev` as the main device, and turn the dma-buf
+    /// tokens clients hand over into `wl_shm` pools on the shared allocation
+    /// (`session/dmabuf.rs`). `None` (the default): nothing changes.
+    /// Stat()ed per client, not here: the node may appear after the proxy
+    /// started (`session/dmabuf.rs`).
+    dmabuf_node: Option<PathBuf>,
     accept_timeout: Duration,
     idle_timeout: Duration,
     /// STAGE 11. Resolve `xdg_toplevel.set_app_id` to icon pixels here, where
@@ -233,6 +240,17 @@ usage: wc-proxy --upstream <path> [options]
                          a damage bug and never for timing one\n  --pool-headroom N      over-allocate each region N-fold so resize fits
                          (default 1)
 
+  --dmabuf-node PATH     offer zwp_linux_dmabuf_v1 v4 to clients, main device
+                         PATH's st_rdev (a render node, e.g. /dev/dri/renderD128
+                         from sv-drm). A dma-buf is an sv-drm token naming a
+                         shared allocation; the compositor gets it as a wl_shm
+                         pool on that allocation and nothing is copied
+                         (waycompose-design.md §104). Checked for each client
+                         when its registry is filled, so the node may appear,
+                         vanish and come back while the proxy runs; a client
+                         is offered the global only if PATH is a character
+                         device at that moment. Default: not offered
+
   --icon-theme NAME      the icon theme to search before hicolor
                          (default $WC_ICON_THEME, else hicolor)
   --no-clipboard         do not carry the clipboard: no third connection to the
@@ -281,6 +299,7 @@ fn parse_args() -> Result<Args, String> {
         pace_hz: 0,
         pace_depth: 3,
         verify: false,
+        dmabuf_node: None,
         accept_timeout: Duration::from_secs(20),
         idle_timeout: Duration::from_secs(20),
         icons: true,
@@ -344,6 +363,7 @@ fn parse_args() -> Result<Args, String> {
             "--pace-frames" => a.pace_hz = next()?.parse().map_err(|e| format!("--pace-frames: {e}"))?,
             "--pace-depth" => a.pace_depth = next()?.parse().map_err(|e| format!("--pace-depth: {e}"))?,
             "--verify-damage" => a.verify = true,
+            "--dmabuf-node" => a.dmabuf_node = Some(next()?.into()),
             "--no-icons" => a.icons = false,
             "--no-clipboard" => a.clipboard = false,
             "--icon-theme" => a.icon_theme = next()?,
@@ -449,6 +469,21 @@ fn announce_outbound(t: &Arena) {
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let spec = Spec::builtin()?;
     println!("[proxy] {} interfaces from the vendored protocols", spec.len());
+    // §104. Said, not required: the node is looked at again for every client.
+    if let Some(node) = &args.dmabuf_node {
+        match wc_proxy::session::render_node(node) {
+            Ok(dev) => println!(
+                "[proxy] --dmabuf-node {}: {}:{} now; checked again for each client",
+                node.display(),
+                wc_proxy::session::dev_major(dev),
+                wc_proxy::session::dev_minor(dev)
+            ),
+            Err(e) => println!(
+                "[proxy] --dmabuf-node {}: not there yet ({e}); checked again for each client",
+                node.display()
+            ),
+        }
+    }
 
     // CHANGED IN STAGE 9: a **factory**, called once per client, rather than
     // one transport for the process. See the accept loop below for why there is
@@ -1060,6 +1095,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let (spec, scope, headroom, trace, idle) =
             (spec.clone(), args.scope, args.headroom, args.trace, args.idle_timeout);
         let verify = args.verify;
+        let dmabuf_node = args.dmabuf_node.clone();
         let (pace_hz, pace_depth) = (args.pace_hz, args.pace_depth);
         // STAGE 11. The icon feed, one per served connection.
         //
@@ -1223,6 +1259,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             session.set_forced_title(forced_title.clone());
             session.set_trace(trace);
             session.set_verify(verify);
+            session.set_dmabuf_node(dmabuf_node.clone());
             session.set_pacing(pace_hz, pace_depth);
             let mut log = |s: &str| println!("[proxy] client {n}: {s}");
             match proxy::pump(
@@ -1296,3 +1333,4 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("[proxy] stopped: {served} client(s) served");
     Ok(())
 }
+
