@@ -741,6 +741,66 @@ fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<ByteChanne
     Some(ch)
 }
 
+/// §105.14: a request's thread, raised above normal priority while it waits
+/// for its answer. Measured on a loaded guest (a game at half a core), a
+/// wait that yielded with `SwitchToThread` handed its vCPU to the load and
+/// got it back 7.6 ms later; raised, and yielding with `Sleep(0)`, which
+/// gives way only to threads of the same or higher priority, it keeps the
+/// vCPU for the at most [`spin`] it waits. Restored when dropped.
+struct Urgent {
+    #[cfg(windows)]
+    was: i32,
+}
+
+#[cfg(windows)]
+mod prio {
+    pub const HIGHEST: i32 = 2;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn GetCurrentThread() -> isize;
+        pub fn GetThreadPriority(t: isize) -> i32;
+        pub fn SetThreadPriority(t: isize, p: i32) -> i32;
+        pub fn Sleep(ms: u32);
+    }
+}
+
+impl Urgent {
+    fn now() -> Urgent {
+        #[cfg(windows)]
+        {
+            // SAFETY: the pseudo-handle of the calling thread; no other effect.
+            let was = unsafe { prio::GetThreadPriority(prio::GetCurrentThread()) };
+            // SAFETY: as above.
+            unsafe { prio::SetThreadPriority(prio::GetCurrentThread(), prio::HIGHEST) };
+            Urgent { was }
+        }
+        #[cfg(not(windows))]
+        Urgent {}
+    }
+}
+
+impl Drop for Urgent {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        // SAFETY: as in `now`.
+        unsafe {
+            prio::SetThreadPriority(prio::GetCurrentThread(), self.was);
+        }
+    }
+}
+
+/// One turn of a wait's spin: give way to a thread of this priority that is
+/// ready on this processor, and to nobody else (Windows); a yield elsewhere.
+fn relax() {
+    #[cfg(windows)]
+    // SAFETY: no arguments that matter; Sleep(0) only gives up the slice.
+    unsafe {
+        prio::Sleep(0)
+    };
+    #[cfg(not(windows))]
+    std::thread::yield_now();
+}
+
 /// How long a request waits for its answer before it parks (§105.13): the
 /// host waking from its park and answering takes 0.1–1.5 ms on an idle
 /// guest, and an answer seen here needs no doorbell back (§105.14). A
@@ -818,11 +878,10 @@ impl Ctl {
                 // would add a doorbell round trip.
                 let t0 = Instant::now();
                 while t0.elapsed() < spin() && !ch.readable().unwrap_or(true) {
-                    // §105.14: a yielding spin. A busy one held its vCPU
-                    // against the launcher on the guest, and both lost a
-                    // 15.6 ms tick to it (Windows does not move a woken
-                    // thread to a parked core).
-                    std::thread::yield_now();
+                    // §105.14: a yielding spin (a busy one held its vCPU
+                    // against the thread it waited for), at the raised
+                    // priority `Urgent` gives the request.
+                    relax();
                 }
                 if ch.readable().unwrap_or(true) {
                     continue;
@@ -857,6 +916,7 @@ impl Ctl {
 
     /// [`Ctl::request`] for a caller that holds the turn.
     fn exchange(&self, line: &str, within: Duration) -> Result<Vec<u8>, String> {
+        let _urgent = Urgent::now();
         self.drain_stale();
         sv_transport::frametrace::hop("C.ringtx0");
         self.write_all(format!("{line}\n").as_bytes())?;
@@ -1486,6 +1546,14 @@ fn lines(mut conn: wc_transport::Stream, mut f: impl FnMut(&str) -> Vec<u8>) {
 /// One connection of a launcher: request lines, each answered in order, until
 /// it closes. A launcher sends one; `--ping N` sends N on one connection.
 fn answer(conn: wc_transport::Stream, ctl: &Ctl) {
+    // §105.14: above normal for as long as the connection lives. The thread
+    // runs only when a request arrives, and on a loaded guest a normal one
+    // waited up to 133 ms for its vCPU after the launcher had written.
+    #[cfg(windows)]
+    // SAFETY: the calling thread's pseudo-handle; 1 is ABOVE_NORMAL.
+    unsafe {
+        prio::SetThreadPriority(prio::GetCurrentThread(), 1);
+    }
     lines(conn, |line| {
         let line = line.trim();
         // `ping` is the lease's word on the ring; a launcher's bare `ping` is
