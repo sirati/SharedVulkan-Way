@@ -33937,10 +33937,10 @@ with full suites alongside as load.
 ## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 
 2026-10-19, branch `host-integration`, crate `wc-hostint`. The model is the
-one the real-Mac prototype proved over vsock (github sirati/
-nix-darwin-subsystem-linux, `agent/`). Its pure functions and tests were
-adopted (the URL check, the rate limiter, the slugs, the reconciler, the
-`pw-metadata` argv). What differs is the transport. Nothing here crosses
+one the real-Mac prototype proved over vsock (`nix-darwin-subsystem-linux`,
+`agent/`). Its pure functions and tests were adopted where they still fit
+(the URL check, the rate limiter, the slugs and their deduplication). What
+differs is the transport. Nothing here crosses
 the boundary except through the session's shared memory: one ring slot for
 messages, the sound ring for samples, and a file share that the VM already
 has.
@@ -34104,10 +34104,20 @@ The macOS VM is §106.6.
 **Host side, Windows.** `wc-launch`'s deploy registers each application's
 types under HKCU (`wc_hostint::assoc::windows_plan`). It writes a manifest,
 and `--uninstall-assoc` removes exactly what the manifest lists. A file
-opened through the registration runs `wc-launch --install I APP --file
+opened through the registration runs `wc-launch --session-name S APP --file
 "%1"`, which maps or copies the path and sends the existing `open` verb with
-a `file:///` URL. Opening for Linux uses `ShellExecuteW` with the verb
-`open`, or the handler's own executable through `CreateProcessW`.
+a `file:///` URL. The label in "Open with" is the shortcut's title, so two
+installations stay apart. Opening for Linux uses `ShellExecuteW` with the
+verb `open`, after `AssocIsDangerous` and the extension list, or the
+handler's own executable through `CreateProcessW`. The configured browser
+(`[hostint] browser`, with fixed `browser-arg`s before the URL, which is
+always one argument of its own) replaces the default browser.
+
+**On the compositor.** Only the compositor can map the ivshmem device, so it
+serves both slots. `session_svc` opens `OWNER_HOSTINT` when the launcher
+passed `--hostint` (with the share and browser from `[hostint]`), and runs
+`sound_win` on `OWNER_AUDIO` in place of §105's single default-output
+player.
 
 **Host side, macOS.** The bundle's `Info.plist` lists the types at rank
 `Alternate` (`wc_hostint::assoc::plist_types`). The face's
@@ -34265,6 +34275,81 @@ agent:
   microphone's start and the open block the threads they run on. 106.8 has
   the fix.
 
+**The Windows guest** (the test host's VM, while it was idle, under the lease,
+18:14–18:24). This used a separate test installation with its own
+directory, session name, application section ("Firefox (Linux HI test)"),
+ProgID and taskbar identity, and `WC_LAUNCH_TEST_HOME` for its applications,
+through a `test-home` file beside its `wc-session`. Deploy left the shared
+doorbell hub and the session service as they were
+(`WC_LAUNCH_SERVICES=keep`). The session started cold in 4.1 s with no ssh
+in its path. Evidence is in
+`/mnt/datasets/builds/evidence/host-integration/win-e2e/`. Each image was
+judged by a fresh Sonnet agent and checked afterwards for the user's own
+windows or content (none):
+* **Audio.** The guest has one HDA output and one input. A QEMU
+  `usb-audio` on its existing xHCI controller and audio backend,
+  hot-plugged for about 80 s, made a second output. The session's server
+  then had `win.sink.lautsprecher_2-_high_definition_audio_device`,
+  `win.sink.lautsprecher_audio_device` and
+  `win.source.eingang_2-_high_definition_audio_device`, described by
+  Windows' names. Windows made the new device its default when it appeared,
+  and Linux followed. The default was then set to HDA, USB and HDA again
+  (`wc-hostint-probe --set-default render all`, through `IPolicyConfig`),
+  and the Linux default sink followed each time, 0.83 to 0.89 s after the
+  command was sent. 1.5 s of signal crossed with nothing dropped. Recording
+  from the source for 2 s gave 352,800 bytes, with capture started and
+  stopped on both sides. After the unplug, all six default roles (render and
+  capture × console, multimedia, communications) were restored and read back
+  identical to before.
+* **Linux to Windows, a link.** `xdg-open https://example.org` in the Linux
+  application's own environment answered `ok`, and a Windows browser showed
+  "Example Domain". The browser was the configured one (`[hostint]
+  browser`), so that nothing touched the user's own: this guest has no Edge
+  (its directory is an empty file), so it was Windows' Firefox with
+  `-no-remote -profile <test dir> -new-window`. That process tree was closed
+  by its pid and the profile deleted. `xdg-open file:///etc/passwd` was
+  refused (exit 2).
+* **Windows to Linux, by type.** `Z:\waycompose-test\t.html` was opened
+  through the test installation's ProgID with `ShellExecuteEx` (`lpClass`),
+  which is what Explorer's "Open with" invokes, rather than by clicking in
+  Explorer. The Linux Firefox showed it at
+  `file:///srv/winshare/waycompose-test/t.html`. The application is listed
+  among `.html`'s recommended handlers. Windows added no OpenWithList entry.
+* **Linux "Open with" a Windows application.** The session's
+  `wc-host-<token>.desktop` was "Paint (Windows)". `wc-host-open --with
+  <token>` on a PNG in the share opened it in Paint.
+* **Registry.** `--install` wrote 27 values for four types and two schemes,
+  among them the ProgID, `OpenWithProgids` for `.html` and `.xhtml`, and
+  Capabilities with URL associations for http and https. `--uninstall-assoc`
+  removed all of them, the empty keys it had made included.
+* Before the run no other compositor was mapping the device, and afterwards
+  nothing of the test was left. The guest was up and unlocked before and
+  after.
+
+**On one machine, before the guest** (`scripts/wc-hostint-win-local.sh`, on
+`scripts/wc-no-ssh.sh`'s stand-ins for the device, the port and the
+guest): the Windows session path's channel came up, and links, refusals,
+`--with`, a share file sent as `Z:\…`, and `open` of a share file into `%u`
+and `%f` (a file outside the share refused) all passed. This found one bug
+of the merge itself: the proxy's socketless ring branch never claimed the
+slot. `sound_win` against a fake session side under Wine announced four
+streams and both defaults, and returned every byte of 2 s of output as
+credit.
+
+**The Mac's outputs and its microphone dialog.** While macOS asks the user
+for the microphone, a CoreAudio start for the device that also has the
+microphone waits in coreaudiod until the dialog is answered. The outputs are
+therefore AUHAL units started on workers of their own, never on the sound
+ring's thread or under its lock, and the microphone is asked for through
+AVFoundation before any input exists. Measured in the VM with the dialog
+up: the output-only device played (a 3 s tone in 3.37 s), the Linux default
+followed, `xdg-open` was answered in 0.50 s, and an open with TextEdit got
+"the Mac is asking for permission; answer the dialog" in 2.5 s. Output to
+the device that has the microphone still waits until the dialog is answered.
+That is the system audio server, and it happens once, on first use. After
+Allow: 754,948 bytes recorded in 5 s, and both outputs played the tone in
+3.0–3.1 s.
+
 ### 106.8 Not done, not proven, and known defects
 
 * **The real Mac (role (b)) has not run any of this.** The Linux side is the
@@ -34273,11 +34358,10 @@ agent:
   the Nix activation's job (the prototype's `stable-codesign.nix`). Until
   then TCC asks for the microphone again after every rebuild. In the VM the
   binary is unsigned.
-* **The fix for the session stalling while a TCC dialog waits** is code- and
-  unit-tested (the microphone opens on a thread of its own per input; an
-  open for Linux runs on a worker and is answered within 2 s), and has not
-  been re-run in the VM. Its check: reset both grants, then record and play
-  while the dialog is up.
+* **On first use, output to the Mac device that also has the microphone
+  waits for TCC's dialog.** coreaudiod holds that device's setup until the
+  dialog is answered (106.7). Everything else keeps working meanwhile: other
+  outputs, the defaults and the opens.
 * **Windows never has a Linux application as a default by itself.**
   `UserChoice` is protected, so the registration offers the application in
   "Open with" and in Settings' Default apps, and the user chooses. The same
@@ -34298,4 +34382,10 @@ agent:
   that runs `pipewire` mode needs it anyway.
 * **Windows' default-browser path** (`ShellExecuteW` with the URL) ran only
   under Wine. On the guest the run opened links in a configured browser
-  with a throwaway profile, so that nothing touched the user's own.
+  with a throwaway profile, so that nothing touched the user's own. That
+  was Windows' Firefox, because the guest has no Edge.
+* **Explorer's "Open with" was invoked, not clicked**: `ShellExecuteEx`
+  with the installation's ProgID, which is the call the menu makes.
+* **"Open with" lists one entry per installation**, labelled with the
+  shortcut's title; nothing groups several installations of one
+  application.
