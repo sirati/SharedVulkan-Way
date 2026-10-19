@@ -18,7 +18,7 @@ keycodes, and gets a keymap across the boundary — which is `wl_keyboard.keymap
 `h` argument going the *other* way from a `wl_shm` pool, and is the direction
 stage 4 implemented without ever exercising. `weston-terminal`, unmodified, in a
 window with Windows' own caption, with text typed into it by `SendInput`:
-[`docs/stage6-typing.png`](docs/stage6-typing.png). Under Wine — stage 5 put the
+`docs/stage6-typing.png` (a screenshot, kept outside the repository). Under Wine — stage 5 put the
 earlier stages on the real guest, and no input has run there yet.
 
 **Two known defects of the keyboard, stated here because both are silent**
@@ -369,3 +369,16 @@ btrfs. **Do not share a `CARGO_TARGET_DIR` between them** — the comment at the
 top of `wc-worktree.sh` explains what happened last time, and this project is
 unusually exposed to it because `vendor/` holds path dependencies with the same
 names and versions as the crates.io originals.
+
+### Machine-specific values and evidence
+
+The harness scripts read the guest's user, the host and guest addresses and
+the ssh aliases from `scripts/site.env`, which is not tracked: copy
+`scripts/site.env.example` and fill it in. A worktree without its own copy
+uses the main checkout's (`scripts/site.sh`). The docs write these values as
+placeholders such as `<guest-user>`, `<guest-ip>` and `<host-ip>`, and call
+the Linux machine that runs the Windows VM `testhost`.
+
+Screenshots, logs and captured output are not in the repository; `.gitignore`
+keeps everything under `docs/` except Markdown out. Docs still name such files
+by path, as a record of where a run put them.

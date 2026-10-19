@@ -46,6 +46,7 @@
 #   SVMC_MEM       the game's memory cap (6G); the heap is Prism's 3 GiB
 #   SVMC_GPU_ARENA_MIB  the GPU side's arena (512); the guest gives a session 64 or 240
 #   SVMC_GPU_POOL_MIB   lease from one pool of this size instead, as the guest does (§97)
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 CMD=${1:-}
@@ -550,7 +551,7 @@ verdict() {
 # narrator off, the sound on, vsync on, a view distance for a laptop), the
 # launcher `scripts/minecraft-demo`, and desktop entries and Minecraft's own
 # icon in share/, where `wc-session`'s `app` and `icon` verbs look.
-HOST_DIR=${SVMC_HOST_DIR:-~/wc-mc}
+HOST_DIR=${SVMC_HOST_DIR:-${SITE_HOST_HOME}/wc-mc}
 bundle() {
   [ -s "$CAP/stock/stdin" ] && [ -s "$CAP/vulkanmod/stdin" ] || die "run '$0 setup' first"
   local host=${1:?bundle HOSTNAME} B="$DATA/bundle/wc-mc"

@@ -48,6 +48,7 @@
 # reason it is also written here is that this project has twice read a stale
 # deployed binary as a transport fault and lost an afternoon to it.
 # ---------------------------------------------------------------------------
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 SESSIONS=${1:-1}
@@ -55,7 +56,7 @@ BASE=${2:-57340}
 MODE=${3:-gl}
 
 DIR=/tmp/svff-int
-G=${SVFF_GUEST:-<guest-user>@<guest-nat-ip>}
+G=${SVFF_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}
 GK=(-i "$HOME/.ssh/wc_guest" -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 ROOTC=${SVFF_ROOTC:-$HOME/rootc}
 BASH_BIN=$(command -v bash)

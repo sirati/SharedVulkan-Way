@@ -40,11 +40,12 @@
 #    handle -- but "should not matter" is not evidence, so the guest half must
 #    be *seen echoing* before any latency is quoted. A silent discard then fails
 #    the handshake instead of producing a plausible number.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-VMHOST=${SV_HOST:-<host-user>@<host-ip>}
-GUEST=${SV_GUEST:-<guest-user>@<guest-ip>}
+VMHOST=${SV_HOST:-$SITE_HOST}
+GUEST=${SV_GUEST:-$SITE_GUEST}
 AGENT=${SV_SSH_AGENT:-$HOME/.1password/agent.sock}
 PORT=org.sirati.svbell.0
 SOCK=/run/windows-vm/vport-$PORT.sock
@@ -95,12 +96,12 @@ NEW=$(comm -13 <(printf '%s\n' "$BEFORE") <(printf '%s\n' "$AFTER") 2>/dev/null)
 
 say "deploying the probe"
 scp "${S[@]}" -q "$ROOT/target/x86_64-pc-windows-gnu/debug/sv-bell-probe.exe" \
-    "$GUEST:C:/Users/<guest-user>/sv-bell-probe.exe" || { echo "FAIL: cannot deploy to the guest"; exit 1; }
+    "$GUEST:C:/Users/${SITE_GUEST_USER}/sv-bell-probe.exe" || { echo "FAIL: cannot deploy to the guest"; exit 1; }
 scp "${S[@]}" -q "$ROOT/target/debug/sv-bell-probe" "$VMHOST:/tmp/sv-bell-probe-linux" || exit 1
 
 # The echo must be seen before any latency is quoted -- see the header.
 say "starting the guest half"
-guest "C:/Users/<guest-user>/sv-bell-probe.exe guest --port $PORT --seconds 180" > /tmp/sv-bellguest.log 2>&1 &
+guest "C:/Users/${SITE_GUEST_USER}/sv-bell-probe.exe guest --port $PORT --seconds 180" > /tmp/sv-bellguest.log 2>&1 &
 GP=$!
 for _ in $(seq 1 40); do grep -q "echoing on" /tmp/sv-bellguest.log 2>/dev/null && break; sleep 1; done
 if ! grep -q "echoing on" /tmp/sv-bellguest.log 2>/dev/null; then
@@ -115,7 +116,7 @@ vmhost "export PATH=/run/current-system/sw/bin:/run/wrappers/bin; sudo -n /tmp/s
 rc=$?
 
 kill $GP 2>/dev/null
-guest 'rm -f /c/Users/<guest-user>/sv-bell-probe.exe' >/dev/null 2>&1
+guest "rm -f $SITE_GUEST_MSYS_HOME/sv-bell-probe.exe" >/dev/null 2>&1
 vmhost 'rm -f /tmp/sv-bell-probe-linux' >/dev/null 2>&1
 rm -f /tmp/sv-bellguest.log
 say "the port is transient and dies with the QEMU process; nothing to undo"

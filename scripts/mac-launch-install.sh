@@ -16,6 +16,7 @@
 # GUEST (the VM): the macOS wc-launch in ~/Library/Application Support/waycompose,
 #   its key, its wc-launch.ini, an ssh alias `wchost`, and one .app per APP in
 #   ~/Applications/Linux, kept in the Dock.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -euo pipefail
 inst=${MACVM_INSTANCE:-wayland-host}
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -103,7 +104,7 @@ systemd-run --user --unit=wc-mac-sshd --collect "$sshd_bin" -D -e -f "$BASE/sshd
 sleep 1
 ss -ltnH | grep -q "127.0.0.1:$PORT" || { echo "the private sshd did not listen"; journalctl --user -u wc-mac-sshd -n 20 --no-pager; exit 1; }
 
-vm "grep -q '^Host wchost' ~/.ssh/config 2>/dev/null || printf 'Host wchost\n  HostName <vm-gateway-ip>\n  Port $PORT\n  User $(id -un)\n' >> ~/.ssh/config; chmod 600 ~/.ssh/config"
+vm "grep -q '^Host wchost' ~/.ssh/config 2>/dev/null || printf 'Host wchost\n  HostName $SITE_VM_GATEWAY_IP\n  Port $PORT\n  User $(id -un)\n' >> ~/.ssh/config; chmod 600 ~/.ssh/config"
 {
   echo "# §103.8, written by scripts/mac-launch-install.sh"
   echo "[session]"

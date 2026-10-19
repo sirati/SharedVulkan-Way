@@ -18,11 +18,12 @@
 # The workload is bounded and the fence has a 2 s timeout. It never restarts the
 # guest and never touches the display configuration.
 
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
-HOST=<host-user>@<host-ip>
-GUEST=<guest-user>@<guest-ip>
-HOST_ALIAS=testhost.lan
+HOST=$SITE_HOST
+GUEST=$SITE_GUEST
+HOST_ALIAS=$SITE_HOST_KEYALIAS
 SHARE=/srv/winshare/probe
 # Forward slashes on purpose. The guest shell is git-bash, and `Z:\probe` inside
 # a double-quoted string that crosses two shells loses the backslash and becomes

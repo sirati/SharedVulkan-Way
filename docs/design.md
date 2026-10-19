@@ -2045,8 +2045,8 @@ AV1         Supported          Unsupported
 HEVC        Supported          Unsupported
 ```
 
-![about:support's Media section on testhost's host: Hardware Decoding
-"Unsupported" for every codec](video-decode/h264-support-media.png)
+Screenshot `docs/video-decode/h264-support-media.png`, not in the repository: about:support's Media section on testhost's host: Hardware Decoding
+"Unsupported" for every codec.
 
 Every codec, hardware decoding **Unsupported**, and `media.hardware-video-decoding.force-enabled`
 does not move it. The one control this does not have is a positive one: the
@@ -2201,11 +2201,11 @@ The codec line is read off the player's own "Stats for nerds" panel rather than
 off the preference, because the preference is what was asked and the panel is
 what was answered:
 
-![YouTube's stats panel, AV1 arm: Codecs av01.0.08M.08 (398) / opus (251), 0
-dropped of 1412, optimal 1280x720@60](video-decode/h264-overlay-av1.png)
+Screenshot `docs/video-decode/h264-overlay-av1.png`, not in the repository: YouTube's stats panel, AV1 arm: Codecs av01.0.08M.08 (398) / opus (251), 0
+dropped of 1412, optimal 1280x720@60.
 
-![the same panel, H.264 arm: Codecs avc1.4d4020 (298) / mp4a.40.2 (140), 0
-dropped of 2007, optimal 1280x720@60](video-decode/h264-overlay-avc1.png)
+Screenshot `docs/video-decode/h264-overlay-avc1.png`, not in the repository: the same panel, H.264 arm: Codecs avc1.4d4020 (298) / mp4a.40.2 (140), 0
+dropped of 2007, optimal 1280x720@60.
 
 **AV1 costs more CPU, and the margin is smaller and noisier than one resolution
 made it look.** Pooling the four windows of each arm: AV1 13.4, 23.4, 13.8, 15.3

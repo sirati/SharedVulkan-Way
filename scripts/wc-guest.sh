@@ -89,6 +89,7 @@
 # `~/.ssh/authorized_keys` is read by nobody, and a key appended there is
 # offered, refused, and looks exactly like a key problem. `WC_HOST`'s key goes
 # in the ProgramData file.
+. "$(dirname "${BASH_SOURCE[0]}")/site.sh"
 set -uo pipefail
 
 MODE="${1:-all}"
@@ -96,7 +97,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WIN_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/x86_64-pc-windows-gnu/debug"
 LINUX_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug"
 
-GUEST="${WC_GUEST:-<guest-user>@<guest-ip>}"
+GUEST="${WC_GUEST:-$SITE_GUEST}"
 # Exported as resolved: `wc_topology_declare cross-vm` (wc-topology.sh) checks
 # WC_GUEST, and a default that lived only in GUEST made it refuse cross-vm
 # unless the caller had happened to set the variable this line defaults.
@@ -106,9 +107,9 @@ export WC_GUEST="$GUEST"
 # other's binaries in the middle of its run — which presents as the other run
 # testing code nobody wrote.
 GUESTNAME="${WC_GUESTNAME:-wctest}"
-GUESTDIR="/c/Users/<guest-user>/$GUESTNAME"
-GUESTDIR_WIN="C:\\Users\\<guest-user>\\$GUESTNAME"
-APPDATA_WIN='C:\Users\<guest-user>\AppData\Local\waycompose'
+GUESTDIR="$SITE_GUEST_MSYS_HOME/$GUESTNAME"
+GUESTDIR_WIN="$SITE_GUEST_WIN_HOME\\$GUESTNAME"
+APPDATA_WIN="$SITE_GUEST_WIN_HOME\\AppData\\Local\\waycompose"
 AGENT="${WC_AGENT:-$HOME/.1password/agent.sock}"
 KEY="${WC_GUEST_KEY:-/tmp/wc-guest-key.pub}"
 PORT_BASE="${WC_PORT_BASE:-57271}"
@@ -118,7 +119,7 @@ HOST="${WC_HOST:-}"                                  # ssh target of the VM host
 HOST_DIR="${WC_HOST_DIR:-/tmp/wc-stage4}"            # where its binaries land
 SHARE="${WC_HOST_SHARE:-/srv/winshare/wc}"           # the export, as the host spells it
 SHARE_WIN="${WC_GUEST_SHARE:-Z:\\wc}"                # the export, as the guest spells it
-HOST_GUEST="${WC_HOST_GUEST:-<guest-user>@<guest-nat-ip>}"       # how the host reaches the guest
+HOST_GUEST="${WC_HOST_GUEST:-$SITE_GUEST_USER@$SITE_GUEST_NAT_IP}"       # how the host reaches the guest
 HOST_KEY="${WC_HOST_KEY:-\$HOME/.ssh/wc_guest}"      # and with which key (expanded there)
 HOST_WESTON="${WC_HOST_WESTON:-}"                    # dir holding weston-terminal, or ""
 
@@ -378,7 +379,7 @@ OUT_EXTRA=()
 # any of ours, and the symptom lands in *their* run rather than in this one.
 # What made the kill necessary was socket reuse, and $$-unique names plus
 # --timeout already deal with that.
-ssh "${GK[@]}" "$G" "rm -f /c/Users/<guest-user>/AppData/Local/waycompose/wg-s4-* 2>/dev/null; true" >/dev/null 2>&1
+ssh "${GK[@]}" "$G" "rm -f /c/Users/${SITE_GUEST_USER}/AppData/Local/waycompose/wg-s4-* 2>/dev/null; true" >/dev/null 2>&1
 
 # The export's own leftovers, and this one produced a wrong answer rather than a
 # missing one. The frame list is written into $SHARE by the guest and read back
@@ -473,7 +474,7 @@ chmod a+r '$RUN/locate.log' '$RUN/arena.plan' 2>/dev/null; true" | eval "$ROOTC"
 fi
 
 ssh "${GK[@]}" "$G" "export MSYS_NO_PATHCONV=1; cd $GDIR && ./probe-relay.exe $PORT \
-  'C:\\Users\\<guest-user>\\AppData\\Local\\waycompose\\$SOCK' --timeout $((SECS + 30))" >"$RUN/relay.out" 2>&1 &
+  'C:\\Users\\${SITE_GUEST_USER}\\AppData\\Local\\waycompose\\$SOCK' --timeout $((SECS + 30))" >"$RUN/relay.out" 2>&1 &
 RELAY=$!
 sleep 4
 
@@ -1617,7 +1618,7 @@ do_clean() {
   # deploy owns is scoped by `WC_GUESTNAME`; the AppData directory is not
   # scoped by anything, so it is left alone unless nobody else can be using it.
   local sockets=""
-  [ "$GUESTNAME" = wctest ] && sockets="rm -f /c/Users/<guest-user>/AppData/Local/waycompose/*.lock /c/Users/<guest-user>/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/<guest-user>/AppData/Local/waycompose 2>/dev/null;"
+  [ "$GUESTNAME" = wctest ] && sockets="rm -f /c/Users/${SITE_GUEST_USER}/AppData/Local/waycompose/*.lock /c/Users/${SITE_GUEST_USER}/AppData/Local/waycompose/wg-* 2>/dev/null; rmdir /c/Users/${SITE_GUEST_USER}/AppData/Local/waycompose 2>/dev/null;"
   kill_in_dir "$GUESTDIR_WIN"
   g "rm -rf $GUESTDIR; $sockets echo cleaned" 2>&1 | tail -1
   [ -n "$HOST" ] || return 0
