@@ -130,9 +130,15 @@ fn answer(file: &std::fs::File, f: &Found, state: macboot::State, msg: &str) -> 
 /// the validation `wc-session` gives a guest's request (§94): some of them
 /// came out of guest RAM.
 pub(crate) fn verb(session: &std::path::Path, words: &[&str]) -> Result<String, String> {
+    verb_env(session, words, &[])
+}
+
+/// [`verb`] with more environment: §107's session index for `up`.
+pub(crate) fn verb_env(session: &std::path::Path, words: &[&str], env: &[(&str, String)]) -> Result<String, String> {
     let out = Command::new("bash")
         .arg(session)
         .env("SSH_ORIGINAL_COMMAND", words.join(" "))
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .map_err(|e| format!("bash {}: {e}", session.display()))?;
     let text = String::from_utf8_lossy(&out.stdout).trim().replace('\n', "; ");

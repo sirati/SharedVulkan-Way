@@ -112,6 +112,11 @@ where
     ) {
         data_init.init(resource, ());
     }
+
+    // WAYCOMPOSE FORK (waycompose-design.md §107): only the sessions that asked.
+    fn can_view(client: wayland_server::Client, _global_data: &()) -> bool {
+        crate::wayland::nested_visible(&client)
+    }
 }
 
 impl<D> Dispatch<wp_viewporter::WpViewporter, (), D> for ViewporterState

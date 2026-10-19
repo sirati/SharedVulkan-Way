@@ -108,6 +108,10 @@ pub mod rings;
 pub mod macsvc;
 #[cfg(unix)]
 pub mod ctlfast;
+/// §107: the arena of one session of a compositor shared by several
+/// installations: windows of the BAR the compositor grants.
+#[cfg(unix)]
+pub mod barwin;
 /// §103.16: the session side of the multi-stream sound ring.
 #[cfg(unix)]
 pub mod sound;

@@ -50,7 +50,7 @@ where
 {
     fn request(
         _state: &mut D,
-        _client: &wayland_server::Client,
+        client: &wayland_server::Client,
         shm: &WlShm,
         request: wl_shm::Request,
         _data: &(),
@@ -68,6 +68,15 @@ where
         if size <= 0 {
             shm.post_error(Error::InvalidStride, "invalid wl_shm_pool size");
             return;
+        }
+
+        // WAYCOMPOSE FORK (waycompose-design.md §107): a compositor serving
+        // several sessions refuses a pool that names another session's memory.
+        if let Some(check) = super::pool_check() {
+            if let Err(why) = check(client, &fd) {
+                shm.post_error(Error::InvalidFd, why);
+                return;
+            }
         }
 
         let mmap_pool = match Pool::new(fd, NonZeroUsize::try_from(size as usize).unwrap()) {

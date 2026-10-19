@@ -119,6 +119,58 @@ pub fn boot_argv(cfg: &Config, id: &str, key_file: &str, control: &str) -> Vec<S
     a
 }
 
+/// §107. The named mutexes (`Local\…`) the user's one compositor and one GPU
+/// process hold for their lives: a launcher that finds one held uses that
+/// process instead of starting its own.
+pub const COMPOSITOR_MUTEX: &str = "waycompose-compositor";
+pub const GPU_MUTEX: &str = "waycompose-gpu";
+/// §107. How long the user's GPU process lives with no session leasing from it.
+pub const GPU_IDLE_SECS: u64 = 120;
+
+/// §107. The user's compositor, which serves every installation: §105's
+/// arguments with no session of its own, its socket for the launchers' `boot`
+/// lines, and the mutex that makes it the only one. The nested-compositor
+/// globals are asked for per session, in the boot (`boot_request`).
+pub fn shared_compositor_argv(cfg: &Config, log: &str, user_ctl: &str) -> Vec<String> {
+    let mut a = compositor_argv(cfg, "wl-shared", log);
+    a.retain(|x| x != "--nested-compositor-globals");
+    a.extend(["--user-control".into(), user_ctl.into(), "--singleton".into(), COMPOSITOR_MUTEX.into()]);
+    a
+}
+
+/// §107. The `boot` line for the user's compositor: tab-separated `key=value`
+/// (a Windows path may hold spaces and never a tab). The compositor's
+/// `session_svc::Config::parse_request` reads it; the test below pins the
+/// line both sides agree on.
+pub fn boot_request(cfg: &Config, id: &str, key_file: &str, control: &str, gpu: bool, relaunch: &str) -> String {
+    let mut f = vec![
+        "boot".to_string(),
+        format!("session={id}"),
+        format!("install={}", cfg.installation()),
+        format!("key={key_file}"),
+        format!("control={control}"),
+    ];
+    if gpu {
+        f.push("gpu=1".into());
+    }
+    if cfg.audio {
+        f.push(format!("audio={}", cfg.audio_volume));
+    }
+    if cfg.nested_globals {
+        f.push("nested=1".into());
+    }
+    f.push(format!("relaunch={relaunch}"));
+    f.join("\t")
+}
+
+/// §107. The user's GPU process: §97's pool, held by its mutex, ending after
+/// [`GPU_IDLE_SECS`] with no session rather than with any installation's.
+pub fn shared_gpu_argv(cfg: &Config) -> Vec<String> {
+    let mut a = gpu_argv(cfg);
+    a.extend(["--singleton".into(), GPU_MUTEX.into(), "--exit-idle".into(), GPU_IDLE_SECS.to_string()]);
+    a
+}
+
 /// §105. A request as the control ring takes it: the host puts this session's
 /// id after the verb itself, so the id the ssh path sent second is dropped.
 pub fn without_id(verb: &[String]) -> Vec<String> {
@@ -623,6 +675,33 @@ mod tests {
 
     fn cfg() -> Config {
         Config::parse(EXAMPLE).unwrap()
+    }
+
+    /// §107. The user's compositor: no session of its own, the user's socket,
+    /// the mutex; the nested globals go per session in the boot line.
+    #[test]
+    fn the_shared_compositor_boots_sessions_on_its_socket() {
+        let mut c = cfg();
+        c.nested_globals = true;
+        let a = shared_compositor_argv(&c, r"C:\L\wc-compositor.log", r"C:\L\wc-compositor.ctl");
+        let after = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].as_str());
+        assert_eq!(after("--user-control"), Some(r"C:\L\wc-compositor.ctl"));
+        assert_eq!(after("--singleton"), Some(COMPOSITOR_MUTEX));
+        assert!(!a.iter().any(|x| x.starts_with("--boot-") || x == "--control-socket" || x == "--nested-compositor-globals"), "{a:?}");
+        assert_eq!(after("--arena-ivshmem"), Some("0"));
+        // The line the compositor's `Config::parse_request` reads (its test
+        // pins the same shape): tabs between fields, spaces kept in paths.
+        let line = boot_request(&c, "wcl-42", r"C:\U\First Last\session.key", r"C:\L\wc-launch-wcl.ctl", true, r"C:\U\First Last\apps");
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f[0], "boot");
+        assert!(f.contains(&"session=wcl-42") && f.contains(&r"key=C:\U\First Last\session.key"));
+        assert!(f.contains(&"gpu=1") && f.contains(&"nested=1") && f.contains(&r"relaunch=C:\U\First Last\apps"));
+        assert!(f.iter().any(|x| x.starts_with("install=")));
+        assert!(!line.contains('\n'));
+        let g = shared_gpu_argv(&c);
+        let after = |k: &str| g.iter().position(|x| x == k).map(|i| g[i + 1].as_str());
+        assert_eq!(after("--singleton"), Some(GPU_MUTEX));
+        assert_eq!(after("--exit-idle"), Some("120"));
     }
 
     /// The hard requirement, as a test rather than as a paragraph. Every

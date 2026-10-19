@@ -62,6 +62,10 @@ pub struct PoolServe {
     pub idle: Duration,
     /// Concurrent sessions at most.
     pub max_sessions: u32,
+    /// §107: end the process after this long with no session. The GPU
+    /// process is the user's (every installation's sessions lease from it),
+    /// so nothing else ends it; `None` serves for ever, as before.
+    pub exit_idle: Option<Duration>,
 }
 
 /// Serve sessions from a pool over `boot`, for the life of the process.
@@ -124,6 +128,24 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
         },
     };
     let live = Arc::new(AtomicU32::new(0));
+    if let Some(after) = cfg.exit_idle {
+        let live = Arc::clone(&live);
+        std::thread::Builder::new()
+            .name("sv-pool-idle".into())
+            .spawn(move || {
+                let mut since = Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if live.load(Ordering::SeqCst) > 0 {
+                        since = Instant::now();
+                    } else if since.elapsed() >= after {
+                        eprintln!("[gpu] no session for {after:?}: this user's GPU process ends (§107); the next session starts another");
+                        std::process::exit(0);
+                    }
+                }
+            })
+            .map_err(|e| format!("{e}"))?;
+    }
 
     if let Some(port) = cfg.port {
         return serve_tcp(port, server, pool_nonce, cfg, set, live);

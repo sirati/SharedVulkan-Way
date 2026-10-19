@@ -815,6 +815,10 @@ pub struct ProvidedRegion {
     backing: Backing,
     origin: String,
     len: u64,
+    /// §107: the id the region's grantor gave it. A window of a shared BAR is
+    /// named by the compositor that cut it, not by this arena's counter: two
+    /// sessions' proxies would otherwise both call their second region 1.
+    id: Option<u32>,
 }
 
 impl ProvidedRegion {
@@ -832,7 +836,7 @@ impl ProvidedRegion {
             region.runs(),
             region.origin()
         );
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len })
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len, id: None })
     }
 
     /// IVSHMEM ARENA. BAR2 of the guest's ivshmem device, as the file QEMU
@@ -847,7 +851,39 @@ impl ProvidedRegion {
             plan.run_id,
             region.origin()
         );
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len })
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len, id: None })
+    }
+
+    /// §107: a window of a shared ivshmem BAR, `[offset, offset + len)` in
+    /// arena offsets, which the guest's compositor granted to this session as
+    /// region `id`. One run of the same file the BAR is, at the header page
+    /// plus `offset`, mapped as the BAR itself is. The header's run id is
+    /// checked first, so a window granted by a compositor that has since been
+    /// replaced is never mapped.
+    pub fn ivshmem_window(path: &Path, run: u64, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
+        let h = crate::guestram::ivshmem_header(path, run)?;
+        let end = offset.checked_add(len).ok_or_else(|| io::Error::other("a window that overflows"))?;
+        if len == 0 || !offset.is_multiple_of(4096) || !len.is_multiple_of(ARENA_GRANULARITY) || end > h.arena_len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a window at {offset}+{len} is not whole pages inside the {}-byte arena", h.arena_len()),
+            ));
+        }
+        let plan = crate::guestram::Plan {
+            id,
+            object: path.to_path_buf(),
+            len,
+            run_id: run,
+            outbound: None,
+            runs: vec![crate::guestram::Run {
+                arena_offset: 0,
+                file_offset: wc_handle::ivshmem::HEADER_BYTES + offset,
+                len,
+            }],
+        };
+        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let origin = format!("ivshmem BAR window {offset}+{len}, run 0x{run:016x}");
+        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
     }
 
     /// A region backed by a file on this machine.
@@ -873,6 +909,7 @@ impl ProvidedRegion {
             backing: Backing::File { _handle: handle, view },
             origin: name,
             len,
+            id: None,
         })
     }
 }
@@ -1135,6 +1172,32 @@ impl Arena {
     pub fn from_ivshmem(id: u32, path: &Path, run_id: u64) -> io::Result<Arena> {
         let plan = crate::guestram::Plan::from_ivshmem(id, path, run_id)?;
         Arena::from_plans(id, std::slice::from_ref(&plan), ProvidedRegion::ivshmem)
+    }
+
+    /// §107: the arena of one session of a compositor shared by several
+    /// installations. The BAR is mapped as [`Arena::from_ivshmem`] maps it, so
+    /// that the compositor's outbound window can be read, but **none of it is
+    /// this allocator's**: every pool goes in a window the compositor grants
+    /// (`source`, normally [`crate::barwin::BarWindows`]), and an empty window
+    /// goes back after `idle` frames.
+    pub fn from_ivshmem_shared(
+        id: u32,
+        path: &Path,
+        run_id: u64,
+        source: Box<dyn RegionSource>,
+        idle: u64,
+    ) -> io::Result<Arena> {
+        let mut arena = Arena::from_ivshmem(id, path, run_id)?;
+        {
+            let inner = Arc::get_mut(&mut arena.inner).expect("a new arena is shared with nobody");
+            let a = inner.arenas.get_mut().unwrap_or_else(|e| e.into_inner());
+            for s in &mut a.slots {
+                s.alloc.free = Vec::new();
+            }
+        }
+        arena.set_source(source)?;
+        arena.set_reclaim_idle(idle)?;
+        Ok(arena)
     }
 
     fn from_plans(
@@ -2052,7 +2115,16 @@ impl Arena {
             let Some(src) = src.as_mut() else {
                 return Ok(None);
             };
-            src.provide(id, min_len)?
+            match src.provide(id, min_len) {
+                Ok(p) => p,
+                // §107: the geometric step is a preference, `want` is the
+                // need. A source that has less than the step left (a shared
+                // BAR other installations hold most of) is asked once more for
+                // exactly what this pool needs, rather than refusing a pool
+                // that would fit.
+                Err(e) if e.kind() == io::ErrorKind::OutOfMemory && min_len > want => src.provide(id, want)?,
+                Err(e) => return Err(e),
+            }
         };
         let elapsed = started.elapsed().as_nanos() as u64;
         if provided.len < want {
@@ -2065,6 +2137,7 @@ impl Arena {
                 ),
             ));
         }
+        let id = provided.id.unwrap_or(id);
         let note = format!("region {id}: {} bytes from {}", provided.len, provided.origin);
         let mut a = self.alloc();
         Arena::adopt(

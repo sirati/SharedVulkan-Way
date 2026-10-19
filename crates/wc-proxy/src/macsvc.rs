@@ -39,6 +39,9 @@ pub struct Services {
     /// §103.16: the multi-stream sound ring (`--sound-pactl`, `--sound-server`,
     /// `--sound-dir`); takes the place of `audio`'s single stream.
     pub sound: Option<crate::sound::SoundCfg>,
+    /// §107: the session's index in a compositor shared by several
+    /// installations (`--session-index`), put into every claim; 0 for none.
+    pub index: u8,
 }
 
 static LAST_PING: AtomicU64 = AtomicU64::new(0);
@@ -50,7 +53,7 @@ fn now_ms() -> u64 {
 /// Start the services the arguments name. Each runs on a thread of its own.
 pub fn start(control: &Arc<Control>, svc: &Services) {
     if let (Some(session), Some(id)) = (svc.session.clone(), svc.id.clone()) {
-        match ByteChannel::claim(control, OWNER_CONTROL) {
+        match ByteChannel::claim(control, sv_transport::wlbytes::with_session(OWNER_CONTROL, svc.index)) {
             Ok(ch) => {
                 println!("[proxy] session control on ring slot {} (no ssh)", ch.slot());
                 let c = Arc::clone(control);
@@ -64,7 +67,7 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
         }
     }
     if let Some(cfg) = svc.sound.clone() {
-        match ByteChannel::claim(control, OWNER_AUDIO) {
+        match ByteChannel::claim(control, sv_transport::wlbytes::with_session(OWNER_AUDIO, svc.index)) {
             Ok(ch) => {
                 println!("[proxy] session sound on ring slot {} (§103.16, every device a stream)", ch.slot());
                 let c = Arc::clone(control);
@@ -73,7 +76,7 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
             Err(e) => println!("[proxy] no session sound ring: {e}"),
         }
     } else if let Some(sock) = svc.audio.clone() {
-        match ByteChannel::claim(control, OWNER_AUDIO) {
+        match ByteChannel::claim(control, sv_transport::wlbytes::with_session(OWNER_AUDIO, svc.index)) {
             Ok(ch) => {
                 println!("[proxy] session sound on ring slot {} (no ssh)", ch.slot());
                 let c = Arc::clone(control);
@@ -141,7 +144,7 @@ fn words_ok(line: &str) -> bool {
         && line.chars().all(|c| c.is_ascii_alphanumeric() || " +/=._-".contains(c))
 }
 
-fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String) {
+fn serve_control(control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: String) {
     let fast = crate::ctlfast::Fast::new(session.clone(), id.clone());
     fast.prefetch();
     let mut lines = Lines { ch, buf: Vec::new() };
@@ -161,6 +164,9 @@ fn serve_control(_control: Arc<Control>, ch: ByteChannel, session: PathBuf, id: 
             let reply: &[u8] = if line.starts_with("raw ") { b"ok-raw 0\n" } else { b"ok down\n" };
             let _ = write_all(&mut lines.ch, reply);
             std::thread::sleep(Duration::from_millis(50));
+            // §107: and the slot is closed, so a compositor shared by other
+            // sessions sees this one end now rather than when it stops answering.
+            let _ = control.kill_ring(lines.ch.slot());
             std::process::exit(0);
         }
         let (raw, line) = match line.strip_prefix("raw ") {

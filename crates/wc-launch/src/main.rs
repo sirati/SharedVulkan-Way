@@ -832,7 +832,11 @@ mod win {
         let _ = host_session(cfg, p, &s.id, &["down"]);
         // The compositor is the session's life. Ending it makes the owner run
         // its own teardown, which is the only code that knows what to unwind.
-        kill(s.comp_pid);
+        // §107: unless it is the user's shared compositor (pid 0 in the
+        // state), which other installations' windows are in; `down` is enough.
+        if s.comp_pid != 0 {
+            kill(s.comp_pid);
+        }
         Ok(())
     }
 
@@ -964,6 +968,9 @@ mod win {
         if cfg.debug_ssh_transport {
             return cold_ssh_debug(cfg, p, log, owner);
         }
+        if cfg.shared_compositor {
+            return cold_shared(cfg, p, log);
+        }
         let t = Instant::now();
         let id = plan::run_id(&cfg.session, std::process::id());
         let socket = format!("wl-{id}");
@@ -1061,7 +1068,175 @@ mod win {
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+    }
+
+    // ---------------------------------------- §107: the user's compositor ---
+
+    fn user_ctl(p: &Paths) -> std::path::PathBuf {
+        p.state_dir.join("wc-compositor.ctl")
+    }
+
+    fn shared_log(p: &Paths) -> std::path::PathBuf {
+        p.state_dir.join("wc-compositor.log")
+    }
+
+    /// Whether some process holds the named mutex `Local\NAME`.
+    fn held(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        let w = wide(&format!("Local\\{name}"));
+        // SAFETY: a NUL-terminated name; the handle is closed at once.
+        let h = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, w.as_ptr()) };
+        if h.is_null() {
+            return false;
+        }
+        // SAFETY: the handle just opened.
+        unsafe { CloseHandle(h) };
+        true
+    }
+
+    /// One line to the user's compositor and its one-line answer. `wait`
+    /// requests block until their session ends, so they get no timeout.
+    fn user_request(p: &Paths, line: &str, timeout: Option<Duration>) -> Result<String, String> {
+        use std::io::{Read, Write};
+        let mut s = wc_transport::connect(&user_ctl(p)).map_err(|e| format!("the user's compositor ({}): {e}", user_ctl(p).display()))?;
+        let _ = s.set_read_timeout(timeout);
+        s.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("the user's compositor: {e}"))?;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !buf.contains(&b'\n') {
+            match s.read(&mut tmp) {
+                Ok(0) => return Err("the compositor closed its socket".into()),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => return Err(format!("the user's compositor: {e}")),
+            }
+        }
+        let line = String::from_utf8_lossy(&buf).lines().next().unwrap_or("").to_string();
+        match line.strip_prefix("ok") {
+            Some(rest) => Ok(rest.trim().to_string()),
+            None => Err(line.strip_prefix("err").unwrap_or(&line).trim().to_string()),
+        }
+    }
+
+    /// §107: the user's one compositor, started if nobody holds its mutex.
+    /// Two launchers that both start one race for the mutex before either
+    /// maps the device; the loser exits and both use the winner's socket.
+    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<(), String> {
+        let t = Instant::now();
+        let mut kid: Option<Child> = None;
+        if held(plan::COMPOSITOR_MUTEX) {
+            log.say("compositor: the user's compositor is up; this installation's session joins it (§107)");
+        } else {
+            let argv = plan::shared_compositor_argv(cfg, &shared_log(p).to_string_lossy(), &user_ctl(p).to_string_lossy());
+            log.say(&format!("compositor: starting the user's compositor: {} {}", cfg.compositor, argv.join(" ")));
+            kid = Some(spawn_outliving(quiet(Command::new(&cfg.compositor).args(&argv)), CREATE_NO_WINDOW).map_err(|e| format!("{}: {e}", cfg.compositor))?);
+        }
+        loop {
+            if let Ok(r) = user_request(p, "ping", Some(Duration::from_secs(5))) {
+                log.say(&format!("compositor: {r} answers ({} ms)", t.elapsed().as_millis()));
+                return Ok(());
+            }
+            if let Some(k) = kid.as_mut()
+                && let Ok(Some(rc)) = k.try_wait()
+            {
+                // Lost the race (exit 5): another launcher's compositor holds
+                // the mutex; wait for its socket like everybody else.
+                kid = None;
+                log.say(&format!("compositor: the one this launcher started exited ({rc}); waiting for the user's"));
+            }
+            if t.elapsed() > Duration::from_secs(30) {
+                return Err(format!("the user's compositor never answered on {}", user_ctl(p).display()));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// §107: this installation's session in the user's compositor. No
+    /// compositor of its own and no GPU process of its own: the session is a
+    /// `boot` line, and what it is told is the host's answer to its record.
+    fn cold_shared(cfg: &Config, p: &Paths, log: &mut Log) -> Result<Session, String> {
+        let t = Instant::now();
+        let id = plan::run_id(&cfg.session, std::process::id());
+        let _ = std::fs::remove_file(&p.ctl);
+        let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
+        if !key.exists() {
+            return Err(format!(
+                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+                key.display()
+            ));
+        }
+        let comp_log = shared_log(p).display().to_string();
+        State { id: id.clone(), comp_log: comp_log.clone(), ..State::default() }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+        // The user's GPU process, first, so its driver opens while the
+        // session boots (§105.13); never this launcher's to end.
+        let gpu = cfg.gpu_sessions > 0;
+        if gpu {
+            if held(plan::GPU_MUTEX) {
+                log.say("gpu: the user's GPU process is up; this session leases from it");
+            } else {
+                spawn_shared_gpu(cfg, p, log);
+            }
+        }
+        ensure_compositor(cfg, p, log)?;
+        let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
+        log.say(&format!(
+            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
+            cfg.installation()
+        ));
+        let t_boot = Instant::now();
+        let said = user_request(p, &line, Some(Duration::from_secs(120))).map_err(|e| format!("the session did not start: {e}"))?;
+        log.say(&format!("up: {said} ({} ms)", t_boot.elapsed().as_millis()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !p.ctl.exists() {
+            if Instant::now() > deadline {
+                return Err("the compositor never opened this session's control socket (the host claimed no control ring)".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if !cfg.audio {
+            log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
+        }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, ready: true }
+            .write(&p.state)
+            .map_err(|e| format!("state file: {e}"))?;
+        log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
+        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into() })
+    }
+
+    /// §107: start a process that must outlive this launcher: the user's
+    /// compositor and GPU process serve other installations after this one's
+    /// session ends. Out of this launcher's job when the job allows it (a
+    /// task the scheduler started may be one that ends its whole tree), else
+    /// as an ordinary child, which is what every launcher before §107 did.
+    fn spawn_outliving(cmd: &mut Command, flags: u32) -> std::io::Result<Child> {
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        match cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {
+            Ok(c) => Ok(c),
+            Err(_) => cmd.creation_flags(flags).spawn(),
+        }
+    }
+
+    /// §107: the user's GPU process, held by its mutex and ending by itself
+    /// when no session has leased from it for a while.
+    fn spawn_shared_gpu(cfg: &Config, p: &Paths, log: &mut Log) {
+        let path = p.state_dir.join("wc-gpu.log");
+        let file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log.say(&format!("gpu: {}: {e}; no forwarded GPU", path.display()));
+                return;
+            }
+        };
+        let mut cmd = Command::new(&cfg.compositor);
+        cmd.args(plan::shared_gpu_argv(cfg)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(file));
+        match spawn_outliving(&mut cmd, CREATE_NO_WINDOW)
+        {
+            Ok(_) => log.say("gpu: started the user's GPU process (§107)"),
+            Err(e) => log.say(&format!("gpu: {}: {e}; no forwarded GPU", cfg.compositor)),
+        }
     }
 
     fn cold_ssh_debug(cfg: &Config, p: &Paths, log: &mut Log, _owner: &Owner) -> Result<Session, String> {
@@ -1234,12 +1409,14 @@ mod win {
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp, relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
     }
 
     pub struct Session {
         id: String,
-        comp: Child,
+        /// The compositor, when this launcher started it for its session
+        /// alone; `None` for §107's shared compositor, which is nobody's child.
+        comp: Option<Child>,
         /// The debug transport's relay and tunnel (§105); `None` on the product path.
         relay: Option<Child>,
         tunnel: Option<Child>,
@@ -1530,8 +1707,19 @@ mod win {
     /// the compositor is the session: when its window closes, or its own
     /// deadline passes, the rest has nothing left to carry.
     fn supervise(cfg: &Config, p: &Paths, log: &mut Log, mut s: Session) -> Result<(), String> {
-        let rc = s.comp.wait().map_err(|e| format!("waiting on the compositor: {e}"))?;
-        log.say(&format!("the compositor exited: {rc}"));
+        match s.comp.as_mut() {
+            Some(c) => {
+                let rc = c.wait().map_err(|e| format!("waiting on the compositor: {e}"))?;
+                log.say(&format!("the compositor exited: {rc}"));
+            }
+            // §107: the shared compositor says when this session has ended
+            // (its proxy ended, its last window closed a linger ago, or the
+            // compositor itself ended, which closes the socket).
+            None => match user_request(p, &format!("wait {}", s.id), None) {
+                Ok(why) => log.say(&format!("the session ended: {why}")),
+                Err(e) => log.say(&format!("the session ended with the compositor: {e}")),
+            },
+        }
         for c in s.relay.iter_mut().chain(s.tunnel.iter_mut()).chain(s.gpus.iter_mut()) {
             let _ = c.kill();
         }
@@ -1542,7 +1730,9 @@ mod win {
             let _ = ssh(cfg, p, &["down", &s.id]);
         }
         let _ = std::fs::remove_file(&p.state);
-        let _ = std::fs::remove_file(&s.comp_log);
+        if s.comp.is_some() {
+            let _ = std::fs::remove_file(&s.comp_log);
+        }
         log.say("session down");
         Ok(())
     }

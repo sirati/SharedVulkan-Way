@@ -1070,6 +1070,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         return std::process::ExitCode::from(code);
     }
 
+    // §107: one compositor per user. Claimed before anything is mapped, so a
+    // second one never clears the header of the first; the kernel lets go
+    // when this process ends, crash included.
+    let _singleton = match session_svc::claim_singleton() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("wc-compositor: {e}; not starting a second one");
+            eprintln!("wc-compositor: {e}");
+            return std::process::ExitCode::from(5);
+        }
+    };
+    session_svc::set_legacy_nested(args.nested_globals);
+
     // Arenas first, and before the socket exists. An arena that were attached
     // lazily — on the first `ArenaSlice` that named it — would make the first
     // client of a run take a different path from every later one, and would put
@@ -1200,7 +1213,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
         let rings_len = if bell_port.is_some() {
-            sv_transport::control::Geometry::for_wayland().control_size
+            ringlink::ivshmem_geometry().control_size
         } else {
             0
         };
@@ -1383,6 +1396,15 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                      outbound {}+{}",
                     h.run_id, h.generation, h.outbound.0, h.outbound.1
                 );
+                // §107: the sessions' arena regions, and the user's socket when
+                // this compositor serves every installation.
+                if let Err(e) = session_svc::init(id, args.exit_when_empty) {
+                    eprintln!("wc-compositor: {e}");
+                    return std::process::ExitCode::from(2);
+                }
+                if let Some(path) = session_svc::user_control() {
+                    session_svc::serve_user(path);
+                }
                 // §105: with --boot-*, ask the host's session service for the
                 // session through the header page, instead of the launcher
                 // asking over ssh.
@@ -1520,7 +1542,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty,
-                args.nested_globals);
+                args.nested_globals || session_svc::multi());
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -1848,11 +1870,17 @@ fn wayland_thread(
         // The ring's accept, first, so a connection that arrived between turns
         // is dispatched in the same turn as one that arrived on the socket.
         if let Some(rl) = ring_link.as_mut() {
-            for (slot, stream) in rl.accept() {
+            // §107: the clients of sessions that have ended go first.
+            for s in session_svc::doomed() {
+                let n = rl.drop_session(s);
+                println!("wc-compositor: session {s} ended: {n} connection(s) closed");
+                session_svc::dropped(s);
+            }
+            for (slot, stream, session) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
                 match display
                     .handle()
-                    .insert_client(stream, Arc::new(ClientState::new(index)))
+                    .insert_client(stream, Arc::new(ClientState::in_session(index, session)))
                 {
                     Ok(client) => {
                         // §79. **A ring slot is the proxy by construction**, so this
@@ -1870,8 +1898,9 @@ fn wayland_thread(
                         }
                         state.clients_seen += 1;
                         println!(
-                            "wc-compositor: client {index} accepted on ring slot {slot} \
-                             (no socket crossed the VM boundary, h in band)"
+                            "wc-compositor: client {index} accepted on ring slot {slot}{} \
+                             (no socket crossed the VM boundary, h in band)",
+                            if session == 0 { String::new() } else { format!(" of session {session}") }
                         );
                         let _ = std::io::stdout().flush();
                         // §72. **The same two calls as the socket accept, and
@@ -2003,6 +2032,7 @@ fn wayland_thread(
         // the slots whose connections both ends have finished go back.
         if let Some(rl) = ring_link.as_mut() {
             rl.pump();
+            session_svc::note_connections(&rl.connections_by_session());
             let recycled = rl.reap();
             if recycled > 0 && sv_transport::frametrace::enabled() {
                 sv_transport::frametrace::emit("wc.recycled", format_args!("slots={recycled}"));
@@ -2063,7 +2093,14 @@ fn wayland_thread(
             break;
         }
 
-        if let Some(w) = empty_watch.as_mut()
+        // §107: a shared compositor ends once its last session has, not when
+        // one installation's last window closes.
+        if session_svc::multi() && live == 0 && session_svc::shared_compositor_idle() {
+            println!("wc-compositor: no session has been up for the linger and no client is connected; ending");
+            code = 0;
+            break;
+        }
+        if let Some(w) = empty_watch.as_mut().filter(|_| !session_svc::multi())
             && w.tick(Instant::now(), state.live_toplevels(), state.toplevels > 0, state.clients_seen)
             && live == 0
         {

@@ -33826,3 +33826,232 @@ by unsetting `DBUS_SESSION_BUS_ADDRESS`. Under a user unit, libdbus then falls
 back to `$XDG_RUNTIME_DIR/bus`, and a second PulseAudio on that bus (here, an
 unrelated program's) still took the name `org.PulseAudio1`, so the session had
 no sound. The address now points nowhere.
+
+## 107. One compositor and one GPU process per user: every installation at once
+
+Written 2026-10-19, branch `windows-multi-install`, from master `a27ca12`
+(§105 merged). The brief: on Windows each ivshmem device (the arena at 0x1c
+with the Wayland rings in its tail, the GPU pool at 0x1d) allows **one
+mapping**, and each virtio-serial port one opener. Every installation
+(`wcivs` = "Firefox (Linux)", `wclinux` = "Windows 7 (Linux)", `wcmc` =
+Minecraft, …) started its own compositor and its own GPU process, so a click
+on a second installation while another ran failed (§93.4, §105.12). The
+user's requirement: any number of applications **and** installations at
+once, zero-copy, no new copies.
+
+### 107.1 Status in one paragraph
+
+**One compositor and one GPU process per Windows user serve every
+installation.** The first launcher of any installation starts the compositor
+(a named mutex, `Local\waycompose-compositor`, held by the compositor itself,
+makes it the only one), and every launcher asks it for its session with one
+`boot` line on the user's socket. A boot is §105's record in the header page,
+written one at a time, signed with *that* installation's key and carrying
+the session's **index**, which every ring claim of the session's proxy then
+carries in its owner id. The arena is no longer any proxy's: the compositor
+cuts the BAR into **regions** (whole MiB, ids from `0x100`, never reused in a
+run), grants them to a session's proxy on request over its own arena slot,
+and takes them back when a proxy gives one up or its session ends. A
+session ends when its proxy closes its control slot, goes silent for two
+probes, or its last client has been gone for the linger; its clients are
+disconnected, its slots closed and quarantined, its regions returned, and no
+other installation's window notices. Everything is run locally by
+`scripts/wc-multi-install.sh`: three installations at once, one proxy
+killed, the compositor killed and restarted, a wrong key, a BAR too small,
+all green (107.7). **Not run on the Windows guest** (no access from this
+branch): 107.9 is the list.
+
+### 107.2 What runs, per user and per installation
+
+| | before (§105) | after (§107) |
+|---|---|---|
+| compositor (`sv-guest wayland`) | one per installation, the owner launcher's child, mapping the device | **one per user**, `--user-control %LOCALAPPDATA%\waycompose\wc-compositor.ctl --singleton waycompose-compositor`, started by whichever launcher needs it first, ends `linger-secs` after its last session |
+| GPU process (`sv-guest gpu guest --pool`) | one per installation, killed with its session | **one per user**, `--singleton waycompose-gpu --exit-idle 120`, never killed by a launcher |
+| the launcher's control socket | `wc-launch-<name>.ctl`, served by its own compositor | the same path, served by the shared compositor for that session; the launcher's requests are unchanged |
+| the boot | `--boot-*` flags on the compositor's command line | a `boot` line on the user's socket (107.3); the flags still work for a one-session compositor |
+| the host | one session service, one hub (§99, §105) | unchanged: the same service and hub, one proxy per session |
+| the arena | the proxy's allocator owned the BAR | the compositor grants regions; each proxy allocates in its own |
+
+A launcher's `cold` (`wc-launch/src/main.rs`, `cold_shared`): the GPU process
+if the ini asks for one and nobody holds `Local\waycompose-gpu`; the
+compositor if nobody holds `Local\waycompose-compositor` (two launchers that
+both start one race for the mutex before either maps the device; the loser
+exits with code 5 and both use the winner); then `ping` until the user's
+socket answers, then the `boot` line, then the per-installation control
+socket. Both processes are started out of the launcher's job where the job
+allows it (`CREATE_BREAKAWAY_FROM_JOB`, falling back to an ordinary child),
+because they outlive the launcher that started them. The owner launcher then
+waits for `wait <session>` on the user's socket instead of for the
+compositor's exit; `--stop` sends `down` and no longer kills the compositor
+(the state file says `comp-pid=0`). `shared-compositor = off` in
+`wc-launch.ini` is §105's per-installation compositor, unchanged.
+
+### 107.3 Protocol changes
+
+**The boot record** (`wc_handle::macboot`, the single definition; the macOS
+writers use the same module). Additive only:
+
+```text
+  page 0, from macboot::OFF (1024)
+  116  session index, u32 (macboot::OFF_SESSION_INDEX = 1140): 0 = none,
+       1..=255 = a session of a shared compositor
+```
+
+Every writer before §107 left those bytes zero, so a one-session record is
+byte for byte what it was (`publish` = `publish_indexed(…, 0, …)`, a test
+asserts the pages equal). The MAC covers the index when it is not zero:
+`auth_message_indexed` appends `"wcboot-session-v1\0"` and the index byte to
+§105's message, so a record cannot be replayed under another session's
+index, and index 0 signs exactly §105's message. `Record` gained no field:
+literal constructors elsewhere keep compiling.
+
+**The host's service** (`sessiond_ivshmem`): verifies with
+`Auth::verifies_indexed(rec, index, key)`; dedupes the records it has served
+by **(run id, session id, sequence number)**, because every session of a
+shared compositor has that compositor's run id; passes a nonzero index to
+`wc-session up` as `WC_LAUNCH_SESSION_INDEX`. `wc-session up` keeps it in
+`$D/session.index` (0..255 or refused), and `proxy` adds `--session-index N`
+to wc-proxy. A one-session page is served exactly as before.
+
+**The user's socket** (`session_svc::serve_user`), one line each way:
+
+```text
+  boot<TAB>session=ID<TAB>install=NAME<TAB>key=PATH<TAB>control=PATH
+      [<TAB>gpu=1][<TAB>audio=VOL][<TAB>nested=1][<TAB>relaunch=DIR]
+                         -> ok located INDEX MESSAGE  |  err WHY
+  wait ID                -> ok ended WHY        (blocks until session ID ends)
+  sessions               -> ok INDEX:INSTALL:ID:STATE:MiB/REGIONS ...
+  ping                   -> ok compositor PID
+```
+
+Tabs because a Windows path may hold spaces and never a tab; an unknown field
+is refused, not ignored. Each boot takes the boot turn (one record in the
+page at a time), so simultaneous clicks are served one after the other:
+locally 0.2–0.95 s each.
+
+**Owner ids** (`sv_transport::wlbytes`): bits 48..56 of every owner id a
+proxy claims with are the session index (`with_session`, `session_of`);
+0 is the one-session proxy, so an older proxy's ids read as session 0. The
+service tag (top byte `0x5C`) and the low bits are unchanged.
+`OWNER_ARENA = SERVICE_TAG | 3` is new: the session's arena slot.
+
+**The arena slot** (proxy: `wc_proxy::barwin`; compositor:
+`session_svc::serve_arena`), one line each way:
+
+```text
+  grow MIN       -> ok ID OFFSET LEN   (OFFSET, LEN in arena offsets, whole MiB)
+                  | err WHY            (over the session's cap, or no run long enough)
+  release ID     -> ok | err WHY       (only the session's own region)
+  regions        -> ok COUNT BYTES
+```
+
+The proxy maps a granted window as one run of the BAR's file at
+`HEADER_BYTES + OFFSET` (`ProvidedRegion::ivshmem_window`, after checking the
+header's run id again) and names it `Descriptor::ArenaSlice { arena: ID, .. }`.
+The compositor registers it as arena `ID`, a view of its one BAR mapping at
+another base (`wc_handle::arena::attach_ivshmem_window`, no new mapping).
+The proxy's region 0 is still the whole BAR, mapped so the outbound window
+can be read, with an empty free list (`Arena::from_ivshmem_shared`). §34's
+growth runs unchanged on top: the geometric step is asked for first, and
+since §107 a refusal is followed by one request for exactly the pool's size.
+
+**The rings**: a shared compositor makes its ring region with
+`Geometry::for_wayland_shared()`, **64 slots** in 10 MiB instead of 32 in
+6 MiB (every session takes three service slots and three per connection; 31
+usable slots were two Firefox sessions). 64 is the doorbell token's limit.
+The proxy reads the geometry from the region, so the host side needs no flag.
+
+### 107.4 What is per session now
+
+* **Clients**: `ClientState::session`, from the ring slot's owner id. A claim
+  of a session that is not being served (ended, never booted, or index 0 on a
+  shared compositor) is closed, not accepted.
+* **Memory**: `wl_shm.create_pool` passes `session_svc::pool_check` (a hook
+  the vendored smithay calls, `set_pool_check`): a session's client may name
+  only an arena id granted to its own session (`slice_allowed`); arena 0, a
+  region given back, and another session's region are a protocol error.
+* **Nested-compositor globals** (§102): created always on a shared
+  compositor and offered only to the sessions whose boot said `nested=1`
+  (`smithay::wayland::set_nested_filter`, a `can_view` on the three globals).
+* **The relaunch directory** (§92): one per booted session, searched in
+  boot order (`taskbar::add_relaunch_dir`), removed with the session.
+* **The output** is the desktop's work area for every session: one desktop,
+  one monitor. A per-session `--output` was not needed by any installation.
+* **The linger**: a session whose last connection left `--exit-when-empty`
+  seconds ago is told `down` and ended; the compositor ends that long after
+  its last session.
+
+### 107.5 Fault isolation and bounds
+
+| what one session can do | bound |
+|---|---|
+| fill the arena | at most three quarters of the pool (`BarPool::cap`), so another installation always has room for its first region; exhaustion is `err` with the numbers, nobody else's region is touched |
+| take ring slots | at most 28 connections (`ringlink::SLOTS_PER_SESSION`); the 29th is closed |
+| flood its control ring | its own requests wait for their own turn (one `Ctl` per session) |
+| crash its proxy | the next `rtt` probe (every 2 s) and the one after time out: the session ends in about 5 s (measured 4.8–5.0 s), its clients are disconnected, its slots closed |
+| leave a proxy running after its session ended | its slots are closed and kept out of reuse for 10 s, longer than its 5 s lease; this process's own service threads stop writing first (the control channel is taken away under its lock, the sound ring ends when its slot is closed) |
+| keep a stale descriptor | region ids and session indices are never reused within a compositor's run |
+
+### 107.6 When the compositor dies
+
+The proxies lose their lease 5 s later (measured 5.08–5.12 s), the service
+runs `down` for each, and the next click starts a new compositor whose header
+has a new run id: every old record, region and slot is void because the host
+refuses a header with another run id, and a window granted by the old run is
+refused by `ivshmem_window`'s run check. The harness kills the compositor
+under three sessions and boots all three again in 0.73–0.80 s each.
+
+### 107.7 Measured (`scripts/wc-multi-install.sh`)
+
+One machine: a 128 MiB file for the BAR, socat for QEMU's port, the real hub,
+service, proxies and the Linux compositor; `weston-presentation-shm` as each
+session's client (it asks for one 15 MB pool).
+
+| leg | result |
+|---|---|
+| three boots at once | located in 615, 768, 949 ms (served one after the other); indices 1, 2, 3; the service took three records from one header page |
+| regions | each session: one region of 16 MiB (the growth step) at 0, 16 and 32 MiB; pool 116 MiB, cap 87 MiB per session |
+| every session's own control ring | `status` answered in each |
+| a wrong key for a fourth installation | `REFUSED … does not verify under its key`; the three others still answer |
+| session b's proxy killed (SIGKILL) | ended in 4.8–5.0 s ("its proxy is silent"); its 3 connections closed; its 16 MiB back; a and c answer; b booted again as index 5 and its first region landed where the dead one's was |
+| compositor killed under three sessions | each proxy `LEASE LOST` after 5.08–5.12 s, the service took all three down; a new compositor (new run id) booted all three again in 0.73–0.80 s and granted three regions |
+| `down` for all | each session ended within 4–5 s ("its proxy closed the control ring"); the compositor ended 3.96 s after the last (linger 4 s), all 116 MiB back |
+| a 44 MiB BAR (pool 32 MiB) | two sessions granted 16 MiB each; the third refused the 16 MiB step and then its 15 MB pool ("0 bytes free"); the other two still answer |
+
+Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
+
+### 107.8 Gates
+
+See the branch's report; the table is filled in when it merges.
+
+### 107.9 Not done, and what the Windows guest has to show
+
+* **Nothing of this has run on the Windows guest.** What it must show, in
+  order (each step's log is the launcher's `wc-launch-<name>.log`, the
+  compositor's `%LOCALAPPDATA%\waycompose\wc-compositor.log`, and on the host
+  `journalctl --user -u wc-sessiond`):
+  1. deploy two installations (e.g. `wcivs` and `wclinux`) with this build;
+     click the first: the log says `starting the user's compositor`, `up: located
+     <index>`; the compositor's log says `sessions: one compositor for every
+     installation` and `arena: session 1 granted region`;
+  2. click the second while the first's window is open: `the user's
+     compositor is up; this installation's session joins it`, a second index,
+     both windows live; `sessions` on the user socket lists both;
+  3. a third installation (`wcmc`), the same;
+  4. close all of one installation's windows: after `linger-secs` its session
+     ENDs and its regions come back, the others keep running;
+  5. kill the compositor in Task Manager with two installations up: within
+     ~5 s the host takes both sessions down; the next click starts a new
+     compositor and works;
+  6. the GPU: two installations with `gpu-sessions` > 0 lease from one
+     `sv-guest gpu` process; it survives one installation's end and ends
+     120 s after the last;
+  7. a launcher started by the scheduler (§91) that exits must not take the
+     shared compositor with it (the job breakaway).
+* **Sound** is per session: each session's sound ring opens its own waveOut
+  device; Windows mixes them. Not heard on the guest yet.
+* **Pins and jump lists** (§92) of two installations that publish the same
+  application id share one taskbar identity, as they did before.
+* **The output** is one for every session (107.4).
+* **A crashed proxy's windows close.** Its session's clients are disconnected
+  when the session ends, as a crashed compositor's always were.

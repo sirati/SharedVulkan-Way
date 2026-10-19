@@ -268,6 +268,7 @@ pub fn spawn(
     let kick = std::sync::Arc::new(ch.kicker(control).map_err(|e| e.to_string())?);
     let link = Link { tx, kick };
     let l2 = link.clone();
+    let ctl = std::sync::Arc::clone(control);
     std::thread::Builder::new()
         .name(format!("sound-ring-{}", ch.slot()))
         .spawn(move || {
@@ -275,6 +276,11 @@ pub fn spawn(
             let mut dec = Decoder::default();
             let mut buf = vec![0u8; 16 * 1024];
             let why = 'run: loop {
+                // §107: a ring this side's owner closed (its session ended) is
+                // not written again, whatever is still queued.
+                if ctl.ring_state(ch.slot()).ok() == Some(crate::control::RingState::Dead) {
+                    break 'run "the ring was closed".into();
+                }
                 // Before the queue is looked at: a send after this is a kick
                 // the wait below will not sleep through.
                 let epoch = match ch.wake_epoch() {
