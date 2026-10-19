@@ -51,6 +51,8 @@ pub struct PoolServe {
 
 /// Serve sessions from a pool over `boot` until the listener fails.
 pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>) -> Result<(), String> {
+    // §104.10 item 5: a GPU process that crashed left its sections behind.
+    crate::shared::sweep_stale_once();
     let pool_nonce = nonce();
     PoolHeader::new(&boot).map_err(|e| format!("the pool cannot hold its header: {e}"))?.publish(pool_nonce);
     // The reserve is exactly one session's start: its control region and its

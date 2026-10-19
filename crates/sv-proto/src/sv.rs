@@ -759,10 +759,147 @@ impl ImportSharedReply {
     }
 }
 
+/// `svFenceRecord` (§104.11): the name of this session's fence record, a
+/// small section the GPU side creates on first use and writes "every marked
+/// piece of work up to `n` has completed" into. Answered; asked once.
+pub const SV_FENCE_RECORD: u32 = PROTOCOL_BASE + 8;
+
+/// `svFenceMark` (§104.11): GPU work numbered `seq` is the work that last
+/// signalled `semaphore` on `queue`; once it has completed, the record says
+/// `completed >= seq`. `memory` is the shared allocation the work touched, or
+/// 0. Sent on the queue ring after the submit, never answered: the export of a
+/// sync fd returns at once.
+pub const SV_FENCE_MARK: u32 = PROTOCOL_BASE + 9;
+
+/// `svFenceWait` (§104.11): before the next command on this ring, wait until
+/// the work that wrote the shared allocation `memory` has completed: the work
+/// numbered `seq` in fence record `record` (another session's), and every
+/// marked work of any other session on the same section that the GPU side has
+/// already seen. Sent on the queue ring before a submit, never answered; the
+/// wait is the GPU side's, on its own thread.
+pub const SV_FENCE_WAIT: u32 = PROTOCOL_BASE + 10;
+
+/// A command whose sender does not wait for a reply.
+fn unanswered(out: &mut Vec<u8>, cmd_type: u32, size: usize) -> Result<Encoder<'_>> {
+    out.clear();
+    out.resize(size, 0);
+    let mut enc = Encoder::new(out);
+    CommandHeader { cmd_type, cmd_flags: 0, cmd_size: size as u32 }.encode(&mut enc)?;
+    Ok(enc)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FenceRecord;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FenceRecordReply {
+    /// `VK_SUCCESS`, or why there is no record (the dma-buf sync then falls
+    /// back to waiting on the app side).
+    pub result: i32,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FenceMark {
+    pub queue: u64,
+    pub semaphore: u64,
+    pub seq: u64,
+    pub memory: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FenceWait {
+    pub memory: u64,
+    pub seq: u64,
+    /// Empty: no other session's number to wait for, only the marks already
+    /// seen on the section.
+    pub record: String,
+}
+
+const FENCE_RECORD_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4;
+const FENCE_RECORD_REPLY_SIZE: usize = sv_wire::REPLY_HEADER_SIZE + 4 + 4 + SHARED_NAME_LEN;
+const FENCE_MARK_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 32;
+const FENCE_WAIT_SIZE: usize = sv_wire::COMMAND_HEADER_SIZE + 4 + 16 + 4 + SHARED_NAME_LEN;
+
+impl FenceRecord {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = command(out, SV_FENCE_RECORD, FENCE_RECORD_SIZE)?;
+        enc.u32(0)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<FenceRecord> {
+        let mut dec = expect_command(payload, SV_FENCE_RECORD)?;
+        let _pad = dec.u32()?;
+        Ok(FenceRecord)
+    }
+}
+
+impl FenceRecordReply {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = reply(out, SV_FENCE_RECORD, FENCE_RECORD_REPLY_SIZE)?;
+        enc.i32(self.result)?;
+        put_name(&mut enc, &self.name)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<FenceRecordReply> {
+        let mut dec = expect_reply(payload, SV_FENCE_RECORD)?;
+        let result = dec.i32()?;
+        let name = get_name(&mut dec)?;
+        Ok(FenceRecordReply { result, name })
+    }
+}
+
+impl FenceMark {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = unanswered(out, SV_FENCE_MARK, FENCE_MARK_SIZE)?;
+        enc.u32(0)?;
+        enc.u64(self.queue)?;
+        enc.u64(self.semaphore)?;
+        enc.u64(self.seq)?;
+        enc.u64(self.memory)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<FenceMark> {
+        let mut dec = expect_command(payload, SV_FENCE_MARK)?;
+        let _pad = dec.u32()?;
+        Ok(FenceMark { queue: dec.u64()?, semaphore: dec.u64()?, seq: dec.u64()?, memory: dec.u64()? })
+    }
+}
+
+impl FenceWait {
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
+        let mut enc = unanswered(out, SV_FENCE_WAIT, FENCE_WAIT_SIZE)?;
+        enc.u32(0)?;
+        enc.u64(self.memory)?;
+        enc.u64(self.seq)?;
+        put_name(&mut enc, &self.record)?;
+        enc.finish()?;
+        Ok(())
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<FenceWait> {
+        let mut dec = expect_command(payload, SV_FENCE_WAIT)?;
+        let _pad = dec.u32()?;
+        let memory = dec.u64()?;
+        let seq = dec.u64()?;
+        let record = get_name(&mut dec)?;
+        Ok(FenceWait { memory, seq, record })
+    }
+}
+
 /// A printable name for any opcode on a ring, ours or Vulkan's, for
 /// instruments (`WC_FRAME_TRACE`, docs/waycompose-design.md §88).
 pub fn opcode_name(op: u32) -> std::borrow::Cow<'static, str> {
     match op {
+        SV_FENCE_RECORD => "svFenceRecord".into(),
+        SV_FENCE_MARK => "svFenceMark".into(),
+        SV_FENCE_WAIT => "svFenceWait".into(),
         SV_ALLOC_SHARED => "svAllocShared".into(),
         SV_IMPORT_SHARED => "svImportShared".into(),
         SV_EXECUTE_COMMAND_BLOB => "svExecuteCommandBlob".into(),
@@ -909,10 +1046,33 @@ mod tests {
         let full = ImportShared { name: "b".repeat(SHARED_NAME_LEN), ..Default::default() };
         full.encode(&mut buf).unwrap();
         assert_eq!(ImportShared::decode(&buf).unwrap().name.len(), SHARED_NAME_LEN);
-        for op in [SV_ALLOC_SHARED, SV_IMPORT_SHARED] {
+        for op in [SV_ALLOC_SHARED, SV_IMPORT_SHARED, SV_FENCE_RECORD, SV_FENCE_MARK, SV_FENCE_WAIT] {
             assert!(crate::Opcode::from_u32(op).is_none());
             assert!(is_protocol(op));
         }
+    }
+
+    #[test]
+    fn the_fence_commands_round_trip_and_two_of_them_want_no_reply() {
+        let mut buf = Vec::new();
+        FenceRecord.encode(&mut buf).unwrap();
+        assert_eq!(FenceRecord::decode(&buf).unwrap(), FenceRecord);
+        assert!(wants_reply(&buf));
+        let r = FenceRecordReply { result: 0, name: "/dev/shm/sv-fence-1-0-00ff".into() };
+        r.encode(&mut buf).unwrap();
+        assert_eq!(FenceRecordReply::decode(&buf).unwrap(), r);
+
+        let m = FenceMark { queue: 7, semaphore: 9, seq: 1 << 40, memory: 11 };
+        m.encode(&mut buf).unwrap();
+        assert_eq!(FenceMark::decode(&buf).unwrap(), m);
+        assert_eq!(peek_opcode(&buf), Some(SV_FENCE_MARK));
+        assert!(!wants_reply(&buf));
+
+        let w = FenceWait { memory: 3, seq: 12, record: "Local\\sv-fence-412-1-ab".into() };
+        w.encode(&mut buf).unwrap();
+        assert_eq!(FenceWait::decode(&buf).unwrap(), w);
+        assert!(!wants_reply(&buf));
+        assert!(FenceMark::decode(&buf).is_err());
     }
 
     /// The one property that makes the two namespaces safe to share a `u32`.
