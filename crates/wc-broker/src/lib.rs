@@ -26,5 +26,6 @@ pub mod core;
 pub mod proto;
 pub mod server;
 pub mod sys;
+pub mod usermap;
 
 pub use core::{Allow, DeviceSpec, Peer, Release, User};

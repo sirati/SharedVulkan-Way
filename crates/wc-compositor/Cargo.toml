@@ -65,6 +65,9 @@ wc-handle = { workspace = true }
 # Only for `dup2`, so `--log` means the same thing on both platforms. std has
 # no safe way to point an existing file descriptor at a file.
 libc = "0.2"
+# §111.6/§111.10: `--boot-key broker:SOCK`, the record signed by the broker for
+# the caller (the Linux server role's stand-in for the guest's service).
+wc-broker = { workspace = true }
 
 # §103.7: the AppKit platform. The objc2 family (MIT) enables every framework
 # class by default; only the macOS build compiles any of it.

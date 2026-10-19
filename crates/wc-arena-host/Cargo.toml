@@ -43,6 +43,9 @@ sv-arena = { path = "../sv-arena" }
 arena-record = { path = "../arena-record" }
 # And our own side of the same twenty bytes.
 wc-handle = { path = "../wc-handle" }
+# §111.10: the client role's broker, embedded in the session service, and
+# the users.conf map.
+wc-broker = { path = "../wc-broker" }
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid`, for the session service's refusal to run as root and its key check.
