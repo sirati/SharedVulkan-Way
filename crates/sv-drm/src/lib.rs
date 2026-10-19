@@ -2,7 +2,7 @@
 //! in for dma-bufs (docs/waycompose-design.md §104).
 //!
 //! KWin's nested Wayland backend composites with OpenGL only when the host
-//! compositor names a render node it can open. testhost's host has no GPU and
+//! compositor names a render node it can open. The test host has no GPU and
 //! must not get a GPU driver; the GPU is the guest's, reached through
 //! `sv-icd`. So the node is a CUSE device served by `sv-drm serve`, it answers
 //! the handful of DRM ioctls Mesa's GBM, Zink and KWin issue, and the buffers
