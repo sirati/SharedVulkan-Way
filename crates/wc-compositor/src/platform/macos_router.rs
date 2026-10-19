@@ -468,6 +468,18 @@ impl R {
                     (h.on_request)(&section, &key);
                 }
             }
+            // §105: what macOS asked the face's application to open. Each
+            // becomes the request a Dock-menu page is (`open:<url>`); the
+            // launcher maps a file to its Linux path before it is sent.
+            FromFace::Open { urls } => {
+                self.last_request = Some((fid, Instant::now()));
+                let section = self.faces.get(&fid).map(|f| f.section.clone()).unwrap_or_default();
+                if let Some(h) = HOOKS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    for u in urls.iter().take(super::faceproto::MAX_OPEN) {
+                        (h.on_request)(&section, &format!("open:{u}"));
+                    }
+                }
+            }
             FromFace::Bye => {
                 if let Some(f) = self.faces.get_mut(&fid) {
                     f.bye = true;
