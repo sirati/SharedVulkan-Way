@@ -118,6 +118,7 @@ pub fn map_open_key(cfg: &Config, key: &str) -> Result<String, String> {
 /// ```text
 /// wc-launch --hostint-probe            devices, defaults, nodes, handlers
 /// wc-launch --render-test UID|- MS     play a 440 Hz tone to one device
+/// wc-launch --bundle-test DIR [--keep] a Linux bundle registers for .txt/.html/https
 /// wc-launch --capture-test UID|- MS    record from one (only in the host
 ///                                      bundle: turns a microphone on)
 /// ```
@@ -126,6 +127,17 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
     if args.iter().any(|a| a == "--hostint-probe") {
         print!("{}", wc_hostplat::mac::probe());
         return Some(ExitCode::SUCCESS);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bundle-test") {
+        let dir = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp/wc-bundle-test"));
+        let keep = args.iter().any(|a| a == "--keep");
+        return Some(match bundle_test(&dir, keep) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("wc-launch: {e}");
+                ExitCode::from(1)
+            }
+        });
     }
     let i = args.iter().position(|a| a == "--render-test" || a == "--capture-test")?;
     let render = args[i] == "--render-test";
@@ -141,6 +153,54 @@ pub fn cli(args: &[String]) -> Option<std::process::ExitCode> {
             ExitCode::from(1)
         }
     })
+}
+
+const LSREGISTER: &str =
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+
+/// Write a Linux application's bundle the way `--install` does (its
+/// Info.plist from `macbundle::info_plist_for`, a copy of this program),
+/// register it, ask Launch Services whether it now opens text/plain,
+/// text/html and https, check that the offers to Linux leave it out, then
+/// unregister and remove it (unless `keep`).
+fn bundle_test(dir: &Path, keep: bool) -> Result<(), String> {
+    use wc_hostplat::mac::handlers::{for_scheme, for_uti, handlers};
+    let section = "hostint-probe";
+    let bid = crate::macbundle::bundle_id(section);
+    let mimes: Vec<String> = ["text/plain", "text/html", "x-scheme-handler/https"].iter().map(|s| s.to_string()).collect();
+    let b = dir.join("HostInt Probe.app");
+    std::fs::create_dir_all(b.join("Contents/MacOS")).map_err(|e| e.to_string())?;
+    std::fs::write(b.join("Contents/Info.plist"), crate::macbundle::info_plist_for(section, "HostInt Probe", &mimes))
+        .map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    std::fs::copy(&exe, b.join("Contents/MacOS").join(EXECUTABLE)).map_err(|e| e.to_string())?;
+    let st = Command::new(LSREGISTER).arg("-f").arg(&b).status().map_err(|e| e.to_string())?;
+    println!("lsregister -f {}: {st}", b.display());
+    // Launch Services' database is updated asynchronously.
+    let mut ok = false;
+    for _ in 0..20 {
+        let txt = for_uti("public.plain-text").0;
+        let html = for_uti("public.html").0;
+        let https = for_scheme("https").0;
+        let has = |v: &[String]| v.iter().any(|x| x.eq_ignore_ascii_case(&bid));
+        if has(&txt) && has(&html) && has(&https) {
+            println!("public.plain-text handlers: {txt:?}");
+            println!("public.html handlers: {html:?}");
+            println!("https handlers: {https:?}");
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("{bid} opens .txt, .html and https per Launch Services: {ok}");
+    let offered = handlers().iter().any(|h| h.app.eq_ignore_ascii_case(&bid));
+    println!("{bid} offered to Linux as a host handler: {offered} (must be false)");
+    if !keep {
+        let _ = Command::new(LSREGISTER).arg("-u").arg(&b).status();
+        let _ = std::fs::remove_dir_all(&b);
+        println!("unregistered and removed {}", b.display());
+    }
+    if ok && !offered { Ok(()) } else { Err("the bundle test failed".into()) }
 }
 
 fn stream_test(render: bool, uid: Option<&str>, ms: u64) -> Result<String, String> {
