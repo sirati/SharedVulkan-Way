@@ -189,6 +189,32 @@ pub fn is_service(owner_id: u64) -> bool {
     owner_id >> 56 == SERVICE_TAG >> 56
 }
 
+/// §103.14: a proxy's feed for one of its clients (the icon feed; with
+/// [`CLIP_FEED`] too, the clipboard feed). The low bits are the ordinal of the
+/// client connection the feed serves. A feed is a Wayland client to the
+/// compositor, but not an application: it must not keep a session alive, and
+/// it has no business outliving the connection it serves (§107.12).
+pub const FEED_TAG: u64 = 1 << 40;
+/// With [`FEED_TAG`]: the clipboard feed rather than the icon feed.
+pub const CLIP_FEED: u64 = 1 << 39;
+
+/// The owner id of client `ordinal`'s icon feed (`clip`: its clipboard feed).
+pub fn feed_owner(ordinal: u64, clip: bool) -> u64 {
+    FEED_TAG | if clip { CLIP_FEED } else { 0 } | (ordinal & (CLIP_FEED - 1))
+}
+
+/// Whether an owner id names a proxy's feed rather than an application's
+/// connection.
+pub fn is_feed(owner_id: u64) -> bool {
+    !is_service(owner_id) && without_session(owner_id) & FEED_TAG != 0
+}
+
+/// The ordinal of the client connection an owner id belongs to: its own for
+/// a connection, the one it serves for a feed. Same session either way.
+pub fn client_ordinal(owner_id: u64) -> u64 {
+    without_session(owner_id) & (CLIP_FEED - 1)
+}
+
 /// §107: where a claim says which session of a shared compositor it is.
 /// Bits 48..56 of every owner id a proxy claims with: the session index the
 /// compositor gave the session in its boot record. Zero is "no index", the
@@ -229,6 +255,17 @@ mod session_tag_tests {
                 assert_eq!(is_service(o), is_service(base), "the service tag survives the index");
             }
         }
+        // §107.12: a feed knows whose it is, in any session.
+        for idx in [0u8, 3] {
+            let app = with_session(42, idx);
+            let icons = with_session(feed_owner(42, false), idx);
+            let clip = with_session(feed_owner(42, true), idx);
+            assert!(!is_feed(app) && is_feed(icons) && is_feed(clip));
+            assert_eq!([client_ordinal(app), client_ordinal(icons), client_ordinal(clip)], [42; 3]);
+            assert_eq!(session_of(clip), idx);
+        }
+        assert_eq!(feed_owner(3, true), (1 << 40) | (1 << 39) | 3, "the ids proxies have claimed with since §103.14");
+        assert!(!is_feed(OWNER_CONTROL) && !is_feed(with_session(OWNER_AUDIO, 2)));
         // An untagged id is session 0: every proxy from before §107.
         assert_eq!(session_of(OWNER_CONTROL), 0);
         assert_eq!(session_of(5), 0);

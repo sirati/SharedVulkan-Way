@@ -228,71 +228,90 @@ impl BellHub {
 /// for code written against a socket (the icon and clipboard feeds). One
 /// thread copies both ways and polls when idle; the feeds are small and rare.
 /// Returns this process's end.
+///
+/// **Every way out ends the ring** (§107.12). The compositor counts a feed as
+/// connected until it sees the end of the stream or the slot marked dead, so
+/// a bridge that returned on an error with neither kept its session alive for
+/// ever. The usual such error is `ECONNRESET`: a feed dropped while bytes the
+/// compositor had sent it were still unread, which is how Linux reports the
+/// close of a unix socket whose queue was not empty.
 pub fn bridge(control: Arc<Control>, owner: u64) -> io::Result<std::os::unix::net::UnixStream> {
     use std::io::{Read, Write};
     let mut ch = ByteChannel::claim(&control, owner).map_err(|e| io::Error::other(format!("ring claim: {e}")))?;
     let (mine, mut theirs) = std::os::unix::net::UnixStream::pair()?;
     theirs.set_nonblocking(true)?;
     std::thread::Builder::new().name(format!("ring-bridge-{}", ch.slot())).spawn(move || {
-        let _keep = control;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut to_ring: Vec<u8> = Vec::new();
-        let mut to_sock: Vec<u8> = Vec::new();
-        loop {
-            let mut idle = true;
-            if to_ring.is_empty() {
-                match theirs.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = ch.write_eof();
-                        return;
+        let mut copy = || {
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut to_ring: Vec<u8> = Vec::new();
+            let mut to_sock: Vec<u8> = Vec::new();
+            loop {
+                let mut idle = true;
+                if to_ring.is_empty() {
+                    match theirs.read(&mut buf) {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            to_ring.extend_from_slice(&buf[..n]);
+                            idle = false;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => return,
                     }
-                    Ok(n) => {
-                        to_ring.extend_from_slice(&buf[..n]);
-                        idle = false;
+                }
+                if !to_ring.is_empty() {
+                    match ch.write(&to_ring) {
+                        Ok(n) if n > 0 => {
+                            to_ring.drain(..n);
+                            idle = false;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => return,
+                }
+                if to_sock.is_empty() {
+                    match ch.read(&mut buf) {
+                        Ok(sv_transport::wlbytes::ReadOutcome::Bytes(n)) => {
+                            to_sock.extend_from_slice(&buf[..n]);
+                            idle = false;
+                        }
+                        Ok(sv_transport::wlbytes::ReadOutcome::Eof) => return,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+                if !to_sock.is_empty() {
+                    match theirs.write(&to_sock) {
+                        Ok(n) => {
+                            to_sock.drain(..n);
+                            idle = false;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => return,
+                    }
+                }
+                if idle {
+                    // The ring's side wakes this at once; the socket's is looked
+                    // at once a slice (the feeds are small and rare).
+                    let _ = ch.wait_readable(service_slice().min(std::time::Duration::from_millis(20)));
                 }
             }
-            if !to_ring.is_empty() {
-                match ch.write(&to_ring) {
-                    Ok(n) if n > 0 => {
-                        to_ring.drain(..n);
-                        idle = false;
-                    }
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-            }
-            if to_sock.is_empty() {
-                match ch.read(&mut buf) {
-                    Ok(sv_transport::wlbytes::ReadOutcome::Bytes(n)) => {
-                        to_sock.extend_from_slice(&buf[..n]);
-                        idle = false;
-                    }
-                    Ok(sv_transport::wlbytes::ReadOutcome::Eof) => return,
-                    Ok(_) => {}
-                    Err(_) => return,
-                }
-            }
-            if !to_sock.is_empty() {
-                match theirs.write(&to_sock) {
-                    Ok(n) => {
-                        to_sock.drain(..n);
-                        idle = false;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => return,
-                }
-            }
-            if idle {
-                // The ring's side wakes this at once; the socket's is looked
-                // at once a slice (the feeds are small and rare).
-                let _ = ch.wait_readable(service_slice().min(std::time::Duration::from_millis(20)));
-            }
-        }
+        };
+        copy();
+        end_ring(&mut ch, &control);
     })?;
     Ok(mine)
+}
+
+/// The bridge's last touch of its slot: the end of stream behind whatever was
+/// written (given a moment if the lane is full), then `DEAD`, which the
+/// compositor reads as the end even without the zero-length packet and which
+/// lets it recycle the slot (§89). The order `RingUpstream`'s drop uses.
+fn end_ring(ch: &mut ByteChannel, control: &Control) {
+    let t0 = std::time::Instant::now();
+    while matches!(ch.write_eof(), Ok(false)) && t0.elapsed() < std::time::Duration::from_millis(500) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let _ = ch.kill(control);
 }
 
 /// §103.14: attach the ring region a guest made in its own RAM, located by
@@ -483,6 +502,78 @@ mod tests {
         let mut host = host;
         let mut buf = [0u8; 16];
         assert_eq!(host.read(&mut buf).unwrap(), ReadOutcome::Bytes(5));
+    }
+
+    /// Waits up to two seconds for the compositor's end of a bridged feed to
+    /// see the end of the stream or the slot marked dead.
+    fn peer_sees_the_end(guest: &mut ByteChannel, owner: &Control) -> bool {
+        use sv_transport::control::RingState;
+        let t0 = std::time::Instant::now();
+        let mut buf = [0u8; 256];
+        while t0.elapsed() < std::time::Duration::from_secs(2) {
+            loop {
+                match guest.read(&mut buf) {
+                    Ok(ReadOutcome::Bytes(_)) => continue,
+                    Ok(ReadOutcome::Eof) => return true,
+                    _ => break,
+                }
+            }
+            if owner.ring_state(guest.slot()).ok() == Some(RingState::Dead) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// The 2026-10-19 wcns session that never ended (§107.12): a feed dropped
+    /// with bytes it had not read yet gets `ECONNRESET` on the bridge's side
+    /// of the pair, not end of file. The bridge used to return on that with
+    /// no word to the ring, so the compositor kept the feed as a connected
+    /// client for ever and the session's linger never started.
+    #[test]
+    fn a_feed_dropped_with_unread_bytes_still_ends_its_ring() {
+        let (owner, peer) = region();
+        let peer = Arc::new(peer);
+        let mine = bridge(Arc::clone(&peer), 7).unwrap();
+        let slot = (0..owner.layout().geometry.ring_slot_count)
+            .find(|&s| owner.ring_owner(s).ok() == Some(7))
+            .expect("the bridge claimed a slot");
+        let mut guest = ByteChannel::open(&owner, slot, Endpoint::Peer).unwrap();
+        guest.write(b"an offer the feed never reads").unwrap();
+        // Until the bridge has moved it into the socket pair.
+        let t0 = std::time::Instant::now();
+        let mut n: libc::c_int = 0;
+        while n == 0 && t0.elapsed() < std::time::Duration::from_secs(2) {
+            // SAFETY: a live socket and an int out-parameter.
+            unsafe { libc::ioctl(mine.as_raw_fd(), libc::FIONREAD, &mut n) };
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(n > 0, "the bridge forwarded the bytes");
+        drop(mine);
+        assert!(peer_sees_the_end(&mut guest, &owner), "the compositor still thinks the feed is connected");
+    }
+
+    /// And the orderly end gives the slot back: the bridge marks it dead as
+    /// its last touch, which is what lets the compositor recycle it (§89).
+    #[test]
+    fn a_feed_closed_cleanly_marks_its_slot_dead() {
+        use sv_transport::control::RingState;
+        let (owner, peer) = region();
+        let peer = Arc::new(peer);
+        let mine = bridge(Arc::clone(&peer), 9).unwrap();
+        let slot = (0..owner.layout().geometry.ring_slot_count)
+            .find(|&s| owner.ring_owner(s).ok() == Some(9))
+            .unwrap();
+        drop(mine);
+        let t0 = std::time::Instant::now();
+        while owner.ring_state(slot).ok() != Some(RingState::Dead) && t0.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(owner.ring_state(slot).ok(), Some(RingState::Dead));
+        let mut guest = ByteChannel::open(&owner, slot, Endpoint::Peer).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(guest.read(&mut buf).unwrap(), ReadOutcome::Eof, "and the end of stream came first");
     }
 
     /// A header without rings is `None`, not an error: the compositor said it

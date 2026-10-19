@@ -59,6 +59,10 @@ struct Link {
     slot: u32,
     /// §107: the session the proxy that claimed it said it is (0: none).
     session: u8,
+    /// The owner id it was claimed with: which client connection it is, or
+    /// which one it is a feed for (§107.12).
+    owner: u64,
+    accepted_at: std::time::Instant,
     channel: ByteChannel,
     /// Our end of the pair. smithay holds the other.
     local: wc_transport::Stream,
@@ -317,7 +321,7 @@ impl RingLink {
     /// ever accepted once; `seen` is not pruned, because a `Dead` slot is never
     /// reused within a generation (`Control::kill_ring`'s own rule) and so a
     /// slot number cannot come back meaning something else.
-    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream, u8)> {
+    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream, u8, bool)> {
         let live = match ByteChannel::live_connections(&self.control) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
@@ -365,6 +369,8 @@ impl RingLink {
             self.links.push(Link {
                 slot,
                 session,
+                owner,
+                accepted_at: std::time::Instant::now(),
                 channel,
                 local,
                 to_local: Vec::new(),
@@ -372,7 +378,7 @@ impl RingLink {
                 ring_eof: false,
                 dead: false,
             });
-            out.push((slot, theirs, session));
+            out.push((slot, theirs, session, sv_transport::wlbytes::is_feed(owner)));
         }
         out
     }
@@ -389,7 +395,42 @@ impl RingLink {
             link.pump();
         }
         self.links.retain(|l| !l.dead);
+        self.close_orphan_feeds();
     }
+
+    /// §107.12: a feed whose client connection has gone is closed, in case
+    /// its proxy did not close it. A proxy's icon and clipboard feeds live
+    /// and die with the connection they serve; one left behind is a Wayland
+    /// client that is no application, and it used to keep its session up for
+    /// ever (the wcns session of 2026-10-19, after the bridge returned on an
+    /// error without ending its ring). The proxy claims the connection before
+    /// its feeds, so a feed is given [`ORPHAN_GRACE`] to have been seen with
+    /// it before it counts as left behind.
+    fn close_orphan_feeds(&mut self) {
+        use sv_transport::wlbytes::{client_ordinal, is_feed};
+        let apps: Vec<(u8, u64)> = self
+            .links
+            .iter()
+            .filter(|l| !l.dead && !is_feed(l.owner))
+            .map(|l| (l.session, client_ordinal(l.owner)))
+            .collect();
+        for link in self.links.iter_mut().filter(|l| !l.dead && is_feed(l.owner)) {
+            if link.accepted_at.elapsed() < ORPHAN_GRACE || apps.contains(&(link.session, client_ordinal(link.owner))) {
+                continue;
+            }
+            println!(
+                "wc-compositor: ring slot {}: a feed of client connection {} outlived it; closed",
+                link.slot,
+                client_ordinal(link.owner)
+            );
+            let _ = link.channel.write_eof();
+            let _ = self.control.kill_ring(link.slot);
+            quarantine(link.slot);
+            link.dead = true;
+        }
+        self.links.retain(|l| !l.dead);
+    }
+
 
     /// §107: end every connection of `session`: its clients are disconnected
     /// (smithay sees their sockets close, after what they had already sent),
@@ -408,10 +449,11 @@ impl RingLink {
         n
     }
 
-    /// §107: how many connections each session has now.
+    /// §107: how many application connections each session has now. Feeds
+    /// are not counted (§107.12): they keep no session alive.
     pub fn connections_by_session(&self) -> std::collections::HashMap<u8, usize> {
         let mut m = std::collections::HashMap::new();
-        for l in self.links.iter().filter(|l| !l.dead) {
+        for l in self.links.iter().filter(|l| !l.dead && !sv_transport::wlbytes::is_feed(l.owner)) {
             *m.entry(l.session).or_insert(0) += 1;
         }
         m
@@ -944,6 +986,10 @@ pub const SLOTS_PER_SESSION: usize = 28;
 
 pub const QUARANTINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// §107.12: how long a feed may be connected without the client connection
+/// it serves before [`RingLink::pump`] closes it.
+pub const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 static QUARANTINED: std::sync::Mutex<Vec<(u32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
 
 /// Keep `slot` from being recycled for [`QUARANTINE`].
@@ -978,5 +1024,73 @@ mod quarantine_tests {
         super::quarantine(61);
         assert!(super::quarantined(61));
         assert!(!super::quarantined(62));
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    use sv_transport::wlbytes::{feed_owner, with_session};
+
+    fn link_pair() -> (RingLink, Control) {
+        let g = Geometry::small();
+        let r = Arc::new(sv_transport::region::SharedRegion::heap(g.control_size as usize).unwrap());
+        let ids = ProtocolIds::new(1, 2);
+        let owner = Control::create(Arc::clone(&r), g, ids, 1).unwrap();
+        (RingLink::over(Arc::new(owner)), Control::attach(r, ids).unwrap())
+    }
+
+    /// §107.12: a feed is a client to smithay and nothing more. It does not
+    /// count as a session's connection, and once the connection it serves
+    /// has gone it is closed even if its proxy never closes it -- the wcns
+    /// session of 2026-10-19 that stayed up past its linger for ever.
+    #[test]
+    fn a_feed_keeps_no_session_up_and_does_not_outlive_its_client() {
+        let (mut rl, proxy) = link_pair();
+        let app = ByteChannel::claim(&proxy, with_session(5, 0)).unwrap();
+        let icons = ByteChannel::claim(&proxy, with_session(feed_owner(5, false), 0)).unwrap();
+        let mut accepted = rl.accept();
+        accepted.sort_by_key(|a| a.0);
+        let feeds: Vec<bool> = accepted.iter().map(|a| a.3).collect();
+        assert_eq!(feeds, [false, true], "the connection, then its feed");
+        assert_eq!(rl.connections_by_session().get(&0), Some(&1), "the feed is not counted");
+
+        // The application goes, as a proxy ends a connection.
+        let mut app = app;
+        app.write_eof().unwrap();
+        app.kill(&proxy).unwrap();
+        rl.pump();
+        rl.reap();
+        assert_eq!(rl.connections_by_session().get(&0), None);
+        assert_eq!(rl.links.len(), 1, "the feed is still within its grace");
+
+        std::thread::sleep(ORPHAN_GRACE + std::time::Duration::from_millis(50));
+        rl.pump();
+        assert!(rl.links.is_empty(), "the feed outlived its client and was closed");
+        // And its proxy is told: the end of stream, and the slot marked dead.
+        let mut icons = icons;
+        let mut buf = [0u8; 8];
+        assert_eq!(icons.read(&mut buf).unwrap(), ReadOutcome::Eof);
+        assert_eq!(
+            proxy.ring_state(icons.slot()).unwrap(),
+            sv_transport::control::RingState::Dead
+        );
+    }
+
+    /// A feed whose client is still connected is left alone, however long.
+    #[test]
+    fn a_feed_of_a_live_client_stays() {
+        let (mut rl, proxy) = link_pair();
+        let _app = ByteChannel::claim(&proxy, with_session(8, 0)).unwrap();
+        let _clip = ByteChannel::claim(&proxy, with_session(feed_owner(8, true), 0)).unwrap();
+        // Another client's connection does not make this feed's.
+        let _other = ByteChannel::claim(&proxy, with_session(9, 0)).unwrap();
+        // Held: they are smithay's ends, and dropping one is a disconnect.
+        let accepted = rl.accept();
+        assert_eq!(accepted.len(), 3);
+        std::thread::sleep(ORPHAN_GRACE + std::time::Duration::from_millis(50));
+        rl.pump();
+        assert_eq!(rl.links.len(), 3);
+        assert_eq!(rl.connections_by_session().get(&0), Some(&2));
     }
 }
