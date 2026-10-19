@@ -71,7 +71,9 @@ cp "$INST/session.key" "$D/guest.key"
 ln -s "$INST" "$D/installs/wcns"
 
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
-export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_AUDIO=off WC_LAUNCH_SESSION_SECS=120
+export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=120
+PACAT=$(ls /nix/store/*-pulseaudio-1*/bin/pacat 2>/dev/null | head -1)
+[ -n "$PACAT" ] || export WC_LAUNCH_AUDIO=off
 
 start_port() {
   # QEMU's chardev and the guest's port. The guest's end is held for as long
@@ -104,7 +106,7 @@ start_compositor() {
     --arena-ivshmem 0 --arena-outbound 0:1048576 --wayland-rings "$port" \
     --socket "wcns$$-$tag" --in-band --timeout 120 \
     --boot-session "wcns-$$-$tag" --boot-install wcns --boot-key "$key" \
-    --control-socket "$D/ctl-$tag.sock" >"$D/comp-$tag.log" 2>&1 &
+    --control-socket "$D/ctl-$tag.sock" --session-audio 0 >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
 }
 wait_line() { # FILE REGEX SECS
@@ -145,6 +147,13 @@ T0=$(date +%s%N); for _ in $(seq 1 20); do request a "raw status" >/dev/null; do
 ok "control round trip (status verb included) $(( (T1 - T0) / 20000000 )) ms mean"
 ps -o pid=,comm= --ppid "$SVC" | grep -qw ssh && bad "the service has an ssh child"
 pgrep -u "$(id -u)" -f "ssh .*wc-session" >/dev/null && bad "an ssh wc-session process exists"
+
+if [ -n "$PACAT" ]; then
+  say "leg 1b: the sound ring (§103.16): a tone into the session's default sink reaches the guest side"
+  wait_line "$PLOG" 'session sound: sink' 10 && ok "proxy: $(grep -m1 -o 'session sound: sink.*' "$PLOG" | cut -c1-90)" || bad "no sink for the guest's output stream"
+  head -c 384000 /dev/urandom | PULSE_SERVER="unix:$D/run/wcns-$$-a/xdg/pulse/native" timeout 10 "$PACAT" --rate=48000 --channels=2 --format=s16le >/dev/null 2>&1
+  wait_line "$D/comp-a.log" 'bytes through the sound ring' 10 && ok "guest side: $(grep -o 'audio: [0-9]* bytes through the sound ring' "$D/comp-a.log" | tail -1)" || bad "no sound reached the guest side: $(grep audio: "$D/comp-a.log" | tail -3)"
+fi
 
 say "leg 2: the hub restarted under the session; requests still answered (the rescan)"
 kill "$HUB"; wait "$HUB" 2>/dev/null

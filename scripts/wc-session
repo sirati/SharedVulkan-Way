@@ -1117,9 +1117,13 @@ proxy)
         BELLUSE=poll
         [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
         RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
-        if [ "$(cut -d: -f1 "$D/audio.state" 2>/dev/null | cut -d' ' -f1)" = pulse ]; then
-          RINGARGS="$RINGARGS $(printf -- '--audio-socket %q' "$D/audio.sock")"
-        fi
+        # §103.16 on Windows (§105): the sound ring, the guest's default output
+        # a pipe sink on the session's server, paced by the guest's credit.
+        PACTL=$(pulse_bin pactl 2>/dev/null)
+        case "$(cut -d' ' -f1 "$D/audio.state" 2>/dev/null)" in
+          pulse) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:$D/xdg/pulse/native" "$D")" ;;
+          system) [ -n "$PACTL" ] && RINGARGS="$RINGARGS $(printf -- '--sound-pactl %q --sound-server %q --sound-dir %q' "$PACTL" "unix:/run/user/$UID_/pulse/native" "$D")" ;;
+        esac
       fi
       printf 'exec %q %s --socket wl-proxy --runtime-dir %q --transport arena --arena-ivshmem %q --arena-run %q --arena-id 0 %s --copy %s %s --pace-frames 60 --accept-timeout %s --timeout %s >%q 2>&1\n' \
         "$BIN/wc-proxy" "$UPARGS" "$D" "$ARENA" "$RUN" "$RINGARGS" "$COPY_SCOPE" "$DMABUF_ARGS" \

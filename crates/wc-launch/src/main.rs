@@ -260,6 +260,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // §105: the installation's own name from here on, whatever the command
+    // line said (a shortcut carries none). The log, the state file and the
+    // control socket are the session's, and every launcher of the
+    // installation, and its jump-list thread, must find the same ones: the
+    // first guest run had the click on `wcl`'s and the jump list on `wcns`'s.
+    let (p, mut log) = if cfg.session != session {
+        match paths(&cfg.session) {
+            Ok(q) => {
+                let l = Log::open(&q.log);
+                (q, l)
+            }
+            Err(_) => (p, log),
+        }
+    } else {
+        (p, log)
+    };
     let rc = run(&args, &cfg, &p, &mut log, t0);
     match rc {
         Ok(()) => ExitCode::SUCCESS,

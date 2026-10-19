@@ -316,8 +316,8 @@ fn services(cfg: Config) {
         let _ = std::thread::Builder::new().name("session-sound".into()).spawn(move || {
             match service_channel(OWNER_AUDIO, Duration::from_secs(20)) {
                 Some(ch) => {
-                    say(&format!("audio: playing the session's sound from ring slot {} (no ssh)", ch.slot()));
-                    play(RingReader(ch), vol);
+                    say(&format!("audio: the session's sound ring is slot {} (§103.16, no ssh)", ch.slot()));
+                    sound_ring(ch, vol);
                 }
                 None => say("audio: the host opened no sound ring; no sound this session"),
             }
@@ -327,37 +327,78 @@ fn services(cfg: Config) {
     // here, on a thread of its own, with `service_channel(owner, wait)`.
 }
 
+/// The output stream this side announces: Windows' default output device.
+const OUT_STREAM: u16 = 1;
+/// What the session may send before the device has played anything: 80 ms.
+/// With the device's own queue (`audio::BUFFERS`) that bounds the delay.
+const CREDIT_INIT: u32 = 4 * 3840;
+
+/// §103.16 on Windows: this side is the **device side** of the sound ring.
+/// It announces one output stream, Windows' default device, which the host's
+/// proxy makes the session's default sink (a pipe sink, paced by this side's
+/// credit), plays what arrives through waveOut, and gives the credit back as
+/// it hands each chunk to the device. Nothing is dropped on the way: a device
+/// that is slow slows the sink. Microphones are not announced (see §105).
+fn sound_ring(ch: ByteChannel, vol: u8) {
+    use sv_transport::soundring::{Dir, Msg, VERSION};
+    let Some(control) = crate::ringlink::shared_control() else { return };
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let tx = Mutex::new(Some(tx));
+    let link = sv_transport::soundring::spawn(
+        ch,
+        &control,
+        crate::ringlink::ring_wait_slice(),
+        move |m, _link| match m {
+            Msg::Data { stream: OUT_STREAM, pcm } => {
+                if let Some(t) = tx.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    let _ = t.send(pcm);
+                }
+            }
+            Msg::Hello { version } => say(&format!("audio: the session side speaks sound ring version {version}")),
+            _ => {}
+        },
+        |why| say(&format!("audio: the sound ring ended: {why}")),
+    );
+    let link = match link {
+        Ok(l) => l,
+        Err(e) => {
+            say(&format!("audio: the sound ring: {e}; no sound this session"));
+            return;
+        }
+    };
+    link.send(Msg::Hello { version: VERSION });
+    link.send(Msg::Device { stream: OUT_STREAM, dir: Dir::Out, channels: 2, rate: 48_000, name: "Windows (default output)".into() });
+    link.send(Msg::Default { stream: OUT_STREAM, dir: Dir::Out });
+    link.send(Msg::Credit { stream: OUT_STREAM, bytes: CREDIT_INIT });
+    play(rx, vol, link);
+}
+
 #[cfg(windows)]
-fn play(src: RingReader, vol: u8) {
-    match crate::audio::play(src, vol, |l| say(l)) {
+fn play(rx: std::sync::mpsc::Receiver<Vec<u8>>, vol: u8, link: sv_transport::soundring::Link) {
+    use sv_transport::soundring::Msg;
+    let credit = |n: u32| {
+        link.send(Msg::Credit { stream: OUT_STREAM, bytes: n });
+    };
+    match crate::audio::play_credited(rx, vol, |l| say(l), credit) {
         Ok(st) => say(&st.line()),
         Err(e) => say(&format!("audio: {e}; no sound this session")),
     }
 }
 
 #[cfg(not(windows))]
-fn play(mut src: RingReader, _vol: u8) {
-    // Only the test fixture runs this off Windows: drain, so the host's
-    // monitor is not held up.
-    let mut buf = vec![0u8; 3840];
-    while matches!(src.read(&mut buf), Ok(n) if n > 0) {}
-}
-
-/// The sound channel as a `Read`, for the player.
-struct RingReader(ByteChannel);
-
-impl Read for RingReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            match self.0.read(buf) {
-                Ok(ReadOutcome::Bytes(n)) => return Ok(n),
-                Ok(ReadOutcome::Eof) => return Ok(0),
-                Ok(_) => {
-                    let _ = self.0.wait_readable(crate::ringlink::ring_wait_slice());
-                }
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
-            }
+fn play(rx: std::sync::mpsc::Receiver<Vec<u8>>, _vol: u8, link: sv_transport::soundring::Link) {
+    // Off Windows only the test fixture runs this: consume and credit, as a
+    // device would, so the session's sink keeps moving.
+    let mut total = 0u64;
+    while let Ok(b) = rx.recv() {
+        if total == 0 {
+            say("audio: the first bytes arrived on the sound ring");
         }
+        total += b.len() as u64;
+        if total / 192_000 != (total - b.len() as u64) / 192_000 {
+            say(&format!("audio: {total} bytes through the sound ring"));
+        }
+        link.send(sv_transport::soundring::Msg::Credit { stream: OUT_STREAM, bytes: b.len() as u32 });
     }
 }
 
