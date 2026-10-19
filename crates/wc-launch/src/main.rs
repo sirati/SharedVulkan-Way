@@ -42,6 +42,9 @@ mod ico;
 mod macbundle;
 #[cfg(target_os = "macos")]
 mod mac;
+// §105: the macOS main process's host integration.
+#[cfg(target_os = "macos")]
+mod mac_hostint;
 #[cfg(target_os = "macos")]
 mod audio_mac;
 mod plan;
