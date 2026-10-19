@@ -155,9 +155,31 @@ pub fn open_file_object(name: &str, size: u64) -> io::Result<OwnedObject> {
     Ok(OwnedObject { file, path, unlink_on_drop: false })
 }
 
+/// On macOS a section the GPU side made is a POSIX shared memory object
+/// (`/sv…`, one leading slash and no other), opened by that name (§103.19).
+#[cfg(target_os = "macos")]
+fn open_object(name: &str) -> io::Result<File> {
+    if name.len() > 1 && name.starts_with('/') && !name[1..].contains('/') {
+        let c = std::ffi::CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: a NUL-terminated name, read-only, no creation.
+        let fd = unsafe { libc::shm_open(c.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a descriptor shm_open just returned, owned from here.
+        return Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) });
+    }
+    File::open(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_object(name: &str) -> io::Result<File> {
+    File::open(name)
+}
+
 /// Open the object by name and map it read-only.
 pub fn map_section(name: &str, len: usize) -> io::Result<MappedView> {
-    let file = File::open(name)?;
+    let file = open_object(name)?;
     if len == 0 {
         return Ok(MappedView { ptr: std::ptr::NonNull::<u8>::dangling().as_ptr(), len: 0 });
     }

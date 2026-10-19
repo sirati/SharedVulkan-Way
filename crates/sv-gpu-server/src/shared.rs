@@ -90,7 +90,7 @@ fn hex(b: &[u8]) -> String {
 
 /// A mapped view of a section this process holds.
 pub struct View {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     region: sv_transport::region::SharedRegion,
     #[cfg(windows)]
     section: sv_transport::winshm::Section,
@@ -100,7 +100,7 @@ pub struct View {
 // The pointer is handed to the driver as an import, never dereferenced here
 // (I3 of `SharedRegion`).
 impl View {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn base(&self) -> *mut u8 {
         // SAFETY: as above.
         unsafe { self.region.base_ptr() }
@@ -112,7 +112,7 @@ impl View {
         unsafe { self.section.base_ptr() }
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn base(&self) -> *mut u8 {
         std::ptr::null_mut()
     }
@@ -154,6 +154,64 @@ fn open_section(name: &str, len: u64) -> Result<View, String> {
     Ok(View { region, len })
 }
 
+/// §103.19: on the Mac a section is a POSIX shared memory object, which the
+/// compositor (another process of the same user) opens by its name.
+#[cfg(target_os = "macos")]
+fn shm_fd(name: &str, create: bool) -> Result<std::fs::File, String> {
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(name).map_err(|_| format!("{name:?} has a NUL"))?;
+    let flags = if create { libc::O_RDWR | libc::O_CREAT | libc::O_EXCL } else { libc::O_RDWR };
+    // SAFETY: a NUL-terminated name; the mode is read only with O_CREAT.
+    let fd = unsafe { libc::shm_open(c.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(format!("shm_open {name}: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: a descriptor shm_open just returned, owned from here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The name goes with the last view this process holds; mappings, the
+/// compositor's included, keep the memory until they end.
+fn remove_name(name: &str) {
+    #[cfg(target_os = "linux")]
+    let _ = std::fs::remove_file(name);
+    #[cfg(target_os = "macos")]
+    if let Ok(c) = std::ffi::CString::new(name) {
+        // SAFETY: a NUL-terminated name.
+        unsafe { libc::shm_unlink(c.as_ptr()) };
+    }
+    let _ = name;
+}
+
+#[cfg(target_os = "macos")]
+fn create_section(name: &str, len: u64) -> Result<View, String> {
+    use std::os::fd::AsFd;
+    let f = shm_fd(name, true)?;
+    let made = (|| {
+        f.set_len(len).map_err(|e| format!("ftruncate {name}: {e}"))?;
+        let region = sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)
+            .map_err(|e| format!("mmap {name}: {e:?}"))?;
+        Ok(View { region, len })
+    })();
+    if made.is_err() {
+        remove_name(name);
+    }
+    made
+}
+
+#[cfg(target_os = "macos")]
+fn open_section(name: &str, len: u64) -> Result<View, String> {
+    use std::os::fd::AsFd;
+    let f = shm_fd(name, false)?;
+    let have = f.metadata().map_err(|e| format!("stat {name}: {e}"))?.len();
+    if have < len {
+        return Err(format!("{name} is {have} bytes, not {len}"));
+    }
+    let region = sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)
+        .map_err(|e| format!("mmap {name}: {e:?}"))?;
+    Ok(View { region, len })
+}
+
 #[cfg(windows)]
 fn create_section(name: &str, len: u64) -> Result<View, String> {
     let section = sv_transport::winshm::Section::create(name, len).map_err(|e| format!("{name}: {e:?}"))?;
@@ -166,12 +224,12 @@ fn open_section(name: &str, len: u64) -> Result<View, String> {
     Ok(View { section, len })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn create_section(_name: &str, _len: u64) -> Result<View, String> {
     Err("no shared sections on this system".into())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn open_section(_name: &str, _len: u64) -> Result<View, String> {
     Err("no shared sections on this system".into())
 }
@@ -182,6 +240,9 @@ fn new_name() -> String {
     let pid = std::process::id();
     if cfg!(windows) {
         format!("Local\\sv-shared-{pid}-{n}-{tag}")
+    } else if cfg!(target_os = "macos") {
+        // A shared memory object's name: at most 31 bytes on macOS.
+        format!("/sv{pid:x}.{n:x}.{}", &tag[..12])
     } else {
         format!("/dev/shm/sv-shared-{pid}-{n}-{tag}")
     }
@@ -217,11 +278,9 @@ impl Drop for SharedImport {
         // The name goes with the last view this process holds. The compositor's
         // own mapping survives it, as any unlinked file's does; on Windows the
         // section lives while any handle to it does.
-        #[cfg(target_os = "linux")]
         if last {
-            let _ = std::fs::remove_file(&self.name);
+            remove_name(&self.name);
         }
-        let _ = last;
     }
 }
 
@@ -303,8 +362,7 @@ pub fn alloc(driver: &Driver, size: u64, image: Option<vk::Image>) -> Result<(Sh
     let view = create_section(&name, len)?;
     if !(view.base() as u64).is_multiple_of(a) {
         drop(view);
-        #[cfg(target_os = "linux")]
-        let _ = std::fs::remove_file(&name);
+        remove_name(&name);
         return Err(format!("the view of {name} is not {a}-byte aligned"));
     }
     let nonce = random_bytes::<16>();
@@ -374,11 +432,9 @@ fn release_ref(name: &str) {
         }
         None => false,
     });
-    #[cfg(target_os = "linux")]
     if last {
-        let _ = std::fs::remove_file(name);
+        remove_name(name);
     }
-    let _ = last;
 }
 
 /// Whether the driver says an image of this description can be bound to
