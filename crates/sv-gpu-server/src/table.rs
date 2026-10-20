@@ -157,6 +157,9 @@ pub struct Objects {
     /// `VkDeviceMemory` is also in `memory`; it is freed before the entry here
     /// is dropped, which unmaps the view.
     pub shared_imports: HashMap<u64, crate::shared::SharedImport>,
+    /// Dedicated imports for ordinary LINEAR images. Memory frees first.
+    #[cfg(target_os = "macos")]
+    pub native_image_imports: HashMap<u64, crate::iosurface::Section>,
     /// Driver images created to be bound to a shared section, whose
     /// requirements offer the application type 0 only.
     pub shared_images: std::collections::HashSet<u64>,
@@ -182,6 +185,8 @@ impl Objects {
             pool: None,
             video_views: Default::default(),
             shared_imports: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            native_image_imports: HashMap::new(),
             shared_images: Default::default(),
             fence: None,
         }
@@ -525,6 +530,8 @@ impl Objects {
         // Their imports were freed with the other memory above; the views go
         // now (§104).
         self.shared_imports.clear();
+        #[cfg(target_os = "macos")]
+        self.native_image_imports.clear();
         self.shared_images.clear();
         Ok(n)
     }

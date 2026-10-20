@@ -846,6 +846,29 @@ impl GpuHost for GpuServer {
             p::PNextLink::VkMemoryDedicatedAllocateInfo(d) => Some((d.image.0, d.buffer.0)),
             _ => None,
         });
+        #[cfg(target_os = "macos")]
+        if let Some((image, 0)) = dedicated {
+            let image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
+            if crate::iosurface::is_shared(image) {
+                let requirements = unsafe { self.d().get_image_memory_requirements(image) };
+                if info.memory_type_index != 0 || info.allocation_size < requirements.size || a.p_memory.is_none() {
+                    return Ok(p::VkAllocateMemoryReply { result: fail(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY), p_memory: None });
+                }
+                return match crate::iosurface::make(&self.shared.driver, image, requirements.memory_type_bits) {
+                    Ok((section, memory, _)) => {
+                        let id = a.p_memory.expect("checked").0;
+                        let mut objects = self.shared.objects();
+                        objects.insert_memory(id, crate::table::MemoryRange { memory, base: 0, len: info.allocation_size });
+                        objects.native_image_imports.insert(id, section);
+                        Ok(p::VkAllocateMemoryReply { result: OK, p_memory: a.p_memory })
+                    }
+                    Err(why) => {
+                        eprintln!("sv-gpu-server: dedicated native IOSurface allocation refused: {why}");
+                        Ok(p::VkAllocateMemoryReply { result: fail(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY), p_memory: None })
+                    }
+                };
+            }
+        }
         let mut ded = vk::MemoryDedicatedAllocateInfo::default();
         if let Some((image, buffer)) = dedicated {
             ded.image = vk::Image::from_raw(self.map_handle(HandleType::VkImage, image)?);
@@ -995,6 +1018,13 @@ impl GpuHost for GpuServer {
         // driver said such an image can be bound to imported host memory: on
         // the guest a driver fault can stop the VM, so a combination the
         // driver did not promise is never sent.
+        #[cfg(target_os = "macos")]
+        let native_iosurface = match crate::metal_image::prepare_create(info) {
+            Ok(yes) => yes,
+            Err(()) => return Ok(p::VkCreateImageReply { result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), p_image: None }),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let native_iosurface = false;
         let host_alloc = info.p_next.iter_mut().find_map(|l| match l {
             p::PNextLink::VkExternalMemoryImageCreateInfo(x) if x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0 => {
                 Some(x)
@@ -1015,6 +1045,12 @@ impl GpuHost for GpuServer {
                     result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED),
                     p_image: None,
                 });
+            }
+            true
+        } else if native_iosurface {
+            if let Err(why) = crate::shared::image_importable(&self.shared.driver, info) {
+                eprintln!("sv-gpu-server: native IOSurface image refused: {why}");
+                return Ok(p::VkCreateImageReply { result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), p_image: None });
             }
             true
         } else {
@@ -1327,6 +1363,8 @@ impl GpuHost for GpuServer {
             o.shared_imports.remove(&id)
         };
         drop(section);
+        #[cfg(target_os = "macos")]
+        self.shared.objects().native_image_imports.remove(&id);
         Ok(())
     }
 
@@ -1724,7 +1762,7 @@ impl GpuHost for GpuServer {
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
         #[cfg(target_os = "macos")]
         {
-            props.linear_tiling_features.0 |= crate::iosurface::linear_extra(vk::Format::from_raw(a.format.0)) as u32;
+            props.linear_tiling_features.0 |= crate::iosurface::linear_extra(&self.shared.driver, vk::Format::from_raw(a.format.0)) as u32;
         }
         Ok(p::VkGetPhysicalDeviceFormatPropertiesReply { p_format_properties: Some(Box::new(props)) })
     }
@@ -1754,7 +1792,7 @@ impl GpuHost for GpuServer {
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
         #[cfg(target_os = "macos")]
         {
-            let extra = crate::iosurface::linear_extra(vk::Format::from_raw(a.format.0));
+            let extra = crate::iosurface::linear_extra(&self.shared.driver, vk::Format::from_raw(a.format.0));
             props.format_properties.linear_tiling_features.0 |= extra as u32;
             for l in &mut props.p_next {
                 if let p::PNextLink::VkFormatProperties3(x) = l {
@@ -1763,6 +1801,22 @@ impl GpuHost for GpuServer {
             }
         }
         Ok(p::VkGetPhysicalDeviceFormatProperties2Reply { p_format_properties: Some(Box::new(props)) })
+    }
+
+    fn get_physical_device_image_format_properties(
+        &mut self, a: p::VkGetPhysicalDeviceImageFormatPropertiesArgs,
+    ) -> WireResult<p::VkGetPhysicalDeviceImageFormatPropertiesReply> {
+        let mut info = p::VkPhysicalDeviceImageFormatInfo2::default();
+        info.format = a.format; info.type_ = a.type_; info.tiling = a.tiling;
+        info.usage = a.usage; info.flags = a.flags;
+        let reply = self.get_physical_device_image_format_properties2(p::VkGetPhysicalDeviceImageFormatProperties2Args {
+            physical_device: a.physical_device, p_image_format_info: Some(Box::new(info)),
+            p_image_format_properties: Some(Box::new(p::VkImageFormatProperties2::default())),
+        })?;
+        Ok(p::VkGetPhysicalDeviceImageFormatPropertiesReply {
+            result: reply.result,
+            p_image_format_properties: reply.p_image_format_properties.map(|x| Box::new(x.image_format_properties)),
+        })
     }
 
     /// Forwarded, except that on a Mac a shared image's question (the
@@ -1775,6 +1829,9 @@ impl GpuHost for GpuServer {
     ) -> WireResult<p::VkGetPhysicalDeviceImageFormatProperties2Reply> {
         let mut a = a;
         a.physical_device.0 = self.map_handle(HandleType::VkPhysicalDevice, a.physical_device.0)?;
+        #[cfg(target_os = "macos")]
+        let caller_external_output = a.p_image_format_properties.as_ref().is_some_and(|out|
+            out.p_next.iter().any(|l| matches!(l, p::PNextLink::VkExternalImageFormatProperties(_))));
         let shared = crate::shared::shared_handle_type();
         let mut asked = false;
         if let Some(info) = &mut a.p_image_format_info {
@@ -1788,10 +1845,25 @@ impl GpuHost for GpuServer {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        let native_iosurface = match a.p_image_format_info.as_mut().map(|info| crate::metal_image::prepare_query(info)) {
+            Some(Ok(yes)) => yes,
+            Some(Err(())) => return Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply {
+                result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), ..Default::default()
+            }),
+            None => false,
+        };
         let Some(f) = self.fns().vk_get_physical_device_image_format_properties2 else {
             self.note_missing("vkGetPhysicalDeviceImageFormatProperties2");
             return Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply { result: p::VkResult(-3), ..Default::default() });
         };
+        #[cfg(target_os = "macos")]
+        if native_iosurface {
+            let out = a.p_image_format_properties.get_or_insert_with(|| Box::new(p::VkImageFormatProperties2::default()));
+            if !out.p_next.iter().any(|l| matches!(l, p::PNextLink::VkExternalImageFormatProperties(_))) {
+                out.p_next.push(p::PNextLink::VkExternalImageFormatProperties(Box::new(p::VkExternalImageFormatProperties::default())));
+            }
+        }
         let mut pool = sv_gpu_entry::Raise::default();
         let info: *const sv_gpu_entry::VkPhysicalDeviceImageFormatInfo2 = match &a.p_image_format_info {
             Some(x) => {
@@ -1822,6 +1894,19 @@ impl GpuHost for GpuServer {
         // SAFETY: the driver filled `out` and its chain, which `pool` owns.
         let mut props = unsafe { sv_gpu_entry::lower_full_vk_image_format_properties2(&raw const out) }
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        #[cfg(target_os = "macos")]
+        if native_iosurface {
+            let importable = props.p_next.iter().any(|l| matches!(l,
+                p::PNextLink::VkExternalImageFormatProperties(x)
+                    if crate::metal_image::importable(x.external_memory_properties.external_memory_features.0,
+                        x.external_memory_properties.compatible_handle_types.0, props.image_format_properties.sample_counts.0)));
+            if r.0 == 0 && !importable {
+                return Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply {
+                    result: fail(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), ..Default::default()
+                });
+            }
+            crate::metal_image::constrain_properties(&mut props.image_format_properties);
+        }
         if asked {
             // The caller asked about host allocations: answer in its terms.
             for l in &mut props.p_next {
@@ -1831,6 +1916,10 @@ impl GpuHost for GpuServer {
                     m.export_from_imported_handle_types.0 = 0;
                 }
             }
+        }
+        #[cfg(target_os = "macos")]
+        if !caller_external_output {
+            props.p_next.retain(|l| !matches!(l, p::PNextLink::VkExternalImageFormatProperties(_)));
         }
         Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply {
             result: p::VkResult(r.0),
@@ -1845,6 +1934,10 @@ impl GpuHost for GpuServer {
         let mut a = a;
         // §103.19: a shared image is measured as the Mac makes it.
         if let Some(ci) = a.p_info.as_mut().and_then(|i| i.p_create_info.as_mut()) {
+            #[cfg(target_os = "macos")]
+            if crate::metal_image::prepare_create(ci).is_err() {
+                return Err(WireError::UnknownCommand { opcode: 0 });
+            }
             for l in &mut ci.p_next {
                 if let p::PNextLink::VkExternalMemoryImageCreateInfo(x) = l
                     && x.handle_types.0 & crate::shared::HOST_ALLOCATION != 0

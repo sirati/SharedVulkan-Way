@@ -670,6 +670,9 @@ pub fn image_importable(driver: &Driver, ci: &sv_proto::VkImageCreateInfo) -> Re
     if feats & IMPORTABLE == 0 {
         return Err(format!("the driver cannot import host memory for it (features {feats:#x})"));
     }
+    if eprops.external_memory_properties.compatible_handle_types.as_raw() & shared_handle_type() == 0 {
+        return Err("the driver does not list the requested import handle as compatible".into());
+    }
     // An IOSurface texture is always a dedicated import (§103.19).
     if feats & DEDICATED_ONLY != 0 && shared_handle_type() == HOST_ALLOCATION {
         return Err("the driver wants a dedicated import, which a host pointer is not".into());

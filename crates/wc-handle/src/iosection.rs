@@ -117,6 +117,7 @@ unsafe extern "C" {
     fn IOSurfaceUnlock(s: *mut c_void, flags: u32, seed: *mut u32) -> i32;
     fn IOSurfaceGetBytesPerElement(s: *mut c_void) -> usize;
     fn IOSurfaceGetPlaneCount(s: *mut c_void) -> usize;
+    fn IOSurfaceGetPixelFormat(s: *mut c_void) -> u32;
     fn IOSurfaceGetWidth(s: *mut c_void) -> usize;
     fn IOSurfaceGetBaseAddress(s: *mut c_void) -> *mut c_void;
     fn IOSurfaceGetBytesPerRow(s: *mut c_void) -> usize;
@@ -229,6 +230,12 @@ impl Surface {
         unsafe { CFRetain(self.0) };
         Surface(self.0)
     }
+
+    pub fn width(&self) -> usize { unsafe { IOSurfaceGetWidth(self.0) } }
+    pub fn height(&self) -> usize { unsafe { IOSurfaceGetHeight(self.0) } }
+    pub fn bytes_per_element(&self) -> usize { unsafe { IOSurfaceGetBytesPerElement(self.0) } }
+    pub fn pixel_format(&self) -> u32 { unsafe { IOSurfaceGetPixelFormat(self.0) } }
+    pub fn plane_count(&self) -> usize { unsafe { IOSurfaceGetPlaneCount(self.0) } }
 
     pub fn bytes_per_row(&self) -> usize {
         // SAFETY: a live surface.

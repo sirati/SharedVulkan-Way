@@ -64,21 +64,33 @@ pub fn format_ok(f: vk::Format) -> bool {
     formats(f).is_some()
 }
 
-/// What a LINEAR image of an IOSurface format can do here beyond the
-/// driver's own `linearTilingFeatures`: every exported (dma-buf) image is
-/// LINEAR and is made on an imported IOSurface texture, which the driver lets
-/// an application render, blend and blit into (KosmicKrisp with the MTLTEXTURE
-/// import). `VkFormatFeatureFlags` and `VkFormatFeatureFlags2` agree on these
-/// bits.
-pub fn linear_extra(format: vk::Format) -> u64 {
-    if !format_ok(format) {
-        return 0;
+/// Extra LINEAR features are offered only when the real driver accepts the
+/// corresponding dedicated MTLTexture import and its optimal format has them.
+pub fn linear_extra(driver: &crate::driver::Driver, format: vk::Format) -> u64 {
+    if !format_ok(format) { return 0; }
+    let native = unsafe { driver.instance.get_physical_device_format_properties(driver.pd, format) };
+    let mut extra = 0;
+    for (feature, usage) in [
+        (vk::FormatFeatureFlags::COLOR_ATTACHMENT, vk::ImageUsageFlags::COLOR_ATTACHMENT),
+        (vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND, vk::ImageUsageFlags::COLOR_ATTACHMENT),
+        (vk::FormatFeatureFlags::BLIT_DST, vk::ImageUsageFlags::TRANSFER_DST),
+    ] {
+        if !native.optimal_tiling_features.contains(feature) { continue; }
+        let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::from_raw(MTLTEXTURE));
+        let info = vk::PhysicalDeviceImageFormatInfo2::default().format(format).ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::LINEAR).usage(usage).push_next(&mut ext);
+        let mut external = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external);
+        let accepted = unsafe { driver.instance.get_physical_device_image_format_properties2(driver.pd, &info, &mut props) }.is_ok();
+        let samples = props.image_format_properties.sample_counts.as_raw();
+        if accepted && crate::metal_image::importable(
+            external.external_memory_properties.external_memory_features.as_raw(),
+            external.external_memory_properties.compatible_handle_types.as_raw(), samples) {
+            extra |= u64::from(feature.as_raw());
+        }
     }
-    (vk::FormatFeatureFlags::COLOR_ATTACHMENT
-        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
-        | vk::FormatFeatureFlags::BLIT_DST)
-        .as_raw()
-        .into()
+    extra
 }
 
 /// `vkCreateImage` made a shared image.
@@ -108,6 +120,8 @@ unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> *mut c_void;
     fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 /// One Metal texture on an IOSurface, owned (+1).
@@ -152,6 +166,11 @@ pub(crate) unsafe fn texture_plane(surface: *mut c_void, mtl_format: u64,
     // SAFETY: messages to Metal classes and objects with the argument types
     // their selectors take; every object here is autoreleased or owned.
     unsafe {
+        struct Pool(*mut c_void);
+        impl Drop for Pool { fn drop(&mut self) { unsafe { objc_autoreleasePoolPop(self.0) }; } }
+        // Rust CLI workers have no implicit AppKit autorelease pool. The
+        // descriptor is autoreleased; the returned new texture owns its +1.
+        let _pool = Pool(objc_autoreleasePoolPush());
         let class = objc_getClass(c"MTLTextureDescriptor".as_ptr());
         let make: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u64, bool) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
@@ -195,6 +214,7 @@ pub fn make(driver: &crate::driver::Driver, image: vk::Image, want: u32) -> Resu
     // SAFETY: the driver's own LINEAR image, not yet bound; its layout is
     // what the app side is told, so the surface is made to match it.
     let layout = unsafe { driver.device.get_image_subresource_layout(image, sub) };
+    if layout.offset != 0 { return Err(format!("IOSurface image layout requires unsupported offset {}", layout.offset)); }
     let pitch = u32::try_from(layout.row_pitch).map_err(|_| "row pitch beyond 4 GiB")?;
     let surface = Surface::new(sh.width, sh.height, 4, pitch, fourcc)
         .ok_or_else(|| format!("IOSurfaceCreate {}x{} failed", sh.width, sh.height))?;
@@ -205,7 +225,17 @@ pub fn make(driver: &crate::driver::Driver, image: vk::Image, want: u32) -> Resu
 /// GPU process importing a token it made: `svImportShared`).
 pub fn import(driver: &crate::driver::Driver, image: vk::Image, want: u32, surface: Surface) -> Result<(Section, vk::DeviceMemory, u32), String> {
     let sh = shapes(|s| s.get(&ash::vk::Handle::as_raw(image)).copied()).ok_or("not a shared image this process made")?;
-    let (mtl, _) = formats(sh.format).ok_or_else(|| format!("format {:?} cannot be an IOSurface", sh.format))?;
+    let (mtl, fourcc) = formats(sh.format).ok_or_else(|| format!("format {:?} cannot be an IOSurface", sh.format))?;
+    let sub = vk::ImageSubresource { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, array_layer: 0 };
+    let layout = unsafe { driver.device.get_image_subresource_layout(image, sub) };
+    let actual = crate::metal_image::SurfaceLayout {
+        width: surface.width(), height: surface.height(), pitch: surface.bytes_per_row(),
+        bpp: surface.bytes_per_element(), fourcc: surface.pixel_format(), allocation: surface.len(),
+    };
+    if surface.plane_count() != 0 || !crate::metal_image::compatible_surface(actual, sh.width, sh.height,
+        fourcc, layout.offset, layout.row_pitch, layout.size) {
+        return Err(format!("IOSurface geometry/format does not match target image layout {layout:?}"));
+    }
     let texture = texture(&surface, mtl, sh.width, sh.height).ok_or("newTextureWithDescriptor:iosurface:plane: failed")?;
     // SAFETY: the driver's own image.
     let req = unsafe { driver.device.get_image_memory_requirements(image) };
