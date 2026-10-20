@@ -1510,6 +1510,17 @@ fn emit_forward_command(
         }
     };
 
+    let recorded_prepare = if wire.is_recorded {
+        let buffer = wire.inputs.iter().find(|field| {
+            matches!(&field.shape, Shape::Scalar(Scalar::Handle(name)) if name == "VkCommandBuffer")
+        }).ok_or_else(|| format!("{}: recorded command has no command buffer", c.name))?;
+        let buffer = naming::ident(&buffer.rust_name);
+        quote! {
+            if !__h.bypass_optional_overrides() {
+                __h.prepare_recorded_command(#cname, a.#buffer.0)?;
+            }
+        }
+    } else { quote!() };
     let optional_override = if crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str()) {
         let hook = format_ident!("override_{}", naming::command_method(&c.name));
         quote! {
@@ -1523,6 +1534,7 @@ fn emit_forward_command(
         let #mut_a a = a;
         let __h = &mut self.0;
         #optional_override
+        #recorded_prepare
         #unbind_block
         #pre
         #unpoison
@@ -1662,6 +1674,9 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
         /// not named here is generated (docs/design.md §7.2, pass 12).
         pub trait GpuHost {
             fn bypass_optional_overrides(&self) -> bool { false }
+            /// Called with wire handles before every ordinary recorded command.
+            fn prepare_recorded_command(&mut self, _name: &'static str, _command_buffer: u64)
+                -> sv_wire::Result<()> { Ok(()) }
             #(#optional_methods)*
             /// The driver's entry points.
             fn fns(&self) -> &DriverFns;

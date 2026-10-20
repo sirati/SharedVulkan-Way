@@ -20,6 +20,7 @@ fn wire_result(r: VideoResult<()>) -> p::VkResult {
 }
 #[derive(Default)]
 pub struct DispatchState {
+    pub plans:crate::video_recording::Plans,
     pub video: NativeVideo,
     failure: Option<vk::Result>,
     sessions: HashMap<u64, u64>,
