@@ -144,6 +144,7 @@ mod process {
     /// broker connection. Harmless to call more than once.
     pub fn install_hooks() {
         sv_transport::brokered::install(connect_service);
+        sv_transport::brokered::install_regions(|name| open_path(std::path::Path::new(name)));
     }
 
     /// A lease on the live region of this user's pool `pool` (`find`, e.g.

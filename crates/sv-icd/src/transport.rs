@@ -522,6 +522,10 @@ impl RingTransport {
         use std::os::unix::net::UnixStream;
         use sv_transport::cold::{ColdMessage, send};
 
+        // waycompose-design.md §111.10: the GPU BAR's name may be `broker:ID`
+        // and the bell `broker:sv-hub`, both reached through the broker.
+        #[cfg(target_os = "linux")]
+        wc_broker::client::install_hooks();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let sock = loop {
             match UnixStream::connect(socket) {

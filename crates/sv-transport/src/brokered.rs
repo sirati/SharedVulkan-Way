@@ -32,6 +32,36 @@ pub fn install(f: Opener) {
     let _ = OPENER.set(f);
 }
 
+/// Opens region `broker:ID` read-write (a published BAR, §111.10).
+#[cfg(unix)]
+pub type RegionOpener = fn(&str) -> std::io::Result<std::fs::File>;
+
+#[cfg(unix)]
+static REGION_OPENER: OnceLock<RegionOpener> = OnceLock::new();
+
+/// Install the process's region opener, for `region::open_named` of a
+/// `broker:ID` name (the GPU BAR's name that sv-hostd hands the ICD).
+#[cfg(unix)]
+pub fn install_regions(f: RegionOpener) {
+    let _ = REGION_OPENER.set(f);
+}
+
+/// Open a `broker:ID` region; `None` if `name` is not one.
+#[cfg(unix)]
+pub fn open_region(name: &str) -> Option<std::io::Result<std::fs::File>> {
+    let id = name.strip_prefix(PREFIX)?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(match REGION_OPENER.get() {
+        Some(f) => f(name),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{name}: this process has no broker client installed"),
+        )),
+    })
+}
+
 /// The service name of a `broker:NAME` spec.
 pub fn service(spec: &str) -> Option<&str> {
     spec.strip_prefix(PREFIX).filter(|n| !n.is_empty())
