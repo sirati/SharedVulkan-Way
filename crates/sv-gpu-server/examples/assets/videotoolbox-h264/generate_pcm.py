@@ -167,13 +167,30 @@ def cases():
             ],
             "gap": [dict(frame_num=0, y=40, idr=True),
                     dict(frame_num=3, y=80), dict(frame_num=4, y=80, kind=0)],
-            "bootstrap": [dict(frame_num=3, y=120)],
         }
         for name, frames in groups.items():
             data = parameters(poc, gaps=name == "gap")
             data += b"".join(picture(poc, **frame) for frame in frames)
             output.append((f"original-pcm-poc{poc}-{name}-64x64.h264", data,
-                           b"".join(raw_frame(frame["y"]) for frame in frames)))
+                           b"".join(raw_frame(frame["y"]) for frame in frames), None))
+        source_frames = [dict(frame_num=0, y=40, idr=True),
+                         dict(frame_num=1, y=40, kind=0),
+                         dict(frame_num=2, y=40, kind=0),
+                         dict(frame_num=3, y=120)]
+        original_parameters = parameters(poc)
+        source_nals = [picture(poc, **frame) for frame in source_frames]
+        source = original_parameters + b"".join(source_nals)
+        source_name = f"original-pcm-poc{poc}-bootstrap-source-64x64.h264"
+        output.append((source_name, source,
+                       b"".join(raw_frame(frame["y"]) for frame in source_frames), None))
+        final_start = len(original_parameters) + sum(map(len, source_nals[:-1]))
+        # Select the exact original SPS/PPS bytes and final complete original
+        # VCL NAL. No slice/RBSP byte is rewritten for fresh decoder submission.
+        bootstrap = source[:len(original_parameters)] + source[final_start:]
+        output.append((f"original-pcm-poc{poc}-bootstrap-64x64.h264", bootstrap,
+                       raw_frame(120), dict(file=source_name,
+                       parameter_range=[0, len(original_parameters)],
+                       original_vcl_range=[final_start, len(source)])))
     frames = [dict(kind=2, frame_num=0, poc_lsb=0, y=40, idr=True),
               dict(kind=2, frame_num=1, poc_lsb=4, y=120),
               dict(kind=1, frame_num=2, poc_lsb=2, y=80),
@@ -182,7 +199,7 @@ def cases():
     data += b"".join(picture(0, **frame) for frame in frames)
     expected = b"".join(raw_frame(frame["y"])
                         for frame in sorted(frames, key=lambda frame: frame["poc_lsb"]))
-    output.append(("original-pcm-b-skip-64x64.h264", data, expected))
+    output.append(("original-pcm-b-skip-64x64.h264", data, expected, None))
     return output
 
 
@@ -195,7 +212,7 @@ def main():
     version = subprocess.run([args.ffmpeg, "-version"], check=True,
                              capture_output=True, text=True).stdout.splitlines()[0]
     records = []
-    for name, data, expected in cases():
+    for name, data, expected, original_source in cases():
         path = args.output_dir / name
         path.write_bytes(data)
         decoded = subprocess.run([
@@ -206,9 +223,12 @@ def main():
         if decoded.stdout != expected or decoded.stderr:
             raise RuntimeError(f"independent software pixel verification failed for {name}: "
                                f"{decoded.stderr.decode(errors='replace')}")
-        records.append(dict(file=name, size=len(data), sha256=hashlib.sha256(data).hexdigest(),
-                            frames=len(expected) // 6144, decoded_bytes=len(expected),
-                            decoded_sha256=hashlib.sha256(expected).hexdigest()))
+        record = dict(file=name, size=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                      frames=len(expected) // 6144, decoded_bytes=len(expected),
+                      decoded_sha256=hashlib.sha256(expected).hexdigest())
+        if original_source is not None:
+            record["original_source"] = original_source
+        records.append(record)
     evidence = dict(generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     ffmpeg=version, verification="-err_detect explode; exact YUV420P bytes; empty error stderr",
                     fixtures=records)

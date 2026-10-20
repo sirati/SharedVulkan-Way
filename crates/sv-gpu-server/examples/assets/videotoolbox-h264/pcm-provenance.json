@@ -1,5 +1,5 @@
 {
-  "generator_sha256": "4a408a29eb15d732b4b30488cfbeb46c5955ebaae220c84f0bf98aee871e8141",
+  "generator_sha256": "08c628962b101ca0e2767dc2830eaad179b519d19986f099fe053d2f9dae3212",
   "ffmpeg": "ffmpeg version 8.0.1 Copyright (c) 2000-2025 the FFmpeg developers",
   "verification": "-err_detect explode; exact YUV420P bytes; empty error stderr",
   "fixtures": [
@@ -20,12 +20,31 @@
       "decoded_sha256": "2963e519d09fa04698719bd03579dea1cec019b4fb733433a344c436e9987281"
     },
     {
+      "file": "original-pcm-poc0-bootstrap-source-64x64.h264",
+      "size": 12406,
+      "sha256": "1d9bb26bf81c342638ec952df19db85621c0eaaec7e7e1d7afe459caf8fd898c",
+      "frames": 4,
+      "decoded_bytes": 24576,
+      "decoded_sha256": "886cac73f28ad449a59ba31948ac249cd0c83fb7f0ed7ba514fe5e5540a5d6ee"
+    },
+    {
       "file": "original-pcm-poc0-bootstrap-64x64.h264",
       "size": 6204,
       "sha256": "fc43013b91fc1f62bab012daa83275a768c93e1eb718a99efd7b6e0561482dc5",
       "frames": 1,
       "decoded_bytes": 6144,
-      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001"
+      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+      "original_source": {
+        "file": "original-pcm-poc0-bootstrap-source-64x64.h264",
+        "parameter_range": [
+          0,
+          20
+        ],
+        "original_vcl_range": [
+          6222,
+          12406
+        ]
+      }
     },
     {
       "file": "original-pcm-poc1-marking-64x64.h264",
@@ -44,12 +63,31 @@
       "decoded_sha256": "2963e519d09fa04698719bd03579dea1cec019b4fb733433a344c436e9987281"
     },
     {
+      "file": "original-pcm-poc1-bootstrap-source-64x64.h264",
+      "size": 12404,
+      "sha256": "a2a2e16d91c0c72451e39f6e0a354e36cf05ea732167ac5caa9d4ab81cdec82d",
+      "frames": 4,
+      "decoded_bytes": 24576,
+      "decoded_sha256": "886cac73f28ad449a59ba31948ac249cd0c83fb7f0ed7ba514fe5e5540a5d6ee"
+    },
+    {
       "file": "original-pcm-poc1-bootstrap-64x64.h264",
       "size": 6204,
       "sha256": "0996e652955f24f4933d8c49bd3177a84036dd526434349290c9cf8b8d59cb80",
       "frames": 1,
       "decoded_bytes": 6144,
-      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001"
+      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+      "original_source": {
+        "file": "original-pcm-poc1-bootstrap-source-64x64.h264",
+        "parameter_range": [
+          0,
+          21
+        ],
+        "original_vcl_range": [
+          6221,
+          12404
+        ]
+      }
     },
     {
       "file": "original-pcm-poc2-marking-64x64.h264",
@@ -68,12 +106,31 @@
       "decoded_sha256": "2963e519d09fa04698719bd03579dea1cec019b4fb733433a344c436e9987281"
     },
     {
+      "file": "original-pcm-poc2-bootstrap-source-64x64.h264",
+      "size": 12403,
+      "sha256": "46ecfd6fc5be1d188c12cfa1cae3b9cedefcf9e56e23a0e275c9718f7a728efe",
+      "frames": 4,
+      "decoded_bytes": 24576,
+      "decoded_sha256": "886cac73f28ad449a59ba31948ac249cd0c83fb7f0ed7ba514fe5e5540a5d6ee"
+    },
+    {
       "file": "original-pcm-poc2-bootstrap-64x64.h264",
       "size": 6203,
       "sha256": "42d9ec327aa860f0727a851ce8330776b8bd8fecda0ea9b8cd4bd1fcd0c6d298",
       "frames": 1,
       "decoded_bytes": 6144,
-      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001"
+      "decoded_sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+      "original_source": {
+        "file": "original-pcm-poc2-bootstrap-source-64x64.h264",
+        "parameter_range": [
+          0,
+          20
+        ],
+        "original_vcl_range": [
+          6220,
+          12403
+        ]
+      }
     },
     {
       "file": "original-pcm-b-skip-64x64.h264",

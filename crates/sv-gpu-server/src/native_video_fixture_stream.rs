@@ -7,6 +7,9 @@ mod dpb;
 mod h264;
 #[path = "native_video_lists.rs"]
 mod lists;
+#[cfg(test)]
+#[path = "video_nv12/h264_parameters.rs"]
+mod parameter_encoder;
 #[path = "native_video_poc.rs"]
 mod poc;
 use std::{collections::HashMap, ops::Range};
@@ -240,6 +243,58 @@ pub(crate) enum PcmCase {
     Gap(u8),
     Bootstrap(u8),
     BSkip,
+}
+impl PcmCase {
+    /// Exact wire metadata for original PCM fixtures. Keep the owning wire
+    /// value and Raise pool alive while native Std pointers are consumed.
+    pub(crate) fn parameter_sets(
+        self,
+    ) -> Result<sv_proto::VkVideoDecodeH264SessionParametersAddInfoKHR, String> {
+        use ash::vk;
+        use sv_proto as p;
+        let (poc, gaps, profile) = match self {
+            Self::Marking(poc) | Self::Bootstrap(poc) if poc <= 2 => (poc, false, 66),
+            Self::Gap(poc) if poc <= 2 => (poc, true, 66),
+            Self::BSkip => (0, false, 77),
+            _ => return Err("fixture POC type must be zero, one, or two".into()),
+        };
+        fn flags<const N: usize>(value: &vk::native::__BindgenBitfieldUnit<[u8; N]>) -> u32 {
+            assert!(N > 0 && N <= 4);
+            value.get(0, (N * 8) as u8) as u32
+        }
+        let mut sps_flags: vk::native::StdVideoH264SpsFlags = unsafe { std::mem::zeroed() };
+        sps_flags.set_frame_mbs_only_flag(1);
+        sps_flags.set_direct_8x8_inference_flag(1);
+        sps_flags.set_gaps_in_frame_num_value_allowed_flag(u32::from(gaps));
+        sps_flags.set_delta_pic_order_always_zero_flag(u32::from(poc == 1));
+        let sps = p::StdVideoH264SequenceParameterSet {
+            flags: p::StdVideoH264SpsFlags(flags(&sps_flags._bitfield_1)),
+            profile_idc: p::StdVideoH264ProfileIdc(profile),
+            // Std enum zero serializes H.264 level_idc10.
+            level_idc: p::StdVideoH264LevelIdc(0),
+            chroma_format_idc: p::StdVideoH264ChromaFormatIdc(1),
+            pic_order_cnt_type: p::StdVideoH264PocType(i32::from(poc)),
+            num_ref_frames_in_pic_order_cnt_cycle: u8::from(poc == 1),
+            p_offset_for_ref_frame: if poc == 1 { vec![2] } else { vec![] },
+            max_num_ref_frames: 4,
+            pic_width_in_mbs_minus1: 3,
+            pic_height_in_map_units_minus1: 3,
+            ..Default::default()
+        };
+        let mut pps_flags: vk::native::StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
+        pps_flags.set_deblocking_filter_control_present_flag(1);
+        let pps = p::StdVideoH264PictureParameterSet {
+            flags: p::StdVideoH264PpsFlags(flags(&pps_flags._bitfield_1)),
+            ..Default::default()
+        };
+        Ok(p::VkVideoDecodeH264SessionParametersAddInfoKHR {
+            std_sps_count: 1,
+            p_std_sp_ss: vec![sps],
+            std_pps_count: 1,
+            p_std_pp_ss: vec![pps],
+            ..Default::default()
+        })
+    }
 }
 pub(crate) fn pcm_original(case: PcmCase) -> Result<Stream, String> {
     use h264::{Marking, Operation};
@@ -571,5 +626,101 @@ mod tests {
         );
         assert_eq!(b.frames[2].expected_y, Some(80));
         assert_eq!(b.frames[3].references[0].frame_index, 1);
+    }
+    #[test]
+    fn bootstrap_nals_are_selected_unchanged_from_complete_original_sources() {
+        for ty in 0..=2 {
+            let source: &[u8] = match ty {
+                0 => include_bytes!(
+                    "../examples/assets/videotoolbox-h264/original-pcm-poc0-bootstrap-source-64x64.h264"
+                ),
+                1 => include_bytes!(
+                    "../examples/assets/videotoolbox-h264/original-pcm-poc1-bootstrap-source-64x64.h264"
+                ),
+                _ => include_bytes!(
+                    "../examples/assets/videotoolbox-h264/original-pcm-poc2-bootstrap-source-64x64.h264"
+                ),
+            };
+            let selected = pcm_original(PcmCase::Bootstrap(ty)).unwrap();
+            let frame = &selected.frames[0];
+            assert_eq!(
+                &selected.bytes[..frame.range.start],
+                &source[..frame.range.start]
+            );
+            assert!(source.ends_with(&selected.bytes[frame.range.clone()]));
+            assert!(source.len() > selected.bytes.len());
+        }
+    }
+    #[test]
+    fn original_pcm_wire_parameters_raise_to_exact_original_sps_pps() {
+        use ash::vk;
+        let mut cases = vec![PcmCase::BSkip];
+        for ty in 0..=2 {
+            cases.extend([
+                PcmCase::Marking(ty),
+                PcmCase::Gap(ty),
+                PcmCase::Bootstrap(ty),
+            ]);
+        }
+        for case in cases {
+            let stream = pcm_original(case).unwrap();
+            let sets = case.parameter_sets().unwrap();
+            let mut pool = sv_gpu_entry::Raise::default();
+            let raised = sv_gpu_entry::raise_vk_video_decode_h264_session_parameters_add_info_khr(
+                &sets, &mut pool,
+            )
+            .unwrap();
+            const {
+                assert!(
+                    std::mem::size_of::<sv_gpu_entry::StdVideoH264SequenceParameterSet>()
+                        == std::mem::size_of::<vk::native::StdVideoH264SequenceParameterSet>()
+                );
+                assert!(
+                    std::mem::size_of::<sv_gpu_entry::StdVideoH264PictureParameterSet>()
+                        == std::mem::size_of::<vk::native::StdVideoH264PictureParameterSet>()
+                );
+            }
+            let sps = unsafe {
+                &*raised
+                    .p_std_sp_ss
+                    .cast::<vk::native::StdVideoH264SequenceParameterSet>()
+            };
+            let pps = unsafe {
+                &*raised
+                    .p_std_pp_ss
+                    .cast::<vk::native::StdVideoH264PictureParameterSet>()
+            };
+            assert_eq!(
+                unsafe { parameter_encoder::sps_nal(sps) }.unwrap(),
+                stream.bytes[stream.sps.clone()]
+            );
+            assert_eq!(
+                unsafe { parameter_encoder::pps_nal(pps, sps) }.unwrap(),
+                stream.bytes[stream.pps.clone()]
+            );
+            let poc = match case {
+                PcmCase::Marking(ty) | PcmCase::Gap(ty) | PcmCase::Bootstrap(ty) => ty,
+                PcmCase::BSkip => 0,
+            };
+            assert_eq!(
+                sps.flags.delta_pic_order_always_zero_flag(),
+                u32::from(poc == 1)
+            );
+            assert_eq!(
+                sps.flags.gaps_in_frame_num_value_allowed_flag(),
+                u32::from(matches!(case, PcmCase::Gap(_)))
+            );
+            assert_eq!(
+                sps.num_ref_frames_in_pic_order_cnt_cycle,
+                u8::from(poc == 1)
+            );
+            if poc == 1 {
+                assert!(!sps.pOffsetForRefFrame.is_null());
+                assert_eq!(unsafe { *sps.pOffsetForRefFrame }, 2);
+            }
+            assert_eq!(pps.flags.deblocking_filter_control_present_flag(), 1);
+            assert_eq!(pps.pic_init_qp_minus26, 0);
+        }
+        assert!(PcmCase::Marking(3).parameter_sets().is_err());
     }
 }

@@ -30,7 +30,10 @@ For each POC type 0,1,2:
   using sliding marking. Final P-skip selects original real picture1, never an
   inferred non-existing frame.
 - bootstrap: a fresh original non-IDR reference I_PCM picture at FrameNum3,
-  POC6,Y120. There is no preceding IDR/picture in this stream.
+  POC6,Y120. This fresh-decoder input selects its unchanged final original VCL
+  NAL plus the unchanged original SPS/PPS from bootstrap-source. That complete
+  source contains IDR0/P-skip1/P-skip2/I_PCM3 with luma [40,40,40,120] and is
+  independently software-verified too. Exact extraction ranges are in the JSON.
 
 The B-skip stream is Main profile with decode-order FrameNum [0,1,2,2],
 POC [0,4,2,6], reference flags [true,true,false,true], Y [40,120,80,120].
