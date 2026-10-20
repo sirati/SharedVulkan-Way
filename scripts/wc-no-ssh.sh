@@ -202,6 +202,12 @@ echo "$SEQ" >"$D/state/wcns.seq"
 
 say "leg 5: no ring port at all: polled, said loudly, still no ssh"
 kill "$PORT" 2>/dev/null
+# The host end's loop outlives its socat for a moment and, with
+# `unlink-early`, made host.sock again after the rm below: the session then
+# found a doorbell socket, and the proxy never said it polls. Its loop and
+# listener go first.
+pkill -f "$D/qemu-host-end.sh" 2>/dev/null; pkill -f "UNIX-LISTEN:$D/host.sock" 2>/dev/null
+for _ in $(seq 1 40); do pgrep -f "UNIX-LISTEN:$D/host.sock" >/dev/null || break; sleep 0.05; done
 # A VM without the port has no chardev for a hub to hold either.
 kill "$HUB" 2>/dev/null; wait "$HUB" 2>/dev/null; rm -f "$D/hub/"*.sock "$D/host.sock"
 kill "$SVC" 2>/dev/null; wait "$SVC" 2>/dev/null

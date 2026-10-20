@@ -303,6 +303,7 @@ impl RingLink {
                 || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
                 || self.links.iter().any(|l| l.slot == slot)
                 || quarantined(slot)
+                || has_reader(slot)
                 || !crate::session_svc::may_recycle(self.control.ring_owner(slot).unwrap_or(0))
             {
                 continue;
@@ -1005,6 +1006,41 @@ pub fn quarantined(slot: u32) -> bool {
     let now = std::time::Instant::now();
     q.retain(|(_, until)| *until > now);
     q.iter().any(|(s, _)| *s == slot)
+}
+
+/// §107.11: the slots a thread of this process reads outside the Wayland
+/// thread's links: a session's control, sound, arena and hostint channels.
+/// [`RingLink::reap`] never recycles one of them, whatever its quarantine
+/// says, so a slot cannot mean somebody else's connection while an old
+/// reader of it is still running. One entry per [`SlotReader`].
+static READERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A thread's claim to read `slot`, held for as long as it may touch the
+/// slot's ring, and released when it is dropped.
+#[derive(Debug)]
+pub struct SlotReader {
+    slot: u32,
+}
+
+impl SlotReader {
+    pub fn new(slot: u32) -> SlotReader {
+        READERS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        SlotReader { slot }
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        let mut r = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = r.iter().position(|s| *s == self.slot) {
+            r.swap_remove(i);
+        }
+    }
+}
+
+/// Whether a thread still holds a [`SlotReader`] for `slot`.
+pub fn has_reader(slot: u32) -> bool {
+    READERS.lock().unwrap_or_else(|e| e.into_inner()).contains(&slot)
 }
 
 /// The ring region's geometry for the ivshmem tail: §107's 64 slots when this

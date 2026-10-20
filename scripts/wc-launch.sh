@@ -632,7 +632,7 @@ audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
 gpu-arena-mib = $GPU_ARENA_MIB
 # §97: one pool over the whole GPU device, leased as each session needs it;
-# `slots` is §87's fixed slots of gpu-arena-mib.
+# \`slots\` is §87's fixed slots of gpu-arena-mib.
 gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
@@ -989,15 +989,34 @@ do_install() {
   # §92. Since the shortcuts are written through IShellLinkW, the install also
   # wrote the icon, the relaunch file, the Start menu entry and the jump list,
   # and logged one `pins:` line per step that went wrong and one for the list.
-  local pins
+  local pins never_run=0
   pins=$(g "tail -30 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '\] pins: ')
-  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
-    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
+  # §107.11: the icon and the jump list are the host's answer about the
+  # application, and since §105 that answer comes over a session's control
+  # ring. An installation no session has run yet has nothing to ask and
+  # nothing cached; the first session's refresh writes both. That is not a
+  # failure; any other reason for a missing icon or list still is.
+  if printf '%s\n' "$pins" | grep -q 'no session to ask' \
+    && ! g "test -s $DIR_MSYS/apps/firefox.meta && echo cached" | grep -q cached; then
+    never_run=1
+  fi
+  if g "test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
+    ok "Firefox's relaunch file: $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
   else
-    bad "no icon or no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+    bad "no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+  fi
+  if g "test -s $DIR_MSYS/firefox.ico && echo yes" | grep -q yes; then
+    ok "Firefox's own icon: $DIR_WIN\\firefox.ico"
+  elif [ "$never_run" = 1 ]; then
+    ok "no icon yet: no session of $SESSION has run, so there is no host to ask; the first session writes it"
+  else
+    bad "no icon"; printf '%s\n' "$pins" | sed 's/^/        /'
   fi
   case "$pins" in
     *"jump list "*" task(s)"*) ok "$(printf '%s\n' "$pins" | grep 'jump list ' | tail -1 | sed 's/^.*pins: //')" ;;
+    *"no desktop entry known yet"*) [ "$never_run" = 1 ] \
+      && ok "no jump list yet: no session of $SESSION has run; the first session commits it" \
+      || bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
     *) bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
   esac
 }

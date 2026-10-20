@@ -172,6 +172,35 @@ pub fn compositor_pid(answer: &str) -> u32 {
     answer.trim().strip_prefix("compositor ").and_then(|p| p.trim().parse().ok()).unwrap_or(0)
 }
 
+/// §107: the session index in the user's compositor's answer to `boot`
+/// (`located INDEX MESSAGE`, its `ok` taken off); 0 when it names none.
+pub fn boot_index(answer: &str) -> u8 {
+    answer.trim().strip_prefix("located ").and_then(|r| r.split_whitespace().next()).and_then(|i| i.parse().ok()).unwrap_or(0)
+}
+
+/// The windows a compositor's log says are mapped. `session` 0 counts every
+/// `mapped` line (a compositor of this installation's own); otherwise only
+/// the toplevels the shared compositor made for that session (§107.11:
+/// `xdg_toplevel created (#N) -> window W of session S`), so another
+/// installation's window opening meanwhile is not taken for this one's.
+pub fn count_mapped(log: &str, session: u8) -> usize {
+    if session == 0 {
+        return log.lines().filter(|l| l.contains(" mapped ")).count();
+    }
+    let tag = format!(" of session {session}");
+    let mine: std::collections::HashSet<&str> = log
+        .lines()
+        .filter_map(|l| l.split_once("-> window ").map(|(_, r)| r))
+        .filter_map(|r| r.strip_suffix(tag.as_str()))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    log.lines()
+        .filter_map(|l| l.split_once("wc-compositor: window ").map(|(_, r)| r))
+        .filter_map(|r| r.split_once(" mapped "))
+        .filter(|(id, _)| mine.contains(id) && seen.insert(*id))
+        .count()
+}
+
 /// §110: whether the shared compositor runs the GPU pool itself.
 pub fn one_pool_gpu(cfg: &Config) -> bool {
     cfg.shared_compositor && cfg.one_pool && cfg.gpu_sessions > 0 && cfg.gpu_pool
@@ -715,6 +744,32 @@ mod tests {
         assert_eq!(super::compositor_pid(" compositor 7\n"), 7);
         assert_eq!(super::compositor_pid("session up"), 0);
         assert_eq!(super::compositor_pid("compositor x"), 0);
+    }
+
+    #[test]
+    fn the_session_index_comes_from_the_boot_answer() {
+        assert_eq!(super::boot_index("located 4 ivshmem run 0x1 generation 59"), 4);
+        assert_eq!(super::boot_index(" located 12\n"), 12);
+        assert_eq!(super::boot_index("REFUSED"), 0);
+    }
+
+    /// §107.11: with a shared compositor the click measures its own
+    /// session's window, in the shared log, and nobody else's.
+    #[test]
+    fn a_shared_compositors_log_counts_this_sessions_windows_only() {
+        let log = "\
+wc-compositor: xdg_toplevel created (#1) -> window 1 of session 2
+wc-compositor: window 1 mapped 800x600
+wc-compositor: xdg_toplevel created (#2) -> window 3 of session 5
+wc-compositor: window 3 mapped 640x480
+wc-compositor: window 4 mapped 100x50 as a popup at 3,4
+wc-compositor: window 1 mapped 900x600
+";
+        assert_eq!(super::count_mapped(log, 0), 4, "a compositor of its own: every line");
+        assert_eq!(super::count_mapped(log, 2), 1, "session 2's window, once, however often it maps");
+        assert_eq!(super::count_mapped(log, 5), 1);
+        assert_eq!(super::count_mapped(log, 7), 0);
+        assert_eq!(super::count_mapped(&log.replace(" of session 2", ""), 2), 0, "an untagged toplevel is no session's");
     }
 
     use super::*;
