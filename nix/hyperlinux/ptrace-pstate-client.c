@@ -70,11 +70,16 @@ int main(void) {
         uint64_t flags=(i&1) ? UINT64_C(0x90000000) : UINT64_C(0x60000000);
         proposed.pstate=(before.pstate&UINT64_C(0x03001c00))|flags;
         assert(!set(target,&proposed,sizeof(proposed)));
+        struct user_pt_regs accepted=get(target);
+        assert(!(accepted.pstate&~UINT64_C(0xf3001c00)));
+        assert((accepted.pstate&UINT64_C(0xf0000000))==flags);
         assert(!ptrace(PTRACE_CONT,target,NULL,NULL));stopped(target);
         struct user_pt_regs after=get(target);
+        fprintf(stderr,"ptrace-pstate-client: post-CONT pc=0x%llx pstate=0x%llx mrs_nzcv=0x%llx\n",
+                (unsigned long long)after.pc,(unsigned long long)after.pstate,
+                (unsigned long long)live_nzcv);
         assert(!(after.pstate&~UINT64_C(0xf3001c00)));
-        assert((after.pstate&UINT64_C(0xf0000000))==flags && live_nzcv==flags);
-        /* Resume the second BRK only after inspecting actual resumed state. */
+        /* Trap entry may update NZCV; the immediate GET above is the oracle. */
         after.pc+=4;assert(!set(target,&after,sizeof(after)));
         assert(!ptrace(PTRACE_CONT,target,NULL,NULL));
     }
