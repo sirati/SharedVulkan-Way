@@ -9,7 +9,7 @@
 use crate::bar_registry::{DurableStore, EpochTicket, Registry};
 use crate::service_auth::{Authenticator, Frame, ServiceEndpoint, VerifiedMessage};
 use crate::service_bootstrap::{BootstrapBinding, BootstrapMessage, BootstrapPhase, DOMAIN};
-use crate::service_control::{Binding, Origin, Payload, Phase, Source};
+use crate::service_control::{Binding, Message, Origin, Payload, Phase, Source};
 use std::{
     io,
     sync::{Arc, Mutex, MutexGuard},
@@ -61,6 +61,7 @@ pub struct ServiceContext<S: DurableStore, B: Send + Sync + 'static> {
     ticket: EpochTicket,
     endpoint: ServiceEndpoint,
     source: Source,
+    grantor: Origin,
     original_backing: Arc<B>,
 }
 impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
@@ -70,12 +71,16 @@ impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
     /// Endpoint must name this protected daemon's own exact native process.
     /// Source and registry must already be rooted to the actual retained full
     /// original backing/device. Every alias and allocator route must use this
-    /// context, never a second store/context. No valid older snapshot may be
-    /// restored while original bytes live. No session metadata is authority.
+    /// context, never a second store/context. Grantor must be the one protected
+    /// source-wide canonical allocator origin, identical on both machines and
+    /// immutable while this original backing lives. No session can choose it.
+    /// No valid older snapshot may be restored while original bytes live.
+    /// No session metadata is authority.
     pub unsafe fn start(
         mut registry: Registry<S>,
         endpoint: ServiceEndpoint,
         source: Source,
+        grantor: Origin,
         original_backing: Arc<B>,
     ) -> io::Result<Arc<Self>> {
         let physical = registry.backing();
@@ -99,6 +104,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
             ticket,
             endpoint,
             source,
+            grantor,
             original_backing,
         }))
     }
@@ -125,6 +131,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
     pub(crate) fn origin(&self) -> Origin {
         self.endpoint.origin()
     }
+    pub(crate) fn grantor(&self) -> Origin { self.grantor }
     pub(crate) fn source(&self) -> &Source {
         &self.source
     }
@@ -196,6 +203,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         binding.validate()?;
         if installation != binding.installation
             || binding.source != context.source
+            || binding.roles.grantor != context.grantor
             || local_challenge == [0; 32]
         {
             return Err(denied(
@@ -276,6 +284,26 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
             windows_sid: self.binding.windows_sid.clone(),
             linux_uid: self.binding.linux_uid,
         })
+    }
+    /// Authenticate a newly offered grant before the peer mirror can reserve
+    /// it. This proves canonical service origin, not historical apply authority.
+    pub(crate) fn incoming_grant(&self, frame: &Frame) -> io::Result<Binding> {
+        self.ready()?;
+        if self.context.endpoint.origin() == self.context.grantor {
+            return Err(denied("canonical grantor cannot accept peer allocation authority"));
+        }
+        let mut signed = DOMAIN.to_vec(); signed.extend_from_slice(frame.canonical());
+        let expected = hmac_sha256(&self.key, &signed);
+        if expected.iter().zip(frame.mac()).fold(0u8,|v,(a,b)|v|(a^b)) != 0 {
+            return Err(denied("invalid canonical grant authentication"));
+        }
+        let message = Message::decode(frame.canonical())?;
+        let b = &message.binding;
+        if message.origin != self.context.grantor || message.phase != Phase::Grant || message.sequence != 1
+            || *b != self.grant_binding(b.grant,b.grant_offset,b.grant_length)? {
+            return Err(denied("offered grant differs from enrolled canonical source/pair"));
+        }
+        Ok(message.binding)
     }
     /// The initiator may emit Hello exactly once for this ticket.
     pub fn hello(&mut self) -> io::Result<Frame> {
@@ -617,6 +645,7 @@ mod tests {
                 registry,
                 endpoint(origin, process.clone()),
                 binding().source,
+                binding().roles.grantor,
                 Arc::new(()),
             )
             .unwrap()
@@ -877,6 +906,12 @@ mod tests {
                 .seal(&mut channel, Phase::Allocate, payload)
                 .is_err()
         );
+        let mut wrong_grantor = binding();
+        wrong_grantor.installation = "third-install".into();
+        wrong_grantor.session += 2;
+        wrong_grantor.roles.grantor = opposite(w.context.grantor);
+        assert!(Lifecycle::start_with_challenge(w.context.clone(), ("third-install", KEY),
+            wrong_grantor, BootstrapRole::Initiator, [13;32]).is_err());
     }
     #[test]
     fn os_challenges_are_nonzero_and_independent() {
