@@ -35400,6 +35400,13 @@ and lease files.
   that runs before a lease's fds are sent would close that gap. It has been
   asked of the broker's owner.
 
+**The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
+a process that passes the kernel's ptrace access check, which needs the same
+uid *and* gid. The first run of the GPU-pool VM test had the pool's process
+in another group: the daemon found "no memfd" and the pool never grew. So
+testhost's `windows-vm` account runs both QEMU and the daemon, with one
+primary group.
+
 **The client role never touches a raw resource.** It has no group
 membership and no ACL. A udmabuf reaches exactly its region's pages, and
 the kernel refuses a mapping past them. Clients of another uid get nothing:
@@ -35434,7 +35441,24 @@ testhost.
 **The GPU pool end to end** (`scripts/sv-pool-grow-e2e.sh`, now a VM test
 too, `nix/vmtest-pool-grow.nix`). The pool-guest runs as `wcbroker` on
 lavapipe and grows from a sealed memfd (`--grow-ram memfd:MIB`). The client
-user's ICD gets every grown region from the broker. Results: POOLGROW_RESULTS.
+user's ICD gets every grown region from the broker.
+
+In a 1.5 GiB VM with a 768 MiB budget:
+
+| check | result |
+|---|---|
+| the load: 64 MiB host-visible blocks until refused, every block checked | 9 × 64 MiB at first, then `VK_ERROR_OUT_OF_DEVICE_MEMORY`, every block intact (`ok=1`); the budget, not a failure, ends it |
+| growth | 7 regions (64 → 218 MiB, the geometric step), each one published as udmabufs and found by the ICD with `find gpu.<k>` |
+| Zink (`gl-probe`, software Zink over the ICD) and vulkaninfo beside it | `zink Vulkan 1.4 (llvmpipe)`, PASS; llvmpipe listed |
+| giving back | while the load still lived, the idle regions retired: each answered `UNMAPPED` right after the broker reported it drained, and was freed 250 ms after its retire |
+| a second load | grew the pool again, `ok=1` |
+| lost devices, refusals | none |
+
+Announce → `MAPPED` took 200–630 ms, growing with the region's size (about
+3 ms per MiB). That cost belongs to the stand-in: its memfd's pages are first
+allocated when the udmabuf pins them. A VM's RAM is already populated, and in
+the nested test above a 32 MiB region took 9.2 ms end to end.
+
 
 **What moved where.** `wc-multi-install.sh` leg 9 used the stand-in. It
 needs an account that may make udmabufs, which the harness's user never is,

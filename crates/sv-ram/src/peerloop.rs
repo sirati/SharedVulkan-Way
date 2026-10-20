@@ -51,13 +51,19 @@ pub struct Config {
 /// never the display surface's memfd (the same rule as `sv_hostd::qemu`).
 pub fn find_memfd(pid: u32) -> Result<PathBuf, String> {
     let dir = format!("/proc/{pid}/fd");
+    let (mut seen, mut unreadable) = (0, 0);
     for e in std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))? {
         let p = e.map_err(|e| e.to_string())?.path();
-        if let Ok(l) = std::fs::read_link(&p)
-            && l.to_string_lossy().contains("memfd:memory-backend")
-        {
-            return Ok(p);
+        seen += 1;
+        match std::fs::read_link(&p) {
+            Ok(l) if l.to_string_lossy().contains("memfd:memory-backend") => return Ok(p),
+            Ok(_) => {}
+            Err(_) => unreadable += 1,
         }
+    }
+    if seen > 0 && unreadable == seen {
+        // The kernel's ptrace access check: the same uid *and* gid as QEMU.
+        return Err(format!("none of the {seen} links in {dir} can be read: this process needs QEMU's uid and gid"));
     }
     Err(format!("no memfd:memory-backend among {dir}"))
 }

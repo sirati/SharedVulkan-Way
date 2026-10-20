@@ -50,12 +50,10 @@
     export PATH=${pkgs.lib.makeBinPath [pkgs.coreutils pkgs.gnugrep pkgs.vulkan-tools probes]}
     export LD_LIBRARY_PATH=${libs}
     R=/run/vmt
-    ${binDir}/sv-hostd ivshmem-serve --region /run/wcpool/gpu --cold pool --socket $R/icd.sock >$R/hostd.log 2>&1 &
-    for _ in $(seq 1 50); do [ -S $R/icd.sock ] && break; sleep 0.1; done
     export VK_DRIVER_FILES=${icdJson} SV_SOCKET=$R/icd.sock WC_BROKER=/run/waycompose/broker.sock
     timeout 600 sv-pool-stress 64 10 big 75 >$R/stress-big.log 2>&1 & A=$!
     sleep 4
-    MESA_LOADER_DRIVER_OVERRIDE=zink ZINK_DEBUG=cpu EGL_PLATFORM=surfaceless timeout 180 gl-probe >$R/gl1.log 2>&1; echo $? >$R/gl1.rc
+    LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink ZINK_DEBUG=cpu EGL_PLATFORM=surfaceless timeout 180 gl-probe >$R/gl1.log 2>&1; echo $? >$R/gl1.rc
     timeout 120 vulkaninfo --summary >$R/vulkaninfo.log 2>&1; echo $? >$R/vulkaninfo.rc
     wait $A; echo $? >$R/stress-big.rc
     : >$R/client-first.done
@@ -100,12 +98,18 @@ in
           LD_LIBRARY_PATH = libs;
         };
         serviceConfig = {
+          # The same uid and gid as the daemon: /proc/PID/fd is open only to
+          # a process with both (ptrace access), and the daemon finds the
+          # "guest RAM" there, as it finds QEMU's.
           User = "wcbroker";
-          Group = "wcgpu";
+          Group = "wcbroker";
           RuntimeDirectory = "wcpool";
-          RuntimeDirectoryMode = "0750";
-          UMask = "0007";
-          ExecStartPre = "${pkgs.coreutils}/bin/truncate -s 64M /run/wcpool/gpu";
+          RuntimeDirectoryMode = "0755";
+          ExecStartPre = [
+            "${pkgs.coreutils}/bin/truncate -s 64M /run/wcpool/gpu"
+            "+${pkgs.coreutils}/bin/chgrp wcgpu /run/wcpool/gpu"
+            "${pkgs.coreutils}/bin/chmod 0660 /run/wcpool/gpu"
+          ];
           ExecStart = "${binDir}/sv-gpu-server pool-guest --pool-file /run/wcpool/gpu --grow-ram memfd:${toString (budgetMiB + 256)} --grow-budget ${toString budgetMiB} --sessions 8 --idle 20";
           ExecStartPost = "${pkgs.bash}/bin/sh -c 'echo $MAINPID > /run/wcpool/gpu.pid'";
         };
@@ -145,6 +149,10 @@ in
       host.wait_for_unit("wcbroker.service")
       host.wait_until_succeeds("journalctl -u wcgpu | grep -q 'publishing the extent'", timeout=60)
       host.wait_until_succeeds("journalctl -u wcbroker | grep -q 'pool gpu: bootstrap'", timeout=60)
+      # the cold path, as alice, in a unit of its own: it outlives each client
+      host.succeed("systemd-run --uid=alice --unit=hostd -p StandardOutput=file:/run/vmt/hostd.log -p StandardError=file:/run/vmt/hostd.log "
+                   "${binDir}/sv-hostd ivshmem-serve --region /run/wcpool/gpu --cold pool --socket /run/vmt/icd.sock")
+      host.wait_until_succeeds("[ -S /run/vmt/icd.sock ]", timeout=30)
       host.succeed("systemd-run --uid=alice --unit=client ${clientRun}")
       host.wait_until_succeeds("grep -q lingering /run/vmt/stress-big.log", timeout=600)
       grown = int(host.succeed("journalctl -u wcgpu | grep -c 'added to the pool' || true").strip())
@@ -159,6 +167,7 @@ in
           return host.succeed(f"cat /run/vmt/{name}.rc").strip()
 
       print(host.succeed("grep RESULT /run/vmt/stress-*.log"))
+      print(host.succeed("cat /run/vmt/gl1.log; head -30 /run/vmt/vulkaninfo.log; tail -20 /run/vmt/hostd.log"))
       first = int(host.succeed("sed -n 's/.*RESULT label=big block=64 first=\\([0-9]*\\).*/\\1/p' /run/vmt/stress-big.log").strip() or "0")
       assert rc("stress-big") == "0" and "ok=1" in host.succeed("cat /run/vmt/stress-big.log"), "the load"
       assert first >= 9, f"the load filled past the boot pool: {first} x 64 MiB"
