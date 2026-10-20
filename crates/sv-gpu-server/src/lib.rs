@@ -106,3 +106,6 @@ pub(crate) mod native_video_dispatch;
 
 #[cfg(target_os = "macos")]
 mod native_queue;
+
+#[cfg(target_os = "macos")]
+mod native_video_image;
