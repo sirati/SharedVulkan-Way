@@ -20,6 +20,10 @@
 __declspec(dllimport)
 #endif
 int wc_bridge_pool_alloc(size_t, uintptr_t *, uint64_t *, uint32_t *);
+#ifdef __CYGWIN__
+__declspec(dllimport)
+#endif
+int wc_bridge_bar_overlap(uintptr_t, size_t);
 
 #define MAX_POOLS 64
 struct pool {
@@ -93,6 +97,23 @@ int os_create_anonymous_file(off_t size)
     return fd;
 }
 
+/* Retained device pages must never reach Cygwin's ordinary VM manager.
+ * This covers the entire native mapping, not only currently mapped pools. */
+static int bar_overlap(void *address, size_t length)
+{
+    uintptr_t start = (uintptr_t)address;
+    if (length > UINTPTR_MAX - start) return 1;
+    if (wc_bridge_bar_overlap(start, length)) return 1;
+    uintptr_t end = start + length;
+    for (unsigned i = 0; i < count; ++i) {
+        uintptr_t first = (uintptr_t)pools[i].address;
+        if (pools[i].size > UINTPTR_MAX - first) return 1;
+        uintptr_t last = first + pools[i].size;
+        if (length && start < last && first < end) return 1;
+    }
+    return 0;
+}
+
 /* This symbol is resolved from the shipped companion DLL ahead of cygwin1
  * when linking a Cygwin application. No application source is changed. */
 void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset)
@@ -108,6 +129,9 @@ void *mmap(void *address, size_t length, int prot, int flags, int fd, off_t offs
         void *result = p->address;
         pthread_mutex_unlock(&pool_lock);
         return result;
+    }
+    if (bar_overlap(address, length)) {
+        pthread_mutex_unlock(&pool_lock); errno = ENOTSUP; return MAP_FAILED;
     }
     pthread_mutex_unlock(&pool_lock);
     void *runtime = dlopen("cygwin1.dll", RTLD_NOW);
@@ -134,6 +158,9 @@ int munmap(void *address, size_t length)
             pthread_mutex_unlock(&pool_lock);
             return 0;
         }
+    }
+    if (bar_overlap(address, length)) {
+        pthread_mutex_unlock(&pool_lock); errno = EINVAL; return -1;
     }
     pthread_mutex_unlock(&pool_lock);
     void *runtime = dlopen("cygwin1.dll", RTLD_NOW);

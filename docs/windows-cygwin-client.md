@@ -155,3 +155,15 @@ claimed. This run also repeated the native MinGW same-kernel GDI test with
 30 committed/presented frames and normal teardown. That native result does
 not establish a native MinGW cross-VM pixel path. The disposable clone stopped
 normally after both tests.
+
+
+The POSIX boundary refuses any fallback mapping operation overlapping the
+retained device mapping, including interior/partial unmaps, inactive pool
+extents and fixed mappings for unrelated fds. Overflowing ranges also fail.
+The native mapping owner remains valid independently of local token state.
+
+The QMP socket and device configuration are trusted operator inputs. The
+executable basename check detects unsupported launchers; it does not authenticate
+arbitrary executable paths. Attach repeats the device's memory-backend link,
+sharing, size, path and retained inode checks before returning. Device hotplug
+and backend reassignment must remain disabled for the attached session.
