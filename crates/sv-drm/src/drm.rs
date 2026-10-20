@@ -10,14 +10,16 @@
 //! `drm_version` and `drm_unique`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 
 use std::sync::Arc;
 
 use crate::cuse::{Device, InHeader, IoVec, IoctlIn, IoctlReply, OpenIn};
-use crate::relay::{self, Relay};
-use crate::token::{self, Token};
+use crate::relay_api::{self as relay, Relay};
+use crate::token_wire::Token;
 
 /// `DRM_IOCTL_BASE`.
 pub const DRM_IOCTL_BASE: u32 = b'd' as u32;
@@ -187,6 +189,7 @@ pub trait FdResolver {
 }
 
 /// `TMPFS_MAGIC`: memfds live on the kernel's internal shmem mount.
+#[cfg(target_os = "linux")]
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
 /// Resolves through `/proc/<pid>/fd/<fd>`, where `pid` is the task that issued
@@ -197,8 +200,10 @@ const TMPFS_MAGIC: i64 = 0x0102_1994;
 /// at a FUSE file it serves itself, or at this very node and deadlock the
 /// loop), checked to be a regular file on tmpfs, and only then reopened for
 /// reading through `/proc/self/fd`, which names that same inode.
+#[cfg(target_os = "linux")]
 pub struct ProcResolver;
 
+#[cfg(target_os = "linux")]
 fn open_c(path: &str, flags: libc::c_int) -> Result<OwnedFd, i32> {
     let p = CString::new(path).map_err(|_| libc::EINVAL)?;
     // SAFETY: valid C string; the result is checked.
@@ -210,6 +215,7 @@ fn open_c(path: &str, flags: libc::c_int) -> Result<OwnedFd, i32> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
 impl FdResolver for ProcResolver {
     fn token(&self, pid: u32, fd: i32) -> Result<Token, i32> {
         if pid == 0 || fd < 0 {
@@ -230,7 +236,7 @@ impl FdResolver for ProcResolver {
             libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOCTTY,
         )
         .map_err(|_| libc::EINVAL)?;
-        token::read(f.as_fd()).map_err(|_| libc::EINVAL)
+        crate::token::read(f.as_fd()).map_err(|_| libc::EINVAL)
     }
 }
 
@@ -432,6 +438,7 @@ impl<R: FdResolver> Device for DrmNode<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token;
     use crate::cuse::tests::{Got, decode_ioctl_reply, init_req, req, req_as};
     use crate::cuse::{
         DevInfo, FUSE_IOCTL_32BIT, FUSE_IOCTL_UNRESTRICTED, FUSE_OPEN, FUSE_RELEASE, OutHeader, ReleaseIn, Server,

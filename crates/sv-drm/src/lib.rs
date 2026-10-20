@@ -17,9 +17,9 @@
 //!   client reaches its GPU services, and the registrations behind it.
 //! * [`fusenode`]: a test harness serving the node as a FUSE file, without root.
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod cuse;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod drm;
 #[cfg(target_os = "linux")]
 pub mod ns;
@@ -30,5 +30,9 @@ pub mod relay;
 #[cfg(target_os = "linux")]
 pub mod fusenode;
 
+#[cfg(unix)]
+pub mod token_wire;
+#[cfg(unix)]
+pub mod relay_api;
 #[cfg(unix)]
 pub mod native_prime;
