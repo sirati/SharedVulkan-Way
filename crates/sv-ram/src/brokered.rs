@@ -453,7 +453,7 @@ impl BrokerMappers {
         }
         if let Some(path) = self.state_file()
             && let Err(error) = write_records(&path, std::iter::empty()) {
-                self.recovery_error = Some(error);
+                self.recovery_error = Some(error.to_string());
             }
     }
 
