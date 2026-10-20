@@ -4249,7 +4249,7 @@ impl State {
                 return Err(Some(format!("buffer transform {transform:?}")));
             }
             let viewed = match self.viewport_of(surface) {
-                Some((src, dst, s)) => view_of((w, h), s, src, dst).is_some(),
+                Some((src, dst, s)) => view_of((w, h), s, src, dst, self.scale_for(surface)).is_some(),
                 None => scale != 1,
             };
             if viewed || self.viewed.contains_key(surface) {

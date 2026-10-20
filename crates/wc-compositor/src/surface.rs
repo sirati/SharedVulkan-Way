@@ -1150,7 +1150,7 @@ mod view_tests {
         canvas.set_scale(k);
         let child = filled(2 * k, 2 * k, PixelFormat::Xrgb8888, |_, _| [5, 5, 5, 255]);
         let at = Rect::new(3, 1, 0, 0).scaled(k, 1);
-        canvas.compose(&child, (at.x, at.y));
+        canvas.compose(&child, (at.x, at.y), EVERYWHERE);
         let px = |x: i32, y: i32| canvas.pixels()[((y * 8 * k + x) * 4) as usize];
         assert_eq!(px(5, 2), 0);
         assert_eq!(px(6, 2), 5);
