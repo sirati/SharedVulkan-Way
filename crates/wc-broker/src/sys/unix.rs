@@ -315,10 +315,9 @@ impl Platform for Unix {
     }
 
     fn region_made(&self, info: &crate::core::RegionInfo, user: &User, obj: &Object) -> io::Result<Option<String>> {
-        if let Object::Region(region) = obj {
-            if let Some(holder) = self.holder.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                holder.retain(info, user, region)?;
-            }
+        if let Object::Region(region) = obj
+            && let Some(holder) = self.holder.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            holder.retain(info, user, region)?;
         }
         Ok(None)
     }
