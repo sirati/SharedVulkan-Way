@@ -4430,8 +4430,8 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
                 // §46: `SWP_FRAMECHANGED` when this window's caption is folded, so
                 // that this final `SetWindowPos` both places the window and asks
                 // `WM_NCCALCSIZE` again. `frame_glass` above did the DWM half and
-                // deliberately no `SetWindowPos` of its own — two of them at map is
-                // what made the Wine keyboard leg flaky.
+                // deliberately no frame recalculation of its own. An unguarded
+                // extra call caused size echoes that made Wine keyboard input flaky.
                 SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
