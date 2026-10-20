@@ -1085,6 +1085,8 @@ impl GpuHost for GpuServer {
                     vk::Format::from_raw(ci.format.0),
                     ci.extent.width,
                     ci.extent.height,
+                    vk::ImageUsageFlags::from_raw(ci.usage.0),
+                    vk::ImageCreateFlags::from_raw(ci.flags.0),
                 );
             }
         }
@@ -1762,7 +1764,8 @@ impl GpuHost for GpuServer {
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
         #[cfg(target_os = "macos")]
         {
-            props.linear_tiling_features.0 |= crate::iosurface::linear_extra(&self.shared.driver, vk::Format::from_raw(a.format.0)) as u32;
+            props.linear_tiling_features.0 = crate::metal_image::filter_features(a.format.0,
+                u64::from(props.linear_tiling_features.0) | crate::iosurface::linear_extra(&self.shared.driver, vk::Format::from_raw(a.format.0))) as u32;
         }
         Ok(p::VkGetPhysicalDeviceFormatPropertiesReply { p_format_properties: Some(Box::new(props)) })
     }
@@ -1793,10 +1796,11 @@ impl GpuHost for GpuServer {
         #[cfg(target_os = "macos")]
         {
             let extra = crate::iosurface::linear_extra(&self.shared.driver, vk::Format::from_raw(a.format.0));
-            props.format_properties.linear_tiling_features.0 |= extra as u32;
+            props.format_properties.linear_tiling_features.0 = crate::metal_image::filter_features(a.format.0,
+                u64::from(props.format_properties.linear_tiling_features.0) | extra) as u32;
             for l in &mut props.p_next {
                 if let p::PNextLink::VkFormatProperties3(x) = l {
-                    x.linear_tiling_features.0 |= extra;
+                    x.linear_tiling_features.0 = crate::metal_image::filter_features(a.format.0, x.linear_tiling_features.0 | extra);
                 }
             }
         }

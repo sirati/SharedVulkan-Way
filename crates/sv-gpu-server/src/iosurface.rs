@@ -38,6 +38,8 @@ struct Shape {
     format: vk::Format,
     width: u32,
     height: u32,
+    usage: vk::ImageUsageFlags,
+    flags: vk::ImageCreateFlags,
 }
 
 static SHAPES: Mutex<Option<HashMap<u64, Shape>>> = Mutex::new(None);
@@ -75,7 +77,8 @@ pub fn linear_extra(driver: &crate::driver::Driver, format: vk::Format) -> u64 {
         (vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND, vk::ImageUsageFlags::COLOR_ATTACHMENT),
         (vk::FormatFeatureFlags::BLIT_DST, vk::ImageUsageFlags::TRANSFER_DST),
     ] {
-        if !native.optimal_tiling_features.contains(feature) { continue; }
+        if !native.optimal_tiling_features.contains(feature)
+            || crate::metal_image::texture_usage(format.as_raw(), usage.as_raw(), 0).is_none() { continue; }
         let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::from_raw(MTLTEXTURE));
         let info = vk::PhysicalDeviceImageFormatInfo2::default().format(format).ty(vk::ImageType::TYPE_2D)
@@ -94,8 +97,9 @@ pub fn linear_extra(driver: &crate::driver::Driver, format: vk::Format) -> u64 {
 }
 
 /// `vkCreateImage` made a shared image.
-pub fn remember(image: vk::Image, format: vk::Format, width: u32, height: u32) {
-    shapes(|s| s.insert(ash::vk::Handle::as_raw(image), Shape { format, width, height }));
+pub fn remember(image: vk::Image, format: vk::Format, width: u32, height: u32,
+    usage: vk::ImageUsageFlags, flags: vk::ImageCreateFlags) {
+    shapes(|s| s.insert(ash::vk::Handle::as_raw(image), Shape { format, width, height, usage, flags }));
 }
 
 /// `vkDestroyImage`.
@@ -150,9 +154,9 @@ fn device() -> *mut c_void {
 
 /// `[device newTextureWithDescriptor:d iosurface:surface plane:0]`, render
 /// target and shader read/write.
-fn texture(surface: &Surface, mtl_format: u64, width: u32, height: u32) -> Option<Texture> {
+fn texture(surface: &Surface, mtl_format: u64, width: u32, height: u32, usage: u64) -> Option<Texture> {
     // SAFETY: the reference owns a live IOSurface throughout this call.
-    unsafe { texture_plane(surface.as_ptr(), mtl_format, width, height, 0, 1 | 2 | 4 | 0x10) }
+    unsafe { texture_plane(surface.as_ptr(), mtl_format, width, height, 0, usage) }
 }
 
 /// Wrap one actual IOSurface plane. Caller owns the live surface and supplies
@@ -236,7 +240,9 @@ pub fn import(driver: &crate::driver::Driver, image: vk::Image, want: u32, surfa
         fourcc, layout.offset, layout.row_pitch, layout.size) {
         return Err(format!("IOSurface geometry/format does not match target image layout {layout:?}"));
     }
-    let texture = texture(&surface, mtl, sh.width, sh.height).ok_or("newTextureWithDescriptor:iosurface:plane: failed")?;
+    let usage = crate::metal_image::texture_usage(sh.format.as_raw(), sh.usage.as_raw(), sh.flags.as_raw())
+        .ok_or("unsupported Metal texture format/usage/view combination")?;
+    let texture = texture(&surface, mtl, sh.width, sh.height, usage).ok_or("newTextureWithDescriptor:iosurface:plane: failed")?;
     // SAFETY: the driver's own image.
     let req = unsafe { driver.device.get_image_memory_requirements(image) };
     let bits = req.memory_type_bits & want & ((1u64 << driver.mem_props.memory_type_count) - 1) as u32;
