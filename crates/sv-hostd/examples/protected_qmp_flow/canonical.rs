@@ -19,6 +19,12 @@ pub struct FixtureOwner {
     _lifecycle:Lifecycle<DirectoryStore,SealedBacking>,
     _grants:ProtectedGrants<DirectoryStore,SealedBacking>,
 }
+impl FixtureOwner {
+    /// Native export retirement does not release canonical physical capacity.
+    pub fn exclusions(&self) -> io::Result<Vec<(u64, u64)>> {
+        self._context.exclusions()
+    }
+}
 pub struct Flow {
     pub producer:ProtectedProjection,
     pub consumer:ProtectedProjection,
