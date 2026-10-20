@@ -2327,10 +2327,10 @@ impl Icd for SharedVulkan {
         }
         let image = args.image.0;
         let mut reply = forward::get_image_subresource_layout(t, args)?;
-        if let Some(layout) = reply.p_layout.as_mut() {
-            if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
-                layout.offset = image.translated_offset(layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
-            }
+        if let Some(layout) = reply.p_layout.as_mut()
+            && let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some())
+        {
+            layout.offset = image.translated_offset(layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
         }
         Ok(reply)
     }
@@ -2349,10 +2349,10 @@ impl Icd for SharedVulkan {
         }
         let image = args.image.0;
         let mut reply = forward::get_image_subresource_layout2(t, args)?;
-        if let Some(layout) = reply.p_layout.as_mut() {
-            if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
-                layout.subresource_layout.offset = image.translated_offset(layout.subresource_layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
-            }
+        if let Some(layout) = reply.p_layout.as_mut()
+            && let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some())
+        {
+            layout.subresource_layout.offset = image.translated_offset(layout.subresource_layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
         }
         Ok(reply)
     }
