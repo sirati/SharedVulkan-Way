@@ -37943,15 +37943,22 @@ allocations require existing broker-leased guest RAM or registered contiguous
 BAR backing and the existing mapped user policy. No new sandbox exception, broker authorization policy, or raw
 QEMU RAM descriptor is introduced.
 
-Seven targeted Rust fixture tests pass: original-page painting, SCM_RIGHTS
-identity and lifetime, a real broker lease blocking retirement through mapping
-use, foreign anon-inode rejection despite matching fstat metadata, proxy
-registration rejection for a foreign fd, ordinary dual-lifetime reclamation,
-and refusal to guess drain after premature destruction. GTK packaging builds
-successfully. Additional broker generation, original-source and registered BAR
-regressions are added; their final validation and real Cairo/Firefox runtime
-validation remain pending. The strict Firefox
-zero-copy and guest hardware gates remain open.
+On `55d1987`, all workspace tests pass: 3,455 passed, zero failed, ten
+ignored. Clippy completes with existing warnings; Windows workspace and
+selected macOS checks pass. The native regressions cover original-page
+painting, SCM_RIGHTS identity and lifetime, broker retirement through mapping
+use, broker run/epoch rejection, foreign anon-inode rejection with matching
+stat metadata, mismatched transport-source rejection, registered BAR mapping
+and actual-header validation, dual-lifetime reclamation, and refusal to guess
+drain after premature destruction. The GTK package and release proxy build.
+
+The disposable NixOS kernel test passes as ordinary user `alice`, with normal
+`ptrace_scope=1`. Actual udmabufs pass duplicate identity and reject a foreign
+fd and an out-of-bounds mmap. Painting through the mapped fd and SCM_RIGHTS
+changes the original backing pages. Independent proxy and Cairo broker leases
+both block retirement. No family guest or host kernel change is involved.
+This proves the bounded-fd mapping contract, not cross-VM app rendering.
+Real Firefox zero-copy and default guest hardware gates remain open.
 
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
 
