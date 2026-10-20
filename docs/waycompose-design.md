@@ -37015,6 +37015,35 @@ them in the host configuration's `wctestInstalls`, which adds
 `<guest-user> -> wctest installs=…` to the table. Deploy them into
 `/var/lib/waycompose/installs/<name>` as the migration script lays them out.
 
+**Deploying onto the system layout.** Once a host runs the system services,
+`scripts/wc-launch.sh deploy` in its old form would write the admin's hub and
+session service units back beside them, and two session services would race
+for every boot record. So it refuses on such a host (`/etc/waycompose/users.conf`
+or a system `wc-sessiond.service` present), and `install_services` refuses too.
+`WC_LAUNCH_HOST_LAYOUT=system` is the form for it:
+
+* the installation is built as before, in a stage in the admin's home
+  (`~/.cache/waycompose-stage/<name>`), GC roots included;
+* `scripts/wc-users-migrate.sh install-staged ADMIN auto STAGE NAME`, as root
+  (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
+  host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
+  paths become the installation's, the admin's home becomes `~/` (the mapped
+  user's), the GC roots are registered at their new path, an installed key is
+  kept, and the stage's copy of the key is deleted;
+* the deploy is refused unless `users.conf` maps the installation to a user. A
+  test installation is named in the host's `wctestInstalls`, so it runs as
+  `wctest`, with its profile in that user's home;
+* no unit is written, and the system hub's and session service's binaries are
+  left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
+  which is a doorbell blip of about a second for every session;
+* the debug ssh transport is not available with it.
+
+`scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
+(paths, key kept across a redeploy, the mapped user, refusals) and deploy's
+guard against a stubbed host (the old form refused on a system-services host,
+accepted on a plain one; the system layout refused for an unmapped
+installation and on a plain host).
+
 #### Tests
 
 * `wc_broker::usermap` (5), `wc_broker::host` (1), and in wc-arena-host:
