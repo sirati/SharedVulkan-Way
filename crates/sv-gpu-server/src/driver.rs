@@ -458,6 +458,8 @@ pub fn prefer_cpu_by_environment() -> bool {
 
 /// One open driver: instance, physical device, device, queue.
 pub struct Driver {
+    #[cfg(target_os = "macos")]
+    native_submissions: std::sync::Mutex<Option<std::sync::Arc<crate::video_worker::Queue>>>,
     /// Held rather than read: it owns the loaded `libvulkan.so`, and dropping it
     /// while an instance is live would unload the loader out from under the
     /// driver. `gpu-probe` learned the same thing.
@@ -663,6 +665,8 @@ impl Driver {
                     .is_some()
                     .then(|| ash::khr::video_queue::Device::new(&instance, &device));
                 Ok(Driver {
+                    #[cfg(target_os = "macos")]
+                    native_submissions: Default::default(),
                     entry: std::mem::ManuallyDrop::new(entry),
                     instance,
                     pd,
@@ -1293,5 +1297,17 @@ mod tests {
         assert!(!SERVED_QUEUE_FLAGS.contains(Q::VIDEO_ENCODE_KHR));
         assert!(!SERVED_QUEUE_FLAGS.contains(Q::PROTECTED));
         assert!(SERVED_QUEUE_FLAGS.contains(Q::VIDEO_DECODE_KHR | G));
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Driver {
+    pub(crate) fn native_submission_queue(&self) -> std::result::Result<std::sync::Arc<crate::video_worker::Queue>, vk::Result> {
+        let mut queue = self.native_submissions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = &*queue { return Ok(std::sync::Arc::clone(queue)); }
+        let created = std::sync::Arc::new(crate::video_worker::Queue::new()
+            .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?);
+        *queue = Some(std::sync::Arc::clone(&created));
+        Ok(created)
     }
 }

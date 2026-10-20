@@ -176,6 +176,10 @@ impl Shared {
 
 /// One ring's view of the session.
 pub struct GpuServer {
+    #[cfg(target_os = "macos")]
+    pub(crate) native_queue_worker: bool,
+    #[cfg(target_os = "macos")]
+    pub(crate) native_fatal: Option<crate::native_queue::Fatal>,
     pub shared: std::sync::Arc<Shared>,
     /// The last table failure, so the ring can put a real diagnosis in
     /// `fatal_msg` instead of "unknown command 12".
@@ -264,6 +268,10 @@ impl GpuServer {
 
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
         GpuServer {
+            #[cfg(target_os = "macos")]
+            native_queue_worker: false,
+            #[cfg(target_os = "macos")]
+            native_fatal: None,
             shared,
             last_error: None,
             dispatch_poison: None,
@@ -478,6 +486,17 @@ fn no_info() -> WireError {
 }
 
 impl GpuHost for GpuServer {
+    #[cfg(target_os = "macos")]
+    fn bypass_optional_overrides(&self) -> bool { self.native_queue_worker }
+    #[cfg(target_os = "macos")]
+    fn override_queue_submit(&mut self, a: &p::VkQueueSubmitArgs) -> Option<WireResult<p::VkQueueSubmitReply>> { self.native_queue_submit(a) }
+    #[cfg(target_os = "macos")]
+    fn override_queue_submit2(&mut self, a: &p::VkQueueSubmit2Args) -> Option<WireResult<p::VkQueueSubmit2Reply>> { self.native_queue_submit2(a) }
+    #[cfg(target_os = "macos")]
+    fn override_queue_wait_idle(&mut self, a: &p::VkQueueWaitIdleArgs) -> Option<WireResult<p::VkQueueWaitIdleReply>> { self.native_queue_idle(a) }
+    #[cfg(target_os = "macos")]
+    fn override_device_wait_idle(&mut self, a: &p::VkDeviceWaitIdleArgs) -> Option<WireResult<p::VkDeviceWaitIdleReply>> { self.native_device_idle(a) }
+
     #[cfg(target_os = "macos")]
     fn override_get_physical_device_video_format_properties_khr(&mut self, a: &p::VkGetPhysicalDeviceVideoFormatPropertiesKHRArgs) -> Option<WireResult<p::VkGetPhysicalDeviceVideoFormatPropertiesKHRReply>> { self.native_get_physical_device_video_format_properties_khr(a) }
 

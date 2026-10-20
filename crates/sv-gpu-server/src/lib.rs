@@ -103,3 +103,6 @@ mod video_worker;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod native_video_dispatch;
+
+#[cfg(target_os = "macos")]
+mod native_queue;
