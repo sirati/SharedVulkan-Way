@@ -1010,8 +1010,11 @@ mod win {
         let _ = std::fs::remove_file(&p.ctl);
         let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
         if !key.exists() {
-            return Err(format!(
-                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+            // §111.8: deploy moves the key to the broker's directory, which
+            // this user cannot read; the compositor asks the broker to sign.
+            log.say(&format!(
+                "no installation key at {}: the boot record is the broker's to sign (§111.8); \
+                 without a broker the host's session service refuses the session",
                 key.display()
             ));
         }
@@ -1191,8 +1194,11 @@ mod win {
         let _ = std::fs::remove_file(&p.ctl);
         let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
         if !key.exists() {
-            return Err(format!(
-                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+            // §111.8: deploy moves the key to the broker's directory, which
+            // this user cannot read; the compositor asks the broker to sign.
+            log.say(&format!(
+                "no installation key at {}: the boot record is the broker's to sign (§111.8); \
+                 without a broker the host's session service refuses the session",
                 key.display()
             ));
         }

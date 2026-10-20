@@ -32,3 +32,7 @@ wc-compositor = { path = "../wc-compositor", optional = true }
 # §110: the one pool, when both halves run in one process (`--with-gpu`).
 sv-arena = { workspace = true }
 sv-transport = { workspace = true }
+
+# §111.8: `sv-guest broker`, the SYSTEM service that lends the devices.
+[target.'cfg(windows)'.dependencies]
+wc-broker = { workspace = true }

@@ -46,12 +46,14 @@ fn usage() -> String {
         "sv-guest — the in-VM half of shared_vulkan + waycompose\n\
          \n\
          usage: sv-guest <{}> [args…]\n\
+         {}\
          \n\
          built with: {}\n\
          \n\
          `gpu` takes sv-gpu-server's arguments; `wayland` takes\n\
          wc-compositor's. Both halves share one arena — see docs/one-binary.md.",
         halves.join("|"),
+        if cfg!(windows) { "       sv-guest broker [--console] …  the SYSTEM service (§111.8)\n" } else { "" },
         if halves.is_empty() { "no halves — this binary does nothing".to_string() } else { halves.join(", ") },
     )
 }
@@ -65,6 +67,10 @@ fn main() -> ExitCode {
     };
 
     match half.as_str() {
+        // §111.8: the SYSTEM service that lends the devices, on every build:
+        // it is neither half, and the guest has one binary.
+        #[cfg(windows)]
+        "broker" => wc_broker::sys::windows::service::main(&args.collect::<Vec<_>>()),
         #[cfg(feature = "gpu")]
         "gpu" => sv_gpu_server::entry::run_main(half_argv("sv-guest gpu", args)),
         #[cfg(all(feature = "wayland", feature = "gpu"))]

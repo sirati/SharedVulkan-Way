@@ -830,6 +830,10 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
     }
     #[cfg(windows)]
     {
+        // §111.8: the broker opens the port and moves it here.
+        if let Some(p) = wc_broker::client::lend::port(name, "compositor") {
+            return Ok(sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)));
+        }
         sv_transport::winpipe::open_virtio_port(name, 500)
             .map(|p| sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)))
             .map_err(|e| std::io::Error::other(format!("{e}")))

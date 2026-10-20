@@ -145,6 +145,9 @@ pub struct Request {
     /// §107: the session's index in the guest's shared compositor; 0 for a
     /// compositor serving one session.
     pub index: u8,
+    /// §111.6: the guest user the broker signed the record for, verified by
+    /// the MAC; `None` for a record signed without a broker.
+    pub identity: Option<macboot::Identity>,
 }
 
 pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Request>, String> {
@@ -161,9 +164,16 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
     let index = macboot::session_index(page).ok_or("the boot record's session index is not 0..255")?;
     let install = lookup(installs, &auth.installation)?;
     let key = key_of(&install)?;
+    // §111.6: a record the guest's broker signed carries who asked, and the
+    // MAC covers it; an identity area that does not parse is refused rather
+    // than read as none. Without the area the MAC is §107's.
+    let identity = macboot::Identity::read(page);
+    if macboot::has_identity(page) && identity.is_none() {
+        return Err(format!("the boot record for installation {} has an identity that does not parse", install.name));
+    }
     // §107: the index is covered by the MAC, so a record cannot be replayed
     // into another session's place; index 0 is the one-session message.
-    if !auth.verifies_indexed(&rec, index, &key) {
+    if !auth.verifies_identity(&rec, index, identity.as_ref(), &key) {
         return Err(format!("the boot record for installation {} does not verify under its key", install.name));
     }
     let last = last_seq(state, &install.name);
@@ -173,7 +183,7 @@ pub fn check(page: &[u8], installs: &Path, state: &Path) -> Result<Option<Reques
             install.name, auth.seq
         ));
     }
-    Ok(Some(Request { rec, install, seq: auth.seq, index }))
+    Ok(Some(Request { rec, install, seq: auth.seq, index, identity }))
 }
 
 /// Write the answer into page 0, if it still holds the record: the message
@@ -505,6 +515,45 @@ mod tests {
         let mut p = page(0x77, &r, Some(&a));
         p[..8].fill(0);
         assert_eq!(check(&p, &inst, &st), Ok(None));
+    }
+
+    /// §111.6, §111.8: a record the guest's broker signed carries the guest
+    /// user it was signed for; the service takes it with the record, and a
+    /// record whose identity was rewritten in the page (by the user process
+    /// that can write it), removed, or made unreadable is refused.
+    #[test]
+    fn a_broker_signed_record_carries_its_identity_and_a_rewritten_one_is_refused() {
+        let t = tmp("identity");
+        let k = [5u8; 32];
+        install(&t.0, "wcivs", &k);
+        let (inst, st) = (t.0.join("installs"), t.0.join("state"));
+        let r = rec(0x77);
+        let alice = macboot::Identity { os: "windows".into(), user: "alice".into(), id: "S-1-5-21-1-2-3-1001".into() };
+        let bob = macboot::Identity { os: "windows".into(), user: "bob".into(), id: "S-1-5-21-1-2-3-1002".into() };
+        let a = macboot::Auth::sign_identity(&r, 2, Some(&alice), "wcivs", 20, &k);
+        let signed = || {
+            let mut p = page(0x77, &r, None);
+            // SAFETY: a 4096-byte buffer this test owns.
+            unsafe { macboot::publish_identity(p.as_mut_ptr(), &r, 2, Some(&alice), Some(&a)) };
+            p
+        };
+        let got = check(&signed(), &inst, &st).unwrap().unwrap();
+        assert_eq!((got.index, got.identity.as_ref()), (2, Some(&alice)));
+        let mut p = signed();
+        bob.write(&mut p);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not verify"), "another user's identity written over it");
+        let mut p = signed();
+        p[macboot::OFF_IDENTITY..macboot::OFF_IDENTITY + 8].fill(0);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not verify"), "the identity removed");
+        let mut p = signed();
+        p[macboot::OFF_IDENTITY + 10] = b' ';
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not parse"), "an identity that does not parse");
+        // A record signed without a broker has none, and is §107's.
+        let b = macboot::Auth::sign_indexed(&r, 2, "wcivs", 21, &k);
+        let mut p = page(0x77, &r, None);
+        // SAFETY: as above.
+        unsafe { macboot::publish_identity(p.as_mut_ptr(), &r, 2, None, Some(&b)) };
+        assert_eq!(check(&p, &inst, &st).unwrap().unwrap().identity, None);
     }
 
     /// §107: a shared compositor's record carries its session's index, which

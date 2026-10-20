@@ -46,6 +46,8 @@ awe-probe = { path = "../awe-probe" }
 # the GPU sessions' arena is the second device, and a second copy of that FFI
 # would be the drift `awe-probe`'s comment above warns about.
 wc-handle = { path = "../wc-handle" }
+# §111.8: the GPU device and the svbell port, lent by the broker.
+wc-broker = { workspace = true }
 
 # macOS (waycompose-design.md §103.6): the session's extent is guest RAM pinned
 # by `wc_handle::arena::alloc_guest_ram_window`, superpages or wired pages, the
