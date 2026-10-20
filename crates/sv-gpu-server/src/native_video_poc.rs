@@ -50,6 +50,9 @@ impl History {
             }
         }
         let maximum = 1u32 << s.frame_bits;
+        if parsed.max_frame_num != maximum || parsed.max_refs != s.max_refs {
+            return Err("inconsistent parsed sequence limits".into());
+        }
         if parsed.idr {
             if parsed.frame_num != 0 || !parsed.reference {
                 return Err("invalid IDR frame identity".into());

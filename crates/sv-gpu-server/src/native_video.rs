@@ -495,13 +495,17 @@ impl NativeVideo {
             validate_picture(&r.picture, &scope.session)?;
         }
         if let Some(r) = &job.setup {
-            if !r.h264.matches_picture(&job.h264) {
+            // Vulkan decode-h264-ref-pic-setup: non-reference setup only
+            // invalidates the slot. A distinct setup resource has undefined contents.
+            if job.h264.is_reference && !r.h264.recordable_setup(&job.h264) {
                 return invalid();
             }
             if r.slot >= scope.session.dpb_slots {
                 return invalid();
             }
-            validate_picture(&r.picture, &scope.session)?;
+            if job.h264.is_reference {
+                validate_picture(&r.picture, &scope.session)?;
+            }
         }
         job.begin_before = scope.jobs.is_empty();
         job.reset_before = scope.reset;
@@ -1026,6 +1030,25 @@ impl NativeVideo {
     }
 }
 impl H264Reference {
+    /// Recording cannot inspect compressed bytes before queue waits. Permit
+    /// only the precise progressive MMCO5 normalization candidate here. Native
+    /// execution must independently derive the exact setup from source marking.
+    fn recordable_setup(&self, picture: &H264Picture) -> bool {
+        if self.matches_picture(picture) {
+            return true;
+        }
+        if !picture.is_reference || picture.field_pic_flag || picture.bottom_field_flag {
+            return false;
+        }
+        let minimum = picture.pic_order_cnt[0].min(picture.pic_order_cnt[1]);
+        let Some(top) = picture.pic_order_cnt[0].checked_sub(minimum) else {
+            return false;
+        };
+        let Some(bottom) = picture.pic_order_cnt[1].checked_sub(minimum) else {
+            return false;
+        };
+        self.pic_order_cnt == [top, bottom] && (self.long_term || self.frame_num == 0)
+    }
     /// Khronos video.xml, StdVideoDecodeH264ReferenceInfo.FrameNum:
     /// `used_for_long_term_reference ? long_term_frame_idx : frame_num`.
     /// POC still identifies the reconstructed picture for both forms.
@@ -1065,5 +1088,38 @@ mod tests_reference_matching {
         reference.frame_num = 42;
         reference.long_term = false;
         assert!(reference.matches_picture(&picture));
+    }
+    #[test]
+    fn setup_recording_defers_only_exact_mmco5_normalization() {
+        let mut picture = H264Picture {
+            idr_pic_flag: false,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            is_reference: true,
+            is_intra: false,
+            frame_num: 42,
+            pic_order_cnt: [80, 81],
+            idr_pic_id: 0,
+            sps_id: 0,
+            pps_id: 0,
+        };
+        let mut reference = H264Reference {
+            frame_num: 0,
+            pic_order_cnt: [0, 1],
+            long_term: false,
+        };
+        assert!(reference.recordable_setup(&picture));
+        reference.frame_num = 1;
+        assert!(!reference.recordable_setup(&picture));
+        reference.long_term = true;
+        assert!(reference.recordable_setup(&picture));
+        reference.pic_order_cnt = [1, 2];
+        assert!(!reference.recordable_setup(&picture));
+        reference.pic_order_cnt = [0, 1];
+        picture.field_pic_flag = true;
+        assert!(!reference.recordable_setup(&picture));
+        picture.field_pic_flag = false;
+        picture.pic_order_cnt = [i32::MIN, i32::MAX];
+        assert!(!reference.recordable_setup(&picture));
     }
 }

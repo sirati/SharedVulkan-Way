@@ -1,5 +1,6 @@
 //! Serialized, resolved native decode execution. This staging runtime requires
-//! a validated independent picture after reset. It does not advertise readiness or emulate MMCO.
+//! a validated independent picture after reset. Codec history and canonical
+//! resource associations commit only after native completion and all target copies.
 use crate::{
     native_video::{Decode, H264Reference, Picture, Reference, Session},
     native_video_image::Image,
@@ -28,14 +29,15 @@ pub(crate) struct Resources {
 struct Slot {
     image: Arc<Image>,
     region: Picture,
-    metadata: H264Reference,
-    generation: u64,
 }
 struct State {
     session: Arc<Session>,
     decoder: Option<Decoder>,
-    slots: HashMap<u32, Slot>,
-    generation: u64,
+    slots: HashMap<u32, u64>,
+    associations: HashMap<u64, Slot>,
+    codec: dpb::Dpb,
+    history: poc::History,
+    active_sps: Option<Vec<u8>>,
     poisoned: bool,
     // A failed accepted write cannot release allocations still used by native work.
     failed_images: Vec<Arc<Image>>,
@@ -63,24 +65,32 @@ fn validate_target(image: &Image, region: &Picture) -> Result<(), String> {
     }
     Ok(())
 }
-fn validate_reference(
-    slots: &HashMap<u32, Slot>,
+fn metadata(entry: &dpb::Entry) -> Result<H264Reference, String> {
+    Ok(H264Reference {
+        frame_num: u16::try_from(entry.long_term.unwrap_or(entry.frame_num))
+            .map_err(|_| "reference frame/index exceeds StdVideo representation")?,
+        pic_order_cnt: entry.poc,
+        long_term: entry.long_term.is_some(),
+    })
+}
+fn canonical_generation(
+    codec: &dpb::Dpb,
+    associations: &HashMap<u64, Slot>,
     reference: &Reference,
     image: &Arc<Image>,
-    generation: u64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     validate_target(image, &reference.picture)?;
-    let slot = slots
-        .get(&reference.slot)
-        .ok_or("unknown native DPB slot")?;
-    if !Arc::ptr_eq(&slot.image, image)
-        || !same_region(&slot.region, &reference.picture)
-        || !same_metadata(&slot.metadata, &reference.h264)
-        || slot.generation > generation
-    {
-        return Err("native DPB identity, metadata, or generation mismatch".into());
+    for entry in &codec.entries {
+        if let Some(known) = associations.get(&entry.generation) {
+            if Arc::ptr_eq(&known.image, image)
+                && same_region(&known.region, &reference.picture)
+                && same_metadata(&metadata(entry)?, &reference.h264)
+            {
+                return Ok(entry.generation);
+            }
+        }
     }
-    Ok(())
+    Err("native DPB identity, metadata, or generation mismatch".into())
 }
 // Inspect only original framing/header bytes. Stock Zink does not populate
 // IdrPicFlag/is_intra, so those optional declarations cannot bootstrap VT.
@@ -138,14 +148,34 @@ impl Runtime {
         } = resources;
         if references.len() != job.references.len()
             || begin_references.len() != job.begin_references.len()
-            || setup.is_some() != job.setup.is_some()
+            || setup.is_some() != (job.h264.is_reference && job.setup.is_some())
         {
             return Err("resolved resource count mismatch".into());
         }
         if source_range.len() as u64 != job.source_range {
             return Err("resolved compressed range length mismatch".into());
         }
-        let actual = h264::summary(source.bytes(), &source_range, &job.slice_offsets)?;
+        let parsed = h264::parse(
+            source.bytes(),
+            &source_range,
+            &job.slice_offsets,
+            &job.configuration.sps,
+            &job.configuration.pps,
+        )?;
+        let actual = h264::Summary {
+            idr: parsed.idr,
+            reference: parsed.reference,
+            intra: parsed.slices.iter().all(|slice| slice.kind == 2),
+        };
+        if parsed.frame_num != u32::from(job.h264.frame_num)
+            || parsed.pps_id != u32::from(job.h264.pps_id)
+            || parsed.sequence.id != u32::from(job.h264.sps_id)
+            || (job.h264.idr_pic_flag && parsed.idr_pic_id != Some(u32::from(job.h264.idr_pic_id)))
+        {
+            return Err(
+                "original slice parameter/frame identity disagrees with decode metadata".into(),
+            );
+        }
         let idr = actual.idr;
         if actual.reference != job.h264.is_reference || (job.h264.is_intra && !actual.intra) {
             return Err(
@@ -166,7 +196,10 @@ impl Runtime {
                 session: job.session.clone(),
                 decoder: None,
                 slots: HashMap::new(),
-                generation: 0,
+                associations: HashMap::new(),
+                codec: dpb::Dpb::default(),
+                history: poc::History::default(),
+                active_sps: None,
                 poisoned: false,
                 failed_images: Vec::new(),
             });
@@ -195,46 +228,90 @@ impl Runtime {
                 job.h264.pic_order_cnt,
             )?;
         }
+        if !reset && !idr && state.active_sps.as_deref() != Some(job.configuration.sps.as_ref()) {
+            return Err("active SPS content changed inside coded video sequence".into());
+        }
+        if job.references.len() > job.session.references as usize
+            || job
+                .setup
+                .as_ref()
+                .is_some_and(|r| r.slot >= job.session.dpb_slots)
+            || parsed.max_refs > job.session.dpb_slots
+        {
+            return Err("decode references exceed session limits".into());
+        }
+        let mut codec = state.codec.clone();
+        let mut associations = state.associations.clone();
         let mut slots = state.slots.clone();
+        if job.begin_before {
+            let mut snapshot = HashMap::new();
+            for (reference, image) in job.begin_references.iter().zip(&begin_references) {
+                if reference.slot >= job.session.dpb_slots || snapshot.contains_key(&reference.slot)
+                {
+                    return Err("invalid begin DPB slot".into());
+                }
+                let generation = canonical_generation(&codec, &associations, reference, image)?;
+                snapshot.insert(reference.slot, generation);
+            }
+            slots = snapshot;
+        }
         if reset || idr {
             if !job.references.is_empty() {
                 return Err("IDR/reset cannot import reference images".into());
             }
-        }
-        if job.begin_before {
-            for (reference, image) in job.begin_references.iter().zip(&begin_references) {
-                validate_reference(&slots, reference, image, state.generation)?;
-            }
-            slots.retain(|slot, _| job.begin_references.iter().any(|r| r.slot == *slot));
-        }
-        if reset || idr {
+            codec.entries.clear();
+            codec.max_long_term_index = None;
+            associations.clear();
             slots.clear();
         }
+        let history = if reset {
+            poc::History::default()
+        } else {
+            state.history.clone()
+        };
+        let history_plan = history.plan(&parsed, reset && !idr)?;
+        if history_plan.poc != job.h264.pic_order_cnt {
+            return Err("source-derived picture order count disagrees with decode metadata".into());
+        }
+        let current = dpb::Picture {
+            frame_num: parsed.frame_num,
+            poc: history_plan.poc,
+        };
+        let lists = codec.reference_lists(current, &parsed)?;
+        let mut declared = Vec::new();
+        let mut declared_slots = std::collections::HashSet::new();
         for (reference, image) in job.references.iter().zip(&references) {
-            validate_reference(&slots, reference, image, state.generation)?;
-        }
-        if !actual.intra && job.references.is_empty() {
-            return Err("dependent native decode requires explicit validated references".into());
-        }
-        if let Some(reference) = &job.setup {
-            // Non-IDR long-term marking needs MMCO syntax validation against VT's
-            // implicit DPB. Until then, only IDR long_term_reference_flag is safe.
-            if job.h264.is_reference && reference.h264.long_term && !idr {
-                return Err("non-IDR long-term marking is not implemented".into());
+            if reference.slot >= job.session.dpb_slots || !declared_slots.insert(reference.slot) {
+                return Err("invalid decode DPB slot".into());
             }
-            if job.h264.is_reference
-                && (reference.h264.pic_order_cnt != job.h264.pic_order_cnt
-                    || (!reference.h264.long_term
-                        && reference.h264.frame_num != job.h264.frame_num)
-                    || (idr && reference.h264.long_term && reference.h264.frame_num != 0))
-            {
-                return Err("setup metadata does not describe decoded picture".into());
+            let generation = *slots
+                .get(&reference.slot)
+                .ok_or("unknown native DPB slot")?;
+            if canonical_generation(&codec, &associations, reference, image)? != generation {
+                return Err("active slot does not name canonical generation".into());
+            }
+            declared.push(generation);
+        }
+        for list in lists.iter().flat_map(|pair| pair.iter()) {
+            if list.iter().any(|generation| !declared.contains(generation)) {
+                return Err(
+                    "source reference list needs an undeclared canonical generation".into(),
+                );
             }
         }
-        let generation = state
-            .generation
-            .checked_add(1)
-            .ok_or("decode generation exhausted")?;
+        let plan = codec.plan(
+            current,
+            &parsed.marking,
+            dpb::Limits {
+                max_frame_num: parsed.max_frame_num,
+                max_refs: parsed.max_refs,
+            },
+        )?;
+        if let (Some(reference), Some(current)) = (&job.setup, &plan.current) {
+            if !same_metadata(&reference.h264, &metadata(current)?) {
+                return Err("setup metadata disagrees with source reference marking".into());
+            }
+        }
         let mut replacement = if reset {
             Some(Decoder::new_coded(
                 &job.configuration.sps,
@@ -265,10 +342,9 @@ impl Runtime {
             .unwrap()
             .coded_extent;
         if [job.destination.extent.width, job.destination.extent.height] != extent
-            || job
-                .setup
-                .as_ref()
-                .is_some_and(|r| [r.picture.extent.width, r.picture.extent.height] != extent)
+            || job.setup.as_ref().is_some_and(|r| {
+                job.h264.is_reference && [r.picture.extent.width, r.picture.extent.height] != extent
+            })
         {
             return Err("coded decoder output does not match exact target".into());
         }
@@ -302,28 +378,35 @@ impl Runtime {
                     .map_err(|e| format!("DPB GPU copy failed: {e:?}"))?;
             }
         }
-        slots.retain(|_, slot| {
-            !Arc::ptr_eq(&slot.image, &destination)
+        associations.retain(|generation, slot| {
+            plan.next
+                .entries
+                .iter()
+                .any(|entry| entry.generation == *generation)
+                && !Arc::ptr_eq(&slot.image, &destination)
                 && !setup
                     .as_ref()
                     .is_some_and(|image| Arc::ptr_eq(image, &slot.image))
         });
-        if let (Some(reference), Some(image)) = (&job.setup, setup) {
+        slots.retain(|_, generation| associations.contains_key(generation));
+        if let Some(reference) = &job.setup {
             slots.remove(&reference.slot);
-            if job.h264.is_reference {
-                slots.insert(
-                    reference.slot,
+            if let (Some(image), Some(current)) = (setup, &plan.current) {
+                associations.insert(
+                    current.generation,
                     Slot {
                         image,
                         region: reference.picture.clone(),
-                        metadata: reference.h264.clone(),
-                        generation,
                     },
                 );
+                slots.insert(reference.slot, current.generation);
             }
         }
         state.slots = slots;
-        state.generation = generation;
+        state.associations = associations;
+        state.codec = plan.next;
+        state.history = history_plan.next;
+        state.active_sps = Some(job.configuration.sps.to_vec());
         state.failed_images.clear();
         state.poisoned = false;
         Ok(())
