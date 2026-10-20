@@ -149,7 +149,7 @@ index e878fa6..3db8c7c 100644
  
      if (verbose)
 diff --git a/src/syscall_proc.c b/src/syscall_proc.c
-index a6583c9..6375af8 100644
+index a6583c9..d3adfaf 100644
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
 @@ -19,6 +19,7 @@
@@ -517,7 +517,16 @@ index a6583c9..6375af8 100644
  }
  
  /* ---------- sys_waitid ---------- */
-@@ -858,22 +718,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+@@ -829,7 +689,7 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+     switch (idtype) {
+     case P_ALL:  wait_pid = -1; break;
+     case P_PID:  wait_pid = (pid_t)id; break;
+-    case P_PGID: wait_pid = -(pid_t)id; break;
++    case P_PGID: return -LINUX_EINVAL; /* Guest process groups are not tracked. */
+     default:     return -LINUX_EINVAL;
+     }
+ 
+@@ -858,26 +718,16 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                  status = proc_table[i].exit_status;
                  ret = proc_table[i].host_pid;
              } else {
@@ -540,15 +549,32 @@ index a6583c9..6375af8 100644
 +                status=proc_collect_status_unlocked(&proc_table[i],status);
              }
  
+-            /* Fill siginfo_t in guest memory */
 +            if (!(options & LINUX_WNOWAIT)) proc_table[i].active=0;
 +
-             /* Fill siginfo_t in guest memory */
++            /* Capture under pid_lock, then copy to guest after releasing it. */
++            uint8_t si[SIGINFO_SIZE]={0};
              if (infop_gva) {
-                 uint8_t si[SIGINFO_SIZE];
-@@ -907,13 +758,6 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
-                 }
-             }
+-                uint8_t si[SIGINFO_SIZE];
+-                memset(si, 0, sizeof(si));
  
+                 int32_t signo = LINUX_SIGCHLD;
+                 int32_t si_code;
+@@ -897,24 +747,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                 memcpy(si + SIGINFO_OFF_SIGNO, &signo, 4);
+                 memcpy(si + SIGINFO_OFF_CODE, &si_code, 4);
+                 memcpy(si + SIGINFO_OFF_PID, &gpid32, 4);
+-                uint32_t uid = 0;
++                uint32_t uid = (uint32_t)getuid();
+                 memcpy(si + SIGINFO_OFF_UID, &uid, 4);
+                 memcpy(si + SIGINFO_OFF_STATUS, &si_status, 4);
+ 
+-                if (guest_write(g, infop_gva, si, SIGINFO_SIZE) < 0) {
+-                    pthread_mutex_unlock(&pid_lock);
+-                    return -LINUX_EFAULT;
+-                }
+             }
+-
 -            /* Don't remove from table if WNOWAIT is set.
 -             * Re-validate slot after re-locking (another thread may have
 -             * reused it while we released the lock for waitpid). */
@@ -557,9 +583,11 @@ index a6583c9..6375af8 100644
 -                proc_table[i].active = 0;
 -
              pthread_mutex_unlock(&pid_lock);
++            if (infop_gva && guest_write(g,infop_gva,si,sizeof(si))<0) return -LINUX_EFAULT;
              return 0; /* waitid returns 0 on success */
          }
-@@ -934,6 +778,11 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+ 
+@@ -934,6 +773,11 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
              return 0;
          }
  
