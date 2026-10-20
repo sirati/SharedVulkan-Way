@@ -1,10 +1,15 @@
 #![allow(unexpected_cfgs)]
 //! Headless real hardware H.264 decode fixture. CPU readback exists only here.
 //! Run the signed macOS example in a coordinated test window. It exits after
-//! thirty seconds even if the platform decoder stops responding.
+//! thirty seconds in legacy cropped modes. Original PCM modes instead retain
+//! one bounded graph/process without a watchdog if native retirement is unproved.
 #[cfg(all(target_os = "macos", sv_nv12_sampling_fixture))]
 #[path = "support/vt_joined_sample.rs"]
 mod joined_sample;
+
+#[cfg(all(target_os = "macos", sv_nv12_sampling_fixture))]
+#[path = "support/vt_pcm_fixture.rs"]
+mod pcm_fixture;
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -211,6 +216,15 @@ mod fixture {
         Ok(())
     }
     pub fn run() -> Result<(), String> {
+        if std::env::args()
+            .nth(1)
+            .is_some_and(|arg| arg == "--pcm" || arg == "--pcm-all")
+        {
+            #[cfg(sv_nv12_sampling_fixture)]
+            return super::pcm_fixture::run();
+            #[cfg(not(sv_nv12_sampling_fixture))]
+            return Err("PCM joined-image fixture requires sv_nv12_sampling_fixture build".into());
+        }
         let mut intra_bootstrap = false;
         let mut full_range = false;
         let mut coded_output = false;
