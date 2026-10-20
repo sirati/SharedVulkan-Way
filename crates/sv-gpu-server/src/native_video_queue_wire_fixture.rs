@@ -188,45 +188,6 @@ fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
         )?
         .result,
     )?;
-    // These canonical Std fields were independently pixel-tested against the
-    // original cropped 64x50 Baseline stream. Their SPS differs only in omitted
-    // MV restriction bounds, which StdVideo cannot represent directly.
-    let mut sps_flags: vk::native::StdVideoH264SpsFlags = unsafe { std::mem::zeroed() };
-    sps_flags.set_constraint_set0_flag(1);
-    sps_flags.set_constraint_set1_flag(1);
-    sps_flags.set_frame_mbs_only_flag(1);
-    sps_flags.set_direct_8x8_inference_flag(1);
-    sps_flags.set_frame_cropping_flag(1);
-    sps_flags.set_vui_parameters_present_flag(1);
-    let mut vui_flags: vk::native::StdVideoH264SpsVuiFlags = unsafe { std::mem::zeroed() };
-    vui_flags.set_timing_info_present_flag(1);
-    vui_flags.set_bitstream_restriction_flag(1);
-    let sps = p::StdVideoH264SequenceParameterSet {
-        flags: p::StdVideoH264SpsFlags(sps_flags._bitfield_1.get(0, 32) as u32),
-        profile_idc: p::StdVideoH264ProfileIdc(66),
-        level_idc: p::StdVideoH264LevelIdc(0),
-        chroma_format_idc: p::StdVideoH264ChromaFormatIdc(1),
-        pic_order_cnt_type: p::StdVideoH264PocType(2),
-        max_num_ref_frames: 1,
-        pic_width_in_mbs_minus1: 3,
-        pic_height_in_map_units_minus1: 3,
-        frame_crop_bottom_offset: 7,
-        p_sequence_parameter_set_vui: Some(Box::new(p::StdVideoH264SequenceParameterSetVui {
-            flags: p::StdVideoH264SpsVuiFlags(vui_flags._bitfield_1.get(0, 32) as u32),
-            num_units_in_tick: 1,
-            time_scale: 50,
-            max_dec_frame_buffering: 1,
-            ..Default::default()
-        })),
-        ..Default::default()
-    };
-    let mut pps_flags: vk::native::StdVideoH264PpsFlags = unsafe { std::mem::zeroed() };
-    pps_flags.set_deblocking_filter_control_present_flag(1);
-    let pps = p::StdVideoH264PictureParameterSet {
-        flags: p::StdVideoH264PpsFlags(pps_flags._bitfield_1.get(0, 32) as u32),
-        pic_init_qp_minus26: -14,
-        ..Default::default()
-    };
     checked(
         wire(
             rpc.create_video_session_parameters_khr(p::VkCreateVideoSessionParametersKHRArgs {
@@ -240,13 +201,7 @@ fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
                                 max_std_sps_count: 1,
                                 max_std_pps_count: 1,
                                 p_parameters_add_info: Some(Box::new(
-                                    p::VkVideoDecodeH264SessionParametersAddInfoKHR {
-                                        std_sps_count: 1,
-                                        p_std_sp_ss: vec![sps],
-                                        std_pps_count: 1,
-                                        p_std_pp_ss: vec![pps],
-                                        ..Default::default()
-                                    },
+                                    crate::native_video_fixture_parameters::parameter_sets(),
                                 )),
                                 ..Default::default()
                             },
@@ -346,21 +301,14 @@ fn record(rpc: &mut Rpc, source_len: u64) -> Result<(), String> {
             ..Default::default()
         })),
     }))?;
-    let mut flags: vk::native::StdVideoDecodeH264PictureInfoFlags = unsafe { std::mem::zeroed() };
-    flags.set_IdrPicFlag(1);
-    flags.set_is_reference(1);
-    flags.set_is_intra(1);
     wire(rpc.cmd_decode_video_khr(p::VkCmdDecodeVideoKHRArgs {
         command_buffer: p::VkCommandBuffer(COMMAND),
         p_decode_info: Some(Box::new(p::VkVideoDecodeInfoKHR {
             p_next: vec![p::PNextLink::VkVideoDecodeH264PictureInfoKHR(Box::new(
                 p::VkVideoDecodeH264PictureInfoKHR {
-                    p_std_picture_info: Some(Box::new(p::StdVideoDecodeH264PictureInfo {
-                        flags: p::StdVideoDecodeH264PictureInfoFlags(
-                            flags._bitfield_1.get(0, 32) as u32
-                        ),
-                        ..Default::default()
-                    })),
+                    p_std_picture_info: Some(Box::new(
+                        crate::native_video_fixture_parameters::idr_picture(),
+                    )),
                     slice_count: 1,
                     p_slice_offsets: vec![0],
                     ..Default::default()

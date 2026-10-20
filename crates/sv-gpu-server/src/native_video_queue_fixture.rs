@@ -391,10 +391,7 @@ fn submit_and_verify(
             .ok_or("missing decode")?
     };
     if wire_recording {
-        let canonical_sps = [
-            0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9f, 0x88, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0xc8,
-            0x3c, 0x22, 0x11, 0xa8,
-        ];
+        let canonical_sps = crate::native_video_fixture_parameters::CANONICAL_SPS;
         let (_, original_pps, _) = first_picture()?;
         if job.configuration.sps.as_ref() != canonical_sps
             || job.configuration.pps.as_ref() != original_pps
@@ -504,7 +501,16 @@ fn submit_and_verify(
         }))?
         .result,
     )?;
-    native(unsafe { driver.device.wait_for_fences(&[fence], true, 5_000_000_000) })?;
+    checked(
+        wire(rpc.wait_for_fences(p::VkWaitForFencesArgs {
+            device: p::VkDevice(DEVICE),
+            fence_count: 1,
+            p_fences: vec![p::VkFence(FENCE)],
+            wait_all: true,
+            timeout: 5_000_000_000,
+        }))?
+        .result,
+    )?;
     // The user fence follows decode and ownership acquire. Sampling these exact
     // images must observe both writes, without copying into a different target.
     for (role, image) in [("destination", &destination), ("setup", &setup)] {

@@ -139,3 +139,6 @@ mod native_video_queue;
 
 #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
 pub mod native_video_queue_fixture;
+
+#[cfg(any(test, all(target_os = "macos", feature = "native-video-fixture")))]
+mod native_video_fixture_parameters;
