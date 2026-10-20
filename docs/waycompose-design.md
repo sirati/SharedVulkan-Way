@@ -37373,6 +37373,36 @@ Before upgrading the old service with live sessions, drain those sessions
 through their actual owner. Old global checkpoints cannot prove installation
 ownership and are not automatically migrated.
 
+**Independent-holder macOS runtime proof, 2026-10-20.** The disposable
+`wayland-host` VM ran at 3072 MiB under an exclusive run lease, using the
+vmhost-built broker from `5ec8367`. A native fixture allocated two 64 KiB regions
+in pool A and one in pool B, stamped them, closed every fd and mapping, and
+exited before the broker was killed. No GUI or application workload was used.
+
+The root LaunchDaemon broker PID 383 was SIGKILLed. Twelve seconds later its
+separate holder PID 385 remained, reparented to launchd. Native
+`mach_vm_region(..., VM_REGION_BASIC_INFO_64, ...)` inspection reported
+`user_wired_count=1` for all three independent holder mappings, at the same
+addresses observed before broker death. The host wrote sentinel values directly
+through QEMU's shared guest-RAM backend both before and after the broker kill;
+Mach reads of the holder's mappings verified both values.
+
+The host then wrote pool A's release word exactly once, stopped accessing that
+pool, and observed both A mappings disappear while B remained wired at the same
+address with its sentinel intact. Pool B's release ended the holder. A successful
+sudo process-table snapshot positively established its absence. Panic-file
+counts stayed 4 before and 4 after. This proves broker-process SIGKILL retention
+and per-pool host release in this macOS VM; it does not test simultaneous
+holder/broker death, a full graphical session or the GPU server's own extent.
+
+The VM was cleanly stopped, its exact prior 4096 MiB configuration restored, and
+the temporary job, binaries and socket removed. Both existing host units kept
+their PIDs and arguments throughout. Measured VM-unit MemoryPeak was
+5,239,672,832 bytes including QEMU/cache. Evidence is in
+`evidence/session-fixes/broker-mac/holder-vm/`. An earlier successful run is
+retained as `holder-vm-first`; the final run strengthened holder-exit observation
+with a successful full process-table query.
+
 #### 111.9.5 Limits
 
 * **One wcbell port.** The VM has one rings port, and a port has one holder.
@@ -37384,9 +37414,9 @@ ownership and are not automatically migrated.
   VM termination still loses those wires. Restarted brokers do not re-adopt
   the old holders, so old allocations remain private to their original
   clients until host release; missing release pages retain memory indefinitely.
-  Linux lifecycle tests do not establish Darwin physical-page stability or
-  launchd behavior. A disposable macOS VM broker-SIGKILL proof remains required
-  before claiming those runtime properties.
+  The disposable macOS VM proof above verifies independent wiring and
+  launchd survival for a broker-process SIGKILL. It does not establish safety
+  against failure of the holder itself or a terminated VM.
 * **The GPU server's own extent** is still its own superpages: kept by
   nothing if the GPU server itself crashes while `sv-hostd` serves it
   (§103.15's remaining case). Moving it into the broker would change its

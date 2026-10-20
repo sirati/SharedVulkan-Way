@@ -1337,6 +1337,7 @@ dependencies = [
  "sv-transport",
  "sv-wire",
  "wc-broker",
+ "wc-handle",
 ]
 
 [[package]]

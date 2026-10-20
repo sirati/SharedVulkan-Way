@@ -26,3 +26,10 @@ libc.workspace = true
 sv-drm.workspace = true
 # waycompose-design.md §111.10: `SV_BELL=broker:sv-hub`, the hub through the broker.
 wc-broker.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+wc-broker.workspace = true
+wc-handle.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wc-broker.workspace = true

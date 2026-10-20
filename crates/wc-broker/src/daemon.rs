@@ -54,6 +54,28 @@ pub const DEFAULT_DEVICES: &[(&str, &str)] =
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_DEVICES: &[(&str, &str)] = &[];
 
+/// A root-selected PCI slice, published for exactly one uid by the same core.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PciSlice {
+    pub uid:u32, pub pool:String, pub registry:u64, pub offset:u64, pub len:u64, pub epoch:u64,
+}
+impl PciSlice {
+    fn parse(value:&str) -> Result<Self,String> {
+        let parts:Vec<_> = value.split(':').collect();
+        if parts.len() != 6 { return Err("--pci-slice requires UID:POOL:REGISTRY:OFFSET:LEN:EPOCH".into()); }
+        let number = |s:&str| -> Result<u64,String> {
+            if let Some(hex) = s.strip_prefix("0x") { u64::from_str_radix(hex,16) } else { s.parse() }
+                .map_err(|_| "invalid --pci-slice integer".into())
+        };
+        let pool = parts[1];
+        if crate::proto::Request::parse(&format!("find {pool}")).is_err() { return Err("invalid PCI pool name".into()); }
+        let uid = u32::try_from(number(parts[0])?).map_err(|_| "PCI uid exceeds u32")?;
+        let slice = Self { uid, pool:pool.into(), registry:number(parts[2])?, offset:number(parts[3])?, len:number(parts[4])?, epoch:number(parts[5])? };
+        if slice.len == 0 || slice.offset.checked_add(slice.len).is_none() { return Err("invalid PCI slice range".into()); }
+        Ok(slice)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ServeArgs {
     pub socket: String,
@@ -62,6 +84,7 @@ pub struct ServeArgs {
     /// `--service NAME=PATH`: a socket `connect NAME` reaches (any user).
     pub services: Vec<(String, PathBuf)>,
     pub budget: Option<u64>,
+    pub pci_slices: Vec<PciSlice>,
 }
 
 pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
@@ -71,6 +94,7 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
         devices: DEFAULT_DEVICES.iter().map(|(n, p)| (n.to_string(), PathBuf::from(p))).collect(),
         services: Vec::new(),
         budget: None,
+        pci_slices: Vec::new(),
     };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
@@ -96,8 +120,16 @@ pub fn parse_serve(argv: &[String]) -> Result<ServeArgs, String> {
                 }
                 a.services.push((n.to_string(), p.into()));
             }
+            "--pci-slice" => a.pci_slices.push(PciSlice::parse(&v()?)?),
             "--budget-mib" => a.budget = Some(v()?.parse::<u64>().map_err(|e| format!("--budget-mib: {e}"))? << 20),
             _ => return Err(format!("unknown argument {k}")),
+        }
+    }
+    for (index, slice) in a.pci_slices.iter().enumerate() {
+        if a.pci_slices[..index].iter().any(|old|
+            (old.uid == slice.uid && old.pool == slice.pool) ||
+            (old.registry == slice.registry && old.offset < slice.offset + slice.len && slice.offset < old.offset + old.len)) {
+            return Err("PCI slices overlap or repeat a user's pool name".into());
         }
     }
     Ok(a)
@@ -133,6 +165,8 @@ fn restrict(path: &std::path::Path) {
 }
 
 pub fn serve(a: ServeArgs) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    if !a.pci_slices.is_empty() { return Err("--pci-slice requires the Intel macOS guest driver".into()); }
     if let Some(dir) = std::path::Path::new(&a.socket).parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -166,6 +200,17 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
         run,
     };
     let broker = Broker::new(unix, config);
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::sys::macos_mach::start(broker.clone()) {
+        if !a.pci_slices.is_empty() { return Err(format!("Mach PCI lending unavailable: {e}")); }
+        log(&format!("Mach PCI lending unavailable: {e}"));
+    }
+    #[cfg(target_os = "macos")]
+    for slice in &a.pci_slices {
+        let id = crate::sys::macos_pci::publish(&broker, crate::core::User::uid(slice.uid), &slice.pool,
+            slice.epoch, slice.registry, slice.offset, slice.len).map_err(|e| format!("publish PCI pool {}: {e}", slice.pool))?;
+        log(&format!("published PCI pool {} as region {id} for uid {}", slice.pool, slice.uid));
+    }
     log(&format!(
         "socket {} (0666, decided per uid), keys {}, devices {}, regions held until host release",
         a.socket,
@@ -263,6 +308,8 @@ pub fn launchd_plist(bin: &str) -> String {
   <array><string>{}</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>MachServices</key>
+  <dict><key>org.waycompose.broker.memory</key><true/></dict>
   <key>ExitTimeOut</key><integer>0</integer>
   <key>AbandonProcessGroup</key><true/>
   <key>StandardErrorPath</key><string>/Library/Logs/waycompose/broker.log</string>
@@ -355,5 +402,21 @@ mod tests {
         let t: u64 = p.split("<key>ExitTimeOut</key><integer>").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
         assert_eq!(t, 0, "launchd must not SIGKILL a broker retaining host-visible RAM");
         assert!(launchd_plist("/a<b").contains("/a&lt;b"));
+    }
+}
+
+#[cfg(test)]
+mod pci_config_tests {
+    use super::*;
+    fn args(values:&[&str]) -> Vec<String> { values.iter().map(|s| s.to_string()).collect() }
+    #[test]
+    fn pci_configuration_checks_identity_and_ranges() {
+        let parsed = parse_serve(&args(&["--pci-slice", "501:gpu:0x42:0:65536:7"])).unwrap();
+        assert_eq!(parsed.pci_slices[0], PciSlice { uid:501, pool:"gpu".into(), registry:66, offset:0, len:65536, epoch:7 });
+        for bad in ["501:gpu:1:0:0:1", "4294967296:gpu:1:0:1:1", "501:gpu:1:18446744073709551615:1:1", "501:gpu:1:0:1", "501:bad pool:1:0:1:1"] {
+            assert!(parse_serve(&args(&["--pci-slice", bad])).is_err(), "{bad}");
+        }
+        assert!(parse_serve(&args(&["--pci-slice", "501:a:1:0:8192:1", "--pci-slice", "502:b:1:4096:8192:1"])).is_err());
+        assert!(parse_serve(&args(&["--pci-slice", "501:a:1:0:8192:1", "--pci-slice", "502:b:1:8192:8192:1"])).is_ok());
     }
 }

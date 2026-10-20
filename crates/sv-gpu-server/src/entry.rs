@@ -1198,6 +1198,12 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if mode == "mem-guest" {
         return mem_guest(&args);
     }
+    if mode == "pool-host" {
+        if arg("--grow-ram").is_some() || arg("--port").is_some() {
+            return Err("pool-host serves a fixed shared BAR through pool mailboxes; --grow-ram and --port are unsupported".into());
+        }
+        return linux_pool_guest(&args);
+    }
     if mode == "pool-guest" {
         return linux_pool_guest(&args);
     }
@@ -1236,7 +1242,7 @@ fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage: sv-gpu-server <serve|attach|guest|pool-guest|mem-guest> --socket <path> \
+                "usage: sv-gpu-server <serve|attach|guest|pool-guest|pool-host|mem-guest> --socket <path> \
                  [--device N] [--arena BYTES] [--clients N] [--slots N] [--pool BYTES] [--huge] [--bell PORT]"
             );
             Err("no subcommand".into())
