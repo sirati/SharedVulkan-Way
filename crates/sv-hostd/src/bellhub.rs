@@ -142,21 +142,28 @@ impl DirectRings {
     }
 
     /// Wake the waiters of every lane `bytes` name; on `RESCAN_TOKEN`, every lane.
-    pub fn ring(&self, bytes: &[u8]) {
+    /// Returns whether a lane it rang had a waiter parked on it.
+    pub fn ring(&self, bytes: &[u8]) -> bool {
         use sv_transport::vdoorbell::BellTarget;
         let c = {
-            let Ok(mut st) = self.state.lock() else { return };
+            let Ok(mut st) = self.state.lock() else { return false };
             self.current(&mut st)
         };
-        let Some(c) = c else { return };
+        let Some(c) = c else { return false };
         let woken = AtomicU64::new(0);
+        let mut waiter = false;
         for &t in bytes {
             if t == sv_transport::park::RESCAN_TOKEN {
                 c.rescan(&woken);
             } else if t & 0x80 == 0 {
+                let (slot, lane) = sv_transport::park::lane_from_token(t);
+                waiter |= sv_transport::ring::RingCtrl::open(&c, slot)
+                    .and_then(|r| r.bell(lane).map(|b| b.parked.load(Ordering::Acquire) > 0))
+                    .unwrap_or(false);
                 c.ring_token(t, &woken);
             }
         }
+        waiter
     }
 }
 
@@ -199,8 +206,16 @@ impl Hub {
 
     /// Bytes from the guest, to every client. Never blocks.
     fn fan_out(&self, b: &[u8]) {
-        if let Some(d) = self.direct.get() {
-            d.ring(b);
+        // §105.14: ring the lanes first, and if that woke a waiter, let it
+        // run before the clients are told. Linux puts a thread this one wakes on this CPU (the wake
+        // is "affine"), and on the VM host's two user cores the proxy's
+        // control thread waited there for the fan-out below: 60 µs (median
+        // of 41 traced requests, 40 of them on the hub's own CPU). One yield
+        // costs a microsecond when nobody waits.
+        if let Some(d) = self.direct.get()
+            && d.ring(b)
+        {
+            std::thread::yield_now();
         }
         self.stats.down.fetch_add(b.len() as u64, Ordering::Relaxed);
         let Ok(mut c) = self.clients.lock() else { return };
