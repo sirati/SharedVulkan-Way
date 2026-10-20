@@ -1,6 +1,7 @@
 # A complete ARM64 Darwin launcher closure, assembled and cross-built on Linux.
 { inputs, sessionPackage ? null }:
 let
+  runtimeInputs = import ./runtime-inputs.nix;
   t = import ./cross-toolchain.nix { inherit inputs; };
   pkgs = t.pkgs;
   nativeSource = inputs.nativeNixpkgs or inputs.nixpkgs;
@@ -68,33 +69,11 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ./async-signal-context.patch ];
+    patches = runtimeInputs.patches;
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
-    postPatch = ''
-      cp ${./hl_shared.c} src/hl_shared.c
-      cp ${./hl_shared.h} src/hl_shared.h
-      cp ${./hl_seals.c} src/hl_seals.c
-      cp ${./hl_seals.h} src/hl_seals.h
-      cp ${./hl_drm.c} src/hl_drm.c
-      cp ${./hl_drm.h} src/hl_drm.h
-      cp ${./hl_socket.c} src/hl_socket.c
-      cp ${./hl_socket.h} src/hl_socket.h
-      cp ${./hl_seqpacket.c} src/hl_seqpacket.c
-      cp ${./hl_seqpacket.h} src/hl_seqpacket.h
-      cp ${./hl_script.h} src/hl_script.h
-      cp ${./hl_copy.c} src/hl_copy.c
-      cp ${./hl_copy.h} src/hl_copy.h
-      cp ${./hl_atomic.c} src/hl_atomic.c
-      cp ${./hl_atomic.h} src/hl_atomic.h
-      cp ${./hl_seccomp.c} src/hl_seccomp.c
-      cp ${./hl_seccomp.h} src/hl_seccomp.h
-      cp ${./hl_status.c} src/hl_status.c
-      cp ${./hl_status.h} src/hl_status.h
-      cp ${./hl_seccomp_bpf.c} src/hl_seccomp_bpf.c
-      cp ${./hl_seccomp_bpf.h} src/hl_seccomp_bpf.h
-      cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
-    '';
+    postPatch = lib.concatMapStringsSep "\n"
+      (source: "cp ${source} src/${builtins.baseNameOf source}") runtimeInputs.sources;
     buildPhase = ''
       runHook preBuild
       mkdir -p _build
