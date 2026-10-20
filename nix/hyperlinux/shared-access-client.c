@@ -49,7 +49,13 @@ int main(int argc,char **argv) {
     char path[]="/tmp/hl-access-XXXXXX";
     int rw=mkstemp(path);assert(rw>=0);assert(!ftruncate(rw,16384));
     int ro=open(path,O_RDONLY);assert(ro>=0);assert(!unlink(path));
-    void *map=mmap(NULL,16384,PROT_READ,MAP_SHARED,ro,0);assert(map!=MAP_FAILED);
+    void *map=mmap(NULL,16384,PROT_READ,MAP_SHARED,ro,0);
+    if(map==MAP_FAILED) {
+        int error=errno;
+        fprintf(stderr,"O_RDONLY MAP_SHARED PROT_READ failed: errno=%d (%s), fd=%d flags=%d\n",error,strerror(error),ro,fcntl(ro,F_GETFL));
+        errno=error;perror("shared access read-only mmap");
+        return 1;
+    }
     output_denied(map);assert(!munmap(map,16384));close(ro);
     map=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,rw,0);assert(map!=MAP_FAILED);
     assert(!mprotect(map,16384,PROT_READ));output_denied(map);
