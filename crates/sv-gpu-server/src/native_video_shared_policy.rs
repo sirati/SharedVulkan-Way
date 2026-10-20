@@ -2,6 +2,19 @@
 //! Native IOSurface kind/geometry validation precedes these identity checks.
 use crate::video_nv12::Layout;
 
+/// Monotonic owner-generation validity. Retained allocations survive revocation,
+/// but an import beginning after observed revocation must fail.
+#[derive(Default)]
+pub(crate) struct Revocation(std::sync::atomic::AtomicBool);
+impl Revocation {
+    pub(crate) fn revoke(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn active(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 pub(crate) fn authorize(
     expected: &[u8; 16],
     allocation: u64,
@@ -39,6 +52,19 @@ pub(crate) fn validate_layout(layout: Layout, original: Layout) -> Result<u64, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn revocation_blocks_new_imports_without_dropping_retained_owners() {
+        let owner = std::sync::Arc::new(Revocation::default());
+        let accepted = std::sync::Arc::clone(&owner);
+        assert!(owner.active());
+        owner.revoke();
+        assert!(!owner.active());
+        assert!(!accepted.active());
+        assert_eq!(std::sync::Arc::strong_count(&owner), 2);
+        owner.revoke();
+        assert!(!owner.active());
+    }
+
     #[test]
     fn nonce_and_original_allocation_bound_are_both_required() {
         let nonce = [0x97; 16];

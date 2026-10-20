@@ -282,17 +282,59 @@ fn service() -> Option<u32> {
     })
 }
 
+/// Fail closed if the retained service send right has become a dead name.
+/// This checks endpoint lifetime, not the receiver identity established by its
+/// capability handoff. It never looks up a replacement service after failure.
+pub(crate) fn nv12_endpoint_alive() -> bool {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_port_type(task: u32, name: u32, kind: *mut u32) -> i32;
+    }
+    let Some(port) = service() else { return false; };
+    let mut kind = 0;
+    // SAFETY: the cached capability belongs to this task; kind is writable.
+    unsafe { mach_port_type(mach_task_self_, port, &mut kind) == 0 }
+        && kind & (1 << 16) != 0 && kind & (1 << 20) == 0
+}
+
 /// Keep the authenticated owner connection open for this GPU process lifetime.
-fn owner() -> Result<wc_handle::iosection::Owner, String> {
-    static CONNECTION: Mutex<Option<(wc_broker::client::Client, wc_handle::iosection::Owner)>> = Mutex::new(None);
+/// A separate atomic broker observation makes revocation permanent locally too.
+struct OwnerConnection {
+    _client: wc_broker::client::Client,
+    owner: wc_handle::iosection::Owner,
+    validity: std::sync::Arc<crate::native_video_shared_policy::Revocation>,
+}
+fn owner_connection() -> Result<(wc_handle::iosection::Owner,
+    std::sync::Arc<crate::native_video_shared_policy::Revocation>), String> {
+    static CONNECTION: Mutex<Option<OwnerConnection>> = Mutex::new(None);
     let mut g = CONNECTION.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
-        let mut c = wc_broker::client::Client::connect(&wc_broker::client::path()).map_err(|e| e.to_string())?;
-        c.hello("gpu").map_err(|e| e.to_string())?;
-        let token = c.owner_token().map_err(|e| e.to_string())?;
-        *g = Some((c, token));
+        let mut client = wc_broker::client::Client::connect(&wc_broker::client::path()).map_err(|e| e.to_string())?;
+        client.hello("gpu").map_err(|e| e.to_string())?;
+        let owner = client.owner_token().map_err(|e| e.to_string())?;
+        let mut observer = wc_broker::client::Client::connect(&wc_broker::client::path()).map_err(|e| e.to_string())?;
+        observer.hello("iosurface-observer").map_err(|e| e.to_string())?;
+        observer.observe_owner(owner, std::process::id()).map_err(|e| e.to_string())?;
+        let validity = std::sync::Arc::new(crate::native_video_shared_policy::Revocation::default());
+        let watched = std::sync::Arc::clone(&validity);
+        std::thread::Builder::new().name("nv12-export-owner".into()).spawn(move || {
+            let ended = format!("!owner-ended {}", owner.connection);
+            loop {
+                match observer.next_event() {
+                    Ok(event) if event != ended => continue,
+                    _ => break,
+                }
+            }
+            watched.revoke();
+        }).map_err(|e| e.to_string())?;
+        *g = Some(OwnerConnection { _client: client, owner, validity });
     }
-    Ok(g.as_ref().expect("initialized").1)
+    let connection = g.as_ref().expect("initialized");
+    if !connection.validity.active() { return Err("IOSurface broker owner was revoked".into()); }
+    Ok((connection.owner, std::sync::Arc::clone(&connection.validity)))
+}
+fn owner() -> Result<wc_handle::iosection::Owner, String> {
+    owner_connection().map(|(owner, _)| owner)
 }
 
 /// Publish only after the compositor has acknowledged an authenticated ADD.
@@ -310,16 +352,20 @@ pub fn announce(name: &str, surface: &Surface) -> Result<(), String> {
 
 /// Publish the exact joined NV12 surface through the typed audited endpoint.
 /// Acknowledgment proves registration, never producer or consumer completion.
-pub(crate) fn announce_nv12(name: &str, surface: &Surface) -> Result<(), String> {
+pub(crate) fn announce_nv12(name: &str, surface: &Surface) -> Result<std::sync::Arc<crate::native_video_shared_policy::Revocation>, String> {
     let s = service().ok_or("no compositor IOSurface service")?;
-    let owner = owner()?;
+    let (owner, validity) = owner_connection()?;
     let kr = wc_handle::iosection::send_nv12(s, owner, name, surface);
     if kr != 0 {
         // The receiver may have adopted the exact surface before ACK was lost.
         let _ = wc_handle::iosection::send_gone(s, owner, name);
         return Err(format!("registering original NV12 IOSurface {name}: {kr}"));
     }
-    Ok(())
+    if !validity.active() || !nv12_endpoint_alive() {
+        let _ = wc_handle::iosection::send_gone(s, owner, name);
+        return Err("NV12 owner or endpoint was revoked during registration".into());
+    }
+    Ok(validity)
 }
 
 pub fn retire(name: &str) {

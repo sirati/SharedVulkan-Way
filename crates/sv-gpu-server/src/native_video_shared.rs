@@ -3,13 +3,13 @@
 use crate::{
     native_video_image::Image,
     native_video_shared_policy::{authorize, validate_layout},
-    video_nv12::{macos::Picture, Layout},
+    video_nv12::{Layout, macos::Picture},
 };
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use wc_handle::iosection::Surface;
@@ -18,6 +18,7 @@ struct Registration {
     name: String,
     nonce: [u8; 16],
     size: u64,
+    validity: Arc<crate::native_video_shared_policy::Revocation>,
     // Image exclusively owns VkImage/VkDeviceMemory. The other owners retain
     // the same underlying IOSurface independently, including across withdrawal.
     _image: Arc<Image>,
@@ -122,11 +123,12 @@ pub(crate) fn register(image: Arc<Image>) -> Result<Lease, String> {
         return Err("NV12 export image differs from original picture extent".into());
     }
     let (name, nonce) = identity()?;
-    crate::iosurface::announce_nv12(&name, &surface)?;
+    let validity = crate::iosurface::announce_nv12(&name, &surface)?;
     let registration = Arc::new(Registration {
         name,
         nonce,
         size,
+        validity,
         _image: image,
         picture,
         _surface: surface,
@@ -151,6 +153,9 @@ pub(crate) fn resolve(
         index.get(name).and_then(Weak::upgrade)
     }
     .ok_or("NV12 export is not held by a live lease in this process")?;
+    if !registration.validity.active() || !crate::iosurface::nv12_endpoint_alive() {
+        return Err("NV12 export owner was revoked".into());
+    }
     authorize(&registration.nonce, registration.size, nonce, size)?;
     let picture = Arc::clone(&registration.picture);
     Ok((Lease(registration), picture))
