@@ -129,6 +129,7 @@ static void rights(void) {
                   &passed, &flags, 1) == 6 && passed >= 0);
     CHECK(!memcmp(bytes, "rights", 6) && !(flags & (MSG_TRUNC | MSG_CTRUNC)));
     CHECK(fcntl(passed, F_GETFD) & FD_CLOEXEC);
+    CHECK((fcntl(passed, F_GETFL) & O_ACCMODE) == (fcntl(file, F_GETFL) & O_ACCMODE));
     CHECK(fstat(passed, &received) == 0 && original.st_dev == received.st_dev &&
           original.st_ino == received.st_ino && original.st_size == received.st_size);
     CHECK(read(passed, bytes, 1) == 1 && bytes[0] == '2');
@@ -254,6 +255,8 @@ int main(int argc, char **argv) {
         int keep = atoi(argv[2]), cloexec = atoi(argv[3]); char bytes[8];
         CHECK(fcntl(cloexec, F_GETFD) == -1 && errno == EBADF);
         CHECK(fcntl(keep, F_GETFD) >= 0);
+        CHECK(fcntl(keep, F_GETFL) & O_NONBLOCK);
+        CHECK((fcntl(keep, F_GETFL) & O_ACCMODE) == O_RDWR);
         CHECK(read(keep, bytes, sizeof(bytes)) == 4 && !memcmp(bytes, "exec", 4));
         send_fd(keep, "child", 5, -1); CHECK(close(keep) == 0); return 0;
     }

@@ -90,6 +90,9 @@ int hl_wc_socket_set(int fd, int enabled) {
             close(backing);
         }
     }
+    if (s && atomic_load_explicit(&s->option->seqpacket, memory_order_acquire)) {
+        pthread_mutex_unlock(&state_lock); hl_fd_put(&ref); errno = EOPNOTSUPP; return -1;
+    }
     if (s) atomic_store_explicit(&s->option->passcred, !!enabled, memory_order_release);
     pthread_mutex_unlock(&state_lock);
     hl_fd_put(&ref);
@@ -124,8 +127,10 @@ int hl_wc_socket_import(int fd, int backing) {
     /* Fork import reconstructs legacy host aliases before option records. */
     pthread_mutex_lock(&fd_lock);
     if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_SOCKET && !fd_table[fd].desc) {
+        int flags = fcntl(fd_table[fd].host_fd, F_GETFL);
+        if (flags < 0) { pthread_mutex_unlock(&fd_lock); return -1; }
         hl_open_file_t *of = hl_open_file_create(FD_SOCKET, &hl_fd_ops_host_file,
-            fd_table[fd].linux_flags & ~LINUX_O_CLOEXEC, NULL);
+            mac_to_linux_status_flags(flags), NULL);
         hl_descriptor_t *desc = of ? hl_descriptor_create(of, fd_table[fd].host_fd,
             fd_table[fd].linux_flags & LINUX_O_CLOEXEC, FD_SOCKET, NULL) : NULL;
         if (desc) { fd_table[fd].of = of; fd_table[fd].desc = desc; }
@@ -250,13 +255,16 @@ int hl_wc_socket_enabled(hl_open_file_t *of) {
     return enabled;
 }
 
+int hl_wc_socket_seqpacket_of(hl_open_file_t *of) {
+    pthread_mutex_lock(&state_lock);
+    socket_state *s = of ? of->socket_state : NULL;
+    int result = s && atomic_load_explicit(&s->option->seqpacket, memory_order_acquire);
+    pthread_mutex_unlock(&state_lock); return result;
+}
 int hl_wc_socket_seqpacket(int fd) {
     hl_fd_ref_t ref;
     if (hl_fd_get(fd, &ref) < 0) return 0;
-    pthread_mutex_lock(&state_lock);
-    socket_state *s = ref.of ? ref.of->socket_state : NULL;
-    int result = s && atomic_load_explicit(&s->option->seqpacket, memory_order_acquire);
-    pthread_mutex_unlock(&state_lock);
+    int result = hl_wc_socket_seqpacket_of(ref.of);
     hl_fd_put(&ref); return result;
 }
 

@@ -21,5 +21,6 @@ void hl_wc_socket_transfer_end(hl_wc_socket_transfers *);
 int hl_wc_socket_transfer(int, const int *, unsigned, int *, unsigned *, hl_wc_socket_transfers *);
 int hl_wc_socket_receive(int, int *, unsigned, int *, unsigned *, int);
 int hl_wc_socket_seqpacket(int);
+int hl_wc_socket_seqpacket_of(hl_open_file_t *);
 int hl_wc_socket_private_file(void);
 #endif
