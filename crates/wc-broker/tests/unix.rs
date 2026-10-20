@@ -247,15 +247,16 @@ fn a_service_is_reached_through_the_broker() {
 // ------------------------------------------------- the keeper (§111.9)
 
 /// A broker set up as the macOS LaunchDaemon's keeper: regions wired by it,
-/// a pool's orphans released by the boot page's word, or after `after`.
-fn start_keeper(d: &Path, after: Duration) -> String {
+/// a pool's orphans released by the boot page's word. An optional timeout
+/// is used only to test the generic core policy, never by the daemon.
+fn start_keeper(d: &Path, after: Option<Duration>) -> String {
     let sock = d.join("broker.sock");
     let unix = Unix::bind(&sock, vec![]).unwrap().mac_keeper();
     let config = Config {
         devices: vec![],
         services: vec![],
         keys: None,
-        release: Release::Probe { after: Some(after) },
+        release: Release::Probe { after },
         budget: None,
         run: 9,
     };
@@ -354,7 +355,7 @@ fn wait_exit(c: &mut std::process::Child, within: Duration) -> Option<std::proce
 fn a_killed_main_process_leaves_its_pool_held_until_the_release_word() {
     use std::os::unix::process::ExitStatusExt;
     let d = dir("keeper");
-    let sock = start_keeper(&d, Duration::from_secs(600));
+    let sock = start_keeper(&d, None);
     let mut me = Client::connect(&sock).unwrap();
     me.hello("test").unwrap();
     me.subscribe().unwrap();
@@ -387,14 +388,14 @@ fn a_killed_main_process_leaves_its_pool_held_until_the_release_word() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-/// The keeper's limit: with no release word, the pool goes after its time
+/// The generic core's optional limit, not the daemon's policy: a pool goes after its time
 /// and its tied process with it; an arena page that merely holds a nonzero
 /// word where the release word would be releases nothing.
 #[test]
 fn a_pool_with_no_release_goes_after_its_limit() {
     use std::os::unix::process::ExitStatusExt;
     let d = dir("keeper-limit");
-    let sock = start_keeper(&d, Duration::from_secs(3));
+    let sock = start_keeper(&d, Some(Duration::from_secs(3)));
     let mut me = Client::connect(&sock).unwrap();
     let (mut main, line) = spawn_keeper_helper(&sock, "main");
     let ids: Vec<u64> = line.split(' ').skip(1).map(|w| w.parse().unwrap()).collect();
@@ -438,4 +439,76 @@ fn a_forwarded_connection_is_served_as_its_maker() {
     let uid = unsafe { libc::geteuid() };
     assert_eq!(line.trim(), format!("ok hello 0000000000000009 uid:{uid} {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// SIGTERM cannot drop either a live owner's region or an orphan. New
+/// allocations are refused, but adoption/free remain available to drain.
+#[test]
+fn daemon_shutdown_retains_live_regions_and_orphans_until_explicit_release() {
+    let d = dir("daemon-shutdown");
+    let sock = d.join("broker.sock");
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_wc-broker"))
+        .args([
+            "serve",
+            "--socket",
+            sock.to_str().unwrap(),
+            "--keys",
+            d.join("keys").to_str().unwrap(),
+            "--no-default-devices",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    struct Cleanup<'a>(&'a mut std::process::Child);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let cleanup = Cleanup(&mut daemon);
+    assert!(wait_for(|| sock.exists()));
+    let mut owner = Client::connect(sock.to_str().unwrap()).unwrap();
+    owner.hello("main").unwrap();
+    let (region, _) = owner.alloc("shutdown-pool", 8192, false).unwrap();
+    // SAFETY: the recorded child PID belongs to this test's daemon.
+    assert_eq!(
+        unsafe { libc::kill(cleanup.0.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert!(wait_for(|| match owner.alloc("new-pool", 8192, false) {
+        Err(_) => true,
+        Ok((r, _)) => {
+            owner.free(r.id).unwrap();
+            false
+        }
+    }));
+    // Exceeds the old ten-second forced shutdown, with a live owner.
+    std::thread::sleep(Duration::from_secs(11));
+    assert!(
+        cleanup.0.try_wait().unwrap().is_none(),
+        "live host memory must keep daemon alive"
+    );
+    drop(owner);
+    let mut adopter = Client::connect(sock.to_str().unwrap()).unwrap();
+    adopter.hello("adopter").unwrap();
+    assert!(wait_for(|| adopter.stats().unwrap().contains("orphans=1")));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        cleanup.0.try_wait().unwrap().is_none(),
+        "orphan memory must keep daemon alive"
+    );
+    assert!(adopter.alloc("new-pool", 8192, false).is_err());
+    let held = adopter.adopt("shutdown-pool").unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].0, region.id);
+    adopter.free(region.id).unwrap();
+    assert!(
+        wait_exit(cleanup.0, Duration::from_secs(3))
+            .unwrap()
+            .success()
+    );
+    drop(cleanup);
+    let _ = std::fs::remove_dir_all(d);
 }
