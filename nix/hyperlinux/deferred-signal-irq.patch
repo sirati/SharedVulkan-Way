@@ -1,0 +1,115 @@
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -980,8 +980,15 @@
+     if (hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc) != HV_SUCCESS ||
+         hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &pstate) != HV_SUCCESS)
+         goto failed;
+-    if ((pstate & 0x1f) != 0)
+-        return 0;
++    if ((pstate & 0x1f) != 0) {
++        /* Exception entry masks IRQ until ERET has restored all EL0 state.
++         * Request a virtual IRQ to obtain a safe return boundary even when
++         * the guest's resumed EL0 code makes no further syscall. */
++        if (((pstate & 0x1f) != 4 && (pstate & 0x1f) != 5) ||
++            !(pstate & (1ULL << 7)))
++            goto failed;
++        return 2;
++    }
+     if (hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc) != HV_SUCCESS ||
+         hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate) != HV_SUCCESS)
+         goto failed;
+@@ -1004,6 +1011,7 @@
+                   guest_t *g, int verbose, int timeout_sec, int is_main) {
+     int exit_code = 0;
+     int running = 1;
++    int deferred_signal_irq = 0;
+     int iter = 0;
+     /* The watchdog is now OPT-IN and covers the main vCPU only: it fires when
+      * the guest runs `timeout_sec` seconds without a VM exit (a coarse hang
+@@ -1045,6 +1053,18 @@
+         if (watchdog)
+             alarm((unsigned)timeout_sec);
+
++        /* HVF clears pending virtual interrupts after each run. Rearm only
++         * while this vCPU has a deliverable signal deferred from masked EL1. */
++        if (deferred_signal_irq) {
++            deferred_signal_irq = signal_pending();
++            if (hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ,
++                                             deferred_signal_irq != 0) != HV_SUCCESS) {
++                crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                             "failed to arm deferred signal IRQ");
++                exit_code = 128;
++                break;
++            }
++        }
+         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
+
+         /* Main: disarm timeout */
+@@ -1655,6 +1675,25 @@
+                     break;
+                 }
+
++                case 13: {
++                    /* Lower-EL IRQ entry preserves every GPR and supplies
++                     * banked EL0 PC/PSTATE. The shim has no partial saves. */
++                    uint64_t user_pstate;
++                    deferred_signal_irq = 0;
++                    if (hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1,
++                                            &user_pstate) != HV_SUCCESS ||
++                        (user_pstate & 0x1f) != 0) {
++                        crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                                     "deferred signal IRQ outside EL0");
++                        exit_code = 128;
++                        running = 0;
++                        break;
++                    }
++                    if (signal_deliver(vcpu, g, &exit_code) < 0)
++                        running = 0;
++                    break;
++                }
++
+                 case 12: {
+                     /* HVC #12: System instruction trap (EC=0x18 Direction=0).
+                      * The shim forwards trapped cache maintenance instructions
+@@ -1925,6 +1964,7 @@
+              * and tgkill-based signals in compute-bound loops. */
+             if (signal_pending()) {
+                 int sig_ret = deliver_canceled_signal(vcpu, g, &exit_code);
++                if (sig_ret == 2) deferred_signal_irq = 1;
+                 if (sig_ret < 0)
+                     running = 0;
+                 /* sig_ret >= 0: signal delivered or nothing pending,
+--- a/src/shim.S
++++ b/src/shim.S
+@@ -19,6 +19,7 @@
+  *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
+  *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame)
+  *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
++ *   #13 Deferred signal IRQ (banked EL0 state, all GPRs preserved)
+  *
+  * IMPORTANT: macOS `as` uses ';' as a comment character on AArch64,
+  * NOT as a statement separator. Each instruction must be on its own line.
+@@ -155,9 +156,8 @@
+     /* 0x400: Synchronous (from EL0) — must not clobber GPRs */
+     b svc_handler
+     .align 7
+-    /* 0x480: IRQ */
+-    mov x5, #0x480
+-    b bad_exception
++    /* 0x480: IRQ from EL0. Do not clobber any user register. */
++    b handle_signal_irq
+     .align 7
+     /* 0x500: FIQ */
+     mov x5, #0x500
+@@ -648,3 +648,11 @@
+     /* Return to EL0 — X0 now holds the syscall return value,
+      * X1-X30 retain their original EL0 values. */
+     eret
++
++/* A deferred host signal uses only the lower-EL IRQ vector. EL1 IRQs remain
++ * fatal. Exception entry has saved EL0 PC/PSTATE and masked interrupts; no
++ * GPR is touched before host delivery or after it, so ERET uses the exact
++ * resumed user state or the newly constructed handler frame. */
++handle_signal_irq:
++    hvc #13
++    eret

@@ -1,0 +1,47 @@
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -1007,2 +1007,3 @@
+     int iter = 0;
++    int test_defer_injected = 0, test_defer_observed = 0;
+     /* The watchdog is now OPT-IN and covers the main vCPU only: it fires when
+@@ -1096,2 +1097,4 @@
+                 uint16_t imm = vexit->exception.syndrome & 0xFFFF;
++                if (test_defer_observed && imm == 13)
++                    fprintf(stderr, "HL_TEST_DEFERRED_EL1 reached actual IRQ HVC13\n");
+
+@@ -1133,2 +1136,9 @@
+
++                    /* Test-build-only seam, never included in runtime.nix. */
++                    uint64_t test_nr = 0, test_arg = 0;
++                    hv_vcpu_get_reg(vcpu, HV_REG_X8, &test_nr);
++                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &test_arg);
++                    int test_trigger = !test_defer_injected && test_nr == 178 &&
++                        test_arg == UINT64_C(0x484c534947) &&
++                        getenv("HL_TEST_DEFERRED_EL1") != NULL;
+                     int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
+@@ -1163,2 +1173,10 @@
+                             running = 0; /* Default TERM/CORE disposition */
++                    }
++
++                    if (running && test_trigger) {
++                        test_defer_injected = 1;
++                        signal_queue_directed(LINUX_SIGUSR1, current_thread->tid,
++                                              LINUX_SI_TKILL);
++                        HV_CHECK_CTX(hv_vcpus_exit(&vcpu, 1), vcpu, g);
++                        fprintf(stderr, "HL_TEST_DEFERRED_EL1 queued after safe syscall check\n");
+                     }
+@@ -1881,2 +1899,14 @@
+         } else if (vexit->reason == HV_EXIT_REASON_CANCELED) {
++            if (test_defer_injected && !test_defer_observed) {
++                uint64_t test_pstate = 0;
++                HV_CHECK_CTX(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &test_pstate), vcpu, g);
++                if ((test_pstate & 0x1f) != 5 || !(test_pstate & (1ULL << 7))) {
++                    fprintf(stderr, "HL_TEST_DEFERRED_EL1 failed actual masked EL1 check\n");
++                    exit_code = 94;
++                    running = 0;
++                    continue;
++                }
++                test_defer_observed = 1;
++                fprintf(stderr, "HL_TEST_DEFERRED_EL1 observed actual canceled masked EL1\n");
++            }
+             /* Canceled by hv_vcpus_exit(). Can be: alarm timeout,
