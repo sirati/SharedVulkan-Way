@@ -19,6 +19,10 @@ fn optional_hooks_precede_mapping_and_support_explicit_worker_bypass() {
         "bind_buffer_memory2",
         "queue_submit",
         "queue_submit2",
+        "get_fence_status",
+        "wait_for_fences",
+        "get_semaphore_counter_value",
+        "wait_semaphores",
         "queue_wait_idle",
         "device_wait_idle",
         "get_physical_device_video_capabilities_khr",
@@ -85,5 +89,34 @@ fn ordinary_recording_preparation_precedes_mapping_and_follows_typed_override() 
             let typed = body.find(&format!("__h.override_{method}(&a)")).unwrap();
             assert!(typed < preparation);
         }
+    }
+}
+
+#[test]
+fn timeline_status_aliases_use_the_intercepted_core_entrypoints() {
+    let path =
+        vk_registry::registry_path().expect("VK_XML is required for this generator regression");
+    let registry = vk_registry::Registry::load_from(path).unwrap();
+    let model = registry.model().unwrap();
+    let profile = sv_codegen::profile_by_name(sv_codegen::DEFAULT_PROFILE).unwrap();
+    let generated = sv_codegen::generate_icd_entry(&model, &profile).unwrap();
+    let flat: String = generated
+        .source
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for (name, method) in [
+        (
+            "vkGetSemaphoreCounterValueKHR",
+            "sv_vk_get_semaphore_counter_value",
+        ),
+        ("vkWaitSemaphoresKHR", "sv_vk_wait_semaphores"),
+    ] {
+        assert!(
+            flat.contains(&format!(
+                "name:\"{name}\",pfn:{method}as*constcore::ffi::c_void"
+            )),
+            "{name} must share the core trampoline"
+        );
     }
 }

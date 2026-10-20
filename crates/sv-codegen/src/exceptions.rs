@@ -1047,4 +1047,5 @@ pub const GPU_OPTIONAL_OVERRIDES: &[&str] = &[
     "vkUpdateVideoSessionParametersKHR", "vkDestroyVideoSessionParametersKHR",
     "vkGetVideoSessionMemoryRequirementsKHR", "vkBindVideoSessionMemoryKHR",
     "vkQueueSubmit", "vkQueueSubmit2", "vkQueueWaitIdle", "vkDeviceWaitIdle",
+    "vkGetFenceStatus", "vkWaitForFences", "vkGetSemaphoreCounterValue", "vkWaitSemaphores",
 ];

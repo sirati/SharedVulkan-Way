@@ -39,6 +39,10 @@
 // `crate::convert` gives.
 #![allow(clippy::field_reassign_with_default)]
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "native_video_status.rs"]
+mod native_video_status;
+
 use crate::arena::Arena;
 use crate::driver::Driver;
 use crate::table::{Objects, TableError};
@@ -486,6 +490,15 @@ fn no_info() -> WireError {
 }
 
 impl GpuHost for GpuServer {
+    #[cfg(target_os = "macos")]
+    fn override_get_fence_status(&mut self,_a:&p::VkGetFenceStatusArgs)->Option<WireResult<p::VkGetFenceStatusReply>> {self.native_failed_status()}
+    #[cfg(target_os = "macos")]
+    fn override_wait_for_fences(&mut self,_a:&p::VkWaitForFencesArgs)->Option<WireResult<p::VkWaitForFencesReply>> {self.native_failed_status()}
+    #[cfg(target_os = "macos")]
+    fn override_get_semaphore_counter_value(&mut self,_a:&p::VkGetSemaphoreCounterValueArgs)->Option<WireResult<p::VkGetSemaphoreCounterValueReply>> {self.native_failed_status()}
+    #[cfg(target_os = "macos")]
+    fn override_wait_semaphores(&mut self,_a:&p::VkWaitSemaphoresArgs)->Option<WireResult<p::VkWaitSemaphoresReply>> {self.native_failed_status()}
+
     #[cfg(target_os = "macos")]
     fn prepare_recorded_command(&mut self,name:&'static str,wire:u64)->WireResult<()> {self.native_prepare_recorded_command(name,wire)}
 
