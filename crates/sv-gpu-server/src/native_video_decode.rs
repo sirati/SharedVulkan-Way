@@ -7,6 +7,8 @@ use crate::{
 };
 use std::{collections::HashMap, ops::Range, sync::Arc};
 
+#[path = "native_video_dpb.rs"]
+mod dpb;
 #[path = "native_video_h264.rs"]
 mod h264;
 // Enable only after the fresh hardware non-IDR I fixture is proven natively.
