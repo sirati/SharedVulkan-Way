@@ -19,13 +19,15 @@
 +                        test_arg == UINT64_C(0x484c534947) &&
 +                        getenv("HL_TEST_DEFERRED_EL1") != NULL;
                      int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
-@@ -1163,2 +1173,10 @@
+@@ -1163,2 +1173,12 @@
                              running = 0; /* Default TERM/CORE disposition */
 +                    }
 +
 +                    if (running && test_trigger) {
 +                        test_defer_injected = 1;
 +                        signal_queue_directed(LINUX_SIGUSR1, current_thread->tid,
++                                              LINUX_SI_TKILL);
++                        signal_queue_directed(LINUX_SIGUSR2, current_thread->tid,
 +                                              LINUX_SI_TKILL);
 +                        HV_CHECK_CTX(hv_vcpus_exit(&vcpu, 1), vcpu, g);
 +                        fprintf(stderr, "HL_TEST_DEFERRED_EL1 queued after safe syscall check\n");
