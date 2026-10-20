@@ -48,7 +48,7 @@ impl WiredHolder {
         send_with_fds(&self.socket, line.as_bytes(), &[region.fd.as_raw_fd()])?;
         let mut reply = [0u8; 1];
         self.socket.read_exact(&mut reply)?;
-        if reply != [b'+'] { return Err(io::Error::other("independent holder could not wire the region")); }
+        if reply != *b"+" { return Err(io::Error::other("independent holder could not wire the region")); }
         Ok(())
     }
 
@@ -81,13 +81,9 @@ pub fn run() -> io::Result<()> {
     let mut regions = BTreeMap::<u64, Region>::new();
     let mut buf = Vec::new();
     let mut fds = Vec::new();
-    loop {
-        let line = match recv_line(&socket, &mut buf, &mut fds) {
-            Ok(Some(line)) => line,
-            // A malformed/broken private channel is loss of the controller,
-            // never permission to unwind mappings or exit.
-            Ok(None) | Err(_) => break,
-        };
+    // A malformed/broken private channel is loss of the controller,
+    // never permission to unwind mappings or exit.
+    while let Ok(Some(line)) = recv_line(&socket, &mut buf, &mut fds) {
         let words: Vec<_> = line.split_whitespace().collect();
         match words.as_slice() {
             ["add", id, epoch, len, user, pool] if fds.len() == 1 => {
