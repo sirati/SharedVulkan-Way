@@ -165,7 +165,10 @@ fn normalized(path: &Path) -> io::Result<PathBuf> {
 }
 fn open(path: &Path, write_security: bool, directory: bool) -> io::Result<Owned> {
     let text = wide(path.to_str().ok_or_else(|| deny("non-Unicode path"))?);
+    // Metadata-only handles do not participate in Windows share checks.
+    // READ_DATA/LIST_DIRECTORY activates the deny-write/delete share contract.
     let rights = READ_CONTROL
+        | 1
         | FILE_READ_ATTRIBUTES
         | if write_security {
             WRITE_DAC | WRITE_OWNER
@@ -229,7 +232,7 @@ fn open_child(parent: &Owned, name: &std::ffi::OsStr) -> io::Result<Owned> {
     let result = unsafe {
         NtCreateFile(
             &mut raw,
-            READ_CONTROL | FILE_READ_ATTRIBUTES | 0x0010_0000,
+            READ_CONTROL | 1 | FILE_READ_ATTRIBUTES | 0x0010_0000,
             &object,
             &mut status,
             std::ptr::null(),
@@ -605,7 +608,7 @@ mod tests {
             let before = extra(right).unwrap();
             assert!(
                 DirectoryPin::open(&directory).is_err(),
-                "preexisting write/delete handle was ignored"
+                "preexisting right {right:#x} handle was ignored"
             );
             drop(before);
         }
