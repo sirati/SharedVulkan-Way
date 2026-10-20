@@ -583,19 +583,12 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             }
         }
     }
-    pub fn seal(
-        &mut self,
-        lifecycle: &Lifecycle<S, B>,
-        grant: &GrantId,
-        phase: Phase,
-        payload: Payload,
-    ) -> io::Result<Frame> {
-        self.record(lifecycle, grant)?;
-        lifecycle.seal(
-            &mut self.records.get_mut(&grant.id).unwrap().channel,
-            phase,
-            payload,
-        )
+    /// Announce only this service-owned, durable, initialized existing grant.
+    /// Resource messages need typed canonical-resource adapters; callers cannot
+    /// supply arbitrary allocation/transfer payloads through this owner.
+    pub fn grant_frame(&mut self, lifecycle: &Lifecycle<S,B>, grant: &GrantId) -> io::Result<Frame> {
+        self.record(lifecycle,grant)?;
+        lifecycle.seal(&mut self.records.get_mut(&grant.id).unwrap().channel, Phase::Grant, Payload::default())
     }
     /// Evidence is historical only. No resource mutation accepts it later.
     pub fn verify(
@@ -792,7 +785,7 @@ mod tests {
         assert_eq!(range(&o, &output), (8 * MIB, PAGE));
         assert_eq!(range(&o, &stream), (12 * MIB, PAGE));
         assert!(
-            o.seal(&b, &ga, Phase::Allocate, Payload::default())
+            o.grant_frame(&b, &ga)
                 .is_err()
         );
         assert!(o.record(&a, &gb).is_err());
@@ -910,10 +903,10 @@ mod tests {
         assert!(o.project_producer(&life, &p, &a, &mut backend).is_err());
         assert!(o.allocate(&life, &p, 1, PAGE).is_err());
         assert!(o.resize(&life, &p, &a, PAGE).is_err());
-        assert!(o.seal(&life, &g, Phase::Grant, Payload::default()).is_err());
+        assert!(o.grant_frame(&life, &g).is_err());
     }
     #[test]
-    fn retained_historical_evidence_never_bypasses_current_context_or_process_checks() {
+    fn current_context_and_process_queries_are_required_at_each_mutation() {
         let (mut o, mut life, _, _, _, _, _, service) = setup();
         let g = o.grant(&mut life, GrantKind::Pixel, 3 * PAGE).unwrap();
         let (p, process) = process(&mut o, &life, &g);
