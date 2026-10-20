@@ -25,15 +25,13 @@ fn main() -> std::io::Result<()> {
     fn require(ok: bool, s: &str) -> io::Result<()> {
         if ok { Ok(()) } else { Err(io::Error::other(s)) }
     }
-    fn retired(m: &sv_ram::linux_payload::protected::ProtectedMonitor) -> io::Result<()> {
+    fn proof(
+        m: &mut sv_ram::linux_payload::protected::ProtectedMonitor,
+    ) -> io::Result<wc_broker::service_grants::native::RetirementProof> {
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            match m.native_state()? {
-                NativeExportState::Retired => return Ok(()),
-                NativeExportState::Failed => {
-                    return Err(io::Error::other("kernel exporter failed"));
-                }
-                _ => {}
+            if let Some(proof) = m.try_retirement()? {
+                return Ok(proof);
             }
             require(
                 Instant::now() < until,
@@ -115,7 +113,7 @@ fn main() -> std::io::Result<()> {
     let canonical::Flow {
         producer,
         consumer,
-        owner,
+        mut owner,
         physical_offset,
         capacity,
         durable_exclusions,
@@ -159,9 +157,14 @@ fn main() -> std::io::Result<()> {
         "canonical RO mapping upgraded to execute",
     )?;
     println!("CANONICAL: shared original bytes and immutable RO write/execute denial verified");
-    let consumer_monitor = consumer.into_monitor();
-    retired(&consumer_monitor)?;
-    println!("CANONICAL: exact consumer monitor retired");
+    let mut consumer_monitor = consumer.into_monitor();
+    owner.complete(proof(&mut consumer_monitor)?)?;
+    require(
+        consumer_monitor.try_retirement().is_err(),
+        "consumer proof repeated",
+    )?;
+    owner.assert_producer_pressure(&mut backend)?;
+    println!("TRACKED: consumer proof consumed once; live producer remains admission-limited");
     let mut pipe = [-1; 2];
     require(
         unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } == 0,
@@ -183,10 +186,14 @@ fn main() -> std::io::Result<()> {
     unsafe {
         libc::close(pipe[0]);
     }
-    let producer_monitor = producer.into_monitor();
+    let mut producer_monitor = producer.into_monitor();
     require(
         producer_monitor.native_state()? == NativeExportState::Live,
         "surviving child alias was falsely retired",
+    )?;
+    require(
+        producer_monitor.try_retirement()?.is_none(),
+        "surviving child alias minted a proof",
     )?;
     let byte = 1u8;
     require(
@@ -204,7 +211,11 @@ fn main() -> std::io::Result<()> {
         "protected alias child failed",
     )?;
     // Actual kernel completion is checked independently after child exit.
-    retired(&producer_monitor)?;
+    owner.complete(proof(&mut producer_monitor)?)?;
+    require(
+        producer_monitor.try_retirement().is_err(),
+        "producer proof repeated",
+    )?;
     println!(
         "CANONICAL: surviving child alias kept producer LIVE; exact monitor retired after final alias"
     );
@@ -212,6 +223,22 @@ fn main() -> std::io::Result<()> {
         owner.exclusions()? == durable_exclusions,
         "canonical exclusion changed after native retirement",
     )?;
+    // Exceed the total admission limit many times while the exact live source
+    // stays enrolled. Each proof returns only native count/capacity admission.
+    for _ in 0..32 {
+        let projection = owner.project_producer(&mut backend)?;
+        owner.assert_producer_pressure(&mut backend)?;
+        let mut monitor = projection.into_monitor();
+        owner.complete(proof(&mut monitor)?)?;
+        require(monitor.try_retirement().is_err(), "repeated loop proof")?;
+    }
+    require(
+        owner.exclusions()? == durable_exclusions,
+        "native admission reuse changed durable exclusion",
+    )?;
+    println!(
+        "TRACKED: 32 fresh native exports completed beyond limit2; capacity returned, exact proofs single-use, durable grant retained"
+    );
     // Mutating our own disposable QEMU status must invalidate native source
     // liveness without treating either source death or pause as grant retirement.
     enrolled.pause_owned_source()?;
@@ -267,7 +294,7 @@ fn main() -> std::io::Result<()> {
     drop(reopened);
     drop((backend, enrolled));
     println!(
-        "CANONICAL NATIVE PASS: actual QMP inherited original -> durable registry/context/grant -> typed producerRW/consumerRO -> surviving native alias LIVE -> exact monitors RETIRED; durable exclusions retained {:?}. SIMULATED remote bootstrap only; no GPU/crossVM/release",
+        "TRACKED CANONICAL NATIVE PASS: actual QMP inherited original -> durable registry/context/grant -> typed producerRW/consumerRO -> surviving native alias LIVE -> exact monitors RETIRED; durable exclusions retained {:?}. SIMULATED remote bootstrap only; no GPU/crossVM/release",
         durable_exclusions
     );
     // Registry evidence remains in this private directory. No deletion/reset API.

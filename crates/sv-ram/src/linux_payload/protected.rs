@@ -2,7 +2,13 @@
 //! Native retirement is one local export fact, never permission to reuse a
 //! physical grant. No descriptor transfer or canonical release API is exposed.
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use wc_broker::service_grants::native::{
+    NativeExportIdentity, NativeProjectionAuthority, NativeProviderAuthority, ProjectionTicket,
+    RetirementProof, TrackedProjectionBackend,
+};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 struct Range {
     offset: u64,
@@ -78,26 +84,75 @@ fn immutable(mut info: Info) -> Info {
     info
 }
 
+/// Actual retained raw-device/module authority. Never a pathname or instance
+/// tuple. The reviewed fops owner pins its module for this open File's lifetime.
+struct ProtectedProvider {
+    device: File,
+    identity: (u64, u64, u64),
+}
+impl ProtectedProvider {
+    fn validate(&self) -> io::Result<()> {
+        let m = self.device.metadata()?;
+        let flags = unsafe { libc::fcntl(self.device.as_raw_fd(), libc::F_GETFL) };
+        let descriptor = unsafe { libc::fcntl(self.device.as_raw_fd(), libc::F_GETFD) };
+        if m.mode() & libc::S_IFMT != libc::S_IFCHR
+            || (m.dev(), m.ino(), m.rdev()) != self.identity
+            || flags < 0
+            || flags & libc::O_ACCMODE != libc::O_RDWR
+            || descriptor < 0
+            || descriptor & libc::FD_CLOEXEC == 0
+        {
+            return Err(denied("retained protected provider object/access changed"));
+        }
+        Ok(())
+    }
+}
+// SAFETY: created only from independently authenticated reviewed native device.
+// The exact retained File pins that fops/module instance, whose CREATE IDs are
+// global, strictly monotonic, nonwrapping and never reused. No discovery export
+// or caller-supplied instance establishes this authority.
+unsafe impl NativeProviderAuthority for ProtectedProvider {}
+
 /// Retains a trusted private-overlay device and exact current service target.
 /// There is no stock-ABI or pathname fallback.
 pub struct ProtectedBackend {
     local: ServiceLocalBackend,
-    device: File,
+    provider: Arc<ProtectedProvider>,
+    authority: Arc<dyn NativeProviderAuthority>,
 }
 impl ProtectedBackend {
     /// # Safety
     /// Protected launcher must independently authenticate this retained device
     /// as the reviewed overlay instance, its loaded source/build and native
-    /// proof. An ioctl number or caller pathname does not authenticate a module.
+    /// proof, including fops module ownership, one immutable instance per module
+    /// lifetime, strictly monotonic nonwrapping CREATE IDs, and irreversible
+    /// all-alias/native-hold/fence retirement with no later remap. The retained
+    /// raw File must pin that module lifetime. An ioctl number or caller pathname
+    /// does not authenticate a module.
     /// `local` must obey its protected-service enrollment/fork contract.
     pub unsafe fn from_verified_device(
         local: ServiceLocalBackend,
         device: File,
     ) -> io::Result<Self> {
-        if device.metadata()?.mode() & libc::S_IFMT != libc::S_IFCHR {
-            return Err(denied("protected exporter is not a character device"));
-        }
-        Ok(Self { local, device })
+        let m = device.metadata()?;
+        let provider = Arc::new(ProtectedProvider {
+            device,
+            identity: (m.dev(), m.ino(), m.rdev()),
+        });
+        provider.validate()?;
+        let authority: Arc<dyn NativeProviderAuthority> = provider.clone();
+        Ok(Self {
+            local,
+            provider,
+            authority,
+        })
+    }
+    /// Enroll this exact retained device authority with the canonical owner.
+    /// Its first fresh tracked export pins the actual kernel instance at bind.
+    pub fn provider_authority(&self) -> io::Result<Arc<dyn NativeProviderAuthority>> {
+        self.local.local.current()?;
+        self.provider.validate()?;
+        Ok(self.authority.clone())
     }
     pub fn target(&self) -> Arc<dyn ServiceProcess> {
         self.local.target()
@@ -130,6 +185,7 @@ unsafe impl ProjectionBackend<SealedBacking> for ProtectedBackend {
         access: ProjectionAccess,
     ) -> io::Result<Self::Projection> {
         self.local.local.current()?;
+        self.provider.validate()?;
         if !Arc::ptr_eq(&target, &self.local.target) {
             return Err(denied(
                 "protected export target differs from retained local service",
@@ -158,7 +214,8 @@ unsafe impl ProjectionBackend<SealedBacking> for ProtectedBackend {
                 "protected projection differs from canonical physical grant",
             ));
         }
-        let (mapping, data, monitor, info) = create_checked(&self.device, b, extent, access)?;
+        let (mapping, data, monitor, info) =
+            create_checked(&self.provider.device, b, extent, access)?;
         Ok(ProtectedProjection {
             mapping,
             data,
@@ -168,8 +225,84 @@ unsafe impl ProjectionBackend<SealedBacking> for ProtectedBackend {
             local: self.local.local.clone(),
             logical: extent.length,
             access,
+            extent,
+            provider: self.provider.clone(),
+            authority: None,
         })
     }
+}
+// SAFETY: this callback performs one fresh synchronous CREATE/immutable INFO+
+// RANGE validation/bind under the owner's serialized gate. Only this exact
+// retained provider and native target are admitted. Authority stays attached to
+// the actual monitor and cannot turn an untracked export into a tracked proof.
+unsafe impl TrackedProjectionBackend<SealedBacking> for ProtectedBackend {
+    type Projection = ProtectedProjection;
+    fn project_tracked(
+        &mut self,
+        grant: Arc<RetainedGrant<SealedBacking>>,
+        ticket: ProjectionTicket,
+    ) -> io::Result<Self::Projection> {
+        if !Arc::ptr_eq(ticket.provider(), &self.authority) {
+            return Err(denied(
+                "projection ticket belongs to another retained provider",
+            ));
+        }
+        if ticket.binding() != grant.binding() {
+            return Err(denied(
+                "projection ticket differs from exact retained grant",
+            ));
+        }
+        if grant.original().live_owner.is_none() {
+            return Err(unsupported(
+                "tracked projection requires requeryable original source owner",
+            ));
+        }
+        let extent = ticket.extent();
+        let access = ticket.access();
+        let target = ticket.target().clone();
+        let mut projection = <Self as ProjectionBackend<SealedBacking>>::project(
+            self,
+            grant,
+            extent,
+            target.clone(),
+            access,
+        )?;
+        let info = projection.expected;
+        // SAFETY: actual retained monitor's immutable facts and exact one-range
+        // source were verified before this view can be returned or transferred.
+        let identity = unsafe {
+            NativeExportIdentity::from_kernel(
+                info.instance,
+                info.export_id,
+                wc_broker::bar_registry::PhysicalBacking {
+                    host_device: info.source_dev,
+                    host_inode: info.source_ino,
+                    bar_bytes: info.source_bytes,
+                },
+                extent.offset,
+                extent.capacity,
+                access,
+            )
+        }?;
+        // SAFETY: fresh export belongs only to this ticket and exact native
+        // target. The returned authority is retained in this view/monitor.
+        projection.authority = Some(unsafe { ticket.bind(identity, target) }?);
+        Ok(projection)
+    }
+}
+fn query_range(fd: &OwnedFd) -> io::Result<Range> {
+    let mut query = QueryRange {
+        index: 0,
+        reserved: 0,
+        range: Range { offset: 0, size: 0 },
+    };
+    if unsafe { libc::ioctl(fd.as_raw_fd(), RANGE, &mut query) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if query.index != 0 || query.reserved != 0 {
+        return Err(denied("native range query identity changed"));
+    }
+    Ok(query.range)
 }
 fn create_checked(
     device: &File,
@@ -237,15 +370,8 @@ fn create_checked(
     {
         return Err(denied("protected kernel source/access identity differs"));
     }
-    let mut qr = QueryRange {
-        index: 0,
-        reserved: 0,
-        range: Range { offset: 0, size: 0 },
-    };
-    if unsafe { libc::ioctl(monitor.as_raw_fd(), RANGE, &mut qr) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if qr.range.offset != extent.offset || qr.range.size != extent.capacity {
+    let range = query_range(&monitor)?;
+    if range.offset != extent.offset || range.size != extent.capacity {
         return Err(denied("protected kernel physical extent differs"));
     }
     let length = usize::try_from(extent.capacity)
@@ -276,6 +402,9 @@ pub struct ProtectedProjection {
     local: Arc<LocalProcess>,
     logical: u64,
     access: ProjectionAccess,
+    extent: Extent,
+    provider: Arc<ProtectedProvider>,
+    authority: Option<NativeProjectionAuthority>,
 }
 impl ProtectedProjection {
     /// A const pointer for both access modes. Writes require the separately
@@ -303,6 +432,9 @@ impl ProtectedProjection {
             expected,
             grant,
             local,
+            extent,
+            provider,
+            authority,
             ..
         } = self;
         drop(mapping);
@@ -312,6 +444,10 @@ impl ProtectedProjection {
             expected,
             _grant: grant,
             local,
+            extent,
+            provider,
+            authority,
+            poisoned: AtomicBool::new(false),
         }
     }
 }
@@ -322,15 +458,68 @@ pub struct ProtectedMonitor {
     expected: Info,
     _grant: Arc<RetainedGrant<SealedBacking>>,
     local: Arc<LocalProcess>,
+    extent: Extent,
+    provider: Arc<ProtectedProvider>,
+    authority: Option<NativeProjectionAuthority>,
+    poisoned: AtomicBool,
 }
 impl ProtectedMonitor {
-    pub fn native_state(&self) -> io::Result<NativeExportState> {
-        self.local.current()?;
-        let current = query(&self.monitor)?;
-        if immutable(current) != self.expected {
-            return Err(denied("retained native monitor identity changed"));
+    fn checked_state(&self) -> io::Result<NativeExportState> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(denied("native monitor permanently quarantined"));
         }
-        state(current.state)
+        let result = (|| {
+            self.local.current()?;
+            self.provider.validate()?;
+            self._grant.original().validate()?;
+            let current = query(&self.monitor)?;
+            if immutable(current) != self.expected {
+                return Err(denied("retained native monitor identity changed"));
+            }
+            let range = query_range(&self.monitor)?;
+            if range.offset != self.extent.offset || range.size != self.extent.capacity {
+                return Err(denied("retained native monitor range changed"));
+            }
+            state(current.state)
+        })();
+        if result.is_err() || matches!(result, Ok(NativeExportState::Failed)) {
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    /// Local native fact only; never a canonical release or proof constructor.
+    pub fn native_state(&self) -> io::Result<NativeExportState> {
+        self.checked_state()
+    }
+    /// Produce one owner-bound proof only after this exact export's irreversible
+    /// kernel all-alias/fence retirement. LIVE/DRAINING retains its authority;
+    /// any uncertain native/source/provider query permanently quarantines it.
+    pub fn try_retirement(&mut self) -> io::Result<Option<RetirementProof>> {
+        if self.authority.is_none() {
+            return Err(unsupported(
+                "untracked or already consumed native authority",
+            ));
+        }
+        match self.checked_state()? {
+            NativeExportState::Live | NativeExportState::Draining => Ok(None),
+            NativeExportState::Failed => Err(denied("native export failed, authority retained")),
+            NativeExportState::Retired => {
+                let authority = self.authority.take().unwrap();
+                // SAFETY: exact retained reviewed monitor, immutable source/
+                // access/range and current provider/source were revalidated.
+                // RETIRED is published only after all exporter aliases, native
+                // holds and captured fences have ended. No process exit or
+                // caller enum supplies this authority. This private backend
+                // offers no hardware GPU/desktop import route.
+                match unsafe { authority.prove_retired() } {
+                    Ok(proof) => Ok(Some(proof)),
+                    Err(error) => {
+                        self.poisoned.store(true, Ordering::SeqCst);
+                        Err(error)
+                    }
+                }
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -385,7 +574,7 @@ mod tests {
         };
         for access in [ProjectionAccess::ReadOnly, ProjectionAccess::ReadWrite] {
             let (mapping, data, monitor, info) =
-                create_checked(&backend.device, &b, extent, access).unwrap();
+                create_checked(&backend.provider.device, &b, extent, access).unwrap();
             assert_eq!(query(&monitor).unwrap(), info);
             assert_eq!(
                 unsafe { std::ptr::read_volatile(mapping.base.cast::<u8>()) },
