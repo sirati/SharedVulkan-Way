@@ -468,8 +468,14 @@ impl Platform for Windows {
             unsafe { UnmapViewOfFile(v) };
             note = r?;
         }
-        if let Some(h) = &self.holder {
-            h.add(info, user, obj.h)?;
+        if let Some(h) = &self.holder
+            && let Err(e) = h.add(info, user, obj.h)
+        {
+            // Link::add registers the raw handle before transferring it.
+            // The failed allocation drops that handle, so the restart
+            // watcher must not retain it and later duplicate a reused value.
+            h.del(info.id);
+            return Err(e);
         }
 
         Ok(note)
