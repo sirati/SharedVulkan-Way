@@ -238,6 +238,24 @@ fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
         Ok(uid)
     }
 }
+#[cfg(target_os = "macos")]
+fn no_sigpipe(stream: &UnixStream) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as _,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn receive(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; REQUEST_LEN])>> {
     let mut bytes = [0u8; REQUEST_LEN];
     // Aligned, bounded control buffer. Adopt every received FD before checking
@@ -252,8 +270,12 @@ fn receive(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; REQUEST_
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    #[cfg(target_os = "linux")]
+    let recv_flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let recv_flags = 0;
     let n = loop {
-        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, recv_flags) };
         if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         }
@@ -306,6 +328,8 @@ pub fn serve_connection(
     expected_uid: libc::uid_t,
     registry: &Registry,
 ) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    no_sigpipe(&stream)?;
     if peer_uid(&stream)? != expected_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -353,8 +377,12 @@ pub fn register(stream: &mut UnixStream, fd: BorrowedFd<'_>, header: &[u8]) -> i
         (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<libc::c_int>(), fd.as_raw_fd());
     }
+    #[cfg(target_os = "linux")]
+    let send_flags = libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let send_flags = 0;
     let n = loop {
-        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, 0) };
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, send_flags) };
         if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
             continue;
         }
