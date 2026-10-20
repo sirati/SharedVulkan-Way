@@ -198,21 +198,47 @@ def decode_protocol(lines):
             "complete_import_metadata": bool(imports) and not errors and not pending and all(i["complete_plane_fields_no_observed_collision"] for i in imports)}
 
 
+def decode_native(lines):
+    errors, received, sent, pending = [], [], [], {}
+    for line_number, line in enumerate(lines, 1):
+        resumed = re.search(r"<\.\.\. ([a-z_0-9]+) resumed>", line)
+        call = re.search(r"\b([a-z_][a-z_0-9]*)\(", line)
+        operation = resumed.group(1) if resumed else call.group(1) if call else None
+        if operation is None:
+            continue
+        prefix = re.match(r"(?:\[pid\s+(\d+)\]|(\d+))\s+\d+\.\d+\s+", line)
+        pid = next((value for value in prefix.groups() if value), None) if prefix else None
+        key = (pid, operation)
+        entry = {"line": line_number, "raw": line, "operation": operation, "pid": pid}
+        if resumed and key in pending:
+            entry["unfinished_entry"] = pending.pop(key)
+        if "<unfinished ...>" in line:
+            pending[key] = entry.copy()
+        if "SCM_RIGHTS" in line:
+            if operation == "recvmsg":
+                received.append(entry.copy())
+            elif operation == "sendmsg":
+                sent.append(entry.copy())
+        error = re.search(r"= -1 ([A-Z_]+)", line)
+        if error:
+            entry["errno"] = error.group(1)
+            errors.append(entry)
+    return {"native_syscall_errors": errors, "received_descriptor_records": received,
+            "sent_descriptor_records": sent, "unfinished_native_calls": list(pending.values())}
+
+
 def decode(args):
     protocol = Path(args.protocol)
     result = decode_protocol(protocol.read_text(errors="replace").splitlines())
     result["protocol_log"] = record(protocol)
     result["native_trace_logs"] = [record(path) for path in args.trace]
-    result["native_failures"] = []
-    result["received_descriptor_records"] = []
+    for key in ("native_syscall_errors", "received_descriptor_records", "sent_descriptor_records", "unfinished_native_calls"):
+        result[key] = []
     for path in args.trace:
-        for line_number, line in enumerate(Path(path).read_text(errors="replace").splitlines(), 1):
-            entry = {"path": str(path), "line": line_number, "raw": line}
-            if "SCM_RIGHTS" in line:
-                result["received_descriptor_records"].append(entry)
-            if re.search(r"\b(ioctl|mmap|recvmsg)\(", line) and re.search(r"= -1 [A-Z_]+", line):
-                result["native_failures"].append(entry)
-    result["acceptance"] = "diagnostic receipt only; absence of a kernel error does not establish native import success"
+        native = decode_native(Path(path).read_text(errors="replace").splitlines())
+        for key, entries in native.items():
+            result[key].extend({"path": str(path), **entry} for entry in entries)
+    result["acceptance"] = "diagnostic receipt only; syscall errors can be nonfatal and do not by themselves identify the import failure"
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
 
 

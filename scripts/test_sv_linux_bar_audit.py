@@ -49,5 +49,28 @@ class ImportReceipts(unittest.TestCase):
         self.assertFalse(audit.decode_protocol(['Error during import'])['complete_import_metadata'])
 
 
+class NativeReceipts(unittest.TestCase):
+    def test_resumed_error_retains_original_fd_and_errno(self):
+        result = audit.decode_native([
+            '33 1792512000.100 ioctl(47</dev/dri/renderD190>, DRM_IOCTL_PRIME_FD_TO_HANDLE, 0x123 <unfinished ...>',
+            '44 1792512000.101 mmap(NULL, 4096, PROT_READ, MAP_SHARED, 9, 0) = 0x10000',
+            '33 1792512000.102 <... ioctl resumed>) = -1 EINVAL (Invalid argument)',
+        ])
+        error = result['native_syscall_errors'][0]
+        self.assertEqual(error['errno'], 'EINVAL')
+        self.assertIn('47</dev/dri/renderD190>', error['unfinished_entry']['raw'])
+        self.assertEqual(error['unfinished_entry']['line'], 1)
+        self.assertFalse(result['unfinished_native_calls'])
+
+    def test_send_rights_are_not_reported_as_received_rights(self):
+        result = audit.decode_native([
+            '33 1792512000.100 sendmsg(4, {msg_control=[{cmsg_type=SCM_RIGHTS, cmsg_data=[8]}]}, 0) = 24',
+            '33 1792512000.101 recvmsg(4, {msg_control=[{cmsg_type=SCM_RIGHTS, cmsg_data=[19</dev/shm/object>]}]}, 0) = 24',
+        ])
+        self.assertEqual(len(result['sent_descriptor_records']), 1)
+        self.assertEqual(len(result['received_descriptor_records']), 1)
+        self.assertIn('19</dev/shm/object>', result['received_descriptor_records'][0]['raw'])
+
+
 if __name__ == '__main__':
     unittest.main()
