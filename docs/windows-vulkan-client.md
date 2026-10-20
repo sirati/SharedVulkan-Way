@@ -65,3 +65,20 @@ strict transport lint and Linux/Windows ICD library lint, plus the Windows
 probe build/lint. Existing ICD all-target lint hits an unrelated
 `state.rs` items-after-test-module warning. Runtime results must be reported
 separately from these compile/protocol checks.
+
+The real reverse-topology Vulkan leg passed on 2026-10-20 at executable
+`64a14b0`. The GPU server ran natively on vmhost's NVIDIA GeForce RTX 5090;
+the client ran inside disposable Windows `wcram` with 3 GiB RAM, four vCPUs,
+no GPU passthrough and a 64 MiB shared BAR. The native Windows Vulkan loader
+loaded the MinGW ICD, obtained the BAR and virtio-serial port from the SID-bound
+broker, attached through the pool mailboxes and submitted the fill workload.
+The Linux server reported the NVIDIA device and leased host memory type 2.
+All 65,536 words contained the GPU fill pattern. The watchdog stayed healthy;
+the Linux writer exited before the VM stopped normally.
+
+This proves that hardware/driver and role direction. It does not prove
+testhost's Intel iGPU topology: read-only inspection found its only display
+function, 0000:00:02.0, bound to vfio-pci while the daily Windows VM was active.
+No device was rebound and that VM was not restarted. The separate Cygwin
+Wayland-client proof remains owned by its adapter work; Vulkan success is not
+a substitute for Cygwin compatibility or presentation.
