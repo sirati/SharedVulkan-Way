@@ -8,13 +8,14 @@ assert lib.assertMsg (hlCross.stdenv.buildPlatform.isLinux &&
 hlCross.overrideAttrs (old: {
   pname = "hl-waycompose";
   src = import ./source.nix;
-  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ./async-signal-context.patch ./deferred-signal-irq.patch ./primary-access-permissions.patch ./native-buffer-authority.patch ./user-state-guard.patch ./gdb-user-state.patch ];
+  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ./async-signal-context.patch ./deferred-signal-irq.patch ./primary-access-permissions.patch ./primary-pt-domain.patch ./native-buffer-authority.patch ./user-state-guard.patch ./gdb-user-state.patch ];
   postPatch = (old.postPatch or "") + ''
     cp ${./hl_shared.c} src/hl_shared.c
     cp ${./hl_shared.h} src/hl_shared.h
     cp ${./hl_pt_access.h} src/hl_pt_access.h
     cp ${./hl_guest_iov.h} src/hl_guest_iov.h
     cp ${./hl_user_regs.h} src/hl_user_regs.h
+    cp ${./hl_pt_domain.h} src/hl_pt_domain.h
     cp ${./hl_seals.c} src/hl_seals.c
     cp ${./hl_seals.h} src/hl_seals.h
     cp ${./hl_drm.c} src/hl_drm.c
