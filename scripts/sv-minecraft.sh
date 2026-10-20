@@ -340,6 +340,9 @@ run() {
     [ -n "$NODE" ] && break; sleep 0.2
   done
   [ -n "$NODE" ] || die "wc-compositor.exe never listened; see $RUN/wine.log"
+  # Wine prefixes can exceed the Unix socket pathname limit.
+  ln -s "$NODE" "$RUN/compositor.sock"
+  NODE="$RUN/compositor.sock"
   SV_ALLOW_FILE_ARENA=1 WC_FRAME_TRACE="$RUN/trace/%p.txt" "$BIN/wc-proxy" --upstream "$NODE" \
     --socket svmc --runtime-dir "$RUN/xdg" --copy damage --dmabuf-node "$RENDER_NODE" \
     --transport arena --arena-path "$RUN/wc-arena" --arena-id 0 --arena-size "$WCARENA" \

@@ -199,6 +199,9 @@ for _ in $(seq 1 600); do
   sleep 0.2
 done
 [ -n "$NODE_SOCK" ] || { echo "FAIL: the compositor never made its socket"; tail "$RUN/loader.log"; exit 1; }
+# Wine prefixes can exceed the Unix socket pathname limit.
+ln -s "$NODE_SOCK" "$RUN/compositor.sock"
+NODE_SOCK="$RUN/compositor.sock"
 
 # ----------------------------------------------------------------- GPU side ---
 PORT=$((30000 + RANDOM % 20000))
