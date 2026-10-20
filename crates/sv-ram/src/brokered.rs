@@ -615,6 +615,8 @@ mod tests {
     use sv_transport::region::SharedRegion;
     use sv_transport::regiontab::TABLE_LEN;
 
+    type Drained = Box<dyn FnMut(u64, u64) + Send>;
+
     #[derive(Default)]
     struct Fake {
         log: Mutex<Vec<String>>,
@@ -622,7 +624,7 @@ mod tests {
         leases: Mutex<BTreeMap<u64, Vec<u32>>>,
         retiring: Mutex<BTreeSet<u64>>,
         next: Mutex<u64>,
-        cb: Mutex<Vec<Box<dyn FnMut(u64, u64) + Send>>>,
+        cb: Mutex<Vec<Drained>>,
         pieces: Mutex<BTreeMap<u64, Vec<(u64, u64)>>>,
     }
 

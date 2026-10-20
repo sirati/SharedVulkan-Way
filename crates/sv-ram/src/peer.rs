@@ -537,8 +537,10 @@ mod tests {
 
     /// A stand-in for the broker: it records what was published, and holds a
     /// retire for as long as a "client" holds the region.
+    /// (published (k, epoch, runs), a client holds it, let_go calls (k, epoch))
+    type FakeState = (Vec<(u32, u64, usize)>, bool, Vec<(u32, u64)>);
     #[derive(Clone, Default)]
-    struct FakeMappers(std::sync::Arc<std::sync::Mutex<(Vec<(u32, u64, usize)>, bool, Vec<(u32, u64)>)>>);
+    struct FakeMappers(std::sync::Arc<std::sync::Mutex<FakeState>>);
 
     impl Mappers for FakeMappers {
         fn publish(&mut self, m: &Mapped, _: std::os::fd::BorrowedFd<'_>) -> Result<(), String> {
