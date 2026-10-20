@@ -2291,11 +2291,13 @@ mod native_prime;
 #[cfg(target_os = "macos")]
 pub fn run_headless_section_fixture() -> std::io::Result<()> {
     let private = std::env::var_os("WC_NV12_PRIVATE_NAMESPACE").is_some();
+    let _owner;
     if private {
-        let (_owner, port) = native_prime::start_private_section_service()?;
-        eprintln!("NV12_PRIVATE_SECTION_READY port={port}");
+        let (owner, port) = native_prime::start_private_section_service()?;
+        _owner = Some(owner);
+        eprintln!("NV12_PRIVATE_SECTION_READY port={port} capability=task-local-send-right");
     } else {
-        let _owner = native_prime::start_section_service()?
+        _owner = native_prime::start_section_service()?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
                                                "WC_GPU_SECTIONS is unset"))?;
         eprintln!("NV12_SECTION_SERVICE_READY");

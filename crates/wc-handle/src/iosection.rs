@@ -110,6 +110,7 @@ unsafe extern "C" {
     fn bootstrap_look_up(bp: Port, name: *const i8, sp: *mut Port) -> Kr;
     fn mach_msg_destroy(msg: *mut c_void);
     fn mach_port_allocate(task: Port, right: u32, name: *mut Port) -> Kr;
+    fn mach_port_insert_right(task: Port, name: Port, poly: Port, disposition: u32) -> Kr;
     fn mach_port_mod_refs(task: Port, name: Port, right: u32, delta: i32) -> Kr;
     fn mach_msg(msg: *mut c_void, option: i32, send: u32, rcv: u32, port: Port, timeout: u32, notify: Port) -> Kr;
 }
@@ -466,6 +467,10 @@ fn acknowledge(bytes: &mut Receive, status: i32) {
 pub fn private_service_port() -> Result<u32, Kr> {
     let mut port = 0;
     let kr = unsafe { mach_port_allocate(mach_task_self_, 1, &mut port) };
+    if kr != 0 { return Err(kr); }
+    /* Install a send right in this same task. The numeric name is only
+     * meaningful with this capability; no bootstrap lookup is involved. */
+    let kr = unsafe { mach_port_insert_right(mach_task_self_, port, port, MOVE_SEND) };
     if kr == 0 { Ok(port) } else { Err(kr) }
 }
 
