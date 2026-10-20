@@ -60,7 +60,9 @@ query is outside the allowed scope.
 properties3, both modifier-list versions, and their combined chain. It also
 tests VkSubpassResolvePerformanceQueryEXT, alone and with properties3, when the
 multisampled-render-to-single-sampled extension is advertised. Current upstream
-vulkaninfo includes that structure in its generated format chain. It tests
+vulkaninfo includes that structure in its generated format chain. With headers
+and a driver supporting VK_KHR_extended_flags, the probe includes
+VkFormatProperties4KHR and its combinations with the other output structures. It tests
 count and fill calls separately and flushes the format and chain before every
 call. The last unmatched `begin` line identifies a crashing call. A single
 format and chain can be replayed by passing their numeric values.

@@ -6,7 +6,8 @@
  * probe-vk-formats [format [chain]]
  * chain: 0=legacy, 1=properties2, 2=properties3, 3=modifier list,
  *        4=modifier list2, 5=properties3 + both modifier lists,
- *        6=subpass resolve performance, 7=properties3 + resolve performance.
+ *        6=subpass resolve performance, 7=properties3 + resolve performance,
+ *        8=properties4, 9=properties4 + resolve, 10=properties3 + 4 + resolve.
  * With no arguments, sweep core, YCbCr, ASTC HDR and PVRTC format values.
  * Only advertised extension chains or promoted core structures are queried.
  */
@@ -39,14 +40,20 @@ static void query(VkPhysicalDevice pd, int format, unsigned chain)
         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT };
     VkDrmFormatModifierPropertiesList2EXT m2 = {
         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT };
+    #ifdef VK_KHR_extended_flags
+    VkFormatProperties4KHR p4 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_4_KHR };
+    #endif
     VkSubpassResolvePerformanceQueryEXT resolve = {
         .sType = VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT };
     VkFormatProperties2 p = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2 };
     void **next = &p.pNext;
-    if (chain == 2 || chain == 5 || chain == 7) { *next = &p3; next = &p3.pNext; }
+    if (chain == 2 || chain == 5 || chain == 7 || chain == 10) { *next = &p3; next = &p3.pNext; }
     if (chain == 3 || chain == 5) { *next = &m1; next = &m1.pNext; }
     if (chain == 4 || chain == 5) { *next = &m2; next = &m2.pNext; }
-    if (chain == 6 || chain == 7) { *next = &resolve; next = &resolve.pNext; }
+    #ifdef VK_KHR_extended_flags
+    if (chain >= 8) { *next = &p4; next = &p4.pNext; }
+    #endif
+    if (chain == 6 || chain == 7 || chain >= 9) { *next = &resolve; next = &resolve.pNext; }
     (void)next;
     printf("begin format=%d chain=%u phase=count\n", format, chain);
     fflush(stdout);
@@ -95,21 +102,27 @@ int main(int argc, char **argv)
     int p3 = props.apiVersion >= VK_API_VERSION_1_3 ||
         has_extension(pd, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
     int resolve = has_extension(pd, VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME);
+    int p4 = 0;
+    #ifdef VK_KHR_extended_flags
+    p4 = has_extension(pd, VK_KHR_EXTENDED_FLAGS_EXTENSION_NAME);
+    #endif
     printf("device=%s api=%#x modifiers=%d properties3=%d\n", props.deviceName, props.apiVersion, mod, p3);
     if (argc > 1) {
         unsigned chain = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 0) : 1;
-        if (chain > 7 || ((chain == 2 || chain == 5 || chain == 7) && !p3) ||
-            (chain >= 3 && chain <= 5 && !mod) || (chain >= 6 && !resolve)) return 2;
+        if (chain > 10 || ((chain == 2 || chain == 5 || chain == 7 || chain == 10) && !p3) ||
+            (chain >= 3 && chain <= 5 && !mod) || ((chain == 6 || chain == 7 || chain >= 9) && !resolve) ||
+            (chain >= 8 && !p4)) return 2;
         query(pd, (int)strtol(argv[1], NULL, 0), chain);
     } else {
         const int ranges[][2] = {{0,184}, {1000156000,1000156033},
                                  {1000066000,1000066013}, {1000054000,1000054007}};
         for (size_t i = 0; i < sizeof(ranges)/sizeof(ranges[0]); ++i)
             for (int f = ranges[i][0]; f <= ranges[i][1]; ++f)
-                for (unsigned chain = 0; chain <= 7; ++chain) {
-                    if ((chain == 2 || chain == 5 || chain == 7) && !p3) continue;
+                for (unsigned chain = 0; chain <= 10; ++chain) {
+                    if ((chain == 2 || chain == 5 || chain == 7 || chain == 10) && !p3) continue;
                     if (chain >= 3 && chain <= 5 && !mod) continue;
-                    if (chain >= 6 && !resolve) continue;
+                    if ((chain == 6 || chain == 7 || chain >= 9) && !resolve) continue;
+                    if (chain >= 8 && !p4) continue;
                     query(pd, f, chain);
                 }
     }
