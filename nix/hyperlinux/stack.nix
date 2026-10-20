@@ -180,6 +180,9 @@ let
     programName = "hl-async-fault-client"; source = ./async-fault-client.c;
     linkFlags = [ "-pthread" ];
   };
+  dcZvaClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-dc-zva-client"; source = ./dc-zva-client.c;
+  };
   primaryOutputClient = guest.callPackage ./client-probe.nix {
     programName = "hl-primary-output-authority-client"; source = ./primary-output-authority-client.c;
   };
@@ -273,5 +276,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient seqpacketCleanupClient primaryOutputClient ptracePstateClient asyncFaultClient fatalBusWaitClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient seqpacketCleanupClient dcZvaClient primaryOutputClient ptracePstateClient asyncFaultClient fatalBusWaitClient probeRunner;
 }

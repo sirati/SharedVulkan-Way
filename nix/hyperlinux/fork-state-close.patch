@@ -1,0 +1,25 @@
+--- a/src/fork_ipc.c
++++ b/src/fork_ipc.c
+@@ -734,11 +734,11 @@
+             int32_t gfd; int state = -1, n = 0;
+             if (ipc_read_all(ipc_fd, &gfd, sizeof(gfd)) < 0 ||
+                 recv_fds(ipc_fd, &state, 1, &n) < 0 || n != 1) {
+-                if (state >= 0) close(state);
++                if (state >= 0) hl_wc_socket_native_close(state);
+                 guest_destroy(&g); return 1;
+             }
+             int rc = hl_wc_socket_import(gfd, state);
+-            close(state);
++            hl_wc_socket_native_close(state);
+             if (rc < 0) { guest_destroy(&g); return 1; }
+         }
+     }
+@@ -2167,7 +2167,7 @@
+             if (ipc_write_all(ipc_sock, &fd, sizeof(fd)) < 0 || send_fds(ipc_sock, &states[i], 1) < 0)
+                 failed = 1;
+         }
+-        for (int32_t i = 0; i < count; i++) close(states[i]);
++        for (int32_t i = 0; i < count; i++) hl_wc_socket_native_close(states[i]);
+         if (failed) { close(ipc_sock); return -LINUX_EIO; }
+     }
+     /* Sysroot path (for dynamic linker library resolution) */
