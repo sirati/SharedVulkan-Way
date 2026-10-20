@@ -452,6 +452,7 @@ impl NativeVideo {
                 .iter()
                 .any(|&v| u64::from(v) >= job.source_range)
             || job.slice_offsets.windows(2).any(|v| v[0] >= v[1])
+            || (job.h264.idr_pic_flag && !job.references.is_empty())
             || job.references.len() > scope.session.references as usize
         {
             return invalid();
@@ -465,6 +466,12 @@ impl NativeVideo {
             validate_picture(&r.picture, &scope.session)?;
         }
         if let Some(r) = &job.setup {
+            if !job.h264.is_reference
+                || r.h264.frame_num != job.h264.frame_num
+                || r.h264.pic_order_cnt != job.h264.pic_order_cnt
+            {
+                return invalid();
+            }
             if r.slot >= scope.session.dpb_slots {
                 return invalid();
             }
