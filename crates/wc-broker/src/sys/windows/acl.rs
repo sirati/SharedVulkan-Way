@@ -453,24 +453,37 @@ pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
     out
 }
 
-/// Refuse rollback that would expose uncleared physical memory through a
-/// direct device open. A persisted SID binding cannot police a reverted
-/// kernel DACL. There is no independently attested drain/reset boundary yet.
-/// Verify every present raw device has the exact protected descriptor in both its live object and PnP property. Missing devices are optional and skipped.
+/// Every present BAR and doorbell must have protected live and PnP DACLs.
+/// Missing optional hardware is skipped; arbitrary private test paths are not
+/// installed raw devices and keep their explicit test behavior.
 pub fn verify_raw_protection(devices: &[DeviceAt]) -> Result<(), String> {
     verify_raw_protection_with(devices, find)
 }
 
-fn verify_raw_protection_with(devices: &[DeviceAt], mut lookup: impl FnMut(&DeviceAt) -> io::Result<Option<Found>>) -> Result<(), String> {
+fn verify_raw_protection_with(devices: &[DeviceAt], lookup: impl FnMut(&DeviceAt) -> io::Result<Option<Found>>) -> Result<(), String> {
+    verify_protection_with(devices, lookup, |found| {
+        Ok((live(&found.live).map_err(|e| format!("live ACL unreadable: {e}"))?,
+            property(&found.instance).map_err(|e| format!("PnP ACL unreadable: {e}"))?))
+    })
+}
+
+fn verify_protection_with(
+    devices: &[DeviceAt],
+    mut lookup: impl FnMut(&DeviceAt) -> io::Result<Option<Found>>,
+    mut descriptors: impl FnMut(&Found) -> Result<(String, Option<String>), String>,
+) -> Result<(), String> {
     for d in devices {
-        if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+        if matches!(d.loc, DeviceLoc::Path(_)) { continue; }
         let Some(found) = lookup(d).map_err(|e| format!("{}: lookup failed: {e}", d.name))? else { continue; };
-        if live(&found.live).map_err(|e| format!("{}: live ACL unreadable: {e}", d.name))? != DEVICE_SDDL { return Err(format!("{}: live ACL is not protected", d.name)); }
-        if property(&found.instance).map_err(|e| format!("{}: PnP ACL unreadable: {e}", d.name))?.as_deref() != Some(DEVICE_SDDL) { return Err(format!("{}: PnP ACL is not protected", d.name)); }
+        let (live, pnp) = descriptors(&found).map_err(|e| format!("{}: {e}", d.name))?;
+        if live != DEVICE_SDDL { return Err(format!("{}: live ACL is not protected", d.name)); }
+        if pnp.as_deref() != Some(DEVICE_SDDL) { return Err(format!("{}: PnP ACL is not protected", d.name)); }
     }
     Ok(())
 }
 
+/// Refuse rollback that would expose uncleared physical memory through a
+/// direct device open. A SID binding cannot police a reverted kernel DACL.
 pub fn revert_check(state: &Path) -> Result<(), String> {
     let rows = check_baseline(state)?;
     for (_, instance, path, original, property) in rows {
@@ -546,6 +559,30 @@ mod tests {
         assert!(verify_raw_protection_with(&devices, |_| Ok(None)).is_ok());
         assert!(verify_raw_protection_with(&devices, |_| Err(io::Error::other("injected lookup failure")))
             .unwrap_err().contains("injected lookup failure"));
+    }
+
+    #[test]
+    fn protected_bars_never_hide_permissive_doorbell_live_or_pnp_acls() {
+        let devices = vec![
+            DeviceAt { name: "arena".into(), loc: DeviceLoc::IvshmemSlot(0) },
+            DeviceAt { name: "wcbell".into(), loc: DeviceLoc::Port("fixture-wc".into()) },
+            DeviceAt { name: "svbell".into(), loc: DeviceLoc::Port("fixture-sv".into()) },
+        ];
+        for port in ["wcbell", "svbell"] {
+            for part in ["live", "PnP"] {
+                let error = verify_protection_with(&devices,
+                    |d| Ok(Some(Found { name: d.name.clone(), instance: "fixture".into(), live: "fixture".into() })),
+                    |d| {
+                        let permissive = "D:P(A;;FA;;;WD)";
+                        Ok((if d.name == port && part == "live" { permissive } else { DEVICE_SDDL }.into(),
+                            Some(if d.name == port && part == "PnP" { permissive } else { DEVICE_SDDL }.into())))
+                    }).unwrap_err();
+                assert_eq!(error, format!("{port}: {part} ACL is not protected"));
+            }
+            let optional = vec![devices.iter().find(|d| d.name == port).unwrap().clone()];
+            assert!(verify_raw_protection_with(&optional, |_| Ok(None)).is_ok());
+            assert!(verify_raw_protection_with(&optional, |_| Err(io::Error::other("port lookup failed"))).is_err());
+        }
     }
 
     #[test]

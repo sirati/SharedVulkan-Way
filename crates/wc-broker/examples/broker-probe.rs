@@ -66,20 +66,24 @@ mod win {
                 let permissive = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGW;;;WD)";
                 let part = arg(1);
                 if part != "live" && part != "pnp" { return Err("fixture selects live or pnp".into()); }
+                let target = arg(2);
+                if !["", "wcbell", "svbell"].contains(&target.as_str()) { return Err("fixture target is bars, wcbell or svbell".into()); }
                 for d in default_devices() {
-                    if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
-                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone BAR")?;
+                    if target.is_empty() {
+                        if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    } else if d.name != target { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone device")?;
                     if part == "live" { acl::set_live(&f.live, permissive)?; }
                     else { acl::set_property(&f.instance, Some(permissive))?; }
                     println!("RESULT private-fixture-permissive-{part} {}", f.instance);
                 }
                 Ok(())
             }
-            "protect-raw" => {
+            "protect-raw" | "protect-devices" => {
                 use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
                 for d in default_devices() {
-                    if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
-                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone BAR")?;
+                    if arg(0) == "protect-raw" && !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone device")?;
                     acl::set_property(&f.instance, Some(acl::DEVICE_SDDL))?;
                     acl::set_live(&f.live, acl::DEVICE_SDDL)?;
                     println!("RESULT protected-raw {}", f.instance);
