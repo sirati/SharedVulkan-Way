@@ -623,6 +623,7 @@ fn verification_body(
     )?;
     if let Some(mixed) = &mixed {
         mixed.verify(&shared)?;
+        mixed.verify_queries(&mut rpc)?;
     }
     // The user fence follows decode and ownership acquire. Sampling these exact
     // images must observe both writes, without copying into a different target.

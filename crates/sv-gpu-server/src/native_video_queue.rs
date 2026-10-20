@@ -104,6 +104,16 @@ impl Submission {
         if !shared.driver.native_video_queue_contract() {
             return Err(invalid());
         }
+        // Repeated GetDeviceQueue may return distinct wire aliases for the
+        // same queue. Event provenance follows the actual VkQueue identity.
+        let queue = shared
+            .objects()
+            .get::<vk::Queue>(HandleType::VkQueue, queue)
+            .map_err(|_| invalid())?;
+        if queue != shared.driver.queue {
+            return Err(invalid());
+        }
+        let queue = queue.as_raw();
         let runtime = Arc::clone(
             &shared
                 .native_video
