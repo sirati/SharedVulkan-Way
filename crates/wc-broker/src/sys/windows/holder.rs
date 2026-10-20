@@ -450,7 +450,14 @@ mod tests {
         assert!(!view.Value.is_null());
         assert_eq!(unsafe { std::ptr::read_volatile(view.Value.cast::<u8>()) }, 0x6d);
         unsafe { UnmapViewOfFile(view); }
-        let mut f = open_pipe(&pipe).unwrap();
+        let mut f = loop {
+            match open_pipe(&pipe) {
+                Ok(f) => break f,
+                Err(e) if e.raw_os_error() == Some(231) && std::time::Instant::now() < until =>
+                    std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => panic!("holder unavailable after refused quit: {e}"),
+            }
+        };
         f.write_all(b"del 1\n").unwrap();
         let mut rd = BufReader::new(f);
         reply.clear();
