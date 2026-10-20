@@ -439,3 +439,34 @@ fn a_forwarded_connection_is_served_as_its_maker() {
     assert_eq!(line.trim(), format!("ok hello 0000000000000009 uid:{uid} {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// `on_leased` sees a lease, with its holder's pid, before the fds arrive.
+#[test]
+fn a_lease_is_told_before_its_fds_are_sent() {
+    let d = dir("leased");
+    let unix = Unix::bind(d.join("broker.sock"), vec![]).unwrap();
+    let config = Config { devices: vec![], services: vec![], keys: None, release: Release::OwnerFree, budget: None, run: 3 };
+    let b = Broker::new(unix, config);
+    let (tx, rx) = std::sync::mpsc::channel();
+    b.on_leased(Box::new(move |id, pid| {
+        let _ = tx.send((id, pid));
+    }));
+    let memfd = {
+        // SAFETY: a static name, flags only.
+        let fd = unsafe { libc::memfd_create(c"leased".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: a fresh fd we own; a live fd.
+        let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        // SAFETY: a live fd.
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) }, 0);
+        fd
+    };
+    let id = b.publish(User::uid(unsafe { libc::geteuid() }), "gpu.0", 1, vec![(Unix::object(memfd), 0, 4096)]);
+    let b2 = b.clone();
+    std::thread::spawn(move || b2.serve());
+    let mut c = Client::connect(&d.join("broker.sock").to_string_lossy()).unwrap();
+    let (r, _fds) = c.find("gpu.0").unwrap();
+    assert_eq!(r.id, id);
+    assert_eq!(rx.try_recv().unwrap(), (id, std::process::id()), "told before the reply was read");
+    let _ = std::fs::remove_dir_all(&d);
+}
