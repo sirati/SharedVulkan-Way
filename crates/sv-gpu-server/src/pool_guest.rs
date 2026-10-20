@@ -545,6 +545,9 @@ fn run_prepared(
     // everything made from it are gone.
     let control_region = RetainedGraph::new(Arc::new(unsafe { SharedRegion::from_raw(boot.base_ptr().add(offset as usize), control.len as usize) }));
     let binding_owner = RetainedGraph::new(binding.clone());
+    // map_lazy below has no native memory/fd yet. Its ordinary Arena may
+    // drop during setup failure; this pool binding still roots the original
+    // boot mapping, so dropping that temporary Arc cannot unmap native pages.
 
     let t = Instant::now();
     let setup = (|| -> Result<_, String> {
