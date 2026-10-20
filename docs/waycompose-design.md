@@ -35878,4 +35878,252 @@ the stamping hook's implementation (windows-guest-ram's); a run on the deploymen
 
 ### 111.10 The Linux host: sessions run as the mapped user
 
-(Written by the host half's branch.)
+Written 2026-10-20, branch `broker-host`. Until now the doorbell hub (§99) and
+the session service (§105) were user units of the VM host's admin account,
+and every session's proxy, applications, sound and host integration ran as
+that admin. So the guest's Windows user ran Linux programs with the admin's
+files and keys. On the client role's host now:
+
+* the hub and the session service are **system services** of their own
+  account, `waycompose` (group `wc-arena`). Only they open the arena and GPU
+  BAR files and QEMU's doorbell sockets; desktop users have neither the group
+  nor an ACL;
+* a root-owned table, `/etc/waycompose/users.conf`, maps the boot record's
+  identity (111.6) to a Linux user. A record nobody is mapped for is refused,
+  and the guest reads why in the boot page;
+* a session runs **as that user, in that user's systemd manager**, with their
+  home and groups. Its processes get the BAR files and the hub through the
+  broker the session service embeds.
+
+#### The table
+
+```text
+# SERVER   SERVER-USER    LINUX-USER      [installs=a,b] [id=SID-or-uid]
+vm-guest   <guest-user>   <desktop-user>  installs=wcivs,wcmc,wclinux
+vm-guest   <guest-user>   wctest          installs=wctest1
+vm-guest   -              <desktop-user>  installs=wcivs        # transitional
+```
+
+`SERVER` is the VM a service serves (`--server`); it reads only those lines.
+`SERVER-USER` is matched against the identity's account name, without regard
+to ASCII case when the identity's os is `windows` (Windows' own rule) and
+exactly otherwise; `id=` pins the account's SID or uid as well. `installs=`
+narrows a line to those installations. The first matching line wins. A table
+with one bad line fails whole, and the service does not start: a policy read
+in part would map someone it should not (`wc_broker::usermap`, 5 tests).
+`root` is never a target. The NixOS option `services.waycompose.mappings`
+writes the file.
+
+What the guest is told, verbatim from the tests:
+
+* `<os> user <name> (<id>) is not mapped to any Linux user on this host`;
+* `... may not start installation <name> on this host`: the user is mapped,
+  for other installations;
+* `the boot record of installation <name> carries no identity, and this host
+  requires one`;
+* `the boot record ... does not verify under its key with the identity it
+  carries`: the identity was rewritten (111.6);
+* `the boot record's identity area does not parse`: never read as "none".
+
+**Transitional, and to be removed.** The guest's privileged service (111.8)
+is not deployed yet, so today's records carry no identity. With
+`--accept-unidentified`, a record without one maps through a `-` line, which
+must name its installations, one Linux user per installation. A record that
+has an identity never matches `-`. Remove the flag and the `-` lines
+(`acceptUnidentified`, `unidentified` in the NixOS module) as soon as every
+installation on the guest boots through its service; from then on an
+unsigned record is refused.
+
+#### Who starts the session: the user's own agent
+
+The service runs as `waycompose` and must start processes in another user's
+manager. Three ways were weighed:
+
+* (a) `systemd-run --machine=<user>@.host --user` from the service. It needs a
+  polkit rule letting `waycompose` manage units in other users' managers, and
+  polkit's `manage-units` action cannot be scoped to one target user
+  without matching on unit names it cannot see. Rejected: a rule that broad is
+  more than a session start needs.
+* (b) a socket-activated agent per user. Chosen. `wc-session-agent.socket` is a
+  user unit (`Accept=yes`) at `/run/waycompose-agent/<user>/agent.sock`, in a
+  directory only that user can write. The service connects and checks with
+  `SO_PEERCRED` that the socket is the mapped uid's (the listener is that
+  user's manager). The agent checks that the caller is `waycompose` or root.
+  Then it runs the installation's `wc-session up/proxy/gpu` itself, as the
+  user, so `systemd-run --user` lands in the user's manager as it always did.
+  No polkit, no root helper. The agent stays connected until the session's
+  proxy unit ends, runs `down`, and says `ended`; then the service unpublishes
+  the session's regions.
+* (c) a system service with `User=` per session: not the user's manager, no
+  session environment, and every session a new system unit. Rejected.
+
+The line on the agent's socket is `start INSTALL ID RUNID INDEX GPU
+ARENA-REGION GPU-REGION`. It is parsed as untrusted input; `wc-session`
+validates the words again (§94). The mapped users linger, so their agents
+are there before anybody logs in.
+
+One test, leg 5 of `scripts/wc-broker-host.sh`, maps a user to an account
+whose agent socket is a link to another user's. The service refuses it:
+`... is uid 1000's socket, not uid 65534's`.
+
+#### The session service and the broker: one process
+
+`wc-arena-host sessiond --broker /run/waycompose/broker.sock` serves
+`wc_broker::server::Broker<Unix>` on a thread of its own. One process,
+because:
+
+* what the broker hands out per session is decided by the service. It
+  publishes the BAR files for the uid users.conf just named, when the session
+  starts (`publish(uid, "arena"|"gpu", …)`). It unpublishes them when the
+  session ends. Two processes would need a protocol between them for exactly
+  that, plus a story for when one restarts without the other;
+* a restart of the service (a changed users.conf, `restartTriggers`) costs
+  running sessions nothing they hold. Their fds and mappings are theirs, and
+  the per-process broker connection reconnects lazily.
+
+The hub stays a separate service. Its QEMU connections live in systemd's fd
+store (§99.6), and it must not restart when the mapping changes.
+
+A session's processes reach everything through specs the binaries take
+wherever a path was taken before. `wc-session` writes them when the service
+passes `WC_BROKER` and the region ids (`WC_LAUNCH_BROKER_ARENA`, `_GPU`).
+Without them it writes the old paths, so nothing changes where no broker runs:
+
+| before | through the broker | who |
+|---|---|---|
+| `/run/windows-vm/wc-arena/arena` | `broker:<id>` (`open`) | wc-proxy, `wc-arena-host broker-read` (the header `up` checks) |
+| `/run/windows-vm/wc-arena/gpu` | `broker:<id>` | sv-hostd `--region`, and sv-icd, which opens the name sv-hostd sends it |
+| `~/…/wc-bell/wl.sock`, `sv.sock` | `broker:wl-hub`, `broker:sv-hub` (`connect`) | wc-proxy, sv-hostd `--cold-bell`, sv-icd `SV_BELL` |
+
+`sv_transport::brokered` holds two hooks, a service connector and a region
+opener. `wc_broker::client::install_hooks` fills them with the process's one
+broker connection. So `vdoorbell::PortHandle::open`, `poolcold::HubBell` and
+`region::open_named` understand `broker:` with no broker client in
+sv-transport. The connection is per process and kept for its life: the broker
+watches the process through it, and the leases are its. For leases held for
+one of several clients (the proxy's Wayland clients, §112),
+`client::own_connection` gives a connection whose leases end when it is
+dropped.
+
+**Every fd of one region shares one file offset.** The broker's fd and every
+copy it sends are one open file description. The first run of the harness
+failed on exactly this: `up` read the header with `read`, which moved the
+offset, and the proxy's own `read` then found zeros. Readers of a broker
+region use `mmap` or positional I/O (`read_exact_at`). The header readers do
+now, and `client::open_path`'s comment says so.
+
+The guest-RAM substrate (§108) is embedded the same way.
+`wc_broker::host::Embedded` (`attach(&Broker<Unix>, &SessionsView)` once,
+`session_up`, `session_down`) is the interface. `SessionsView` answers whose
+each live session is. `embedded(GuestRam)` in `sessiond_ivshmem.rs` is where a
+component is constructed, from the `--guest-ram-*` flags: `-boot`, `-qemu-pid`
+/ `-qemu-pidfile` / `--guest-ram`, `-bell`, and `-user UID|mapped`. `mapped` is
+users.conf's mapping of the guest GPU process's user, `UserMap::resolve_any`.
+
+#### Layout
+
+| what | where | whose |
+|---|---|---|
+| the services' binaries (`wc-arena-host`, `sv-hostd`) | `/var/lib/waycompose/bin` | root, 0755 |
+| an installation's definition (`wc-session`, `apps.ini`, `gpu.env`, `bin/`) | `/var/lib/waycompose/installs/<name>` | root, 0755 |
+| its key | `…/<name>/session.key` | `waycompose`, 0600 (the service checks) |
+| sequence numbers (§105) | `/var/lib/waycompose/sessiond` | `waycompose`, 0700 |
+| broker, hub | `/run/waycompose/{broker.sock,hub/}` | `waycompose`; broker socket 0666 (access is per request, by uid), hub 0750 |
+| agents | `/run/waycompose-agent/<user>/agent.sock` | a root tree (systemd-tmpfiles refuses a root directory under the service's), each directory the user's |
+| a session's run directory | `$XDG_RUNTIME_DIR/wc-launch/<id>` of the mapped user | the user, 0700 |
+| per-user state: Firefox profiles, Prism's data | the mapped user's home (`~/.wc-launch/<profile>`, `~/wc-mc`) | the user |
+
+`apps.ini` spells per-user paths `~/…`, which `wc-session` expands to the
+running user's home in `exec`, `profile`, every word of `args`, and `env`
+values. So one definition serves whichever user its guest user is mapped to.
+A definition holds nothing of a user's. Nothing writes into the installation
+directory at run time (checked: every `$BASE` use in `wc-session` reads).
+
+#### The existing installations (the Windows VM host)
+
+`scripts/wc-users-migrate.sh plan|apply|verify|remove-old|rollback ADMIN
+DESKTOP BIN-DIR INSTALL...` moves them, as root, after the switch to the
+generation with `services.waycompose`. For each installation it does this:
+
+* the base its admin link names is copied into `/var/lib/waycompose/installs`,
+  with this branch's binaries over `bin/`, root's, and the key `waycompose`'s.
+  GC roots of `bin/`'s store links are registered again;
+* every path under the admin's home that `apps.ini` names is copied into the
+  desktop user's home: the Firefox profile `wcivs` uses, the Prism data and
+  launcher `wcmc` uses. The copy is chowned. Absolute paths in its text files
+  are rewritten (Prism's config, the recorded launches, Firefox's prefs), and
+  `apps.ini` says `~/`;
+* the sequence numbers move, so an old record cannot be replayed;
+* the admin's user units stop and are kept in a backup. The running VM's ACLs
+  for the admin and the desktop user are dropped and one for `waycompose` is
+  added; the VM is not restarted;
+* `remove-old` deletes the admin's copies only after a session was seen
+  working; `rollback` puts the admin's units and links back.
+
+A dry run under `ROOT=` on a tree shaped like the VM host's (three
+installations, a profile with a lock file, Prism data with absolute paths and
+a binary file) gave the expected tree for plan, apply, rollback, apply again
+and remove-old. Not run on the VM host itself.
+
+**wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
+runs as the desktop user, like his applications. Its seat is still brought up
+as root through win7-desktop.nix's sudo rule. That rule's users are now an
+option, `seatUsers` (default: the owner, unchanged elsewhere). The seat still
+asks for a password at its login screen. The seat now also accepts the GPU
+words a brokered session passes: `SV_BELL=broker:<name>`, and `WC_BROKER`
+only as `/run/waycompose/broker.sock`. So its KWin's sv-icd reaches the GPU
+BAR through the broker as the desktop user, and the desktop user's ACL on the
+GPU file is gone. The nested-session user lingers now. win7-desktop's
+`linger = false` became a default, because the agent must be there before any
+login.
+
+**Test installations** of other agents run as the Linux user `wctest`: name
+them in the host configuration's `wctestInstalls`, which adds
+`<guest-user> -> wctest installs=…` to the table. Deploy them into
+`/var/lib/waycompose/installs/<name>` as the migration script lays them out.
+
+#### Tests
+
+* `wc_broker::usermap` (5), `wc_broker::host` (1), and in wc-arena-host:
+  `the_identity_is_verified_with_the_record`,
+  `a_verified_record_maps_to_its_linux_user_or_is_refused`, and the agent's
+  `a_start_line_round_trips_and_bad_ones_are_refused`.
+* `scripts/wc-broker-host.sh`, on one machine without root: the service maps
+  and runs the session through the agent. The proxy maps the arena as
+  `broker:1` and holds the BAR file through the broker's fd. An application
+  runs on a ring slot. Leg 1 located in 422 ms (2026-10-20, debug build).
+  Also covered: the lease ends the session and its regions are unpublished; an
+  unmapped identity, an out-of-scope installation, and a record without
+  identity are refused, each with its message; the transitional rule runs; a
+  foreign agent socket is refused. 5 legs, OK.
+* `waycompose-users.nix`, the host configuration's NixOS VM test (
+  1024 MiB): two desktop users, two mapped guest identities and one unmapped.
+  The service runs as `waycompose`. Each session's proxy and application run
+  under the mapped uid (`/proc/<pid>/status`) in `user@<uid>.service`.
+  Neither user can open the BAR file or the hub. One user's broker connection
+  cannot open the other's region. Passed 2026-10-20: 6 subtests, the script
+  in 33.9 s, 282 MiB of the VM's 962 in use at the end.
+* The broker is set-up only, and the data path is unchanged. The control
+  ring's round trip in a brokered session (`wc-broker-host.sh`) was 11.2 us
+  mean, p99 15.9 (10000 round trips). On the plain no-ssh path
+  (`wc-no-ssh.sh`, the same hour) it was 8.4 us, p99 23.3. Both are debug
+  builds on this workstation, and the gap is run-to-run noise: no broker
+  call is on that path.
+
+#### Debt
+
+* **The whole BAR goes to each session's user.** The broker publishes the file
+  for each session's uid; per-session windows (§107's barwin, §108's udmabuf
+  pieces) are what would narrow it.
+* **A restarted service does not answer UNMAPPED for regions its previous run
+  published until it re-watches their holders.** Memory is wasted until the
+  holders exit; nothing is corrupted.
+* `scripts/wc-launch.sh deploy` still writes the old per-admin layout.
+  Deploying into `/var/lib/waycompose` needs root and is the migration
+  script's for now.
+* The services' binaries are deployed files, not a Nix package of this tree.
+* The GPU path through the broker (`--region broker:ID`, sv-icd's
+  `open_named`) is built and unit-tested, but no harness here runs a GPU
+  session; the guest proof is the coordinator's. Pool regions past the first
+  (§110's `region_path` of a `broker:` boot name) are not reachable through
+  the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.

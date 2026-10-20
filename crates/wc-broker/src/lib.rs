@@ -22,9 +22,12 @@
 //! through the broker, and nothing is copied.
 
 pub mod client;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod host;
 pub mod core;
 pub mod proto;
 pub mod server;
 pub mod sys;
+pub mod usermap;
 
 pub use core::{Allow, DeviceSpec, Peer, Release, User};

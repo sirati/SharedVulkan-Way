@@ -1317,6 +1317,7 @@ dependencies = [
  "sv-arena",
  "sv-transport",
  "sv-wire",
+ "wc-broker",
 ]
 
 [[package]]
@@ -1330,6 +1331,7 @@ dependencies = [
  "sv-proto",
  "sv-transport",
  "sv-wire",
+ "wc-broker",
 ]
 
 [[package]]
@@ -1688,6 +1690,7 @@ dependencies = [
  "sv-arena",
  "sv-hostd",
  "sv-transport",
+ "wc-broker",
  "wc-handle",
 ]
 
@@ -1795,6 +1798,7 @@ dependencies = [
  "sv-drm",
  "sv-proto",
  "sv-transport",
+ "wc-broker",
  "wc-handle",
  "wc-hostint",
 ]

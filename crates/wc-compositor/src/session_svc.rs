@@ -274,6 +274,34 @@ fn now_micros() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
+/// §111.6: the record signed by the privileged service at `sock` for this
+/// process's user, and the identity it signed. On a Linux server the broker
+/// (`wc-broker`, which holds `<install>.key`), named `broker:SOCK` as the
+/// key file. Windows reaches its service through `sign`.
+#[cfg(unix)]
+fn sign_by_broker(
+    sock: &str,
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+    install: &str,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    let mut c = wc_broker::client::Client::connect(sock).map_err(|e| e.to_string())?;
+    let req = wc_broker::proto::SignReq {
+        install: install.to_string(),
+        session: rec.session.clone(),
+        index,
+        arena_run: rec.arena_run,
+        arena_pages: rec.arena_pages,
+        outbound: rec.outbound,
+        rings_run: rec.rings_run,
+        rings_pages: rec.rings_pages,
+        gpu: rec.gpu,
+        seq: now_micros(),
+    };
+    let (auth, id) = c.sign(&req).map_err(|e| format!("the broker at {sock} would not sign: {e}"))?;
+    Ok((auth, Some(id)))
+}
+
 // ------------------------------------------------------------ the singleton ---
 
 /// §107: what keeps a second compositor of the user from starting. Held for
@@ -671,6 +699,15 @@ fn sign(
 ) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
     use wc_handle::macboot;
     let seq = now_micros();
+    // A Linux server's broker, named as the key file (§111.10).
+    #[cfg(unix)]
+    if let Some(sock) = cfg.key_file.to_str().and_then(|s| s.strip_prefix("broker:")) {
+        let (auth, identity) = sign_by_broker(sock, rec, index, &cfg.install)?;
+        if let Some(i) = &identity {
+            say(&format!("boot: the broker signed the record for {}", i.text()));
+        }
+        return Ok((auth, identity));
+    }
     #[cfg(windows)]
     {
         let req = wc_broker::proto::SignReq {

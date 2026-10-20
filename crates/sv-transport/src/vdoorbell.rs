@@ -696,6 +696,11 @@ impl PortHandle {
                 format!("fd:{fds}: inherited descriptors are a Unix doorbell"),
             ));
         }
+        // §111.10: the hub's service, connected by the broker.
+        #[cfg(unix)]
+        if crate::brokered::service(spec).is_some() {
+            return PortHandle::host_socket(spec);
+        }
         if let Some(path) = spec.strip_prefix("socket:") {
             #[cfg(unix)]
             return PortHandle::host_socket(path);
@@ -813,10 +818,11 @@ impl PortHandle {
             .map_err(|e| std::io::Error::other(format!("{e}")))
     }
 
-    /// Connect to the host end of the chardev.
+    /// Connect to the host end of the chardev, or (`broker:NAME`, §111.10)
+    /// have the broker connect to the hub's service and move it into us.
     #[cfg(unix)]
     pub fn host_socket(path: &str) -> std::io::Result<PortHandle> {
-        std::os::unix::net::UnixStream::connect(path).map(PortHandle::Unix)
+        crate::brokered::connect(path).map(PortHandle::Unix)
     }
 
     /// One reader and one writer over the one open (see [`attach`]). Public

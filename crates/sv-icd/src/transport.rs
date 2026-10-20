@@ -522,6 +522,10 @@ impl RingTransport {
         use std::os::unix::net::UnixStream;
         use sv_transport::cold::{ColdMessage, send};
 
+        // waycompose-design.md §111.10: the GPU BAR's name may be `broker:ID`
+        // and the bell `broker:sv-hub`, both reached through the broker.
+        #[cfg(target_os = "linux")]
+        wc_broker::client::install_hooks();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let sock = loop {
             match UnixStream::connect(socket) {
@@ -858,8 +862,13 @@ impl RingTransport {
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             // §99: reconnecting, so a restarted hub costs this session only
-            // the bells in the gap.
-            Ok(path) => match sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
+            // the bells in the gap. waycompose-design.md §111.10: a
+            // `broker:NAME` spec is a connection the broker makes for us.
+            Ok(path) => match {
+                #[cfg(target_os = "linux")]
+                wc_broker::client::install_hooks();
+                sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
+            }
                 .map_err(|e| e.to_string())
             {
                 Ok((d, true)) => {

@@ -896,7 +896,7 @@ impl ProvidedRegion {
     /// len)` of the file at `path` (the GPU device's, whose pool offsets are
     /// file offsets), granted to this session as region `id`.
     pub fn region_window(path: &Path, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
-        let file_len = std::fs::metadata(path)?.len();
+        let file_len = crate::guestram::open_backing(path, false)?.metadata()?.len();
         if len == 0 || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) || offset.checked_add(len).is_none_or(|e| e > file_len) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
