@@ -947,6 +947,10 @@ pub mod wayland {
         proxy_get_display: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
         display_roundtrip_queue: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
         display_dispatch_queue_pending: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+        display_prepare_read_queue: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+        display_read_events: unsafe extern "C" fn(*mut c_void) -> c_int,
+        display_cancel_read: unsafe extern "C" fn(*mut c_void),
+        display_get_fd: unsafe extern "C" fn(*mut c_void) -> c_int,
         display_flush: unsafe extern "C" fn(*mut c_void) -> c_int,
         registry_interface: *const WlInterface,
         shm_interface: *const WlInterface,
@@ -1015,6 +1019,10 @@ pub mod wayland {
                     proxy_get_display: sym!("wl_proxy_get_display"),
                     display_roundtrip_queue: sym!("wl_display_roundtrip_queue"),
                     display_dispatch_queue_pending: sym!("wl_display_dispatch_queue_pending"),
+                    display_prepare_read_queue: sym!("wl_display_prepare_read_queue"),
+                    display_read_events: sym!("wl_display_read_events"),
+                    display_cancel_read: sym!("wl_display_cancel_read"),
+                    display_get_fd: sym!("wl_display_get_fd"),
                     display_flush: sym!("wl_display_flush"),
                     registry_interface: iface!("wl_registry_interface"),
                     shm_interface: iface!("wl_shm_interface"),
@@ -1654,11 +1662,112 @@ pub mod wayland {
         }
         static PARAMS: ParamsListener = ParamsListener { created: on_created, failed: on_failed };
 
-        /// One image's buffer: the `wl_buffer` proxy and whether the
-        /// compositor holds it.
+        const AVAILABLE: u8 = 0;
+        const ACQUIRED: u8 = 1;
+        const SUBMITTING: u8 = 2;
+        const COMPOSITOR: u8 = 3;
+        const QUARANTINED: u8 = 4;
+
+        /// Release events can end compositor ownership only. They cannot undo
+        /// an acquisition or recover a frame whose completion is unknown.
+        struct ImageLease(std::sync::atomic::AtomicU8);
+        impl ImageLease {
+            fn new() -> Self { Self(std::sync::atomic::AtomicU8::new(AVAILABLE)) }
+            fn change(&self, from: u8, to: u8) -> bool {
+                self.0.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            }
+            fn reserve(&self) -> bool { self.change(AVAILABLE, ACQUIRED) }
+            fn release(&self) { self.change(COMPOSITOR, AVAILABLE); }
+            fn drained(&self) -> bool { matches!(self.0.load(Ordering::Acquire), AVAILABLE | ACQUIRED) }
+        }
+        unsafe extern "C" fn release_image(data: *mut c_void, _buffer: *mut c_void) {
+            if !data.is_null() {
+                // SAFETY: boxed beside the buffer; quarantined surfaces retain
+                // both this listener data and every proxy until process exit.
+                unsafe { (&*(data as *const ImageLease)).release() };
+            }
+        }
+        static IMAGE_LISTENER: BufferListener = BufferListener { release: release_image };
+
         struct Buf {
             proxy: *mut c_void,
-            busy: Box<AtomicBool>,
+            lease: Box<ImageLease>,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        pub enum AcquireError { NotReady, Timeout, SurfaceLost }
+
+        /// One absolute deadline covers lock contention and Wayland events.
+        pub struct AcquireWait {
+            deadline: Option<std::time::Instant>,
+            immediate: bool,
+        }
+        impl AcquireWait {
+            pub fn new(timeout: u64) -> Self {
+                Self {
+                    deadline: if timeout == u64::MAX { None } else {
+                        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(timeout))
+                    },
+                    immediate: timeout == 0,
+                }
+            }
+            pub fn remaining(&self) -> Option<std::time::Duration> {
+                self.deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()))
+            }
+            pub fn exhausted(&self) -> Option<AcquireError> {
+                self.remaining().filter(|d| d.is_zero()).map(|_| {
+                    if self.immediate { AcquireError::NotReady } else { AcquireError::Timeout }
+                })
+            }
+        }
+
+        /// A prepared Wayland read must span poll, even while the WSI state
+        /// mutex is unlocked. Otherwise another reader can drain a release into
+        /// our private queue just before we sleep on an empty socket.
+        pub struct PreparedRead {
+            display: *mut c_void,
+            fd: i32,
+            events: i16,
+            armed: bool,
+        }
+        impl PreparedRead {
+            fn prepare(display: *mut c_void, queue: *mut c_void) -> Result<Option<Self>, AcquireError> {
+                let l = lib().ok_or(AcquireError::SurfaceLost)?;
+                // SAFETY: called with a live display and queue retained by the
+                // acquire's ZeroCopy Arc. Preparing does not dispatch callbacks.
+                unsafe {
+                    if (l.display_prepare_read_queue)(display, queue) != 0 { return Ok(None); }
+                    let mut read = Self { display, fd: (l.display_get_fd)(display), events: libc::POLLIN, armed: true };
+                    if read.fd < 0 { return Err(AcquireError::SurfaceLost); }
+                    if (l.display_flush)(display) < 0 {
+                        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                            return Err(AcquireError::SurfaceLost); // Drop cancels
+                        }
+                        read.events |= libc::POLLOUT;
+                    }
+                    Ok(Some(read))
+                }
+            }
+            pub fn source(&self) -> (i32, i16) { (self.fd, self.events) }
+            pub fn finish(mut self, readable: bool) -> Result<(), AcquireError> {
+                if readable {
+                    let l = lib().ok_or(AcquireError::SurfaceLost)?;
+                    self.armed = false;
+                    // SAFETY: matches this guard's successful prepare. This
+                    // synchronizes with other Wayland readers, outside the WSI
+                    // mutex, and never dispatches buffer callbacks itself.
+                    if unsafe { (l.display_read_events)(self.display) } < 0 { return Err(AcquireError::SurfaceLost); }
+                }
+                Ok(()) // Drop cancels if only the wake fd or POLLOUT was ready
+            }
+        }
+        impl Drop for PreparedRead {
+            fn drop(&mut self) {
+                if self.armed && let Some(l) = lib() {
+                    // SAFETY: exactly one cancel for an unread prepared guard.
+                    unsafe { (l.display_cancel_read)(self.display) };
+                }
+            }
         }
 
         /// A swapchain's images as `wl_buffer`s on the application's surface.
@@ -1784,13 +1893,13 @@ pub mod wayland {
                             (l.proxy_destroy)(params);
                             break;
                         }
-                        let busy = Box::new(AtomicBool::new(false));
+                        let lease = Box::new(ImageLease::new());
                         (l.proxy_add_listener)(
                             b,
-                            &BUFFER_LISTENER as *const BufferListener as *const c_void,
-                            &*busy as *const AtomicBool as *mut c_void,
+                            &IMAGE_LISTENER as *const BufferListener as *const c_void,
+                            &*lease as *const ImageLease as *mut c_void,
                         );
-                        buffers.push((Buf { proxy: b, busy }, params));
+                        buffers.push((Buf { proxy: b, lease }, params));
                     }
                     // `failed` comes before the answer to this sync if at all.
                     let ok = (l.display_roundtrip_queue)(display, queue) >= 0;
@@ -1830,48 +1939,72 @@ pub mod wayland {
                 self.slot
             }
 
-            /// The first image the compositor is not holding, waiting for a
-            /// release up to `limit`. `None` when every image is still held.
-            pub fn free(&mut self, prefer: usize, limit: std::time::Duration) -> Option<usize> {
-                let l = lib()?;
-                let n = self.buffers.len();
-                let deadline = std::time::Instant::now() + limit;
-                loop {
-                    // SAFETY: our own queue, dispatched only here, under `&mut self`.
-                    unsafe { (l.display_dispatch_queue_pending)(self.display, self.queue) };
-                    if let Some(i) = (0..n).map(|k| (prefer + k) % n).find(|&i| !self.buffers[i].busy.load(Ordering::Acquire)) {
-                        return Some(i);
+            /// Dispatch our own pending callbacks. Socket reads use the
+            /// prepared-read guard outside the WSI mutex, below.
+            fn progress(&mut self) -> Result<(), AcquireError> {
+                let l = lib().ok_or(AcquireError::SurfaceLost)?;
+                // SAFETY: own event queue, serialized by the ZeroCopy mutex.
+                unsafe {
+                    if (l.display_dispatch_queue_pending)(self.display, self.queue) < 0 {
+                        return Err(AcquireError::SurfaceLost);
                     }
-                    if std::time::Instant::now() >= deadline {
-                        return None;
+                    if (l.display_flush)(self.display) < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                        return Err(AcquireError::SurfaceLost);
                     }
-                    // SAFETY: as above. A round trip returns once the
-                    // compositor has answered, releases sent before it included.
-                    unsafe {
-                        (l.display_flush)(self.display);
-                        if (l.display_roundtrip_queue)(self.display, self.queue) < 0 {
-                            return None;
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(500));
                 }
+                Ok(())
+            }
+
+            /// Reserve an available image before exposing its index to Vulkan.
+            pub fn try_acquire(&mut self, prefer: usize) -> Result<Option<usize>, AcquireError> {
+                self.progress()?;
+                if self.buffers.iter().any(|b| b.lease.0.load(Ordering::Acquire) == QUARANTINED) {
+                    return Err(AcquireError::SurfaceLost);
+                }
+                let n = self.buffers.len();
+                Ok((0..n).map(|k| (prefer + k) % n).find(|&i| self.buffers[i].lease.reserve()))
+            }
+
+            pub fn cancel_acquire(&self, i: usize) {
+                if let Some(b) = self.buffers.get(i) { b.lease.change(ACQUIRED, AVAILABLE); }
+            }
+
+            pub fn begin_present(&self, i: usize) -> bool {
+                self.buffers.get(i).is_some_and(|b| b.lease.change(ACQUIRED, SUBMITTING))
+            }
+
+            pub fn quarantine(&self, i: usize) {
+                if let Some(b) = self.buffers.get(i) { b.lease.0.store(QUARANTINED, Ordering::Release); }
+            }
+
+            pub fn prepare_wait(&self) -> Result<Option<PreparedRead>, AcquireError> {
+                PreparedRead::prepare(self.display, self.queue)
+            }
+
+            /// Destruction is not compositor completion. Failed or still-held
+            /// buffers retain their complete proxy/listener/backing ownership.
+            pub fn drained(&mut self) -> bool {
+                self.progress().is_ok() && self.buffers.iter().all(|b| b.lease.drained())
             }
 
             /// Show image `i`: attach, damage all of it, commit. Called inside
             /// `vkQueuePresentKHR`. With the shim and a dead surface, nothing.
-            pub fn show(&mut self, i: usize, generation: Option<u32>) {
-                let Some(l) = lib() else { return };
-                let Some(b) = self.buffers.get(i) else { return };
+            pub fn show(&mut self, i: usize, generation: Option<u32>) -> Result<(), AcquireError> {
+                let l = lib().ok_or(AcquireError::SurfaceLost)?;
+                let b = self.buffers.get(i).ok_or(AcquireError::SurfaceLost)?;
                 let guarded = match (generation, self.slot) {
                     (Some(g), Some(slot)) => {
                         if !guard::begin(slot, g) {
-                            return;
+                            return Err(AcquireError::SurfaceLost);
                         }
                         true
                     }
                     _ => false,
                 };
-                b.busy.store(true, Ordering::Release);
+                if !b.lease.change(SUBMITTING, COMPOSITOR) {
+                    if guarded { guard::end(); }
+                    return Err(AcquireError::SurfaceLost);
+                }
                 // SAFETY: requests on the application's live surface (inside
                 // its call, or under the shim's lock) and on our own buffer.
                 unsafe {
@@ -1889,8 +2022,139 @@ pub mod wayland {
                     if guarded {
                         guard::end();
                     }
-                    (l.display_flush)(self.display);
+                    if (l.display_flush)(self.display) < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                        return Err(AcquireError::SurfaceLost);
+                    }
                 }
+                Ok(())
+            }
+        }
+
+        #[cfg(test)]
+        mod ownership_tests {
+            use super::*;
+
+            #[test]
+            #[ignore = "requires libwayland-client in the runtime library search path"]
+            fn prepared_read_spans_another_wayland_readers_private_queue_delivery() {
+                use std::io::{Read, Write};
+                use std::os::fd::IntoRawFd;
+                use std::sync::mpsc;
+                use std::time::Duration;
+                let l = lib().expect("libwayland-client required for queue handshake regression");
+                // SAFETY: symbols have libwayland's documented C signatures.
+                let (connect, disconnect, callback_iface) = unsafe {
+                    let h = libc::dlopen(c"libwayland-client.so.0".as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+                    assert!(!h.is_null());
+                    let connect = libc::dlsym(h, c"wl_display_connect_to_fd".as_ptr());
+                    let disconnect = libc::dlsym(h, c"wl_display_disconnect".as_ptr());
+                    let iface = libc::dlsym(h, c"wl_callback_interface".as_ptr());
+                    assert!(!connect.is_null() && !disconnect.is_null() && !iface.is_null());
+                    (
+                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn(i32) -> *mut c_void>(connect),
+                        std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void)>(disconnect),
+                        iface.cast::<WlInterface>().cast_const(),
+                    )
+                };
+                let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+                server.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                // SAFETY: transfers the connected socket to a fresh display.
+                let display = unsafe { connect(client.into_raw_fd()) };
+                assert!(!display.is_null());
+                let done = AtomicBool::new(false);
+                #[repr(C)]
+                struct CallbackListener { done: unsafe extern "C" fn(*mut c_void, *mut c_void, u32) }
+                unsafe extern "C" fn callback_done(data: *mut c_void, _: *mut c_void, _: u32) {
+                    // SAFETY: test's AtomicBool outlives dispatch and proxy.
+                    unsafe { (&*data.cast::<AtomicBool>()).store(true, Ordering::Release) };
+                }
+                static CALLBACK: CallbackListener = CallbackListener { done: callback_done };
+                // SAFETY: private display/queues and callback with matching ABI.
+                let (queue, other_queue, callback) = unsafe {
+                    let queue = (l.display_create_queue)(display);
+                    let other = (l.display_create_queue)(display);
+                    let wrapper = (l.proxy_create_wrapper)(display);
+                    (l.proxy_set_queue)(wrapper, queue);
+                    let mut args = [arg_new()];
+                    let callback = (l.proxy_marshal_array_flags)(wrapper, 0, callback_iface, 1, 0, args.as_mut_ptr());
+                    (l.proxy_wrapper_destroy)(wrapper);
+                    assert!(!callback.is_null());
+                    (l.proxy_add_listener)(callback, (&CALLBACK as *const CallbackListener).cast(), (&done as *const AtomicBool).cast_mut().cast());
+                    assert!((l.display_flush)(display) >= 0);
+                    (queue, other, callback)
+                };
+                let mut request = [0u8; 12];
+                server.read_exact(&mut request).unwrap();
+                let callback_id = u32::from_ne_bytes(request[8..12].try_into().unwrap());
+                let read = PreparedRead::prepare(display, queue).unwrap().expect("empty own queue");
+                let (prepared_tx, prepared_rx) = mpsc::channel();
+                let (go_tx, go_rx) = mpsc::channel();
+                let (read_tx, read_rx) = mpsc::channel();
+                let shared_display = display as usize;
+                let shared_queue = other_queue as usize;
+                let other = std::thread::spawn(move || {
+                    // SAFETY: display and queue outlive this joined thread.
+                    unsafe {
+                        assert_eq!((l.display_prepare_read_queue)(shared_display as *mut c_void, shared_queue as *mut c_void), 0);
+                        prepared_tx.send(()).unwrap();
+                        go_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                        let result = (l.display_read_events)(shared_display as *mut c_void);
+                        read_tx.send(result).unwrap();
+                    }
+                });
+                prepared_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let event: Vec<u8> = [callback_id, 12u32 << 16, 42].into_iter().flat_map(u32::to_ne_bytes).collect();
+                server.write_all(&event).unwrap();
+                go_tx.send(()).unwrap();
+                assert_eq!(read_rx.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout),
+                    "the other reader must not drain our release before our guarded poll");
+                let (fd, events) = read.source();
+                let mut poll = libc::pollfd { fd, events, revents: 0 };
+                // SAFETY: initialized poll entry on the owned display socket.
+                assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
+                assert_ne!(poll.revents & libc::POLLIN, 0);
+                read.finish(true).unwrap();
+                assert_eq!(read_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+                other.join().unwrap();
+                assert!(!done.load(Ordering::Acquire), "socket reads must not dispatch private callbacks");
+                // SAFETY: both readers finished; callback data is still live.
+                unsafe {
+                    assert!((l.display_dispatch_queue_pending)(display, queue) >= 0);
+                    assert!(done.load(Ordering::Acquire), "private queue event must remain available after the read handshake");
+                    (l.proxy_destroy)(callback);
+                    (l.event_queue_destroy)(queue);
+                    (l.event_queue_destroy)(other_queue);
+                    disconnect(display);
+                }
+            }
+
+            #[test]
+            fn acquired_images_are_distinct_and_release_cannot_cancel_a_reservation() {
+                let images: Vec<_> = (0..3).map(|_| ImageLease::new()).collect();
+                for i in &images { assert!(i.reserve()); }
+                assert!(!images.iter().any(ImageLease::reserve));
+                images[0].release();
+                assert!(!images[0].reserve(), "a release cannot revoke an unpresented acquisition");
+                assert!(images[0].change(ACQUIRED, SUBMITTING));
+                assert!(!images[0].change(ACQUIRED, SUBMITTING), "duplicate present refused");
+                images[0].release();
+                assert!(!images[0].drained(), "GPU submission has not reached the compositor");
+                assert!(images[0].change(SUBMITTING, COMPOSITOR));
+                assert!(!images[0].reserve());
+                images[0].release();
+                assert!(images[0].reserve(), "only actual compositor release makes an image reusable");
+                assert!(!images[1].reserve());
+            }
+
+            #[test]
+            fn unknown_submission_completion_remains_quarantined_after_release() {
+                let image = ImageLease::new();
+                assert!(image.reserve());
+                assert!(image.change(ACQUIRED, SUBMITTING));
+                image.0.store(QUARANTINED, Ordering::Release);
+                image.release();
+                assert!(!image.reserve());
+                assert!(!image.drained(), "destroy must retain proxies, callback data and backing");
             }
         }
 

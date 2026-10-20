@@ -131,6 +131,7 @@ pub struct Swapchain {
     target: std::sync::Arc<std::sync::Mutex<crate::present::Target>>,
     /// `None` presents on the calling thread (see [`queue_present`]).
     presenter: Option<Presenter>,
+    availability: Busy,
     /// The Wayland surface's slot in `libsv_wlshim.so` (§100). Read inside
     /// `vkQueuePresentKHR` for the frame's generation, so that call never
     /// waits for the target's lock, which the presenter holds while it shows.
@@ -149,7 +150,7 @@ pub struct Swapchain {
     pool: u64,
     /// Round-robin acquire cursor. An image is free once the present that used
     /// it has been shown, which a synchronous present has done by the time it
-    /// returns and a pipelined one says through [`Presenter::wait_for`].
+    /// returns and a pipelined one records in `availability`.
     next: usize,
     /// §112: the images are shared sections the compositor reads in place.
     zc: Option<std::sync::Arc<std::sync::Mutex<ZeroCopy>>>,
@@ -161,6 +162,7 @@ pub struct Swapchain {
 pub(crate) struct ZeroCopy {
     surface: crate::present::wayland::dmabuf::Surface,
     semaphores: Vec<u64>,
+    wake: std::os::fd::OwnedFd,
 }
 #[cfg(not(target_os = "linux"))]
 pub(crate) struct ZeroCopy;
@@ -323,13 +325,15 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
     let id = IcdLocal::mint_id(icd);
     let target = crate::present::Target::open(desc.target, desc.width, desc.height, desc.premultiplied_alpha);
     let wl_slot = target.wl_slot();
+    let availability = new_availability(images.len());
     icd.swapchains().insert(
         id,
         Swapchain {
             device,
             queue,
             target: std::sync::Arc::new(std::sync::Mutex::new(target)),
-            presenter: Presenter::start(icd, images.len(), &desc.target, wl_slot.is_some()),
+            presenter: Presenter::start(icd, std::sync::Arc::clone(&availability), &desc.target, wl_slot.is_some()),
+            availability,
             wl_slot,
             present_target: desc.target,
             width: desc.width,
@@ -605,10 +609,13 @@ pub fn acquire_next_image(
     icd: &SharedVulkan,
     device: u64,
     swapchain: u64,
-    _timeout: u64,
+    timeout: u64,
     semaphore: u64,
     fence: u64,
 ) -> IcdResult<u32> {
+    let acquire_started = std::time::Instant::now();
+    #[cfg(target_os = "linux")]
+    let wait = crate::present::wayland::dmabuf::AcquireWait::new(timeout);
     let (mut index, queue, busy, zc, n) = {
         let mut chains = icd.swapchains();
         let sc = chains
@@ -619,7 +626,7 @@ pub fn acquire_next_image(
         (
             index as u32,
             sc.queue,
-            sc.presenter.as_ref().map(|p| std::sync::Arc::clone(&p.busy)),
+            std::sync::Arc::clone(&sc.availability),
             sc.zc.clone(),
             sc.images.len(),
         )
@@ -627,15 +634,14 @@ pub fn acquire_next_image(
     // §112: the image the compositor has let go of, outside the table's lock.
     #[cfg(target_os = "linux")]
     if let Some(zc) = &zc {
-        index = zero_copy::acquire(zc, index as usize, n) as u32;
+        index = zero_copy::acquire(zc, index as usize, &wait)? as u32;
         if let Some(sc) = icd.swapchains().get_mut(&swapchain) {
             sc.next = (index as usize + 1) % n.max(1);
         }
     }
-    let _ = (&zc, n);
-    // A pipelined present of this image may still be copying out of it.
-    if let Some(busy) = busy {
-        Presenter::wait_for(&busy, index as usize);
+    let _ = (&zc, n, timeout);
+    if zc.is_none() {
+        index = acquire_copy(&busy, index as usize, timeout, acquire_started)? as u32;
     }
     let _ = device;
     if semaphore != 0 || fence != 0 {
@@ -644,13 +650,23 @@ pub fn acquire_next_image(
             si.signal_semaphore_count = 1;
             si.p_signal_semaphores = vec![p::VkSemaphore(semaphore)];
         }
-        let r = icd.queue_submit(p::VkQueueSubmitArgs {
-            queue: p::VkQueue(queue),
-            submit_count: 1,
-            p_submits: vec![si],
-            fence: p::VkFence(fence),
-        })?;
-        result_ok(r.result)?;
+        let signaled = (|| -> IcdResult<()> {
+            let r = icd.queue_submit(p::VkQueueSubmitArgs {
+                queue: p::VkQueue(queue),
+                submit_count: 1,
+                p_submits: vec![si],
+                fence: p::VkFence(fence),
+            })?;
+            result_ok(r.result)
+        })();
+        if let Err(e) = signaled {
+            #[cfg(target_os = "linux")]
+            if let Some(zc) = &zc {
+                zero_copy::cancel_acquire(zc, index as usize);
+            }
+            if zc.is_none() { cancel_copy_acquire(&busy, index as usize); }
+            return Err(e);
+        }
     }
     Ok(index)
 }
@@ -707,7 +723,7 @@ pub fn queue_present(
             return zero_copy::present(icd, queue, &zc, image_index, memory, waits, generation);
         }
     }
-    let (job, presenter) = {
+    let (job, presenter, availability) = {
         let chains = icd.swapchains();
         let sc = chains
             .get(&swapchain)
@@ -737,61 +753,66 @@ pub fn queue_present(
                 // is alive and cannot be unmapped under us (§100).
                 generation: sc.wl_slot.map(wl_generation),
             },
-            sc.presenter.as_ref().map(|p| (p.tx.clone(), std::sync::Arc::clone(&p.busy))),
+            sc.presenter.as_ref().map(|p| p.tx.clone()),
+            std::sync::Arc::clone(&sc.availability),
         )
     };
-    let mut job = job;
-
-    job.started = std::time::Instant::now();
-    job.app = traced_app_interval(swapchain, job.started);
-    let r = icd.reset_fences(p::VkResetFencesArgs {
-        device: p::VkDevice(job.device),
-        fence_count: 1,
-        p_fences: vec![p::VkFence(job.fence)],
-    })?;
-    result_ok(r.result)?;
-    job.reset = Some(std::time::Instant::now());
-
-    let mut si = p::VkSubmitInfo::default();
-    si.wait_semaphore_count = waits.len() as u32;
-    si.p_wait_semaphores = waits.iter().map(|w| p::VkSemaphore(*w)).collect();
-    // `TRANSFER` and not `ALL_COMMANDS`: the only thing this submission does is
-    // the copy, so that is the stage that has to wait for the application's
-    // rendering to have finished.
-    si.p_wait_dst_stage_mask =
-        waits.iter().map(|_| p::VkPipelineStageFlags::VK_PIPELINE_STAGE_TRANSFER_BIT).collect();
-    si.command_buffer_count = 1;
-    si.p_command_buffers = vec![p::VkCommandBuffer(job.cmd)];
-    let r = icd.queue_submit(p::VkQueueSubmitArgs {
-        queue: p::VkQueue(queue),
-        submit_count: 1,
-        p_submits: vec![si],
-        fence: p::VkFence(job.fence),
-    })?;
-    result_ok(r.result)?;
-    let submitted = std::time::Instant::now();
-    job.submitted = Some(submitted);
-
-    if let Some((tx, busy)) = presenter {
-        {
-            let mut b = busy.0.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = b.get_mut(image_index as usize) {
-                *slot = true;
-            }
-        }
-        if let Err(back) = tx.send(job) {
-            // The presenter is gone, which only teardown does; finish here.
-            let job = back.0;
-            busy.0.lock().unwrap_or_else(|e| e.into_inner())[image_index as usize] = false;
-            busy.1.notify_all();
-            return finish_present(icd, job, false);
-        }
-        if sv_transport::frametrace::enabled() {
-            PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, submitted);
-        }
-        return Ok(());
+    {
+        let mut states = availability.0.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states.get_mut(image_index as usize).ok_or(LowerError::Shape("vkQueuePresentKHR: image index out of range"))?;
+        if *state != ImageState::Acquired { return Err(LowerError::Shape("vkQueuePresentKHR: image was not acquired")); }
+        *state = ImageState::Presenting;
     }
-    finish_present(icd, job, false)
+    let result = (|| -> IcdResult<()> {
+        let mut job = job;
+
+        job.started = std::time::Instant::now();
+        job.app = traced_app_interval(swapchain, job.started);
+        let r = icd.reset_fences(p::VkResetFencesArgs {
+            device: p::VkDevice(job.device),
+            fence_count: 1,
+            p_fences: vec![p::VkFence(job.fence)],
+        })?;
+        result_ok(r.result)?;
+        job.reset = Some(std::time::Instant::now());
+
+        let mut si = p::VkSubmitInfo::default();
+        si.wait_semaphore_count = waits.len() as u32;
+        si.p_wait_semaphores = waits.iter().map(|w| p::VkSemaphore(*w)).collect();
+        // `TRANSFER` and not `ALL_COMMANDS`: the only thing this submission does is
+        // the copy, so that is the stage that has to wait for the application's
+        // rendering to have finished.
+        si.p_wait_dst_stage_mask =
+            waits.iter().map(|_| p::VkPipelineStageFlags::VK_PIPELINE_STAGE_TRANSFER_BIT).collect();
+        si.command_buffer_count = 1;
+        si.p_command_buffers = vec![p::VkCommandBuffer(job.cmd)];
+        let r = icd.queue_submit(p::VkQueueSubmitArgs {
+            queue: p::VkQueue(queue),
+            submit_count: 1,
+            p_submits: vec![si],
+            fence: p::VkFence(job.fence),
+        })?;
+        result_ok(r.result)?;
+        let submitted = std::time::Instant::now();
+        job.submitted = Some(submitted);
+
+        if let Some(tx) = presenter {
+            if let Err(back) = tx.send(job) {
+                let result = finish_present(icd, back.0, false);
+                complete_copy(&availability, image_index as usize, if result.is_ok() { ImageState::Available } else { ImageState::Quarantined });
+                return result;
+            }
+            if sv_transport::frametrace::enabled() {
+                PRESENT_END.lock().unwrap_or_else(|e| e.into_inner()).insert(swapchain, submitted);
+            }
+            return Ok(());
+        }
+        let result = finish_present(icd, job, false);
+        complete_copy(&availability, image_index as usize, if result.is_ok() { ImageState::Available } else { ImageState::Quarantined });
+        result
+    })();
+    if result.is_err() { complete_copy(&availability, image_index as usize, ImageState::Quarantined); }
+    result
 }
 
 /// One present, from its copy being submitted to its frame being shown.
@@ -818,12 +839,59 @@ struct Job {
 
 /// The images a presenter has not finished with, and the condition
 /// `vkAcquireNextImageKHR` waits on.
-type Busy = std::sync::Arc<(std::sync::Mutex<Vec<bool>>, std::sync::Condvar)>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageState { Available, Acquired, Presenting, Quarantined }
+type Busy = std::sync::Arc<(std::sync::Mutex<Vec<ImageState>>, std::sync::Condvar)>;
+
+fn new_availability(images: usize) -> Busy {
+    std::sync::Arc::new((std::sync::Mutex::new(vec![ImageState::Available; images]), std::sync::Condvar::new()))
+}
+
+fn complete_copy(busy: &Busy, index: usize, state: ImageState) {
+    let mut states = busy.0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = states.get_mut(index) { *slot = state; }
+    busy.1.notify_all();
+}
+
+fn cancel_copy_acquire(busy: &Busy, index: usize) {
+    let mut states = busy.0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = states.get_mut(index).filter(|s| **s == ImageState::Acquired) { *slot = ImageState::Available; }
+    busy.1.notify_all();
+}
+
+fn acquire_copy(busy: &Busy, prefer: usize, timeout: u64, started: std::time::Instant) -> IcdResult<usize> {
+    let remaining = || {
+        if timeout == u64::MAX { None } else { Some(std::time::Duration::from_nanos(timeout).saturating_sub(started.elapsed())) }
+    };
+    let expired = || LowerError::Result(if timeout == 0 { 1 } else { 2 });
+    let mut states = loop {
+        match busy.0.try_lock() {
+            Ok(states) => break states,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if remaining().is_some_and(|d| d.is_zero()) { return Err(expired()); }
+                std::thread::park_timeout(remaining().unwrap_or(std::time::Duration::from_millis(1)).min(std::time::Duration::from_millis(1)));
+            }
+        }
+    };
+    loop {
+        if states.contains(&ImageState::Quarantined) { return Err(LowerError::Result(-1_000_000_000)); }
+        let n = states.len();
+        if let Some(i) = (0..n).map(|k| (prefer + k) % n).find(|&i| states[i] == ImageState::Available) {
+            states[i] = ImageState::Acquired;
+            return Ok(i);
+        }
+        states = match remaining() {
+            Some(d) if d.is_zero() => return Err(expired()),
+            Some(d) => busy.1.wait_timeout(states, d).unwrap_or_else(|e| e.into_inner()).0,
+            None => busy.1.wait(states).unwrap_or_else(|e| e.into_inner()),
+        };
+    }
+}
 
 /// A swapchain's present thread (see [`queue_present`]).
 pub(crate) struct Presenter {
     tx: std::sync::mpsc::Sender<Job>,
-    busy: Busy,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -867,14 +935,12 @@ impl Presenter {
     /// it and needs an ICD that lives as long. `None` means present on the
     /// calling thread, which is what [`pipelines`] says for a Wayland surface
     /// without the shim and `SV_PRESENT_SYNC=1` asks for everywhere.
-    fn start(icd: &SharedVulkan, images: usize, target: &PresentTarget, guarded: bool) -> Option<Presenter> {
+    fn start(icd: &SharedVulkan, busy: Busy, target: &PresentTarget, guarded: bool) -> Option<Presenter> {
         if !pipelines(target, std::env::var_os("SV_PRESENT_SYNC").as_deref(), guarded) {
             return None;
         }
         let global = crate::instance().filter(|g| std::ptr::eq(*g, icd))?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let busy: Busy =
-            std::sync::Arc::new((std::sync::Mutex::new(vec![false; images]), std::sync::Condvar::new()));
         let theirs = std::sync::Arc::clone(&busy);
         let thread = std::thread::Builder::new()
             .name("sv-present".into())
@@ -884,30 +950,13 @@ impl Presenter {
                 crate::transport::untallied_on_this_thread();
                 while let Ok(job) = rx.recv() {
                     let index = job.image_index as usize;
-                    if let Err(e) = finish_present(global, job, true) {
-                        trace!("vkQueuePresentKHR (presenter): {e:?}; that frame is dropped");
-                    }
-                    let mut b = theirs.0.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(slot) = b.get_mut(index) {
-                        *slot = false;
-                    }
-                    theirs.1.notify_all();
+                    let result = finish_present(global, job, true);
+                    if let Err(e) = &result { trace!("vkQueuePresentKHR (presenter): {e:?}; image quarantined"); }
+                    complete_copy(&theirs, index, if result.is_ok() { ImageState::Available } else { ImageState::Quarantined });
                 }
             })
             .ok()?;
-        Some(Presenter { tx, busy, thread: Some(thread) })
-    }
-
-    /// Wait until `index`'s last present has been shown. Bounded: a presenter
-    /// that never finishes is a GPU side that has stopped answering, and the
-    /// application's next call will say so. Takes the shared state rather than
-    /// `self` so the swapchain table is not held while it waits.
-    fn wait_for(busy: &Busy, index: usize) {
-        let (lock, cv) = &**busy;
-        let b = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = cv.wait_timeout_while(b, std::time::Duration::from_secs(10), |b| {
-            b.get(index).copied().unwrap_or(false)
-        });
+        Some(Presenter { tx, thread: Some(thread) })
     }
 
     /// Finish every present already queued, then stop.
@@ -1180,15 +1229,27 @@ pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
     // an application that destroys a swapchain while a present is in flight has
     // already been told not to. A failed teardown leaks a GPU-side object rather
     // than corrupting one.
-    let _ = icd.device_wait_idle(p::VkDeviceWaitIdleArgs { device: p::VkDevice(device) });
+    let idle = matches!(icd.device_wait_idle(p::VkDeviceWaitIdleArgs { device: p::VkDevice(device) }), Ok(r) if r.result.0 == 0);
+    if !idle {
+        // No completion proof: keep Wayland callbacks and original allocations
+        // alive together. Destruction must never turn an uncertain image free.
+        if let Some(zc) = sc.zc.take() { std::mem::forget(zc); }
+        return;
+    }
     #[cfg(target_os = "linux")]
     if let Some(zc) = sc.zc.take() {
         // The wl_buffers go first (the surface's drop), then what backs them.
         let z = match std::sync::Arc::try_unwrap(zc) {
             Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-            Err(_) => return, // an acquire still holds it: leak rather than free under it
+            Err(retained) => { std::mem::forget(retained); return; }
         };
-        let ZeroCopy { surface, semaphores } = z;
+        let mut z = z;
+        if !z.surface.drained() {
+            trace!("vkDestroySwapchainKHR: compositor completion unproved; retaining images and listeners");
+            std::mem::forget(z);
+            return;
+        }
+        let ZeroCopy { surface, semaphores, wake: _wake } = z;
         drop(surface);
         zero_copy::release(icd, device, &sc.images, &semaphores);
         return;
@@ -1211,6 +1272,61 @@ pub fn destroy_swapchain(icd: &SharedVulkan, device: u64, swapchain: u64) {
 #[cfg(target_os = "linux")]
 mod zero_copy {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use crate::present::wayland::dmabuf::{AcquireError, AcquireWait};
+
+    fn acquire_error(e: AcquireError) -> LowerError {
+        LowerError::Result(match e {
+            AcquireError::NotReady => 1,
+            AcquireError::Timeout => 2,
+            AcquireError::SurfaceLost => -1_000_000_000,
+        })
+    }
+
+    fn new_wake() -> IcdResult<OwnedFd> {
+        // SAFETY: no pointers; a fresh nonblocking close-on-exec descriptor.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC | libc::EFD_SEMAPHORE) };
+        if fd < 0 { return Err(LowerError::Shape("WSI eventfd creation failed")); }
+        // SAFETY: this function owns the descriptor returned above.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn notify(z: &ZeroCopy) {
+        let one = 1u64;
+        // SAFETY: an owned eventfd, pointer valid for eight bytes. A full
+        // counter is already readable, so EAGAIN cannot lose a wakeup.
+        unsafe { libc::write(z.wake.as_raw_fd(), (&one as *const u64).cast(), 8); }
+    }
+
+    fn wait_ready(fd: i32, events: i16, wake: i32, wait: &AcquireWait) -> Result<bool, AcquireError> {
+        loop {
+            if let Some(e) = wait.exhausted() { return Err(e); }
+            let ms = wait.remaining().map_or(-1, |d| d.as_millis().saturating_add(1).min(i32::MAX as u128) as i32);
+            let mut fds = [
+                libc::pollfd { fd, events, revents: 0 },
+                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+            ];
+            // SAFETY: two initialized entries; both descriptor owners outlive
+            // this acquire's retained ZeroCopy Arc. No state lock is held.
+            let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+                return Err(AcquireError::SurfaceLost);
+            }
+            if result == 0 { continue; }
+            if fds.iter().any(|p| p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0) {
+                return Err(AcquireError::SurfaceLost);
+            }
+            if fds[1].revents & libc::POLLIN != 0 {
+                let mut value = 0u64;
+                // SAFETY: eight writable bytes, nonblocking eventfd. Another
+                // waiter consuming the notification first is harmless.
+                unsafe { libc::read(wake, (&mut value as *mut u64).cast(), 8); }
+            }
+            return Ok(fds[0].revents & libc::POLLIN != 0);
+        }
+    }
+
 
     pub fn create(
         icd: &SharedVulkan,
@@ -1233,6 +1349,7 @@ mod zero_copy {
         // One shown, one in flight, one to draw: the compositor holds the
         // buffer it shows until the next one replaces it (§104.12).
         let count = count.max(3);
+        let wake = new_wake()?;
         let mut images: Vec<SwapImage> = Vec::new();
         let mut semaphores: Vec<u64> = Vec::new();
         let mut handed: Vec<(i32, u32)> = Vec::new();
@@ -1279,6 +1396,7 @@ mod zero_copy {
         };
         let id = IcdLocal::mint_id(icd);
         let wl_slot = surface.slot();
+        let availability = new_availability(images.len());
         icd.swapchains().insert(
             id,
             Swapchain {
@@ -1291,6 +1409,7 @@ mod zero_copy {
                     false,
                 ))),
                 presenter: None,
+                availability,
                 wl_slot,
                 present_target: desc.target,
                 width: desc.width,
@@ -1299,7 +1418,7 @@ mod zero_copy {
                 images,
                 pool: 0,
                 next: 0,
-                zc: Some(std::sync::Arc::new(std::sync::Mutex::new(ZeroCopy { surface, semaphores }))),
+                zc: Some(std::sync::Arc::new(std::sync::Mutex::new(ZeroCopy { surface, semaphores, wake }))),
             },
         );
         Ok(Some(id))
@@ -1419,11 +1538,44 @@ mod zero_copy {
         }
     }
 
-    /// The image to hand out: one the compositor has released, waiting for a
-    /// release up to two seconds, else the next in turn.
-    pub fn acquire(zc: &std::sync::Mutex<ZeroCopy>, prefer: usize, n: usize) -> usize {
-        let mut z = zc.lock().unwrap_or_else(|e| e.into_inner());
-        z.surface.free(prefer, std::time::Duration::from_secs(2)).unwrap_or(prefer % n.max(1))
+    fn lock_until<'a, T>(mutex: &'a std::sync::Mutex<T>, wait: &AcquireWait) -> Result<std::sync::MutexGuard<'a, T>, AcquireError> {
+        loop {
+            match mutex.try_lock() {
+                Ok(z) => return Ok(z),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if let Some(e) = wait.exhausted() { return Err(e); }
+                    std::thread::park_timeout(wait.remaining().unwrap_or(std::time::Duration::from_millis(1)).min(std::time::Duration::from_millis(1)));
+                }
+            }
+        }
+    }
+
+    /// Reserve under the state lock, but wait outside it so presents and
+    /// failed-acquire rollbacks can progress even when every image is reserved.
+    pub fn acquire(zc: &std::sync::Mutex<ZeroCopy>, prefer: usize, wait: &AcquireWait) -> IcdResult<usize> {
+        loop {
+            let mut z = lock_until(zc, wait).map_err(acquire_error)?;
+            if let Some(index) = z.surface.try_acquire(prefer).map_err(acquire_error)? {
+                notify(&z);
+                return Ok(index);
+            }
+            let Some(read) = z.surface.prepare_wait().map_err(acquire_error)? else {
+                if let Some(e) = wait.exhausted() { return Err(acquire_error(e)); }
+                continue; // a private-queue event arrived; dispatch before sleeping
+            };
+            let (fd, events) = read.source();
+            let wake = z.wake.as_raw_fd();
+            drop(z);
+            let readable = wait_ready(fd, events, wake, wait).map_err(acquire_error)?;
+            read.finish(readable).map_err(acquire_error)?;
+        }
+    }
+
+    pub fn cancel_acquire(zc: &std::sync::Mutex<ZeroCopy>, index: usize) {
+        let z = zc.lock().unwrap_or_else(|e| e.into_inner());
+        z.surface.cancel_acquire(index);
+        notify(&z);
     }
 
     /// Submit the application's waits and the image's signal, number the
@@ -1442,24 +1594,36 @@ mod zero_copy {
             .semaphores
             .get(image_index as usize)
             .ok_or(LowerError::Shape("vkQueuePresentKHR: image index out of range"))?;
-        let mut si = p::VkSubmitInfo::default();
-        si.wait_semaphore_count = waits.len() as u32;
-        si.p_wait_semaphores = waits.iter().map(|w| p::VkSemaphore(*w)).collect();
-        si.p_wait_dst_stage_mask =
-            waits.iter().map(|_| p::VkPipelineStageFlags::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT).collect();
-        si.signal_semaphore_count = 1;
-        si.p_signal_semaphores = vec![p::VkSemaphore(sem)];
-        let r = icd.queue_submit(p::VkQueueSubmitArgs {
-            queue: p::VkQueue(queue),
-            submit_count: 1,
-            p_submits: vec![si],
-            fence: p::VkFence(0),
-        })?;
-        result_ok(r.result)?;
-        if !icd.mark_shared_write(queue, sem, memory)? {
-            return Err(LowerError::Shape("vkQueuePresentKHR: a zero-copy frame could not be numbered"));
+        if !z.surface.begin_present(image_index as usize) {
+            return Err(LowerError::Shape("vkQueuePresentKHR: image was not acquired"));
         }
-        z.surface.show(image_index as usize, generation);
+        let presented = (|| -> IcdResult<()> {
+            let mut si = p::VkSubmitInfo::default();
+            si.wait_semaphore_count = waits.len() as u32;
+            si.p_wait_semaphores = waits.iter().map(|w| p::VkSemaphore(*w)).collect();
+            si.p_wait_dst_stage_mask =
+                waits.iter().map(|_| p::VkPipelineStageFlags::VK_PIPELINE_STAGE_ALL_COMMANDS_BIT).collect();
+            si.signal_semaphore_count = 1;
+            si.p_signal_semaphores = vec![p::VkSemaphore(sem)];
+            let r = icd.queue_submit(p::VkQueueSubmitArgs {
+                queue: p::VkQueue(queue),
+                submit_count: 1,
+                p_submits: vec![si],
+                fence: p::VkFence(0),
+            })?;
+            result_ok(r.result)?;
+            if !icd.mark_shared_write(queue, sem, memory)? {
+                return Err(LowerError::Shape("vkQueuePresentKHR: a zero-copy frame could not be numbered"));
+            }
+            z.surface.show(image_index as usize, generation).map_err(acquire_error)?;
+            Ok(())
+        })();
+        if let Err(e) = presented {
+            z.surface.quarantine(image_index as usize);
+            notify(&z);
+            return Err(e);
+        }
+        notify(&z);
         if sv_transport::frametrace::enabled() {
             sv_transport::frametrace::emit_at(
                 sv_transport::frametrace::at_us(std::time::Instant::now()),
@@ -1469,6 +1633,55 @@ mod zero_copy {
         }
         Ok(())
     }
+    #[cfg(test)]
+    mod acquire_wait_tests {
+        use super::*;
+
+        fn sockets() -> (OwnedFd, OwnedFd) {
+            let mut fds = [-1; 2];
+            // SAFETY: space for exactly two descriptors.
+            assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) }, 0);
+            // SAFETY: newly owned descriptors on success.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        #[test]
+        fn zero_and_finite_acquire_deadlines_do_not_reclaim_an_image() {
+            let (read, _write) = sockets();
+            let wake = new_wake().unwrap();
+            assert_eq!(wait_ready(read.as_raw_fd(), libc::POLLIN, wake.as_raw_fd(), &AcquireWait::new(0)), Err(AcquireError::NotReady));
+            let start = std::time::Instant::now();
+            assert_eq!(wait_ready(read.as_raw_fd(), libc::POLLIN, wake.as_raw_fd(), &AcquireWait::new(15_000_000)), Err(AcquireError::Timeout));
+            assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        }
+
+        #[test]
+        fn compositor_disconnect_is_surface_lost_and_rollback_wakes_waiter() {
+            let (read, write) = sockets();
+            let wake = new_wake().unwrap();
+            let one = 1u64;
+            // SAFETY: owned eventfd and eight initialized bytes.
+            assert_eq!(unsafe { libc::write(wake.as_raw_fd(), (&one as *const u64).cast(), 8) }, 8);
+            assert_eq!(wait_ready(read.as_raw_fd(), libc::POLLIN, wake.as_raw_fd(), &AcquireWait::new(u64::MAX)), Ok(false));
+            drop(write);
+            assert_eq!(wait_ready(read.as_raw_fd(), libc::POLLIN, wake.as_raw_fd(), &AcquireWait::new(u64::MAX)), Err(AcquireError::SurfaceLost));
+        }
+
+        #[test]
+        fn acquisition_deadline_includes_a_contended_state_lock() {
+            let mutex = std::sync::Arc::new(std::sync::Mutex::new(()));
+            let held = mutex.lock().unwrap();
+            let theirs = mutex.clone();
+            let waiter = std::thread::spawn(move || {
+                let wait = AcquireWait::new(15_000_000);
+                matches!(lock_until(&theirs, &wait), Err(AcquireError::Timeout))
+            });
+            assert!(waiter.join().unwrap(), "a held lock must not turn a finite acquire into an unlimited wait");
+            drop(held);
+        }
+    }
+
 }
 
 /// A Wayland surface's shim generation now (§100).
@@ -1490,6 +1703,24 @@ fn result_ok(r: p::VkResult) -> IcdResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acquired_copy_images_are_reserved_until_explicit_completion() {
+        let states = super::new_availability(3);
+        let start = std::time::Instant::now();
+        for expected in 0..3 { assert_eq!(super::acquire_copy(&states, 0, 0, start).unwrap(), expected); }
+        assert!(matches!(super::acquire_copy(&states, 0, 0, start), Err(super::LowerError::Result(1))));
+        assert!(matches!(super::acquire_copy(&states, 0, 1_000_000, std::time::Instant::now()), Err(super::LowerError::Result(2))));
+        super::complete_copy(&states, 1, super::ImageState::Presenting);
+        super::cancel_copy_acquire(&states, 1);
+        assert_eq!(states.0.lock().unwrap()[1], super::ImageState::Presenting);
+        let theirs = states.clone();
+        let waiter = std::thread::spawn(move || super::acquire_copy(&theirs, 0, u64::MAX, std::time::Instant::now()));
+        super::complete_copy(&states, 1, super::ImageState::Available);
+        assert_eq!(waiter.join().unwrap().unwrap(), 1);
+        super::complete_copy(&states, 1, super::ImageState::Quarantined);
+        assert!(matches!(super::acquire_copy(&states, 0, 0, start), Err(super::LowerError::Result(-1_000_000_000))));
+    }
+
     use super::*;
     use std::ffi::OsStr;
 
