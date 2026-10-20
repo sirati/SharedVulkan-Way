@@ -34626,6 +34626,61 @@ machines.
 | the hub yielding to the thread it just woke (the wake is affine) | `bellhub` | Linux hosts; any host whose hub and proxy share few cores |
 | a guest freeze while the passed-through GPU leaves D3 (up to ~6 s, about once a minute) | the guest's GPU driver, vfio | this VM; samples within one are set apart below |
 
+**After.** The same instrument on the final build (test installation
+`wcil`, shared compositor, release, session 0). At 1 s between requests,
+p50 µs after `L.send`:
+
+| hop | before | after |
+|---|---|---|
+| the compositor's request thread has the request | 61.6 | 55.0 |
+| request in the ring, bell written | 389 (the writer thread's wake) | 104.8 (`WriteFile` issued inline) |
+| the compositor sees the answer | 793 | 247.2 |
+| the launcher has it | 859 | 275.0 |
+
+On the host, from the hub's read of the byte to the control thread being
+woken: 71 µs p50 before, 10 µs after; and the thread then ran on the
+other core instead of waiting for the hub's fan-out.
+
+**Measured.** One lease, one guest state, master at the merge base
+(bc19340) against this branch, each deployed in turn to the same test
+installation, hop trace off:
+
+| | master bc19340 | §105.14 |
+|---|---|---|
+| 20 ms between requests (n = 1000): mean / p50 / p99 | 487 ms / 480 ms / 503 ms | 268 / 141 / 363 µs |
+| 1 s between requests (n = 200): mean / p50 / p99 | 57 ms / 405 µs / 685 ms | 317 / 262 / 1341 µs |
+| idle, 60 s with the session up: the guest's compositor / the host's proxy | 0.72 s / 0.32 s CPU | 0.22 s / 0.33 s CPU |
+
+Master's 480 ms is a parked proxy answering on its 500 ms slice: since the
+shared compositor (§107), a byte through the proxy's own doorman no longer
+wakes the control thread. Here the hub wakes it, which is why this branch
+does not show it; the plain path is a separate fix.
+
+The larger runs, with the hop trace on, so that every sample can be placed
+against the GPU's power transitions (`scripts/wc-hop-stats.py`):
+
+| gap | n | mean | p50 | p99 | max | within a GPU wake (set apart) |
+|---|---|---|---|---|---|---|
+| none | 2000 | 20.0 µs | 19.4 | 30.1 | 187 | 0 |
+| 20 ms | 2000 | 240.0 µs (257.1 outside the wakes) | 144.7 | 604.7 | 53 ms | 295, mean 140.9 |
+| 20 ms, final configuration | 1000 | 180.2 µs | 158.0 | 352.8 | 8.8 ms | not traced |
+| 1 s | 300 | 306.7 µs | 275.0 | 812.9 | 5.4 ms | 32, mean 309.0 |
+| 1 s, final configuration | 60 + 200 | 298–317 µs | 262–287 | 470–1341 | 5.5 ms | not traced |
+
+The bound is met back to back and, by the median, at 20 ms. It is **not**
+met by the mean at 1 s between requests: about 300 µs. Where it goes is in
+the timeline above: on the guest ~105 µs before the request is in the
+ring (a thread's wake on a halted vCPU and the vioser write), ~140 µs
+through QEMU, the hub and the proxy and back, and ~30 µs for the
+launcher's wake. The means at 20 ms also carry the guest's own scheduling
+outliers (a game in session 1 had them at 2–53 ms, 7 in 2000), which no
+change on our side removed (item 5).
+
+**Idle CPU.** Nothing added spins or polls while idle: every spin is
+bounded by an outstanding request, and the hub's yield runs only when a
+byte rang a parked lane. Host: hub 0.01 s and session service 0.02 s per
+minute, as before.
+
 **What is left on the path, and why it is not software here.** The kick
 reaches the host through QEMU's main loop: its main thread is woken by the
 vCPU's ioeventfd, runs virtio-serial's handler and writes the byte to the
@@ -34683,6 +34738,45 @@ Tests: `down_stops_every_unit_even_while_the_manager_re_executes` and
 `down_that_cannot_stop_the_units_fails_and_keeps_the_session` (the real
 script against a stand-in `systemctl` that refuses like a re-executing
 manager), `a_session_is_forgotten_only_after_a_down_that_worked`.
+
+**The cold start.**
+
+* **`up` in the service's own process** (`sessiond_ivshmem::up_inline`,
+  called from `agent::start_session`): the header page read and checked,
+  `arena.run`, `transport` and `session.index` written, the same words
+  back, 0.2–0.5 ms where the script took 58–75 ms. It steps aside to the
+  script whenever a broker hands out the arena (§111) or no hub is
+  running, and `WC_SESSIOND_BASH_UP=1` forces the script.
+  `up_in_process_matches_the_script` runs both on one header and compares
+  their output and files, for a plain and an indexed session.
+* **The `proxy` verb before its unit starts: 74–78 ms to 17 ms.** It
+  scanned the store for PipeWire's node binary in a session whose sound is
+  PulseAudio (25–35 ms), asked systemd for the doorbell twice, and forked
+  some twenty `cat`, `grep`, `id` and `date`. The verb now stamps its
+  stages into `proxy.timing`, which the service puts in its log line.
+* **The session's PulseAudio is not waited for.** It starts beside the
+  proxy and `proxy` returns without it; `run` waits for its state only
+  while it is still starting.
+
+Measured on the guest (test installation `wcil`, whose application is
+`foot`, so the window's own start is shorter than Firefox's):
+
+| stage | before | after |
+|---|---|---|
+| the service's `up` | 58–75 ms | 0.19–0.34 ms |
+| the service's `proxy` | 163–260 ms | 107–147 ms (script 21–30, unit started 49–78, socket bound 68–109, rings 84–122) |
+| the service's `gpu`, beside `proxy` | 124–217 ms | 112–132 ms |
+| the host's answer, from the record | 226–338 ms | 123–150 ms |
+| the launcher's session up, nothing running | 409–498 ms | 290–321 ms |
+| the launcher's session up, the shared compositor running | — | 137–159 ms |
+| click to window, nothing running | ~850 ms (Firefox) | 435 ms (897 the first time after a deploy, cold disk caches) |
+| click to window, a new session in a running compositor | — | 286–376 ms |
+| click to window, the session up | 532–659 ms (Firefox, 105.9) | 129–165 ms |
+
+What is left is `systemd-run` (~35 ms) and the proxy's own start to its
+socket (~35 ms). Units started ahead of the click, or socket-activated,
+would take both out of the path; that changes how sessions own their
+units, and is not done here.
 
 ## 106. Host integration: every host audio device in Linux, and links and files opened across the boundary, both ways
 
