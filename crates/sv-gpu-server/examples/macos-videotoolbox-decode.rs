@@ -22,7 +22,8 @@ mod fixture {
         macos::{Picture, Range as PixelRange},
         videotoolbox::{CompressedBytes, Decoder},
     };
-    const STREAM: &[u8] = include_bytes!("assets/videotoolbox-h264/progressive-64x50.h264");
+    const VIDEO_STREAM: &[u8] = include_bytes!("assets/videotoolbox-h264/progressive-64x50.h264");
+    const FULL_STREAM: &[u8] = include_bytes!("assets/videotoolbox-h264/full-range-64x50.h264");
     const WIDTH: usize = 64;
     const HEIGHT: usize = 50;
     const FRAMES: usize = 8;
@@ -138,7 +139,7 @@ mod fixture {
             }
         }
     }
-    fn verify(picture: &Picture, frame: usize) -> Result<(), String> {
+    fn verify(picture: &Picture, frame: usize, expected_range: PixelRange) -> Result<(), String> {
         let layout = picture.layout();
         if layout.width != WIDTH || ![HEIGHT, 64].contains(&layout.height) {
             return Err(format!(
@@ -146,8 +147,11 @@ mod fixture {
                 layout.width, layout.height
             ));
         }
-        if picture.range() != PixelRange::Video {
-            return Err("fixture requires video-range NV12 output".into());
+        if picture.range() != expected_range {
+            return Err(format!(
+                "fixture requires {expected_range:?} NV12 output, got {:?}",
+                picture.range()
+            ));
         }
         let status = unsafe { CVPixelBufferLockBaseAddress(picture.pixel_buffer(), 1) };
         if status != 0 {
@@ -191,11 +195,31 @@ mod fixture {
         Ok(())
     }
     pub fn run() -> Result<(), String> {
+        let mut arguments = std::env::args().skip(1);
+        let full_range = match arguments.next().as_deref() {
+            None => false,
+            Some("--full-range") => true,
+            _ => return Err("usage: macos-videotoolbox-decode [--full-range]".into()),
+        };
+        if arguments.next().is_some() {
+            return Err("unexpected fixture arguments".into());
+        }
+        let expected_range = if full_range {
+            PixelRange::Full
+        } else {
+            PixelRange::Video
+        };
+        let stream = if full_range {
+            FULL_STREAM
+        } else {
+            VIDEO_STREAM
+        };
+        eprintln!("fixture stage=mode expected_range={expected_range:?}");
         unsafe {
             libc::alarm(30);
         }
-        eprintln!("fixture stage=parse stream bytes={}", STREAM.len());
-        let parsed = nals(STREAM)?;
+        eprintln!("fixture stage=parse stream bytes={}", stream.len());
+        let parsed = nals(stream)?;
         let sps = parsed
             .iter()
             .find(|n| n.0 == 7)
@@ -205,8 +229,8 @@ mod fixture {
             .find(|n| n.0 == 8)
             .ok_or("missing fixture PPS")?;
         for entry in &parsed {
-            if entry.0 == 7 && STREAM[entry.2.clone()] != STREAM[sps.2.clone()]
-                || entry.0 == 8 && STREAM[entry.2.clone()] != STREAM[pps.2.clone()]
+            if entry.0 == 7 && stream[entry.2.clone()] != stream[sps.2.clone()]
+                || entry.0 == 8 && stream[entry.2.clone()] != stream[pps.2.clone()]
             {
                 return Err("fixture changes parameter sets".into());
             }
@@ -216,13 +240,19 @@ mod fixture {
             return Err("fixture must contain two IDR and six P pictures".into());
         }
         eprintln!("fixture stage=map shared source");
-        let source = Arc::new(Mapping::new(STREAM)?);
+        let source = Arc::new(Mapping::new(stream)?);
         eprintln!("fixture stage=create hardware-required decoder");
-        let mut decoder = Decoder::new(&STREAM[sps.2.clone()], &STREAM[pps.2.clone()])?;
+        let mut decoder = Decoder::new(&stream[sps.2.clone()], &stream[pps.2.clone()])?;
         eprintln!(
             "fixture stage=decoder created coded={:?} display={:?}",
             decoder.coded_extent, decoder.display_extent
         );
+        if decoder.output_range != expected_range {
+            return Err(format!(
+                "format range {:?} disagrees with fixture {expected_range:?}",
+                decoder.output_range
+            ));
+        }
         if decoder.coded_extent != [64, 64]
             || decoder.display_extent != [64, 50]
             || decoder.crop_origin != [0, 0]
@@ -234,6 +264,7 @@ mod fixture {
         }
         let mut pictures = Vec::new();
         for (frame, slice) in slices.iter().enumerate() {
+            decoder.update_parameters(&stream[sps.2.clone()], &stream[pps.2.clone()])?;
             eprintln!("fixture stage=submit frame={frame} nal_type={}", slice.0);
             let completion =
                 decoder.submit_annex_b_tracked(source.clone(), slice.1.clone(), &[0])?;
@@ -260,7 +291,7 @@ mod fixture {
             }
             eprintln!("fixture stage=source released before fence frame={frame}");
             eprintln!("fixture stage=verify frame={frame}");
-            verify(&picture, frame)?;
+            verify(&picture, frame, expected_range)?;
             pictures.push(picture);
         }
         eprintln!("fixture stage=final drain");
@@ -280,7 +311,7 @@ mod fixture {
             return Err("source mutation did not reach mapping".into());
         }
         for (frame, picture) in pictures.iter().enumerate() {
-            verify(picture, frame)?;
+            verify(picture, frame, expected_range)?;
         }
         unsafe {
             libc::alarm(0);
