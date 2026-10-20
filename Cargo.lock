@@ -1339,6 +1339,7 @@ dependencies = [
  "serde_json",
  "sv-arena",
  "sv-drm",
+ "sv-ram",
  "sv-transport",
  "sv-wire",
  "wc-broker",

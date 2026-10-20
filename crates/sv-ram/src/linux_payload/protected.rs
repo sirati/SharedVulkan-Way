@@ -102,6 +102,20 @@ impl ProtectedBackend {
     pub fn target(&self) -> Arc<dyn ServiceProcess> {
         self.local.target()
     }
+    /// Admit the same retained actual service process into its canonical
+    /// context. This issues no epoch and supplies no synthetic remote process.
+    pub fn context_endpoint(&self, policy: &ServicePolicy) -> io::Result<ServiceEndpoint> {
+        self.local.local.current()?;
+        // SAFETY: protected construction already proved own service provenance;
+        // current() rechecks actual primary credentials and exact live pidfd.
+        unsafe {
+            ServiceEndpoint::from_current_service(
+                policy,
+                wc_broker::User::uid(self.local.local.uid),
+                self.local.target(),
+            )
+        }
+    }
 }
 // SAFETY: original/grant checks precede export; only exact local native target
 // is admitted. Immutable access/range/source metadata is checked on the retained

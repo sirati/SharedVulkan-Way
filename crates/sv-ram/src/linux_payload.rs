@@ -32,11 +32,21 @@ fn page() -> io::Result<u64> {
         ))
     }
 }
+/// Native original-source liveness, retained with every canonical grant.
+///
+/// # Safety
+/// Query the exact retained original process/backend objects and fail on any
+/// source reassignment, native query failure or death. No PID-name reopening,
+/// shared words or timeout may supply liveness or completion.
+pub unsafe trait LiveOriginalOwner: Send + Sync {
+    fn ensure_live(&self) -> io::Result<()>;
+}
 /// Full original sealed memfd, never an exported/narrowed descriptor or a copy.
 pub struct SealedBacking {
     original: File,
     geometry: BackingGeometry,
     _original_owner: Arc<dyn Send + Sync>,
+    live_owner: Option<Arc<dyn LiveOriginalOwner>>,
 }
 impl SealedBacking {
     /// Enroll the independently retained original backend, not a caller path.
@@ -56,11 +66,35 @@ impl SealedBacking {
             original,
             geometry,
             _original_owner: original_owner,
+            live_owner: None,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+    /// Enroll a source that additionally revalidates its retained native owner
+    /// before every initialization or projection.
+    ///
+    /// # Safety
+    /// Same original/delegation contract as from_original. owner must be the
+    /// independently authenticated exact native source, not a caller assertion.
+    pub unsafe fn from_live_original<T: LiveOriginalOwner + 'static>(
+        original: File,
+        geometry: BackingGeometry,
+        owner: Arc<T>,
+    ) -> io::Result<Self> {
+        let result = Self {
+            original,
+            geometry,
+            _original_owner: owner.clone(),
+            live_owner: Some(owner),
         };
         result.validate()?;
         Ok(result)
     }
     fn validate(&self) -> io::Result<()> {
+        if let Some(owner) = &self.live_owner {
+            owner.ensure_live()?;
+        }
         let page = page()?;
         let m = self.original.metadata()?;
         let expected = self.geometry.physical;
@@ -452,6 +486,30 @@ mod tests {
         let (file, mut geometry) = memfd(stable());
         geometry.arena_base = 4097;
         assert!(unsafe { SealedBacking::from_original(file, geometry, Arc::new(())) }.is_err());
+    }
+    #[test]
+    fn uncertain_native_source_prevents_zeroing_retained_original() {
+        struct Watch(std::sync::atomic::AtomicBool);
+        // SAFETY: deterministic failure injection only, never native authority.
+        unsafe impl LiveOriginalOwner for Watch {
+            fn ensure_live(&self) -> io::Result<()> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(denied("injected native source query failure"))
+                }
+            }
+        }
+        let (file, geometry) = memfd(stable());
+        file.write_all_at(&[0x91; 16384], 0).unwrap();
+        let owner = Arc::new(Watch(std::sync::atomic::AtomicBool::new(true)));
+        let original =
+            unsafe { SealedBacking::from_live_original(file, geometry, owner.clone()).unwrap() };
+        owner.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(original.initialize_zeroed(4096, 8192).is_err());
+        let mut bytes = [0; 16384];
+        original.original.read_exact_at(&mut bytes, 0).unwrap();
+        assert!(bytes.iter().all(|b| *b == 0x91));
     }
     #[test]
     fn physical_header_and_full_page_capacity_are_bounded() {
