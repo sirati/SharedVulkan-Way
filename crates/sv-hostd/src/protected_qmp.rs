@@ -618,6 +618,66 @@ impl EnrolledOriginal {
         reply(&mut qmp, json!({"execute":"stop"}))?;
         Ok(())
     }
+    /// End this disposable fixture's exact child through its retained channel,
+    /// then wait on the captured pidfd and Child. Keeps original backing and
+    /// durable exclusions intact even when canonical guards retain this owner.
+    ///
+    /// # Safety
+    /// Disposable no-GPU fixture only. Every known projected export must have
+    /// reached actual native all-alias retirement, and the source must already
+    /// be paused/invalidated. Caller must retain original and durable exclusion
+    /// guards throughout. This is controller cleanup, never grant retirement,
+    /// logical completion, physical reuse or authority to stop another VM.
+    #[cfg(feature = "protected-payload-fixture")]
+    pub unsafe fn shutdown_owned_fixture_source(&self) -> io::Result<()> {
+        let mut original = self
+            .owner
+            .launched
+            .lock()
+            .map_err(|_| denied("QEMU child owner poisoned"))?;
+        if original.child.is_none() {
+            return Err(denied("fixture child already waited"));
+        }
+        live(&original.pidfd)?;
+        if source_census(self.pid, self.physical, self.owner.inherited_fd)? != self.owner.census {
+            return Err(denied("fixture source census changed before shutdown"));
+        }
+        let mut qmp = self
+            .owner
+            .qmp
+            .lock()
+            .map_err(|_| denied("QMP original owner poisoned"))?;
+        let status = reply(&mut qmp, json!({"execute":"query-status"}))?;
+        if status["running"].as_bool() != Some(false) {
+            return Err(denied("fixture source must be invalidated before shutdown"));
+        }
+        reply(&mut qmp, json!({"execute":"quit"}))?;
+        let mut poll = libc::pollfd {
+            fd: original.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll, 1, 5000) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "owned fixture QEMU did not exit, no cleanup pass",
+            ));
+        }
+        if poll.revents & libc::POLLIN == 0 || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            return Err(denied("owned fixture native exit query uncertain"));
+        }
+        let status = original.child.as_mut().unwrap().wait()?;
+        original.child.take();
+        if !status.success() {
+            return Err(denied("owned fixture QEMU exited unsuccessfully"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
