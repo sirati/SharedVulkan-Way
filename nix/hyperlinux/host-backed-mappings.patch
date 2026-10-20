@@ -2355,3 +2355,14 @@ index 10753ca..6854b0e 100644
 +            if (guest_control_va_overlap(g, in[i].attach_va[k], in[i].ipa_span))
 +                return -1;
 +    }
+--- a/src/fork_ipc.c
++++ b/src/fork_ipc.c
+@@ -695 +695 @@
+-            hl_shm_fork_import(&g, recs, nshm);
++            int rc = hl_shm_fork_import(&g, recs, nshm);
+@@ -696,0 +697,5 @@
++            if (rc < 0) {
++                fprintf(stderr, "hl: fork-child: rejected SHM image\n");
++                guest_destroy(&g);
++                return 1;
++            }
