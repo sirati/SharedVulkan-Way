@@ -501,19 +501,10 @@ play() {
   # touching it.
   mark "steady begin"; sleep 30; mark "steady end"
   xdotool key Escape; sleep 2; shot "$RUN/p7-paused.png"; mark paused
-  # Quit the way a person on Windows does: the window's close button, which
-  # is `WM_CLOSE`, then `xdg_toplevel.close`, then Minecraft saving the world
-  # and exiting by itself.
-  # The button is found from where the compositor says the window is (Wine's
-  # virtual desktop has no X window per Win32 window to ask): the last
-  # "(window WxH at X,Y)" it logged, and the caption's close box 15 px in from
-  # the right edge and 16 down, which is Wine's default theme.
-  local geo; geo=$(grep -o "(window [0-9]*x[0-9]* at -\?[0-9]*,-\?[0-9]*)" "$RUN/compositor.log" | tail -1 | tr -dc "0-9x,\- \n" )
-  local ww wy wx
-  ww=$(echo "$geo" | sed -E 's/ *([0-9]+)x.*/\1/')
-  wx=$(echo "$geo" | sed -E 's/.* (-?[0-9]+),.*/\1/')
-  wy=$(echo "$geo" | sed -E 's/.*,(-?[0-9]+).*/\1/')
-  xdotool mousemove $((wx + ww - 15)) $((wy + 16)) click 1
+  # Alt+F4 follows Windows' ordinary WM_CLOSE path through Wine and the
+  # compositor. Window position logs are diagnostic text, not a stable input
+  # API; the former geometry parser produced a negative click and never closed.
+  xdotool key alt+F4
   mark "closed the window"
 }
 
