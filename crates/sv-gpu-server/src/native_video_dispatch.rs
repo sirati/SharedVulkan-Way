@@ -41,6 +41,12 @@ impl DispatchState {
     pub fn available(&self) -> bool {
         self.failure.is_none() && self.video.available()
     }
+    pub fn owns_session(&self, wire: u64) -> bool {
+        self.session_ids.contains(&wire)
+    }
+    pub fn owns_parameters(&self, wire: u64) -> bool {
+        self.parameter_ids.contains(&wire)
+    }
     pub fn session(&self, wire: u64) -> Option<u64> {
         self.sessions.get(&wire).copied()
     }
