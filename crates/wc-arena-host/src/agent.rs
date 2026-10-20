@@ -118,7 +118,13 @@ pub fn start_session(ws: &Path, s: &Start, env: &[(&'static str, String)]) -> Re
     let id = s.id.as_str();
     let run = format!("0x{:016x}", s.run);
     let t_up = Instant::now();
-    let up = crate::sessiond::verb_env(ws, &["up", id, &run, "ivshmem"], env);
+    // §105.14: in this process, unless the broker hands out the arena (its
+    // header is then read through the broker, which is the script's job).
+    let brokered = env.iter().any(|(k, _)| *k == "WC_BROKER");
+    let up = (!brokered)
+        .then(|| crate::sessiond_ivshmem::up_inline(id, s.run, s.index))
+        .flatten()
+        .unwrap_or_else(|| crate::sessiond::verb_env(ws, &["up", id, &run, "ivshmem"], env));
     let d_up = t_up.elapsed();
     let gpu = (s.gpu && up.is_ok()).then(|| {
         let (ws, id, env) = (ws.to_path_buf(), id.to_string(), env.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>());
@@ -147,7 +153,12 @@ pub fn start_session(ws: &Path, s: &Start, env: &[(&'static str, String)]) -> Re
             Err(e) => msg = format!("{msg}; NO GPU: {e}"),
         }
     }
-    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?}, gpu {d_gpu:?} (beside the proxy)"));
+    // §105.14: the proxy verb's own stages (`wc-session` writes them).
+    let runroot = std::env::var("WC_LAUNCH_RUN").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "/tmp/wc-launch".into());
+    let stages = std::fs::read_to_string(Path::new(&runroot).join(id).join("proxy.timing"))
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().chunks(2).map(|c| c.join(" ")).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?} (ms into it: {stages}), gpu {d_gpu:?} (beside the proxy)"));
     Ok(msg)
 }
 

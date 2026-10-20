@@ -310,6 +310,93 @@ fn answer(file: &std::fs::File, rec: &macboot::Record, st: macboot::State, msg: 
     Ok(true)
 }
 
+/// §105.14: `wc-session up ID RUN ivshmem`, in this process. It was a bash
+/// script and its `od`s, 60 ms of every cold start before the proxy and the
+/// GPU could begin. The same checks, the same files (`arena.run`,
+/// `transport`) and the same words back. `None` when this cannot decide it
+/// the script's way (no doorbell hub running), and the script then runs; so
+/// does `WC_SESSIOND_BASH_UP=1`, to compare.
+pub fn up_inline(id: &str, run: u64, index: u8) -> Option<Result<String, String>> {
+    if std::env::var("WC_SESSIOND_BASH_UP").is_ok_and(|v| v == "1") || !macboot::valid_id(id) {
+        return None;
+    }
+    let env = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
+    let runroot = PathBuf::from(env("WC_LAUNCH_RUN", "/tmp/wc-launch"));
+    let arena = PathBuf::from(env("WC_LAUNCH_ARENA", "/run/windows-vm/wc-arena/arena"));
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let hubdir = PathBuf::from(env("WC_LAUNCH_BELL_HUB", &format!("/run/user/{uid}/wc-bell")));
+    up_in(&runroot, &arena, &hubdir, id, run, index)
+}
+
+/// [`up_inline`] with its three places given.
+pub fn up_in(runroot: &Path, arena: &Path, hubdir: &Path, id: &str, run: u64, index: u8) -> Option<Result<String, String>> {
+    use std::os::unix::fs::{DirBuilderExt, FileExt};
+    if !macboot::valid_id(id) {
+        return None;
+    }
+    // `wl_hub`: the hub's Wayland socket, answered. Without a running hub the
+    // script would start one or fall back to QEMU's socket; that stays its job.
+    let hub = hubdir.join("wl.sock");
+    if std::os::unix::net::UnixStream::connect(&hub).is_err() {
+        return None;
+    }
+    let d = runroot.join(id);
+    let _ = std::fs::remove_dir_all(&d);
+    let mk = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(d.join("xdg"));
+    if let Err(e) = mk.and_then(|()| std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))) {
+        return Some(Err(format!("up failed: {}: {e}", d.display())));
+    }
+    let f = match std::fs::OpenOptions::new().read(true).write(true).open(arena) {
+        Ok(f) => f,
+        Err(e) => {
+            return Some(Err(format!(
+                "up failed: {}: {e} (no wc-arena device, or {} may not read and write it)",
+                arena.display(),
+                std::env::var("USER").unwrap_or_default()
+            )));
+        }
+    };
+    let mut b = [0u8; wc_handle::ivshmem::ENCODED_LEN];
+    let h = match f.read_exact_at(&mut b, 0).map_err(|e| e.to_string()).and_then(|()| {
+        wc_handle::ivshmem::Header::decode(&b).map_err(|e| e.to_string())
+    }) {
+        Ok(h) => h,
+        Err(e) => return Some(Err(format!("up failed: {}: {e}", arena.display()))),
+    };
+    if h.run_id != run {
+        return Some(Err(format!(
+            "up failed: {} describes run 0x{:016x} and the compositor said 0x{run:016x}: another compositor's header",
+            arena.display(),
+            h.run_id
+        )));
+    }
+    let w = |name: &str, text: String| std::fs::write(d.join(name), text).map_err(|e| format!("up failed: {name}: {e}"));
+    if let Err(e) = w("arena.run", format!("0x{run:016x}\n")) {
+        return Some(Err(e));
+    }
+    let mut out = vec![format!("ivshmem run 0x{run:016x} generation {}, {} bytes at {}", h.generation, h.region_len, arena.display())];
+    if h.rings.1 == 0 {
+        return Some(Err(format!(
+            "up failed: no Wayland rings in {} (the compositor kept no rings; its log says why) and no ssh to fall back to: refusing the session (§105)",
+            arena.display()
+        )));
+    }
+    if let Err(e) = w("transport", "rings\n".into()) {
+        return Some(Err(e));
+    }
+    out.push(format!("transport rings: {} bytes at {}, doorbell {}", h.rings.1, h.rings.0, hub.display()));
+    // §107: the session's index in the guest's shared compositor.
+    if index != 0 {
+        if let Err(e) = w("session.index", format!("{index}\n")) {
+            return Some(Err(e));
+        }
+        out.push(format!("session index {index} of a shared compositor"));
+    }
+    out.push(format!("up ok {}", d.display()));
+    Some(Ok(out.join("; ")))
+}
+
 /// Sessions this service started, kept in a file each so a restarted service
 /// still runs their `down` with the right installation's `wc-session`.
 struct Live {
@@ -339,14 +426,35 @@ impl Live {
 
     /// End every session whose proxy unit is gone.
     fn reap(&mut self, host: &Host) {
+        self.reap_with(
+            crate::sessiond::unit_active,
+            |base, id| crate::sessiond::verb(&base.join("wc-session"), &["down", id]),
+            |id| host.ended(id),
+        );
+    }
+
+    /// [`Live::reap`], with the questions it asks the system passed in.
+    /// §105.14: a session is forgotten only once its `down` succeeded; until
+    /// then it is tried again on every pass. An unanswered manager is not an
+    /// ended session (`unit_active`), and a `down` that could not stop the
+    /// units leaves them named here, never orphaned.
+    fn reap_with(
+        &mut self,
+        active: impl Fn(&str) -> bool,
+        down: impl Fn(&Path, &str) -> Result<String, String>,
+        ended: impl Fn(&str),
+    ) {
         let gone: Vec<(String, PathBuf)> =
-            self.map.iter().filter(|(id, _)| !crate::sessiond::unit_active(id)).map(|(i, b)| (i.clone(), b.clone())).collect();
+            self.map.iter().filter(|(id, _)| !active(id)).map(|(i, b)| (i.clone(), b.clone())).collect();
         for (id, base) in gone {
-            match crate::sessiond::verb(&base.join("wc-session"), &["down", &id]) {
+            match down(&base, &id) {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
-                Err(e) => say(&format!("session {id} ended; {e}")),
+                Err(e) => {
+                    say(&format!("session {id} ended, but {e}; trying again"));
+                    continue;
+                }
             }
-            host.ended(&id);
+            ended(&id);
             let _ = std::fs::remove_file(self.dir.join(&id));
             self.map.remove(&id);
         }
@@ -1057,5 +1165,109 @@ mod tests {
         assert_eq!(map_user(&map, "vm", true, &req("wcivs", None)).unwrap(), "desk", "transitional");
         let e = map_user(&map, "vm", true, &req("wcmc", None)).unwrap_err();
         assert!(e.contains("maps no user for that installation without one"), "{e}");
+    }
+
+    /// §105.14: wcl-12128. The user's manager re-executed during a NixOS
+    /// switch, `is-active` failed, and the session was taken for ended; its
+    /// `down` could not stop anything either, said "down ok", and the service
+    /// forgot the session with its sound and GPU units still running.
+    #[test]
+    fn a_session_is_forgotten_only_after_a_down_that_worked() {
+        use crate::sessiond::{UnitState, classify_is_active};
+        assert_eq!(classify_is_active(""), UnitState::Unknown, "no answer from the manager is not an ended unit");
+        assert_eq!(classify_is_active("inactive\n"), UnitState::Gone);
+        assert_eq!(classify_is_active("failed\n"), UnitState::Gone);
+        assert_eq!(classify_is_active("active\n"), UnitState::Running);
+        assert_eq!(classify_is_active("deactivating\n"), UnitState::Running);
+
+        let t = tmp("reap");
+        let mut live = Live { dir: t.0.join("live"), map: HashMap::new() };
+        live.insert("wcl-1", &t.0);
+        live.insert("wcl-2", &t.0);
+        let tries = std::cell::Cell::new(0);
+        // wcl-1 is gone, and its first two downs cannot stop its units.
+        let down = |_: &Path, id: &str| {
+            assert_eq!(id, "wcl-1", "a running session was taken down");
+            tries.set(tries.get() + 1);
+            if tries.get() < 3 { Err("down failed: wc-launch-audio-wcl-1 is still unknown".into()) } else { Ok("down ok".into()) }
+        };
+        let active = |id: &str| id == "wcl-2";
+        live.reap_with(active, down, |_| {});
+        live.reap_with(active, down, |_| {});
+        assert!(live.map.contains_key("wcl-1") && t.0.join("live/wcl-1").exists(), "forgotten after a failed down");
+        live.reap_with(active, down, |_| {});
+        assert_eq!(tries.get(), 3);
+        assert!(!live.map.contains_key("wcl-1") && !t.0.join("live/wcl-1").exists());
+        assert!(live.map.contains_key("wcl-2"));
+    }
+
+    /// §105.14: the in-process `up` does what `wc-session up ID RUN ivshmem`
+    /// does, file for file and word for word, and refuses what it refuses.
+    #[test]
+    fn up_in_process_matches_the_script() {
+        let t = tmp("up");
+        let arena = t.0.join("arena");
+        let h = wc_handle::ivshmem::Header {
+            run_id: 0x00f2e6312f23d405,
+            generation: 29,
+            region_len: 134217728,
+            arena_id: 0,
+            outbound: (0, 0),
+            rings: (127926272, 6291456),
+        };
+        std::fs::write(&arena, h.encode()).unwrap();
+        std::fs::create_dir_all(t.0.join("hub")).unwrap();
+        let _hub = std::os::unix::net::UnixListener::bind(t.0.join("hub/wl.sock")).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/wc-session");
+        let bash = |run: &str| {
+            std::process::Command::new("bash")
+                .arg(&script)
+                .env("SSH_ORIGINAL_COMMAND", format!("up wcl-1 {run} ivshmem"))
+                .env("WC_LAUNCH_RUN", t.0.join("run-b"))
+                .env("WC_LAUNCH_ARENA", &arena)
+                .env("WC_LAUNCH_BELL_HUB", t.0.join("hub"))
+                .env("WC_LAUNCH_HUB_UNMANAGED", "1")
+                .env("WC_LAUNCH_SERVICE", "1")
+                .output()
+                .unwrap()
+        };
+        let mine = up_in(&t.0.join("run-a"), &arena, &t.0.join("hub"), "wcl-1", h.run_id, 0).expect("decided in process").unwrap();
+        let theirs = bash("0x00f2e6312f23d405");
+        assert!(theirs.status.success(), "{}", String::from_utf8_lossy(&theirs.stderr));
+        let theirs = String::from_utf8_lossy(&theirs.stdout).trim().replace('\n', "; ");
+        assert_eq!(mine.replace(&t.0.join("run-a").display().to_string(), "D"), theirs.replace(&t.0.join("run-b").display().to_string(), "D"));
+        for f in ["arena.run", "transport"] {
+            assert_eq!(
+                std::fs::read_to_string(t.0.join("run-a/wcl-1").join(f)).unwrap(),
+                std::fs::read_to_string(t.0.join("run-b/wcl-1").join(f)).unwrap(),
+                "{f}"
+            );
+        }
+        assert_eq!(std::fs::metadata(t.0.join("run-a/wcl-1")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(t.0.join("run-a/wcl-1/xdg").is_dir());
+        // Another compositor's header: both refuse.
+        assert!(up_in(&t.0.join("run-a"), &arena, &t.0.join("hub"), "wcl-1", 0x77, 0).unwrap().unwrap_err().contains("another compositor"));
+        assert!(!bash("0x77").status.success());
+        // No hub: the script decides.
+        assert!(up_in(&t.0.join("run-a"), &arena, &t.0.join("nohub"), "wcl-1", h.run_id, 0).is_none());
+        // §107: a shared compositor's session, by its index.
+        let mine = up_in(&t.0.join("run-a"), &arena, &t.0.join("hub"), "wcl-1", h.run_id, 3).unwrap().unwrap();
+        let theirs = std::process::Command::new("bash")
+            .arg(&script)
+            .env("SSH_ORIGINAL_COMMAND", "up wcl-1 0x00f2e6312f23d405 ivshmem")
+            .env("WC_LAUNCH_RUN", t.0.join("run-b"))
+            .env("WC_LAUNCH_ARENA", &arena)
+            .env("WC_LAUNCH_BELL_HUB", t.0.join("hub"))
+            .env("WC_LAUNCH_HUB_UNMANAGED", "1")
+            .env("WC_LAUNCH_SERVICE", "1")
+            .env("WC_LAUNCH_SESSION_INDEX", "3")
+            .output()
+            .unwrap();
+        let theirs = String::from_utf8_lossy(&theirs.stdout).trim().replace('\n', "; ");
+        assert_eq!(mine.replace(&t.0.join("run-a").display().to_string(), "D"), theirs.replace(&t.0.join("run-b").display().to_string(), "D"));
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("run-a/wcl-1/session.index")).unwrap(),
+            std::fs::read_to_string(t.0.join("run-b/wcl-1/session.index")).unwrap()
+        );
     }
 }

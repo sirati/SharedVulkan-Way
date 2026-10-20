@@ -886,10 +886,20 @@ fn service_over(sess: &Sess, ch: &ByteChannel) -> bool {
             && !ch.readable().unwrap_or(false)
 }
 
-/// How long a request waits for its answer before it parks (§105.13): a
-/// millisecond covers the host waking from its park and answering, so the
-/// answer needs no doorbell back. Only while a request is outstanding.
-const SPIN: Duration = Duration::from_millis(1);
+/// How long a request waits for its answer before it parks (§105.13): the
+/// host waking from its park and answering takes 0.1–1.5 ms on an idle
+/// guest, and an answer seen here needs no doorbell back (§105.14). A
+/// yielding wait, and only while a request is outstanding.
+/// `WC_CTL_SPIN_US` overrides it, for measuring (§105.14).
+fn spin() -> Duration {
+    static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("WC_CTL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(Duration::from_millis(2), Duration::from_micros)
+    })
+}
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
@@ -942,6 +952,7 @@ impl Ctl {
                 let ch = g.as_mut().ok_or("the session has ended")?;
                 match ch.read(&mut buf).map_err(|e| e.to_string())? {
                     ReadOutcome::Bytes(n) => {
+                        sv_transport::frametrace::hop("C.reply");
                         out.extend_from_slice(&buf[..n]);
                         return Ok(());
                     }
@@ -955,14 +966,20 @@ impl Ctl {
                 // tens of microseconds; look for it before parking, which
                 // would add a doorbell round trip.
                 let t0 = Instant::now();
-                while t0.elapsed() < SPIN && !ch.readable().unwrap_or(true) {
-                    std::hint::spin_loop();
+                while t0.elapsed() < spin() && !ch.readable().unwrap_or(true) {
+                    // §105.14: a yielding spin. A busy one held its vCPU
+                    // against the launcher on the guest, and both lost a
+                    // 15.6 ms tick to it (Windows does not move a woken
+                    // thread to a parked core).
+                    std::thread::yield_now();
                 }
                 if ch.readable().unwrap_or(true) {
                     continue;
                 }
                 // Short, so the lease never waits long behind this lock.
+                sv_transport::frametrace::hop("C.park");
                 let _ = ch.wait_readable(crate::ringlink::ring_wait_slice().min(Duration::from_millis(20)));
+                sv_transport::frametrace::hop("C.unpark");
             }
         }
     }
@@ -990,7 +1007,9 @@ impl Ctl {
     /// [`Ctl::request`] for a caller that holds the turn.
     fn exchange(&self, line: &str, within: Duration) -> Result<Vec<u8>, String> {
         self.drain_stale();
+        sv_transport::frametrace::hop("C.ringtx0");
         self.write_all(format!("{line}\n").as_bytes())?;
+        sv_transport::frametrace::hop("C.ringtx1");
         let deadline = Instant::now() + within;
         let mut got = Vec::new();
         let nl = loop {
@@ -1713,9 +1732,11 @@ fn lines(mut conn: wc_transport::Stream, mut f: impl FnMut(&str) -> Vec<u8>) {
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         };
+        sv_transport::frametrace::hop("C.line");
         if conn.write_all(&f(&line)).is_err() {
             return;
         }
+        sv_transport::frametrace::hop("C.socktx");
     }
 }
 

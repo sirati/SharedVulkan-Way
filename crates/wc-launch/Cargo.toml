@@ -38,6 +38,8 @@ wc-broker = { workspace = true }
 # §105: the compositor's control socket, which carries this launcher's
 # requests to the host's session over the rings; AF_UNIX, as the Wayland one.
 wc-transport = { workspace = true }
+# §105.14: the hop trace (`frametrace::hop`), on the clock the compositor uses.
+sv-transport = { workspace = true }
 windows-sys = { workspace = true, features = [
   # CloseHandle, GetLastError, ERROR_ALREADY_EXISTS.
   "Win32_Foundation",

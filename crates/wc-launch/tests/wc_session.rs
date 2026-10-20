@@ -510,3 +510,67 @@ fn a_definition_outside_the_rules_runs_nothing() {
     let (ok, _, se) = h.guest("run t94 app 96 0");
     assert!(!ok && se.contains("apps.ini is missing"), "{se}");
 }
+
+// ------------------------------------------------------------- teardown ---
+
+/// A stand-in `systemctl --user` with three units of session `t94` running,
+/// which refuses the first `refusals` calls the way a manager in the middle
+/// of a re-execution does. Returns the PATH that finds it first.
+fn fake_systemctl(h: &Host, refusals: u32) -> String {
+    let r = h.root.display().to_string();
+    std::fs::create_dir_all(h.p("fakebin")).unwrap();
+    std::fs::create_dir_all(h.p("units")).unwrap();
+    for u in ["wc-launch-t94", "wc-launch-audio-t94", "wc-launch-gpu-t94"] {
+        std::fs::write(h.p("units").join(u), "").unwrap();
+    }
+    std::fs::write(h.p("out/refusals"), refusals.to_string()).unwrap();
+    write_exe(
+        &h.p("fakebin/systemctl"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >>{r}/out/systemctl.log\n\
+             n=$(cat {r}/out/refusals)\n\
+             if [ \"$n\" -gt 0 ]; then echo $((n - 1)) >{r}/out/refusals\n\
+               echo 'Failed to connect to user scope bus via local transport: Connection refused' >&2; exit 1; fi\n\
+             [ \"$1\" = --user ] || exit 2\n\
+             u=\"${{3%.service}}\"\n\
+             case \"$2\" in\n\
+               stop) rm -f {r}/units/\"$u\" ;;\n\
+               is-active) if [ -f {r}/units/\"$u\" ]; then echo active; else echo inactive; exit 3; fi ;;\n\
+             esac\n"
+        ),
+    );
+    format!("{}:{}", h.p("fakebin").display(), std::env::var("PATH").unwrap_or_default())
+}
+
+/// §105.14: wcl-12128. A NixOS switch re-executed the user's manager while a
+/// session ended; every `systemctl --user` in `down` failed, `down` said
+/// "down ok" anyway, removed the session's directory, and its PulseAudio
+/// and GPU units ran on. `down` now waits for the manager and stops all
+/// three.
+#[test]
+fn down_stops_every_unit_even_while_the_manager_re_executes() {
+    let h = Host::new("down-reexec");
+    let path = fake_systemctl(&h, 6);
+    let out = h.cmd().env("PATH", path).args(["down", "t94"]).output().unwrap();
+    let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "down failed\n{so}{se}");
+    assert!(so.contains("down ok"), "{so}");
+    for u in ["wc-launch-t94", "wc-launch-audio-t94", "wc-launch-gpu-t94"] {
+        assert!(!h.p("units").join(u).exists(), "{u} still runs after down\n{so}{se}");
+    }
+    assert!(!h.p("run/t94").exists(), "the session's directory outlived down");
+}
+
+/// And a manager that never answers: `down` fails, says which units, and
+/// keeps the directory, so the session service tries again later.
+#[test]
+fn down_that_cannot_stop_the_units_fails_and_keeps_the_session() {
+    let h = Host::new("down-stuck");
+    let path = fake_systemctl(&h, 1_000_000);
+    let out = h.cmd().env("PATH", path).env("WC_LAUNCH_STOP_TRIES", "3").args(["down", "t94"]).output().unwrap();
+    let (so, se) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "down said it worked\n{so}{se}");
+    assert!(!so.contains("down ok"), "{so}");
+    assert!(se.contains("could not stop") && se.contains("wc-launch-audio-t94") && se.contains("wc-launch-gpu-t94"), "{se}");
+    assert!(h.p("run/t94").exists(), "the directory went with the units still running");
+}
