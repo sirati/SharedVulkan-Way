@@ -37,12 +37,19 @@
 #
 #   SVFS_FIREFOX   the browser (default: nixpkgs' firefox on PATH)
 #   SVFS_ICD       the GPU side's driver (default: the dev shell's RADV)
+#   SVFS_PCI       forwarded GPU PCI ids VVVV:DDDD, required for CUSE nodes
 #   SVFS_NODE      the render node (default /dev/dri/renderD129 if it is AMD)
 #   SVFS_CODECS    "H264" (default); "H264 HEVC" once Zink's VA driver has H.265
 #   SVFS_MESA      the GPU sessions' Mesa (a store path of nix/mesa-zink-va.nix);
 #                  without it there is no VA-API driver and no decode check passes
 #   SVFS_BIN       Linux build dir (default target/release)
 set -uo pipefail
+
+# Reject inherited sandbox overrides before launching any application.
+if env | grep -qE '^MOZ_DISABLE_.*SANDBOX='; then
+  echo "FAIL: the invoking environment overrides a Firefox sandbox"
+  exit 2
+fi
 
 SECS=${1:-40}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -85,6 +92,17 @@ for n in /sys/class/drm/renderD* /sys/class/drm/card[0-9]; do
 done
 DEV=$(stat -c '%Hr:%Lr' "$NODE")
 MINOR=${NODE##*renderD}
+PCI=()
+if [ -n "${SVFS_PCI:-}" ]; then
+  PCI=(--pci "$SVFS_PCI")
+elif [ -r "/sys/class/drm/renderD$MINOR/device/vendor" ] && [ -r "/sys/class/drm/renderD$MINOR/device/device" ]; then
+  vendor=$(cat "/sys/class/drm/renderD$MINOR/device/vendor")
+  device=$(cat "/sys/class/drm/renderD$MINOR/device/device")
+  PCI=(--pci "${vendor#0x}:${device#0x}")
+else
+  echo "need SVFS_PCI=VVVV:DDDD for the forwarded render node"
+  exit 2
+fi
 
 mkdir -p "$SCRATCH"
 RUN=$(mktemp -d "$SCRATCH/run-XXXXXX")
@@ -96,7 +114,7 @@ KIDS=()
 cleanup() {
   kill "${KIDS[@]}" 2>/dev/null
   wineserver -k 2>/dev/null
-  rm -f "$POOL"
+  rm -f "${POOL:-}"
 }
 trap cleanup EXIT INT TERM
 
@@ -228,17 +246,6 @@ for _ in $(seq 1 200); do grep -q '^\[proxy\] listening on' "$RUN/proxy.log" && 
 # ------------------------------------------------------------------ firefox ---
 MPORT=$((20000 + RANDOM % 9000))
 cat >"$RUN/profile/user.js" <<PREFS
-user_pref("media.hardware-video-decoding.force-enabled", true);
-user_pref("media.hardware-video-decoding-vulkan.enabled", true);
-user_pref("media.suspend-background-video.enabled", false);
-user_pref("media.autoplay.default", 0);
-user_pref("media.block-autoplay-until-in-foreground", false);
-user_pref("devtools.console.stdout.content", true);
-user_pref("browser.shell.checkDefaultBrowser", false);
-user_pref("browser.aboutwelcome.enabled", false);
-user_pref("browser.sessionstore.resume_from_crash", false);
-user_pref("datareporting.policy.dataSubmissionEnabled", false);
-user_pref("toolkit.telemetry.enabled", false);
 user_pref("marionette.port", $MPORT);
 PREFS
 # Lavapipe only: Firefox blocklists a renderer string naming llvmpipe, so a
@@ -269,12 +276,10 @@ fi
 }
 unset DISPLAY
 
-pages=()
-for c in $CODECS; do pages+=("file://$RUN/play.html#$c"); done
 say "firefox $("$FIREFOX" --version 2>/dev/null), $SECS s, node $NODE ($DEV) ${HIDE[*]}"
-env "${FFENV[@]}" timeout $((SECS + 30)) "$BIN/sv-drm" ns --dev "$DEV" --minor "$MINOR" "${HIDE[@]}" -- \
+env "${FFENV[@]}" timeout $((SECS + 30)) "$BIN/sv-drm" ns --dev "$DEV" --minor "$MINOR" "${PCI[@]}" "${HIDE[@]}" -- \
   "$FIREFOX" --no-remote --marionette --remote-allow-system-access --profile "$RUN/profile" \
-  "file://$RUN/webgl.html" "${pages[@]}" "about:support" >"$RUN/ff.log" 2>&1 &
+  "file://$RUN/webgl.html" >"$RUN/ff.log" 2>&1 &
 FF=$!
 KIDS+=($FF)
 sleep $((SECS - 15))
@@ -294,11 +299,36 @@ if [ -n "$GECKODRIVER" ] && [ -n "$JQ" ]; then
   done
   sid=$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "$RUN/wd-session.json")
   if [ -n "$sid" ]; then
+    # Collect results through WebDriver without changing media or console prefs.
+    wd "/session/$sid/execute/sync" '{"args":[],"script":"return document.getElementById(\"s\").textContent"}' >"$RUN/webgl.json"
+    "$JQ" -r '"svfs webgl " + .value' "$RUN/webgl.json" >>"$RUN/page.log"
+    for c in $CODECS; do
+      payload=$("$JQ" -nc --arg url "file://$RUN/play.html#$c" '{url:$url}')
+      wd "/session/$sid/url" "$payload" >"$RUN/navigation-$c.json"
+      sleep 10
+      wd "/session/$sid/execute/sync" '{"args":[],"script":"return document.getElementById(\"s\").textContent"}' >"$RUN/video-$c.json"
+      "$JQ" -r '"svfs " + .value' "$RUN/video-$c.json" >>"$RUN/page.log"
+    done
     wd "/session/$sid/moz/context" '{"context":"chrome"}' >/dev/null
     wd "/session/$sid/execute/async" '{"args":[],"script":"const done = arguments[arguments.length-1]; const {Troubleshoot} = ChromeUtils.importESModule(\"resource://gre/modules/Troubleshoot.sys.mjs\"); Troubleshoot.snapshot().then(s => done(JSON.stringify({media: {codecSupportInfo: s.media.codecSupportInfo}, sandbox: s.sandbox, graphics: {featureLog: s.graphics.featureLog, adapterDescription: s.graphics.adapterDescription, driverVendor: s.graphics.driverVendor, windowLayerManagerType: s.graphics.windowLayerManagerType, webgl2Renderer: s.graphics.webgl2Renderer, failures: s.graphics.failures}})), e => done(String(e)));"}' \
       >"$RUN/support.json"
   fi
 fi
+# Capture the actual RDD's kernel sandbox state while it is still alive.
+# Limit the walk to this browser's descendants, not other users' browsers.
+descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    echo "$child"
+    descendants "$child"
+  done
+}
+: >"$RUN/rdd-status.txt"
+for pid in $(descendants "$FF"); do
+  if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "RDD Process" ]; then
+    grep -E '^(Name|Pid|NoNewPrivs|Seccomp):' "/proc/$pid/status" >>"$RUN/rdd-status.txt"
+  fi
+done
 # What the compositor put on its desktop, for a reader to judge.
 (xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/screen.png") 2>/dev/null
 wait $FF 2>/dev/null
@@ -320,7 +350,7 @@ case "$lm" in
 esac
 case "$adapter" in *zink*|*Zink*) ok "the adapter is Zink on the forwarded device" ;; *) bad "the adapter is not Zink: $adapter" ;; esac
 
-wgl=$(grep -a -o 'svfs webgl .*' "$RUN/ff.log" | tail -1)
+wgl=$(grep -a -o 'svfs webgl .*' "$RUN/page.log" | tail -1)
 o=$(sed -n 's/.*orange=\([0-9]*\).*/\1/p' <<<"$wgl"); b=$(sed -n 's/.*blue=\([0-9]*\).*/\1/p' <<<"$wgl")
 wr=$(sup '.graphics.webgl2Renderer')
 if [[ "$wr" == *zink* ]] && [ "${o:-0}" -gt 30000 ] && [ "${b:-0}" -gt 30000 ]; then
@@ -330,7 +360,7 @@ else
 fi
 
 for c in $CODECS; do
-  page=$(grep -a -o "svfs $c frames [0-9]* dropped [0-9]* t=[0-9.]* err=.*" "$RUN/ff.log" | tail -1)
+  page=$(grep -a -o "svfs $c frames [0-9]* dropped [0-9]* t=[0-9.]* err=.*" "$RUN/page.log" | tail -1)
   frames=$(awk '{print $4}' <<<"$page")
   if [ -n "$page" ] && [ "${frames:-0}" -gt 60 ] && grep -q 'err=none' <<<"$page"; then
     ok "$c: the page presented $frames frames with no media error (${page#svfs })"
@@ -341,18 +371,29 @@ for c in $CODECS; do
   [[ "$listed" == *HWDEC* ]] && ok "about:support: $listed" || bad "about:support does not list $c hardware decoding ($listed)"
 done
 n=$(logs | grep -a -c "VA-API frame pts=")
-logs | grep -a -q "VA-API FFmpeg init successful" && ok "the RDD process opened VA-API on the render node (Zink's VA driver)" || bad "VA-API did not initialise in the RDD process"
+grep -a -q "VA-API FFmpeg init successful" "$RUN"/moz.log* 2>/dev/null && ok "the RDD process opened VA-API on the render node (Zink's VA driver)" || bad "VA-API did not initialise in the RDD process"
 [ "${n:-0}" -gt 100 ] && ok "$n frames decoded by VA-API on the forwarded device and handed over as dma-bufs" \
-  || { bad "only ${n:-0} Vulkan-decoded frames were exported"; logs | grep -a -iE 'VULKAN.*(fail|error)|Failed to' | head -8 | sed 's/^/        /'; }
+  || { bad "only ${n:-0} VA-API-decoded frames were exported"; logs | grep -a -iE 'VULKAN.*(fail|error)|Failed to' | head -8 | sed 's/^/        /'; }
 
-rdd=$(sup '.sandbox.effectiveContentSandboxLevel')
-ok "Firefox ran with its default sandbox (content sandbox level ${rdd:-?}); nothing here can turn it off"
+level=$(sup '.sandbox.effectiveContentSandboxLevel')
+if [[ "$level" =~ ^[0-9]+$ ]] && [ "$level" -gt 0 ]; then
+  ok "Firefox reports an active content sandbox at level $level"
+else
+  bad "Firefox did not report an active content sandbox: ${level:-unknown}"
+fi
+if grep -qE '^Seccomp:[[:space:]]+2$' "$RUN/rdd-status.txt" &&
+   grep -qE '^NoNewPrivs:[[:space:]]+1$' "$RUN/rdd-status.txt"; then
+  ok "the browser's RDD process has seccomp filtering and NoNewPrivs enabled"
+else
+  bad "no sandboxed RDD process was observed in this browser's process tree"
+fi
 
 stats=$(grep -m1 "commits, " "$RUN/proxy.log")
 commits=$(sed -n 's/.*dmabuf_commits=\([0-9]*\).*/\1/p' <<<"$stats")
 zc=$(grep -c "px.commit .*zero_copy=1" "$RUN/proxy-trace.txt" 2>/dev/null)
 cp=$(grep "px.commit" "$RUN/proxy-trace.txt" 2>/dev/null | grep -vc "zero_copy=1")
 say "proxy: $stats"
+[ "${cp:-0}" -eq 0 ] || bad "the proxy copied $cp Firefox commits"
 [ "${zc:-0}" -gt 100 ] && ok "$zc of Firefox's commits reached the compositor as sections, zero copy ($cp copied ones)" \
   || bad "zero-copy commits: ${zc:-0}, copied: ${cp:-0}"
 

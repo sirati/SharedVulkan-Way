@@ -37073,6 +37073,11 @@ what we ship below them (sv-icd, sv-drm, our Mesa) may be patched.
 
 ### 112.1 What changed, in one paragraph
 
+This is the intended path implemented on this branch. The final guest proof
+is still open. The first stock guest measurement used software rendering;
+§112.9 records that failed gate. The following description does not establish
+that the guest has selected hardware acceleration.
+
 Firefox is the nixpkgs package, unpatched, with no preference set for its
 graphics or its decoder, and its RDD sandbox on. It runs inside `sv-drm ns`,
 where the userspace render node of §104 is a PCI device with the guest GPU's
@@ -37133,6 +37138,63 @@ This reverses the choice `wsi.rs`'s header defended (render targets in
 host-visible LINEAR memory). The argument there was about a discrete GPU; the
 guest's GPU is integrated, its "device-local" memory is the same RAM, and §104
 already renders KWin's frames this way.
+
+### 112.4 Mesa with Zink's VA-API frontend
+
+`nix/mesa-zink-va.nix` pins Mesa main at
+`42c325ea02518276f08c5b44b487e37affc9fe69`, which includes the Zink
+VA-API frontend merged upstream on 2026-10-16. The build contains
+`zink_drv_video.so`. Its initial supported decode codec is H.264. H.265
+and AV1 are separate gates and are not established by an H.264 result.
+Applications remain unpatched. The existing kopper Wayland patch changes
+our Mesa library only.
+
+### 112.5 Decoded frames and their planes
+
+The ICD reports the actual plane count for LINEAR modifiers and accepts
+explicit layouts for each plane. It translates `MEMORY_PLANE_i` to
+`PLANE_i`, validates offsets and applies the common aligned bind offset.
+The NV12 export probe produces one object with R8 and GR88 layers.
+`sv-dmabuf-e2e` checks reimport of those planes at distinct offsets.
+A successful VA context or exported allocation alone is not proof of
+Firefox hardware decode. The guest gate needs RDD VA-API frame logs,
+about:support hardware codec support and default sandbox settings.
+
+### 112.6 Why the first guest run selected software
+
+The deployment wrote `LIBGL_KOPPER_DRI2=1` even when a render node existed.
+Our `mesa-kopper-wayland.patch` handles that override by taking the swrast
+initialization route and calling `dri2_setup_device` with software forced.
+Firefox therefore sees a software EGLDevice despite the real GPU behind
+Zink. This contradicts the purpose of the render node.
+
+Node deployments now omit that legacy override. `wc-session` also filters
+it from old `gpu.env` files when it successfully installs the render-node
+namespace. The wl_shm-only legacy path retains its existing configuration.
+This fixes the conflicting driver configuration without changing Firefox's
+preferences. Guest confirmation of hardware selection remains required.
+
+### 112.7 Measurement requirements
+
+The initial comparison in §112.9 is a failed hardware gate and cannot measure
+the GPU implementation's performance. Repeat scroll, H.264 video and idle
+windows only after hardware WebRender, WebGL and sandboxed VA-API decode are
+proven on the same tree. Record browser and compositor CPU separately,
+frame intervals and dropped video frames, with isolated HOME and XDG paths.
+The local lavapipe stand-in cannot prove hardware video decode or the
+Intel direct-present path in §104.12.
+
+### 112.8 Removed application modifications and regression harness
+
+The Firefox readback patch, its package and decode scripts, marker detection
+and sandbox override were removed. Historical readback measurements in
+`video-decode.md` describe the former implementation, not the supported path.
+`sv-firefox-stock.sh` now uses WebDriver to read page results and runs video
+in the foreground. It does not force the hardware decoder or enable Firefox's
+Nightly-only Vulkan decoder. Its only normal profile preference configures
+the automation port. The explicit lavapipe WebRender override is test-only
+and cannot count as the stock guest gate. Missing sandbox data and any copied
+Firefox commits fail the harness.
 
 ### 112.x The render node introduces a sandboxed client to its GPU services
 

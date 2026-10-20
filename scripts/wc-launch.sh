@@ -969,12 +969,16 @@ APPS
     fi
     local genv
     genv="MESA_LOADER_DRIVER_OVERRIDE=zink
-LIBGL_KOPPER_DRI2=1
 __EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
 LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
 LIBVA_DRIVER_NAME=zink
 LIBVA_DRIVERS_PATH=${KOPPER_MESA:-<mesa-zink-va>}/lib/dri
 VK_DRIVER_FILES=$icd_json"
+    # Only the legacy wl_shm-only path needs a forced software EGLDevice.
+    if [ -z "$DMABUF_NODE" ]; then
+      genv="$genv
+LIBGL_KOPPER_DRI2=1"
+    fi
     if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
       printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
       echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"

@@ -1017,7 +1017,15 @@ start_app() {
       PCI=$(head -c 16 "$BASE/gpu-pci" 2>/dev/null | tr -d '[:space:]')
       [[ "$PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] && NSWRAP+=(--pci "$PCI")
       NSWRAP+=(--)
-      GPUENV+=("SV_DRM_NODE=$DMABUF_NODE")
+      # The old wl_shm-only kopper override explicitly creates a software
+      # EGLDevice in our Mesa patch. With a render node, use Mesa's normal
+      # DRM path so native clients can discover the real hardware device.
+      # Filter old gpu.env files as well as newly generated deployments.
+      NODE_GPUENV=()
+      for line in "${GPUENV[@]}"; do
+        case "$line" in LIBGL_KOPPER_DRI2=*) ;; *) NODE_GPUENV+=("$line") ;; esac
+      done
+      GPUENV=("${NODE_GPUENV[@]}" "SV_DRM_NODE=$DMABUF_NODE")
       echo "wc-session: $ID renders through the render node $DMABUF_NODE ($NODE_DEV${PCI:+, pci $PCI})" >>"$D/app.log"
     else
       echo "wc-session: NO RENDER NODE for $ID -- $DMABUF_NODE is there and sv-drm is not ($BASE/bin/sv-drm); frames are copied" | tee -a "$D/app.log" >&2
