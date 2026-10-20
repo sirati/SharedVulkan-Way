@@ -1,5 +1,6 @@
 //! Durable exclusions for original BAR bytes. This is not an allocator or
-//! proof of canonical grant ownership. No record is ever released here.
+//! proof of canonical grant ownership. Only a live current reservation can be
+//! removed after trusted complete native/logical/both-service close authority.
 //!
 //! Unactivated until every original allocator consults these exclusions. The
 //! Unix and protected Windows NTFS stores are implemented. Windows requires
@@ -8,7 +9,7 @@
 //! privileged restoration of an older valid filesystem image: canonical
 //! provisioning/recovery must never roll back this state while backing lives.
 use crate::service_control::{Binding, Message, Origin, Payload, Phase};
-use std::io;
+use std::{io, sync::Arc};
 
 /// Whole original backing file at byte zero. Enrollment must derive dev/ino
 /// and exact file length from its retained privileged fd, not a path or wire
@@ -53,6 +54,7 @@ impl EpochTicket {
 /// not establish that the original compositor actually delegated the grant.
 pub struct Reservation {
     binding: Binding,
+    registry: Arc<()>,
 }
 impl Reservation {
     pub fn binding(&self) -> &Binding {
@@ -62,6 +64,7 @@ impl Reservation {
 
 pub struct Registry<S: DurableStore> {
     store: S,
+    identity: Arc<()>,
     backing: PhysicalBacking,
     local_origin: Origin,
     local_issued: bool,
@@ -101,6 +104,7 @@ impl<S: DurableStore> Registry<S> {
         }
         let mut result = Self {
             store,
+            identity: Arc::new(()),
             backing,
             local_origin,
             local_issued: false,
@@ -184,6 +188,7 @@ impl<S: DurableStore> Registry<S> {
         }
         Ok(Self {
             store,
+            identity: Arc::new(()),
             backing,
             local_origin,
             local_issued: false,
@@ -329,7 +334,55 @@ impl<S: DurableStore> Registry<S> {
         check_overlap(&self.records, &binding)?;
         self.records.push(binding.clone());
         self.persist()?;
-        Ok(Reservation { binding })
+        Ok(Reservation {
+            binding,
+            registry: self.identity.clone(),
+        })
+    }
+    /// Remove only the exact live current reservation after complete close.
+    /// Consumes the token on every outcome and returns no free extent.
+    ///
+    /// # Safety
+    /// The canonical owner/lifecycle must have irreversibly closed every native
+    /// and logical reference and future projection path for this exact channel,
+    /// revalidated actual live source and provider authority, authenticated the
+    /// exact current peer's terminal close, and burned its opaque release-ready
+    /// authority. On the noncanonical side the exact canonical durable release
+    /// commit is also required. All facts must bind this current full Binding,
+    /// private channel identity and close generation. No caller tuple, wire frame
+    /// alone, source/process death or historical/reopened record is authority.
+    /// Any failure must retain caller exclusions/quarantine and cannot be retried
+    /// with reconstructed authority. Only durable success may authorize the
+    /// caller's separate free-list transition, never this method's return value.
+    pub(crate) unsafe fn release_current(
+        &mut self,
+        ticket: &EpochTicket,
+        reservation: Reservation,
+    ) -> io::Result<()> {
+        self.live()?;
+        if !Arc::ptr_eq(&reservation.registry, &self.identity)
+            || !self.owns_current_ticket(ticket)
+            || !self.pair_ready
+            || reservation.binding.windows_run != self.windows_epoch
+            || reservation.binding.linux_run != self.linux_epoch
+        {
+            return Err(invalid("release differs from live current registry pair"));
+        }
+        check_binding(self.backing, &reservation.binding)?;
+        let index = self
+            .records
+            .iter()
+            .position(|b| *b == reservation.binding)
+            .ok_or_else(|| invalid("release has no exact retained reservation"))?;
+        let retained = self.records.remove(index);
+        if let Err(error) = self.persist() {
+            // Even a successful replace followed by uncertain flush never
+            // permits this live instance or caller to reuse the physical bytes.
+            self.records.insert(index, retained);
+            self.poisoned = true;
+            return Err(error);
+        }
+        Ok(())
     }
     fn live(&self) -> io::Result<()> {
         if self.poisoned {
@@ -536,6 +589,107 @@ mod tests {
     }
     fn fresh(memory: Memory) -> Registry<Memory> {
         unsafe { Registry::initialize_fresh(memory, backing(), Origin::Windows).unwrap() }
+    }
+    fn current(memory: Memory) -> (Registry<Memory>, EpochTicket, Reservation) {
+        let mut registry = fresh(memory);
+        let ticket = registry.issue_next_service_epoch(Origin::Windows).unwrap();
+        unsafe {
+            registry.confirm_peer_epoch(&ticket, 101).unwrap();
+        }
+        let reservation = unsafe {
+            registry
+                .reserve(&ticket, binding(ticket.value(), 101, 4096))
+                .unwrap()
+        };
+        (registry, ticket, reservation)
+    }
+    #[test]
+    fn current_release_removes_only_exact_record_after_durable_success() {
+        let memory = Memory::default();
+        let (mut registry, ticket, reservation) = current(memory.clone());
+        let mut other = binding(ticket.value(), 101, 8192);
+        other.grant += 1;
+        unsafe {
+            registry.reserve(&ticket, other).unwrap();
+        }
+        unsafe {
+            registry.release_current(&ticket, reservation).unwrap();
+        }
+        assert_eq!(registry.exclusions(), vec![(8192, 4096)]);
+        drop(registry);
+        let registry = Registry::open(memory, backing(), Origin::Windows).unwrap();
+        assert_eq!(registry.exclusions(), vec![(8192, 4096)]);
+    }
+    #[test]
+    fn release_rejects_other_live_registry_even_with_identical_binding_and_pair() {
+        let (mut first, ticket, token) = current(Memory::default());
+        let (mut second, second_ticket, second_token) = current(Memory::default());
+        assert_eq!(token.binding(), second_token.binding());
+        assert!(unsafe { second.release_current(&second_ticket, token) }.is_err());
+        assert_eq!(second.exclusions(), vec![(4096, 4096)]);
+        assert!(unsafe { first.release_current(&ticket, second_token) }.is_err());
+        assert_eq!(first.exclusions(), vec![(4096, 4096)]);
+    }
+    #[test]
+    fn release_rejects_old_epoch_even_after_new_live_pair_confirmation() {
+        for use_old_ticket in [true, false] {
+            let (mut registry, old, token) = current(Memory::default());
+            let new = registry.issue_next_service_epoch(Origin::Windows).unwrap();
+            unsafe {
+                registry.confirm_peer_epoch(&new, 102).unwrap();
+            }
+            assert!(
+                unsafe {
+                    registry.release_current(if use_old_ticket { &old } else { &new }, token)
+                }
+                .is_err()
+            );
+            assert_eq!(registry.exclusions(), vec![(4096, 4096)]);
+        }
+    }
+    #[test]
+    fn reopened_registry_cannot_consume_old_live_reservation() {
+        let memory = Memory::default();
+        let (registry, ticket, token) = current(memory.clone());
+        drop(registry);
+        let mut reopened = Registry::open(memory, backing(), Origin::Windows).unwrap();
+        assert!(unsafe { reopened.release_current(&ticket, token) }.is_err());
+        assert_eq!(reopened.exclusions(), vec![(4096, 4096)]);
+    }
+    #[test]
+    fn release_refuses_binding_or_missing_record_without_changing_exclusions() {
+        for change in [0, 1] {
+            let (mut registry, ticket, mut token) = current(Memory::default());
+            if change == 0 {
+                token.binding.session += 1;
+            } else {
+                registry.records.clear();
+            }
+            let before = registry.exclusions();
+            assert!(unsafe { registry.release_current(&ticket, token) }.is_err());
+            assert_eq!(registry.exclusions(), before);
+        }
+    }
+    #[test]
+    fn uncertain_release_restores_live_exclusion_and_permanently_poisons() {
+        for failure in [1, 2] {
+            let memory = Memory::default();
+            let (mut registry, ticket, token) = current(memory.clone());
+            *memory.failure.lock().unwrap() = failure;
+            assert!(unsafe { registry.release_current(&ticket, token) }.is_err());
+            assert_eq!(registry.exclusions(), vec![(4096, 4096)]);
+            assert!(!registry.owns_current_ticket(&ticket));
+            assert!(!registry.confirmed_pair(&ticket, 101));
+            assert!(registry.issue_next_service_epoch(Origin::Windows).is_err());
+            assert!(
+                unsafe { registry.reserve(&ticket, binding(ticket.value(), 101, 8192)) }.is_err()
+            );
+            drop(registry);
+            *memory.failure.lock().unwrap() = 0;
+            let reopened = Registry::open(memory, backing(), Origin::Windows).unwrap();
+            assert_eq!(reopened.exclusions().len(), usize::from(failure == 1));
+            assert!(!reopened.owns_current_ticket(&ticket));
+        }
     }
     #[test]
     fn overflowing_prior_extent_refuses_even_an_apparently_disjoint_new_grant() {
