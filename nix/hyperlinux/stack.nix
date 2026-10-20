@@ -143,9 +143,9 @@ let
     dontUnpack = true; dontStrip = true;
     nativeBuildInputs = [ pkgs.rcodesign ];
     buildPhase = ''
-      $CC -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
+      ${t.compiler}/bin/aarch64-apple-darwin-cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
         ${./copy-fault-check.c} ${./hl_copy.c} -o hl-copy-fault-check
-      $CC -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
+      ${t.compiler}/bin/aarch64-apple-darwin-cc -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
         ${./atomic-fault-check.c} ${./hl_atomic.c} -o hl-atomic-fault-check
     '';
     installPhase = ''
