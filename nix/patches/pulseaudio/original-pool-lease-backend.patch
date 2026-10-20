@@ -1,0 +1,231 @@
+--- a/src/pulsecore/memblock.c
++++ b/src/pulsecore/memblock.c
+@@ -58,6 +58,10 @@
+ #define PA_MEMPOOL_SLOT_SIZE (64*1024)
+ 
+ #define PA_MEMEXPORT_SLOTS_MAX 128
++
++/* Reserved before offering the capability; never allocated on disconnect. */
++#define PA_ORIGINAL_QUARANTINE_MAX (128 * 1024 * 1024)
++static pa_atomic_t original_quarantine_reserved = PA_ATOMIC_INIT(0);
+ 
+ #define PA_MEMIMPORT_SLOTS_MAX 160
+ #define PA_MEMIMPORT_SEGMENTS_MAX 16
+@@ -128,6 +132,9 @@
+ /* A collection of multiple segments */
+ struct pa_memimport {
+     pa_mutex *mutex;
++    bool original_leases;
++    bool orphaned;
++    unsigned release_callbacks;
+ 
+     pa_mempool *pool;
+     pa_hashmap *segments;
+@@ -148,6 +155,7 @@
+ 
+ struct pa_memexport {
+     pa_mutex *mutex;
++    bool quarantine_reserved;
+     pa_mempool *pool;
+ 
+     struct memexport_slot slots[PA_MEMEXPORT_SLOTS_MAX];
+@@ -645,9 +653,29 @@
+             if (-- segment->n_blocks <= 0)
+                 segment_detach(segment);
+ 
+-            pa_mutex_unlock(import->mutex);
+-
+-            import->release_cb(import, b->per_type.imported.id, import->userdata);
++            if (import->original_leases) {
++                bool destroy_import;
++                /* Serialize callback completion with transport orphaning.
++                 * Nothing may read import after unlocking unless this is
++                 * the elected final orphan cleanup. */
++                if (!import->orphaned) {
++                    /* The mutex is recursive. A callback can synchronously
++                     * orphan this importer, so defer final destruction until
++                     * every nested callback has returned. */
++                    import->release_callbacks++;
++                    import->release_cb(import, b->per_type.imported.id, import->userdata);
++                    pa_assert(import->release_callbacks > 0);
++                    import->release_callbacks--;
++                }
++                destroy_import = import->orphaned && import->release_callbacks == 0 &&
++                                 pa_hashmap_size(import->blocks) == 0;
++                pa_mutex_unlock(import->mutex);
++                if (destroy_import)
++                    pa_memimport_free(import);
++            } else {
++                pa_mutex_unlock(import->mutex);
++                import->release_cb(import, b->per_type.imported.id, import->userdata);
++            }
+ 
+             if (pa_flist_push(PA_STATIC_FLIST_GET(unused_memblocks), b) < 0)
+                 pa_xfree(b);
+@@ -1113,12 +1141,38 @@
+     i->blocks = pa_hashmap_new(NULL, NULL);
+     i->release_cb = cb;
+     i->userdata = userdata;
++    i->original_leases = false;
++    i->orphaned = false;
++    i->release_callbacks = 0;
+ 
+     pa_mutex_lock(p->mutex);
+     PA_LLIST_PREPEND(pa_memimport, p->imports, i);
+     pa_mutex_unlock(p->mutex);
+ 
+     return i;
++}
++
++void pa_memimport_enable_original_leases(pa_memimport *i) {
++    pa_assert(i);
++    pa_assert(pa_hashmap_size(i->blocks) == 0);
++    i->original_leases = true;
++}
++
++/* Only the transport owner calls this, after callbacks can no longer run.
++ * The importer owns a pool reference until its last original block drains. */
++void pa_memimport_orphan(pa_memimport *i) {
++    pa_assert(i);
++    pa_assert(i->original_leases);
++    pa_mutex_lock(i->mutex);
++    pa_assert(!i->orphaned);
++    i->orphaned = true;
++    i->release_cb = NULL;
++    i->userdata = NULL;
++    if (pa_hashmap_size(i->blocks) == 0 && i->release_callbacks == 0) {
++        pa_mutex_unlock(i->mutex);
++        pa_memimport_free(i);
++    } else
++        pa_mutex_unlock(i->mutex);
+ }
+ 
+ static void memexport_revoke_blocks(pa_memexport *e, pa_memimport *i);
+@@ -1172,6 +1226,9 @@
+     pa_assert(i);
+ 
+     pa_mutex_lock(i->mutex);
++    /* Negotiated originals must drain through orphaning, never localize. */
++    pa_assert(!i->original_leases ||
++              (pa_hashmap_size(i->blocks) == 0 && i->release_callbacks == 0));
+ 
+     while ((b = pa_hashmap_first(i->blocks)))
+         memblock_replace_import(b);
+@@ -1251,6 +1308,9 @@
+     pa_assert(pa_mem_type_is_shared(type));
+ 
+     pa_mutex_lock(i->mutex);
++
++    if (i->orphaned || (i->original_leases && type != PA_MEM_TYPE_SHARED_MEMFD))
++        goto finish;
+ 
+     if ((b = pa_hashmap_get(i->blocks, PA_UINT32_TO_PTR(block_id)))) {
+         pa_memblock_ref(b);
+@@ -1313,6 +1373,9 @@
+     int ret = 0;
+     pa_assert(i);
+ 
++    if (i->original_leases)
++        return -2;
++
+     pa_mutex_lock(i->mutex);
+ 
+     if (!(b = pa_hashmap_get(i->blocks, PA_UINT32_TO_PTR(id)))) {
+@@ -1342,6 +1405,7 @@
+ 
+     e = pa_xnew(pa_memexport, 1);
+     e->mutex = pa_mutex_new(true, true);
++    e->quarantine_reserved = false;
+     e->pool = p;
+     pa_mempool_ref(e->pool);
+     PA_LLIST_HEAD_INIT(struct memexport_slot, e->free_slots);
+@@ -1359,10 +1423,48 @@
+     return e;
+ }
+ 
++/* Admission must precede any exported blocks. A reservation covers the
++ * entire backing pool, not merely its currently used block extents. */
++int pa_memexport_enable_original_quarantine(pa_memexport *e) {
++    int current, size;
++    pa_assert(e);
++    pa_assert(!e->used_slots);
++    if (e->quarantine_reserved)
++        return 0;
++    if (e->pool->memory.type != PA_MEM_TYPE_SHARED_MEMFD)
++        return -1;
++    if (e->pool->memory.size > PA_ORIGINAL_QUARANTINE_MAX)
++        return -1;
++    size = (int) e->pool->memory.size;
++    do {
++        current = pa_atomic_load(&original_quarantine_reserved);
++        if (current > PA_ORIGINAL_QUARANTINE_MAX - size)
++            return -1;
++    } while (!pa_atomic_cmpxchg(&original_quarantine_reserved, current, current + size));
++    e->quarantine_reserved = true;
++    return 0;
++}
++
+ void pa_memexport_free(pa_memexport *e) {
+     pa_assert(e);
+ 
+     pa_mutex_lock(e->mutex);
++    if (e->quarantine_reserved && e->used_slots) {
++        struct memexport_slot *slot;
++        /* These source-owned refs prevent allocator reuse and pool vacuum.
++         * No dead transport callback is kept reachable from pool exporters. */
++        for (slot = e->used_slots; slot; slot = slot->next)
++            pa_assert(!slot->block->foreign_origin);
++        e->revoke_cb = NULL;
++        e->userdata = NULL;
++        pa_mutex_unlock(e->mutex);
++        pa_mutex_lock(e->pool->mutex);
++        PA_LLIST_REMOVE(pa_memexport, e->pool->exports, e);
++        pa_mutex_unlock(e->pool->mutex);
++        pa_log_warn("Quarantined original export pool until process exit: size=%lu",
++                    (unsigned long) e->pool->memory.size);
++        return;
++    }
+     while (e->used_slots)
+         pa_memexport_process_release(e, (uint32_t) (e->used_slots - e->slots + e->baseidx));
+     pa_mutex_unlock(e->mutex);
+@@ -1371,6 +1473,8 @@
+     PA_LLIST_REMOVE(pa_memexport, e->pool->exports, e);
+     pa_mutex_unlock(e->pool->mutex);
+ 
++    if (e->quarantine_reserved)
++        pa_atomic_sub(&original_quarantine_reserved, (int) e->pool->memory.size);
+     pa_mempool_unref(e->pool);
+     pa_mutex_free(e->mutex);
+     pa_xfree(e);
+@@ -1480,6 +1584,11 @@
+     pa_assert(offset);
+     pa_assert(size);
+     pa_assert(b->pool == e->pool);
++
++    /* Caller must translate this distinct failure into transport refusal,
++     * never socket fallback. Quarantine capability covers owned blocks only. */
++    if (e->quarantine_reserved && b->foreign_origin)
++        return -2;
+ 
+     if (!(b = memblock_shared_copy(e->pool, b)))
+         return -1;
+--- a/src/pulsecore/memblock.h
++++ b/src/pulsecore/memblock.h
+@@ -147,6 +147,9 @@
+ /* For receiving blocks from other nodes */
+ pa_memimport* pa_memimport_new(pa_mempool *p, pa_memimport_release_cb_t cb, void *userdata);
+ void pa_memimport_free(pa_memimport *i);
++/* Inactive unless explicitly enabled by negotiated original-pool protocol. */
++void pa_memimport_enable_original_leases(pa_memimport *i);
++void pa_memimport_orphan(pa_memimport *i);
+ int pa_memimport_attach_memfd(pa_memimport *i, uint32_t shm_id, int memfd_fd, bool writable);
+ pa_memblock* pa_memimport_get(pa_memimport *i, pa_mem_type_t type, uint32_t block_id,
+                               uint32_t shm_id, size_t offset, size_t size, bool writable);
+@@ -155,6 +158,7 @@
+ /* For sending blocks to other nodes */
+ pa_memexport* pa_memexport_new(pa_mempool *p, pa_memexport_revoke_cb_t cb, void *userdata);
+ void pa_memexport_free(pa_memexport *e);
++int pa_memexport_enable_original_quarantine(pa_memexport *e);
+ int pa_memexport_put(pa_memexport *e, pa_memblock *b, pa_mem_type_t *type, uint32_t *block_id,
+                      uint32_t *shm_id, size_t *offset, size_t * size);
+ int pa_memexport_process_release(pa_memexport *e, uint32_t id);
