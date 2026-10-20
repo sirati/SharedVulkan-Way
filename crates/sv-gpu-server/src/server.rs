@@ -1808,6 +1808,17 @@ impl GpuHost for GpuServer {
         // device is the driver's own.
         let r = unsafe { f(a.physical_device.0 as usize as _, info, &mut out) };
         note_driver_error("vkGetPhysicalDeviceImageFormatProperties2", r.0);
+        // A shared image the driver refuses is a dma-buf an application
+        // cannot export: say exactly what was asked.
+        if asked
+            && r.0 != 0
+            && let Some(i) = &a.p_image_format_info
+        {
+            eprintln!(
+                "[gpu] shared image refused by the driver ({}): format {} type {} tiling {} usage {:#x} flags {:#x}",
+                r.0, i.format.0, i.type_.0, i.tiling.0, i.usage.0, i.flags.0
+            );
+        }
         // SAFETY: the driver filled `out` and its chain, which `pool` owns.
         let mut props = unsafe { sv_gpu_entry::lower_full_vk_image_format_properties2(&raw const out) }
             .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
