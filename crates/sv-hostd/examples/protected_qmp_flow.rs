@@ -227,6 +227,30 @@ fn main() -> std::io::Result<()> {
         "source invalidation allowed original mutation",
     )?;
     println!("CANONICAL: paused original source refused further mutation");
+    // Canonical retained guards intentionally need not drop this backing. Use
+    // explicit controller authority after both actual kernel monitors retired;
+    // do not weaken retention merely to make a Child destructor run.
+    unsafe {
+        enrolled.shutdown_owned_fixture_source()?;
+    }
+    require(
+        enrolled.ensure_live().is_err(),
+        "exited source remained live",
+    )?;
+    require(
+        enrolled
+            .backing()
+            .initialize_zeroed(physical_offset, 4096)
+            .is_err(),
+        "exited source allowed original mutation",
+    )?;
+    require(
+        owner.exclusions()? == durable_exclusions,
+        "controller cleanup changed canonical exclusions",
+    )?;
+    println!(
+        "CANONICAL: retained-channel quit and exact pidfd/Child wait completed; dead source refused, exclusions retained"
+    );
     drop((owner, producer_monitor, consumer_monitor));
     // Reopen the protected snapshot after its exclusive context lock ends.
     // enrolled still retains the exact original memfd and native owner.
