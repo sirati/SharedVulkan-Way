@@ -125,7 +125,7 @@ impl Probe {
             unsafe { kk_nv12_fixture_destroy(release) },
             "release-destroy",
         );
-        unsafe { self.image.picture().copy_from_gpu(&source) }.map_err(str::to_string)?;
+        unsafe { self.image.picture().copy_from_gpu(&source) }?;
         info.src_queue_family = vk::QUEUE_FAMILY_EXTERNAL;
         info.dst_queue_family = self.driver.queue_family;
         info.old_layout = vk::ImageLayout::GENERAL;
