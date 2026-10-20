@@ -38072,10 +38072,11 @@ Its local FPS under concurrent tests is not a hardware benchmark.
 The local screenshot's black rectangle outside Firefox belongs to Wine's
 1920x1200 Explorer desktop, not the 1288x1044 compositor window. Before/after
 window trees, PID properties and images establish that ownership. Wine retains
-uncovered pixels after child windows resize or leave. The fixture calls
-`PaintDesktop` with `DCX_CLIPCHILDREN`, then requests repaint: the uncovered
-background returns to blue while Firefox remains drawn. It does not paint over
-an application child or change the Wayland copy count.
+uncovered pixels after child windows resize or leave. Successful `RedrawWindow` and `PaintDesktop` return values did not clear the
+black strip: direct pixel checks still show RGB 0,0,0 outside the application.
+The ineffective repaint helper was removed. A minimal Win32 resize/region
+fixture investigates stale Wine clipping separately; this desktop artifact is
+not evidence of omitted GTK parent frames, and is not waived as clean rendering.
 
 GPU Firefox deployment requires `WC_LAUNCH_GPU_GTK`, a shipped GTK store output
 already copied to the host, plus the render node, guest PCI identity and Zink
@@ -38085,7 +38086,10 @@ source. It retains the output with a GC root and writes its library path and
 strict allocation settings into `gpu.env`. The session enables the allocator
 on the proxy and refuses GPU Firefox startup without the matching library,
 namespace and PCI prerequisites. It never writes a WebRender force preference;
-it clears the legacy automatic true value from managed Firefox profiles.
+it migrates only exact wc-session-generated graphics and Vulkan readback
+comment/preference blocks, preserving manually authored settings and unrelated
+profile content. Persisted values clear only when that provenance exists and
+no retained user declaration claims the same key.
 Lavapipe's explicit force preference exists only in the test fixture.
 
 These GTK/VA checks apply to the selected GPU Firefox applications: selected

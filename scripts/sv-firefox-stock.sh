@@ -106,14 +106,6 @@ else
   exit 2
 fi
 
-# Build the tiny Wine desktop fixture helper before releasing the build lock.
-mkdir -p "$SCRATCH"
-REPAINT="$SCRATCH/wine-desktop-repaint.exe"
-if [ ! -f "$REPAINT" ] || [ "$ROOT/scripts/wine-desktop-repaint.c" -nt "$REPAINT" ]; then
-  x86_64-w64-mingw32-gcc -mwindows "$ROOT/scripts/wine-desktop-repaint.c" -luser32 -o "$REPAINT" \
-    || { echo "FAIL: could not prepare the Wine desktop repaint fixture"; exit 1; }
-fi
-
 # All inputs are already built. Runtime children must not retain cg's build
 # lock while the browser and Wine compositor are running.
 exec 9>&-
@@ -388,11 +380,6 @@ for pid in $(descendants "$FF"); do
   fi
 done
 # What the compositor put on its desktop, for a reader to judge.
-x11_windows pre-repaint
-# Wine can retain uncovered pixels after a native child resizes. Repaint the
-# owning desktop background through its API, with all child windows clipped.
-REPAINT_OK=0
-wine "$REPAINT" >"$RUN/desktop-repaint.log" 2>&1 && REPAINT_OK=1
 x11_windows screenshot
 (xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/screen.png") 2>/dev/null
 wait $FF 2>/dev/null
@@ -403,8 +390,7 @@ fail=0
 ok()  { echo "  ok   $*"; }
 bad() { echo "  FAIL $*"; fail=1; }
 logs() { cat "$RUN"/moz.log* 2>/dev/null; }
-[ "$REPAINT_OK" = 1 ] && ok "Wine repainted its own desktop background with application children clipped" \
-  || bad "the Wine desktop background repaint failed"
+
 say "---- the verdict ($RUN) ----"
 "$JQ" -r '.value' "$RUN/support.json" >"$RUN/support.data.json" 2>/dev/null
 sup() { "$JQ" -r "$1" "$RUN/support.data.json" 2>/dev/null; }
