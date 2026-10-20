@@ -495,17 +495,15 @@ impl NativeVideo {
             validate_picture(&r.picture, &scope.session)?;
         }
         if let Some(r) = &job.setup {
-            // Vulkan decode-h264-ref-pic-setup: non-reference setup only
-            // invalidates the slot. A distinct setup resource has undefined contents.
+            // Non-reference setup invalidates the slot and has no defined pixel
+            // output. Its descriptor still obeys VUID07149/07173/10803.
             if job.h264.is_reference && !r.h264.recordable_setup(&job.h264) {
                 return invalid();
             }
             if r.slot >= scope.session.dpb_slots {
                 return invalid();
             }
-            if job.h264.is_reference {
-                validate_picture(&r.picture, &scope.session)?;
-            }
+            validate_picture(&r.picture, &scope.session)?;
         }
         job.begin_before = scope.jobs.is_empty();
         job.reset_before = scope.reset;

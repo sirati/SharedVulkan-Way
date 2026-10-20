@@ -16,11 +16,11 @@ fn pic_num(entry: &Entry, current: u32, maximum: u32) -> i64 {
 fn poc(entry: &Entry) -> i32 {
     entry.poc[0].min(entry.poc[1])
 }
-fn defaults(dpb: &Dpb, current: Picture, maximum: u32, bi: bool) -> [Vec<u64>; 2] {
+fn defaults(dpb: &Dpb, current: Picture, maximum: u32, bi: bool, poc_type: u32) -> [Vec<u64>; 2] {
     let short: Vec<_> = dpb
         .entries
         .iter()
-        .filter(|e| e.long_term.is_none())
+        .filter(|e| e.long_term.is_none() && !(bi && poc_type == 0 && e.nonexisting))
         .collect();
     let mut long: Vec<_> = dpb
         .entries
@@ -114,7 +114,9 @@ fn modified(
                 dpb.entries
                     .iter()
                     .find(|e| {
-                        e.long_term.is_none() && pic_num(e, current.frame_num, maximum) == target
+                        !e.nonexisting
+                            && e.long_term.is_none()
+                            && pic_num(e, current.frame_num, maximum) == target
                     })
                     .ok_or("slice selects an absent short-term reference")?
                     .generation
@@ -167,10 +169,16 @@ impl Dpb {
                 result.push([Vec::new(), Vec::new()]);
                 continue;
             }
-            if slice.kind > 1 || self.entries.is_empty() {
+            if slice.kind > 1 || !self.entries.iter().any(|entry| !entry.nonexisting) {
                 return Err("inter slice has no decoded reference state".into());
             }
-            let initial = defaults(self, current, parsed.max_frame_num, slice.kind == 1);
+            let initial = defaults(
+                self,
+                current,
+                parsed.max_frame_num,
+                slice.kind == 1,
+                parsed.sequence.poc,
+            );
             let list0 = modified(
                 self,
                 current,
@@ -209,30 +217,35 @@ mod tests {
             max_long_term_index: Some(3),
             entries: vec![
                 Entry {
+                    nonexisting: false,
                     generation: 1,
                     frame_num: 14,
                     poc: [0, 0],
                     long_term: None,
                 },
                 Entry {
+                    nonexisting: false,
                     generation: 2,
                     frame_num: 15,
                     poc: [4, 4],
                     long_term: None,
                 },
                 Entry {
+                    nonexisting: false,
                     generation: 3,
                     frame_num: 0,
                     poc: [8, 8],
                     long_term: None,
                 },
                 Entry {
+                    nonexisting: false,
                     generation: 4,
                     frame_num: 9,
                     poc: [-2, -2],
                     long_term: Some(3),
                 },
                 Entry {
+                    nonexisting: false,
                     generation: 5,
                     frame_num: 10,
                     poc: [-4, -4],
@@ -372,5 +385,19 @@ mod tests {
         p.marking = Marking::Adaptive(vec![super::super::h264::Operation::ForgetAll]);
         assert_eq!(d.reference_lists(current(), &p).unwrap()[0][0], [3]);
         assert_eq!(d, before);
+    }
+    #[test]
+    fn nonexisting_type0_b_omission_and_modification_prohibition() {
+        let mut d = dpb();
+        d.entries[1].nonexisting = true;
+        let current = Picture {
+            frame_num: 1,
+            poc: [6, 6],
+        };
+        let zero = defaults(&d, current, 16, true, 0);
+        let one = defaults(&d, current, 16, true, 1);
+        assert!(zero.iter().all(|list| !list.contains(&2)));
+        assert!(one.iter().all(|list| list.contains(&2)));
+        assert!(modified(&d, current, 16, &[1], 1, &[Modification::Subtract(1)]).is_err());
     }
 }

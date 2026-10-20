@@ -2,13 +2,14 @@
 //! ITU-T H.264 (08/2021), 7.4.3.3 and 8.2.5. This owns codec metadata only.
 //! A caller must reconcile every generation with exact bound resources before
 //! native submission, then commit `Plan::next` only after successful completion.
-//! This marking model does not synthesize gap pictures or derive full POC.
+//! Gap synthesis is modeled separately and remains gated from native execution.
 //! Authoritative edition PDF SHA256:
 //! d6e09bcc94e5d095e1b2d6d16bf96d82a593d67915a963336ada082a775e9cdf.
 use super::h264::{Marking, Operation};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Entry {
     pub generation: u64,
+    pub nonexisting: bool,
     /// FrameNum after MMCO5 normalization. LT metadata uses `long_term` instead.
     pub frame_num: u32,
     pub poc: [i32; 2],
@@ -64,6 +65,32 @@ fn check_long(index: u32, maximum: Option<u32>) -> Result<(), String> {
     Ok(())
 }
 impl Dpb {
+    /// 8.2.5.2 applies sliding marking to each inferred frame, never collapsing
+    /// a gap to its final frame. These entries have no producer image.
+    pub(super) fn synthesize_unproven(
+        &self,
+        missing: &[super::poc::Synthetic],
+        limits: Limits,
+    ) -> Result<Self, String> {
+        let mut next = self.clone();
+        for missing in missing {
+            let plan = next.plan(
+                Picture {
+                    frame_num: missing.frame_num,
+                    poc: missing.poc.unwrap_or([0; 2]),
+                },
+                &Marking::Sliding,
+                limits,
+            )?;
+            next = plan.next;
+            next.entries
+                .last_mut()
+                .ok_or("missing inferred DPB entry")?
+                .nonexisting = true;
+        }
+        Ok(next)
+    }
+
     pub(super) fn plan(
         &self,
         picture: Picture,
@@ -84,6 +111,7 @@ impl Dpb {
             .checked_add(1)
             .ok_or("DPB generation overflow")?;
         let mut current = Entry {
+            nonexisting: false,
             generation: next.generation,
             frame_num: picture.frame_num,
             poc: picture.poc,
@@ -177,6 +205,9 @@ impl Dpb {
                                 limits.max_frame_num,
                                 difference_minus1,
                             )?;
+                            if next.entries[target].nonexisting {
+                                return Err("MMCO3 selects a non-existing reference".into());
+                            }
                             let generation = next.entries[target].generation;
                             next.entries.retain(|e| e.long_term != Some(index));
                             next.entries
@@ -613,5 +644,57 @@ mod tests {
         assert_eq!(plan.current.unwrap().generation, 3);
         assert_eq!(d.entries.len(), 1);
         assert_eq!(d.max_long_term_index, None);
+    }
+    #[test]
+    fn inferred_frames_slide_individually_and_cannot_be_promoted() {
+        let mut d = Dpb::default();
+        step(&mut d, 0, Marking::Sliding);
+        let missing = (1..=4)
+            .map(|frame_num| super::super::poc::Synthetic {
+                frame_num,
+                poc: Some([frame_num as i32 * 2; 2]),
+            })
+            .collect::<Vec<_>>();
+        let staged = d.synthesize_unproven(&missing, LIMITS).unwrap();
+        assert_eq!(
+            staged
+                .entries
+                .iter()
+                .map(|e| e.frame_num)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(staged.entries.iter().all(|e| e.nonexisting));
+        assert_eq!(d.entries.len(), 1);
+        let failure = staged
+            .plan(
+                picture(5),
+                &Marking::Adaptive(vec![
+                    Operation::LimitLong { max_index_plus1: 1 },
+                    Operation::Promote {
+                        difference_minus1: 0,
+                        index: 0,
+                    },
+                ]),
+                LIMITS,
+            )
+            .err()
+            .unwrap();
+        assert!(failure.contains("non-existing"));
+        let removed = staged
+            .plan(
+                picture(5),
+                &Marking::Adaptive(vec![
+                    Operation::ForgetShort {
+                        difference_minus1: 0,
+                    },
+                    Operation::ForgetShort {
+                        difference_minus1: 1,
+                    },
+                ]),
+                LIMITS,
+            )
+            .unwrap();
+        assert_eq!(removed.next.entries.len(), 2);
     }
 }

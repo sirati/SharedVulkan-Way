@@ -21,8 +21,78 @@ pub(super) struct Plan {
 fn integer(value: i64) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| "H264 picture order count overflow".into())
 }
+pub(super) struct Synthetic {
+    pub frame_num: u32,
+    // POC is not inferred for type0 non-existing frames, 8.2.5.2.
+    pub poc: Option<[i32; 2]>,
+}
+pub(super) struct CompletePlan {
+    pub next: History,
+    pub poc: [i32; 2],
+    pub missing: Vec<Synthetic>,
+}
 impl History {
+    /// Pure staging model. Native execution still calls the guarded `plan`.
+    /// ITU-T H.264 8.2.5.2 synthesizes every intervening frame in order, even
+    /// when the triggering access unit is non-reference.
+    pub(super) fn plan_unproven(
+        &self,
+        parsed: &Parsed,
+        bootstrap: bool,
+    ) -> Result<CompletePlan, String> {
+        let mut history = self.clone();
+        let mut missing = Vec::new();
+        if !parsed.idr {
+            if let Some(previous) = history.previous_reference_frame_num {
+                let maximum = parsed.max_frame_num;
+                if !(16..=65536).contains(&maximum)
+                    || !maximum.is_power_of_two()
+                    || parsed.frame_num >= maximum
+                {
+                    return Err("invalid gap frame modulus".into());
+                }
+                if parsed.frame_num != previous && parsed.frame_num != (previous + 1) % maximum {
+                    if !parsed.sequence.gaps_allowed {
+                        return Err("frame_num gap is forbidden by SPS".into());
+                    }
+                    let mut frame = (previous + 1) % maximum;
+                    while frame != parsed.frame_num {
+                        let poc = if parsed.sequence.poc == 0 {
+                            history.previous_reference_frame_num = Some(frame);
+                            None
+                        } else {
+                            let mut synthetic = parsed.clone();
+                            synthetic.frame_num = frame;
+                            synthetic.reference = true;
+                            synthetic.idr = false;
+                            synthetic.idr_pic_id = None;
+                            synthetic.poc = super::h264::Poc::default();
+                            synthetic.marking = Marking::Sliding;
+                            let plan = history.plan_inner(&synthetic, false, true)?;
+                            history = plan.next;
+                            // 8.2.1 listD includes inferred frames for POC1/2.
+                            Some(plan.poc)
+                        };
+                        missing.push(Synthetic {
+                            frame_num: frame,
+                            poc,
+                        });
+                        frame = (frame + 1) % maximum;
+                    }
+                }
+            }
+        }
+        let plan = history.plan_inner(parsed, bootstrap, true)?;
+        Ok(CompletePlan {
+            next: plan.next,
+            poc: plan.poc,
+            missing,
+        })
+    }
     pub(super) fn plan(&self, parsed: &Parsed, bootstrap: bool) -> Result<Plan, String> {
+        self.plan_inner(parsed, bootstrap, false)
+    }
+    fn plan_inner(&self, parsed: &Parsed, bootstrap: bool, unproven: bool) -> Result<Plan, String> {
         let s = &parsed.sequence;
         if !(4..=16).contains(&s.frame_bits) || s.poc > 2 || parsed.frame_num >= 1 << s.frame_bits {
             return Err("invalid POC sequence/frame syntax".into());
@@ -30,7 +100,7 @@ impl History {
         if self.sequence.is_none() && !parsed.idr {
             if !bootstrap
                 || !parsed.reference
-                || s.poc != 0
+                || (!unproven && s.poc != 0)
                 || parsed.slices.iter().any(|slice| slice.kind != 2)
                 || parsed.marking != Marking::Sliding
             {
@@ -163,6 +233,11 @@ impl History {
             }
             _ => unreachable!(),
         };
+        // 8.2.1 bounds intermediate FrameNumOffset and PicOrderCntMsb too.
+        if s.poc != 0 {
+            integer(frame_offset)?;
+        }
+        integer(current_msb)?;
         let poc = [integer(values[0])?, integer(values[1])?];
         if parsed.idr && poc[0].min(poc[1]) != 0 {
             return Err("IDR picture order count must start at zero".into());
@@ -412,5 +487,97 @@ mod tests {
         let before = h.clone();
         assert!(h.plan(&p, false).is_err());
         assert_eq!(h, before);
+    }
+    #[test]
+    fn unproven_fresh_reference_i_models_poc1_and_poc2_without_opening_live_gate() {
+        for ty in [1, 2] {
+            let mut p = picture(ty, 3, true);
+            if ty == 1 {
+                p.sequence.cycle_offsets = vec![2];
+                p.sequence.offset_top_bottom = 1;
+            }
+            assert!(History::default().plan(&p, true).is_err());
+            let plan = History::default().plan_unproven(&p, true).unwrap();
+            assert_eq!(plan.poc, if ty == 1 { [6, 7] } else { [6, 6] });
+            assert!(plan.missing.is_empty());
+        }
+    }
+    #[test]
+    fn unproven_gap_models_each_missing_frame_and_wrap() {
+        for ty in [0, 1, 2] {
+            let mut initial = idr(ty);
+            initial.sequence.gaps_allowed = true;
+            if ty == 1 {
+                initial.sequence.cycle_offsets = vec![2];
+            }
+            let mut history = History::default().plan(&initial, false).unwrap().next;
+            let mut current = picture(ty, 3, true);
+            current.sequence = initial.sequence.clone();
+            if ty == 0 {
+                current.poc.lsb = Some(6);
+            }
+            assert!(history.plan(&current, false).is_err());
+            let plan = history.plan_unproven(&current, false).unwrap();
+            assert_eq!(
+                plan.missing.iter().map(|p| p.frame_num).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(plan.poc, [6, 6]);
+            assert_eq!(
+                plan.missing[0].poc,
+                if ty == 0 { None } else { Some([2, 2]) }
+            );
+            history = plan.next;
+            current.frame_num = 1;
+            if ty == 0 {
+                current.poc.lsb = Some(8);
+            }
+            let plan = history.plan_unproven(&current, false).unwrap();
+            assert_eq!(plan.missing.len(), 13);
+            assert_eq!(plan.missing.first().unwrap().frame_num, 4);
+            assert_eq!(plan.missing.last().unwrap().frame_num, 0);
+            assert_eq!(plan.poc, if ty == 0 { [8, 8] } else { [34, 34] });
+        }
+    }
+    #[test]
+    fn nonreference_gap_updates_prev_reference_to_last_inferred_frame() {
+        let mut initial = idr(2);
+        initial.sequence.gaps_allowed = true;
+        let history = History::default().plan(&initial, false).unwrap().next;
+        let mut nonref = picture(2, 3, false);
+        nonref.sequence = initial.sequence.clone();
+        let plan = history.plan_unproven(&nonref, false).unwrap();
+        assert_eq!(plan.poc, [5, 5]);
+        let mut current = picture(2, 3, true);
+        current.sequence = initial.sequence;
+        assert!(
+            plan.next
+                .plan_unproven(&current, false)
+                .unwrap()
+                .missing
+                .is_empty()
+        );
+    }
+    #[test]
+    fn mmco5_output_order_includes_poc1_inferred_frames() {
+        let mut initial = idr(1);
+        initial.sequence.gaps_allowed = true;
+        initial.sequence.cycle_offsets = vec![10, -9];
+        let history = History::default().plan(&initial, false).unwrap().next;
+        let mut current = picture(1, 2, true);
+        current.sequence = initial.sequence;
+        current.marking = Marking::Adaptive(vec![Operation::ForgetAll]);
+        let failure = history.plan_unproven(&current, false).err().unwrap();
+        assert!(failure.contains("output order"));
+    }
+    #[test]
+    fn poc0_does_not_impose_unused_frame_offset_bound() {
+        let mut history = History::default().plan(&idr(0), false).unwrap().next;
+        history.previous_frame_num = 15;
+        history.previous_reference_frame_num = Some(15);
+        history.frame_num_offset = i64::from(i32::MAX);
+        let mut current = picture(0, 0, true);
+        current.poc.lsb = Some(2);
+        assert_eq!(history.plan(&current, false).unwrap().poc, [2, 2]);
     }
 }
