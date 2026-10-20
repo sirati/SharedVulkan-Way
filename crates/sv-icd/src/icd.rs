@@ -47,6 +47,48 @@ const VK_ERROR_TOO_MANY_OBJECTS: i32 = -10;
 /// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, vulkan_core.h.
 const VK_ERROR_INVALID_EXTERNAL_HANDLE: i32 = -1_000_072_003;
 
+/// Reserve only affected binary payload transitions while a submission crosses
+/// the transport. State is never locked during IO. Rejection rolls back entries
+/// that have not since changed, without overwriting unrelated acquisitions.
+/// Applications still order consumption and reuse of the same binary payload
+/// according to Vulkan's valid-usage rules. Independent handles remain free to
+/// progress while this submission waits on transport capacity or its reply.
+struct SemaphoreTransition<'a> {
+    icd: &'a SharedVulkan,
+    changes: Vec<(u64, crate::dmabuf::Semaphore, u64)>,
+    accepted: bool,
+}
+impl<'a> SemaphoreTransition<'a> {
+    fn stage(icd: &'a SharedVulkan, rewrite: impl FnOnce(&mut std::collections::HashMap<u64, crate::dmabuf::Semaphore>)) -> Self {
+        let mut state = icd.state();
+        let before = state.semaphores.clone();
+        rewrite(&mut state.semaphores);
+        let mut changes = Vec::new();
+        for (&id, payload) in &mut state.semaphores {
+            if let Some(previous) = before.get(&id).filter(|old| **old != *payload) {
+                payload.advance_revision();
+                changes.push((id, *previous, payload.revision));
+            }
+        }
+        Self { icd, changes, accepted: false }
+    }
+    fn accept(mut self) { self.accepted = true; }
+}
+impl Drop for SemaphoreTransition<'_> {
+    fn drop(&mut self) {
+        if self.accepted { return; }
+        let mut state = self.icd.state();
+        for &(id, previous, revision) in &self.changes {
+            if let Some(payload) = state.semaphores.get_mut(&id).filter(|p| p.revision == revision) {
+                let mut restored = previous;
+                restored.revision = revision;
+                restored.advance_revision();
+                *payload = restored;
+            }
+        }
+    }
+}
+
 /// Forward if there is a GPU side, otherwise answer with `$local`.
 ///
 /// Every physical-device query below has this shape, and writing it out
@@ -777,10 +819,10 @@ impl Icd for SharedVulkan {
         let mut out = p::VkExternalSemaphoreProperties::default();
         let ty = args.p_external_semaphore_info.as_ref().map_or(0, |i| i.handle_type.0 as u32);
         if crate::dmabuf::enabled() && ty == crate::dmabuf::SYNC_FD {
-            out.export_from_imported_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
+            out.export_from_imported_handle_types = p::VkExternalSemaphoreHandleTypeFlags(0);
             out.compatible_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
-            // EXPORTABLE | IMPORTABLE.
-            out.external_semaphore_features = p::VkExternalSemaphoreFeatureFlags(0x3);
+            // EXPORTABLE only; arbitrary pending sync-file imports are unsupported.
+            out.external_semaphore_features = p::VkExternalSemaphoreFeatureFlags(0x1);
         }
         Ok(p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply {
             p_external_semaphore_properties: Some(Box::new(out)),
@@ -892,7 +934,18 @@ impl Icd for SharedVulkan {
             return refuse;
         }
         let sem = info.semaphore.0;
-        let queue = self.state().semaphores.get_mut(&sem).and_then(|x| x.signal_queue.take());
+        let queue = {
+            let mut state = self.state();
+            if let Some(payload) = state.semaphores.get_mut(&sem) {
+                if payload.consume_local_signal() {
+                    payload.advance_revision();
+                    return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) });
+                }
+                let queue = payload.signal_queue.take();
+                payload.advance_revision();
+                queue
+            } else { None }
+        };
         let Some(queue) = queue else {
             return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) });
         };
@@ -937,11 +990,9 @@ impl Icd for SharedVulkan {
         })
     }
 
-    /// A sync fd on the dma-buf path (§104) is accepted and closed, and the
-    /// semaphore's next wait is dropped rather than forwarded: nothing on the
-    /// GPU side would ever signal it, and a wait nobody signals hangs the
-    /// guest's GPU. The fd is -1 from this ICD's own exports, and whatever a
-    /// foreign one guarded happened on this process's side already.
+    /// Only the special already-complete SYNC_FD payload (-1) is supported.
+    /// Pending foreign sync files need an asynchronous retained-fd bridge;
+    /// refusal leaves descriptor ownership with the caller.
     fn import_semaphore_fd_khr(
         &self,
         args: p::VkImportSemaphoreFdKHRArgs,
@@ -949,9 +1000,12 @@ impl Icd for SharedVulkan {
         if let Some(info) = args.p_import_semaphore_fd_info.as_ref()
             && crate::dmabuf::enabled()
             && info.handle_type.0 as u32 == crate::dmabuf::SYNC_FD
+            && info.fd == -1
         {
-            crate::dmabuf::close_fd(info.fd);
-            self.state().semaphores.entry(info.semaphore.0).or_default().presignalled = true;
+            let mut state = self.state();
+            let payload = state.semaphores.entry(info.semaphore.0).or_default();
+            payload.temporary_presignalled = true;
+            payload.advance_revision();
             return Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(0) });
         }
         Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
@@ -1904,8 +1958,12 @@ impl Icd for SharedVulkan {
         let mut args = args;
         if crate::dmabuf::enabled() {
             self.flush_fences()?;
-            self.track_sync_fd_semaphores(args.queue.0, &mut args.p_submits);
         }
+        // Stage one-shot payload consumption. A failed encode/send has not
+        // accepted a wait and must leave the local acquisition signal intact.
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            Self::track_sync_fd_semaphores(semaphores, args.queue.0, &mut args.p_submits, crate::dmabuf::enabled());
+        });
         let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&args)];
         {
             let mut enc = sv_wire::Encoder::new(&mut buf);
@@ -1913,6 +1971,7 @@ impl Icd for SharedVulkan {
             enc.finish().map_err(LowerError::Wire)?;
         }
         t.send(sv_icd_entry::RingClass::Queue, p::Opcode::VkQueueSubmit as u32, &buf)?;
+        transition.accept();
         Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
     }
 
@@ -1944,6 +2003,7 @@ impl Icd for SharedVulkan {
     }
 
     fn destroy_fence(&self, args: p::VkDestroyFenceArgs) -> IcdResult<()> {
+        self.state().acquired_fences.remove(&args.fence.0);
         forwarded!(self, destroy_fence, args, { Ok(()) })
     }
 
@@ -1951,6 +2011,9 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetFenceStatusArgs,
     ) -> IcdResult<p::VkGetFenceStatusReply> {
+        if self.state().acquired_fences.contains(&args.fence.0) {
+            return Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) });
+        }
         forwarded!(self, get_fence_status, args, {
             Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) })
         })
@@ -1977,6 +2040,8 @@ impl Icd for SharedVulkan {
                 |enc| p::encode_cmd_vk_reset_fences(enc, 0, &args),
             )?;
         }
+        let mut state = self.state();
+        for fence in &args.p_fences { state.acquired_fences.remove(&fence.0); }
         Ok(p::VkResetFencesReply { result: p::VkResult(0) })
     }
 
@@ -2002,8 +2067,19 @@ impl Icd for SharedVulkan {
 
     fn wait_for_fences(
         &self,
-        args: p::VkWaitForFencesArgs,
+        mut args: p::VkWaitForFencesArgs,
     ) -> IcdResult<p::VkWaitForFencesReply> {
+        {
+            let state = self.state();
+            let complete = args.p_fences.iter().filter(|f| state.acquired_fences.contains(&f.0)).count();
+            if complete > 0 && (!args.wait_all || complete == args.p_fences.len()) {
+                return Ok(p::VkWaitForFencesReply { result: p::VkResult(0) });
+            }
+            if args.wait_all {
+                args.p_fences.retain(|f| !state.acquired_fences.contains(&f.0));
+                args.fence_count = args.p_fences.len() as u32;
+            }
+        }
         forwarded!(self, wait_for_fences, args, {
             Ok(p::VkWaitForFencesReply { result: p::VkResult(0) })
         })
@@ -2137,24 +2213,48 @@ impl Icd for SharedVulkan {
         if reply.result.0 != 0 {
             return Ok(reply);
         }
-        if let Some((offset, pitch)) = img.explicit {
-            let mut sub = p::VkImageSubresource::default();
-            sub.aspect_mask = p::VkImageAspectFlags(crate::dmabuf::ASPECT_COLOR);
-            let got = forward::get_image_subresource_layout(
+        let mut img = img;
+        if img.explicit.is_some() {
+            // Each plane where the GPU side's LINEAR image has it, up to one
+            // shift of the whole image, which the bind then adds (§112: an
+            // NV12 frame's chroma plane imported on its own).
+            let n = usize::from(img.nplanes.max(1));
+            let mut have = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut sub = p::VkImageSubresource::default();
+                sub.aspect_mask = p::VkImageAspectFlags(if n > 1 {
+                    crate::dmabuf::ASPECT_PLANE_0 << i
+                } else {
+                    crate::dmabuf::ASPECT_COLOR
+                });
+                let got = forward::get_image_subresource_layout(
+                    t,
+                    p::VkGetImageSubresourceLayoutArgs {
+                        device,
+                        image: p::VkImage(id),
+                        p_subresource: Some(Box::new(sub)),
+                        p_layout: Some(Box::default()),
+                    },
+                )?;
+                have.push(got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default());
+            }
+            let requirements = forward::get_image_memory_requirements(
                 t,
-                p::VkGetImageSubresourceLayoutArgs {
-                    device,
-                    image: p::VkImage(id),
-                    p_subresource: Some(Box::new(sub)),
-                    p_layout: Some(Box::default()),
-                },
-            )?;
-            let have = got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default();
-            if have != (offset, pitch) {
+                p::VkGetImageMemoryRequirementsArgs { device, image: p::VkImage(id), p_memory_requirements: None },
+            )?.p_memory_requirements;
+            let (size, align) = requirements.map_or((0, 0), |r| (r.size, r.alignment));
+            let base = crate::dmabuf::explicit_base(&img.planes[..n], &have, align);
+            let fits = size > 0 && base.is_some_and(|b| b.checked_add(size).is_some());
+            if fits {
+                img.bind_offset = base.unwrap_or(0);
+                img.required_size = size;
+                img.required_alignment = align;
+            } else {
+                let (offset, pitch) = img.planes[0];
                 sv_icd_entry::report_always(&format_args!(
-                    "vkCreateImage: a dma-buf import asks for offset {offset} and row pitch {pitch}, the \
-                     GPU side lays the LINEAR image out at offset {} pitch {}; refused",
-                    have.0, have.1
+                    "vkCreateImage: a dma-buf import asks for planes {:?} (plane 0 at offset {offset}, row pitch \
+                     {pitch}), the GPU side lays the LINEAR image out as {have:?} with alignment {align}; refused",
+                    &img.planes[..n]
                 ));
                 forward::destroy_image(t, p::VkDestroyImageArgs { device, image: p::VkImage(id) })?;
                 return Ok(p::VkCreateImageReply {
@@ -2175,22 +2275,99 @@ impl Icd for SharedVulkan {
         forward::destroy_image(t, args)
     }
 
-    /// As `create_image`, for an image that does not exist yet.
+    /// An import whose planes start inside the dma-buf is bound that far in
+    /// (§112).
+    fn bind_image_memory(&self, mut args: p::VkBindImageMemoryArgs) -> IcdResult<p::VkBindImageMemoryReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory"));
+        };
+        if crate::dmabuf::enabled() {
+            let state = self.state();
+            if let Some(image) = state.dmabuf_images.get(&args.image.0).filter(|i| i.explicit.is_some()) {
+                let offset = state.memories.get(&args.memory.0).and_then(|m| image.binding_offset(args.memory_offset, m.size));
+                let Some(offset) = offset else {
+                    return Ok(p::VkBindImageMemoryReply { result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE) });
+                };
+                args.memory_offset = offset;
+            }
+        }
+        forward::bind_image_memory(t, args)
+    }
+
+    fn bind_image_memory2(&self, mut args: p::VkBindImageMemory2Args) -> IcdResult<p::VkBindImageMemory2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory2"));
+        };
+        if crate::dmabuf::enabled() {
+            let s = self.state();
+            for b in args.p_bind_infos.iter_mut() {
+                if let Some(image) = s.dmabuf_images.get(&b.image.0).filter(|i| i.explicit.is_some()) {
+                    let offset = s.memories.get(&b.memory.0).and_then(|m| image.binding_offset(b.memory_offset, m.size));
+                    let Some(offset) = offset else {
+                        return Ok(p::VkBindImageMemory2Reply { result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE) });
+                    };
+                    b.memory_offset = offset;
+                }
+            }
+        }
+        forward::bind_image_memory2(t, args)
+    }
+
+    fn get_image_memory_requirements(
+        &self,
+        args: p::VkGetImageMemoryRequirementsArgs,
+    ) -> IcdResult<p::VkGetImageMemoryRequirementsReply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetImageMemoryRequirements")); };
+        let image = args.image.0;
+        let mut reply = forward::get_image_memory_requirements(t, args)?;
+        if let Some(requirements) = reply.p_memory_requirements.as_mut() {
+            self.translate_image_requirements(image, requirements)?;
+        }
+        Ok(reply)
+    }
+
+    fn get_image_memory_requirements2(
+        &self,
+        args: p::VkGetImageMemoryRequirements2Args,
+    ) -> IcdResult<p::VkGetImageMemoryRequirements2Reply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetImageMemoryRequirements2")); };
+        let image = args.p_info.as_ref().map_or(0, |i| i.image.0);
+        let mut reply = forward::get_image_memory_requirements2(t, args)?;
+        if let Some(requirements) = reply.p_memory_requirements.as_mut() {
+            self.translate_image_requirements(image, &mut requirements.memory_requirements)?;
+        }
+        Ok(reply)
+    }
+
+    /// Explicit layouts require real backend subresource origins to calculate
+    /// their binding shift. Resolve a private temporary image exactly as create
+    /// would, rather than assuming a driver origin for this handle-free query.
     fn get_device_image_memory_requirements(
         &self,
         mut args: p::VkGetDeviceImageMemoryRequirementsArgs,
     ) -> IcdResult<p::VkGetDeviceImageMemoryRequirementsReply> {
-        let Some(t) = self.wire() else {
-            return Err(LowerError::NotImplemented("vkGetDeviceImageMemoryRequirements"));
-        };
-        if crate::dmabuf::enabled()
-            && let Some(ci) = args.p_info.as_mut().and_then(|i| i.p_create_info.as_mut())
-            && let Err(r) = crate::dmabuf::rewrite_image_create_info(ci)
-        {
-            sv_icd_entry::report_always(&format_args!(
-                "vkGetDeviceImageMemoryRequirements: an image this driver cannot create ({r})"
-            ));
-            return Err(LowerError::Result(r));
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetDeviceImageMemoryRequirements")); };
+        if crate::dmabuf::enabled() {
+            let original = args.p_info.as_ref().and_then(|i| i.p_create_info.as_ref()).cloned();
+            if let Some(original) = original {
+                let mut rewritten = original.clone();
+                let image = crate::dmabuf::rewrite_image_create_info(&mut rewritten).map_err(LowerError::Result)?;
+                if image.as_ref().is_some_and(|i| i.explicit.is_some()) {
+                    let created = self.create_image(p::VkCreateImageArgs { device: args.device, p_create_info: Some(original), p_image: None })?;
+                    if created.result.0 != 0 { return Err(LowerError::Result(created.result.0)); }
+                    let image = created.p_image.ok_or(LowerError::Shape("temporary explicit image missing"))?;
+                    let queried = self.get_image_memory_requirements2(p::VkGetImageMemoryRequirements2Args {
+                        device: args.device,
+                        p_info: Some(Box::new(p::VkImageMemoryRequirementsInfo2 { image, ..Default::default() })),
+                        p_memory_requirements: args.p_memory_requirements.clone(),
+                    });
+                    let destroyed = self.destroy_image(p::VkDestroyImageArgs { device: args.device, image });
+                    let reply = queried?;
+                    destroyed?;
+                    return Ok(p::VkGetDeviceImageMemoryRequirementsReply { p_memory_requirements: reply.p_memory_requirements });
+                }
+                if let Some(info) = args.p_info.as_mut() { info.p_create_info = Some(rewritten); }
+            }
         }
         forward::get_device_image_memory_requirements(t, args)
     }
@@ -2224,7 +2401,14 @@ impl Icd for SharedVulkan {
         {
             self.plane_to_colour(args.image.0, &mut sub.aspect_mask);
         }
-        forward::get_image_subresource_layout(t, args)
+        let image = args.image.0;
+        let mut reply = forward::get_image_subresource_layout(t, args)?;
+        if let Some(layout) = reply.p_layout.as_mut()
+            && let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some())
+        {
+            layout.offset = image.translated_offset(layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+        }
+        Ok(reply)
     }
 
     fn get_image_subresource_layout2(
@@ -2239,7 +2423,14 @@ impl Icd for SharedVulkan {
         {
             self.plane_to_colour(args.image.0, &mut sub.image_subresource.aspect_mask);
         }
-        forward::get_image_subresource_layout2(t, args)
+        let image = args.image.0;
+        let mut reply = forward::get_image_subresource_layout2(t, args)?;
+        if let Some(layout) = reply.p_layout.as_mut()
+            && let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some())
+        {
+            layout.subresource_layout.offset = image.translated_offset(layout.subresource_layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+        }
+        Ok(reply)
     }
 
     fn cmd_pipeline_barrier(&self, mut args: p::VkCmdPipelineBarrierArgs) -> IcdResult<()> {
@@ -2274,27 +2465,54 @@ impl Icd for SharedVulkan {
         forward::cmd_pipeline_barrier2(t, args)
     }
 
+    fn queue_bind_sparse(&self, mut args: p::VkQueueBindSparseArgs) -> IcdResult<p::VkQueueBindSparseReply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkQueueBindSparse")); };
+        if crate::dmabuf::enabled() { self.flush_fences()?; }
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            for batch in &mut args.p_bind_info {
+                // Sparse binds have the same semaphore/timeline payload shape,
+                // with no pipeline-stage array or command buffer submission.
+                let mut waits = p::VkSubmitInfo {
+                    p_next: std::mem::take(&mut batch.p_next),
+                    p_wait_semaphores: std::mem::take(&mut batch.p_wait_semaphores),
+                    p_signal_semaphores: batch.p_signal_semaphores.clone(),
+                    ..Default::default()
+                };
+                Self::track_sync_fd_semaphores(semaphores, args.queue.0, std::slice::from_mut(&mut waits), crate::dmabuf::enabled());
+                batch.wait_semaphore_count = waits.wait_semaphore_count;
+                batch.p_wait_semaphores = waits.p_wait_semaphores;
+                batch.p_next = waits.p_next;
+            }
+        });
+        let reply = forward::queue_bind_sparse(t, args)?;
+        if reply.result.0 == 0 { transition.accept(); }
+        Ok(reply)
+    }
+
     /// As `queue_submit`, for the sync-fd semaphores.
     fn queue_submit2(&self, mut args: p::VkQueueSubmit2Args) -> IcdResult<p::VkQueueSubmit2Reply> {
         let Some(t) = self.wire() else {
             return Err(LowerError::NotImplemented("vkQueueSubmit2"));
         };
-        if crate::dmabuf::enabled() {
-            self.flush_fences()?;
-            let mut s = self.state();
-            for b in args.p_submits.iter_mut() {
-                b.p_wait_semaphore_infos.retain(|w| {
-                    !s.semaphores.get_mut(&w.semaphore.0).is_some_and(|x| std::mem::take(&mut x.presignalled))
-                });
-                b.wait_semaphore_info_count = b.p_wait_semaphore_infos.len() as u32;
-                for sig in &b.p_signal_semaphore_infos {
-                    if let Some(x) = s.semaphores.get_mut(&sig.semaphore.0) {
-                        x.signal_queue = Some(args.queue.0);
+        if crate::dmabuf::enabled() { self.flush_fences()?; }
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            for batch in &mut args.p_submits {
+                batch.p_wait_semaphore_infos.retain(|wait| {
+                    !semaphores.get_mut(&wait.semaphore.0).is_some_and(crate::dmabuf::Semaphore::consume_local_signal)
+            });
+            batch.wait_semaphore_info_count = batch.p_wait_semaphore_infos.len() as u32;
+            if crate::dmabuf::enabled() {
+                for signal in &batch.p_signal_semaphore_infos {
+                    if let Some(payload) = semaphores.get_mut(&signal.semaphore.0) {
+                        payload.signal_queue = Some(args.queue.0);
                     }
                 }
             }
         }
-        forward::queue_submit2(t, args)
+        });
+        let reply = forward::queue_submit2(t, args)?;
+        if reply.result.0 == 0 { transition.accept(); }
+        Ok(reply)
     }
 }
 
@@ -2455,14 +2673,35 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
 }
 
 impl SharedVulkan {
+    /// Keep backend requirements unchanged internally. Application-visible size
+    /// includes the exact explicit origin that the bind implementation adds.
+    fn translate_image_requirements(&self, image: u64, requirements: &mut p::VkMemoryRequirements) -> IcdResult<()> {
+        if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
+            requirements.size = image.translated_offset(requirements.size)
+                .ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+        }
+        Ok(())
+    }
     /// `MEMORY_PLANE_0` of a LINEAR modifier image is the colour aspect to the
     /// driver behind the GPU side, which never saw a modifier (§104).
     /// (The aspect is valid only for a modifier image, so the image is not
     /// looked up: whichever image names it was made through this path.)
-    fn plane_to_colour(&self, _image: u64, aspect: &mut p::VkImageAspectFlags) {
-        if aspect.0 == crate::dmabuf::ASPECT_MEMORY_PLANE_0 {
-            aspect.0 = crate::dmabuf::ASPECT_COLOR;
-        }
+    fn plane_to_colour(&self, image: u64, aspect: &mut p::VkImageAspectFlags) {
+        let m0 = crate::dmabuf::ASPECT_MEMORY_PLANE_0;
+        let plane = match aspect.0 {
+            a if a == m0 => 0,
+            a if a == m0 << 1 => 1,
+            a if a == m0 << 2 => 2,
+            _ => return,
+        };
+        // A LINEAR image's memory plane i is its format plane i (§112); a
+        // one-plane format has only the colour aspect.
+        let format = self.state().dmabuf_images.get(&image).map_or(0, |i| i.format);
+        aspect.0 = if crate::dmabuf::plane_count(format) > 1 {
+            crate::dmabuf::ASPECT_PLANE_0 << plane
+        } else {
+            crate::dmabuf::ASPECT_COLOR
+        };
     }
 
     /// `vkAllocateMemory` on the dma-buf path (§104): an import of a token, or
@@ -2552,7 +2791,7 @@ impl SharedVulkan {
 
     /// The session's fence record (§104.11), asked of the GPU side once.
     /// `None`: it has none, and sync-fd exports wait as before.
-    fn fence_record(&self) -> IcdResult<Option<String>> {
+    pub(crate) fn fence_record(&self) -> IcdResult<Option<String>> {
         if let Some(r) = self.state().fences.record.clone() {
             return Ok(r);
         }
@@ -2569,6 +2808,36 @@ impl SharedVulkan {
         };
         self.state().fences.record = Some(r.clone());
         Ok(r)
+    }
+
+    /// §112: a swapchain image's frame, written by the work that signals
+    /// `semaphore` on `queue` (submitted just before), numbered for the
+    /// compositor: the token's sync page gets the number and the GPU side the
+    /// mark, as Zink's export of a dma-buf frame does (§104.11). `false` when
+    /// the GPU side has no fence record or the memory is not shared.
+    pub(crate) fn mark_shared_write(&self, queue: u64, semaphore: u64, memory: u64) -> IcdResult<bool> {
+        if self.fence_record()?.is_none() {
+            return Ok(false);
+        }
+        let seq = {
+            let mut s = self.state();
+            if !s.shared_memories.contains_key(&memory) {
+                return Ok(false);
+            }
+            s.fences.seq += 1;
+            let seq = s.fences.seq;
+            if let Some(m) = s.shared_memories.get(&memory) {
+                m.file.mark(seq);
+            }
+            seq
+        };
+        self.send_mark(crate::dmabuf::Mark { queue, semaphore, seq }, memory)?;
+        Ok(true)
+    }
+
+    /// A new fd for a shared allocation's token (§112); the caller closes it.
+    pub(crate) fn shared_token_fd(&self, memory: u64) -> Option<i32> {
+        self.state().shared_memories.get(&memory).and_then(|m| m.file.export())
     }
 
     /// `svFenceMark` for an export, on the queue ring after the submit that
@@ -2608,21 +2877,32 @@ impl SharedVulkan {
     /// Before a submit on the dma-buf path (§104): drop the waits on
     /// pre-signalled semaphores, and note which queue signals each sync-fd
     /// semaphore.
-    fn track_sync_fd_semaphores(&self, queue: u64, submits: &mut [p::VkSubmitInfo]) {
-        let mut s = self.state();
-        if s.semaphores.is_empty() {
-            return;
-        }
-        for b in submits.iter_mut() {
-            crate::dmabuf::drop_presignalled_waits(b, |sem| {
-                s.semaphores.get_mut(&sem).is_some_and(|x| std::mem::take(&mut x.presignalled))
+    fn track_sync_fd_semaphores(semaphores: &mut std::collections::HashMap<u64, crate::dmabuf::Semaphore>, queue: u64, submits: &mut [p::VkSubmitInfo], track_signals: bool) {
+        for batch in submits {
+            crate::dmabuf::drop_presignalled_waits(batch, |sem| {
+                semaphores.get_mut(&sem).is_some_and(crate::dmabuf::Semaphore::consume_local_signal)
             });
-            for sig in &b.p_signal_semaphores {
-                if let Some(x) = s.semaphores.get_mut(&sig.0) {
-                    x.signal_queue = Some(queue);
+            if track_signals {
+                for signal in &batch.p_signal_semaphores {
+                    if let Some(payload) = semaphores.get_mut(&signal.0) {
+                        payload.signal_queue = Some(queue);
+                    }
                 }
             }
         }
+    }
+
+    /// Publish already completed acquisition payloads atomically. No GPU work
+    /// or application-queue dependency is needed to release these signals.
+    pub(crate) fn complete_acquisition(&self, semaphore: u64, fence: u64) {
+        let mut state = self.state();
+        if semaphore != 0 {
+            let payload = state.semaphores.entry(semaphore).or_default();
+            payload.presignalled = true;
+            payload.signal_queue = None;
+            payload.advance_revision();
+        }
+        if fence != 0 { state.acquired_fences.insert(fence); }
     }
 
     /// Consume `sem`'s pending signal on `queue` and wait for it: a submit
@@ -2956,3 +3236,15 @@ mod tests {
         assert_eq!(samplers(&w), vec![POISON], "a reset pool's sets are forgotten");
     }
 }
+
+#[cfg(test)]
+#[path = "explicit_requirements_tests.rs"]
+mod explicit_requirements_tests;
+
+#[cfg(test)]
+#[path = "acquisition_sync_tests.rs"]
+mod acquisition_sync_tests;
+
+#[cfg(all(test, unix))]
+#[path = "external_sync_scope_tests.rs"]
+mod external_sync_scope_tests;

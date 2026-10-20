@@ -342,14 +342,9 @@ fi
 # about one environment variable does not need an edit to this file.
 EXTRA=${SVFF_EXTRA_ENV:-}
 
-# **Zink on the Wayland platform needs a Mesa that allows it** (docs/design.md
-# §0.28). `wc-proxy` offers `wl_shm` and no DRM device, and stock Mesa then loads
-# llvmpipe on the Wayland platform whatever this ICD offers. `SVFF_KOPPER_MESA`
-# is the store path of `nix/mesa-kopper-wayland.nix` — this host's own Mesa plus
-# the override platform_x11.c already reads — built on this host against the
-# nixpkgs its Firefox comes from (the command is in docs/design.md §0.28).
-# Unset, the run is what it always was. Not used by `x11`, which has kopper on
-# stock Mesa already.
+# This historical harness accepts an alternate upstream Mesa build through
+# SVFF_KOPPER_MESA. No custom Mesa patch is supported. The native/default
+# render-node proof uses sv-firefox-stock.sh instead.
 KOPPER_MESA=${SVFF_KOPPER_MESA:-}
 KOPPER_ENV=""
 if [ -n "$KOPPER_MESA" ] && [ "$MODE" != soft ] && [ "$MODE" != x11 ]; then
