@@ -42,4 +42,13 @@ static inline int hl_pt_access_translate(const void *context, hl_pt_fetch_fn fet
     }
     return -1;
 }
+/* Resolve an absolute IPA against an absolute native segment start. The
+ * primary mapping's start is ipa_base; overflow starts are hv_vm_map IPAs. */
+static inline int hl_pt_backing_offset(uint64_t ipa, uint64_t start, uint64_t size,
+                                       uint64_t *offset, uint64_t *available) {
+    if (ipa < start || ipa - start >= size) return -1;
+    *offset = ipa - start;
+    if (*available > size - *offset) *available = size - *offset;
+    return 0;
+}
 #endif
