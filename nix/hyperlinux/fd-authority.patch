@@ -113,7 +113,23 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      struct statfs mac_st;
-@@ -981,6 +1000,7 @@
+@@ -861,12 +880,14 @@
+ 
+ int64_t sys_statx(guest_t *g, int dirfd, uint64_t path_gva,
+                   int flags, unsigned int mask, uint64_t statxbuf_gva) {
++    FS_FD_SCOPE;
+     (void)mask;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+         return -LINUX_EFAULT;
+ 
+-    int host_dirfd = resolve_dirfd(dirfd);
++    int host_dirfd = (path[0] == '/' || dirfd == LINUX_AT_FDCWD)
++        ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd);
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
+         && hl_vfs_mode() != HL_FS_ROOTED) {
+         /* A device/OSS/synthetic fd has no host alias but is a valid guest
+@@ -981,6 +1002,7 @@
  /* ---------- dup/fcntl ---------- */
  
  int64_t sys_dup(int oldfd) {
@@ -121,7 +137,7 @@
      if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
      if (fd_table[oldfd].type == FD_CLOSED) return -LINUX_EBADF;
      /* Descriptor-backed fds must share the open-file description (POSIX).
-@@ -1001,8 +1021,11 @@
+@@ -1001,8 +1023,11 @@
          return gfd;
      }
  
@@ -134,7 +150,7 @@
  
      int new_host_fd = dup(host_fd);
      if (new_host_fd < 0) return linux_errno();
-@@ -1038,6 +1061,7 @@
+@@ -1038,6 +1063,7 @@
  }
  
  int64_t sys_dup3(int oldfd, int newfd, int linux_flags) {
@@ -142,7 +158,7 @@
      if (oldfd < 0 || oldfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
      if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
      /* Linux dup3(2): EINVAL if oldfd == newfd (unlike dup2 which is a no-op) */
-@@ -1048,8 +1072,9 @@
+@@ -1048,8 +1074,9 @@
      if (fd_table[oldfd].desc)
          return hl_fd_dup3(oldfd, newfd, linux_flags);
  
@@ -153,7 +169,7 @@
  
      int new_host_fd = dup(host_fd);
      if (new_host_fd < 0) return linux_errno();
-@@ -1087,9 +1112,12 @@
+@@ -1087,9 +1114,12 @@
  }
  
  int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg) {
@@ -167,7 +183,7 @@
          int64_t result = hl_wc_seal_fcntl(ref.host_fd, cmd, arg);
          if (result >= 0 && cmd == 1033 && ref.of && hl_wc_memfd_adopt(ref.of, ref.host_fd) < 0)
              result = linux_errno();
-@@ -1122,7 +1150,7 @@
+@@ -1122,7 +1152,7 @@
       * for its own purposes — reporting or mutating that leaked internal
       * state to the guest and left the guest's own O_NONBLOCK request
       * unseen by the OSS write path. */
@@ -176,7 +192,7 @@
      /* ...but ONLY for those: a plain file or stdio also carries an open-file
       * object, and its status_flags are never seeded from the host, so
       * F_GETFL reported O_RDONLY for stdout and F_SETFL(O_NONBLOCK) never
-@@ -1144,7 +1172,7 @@
+@@ -1144,7 +1174,7 @@
          return hl_fd_dup_from(fd, (int)arg, cmd == 1030);
      }
  
@@ -185,7 +201,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      /* Linux F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4,
-@@ -1509,7 +1537,8 @@
+@@ -1509,7 +1539,8 @@
  }
  
  int64_t sys_lseek(int fd, int64_t offset, int whence) {
@@ -195,7 +211,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      /* Directory FDs: getdents64 is backed by a host DIR* (fdopendir).
-@@ -1548,6 +1577,7 @@
+@@ -1548,6 +1579,7 @@
  
  int64_t sys_readlinkat(guest_t *g, int dirfd, uint64_t path_gva,
                         uint64_t buf_gva, uint64_t bufsiz) {
@@ -203,7 +219,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -1575,7 +1605,7 @@
+@@ -1575,7 +1607,7 @@
      if (rr < 0) return rr;
      int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
          ? host_dirfd_for_resolved()
@@ -212,7 +228,7 @@
      if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
          return -LINUX_EBADF;
  
-@@ -1601,6 +1631,7 @@
+@@ -1601,6 +1633,7 @@
  }
  
  int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
@@ -220,7 +236,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -1619,7 +1650,7 @@
+@@ -1619,7 +1652,7 @@
  
      int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
          ? host_dirfd_for_resolved()
@@ -229,7 +245,7 @@
      if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
          return -LINUX_EBADF;
  
-@@ -1642,6 +1673,7 @@
+@@ -1642,6 +1675,7 @@
  }
  
  int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode) {
@@ -237,7 +253,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -1657,7 +1689,7 @@
+@@ -1657,7 +1691,7 @@
  
      int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
          ? host_dirfd_for_resolved()
@@ -246,7 +262,7 @@
      if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
          return -LINUX_EBADF;
  
-@@ -1706,6 +1738,7 @@
+@@ -1706,6 +1740,7 @@
  
  int64_t sys_renameat2(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                        int newdirfd, uint64_t newpath_gva, int flags) {
@@ -254,7 +270,7 @@
      char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
      if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
          return -LINUX_EFAULT;
-@@ -1728,8 +1761,8 @@
+@@ -1728,8 +1763,8 @@
          if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
          if ((om && (om->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) || (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))))
              return -LINUX_EROFS;
@@ -265,7 +281,41 @@
          if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
      }
  
-@@ -1833,6 +1866,7 @@
+@@ -1768,6 +1803,7 @@
+ 
+ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva,
+                     int mode, int dev) {
++    FS_FD_SCOPE;
+     (void)dev;
+     char path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
+@@ -1782,7 +1818,7 @@
+     if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
+ 
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+-        ? host_dirfd_for_resolved() : resolve_dirfd(dirfd);
++        ? host_dirfd_for_resolved() : host_dirfd_for_op(&fd_scope, dirfd, path);
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1805,6 +1841,7 @@
+ 
+ int64_t sys_symlinkat(guest_t *g, uint64_t target_gva,
+                       int dirfd, uint64_t linkpath_gva) {
++    FS_FD_SCOPE;
+     char target[LINUX_PATH_MAX], linkpath[LINUX_PATH_MAX];
+     if (guest_read_str(g, target_gva, target, sizeof(target)) < 0)
+         return -LINUX_EFAULT;
+@@ -1820,7 +1857,7 @@
+     if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
+ 
+     int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
+-        ? host_dirfd_for_resolved() : resolve_dirfd(dirfd);
++        ? host_dirfd_for_resolved() : host_dirfd_for_op(&fd_scope, dirfd, linkpath);
+     if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
+         return -LINUX_EBADF;
+ 
+@@ -1833,6 +1870,7 @@
  
  int64_t sys_linkat(guest_t *g, int olddirfd, uint64_t oldpath_gva,
                     int newdirfd, uint64_t newpath_gva, int flags) {
@@ -273,7 +323,7 @@
      char oldpath[LINUX_PATH_MAX], newpath[LINUX_PATH_MAX];
      if (guest_read_str(g, oldpath_gva, oldpath, sizeof(oldpath)) < 0)
          return -LINUX_EFAULT;
-@@ -1854,8 +1888,8 @@
+@@ -1854,8 +1892,8 @@
          if (r2 < 0) return r2;
          if (om && nm && om->id != nm->id) return -LINUX_EXDEV;
          if (nm && (nm->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
@@ -284,7 +334,7 @@
          if (host_olddir == -1 || host_newdir == -1) return -LINUX_EBADF;
      }
  
-@@ -1881,6 +1915,7 @@
+@@ -1881,6 +1919,7 @@
  
  int64_t sys_faccessat(guest_t *g, int dirfd, uint64_t path_gva,
                        int mode, int flags) {
@@ -292,7 +342,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -1901,7 +1936,7 @@
+@@ -1901,7 +1940,7 @@
  
      int host_dirfd = (hl_vfs_mode() == HL_FS_ROOTED)
          ? host_dirfd_for_resolved()
@@ -301,7 +351,7 @@
      if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD && hl_vfs_mode() != HL_FS_ROOTED)
          return -LINUX_EBADF;
  
-@@ -1954,7 +1989,8 @@
+@@ -1954,7 +1993,8 @@
  /* ---------- permissions/ownership ---------- */
  
  int64_t sys_fchmod(int fd, uint32_t mode) {
@@ -311,7 +361,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
      if (fchmod(host_fd, mode) < 0)
          return linux_errno();
-@@ -1963,6 +1999,7 @@
+@@ -1963,6 +2003,7 @@
  
  int64_t sys_fchmodat(guest_t *g, int dirfd, uint64_t path_gva,
                       uint32_t mode, int flags) {
@@ -319,7 +369,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -1976,7 +2013,7 @@
+@@ -1976,7 +2017,7 @@
                                       &host_path, &mnt);
          if (rr < 0) return rr;
          if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
@@ -328,7 +378,7 @@
          if (host_dirfd == -1) return -LINUX_EBADF;
      }
  
-@@ -2008,6 +2045,7 @@
+@@ -2008,6 +2049,7 @@
  
  int64_t sys_fchownat(guest_t *g, int dirfd, uint64_t path_gva,
                       uint32_t owner, uint32_t group, int flags) {
@@ -336,7 +386,7 @@
      char path[LINUX_PATH_MAX];
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
-@@ -2021,7 +2059,7 @@
+@@ -2021,7 +2063,7 @@
                                       &host_path, &mnt);
          if (rr < 0) return rr;
          if (mnt && (mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL))) return -LINUX_EROFS;
@@ -345,7 +395,7 @@
          if (host_dirfd == -1) return -LINUX_EBADF;
      }
  
-@@ -2043,7 +2081,8 @@
+@@ -2043,7 +2085,8 @@
  }
  
  int64_t sys_fchown(int fd, uint32_t owner, uint32_t group) {
@@ -355,15 +405,18 @@
      if (host_fd < 0) return -LINUX_EBADF;
      if (fchown(host_fd, owner, group) < 0)
          return linux_errno();
-@@ -2052,6 +2091,7 @@
+@@ -2052,7 +2095,9 @@
  
  int64_t sys_utimensat(guest_t *g, int dirfd, uint64_t path_gva,
                        uint64_t times_gva, int flags) {
+-    int host_dirfd = resolve_dirfd(dirfd);
 +    FS_FD_SCOPE;
-     int host_dirfd = resolve_dirfd(dirfd);
++    int host_dirfd = (path_gva != 0 || dirfd == LINUX_AT_FDCWD)
++        ? AT_FDCWD : fs_fd_pin(&fd_scope, dirfd);
      if (host_dirfd < 0 && dirfd != LINUX_AT_FDCWD
          && hl_vfs_mode() != HL_FS_ROOTED)
-@@ -2078,7 +2118,7 @@
+         return -LINUX_EBADF;
+@@ -2078,7 +2123,7 @@
              if (g_utimensat_mnt &&
                  (g_utimensat_mnt->flags & (HL_MOUNT_RO | HL_MOUNT_VIRTUAL)))
                  return -LINUX_EROFS;
@@ -372,7 +425,7 @@
              if (host_dirfd == -1) return -LINUX_EBADF;
          }
      }
-@@ -2293,7 +2333,8 @@
+@@ -2293,7 +2338,8 @@
  
  int64_t sys_fgetxattr(guest_t *g, int fd, uint64_t name_gva,
                        uint64_t value_gva, uint64_t size) {
@@ -382,7 +435,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      char name[256];
-@@ -2320,7 +2361,8 @@
+@@ -2320,7 +2366,8 @@
  
  int64_t sys_fsetxattr(guest_t *g, int fd, uint64_t name_gva,
                        uint64_t value_gva, uint64_t size, int flags) {
@@ -392,7 +445,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      char name[256];
-@@ -2347,7 +2389,8 @@
+@@ -2347,7 +2394,8 @@
  }
  
  int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size) {
@@ -402,7 +455,7 @@
      if (host_fd < 0) return -LINUX_EBADF;
  
      if (size == 0) {
-@@ -2369,7 +2412,8 @@
+@@ -2369,7 +2417,8 @@
  }
  
  int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva) {
