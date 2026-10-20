@@ -38,6 +38,9 @@
 #
 # ENVIRONMENT
 #
+#   SVMC_NODE      render node for the native dma-buf path, defaults to AMD
+#   SVMC_PCI       forwarded PCI ids for a CUSE node, VVVV:DDDD
+#   SVMC_MESA      upstream Mesa build, defaults to nix/mesa-zink-va.nix
 #   SVMC_DATA      where Prism's data dir and the captures live  (/tmp/svmc)
 #   SVMC_VALIDATE  1: VK_LAYER_KHRONOS_validation on the GPU side, VUIDs counted
 #   SVMC_VSYNC     1 to leave the game's vsync on (default off, to measure FPS)
@@ -178,7 +181,7 @@ EOF
   # automated — the device-code flow started on its own, polled
   # login.microsoftonline.com and tried to open a browser — and nothing was
   # entered anywhere, but "nothing was entered" is not a property to rely on.
-  mkdir -p "$run/nobrowser"
+  mkdir -p "$run/nobrowser" "$run/home" "$run/config" "$run/data" "$run/state" "$run/cache"
   printf '#!/bin/sh\necho "refused: $0 $*" >>"%s/nobrowser/log"\nexit 1\n' "$run" >"$run/nobrowser/xdg-open"
   chmod +x "$run/nobrowser/xdg-open"
   for b in firefox chromium google-chrome sensible-browser www-browser; do
@@ -194,7 +197,9 @@ EOF
     # driver at all, so VulkanMod's first start fails cleanly after the
     # download rather than finding the workstation's NVIDIA card.
     systemd-run --user --scope --quiet -p MemoryMax="${SVMC_MEM:-6G}" \
-      env DISPLAY=":$XN" QT_QPA_PLATFORM=xcb WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 \
+      env HOME="$run/home" XDG_CONFIG_HOME="$run/config" XDG_DATA_HOME="$run/data" \
+      XDG_STATE_HOME="$run/state" XDG_CACHE_HOME="$run/cache" \
+      DISPLAY=":$XN" QT_QPA_PLATFORM=xcb WAYLAND_DISPLAY= LIBGL_ALWAYS_SOFTWARE=1 \
       __GLX_VENDOR_LIBRARY_NAME=mesa VK_DRIVER_FILES=/nonexistent.json \
       PATH="$run/nobrowser:$PATH" BROWSER="$run/nobrowser/xdg-open" \
       DBUS_SESSION_BUS_ADDRESS=disabled: \
@@ -269,9 +274,30 @@ run() {
   [ -x "$BIN/sv-gpu-server" ] && [ -x "$BIN/wc-proxy" ] && [ -f "$BIN/sv_icd.json" ] \
     && [ -x "$WINBIN/wc-compositor.exe" ] \
     || die "build first: cargo build --release -p sv-icd -p sv-gpu-server -p wc-proxy; cargo build --target x86_64-pc-windows-gnu -p wc-compositor"
+  [ -x "$BIN/sv-drm" ] || die "build sv-drm for the native render-node test"
+  local RENDER_NODE=${SVMC_NODE:-} n
+  if [ -z "$RENDER_NODE" ]; then
+    for n in /sys/class/drm/renderD*; do
+      [ "$(cat "$n/device/vendor" 2>/dev/null)" = 0x1002 ] && { RENDER_NODE=/dev/dri/${n##*/}; break; }
+    done
+  fi
+  [ -c "$RENDER_NODE" ] || die "no render node; set SVMC_NODE"
+  local PCI=${SVMC_PCI:-} minor=${RENDER_NODE##*renderD} vendor device
+  if [ -z "$PCI" ]; then
+    vendor=$(cat "/sys/class/drm/renderD$minor/device/vendor" 2>/dev/null)
+    device=$(cat "/sys/class/drm/renderD$minor/device/device" 2>/dev/null)
+    [ -n "$vendor" ] && [ -n "$device" ] && PCI="${vendor#0x}:${device#0x}"
+  fi
+  [[ "$PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] || die "need SVMC_PCI for the forwarded GPU"
+  local -a NS=("$BIN/sv-drm" ns --dev "$(stat -c '%Hr:%Lr' "$RENDER_NODE")" --minor "$minor" --pci "$PCI")
+  for n in /sys/class/drm/renderD* /sys/class/drm/card[0-9]; do
+    [ "$(cat "$n/device/vendor" 2>/dev/null)" = 0x10de ] && NS+=(--hide "/dev/dri/${n##*/}")
+  done
+  NS+=(--)
   local RUN; RUN=$(mktemp -d "$DATA/run-$inst-XXXX")
   local GAMEDIR; GAMEDIR=$(cat "$CAP/$inst/cwd")
-  mkdir -p "$RUN/xdg" "$RUN/keymaps" "$RUN/trace"; chmod 700 "$RUN/xdg"
+  mkdir -p "$RUN/xdg" "$RUN/keymaps" "$RUN/trace" "$RUN/home" "$RUN/config" "$RUN/data" "$RUN/state" "$RUN/cache"
+  chmod 700 "$RUN/xdg"
   say "run $inst for $secs s in $RUN"
 
   # The game's options: no accessibility onboarding, no pause when the window
@@ -315,7 +341,7 @@ run() {
   done
   [ -n "$NODE" ] || die "wc-compositor.exe never listened; see $RUN/wine.log"
   SV_ALLOW_FILE_ARENA=1 WC_FRAME_TRACE="$RUN/trace/%p.txt" "$BIN/wc-proxy" --upstream "$NODE" \
-    --socket svmc --runtime-dir "$RUN/xdg" --copy damage \
+    --socket svmc --runtime-dir "$RUN/xdg" --copy damage --dmabuf-node "$RENDER_NODE" \
     --transport arena --arena-path "$RUN/wc-arena" --arena-id 0 --arena-size "$WCARENA" \
     --accept-timeout 120 --timeout $((secs + 300)) >"$RUN/proxy.log" 2>&1 &
   KIDS+=($!)
@@ -350,22 +376,27 @@ run() {
   KIDS+=($(cat "$RUN/gpu.pid"))
 
   # ---- the game, as Prism launched it, with the session's environment
-  local KM; KM=$(nix build --no-link --print-out-paths --impure --expr \
+  local KM=${SVMC_MESA:-}
+  if [ -z "$KM" ]; then
+    KM=$(nix build --no-link --print-out-paths --impure --expr \
     "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
+  fi
   [ -n "$KM" ] || die "could not build nix/mesa-zink-va.nix"
   local LDP; LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$CAP/$inst/env")
   local -a GAME_ENV=(
-    XDG_RUNTIME_DIR="$RUN/xdg" WAYLAND_DISPLAY=svmc
+    HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/config" XDG_DATA_HOME="$RUN/data"
+    XDG_STATE_HOME="$RUN/state" XDG_CACHE_HOME="$RUN/cache"
+    XDG_RUNTIME_DIR="$RUN/xdg" WAYLAND_DISPLAY=svmc SV_DRM_NODE="$RENDER_NODE"
     # Our ICD, and only ours.
     VK_DRIVER_FILES="$BIN/sv_icd.json" SV_SOCKET="$RUN/gpu.sock"
     # Prism's own library path (OpenAL, GLFW, the Vulkan loader, libglvnd).
     LD_LIBRARY_PATH="$LDP"
-    # GL: Mesa's EGL from our Mesa (nix/mesa-zink-va.nix), and Zink, through kopper with no
-    # DRM device (docs/design.md §0.28) — what gpu.env sets for Firefox.
+    # Stock upstream Mesa reaches Zink through the native DRM device.
     __GLX_VENDOR_LIBRARY_NAME=mesa
     __EGL_VENDOR_LIBRARY_FILENAMES="$KM/share/glvnd/egl_vendor.d/50_mesa.json"
-    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink LIBGL_KOPPER_DRI2=1
+    LIBGL_DRIVERS_PATH="$KM/lib/dri" GBM_BACKENDS_PATH="$KM/lib/gbm"
+    MESA_LOADER_DRIVER_OVERRIDE=zink GALLIUM_DRIVER=zink
     WC_FRAME_TRACE="$RUN/trace/%p.txt"
   )
   if [ "${SVMC_SOUND:-0}" = 1 ] && [ -S "/run/user/$(id -u)/pulse/native" ]; then
@@ -386,18 +417,12 @@ run() {
   GAME_ENV+=("${EXTRA_ENV[@]}")
   local ARGS=()
   [ -d "$GAMEDIR/saves/Demo_World" ] && ARGS=(--quickPlaySingleplayer Demo_World)
-  # **No `/dev/dri` for the game.** Mesa's EGL probes every DRM device it
-  # can open before it settles on the kopper path, and on this workstation the
-  # first one is the NVIDIA card other people's jobs run on (`pci id for fd
-  # 16: 10de:2b85`). It found no driver and let go, but the harness must not
-  # open that device at all; an empty `/dev/dri` is also exactly what the
-  # deployed host has, which has no GPU.
-  need bwrap
+  # The namespace exposes the selected node and hides NVIDIA devices leased
+  # by other jobs. The game uses its normal Wayland/DRM initialization.
   local -a ARGV; mapfile -t ARGV <"$CAP/$inst/argv"
   ( cd "$GAMEDIR" && { grep -v '^launch$' "$CAP/$inst/stdin"; for a in "${ARGS[@]}"; do echo "param $a"; done; echo launch; } \
       | systemd-run --user --scope --quiet -p MemoryMax="${SVMC_MEM:-6G}" \
-          bwrap --dev-bind / / --tmpfs /dev/dri -- \
-          env -u DISPLAY "${GAME_ENV[@]}" timeout "$secs" "${ARGV[@]}" ) >"$RUN/game.log" 2>&1 &
+          env -u DISPLAY "${GAME_ENV[@]}" "${NS[@]}" timeout "$secs" "${ARGV[@]}" ) >"$RUN/game.log" 2>&1 &
   local G=$!
   KIDS+=($G)
 
