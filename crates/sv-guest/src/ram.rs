@@ -1,9 +1,9 @@
-//! `sv-guest ram …`: the keeper, and the instruments that proved guest-RAM
+//! `sv-guest ram …`: the shared broker alias and the guest-RAM instruments
 //! regions on a Windows test VM before any real guest saw them
 //! (waycompose-design.md §108.12).
 //!
 //! ```text
-//! sv-guest ram keeper                      the SYSTEM keeper (§108.10)
+//! sv-guest ram keeper                      shared broker console alias (§108.18)
 //! sv-guest ram test [opts]                 a provider serving N sessions that grow and shrink
 //! sv-guest ram canary --mib N              ordinary memory, filled and checked: a host write into
 //!                                          freed guest RAM shows up here as corruption
@@ -66,8 +66,23 @@ mod imp {
             Some("hog") => hog(&args[1..]),
             Some("jitter") => jitter(&args[1..]),
             Some("stats") => {
-                let (mut k, _) = sv_ram::keeper::KeeperClient::connect("stats")?;
-                println!("{}", k.stats()?);
+                let mut c = wc_broker::client::Client::connect(&wc_broker::client::path())
+                    .map_err(|e| e.to_string())?;
+                c.hello("guest-ram-stats").map_err(|e| e.to_string())?;
+                let stats = c.stats().map_err(|e| e.to_string())?;
+                let value = |key: &str| {
+                    stats
+                        .split_whitespace()
+                        .find_map(|w| w.strip_prefix(key))
+                        .unwrap_or("0")
+                };
+                let (total, available) = sv_transport::winram::memory_status();
+                println!("{} {} {} {} {available} {total}",
+                    value("regions="),
+                    value("region-bytes="),
+                    value("orphans="),
+                    value("orphan-bytes=")
+                );
                 Ok(())
             }
             _ => Err("usage: sv-guest ram keeper|test|canary|hog|stats".into()),
@@ -172,7 +187,7 @@ mod imp {
         let run = u64::from_le_bytes(sv_ram::winsys::random::<8>());
         let mut prov = Provider::start(boot, table_off, sub, run)?;
         let adopted = prov.regions.len();
-        eprintln!("[ram] {} provider run {run:016x}, keeper run {:016x}, {adopted} orphan(s) adopted", ts(), prov.substrate.keeper.run);
+        eprintln!("[ram] {} provider run {run:016x}, broker run {}, {adopted} orphan(s) adopted", ts(), prov.substrate.run);
         let bell = Arc::new(Bell::open(bell_name));
         bell.ring();
 
@@ -277,7 +292,7 @@ mod imp {
         for w in workers {
             let _ = w.join();
         }
-        let k = prov.substrate.keeper.stats().unwrap_or_default();
+        let k = prov.substrate.stats().unwrap_or_default();
         println!(
             "[ram] {} DONE large-page views={} grows={} bytes={} MiB verified={} MiB refused={} errors={} keeper={k}",
             ts(),

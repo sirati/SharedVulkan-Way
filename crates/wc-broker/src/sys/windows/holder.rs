@@ -349,8 +349,12 @@ impl Link {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            let all: Vec<(RegionInfo, User, usize)> = self.regions.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
-            for (info, user, h) in &all {
+            // Keep the registry locked while duplicating its borrowed raw
+            // handles. region_destroyed removes an entry before closing the
+            // broker's handle; it must not close or reuse a value from a
+            // refill snapshot before we have duplicated it.
+            let all = self.regions.lock().unwrap_or_else(|e| e.into_inner());
+            for (info, user, h) in all.values() {
                 if let Err(e) = self.give(info, user, *h as HANDLE) {
                     eprintln!("[wc-broker] holder: refilling region {}: {e}", info.id);
                 }

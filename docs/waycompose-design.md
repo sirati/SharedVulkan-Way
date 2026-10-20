@@ -36273,17 +36273,15 @@ R43 accepts that: one host user is one trust domain.
 
 ### 108.16 Not done, and not proven
 
-* **The broker**: built and proven in a VM (108.18). One gap remains: a
-  lease taken in the last beat before the daemon crashes is not in its
-  record.
+* **The broker**: built and proven in a VM (108.18). Lease records are now
+  written before handle transfer, with a failed write refusing the lease.
 * **The Intel driver's import of a large-page section view** (108.11).
-* **The GPU process does not ring `0xFB`**; both sides poll while a region
-  is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
-  the region manager the pool's port.
-* **A keeper service install** with restart-on-failure; the test VM used a
-  scheduled task. It becomes a module of the shared Windows service (108.10).
-* **The kept-keeper residual** (108.10): a keeper and every provider of a
-  pool killed together before the host lets go.
+* **Region doorbells** are wired through the pool's per-range port lookup.
+  Commit `48b90cc` rings `0xFB` on announce and retire and rescans on reopen.
+* **The Windows region backend** now uses the shared broker service and its
+  independent holder. The old keeper command is a compatibility alias for that broker.
+  A simultaneous kill of the provider, broker and holder still loses pages;
+  an ordinary provider or broker crash retains them.
 * **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
   the user.
 * **The peer's own restart** (the broker daemon's): handled by its record
@@ -36347,13 +36345,59 @@ and lease files.
   newest live one, and each epoch is answered on its own.
 * **The daemon's own restart.** The component records every published
   region in its state directory: its runs, and its holders as (pid, start
-  time), written at publish and in every beat in which they change. A new run
-  publishes the recorded regions the table still holds, so their holders can
-  find them again. It answers one only once the new broker has drained it
-  *and* every recorded holder has exited (`broker::holders`, §111). Not
-  covered: a lease taken in the last beat (250 ms) before a crash. A hook
-  that runs before a lease's fds are sent would close that gap. It has been
-  asked of the broker's owner.
+  time). `on_leased_checked` writes and fsyncs an atomic replacement before
+  a region's handles leave the broker. The callback refuses an unregistered
+  region or a failed write, rolling back the new lease without sending fds.
+  It shares a lock with the peer's record updates, so a beat cannot erase a
+  newly recorded holder. A new run republishes the recorded regions and
+  answers only once its current leases have drained and every recorded
+  holder has exited. Failed re-publication also retains the old holders.
+
+**A journal that cannot be trusted blocks recovery.** Before publishing any
+inherited region, the component checks the complete journal's version,
+checksum and every record. Missing or unreadable files, malformed records,
+truncation, duplicate epochs and mapped entries without records block the
+whole pool. The peer freezes every table answer, including `REFUSED` for
+new announcements and `UNMAPPED` for unknown epochs. A refusal could also
+let the provider free memory handed to a mapper before `MAPPED` was written. Heartbeats leave the damaged
+file untouched. Restoring a trusted journal and restarting the daemon is
+required to resume recovery; a timeout never clears the block.
+
+Only a newly created private state directory with a demonstrably empty
+shared region table gets an initial, durably empty journal. A nonempty
+table blocks initialization, including ANNOUNCED entries before MAPPED. An existing directory with a missing journal is not treated as a
+first start. Production `GuestRamComponent` construction requires this
+directory; explicitly in-memory simulations retain their test-only mode.
+Unversioned journals are rejected because older heartbeat records cannot
+prove holder completeness. Their migration requires old mappings to have
+ended, rather than adding an integrity header to potentially incomplete
+holder records. A completed `UNMAPPED` entry needs no journal record while
+the provider finishes its cleanup.
+
+Recovery correction validation, 2026-10-20, code `5bc0ae9`: all 63 scoped
+`sv-ram`/`wc-broker` tests passed, as did strict scoped Clippy with
+`--all-targets --no-deps -- -D warnings`. The retained-mapper regression covers
+eight journal failures, including loss of the entire directory while the
+entry is ANNOUNCED with no answer. The NixOS guest-RAM broker VM test passed.
+Its unreadable and malformed journal cases kept alice's actual udmabuf mapping
+at the same address with unchanged bytes over 55 and 47 checks respectively.
+After trusted journal restoration and daemon restart, retirement still waited
+for alice to release her mapping before UNMAPPED and free. The test cleaned up
+its QEMU. No Windows VM rerun was needed for this Linux recovery correction.
+
+**Windows provider integration.** `KeeperSubstrate` now connects to the
+shared Windows broker and requests `alloc guest-ram.POOL BYTES large`.
+The service's region-init hook stamps every 2 MiB page with a random nonce
+and returns it in the allocation reply. The provider adopts that user's
+orphans on reconnect and opens their section handles. It sends `close` and
+`free` only after the peer's `UNMAPPED`. Regions remain address-stable for
+their whole epoch. The Windows backend keeps max(1 GiB, 15% of physical RAM)
+available for Windows, with the existing `WC_RAM_RESERVE_MIB` override.
+A failed copy into the independent holder now refuses allocation, rather
+than silently losing protection against a broker crash. The old `sv-guest ram keeper` command forwards to the shared broker's
+console mode for existing test tasks. Its old pipe and allocator are removed.
+`--grow-keeper` and `ram test` both use the broker client.
+
 
 **The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
 a process that passes the kernel's ptrace access check, which needs the same
@@ -36420,6 +36464,37 @@ needs an account that may make udmabufs, which the harness's user never is,
 so its guest-RAM part is the two VM tests now. Not covered end to end in a
 VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
 the same `find` + `map_fixed` per part as the ICD).
+
+
+**Shared broker keeper integration, 2026-10-20.** Branch
+`windows-guest-ram-broker`, checked after merging the broker shutdown fix
+from master. The final code checks cover 60 `sv-ram` and `wc-broker` tests,
+the Windows target for `sv-guest`, `sv-ram` and `wc-broker`, strict Clippy on
+`sv-ram` and `wc-broker` with dependencies excluded, and the
+NixOS guest-RAM broker VM test above. Full dependency linting also reports a
+pre-existing empty doc-comment line in `wc-handle/src/grow.rs`.
+
+A separate disposable Windows VM, with 3 GiB RAM and four vCPUs, ran the
+new broker backend through the compatibility `ram keeper` command. Its
+host instrument continued writing into the lent RAM during each crash.
+
+| check | result |
+|---|---|
+| ordinary allocation and release | two sessions, six grows of 64 and 128 MiB; 576 MiB filled and verified, large-page translations active, no refusal or error |
+| provider killed while the host writes | one orphan adopted by the replacement provider and freed after `UNMAPPED`; broker statistics returned to zero |
+| provider then broker killed while the host writes | the independent holder survived, the new broker restored the section, and the next provider adopted and freed it after `UNMAPPED`; statistics returned to zero |
+| holder killed while two sessions allocate and retire | the broker replaced its holder; one allocation was refused while no holder was available and its retry succeeded; 220 grows and 13.75 GiB verified, no bad word or stalled counter; statistics returned to zero |
+| memory reserve | while two 128 MiB sections were held, Windows still reported about 1.8 GiB available; the 1 GiB reserve stayed intact |
+| guest health and cleanup | every watchdog probe succeeded; the host instrument exited before the VM stopped, and its overlay was retained |
+
+The holder restart registry also retains its lock while duplicating section
+handles. A region's destruction cannot close and reuse a handle from an
+in-flight refill. A refused allocation removes its restart record before
+its section handle is closed.
+
+The Intel driver's import of these views and the proxy's grown arena window
+still need their separate end-to-end proofs. These tests ran only in the
+disposable local VMs.
 
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
@@ -37598,6 +37673,7 @@ The following thirty-minute observation contained 13 complete GPU D0
 dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
 the busy-loop recovery under that workload. The process that triggers the
 periodic GPU wake remains unidentified.
+
 ## 112. Stock Firefox on the dma-buf path
 
 This branch provides the render-node relay prerequisite only. The stock
