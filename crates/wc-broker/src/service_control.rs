@@ -88,12 +88,7 @@ impl Message {
     pub fn validate(&self) -> io::Result<()> {
         let b = &self.binding;
         let s = &b.source;
-        if b.installation.is_empty()
-            || b.installation.len() > 32
-            || !b
-                .installation
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        if !wc_handle::macboot::valid_installation(&b.installation)
             || s.vm.is_empty()
             || s.vm.len() > 64
             || !s
@@ -469,6 +464,11 @@ mod tests {
         m = fixture();
         m.binding.installation = "../other".into();
         assert!(m.encode().is_err());
+        for installation in [".", "..", "with.dot"] {
+            m = fixture();
+            m.binding.installation = installation.into();
+            assert!(m.encode().is_err());
+        }
         m = fixture();
         m.binding.source.windows_device = "x".repeat(1025);
         assert!(m.encode().is_err());
