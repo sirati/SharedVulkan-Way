@@ -195,6 +195,19 @@ done
 for t in a b c; do R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "status $t: $R" ;; esac; done
 ok "every session answers its own control ring"
 
+say "leg 1d: isolated control requests: 20 ms and 1 s apart, the host's proxy parked between them, mean under 1 ms"
+# A request after a pause finds the proxy's control thread parked on its lane
+# with a 500 ms slice, so only the doorbell (compositor -> port -> hub -> the
+# proxy's doorman -> the lane's futex) answers it in time. Back to back (the
+# probe's default) the proxy is still spinning and the doorbell is never used.
+cc -O2 -o "$D/probe-ctl-rtt" "$ROOT/scripts/probe-ctl-rtt.c" 2>/dev/null || bad "cannot build the rtt probe"
+for spec in "a 20 50" "b 20 50" "c 1000 6"; do
+  set -- $spec
+  R=$(GAP_MS=$2 "$D/probe-ctl-rtt" "$D/ctl-$1.sock" "$3" rtt 2>&1)
+  M=$(echo "$R" | sed -n 's/.*mean \([0-9.]*\) us.*/\1/p')
+  if [ -n "$M" ] && awk -v m="$M" 'BEGIN { exit !(m < 1000) }'; then ok "wcm$1, $2 ms apart: $R"; else bad "wcm$1, $2 ms apart: ${R:-no answer} (mean must be < 1000 us)"; fi
+done
+
 if [ -n "$INFO" ]; then
   say "leg 1c: the nested-compositor globals only for the session that asked (wcmc booted with nested=1)"
   for t in a c; do request "$t" "raw run info 96 30" >/dev/null; done
