@@ -1,0 +1,264 @@
+/* Guest acceptance for the bounded AF_UNIX SOCK_SEQPACKET pair ABI. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define CHECK(test) do { if (!(test)) { \
+    fprintf(stderr, "seqpacket line %d: %s, errno=%d\n", __LINE__, #test, errno); \
+    exit(1); } } while (0)
+#define MAX_RECORD 16384
+static int linux_reference;
+static void pair(int fd[2]) {
+    CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                     0, fd) == 0);
+    CHECK(fcntl(fd[0], F_GETFD) & FD_CLOEXEC);
+    CHECK(fcntl(fd[0], F_GETFL) & O_NONBLOCK);
+    int type = 0; socklen_t length = sizeof(type);
+    CHECK(getsockopt(fd[0], SOL_SOCKET, SO_TYPE, &type, &length) == 0);
+    CHECK(length == sizeof(type) && type == SOCK_SEQPACKET);
+}
+static void close_pair(int fd[2]) { CHECK(close(fd[0]) == 0); CHECK(close(fd[1]) == 0); }
+static void send_fd(int socket, const char *data, size_t length, int fd) {
+    union { struct cmsghdr alignment; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct iovec io = { (void *)data, length };
+    struct msghdr message = { .msg_iov = &io, .msg_iovlen = 1 };
+    if (fd >= 0) {
+        message.msg_control = control.bytes;
+        message.msg_controllen = sizeof(control.bytes);
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+    }
+    CHECK(sendmsg(socket, &message, MSG_NOSIGNAL) == (ssize_t)length);
+}
+static ssize_t receive(int socket, char *data, size_t length, int flags,
+                       int *received, int *output_flags, int with_control) {
+    union { struct cmsghdr alignment; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct iovec io = { data, length };
+    struct msghdr message = { .msg_iov = &io, .msg_iovlen = 1 };
+    if (with_control) {
+        message.msg_control = control.bytes;
+        message.msg_controllen = sizeof(control.bytes);
+    }
+    *received = -1;
+    ssize_t result = recvmsg(socket, &message, flags);
+    *output_flags = message.msg_flags;
+    if (result >= 0 && message.msg_controllen && with_control) {
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        if (header) {
+            CHECK(header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS);
+            CHECK(header->cmsg_len == CMSG_LEN(sizeof(int)));
+            memcpy(received, CMSG_DATA(header), sizeof(*received));
+        }
+    }
+    return result;
+}
+static void empty(int fd) {
+    char byte;
+    CHECK(recv(fd, &byte, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+}
+static void check_peek(int fd, const char *expected, int with_control) {
+    char bytes[32] = {0}; int passed, flags;
+    ssize_t result = receive(fd, bytes, sizeof(bytes), MSG_PEEK | MSG_CMSG_CLOEXEC,
+                             &passed, &flags, with_control);
+    if (linux_reference) {
+        CHECK(result == (ssize_t)strlen(expected));
+        CHECK(!memcmp(bytes, expected, strlen(expected)));
+        if (passed >= 0) CHECK(close(passed) == 0);
+    } else {
+        CHECK(result == -1 && errno == EOPNOTSUPP);
+        CHECK(passed == -1);
+    }
+}
+static void records(void) {
+    int fd[2]; char bytes[64] = {0}; pair(fd);
+    CHECK(write(fd[0], "abcdef", 6) == 6);
+    struct iovec output[] = { {"GH", 2}, {"ijk", 3} };
+    CHECK(writev(fd[0], output, 2) == 5);
+    CHECK(read(fd[1], bytes, 3) == 3 && !memcmp(bytes, "abc", 3));
+    struct iovec input[] = { {bytes, 1}, {bytes + 1, sizeof(bytes) - 1} };
+    CHECK(readv(fd[1], input, 2) == 5 && !memcmp(bytes, "GHijk", 5));
+    empty(fd[1]);
+    struct msghdr message = { .msg_iov = output, .msg_iovlen = 2 };
+    CHECK(sendmsg(fd[0], &message, MSG_NOSIGNAL) == 5);
+    message.msg_iov = input; message.msg_iovlen = 2;
+    CHECK(recvmsg(fd[1], &message, 0) == 5 && !memcmp(bytes, "GHijk", 5));
+    CHECK(!(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)));
+    int passed, flags;
+    send_fd(fd[0], "longer", 6, -1);
+    CHECK(receive(fd[1], bytes, 2, 0, &passed, &flags, 0) == 2);
+    CHECK((flags & MSG_TRUNC) && !memcmp(bytes, "lo", 2)); empty(fd[1]);
+    send_fd(fd[0], "longer", 6, -1);
+    CHECK(receive(fd[1], bytes, 2, MSG_TRUNC, &passed, &flags, 0) == 6);
+    CHECK((flags & MSG_TRUNC) && !memcmp(bytes, "lo", 2)); empty(fd[1]);
+    send_fd(fd[0], "peek", 4, -1);
+    check_peek(fd[1], "peek", 0); check_peek(fd[1], "peek", 1);
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 4 && !memcmp(bytes, "peek", 4));
+    empty(fd[1]);
+    CHECK(write(fd[0], "", 0) == 0);
+    struct pollfd pollfd = { fd[1], POLLIN, 0 };
+    CHECK(poll(&pollfd, 1, 0) == 1 && (pollfd.revents & POLLIN));
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 0); empty(fd[1]);
+    close_pair(fd); puts("SEQPACKET records PASS");
+}
+static void rights(void) {
+    int fd[2]; pair(fd);
+    int file = memfd_create("seqpacket-identity", MFD_CLOEXEC); CHECK(file >= 0);
+    CHECK(write(file, "0123456789", 10) == 10 && lseek(file, 2, SEEK_SET) == 2);
+    struct stat original, received; CHECK(fstat(file, &original) == 0);
+    send_fd(fd[0], "rights", 6, file);
+    check_peek(fd[1], "rights", 0); check_peek(fd[1], "rights", 1);
+    char bytes[32]; int passed, flags;
+    CHECK(receive(fd[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC,
+                  &passed, &flags, 1) == 6 && passed >= 0);
+    CHECK(!memcmp(bytes, "rights", 6) && !(flags & (MSG_TRUNC | MSG_CTRUNC)));
+    CHECK(fcntl(passed, F_GETFD) & FD_CLOEXEC);
+    CHECK(fstat(passed, &received) == 0 && original.st_dev == received.st_dev &&
+          original.st_ino == received.st_ino && original.st_size == received.st_size);
+    CHECK(read(passed, bytes, 1) == 1 && bytes[0] == '2');
+    CHECK(lseek(file, 0, SEEK_CUR) == 3);
+    int alias = dup(passed); CHECK(alias >= 0 && !(fcntl(alias, F_GETFD) & FD_CLOEXEC));
+    CHECK(close(file) == 0 && close(passed) == 0);
+    CHECK(read(alias, bytes, 1) == 1 && bytes[0] == '3');
+    /* Omitted ancillary storage must discard rights while consuming the record. */
+    send_fd(fd[0], "discard", 7, alias);
+    CHECK(receive(fd[1], bytes, sizeof(bytes), 0, &passed, &flags, 0) == 7);
+    CHECK((flags & MSG_CTRUNC) && passed == -1); empty(fd[1]);
+    send_fd(fd[0], "truncated", 9, alias);
+    CHECK(receive(fd[1], bytes, 1, MSG_CMSG_CLOEXEC, &passed, &flags, 1) == 1);
+    CHECK((flags & MSG_TRUNC) && passed >= 0); CHECK(close(passed) == 0);
+    CHECK(close(alias) == 0); close_pair(fd);
+    puts("SEQPACKET rights identity CLOEXEC offsets dup PASS");
+}
+static void endpoints(void) {
+    int channel[2], response[2]; pair(channel); pair(response);
+    send_fd(channel[0], "request", 7, response[1]); CHECK(close(response[1]) == 0);
+    char bytes[32]; int endpoint, flags;
+    CHECK(receive(channel[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC,
+                  &endpoint, &flags, 1) == 7 && endpoint >= 0);
+    send_fd(endpoint, "real", 4, -1);
+    /* Firefox keeps the sending endpoint alive in its trailing fake response. */
+    send_fd(endpoint, "fake", 4, endpoint); CHECK(close(endpoint) == 0);
+    CHECK(read(response[0], bytes, sizeof(bytes)) == 4 && !memcmp(bytes, "real", 4));
+    CHECK(receive(response[0], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC,
+                  &endpoint, &flags, 1) == 4 && endpoint >= 0);
+    CHECK(!memcmp(bytes, "fake", 4)); empty(response[0]);
+    CHECK(close(endpoint) == 0); CHECK(read(response[0], bytes, sizeof(bytes)) == 0);
+    CHECK(close(response[0]) == 0); close_pair(channel);
+    puts("SEQPACKET endpoint transfer and queued self-reference PASS");
+}
+static void shutdowns(void) {
+    int fd[2]; pair(fd); char bytes[32];
+    send_fd(fd[0], "before", 6, -1); CHECK(shutdown(fd[0], SHUT_WR) == 0);
+    struct pollfd pollfd = { fd[1], POLLIN | POLLRDHUP, 0 };
+    CHECK(poll(&pollfd, 1, 0) == 1 && (pollfd.revents & POLLIN));
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 6 && !memcmp(bytes, "before", 6));
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 0);
+    CHECK(send(fd[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    send_fd(fd[1], "reverse", 7, -1);
+    CHECK(read(fd[0], bytes, sizeof(bytes)) == 7 && !memcmp(bytes, "reverse", 7));
+    close_pair(fd); pair(fd);
+    CHECK(shutdown(fd[1], SHUT_RD) == 0);
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 0);
+    CHECK(send(fd[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    close_pair(fd); puts("SEQPACKET shutdown EOF NOSIGNAL PASS");
+}
+static void readiness(void) {
+    int fd[2]; pair(fd);
+    struct pollfd p = { fd[0], POLLIN | POLLOUT, 0 };
+    CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLOUT) && !(p.revents & POLLIN));
+    int ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+    struct epoll_event event = { .events = EPOLLIN | EPOLLOUT, .data.u64 = 7 }, result;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == 0);
+    CHECK(epoll_wait(ep, &result, 1, 0) == 1 && result.data.u64 == 7 &&
+          (result.events & EPOLLOUT) && !(result.events & EPOLLIN));
+    send_fd(fd[0], "ready", 5, -1);
+    CHECK(epoll_wait(ep, &result, 1, 0) == 1 && (result.events & EPOLLIN));
+    char bytes[MAX_RECORD + 1]; memset(bytes, 'Q', sizeof(bytes));
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 5); empty(fd[1]);
+    memset(bytes, 'Q', sizeof(bytes));
+    CHECK(send(fd[0], bytes, MAX_RECORD, MSG_NOSIGNAL) == MAX_RECORD);
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == MAX_RECORD);
+    for (unsigned i = 0; i < MAX_RECORD; i++) CHECK(bytes[i] == 'Q');
+    if (!linux_reference) {
+        CHECK(send(fd[0], bytes, sizeof(bytes), MSG_NOSIGNAL) == -1 && errno == EMSGSIZE);
+        empty(fd[1]);
+    }
+    unsigned count;
+    for (count = 0; count < 65536; count++) {
+        ssize_t sent = send(fd[0], bytes, 1, MSG_NOSIGNAL);
+        if (sent < 0) { CHECK(errno == EAGAIN); break; }
+        CHECK(sent == 1);
+    }
+    CHECK(count > 0 && count < 65536);
+    p = (struct pollfd){ fd[0], POLLOUT, 0 };
+    CHECK(poll(&p, 1, 0) == 0);
+    for (unsigned i = 0; i < count; i++) CHECK(read(fd[1], bytes, sizeof(bytes)) == 1);
+    CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLOUT));
+    CHECK(epoll_wait(ep, &result, 1, 0) == 1 && !(result.events & EPOLLIN));
+    CHECK(close(ep) == 0); close_pair(fd);
+    puts("SEQPACKET bounded backpressure poll epoll PASS");
+}
+static void unsupported(void) {
+    if (linux_reference) return;
+    CHECK(socket(AF_UNIX, SOCK_SEQPACKET, 0) == -1 && errno == EOPNOTSUPP);
+    int fd[2]; pair(fd); int value = 8192;
+    CHECK(setsockopt(fd[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == -1 && errno == EOPNOTSUPP);
+    CHECK(setsockopt(fd[0], SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) == -1 && errno == EOPNOTSUPP);
+    value = 1;
+    CHECK(setsockopt(fd[0], SOL_SOCKET, SO_PASSCRED, &value, sizeof(value)) == -1 && errno == EOPNOTSUPP);
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    memcpy(address.sun_path, "seqpacket-unsupported", sizeof("seqpacket-unsupported"));
+    CHECK(bind(fd[0], (struct sockaddr *)&address, sizeof(address)) == -1 && errno == EOPNOTSUPP);
+    CHECK(connect(fd[0], (struct sockaddr *)&address, sizeof(address)) == -1 && errno == EOPNOTSUPP);
+    CHECK(listen(fd[0], 1) == -1 && errno == EOPNOTSUPP);
+    close_pair(fd); puts("SEQPACKET unsupported operations PASS");
+}
+static void fork_exec(const char *self) {
+    int fd[2]; pair(fd);
+    int keep = fcntl(fd[1], F_DUPFD, 100); CHECK(keep >= 100);
+    int cloexec = fcntl(fd[1], F_DUPFD_CLOEXEC, 200); CHECK(cloexec >= 200);
+    send_fd(fd[0], "exec", 4, -1);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        char keep_arg[24], close_arg[24];
+        snprintf(keep_arg, sizeof(keep_arg), "%d", keep);
+        snprintf(close_arg, sizeof(close_arg), "%d", cloexec);
+        execl(self, self, "--exec-check", keep_arg, close_arg, (char *)NULL);
+        perror("seqpacket exec"); _exit(1);
+    }
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char bytes[8]; CHECK(read(fd[0], bytes, sizeof(bytes)) == 5 && !memcmp(bytes, "child", 5));
+    CHECK(close(keep) == 0 && close(cloexec) == 0); close_pair(fd);
+    puts("SEQPACKET fork exec inherited endpoint CLOEXEC PASS");
+}
+int main(int argc, char **argv) {
+    alarm(30);
+    if (argc == 4 && !strcmp(argv[1], "--exec-check")) {
+        int keep = atoi(argv[2]), cloexec = atoi(argv[3]); char bytes[8];
+        CHECK(fcntl(cloexec, F_GETFD) == -1 && errno == EBADF);
+        CHECK(fcntl(keep, F_GETFD) >= 0);
+        CHECK(read(keep, bytes, sizeof(bytes)) == 4 && !memcmp(bytes, "exec", 4));
+        send_fd(keep, "child", 5, -1); CHECK(close(keep) == 0); return 0;
+    }
+    CHECK(argc == 1 || (argc == 2 && !strcmp(argv[1], "--linux-reference")));
+    linux_reference = argc == 2;
+    records(); rights(); endpoints(); shutdowns(); readiness(); unsupported(); fork_exec(argv[0]);
+    puts("SEQPACKET ALL PASS"); return 0;
+}

@@ -1,0 +1,434 @@
+--- a/Makefile
++++ b/Makefile
+@@ -87,7 +87,7 @@
+            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
+            thread.c futex.c vdso.c crash_report.c rosetta.c \
+            gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
+-           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_copy.c hl_atomic.c hl_seccomp.c hl_seccomp_bpf.c hl_status.c)
++           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_seqpacket.c hl_copy.c hl_atomic.c hl_seccomp.c hl_seccomp_bpf.c hl_status.c)
+ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
+            syscall_internal.h syscall_fs.h syscall_io.h \
+            syscall_poll.h syscall_fd.h syscall_inotify.h \
+--- a/src/syscall_net.c
++++ b/src/syscall_net.c
+@@ -16,6 +16,7 @@
+ #include "syscall_internal.h"
+ #include "hl_seals.h"
+ #include "hl_socket.h"
++#include "hl_seqpacket.h"
+ #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
+ #include "syscall_io.h"      /* rosettad_is_socket */
+ #include "syscall_fs.h"      /* hl_fs_open_parent_beneath (rooted confinement) */
+@@ -501,43 +502,9 @@
+     int nonblock = extract_sock_nonblock(type);
+     int cloexec = extract_sock_cloexec(type);
+ 
+-    /* Rosetta uses AF_UNIX SOCK_SEQPACKET to connect to rosettad for AOT
+-     * (ahead-of-time) translation. macOS doesn't support SOCK_SEQPACKET
+-     * for AF_UNIX. Instead, create a socketpair(SOCK_STREAM) and spawn
+-     * our rosettad handler thread on one end. Rosetta gets the other end.
+-     * When rosetta later calls connect(), we return success immediately
+-     * (the socketpair is already connected). */
+-    if (real_type == 5 /* SOCK_SEQPACKET */ && mac_domain == AF_UNIX) {
+-        int pair[2];
+-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0)
+-            return linux_errno();
+-
+-        /* pair[0] = rosetta's end, pair[1] = our handler thread's end */
+-        if (nonblock) {
+-            int fl = fcntl(pair[0], F_GETFL);
+-            if (fl >= 0) fcntl(pair[0], F_SETFL, fl | O_NONBLOCK);
+-        }
+-        if (cloexec) fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+-
+-        int one = 1;
+-        setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+-
+-        int gfd = hl_wc_socket_alloc(pair[0]);
+-        if (gfd < 0) { close(pair[1]); return -LINUX_EMFILE; }
+-
+-        int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
+-        fd_table[gfd].linux_flags = linux_flags_val;
+-
+-        /* Start the rosettad handler thread on pair[1] and track pair[0]
+-         * so connect() can be intercepted. */
+-        rosettad_start_handler(pair[1], pair[0]);
+-
+-        if (g->verbose)
+-            fprintf(stderr, "hl: rosettad: SEQPACKET → socketpair "
+-                    "(client_fd=%d guest=%d, handler_fd=%d)\n",
+-                    pair[0], gfd, pair[1]);
+-        return gfd;
+-    }
++    /* Named seqpacket endpoints need endpoint negotiation. Do not silently
++     * connect an unrelated native stream to the private record protocol. */
++    if (real_type == 5 && mac_domain == AF_UNIX) return -LINUX_EOPNOTSUPP;
+ 
+     int fd = socket(mac_domain, real_type, protocol);
+     if (fd < 0) return linux_errno();
+@@ -572,8 +539,10 @@
+     int nonblock = extract_sock_nonblock(type);
+     int cloexec = extract_sock_cloexec(type);
+ 
++    int seqpacket = mac_domain == AF_UNIX && real_type == 5;
++    if (seqpacket && protocol != 0) return -LINUX_EPROTONOSUPPORT;
+     int fds[2];
+-    if (socketpair(mac_domain, real_type, protocol, fds) < 0)
++    if ((seqpacket ? hl_wc_seqpacket_pair(fds) : socketpair(mac_domain, real_type, protocol, fds)) < 0)
+         return linux_errno();
+ 
+     /* Apply flags */
+@@ -587,12 +556,12 @@
+         setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+     }
+ 
+-    int gfd0 = hl_wc_socket_alloc(fds[0]);
++    int gfd0 = seqpacket ? hl_wc_socket_alloc_seqpacket(fds[0]) : hl_wc_socket_alloc(fds[0]);
+     if (gfd0 < 0) {
+         close(fds[1]);
+         return -LINUX_EMFILE;
+     }
+-    int gfd1 = hl_wc_socket_alloc(fds[1]);
++    int gfd1 = seqpacket ? hl_wc_socket_alloc_seqpacket(fds[1]) : hl_wc_socket_alloc(fds[1]);
+     if (gfd1 < 0) {
+         sys_close(gfd0);
+         return -LINUX_EMFILE;
+@@ -613,6 +582,7 @@
+ }
+ 
+ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
++    if (hl_wc_socket_seqpacket(fd)) return -LINUX_EOPNOTSUPP;
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+@@ -675,6 +645,7 @@
+ }
+ 
+ int64_t sys_listen(int fd, int backlog) {
++    if (hl_wc_socket_seqpacket(fd)) return -LINUX_EOPNOTSUPP;
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+@@ -749,6 +720,7 @@
+ }
+ 
+ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
++    if (hl_wc_socket_seqpacket(fd)) return -LINUX_EOPNOTSUPP;
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+@@ -911,6 +883,14 @@
+     if (!buf && len > 0) return -LINUX_EFAULT;
+     if (len > avail) len = avail;
+ 
++    if (hl_wc_socket_seqpacket(fd)) {
++        if (dest_gva || addrlen) return -LINUX_EOPNOTSUPP;
++        struct iovec iov = { buf, len };
++        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++        ssize_t n = hl_wc_seqpacket_send(host_fd, &msg, translate_msg_flags(linux_flags));
++        if (n < 0) { if (errno == EPIPE && !(linux_flags & 0x4000)) signal_queue(LINUX_SIGPIPE); return linux_errno(); }
++        return n;
++    }
+     int mac_flags = translate_msg_flags(linux_flags);
+     /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE.
+      * macOS has no MSG_NOSIGNAL; we handle it by not queuing SIGPIPE. */
+@@ -984,6 +964,14 @@
+     if (!buf && len > 0) return -LINUX_EFAULT;
+     if (len > avail) len = avail;
+ 
++    if (hl_wc_socket_seqpacket(fd)) {
++        struct iovec iov = { buf, len };
++        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++        ssize_t n = hl_wc_seqpacket_recv(host_fd, &msg, translate_msg_flags(flags), !!(flags & 0x20));
++        if (n < 0) return linux_errno();
++        if (src_gva && addrlen_gva) { uint32_t zero = 0; if (guest_write(g, addrlen_gva, &zero, 4) < 0) return -LINUX_EFAULT; }
++        return n;
++    }
+     int mac_flags = translate_msg_flags(flags);
+ 
+     struct sockaddr_storage mac_sa;
+@@ -1030,6 +1018,11 @@
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
++    /* Native buffer/low-water controls are the shared kernel record quota.
++     * Changing them would invalidate the fixed bound or token readiness. */
++    if (hl_wc_socket_seqpacket(fd) && level == LINUX_SOL_SOCKET &&
++        (optname == 16 || optname == 7 || optname == 8 || optname == 18 || optname == 19 || optname == 32 || optname == 33))
++        return -LINUX_EOPNOTSUPP;
+     if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
+         int32_t enabled;
+         if (optlen < sizeof(enabled)) return -LINUX_EINVAL;
+@@ -1089,6 +1082,7 @@
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
++    if (hl_wc_socket_seqpacket(fd) && level == LINUX_SOL_SOCKET && optname == 17) return -LINUX_EOPNOTSUPP;
+     if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
+         int32_t enabled; uint32_t len;
+         if (guest_read(g, optlen_gva, &len, sizeof(len)) < 0) return -LINUX_EFAULT;
+@@ -1176,7 +1170,7 @@
+     if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
+         && mac_optlen >= (socklen_t)sizeof(int)) {
+         int *type_val = (int *)optval;
+-        *type_val &= 0xF;  /* Keep only the base socket type */
++        *type_val = hl_wc_socket_seqpacket(fd) ? 5 : (*type_val & 0xF);  /* Keep only the base socket type */
+     }
+ 
+     /* SO_ERROR: macOS returns a macOS errno value; translate to Linux. */
+@@ -1234,7 +1228,7 @@
+      * X11 display write path and ordinary AF_UNIX SOCK_STREAM traffic.
+      * Does not handle SCM_RIGHTS (falls through to full path).
+      */
+-    if (msghdr_simple_stream(&lmsg) &&
++    if (!hl_wc_socket_seqpacket(fd) && msghdr_simple_stream(&lmsg) &&
+         (linux_flags & ~MSG_FP_LINUX_OK) == 0) {
+         struct iovec host_iov[64];
+         int iovlen = 0;
+@@ -1306,7 +1300,7 @@
+      *   macOS:  cmsg_len=16, msg_controllen=16
+      */
+     uint8_t linux_ctrl[512];   /* Linux-format control from guest */
+-    uint8_t mac_ctrl[256];     /* macOS-format control for host sendmsg */
++    uint8_t mac_ctrl[1024];     /* macOS-format control for host sendmsg */
+     uint8_t *ctrl_ptr = NULL;
+     socklen_t ctrl_len = 0;
+ 
+@@ -1410,7 +1404,7 @@
+         .msg_flags = 0,
+     };
+ 
+-    ssize_t ret = sendmsg(host_fd, &msg, mac_flags);
++    ssize_t ret = hl_wc_socket_seqpacket(fd) ? hl_wc_seqpacket_send(host_fd, &msg, mac_flags) : sendmsg(host_fd, &msg, mac_flags);
+     int send_errno = errno;
+     unix_confine_end(&cf);
+     if (ret < 0) {
+@@ -1430,9 +1424,10 @@
+     if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
+     int host_fd = socket_ref.host_fd;
+ 
++    int seqpacket = hl_wc_socket_seqpacket(fd);
+     int passcred = hl_wc_socket_enabled(socket_ref.of);
+-    hl_wc_ucred peer;
+-    if (passcred && hl_wc_socket_peer(host_fd, &peer) < 0) return linux_errno();
++    hl_wc_ucred peer = {0};
++    if (passcred && !seqpacket && hl_wc_socket_peer(host_fd, &peer) < 0) return linux_errno();
+     linux_msghdr_t lmsg;
+     if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
+         return -LINUX_EFAULT;
+@@ -1443,6 +1438,7 @@
+     if ((flags & 2) && lmsg.msg_control && lmsg.msg_controllen)
+         return -LINUX_EOPNOTSUPP;
+ 
++    if (seqpacket && (flags & 2)) return -LINUX_EOPNOTSUPP;
+     int mac_flags = translate_msg_flags(flags);
+ 
+     /*
+@@ -1450,7 +1446,7 @@
+      * Dominant path for X11 display sockets under GTK (idle EAGAIN storm
+      * and event reads). SCM_RIGHTS / PEEK / OOB take the full path below.
+      */
+-    if (!passcred && msghdr_simple_stream(&lmsg) &&
++    if (!seqpacket && !passcred && msghdr_simple_stream(&lmsg) &&
+         (flags & ~MSG_FP_LINUX_OK) == 0) {
+         struct iovec host_iov[64];
+         int iovlen = 0;
+@@ -1499,7 +1495,7 @@
+      * macOS cmsghdr is 12 bytes, Linux is 16 bytes — we must
+      * translate from macOS format back to Linux format before
+      * writing to guest memory. */
+-    uint8_t mac_ctrl[256];
++    uint8_t mac_ctrl[1024];
+     socklen_t ctrl_alloc = 0;
+ 
+     if (lmsg.msg_control && lmsg.msg_controllen > 0) {
+@@ -1516,7 +1512,7 @@
+         .msg_flags = 0,
+     };
+ 
+-    ssize_t ret = recvmsg(host_fd, &msg, mac_flags);
++    ssize_t ret = seqpacket ? hl_wc_seqpacket_recv(host_fd, &msg, mac_flags, !!(flags & 0x20)) : recvmsg(host_fd, &msg, mac_flags);
+     if (ret < 0) return linux_errno();
+ 
+     /* Write back source address to guest */
+@@ -1560,8 +1556,8 @@
+             const void *data_src = CMSG_DATA(cmsg);
+             if (rights) {
+                 if (data_len % sizeof(int) || data_len / sizeof(int) > 64) return -LINUX_EIO;
+-                if (hl_wc_socket_receive(host_fd, CMSG_DATA(cmsg), (unsigned)(data_len / sizeof(int)),
+-                    received_fds, &received_count) < 0) return linux_errno();
++                if (hl_wc_socket_receive(host_fd, (int *)CMSG_DATA(cmsg), (unsigned)(data_len / sizeof(int)),
++                    received_fds, &received_count, !!(flags & 0x40000000)) < 0) return linux_errno();
+                 for (unsigned i = 0; i < received_count; i++) {
+                     if (received.count == 64) {
+                         for (unsigned j = i; j < received_count; j++) sys_close(received_fds[j]);
+@@ -1571,14 +1567,26 @@
+                 }
+                 data_len = received_count * sizeof(int);
+                 data_src = received_fds;
+-                for (unsigned i = 0; i < received_count; i++)
+-                    if (flags & 0x40000000) fd_table[received_fds[i]].linux_flags |= LINUX_O_CLOEXEC;
+             }
+             if (data_len > sizeof(linux_ctrl) - 16) return -LINUX_EIO;
++            if (rights) {
++                size_t room = lpos <= lmsg.msg_controllen ? lmsg.msg_controllen - lpos : 0;
++                if (room > sizeof(linux_ctrl) - lpos) room = sizeof(linux_ctrl) - lpos;
++                unsigned fit = room >= 16 ? (unsigned)((room - 16) / sizeof(int)) : 0;
++                if (fit < received_count) {
++                    for (unsigned i = fit; i < received_count; i++) sys_close(received_fds[i]);
++                    received.count -= received_count - fit;
++                    received_count = fit; data_len = fit * sizeof(int);
++                    lmsg.msg_flags |= LINUX_MSG_CTRUNC;
++                }
++                if (!received_count) continue;
++            }
+             /* Linux CMSG_LEN = 16 + data_len */
+             uint64_t lcmsg_len = 16 + data_len;
+             /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */
+             size_t lcmsg_space = (size_t)((lcmsg_len + 7) & ~7ULL);
++            if (rights && lpos + lcmsg_len <= lmsg.msg_controllen && lpos + lcmsg_space > lmsg.msg_controllen)
++                lcmsg_space = (size_t)lcmsg_len;
+ 
+             /* No room in the guest's control buffer. Linux reports
+              * MSG_CTRUNC; and any SCM_RIGHTS fds in the part we drop must
+--- a/src/syscall_io.c
++++ b/src/syscall_io.c
+@@ -1,3 +1,4 @@
++#include "hl_seqpacket.h"
+ #include "hl_shared.h"
+ /* syscall_io.c — Core I/O syscall handlers for hl
+  *
+@@ -294,7 +295,14 @@
+     int host_fd = guard.fd;
+ 
+     /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
+-    if (count == 0) return 0;
++    if (count == 0) {
++        if (hl_wc_socket_seqpacket(fd)) {
++            struct iovec empty = { NULL, 0 };
++            ssize_t result = hl_wc_seqpacket_io(host_fd, &empty, 1, 1);
++            if (result < 0) { if (errno == EPIPE) signal_queue(LINUX_SIGPIPE); return linux_errno(); }
++        }
++        return 0;
++    }
+ 
+     /* Resolve buffer and cap count to available contiguous guest bytes.
+      * guest_ptr_avail returns the host pointer and remaining bytes in
+@@ -305,7 +313,8 @@
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+-    ssize_t ret = hl_wc_write(host_fd, buf, count);
++    struct iovec record_iov = { buf, count };
++    ssize_t ret = hl_wc_socket_seqpacket(fd) ? hl_wc_seqpacket_io(host_fd, &record_iov, 1, 1) : hl_wc_write(host_fd, buf, count);
+     if (ret < 0) {
+         int saved_errno = errno;
+         if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+@@ -354,7 +363,8 @@
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+-    ssize_t ret = read(host_fd, buf, count);
++    struct iovec record_iov = { buf, count };
++    ssize_t ret = hl_wc_socket_seqpacket(fd) ? hl_wc_seqpacket_io(host_fd, &record_iov, 1, 0) : read(host_fd, buf, count);
+     return ret < 0 ? linux_errno() : ret;
+ }
+ 
+@@ -485,7 +495,7 @@
+     int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 1);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = readv(host_fd, host_iov, iovcnt);
++    ssize_t ret = hl_wc_socket_seqpacket(fd) ? hl_wc_seqpacket_io(host_fd, host_iov, iovcnt, 0) : readv(host_fd, host_iov, iovcnt);
+     return ret < 0 ? linux_errno() : ret;
+ }
+ 
+@@ -549,7 +559,7 @@
+     int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 0);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = hl_wc_writev(host_fd, host_iov, iovcnt);
++    ssize_t ret = hl_wc_socket_seqpacket(fd) ? hl_wc_seqpacket_io(host_fd, host_iov, iovcnt, 1) : hl_wc_writev(host_fd, host_iov, iovcnt);
+     if (ret < 0) {
+         int saved_errno = errno;
+         if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+@@ -1204,6 +1214,9 @@
+ /* VZ ioctl constants: centralized in rosetta.h */
+ 
+ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
++    /* FIONBIO is safe on the actual token socket. Raw FIONREAD and other
++     * byte-oriented socket ioctls must not expose private token lengths. */
++    if (hl_wc_socket_seqpacket(fd) && request != 0x5421) return -LINUX_EOPNOTSUPP;
+     /* Typed open-file ops before generic Darwin ioctl translation.
+      * Synthetic devices (OSS) must not see Linux request codes on host. */
+     {
+--- a/src/fd_object.c
++++ b/src/fd_object.c
+@@ -206,25 +206,20 @@
+ int hl_fd_install(hl_open_file_t *of, int host_fd, uint32_t fd_flags) {
+     if (!of) return -1;
+     int type = of->kind;
+-    int gfd = fd_alloc(type, host_fd);
+-    if (gfd < 0) {
+-        hl_open_file_release(of);
+-        if (host_fd >= 0 && type != FD_STDIO) close(host_fd);
+-        return -1;
+-    }
+     hl_descriptor_t *d = hl_descriptor_create(of, host_fd, fd_flags, type, NULL);
+     if (!d) {
+-        /* of already owned by failed path — release via close path */
+-        fd_mark_closed(gfd);
+         hl_open_file_release(of);
+         if (host_fd >= 0 && type != FD_STDIO) close(host_fd);
+         return -1;
+     }
+-    pthread_mutex_lock(&fd_lock);
+-    fd_table[gfd].desc = d;
+-    fd_table[gfd].of = of;
+-    hl_fd_sync_legacy(gfd);
+-    pthread_mutex_unlock(&fd_lock);
++    /* Publish descriptor, protocol state and CLOEXEC together. A legacy
++     * fd_alloc() publication before descriptor construction exposes a raw
++     * transport socket to another guest thread guessing the new fd. */
++    int gfd = fd_alloc_descriptor(d);
++    if (gfd < 0) {
++        hl_descriptor_release(d); errno = EMFILE; return -1;
++    }
++
+ 
+     if (hl_trace_on(HL_TRACE_FD))
+         hl_trace(HL_TRACE_FD, "install gfd=%d kind=%d host_fd=%d of=%llu",
+--- a/src/fd_object.h
++++ b/src/fd_object.h
+@@ -160,6 +160,7 @@
+ 
+ /* Install: takes ownership of one open-file ref and host_fd. */
+ int hl_fd_install(hl_open_file_t *of, int host_fd, uint32_t fd_flags);
++int fd_alloc_descriptor(hl_descriptor_t *descriptor);
+ int hl_fd_install_at(int guest_fd, hl_open_file_t *of,
+                      int host_fd, uint32_t fd_flags, bool replace);
+ 
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -183,6 +183,21 @@
+     return fd;
+ }
+ 
++/* Publish a complete refcounted descriptor, protocol state and flags in
++ * one guest-table transaction while retaining the normal bitmap allocator. */
++int fd_alloc_descriptor(hl_descriptor_t *descriptor) {
++    pthread_mutex_lock(&fd_lock);
++    int fd = fd_bitmap_find_free(0);
++    if (fd >= 0) {
++        fd_bitmap_set_used(fd);
++        fd_table[fd].desc = descriptor;
++        fd_table[fd].of = descriptor->of;
++        hl_fd_sync_legacy(fd);
++    }
++    pthread_mutex_unlock(&fd_lock);
++    return fd;
++}
++
+ /* Allocate the lowest available FD >= minfd. Returns -1 if none available. */
+ int fd_alloc_from(int minfd, int type, int host_fd) {
+     pthread_mutex_lock(&fd_lock);

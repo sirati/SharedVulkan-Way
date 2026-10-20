@@ -18,9 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 #define ATTR HL_WC_XATTR_PREFIX "socket.v1"
 #define MAGIC UINT64_C(0x5743534f434b3031)
-typedef struct { uint64_t magic; _Atomic uint32_t passcred; } shared_option;
+typedef struct { uint64_t magic; _Atomic uint32_t passcred; _Atomic uint32_t seqpacket; } shared_option;
 typedef struct { int fd; shared_option *option; } socket_state;
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int stream_socket(int fd) {
@@ -50,10 +51,11 @@ int hl_wc_socket_same_runtime(int fd) {
         a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 int hl_wc_socket_is_state(int fd) {
-    uint64_t magic = 0;
+    uint64_t magic = 0, contents = 0;
     struct stat st;
     return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
-        st.st_size == sizeof(shared_option) &&
+        st.st_nlink == 0 && (st.st_mode & 0777) == 0 && st.st_size == sizeof(shared_option) &&
+        pread(fd, &contents, sizeof(contents), 0) == sizeof(contents) && contents == MAGIC &&
         fgetxattr(fd, ATTR, &magic, sizeof(magic), 0, 0) == sizeof(magic) && magic == MAGIC;
 }
 static socket_state *adopt(int fd) {
@@ -77,12 +79,10 @@ int hl_wc_socket_set(int fd, int enabled) {
     pthread_mutex_lock(&state_lock);
     socket_state *s = ref.of ? ref.of->socket_state : NULL;
     if (!s) {
-        char path[] = "/tmp/hl-socket-option.XXXXXXXX";
-        int backing = mkstemp(path);
+        int backing = hl_wc_socket_private_file();
         if (backing >= 0) {
-            unlink(path);
             uint64_t magic = MAGIC;
-            if (fchmod(backing, 0600) == 0 && ftruncate(backing, sizeof(shared_option)) == 0 &&
+            if (ftruncate(backing, sizeof(shared_option)) == 0 &&
                 fsetxattr(backing, ATTR, &magic, sizeof(magic), 0, XATTR_CREATE) == 0) {
                 s = adopt(backing);
                 if (s) { s->option->magic = MAGIC; ref.of->socket_state = s; }
@@ -169,25 +169,35 @@ int hl_wc_socket_transfer(int channel, const int *guest, unsigned count,
     }
     *out = n; return 0;
 }
-int hl_wc_socket_receive(int channel, int *native, unsigned count, int *guest, unsigned *out) {
+static int alloc_socket(int, int, int);
+int hl_wc_socket_receive(int channel, int *native, unsigned count, int *guest, unsigned *out, int cloexec) {
     unsigned n = 0;
-    int last_socket = -1;
     for (unsigned i = 0; i < count; i++) {
         int fd = native[i]; native[i] = -1;
-        if (hl_wc_socket_is_state(fd)) {
-            int rc = last_socket >= 0 && hl_wc_socket_same_runtime(channel)
-                ? hl_wc_socket_import(last_socket, fd) : -1;
-            close(fd); last_socket = -1;
-            if (rc < 0) goto fail;
-            continue;
-        }
+        if (hl_wc_socket_is_state(fd)) { close(fd); goto fail; }
         int type; socklen_t len = sizeof(type);
         int is_socket = getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0;
-        int gfd = is_socket ? hl_wc_socket_alloc(fd) : fd_alloc(FD_REGULAR, fd);
-        if (gfd < 0) { if (!is_socket) close(fd); goto fail; }
-        if (!is_socket && hl_wc_memfd_restore(gfd) < 0) { sys_close(gfd); goto fail; }
+        if (fcntl(fd, F_SETFD, cloexec ? FD_CLOEXEC : 0) < 0) { close(fd); goto fail; }
+        int gfd;
+        if (is_socket) {
+            int backing = -1;
+            if (i + 1 < count && hl_wc_socket_is_state(native[i + 1])) {
+                if (!hl_wc_socket_same_runtime(channel)) { close(fd); goto fail; }
+                backing = native[++i]; native[i] = -1;
+            }
+            gfd = alloc_socket(fd, 0, backing);
+            if (backing >= 0) close(backing);
+        }
+        else {
+            int native_flags = fcntl(fd, F_GETFL);
+            if (native_flags < 0) { close(fd); goto fail; }
+            hl_open_file_t *of = hl_open_file_create(FD_REGULAR, &hl_fd_ops_host_file, mac_to_linux_status_flags(native_flags), NULL);
+            if (!of) { close(fd); goto fail; }
+            if (hl_wc_memfd_adopt(of, fd) < 0) { hl_open_file_release(of); close(fd); goto fail; }
+            gfd = hl_fd_install(of, fd, cloexec ? LINUX_O_CLOEXEC : 0);
+        }
+        if (gfd < 0) goto fail;
         guest[n++] = gfd;
-        last_socket = is_socket ? gfd : -1;
     }
     *out = n; return 0;
 fail:
@@ -196,19 +206,37 @@ fail:
     errno = EINVAL; return -1;
 }
 
-int hl_wc_socket_alloc(int native) {
+static socket_state *new_state(void) {
+    int backing = hl_wc_socket_private_file();
+    if (backing < 0) return NULL;
+    uint64_t magic = MAGIC;
+    socket_state *state = NULL;
+    if (ftruncate(backing, sizeof(shared_option)) == 0 &&
+        fsetxattr(backing, ATTR, &magic, sizeof(magic), 0, XATTR_CREATE) == 0) {
+        state = adopt(backing);
+        if (state) state->option->magic = MAGIC;
+    }
+    int saved = errno; close(backing); errno = saved; return state;
+}
+static int alloc_socket(int native, int seqpacket, int backing) {
     hl_open_file_t *of = hl_open_file_create(FD_SOCKET, &hl_fd_ops_host_file, 0, NULL);
     if (!of) { close(native); return -1; }
     int flags = fcntl(native, F_GETFL);
-    atomic_store(&of->status_flags, flags >= 0 && (flags & O_NONBLOCK) ? LINUX_O_NONBLOCK : 0);
-    int cloexec = fcntl(native, F_GETFD);
-    int fd = hl_fd_install(of, native, cloexec >= 0 && (cloexec & FD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
-    if (fd < 0) return -1;
-    if (stream_socket(native) == 0 && hl_wc_socket_set(fd, 0) < 0) {
-        sys_close(fd); return -1;
+    if (flags < 0) { hl_open_file_release(of); close(native); return -1; }
+    atomic_store(&of->status_flags, mac_to_linux_status_flags(flags));
+    if (stream_socket(native) == 0) {
+        socket_state *s = backing >= 0 ? adopt(backing) : new_state();
+        if (!s) { hl_open_file_release(of); close(native); return -1; }
+        of->socket_state = s;
+        if (seqpacket) atomic_store(&s->option->seqpacket, 1);
+    } else if (seqpacket || backing >= 0) {
+        hl_open_file_release(of); close(native); errno = EINVAL; return -1;
     }
-    return fd;
+    int cloexec = fcntl(native, F_GETFD);
+    return hl_fd_install(of, native, cloexec >= 0 && (cloexec & FD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
 }
+int hl_wc_socket_alloc(int native) { return alloc_socket(native, 0, -1); }
+int hl_wc_socket_alloc_seqpacket(int native) { return alloc_socket(native, 1, -1); }
 
 void hl_wc_socket_received_end(hl_wc_socket_transfers *t) {
     for (unsigned i = 0; i < t->count; i++) if (t->fds[i] >= 0) sys_close(t->fds[i]);
@@ -220,4 +248,32 @@ int hl_wc_socket_enabled(hl_open_file_t *of) {
     int enabled = s ? atomic_load_explicit(&s->option->passcred, memory_order_acquire) : 0;
     pthread_mutex_unlock(&state_lock);
     return enabled;
+}
+
+int hl_wc_socket_seqpacket(int fd) {
+    hl_fd_ref_t ref;
+    if (hl_fd_get(fd, &ref) < 0) return 0;
+    pthread_mutex_lock(&state_lock);
+    socket_state *s = ref.of ? ref.of->socket_state : NULL;
+    int result = s && atomic_load_explicit(&s->option->seqpacket, memory_order_acquire);
+    pthread_mutex_unlock(&state_lock);
+    hl_fd_put(&ref); return result;
+}
+
+/* Mode zero at creation closes the mkstemp-before-unlink pathname race.
+ * The seqpacket caller refuses native root, which bypasses inode checks.
+ * Guest fd tables never
+ * expose these fds. No writable pathname alias exists after unlink. */
+int hl_wc_socket_private_file(void) {
+    char path[96];
+    for (unsigned attempt = 0; attempt < 16; attempt++) {
+        uint64_t random[2]; arc4random_buf(random, sizeof(random));
+        snprintf(path, sizeof(path), "/tmp/hl-private-%016llx%016llx",
+            (unsigned long long)random[0], (unsigned long long)random[1]);
+        int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0);
+        if (fd < 0) { if (errno == EEXIST) continue; return -1; }
+        if (unlink(path) < 0) { int saved = errno; close(fd); errno = saved; return -1; }
+        return fd;
+    }
+    errno = EEXIST; return -1;
 }
