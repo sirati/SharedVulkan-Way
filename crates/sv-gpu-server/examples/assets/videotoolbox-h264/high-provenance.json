@@ -1,0 +1,361 @@
+{
+  "generator": "generate_high.py",
+  "input_sha256": "7dc8aaaddd72332e4444dbbacfb1b6148d58f8d745f105f07483f2e30c1b6506",
+  "input_frame_y": [
+    40,
+    120,
+    120
+  ],
+  "input_cb": 80,
+  "input_cr": 180,
+  "encoder_command": [
+    "/nix/store/i5dzymmqgcc1qw90pqnpalj24m66iqik-ffmpeg-full-8.0.1-bin/bin/ffmpeg",
+    "-hide_banner",
+    "-loglevel",
+    "info",
+    "-f",
+    "rawvideo",
+    "-pixel_format",
+    "yuv420p",
+    "-video_size",
+    "64x64",
+    "-framerate",
+    "25",
+    "-i",
+    "pipe:0",
+    "-frames:v",
+    "3",
+    "-an",
+    "-c:v",
+    "libx264",
+    "-profile:v",
+    "high",
+    "-level:v",
+    "1.0",
+    "-preset",
+    "medium",
+    "-x264-params",
+    "keyint=250:min-keyint=250:scenecut=0:bframes=0:ref=1:qp=12:threads=1:lookahead-threads=1:8x8dct=1:cabac=1:aud=1:repeat-headers=1:force-cfr=1:slices=1:weightp=0",
+    "-f",
+    "h264",
+    "pipe:1"
+  ],
+  "ffmpeg_version": "ffmpeg version 8.0.1 Copyright (c) 2000-2025 the FFmpeg developers\nbuilt with gcc 15.2.0 (GCC)\nconfiguration: --disable-static --prefix=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1 --target_os=linux --arch=x86_64 --pkg-config=pkg-config --enable-gpl --enable-version3 --disable-nonfree --disable-static --enable-shared --enable-pic --disable-thumb --disable-small --enable-runtime-cpudetect --enable-gray --enable-swscale-alpha --enable-hardcoded-tables --enable-safe-bitstream-reader --enable-pthreads --disable-w32threads --disable-os2threads --enable-network --enable-pixelutils --datadir=/nix/store/dz3fn8jhqxj278bix80j4dc1k1rlnj41-ffmpeg-full-8.0.1-data/share/ffmpeg --enable-ffmpeg --enable-ffplay --enable-ffprobe --bindir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1-bin/bin --enable-avcodec --enable-avdevice --enable-avfilter --enable-avformat --enable-avutil --enable-swresample --enable-swscale --libdir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1-lib/lib --incdir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1-dev/include --enable-doc --enable-htmlpages --enable-manpages --mandir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1-man/share/man --enable-podpages --enable-txtpages --docdir=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-ffmpeg-full-8.0.1-doc/share/doc/ffmpeg --enable-alsa --enable-amf --enable-libaom --enable-libaribb24 --enable-libaribcaption --enable-libass --enable-avisynth --enable-libbluray --enable-libbs2b --enable-bzlib --enable-libcaca --enable-libcdio --enable-libcelt --enable-chromaprint --enable-libcodec2 --enable-cuda --enable-cuda-llvm --disable-cuda-nvcc --enable-cuvid --enable-libdav1d --enable-libdavs2 --enable-libdc1394 --enable-libdrm --enable-libdvdnav --enable-libdvdread --disable-libfdk-aac --enable-ffnvcodec --enable-libflite --enable-fontconfig --enable-libfontconfig --enable-libfreetype --enable-frei0r --enable-libfribidi --enable-libgme --enable-gmp --enable-gnutls --enable-libgsm --enable-libharfbuzz --enable-iconv --enable-libilbc --enable-libjack --enable-libjxl --enable-libkvazaar --enable-ladspa --enable-liblc3 --enable-liblcevc-dec --enable-lcms2 --enable-lzma --disable-metal --disable-libmfx --enable-libmodplug --enable-libmp3lame --enable-libmysofa --disable-libnpp --enable-nvdec --enable-nvenc --enable-openal --enable-liboapv --enable-opencl --enable-libopencore-amrnb --enable-libopencore-amrwb --enable-opengl --enable-libopenh264 --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-libplacebo --enable-libpulse --enable-libqrencode --enable-libquirc --enable-librav1e --enable-librist --disable-librtmp --enable-librubberband --enable-libsmbclient --enable-sdl2 --enable-libshaderc --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libsrt --enable-libssh --enable-librsvg --enable-libsvtav1 --disable-libtensorflow --enable-libtheora --enable-libtwolame --enable-libuavs3d --enable-libv4l2 --enable-v4l2-m2m --enable-vaapi --enable-vdpau --enable-libvpl --enable-libvidstab --enable-libvmaf --enable-libvo-amrwbenc --enable-libvorbis --enable-libvpx --enable-vulkan --enable-libvvenc --enable-libwebp --enable-whisper --enable-libx264 --enable-libx265 --enable-libxavs --enable-libxavs2 --enable-libxcb --enable-libxcb-shape --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxevd --enable-libxeve --enable-xlib --enable-libxml2 --enable-libxvid --enable-libzimg --enable-zlib --enable-libzmq --enable-libzvbi --disable-debug --enable-optimizations --disable-extra-warnings --disable-stripping\nlibavutil      60.  8.100 / 60.  8.100\nlibavcodec     62. 11.100 / 62. 11.100\nlibavformat    62.  3.100 / 62.  3.100\nlibavdevice    62.  1.100 / 62.  1.100\nlibavfilter    11.  4.100 / 11.  4.100\nlibswscale      9.  1.100 /  9.  1.100\nlibswresample   6.  1.100 /  6.  1.100\n\nExiting with exit code 0\n",
+  "cases": [
+    {
+      "name": "cavlc-pcm",
+      "file": "original-high-cavlc-pcm-64x64.h264",
+      "sha256": "e1ead65995d07ae1ac300b14b1ee7a93cd167541b5c747bf7fc29599f07b0466",
+      "headers": [
+        {
+          "type": 7,
+          "range": [
+            0,
+            12
+          ],
+          "payload_range": [
+            4,
+            12
+          ],
+          "sha256": "261f1b7a5273c9705e162bafad9a0ac0d0060f307eb3ad203ca52482ee239fa9",
+          "payload_sha256": "c096b48bd59e3ea1088da2e2e8057c27b3ce9ca25395062a585a7fb8a1d0d378",
+          "payload_hex": "6764000aace84264",
+          "syntax": {
+            "profile_idc": 100,
+            "constraint_and_reserved_bits": 0,
+            "level_idc": 10,
+            "sps_id": 0,
+            "chroma_format_idc": 1,
+            "bit_depth_luma_minus8": 0,
+            "bit_depth_chroma_minus8": 0,
+            "qpprime_y_zero_transform_bypass_flag": 0,
+            "log2_max_frame_num_minus4": 0,
+            "pic_order_cnt_type": 0,
+            "log2_max_pic_order_cnt_lsb_minus4": 0,
+            "max_num_ref_frames": 1,
+            "gaps_allowed": 0,
+            "pic_width_in_mbs_minus1": 3,
+            "pic_height_in_map_units_minus1": 3,
+            "direct_8x8_inference_flag": 1,
+            "frame_cropping_flag": 0,
+            "vui_present": 0,
+            "std_canonical_sps_hex": "6764000aace84264",
+            "std_canonical_sps_sha256": "c096b48bd59e3ea1088da2e2e8057c27b3ce9ca25395062a585a7fb8a1d0d378",
+            "original_sps_sha256": "c096b48bd59e3ea1088da2e2e8057c27b3ce9ca25395062a585a7fb8a1d0d378",
+            "canonical_difference_scope": "byte-exact"
+          }
+        },
+        {
+          "type": 8,
+          "range": [
+            12,
+            20
+          ],
+          "payload_range": [
+            16,
+            20
+          ],
+          "sha256": "ba7020b97126f3ab9406eae0c10b45afd6d2d1fd3d6f408c1c9501893df2d0fe",
+          "payload_sha256": "bdf30851baee12139152ec7c8447a896d01e1a84bcc96b237f0268ba0b4d1053",
+          "payload_hex": "68ce3c80"
+        }
+      ],
+      "access_units": [
+        {
+          "type": 5,
+          "range": [
+            20,
+            6204
+          ],
+          "payload_range": [
+            24,
+            6204
+          ],
+          "sha256": "eca9e412f812f9438fa76fa8fb9ee42056299c4fb2ba0ae10b5c93d39c12cebf",
+          "payload_sha256": "b9088d061c6f8977b1135204c7961caf5592872a0f968a89f90faa2a5cb2f848"
+        },
+        {
+          "type": 1,
+          "range": [
+            6204,
+            12388
+          ],
+          "payload_range": [
+            6208,
+            12388
+          ],
+          "sha256": "d823574b085ec2c64dcbc7892c9e2ab41c7b147ba9d1db6fb1f4d3d63d37e653",
+          "payload_sha256": "bcc3457fa728cf85796750119eb4b13d287cf54e2dab6743fc36db5aab889317"
+        }
+      ],
+      "oracle_file": "original-high-cavlc-pcm-64x64.yuv",
+      "oracle_sha256": "2183af066bff165a50afbb9b1e2d4d31f4ea8eb34efd2ecbe166f7d35f0488c0",
+      "frames": [
+        {
+          "sha256": "75c843219a4c3f5565e480f9c6fbb89f5a3c1e8408ec2bb072c89fc0bf9bb259",
+          "unique_y_cb_cr": [
+            [
+              40
+            ],
+            [
+              80
+            ],
+            [
+              180
+            ]
+          ]
+        },
+        {
+          "sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+          "unique_y_cb_cr": [
+            [
+              120
+            ],
+            [
+              80
+            ],
+            [
+              180
+            ]
+          ]
+        }
+      ],
+      "decode_command": [
+        "/nix/store/i5dzymmqgcc1qw90pqnpalj24m66iqik-ffmpeg-full-8.0.1-bin/bin/ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-err_detect",
+        "explode",
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rawvideo",
+        "pipe:1"
+      ],
+      "decode_stderr": ""
+    },
+    {
+      "name": "cabac",
+      "file": "original-high-cabac-64x64.h264",
+      "sha256": "ed721946137d11ea4dc99d662f7e7791b3deb22c5fbcb1357db50378af453205",
+      "headers": [
+        {
+          "type": 7,
+          "range": [
+            6,
+            31
+          ],
+          "payload_range": [
+            10,
+            31
+          ],
+          "sha256": "36bb35e9d3147d951c7a818403dc4286b490a0f27417d73edbd90261fd76554c",
+          "payload_sha256": "41d175d0e9053cfb249c216f91a88482d55d80d873688069f6603b441f84e682",
+          "payload_hex": "6764000aacb4213420000003002000000651e244d4",
+          "syntax": {
+            "profile_idc": 100,
+            "constraint_and_reserved_bits": 0,
+            "level_idc": 10,
+            "sps_id": 0,
+            "chroma_format_idc": 1,
+            "bit_depth_luma_minus8": 0,
+            "bit_depth_chroma_minus8": 0,
+            "qpprime_y_zero_transform_bypass_flag": 0,
+            "log2_max_frame_num_minus4": 0,
+            "pic_order_cnt_type": 2,
+            "max_num_ref_frames": 1,
+            "gaps_allowed": 0,
+            "pic_width_in_mbs_minus1": 3,
+            "pic_height_in_map_units_minus1": 3,
+            "direct_8x8_inference_flag": 1,
+            "frame_cropping_flag": 0,
+            "vui_present": 1,
+            "timing": [
+              1,
+              50,
+              1
+            ],
+            "bitstream_restriction_flag": 1,
+            "std_omitted_vui_bounds": [
+              1,
+              0,
+              0,
+              8,
+              8
+            ],
+            "max_num_reorder_frames": 0,
+            "max_dec_frame_buffering": 1,
+            "std_canonical_sps_hex": "6764000aacb4213420000003002000000651e1108d40",
+            "std_canonical_sps_sha256": "c2f7b44b8d820f8e94b2a7b7dbcde29ae6827f5c2f4564408fac56cf1e1a4cd8",
+            "original_sps_sha256": "41d175d0e9053cfb249c216f91a88482d55d80d873688069f6603b441f84e682",
+            "canonical_difference_scope": "only StdVideo-omitted VUI restriction bounds"
+          }
+        },
+        {
+          "type": 8,
+          "range": [
+            31,
+            41
+          ],
+          "payload_range": [
+            35,
+            41
+          ],
+          "sha256": "fa6ce61bb1eda828b5553e6a6055372833c8129aaf0923520bde0d14cc7e8575",
+          "payload_sha256": "e0b57ecc6abbc59fa2312a365010b2f7556b16a03dd6f01145c40c41fafee998",
+          "payload_hex": "68ee03b2c8b0"
+        }
+      ],
+      "access_units": [
+        {
+          "type": 5,
+          "range": [
+            603,
+            643
+          ],
+          "payload_range": [
+            606,
+            643
+          ],
+          "sha256": "b33a804056e96086996db8a2a542ed9196111c9f7432542926852b7121f010e9",
+          "payload_sha256": "70f1888c4dc4df1a450fd0cfb4ae3c857e6e8455087f7ed220f24f594c43c324"
+        },
+        {
+          "type": 1,
+          "range": [
+            649,
+            687
+          ],
+          "payload_range": [
+            652,
+            687
+          ],
+          "sha256": "ce5a51a1909ef7cb02e4364fcb483df1bb71245d7b6d73a6e34c1a06d07c29a9",
+          "payload_sha256": "d1dfaa2eca3b5773e49032967396738c829d9d88a289fea47a139928786bf66a"
+        },
+        {
+          "type": 1,
+          "range": [
+            693,
+            704
+          ],
+          "payload_range": [
+            696,
+            704
+          ],
+          "sha256": "8fb291bc1fae9bb165d0560739ebda077d17964d45bdbbe4effafe273fbd56d1",
+          "payload_sha256": "ee5fa63bfaf69b220d8d39e670b7d6f574a0aaff9e8a9662cfb3a95d2d7c0525"
+        }
+      ],
+      "oracle_file": "original-high-cabac-64x64.yuv",
+      "oracle_sha256": "7dc8aaaddd72332e4444dbbacfb1b6148d58f8d745f105f07483f2e30c1b6506",
+      "frames": [
+        {
+          "sha256": "75c843219a4c3f5565e480f9c6fbb89f5a3c1e8408ec2bb072c89fc0bf9bb259",
+          "unique_y_cb_cr": [
+            [
+              40
+            ],
+            [
+              80
+            ],
+            [
+              180
+            ]
+          ]
+        },
+        {
+          "sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+          "unique_y_cb_cr": [
+            [
+              120
+            ],
+            [
+              80
+            ],
+            [
+              180
+            ]
+          ]
+        },
+        {
+          "sha256": "3c5b27ea013a1cdf9c687cb511f85f9bed552ef73d7900833217048aa63d3001",
+          "unique_y_cb_cr": [
+            [
+              120
+            ],
+            [
+              80
+            ],
+            [
+              180
+            ]
+          ]
+        }
+      ],
+      "decode_command": [
+        "/nix/store/i5dzymmqgcc1qw90pqnpalj24m66iqik-ffmpeg-full-8.0.1-bin/bin/ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-err_detect",
+        "explode",
+        "-f",
+        "h264",
+        "-i",
+        "pipe:0",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "rawvideo",
+        "pipe:1"
+      ],
+      "decode_stderr": ""
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+Original generated High100 progressive 8-bit 4:2:0 64x64 streams.
+CAVLC uses freshly encoded High SPS/PPS and two original I_PCM pictures.
+CABAC uses unmodified libx264 High output from independently specified Y40/Y120/Y120 Cb80 Cr180 inputs.
+First P may be intra-coded; third frame must be dependent Pskip as recorded in encoder log.
+FFmpeg explode-mode software decoded complete original streams before any native hardware run.
+Per-pixel YUV outputs, complete stream/header/AU hashes and exact commands are in high-provenance.json.
+StdVideo omits some VUI restriction fields; canonical SPS roundtrip may differ only there. Original payloads remain unchanged.
