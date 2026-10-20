@@ -1,7 +1,7 @@
 # Linux guest on macOS: GPU gates
 
-This document describes offline findings and implementation gates. It does not
-claim a hardware run. The guest uses stock Firefox and stock Zink. KosmicKrisp's
+This document describes implementation gates and the bounded headless Neo
+acceptance run on 2026-10-20. The guest uses stock Firefox and stock Zink. KosmicKrisp's
 Metal platform import implementation is the permitted driver patch.
 
 ## GBM export before allocation
@@ -66,7 +66,11 @@ the hardware gate for query, create, dedicated requirements, allocation and bind
 for all four supported formats. Cross-linking it does not prove a native driver
 run or rendered pixels. Stock Zink's INPUT_ATTACHMENT candidate remains a
 separate restriction, and the ordinary image route still requires this native
-hardware execution gate before it is claimed to work end to end.
+application execution gate before it is claimed to work end to end. The
+headless native gate passed query/create/requirements/allocation/bind for both
+UNORM formats with color, storage and transfer usage and both SRGB formats with
+color-only usage. Unsupported SRGB write usage was refused. This does not prove
+rendered application pixels.
 
 A second independent restriction concerns input attachments. Zink's
 `get_image_usage_for_feats` adds INPUT_ATTACHMENT for a render target unless both
@@ -146,8 +150,11 @@ The headless macos-metal-retirement example verifies source overwrite after
 completion, padded and unaligned original shared-memory input, opaque XRGB,
 alpha blending, clipping, subsurface placement, viewport crop and scaling, and
 metadata-only viewport changes. Its CPU reads are diagnostic verification only.
-Cross-linking cannot validate runtime Metal shader compilation. Native execution
-and full application presentation remain distinct acceptance gates.
+The bounded Neo execution passed these assertions, including runtime Metal
+shader compilation and original shared mmap import. Evidence is
+`/mnt/datasets/builds/evidence/mac-role-b-offline/native-gpu18.log`. This fixture
+calls GPU capture/composition directly and fails on refusal; CPU fallback cannot
+produce a passing result. Full application presentation remains a separate gate.
 
 ## VideoToolbox decode
 
