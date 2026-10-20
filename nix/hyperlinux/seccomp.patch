@@ -12,7 +12,7 @@ index 6079262..dea6f78 100644
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index 2ca2809..e0300bd 100644
+index 2ca2809..c5ce74f 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
 @@ -16,6 +16,7 @@
@@ -81,7 +81,24 @@ index 2ca2809..e0300bd 100644
  
      if (verbose)
          fprintf(stderr, "hl: clone_vm: child tid=%lld created "
-@@ -2264,6 +2271,10 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -1540,6 +1547,7 @@ static void *vm_clone_thread_run(void *arg) {
+     pthread_mutex_t *lock = thread_get_lock();
+     pthread_mutex_lock(lock);
+     t->vm_exited = 1;
++    thread_notify_exit_locked();
+     t->vm_exit_status = (exit_code & 0xFF) << 8;
+     pthread_cond_broadcast(&t->ptrace_cond);
+     pthread_mutex_unlock(lock);
+@@ -1554,7 +1562,7 @@ static void *vm_clone_thread_run(void *arg) {
+      * requesting exit_group and interrupting all vCPUs. */
+     int last_clone = (thread_count_active_vm_clones() == 0);
+ 
+-    if (last_clone) {
++    if (last_clone && !thread_seccomp_terminated()) {
+         if (verbose)
+             fprintf(stderr, "hl: last vm_clone exited, triggering exit_group\n");
+         /* The main thread may be in hv_vcpu_run or a host wait. The shared
+@@ -2264,6 +2272,10 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          return -LINUX_ENOMEM;
      }
  
@@ -92,7 +109,7 @@ index 2ca2809..e0300bd 100644
      close(ipc_sock);
  
      /* After COW fork: parent stays on MAP_SHARED (no remap was done).
-@@ -2305,6 +2316,9 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -2305,6 +2317,9 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
       * Used by Rosetta's two-process JIT: the inferior shares guest memory
       * but has a separate TID and is waitable via wait4/ptrace. */
      if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD)) {
@@ -520,7 +537,7 @@ index 7faa84b..d5cfdd9 100644
   * the guest stack. Returns SYSCALL_EXEC_HAPPENED to skip X0 writeback. */
  int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g);
 diff --git a/src/thread.c b/src/thread.c
-index 6854b0e..5dc7274 100644
+index 6854b0e..44113b6 100644
 --- a/src/thread.c
 +++ b/src/thread.c
 @@ -8,6 +8,8 @@
@@ -611,7 +628,7 @@ index 6854b0e..5dc7274 100644
  void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
      pthread_mutex_lock(&thread_lock);
      for (int i = 0; i < MAX_THREADS; i++) {
-@@ -532,3 +554,58 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+@@ -532,3 +554,61 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
          }
      }
  }
@@ -645,7 +662,8 @@ index 6854b0e..5dc7274 100644
 +    for (;;) {
 +        int others=0;
 +        for (int i=0;i<MAX_THREADS;++i)
-+            if (thread_table[i].active && &thread_table[i]!=current_thread) ++others;
++            if (thread_table[i].active && !thread_table[i].vm_exited &&
++                &thread_table[i]!=current_thread) ++others;
 +        if (!others) break;
 +        pthread_cond_wait(&thread_exit_cond,&thread_lock);
 +    }
@@ -670,8 +688,10 @@ index 6854b0e..5dc7274 100644
 +    if (exec_owner==current_thread) exec_owner=NULL;
 +    pthread_mutex_unlock(&thread_lock);
 +}
++
++void thread_notify_exit_locked(void) { pthread_cond_broadcast(&thread_exit_cond); }
 diff --git a/src/thread.h b/src/thread.h
-index 540ba99..d79b6a9 100644
+index 540ba99..eccae0e 100644
 --- a/src/thread.h
 +++ b/src/thread.h
 @@ -19,6 +19,7 @@
@@ -702,19 +722,20 @@ index 540ba99..d79b6a9 100644
  
  /* Mark a thread as inactive and release its table slot. */
  void thread_deactivate(thread_entry_t *t);
-@@ -136,6 +141,11 @@ int thread_tid_alive(int64_t tid);
+@@ -136,6 +141,12 @@ int thread_tid_alive(int64_t tid);
  
  /* Count currently active threads. */
  int thread_active_count(void);
 +int thread_seccomp_terminate(int whole_group);
 +int thread_seccomp_terminated(void);
 +void thread_wait_other_workers(void);
++void thread_notify_exit_locked(void);
 +int thread_exec_begin(void);
 +void thread_exec_end(int *scope);
  
  /* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KB slot
   * counting down from the top of the shim data region. The IPA base
-@@ -146,6 +156,8 @@ uint64_t thread_alloc_sp_el1(void);
+@@ -146,6 +157,8 @@ uint64_t thread_alloc_sp_el1(void);
  /* Iterate over all active threads, calling fn(entry, ctx) for each.
   * Holds the thread table lock during iteration. */
  void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
