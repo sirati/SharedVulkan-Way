@@ -184,15 +184,37 @@ index 1041c94..7cd2ea6 100644
      char sysroot_ipc[LINUX_PATH_MAX] = {0};
      const char *sr = proc_get_sysroot();
 diff --git a/src/futex.c b/src/futex.c
-index bbf5a81..ff3d999 100644
+index bbf5a81..e77e2bb 100644
 --- a/src/futex.c
 +++ b/src/futex.c
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
 +#include "hl_shared.h"
++#include "hl_atomic.h"
  /* futex.c — Linux futex emulation for hl
   *
   * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
-@@ -483,7 +484,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+@@ -191,7 +193,8 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
+         return -LINUX_EFAULT;
+     }
+
+-    uint32_t current = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++    uint32_t current;
++    if (hl_wc_atomic_load(word, &current) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
+     if (current != expected) {
+         pthread_mutex_unlock(&b->lock);
+         return -LINUX_EAGAIN;
+@@ -380,7 +383,9 @@ static int64_t futex_requeue(guest_t *g, uint64_t uaddr, uint32_t wake_count,
+             pthread_mutex_unlock(&b_src->lock);
+             return -LINUX_EFAULT;
+         }
+-        uint32_t current = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++        uint32_t current;
++    if (hl_wc_atomic_load(word, &current) < 0) { if (idx_src != idx_dst) pthread_mutex_unlock(&b_dst->lock);
++            pthread_mutex_unlock(&b_src->lock); return -LINUX_EFAULT; }
+         if (current != expected) {
+             if (idx_src != idx_dst) pthread_mutex_unlock(&b_dst->lock);
+             pthread_mutex_unlock(&b_src->lock);
+@@ -483,7 +488,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
      if (op_shift) op_arg = (int)(1U << (op_arg & 0x1F));
 
      /* Atomically modify *uaddr2 */
@@ -201,7 +223,34 @@ index bbf5a81..ff3d999 100644
      if (!word2) {
          if (idx1 != idx2) pthread_mutex_unlock(&b2->lock);
          pthread_mutex_unlock(&b1->lock);
-@@ -595,7 +596,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+@@ -493,10 +498,11 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+     /* Atomic read-modify-write on *uaddr2 using CAS loop.
+      * Matches Linux kernel's futex_atomic_op_inuser() semantics:
+      * the modification must be atomic w.r.t. concurrent guest stores. */
++    int exchanged;
+     uint32_t old_val;
+     uint32_t new_val;
+     do {
+-        old_val = __atomic_load_n(word2, __ATOMIC_SEQ_CST);
++        if (hl_wc_atomic_load(word2, &old_val) < 0) { if (idx1 != idx2) pthread_mutex_unlock(&b2->lock); pthread_mutex_unlock(&b1->lock); return -LINUX_EFAULT; }
+         switch (wake_op) {
+         case 0: new_val = op_arg;             break;  /* SET */
+         case 1: new_val = old_val + op_arg;   break;  /* ADD */
+@@ -505,10 +511,9 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+         case 4: new_val = old_val ^ op_arg;   break;  /* XOR */
+         default: new_val = old_val;           break;
+         }
+-    } while (!__atomic_compare_exchange_n(word2, &old_val, new_val,
+-                                           /*weak=*/0,
+-                                           __ATOMIC_SEQ_CST,
+-                                           __ATOMIC_SEQ_CST));
++    exchanged = hl_wc_atomic_cas(word2, &old_val, new_val);
++        if (exchanged < 0) { if (idx1 != idx2) pthread_mutex_unlock(&b2->lock); pthread_mutex_unlock(&b1->lock); return -LINUX_EFAULT; }
++    } while (!exchanged);
+
+     /* Wake up to val waiters at uaddr (unlink woken entries) */
+     int woken = 0;
+@@ -595,7 +600,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
   * one queued waiter so another waiter cannot be stranded by a fast unlock. */
  static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
                                uint64_t timeout_gva) {
@@ -210,7 +259,109 @@ index bbf5a81..ff3d999 100644
      if (!word) return -LINUX_EFAULT;
 
      uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
-@@ -773,7 +774,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+@@ -612,13 +617,12 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+     unsigned idx = futex_hash(uaddr);
+     futex_bucket_t *b = &buckets[idx];
+
++    int exchanged;
+     for (;;) {
+         /* Fast path: try to CAS 0 → our TID (uncontended acquisition) */
+         uint32_t expected = 0;
+-        if (__atomic_compare_exchange_n(word, &expected, tid,
+-                                         /*weak=*/0,
+-                                         __ATOMIC_SEQ_CST,
+-                                         __ATOMIC_SEQ_CST)) {
++        if ((exchanged = hl_wc_atomic_cas(word, &expected, tid)) < 0) { return -LINUX_EFAULT; }
++        if (exchanged) {
+             return 0;  /* Acquired */
+         }
+
+@@ -633,7 +637,8 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+
+         /* Double-check under bucket lock: owner may have released
+          * before we entered the queue. */
+-        uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++        uint32_t cur;
++        if (hl_wc_atomic_load(word, &cur) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
+         if ((cur & FUTEX_TID_MASK) == 0) {
+             pthread_mutex_unlock(&b->lock);
+             continue;
+@@ -647,17 +652,15 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+             uint32_t recovered = tid;
+             if (futex_has_pi_waiter_locked(b, uaddr, NULL))
+                 recovered |= FUTEX_WAITERS;
+-            __atomic_store_n(word, recovered, __ATOMIC_SEQ_CST);
++            if (hl_wc_atomic_store(word, recovered) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
+             pthread_mutex_unlock(&b->lock);
+             return 0;
+         }
+
+         while (!(cur & FUTEX_WAITERS)) {
+             uint32_t desired = cur | FUTEX_WAITERS;
+-            if (__atomic_compare_exchange_n(word, &cur, desired,
+-                                             /*weak=*/0,
+-                                             __ATOMIC_SEQ_CST,
+-                                             __ATOMIC_SEQ_CST))
++            if ((exchanged = hl_wc_atomic_cas(word, &cur, desired)) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
++        if (exchanged)
+                 break;
+             if ((cur & FUTEX_TID_MASK) == 0)
+                 break;
+@@ -694,13 +697,12 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+                      * be erased by this timed removal. */
+                     if (!futex_has_pi_waiter_locked(b, uaddr, NULL)) {
+                         for (;;) {
+-                            uint32_t v = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++                            uint32_t v;
++        if (hl_wc_atomic_load(word, &v) < 0) { goto pi_fault; }
+                             if (!(v & FUTEX_WAITERS)) break;
+                             uint32_t nv = v & ~FUTEX_WAITERS;
+-                            if (__atomic_compare_exchange_n(word, &v, nv,
+-                                                             /*weak=*/0,
+-                                                             __ATOMIC_SEQ_CST,
+-                                                             __ATOMIC_SEQ_CST))
++                            if ((exchanged = hl_wc_atomic_cas(word, &v, nv)) < 0) { goto pi_fault; }
++        if (exchanged)
+                                 break;
+                         }
+                     }
+@@ -740,13 +742,14 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+                  * Use thread_tid_alive (lock-free) instead of thread_find
+                  * to avoid lock order inversion: bucket lock(7) is held
+                  * here, and thread_find acquires thread_lock(5). */
+-                uint32_t check = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++                uint32_t check;
++        if (hl_wc_atomic_load(word, &check) < 0) { goto pi_fault; }
+                 uint32_t check_tid = check & FUTEX_TID_MASK;
+                 if (check_tid != 0 && !thread_tid_alive((int64_t)check_tid)) {
+                     uint32_t recovered = tid;
+                     if (futex_has_pi_waiter_locked(b, uaddr, &waiter))
+                         recovered |= FUTEX_WAITERS;
+-                    __atomic_store_n(word, recovered, __ATOMIC_SEQ_CST);
++                    if (hl_wc_atomic_store(word, recovered) < 0) goto pi_fault;
+                     waiter.pi_acquired = 1;
+                     waiter.woken = 1;
+                     break;
+@@ -767,23 +770,35 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+             return 0;
+
+         /* A non-PI wake is not an ownership handoff. Retry acquisition. */
++        continue;
++pi_fault:
++        /* Faults can arrive after the timeout path already unlinked us. */
++        {
++            futex_waiter_t **at = &b->head;
++            while (*at) {
++                if (*at == &waiter) { *at = waiter.next; break; }
++                at = &(*at)->next;
++            }
++        }
++        pthread_mutex_unlock(&b->lock);
++        pthread_cond_destroy(&waiter.cond);
++        return -LINUX_EFAULT;
+     }
+ }
+
  /* FUTEX_TRYLOCK_PI: Non-blocking version of LOCK_PI.
   * CAS 0 → TID; if the lock is held, return -EAGAIN immediately. */
  static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
@@ -219,7 +370,20 @@ index bbf5a81..ff3d999 100644
      if (!word) return -LINUX_EFAULT;
 
      uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
-@@ -797,7 +798,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
+                                   : (uint32_t)proc_get_pid();
+
+     uint32_t expected = 0;
+-    if (__atomic_compare_exchange_n(word, &expected, tid,
+-                                     /*weak=*/0,
+-                                     __ATOMIC_SEQ_CST,
+-                                     __ATOMIC_SEQ_CST)) {
++    int exchanged = hl_wc_atomic_cas(word, &expected, tid);
++    if (exchanged < 0) return -LINUX_EFAULT;
++    if (exchanged) {
+         return 0;  /* Acquired */
+     }
+
+@@ -797,7 +812,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
   * owner must observe FUTEX_WAITERS while another waiter remains, otherwise
   * its legal userspace fast unlock can strand that waiter indefinitely. */
  static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
@@ -228,11 +392,51 @@ index bbf5a81..ff3d999 100644
      if (!word) return -LINUX_EFAULT;
 
      uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
-@@ -851,6 +852,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+@@ -810,7 +825,8 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+
+     /* Verify ownership while holding the queue lock. Contended acquisitions
+      * publish FUTEX_WAITERS and enqueue under this lock as well. */
+-    uint32_t cur = __atomic_load_n(word, __ATOMIC_SEQ_CST);
++    uint32_t cur;
++    if (hl_wc_atomic_load(word, &cur) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
+     if ((cur & FUTEX_TID_MASK) != tid) {
+         pthread_mutex_unlock(&b->lock);
+         return -LINUX_EPERM;
+@@ -821,7 +837,6 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+     while (*pp) {
+         futex_waiter_t *w = *pp;
+         if (w->uaddr == uaddr && w->pi_tid != 0) {
+-            *pp = w->next;
+             selected = w;
+             break;
+         }
+@@ -829,15 +844,16 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+     }
+
+     if (!selected) {
+-        __atomic_store_n(word, 0, __ATOMIC_SEQ_CST);
++        if (hl_wc_atomic_store(word, 0) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
+         pthread_mutex_unlock(&b->lock);
+         return 0;
+     }
+
+     uint32_t next_owner = selected->pi_tid;
+-    if (futex_has_pi_waiter_locked(b, uaddr, NULL))
++    if (futex_has_pi_waiter_locked(b, uaddr, selected))
+         next_owner |= FUTEX_WAITERS;
+-    __atomic_store_n(word, next_owner, __ATOMIC_SEQ_CST);
++    if (hl_wc_atomic_store(word, next_owner) < 0) { pthread_mutex_unlock(&b->lock); return -LINUX_EFAULT; }
++    *pp = selected->next;
+
+     selected->pi_acquired = 1;
+     selected->woken = 1;
+@@ -851,6 +867,9 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
 
  int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
                    uint64_t timeout_gva, uint64_t uaddr2, uint32_t val3) {
 +    HL_WC_ACCESS_SCOPE;
++    hl_wc_atomic_scope fault_scope __attribute__((cleanup(hl_wc_atomic_end))) = {0};
++    if (hl_wc_atomic_begin(&fault_scope) < 0) return -LINUX_EOPNOTSUPP;
      int cmd = op & FUTEX_CMD_MASK;
 
      switch (cmd) {

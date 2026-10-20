@@ -82,3 +82,25 @@ concurrent truncate during these production copy operations. The Linux ELF
 `shared-access-client.c` also covers truncated output and pathname buffers.
 External futex atomic fault isolation is a separate pending gate; kernel copies
 alone do not make native CPU atomics on a truncated file safe.
+
+External futex words use public ARM64 native leaf load/store/CAS helpers.
+Each futex syscall temporarily swaps only its calling thread's BAD_ACCESS
+exception port. A private in-process worker accepts only the public
+EXCEPTION_STATE packet shape and named guest-address instruction PCs. It
+returns EFAULT by resuming the same leaf at its normal error return. It never
+unwinds C or Rust frames. An unrelated fault PC returns KERN_FAILURE to the
+untouched task/system exception chain. No process-wide signal handler or task
+exception port changes are used.
+
+A preexisting custom thread BAD_ACCESS handler causes immediate atomic
+restoration and refusal before guest atomic access. Debugger/custom-thread
+exception configurations therefore remain unsupported. Normal and error
+returns restore the previous single-bit thread exception chain in one kernel
+call and release the acquired send rights. Restoration failure is fatal.
+`atomic-fault-check.c` tests real truncate races, normal atomic operations,
+thread-right counts, prior-handler refusal/restoration, task-handler identity,
+and unrelated-PC rejection in a disposable spawned child. Cross-linking alone
+is not native proof. The integrated Linux ELF acceptance also exercises
+truncated futex words; its separate `--guest-map-fault` mode must print a guest
+signal marker for a direct CPU load after truncate. That mode distinguishes a
+delivered guest fault from a native host crash.

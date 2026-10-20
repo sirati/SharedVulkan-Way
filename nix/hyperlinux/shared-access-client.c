@@ -11,6 +11,10 @@
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <linux/futex.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 
 static void output_denied(void *map) {
@@ -24,7 +28,23 @@ static void output_denied(void *map) {
     errno=0; assert(recvmsg(pair[1],&msg,MSG_DONTWAIT)==-1 && errno==EFAULT);
     close(pair[0]);close(pair[1]);
 }
-int main(void) {
+static void guest_fault(int signal) {
+    if(signal==SIGBUS) (void)write(1,"GUEST_SIGBUS\n",13);
+    else (void)write(1,"GUEST_SIGSEGV\n",14);
+    _exit(0);
+}
+int main(int argc,char **argv) {
+    if(argc==2 && !strcmp(argv[1],"--guest-map-fault")) {
+        char name[]="/tmp/hl-guest-fault-XXXXXX";int fd=mkstemp(name);assert(fd>=0);
+        assert(!unlink(name));assert(!ftruncate(fd,16384));
+        void *p=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);assert(p!=MAP_FAILED);
+        struct sigaction action={.sa_handler=guest_fault};sigemptyset(&action.sa_mask);
+        assert(!sigaction(SIGBUS,&action,NULL));assert(!sigaction(SIGSEGV,&action,NULL));
+        assert(!ftruncate(fd,0));
+        (void)*(volatile uint32_t *)p;
+        _exit(99);
+    }
+    assert(argc==1);
     char path[]="/tmp/hl-access-XXXXXX";
     int rw=mkstemp(path);assert(rw>=0);assert(!ftruncate(rw,16384));
     int ro=open(path,O_RDONLY);assert(ro>=0);assert(!unlink(path));
@@ -43,8 +63,15 @@ int main(void) {
     assert(*(char *)map=='y');close(pair[0]);close(pair[1]);
     assert(!munmap(map,16384));
     map=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,rw,0);assert(map!=MAP_FAILED);
+    *(uint32_t *)map=0;
+    struct timespec timeout={0,0};errno=0;
+    assert(syscall(SYS_futex,map,FUTEX_WAIT,0,&timeout,NULL,0)==-1 && errno==ETIMEDOUT);
     assert(!ftruncate(rw,0));output_denied(map);
+    errno=0;assert(syscall(SYS_futex,map,FUTEX_WAIT,0,&timeout,NULL,0)==-1 && errno==EFAULT);
+    errno=0;assert(syscall(SYS_futex,map,FUTEX_WAKE_OP,1,1,map,FUTEX_OP(FUTEX_OP_ADD,1,FUTEX_OP_CMP_EQ,0))==-1 && errno==EFAULT);
+    errno=0;assert(syscall(SYS_futex,map,FUTEX_TRYLOCK_PI,0,NULL,NULL,0)==-1 && errno==EFAULT);
+    errno=0;assert(syscall(SYS_futex,map,FUTEX_UNLOCK_PI,0,NULL,NULL,0)==-1 && errno==EFAULT);
     errno=0;assert(syscall(SYS_openat,AT_FDCWD,map,O_RDONLY,0)==-1 && errno==EFAULT);
     assert(!munmap(map,16384));close(rw);
-    puts("shared-access-client: O_RDONLY, PROT_READ, PROT_NONE EFAULT and vectored/message direction passed");
+    puts("shared-access-client: O_RDONLY, PROT_READ, PROT_NONE EFAULT and vectored/message/futex truncate direction passed");
 }
