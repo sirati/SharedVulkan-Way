@@ -40,6 +40,10 @@ pub const SERVER_ID_BASE: u32 = 0xff00_0000;
 #[derive(Debug, Default)]
 pub struct Objects {
     map: HashMap<u32, String>,
+    /// The highest client id ever declared (§104.11): one past it is an id
+    /// the compositor will accept and the client has not used, which is the
+    /// only kind the proxy may borrow for an object of its own.
+    max_client: u32,
     /// Ids seen that the table had no interface for. Counted rather than
     /// listed: it is a number that should be zero, and a proxy that forwards a
     /// message on an object of unknown type is forwarding bytes it cannot
@@ -52,7 +56,7 @@ impl Objects {
     pub fn new() -> Objects {
         let mut map = HashMap::new();
         map.insert(1u32, "wl_display".to_owned());
-        Objects { map, unknown: 0 }
+        Objects { map, max_client: 1, unknown: 0 }
     }
 
     pub fn interface(&self, id: u32) -> Option<&str> {
@@ -60,7 +64,18 @@ impl Objects {
     }
 
     pub fn record(&mut self, id: u32, interface: &str) {
+        if id < SERVER_ID_BASE {
+            self.max_client = self.max_client.max(id);
+        }
         self.map.insert(id, interface.to_owned());
+    }
+
+    /// One past the highest client id so far: free on both sides, and within
+    /// the "at most one past the highest" a server accepts for a new id. An
+    /// object made there must be destroyed before the client's next request
+    /// is forwarded, which may create the same id.
+    pub fn next_client_id(&self) -> u32 {
+        self.max_client + 1
     }
 
     pub fn forget(&mut self, id: u32) {

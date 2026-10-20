@@ -1138,6 +1138,18 @@ the identity. Nothing on either side logs a URL or a title. Firefox's
 `browser.taskbar.lists.enabled` and `…frequent.enabled` turn the pages off.
 Private windows record no history, so nothing from one can appear.
 
+**One installation's history stays in its own jump list** (`waycompose-design.md`
+§92.12). Until then the identity, and so the jump list, was the application's:
+every installation of Firefox wrote `Waycompose.app.firefox`'s list, and a test
+installation's run replaced the user's list with the test profile's pages. Now
+each installation has its own identity (`Waycompose.install.<name>.<app>`) and
+its own jump-list directory; only the one installation deploy found the user's
+pin of keeps the old identity, and a claim file and the compositor keep a
+second from taking it. A session's `taskbar=` boot field must name the
+session's own installation, which the host has already checked against that
+installation's key; it cannot name another's windows. All of it is one Windows
+user's own taskbar.
+
 ### R34 — The GPU sessions share one pool
 Added 2026-10-16 with `waycompose-design.md` §97. The GPU ivshmem device was cut
 into fixed slots, one per session (§87); it is now one pool, and every session
@@ -1448,6 +1460,38 @@ process (macOS: bundle `org.waycompose.host`, after the user grants the TCC
 prompt once), never by a per-application process, and only while the
 session has a source node that a Linux client records from.
 
+### R39 — A userspace render node, and guest sections named by tokens
+Added 2026-10-19 with `waycompose-design.md` §104. The nested KWin composites on
+the forwarded GPU through pieces that each widen something a little.
+
+**`sv-drm serve` runs as root** (started by `atp-nested-seat`, only with
+`kwinGpu` and a GPU offered). It is a CUSE device answering a fixed list of DRM
+ioctls; nothing it does touches a kernel driver or memory. The one ioctl that
+reads anything is `PRIME_FD_TO_HANDLE`: it opens `/proc/<pid>/fd/<fd>` of the
+pid that issued the ioctl, and only if that is a regular file on tmpfs (a
+memfd), so a client cannot make it block on a FIFO or reopen the node; it then
+reads at most the token header. The node is `root:users` 0660: any member of
+`users` can open it and gets only those answers.
+
+**`sv-drm ns` is unprivileged**: a user and mount namespace that hides nothing
+and grants nothing; it overlays `/sys/dev/char` and `/tmp/.X11-unix` with
+tmpfs files of its own and drops back to the real ids before exec.
+
+**The desktop user may map the GPU region** (`waycomposeArena.gpu.users`, a
+named ACL on `/run/windows-vm/wc-arena/gpu` only): that user's sv-icd maps the
+pool like the session user's does. It can read and write every GPU session's
+pool memory, as the session user always could; the compositor's arena and the
+doorbells stay the session user's.
+
+**Tokens and sections.** A dma-buf here is a sealed memfd naming a section; a
+reader refuses an unsealed one, an unknown version, a name outside
+`[A-Za-z0-9_-./\\]` or with `..`. The GPU process opens only names it
+created itself, with the nonce it gave them, so one session can import
+another's buffer only by holding its token (the dma-buf the producer handed
+over). The compositor opens a section by the name the proxy passes, read and
+write for GDI's `CreateDIBSection`, and only reads it. The fence record
+(§104.11) is a page per GPU session that the compositor and other sessions only
+read.
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It

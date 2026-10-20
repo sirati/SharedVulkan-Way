@@ -578,6 +578,8 @@ impl PumpInner {
                      (no window manager here; control.rs derives it)"
                 );
             }
+            // Never sent off Windows; see its definition.
+            ToUi::Direct { .. } => {}
             ToUi::Present { id, damage } => {
                 let Some(w) = windows.get_mut(&id) else { return };
                 {

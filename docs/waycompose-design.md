@@ -28868,10 +28868,207 @@ separate check found nothing personal in them.
    is used for other applications.
 5. **A second application** would get its own identity, pin and jump list from
    its desktop entry. Only Firefox has been run.
-6. **Multiple installations share an identity.** `wcivs`, `wcpins` and `wcmil`
-   all launch `firefox`, so they all write `Waycompose.app.firefox`'s jump list,
-   and the last one to refresh wins. That is right for one installation per
-   user, which is the product.
+6. **Multiple installations shared an identity.** `wcivs`, `wcpins` and `wcmil`
+   all launch `firefox`, so they all wrote `Waycompose.app.firefox`'s jump
+   list, and the last one to refresh won. Fixed in 92.12: the identity is
+   per installation, and only the installation whose pin already carries the
+   old identity keeps it.
+
+### 92.12 One identity per installation
+
+Branch `session-fixes-aumid`, 2026-10-19.
+
+**The cause.** `taskbar::identity` was a function of the app id alone. Every
+installation of Firefox put its windows, shortcuts, pins, jump list and
+relaunch file under `Waycompose.app.firefox`. The test installation "Windows
+7 (Linux, no ssh)" shared `Waycompose.app.atp-nested` with the user's "Windows
+7 (Linux)". `ICustomDestinationList` keys a jump list by that string and the
+last writer wins, so a test run replaced the user's Firefox jump list with
+the test profile's pages. Since §107 one compositor serves every
+installation, so windows of two installations of one application shared one
+button, and a pin made from either relaunched whichever installation's
+relaunch directory came first in boot order.
+
+**The scheme.** An installation's applications carry
+`Waycompose.install.<installation>.<app id>`, for example
+`Waycompose.install.wclinux.atp-nested` (`taskbar::installed_identity`).
+`install.` is a segment of its own beside `app.` and `unnamed.`, so no
+installation name and no client's app id can produce another namespace's
+string. The installation's name has no dot (the session service allows
+letters, digits, `-` and `_`, at most 32), so the segment after it is the
+app. Windows does not document whether it compares AUMIDs with regard to
+case, so the scoped form is lower case only. An upper-case letter is
+lowered, and the name then counts as mapped: it carries the hash of the
+original, as `identity` already did for spaces and long names. Two
+installations, or two app ids, that differ at all get different strings,
+and every string fits Windows' 128 characters with no space
+(`every_scoped_identity_fits_what_windows_documents` checks 30 pairs of
+odd names, all distinct). A client that never set an app id keeps
+`Waycompose.unnamed.c<N>`: the connection number is unique in the
+compositor, and such a window cannot be pinned.
+
+**The one exception: the user's existing pin.** The old identity is in the
+user's pinned shortcuts, desktop shortcuts and Explorer's own copy of the
+pins (the Taskband blob). Two ways were weighed:
+
+* (a) rewrite every shortcut's AUMID at deploy and rebuild the jump list
+  under the new id. Changing a pinned shortcut's identity under a running
+  Explorer splits the pin and its windows into two buttons until Explorer
+  restarts, because Explorer reads its cached copy. That is a visible change
+  to the user's taskbar, or an Explorer restart, and neither is allowed.
+* (b) keep `Waycompose.app.<app>` for the one installation whose pin already
+  carries it. Nothing the user sees changes, by construction: the pin, its
+  windows and its jump list keep the string they have.
+
+So (b), with (a)'s rewrite only where it is invisible. Deploy runs
+`wc-launch.exe --taskbar-ids` on the guest (`taskbar_id::decide`). For each
+`[app.*]` of the installation:
+
+1. A decision an earlier deploy made is kept. Deploy copies the old ini to
+   `wc-launch.ini.prev` before it copies the new one, and the verb reads
+   `taskbar-id` from it. A decision never flips.
+2. A test installation always gets its own identity: `WC_LAUNCH_TEST_HOME`
+   set for the deploy, a `test-home` file beside its `wc-session` on the VM
+   host, or `WC_LAUNCH_TASKBAR_ID=install`.
+3. A claim file, `%LOCALAPPDATA%\waycompose\taskbar\<identity>.owner`, names
+   the `wc-launch.exe` that holds an old identity. If it names another
+   installation that still exists, this one gets its own.
+4. Otherwise the user's shortcuts decide: those in `User Pinned\TaskBar`, on
+   the desktop and in the Start menu's programs, read through `IShellLinkW`
+   and its property store. A pin with the old identity that runs this
+   installation keeps it. A pin that runs another installation gives it to
+   that one. With no pin, a desktop shortcut decides, unless another
+   installation has one too; then neither keeps it. Start menu entries are
+   not evidence, because every launch writes one. A shortcut of a removed
+   installation is not evidence either.
+5. Anything else gets its own identity.
+
+The result is written into the installation's `wc-launch.ini` as
+`[app.<id>] taskbar-id = legacy` or `install` (absent is `install`). A
+`legacy` decision writes the claim file. An `install` decision gives this
+installation's own unpinned desktop and Start menu shortcuts the new
+identity (`shell::set_link_aumid`, which keeps everything else in the
+file), and removes the relaunch file of the form it no longer uses. Its pin,
+if it has one with the old identity (only a test installation can), is left
+alone and the log says so: its windows get their own button until the user
+pins again. A shortcut whose identity cannot be read is taken to carry the
+old one, so it can only keep it where it is, and it is never rewritten.
+`scripts/wc-launch.sh taskbar-plan` is the same verb with `--dry-run`: it
+prints the shortcuts it found and each decision, and changes nothing.
+
+**Two installations never carry one identity.** The claim file is checked
+before any shortcut. The compositor checks again: a session whose boot
+claims an old identity that another live session holds does not get it, and
+the log says `taskbar: session N … asked for the application-wide identity of
+…` (`Registry::add_session`).
+
+**The compositor.** The launcher sends its scope in the boot line,
+`taskbar=INSTALL[:APP,…]` (107.3), where the apps are the window app ids that
+keep the old identity. The scope must name the boot's own installation. A
+one-session compositor gets it as `--taskbar-scope`. Each window remembers its
+client's session, and `taskbar::identity_in(app_id, client, session)` stamps
+the session's installation's identity. A session with no scope (a launcher
+from before §92.12) keeps the old identity, as before. A launcher whose boot
+is refused with `unknown boot field "taskbar"` is talking to a compositor
+from before §92.12 (another installation started it); it boots again without
+the field and logs that its windows carry the old identity until that
+compositor ends.
+
+**Relaunch, per installation.** A window's relaunch file is looked up only in
+the directory of the session whose scope owns the identity
+(`Registry::relaunch_dirs`). Before, every session's directory was searched
+in boot order, and a stale `Waycompose.app.firefox.relaunch` left in a test
+installation's `apps` could give the user's window the test installation's
+command. An identity no scope owns is looked up in the unscoped sessions'
+directories, as before.
+
+**The jump list.** `ICustomDestinationList::SetAppID` gets the same string as
+the windows and shortcuts. The jump list's own files (icons, removed pages,
+refresh period) were in `%LOCALAPPDATA%\waycompose\jumplist\<app>`, shared by
+every installation too. An installation with its own identity now keeps them
+in `jumplist\<installation>\<app>`; the one with the old identity keeps the
+old directory, and with it the pages the user removed.
+
+**Removal.** `wc-launch.exe --uninstall-taskbar` (`scripts/wc-launch.sh
+uninstall-taskbar`) deletes the installation's own jump list
+(`ICustomDestinationList::DeleteList` on its own identity). It deletes the
+old identity's list only while this installation holds the claim, and then
+removes the claim. It removes its desktop and Start menu shortcuts, its
+relaunch files and its jump-list directory. It never touches another
+installation's, and it lists its pins, which only the user can unpin
+(`taskbar_id::plan_removal`).
+
+**What deploy does to the user's installations.** On the next deploy of
+each, with this build, nothing else running:
+
+| installation | expected decision | what the user sees |
+|---|---|---|
+| `wcivs` ("Firefox (Linux)") | `legacy`: the pin `Firefox (Linux)` in `User Pinned\TaskBar` carries `Waycompose.app.firefox` and runs `wcivs\wc-launch.exe` (92.9). Claim written | nothing changes: the pin, its windows and its jump list keep their identity. The list's pages are rebuilt at the next launch from the user's profile, which replaces whatever a test run left in it |
+| `wclinux` ("Windows 7 (Linux)") | `legacy` if its pin or desktop shortcut is the only one with `Waycompose.app.atp-nested`; `install` if the test installation's desktop shortcut carries it too and neither is pinned | `legacy`: nothing. `install`: nothing visible either; the unpinned desktop and Start menu shortcuts get `Waycompose.install.wclinux.atp-nested`, and a pin made afterwards joins its windows |
+| `wcmc` (Minecraft) | `legacy`, from its pin or desktop shortcut | nothing |
+| the test installations | `install` | their windows leave the user's buttons and get their own; their Start menu entries move with them |
+
+The real decisions are in each deploy's log (`taskbar-id: <app> legacy|install
+<identity>: <why>`); `taskbar-plan` shows them before anything is written.
+Not run on the guest from this branch.
+
+**The tests.**
+
+| where | what |
+|---|---|
+| `taskbar.rs` `install_tests` (both crates) | the scheme: legible ids, case and mapping, uniqueness over 30 odd pairs, the 128-character limit, no dot in the installation segment, the scope's parse and render, legacy only where the scope says, a shared compositor naming three sessions' windows by their installations, a second legacy claim refused, the one-session default, relaunch files found only in the owning installation's directory |
+| `session_svc.rs` | the boot line carries `taskbar=`, and a scope of another installation or a bad app id is refused |
+| `taskbar_id.rs` | the decision: the user's situation (pin of `wcivs`, a test installation's Start menu entry), never two `legacy` in either deploy order over six shortcut layouts, test installations, a persisted decision that does not flip, claims (another's, ours, stale), shortcuts of removed installations and Start menu entries are not evidence, unreadable identities, path comparison, removal |
+| `config.rs` | `taskbar-id` parsed, defaulted and refused; read from any ini text; set in place, CRLF kept |
+| `plan.rs`, `appmeta.rs` | the scope the launcher sends, and the launcher's identity equal to the compositor's for the same installation |
+
+Under Wine (`/mnt/datasets/builds/evidence/session-fixes/aumid/wine-taskbar-ids.txt`):
+two installations `wcivs` and `wcpins` of one Firefox, both first configured as
+before §92.12 and `--install`ed, `wcivs`'s shortcut copied into `User
+Pinned\TaskBar`. Then the deploy's step: `wcpins --taskbar-ids` decided
+`install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe") and
+removed its old relaunch file; `wcivs --taskbar-ids` decided `legacy` and wrote
+the claim. A second deploy kept both ("kept from the installation's ini").
+`--refresh` then wrote `Waycompose.app.firefox.relaunch` in `wcivs\apps` and
+`Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps`.
+`wcpins --uninstall-taskbar` removed its two shortcuts and its relaunch file
+and left `wcivs`'s three. Wine's shell links do not implement
+`IPropertyStore::GetValue` (`E_NOTIMPL`) and do not store the identity, so
+every identity read as unreadable, which is the path the rule above takes
+for that; `DeleteList` is `E_NOTIMPL` too.
+
+On a real Windows 11 (a throwaway clone of the local test image, 24H2,
+build 26100; `/mnt/datasets/builds/evidence/session-fixes/aumid/vm/`), the
+same scenario with two throwaway installations whose shortcuts our
+`--install` wrote, `wcivs`'s copied into `User Pinned\TaskBar`, and a cached
+host answer for Firefox:
+
+| step | result |
+|---|---|
+| the property store read | every shortcut read `[Waycompose.app.firefox]`, the same as the shell's own `System.AppUserModel.ID` column; nothing unreadable |
+| `--taskbar-ids`, `wcpins` first | `wcpins`: `install` ("the user's pin carries it and runs …\wcivs\wc-launch.exe"), its desktop and Start menu shortcuts rewritten, the shell then reads `Waycompose.install.wcpins.firefox`; `wcivs`: `legacy`, claim written |
+| `--taskbar-ids`, `wcivs` first | `wcivs`: `legacy`, claim written; `wcpins`: `install` ("…\wcivs\wc-launch.exe holds the claim") |
+| the pinned `.lnk` | SHA-256 the same before and after, in both orders |
+| `--refresh` for both | `SetAppID` and `CommitList` succeeded for both identities (`jump list 3 task(s)`, 10 slots); two `customDestinations-ms` files, one whose links run `wcivs`, one `wcpins`; relaunch files `Waycompose.app.firefox.relaunch` in `wcivs\apps` and `Waycompose.install.wcpins.firefox.relaunch` in `wcpins\apps` |
+| `--uninstall-taskbar` of `wcpins` | its list file gone (`DeleteList` succeeded), `wcivs`'s list unchanged; its two shortcuts and its relaunch file gone, `wcivs`'s three shortcuts and relaunch file still there; `jumplist\wcpins` removed |
+
+The first run left an empty `jumplist\wcpins` after the removal; the removal
+now takes the installation's directory too once it is empty.
+
+**Not run:** per-session identities on window properties in a shared
+compositor. A session's clients reach the compositor only through the
+ivshmem rings that the VM host's session service serves; a socket client is
+always session 0. That path is covered by the registry's and the boot line's
+unit tests above, and the code that writes the property (`win32.rs`,
+`set_taskbar_identity`) is §92's, unchanged.
+
+**Gates.** `cargo test --workspace --no-fail-fast`: 114 binaries, 3291
+passed, 0 failed, 9 ignored. `cargo clippy --workspace --all-targets`, and
+`-p wc-launch -p wc-compositor --all-targets` for Windows: no warning in a
+line this section wrote. `cargo check --workspace --target
+x86_64-pc-windows-gnu` and `-p wc-launch -p wc-compositor --target
+x86_64-apple-darwin`: exit 0. `scripts/wc-xref.sh --list` and
+`design_citations`: no missing citation.
 
 ## 93. Two bugs from real use: the clipboard, and a menu that closes instead of opening
 
@@ -33494,20 +33691,264 @@ was not measured.
 1. **CPU.** The compositor's blit from a section is not damage-scoped, and the
    per-frame SYNC_FD wait is synchronous on KWin's thread. Both are the next
    steps; a heavy-repaint workload is the measurement that should decide.
+   *The wait is gone since §104.11; the composite is damage-scoped, and a
+   window whose picture is one section is drawn without reading it, since
+   §104.12.*
 2. **Plasma's clients** still hand KWin `wl_shm` (llvmpipe) or kopper frames.
    Clients inside the namespace could use dma-bufs too; that needs the GPU side
    to import a section into another session's device, which the registry
-   already allows by name.
+   already allows by name. *The GPU side is ready since §104.11; the NixOS side
+   is not.*
 3. **`zwp_linux_buffer_params_v1.create`** (not immediate) answers `failed`.
 4. **Two installations with the GPU at once**: the GPU device has one mapping,
    so a Firefox session with the GPU and this one exclude each other (as
    before §104).
 5. **A crashed GPU process on Linux** leaves its `/dev/shm` files behind
-   (Windows frees sections itself).
+   (Windows frees sections itself). *Swept at the next start since §104.11.*
 6. **The seat's node is for group `users`**: whichever of the login screen's
    users logs in gets it; any member of the group can open it, which gives
    access to nothing but the fake ioctls.
 
+### 104.11 Implicit sync that nobody waits for, and a client's buffer in KWin
+
+Branch `kwin-gpu-zc-icd`. Three changes to the path above: the sync fd export
+no longer waits for the guest's GPU; a buffer one ICD session made can be
+imported into another (a Plasma client's into KWin's); a crashed GPU process's
+`/dev/shm` files are removed.
+
+**The problem.** Zink exports a `SYNC_FD` semaphore after every flush that
+touched an exported image (`zink_screen_import_dmabuf_semaphore`), and §104.4
+answered it by submitting a wait with a fence and waiting for the fence: KWin's
+thread stalled a round trip to the guest's GPU per frame. The export must
+return at once, and still nobody may read a frame the GPU has not finished.
+The difficulty is ordering: KWin's submit reaches the GPU process on the ICD's
+rings, its commit reaches the compositor through wc-proxy, and the commit can
+arrive before the GPU process has even dequeued the submit. Whoever waits
+must therefore be told *which* work to wait for by somebody who knew it before
+the commit was sent — the ICD.
+
+**The options weighed.**
+
+| option | why not / why |
+|---|---|
+| a per-section "submitted/completed" record the GPU side writes, read by the compositor at commit | racy: "submitted" is bumped when the GPU process dequeues the work, which can be after the commit arrives; the compositor would wait for the previous frame |
+| the token as an open file of the `sv-drm` CUSE node, so `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` reaches the daemon | the import direction works, but the consumer side (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`, which Zink uses before sampling an imported buffer) must return a new fd, and a CUSE server cannot put an fd into its caller; it also puts every frame through a root daemon |
+| proxy holds the commit until the GPU is done | the host cannot see the guest's completion without another channel, and the frame would wait for a host round trip after the GPU finished |
+| **the ICD numbers the work; the token carries the number; the consumer waits in the guest** | **chosen**: the number exists before the commit, the wait is where the pixels are read, nothing is added to the GPU's work |
+
+**How it works.**
+
+* **Fence records.** Each GPU session has one (`sv_gpu_server::fence`): a
+  4 KiB named section (`Local\sv-fence-<pid>-<n>-<tag>`, a `/dev/shm` file on
+  Linux) holding `"SVFENCE1"` and `completed`, a little-endian u64.
+  `svFenceRecord` (answered, once per session) names it to the ICD.
+* **Tokens, version 2** (`sv_drm::token`): the header also names the
+  session's record, and the second page of the memfd is the **sync page**, the
+  number of the last work that wrote the allocation. The file is sealed with
+  `F_SEAL_FUTURE_WRITE` instead of `F_SEAL_WRITE`: no `write` and no new
+  writable mapping for anybody, but the ICD's mapping of the sync page, made
+  before sealing, stays writable. One token file per allocation;
+  `vkGetMemoryFdKHR` returns a `dup` (as a kernel export returns another fd for
+  the same buffer), so every holder maps the same page.
+* **The export.** `vkGetSemaphoreFdKHR(SYNC_FD)` numbers the semaphore's
+  pending signal (`seq`, from 1 per session) and returns -1 at once. Zink asks
+  for the image's memory fd right after (measured with Mesa 26.2's real path
+  in `sv-dmabuf-e2e.sh`); then the ICD sends `svFenceMark{queue, semaphore,
+  seq, memory}` on the queue ring, unanswered, and stores `seq` in the sync
+  page. The GPU side submits an empty batch waiting on the semaphore with a
+  fence (what the export did before, minus the wait); a watcher thread per
+  session waits for the fences in order and writes `completed = seq`.
+* **KWin → compositor.** wc-proxy maps the sync page of each dma-buf buffer's
+  token. On a commit it reads `seq` and, if it is larger than what it already
+  sent for that record, sends `wc_gpu_fence_v1.wait(record, seq)` before the
+  commit (`crates/wc-compositor/protocols/wc-gpu-fence-v1.xml`), on an object
+  bound at the id one past the client's highest and destroyed right after; its
+  `delete_id` is dropped by count. The compositor (`gpu_fence.rs`, a new module;
+  `surface.rs` is untouched) does not return from the request until the record
+  says `completed >= seq` — usually the first check — or 100 ms passed; a
+  record that ran out its time is not waited on again until it moves.
+* **Client → KWin (another session).** Before Zink samples an imported
+  dma-buf it asks for its memory fd *without* an export in front
+  (`zink_screen_export_dmabuf_semaphore`, whose `EXPORT_SYNC_FILE` then fails
+  on the memfd). The ICD takes that as "the next batch reads this": it reads
+  the producer's record and number from the token and sends `svFenceWait{memory,
+  seq, record}` before the next submit. The GPU side waits on the producer's
+  in-process progress on the consumer's queue-ring thread (not the app's,
+  and no GPU work), up to 2 s. The same message also waits for every mark
+  another session has made on that section that the GPU process has already
+  seen: the reads of a consumer, before the producer writes again.
+* **Fallback.** A GPU side without a record (`svFenceRecord` refused) gets
+  the old behaviour, the export waits; a version-1 token is waited for by
+  nobody, as before §104.11 except that the export no longer blocks.
+
+**Cross-session import.** The registry of sections was already process-wide
+(a static); what changes is that it is now exercised and its lifetime spelled
+out: each import maps its own view (a new mapping of the section, never the
+creator's pointer imported into a second device), the entry counts the views
+of every session, the creator's free does not end the section while another
+session holds a view (Windows: each view's own section handle keeps it; Linux:
+the file is unlinked with the last view), and the nonce is checked as before.
+
+**Crashed GPU processes** (Linux): before its first section a GPU process
+removes `/dev/shm/sv-shared-<pid>-<n>-<16 hex>` and `sv-fence-…` files owned by
+its user whose pid is not a process (`kill(pid, 0)` is `ESRCH`); a reused pid
+keeps its files. Windows has nothing to sweep.
+
+**Checked locally** (logs: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`):
+
+| test | result |
+|---|---|
+| `scripts/sv-dmabuf-e2e.sh` | PASS: the export returns in microseconds, the record reaches the number ~0.3 ms later, all pixels right; Zink's own path (egl-dmabuf) marked its export for its section without waiting |
+| `scripts/sv-dmabuf-xsession-e2e.sh` (new; two processes, one pool-guest) | PASS: the producer hands the token on 40 µs after a submit that keeps lavapipe busy for ~80 ms; the consumer's copy waits for it on the GPU side and reads the producer's colour in every pixel. With `SVX_NO_ACQUIRE=1` (no acquire, so no wait) the same copy finishes in 2 ms and reads 32768 wrong pixels. The consumer's frame back to the producer, and the section outliving the producer's free |
+| `scripts/wc-dmabuf.sh` (Wine; the client draws each frame 15 ms *after* committing it and completes its own record) | 15 passed: 355 `wc_gpu_fence_v1.wait`s, the compositor held all 355 commits until the frame was done, the bar where the last frame put it |
+| `scripts/sv-pool-e2e.sh` | PASS |
+
+**What is not done.** The compositor's wait blocks its thread (bounded); a
+commit held without blocking would need the surface code. Zink's export and
+the memory fd that follows are paired per thread, by order; a Mesa that asked
+for them in another order would leave the sync page at the previous frame.
+The consumer-to-producer ordering (a producer writing again while
+another session still reads) is as good as the order the GPU process sees the
+marks in. Plasma's clients still need the NixOS side (104.6) to run inside
+`sv-drm ns` with the ICD's environment.
+
+### 104.12 What the compositor pays per frame
+
+2026-10-19, branch `kwin-gpu-zc-comp`. 104.8 measured the guest's compositor
+at 34–35 % of a core under OpenGL against 16–20 % under QPainter, and put it
+down to a read of the whole section at every commit.
+
+**It was not the read.** `present` copies only the commit's damage out of the
+client's buffer into the surface's staging shadow, for a section as for every
+pool. The staging shadow is per surface, and a commit's damage is relative to
+the surface's previous content, which is what that shadow holds, so no
+per-buffer arrears are needed here (the proxy needs them, §27.4, because its
+copies are per buffer). KWin damages its layer with `damage_buffer` and the
+frame's damaged region (`wayland_layer.cpp`). The full-frame work came after
+the read: `compose_tree` recomposited the window's whole tree into its shadow
+at every commit (KWin's 1264x713 black root, a single pixel stretched by a
+viewport, and the 1264x713 layer over it), blending a translucent layer pixel
+by pixel, and `WM_PAINT` handed the whole shadow to `SetDIBitsToDevice`.
+Locally, in KWin's shape with a 64x64 change at 60 fps, that cost 3 % of a core
+with opaque frames and 15–17 % with translucent pixels in the layer. An OpenGL
+framebuffer can carry alpha below 1 where QPainter's frames are opaque; that
+would explain the guest's difference, and was not measured there.
+
+**(a1) Only the damage is recomposed.** `Window::composed` keeps the shape the
+shadow was last composited from: the canvas, and each drawn surface's place,
+size and format. While a commit leaves that shape as it was, only the commit's
+damage is recomposed. `Shadow::compose_stack` recomputes each rectangle from
+the staging shadows alone, and it is the same function the whole canvas is
+drawn with, so a part cannot disagree with the whole, and overlapping
+rectangles give the same pixels. A changed shape, or a change with no damage to
+name (a view, a removed subsurface, a geometry), is recomposed whole.
+`WM_PAINT` hands GDI only the band of rows the update region spans.
+
+**(a2) A window whose picture is one buffer is drawn from that buffer.** The
+conditions: the committing surface is the topmost of a mapped toplevel whose
+caption is not folded, covers the canvas exactly, with no viewport, scale or
+transform between buffer and surface; the tree is as it was last composited;
+the buffer is `Xrgb8888`, or `Argb8888` over nothing but opaque black single
+pixels (premultiplied over black is the buffer's own colour, and GDI draws a
+window opaque); its pool is a `Section` or a `SharedFile`, rows and offset
+DWORD-aligned. KWin's primary layer over its black root is that case. Then
+nothing is read. The section is opened once per buffer
+(`wc_handle::Handle::open_section_object`, readable and writable because GDI
+refuses read-only sections; GDI is its only user and only reads it), the UI
+thread makes a DIB section over it (`CreateDIBSection(…, hSection, offset)`,
+`stride / 4` pixels wide so padded rows fit), selects it into a memory DC and
+`BitBlt`s the update region.
+
+Such a buffer is not released at its commit, because `WM_PAINT` can draw from
+it at any time. The buffer it replaced is released when the UI thread answers
+the `ToUi::Direct` that replaced it (`FromUi::DirectShown`; the answers come in
+order). KWin's swapchain keeps two or three buffers and expects the one shown
+to be held. Leaving the path (any other commit, a changed tree, a DIB that
+could not be made) re-reads the surface's staging shadow whole from the buffer
+still held, recomposites the window whole, and only then tells the UI thread to
+draw the shadow, so it never draws a shadow that is not yet the picture.
+Popups (layered windows), folded captions, and every other pool (arena slices,
+memfds) stay on the shadow, and `WC_DIRECT_PRESENT=off` puts every window
+there.
+
+**How to tell which path a window took.** One log line per window whenever
+it changes:
+
+    wc-compositor: window 1 is drawn directly from its client's buffer, which this process does not read (surface 17, 1280x720 Argb8888, stride 5120, offset 0)
+    wc-compositor: window 1 is drawn from its shadow: <why>
+
+`<why>` is the first condition above that failed. The frame trace's
+`wc.present` and `wc.paint` lines carry `direct=1` on the direct path.
+
+**Measured locally**, under Wine on Xvfb, release builds: the compositor
+process's CPU (utime + stime of the Wine process, `/proc`) over 20 s at 60 fps,
+two runs each. `scripts/wc-dmabuf.sh` with `WC_DMABUF_BENCH="NBUF FMT SQ
+SHAPE"` runs it: a 1280x720 window, three buffers in `/dev/shm` sections used
+as KWin's swapchain uses them (reused only after release, each repainting what
+it owes), an SQ x SQ square moving, only it damaged. `kwin` is KWin's shape (a
+black single pixel, the frames in a subsurface over it); `argbt` is
+translucent.
+
+| shape, damage | before | (a1) | (a1) + (a2) |
+|---|---|---|---|
+| one surface, xrgb, 64x64 | 2.3 / 1.9 % | 1.7 / 1.5 % | 1.5 / 1.2 % |
+| kwin, xrgb, 64x64 | 3.1 / 3.1 % | 1.7 / 1.3 % | 1.5 / 1.5 % |
+| kwin, argb, 64x64 | 3.2 / 4.3 % | 1.1 / 1.3 % | 1.8 / 1.4 % |
+| kwin, argbt, 64x64 | 17.5 / 15.0 % | 2.7 / 1.3 % | 1.8 / 1.4 % |
+| kwin, xrgb, 720x720 moving | 5.2 / 5.2 % | 5.8 / 4.7 % | 3.3 / 3.2 % |
+| kwin, argbt, 720x720 moving | 12.4 / 11.8 % | 6.9 / 8.2 % | 3.0 / 3.5 % |
+
+With little damage, (a1) already does what (a2) does; what remains, about
+1.5 %, is the per-commit work around the pixels (the Wayland dispatch, the
+frame callback, a log line per commit). With much damage, (a2) halves (a1),
+because nothing of the frame is copied on this side. Xvfb stayed under 1.1 %.
+Numbers: `/mnt/datasets/builds/evidence/kwin-gpu-zero-cost/`.
+
+**Checked.** A unit test that a stack recomposed in parts, overlapping parts
+included, is the stack recomposed whole. `scripts/wc-dmabuf.sh`: 13 of 13 (it
+now takes the direct path). `WC_DMABUF_BENCH_CHECK=1`: the compositor's last
+frame dump and the screen (Xvfb's root window) are the client's last buffer
+pixel for pixel, on both paths, in both shapes, opaque and translucent; with
+`toggle` (a buffer in the other format every 50th frame and last) the window
+left the direct path and came back 11 times in 4 s, and the last frame, drawn
+right after leaving, was exact on screen too.
+
+**With §104.11's fence.** A commit held for `wc_gpu_fence_v1.wait` is
+processed only after the wait returns, so when the record said done, the
+direct path, which reads the buffer later still (at `WM_PAINT`), never sees an
+unfinished frame. A wait that gave up (`Late`) or could not wait (`Refused`)
+lets the commit go on unfinished; that client's next buffer commit is then
+drawn from the shadow ("drawn from its shadow: its GPU frame was not done when
+it was committed"), unless the record got there meanwhile
+(`gpu_fence::Unfinished`, unit-tested), and the next commit of that surface
+reads the late commit's damage again, from a buffer that is complete there:
+without it, the part of the late frame's change that the next frame does not
+damage stayed stale on screen (measured: a 64x4 strip). `scripts/wc-dmabuf.sh` with
+`WC_DMABUF_FENCE=1 WC_DMABUF_FENCE_LATE=N` and a bench makes every Nth frame
+miss the 100 ms limit and checks that each such commit fell back.
+
+**On the guest, still to see.**
+
+1. The log line for KWin's window. "Drawn from its shadow: …" names the
+   condition that failed.
+2. That `OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE)` on the GPU
+   process's section succeeds (same user, default DACL, so it should), and
+   that `CreateDIBSection` accepts the section the Intel driver imported. If
+   either fails, the log says "its section could not be opened for GDI" or
+   "cannot be drawn from its client's buffer: CreateDIBSection failed", and the
+   window stays on (a1).
+3. The compositor's CPU by 104.8's method, and the picture: correct, no
+   tearing, the caption and frame unchanged.
+4. Whether GDI's reads of those pages are slow: they are imported into the
+   GPU's device as host memory, and whatever cache attribute the driver gave
+   them, the compositor's `BitBlt` now reads them where `present` read them
+   before.
+
+| gate | result |
+|---|---|
+| `cargo test -p wc-compositor -p wc-handle` | 238 and 55 passed, 0 failed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `cargo clippy -p wc-compositor -p wc-handle` (Linux, `--all-targets`, and the Windows target) | no warning in a line this branch wrote |
 
 ## 105. Windows without ssh: the session boots from the device's header page, and every byte crosses on its rings
 
@@ -34562,6 +35003,7 @@ to wc-proxy. A one-session page is served exactly as before.
 ```text
   boot<TAB>session=ID<TAB>install=NAME<TAB>key=PATH<TAB>control=PATH
       [<TAB>gpu=1][<TAB>audio=VOL][<TAB>nested=1][<TAB>relaunch=DIR]
+      [<TAB>taskbar=NAME[:APP,…]]          (§92.12)
                          -> ok located INDEX MESSAGE  |  err WHY
   wait ID                -> ok ended WHY        (blocks until session ID ends)
   sessions               -> ok INDEX:INSTALL:ID:STATE:MiB/REGIONS ...
@@ -34621,8 +35063,12 @@ The proxy reads the geometry from the region, so the host side needs no flag.
 * **Nested-compositor globals** (§102): created always on a shared
   compositor and offered only to the sessions whose boot said `nested=1`
   (`smithay::wayland::set_nested_filter`, a `can_view` on the three globals).
-* **The relaunch directory** (§92): one per booted session, searched in
-  boot order (`taskbar::add_relaunch_dir`), removed with the session.
+* **The relaunch directory** (§92): one per booted session, removed with the
+  session. Since §92.12 a window's file is looked up only in the directory of
+  the session whose installation owns its identity
+  (`taskbar::Registry::relaunch_dirs`), not in every directory in boot order.
+* **The taskbar identity** (§92.12): the session's installation's, from the
+  boot's `taskbar=` scope (`taskbar::identity_in`).
 * **The output** is the desktop's work area for every session: one desktop,
   one monitor. A per-session `--output` was not needed by any installation.
 * **The linger**: a session whose last connection left `--exit-when-empty`
@@ -34707,8 +35153,11 @@ Logs of that run are in `/mnt/datasets/builds/evidence/windows-multi-install/`.
      shared compositor with it (the job breakaway).
 * **Sound** is per session: each session's sound ring opens its own waveOut
   device; Windows mixes them. Not heard on the guest yet.
-* **Pins and jump lists** (§92) of two installations that publish the same
-  application id share one taskbar identity, as they did before.
+* **Pins and jump lists** (§92) are per installation since §92.12: the boot
+  line's `taskbar=` scope names the session's installation, and its windows,
+  shortcuts, relaunch files and jump list carry
+  `Waycompose.install.<installation>.<app>`, except where deploy kept the old
+  identity for the one installation whose pin has it.
 * **The output** is one for every session (107.4).
 * **A crashed proxy's windows close.** Its session's clients are disconnected
   when the session ends, as a crashed compositor's always were.

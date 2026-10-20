@@ -283,6 +283,8 @@ PipeWire each device is a native node, `wc-pw-node`, paced by the ring's credit.
 scripts/wc-hostint-local.sh [--mode pipewire|on]  # the Linux end without a VM: devices, defaults, credit, links
 wc-launch.exe --install APP                # also registers APP's types (HKCU), with a manifest
 wc-launch.exe --uninstall-assoc [APP]      # removes exactly what the manifest lists
+wc-launch.exe --taskbar-ids [--dry-run]    # deploy: each app's taskbar identity, per installation (§92.12)
+wc-launch.exe --uninstall-taskbar          # this installation's jump lists, shortcuts, relaunch files
 wc-hostint-probe.exe [--get-defaults]      # the host's endpoints, handlers and defaults
 WC_LAUNCH_AUDIO=on|pipewire|system|user-pipewire   # the session's sound server (wc-session)
 WC_LAUNCH_TEST_HOME=DIR                    # tests: the applications get a throwaway HOME and XDG dirs

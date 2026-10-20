@@ -67,6 +67,8 @@ pub enum Request<'a> {
     Open(&'a str),
 }
 mod token;
+// §92.12: which taskbar identity each application has, decided at deploy.
+mod taskbar_id;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -410,6 +412,9 @@ fn run(
     let mut file: Option<&str> = None;
     let mut uninstall_assoc: Option<Option<&str>> = None;
     // §106 (end)
+    // §92.12: deploy's decision of each application's taskbar identity, and
+    // an installation's removal.
+    let (mut taskbar_ids, mut uninstall_taskbar, mut dry_run, mut test_install) = (false, false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -453,6 +458,10 @@ fn run(
                 uninstall_assoc = Some(next.map(String::as_str));
             }
             // §106 (end)
+            "--taskbar-ids" => taskbar_ids = true,
+            "--uninstall-taskbar" => uninstall_taskbar = true,
+            "--dry-run" => dry_run = true,
+            "--test-install" => test_install = true,
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => app = Some(other),
         }
@@ -466,6 +475,12 @@ fn run(
     }
     if stop {
         return win::stop(cfg, p, log);
+    }
+    if taskbar_ids {
+        return win::taskbar_ids(cfg, p, log, dry_run, test_install);
+    }
+    if uninstall_taskbar {
+        return win::uninstall_taskbar(cfg, p, log, dry_run);
     }
     if let Some(id) = install {
         return win::install(cfg, p, log, id);
@@ -958,7 +973,7 @@ mod win {
         // §105: the host is reached only through a session's control ring, so
         // with no session up yet this is done once the session is, before the
         // application is asked for (`first_refresh` below).
-        let first = app.filter(|(section, a)| !relaunch_file(p, section, a).exists()).map(|(s, _)| s);
+        let first = app.filter(|(section, a)| !relaunch_file(cfg, p, section, a).exists()).map(|(s, _)| s);
         if let Some(section) = first
             && (cfg.debug_ssh_transport || p.ctl.exists())
         {
@@ -968,7 +983,7 @@ mod win {
             if let Some(section) = first
                 && !cfg.debug_ssh_transport
                 && let Some((_, a)) = app
-                && !relaunch_file(p, section, a).exists()
+                && !relaunch_file(cfg, p, section, a).exists()
             {
                 refresh(cfg, p, log, section, Refresh::Full);
             }
@@ -1100,6 +1115,7 @@ mod win {
         let gpu_kid = if cfg.gpu_sessions > 0 { spawn_gpu(cfg, p, log) } else { None };
         let mut argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
         argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
+        argv.extend(plan::taskbar_argv(&taskbar_scope(cfg, p).render()));
         argv.extend(plan::boot_argv(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy()));
         if gpu_kid.is_some() {
             argv.push("--boot-gpu".into());
@@ -1289,13 +1305,30 @@ mod win {
             }
         }
         let shared_pid = ensure_compositor(cfg, p, log)?;
-        let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
+        let scope = taskbar_scope(cfg, p).render();
+        let boot_line = |taskbar: Option<&str>| {
+            plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy(), taskbar)
+        };
         log.say(&format!(
-            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
+            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}, taskbar {scope}",
             cfg.installation()
         ));
         let t_boot = Instant::now();
-        let said = user_request(p, &line, Some(Duration::from_secs(120))).map_err(|e| format!("the session did not start: {e}"))?;
+        let said = match user_request(p, &boot_line(Some(&scope)), Some(Duration::from_secs(120))) {
+            // §92.12: the user's compositor was started by an installation
+            // deployed before §92.12, and it refuses the field. The session
+            // still starts; its windows carry the application-wide identity
+            // until that compositor ends, which the log says.
+            Err(e) if e.contains("unknown boot field \"taskbar\"") => {
+                log.say(
+                    "taskbar: THE USER'S COMPOSITOR PREDATES §92.12: this session's windows carry the application-wide \
+                     identity until it ends, not this installation's (§92.12)",
+                );
+                user_request(p, &boot_line(None), Some(Duration::from_secs(120)))
+            }
+            r => r,
+        }
+        .map_err(|e| format!("the session did not start: {e}"))?;
         log.say(&format!("up: {said} ({} ms)", t_boot.elapsed().as_millis()));
         let session = plan::boot_index(&said);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1372,6 +1405,7 @@ mod win {
         // §92. Where this installation keeps each application's relaunch
         // file, so its windows can be pinned as the application.
         argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
+        argv.extend(plan::taskbar_argv(&taskbar_scope(cfg, p).render()));
         // IVSHMEM ARENA (§83). The arena is BAR2 of the VM's ivshmem device, so
         // its size is the device's, set on the VM host, and `arena-mib` decides
         // nothing. Said once per session so that a log read later cannot
@@ -2041,7 +2075,7 @@ mod win {
             return None;
         }
         let (hwnds, ws) = windows_of(pid);
-        let aumid = app_aumid(p, section, app);
+        let aumid = app_aumid(cfg, p, section, app);
         crate::single::find(&ws, pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
     }
 
@@ -2180,11 +2214,225 @@ mod win {
         // is a file nobody sees.
         let desktop = crate::shell::known_folder(&crate::shell::FOLDER_DESKTOP)?;
         let path = desktop.join(format!("{}.lnk", file_name(&app.title)));
-        crate::shell::save_link(&shortcut(p, id, app), &path)?;
+        crate::shell::save_link(&shortcut(cfg, p, id, app), &path)?;
         log.say(&format!("installed {}", path.display()));
         // §106: the types its desktop entry opens, from the host's answer
         // that `refresh` just cached. `--uninstall-assoc` takes them back.
         crate::hostint::deploy(cfg, &p.apps, &exe_path(), icon_path(p, id).as_deref(), id, cached_meta(p, id).as_ref(), log);
+        Ok(())
+    }
+
+    // ------------------------------------------------- §92.12 identities ---
+
+    /// A line in the log and on standard output (deploy reads the log; a
+    /// person running the verb by hand sees the output).
+    fn tell(log: &mut Log, msg: &str) {
+        log.say(msg);
+        println!("{msg}");
+    }
+
+    /// Every shortcut with one of our identities, in the three places one
+    /// can be: the user's pins, the desktop and the Start menu's programs.
+    fn scan_links(log: &mut Log) -> Vec<crate::taskbar_id::Link> {
+        use crate::taskbar_id::{Link, Place};
+        let mut dirs: Vec<(Place, std::path::PathBuf)> = Vec::new();
+        if let Some(a) = std::env::var_os("APPDATA") {
+            dirs.push((Place::Pinned, std::path::PathBuf::from(a).join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar")));
+        }
+        for (place, folder) in [(Place::Desktop, crate::shell::FOLDER_DESKTOP), (Place::StartMenu, crate::shell::FOLDER_PROGRAMS)] {
+            match crate::shell::known_folder(&folder) {
+                Ok(d) => dirs.push((place, d)),
+                Err(e) => tell(log, &format!("taskbar-id: {}: {e}", place.as_str())),
+            }
+        }
+        let mut out = Vec::new();
+        for (place, dir) in dirs {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let path = e.path();
+                if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+                    continue;
+                }
+                // Ours by identity; or, when the identity cannot be read, a
+                // shortcut of some installation's `wc-launch.exe`.
+                let launcher = |t: &str| Path::new(t).file_name().is_some_and(|n| n.eq_ignore_ascii_case("wc-launch.exe"));
+                match crate::shell::read_link(&path) {
+                    Ok((target, aumid))
+                        if aumid.as_deref().map_or(launcher(&target), |a| a.starts_with(crate::taskbar::PREFIX)) =>
+                    {
+                        out.push(Link { place, path: path.display().to_string(), target, aumid });
+                    }
+                    Ok(_) => {}
+                    Err(e) => tell(log, &format!("taskbar-id: {}: {e}", path.display())),
+                }
+            }
+        }
+        out
+    }
+
+    /// `%LOCALAPPDATA%\waycompose\taskbar\<identity>.owner`: which
+    /// installation holds an application-wide identity.
+    fn claim_path(p: &Paths, legacy: &str) -> std::path::PathBuf {
+        p.state_dir.join("taskbar").join(format!("{legacy}.owner"))
+    }
+
+    fn read_claim(p: &Paths, legacy: &str) -> Option<crate::taskbar_id::Claim> {
+        let text = std::fs::read_to_string(claim_path(p, legacy)).ok()?;
+        let owner = text.lines().next()?.trim().to_string();
+        let owner_exists = Path::new(&owner).exists();
+        (!owner.is_empty()).then_some(crate::taskbar_id::Claim { owner, owner_exists })
+    }
+
+    /// §92.12. `--taskbar-ids [--dry-run] [--test-install]`, run by deploy
+    /// after it copied the new ini: decide each application's identity
+    /// (`taskbar_id::decide`), write it into `wc-launch.ini`, claim the
+    /// application-wide identity where this installation keeps it, give this
+    /// installation's own unpinned shortcuts its own identity where it does
+    /// not, and remove the relaunch file of the form it no longer uses.
+    /// `wc-launch.ini.prev`, the ini deploy replaced, carries the decisions
+    /// of earlier deploys, so none flips.
+    pub fn taskbar_ids(cfg: &Config, p: &Paths, log: &mut Log, dry: bool, test: bool) -> Result<(), String> {
+        use crate::config::TaskbarId;
+        use crate::taskbar_id::{ClaimAction, Input, decide};
+        crate::shell::init();
+        let exe = exe_path();
+        let prev_path = p.exe_dir.join("wc-launch.ini.prev");
+        let carried = crate::config::taskbar_ids(&std::fs::read_to_string(&prev_path).unwrap_or_default());
+        let mut text = std::fs::read_to_string(&p.ini).map_err(|e| format!("{}: {e}", p.ini.display()))?;
+        let explicit = crate::config::taskbar_ids(&text);
+        let links = scan_links(log);
+        tell(log, &format!(
+            "taskbar-id: installation {}, {} shortcut(s) of a Waycompose launcher{}{}",
+            cfg.installation(),
+            links.len(),
+            if test { ", a test installation" } else { "" },
+            if dry { ", dry run" } else { "" }
+        ));
+        for l in &links {
+            tell(log, &format!(
+                "taskbar-id:   {} {} -> {} [{}]",
+                l.place.as_str(),
+                l.path,
+                l.target,
+                l.aumid.as_deref().unwrap_or("identity unreadable")
+            ));
+        }
+        let exists = |s: &str| Path::new(s).exists();
+        for (section, app) in &cfg.apps {
+            let legacy = legacy_aumid(p, section, app);
+            let own = appmeta::aumid(Some(cfg.installation()), &app.app_id, &app.desktop, cached_meta(p, section).as_ref());
+            let claim = read_claim(p, &legacy);
+            let d = decide(&Input {
+                legacy_aumid: &legacy,
+                own_exe: &exe,
+                persisted: carried.get(section).or(explicit.get(section)).copied(),
+                test,
+                claim: claim.as_ref(),
+                links: &links,
+                exists: &exists,
+            });
+            let (chosen, other) = if d.id == TaskbarId::Legacy { (&legacy, &own) } else { (&own, &legacy) };
+            tell(log, &format!("taskbar-id: {section} {} {chosen}: {}", d.id.as_str(), d.why));
+            for w in &d.warnings {
+                tell(log, &format!("taskbar-id: {section}: WARNING: {w}"));
+            }
+            for r in &d.rewrite {
+                tell(log, &format!("taskbar-id: {section}: {r}: {legacy} -> {own}"));
+            }
+            if dry {
+                continue;
+            }
+            text = crate::config::set_taskbar_id(&text, section, d.id)?;
+            if d.claim == ClaimAction::Write {
+                let c = claim_path(p, &legacy);
+                let _ = std::fs::create_dir_all(c.parent().unwrap_or(Path::new(".")));
+                std::fs::write(&c, format!("{exe}\n")).map_err(|e| format!("{}: {e}", c.display()))?;
+                tell(log, &format!("taskbar-id: {section}: claimed {legacy} ({})", c.display()));
+            }
+            for r in &d.rewrite {
+                if let Err(e) = crate::shell::set_link_aumid(Path::new(r), &own) {
+                    tell(log, &format!("taskbar-id: {section}: {r}: {e}"));
+                }
+            }
+            if let Some(f) = crate::taskbar::relaunch_file_name(other) {
+                let f = p.apps.join(f);
+                if f.exists() && std::fs::remove_file(&f).is_ok() {
+                    tell(log, &format!("taskbar-id: {section}: removed {}, the form this installation does not use", f.display()));
+                }
+            }
+        }
+        if !dry {
+            std::fs::write(&p.ini, &text).map_err(|e| format!("{}: {e}", p.ini.display()))?;
+            let _ = std::fs::remove_file(&prev_path);
+            Config::parse(&text).map_err(|e| format!("the ini with its taskbar ids does not parse: {e}"))?;
+            tell(log, &format!("taskbar-id: wrote {}", p.ini.display()));
+        }
+        Ok(())
+    }
+
+    /// §92.12. `--uninstall-taskbar [--dry-run]`: take back this
+    /// installation's jump lists (its own identity's, and the
+    /// application-wide one only while it holds the claim), its claims, its
+    /// desktop and Start menu shortcuts, its relaunch files and its jump-list
+    /// files. Never another installation's. Pins are the user's to take off
+    /// the taskbar, and are listed.
+    pub fn uninstall_taskbar(cfg: &Config, p: &Paths, log: &mut Log, dry: bool) -> Result<(), String> {
+        crate::shell::init();
+        let exe = exe_path();
+        let links = scan_links(log);
+        for (section, app) in &cfg.apps {
+            let legacy = legacy_aumid(p, section, app);
+            let own = appmeta::aumid(Some(cfg.installation()), &app.app_id, &app.desktop, cached_meta(p, section).as_ref());
+            let claim = read_claim(p, &legacy);
+            let r = crate::taskbar_id::plan_removal(app.taskbar_id, &own, &legacy, &exe, claim.as_ref(), &links);
+            tell(log, &format!(
+                "taskbar-id: remove {section}: jump list {}, claim {}, {} shortcut(s), {} pin(s) left to the user{}",
+                r.delete_list.as_deref().unwrap_or("(not this installation's)"),
+                if r.remove_claim { "removed" } else { "none" },
+                r.remove_links.len(),
+                r.pins_left.len(),
+                if dry { ", dry run" } else { "" }
+            ));
+            for l in &r.pins_left {
+                tell(log, &format!("taskbar-id:   pinned: {l}"));
+            }
+            if dry {
+                continue;
+            }
+            if let Some(id) = &r.delete_list
+                && let Err(e) = crate::shell::delete_jump_list(id)
+            {
+                tell(log, &format!("taskbar-id: {section}: {e}"));
+            }
+            if r.remove_claim {
+                let _ = std::fs::remove_file(claim_path(p, &legacy));
+            }
+            for l in &r.remove_links {
+                if let Err(e) = std::fs::remove_file(l) {
+                    tell(log, &format!("taskbar-id: {l}: {e}"));
+                }
+            }
+            if app.taskbar_id == crate::config::TaskbarId::Install {
+                let dir = jump_dir(cfg, p, section, app);
+                let _ = std::fs::remove_dir_all(&dir);
+                // `jumplist\<installation>`, once its last application is gone.
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+        if !dry {
+            let mut n = 0;
+            if let Ok(rd) = std::fs::read_dir(&p.apps) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.extension().is_some_and(|x| x == crate::taskbar::RELAUNCH_EXT) && std::fs::remove_file(&path).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+            tell(log, &format!("taskbar-id: removed {n} relaunch file(s) from {}", p.apps.display()));
+        }
         Ok(())
     }
 
@@ -2215,13 +2463,43 @@ mod win {
             .and_then(|t| appmeta::Meta::parse(&t).ok())
     }
 
-    fn app_aumid(p: &Paths, section: &str, app: &crate::config::App) -> String {
-        appmeta::aumid(&app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    /// §92.12. The installation whose identity an application carries here:
+    /// this one's, or `None` for the application-wide identity.
+    fn install_of<'a>(cfg: &'a Config, app: &crate::config::App) -> Option<&'a str> {
+        (app.taskbar_id == crate::config::TaskbarId::Install).then(|| cfg.installation())
+    }
+
+    fn app_aumid(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> String {
+        appmeta::aumid(install_of(cfg, app), &app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    }
+
+    /// The application-wide identity, which this installation carries only
+    /// with `taskbar-id = legacy` (§92.12).
+    fn legacy_aumid(p: &Paths, section: &str, app: &crate::config::App) -> String {
+        appmeta::aumid(None, &app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    }
+
+    /// §92.12. This installation's scope, for the boot and `--taskbar-scope`.
+    pub fn taskbar_scope(cfg: &Config, p: &Paths) -> crate::taskbar::Scope {
+        plan::taskbar_scope(cfg, |section, app| {
+            let meta = cached_meta(p, section);
+            appmeta::window_app_id(&app.app_id, &app.desktop, meta.as_ref()).to_string()
+        })
+    }
+
+    /// §92.12. The jump list's icons, removed pages and refresh period: the
+    /// application's directory as before for the application-wide identity,
+    /// which keeps what the user removed; the installation's own otherwise.
+    fn jump_dir(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
+        match install_of(cfg, app) {
+            None => p.jump.join(section),
+            Some(i) => p.jump.join(i).join(section),
+        }
     }
 
     /// The relaunch file the compositor will look for for this application.
-    pub fn relaunch_file(p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
-        let aumid = app_aumid(p, section, app);
+    pub fn relaunch_file(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
+        let aumid = app_aumid(cfg, p, section, app);
         p.apps.join(crate::taskbar::relaunch_file_name(&aumid).unwrap_or_default())
     }
 
@@ -2231,14 +2509,14 @@ mod win {
     }
 
     /// The shortcut a click, the Start menu or a pin runs: `wc-launch.exe <section>`.
-    fn shortcut(p: &Paths, section: &str, app: &crate::config::App) -> crate::shell::LinkSpec {
+    fn shortcut(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> crate::shell::LinkSpec {
         crate::shell::LinkSpec {
             target: exe_path(),
             args: appmeta::quote_arg(section),
             workdir: p.exe_dir.display().to_string(),
             description: format!("{}, running on the Linux host", app.title),
             icon: icon_path(p, section),
-            aumid: Some(app_aumid(p, section, app)),
+            aumid: Some(app_aumid(cfg, p, section, app)),
             title: None,
         }
     }
@@ -2262,7 +2540,7 @@ mod win {
         crate::shell::init();
         let t = Instant::now();
         let _ = std::fs::create_dir_all(&p.apps);
-        let jump = p.jump.join(section);
+        let jump = jump_dir(cfg, p, section, app);
         let _ = std::fs::create_dir_all(&jump);
         let dark = crate::shell::taskbar_is_dark();
 
@@ -2284,7 +2562,7 @@ mod win {
             }
         }
         let meta = cached_meta(p, section);
-        let aumid = appmeta::aumid(&app.app_id, &app.desktop, meta.as_ref());
+        let aumid = appmeta::aumid(install_of(cfg, app), &app.app_id, &app.desktop, meta.as_ref());
 
         if what == Refresh::Full {
             // 2. The icon, the relaunch file and the Start menu entry.
@@ -2306,7 +2584,7 @@ mod win {
             match crate::shell::known_folder(&crate::shell::FOLDER_PROGRAMS) {
                 Ok(dir) => {
                     let lnk = dir.join(format!("{}.lnk", file_name(&app.title)));
-                    if let Err(e) = crate::shell::save_link(&shortcut(p, section, app), &lnk) {
+                    if let Err(e) = crate::shell::save_link(&shortcut(cfg, p, section, app), &lnk) {
                         log.say(&format!("pins: Start menu {}: {e}", lnk.display()));
                     }
                 }
@@ -2438,8 +2716,8 @@ mod win {
             loop {
                 let secs = cfg
                     .apps
-                    .keys()
-                    .filter_map(|s| std::fs::read_to_string(p.jump.join(s).join("refresh-secs")).ok())
+                    .iter()
+                    .filter_map(|(s, a)| std::fs::read_to_string(jump_dir(&cfg, &p, s, a).join("refresh-secs")).ok())
                     .filter_map(|s| s.trim().parse::<u64>().ok())
                     .min()
                     .unwrap_or(120)

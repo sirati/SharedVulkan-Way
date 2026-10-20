@@ -441,7 +441,7 @@ mod tests {
     }
 
     fn tok(n: u8) -> Token {
-        Token { size: 4096, nonce: [n; 16], name: format!("/dev/shm/sv-{n}") }
+        Token { size: 4096, nonce: [n; 16], name: format!("/dev/shm/sv-{n}"), record: String::new() }
     }
 
     /// A server after CUSE_INIT and one OPEN by `pid`; returns it and the fh.
@@ -718,7 +718,7 @@ mod tests {
     fn the_proc_resolver_reads_real_tokens_of_the_calling_pid() {
         use std::os::fd::AsRawFd;
         let t = tok(9);
-        let fd = token::create(&t).unwrap();
+        let fd = token::create(&t).unwrap().fd;
         let pid = std::process::id();
         assert_eq!(ProcResolver.token(pid, fd.as_raw_fd()), Ok(t.clone()));
 

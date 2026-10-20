@@ -17,8 +17,9 @@
 //!    `vkGetMemoryFdKHR` → a token, read back to the section's NAME;
 //! 3. a second image imported from that token with an explicit plane layout;
 //! 4. a clear of the *imported* image behind a `FOREIGN` → graphics barrier,
-//!    submitted with an exportable semaphore whose `SYNC_FD` export must be -1
-//!    once the GPU is done;
+//!    submitted with an exportable semaphore whose `SYNC_FD` export is -1 at
+//!    once (§104.11); then, as the compositor does, the token's sync page and
+//!    the fence record it names, until the record says the clear is done;
 //! 5. the section opened by NAME on this machine: the pixels are the clear
 //!    colour. Nothing copied them there — that is the zero-copy proof;
 //! 6. a sync fd imported into a semaphore whose wait is then dropped (no
@@ -378,7 +379,31 @@ fn work(instance: &ash::Instance, d: &ash::Device, queue: vk::Queue) -> Result<(
         )
     }
     .map_err(|e| format!("vkGetSemaphoreFdKHR(SYNC_FD): {e:?}"))?;
-    check(sync == -1, format_args!("the SYNC_FD export is -1, already signalled, after {:.1?}", t0.elapsed()))?;
+    // What `zink_screen_import_dmabuf_semaphore` does next: the memory's fd,
+    // for DMA_BUF_IOCTL_IMPORT_SYNC_FILE (which fails ENOTTY on a memfd).
+    let fd3 = unsafe {
+        memfd.get_memory_fd(
+            &vk::MemoryGetFdInfoKHR::default().memory(b.memory).handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+        )
+    }
+    .map_err(|e| format!("vkGetMemoryFdKHR after the export: {e:?}"))?;
+    let exported_in = t0.elapsed();
+    unsafe { libc::close(fd3) };
+    check(sync == -1, format_args!("the SYNC_FD export is -1, returned without waiting, after {exported_in:.1?}"))?;
+
+    // -- 4b. what the compositor does (§104.11): the number from the token's
+    // sync page, then the fence record until it says the work is complete.
+    check(
+        sv_drm::token::record_name_ok(&token.record),
+        format_args!("the token names the session's fence record {}", token.record),
+    )?;
+    let page = sv_drm::token::SyncPage::open(std::os::fd::AsFd::as_fd(&owned))
+        .map_err(|e| format!("the sync page: {e}"))?
+        .ok_or("a version-1 token: no sync page")?;
+    let seq = page.load();
+    check(seq > 0, format_args!("the export stored work number {seq} in the token's sync page"))?;
+    let waited = wait_record(&token.record, seq, std::time::Duration::from_secs(20))?;
+    check(true, format_args!("the fence record reached {seq} {waited:.1?} after the export returned"))?;
 
     // -- 5. the pixels, read from the section by name ------------------------
     let bytes = std::fs::read(&token.name).map_err(|e| format!("open {}: {e}", token.name))?;
@@ -442,6 +467,29 @@ fn work(instance: &ash::Instance, d: &ash::Device, queue: vk::Queue) -> Result<(
     check(!std::path::Path::new(&token.name).exists(), "the section's name is gone once both allocations are freed")?;
     let _ = image_a;
     Ok(())
+}
+
+/// Wait, as the compositor does, until the fence record at `path` says
+/// `completed >= seq`; how long that took.
+pub fn wait_record(path: &str, seq: u64, limit: std::time::Duration) -> Result<std::time::Duration, String> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(path).map_err(|e| format!("open the fence record {path}: {e}"))?;
+    let t = std::time::Instant::now();
+    let mut b = [0u8; 16];
+    loop {
+        f.read_exact_at(&mut b, 0).map_err(|e| format!("read {path}: {e}"))?;
+        if &b[..8] != b"SVFENCE1" {
+            return Err(format!("{path} is not a fence record"));
+        }
+        let done = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        if done >= seq {
+            return Ok(t.elapsed());
+        }
+        if t.elapsed() > limit {
+            return Err(format!("{path} stayed at {done}, below {seq}, for {limit:?}"));
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
 }
 
 /// Dedicated type-0 memory for `image`, exportable as a dma-buf, or imported

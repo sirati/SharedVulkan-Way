@@ -75,6 +75,10 @@ pub struct Config {
     pub nested: bool,
     /// §107: where this installation keeps its relaunch files (§92).
     pub relaunch_dir: Option<PathBuf>,
+    /// §92.12: how this installation's windows are named on the taskbar
+    /// (`taskbar=INSTALL[:APP,…]`). `None` from a launcher before §92.12,
+    /// whose windows keep the application-wide identity.
+    pub taskbar: Option<crate::taskbar::Scope>,
 }
 
 impl Config {
@@ -87,6 +91,13 @@ impl Config {
         }
         if !wc_handle::macboot::valid_installation(&self.install) {
             return Err(format!("{:?} is not an installation name", self.install));
+        }
+        // §92.12: a session names its own installation's windows, never
+        // another's.
+        if let Some(t) = &self.taskbar
+            && t.install != self.install
+        {
+            return Err(format!("taskbar={} is not installation {}'s scope", t.render(), self.install));
         }
         Ok(())
     }
@@ -119,6 +130,9 @@ impl Config {
         if let Some(d) = &self.relaunch_dir {
             f.push(format!("relaunch={}", d.display()));
         }
+        if let Some(t) = &self.taskbar {
+            f.push(format!("taskbar={}", t.render()));
+        }
         f.join("\t")
     }
 
@@ -145,6 +159,7 @@ impl Config {
                 "audio" => c.audio_volume = Some(v.parse::<u8>().map_err(|_| format!("audio={v}: a volume, 0..100"))?.min(100)),
                 "nested" => c.nested = v == "1",
                 "relaunch" => c.relaunch_dir = Some(v.into()),
+                "taskbar" => c.taskbar = Some(crate::taskbar::Scope::parse(v)?),
                 _ => return Err(format!("unknown boot field {k:?}")),
             }
         }
@@ -616,8 +631,16 @@ fn boot_session(cfg: Config) -> Result<(Arc<Sess>, String), String> {
     let sess = Arc::new(Sess::new(index, cfg));
     h.sessions.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&sess));
     h.ever.store(true, Ordering::Relaxed);
-    if let Some(d) = &sess.cfg.relaunch_dir {
-        crate::taskbar::add_relaunch_dir(d.clone());
+    // §92.12: the installation its windows are named for, and where its
+    // relaunch files are.
+    let refused = crate::taskbar::add_session(index, sess.cfg.taskbar.clone(), sess.cfg.relaunch_dir.clone());
+    if !refused.is_empty() {
+        say(&format!(
+            "taskbar: session {index} ({}) asked for the application-wide identity of {}, which another \
+             installation's session holds; its windows get their own (§92.12)",
+            sess.cfg.install,
+            refused.join(", ")
+        ));
     }
     let answer = {
         let _turn = h.boot_turn.lock().unwrap_or_else(|e| e.into_inner());
@@ -1061,9 +1084,7 @@ fn end(sess: &Arc<Sess>, why: &str) {
             ));
         }
     }
-    if let Some(d) = &sess.cfg.relaunch_dir {
-        crate::taskbar::remove_relaunch_dir(d);
-    }
+    crate::taskbar::remove_session(sess.index);
     h.sessions.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| !Arc::ptr_eq(s, sess));
     h.changed.notify_all();
 }
@@ -1610,6 +1631,7 @@ mod tests {
             audio_volume: Some(80),
             nested: true,
             relaunch_dir: Some(r"C:\Users\First Last\wcivs\apps".into()),
+            taskbar: Some(crate::taskbar::Scope::parse("wcivs:firefox").unwrap()),
         };
         let line = c.request_line();
         assert!(!line.contains('\n'));
@@ -1617,6 +1639,7 @@ mod tests {
         assert_eq!(back.request_line(), line);
         assert_eq!(back.key_file, c.key_file);
         assert!(back.gpu && back.nested);
+        assert_eq!(back.taskbar, c.taskbar);
         assert_eq!(back.audio_volume, Some(80));
     }
 
@@ -1643,5 +1666,19 @@ mod tests {
         assert!(Config::parse_request(&format!("{ok}\tcolour=red")).unwrap_err().contains("unknown boot field"));
         assert!(Config::parse_request(&format!("{ok}\taudio=loud")).is_err());
         assert!(Config::parse_request("bootx\tsession=s-1").is_err());
+    }
+
+    /// §92.12: the session names its own installation's windows: a scope
+    /// of another installation, or one that is not a scope, is refused.
+    #[test]
+    fn a_boot_s_taskbar_scope_is_its_own_installation_s() {
+        let ok = "boot\tsession=s-1\tinstall=wcivs\tkey=k";
+        let c = Config::parse_request(&format!("{ok}\ttaskbar=wcivs:firefox")).unwrap();
+        assert_eq!(c.taskbar.unwrap().identity("firefox", 1), "Waycompose.app.firefox");
+        let c = Config::parse_request(&format!("{ok}\ttaskbar=wcivs")).unwrap();
+        assert_eq!(c.taskbar.unwrap().identity("firefox", 1), "Waycompose.install.wcivs.firefox");
+        assert!(Config::parse_request(ok).unwrap().taskbar.is_none(), "a launcher before §92.12");
+        assert!(Config::parse_request(&format!("{ok}\ttaskbar=wcpins")).unwrap_err().contains("not installation wcivs"));
+        assert!(Config::parse_request(&format!("{ok}\ttaskbar=wcivs:a b")).is_err());
     }
 }
