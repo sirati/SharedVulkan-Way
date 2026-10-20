@@ -90,6 +90,9 @@ if [ -z "$NODE" ]; then
 fi
 [ -c "${NODE:-}" ] || { echo "no render node (SVFS_NODE)"; exit 2; }
 for n in /sys/class/drm/renderD* /sys/class/drm/card[0-9]; do
+  # An explicit NVIDIA node is a valid isolated hardware gate. Keep its
+  # namespace node while hiding the other physical NVIDIA device paths.
+  [ "/dev/dri/$(basename "$n")" = "$NODE" ] && continue
   [ "$(cat "$n/device/vendor" 2>/dev/null)" = 0x10de ] && HIDE+=(--hide "/dev/dri/$(basename "$n")")
 done
 DEV=$(stat -c '%Hr:%Lr' "$NODE")
