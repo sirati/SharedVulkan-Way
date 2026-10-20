@@ -164,6 +164,10 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  seccompClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-seccomp-client"; source = ./seccomp-client.c;
+    linkFlags = [ "-pthread" ];
+  };
   socketClient = guest.callPackage ./client-probe.nix {
     programName = "hl-socket-client"; source = ./socket-client.c;
   };
@@ -208,8 +212,11 @@ let
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
+      for mode in --basic --backend-denial --trap --tsync; do
+        "$HL_RUNNER" ${seccompClient}/bin/hl-seccomp-client "$mode"
+      done
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient probeRunner;
 }

@@ -1,0 +1,105 @@
+#define _GNU_SOURCE
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/audit.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+#define CHECK(c) do { if (!(c)) { fprintf(stderr,"seccomp probe failed line %d errno=%d\n",__LINE__,errno); return 1; } } while(0)
+static int filter(unsigned nr, unsigned action, unsigned flags) {
+    struct sock_filter p[]={BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,nr,0,1),BPF_STMT(BPF_RET|BPF_K,action),
+        BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+    struct sock_fprog f={4,p};
+    return syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,flags,&f);
+}
+static volatile sig_atomic_t trapped;
+static void trap(int sig,siginfo_t *info,void *opaque) {
+    ucontext_t *u=opaque;
+    int ok=sig==SIGSYS && info->si_code==SYS_SECCOMP && info->si_errno==73 &&
+        info->si_syscall==SYS_getppid && info->si_arch==AUDIT_ARCH_AARCH64 && info->si_call_addr;
+#if defined(__aarch64__)
+    ok=ok && u->uc_mcontext.regs[0]==0x12345678;
+    u->uc_mcontext.regs[0]=0x76543210;
+#else
+    (void)u; ok=0;
+#endif
+    trapped=ok ? 1 : -1;
+}
+static atomic_int stage;
+static void *worker(void *unused) {
+    (void)unused;
+    int before=prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0);
+    atomic_store(&stage,1);
+    while (atomic_load(&stage)==1) sched_yield();
+    errno=0; long r=syscall(SYS_getppid);
+    return (void *)(long)(before==0 && r==-1 && errno==77 && prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
+}
+int main(int argc,char **argv) {
+    if (argc==2 && !strcmp(argv[1],"--exec-child")) {
+        errno=0; CHECK(syscall(SYS_getppid)==-1 && errno==71);
+        CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
+        return 0;
+    }
+    CHECK(argc==2);
+    CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==0);
+    if (!strcmp(argv[1],"--basic")) {
+        errno=0; CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,0)==-1 && errno==EACCES);
+        errno=0; CHECK(prctl(PR_SET_NO_NEW_PRIVS,0,0,0,0)==-1 && errno==EINVAL);
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
+        errno=0; CHECK(prctl(PR_SET_NO_NEW_PRIVS,0,0,0,0)==-1 && errno==EINVAL);
+        errno=0; CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,1U<<31)==-1 && errno==EINVAL);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,0)==0);
+        errno=0; CHECK(syscall(SYS_getppid)==-1 && errno==71);
+        CHECK(prctl(PR_GET_SECCOMP)==2);
+        pid_t child=fork(); CHECK(child>=0);
+        if (!child) {
+            char *args[]={argv[0],"--exec-child",NULL};
+            execv(argv[0],args); _exit(93);
+        }
+        int status; CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+        puts("seccomp basic: NNP, unsupported flags, ERRNO, fork+exec inheritance passed");
+    } else if (!strcmp(argv[1],"--backend-denial")) {
+        int fds[2]; CHECK(pipe2(fds,O_NONBLOCK)==0);
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        struct sock_filter p[]={BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_write,0,3),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,16),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,(unsigned)fds[1],0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|79),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+        struct sock_fprog f={6,p}; CHECK(syscall(SYS_seccomp,1,0,&f)==0);
+        errno=0; CHECK(write(fds[1],"x",1)==-1 && errno==79);
+        char ch; errno=0; CHECK(read(fds[0],&ch,1)==-1 && errno==EAGAIN);
+        CHECK(close(fds[1])==0); CHECK(read(fds[0],&ch,1)==0); CHECK(close(fds[0])==0);
+        puts("seccomp backend denial: filtered write delivered no pipe byte");
+    } else if (!strcmp(argv[1],"--trap")) {
+        struct sigaction a={0}; a.sa_sigaction=trap; a.sa_flags=SA_SIGINFO;
+        CHECK(sigaction(SIGSYS,&a,NULL)==0);
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_TRAP|73,0)==0);
+        CHECK(syscall(SYS_getppid,0x12345678)==0x76543210 && trapped==1);
+        puts("seccomp trap: SIGSYS metadata and saved syscall argument passed");
+    } else if (!strcmp(argv[1],"--tsync")) {
+        pthread_t t; CHECK(pthread_create(&t,NULL,worker,NULL)==0);
+        while (!atomic_load(&stage)) sched_yield();
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|77,SECCOMP_FILTER_FLAG_TSYNC)==0);
+        atomic_store(&stage,2); void *result; CHECK(pthread_join(t,&result)==0 && result==(void *)1);
+        puts("seccomp TSYNC: existing thread receives filter and NNP");
+    } else return 2;
+    return 0;
+}
