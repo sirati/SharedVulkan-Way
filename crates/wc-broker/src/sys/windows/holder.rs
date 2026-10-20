@@ -423,6 +423,13 @@ mod tests {
         let endpoint = pipe.clone();
         let worker = std::thread::spawn(move || serve(&endpoint, HOLDER_SDDL).unwrap());
         let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let request_quit = || loop {
+            match super::quit(&pipe) {
+                Err(e) if matches!(e.raw_os_error(), Some(2 | 231)) && std::time::Instant::now() < until =>
+                    std::thread::sleep(std::time::Duration::from_millis(10)),
+                result => break result,
+            }
+        };
         let mut f = loop {
             match open_pipe(&pipe) {
                 Ok(f) => break f,
@@ -443,7 +450,7 @@ mod tests {
         rd.read_line(&mut reply).unwrap();
         assert_eq!(reply, "ok\n");
         drop(rd);
-        assert!(quit(&pipe).unwrap_err().to_string().contains("retained 1 region"));
+        assert!(request_quit().unwrap_err().to_string().contains("retained 1 region"));
         assert!(!worker.is_finished());
         // The temporary view was unmapped before quit. Only the retained
         // handle now keeps the section and its bytes alive.
@@ -454,7 +461,7 @@ mod tests {
         let mut f = loop {
             match open_pipe(&pipe) {
                 Ok(f) => break f,
-                Err(e) if e.raw_os_error() == Some(231) && std::time::Instant::now() < until =>
+                Err(e) if matches!(e.raw_os_error(), Some(2 | 231)) && std::time::Instant::now() < until =>
                     std::thread::sleep(std::time::Duration::from_millis(10)),
                 Err(e) => panic!("holder unavailable after refused quit: {e}"),
             }
@@ -465,7 +472,7 @@ mod tests {
         rd.read_line(&mut reply).unwrap();
         assert_eq!(reply, "ok\n");
         drop(rd);
-        quit(&pipe).unwrap();
+        request_quit().unwrap();
         worker.join().unwrap();
     }
 }
