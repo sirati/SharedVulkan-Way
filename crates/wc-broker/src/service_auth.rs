@@ -308,7 +308,8 @@ impl Authenticator {
             Phase::RegisterConsumer
             | Phase::Accept
             | Phase::ConsumerReleased
-            | Phase::TransferCancelAck => roles.consumer,
+            | Phase::TransferCancelAck
+            | Phase::PrepareDeclined => roles.consumer,
         };
         if origin != required {
             return Err(denied("service control phase is not this endpoint's role"));

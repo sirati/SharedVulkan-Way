@@ -72,6 +72,7 @@ pub enum Phase {
     GrantQuiescent = 13,
     GrantReleaseCommit = 14,
     TransferCancelAck = 15,
+    PrepareDeclined = 16,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Payload {
@@ -180,7 +181,10 @@ impl Message {
                     && p.consumer == 0
                     && extent
             }
-            Phase::Prepare | Phase::TransferCancelled | Phase::TransferCancelAck => {
+            Phase::Prepare
+            | Phase::TransferCancelled
+            | Phase::TransferCancelAck
+            | Phase::PrepareDeclined => {
                 p.producer_registration != 0
                     && p.recipient_registration != 0
                     && p.allocation != 0
@@ -303,6 +307,7 @@ impl Message {
             13 => Phase::GrantQuiescent,
             14 => Phase::GrantReleaseCommit,
             15 => Phase::TransferCancelAck,
+            16 => Phase::PrepareDeclined,
             _ => return Err(bad("unknown service control phase")),
         };
         let sequence = r.u64()?;

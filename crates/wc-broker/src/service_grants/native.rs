@@ -579,6 +579,12 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             _ => return Err(denied("native retirement proof not irreversibly retired")),
         }
         drop(state);
+        record.bump_lineage()?;
+        record.note_terminal(
+            proof.ticket.allocation,
+            proof.ticket.reference,
+            Some((proof.identity.key.instance, proof.identity.key.export)),
+        );
         record.native_holds.remove(&proof.ticket.id);
         Ok(())
     }

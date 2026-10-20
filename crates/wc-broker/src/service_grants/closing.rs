@@ -102,6 +102,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             return self.finish_remote_consumer_close(lifecycle, token);
         }
         let record = self.records.get_mut(&token.grant.id).unwrap();
+        record.bump_lineage()?;
         let mut terminal_frame = None;
         match token.local {
             Some((key, None)) => {
@@ -114,7 +115,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                     record.table.close_producer(token.process, key)?;
                 }
                 record.producers.remove(&key);
-                if record.remote_producer_announced(key) {
+                if record.take_remote_producer_announcement(key) {
                     match lifecycle.seal(
                         &mut record.channel,
                         Phase::ProducerRetired,
@@ -151,10 +152,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 ));
             }
         }
-        *record
-            .closing
-            .get_mut(&(token.allocation, token.reference))
-            .unwrap() = true;
+        record.note_terminal(token.allocation, token.reference, None);
+        record.closing.remove(&(token.allocation, token.reference));
         Ok(terminal_frame)
     }
 }

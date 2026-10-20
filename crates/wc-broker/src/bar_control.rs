@@ -449,6 +449,9 @@ impl Allocator {
             self.allocations.remove(&key);
         }
     }
+    // Admission bookkeeping only. Neither value is retirement authority.
+    pub(crate) fn admitted_allocations(&self) -> usize { self.allocations.len() }
+    pub(crate) fn admitted_references(&self) -> usize { self.allocations.values().map(|a| a.pending.len() + a.consumers.len()).sum() }
     pub fn extent(&self, key: Key) -> Option<Extent> {
         self.allocations.get(&key).map(|a| a.extent)
     }

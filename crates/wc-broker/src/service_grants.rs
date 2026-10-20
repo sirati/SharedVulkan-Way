@@ -32,6 +32,33 @@ pub use remote::{
     RemoteRegistration,
 };
 
+/// Finite recurring metadata policy. Pending admission reserves its eventual
+/// consumer slot, so Accept does not depend on new capacity being available.
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceLimits {
+    grants: usize,
+    registrations: usize,
+    allocations: usize,
+    references: usize,
+}
+impl ResourceLimits {
+    pub fn new(
+        grants: usize,
+        registrations: usize,
+        allocations: usize,
+        references: usize,
+    ) -> io::Result<Self> {
+        if [grants, registrations, allocations, references].contains(&0) {
+            return Err(denied("zero protected resource limit"));
+        }
+        Ok(Self {
+            grants,
+            registrations,
+            allocations,
+            references,
+        })
+    }
+}
 const PAGE: u64 = 4096;
 fn denied(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, s)
@@ -190,6 +217,52 @@ struct Record<B: OriginalBacking> {
     native_holds: BTreeMap<u64, native::Hold>,
     untracked_native: bool,
     closing: BTreeMap<(u64, native::ProjectionReference), bool>,
+    lineage_digest: [u8; 32],
+    lineage_revision: u64,
+}
+impl<B: OriginalBacking> Record<B> {
+    fn bump_lineage(&mut self) -> io::Result<()> {
+        self.lineage_revision = self
+            .lineage_revision
+            .checked_add(1)
+            .ok_or_else(|| denied("lineage revision exhausted"))?;
+        Ok(())
+    }
+    fn note_terminal(
+        &mut self,
+        allocation: u64,
+        reference: native::ProjectionReference,
+        native_key: Option<([u8; 16], u64)>,
+    ) {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"wc-broker/private-terminal-receipt/v1\0");
+        digest.update(self.lineage_digest);
+        digest.update(self.lineage_revision.to_le_bytes());
+        digest.update(allocation.to_le_bytes());
+        let (kind, registration, consumer) = match reference {
+            native::ProjectionReference::Producer { registration } => (1u8, registration, 0),
+            native::ProjectionReference::Consumer {
+                registration,
+                consumer,
+            } => (2, registration, consumer),
+            native::ProjectionReference::RemoteConsumer {
+                registration,
+                consumer,
+            } => (3, registration, consumer),
+        };
+        digest.update([kind]);
+        digest.update(registration.to_le_bytes());
+        digest.update(consumer.to_le_bytes());
+        if let Some((instance, export)) = native_key {
+            digest.update([1]);
+            digest.update(instance);
+            digest.update(export.to_le_bytes());
+        } else {
+            digest.update([0]);
+        }
+        self.lineage_digest = digest.finalize().into();
+    }
 }
 /// Owns all categories and all sessions in one physical free list. Construction
 /// claims the context exactly once; dropping it cannot start a parallel owner.
@@ -199,6 +272,7 @@ pub struct ProtectedGrants<S: DurableStore, B: OriginalBacking> {
     free: Vec<FreeRun>,
     records: BTreeMap<u64, Record<B>>,
     geometry: BackingGeometry,
+    resource_limits: ResourceLimits,
     next_projection: u64,
     native_exports: Arc<std::sync::Mutex<Option<native::Provider>>>,
 }
@@ -291,9 +365,26 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             free,
             records: BTreeMap::new(),
             geometry,
+            resource_limits: ResourceLimits::new(64, 128, 256, 1024)?,
             next_projection: 1,
             native_exports: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+    pub fn configure_resource_limits(&mut self, limits: ResourceLimits) -> io::Result<()> {
+        if !self.records.is_empty() {
+            return Err(denied("resource policy already in use"));
+        }
+        self.resource_limits = limits;
+        Ok(())
+    }
+    fn admit_grant(&self) -> io::Result<()> {
+        if self.records.len() >= self.resource_limits.grants {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "whole grant admission saturated",
+            ));
+        }
+        Ok(())
     }
     fn check_lifecycle(&self, lifecycle: &Lifecycle<S, B>) -> io::Result<()> {
         if !lifecycle.belongs_to(&self.context) {
@@ -325,6 +416,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         capacity: u64,
     ) -> io::Result<GrantId> {
         self.check_lifecycle(lifecycle)?;
+        self.admit_grant()?;
         if self.context.origin() != self.context.grantor() {
             return Err(denied(
                 "only source-wide canonical grantor may choose original ranges",
@@ -365,6 +457,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         frame: &Frame,
     ) -> io::Result<GrantId> {
         self.check_lifecycle(lifecycle)?;
+        self.admit_grant()?;
         let binding = lifecycle.incoming_grant(frame)?;
         if self.records.contains_key(&binding.grant) {
             return Err(denied("canonical peer grant ID already installed"));
@@ -428,8 +521,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         } else {
             guard.backing.initialize_zeroed(offset, length)?;
         }
-        let region =
-            u32::try_from(id).map_err(|_| denied("canonical bookkeeping IDs exhausted"))?;
+        let region = 1; // Private per-grant legacy bookkeeping, not full grant ID.
         // The legacy table has only a u8 session slot. This private table is
         // per exact canonical grant, so slot1 is bookkeeping normalization,
         // NEVER the original session authority. The retained outer Binding's
@@ -454,6 +546,20 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         };
         // SAFETY: canonical record above, never cooperative Directory state.
         let table = unsafe { Allocator::from_delegated_grant(id, identity, grant, guard.clone())? };
+        let lineage_digest = {
+            use sha2::Digest;
+            sha2::Sha256::digest(
+                crate::service_control::Message {
+                    binding: binding.clone(),
+                    origin: binding.roles.grantor,
+                    sequence: 1,
+                    phase: Phase::Grant,
+                    payload: Payload::default(),
+                }
+                .encode()?,
+            )
+            .into()
+        };
         self.records.insert(
             id,
             Record {
@@ -468,6 +574,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 native_holds: BTreeMap::new(),
                 untracked_native: false,
                 closing: BTreeMap::new(),
+                lineage_digest,
+                lineage_revision: 0,
             },
         );
         Ok(GrantId {
@@ -535,6 +643,12 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         let record = self.record(lifecycle, grant)?;
         if user != record.table.grant().user {
             return Err(denied("process user differs from canonical grant"));
+        }
+        if record.processes.len() >= self.resource_limits.registrations {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "registration admission saturated",
+            ));
         }
         let native = NativeProcess {
             role,
@@ -642,6 +756,14 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         capacity: u64,
     ) -> io::Result<(AllocationId, Extent)> {
         self.process_role(lifecycle, process, ProcessRole::Producer)?;
+        if self.records[&process.grant.id].table.admitted_allocations()
+            >= self.resource_limits.allocations
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "allocation admission saturated",
+            ));
+        }
         let (key, extent) = self
             .records
             .get_mut(&process.grant.id)
@@ -697,6 +819,14 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.allocation(lifecycle, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         Self::same_grant(&recipient.grant, &allocation.grant)?;
+        if self.records[&allocation.grant.id].admitted_references()
+            >= self.resource_limits.references
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "reference admission saturated",
+            ));
+        }
         let transfer = self
             .records
             .get_mut(&allocation.grant.id)
@@ -2314,6 +2444,109 @@ mod tests {
                 .extent(allocation.key)
                 .is_none()
         );
+    }
+    #[test]
+    fn repeated_local_reference_cycles_compact_history_and_return_allocation_capacity() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        owner
+            .configure_resource_limits(ResourceLimits::new(1, 2, 1, 1).unwrap())
+            .unwrap();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        for _ in 0..100 {
+            let (allocation, extent) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+            assert_eq!(extent.offset, PAGE);
+            let close = owner
+                .begin_close_producer(&life, &producer, &allocation)
+                .unwrap();
+            owner.finish_close_reference(&life, &close).unwrap();
+            assert!(owner.records[&grant.id].closing.is_empty());
+            assert!(owner.records[&grant.id].producers.is_empty());
+            assert_eq!(owner.records[&grant.id].table.admitted_allocations(), 0);
+        }
+        assert_eq!(owner.records[&grant.id].lineage_revision, 100);
+        assert_ne!(owner.records[&grant.id].lineage_digest, [0; 32]);
+    }
+    #[test]
+    fn remote_saturation_decline_burns_exact_pending_and_closing_pin_once() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        b.resource_limits = ResourceLimits::new(1, 2, 4, 1).unwrap();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (first, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &first).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = a.prepare_remote(&wl, &p, &first, &remote).unwrap();
+        let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Prepared(p) => p,
+            _ => panic!(),
+        };
+        let (_, accepted) = b.accept_remote(&ll, &c, &pending).unwrap();
+        a.apply_remote(&wl, &ga, &accepted).unwrap();
+        let (second, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &second).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let (outgoing, prepare) = a
+            .prepare_remote_with_handle(&wl, &p, &second, &remote)
+            .unwrap();
+        let decline = match b.apply_remote(&ll, &gb, &prepare).unwrap() {
+            RemoteApplied::Declined(frame) => frame,
+            _ => panic!(),
+        };
+        let closing = a.begin_close_producer(&wl, &p, &second).unwrap();
+        let retired = a.finish_close_reference(&wl, &closing).unwrap().unwrap();
+        b.apply_remote(&ll, &gb, &retired).unwrap();
+        let cancel = a.begin_cancel_remote(&wl, &p, &outgoing).unwrap();
+        assert!(matches!(
+            a.apply_remote(&wl, &ga, &decline).unwrap(),
+            RemoteApplied::DeclineAcknowledged
+        ));
+        assert!(a.records[&ga.id].table.extent(second.key).is_none());
+        assert!(a.records[&ga.id].table.extent(first.key).is_some());
+        assert!(a.apply_remote(&wl, &ga, &decline).is_err());
+        assert!(b.apply_remote(&ll, &gb, &prepare).is_err());
+        assert!(b.apply_remote(&ll, &gb, &cancel).is_err());
+        assert!(a.begin_cancel_remote(&wl, &p, &outgoing).is_err());
+    }
+    #[test]
+    fn repeated_remote_resource_cycles_do_not_accumulate_allocation_or_transfer_maps() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        a.resource_limits = ResourceLimits::new(1, 2, 1, 1).unwrap();
+        b.resource_limits = a.resource_limits;
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        for _ in 0..100 {
+            let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+            let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+            b.apply_remote(&ll, &gb, &frame).unwrap();
+            let frame = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+            let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+                RemoteApplied::Prepared(p) => p,
+                _ => panic!(),
+            };
+            let (consumer, accepted) = b.accept_remote(&ll, &c, &pending).unwrap();
+            a.apply_remote(&wl, &ga, &accepted).unwrap();
+            let close = b.begin_close_remote_consumer(&ll, &c, &consumer).unwrap();
+            let released = b.finish_close_reference(&ll, &close).unwrap().unwrap();
+            a.apply_remote(&wl, &ga, &released).unwrap();
+            let close = a.begin_close_producer(&wl, &p, &allocation).unwrap();
+            let retired = a.finish_close_reference(&wl, &close).unwrap().unwrap();
+            b.apply_remote(&ll, &gb, &retired).unwrap();
+            assert_eq!(a.records[&ga.id].admitted_references(), 0);
+            assert_eq!(b.records[&gb.id].admitted_references(), 0);
+            assert!(a.records[&ga.id].closing.is_empty());
+            assert!(b.records[&gb.id].closing.is_empty());
+        }
     }
     #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {
