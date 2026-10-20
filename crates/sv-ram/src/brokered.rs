@@ -187,7 +187,9 @@ pub struct BrokerMappers {
     uid: Option<u32>,
     pool: String,
     make: Box<MakeParts>,
-    live: BTreeMap<u32, Published>,
+    /// By (region, epoch): a pool may reuse a region index while its
+    /// previous epoch still waits for its holders.
+    live: BTreeMap<(u32, u64), Published>,
     drained: Arc<Mutex<BTreeSet<u64>>>,
     state: Option<PathBuf>,
 }
@@ -271,7 +273,7 @@ impl BrokerMappers {
     fn save(&self) {
         let Some(path) = self.state_file() else { return };
         let mut s = String::new();
-        for (k, p) in &self.live {
+        for ((k, _), p) in &self.live {
             let runs: Vec<String> = p.runs.iter().map(|(o, l)| format!("{o}:{l}")).collect();
             let all: BTreeSet<Proc> = p.holders.union(&p.inherited).copied().collect();
             s.push_str(&format!("region {k} {} {} {}\n", p.epoch, runs.join(","), procs_text(&all)));
@@ -353,14 +355,14 @@ impl BrokerMappers {
                     if !alive.is_empty() {
                         say(&format!("region {}: held for the previous run's holders {}", r.k, procs_text(&alive)));
                     }
-                    self.live.insert(r.k, Published { id: u64::MAX, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
+                    self.live.insert((r.k, r.epoch), Published { id: u64::MAX, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
                     continue;
                 }
             };
             match self.publish_parts(uid, r.k, r.epoch, &r.runs, peer.ram(), None) {
                 Ok(id) => {
                     say(&format!("region {} (epoch {}): published by the previous run; its holders then: {}, alive now: {}", r.k, r.epoch, procs_text(&r.holders), procs_text(&alive)));
-                    self.live.insert(r.k, Published { id, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
+                    self.live.insert((r.k, r.epoch), Published { id, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
                 }
                 Err(e) => say(&format!("region {} (epoch {}) of the previous run: {e}", r.k, r.epoch)),
             }
@@ -370,33 +372,22 @@ impl BrokerMappers {
 
     /// Regions published now: `(k, broker id)`.
     pub fn published(&self) -> Vec<(u32, u64)> {
-        self.live.iter().map(|(k, p)| (*k, p.id)).collect()
+        self.live.iter().map(|((k, _), p)| (*k, p.id)).collect()
     }
 }
 
 impl Mappers for BrokerMappers {
     fn publish(&mut self, m: &Mapped, ram: BorrowedFd<'_>) -> Result<(), String> {
-        if let Some(old) = self.live.get(&m.k)
-            && old.epoch != m.epoch
-        {
-            // The peer let the old epoch go only after `let_go` said so, so
-            // a record here is one the table replaced; a host mapper of it
-            // would be a bug elsewhere, so it stays held, never reused.
-            return Err(format!("region {} of epoch {} is still published", m.k, old.epoch));
-        }
         let uid = self.owner_uid()?;
         let id = self.publish_parts(uid, m.k, m.epoch, &m.runs, ram, Some(&m.view))?;
-        self.live.insert(m.k, Published { id, epoch: m.epoch, runs: m.runs.clone(), retiring: false, holders: BTreeSet::new(), inherited: BTreeSet::new(), held_logged: false });
+        self.live.insert((m.k, m.epoch), Published { id, epoch: m.epoch, runs: m.runs.clone(), retiring: false, holders: BTreeSet::new(), inherited: BTreeSet::new(), held_logged: false });
         self.save();
         Ok(())
     }
 
     fn let_go(&mut self, k: u32, epoch: u64) -> bool {
-        let Some(p) = self.live.get_mut(&k) else { return true };
-        if p.epoch != epoch {
-            // Never published for this epoch.
-            return true;
-        }
+        // Never published for this epoch: nothing of the broker maps it.
+        let Some(p) = self.live.get_mut(&(k, epoch)) else { return true };
         if !p.retiring {
             p.retiring = true;
             if p.id != u64::MAX {
@@ -406,7 +397,7 @@ impl Mappers for BrokerMappers {
             }
             say(&format!("region {k} (epoch {epoch}): retiring; UNMAPPED once its last lease has ended"));
         }
-        let p = self.live.get_mut(&k).expect("present");
+        let p = self.live.get_mut(&(k, epoch)).expect("present");
         let drained = p.id == u64::MAX || self.drained.lock().unwrap_or_else(|e| e.into_inner()).contains(&p.id);
         if !drained {
             return false;
@@ -424,7 +415,7 @@ impl Mappers for BrokerMappers {
             self.drained.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.publisher.unpublish(id);
         }
-        self.live.remove(&k);
+        self.live.remove(&(k, epoch));
         self.save();
         say(&format!("region {k} (epoch {epoch}): drained; the broker's udmabufs are closed"));
         true
@@ -845,6 +836,33 @@ mod tests {
         let ev = peer.scan(|_| {});
         assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 2 }), "{ev:?}");
         assert!(matches!(p.poll().unwrap()[0], Event::Freed { k: 2, .. }));
+    }
+
+    /// The pool reuses a region index while the previous epoch still waits
+    /// for a holder: both are published, each answered on its own.
+    #[test]
+    fn a_reused_region_index_is_a_new_region_beside_the_retiring_one() {
+        let r = rig(32);
+        let sim = SimGuestRam::open(r.ram_path.to_str().unwrap()).unwrap();
+        let mut p = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
+        let mut peer = peer(&r);
+        let fake = Arc::new(Fake::default());
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), None)));
+        let a = p.announce(1, 4 << 20).unwrap();
+        peer.scan(|_| {});
+        p.poll().unwrap();
+        fake.open(1, std::process::id());
+        p.retire(a);
+        peer.scan(|_| {});
+        let b = p.announce(1, 4 << 20).unwrap();
+        let ev = peer.scan(|_| {});
+        assert!(ev.iter().any(|e| matches!(e, PeerEvent::Mapped { k: 1, .. })), "{ev:?}");
+        assert_eq!(fake.log.lock().unwrap().iter().filter(|l| l.starts_with("publish 1000 gpu.1 ")).count(), 2);
+        fake.close(1);
+        let ev = peer.scan(|_| {});
+        assert!(ev.contains(&PeerEvent::Unmapped { entry: a, k: 1 }), "{ev:?}");
+        assert!(!ev.contains(&PeerEvent::Unmapped { entry: b, k: 1 }));
+        assert_eq!(fake.log.lock().unwrap().last().unwrap(), "unpublish 1", "the old epoch's, not the new one's");
     }
 
     #[test]
