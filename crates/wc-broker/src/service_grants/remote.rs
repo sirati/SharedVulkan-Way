@@ -42,6 +42,7 @@ struct IncomingPending {
     recipient: Process,
 }
 struct OutgoingPending {
+    external: crate::bar_control::ExternalHold,
     allocation: Key,
     producer: Process,
     recipient: u64,
@@ -58,7 +59,7 @@ pub(super) struct State {
     seen_incoming_transfers: BTreeSet<u64>,
     outgoing_pending: BTreeMap<u64, OutgoingPending>,
     consumers: BTreeMap<u64, Consumer>,
-    outgoing_consumers: BTreeMap<u64, (Key, u64)>,
+    outgoing_consumers: BTreeMap<u64, OutgoingPending>,
     announced_processes: BTreeSet<Process>,
     announced_allocations: BTreeSet<Key>,
     next_transfer: u64,
@@ -217,9 +218,13 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             return Err(denied("remote transfer registration/allocation mismatch"));
         }
         let transfer = State::serial(&mut record.remote.next_transfer)?;
+        let external = record
+            .table
+            .pin_external(producer.process, allocation.key)?;
         record.remote.outgoing_pending.insert(
             transfer,
             OutgoingPending {
+                external,
                 allocation: allocation.key,
                 producer: producer.process,
                 recipient: recipient.registration,
@@ -381,9 +386,10 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 {
                     return Err(denied("remote accept differs from exact pending/recipient"));
                 }
-                let hold = (pending.allocation, pending.recipient);
+                record.table.check_external(&pending.external)?;
+                // Move the same table pin. There is never a zero-hold interval.
+                let hold = record.remote.outgoing_pending.remove(&p.transfer).unwrap();
                 record.remote.outgoing_consumers.insert(p.consumer, hold);
-                record.remote.outgoing_pending.remove(&p.transfer);
                 Ok(RemoteApplied::Accepted)
             }
             _ => Err(io::Error::new(

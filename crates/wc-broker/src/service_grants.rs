@@ -1400,6 +1400,17 @@ mod tests {
             RemoteApplied::Prepared(pending) => pending,
             _ => panic!("pending"),
         };
+        // Simulated producer drain, with no producer native exports. The remote
+        // pending pin must already be represented inside the private table.
+        unsafe {
+            a.records
+                .get_mut(&ga.id)
+                .unwrap()
+                .table
+                .close_producer(p.process, allocation.key)
+                .unwrap();
+        }
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
         let (consumer, frame) = b.accept_remote(&ll, &c, &pending).unwrap();
         assert!(b.accept_remote(&ll, &c, &pending).is_err());
         assert!(matches!(
@@ -1407,6 +1418,8 @@ mod tests {
             RemoteApplied::Accepted
         ));
         assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        // Accept moved the same external pin without releasing the allocation.
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
         let target = b.records[&gb.id].processes[&c.process].process.clone();
         let mut backend = Backend {
             target,
