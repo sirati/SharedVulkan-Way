@@ -37958,7 +37958,24 @@ fd and an out-of-bounds mmap. Painting through the mapped fd and SCM_RIGHTS
 changes the original backing pages. Independent proxy and Cairo broker leases
 both block retirement. No family guest or host kernel change is involved.
 This proves the bounded-fd mapping contract, not cross-VM app rendering.
-Real Firefox zero-copy and default guest hardware gates remain open.
+The real local Firefox run `run-eAhdW9` loads that shipped GDK and passes the
+strict startup-copy check: 4,453 zero-copy commits, zero copied commits. The
+GTK parent surface 38, buffer 51, appears twice with `copied=0`; it is neither
+suppressed nor excluded. Upstream Mesa/Zink supplies WebRender and WebGL.
+H.264 presents 290 frames with one drop and no media error; the content sandbox
+remains level 6, and the RDD has seccomp filtering and NoNewPrivs. This uses the
+explicit named-file/lavapipe fixture and its WebRender test preference.
+Hardware VA decode remains unavailable on lavapipe, so the overall harness
+correctly fails its hardware-decode checks. Default guest hardware gates remain
+open.
+
+`WC_LAUNCH_GPU_GTK` selects a shipped GTK store output already copied to the
+host. Deployment checks its GDK and retains its closure with a GC root, then
+writes its library path and strict allocator setting into `gpu.env`. The session
+exports allocator enablement to the proxy as well as the application. Fixture
+mode is never enabled by deployment. The current broker migration and mapped
+user authorization guards still apply. Family deployment remains held for
+review.
 
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
 

@@ -1559,12 +1559,13 @@ proxy)
       # run already says what the session's frame should record. §89: and
       # its clock, so the proxy's half of an input timeline is on the
       # machine's monotonic counter like the compositor's. §105.14: and the
-      # control round trip's hops, on the same clock. The first of each.
+      # control round trip's hops, on the same clock. §112.10 also enables the
+      # original GTK allocator on this proxy. The first of each.
       if [ -f "$BASE/gpu.env" ]; then
         local_seen=" "
         while IFS= read -r ft; do
           case "$ft" in
-            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*)
+            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*|WC_NATIVE_SHM=*)
               [[ "$local_seen" == *" ${ft%%=*} "* ]] && continue
               local_seen="$local_seen${ft%%=*} "
               printf 'export %q\n' "$ft" ;;

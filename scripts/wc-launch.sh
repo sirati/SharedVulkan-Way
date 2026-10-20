@@ -225,6 +225,9 @@ GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
 # and GBM, and since §112 its VA-API driver (nix/mesa-zink-va.nix).
 # WC_LAUNCH_KOPPER_MESA is the older name of the same setting.
 KOPPER_MESA="${WC_LAUNCH_GPU_MESA:-${WC_LAUNCH_KOPPER_MESA:-}}"
+# §112.10: a shipped GTK output already copied into the host's Nix store.
+# Its original-page allocator uses the installation's existing broker policy.
+GPU_GTK="${WC_LAUNCH_GPU_GTK:-}"
 # §112: the guest GPU's PCI ids, VVVV:DDDD, which `sv-drm ns` gives the
 # render node ($HOSTDIR/gpu-pci).
 GPU_PCI="${WC_LAUNCH_GPU_PCI:-}"
@@ -1104,6 +1107,20 @@ LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
 LIBVA_DRIVER_NAME=zink
 LIBVA_DRIVERS_PATH=${KOPPER_MESA:-<mesa-zink-va>}/lib/dri
 VK_DRIVER_FILES=$icd_json"
+    if [ -n "$GPU_GTK" ]; then
+      case "$GPU_GTK" in
+        /nix/store/*) ;;
+        *) echo "error: WC_LAUNCH_GPU_GTK must name a GTK output in the host Nix store"; exit 1 ;;
+      esac
+      [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+        || { echo "error: WC_LAUNCH_GPU_GTK must name one store output"; exit 1; }
+      h "test -f $GPU_GTK/lib/libgdk-3.so && nix-store -r $GPU_GTK --add-root $HOSTDIR/bin/gpu-gtk --indirect >/dev/null" \
+        || { bad "$GPU_GTK is not on $HOST; copy the shipped GTK closure there first"; exit 1; }
+      genv="$genv
+LD_LIBRARY_PATH=$GPU_GTK/lib
+WC_NATIVE_SHM=1
+WC_NATIVE_SHM_STRICT=1"
+    fi
     # Only the legacy wl_shm-only path needs a forced software EGLDevice.
     if [ -z "$DMABUF_NODE" ]; then
       genv="$genv
