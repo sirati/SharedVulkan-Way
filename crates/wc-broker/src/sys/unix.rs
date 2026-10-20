@@ -76,7 +76,9 @@ impl Object {
 }
 
 pub struct Unix {
-    listener: UnixListener,
+    /// Connections to serve: accepted on the socket, or handed in (`injector`).
+    incoming: Mutex<std::sync::mpsc::Receiver<UnixStream>>,
+    inject: std::sync::mpsc::Sender<UnixStream>,
     devices: Vec<DevicePath>,
     services: Vec<DevicePath>,
     /// Users with admin rights besides root: the broker's own account.
@@ -98,8 +100,26 @@ impl Unix {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
         // SAFETY: no arguments.
         let me = unsafe { libc::geteuid() };
+        let (inject, incoming) = std::sync::mpsc::channel();
+        let accepted = inject.clone();
+        std::thread::Builder::new().name("wc-broker-accept".into()).spawn(move || {
+            for s in listener.incoming() {
+                match s {
+                    Ok(s) => {
+                        if accepted.send(s).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[wc-broker] accept: {e}");
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        })?;
         Ok(Unix {
-            listener,
+            incoming: Mutex::new(incoming),
+            inject,
             devices,
             services: Vec::new(),
             admins: vec![0, me],
@@ -107,6 +127,15 @@ impl Unix {
             release_word: None,
             watcher: Watcher::start()?,
         })
+    }
+
+    /// A way to hand the broker a connection it did not accept itself: one
+    /// end of a socket pair a client made and something trusted forwarded
+    /// (sv-drm's handoff for sandboxed processes, §112). It is served like any
+    /// other, and its identity is still the kernel's: `SO_PEERCRED` on a
+    /// socket pair names the process that made it, not whoever carried it.
+    pub fn injector(&self) -> std::sync::mpsc::Sender<UnixStream> {
+        self.inject.clone()
     }
 
     /// The local services `connect` reaches: a socket path each.
@@ -173,7 +202,12 @@ impl Platform for Unix {
     type Object = Object;
 
     fn accept(&self) -> io::Result<(UnixStream, UnixStream, Peer)> {
-        let (s, _) = self.listener.accept()?;
+        let s = self
+            .incoming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv()
+            .map_err(|_| io::Error::other("the accepting thread has stopped"))?;
         let (pid, uid) = peer_of(&s)?;
         let peer = Peer { pid, user: User::uid(uid), admin: self.admins.contains(&uid) };
         let w = s.try_clone()?;
