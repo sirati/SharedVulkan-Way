@@ -80,6 +80,8 @@ let
       cp ${./hl_drm.h} src/hl_drm.h
       cp ${./hl_socket.c} src/hl_socket.c
       cp ${./hl_socket.h} src/hl_socket.h
+      cp ${./hl_copy.c} src/hl_copy.c
+      cp ${./hl_copy.h} src/hl_copy.h
       cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
     '';
     buildPhase = ''
