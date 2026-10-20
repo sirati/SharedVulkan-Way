@@ -245,6 +245,26 @@ impl Pool {
         self.inner.as_ref().unwrap().with_data_mut(f)
     }
 
+    #[cfg(unix)]
+    pub fn with_mapped_data<T>(&self, f: impl FnOnce(*const u8, usize, usize) -> T) -> Result<Option<T>, ()> {
+        let inner = self.inner.as_ref().unwrap();
+        if !matches!(inner.fd, WireFd::Open(_)) { return Ok(None); }
+        let guard = inner.map.read().map_err(|_| ())?;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 || guard.ptr.is_null() { return Err(()); }
+        let page = page as usize;
+        let mapped_len = guard.size.checked_add(page - 1).ok_or(())? / page * page;
+        if guard.ptr as usize % page != 0 { return Err(()); }
+        // WireFd::Open maps at offset zero via mmap. POSIX maps the final
+        // partial native page too. Only logical bytes may be read by a
+        // GPU; the rounded extent describes VM coverage, not file contents.
+        // The read lock prevents pool resize/unmap until GPU completion.
+        unsafe { place_sigbus_handler() };
+        guard_enter(&guard);
+        let result = f(guard.ptr.cast_const(), mapped_len, guard.size);
+        if guard_leave() { Err(()) } else { Ok(Some(result)) }
+    }
+
     /// The named object this pool was opened from (a refcounted clone), or
     /// `None` for one that arrived as an open descriptor.
     pub fn handle(&self) -> Option<crate::utils::os::Handle> {
