@@ -909,6 +909,29 @@ sound_ring_args() {
 # DBUS is passed so that a second launch reaches the first one's instance
 # instead of colliding on its profile lock -- which is what a second click on a
 # Windows application does too.
+stock_gpu_prerequisite_check() {
+  local NATIVE=0 STRICT=0 GTK_LIB="" EXPECT_GTK="" line
+  if [ -n "$PROFILE" ] && [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
+    [ -n "$GPU_ON" ] && [ ${#NSWRAP[@]} -gt 0 ] \
+      || die "GPU Firefox requires its session GPU and sv-drm render-node namespace"
+    [[ "${PCI:-}" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+      || die "GPU Firefox requires the guest GPU PCI identity"
+    NATIVE=0; STRICT=0; GTK_LIB=""
+    for line in "${GPUENV[@]}"; do
+      case "$line" in
+        WC_NATIVE_SHM=1) NATIVE=1 ;;
+        WC_NATIVE_SHM_STRICT=1) STRICT=1 ;;
+        LD_LIBRARY_PATH=*) GTK_LIB=${line#LD_LIBRARY_PATH=}; GTK_LIB=${GTK_LIB%%:*} ;;
+      esac
+    done
+    EXPECT_GTK=$(readlink -f "$BASE/bin/gpu-gtk" 2>/dev/null)
+    [ "$NATIVE" = 1 ] && [ "$STRICT" = 1 ] && [ -n "$EXPECT_GTK" ] \
+      && [ "$GTK_LIB" = "$EXPECT_GTK/lib" ] && [ -f "$GTK_LIB/libgdk-3.so" ] \
+      && [ -s "$EXPECT_GTK/nix-support/wc-native-shm-abi" ] \
+      || die "GPU Firefox requires the deployment's matched shipped GTK and strict original allocation"
+  fi
+}
+
 start_app() {
   local ID="$1" DPI="$2" CAPTION="$3" R RO TITLEBAR PROFILE="$DEF_PROFILE"
   # An application's data directory, created on demand -- and *only* under this
@@ -1049,25 +1072,7 @@ start_app() {
       echo "wc-session: NO RENDER NODE for $ID -- $DMABUF_NODE is there and sv-drm is not ($BASE/bin/sv-drm); frames are copied" | tee -a "$D/app.log" >&2
     fi
   fi
-  if [ -n "$PROFILE" ] && [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
-    [ -n "$GPU_ON" ] && [ ${#NSWRAP[@]} -gt 0 ] \
-      || die "GPU Firefox requires its session GPU and sv-drm render-node namespace"
-    [[ "${PCI:-}" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
-      || die "GPU Firefox requires the guest GPU PCI identity"
-    NATIVE=0; STRICT=0; GTK_LIB=""
-    for line in "${GPUENV[@]}"; do
-      case "$line" in
-        WC_NATIVE_SHM=1) NATIVE=1 ;;
-        WC_NATIVE_SHM_STRICT=1) STRICT=1 ;;
-        LD_LIBRARY_PATH=*) GTK_LIB=${line#LD_LIBRARY_PATH=}; GTK_LIB=${GTK_LIB%%:*} ;;
-      esac
-    done
-    EXPECT_GTK=$(readlink -f "$BASE/bin/gpu-gtk" 2>/dev/null)
-    [ "$NATIVE" = 1 ] && [ "$STRICT" = 1 ] && [ -n "$EXPECT_GTK" ] \
-      && [ "$GTK_LIB" = "$EXPECT_GTK/lib" ] && [ -f "$GTK_LIB/libgdk-3.so" ] \
-      && [ -s "$EXPECT_GTK/nix-support/wc-native-shm-abi" ] \
-      || die "GPU Firefox requires the deployment's matched shipped GTK and strict original allocation"
-  fi
+  stock_gpu_prerequisite_check
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in

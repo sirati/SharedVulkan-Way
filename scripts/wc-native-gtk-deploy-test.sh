@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$ROOT"
+source <(sed -n '/^gpu_prerequisite_check() {/,/^}/p' scripts/wc-launch.sh)
+ROOT=$PWD HOST=fixture GPU_SESSIONS=0 GPU_ENV_MODE=print GPU_GTK='' KOPPER_MESA='' DMABUF_NODE='' GPU_PCI=''
+EXPECTED=$(sha256sum crates/wc-proxy/protocols/wc-native-shm-v1.xml crates/wc-native-shm/include/wc-native-shm.h | cut -d' ' -f1)
+MOCK=valid
+h() { case "$MOCK" in valid) printf '%s\n' "$EXPECTED";; mismatch) echo wrong;; unavailable) return 1;; esac; }
+reject() { if gpu_prerequisite_check; then echo "FAIL accepted $1"; exit 1; fi; echo "PASS rejects $1"; }
+gpu_prerequisite_check
+GPU_SESSIONS=1; reject print-only
+GPU_ENV_MODE=write; reject missing-gtk
+GPU_GTK=/nix/store/test-gtk; KOPPER_MESA=/nix/store/test-mesa; reject missing-node
+DMABUF_NODE=/dev/dri/renderD129; GPU_PCI=invalid; reject missing-pci
+GPU_PCI=8086:a7a8; MOCK=mismatch; reject mismatched-library
+MOCK=unavailable; reject unavailable-host-prerequisite
+MOCK=valid; gpu_prerequisite_check; echo 'PASS matched prerequisites'
+if grep -F 'user_pref("gfx.webrender.all"' scripts/wc-session; then echo 'FAIL product force preference'; exit 1; fi
+echo 'PASS no product WebRender force preference'
+source <(sed -n '/^stock_gpu_prerequisite_check() {/,/^}/p' scripts/wc-session)
+die() { echo "$*" >&2; exit 1; }
+STAGE=$(mktemp -d /mnt/datasets/builds/wcrun/native-gtk-policy-XXXXXX)
+trap 'rm -rf "$STAGE"' EXIT
+BASE=$STAGE; PROFILE="$BASE/profile"; DEF_GPU=on
+mkdir -p "$BASE/bin" "$BASE/gtk/lib" "$BASE/gtk/nix-support"
+touch "$BASE/gpu.env" "$BASE/gtk/lib/libgdk-3.so"
+printf 'abi\n' >"$BASE/gtk/nix-support/wc-native-shm-abi"
+ln -s "$BASE/gtk" "$BASE/bin/gpu-gtk"
+GPU_ON=''; NSWRAP=(); GPUENV=(); PCI=''
+reject_runtime() { if (stock_gpu_prerequisite_check); then echo "FAIL runtime accepted $1"; exit 1; fi; echo "PASS runtime rejects $1"; }
+reject_runtime missing-gpu-and-node
+GPU_ON=1; NSWRAP=(/fixture/sv-drm ns --); reject_runtime missing-pci
+PCI=8086:a7a8; GPUENV=(WC_NATIVE_SHM=1); reject_runtime missing-strict-library
+GPUENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_STRICT=1 LD_LIBRARY_PATH=/wrong/lib); reject_runtime foreign-library
+GPUENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_STRICT=1 "LD_LIBRARY_PATH=$BASE/gtk/lib")
+stock_gpu_prerequisite_check; echo 'PASS runtime matched native route'
+
