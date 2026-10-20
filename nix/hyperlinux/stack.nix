@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ];
+    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
@@ -169,6 +169,9 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  externalFaultClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-external-fault-client"; source = ./external-fault-client.c;
+  };
   controlLifecycleClient = guest.callPackage ./client-probe.nix {
     programName = "hl-control-lifecycle-client"; source = ./control-lifecycle-client.c;
     linkFlags = [ "-pthread" ];
@@ -224,6 +227,7 @@ let
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
+      "$HL_RUNNER" ${externalFaultClient}/bin/hl-external-fault-client handled
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-write
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-exec
       for address in 0x100000 0x3c0000 0x3ff000; do
@@ -241,5 +245,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient probeRunner;
 }
