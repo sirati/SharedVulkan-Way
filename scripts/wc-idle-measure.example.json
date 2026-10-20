@@ -1,7 +1,11 @@
 {
   "host": "ADMIN@VM_HOST",
   "guest": "GUEST_USER@GUEST_IP",
-  "root_argv": ["sudokey", "run", "--"],
+  "root_argv": [
+    "sudokey",
+    "run",
+    "--"
+  ],
   "server": "VM_SERVER_NAME",
   "guest_user": "GUEST_USER",
   "linux_user": "wctest",
@@ -15,11 +19,15 @@
   "host_binaries": {
     "/var/lib/waycompose/bin/sv-hostd": "REPLACE_WITH_APPROVED_SHA256",
     "/var/lib/waycompose/bin/wc-arena-host": "REPLACE_WITH_APPROVED_SHA256",
-    "/var/lib/waycompose/installs/wcil/wc-session": "REPLACE_WITH_APPROVED_SHA256"
+    "/var/lib/waycompose/installs/wcil/wc-session": "REPLACE_WITH_APPROVED_SHA256",
+    "/var/lib/waycompose/installs/wcil/bin/wc-proxy": "REPLACE_WITH_APPROVED_PROXY_SHA256"
   },
   "source_commit": "REPLACE_WITH_FULL_BUILD_COMMIT",
   "repo": "/mnt/datasets/builds/shared-vulkan-base",
   "lease_helper": "/mnt/datasets/builds/wcrun/guest-lease.sh",
   "guest_nat_ip": "GUEST_NAT_IP",
-  "evidence": "/mnt/datasets/builds/evidence/idle-latency/system-UNIQUE"
+  "evidence": "/mnt/datasets/builds/evidence/idle-latency/system-UNIQUE",
+  "guest_compositor": "C:\\Users\\GUEST_USER\\wcil\\sv-guest.exe",
+  "compositor_sha256": "REPLACE_WITH_APPROVED_COMPOSITOR_SHA256",
+  "host_proxy": "/var/lib/waycompose/installs/wcil/bin/wc-proxy"
 }

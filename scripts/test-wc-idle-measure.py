@@ -14,7 +14,7 @@ spec.loader.exec_module(m)
 
 def config():
     c = json.loads(Path(__file__).with_name('wc-idle-measure.example.json').read_text())
-    c.update(guest_sha256='a' * 64, app_sha256='b' * 64, source_commit='c' * 40)
+    c.update(guest_sha256='a' * 64, compositor_sha256='e' * 64, app_sha256='b' * 64, source_commit='c' * 40)
     c['host_binaries'] = {p: 'd' * 64 for p in c['host_binaries']}
     return c
 
@@ -56,9 +56,11 @@ class Validation(unittest.TestCase):
     def test_aggregate_requires_2000_and_one_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            def put(tag, count, ns, commit='a'):
+            def put(tag, count, ns, commit='a', host_hash='d'):
                 (root / tag).mkdir()
+                manifest = {'schema': 1, 'source_commit': commit, 'host_binaries': {'wc-proxy': host_hash}}
                 (root / tag / 'result.json').write_text(json.dumps({
+                    'manifest': manifest, 'manifest_sha256': m.fingerprint(manifest),
                     'kind': 'batch', 'source_commit': commit, 'guest_sha256': 'b',
                     'count': count, 'samples_ns': [[i * 1001000000, i * 1001000000 + ns] for i in range(count)]}))
             put('one', 500, 100000)
@@ -70,6 +72,73 @@ class Validation(unittest.TestCase):
             self.assertFalse(result['target_mean_below_200us'])
             put('other-build', 1, 1000, 'different')
             with self.assertRaises(m.Refused):
+                m.report(root, 2000)
+
+    def test_partial_minimum_override_cannot_pass_acceptance(self):
+        with tempfile.TemporaryDirectory() as root, self.assertRaisesRegex(m.Refused, 'at least 2000'):
+            m.report(root, 1)
+
+    def test_mixed_host_binary_hashes_refused_with_same_launcher(self):
+        with tempfile.TemporaryDirectory() as root:
+            for tag, host_hash in [('a', 'old'), ('b', 'new')]:
+                directory = Path(root) / tag
+                directory.mkdir()
+                manifest = {'schema': 1, 'source_commit': 'same', 'guest_sha256': 'same',
+                            'host_binaries': {'wc-proxy': host_hash}}
+                (directory / 'result.json').write_text(json.dumps({
+                    'kind': 'batch', 'count': 1000, 'source_commit': 'same', 'guest_sha256': 'same',
+                    'manifest': manifest, 'manifest_sha256': m.fingerprint(manifest),
+                    'samples_ns': [[i * 1001000000, i * 1001000000 + 100000] for i in range(1000)]}))
+            with self.assertRaisesRegex(m.Refused, 'mixed measurement manifests'):
+                m.report(root, 2000)
+
+    def test_transitioning_units_are_not_stopped(self):
+        for state in ('active', 'activating', 'deactivating', 'reloading', 'maintenance'):
+            self.assertFalse(m.terminal_units(f'wc-launch-wcil-1.service loaded {state} pending session'))
+        for state in ('inactive', 'failed'):
+            self.assertTrue(m.terminal_units(f'wc-launch-wcil-1.service loaded {state} dead session'))
+        self.assertTrue(m.terminal_units(''))
+        with self.assertRaises(m.Refused):
+            m.terminal_units('manager is unavailable')
+
+    def test_stop_waits_for_terminal_state_and_manager_errors_fail(self):
+        h = m.Harness(config())
+        h.guest = lambda *args, **kwargs: ''
+        answers = iter(['wc-launch-wcil-1.service loaded deactivating stop session',
+                        'wc-launch-wcil-1.service loaded inactive dead session'])
+        h.host = lambda script: next(answers)
+        with patch.object(m.time, 'sleep') as sleep:
+            h.stop()
+        sleep.assert_called_once()
+        h.host = lambda script: (_ for _ in ()).throw(m.Refused('manager failed'))
+        with self.assertRaisesRegex(m.Refused, 'manager failed'):
+            h.stop()
+
+    def test_proxy_and_compositor_pins_required(self):
+        for key in ('host_proxy', 'compositor_sha256', 'guest_compositor'):
+            c = config()
+            del c[key]
+            with self.subTest(key=key), self.assertRaises(m.Refused):
+                m.validate(c)
+
+    def test_existing_shared_compositor_must_match_pin(self):
+        h = m.Harness(config())
+        replies = iter([h.c['compositor_sha256'], 'f' * 64])
+        h.guest = lambda script: next(replies)
+        with self.assertRaisesRegex(m.Refused, 'existing shared compositor'):
+            h.check_compositor()
+
+    def test_manifest_tampering_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / 'one'
+            directory.mkdir()
+            manifest = {'schema': 1, 'host_binaries': {'proxy': 'first'}}
+            digest = m.fingerprint(manifest)
+            manifest['host_binaries']['proxy'] = 'changed'
+            (directory / 'result.json').write_text(json.dumps({
+                'kind': 'batch', 'manifest': manifest, 'manifest_sha256': digest,
+                'count': 2000, 'samples_ns': [[0, 1]] * 2000}))
+            with self.assertRaisesRegex(m.Refused, 'fingerprint mismatch'):
                 m.report(root, 2000)
 
     def test_wrong_system_layout_never_touches_guest(self):
@@ -95,6 +164,7 @@ class Stub(m.Harness):
 
     def preflight(self):
         self.checks += 1
+        self.manifest = {'schema': 1, 'identity': self.c.copy()}
 
     def launch(self, *args, **kwargs):
         self.actions.append('launch')

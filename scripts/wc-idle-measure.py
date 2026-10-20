@@ -8,6 +8,8 @@ See docs/idle-measure.md for deployment prerequisites and split-lease use.
 import argparse
 import base64
 import configparser
+import hashlib
+import ntpath
 import json
 import os
 from pathlib import Path
@@ -32,7 +34,7 @@ def require(ok, message):
 def validate(c):
     for key in ('host', 'guest', 'root_argv', 'server', 'guest_user', 'linux_user',
                 'install', 'guest_dir', 'guest_home', 'test_home', 'app_exec',
-                'guest_sha256', 'app_sha256', 'host_binaries', 'source_commit', 'repo',
+                'guest_sha256', 'guest_compositor', 'compositor_sha256', 'host_proxy', 'app_sha256', 'host_binaries', 'source_commit', 'repo',
                 'lease_helper', 'guest_nat_ip', 'evidence'):
         require(c.get(key), f'missing configuration: {key}')
     for key in ('install', 'linux_user', 'server', 'guest_user'):
@@ -47,11 +49,12 @@ def validate(c):
     require(re.fullmatch(r'/var/tmp/waycompose-tests/[A-Za-z0-9_-]+', c['test_home']), 'test_home must be a dedicated throwaway directory')
     require(Path(c['evidence']).is_absolute() and c['evidence'].startswith('/mnt/datasets/'),
             'evidence must be under /mnt/datasets')
-    for key in ('guest_sha256', 'app_sha256'):
+    for key in ('guest_sha256', 'compositor_sha256', 'app_sha256'):
         require(re.fullmatch('[0-9a-f]{64}', c[key]), f'{key} must pin the approved binary')
-    require(isinstance(c['host_binaries'], dict) and len(c['host_binaries']) >= 3, 'pin host daemon and wc-session hashes')
+    require(isinstance(c['host_binaries'], dict) and len(c['host_binaries']) >= 4, 'pin host daemon and wc-session hashes')
     for path, digest in c['host_binaries'].items():
         require(path.startswith('/') and re.fullmatch('[0-9a-f]{64}', digest), 'invalid host binary pin')
+    require(c['host_proxy'].endswith('/wc-proxy') and c['host_proxy'] in c['host_binaries'], 'pin installed wc-proxy')
     require(re.fullmatch('[0-9a-f]{40}', c['source_commit']), 'source_commit must be a full commit hash')
 
 
@@ -87,6 +90,21 @@ def check_mapping(text, c):
     require(selected == [c['linux_user']], 'users.conf mapping is absent, ambiguous, or wrong')
 
 
+def terminal_units(text):
+    """list-units --all --plain has UNIT LOAD ACTIVE SUB DESCRIPTION columns."""
+    for line in text.splitlines():
+        fields = line.split()
+        require(len(fields) >= 4 and fields[0].endswith(('.service', '.socket', '.scope')),
+                'malformed manager response while checking teardown')
+        if fields[2] not in ('inactive', 'failed'):
+            return False
+    return True
+
+
+def fingerprint(manifest):
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def check_app(text, c):
     ini = configparser.ConfigParser(strict=False, interpolation=None)
     ini.read_string(text)
@@ -111,6 +129,7 @@ class Harness:
         self.failed = threading.Event()
         self.done = threading.Event()
         self.log = None
+        self.manifest = None
 
     def command(self, argv, data=None, timeout=60):
         p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -208,7 +227,36 @@ class Harness:
         require(guest_ini.getint('session', 'linger-secs', fallback=60) >= 900,
                 'test session linger-secs must be at least 900 for split batches')
         require(guest_ini.get('session', 'wayland-bell', fallback='').strip(), 'guest has no Wayland doorbell')
+        require(ntpath.normcase(ntpath.normpath(guest_ini.get('session', 'compositor', fallback='')))
+                == ntpath.normcase(ntpath.normpath(c['guest_compositor'])), 'guest ini selects an unpinned compositor')
+        self.check_compositor()
+        # Snapshot only immutable inputs, excluding dynamic PIDs/state and sample counts.
+        identity_keys = ('source_commit', 'server', 'guest_user', 'linux_user', 'install',
+                         'guest_dir', 'guest_home', 'test_home', 'app_exec', 'app_sha256',
+                         'guest_sha256', 'guest_compositor', 'compositor_sha256', 'host_proxy', 'host_binaries')
+        manifest = {'schema': 1, 'identity': {key: c[key] for key in identity_keys},
+                    'guest_ini_sha256': hashlib.sha256(ini.encode()).hexdigest(),
+                    'gap_ms': 1000, 'instrument': 'guest QPC L.send/L.recv',
+                    'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    'guest_wc_environment': self.guest("Get-ChildItem Env: | Where-Object { $_.Name -like 'WC_*' } | Sort-Object Name | ForEach-Object { $_.Name + '=' + $_.Value }")}
+        manifest['host_configuration'] = self.host(
+            'systemctl cat wc-bell-hub wc-sessiond\n'
+            'systemctl show -p ExecStart -p Environment wc-bell-hub wc-sessiond\n'
+            'cat /etc/waycompose/users.conf\n'
+            + 'cat ' + shlex.quote(base + '/apps.ini') + ' ' + shlex.quote(base + '/test-home') + '\n'
+            + 'if test -f ' + shlex.quote(base + '/gpu.env') + '; then cat '
+            + shlex.quote(base + '/gpu.env') + '; fi\n')
+        # JSON roundtrip prevents later config mutations from altering the snapshot.
+        self.manifest = json.loads(json.dumps(manifest))
         self.health()
+
+    def check_compositor(self):
+        c = self.c
+        script = f"(Get-FileHash -Algorithm SHA256 -LiteralPath {self.ps(c['guest_compositor'])}).Hash"
+        require(self.guest(script).strip().lower() == c['compositor_sha256'], 'guest compositor hash differs')
+        hashes = self.guest("Get-CimInstance Win32_Process -Filter \"Name='sv-guest.exe'\" | ForEach-Object { if (-not $_.ExecutablePath) {throw 'cannot inspect compositor image'}; (Get-FileHash -Algorithm SHA256 -LiteralPath $_.ExecutablePath).Hash }")
+        require(all(x.lower() == c['compositor_sha256'] for x in hashes.split()),
+                'an existing shared compositor uses an unpinned build')
 
     def launch(self, args, extra=''):
         require(not self.failed.is_set(), 'health watchdog failed')
@@ -222,9 +270,9 @@ class Harness:
         limit = time.monotonic() + 30
         pattern = shlex.quote('wc-launch-' + self.c['install'] + '-*')
         script = ('runuser -u wctest -- env XDG_RUNTIME_DIR=/run/user/$(id -u wctest) '
-                  'systemctl --user list-units --state=active --no-legend ' + pattern + '\n')
+                  'systemctl --user list-units --all --plain --no-legend ' + pattern + '\n')
         while time.monotonic() < limit:
-            if not self.host(script).strip():
+            if terminal_units(self.host(script)):
                 return
             time.sleep(.5)
         raise Refused('scoped stop did not end its host units; no completed batch recorded')
@@ -247,10 +295,15 @@ class Harness:
     def live_identity(self, app=False):
         c = self.c
         # Check actual running proxy identity, not just configured mapping.
-        script = "ps -eo user=,args=\n"
+        script = "ps -eo user=,pid=,args=\n"
         rows = self.host(script).splitlines()
-        proxies = [x.split(None, 1) for x in rows if 'wc-proxy ' in x and c['install'] + '-' in x]
+        proxies = [x.split(None, 2) for x in rows if 'wc-proxy ' in x and c['install'] + '-' in x]
         require(proxies and all(x[0] == c['linux_user'] for x in proxies), 'live proxy has wrong mapped user')
+        for proxy in proxies:
+            require(proxy[1].isdigit(), 'invalid proxy PID')
+            digest = self.host(f'sha256sum /proc/{proxy[1]}/exe\n').split()[0]
+            require(digest == c['host_binaries'][c['host_proxy']], 'live proxy uses an unpinned binary')
+        self.check_compositor()
         if app:
             # The dedicated wctest account must have exactly one stock foot.
             command = f"pgrep -u wctest -f -- {shlex.quote('^' + re.escape(c['app_exec']) + '($| )')}\n"
@@ -334,21 +387,29 @@ class Harness:
                 finally:
                     self.command([c['lease_helper'], 'release', name])
             require(not self.failed.is_set(), 'health failed; no completed batch recorded')
+            require(self.manifest is not None, 'missing immutable measurement manifest')
+            result['manifest'] = self.manifest
+            result['manifest_sha256'] = fingerprint(self.manifest)
             (Path(out) / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
 
 
 def report(root, minimum):
+    require(minimum >= 2000, 'acceptance requires at least 2000 samples; --minimum cannot lower that gate')
     values = []
     identities = set()
     for file in sorted(Path(root).glob('*/result.json')):
         result = json.loads(file.read_text())
         if result.get('kind') != 'batch':
             continue
-        identities.add((result['source_commit'], result['guest_sha256']))
+        manifest = result.get('manifest')
+        require(isinstance(manifest, dict) and manifest.get('schema') == 1, f'missing measurement manifest: {file}')
+        digest = fingerprint(manifest)
+        require(result.get('manifest_sha256') == digest, f'manifest fingerprint mismatch: {file}')
+        identities.add(digest)
         pairs = result['samples_ns']
         require(len(pairs) == result['count'], f'partial batch: {file}')
         values.extend((b - a) / 1000 for a, b in pairs)
-    require(len(identities) == 1, 'no samples or mixed builds; report each build separately')
+    require(len(identities) == 1, 'no samples or mixed measurement manifests; report each configuration separately')
     require(len(values) >= minimum, f'only {len(values)} samples, need {minimum}; keep partial batches explicit')
     values.sort()
     mean = statistics.mean(values)

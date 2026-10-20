@@ -9,7 +9,10 @@ stamps, so SSH latency is outside the measured round trips.
 
 Copy `scripts/wc-idle-measure.example.json` outside git and replace every
 placeholder with the deployment executor's approved values. Pin the exact
-launcher, host daemons, installed wc-session script, and stock foot hashes.
+launcher, guest compositor, host proxy, host daemons, installed wc-session
+script, and stock foot hashes. The compositor selected in the guest ini
+must match its approved path. An already running shared compositor must
+also have the approved image hash; the harness never replaces or kills it.
 The source commit must contain the broker and original latency fixes.
 There is no default Firefox executable or administrator profile.
 
@@ -62,7 +65,14 @@ python3 scripts/wc-idle-measure.py /mnt/datasets/private-idle.json report
 ```
 
 The report requires at least 2000 complete samples from one approved build.
-It pools raw samples rather than averaging batch percentiles. Every request
+It pools raw samples rather than averaging batch percentiles. `--minimum`
+may raise the 2000-sample acceptance threshold but cannot lower it. Each
+batch records a fingerprinted immutable manifest containing every binary
+pin, the harness hash, install and mapped-user identity, guest ini hash,
+ambient guest WC_* settings, host service configuration, mapping table,
+apps.ini, gpu.env, and test-home. Reports reject missing, changed, or mixed
+manifests, including different host builds with the same launcher. The
+running proxy image and compositor images are checked against their pins. Every request
 must have a paired send/reply and at least 950 ms between the prior reply
 and its send. The guest requests a 1000 ms sleep. The tolerance accepts
 clock rounding, not back-to-back traffic. Report all samples, including
@@ -84,7 +94,10 @@ first foot remains open for the second click; the final scoped `--stop`
 ends only this installation's session. Compare these timings with the
 historical foot table only after checking the PulseAudio wait remains in
 the approved build. No successful result manifest is written until scoped
-cleanup, final health, and lease release succeed. Failed attempts retain
+cleanup, final health, and lease release succeed. Teardown checks all
+matching units with a successful manager response; activating,
+deactivating, or other pending states cannot count as stopped. Only
+inactive, failed, or gone units satisfy that gate. Failed attempts retain
 command evidence but are excluded from aggregate reports.
 
 Run local regression checks without a VM:
