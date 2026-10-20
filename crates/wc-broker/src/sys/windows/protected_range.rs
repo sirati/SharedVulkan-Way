@@ -11,6 +11,7 @@ const QUERY: u32 = 0x0022_6080;
 const MAP: u32 = 0x0022_e084;
 const UNMAP: u32 = 0x0022_e088;
 const CONFIGURE: u32 = 0x0022_e08c;
+const POLICY_QUERY: u32 = 0x0022_6090;
 const VERSION: u32 = 1;
 
 #[repr(C)]
@@ -22,7 +23,7 @@ pub struct Caps {
     pub bar_bytes: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     pub version: u32,
     pub reserved: u32,
@@ -31,6 +32,13 @@ pub struct Policy {
     pub write_length: u64,
     pub read_offset: u64,
     pub read_length: u64,
+}
+#[repr(C)]
+#[derive(Default)]
+struct PolicyStatus {
+    configured: u32,
+    reserved: u32,
+    policy: Policy,
 }
 #[repr(C)]
 struct MapRequest {
@@ -84,6 +92,53 @@ impl Device {
     }
     pub fn caps(&self) -> Caps {
         self.caps
+    }
+    /// Read the actual immutable kernel policy for this retained device.
+    /// None means only that the current generation is unconfigured. This is
+    /// not a mapping census or evidence that old grant bytes are unused.
+    /// Unknown/unsupported queries and generation changes fail closed.
+    pub fn policy(&self) -> io::Result<Option<Policy>> {
+        let mut status = PolicyStatus::default();
+        self.ioctl(POLICY_QUERY, &[], bytes_mut(&mut status))?;
+        let policy = status.policy;
+        if status.configured > 1
+            || status.reserved != 0
+            || policy.version != VERSION
+            || policy.reserved != 0
+            || policy.generation != self.caps.generation
+        {
+            return Err(io::Error::other("invalid protected BAR policy status"));
+        }
+        if status.configured == 0 {
+            if policy.write_offset != 0
+                || policy.write_length != 0
+                || policy.read_offset != 0
+                || policy.read_length != 0
+            {
+                return Err(io::Error::other("unconfigured BAR carries payload policy"));
+            }
+            return Ok(None);
+        }
+        let within = |offset: u64, length: u64| {
+            offset % 4096 == 0
+                && length % 4096 == 0
+                && offset
+                    .checked_add(length)
+                    .is_some_and(|end| end <= self.caps.bar_bytes)
+        };
+        if policy.version != VERSION
+            || policy.reserved != 0
+            || policy.generation != self.caps.generation
+            || policy.write_length == 0
+            || !within(policy.write_offset, policy.write_length)
+            || !within(policy.read_offset, policy.read_length)
+            || (policy.read_length != 0
+                && policy.write_offset < policy.read_offset + policy.read_length
+                && policy.read_offset < policy.write_offset + policy.write_length)
+        {
+            return Err(io::Error::other("invalid protected BAR policy reply"));
+        }
+        Ok(Some(policy))
     }
     /// Install immutable payload windows. Everything outside them, including
     /// control, directory and ring metadata, remains unmappable by clients.

@@ -3,6 +3,20 @@
 #include "Range.h"
 #include "RangeBounds.h"
 
+/* These ntoskrnl exports are present in the pinned WDK import library but
+ * absent from its public headers. They are an explicit undocumented ABI
+ * dependency; a successful link does not establish support on a target OS.
+ * Keep the exit fence: a process reference alone does not retain its address
+ * space while another thread exits. */
+NTKERNELAPI NTSTATUS NTAPI PsAcquireProcessExitSynchronization(PEPROCESS Process);
+NTKERNELAPI VOID NTAPI PsReleaseProcessExitSynchronization(PEPROCESS Process);
+
+/* Process access bit from the matching SDK winnt.h. Do not include user-mode
+ * Windows headers in this kernel translation unit. */
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION (0x0008)
+#endif
+
 #define RANGE_TAG 'rIvW'
 
 typedef struct {
@@ -286,7 +300,7 @@ VOID IVSHMEMRangeCallerContext(WDFDEVICE Device, WDFREQUEST Request)
         WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
         return;
     }
-    if (code != IOCTL_IVSHMEM_RANGE_QUERY && code != IOCTL_IVSHMEM_RANGE_MAP && code != IOCTL_IVSHMEM_RANGE_UNMAP && code != IOCTL_IVSHMEM_RANGE_CONFIGURE) {
+    if (code != IOCTL_IVSHMEM_RANGE_QUERY && code != IOCTL_IVSHMEM_RANGE_MAP && code != IOCTL_IVSHMEM_RANGE_UNMAP && code != IOCTL_IVSHMEM_RANGE_CONFIGURE && code != IOCTL_IVSHMEM_RANGE_POLICY_QUERY) {
         status = WdfDeviceEnqueueRequest(Device, Request);
         if (!NT_SUCCESS(status)) WdfRequestComplete(Request, status);
         return;
@@ -297,7 +311,23 @@ VOID IVSHMEMRangeCallerContext(WDFDEVICE Device, WDFREQUEST Request)
     if (s->Ready) {
         size_t input = parameters.Parameters.DeviceIoControl.InputBufferLength;
         size_t output = parameters.Parameters.DeviceIoControl.OutputBufferLength;
-        if (code == IOCTL_IVSHMEM_RANGE_CONFIGURE) {
+        if (code == IOCTL_IVSHMEM_RANGE_POLICY_QUERY) {
+            IVSHMEM_RANGE_POLICY_STATUS *out;
+            status = STATUS_INFO_LENGTH_MISMATCH;
+            if (input == 0 && output == sizeof(*out)) {
+                status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+                if (NT_SUCCESS(status)) {
+                    RtlZeroMemory(out, sizeof(*out));
+                    out->Configured = s->Configured ? 1 : 0;
+                    if (s->Configured) out->Policy = s->Policy;
+                    else {
+                        out->Policy.Version = IVSHMEM_RANGE_VERSION;
+                        out->Policy.Generation = s->Generation;
+                    }
+                    written = sizeof(*out);
+                }
+            }
+        } else if (code == IOCTL_IVSHMEM_RANGE_CONFIGURE) {
             status = configure(Device, Request, input, output);
         } else if (code == IOCTL_IVSHMEM_RANGE_MAP) {
             status = map_range(Device, Request, input, output, &written);
