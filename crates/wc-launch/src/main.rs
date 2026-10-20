@@ -110,6 +110,9 @@ struct State {
     /// Never this installation's to kill (`--stop` reads `comp_pid` only);
     /// [`find_window`] looks among its windows.
     shared_pid: u32,
+    /// §107.11: this session's index in the shared compositor (0 with a
+    /// compositor of its own), whose windows a click measures.
+    session: u8,
     ready: bool,
 }
 
@@ -123,6 +126,7 @@ impl State {
                 "comp-log" => s.comp_log = v.into(),
                 "comp-pid" => s.comp_pid = v.parse().unwrap_or(0),
                 "shared-pid" => s.shared_pid = v.parse().unwrap_or(0),
+                "session-index" => s.session = v.parse().unwrap_or(0),
                 "ready" => s.ready = v == "1",
                 _ => {}
             }
@@ -131,11 +135,12 @@ impl State {
     }
     fn render(&self) -> String {
         format!(
-            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nready={}\n",
+            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nsession-index={}\nready={}\n",
             self.id,
             self.comp_log,
             self.comp_pid,
             self.shared_pid,
+            self.session,
             u8::from(self.ready)
         )
     }
@@ -825,10 +830,10 @@ mod win {
         }
     }
 
-    fn count_mapped(path: &Path) -> usize {
-        std::fs::read_to_string(path)
-            .map(|t| t.lines().filter(|l| l.contains(" mapped ")).count())
-            .unwrap_or(0)
+    /// The windows mapped so far: every one in a compositor of its own,
+    /// `session`'s only in the shared one (§107.11, [`plan::count_mapped`]).
+    fn count_mapped(path: &Path, session: u8) -> usize {
+        std::fs::read_to_string(path).map(|t| plan::count_mapped(&t, session)).unwrap_or(0)
     }
 
     // -------------------------------------------------------------- verbs ---
@@ -1030,9 +1035,11 @@ mod win {
                 log.say(&format!("session up in {} ms", t0.elapsed().as_millis()));
                 first_refresh(log);
                 if let Some((section, a)) = app {
-                    let before = count_mapped(&p.comp_log);
+                    let before = count_mapped(&s.comp_log, s.session);
                     start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
-                    let _ = shown(cfg, p, log, one, &p.comp_log, before, t0, "cold", req);
+                    // §107.11: the session's log, which is the shared compositor's when it
+                    // joined one: this installation's own log then has no windows at all.
+                    let _ = shown(cfg, p, log, one, &s.comp_log, s.session, before, t0, "cold", req);
                     refresh(cfg, p, log, section, Refresh::Full);
                 }
                 // §92. While the session runs, its jump lists follow the
@@ -1060,9 +1067,9 @@ mod win {
             log.say("--session with a session already up: nothing to do");
             return Ok(());
         };
-        let before = count_mapped(Path::new(&s.comp_log));
+        let before = count_mapped(Path::new(&s.comp_log), s.session);
         start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
-        let shown = shown(cfg, p, log, one, Path::new(&s.comp_log), before, t0, "warm", req);
+        let shown = shown(cfg, p, log, one, Path::new(&s.comp_log), s.session, before, t0, "warm", req);
         refresh(cfg, p, log, section, Refresh::Full);
         shown
     }
@@ -1179,11 +1186,11 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, ready: true }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, session: 0, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone(), session: 0 })
     }
 
     // ---------------------------------------- §107: the user's compositor ---
@@ -1323,6 +1330,7 @@ mod win {
         }
         .map_err(|e| format!("the session did not start: {e}"))?;
         log.say(&format!("up: {said} ({} ms)", t_boot.elapsed().as_millis()));
+        let session = plan::boot_index(&said);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !p.ctl.exists() {
             if Instant::now() > deadline {
@@ -1333,11 +1341,11 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, ready: true }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, session, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into() })
+        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into(), session })
     }
 
     /// §107: start a process that must outlive this launcher: the user's
@@ -1541,11 +1549,12 @@ mod win {
             comp_log: p.comp_log.display().to_string(),
             comp_pid,
             shared_pid: 0,
+            session: 0,
             ready: true,
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone(), session: 0 })
     }
 
     pub struct Session {
@@ -1559,6 +1568,8 @@ mod win {
         /// The GPU sides this session started (§86); empty without `gpu-sessions`.
         gpus: Vec<Child>,
         comp_log: std::path::PathBuf,
+        /// §107.11: its index in the shared compositor, 0 with its own.
+        session: u8,
     }
 
     /// The forwarded GPU (§86, §87): one `sv-guest.exe gpu guest` on the GPU
@@ -1806,6 +1817,7 @@ mod win {
     fn report(
         log: &mut Log,
         comp_log: &Path,
+        session: u8,
         before: usize,
         t0: Instant,
         kind: &str,
@@ -1818,7 +1830,7 @@ mod win {
         let optional = !matches!(req, crate::Request::Run);
         let deadline = Instant::now() + Duration::from_secs(if optional { 15 } else { 120 });
         loop {
-            if count_mapped(&path) > before {
+            if count_mapped(&path, session) > before {
                 log.say(&format!(
                     "CLICK-TO-WINDOW {} ms ({kind}, {} window(s) before)",
                     t0.elapsed().as_millis(),
@@ -1891,13 +1903,14 @@ mod win {
         log: &mut Log,
         one: &mut Option<Single>,
         comp_log: &Path,
+        session: u8,
         before: usize,
         t0: Instant,
         kind: &str,
         req: crate::Request,
     ) -> Result<(), String> {
         use crate::single::{Launching, launching};
-        let Some(o) = one.as_mut() else { return report(log, comp_log, before, t0, kind, req) };
+        let Some(o) = one.as_mut() else { return report(log, comp_log, session, before, t0, kind, req) };
         loop {
             let w = find_window(cfg, p, o.section, o.app);
             match launching(w.is_some(), o.since.elapsed()) {
