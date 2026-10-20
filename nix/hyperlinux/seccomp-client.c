@@ -39,7 +39,26 @@ static void trap(int sig,siginfo_t *info,void *opaque) {
 #endif
     trapped=ok ? 1 : -1;
 }
-static atomic_int stage;
+static atomic_int stage, divergent_tid;
+static void *divergent_worker(void *unused) {
+    (void)unused;
+    if (prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0) || filter(SYS_getppid,SECCOMP_RET_ERRNO|88,0)) return NULL;
+    atomic_store(&divergent_tid,(int)syscall(SYS_gettid));
+    atomic_store(&stage,1);
+    while (atomic_load(&stage)==1) sched_yield();
+    errno=0; long r=syscall(SYS_getppid);
+    int ok=r==-1 && errno==88;
+    ok=ok && syscall(SYS_getpid)>0;
+    return (void *)(long)ok;
+}
+static void *killed_worker(void *unused) {
+    (void)unused;
+    if (prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0) || filter(SYS_getppid,SECCOMP_RET_KILL_THREAD,0)) return NULL;
+    atomic_store(&stage,1);
+    syscall(SYS_getppid);
+    atomic_store(&stage,2);
+    return NULL;
+}
 static void *worker(void *unused) {
     (void)unused;
     int before=prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0);
@@ -93,6 +112,40 @@ int main(int argc,char **argv) {
         CHECK(filter(SYS_getppid,SECCOMP_RET_TRAP|73,0)==0);
         CHECK(syscall(SYS_getppid,0x12345678)==0x76543210 && trapped==1);
         puts("seccomp trap: SIGSYS metadata and saved syscall argument passed");
+    } else if (!strcmp(argv[1],"--stacked")) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,0)==0);
+        CHECK(filter(SYS_getppid,0x12340000U,0)==0);
+        errno=0; CHECK(syscall(SYS_getppid)==-1 && errno==71);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|72,0)==0);
+        errno=0; CHECK(syscall(SYS_getppid)==-1 && errno==72);
+        puts("seccomp stacked: raw action precedence and newest data passed");
+    } else if (!strcmp(argv[1],"--tsync-divergent")) {
+        pthread_t t; CHECK(pthread_create(&t,NULL,divergent_worker,NULL)==0);
+        while (!atomic_load(&stage)) sched_yield();
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        CHECK(filter(SYS_getpid,SECCOMP_RET_ERRNO|89,0)==0);
+        CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|90,SECCOMP_FILTER_FLAG_TSYNC)==atomic_load(&divergent_tid));
+        errno=0; CHECK(syscall(SYS_getpid)==-1 && errno==89);
+        CHECK(syscall(SYS_getppid)>0);
+        atomic_store(&stage,2); void *result; CHECK(pthread_join(t,&result)==0 && result==(void *)1);
+        puts("seccomp divergent TSYNC: offending TID and no partial update passed");
+    } else if (!strcmp(argv[1],"--kill-thread")) {
+        pthread_t t; CHECK(pthread_create(&t,NULL,killed_worker,NULL)==0);
+        CHECK(pthread_join(t,NULL)==0);
+        CHECK(atomic_load(&stage)==1);
+        puts("seccomp KILL_THREAD: worker stopped and parent survived");
+    } else if (!strcmp(argv[1],"--arguments")) {
+        CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+        struct sock_filter p[]={BPF_STMT(BPF_LD|BPF_W|BPF_ABS,0),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,SYS_getppid,0,3),
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS,20),
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,0x12345678U,0,1),
+            BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ERRNO|93),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)};
+        struct sock_fprog f={6,p}; CHECK(syscall(SYS_seccomp,1,0,&f)==0);
+        errno=0; CHECK(syscall(SYS_getppid,0x1234567800000000ULL)==-1 && errno==93);
+        CHECK(syscall(SYS_getppid,0x8765432100000000ULL)>0);
+        puts("seccomp arguments: actual 64-bit register high words passed");
     } else if (!strcmp(argv[1],"--tsync")) {
         pthread_t t; CHECK(pthread_create(&t,NULL,worker,NULL)==0);
         while (!atomic_load(&stage)) sched_yield();

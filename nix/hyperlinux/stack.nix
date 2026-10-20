@@ -216,7 +216,7 @@ let
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
-      for mode in --basic --backend-denial --trap --tsync; do
+      for mode in --basic --backend-denial --trap --tsync --stacked --tsync-divergent --kill-thread --arguments; do
         "$HL_RUNNER" ${seccompClient}/bin/hl-seccomp-client "$mode"
       done
     '';
