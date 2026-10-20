@@ -136,6 +136,11 @@ let
   renderClient = guest.callPackage ./client-probe.nix {
     programName = "hl-render-client"; source = ./render-client.c;
   };
+  zinkClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-zink-client"; source = ./zink-client.c;
+    buildInputs = [ guestApps.libglvnd ];
+    linkFlags = [ "-lEGL" "-lGLESv2" ];
+  };
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
@@ -181,5 +186,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient;
 }
