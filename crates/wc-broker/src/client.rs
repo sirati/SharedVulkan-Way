@@ -527,6 +527,15 @@ mod win_client {
             }
         }
 
+        /// A broker-created local service endpoint, moved into this process.
+        pub fn connect_service(&mut self, name: &str) -> io::Result<OwnedHandle> {
+            let line = self.call(&Request::Connect { name: name.into() })?;
+            match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["ok", "connect", returned, handle] if *returned == name => take_handle(handle),
+                _ => Err(io::Error::other(format!("connect {name}: {line}"))),
+            }
+        }
+
         fn region(&mut self, req: &Request) -> io::Result<(RegionReply, Vec<OwnedHandle>)> {
             let l = self.call(req)?;
             let r = proto::parse_region(&l).map_err(io::Error::other)?;
@@ -660,14 +669,22 @@ pub mod lend {
         Some(unsafe { wc_handle::IvshmemDevice::from_raw(h.into_raw_handle() as _, format!("{name} (lent by the broker)")) })
     }
 
-    /// The virtio-serial port `port` (`org.sirati.wcbell.0`), opened
-    /// overlapped by the broker, wrapped as the doorbell code wraps its own.
-    pub fn port(port: &str, role: &str) -> Option<sv_transport::winpipe::Pipe> {
+    /// Wake-only local subscription. The broker retains the original port;
+    /// failure never falls back to a second raw reader.
+    pub fn bell_port(port: &str, role: &str) -> Option<sv_transport::winpipe::Pipe> {
         let name = port_name(port)?;
-        let h = device(&name, role)?;
-        // SAFETY: the broker opened the port overlapped and moved its only
-        // handle here.
-        Some(unsafe { sv_transport::winpipe::Pipe::from_port_handle(h.into_raw_handle() as isize) })
+        let handle = match super::process_client(role).and_then(|mut client| client.connect_service(&format!("bell:{name}"))) {
+            Ok(handle) => handle,
+            Err(error) => { eprintln!("[wc-broker] wake subscription {name} refused: {error}"); return None; }
+        };
+        // SAFETY: broker created this owned private local pipe overlapped.
+        Some(unsafe { sv_transport::winpipe::Pipe::from_port_handle(handle.into_raw_handle() as isize) })
+    }
+
+    /// The wake subscription for `port`, using the same local Pipe surface.
+    /// The original virtio-serial handle remains exclusively in the broker.
+    pub fn port(port: &str, role: &str) -> Option<sv_transport::winpipe::Pipe> {
+        bell_port(port, role)
     }
 }
 

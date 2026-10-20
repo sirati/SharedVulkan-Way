@@ -344,12 +344,39 @@ fn serve(a: &Args) -> Result<(), String> {
             allow,
         });
     }
+    // A bell belongs to the SID already bound to its original physical BAR.
+    // Names and client roles never create ownership. Port ACLs must be known.
+    let mut bell_sources = Vec::new();
+    let mut services = Vec::new();
+    for (bell, arena, expected_port) in [
+        ("wcbell", "arena", "org.sirati.wcbell.0"),
+        ("svbell", "gpu", "org.sirati.svbell.0"),
+    ] {
+        let Some(device) = a.devices.iter().find(|d| d.name == bell && d.loc == DeviceLoc::Port(expected_port.into())) else { continue; };
+        let Some(Allow::Users(owners)) = devices.iter().find(|d| d.name == arena).map(|d| &d.allow) else { continue; };
+        if owners.len() != 1 { continue; }
+        let found = acl::find(device).map_err(|e| e.to_string())?.ok_or_else(|| format!("bell {bell} has no protected original device"))?;
+        if acl::live(&found.live).as_deref() != Ok(acl::DEVICE_SDDL)
+            || acl::property(&found.instance).ok().flatten().as_deref() != Some(acl::DEVICE_SDDL) {
+            return Err(format!("bell {bell} device ACL protection is unknown"));
+        }
+        bell_sources.push(super::bell_hub::Source { device: bell.into(), path: found.live, owner: owners[0].clone() });
+        services.push(DeviceSpec { name: format!("bell:{bell}"), allow: Allow::Users(owners.clone()) });
+    }
+    // Raw port requests cannot race the broker's sole reader, even when a
+    // particular wake source is reserved or its owner policy is unavailable.
+    for device in &mut devices {
+        if a.devices.iter().any(|d| d.name == device.name && matches!(d.loc, DeviceLoc::Port(_))) {
+            device.allow = Allow::Users(Vec::new());
+        }
+    }
     if a.protected_bar && (!system || !a.acl) {
         return Err("protected BAR mode requires SYSTEM and raw-device ACL protection".into());
     }
     let protected_paths = paths.clone();
     let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?
         .with_raw_device_paths(paths)
+        .with_bell_hub(bell_sources)
         .with_region_init(Box::new(stamp_guest_ram));
     let platform = if a.protected_bar {
         let mut platform = platform.reserve_bars_for_protected_mode();
@@ -390,7 +417,7 @@ fn serve(a: &Args) -> Result<(), String> {
         platform,
         Config {
             devices,
-            services: Vec::new(),
+            services,
             keys: Some(a.keys.clone()),
             release: Release::OwnerFree,
             budget: a.budget,

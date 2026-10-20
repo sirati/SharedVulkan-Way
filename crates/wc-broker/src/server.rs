@@ -85,6 +85,11 @@ pub trait Platform: Send + Sync + 'static {
     }
     /// A fresh connection to local service `name` (the doorbell hub), for
     /// `connect`. Unlike a device, any number may be open at once.
+    /// Connect using the exact authenticated connection target when a platform
+    /// needs to retain process identity beyond its numeric PID.
+    fn open_service_for(&self, _writer: &Self::Writer, _peer: &Peer, name: &str) -> io::Result<Self::Object> {
+        self.open_service(name)
+    }
     fn open_service(&self, name: &str) -> io::Result<Self::Object> {
         Err(io::Error::new(io::ErrorKind::Unsupported, format!("no service {name} on this platform")))
     }
@@ -489,7 +494,7 @@ impl<P: Platform> Broker<P> {
                 match allowed {
                     None => p.push(w, &format!("err no service {name} here")),
                     Some(false) => p.push(w, &format!("err service {name} is not for {}", peer.user)),
-                    Some(true) => match p.open_service(name) {
+                    Some(true) => match p.open_service_for(w, peer, name) {
                         Ok(obj) => {
                             let n = name.clone();
                             p.send(w, &|h| format!("ok connect {n} {}", h[0]), vec![Give::Move(obj)])
