@@ -6,7 +6,7 @@
 //! session asks a handful of questions when it starts, and the doorbells,
 //! rings and regions it is given are its own from then on.
 
-use crate::core::{Core, ConnId, DeviceSpec, Notice, ObjId, Peer, Pid, Refusal, Release};
+use crate::core::{Core, ConnId, DeviceSpec, Notice, ObjId, Peer, Pid, Refusal, RegionInfo, Release, User};
 use crate::proto::{self, Piece, Request};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader};
@@ -52,6 +52,21 @@ pub trait Platform: Send + Sync + 'static {
     /// release word, §103.15). Platforms without such a word say no.
     fn released(&self, _obj: &Self::Object) -> bool {
         false
+    }
+    /// A region was just made for `user` (§111.8): the platform may stamp it
+    /// (§108.8, through its region-init hook) and record it where a restarted
+    /// broker finds it again (the Windows holder). What it returns is one
+    /// word for the end of the `ok region` reply; an error undoes the alloc.
+    fn region_made(&self, _info: &RegionInfo, _user: &User, _obj: &Self::Object) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+    /// Region `id` is gone; the broker's own object is dropped after this.
+    fn region_destroyed(&self, _id: ObjId) {}
+    /// Regions a previous run of the broker held that still exist (the
+    /// Windows holder's copies), with their users: each comes back as an
+    /// orphan of its pool, for its user's next provider to adopt.
+    fn restore(&self) -> Vec<(RegionInfo, User, Self::Object)> {
+        Vec::new()
     }
     /// Who the caller is, as the boot record's identity (§111.6): the
     /// platform reads it from the kernel's credentials or token, never from
@@ -128,11 +143,17 @@ impl<P: Platform> Broker<P> {
     pub fn new(platform: P, config: Config) -> Broker<P> {
         let mut core = Core::new(config.devices);
         core.set_budget(config.budget);
+        let mut objs = BTreeMap::new();
+        for (info, user, obj) in platform.restore() {
+            log(&format!("region {} of pool {} ({} bytes, {user}): kept across a restart, now an orphan", info.id, info.pool, info.len));
+            core.restore_orphan(&info, user, config.release, Instant::now());
+            objs.insert(info.id, vec![Held { obj, pieces: vec![(0, info.len)] }]);
+        }
         Broker {
             platform: Arc::new(platform),
             state: Arc::new(Mutex::new(State {
                 core,
-                objs: BTreeMap::new(),
+                objs,
                 writers: BTreeMap::new(),
                 on_drained: Vec::new(),
             })),
@@ -157,6 +178,7 @@ impl<P: Platform> Broker<P> {
         for n in st.core.drain() {
             match n {
                 Notice::Destroy(id) => {
+                    self.platform.region_destroyed(id);
                     if st.objs.remove(&id).is_some() {
                         log(&format!("region {id}: the broker's handle is closed"));
                     }
@@ -300,9 +322,19 @@ impl<P: Platform> Broker<P> {
                 Ok(info) => match p.create_region(*len, *large) {
                     Ok(obj) => {
                         let held = Held { obj, pieces: vec![(0, *len)] };
+                        let note = match p.region_made(&info, &peer.user, &held.obj) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                st.core.alloc_failed(info.id);
+                                return p.push(w, &format!("err cannot prepare region {}: {e}", info.id));
+                            }
+                        };
                         let r = p.send(
                             w,
-                            &|h| proto::region_line(&info, &[Piece { handle: h[0].clone(), offset: 0, len: info.len }]),
+                            &|h| {
+                                let piece = [Piece { handle: h[0].clone(), offset: 0, len: info.len }];
+                                proto::region_line_noted(&info, &piece, note.as_deref())
+                            },
                             vec![Give::Copy(&held.obj)],
                         );
                         st.objs.insert(info.id, vec![held]);

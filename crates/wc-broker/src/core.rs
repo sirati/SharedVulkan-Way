@@ -361,6 +361,27 @@ impl Core {
         Ok(info)
     }
 
+    /// A region a previous run of the broker made, found again (§111.8: the
+    /// Windows holder kept it): back as an orphan of its user's pool, under
+    /// its old id, so the next provider of that pool adopts it as if this
+    /// broker had never restarted.
+    pub fn restore_orphan(&mut self, info: &RegionInfo, user: User, release: Release, now: Instant) {
+        self.next_id = self.next_id.max(info.id + 1);
+        self.made_bytes += info.len;
+        self.regions.insert(
+            info.id,
+            Region {
+                info: info.clone(),
+                user,
+                owner: None,
+                orphan_since: Some(now),
+                release,
+                leases: BTreeMap::new(),
+                retiring: false,
+            },
+        );
+    }
+
     pub fn alloc_failed(&mut self, id: ObjId) {
         if let Some(r) = self.regions.remove(&id) {
             self.made_bytes = self.made_bytes.saturating_sub(r.info.len);
@@ -762,6 +783,25 @@ mod tests {
                 Notice::Push(4, "!device-free arena".into()),
             ]
         );
+    }
+
+    /// §111.8: a region a restarted broker found again is an orphan of its
+    /// user's pool under its old id; only that user adopts it, ids go on
+    /// above it, and its bytes count.
+    #[test]
+    fn a_restored_region_is_an_orphan_its_user_adopts() {
+        let mut c = core();
+        let t = Instant::now();
+        let info = RegionInfo { id: 41, pool: "gpu".into(), len: 2 << 20, epoch: 1 };
+        c.restore_orphan(&info, User::sid("S-1-5-21-1-2-3-1001"), Release::OwnerFree, t);
+        assert_eq!((c.stats().orphans, c.stats().region_bytes), (1, 2 << 20));
+        c.connect(1, Peer { pid: 10, user: User::sid("S-1-5-21-1-2-3-1002"), admin: false });
+        assert!(c.adopt(1, "gpu").unwrap().is_empty());
+        c.connect(2, Peer { pid: 11, user: User::sid("S-1-5-21-1-2-3-1001"), admin: false });
+        assert_eq!(c.adopt(2, "gpu").unwrap(), vec![info]);
+        assert_eq!(c.alloc(2, "gpu", 4096, Release::OwnerFree).unwrap().id, 42);
+        c.free(2, 41).unwrap();
+        assert_eq!(c.stats().region_bytes, 4096);
     }
 
     #[test]
