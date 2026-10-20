@@ -25,6 +25,8 @@ default = ["gpu", "wayland"]
 gpu = ["dep:sv-gpu-server"]
 # Exactly the old `wc-compositor.exe`.
 wayland = ["dep:wc-compositor"]
+# Explicit same-task private IOSurface service for the native video fixture only.
+native-video-fixture = ["gpu", "wayland", "sv-gpu-server/native-video-fixture"]
 
 [dependencies]
 sv-gpu-server = { path = "../sv-gpu-server", optional = true }

@@ -44,6 +44,11 @@ fn usage() -> String {
     if cfg!(feature = "wayland") {
         halves.push("wayland");
     }
+    let fixture_help = if cfg!(all(target_os = "macos", feature = "native-video-fixture")) {
+        "\n\nFixture: gpu hl-local --fixture-private-video-endpoint [GPU arguments]"
+    } else {
+        ""
+    };
     format!(
         "sv-guest — the in-VM half of shared_vulkan + waycompose\n\
          \n\
@@ -53,7 +58,7 @@ fn usage() -> String {
          built with: {}\n\
          \n\
          `gpu` takes sv-gpu-server's arguments; `wayland` takes\n\
-         wc-compositor's. Both halves share one arena — see docs/one-binary.md.",
+         wc-compositor's. Both halves share one arena — see docs/one-binary.md.{fixture_help}",
         halves.join("|"),
         if cfg!(windows) { "       sv-guest broker [--console] …  the SYSTEM service (§111.8)\n" } else { "" },
         if halves.is_empty() { "no halves — this binary does nothing".to_string() } else { halves.join(", ") },
@@ -74,7 +79,7 @@ fn main() -> ExitCode {
         #[cfg(windows)]
         "broker" => wc_broker::sys::windows::service::main(&args.collect::<Vec<_>>()),
         #[cfg(feature = "gpu")]
-        "gpu" => sv_gpu_server::entry::run_main(half_argv("sv-guest gpu", args)),
+        "gpu" => run_gpu(half_argv("sv-guest gpu", args)),
         #[cfg(all(feature = "wayland", feature = "gpu"))]
         "wayland" => one_pool::run(args.collect()),
         #[cfg(all(feature = "wayland", not(feature = "gpu")))]
@@ -103,6 +108,46 @@ fn main() -> ExitCode {
             eprintln!("sv-guest: no half called {other:?}\n\n{}", usage());
             ExitCode::from(2)
         }
+    }
+}
+
+/// Opt in to the private fixture service in the same Mach task as the GPU.
+#[cfg(feature = "gpu")]
+fn run_gpu(argv: Vec<String>) -> ExitCode {
+    const FLAG: &str = "--fixture-private-video-endpoint";
+    let count = argv.iter().filter(|arg| arg.as_str() == FLAG).count();
+    if count == 0 {
+        return sv_gpu_server::entry::run_main(argv);
+    }
+    if count != 1 || argv.get(1).map(String::as_str) != Some("hl-local") {
+        eprintln!("sv-guest: {FLAG} requires gpu hl-local and may appear only once");
+        return ExitCode::from(2);
+    }
+    #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+    {
+        let mut argv = argv;
+        argv.retain(|arg| arg != FLAG);
+        let (owner, port) = match wc_compositor::start_private_section_service() {
+            Ok(service) => service,
+            Err(error) => {
+                eprintln!("sv-guest: private video fixture service: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(error) = sv_gpu_server::install_fixture_private_video_endpoint(port) {
+            eprintln!("sv-guest: private video fixture endpoint: {error}");
+            return ExitCode::from(1);
+        }
+        // The authenticated owner must remain live through every GPU session.
+        // The real receive name is passed directly above, within this task.
+        let code = sv_gpu_server::entry::run_main(argv);
+        drop(owner);
+        code
+    }
+    #[cfg(not(all(target_os = "macos", feature = "native-video-fixture")))]
+    {
+        eprintln!("sv-guest: {FLAG} requires macOS and the native-video-fixture feature");
+        ExitCode::from(2)
     }
 }
 
