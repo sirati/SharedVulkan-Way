@@ -4365,11 +4365,7 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
     } else {
         w.placing.set(true);
         w.self_driven.set(true);
-        unsafe {
-            if !w.mapped.replace(true) {
-                ShowWindow(w.hwnd(), SW_SHOWNORMAL);
-            }
-        }
+        let first_map = !w.mapped.replace(true);
         let (ox, oy) = succeeded.map_or_else(|| window_origin(w.hwnd()), |(origin, _)| origin);
         let asked = (ox, oy, rc.right - rc.left, rc.bottom - rc.top);
         let mut got = asked;
@@ -4417,6 +4413,12 @@ fn map_window(w: &Rc<WindowState>, width: i32, height: i32, fold_caption: bool) 
                     | SWP_NOACTIVATE
                     | if w.frame.get().extend_top { SWP_FRAMECHANGED } else { 0 },
             );
+            // Size the hidden window before its first paint. Showing the
+            // CW_USEDEFAULT rectangle first leaves stale desktop pixels in Wine
+            // when the client buffer needs a smaller window.
+            if first_map {
+                ShowWindow(w.hwnd(), SW_SHOWNORMAL);
+            }
         }
         w.self_driven.set(false);
         w.placing.set(false);
