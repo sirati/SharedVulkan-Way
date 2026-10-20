@@ -2013,3 +2013,194 @@ index 10753ca..6854b0e 100644
 +    cbnz x0, handle_el0_fault  /* Host refused permission promotion */
 @@ -431,0 +433 @@
 +    cbnz x0, handle_el0_fault  /* Host refused permission promotion */
+--- a/src/guest.c
++++ b/src/guest.c
+@@ -57,0 +58,2 @@
++#define PT_AP_RW_EL1   (0ULL << 6)
++#define PT_AP_RO_EL1   (2ULL << 6)
+@@ -85,0 +88,32 @@
++}
++
++static int range_overlaps(uint64_t lo, uint64_t len, uint64_t begin, uint64_t end) {
++    return len && lo < end && (len > UINT64_MAX - lo || lo + len > begin);
++}
++int guest_control_layout_overlap(uint64_t guest_size, uint64_t off, uint64_t len) {
++    if (guest_size < PT_POOL_SIZE || len > UINT64_MAX - off) return 1;
++    return range_overlaps(off, len, 0, SHIM_DATA_BASE + BLOCK_2MB) ||
++        range_overlaps(off, len, guest_size - PT_POOL_SIZE, guest_size);
++}
++int guest_control_gpa_overlap(const guest_t *g, uint64_t off, uint64_t len) {
++    return guest_control_layout_overlap(g->guest_size, off, len);
++}
++int guest_control_va_overlap(const guest_t *g, uint64_t va, uint64_t len) {
++    if (!len) return 0;
++    if (len > UINT64_MAX - va) return 1;
++    if (range_overlaps(va, len, g->ipa_base,
++                       g->ipa_base + SHIM_DATA_BASE + BLOCK_2MB) ||
++        range_overlaps(va, len, g->ipa_base + guest_page_table_pool_base(g),
++                       g->ipa_base + g->guest_size)) return 1;
++    /* Registered nonidentity aliases are trusted mappings, but syscall
++     * mutation must still reject any alias of control storage. */
++    for (int i = 0; i < g->naliases; i++) {
++        const guest_va_alias_t *a = &g->va_aliases[i];
++        if (range_overlaps(va, len, a->va_start, a->va_start + a->size) &&
++            guest_control_gpa_overlap(g, a->gpa_start, a->size)) return 1;
++    }
++    return 0;
++}
++void *guest_trusted_ptr(const guest_t *g, uint64_t off, uint64_t len) {
++    if (off > g->guest_size || len > g->guest_size - off) return NULL;
++    return (uint8_t *)g->host_base + off;
+@@ -409,0 +444 @@
++    if (guest_control_gpa_overlap(g, kbuf_gpa, KBUF_SIZE)) return -1;
+@@ -478,0 +514 @@
++    if (guest_control_gpa_overlap(g, gpa_start, size)) return -1;
+@@ -700 +736 @@
+-static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
++static void *gva_resolve_raw(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
+@@ -757,0 +794,28 @@
++}
++
++static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
++    /* Reserved VAs cannot become a route around control isolation through
++     * an external resolver. Public vvar/vDSO reads are the sole exception. */
++    uint64_t off = gva - g->ipa_base;
++    int public_low = gva >= g->ipa_base && off >= 0xe000 && off < 0x10000;
++    if (guest_control_va_overlap(g, gva, 1) && (!public_low || write)) return NULL;
++    uint64_t span = 0;
++    void *ptr = gva_resolve_raw(g, gva, &span, write);
++    if (!ptr) return NULL;
++    uintptr_t base = (uintptr_t)g->host_base, value = (uintptr_t)ptr;
++    /* Check physical storage after resolution, including optional native
++     * resolvers and nonidentity aliases. Never trust the VA alone. */
++    if (value >= base && value - base < g->guest_size) {
++        uint64_t off = value - base;
++        if (off < SHIM_DATA_BASE + BLOCK_2MB) {
++            /* vvar/vDSO are the only public low pages, both immutable. */
++            if (write || off < 0xe000 || off >= 0x10000) return NULL;
++            if (span > 0x10000 - off) span = 0x10000 - off;
++        } else {
++            uint64_t pool = guest_page_table_pool_base(g);
++            if (off >= pool) return NULL;
++            if (span > pool - off) span = pool - off;
++        }
++    }
++    if (avail) *avail = span;
++    return ptr;
+@@ -1299 +1363,4 @@
+-    if (perms & MEM_PERM_W) {
++    if (perms & MEM_PERM_PRIV) {
++        desc |= (perms & MEM_PERM_W) ? PT_AP_RW_EL1 : PT_AP_RO_EL1;
++        desc |= PT_UXN;
++    } else if (perms & MEM_PERM_W) {
+@@ -1581,0 +1649,2 @@
++    if (va_end < va_start ||
++        guest_control_gpa_overlap(g, gpa_start, va_end - va_start)) return -1;
+@@ -1675 +1744,4 @@
+-    if (perms & MEM_PERM_W)
++    if (perms & MEM_PERM_PRIV) {
++        desc |= (perms & MEM_PERM_W) ? PT_AP_RW_EL1 : PT_AP_RO_EL1;
++        desc |= PT_UXN;
++    } else if (perms & MEM_PERM_W) {
+@@ -1677 +1749 @@
+-    else
++    } else {
+@@ -1678,0 +1751 @@
++    }
+@@ -1686 +1759,3 @@
+-    if (!(desc & PT_UXN))
++    int privileged = !(desc & (1ULL << 6));
++    if (privileged) perms |= MEM_PERM_PRIV;
++    if (!(desc & (privileged ? PT_PXN : PT_UXN)))
+@@ -1688 +1763 @@
+-    if ((desc & (3ULL << 6)) == PT_AP_RW_EL0)
++    if (!(desc & (1ULL << 7)))
+@@ -2036,0 +2112,3 @@
++    if (guest_control_va_overlap(g, va, len)) return -1;
++    if (ipa >= g->ipa_base && ipa - g->ipa_base < g->guest_size &&
++        guest_control_gpa_overlap(g, ipa - g->ipa_base, len)) return -1;
+--- a/src/guest.h
++++ b/src/guest.h
+@@ -106,0 +107 @@
++#define MEM_PERM_PRIV (1 << 3) /* EL1 access only, never guest EL0. */
+@@ -267,0 +269,8 @@
++/* Untrusted mappings may never replace the low control region or table pool.
++ * GPA arguments are offsets into primary host_base, not absolute IPAs. */
++int guest_control_layout_overlap(uint64_t guest_size, uint64_t off, uint64_t len);
++int guest_control_gpa_overlap(const guest_t *, uint64_t, uint64_t);
++int guest_control_va_overlap(const guest_t *, uint64_t, uint64_t);
++/* Trusted initialization only. Never pass a guest-supplied offset here. */
++void *guest_trusted_ptr(const guest_t *, uint64_t, uint64_t);
++
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -810 +810,2 @@
+-        void *ptr = guest_ptr(g, va + written);
++        uint64_t resolved_avail;
++        void *ptr = guest_ptr_access(g, va + written, &resolved_avail, 1);
+@@ -825,0 +827 @@
++        if (chunk > resolved_avail) chunk = resolved_avail;
+@@ -852,0 +855,2 @@
++    if ((flags & (LINUX_MAP_FIXED | LINUX_MAP_FIXED_NOREPLACE)) &&
++        guest_control_va_overlap(g, addr, length)) return -LINUX_EPERM;
+@@ -1310,0 +1315,5 @@
++        if (guest_control_va_overlap(g, unmap_addr, unmap_len)) {
++            result = -LINUX_EPERM;
++            pthread_mutex_unlock(&mmap_lock);
++            break;
++        }
+@@ -1386 +1395,2 @@
+-                    void *ptr = guest_ptr(g, va);
++                    uint64_t resolved_avail;
++                    void *ptr = guest_ptr_access(g, va, &resolved_avail, 1);
+@@ -1397 +1407,3 @@
+-                    memset(ptr, 0, zero_end - zero_start);
++                    uint64_t zero_len = zero_end - zero_start;
++                    if (zero_len > resolved_avail) zero_len = resolved_avail;
++                    memset(ptr, 0, zero_len);
+@@ -1437,0 +1450,5 @@
++        if (guest_control_va_overlap(g, mprot_addr, mprot_len)) {
++            result = -LINUX_EPERM;
++            pthread_mutex_unlock(&mmap_lock);
++            break;
++        }
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -1416 +1416,2 @@
+-                        if (hl_wc_contains(far)) {
++                        if (hl_wc_contains(far) ||
++                            guest_control_va_overlap(g, far & ~4095ULL, 4096)) {
+--- a/src/vdso.c
++++ b/src/vdso.c
+@@ -55,0 +56 @@
++#include <stdlib.h>
+@@ -265,0 +267,9 @@
++    /* A failed control-table update must never resume guest execution. */
++
++    /* EL1 executes the shim and saves exception frames on its own stack.
++     * Neither area may be read, written or executed by guest EL0. */
++    if (guest_update_perms(g, SHIM_BASE, SHIM_DATA_BASE,
++                       MEM_PERM_RX | MEM_PERM_PRIV) < 0) abort();
++    if (guest_update_perms(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MB,
++                       MEM_PERM_RW | MEM_PERM_PRIV) < 0) abort();
++
+@@ -272,2 +282,2 @@
+-    guest_invalidate_ptes(g, guest_page_table_pool_base(g),
+-                          guest_page_table_pool_end(g));
++    if (guest_invalidate_ptes(g, guest_page_table_pool_base(g),
++                          guest_page_table_pool_end(g)) < 0) abort();
+@@ -276 +286 @@
+-    guest_invalidate_ptes(g, 0x1000ULL, VVAR_BASE);
++    if (guest_invalidate_ptes(g, 0x1000ULL, VVAR_BASE) < 0) abort();
+@@ -281 +291 @@
+-    guest_invalidate_ptes(g, 0x10000ULL, SHIM_BASE);
++    if (guest_invalidate_ptes(g, 0x10000ULL, SHIM_BASE) < 0) abort();
+@@ -286 +296 @@
+-    guest_update_perms(g, VVAR_BASE, VVAR_BASE + VVAR_SIZE, MEM_PERM_R);
++    if (guest_update_perms(g, VVAR_BASE, VVAR_BASE + VVAR_SIZE, MEM_PERM_R) < 0) abort();
+@@ -304 +314 @@
+-    uint8_t *page = (uint8_t *)guest_ptr(g, VDSO_BASE);
++    uint8_t *page = (uint8_t *)guest_trusted_ptr(g, VDSO_BASE, VDSO_SIZE);
+@@ -315 +325 @@
+-    if (guest_ptr(g, VVAR_BASE)) {
++    if (guest_trusted_ptr(g, VVAR_BASE, VVAR_SIZE)) {
