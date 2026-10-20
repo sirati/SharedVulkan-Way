@@ -308,6 +308,20 @@ pub fn announce(name: &str, surface: &Surface) -> Result<(), String> {
     Ok(())
 }
 
+/// Publish the exact joined NV12 surface through the typed audited endpoint.
+/// Acknowledgment proves registration, never producer or consumer completion.
+pub(crate) fn announce_nv12(name: &str, surface: &Surface) -> Result<(), String> {
+    let s = service().ok_or("no compositor IOSurface service")?;
+    let owner = owner()?;
+    let kr = wc_handle::iosection::send_nv12(s, owner, name, surface);
+    if kr != 0 {
+        // The receiver may have adopted the exact surface before ACK was lost.
+        let _ = wc_handle::iosection::send_gone(s, owner, name);
+        return Err(format!("registering original NV12 IOSurface {name}: {kr}"));
+    }
+    Ok(())
+}
+
 pub fn retire(name: &str) {
     if let (Some(s), Ok(owner)) = (service(), owner()) {
         let _ = wc_handle::iosection::send_gone(s, owner, name);
