@@ -1,0 +1,16 @@
+[package]
+name = "wc-local-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wc-handle.workspace = true
+wc-transport.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_Networking_WinSock"] }
