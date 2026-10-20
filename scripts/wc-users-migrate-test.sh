@@ -107,6 +107,36 @@ out=$(scope 1 WC_LAUNCH_SERVICES=install); rc=$?
 out=$(scope 0 BROKER=yes); rc=$?
 [ "$rc" = 2 ] && ok "an unknown value is refused" || bad "unknown value: rc=$rc"
 
+out=$(scope 1 BROKER=key); rc=$?
+[ "$rc" = 0 ] && ok "a test may provision its own broker key without installing the service" || bad "test key: rc=$rc $out"
+out=$(scope 0 PORT_ACCESS=key); rc=$?
+[ "$rc" = 2 ] && ok "key mode is refused for other shared settings" || bad "port key: rc=$rc $out"
+
+broker_probe() { # MODE SERVICE-STATE [LAYOUT]
+  ( eval "$(sed -n '/^broker_deploy_check() {/,/^}/p' "$ROOT_DIR/scripts/wc-launch.sh")"
+    BROKER=$1 LAYOUT=${3:-user}
+    # The fake guest returns the service state, never opens a session.
+    state_reply=$2
+    g() { printf '%s\n' "$state_reply"; }
+    broker_deploy_check ) 2>&1
+}
+for state in Running Stopped; do
+  out=$(broker_probe skip "$state"); rc=$?
+  [ "$rc" = 2 ] && echo "$out" | grep -q 'keep this installation.*key privileged' && ok "skip refuses an existing $state broker before leaking its key" || bad "skip $state: rc=$rc $out"
+done
+out=$(broker_probe key Running); rc=$?
+[ "$rc" = 0 ] && ok "key-only deploy accepts a running broker" || bad "key Running: rc=$rc $out"
+for state in absent Stopped broken; do
+  out=$(broker_probe key "$state"); rc=$?
+  [ "$rc" = 2 ] && ok "key-only deploy refuses broker state $state" || bad "key $state: rc=$rc $out"
+done
+out=$(broker_probe skip absent system); rc=$?
+[ "$rc" = 2 ] && ok "the system layout never recreates a desktop-readable key, even if its broker is absent" || bad "system skip absent: rc=$rc $out"
+out=$(broker_probe key Running system); rc=$?
+[ "$rc" = 0 ] && ok "the system layout accepts key mode with the running broker" || bad "system key: rc=$rc $out"
+out=$(broker_probe skip absent); rc=$?
+[ "$rc" = 0 ] && ok "pre-broker skip still works" || bad "skip absent: rc=$rc $out"
+
 rm -rf "$T"
 [ "$FAIL" = 0 ] && { echo "wc-users-migrate-test: OK"; exit 0; }
 echo "wc-users-migrate-test: FAILED"; exit 1

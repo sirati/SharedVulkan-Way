@@ -36959,9 +36959,20 @@ runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=key` registers only this installation's key in an already
+running broker. It never installs or restarts the service and is allowed for
+tests. The key and its protected parent directories belong to Administrators
+and grant access only to SYSTEM and Administrators. Provisioning replaces the
+whole DACL, including any old explicit desktop grant. The service executable
+and recovery files also have privileged ownership. This matters because an
+owner can change a DACL even without a grant in that DACL.
+
 `WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
-holder ended, keys kept).
+holder ended, keys kept). A deploy with `skip` refuses if the broker already
+exists, before stopping a session or copying any files. Use `key` there;
+recreating a desktop-readable signing key would defeat the broker identity
+check. Unknown service status also refuses the deploy.
 
 **Rollback baseline.** The first broker start records each device's live DACL
 and PnP descriptor before changing either. PnP security is read through the

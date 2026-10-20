@@ -51,12 +51,21 @@ function Run([string]$exe, [string[]]$a) {
   return @($code, $out)
 }
 
+# Ownership grants WRITE_DAC independently of the DACL. Replace both the
+# owner and the entire DACL, including explicit grants from an older install.
+function Secure-Path([string]$p, [bool]$Directory, [bool]$UsersRead) {
+  $acl = Get-Acl -LiteralPath $p
+  $inherit = if ($Directory) { "OICI" } else { "" }
+  $sddl = "O:BAD:P(A;$inherit;FA;;;SY)(A;$inherit;FA;;;BA)"
+  if ($UsersRead) { $sddl += "(A;$inherit;FRFX;;;BU)" }
+  $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+  $acl.SetSecurityDescriptorSddlForm($sddl, $sections)
+  Set-Acl -LiteralPath $p -AclObject $acl
+}
+
 function Secure-Dir([string]$d, [bool]$UsersRead) {
   New-Item -ItemType Directory -Force -Path $d | Out-Null
-  $g = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
-  if ($UsersRead) { $g += "*S-1-5-32-545:(OI)(CI)RX" }
-  $r = Run icacls.exe (@($d, "/inheritance:r", "/grant:r") + $g)
-  if ($r[0] -ne 0) { throw "icacls $d failed: $($r[1])" }
+  Secure-Path $d $true $UsersRead
 }
 
 switch ($Action) {
@@ -77,6 +86,7 @@ switch ($Action) {
       try { Remove-Item -Force $Exe } catch { Rename-Item -Force $Exe ("sv-guest.exe.old-" + (Get-Date -Format "yyyyMMddHHmmss")) }
     }
     Copy-Item -Force $src $Exe
+    Secure-Path $Exe $false $true
     # Not `sc.exe create binPath= "..."`: Windows PowerShell 5 passes the
     # quotes a path with a space needs to a native program mangled.
     $bin = "`"$Exe`" broker"
@@ -105,6 +115,7 @@ switch ($Action) {
         if (Test-Path $p) { Copy-Item -Force $p (Join-Path $Before $f) }
       }
       New-Item -ItemType File -Path (Join-Path $Before "complete") -Force | Out-Null
+      Get-ChildItem -File $Before | ForEach-Object { Secure-Path $_.FullName $false $false }
     }
     # §91's per-user grant is superseded: the broker sets the devices'
     # descriptors itself at every start.
@@ -127,11 +138,11 @@ switch ($Action) {
     $k = (@($input) -join "").Trim()
     if (-not $k) { $k = [Console]::In.ReadToEnd().Trim() }
     if ($k -notmatch '^[0-9a-f]{64}$') { throw "the key on stdin is not 64 hex digits" }
+    Secure-Dir $Data $false
     Secure-Dir $Keys $false
     $p = Join-Path $Keys "$Install.key"
     [IO.File]::WriteAllText($p, $k)
-    $r = Run icacls.exe @($p, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F")
-    if ($r[0] -ne 0) { throw "icacls $p failed: $($r[1])" }
+    Secure-Path $p $false $false
     Say "key of installation $Install stored in $p (SYSTEM and Administrators only)"
   }
   "show" {
@@ -157,7 +168,11 @@ switch ($Action) {
     if (Test-Path (Join-Path $Before "complete")) {
       foreach ($f in $LegacyFiles) {
         $p = Join-Path $Before $f
-        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $Dir $f) }
+        if (Test-Path $p) {
+          $restored = Join-Path $Dir $f
+          Copy-Item -Force $p $restored
+          Secure-Path $restored $false $true
+        }
       }
       $xml = Join-Path $Before "task.xml"
       if (Test-Path $xml) {
