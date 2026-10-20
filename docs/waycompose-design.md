@@ -35249,3 +35249,138 @@ yet: the table itself is §108's to build.
 | `cargo check --workspace --target x86_64-pc-windows-gnu`; `-p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 |
 | `scripts/wc-xref.sh --list` | no missing citation |
 | `scripts/wc-multi-install.sh` (legs 1–7), `scripts/wc-no-ssh.sh`, `scripts/wc-lazy-pools.sh` | OK, OK, OK |
+
+## 112. Stock Firefox on the dma-buf path
+
+### 112.x The render node introduces a sandboxed client to its GPU services
+
+Branch `sf-relay`. Stock Firefox decodes video in its RDD process, and that
+process loads our ICD inside Firefox's default sandbox. The sandbox (Firefox
+157, `security/sandbox/linux`) gives it the `/dev/dri` tree read-write, every
+DRM (`'d'`) and dma-buf (`'b'`) ioctl, `socketpair(AF_UNIX, STREAM|SEQPACKET)`,
+`sendmsg`/`recvmsg`, `mmap`, `memfd_create` and `F_ADD_SEALS`. It does not let
+the process `connect()` to `SV_SOCKET` or `SV_BELL`, nor open the GPU pool's
+file by name. A real driver reaches its kernel side through `renderD128`; ours
+now reaches its services the same way.
+
+**The ioctl.** `sv-drm serve --services PATH` answers one driver-private
+ioctl, `DRM_IOCTL_SVDRM_CONNECT` = `DRM_IOW(DRM_COMMAND_BASE + 0, struct
+drm_svdrm_connect)` = `0x40446440`, with
+
+```c
+struct drm_svdrm_connect {
+    __s32 fd;          /* the caller's end of a socketpair it made */
+    char  service[64]; /* NUL-terminated, 1..63 bytes of 0x21..0x7e */
+};
+```
+
+`sv-drm` takes the uid and the calling task from the FUSE header, looks the
+name up, and only then takes the descriptor with `pidfd_open` (falling back to
+`PIDFD_THREAD`, because the header names the calling thread) and
+`pidfd_getfd`. It passes it on only if it is an `AF_UNIX` stream or seqpacket
+socket whose `SO_PEERCRED` uid is the caller's. Without `--services` the ioctl
+answers `EOPNOTSUPP`.
+
+**Registration.** The control socket (`--services`, mode 0666, its directory
+made 0755 if absent) takes one line per connection: `register NAME` serves
+the registrant's own `SO_PEERCRED` uid; `register NAME ANY-UID` serves every
+uid and is refused unless the registrant is uid 0 or a system uid (< 1000),
+which then does its own `SO_PEERCRED` check. A refused registration is closed
+without a reply. A registration lives as long as its connection; anything the
+registrant sends after the line ends it. A second registration of a
+`(NAME, scope)` that is still live is refused (the first one wins until its
+connection closes). For each forwarded client `sv-drm` sends `conn UID PID\n`
+on the registration connection with the descriptor as `SCM_RIGHTS`, in one
+`sendmsg` with `MSG_DONTWAIT`: a service that does not read costs the client
+an `EAGAIN`, never the node's loop. PID is the caller's thread group, in
+`sv-drm`'s pid namespace. This is the shape agreed with `wc-broker`
+(`register waycompose-broker ANY-UID`).
+
+**Forwarding.** A caller of uid U asking for NAME reaches `(NAME, U)` if
+registered, else `(NAME, ANY-UID)`. Nothing registered under NAME is
+`ENOENT`; NAME registered only for other uids is `EACCES`. `sv-drm` never
+opens a file or connects anywhere for a caller; it moves a socket the caller
+made to a service that asked for it.
+
+**Names.** `sv-gpu:` + `SV_SOCKET` and `sv-bell:` + `SV_BELL`, byte for byte
+as both sides were given them (`sv_drm::relay::service_name`). When that is
+not a valid name (too long, or a space in the path), the name is the prefix,
+`#`, and the path's 64-bit FNV-1a hash in 16 hex digits.
+
+**sv-hostd.** `ivshmem-serve --drm-services PATH` registers
+`sv-gpu:<--socket>` for its own uid, keeps the registration (re-registering a
+second after it ends), checks each forwarded client's `SO_PEERCRED` uid once
+more, and serves it exactly as an accepted connection. `bell-hub
+--drm-services PATH` registers `sv-bell:<hub socket>` per port and adds
+forwarded clients to the hub.
+
+**The cold path by descriptor.** Three messages, new tags, so an old daemon
+refuses them as unexpected and an old ICD never sends them:
+
+| message | tag | meaning |
+|---|---|---|
+| `AttachRequestFds` | 9 | the client cannot open names: answer with descriptors |
+| `RegionRequest { k: u32 }` | 10 | after such an attach: region `k` of the pool |
+| `Region { k: u32, len: u64 }` | 11 | region `k` is `len` bytes; its descriptor comes with it |
+
+The `Attach` that answers `AttachRequestFds` carries no names. It comes with
+the control object's descriptor and, if the arena is another object, the
+arena's (`sv_transport::localfd::MAX_FDS` is 2 now). The objects are the ones
+a named client would have opened, opened by `sv-hostd` as the same user. The
+connection then stays open, and `RegionRequest { k }` is answered with
+`poolhdr::region_path(region, k)`'s descriptor, or `Refuse`.
+
+**sv-icd.** Only when `SV_DRM_NODE` is set and the direct path fails. Either
+`connect(SV_SOCKET)` fails (each retry within the existing 10 s also tries the
+node), or the names in the `Attach` do not open (then the exchange starts over
+through the node). In both cases the ICD opens the node, makes a socketpair,
+issues the ioctl, and runs the same exchange asking for descriptors. The pool
+is then `PoolSource::Relay`: region 0 and every later region come by
+`RegionRequest`. The doorbell's connector tries `SV_BELL` and then the node,
+on every reconnect. Everything else is unchanged; Windows and macOS builds do
+not have this code.
+
+**What a test without root can show.** `/dev/cuse` is root's, so locally the
+node is `sv-drm fuse-node`: the same handler behind one regular file on an
+unprivileged FUSE mount. A FUSE file answers ioctls in restricted mode, where
+the kernel copies the argument by the size and direction in the number, which
+is all this ioctl needs, so the ICD runs its real open, socketpair and ioctl.
+The differences from `serve`: the file is not a character device, so the
+dma-buf path stays off; and `pidfd_getfd` runs without root, which Yama's
+scope 1 allows only for descendants, so `fuse-node` runs the clients as its
+children. `serve` runs as root and has `CAP_SYS_PTRACE`, so the clients do
+not need to be its descendants; under Yama's scope 3 nobody can call
+`pidfd_getfd` and the relay cannot work.
+
+`scripts/sv-relay-e2e.sh` runs `sv-pool-e2e.sh`'s topology (pool-guest on
+lavapipe, `ivshmem-serve` with the mailbox cold path, the bell hub) with both
+sockets behind a directory made mode 000, so `connect()` fails with `EACCES`
+as in the sandbox. Results are in 112.x.1.
+
+**Not shown here.** That Firefox's RDD sandbox lets exactly this through (the
+open of the node by its path through the broker, the `'d'` ioctl with this
+number, the socketpair): that needs the real node, which needs root, and the
+real Firefox. CUSE delivers the same header (uid, calling thread, in
+`sv-drm`'s namespaces) as FUSE, and both carry the ioctl through the same
+`fuse_do_ioctl`, but with CUSE in unrestricted mode, which costs one retry
+round (unit-tested over the CUSE harness, not with a kernel).
+
+#### 112.x.1 Checked locally
+
+| test | result |
+|---|---|
+| `sv-drm` unit tests (`relay`, `drm`, `fusenode`) | the ioctl number and struct; the registration rule (ANY-UID refused for uid ≥ 1000) and the forwarding rule (own uid, then ANY-UID; `EACCES`, `ENOENT`) as pure functions; through the CUSE harness, both by `Server::handle` and by `cuse::serve` over a seqpacket socketpair: an unregistered name is `ENOENT`, a caller of another uid is `EACCES`, a granted one reaches the service, which sees the client's `SO_PEERCRED`; a socketpair made by a forked child reaches the service with the child's pid and uid; a registration ends with its connection |
+| `sv-transport`, `sv-icd` unit tests | the three new messages round-trip; an `Attach` with two descriptors; `RegionRequest` answered by a descriptor and by a refusal |
+| `scripts/sv-relay-e2e.sh` | PASS: both services registered through `--drm-services`; without `SV_DRM_NODE` the ICD is refused (`Permission denied`); with it, two `vulkaninfo`, two `gl-probe` frames on Zink and three pool fills pass as in `sv-pool-e2e.sh`, every attach (≥ 7) by descriptor through the node, every pool region by `RegionRequest`, the doorbell through the node, every session's leases given back |
+| `scripts/sv-pool-e2e.sh`, `scripts/sv-dmabuf-e2e.sh` | PASS, PASS (unchanged paths) |
+| `cargo test -p sv-drm -p sv-hostd -p sv-icd -p sv-transport` | 284 passed, 0 failed, 5 ignored |
+| `cargo clippy` on those crates, `--all-targets` | no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu`; `-p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 |
+
+Logs: `/mnt/datasets/builds/evidence/stock-firefox/relay/`.
+
+Not exercised by a test: a pool region other than 0 by `RegionRequest` (the
+local pool has one region; the ICD's path is the same call with another `k`);
+`ivshmem-serve`'s built-in `--bell` hub and `sv-hostd serve`/`qemu-serve`,
+which do not register; an `ANY-UID` registration accepted (the tests run as a
+user; the rule is a pure function, tested).
