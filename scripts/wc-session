@@ -115,6 +115,10 @@ set -uo pipefail
 # against the first install's wc-proxy (found by §83's session-0 run).
 BASE="${WC_LAUNCH_BASE:-$(cd "$(dirname "$0")" && pwd)}"
 BIN="$BASE/bin"
+UID_=$(id -u)
+# The mapped user's agent may use a private runtime directory. Capture its
+# manager's path before application-specific XDG directories replace it.
+USER_RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$UID_}"
 RUNROOT="${WC_LAUNCH_RUN:-/tmp/wc-launch}"
 ROOTC="${WC_LAUNCH_ROOTC:-$HOME/rootc}"
 # IVSHMEM ARENA. Made by the VM's own unit, 0660 root:wc-arena (§83).
@@ -131,7 +135,7 @@ WCBELL="${WC_LAUNCH_WCBELL:-/run/windows-vm/wc-arena/wcbell.sock}"
 # user unit wc-bell-hub.service (`sv-hostd bell-hub`, installed by deploy)
 # holds both for every session of every installation and serves them here.
 # Without it a session falls back to holding the port itself, said loudly.
-HUBDIR="${WC_LAUNCH_BELL_HUB:-/run/user/$(id -u)/wc-bell}"
+HUBDIR="${WC_LAUNCH_BELL_HUB:-$USER_RUNTIME/wc-bell}"
 SVHUB="$HUBDIR/sv.sock"
 WLHUB="$HUBDIR/wl.sock"
 # §111.10: THE BROKER. On a host whose session service runs as a system
@@ -166,10 +170,10 @@ hub_up() {
   if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
     [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
   fi
-  local sd="env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user"
-  $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
+  local sd=(env "XDG_RUNTIME_DIR=$USER_RUNTIME" systemctl --user)
+  "${sd[@]}" is-active --quiet wc-bell-hub.service || "${sd[@]}" start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
-    $sd is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
+    "${sd[@]}" is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
     sleep 0.05
   done
   return 1
@@ -182,12 +186,11 @@ wl_hub() {
   [ -n "$BROKERED" ] && return 0
   [ -S "$HUBDIR/wl.sock" ] || return 1
   [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
-  env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user is-active --quiet wc-bell-hub.service
+  env "XDG_RUNTIME_DIR=$USER_RUNTIME" systemctl --user is-active --quiet wc-bell-hub.service
 }
 wcbell_use() { if wl_hub || hub_up; then echo "$WLHUB"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
 VM_HINT="${WC_LAUNCH_VM:-windows-vm}"
-UID_=$(id -u)
 GID_=$(id -g)
 
 # §94. The application definitions. One section per application the guest may
@@ -286,7 +289,7 @@ dir_of() { echo "$RUNROOT/$1"; }
 # when the manager says `inactive` or `failed` (a collected unit is
 # `inactive`); an unreachable manager is asked again, for up to
 # WC_LAUNCH_STOP_TRIES tenths of a second.
-sd_user() { XDG_RUNTIME_DIR="/run/user/$UID_" systemctl --user "$@"; }
+sd_user() { XDG_RUNTIME_DIR="$USER_RUNTIME" systemctl --user "$@"; }
 unit_state() { local s; s=$(sd_user is-active "$1" 2>/dev/null | head -n 1); echo "${s:-unknown}"; }
 stop_unit() {
   local U="$1" st=unknown i
@@ -619,7 +622,7 @@ audio_up() {
     printf '  -L %q >%q 2>&1\n' "module-native-protocol-unix socket=$D/xdg/pulse/native auth-anonymous=1" "$D/pulse.log"
   } >"$D/pulse.sh"
   chmod 755 "$D/pulse.sh"
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pulse.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
@@ -817,7 +820,7 @@ pw_up() {
   if ! WHY=$(pw_stack_write "$D"); then
     echo "none: $WHY" >"$D/audio.state"; return 0
   fi
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   if ! systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/pipewire.sh" >/dev/null 2>&1; then
     echo "none: systemd-run --user could not start $UNIT" >"$D/audio.state"; return 0
@@ -1282,7 +1285,7 @@ start_app() {
     CONFIG_ENV=(XDG_CONFIG_HOME="$C")
   fi
   DBUS=""
-  [ -S "/run/user/$UID_/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus"
+  [ -S "$USER_RUNTIME/bus" ] && DBUS="DBUS_SESSION_BUS_ADDRESS=unix:path=$USER_RUNTIME/bus"
   # §95: a crash reporter that is dismissed deletes its minidump, and four of
   # §95's crashes left nothing to read. Kept in the profile's minidumps/.
   KEEP_DUMPS="MOZ_CRASHREPORTER_NO_DELETE_DUMP=1"
@@ -1693,7 +1696,7 @@ proxy)
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
     stamp script
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
@@ -1779,7 +1782,7 @@ EOF
     # socket and /proc/<pid>/fd are this user's and neither the locate nor the
     # proxy needs root: a user unit, as on the ivshmem path. Pair it with
     # WC_LAUNCH_ROOTC=bash so `up` runs the locate as this user too.
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$BASH" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT"
@@ -2101,7 +2104,7 @@ gpu)
         "$BIN/sv-hostd" "$QMP" "$VM_HINT" "mem:$LABEL" "$D/icd.sock" "$N" "$D/hostd.log"
     } >"$D/gpu.sh"
     chmod 755 "$D/gpu.sh"
-    export XDG_RUNTIME_DIR="/run/user/$UID_"
+    export XDG_RUNTIME_DIR="$USER_RUNTIME"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT"
@@ -2148,7 +2151,7 @@ gpu)
       "$BIN/sv-hostd" "$GPUREGION" "$D/icd.sock" "$BELLARGS" "$D/hostd.log"
   } >"$D/gpu.sh"
   chmod 755 "$D/gpu.sh"
-  export XDG_RUNTIME_DIR="/run/user/$UID_"
+  export XDG_RUNTIME_DIR="$USER_RUNTIME"
   systemctl --user reset-failed "$UNIT" 2>/dev/null
   systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/gpu.sh" >/dev/null 2>&1 \
     || die "systemd-run --user could not start $UNIT"
