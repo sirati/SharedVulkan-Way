@@ -21,8 +21,8 @@
 #include <stdio.h>
 #define ATTR HL_WC_XATTR_PREFIX "socket.v1"
 #define MAGIC UINT64_C(0x5743534f434b3031)
-typedef struct { uint64_t magic; _Atomic uint32_t passcred; _Atomic uint32_t seqpacket; } shared_option;
-typedef struct { int fd; shared_option *option; } socket_state;
+typedef struct { uint64_t magic; _Atomic uint32_t passcred; _Atomic uint32_t seqpacket; uint64_t endpoints[2]; _Atomic uint32_t read_shutdown[2]; } shared_option;
+typedef struct { int fd; shared_option *option; int side; } socket_state;
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int stream_socket(int fd) {
     int type; socklen_t n = sizeof(type);
@@ -67,10 +67,22 @@ static socket_state *adopt(int fd) {
     if (s->option == MAP_FAILED) { close(s->fd); free(s); return NULL; }
     return s;
 }
-void hl_wc_socket_drop(hl_open_file_t *of) {
-    socket_state *s = of->socket_state;
+static int match_side(socket_state *s, int native) {
+    if (!atomic_load_explicit(&s->option->seqpacket, memory_order_acquire)) { s->side = 0; return 0; }
+    struct stat st;
+    if (fstat(native, &st) < 0) return -1;
+    for (int side = 0; side < 2; side++) if (s->option->endpoints[side] == (uint64_t)st.st_ino) {
+        s->side = side; return 0;
+    }
+    errno = EPROTO; return -1;
+}
+static void free_state(socket_state *s) {
     if (!s) return;
     munmap(s->option, sizeof(*s->option)); close(s->fd); free(s);
+}
+void hl_wc_socket_drop(hl_open_file_t *of) {
+    socket_state *s = of->socket_state;
+    free_state(s);
 }
 int hl_wc_socket_set(int fd, int enabled) {
     hl_fd_ref_t ref;
@@ -142,6 +154,7 @@ int hl_wc_socket_import(int fd, int backing) {
     if (!ref.of || stream_socket(ref.host_fd) < 0) { hl_fd_put(&ref); return -1; }
     socket_state *s = adopt(backing);
     if (!s) { hl_fd_put(&ref); return -1; }
+    if (match_side(s, ref.host_fd) < 0) { free_state(s); hl_fd_put(&ref); return -1; }
     pthread_mutex_lock(&state_lock);
     hl_wc_socket_drop(ref.of);
     ref.of->socket_state = s;
@@ -240,6 +253,23 @@ static socket_state *new_state(void) {
     }
     int saved = errno; close(backing); errno = saved; return state;
 }
+int hl_wc_socket_pair_metadata(int pair[2]) {
+    socket_state *s = new_state();
+    if (!s) return -1;
+    for (int i = 0; i < 2; i++) {
+        struct stat st;
+        if (fstat(pair[i], &st) < 0) { free_state(s); return -1; }
+        /* XNU assigns its first synthetic inode lazily; reject zero. */
+        if (!st.st_ino && fstat(pair[i], &st) < 0) { free_state(s); return -1; }
+        if (!st.st_ino) { free_state(s); errno = EOPNOTSUPP; return -1; }
+        s->option->endpoints[i] = (uint64_t)st.st_ino;
+    }
+    if (s->option->endpoints[0] == s->option->endpoints[1]) { free_state(s); errno = EOPNOTSUPP; return -1; }
+    atomic_store_explicit(&s->option->seqpacket, 1, memory_order_release);
+    int backing = s->fd;
+    munmap(s->option, sizeof(*s->option)); free(s);
+    return backing;
+}
 static int alloc_socket(int native, int seqpacket, int backing, hl_descriptor_t **identity) {
     hl_open_file_t *of = hl_open_file_create(FD_SOCKET, &hl_fd_ops_host_file, 0, NULL);
     if (!of) { close(native); return -1; }
@@ -250,7 +280,8 @@ static int alloc_socket(int native, int seqpacket, int backing, hl_descriptor_t 
         socket_state *s = backing >= 0 ? adopt(backing) : new_state();
         if (!s) { hl_open_file_release(of); close(native); return -1; }
         of->socket_state = s;
-        if (seqpacket) atomic_store(&s->option->seqpacket, 1);
+        if (seqpacket && !atomic_load(&s->option->seqpacket)) { hl_open_file_release(of); close(native); errno = EPROTO; return -1; }
+        if (match_side(s, native) < 0) { hl_open_file_release(of); close(native); return -1; }
     } else if (seqpacket || backing >= 0) {
         hl_open_file_release(of); close(native); errno = EINVAL; return -1;
     }
@@ -258,8 +289,7 @@ static int alloc_socket(int native, int seqpacket, int backing, hl_descriptor_t 
     return hl_fd_install_retained(of, native, cloexec >= 0 && (cloexec & FD_CLOEXEC) ? LINUX_O_CLOEXEC : 0, identity);
 }
 int hl_wc_socket_alloc(int native) { return alloc_socket(native, 0, -1, NULL); }
-int hl_wc_socket_alloc_seqpacket(int native) { return alloc_socket(native, 1, -1, NULL); }
-int hl_wc_socket_alloc_retained(int native, int seqpacket, hl_descriptor_t **identity) { return alloc_socket(native, seqpacket, -1, identity); }
+int hl_wc_socket_alloc_retained(int native, int seqpacket, int backing, hl_descriptor_t **identity) { return alloc_socket(native, seqpacket, backing, identity); }
 
 void hl_wc_socket_received_close(hl_wc_socket_transfers *t, int fd) {
     for (unsigned i = 0; i < t->count; i++) if (t->fds[i] == fd && t->descriptors[i]) {
@@ -328,4 +358,30 @@ void hl_wc_socket_native_end(hl_wc_socket_native_guard *guard) {
         int *fds = (int *)CMSG_DATA(c);
         for (unsigned i = 0; i < count; i++) if (fds[i] >= 0) { close(fds[i]); fds[i] = -1; }
     }
+}
+
+int hl_wc_socket_read_closed(hl_open_file_t *of, int peer) {
+    pthread_mutex_lock(&state_lock);
+    socket_state *s = of ? of->socket_state : NULL;
+    int result = s && atomic_load_explicit(&s->option->seqpacket, memory_order_acquire) &&
+        atomic_load_explicit(&s->option->read_shutdown[s->side ^ !!peer], memory_order_acquire);
+    pthread_mutex_unlock(&state_lock); return result;
+}
+int hl_wc_socket_shutdown_pair(hl_open_file_t *of, int native, int how) {
+    if (how < 0 || how > 2) { errno = EINVAL; return -1; }
+    if (how != SHUT_WR) {
+        pthread_mutex_lock(&state_lock);
+        socket_state *s = of ? of->socket_state : NULL;
+        if (!s || !atomic_load(&s->option->seqpacket)) { pthread_mutex_unlock(&state_lock); errno = EINVAL; return -1; }
+        /* This store is the logical read-shutdown linearization point.
+         * It survives dup/fork/exec/SCM_RIGHTS aliases. Darwin's native
+         * shutdown supplies wakeups and closes queued native rights. */
+        atomic_store_explicit(&s->option->read_shutdown[s->side], 1, memory_order_release);
+        pthread_mutex_unlock(&state_lock);
+        if (shutdown(native, SHUT_RD) < 0 && errno != ENOTCONN) return -1;
+    }
+    /* Darwin's combined shutdown skips SHUT_WR if already read-closed.
+     * Separate idempotent halves preserve the Linux pair behavior. */
+    if (how != SHUT_RD && shutdown(native, SHUT_WR) < 0 && errno != ENOTCONN) return -1;
+    return 0;
 }

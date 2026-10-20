@@ -8,7 +8,7 @@
 #define HL_WC_SEQPACKET_MAX 16384u
 #define HL_WC_SEQPACKET_BUFFER 256
 int hl_wc_seqpacket_pair(int [2]);
-ssize_t hl_wc_seqpacket_send(int, const struct msghdr *, int);
-ssize_t hl_wc_seqpacket_recv(int, struct msghdr *, int, int);
-ssize_t hl_wc_seqpacket_io(int, const struct iovec *, int, int);
+ssize_t hl_wc_seqpacket_send(hl_open_file_t *, int, const struct msghdr *, int);
+ssize_t hl_wc_seqpacket_recv(hl_open_file_t *, int, struct msghdr *, int, int);
+ssize_t hl_wc_seqpacket_io(hl_open_file_t *, int, const struct iovec *, int, int);
 #endif

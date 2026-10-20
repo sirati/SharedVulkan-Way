@@ -89,30 +89,37 @@
          return linux_errno();
  
      /* Apply flags */
-@@ -587,34 +552,32 @@
+@@ -587,34 +552,39 @@
          setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
      }
  
 -    int gfd0 = hl_wc_socket_alloc(fds[0]);
-+    hl_wc_socket_transfers pair __attribute__((cleanup(hl_wc_socket_received_end))) = {0};
-+    int gfd0 = hl_wc_socket_alloc_retained(fds[0], seqpacket, &pair.descriptors[0]);
-     if (gfd0 < 0) {
+-    if (gfd0 < 0) {
 -        close(fds[1]);
 -        return -LINUX_EMFILE;
-+        int saved = errno; close(fds[1]); errno = saved;
-+        return seqpacket ? linux_errno() : -LINUX_EMFILE;
++    hl_wc_socket_transfers metadata __attribute__((cleanup(hl_wc_socket_transfer_end))) = {0};
++    int backing = -1;
++    if (seqpacket) {
++        backing = hl_wc_socket_pair_metadata(fds);
++        if (backing < 0) { int saved = errno; close(fds[0]); close(fds[1]); errno = saved; return linux_errno(); }
++        metadata.fds[metadata.count++] = backing;
      }
 -    int gfd1 = hl_wc_socket_alloc(fds[1]);
 -    if (gfd1 < 0) {
 -        sys_close(gfd0);
 -        return -LINUX_EMFILE;
--    }
++    hl_wc_socket_transfers pair __attribute__((cleanup(hl_wc_socket_received_end))) = {0};
++    int gfd0 = hl_wc_socket_alloc_retained(fds[0], seqpacket, backing, &pair.descriptors[0]);
++    if (gfd0 < 0) {
++        int saved = errno; close(fds[1]); errno = saved;
++        return seqpacket ? linux_errno() : -LINUX_EMFILE;
+     }
 -
 -    int linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
 -    fd_table[gfd0].linux_flags = linux_flags;
 -    fd_table[gfd1].linux_flags = linux_flags;
 +    pair.fds[pair.count++] = gfd0;
-+    int gfd1 = hl_wc_socket_alloc_retained(fds[1], seqpacket, &pair.descriptors[1]);
++    int gfd1 = hl_wc_socket_alloc_retained(fds[1], seqpacket, backing, &pair.descriptors[1]);
 +    if (gfd1 < 0) return seqpacket ? linux_errno() : -LINUX_EMFILE;
 +    pair.fds[pair.count++] = gfd1;
  
@@ -131,41 +138,41 @@
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description)) return -LINUX_EOPNOTSUPP;
  
      uint8_t linux_sa[128];
      if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
-@@ -675,8 +638,11 @@
+@@ -675,8 +645,11 @@
  }
  
  int64_t sys_listen(int fd, int backlog) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description)) return -LINUX_EOPNOTSUPP;
  
      if (listen(host_fd, backlog) < 0)
          return linux_errno();
-@@ -686,8 +652,10 @@
+@@ -686,8 +659,10 @@
  /* Shared implementation for accept and accept4. */
  static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
                            uint64_t addrlen_gva, int nonblock, int cloexec) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
  
      struct sockaddr_storage mac_sa;
      socklen_t mac_len = sizeof(mac_sa);
-@@ -706,7 +674,6 @@
+@@ -706,7 +681,6 @@
  
      int gfd = hl_wc_socket_alloc(new_fd);
      if (gfd < 0) return -LINUX_EMFILE;
@@ -173,54 +180,54 @@
  
      /* Write back peer address if requested. The accept has already
       * succeeded and gfd is valid; EFAULT here mirrors Linux kernel
-@@ -749,8 +716,11 @@
+@@ -749,8 +723,11 @@
  }
  
  int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description)) return -LINUX_EOPNOTSUPP;
  
      uint8_t linux_sa[128];
      if (addrlen > sizeof(linux_sa)) return -LINUX_EINVAL;
-@@ -834,8 +804,10 @@
+@@ -834,8 +811,10 @@
  int64_t sys_getsockname(guest_t *g, int fd, uint64_t addr_gva,
                          uint64_t addrlen_gva) {
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
  
      struct sockaddr_storage mac_sa;
      socklen_t mac_len = sizeof(mac_sa);
-@@ -868,8 +840,10 @@
+@@ -868,8 +847,10 @@
  int64_t sys_getpeername(guest_t *g, int fd, uint64_t addr_gva,
                          uint64_t addrlen_gva) {
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
  
      struct sockaddr_storage mac_sa;
      socklen_t mac_len = sizeof(mac_sa);
-@@ -903,14 +877,25 @@
+@@ -903,14 +884,25 @@
                     int linux_flags, uint64_t dest_gva, uint32_t addrlen) {
      HL_WC_ACCESS_SCOPE;
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description) && (linux_flags & ~(0x40 | 0x80 | 0x4000))) return -LINUX_EOPNOTSUPP;
@@ -234,21 +241,21 @@
 +        if (dest_gva || addrlen) return -LINUX_EOPNOTSUPP;
 +        struct iovec iov = { buf, len };
 +        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
-+        ssize_t n = hl_wc_seqpacket_send(host_fd, &msg, translate_msg_flags(linux_flags));
++        ssize_t n = hl_wc_seqpacket_send(description, host_fd, &msg, translate_msg_flags(linux_flags));
 +        if (n < 0) { if (errno == EPIPE && !(linux_flags & 0x4000)) signal_queue(LINUX_SIGPIPE); return linux_errno(); }
 +        return n;
 +    }
      int mac_flags = translate_msg_flags(linux_flags);
      /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE.
       * macOS has no MSG_NOSIGNAL; we handle it by not queuing SIGPIPE. */
-@@ -976,14 +961,25 @@
+@@ -976,14 +968,25 @@
                       int flags, uint64_t src_gva, uint64_t addrlen_gva) {
      HL_WC_ACCESS_SCOPE;
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description) && (flags & ~(0x20 | 0x40 | 0x100 | 0x40000000))) return -LINUX_EOPNOTSUPP;
@@ -261,7 +268,7 @@
 +    if (hl_wc_socket_seqpacket_of(description)) {
 +        struct iovec iov = { buf, len };
 +        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
-+        ssize_t n = hl_wc_seqpacket_recv(host_fd, &msg, translate_msg_flags(flags), !!(flags & 0x20));
++        ssize_t n = hl_wc_seqpacket_recv(description, host_fd, &msg, translate_msg_flags(flags), !!(flags & 0x20));
 +        if (n < 0) return linux_errno();
 +        if (src_gva && addrlen_gva) { uint32_t zero = 0; if (guest_write(g, addrlen_gva, &zero, 4) < 0) return -LINUX_EFAULT; }
 +        return n;
@@ -269,7 +276,7 @@
      int mac_flags = translate_msg_flags(flags);
  
      struct sockaddr_storage mac_sa;
-@@ -1027,9 +1023,16 @@
+@@ -1027,9 +1030,16 @@
                         uint64_t optval_gva, uint32_t optlen) {
      /* Synthetic X PV channel: accept common Xlib socket opts as no-ops. */
  
@@ -277,7 +284,7 @@
 -    if (host_fd < 0) return -LINUX_EBADF;
 -
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
 +
@@ -289,14 +296,14 @@
      if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
          int32_t enabled;
          if (optlen < sizeof(enabled)) return -LINUX_EINVAL;
-@@ -1086,9 +1089,12 @@
+@@ -1086,9 +1096,12 @@
  int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
                         uint64_t optval_gva, uint64_t optlen_gva) {
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
  
@@ -304,7 +311,7 @@
      if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
          int32_t enabled; uint32_t len;
          if (guest_read(g, optlen_gva, &len, sizeof(len)) < 0) return -LINUX_EFAULT;
-@@ -1176,7 +1182,7 @@
+@@ -1176,7 +1189,7 @@
      if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
          && mac_optlen >= (socklen_t)sizeof(int)) {
          int *type_val = (int *)optval;
@@ -313,29 +320,35 @@
      }
  
      /* SO_ERROR: macOS returns a macOS errno value; translate to Linux. */
-@@ -1205,8 +1211,10 @@
+@@ -1205,8 +1218,13 @@
  }
  
  int64_t sys_shutdown(int fd, int how) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
 +    hl_fd_ref_t native_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &native_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &native_ref) < 0) return -LINUX_EBADF;
 +    int host_fd = native_ref.host_fd;
 +    hl_open_file_t *description __attribute__((unused)) = native_ref.of;
++
++    if (hl_wc_socket_seqpacket_of(description))
++        return hl_wc_socket_shutdown_pair(description, host_fd, how) < 0 ? linux_errno() : 0;
  
      /* Shutdown constants are identical on Linux and macOS */
      if (shutdown(host_fd, how) < 0)
-@@ -1221,6 +1229,8 @@
+@@ -1219,8 +1237,10 @@
+ 
+     hl_wc_socket_transfers transfers __attribute__((cleanup(hl_wc_socket_transfer_end))) = {0};
      hl_fd_ref_t socket_ref __attribute__((cleanup(hl_fd_put))) = {0};
-     if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
+-    if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &socket_ref) < 0) return -LINUX_EBADF;
      int host_fd = socket_ref.host_fd;
 +    hl_open_file_t *description = socket_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description) && (linux_flags & ~(0x40 | 0x80 | 0x4000))) return -LINUX_EOPNOTSUPP;
  
      linux_msghdr_t lmsg;
      if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
-@@ -1234,7 +1244,7 @@
+@@ -1234,7 +1254,7 @@
       * X11 display write path and ordinary AF_UNIX SOCK_STREAM traffic.
       * Does not handle SCM_RIGHTS (falls through to full path).
       */
@@ -344,7 +357,7 @@
          (linux_flags & ~MSG_FP_LINUX_OK) == 0) {
          struct iovec host_iov[64];
          int iovlen = 0;
-@@ -1306,7 +1316,7 @@
+@@ -1306,7 +1326,7 @@
       *   macOS:  cmsg_len=16, msg_controllen=16
       */
      uint8_t linux_ctrl[512];   /* Linux-format control from guest */
@@ -353,7 +366,7 @@
      uint8_t *ctrl_ptr = NULL;
      socklen_t ctrl_len = 0;
  
-@@ -1330,10 +1340,16 @@
+@@ -1330,10 +1350,16 @@
              memcpy(&lcmsg_level, linux_ctrl + lpos + 8, 4);
              memcpy(&lcmsg_type, linux_ctrl + lpos + 12, 4);
  
@@ -372,7 +385,7 @@
              size_t ldata_len = (size_t)(lcmsg_len - 16);
  
              /* Linux SCM_CREDENTIALS is not Darwin SCM_TIMESTAMP (both 2).
-@@ -1358,7 +1374,7 @@
+@@ -1358,7 +1384,7 @@
              if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
                  if (ldata_len % sizeof(int)) return -LINUX_EINVAL;
                  if (hl_wc_socket_transfer(host_fd, data_src, (unsigned)(ldata_len / sizeof(int)),
@@ -381,18 +394,21 @@
                  native_data_len = native_count * sizeof(int);
                  data_src = native_fds;
              }
-@@ -1410,7 +1426,7 @@
+@@ -1410,7 +1436,7 @@
          .msg_flags = 0,
      };
  
 -    ssize_t ret = sendmsg(host_fd, &msg, mac_flags);
-+    ssize_t ret = hl_wc_socket_seqpacket_of(description) ? hl_wc_seqpacket_send(host_fd, &msg, mac_flags) : sendmsg(host_fd, &msg, mac_flags);
++    ssize_t ret = hl_wc_socket_seqpacket_of(description) ? hl_wc_seqpacket_send(description, host_fd, &msg, mac_flags) : sendmsg(host_fd, &msg, mac_flags);
      int send_errno = errno;
      unix_confine_end(&cf);
      if (ret < 0) {
-@@ -1429,10 +1445,13 @@
+@@ -1427,12 +1453,15 @@
+ 
+     hl_wc_socket_transfers received __attribute__((cleanup(hl_wc_socket_received_end))) = {0};
      hl_fd_ref_t socket_ref __attribute__((cleanup(hl_fd_put))) = {0};
-     if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
+-    if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &socket_ref) < 0) return -LINUX_EBADF;
      int host_fd = socket_ref.host_fd;
 +    hl_open_file_t *description = socket_ref.of;
 +    if (hl_wc_socket_seqpacket_of(description) && (flags & ~(0x20 | 0x40 | 0x100 | 0x40000000))) return -LINUX_EOPNOTSUPP;
@@ -406,7 +422,7 @@
      linux_msghdr_t lmsg;
      if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
          return -LINUX_EFAULT;
-@@ -1443,6 +1462,7 @@
+@@ -1443,6 +1472,7 @@
      if ((flags & 2) && lmsg.msg_control && lmsg.msg_controllen)
          return -LINUX_EOPNOTSUPP;
  
@@ -414,7 +430,7 @@
      int mac_flags = translate_msg_flags(flags);
  
      /*
-@@ -1450,7 +1470,7 @@
+@@ -1450,7 +1480,7 @@
       * Dominant path for X11 display sockets under GTK (idle EAGAIN storm
       * and event reads). SCM_RIGHTS / PEEK / OOB take the full path below.
       */
@@ -423,7 +439,7 @@
          (flags & ~MSG_FP_LINUX_OK) == 0) {
          struct iovec host_iov[64];
          int iovlen = 0;
-@@ -1499,7 +1519,7 @@
+@@ -1499,7 +1529,7 @@
       * macOS cmsghdr is 12 bytes, Linux is 16 bytes — we must
       * translate from macOS format back to Linux format before
       * writing to guest memory. */
@@ -432,12 +448,12 @@
      socklen_t ctrl_alloc = 0;
  
      if (lmsg.msg_control && lmsg.msg_controllen > 0) {
-@@ -1516,9 +1536,11 @@
+@@ -1516,9 +1546,11 @@
          .msg_flags = 0,
      };
  
 -    ssize_t ret = recvmsg(host_fd, &msg, mac_flags);
-+    ssize_t ret = seqpacket ? hl_wc_seqpacket_recv(host_fd, &msg, mac_flags, !!(flags & 0x20)) : recvmsg(host_fd, &msg, mac_flags);
++    ssize_t ret = seqpacket ? hl_wc_seqpacket_recv(description, host_fd, &msg, mac_flags, !!(flags & 0x20)) : recvmsg(host_fd, &msg, mac_flags);
      if (ret < 0) return linux_errno();
  
 +    hl_wc_socket_native_guard native_received __attribute__((cleanup(hl_wc_socket_native_end))) = { &msg };
@@ -445,7 +461,7 @@
      /* Write back source address to guest */
      if (lmsg.msg_name) {
          if (msg.msg_namelen > 0) {
-@@ -1560,25 +1582,30 @@
+@@ -1560,25 +1592,30 @@
              const void *data_src = CMSG_DATA(cmsg);
              if (rights) {
                  if (data_len % sizeof(int) || data_len / sizeof(int) > 64) return -LINUX_EIO;
@@ -487,7 +503,7 @@
  
              /* No room in the guest's control buffer. Linux reports
               * MSG_CTRUNC; and any SCM_RIGHTS fds in the part we drop must
-@@ -1586,7 +1613,7 @@
+@@ -1586,7 +1623,7 @@
              if (lpos + lcmsg_space > sizeof(linux_ctrl) ||
                  lpos + lcmsg_space > lmsg.msg_controllen) {
                  if (rights) {
@@ -496,7 +512,7 @@
                      received.count -= received_count;
                  }
                  lmsg.msg_flags |= LINUX_MSG_CTRUNC;
-@@ -1655,7 +1682,7 @@
+@@ -1655,7 +1692,7 @@
      if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
          return -LINUX_EFAULT;
  
@@ -518,7 +534,7 @@
      HL_WC_ACCESS_SCOPE;
 -    if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD)
 +    hl_fd_ref_t io_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &io_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &io_ref) < 0) return -LINUX_EBADF;
 +    int record_socket = hl_wc_socket_seqpacket_of(io_ref.of);
 +
 +    if (!record_socket && fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD)
@@ -544,7 +560,7 @@
 +    if (count == 0) {
 +        if (record_socket) {
 +            struct iovec empty = { NULL, 0 };
-+            ssize_t result = hl_wc_seqpacket_io(host_fd, &empty, 1, 1);
++            ssize_t result = hl_wc_seqpacket_io(io_ref.of, host_fd, &empty, 1, 1);
 +            if (result < 0) { if (errno == EPIPE) signal_queue(LINUX_SIGPIPE); return linux_errno(); }
 +        }
 +        return 0;
@@ -558,7 +574,7 @@
  
 -    ssize_t ret = hl_wc_write(host_fd, buf, count);
 +    struct iovec record_iov = { buf, count };
-+    ssize_t ret = record_socket ? hl_wc_seqpacket_io(host_fd, &record_iov, 1, 1) : hl_wc_write(host_fd, buf, count);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, &record_iov, 1, 1) : hl_wc_write(host_fd, buf, count);
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
@@ -568,7 +584,7 @@
      HL_WC_ACCESS_SCOPE;
 -    if (fd >= 0 && fd < FD_TABLE_SIZE) {
 +    hl_fd_ref_t io_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &io_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &io_ref) < 0) return -LINUX_EBADF;
 +    int record_socket = hl_wc_socket_seqpacket_of(io_ref.of);
 +
 +    if (!record_socket && fd >= 0 && fd < FD_TABLE_SIZE) {
@@ -599,7 +615,7 @@
  
 -    ssize_t ret = read(host_fd, buf, count);
 +    struct iovec record_iov = { buf, count };
-+    ssize_t ret = record_socket ? hl_wc_seqpacket_io(host_fd, &record_iov, 1, 0) : read(host_fd, buf, count);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, &record_iov, 1, 0) : read(host_fd, buf, count);
      return ret < 0 ? linux_errno() : ret;
  }
  
@@ -608,7 +624,7 @@
  int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
      HL_WC_ACCESS_SCOPE;
 +    hl_fd_ref_t io_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &io_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &io_ref) < 0) return -LINUX_EBADF;
 +    int record_socket = hl_wc_socket_seqpacket_of(io_ref.of);
 +
      if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
@@ -640,14 +656,14 @@
      if (err < 0) return err;
  
 -    ssize_t ret = readv(host_fd, host_iov, iovcnt);
-+    ssize_t ret = record_socket ? hl_wc_seqpacket_io(host_fd, host_iov, iovcnt, 0) : readv(host_fd, host_iov, iovcnt);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, iovcnt, 0) : readv(host_fd, host_iov, iovcnt);
      return ret < 0 ? linux_errno() : ret;
  }
  
  int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
      HL_WC_ACCESS_SCOPE;
 +    hl_fd_ref_t io_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &io_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &io_ref) < 0) return -LINUX_EBADF;
 +    int record_socket = hl_wc_socket_seqpacket_of(io_ref.of);
 +
      /* Special FD types: glibc may use writev() for eventfd wakeup writes.
@@ -683,7 +699,7 @@
      if (err < 0) return err;
  
 -    ssize_t ret = hl_wc_writev(host_fd, host_iov, iovcnt);
-+    ssize_t ret = record_socket ? hl_wc_seqpacket_io(host_fd, host_iov, iovcnt, 1) : hl_wc_writev(host_fd, host_iov, iovcnt);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, iovcnt, 1) : hl_wc_writev(host_fd, host_iov, iovcnt);
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
@@ -692,7 +708,7 @@
  
  int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg) {
 +    hl_fd_ref_t io_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &io_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &io_ref) < 0) return -LINUX_EBADF;
 +    int record_socket = hl_wc_socket_seqpacket_of(io_ref.of);
 +
 +    /* FIONBIO is safe on the actual token socket. Raw FIONREAD and other
@@ -720,7 +736,7 @@
                       uint64_t offset_gva, uint64_t count) {
 +    hl_fd_ref_t input_ref __attribute__((cleanup(hl_fd_put))) = {0};
 +    hl_fd_ref_t output_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(in_fd, &input_ref) < 0 || hl_fd_get(out_fd, &output_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(in_fd, &input_ref) < 0 || hl_fd_get_pinned(out_fd, &output_ref) < 0) return -LINUX_EBADF;
 +    if (hl_wc_socket_seqpacket_of(input_ref.of) || hl_wc_socket_seqpacket_of(output_ref.of)) return -LINUX_EOPNOTSUPP;
 +
      hl_wc_seal_guard guard __attribute__((cleanup(hl_wc_seal_end))) = { .lockfd = -1 };
@@ -740,7 +756,7 @@
                              uint64_t len, unsigned int flags) {
 +    hl_fd_ref_t input_ref __attribute__((cleanup(hl_fd_put))) = {0};
 +    hl_fd_ref_t output_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd_in, &input_ref) < 0 || hl_fd_get(fd_out, &output_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd_in, &input_ref) < 0 || hl_fd_get_pinned(fd_out, &output_ref) < 0) return -LINUX_EBADF;
 +    if (hl_wc_socket_seqpacket_of(input_ref.of) || hl_wc_socket_seqpacket_of(output_ref.of)) return -LINUX_EOPNOTSUPP;
 +
      (void)flags;
@@ -760,7 +776,7 @@
                     size_t len, unsigned int flags) {
 +    hl_fd_ref_t input_ref __attribute__((cleanup(hl_fd_put))) = {0};
 +    hl_fd_ref_t output_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd_in, &input_ref) < 0 || hl_fd_get(fd_out, &output_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd_in, &input_ref) < 0 || hl_fd_get_pinned(fd_out, &output_ref) < 0) return -LINUX_EBADF;
 +    if (hl_wc_socket_seqpacket_of(input_ref.of) || hl_wc_socket_seqpacket_of(output_ref.of)) return -LINUX_EOPNOTSUPP;
 +
      (void)flags;
@@ -779,7 +795,7 @@
                       unsigned long nr_segs, unsigned int flags) {
      HL_WC_ACCESS_SCOPE;
 +    hl_fd_ref_t pipe_ref __attribute__((cleanup(hl_fd_put))) = {0};
-+    if (hl_fd_get(fd, &pipe_ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(fd, &pipe_ref) < 0) return -LINUX_EBADF;
 +    if (hl_wc_socket_seqpacket_of(pipe_ref.of)) return -LINUX_EOPNOTSUPP;
 +
      (void)flags;
@@ -793,7 +809,45 @@
      if (nr_segs > 64) nr_segs = 64;  /* local processing limit */
 --- a/src/fd_object.c
 +++ b/src/fd_object.c
-@@ -203,28 +203,25 @@
+@@ -150,7 +150,7 @@
+ 
+ /* ---------- Table ops ---------- */
+ 
+-int hl_fd_get(int guest_fd, hl_fd_ref_t *out) {
++static int get_descriptor(int guest_fd, hl_fd_ref_t *out, int pin_legacy) {
+     if (!out) return -1;
+     memset(out, 0, sizeof(*out));
+     if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) return -1;
+@@ -183,14 +183,28 @@
+     out->of = fd_table[guest_fd].of;
+     if (out->of) hl_open_file_retain(out->of);
+     out->host_fd = fd_table[guest_fd].host_fd;
++    if (pin_legacy && out->host_fd >= 0) {
++        out->host_fd = fcntl(out->host_fd, F_DUPFD_CLOEXEC, 0);
++        if (out->host_fd < 0) {
++            int saved = errno; hl_open_file_t *held = out->of;
++            memset(out, 0, sizeof(*out)); pthread_mutex_unlock(&fd_lock);
++            if (held) hl_open_file_release(held); errno = saved; return -1;
++        }
++        out->owns_host_fd = 1;
++    }
+     out->guest_fd = guest_fd;
+     out->fd_flags = (uint32_t)(fd_table[guest_fd].linux_flags & LINUX_O_CLOEXEC);
+     pthread_mutex_unlock(&fd_lock);
+     return 0;
+ }
++int hl_fd_get(int guest_fd, hl_fd_ref_t *out) { return get_descriptor(guest_fd, out, 0); }
++int hl_fd_get_pinned(int guest_fd, hl_fd_ref_t *out) { return get_descriptor(guest_fd, out, 1); }
++
+ 
+ void hl_fd_put(hl_fd_ref_t *ref) {
+     if (!ref) return;
++    if (ref->owns_host_fd && ref->host_fd >= 0) close(ref->host_fd);
++    ref->owns_host_fd = 0;
+     if (ref->of) {
+         hl_open_file_release(ref->of);
+         ref->of = NULL;
+@@ -203,28 +217,25 @@
      ref->guest_fd = -1;
  }
  
@@ -833,7 +887,7 @@
  
      if (hl_trace_on(HL_TRACE_FD))
          hl_trace(HL_TRACE_FD, "install gfd=%d kind=%d host_fd=%d of=%llu",
-@@ -232,6 +229,10 @@
+@@ -232,6 +243,10 @@
      return gfd;
  }
  
@@ -844,7 +898,7 @@
  int hl_fd_install_at(int guest_fd, hl_open_file_t *of,
                       int host_fd, uint32_t fd_flags, bool replace) {
      if (!of || guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) {
-@@ -245,35 +246,19 @@
+@@ -245,35 +260,19 @@
          return -1;
      }
  
@@ -884,7 +938,7 @@
          pthread_mutex_unlock(&fd_lock);
          return -1;
      }
-@@ -295,6 +280,13 @@
+@@ -295,6 +294,13 @@
      pthread_mutex_unlock(&fd_lock);
      return 0;
  }
@@ -898,7 +952,7 @@
  
  /* Single source of truth for releasing an fd's `.dir` handle by kind.
   *
-@@ -405,22 +397,12 @@
+@@ -405,22 +411,12 @@
          return -LINUX_ENOMEM;
      }
  
@@ -922,7 +976,7 @@
      hl_fd_put(&ref);
      if (hl_trace_on(HL_TRACE_FD))
          hl_trace(HL_TRACE_FD, "dup old=%d new=%d host=%d", oldfd, gfd, new_host);
-@@ -465,6 +447,13 @@
+@@ -465,6 +461,13 @@
          }
      }
  
@@ -938,7 +992,20 @@
       * eventfd/signalfd/timerfd/inotify state stayed alive under a number
 --- a/src/fd_object.h
 +++ b/src/fd_object.h
-@@ -160,6 +160,11 @@
+@@ -125,6 +125,7 @@
+     hl_open_file_t *of;
+     int host_fd;
+     int guest_fd;
++    int owns_host_fd; /* transient pinned legacy alias only */
+     uint32_t fd_flags;
+ } hl_fd_ref_t;
+ 
+@@ -156,10 +157,16 @@
+ 
+ /* Lookup and pin descriptor + open-file for syscall duration. */
+ int hl_fd_get(int guest_fd, hl_fd_ref_t *out);
++int hl_fd_get_pinned(int guest_fd, hl_fd_ref_t *out);
+ void hl_fd_put(hl_fd_ref_t *ref);
  
  /* Install: takes ownership of one open-file ref and host_fd. */
  int hl_fd_install(hl_open_file_t *of, int host_fd, uint32_t fd_flags);

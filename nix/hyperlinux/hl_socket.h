@@ -5,8 +5,10 @@
 #include <sys/socket.h>
 typedef struct { int32_t pid; uint32_t uid, gid; } hl_wc_ucred;
 int hl_wc_socket_alloc(int);
-int hl_wc_socket_alloc_seqpacket(int);
-int hl_wc_socket_alloc_retained(int, int, hl_descriptor_t **);
+int hl_wc_socket_alloc_retained(int, int, int, hl_descriptor_t **);
+int hl_wc_socket_pair_metadata(int [2]);
+int hl_wc_socket_read_closed(hl_open_file_t *, int);
+int hl_wc_socket_shutdown_pair(hl_open_file_t *, int, int);
 void hl_wc_socket_drop(hl_open_file_t *);
 int hl_wc_socket_set(int, int);
 int hl_wc_socket_get(int, int *);

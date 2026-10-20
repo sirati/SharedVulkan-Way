@@ -204,6 +204,23 @@ static void shutdowns(void) {
     CHECK(send(fd[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
     close_pair(fd); puts("SEQPACKET shutdown EOF NOSIGNAL PASS");
 }
+static void shared_shutdown(void) {
+    int channel[2], fd[2]; pair(channel); pair(fd);
+    send_fd(channel[0], "endpoint", 8, fd[1]); CHECK(close(fd[1]) == 0);
+    char bytes[32]; int endpoint, flags;
+    CHECK(receive(channel[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC, &endpoint, &flags, 1) == 8 && endpoint >= 0);
+    CHECK(shutdown(endpoint, SHUT_RD) == 0);
+    CHECK(send(fd[0], "closed", 6, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    send_fd(endpoint, "reverse", 7, -1);
+    CHECK(read(fd[0], bytes, sizeof(bytes)) == 7 && !memcmp(bytes, "reverse", 7));
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) { CHECK(shutdown(fd[0], SHUT_RD) == 0); _exit(0); }
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(send(endpoint, "closed", 6, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    CHECK(read(endpoint, bytes, sizeof(bytes)) == 0);
+    CHECK(close(endpoint) == 0 && close(fd[0]) == 0); close_pair(channel);
+    puts("SEQPACKET shared shutdown through rights and fork PASS");
+}
 static void readiness(void) {
     int fd[2]; pair(fd);
     struct pollfd p = { fd[0], POLLIN | POLLOUT, 0 };
@@ -358,6 +375,6 @@ int main(int argc, char **argv) {
     }
     CHECK(argc == 1 || (argc == 2 && !strcmp(argv[1], "--linux-reference")));
     linux_reference = argc == 2;
-    records(); rights(); endpoints(); shutdowns(); readiness(); unsupported(); byte_copy_refusal(); fork_exec(argv[0]); sender_exit();
+    records(); rights(); endpoints(); shutdowns(); shared_shutdown(); readiness(); unsupported(); byte_copy_refusal(); fork_exec(argv[0]); sender_exit();
     puts("SEQPACKET ALL PASS"); return 0;
 }

@@ -72,10 +72,11 @@ int hl_wc_seqpacket_pair(int pair[2]) {
 fail: {
     int saved = errno; close(pair[0]); close(pair[1]); errno = saved; return -1;
 }}
-ssize_t hl_wc_seqpacket_send(int fd, const struct msghdr *message, int flags) {
+ssize_t hl_wc_seqpacket_send(hl_open_file_t *of, int fd, const struct msghdr *message, int flags) {
     if (flags & (MSG_PEEK | MSG_OOB) || message->msg_name || message->msg_namelen) {
         errno = EOPNOTSUPP; return -1;
     }
+    if (hl_wc_socket_read_closed(of, 1)) { errno = EPIPE; return -1; }
     size_t size = 0;
     for (int i = 0; i < message->msg_iovlen; i++) {
         if (message->msg_iov[i].iov_len > HL_WC_SEQPACKET_MAX - size) { errno = EMSGSIZE; return -1; }
@@ -115,14 +116,19 @@ ssize_t hl_wc_seqpacket_send(int fd, const struct msghdr *message, int flags) {
     c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(count * sizeof(int));
     memcpy(CMSG_DATA(c), rights, count * sizeof(int));
     ssize_t n = sendmsg(fd, &native, flags & ~(MSG_EOR | MSG_WAITALL));
-    if (n != 1) { if (n >= 0) errno = EIO; goto fail; }
+    if (n != 1) {
+        if (n >= 0) errno = EIO;
+        else if (errno == EINVAL && hl_wc_socket_read_closed(of, 1)) errno = EPIPE;
+        goto fail;
+    }
     close(backing); return (ssize_t)size;
 fail:
     result_errno = errno; close(backing); errno = result_errno; return -1;
 }
-ssize_t hl_wc_seqpacket_recv(int fd, struct msghdr *message, int flags, int full_length) {
+ssize_t hl_wc_seqpacket_recv(hl_open_file_t *of, int fd, struct msghdr *message, int flags, int full_length) {
     /* Darwin MSG_PEEK does not externalize SCM_RIGHTS. Refuse before receive. */
     if (flags & (MSG_PEEK | MSG_OOB)) { errno = EOPNOTSUPP; return -1; }
+    if (hl_wc_socket_read_closed(of, 0)) { message->msg_flags = 0; message->msg_namelen = 0; message->msg_controllen = 0; return 0; }
     int rights[RIGHTS_MAX + 1]; unsigned count = 0;
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(rights))]; } ancillary;
     memset(&ancillary, 0, sizeof(ancillary));
@@ -172,7 +178,7 @@ fail: {
     int saved = errno; for (unsigned i = 0; i < count; i++) if (rights[i] >= 0) close(rights[i]);
     errno = saved; return -1;
 }}
-ssize_t hl_wc_seqpacket_io(int fd, const struct iovec *iov, int count, int writing) {
+ssize_t hl_wc_seqpacket_io(hl_open_file_t *of, int fd, const struct iovec *iov, int count, int writing) {
     struct msghdr message = { .msg_iov = (struct iovec *)iov, .msg_iovlen = count };
-    return writing ? hl_wc_seqpacket_send(fd, &message, 0) : hl_wc_seqpacket_recv(fd, &message, 0, 0);
+    return writing ? hl_wc_seqpacket_send(of, fd, &message, 0) : hl_wc_seqpacket_recv(of, fd, &message, 0, 0);
 }
