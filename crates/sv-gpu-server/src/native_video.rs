@@ -100,7 +100,7 @@ pub struct Configuration {
 }
 /// Parent resolves these stable resource IDs against its object table, retaining
 /// the corresponding buffer/image allocations until queue completion.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picture {
     pub image_view: u64,
     pub layer: u32,
@@ -131,6 +131,7 @@ pub struct Decode {
     pub references: Arc<[Reference]>,
 }
 struct Scope {
+    bound_pictures: Arc<[Picture]>,
     reset: bool,
     begin_references: Arc<[Reference]>,
     session: Arc<Session>,
@@ -427,6 +428,7 @@ impl NativeVideo {
         self.scopes.insert(
             command,
             Scope {
+                bound_pictures: Arc::from([]),
                 reset: false,
                 begin_references: Arc::from([]),
                 session: p.session.clone(),
@@ -493,10 +495,7 @@ impl NativeVideo {
             validate_picture(&r.picture, &scope.session)?;
         }
         if let Some(r) = &job.setup {
-            if !job.h264.is_reference
-                || r.h264.frame_num != job.h264.frame_num
-                || r.h264.pic_order_cnt != job.h264.pic_order_cnt
-            {
+            if !r.h264.matches_picture(&job.h264) {
                 return invalid();
             }
             if r.slot >= scope.session.dpb_slots {
@@ -979,5 +978,92 @@ mod tests_zink_profile {
         ] {
             assert_eq!(Profile { idc: session }.supports_sps_profile(sps), accepted);
         }
+    }
+}
+impl NativeVideo {
+    pub fn scope_active(&self, command: u64) -> bool {
+        self.scopes.contains_key(&command)
+    }
+    pub fn scope_session(&self, command: u64) -> VideoResult<Arc<Session>> {
+        self.scopes
+            .get(&command)
+            .map(|s| s.session.clone())
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+    }
+    pub fn set_scope_bound_pictures(
+        &mut self,
+        command: u64,
+        pictures: Arc<[Picture]>,
+    ) -> VideoResult<()> {
+        let scope = self
+            .scopes
+            .get_mut(&command)
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        if !scope.jobs.is_empty() || pictures.len() > scope.session.dpb_slots as usize + 1 {
+            return invalid();
+        }
+        for (index, picture) in pictures.iter().enumerate() {
+            validate_picture(picture, &scope.session)?;
+            if pictures[..index].contains(picture) {
+                return invalid();
+            }
+        }
+        scope.bound_pictures = pictures;
+        Ok(())
+    }
+    pub fn scope_bound_pictures(&self, command: u64) -> VideoResult<Arc<[Picture]>> {
+        self.scopes
+            .get(&command)
+            .map(|s| s.bound_pictures.clone())
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+    }
+    pub fn last_decode(&self, command: u64) -> VideoResult<Decode> {
+        self.scopes
+            .get(&command)
+            .and_then(|s| s.jobs.last())
+            .cloned()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
+    }
+}
+impl H264Reference {
+    /// Khronos video.xml, StdVideoDecodeH264ReferenceInfo.FrameNum:
+    /// `used_for_long_term_reference ? long_term_frame_idx : frame_num`.
+    /// POC still identifies the reconstructed picture for both forms.
+    pub fn matches_picture(&self, picture: &H264Picture) -> bool {
+        self.pic_order_cnt == picture.pic_order_cnt
+            && (self.long_term || self.frame_num == picture.frame_num)
+    }
+}
+#[cfg(test)]
+mod tests_reference_matching {
+    use super::*;
+    #[test]
+    fn long_term_reference_index_is_not_current_picture_frame_num() {
+        let picture = H264Picture {
+            idr_pic_flag: false,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            is_reference: true,
+            is_intra: false,
+            frame_num: 42,
+            pic_order_cnt: [80, 81],
+            idr_pic_id: 0,
+            sps_id: 0,
+            pps_id: 0,
+        };
+        let mut reference = H264Reference {
+            frame_num: 3,
+            pic_order_cnt: [80, 81],
+            long_term: false,
+        };
+        assert!(!reference.matches_picture(&picture));
+        reference.long_term = true;
+        assert!(reference.matches_picture(&picture));
+        reference.pic_order_cnt = [81, 82];
+        assert!(!reference.matches_picture(&picture));
+        reference.pic_order_cnt = picture.pic_order_cnt;
+        reference.frame_num = 42;
+        reference.long_term = false;
+        assert!(reference.matches_picture(&picture));
     }
 }
