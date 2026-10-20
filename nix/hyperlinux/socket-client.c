@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -42,6 +43,12 @@ int main(void) {
     assert(recvmsg(t[1],&msg,MSG_CMSG_CLOEXEC)==1 && !(msg.msg_flags&MSG_CTRUNC));
     c=CMSG_FIRSTHDR(&msg); assert(c && c->cmsg_type==SCM_RIGHTS && c->cmsg_len==CMSG_LEN(sizeof(int)));
     int received; memcpy(&received,CMSG_DATA(c),sizeof(received)); option(received,1);
+    assert(fcntl(received,F_GETFD)&FD_CLOEXEC);
+    int status_flags=fcntl(received,F_GETFL); assert(status_flags>=0);
+    assert(fcntl(received,F_SETFL,status_flags|O_NONBLOCK)==0);
+    assert(fcntl(received,F_GETFD)&FD_CLOEXEC);
+    assert(fcntl(received,F_SETFD,0)==0 && fcntl(received,F_GETFD)==0);
+    assert(fcntl(received,F_SETFL,status_flags)==0 && fcntl(received,F_GETFD)==0);
     set(received,0); option(alias,0); close(received);
     set(s[0],1); assert(write(s[1],&byte,1)==1);
     msg.msg_control=NULL; msg.msg_controllen=0;

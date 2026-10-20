@@ -29,9 +29,10 @@ static void output_denied(void *map) {
     close(pair[0]);close(pair[1]);
 }
 static void guest_fault(int signal) {
-    if(signal==SIGBUS) (void)write(1,"GUEST_SIGBUS\n",13);
-    else (void)write(1,"GUEST_SIGSEGV\n",14);
-    _exit(0);
+    const char *message=signal==SIGBUS ? "GUEST_SIGBUS\n" : "GUEST_SIGSEGV\n";
+    size_t length=signal==SIGBUS ? 13 : 14;
+    ssize_t written=write(1,message,length);
+    _exit(written==(ssize_t)length ? 0 : 98);
 }
 int main(int argc,char **argv) {
     if(argc==2 && !strcmp(argv[1],"--guest-map-fault")) {
