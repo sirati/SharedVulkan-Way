@@ -58,6 +58,23 @@ mod win {
     pub fn run(a: &[String]) -> Result<(), String> {
         let arg = |i: usize| a.get(i).cloned().unwrap_or_default();
         match arg(0).as_str() {
+            "raw-acl-fixture" => {
+                if std::env::var("WC_PRIVATE_RAW_ACL_FIXTURE").as_deref() != Ok("yes") {
+                    return Err("private disposable raw ACL fixture opt-in required".into());
+                }
+                use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
+                let permissive = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGW;;;WD)";
+                let part = arg(1);
+                if part != "live" && part != "pnp" { return Err("fixture selects live or pnp".into()); }
+                for d in default_devices() {
+                    if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone BAR")?;
+                    if part == "live" { acl::set_live(&f.live, permissive)?; }
+                    else { acl::set_property(&f.instance, Some(permissive))?; }
+                    println!("RESULT private-fixture-permissive-{part} {}", f.instance);
+                }
+                Ok(())
+            }
             "protect-raw" => {
                 use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
                 for d in default_devices() {
