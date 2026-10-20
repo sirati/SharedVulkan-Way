@@ -56,3 +56,59 @@ broker-lent file-port hub test, and native builds of hostd, broker, ICD,
 GPU server and probe. Five stopwatch tests were ignored. Clippy completed
 with existing warnings outside the changed lines. Strict warning denial
 stopped on pre-existing render-node warnings.
+
+## Bounded native-import diagnostics
+
+`scripts/sv-linux-bar-audit.py prepare` freezes a clean, explicitly selected
+source commit, the completed build log and every actual component hash into
+an artifact directory outside git. The component source bindings are
+explicit because the compatible GPU owner, hostd and tracing ICD may have
+different source commits. The copied executable artifacts avoid mutable
+worktree targets. The receipt records package manifests and resolved ELF
+paths. `verify --receipt FILE` refuses changed bytes before a launch.
+Build-log/source correspondence still requires review; a matching file hash
+alone does not prove how an executable was built.
+
+Required named artifacts are `sv-drm`, `sv-hostd`, `wc-broker`,
+`sv-gpu-server`, `vk-probe`, `qemu`, `kernel`, `initrd`, `boot-script`,
+`setup-script`, `gpu-script` and `guest-runner`. Supply the actual final
+Firefox payload, tracer and build log through their separate options.
+The final payload must select immutable Firefox, Weston, Mesa, ICD,
+geckodriver and jq packages. The six binary component source bindings also
+include `icd_library`. Use the traced ICD's reviewed immutable package,
+not an earlier package with the same wire protocol.
+
+The derived payload changes only the compositor invocation to an audit
+wrapper. Only Weston receives `WAYLAND_DEBUG=server`, `SV_DMABUF_TRACE=1`
+and syscall tracing. Firefox and its default sandbox remain untraced.
+The wrapper keeps the original compositor arguments, uses one bounded
+64 MiB trace file and terminates its own compositor process group during
+cleanup. This diagnostic run cannot establish latency results.
+
+Protocol logging records the actual linux-dmabuf create request, format,
+modifier, plane indices, received descriptors, offsets and strides. Native
+tracing preserves socket identities, SCM_RIGHTS descriptors and actual
+ioctl/mmap errors before a Vulkan import. The reviewed ICD's opt-in logs
+separately identify format-query, image-create and import entry/results.
+If those entries are absent, do not invent an ICD error for a rejection in
+Mesa, EGL or GBM. Preserve the entire logs, process maps/status and crash
+artifacts, including `.dmp` and `.extra` files, outside git.
+
+`decode --protocol weston.log --trace native-import.strace --output FILE`
+writes a diagnostic JSON receipt. It preserves raw native failure lines and
+refuses to mark missing planes, malformed fields or observed object-ID
+collisions complete. Wayland object IDs are client-local, so correlate the
+protocol lines with native socket/descriptor records before assigning a
+buffer to an importer. The parser is not an import-success verdict.
+The focused parser checks cover multi-plane modifiers, repeated client-local
+IDs and incomplete records. No GPU or VM starts during prepare, verify,
+decode or those checks.
+
+Every next runtime must independently retain the initial original-backing
+fill check and actual BAR-size/permission/mapping receipts, then record the
+exact executed binaries and arguments against the frozen snapshot. Stop all
+guest clients and services, then the host GPU writer, then the disposable VM.
+Assert both scopes are inactive before removing the owned disk and backing.
+The three GiB, two vCPU, no-network, 600-second VM and 480-second GPU bounds
+remain. Increasing the initial test BAR to 256 MiB is fixture provisioning;
+it does not implement dynamic region growth or change allocation reserves.
