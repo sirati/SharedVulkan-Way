@@ -37,7 +37,11 @@ impl Protocol {
             table.extend_from_slice(&0u64.to_ne_bytes());
         }
         let table = smithay::utils::SealedFile::with_data(c"wc-native-prime-formats", &table)?;
-        dh.create_global::<State, ZwpLinuxDmabufV1, _>(4, ());
+        // Synthetic feedback belongs to the configured native HyperLinux
+        // topology. VM-role wc-proxy advertises its own render node.
+        if std::env::var_os("WC_GPU_SECTIONS").is_some() {
+            dh.create_global::<State, ZwpLinuxDmabufV1, _>(4, ());
+        }
         Ok(Self {
             registry: Registry::default(),
             table,
