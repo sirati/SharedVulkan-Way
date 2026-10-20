@@ -158,6 +158,24 @@ int main(void) {
     bitmap_init();
     memset(fd_table, 0, sizeof(fd_table));
 
+    /* Native descriptor numbers confer no guest authority, even while an
+     * unlinked private backing file occupies that native number. */
+    char private_path[] = "/tmp/hl-fd-authority.XXXXXX";
+    int private_fd = mkstemp(private_path);
+    CHECK(private_fd >= 0, "private backing created");
+    CHECK(unlink(private_path) == 0, "private backing unlinked");
+    CHECK(write(private_fd, "secret", 6) == 6, "private backing initialized");
+    hl_fd_ref_t invalid = {0};
+    CHECK(hl_fd_get_pinned(-1, &invalid) < 0, "negative guest descriptor rejected");
+    CHECK(hl_fd_get_pinned(FD_TABLE_SIZE, &invalid) < 0, "out of range guest descriptor rejected");
+    CHECK(private_fd < FD_TABLE_SIZE && fd_table[private_fd].type == FD_CLOSED &&
+          hl_fd_get_pinned(private_fd, &invalid) < 0,
+          "guessed live native backing number rejected as closed guest slot");
+    char private_bytes[6];
+    CHECK(pread(private_fd, private_bytes, sizeof(private_bytes), 0) == 6 &&
+          memcmp(private_bytes, "secret", 6) == 0,
+          "invalid guest lookup leaves backing native file open and unchanged");
+    close(private_fd);
     int *state = malloc(sizeof(int));
     *state = 7;
     hl_open_file_t *of = hl_open_file_create(FD_REGULAR, &ops, 0, state);
