@@ -234,6 +234,63 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires the disposable udmabuf kernel fixture"]
+    fn real_udmabuf_original_pages_identity_bounds_and_two_broker_leases() {
+        use std::os::fd::{AsFd, FromRawFd};
+        use std::os::unix::fs::FileExt;
+        use std::os::unix::net::UnixStream;
+        use wc_broker::core::{Release, User};
+        use wc_broker::server::{Broker, Config};
+        use wc_broker::sys::unix::Unix;
+        #[repr(C)]
+        struct CreateList { flags:u32, count:u32, fd:u32, pad:u32, offset:u64, size:u64 }
+        let raw=unsafe{libc::memfd_create(c"original-gtk-pages".as_ptr(),libc::MFD_CLOEXEC|libc::MFD_ALLOW_SEALING)};
+        assert!(raw>=0);
+        let original=unsafe{std::fs::File::from_raw_fd(raw)};
+        original.set_len(16384).unwrap();
+        assert_eq!(unsafe{libc::fcntl(raw,libc::F_ADD_SEALS,libc::F_SEAL_SHRINK)},0);
+        let dev=std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf").unwrap();
+        let make=|offset| {
+            let request=CreateList{flags:1,count:1,fd:raw as u32,pad:0,offset,size:4096};
+            let fd=unsafe{libc::ioctl(dev.as_raw_fd(),0x4008_7543u64,&request)};
+            assert!(fd>=0,"udmabuf creation: {}",io::Error::last_os_error());
+            unsafe{OwnedFd::from_raw_fd(fd)}
+        };
+        let actual=make(0);let foreign=make(8192);
+        assert!(same_open_file(&actual,&actual.try_clone().unwrap()).unwrap());
+        assert!(!same_open_file(&actual,&foreign).unwrap());
+        eprintln!("real udmabuf metadata original={:?} foreign={:?}; KCMP_FILE distinguishes them",file_metadata(&actual).unwrap(),file_metadata(&foreign).unwrap());
+        let beyond=unsafe{libc::mmap(std::ptr::null_mut(),8192,libc::PROT_READ,libc::MAP_SHARED,actual.as_raw_fd(),0)};
+        assert_eq!(beyond,libc::MAP_FAILED,"bounded fd mapped past its original pages");
+        let dir=std::env::temp_dir().join(format!("native-real-udma-{}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();let path=dir.join("broker.sock");
+        let broker=std::sync::Arc::new(Broker::new(Unix::bind(&path,Vec::new()).unwrap(),Config{
+            devices:Vec::new(),services:Vec::new(),keys:None,release:Release::OwnerFree,budget:None,run:8}));
+        let id=broker.publish(User::uid(unsafe{libc::geteuid()}),"gtk-original",11,vec![(Unix::object(actual),0,4096)]);
+        let serving=broker.clone();std::thread::spawn(move||{let _=serving.serve();});
+        let(tx,rx)=std::sync::mpsc::channel();broker.on_drained(Box::new(move|id,epoch|{tx.send((id,epoch)).unwrap();}));
+        let backing=Backing::Broker{id,offset:0};
+        let proxy=Mapping::open_at(&backing,4096,path.to_str().unwrap()).unwrap();
+        let cairo=Mapping::open_at(&backing,4096,path.to_str().unwrap()).unwrap();
+        let(a,b)=UnixStream::pair().unwrap();
+        sv_transport::localfd::send_with_fds(&a,b"original",&[cairo.fd().as_fd()]).unwrap();
+        let mut payload=Vec::new();let mut fds=sv_transport::localfd::recv_with_fds(&b,&mut payload).unwrap();
+        let received=fds.remove(0);assert!(same_open_file(proxy.fd(),&received).unwrap());
+        let peer=unsafe{libc::mmap(std::ptr::null_mut(),4096,libc::PROT_READ,libc::MAP_SHARED,received.as_raw_fd(),0)};
+        assert_ne!(peer,libc::MAP_FAILED);
+        unsafe{std::ptr::write_volatile(cairo.data().cast::<u64>(),0x1020_3040_5060_7080);}
+        assert_eq!(unsafe{std::ptr::read_volatile(peer.cast::<u64>())},0x1020_3040_5060_7080);
+        let mut bytes=[0;8];original.read_exact_at(&mut bytes,0).unwrap();
+        assert_eq!(u64::from_ne_bytes(bytes),0x1020_3040_5060_7080,"paint did not reach original physical backing");
+        broker.retire(id);assert!(rx.try_recv().is_err());
+        drop(cairo);assert!(rx.try_recv().is_err(),"Cairo close discarded the proxy's independent lease");
+        unsafe{libc::munmap(peer,4096);}drop(received);drop(proxy);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),(id,11));
+        broker.unpublish(id);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn broker_retirement_waits_for_the_cairo_mapping_lease() {
         use wc_broker::core::{Release, User};
         use wc_broker::server::{Broker, Config};
