@@ -499,9 +499,11 @@ impl Port {
                     if error.raw_os_error() == Some(1450)
                         && !self.ever_ready.load(Ordering::Acquire) =>
                 {
-                    // The read completed synchronously, before any raw write or
-                    // subscriber was admitted. Keep this handle, park, and let
-                    // only a new explicit subscription trigger another probe.
+                    // The read is known complete before readiness, with no raw
+                    // write or subscriber admitted. This includes an unusual
+                    // API error whose observed pending operation then completed.
+                    // Keep this handle and let only a new explicit subscription
+                    // trigger another probe.
                     let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
                     state.phase = Phase::Unavailable;
                     self.read_changed.notify_all();
