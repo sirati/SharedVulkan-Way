@@ -367,6 +367,7 @@ impl BellTarget for ControlSet {
 /// Named for what it does rather than what it is: it answers the door.
 pub struct Doorman {
     stop: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
     woken: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<ServeEnd>>,
 }
@@ -388,16 +389,28 @@ impl Doorman {
     ) -> Doorman {
         let stop = Arc::new(AtomicBool::new(false));
         let woken = Arc::new(AtomicU64::new(0));
+        let ended = Arc::new(AtomicBool::new(false));
         let handle = {
             let stop = Arc::clone(&stop);
             let woken = Arc::clone(&woken);
+            let ended = Arc::clone(&ended);
             std::thread::Builder::new()
                 .name("sv-doorbell".into())
-                .spawn(move || serve_port(port, &*control, &stop, &woken))
+                .spawn(move || {
+                    let result = serve_port(port, &*control, &stop, &woken);
+                    // Publish notification-channel failure before waking every
+                    // waiter. This is not resource or process completion.
+                    ended.store(true, Ordering::Release);
+                    control.rescan(&woken);
+                    result
+                })
                 .expect("a thread")
         };
-        Doorman { stop, woken, handle: Some(handle) }
+        Doorman { stop, ended, woken, handle: Some(handle) }
     }
+
+    /// The notification reader ended. This never proves resource completion.
+    pub fn ended(&self) -> bool { self.ended.load(Ordering::Acquire) }
 
     /// How many wakes have been delivered. The number that says whether the
     /// doorbell is working, and the first thing to print when it is not.
@@ -552,16 +565,20 @@ pub fn connect_reconnecting_with<T: BellTarget + ?Sized + 'static>(
     let connected = first.is_some();
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicU64::new(0));
+    let ended = Arc::new(AtomicBool::new(false));
     let path = path.to_string();
     let handle = {
         let stop = Arc::clone(&stop);
         let woken = Arc::clone(&woken);
+        let ended = Arc::clone(&ended);
         std::thread::Builder::new().name("sv-doorbell".into()).spawn(move || {
             let mut next = first;
             let mut reconnects = 0u64;
             loop {
                 if stop.load(Ordering::Acquire) {
                     writer.set(None);
+                    ended.store(true, Ordering::Release);
+                    target.rescan(&woken);
                     return ServeEnd::Stopped;
                 }
                 let port = match next.take() {
@@ -586,6 +603,8 @@ pub fn connect_reconnecting_with<T: BellTarget + ?Sized + 'static>(
                 let end = serve_port(reader, &*target, &stop, &woken);
                 writer.set(None);
                 if end == ServeEnd::Stopped {
+                    ended.store(true, Ordering::Release);
+                    target.rescan(&woken);
                     return end;
                 }
                 eprintln!("[doorbell] {path} closed ({end:?}); waits use their slices until it is back");
@@ -593,7 +612,7 @@ pub fn connect_reconnecting_with<T: BellTarget + ?Sized + 'static>(
             }
         })?
     };
-    Ok((Doorman { stop, woken, handle: Some(handle) }, connected, wake))
+    Ok((Doorman { stop, ended, woken, handle: Some(handle) }, connected, wake))
 }
 
 /// The host's doorbell writer since §99.9: each byte is sent with
@@ -1504,6 +1523,34 @@ mod tests {
         assert_eq!(wake.stats(), (0, 0), "a byte was sent for a lane nobody was waiting on");
         drop(guest_end);
     }
+    #[test]
+    fn terminal_port_close_publishes_failure_before_rescanning_waiters() {
+        use std::os::unix::net::UnixStream;
+        struct Target {
+            ended: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+            notice: std::sync::mpsc::Sender<bool>,
+        }
+        impl BellTarget for Target {
+            fn ring_token(&self, _: u8, _: &AtomicU64) -> bool { false }
+            fn rescan(&self, _: &AtomicU64) {
+                if let Some(flag) = self.ended.lock().unwrap().as_ref() {
+                    let _ = self.notice.send(flag.load(Ordering::Acquire));
+                }
+            }
+        }
+        let (port, peer) = UnixStream::pair().unwrap();
+        let (notice, notices) = std::sync::mpsc::channel();
+        let target = Arc::new(Target { ended: std::sync::Mutex::new(None), notice });
+        let door = Doorman::spawn_target(port, target.clone());
+        *target.ended.lock().unwrap() = Some(door.ended.clone());
+        drop(peer);
+        // An initial rescan can race target setup. Only terminal rescan must
+        // carry true, and it must arrive without waiting for a periodic check.
+        while !notices.recv_timeout(std::time::Duration::from_secs(2)).unwrap() {}
+        assert!(door.ended());
+        assert_eq!(door.join(), ServeEnd::Closed);
+    }
+
 }
 
 #[cfg(test)]
