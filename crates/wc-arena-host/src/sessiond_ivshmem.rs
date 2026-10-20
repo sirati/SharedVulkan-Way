@@ -499,7 +499,12 @@ fn serve(args: &Args, live: &mut Live, done: &mut HashSet<Seen>, why: &str) {
             Err(e) => msg = format!("{msg}; NO GPU: {e}"),
         }
     }
-    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?}, gpu {d_gpu:?} (beside the proxy)"));
+    // §105.14: the proxy verb's own stages (`wc-session` writes them).
+    let runroot = std::env::var("WC_LAUNCH_RUN").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "/tmp/wc-launch".into());
+    let stages = std::fs::read_to_string(Path::new(&runroot).join(&id).join("proxy.timing"))
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().chunks(2).map(|c| c.join(" ")).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    say(&format!("session {id}: up {d_up:?}, proxy {d_proxy:?} (ms into it: {stages}), gpu {d_gpu:?} (beside the proxy)"));
     match answer(&file, &rec, macboot::State::Located, &msg) {
         Ok(true) => say(&format!("session {id}: started in {:?} ({why}): {msg}", t0.elapsed())),
         Ok(false) => say(&format!("session {id}: started, but the guest replaced its record before the answer; its lease will end it")),

@@ -1433,6 +1433,9 @@ proxy)
   words 1 1 "ID" "$@"
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
+  # §105.14: where the verb's time goes, in ms since it started.
+  STAMP0=$(date +%s%N)
+  stamp() { [ -d "$D" ] && echo "$1 $(( ($(date +%s%N) - STAMP0) / 1000000 ))" >>"$D/proxy.timing"; }
   # IVSHMEM ARENA (§83): this user, a user unit, no $ROOTC. The socket is made
   # by this user, so there is nothing to chown. `--arena-run` is the run id `up`
   # checked, and the proxy refuses a header carrying any other. No
@@ -1518,11 +1521,14 @@ proxy)
         "${WC_LAUNCH_SESSION_SECS:-43200}" "${WC_LAUNCH_SESSION_SECS:-43200}" "$D/proxy.log"
     } >"$D/proxy.sh"
     chmod 755 "$D/proxy.sh"
+    stamp script
     export XDG_RUNTIME_DIR="/run/user/$UID_"
     systemctl --user reset-failed "$UNIT" 2>/dev/null
     systemd-run --user --unit="$UNIT" --collect "$(command -v bash)" "$D/proxy.sh" >/dev/null 2>&1 \
       || die "systemd-run --user could not start $UNIT (is this user's manager running? loginctl enable-linger)"
+    stamp unit
     for _ in $(seq 1 1000); do [ -S "$D/wl-proxy" ] && break; sleep 0.01; done
+    stamp bound
     if [ ! -S "$D/wl-proxy" ]; then
       echo "wc-session: the proxy never bound its socket" >&2
       tail -20 "$D/proxy.log" 2>/dev/null | sed 's/^/  /' >&2
@@ -1540,6 +1546,7 @@ proxy)
         sleep 0.01
       done
       echo "transport ${T:-the proxy said nothing about the rings in 2 s (see $D/proxy.log)}"
+      stamp rings
     elif [ "$(cat "$D/transport" 2>/dev/null)" = rings ]; then
       T=""
       for _ in $(seq 1 200); do
