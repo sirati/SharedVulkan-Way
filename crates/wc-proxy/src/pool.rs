@@ -892,6 +892,11 @@ impl ProvidedRegion {
     /// retained for GTK export. Never reopen an id after mapping cached pages.
     #[cfg(target_os = "linux")]
     fn registered_plan(plan: &crate::guestram::Plan, check_header: bool) -> io::Result<Option<Backing>> {
+        Self::registered_plan_at(plan, check_header, &wc_broker::client::path())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn registered_plan_at(plan: &crate::guestram::Plan, check_header: bool, broker: &str) -> io::Result<Option<Backing>> {
         use std::os::fd::AsFd;
         let Some(id) = wc_broker::client::region_spec(&plan.object) else { return Ok(None); };
         let [run] = plan.runs.as_slice() else {
@@ -900,7 +905,7 @@ impl ProvidedRegion {
         if run.arena_offset != 0 || run.len != plan.len || plan.len == 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid registered GTK plan"));
         }
-        let mut client = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+        let mut client = wc_broker::client::Client::connect(broker)?;
         let hello = client.hello("proxy-memory")?;
         let broker_run = u64::from_str_radix(&hello.run, 16).map_err(|_| io::Error::other("invalid broker run"))?;
         let (r, fds) = client.open(id)?;
@@ -2381,6 +2386,46 @@ mod tests {
         let d = std::env::temp_dir().join(format!("wc-proxy-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registered_bar_plan_maps_held_original_fd_and_checks_actual_header() {
+        use wc_broker::{core::{Release, User}, server::{Broker, Config}, sys::unix::Unix};
+        use wc_handle::ivshmem::{HEADER_BYTES, Header};
+        let dir = tmpdir("native-registered-bar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broker.sock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(dir.join("bar")).unwrap();
+        let len = 2 * ARENA_GRANULARITY + HEADER_BYTES;
+        file.set_len(len).unwrap();
+        let header = Header { run_id: 42, generation: 1, region_len: len, arena_id: 0,
+            outbound: (0, 0), rings: (0, 0) };
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&header.encode(), 0).unwrap();
+        let broker = std::sync::Arc::new(Broker::new(Unix::bind(&path, Vec::new()).unwrap(), Config {
+            devices: Vec::new(), services: Vec::new(), keys: None, release: Release::OwnerFree, budget: None, run: 7,
+        }));
+        let id = broker.publish(User::uid(unsafe { libc::geteuid() }), "bar", 9,
+            vec![(Unix::object(file.try_clone().unwrap().into()), 0, len)]);
+        let serving = broker.clone();
+        std::thread::spawn(move || { let _ = serving.serve(); });
+        let mut plan = crate::guestram::Plan { id: 0, object: format!("broker:{id}").into(),
+            len: ARENA_GRANULARITY, run_id: 42, outbound: None,
+            runs: vec![crate::guestram::Run { arena_offset: 0, file_offset: HEADER_BYTES, len: ARENA_GRANULARITY }] };
+        let backing = ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).unwrap().unwrap();
+        let Backing::GuestRamLeased(mut region, lease) = backing else { panic!("missing registered lease") };
+        assert_eq!((lease.id, lease.run, lease.epoch, lease.offset), (id, 7, 9, HEADER_BYTES));
+        region.as_mut_slice()[0..4].copy_from_slice(b"GTK!");
+        let mut actual = [0; 4];
+        file.read_exact_at(&mut actual, HEADER_BYTES).unwrap();
+        assert_eq!(&actual, b"GTK!");
+        assert!(wc_native_shm::same_open_file(&lease.fds[0], &file.try_clone().unwrap().into()).unwrap());
+        plan.run_id = 43;
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err());
+        drop(region);
+        drop(lease);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The claim both transports must satisfy: bytes written here are readable
