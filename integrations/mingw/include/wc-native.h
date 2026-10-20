@@ -6,6 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+static inline int wc_native_path_is_absolute(const char *path) {
+  return path && ((path[0] >= 'A' && path[0] <= 'Z') ||
+                  (path[0] >= 'a' && path[0] <= 'z')) &&
+         path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+}
 static inline const char *wc_native_program_name(void) {
   const char *name = _pgmptr;
   const char *slash = name ? strrchr(name, '\\') : NULL;

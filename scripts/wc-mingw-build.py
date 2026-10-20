@@ -125,6 +125,13 @@ def build(root):
         run(['wayland-scanner', mode, *extra, source / 'protocol/wayland.xml', output / name])
 
     patch_descriptors(source)
+    client = source / 'src/wayland-client.c'
+    text = client.read_text()
+    for old, new in [("path_is_absolute = name[0] == '/';", "path_is_absolute = wc_native_path_is_absolute(name);"),
+                     ("runtime_dir[0] != '/'", "!wc_native_path_is_absolute(runtime_dir)")]:
+        if text.count(old) != 1: raise RuntimeError('upstream native pathname check changed')
+        text = text.replace(old, new)
+    client.write_text(text)
     connection = source / 'src/connection.c'
     text = connection.read_text()
     # UCRT has no open_memstream. Serialize debug output to stderr under the
