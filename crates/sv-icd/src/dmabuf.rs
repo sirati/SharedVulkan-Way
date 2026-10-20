@@ -352,11 +352,32 @@ pub struct DmabufImage {
     /// the start of the dma-buf (an NV12 frame's chroma plane imported on
     /// its own as R8G8, §112), checked against the driver's layout.
     pub bind_offset: u64,
+    /// Full backend image requirement, checked after applying the explicit
+    /// layout translation before any bind reaches the real driver.
+    pub required_size: u64,
+    pub required_alignment: u64,
     /// The image's `VkFormat`, for its plane count.
     pub format: i32,
     /// Made with `VkExternalMemoryImageCreateInfo{DMA_BUF}`: bound to a
     /// shared section on the GPU side.
     pub external: bool,
+}
+
+/// Preserve the exact explicit plane offsets without wrapping arithmetic.
+pub(crate) fn explicit_base(wanted: &[(u64, u64)], actual: &[(u64, u64)], alignment: u64) -> Option<u64> {
+    if wanted.is_empty() || wanted.len() != actual.len() || alignment == 0 { return None; }
+    let base = wanted[0].0.checked_sub(actual[0].0)?;
+    (base % alignment == 0 && wanted.iter().zip(actual).all(|(w, a)| w.1 == a.1 && a.0.checked_add(base) == Some(w.0))).then_some(base)
+}
+
+impl DmabufImage {
+    pub(crate) fn translated_offset(&self, offset: u64) -> Option<u64> { offset.checked_add(self.bind_offset) }
+    pub(crate) fn binding_offset(&self, requested: u64, allocation_size: u64) -> Option<u64> {
+        let offset = self.translated_offset(requested)?;
+        (self.required_size > 0 && self.required_alignment > 0
+            && offset % self.required_alignment == 0
+            && offset.checked_add(self.required_size)? <= allocation_size).then_some(offset)
+    }
 }
 
 /// What the app side remembers about a semaphore created exportable as a
@@ -959,5 +980,34 @@ mod tests {
         let d = drm_properties(226, 128);
         assert!(!d.has_primary && d.has_render);
         assert_eq!((d.render_major, d.render_minor), (226, 128));
+    }
+}
+
+#[cfg(test)]
+mod explicit_layout_tests {
+    use super::*;
+    #[test]
+    fn chroma_shift_preserves_layout_and_checks_the_complete_image_extent() {
+        let wanted = [(8192, 256)];
+        assert_eq!(explicit_base(&wanted, &[(0, 256)], 4096), Some(8192));
+        let image = DmabufImage { bind_offset: 8192, required_size: 4096, required_alignment: 4096, ..Default::default() };
+        assert_eq!(image.translated_offset(0), Some(8192));
+        assert_eq!(image.binding_offset(0, 12288), Some(8192));
+        assert_eq!(image.binding_offset(0, 12287), None);
+        assert_eq!(image.binding_offset(1, 16384), None);
+        assert_eq!(image.binding_offset(u64::MAX, u64::MAX), None);
+        assert_eq!(image.translated_offset(u64::MAX), None);
+    }
+    #[test]
+    fn all_planes_must_share_one_checked_shift_and_exact_pitches() {
+        let actual = [(0, 256), (8192, 256)];
+        assert_eq!(explicit_base(&[(4096,256),(12288,256)], &actual, 4096), Some(4096));
+        assert_eq!(explicit_base(&[(4096,256),(12289,256)], &actual, 4096), None);
+        assert_eq!(explicit_base(&[(4096,256),(12288,128)], &actual, 4096), None);
+        assert_eq!(explicit_base(&[(1,256)], &[(2,256)], 1), None);
+        assert_eq!(explicit_base(&[(1,256),(0,256)], &[(0,256),(u64::MAX,256)], 1), None);
+        assert_eq!(explicit_base(&[(0,256)], &[(0,256)], 0), None);
+        let image = DmabufImage { bind_offset: u64::MAX - 4095, required_size: 4096, required_alignment: 1, ..Default::default() };
+        assert_eq!(image.binding_offset(0, u64::MAX), None);
     }
 }

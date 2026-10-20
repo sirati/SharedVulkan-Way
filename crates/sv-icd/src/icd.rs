@@ -2162,18 +2162,17 @@ impl Icd for SharedVulkan {
                 )?;
                 have.push(got.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default());
             }
-            let base = img.planes[0].0.checked_sub(have[0].0);
-            let align = forward::get_image_memory_requirements(
+            let requirements = forward::get_image_memory_requirements(
                 t,
                 p::VkGetImageMemoryRequirementsArgs { device, image: p::VkImage(id), p_memory_requirements: None },
-            )?
-            .p_memory_requirements
-            .map_or(1, |r| r.alignment.max(1));
-            let fits = base.is_some_and(|b| {
-                b % align == 0 && (0..n).all(|i| img.planes[i].1 == have[i].1 && img.planes[i].0 == b + have[i].0)
-            });
+            )?.p_memory_requirements;
+            let (size, align) = requirements.map_or((0, 0), |r| (r.size, r.alignment));
+            let base = crate::dmabuf::explicit_base(&img.planes[..n], &have, align);
+            let fits = size > 0 && base.is_some_and(|b| b.checked_add(size).is_some());
             if fits {
                 img.bind_offset = base.unwrap_or(0);
+                img.required_size = size;
+                img.required_alignment = align;
             } else {
                 let (offset, pitch) = img.planes[0];
                 sv_icd_entry::report_always(&format_args!(
@@ -2207,7 +2206,14 @@ impl Icd for SharedVulkan {
             return Err(LowerError::NotImplemented("vkBindImageMemory"));
         };
         if crate::dmabuf::enabled() {
-            args.memory_offset += self.state().dmabuf_images.get(&args.image.0).map_or(0, |i| i.bind_offset);
+            let state = self.state();
+            if let Some(image) = state.dmabuf_images.get(&args.image.0).filter(|i| i.explicit.is_some()) {
+                let offset = state.memories.get(&args.memory.0).and_then(|m| image.binding_offset(args.memory_offset, m.size));
+                let Some(offset) = offset else {
+                    return Ok(p::VkBindImageMemoryReply { result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE) });
+                };
+                args.memory_offset = offset;
+            }
         }
         forward::bind_image_memory(t, args)
     }
@@ -2219,7 +2225,13 @@ impl Icd for SharedVulkan {
         if crate::dmabuf::enabled() {
             let s = self.state();
             for b in args.p_bind_infos.iter_mut() {
-                b.memory_offset += s.dmabuf_images.get(&b.image.0).map_or(0, |i| i.bind_offset);
+                if let Some(image) = s.dmabuf_images.get(&b.image.0).filter(|i| i.explicit.is_some()) {
+                    let offset = s.memories.get(&b.memory.0).and_then(|m| image.binding_offset(b.memory_offset, m.size));
+                    let Some(offset) = offset else {
+                        return Ok(p::VkBindImageMemory2Reply { result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE) });
+                    };
+                    b.memory_offset = offset;
+                }
             }
         }
         forward::bind_image_memory2(t, args)
@@ -2274,7 +2286,14 @@ impl Icd for SharedVulkan {
         {
             self.plane_to_colour(args.image.0, &mut sub.aspect_mask);
         }
-        forward::get_image_subresource_layout(t, args)
+        let image = args.image.0;
+        let mut reply = forward::get_image_subresource_layout(t, args)?;
+        if let Some(layout) = reply.p_layout.as_mut() {
+            if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
+                layout.offset = image.translated_offset(layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+            }
+        }
+        Ok(reply)
     }
 
     fn get_image_subresource_layout2(
@@ -2289,7 +2308,14 @@ impl Icd for SharedVulkan {
         {
             self.plane_to_colour(args.image.0, &mut sub.image_subresource.aspect_mask);
         }
-        forward::get_image_subresource_layout2(t, args)
+        let image = args.image.0;
+        let mut reply = forward::get_image_subresource_layout2(t, args)?;
+        if let Some(layout) = reply.p_layout.as_mut() {
+            if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
+                layout.subresource_layout.offset = image.translated_offset(layout.subresource_layout.offset).ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+            }
+        }
+        Ok(reply)
     }
 
     fn cmd_pipeline_barrier(&self, mut args: p::VkCmdPipelineBarrierArgs) -> IcdResult<()> {

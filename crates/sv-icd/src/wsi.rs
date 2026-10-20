@@ -1378,16 +1378,25 @@ mod zero_copy {
             }
             let mut sub = p::VkImageSubresource::default();
             sub.aspect_mask = p::VkImageAspectFlags(crate::dmabuf::ASPECT_COLOR);
-            let l = icd.get_image_subresource_layout(p::VkGetImageSubresourceLayoutArgs {
+            let l = match icd.get_image_subresource_layout(p::VkGetImageSubresourceLayoutArgs {
                 device: p::VkDevice(device),
                 image: p::VkImage(image),
                 p_subresource: Some(Box::new(sub)),
                 p_layout: Some(Box::default()),
-            })?;
-            let pitch = l.p_layout.map(|l| l.row_pitch).unwrap_or(0);
-            if pitch == 0 || pitch > u32::MAX as u64 {
+            }) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    let _ = icd.free_memory(p::VkFreeMemoryArgs { device: p::VkDevice(device), memory: p::VkDeviceMemory(memory) });
+                    return Err(error);
+                }
+            };
+            let (offset, pitch) = l.p_layout.map(|l| (l.offset, l.row_pitch)).unwrap_or_default();
+            // The Wayland export tuple currently carries only fd and pitch.
+            // Refuse a nonzero backend origin rather than advertise offset 0
+            // for different bytes. No allocation or payload copy substitutes.
+            if offset != 0 || pitch == 0 || pitch > u32::MAX as u64 {
                 let _ = icd.free_memory(p::VkFreeMemoryArgs { device: p::VkDevice(device), memory: p::VkDeviceMemory(memory) });
-                return Err(LowerError::Shape("a shared swapchain image with no row pitch"));
+                return Err(LowerError::Shape("a shared swapchain image has an unsupported offset or row pitch"));
             }
             Ok((memory, pitch as u32))
         })();
