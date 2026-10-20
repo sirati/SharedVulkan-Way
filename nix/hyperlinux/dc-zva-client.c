@@ -10,14 +10,16 @@
 #include <unistd.h>
 static volatile sig_atomic_t faulted;
 static uintptr_t expected;
+static int expected_signal = SIGSEGV;
 static void on_fault(int sig, siginfo_t *info, void *context) {
-    if (sig != SIGSEGV || (uintptr_t)info->si_addr != expected || faulted) _exit(90);
+    if (sig != expected_signal || info->si_code != 2 || (uintptr_t)info->si_addr != expected || faulted) _exit(90);
     faulted = 1;
     ((ucontext_t *)context)->uc_mcontext.pc += 4;
 }
 static void install(void) {
     struct sigaction action = { .sa_sigaction = on_fault, .sa_flags = SA_SIGINFO };
-    sigemptyset(&action.sa_mask); assert(!sigaction(SIGSEGV, &action, NULL));
+    sigemptyset(&action.sa_mask);
+    assert(!sigaction(SIGSEGV, &action, NULL) && !sigaction(SIGBUS, &action, NULL));
 }
 static void zva(void *pointer) {
     register void *operand __asm__("x0") = pointer;
@@ -34,6 +36,17 @@ static void zva(void *pointer) {
 }
 int main(int argc, char **argv) {
     assert(argc == 2); const char *mode = argv[1];
+    if (!strcmp(mode, "bus")) {
+        int fd = memfd_create("dc-zva-truncate", MFD_CLOEXEC); assert(fd >= 0);
+        assert(!ftruncate(fd, 4096));
+        uint8_t *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        assert(page != MAP_FAILED && !ftruncate(fd, 0));
+        expected = (uintptr_t)(page + 17); expected_signal = SIGBUS; install();
+        zva(page + 17); assert(faulted);
+        assert(!munmap(page, 4096) && !close(fd));
+        puts("DCZVA_BUS original truncated backing faults in guest, exact address and state preserved PASS");
+        return 0;
+    }
     int valid = !strcmp(mode, "valid"), tagged = !strcmp(mode, "validtag");
     int readonly = !strcmp(mode, "ro"), inaccessible = !strcmp(mode, "none");
     if (valid || tagged || readonly || inaccessible) {
