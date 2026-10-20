@@ -37061,6 +37061,13 @@ An already-open handle to an old readable key cannot observe the rotated
 bytes. Reparse directories and key paths are refused. The service executable
 and recovery files also have privileged ownership. This matters because an
 owner can change a DACL even without a grant in that DACL.
+Installation does not trust SCM's transient Running state alone. The ready
+command independently verifies raw ACLs, opens an overlapped pipe, checks its
+kernel server PID against the current running SCM service and its token SID
+against SYSTEM, then checks hello/stats. It pins the process and rechecks SCM
+before success. Each exchange has a one-second I/O deadline; cancellation is
+drained before its buffers disappear. Generic private/user broker clients
+keep their existing connection behavior.
 
 `WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
