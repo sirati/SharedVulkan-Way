@@ -35321,7 +35321,14 @@ them in the host configuration's `wctestInstalls`, which adds
   The service runs as `waycompose`. Each session's proxy and application run
   under the mapped uid (`/proc/<pid>/status`) in `user@<uid>.service`.
   Neither user can open the BAR file or the hub. One user's broker connection
-  cannot open the other's region. Results below.
+  cannot open the other's region. Passed 2026-10-20: 6 subtests, the script
+  in 33.9 s, 282 MiB of the VM's 962 in use at the end.
+* The broker is set-up only, and the data path is unchanged. The control
+  ring's round trip in a brokered session (`wc-broker-host.sh`) was 11.2 us
+  mean, p99 15.9 (10000 round trips). On the plain no-ssh path
+  (`wc-no-ssh.sh`, the same hour) it was 8.4 us, p99 23.3. Both are debug
+  builds on this workstation, and the gap is run-to-run noise: no broker
+  call is on that path.
 
 #### Debt
 
