@@ -1514,6 +1514,12 @@ identity, no secrets:
   socket whose peer uid is the caller's, and never opens or connects anything
   for a caller. The service sees the client's own `SO_PEERCRED` on it, and
   `sv-hostd` and the bell hub check that uid again against their own.
+* The embedded system broker registers `waycompose-broker ANY-UID` when
+  the render-node services socket exists. It compares the forwarded uid and
+  pid with the socket's kernel credentials before handing it to its normal
+  accept path. The broker then applies its existing mapped-user policy to
+  hub connections and region access. A sandboxed client gains no cross-user
+  direct hub grant and no bypass of the broker's user mapping.
 * `conn UID PID` is sent without waiting: a service that stops reading costs
   its clients `EAGAIN`, not the node.
 
