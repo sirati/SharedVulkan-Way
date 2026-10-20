@@ -284,8 +284,8 @@ pub fn main(args: Vec<String>) -> std::process::ExitCode {
         },
         Some("serve") => parse_serve(&args[1..]).and_then(serve),
         None => parse_serve(&[]).and_then(serve),
-        Some(_) => Err("usage: wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--no-default-devices] \
-                        [--release-after SECS] [--budget-mib N] | wc-broker ctl [--hold] REQUEST... | wc-broker plist BIN"
+        Some(_) => Err("usage: wc-broker serve [--socket PATH] [--keys DIR] [--device NAME=PATH]... [--service NAME=PATH]... [--no-default-devices] \
+                        [--budget-mib N] | wc-broker ctl [--hold] REQUEST... | wc-broker plist BIN"
             .into()),
     };
     match r {
