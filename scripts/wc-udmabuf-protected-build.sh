@@ -3,6 +3,7 @@
 # Must be invoked through /mnt/datasets/builds/wcrun/cg on this host.
 set -euo pipefail
 [[ $# == 3 ]] || { echo "usage: $0 PREPARED_SOURCE KERNEL_BUILD OUTPUT_DIRECTORY" >&2; exit 2; }
+repo=$(cd "$(dirname "$0")/.." && pwd)
 src=$(realpath "$1")
 kernel=$(realpath "$2")
 mkdir -p "$3"
@@ -21,6 +22,11 @@ if [[ ${UDMABUF_TEST_NODE:-0} == 1 ]]; then
     echo '/dev/udmabuf-protected-test; fixture-only alternate node' > "$out/node-provenance.txt"
 else
     echo '/dev/udmabuf; replacement node, not loaded' > "$out/node-provenance.txt"
+fi
+if [[ ${UDMABUF_BUILD_TEST_IMPORTER:-0} == 1 ]]; then
+    [[ ${UDMABUF_TEST_NODE:-0} == 1 ]] || { echo 'test importer requires fixture node' >&2; exit 2; }
+    cp "$repo/drivers/linux-udmabuf/tests/wc_udmabuf_import_test.c" "$repo/drivers/linux-udmabuf/tests/udmabuf-import-test-uapi.h" "$out/"
+    echo 'obj-m += wc_udmabuf_import_test.o' >> "$out/Makefile"
 fi
 sha256sum "$kernel/.config" > "$out/kernel-config.sha256"
 "${CC:-gcc}" --version > "$out/compiler.txt"
