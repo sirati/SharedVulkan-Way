@@ -306,6 +306,9 @@ pub struct State {
     pub dmabuf_images: HashMap<u64, crate::dmabuf::DmabufImage>,
     pub semaphores: HashMap<u64, crate::dmabuf::Semaphore>,
     pub sync_fences: HashMap<u64, u64>,
+    /// Fences completed by CPU-known swapchain acquisition, independently of
+    /// unrelated work on any application queue. Reset removes this payload.
+    pub acquired_fences: std::collections::HashSet<u64>,
     /// The fence record, its numbers and what the next submit waits for
     /// (§104.11).
     pub fences: crate::dmabuf::Fences,
@@ -334,6 +337,7 @@ impl State {
             dmabuf_images: HashMap::new(),
             semaphores: HashMap::new(),
             sync_fences: HashMap::new(),
+            acquired_fences: Default::default(),
             fences: Default::default(),
             allocator,
             arena_high_water: 0,

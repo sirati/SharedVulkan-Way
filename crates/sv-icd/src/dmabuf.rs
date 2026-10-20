@@ -398,8 +398,27 @@ pub struct Semaphore {
     /// The queue of the last submit that signalled it, until an export
     /// consumes that signal.
     pub signal_queue: Option<u64>,
-    /// A sync fd was imported into it: the next wait on it is dropped.
+    /// The permanent payload was signaled by completed CPU-side acquisition.
     pub presignalled: bool,
+    /// A temporary already-complete SYNC_FD import shadows the permanent
+    /// payload until the next wait or copy-payload export restores it.
+    pub temporary_presignalled: bool,
+    /// Every local payload transition changes this revision, allowing failed
+    /// submissions to roll back only their own still-current reservation.
+    pub revision: u64,
+}
+impl Semaphore {
+    pub fn advance_revision(&mut self) {
+        self.revision = self.revision.checked_add(1).expect("semaphore revision exhausted");
+    }
+    pub fn consume_local_signal(&mut self) -> bool {
+        if self.temporary_presignalled {
+            self.temporary_presignalled = false;
+            true
+        } else {
+            std::mem::take(&mut self.presignalled)
+        }
+    }
 }
 
 /// The implicit-sync bookkeeping of §104.11, app side.
@@ -676,6 +695,12 @@ pub fn drop_presignalled_waits(s: &mut p::VkSubmitInfo, mut take: impl FnMut(u64
                 {
                     t.p_wait_semaphore_values.remove(i);
                     t.wait_semaphore_value_count = t.p_wait_semaphore_values.len() as u32;
+                }
+                if let p::PNextLink::VkDeviceGroupSubmitInfo(group) = l
+                    && i < group.p_wait_semaphore_device_indices.len()
+                {
+                    group.p_wait_semaphore_device_indices.remove(i);
+                    group.wait_semaphore_count = group.p_wait_semaphore_device_indices.len() as u32;
                 }
             }
         } else {
