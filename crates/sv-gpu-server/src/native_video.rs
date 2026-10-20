@@ -868,3 +868,41 @@ mod tests_multiple_scopes {
         assert!(recorded[2].reset_before);
     }
 }
+#[cfg(test)]
+mod tests_level {
+    use super::*;
+    #[test]
+    fn level_and_dpb_limits_match_the_advertised_maximum() {
+        let mut v = NativeVideo::new(Ready {
+            hardware_h264: true,
+            joined_nv12_import: true,
+            native_queue_bound_decode: true,
+        });
+        let info = vk::VideoSessionCreateInfoKHR::default()
+            .picture_format(FORMAT)
+            .reference_picture_format(FORMAT)
+            .max_coded_extent(vk::Extent2D {
+                width: 4096,
+                height: 2304,
+            })
+            .max_dpb_slots(16)
+            .max_active_reference_pictures(16);
+        let id = v.create_session(Profile { idc: 100 }, &info).unwrap();
+        let p = v.create_parameters(id, None, 1, 1).unwrap();
+        let mut s: vk::native::StdVideoH264SequenceParameterSet = unsafe { std::mem::zeroed() };
+        s.profile_idc = 100;
+        s.level_idc = 16;
+        s.chroma_format_idc = 1;
+        s.pic_width_in_mbs_minus1 = 255;
+        s.pic_height_in_map_units_minus1 = 143;
+        s.max_num_ref_frames = 5;
+        s.flags.set_frame_mbs_only_flag(1);
+        s.flags.set_direct_8x8_inference_flag(1);
+        assert!(unsafe { v.update_parameters(p, 1, &[s], &[]) }.is_err());
+        s.level_idc = 15;
+        s.max_num_ref_frames = 6;
+        assert!(unsafe { v.update_parameters(p, 1, &[s], &[]) }.is_err());
+        s.max_num_ref_frames = 5;
+        unsafe { v.update_parameters(p, 1, &[s], &[]) }.unwrap();
+    }
+}
