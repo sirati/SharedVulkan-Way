@@ -36988,7 +36988,10 @@ died is started again and given every region. So a region the host still
 maps is lost only if the broker, the holder and every provider die together;
 before the holder, the broker's crash while the provider was down was enough.
 An orderly stop of the service leaves the holder running (an upgrade keeps
-the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+the regions). `sv-guest broker holder-quit` atomically refuses while any
+region remains. Normal region release permits holder exit. On refusal,
+uninstall retains the binary, service, protections and recovery state, and
+restarts a previously running service to adopt retained regions.
 
 **Signing (§111.6).** `Platform::identity` is `os=windows
 user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
@@ -37060,29 +37063,41 @@ exists, before stopping a session or copying any files. Use `key` there;
 recreating a desktop-readable signing key would defeat the broker identity
 check. Unknown service status also refuses the deploy.
 
-**Rollback baseline.** The first broker start records each device's live DACL
-and PnP descriptor before changing either. PnP security is read through the
-binary `SPDRP_SECURITY` property, including its mandatory label; the SDDL
-property is for writing. A five-column `devices.txt` stores both originals,
-written before the change. Unreadable or invalid snapshots refuse changes.
-Uninstall retains failed restoration records for retry and refuses an older
-four-column baseline whose PnP original is unknown.
+**Rollback baseline and refusal.** The first broker start records each device's
+live DACL and PnP descriptor before changing either. Binary `SPDRP_SECURITY`
+includes the mandatory label. The five-column `devices.txt` and durable count
+checkpoint are flushed before mutation. Missing, truncated, unreadable or
+invalid installed history requires trusted recovery. A fresh install records
+an explicit empty baseline; restart cannot invent lost history.
 
-The installer preserves the earlier port-access task XML and its script,
-log and port map under ProgramData before removing them. Reinstall keeps
-the first snapshot. Uninstall restores it, stops the holder before restoring
-the live descriptors, removes the service binary, and removes its Program
-Files directory if empty. A failed restoration keeps the executable and the
-snapshot. Installation keys remain available for a later reinstall.
+Uninstall checks before stopping the service whether either original raw BAR
+descriptor could expose old bytes. Anything beyond the exact protected SYSTEM
+and Administrators DACL refuses restoration. Direct `revert-acl` enforces the
+same check. Retaining the SID file cannot police direct opens through a
+permissive DACL. Uninstall is therefore unavailable for ordinary pre-broker
+permissive raw baselines and is not an application rollback procedure. The
+installer retains the original port task/files and all recovery state on
+refusal. Only an empty holder and protected raw baseline permit removal.
 
-Verified on a private Windows 11 clone with 2 GiB, four vCPUs, two 64 MiB
-ivshmem BARs and both virtio-serial ports. Two installs followed by uninstall
-restore all four live/PnP descriptors, the task's exported XML and SHA256s of
-all three legacy files. An independent port-access query confirms mandatory
-labels match. A corrupt snapshot refuses uninstall and keeps recovery files;
-repairing it allows retry. With no earlier task/files, uninstall creates none
-and removes the empty directory. Evidence is
-`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/roundtrip-final.txt`.
+Raw BAR ownership is bound to the canonical physical PnP instance and a
+privileged reviewed SID policy. Process exit, holder or broker restart, and
+protocol alias changes cannot reassign it. Missing or untrusted policy denies
+access. There is no first-claim or reset API. This is a single-owner limitation
+until host/GPU drain can be proved.
+
+A private Windows clone proved old BAR bytes crossed SIDs before this policy.
+The corrected binary refuses the other SID after process exit, holder
+replacement and broker restart; the owner still reads its original bytes.
+Both ordinary users are denied direct raw opens. An actual-section proof
+retained `user1-secret` through refused uninstall and direct refused holder
+quit, recovered the same holder, then adopted/read and normally released it.
+Unsafe raw rollback and missing-baseline uninstall refuse before service
+mutation. Evidence is
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`, especially
+`raw-policy-clone.txt`, `raw-policy-alias.txt`,
+`uninstall-lifetime-proof.txt` and `uninstall-direct-open-denied.txt`.
+The final real Windows unit run passed all 30 tests in
+`uninstall-windows-units-final.txt`.
 
 **What remains.** Running the compositor and the GPU process on the VM under
 the broker end to end (the probe exercises the same calls, not the products);
