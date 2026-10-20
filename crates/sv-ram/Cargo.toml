@@ -1,0 +1,19 @@
+[package]
+name = "sv-ram"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared memory that grows and shrinks (waycompose-design.md §108): the region provider, the Windows keeper, the host peer"
+
+[dependencies]
+sv-transport = { workspace = true }
+# `sv-ram-vmtest provider`: the GPU pool's rules (a leased region is never retired).
+sv-arena = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+# `brokered`: the regions are handed to clients by the broker daemon (§111).
+[target.'cfg(target_os = "linux")'.dependencies]
+wc-broker = { workspace = true }

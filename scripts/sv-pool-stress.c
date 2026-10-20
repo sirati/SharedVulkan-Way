@@ -3,7 +3,7 @@
  * memory freed is memory allocatable again, and that every byte mapped is the
  * application's (waycompose-design.md §97).
  *
- *   sv-pool-stress <block MiB> [hold seconds] [label]
+ *   sv-pool-stress <block MiB> [hold seconds] [label] [linger seconds]
  *
  * 1. Allocate host-visible blocks of <block MiB> until vkAllocateMemory
  *    refuses; the refusal must be VK_ERROR_OUT_OF_DEVICE_MEMORY. Every block is
@@ -109,6 +109,14 @@ int main(int argc, char **argv) {
 
     for (int i = 0; i < first; i++)
         if (mem[i]) vkFreeMemory(dev, mem[i], 0);
+    /* [linger seconds]: stay alive with the device open after freeing
+     * everything, so a pool that shrinks (§108) is seen giving memory back
+     * while this process still lives. */
+    if (argc > 4) {
+        printf("%s: everything freed; lingering %d s\n", label, atoi(argv[4]));
+        fflush(stdout);
+        sleep(atoi(argv[4]));
+    }
     vkDestroyDevice(dev, 0);
     vkDestroyInstance(inst, 0);
     printf("RESULT label=%s block=%llu first=%d refused=%d again=%d ok=1\n", label,

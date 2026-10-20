@@ -696,6 +696,8 @@ mod host {
 #[cfg(unix)]
 mod agent;
 #[cfg(unix)]
+mod ram_peer;
+#[cfg(unix)]
 mod sessiond;
 #[cfg(unix)]
 mod sessiond_ivshmem;
@@ -739,6 +741,10 @@ fn main() -> std::process::ExitCode {
         Some("agent") => return agent::main(&argv[2..]),
         Some("broker-read") => return broker_read(&argv[2..]),
         _ => {}
+    }
+    // §108: the host's half of a region table (the test VM's instrument).
+    if argv.get(1).map(String::as_str) == Some("ram-peer") {
+        return ram_peer::main(&argv[2..]);
     }
     // §105: one service, two substrates. `--ivshmem` is a guest with a
     // shared-memory device (Windows); without it, guest RAM swept (macOS).

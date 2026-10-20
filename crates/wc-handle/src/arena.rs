@@ -800,6 +800,21 @@ pub unsafe fn register_borrowed_base(id: u32, ptr: *const u8, len: usize, origin
     Ok(())
 }
 
+/// §108: forget a base [`register_borrowed_base`] registered, because the
+/// region it named went away (a GPU pool region retired and its slot reused).
+/// The caller makes sure no window of it is still attached.
+pub fn unregister_borrowed_base(id: u32) -> io::Result<()> {
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    match guard.get(&id) {
+        Some(a) if a.fixed && !a.provided => {
+            guard.remove(&id);
+            Ok(())
+        }
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("arena {id} is not a borrowed base"))),
+        None => Ok(()),
+    }
+}
+
 /// §110: map the file at `path` read-write for the rest of the process and
 /// return its address: a file standing in for another device's BAR in a
 /// harness, made a pool region with [`register_borrowed_base`].

@@ -35314,6 +35314,777 @@ x86_64-pc-windows-gnu` and the macOS check of `wc-launch` and `wc-compositor`:
 exit 0. `scripts/wc-xref.sh --list`: exit 0. `scripts/wc-multi-install.sh`:
 OK, all ten legs. `scripts/wc-no-ssh.sh`: OK in every run after the leg 5 fix (five).
 
+## 108. Shared memory that grows and shrinks: one region protocol, and a Windows guest that lends its own RAM
+
+Branch `windows-guest-ram`, from master `3955922`, 2026-10-19. The brief
+(user, 2026-10-19): "it's rather important that the shared memory can be
+dynamically allocated and deallocated as needed and that we are not fixed at a
+specific size", and "128 MB are not enough. We need to be able to use the GPU
+properly." Any number of applications must fit together. A client that asks
+for more than exists gets a lazy yes (the proxy backs `wl_shm` pools on
+demand, another branch). §97.3 already showed that the ivshmem devices cannot
+grow at run time without pinning more host RAM, which the host does not have.
+
+This section has two halves:
+
+* **108.1–108.6, the region protocol.** It is substrate-independent: the
+  GPU pool (§97) and the Wayland arena (§107) both grow and shrink through it,
+  whatever backs the memory: a BAR, the Windows guest's RAM, or a real Mac's
+  POSIX shm chunks (§103.17, role (b)).
+* **108.7 onwards, the Windows substrate.** Large-page sections in the guest's
+  RAM, held by a keeper, and located by the host with one probe per 2 MiB.
+
+The protocol was written first so that the other substrates can be built
+against it in parallel. Everything marked *measured* below has a number from a
+run; the rest is the specification.
+
+### 108.1 Words
+
+* **Pool**: an allocator that hands out ranges to sessions. Today there are two:
+  `sv_arena::pool` (the GPU pool, §97) and the compositor's `BarPool` (the
+  Wayland arena, §107). A pool offset is `region << 32 | offset` (§97.4).
+  Region 0 is the **bootstrap**: memory both sides have from the start (an
+  ivshmem BAR on Windows, the arena file in role (b), the guest-RAM window on
+  macOS role (a)).
+* **Region K** (K ≥ 1): memory added to a pool at run time and removed again.
+  One region is one substrate allocation, freed only as a whole.
+* **Provider**: the side that owns the region's memory and frees it. It is
+  always the pool's owner: the guest's GPU process or compositor on Windows,
+  and the Mac's GPU server or main process in role (b).
+* **Peer**: the side that maps the region from across the VM boundary. It is
+  one service per pool, the only writer of the peer half of the table (108.2).
+  Every other process on the peer's side that maps any byte of a region holds a
+  **mapping lease** from that service.
+* **Substrate**: what backs a region, and how the peer finds it. One `kind`
+  per substrate (108.3).
+
+### 108.2 The region table
+
+A 32 KiB block in the pool's bootstrap memory, at an offset each pool
+publishes (108.6). Every field is little-endian. Each half of each entry has
+exactly one writer, so no word is written from both sides of the boundary.
+
+```text
+table header, 128 bytes
+  0   magic "SVRGN001"                       provider, written last at start
+  8   u32 version (1)                        provider
+  12  u32 entries (255)                      provider
+  16  u64 provider run id                    provider; a new owner, a new id
+  24  u64 provider beat                      provider, +1 at least every 250 ms
+  32  u64 peer run id                        peer
+  40  u64 peer beat                          peer, +1 at least every 250 ms
+  48  u64 want bytes                         peer: "a host-side caller is short"
+  56  u64 want seq                           peer, +1 per new want
+  64  u64 budget bytes                       provider: what it may still add
+  72  u64 epoch counter                      provider (the last epoch it used)
+  80  48 bytes reserved, zero
+
+entry i (1..=255), 128 bytes, at 128 * i
+  provider half
+    0   u32 pstate   0 EMPTY, 1 ANNOUNCED, 2 RETIRING      written last
+    4   u32 kind     108.3
+    8   u64 epoch    unique per announce in this provider run, never 0
+    16  u32 region   K, the pool's region index (1..)
+    20  u32 flags    bit 0: an orphan adopted from a dead provider run (108.5)
+    24  u64 len      bytes, a multiple of the kind's unit
+    32  64 bytes     the kind's handle (108.3)
+  peer half
+    96  u32 qstate   0 NONE, 1 MAPPED, 2 REFUSED, 3 UNMAPPED  written last
+    100 u32 reason   a code from 108.4 when REFUSED
+    104 u64 epoch    the provider epoch this answer is for
+    112 u64 peer time of the answer, µs (frametrace::mono_us)
+    120 u64 reserved
+```
+
+A table is valid only while the header's magic, version and provider run id
+match the ones the peer saw at attach. A changed run id is a provider restart
+(108.5).
+
+**Wakes.** Any write that the other side must act on is followed by one bell
+token, `0xFB` `REGION_TOKEN` ("a region table changed"), on the pool's own
+doorbell: `svbell` for the GPU pool and `wcbell` for the Wayland arena. The
+rescan rule of §103.14 applies. Every open, reopen, `RESCAN_TOKEN` and every
+beat timer tick (250 ms) rereads the whole table, so a lost token costs at
+most 250 ms and never a stuck region. The table is 32 KiB, so a reread costs
+microseconds.
+
+### 108.3 Kinds and handles
+
+| kind | substrate | handle (64 bytes) | unit | how the peer finds it |
+|---|---|---|---|---|
+| 1 `BAR` | a range of an ivshmem BAR beyond the bootstrap | u64 offset into the device's file | 1 MiB | opens the device's file by name and maps `offset` (§107's `ivshmem_window`); stamps checked once |
+| 2 `WIN_LARGE` | a Windows large-page section in guest RAM (108.7) | 16-byte nonce, u32 units, u32 keeper id, u64 0 | 2 MiB | **`Locator::Probe`**: reads one 64-byte stamp every 2 MiB of the RAM backend (108.9); every unit found exactly once, or REFUSED |
+| 3 `WIN_AWE` | AWE frames (reserved, not built: 108.8) | u64 offset and u64 length of an out-of-line frame list in the bootstrap | 4 KiB | translates the frames through the flat view (`PfnLocator`) and checks each stamp |
+| 4 `MAC_SHM` | role (b): a POSIX shm object of the Mac, which libkrun maps into the guest as the DAX range of a tag file in the virtio-fs share (xattr `user.krun.shm=/krun.NAME`), cacheable and coherent | 32 bytes: the shm name (`/krun.NAME`, NUL-padded); 32 bytes: the tag file's name in the share (NUL-padded). No window offset: the guest finds the region by path | the object (64 MiB chunks) | the Linux guest opens and maps the tag file; the Mac maps the object by name |
+| 5 `FILE` | a range of a plain shared file (tests; the Linux guest of §71) | u64 offset | 4 KiB | maps the file at `offset` |
+
+A kind the peer does not know is answered `REFUSED`/`KIND`. New substrates
+add a kind; the table does not change.
+
+### 108.4 The life of a region
+
+```text
+ provider                                  peer
+ ────────                                  ────
+ allocate the substrate, stamp it
+ fill the entry, epoch = ++counter,
+ pstate = ANNOUNCED            ── 0xFB ──▶ locate, map, verify the stamps
+                                           qstate = MAPPED (or REFUSED + reason),
+                               ◀── 0xFB ── epoch echoed
+ pool.add_region(K, len)
+ ... leases in K ...
+ K empty for the shrink delay:
+ pool.drain(K); pool.remove_region(K)
+ pstate = RETIRING             ── 0xFB ──▶ every mapping lease of K returned
+                                           (or its process dead), its own view
+                                           unmapped
+                               ◀── 0xFB ── qstate = UNMAPPED, epoch echoed
+ free the substrate
+ pstate = EMPTY
+```
+
+Rules, each one there for a failure it prevents:
+
+1. **Nothing is leased in K before `MAPPED` for K's epoch.** A lease the peer
+   cannot reach would be a session that hangs on its first write.
+2. **A region is retired only when it holds no lease.** The pool's `drain`
+   stops new leases in K first. Nothing live is ever moved: the pool does not
+   copy, so a region that never empties is simply never retired.
+3. **The keeper rule: the provider frees the substrate only after `UNMAPPED`
+   for that epoch.** No timeout replaces the acknowledgement. A peer that never
+   answers keeps the memory allocated, which wastes memory and corrupts
+   nothing. §103.15 shows what a timeout costs: the macOS guest panicked
+   three times out of three when the proxy wrote for its 5 s lease into pages
+   the guest had already reused.
+4. **The peer answers `UNMAPPED` only when no process on its side can touch
+   K.** Every process that maps a byte of K holds a mapping lease from the
+   peer service: a connection whose end means "unmapped or dead". A process
+   that unmaps replaces the range with an inaccessible reservation
+   (`PROT_NONE`), never with nothing, so a stale pointer faults in its own
+   process instead of reaching a page the guest has reused. The peer waits
+   for every lease. If one is held past 30 s, it logs the holder's pid and
+   keeps waiting; it never kills a process to finish a retire.
+5. **Epochs are never reused in a provider run**, and every answer echoes the
+   epoch, so an answer meant for an earlier occupant of entry i (or of region
+   K) is never taken for the current one.
+6. **REFUSED is final for that epoch.** The provider frees the substrate at
+   once (the peer mapped nothing) and may try again with a new epoch. Reasons:
+   1 `KIND`, 2 `NOT_FOUND` (units missing), 3 `DUPLICATE` (a unit found twice),
+   4 `LIMIT` (the peer's own limit, e.g. map count), 5 `MAP` (the mapping
+   failed), 6 `BUDGET` (larger than the peer allows).
+
+The peer never writes the provider half, and the provider never writes the peer
+half. A peer that restarts reads every entry again: it maps `ANNOUNCED`
+entries it has no record of and answers `MAPPED` again with the same epoch,
+and it answers `RETIRING` ones directly with `UNMAPPED` once its previous run's
+mapping leases have ended. It keeps those records in `$XDG_RUNTIME_DIR`, so a
+restart within one boot still knows the old run's leases.
+
+### 108.5 When a side dies
+
+* **The provider dies.** Its memory must outlive it. On Windows the keeper
+  holds it (108.10); on the Mac, whatever holds the chunk's name does. While
+  something holds it, a host write into the region lands in memory the guest
+  has given to no one else, so **the peer does not have to notice the death at
+  all**, and it has no timeout that could fire early on a provider that is only
+  slow. The next provider run of the pool **adopts** the dead run's entries: it
+  publishes its own run id and rewrites every live entry as `RETIRING`, with
+  `flags` bit 0 and the old epoch. The peer then lets go as for any retire, and
+  the new provider frees each region when `UNMAPPED` for its epoch arrives. If
+  no provider of that pool ever starts again, the memory stays held. That
+  costs memory, never correctness. A substrate whose memory the provider's
+  death frees at once (Windows AWE, a private `VirtualAlloc`) cannot satisfy
+  rule 3, so it is not allowed as a region's kind. The provider beat is for
+  the peer's logs and the user's status display only.
+* **The peer dies.** Nothing is freed while its acknowledgements are
+  outstanding. A new peer run reads the table and answers everything (108.4).
+  The provider keeps running and keeps leasing in regions that are `MAPPED`.
+  A host process that still maps them (a proxy) holds them alive, which is
+  correct.
+
+### 108.6 Policy, and the hooks in the two pools
+
+**Grow.**
+* **On demand.** A lease that does not fit in any region asks for a region of
+  `max(request rounded up to the unit, step)`. The lease waits for the answer
+  (one round trip plus the locate, 108.11) instead of failing. It fails with
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` (GPU) or `err` (arena slot) only if the
+  provider is past its budget or the peer refuses.
+* **Ahead of demand (high water).** After any lease, when free bytes across
+  all regions fall below `low_water = max(32 MiB, used / 4)`, one region of
+  `step` is announced in the background. The next lease then usually fits
+  without waiting.
+* **The step** is geometric: `step = clamp(used / 2, 64 MiB, 1 GiB)`. Two
+  small Firefox sessions cost one or two 64 MiB regions, and VulkanMod's
+  several hundred MiB cost two or three regions instead of fifty.
+* **The budget**, set by the provider and published in the header so the
+  peer can show it. On Windows, `min(the configured cap, available guest RAM −
+  reserve)`, with `reserve = max(1 GiB, 15% of guest RAM)`, read from
+  `GlobalMemoryStatusEx` at each grow. Windows itself never runs out because
+  of us. A grow that would cross it is refused, and the pool answers out of
+  memory as §97 does.
+* **The peer's want.** The peer (for example a host-side heap of the ICD, or
+  the proxy's lazy `wl_shm` backing) bumps `want bytes`/`want seq` when it
+  needs room the provider cannot see. The provider treats a new want like a
+  failed lease of that size.
+
+**Shrink.**
+* A region that has held no lease for **30 s** is retired. It must also be
+  that, without it, free bytes stay above `2 × low_water`, so a region is
+  not retired just to be announced again a second later (hysteresis).
+* At most one retire is in flight per pool, and none within 10 s of a grow.
+* **Packing.** New leases go to the lowest-numbered non-draining region with
+  room. Region 0 first, then the oldest regions, so the newest regions empty
+  first and are the ones given back.
+
+**The GPU pool (`sv_arena::pool`, §97).** The table is a 64 KiB lease of
+region 0, the pool's first lease, so it lands at +64 KiB. Its offset is
+published in the pool header's word 32 (`poolhdr::OFF_REGION_TABLE`). The
+header's pages 1–15 are the cold path's mailboxes, so the table cannot sit
+there; this section's first draft said offset 4096, which was wrong. The
+provider is the guest's GPU process (`sv_gpu_server::regions`), and the peer
+is `wc-arena-host ram-peer --table-off auto`.
+* A lease that does not fit grows the pool before it is refused
+  (`PoolServer::take`). A control region never leaves region 0, because the
+  host reads it from the boot device by offset.
+* The ICD gets region K from the broker (`find gpu.K`, 108.18): its
+  udmabufs and a lease, which it holds while it maps any of it (its mapping
+  lease). When its last lease in K is freed it unmaps to `PROT_NONE` and
+  closes the broker lease.
+* `MAX_REGIONS` went from 8 to 64, and only region 0 keeps the 64 KiB
+  header.
+
+**The Wayland arena (§110's one pool).** The shared compositor runs the GPU
+pool in its own process, and the Wayland arena leases from it (§110). So the
+Wayland arena grows through the **same** table: no second table, no second
+provider, and one budget for both.
+* GPU-pool region k ≥ 1 is arena region 1 + k (`GpuRegion::lease_in`,
+  `replace_pool_region`), and a grant in it is answered `ok ID region 1+k
+  OFFSET LEN`.
+* The proxy maps such a window from the parts of `gpu.k` the broker gives
+  it, and holds a broker lease per window (`ProvidedRegion::ram_window`).
+* Wayland leases grow the pool as GPU leases do (`PoolServer::lease_growing`).
+* §110.4's arena table (the arena's first 64 KiB, announced at header byte
+  2048 as `"WCRGNTB1"`) stays reserved and unwritten. It is for a substrate
+  that is not the GPU pool's.
+* The BAR shrinking to a bootstrap is a VM configuration change. It is
+  108.14's, not this branch's.
+
+**Role (b) (the real Mac).** The Mac's process is the provider with kind
+`MAC_SHM`, and the Linux guest's ICD and proxy are peers. The release order
+(corrected by the real-Mac session, 2026-10-19):
+1. the guest munmaps and closes the region;
+2. the guest **unlinks the tag file**, which is required, because virtio-fs
+   otherwise keeps the DAX range cached;
+3. libkrun unmaps the range;
+4. the guest acknowledges `UNMAPPED`;
+5. the Mac calls `shm_unlink` and unmaps for the last time.
+
+**Growth without waiting (built, after the first measurements).** The test
+VM showed large-page allocation tails of 1.6 s for 1 GiB and 3.1 s for 2 GiB
+(108.7): a lease that waits for such a grow stalls an application's frame.
+* The step is now at most **256 MiB** (`max_step`), and the low-water floor
+  is 64 MiB.
+* **Every lease wakes the region manager** (`regiontab::wake`), so it grows
+  ahead of demand at once rather than at its next 250 ms tick.
+* `PoolServer::take` logs each lease that had to wait for a grow.
+
+Measured with `sv-pool-grow-e2e.sh` (the same 1.9 GiB burst of 64 MiB
+blocks):
+
+| policy | regions | leases that waited for a grow | total wait |
+|---|---|---|---|
+| before (1 GiB steps, 32 MiB low water) | 14 | 10 | 31 ms |
+| 256 MiB steps | 21 | 13 | 40 ms |
+| 256 MiB steps + wake on lease | 22 | **2** (the first two, before anything could be ahead) | 5.8 ms |
+
+On Windows a grow is now at most a 256 MiB section: mean 17 ms, one
+outlier of 0.86 s in 754, against 2 GiB's mean of 381 ms and tail of 3.1 s.
+`SV_RAM_MAX_STEP_MIB` and `SV_RAM_LOW_WATER_MIB` override the sizes.
+
+**Shrink, one more rule (built).** A region idle for 5 minutes (`deep_idle_ms`)
+is retired even inside the low-water margin, so an idle pool gives back
+everything it grew. An orderly exit of the GPU process or the shared
+compositor (`regions::retire_all`) retires every empty region and waits up to
+5 s for `UNMAPPED`. Harnesses shorten the times with `SV_RAM_IDLE_MS`,
+`SV_RAM_DEEP_IDLE_MS` and `SV_RAM_CALM_MS`.
+
+### 108.7 The Windows substrate: what was compared
+
+| allocator | frames known to the guest | contiguity (measured) | survives its owner's crash | privilege | verdict |
+|---|---|---|---|---|---|
+| `VirtualAlloc` + `VirtualLock`, 4 KiB | no | ~44 KiB runs | no | none | **refused**: pages move under a lock (§84.5), and the 2026-10-15 hang (§84.7) happened on this path |
+| AWE, `AllocateUserPhysicalPages` | **yes**, raw guest PFNs | 2.8 pages per run, the worst measured (measured-gpu-side.md) | **no**: AWE pages belong to one process and are freed when it dies; no other process can map them | `SeLockMemoryPrivilege` | **refused**, see below |
+| AWE2 with `NONPAGED_LARGE` | yes | 1 page per run; satisfied 3992 of 16384 frames | no | same | refused (measured-gpu-side.md) |
+| `VirtualAlloc(MEM_LARGE_PAGES)`, private | no | 2 MiB pages, often 1 run per GiB on a fresh guest | no: private memory | same | refused for the same reason as AWE |
+| **pagefile section, `SEC_COMMIT \| SEC_LARGE_PAGES`** | no | 2 MiB pages, 2 MiB aligned; on this VM after hours of churn **2.4 runs per 2 MiB unit** (64 MiB → 27.7 runs, 2 GiB → 819) | **yes**: a section lives while any handle or view of it lives, in any process | `SeLockMemoryPrivilege` **in the creating process only**; a view in an unprivileged process works, with 2 MiB translations (`FILE_MAP_LARGE_PAGES` granted, measured) | **chosen** |
+| a KMDF driver (`MmAllocatePagesForMdlEx`, PFNs from the MDL) | yes | anything | yes | a signed driver: test signing is ruled out (hardware-constraints.md), an EV certificate and attestation signing are out of scope | refused |
+
+**Why not AWE, although it reports frames.** The keeper rule (§108.4 rule 3)
+needs the memory to outlive the process that uses it, until the host has let
+go. An AWE page is owned by exactly one process, cannot be mapped by any
+other, and is freed when that process dies. The GPU process is the one that
+must map the pages (it imports them into the Intel driver), and it is the
+process most likely to crash (§86.4, §86.5). An AWE region would be freed
+while the host still writes into it. That is the macOS panic of §103.15,
+with the Windows kernel's memory instead of Console's. Getting frames
+without a scan is worth nothing at that price. The large-page section also
+wins on the second axis: its runs are 2 MiB units and AWE's are 4 KiB frames.
+
+**What the section costs.** Windows assembles 2 MiB pages from free memory,
+which can be slow on a fragmented guest. Measured on the test VM over about
+5000 grows:
+* a mean of 52–66 µs per MiB from 32 to 512 MiB;
+* 120 µs per MiB at 1 GiB and 186 µs per MiB at 2 GiB;
+* tails of 0.86 s (256 MiB), 1.59 s (1 GiB) and 3.13 s (2 GiB), under three
+  sessions churning plus a canary.
+
+The keeper does the allocation, so a slow grow delays one lease and stalls
+nothing else (108.11, jitter). When no 2 MiB page is free, the call fails
+with `ERROR_NO_SYSTEM_RESOURCES` (1450). It never falls back to small pages,
+and the lease is then refused like any full pool.
+
+### 108.8 Locating without a scan: `Locator::Probe`
+
+A large page is 2 MiB aligned in guest-physical memory. QEMU maps guest RAM
+into its backend linearly per RAM block, at 2 MiB aligned offsets (`pc` and
+`q35`, below and above 4 GiB). So each unit of a region is one 2 MiB aligned
+run of the **backend file**.
+* The keeper stamps the first 64 bytes of every unit: magic `SVLP2M01`, the
+  region's 128-bit random nonce, the unit index, the unit count, and an
+  FNV-1a check (`sv_transport::lpstamp`).
+* The peer reads 64 bytes at every 2 MiB of the backend, 3072 reads for a
+  6 GiB guest and 5248 for testhost's 10.25 GiB. It never translates a
+  guest-physical address, so §5.1's flat-view table and R21's silent wrong
+  offset do not arise.
+* Every unit must be found **exactly once**. A unit found twice is refused
+  (`DUPLICATE`), never resolved by picking one: that is what a stale or forged
+  stamp looks like, and what §84.5's relocated pages looked like.
+* The peer then maps the runs (`SharedRegion::stitch`) and checks each stamp
+  again **through its own mapping**, before it answers.
+
+Nothing runs in the guest to locate: no PFN query, no SuperfetchPfnQuery, no
+sweep. The guest only writes 64 bytes per 2 MiB of its own memory.
+
+| region | units | runs (mean) | probe (mean / max) | map + verify (mean) |
+|---|---|---|---|---|
+| 32 MiB | 16 | 14.0 | 1.71 / 18.3 ms | 0.10 ms |
+| 256 MiB | 128 | 108.7 | 2.52 / 11.4 ms | 0.62 ms |
+| 1 GiB | 512 | 418.3 | 2.42 / 15.5 ms | 2.36 ms |
+| 2 GiB | 1024 | 819.2 | 2.35 / 7.4 ms | 4.27 ms |
+
+(Test VM, 6 GiB guest, about 5000 regions over the stress legs; the
+`[peer] MAPPED` lines in the evidence.) The probe is flat in the region's
+size, about 2 ms for the whole guest. That is three orders of magnitude below
+§5.1's 2 s sweep, which read every page.
+
+### 108.9 Announcing, and the round trip
+
+The guest's GPU process writes the entry and rings `0xFB` (on the test VM
+the instrument rang it on its own `svbell` port, with the host's peer
+connected to QEMU's chardev). The peer probes, maps, verifies, answers and
+rings back. The product's GPU process does not yet ring: its port belongs
+to the pool's doorbell (§110.3's per-range bells). Until then, its region
+manager polls the table at 200 µs while it waits, and the peer polls at
+1 ms. A grow is rare and dominated by the keeper's allocation, so this costs
+little. It is listed in 108.15.
+
+| measured (test VM) | value |
+|---|---|
+| announce → `MAPPED`, 32–128 MiB | mean 6.5–8.2 ms (the probe, the map, and the 1 ms poll on each side) |
+| announce → `MAPPED`, 256 MiB–2 GiB | mean 20–112 ms, tails to 3.4 s: queued behind other regions' fills in the instrument's host writer |
+| retire → freed (peer unmaps, answers, the keeper closes the section) | p50 9.8 ms, p90 49 ms, max 1.39 s (Windows zeroing GiBs of large pages), n = 4926 |
+| on Linux (`sv-pool-grow-e2e.sh`, no instrument writer): announce → `MAPPED` | 1.7–4.5 ms |
+
+### 108.10 The keeper
+
+`sv-guest ram keeper`, one per guest, running as **SYSTEM** (on the test VM
+a SYSTEM scheduled task; in a product install a service).
+* **Privilege.** LocalSystem holds `SeLockMemoryPrivilege`, so the user's
+  account needs no new right. Measured: the test user did not hold it, and
+  its views were granted 2 MiB translations anyway.
+* **Requests.** Lines on `\\.\pipe\waycompose-ram` (`hello POOL`, `alloc
+  BYTES`, `free ID`, `stats`), with an SDDL that admits SYSTEM,
+  administrators and every authenticated user. Talking to the keeper gives
+  access to nothing by itself.
+* **Who is asking.** At connect, the keeper reads the client's pid
+  (`GetNamedPipeClientProcessId`) and its token's user SID. A pool is the pair
+  (SID, pool name). Two Windows users with the same pool name have two
+  pools, and neither can adopt or free the other's regions.
+* **What it holds.** Each region is an **unnamed** section. The keeper
+  creates it, stamps it through a short-lived view, and keeps only the
+  handle. It passes the section to the asking process with `DuplicateHandle`
+  (to orphans' new owners too), so while the provider runs the memory has
+  **two holders**. The first build used named `Global\waycompose-ram-*`
+  sections with an SDDL admitting every interactive user. That let any
+  Windows user open another's regions. It was found in review (the shared
+  broker's owner) and replaced.
+* **The budget.** The keeper refuses a region that would leave Windows less
+  than `max(1 GiB, 15% of RAM)` available (`err budget`), or
+  `WC_RAM_RESERVE_MIB`.
+* **When a provider dies.** Its regions become orphans of its pool, still
+  held by the keeper. The next provider of **that user's** pool gets them in
+  `hello`. It adopts the table's entries as retiring (§108.5) and frees each
+  one after `UNMAPPED`. An orphan the table no longer lists has already been
+  let go by the host, so it is freed at once.
+* **A provider of another user** that maps the bootstrap after the owner
+  died finds the owner's entries in the table but gets no orphan from the
+  keeper. It marks them *foreign*: the host lets go, the entries are cleared,
+  and it frees nothing. The owner's next run then frees them at once.
+  Measured: user2 adopted two of `user`'s regions as foreign; the keeper
+  still held both (402 MiB); `user`'s next provider freed them.
+* **What becomes of this program.** The keeper's four operations (allocate,
+  hand over, free after `UNMAPPED`, adopt) become a module of the one
+  privileged Windows service the shared broker crate provides (§111,
+  branch `session-fixes`). This pipe server is the stand-in until then.
+
+
+**What is not covered.** A keeper killed together with every provider of a
+pool, before the host has let go: for example `taskkill /F` on both at
+once by an administrator, or a SYSTEM-level crash of the keeper while the
+provider also dies. Logoff does not end a SYSTEM process; a VM shutdown ends
+the host's interest too. The service install should set restart-on-failure,
+but a restarted keeper does not get its old handles back. This case is the
+one residual risk and is R43's.
+
+### 108.11 The test VM, and what it replicates
+
+| | testhost's guest | the test VM (`winvm` clone `wcram`) |
+|---|---|---|
+| QEMU | `qemu-host-cpu-only-battery-10.2.2` (`55ry51j4…`, testhost's patches 0001–0005) | **the same store path** |
+| guest RAM | `memory-backend-memfd,share=on`, 10496 MiB | `memory-backend-memfd,share=on`, 6 GiB |
+| pinning | vfio pins every page (VmLck = RAM + both BARs); balloon inhibited | `prealloc=on` and **no balloon or free-page reporting** (a user cannot `mlock` 6 GiB here: `ulimit -l` 8 MiB): every page populated, none ever discarded |
+| machine | `pc` (i440fx), 12 vCPUs, the Intel iGPU by vfio | `q35` (the golden image was installed on it), 4 vCPUs, no GPU passthrough, `virtio-vga` |
+| ivshmem | arena 128 MiB, GPU 1 GiB, the Looking Glass B7 signed driver | one 64 MiB bootstrap device, the same driver |
+| doorbells | `svbell`, `wcbell` | the same two ports |
+| Windows | 11, build 26200, the daily user's | 11 24H2 (26100), debloated golden image, a throwaway overlay |
+
+**What differs, and why it does not change the verdicts.**
+* Without vfio, nothing translates guest pages for a device. The pages here
+  are pinned by QEMU, not by the IOMMU, but in both cases they never move in
+  the backend, which is what the host's mapping relies on.
+* `q35` against `pc`: the probe never translates addresses, so the below-4 GiB
+  split and its holes do not enter.
+* The Intel driver's import of a **section view** as a host pointer is
+  **not tested here** (no Intel GPU). §87.3 measured it for an ivshmem view
+  and measured-gpu-side.md for private large pages. A section view is a
+  third kind of VAD and is the first thing to check on the real guest (108.14).
+
+### 108.12 Measured on the test VM: stress
+
+Every leg ran with a 512 MiB **canary** in the guest: ordinary memory, filled
+with a seeded pattern, checked every 2 s and reallocated every 20 s, so that
+frames freed by a region are soon the canary's. A host write into a freed
+frame shows up there as a changed word. A **jitter** monitor ran at
+time-critical priority (a `sleep(1 ms)` loop; only a system-wide stall delays
+it). A host **watchdog** made an ssh round trip into the guest and read
+QEMU's run state every 3 s. The host's peer wrote every mapped region's
+counters every millisecond until told to stop.
+(`scripts/wc-guestram-stress.sh`; logs in
+`/mnt/datasets/builds/evidence/windows-guest-ram/`.)
+
+| leg | what | result |
+|---|---|---|
+| GiB alloc/free/realloc | three sessions cycling 256 MiB, 1 GiB, 2 GiB regions: grow, the host fills every byte, the guest checks every word, the guest writes back, the host checks, retire, free | 16–18 grows, 12–16 GiB per leg; **0 bad words** in either direction, ever |
+| many sessions | 8 and 16 sessions, 32–128 MiB regions, 48 grows per leg | all verified, 0 errors |
+| crash | the provider killed (`TerminateProcess`) 4–9 s into a run, with two regions mapped and the host writing their counters; 5 s of host writes into the keeper-held orphans; a new provider adopts them | every time: 2 orphans held, adopted, freed only after `UNMAPPED`; **canary clean** |
+| memory pressure | for 10 min, a hog in the 6 GiB guest touched 4 GiB three times per round while three sessions cycled 256 MiB–1 GiB regions. Windows paged (pagefile peak 3992 MiB). 599 grows (308 GiB) were filled and checked, 394 were refused by the budget, 1 by `ERROR_NO_SYSTEM_RESOURCES`. Alloc p50 46 ms, max 2.58 s. **0 bad words, canary clean**, worst stall 61.8 ms, ssh 2.6 s during the thrash |
+| long run | 65 min (gib, sessions ×8, crash, pressure in turn): **345 legs, 1035 checks, 0 FAIL**. 5684 grows, 1551 GiB allocated, filled and checked. 86 provider kills under host writes, every one adopted and freed after `UNMAPPED`. Canary 6046 checks, **0 corrupt words**. Watchdog 3341 probes, 0 missed. (The long run's own pressure legs ran one cycle per session, a harness bug that is fixed; the 10-minute leg above is the pressure evidence) |
+| guest health | the watchdog: no missed probe in the whole run; ssh round trip 0.35–1.8 s (the shared host's load was 28–38 on 32 threads) |
+| stalls | idle: the worst `sleep(1 ms)` per minute 1.5–7.4 ms; under the legs: no stall over 20 ms except 54 over 205 minutes, the worst 60–62 ms, all while the host's load was 28–38 on 32 threads (vCPU preemption); idle minutes stayed under 7.4 ms |
+| first run, normal-priority monitor | stalls of 60–94 ms. They came from the instruments' own verify threads saturating 4 vCPUs (a time-critical monitor showed none in the same load), not from the allocator |
+
+**Throughput.** The host filled regions at 5.4 GB/s (mean over 5103 fills,
+a volatile 8-byte store loop). The guest checked them at 23.3 GB/s.
+
+### 108.13 Measured: the GPU pool and the Wayland arena grow past their devices
+
+**`scripts/sv-pool-grow-e2e.sh`** (Linux, lavapipe, a 64 MiB boot pool, a
+3.5 GiB file as guest RAM, scattered stamped 2 MiB units):
+
+| check | result |
+|---|---|
+| a VulkanMod-sized load: 64 MiB host-visible blocks until refused, every block checked | **30 × 64 MiB = 1920 MiB** (the session cap, ¾ of 64 MiB + 2560 MiB), then `VK_ERROR_OUT_OF_DEVICE_MEMORY`, every block intact |
+| the pool's growth | 10 regions, 64 → 542 MiB each (the geometric step), 2.6 GiB in all; probe 0.8–3.7 ms, map + verify 0.06–0.6 ms, announce → `MAPPED` 1.7–4.5 ms |
+| Zink and vulkaninfo beside it | frames good, llvmpipe listed |
+| giving back | 30 s after the load freed everything, **while it still lived** (its ICD had unmapped each region and let go of its lease file), 9 of 10 regions retired one per 250 ms and were freed after `UNMAPPED`; the tenth stayed as the low-water margin until the deep-idle time |
+| a second load | grew the pool again (270–760 MiB regions) |
+| lost devices, refusals | none |
+
+**`scripts/wc-multi-install.sh` leg 8** (one pool, §110):
+* the setup: a 32 MiB BAR and a 64 MiB GPU pool, served by `sv-guest wayland
+  … --with-gpu pool-guest --grow-ram …`, with the peer;
+* three installations' clients took 96 MiB pools; the GPU pool grew by one
+  region, and a Wayland grant landed in it as arena region 2;
+* the proxy mapped that window from the peer's run list, and four windows
+  were mapped;
+* after `down` and the compositor's exit, the region went back after the
+  host's `UNMAPPED`.
+
+### 108.14 testhost: what a guest run would need (proposed, not done)
+
+Nothing in this section has touched testhost. What a run there needs, in
+order:
+
+1. **Only a broker reaches guest RAM (user decision, 2026-10-19).** Today
+   QEMU runs as root, and its memfd is reachable only through
+   `/proc/<qemu>/fd` as root (checked read-only via sudokey: fd 37,
+   `memfd:memory-backend-memfd`, root 0600; VmLck 11927424 kB = RAM + 128 +
+   1024 MiB).
+   * **The plan:** QEMU runs as a dedicated `windows-vm` user. It needs group
+     kvm (for `/dev/kvm` and `/dev/udmabuf`) and `wc-arena`, udev ownership of
+     the vfio group nodes, `LimitMEMLOCK=infinity` (vfio accounts RAM and both
+     BARs, about 11.4 GiB), pre-created tap devices owned by it, and its QMP,
+     chardevs and ivshmem files.
+   * The broker runs as the same user. It is the only party that opens the
+     memfd and `/dev/udmabuf`.
+   * Clients (the ICDs, the proxies, all of them the desktop user) receive
+     udmabufs of exactly their regions over the broker's socket (108.15).
+     They never open the memfd, `/proc/<qemu>` or `/dev/udmabuf`.
+   * `udmabuf.size_limit_mb=4096` on the kernel command line, at the reboot
+     the next kernel needs anyway, makes one udmabuf per region.
+   * A nix-config change and a planned cold restart of the VM. Rollback: the
+     previous generation and a restart.
+   * Not built until the vmhost test passes and the coordinator approves.
+2. **The keeper as a service** (`sv-guest ram keeper`, LocalSystem,
+   restart on failure) in the guest. No change to the guest user's account rights.
+3. **The peer inside the broker daemon** (108.18), with
+   `--guest-ram-qemu-pidfile` and `--guest-ram-user mapped`.
+4. **`--grow-keeper`** on the guest's GPU process (or the compositor's
+   `--with-gpu`), with a budget.
+
+**The first guest run, for the user to decide:**
+* while the guest is idle, under the lease, with the health watchdog;
+* the keeper alone first (one 64 MiB region, located, mapped, retired,
+  freed);
+* then one Intel import of a section view (`vulkaninfo` through a grown
+  pool; the R19-style check of 108.11);
+* then a single Firefox window grown past the device;
+* stop at the first unexpected line.
+
+### 108.15 Per-region handles: udmabuf, and a broker that alone holds guest RAM
+
+**The requirement (user, 2026-10-19).** No client may get a handle that
+reaches beyond its regions. An fd for QEMU's RAM memfd reaches the whole
+guest. A broker running as its own system user (the VM's user) is the only
+party that holds guest RAM, and clients ask it for their regions.
+
+| per-region handle | verdict |
+|---|---|
+| **udmabuf** (`UDMABUF_CREATE_LIST` over the sealed RAM memfd) | **chosen**: a dma-buf of exactly the region's runs. The kernel refuses any mapping beyond them, it is zero-copy, and it costs no host RAM (the pages are the memfd's, already pinned by vfio) |
+| guest RAM split over several QEMU backends or NUMA nodes | refused: Windows decides where a large-page section lands, so no backend is ever one region |
+| virtio-mem | refused for handles: still one backend fd (it works with vfio through `RamDiscardManager`, and Windows has `viomem`; worth keeping in mind for host RAM that is pinned only when plugged) |
+| a hot-plugged ivshmem device per region | refused: new pinned host RAM and root's QMP (§97.3) |
+| per-region copies made by the broker | refused: not zero-copy |
+
+**Measured preconditions.**
+* QEMU's memfd is sealed `F_SEAL_SEAL|SHRINK|GROW`, not `WRITE`, which is
+  what udmabuf requires (checked on the test VM's QEMU, the same build as
+  testhost's).
+* `/dev/udmabuf` exists on vmhost and testhost (root:kvm 0660,
+  `CONFIG_UDMABUF=y`). On both, `list_limit` is 1024 and `size_limit_mb` is 64.
+  `sv_ram::udma::plan` cuts a region into parts within those limits (a 2 GiB
+  region of 1024 scattered units becomes 32 parts), and the client maps them
+  side by side at the region's fixed address.
+
+**Proven** (`sv_ram::udma` tests, run as root and as an ordinary user in a
+minimal VM on vmhost's own kernel: `/mnt/datasets/builds/wcram/initramfs`,
+`evidence/…/udmabuf-vm.log`):
+* as root (the broker's role), a udmabuf of two out-of-order ranges of a
+  sealed memfd maps them in that order;
+* a write through it lands in the memfd;
+* a mapping larger than the udmabuf is refused;
+* as uid 1000 (a client), `/dev/udmabuf` cannot be opened.
+
+**The broker** is the client-side role of the shared broker crate
+(`wc-broker`, branch `session-fixes`), not a daemon of this branch. This
+branch provides the substrate:
+* `sv_ram::peer` reads the table, locates, maps, verifies and answers;
+* `sv_ram::udma` makes the per-region handles.
+
+What the broker exposes to clients:
+* `open_region(pool, k) → {epoch, len, [(fd, offset, len)]}`, checked by
+  `SO_PEERCRED` uid: a region belongs to the host user its pool serves, and
+  root;
+* a lease per (region, epoch), released by message or by the connection
+  closing (liveness by pidfd), which gates `UNMAPPED`;
+* a push of "retiring k" to lease holders.
+
+This is built (108.18). The run lists and lease files the ICD and the proxy
+used before were a stand-in, and they are gone. The clients' mapping code
+stayed as it was: `map_fixed` per part, and `PROT_NONE` on release.
+
+**Revocation** is by lease: a dma-buf cannot be revoked. A process of the
+same uid that keeps a udmabuf past its release can still write the region.
+R43 accepts that: one host user is one trust domain.
+
+**Address stability** (user requirement: the GPU pins this memory).
+* **Guest:** a region is the keeper's large pages, never paged or moved
+  (§84.5: 0 of 16384 moved). A region retires only when it holds no lease,
+  and every Vulkan import is per lease and freed before its range goes back.
+  So no GPU import ever outlives its pages' place.
+* **Host:** every mapper maps region k at a fixed place for the region's
+  whole epoch: the ICD at `k × 4 GiB` of its reserved pool view, the proxy in
+  its window, the peer in its view. Nothing remaps a region.
+* **Tests:**
+  * `pool::tests::regions_stay_put_while_others_come_and_go_and_a_leased_region_cannot_retire`:
+    the base and the lease's bytes stay put across four other regions added
+    and three retired, a retire is refused while the lease lives, and control
+    leases stay in region 0;
+  * `peer::tests::a_mapped_region_stays_at_its_address_while_others_come_and_go`:
+    the host's view of a region keeps its address and content across 15 other
+    regions mapped and retired.
+
+### 108.16 Not done, and not proven
+
+* **The broker**: built and proven in a VM (108.18). One gap remains: a
+  lease taken in the last beat before the daemon crashes is not in its
+  record.
+* **The Intel driver's import of a large-page section view** (108.11).
+* **The GPU process does not ring `0xFB`**; both sides poll while a region
+  is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
+  the region manager the pool's port.
+* **A keeper service install** with restart-on-failure; the test VM used a
+  scheduled task. It becomes a module of the shared Windows service (108.10).
+* **The kept-keeper residual** (108.10): a keeper and every provider of a
+  pool killed together before the host lets go.
+* **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
+  the user.
+* **The peer's own restart** (the broker daemon's): handled by its record
+  of regions and holders (108.18). It answers an inherited region only when
+  every recorded holder has exited. The peer itself never writes into a
+  region, so its own lost views need no record.
+
+### 108.17 Gates
+
+At the commit that adds this subsection (master `f0b85c3` merged in):
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --no-fail-fast` | 116 binaries, **3272 passed, 0 failed**, 9 ignored |
+| `cargo clippy --workspace --all-targets` | exit 0; no warning in a file this section wrote or changed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `scripts/wc-xref.sh --list` | every citation resolves |
+| `scripts/sv-pool-grow-e2e.sh` | PASS (108.13) |
+| `scripts/wc-multi-install.sh` (legs 1–8) | `wc-multi-install: OK`; leg 8 is this section's |
+| `scripts/wc-guestram-stress.sh` on the test VM | 65-min long run and the 10-min pressure leg OK (108.12); the cross-user leg by hand (108.10) |
+| `sv_ram::udma` tests as root and as uid 1000 in a minimal VM | pass, and refused, as they should be (108.15) |
+
+Evidence (logs only, outside the repository):
+`/mnt/datasets/builds/evidence/windows-guest-ram/`.
+
+### 108.18 The broker hands out guest RAM: built, and proven in a VM
+
+Branch `windows-guest-ram`, 2026-10-20, with `broker` (§111) and
+`broker-host` (§111.10) merged in. This replaces the stand-in that 108.13's
+harnesses used: run lists (`{device}-{k}.ram`) naming QEMU's whole RAM memfd,
+and lease files.
+
+**Who holds what.**
+* **The broker daemon** (`wc-arena-host sessiond --broker`, broker-host's
+  daemon) runs as its own system account. That account alone may open
+  `/dev/udmabuf` (group `kvm`), and only it shares the QEMU process's uid,
+  so only it reaches the RAM memfd through `/proc/<qemu>/fd`. It embeds the
+  guest-RAM component, `sv_ram::brokered::GuestRamComponent` (a
+  `wc_broker::host::Embedded`), made from its `--guest-ram-*` flags.
+* **The component** runs the peer loop (`sv_ram::peerloop`: the doorbell,
+  the reconnect, the beat). For each region the guest announces:
+  * it locates, maps and verifies the region, as before;
+  * it cuts the region into udmabufs (`sv_ram::udma`) and checks each one
+    against its own view;
+  * it publishes the region in the broker as pool `gpu.<k>` for the pool's
+    one host user (`--guest-ram-user UID`, or the user the live sessions run
+    as);
+  * only then does it answer `MAPPED`.
+* **A client** (the ICD, the proxy) asks `find gpu.<k>` on its process's
+  broker connection. It gets the udmabufs and a lease, maps each part at its
+  fixed place (the ICD at `k × 4 GiB` of its pool view, the proxy in its
+  window), and closes its fds. The mapping keeps the pages. After it unmaps
+  (`PROT_NONE`), it `close`s the lease.
+* **On `RETIRING`** the component retires the region in the broker: no new
+  `find` gets it, and its holders are told. It answers `UNMAPPED` only once
+  the broker reports the region drained (`on_drained`), which needs every
+  lease ended by `close`, by its connection, or by its process's exit. Then
+  the broker's own udmabufs are closed, and the guest frees the region.
+* **A pool may reuse a region index** while the old epoch still waits for a
+  holder. Published regions are keyed by (index, epoch). `find` returns the
+  newest live one, and each epoch is answered on its own.
+* **The daemon's own restart.** The component records every published
+  region in its state directory: its runs, and its holders as (pid, start
+  time), written at publish and in every beat in which they change. A new run
+  publishes the recorded regions the table still holds, so their holders can
+  find them again. It answers one only once the new broker has drained it
+  *and* every recorded holder has exited (`broker::holders`, §111). Not
+  covered: a lease taken in the last beat (250 ms) before a crash. A hook
+  that runs before a lease's fds are sent would close that gap. It has been
+  asked of the broker's owner.
+
+**The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
+a process that passes the kernel's ptrace access check, which needs the same
+uid *and* gid. The first run of the GPU-pool VM test had the pool's process
+in another group: the daemon found "no memfd" and the pool never grew. So
+testhost's `windows-vm` account runs both QEMU and the daemon, with one
+primary group.
+
+**The client role never touches a raw resource.** It has no group
+membership and no ACL. A udmabuf reaches exactly its region's pages, and
+the kernel refuses a mapping past them. Clients of another uid get nothing:
+`find` is checked by `SO_PEERCRED` uid.
+
+**The NixOS VM test** (`scripts/wc-guestram-vmtest.sh`,
+`nix/vmtest-guest-ram.nix`). It runs on vmhost's KVM and touches nothing of
+testhost.
+* **The machines.** The VM has 1 GiB. Inside it, a nested QEMU guest with
+  320 MiB, 64 hugetlb pages of 2 MiB, and the RAM as a sealed memfd; a 1 MiB
+  ivshmem bootstrap holds the table.
+* **The users.** The nested QEMU and the daemon run as `wcbroker` (group
+  `kvm`). `alice` is the pool's user; `bob` is another client.
+* **The guest's provider** (`sv-ram-vmtest provider`) stamps hugetlb pages
+  exactly as the Windows keeper stamps large pages (`sv_ram::hugesub`, a test
+  substrate). It keeps the GPU pool's lease rules (`sv_arena::pool`). The
+  test driver commands it through a control page in the shared bootstrap,
+  with no network.
+
+| subtest | result |
+|---|---|
+| growth | 32 MiB region found by the probe (105 µs, 2 runs), mapped and verified (56 µs), published as `gpu.1` for uid 1001 as one udmabuf; announce → `MAPPED` 9.2 ms |
+| zero copy | alice's client mapped it, saw the guest's pattern in every unit, wrote its own; the guest saw it in all 16 units |
+| isolation | bob's `find gpu.1` refused; alice cannot open `/dev/udmabuf`, QEMU's memfd through `/proc/<qemu>/fd/N`, `/proc/<qemu>/mem`, the bootstrap file or the daemon's files, nor list `/proc/<qemu>/fd`; she is not in `kvm` |
+| growth and shrink | 64 and 16 MiB more (located in 188 and 109 µs); region 2 mapped by alice, let go, retired, `UNMAPPED`, freed |
+| address stability | alice's mapping of region 1 kept its address and bytes over 80 checks across two more regions mapped and one retired; region 3 over 57 checks across a daemon restart |
+| a retire refused while the guest holds a lease (an import stand-in) in the region | `retire 1: region: still holds leases` |
+| a retire held by a host lease | `retiring` for 3 s and no `UNMAPPED` while alice mapped it; `UNMAPPED` and freed once she unmapped and closed |
+| the daemon restarted while alice mapped region 3 | the new run published it again (her pid and start time from the record), held the retire "for the previous run's holders" although its own broker had no lease, and answered once her process ended |
+| the guest | no region refused, the nested VM alive throughout |
+
+**The GPU pool end to end** (`scripts/sv-pool-grow-e2e.sh`, now a VM test
+too, `nix/vmtest-pool-grow.nix`). The pool-guest runs as `wcbroker` on
+lavapipe and grows from a sealed memfd (`--grow-ram memfd:MIB`). The client
+user's ICD gets every grown region from the broker.
+
+In a 1.5 GiB VM with a 768 MiB budget:
+
+| check | result |
+|---|---|
+| the load: 64 MiB host-visible blocks until refused, every block checked | 9 × 64 MiB at first, then `VK_ERROR_OUT_OF_DEVICE_MEMORY`, every block intact (`ok=1`); the budget, not a failure, ends it |
+| growth | 7 regions (64 → 218 MiB, the geometric step), each one published as udmabufs and found by the ICD with `find gpu.<k>` |
+| Zink (`gl-probe`, software Zink over the ICD) and vulkaninfo beside it | `zink Vulkan 1.4 (llvmpipe)`, PASS; llvmpipe listed |
+| giving back | while the load still lived, the idle regions retired: each answered `UNMAPPED` right after the broker reported it drained, and was freed 250 ms after its retire |
+| a second load | grew the pool again, `ok=1` |
+| lost devices, refusals | none |
+
+Announce → `MAPPED` took 200–630 ms, growing with the region's size (about
+3 ms per MiB). That cost belongs to the stand-in: its memfd's pages are first
+allocated when the udmabuf pins them. A VM's RAM is already populated, and in
+the nested test above a 32 MiB region took 9.2 ms end to end.
+
+
+**What moved where.** `wc-multi-install.sh`'s guest-RAM leg used the stand-in. It
+needs an account that may make udmabufs, which the harness's user never is,
+so its guest-RAM part is the two VM tests now. Not covered end to end in a
+VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
+the same `find` + `map_fixed` per part as the ICD).
+
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same

@@ -58,6 +58,9 @@ pub struct Granted {
     pub memory_type: u32,
 }
 
+/// §108: called with the pool unlocked when a lease does not fit.
+pub type Grower = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 /// The pool, shared by every session of this process.
 pub struct PoolServer {
     pool: Mutex<Pool>,
@@ -67,6 +70,9 @@ pub struct PoolServer {
     /// steps.
     logged_high: Mutex<u64>,
     next_session: std::sync::atomic::AtomicU64,
+    /// §108: called with the pool unlocked when a lease does not fit; true
+    /// means a region was added and the lease is worth trying again.
+    grower: std::sync::OnceLock<Grower>,
 }
 
 /// A session's handle on the pool.
@@ -94,7 +100,57 @@ impl PoolServer {
             importer,
             logged_high: Mutex::new(0),
             next_session: std::sync::atomic::AtomicU64::new(1),
+            grower: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Grow on demand from now on (§108).
+    pub fn set_grower(&self, g: Grower) {
+        let _ = self.grower.set(g);
+    }
+
+    pub fn capacity_and_free(&self) -> (u64, u64) {
+        let p = self.pool();
+        (p.capacity(), p.free())
+    }
+
+    pub fn largest_free(&self) -> u64 {
+        self.pool().largest_free()
+    }
+
+    pub fn next_region_id(&self) -> Option<u32> {
+        self.pool().next_region_id()
+    }
+
+    pub fn empty_regions(&self) -> Vec<u32> {
+        self.pool().empty_regions()
+    }
+
+    /// Add region `id`, which this process sees as `view`.
+    pub fn add_region(&self, id: u32, view: Arc<SharedRegion>) -> Result<(), String> {
+        let mut regions = self.regions.write().unwrap_or_else(|e| e.into_inner());
+        let slot = regions.get_mut(id as usize).ok_or("region id out of range")?;
+        self.pool().add_region(id, view.len() as u64).map_err(|e| format!("{e}"))?;
+        *slot = Some(view);
+        Ok(())
+    }
+
+    /// Take region `id` out of the pool, if it holds no lease. After this no
+    /// lease can land in it and this process no longer reads it.
+    pub fn remove_region(&self, id: u32) -> Result<(), String> {
+        let mut regions = self.regions.write().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut p = self.pool();
+            p.drain(id);
+            if let Err(e) = p.remove_region(id) {
+                p.undrain(id);
+                return Err(format!("{e}"));
+            }
+        }
+        if let Some(s) = regions.get_mut(id as usize) {
+            *s = None;
+        }
+        Ok(())
     }
 
     pub fn config(&self) -> PoolConfig {
@@ -145,6 +201,12 @@ impl PoolServer {
         Ok(l)
     }
 
+    /// Lease without importing, growing the pool if it is full (§108): what a
+    /// Wayland buffer in the one pool needs (§110).
+    pub fn lease_growing(&self, session: u64, len: u64, purpose: Purpose) -> Result<Lease, String> {
+        self.take(session, len, purpose)
+    }
+
     fn note_lease(&self) {
         let used = {
             let p = self.pool();
@@ -179,7 +241,23 @@ impl PoolServer {
         // asks for the report: a guard in a `match` scrutinee lives to the end
         // of the `match`, and `report` takes the same lock (measured: the
         // first refused lease hung the whole process).
-        let leased = self.pool().lease(session, len, purpose);
+        let mut leased = self.pool().lease(session, len, purpose);
+        // §108: the pool, not the session, ran out. Grow (with the pool
+        // unlocked) and try once more.
+        if matches!(leased, Err(PoolError::NoSpace { .. }))
+            && purpose != Purpose::Control
+            && let Some(grow) = self.grower.get()
+            && {
+                // §108.7: how long a lease waited for a grow is what ahead-of-
+                // demand growth exists to make rare; logged every time.
+                let t = std::time::Instant::now();
+                let grew = grow(len);
+                eprintln!("[gpu] regions: a lease of {} KiB waited {:.2} ms for a grow ({})", len >> 10, t.elapsed().as_secs_f64() * 1e3, if grew { "grown" } else { "refused" });
+                grew
+            }
+        {
+            leased = self.pool().lease(session, len, purpose);
+        }
         let lease = match leased {
             Ok(l) => l,
             Err(e) => {
@@ -187,6 +265,9 @@ impl PoolServer {
                 return Err(format!("{e}"));
             }
         };
+        // §108.6: the region manager looks at once whether to grow ahead, so a
+        // burst of leases finds room instead of waiting for a grow.
+        sv_transport::regiontab::wake::notify();
         self.note_lease();
         Ok(lease)
     }
@@ -277,6 +358,62 @@ mod tests {
     use super::*;
 
     const M: u64 = 1 << 20;
+
+    /// §108, address stability: a region's base and every lease's place in
+    /// it stay where they are while other regions are added and retired; a
+    /// region is refused retirement while any lease (and so any driver import,
+    /// which is per lease) lives in it; and a control region never leaves
+    /// region 0.
+    #[test]
+    fn regions_stay_put_while_others_come_and_go_and_a_leased_region_cannot_retire() {
+        let boot = Arc::new(SharedRegion::heap((64 * M) as usize).unwrap());
+        let s = PoolServer::new(PoolConfig::for_capacity(1024 * M), boot, Importer::HostPointer).unwrap();
+        let b = s.open_session("app");
+        // Fill region 0 so that the next leases land in added regions.
+        let mut fill = Vec::new();
+        while let Ok(l) = s.lease_raw(b.session, 8 * M, Purpose::Dedicated) {
+            if pool::split(l.offset).0 != 0 {
+                let _ = s.release(l.offset);
+                break;
+            }
+            fill.push(l);
+        }
+        let r1 = Arc::new(SharedRegion::heap((64 * M) as usize).unwrap());
+        s.add_region(1, Arc::clone(&r1)).unwrap();
+        let base1 = unsafe { s.region(1).unwrap().base_ptr() } as usize;
+        let l1 = s.lease_raw(b.session, 16 * M, Purpose::Dedicated).unwrap();
+        assert_eq!(pool::split(l1.offset).0, 1);
+        s.region(1).unwrap().write_bytes(pool::split(l1.offset).1, b"imported").unwrap();
+        // Other regions come and go.
+        for k in 2..6 {
+            s.add_region(k, Arc::new(SharedRegion::heap((32 * M) as usize).unwrap())).unwrap();
+        }
+        for k in [3, 5, 2] {
+            s.remove_region(k).unwrap();
+        }
+        s.add_region(3, Arc::new(SharedRegion::heap((128 * M) as usize).unwrap())).unwrap();
+        // Region 1 is where it was, and so is the lease's content.
+        assert_eq!(unsafe { s.region(1).unwrap().base_ptr() } as usize, base1);
+        let mut got = [0u8; 8];
+        s.read_bytes(l1.offset, &mut got).unwrap();
+        assert_eq!(&got, b"imported");
+        // While the lease lives, region 1 cannot be retired, and it still
+        // takes no new lease after the refused attempt is undone.
+        assert!(s.remove_region(1).is_err(), "a region with a live lease must not retire");
+        assert_eq!(unsafe { s.region(1).unwrap().base_ptr() } as usize, base1);
+        // A control region never lands outside region 0.
+        let c = s.lease_raw(b.session, 64 * 1024, Purpose::Control);
+        if let Ok(c) = c {
+            assert_eq!(pool::split(c.offset).0, 0);
+        }
+        // Released, it retires.
+        s.release(l1.offset).unwrap();
+        s.remove_region(1).unwrap();
+        assert!(s.region(1).is_none());
+        for l in fill {
+            s.release(l.offset).unwrap();
+        }
+    }
 
     /// The pool logic without a driver: a control lease, a read through the
     /// region, a release, and an account that closes to nothing.

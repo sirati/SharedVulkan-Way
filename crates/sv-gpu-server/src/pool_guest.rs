@@ -81,6 +81,13 @@ pub fn set_pool_hook(hook: PoolHook) {
     let _ = POOL_HOOK.set(hook);
 }
 
+/// §108: how the pool grows: the most it may add, and what starts the
+/// region manager once the pool exists.
+pub struct Grow {
+    pub budget: u64,
+    pub start: Box<dyn FnOnce(Arc<SharedRegion>, Arc<crate::pool::PoolServer>) -> Result<(), String> + Send>,
+}
+
 /// The GPU process's doorbell port from `--bell`'s spec (§111.8): on a
 /// Windows guest the broker opens the port and moves it here; without a
 /// broker, or for any other spelling, [`PortHandle::open`] as before.
@@ -106,7 +113,7 @@ pub fn map_ivshmem_slot(slot: u8) -> std::io::Result<(wc_handle::MappedView, u64
 }
 
 /// Serve sessions from a pool over `boot`, for the life of the process.
-pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>) -> Result<(), String> {
+pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>, grow: Option<Grow>) -> Result<(), String> {
     // §104.10 item 5: a GPU process that crashed left its sections behind.
     crate::shared::sweep_stale_once();
     // SAFETY: only the address is taken, to name the pool's range for its
@@ -121,9 +128,14 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>)
     // blob reserve. The offer waiting in a mailbox holds the control region.
     let pcfg = PoolConfig {
         reserve: geometry().control_size + sv_arena::pool::BLOB_LEASE,
-        ..PoolConfig::for_capacity(boot.len() as u64)
+        // A pool that grows sets its per-session cap from what it may grow
+        // to, not from the boot device (§108).
+        ..PoolConfig::for_capacity(boot.len() as u64 + grow.as_ref().map_or(0, |g| g.budget))
     };
     let server = PoolServer::new(pcfg, Arc::clone(&boot), Importer::HostPointer).map_err(|e| format!("{e}"))?;
+    if let Some(g) = grow {
+        (g.start)(Arc::clone(&boot), Arc::clone(&server))?;
+    }
     if let Some(hook) = POOL_HOOK.get() {
         hook(&server, &boot);
     }

@@ -63,6 +63,10 @@ pub mod park;
 pub mod poolcold;
 pub mod poolhdr;
 pub mod region;
+pub mod regiontab;
+pub mod lpstamp;
+#[cfg(windows)]
+pub mod winram;
 pub mod ring;
 pub mod stream;
 pub mod winpipe;

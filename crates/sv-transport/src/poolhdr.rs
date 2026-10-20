@@ -12,6 +12,7 @@
 //!      8  version (1)
 //!     16  nonce: this owner's run id; a new owner, a new nonce
 //!     24  beat: incremented about once a second while the owner lives
+//!     32  the region table's offset in region 0 (§108), 0: none
 //! ```
 //!
 //! Only the guest writes it. A session's `Hello` carries the nonce
@@ -32,6 +33,13 @@ const OFF_MAGIC: u64 = 0;
 const OFF_VERSION: u64 = 8;
 const OFF_NONCE: u64 = 16;
 const OFF_BEAT: u64 = 24;
+/// §108: where the region table is, as an offset into region 0; 0: none.
+pub const OFF_REGION_TABLE: u64 = 32;
+
+/// The region table's offset from the header's bytes (a host that `pread`s).
+pub fn region_table(b: &[u8]) -> u64 {
+    b.get(OFF_REGION_TABLE as usize..OFF_REGION_TABLE as usize + 8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()))
+}
 
 /// The header as read at one moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,8 +86,14 @@ impl<'a> PoolHeader<'a> {
         self.region.atomic_u32(OFF_VERSION).expect("inside the header").store(VERSION, Ordering::Relaxed);
         self.u64(OFF_NONCE).store(nonce, Ordering::Relaxed);
         self.u64(OFF_BEAT).store(0, Ordering::Relaxed);
+        self.u64(OFF_REGION_TABLE).store(0, Ordering::Relaxed);
         std::sync::atomic::fence(Ordering::Release);
         self.region.write_bytes(OFF_MAGIC, &MAGIC).expect("inside the header");
+    }
+
+    /// Say where the region table is (§108).
+    pub fn set_region_table(&self, offset: u64) {
+        self.u64(OFF_REGION_TABLE).store(offset, Ordering::Release);
     }
 
     pub fn beat(&self) {

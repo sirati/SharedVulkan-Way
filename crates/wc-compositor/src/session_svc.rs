@@ -1316,11 +1316,25 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
                     drop(pool);
                     let mut why = e.to_string();
                     for (region, base, src) in pool_regions() {
-                        match src.lease(sess.index, &sess.cfg.install, min) {
-                            Ok((off, len)) => match grant_external(h, sess, region, base, &src, off, len) {
+                        match src.lease_in(sess.index, &sess.cfg.install, min) {
+                            Ok((0, off, len)) => match grant_external(h, sess, region, base, &src, off, len) {
                                 Ok(reply) => return reply,
                                 Err(e) => why = format!("{why}; region {region}: {e}"),
                             },
+                            // §108: the lease landed in a region the allocator
+                            // added at run time; its own entry releases it.
+                            Ok((d, off, len)) => {
+                                let r = region + d;
+                                let Some((_, b, s)) = pool_regions().into_iter().find(|(k, _, _)| *k == r) else {
+                                    src.release(off);
+                                    why = format!("{why}; region {r} was leased in but never registered");
+                                    continue;
+                                };
+                                match grant_external(h, sess, r, b, &s, off, len) {
+                                    Ok(reply) => return reply,
+                                    Err(e) => why = format!("{why}; region {r}: {e}"),
+                                }
+                            }
                             Err(e) => why = format!("{why}; region {region} ({}): {e}", src.describe()),
                         }
                     }
@@ -1413,6 +1427,13 @@ pub trait PoolRegion: Send + Sync {
     /// `len` bytes for session `session` of installation `install`, as
     /// `(offset, len)` within this region's mapping.
     fn lease(&self, session: u8, install: &str, len: u64) -> Result<(u64, u64), String>;
+    /// §108: the same, for an allocator whose lease may land in another region
+    /// of the one pool (a GPU pool that grew from guest RAM): `(delta, offset,
+    /// len)`, the range being in region `this + delta`, which the allocator has
+    /// registered with [`replace_pool_region`] before answering.
+    fn lease_in(&self, session: u8, install: &str, len: u64) -> Result<(u32, u64, u64), String> {
+        self.lease(session, install, len).map(|(o, l)| (0, o, l))
+    }
     /// The range at `offset` goes back.
     fn release(&self, offset: u64);
     /// For the log: what the region is.
@@ -1444,6 +1465,24 @@ pub unsafe fn add_pool_region(region: u32, ptr: *const u8, len: usize, src: Arc<
     say(&format!("sessions: pool region {region} ({} MiB, {}) serves Wayland buffers when a session's BAR is full", len >> 20, src.describe()));
     POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).push((region, base, src));
     Ok(())
+}
+
+/// §108: (re)register region `region` at `[ptr, ptr + len)`: a region of the
+/// GPU pool added at run time, whose slot may be reused at another address
+/// after a retire. The caller makes sure no grant of the old one is live.
+///
+/// # Safety
+/// As [`add_pool_region`].
+pub unsafe fn replace_pool_region(region: u32, ptr: *const u8, len: usize, src: Arc<dyn PoolRegion>) -> Result<(), String> {
+    {
+        let mut regions = POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = regions.iter().position(|(r, _, _)| *r == region) {
+            let (_, base, _) = regions.remove(i);
+            wc_handle::arena::unregister_borrowed_base(base).map_err(|e| e.to_string())?;
+        }
+    }
+    // SAFETY: the caller's contract.
+    unsafe { add_pool_region(region, ptr, len, src) }
 }
 
 /// §110, for the harness and for a machine with no GPU pool in this process:

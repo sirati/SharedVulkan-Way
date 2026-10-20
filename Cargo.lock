@@ -1291,6 +1291,7 @@ dependencies = [
  "sv-hostd",
  "sv-icd",
  "sv-proto",
+ "sv-ram",
  "sv-transport",
  "sv-wire",
  "wc-broker",
@@ -1303,9 +1304,11 @@ version = "0.1.0"
 dependencies = [
  "sv-arena",
  "sv-gpu-server",
+ "sv-ram",
  "sv-transport",
  "wc-broker",
  "wc-compositor",
+ "wc-handle",
 ]
 
 [[package]]
@@ -1353,6 +1356,16 @@ dependencies = [
  "sv-codegen",
  "sv-wire",
  "vk-registry",
+]
+
+[[package]]
+name = "sv-ram"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-arena",
+ "sv-transport",
+ "wc-broker",
 ]
 
 [[package]]
@@ -1689,6 +1702,7 @@ dependencies = [
  "libc",
  "sv-arena",
  "sv-hostd",
+ "sv-ram",
  "sv-transport",
  "wc-broker",
  "wc-handle",
