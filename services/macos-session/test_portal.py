@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from dbus_next import Message, MessageType, Variant
 from bus import SessionBus as MessageBus
@@ -151,7 +152,7 @@ class Contract(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_files_commands_or_unsupported_grants(self):
         for uri, options in [('file:///etc/passwd', {}), ('javascript:alert(1)', {}),
-                             ('https://example.invalid/\n', {}), ('https://example.invalid/', {'writable': Variant('b', True)}),
+                             ('https://example.invalid/\n', {}), ('https://example.invalid/', {'ask': Variant('s', 'invalid')}),
                              ('https://example.invalid/', {'handle_token': Variant('s', '../../bad')})]:
             result = await self.open(uri, options)
             self.assertEqual(result.error_name, 'org.freedesktop.portal.Error.InvalidArgument')
@@ -173,6 +174,85 @@ class Contract(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.host.cancelled.is_set())
         self.assertEqual(self.service.requests, {})
         self.assertEqual(self.host.opened, [])
+
+    async def test_native_host_dispatches_default_opener_without_dialog(self):
+        with patch.dict(os.environ, {'WC_PORTAL_OPENER': '/native/wc-portal-open'}):
+            with patch.object(portal, 'command', new=AsyncMock(return_value=(0, ''))) as invoke:
+                self.assertEqual(await portal.NativeHost().open_uri('https://example.invalid/'), 0)
+                invoke.assert_awaited_once_with('/native/wc-portal-open', 'https://example.invalid/')
+
+    async def test_standard_open_options(self):
+        for key in ('ask', 'writable'):
+            result = await self.open(options={key: Variant('b', True)})
+            self.assertEqual(result.error_name, 'org.freedesktop.DBus.Error.NotSupported')
+        result = await self.open(options={'ask': Variant('b', False), 'writable': Variant('b', False),
+            'activation_token': Variant('s', 'advisory-wayland-token')})
+        self.assertEqual(result.message_type, MessageType.METHOD_RETURN)
+        await asyncio.wait_for(self.host.started.wait(), 2)
+
+    async def test_caller_disappearance_during_authentication_cancels_open(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = self.server.call
+        async def delayed_auth(message):
+            result = await original(message)
+            if message.member == 'GetConnectionUnixUser':
+                entered.set()
+                await release.wait()
+            return result
+        self.server.call = delayed_auth
+        client_call = asyncio.create_task(self.call('org.freedesktop.portal.OpenURI', 'OpenURI',
+            'ssa{sv}', ['', 'https://example.invalid/', {}], client=self.other))
+        await asyncio.wait_for(entered.wait(), 2)
+        pending = [task for task, owner in self.service.pending_owners.items()
+                   if owner == self.other.unique_name]
+        self.assertEqual(len(pending), 1)
+        self.other.disconnect()
+        await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2)
+        release.set()
+        await asyncio.gather(client_call, return_exceptions=True)
+        self.assertTrue(pending[0].cancelled())
+        self.assertFalse(self.host.started.is_set())
+        self.assertEqual(self.service.requests, {})
+
+    async def test_reused_path_survives_delayed_old_done_callback(self):
+        options = {'handle_token': Variant('s', 'reused')}
+        first = await self.open(options=options)
+        path = first.body[0]
+        old_task = self.service.requests[path][1]
+        original = self.service.forget_request
+        delayed = []
+        def defer_old_callback(path, task):
+            if task is old_task and task.done():
+                delayed.append((path, task))
+            else:
+                original(path, task)
+        self.service.forget_request = defer_old_callback
+        self.host.proceed.set()
+        await asyncio.wait_for(self.responses.get(), 2)
+        await old_task
+        await asyncio.sleep(0)
+        self.assertEqual(delayed, [(path, old_task)])
+        self.host.proceed.clear()
+        second = await self.open(options=options)
+        self.assertEqual(second.body, [path])
+        replacement = self.service.requests[path][1]
+        original(*delayed.pop())
+        self.assertIs(self.service.requests[path][1], replacement)
+        info = await self.call('org.freedesktop.DBus.Introspectable', 'Introspect', path=path)
+        self.assertIn('org.freedesktop.portal.Request', info.body[0])
+        closed = await self.call('org.freedesktop.portal.Request', 'Close', path=path)
+        self.assertEqual(closed.message_type, MessageType.METHOD_RETURN)
+
+    async def test_cancel_before_first_execution_removes_request(self):
+        path = '/org/freedesktop/portal/desktop/request/test/early'
+        task = asyncio.create_task(self.service.finish(path, 'https://example.invalid/', self.client.unique_name))
+        self.service.requests[path] = (self.client.unique_name, task)
+        self.server.export(path, portal.Request())
+        task.add_done_callback(lambda completed: self.service.forget_request(path, completed))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertNotIn(path, self.service.requests)
 
     async def test_duplicate_request_token_is_rejected(self):
         options = {'handle_token': Variant('s', 'same')}

@@ -2,7 +2,7 @@
 
 Settings is both a real public portal and a selectable backend. OpenURI is
 implemented by the frontend because there is no separate Linux portal broker
-on Darwin. Every open requires an affirmative native dialog. Unsupported
+on Darwin. Ordinary links use the native default handler. Unsupported
 interfaces are absent from introspection and return UnknownMethod.
 """
 import asyncio
@@ -53,19 +53,6 @@ class NativeHost:
         return {SETTINGS: {'color-scheme': Variant('u', scheme)}}
 
     async def open_uri(self, uri):
-        # Pass the untrusted URI as an argument, never as AppleScript source.
-        script = '''on run argv
-set answer to display dialog ("A Linux application wants to open this link:" & return & item 1 of argv) with title "Waycompose" buttons {"Cancel", "Open"} default button "Cancel" cancel button "Cancel"
-return button returned of answer
-on error number -128
-return "Cancel"
-end try
-end run'''
-        status, answer = await command('/usr/bin/osascript', '-e', script, uri)
-        if status:
-            return 2
-        if answer != 'Open':
-            return 1 if answer == 'Cancel' else 2
         status, _ = await command(os.environ['WC_PORTAL_OPENER'], uri)
         return 0 if status == 0 else 2
 
@@ -145,6 +132,7 @@ class Portal:
         self.requests = {}
         self.counter = 0
         self.tasks = set()
+        self.pending_owners = {}
         bus.add_message_handler(self.handle)
         self.settings_interfaces = [PublicSettings('org.freedesktop.portal.Settings', host),
                                     Settings('org.freedesktop.impl.portal.Settings', host)]
@@ -164,10 +152,15 @@ class Portal:
                             interface.SettingChanged(namespace, key, value)
             previous = current
 
-    def spawn(self, operation):
+    def spawn(self, operation, owner=None):
         task = asyncio.create_task(operation)
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        if owner is not None:
+            self.pending_owners[task] = owner
+        def completed(task):
+            self.tasks.discard(task)
+            self.pending_owners.pop(task, None)
+        task.add_done_callback(completed)
 
     async def shutdown(self):
         tasks = list(self.tasks) + [task for _, task in self.requests.values()]
@@ -188,6 +181,9 @@ class Portal:
                 and message.signature == 'sss'):
             name, _, owner = message.body
             if not owner:
+                for task, pending_owner in list(self.pending_owners.items()):
+                    if pending_owner == name:
+                        task.cancel()
                 for request_owner, task in list(self.requests.values()):
                     if request_owner == name:
                         task.cancel()
@@ -195,7 +191,7 @@ class Portal:
         if message.message_type != MessageType.METHOD_CALL:
             return False
         if message.path == PATH and message.interface == 'org.freedesktop.portal.OpenURI' and message.member == 'OpenURI':
-            self.spawn(self.open_request(message))
+            self.spawn(self.open_request(message), message.sender)
             return True
         if message.interface == 'org.freedesktop.portal.Request' and message.member == 'Close':
             request = self.requests.get(message.path)
@@ -221,10 +217,16 @@ class Portal:
             if reply.message_type == MessageType.ERROR or reply.body != [os.getuid()]:
                 raise DBusError('org.freedesktop.DBus.Error.AccessDenied', 'Caller must have the native user UID')
             _, uri, options = message.body
-            # File grants, chooser persistence and writable grants need a document
-            # portal. Do not imply those permissions exist by accepting options.
-            if set(options) - {'handle_token'}:
-                raise DBusError('org.freedesktop.portal.Error.InvalidArgument', 'Unsupported OpenURI option')
+            for key, signature in (('ask', 'b'), ('writable', 'b'), ('activation_token', 's')):
+                if key in options and options[key].signature != signature:
+                    raise DBusError('org.freedesktop.portal.Error.InvalidArgument', f'Invalid {key}')
+            if options.get('ask', Variant('b', False)).value:
+                raise DBusError('org.freedesktop.DBus.Error.NotSupported', 'Native application chooser is unavailable')
+            if options.get('writable', Variant('b', False)).value:
+                raise DBusError('org.freedesktop.DBus.Error.NotSupported', 'Document grants are unavailable')
+            # activation_token is advisory Wayland activation metadata. macOS
+            # Launch Services handles activation; it cannot consume that token.
+            # Unknown options are ignored for portal protocol extensibility.
             parsed = urlsplit(uri)
             if parsed.scheme not in ('https', 'http', 'mailto') or any(ord(c) < 32 for c in uri):
                 raise DBusError('org.freedesktop.portal.Error.InvalidArgument', 'Only http, https and mailto links are supported')
@@ -240,15 +242,17 @@ class Portal:
             task = asyncio.create_task(self.finish(path, uri, message.sender))
             self.requests[path] = (message.sender, task)
             self.bus.export(path, Request())
-            task.add_done_callback(lambda completed: self.forget_request(path))
+            task.add_done_callback(lambda completed: self.forget_request(path, completed))
             self.bus.send(Message.new_method_return(message, 'o', [path]))
         except DBusError as error:
             self.bus.send(Message.new_error(message, error.type, error.text))
         except Exception:
             self.bus.send(Message.new_error(message, 'org.freedesktop.portal.Error.Failed', 'Native request failed'))
 
-    def forget_request(self, path):
-        if self.requests.pop(path, None) is not None:
+    def forget_request(self, path, task):
+        current = self.requests.get(path)
+        if current is not None and current[1] is task:
+            self.requests.pop(path)
             self.bus.unexport(path)
 
     async def finish(self, path, uri, sender):
@@ -262,7 +266,7 @@ class Portal:
             self.bus.send(Message(destination=sender, path=path, interface='org.freedesktop.portal.Request',
                 member='Response', message_type=MessageType.SIGNAL, signature='ua{sv}', body=[2, {}]))
         finally:
-            self.forget_request(path)
+            self.forget_request(path, asyncio.current_task())
 
 
 async def main():

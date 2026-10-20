@@ -1,72 +1,58 @@
-# Import with a Darwin pkgs set. An existing native hostTools package can
-# supply bin/wc-portal-open to avoid building it twice. Linux evaluation can use
-# allowUnsupportedSystem for the source package, never to claim a Darwin run.
-{ pkgs, hostTools ? null }:
+# Assemble on vmhost, with Darwin runtime dependencies fetched from substitutes
+# or cross-built beforehand. hostTools must contain a vmhost-built Mach-O opener.
+{ pkgs, buildPkgs, hostTools }:
+assert buildPkgs.stdenv.buildPlatform.isLinux;
 let
-  nativeOpener = pkgs.rustPlatform.buildRustPackage {
-    pname = "wc-portal-open";
-    version = "0.1.0";
-    src = pkgs.lib.fileset.toSource {
-      root = ../.;
-      fileset = pkgs.lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../crates ../vendor ];
-    };
-    cargoLock.lockFile = ../Cargo.lock;
-    cargoBuildFlags = [ "-p" "wc-hostplat" "--bin" "wc-portal-open" ];
-    doCheck = false;
-    meta.platforms = pkgs.lib.platforms.darwin;
+  source = pkgs.lib.cleanSourceWith {
+    src = ../services/macos-session;
+    filter = path: _: builtins.baseNameOf path != "__pycache__";
   };
-  opener = if hostTools == null then nativeOpener else hostTools;
-  python = pkgs.python3.withPackages (p: [ p.dbus-next ]);
-  package = pkgs.stdenvNoCC.mkDerivation {
-    pname = "wc-macos-session-services";
-    version = "0.1.0";
-    src = pkgs.lib.cleanSourceWith {
-      src = ../services/macos-session;
-      filter = path: _: builtins.baseNameOf path != "__pycache__";
-    };
-    nativeBuildInputs = [ pkgs.makeWrapper ];
-    installPhase = ''
-      mkdir -p $out/libexec/waycompose $out/bin $out/share/xdg-desktop-portal/portals
-      cp bus.py portal.py session.py $out/libexec/waycompose/
-      cp waycompose.portal $out/share/xdg-desktop-portal/portals/
-      cp portals.conf $out/share/xdg-desktop-portal/waycompose-portals.conf
-      makeWrapper ${python}/bin/python $out/bin/wc-macos-session-services \
-        --add-flags $out/libexec/waycompose/session.py \
-        --set WC_DBUS_DAEMON ${pkgs.dbus}/bin/dbus-daemon \
-        --set WC_PULSEAUDIO ${pkgs.pulseaudio}/bin/pulseaudio \
-        --set WC_PORTAL $out/libexec/waycompose/portal.py \
-        --set WC_PORTAL_OPENER ${opener}/bin/wc-portal-open \
-        --set WC_SESSION_PLIST $out/Library/LaunchAgents/org.waycompose.session-services.plist
-      mkdir -p $out/Library/LaunchAgents
-      cat > $out/Library/LaunchAgents/org.waycompose.session-services.plist <<PLIST
-      <?xml version="1.0" encoding="UTF-8"?>
-      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-      <plist version="1.0"><dict>
-        <key>Label</key><string>org.waycompose.session-services</string>
-        <key>ProgramArguments</key><array><string>$out/bin/wc-macos-session-services</string></array>
-        <key>RunAtLoad</key><true/>
-        <key>KeepAlive</key><true/>
-        <key>ThrottleInterval</key><integer>10</integer>
-        <key>LimitLoadToSessionType</key><string>Aqua</string>
-      </dict></plist>
-      PLIST
-    '';
-    meta.platforms = pkgs.lib.platforms.darwin;
-  };
+  # Use the target interpreter and pure Python library directly. A native
+  # python.withPackages would add a Darwin builder for a symlink environment.
+  python = pkgs.python3;
+  dbusNext = pkgs.python3Packages.dbus-next;
+  package = buildPkgs.runCommand "wc-macos-session-services-0.1.0" { } ''
+    test -x ${hostTools}/bin/wc-portal-open
+    mkdir -p $out/libexec/waycompose $out/bin $out/share/xdg-desktop-portal/portals
+    cp ${source}/{bus,portal,session}.py $out/libexec/waycompose/
+    cp ${source}/waycompose.portal $out/share/xdg-desktop-portal/portals/
+    cp ${source}/portals.conf $out/share/xdg-desktop-portal/waycompose-portals.conf
+    cat > $out/bin/wc-macos-session-services <<WRAPPER
+    #!${pkgs.runtimeShell}
+    export PYTHONPATH=${dbusNext}/${python.sitePackages}
+    export WC_DBUS_DAEMON=${pkgs.dbus}/bin/dbus-daemon
+    export WC_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
+    export WC_PORTAL=$out/libexec/waycompose/portal.py
+    export WC_PORTAL_OPENER=${hostTools}/bin/wc-portal-open
+    export WC_SESSION_PLIST=$out/Library/LaunchAgents/org.waycompose.session-services.plist
+    exec ${python}/bin/python3 $out/libexec/waycompose/session.py "\$@"
+    WRAPPER
+    chmod +x $out/bin/wc-macos-session-services
+    mkdir -p $out/Library/LaunchAgents
+    cat > $out/Library/LaunchAgents/org.waycompose.session-services.plist <<PLIST
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0"><dict>
+      <key>Label</key><string>org.waycompose.session-services</string>
+      <key>ProgramArguments</key><array><string>$out/bin/wc-macos-session-services</string></array>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+      <key>ThrottleInterval</key><integer>10</integer>
+      <key>LimitLoadToSessionType</key><string>Aqua</string>
+    </dict></plist>
+    PLIST
+  '';
 in {
-  inherit package nativeOpener;
-  # Import in nix-darwin. This changes no live service until the user deploys.
+  inherit package;
   darwinModule = { ... }: {
     environment.systemPackages = [ package ];
-    launchd.user.agents.waycompose-session-services = {
-      serviceConfig = {
-        Label = "org.waycompose.session-services";
-        ProgramArguments = [ "${package}/bin/wc-macos-session-services" ];
-        RunAtLoad = true;
-        KeepAlive = true;
-        ThrottleInterval = 10;
-        LimitLoadToSessionType = "Aqua";
-      };
+    launchd.user.agents.waycompose-session-services.serviceConfig = {
+      Label = "org.waycompose.session-services";
+      ProgramArguments = [ "${package}/bin/wc-macos-session-services" ];
+      RunAtLoad = true;
+      KeepAlive = true;
+      ThrottleInterval = 10;
+      LimitLoadToSessionType = "Aqua";
     };
   };
 }

@@ -1,10 +1,22 @@
 # Native macOS session services
 
-`nix/macos-session-services.nix { pkgs = darwinPkgs; }` returns `package`,
-`nativeOpener`, and `darwinModule`. The opener uses the existing `wc-hostplat`
-`MacOpener` and `wc-hostint` URL validator, including the check against handing
-links back to Linux. A prebuilt native host-tools package containing
-`bin/wc-portal-open` can be passed as `hostTools`.
+`import nix/macos-session-services.nix { pkgs = darwinPkgs;
+buildPkgs = hostLinuxPkgs; hostTools = hostCrossBuiltHostTools; }` returns
+`package` and `darwinModule`. `buildPkgs` must target Linux, so assembly runs
+on vmhost. The package contains text wrappers/configuration and references the
+Darwin interpreter and compiled daemon dependencies. It does not build a
+native Darwin Python environment or compile its opener on Mac.
+
+`hostTools` is mandatory and must contain a vmhost cross-linked Mach-O
+`bin/wc-portal-open`, using the existing `wc-hostplat` `MacOpener` and
+`wc-hostint` URL validator, including the check against handing links back to
+Linux. A Darwin cross-target cargo check is not a linked executable.
+The pinned Darwin Python/dbus-next/dbus/PulseAudio compiled dependencies were
+available from binary substitutes in the offline dry-run. The deployment gate
+is still an actual cross-linked opener and a complete closure realized on vmhost
+and copied to the target. Pass that pre-realized `sessionServices` into the
+application factory. Never use target-native compilation to fill missing
+compiled artifacts; missing target substitutes require a vmhost cross-build.
 
 The module installs one Aqua LaunchAgent, `org.waycompose.session-services`.
 The package also contains its plist for deployments without nix-darwin.
@@ -56,20 +68,26 @@ seconds. Accent color, contrast, and automatic-appearance behavior have not
 been validated.
 
 Public OpenURI version 1 implements `OpenURI` for `http`, `https`, and
-`mailto`, with an asynchronous owned Request object. Dialogs are currently unparented; Wayland parent handles are not resolved.
-Every request needs an explicit affirmative macOS dialog before the existing host opener runs.
-`Request.Close` cancels the native dialog process. Responses report success,
-cancellation, or failure after the native operation finishes. A caller cannot
-close another connection's request. A disappearing caller cancels its requests. Only `handle_token` is accepted in options;
-file grants, writable grants, chooser persistence, and activation tokens are
-unsupported. The service checks the caller's actual D-Bus Unix UID.
+`mailto`, with an asynchronous owned Request object. The default `ask=false`
+uses the existing native default handler without an extra confirmation dialog.
+`ask=true` returns NotSupported because there is no native application chooser.
+Valid boolean `writable=false` is accepted; `writable=true` is unsupported since
+there are no document grants. A string `activation_token` is accepted as advisory
+Wayland metadata, but macOS Launch Services cannot consume that token and uses
+its normal activation behavior. Parent window handles are not resolved.
+Unknown extension options are ignored. Invalid standard option types fail.
+`Request.Close` cancels pending native work, and caller exit or service shutdown
+also cancels requests. Cancellation cannot undo a launch already accepted by
+macOS. Cleanup compares task identity, so a delayed callback cannot remove a
+new request that reuses the same handle token. The service checks the caller's
+actual D-Bus Unix UID.
 
 `waycompose.portal` advertises only the implemented Settings backend. The
 matching `waycompose-portals.conf` selects it. On Darwin this service also
 implements the public frontend, since there is no upstream Linux portal
 frontend in this native session. Do not run another owner of
 `org.freedesktop.portal.Desktop` on the same bus. There is no AppChooser backend
-advertisement. OpenURI's native consent and launch are handled by this frontend.
+advertisement. OpenURI's default native launch is handled by this frontend.
 
 FileChooser, document grants, ScreenCast, RemoteDesktop, screenshot,
 notification, secret, inhibit, and other portal interfaces are absent. Calls
