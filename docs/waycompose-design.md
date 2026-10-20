@@ -37744,7 +37744,11 @@ parent. It moves the entire old Data object into a newly protected recovery
 container without traversing or normalizing retired descendants. A retained
 old writable directory handle can change only that retired generation.
 Directory creation uses native atomic create-new semantics and supplies its
-owner/DACL at creation. Existing raw security history refuses fresh replacement
+owner/DACL at creation. Anchor validation walks from a verified local fixed
+HarddiskVolume root through every parent. It rejects ambiguous paths, SUBST,
+reparse ancestors and unprivileged replacement/ACL rights. Only DELETE alone
+on the verified volume root is exempt, since that object has no removable
+parent entry. The same right on any nonroot ancestor refuses. Existing raw security history refuses fresh replacement
 and requires trusted recovery.
 
 Existing-service installs require protected directory-generation receipts

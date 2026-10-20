@@ -165,15 +165,55 @@ function Write-ProtectedNewText([string]$p, [string]$text) {
   try { $b = [Text.Encoding]::UTF8.GetBytes($text); $s.Write($b,0,$b.Length); $s.Flush($true) } finally { $s.Dispose() }
 }
 function Assert-DataAnchor([string]$Child = $Data) {
-  $parent = Split-Path -Parent $Child
-  $item = Get-Item -Force -LiteralPath $parent
-  if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'untrusted broker data anchor' }
-  $a = Get-Acl -LiteralPath $parent
-  if ($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { throw 'untrusted broker data anchor owner' }
-  $danger = [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership -bor [Security.AccessControl.FileSystemRights]::Delete
-  foreach ($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
-    if ($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and -not ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
-        $r.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') -and ($r.FileSystemRights -band $danger)) { throw 'untrusted broker data anchor grants replacement rights' }
+  # Resolve only unambiguous local DOS paths. Relative/device/UNC paths, ADS,
+  # DOS aliases and Win32-normalized components cannot name a trusted anchor.
+  if ($Child -notmatch '^[A-Za-z]:\\[^\\]' -or $Child.Contains('/') -or
+      -not [string]::Equals([IO.Path]::GetFullPath($Child),$Child,[StringComparison]::OrdinalIgnoreCase)) { throw 'ambiguous or nonlocal broker anchor path' }
+  $parts=$Child.Substring(3).Split([char]'\')
+  foreach($part in $parts) {
+    if (-not $part -or $part -in @('.','..') -or $part.EndsWith('.') -or $part.EndsWith(' ') -or
+        $part.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $part -match '~[0-9]' -or $part -match '^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|COM[1-9]|LPT[1-9])(\.|$)') { throw 'ambiguous broker anchor component' }
+  }
+  $root=$Child.Substring(0,3)
+  if ([IO.DriveInfo]::new($root).DriveType -ne [IO.DriveType]::Fixed) { throw 'broker anchor must be on a local fixed drive' }
+  if (-not ('WcDriveAnchor' -as [type])) {
+    Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class WcDriveAnchor {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern uint QueryDosDevice(string name, StringBuilder target, int length);
+  public static bool IsVolume(string drive) {
+    var b=new StringBuilder(32768);
+    if(QueryDosDevice(drive,b,b.Capacity)==0) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    return System.Text.RegularExpressions.Regex.IsMatch(b.ToString(), @"^\\Device\\HarddiskVolume[0-9]+$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+  }
+}
+'@
+  }
+  if (-not [WcDriveAnchor]::IsVolume($root.Substring(0,2))) { throw 'ambiguous mapped broker anchor drive' }
+  $privileged=@('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+  $danger=0x10000000 -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership -bor [Security.AccessControl.FileSystemRights]::Delete
+  # Check root-to-leaf. Only descend after the preceding object is known not
+  # to permit desktop replacement, so no untrusted ancestor can swap it later.
+  $ancestor=$root
+  for($i=0; $i -lt $parts.Length; $i++) {
+    $item=Get-Item -Force -LiteralPath $ancestor
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'untrusted broker anchor ancestor reparse or type' }
+    $a=Get-Acl -LiteralPath $ancestor
+    if ($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $privileged) { throw 'untrusted broker anchor ancestor owner' }
+    # A verified physical volume root has no parent directory entry to
+    # delete or rename. DELETE alone is inapplicable there; DELETE_CHILD and
+    # ACL/owner changes remain dangerous. Every nonroot ancestor keeps DELETE.
+    $applicableDanger=$danger
+    if($i -eq 0) { $applicableDanger=$danger -band (-bnot [int][Security.AccessControl.FileSystemRights]::Delete) }
+    foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+      if ($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+          -not ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+          $r.IdentityReference.Value -notin $privileged -and ($r.FileSystemRights -band $applicableDanger)) { throw 'untrusted broker data anchor grants replacement rights on ancestor' }
+    }
+    if($i -lt $parts.Length-1) { $ancestor=Join-Path $ancestor $parts[$i] }
   }
 }
 function Assert-DataGeneration {
