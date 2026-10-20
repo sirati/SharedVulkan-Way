@@ -115,6 +115,7 @@ struct State<P: Platform> {
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
     writers: BTreeMap<ConnId, Arc<Mutex<P::Writer>>>,
     on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
+    on_leased: Vec<Box<dyn FnMut(ObjId, Pid) + Send>>,
 }
 
 /// A running broker. Cloned into every connection's thread; also what a
@@ -165,6 +166,7 @@ impl<P: Platform> Broker<P> {
                 objs,
                 writers: BTreeMap::new(),
                 on_drained: Vec::new(),
+                on_leased: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
@@ -401,6 +403,12 @@ impl<P: Platform> Broker<P> {
                         return p.push(w, &format!("err region {rid} has no object here"));
                     };
                     let pieces: Vec<(u64, u64)> = held.iter().flat_map(|h| h.pieces.iter().copied()).collect();
+                    // Before the fds leave: an embedder that records holders
+                    // has this one before it can map anything.
+                    for f in st.on_leased.iter_mut() {
+                        f(rid, peer.pid);
+                    }
+                    let held = st.objs.get(&rid).expect("looked up above, under the same lock");
                     let give: Vec<Give<'_, P::Object>> = held.iter().map(|h| Give::Copy(&h.obj)).collect();
                     let r = p.send(
                         w,
@@ -549,6 +557,14 @@ impl<P: Platform> Broker<P> {
     /// channel), never call back into the broker.
     pub fn on_drained(&self, f: Box<dyn FnMut(ObjId, u64) + Send>) {
         self.lock().on_drained.push(f);
+    }
+
+    /// Add a callback for each lease (`open`, `find`), called with the
+    /// region and the holder's pid **before** the region's handles are sent,
+    /// so a holder record written from it cannot miss a lease taken just
+    /// before a crash. Under the broker's lock, like [`Self::on_drained`].
+    pub fn on_leased(&self, f: Box<dyn FnMut(ObjId, Pid) + Send>) {
+        self.lock().on_leased.push(f);
     }
 
     /// The processes holding a lease on region `id` now, so that a
