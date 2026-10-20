@@ -35165,7 +35165,7 @@ manager. Three ways were weighed:
   without matching on unit names it cannot see. Rejected: a rule that broad is
   more than a session start needs.
 * (b) a socket-activated agent per user. Chosen. `wc-session-agent.socket` is a
-  user unit (`Accept=yes`) at `/run/waycompose/agent/<user>/agent.sock`, in a
+  user unit (`Accept=yes`) at `/run/waycompose-agent/<user>/agent.sock`, in a
   directory only that user can write. The service connects and checks with
   `SO_PEERCRED` that the socket is the mapped uid's (the listener is that
   user's manager). The agent checks that the caller is `waycompose` or root.
@@ -35248,7 +35248,8 @@ users.conf's mapping of the guest GPU process's user, `UserMap::resolve_any`.
 | an installation's definition (`wc-session`, `apps.ini`, `gpu.env`, `bin/`) | `/var/lib/waycompose/installs/<name>` | root, 0755 |
 | its key | `…/<name>/session.key` | `waycompose`, 0600 (the service checks) |
 | sequence numbers (§105) | `/var/lib/waycompose/sessiond` | `waycompose`, 0700 |
-| broker, hub, agents | `/run/waycompose/{broker.sock,hub/,agent/<user>/}` | broker socket 0666 (access is per request, by uid); hub 0750 `waycompose` |
+| broker, hub | `/run/waycompose/{broker.sock,hub/}` | `waycompose`; broker socket 0666 (access is per request, by uid), hub 0750 |
+| agents | `/run/waycompose-agent/<user>/agent.sock` | a root tree (systemd-tmpfiles refuses a root directory under the service's), each directory the user's |
 | a session's run directory | `$XDG_RUNTIME_DIR/wc-launch/<id>` of the mapped user | the user, 0700 |
 | per-user state: Firefox profiles, Prism's data | the mapped user's home (`~/.wc-launch/<profile>`, `~/wc-mc`) | the user |
 

@@ -78,7 +78,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         users: None,
         server: String::new(),
         accept_unidentified: false,
-        agents: "/run/waycompose/agent".into(),
+        agents: "/run/waycompose-agent".into(),
         broker: None,
         gpu_region: None,
         hub_wl: None,

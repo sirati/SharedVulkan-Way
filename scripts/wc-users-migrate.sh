@@ -211,7 +211,7 @@ if [ "$VERB" = verify ] || { [ "$VERB" = apply ] && [ "$FAIL" = 0 ]; }; then
     chk "wc-bell-hub runs as waycompose" '[ "$(ps -o user= -p "$(systemctl show -p MainPID --value wc-bell-hub)")" = waycompose ]'
     chk "wc-sessiond runs as waycompose" '[ "$(ps -o user= -p "$(systemctl show -p MainPID --value wc-sessiond)")" = waycompose ]'
     chk "the broker listens" '[ -S /run/waycompose/broker.sock ]'
-    chk "$DESK's agent listens" '[ -S /run/waycompose/agent/'"$DESK"'/agent.sock ]'
+    chk "$DESK's agent listens" '[ -S /run/waycompose-agent/'"$DESK"'/agent.sock ]'
     chk "the admin runs no hub or service" '! systemctl --machine='"$ADMIN"'@.host --user is-active -q wc-sessiond.service wc-bell-hub.service'
     chk "users.conf was read" 'journalctl -u wc-sessiond -n 50 --no-pager | grep -q "sessions of"'
   fi
