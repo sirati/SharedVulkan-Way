@@ -22,13 +22,35 @@ scripts/wc-ivshmem-range-source.sh /mnt/datasets/builds/scratch/ivshmem-protecte
 
 The script fetches the exact commit, checks the patch before applying it, and
 copies the added source files. It does not build, sign, install, or load
-anything. Upstream's `ivshmem/ivshmem.vcxproj` then includes the overlay. Building
-requires the Windows 10 WDK with KMDF 1.15, its SDK, and MSBuild driver targets.
-A normal MinGW sysroot lacks KMDF and is insufficient. No complete WDK was
-found on this Linux build host, so kernel compilation and Driver Verifier
-validation remain outstanding. Any build on this host must run through
-`/mnt/datasets/builds/wcrun/cg`, including its outer `nix develop` invocation.
-No driver installation or signing policy change is part of this work.
+anything. Upstream's `ivshmem/ivshmem.vcxproj` includes the overlay for
+Windows MSBuild with the WDK and KMDF 1.15. A normal MinGW sysroot lacks KMDF.
+An isolated Linux cross-build also compiles all four actual driver translation
+units and links an unsigned x64 native kernel image using Microsoft NuGet
+WDK/SDK 10.0.26100.1, KMDF 1.15 and LLVM 21.1.8:
+
+```sh
+/mnt/datasets/builds/wcrun/cg env CLANG_CL=clang-cl LLD_LINK=lld-link PYTHON=python3 \
+  scripts/wc-ivshmem-range-build.sh \
+  /mnt/datasets/builds/scratch/ivshmem-protected \
+  /mnt/datasets/builds/scratch/ivshmem-kernel-build
+```
+
+The build script downloads the official packages, verifies their pinned SHA-256
+hashes, and records the compiler and linker versions. It adds include-case
+aliases in its own scratch copies for Linux. It does not sign, install, or load
+anything. The NuGet packages retain Microsoft's licensing terms. All builds on
+this host must run through `/mnt/datasets/builds/wcrun/cg`, including any outer
+`nix develop` invocation. There is no driver installation or signing policy
+change in this work.
+
+The overlay explicitly declares `PsAcquireProcessExitSynchronization` and
+`PsReleaseProcessExitSynchronization`. The pinned WDK's `ntoskrnl.lib` exports
+them but its public headers do not declare them. This is an undocumented kernel
+ABI dependency. The successful cross-link verifies symbol availability in that
+import library, not support or behavior on any target Windows installation.
+Replacing or accepting this dependency requires a separate compatibility review.
+The cross-build still emits upstream/WDK warnings, including ignored upstream
+`#pragma align`, Microsoft enum extensions and deprecated pool allocation.
 
 ## API and authority
 
@@ -150,8 +172,11 @@ fixture confirms that the retained producer process HANDLE fires retirement
 only after its child process actually terminates. Evidence is outside Git at
 `/mnt/datasets/builds/evidence/windows-producer-retirement` and
 `/mnt/datasets/builds/evidence/windows-bar-retirement/real-windows-OJRK27`.
-These checks do not validate the kernel overlay or establish production crash
-recovery. Portable C tests execute the same range helpers used by the driver
+These checks do not validate kernel mapping behavior or establish production crash
+recovery. The isolated cross-build compiles Driver.c, Device.c, Queue.c and
+Range.c and links an unsigned native x64 `.sys` against the pinned official
+WDK libraries. Binary inspection confirms the native subsystem and expected
+ntoskrnl, HAL and WDF imports. Portable C tests execute the same range helpers used by the driver
 against control-page overlap, out-of-bounds extents, unaligned ranges and
-physical-address overflow. They do not emulate kernel mapping semantics. Kernel build, code analysis, Driver Verifier, protected mapping tests,
+physical-address overflow. They do not emulate kernel mapping semantics. MSBuild validation, code analysis, Driver Verifier, protected mapping tests,
 and complete authenticated control-path integration remain required.

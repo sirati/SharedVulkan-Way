@@ -3,6 +3,20 @@
 #include "Range.h"
 #include "RangeBounds.h"
 
+/* These ntoskrnl exports are present in the pinned WDK import library but
+ * absent from its public headers. They are an explicit undocumented ABI
+ * dependency; a successful link does not establish support on a target OS.
+ * Keep the exit fence: a process reference alone does not retain its address
+ * space while another thread exits. */
+NTKERNELAPI NTSTATUS NTAPI PsAcquireProcessExitSynchronization(PEPROCESS Process);
+NTKERNELAPI VOID NTAPI PsReleaseProcessExitSynchronization(PEPROCESS Process);
+
+/* Process access bit from the matching SDK winnt.h. Do not include user-mode
+ * Windows headers in this kernel translation unit. */
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION (0x0008)
+#endif
+
 #define RANGE_TAG 'rIvW'
 
 typedef struct {
