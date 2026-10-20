@@ -1877,6 +1877,7 @@ name = "wc-transport"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-transport",
  "uds_windows",
  "wc-cygwin-link",
  "wc-handle",

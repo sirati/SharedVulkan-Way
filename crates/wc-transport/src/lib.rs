@@ -291,6 +291,17 @@ pub fn socket_dir() -> io::Result<std::path::PathBuf> {
     }
 }
 
+/// Send one framed protocol message carrying a shared handle. The closure
+/// wraps the prepared descriptor body with the protocol framing. This is the
+/// ownership emission boundary, not Descriptor::encode.
+pub fn send_handle_message(stream: &mut Stream, handle: &wc_handle::Handle,
+    frame: impl FnOnce(&[u8]) -> Vec<u8>) -> io::Result<()> {
+    let abort = stream.try_clone()?;
+    framed::send_handle_frame(stream, handle, frame, || {
+        let _ = abort.shutdown(std::net::Shutdown::Both);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,13 +335,3 @@ mod tests {
     }
 }
 
-/// Send one framed protocol message carrying a shared handle. The closure
-/// wraps the prepared descriptor body with the protocol framing. This is the
-/// ownership emission boundary, not Descriptor::encode.
-pub fn send_handle_message(stream: &mut Stream, handle: &wc_handle::Handle,
-    frame: impl FnOnce(&[u8]) -> Vec<u8>) -> io::Result<()> {
-    let abort = stream.try_clone()?;
-    framed::send_handle_frame(stream, handle, frame, || {
-        let _ = abort.shutdown(std::net::Shutdown::Both);
-    })
-}
