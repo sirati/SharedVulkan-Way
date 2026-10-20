@@ -44,6 +44,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if std::env::args().any(|a| a == "--fill-buffer") {
+        fill_buffer(&instance, devices[0])?;
+        unsafe { instance.destroy_instance(None) };
+        return Ok(());
+    }
+
     for (i, pd) in devices.iter().enumerate() {
         let props = unsafe { instance.get_physical_device_properties(*pd) };
         let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
@@ -244,5 +250,59 @@ fn try_import(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Result<()> {
     }
 
     unsafe { device.destroy_device(None); dealloc(ptr, layout) };
+    Ok(())
+}
+
+
+/// A bounded real GPU write, usable through the ICD without host-pointer
+/// extensions in the application. The mapped bytes must contain the fill
+/// pattern after the host GPU signals the fence. No CPU copy fills the buffer.
+fn fill_buffer(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Result<()> {
+    const BYTES: u64 = 256 << 10;
+    const PATTERN: u32 = 0x7356_9b21;
+    let family = unsafe { instance.get_physical_device_queue_family_properties(pd) }.iter()
+        .position(|q| q.queue_count > 0 && q.queue_flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
+        .ok_or_else(|| anyhow::anyhow!("no graphics/compute queue"))? as u32;
+    let priorities = [1.0];
+    let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
+    let device = unsafe { instance.create_device(pd, &vk::DeviceCreateInfo::default().queue_create_infos(&queues), None) }?;
+    let buffer = unsafe { device.create_buffer(&vk::BufferCreateInfo::default().size(BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST), None) }?;
+    let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let ty = (0..props.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(flags))
+        .ok_or_else(|| anyhow::anyhow!("no coherent host-visible buffer memory"))?;
+    let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None) }?;
+    unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+    let mapped = unsafe { device.map_memory(memory, 0, BYTES, vk::MemoryMapFlags::empty()) }?;
+    // Initialize a different value so stale or never-submitted work fails.
+    unsafe { std::ptr::write_bytes(mapped, 0, BYTES as usize) };
+    let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None) }?;
+    let command = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }?[0];
+    unsafe {
+        device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
+        device.cmd_fill_buffer(command, buffer, 0, BYTES, PATTERN);
+        device.end_command_buffer(command)?;
+    }
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+    let commands = [command];
+    let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+    unsafe {
+        device.queue_submit(device.get_device_queue(family, 0), &submits, fence)?;
+        device.wait_for_fences(&[fence], true, 10_000_000_000)?;
+    }
+    let words = unsafe { std::slice::from_raw_parts(mapped.cast::<u32>(), BYTES as usize / 4) };
+    if let Some(i) = words.iter().position(|&word| word != PATTERN) {
+        bail!("GPU fill differs at word {i}: {:#x}", words[i]);
+    }
+    println!("GPU FILL OK: {BYTES} bytes, {} verified words, pattern {PATTERN:#x}", words.len());
+    unsafe {
+        device.unmap_memory(memory);
+        device.destroy_fence(fence, None);
+        device.destroy_command_pool(pool, None);
+        device.destroy_buffer(buffer, None);
+        device.free_memory(memory, None);
+        device.destroy_device(None);
+    }
     Ok(())
 }
