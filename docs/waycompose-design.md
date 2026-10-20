@@ -37738,16 +37738,30 @@ generation with `services.waycompose`. For each installation it does this:
   with the current trusted key. Shared services and user mapping stay in place.
   Both confirmation and rollback require idle admin and mapped-user sessions.
 
-Before any first-install SCM changes, the Windows installer quarantines an
-existing key tree into privileged recovery storage and creates an empty signer
-tree. It replaces recovery owners and DACLs without reading key material.
-Existing-service installs require privileged protected metadata and explicit
-per-install enrollment receipts bound to the current NTFS file ID. The key
-action creates those receipts only after publishing a fresh protected key
-object. Unknown keys, stale receipts and reparse trees refuse before service
-mutation. Actual Windows filesystem fixtures verified these paths, including
-a desktop-owned key with a protected-looking SYSTEM/Administrators DACL and
-a retained original read handle.
+Before first-install SCM changes, the Windows installer creates a fresh
+privileged Data directory object and empty signer tree under a validated
+parent. It moves the entire old Data object into a newly protected recovery
+container without traversing or normalizing retired descendants. A retained
+old writable directory handle can change only that retired generation.
+Directory creation uses native atomic create-new semantics and supplies its
+owner/DACL at creation. Existing raw security history refuses fresh replacement
+and requires trusted recovery.
+
+Existing-service installs require protected directory-generation receipts
+bound to current NTFS object IDs, plus per-install key enrollment receipts.
+The key action requires a valid fresh Data generation and creates each new key
+object with privileged security at creation. The executable directory similarly
+requires fresh generation provenance; unknown, exposed or reparse binary
+directories refuse before Data or SCM changes. Unknown keys and stale receipts
+cannot bless replacement objects merely through owner/DACL normalization.
+
+Actual Windows filesystem fixtures exercised writable old parent handles,
+retired ACL edits and relative injected-directory/key creation. The active
+Data/Keys object identities and ACLs remained unchanged. A retained writable
+old key handle prevented old-directory rename; the installer failed closed
+without publishing a new generation. Fixtures also verified native name
+collision, raw-history and unsafe-anchor refusals and binary-directory
+provenance/reparse checks. No actual family/service/device objects were touched.
 
 Migration replaces the running raw-resource ACLs completely and makes their
 owner/group root, with only the named service account allowed. It clears
