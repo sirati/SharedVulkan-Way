@@ -53,3 +53,21 @@ No raw device-open fallback or file-arena bypass is enabled. The directory
 layout uses header format 3 and control wire version 2. Legacy format-2
 clients must reject this header before touching pixel or allocation metadata;
 new lease clients also reject legacy headers and control versions.
+
+The native runtime passed on the disposable Windows guest with 3 GiB and four
+vCPUs, without GPU passthrough. The fixture committed 30 frames, and the Linux
+headless compositor presented 30 distinct pixel hashes. The final submitted
+hash `6cd1c180a52e02a5` matched a Linux presentation. The wire carried 2,296
+request bytes and 1,860 reply bytes while the original BAR held the two
+400 by 300 pixel buffers. Normal explicit release left zero allocation
+capacity, owner, pending-transfer and consumer counts; the host observed
+`ring_dead=1` before the VM stopped normally.
+
+A separate native Windows Vulkan probe in the same boot verified 65,536 words
+from a 256 KiB GPU fill served by the Linux NVIDIA GeForce RTX 5090. This
+establishes that separate Vulkan path. The Wayland pixel fixture uses wl_shm;
+it does not establish Vulkan presentation or the requested laptop iGPU path.
+The runtime evidence is `windows-mingw-client/real-windows-5gOkPt`, with exact
+binary hashes, logs, directory snapshot and QEMU arguments. Scoped validation
+passed 115 tests, strict Linux and Windows transport/client lint, and the
+native client plus Linux host and compositor builds.
