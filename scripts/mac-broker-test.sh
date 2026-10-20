@@ -60,7 +60,7 @@ phase_state() {
     echo "== ports"; vm "ls -l /dev/cu.org.sirati.*"
     echo "== socket"; vm "ls -ld /var/run/waycompose /var/run/waycompose/broker.sock"
     echo "== keys"; vm "sudo -n ls -la \"$SYS/keys\" \"$SYS/bin\""
-    echo "== the VM's user opens a port itself"; vm "head -c0 /dev/cu.org.sirati.wcbell.0 && echo OPENED || echo refused: \$?" 2>&1
+    echo "== the VM's user opens a port itself"; vm "( : </dev/cu.org.sirati.wcbell.0 ) 2>/dev/null && echo OPENED || echo refused: \$?" 2>&1
     echo "== the VM's user reads a key"; vm "cat \"$SYS/keys/wcm.key\" >/dev/null 2>&1 && echo READ || echo refused"
     echo "== stats"; vm "\"$SYS/bin/wc-broker\" ctl 'hello state' stats"
   } 2>&1 | tee "$out"
@@ -155,7 +155,7 @@ phase_users() {
     for id in $ids; do vm "$as2 'open $id'"; done
     vm "$as2 'find $sid' 'device wcbell' 'device svbell'"
     echo "== user 2 opens the port nodes and user 1's keys itself"
-    vm "sudo -n -u $U2 sh -c 'head -c0 /dev/cu.org.sirati.wcbell.0 && echo OPENED || echo refused'" 2>&1
+    vm "sudo -n -u $U2 sh -c '( : </dev/cu.org.sirati.wcbell.0 ) 2>/dev/null && echo OPENED || echo refused'" 2>&1
     vm "sudo -n -u $U2 sh -c 'cat \"$SYS/keys/wcm.key\" >/dev/null 2>&1 && echo READ || echo refused'"
     echo "== user 2's own region and its signature"
     vm "$as2 'hello u2' 'alloc u2pool 8192' 'sign wcm u2-1 0 1 2 0 3 2 0 1' stats"

@@ -35199,7 +35199,58 @@ SIGTERM with `down`, so the host releases within about 1–2 s.
   written over it or the record is unsigned). `sessiond_ivshmem` verifies with
   `verifies_identity`, which is §107's check when there is no identity.
 
-VM_RESULTS
+**In the VM** (wayland-host, 4096 MiB, 2026-10-20 11:06–11:20,
+`scripts/mac-broker-test.sh` driven by a waiter; evidence in
+`/mnt/datasets/builds/evidence/session-fixes/broker-mac/`, `broker-*.txt`,
+`keeper-*.txt`, `broker-daemon.log`, `vmrun.log`):
+
+* **The daemon and the ports.** launchd ran it (`keepalive | runatload`).
+  The port nodes became `crw------- root wheel`, the socket
+  `srw-rw-rw-`, the keys directory `drwx------` and the key `-rw-------`, all
+  root's. The VM's user could not read the key. The daemon lent `wcbell` to
+  every main process and `svbell` to the GPU server (`device ... lent to
+  process N`), and logged each exit by kqueue (`process N (main) exited`).
+* **SIGKILL of the main process under load, 5 times** (Console open, foot on
+  this side scrolling `seq` into the session): every time the broker held
+  the session's two windows (64 MiB arena, 6 MiB rings) as orphans after the
+  exit, the host's session service took the session down and wrote the
+  release word, and the broker freed the pool on it (`the release word of
+  pool wcm-N is set; freeing the pool's orphans`). Kernel panic reports
+  before 0, after 0; the guest stayed up.
+* **The GPU server** was tied to its session (`ends with pool`), its exit
+  seen, and its session's pool freed by the release word; 300 frames
+  presented (PASS).
+* **SIGTERM to the daemon** while it held 2 orphans: it waited for their
+  release word (the host wrote it), freed them, and ended 0.70 s after the
+  signal; launchd started it again.
+* **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
+  after): its `open` of user 1's regions, `find` of user 1's pool and
+  `device wcbell` (held by user 1's main process) were refused by uid; it
+  could not read the key; its own `alloc` worked; `sign` named it
+  (`os=macos user=wctest2 id=503`). The host logged user 1's sessions as
+  `asked by os=macos user=<user> id=501 (verified, installation wcm)`.
+  `svbell`, free at that moment, was lent to user 2: a free device goes to
+  any user, one at a time, by design.
+
+**Not shown by this run, and why:**
+
+* **Wayland round trip and present time, before and after.** The VM was
+  slow throughout. The host's memory group for the macOS VMs was near its
+  limit while another instance ran, and every number was far from §103.15's
+  in both builds: the GPU present was 8.50 ms/frame with the keeper and
+  23.35 ms/frame with the broker (§103.15: 0.56), and the broker's
+  2000 round trips gave p50 3.52 ms, p99 179 ms (§103.15: 0.248, 0.322). The
+  keeper's round-trip leg produced no number: its main process had already
+  ended when the client connected. Nothing on the data path changed (the
+  doorbell is the same port, now an inherited fd; the windows are the same
+  wired pages), but "the same within noise" is **not measured**; it needs a
+  rerun on a quiet host.
+* **The second user's own session.** Its main process, started with
+  `sudo -u` from ssh, wrote no log, so a second session side by side was not
+  run.
+* The harness's check that a user cannot open a port node itself used
+  `head -c0`, which macOS rejects; the node modes above are the evidence.
+  Fixed for the next run.
 
 #### 111.9.5 Limits
 
