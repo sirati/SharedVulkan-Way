@@ -2,6 +2,7 @@
  * Payload is one shared atomic word; sockets carry notifications only. */
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -49,6 +50,19 @@ int main(int argc, char **argv) {
     assert(strlen(argv[2]) < sizeof(addr.sun_path));
     strcpy(addr.sun_path, argv[2]);
     assert(connect(bell, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    /* A native peer cannot retain hl's shared socket-option metadata. */
+    char rejected_byte = '!';
+    struct iovec rejected_iov = { &rejected_byte, 1 };
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } rejected_control;
+    memset(&rejected_control, 0, sizeof(rejected_control));
+    struct msghdr rejected = { .msg_iov=&rejected_iov, .msg_iovlen=1,
+        .msg_control=rejected_control.bytes, .msg_controllen=sizeof(rejected_control) };
+    struct cmsghdr *rejected_header=CMSG_FIRSTHDR(&rejected);
+    rejected_header->cmsg_level=SOL_SOCKET; rejected_header->cmsg_type=SCM_RIGHTS;
+    rejected_header->cmsg_len=CMSG_LEN(sizeof(bell));
+    memcpy(CMSG_DATA(rejected_header), &bell, sizeof(bell));
+    assert(sendmsg(bell, &rejected, MSG_NOSIGNAL)<0 && errno==EOPNOTSUPP);
+
     char byte = 0;
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
     struct iovec iov = { &byte, 1 };

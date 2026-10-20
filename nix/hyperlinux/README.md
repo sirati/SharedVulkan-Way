@@ -46,3 +46,14 @@ launching the GUI or user services. Native KosmicKrisp
 keeps its existing authorized MTLTexture import patch; Linux Mesa/Zink/VA remain
 upstream. Native binaries are signed after their final modifications with the
 Linux-native rcodesign tool, preserving hl's Hypervisor entitlement.
+
+Connected Unix stream sockets support `SO_PASSCRED`. Incoming Linux credential
+messages contain only Darwin kernel peer UID, GID and native PID, queried before
+receiving bytes. Guest-supplied credentials never define that identity. Shared
+option storage follows the open description through dup, fork and descriptor
+transfer between the same exact native hl executable. Internal option descriptors
+are hidden from the guest and recognized only by protected inode metadata.
+Sending such a socket through an arbitrary native peer fails with EOPNOTSUPP,
+because that peer cannot preserve the shared option state for a later import.
+Unix datagram credential semantics are explicitly unsupported. This is connected
+stream support, not a claim of complete Linux per-message credential semantics.

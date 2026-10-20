@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 20b0299..43dc0fa 100644
+index 20b0299..7648ae2 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -87,7 +87,7 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
@@ -7,7 +7,7 @@ index 20b0299..43dc0fa 100644
             thread.c futex.c vdso.c crash_report.c rosetta.c \
             gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
 -           audio.c audio_oss.c audio_coreaudio.c app_open.c)
-+           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c)
++           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c)
  HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
@@ -52,10 +52,26 @@ index dab2512..709d9d7 100644
      for (int i = 0; i < g_nnodes; i++) {
          if (strcmp(g_nodes[i].name, base) == 0) {
 diff --git a/src/fd_object.c b/src/fd_object.c
-index e8cfaa2..61d77a2 100644
+index e8cfaa2..60b4576 100644
 --- a/src/fd_object.c
 +++ b/src/fd_object.c
-@@ -392,8 +392,10 @@ int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
+@@ -4,6 +4,7 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ #include "fd_object.h"
++#include "hl_socket.h"
+ #include "syscall.h"
+ #include "syscall_internal.h"
+ #include "trace.h"
+@@ -70,6 +71,7 @@ void hl_open_file_release(hl_open_file_t *of) {
+     if (prev == 1) {
+         if (of->ops && of->ops->destroy)
+             of->ops->destroy(of);
++        hl_wc_socket_drop(of);
+         free(of->guest_path_hint);
+         free(of);
+     }
+@@ -392,8 +394,10 @@ int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
      uint32_t new_fd_flags = cloexec ? LINUX_O_CLOEXEC : 0;
      if (cloexec && new_host >= 0)
          fcntl(new_host, F_SETFD, FD_CLOEXEC);
@@ -67,7 +83,7 @@ index e8cfaa2..61d77a2 100644
      if (!nd) {
          if (new_host >= 0) close(new_host);
          hl_open_file_release(of);
-@@ -451,7 +453,8 @@ int hl_fd_dup3(int oldfd, int newfd, int flags) {
+@@ -451,7 +455,8 @@ int hl_fd_dup3(int oldfd, int newfd, int flags) {
      int kind = of ? of->kind : fd_table[oldfd].type;
      hl_descriptor_t *nd = NULL;
      if (of) {
@@ -77,30 +93,43 @@ index e8cfaa2..61d77a2 100644
          if (!nd) {
              if (new_host >= 0) close(new_host);
              if (of) hl_open_file_release(of);
+diff --git a/src/fd_object.h b/src/fd_object.h
+index 88c81fa..959f23d 100644
+--- a/src/fd_object.h
++++ b/src/fd_object.h
+@@ -102,6 +102,7 @@ struct hl_open_file {
+     const hl_fd_ops_t *ops;
+     atomic_uint status_flags; /* O_NONBLOCK, O_APPEND, access mode bits */
+     void *state;
++    void *socket_state; /* shared option storage, owned by hl_socket */
+     uint64_t mount_id;
+     char *guest_path_hint;
+ };
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index 1041c94..7cd2ea6 100644
+index 1041c94..2ca2809 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
-@@ -18,6 +18,9 @@
+@@ -18,6 +18,10 @@
  #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
  #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
  #include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
 +#include "hl_shared.h"
 +#include "hl_seals.h"
 +#include "hl_drm.h"
++#include "hl_socket.h"
  #include "syscall_shm.h"     /* hl_shm_fork_export/import */
  #include "futex.h"           /* futex_wake_one */
  #include "fd_object.h"
-@@ -47,7 +50,7 @@
+@@ -47,7 +51,7 @@
  /* Magic values for IPC frame delimiters */
  #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
  #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
 -#define IPC_VERSION       7            /* v7: recreate kqueue-backed epoll fds */
-+#define IPC_VERSION       8            /* v8: transferable external shared views */
++#define IPC_VERSION       9            /* v8: transferable external shared views */
  #define IPC_FD_HAS_OBJECT 1            /* ipc_fd_entry_t.pad: synthetic open-file follows */
  #define IPC_FD_RECREATE_EPOLL 2        /* ipc_fd_entry_t.pad: epoll state follows */
  
-@@ -538,6 +541,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+@@ -538,6 +542,10 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
                       * free and overwrite them on the first allocation. */
                      fd_alloc_at(gfd, fd_entries[i].type, host_fds[i]);
                      fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
@@ -111,7 +140,7 @@ index 1041c94..7cd2ea6 100644
  
                      /* Re-derive FD_DEVICE's registry pointer from the index
                       * carried in pad, so fstat keeps the Linux numbers (V6). */
-@@ -690,6 +697,26 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+@@ -690,6 +698,44 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
          }
      }
  
@@ -135,10 +164,28 @@ index 1041c94..7cd2ea6 100644
 +            if (rc < 0) { guest_destroy(&g); return 1; }
 +        }
 +    }
++    /* Shared socket options follow the original native socket aliases. */
++    {
++        int32_t count;
++        if (ipc_read_all(ipc_fd, &count, sizeof(count)) < 0 || count < 0 || count > FD_TABLE_SIZE) {
++            guest_destroy(&g); return 1;
++        }
++        for (int32_t i = 0; i < count; i++) {
++            int32_t gfd; int state = -1, n = 0;
++            if (ipc_read_all(ipc_fd, &gfd, sizeof(gfd)) < 0 ||
++                recv_fds(ipc_fd, &state, 1, &n) < 0 || n != 1) {
++                if (state >= 0) close(state);
++                guest_destroy(&g); return 1;
++            }
++            int rc = hl_wc_socket_import(gfd, state);
++            close(state);
++            if (rc < 0) { guest_destroy(&g); return 1; }
++        }
++    }
      if (hl_vfs_mode() == HL_FS_ROOTED) {
          if (cwd[0] != '\0')
              hl_vfs_set_cwd(cwd);
-@@ -1534,6 +1561,13 @@ static void *vm_clone_thread_run(void *arg) {
+@@ -1534,6 +1580,13 @@ static void *vm_clone_thread_run(void *arg) {
  __attribute__((noinline))
  static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
                                int verbose) {
@@ -152,7 +199,7 @@ index 1041c94..7cd2ea6 100644
      /* We only support fork-like clone (SIGCHLD) and posix_spawn-like
       * clone (CLONE_VM|CLONE_VFORK|SIGCHLD) */
      int is_vfork = (flags & LINUX_CLONE_VFORK) != 0;
-@@ -2059,6 +2093,30 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -2059,6 +2112,49 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          free(shm_recs);
      }
  
@@ -178,6 +225,25 @@ index 1041c94..7cd2ea6 100644
 +        for (int i = 0; i < retained; i++) close(fds[i]);
 +        free(fds);
 +        free(records);
++        if (failed) { close(ipc_sock); return -LINUX_EIO; }
++    }
++    {
++        int states[FD_TABLE_SIZE], guest_fds[FD_TABLE_SIZE];
++        int32_t count = 0; int failed = 0;
++        for (int fd = 0; fd < FD_TABLE_SIZE; fd++) {
++            if (fd_table[fd].type == FD_CLOSED) continue;
++            int state = hl_wc_socket_export(fd);
++            if (state == -2) { failed = 1; break; }
++            if (state < 0) continue;
++            guest_fds[count] = fd; states[count++] = state;
++        }
++        if (!failed) failed = ipc_write_all(ipc_sock, &count, sizeof(count)) < 0;
++        for (int32_t i = 0; !failed && i < count; i++) {
++            int32_t fd = guest_fds[i];
++            if (ipc_write_all(ipc_sock, &fd, sizeof(fd)) < 0 || send_fds(ipc_sock, &states[i], 1) < 0)
++                failed = 1;
++        }
++        for (int32_t i = 0; i < count; i++) close(states[i]);
 +        if (failed) { close(ipc_sock); return -LINUX_EIO; }
 +    }
      /* Sysroot path (for dynamic linker library resolution) */
@@ -859,23 +925,111 @@ index 5c6d8f1..03d3c49 100644
              if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
              return total > 0 ? (int64_t)total : linux_errno();
 diff --git a/src/syscall_net.c b/src/syscall_net.c
-index 161ffc9..b779aaf 100644
+index 161ffc9..db314e2 100644
 --- a/src/syscall_net.c
 +++ b/src/syscall_net.c
-@@ -11,7 +11,9 @@
+@@ -11,7 +11,10 @@
   *   - Socket options: SOL_SOCKET option constants differ
   */
  #include "syscall_net.h"
 +#include "syscall_proc.h"
  #include "syscall_internal.h"
 +#include "hl_seals.h"
++#include "hl_socket.h"
  #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
  #include "syscall_io.h"      /* rosettad_is_socket */
  #include "syscall_fs.h"      /* hl_fs_open_parent_beneath (rooted confinement) */
-@@ -1076,6 +1078,25 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
+@@ -518,8 +521,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
+         int one = 1;
+         setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+ 
+-        int gfd = fd_alloc(FD_SOCKET, pair[0]);
+-        if (gfd < 0) { close(pair[0]); close(pair[1]); return -LINUX_EMFILE; }
++        int gfd = hl_wc_socket_alloc(pair[0]);
++        if (gfd < 0) { close(pair[1]); return -LINUX_EMFILE; }
+ 
+         int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
+         fd_table[gfd].linux_flags = linux_flags_val;
+@@ -551,8 +554,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
+     int one = 1;
+     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+ 
+-    int gfd = fd_alloc(FD_SOCKET, fd);
+-    if (gfd < 0) { close(fd); return -LINUX_EMFILE; }
++    int gfd = hl_wc_socket_alloc(fd);
++    if (gfd < 0) return -LINUX_EMFILE;
+ 
+     int linux_flags = 0;
+     if (cloexec) linux_flags |= LINUX_O_CLOEXEC;
+@@ -583,14 +586,14 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
+         setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+     }
+ 
+-    int gfd0 = fd_alloc(FD_SOCKET, fds[0]);
++    int gfd0 = hl_wc_socket_alloc(fds[0]);
+     if (gfd0 < 0) {
+-        close(fds[0]); close(fds[1]);
++        close(fds[1]);
+         return -LINUX_EMFILE;
+     }
+-    int gfd1 = fd_alloc(FD_SOCKET, fds[1]);
++    int gfd1 = hl_wc_socket_alloc(fds[1]);
+     if (gfd1 < 0) {
+-        fd_mark_closed(gfd0); close(fds[0]); close(fds[1]);
++        sys_close(gfd0);
+         return -LINUX_EMFILE;
+     }
+ 
+@@ -600,8 +603,8 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
+ 
+     int32_t guest_fds[2] = { gfd0, gfd1 };
+     if (guest_write(g, sv_gva, guest_fds, 8) < 0) {
+-        fd_mark_closed(gfd0); close(fds[0]);
+-        fd_mark_closed(gfd1); close(fds[1]);
++        sys_close(gfd0);
++        sys_close(gfd1);
+         return -LINUX_EFAULT;
+     }
+ 
+@@ -700,8 +703,8 @@ static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
+     int one = 1;
+     setsockopt(new_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+ 
+-    int gfd = fd_alloc(FD_SOCKET, new_fd);
+-    if (gfd < 0) { close(new_fd); return -LINUX_EMFILE; }
++    int gfd = hl_wc_socket_alloc(new_fd);
++    if (gfd < 0) return -LINUX_EMFILE;
+     fd_table[gfd].linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
+ 
+     /* Write back peer address if requested. The accept has already
+@@ -1024,6 +1027,13 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
      int host_fd = fd_to_host(fd);
      if (host_fd < 0) return -LINUX_EBADF;
  
++    if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
++        int32_t enabled;
++        if (optlen < sizeof(enabled)) return -LINUX_EINVAL;
++        if (guest_read(g, optval_gva, &enabled, sizeof(enabled)) < 0) return -LINUX_EFAULT;
++        return hl_wc_socket_set(fd, enabled) < 0 ? linux_errno() : 0;
++    }
++
+     int mac_level = level;
+     int mac_optname = optname;
+ 
+@@ -1076,6 +1086,35 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
++    if (level == LINUX_SOL_SOCKET && optname == 16 /* SO_PASSCRED */) {
++        int32_t enabled; uint32_t len;
++        if (guest_read(g, optlen_gva, &len, sizeof(len)) < 0) return -LINUX_EFAULT;
++        if (hl_wc_socket_get(fd, &enabled) < 0) return linux_errno();
++        if (len > sizeof(enabled)) len = sizeof(enabled);
++        if (guest_write(g, optval_gva, &enabled, len) < 0 ||
++            guest_write(g, optlen_gva, &len, sizeof(len)) < 0) return -LINUX_EFAULT;
++        return 0;
++    }
++
 +    /* Linux ucred is sized explicitly; Darwin identifies the same native
 +     * peer without trusting a claimed identity in the guest payload. */
 +    if (level == LINUX_SOL_SOCKET && optname == 17 /* SO_PEERCRED */) {
@@ -898,7 +1052,20 @@ index 161ffc9..b779aaf 100644
      int mac_level = level;
      int mac_optname = optname;
  
-@@ -1291,6 +1312,18 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+@@ -1174,8 +1213,10 @@ int64_t sys_shutdown(int fd, int how) {
+ 
+ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+ 
+-    int host_fd = fd_to_host(fd);
+-    if (host_fd < 0) return -LINUX_EBADF;
++    hl_wc_socket_transfers transfers __attribute__((cleanup(hl_wc_socket_transfer_end))) = {0};
++    hl_fd_ref_t socket_ref __attribute__((cleanup(hl_fd_put))) = {0};
++    if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
++    int host_fd = socket_ref.host_fd;
+ 
+     linux_msghdr_t lmsg;
+     if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
+@@ -1291,38 +1332,42 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
              if (lcmsg_len > lctl_len - lpos) break;
              size_t ldata_len = (size_t)(lcmsg_len - 16);
  
@@ -917,14 +1084,234 @@ index 161ffc9..b779aaf 100644
              /* Translate SOL_SOCKET (Linux=1 → macOS=0xFFFF) */
              int mac_level = (lcmsg_level == 1) ? SOL_SOCKET : lcmsg_level;
              int mac_type = lcmsg_type;
-@@ -1556,6 +1589,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
-                         close(fds[i]);
-                         fds[i] = -1;
-                     } else {
-+                        if (hl_wc_memfd_restore(gfd) < 0) { sys_close(gfd); fds[i] = -1; continue; }
-                         fds[i] = gfd;
-                         /* MSG_CMSG_CLOEXEC (0x40000000): set CLOEXEC on received fds */
-                         if (flags & 0x40000000)
+ 
+-            /* Build macOS cmsghdr: [4 cmsg_len][4 level][4 type][data at 12] */
+-            if (mpos + CMSG_SPACE(ldata_len) > sizeof(mac_ctrl)) break;
+-
+-            /* Use CMSG macros to build properly aligned macOS cmsghdr */
++            int native_fds[64]; unsigned native_count = 0;
++            const void *data_src = linux_ctrl + lpos + 16;
++            size_t native_data_len = ldata_len;
++            if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
++                if (ldata_len % sizeof(int)) return -LINUX_EINVAL;
++                if (hl_wc_socket_transfer(host_fd, data_src, (unsigned)(ldata_len / sizeof(int)),
++                    native_fds, &native_count, &transfers) < 0) return linux_errno();
++                native_data_len = native_count * sizeof(int);
++                data_src = native_fds;
++            }
++            if (mpos + CMSG_SPACE(native_data_len) > sizeof(mac_ctrl)) return -LINUX_EMSGSIZE;
+             struct msghdr tmsg = { .msg_control = mac_ctrl + mpos,
+                                    .msg_controllen = sizeof(mac_ctrl) - mpos };
+             struct cmsghdr *cmsg = CMSG_FIRSTHDR(&tmsg);
+-            if (!cmsg) break;
+-            cmsg->cmsg_len = CMSG_LEN(ldata_len);
++            if (!cmsg) return -LINUX_EMSGSIZE;
++            cmsg->cmsg_len = CMSG_LEN(native_data_len);
+             cmsg->cmsg_level = mac_level;
+             cmsg->cmsg_type = mac_type;
+-            memcpy(CMSG_DATA(cmsg), linux_ctrl + lpos + 16, ldata_len);
+-
+-            /* For SCM_RIGHTS: translate guest fds to host fds.
+-             * Validate ALL fds before overwriting any — a partial translation
+-             * would leave the buffer in an inconsistent state on error. */
+-            if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
+-                int *fds = (int *)CMSG_DATA(cmsg);
+-                size_t nfds = ldata_len / sizeof(int);
+-                for (size_t i = 0; i < nfds; i++) {
+-                    if (fd_to_host(fds[i]) < 0) return -LINUX_EBADF;
+-                }
+-                for (size_t i = 0; i < nfds; i++) {
+-                    fds[i] = fd_to_host(fds[i]);
+-                }
+-            }
+-
+-            mpos += CMSG_SPACE(ldata_len);
++            memcpy(CMSG_DATA(cmsg), data_src, native_data_len);
++            mpos += CMSG_SPACE(native_data_len);
+ 
+             /* Advance to next Linux cmsghdr (8-byte aligned) */
+             lpos += (size_t)((lcmsg_len + 7) & ~7ULL);
+@@ -1375,9 +1420,14 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+ 
+ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+ 
+-    int host_fd = fd_to_host(fd);
+-    if (host_fd < 0) return -LINUX_EBADF;
++    hl_wc_socket_transfers received __attribute__((cleanup(hl_wc_socket_received_end))) = {0};
++    hl_fd_ref_t socket_ref __attribute__((cleanup(hl_fd_put))) = {0};
++    if (hl_fd_get(fd, &socket_ref) < 0) return -LINUX_EBADF;
++    int host_fd = socket_ref.host_fd;
+ 
++    int passcred = hl_wc_socket_enabled(socket_ref.of);
++    hl_wc_ucred peer;
++    if (passcred && hl_wc_socket_peer(host_fd, &peer) < 0) return linux_errno();
+     linux_msghdr_t lmsg;
+     if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
+         return -LINUX_EFAULT;
+@@ -1389,7 +1439,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+      * Dominant path for X11 display sockets under GTK (idle EAGAIN storm
+      * and event reads). SCM_RIGHTS / PEEK / OOB take the full path below.
+      */
+-    if (msghdr_simple_stream(&lmsg) &&
++    if (!passcred && msghdr_simple_stream(&lmsg) &&
+         (flags & ~MSG_FP_LINUX_OK) == 0) {
+         struct iovec host_iov[64];
+         int iovlen = 0;
+@@ -1485,7 +1535,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+      *
+      * SOL_SOCKET: macOS=0xFFFF → Linux=1
+      * CMSG_ALIGN: macOS=4, Linux=8 */
+-    if (ctrl_alloc > 0 && msg.msg_controllen > 0 && lmsg.msg_control) {
++    if (ctrl_alloc > 0 && lmsg.msg_control) {
+         uint8_t linux_ctrl[512];
+         size_t lpos = 0;
+ 
+@@ -1493,11 +1543,27 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+              cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+             if (cmsg->cmsg_len < CMSG_LEN(0)) continue; /* malformed */
+-            /* Cap data_len to prevent integer overflow in lcmsg_space
+-             * calculation. Kernel-returned cmsg_len should be sane but
+-             * defend against edge cases. */
+             size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+-            if (data_len > sizeof(linux_ctrl) - 16) break;
++            int received_fds[64]; unsigned received_count = 0;
++            int rights = cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS;
++            const void *data_src = CMSG_DATA(cmsg);
++            if (rights) {
++                if (data_len % sizeof(int) || data_len / sizeof(int) > 64) return -LINUX_EIO;
++                if (hl_wc_socket_receive(host_fd, CMSG_DATA(cmsg), (unsigned)(data_len / sizeof(int)),
++                    received_fds, &received_count) < 0) return linux_errno();
++                for (unsigned i = 0; i < received_count; i++) {
++                    if (received.count == 64) {
++                        for (unsigned j = i; j < received_count; j++) sys_close(received_fds[j]);
++                        return -LINUX_EMSGSIZE;
++                    }
++                    received.fds[received.count++] = received_fds[i];
++                }
++                data_len = received_count * sizeof(int);
++                data_src = received_fds;
++                for (unsigned i = 0; i < received_count; i++)
++                    if (flags & 0x40000000) fd_table[received_fds[i]].linux_flags |= LINUX_O_CLOEXEC;
++            }
++            if (data_len > sizeof(linux_ctrl) - 16) return -LINUX_EIO;
+             /* Linux CMSG_LEN = 16 + data_len */
+             uint64_t lcmsg_len = 16 + data_len;
+             /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */
+@@ -1508,68 +1574,21 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+              * be closed or they leak in hl forever. */
+             if (lpos + lcmsg_space > sizeof(linux_ctrl) ||
+                 lpos + lcmsg_space > lmsg.msg_controllen) {
+-                if (cmsg->cmsg_level == SOL_SOCKET &&
+-                    cmsg->cmsg_type == SCM_RIGHTS) {
+-                    int *rawfds = (int *)CMSG_DATA(cmsg);
+-                    size_t rawn = data_len / sizeof(int);
+-                    for (size_t i = 0; i < rawn; i++)
+-                        if (rawfds[i] >= 0) close(rawfds[i]);
++                if (rights) {
++                    for (unsigned i = 0; i < received_count; i++) sys_close(received_fds[i]);
++                    received.count -= received_count;
+                 }
+                 lmsg.msg_flags |= LINUX_MSG_CTRUNC;
+-                break;
++                continue;
+             }
+ 
+             /* Translate SOL_SOCKET (macOS=0xFFFF → Linux=1) */
+             int32_t llevel = (cmsg->cmsg_level == SOL_SOCKET) ? 1
+                              : cmsg->cmsg_level;
+             int32_t ltype = cmsg->cmsg_type;
+-
+-            /* For SCM_RIGHTS: translate host fds → guest fds */
+-            /* Room for every fd macOS can hand us in one cmsg. The old
+-             * 128-byte buffer capped translation at 32 fds; a larger
+-             * SCM_RIGHTS array fell through UNTRANSLATED, so the guest was
+-             * handed raw HOST fd numbers (aliasing unrelated entries in its
+-             * own table) and those host fds leaked permanently. mac_ctrl is
+-             * 256 bytes, so 61 fds is the ceiling — size for that. */
+-            uint8_t data_copy[256];
+-            uint8_t *data_src = CMSG_DATA(cmsg);
+-            if (cmsg->cmsg_level == SOL_SOCKET &&
+-                cmsg->cmsg_type == SCM_RIGHTS && data_len > sizeof(data_copy)) {
+-                /* Cannot translate: close them rather than leaking host fds
+-                 * into the guest. */
+-                int *rawfds = (int *)CMSG_DATA(cmsg);
+-                size_t rawn = data_len / sizeof(int);
+-                for (size_t i = 0; i < rawn; i++)
+-                    if (rawfds[i] >= 0) close(rawfds[i]);
+-                lmsg.msg_flags |= LINUX_MSG_CTRUNC;
+-                continue;
+-            }
+-            if (cmsg->cmsg_level == SOL_SOCKET &&
+-                cmsg->cmsg_type == SCM_RIGHTS && data_len <= sizeof(data_copy)) {
+-                memcpy(data_copy, data_src, data_len);
+-                int *fds = (int *)data_copy;
+-                size_t nfds = data_len / sizeof(int);
+-                for (size_t i = 0; i < nfds; i++) {
+-                    int host_recv_fd = fds[i];
+-                    int gfd = fd_alloc(FD_REGULAR, fds[i]);
+-                    if (gfd < 0) {
+-                        close(fds[i]);
+-                        fds[i] = -1;
+-                    } else {
+-                        fds[i] = gfd;
+-                        /* MSG_CMSG_CLOEXEC (0x40000000): set CLOEXEC on received fds */
+-                        if (flags & 0x40000000)
+-                            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+-                        /* Log SCM_RIGHTS fd reception for rosettad debugging */
+-                        if (g->verbose && rosettad_is_socket(fd_to_host(fd))) {
+-                            fprintf(stderr, "hl: rosettad: recvmsg SCM_RIGHTS "
+-                                    "host_fd=%d → guest_fd=%d\n",
+-                                    host_recv_fd, gfd);
+-                        }
+-                    }
+-                }
+-                data_src = data_copy;
+-            }
++            /* Darwin timestamp type2 is never Linux credentials type2. */
++            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP)
++                ltype = 29; /* Linux SCM_TIMESTAMP */
+ 
+             /* Build Linux cmsghdr */
+             memset(linux_ctrl + lpos, 0, lcmsg_space);
+@@ -1581,6 +1600,20 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+             lpos += lcmsg_space;
+         }
+ 
++        if (passcred && ret > 0) {
++            uint64_t size = 16 + sizeof(peer);
++            size_t space = (size + 7) & ~(size_t)7;
++            if (space <= sizeof(linux_ctrl) - lpos && space <= lmsg.msg_controllen - lpos) {
++                int32_t level = 1, type = 2;
++                memset(linux_ctrl + lpos, 0, space);
++                memcpy(linux_ctrl + lpos, &size, 8);
++                memcpy(linux_ctrl + lpos + 8, &level, 4);
++                memcpy(linux_ctrl + lpos + 12, &type, 4);
++                memcpy(linux_ctrl + lpos + 16, &peer, sizeof(peer));
++                lpos += space;
++            } else lmsg.msg_flags |= LINUX_MSG_CTRUNC;
++        }
++
+         if (lpos > 0) {
+             if (guest_write(g, lmsg.msg_control, linux_ctrl, lpos) < 0)
+                 return -LINUX_EFAULT;
+@@ -1600,6 +1633,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+             return -LINUX_EFAULT;
+     }
+ 
++    if (passcred && ret > 0 && !ctrl_alloc) lmsg.msg_flags |= LINUX_MSG_CTRUNC;
++
+     /* Update msg_flags in guest (offset 48 in linux_msghdr_t).
+      * macOS msg_flags use macOS values — translate to Linux. */
+     /* Preserve any CTRUNC raised while translating the control buffer;
+@@ -1609,6 +1644,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+     if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
+         return -LINUX_EFAULT;
+ 
++    received.count = 0; /* guest now owns the published descriptors */
+     return ret;
+ }
+ 
 diff --git a/src/syscall_shm.c b/src/syscall_shm.c
 index dfce9fc..e558a11 100644
 --- a/src/syscall_shm.c

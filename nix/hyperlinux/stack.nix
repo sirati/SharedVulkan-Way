@@ -78,6 +78,8 @@ let
       cp ${./hl_seals.h} src/hl_seals.h
       cp ${./hl_drm.c} src/hl_drm.c
       cp ${./hl_drm.h} src/hl_drm.h
+      cp ${./hl_socket.c} src/hl_socket.c
+      cp ${./hl_socket.h} src/hl_socket.h
       cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
     '';
     buildPhase = ''
@@ -132,6 +134,9 @@ let
   renderClient = guest.callPackage ./client-probe.nix {
     programName = "hl-render-client"; source = ./render-client.c;
   };
+  socketClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-socket-client"; source = ./socket-client.c;
+  };
   probeRoot = pkgs.runCommand "hyperlinux-probe-sysroot" {} ''
     mkdir -p "$out/lib"
     ln -s ${guest.glibc}/lib/ld-linux-aarch64.so.1 "$out/lib/ld-linux-aarch64.so.1"
@@ -166,6 +171,7 @@ let
       export HOME="$fixture/home" XDG_CONFIG_HOME="$fixture/config" XDG_DATA_HOME="$fixture/data"
       export XDG_STATE_HOME="$fixture/state" XDG_RUNTIME_DIR="$fixture/runtime" HL_NATIVE_FIXTURE="$fixture"
       "$HL_RUNNER" ${renderClient}/bin/hl-render-client
+      "$HL_RUNNER" ${socketClient}/bin/hl-socket-client
     '';
   };
 in {

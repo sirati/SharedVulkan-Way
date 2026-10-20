@@ -16,6 +16,8 @@ hlCross.overrideAttrs (old: {
     cp ${./hl_seals.h} src/hl_seals.h
     cp ${./hl_drm.c} src/hl_drm.c
     cp ${./hl_drm.h} src/hl_drm.h
+    cp ${./hl_socket.c} src/hl_socket.c
+    cp ${./hl_socket.h} src/hl_socket.h
     cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
   '';
   WC_HYPERLINUX_LIB = "${backend}/lib/libwc_hyperlinux.a";
