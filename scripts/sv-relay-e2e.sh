@@ -24,6 +24,7 @@
 # through the node, the doorbell came the same way, and a client without
 # SV_DRM_NODE is refused.
 set -uo pipefail
+command -v socat >/dev/null || { echo "need socat (run inside nix develop)"; exit 2; }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${SVPE_BIN:-$ROOT/target/release}
@@ -55,6 +56,7 @@ for _ in $(seq 1 50); do [ -S "$RUN/svbell.sock" ] && break; sleep 0.1; done
 "$BIN/sv-hostd" bell-hub --port "$RUN/svbell.sock=$SV_HUB" --drm-services "$SERVICES" >"$RUN/hub.log" 2>&1 &
 KIDS+=($!)
 for _ in $(seq 1 50); do [ -S "$RUN/guestbell.sock" ] && [ -S "$SV_HUB" ] && break; sleep 0.1; done
+[ -S "$RUN/guestbell.sock" ] && [ -S "$SV_HUB" ] || { echo "FAIL: the doorbell stand-in did not connect"; exit 1; }
 
 say "pool-guest on lavapipe, a ${POOL_MIB} MiB pool, cold path pool, bell on"
 VK_DRIVER_FILES="$LVP" "$BIN/sv-gpu-server" pool-guest --pool-file "$RUN/gpu" --bell "socket:$RUN/guestbell.sock" \

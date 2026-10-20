@@ -809,7 +809,9 @@ mod tests {
     }
 
     fn tmp(tag: &str) -> Tmp {
-        let p = std::env::temp_dir().join(format!("wc-sessiond-test-{tag}-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("wc-sessiond-test-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         Tmp(p)

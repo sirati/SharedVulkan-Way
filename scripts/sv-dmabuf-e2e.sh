@@ -24,6 +24,7 @@
 #                                   VkPhysicalDeviceDrmPropertiesEXT (the node
 #                                   is only opened and probed, never used)
 set -uo pipefail
+command -v socat >/dev/null || { echo "need socat (run inside nix develop)"; exit 2; }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${SVDE_BIN:-$ROOT/target/release}
