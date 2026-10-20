@@ -227,6 +227,10 @@ let
           "$HL_RUNNER" ${controlClient}/bin/hl-control-access-client "$mode" "$address"
         done
       done
+      for address in 0xe000 0xf000; do
+        "$HL_RUNNER" ${controlClient}/bin/hl-control-access-client --syscalls "$address"
+        "$HL_RUNNER" ${controlClient}/bin/hl-control-access-client --cpu-write "$address"
+      done
       for mode in --basic --backend-denial --trap --tsync --stacked --tsync-divergent --kill-thread --arguments; do
         "$HL_RUNNER" ${seccompClient}/bin/hl-seccomp-client "$mode"
       done
