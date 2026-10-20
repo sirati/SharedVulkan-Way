@@ -90,6 +90,13 @@ CPU write/bidirectional access requests are rejected. Trusted kernel code and
 the privileged original source owner remain outside the unprivileged-client
 access boundary.
 
+The CPU-access cache has one per-buffer mutex covering SG creation, direction,
+begin/end sync and final cleanup. Each SG is published only after successful
+creation and is unmapped exactly once under that mutex. RW CPU cache mappings
+use BIDIRECTIONAL consistently across mixed read/write sync callers; RO uses
+FROM_DEVICE for CPU reads. The stock unsynchronized cache initialization must
+not be carried into a retirement-certified exporter.
+
 ## Lifetime and final retirement
 
 The pinned source audit covers these mechanisms:

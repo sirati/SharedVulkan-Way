@@ -82,8 +82,7 @@ static void udmabuf_finish_retirement(struct work_struct *work)
 		udmabuf_set_retirement(r, UDMABUF_PROTECTED_FAILED);
 		return;
 	}
-	if (ubuf->sg)
-		put_sg_table(ubuf->device->this_device, ubuf->sg, ubuf->sg_dir);
+	udmabuf_cleanup_cpu(ubuf);
 	deinit_udmabuf(ubuf);
 	kfree(ubuf);
 	r->ubuf = NULL;
