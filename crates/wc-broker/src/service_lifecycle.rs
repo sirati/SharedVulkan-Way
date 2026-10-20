@@ -321,6 +321,10 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         self.channel_ready(channel)?;
         channel.auth.seal(phase, payload)
     }
+    /// Returns historical authentication evidence only. Before delayed use,
+    /// the canonical resource owner must recheck this lifecycle's current
+    /// readiness/channel and exact pending resource state at mutation time.
+    /// This foundation provides no allocator apply/completion operation.
     pub fn verify(&self, channel: &mut GrantChannel, frame: &Frame) -> io::Result<VerifiedMessage> {
         self.channel_ready(channel)?;
         channel.auth.verify(frame)
