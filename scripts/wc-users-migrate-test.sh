@@ -128,7 +128,14 @@ printf 'fixture\n' >"$T/build-bin/wc-arena-host"
 printf 'fixture\n' >"$T/build-bin/sv-hostd"
 printf '#!/bin/sh\nprintf "apps ok\\n"\n' >"$S/bin/profile-renderer"
 chmod 0755 "$S/bin/profile-renderer"
+printf 'original renderer\n' >"$S/bin/wc-launch"
+printf 'original presentation\n' >"$S/bin/libsv_wlshim.so"
+printf 'candidate renderer\n' >"$T/build-bin/wc-launch"
+printf 'candidate presentation\n' >"$T/build-bin/libsv_wlshim.so"
+printf 'broker-aware transport\n' >"$T/build-bin/wc-proxy"
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" apply admin wctest "$T/build-bin" wct2 >"$T/first-apply.txt" 2>&1 || { cat "$T/first-apply.txt"; exit 1; }
+cmp -s "$S/bin/wc-launch" "$T/var/lib/waycompose/installs/wct2/bin/wc-launch" && cmp -s "$S/bin/libsv_wlshim.so" "$T/var/lib/waycompose/installs/wct2/bin/libsv_wlshim.so" && ok "first migration preserves original UI and presentation binaries" || bad "original UI was replaced"
+cmp -s "$T/build-bin/wc-proxy" "$T/var/lib/waycompose/installs/wct2/bin/wc-proxy" && ok "first migration upgrades broker-dependent transport" || bad "transport was left pre-broker"
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" rollback admin wctest unused wct2 >"$T/unconfirmed-rollback.txt" 2>&1; rc=$?
 [ "$rc" != 0 ] && [ -f "$T/var/lib/waycompose/legacy-original/wct2/wc-session" ] && ok "pre-broker script is retained as history and cannot be called a tested rollback" || bad "untested legacy rollback accepted"
 app_out=$(bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps)

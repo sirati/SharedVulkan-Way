@@ -199,6 +199,13 @@ if [ "$VERB" = baseline-confirm ]; then
     [ ! -e "$snap" ] || run mv "$snap" "$snap.previous"
     run mv "$tmp" "$snap"
     run rm -rf "$snap.previous"
+    # Keep original application packages alive after a candidate replaces the
+    # live installation's GC roots. The tested baseline is a root of its own.
+    for l in "$snap"/bin/*; do
+      [ -L "$l" ] || continue
+      t=$(readlink "$l"); case "$t" in /nix/store/*) ;; *) continue ;; esac
+      if [ -n "$REAL" ]; then run nix-store --add-root "$l" --indirect -r "$t" >/dev/null; else say "  (would register baseline GC root $l -> $t)"; fi
+    done
     say "$n: confirmed tested mapped-product baseline saved; current trust and security infrastructure retained"
   done
   exit 0
