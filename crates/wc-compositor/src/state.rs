@@ -657,6 +657,8 @@ pub struct State {
     /// §104.11 with §104.12: commits whose fence wait gave up, per client
     /// (`gpu_fence::Unfinished`); such a commit is never drawn directly.
     pub(crate) fence_unfinished: crate::gpu_fence::Unfinished<ClientId>,
+    #[cfg(target_os = "macos")]
+    pub(crate) native_prime: crate::native_prime::Protocol,
     /// The damage of a surface's commit that went on unfinished, read again
     /// at its next commit (`present`).
     fence_stale: HashMap<WlSurface, Vec<Rect>>,
@@ -1180,7 +1182,15 @@ impl State {
             events,
             // §102: a single-pixel buffer is "read" like any other, and only
             // exists when the nested-compositor globals do.
-            sources: vec![Box::new(ShmSource), Box::new(SinglePixelSource)],
+            sources: {
+                #[allow(unused_mut)]
+                let mut sources: Vec<Box<dyn PixelSource>> = vec![Box::new(ShmSource), Box::new(SinglePixelSource)];
+                #[cfg(target_os = "macos")]
+                sources.push(Box::new(crate::native_prime::Source));
+                sources
+            },
+            #[cfg(target_os = "macos")]
+            native_prime: crate::native_prime::Protocol::new(dh).expect("native PRIME protocol"),
             fence_unfinished: Default::default(),
             fence_stale: HashMap::new(),
             direct: DirectPresent {
