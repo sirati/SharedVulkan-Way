@@ -64,3 +64,6 @@ mod tests {
 /// the POSIX shm backend for macOS-owned guest-RAM windows.
 #[cfg(target_os = "macos")]
 pub mod macos_pci;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod wired_holder;

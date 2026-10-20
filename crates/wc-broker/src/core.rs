@@ -103,6 +103,10 @@ pub enum Release {
     Probe { after: Option<Duration> },
 }
 
+/// Host-visible guest RAM has no elapsed-time release. Both the broker and
+/// its independent wired holder use this policy with the host release probe.
+pub const HOST_VISIBLE_RELEASE: Release = Release::Probe { after: None };
+
 /// Why a request was refused. Sent as `err <text>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal(pub String);

@@ -37147,9 +37147,27 @@ or an existing broker socket before changing either end's installed files;
 it no longer issues `launchctl bootout`. To upgrade, first end sessions and
 verify their host release, SIGTERM the daemon, wait for its exit, and prevent
 new sessions before unloading its job. Never force bootout of an old broker
-that still holds regions. A crash, explicit SIGKILL, or VM termination still
-removes this process's holds; crash-safe retention needs an independent
-holder and adoption, and is not implemented.
+that still holds regions.
+
+**Independent retention after broker death.** Before any region grant, a
+private retention process receives the already allocated shared-memory fd,
+creates its own shared mapping, independently calls `mlock`, and acknowledges
+success. It is another invocation of `wc-broker`, with no public socket,
+allocator or authorization endpoint. The broker alone decides grants and
+normal destruction. The holder uses a separate session/process group, and
+launchd's `AbandonProcessGroup` preserves it when the broker exits.
+
+Broker EOF never frees its mappings. The holder restores their metadata as
+orphans in the same `Core` lifetime engine, uses `Release::Probe { after: None }`,
+and frees only the matching user's pool when its boot page carries the host
+release word. Other pools remain wired. No deadline, signal handler or channel
+error unwinds existing holds. A missing or failed holder refuses new grants.
+This covers a broker-process crash with a surviving holder. It does not cover
+holder and broker failure together, VM termination, or the GPU server's own
+extent. A region never stamped with a boot release page may remain held
+indefinitely after broker death. New brokers do not yet re-adopt old holders;
+those holders independently wait for host release rather than freeing on
+restart.
 
 #### 111.9.4 Tests
 
@@ -37291,14 +37309,14 @@ ownership and are not automatically migrated.
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** Normal SIGTERM retains every
-  live and orphan region until release, and launchd has no automatic
-  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
-  launchd restarts it, but the new
-  process holds none of the old one's regions: a main process that dies after
-  that, before its session's release, is the §103.15 case again. The broker
-  has no state to lose otherwise. A main process could hand its fds back to a
-  new broker (`adopt` with fds); not built.
+* **Independent holder limits.** A broker-process crash leaves its separate
+  wired holder alive until host release. Simultaneous holder/broker death or
+  VM termination still loses those wires. Restarted brokers do not re-adopt
+  the old holders, so old allocations remain private to their original
+  clients until host release; missing release pages retain memory indefinitely.
+  Linux lifecycle tests do not establish Darwin physical-page stability or
+  launchd behavior. A disposable macOS VM broker-SIGKILL proof remains required
+  before claiming those runtime properties.
 * **The GPU server's own extent** is still its own superpages: kept by
   nothing if the GPU server itself crashes while `sv-hostd` serves it
   (§103.15's remaining case). Moving it into the broker would change its
