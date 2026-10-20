@@ -20,6 +20,30 @@ spec.loader.exec_module(common)
 run = common.run
 
 
+def provenance(root, output, source, bundle, manifest):
+    inputs = ['flake.lock', 'scripts/wc-local-runtime.ps1', 'scripts/wc-mingw-build.py', 'scripts/wc-cygwin-local-build.py',
+              'scripts/wc-cygwin-build.py', 'integrations/cygwin/sources.json',
+              'integrations/cygwin/packages.json', 'integrations/cygwin/ring-transport.c',
+              'integrations/cygwin/wayland-os.c']
+    manifest['build_inputs'] = {name: common.digest(REPO / name) for name in inputs}
+    manifest['generated_sources'] = {}
+    directory = bundle / 'provenance'
+    directory.mkdir(exist_ok=True)
+    for name in inputs:
+        target = directory / 'inputs' / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists(): target.chmod(0o600)
+        shutil.copyfile(REPO / name, target)
+        manifest['generated_sources'][str(target.relative_to(bundle))] = common.digest(target)
+    generated = [source / 'src/connection.c', source / 'src/wayland-client.c', output / 'config.h', output / 'abi.c']
+    if (output / 'local-transport.c').exists(): generated.append(output / 'local-transport.c')
+    for original in generated + [root / 'weston-info.c', root / 'simple-shm.c']:
+        target = directory / original.name
+        if target.exists(): target.chmod(0o600)
+        shutil.copyfile(original, target)
+        manifest['generated_sources']['provenance/' + target.name] = common.digest(target)
+
+
 def patch_descriptors(source):
     # The library wire decoder already knows every signature, including fds.
     # Local Windows peers use canonical variable-size named Section descriptors.
@@ -140,7 +164,7 @@ def build(root):
     bundle = root / 'bundle'
     bundle.mkdir(exist_ok=True)
     artifacts = [output / name for name in ['abi.exe', 'posix-probe.exe', 'weston-info.exe', 'simple-shm.exe', 'wayland-client-0.dll', 'wc-native-posix.dll']]
-    artifacts += [native / 'wc_local_client.dll']
+    artifacts += [native / 'wc_local_client.dll', native / 'wc-local-namespace.exe']
     for path in paths:
         artifacts.extend(Path(path).rglob('*.dll'))
     manifest = {'sources': pins, 'artifacts': {}, 'adapter_sources': {str(file.relative_to(REPO)): common.digest(file) for directory in ['crates/wc-local-client', 'integrations/mingw', 'integrations/windows-local'] for file in (REPO / directory).rglob('*') if file.is_file()}}
@@ -152,6 +176,7 @@ def build(root):
         if any('cygwin' in item.lower() for item in imports):
             raise RuntimeError('native binary depends on Cygwin')
         manifest['artifacts'][artifact.name] = {'sha256': common.digest(artifact), 'imports': imports}
+    provenance(root, output, source, bundle, manifest)
     (bundle / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('MINGW_ORDINARY_APP_BUILD_OK', bundle, flush=True)
 

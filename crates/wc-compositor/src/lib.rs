@@ -1824,6 +1824,14 @@ fn wayland_thread(
     let mut state =
         State::new(&dh, ui, events, debug_icon, &layout, output, output_scale, decorations, nested_globals);
 
+    #[cfg(windows)]
+    let private_directory = if std::env::var_os("WC_LOCAL_PRIVATE").is_some_and(|v| v == "1") {
+        match wc_local_client::namespace::DirectoryPin::runtime() {
+            Ok(pin) => Some(pin),
+            Err(error) => { eprintln!("wc-compositor: private local namespace: {error}"); state.quit(0); return 2; }
+        }
+    } else { None };
+
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
         None => ListeningSocket::bind_auto("wayland", 1..32),
@@ -1835,6 +1843,18 @@ fn wayland_thread(
             state.quit(0);
             return 2;
         }
+    };
+
+    #[cfg(windows)]
+    let _private_socket = match private_directory {
+        Some(directory) => {
+            let Some(name) = listener.socket_name() else { state.quit(0); return 2; };
+            match directory.seal(std::path::Path::new(name)) {
+                Ok(pin) => Some(pin),
+                Err(error) => { eprintln!("wc-compositor: private local socket: {error}"); state.quit(0); return 2; }
+            }
+        }
+        None => None,
     };
 
     #[cfg(target_os = "macos")]

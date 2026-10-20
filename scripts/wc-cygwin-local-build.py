@@ -101,7 +101,7 @@ int wc_cygwin_local_socket(const char *name) {
     obj=compile(REPO/'integrations/windows-local/posix-probe.c','posix-probe')
     link([obj,native/'libwc_local_client.dll.a'],output/'posix-probe.exe',libraries=['-lwc-local-posix'])
     bundle=root/'bundle';bundle.mkdir(exist_ok=True)
-    artifacts=[output/name for name in ['abi.exe','posix-probe.exe','weston-info.exe','simple-shm.exe','cygwayland-client-0.dll','cygwc-local-posix-0.dll']]+[native/'wc_local_client.dll',*list((sysroot/'usr/bin').glob('*.dll'))]
+    artifacts=[output/name for name in ['abi.exe','posix-probe.exe','weston-info.exe','simple-shm.exe','cygwayland-client-0.dll','cygwc-local-posix-0.dll']]+[native/'wc_local_client.dll',native/'wc-local-namespace.exe',*list((sysroot/'usr/bin').glob('*.dll'))]
     manifest={'sources':pins,'artifacts':{},'adapter_sources':{str(file.relative_to(REPO)):digest(file) for directory in ['crates/wc-local-client','integrations/cygwin-local','integrations/windows-local'] for file in (REPO/directory).rglob('*') if file.is_file()}}
     for item in artifacts:
         destination=bundle/item.name
@@ -109,6 +109,7 @@ int wc_cygwin_local_socket(const char *name) {
         shutil.copyfile(item,destination);manifest['artifacts'][item.name]={'sha256':digest(item),'imports':pe_imports(item)}
     for name in ['simple-shm.exe','weston-info.exe','cygwayland-client-0.dll']:
         if 'cygwin1.dll' not in [x.lower() for x in manifest['artifacts'][name]['imports']]:raise RuntimeError('not a genuine Cygwin ABI executable')
+    common.provenance(root,output,source,bundle,manifest)
     (bundle/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print('CYGWIN_LOCAL_ORDINARY_APP_BUILD_OK',bundle,flush=True)
 

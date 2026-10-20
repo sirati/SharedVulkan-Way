@@ -8,9 +8,13 @@ named sections. The compositor opens those sections directly.
 `wc-local-client` provides a fixed-width C ABI in
 `integrations/windows-local/wc-local-client.h`. It wraps the existing
 `wc_transport` local socket and `wc_handle` named-section implementation. It
-adds no allocator or keeper process. The socket peer must have the same OS
-user SID, obtained from its actual Windows process token. Missing peer identity
-fails closed. The local entry refuses the BAR endpoint and BAR selection env.
+adds no allocator or keeper process. Each endpoint lives in a protected full-SID directory. The adapter audits its
+owner, DACL and ancestry, rejects reparse directories, and retains directory
+and exact socket file handles that prevent replacement. The server seals the
+AF_UNIX socket to the current SID and SYSTEM before publishing readiness.
+Clients audit and pin that actual socket before connecting. Windows enforces
+socket write access on connection. This uses filesystem access control, not a
+PID lookup. Other users and unsupported ACLs fail closed. The local entry refuses the BAR endpoint and BAR selection env.
 
 Section descriptors use the existing canonical variable-length codec. This
 boundary accepts only bounded `Local\wc-` Section names, not raw HANDLEs,

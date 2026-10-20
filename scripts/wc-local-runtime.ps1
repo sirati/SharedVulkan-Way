@@ -44,17 +44,33 @@ function Set-State([string]$kind,[bool]$cygwin){
  $base=Join-Path $Root "state\$kind"
  if($cygwin){$base='/cygdrive/'+$base.Substring(0,1).ToLowerInvariant()+$base.Substring(2).Replace('\','/')}
  $env:HOME="$base/home";$env:XDG_CONFIG_HOME="$base/config";$env:XDG_DATA_HOME="$base/data"
- $env:XDG_STATE_HOME="$base/state";$env:XDG_CACHE_HOME="$base/cache";$env:XDG_RUNTIME_DIR="$base/runtime"
+ $env:XDG_STATE_HOME="$base/state";$env:XDG_CACHE_HOME="$base/cache"
+ $runtime=$privateRuntime[$kind]
+ if($runtime){
+  if($cygwin){$runtime='/cygdrive/'+$runtime.Substring(0,1).ToLowerInvariant()+$runtime.Substring(2).Replace('\','/')}
+  $env:XDG_RUNTIME_DIR=$runtime
+ }else{$env:XDG_RUNTIME_DIR="$base/runtime"}
+ $env:WC_LOCAL_PRIVATE='1'
  $env:LOCALAPPDATA=Join-Path $Root "state\$kind\local"
  foreach($name in @('WC_BROKER','WC_WAYLAND_RING','WC_CYGWIN_RUN','WC_CYGWIN_ARENA_ID','WAYLAND_SOCKET','SV_SOCKET','SV_BELL')){Remove-Item "Env:$name" -ErrorAction SilentlyContinue}
 }
 $results=@()
+$privateRuntime=@{}
 foreach($kind in @('mingw','cygwin')){
  $bin=Join-Path $Root $kind
  $manifest=Get-Content -Raw -LiteralPath (Join-Path $bin 'manifest.json')|ConvertFrom-Json
  foreach($entry in $manifest.artifacts.PSObject.Properties){
   if((Get-FileHash -LiteralPath (Join-Path $bin $entry.Name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value.sha256){throw ('artifact differs: '+$kind+'/'+$entry.Name)}
  }
+ foreach($entry in $manifest.generated_sources.PSObject.Properties){
+  if((Get-FileHash -LiteralPath (Join-Path $bin $entry.Name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value){throw ('source receipt differs: '+$kind+'/'+$entry.Name)}
+ }
+ Set-State $kind $false
+ $setup=Start-Owned (Join-Path $bin 'wc-local-namespace.exe') @($env:XDG_RUNTIME_DIR) "$kind-namespace"
+ try {Wait-Owned $setup 15} finally {if(-not $setup.p.HasExited){$setup.p.Kill();$setup.p.WaitForExit()};Save-Owned $setup;$setup.p.Dispose()}
+ $runtime=(Get-Content -Raw (Join-Path $e "$kind-namespace.stdout")).Trim()
+ if($runtime -notmatch '^[A-Za-z]:\\' -or [Text.Encoding]::UTF8.GetByteCount($runtime+'/local-'+$kind+'-shm') -ge 108){throw 'invalid or overlong private runtime'}
+ $privateRuntime[$kind]=$runtime
  Set-State $kind ($kind -eq 'cygwin')
  $probe=Start-Owned (Join-Path $bin 'abi.exe') @() "$kind-abi"
  try {Wait-Owned $probe 15} finally {if(-not $probe.p.HasExited){$probe.p.Kill();$probe.p.WaitForExit()};Save-Owned $probe;$probe.p.Dispose()}

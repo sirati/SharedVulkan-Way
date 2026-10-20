@@ -1768,6 +1768,7 @@ dependencies = [
  "wc-handle",
  "wc-hostint",
  "wc-hostplat",
+ "wc-local-client",
  "wc-transport",
  "windows-sys",
 ]

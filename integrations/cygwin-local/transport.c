@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/cygwin.h>
+#include <windows.h>
 static int local_child;
 static uint64_t connection;
 static const char *connecting_name;
@@ -34,21 +35,19 @@ int wc_local_transport_open(void) {
   }
   if (!path)
     return -1;
-  ssize_t size = cygwin_conv_path(CCP_POSIX_TO_WIN_A, path, NULL, 0);
-  if (size <= 0) {
-    free(path);
-    return -1;
+  ssize_t size = cygwin_conv_path(CCP_POSIX_TO_WIN_W, path, NULL, 0);
+  if (size <= 0) { free(path); return -1; }
+  void *native_wide = malloc((size_t)size);
+  if (!native_wide) { free(path); return -1; }
+  if (cygwin_conv_path(CCP_POSIX_TO_WIN_W, path, native_wide, (size_t)size)) {
+    free(native_wide); free(path); return -1;
   }
-  char *native = malloc((size_t)size);
-  if (!native) {
-    free(path);
-    return -1;
-  }
-  int result = cygwin_conv_path(CCP_POSIX_TO_WIN_A, path, native, (size_t)size)
-                   ? -1
-                   : wc_local_connect((const uint8_t *)native,
-                                      (uint32_t)strlen(native), &connection);
-  free(native);
+  int length=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,(LPCWCH)native_wide,-1,NULL,0,NULL,NULL);
+  char *native=length>0?malloc((size_t)length):NULL;
+  int result=-1;
+  if(native && WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,(LPCWCH)native_wide,-1,native,length,NULL,NULL)>0)
+    result=wc_local_connect((const uint8_t *)native,(uint32_t)length-1,&connection);
+  free(native); free(native_wide);
   free(path);
   return result;
 }

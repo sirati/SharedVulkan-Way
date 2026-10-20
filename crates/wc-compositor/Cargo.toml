@@ -79,6 +79,7 @@ objc2-app-kit = "0.3"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
+wc-local-client = { path = "../wc-local-client" }
 # §106: the host's platform calls for host integration (endpoints, the shell opener, handlers).
 wc-hostplat = { workspace = true }
 # §111.8: the arena device and the wcbell port, lent by the broker.

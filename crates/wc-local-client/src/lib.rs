@@ -5,6 +5,9 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use wc_handle::{Descriptor, Handle, Mapping, MappingMut};
 
+#[cfg(windows)]
+pub mod namespace;
+
 const LIMIT: usize = 256;
 const MAX_DESCRIPTOR: usize = 4096;
 const MAX_SECTION: u64 = 1 << 30;
@@ -36,6 +39,8 @@ impl<T> Table<T> {
 }
 struct Connection {
     stream: wc_transport::Stream,
+    #[cfg(windows)]
+    _namespace: namespace::SocketPin,
 }
 enum View {
     Read(Mapping),
@@ -266,78 +271,16 @@ pub extern "C" fn wc_local_unmap(id: u64) -> i32 {
 }
 
 #[cfg(windows)]
-fn same_user(stream: &wc_transport::Stream) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::CloseHandle,
-        Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
-        System::Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        },
-    };
-    struct Owned(windows_sys::Win32::Foundation::HANDLE);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    fn token(process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Owned> {
-        let mut out = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut out) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Owned(out))
-    }
-    fn user(token: &Owned) -> io::Result<Vec<u64>> {
-        let mut size = 0;
-        unsafe {
-            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut size);
-        }
-        if size == 0 || size > 65536 {
-            return Err(io::Error::other("invalid token SID size"));
-        }
-        let mut data = vec![0u64; (size as usize).div_ceil(8)];
-        if unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                data.as_mut_ptr().cast(),
-                size,
-                &mut size,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(data)
-    }
-    let peer = wc_transport::peer_credentials(stream)?;
-    if peer.pid == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "local peer PID unavailable",
-        ));
-    }
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, peer.pid) };
-    if process.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let process = Owned(process);
-    let mine = user(&token(unsafe { GetCurrentProcess() })?)?;
-    let theirs = user(&token(process.0)?)?;
-    let mine = unsafe { &*mine.as_ptr().cast::<TOKEN_USER>() };
-    let theirs = unsafe { &*theirs.as_ptr().cast::<TOKEN_USER>() };
-    if unsafe { EqualSid(mine.User.Sid, theirs.User.Sid) } == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "local peer belongs to another SID",
-        ));
-    }
-    Ok(())
+fn connect_local(path: &std::path::Path) -> io::Result<Arc<Connection>> {
+    let pin = namespace::SocketPin::open(path)?;
+    let stream = wc_transport::connect(path)?;
+    Ok(Arc::new(Connection {
+        stream,
+        _namespace: pin,
+    }))
 }
 #[cfg(not(windows))]
-fn same_user(_: &wc_transport::Stream) -> io::Result<()> {
+fn connect_local(_: &std::path::Path) -> io::Result<Arc<Connection>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows local endpoint only",
@@ -362,10 +305,8 @@ pub unsafe extern "C" fn wc_local_connect(path: *const u8, length: u32, out: *mu
     {
         return -1;
     }
-    let result = wc_transport::connect(std::path::Path::new(path)).and_then(|stream| {
-        same_user(&stream)?;
-        lock().connections.insert(Arc::new(Connection { stream }))
-    });
+    let result =
+        connect_local(std::path::Path::new(path)).and_then(|c| lock().connections.insert(c));
     match result {
         Ok(id) => {
             unsafe { out.write(id) };
