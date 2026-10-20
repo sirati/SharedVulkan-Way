@@ -116,6 +116,9 @@ This does not solve crash safety for the separate wired guest-RAM backend.
 
 ## Broker and ICD attachment
 
+The multi-user capability is held. The preparatory VM-wide single-uid gate
+below is mandatory and does not complete per-range ownership.
+
 The root broker can publish an explicitly configured BAR2 slice with
 `serve --pci-slice UID:POOL:REGISTRY:OFFSET:LEN:EPOCH`. Integers accept decimal
 or `0x` hexadecimal. Registry IDs identify `WCIVSHMEM` devices, not arbitrary
@@ -158,7 +161,9 @@ Doorbell writes stay in the root broker and require the same lease. Application
 producer calls enqueue a coalesced hint without blocking on Mach IPC. One
 root IOKit async IRQ owner per PCI registry ID shares counted hints among its
 published slices. A bounded Mach wait retains the mapping while sleeping
-outside the Core lock, then rechecks the lease before replying. The client
+outside the Core lock, then rechecks the lease before replying. Eight wait
+workers have a separate bounded queue from two immediate-operation workers,
+so blocked IRQ waits cannot occupy redemption or outgoing-bell capacity. The client
 rescans its process-owned control set and cold mailbox on each changed IRQ
 count. Wait expiry does not release a mapping or a region lease. This entire
 Mach/IRQ path is offline-compiled only and requires the runtime proof below.
@@ -201,3 +206,39 @@ stability over growth, GPU lease retirement, broker death/reconnect, MSI wake
 counts and idle round-trip latency. A real Mac or daily-use VM must not be used
 to bypass these gates. Stock applications, their sandbox, and stock Zink Mesa
 remain unchanged.
+
+## Preparatory ownership restriction: multi-user lending held
+
+Mach rights and receiver mappings can outlive the Unix lease and the broker.
+A guest reboot also does not drain persistent host backing or host GPU writers.
+The current ivshmem ABI has no trusted host-backing identity that survives
+registry/service aliases, PCI address relocation and guest boots. Registry IDs,
+BAR addresses, pool headers writable by clients, and boot IDs cannot establish
+that identity or prove safe reassignment.
+
+Consequently this candidate does **not** complete multi-user per-range lending.
+Publication and the Mach service fail closed unless the existing read-only
+`/Library/Application Support/waycompose/pci-vm-owner` anchor restricts every
+PCI backing in the VM permanently to one uid. This is deliberately broader
+than a device or slice. A different uid is refused even for disjoint ranges,
+new registry IDs, other devices, aliases, relocated BARs or another boot.
+The shared broker crate's immutable raw-device snapshot policy enforces it;
+there is no second daemon or watcher.
+
+The staging snapshot version is `wc-pci-vm-owner-preparatory-v1`, with exactly
+one tab-separated row binding `all-pci-backings` to a canonical `uid:N`.
+All ancestor directories must be root-owned and not writable by group/others;
+the anchor must be a root-owned regular 0400 file with one link. Nonempty macOS extended ACLs are also refused, including on ancestors. Symlinks,
+missing, malformed, oversized, ambiguous or untrusted state grant nothing.
+The broker never writes, provisions, clears, resets or reassigns this state.
+Initial provisioning or any change requires a separately admitted host drain,
+backing reset/zero proof and ownership migration; none is authorized or
+performed by this candidate. Deleting state disables lending, not enrollment.
+
+Completing the intended multi-user capability needs a trusted host-supplied
+canonical backing identity and relative physical range, outside client-writable
+memory, with identical identity for every alias and persistence across guest
+boots/PCI relocation. That identity must feed the shared broker's durable
+per-range uid policy before publication/export. Reassignment additionally needs
+a proven host GPU drain and backing reset/zero boundary. Until then the
+single-uid gate is preparatory and the multi-user capability remains held.

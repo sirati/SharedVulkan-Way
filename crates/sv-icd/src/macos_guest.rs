@@ -179,6 +179,7 @@ impl Attached {
             .ok_or("the GPU owner did not answer arena mode")?;
         if info.mode != sv_proto::sv::ARENA_MODE_LEASED
             || info.capacity > t.arena.len() as u64
+            || info.max_capacity > t.arena.len() as u64
             || info.lease_granule == 0
             || !info.lease_granule.is_power_of_two()
             || info.session_cap == 0

@@ -259,6 +259,8 @@ impl Irq {
 /// Export is probed before publication; refusal never substitutes new backing.
 pub fn publish(broker:&crate::server::Broker<super::unix::Unix>, user:crate::core::User, pool:&str,
     epoch:u64, registry:u64, offset:u64, len:u64) -> io::Result<crate::core::ObjId> {
+    super::pci_owner::load()?.authorize(&user)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied,e))?;
     let mapping = std::sync::Arc::new(Device::open(registry)?.map(offset, len)?);
     drop(mapping.memory_entry()?);
     Ok(broker.publish(user, pool, epoch, vec![(super::unix::Object::MachRegion(mapping), 0, len)]))

@@ -72,3 +72,8 @@ pub mod wired_holder;
 pub mod macos_mach;
 
 mod machwire;
+
+mod machworkers;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod pci_owner;

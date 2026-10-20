@@ -106,6 +106,7 @@ pub fn start(broker: Broker<Unix>) -> io::Result<()> {
             "Mach lender must run as root",
         ));
     }
+    let owner = super::pci_owner::load()?;
     let name = CString::new(SERVICE).unwrap();
     let mut port = 0;
     mach::check(
@@ -113,19 +114,9 @@ pub fn start(broker: Broker<Unix>) -> io::Result<()> {
         "bootstrap_check_in",
     )?;
     let right = ReceiveRight(port);
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Buffer>(64);
-    let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
-    for n in 0..8 {
-        let broker = broker.clone();
-        let receiver = std::sync::Arc::clone(&receiver);
-        std::thread::Builder::new()
-            .name(format!("wc-mach-lend-{n}"))
-            .spawn(move || loop {
-                let packet = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(mut buffer) = packet else { break };
-                let _ = serve_one(&broker, &mut buffer);
-            })?;
-    }
+    let workers = super::machworkers::Workers::new(move |mut buffer: Buffer| {
+        let _ = serve_one(&broker, &owner, &mut buffer);
+    })?;
     std::thread::Builder::new()
         .name("wc-mach-lender".into())
         .spawn(move || {
@@ -139,20 +130,32 @@ pub fn start(broker: Broker<Unix>) -> io::Result<()> {
                             io::ErrorKind::TimedOut | io::ErrorKind::InvalidData
                         ) =>
                     {
-                        continue
+                        continue;
                     }
                     Err(error) => {
                         eprintln!("[wc-broker] Mach lender stopped: {error}");
                         break;
                     }
                 };
-                let _ = sender.try_send(buffer);
+                // Classify only structurally valid requests. Each worker still
+                // authenticates the kernel audit identity and checks Core.
+                let request = unsafe { ptr::read(buffer.bytes.as_ptr().cast::<Request>()) };
+                if request.validate().is_ok() {
+                    let _ = workers.submit(request.op, buffer);
+                }
             }
         })?;
     Ok(())
 }
-fn serve_one(broker: &Broker<Unix>, buffer: &mut Buffer) -> io::Result<()> {
+fn serve_one(
+    broker: &Broker<Unix>,
+    owner: &crate::raw_device::VmPciOwner,
+    buffer: &mut Buffer,
+) -> io::Result<()> {
     let peer = buffer.audit()?;
+    owner
+        .authorize(&peer.user)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
     let req = unsafe { ptr::read(buffer.bytes.as_ptr().cast::<Request>()) };
     req.validate()?;
     let mut reply = Reply {
