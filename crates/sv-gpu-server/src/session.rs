@@ -608,7 +608,17 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     // `Forward` is the generated half: 221 of the 239 commands are answered
     // inside it, and `GpuServer` supplies only the eighteen whose meaning is
     // ours (docs/design.md §7.2 pass 12).
-    let mut srv = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
+    let mut host = GpuServer::new(Arc::clone(&shared));
+    #[cfg(target_os = "macos")]
+    {
+        let control = Arc::clone(&control);
+        host.native_fatal = Some(Arc::new(move |error| {
+            if let Ok(ctrl) = RingCtrl::open(&control, slot) {
+                let _ = ctrl.set_fatal(1, 0, &format!("native queue execution failed: {error:?}"));
+            }
+        }));
+    }
+    let mut srv = sv_gpu_entry::Forward::new(host);
     let mut handled = 0u64;
     let mut reply = Vec::new();
     // The blob is copied out of the arena before it is decoded, into a buffer
