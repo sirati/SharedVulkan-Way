@@ -149,6 +149,14 @@ impl SealedBacking {
 // SAFETY: constructor retains the independently authenticated original owner;
 // fstat/seals prevent substitution/resizing, and all offsets use physical bytes.
 unsafe impl OriginalBacking for SealedBacking {
+    fn validate_live_source(&self) -> io::Result<()> {
+        if self.live_owner.is_none() {
+            return Err(unsupported(
+                "original has no requeryable native source owner",
+            ));
+        }
+        self.validate()
+    }
     fn geometry(&self) -> BackingGeometry {
         self.geometry
     }
@@ -505,7 +513,9 @@ mod tests {
         let owner = Arc::new(Watch(std::sync::atomic::AtomicBool::new(true)));
         let original =
             unsafe { SealedBacking::from_live_original(file, geometry, owner.clone()).unwrap() };
+        original.validate_live_source().unwrap();
         owner.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(original.validate_live_source().is_err());
         assert!(original.initialize_zeroed(4096, 8192).is_err());
         let mut bytes = [0; 16384];
         original.original.read_exact_at(&mut bytes, 0).unwrap();
@@ -517,6 +527,10 @@ mod tests {
         file.write_all_at(&[0x91; 16384], 0).unwrap();
         let original =
             unsafe { SealedBacking::from_original(file, geometry, Arc::new(())).unwrap() };
+        assert_eq!(
+            original.validate_live_source().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         for (offset, length) in [
             (0, 4096),
             (4097, 4096),

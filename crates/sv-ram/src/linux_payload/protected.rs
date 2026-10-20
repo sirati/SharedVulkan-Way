@@ -111,7 +111,11 @@ impl ProtectedProvider {
 // The exact retained File pins that fops/module instance, whose CREATE IDs are
 // global, strictly monotonic, nonwrapping and never reused. No discovery export
 // or caller-supplied instance establishes this authority.
-unsafe impl NativeProviderAuthority for ProtectedProvider {}
+unsafe impl NativeProviderAuthority for ProtectedProvider {
+    fn validate_live_provider(&self) -> io::Result<()> {
+        self.validate()
+    }
+}
 
 /// Retains a trusted private-overlay device and exact current service target.
 /// There is no stock-ABI or pathname fallback.
@@ -126,7 +130,7 @@ impl ProtectedBackend {
     /// as the reviewed overlay instance, its loaded source/build and native
     /// proof, including fops module ownership, one immutable instance per module
     /// lifetime, strictly monotonic nonwrapping CREATE IDs, and irreversible
-    /// all-alias/native-hold/fence retirement with no later remap. The retained
+    /// all-alias/native-hold/fence retirement with no later remap of that export. The retained
     /// raw File must pin that module lifetime. An ioctl number or caller pathname
     /// does not authenticate a module.
     /// `local` must obey its protected-service enrollment/fork contract.
