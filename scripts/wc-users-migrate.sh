@@ -93,7 +93,7 @@ DGROUP=$(id -gn "$DESK" 2>/dev/null || echo "$DESK")
 # The paths under the admin's home an installation's apps.ini names, as the
 # unit to move: ~/.wc-launch/<profile>, else the first directory under ~.
 user_data() { # APPS.INI BASE
-  grep -oE "$AH_REAL/[^ ;:\"']+" "$1" 2>/dev/null | while read -r p; do
+  { grep -oE "$AH_REAL/[^ ;:\"']+" "$1" 2>/dev/null || [ "$?" = 1 ]; } | while read -r p; do
     case "$p" in "$2"/*|"$2") continue ;; esac
     r=${p#"$AH_REAL"/}
     case "$r" in
@@ -326,7 +326,7 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
       # Absolute paths inside it (Prism's configs, recorded launches, the
       # wrapper, Firefox's prefs) name the new home.
       if [ -z "$DRY" ]; then
-        grep -rlIZ "$AH_REAL/$u" "$dst" 2>/dev/null | xargs -0 -r sed -i "s|$AH_REAL/$u|$DH_REAL/$u|g"
+        { grep -rlIZ "$AH_REAL/$u" "$dst" 2>/dev/null || [ "$?" = 1 ]; } | xargs -0 -r sed -i "s|$AH_REAL/$u|$DH_REAL/$u|g"
       else
         say "  (would rewrite $AH_REAL/$u -> $DH_REAL/$u in $(grep -rlI "$AH_REAL/$u" "$src" 2>/dev/null | wc -l) text file(s))"
       fi
