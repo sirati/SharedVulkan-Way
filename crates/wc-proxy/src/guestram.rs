@@ -373,9 +373,8 @@ pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::i
 }
 
 fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle::ivshmem::Header, u64)> {
-    use std::io::Read;
     use wc_handle::ivshmem::{ENCODED_LEN, Header};
-    let mut f = open_backing(path, false).map_err(|e| {
+    let f = open_backing(path, false).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -387,7 +386,8 @@ fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle:
     })?;
     let file_len = f.metadata()?.len();
     let mut b = [0u8; ENCODED_LEN];
-    f.read_exact(&mut b)?;
+    // Positional: a broker region's fds share one file offset (§111.10).
+    std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 0)?;
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
     let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
     if h.run_id != expected_run {

@@ -109,6 +109,10 @@ mod process {
 
     /// Open `path` read-write: region `ID` of the broker for `broker:ID`
     /// (its fd, asked for once and duplicated after), else the file.
+    ///
+    /// Every fd of one region, in every process, is the same open file
+    /// description and so shares one file offset: use `mmap` or positional
+    /// I/O (`read_exact_at`), never `read`/`seek`.
     pub fn open_path(path: &std::path::Path) -> io::Result<std::fs::File> {
         let Some(id) = region_spec(path) else {
             return std::fs::OpenOptions::new().read(true).write(true).open(path);

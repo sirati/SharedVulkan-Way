@@ -93,7 +93,7 @@ start_hub() {
   for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
 }
 start_service() {
-  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
     ${1:+--bell "$1"} --poll-ms "${2:-1000}" >>"$D/sessiond.log" 2>&1 &
   SVC=$!; PIDS+=("$SVC")
 }

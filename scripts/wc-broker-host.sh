@@ -82,6 +82,7 @@ start_port() {
   printf '#!/usr/bin/env bash\nwhile true; do %q - UNIX-LISTEN:%q,unlink-early 2>/dev/null; done\n' "$SOCAT" "$D/host.sock" >"$D/qemu-host-end.sh"
   chmod +x "$D/qemu-host-end.sh"
   "$SOCAT" UNIX-LISTEN:"$D/guest.sock" EXEC:"$D/qemu-host-end.sh" &
+  PORT=$!
   PIDS+=("$!")
   for _ in $(seq 1 50); do [ -S "$D/guest.sock" ] && break; sleep 0.1; done
 }
@@ -103,16 +104,20 @@ start_agent() {
 }
 start_service() { # USERS-CONF [EXTRA...]
   local conf=$1; shift
+  local before; before=$(grep -c "\[wc-broker\] run .*: serving" "$D/sessiond.log" 2>/dev/null)
   [ -n "${SVC:-}" ] && { kill "$SVC" 2>/dev/null; wait "$SVC" 2>/dev/null; }
-  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
     --bell "$D/hub/wl.sock" --poll-ms 60000 --users "$conf" --server testvm --agents "$D/agents" \
     --broker "$D/broker.sock" --gpu-region "$D/gpu" --hub-wl "$D/hub/wl.sock" "$@" >>"$D/sessiond.log" 2>&1 &
   SVC=$!; PIDS+=("$SVC")
-  for _ in $(seq 1 50); do [ -S "$D/broker.sock" ] && grep -q 'serving' "$D/sessiond.log" && break; sleep 0.1; done
+  for _ in $(seq 1 100); do [ "$(grep -c "\[wc-broker\] run .*: serving" "$D/sessiond.log" 2>/dev/null)" -gt "${before:-0}" ] && break; sleep 0.1; done
+  sleep 0.5
 }
 # compositor TAG INSTALL KEYSPEC
 start_compositor() {
   local tag=$1 inst=$2 key=$3
+  # The guest's port takes one holder, as virtio-serial does: a new one each time.
+  [ -n "${PORT:-}" ] && { kill "$PORT" 2>/dev/null; wait "$PORT" 2>/dev/null; start_port; }
   rm -f "$D/arena" "$D/ctl-$tag.sock"
   truncate -s $((128 << 20)) "$D/arena"
   XDG_RUNTIME_DIR="$D/crt" WC_IVSHMEM_STANDIN="$D/arena" "$BIN/wc-compositor" \
@@ -122,7 +127,9 @@ start_compositor() {
     --control-socket "$D/ctl-$tag.sock" --session-audio 0 >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
 }
-stop_compositor() { kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null; }
+# A stopped compositor's waiting record stays in the file: take the file away
+# too, or the next service serves the old record.
+stop_compositor() { kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null; rm -f "$D/arena"; }
 wait_line() { # FILE REGEX SECS
   local i; for i in $(seq 1 $(($3 * 10))); do grep -qE "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1
 }
@@ -145,7 +152,7 @@ T0=$(date +%s%N)
 R=$(boot_result a)
 case "$R" in
   *located*) ok "located in $(( ($(date +%s%N) - T0) / 1000000 )) ms: ${R:0:120}" ;;
-  *) bad "leg 1 boot: $R"; tail -5 "$D/sessiond.log" "$D/agent.log" ;;
+  *) bad "leg 1 boot: $R"; tail -n 5 "$D/sessiond.log" "$D/agent.log" ;;
 esac
 grep -q "the broker signed the record for os=linux user=$ME id=$MYUID" "$D/comp-a.log" \
   && ok "the server broker signed for os=linux user=<me> id=<my uid>" || bad "no signed identity in the compositor's log"
@@ -172,7 +179,7 @@ fi
 R=$(request a "raw status"); case "$R" in ok-raw*) ok "status round trip" ;; *) bad "status: $R" ;; esac
 
 say "leg 1b: the lease ends the session; the agent says ended; the regions go"
-kill -9 "$COMP"; wait "$COMP" 2>/dev/null
+kill -9 "$COMP"; wait "$COMP" 2>/dev/null; rm -f "$D/arena"
 wait_line "$D/sessiond.log" "session wcbh-$$-a ended" 25 && ok "service: $(grep -o "session wcbh-$$-a ended.*" "$D/sessiond.log" | cut -c1-100)" || bad "the service never heard the session end"
 grep -q "region [0-9]*: the broker's handle is closed" "$D/sessiond.log" && ok "the session's regions were unpublished" || bad "no region was unpublished"
 

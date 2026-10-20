@@ -61,6 +61,9 @@ struct Args {
     /// §108 through §111.10: the guest-RAM substrate's flags, for the
     /// embedded component that serves them (`embedded()`).
     guest_ram: wc_broker::host::GuestRam,
+    /// Where the sessions it started itself are recorded (default
+    /// `$XDG_RUNTIME_DIR/wc-sessiond/live`).
+    live: Option<PathBuf>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -81,6 +84,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         hub_wl: None,
         hub_sv: None,
         guest_ram: Default::default(),
+        live: None,
     };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
@@ -102,6 +106,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--gpu-region" => a.gpu_region = Some(v()?.into()),
             "--hub-wl" => a.hub_wl = Some(v()?.into()),
             "--hub-sv" => a.hub_sv = Some(v()?.into()),
+            "--live" => a.live = Some(v()?.into()),
             "--guest-ram-boot" => a.guest_ram.boot = Some(v()?.into()),
             "--guest-ram-qemu-pid" | "--guest-ram-qemu-pidfile" | "--guest-ram" => {
                 use wc_broker::host::QemuRam;
@@ -575,8 +580,13 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     } else {
         say("NO DOORBELL HUB given: the arena's header page is read every poll interval only");
     }
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let mut live = Live::load(runtime.join("wc-sessiond/live"));
+    // The sessions this service started itself (not through an agent), so a
+    // restarted service still ends them. `--live`: a harness keeps its own.
+    let live_dir = args.live.clone().unwrap_or_else(|| {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        runtime.join("wc-sessiond/live")
+    });
+    let mut live = Live::load(live_dir);
     if !live.map.is_empty() {
         say(&format!("adopted running session(s): {:?}", live.map.keys().collect::<Vec<_>>()));
     }
