@@ -16,6 +16,7 @@ use std::os::unix::{
     net::{UnixListener, UnixStream},
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sv_transport::{
@@ -28,15 +29,92 @@ use sv_transport::{
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Default)]
-struct Bells(Mutex<Vec<UnixStream>>);
+// Match the existing pool endpoint's default session count. A retained unsafe
+// session keeps its admission slot, so repeated drain failures cannot grow the
+// server's quarantined GPU/backing ownership beyond this same finite budget.
+const DEFAULT_SESSIONS: usize = 8;
+struct Budget {
+    limit: usize,
+    used: AtomicUsize,
+    retained: AtomicUsize,
+}
+impl Budget {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit,
+            used: AtomicUsize::new(0),
+            retained: AtomicUsize::new(0),
+        })
+    }
+    fn acquire(self: &Arc<Self>) -> Option<Permit> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < self.limit).then_some(used + 1)
+            })
+            .ok()?;
+        Some(Permit {
+            budget: self.clone(),
+            release: true,
+        })
+    }
+}
+struct Permit {
+    budget: Arc<Budget>,
+    release: bool,
+}
+impl Permit {
+    fn quarantine(&mut self, reason: &str) {
+        self.release = false;
+        let retained = self.budget.retained.fetch_add(1, Ordering::AcqRel) + 1;
+        eprintln!(
+            "[gpu] hl retained {retained}/{} admission slots: {reason}",
+            self.budget.limit
+        );
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if self.release {
+            self.budget.used.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+struct Bells {
+    peers: Mutex<Vec<(u64, UnixStream)>>,
+    next: AtomicU64,
+    budget: Arc<Budget>,
+}
+impl Bells {
+    fn new(limit: usize) -> Self {
+        Self {
+            peers: Mutex::new(Vec::new()),
+            next: AtomicU64::new(0),
+            budget: Budget::new(limit),
+        }
+    }
+    fn remove(&self, id: u64) {
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.retain(|(key, _)| *key != id);
+        }
+    }
+}
+struct BellRegistration {
+    writers: Arc<Bells>,
+    id: u64,
+    _permit: Permit,
+}
+impl Drop for BellRegistration {
+    fn drop(&mut self) {
+        self.writers.remove(self.id);
+    }
+}
 impl CrossWake for Bells {
     fn poke(&self, _token: u8) {
         // A queued rescan covers all publications, including a later send
         // coalesced because the socket buffer is already full.
         let token = sv_transport::park::RESCAN_TOKEN;
-        if let Ok(mut peers) = self.0.lock() {
-            peers.retain_mut(|p| {
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.retain_mut(|(_, p)| {
                 #[cfg(target_os = "linux")]
                 let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
                 #[cfg(target_os = "macos")]
@@ -88,6 +166,42 @@ fn same_user(s: &UnixStream) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+type Accepted = (UnixStream, Permit);
+fn reject(sock: &UnixStream, reason: &str) {
+    let _ = sock.set_nonblocking(true);
+    let _ = send(
+        sock,
+        &ColdMessage::Refuse {
+            code: libc::EBUSY as u32,
+            reason: reason.into(),
+        },
+    );
+}
+fn admit(
+    sock: UnixStream,
+    queue: &std::sync::mpsc::SyncSender<Accepted>,
+    budget: &Arc<Budget>,
+) -> bool {
+    if same_user(&sock).is_err() {
+        return false;
+    }
+    let Some(permit) = budget.acquire() else {
+        reject(
+            &sock,
+            "all native GPU session slots are occupied or retained",
+        );
+        return false;
+    };
+    match queue.try_send((sock, permit)) {
+        Ok(()) => true,
+        Err(error) => {
+            let (std::sync::mpsc::TrySendError::Full((sock, _))
+            | std::sync::mpsc::TrySendError::Disconnected((sock, _))) = error;
+            reject(&sock, "native GPU admission queue is full");
+            false
+        }
+    }
 }
 fn private_dir(path: &Path) -> io::Result<()> {
     let st = std::fs::symlink_metadata(path)?;
@@ -172,6 +286,11 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("GPU sockets must be directly inside the private runtime directory".into());
     }
+    let max_sessions = arg("--sessions").map_or(Ok(DEFAULT_SESSIONS), |s| s.parse::<usize>())?;
+    if !(1..=64).contains(&max_sessions) {
+        return Err("--sessions must be between 1 and 64".into());
+    }
+    let budget = Budget::new(max_sessions);
     let bytes = arg("--arena").map_or(Ok(64 << 20), |s| s.parse::<u64>())?;
     let geometry = super::geometry_for(bytes);
     let total = geometry
@@ -183,7 +302,7 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // Bind every endpoint before starting workers so name conflicts unwind.
     let relay = Endpoint::bind(&format!("{socket}.relay"))?;
     let controls = ControlSet::new();
-    let writers = Arc::new(Bells::default());
+    let writers = Arc::new(Bells::new(max_sessions));
     sv_transport::park::install_cross_wake(Some(writers.clone()));
     let set = controls.clone();
     let bell_writers = writers.clone();
@@ -195,16 +314,15 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = attach_bell(reader, &set, &bell_writers);
             }
         })?;
-    let (accepted, clients) = std::sync::mpsc::channel();
+    let (accepted, clients) = std::sync::mpsc::sync_channel(max_sessions);
     let direct = accepted.clone();
+    let direct_budget = budget.clone();
     std::thread::Builder::new()
         .name("hl-gpu-accept".into())
         .spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(sock) = incoming else { break };
-                if direct.send(sock).is_err() {
-                    break;
-                }
+                let _ = admit(sock, &direct, &direct_budget);
             }
         })?;
     let relay_set = controls.clone();
@@ -241,28 +359,35 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let accepted = match tag {
-                    1 => accepted.send(sock).is_ok(),
+                    1 => admit(sock, &accepted, &budget),
                     2 => attach_bell(sock, &relay_set, &writers).is_ok(),
                     _ => false,
                 };
                 let _ = request.write_all(&[if accepted { 0 } else { 1 }]);
             }
         })?;
-    for (sequence, sock) in clients.iter().enumerate() {
+    for (sequence, (sock, permit)) in clients.iter().enumerate() {
         if same_user(&sock).is_err() {
             continue;
         }
         let runtime = runtime.clone();
         let controls = controls.clone();
-        std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("hl-gpu-session".into())
             .spawn(move || {
-                if let Err(e) =
-                    serve_one(sock, &runtime, sequence as u64, total, geometry, controls)
-                {
+                if let Err(e) = serve_one(
+                    sock,
+                    &runtime,
+                    sequence as u64,
+                    total,
+                    geometry,
+                    controls,
+                    permit,
+                ) {
                     eprintln!("[gpu] hl session {sequence}: {e}");
                 }
-            })?;
+            })
+            .map_err(|e| eprintln!("[gpu] cannot start bounded native session worker: {e}"));
     }
     Ok(())
 }
@@ -274,6 +399,7 @@ fn serve_one(
     total: u64,
     geometry: sv_transport::control::Geometry,
     controls: Arc<ControlSet>,
+    mut permit: Permit,
 ) -> Result<(), Error> {
     sock.set_read_timeout(Some(Duration::from_secs(30)))?;
     let by_fd = match recv(&sock)? {
@@ -380,6 +506,7 @@ fn serve_one(
         Ok(s) => s,
         Err(s) => {
             std::mem::forget(s);
+            permit.quarantine("live GPU workers retained session backing");
             return Err("live GPU workers retained session backing".into());
         }
     };
@@ -391,6 +518,7 @@ fn serve_one(
         });
     if !clean {
         std::mem::forget(shared);
+        permit.quarantine("undrained GPU session backing retained");
         return Err("undrained GPU session backing retained".into());
     }
     unsafe {
@@ -444,6 +572,11 @@ fn attach_bell(
     writers: &Arc<Bells>,
 ) -> io::Result<()> {
     same_user(&reader)?;
+    let permit = writers
+        .budget
+        .acquire()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY))?;
+    let id = writers.next.fetch_add(1, Ordering::Relaxed);
     let writer = reader.try_clone()?;
     #[cfg(target_os = "macos")]
     {
@@ -462,18 +595,87 @@ fn attach_bell(
         }
     }
     writers
-        .0
+        .peers
         .lock()
         .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?
-        .push(writer);
+        .push((id, writer));
     writers.poke(sv_transport::park::RESCAN_TOKEN);
     let target = controls.clone();
-    std::thread::Builder::new()
+    let registered = writers.clone();
+    let spawn = std::thread::Builder::new()
         .name("hl-gpu-doorbell".into())
         .spawn(move || {
+            let _registration = BellRegistration {
+                writers: registered,
+                id,
+                _permit: permit,
+            };
             let stop = std::sync::atomic::AtomicBool::new(false);
             let woken = std::sync::atomic::AtomicU64::new(0);
             let _ = sv_transport::vdoorbell::serve_port(reader, &*target, &stop, &woken);
-        })?;
+        });
+    if let Err(error) = spawn {
+        writers.remove(id);
+        return Err(error);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn idle_admission_has_a_finite_cap_and_releases_on_actual_drop() {
+        let budget = Budget::new(2);
+        let (queue, clients) = std::sync::mpsc::sync_channel(2);
+        let (a, mut existing) = UnixStream::pair().unwrap();
+        let (b, _second) = UnixStream::pair().unwrap();
+        assert!(admit(a, &queue, &budget));
+        assert!(admit(b, &queue, &budget));
+        let (extra, refused) = UnixStream::pair().unwrap();
+        assert!(!admit(extra, &queue, &budget));
+        assert!(matches!(
+            recv(&refused).unwrap(),
+            ColdMessage::Refuse { .. }
+        ));
+        let (mut active, lease) = clients.recv().unwrap();
+        use std::io::{Read, Write};
+        existing.write_all(b"still alive").unwrap();
+        let mut bytes = [0; 11];
+        active.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"still alive");
+        assert!(budget.acquire().is_none());
+        drop(lease);
+        assert!(budget.acquire().is_some());
+    }
+    #[test]
+    fn retained_failure_uses_the_same_finite_admission_budget() {
+        let budget = Budget::new(1);
+        let mut permit = budget.acquire().unwrap();
+        permit.quarantine("test unknown GPU ownership");
+        drop(permit);
+        assert_eq!(budget.retained.load(Ordering::Acquire), 1);
+        assert!(budget.acquire().is_none());
+    }
+    #[test]
+    fn closed_bell_releases_worker_and_registration() {
+        let controls = ControlSet::new();
+        let writers = Arc::new(Bells::new(1));
+        let (server, client) = UnixStream::pair().unwrap();
+        attach_bell(server, &controls, &writers).unwrap();
+        let (extra, _peer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            attach_bell(extra, &controls, &writers)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        drop(client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while writers.budget.used.load(Ordering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(writers.peers.lock().unwrap().is_empty());
+    }
 }

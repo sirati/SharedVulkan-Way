@@ -93,3 +93,13 @@ concurrent truncate during these production copy operations. The Linux ELF
 `shared-access-client.c` also covers truncated output and pathname buffers.
 External futex atomic fault isolation is a separate pending gate; kernel copies
 alone do not make native CPU atomics on a truncated file safe.
+
+The native GPU endpoint defaults to eight session slots, matching the existing
+pool endpoint. `--sessions` accepts 1 through 64. A slot covers the admission
+queue, handshake and active GPU ownership. Rejected peers receive the existing
+cold-protocol refusal without starting a worker or allocating an arena. A session
+whose GPU/backing ownership cannot safely drain retains its slot permanently and
+reports the retained count, bounding that failure budget. Bell readers and their
+writer registrations have the same finite connection budget. Closing a bell
+releases its registration only when the reader worker actually ends. These limits
+do not evict an established idle owner.

@@ -130,23 +130,47 @@ pub fn serve(
     let heart = {
         let control = Arc::clone(&control);
         let beating = Arc::clone(&beating);
-        std::thread::spawn(move || {
-            while beating.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = control.beat_now();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })
+        std::thread::Builder::new()
+            .name("gpu-heartbeat".into())
+            .spawn(move || {
+                while beating.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = control.beat_now();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .map_err(err)?
     };
 
     let mut workers = Vec::new();
+    let mut first_error = None;
     for slot in slots {
-        let control = Arc::clone(&control);
-        let shared = Arc::clone(&shared);
-        workers.push(std::thread::spawn(move || drain(control, shared, slot)));
+        let worker_control = Arc::clone(&control);
+        let worker_shared = Arc::clone(&shared);
+        match std::thread::Builder::new()
+            .name(format!("gpu-ring-{slot}"))
+            .spawn(move || drain(worker_control, worker_shared, slot))
+        {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                first_error = Some(format!("cannot start ring consumer: {error}"));
+                // Already-started workers still own their mappings and device.
+                // Ask them to stop, then retain the ordinary join/drain path.
+                let _ = control.set_flag(Flags::SHUTDOWN);
+                for index in 0..slot_count {
+                    if let Ok(ring) = RingCtrl::open(&control, index) {
+                        for lane in [Lane::Command, Lane::Reply] {
+                            if let Ok(bell) = ring.bell(lane) {
+                                bell.ring();
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
     }
 
     let mut total = 0u64;
-    let mut first_error = None;
     for w in workers {
         match w.join() {
             Ok(Ok(n)) => total += n,
