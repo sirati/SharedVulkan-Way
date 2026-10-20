@@ -48,7 +48,7 @@ let
 in buildPkgs.stdenv.mkDerivation {
   pname = "wc-pulseaudio-aarch64-darwin";
   inherit (pkgs.pulseaudio) version src;
-  patches = pkgs.pulseaudio.patches ++ [ ./patches/pulseaudio/darwin-shared-fd.patch ];
+  patches = pkgs.pulseaudio.patches ++ [ ./patches/pulseaudio/darwin-shared-fd.patch ./patches/pulseaudio/strict-original-pool.patch ];
   nativeBuildInputs = [ buildPkgs.meson buildPkgs.ninja buildPkgs.pkg-config buildPkgs.python3 buildPkgs.rcodesign buildPkgs.gnum4 buildPkgs.gettext ];
   buildInputs = targetInputs;
   strictDeps = true;

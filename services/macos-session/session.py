@@ -167,7 +167,9 @@ async def main():
     pulse_config = root / 'pulse/default.pa'
     # Keep native PulseAudio shared memory enabled. hl must supply shared host
     # mappings and descriptor passing; disabling shm would hide a runtime bug.
-    pulse_config.write_text(f'''load-module module-native-protocol-unix socket={json.dumps(str(root / "pulse/native"), ensure_ascii=False)} auth-cookie={json.dumps(str(cookie), ensure_ascii=False)} auth-anonymous=no
+    # Foreign imported-pool forwarding fails the destination connection until
+    # the shipped peers negotiate original-page leases and whole-pool rights.
+    pulse_config.write_text(f'''load-module module-native-protocol-unix socket={json.dumps(str(root / "pulse/native"), ensure_ascii=False)} auth-cookie={json.dumps(str(cookie), ensure_ascii=False)} auth-anonymous=no strict-original-pool=yes
 load-module module-coreaudio-detect
 ''')
     env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=bus_address(root),
