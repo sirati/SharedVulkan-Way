@@ -35,6 +35,25 @@ static void guest_fault(int signal) {
     _exit(written==(ssize_t)length ? 0 : 98);
 }
 int main(int argc,char **argv) {
+    if(argc==2 && (!strcmp(argv[1],"--guest-readonly-write") ||
+                   !strcmp(argv[1],"--guest-readonly-exec"))) {
+        int execute=!strcmp(argv[1],"--guest-readonly-exec");
+        char name[]="/tmp/hl-guest-access-XXXXXX";
+        int fd=mkstemp(name);assert(fd>=0);assert(!unlink(name));
+        assert(!ftruncate(fd,16384));
+        /* AArch64 RET. The producer writes the original backing before the
+         * consumer view becomes read-only. No copied or executable alias. */
+        uint32_t ret=0xd65f03c0;
+        assert(pwrite(fd,&ret,sizeof(ret),0)==sizeof(ret));
+        void *p=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+        assert(p!=MAP_FAILED);assert(!mprotect(p,16384,PROT_READ));
+        errno=0;assert(mprotect(p,16384,PROT_READ|PROT_EXEC)==-1 && errno==EACCES);
+        struct sigaction action={.sa_handler=guest_fault};sigemptyset(&action.sa_mask);
+        assert(!sigaction(SIGSEGV,&action,NULL));
+        if(execute) ((void (*)(void))p)();
+        else *(volatile uint32_t *)p=0;
+        _exit(99);
+    }
     if(argc==2 && !strcmp(argv[1],"--guest-map-fault")) {
         char name[]="/tmp/hl-guest-fault-XXXXXX";int fd=mkstemp(name);assert(fd>=0);
         assert(!unlink(name));assert(!ftruncate(fd,16384));
