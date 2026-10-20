@@ -116,6 +116,14 @@ impl Region {
     }
 }
 
+/// Registered original backing plus the exact kernel file description that
+/// was used for the transport's own mapping. Metadata alone is insufficient.
+pub struct NativeBacking {
+    pub description: wc_native_shm::Backing,
+    pub original: std::os::fd::OwnedFd,
+    pub fd_offset: u64,
+}
+
 /// Somewhere a pool's bytes can live such that only a name or an offset
 /// crosses.
 pub trait PoolTransport {
@@ -129,7 +137,7 @@ pub trait PoolTransport {
 
     /// The original backing of an allocation, before a toolkit paints it.
     /// Unsupported transports refuse instead of returning copied memory.
-    fn native_backing(&self, _region: &Region) -> io::Result<wc_native_shm::Backing> {
+    fn native_backing(&self, _region: &Region) -> io::Result<NativeBacking> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "this transport cannot export original GTK backing"))
     }
 
@@ -270,12 +278,14 @@ impl SharedFile {
 }
 
 impl PoolTransport for SharedFile {
-    fn native_backing(&self, region: &Region) -> io::Result<wc_native_shm::Backing> {
+    fn native_backing(&self, region: &Region) -> io::Result<NativeBacking> {
         if !self.native_fixture {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "native GTK files require the explicit disposable fixture"));
         }
         let live = self.live.get(&region.key).ok_or_else(|| io::Error::other("native GTK allocation is no longer live"))?;
-        Ok(wc_native_shm::Backing::Fixture { path: live.local.clone(), offset: 0 })
+        let original = std::fs::OpenOptions::new().read(true).write(true).open(&live.local)?;
+        Ok(NativeBacking { description: wc_native_shm::Backing::Fixture { path: live.local.clone(), offset: 0 },
+            original: original.into(), fd_offset: 0 })
     }
 
     fn name(&self) -> &'static str {
@@ -391,14 +401,21 @@ enum Backing {
 }
 
 /// A lease on a broker region (§111), ended when dropped.
-pub struct BrokerLease(pub u64, pub u64);
+pub struct BrokerLease {
+    id: u64,
+    run: u64,
+    epoch: u64,
+    offset: u64,
+    pieces: Vec<wc_broker::proto::Piece>,
+    fds: Vec<std::os::fd::OwnedFd>,
+    client: wc_broker::client::Client,
+}
 
 impl Drop for BrokerLease {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Err(e) = wc_broker::client::close_region(self.0) {
-            // The connection is gone, and the lease with it.
-            println!("[proxy] broker region {}: close: {e}", self.0);
+        if let Err(e) = self.client.close(self.id) {
+            println!("[proxy] broker region {}: close: {e}", self.id);
         }
     }
 }
@@ -871,6 +888,60 @@ pub struct ProvidedRegion {
 }
 
 impl ProvidedRegion {
+    /// Map an already authorized broker plan from the same owned descriptors
+    /// retained for GTK export. Never reopen an id after mapping cached pages.
+    #[cfg(target_os = "linux")]
+    fn registered_plan(plan: &crate::guestram::Plan, check_header: bool) -> io::Result<Option<Backing>> {
+        use std::os::fd::AsFd;
+        let Some(id) = wc_broker::client::region_spec(&plan.object) else { return Ok(None); };
+        let [run] = plan.runs.as_slice() else {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "registered GTK plan must have one contiguous run"));
+        };
+        if run.arena_offset != 0 || run.len != plan.len || plan.len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid registered GTK plan"));
+        }
+        let mut client = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+        let hello = client.hello("proxy-memory")?;
+        let broker_run = u64::from_str_radix(&hello.run, 16).map_err(|_| io::Error::other("invalid broker run"))?;
+        let (r, fds) = client.open(id)?;
+        let lease = BrokerLease { id, run: broker_run, epoch: r.epoch, offset: run.file_offset,
+            pieces: r.pieces.clone(), fds, client };
+        if check_header {
+            use std::os::unix::fs::FileExt;
+            let (_, fd) = lease.pieces.iter().zip(&lease.fds)
+                .find(|(p, _)| p.offset == 0 && p.len >= wc_handle::ivshmem::ENCODED_LEN as u64)
+                .ok_or_else(|| io::Error::other("broker BAR header is not available"))?;
+            let file = std::fs::File::from(fd.try_clone()?);
+            let mut bytes = [0u8; wc_handle::ivshmem::ENCODED_LEN];
+            file.read_exact_at(&mut bytes, 0)?;
+            let header = wc_handle::ivshmem::Header::decode(&bytes)?;
+            if header.run_id != plan.run_id || header.region_len != r.len {
+                return Err(io::Error::other("original broker BAR header changed"));
+            }
+        }
+        let end = run.file_offset.checked_add(run.len).ok_or_else(|| io::Error::other("registered plan overflow"))?;
+        if end > r.len { return Err(io::Error::other("registered plan exceeds broker region")); }
+        let mut runs = Vec::new();
+        for (piece, fd) in lease.pieces.iter().zip(&lease.fds) {
+            let piece_end = piece.offset.checked_add(piece.len).ok_or_else(|| io::Error::other("broker part overflow"))?;
+            let (start, stop) = (piece.offset.max(run.file_offset), piece_end.min(end));
+            if start < stop {
+                runs.push((fd.as_fd(), crate::guestram::Run { arena_offset: start-run.file_offset,
+                    file_offset: start-piece.offset, len: stop-start }));
+            }
+        }
+        let parts: Vec<_> = runs.iter().map(|(fd, run)| (*fd, run)).collect();
+        let region = crate::guestram::StitchedRegion::attach_parts(plan.len, &parts, plan.object.display().to_string())?;
+        Ok(Some(Backing::GuestRamLeased(region, lease)))
+    }
+
+    fn attach_plan(plan: &crate::guestram::Plan, check_header: bool) -> io::Result<Backing> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = check_header;
+        #[cfg(target_os = "linux")]
+        if let Some(backing) = Self::registered_plan(plan, check_header)? { return Ok(backing); }
+        Ok(Backing::GuestRam(crate::guestram::StitchedRegion::attach(plan)?))
+    }
     /// A region of the guest's RAM, described by a plan the locator wrote.
     ///
     /// The deployment path. Everything expensive already happened: the guest
@@ -878,14 +949,15 @@ impl ProvidedRegion {
     /// is left is `mmap(MAP_FIXED)` per run into one reservation, which §12.5
     /// measured at **4.16–4.24 ms** for ~1510 runs.
     pub fn guest_ram(plan: &crate::guestram::Plan) -> io::Result<ProvidedRegion> {
-        let region = crate::guestram::StitchedRegion::attach(plan)?;
+        let backing = Self::attach_plan(plan, false)?;
+        let region = match &backing { Backing::GuestRam(r) | Backing::GuestRamLeased(r, _) => r, _ => unreachable!() };
         let origin = format!(
             "guest RAM, run 0x{:016x}, {} run(s) of {}",
             plan.run_id,
             region.runs(),
             region.origin()
         );
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len, id: None })
+        Ok(ProvidedRegion { backing, origin, len: plan.len, id: None })
     }
 
     /// IVSHMEM ARENA. BAR2 of the guest's ivshmem device, as the file QEMU
@@ -894,13 +966,14 @@ impl ProvidedRegion {
     /// range of a host object the guest's pages live in. Only the origin
     /// differs, so that a log says which of the two ran.
     pub fn ivshmem(plan: &crate::guestram::Plan) -> io::Result<ProvidedRegion> {
-        let region = crate::guestram::StitchedRegion::attach(plan)?;
+        let backing = Self::attach_plan(plan, true)?;
+        let region = match &backing { Backing::GuestRam(r) | Backing::GuestRamLeased(r, _) => r, _ => unreachable!() };
         let origin = format!(
             "ivshmem BAR2, run 0x{:016x}, {}",
             plan.run_id,
             region.origin()
         );
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len: plan.len, id: None })
+        Ok(ProvidedRegion { backing, origin, len: plan.len, id: None })
     }
 
     /// §107: a window of a shared ivshmem BAR, `[offset, offset + len)` in
@@ -930,9 +1003,9 @@ impl ProvidedRegion {
                 len,
             }],
         };
-        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let backing = Self::attach_plan(&plan, true)?;
         let origin = format!("ivshmem BAR window {offset}+{len}, run 0x{run:016x}");
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
+        Ok(ProvidedRegion { backing, origin, len, id: Some(id) })
     }
 
     /// §110: a range of another region of the one pool, `[offset, offset +
@@ -954,9 +1027,9 @@ impl ProvidedRegion {
             outbound: None,
             runs: vec![crate::guestram::Run { arena_offset: 0, file_offset: offset, len }],
         };
-        let region = crate::guestram::StitchedRegion::attach(&plan)?;
+        let backing = Self::attach_plan(&plan, false)?;
         let origin = format!("pool region window {offset}+{len} of {}", path.display());
-        Ok(ProvidedRegion { backing: Backing::GuestRam(region), origin, len, id: Some(id) })
+        Ok(ProvidedRegion { backing, origin, len, id: Some(id) })
     }
 
     /// §108: a window `[offset, offset+len)` of guest-RAM region `k` of the
@@ -966,8 +1039,12 @@ impl ProvidedRegion {
     #[cfg(target_os = "linux")]
     pub fn ram_window(k: u32, id: u32, offset: u64, len: u64) -> io::Result<ProvidedRegion> {
         use std::os::fd::AsFd;
-        let (r, fds) = wc_broker::client::find_region(&format!("gpu.{k}"))?;
-        let lease = BrokerLease(r.id, offset);
+        let mut client = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+        let hello = client.hello("proxy-memory")?;
+        let run = u64::from_str_radix(&hello.run, 16).map_err(|_| io::Error::other("invalid broker run"))?;
+        let (r, fds) = client.find(&format!("gpu.{k}"))?;
+        let lease = BrokerLease { id: r.id, run, epoch: r.epoch, offset, pieces: r.pieces.clone(),
+            fds: fds.iter().map(|f| f.try_clone()).collect::<io::Result<_>>()?, client };
         if len == 0 || offset.checked_add(len).is_none_or(|e| e > r.len) || !offset.is_multiple_of(4096) || !len.is_multiple_of(4096) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("no window {offset}+{len} in the {}-byte guest-RAM region {k}", r.len)));
         }
@@ -1959,7 +2036,7 @@ impl Alloc {
 }
 
 impl PoolTransport for Arena {
-    fn native_backing(&self, region: &Region) -> io::Result<wc_native_shm::Backing> {
+    fn native_backing(&self, region: &Region) -> io::Result<NativeBacking> {
         let Descriptor::ArenaSlice { arena, offset, len } = &region.descriptor else {
             return Err(io::Error::other("native GTK allocation has no arena identity"));
         };
@@ -1972,8 +2049,13 @@ impl PoolTransport for Arena {
         let Backing::GuestRamLeased(_, lease) = &slot.map.backing._backing else {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "native GTK requires a broker-leased guest-RAM region"));
         };
-        let offset = lease.1.checked_add(*offset).ok_or_else(|| io::Error::other("native GTK backing offset overflow"))?;
-        Ok(wc_native_shm::Backing::Broker { id: lease.0, offset })
+        let offset = lease.offset.checked_add(*offset).ok_or_else(|| io::Error::other("native GTK backing offset overflow"))?;
+        let end = offset.checked_add(*len).ok_or_else(|| io::Error::other("native GTK backing length overflow"))?;
+        let (_, fd) = lease.pieces.iter().zip(&lease.fds).find(|(p,_)|
+            p.offset <= offset && p.offset.checked_add(p.len).is_some_and(|e| e >= end))
+            .ok_or_else(|| io::Error::other("native GTK allocation crosses bounded broker fd parts"))?;
+        Ok(NativeBacking { description: wc_native_shm::Backing::Broker { id: lease.id, run: lease.run, epoch: lease.epoch, offset },
+            original: fd.try_clone()?, fd_offset: offset - piece.offset })
     }
 
     fn free_bytes(&self) -> Option<(u64, u64)> {

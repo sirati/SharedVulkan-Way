@@ -383,7 +383,8 @@ mod tests {
         // presentation-time (two): 52.
         // §104 adds linux-dmabuf (three: the global, the params and the
         // feedback): 55.
-        assert_eq!(s.len(), 55, "interfaces: {:?}", s.names());
+        // §112 adds the proxy-local native SHM allocator.
+        assert_eq!(s.len(), 56, "interfaces: {:?}", s.names());
     }
 
     /// The message this whole crate exists for. `wl_shm.create_pool(new_id id,

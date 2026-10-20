@@ -4,6 +4,16 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 use wc_native_shm::{Backing, Mapping, same_open_file};
 
+fn verify_original(registered: &crate::pool::NativeBacking, mapping: &Mapping) -> io::Result<()> {
+    if mapping.fd_offset() != registered.fd_offset { return Err(io::Error::other("native GTK original backing offset changed")); }
+    let same = match &registered.description {
+        Backing::Broker { .. } => same_open_file(&registered.original,mapping.fd())?,
+        Backing::Fixture { .. } => wc_native_shm::file_metadata(&registered.original)? == wc_native_shm::file_metadata(mapping.fd())?,
+    };
+    if !same { return Err(io::Error::other("native GTK original registered backing changed")); }
+    Ok(())
+}
+
 const GLOBAL: u32 = 0xfffe_d4b1;
 const INTERFACE: &str = "wc_native_shm_v1";
 
@@ -124,7 +134,11 @@ impl Session {
             let allocation = (|| -> io::Result<_> {
                 if size == 0 || size > i32::MAX as u64 { return Err(io::Error::other("invalid native shm size")); }
                 let region = self.transport.create(size)?;
-                let result = self.transport.native_backing(&region).and_then(|backing| Mapping::open(&backing,size).map(|m|(backing,m)));
+                let result = self.transport.native_backing(&region).and_then(|registered| {
+                    let mapping = Mapping::open(&registered.description,size)?;
+                    verify_original(&registered, &mapping)?;
+                    Ok((registered.description,mapping))
+                });
                 match result {
                     Ok((backing,mapping)) => Ok((region,backing,mapping)),
                     Err(e) => { self.transport.destroy(&region); Err(e) }
@@ -133,11 +147,12 @@ impl Session {
             match allocation {
                 Ok((region,backing,mapping)) => {
                     let fixture = matches!(backing, Backing::Fixture { .. });
-                    let (kind,id,offset,path) = match backing {
-                        Backing::Broker { id, offset } => (1u32,id,offset,String::new()),
-                        Backing::Fixture { path, offset } => (2u32,0,offset,path.to_string_lossy().into_owned()),
+                    let (kind,id,run,epoch,offset,path) = match backing {
+                        Backing::Broker { id, run, epoch, offset } => (1u32,id,run,epoch,offset,String::new()),
+                        Backing::Fixture { path, offset } => (2u32,0,0,0,offset,path.to_string_lossy().into_owned()),
                     };
-                    let words = [serial,kind,(id>>32) as u32,id as u32,(offset>>32) as u32,offset as u32,size as u32];
+                    let words = [serial,kind,(id>>32) as u32,id as u32,(run>>32) as u32,run as u32,
+                        (epoch>>32) as u32,epoch as u32,(offset>>32) as u32,offset as u32,size as u32];
                     let mut b: Vec<u8> = words.into_iter().flat_map(u32::to_ne_bytes).collect(); wire::push_string(&mut b,&path);
                     self.to_client.extend_from_slice(&wire::message(object,0,&b));
                     self.native_shm.allocations.insert(key,Allocation { region,mapping,fixture,pool_created:false,pool_destroyed:false,
@@ -150,7 +165,7 @@ impl Session {
             }
             return Ok(Some(Vec::new()));
         }
-        if interface == "wl_shm" && opcode == op::SHM_CREATE_POOL && !self.native_shm.allocations.is_empty() {
+        if interface == "wl_shm" && opcode == op::SHM_CREATE_POOL && !self.native_shm.managers.is_empty() {
             let fd = fds.front().ok_or_else(|| Error::Walk("native shm pool has no fd".into()))?;
             let mut matched = None;
             for (key,a) in &self.native_shm.allocations {
@@ -175,6 +190,7 @@ impl Session {
                 fds.pop_front();
                 return Ok(Some(create_pool_message(object,pool,&a.region.descriptor,a.region.size as u32)));
             }
+            return Err(Error::Walk("native GTK pool fd is not a registered original backing".into()));
         }
         if interface == "wl_shm_pool" && let Some(key) = self.native_shm.pools.get(&object).copied() {
             if opcode == op::POOL_DESTROY {
@@ -231,7 +247,7 @@ mod tests {
     }
     fn create(s:&mut Session,key:u64)->Mapping {
         let a=&s.native_shm.allocations[&key];
-        let path=match s.transport.native_backing(&a.region).unwrap(){ Backing::Fixture{path,..}=>path,_=>unreachable!() };
+        let path=match s.transport.native_backing(&a.region).unwrap().description { Backing::Fixture{path,..}=>path,_=>unreachable!() };
         let cairo=Mapping::open(&Backing::Fixture{path,offset:0},4096).unwrap();
         let mut fds=VecDeque::from([cairo.fd().try_clone().unwrap()]);
         let bytes=request(s,3,0,&[4,4096],&mut fds).unwrap();
@@ -243,6 +259,21 @@ mod tests {
     fn event(s:&mut Session,object:u32,opcode:u16,words:&[u32]) {
         let b:Vec<u8>=words.iter().flat_map(|w|w.to_ne_bytes()).collect();
         s.server_message(Header{object,opcode,size:b.len()+8},&b).unwrap();
+    }
+    #[test]
+    fn allocation_metadata_cannot_replace_the_transports_original_file() {
+        let (mut s, dir) = fixture("source-identity");
+        let key = allocate(&mut s);
+        let a = &s.native_shm.allocations[&key];
+        let mut original = s.transport.native_backing(&a.region).unwrap();
+        assert!(verify_original(&original, &a.mapping).is_ok());
+        let foreign = std::fs::OpenOptions::new().read(true).write(true)
+            .create_new(true).open(dir.join("foreign-original")).unwrap();
+        foreign.set_len(4096).unwrap();
+        original.original = foreign.into();
+        assert!(verify_original(&original, &a.mapping).is_err());
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn original_cairo_pages_reach_the_peer_and_are_recycled_only_after_both_lifetimes() {
@@ -273,7 +304,7 @@ mod tests {
         let raw=unsafe{libc::memfd_create(c"foreign-toolkit".as_ptr(),libc::MFD_CLOEXEC)};assert!(raw>=0);
         let fd=unsafe{OwnedFd::from_raw_fd(raw)};assert_eq!(unsafe{libc::ftruncate(fd.as_raw_fd(),4096)},0);
         let mut fds=VecDeque::from([fd]);
-        request(&mut s,3,0,&[4,4096],&mut fds).unwrap();
+        assert!(request(&mut s,3,0,&[4,4096],&mut fds).is_err());
         assert!(!s.native_shm.allocations[&key].pool_created);
         assert!(!s.native_shm.pools.contains_key(&4));
         request(&mut s,2,1,&[1],&mut VecDeque::new()).unwrap();

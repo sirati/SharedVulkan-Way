@@ -5,7 +5,7 @@ use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Backing {
-    Broker { id: u64, offset: u64 },
+    Broker { id: u64, run: u64, epoch: u64, offset: u64 },
     /// Only an explicitly configured disposable fixture may use this variant.
     Fixture { path: std::path::PathBuf, offset: u64 },
 }
@@ -72,11 +72,15 @@ impl Mapping {
     fn open_at(backing: &Backing, len: u64, broker: &str) -> io::Result<Self> {
         if len == 0 || len > i32::MAX as u64 { return Err(invalid("invalid GTK allocation size")); }
         let (fd, offset, lease) = match backing {
-            Backing::Broker { id, offset } => {
+            Backing::Broker { id, run, epoch, offset } => {
                 let mut client = wc_broker::client::Client::connect(broker)?;
-                client.hello("gtk-shm")?;
+                let hello = client.hello("gtk-shm")?;
+                if u64::from_str_radix(&hello.run, 16).ok() != Some(*run) {
+                    return Err(invalid("registered GTK backing belongs to a different broker run"));
+                }
                 let (region, fds) = client.open(*id)?;
                 let lease = Lease { client, id: *id };
+                if region.epoch != *epoch { return Err(invalid("registered GTK backing epoch changed")); }
                 let end = offset.checked_add(len).ok_or_else(|| invalid("allocation overflow"))?;
                 if end > region.len { return Err(invalid("allocation exceeds the broker region")); }
                 // GTK needs one ordinary fd for wl_shm. Never substitute a
@@ -133,10 +137,10 @@ fn invalid(message: &str) -> io::Error { io::Error::new(io::ErrorKind::InvalidDa
 /// Fixture paths are accepted only when the library was explicitly enabled
 /// for fixtures. Production calls always use broker-backed bounded fds.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wc_native_shm_open(kind: u32, id: u64, path: *const c_char, offset: u64, len: u64) -> *mut Mapping {
+pub unsafe extern "C" fn wc_native_shm_open(kind: u32, id: u64, run: u64, epoch: u64, path: *const c_char, offset: u64, len: u64) -> *mut Mapping {
     let result = std::panic::catch_unwind(|| {
         let backing = match kind {
-            1 => Backing::Broker { id, offset },
+            1 => Backing::Broker { id, run, epoch, offset },
             2 if std::env::var_os("WC_NATIVE_SHM_FIXTURE").is_some_and(|v| v == "1") && !path.is_null() => {
                 // SAFETY: the C ABI requires a live NUL-terminated path.
                 let p = unsafe { CStr::from_ptr(path) }.to_str().map_err(|_| invalid("fixture path is not UTF-8"))?;
@@ -253,7 +257,7 @@ mod tests {
         let dev=std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf").unwrap();
         let make=|offset| {
             let request=CreateList{flags:1,count:1,fd:raw as u32,pad:0,offset,size:4096};
-            let fd=unsafe{libc::ioctl(dev.as_raw_fd(),0x4008_7543u64,&request)};
+            let fd=unsafe{libc::ioctl(dev.as_raw_fd(),0x4008_7543 as _,&request)};
             assert!(fd>=0,"udmabuf creation: {}",io::Error::last_os_error());
             unsafe{OwnedFd::from_raw_fd(fd)}
         };
@@ -270,7 +274,7 @@ mod tests {
         let id=broker.publish(User::uid(unsafe{libc::geteuid()}),"gtk-original",11,vec![(Unix::object(actual),0,4096)]);
         let serving=broker.clone();std::thread::spawn(move||{let _=serving.serve();});
         let(tx,rx)=std::sync::mpsc::channel();broker.on_drained(Box::new(move|id,epoch|{tx.send((id,epoch)).unwrap();}));
-        let backing=Backing::Broker{id,offset:0};
+        let backing=Backing::Broker{id,run:8,epoch:11,offset:0};
         let proxy=Mapping::open_at(&backing,4096,path.to_str().unwrap()).unwrap();
         let cairo=Mapping::open_at(&backing,4096,path.to_str().unwrap()).unwrap();
         let(a,b)=UnixStream::pair().unwrap();
@@ -309,12 +313,16 @@ mod tests {
         std::thread::spawn(move || { let _ = serving.serve(); });
         let (tx, rx) = std::sync::mpsc::channel();
         broker.on_drained(Box::new(move |id, epoch| { tx.send((id, epoch)).unwrap(); }));
-        let m = Mapping::open_at(&Backing::Broker { id, offset: 0 }, 8192, path.to_str().unwrap()).unwrap();
+        for (run, epoch) in [(8, 9), (7, 10)] {
+            assert!(Mapping::open_at(&Backing::Broker { id, run, epoch, offset: 0 }, 8192, path.to_str().unwrap()).is_err());
+            assert!(broker.holders(id).is_empty(), "rejected identity retained a broker lease");
+        }
+        let m = Mapping::open_at(&Backing::Broker { id, run: 7, epoch: 9, offset: 0 }, 8192, path.to_str().unwrap()).unwrap();
         assert_eq!(broker.holders(id), vec![std::process::id()]);
         broker.retire(id);
         assert!(rx.try_recv().is_err(), "retirement released live Cairo pages");
         unsafe { std::ptr::write_volatile(m.data().cast::<u64>(), 0x12345678); }
-        assert!(Mapping::open_at(&Backing::Broker { id, offset: 0 }, 8192, path.to_str().unwrap()).is_err());
+        assert!(Mapping::open_at(&Backing::Broker { id, run: 7, epoch: 9, offset: 0 }, 8192, path.to_str().unwrap()).is_err());
         drop(m);
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), (id, 9));
         assert!(broker.holders(id).is_empty());

@@ -32,6 +32,7 @@ typedef struct {
 
 static void allocated(void *opaque, struct wc_native_shm_v1 *manager,
     uint32_t serial, uint32_t kind, uint32_t id_high, uint32_t id_low,
+    uint32_t run_high, uint32_t run_low, uint32_t epoch_high, uint32_t epoch_low,
     uint32_t offset_high, uint32_t offset_low, uint32_t size, const char *path)
 {
   WcNativeState *state = opaque;
@@ -43,6 +44,7 @@ static void allocated(void *opaque, struct wc_native_shm_v1 *manager,
   }
   state->allocated = TRUE;
   state->mapping = wc_native_shm_open(kind, ((uint64_t)id_high << 32) | id_low,
+      ((uint64_t)run_high << 32) | run_low, ((uint64_t)epoch_high << 32) | epoch_low,
       path, ((uint64_t)offset_high << 32) | offset_low, size);
   if (!state->mapping)
     state->failure = g_strdup("registered original backing could not be opened");

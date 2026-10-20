@@ -28,6 +28,10 @@
       <arg name="kind" type="uint" summary="1 broker region, 2 explicit disposable fixture"/>
       <arg name="region_high" type="uint"/>
       <arg name="region_low" type="uint"/>
+      <arg name="broker_run_high" type="uint"/>
+      <arg name="broker_run_low" type="uint"/>
+      <arg name="epoch_high" type="uint"/>
+      <arg name="epoch_low" type="uint"/>
       <arg name="offset_high" type="uint"/>
       <arg name="offset_low" type="uint"/>
       <arg name="size" type="uint"/>

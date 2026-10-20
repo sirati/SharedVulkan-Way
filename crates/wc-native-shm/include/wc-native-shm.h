@@ -7,7 +7,8 @@ struct wc_native_shm_mapping;
  * opened with the caller's authenticated identity. Fixture kind 2 requires
  * WC_NATIVE_SHM_FIXTURE=1. The mapping owns its fd and its broker lease. */
 struct wc_native_shm_mapping *wc_native_shm_open(uint32_t kind, uint64_t region,
-    const char *fixture_path, uint64_t offset, uint64_t size);
+    uint64_t broker_run, uint64_t epoch, const char *fixture_path,
+    uint64_t offset, uint64_t size);
 void *wc_native_shm_data(const struct wc_native_shm_mapping *mapping);
 /* Borrowed fd. The Wayland marshaller copies it before this mapping closes. */
 int wc_native_shm_fd(const struct wc_native_shm_mapping *mapping);
