@@ -377,3 +377,49 @@ fn cancellation_during_success_callback_quarantines_job_before_worker_exit() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(drops.load(std::sync::atomic::Ordering::Acquire), 0);
 }
+
+struct ReentrantFailure {
+    _owner: Owner,
+    queue: std::sync::Weak<Queue>,
+    finished: mpsc::Sender<()>,
+}
+impl Submission for ReentrantFailure {
+    fn execute(&mut self) -> Result<(), vk::Result> {
+        Err(vk::Result::ERROR_UNKNOWN)
+    }
+    fn retire_failed(&mut self) -> bool {
+        false
+    }
+    fn finished(&mut self, _: Result<(), vk::Result>) {
+        self.queue.upgrade().unwrap().cancel();
+        self.finished.send(()).unwrap();
+    }
+}
+#[test]
+fn failure_callback_can_cancel_its_own_queue_without_quarantine_lock_deadlock() {
+    let queue = Arc::new(Queue::new().unwrap());
+    let (dropped, observed) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    queue
+        .enqueue(Box::new(ReentrantFailure {
+            _owner: Owner {
+                log: Arc::new(Mutex::new(Vec::new())),
+                event: dropped,
+            },
+            queue: Arc::downgrade(&queue),
+            finished,
+        }))
+        .unwrap();
+    // A regressed callback holds its upgraded Queue Arc while blocked, so
+    // this assertion can fail without Queue::drop itself joining/deadlocking.
+    assert!(
+        done.recv_timeout(WAIT).is_ok(),
+        "fatal callback must be able to cancel the canonical queue reentrantly"
+    );
+    drop(queue);
+    assert!(
+        observed
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err()
+    );
+}
