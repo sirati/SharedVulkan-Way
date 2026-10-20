@@ -38203,8 +38203,10 @@ placement logic for Windows' cascade, and suppresses intermediate size echoes
 with the existing placement guards. The maximized path is unchanged. Actual
 Firefox run `run-orLiEJ` confirms RGB 37,111,149 at both 1300,100 and 1500,100;
 the full screenshot was also inspected. Its Win32 window is 1288x1044 with a
-1280x1040 client, no custom region and the expected DC clip. All 3,997 commits
-remain zero-copy with zero copied commits, including both real GTK parent
+1280x1040 client, no custom region and the expected DC clip. A separate geometry
+capture, `run-RAFYwl`, confirms the actual X11 child is also 1288x1044 with no
+window or border shape on the 1920x1200 Wine desktop. All 3,997 commits in
+`run-orLiEJ` remain zero-copy with zero copied commits, including both real GTK parent
 surface 38/buffer 51 commits. WebRender/WebGL and sandbox checks pass; H264
 presents 298 frames with one drop at verdict. The overall lavapipe run still
 fails only its hardware VA checks. This local result does not replace native
