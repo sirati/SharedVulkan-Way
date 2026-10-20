@@ -37493,6 +37493,12 @@ on testhost (nix-config). Without the guest build the old lease stands;
 without the unit the 20 s bound applies.
 ## 112. Stock Firefox on the dma-buf path
 
+This branch provides the render-node relay prerequisite only. The stock
+Firefox swapchain, default-settings hardware selection and guest video proof
+remain on the separate stock-firefox branch. No application patch or sandbox
+exception is introduced here.
+
+
 ### 112.x The render node introduces a sandboxed client to its GPU services
 
 Branch `sf-relay`. Stock Firefox decodes video in its RDD process, and that
@@ -37625,3 +37631,22 @@ local pool has one region; the ICD's path is the same call with another `k`);
 `ivshmem-serve`'s built-in `--bell` hub and `sv-hostd serve`/`qemu-serve`,
 which do not register; an `ANY-UID` registration accepted (the tests run as a
 user; the rule is a pure function, tested).
+
+#### 112.x.2 System broker entry for mapped sandboxed clients
+
+A system bell hub keeps its direct relay restricted to its own uid. Desktop
+users reach it through the existing broker service policy instead. On Linux,
+when `/run/sv-drm/services.sock` exists, the embedded session broker registers
+`waycompose-broker`, with `ANY-UID` only for a system uid. A sandboxed broker
+client whose direct socket connection fails can use `SV_DRM_NODE` to reach
+that endpoint. The broker checks the forwarded uid and pid against the
+socket's kernel credentials before injecting it into the ordinary accept
+path. That path authenticates the peer again and applies its existing mapped
+user list to `Connect sv-hub` and `Connect wl-hub`.
+
+The ICD preserves `broker:NAME` connections when using the reconnect callback.
+There is no second mapping table, direct cross-user hub grant, or change to
+the shared-memory data path. Linux-only dependencies leave the other platform
+backends unchanged. Regression tests send a real forwarded socket through the
+broker protocol: mapped access receives a hub fd, unmapped access is refused,
+and forged uid or pid metadata never reaches the broker's incoming queue.
