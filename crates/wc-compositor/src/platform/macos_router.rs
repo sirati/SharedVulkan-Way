@@ -100,6 +100,7 @@ struct Face {
 type Stale = Option<Vec<(i32, i32, i32, i32)>>;
 
 struct Surf {
+    immutable: bool,
     s: [Surface; 2],
     back: u8,
     w: i32,
@@ -272,6 +273,16 @@ impl R {
         let Some(w) = self.wins.get_mut(&id) else { return };
         let Some(fid) = w.face else { return };
         let Some(port) = self.faces.get(&fid).and_then(|f| f.port) else { return };
+        if let Some(surf) = w.surf.as_ref().filter(|s| s.immutable) {
+            // Face restart/expose uses the retained immutable GPU output, not
+            // a CPU shadow that stopped following direct commits.
+            if macmach::send_surfaces(port, id, w.next_gen, [&surf.s[0], &surf.s[1]]) != 0 { return; }
+            let m = ToFace::Surface { id, generation: w.next_gen, w: surf.w,
+                h: surf.h, alpha: true, scale: surf.scale };
+            self.send(fid, &m);
+            self.send(fid, &ToFace::Present { id, buffer: 0 });
+            return;
+        }
         let shadow = w.shadow.clone();
         let s = shadow.lock().unwrap_or_else(|e| e.into_inner());
         // §103.18: device pixels; the face shows them at `scale` per point.
@@ -281,7 +292,7 @@ impl R {
         }
         let alpha = s.format() == PixelFormat::Argb8888;
         let mut fresh = None;
-        if w.surf.as_ref().is_none_or(|x| (x.w, x.h, x.scale) != (sw, sh, scale)) {
+        if w.surf.as_ref().is_none_or(|x| x.immutable || (x.w, x.h, x.scale) != (sw, sh, scale)) {
             let (Some(a), Some(b)) = (Surface::new(sw, sh), Surface::new(sw, sh)) else { return };
             w.next_gen += 1;
             let generation = w.next_gen;
@@ -290,7 +301,7 @@ impl R {
             if macmach::send_surfaces(port, id, generation, [&a, &b]) != 0 {
                 return;
             }
-            w.surf = Some(Surf { s: [a, b], back: 0, w: sw, h: sh, scale, stale: [None, None] });
+            w.surf = Some(Surf { immutable: false, s: [a, b], back: 0, w: sw, h: sh, scale, stale: [None, None] });
             fresh = Some(ToFace::Surface { id, generation, w: sw, h: sh, alpha, scale });
         }
         let surf = w.surf.as_mut().expect("surface pair");
@@ -337,6 +348,34 @@ impl R {
             self.send(fid, &m);
         }
         self.send(fid, &ToFace::Present { id, buffer: back });
+    }
+
+    /// A fresh immutable output for every GPU composition. The client buffer
+    /// stays held by State until the next ordered acknowledgement or fallback.
+    fn present_metal(&mut self, id: WindowId, frame: &super::DirectFrame) -> Result<Arc<wc_handle::iosection::Surface>, &'static str> {
+        let (fid, port, scale) = {
+            let w = self.wins.get(&id).ok_or("window disappeared")?;
+            let fid = w.face.ok_or("no face")?;
+            let port = self.faces.get(&fid).and_then(|f| f.port).ok_or("no face port")?;
+            let scale = w.shadow.lock().unwrap_or_else(|e| e.into_inner()).scale();
+            (fid, port, scale)
+        };
+        let output = super::macos_metal::snapshot(frame)?;
+        let w = self.wins.get_mut(&id).ok_or("window disappeared")?;
+        w.next_gen = w.next_gen.checked_add(1).ok_or("surface generation exhausted")?;
+        let generation = w.next_gen;
+        // Both slots name the same immutable frame. Neither will be overwritten.
+        if macmach::send_surfaces(port, id, generation, [&output, &output]) != 0 {
+            return Err("face surface transfer");
+        }
+        // SAFETY: retain the complete output before moving it into the face state.
+        let snapshot = Arc::new(unsafe { wc_handle::iosection::Surface::retain_raw(output.as_ptr()) });
+        w.surf = Some(Surf { immutable: true, s: [output.retain(), output], back: 0,
+            w: frame.width, h: frame.height, scale, stale: [None, None] });
+        self.send(fid, &ToFace::Surface { id, generation, w: frame.width,
+            h: frame.height, alpha: frame.format.has_alpha(), scale });
+        self.send(fid, &ToFace::Present { id, buffer: 0 });
+        Ok(snapshot)
     }
 
     fn forward(&mut self, id: WindowId, m: ToFace) {
@@ -403,8 +442,22 @@ impl R {
                 }
                 self.present_damage(id, (!full).then_some(&damage[..]))
             }
-            // Never sent off Windows; see its definition.
-            ToUi::Direct { .. } => {}
+            ToUi::Direct { id, frame, damage: _, serial } => {
+                let ok = match frame {
+                    Some(frame) => match self.present_metal(id, &frame) {
+                        Ok(snapshot) => { self.event(FromUi::MetalCopied { id, serial, snapshot }); return true; }
+                        Err(why) => { eprintln!("wc-compositor: Metal composition refused: {why}"); false }
+                    },
+                    None => {
+                        // The old GPU snapshots are immutable. Do not turn them
+                        // into the CPU double-buffer pool on fallback.
+                        if let Some(w) = self.wins.get_mut(&id) { w.surf = None; }
+                        self.present(id);
+                        true
+                    }
+                };
+                self.event(FromUi::DirectShown { id, serial, ok });
+            }
             ToUi::ShiftOrigin { id, dx, dy } => self.forward(id, ToFace::ShiftOrigin { id, dx, dy }),
             ToUi::Map { id, width, height, fold_caption } => {
                 let Some(w) = self.wins.get_mut(&id) else { return true };

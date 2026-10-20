@@ -79,6 +79,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macmach;
 #[cfg(target_os = "macos")]
+pub mod macos_metal;
+#[cfg(target_os = "macos")]
 pub mod macos_router;
 #[cfg(target_os = "macos")]
 pub use macos::{current_layout, has_touch, keyboard_repeat, start};
@@ -827,6 +829,8 @@ pub struct DirectFrame {
     pub key: u64,
     #[cfg(windows)]
     pub section: Arc<wc_handle::SectionObject>,
+    #[cfg(target_os = "macos")]
+    pub surface: Arc<wc_handle::iosection::Surface>,
     /// Bytes from the start of the section; a multiple of 4.
     pub offset: u32,
     pub width: i32,
@@ -840,6 +844,10 @@ pub struct DirectFrame {
 /// UI thread -> Wayland thread.
 #[derive(Debug)]
 pub enum FromUi {
+    /// Metal has finished reading the client buffer. This independent output
+    /// is immutable and retained for fallback even after wl_buffer.release.
+    #[cfg(target_os = "macos")]
+    MetalCopied { id: WindowId, serial: u64, snapshot: Arc<wc_handle::iosection::Surface> },
     /// The answer to [`ToUi::Direct`] with this `serial`: the window draws
     /// only from what that message said, and nothing before it — or, with
     /// `ok` false, the platform could not draw from that buffer (a DIB could

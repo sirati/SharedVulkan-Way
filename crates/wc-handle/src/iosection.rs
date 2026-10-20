@@ -90,6 +90,9 @@ unsafe extern "C" {
     fn IOSurfaceCreate(props: CFTypeRef) -> *mut c_void;
     fn IOSurfaceCreateMachPort(s: *mut c_void) -> Port;
     fn IOSurfaceLookupFromMachPort(p: Port) -> *mut c_void;
+    fn IOSurfaceLock(s: *mut c_void, flags: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceUnlock(s: *mut c_void, flags: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceGetWidth(s: *mut c_void) -> usize;
     fn IOSurfaceGetBaseAddress(s: *mut c_void) -> *mut c_void;
     fn IOSurfaceGetBytesPerRow(s: *mut c_void) -> usize;
     fn IOSurfaceGetHeight(s: *mut c_void) -> usize;
@@ -125,6 +128,31 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    /// # Safety
+    /// `surface` is a live IOSurfaceRef. The returned owner retains it.
+    pub unsafe fn retain_raw(surface: *mut c_void) -> Surface {
+        assert!(!surface.is_null());
+        unsafe { CFRetain(surface) };
+        Surface(surface)
+    }
+
+    /// Read a completed immutable compositor snapshot only on shadow fallback.
+    /// # Safety
+    /// GPU producers must have completed and no writer may mutate the surface
+    /// during the closure.
+    pub unsafe fn read_snapshot<R>(&self, f: impl FnOnce(&[u8], usize, usize, usize) -> R) -> Option<R> {
+        struct Locked(*mut c_void);
+        impl Drop for Locked { fn drop(&mut self) { unsafe { IOSurfaceUnlock(self.0, 1, std::ptr::null_mut()) }; } }
+        // SAFETY: a live surface; the read lock and reference cover the closure.
+        unsafe {
+            if IOSurfaceLock(self.0, 1, std::ptr::null_mut()) != 0 { return None; }
+            let _lock = Locked(self.0);
+            let ptr = IOSurfaceGetBaseAddress(self.0).cast::<u8>();
+            if ptr.is_null() { return None; }
+            Some(f(std::slice::from_raw_parts(ptr, self.len()),
+                IOSurfaceGetWidth(self.0), IOSurfaceGetHeight(self.0), IOSurfaceGetBytesPerRow(self.0)))
+        }
+    }
     /// A new IOSurface of `width`×`height` elements of `bytes_per_element`,
     /// `bytes_per_row` apart, pixel format `fourcc` (e.g. `'BGRA'`). The pitch is
     /// the caller's, so that the app side can be told it before the surface exists.
@@ -209,6 +237,11 @@ static TABLE: Mutex<Option<HashMap<String, Surface>>> = Mutex::new(None);
 fn table<R>(f: impl FnOnce(&mut HashMap<String, Surface>) -> R) -> R {
     let mut g = TABLE.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(HashMap::new))
+}
+
+/// Retain an imported GPU section without mapping or reading its pixels.
+pub fn surface(name: &str) -> Option<Surface> {
+    table(|t| t.get(name).map(Surface::retain))
 }
 
 /// `map_section`'s view of a section by name: a reference of its own (so a

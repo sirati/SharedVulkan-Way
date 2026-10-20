@@ -1709,8 +1709,31 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
             }
         }
         ToUi::Present { id, damage } => present(id, &damage),
-        // Never sent off Windows; see its definition.
-        ToUi::Direct { .. } => {}
+        ToUi::Direct { id, frame, damage: _, serial } => {
+            let ok = if let Some(frame) = frame {
+                match super::macos_metal::snapshot(&frame) {
+                    Ok(output) => {
+                        if let Some((view, scale)) = with_win(id, |w| (w.view.clone(), w.shadow.lock().unwrap_or_else(|e| e.into_inner()).scale()))
+                            && let Some(layer) = view_layer(&view) {
+                            // The layer retains this immutable IOSurface. It is
+                            // never reused as a render target after this point.
+                            unsafe {
+                                let _: () = msg_send![&*layer, setOpaque: !frame.format.has_alpha()];
+                                let _: () = msg_send![&*layer, setContentsScale: f64::from(scale)];
+                                let _: () = msg_send![&*layer, setContents: output.as_ptr().cast::<AnyObject>()];
+                            }
+                            // SAFETY: the complete immutable output is retained
+                            // independently of the layer and this local owner.
+                            let snapshot = Arc::new(unsafe { wc_handle::iosection::Surface::retain_raw(output.as_ptr()) });
+                            send_global(FromUi::MetalCopied { id, serial, snapshot });
+                            return;
+                        } else { false }
+                    }
+                    Err(_) => false,
+                }
+            } else { present(id, &[]); true };
+            send_global(FromUi::DirectShown { id, serial, ok });
+        }
         ToUi::ShiftOrigin { id, dx, dy } => {
             if let Some((window, _, _)) = handles(id) {
                 let mut f = window.frame();

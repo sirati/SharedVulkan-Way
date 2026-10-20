@@ -2247,3 +2247,10 @@ fn wayland_thread(
     state.quit(live_at_exit);
     code
 }
+
+/// Headless hardware acceptance probe for Metal composition and source retirement.
+/// Cross-build on the build host before running on an authorized macOS target.
+#[cfg(target_os = "macos")]
+pub fn probe_metal_retirement() -> Result<(), &'static str> {
+    platform::macos_metal::probe_retirement()
+}

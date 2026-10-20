@@ -101,6 +101,7 @@ unsafe extern "C" {
     fn CFDictionarySetValue(d: *mut c_void, k: CFTypeRef, v: CFTypeRef);
     fn CFNumberCreate(a: CFTypeRef, t: isize, v: *const c_void) -> CFTypeRef;
     fn CFRelease(cf: CFTypeRef);
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
 }
@@ -155,6 +156,13 @@ impl Surface {
             CFRelease(d);
             (!s.is_null()).then_some(Surface(s))
         }
+    }
+
+    /// Another owner; immutable GPU snapshots may be shared by both face slots.
+    pub fn retain(&self) -> Surface {
+        // SAFETY: the returned value owns the new CF reference.
+        unsafe { CFRetain(self.0) };
+        Surface(self.0)
     }
 
     pub fn as_ptr(&self) -> *mut c_void {

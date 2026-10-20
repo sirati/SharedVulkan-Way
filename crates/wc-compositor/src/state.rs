@@ -320,6 +320,12 @@ struct TreeShape {
 struct DirectShown {
     surface: WlSurface,
     buffer: wl_buffer::WlBuffer,
+    #[cfg(target_os = "macos")]
+    serial: u64,
+    #[cfg(target_os = "macos")]
+    released: bool,
+    #[cfg(target_os = "macos")]
+    snapshot: Option<Arc<wc_handle::iosection::Surface>>,
 }
 
 /// §104's follow-up: what the direct present keeps across windows.
@@ -1462,6 +1468,18 @@ impl State {
             match event {
                 FromUi::Stopped => self.stopped = true,
                 FromUi::DirectShown { id, serial, ok } => self.direct_shown(id, serial, ok),
+                #[cfg(target_os = "macos")]
+                FromUi::MetalCopied { id, serial, snapshot } => {
+                    if let Some(w) = self.windows.values_mut().find(|w| w.id == id)
+                        && let Some(shown) = w.direct.as_mut().filter(|s| s.serial == serial) {
+                        shown.snapshot = Some(snapshot);
+                        if !shown.released {
+                            shown.released = true;
+                            if shown.buffer.is_alive() { shown.buffer.release(); }
+                        }
+                    }
+                    self.direct_shown(id, serial, true);
+                }
                 FromUi::Resized { id, width, height } => self.on_resized(id, width, height),
                 FromUi::CloseRequested { id } => {
                     if let Some(w) = self.by_id(id) {
@@ -4193,12 +4211,12 @@ impl State {
         root: &WlSurface,
         buffer: &wl_buffer::WlBuffer,
     ) -> Result<DirectFrame, Option<String>> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = (surface, root, buffer);
             Err(None)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             use smithay::reexports::wayland_server::protocol::wl_shm;
             if self.direct.off {
@@ -4248,9 +4266,13 @@ impl State {
             if transform != wl_output::Transform::Normal {
                 return Err(Some(format!("buffer transform {transform:?}")));
             }
+            #[cfg(target_os = "macos")]
+            if surface != root || !format.has_alpha() || offset != 0 {
+                return Err(None);
+            }
             let viewed = match self.viewport_of(surface) {
                 Some((src, dst, s)) => view_of((w, h), s, src, dst, self.scale_for(surface)).is_some(),
-                None => scale != 1,
+                None => scale != self.scale_for(surface),
             };
             if viewed || self.viewed.contains_key(surface) {
                 return Err(Some("a viewport or buffer scale stands between buffer and surface".into()));
@@ -4265,12 +4287,15 @@ impl State {
                 return Err(Some("it is not the topmost surface of its window".into()));
             }
             let (gx, gy, gw, gh) = shape.canvas;
-            if top.at != (gx, gy) || top.size != (gw, gh) || (w, h) != (gw, gh) {
+            let pixels = (gw.saturating_mul(self.scale_for(surface)), gh.saturating_mul(self.scale_for(surface)));
+            if top.at != (gx, gy) || top.size != pixels || (w, h) != pixels {
                 return Err(Some(format!("its {w}x{h} buffer is not the whole {gw}x{gh} window")));
             }
             if top.format != format {
                 return Err(Some(format!("its buffer changed from {:?} to {format:?}", top.format)));
             }
+            #[cfg(target_os = "macos")]
+            if shape.surfaces.len() != 1 { return Err(None); }
             let below = &shape.surfaces[..shape.surfaces.len() - 1];
             if format.has_alpha() && !below.iter().all(|p| self.direct.opaque_black.contains(&p.surface)) {
                 return Err(Some("it is translucent, over something other than opaque black".into()));
@@ -4278,13 +4303,22 @@ impl State {
             if let Some(frame) = self.direct.frames.get(buffer) {
                 return Ok(frame.clone());
             }
+            #[cfg(windows)]
             let section = handle
                 .open_section_object()
                 .map_err(|e| Some(format!("its section could not be opened for GDI: {e}")))?;
+            #[cfg(target_os = "macos")]
+            let imported = match handle.descriptor() {
+                wc_handle::Descriptor::SharedFile { path, .. } => wc_handle::iosection::surface(path),
+                _ => None,
+            }.ok_or_else(|| Some("not an imported IOSurface section".into()))?;
             self.direct.next_key += 1;
             let frame = DirectFrame {
                 key: self.direct.next_key,
+                #[cfg(windows)]
                 section: Arc::new(section),
+                #[cfg(target_os = "macos")]
+                surface: Arc::new(imported),
                 offset: offset as u32,
                 width: w,
                 height: h,
@@ -4317,7 +4351,10 @@ impl State {
         let window = self.windows.get_mut(root).expect("direct_frame found the window");
         let id = window.id;
         let previous =
-            window.direct.replace(DirectShown { surface: surface.clone(), buffer: buffer.clone() });
+            window.direct.replace(DirectShown { surface: surface.clone(), buffer: buffer.clone(),
+                #[cfg(target_os = "macos")] serial: self.direct.serial + 1,
+                #[cfg(target_os = "macos")] released: false,
+                #[cfg(target_os = "macos")] snapshot: None });
         window.presented += 1;
         let entering = previous.is_none();
         // As `present` does; a client may change its hints in any commit.
@@ -4330,7 +4367,11 @@ impl State {
         if let Some(previous) = previous
             && &previous.buffer != buffer
         {
-            self.direct.held.push((serial, previous.buffer));
+            #[cfg(target_os = "macos")]
+            let held = !previous.released;
+            #[cfg(not(target_os = "macos"))]
+            let held = true;
+            if held { self.direct.held.push((serial, previous.buffer)); }
         }
         if hints_changed {
             self.ui.send(ToUi::SizeHints { id, min: hints.0, max: hints.1 });
@@ -4379,11 +4420,29 @@ impl State {
         let Some(shown) = window.direct.take() else { return };
         let id = window.id;
         window.composed = None;
-        if shown.buffer.is_alive()
+        #[cfg(target_os = "macos")]
+        let readable = shown.buffer.is_alive() || shown.snapshot.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let readable = shown.buffer.is_alive();
+        if readable
             && let Some(staging) = self.staging.get_mut(&shown.surface)
         {
+            #[allow(unused_mut)]
             let mut read = false;
+            #[cfg(target_os = "macos")]
+            if let Some(snapshot) = &shown.snapshot {
+                // SAFETY: MetalCopied is sent only after command completion;
+                // the output is immutable and independent of the released buffer.
+                read = unsafe { snapshot.read_snapshot(|bytes, width, height, stride| {
+                    let spec = crate::surface::BufferSpec { width: width as i32, height: height as i32,
+                        stride: stride as i32, format: PixelFormat::Argb8888 };
+                    staging.blit(bytes, spec, &[Rect::new(0, 0, spec.width, spec.height)]);
+                }) }.is_some();
+            }
             for source in &self.sources {
+                if read { break; }
+                #[cfg(target_os = "macos")]
+                if shown.released { break; }
                 let r = source.with_pixels(&shown.buffer, &mut |bytes, spec| {
                     staging.blit(bytes, spec, &[Rect::new(0, 0, spec.width, spec.height)]);
                 });
@@ -4406,7 +4465,11 @@ impl State {
         let (_, w, h) = self.compose_tree(root, &shown.surface, &[]);
         self.direct.serial += 1;
         let serial = self.direct.serial;
-        self.direct.held.push((serial, shown.buffer));
+        #[cfg(target_os = "macos")]
+        let held = !shown.released;
+        #[cfg(not(target_os = "macos"))]
+        let held = true;
+        if held { self.direct.held.push((serial, shown.buffer)); }
         let damage = if w > 0 && h > 0 { vec![Rect::new(0, 0, w, h)] } else { Vec::new() };
         self.ui.send(ToUi::Direct { id, frame: None, damage, serial });
         self.note_path(root, false, why);
@@ -4419,7 +4482,11 @@ impl State {
         let Some(shown) = shown else { return };
         self.direct.serial += 1;
         let serial = self.direct.serial;
-        self.direct.held.push((serial, shown.buffer));
+        #[cfg(target_os = "macos")]
+        let held = !shown.released;
+        #[cfg(not(target_os = "macos"))]
+        let held = true;
+        if held { self.direct.held.push((serial, shown.buffer)); }
         self.ui.send(ToUi::Direct { id, frame: None, damage: Vec::new(), serial });
     }
 
@@ -4470,6 +4537,9 @@ impl State {
         }
         w.path_said = Some(direct);
         if direct {
+            #[cfg(target_os = "macos")]
+            println!("wc-compositor: window {} uses Metal composition from its IOSurface, with no CPU readback ({detail})", w.id);
+            #[cfg(not(target_os = "macos"))]
             println!(
                 "wc-compositor: window {} is drawn directly from its client's buffer, which this \
                  process does not read ({detail})",
