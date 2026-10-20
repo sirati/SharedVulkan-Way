@@ -418,6 +418,17 @@ static void readiness(void) {
 }
 static void unsupported(void) {
     if (linux_reference) return;
+    /* Both raw legacy and modern dup sources must refuse special targets
+     * before publication; old state stays attached to its original number. */
+    int special = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); CHECK(special >= 0);
+    int legacy[2], modern[2]; CHECK(pipe(legacy) == 0); pair(modern);
+    CHECK(dup3(legacy[0], special, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    CHECK(dup3(modern[0], special, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    uint64_t one = 1, value = 0;
+    CHECK(write(special, &one, sizeof(one)) == sizeof(one));
+    CHECK(read(special, &value, sizeof(value)) == sizeof(value) && value == 1);
+    CHECK(close(special) == 0 && close(legacy[0]) == 0 && close(legacy[1]) == 0);
+    close_pair(modern);
     CHECK(socket(AF_UNIX, SOCK_SEQPACKET, 0) == -1 && errno == EOPNOTSUPP);
     int fd[2]; pair(fd); int value = 8192;
     CHECK(setsockopt(fd[0], SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == -1 && errno == EOPNOTSUPP);

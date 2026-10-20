@@ -1,0 +1,77 @@
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -235,8 +235,8 @@
+ 
+     pthread_mutex_lock(&fd_lock);
+     if (!replace && fd_table[fd].type != FD_CLOSED) { pthread_mutex_unlock(&fd_lock); errno = EEXIST; return -1; }
+-    if (descriptor && (fd_table[fd].type == FD_EVENTFD || fd_table[fd].type == FD_SIGNALFD ||
+-        fd_table[fd].type == FD_TIMERFD || fd_table[fd].type == FD_INOTIFY)) {
++    if (fd_table[fd].type == FD_EVENTFD || fd_table[fd].type == FD_SIGNALFD ||
++        fd_table[fd].type == FD_TIMERFD || fd_table[fd].type == FD_INOTIFY) {
+         pthread_mutex_unlock(&fd_lock); errno = EOPNOTSUPP; return -1;
+     }
+     if (fd_table[fd].type != FD_CLOSED) {
+@@ -265,19 +265,12 @@
+     fd_bitmap_set_used(fd);
+     pthread_mutex_unlock(&fd_lock);
+ 
+-    switch (old_type) {
+-    case FD_EVENTFD: eventfd_close(fd); break;
+-    case FD_SIGNALFD: signalfd_close(fd); break;
+-    case FD_TIMERFD: timerfd_close(fd); break;
+-    case FD_INOTIFY: inotify_close(fd); break;
+-    default: break;
+-    }
+     /* Clean up old resources outside fd_lock */
+     if (old_desc) {
+         hl_descriptor_release(old_desc);
+     } else if (old_type != FD_CLOSED) {
+         if (old_dir)   closedir(old_dir);
+-        if (old_epoll) free(old_epoll);
++        if (old_epoll) hl_fd_free_dir(old_type, old_epoll);
+         if (old_of) hl_open_file_release(old_of);
+         /* Don't close host stdin/stdout/stderr — hl uses them for
+          * diagnostics. The guest may dup2() over fd 0/1/2 but the
+--- a/src/fd_object.c
++++ b/src/fd_object.c
+@@ -534,23 +534,12 @@
+         hl_fd_put(&ref); return newfd;
+     }
+ 
+-    /* Close target and install. The special-FD subsystems key their state
+-     * on the guest fd number, so they must be told too — otherwise the old
+-     * eventfd/signalfd/timerfd/inotify state stayed alive under a number
+-     * now owned by this dup, and the next creator to reuse that number
+-     * inherited it (a recreated eventfd never became poll-ready). */
+-    hl_fd_detached_t old = {0};
+-    int had = (hl_fd_remove(newfd, &old) == 0);
+-    if (had) {
+-        fd_special_subsystem_close(newfd, old.type);
+-        hl_fd_detached_finish(&old);
+-    }
+-
++    /* Atomic replacement refuses special subsystem targets before publish. */
+     if (fd_alloc_at(newfd, kind, new_host) < 0) {
+-        if (nd) hl_descriptor_release(nd);
+-        else if (new_host >= 0) close(new_host);
++        int64_t result = linux_errno();
++        if (new_host >= 0) close(new_host);
+         hl_fd_put(&ref);
+-        return -LINUX_EBADF;
++        return result;
+     }
+     pthread_mutex_lock(&fd_lock);
+     fd_table[newfd].desc = nd;
+--- a/src/syscall_fs.c
++++ b/src/syscall_fs.c
+@@ -1084,7 +1084,9 @@
+     /* fd_alloc_at cleans up old entry (incl. DIR* closedir) */
+     int dup3_src_type = fd_table[oldfd].type;
+     void *dup3_src_dir = fd_table[oldfd].dir;
+-    fd_alloc_at(newfd, dup3_src_type, new_host_fd);
++    if (fd_alloc_at(newfd, dup3_src_type, new_host_fd) < 0) {
++        int64_t result = linux_errno(); close(new_host_fd); return result;
++    }
+     fd_table[newfd].linux_flags = (linux_flags & LINUX_O_CLOEXEC);
+     /* Carry FD_DEVICE's non-owning registry pointer (V6). */
+     if (dup3_src_type == FD_DEVICE)
