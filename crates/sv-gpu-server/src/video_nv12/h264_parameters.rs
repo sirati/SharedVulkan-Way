@@ -1,8 +1,18 @@
 //! Convert Vulkan StdVideo parameter sets to H.264 NAL units. Only metadata is
 //! encoded here; compressed slices remain in their original shared allocation.
+//!
+//! StdVideo omits several VUI resource-bound and display-timing fields. This
+//! conversion emits legal conservative bounds for omitted restrictions, keeps
+//! the supplied reorder/DPB counts and every HRD field, and emits low_delay_hrd=0
+//! and pic_struct_present=0. These choices do not change reconstructed samples,
+//! prediction, POC, or reference marking. They do not reproduce original SPS
+//! bytes or omitted SEI presentation scheduling. Vulkan coded-picture output
+//! has no timed-display operation; callers must not use this encoder to preserve
+//! an elementary stream's original HRD/display schedule.
 use ash::vk::native::{
-    StdVideoH264PictureParameterSet as Pps, StdVideoH264ScalingLists as Scaling,
-    StdVideoH264SequenceParameterSet as Sps, StdVideoH264SequenceParameterSetVui as Vui,
+    StdVideoH264HrdParameters as Hrd, StdVideoH264PictureParameterSet as Pps,
+    StdVideoH264ScalingLists as Scaling, StdVideoH264SequenceParameterSet as Sps,
+    StdVideoH264SequenceParameterSetVui as Vui,
 };
 struct Writer {
     bytes: Vec<u8>,
@@ -120,15 +130,48 @@ unsafe fn scaling(w: &mut Writer, pointer: *const Scaling, count: usize) -> Resu
     }
     Ok(())
 }
+// HRD syntax affects hypothetical rate/buffer scheduling, not reconstructed
+// samples. All representable StdVideo HRD fields are preserved exactly.
+unsafe fn hrd(w: &mut Writer, pointer: *const Hrd) -> Result<(), String> {
+    let h = unsafe { pointer.as_ref() }.ok_or("HRD flag has no HRD parameters")?;
+    require(
+        h.cpb_cnt_minus1 <= 31 && h.bit_rate_scale <= 15 && h.cpb_size_scale <= 15,
+        "invalid H.264 HRD count/scales",
+    )?;
+    require(
+        [
+            h.initial_cpb_removal_delay_length_minus1,
+            h.cpb_removal_delay_length_minus1,
+            h.dpb_output_delay_length_minus1,
+            h.time_offset_length,
+        ]
+        .iter()
+        .all(|n| *n <= 31),
+        "invalid H.264 HRD delay lengths",
+    )?;
+    w.ue(u32::from(h.cpb_cnt_minus1));
+    w.bits(u32::from(h.bit_rate_scale), 4);
+    w.bits(u32::from(h.cpb_size_scale), 4);
+    for i in 0..=usize::from(h.cpb_cnt_minus1) {
+        require(
+            h.cbr_flag[i] <= 1
+                && h.bit_rate_value_minus1[i] < u32::MAX
+                && h.cpb_size_value_minus1[i] < u32::MAX,
+            "invalid H.264 HRD CPB entry",
+        )?;
+        w.ue(h.bit_rate_value_minus1[i]);
+        w.ue(h.cpb_size_value_minus1[i]);
+        w.flag(u32::from(h.cbr_flag[i]));
+    }
+    w.bits(h.initial_cpb_removal_delay_length_minus1, 5);
+    w.bits(h.cpb_removal_delay_length_minus1, 5);
+    w.bits(h.dpb_output_delay_length_minus1, 5);
+    w.bits(h.time_offset_length, 5);
+    Ok(())
+}
 unsafe fn vui(w: &mut Writer, pointer: *const Vui) -> Result<(), String> {
     let v = unsafe { pointer.as_ref() }.ok_or("VUI flag has no VUI data")?;
     let f = &v.flags;
-    require(
-        f.nal_hrd_parameters_present_flag() == 0
-            && f.vcl_hrd_parameters_present_flag() == 0
-            && f.bitstream_restriction_flag() == 0,
-        "StdVideo cannot represent all H.264 HRD/restriction syntax; these VUI modes are unsupported",
-    )?;
     w.flag(f.aspect_ratio_info_present_flag());
     if f.aspect_ratio_info_present_flag() != 0 {
         require(
@@ -177,10 +220,43 @@ unsafe fn vui(w: &mut Writer, pointer: *const Vui) -> Result<(), String> {
         w.bits(v.time_scale, 32);
         w.flag(f.fixed_frame_rate_flag());
     }
+    w.flag(f.nal_hrd_parameters_present_flag());
+    if f.nal_hrd_parameters_present_flag() != 0 {
+        unsafe {
+            hrd(w, v.pHrdParameters)?;
+        }
+    }
+    w.flag(f.vcl_hrd_parameters_present_flag());
+    if f.vcl_hrd_parameters_present_flag() != 0 {
+        unsafe {
+            hrd(w, v.pHrdParameters)?;
+        }
+    }
+    if f.nal_hrd_parameters_present_flag() != 0 || f.vcl_hrd_parameters_present_flag() != 0 {
+        // StdVideo omits low_delay_hrd_flag. Zero permits buffering and places
+        // no extra low-delay restriction on the unchanged coded pictures.
+        w.flag(0);
+    }
+    // StdVideo has no pic_struct_present_flag. Vulkan does not transport SEI
+    // picture-timing/display scheduling, so emit no pic_struct timing syntax.
     w.flag(0);
-    w.flag(0); // nal_hrd_parameters_present, vcl_hrd_parameters_present
-    w.flag(0); // pic_struct_present_flag has no StdVideo field, use absent.
-    w.flag(0); // bitstream_restriction_flag
+    w.flag(f.bitstream_restriction_flag());
+    if f.bitstream_restriction_flag() != 0 {
+        require(
+            v.max_num_reorder_frames <= v.max_dec_frame_buffering
+                && v.max_dec_frame_buffering <= 16,
+            "invalid H.264 VUI reorder/DPB limits",
+        )?;
+        // Canonical values for syntax omitted by StdVideo. These loosen only
+        // resource/motion bounds, never slice prediction, POC or DPB semantics.
+        w.flag(1); // motion vectors may cross picture boundaries
+        w.ue(0); // largest permitted coded-picture byte bound
+        w.ue(0); // largest permitted macroblock bit bound
+        w.ue(16);
+        w.ue(16); // largest legal horizontal/vertical MV exponents
+        w.ue(u32::from(v.max_num_reorder_frames));
+        w.ue(u32::from(v.max_dec_frame_buffering));
+    }
     Ok(())
 }
 /// # Safety
@@ -302,6 +378,14 @@ pub unsafe fn sps_nal(s: &Sps) -> Result<Vec<u8>, String> {
     }
     w.flag(f.vui_parameters_present_flag());
     if f.vui_parameters_present_flag() != 0 {
+        if let Some(v) = unsafe { s.pSequenceParameterSetVui.as_ref() } {
+            if v.flags.bitstream_restriction_flag() != 0 {
+                require(
+                    v.max_dec_frame_buffering >= s.max_num_ref_frames,
+                    "VUI DPB bound is smaller than SPS reference count",
+                )?;
+            }
+        }
         unsafe {
             vui(&mut w, s.pSequenceParameterSetVui)?;
         }
@@ -399,7 +483,7 @@ mod tests {
         );
     }
     #[test]
-    fn refuses_missing_selected_objects_and_unsupported_vui() {
+    fn refuses_missing_selected_objects_and_invalid_vui() {
         let mut s = baseline();
         s.profile_idc = 100;
         s.flags.set_seq_scaling_matrix_present_flag(1);
@@ -412,14 +496,109 @@ mod tests {
         s.flags.set_vui_parameters_present_flag(1);
         let mut v: Vui = unsafe { std::mem::zeroed() };
         v.flags.set_bitstream_restriction_flag(1);
+        v.max_num_reorder_frames = 2;
+        v.max_dec_frame_buffering = 1;
         s.pSequenceParameterSetVui = &v;
-        assert!(unsafe { sps_nal(&s) }.unwrap_err().contains("restriction"));
+        assert!(unsafe { sps_nal(&s) }.unwrap_err().contains("reorder/DPB"));
     }
     #[test]
     fn inserts_emulation_prevention_bytes() {
         let mut w = Writer::new();
         w.bits(0, 24);
         assert_eq!(w.nal(0x67), [0x67, 0, 0, 3, 0, 0x80]);
+    }
+    fn written_bits(w: &Writer) -> String {
+        let count = if w.bit == 0 {
+            w.bytes.len() * 8
+        } else {
+            (w.bytes.len() - 1) * 8 + usize::from(w.bit)
+        };
+        (0..count)
+            .map(|i| {
+                if w.bytes[i / 8] & (1 << (7 - i % 8)) == 0 {
+                    '0'
+                } else {
+                    '1'
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn hrd_keeps_each_cpb_and_all_delay_lengths() {
+        let mut h: Hrd = unsafe { std::mem::zeroed() };
+        h.cpb_cnt_minus1 = 1;
+        h.bit_rate_scale = 4;
+        h.cpb_size_scale = 5;
+        h.bit_rate_value_minus1[0] = 2;
+        h.cpb_size_value_minus1[0] = 3;
+        h.cbr_flag[0] = 1;
+        h.bit_rate_value_minus1[1] = 0;
+        h.cpb_size_value_minus1[1] = 1;
+        h.cbr_flag[1] = 0;
+        h.initial_cpb_removal_delay_length_minus1 = 6;
+        h.cpb_removal_delay_length_minus1 = 7;
+        h.dpb_output_delay_length_minus1 = 8;
+        h.time_offset_length = 9;
+        let mut w = Writer::new();
+        unsafe { hrd(&mut w, &h) }.unwrap();
+        assert_eq!(
+            written_bits(&w),
+            concat!(
+                "010", "0100", "0101", "011", "00100", "1", "1", "010", "0", "00110", "00111",
+                "01000", "01001"
+            )
+        );
+        h.cbr_flag[1] = 2;
+        assert!(unsafe { hrd(&mut Writer::new(), &h) }.is_err());
+        h.cbr_flag[1] = 0;
+        h.time_offset_length = 32;
+        assert!(unsafe { hrd(&mut Writer::new(), &h) }.is_err());
+    }
+    #[test]
+    fn canonical_restrictions_preserve_reorder_and_dpb_counts() {
+        let mut v: Vui = unsafe { std::mem::zeroed() };
+        v.flags.set_bitstream_restriction_flag(1);
+        v.max_num_reorder_frames = 2;
+        v.max_dec_frame_buffering = 4;
+        let mut w = Writer::new();
+        unsafe { vui(&mut w, &v) }.unwrap();
+        assert_eq!(
+            written_bits(&w),
+            concat!(
+                "00000",
+                "00",
+                "0",
+                "1",
+                "1",
+                "1",
+                "1",
+                "000010001",
+                "000010001",
+                "011",
+                "00101"
+            )
+        );
+        let mut s = baseline();
+        s.flags.set_vui_parameters_present_flag(1);
+        s.pSequenceParameterSetVui = &v;
+        assert!(unsafe { sps_nal(&s) }.is_ok());
+        v.max_dec_frame_buffering = 0;
+        v.max_num_reorder_frames = 0;
+        assert!(
+            unsafe { sps_nal(&s) }
+                .unwrap_err()
+                .contains("reference count")
+        );
+    }
+    #[test]
+    fn hrd_requires_selected_parameters() {
+        let mut v: Vui = unsafe { std::mem::zeroed() };
+        v.flags.set_nal_hrd_parameters_present_flag(1);
+        assert!(
+            unsafe { vui(&mut Writer::new(), &v) }
+                .unwrap_err()
+                .contains("HRD parameters")
+        );
     }
     #[test]
     fn rejects_pps_for_wrong_sps() {

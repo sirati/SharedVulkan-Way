@@ -575,8 +575,8 @@ fn compressed_block(owner: Arc<dyn CompressedBytes>, range: Range<usize>) -> Res
     Ok(block)
 }
 fn annex_b_ranges(data: &[u8], offsets: &[u32]) -> Result<Vec<Range<usize>>, String> {
-    if offsets.is_empty() || offsets.len() > 4096 || offsets[0] != 0 {
-        return Err("Annex B requires 1..4096 exact slice offsets beginning at zero".into());
+    if offsets.is_empty() || offsets.len() > 4096 {
+        return Err("Annex B requires 1..4096 exact slice offsets".into());
     }
     let mut ranges = Vec::with_capacity(offsets.len());
     for (i, &offset) in offsets.iter().enumerate() {
@@ -896,6 +896,9 @@ mod annex_tests {
         assert_eq!(annex_b_ranges(&stream, &[0, 6]).unwrap(), [4..6, 9..13]);
         assert!(annex_b_ranges(&stream, &[0]).is_err());
         assert!(annex_b_ranges(&stream, &[1, 6]).is_err());
+        assert_eq!(annex_b_ranges(&stream, &[6]).unwrap(), [9..13]);
+        let padded = [0xff, 0xee, 0, 0, 1, 0x65, 0x88];
+        assert_eq!(annex_b_ranges(&padded, &[2]).unwrap(), [5..7]);
         assert!(annex_b_ranges(&stream, &[0, 0]).is_err());
         assert!(annex_b_ranges(&stream, &[0, 7]).is_err());
     }
