@@ -227,19 +227,40 @@ int hl_wc_memfd_adopt(hl_open_file_t *of, int fd) {
     wc_hl_prime_release(old);
     return 1;
 }
+/* Failure cleanup is conditional on the retained descriptor. An intercepted
+ * open is already visible to other guest threads by the time restore runs. */
+static int restore_failed(hl_fd_ref_t *expected) {
+    int saved = errno;
+    hl_fd_detached_t detached;
+    if (hl_fd_remove_exact(expected->guest_fd, expected->desc, &detached) == 0)
+        hl_fd_detached_finish(&detached);
+    errno = saved;
+    return -1;
+}
 int hl_wc_memfd_restore(int gfd) {
-    int fd = fd_to_host(gfd);
-    if (fd < 0) return -1;
+    /* Restore may race a guest close/dup2 after the intercepted open has
+     * published its slot. Pin the native alias for metadata and require the
+     * same descriptor identity when publishing the adopted open file. */
+    hl_fd_ref_t expected __attribute__((cleanup(hl_fd_put))) = {0};
+    if (hl_fd_get_replaceable(gfd, &expected) < 0) return -1;
+    int fd = expected.host_fd;
+    if (fd < 0) { errno = EBADF; return restore_failed(&expected); }
     metadata m;
     int present = load(fd, &m);
-    if (present <= 0) return present;
+    if (present < 0) return restore_failed(&expected);
+    if (!present) return 0;
     int alias = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    if (alias < 0) return -1;
-    int flags = fd_table[gfd].linux_flags;
+    if (alias < 0) return restore_failed(&expected);
+    uint32_t flags = atomic_load(&expected.of->status_flags);
+    if (expected.fd_flags & LINUX_O_CLOEXEC) flags |= LINUX_O_CLOEXEC;
     hl_open_file_t *of = hl_open_file_create(FD_REGULAR, &seal_file_ops, flags, NULL);
-    if (!of) { close(alias); errno = ENOMEM; return -1; }
-    if (hl_wc_memfd_adopt(of, alias) < 0) { hl_open_file_release(of); close(alias); return -1; }
-    return hl_fd_install_at(gfd, of, alias, flags & LINUX_O_CLOEXEC, true) < 0 ? -1 : 1;
+    if (!of) { close(alias); errno = ENOMEM; return restore_failed(&expected); }
+    if (hl_wc_memfd_adopt(of, alias) < 0) { int saved = errno; hl_open_file_release(of); close(alias); errno = saved; return restore_failed(&expected); }
+    if (hl_fd_install_if_current(&expected, of, alias, flags & LINUX_O_CLOEXEC) < 0) {
+        if (errno == EAGAIN) return 0;
+        return restore_failed(&expected);
+    }
+    return 1;
 }
 
 #endif
