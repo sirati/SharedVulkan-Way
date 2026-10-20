@@ -21,6 +21,7 @@ pub struct Key {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Extent {
+    /// Byte offset in the complete original physical BAR/backing object.
     pub offset: u64,
     pub capacity: u64,
     pub length: u64,
@@ -42,6 +43,9 @@ struct Allocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantIdentity {
     pub bar_run: u64,
+    /// Rooted physical BAR offset of the canonical allocator's offset zero.
+    /// BarPool grants use arena-relative offsets after the ivshmem header.
+    pub bar_offset_base: u64,
     pub session: u8,
     pub region: u32,
     pub user: User,
@@ -93,7 +97,10 @@ impl Allocator {
         grant: wc_handle::barpool::Grant,
         retained_grant: Arc<dyn Send + Sync>,
     ) -> io::Result<Self> {
-        let start = grant.offset;
+        let start = identity
+            .bar_offset_base
+            .checked_add(grant.offset)
+            .ok_or_else(|| io::Error::other("BAR grant base overflow"))?;
         let end = start
             .checked_add(grant.len)
             .ok_or_else(|| io::Error::other("BAR grant overflow"))?;
@@ -130,6 +137,7 @@ impl Allocator {
                 run,
                 GrantIdentity {
                     bar_run: 19,
+                    bar_offset_base: 0,
                     session: 1,
                     region: 256,
                     user: User::sid("S-1-5-21-1"),
@@ -397,6 +405,36 @@ mod tests {
         (a, p, c)
     }
     #[test]
+    fn canonical_header_offset_is_applied_once_and_overflow_refuses() {
+        let user = User::sid("S-1-5-21-1");
+        let identity = GrantIdentity {
+            bar_run: 19,
+            bar_offset_base: 4096,
+            session: 1,
+            region: 256,
+            user: user.clone(),
+        };
+        let grant = wc_handle::barpool::Grant {
+            id: 256,
+            session: 1,
+            region: 0,
+            offset: 8192,
+            len: 8192,
+        };
+        // SAFETY: the fixture owns the canonical arena grant and its header.
+        let mut a =
+            unsafe { Allocator::from_delegated_grant(71, identity.clone(), grant, Arc::new(())) }
+                .unwrap();
+        let p = a.register_process(user).unwrap();
+        assert_eq!(a.allocate(p, 4096).unwrap().1.offset, 12288);
+        let bad = GrantIdentity {
+            bar_offset_base: u64::MAX,
+            ..identity
+        };
+        // SAFETY: malformed simulated source geometry must be refused.
+        assert!(unsafe { Allocator::from_delegated_grant(72, bad, grant, Arc::new(())) }.is_err());
+    }
+    #[test]
     fn abandoning_live_state_does_not_drop_the_canonical_grant_guard() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Guard(Arc<AtomicBool>);
@@ -412,6 +450,7 @@ mod tests {
                 71,
                 GrantIdentity {
                     bar_run: 19,
+                    bar_offset_base: 0,
                     session: 1,
                     region: 256,
                     user: User::sid("S-1-5-21-1"),
