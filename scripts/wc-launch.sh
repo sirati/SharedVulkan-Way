@@ -206,8 +206,10 @@ PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-skip}"
 # §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
 # from Program Files) and gives it this installation's key; the broker opens
 # the devices for the user's processes, so the per-user port grant above is
-# superseded and its task removed. `skip` keeps §91's grant and the key in the
-# user's install directory, as before §111.
+# superseded and its task removed. `key` only provisions this installation's
+# key in an already running broker, without changing its service or devices.
+# `skip` is for a machine without the broker; it keeps §91's grant and the
+# key in the user's install directory, as before §111.
 BROKER="${WC_LAUNCH_BROKER:-skip}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
@@ -671,7 +673,8 @@ deploy_scope_check() {
     case "$val" in
       install) asked="$asked $name" ;;
       skip|keep) ;;
-      *) echo "error: $name is install, skip or keep, not $val"; exit 2 ;;
+      key) [ "$name" = WC_LAUNCH_BROKER ] || { echo "error: key is only valid for WC_LAUNCH_BROKER"; exit 2; } ;;
+      *) echo "error: $name is install, skip, keep or (broker only) key, not $val"; exit 2 ;;
     esac
   done
   if [ -n "$test" ] && [ -n "$asked" ]; then
@@ -684,6 +687,38 @@ deploy_scope_check() {
   else
     echo "  this deploy changes this installation only (broker, port access, host services: left as they are)"
   fi
+}
+
+# A redeploy must not put an existing broker's signing key back in a desktop
+# user's directory. Check before stopping a session, building or copying files.
+broker_deploy_check() {
+  if [ "${LAYOUT:-user}" != system ] && { [ "$BROKER" = install ] || [ "$BROKER" = key ]; }; then
+    echo "error: privileged broker keys require the system host layout and protected key rotation"
+    return 2
+  fi
+  [ "$BROKER" = install ] && return 0
+  if [ "${LAYOUT:-user}" = system ] && [ "$BROKER" != key ]; then
+    echo "error: the system layout requires WC_LAUNCH_BROKER=key; its signing key must stay privileged"
+    return 2
+  fi
+  local state
+  state=$(g "powershell.exe -NoProfile -Command '\$s=Get-Service -Name waycompose-broker -ErrorAction SilentlyContinue; if (\$s) { \$s.Status.ToString() } else { Write-Output absent }'" | tr -d '\r')
+  case "$state" in
+    absent)
+      [ "$BROKER" != key ] && return 0
+      echo "error: WC_LAUNCH_BROKER=key requires an already running broker; it installs no service"
+      return 2 ;;
+    Running)
+      [ "$BROKER" = key ] && return 0 ;;
+    Stopped|StartPending|StopPending|Paused|PausePending|ContinuePending) ;;
+    *) echo "error: cannot determine broker service state; refusing to copy a signing key"; return 2 ;;
+  esac
+  if [ "$BROKER" = key ]; then
+    echo "error: WC_LAUNCH_BROKER=key requires the broker to be Running, not $state"
+  else
+    echo "error: the broker already exists; use WC_LAUNCH_BROKER=key to keep this installation's key privileged"
+  fi
+  return 2
 }
 
 # §111.10: the staged installation into the system layout, as root.
@@ -702,7 +737,7 @@ install_staged() {
     scp "${SSHOPT[@]}" "$LINUX_BIN/wc-arena-host" "$REL_LINUX/sv-hostd" "$HOST:$HOSTDIR/../sysbin/" >/dev/null \
       || { bad "scp of the services' binaries"; exit 1; }
     h "$HOST_ROOT install -m 0755 $HOSTDIR/../sysbin/wc-arena-host $HOSTDIR/../sysbin/sv-hostd /var/lib/waycompose/bin/ && \
-       $HOST_ROOT systemctl restart wc-bell-hub.service wc-sessiond.service" >/dev/null \
+       $HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh services-restart \$(id -un) auto $HOSTDIR $SESSION" >/dev/null \
       && ok "WC_LAUNCH_SYSTEM_BINS=install: the system hub and session service run this build (restarted)" \
       || bad "the system services' binaries were not replaced"
   else
@@ -770,6 +805,7 @@ do_deploy() {
   gpu_prerequisite_check || exit 2
   host_layout_check
   deploy_scope_check
+  broker_deploy_check || exit 2
   # A session from the last run holds both halves' binaries open. Ended through
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null 2>&1
@@ -1013,30 +1049,39 @@ APPS
   # first time, kept across deploys; it crosses to the guest once, over this
   # deploy channel, which is an administrator's and not the session's.
   local key
-  # §111.10: an installed installation's key is the service's; the staging
-  # copy is made from it, and install-staged keeps the installed one.
   if [ "$LAYOUT" = system ]; then
-    h "mkdir -p $HOSTDIR; k=\$($HOST_ROOT cat $SYSTEM_BASE/$SESSION/session.key 2>/dev/null); \
-       [ -n \"\$k\" ] && (umask 077; printf '%s' \"\$k\" >$HOSTDIR/session.key)" >/dev/null 2>&1
+    # The privileged candidate never enters the admin's staging directory.
+    # Failed broker provisioning leaves verifiers stopped and retry uses the
+    # same candidate. Legacy desktop-readable keys are never imported.
+    scp "${SSHOPT[@]}" "$ROOT/scripts/wc-users-migrate.sh" "$HOST:$HOSTDIR/../wc-users-migrate.sh" >/dev/null || exit 1
+    h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-prepare \$(id -un) auto $HOSTDIR $SESSION" || exit 1
+    key=$(h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-export \$(id -un) auto $HOSTDIR $SESSION") || exit 1
+  else
+    if [ "$BROKER" = install ] || [ "$BROKER" = key ]; then
+      echo "error: privileged broker keys require the system host layout and protected key rotation"
+      exit 1
+    fi
+    key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
+             (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
+             chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   fi
-  key=$(h "mkdir -p $HOSTDIR; test -s $HOSTDIR/session.key || \
-           (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
-           chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
-  if [ "$BROKER" = install ]; then
+  if [ "$BROKER" = install ] || [ "$BROKER" = key ]; then
     # §111.8: the key goes to the broker, which signs the boot record with
     # it and with the caller's identity; the user cannot read it, so a user
     # process cannot sign a record that claims another user.
     local ki
     ki=$(printf '%s' "$key" | g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
-          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r')
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r') || { key=""; bad "broker key provisioning failed; verifier remains stopped"; exit 1; }
     key=""
     echo "$ki" | sed 's/^/        /'
     if echo "$ki" | grep -q 'stored in'; then
       g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/session.key" >/dev/null
+      h "$HOST_ROOT bash $HOSTDIR/../wc-users-migrate.sh key-confirm \$(id -un) auto $HOSTDIR $SESSION" || exit 1
       ok "the installation key is the broker's (ProgramData\\waycompose\\keys, SYSTEM and Administrators only); the user's copy is removed"
     else
       bad "the installation key did not reach the broker"
+      exit 1
     fi
   else
     printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
