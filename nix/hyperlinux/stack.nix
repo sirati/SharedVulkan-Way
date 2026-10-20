@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ];
+    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
@@ -80,6 +80,7 @@ let
       cp ${./hl_drm.h} src/hl_drm.h
       cp ${./hl_socket.c} src/hl_socket.c
       cp ${./hl_socket.h} src/hl_socket.h
+      cp ${./hl_script.h} src/hl_script.h
       cp ${./hl_copy.c} src/hl_copy.c
       cp ${./hl_copy.h} src/hl_copy.h
       cp ${./hl_atomic.c} src/hl_atomic.c
