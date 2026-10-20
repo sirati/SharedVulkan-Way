@@ -39,6 +39,9 @@ impl Layout {
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
+pub mod h264_parameters;
 
 #[cfg(test)]
 mod tests {
@@ -70,3 +73,6 @@ mod tests {
         assert_eq!(l.validate(), Err("NV12 plane dimensions"));
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod joined;

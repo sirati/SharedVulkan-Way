@@ -1129,11 +1129,19 @@ fn emit_forward_command(
     // device or ran out of memory said nothing, and the application's log
     // could not say which side failed. After the locks above are released,
     // so the host may take its own.
+    let recorded_result_failure = if wire.is_recorded {
+        let buffer = recorded_buffer(wire);
+        quote! {
+            __h.poison_command_buffer(a.#buffer.0, #cname);
+            if __h.bypass_optional_overrides() { return Err(sv_wire::WireError::Table); }
+        }
+    } else { quote!() };
     let call = if wire.returns_result {
         quote! {
             #call
             if __r.0 < 0 {
                 __h.note_driver_error(#cname, __r.0);
+                #recorded_result_failure
             }
         }
     } else {
@@ -1510,10 +1518,43 @@ fn emit_forward_command(
         }
     };
 
+    let recorded_capture = if captures_native_recorded(wire) {
+        let variant = naming::opcode_variant(&c.name);
+        let buffer = recorded_buffer(wire);
+        quote! {
+            if !__h.bypass_optional_overrides() && __h.capture_recorded_commands(a.#buffer.0) {
+                return __h.capture_recorded_command(RecordedCall::#variant(Box::new(a)));
+            }
+        }
+    } else {
+        quote!()
+    };
+    let recorded_prepare = if wire.is_recorded {
+        let buffer = wire.inputs.iter().find(|field| {
+            matches!(&field.shape, Shape::Scalar(Scalar::Handle(name)) if name == "VkCommandBuffer")
+        }).ok_or_else(|| format!("{}: recorded command has no command buffer", c.name))?;
+        let buffer = naming::ident(&buffer.rust_name);
+        quote! {
+            if !__h.bypass_optional_overrides() {
+                __h.prepare_recorded_command(#cname, a.#buffer.0)?;
+            }
+        }
+    } else { quote!() };
+    let optional_override = if crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str()) {
+        let hook = format_ident!("override_{}", naming::command_method(&c.name));
+        quote! {
+            if !__h.bypass_optional_overrides() {
+                if let Some(result) = __h.#hook(&a) { return result; }
+            }
+        }
+    } else { quote!() };
     let mut_a = if has_pre || submit_after_call { quote!(mut) } else { quote!() };
     Ok(quote! {
         let #mut_a a = a;
         let __h = &mut self.0;
+        #optional_override
+        #recorded_capture
+        #recorded_prepare
         #unbind_block
         #pre
         #unpoison
@@ -1606,7 +1647,127 @@ fn emit_lower_full_pnext(cx: &Ctx<'_>) -> TokenStream {
 // the whole crate
 // ---------------------------------------------------------------------------
 
+/// The external video producer commands retain their existing typed handling.
+fn captures_native_recorded(wire: &CommandPlan) -> bool {
+    wire.is_recorded
+        && !matches!(
+            wire.name.as_str(),
+            "vkCmdBeginVideoCodingKHR"
+                | "vkCmdControlVideoCodingKHR"
+                | "vkCmdDecodeVideoKHR"
+                | "vkCmdEndVideoCodingKHR"
+        )
+}
+fn recorded_buffer(wire: &CommandPlan) -> proc_macro2::Ident {
+    let buffer = wire.inputs.iter().find(|field| {
+        matches!(&field.shape, Shape::Scalar(Scalar::Handle(name)) if name == "VkCommandBuffer")
+    }).expect("recorded command must carry its original command buffer");
+    naming::ident(&buffer.rust_name)
+}
+
+fn emit_recorded_calls(cx: &Ctx<'_>, forwardable: &BTreeMap<String, TokenStream>) -> TokenStream {
+    let calls: Vec<_> = cx
+        .wire
+        .commands
+        .iter()
+        .filter(|w| forwardable.contains_key(&w.name) && captures_native_recorded(w))
+        .collect();
+    let variants = calls.iter().map(|w| {
+        assert!(
+            !w.generates_reply,
+            "recorded replay must return WireResult<()>"
+        );
+        let variant = naming::opcode_variant(&w.name);
+        let args = format_ident!("{}Args", naming::opcode_variant(&w.name));
+        quote!(#variant(Box<sv_proto::#args>))
+    });
+    let buffers = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let buffer = recorded_buffer(w);
+        quote!(Self::#variant(a) => a.#buffer.0)
+    });
+    let names = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let name = &w.name;
+        quote!(Self::#variant(_) => #name)
+    });
+    let available = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let field = fn_field(&w.name);
+        quote!(Self::#variant(_) => fns.#field.is_some())
+    });
+    let replay = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let method = naming::command_method(&w.name);
+        quote!(Self::#variant(a) => sv_proto::Server::#method(forward, *a))
+    });
+    let video_scope = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let allowed = cx.model.commands.get(&w.name)
+            .and_then(|c| c.video_coding.as_deref())
+            .is_some_and(|scope| matches!(scope, "both" | "inside"));
+        quote!(Self::#variant(_) => #allowed)
+    });
+    let restoration = calls.iter().map(|w| {
+        let variant = naming::opcode_variant(&w.name);
+        let state = cx.model.commands.get(&w.name)
+            .and_then(|c| c.tasks.as_deref())
+            .is_some_and(|tasks| tasks.split(',').any(|task| task.trim() == "state"));
+        let classification = if crate::exceptions::GPU_RECORDED_RESTORABLE_STATE.contains(&w.name.as_str()) {
+            assert!(state, "audited state command lacks registry state classification: {}", w.name);
+            quote!(AuditedState)
+        } else if crate::exceptions::GPU_RECORDED_SCOPE_LOCAL_STATE.contains(&w.name.as_str()) {
+            assert!(state, "scope-local state command lacks registry state classification: {}", w.name);
+            quote!(ScopeLocal)
+        } else if state || crate::exceptions::GPU_RECORDED_UNAUDITED_STATE_EFFECTS.contains(&w.name.as_str()) {
+            quote!(UnsupportedState)
+        } else { quote!(Other) };
+        quote!(Self::#variant(_) => RecordedRestoration::#classification)
+    });
+    quote! {
+        /// Owned original wire arguments, never transient native Raise pointers.
+        /// Aliases enter through their canonical protocol method and variant.
+        #[derive(Clone, Debug)]
+        pub enum RecordedCall { #(#variants,)* }
+        /// Pure state restoration requires a separately audited command allowlist.
+        /// Registry task labels alone do not authorize replaying a command twice.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum RecordedRestoration { AuditedState, ScopeLocal, UnsupportedState, Other }
+        impl RecordedCall {
+            pub fn command_buffer(&self) -> u64 { match self { #(#buffers,)* } }
+            pub fn name(&self) -> &'static str { match self { #(#names,)* } }
+            pub fn available(&self, fns: &DriverFns) -> bool { match self { #(#available,)* } }
+            pub fn allowed_in_video_scope(&self) -> bool { match self { #(#video_scope,)* } }
+            /// Only the explicit semantic allowlist authorizes repeated state replay.
+            pub fn restoration(&self) -> RecordedRestoration { match self { #(#restoration,)* } }
+            pub fn is_state_capable(&self) -> bool { self.restoration() != RecordedRestoration::Other }
+            /// The caller supplies a temporary replay host with worker bypass
+            /// and an override for this exact original wire command-buffer ID.
+            /// All remaining object handles retain canonical host resolution.
+            pub fn replay<H: GpuHost>(self, forward: &mut Forward<H>) -> sv_wire::Result<()> {
+                match self { #(#replay,)* }
+            }
+        }
+    }
+}
+
 fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
+    let optional_methods = cx.wire.commands.iter()
+        .filter(|c| crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str()))
+        .map(|c| {
+            let method = format_ident!("override_{}", naming::command_method(&c.name));
+            let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
+            let ret = if c.generates_reply {
+                let reply = format_ident!("{}Reply", naming::opcode_variant(&c.name));
+                quote!(sv_proto::#reply)
+            } else {
+                quote!(())
+            };
+            quote! {
+                fn #method(&mut self, _args: &sv_proto::#args)
+                    -> Option<sv_wire::Result<#ret>> { None }
+            }
+        });
     let methods = hand.iter().filter_map(|c| {
         let wire = cx.wire.commands.iter().find(|w| w.name == c.name)?;
         let m = naming::command_method(&c.name);
@@ -1636,6 +1797,17 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
         /// honest measure of how much of a GPU side is hand-written: everything
         /// not named here is generated (docs/design.md §7.2, pass 12).
         pub trait GpuHost {
+            fn bypass_optional_overrides(&self) -> bool { false }
+            // Opt in per original wire CB. False preserves the native path with no clone.
+            fn capture_recorded_commands(&self, _command_buffer: u64) -> bool { false }
+            // Receives owned wire arguments before any generic mapping or raising.
+            fn capture_recorded_command(&mut self, _call: RecordedCall) -> sv_wire::Result<()> {
+                Err(sv_wire::WireError::Table)
+            }
+            /// Called with wire handles before every ordinary recorded command.
+            fn prepare_recorded_command(&mut self, _name: &'static str, _command_buffer: u64)
+                -> sv_wire::Result<()> { Ok(()) }
+            #(#optional_methods)*
             /// The driver's entry points.
             fn fns(&self) -> &DriverFns;
             /// App-assigned object id → the driver's own handle (docs/design.md §6.4).
@@ -2173,6 +2345,10 @@ pub fn emit_all(
         .chain(hand_cmds.iter().filter(|c| c.forwarded).map(|c| c.name.clone()))
         .collect();
     sections.push(("fns".to_string(), emit_driver_fns(cx, &table)));
+    sections.push((
+        "recorded calls".to_string(),
+        emit_recorded_calls(cx, &forwardable),
+    ));
     sections.push(("host".to_string(), emit_host_trait(cx, &hand_cmds)));
     sections.push((
         "server".to_string(),

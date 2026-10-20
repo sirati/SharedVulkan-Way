@@ -39,6 +39,10 @@
 // `crate::convert` gives.
 #![allow(clippy::field_reassign_with_default)]
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "native_video_status.rs"]
+mod native_video_status;
+
 use crate::arena::Arena;
 use crate::driver::Driver;
 use crate::table::{Objects, TableError};
@@ -69,6 +73,8 @@ use sv_wire::{Result as WireResult, WireError};
 /// - `queue_lock` is **per device** and is the one thing that is shared *and*
 ///   mutable. See its own documentation.
 pub struct Shared {
+    #[cfg(target_os = "macos")]
+    pub native_video: Mutex<crate::native_video_dispatch::DispatchState>,
     pub driver: Arc<Driver>,
     pub arena: Arena,
     pub objects: Mutex<Objects>,
@@ -174,6 +180,12 @@ impl Shared {
 
 /// One ring's view of the session.
 pub struct GpuServer {
+    #[cfg(target_os = "macos")]
+    pub(crate) native_queue_worker: bool,
+    #[cfg(target_os = "macos")]
+    pub(crate) native_record_replay: Option<(u64, u64)>,
+    #[cfg(target_os = "macos")]
+    pub(crate) native_fatal: Option<crate::native_queue::Fatal>,
     pub shared: std::sync::Arc<Shared>,
     /// The last table failure, so the ring can put a real diagnosis in
     /// `fatal_msg` instead of "unknown command 12".
@@ -262,6 +274,12 @@ impl GpuServer {
 
     pub fn new(shared: std::sync::Arc<Shared>) -> GpuServer {
         GpuServer {
+            #[cfg(target_os = "macos")]
+            native_queue_worker: false,
+            #[cfg(target_os = "macos")]
+            native_record_replay: None,
+            #[cfg(target_os = "macos")]
+            native_fatal: None,
             shared,
             last_error: None,
             dispatch_poison: None,
@@ -326,17 +344,6 @@ impl GpuServer {
         self.shared.driver.served.iter().map(|f| crate::convert::queue_family(&f.props)).collect()
     }
 
-    /// The queue `vkGetDeviceQueue(family, …)` names. A family we did not
-    /// advertise gets the first queue rather than nothing — the command returns
-    /// `void`, and `sv_icd::icd::get_device_queue` has already said so.
-    fn queue_for_family(&self, family: u32) -> vk::Queue {
-        self.shared
-            .driver
-            .served
-            .get(family as usize)
-            .map(|f| f.queue)
-            .unwrap_or(self.shared.driver.queue)
-    }
 }
 
 /// The two video links of a `VkQueueFamilyProperties2` reply, for one family.
@@ -476,6 +483,111 @@ fn no_info() -> WireError {
 }
 
 impl GpuHost for GpuServer {
+    #[cfg(target_os = "macos")]
+    fn override_get_fence_status(&mut self,_a:&p::VkGetFenceStatusArgs)->Option<WireResult<p::VkGetFenceStatusReply>> {self.native_failed_status()}
+    #[cfg(target_os = "macos")]
+    fn override_wait_for_fences(&mut self,a:&p::VkWaitForFencesArgs)->Option<WireResult<p::VkWaitForFencesReply>> {self.native_wait_for_fences(a)}
+    #[cfg(target_os = "macos")]
+    fn override_get_semaphore_counter_value(&mut self,_a:&p::VkGetSemaphoreCounterValueArgs)->Option<WireResult<p::VkGetSemaphoreCounterValueReply>> {self.native_failed_status()}
+    #[cfg(target_os = "macos")]
+    fn override_wait_semaphores(&mut self,a:&p::VkWaitSemaphoresArgs)->Option<WireResult<p::VkWaitSemaphoresReply>> {self.native_wait_semaphores(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_create_event(&mut self,a:&p::VkCreateEventArgs)->Option<WireResult<p::VkCreateEventReply>> {self.native_event_create(a)}
+    #[cfg(target_os = "macos")]
+    fn override_destroy_event(&mut self,a:&p::VkDestroyEventArgs)->Option<WireResult<()>> {self.native_event_destroy(a)}
+    #[cfg(target_os = "macos")]
+    fn override_set_event(&mut self,a:&p::VkSetEventArgs)->Option<WireResult<p::VkSetEventReply>> {self.native_event_set(a)}
+    #[cfg(target_os = "macos")]
+    fn override_reset_event(&mut self,a:&p::VkResetEventArgs)->Option<WireResult<p::VkResetEventReply>> {self.native_event_reset(a)}
+    #[cfg(target_os = "macos")]
+    fn override_get_event_status(&mut self,a:&p::VkGetEventStatusArgs)->Option<WireResult<p::VkGetEventStatusReply>> {self.native_event_status(a)}
+
+    #[cfg(target_os = "macos")]
+    fn capture_recorded_commands(&self, wire: u64) -> bool { self.native_captures_recorded_commands(wire) }
+    #[cfg(target_os = "macos")]
+    fn capture_recorded_command(&mut self, call: sv_gpu_entry::RecordedCall) -> WireResult<()> { self.native_capture_recorded_command(call) }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_recorded_command(&mut self,name:&'static str,wire:u64)->WireResult<()> {self.native_prepare_recorded_command(name,wire)}
+
+    #[cfg(target_os = "macos")]
+    fn override_allocate_command_buffers(&mut self,a:&p::VkAllocateCommandBuffersArgs)->Option<WireResult<p::VkAllocateCommandBuffersReply>> {self.native_record_allocate(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_begin_command_buffer(&mut self,a:&p::VkBeginCommandBufferArgs)->Option<WireResult<p::VkBeginCommandBufferReply>> {self.native_record_begin(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_end_command_buffer(&mut self,a:&p::VkEndCommandBufferArgs)->Option<WireResult<p::VkEndCommandBufferReply>> {self.native_record_end(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_reset_command_buffer(&mut self,a:&p::VkResetCommandBufferArgs)->Option<WireResult<p::VkResetCommandBufferReply>> {self.native_record_reset(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_free_command_buffers(&mut self,a:&p::VkFreeCommandBuffersArgs)->Option<WireResult<()>> {self.native_record_free(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_reset_command_pool(&mut self,a:&p::VkResetCommandPoolArgs)->Option<WireResult<p::VkResetCommandPoolReply>> {self.native_record_reset_pool(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_command_pool(&mut self,a:&p::VkDestroyCommandPoolArgs)->Option<WireResult<()>> {self.native_record_destroy_pool(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_pipeline_barrier(&mut self,a:&p::VkCmdPipelineBarrierArgs)->Option<WireResult<()>> {self.native_record_barrier_legacy(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_pipeline_barrier2(&mut self,a:&p::VkCmdPipelineBarrier2Args)->Option<WireResult<()>> {self.native_record_barrier_sync2(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_execute_commands(&mut self,a:&p::VkCmdExecuteCommandsArgs)->Option<WireResult<()>> {self.native_record_execute(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_bind_buffer_memory(&mut self, a: &p::VkBindBufferMemoryArgs) -> Option<WireResult<p::VkBindBufferMemoryReply>> { self.native_bind_video_source(a) }
+    #[cfg(target_os = "macos")]
+    fn override_bind_buffer_memory2(&mut self, a: &p::VkBindBufferMemory2Args) -> Option<WireResult<p::VkBindBufferMemory2Reply>> { self.native_bind_video_sources(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_cmd_control_video_coding_khr(&mut self,a:&p::VkCmdControlVideoCodingKHRArgs)->Option<WireResult<()>> {
+        self.native_cmd_control_video_coding_khr(a)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn override_bind_image_memory(&mut self, a: &p::VkBindImageMemoryArgs) -> Option<WireResult<p::VkBindImageMemoryReply>> { self.native_bind_video_image(a) }
+    #[cfg(target_os = "macos")]
+    fn override_bind_image_memory2(&mut self, a: &p::VkBindImageMemory2Args) -> Option<WireResult<p::VkBindImageMemory2Reply>> { self.native_bind_video_images(a) }
+
+    #[cfg(target_os = "macos")]
+    fn bypass_optional_overrides(&self) -> bool { self.native_queue_worker }
+    #[cfg(target_os = "macos")]
+    fn override_queue_submit(&mut self, a: &p::VkQueueSubmitArgs) -> Option<WireResult<p::VkQueueSubmitReply>> { self.native_queue_submit(a) }
+    #[cfg(target_os = "macos")]
+    fn override_queue_submit2(&mut self, a: &p::VkQueueSubmit2Args) -> Option<WireResult<p::VkQueueSubmit2Reply>> { self.native_queue_submit2(a) }
+    #[cfg(target_os = "macos")]
+    fn override_queue_wait_idle(&mut self, a: &p::VkQueueWaitIdleArgs) -> Option<WireResult<p::VkQueueWaitIdleReply>> { self.native_queue_idle(a) }
+    #[cfg(target_os = "macos")]
+    fn override_device_wait_idle(&mut self, a: &p::VkDeviceWaitIdleArgs) -> Option<WireResult<p::VkDeviceWaitIdleReply>> { self.native_device_idle(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_get_physical_device_video_format_properties_khr(&mut self, a: &p::VkGetPhysicalDeviceVideoFormatPropertiesKHRArgs) -> Option<WireResult<p::VkGetPhysicalDeviceVideoFormatPropertiesKHRReply>> { self.native_get_physical_device_video_format_properties_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_get_physical_device_video_capabilities_khr(&mut self, a: &p::VkGetPhysicalDeviceVideoCapabilitiesKHRArgs) -> Option<WireResult<p::VkGetPhysicalDeviceVideoCapabilitiesKHRReply>> { self.native_get_physical_device_video_capabilities_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_create_video_session_khr(&mut self, a: &p::VkCreateVideoSessionKHRArgs) -> Option<WireResult<p::VkCreateVideoSessionKHRReply>> { self.native_create_video_session_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_video_session_khr(&mut self, a: &p::VkDestroyVideoSessionKHRArgs) -> Option<WireResult<()>> { self.native_destroy_video_session_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_create_video_session_parameters_khr(&mut self, a: &p::VkCreateVideoSessionParametersKHRArgs) -> Option<WireResult<p::VkCreateVideoSessionParametersKHRReply>> { self.native_create_video_session_parameters_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_update_video_session_parameters_khr(&mut self, a: &p::VkUpdateVideoSessionParametersKHRArgs) -> Option<WireResult<p::VkUpdateVideoSessionParametersKHRReply>> { self.native_update_video_session_parameters_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_video_session_parameters_khr(&mut self, a: &p::VkDestroyVideoSessionParametersKHRArgs) -> Option<WireResult<()>> { self.native_destroy_video_session_parameters_khr(a) }
+
     // -- the hooks the generated passes consult -----------------------------
 
     fn fns(&self) -> &DriverFns {
@@ -483,6 +595,12 @@ impl GpuHost for GpuServer {
     }
 
     fn map_handle(&mut self, ty: HandleType, id: u64) -> WireResult<u64> {
+        #[cfg(target_os = "macos")]
+        if ty == HandleType::VkCommandBuffer {
+            if let Some((wire, native)) = self.native_record_replay {
+                if id == wire { return Ok(native); }
+            }
+        }
         if id == 0 {
             return Ok(0);
         }
@@ -525,7 +643,10 @@ impl GpuHost for GpuServer {
 
     fn unbind(&mut self, id: u64) {
         if id != 0 {
-            self.shared.objects().remove(id);
+            let mut objects = self.shared.objects();
+            #[cfg(target_os = "macos")]
+            objects.native_video.sources.destroyed(id);
+            objects.remove(id);
         }
     }
 
@@ -746,6 +867,12 @@ impl GpuHost for GpuServer {
     }
 
     fn create_device(&mut self, a: p::VkCreateDeviceArgs) -> WireResult<p::VkCreateDeviceReply> {
+        let Some(info) = a.p_create_info.as_deref() else {
+            return Ok(p::VkCreateDeviceReply { result: fail(vk::Result::ERROR_INITIALIZATION_FAILED), p_device: None });
+        };
+        if let Err(error) = self.shared.driver.validate_queue_requests(info) {
+            return Ok(p::VkCreateDeviceReply { result: fail(error), p_device: None });
+        }
         // The application's requested feature set is **not** honoured, and that
         // is a real limitation rather than an oversight: the device it is asking
         // for already exists. `crate::driver` compensates by enabling every
@@ -801,7 +928,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueueArgs,
     ) -> WireResult<p::VkGetDeviceQueueReply> {
-        let q = self.queue_for_family(a.queue_family_index);
+        let q = self.shared.driver.served_queue(a.queue_family_index, a.queue_index, 0)
+            .ok_or(WireError::Table)?;
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -812,8 +940,9 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueue2Args,
     ) -> WireResult<p::VkGetDeviceQueue2Reply> {
-        let family = a.p_queue_info.as_ref().map(|i| i.queue_family_index).unwrap_or(0);
-        let q = self.queue_for_family(family);
+        let info = a.p_queue_info.as_ref().ok_or(WireError::Table)?;
+        let q = self.shared.driver.served_queue(info.queue_family_index, info.queue_index, info.flags.0)
+            .ok_or(WireError::Table)?;
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -826,6 +955,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkAllocateMemoryArgs,
     ) -> WireResult<p::VkAllocateMemoryReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_allocate_video_image(&a) { return result; }
         let info = a.p_allocate_info.as_ref().ok_or_else(no_info)?;
         // Arena-backed memory never reaches here: §9.1's heap 1 is allocated by
         // the app side's own allocator and rewritten to `ARENA_MEMORY_ID` before
@@ -956,6 +1087,11 @@ impl GpuHost for GpuServer {
     /// dma-buf legitimately would — has ours OR-ed into it instead.
     fn create_buffer(&mut self, a: p::VkCreateBufferArgs) -> WireResult<p::VkCreateBufferReply> {
         let mut a = a;
+        #[cfg(target_os = "macos")]
+        let native_source_creation = crate::native_video_source::Creation::prepare(
+            self.shared.native_video.lock().unwrap_or_else(|e| e.into_inner()).available(),
+            &mut a,
+        );
         a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let kind = self.shared.arena.external_handle_type.as_raw();
         let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
@@ -990,6 +1126,10 @@ impl GpuHost for GpuServer {
         };
         crate::video_log::buffer_created(buffer as usize as u64, ci.usage.0, ci.size, r.0);
         note_driver_error("vkCreateBuffer", r.0);
+        #[cfg(target_os = "macos")]
+        if let Some(creation) = native_source_creation {
+            creation.complete(&mut self.shared.objects().native_video.sources, r.0);
+        }
         if let Some(id) = a.p_buffer {
             self.bind(id.0, HandleType::VkBuffer, buffer as usize as u64);
         }
@@ -1004,6 +1144,8 @@ impl GpuHost for GpuServer {
     // destroyed it. The observer sees exactly the calls the driver sees.
 
     fn create_image(&mut self, a: p::VkCreateImageArgs) -> WireResult<p::VkCreateImageReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_create_video_image(&a) { return result; }
         let mut a = a;
         a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
@@ -1100,6 +1242,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkCreateImageViewArgs,
     ) -> WireResult<p::VkCreateImageViewReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_create_video_view(&a) { return result; }
         let mut a = a;
         a.device.0 = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let info = a.p_create_info.as_mut().ok_or_else(no_info)?;
@@ -1149,6 +1293,8 @@ impl GpuHost for GpuServer {
     }
 
     fn destroy_image_view(&mut self, a: p::VkDestroyImageViewArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_destroy_video_view(&a) { return result; }
         let id = a.image_view.0;
         let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let view = self.map_handle(HandleType::VkImageView, id)?;
@@ -1161,6 +1307,8 @@ impl GpuHost for GpuServer {
     }
 
     fn destroy_image(&mut self, a: p::VkDestroyImageArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_destroy_video_image(&a) { return result; }
         let id = a.image.0;
         let device = self.map_handle(HandleType::VkDevice, a.device.0)?;
         let image = self.map_handle(HandleType::VkImage, id)?;
@@ -1201,6 +1349,8 @@ impl GpuHost for GpuServer {
     // receives.
 
     fn cmd_begin_video_coding_khr(&mut self, a: p::VkCmdBeginVideoCodingKHRArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_cmd_begin_video_coding_khr(&a){return result;}
         let mut a = a;
         a.command_buffer.0 = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
         if let Some(info) = a.p_begin_info.as_mut() {
@@ -1245,6 +1395,8 @@ impl GpuHost for GpuServer {
     }
 
     fn cmd_decode_video_khr(&mut self, a: p::VkCmdDecodeVideoKHRArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_cmd_decode_video_khr(&a){return result;}
         let mut a = a;
         a.command_buffer.0 = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
         if let Some(info) = a.p_decode_info.as_mut() {
@@ -1313,6 +1465,8 @@ impl GpuHost for GpuServer {
     }
 
     fn cmd_end_video_coding_khr(&mut self, a: p::VkCmdEndVideoCodingKHRArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_cmd_end_video_coding_khr(&a){return result;}
         let cb = self.map_handle(HandleType::VkCommandBuffer, a.command_buffer.0)?;
         let _ = self.take_poisoned_command_buffer();
         let Some(f) = self.fns().vk_cmd_end_video_coding_khr else {
@@ -1349,6 +1503,8 @@ impl GpuHost for GpuServer {
     }
 
     fn free_memory(&mut self, a: p::VkFreeMemoryArgs) -> WireResult<()> {
+        #[cfg(target_os = "macos")]
+        if let Some(result) = self.native_free_video_memory(&a) { return result; }
         let id = a.memory.0;
         if id == crate::ARENA_MEMORY_ID {
             // The arena is freed when the session ends, never by an application.
@@ -1520,6 +1676,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetVideoSessionMemoryRequirementsKHRArgs,
     ) -> WireResult<p::VkGetVideoSessionMemoryRequirementsKHRReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_get_video_session_memory_requirements_khr(&a){return result;}
         let session = self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?;
         let Some(vq) = self.shared.driver.video_queue.as_ref() else {
             self.note_missing("vkGetVideoSessionMemoryRequirementsKHR");
@@ -1583,6 +1741,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkBindVideoSessionMemoryKHRArgs,
     ) -> WireResult<p::VkBindVideoSessionMemoryKHRReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_bind_video_session_memory_khr(&a){return result;}
         let session = vk::VideoSessionKHR::from_raw(
             self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?,
         );

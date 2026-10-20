@@ -42,6 +42,21 @@ fn main() {
             false
         }
     };
+    if std::env::var_os("CARGO_FEATURE_NATIVE_VIDEO_FIXTURE").is_some() {
+        let bounded = manifest.join("examples/assets/mixed-video/bounded.comp");
+        let bounded_spv = out.join("bounded-mixed.spv");
+        println!("cargo:rerun-if-changed={}", bounded.display());
+        let status = Command::new("glslangValidator")
+            .args(["--target-env", "vulkan1.1", "-o"])
+            .arg(&bounded_spv)
+            .arg(&bounded)
+            .status()
+            .expect("native-video-fixture requires glslangValidator for the bounded mixed shader");
+        assert!(
+            status.success(),
+            "bounded mixed fixture shader compilation failed"
+        );
+    }
     // The module is `include_bytes!`d rather than read at run time, and that is
     // not a micro-optimisation: the probe runs inside a bubblewrap sandbox that
     // binds `/nix` and the binary directory and nothing else, so an absolute

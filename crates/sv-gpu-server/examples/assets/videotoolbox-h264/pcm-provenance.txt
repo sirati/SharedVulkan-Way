@@ -1,0 +1,49 @@
+Original PCM/skip H.264 fixture encoder
+
+Generator: generate_pcm.py. SHA256, exact emitted stream hashes, decoded YUV
+hashes, and software decoder version are recorded in pcm-provenance.json.
+Reproduction: python3 generate_pcm.py /path/to/ffmpeg --output-dir /tmp/pcm-fixtures
+The generator emits complete original SPS/PPS/VCL NALs, including I_PCM sample
+payloads and CAVLC skip runs. It never edits a previously emitted NAL. Software
+verification uses FFmpeg -err_detect explode, requires empty error stderr, and
+compares all decoded YUV420P bytes with independent fixed source pixel values.
+
+All pictures are progressive 64x64 8-bit 4:2:0, one slice, four reference slots,
+byte-aligned I_PCM payloads, no crop/VUI, disabled deblocking. Every coded
+pixel has U=80,V=180. I_PCM macroblocks specify luma directly; P-skip predicts
+selected original references with zero motion. Baseline profile is used except
+for the Main-profile B-skip case. No decoded or compressed CPU copy is part of
+the native runtime; the encoder/software decoder are fixture provenance tools.
+
+For each POC type 0,1,2:
+- marking: seven decoded pictures with source FrameNum [0,1,2,3,1,2,3],
+  pre-MMCO5 POC [0,2,4,6,2,4,6], luma [40,80,40,120,120,160,160].
+  Picture1 uses MMCO4(max index1),MMCO3 to promote original picture0 to LT1.
+  Picture2 uses actual idc2 list modification selecting LT1, so its pixels must
+  equal original picture0 despite the newer reference picture1 having Y80.
+  Picture3 uses MMCO5; its setup metadata is normalized FrameNum0,POC0.
+  Picture4 predicts picture3 using ordinary short-term list construction.
+  Picture5 uses MMCO4(max index0),MMCO6 and becomes LT0 with source POC4.
+  Picture6 uses idc2 selecting LT0 and must reproduce picture5's Y160.
+- gap: FrameNum [0,3,4], POC [0,6,8], luma [40,80,80]. The SPS allows gaps.
+  Missing frames1/2 have no emitted NALs. The decoder must infer them in order
+  using sliding marking. Final P-skip selects original real picture1, never an
+  inferred non-existing frame.
+- bootstrap: a fresh original non-IDR reference I_PCM picture at FrameNum3,
+  POC6,Y120. This fresh-decoder input selects its unchanged final original VCL
+  NAL plus the unchanged original SPS/PPS from bootstrap-source. That complete
+  source contains IDR0/P-skip1/P-skip2/I_PCM3 with luma [40,40,40,120] and is
+  independently software-verified too. Exact extraction ranges are in the JSON.
+
+The B-skip stream is Main profile with decode-order FrameNum [0,1,2,2],
+POC [0,4,2,6], reference flags [true,true,false,true], Y [40,120,80,120].
+The non-reference B-skip picture uses L0 original picture0 and L1 picture1,
+producing Y80 through actual bidirectional prediction. Its reference lists
+cannot be replaced by a single most-recent-reference model. FFmpeg output
+reorders to POC [0,2,4,6] and matches all 24576 original expected pixel bytes.
+
+The unwired native_video_fixture_stream.rs utility inspects these full original
+payloads with the production header/POC/DPB/list models and independently fixed
+frame/reference/pixel oracles. Its unproven complete-history planner is used for
+analysis of gaps/fresh POC1/2 only. Native execution remains gated until actual
+required-hardware, original-source, canonical-target pipeline proof succeeds.

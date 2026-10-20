@@ -91,3 +91,66 @@ pub const WIRE_VERSION: u32 = 5;
 pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
     sv_transport::control::ProtocolIds::new(WIRE_VERSION, sv_proto::PROTOCOL_HASH)
 }
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video;
+
+#[cfg(target_os = "macos")]
+mod video_submit;
+
+#[cfg(any(target_os = "macos", test))]
+mod video_worker;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod native_video_dispatch;
+
+#[cfg(target_os = "macos")]
+mod native_queue;
+
+#[cfg(target_os = "macos")]
+mod native_video_image;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod video_recording;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_events;
+
+#[cfg(target_os = "macos")]
+mod native_video_event_dispatch;
+
+#[cfg(target_os = "macos")]
+mod native_video_resources;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video_commands;
+
+#[cfg(target_os = "macos")]
+mod native_video_decode;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_source;
+
+#[cfg(target_os = "macos")]
+mod native_video_recording;
+
+#[cfg(target_os = "macos")]
+mod native_video_barriers;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video_submits;
+
+#[cfg(target_os = "macos")]
+mod native_video_queue;
+
+#[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+pub mod native_video_queue_fixture;
+
+#[cfg(any(test, all(target_os = "macos", feature = "native-video-fixture")))]
+mod native_video_fixture_parameters;
+
+#[cfg(any(target_os = "macos", test))]
+mod native_video_wait_result;
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod native_video_advanced_fixture;

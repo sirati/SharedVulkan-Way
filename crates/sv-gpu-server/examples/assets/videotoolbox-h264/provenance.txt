@@ -1,0 +1,126 @@
+Synthetic VideoToolbox decode fixture, generated on devhost.
+No external media or third-party image content is included.
+
+Asset: progressive-64x50.h264
+SHA256: 51cdf8efcda0a076eee679c57765d055ee904f3f77a1275dbb63d6261e39dc99
+Size: 1997 bytes
+
+Encoder executable:
+/nix/store/i5dzymmqgcc1qw90pqnpalj24m66iqik-ffmpeg-full-8.0.1-bin/bin/ffmpeg
+FFmpeg 8.0.1, libavformat 62.3.100, libavcodec 62.11.100, libx264 core 164.
+The encoder's own SEI records its x264 version/options in the asset.
+Reproduction command:
+python3 generate.py /path/to/ffmpeg-with-libx264
+The checked-in generator records the exact ffmpeg arguments and raw input.
+Different x264 versions may produce different compressed bytes.
+
+Input: eight progressive 64x50 planar yuv420p frames at 25fps.
+For each frame f=0..7:
+  Y(x,y) = 40 + 12*f + 8*floor(x/16) + 6*floor(y/10)
+  U(x,y) = 64 + 5*f
+  V(x,y) = 192 - 5*f
+The SPS reports a 64x64 coded extent and 64x50 display extent with bottom crop.
+Encoder settings: Constrained Baseline, QP12, no B frames, one reference,
+IDR every four frames, AUDs and repeated parameter sets. Encoder log confirms
+2 I pictures and 6 P pictures. All pictures have one VCL slice NAL.
+
+devhost software sanity check:
+ffmpeg -i progressive-64x50.h264 -f rawvideo -pixel_format yuv420p reference.yuv
+Decoded size: 38400 bytes, eight 4800-byte frames.
+Maximum absolute difference from the generated raw Y/U/V input: 1.
+The macOS fixture allows maximum error 4 per channel across every visible pixel.
+This check validates the asset and expected pattern, not VideoToolbox.
+
+Runtime fixture: ../../macos-videotoolbox-decode.rs
+Build/sign on vmhost through the coordinated build flow. Run on the Mac only in
+the parent-coordinated Neo window. No GUI, Vulkan loader, or running compositor
+is required. The fixture sets a 30-second alarm. Success requires eight actual
+hardware-required VT decode completions, valid NV12 IOSurface Pictures, expected
+cropped geometry, all visible Y/U/V pixels within tolerance, and unchanged
+retained output after source-mmap overwrite. The overwrite occurs only after
+session drain/drop and Arc::try_unwrap proves every compressed-block reference
+has been released. CPU pixel readback occurs only in this diagnostic example.
+No macOS execution is claimed by the vmhost software sanity check.
+
+Canonical StdVideo VUI sanity check on vmhost:
+The native parameter encoder's unit test reconstructs this fixture's SPS from
+StdVideo fields using conservative omitted restriction fields. Its expected NAL
+is 6742c00ada109f8884000003000400000300c83c2211a8. Relative to the original SPS,
+the omitted horizontal/vertical motion-vector restriction exponents change
+from 8 to 16. Timing, reorder count 0, DPB count 1, prediction/POC syntax and crop
+remain unchanged. Replacing both original SPS NALs with this canonical SPS,
+then decoding the full 2 IDR + 6 P stream with the same FFmpeg executable,
+produced byte-identical 38400-byte YUV output compared with the original asset.
+This is a pixel-semantics check, not a claim of original SPS byte identity or
+preserved omitted SEI display scheduling, and not a native VT runtime result.
+
+Full-range companion asset: full-range-64x50.h264
+SHA256: f7c98af398b2ccdfa0165a76ef320d1c9ddff1a4d696af45cff2e72c0fdee29a
+Size: 1995 bytes
+Reproduce with generate.py --full-range /path/to/ffmpeg-with-libx264.
+The raw input and output encoder range are both marked pc, so FFmpeg does not
+rescale the known input samples. The SPS explicitly signals full-range VUI.
+Software decode with -c:v rawvideo -pix_fmt yuvj420p produces 38400 bytes with
+maximum per-sample difference 1 from the same known raw pattern.
+Run the signed native fixture with --full-range to require 420f output and
+verify those original full-range values. Default mode requires 420v output.
+Both modes require each original compressed-source FreeBlock release event
+before that frame's completion fence and before submitting the next frame,
+while retaining one VT session across all dependent P pictures. They also call
+update_parameters with unchanged sets for every picture, which must not reset
+or discard VT reference state. Full-range native success is not claimed here.
+
+Full-coded output normalization:
+Decoder::new_coded preserves the original coded/display extent and crop origin,
+but removes only the SPS display-crop flag/offsets in the CM format passed to
+VT. All following VUI bits are retained verbatim; emulation prevention and RBSP
+stop/alignment are regenerated. No compressed slice bytes change. H.264 frame
+cropping is display metadata after macroblock reconstruction, not prediction,
+POC or reference-marking syntax. No pixel resize or padding operation is used.
+The fixture's --coded-output mode requires actual 64x64 Pictures, verifies all
+64 luma rows and all32 chroma rows including encoded edge rows, and still
+reports the original64x50 display rectangle. It also waits per-frame source
+release without resetting the P-picture session. It can combine with --full-range.
+Independent vmhost bit-splicing changed fixture SPS from
+6742c00ada109f8884000003000400000300c83c489a80 to
+6742c00ada109a1000000300100000030320f1226a. FFmpeg then decoded49152bytes,
+eight full64x64 YUV pictures, with maximum error1 against the original input's
+encoded edge-extension rows. This establishes real full macroblock decoding,
+not merely relabeling the cropped50-row image. Native coded-output success is
+not claimed by this software check.
+
+Optional --copy-target adds a real Metal target-copy check. It allocates one
+exact display-size or --coded-output coded-size NV12 target before decoder
+creation and reuses that allocation for every completed frame. Each copy waits
+for tracked input release and synchronous Metal completion before diagnostic
+CPU verification. Target storage is deliberately 420v even for --full-range;
+the copy must preserve the source's raw full-range sample values rather than
+convert according to the target allocation's fourcc. Stream range remains
+separate metadata. The fixture also rechecks every retained decoder picture
+and the final target after compressed-source overwrite. This does not claim
+KK/Vulkan sampling or native target-copy success until the coordinated run.
+
+Independent non-IDR intra bootstrap fixture:
+  non-idr-intra-64x50.h264, 156 bytes
+  SHA256 b6dd041390c9e023b739a78b8ac912b52a819f2a86a734d704b0ee6b38dad4c6
+Recreate with generate.py FFMPEG --intra-bootstrap. Same eight source frames,
+Main profile and x264 bframes=2:open-gop=1 replace Baseline/bframes=0. Extract
+only the unchanged SPS/PPS NALs and unchanged original non-IDR I NAL for source
+frame4. No compressed slice bytes are rewritten. The new fixture has one VCL
+NAL type1, slice_type7 (I), frame_num3, POC8 and default nonadaptive marking.
+devhost FFmpeg independently decodes it to 4800 visible YUV bytes, maximum error0
+against the frame4 pattern. Native --intra-bootstrap starts a fresh required-
+hardware VT decoder and uses source frame4 for every raw-pixel oracle. Coded,
+copy-target and joined-target modes remain available. Native proof is required
+before the production runtime enables non-IDR intra reset/bootstrap.
+
+Native intra40 validation of exact commit5929c81c:
+  display-copy, coded64-copy and coded64 joined Vulkan sampling all exited0.
+  Fresh required-hardware decoder received only the original non-IDR I frame4.
+  Original input release and retained outputs after source mmap overwrite passed.
+  Joined RGB maximum error 1.1920929e-7.
+  Native artifact /nix/store/2v3g0f2q3hi9985z36jwdvffjvhrkcwg-waycompose-darwin-video-probes-arm64-apple-darwin-1
+  Evidence vt-intra-native40.log and vt-intra-cleanup40.log under parent evidence.
+Production bootstrap now accepts parsed POC0 reference I pictures with default marking,
+matching original frame_num and POC computed from fresh state. POC1/non-IDR
+POC2 bootstrap, non-reference I bootstrap and adaptive MMCO bootstrap remain refused pending validation.

@@ -130,11 +130,24 @@ pub fn serve(
     let heart = {
         let control = Arc::clone(&control);
         let beating = Arc::clone(&beating);
+        #[cfg(target_os = "macos")]
+        let shared = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("gpu-heartbeat".into())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                let mut native_peer = sv_transport::control::LivenessMonitor::new(
+                    Instant::now(), APP_GONE_AFTER, Duration::from_millis(50));
                 while beating.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = control.beat_now();
+                    #[cfg(target_os = "macos")]
+                    {
+                        let shutdown = control.flags().is_ok_and(|f| f & Flags::SHUTDOWN != 0);
+                        let gone = matches!(native_peer.poll(&control, Instant::now()),
+                            Ok(sv_transport::control::Liveness::Gone)
+                            | Ok(sv_transport::control::Liveness::Restarted { .. }));
+                        if shutdown || gone { shared.cancel_native_submissions(); }
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
             })
@@ -182,6 +195,8 @@ pub fn serve(
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    shared.cancel_native_submissions();
     beating.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = heart.join();
 
@@ -632,7 +647,17 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     // `Forward` is the generated half: 221 of the 239 commands are answered
     // inside it, and `GpuServer` supplies only the eighteen whose meaning is
     // ours (docs/design.md §7.2 pass 12).
-    let mut srv = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
+    let mut host = GpuServer::new(Arc::clone(&shared));
+    #[cfg(target_os = "macos")]
+    {
+        let control = Arc::clone(&control);
+        host.native_fatal = Some(Arc::new(move |error| {
+            if let Ok(ctrl) = RingCtrl::open(&control, slot) {
+                let _ = ctrl.set_fatal(1, 0, &format!("native queue execution failed: {error:?}"));
+            }
+        }));
+    }
+    let mut srv = sv_gpu_entry::Forward::new(host);
     let mut handled = 0u64;
     let mut reply = Vec::new();
     // The blob is copied out of the arena before it is decoded, into a buffer
@@ -657,6 +682,10 @@ fn drain(control: Arc<Control>, shared: Arc<Shared>, slot: u32) -> Result<u64, S
     let mut ft_window = Instant::now();
 
     loop {
+        #[cfg(target_os = "macos")]
+        if shared.driver.native_submission_failure().is_some() {
+            return Err("native device execution cancelled or failed".into());
+        }
         if control.flags().map_err(err)? & Flags::SHUTDOWN != 0 {
             break;
         }
