@@ -82,12 +82,35 @@ def check_mapping(text, c):
     selected = []
     for line in text.splitlines():
         fields = line.split('#')[0].split()
-        if len(fields) < 3 or fields[0] != c['server'] or fields[1] != c['guest_user']:
+        if len(fields) < 3 or fields[0] != c['server'] or fields[1] not in (c['guest_user'], '-'):
             continue
         installs = next((x[9:].split(',') for x in fields[3:] if x.startswith('installs=')), None)
         if installs is None or c['install'] in installs:
+            require(fields[1] != '-', 'unidentified guest mapping can select the test install')
             selected.append(fields[2])
     require(selected == [c['linux_user']], 'users.conf mapping is absent, ambiguous, or wrong')
+
+
+def broker_key_metadata(data):
+    privileged = {'S-1-5-18', 'S-1-5-32-544'}
+    require(data.get('local_key') is False, 'user-profile session.key must be absent')
+    require(data.get('service') == 'Running', 'Windows broker is not running')
+    require(data.get('length') == 64, 'broker-held key is absent or unprovisioned')
+    for name in ('directory', 'key'):
+        acl = data.get(name, {})
+        require(acl.get('protected') is True, f'broker {name} DACL must disable inheritance')
+        require(acl.get('owner') in privileged, f'broker {name} must have a privileged owner')
+        allow = acl.get('allow')
+        require(isinstance(allow, list) and set(allow) == privileged,
+                f'broker {name} must allow only SYSTEM and Administrators')
+
+
+def signed_identity(text, user):
+    require(re.search(r'boot: record signed by the broker in \d+ us for os=windows user='
+                      + re.escape(user) + r' id=S-1-[0-9-]+(?:\s|$)', text),
+            'fresh compositor log has no authenticated Windows broker signing identity')
+    require('signing with the key file' not in text and 'broker did not sign' not in text,
+            'compositor fell back to an unidentified signing key')
 
 
 def terminal_units(text):
@@ -218,7 +241,7 @@ class Harness:
         require(processes.strip() == '0', 'dedicated guest launcher already runs; leave it untouched')
         script = f"$h=(Get-FileHash -Algorithm SHA256 -LiteralPath {self.ps(exe)}).Hash; Write-Output $h\n"
         require(self.guest(script).strip().lower() == c['guest_sha256'], 'guest launcher differs from approved broker-compatible build')
-        require(self.guest("(Get-Service -Name 'waycompose-broker').Status.ToString()").strip() == 'Running', 'Windows broker is not running')
+        key_metadata = self.check_broker_key()
         ini = self.guest(f"Get-Content -Raw -LiteralPath {self.ps(c['guest_dir'] + '/wc-launch.ini')}")
         guest_ini = configparser.ConfigParser(interpolation=None)
         guest_ini.read_string(ini)
@@ -229,16 +252,18 @@ class Harness:
         require(guest_ini.get('session', 'wayland-bell', fallback='').strip(), 'guest has no Wayland doorbell')
         require(ntpath.normcase(ntpath.normpath(guest_ini.get('session', 'compositor', fallback='')))
                 == ntpath.normcase(ntpath.normpath(c['guest_compositor'])), 'guest ini selects an unpinned compositor')
+        require(guest_ini.get('session', 'installation', fallback='').strip() == c['install'], 'guest ini selects another installation')
+        require(not guest_ini.get('session', 'session-key', fallback='').strip(), 'session-key override bypasses broker-only signing')
         self.check_compositor()
         # Snapshot only immutable inputs, excluding dynamic PIDs/state and sample counts.
         identity_keys = ('source_commit', 'server', 'guest_user', 'linux_user', 'install',
                          'guest_dir', 'guest_home', 'test_home', 'app_exec', 'app_sha256',
                          'guest_sha256', 'guest_compositor', 'compositor_sha256', 'host_proxy', 'host_binaries')
-        manifest = {'schema': 1, 'identity': {key: c[key] for key in identity_keys},
+        manifest = {'schema': 1, 'broker_key_metadata': key_metadata, 'identity': {key: c[key] for key in identity_keys},
                     'guest_ini_sha256': hashlib.sha256(ini.encode()).hexdigest(),
                     'gap_ms': 1000, 'instrument': 'guest QPC L.send/L.recv',
                     'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                    'guest_wc_environment': self.guest("Get-ChildItem Env: | Where-Object { $_.Name -like 'WC_*' } | Sort-Object Name | ForEach-Object { $_.Name + '=' + $_.Value }")}
+                    'guest_wc_environment': self.guest("Get-ChildItem Env: | Where-Object { $_.Name -in @('WC_CTL_SPIN_US','WC_LAUNCH_SPIN_US','WC_BELL_INLINE') } | Sort-Object Name | ForEach-Object { $_.Name + '=' + $_.Value }")}
         manifest['host_configuration'] = self.host(
             'systemctl cat wc-bell-hub wc-sessiond\n'
             'systemctl show -p ExecStart -p Environment wc-bell-hub wc-sessiond\n'
@@ -249,6 +274,53 @@ class Harness:
         # JSON roundtrip prevents later config mutations from altering the snapshot.
         self.manifest = json.loads(json.dumps(manifest))
         self.health()
+
+    def check_broker_key(self):
+        # Administrative management-channel metadata only. Never Get-Content,
+        # Get-FileHash, or open a stream on either signing-key file.
+        local = self.ps(self.c['guest_dir'].rstrip('\\/') + '\\session.key')
+        script = r"""
+function Acl-Metadata($path) {
+  $acl = Get-Acl -LiteralPath $path
+  $allow = @($acl.Access | Where-Object { $_.AccessControlType -eq 'Allow' } |
+    ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } |
+    Sort-Object -Unique)
+  return @{protected=$acl.AreAccessRulesProtected; allow=$allow; owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value}
+}
+$dir = Join-Path $env:ProgramData 'waycompose\keys'
+""" + f"$key = Join-Path $dir {self.ps(self.c['install'] + '.key')}\n" + f"""
+@{{local_key=(Test-Path -LiteralPath {local});
+  service=(Get-Service -Name 'waycompose-broker').Status.ToString();
+  length=(Get-Item -LiteralPath $key).Length;
+  directory=(Acl-Metadata $dir); key=(Acl-Metadata $key)}} | ConvertTo-Json -Depth 4 -Compress
+"""
+        data = json.loads(self.guest(script))
+        broker_key_metadata(data)
+        return data
+
+    def compositor_log_offset(self):
+        log = self.c['guest_home'].rstrip('\\/') + '\\AppData\\Local\\waycompose\\wc-compositor.log'
+        script = f"""
+$p = @(Get-CimInstance Win32_Process -Filter "Name='sv-guest.exe'" | Where-Object {{ $_.CommandLine -like '*--user-control*' }})
+if ($p.Count -gt 0 -and (Test-Path -LiteralPath {self.ps(log)})) {{
+  Write-Output (Get-Item -LiteralPath {self.ps(log)}).Length
+}} else {{ Write-Output 0 }}
+"""
+        return log, int(self.guest(script).strip())
+
+    def verify_signed_boot(self, log, offset):
+        script = f"""
+$f = [IO.File]::Open({self.ps(log)}, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+try {{
+  if ($f.Length -lt {offset}) {{ throw 'compositor log rotated during measurement' }}
+  [void]$f.Seek({offset}, [IO.SeekOrigin]::Begin)
+  $reader = New-Object IO.StreamReader($f)
+  try {{ Write-Output $reader.ReadToEnd() }} finally {{ $reader.Dispose() }}
+}} finally {{ $f.Dispose() }}
+"""
+        text = self.guest(script)
+        signed_identity(text, self.c['guest_user'])
+        return text
 
     def check_compositor(self):
         c = self.c
@@ -339,6 +411,7 @@ class Harness:
                 watch.start()
                 _, log = self.paths()
                 self.guest(f"if (Test-Path -LiteralPath {self.ps(log)}) {{ Remove-Item -LiteralPath {self.ps(log)} }}")
+                comp_log, comp_offset = self.compositor_log_offset()
                 owned = True
                 if mode == 'batch':
                     self.launch(['--session'])
@@ -375,6 +448,8 @@ class Harness:
                 require('shared memory only' in text or 'transport rings:' in text,
                         'launcher log does not confirm shared-memory transport')
                 (Path(out) / 'launcher.log').write_text(text)
+                (Path(out) / 'broker-signing.log').write_text(self.verify_signed_boot(comp_log, comp_offset))
+                self.check_broker_key()
                 self.health()
             finally:
                 self.done.set()

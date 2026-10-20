@@ -21,7 +21,11 @@ listed in `wctestInstalls` and map the authenticated guest identity to
 `wctest`. System `wc-bell-hub` and `wc-sessiond` must run as `waycompose`;
 the hub must have `rings=`. Install only the test installation with
 `WC_LAUNCH_HOST_LAYOUT=system`, `WC_LAUNCH_SESSION=wcil`,
-`WC_LAUNCH_HOST_ROOT='sudokey run --'`, and `WC_LAUNCH_BROKER=skip`.
+`WC_LAUNCH_HOST_ROOT='sudokey run --'`, and `WC_LAUNCH_BROKER=key`. This mode provisions only this installation's
+broker-held signing key and removes its local session.key; it never installs
+or restarts the broker or changes device ACLs. `skip` is not valid for this
+broker deployment. Use the key mode only after its provisioning/ownership
+fix has passed the broker owner's Windows clone gate.
 Leave shared-service and system-binary replacement options at `keep`.
 `WC_LAUNCH_TEST_HOME` alone is not a deployment mechanism for app isolation.
 
@@ -38,7 +42,19 @@ store path with no arguments; no wrapper or altered sandbox settings.
 Set `[session] linger-secs = 900` or greater in the dedicated guest ini
 before measuring. The default 60 seconds is insufficient for a long
 session with no application clients. Require a Wayland doorbell and
-`debug-ssh-transport = off`. An already running wctest session or dedicated
+`debug-ssh-transport = off`. Set `installation = wcil` and leave
+`session-key` unset. Preflight uses the administrative SSH management
+channel to inspect only existence, length, owner and ACL metadata for
+`ProgramData\waycompose\keys\wcil.key` and its parent directory. It never
+reads or hashes signing-key bytes. Both ACLs must be protected and allow
+only SYSTEM and Administrators, with SYSTEM or Administrators ownership.
+The broker must be running and no session.key may remain in the user's
+installation. Insufficient metadata access is a refusal, not proof that
+the key is provisioned. Unidentified mapping entries for wcil are refused.
+Each run also requires a fresh compositor-log signing identity matching the
+configured Windows user, alongside the actual mapped wctest proxy. Only
+new log bytes after the run's offset count as signing evidence; a stale
+prior signing line cannot satisfy this check. An already running wctest session or dedicated
 guest launcher causes a refusal, leaving it untouched. The watchdog checks
 host-to-guest ping and guest SSH every 30 seconds. A failed health check
 aborts management commands without retrying or resetting the guest.
@@ -69,7 +85,7 @@ It pools raw samples rather than averaging batch percentiles. `--minimum`
 may raise the 2000-sample acceptance threshold but cannot lower it. Each
 batch records a fingerprinted immutable manifest containing every binary
 pin, the harness hash, install and mapped-user identity, guest ini hash,
-ambient guest WC_* settings, host service configuration, mapping table,
+ambient guest latency-tuning settings, host service configuration, mapping table,
 apps.ini, gpu.env, and test-home. Reports reject missing, changed, or mixed
 manifests, including different host builds with the same launcher. The
 running proxy image and compositor images are checked against their pins. Every request
