@@ -298,3 +298,30 @@ impl SyncPage {
 impl Drop for SyncPage {
     fn drop(&mut self) { unsafe { libc::munmap(self.base.cast(), 8192); } }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod alias_tests {
+    use super::*;
+    #[test]
+    fn independent_registration_guards_and_sync_page_keep_original_fd() {
+        let token = Token { size: 16384, nonce: [3;16], name: "/sv-shared-native".into(), record: "/sv-fence-test".into() };
+        let header = token.encode();
+        let raw = unsafe { libc::memfd_create(c"prime-sync-alias".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(unsafe { libc::ftruncate(raw, token.size as _) }, 0);
+        assert_eq!(unsafe { libc::pwrite(raw, header.as_ptr().cast(), header.len(), 0) }, header.len() as _);
+        let mut sync = [0u8;16]; sync[..8].copy_from_slice(&crate::token_wire::SYNC_MAGIC); sync[8..].copy_from_slice(&42u64.to_ne_bytes());
+        assert_eq!(unsafe { libc::pwrite(raw, sync.as_ptr().cast(), sync.len(), 4096) }, 16);
+        let registry = Registry::default();
+        let first = registry.register(fd.as_fd(), &header).unwrap();
+        let second = registry.register(fd.as_fd(), &header).unwrap();
+        drop(first);
+        let consumer = registry.import(fd.as_fd()).unwrap();
+        let page = SyncPage::open(consumer.clone()).unwrap().unwrap();
+        drop(second);
+        assert!(registry.import(fd.as_fd()).is_err());
+        drop(fd); drop(consumer);
+        assert_eq!(page.load(), 42);
+    }
+}
