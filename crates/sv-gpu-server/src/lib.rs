@@ -137,3 +137,5 @@ pub(crate) mod native_video_submits;
 #[cfg(target_os = "macos")]
 mod native_video_queue;
 
+#[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+pub mod native_video_queue_fixture;
