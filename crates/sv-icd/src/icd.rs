@@ -47,6 +47,48 @@ const VK_ERROR_TOO_MANY_OBJECTS: i32 = -10;
 /// `VK_ERROR_INVALID_EXTERNAL_HANDLE`, vulkan_core.h.
 const VK_ERROR_INVALID_EXTERNAL_HANDLE: i32 = -1_000_072_003;
 
+/// Reserve only affected binary payload transitions while a submission crosses
+/// the transport. State is never locked during IO. Rejection rolls back entries
+/// that have not since changed, without overwriting unrelated acquisitions.
+/// Applications still order consumption and reuse of the same binary payload
+/// according to Vulkan's valid-usage rules. Independent handles remain free to
+/// progress while this submission waits on transport capacity or its reply.
+struct SemaphoreTransition<'a> {
+    icd: &'a SharedVulkan,
+    changes: Vec<(u64, crate::dmabuf::Semaphore, u64)>,
+    accepted: bool,
+}
+impl<'a> SemaphoreTransition<'a> {
+    fn stage(icd: &'a SharedVulkan, rewrite: impl FnOnce(&mut std::collections::HashMap<u64, crate::dmabuf::Semaphore>)) -> Self {
+        let mut state = icd.state();
+        let before = state.semaphores.clone();
+        rewrite(&mut state.semaphores);
+        let mut changes = Vec::new();
+        for (&id, payload) in &mut state.semaphores {
+            if let Some(previous) = before.get(&id).filter(|old| **old != *payload) {
+                payload.advance_revision();
+                changes.push((id, *previous, payload.revision));
+            }
+        }
+        Self { icd, changes, accepted: false }
+    }
+    fn accept(mut self) { self.accepted = true; }
+}
+impl Drop for SemaphoreTransition<'_> {
+    fn drop(&mut self) {
+        if self.accepted { return; }
+        let mut state = self.icd.state();
+        for &(id, previous, revision) in &self.changes {
+            if let Some(payload) = state.semaphores.get_mut(&id).filter(|p| p.revision == revision) {
+                let mut restored = previous;
+                restored.revision = revision;
+                restored.advance_revision();
+                *payload = restored;
+            }
+        }
+    }
+}
+
 /// Forward if there is a GPU side, otherwise answer with `$local`.
 ///
 /// Every physical-device query below has this shape, and writing it out
@@ -892,7 +934,18 @@ impl Icd for SharedVulkan {
             return refuse;
         }
         let sem = info.semaphore.0;
-        let queue = self.state().semaphores.get_mut(&sem).and_then(|x| x.signal_queue.take());
+        let queue = {
+            let mut state = self.state();
+            if let Some(payload) = state.semaphores.get_mut(&sem) {
+                if payload.consume_local_signal() {
+                    payload.advance_revision();
+                    return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) });
+                }
+                let queue = payload.signal_queue.take();
+                payload.advance_revision();
+                queue
+            } else { None }
+        };
         let Some(queue) = queue else {
             return Ok(p::VkGetSemaphoreFdKHRReply { result: p::VkResult(0), p_fd: Some(-1) });
         };
@@ -949,7 +1002,10 @@ impl Icd for SharedVulkan {
             && info.handle_type.0 as u32 == crate::dmabuf::SYNC_FD
             && info.fd == -1
         {
-            self.state().semaphores.entry(info.semaphore.0).or_default().presignalled = true;
+            let mut state = self.state();
+            let payload = state.semaphores.entry(info.semaphore.0).or_default();
+            payload.temporary_presignalled = true;
+            payload.advance_revision();
             return Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(0) });
         }
         Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(VK_ERROR_INVALID_EXTERNAL_HANDLE) })
@@ -1902,8 +1958,12 @@ impl Icd for SharedVulkan {
         let mut args = args;
         if crate::dmabuf::enabled() {
             self.flush_fences()?;
-            self.track_sync_fd_semaphores(args.queue.0, &mut args.p_submits);
         }
+        // Stage one-shot payload consumption. A failed encode/send has not
+        // accepted a wait and must leave the local acquisition signal intact.
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            Self::track_sync_fd_semaphores(semaphores, args.queue.0, &mut args.p_submits, crate::dmabuf::enabled());
+        });
         let mut buf = vec![0u8; p::size_cmd_vk_queue_submit(&args)];
         {
             let mut enc = sv_wire::Encoder::new(&mut buf);
@@ -1911,6 +1971,7 @@ impl Icd for SharedVulkan {
             enc.finish().map_err(LowerError::Wire)?;
         }
         t.send(sv_icd_entry::RingClass::Queue, p::Opcode::VkQueueSubmit as u32, &buf)?;
+        transition.accept();
         Ok(p::VkQueueSubmitReply { result: p::VkResult(0) })
     }
 
@@ -1942,6 +2003,7 @@ impl Icd for SharedVulkan {
     }
 
     fn destroy_fence(&self, args: p::VkDestroyFenceArgs) -> IcdResult<()> {
+        self.state().acquired_fences.remove(&args.fence.0);
         forwarded!(self, destroy_fence, args, { Ok(()) })
     }
 
@@ -1949,6 +2011,9 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkGetFenceStatusArgs,
     ) -> IcdResult<p::VkGetFenceStatusReply> {
+        if self.state().acquired_fences.contains(&args.fence.0) {
+            return Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) });
+        }
         forwarded!(self, get_fence_status, args, {
             Ok(p::VkGetFenceStatusReply { result: p::VkResult(0) })
         })
@@ -1975,6 +2040,8 @@ impl Icd for SharedVulkan {
                 |enc| p::encode_cmd_vk_reset_fences(enc, 0, &args),
             )?;
         }
+        let mut state = self.state();
+        for fence in &args.p_fences { state.acquired_fences.remove(&fence.0); }
         Ok(p::VkResetFencesReply { result: p::VkResult(0) })
     }
 
@@ -2000,8 +2067,19 @@ impl Icd for SharedVulkan {
 
     fn wait_for_fences(
         &self,
-        args: p::VkWaitForFencesArgs,
+        mut args: p::VkWaitForFencesArgs,
     ) -> IcdResult<p::VkWaitForFencesReply> {
+        {
+            let state = self.state();
+            let complete = args.p_fences.iter().filter(|f| state.acquired_fences.contains(&f.0)).count();
+            if complete > 0 && (!args.wait_all || complete == args.p_fences.len()) {
+                return Ok(p::VkWaitForFencesReply { result: p::VkResult(0) });
+            }
+            if args.wait_all {
+                args.p_fences.retain(|f| !state.acquired_fences.contains(&f.0));
+                args.fence_count = args.p_fences.len() as u32;
+            }
+        }
         forwarded!(self, wait_for_fences, args, {
             Ok(p::VkWaitForFencesReply { result: p::VkResult(0) })
         })
@@ -2387,27 +2465,54 @@ impl Icd for SharedVulkan {
         forward::cmd_pipeline_barrier2(t, args)
     }
 
+    fn queue_bind_sparse(&self, mut args: p::VkQueueBindSparseArgs) -> IcdResult<p::VkQueueBindSparseReply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkQueueBindSparse")); };
+        if crate::dmabuf::enabled() { self.flush_fences()?; }
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            for batch in &mut args.p_bind_info {
+                // Sparse binds have the same semaphore/timeline payload shape,
+                // with no pipeline-stage array or command buffer submission.
+                let mut waits = p::VkSubmitInfo {
+                    p_next: std::mem::take(&mut batch.p_next),
+                    p_wait_semaphores: std::mem::take(&mut batch.p_wait_semaphores),
+                    p_signal_semaphores: batch.p_signal_semaphores.clone(),
+                    ..Default::default()
+                };
+                Self::track_sync_fd_semaphores(semaphores, args.queue.0, std::slice::from_mut(&mut waits), crate::dmabuf::enabled());
+                batch.wait_semaphore_count = waits.wait_semaphore_count;
+                batch.p_wait_semaphores = waits.p_wait_semaphores;
+                batch.p_next = waits.p_next;
+            }
+        });
+        let reply = forward::queue_bind_sparse(t, args)?;
+        if reply.result.0 == 0 { transition.accept(); }
+        Ok(reply)
+    }
+
     /// As `queue_submit`, for the sync-fd semaphores.
     fn queue_submit2(&self, mut args: p::VkQueueSubmit2Args) -> IcdResult<p::VkQueueSubmit2Reply> {
         let Some(t) = self.wire() else {
             return Err(LowerError::NotImplemented("vkQueueSubmit2"));
         };
-        if crate::dmabuf::enabled() {
-            self.flush_fences()?;
-            let mut s = self.state();
-            for b in args.p_submits.iter_mut() {
-                b.p_wait_semaphore_infos.retain(|w| {
-                    !s.semaphores.get_mut(&w.semaphore.0).is_some_and(|x| std::mem::take(&mut x.presignalled))
-                });
-                b.wait_semaphore_info_count = b.p_wait_semaphore_infos.len() as u32;
-                for sig in &b.p_signal_semaphore_infos {
-                    if let Some(x) = s.semaphores.get_mut(&sig.semaphore.0) {
-                        x.signal_queue = Some(args.queue.0);
+        if crate::dmabuf::enabled() { self.flush_fences()?; }
+        let transition = SemaphoreTransition::stage(self, |semaphores| {
+            for batch in &mut args.p_submits {
+                batch.p_wait_semaphore_infos.retain(|wait| {
+                    !semaphores.get_mut(&wait.semaphore.0).is_some_and(crate::dmabuf::Semaphore::consume_local_signal)
+            });
+            batch.wait_semaphore_info_count = batch.p_wait_semaphore_infos.len() as u32;
+            if crate::dmabuf::enabled() {
+                for signal in &batch.p_signal_semaphore_infos {
+                    if let Some(payload) = semaphores.get_mut(&signal.semaphore.0) {
+                        payload.signal_queue = Some(args.queue.0);
                     }
                 }
             }
         }
-        forward::queue_submit2(t, args)
+        });
+        let reply = forward::queue_submit2(t, args)?;
+        if reply.result.0 == 0 { transition.accept(); }
+        Ok(reply)
     }
 }
 
@@ -2772,21 +2877,32 @@ impl SharedVulkan {
     /// Before a submit on the dma-buf path (§104): drop the waits on
     /// pre-signalled semaphores, and note which queue signals each sync-fd
     /// semaphore.
-    fn track_sync_fd_semaphores(&self, queue: u64, submits: &mut [p::VkSubmitInfo]) {
-        let mut s = self.state();
-        if s.semaphores.is_empty() {
-            return;
-        }
-        for b in submits.iter_mut() {
-            crate::dmabuf::drop_presignalled_waits(b, |sem| {
-                s.semaphores.get_mut(&sem).is_some_and(|x| std::mem::take(&mut x.presignalled))
+    fn track_sync_fd_semaphores(semaphores: &mut std::collections::HashMap<u64, crate::dmabuf::Semaphore>, queue: u64, submits: &mut [p::VkSubmitInfo], track_signals: bool) {
+        for batch in submits {
+            crate::dmabuf::drop_presignalled_waits(batch, |sem| {
+                semaphores.get_mut(&sem).is_some_and(crate::dmabuf::Semaphore::consume_local_signal)
             });
-            for sig in &b.p_signal_semaphores {
-                if let Some(x) = s.semaphores.get_mut(&sig.0) {
-                    x.signal_queue = Some(queue);
+            if track_signals {
+                for signal in &batch.p_signal_semaphores {
+                    if let Some(payload) = semaphores.get_mut(&signal.0) {
+                        payload.signal_queue = Some(queue);
+                    }
                 }
             }
         }
+    }
+
+    /// Publish already completed acquisition payloads atomically. No GPU work
+    /// or application-queue dependency is needed to release these signals.
+    pub(crate) fn complete_acquisition(&self, semaphore: u64, fence: u64) {
+        let mut state = self.state();
+        if semaphore != 0 {
+            let payload = state.semaphores.entry(semaphore).or_default();
+            payload.presignalled = true;
+            payload.signal_queue = None;
+            payload.advance_revision();
+        }
+        if fence != 0 { state.acquired_fences.insert(fence); }
     }
 
     /// Consume `sem`'s pending signal on `queue` and wait for it: a submit
@@ -3124,6 +3240,10 @@ mod tests {
 #[cfg(test)]
 #[path = "explicit_requirements_tests.rs"]
 mod explicit_requirements_tests;
+
+#[cfg(test)]
+#[path = "acquisition_sync_tests.rs"]
+mod acquisition_sync_tests;
 
 #[cfg(all(test, unix))]
 #[path = "external_sync_scope_tests.rs"]

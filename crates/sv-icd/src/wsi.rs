@@ -126,7 +126,6 @@ struct SwapImage {
 
 pub struct Swapchain {
     device: u64,
-    queue: u64,
     /// Shared with the presenter, which shows frames from its own thread.
     target: std::sync::Arc<std::sync::Mutex<crate::present::Target>>,
     /// `None` presents on the calling thread (see [`queue_present`]).
@@ -246,7 +245,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
     if desc.width == 0 || desc.height == 0 {
         return Err(LowerError::Shape("vkCreateSwapchainKHR: zero extent"));
     }
-    let queue = {
+    {
         let s = icd.state();
         s.devices
             .get(&device)
@@ -258,7 +257,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
         .clamp(sv_icd_entry::MIN_SWAPCHAIN_IMAGES, sv_icd_entry::MAX_SWAPCHAIN_IMAGES);
 
     #[cfg(target_os = "linux")]
-    if let Some(id) = zero_copy::create(icd, device, desc, queue, count)? {
+    if let Some(id) = zero_copy::create(icd, device, desc, count)? {
         return Ok(id);
     }
 
@@ -330,7 +329,6 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
         id,
         Swapchain {
             device,
-            queue,
             target: std::sync::Arc::new(std::sync::Mutex::new(target)),
             presenter: Presenter::start(icd, std::sync::Arc::clone(&availability), &desc.target, wl_slot.is_some()),
             availability,
@@ -593,18 +591,9 @@ pub fn swapchain_images(icd: &SharedVulkan, swapchain: u64) -> IcdResult<Vec<u64
     Ok(sc.images.iter().map(|i| i.image).collect())
 }
 
-/// `vkAcquireNextImageKHR`.
-///
-/// **Acquire is about timing, not about data**, and the timing it has to
-/// express is "this image is yours now". Every image is free the instant the
-/// present that used it returned — [`queue_present`] waits for its own fence —
-/// so the index is a round-robin cursor and the only work is *signalling*.
-///
-/// Signalling is the part that has to cross. The semaphore and the fence the
-/// application passes are GPU-side objects, and the only way to signal one from
-/// here is to submit something that signals it. An empty `vkQueueSubmit` — no
-/// command buffers, no waits — is exactly that, and it is what every WSI
-/// implementation that does not own the presentation engine does.
+/// `vkAcquireNextImageKHR`. Acquisition completes after an image has been
+/// reserved and its compositor use has ended. Its synchronization payloads
+/// complete locally, independently of unrelated application queue work.
 pub fn acquire_next_image(
     icd: &SharedVulkan,
     device: u64,
@@ -616,7 +605,7 @@ pub fn acquire_next_image(
     let acquire_started = std::time::Instant::now();
     #[cfg(target_os = "linux")]
     let wait = crate::present::wayland::dmabuf::AcquireWait::new(timeout);
-    let (mut index, queue, busy, zc, n) = {
+    let (mut index, busy, zc, n) = {
         let mut chains = icd.swapchains();
         let sc = chains
             .get_mut(&swapchain)
@@ -625,7 +614,6 @@ pub fn acquire_next_image(
         sc.next = (sc.next + 1) % sc.images.len().max(1);
         (
             index as u32,
-            sc.queue,
             std::sync::Arc::clone(&sc.availability),
             sc.zc.clone(),
             sc.images.len(),
@@ -644,30 +632,7 @@ pub fn acquire_next_image(
         index = acquire_copy(&busy, index as usize, timeout, acquire_started)? as u32;
     }
     let _ = device;
-    if semaphore != 0 || fence != 0 {
-        let mut si = p::VkSubmitInfo::default();
-        if semaphore != 0 {
-            si.signal_semaphore_count = 1;
-            si.p_signal_semaphores = vec![p::VkSemaphore(semaphore)];
-        }
-        let signaled = (|| -> IcdResult<()> {
-            let r = icd.queue_submit(p::VkQueueSubmitArgs {
-                queue: p::VkQueue(queue),
-                submit_count: 1,
-                p_submits: vec![si],
-                fence: p::VkFence(fence),
-            })?;
-            result_ok(r.result)
-        })();
-        if let Err(e) = signaled {
-            #[cfg(target_os = "linux")]
-            if let Some(zc) = &zc {
-                zero_copy::cancel_acquire(zc, index as usize);
-            }
-            if zc.is_none() { cancel_copy_acquire(&busy, index as usize); }
-            return Err(e);
-        }
-    }
+    icd.complete_acquisition(semaphore, fence);
     Ok(index)
 }
 
@@ -853,6 +818,7 @@ fn complete_copy(busy: &Busy, index: usize, state: ImageState) {
     busy.1.notify_all();
 }
 
+#[cfg(test)]
 fn cancel_copy_acquire(busy: &Busy, index: usize) {
     let mut states = busy.0.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = states.get_mut(index).filter(|s| **s == ImageState::Acquired) { *slot = ImageState::Available; }
@@ -1332,7 +1298,6 @@ mod zero_copy {
         icd: &SharedVulkan,
         device: u64,
         desc: &SwapchainDesc,
-        queue: u64,
         count: u32,
     ) -> IcdResult<Option<u64>> {
         let PresentTarget::Wayland { display, surface } = desc.target else { return Ok(None) };
@@ -1401,7 +1366,6 @@ mod zero_copy {
             id,
             Swapchain {
                 device,
-                queue,
                 target: std::sync::Arc::new(std::sync::Mutex::new(crate::present::Target::open(
                     PresentTarget::Headless,
                     desc.width,
@@ -1572,12 +1536,6 @@ mod zero_copy {
         }
     }
 
-    pub fn cancel_acquire(zc: &std::sync::Mutex<ZeroCopy>, index: usize) {
-        let z = zc.lock().unwrap_or_else(|e| e.into_inner());
-        z.surface.cancel_acquire(index);
-        notify(&z);
-    }
-
     /// Submit the application's waits and the image's signal, number the
     /// frame, commit its buffer.
     pub fn present(
@@ -1700,6 +1658,19 @@ fn wl_generation(slot: i32) -> u32 {
 fn result_ok(r: p::VkResult) -> IcdResult<()> {
     if r.0 == 0 { Ok(()) } else { Err(LowerError::Result(r.0)) }
 }
+
+#[cfg(test)]
+pub(crate) fn test_available_swapchain(icd: &SharedVulkan, id: u64) {
+    icd.swapchains().insert(id, Swapchain {
+        device: 1,
+        target: std::sync::Arc::new(std::sync::Mutex::new(crate::present::Target::open(PresentTarget::Headless, 1, 1, false))),
+        presenter: None, availability: new_availability(1), wl_slot: None,
+        present_target: PresentTarget::Headless, width: 1, height: 1, swap_rb: false,
+        images: vec![SwapImage { image: 90, memory: 0, buffer: 0, buffer_memory: 0, command_buffer: 0, fence: 0, pixels: 0 }],
+        pool: 0, next: 0, zc: None,
+    });
+}
+
 
 #[cfg(test)]
 mod tests {

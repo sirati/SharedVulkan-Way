@@ -48,7 +48,7 @@ fn external_sync_scope_refuses_real_fd_without_consuming_or_closing_it() {
             .0,
             0
         );
-        assert!(icd.state().semaphores[&20].presignalled);
+        assert!(icd.state().semaphores[&20].temporary_presignalled);
     });
 }
 #[test]
