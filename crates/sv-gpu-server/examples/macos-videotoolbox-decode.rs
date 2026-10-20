@@ -139,7 +139,12 @@ mod fixture {
             }
         }
     }
-    fn verify(picture: &Picture, frame: usize, expected_range: PixelRange) -> Result<(), String> {
+    fn verify(
+        picture: &Picture,
+        frame: usize,
+        expected_range: PixelRange,
+        coded_output: bool,
+    ) -> Result<(), String> {
         let layout = picture.layout();
         if layout.width != WIDTH || ![HEIGHT, 64].contains(&layout.height) {
             return Err(format!(
@@ -165,15 +170,19 @@ mod fixture {
         if y.is_null() || uv.is_null() {
             return Err("fixture pixel planes are not CPU accessible".into());
         }
+        if coded_output && layout.height != 64 {
+            return Err("coded mode requires all 64 output rows".into());
+        }
+        let checked_height = if coded_output { 64 } else { HEIGHT };
         let mut max_error = [0i16; 3];
-        for row in 0..HEIGHT {
+        for row in 0..checked_height {
             for column in 0..WIDTH {
                 let actual = unsafe { *y.add(row * layout.planes[0].stride + column) };
-                let expected = 40 + frame * 12 + (column / 16) * 8 + (row / 10) * 6;
+                let expected = 40 + frame * 12 + (column / 16) * 8 + (row.min(HEIGHT - 1) / 10) * 6;
                 max_error[0] = max_error[0].max((i16::from(actual) - expected as i16).abs());
             }
         }
-        for row in 0..HEIGHT / 2 {
+        for row in 0..checked_height / 2 {
             for column in 0..WIDTH / 2 {
                 let pixel = unsafe { uv.add(row * layout.planes[1].stride + column * 2) };
                 for (channel, expected) in [(1, 64 + frame * 5), (2, 192 - frame * 5)] {
@@ -195,14 +204,18 @@ mod fixture {
         Ok(())
     }
     pub fn run() -> Result<(), String> {
-        let mut arguments = std::env::args().skip(1);
-        let full_range = match arguments.next().as_deref() {
-            None => false,
-            Some("--full-range") => true,
-            _ => return Err("usage: macos-videotoolbox-decode [--full-range]".into()),
-        };
-        if arguments.next().is_some() {
-            return Err("unexpected fixture arguments".into());
+        let mut full_range = false;
+        let mut coded_output = false;
+        for argument in std::env::args().skip(1) {
+            match argument.as_str() {
+                "--full-range" => full_range = true,
+                "--coded-output" => coded_output = true,
+                _ => {
+                    return Err(
+                        "usage: macos-videotoolbox-decode [--full-range] [--coded-output]".into(),
+                    );
+                }
+            }
         }
         let expected_range = if full_range {
             PixelRange::Full
@@ -214,7 +227,9 @@ mod fixture {
         } else {
             VIDEO_STREAM
         };
-        eprintln!("fixture stage=mode expected_range={expected_range:?}");
+        eprintln!(
+            "fixture stage=mode expected_range={expected_range:?} coded_output={coded_output}"
+        );
         unsafe {
             libc::alarm(30);
         }
@@ -242,7 +257,11 @@ mod fixture {
         eprintln!("fixture stage=map shared source");
         let source = Arc::new(Mapping::new(stream)?);
         eprintln!("fixture stage=create hardware-required decoder");
-        let mut decoder = Decoder::new(&stream[sps.2.clone()], &stream[pps.2.clone()])?;
+        let mut decoder = if coded_output {
+            Decoder::new_coded(&stream[sps.2.clone()], &stream[pps.2.clone()])?
+        } else {
+            Decoder::new(&stream[sps.2.clone()], &stream[pps.2.clone()])?
+        };
         eprintln!(
             "fixture stage=decoder created coded={:?} display={:?}",
             decoder.coded_extent, decoder.display_extent
@@ -291,7 +310,7 @@ mod fixture {
             }
             eprintln!("fixture stage=source released before fence frame={frame}");
             eprintln!("fixture stage=verify frame={frame}");
-            verify(&picture, frame, expected_range)?;
+            verify(&picture, frame, expected_range, coded_output)?;
             pictures.push(picture);
         }
         eprintln!("fixture stage=final drain");
@@ -311,7 +330,7 @@ mod fixture {
             return Err("source mutation did not reach mapping".into());
         }
         for (frame, picture) in pictures.iter().enumerate() {
-            verify(picture, frame, expected_range)?;
+            verify(picture, frame, expected_range, coded_output)?;
         }
         unsafe {
             libc::alarm(0);

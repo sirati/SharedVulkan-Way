@@ -259,6 +259,7 @@ unsafe extern "C" fn release_input(context: Ref, _: Ref, size: usize) {
 }
 struct Callbacks {
     range: PixelRange,
+    expected_extent: Option<[u32; 2]>,
     pending: Mutex<HashMap<usize, mpsc::Sender<Result<Arc<Picture>, String>>>>,
 }
 unsafe extern "C" fn completed(
@@ -292,11 +293,16 @@ unsafe extern "C" fn completed(
             let result = unsafe { Picture::from_completed_buffer(image) }
                 .map_err(str::to_owned)
                 .and_then(|picture| {
-                    if picture.range() == state.range {
-                        Ok(picture)
-                    } else {
-                        Err("VideoToolbox ignored requested NV12 sample range".into())
+                    if picture.range() != state.range {
+                        return Err("VideoToolbox ignored requested NV12 sample range".into());
                     }
+                    if state.expected_extent.is_some_and(|extent| {
+                        picture.layout().width != extent[0] as usize
+                            || picture.layout().height != extent[1] as usize
+                    }) {
+                        return Err("VideoToolbox output differs from full coded SPS extent".into());
+                    }
+                    Ok(picture)
                 });
             trace(format_args!(
                 "retain completed picture ok={}",
@@ -315,6 +321,7 @@ pub struct Decoder {
     callbacks: Box<Callbacks>,
     next: usize,
     parameter_sets: (Vec<u8>, Vec<u8>),
+    coded_output: bool,
     pub output_range: PixelRange,
     pub coded_extent: [u32; 2],
     pub display_extent: [u32; 2],
@@ -325,6 +332,16 @@ unsafe impl Send for Decoder {}
 impl Decoder {
     /// SPS and PPS include their NAL headers, without Annex B start codes.
     pub fn new(sps: &[u8], pps: &[u8]) -> Result<Self, String> {
+        Self::new_with_crop_policy(sps, pps, false)
+    }
+    /// Decode full coded macroblocks for Vulkan output. Only SPS display-crop
+    /// metadata is removed from the CM format. Prediction, reference marking,
+    /// VUI and original compressed slices are unchanged. Original display/crop
+    /// metadata remains exposed separately. No pixel resizing or padding occurs.
+    pub fn new_coded(sps: &[u8], pps: &[u8]) -> Result<Self, String> {
+        Self::new_with_crop_policy(sps, pps, true)
+    }
+    fn new_with_crop_policy(sps: &[u8], pps: &[u8], coded_output: bool) -> Result<Self, String> {
         trace(format_args!(
             "new begin SPS_bytes={} PPS_bytes={}",
             sps.len(),
@@ -336,6 +353,13 @@ impl Decoder {
             extent.coded_extent, extent.display_extent
         ));
         validate_pps(pps)?;
+        let normalized;
+        let format_sps = if coded_output {
+            normalized = normalize_sps_crop(sps, &extent)?;
+            normalized.as_slice()
+        } else {
+            sps
+        };
         trace(format_args!("hardware support query begin"));
         if !super::macos::hardware_h264() {
             return Err("hardware H.264 decode unavailable".into());
@@ -349,8 +373,8 @@ impl Decoder {
                 CMVideoFormatDescriptionCreateFromH264ParameterSets(
                     ptr::null_mut(),
                     2,
-                    [sps.as_ptr(), pps.as_ptr()].as_ptr(),
-                    [sps.len(), pps.len()].as_ptr(),
+                    [format_sps.as_ptr(), pps.as_ptr()].as_ptr(),
+                    [format_sps.len(), pps.len()].as_ptr(),
                     4,
                     &mut format.0,
                 ),
@@ -387,6 +411,7 @@ impl Decoder {
             )?;
             let mut callbacks = Box::new(Callbacks {
                 range: output_range,
+                expected_extent: coded_output.then_some(extent.coded_extent),
                 pending: Mutex::new(HashMap::new()),
             });
             let callback = Callback {
@@ -412,6 +437,7 @@ impl Decoder {
                 callbacks,
                 next: 1,
                 parameter_sets: (sps.to_vec(), pps.to_vec()),
+                coded_output,
                 output_range,
                 coded_extent: extent.coded_extent,
                 display_extent: extent.display_extent,
@@ -436,14 +462,21 @@ impl Decoder {
         ));
         let geometry = validate_sps(sps)?;
         validate_pps(pps)?;
+        let normalized;
+        let format_sps = if self.coded_output {
+            normalized = normalize_sps_crop(sps, &geometry)?;
+            normalized.as_slice()
+        } else {
+            sps
+        };
         let mut candidate = Owned(ptr::null_mut());
         unsafe {
             checked(
                 CMVideoFormatDescriptionCreateFromH264ParameterSets(
                     ptr::null_mut(),
                     2,
-                    [sps.as_ptr(), pps.as_ptr()].as_ptr(),
-                    [sps.len(), pps.len()].as_ptr(),
+                    [format_sps.as_ptr(), pps.as_ptr()].as_ptr(),
+                    [format_sps.len(), pps.len()].as_ptr(),
                     4,
                     &mut candidate.0,
                 ),
@@ -475,6 +508,7 @@ impl Decoder {
         self.coded_extent = geometry.coded_extent;
         self.display_extent = geometry.display_extent;
         self.crop_origin = geometry.crop_origin;
+        self.callbacks.expected_extent = self.coded_output.then_some(geometry.coded_extent);
         Ok(())
     }
     /// Submit AVC with an event sent by the final original-input FreeBlock.
@@ -859,6 +893,7 @@ struct Geometry {
     coded_extent: [u32; 2],
     display_extent: [u32; 2],
     crop_origin: [u32; 2],
+    crop_bits: Range<usize>,
 }
 fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
     if sps.first().map(|x| x & 0x9f) != Some(7) {
@@ -949,12 +984,14 @@ fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
         return Err("interlaced H.264 is unsupported".into());
     }
     b.read(1)?;
+    let crop_start = b.bit;
     let mut crop = [0u32; 4];
     if b.read(1)? != 0 {
         for value in &mut crop {
             *value = b.ue()?.checked_mul(2).ok_or("SPS crop overflow")?;
         }
     }
+    let crop_end = b.bit;
     let display_width = width
         .checked_sub(crop[0].checked_add(crop[1]).ok_or("SPS crop overflow")?)
         .filter(|n| *n != 0)
@@ -970,7 +1007,63 @@ fn validate_sps(sps: &[u8]) -> Result<Geometry, String> {
         coded_extent: [width, height],
         display_extent: [display_width, display_height],
         crop_origin: [crop[0], crop[2]],
+        crop_bits: crop_start..crop_end,
     })
+}
+
+/// H.264 cropping describes the output display rectangle after macroblock
+/// reconstruction; it does not participate in inter prediction or DPB marking.
+/// Splice only its syntax out of RBSP, preserving every later VUI bit verbatim.
+fn normalize_sps_crop(sps: &[u8], geometry: &Geometry) -> Result<Vec<u8>, String> {
+    if geometry.crop_bits.len() == 1 {
+        return Ok(sps.to_vec());
+    }
+    let mut rbsp = Vec::new();
+    let mut zeros = 0;
+    for &byte in &sps[1..] {
+        if zeros == 2 && byte == 3 {
+            zeros = 0;
+            continue;
+        }
+        rbsp.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    let last = rbsp
+        .iter()
+        .rposition(|b| *b != 0)
+        .ok_or("SPS has no rbsp_stop_one_bit")?;
+    let stop_bit = last * 8 + 7 - rbsp[last].trailing_zeros() as usize;
+    if geometry.crop_bits.end > stop_bit {
+        return Err("SPS crop syntax overlaps trailing bits".into());
+    }
+    let mut output = Vec::new();
+    let mut bit = 0u8;
+    let mut push = |value: u8| {
+        if bit == 0 {
+            output.push(0);
+        }
+        *output.last_mut().unwrap() |= value << (7 - bit);
+        bit = (bit + 1) % 8;
+    };
+    for index in 0..geometry.crop_bits.start {
+        push((rbsp[index / 8] >> (7 - index % 8)) & 1);
+    }
+    push(0); // frame_cropping_flag
+    for index in geometry.crop_bits.end..stop_bit {
+        push((rbsp[index / 8] >> (7 - index % 8)) & 1);
+    }
+    push(1); // regenerate rbsp_stop_one_bit and zero byte-alignment padding
+    let mut nal = vec![sps[0]];
+    let mut zeros = 0;
+    for byte in output {
+        if zeros == 2 && byte <= 3 {
+            nal.push(3);
+            zeros = 0;
+        }
+        nal.push(byte);
+        zeros = if byte == 0 { zeros + 1 } else { 0 };
+    }
+    Ok(nal)
 }
 
 #[cfg(test)]
@@ -1065,7 +1158,8 @@ mod annex_tests {
         let stream = [0, 0, 0, 1, 0x65, 0x88, 0, 0, 1, 0x41, 0x99, 0, 0];
         assert_eq!(annex_b_ranges(&stream, &[0, 6]).unwrap(), [4..6, 9..13]);
         assert!(annex_b_ranges(&stream, &[0]).is_err());
-        assert!(annex_b_ranges(&stream, &[1, 6]).is_err());
+        assert_eq!(annex_b_ranges(&stream, &[1, 6]).unwrap(), [4..6, 9..13]);
+        assert!(annex_b_ranges(&stream, &[2, 6]).is_err());
         assert_eq!(annex_b_ranges(&stream, &[6]).unwrap(), [9..13]);
         let padded = [0xff, 0xee, 0, 0, 1, 0x65, 0x88];
         assert_eq!(annex_b_ranges(&padded, &[2]).unwrap(), [5..7]);
@@ -1141,5 +1235,35 @@ mod release_tests {
         }
         released.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(dropped.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+    #[test]
+    fn removing_display_crop_preserves_all_later_vui_bits() {
+        // Real SPS from the synthetic 2 IDR + 6 P stream. Independent bit-splice
+        // plus FFmpeg full-coded decode verified 49152 bytes, max error1.
+        let original = [
+            0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9f, 0x88, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0xc8,
+            0x3c, 0x48, 0x9a, 0x80,
+        ];
+        let expected = [
+            0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9a, 0x10, 0, 0, 3, 0, 0x10, 0, 0, 3, 3, 0x20,
+            0xf1, 0x22, 0x6a,
+        ];
+        let metadata = validate_sps(&original).unwrap();
+        assert_eq!(metadata.display_extent, [64, 50]);
+        assert_eq!(metadata.coded_extent, [64, 64]);
+        let normalized = normalize_sps_crop(&original, &metadata).unwrap();
+        assert_eq!(normalized, expected);
+        let normalized_metadata = validate_sps(&normalized).unwrap();
+        assert_eq!(normalized_metadata.display_extent, [64, 64]);
+        assert_eq!(normalized_metadata.coded_extent, [64, 64]);
+        assert_eq!(
+            normalize_sps_crop(&normalized, &normalized_metadata).unwrap(),
+            normalized
+        );
     }
 }

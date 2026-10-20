@@ -584,6 +584,7 @@ mod tests {
         assert!(unsafe { sps_nal(&s) }.is_ok());
         v.max_dec_frame_buffering = 0;
         v.max_num_reorder_frames = 0;
+        s.pSequenceParameterSetVui = &v;
         assert!(
             unsafe { sps_nal(&s) }
                 .unwrap_err()

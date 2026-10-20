@@ -69,3 +69,22 @@ before that frame's completion fence and before submitting the next frame,
 while retaining one VT session across all dependent P pictures. They also call
 update_parameters with unchanged sets for every picture, which must not reset
 or discard VT reference state. Full-range native success is not claimed here.
+
+Full-coded output normalization:
+Decoder::new_coded preserves the original coded/display extent and crop origin,
+but removes only the SPS display-crop flag/offsets in the CM format passed to
+VT. All following VUI bits are retained verbatim; emulation prevention and RBSP
+stop/alignment are regenerated. No compressed slice bytes change. H.264 frame
+cropping is display metadata after macroblock reconstruction, not prediction,
+POC or reference-marking syntax. No pixel resize or padding operation is used.
+The fixture's --coded-output mode requires actual 64x64 Pictures, verifies all
+64 luma rows and all32 chroma rows including encoded edge rows, and still
+reports the original64x50 display rectangle. It also waits per-frame source
+release without resetting the P-picture session. It can combine with --full-range.
+Independent vmhost bit-splicing changed fixture SPS from
+6742c00ada109f8884000003000400000300c83c489a80 to
+6742c00ada109a1000000300100000030320f1226a. FFmpeg then decoded49152bytes,
+eight full64x64 YUV pictures, with maximum error1 against the original input's
+encoded edge-extension rows. This establishes real full macroblock decoding,
+not merely relabeling the cropped50-row image. Native coded-output success is
+not claimed by this software check.
