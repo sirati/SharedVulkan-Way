@@ -79,6 +79,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macmach;
 #[cfg(target_os = "macos")]
+pub mod macos_metal;
+#[cfg(target_os = "macos")]
 pub mod macos_router;
 #[cfg(target_os = "macos")]
 pub use macos::{current_layout, has_touch, keyboard_repeat, start};
@@ -369,6 +371,11 @@ pub enum CursorSpec {
         image: IconImage,
         hotspot_x: i32,
         hotspot_y: i32,
+        /// §103.18: the cursor surface's buffer scale, at least 1. The image
+        /// is `scale` pixels per logical unit and the hotspot is logical, so a
+        /// platform that sizes a cursor in points (macOS) shows it at
+        /// `image / scale`. Win32 shows the pixels as they are, as before.
+        scale: i32,
     },
 }
 
@@ -822,6 +829,8 @@ pub struct DirectFrame {
     pub key: u64,
     #[cfg(windows)]
     pub section: Arc<wc_handle::SectionObject>,
+    #[cfg(target_os = "macos")]
+    pub surface: Arc<wc_handle::iosection::Surface>,
     /// Bytes from the start of the section; a multiple of 4.
     pub offset: u32,
     pub width: i32,
@@ -835,6 +844,10 @@ pub struct DirectFrame {
 /// UI thread -> Wayland thread.
 #[derive(Debug)]
 pub enum FromUi {
+    /// Metal has finished reading the client buffer. This independent output
+    /// is immutable and retained for fallback even after wl_buffer.release.
+    #[cfg(target_os = "macos")]
+    MetalCopied { id: WindowId, serial: u64, snapshot: Arc<wc_handle::iosection::Surface> },
     /// The answer to [`ToUi::Direct`] with this `serial`: the window draws
     /// only from what that message said, and nothing before it — or, with
     /// `ok` false, the platform could not draw from that buffer (a DIB could
@@ -933,6 +946,12 @@ pub enum FromUi {
         /// spoke it.
         v120_h: i32,
         v120_v: i32,
+        /// A trackpad, not a wheel: `axis_source` finger, continuous values
+        /// and no v120, so a client runs its own kinetic scrolling.
+        finger: bool,
+        /// The fingers lifted: `axis_stop` on both axes, which is what starts
+        /// that kinetic scrolling.
+        stop: bool,
         time: u32,
     },
     /// The keyboard layout changed under us (`WM_INPUTLANGCHANGE`), naming one
@@ -1136,6 +1155,12 @@ pub(crate) struct Started {
     /// invent one — `--output` remains the whole answer there, which is what
     /// the conformance suite needs.
     pub work_area: Option<(i32, i32)>,
+    /// §103.18: the integer scale of that monitor, device pixels per logical
+    /// unit: the main screen's `backingScaleFactor` on macOS, rounded, and 1
+    /// on Win32 and headless. One monitor, one output, one scale; a platform
+    /// with a scale per monitor (Windows' per-monitor DPI) would make this a
+    /// list with the outputs.
+    pub scale: i32,
 }
 
 pub(crate) fn assemble(
@@ -1143,11 +1168,13 @@ pub(crate) fn assemble(
     wake: Wake,
     inner: PumpInner,
     work_area: Option<(i32, i32)>,
+    scale: i32,
 ) -> Started {
     Started {
         ui: Ui { tx, wake },
         pump: Pump { inner },
         work_area,
+        scale: scale.max(1),
     }
 }
 

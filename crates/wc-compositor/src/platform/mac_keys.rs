@@ -317,6 +317,13 @@ pub fn bounds_in_parent(visible: (f64, f64, f64, f64), content: (f64, f64, f64, 
     crate::surface::Rect::new(left.round() as i32, top.round() as i32, vw.round() as i32, vh.round() as i32)
 }
 
+/// §103.18: the output's integer scale from a screen's `backingScaleFactor`:
+/// rounded, at least 1. A Retina screen says 2.0; a fractional factor is
+/// rounded, since fractional scale is not built.
+pub fn backing_scale(factor: f64) -> i32 {
+    if factor.is_finite() { (factor.round() as i32).max(1) } else { 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +441,16 @@ mod tests {
         // area's top (775) is 275 above the parent's origin.
         let r = bounds_in_parent((0.0, 0.0, 1280.0, 775.0), (100.0, 100.0, 600.0, 400.0));
         assert_eq!(r, crate::surface::Rect::new(-100, -275, 1280, 775));
+    }
+
+    #[test]
+    fn the_backing_scale_is_a_whole_number_of_at_least_one() {
+        assert_eq!(backing_scale(2.0), 2);
+        assert_eq!(backing_scale(1.0), 1);
+        assert_eq!(backing_scale(3.0), 3);
+        assert_eq!(backing_scale(1.4), 1);
+        assert_eq!(backing_scale(1.5), 2);
+        assert_eq!(backing_scale(0.0), 1);
+        assert_eq!(backing_scale(f64::NAN), 1);
     }
 }

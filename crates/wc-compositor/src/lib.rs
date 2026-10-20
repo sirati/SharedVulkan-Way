@@ -268,6 +268,11 @@ struct Args {
     /// Whether `--output` was given. STAGE 38: a real monitor may replace the
     /// default, and must never replace an answer the harness asked for.
     output_explicit: bool,
+    /// §103.18. `--output-scale N`: the output's integer scale, in place of
+    /// the platform's (`Started::scale`). For a harness that has to see a
+    /// scaled output on a platform whose screen is not one; unset, the
+    /// platform decides, which is 1 everywhere but macOS.
+    output_scale: Option<i32>,
     /// One scripted click, as `X,Y[,BUTTON][,MS]`. Headless only.
     ///
     /// ADDED FOR STAGE 9, to open a menu. See `platform::headless::Click`.
@@ -401,6 +406,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         layout: None,
         output: (1920, 1080),
         output_explicit: false,
+        output_scale: None,
         #[cfg(not(windows))]
         click: None,
         decorations: Decorations::default(),
@@ -624,6 +630,15 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 }
                 args.output = (w, h);
                 args.output_explicit = true;
+            }
+            // §103.18.
+            "--output-scale" => {
+                let Some(n) = it.next().and_then(|s| s.parse::<i32>().ok()).filter(|n| (1..=8).contains(n))
+                else {
+                    eprintln!("wc-compositor: --output-scale wants a whole number from 1 to 8");
+                    return Err(2);
+                };
+                args.output_scale = Some(n);
             }
             "--expect-presents" => {
                 args.expect_presents = it.next().and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -1542,7 +1557,8 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-    let platform::Started { ui, pump, work_area } = started;
+    let platform::Started { ui, pump, work_area, scale } = started;
+    let output_scale = args.output_scale.unwrap_or(scale);
 
     // STAGE 38. The one `wl_output` describes the **work area** of the real
     // monitor, unless the harness asked for a particular size.
@@ -1586,7 +1602,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .name("wayland".into())
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
-                args.expect_presents, args.poll_coarse, layout, args.output,
+                args.expect_presents, args.poll_coarse, layout, args.output, output_scale,
                 args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty,
                 args.nested_globals || session_svc::multi());
             thread_exit.store(code, Ordering::SeqCst);
@@ -1709,6 +1725,8 @@ fn wayland_thread(
     poll_coarse: bool,
     layout: String,
     output: (i32, i32),
+    // §103.18. See `Started::scale`.
+    output_scale: i32,
     decorations: Decorations,
     ui: platform::Ui,
     events: std::sync::mpsc::Receiver<platform::FromUi>,
@@ -1737,7 +1755,8 @@ fn wayland_thread(
         }
     };
     let dh = display.handle();
-    let mut state = State::new(&dh, ui, events, debug_icon, &layout, output, decorations, nested_globals);
+    let mut state =
+        State::new(&dh, ui, events, debug_icon, &layout, output, output_scale, decorations, nested_globals);
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
@@ -2227,4 +2246,11 @@ fn wayland_thread(
     let _ = std::io::stdout().flush();
     state.quit(live_at_exit);
     code
+}
+
+/// Headless hardware acceptance probe for Metal composition and source retirement.
+/// Cross-build on the build host before running on an authorized macOS target.
+#[cfg(target_os = "macos")]
+pub fn probe_metal_retirement() -> Result<(), &'static str> {
+    platform::macos_metal::probe_retirement()
 }

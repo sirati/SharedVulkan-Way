@@ -126,6 +126,42 @@ pub struct SharedRegion {
 unsafe impl Send for SharedRegion {}
 unsafe impl Sync for SharedRegion {}
 
+/// Open a shared file for reading and writing (§103.19). On macOS a file
+/// tagged `user.krun.shm` stands for the POSIX shared memory object it names:
+/// the Mac's libkrun maps that object when the Linux VM maps the file through
+/// virtio-fs DAX, so this side must map it too, not the file's own (empty)
+/// blocks. Anywhere else, and for an untagged file, it is the file.
+#[cfg(unix)]
+pub fn open_shared(path: &str) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        unsafe extern "C" {
+            fn fgetxattr(fd: i32, name: *const i8, value: *mut u8, size: usize, position: u32, options: i32) -> isize;
+            fn shm_open(name: *const i8, oflag: i32, ...) -> i32;
+        }
+        const O_RDWR: i32 = 2;
+        let mut name = [0u8; 32];
+        // SAFETY: a NUL-terminated attribute name and a buffer of the size
+        // given, for a descriptor this function holds.
+        let n = unsafe { fgetxattr(file.as_raw_fd(), c"user.krun.shm".as_ptr(), name.as_mut_ptr(), name.len() - 1, 0, 0) };
+        if n > 0 {
+            // `name` stays NUL-terminated: at most len - 1 bytes were read.
+            // SAFETY: a NUL-terminated name.
+            let fd = unsafe { shm_open(name.as_ptr().cast(), O_RDWR) };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error();
+                let shown = String::from_utf8_lossy(&name[..n as usize]).into_owned();
+                return Err(std::io::Error::new(e.kind(), format!("{path}: shared memory {shown}: {e}")));
+            }
+            // SAFETY: a descriptor shm_open just returned, owned from here.
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+    Ok(file)
+}
+
 impl SharedRegion {
     /// A private, zeroed, page-aligned region.
     ///

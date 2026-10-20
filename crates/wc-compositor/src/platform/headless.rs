@@ -305,6 +305,8 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         // STAGE 38: no monitor here, so no work area. `--output` stays the
         // whole answer, which is what the conformance leg needs.
         None,
+        // §103.18: and no screen to be scaled.
+        1,
     ))
 }
 
@@ -510,6 +512,7 @@ impl PumpInner {
                     image,
                     hotspot_x,
                     hotspot_y,
+                    ..
                 } => {
                     // The hash for the same reason `ToUi::Icon` carries one: it
                     // is how a test asserts that the pixels which arrived are
@@ -970,6 +973,8 @@ impl PumpInner {
             vertical: -10.0,
             v120_h: 0,
             v120_v: -120,
+            finger: false,
+            stop: false,
             time: t(),
         });
 

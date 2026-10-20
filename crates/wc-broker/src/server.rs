@@ -289,7 +289,10 @@ impl<P: Platform> Broker<P> {
 
     /// Serve one connection until it ends.
     pub fn client(&self, conn: P::Conn, writer: P::Writer, peer: Peer) {
-        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let Ok(id) = self.next_conn.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) else {
+            log("connection generations exhausted");
+            return;
+        };
         let writer = Arc::new(Mutex::new(writer));
         {
             let mut st = self.lock();
@@ -298,7 +301,9 @@ impl<P: Platform> Broker<P> {
         }
         let me = self.clone();
         let pid = peer.pid;
-        if !self.platform.watch(pid, Box::new(move || me.exited(pid))) {
+        let watched = self.platform.watch(pid, Box::new(move || me.exited(pid)));
+        self.lock().core.owner_watch_ready(id, watched);
+        if !watched {
             log(&format!("connection {id}: process {pid} cannot be watched; its connection stands for it"));
         }
         let mut rd = BufReader::new(conn);
@@ -502,6 +507,16 @@ impl<P: Platform> Broker<P> {
                     log(&format!("sign refused to process {} of {}: {e}", peer.pid, peer.user));
                     p.push(w, &format!("err {e}"))
                 }
+            },
+            Request::Owner => match st.core.owner(id) {
+                Ok(connection) => p.push(w, &format!("ok owner {} {connection}", self.run)),
+                Err(r) => refused(w, r),
+            },
+            Request::ObserveOwner { run, connection, pid } => {
+                if *run != self.run { p.push(w, "err owner belongs to another broker run") }
+                else { match st.core.observe_owner(id, *connection, *pid) {
+                    Ok(()) => p.push(w, "ok"), Err(r) => refused(w, r),
+                } }
             },
             Request::Subscribe => match st.core.subscribe(id) {
                 Ok(()) => p.push(w, "ok"),

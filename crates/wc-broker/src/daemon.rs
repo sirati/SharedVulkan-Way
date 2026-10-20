@@ -153,9 +153,8 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
     }
     let devices = a.devices.iter().map(|(n, _)| DeviceSpec { name: n.clone(), allow: Allow::AnyUser }).collect();
     let mut rnd = [0u8; 8];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = std::io::Read::read_exact(&mut f, &mut rnd);
-    }
+    let mut random = std::fs::File::open("/dev/urandom").map_err(|e| format!("broker run entropy: {e}"))?;
+    std::io::Read::read_exact(&mut random, &mut rnd).map_err(|e| format!("broker run entropy: {e}"))?;
     let run = u64::from_le_bytes(rnd);
     let config = Config {
         devices,
