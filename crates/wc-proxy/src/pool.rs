@@ -920,6 +920,21 @@ impl ProvidedRegion {
             if header.run_id != plan.run_id || header.region_len != r.len {
                 return Err(io::Error::other("original broker BAR header changed"));
             }
+            let full_arena = run.file_offset == wc_handle::ivshmem::HEADER_BYTES && run.len == header.arena_len();
+            if full_arena {
+                let outbound = (header.outbound.1 != 0).then_some(header.outbound);
+                if plan.id != header.arena_id || plan.outbound != outbound {
+                    return Err(io::Error::other("registered GTK plan arena identity or outbound window differs from original BAR header"));
+                }
+            } else if header.outbound.1 != 0 {
+                // Granted subregions have their own arena ids, but may never
+                // include the compositor-owned outbound tail of the parent.
+                let outbound_start = wc_handle::ivshmem::HEADER_BYTES.checked_add(header.outbound.0)
+                    .ok_or_else(|| io::Error::other("broker BAR outbound overflow"))?;
+                if run.file_offset.checked_add(run.len).is_none_or(|end| end > outbound_start) {
+                    return Err(io::Error::other("registered GTK subregion overlaps compositor outbound window"));
+                }
+            }
             let payload_end = wc_handle::ivshmem::HEADER_BYTES.checked_add(header.arena_len())
                 .ok_or_else(|| io::Error::other("broker BAR payload overflow"))?;
             if run.file_offset < wc_handle::ivshmem::HEADER_BYTES
@@ -2428,6 +2443,24 @@ mod tests {
         assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "header pages cannot become GTK allocations");
         plan.runs[0].file_offset = len;
         assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "payload overrun is refused");
+        let with_outbound = Header { outbound: (ARENA_GRANULARITY, ARENA_GRANULARITY), ..header };
+        file.write_all_at(&with_outbound.encode(), 0).unwrap();
+        plan.runs[0].file_offset = HEADER_BYTES;
+        plan.len = 2 * ARENA_GRANULARITY;
+        plan.runs[0].len = plan.len;
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "omitted outbound window is refused");
+        plan.outbound = Some((0, ARENA_GRANULARITY));
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "incorrect outbound window is refused");
+        plan.outbound = Some(with_outbound.outbound);
+        plan.id = 1;
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "full arena identity must match");
+        plan.id = 0;
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_ok(), "correct outbound metadata is accepted");
+        plan.len = ARENA_GRANULARITY;
+        plan.runs[0].len = plan.len;
+        plan.runs[0].file_offset = HEADER_BYTES + ARENA_GRANULARITY;
+        plan.outbound = None;
+        assert!(ProvidedRegion::registered_plan_at(&plan, true, path.to_str().unwrap()).is_err(), "a granted subregion cannot overlap outbound");
         let with_rings = Header { rings: (len - 4096, 4096), ..header };
         file.write_all_at(&with_rings.encode(), 0).unwrap();
         plan.runs[0].file_offset = len - 4096;
