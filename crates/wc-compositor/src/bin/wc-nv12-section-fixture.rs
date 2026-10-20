@@ -5,5 +5,5 @@ fn main() {
         std::process::exit(2);
     }
 }
-#[cfg(not(target_os = "macos")]
+#[cfg(not(target_os = "macos"))]
 fn main() { eprintln!("NV12_SECTION_SERVICE_ERROR: macOS only"); std::process::exit(2); }
