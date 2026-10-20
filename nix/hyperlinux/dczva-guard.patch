@@ -20,7 +20,12 @@
  5:  hvc #12
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -833,7 +833,9 @@
+@@ -13,3 +13,4 @@
+  */
+ #include "hl_user_regs.h"
++#include "hl_copy.h"
+ #include "syscall_proc.h"
+@@ -833,7 +834,9 @@
                    guest_t *g, int verbose, int timeout_sec, int is_main) {
      int exit_code = 0;
      int running = 1;
