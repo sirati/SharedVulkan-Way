@@ -22,6 +22,7 @@ use smallvec::SmallVec;
 // A BAR connection cannot turn a guest-supplied pathname into a host open.
 fn descriptor_allowed(encoding: FdEncoding, descriptor: &wc_handle::Descriptor) -> bool {
     match encoding {
+        FdEncoding::InBandLease(expected) => matches!(descriptor, wc_handle::Descriptor::BarLease { arena, generation, .. } if *arena == expected && *generation != 0),
         FdEncoding::InBandArena(expected) => matches!(descriptor,
             wc_handle::Descriptor::ArenaSlice { arena, len, .. } if *arena == expected && *len > 0),
         _ => true,
@@ -127,6 +128,7 @@ pub fn write_to_buffers(
     encoding: FdEncoding,
 ) -> Result<usize, MessageWriteError> {
     let orig_payload_len = payload.len();
+    let mut transfers = Vec::new();
     // Helper function to write a u32 or a RawProtoFd to its buffer
     fn write_buf(u: u32, payload: &mut [u8]) -> Result<&mut [u8], MessageWriteError> {
         if payload.len() >= 4 {
@@ -218,12 +220,15 @@ pub fn write_to_buffers(
                     fds.push(dup_fd);
                     payload
                 }
-                (FdEncoding::InBand | FdEncoding::InBandArena(_), RawWireFd::Named(handle)) => {
+                (FdEncoding::InBand | FdEncoding::InBandArena(_) | FdEncoding::InBandLease(_), RawWireFd::Named(handle)) => {
                     if !descriptor_allowed(encoding, handle.descriptor()) {
                         return Err(MessageWriteError::WrongDialect { wanted: encoding });
                     }
                     let _ = &fds; // no control message on this path
-                    write_array_to_payload(&handle.descriptor().encode(), payload)?
+                    let prepared = handle.prepare_transfer().map_err(MessageWriteError::DupFdFailed)?;
+                    let remaining = write_array_to_payload(prepared.bytes(), payload)?;
+                    transfers.push(prepared);
+                    remaining
                 }
                 // The caller brought the wrong kind. Down here neither can be
                 // made from the other — see `MessageWriteError::WrongDialect`.
@@ -236,6 +241,7 @@ pub fn write_to_buffers(
     header[..4].copy_from_slice(&msg.sender_id.to_ne_bytes());
     header[4..]
         .copy_from_slice(&(((wrote_size as u32) << 16) | u32::from(msg.opcode)).to_ne_bytes());
+    for transfer in transfers { transfer.commit(); }
     Ok(orig_payload_len - payload.len())
 }
 
@@ -358,7 +364,7 @@ pub fn parse_message<'a>(
                             tail = rest;
                             match wc_handle::Descriptor::decode(v) {
                                 Ok(d) if descriptor_allowed(encoding, &d) => {
-                                    Ok(Argument::Fd(WireFd::Named(wc_handle::Handle::from_descriptor(d))))
+                                    wc_handle::Handle::receive_descriptor(d).map(|handle| Argument::Fd(WireFd::Named(handle))).map_err(|_| MessageParseError::Malformed)
                                 }
                                 Ok(_) => Err(MessageParseError::Malformed),
                                 // A descriptor we cannot parse is a malformed

@@ -177,6 +177,40 @@ pub fn attach_host_ivshmem(id: u32, file: &std::fs::File, expected_run: u64, ori
     Ok(())
 }
 
+/// Attach consumer pixels read-only, plus writable lease metadata and the
+/// separate host-producer partition. No mutable peer-pixel API is introduced.
+#[cfg(target_os = "linux")]
+pub fn attach_host_bar_leases(id: u32, file: &std::fs::File, expected_run: u64, origin: String) -> io::Result<()> {
+    use crate::ivshmem::{Header, HEADER_BYTES, ENCODED_LEN};
+    use std::os::unix::fs::FileExt;
+    let mut bytes = [0u8; ENCODED_LEN];
+    file.read_exact_at(&mut bytes, 0)?;
+    let header = Header::decode(&bytes)?;
+    if header.run_id != expected_run || header.arena_id != id || header.region_len != file.metadata()?.len() || header.outbound.1 == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "BAR run/arena/backend size identity differs"));
+    }
+    let len = usize::try_from(header.arena_len()).map_err(|_| io::Error::other("BAR arena exceeds address space"))?;
+    let start = usize::try_from(header.outbound.0).map_err(|_| io::Error::other("BAR host partition exceeds address space"))?;
+    if header.outbound.0.checked_add(header.outbound.1) != Some(header.arena_len()) {
+        return Err(io::Error::other("BAR host partition is not the declared tail"));
+    }
+    let read = Arc::new(platform::map_file_window(file, HEADER_BYTES, len)?);
+    let metadata = Arc::new(platform::map_file_window_mut(file, HEADER_BYTES, crate::bar_lease::DIRECTORY_BYTES)?);
+    let write = Arc::new(platform::map_file_window_mut(file, HEADER_BYTES + header.outbound.0, header.outbound.1 as usize)?);
+    let owners: Arc<dyn Send + Sync> = Arc::new((read.clone(), metadata.clone(), write.clone()));
+    // SAFETY: exact checked windows of the original authenticated BAR fd.
+    // Peer pixels remain read-only; only metadata and local output are writable.
+    let directory = unsafe { crate::bar_lease::Directory::attach(metadata.ptr().cast_mut(), read.ptr(), write.ptr().cast_mut(),
+        crate::bar_lease::Role::Host, len, start, expected_run, owners) }?;
+    let mut after = [0u8; ENCODED_LEN]; file.read_exact_at(&mut after, 0)?;
+    if after != bytes { return Err(io::Error::other("BAR header changed while attaching leases")); }
+    crate::bar_lease::register(id, directory)?;
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    if guard.contains_key(&id) { return Err(io::Error::new(io::ErrorKind::AlreadyExists, "BAR arena already attached")); }
+    guard.insert(id, Attached { view: read, len, origin, provided: false, base: 0, fixed: true });
+    Ok(())
+}
+
 /// Attach arena `id` as a **file this process may write**: the local twin of
 /// [`attach_guest_ram`], for a machine with no hypervisor in it.
 ///

@@ -1369,7 +1369,7 @@ impl<D: 'static> ErasedState for State<D> {
     ) -> std::io::Result<()> {
         match encoding {
             FdEncoding::OutOfBand => Ok(()),
-            FdEncoding::InBand | FdEncoding::InBandArena(_) => Err(std::io::Error::new(
+            FdEncoding::InBand | FdEncoding::InBandArena(_) | FdEncoding::InBandLease(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "the libwayland backend cannot speak the in-band `h` dialect; \
                  build the compositor against the rust backend",

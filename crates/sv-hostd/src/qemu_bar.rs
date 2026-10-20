@@ -87,6 +87,20 @@ impl QemuBar {
     /// Bind QMP's live PCI device and shared backend to the exact file held
     /// open by the QMP peer process. Retain this object while its mappings live.
     pub fn open(qmp_path: &Path, device: &str, slot: u8, write: bool) -> io::Result<Self> {
+        Self::open_mode(qmp_path, device, slot, write, write)
+    }
+    /// A session peer writes only its local output partition and atomic lease
+    /// metadata. The initializer keeps the exclusive session lock separately.
+    pub fn open_peer_writer(qmp_path: &Path, device: &str, slot: u8) -> io::Result<Self> {
+        Self::open_mode(qmp_path, device, slot, true, false)
+    }
+    fn open_mode(
+        qmp_path: &Path,
+        device: &str,
+        slot: u8,
+        write: bool,
+        initializer: bool,
+    ) -> io::Result<Self> {
         if device.is_empty()
             || !device
                 .bytes()
@@ -225,7 +239,7 @@ impl QemuBar {
         {
             return Err(invalid("QEMU BAR backend identity changed while opening"));
         }
-        if write {
+        if initializer {
             use std::os::fd::AsRawFd;
             // A host initializer keeps exclusive ownership of this backend.
             // Readers use separate read-only mappings; another writer fails.
