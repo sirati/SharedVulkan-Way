@@ -37639,3 +37639,14 @@ the keeper holds it (§103.15).
 witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
 on testhost (nix-config). Without the guest build the old lease stands;
 without the unit the 20 s bound applies.
+
+Recovery correction validation, 2026-10-20, code `5bc0ae9`: all 63 scoped
+`sv-ram`/`wc-broker` tests passed, as did strict scoped Clippy with
+`--all-targets --no-deps -- -D warnings`. The retained-mapper regression covers
+eight journal failures, including loss of the entire directory while the
+entry is ANNOUNCED with no answer. The NixOS guest-RAM broker VM test passed.
+Its unreadable and malformed journal cases kept alice's actual udmabuf mapping
+at the same address with unchanged bytes over 55 and 47 checks respectively.
+After trusted journal restoration and daemon restart, retirement still waited
+for alice to release her mapping before UNMAPPED and free. The test cleaned up
+its QEMU. No Windows VM rerun was needed for this Linux recovery correction.
