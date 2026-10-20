@@ -169,6 +169,10 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  controlLifecycleClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-control-lifecycle-client"; source = ./control-lifecycle-client.c;
+    linkFlags = [ "-pthread" ];
+  };
   controlClient = guest.callPackage ./client-probe.nix {
     programName = "hl-control-access-client"; source = ./control-access-client.c;
   };
@@ -237,5 +241,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient probeRunner;
 }
