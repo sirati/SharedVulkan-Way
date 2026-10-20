@@ -350,6 +350,12 @@ if [ -n "$INFO" ]; then
     || bad "session ${IDX_L:-x} did not end by its linger ($(sessions))"
   grep -q 'outlived it; closed' "$D/comp-5.log" && ok "a feed the proxy left behind was closed: $(grep -m1 -o 'ring slot [0-9]*: a feed.*' "$D/comp-5.log")"
 fi
+# The guest-RAM leg (§108: the one pool growing from guest RAM, the proxies mapping
+# windows of grown regions) needs the broker, the one account that may make
+# udmabufs of guest RAM, which the user running this harness never is. It is
+# in the NixOS VM tests: scripts/sv-pool-grow-e2e.sh (the GPU pool) and
+# scripts/wc-guestram-vmtest.sh (the broker, its users and its rules).
+say "the guest-RAM leg (§108): in the VM tests, scripts/sv-pool-grow-e2e.sh and scripts/wc-guestram-vmtest.sh"
 
 say "leg 9: host integration (§106) on beside the arena: every session's service slots are its own"
 # The guest's compositor runs with --hostint (wc-launch.exe passes it), so each

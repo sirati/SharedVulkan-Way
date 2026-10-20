@@ -13,7 +13,8 @@
 //! * [`proto`]: the line protocol on the broker's local socket or pipe;
 //! * [`server`]: the serving loop over a [`server::Platform`];
 //! * `sys`: the platforms: Unix (Linux, macOS), Windows;
-//! * [`client`]: what a compositor, GPU process or proxy calls.
+//! * [`client`]: what a compositor, GPU process or proxy calls;
+//! * `daemon`: the `wc-broker` program on Unix (the macOS LaunchDaemon, §111.9).
 //!
 //! **It is a control plane only.** A device is opened by the broker and its
 //! handle moved into the process that asked; a region's handle is copied into
@@ -25,6 +26,8 @@ pub mod client;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod host;
 pub mod core;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod daemon;
 pub mod proto;
 pub mod server;
 pub mod sys;

@@ -27,6 +27,13 @@
 //!    §108.4). It ends with `close`, with the connection, or with the process.
 //!    A retiring region whose last lease has ended is *drained*, which is what
 //!    lets its substrate answer `UNMAPPED`.
+//! 5. **Exits are told** to the user's subscribers and admins (§111.3).
+//! 6. **A pool can be released as a whole** (§111.9, the macOS keeper). Where
+//!    one region of a pool carries the host's word for the whole session (the
+//!    boot page of a macOS session's ring window), the platform's probe of
+//!    that region releases every orphan of the pool at once, and ends the
+//!    processes *tied* to the pool (`tie POOL`: the session's GPU server,
+//!    which the host must have stopped serving before it may go).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -128,6 +135,9 @@ pub enum Notice {
     Push(ConnId, String),
     /// Every lease on retiring region `id` of epoch `epoch` has ended.
     Drained(ObjId, u64),
+    /// End process `pid`: it tied itself to a pool that has been released
+    /// (rule 6). The platform half ends it only while it still watches it.
+    End(Pid),
 }
 
 struct Device {
@@ -168,6 +178,8 @@ pub struct Core {
     /// Bytes of regions the broker made, for `stats` and a budget.
     made_bytes: u64,
     budget: Option<u64>,
+    /// Processes that end with a pool (`tie`), and that pool: (user, pool).
+    ties: BTreeMap<Pid, (User, String)>,
 }
 
 impl Core {
@@ -181,6 +193,7 @@ impl Core {
             roles: BTreeMap::new(),
             made_bytes: 0,
             budget: None,
+            ties: BTreeMap::new(),
         }
     }
 
@@ -259,6 +272,7 @@ impl Core {
             .collect();
         let users: BTreeSet<User> = gone.iter().map(|g| g.1.clone()).chain(freed.iter().map(|f| f.1.clone())).collect();
         let role = self.roles.remove(&pid).or_else(|| gone.first().map(|g| g.2.clone())).unwrap_or_else(|| "?".into());
+        self.ties.remove(&pid);
         for (conn, _, _) in &gone {
             self.conn_closed(*conn, now);
         }
@@ -268,6 +282,11 @@ impl Core {
         for (name, user) in freed {
             self.push_to(&user, &format!("!device-free {name}"));
         }
+    }
+
+    /// What process `pid` said it is, while it lives.
+    pub fn role(&self, pid: Pid) -> Option<&str> {
+        self.roles.get(&pid).map(String::as_str)
     }
 
     fn push_to(&mut self, user: &User, line: &str) {
@@ -533,19 +552,70 @@ impl Core {
         }
     }
 
-    /// Once in a while: orphans past their release rule's time go.
+    /// `tie POOL` (rule 6): this connection's process ends when its user's
+    /// pool `pool` is released. A process can only ask that of itself.
+    pub fn tie(&mut self, conn: ConnId, pool: &str) -> Result<(), Refusal> {
+        let Some(c) = self.conns.get(&conn) else { return refuse("not connected") };
+        self.ties.insert(c.peer.pid, (c.peer.user.clone(), pool.to_string()));
+        Ok(())
+    }
+
+    /// The pool process `pid` is tied to, if any.
+    pub fn tied(&self, pid: Pid) -> Option<&str> {
+        self.ties.get(&pid).map(|t| t.1.as_str())
+    }
+
+    /// The probe found the word orphan `id` carries for its whole pool set
+    /// (rule 6): every orphan of that user's pool goes, and the processes
+    /// tied to it are ended. A region whose owner lives is not a probe's.
+    pub fn pool_released(&mut self, id: ObjId) {
+        let Some(r) = self.regions.get(&id) else { return };
+        if r.orphan_since.is_none() || !matches!(r.release, Release::Probe { .. }) {
+            return;
+        }
+        let (user, pool) = (r.user.clone(), r.info.pool.clone());
+        let gone: Vec<ObjId> = self
+            .regions
+            .values()
+            .filter(|r| r.orphan_since.is_some() && r.user == user && r.info.pool == pool)
+            .map(|r| r.info.id)
+            .collect();
+        for id in gone {
+            self.destroy(id);
+        }
+        self.end_tied(&user, &pool);
+    }
+
+    fn end_tied(&mut self, user: &User, pool: &str) {
+        let pids: Vec<Pid> = self.ties.iter().filter(|(_, t)| t.0 == *user && t.1 == pool).map(|(p, _)| *p).collect();
+        for pid in pids {
+            self.ties.remove(&pid);
+            self.notices.push(Notice::End(pid));
+        }
+    }
+
+    /// Once in a while: orphans past their release rule's time go. A pool
+    /// left with no region by that ends its tied processes too, as the
+    /// macOS keeper's own time limit did (§103.15).
     pub fn tick(&mut self, now: Instant) {
-        let due: Vec<ObjId> = self
+        let due: Vec<(ObjId, User, String)> = self
             .regions
             .values()
             .filter(|r| match (r.orphan_since, r.release) {
                 (Some(t), Release::Probe { after: Some(a) }) => now.duration_since(t) >= a,
                 _ => false,
             })
-            .map(|r| r.info.id)
+            .map(|r| (r.info.id, r.user.clone(), r.info.pool.clone()))
             .collect();
-        for id in due {
+        let mut pools = BTreeSet::new();
+        for (id, user, pool) in due {
             self.destroy(id);
+            pools.insert((user, pool));
+        }
+        for (user, pool) in pools {
+            if !self.regions.values().any(|r| r.user == user && r.info.pool == pool) {
+                self.end_tied(&user, &pool);
+            }
         }
     }
 
@@ -696,6 +766,73 @@ mod tests {
         c.tick(t + Duration::from_secs(600));
         assert_eq!(c.drain(), vec![Notice::Destroy(a.id), Notice::Destroy(b.id)]);
         assert_eq!(c.stats().region_bytes, 0);
+    }
+
+    /// Rule 6, the macOS keeper folded into the broker (§111.9): the boot
+    /// region's probe releases its whole pool, never another pool or another
+    /// user's, never a live owner's, and ends the processes tied to it.
+    #[test]
+    fn a_released_boot_region_frees_its_whole_pool_and_ends_its_ties() {
+        let mut c = core();
+        let t = Instant::now();
+        let rule = Release::Probe { after: Some(Duration::from_secs(600)) };
+        c.connect(1, peer(100, 501)); // the main process of session s1
+        c.connect(2, peer(200, 501)); // its GPU server
+        c.connect(3, peer(300, 501)); // the same user's main process of session s2
+        c.connect(4, peer(400, 502)); // another user's, with the same pool name
+        let arena = c.alloc(1, "s1", 64 << 20, rule).unwrap();
+        let rings = c.alloc(1, "s1", 6 << 20, rule).unwrap();
+        let other = c.alloc(3, "s2", 6 << 20, rule).unwrap();
+        let theirs = c.alloc(4, "s1", 6 << 20, rule).unwrap();
+        c.tie(2, "s1").unwrap();
+        c.tie(4, "s1").unwrap();
+        assert_eq!(c.tied(200), Some("s1"));
+        // While the owner lives, the word changes nothing.
+        c.pool_released(rings.id);
+        assert!(c.region(arena.id).is_some() && c.drain().is_empty());
+        // SIGKILL of the main process: its regions stay held.
+        c.process_exited(100, t);
+        c.conn_closed(4, t);
+        assert_eq!(c.stats().orphans, 3);
+        assert!(c.drain().iter().all(|n| !matches!(n, Notice::Destroy(_) | Notice::End(_))));
+        c.pool_released(rings.id);
+        let n = c.drain();
+        assert_eq!(n, vec![Notice::Destroy(arena.id), Notice::Destroy(rings.id), Notice::End(200)]);
+        assert!(c.region(other.id).is_some(), "another pool of the same user stays");
+        assert!(c.region(theirs.id).is_some(), "another user's pool of the same name stays");
+        assert_eq!(c.tied(400), Some("s1"), "another user's tie stays");
+        assert_eq!(c.stats().region_bytes, 12 << 20);
+        // Its exit clears what is left of it.
+        c.process_exited(400, t);
+        assert_eq!(c.tied(400), None);
+    }
+
+    /// The keeper's time limit, at the pool level: the last orphan of a pool
+    /// going by time ends the pool's tied processes, once; a tied process
+    /// that exited on its own is not ended later.
+    #[test]
+    fn a_pool_that_times_out_ends_its_ties_once() {
+        let mut c = core();
+        let t = Instant::now();
+        let rule = Release::Probe { after: Some(Duration::from_secs(600)) };
+        c.connect(1, peer(100, 501));
+        c.connect(2, peer(200, 501));
+        c.connect(3, peer(300, 501));
+        c.hello(2, "gpu").unwrap();
+        assert_eq!(c.role(200), Some("gpu"));
+        c.alloc(1, "s1", 4 << 20, rule).unwrap();
+        c.tie(2, "s1").unwrap();
+        c.tie(3, "s1").unwrap();
+        c.process_exited(300, t);
+        c.process_exited(100, t);
+        c.drain();
+        c.tick(t + Duration::from_secs(599));
+        assert!(c.drain().is_empty());
+        c.tick(t + Duration::from_secs(600));
+        let ends: Vec<Notice> = c.drain().into_iter().filter(|n| matches!(n, Notice::End(_))).collect();
+        assert_eq!(ends, vec![Notice::End(200)]);
+        c.tick(t + Duration::from_secs(1200));
+        assert!(c.drain().is_empty());
     }
 
     /// Rule 4: leases on a published region; a retiring region drains when

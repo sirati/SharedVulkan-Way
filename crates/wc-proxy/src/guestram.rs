@@ -425,11 +425,20 @@ impl StitchedRegion {
     /// compositor that sees nothing, which is the most expensive possible bug
     /// in this file and is one flag away.
     pub fn attach(plan: &Plan) -> io::Result<StitchedRegion> {
+        use std::os::fd::AsFd;
+        let file = open_backing(&plan.object, true)?;
+        let parts: Vec<_> = plan.runs.iter().map(|r| (file.as_fd(), r)).collect();
+        Self::attach_parts(plan.len, &parts, plan.object.display().to_string())
+    }
+
+    /// The same, with each run from its own descriptor: §108's guest-RAM
+    /// regions, whose udmabufs the broker gives (`file_offset` is the offset
+    /// in that run's descriptor).
+    pub fn attach_parts(len: u64, parts: &[(std::os::fd::BorrowedFd<'_>, &Run)], origin: String) -> io::Result<StitchedRegion> {
         use std::os::fd::AsRawFd;
 
-        let len = usize::try_from(plan.len)
+        let len = usize::try_from(len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
-        let file = open_backing(&plan.object, true)?;
 
         // One reservation first, so the runs land next to each other and the
         // arena's offsets mean something. `PROT_NONE` so that a hole — a run
@@ -454,11 +463,11 @@ impl StitchedRegion {
         let region = StitchedRegion {
             base: base.cast::<u8>(),
             len,
-            runs: plan.runs.len(),
-            origin: plan.object.display().to_string(),
+            runs: parts.len(),
+            origin,
         };
         // Owns the reservation from here, so every early return unmaps it.
-        for (i, r) in plan.runs.iter().enumerate() {
+        for (i, (fd, r)) in parts.iter().enumerate() {
             let (off, rlen) = (
                 usize::try_from(r.arena_offset).unwrap_or(usize::MAX),
                 usize::try_from(r.len).unwrap_or(usize::MAX),
@@ -478,7 +487,7 @@ impl StitchedRegion {
                     rlen,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_SHARED | libc::MAP_FIXED,
-                    file.as_raw_fd(),
+                    fd.as_raw_fd(),
                     r.file_offset as libc::off_t,
                 )
             };
