@@ -1699,6 +1699,72 @@ impl GpuHost for GpuServer {
     }
 
     /// As the `2` form, for an image that does not exist yet.
+    /// Forwarded; on a Mac LINEAR gains what an exported image allows there
+    /// (`iosurface::linear_extra`, §103.19).
+    fn get_physical_device_format_properties(
+        &mut self,
+        a: p::VkGetPhysicalDeviceFormatPropertiesArgs,
+    ) -> WireResult<p::VkGetPhysicalDeviceFormatPropertiesReply> {
+        let mut a = a;
+        a.physical_device.0 = self.map_handle(HandleType::VkPhysicalDevice, a.physical_device.0)?;
+        let Some(f) = self.fns().vk_get_physical_device_format_properties else {
+            self.note_missing("vkGetPhysicalDeviceFormatProperties");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let mut out = match &a.p_format_properties {
+            Some(v) => sv_gpu_entry::raise_vk_format_properties(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: `out` lives on the stack for the call; the physical device
+        // is the driver's own.
+        unsafe { f(a.physical_device.0 as usize as _, sv_gpu_entry::VkFormat(a.format.0 as _), &mut out) };
+        // SAFETY: the driver filled `out`.
+        let mut props = unsafe { sv_gpu_entry::lower_full_vk_format_properties(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        #[cfg(target_os = "macos")]
+        {
+            props.linear_tiling_features.0 |= crate::iosurface::linear_extra(vk::Format::from_raw(a.format.0)) as u32;
+        }
+        Ok(p::VkGetPhysicalDeviceFormatPropertiesReply { p_format_properties: Some(Box::new(props)) })
+    }
+
+    /// As `get_physical_device_format_properties`, and the same for a
+    /// `VkFormatProperties3` in the chain.
+    fn get_physical_device_format_properties2(
+        &mut self,
+        a: p::VkGetPhysicalDeviceFormatProperties2Args,
+    ) -> WireResult<p::VkGetPhysicalDeviceFormatProperties2Reply> {
+        let mut a = a;
+        a.physical_device.0 = self.map_handle(HandleType::VkPhysicalDevice, a.physical_device.0)?;
+        let Some(f) = self.fns().vk_get_physical_device_format_properties2 else {
+            self.note_missing("vkGetPhysicalDeviceFormatProperties2");
+            return Err(WireError::UnknownCommand { opcode: 0 });
+        };
+        let mut pool = sv_gpu_entry::Raise::default();
+        let mut out = match &a.p_format_properties {
+            Some(v) => sv_gpu_entry::raise_vk_format_properties2(v, &mut pool)?,
+            None => Default::default(),
+        };
+        // SAFETY: `out`'s chain lives in `pool`; the physical device is the
+        // driver's own.
+        unsafe { f(a.physical_device.0 as usize as _, sv_gpu_entry::VkFormat(a.format.0 as _), &mut out) };
+        // SAFETY: the driver filled `out` and its chain.
+        let mut props = unsafe { sv_gpu_entry::lower_full_vk_format_properties2(&raw const out) }
+            .map_err(|_| WireError::UnknownCommand { opcode: 0 })?;
+        #[cfg(target_os = "macos")]
+        {
+            let extra = crate::iosurface::linear_extra(vk::Format::from_raw(a.format.0));
+            props.format_properties.linear_tiling_features.0 |= extra as u32;
+            for l in &mut props.p_next {
+                if let p::PNextLink::VkFormatProperties3(x) = l {
+                    x.linear_tiling_features.0 |= extra;
+                }
+            }
+        }
+        Ok(p::VkGetPhysicalDeviceFormatProperties2Reply { p_format_properties: Some(Box::new(props)) })
+    }
+
     /// Forwarded, except that on a Mac a shared image's question (the
     /// dma-buf path asks it as `HOST_ALLOCATION`) is asked as `MTLTEXTURE`,
     /// which is how such an image is made there (§103.19). Elsewhere the two

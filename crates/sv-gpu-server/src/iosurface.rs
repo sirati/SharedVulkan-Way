@@ -64,6 +64,23 @@ pub fn format_ok(f: vk::Format) -> bool {
     formats(f).is_some()
 }
 
+/// What a LINEAR image of an IOSurface format can do here beyond the
+/// driver's own `linearTilingFeatures`: every exported (dma-buf) image is
+/// LINEAR and is made on an imported IOSurface texture, which the driver lets
+/// an application render, blend and blit into (KosmicKrisp with the MTLTEXTURE
+/// import). `VkFormatFeatureFlags` and `VkFormatFeatureFlags2` agree on these
+/// bits.
+pub fn linear_extra(format: vk::Format) -> u64 {
+    if !format_ok(format) {
+        return 0;
+    }
+    (vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        | vk::FormatFeatureFlags::BLIT_DST)
+        .as_raw()
+        .into()
+}
+
 /// `vkCreateImage` made a shared image.
 pub fn remember(image: vk::Image, format: vk::Format, width: u32, height: u32) {
     shapes(|s| s.insert(ash::vk::Handle::as_raw(image), Shape { format, width, height }));
