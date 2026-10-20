@@ -560,6 +560,34 @@ pub fn guest_ram_rings_located() {
     LOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// How often this process beats the ring region's owner heartbeat (§113).
+pub const GUEST_BEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Make `control` the ring region every service uses, and beat for it.
+fn publish_shared(control: &Arc<Control>) {
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(control));
+    start_guest_beat();
+}
+
+/// §113: the guest's heartbeat. Every 100 ms, for as long as this process
+/// runs, the owner word of the ring region moves, on a thread that does
+/// nothing else. Every session's proxy reads it: a session whose pings stop
+/// while this moves is gone; pings and this stopping together is the whole
+/// guest stalled (its GPU waking from D3 held every vCPU for up to ten
+/// seconds on testhost), which the proxy's lease rides out.
+fn start_guest_beat() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("guest-beat".into()).spawn(|| loop {
+        if let Some(c) = shared_control() {
+            let _ = c.beat_now();
+        }
+        std::thread::sleep(GUEST_BEAT_EVERY);
+    });
+}
+
 /// The ring region, once made: the launcher's control and sound channels are
 /// ring slots of it.
 pub fn shared_control() -> Option<Arc<Control>> {
@@ -744,7 +772,7 @@ impl PendingRings {
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
         let control = Arc::new(Control::create(region, self.geometry, ids, 1).map_err(|e| e.to_string())?);
         control.stamp_epoch().map_err(|e| e.to_string())?;
-        *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+        publish_shared(&control);
         let reader = match self.bell {
             Some(b) => {
                 println!(
@@ -866,7 +894,7 @@ pub fn over_ivshmem(id: u32, port: Option<sv_transport::vdoorbell::PortHandle>) 
     control.stamp_epoch().map_err(|e| e.to_string())?;
     let control = Arc::new(control);
     // §105: the session's service threads (control, sound) use the same region.
-    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+    publish_shared(&control);
     let reader = match port {
         Some(port) => {
             let (reader, writer) = port.split().map_err(|e| e.to_string())?;
