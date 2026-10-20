@@ -515,10 +515,16 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.tracked_extent(
             lifecycle,
             &recipient.grant,
-            consumer.allocation.allocation,
-            extent,
-            recipient.process,
-            ProjectionAccess::ReadOnly,
+            native::Request {
+                allocation: consumer.allocation.allocation,
+                reference: native::ProjectionReference::RemoteConsumer {
+                    registration: recipient.process.registration(),
+                    consumer: consumer.consumer,
+                },
+                extent,
+                target: recipient.process,
+                access: ProjectionAccess::ReadOnly,
+            },
             backend,
         )
     }

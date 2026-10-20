@@ -63,10 +63,19 @@ enum Stage {
 struct State {
     stage: Stage,
 }
+/// Logical reference is owner-derived inside the opaque ticket. Merely
+/// constructing this value grants no authority or completion proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionReference {
+    Producer { registration: u64 },
+    Consumer { registration: u64, consumer: u64 },
+    RemoteConsumer { registration: u64, consumer: u64 },
+}
 pub(super) struct Hold {
     state: Arc<Mutex<State>>,
     binding: Binding,
     allocation: u64,
+    reference: ProjectionReference,
     extent: Extent,
     target: Arc<dyn ServiceProcess>,
     access: ProjectionAccess,
@@ -81,6 +90,7 @@ pub struct ProjectionTicket {
     exports: Arc<Mutex<BTreeMap<ExportKey, u64>>>,
     binding: Binding,
     allocation: u64,
+    reference: ProjectionReference,
     extent: Extent,
     target: Arc<dyn ServiceProcess>,
     access: ProjectionAccess,
@@ -91,6 +101,9 @@ impl ProjectionTicket {
     }
     pub fn allocation(&self) -> u64 {
         self.allocation
+    }
+    pub fn reference(&self) -> ProjectionReference {
+        self.reference
     }
     pub fn extent(&self) -> Extent {
         self.extent
@@ -213,18 +226,29 @@ pub unsafe trait TrackedProjectionBackend<B: OriginalBacking> {
         ticket: ProjectionTicket,
     ) -> io::Result<Self::Projection>;
 }
+pub(super) struct Request {
+    pub(super) allocation: u64,
+    pub(super) reference: ProjectionReference,
+    pub(super) extent: Extent,
+    pub(super) target: Process,
+    pub(super) access: ProjectionAccess,
+}
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     pub(super) fn tracked_extent<P: TrackedProjectionBackend<B>>(
         &mut self,
         lifecycle: &Lifecycle<S, B>,
         grant: &GrantId,
-        allocation: u64,
-        extent: Extent,
-        target: Process,
-        access: ProjectionAccess,
+        request: Request,
         backend: &mut P,
     ) -> io::Result<P::Projection> {
         self.record(lifecycle, grant)?;
+        let Request {
+            allocation,
+            reference,
+            extent,
+            target,
+            access,
+        } = request;
         let record = self.records.get_mut(&grant.id).unwrap();
         let native = record
             .processes
@@ -246,6 +270,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 state: state.clone(),
                 binding: binding.clone(),
                 allocation,
+                reference,
                 extent,
                 target: target.clone(),
                 access,
@@ -258,6 +283,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             exports: self.native_exports.clone(),
             binding,
             allocation,
+            reference,
             extent,
             target,
             access,
@@ -265,8 +291,11 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         let guard = record.guard.clone();
         match backend.project_tracked(guard, ticket) {
             Ok(projection) => {
-                let bound = record.native_holds[&id].state.lock()
-                    .map(|state| matches!(state.stage, Stage::Bound(_))).unwrap_or(false);
+                let bound = record.native_holds[&id]
+                    .state
+                    .lock()
+                    .map(|state| matches!(state.stage, Stage::Bound(_)))
+                    .unwrap_or(false);
                 if !bound {
                     record.quarantined = true;
                     return Err(denied(
@@ -301,10 +330,15 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.tracked_extent(
             lifecycle,
             &allocation.grant,
-            allocation.key.allocation,
-            extent,
-            producer.process,
-            ProjectionAccess::ReadWrite,
+            Request {
+                allocation: allocation.key.allocation,
+                reference: ProjectionReference::Producer {
+                    registration: producer.process.registration(),
+                },
+                extent,
+                target: producer.process,
+                access: ProjectionAccess::ReadWrite,
+            },
             backend,
         )
     }
@@ -328,10 +362,16 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.tracked_extent(
             lifecycle,
             &recipient.grant,
-            consumer.allocation.key.allocation,
-            extent,
-            recipient.process,
-            ProjectionAccess::ReadOnly,
+            Request {
+                allocation: consumer.allocation.key.allocation,
+                reference: ProjectionReference::Consumer {
+                    registration: recipient.process.registration(),
+                    consumer: consumer.consumer.reference(),
+                },
+                extent,
+                target: recipient.process,
+                access: ProjectionAccess::ReadOnly,
+            },
             backend,
         )
     }
@@ -358,6 +398,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             || hold.binding != proof.ticket.binding
             || hold.binding != *record.guard.binding()
             || hold.allocation != proof.ticket.allocation
+            || hold.reference != proof.ticket.reference
             || hold.extent != proof.ticket.extent
             || hold.access != proof.ticket.access
             || !Arc::ptr_eq(&hold.target, &proof.ticket.target)

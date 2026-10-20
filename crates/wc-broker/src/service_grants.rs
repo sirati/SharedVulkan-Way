@@ -1759,4 +1759,89 @@ mod tests {
             .unwrap();
         assert!(owner.records[&grant.id].untracked_native);
     }
+    #[test]
+    fn native_backend_success_without_exact_export_binding_is_quarantined() {
+        struct Unbound;
+        // SAFETY: deliberately broken test adapter returns no actual mapping.
+        // The owner must fail closed despite the adapter's success result.
+        unsafe impl native::TrackedProjectionBackend<Backing> for Unbound {
+            type Projection = ();
+            fn project_tracked(
+                &mut self,
+                _grant: Arc<RetainedGrant<Backing>>,
+                _ticket: native::ProjectionTicket,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut Unbound)
+                .is_err()
+        );
+        assert!(owner.records[&grant.id].quarantined);
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+    }
+
+    #[test]
+    fn native_tickets_distinguish_two_consumers_of_same_process_and_allocation() {
+        struct Capture {
+            inner: TicketBackend,
+            references: Vec<native::ProjectionReference>,
+        }
+        // SAFETY: state-machine only adapter, never a native retirement claim.
+        unsafe impl native::TrackedProjectionBackend<Backing> for Capture {
+            type Projection = native::NativeProjectionAuthority;
+            fn project_tracked(
+                &mut self,
+                grant: Arc<RetainedGrant<Backing>>,
+                ticket: native::ProjectionTicket,
+            ) -> io::Result<Self::Projection> {
+                self.references.push(ticket.reference());
+                native::TrackedProjectionBackend::project_tracked(&mut self.inner, grant, ticket)
+            }
+        }
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (consumer, target) = consumer_process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let pending1 = owner
+            .prepare(&life, &producer, &allocation, &consumer)
+            .unwrap();
+        let pending2 = owner
+            .prepare(&life, &producer, &allocation, &consumer)
+            .unwrap();
+        let (c1, _) = owner.accept(&life, &consumer, &pending1).unwrap();
+        let (c2, _) = owner.accept(&life, &consumer, &pending2).unwrap();
+        let mut backend = Capture {
+            inner: TicketBackend {
+                target,
+                next: 0,
+                wrong: 0,
+            },
+            references: Vec::new(),
+        };
+        let export1 = owner
+            .project_consumer_tracked(&life, &consumer, &c1, &mut backend)
+            .unwrap();
+        let export2 = owner
+            .project_consumer_tracked(&life, &consumer, &c2, &mut backend)
+            .unwrap();
+        assert_ne!(backend.references[0], backend.references[1]);
+        owner
+            .complete_projection(&life, &grant, unsafe { export1.prove_retired().unwrap() })
+            .unwrap();
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+        assert_eq!(owner.records[&grant.id].consumers.len(), 2);
+        owner
+            .complete_projection(&life, &grant, unsafe { export2.prove_retired().unwrap() })
+            .unwrap();
+        assert!(owner.records[&grant.id].native_holds.is_empty());
+        assert_eq!(owner.records[&grant.id].consumers.len(), 2);
+    }
 }

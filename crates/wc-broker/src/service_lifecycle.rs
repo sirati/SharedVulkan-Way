@@ -6,7 +6,7 @@
 //! A ready instance refuses rebootstrap, even after peer restart. Recovery
 //! currently requires fresh own tickets/lifecycles on BOTH sides, while all old
 //! grants remain excluded. No automatic replay-counter reset is provided.
-use crate::bar_registry::{DurableStore, EpochTicket, Registry};
+use crate::bar_registry::{DurableStore, EpochTicket, Registry, Reservation};
 use crate::service_auth::{Authenticator, Frame, ServiceEndpoint, VerifiedMessage};
 use crate::service_bootstrap::{BootstrapBinding, BootstrapMessage, BootstrapPhase, DOMAIN};
 use crate::service_control::{Binding, Message, Origin, Payload, Phase, Source};
@@ -45,6 +45,10 @@ enum Stage {
 pub struct GrantChannel {
     auth: Authenticator,
     owner: Arc<()>,
+    // Preserve the opaque LIVE durable-reservation token. Reopened unknown
+    // records cannot recreate one. This confers no release API yet; a future
+    // complete current census/closing barrier must consume it exactly once.
+    _reservation: Reservation,
 }
 
 struct ServiceState<S: DurableStore> {
@@ -496,6 +500,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         Ok(GrantChannel {
             auth,
             owner: self.channel_owner.clone(),
+            _reservation: reservation,
         })
     }
     pub(crate) fn channel_ready(&self, channel: &GrantChannel) -> io::Result<()> {
