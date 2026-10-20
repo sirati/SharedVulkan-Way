@@ -45,6 +45,9 @@ done
 for b in wc-launch wc-broker; do
   [ -x "$root/target/x86_64-apple-darwin/debug/$b" ] || { echo "build $b for x86_64-apple-darwin first"; exit 2; }
 done
+if ! vm "sudo -n true || exit 1; if [ -S /var/run/waycompose/broker.sock ] || sudo -n launchctl print system/org.waycompose.broker >/dev/null 2>&1; then echo 'broker already loaded; drain sessions and unload safely before installing' >&2; exit 1; fi"; then
+  exit 1
+fi
 # The installation's name (the ini's [session] name) and its key (§111.6):
 # the host verifies boot records with it, the guest's broker signs with it.
 inst_name=wcm
@@ -167,7 +170,6 @@ vm "set -e; sudo -n mkdir -p \"$SYS/bin\" \"$SYS/keys\" /Library/Logs/waycompose
   sudo -n install -o root -g wheel -m 600 \"$G/broker.key.new\" \"$SYS/keys/$inst_name.key\"; rm -f \"$G/broker.key.new\"
   \"$SYS/bin/wc-broker\" plist \"$SYS/bin/wc-broker\" | sudo -n tee /Library/LaunchDaemons/org.waycompose.broker.plist >/dev/null
   sudo -n chown root:wheel /Library/LaunchDaemons/org.waycompose.broker.plist; sudo -n chmod 644 /Library/LaunchDaemons/org.waycompose.broker.plist
-  sudo -n launchctl bootout system/org.waycompose.broker 2>/dev/null || true
   sudo -n launchctl bootstrap system /Library/LaunchDaemons/org.waycompose.broker.plist
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /var/run/waycompose/broker.sock ] && break; sleep 0.5; done
   [ -S /var/run/waycompose/broker.sock ] || { sudo -n tail -20 /Library/Logs/waycompose/broker.log; exit 1; }

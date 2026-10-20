@@ -10,19 +10,28 @@ seconds, one per line, at which the passed-through GPU left D3 (`journalctl
 -o short-monotonic | grep 'PM transition D3->D0'`); on the Windows guest each
 can freeze every vCPU for up to ~6 s (§105.14). A sample whose round trip
 overlaps [wake - 0.2 s, wake + 7 s] is counted apart and named, never
-dropped silently.
+dropped silently. Attribution requires a clock fit and applies its drift to
+both endpoints; without GPU_WAKES, guest-only RTT statistics need no fit.
 """
-import glob, os, re, statistics, subprocess, sys
+import glob, json, os, statistics, subprocess, sys
 
 run = sys.argv[1]
 wakes = []
 if len(sys.argv) > 2:
     wakes = sorted(float(l.split()[0]) * 1e9 for l in open(sys.argv[2]) if l.strip())
 here = os.path.dirname(os.path.abspath(__file__))
-out = subprocess.run([sys.executable, os.path.join(here, "wc-hop-timeline.py"), run], capture_output=True, text=True).stdout
-m = re.search(r"offset (-?[\d.]+) us", out)
-off = float(m.group(1)) * 1000 if m else None
-print(out.splitlines()[0] if out else "clock: none")
+result = subprocess.run(
+    [sys.executable, os.path.join(here, "wc-hop-timeline.py"), run, "--clock-json"],
+    capture_output=True, text=True, check=True,
+)
+clock = json.loads(result.stdout)
+print("clock:", clock["description"])
+if wakes and clock["offset_ns"] is None:
+    sys.exit("cannot classify GPU wakes without a guest/host clock fit")
+
+
+def host_time(t):
+    return t - (clock["offset_ns"] + clock["slope"] * (t - clock["reference_ns"]))
 
 
 def q(v, f):
@@ -53,8 +62,8 @@ for f in sorted(glob.glob(os.path.join(run, "guest", "L-*.txt"))):
     clean, hit = [], []
     for s, r in reqs:
         us = (r - s) / 1e3
-        if off is not None and wakes:
-            hs, hr = s - off, r - off
+        if wakes:
+            hs, hr = host_time(s), host_time(r)
             if any(w - 2e8 <= hr and hs <= w + 7e9 for w in wakes):
                 hit.append(us)
                 continue
