@@ -261,6 +261,26 @@ env "${NATIVE_ENV[@]}" WC_FRAME_TRACE="$RUN/proxy-trace.txt" XDG_RUNTIME_DIR="$R
 KIDS+=($!)
 for _ in $(seq 1 200); do grep -q '^\[proxy\] listening on' "$RUN/proxy.log" && break; sleep 0.1; done
 
+# Attribute every visible test window, including surfaces outside Firefox.
+x11_windows() {
+  local stage=$1 id pid
+  if command -v xwininfo >/dev/null; then
+    xwininfo -display ":$DISP" -root -tree >"$RUN/x11-$stage.txt" 2>&1
+  fi
+  if command -v xdotool >/dev/null; then
+    for id in $(DISPLAY=":$DISP" xdotool search --all --onlyvisible --name '.*' 2>/dev/null); do
+      {
+        echo "window=$id"
+        DISPLAY=":$DISP" xdotool getwindowname "$id"
+        DISPLAY=":$DISP" xdotool getwindowgeometry --shell "$id"
+        pid=$(DISPLAY=":$DISP" xdotool getwindowpid "$id" 2>/dev/null)
+        [ -z "$pid" ] || ps -p "$pid" -o pid,ppid,args
+      } >>"$RUN/x11-owners-$stage.txt" 2>&1
+    done
+  fi
+}
+x11_windows before-firefox
+
 # ------------------------------------------------------------------ firefox ---
 MPORT=$((20000 + RANDOM % 9000))
 cat >"$RUN/profile/user.js" <<PREFS
@@ -359,6 +379,7 @@ for pid in $(descendants "$FF"); do
   fi
 done
 # What the compositor put on its desktop, for a reader to judge.
+x11_windows screenshot
 (xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/screen.png") 2>/dev/null
 wait $FF 2>/dev/null
 
