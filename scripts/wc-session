@@ -926,10 +926,10 @@ stock_gpu_prerequisite_check() {
     [[ "${PCI:-}" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
       || die "GPU Firefox requires the guest GPU PCI identity"
     NATIVE=0; STRICT=0; GTK_LIB=""
-    for line in "${GPUENV[@]}"; do
+    for line in "${GPUENV[@]}" "${DEF_ENV[@]}"; do
       case "$line" in
-        WC_NATIVE_SHM=1) NATIVE=1 ;;
-        WC_NATIVE_SHM_STRICT=1) STRICT=1 ;;
+        WC_NATIVE_SHM=*) NATIVE=${line#WC_NATIVE_SHM=} ;;
+        WC_NATIVE_SHM_STRICT=*) STRICT=${line#WC_NATIVE_SHM_STRICT=} ;;
         LD_LIBRARY_PATH=*) GTK_LIB=${line#LD_LIBRARY_PATH=}; GTK_LIB=${GTK_LIB%%:*} ;;
       esac
     done

@@ -48,7 +48,7 @@ mkdir -p "$BASE/bin" "$BASE/gtk/lib" "$BASE/gtk/nix-support"
 touch "$BASE/gpu.env" "$BASE/gtk/lib/libgdk-3.so"
 printf 'abi\n' >"$BASE/gtk/nix-support/wc-native-shm-abi"
 ln -s "$BASE/gtk" "$BASE/bin/gpu-gtk"
-GPU_ON=''; NSWRAP=(); GPUENV=(); PCI=''
+GPU_ON=''; NSWRAP=(); GPUENV=(); DEF_ENV=(); PCI=''
 reject_runtime() { if (stock_gpu_prerequisite_check); then echo "FAIL runtime accepted $1"; exit 1; fi; echo "PASS runtime rejects $1"; }
 reject_runtime missing-gpu-and-node
 GPU_ON=1; NSWRAP=(/fixture/sv-drm ns --); reject_runtime missing-pci
@@ -56,6 +56,10 @@ PCI=8086:a7a8; GPUENV=(WC_NATIVE_SHM=1); reject_runtime missing-strict-library
 GPUENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_STRICT=1 LD_LIBRARY_PATH=/wrong/lib); reject_runtime foreign-library
 GPUENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_STRICT=1 "LD_LIBRARY_PATH=$BASE/gtk/lib")
 stock_gpu_prerequisite_check; echo 'PASS runtime matched native route'
+DEF_ENV=(WC_NATIVE_SHM_STRICT=0); reject_runtime per-app-strict-disable
+DEF_ENV=(LD_LIBRARY_PATH=/wrong/lib); reject_runtime per-app-foreign-library
+DEF_ENV=()
+
 DEF_EXEC=/fixture/bin/native-app; GPU_ON=''; NSWRAP=(); GPUENV=()
 stock_gpu_prerequisite_check; echo 'PASS runtime native app needs no GTK/VA'
 source <(sed -n '/^clear_legacy_webrender_pref() {/,/^}/p' scripts/wc-session)
