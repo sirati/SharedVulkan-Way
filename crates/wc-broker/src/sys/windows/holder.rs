@@ -45,9 +45,10 @@ use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE, WaitForSingleObject};
 
 pub const HOLDER_PIPE: &str = r"\\.\pipe\waycompose-broker-holder";
-/// SYSTEM, and the pipe's owner (the account that started the holder: SYSTEM
-/// for the service, the tester's own account in a test).
-pub const HOLDER_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;OW)";
+/// SYSTEM, elevated Administrators for checked uninstall, and the pipe's
+/// owner for tests. A filtered/disabled Administrators SID grants no access.
+/// Administrators already control the service and its protected data.
+pub const HOLDER_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)";
 
 // ------------------------------------------------------------ the holder
 
