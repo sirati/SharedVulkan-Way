@@ -270,6 +270,13 @@ def build(root, bridge_dir=None):
         for function in ('mmap', 'close', 'os_create_anonymous_file'):
             if function not in imports.get('cygwc-posix-0.dll', []):
                 raise RuntimeError(f'rendered application bypasses BAR POSIX runtime: {function}')
+        compile(INTEGRATION / 'lease-probe.c', output / 'lease-probe.o')
+        link([output / 'lease-probe.o', *app_objects[1:]], output / 'lease-probe.exe',
+             libraries=['-lwc-cygwin-posix', '-lwayland-client'])
+        probe_imports = pe_imports(output / 'lease-probe.exe', symbols=True)
+        for function in ('mmap', 'munmap', 'close', 'ftruncate', 'os_create_anonymous_file'):
+            if function not in probe_imports.get('cygwc-posix-0.dll', []):
+                raise RuntimeError(f'lease fixture bypasses POSIX boundary: {function}')
         library_imports = pe_imports(dll, symbols=True)
         for function in ('close', 'fcntl', 'wc_cygwin_fd_from_words'):
             if function not in library_imports.get('cygwc-posix-0.dll', []):
@@ -281,7 +288,7 @@ def build(root, bridge_dir=None):
     artifacts = [app, dll, output / 'abi.exe', output / 'fd-probe.exe']
     if bridge is not None:
         artifacts.extend([bridge / 'wc_cygwin_link.dll', output / 'cygwc-posix-0.dll',
-                          output / 'weston-simple-shm.exe', output / 'posix-probe.exe'])
+                          output / 'weston-simple-shm.exe', output / 'posix-probe.exe', output / 'lease-probe.exe'])
     helper = sysroot / 'usr/bin/cygwin-console-helper.exe'
     if helper.exists():
         artifacts.append(helper)

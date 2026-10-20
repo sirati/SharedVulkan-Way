@@ -4,9 +4,11 @@ param(
   [Parameter(Mandatory=$true)][string]$Root,
   [switch]$RunRingClient,
   [switch]$RunRenderedClient,
+  [switch]$RunLeaseProbe,
   [string]$BarRun = '',
   [uint32]$ArenaId = 0,
-  [string]$Broker = ''
+  [string]$Broker = '',
+  [string]$LegacyBin = ''
 )
 $ErrorActionPreference = 'Stop'
 $bin = Join-Path $Root 'bin'
@@ -37,12 +39,12 @@ Remove-Item Env:WAYLAND_DISPLAY -ErrorAction SilentlyContinue
 Remove-Item Env:WC_WAYLAND_RING -ErrorAction SilentlyContinue
 Remove-Item Env:WC_CYGWIN_RUN -ErrorAction SilentlyContinue
 Remove-Item Env:WC_CYGWIN_ARENA_ID -ErrorAction SilentlyContinue
-function Run-Probe([string]$name, [int]$seconds) {
-  $stdout = Join-Path $evidence "$name.stdout.txt"
-  $stderr = Join-Path $evidence "$name.stderr.txt"
+function Run-Probe([string]$name, [int]$seconds, [string]$directory = $bin, [string]$label = $name) {
+  $stdout = Join-Path $evidence "$label.stdout.txt"
+  $stderr = Join-Path $evidence "$label.stderr.txt"
   $p = New-Object Diagnostics.Process
-  $p.StartInfo.FileName = Join-Path $bin "$name.exe"
-  $p.StartInfo.WorkingDirectory = $bin
+  $p.StartInfo.FileName = Join-Path $directory "$name.exe"
+  $p.StartInfo.WorkingDirectory = $directory
   $p.StartInfo.UseShellExecute = $false
   $p.StartInfo.RedirectStandardOutput = $true
   $p.StartInfo.RedirectStandardError = $true
@@ -80,18 +82,29 @@ $result = [ordered]@{
   rendered_frames_proved = $false
   ring_client_ran = $false
   rendered_client_ran = $false
+  lease_probe_ran = $false
 }
-if ($RunRingClient -and $RunRenderedClient) { throw 'select one client per bounded host connection' }
-if ($RunRingClient -or $RunRenderedClient) {
+if (([int][bool]$RunRingClient + [int][bool]$RunRenderedClient + [int][bool]$RunLeaseProbe) -gt 1) { throw 'select one client per host connection' }
+if ($RunRingClient -or $RunRenderedClient -or $RunLeaseProbe) {
   if (-not $Broker) { throw 'an explicit isolated broker endpoint is required' }
   if (-not (Test-Path -LiteralPath (Join-Path $bin 'wc_cygwin_link.dll'))) { throw 'bundle lacks native ring adapter' }
   $env:WC_BROKER = $Broker
   $env:WC_WAYLAND_RING = '1'
-  if ($RunRenderedClient) {
+  if ($RunRenderedClient -or $RunLeaseProbe) {
     [uint64]$parsedRun = 0
     if (-not [uint64]::TryParse($BarRun, [ref]$parsedRun) -or $parsedRun -eq 0) { throw 'explicit nonzero BAR run identity required' }
     if ($parsedRun -eq [uint64]::MaxValue) { throw 'run identity must leave room for negative test' }
     $env:WC_CYGWIN_ARENA_ID = [string]$ArenaId
+    if ($LegacyBin) {
+      $legacyManifest = Get-Content -Raw -LiteralPath (Join-Path $LegacyBin 'manifest.json') | ConvertFrom-Json
+      foreach ($entry in $legacyManifest.artifacts.PSObject.Properties) {
+        if ((Get-FileHash -LiteralPath (Join-Path $LegacyBin $entry.Name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entry.Value.sha256) { throw 'legacy format fixture hash differs' }
+      }
+      $env:WC_CYGWIN_RUN = $BarRun
+      $legacy = Run-Probe 'weston-info' 20 $LegacyBin 'legacy-format'
+      $legacyText = Get-Content -Raw -LiteralPath (Join-Path $evidence 'legacy-format.stderr.txt')
+      if ($legacy -eq 0 -or $legacyText -notmatch 'header version 3') { throw 'retained legacy binary did not refuse new allocation layout' }
+    }
     $env:WC_CYGWIN_RUN = [string]($parsedRun + [uint64]1)
     $rejected = Run-Probe 'weston-info' 20
     $rejection = Get-Content -Raw -LiteralPath (Join-Path $evidence 'weston-info.stderr.txt')
@@ -101,17 +114,28 @@ if ($RunRingClient -or $RunRenderedClient) {
     $env:WC_CYGWIN_RUN = $BarRun
     $fallback = Run-Probe 'posix-probe' 20
     if ($fallback -ne 0) { throw "Cygwin POSIX mapping fallback failed: $fallback" }
-    $client = Run-Probe 'weston-simple-shm' 90
-    if ($client -ne 0) { throw "unmodified rendered Cygwin client failed: $client" }
-    $text = Get-Content -Raw -LiteralPath (Join-Path $evidence 'weston-simple-shm.stderr.txt')
-    if ($text -notmatch 'simple-shm exiting' -or $text -notmatch 'WC_CYGWIN_BAR_DESCRIPTOR ' -or
+    $clientName = if ($RunLeaseProbe) { 'lease-probe' } else { 'weston-simple-shm' }
+    $env:WAYLAND_DEBUG = '1'
+    $client = Run-Probe $clientName 90
+    Remove-Item Env:WAYLAND_DEBUG
+    if ($client -ne 0) { throw "$clientName failed: $client" }
+    $text = Get-Content -Raw -LiteralPath (Join-Path $evidence "$clientName.stderr.txt")
+    if ($text -notmatch 'WC_CYGWIN_BAR_DESCRIPTOR ' -or
         $text -notmatch 'WC_CYGWIN_PUMPS_JOINED threads=2' -or
         $text -notmatch 'WC_CYGWIN_BAR_CONNECTION_CLOSED ring_dead=1' -or
-        $text -notmatch 'WC_CYGWIN_BAR_TEARDOWN pools=([0-9]+) token_holds_closed=([0-9]+) extents_recycled=0') {
-      throw 'rendered client lacks clean protocol/runtime teardown stamps'
+        $text -notmatch 'WC_CYGWIN_BAR_TEARDOWN .*kernel_death_required=1 consumer_completion_required=1') {
+      throw 'client lacks honest protocol/runtime teardown stamps'
     }
-    if ([int]$Matches[1] -le 0 -or $Matches[1] -ne $Matches[2]) { throw 'BAR token holds did not close' }
-    $result.rendered_client_ran = $true
+    if ($RunLeaseProbe) {
+      if ($text -notmatch 'WC_CYGWIN_LEASE_ACCEPTANCE keymap_bytes=[1-9][0-9]* grown_bytes=16384 address_preserved=1 remote_hold_blocks_reuse=1 recycled_after_consumer=128 frames=12' -or
+          $text -notmatch 'retained_capabilities=0 retained_maps=0') { throw 'lease fixture lacks its keymap/growth/consumer/recycling proof' }
+      $result.lease_probe_ran = $true
+    } else {
+      if ($text -notmatch 'simple-shm exiting') { throw 'upstream simple-shm did not exit normally' }
+      # Upstream simple-shm leaves mmap alive until process exit. Do not pretend
+      # DLL teardown is kernel death or remote completion for these views.
+      $result.rendered_client_ran = $true
+    }
   } else {
   $client = Run-Probe 'weston-info' 90
   if ($client -ne 0) { throw "unmodified Cygwin Wayland registry client failed: $client" }
