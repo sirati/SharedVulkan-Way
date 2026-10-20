@@ -36961,8 +36961,9 @@ the Looking Glass B7 ivshmem driver leaves its devices
 process mapped the GPU device directly before the broker (`direct-opened`,
 `bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
 another process holds cannot be opened to change its descriptor (vioser is
-exclusive); it keeps its live descriptor until it is free, and the property
-takes over at its next start.
+exclusive). Startup refuses if the port's live or PnP protection cannot be
+verified. Security reads retry access-denied opens for up to two seconds to
+allow asynchronous driver closes to finish; unreadable protection still fails.
 
 **Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
 `SEC_COMMIT`), so no other process can open one by name; `large` adds
@@ -36988,7 +36989,10 @@ died is started again and given every region. So a region the host still
 maps is lost only if the broker, the holder and every provider die together;
 before the holder, the broker's crash while the provider was down was enough.
 An orderly stop of the service leaves the holder running (an upgrade keeps
-the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+the regions). `sv-guest broker holder-quit` atomically refuses while any
+region remains. Normal region release permits holder exit. On refusal,
+uninstall retains the binary, service, protections and recovery state, and
+restarts a previously running service to adopt retained regions.
 
 **Signing (§111.6).** `Platform::identity` is `os=windows
 user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
@@ -37008,6 +37012,10 @@ device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
 `[wc-broker] device NAME: not from the broker (WHY); opening it directly`,
 and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
 device.
+
+The following measurements describe the original broker. Its cross-SID raw
+BAR regrant and unconditional uninstall behavior are superseded by the
+ownership and checked-shutdown restrictions below.
 
 **Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
 a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
@@ -37045,14 +37053,78 @@ runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=key` registers only this installation's key in an already
+running broker. It never installs or restarts the service and is allowed for
+tests. The key and its protected parent directories belong to Administrators
+and grant access only to SYSTEM and Administrators. Provisioning replaces the
+key object using a protected temporary file, then replaces the whole DACL.
+An already-open handle to an old readable key cannot observe the rotated
+bytes. Reparse directories and key paths are refused. The service executable
+and recovery files also have privileged ownership. This matters because an
+owner can change a DACL even without a grant in that DACL.
+Installation does not trust SCM's transient Running state alone. The ready
+command opens an overlapped pipe, checks its kernel server PID against the
+current running SCM service and its token SID against SYSTEM, then checks
+hello/stats. While the verified process remains pinned, it independently
+checks both live and PnP protection for present BARs and doorbell ports, then
+rechecks process liveness and SCM before success. Each exchange has a one-second I/O deadline; cancellation is
+drained before its buffers disappear. Generic private/user broker clients
+keep their existing connection behavior.
+
 `WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
-holder ended, keys kept).
+holder ended, keys kept). A deploy with `skip` refuses if the broker already
+exists, before stopping a session or copying any files. Use `key` there;
+recreating a desktop-readable signing key would defeat the broker identity
+check. Unknown service status also refuses the deploy.
+
+**Rollback baseline and refusal.** The first broker start records each device's
+live DACL and PnP descriptor before changing either. Binary `SPDRP_SECURITY`
+includes the mandatory label. The five-column `devices.txt` and durable count
+checkpoint are flushed before mutation. Missing, truncated, unreadable or
+invalid installed history requires trusted recovery. A fresh install records
+an explicit empty baseline; restart cannot invent lost history. Independent
+startup verification requires both live and PnP descriptors on the BARs and
+doorbell ports to remain protected, even when securing failed or rollback history was lost. Unknown or
+permissive protection fails before the public pipe or signer is created.
+Missing optional devices are skipped. Protected devices with missing history
+can still recover retained holder sections; their uninstall stays refused.
+
+Uninstall checks before stopping the service whether either original raw BAR
+descriptor could expose old bytes. Anything beyond the exact protected SYSTEM
+and Administrators DACL refuses restoration. Direct `revert-acl` enforces the
+same check. Retaining the SID file cannot police direct opens through a
+permissive DACL. Uninstall is therefore unavailable for ordinary pre-broker
+permissive raw baselines and is not an application rollback procedure. The
+installer retains the original port task/files and all recovery state on
+refusal. Any saved legacy grant task, script or port map also refuses uninstall
+before service mutation. Such unreviewed code could undo safe raw descriptors
+later, so protected original ACLs alone do not make legacy task restoration safe. Only an empty holder and protected raw baseline permit removal.
+
+Raw BAR ownership is bound to the canonical physical PnP instance and a
+privileged reviewed SID policy. Process exit, holder or broker restart, and
+protocol alias changes cannot reassign it. Missing or untrusted policy denies
+access. There is no first-claim or reset API. This is a single-owner limitation
+until host/GPU drain can be proved.
+
+A private Windows clone proved old BAR bytes crossed SIDs before this policy.
+The corrected binary refuses the other SID after process exit, holder
+replacement and broker restart; the owner still reads its original bytes.
+Both ordinary users are denied direct raw opens. An actual-section proof
+retained `user1-secret` through refused uninstall and direct refused holder
+quit, recovered the same holder, then adopted/read and normally released it.
+Unsafe raw rollback and missing-baseline uninstall refuse before service
+mutation. Evidence is
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`, especially
+`raw-policy-clone.txt`, `raw-policy-alias.txt`,
+`uninstall-lifetime-proof.txt` and `uninstall-direct-open-denied.txt`.
+The final real Windows unit run passed all 30 tests in
+`uninstall-windows-units-final.txt`.
 
 **What remains.** Running the compositor and the GPU process on the VM under
-the broker end to end (the probe exercises the same calls, not the products);
-the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
-(not touched here).
+the broker end to end under the mapped Linux user (the probe exercises the
+same calls, not the products), and a run on the deployment guest (not touched
+here). The large-page stamping hook is implemented by `stamp_guest_ram`.
 
 ### 111.9 macOS
 
@@ -37575,12 +37647,20 @@ generation with `services.waycompose`. For each installation it does this:
   for the admin and the desktop user are dropped and one for `waycompose` is
   added; the VM is not restarted;
 * `remove-old` deletes the admin's copies only after a session was seen
-  working; `rollback` puts the admin's units and links back.
+  working. `rollback` restores a previous protected installation snapshot
+  beneath the system layout, with its current trusted key. It keeps the
+  system services, user mapping and broker protection. It never restores
+  admin user units, desktop raw-resource ACLs or an exposed old key. A
+  missing protected snapshot refuses rollback. The first protected install
+  creates its initial snapshot, and later deploys snapshot the prior
+  protected installation. Rollback requires idle admin and mapped-user
+  session managers; it restores installation apps, configuration and bins,
+  while keeping shared service binaries and the mapping unchanged.
 
-A dry run under `ROOT=` on a tree shaped like the VM host's (three
-installations, a profile with a lock file, Prism data with absolute paths and
-a binary file) gave the expected tree for plan, apply, rollback, apply again
-and remove-old. Not run on the VM host itself.
+The earlier legacy-layout dry run does not establish protected rollback.
+The current fixture checks protected snapshot restoration, key rotation,
+trusted-key reuse and refusal of unconfirmed provenance. Live migration
+remains pending.
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
@@ -37612,8 +37692,9 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
   host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
   paths become the installation's, the admin's home becomes `~/` (the mapped
-  user's), the GC roots are registered at their new path, an installed key is
-  kept, and the stage's copy of the key is deleted;
+  user's), and the GC roots are registered at their new path. Only a
+  root-generated, broker-confirmed key is installed. A legacy stage key is
+  discarded;
 * the deploy is refused unless `users.conf` maps the installation to a user. A
   test installation is named in the host's `wctestInstalls`, so it runs as
   `wctest`, with its profile in that user's home;
@@ -37621,6 +37702,42 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
   which is a doorbell blip of about a second for every session;
 * the debug ssh transport is not available with it.
+
+Before the first privileged-identity migration, `key-prepare` stops both
+legacy and system verifiers after refusing active sessions. It disables the
+legacy admin units and removes retired verifier keys before provisioning,
+so a restart or reboot cannot revive exposed trust. It generates a
+fresh key beneath root-owned `/var/lib/waycompose/key-trust/<name>` with
+0700 directories and 0600 files. `key-export` sends that candidate directly
+to the deploy channel, never into the admin's staging tree. The Windows
+broker's privileged key provisioning must succeed before `key-confirm`
+records protected provenance. `apply` and `install-staged` refuse keys
+without that provenance. They never infer historical secrecy from a key's
+current owner or mode. Failure keeps the old verifier stopped; retry uses
+the same protected candidate. Already protected deployments reuse their
+key. Every script-managed shared-verifier restart first checks that all
+installed directories have protected broker-confirmed provenance and match
+their registry key; a partially migrated directory leaves services stopped. Privileged broker provisioning through the old user layout is refused.
+Generation provenance is written only when the helper actually generates a
+candidate. A preexisting key with root ownership and 0600 mode but no such
+provenance is refused, not relabelled. A lost candidate cannot inherit an old
+broker confirmation. A generated candidate interrupted before broker
+confirmation can be retried unchanged. Generation is serialized.
+
+The focused fixture reproduces a first migration whose candidate `wc-session`
+exits 91, then runs the restored original executable after protected rollback.
+It checks normalized system paths and the current trusted key. This is an
+isolated filesystem fixture, not a live mapped-user application session.
+The private Windows clone additionally passed real broker signing and host
+boot-record verification with the replacement key while rejecting the retired
+key. An already-open handle to the previously readable key retained only the
+retired bytes after replacement. The replacement object allowed only SYSTEM
+and Administrators. Evidence and the recipe are outside git in
+`evidence/session-fixes/broker-rollback/key-rotation-proof.txt` and
+`key-rotation-proof.ps1`; neither records key bytes or fingerprints.
+
+The root helper and privileged deployment channel are trusted administration
+interfaces, not interfaces exposed to desktop clients.
 
 `scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
 (paths, key kept across a redeploy, the mapped user, refusals) and deploy's

@@ -21,6 +21,7 @@ pub mod holder;
 pub mod ident;
 pub mod pipe;
 pub mod service;
+mod readiness;
 
 use crate::core::{ObjId, Peer, Pid, RegionInfo, User};
 use crate::server::{Give, Platform};
@@ -166,6 +167,7 @@ pub struct Windows {
     listener: Listener,
     devices: Vec<DeviceAt>,
     large_pages: bool,
+    raw_device_paths: Option<BTreeMap<String, String>>,
     region_init: Option<RegionInit>,
     holder: Option<Arc<holder::Link>>,
     /// Process handles opened at accept, for `watch`: the process the pid
@@ -181,10 +183,18 @@ impl Windows {
             listener: Listener::new(name, sddl)?,
             devices,
             large_pages,
+            raw_device_paths: None,
             region_init: None,
             holder: None,
             opened: Arc::default(),
         })
+    }
+
+    /// Pin service raw-device opens to the exact interface whose durable
+    /// owner was checked at startup. Aliases cannot select a different BAR.
+    pub fn with_raw_device_paths(mut self, paths: BTreeMap<String, String>) -> Self {
+        self.raw_device_paths = Some(paths);
+        self
     }
 
     /// Run `f` on every new region (§108.8's stamp plugs in here).
@@ -344,7 +354,18 @@ impl Platform for Windows {
             .find(|d| d.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("device {name} has no location here")))?;
         let h = match &d.loc {
-            DeviceLoc::IvshmemSlot(s) => wc_handle::open_ivshmem_slot(*s)?.into_raw(),
+            DeviceLoc::IvshmemSlot(s) => match &self.raw_device_paths {
+                Some(paths) => {
+                    let path = paths.get(name).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "raw device has no trusted durable owner",
+                        )
+                    })?;
+                    wc_handle::open_ivshmem_path(path.clone())?.into_raw()
+                }
+                None => wc_handle::open_ivshmem_slot(*s)?.into_raw(),
+            },
             DeviceLoc::Port(p) => sv_transport::winpipe::open_virtio_port_handle(p, 500)
                 .map_err(|e| io::Error::other(format!("port {p}: {e}")))? as HANDLE,
             DeviceLoc::Path(p) => open_path(p)?,

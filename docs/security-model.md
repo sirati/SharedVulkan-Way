@@ -1734,7 +1734,31 @@ resources.
   ports are ACL'd to the broker's account and administrators, so a user
   process cannot open them past it. Windows regions are unnamed sections, so
   no name reaches them.
-* **What a dead process leaves.** Its devices are free the moment the kernel
+* **Whole Windows BAR ownership.** The installed service requires
+  `ProgramData/waycompose/raw-device-owners.txt`, with header
+  `wc-raw-device-owners-v1` followed by one PnP instance ID, a tab, and its
+  reviewed existing owner's SID per line. The file must have privileged
+  ownership and exactly the protected SYSTEM/Administrators full-access DACL.
+  The installer never invents or changes a binding. An administrator must
+  establish the legacy owner before provisioning this file. Missing,
+  unreadable, malformed or untrusted policy reserves every raw BAR. An
+  unmatched physical identity remains reserved. Protocol device renaming
+  does not change this binding. Opens use the exact device interface checked
+  at startup. Arbitrary path devices are refused by the installed service.
+  A process exit, broker crash, holder crash, timeout or service restart never
+  transfers ownership to another SID. There is no release/reassignment API
+  and no blind memory wipe. The same SID may resume while old host/GPU writes
+  remain possible. This is a single-owner safety restriction, not multi-user
+  BAR handover. A future cross-user transfer requires positive host/GPU drain
+  and clearing after drain. Uninstall and `revert-acl` refuse any saved raw
+  live/PnP descriptor that would restore desktop access. Keeping a SID file
+  alone cannot enforce ownership after such a kernel ACL rollback. There is
+  no operator override without an independently proved clean/drained boundary.
+  The host must preserve the physical resource's
+  owner across VM/device replacement: Windows cannot attest that a host has
+  substituted new backing memory behind an identical PnP identity.
+* **What a dead process leaves.** Its device handle becomes available again
+  to users permitted by its persistent ownership policy when the kernel
   reports the exit; its regions are held as orphans until the same user's
   next provider of the pool frees them after the host has let go (the keeper
   rule of R43 and §103.15, now one implementation); its leases end, and a
@@ -1766,3 +1790,12 @@ resources.
   binary is installed where users cannot write (a SYSTEM service running a
   user-writable file would hand that user SYSTEM).
 * The platform paragraphs follow.
+
+
+Windows holder shutdown refuses atomically while any retained section exists.
+An error or missing shutdown reply is failure. Uninstall checks raw ACL rollback
+before stopping the service, then retains the service registration, protection,
+binary and recovery files until the holder confirms empty. If a retained
+section blocks uninstall, the previously running service is restarted and
+adopts the holder's sections. No quit or uninstall path clears sections or
+uses a timeout as evidence of host/GPU release.

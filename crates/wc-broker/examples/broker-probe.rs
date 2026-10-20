@@ -12,6 +12,7 @@
 //!                                      in PID, and by the broker's `open ID`
 //! broker-probe adopt POOL              adopt this user's orphans of POOL, read and free them
 //! broker-probe sign INSTALL            the broker's signature and identity
+//! broker-probe sign-check INSTALL      verify current/retired keys from stdin, metadata only
 //! broker-probe rtt N                   N stats requests, timed
 //! broker-probe bw SLOT direct|broker   memcpy bandwidth through the mapped BAR
 //! ```
@@ -57,6 +58,73 @@ mod win {
     pub fn run(a: &[String]) -> Result<(), String> {
         let arg = |i: usize| a.get(i).cloned().unwrap_or_default();
         match arg(0).as_str() {
+            "raw-acl-fixture" => {
+                if std::env::var("WC_PRIVATE_RAW_ACL_FIXTURE").as_deref() != Ok("yes") {
+                    return Err("private disposable raw ACL fixture opt-in required".into());
+                }
+                use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
+                let permissive = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGW;;;WD)";
+                let part = arg(1);
+                if part != "live" && part != "pnp" { return Err("fixture selects live or pnp".into()); }
+                let target = arg(2);
+                if !["", "wcbell", "svbell"].contains(&target.as_str()) { return Err("fixture target is bars, wcbell or svbell".into()); }
+                for d in default_devices() {
+                    if target.is_empty() {
+                        if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    } else if d.name != target { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone device")?;
+                    if part == "live" { acl::set_live(&f.live, permissive)?; }
+                    else { acl::set_property(&f.instance, Some(permissive))?; }
+                    println!("RESULT private-fixture-permissive-{part} {}", f.instance);
+                }
+                Ok(())
+            }
+            "protect-raw" | "protect-devices" => {
+                use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
+                for d in default_devices() {
+                    if arg(0) == "protect-raw" && !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone device")?;
+                    acl::set_property(&f.instance, Some(acl::DEVICE_SDDL))?;
+                    acl::set_live(&f.live, acl::DEVICE_SDDL)?;
+                    println!("RESULT protected-raw {}", f.instance);
+                }
+                Ok(())
+            }
+            "sentinel-write" | "sentinel-read" => {
+                let mut c = client("raw-bar-sentinel")?;
+                let h = c.device(&arg(1)).map_err(|e| e.to_string())?;
+                // SAFETY: the broker moved an unmapped ivshmem device here.
+                let d =
+                    unsafe { wc_handle::IvshmemDevice::from_raw(h.into_raw_handle() as _, arg(1)) };
+                let (view, size, _) =
+                    wc_handle::map_ivshmem_device(d).map_err(|e| e.to_string())?;
+                let marker = b"wc-private-clone-prior-user-sentinel";
+                let offset = 65536;
+                if size < (offset + marker.len()) as u64 {
+                    return Err("BAR too short".into());
+                }
+                if arg(0) == "sentinel-write" {
+                    // SAFETY: checked above; this probe is only for a private
+                    // clone with no compositor or host/GPU writer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            marker.as_ptr(),
+                            view.ptr().cast_mut().add(offset),
+                            marker.len(),
+                        )
+                    };
+                    println!("RESULT sentinel-written size={size}");
+                } else {
+                    // SAFETY: checked above; no private-clone writer is live.
+                    let found =
+                        unsafe { std::slice::from_raw_parts(view.ptr().add(offset), marker.len()) };
+                    println!(
+                        "RESULT prior-user-sentinel-visible={} size={size}",
+                        found == marker
+                    );
+                }
+                Ok(())
+            }
             "hold" => {
                 let mut c = client("probe")?;
                 let t = Instant::now();
@@ -156,7 +224,7 @@ mod win {
                 }
                 Ok(())
             }
-            "sign" => {
+            "sign" | "sign-check" => {
                 let mut c = client("probe")?;
                 let req = wc_broker::proto::SignReq {
                     install: arg(1),
@@ -173,6 +241,25 @@ mod win {
                 let t = Instant::now();
                 let (auth, id) = c.sign(&req).map_err(|e| e.to_string())?;
                 let us = t.elapsed().as_micros();
+                if arg(0) == "sign-check" {
+                    use std::io::Read;
+                    let mut input = String::new();
+                    std::io::stdin().read_to_string(&mut input).map_err(|_| "reading verification input failed")?;
+                    let mut lines = input.lines();
+                    let current = lines.next().and_then(wc_handle::macboot::parse_key).ok_or("invalid current verification key")?;
+                    let retired = lines.next().and_then(wc_handle::macboot::parse_key).ok_or("invalid retired verification key")?;
+                    if lines.next().is_some() { return Err("unexpected verification input".into()); }
+                    let rec = wc_handle::macboot::Record {
+                        session: req.session.clone(), arena_run: req.arena_run,
+                        arena_pages: req.arena_pages, outbound: req.outbound,
+                        rings_run: req.rings_run, rings_pages: req.rings_pages, gpu: req.gpu,
+                    };
+                    let current_ok = auth.verifies_identity(&rec, req.index, Some(&id), &current);
+                    let retired_ok = auth.verifies_identity(&rec, req.index, Some(&id), &retired);
+                    println!("RESULT rotated-signature current={current_ok} retired={retired_ok}");
+                    if !current_ok || retired_ok { return Err("key rotation verification failed".into()); }
+                    return Ok(());
+                }
                 let mac: String = auth.mac.iter().map(|b| format!("{b:02x}")).collect();
                 println!("RESULT signed us={us} identity={:?} mac={mac}", id.text());
                 // With the key (a test's), check what the host's sessiond
