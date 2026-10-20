@@ -351,9 +351,9 @@ run() {
 
   # ---- the game, as Prism launched it, with the session's environment
   local KM; KM=$(nix build --no-link --print-out-paths --impure --expr \
-    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
+    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
-  [ -n "$KM" ] || die "could not build nix/mesa-kopper-wayland.nix"
+  [ -n "$KM" ] || die "could not build nix/mesa-zink-va.nix"
   local LDP; LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$CAP/$inst/env")
   local -a GAME_ENV=(
     XDG_RUNTIME_DIR="$RUN/xdg" WAYLAND_DISPLAY=svmc
@@ -361,7 +361,7 @@ run() {
     VK_DRIVER_FILES="$BIN/sv_icd.json" SV_SOCKET="$RUN/gpu.sock"
     # Prism's own library path (OpenAL, GLFW, the Vulkan loader, libglvnd).
     LD_LIBRARY_PATH="$LDP"
-    # GL: Mesa's EGL from the patched Mesa, and Zink, through kopper with no
+    # GL: Mesa's EGL from our Mesa (nix/mesa-zink-va.nix), and Zink, through kopper with no
     # DRM device (docs/design.md §0.28) — what gpu.env sets for Firefox.
     __GLX_VENDOR_LIBRARY_NAME=mesa
     __EGL_VENDOR_LIBRARY_FILENAMES="$KM/share/glvnd/egl_vendor.d/50_mesa.json"

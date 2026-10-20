@@ -1937,6 +1937,11 @@ gpu)
     echo "wc-session: NO SHARED DOORBELL HUB ($HUBDIR): this session holds QEMU's doorbell port itself, and no other session can have it until this one is gone (§99)" >&2
     BELLARGS=$(printf -- '--bell %q --bell-hub %q' "$BELL" "$D/bell.sock")
   fi
+  # §112: the render node's service socket, when the host runs `sv-drm serve
+  # --services`: this session's GPU service registers there, so a sandboxed
+  # application (Firefox's decoder) reaches it through the node.
+  DRM_SERVICES=${WC_DRM_SERVICES:-/run/sv-drm/services.sock}
+  [ -S "$DRM_SERVICES" ] && BELLARGS="$BELLARGS $(printf -- '--drm-services %q' "$DRM_SERVICES")"
   {
     echo '#!/usr/bin/env bash'
     echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
