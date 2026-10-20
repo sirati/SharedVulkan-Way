@@ -14,6 +14,6 @@ gtk3.overrideAttrs (old: {
       --replace-fail "  'gdkdisplay-wayland.c'," "  'gdkdisplay-wayland.c', 'gtk-native-shm-helper.c'," \
       --replace-fail "  ['gtk-shell', 'private', ]," "  ['gtk-shell', 'private', ], ['wc-native-shm', 'private', ]," \
       --replace-fail "  shmlib," "  shmlib, cc.find_library('wc_native_shm', dirs: '${wcNativeShm}/lib'),"
-    export NIX_CFLAGS_COMPILE="\''${NIX_CFLAGS_COMPILE:-} -I${wcNativeShm}/include"
+    export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -I${wcNativeShm}/include"
   '';
 })
