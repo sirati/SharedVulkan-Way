@@ -85,6 +85,28 @@ out=$(guard user wct1); rc=$?
 out=$(guard system wct1); rc=$?
 [ "$rc" = 2 ] && ok "the system layout refuses a host without the system services" || bad "system on a plain host: rc=$rc"
 
+# deploy's scope: shared state only by name, never from a test installation.
+scope() { # HOSTDIR-HAS-TEST-HOME(0/1) ENV...
+  local th=$1; shift
+  ( eval "$(sed -n '/^deploy_scope_check() {/,/^}/p' "$ROOT_DIR/scripts/wc-launch.sh")"
+    h() { [ "$th" = 1 ]; }
+    HOSTDIR=/stage BROKER=skip PORT_ACCESS=skip
+    for a in "$@"; do eval "$a"; done
+    deploy_scope_check ) 2>&1
+}
+out=$(scope 0); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -q "this installation only" && ok "the defaults change nothing shared" || bad "defaults: rc=$rc $out"
+out=$(scope 0 BROKER=install); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -q "WC_LAUNCH_BROKER" && ok "a user installation may ask for the broker by name" || bad "broker by name: rc=$rc $out"
+out=$(scope 1 BROKER=install); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q "test installation" && ok "a test installation (test-home) is refused the broker" || bad "test + broker: rc=$rc $out"
+out=$(scope 0 WC_LAUNCH_TEST_HOME=/x PORT_ACCESS=install); rc=$?
+[ "$rc" = 2 ] && ok "a test installation (WC_LAUNCH_TEST_HOME) is refused the port grant" || bad "test + port access: rc=$rc"
+out=$(scope 1 WC_LAUNCH_SERVICES=install); rc=$?
+[ "$rc" = 2 ] && ok "a test installation is refused the host's services" || bad "test + services: rc=$rc"
+out=$(scope 0 BROKER=yes); rc=$?
+[ "$rc" = 2 ] && ok "an unknown value is refused" || bad "unknown value: rc=$rc"
+
 rm -rf "$T"
 [ "$FAIL" = 0 ] && { echo "wc-users-migrate-test: OK"; exit 0; }
 echo "wc-users-migrate-test: FAILED"; exit 1

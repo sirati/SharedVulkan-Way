@@ -36629,12 +36629,12 @@ tests): a stand-in device moved into a child, refused to the parent, free
 orphan adopted; `sign`; the holder restoring a region after the broker was
 killed and again after the holder was killed; RTT mean 41 µs, p99 59 µs.
 
-**Deploy.** `scripts/wc-launch.sh deploy` (default `WC_LAUNCH_BROKER=install`)
+**Deploy.** `WC_LAUNCH_BROKER=install scripts/wc-launch.sh deploy`
 runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
-`WC_LAUNCH_BROKER=skip` is the pre-§111 deploy. `wc-launch.sh broker-show`
+`WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
 holder ended, keys kept).
 

@@ -187,16 +187,28 @@ case "$CLICK_LEVEL" in
   elevated) CLICK_RUNLEVEL=Highest ;;
   *) echo "WC_LAUNCH_CLICK must be medium or elevated, not $CLICK_LEVEL" >&2; exit 2 ;;
 esac
+# WHAT A DEPLOY MAY CHANGE BEYOND ITS OWN INSTALLATION. Each of these is
+# guest-wide or host-wide, shared by every installation, and so only done
+# when asked for by name (`install`); the default `skip`/`keep` leaves it as
+# it is. A test installation (WC_LAUNCH_TEST_HOME, or a `test-home` file in
+# its host directory) is refused any of them (`deploy_scope_check`):
+#   WC_LAUNCH_BROKER=install        the guest's broker service, device ACLs, §91's task
+#   WC_LAUNCH_PORT_ACCESS=install   §91's per-user grant of the doorbell ports, its task
+#   WC_LAUNCH_SERVICES=install      the host's hub and session service (user layout)
+#   WC_LAUNCH_SYSTEM_BINS=install   the system hub's and session service's binaries
+# (2026-10-20: a test installation's deploy with the old default `install`
+# put the broker on the deployment guest under production installations.)
+#
 # §91. `deploy` grants the guest user the two doorbell ports
 # (`scripts/wc-port-access.ps1 install`), which is what lets a medium-integrity
 # launch open them. `skip` leaves the guest's device security alone.
-PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
+PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-skip}"
 # §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
 # from Program Files) and gives it this installation's key; the broker opens
 # the devices for the user's processes, so the per-user port grant above is
 # superseded and its task removed. `skip` keeps §91's grant and the key in the
 # user's install directory, as before §111.
-BROKER="${WC_LAUNCH_BROKER:-install}"
+BROKER="${WC_LAUNCH_BROKER:-skip}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 # §105: the pre-§105 transport (ssh exec, relay, tunnel) as an opt-in debug
@@ -571,7 +583,9 @@ taskbar_ids() {
   [ -n "$why" ] && flags="--test-install"
   [ "$dry" = dry ] && flags="$flags --dry-run"
   local before out
-  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  # A first deploy has no log yet: the shell's error text is not a count.
+  before=$(g "cat $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null | wc -l" | tr -d '\r ')
+  [[ "$before" =~ ^[0-9]+$ ]] || before=0
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --taskbar-ids $flags" >/dev/null 2>&1
   out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
   [ -n "$why" ] && note "a test installation ($why): its applications get its own taskbar identity"
@@ -591,7 +605,9 @@ taskbar_ids() {
 do_uninstall_taskbar() {
   echo "== uninstall-taskbar =="
   local before out
-  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  # A first deploy has no log yet: the shell's error text is not a count.
+  before=$(g "cat $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null | wc -l" | tr -d '\r ')
+  [[ "$before" =~ ^[0-9]+$ ]] || before=0
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --uninstall-taskbar ${1:-}" >/dev/null 2>&1
   out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
   printf '%s\n' "$out" | sed 's/^/        /'
@@ -633,6 +649,34 @@ host_layout_check() {
   esac
 }
 
+# The guest-wide and host-wide side effects (see BROKER above): said, and for a
+# test installation refused.
+deploy_scope_check() {
+  local test="" v name val asked=""
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then test="WC_LAUNCH_TEST_HOME is set"
+  elif h "test -s $HOSTDIR/test-home"; then test="$HOSTDIR/test-home exists"
+  fi
+  for v in "WC_LAUNCH_BROKER=$BROKER" "WC_LAUNCH_PORT_ACCESS=$PORT_ACCESS" \
+           "WC_LAUNCH_SERVICES=${WC_LAUNCH_SERVICES:-keep}" "WC_LAUNCH_SYSTEM_BINS=${WC_LAUNCH_SYSTEM_BINS:-keep}"; do
+    name=${v%%=*}; val=${v#*=}
+    case "$val" in
+      install) asked="$asked $name" ;;
+      skip|keep) ;;
+      *) echo "error: $name is install, skip or keep, not $val"; exit 2 ;;
+    esac
+  done
+  if [ -n "$test" ] && [ -n "$asked" ]; then
+    echo "error: a test installation ($test) may not change what every installation shares:$asked=install."
+    echo "       Deploy it with those left at their defaults (skip/keep)."
+    exit 2
+  fi
+  if [ -n "$asked" ]; then
+    echo "  this deploy changes shared state, asked for by name:$asked"
+  else
+    echo "  this deploy changes this installation only (broker, port access, host services: left as they are)"
+  fi
+}
+
 # §111.10: the staged installation into the system layout, as root.
 install_staged() {
   scp "${SSHOPT[@]}" "$ROOT/scripts/wc-users-migrate.sh" "$HOST:$HOSTDIR/../wc-users-migrate.sh" >/dev/null \
@@ -661,6 +705,7 @@ do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
   host_layout_check
+  deploy_scope_check
   # A session from the last run holds both halves' binaries open. Ended through
   # the product's own verb, which kills by the pid in its own state file.
   g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS 2>/dev/null && ./wc-launch.exe --session-name $SESSION --stop" >/dev/null 2>&1
@@ -1060,7 +1105,7 @@ VK_DRIVER_FILES=$icd_json"
   # and unit, and only checked.
   if [ "$LAYOUT" = system ]; then
     : # the system services are the host's (installed after the GC roots below)
-  elif [ "${WC_LAUNCH_SERVICES:-install}" = keep ]; then
+  elif [ "${WC_LAUNCH_SERVICES:-keep}" = keep ]; then
     local ks; ks=$(h "export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user is-active wc-bell-hub.service wc-sessiond.service | tr '\n' ' '")
     case "$ks" in
       "active active "*) ok "WC_LAUNCH_SERVICES=keep: the shared hub and session service run, untouched" ;;
