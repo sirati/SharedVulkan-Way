@@ -47,7 +47,7 @@ static int64_t install(guest_t *g, uint64_t flags, uint64_t addr) {
     /* No listener, SPEC_ALLOW, logging, or TSYNC_ESRCH flags are implemented. */
     if (flags & ~1ULL) return -22;
     struct { uint16_t len; uint8_t pad[6]; uint64_t filter; } f;
-    if (guest_read(g, addr, &f, sizeof(f)) < 0) return -14;
+    if (!addr || guest_read(g, addr, &f, sizeof(f)) < 0) return -14;
     if (!f.len || f.len > HL_SECCOMP_MAX_INSNS) return -22;
     pthread_mutex_lock(thread_get_lock());
     int permitted=current_thread && current_thread->no_new_privs;
@@ -56,7 +56,7 @@ static int64_t install(guest_t *g, uint64_t flags, uint64_t addr) {
     struct hl_seccomp_filter *p = calloc(1, sizeof(*p)+f.len*sizeof(hl_sock_filter));
     if (!p) return -12;
     p->len = f.len; p->refs = 1;
-    if (guest_read(g, f.filter, p->insns, f.len*sizeof(hl_sock_filter)) < 0) {
+    if (!f.filter || guest_read(g, f.filter, p->insns, f.len*sizeof(hl_sock_filter)) < 0) {
         free(p); return -14;
     }
     int valid = hl_bpf_validate(p->insns, p->len);
@@ -109,7 +109,7 @@ int64_t hl_seccomp_syscall(guest_t *g, uint64_t op, uint64_t flags, uint64_t arg
     if (op == 2) { /* SECCOMP_GET_ACTION_AVAIL */
         uint32_t a;
         if (flags) return -22;
-        if (guest_read(g, arg, &a, sizeof(a)) < 0) return -14;
+        if (!arg || guest_read(g, arg, &a, sizeof(a)) < 0) return -14;
         switch (a) {
         case 0: case KILL_PROCESS: case 0x30000: case 0x50000:
         case 0x7ff00000: case ALLOW: return 0;
