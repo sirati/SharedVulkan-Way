@@ -354,6 +354,14 @@ pub fn serve_connection(
 /// Synchronous registration. Keep this connection alive until another owner
 /// has registered its alias or the allocation is no longer discoverable.
 pub fn register(stream: &mut UnixStream, fd: BorrowedFd<'_>, header: &[u8]) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    no_sigpipe(stream)?;
+    if peer_uid(stream)? != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native PRIME server uid",
+        ));
+    }
     if header.is_empty() || header.len() > MAX_HEADER {
         return Err(invalid("token header length"));
     }
