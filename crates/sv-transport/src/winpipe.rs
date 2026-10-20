@@ -99,6 +99,7 @@ mod sys {
 
     pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
     pub const ERROR_IO_PENDING: u32 = 997;
+    #[cfg(test)]
     pub const WAIT_TIMEOUT: u32 = 258;
 
     /// `OVERLAPPED`, x64: two `ULONG_PTR`s, the offset pair, the event.
@@ -127,62 +128,204 @@ mod sys {
 #[cfg(windows)]
 const WRITE_TIMEOUT_MS: u32 = 500;
 
+/// Shared by every transport writer in this process, including allocations
+/// whose owner has been dropped. A deliberately retained permit never returns
+/// capacity, so constructing another wrapper cannot reset the safety bound.
 #[cfg(windows)]
-fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
-    // SAFETY: a fresh manual-reset event, closed below on every path.
-    let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
-    if event == 0 {
-        return Err(unsafe { sys::GetLastError() });
+struct RetentionBudget {
+    records: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    max_records: usize,
+    max_bytes: usize,
+}
+
+#[cfg(windows)]
+impl RetentionBudget {
+    fn new(max_records: usize, max_bytes: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            records: 0.into(), bytes: 0.into(), max_records, max_bytes,
+        })
     }
-    let mut ov = sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event };
-    let mut done: u32 = 0;
-    // SAFETY: `buf` is valid for `len` bytes for the duration of the call,
-    // which does not return before the operation has completed: either the
-    // call finishes synchronously or `GetOverlappedResult` waits for it.
+
+    fn global() -> std::sync::Arc<Self> {
+        static BUDGET: std::sync::OnceLock<std::sync::Arc<RetentionBudget>> = std::sync::OnceLock::new();
+        BUDGET.get_or_init(|| Self::new(1024, 32 * 1024 * 1024)).clone()
+    }
+
+    fn reserve(self: &std::sync::Arc<Self>, bytes: usize) -> core::result::Result<RetentionPermit, u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.records.fetch_update(Relaxed, Relaxed, |n| n.checked_add(1).filter(|n| *n <= self.max_records)).is_err() {
+            return Err(1450); // ERROR_NO_SYSTEM_RESOURCES
+        }
+        if self.bytes.fetch_update(Relaxed, Relaxed, |n| n.checked_add(bytes).filter(|n| *n <= self.max_bytes)).is_err() {
+            self.records.fetch_sub(1, Relaxed);
+            return Err(1450);
+        }
+        Ok(RetentionPermit { budget: self.clone(), bytes })
+    }
+}
+
+#[cfg(windows)]
+struct RetentionPermit {
+    budget: std::sync::Arc<RetentionBudget>,
+    bytes: usize,
+}
+
+#[cfg(windows)]
+impl Drop for RetentionPermit {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.budget.bytes.fetch_sub(self.bytes, Relaxed);
+        self.budget.records.fetch_sub(1, Relaxed);
+    }
+}
+
+/// A synchronous caller's outstanding write. The allocation and its buffer
+/// remain stable until the kernel publishes completion, even after an error.
+#[cfg(windows)]
+struct PendingWrite {
+    ov: sys::Overlapped,
+    buf: Vec<u8>,
+    _permit: RetentionPermit,
+    #[cfg(test)]
+    dropped: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[cfg(windows)]
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        unsafe { sys::CloseHandle(self.ov.event) };
+        #[cfg(test)]
+        if let Some(count) = &self.dropped {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::vec_box)] // Kernel requests must retain their addresses as this vector grows.
+struct WriteQuarantine {
+    pending: Vec<Box<PendingWrite>>,
+    budget: std::sync::Arc<RetentionBudget>,
+}
+
+#[cfg(windows)]
+impl Default for WriteQuarantine {
+    fn default() -> Self {
+        Self { pending: Vec::new(), budget: RetentionBudget::global() }
+    }
+}
+
+#[cfg(windows)]
+impl WriteQuarantine {
+    const LIMIT: usize = 32;
+    // Write permits a short result. Bound bytes as well as request/event count.
+    const CHUNK: usize = 64 * 1024;
+
+    fn reap(&mut self) {
+        self.pending.retain(|op| is_pending(&op.ov));
+    }
+
+    fn write(
+        &mut self,
+        buf: &[u8],
+        issue: impl FnOnce(&mut PendingWrite) -> core::result::Result<u32, u32>,
+    ) -> core::result::Result<u32, u32> {
+        self.reap();
+        if self.pending.len() == Self::LIMIT {
+            // Refuse before creating another event, buffer, or kernel request.
+            return Err(1450); // ERROR_NO_SYSTEM_RESOURCES
+        }
+        let n = buf.len().min(Self::CHUNK);
+        let permit = self.budget.reserve(n)?;
+        let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+        if event == 0 {
+            return Err(unsafe { sys::GetLastError() });
+        }
+        let mut op = Box::new(PendingWrite {
+            ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
+            buf: buf[..n].to_vec(),
+            _permit: permit,
+            #[cfg(test)]
+            dropped: None,
+        });
+        let result = issue(&mut op);
+        // Internal, not the particular error code, determines whether the
+        // kernel still owns this allocation. This also covers unexpected errors.
+        if is_pending(&op.ov) {
+            self.pending.push(op);
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+fn is_pending(ov: &sys::Overlapped) -> bool {
+    // Windows' HasOverlappedIoCompleted tests this field the same way.
+    (unsafe { core::ptr::read_volatile(&ov.internal) }) == AsyncWriter::PENDING
+}
+
+#[cfg(windows)]
+fn issue_io(handle: isize, write: bool, ov: &mut sys::Overlapped, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
+    let mut done = 0;
     let ok = unsafe {
-        let ovp = (&raw mut ov).cast::<core::ffi::c_void>();
-        if write {
-            sys::WriteFile(handle, buf, len, &mut done, ovp)
-        } else {
-            sys::ReadFile(handle, buf, len, &mut done, ovp)
+        let ovp = (ov as *mut sys::Overlapped).cast::<core::ffi::c_void>();
+        if write { sys::WriteFile(handle, buf, len, &mut done, ovp) }
+        else { sys::ReadFile(handle, buf, len, &mut done, ovp) }
+    };
+    let mut result = if ok != 0 {
+        if unsafe { sys::GetOverlappedResult(handle, ov, &mut done, 0) } != 0 { Ok(done) }
+        else { Err(unsafe { sys::GetLastError() }) }
+    } else {
+        let error = unsafe { sys::GetLastError() };
+        if error != sys::ERROR_IO_PENDING { Err(error) }
+        else {
+            let timeout = if write { WRITE_TIMEOUT_MS } else { u32::MAX };
+            if unsafe { sys::GetOverlappedResultEx(handle, ov, &mut done, timeout, 0) } != 0 { Ok(done) }
+            else { Err(unsafe { sys::GetLastError() }) }
         }
     };
-    let result = if ok != 0 {
-        // Completed at once; `done` may not be set on an overlapped handle,
-        // so the count is taken from the overlapped record either way.
-        let mut n = 0u32;
-        if unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 0) } != 0 {
-            Ok(n)
+    if is_pending(ov) {
+        if write {
+            // This applies to every pending return, including non-timeout errors.
+            unsafe { sys::CancelIoEx(handle, ov) };
+            let _ = unsafe { sys::GetOverlappedResultEx(handle, ov, &mut done, WRITE_TIMEOUT_MS, 0) };
+            // The caller retains this write if cancellation did not complete.
         } else {
-            Ok(done)
-        }
-    } else {
-        let e = unsafe { sys::GetLastError() };
-        if e != sys::ERROR_IO_PENDING {
-            Err(e)
-        } else {
-            let mut n = 0u32;
-            // A write waits at most WRITE_TIMEOUT_MS (§99.5): a port whose host
-            // end stopped draining must not hold even the writer thread for
-            // ever. It is cancelled and then waited for, because the
-            // OVERLAPPED and the buffer must outlive the request.
-            let ms = if write { WRITE_TIMEOUT_MS } else { u32::MAX };
-            if unsafe { sys::GetOverlappedResultEx(handle, &mut ov, &mut n, ms, 0) } != 0 {
-                Ok(n)
-            } else {
-                let e = unsafe { sys::GetLastError() };
-                if write && e == sys::WAIT_TIMEOUT {
-                    unsafe { sys::CancelIoEx(handle, &mut ov) };
-                    let _ = unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 1) };
-                    Err(sys::WAIT_TIMEOUT)
+            // The reader keeps its original indefinite lifetime. An unexpected
+            // API error must not return while the kernel owns the caller's buf.
+            while is_pending(ov) {
+                if unsafe { sys::GetOverlappedResultEx(handle, ov, &mut done, u32::MAX, 0) } != 0 {
+                    result = Ok(done);
                 } else {
-                    Err(e)
+                    result = Err(unsafe { sys::GetLastError() });
+                    if is_pending(ov) { std::thread::sleep(std::time::Duration::from_millis(10)); }
                 }
             }
         }
-    };
-    unsafe { sys::CloseHandle(event) };
+    }
     result
+}
+
+#[cfg(windows)]
+fn overlapped_io(pipe: &Pipe, write: bool, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
+    if write {
+        // Separate from the reader: a blocked read never holds this lock.
+        let mut quarantine = pipe.writes.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the caller supplies len readable bytes for a write.
+        let bytes = unsafe { core::slice::from_raw_parts(buf, len as usize) };
+        quarantine.write(bytes, |op| {
+            issue_io(pipe.handle, true, &mut op.ov, op.buf.as_mut_ptr(), op.buf.len() as u32)
+        })
+    } else {
+        let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+        if event == 0 { return Err(unsafe { sys::GetLastError() }); }
+        let mut ov = sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event };
+        let result = issue_io(pipe.handle, false, &mut ov, buf, len);
+        // issue_io cannot return a pending read. Its buffer remains the caller's.
+        unsafe { sys::CloseHandle(event) };
+        result
+    }
 }
 
 /// A doorbell writer that issues each write from the caller's own thread and
@@ -194,14 +337,17 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
 /// sat on the critical path of every request that found the host parked.
 /// Here the caller issues the overlapped `WriteFile` itself (the virtqueue
 /// kick happens inside that call) and returns; the record and its byte live
-/// in a slot of a fixed pool until the write completes, which the next write
-/// notices. Nothing blocks: a pool whose writes all still pend (a host end
-/// that stopped draining, §99.5) has them cancelled and the byte refused,
-/// which the bell counts as dropped, as it did a full queue.
+/// in an address-stable slot until the write completes. Requests that exceed
+/// the write timeout are cancelled and quarantined, so a broken cancellation
+/// cannot occupy the active pool forever. At most 256 quarantined requests are
+/// retained; complete port failure then refuses hints without blocking callers.
 #[cfg(windows)]
+#[allow(clippy::vec_box)] // Each pending record must retain its address when vectors grow.
 pub struct AsyncWriter {
     pipe: std::sync::Arc<Pipe>,
-    slots: Box<[AsyncSlot]>,
+    slots: Vec<Box<AsyncSlot>>,
+    retired: Vec<Box<AsyncSlot>>,
+    budget: std::sync::Arc<RetentionBudget>,
 }
 
 #[cfg(windows)]
@@ -209,6 +355,29 @@ struct AsyncSlot {
     ov: sys::Overlapped,
     buf: [u8; 16],
     busy: bool,
+    started: std::time::Instant,
+    _permit: RetentionPermit,
+}
+
+#[cfg(windows)]
+impl AsyncSlot {
+    fn new(budget: &std::sync::Arc<RetentionBudget>) -> std::io::Result<Box<Self>> {
+        let permit = budget.reserve(16).map_err(|_| std::io::Error::from(std::io::ErrorKind::WouldBlock))?;
+        let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+        if event == 0 { return Err(std::io::Error::last_os_error()); }
+        Ok(Box::new(Self {
+            ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
+            buf: [0; 16], busy: false, started: std::time::Instant::now(), _permit: permit,
+        }))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsyncSlot {
+    fn drop(&mut self) {
+        // Only completed slots are dropped. Outstanding requests are retained.
+        unsafe { sys::CloseHandle(self.ov.event) };
+    }
 }
 
 #[cfg(windows)]
@@ -217,34 +386,41 @@ unsafe impl Send for AsyncWriter {}
 #[cfg(windows)]
 impl AsyncWriter {
     const SLOTS: usize = 32;
+    const MAX_RETIRED: usize = 256;
     /// `STATUS_PENDING`: what `Internal` holds while a request is in flight
     /// (the `HasOverlappedIoCompleted` macro).
     const PENDING: usize = 0x103;
 
     pub fn new(pipe: std::sync::Arc<Pipe>) -> std::io::Result<AsyncWriter> {
+        Self::new_with_budget(pipe, RetentionBudget::global())
+    }
+
+    fn new_with_budget(pipe: std::sync::Arc<Pipe>, budget: std::sync::Arc<RetentionBudget>) -> std::io::Result<AsyncWriter> {
         let mut slots = Vec::with_capacity(Self::SLOTS);
-        for _ in 0..Self::SLOTS {
-            // SAFETY: a fresh manual-reset event, closed in `drop`.
-            let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
-            if event == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            slots.push(AsyncSlot {
-                ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
-                buf: [0; 16],
-                busy: false,
-            });
-        }
-        Ok(AsyncWriter { pipe, slots: slots.into_boxed_slice() })
+        for _ in 0..Self::SLOTS { slots.push(AsyncSlot::new(&budget)?); }
+        Ok(AsyncWriter { pipe, slots, retired: Vec::new(), budget })
     }
 
     fn reap(&mut self) {
-        for s in self.slots.iter_mut().filter(|s| s.busy) {
-            // SAFETY: a volatile read of a field the I/O manager writes when
-            // the request completes; the slot does not move (boxed slice).
-            if unsafe { core::ptr::read_volatile(&s.ov.internal) } != Self::PENDING {
+        for s in self.slots.iter_mut().chain(self.retired.iter_mut()) {
+            if s.busy && unsafe { core::ptr::read_volatile(&s.ov.internal) } != Self::PENDING {
                 s.busy = false;
             }
+        }
+        for i in 0..self.slots.len() {
+            if !self.slots[i].busy || self.slots[i].started.elapsed().as_millis() < WRITE_TIMEOUT_MS as u128 {
+                continue;
+            }
+            unsafe { sys::CancelIoEx(self.pipe.handle, &mut self.slots[i].ov) };
+            let replacement = if let Some(j) = self.retired.iter().position(|s| !s.busy) {
+                self.retired.swap_remove(j)
+            } else if self.retired.len() < Self::MAX_RETIRED {
+                let Ok(slot) = AsyncSlot::new(&self.budget) else { continue };
+                slot
+            } else {
+                continue;
+            };
+            self.retired.push(std::mem::replace(&mut self.slots[i], replacement));
         }
     }
 }
@@ -265,28 +441,32 @@ impl std::io::Write for AsyncWriter {
         };
         let n = buf.len().min(s.buf.len());
         s.buf[..n].copy_from_slice(&buf[..n]);
-        s.ov.internal = Self::PENDING;
+        // Let the I/O manager publish STATUS_PENDING. Pre-filling it would
+        // confuse an ordinary rejected write with a live kernel request.
+        s.ov.internal = 0;
         s.ov.internal_high = 0;
         let mut done = 0u32;
-        // SAFETY: the slot's buffer and record live in a boxed slice this
-        // writer owns, and `drop` cancels and waits for every request still
-        // in flight before they are freed.
+        // SAFETY: each slot has its own stable allocation. Pending slots
+        // retain their buffer and record, including during shutdown.
         let ok = unsafe {
             sys::WriteFile(handle, s.buf.as_ptr(), n as u32, &mut done, (&raw mut s.ov).cast::<core::ffi::c_void>())
         };
-        if ok == 0 {
-            let e = unsafe { sys::GetLastError() };
-            if e != sys::ERROR_IO_PENDING {
-                s.ov.internal = 0;
-                const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
-                return Err(if e == ERROR_NO_SYSTEM_RESOURCES {
-                    std::io::ErrorKind::WouldBlock.into()
-                } else {
-                    std::io::Error::from_raw_os_error(e as i32)
-                });
-            }
+        // Capture LastError before the clock call can change it.
+        let error = (ok == 0).then(|| unsafe { sys::GetLastError() });
+        // Preserve kernel ownership even when WriteFile reports an unexpected
+        // error. Never overwrite a pending status to make the slot reusable.
+        s.busy = is_pending(&s.ov);
+        s.started = std::time::Instant::now();
+        if let Some(e) = error
+            && e != sys::ERROR_IO_PENDING
+        {
+            const ERROR_NO_SYSTEM_RESOURCES: u32 = 1450;
+            return Err(if e == ERROR_NO_SYSTEM_RESOURCES {
+                std::io::ErrorKind::WouldBlock.into()
+            } else {
+                std::io::Error::from_raw_os_error(e as i32)
+            });
         }
-        s.busy = true;
         crate::frametrace::hop("bell.issued");
         Ok(n)
     }
@@ -299,19 +479,21 @@ impl std::io::Write for AsyncWriter {
 #[cfg(windows)]
 impl Drop for AsyncWriter {
     fn drop(&mut self) {
-        let handle = self.pipe.handle;
-        for s in self.slots.iter_mut() {
+        for mut s in self.slots.drain(..).chain(self.retired.drain(..)) {
             if s.busy {
-                let mut n = 0u32;
-                // SAFETY: the record of a request on this handle; waited for
-                // so the record outlives it.
-                unsafe {
-                    sys::CancelIoEx(handle, &mut s.ov);
-                    sys::GetOverlappedResult(handle, &mut s.ov, &mut n, 1);
+                unsafe { sys::CancelIoEx(self.pipe.handle, &mut s.ov) };
+                let mut n = 0;
+                if unsafe { sys::GetOverlappedResult(self.pipe.handle, &mut s.ov, &mut n, 0) } == 0
+                    && unsafe { core::ptr::read_volatile(&s.ov.internal) } == Self::PENDING
+                {
+                    // Preserve the port too: closing it can itself wait on the
+                    // same broken driver's cancellation. No shutdown wait.
+                    // Forgetting the slot also retains its process-budget permit.
+                    std::mem::forget(self.pipe.clone());
+                    std::mem::forget(s);
+                    continue;
                 }
             }
-            // SAFETY: the slot's own event, closed once.
-            unsafe { sys::CloseHandle(s.ov.event) };
         }
     }
 }
@@ -332,6 +514,7 @@ pub struct Pipe {
     /// reads and writes go through [`overlapped_io`] and do not wait for each
     /// other.
     overlapped: bool,
+    writes: std::sync::Mutex<WriteQuarantine>,
 }
 
 #[cfg(windows)]
@@ -473,7 +656,7 @@ impl Pipe {
     /// `handle` must be an open port handle opened with
     /// `FILE_FLAG_OVERLAPPED`, owned by the caller and closed by nobody else.
     pub unsafe fn from_port_handle(handle: isize) -> Pipe {
-        Pipe { handle, server: false, overlapped: true }
+        Pipe { handle, server: false, overlapped: true, writes: Default::default() }
     }
 
     /// Create the pipe and block until a client connects.
@@ -514,7 +697,7 @@ impl Pipe {
             unsafe { sys::CloseHandle(handle) };
             return Err(Error::Os { call: "ConnectNamedPipe", errno: e });
         }
-        Ok(Pipe { handle, server: true, overlapped: false })
+        Ok(Pipe { handle, server: true, overlapped: false, writes: Default::default() })
     }
 
     /// Connect to a pipe the peer is serving, waiting up to `timeout_ms` for it
@@ -540,7 +723,7 @@ impl Pipe {
                 )
             };
             if handle != sys::INVALID_HANDLE_VALUE {
-                return Ok(Pipe { handle, server: false, overlapped: false });
+                return Ok(Pipe { handle, server: false, overlapped: false, writes: Default::default() });
             }
             if std::time::Instant::now() >= deadline {
                 return Err(Error::Os {
@@ -576,7 +759,7 @@ impl std::io::Read for &Pipe {
         let mut got: u32 = 0;
         let len = buf.len().min(u32::MAX as usize) as u32;
         let failed = if self.overlapped {
-            match overlapped_io(self.handle, false, buf.as_mut_ptr(), len) {
+            match overlapped_io(self, false, buf.as_mut_ptr(), len) {
                 Ok(n) => {
                     got = n;
                     None
@@ -639,7 +822,7 @@ impl std::io::Write for &Pipe {
         if self.overlapped {
             // The buffer is only read; `overlapped_io` takes `*mut` for both
             // directions.
-            return overlapped_io(self.handle, true, buf.as_ptr().cast_mut(), len)
+            return overlapped_io(self, true, buf.as_ptr().cast_mut(), len)
                 .map(|n| n as usize)
                 .map_err(|e| std::io::Error::from_raw_os_error(e as i32));
         }
@@ -654,7 +837,7 @@ impl std::io::Write for &Pipe {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // An overlapped write has completed when `overlapped_io` returns, and
+        // An overlapped write has completed or been retained after timeout, and
         // a flush on the handle is one more call that could queue behind the
         // reader on a driver that serialises it; there is nothing to flush.
         if self.overlapped {
@@ -669,6 +852,16 @@ impl std::io::Write for &Pipe {
 #[cfg(windows)]
 impl Drop for Pipe {
     fn drop(&mut self) {
+        let writes = self.writes.get_mut().unwrap_or_else(|e| e.into_inner());
+        writes.reap();
+        if !writes.pending.is_empty() {
+            // Closing a port with a broken cancel may itself block. Keep the
+            // original raw handle and every pending allocation alive together.
+            // Their permits remain charged against the shared process budget,
+            // so another Pipe wrapper cannot reset the retained-resource cap.
+            std::mem::forget(std::mem::take(&mut writes.pending));
+            return;
+        }
         // SAFETY: `handle` was established by `serve` or `connect` and is
         // released exactly once.
         unsafe {
@@ -703,5 +896,271 @@ mod tests {
         let s = "e2e-1234";
         assert!(super::pipe_name(s).ends_with(s));
         assert!(crate::winshm::section_name(s).ends_with(s));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod async_writer_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_cancels_do_not_consume_the_active_pool() {
+        // No driver receives these records. Mark them pending to model a
+        // driver that never completes cancellation, without loading vioser.
+        let pipe = std::sync::Arc::new(Pipe { handle: sys::INVALID_HANDLE_VALUE, server: false, overlapped: true, writes: Default::default() });
+        let mut writer = AsyncWriter::new(pipe).unwrap();
+        for slot in &mut writer.slots {
+            slot.busy = true;
+            slot.ov.internal = AsyncWriter::PENDING;
+            slot.started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        }
+        let address = &writer.slots[0].ov as *const sys::Overlapped;
+        writer.reap();
+        assert_eq!(writer.retired.len(), AsyncWriter::SLOTS);
+        assert!(writer.slots.iter().all(|slot| !slot.busy));
+        assert_eq!(address, &writer.retired[0].ov as *const sys::Overlapped);
+        // Model a late completion, then require reuse of the retired slot.
+        writer.retired[0].ov.internal = 0;
+        writer.slots[0].busy = true;
+        writer.slots[0].ov.internal = AsyncWriter::PENDING;
+        writer.slots[0].started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        writer.reap();
+        assert_eq!(writer.retired.len(), AsyncWriter::SLOTS);
+        assert_eq!(address, &writer.slots[0].ov as *const sys::Overlapped);
+        // Repeated permanent failure is bounded, even when no cancel completes.
+        for _ in 0..12 {
+            for slot in &mut writer.slots {
+                slot.busy = true;
+                slot.ov.internal = AsyncWriter::PENDING;
+                slot.started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+            }
+            writer.reap();
+        }
+        assert_eq!(writer.retired.len(), AsyncWriter::MAX_RETIRED);
+        assert!(writer.slots.iter().all(|slot| slot.busy));
+        // The fake outstanding operations have no kernel owner and may be freed.
+        for slot in writer.slots.iter_mut().chain(writer.retired.iter_mut()) {
+            slot.busy = false;
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod synchronous_write_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    unsafe extern "system" {
+        fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> isize;
+    }
+
+    fn named_event() -> (isize, Vec<u16>) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let name = wide(&format!("sv-sync-drop-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let handle = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, name.as_ptr()) };
+        assert_ne!(handle, 0);
+        (handle, name)
+    }
+
+    #[test]
+    fn broken_cancels_have_bounded_records_events_and_bytes_and_recover() {
+        let mut quarantine = WriteQuarantine::default();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let bytes = vec![17; WriteQuarantine::CHUNK * 2];
+        let mut issued = 0;
+        for i in 0..4096 {
+            let result = quarantine.write(&bytes, |op| {
+                issued += 1;
+                op.dropped = Some(dropped.clone());
+                op.ov.internal = AsyncWriter::PENDING;
+                // Both timeout and other errors may leave kernel ownership.
+                Err(if i % 2 == 0 { sys::WAIT_TIMEOUT } else { 1234 })
+            });
+            assert!(result.is_err());
+        }
+        assert_eq!(issued, WriteQuarantine::LIMIT);
+        assert_eq!(quarantine.pending.len(), WriteQuarantine::LIMIT);
+        assert_eq!(quarantine.pending.iter().map(|op| op.buf.len()).sum::<usize>(),
+                   WriteQuarantine::LIMIT * WriteQuarantine::CHUNK);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        let retained = &quarantine.pending[1].ov as *const sys::Overlapped;
+        quarantine.pending[0].ov.internal = 0; // A late driver completion.
+        assert_eq!(quarantine.write(&[9], |op| {
+            issued += 1;
+            op.dropped = Some(dropped.clone());
+            op.ov.internal = AsyncWriter::PENDING;
+            Err(1234)
+        }), Err(1234));
+        assert_eq!(issued, WriteQuarantine::LIMIT + 1);
+        assert_eq!(quarantine.pending.len(), WriteQuarantine::LIMIT);
+        assert_eq!(retained, &quarantine.pending[0].ov as *const sys::Overlapped);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        // No fabricated operation has a kernel owner; simulate completion
+        // before destroying the fixture's resources.
+        for op in &mut quarantine.pending { op.ov.internal = 0; }
+        quarantine.reap();
+        assert_eq!(dropped.load(Ordering::Relaxed), issued);
+        assert!(quarantine.pending.is_empty());
+    }
+
+    #[test]
+    fn pending_pipe_drop_preserves_original_handle_and_kernel_buffers() {
+        let (handle, name) = named_event();
+        // An event is enough to observe handle closure; this fixture never
+        // submits port I/O on it.
+        let pipe = Pipe { handle, server: false, overlapped: true, writes: Default::default() };
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut event = 0;
+        pipe.writes.lock().unwrap().write(&[71], |op| {
+            op.dropped = Some(dropped.clone());
+            op.ov.internal = AsyncWriter::PENDING;
+            event = op.ov.event;
+            Err(1234)
+        }).unwrap_err();
+        drop(pipe);
+        // Test object identity by name, not a raw handle value that another
+        // parallel test may have recycled after CloseHandle.
+        let probe = unsafe { OpenEventW(0x0010_0000, 0, name.as_ptr()) };
+        assert_ne!(probe, 0, "dropping the pipe closed a handle with a pending write");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0,
+                   "dropping the pipe freed the kernel's outstanding buffer");
+        // These are fake requests. The allocation intentionally retained by
+        // Pipe::drop is small; explicitly release its real test event handles.
+        unsafe { sys::CloseHandle(probe); sys::CloseHandle(event); sys::CloseHandle(handle); }
+    }
+
+    #[test]
+    fn completed_pipe_drop_reclaims_buffers_and_closes_handle() {
+        let (handle, name) = named_event();
+        // An event is enough to observe handle closure; this fixture never
+        // submits port I/O on it.
+        let pipe = Pipe { handle, server: false, overlapped: true, writes: Default::default() };
+        let dropped = Arc::new(AtomicUsize::new(0));
+        pipe.writes.lock().unwrap().write(&[71], |op| {
+            op.dropped = Some(dropped.clone());
+            Err(1234)
+        }).unwrap_err();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        drop(pipe);
+        let probe = unsafe { OpenEventW(0x0010_0000, 0, name.as_ptr()) };
+        if probe != 0 { unsafe { sys::CloseHandle(probe) }; }
+        assert_eq!(probe, 0, "the completed pipe retained its kernel object");
+    }
+
+    fn budget_pipe(budget: &Arc<RetentionBudget>) -> (Arc<Pipe>, isize, Vec<u16>) {
+        let (handle, name) = named_event();
+        let pipe = Arc::new(Pipe {
+            handle, server: false, overlapped: true,
+            writes: std::sync::Mutex::new(WriteQuarantine { pending: Vec::new(), budget: budget.clone() }),
+        });
+        (pipe, handle, name)
+    }
+
+    #[test]
+    fn repeated_pipe_lifetimes_cannot_reset_the_shared_record_budget() {
+        let budget = RetentionBudget::new(4, 4096);
+        let mut retained = Vec::new();
+        let mut issued = 0;
+        for _ in 0..128 {
+            let (pipe, handle, name) = budget_pipe(&budget);
+            let mut event = 0;
+            pipe.writes.lock().unwrap().write(&[71], |op| {
+                issued += 1;
+                event = op.ov.event;
+                op.ov.internal = AsyncWriter::PENDING;
+                Err(1234)
+            }).unwrap_err();
+            drop(pipe);
+            let probe = unsafe { OpenEventW(0x0010_0000, 0, name.as_ptr()) };
+            if event != 0 {
+                assert_ne!(probe, 0, "a stuck original handle was closed");
+                retained.push((handle, event));
+            } else {
+                assert_eq!(probe, 0, "an unused refused wrapper leaked its handle");
+            }
+            if probe != 0 { unsafe { sys::CloseHandle(probe) }; }
+            assert!(budget.records.load(Ordering::Relaxed) <= 4);
+        }
+        assert_eq!(issued, 4);
+        assert_eq!(budget.records.load(Ordering::Relaxed), 4);
+        assert_eq!(budget.bytes.load(Ordering::Relaxed), 4);
+        // No fake request was submitted to the kernel. Retained permits stay
+        // charged, but the fixture can release its real OS event handles.
+        for (handle, event) in retained { unsafe { sys::CloseHandle(event); sys::CloseHandle(handle); } }
+    }
+
+    #[test]
+    fn synchronous_retention_also_limits_new_async_writers_by_bytes() {
+        let budget = RetentionBudget::new(64, 16);
+        let (pipe, handle, _name) = budget_pipe(&budget);
+        let mut event = 0;
+        pipe.writes.lock().unwrap().write(&[71; 16], |op| {
+            event = op.ov.event;
+            op.ov.internal = AsyncWriter::PENDING;
+            Err(sys::WAIT_TIMEOUT)
+        }).unwrap_err();
+        drop(pipe);
+        for _ in 0..128 {
+            let (pipe, _handle, _name) = budget_pipe(&budget);
+            assert!(AsyncWriter::new_with_budget(pipe, budget.clone()).is_err());
+            let mut fresh = WriteQuarantine { pending: Vec::new(), budget: budget.clone() };
+            assert_eq!(fresh.write(&[9], |_| panic!("shared byte budget was reset")), Err(1450));
+            assert_eq!(budget.records.load(Ordering::Relaxed), 1);
+            assert_eq!(budget.bytes.load(Ordering::Relaxed), 16);
+        }
+        unsafe { sys::CloseHandle(event); sys::CloseHandle(handle); }
+    }
+
+    #[test]
+    fn repeated_async_lifetimes_cannot_reset_the_shared_budget() {
+        let budget = RetentionBudget::new(64, 4096);
+        let mut retained = Vec::new();
+        let mut constructed = 0;
+        for _ in 0..64 {
+            let (pipe, handle, name) = budget_pipe(&budget);
+            let mut events = Vec::new();
+            if let Ok(mut writer) = AsyncWriter::new_with_budget(pipe, budget.clone()) {
+                constructed += 1;
+                for slot in &mut writer.slots {
+                    slot.busy = true;
+                    slot.ov.internal = AsyncWriter::PENDING;
+                    events.push(slot.ov.event);
+                }
+                drop(writer);
+            }
+            let probe = unsafe { OpenEventW(0x0010_0000, 0, name.as_ptr()) };
+            if events.is_empty() { assert_eq!(probe, 0); }
+            else {
+                assert_ne!(probe, 0, "a stuck async port handle was closed");
+                retained.push((handle, events));
+            }
+            if probe != 0 { unsafe { sys::CloseHandle(probe) }; }
+            assert!(budget.records.load(Ordering::Relaxed) <= 64);
+        }
+        assert_eq!(constructed, 2);
+        assert_eq!(budget.records.load(Ordering::Relaxed), 64);
+        assert_eq!(budget.bytes.load(Ordering::Relaxed), 64 * 16);
+        for (handle, events) in retained {
+            for event in events { unsafe { sys::CloseHandle(event) }; }
+            unsafe { sys::CloseHandle(handle) };
+        }
+    }
+
+    #[test]
+    fn completed_and_partially_constructed_writers_return_shared_capacity() {
+        for max_records in [1, AsyncWriter::SLOTS] {
+            let budget = RetentionBudget::new(max_records, 4096);
+            for _ in 0..64 {
+                let (pipe, _handle, _name) = budget_pipe(&budget);
+                let writer = AsyncWriter::new_with_budget(pipe, budget.clone());
+                assert_eq!(writer.is_ok(), max_records == AsyncWriter::SLOTS);
+                drop(writer);
+                assert_eq!(budget.records.load(Ordering::Relaxed), 0);
+                assert_eq!(budget.bytes.load(Ordering::Relaxed), 0);
+            }
+        }
+        let pipe = Arc::new(unsafe { Pipe::from_port_handle(sys::INVALID_HANDLE_VALUE) });
+        let writer = AsyncWriter::new(pipe.clone()).unwrap();
+        assert!(Arc::ptr_eq(&writer.budget, &pipe.writes.lock().unwrap().budget));
     }
 }

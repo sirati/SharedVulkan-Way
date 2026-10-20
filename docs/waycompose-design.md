@@ -37878,3 +37878,56 @@ the shared-memory data path. Linux-only dependencies leave the other platform
 backends unchanged. Regression tests send a real forwarded socket through the
 broker protocol: mapped access receives a hub fd, unmapped access is refused,
 and forged uid or pid metadata never reaches the broker's incoming queue.
+
+## §114. Doorbell writer recovery
+
+A shared compositor outlives its installations. A failed doorbell write must
+therefore leave later hints usable. `DetachedWriter` consumes the next queued
+hint after a write error instead of ending its thread. Unix file and inherited
+fd endpoints use that writer too, so a full port cannot block a ring caller.
+`WC_BELL_INLINE=0` selects it for Linux sockets as well, allowing the local
+multi-install harness to exercise the guest's queued writer path.
+
+Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
+cancellation. Each pipe retains at most 32 still-pending synchronous writes,
+including their event, record and buffer. Writes are capped at 64 KiB per call,
+so the pending buffers consume at most 2 MiB per pipe. A full quarantine refuses
+new writes before allocating or submitting anything. Later completions reclaim
+entries and permit new writes. Pending status, rather than a particular timeout
+code, determines ownership on every return. A pipe with pending writes retains
+its original raw handle and outstanding allocations on shutdown, avoiding a
+blocking close and preserving every kernel buffer. Reads use their independent
+completion wait and never acquire the write quarantine's mutex.
+
+The default Windows `AsyncWriter` issues hints without waiting. Each request
+has an address-stable allocation. The I/O manager publishes its pending status;
+an unexpected write error never clears that status or releases its buffer. Requests still pending after 500 ms move to a
+quarantine after cancellation, and fresh or completed allocations replace them
+in the active pool. Late completions permit reuse. The quarantine holds at most
+256 requests beyond the 32 active slots. If a driver stops completing every
+request, hints eventually return `WouldBlock`; the application thread still
+runs. Shutdown retains any allocation and port reference whose request remains
+pending rather than waiting indefinitely for a broken driver.
+
+Both writer implementations reserve from one process-wide budget before
+allocating a record, buffer or event. It permits at most 1024 records/slots and
+32 MiB of write buffers across live and deliberately retained allocations.
+AsyncWriter reserves its slots up front, leaving its ordinary write path free
+of budget operations. A retained allocation keeps its reservation forever, so
+constructing another Pipe or AsyncWriter cannot reset the safety cap. Full
+budgets refuse new allocations; existing owners can reclaim capacity after
+completion or normal destruction. Abandoned allocations have no background
+reaper and remain charged until process exit. Stuck handles are never closed to
+recover capacity. Each retained original handle has at least one charged record.
+
+The broker currently refuses a second device grant to the same process, opens
+ports exclusively and transfers handles with DUPLICATE_CLOSE_SOURCE. The budget
+does not rely on those restrictions: repeated wrappers or async writers still
+share the same limits.
+
+Tests cover a failed queued hint followed by a delivered hint, bounded repeated
+synchronous cancellation failures and handle retention during shutdown,
+repeated Pipe and AsyncWriter lifetimes sharing record and byte budgets,
+constructor rollback, and simulated Windows cancellations that never complete followed by a late completion. The
+simulation never submits the fabricated requests to a driver. Test evidence
+and guest measurements belong outside the repository.
