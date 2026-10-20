@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn changed_binding_is_refused_even_with_valid_installation_mac() {
         let original = fixture();
-        for which in 0..17 {
+        for which in 0..18 {
             let mut m = original.clone();
             match which {
                 0 => m.binding.installation = "other-install".into(),
@@ -436,7 +436,8 @@ mod tests {
                 13 => m.binding.grant_length += 4096,
                 14 => m.binding.windows_sid.push('2'),
                 15 => m.binding.linux_uid += 1,
-                _ => m.binding.roles.producer = Origin::Linux,
+                16 => m.binding.roles.producer = Origin::Linux,
+                _ => m.binding.source.bar_run += 1,
             }
             if which == 12 {
                 m.payload.offset += 4096;
