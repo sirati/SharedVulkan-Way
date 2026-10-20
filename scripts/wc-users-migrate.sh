@@ -13,6 +13,9 @@
 #   wc-users-migrate.sh remove-old ADMIN DESKTOP BIN-DIR INSTALL... delete the admin's copies (after a
 #                                                                     session was seen working)
 #   wc-users-migrate.sh rollback ADMIN DESKTOP BIN-DIR INSTALL...   back to the admin's user units
+#   wc-users-migrate.sh install-staged ADMIN auto STAGE NAME          (wc-launch.sh deploy, system layout:
+#                                                                     one staged installation in; its user
+#                                                                     from users.conf)
 #
 # ADMIN is the account whose user units ran the hub and the session service
 # (<admin-user>), DESKTOP the Linux user the guest user is mapped to
@@ -47,11 +50,17 @@ VERB=${1:-}; ADMIN=${2:-}; DESK=${3:-}; BINS=${4:-}
 shift 4 2>/dev/null || { sed -n '3,40p' "$0"; exit 2; }
 INSTALLS=("$@")
 [ ${#INSTALLS[@]} -gt 0 ] || { echo "no installation named"; exit 2; }
-case "$VERB" in plan|apply|verify|remove-old|rollback) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
+case "$VERB" in plan|apply|verify|remove-old|rollback|install-staged) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
 
 ROOT=${ROOT:-}
 REAL=1; [ "$(id -u)" = 0 ] && [ -z "$ROOT" ] || REAL=""
 homedir() { if [ -n "$ROOT" ]; then echo "$ROOT/home/$1"; else getent passwd "$1" | cut -d: -f6; fi; }
+# install-staged: DESKTOP `auto` is the Linux user users.conf maps the
+# installation to (the first line that names it, or names no installs).
+if [ "$DESK" = auto ]; then
+  DESK=$(awk -v n="${INSTALLS[0]}" '/^#/||NF<3{next} {ok=1; for(i=4;i<=NF;i++) if ($i ~ /^installs=/) { ok=0; k=split(substr($i,10),a,","); for(j=1;j<=k;j++) if (a[j]==n) ok=1 } if (ok) {print $3; exit} }' "$ROOT/etc/waycompose/users.conf" 2>/dev/null)
+  [ -n "$DESK" ] || { echo "users.conf maps no user for ${INSTALLS[0]}"; exit 1; }
+fi
 AH=$(homedir "$ADMIN"); DH=$(homedir "$DESK")
 # What the files say: the real homes, even in a dry run under ROOT.
 AH_REAL=${AH#"$ROOT"}; DH_REAL=${DH#"$ROOT"}
@@ -98,7 +107,7 @@ user_data() { # APPS.INI BASE
 base_of() { readlink -f "$AH/.config/waycompose/installs/$1" 2>/dev/null; }
 
 # ------------------------------------------------------------------- checks
-if [ "$VERB" != rollback ] && [ "$VERB" != verify ] && [ "$VERB" != remove-old ]; then
+if [ "$VERB" != rollback ] && [ "$VERB" != verify ] && [ "$VERB" != remove-old ] && [ "$VERB" != install-staged ]; then
   for f in wc-arena-host sv-hostd wc-session; do
     [ -f "$BINS/$f" ] || { echo "no $BINS/$f: BIN-DIR must hold this branch's builds"; exit 1; }
   done
@@ -201,6 +210,54 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
   sys restart wc-bell-hub.service wc-sessiond.service
   if [ -n "$REAL" ]; then run loginctl enable-linger "$DESK"; fi
   as_user "$DESK" start wc-session-agent.socket
+fi
+
+# ----------------------------------------------------------- install-staged
+# `wc-launch.sh deploy` with WC_LAUNCH_HOST_LAYOUT=system builds an
+# installation in the admin's STAGE (BIN-DIR here) and calls this, as root:
+#   wc-users-migrate.sh install-staged ADMIN auto STAGE NAME
+# It replaces $VL/installs/NAME by the stage, as `apply` lays one out, and keeps
+# the installed key if there is one. No data moves and no service restarts: a
+# deployed installation's data is made by its applications, in the mapped
+# user's home, at their first run.
+if [ "$VERB" = install-staged ]; then
+  n=${INSTALLS[0]}; st=$BINS
+  nb="$VL/installs/$n"; nb_real=${nb#"$ROOT"}; st_real=${st#"$ROOT"}
+  [ -f "$st/wc-session" ] && [ -f "$st/apps.ini" ] || { echo "$st is not a staged installation (no wc-session, apps.ini)"; exit 1; }
+  case "$st_real" in "$AH_REAL"/*) ;; *) echo "the stage $st_real is not under ~$ADMIN"; exit 1 ;; esac
+  if [ -n "$REAL" ]; then getent passwd waycompose >/dev/null || { echo "no account waycompose: this host has no system services"; exit 1; }; fi
+  say "installation $n: $st_real -> $nb_real, its sessions as $DESK"
+  tmp="$nb.new"
+  run rm -rf "$tmp"
+  run install -d -m 0755 "$VL/installs"
+  run cp -a "$st" "$tmp"
+  if [ -s "$nb/session.key" ]; then run cp -f "$nb/session.key" "$tmp/session.key"; fi
+  own root:root "$tmp"
+  run chmod -R go-w "$tmp"
+  if [ -n "$REAL" ]; then run chown waycompose:waycompose "$tmp/session.key"; else say "  (would chown waycompose $tmp/session.key)"; fi
+  run chmod 0600 "$tmp/session.key"
+  run sed -i -e "s|$st_real/|$nb_real/|g" -e "s|$st_real\$|$nb_real|g" -e "s|$AH_REAL/|~/|g" "$tmp/apps.ini"
+  for f in gpu.env copy-scope dmabuf-node; do
+    [ -f "$tmp/$f" ] && run sed -i "s|$st_real/|$nb_real/|g" "$tmp/$f"
+    [ -f "$tmp/$f" ] && [ -z "$DRY" ] && grep -q "$AH_REAL/" "$tmp/$f" && { echo "  $tmp/$f still names $AH_REAL"; FAIL=1; }
+  done
+  if [ "$FAIL" = 0 ]; then
+    [ -e "$nb" ] && run mv "$nb" "$nb.old"
+    run mv "$tmp" "$nb"
+    run rm -rf "$nb.old"
+    # GC roots made for the stage's store links: registered at their new path.
+    for l in "$nb"/bin/*; do
+      [ -L "$l" ] || continue
+      t=$(readlink "$l"); case "$t" in /nix/store/*) ;; *) continue ;; esac
+      if [ -n "$REAL" ]; then run nix-store --add-root "$l" --indirect -r "$t" >/dev/null; else say "  (would register GC root $l -> $t)"; fi
+    done
+    # The admin's copy of the key goes: the service's is the only one.
+    run rm -f "$st/session.key"
+    if [ -n "$REAL" ]; then
+      runuser -u "$DESK" -- env HOME="$DH" bash "$nb/wc-session" apps >/dev/null 2>&1 \
+        && say "  every application checks out as $DESK" || { echo "  FAIL: wc-session apps as $DESK"; FAIL=1; }
+    fi
+  fi
 fi
 
 # ------------------------------------------------------------------- verify
