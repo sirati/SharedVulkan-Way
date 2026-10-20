@@ -152,3 +152,6 @@ mod support_tests {
         assert!(Opcode::from_u32(Opcode::COUNT as u32).is_none());
     }
 }
+
+/// Version of the GPU ring protocol, shared by owners and attachment validators.
+pub const GPU_WIRE_VERSION: u32 = 5;
