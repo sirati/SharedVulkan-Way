@@ -151,3 +151,6 @@ mod native_video_fixture_parameters;
 
 #[cfg(any(target_os = "macos", test))]
 mod native_video_wait_result;
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod native_video_advanced_fixture;

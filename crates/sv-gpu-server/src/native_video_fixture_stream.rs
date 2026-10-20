@@ -26,7 +26,8 @@ pub(crate) struct Prior {
     pub metadata: Metadata,
 }
 pub(crate) struct Frame {
-    /// Exact original framed VCL AU. This fixture has one VCL NAL per picture.
+    /// Exact original VCL AU, including its Annex B prefix.
+    /// This fixture has one VCL NAL per picture.
     pub range: Range<usize>,
     pub slice_offsets: Vec<u32>,
     pub frame_num: u16,
@@ -43,8 +44,9 @@ pub(crate) struct Frame {
 }
 pub(crate) struct Stream {
     pub bytes: &'static [u8],
-    /// NAL payload ranges including NAL headers, excluding Annex B prefixes.
+    /// SPS NAL header and payload, excluding its Annex B prefix.
     pub sps: Range<usize>,
+    /// PPS NAL header and payload, excluding its Annex B prefix.
     pub pps: Range<usize>,
     pub frames: Vec<Frame>,
 }

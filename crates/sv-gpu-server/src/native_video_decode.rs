@@ -44,6 +44,8 @@ struct State {
 }
 #[derive(Default)]
 pub(crate) struct Runtime {
+    #[cfg(feature = "native-video-fixture")]
+    fixture_staging: bool,
     sessions: HashMap<u64, State>,
 }
 fn same_region(a: &Picture, b: &Picture) -> bool {
@@ -125,6 +127,23 @@ fn actual_idr(bytes: &[u8], range: &Range<usize>, offsets: &[u32]) -> Result<boo
     idr.ok_or_else(|| "empty slice list".into())
 }
 impl Runtime {
+    /// Only the isolated diagnostic Shared may opt into the pure staging model.
+    /// Production constructors remain guarded, including feature-enabled builds.
+    #[cfg(feature = "native-video-fixture")]
+    pub(crate) fn enable_fixture_staging(&mut self) {
+        assert!(self.sessions.is_empty());
+        self.fixture_staging = true;
+    }
+    fn fixture_staging(&self) -> bool {
+        #[cfg(feature = "native-video-fixture")]
+        {
+            self.fixture_staging
+        }
+        #[cfg(not(feature = "native-video-fixture"))]
+        {
+            false
+        }
+    }
     /// Caller has retired every submitted use of this session before removal.
     pub(crate) fn remove_session(&mut self, id: u64) {
         self.sessions.remove(&id);
@@ -138,6 +157,7 @@ impl Runtime {
         job: &Decode,
         resources: Resources,
     ) -> Result<(), String> {
+        let fixture_staging = self.fixture_staging();
         let Resources {
             source,
             source_range,
@@ -218,15 +238,17 @@ impl Runtime {
             }
             // Native intra40 proved fresh hardware decode, exact display/coded
             // target copies, and joined Vulkan sampling of this guarded path.
-            h264::independent_intra(
-                source.bytes(),
-                &source_range,
-                &job.slice_offsets,
-                &job.configuration.sps,
-                &job.configuration.pps,
-                job.h264.frame_num,
-                job.h264.pic_order_cnt,
-            )?;
+            if !fixture_staging {
+                h264::independent_intra(
+                    source.bytes(),
+                    &source_range,
+                    &job.slice_offsets,
+                    &job.configuration.sps,
+                    &job.configuration.pps,
+                    job.h264.frame_num,
+                    job.h264.pic_order_cnt,
+                )?;
+            }
         }
         if !reset && !idr && state.active_sps.as_deref() != Some(job.configuration.sps.as_ref()) {
             return Err("active SPS content changed inside coded video sequence".into());
@@ -269,7 +291,20 @@ impl Runtime {
         } else {
             state.history.clone()
         };
-        let history_plan = history.plan(&parsed, reset && !idr)?;
+        let limits = dpb::Limits {
+            max_frame_num: parsed.max_frame_num,
+            max_refs: parsed.max_refs,
+        };
+        let history_plan = if fixture_staging {
+            let complete = history.plan_unproven(&parsed, reset && !idr)?;
+            codec = codec.synthesize_unproven(&complete.missing, limits)?;
+            poc::Plan {
+                next: complete.next,
+                poc: complete.poc,
+            }
+        } else {
+            history.plan(&parsed, reset && !idr)?
+        };
         if history_plan.poc != job.h264.pic_order_cnt {
             return Err("source-derived picture order count disagrees with decode metadata".into());
         }

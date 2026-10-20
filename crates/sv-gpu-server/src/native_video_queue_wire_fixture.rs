@@ -35,7 +35,7 @@ fn profile() -> p::VkVideoProfileInfoKHR {
         ))],
     }
 }
-fn profiles() -> p::PNextLink {
+pub(super) fn profiles() -> p::PNextLink {
     p::PNextLink::VkVideoProfileListInfoKHR(Box::new(p::VkVideoProfileListInfoKHR {
         profile_count: 1,
         p_profiles: vec![profile()],
@@ -63,7 +63,7 @@ fn picture(view: u64) -> p::VkVideoPictureResourceInfoKHR {
         ..Default::default()
     }
 }
-fn image(
+pub(super) fn image(
     rpc: &mut Rpc,
     image: u64,
     memory: u64,
@@ -156,6 +156,21 @@ fn image(
     Ok(())
 }
 fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
+    parameters_for(
+        rpc,
+        queue_family,
+        SESSION,
+        PARAMETERS,
+        crate::native_video_fixture_parameters::parameter_sets(),
+    )
+}
+pub(super) fn parameters_for(
+    rpc: &mut Rpc,
+    queue_family: u32,
+    session: u64,
+    parameters: u64,
+    add: p::VkVideoDecodeH264SessionParametersAddInfoKHR,
+) -> Result<(), String> {
     let mut name = [0u8; 256];
     for (dst, src) in name
         .iter_mut()
@@ -167,7 +182,7 @@ fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
         wire(
             rpc.create_video_session_khr(p::VkCreateVideoSessionKHRArgs {
                 device: p::VkDevice(DEVICE),
-                p_video_session: Some(p::VkVideoSessionKHR(SESSION)),
+                p_video_session: Some(p::VkVideoSessionKHR(session)),
                 p_create_info: Some(Box::new(p::VkVideoSessionCreateInfoKHR {
                     queue_family_index: queue_family,
                     p_video_profile: Some(Box::new(profile())),
@@ -192,17 +207,15 @@ fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
         wire(
             rpc.create_video_session_parameters_khr(p::VkCreateVideoSessionParametersKHRArgs {
                 device: p::VkDevice(DEVICE),
-                p_video_session_parameters: Some(p::VkVideoSessionParametersKHR(PARAMETERS)),
+                p_video_session_parameters: Some(p::VkVideoSessionParametersKHR(parameters)),
                 p_create_info: Some(Box::new(p::VkVideoSessionParametersCreateInfoKHR {
-                    video_session: p::VkVideoSessionKHR(SESSION),
+                    video_session: p::VkVideoSessionKHR(session),
                     p_next: vec![
                         p::PNextLink::VkVideoDecodeH264SessionParametersCreateInfoKHR(Box::new(
                             p::VkVideoDecodeH264SessionParametersCreateInfoKHR {
                                 max_std_sps_count: 1,
                                 max_std_pps_count: 1,
-                                p_parameters_add_info: Some(Box::new(
-                                    crate::native_video_fixture_parameters::parameter_sets(),
-                                )),
+                                p_parameters_add_info: Some(Box::new(add)),
                                 ..Default::default()
                             },
                         )),

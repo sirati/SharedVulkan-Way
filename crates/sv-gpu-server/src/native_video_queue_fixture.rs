@@ -32,6 +32,13 @@ mod normal;
 #[path = "native_video_queue_wire_fixture.rs"]
 mod wire_recording;
 
+#[path = "native_video_advanced_fixture.rs"]
+mod advanced;
+
+pub fn run_advanced(sync2: bool) -> Result<(), String> {
+    advanced::run(sync2)
+}
+
 struct Fixture {
     rpc: sv_gpu_entry::Forward<GpuServer>,
     shared: Arc<Shared>,
@@ -678,6 +685,14 @@ unsafe extern "C" {
     fn kk_nv12_fixture_destroy(job: *mut std::ffi::c_void) -> vk::Result;
 }
 unsafe fn sample(driver: &Driver, image: vk::Image, role: &str) -> Result<(), String> {
+    unsafe { sample_expected(driver, image, role, None) }
+}
+unsafe fn sample_expected(
+    driver: &Driver,
+    image: vk::Image,
+    role: &str,
+    pcm_y: Option<u8>,
+) -> Result<(), String> {
     let info = Info {
         get_device_proc_addr: driver.instance.fp_v1_0().get_device_proc_addr,
         device: driver.device.handle(),
@@ -714,10 +729,12 @@ unsafe fn sample(driver: &Driver, image: vk::Image, role: &str) -> Result<(), St
         for col in 0..4 {
             let x = (col * 2 + 1) * 64 / 8;
             let y = (row * 2 + 1) * 64 / 8;
-            let luma = (40 + (x / 16) * 8 + (y.min(49) / 10) * 6) as f32;
+            let luma = pcm_y
+                .map(f32::from)
+                .unwrap_or((40 + (x / 16) * 8 + (y.min(49) / 10) * 6) as f32);
             let luma = (luma - 16.0) / 219.0;
-            let cb = (64.0 - 128.0) / 224.0;
-            let cr = (192.0 - 128.0) / 224.0;
+            let cb = (if pcm_y.is_some() { 80.0 } else { 64.0 } - 128.0) / 224.0;
+            let cr = (if pcm_y.is_some() { 180.0 } else { 192.0 } - 128.0) / 224.0;
             let expected = [
                 luma + 1.402 * cr,
                 luma - 0.344136 * cb - 0.714136 * cr,
