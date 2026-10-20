@@ -37120,9 +37120,9 @@ The final real Windows unit run passed all 30 tests in
 `uninstall-windows-units-final.txt`.
 
 **What remains.** Running the compositor and the GPU process on the VM under
-the broker end to end (the probe exercises the same calls, not the products);
-the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
-(not touched here).
+the broker end to end under the mapped Linux user (the probe exercises the
+same calls, not the products), and a run on the deployment guest (not touched
+here). The large-page stamping hook is implemented by `stamp_guest_ram`.
 
 ### 111.9 macOS
 
