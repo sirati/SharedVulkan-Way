@@ -93,22 +93,6 @@ function Assert-TrustedKeyTree([string]$p) {
   }
 }
 
-function Assert-NoKeyReparse([string]$p) {
-  $item = Get-Item -Force -LiteralPath $p
-  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "refusing legacy key reparse object; trusted recovery required" }
-  if ($item.PSIsContainer) {
-    foreach ($child in Get-ChildItem -Force -LiteralPath $p) { Assert-NoKeyReparse $child.FullName }
-  }
-}
-
-function Protect-RecoveryTree([string]$p) {
-  $item = Get-Item -Force -LiteralPath $p
-  Secure-Path $p $item.PSIsContainer $false
-  if ($item.PSIsContainer) {
-    foreach ($child in Get-ChildItem -Force -LiteralPath $p) { Protect-RecoveryTree $child.FullName }
-  }
-}
-
 # Enrollment provenance is created only after the key action publishes a new
 # object. Bind it to the file ID so an old receipt cannot bless a replacement.
 function Key-FileId([string]$p) {
@@ -137,54 +121,141 @@ function Record-KeyEnrollment([string]$p, [string]$id) {
   $tmp = Join-Path $records ([Guid]::NewGuid().ToString('N') + '.tmp')
   try {
     $r = @{version=1; install=$id; generation=[Guid]::NewGuid().ToString('N'); fileId=(Key-FileId $p)} | ConvertTo-Json -Compress
-    [IO.File]::WriteAllText($tmp, $r)
+    Write-ProtectedNewText $tmp $r
     Secure-Path $tmp $false $false
     if (Test-Path -LiteralPath $record) { Remove-Item -Force -LiteralPath $record }
     Move-Item -LiteralPath $tmp -Destination $record
   } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -Force -LiteralPath $tmp } }
 }
 
+# Object security must be supplied at creation. Tightening an old object's
+# DACL cannot revoke desktop handles opened before installation.
+function New-ProtectedDirectory([string]$p) {
+  if (-not ('WcAtomicDirectory' -as [type])) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class WcAtomicDirectory {
+  [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES { public int Length; public IntPtr Descriptor; public int Inherit; }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool CreateDirectory(string path, ref SECURITY_ATTRIBUTES attributes);
+  public static void Create(string path, byte[] descriptor) {
+    IntPtr p=Marshal.AllocHGlobal(descriptor.Length);
+    try {
+      Marshal.Copy(descriptor,0,p,descriptor.Length);
+      var a=new SECURITY_ATTRIBUTES { Length=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), Descriptor=p };
+      if (!CreateDirectory(path, ref a)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    } finally { Marshal.FreeHGlobal(p); }
+  }
+}
+'@
+  }
+  $a = New-Object Security.AccessControl.DirectorySecurity
+  $a.SetSecurityDescriptorSddlForm('O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)')
+  # CreateDirectoryW fails on an existing name, unlike Directory.CreateDirectory.
+  [WcAtomicDirectory]::Create($p, $a.GetSecurityDescriptorBinaryForm())
+}
+function Open-ProtectedNewFile([string]$p) {
+  $a = New-Object Security.AccessControl.FileSecurity
+  $a.SetSecurityDescriptorSddlForm('O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)')
+  return [IO.FileStream]::new($p, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $a)
+}
+function Write-ProtectedNewText([string]$p, [string]$text) {
+  $s = Open-ProtectedNewFile $p
+  try { $b = [Text.Encoding]::UTF8.GetBytes($text); $s.Write($b,0,$b.Length); $s.Flush($true) } finally { $s.Dispose() }
+}
+function Assert-DataAnchor([string]$Child = $Data) {
+  $parent = Split-Path -Parent $Child
+  $item = Get-Item -Force -LiteralPath $parent
+  if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'untrusted broker data anchor' }
+  $a = Get-Acl -LiteralPath $parent
+  if ($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')) { throw 'untrusted broker data anchor owner' }
+  $danger = [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership -bor [Security.AccessControl.FileSystemRights]::Delete
+  foreach ($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+    if ($r.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and -not ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+        $r.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') -and ($r.FileSystemRights -band $danger)) { throw 'untrusted broker data anchor grants replacement rights' }
+  }
+}
+function Assert-DataGeneration {
+  Assert-DataAnchor
+  if (-not (Test-Path -LiteralPath $Data)) { throw 'broker data generation missing; fresh installation required' }
+  $item=Get-Item -Force -LiteralPath $Data
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'untrusted broker data reparse object' }
+  # Check only this object's metadata. Logs and retired recovery objects do not
+  # establish provenance and must never be adopted as live key objects.
+  $a=Get-Acl -LiteralPath $Data
+  if (-not $a.AreAccessRulesProtected -or $a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'untrusted broker data generation metadata' }
+  foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+    if($r.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or $r.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'untrusted broker data generation access' }
+  }
+  $record=Join-Path $Data 'data-generation.json'
+  Assert-TrustedKeyTree $record
+  $g=Get-Content -Raw -LiteralPath $record | ConvertFrom-Json
+  if($g.version -ne 1 -or $g.generation -notmatch '^[a-f0-9]{32}$' -or $g.fileId -cne (Key-FileId $Data)) { throw 'unknown broker data generation; fresh installation required' }
+}
 function Prepare-InstallKeys([bool]$ExistingService) {
   if ($ExistingService) {
-    # Include the parent: otherwise normalization can hide its prior exposure.
+    Assert-DataGeneration
     Assert-TrustedKeyTree $Keys
     Assert-KeyEnrollments
-    if ((Get-Item -Force -LiteralPath $Data).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "untrusted broker data reparse object" }
-    $acl = Get-Acl -LiteralPath $Data
-    if (-not $acl.AreAccessRulesProtected) { throw "untrusted broker data inheritance; trusted recovery required" }
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) { throw "untrusted broker data owner; trusted recovery required" }
-    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-      if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-          $rule.IdentityReference.Value -notin @('S-1-5-18', 'S-1-5-32-544')) {
-        throw "untrusted broker data access; trusted recovery required"
-      }
-    }
     return
   }
-  if ((Test-Path -LiteralPath $Data) -and ((Get-Item -Force -LiteralPath $Data).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "refusing reparse broker data directory" }
-  if (Test-Path -LiteralPath $Keys) { Assert-NoKeyReparse $Keys }
-  $records = Join-Path $Data "key-enrollment"
-  if (Test-Path -LiteralPath $records) { Assert-NoKeyReparse $records }
-  Secure-Dir $Data $false
-  if (Test-Path -LiteralPath $Keys) {
-    # Never publish pre-service key objects to the SYSTEM signer. Retain them
-    # only for privileged recovery, with owners and DACLs replaced recursively.
-    $recovery = Join-Path $Data ('key-recovery-' + [Guid]::NewGuid().ToString('N'))
-    Secure-Dir $recovery $false
-    $saved = Join-Path $recovery 'keys'
-    Move-Item -LiteralPath $Keys -Destination $saved
-    Protect-RecoveryTree $saved
-    if (Test-Path -LiteralPath $records) {
-      $savedRecords = Join-Path $recovery "key-enrollment"
-      Move-Item -LiteralPath $records -Destination $savedRecords
-      Protect-RecoveryTree $savedRecords
-    }
-    Say 'preexisting key objects quarantined for privileged recovery; fresh protected enrollment required'
+  Assert-DataAnchor
+  if ((Test-Path -LiteralPath $Data) -and ((Get-Item -Force -LiteralPath $Data).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'refusing reparse broker data directory' }
+  foreach ($history in @("devices.txt","devices.secured","pre-broker","raw-device-owners","raw-device-owners.txt")) {
+    if (Test-Path -LiteralPath (Join-Path $Data $history)) { throw "prior raw security history requires trusted recovery before data replacement" }
   }
-  Secure-Dir $Keys $false
-  if (Test-Path -LiteralPath $records) { throw "orphan key enrollment records; trusted recovery required" }
-  Secure-Dir $records $false
+  $parent=Split-Path -Parent $Data
+  $stage=Join-Path $parent ('waycompose-new-' + [Guid]::NewGuid().ToString('N'))
+  New-ProtectedDirectory $stage
+  # Retain the entire old tree, including logs, baselines and old enrollment
+  # records. Old parent/file handles can mutate only this retired generation.
+  if(Test-Path -LiteralPath $Data) {
+    $recovery=Join-Path $parent ('waycompose-recovery-' + [Guid]::NewGuid().ToString('N'))
+    New-ProtectedDirectory $recovery
+    [IO.Directory]::Move($Data, (Join-Path $recovery 'retired-data'))
+    # Never traverse or normalize retired objects: their retained handles
+    # can still rewrite ACLs or install reparse points inside the old tree.
+    Say 'prior data generation isolated in privileged recovery; fresh protected enrollment required'
+  }
+  # A racing fixed-name creation fails closed. Never normalize or adopt it.
+  [IO.Directory]::Move($stage, $Data)
+  New-ProtectedDirectory $Keys
+  New-ProtectedDirectory (Join-Path $Data 'key-enrollment')
+  $g=@{version=1; generation=[Guid]::NewGuid().ToString('N'); fileId=(Key-FileId $Data)} | ConvertTo-Json -Compress
+  Write-ProtectedNewText (Join-Path $Data 'data-generation.json') $g
+}
+
+function Prepare-BinaryDirectory {
+  Assert-DataAnchor $Dir
+  if (Test-Path -LiteralPath $Dir) {
+    $item=Get-Item -Force -LiteralPath $Dir
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'untrusted broker binary directory reparse or type' }
+    $a=Get-Acl -LiteralPath $Dir
+    if (-not $a.AreAccessRulesProtected -or $a.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'untrusted broker binary directory metadata; trusted recovery required' }
+    $write=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach($r in $a.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+      if($r.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        ($r.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544') -and ($r.FileSystemRights -band $write))) { throw 'untrusted broker binary directory access' }
+    }
+    $record=Join-Path $Dir 'binary-generation.json'
+    Assert-TrustedKeyTree $record
+    $g=Get-Content -Raw -LiteralPath $record | ConvertFrom-Json
+    if($g.version -ne 1 -or $g.generation -notmatch '^[a-f0-9]{32}$' -or $g.fileId -cne (Key-FileId $Dir)) { throw 'unknown broker binary directory generation; trusted recovery required' }
+    return
+  }
+  New-ProtectedDirectory $Dir
+  $g=@{version=1;generation=[Guid]::NewGuid().ToString('N');fileId=(Key-FileId $Dir)} | ConvertTo-Json -Compress
+  Write-ProtectedNewText (Join-Path $Dir 'binary-generation.json') $g
+  Secure-Path $Dir $true $true
+}
+function Copy-ProtectedBinary([string]$source, [string]$destination) {
+  $inputStream=[IO.File]::OpenRead($source)
+  try {
+    $outputStream=Open-ProtectedNewFile $destination
+    try { $inputStream.CopyTo($outputStream); $outputStream.Flush($true) } finally { $outputStream.Dispose() }
+    Secure-Path $destination $false $true
+  } finally { $inputStream.Dispose() }
 }
 
 switch ($Action) {
@@ -193,6 +264,7 @@ switch ($Action) {
     $src = Join-Path $Source "sv-guest.exe"
     if (-not (Test-Path $src)) { throw "no $src" }
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    Prepare-BinaryDirectory
     Prepare-InstallKeys ([bool]$svc)
     Secure-Dir $Dir $true
     Secure-Dir $Data $false
@@ -213,7 +285,7 @@ switch ($Action) {
     if (Test-Path $Exe) {
       try { Remove-Item -Force $Exe } catch { Rename-Item -Force $Exe ("sv-guest.exe.old-" + (Get-Date -Format "yyyyMMddHHmmss")) }
     }
-    Copy-Item -Force $src $Exe
+    Copy-ProtectedBinary $src $Exe
     Secure-Path $Exe $false $true
     # Not `sc.exe create binPath= "..."`: Windows PowerShell 5 passes the
     # quotes a path with a space needs to a native program mangled.
@@ -274,8 +346,9 @@ switch ($Action) {
     $k = (@($input) -join "").Trim()
     if (-not $k) { $k = [Console]::In.ReadToEnd().Trim() }
     if ($k -notmatch '^[0-9a-f]{64}$') { throw "the key on stdin is not 64 hex digits" }
-    Secure-Dir $Data $false
-    Secure-Dir $Keys $false
+    Assert-DataGeneration
+    Assert-TrustedKeyTree $Keys
+    Assert-TrustedKeyTree (Join-Path $Data "key-enrollment")
     $p = Join-Path $Keys "$Install.key"
     if ((Test-Path -LiteralPath $p) -and ((Get-Item -Force -LiteralPath $p).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
       throw "refusing reparse key $p"
@@ -285,7 +358,7 @@ switch ($Action) {
     # changing its DACL cannot revoke that handle's access to new bytes.
     $tmp = Join-Path $Keys (".key-" + [Guid]::NewGuid().ToString("N") + ".tmp")
     try {
-      $stream = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      $stream = Open-ProtectedNewFile $tmp
       try {
         $bytes = [Text.Encoding]::ASCII.GetBytes($k)
         $stream.Write($bytes, 0, $bytes.Length)
