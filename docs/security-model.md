@@ -1602,7 +1602,11 @@ lent and will reuse. What can go wrong, and what holds it:
     by its process's exit, which the kernel reports through a pidfd). After a
     restart of the daemon, it also waits for every holder its record names
     (pid and start time). The fallible lease hook records and fsyncs that
-    holder before any handles leave; failed persistence refuses the lease;
+    holder before any handles leave; failed persistence refuses the lease.
+    Recovery validates a versioned checksum and every record. Unreadable,
+    missing or malformed journals block the whole pool without overwriting
+    the journal or answering `UNMAPPED`. Production cannot disable durable
+    state, and old unversioned journals require a controlled migration;
   * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
     own process;
   * the broker, its independent holder process, and the provider retain the

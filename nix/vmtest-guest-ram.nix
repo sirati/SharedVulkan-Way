@@ -233,6 +233,42 @@ in
           print(release("a3"))
           host.wait_until_succeeds(ctl + "status 3 | grep -q freed", timeout=30)
 
+      for k, damage in [(4, "unreadable"), (5, "malformed")]:
+          with subtest(f"{damage} recovery state cannot release alice's existing mapping"):
+              print(host.succeed(ctl + "grow 16M"))
+              name = f"recovery-{k}"
+              client(name, "alice", f"gpu.{k}")
+              print(mapped(name))
+              journal = "/var/lib/wcbroker/guest-ram/gpu.regions"
+              backup = f"/run/vmt/recovery-{k}.saved"
+              host.succeed("systemctl stop wcbroker.service")
+              host.succeed(f"cp {journal} {backup}")
+              if damage == "unreadable":
+                  host.succeed(f"chmod 000 {journal}")
+              else:
+                  host.succeed(f"printf 'region broken\\n' > {journal}")
+              host.succeed("systemctl start wcbroker.service")
+              invocation = host.succeed("systemctl show -p InvocationID --value wcbroker.service").strip()
+              host.wait_until_succeeds(f"journalctl _SYSTEMD_INVOCATION_ID={invocation} | grep -q 'recovery blocked'", timeout=30)
+              print(host.succeed(ctl + f"retire {k}"))
+              time.sleep(3)
+              assert status(k) == "retiring", status(k)
+              host.fail(f"journalctl _SYSTEMD_INVOCATION_ID={invocation} | grep -q 'UNMAPPED region {k}'")
+              if damage == "unreadable":
+                  host.succeed(f"cmp {journal} {backup}; test $(stat -c %a {journal}) = 0")
+              else:
+                  assert host.succeed(f"cat {journal}") == "region broken\n"
+              # Restore the trusted record while alice still maps the same
+              # pages. A new daemon must wait for her recorded process too.
+              host.succeed("systemctl stop wcbroker.service")
+              host.succeed(f"cp {backup} {journal}; chown wcbroker:wcbroker {journal}; chmod 600 {journal}")
+              host.succeed("systemctl start wcbroker.service")
+              invocation = host.succeed("systemctl show -p InvocationID --value wcbroker.service").strip()
+              host.wait_until_succeeds(f"journalctl _SYSTEMD_INVOCATION_ID={invocation} | grep -q 'held for the previous run'", timeout=30)
+              assert status(k) == "retiring", status(k)
+              print(release(name))
+              host.wait_until_succeeds(ctl + f"status {k} | grep -q freed", timeout=30)
+
       with subtest("the guest is healthy, and no refused region"):
           host.fail("grep -q REFUSED /run/wcvm/console.log")
           host.succeed("systemctl is-active wcvm.service")

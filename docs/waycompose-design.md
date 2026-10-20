@@ -36353,6 +36353,25 @@ and lease files.
   answers only once its current leases have drained and every recorded
   holder has exited. Failed re-publication also retains the old holders.
 
+**A journal that cannot be trusted blocks recovery.** Before publishing any
+inherited region, the component checks the complete journal's version,
+checksum and every record. Missing or unreadable files, malformed records,
+truncation, duplicate epochs and mapped entries without records block the
+whole pool. It neither publishes new regions nor answers `UNMAPPED`, even
+for an epoch absent from its in-memory map. Heartbeats leave the damaged
+file untouched. Restoring a trusted journal and restarting the daemon is
+required to resume recovery; a timeout never clears the block.
+
+Only a newly created private state directory gets an initial, durably empty
+journal. An existing directory with a missing journal is not treated as a
+first start. Production `GuestRamComponent` construction requires this
+directory; explicitly in-memory simulations retain their test-only mode.
+Unversioned journals are rejected because older heartbeat records cannot
+prove holder completeness. Their migration requires old mappings to have
+ended, rather than adding an integrity header to potentially incomplete
+holder records. A completed `UNMAPPED` entry needs no journal record while
+the provider finishes its cleanup.
+
 **Windows provider integration.** `KeeperSubstrate` now connects to the
 shared Windows broker and requests `alloc guest-ram.POOL BYTES large`.
 The service's region-init hook stamps every 2 MiB page with a random nonce
