@@ -23,6 +23,15 @@ writes before GPU sampling and retain decoder resources until GPU completion.
 The imported texture and derived texture retain the IOSurface, but this does
 not substitute for VideoToolbox callback/completion ownership in the server.
 
+MTLTexture handle properties and image memory requirements expose only
+non-host-visible memory types. Texture import rejects a host-visible selected
+memory type before retaining any resources. The provider adds a GPU-only type
+on the same device-local heap and preserves its original host-visible type
+first for ordinary allocations and Metal heap imports. Imported textures have
+no Vulkan CPU mapping, and host-image-copy usage is refused for this path.
+The NV12 helper rejects zero extents and computes chroma extents without
+unsigned addition overflow.
+
 The caller supplies the real stream's conversion model, range and chroma
 location through standard `VkSamplerYcbcrConversion`. The IOSurface FourCC
 alone does not encode the stream's matrix or chroma location. The driver does

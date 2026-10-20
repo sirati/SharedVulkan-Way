@@ -41,6 +41,63 @@ static int failures;
 
 #include "nv12_spv.h"
 #include <math.h>
+static int run_memory_contract(void) {
+   LOAD_D(vkGetMemoryMetalHandlePropertiesEXT);
+   LOAD_D(vkAllocateMemory);
+   LOAD_D(vkMapMemory);
+   LOAD_D(vkUnmapMemory);
+   LOAD_D(vkFreeMemory);
+   LOAD_I(vkGetPhysicalDeviceMemoryProperties);
+   VkPhysicalDeviceMemoryProperties mp;
+   vkGetPhysicalDeviceMemoryProperties(pdev, &mp);
+   uint32_t hosts = 0;
+   for (unsigned i = 0; i < mp.memoryTypeCount; i++)
+      if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         hosts |= 1u << i;
+   if (!hosts)
+      return 1;
+   MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+   desc.size = 65536;
+   desc.storageMode = MTLStorageModeShared;
+   desc.type = MTLHeapTypePlacement;
+   desc.hazardTrackingMode = MTLHazardTrackingModeUntracked;
+   id<MTLHeap> heap = [mtl newHeapWithDescriptor:desc];
+   [desc release];
+   if (!heap)
+      return 1;
+   VkMemoryMetalHandlePropertiesEXT props = {
+       .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT};
+   CHECK(vkGetMemoryMetalHandlePropertiesEXT(
+       dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT, heap, &props));
+   if ((props.memoryTypeBits & hosts) != hosts)
+      return 1;
+   for (unsigned imported = 0; imported < 2; imported++) {
+      VkImportMemoryMetalHandleInfoEXT info = {
+          .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+          .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+          .handle = heap};
+      VkDeviceMemory memory;
+      CHECK(
+          vkAllocateMemory(dev,
+                           &(VkMemoryAllocateInfo){
+                               .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = imported ? &info : NULL,
+                               .allocationSize = 4096,
+                               .memoryTypeIndex = __builtin_ctz(hosts)},
+                           NULL, &memory));
+      void *mapped = NULL;
+      CHECK(vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped));
+      if (!mapped)
+         return 1;
+      memset(mapped, 0x5a, 4096);
+      vkUnmapMemory(dev, memory);
+      vkFreeMemory(dev, memory, NULL);
+   }
+   [heap release];
+   printf("ordinary and MTLHEAP HOST_VISIBLE allocations remain mappable\n");
+   return 0;
+}
+
 static int run_nv12(bool narrow) {
 #define D(x) LOAD_D(x)
    D(vkCreateImage);
@@ -181,6 +238,16 @@ static int run_nv12(bool narrow) {
        .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT};
    CHECK(vkGetMemoryMetalHandlePropertiesEXT(
        dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT, tex, &hp));
+   VkPhysicalDeviceMemoryProperties mp;
+   vkGetPhysicalDeviceMemoryProperties(pdev, &mp);
+   uint32_t host_types = 0;
+   for (unsigned i = 0; i < mp.memoryTypeCount; i++)
+      if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         host_types |= 1u << i;
+   if (!hp.memoryTypeBits || !req.memoryTypeBits ||
+       (hp.memoryTypeBits & host_types) || (req.memoryTypeBits & host_types) ||
+       !(req.memoryTypeBits & hp.memoryTypeBits))
+      return 1;
    uint32_t type = __builtin_ctz(req.memoryTypeBits & hp.memoryTypeBits);
    VkMemoryDedicatedAllocateInfo dedicated = {
        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
@@ -190,6 +257,26 @@ static int run_nv12(bool narrow) {
        .pNext = &dedicated,
        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
        .handle = tex};
+   for (unsigned i = 0; i < mp.memoryTypeCount; i++) {
+      if (!(host_types & (1u << i)))
+         continue;
+      VkDeviceMemory incompatible = VK_NULL_HANDLE;
+      VkResult rejected =
+          vkAllocateMemory(dev,
+                           &(VkMemoryAllocateInfo){
+                               .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                               .pNext = &import,
+                               .allocationSize = req.size,
+                               .memoryTypeIndex = i},
+                           NULL, &incompatible);
+      if (rejected != VK_ERROR_INVALID_EXTERNAL_HANDLE) {
+         printf("HOST_VISIBLE texture import type %u returned %d\n", i,
+                rejected);
+         return 1;
+      }
+   }
+   printf("MTLTEXTURE properties/requirements exclude HOST_VISIBLE; "
+          "incompatible imports refused\n");
    MTLTextureDescriptor *wrong_desc = [MTLTextureDescriptor
        texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
                                     width:2
@@ -303,8 +390,6 @@ static int run_nv12(bool narrow) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT},
        NULL, &out));
    vkGetBufferMemoryRequirements(dev, out, &req);
-   VkPhysicalDeviceMemoryProperties mp;
-   vkGetPhysicalDeviceMemoryProperties(pdev, &mp);
    for (type = 0; type < mp.memoryTypeCount; type++)
       if ((req.memoryTypeBits & (1u << type)) &&
           (mp.memoryTypes[type].propertyFlags &
@@ -593,6 +678,7 @@ int main(void) {
               .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT},
           NULL, &pool));
 
+      CHECK(run_memory_contract());
       CHECK(run_nv12(false));
       CHECK(run_nv12(true));
       LOAD_D(vkDestroyCommandPool);

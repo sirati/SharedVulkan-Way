@@ -28,7 +28,7 @@ index b32170b..c5f9174 100644
  mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
                                         const struct kk_view_layout *layout);
 diff --git a/src/kosmickrisp/bridge/mtl_texture.m b/src/kosmickrisp/bridge/mtl_texture.m
-index 496ce14..4d1d448 100644
+index 496ce14..50011b4 100644
 --- a/src/kosmickrisp/bridge/mtl_texture.m
 +++ b/src/kosmickrisp/bridge/mtl_texture.m
 @@ -13,6 +13,64 @@
@@ -47,7 +47,7 @@ index 496ce14..4d1d448 100644
 +   @autoreleasepool {
 +      id<MTLTexture> tex = (id<MTLTexture>)texture;
 +      IOSurfaceRef surface = tex.iosurface;
-+      if (!surface || tex.iosurfacePlane != 0 ||
++      if (!width || !height || !surface || tex.iosurfacePlane != 0 ||
 +          tex.pixelFormat != MTLPixelFormatR8Unorm ||
 +          tex.textureType != MTLTextureType2D || tex.width != width ||
 +          tex.height != height || tex.mipmapLevelCount != 1 ||
@@ -63,8 +63,8 @@ index 496ce14..4d1d448 100644
 +         return NULL;
 +      size_t allocation = IOSurfaceGetAllocSize(surface);
 +      for (unsigned p = 0; p < 2; p++) {
-+         size_t w = p ? (width + 1u) / 2u : width;
-+         size_t h = p ? (height + 1u) / 2u : height;
++         size_t w = p ? (width / 2u + width % 2u) : width;
++         size_t h = p ? (height / 2u + height % 2u) : height;
 +         size_t element = p ? 2u : 1u;
 +         size_t stride = IOSurfaceGetBytesPerRowOfPlane(surface, p);
 +         uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surface);
@@ -86,7 +86,7 @@ index 496ce14..4d1d448 100644
 +         return NULL;
 +      MTLTextureDescriptor *desc = [MTLTextureDescriptor
 +         texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
-+         width:(width + 1u) / 2u height:(height + 1u) / 2u mipmapped:NO];
++         width:(width / 2u + width % 2u) height:(height / 2u + height % 2u) mipmapped:NO];
 +      desc.storageMode = tex.storageMode;
 +      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +      return [tex.device newTextureWithDescriptor:desc iosurface:surface plane:1];
@@ -203,7 +203,7 @@ index be4f3e7..25f188e 100644
  
  /* Required to create a sampler */
 diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
-index 0e11cc2..fc9fa44 100644
+index 0e11cc2..b867295 100644
 --- a/src/kosmickrisp/vulkan/kk_device_memory.c
 +++ b/src/kosmickrisp/vulkan/kk_device_memory.c
 @@ -8,6 +8,7 @@
@@ -214,7 +214,7 @@ index 0e11cc2..fc9fa44 100644
  #include "kk_entrypoints.h"
  #include "kk_physical_device.h"
  
-@@ -38,6 +39,14 @@ const VkExternalMemoryProperties kk_host_mem_props = {
+@@ -38,6 +39,25 @@ const VkExternalMemoryProperties kk_host_mem_props = {
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT,
  };
  
@@ -226,10 +226,21 @@ index 0e11cc2..fc9fa44 100644
 +   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
 +};
 +
++uint32_t
++kk_mtltexture_memory_types(const struct kk_physical_device *pdev)
++{
++   uint32_t types = 0;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
++      if (!(pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         types |= BITFIELD_BIT(i);
++   }
++   return types;
++}
++
  #ifdef VK_USE_PLATFORM_METAL_EXT
  VKAPI_ATTR VkResult VKAPI_CALL
  kk_GetMemoryMetalHandlePropertiesEXT(
-@@ -48,10 +57,11 @@ kk_GetMemoryMetalHandlePropertiesEXT(
+@@ -48,17 +68,18 @@ kk_GetMemoryMetalHandlePropertiesEXT(
     VK_FROM_HANDLE(kk_device, dev, device);
     struct kk_physical_device *pdev = kk_device_physical(dev);
  
@@ -239,11 +250,38 @@ index 0e11cc2..fc9fa44 100644
 +    * as dedicated image allocations. */
     switch (handleType) {
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT:
++      pMemoryMetalHandleProperties->memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count);
++      break;
 +   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT:
++      pMemoryMetalHandleProperties->memoryTypeBits = kk_mtltexture_memory_types(pdev);
        break;
     default:
        return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-@@ -118,12 +128,57 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+    }
+-   pMemoryMetalHandleProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
+-
+    return VK_SUCCESS;
+ }
+ #endif /* VK_USE_PLATFORM_METAL_EXT */
+@@ -97,6 +118,16 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+    const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
+       pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+ 
++   /* Reject an incompatible type before creating or retaining resources. */
++   if (metal_info && metal_info->handleType ==
++                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
++      const struct kk_physical_device *pdev = kk_device_physical(dev);
++      if (pAllocateInfo->memoryTypeIndex >= pdev->mem_type_count ||
++          !(kk_mtltexture_memory_types(pdev) &
++            BITFIELD_BIT(pAllocateInfo->memoryTypeIndex)))
++         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   }
++
+    // TODO_KOSMICKRISP Do the actual memory allocation with alignment requirements
+    uint32_t alignment = (1ULL << 12);
+ 
+@@ -118,12 +149,62 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
           goto fail_alloc;
        }
  
@@ -265,6 +303,11 @@ index 0e11cc2..fc9fa44 100644
 +         }
 +
 +         VK_FROM_HANDLE(kk_image, image, dedicated_info->image);
++         if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
++            FREE(mem->bo);
++            result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++            goto fail_alloc;
++         }
 +         if (image->vk.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) {
 +            if (image->disjoint || image->vk.image_type != VK_IMAGE_TYPE_2D ||
 +                image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
@@ -304,7 +347,7 @@ index 0e11cc2..fc9fa44 100644
           mem->bo->mtl_handle = mtl_retain(metal_info->handle);
           mem->bo->map =
              mtl_new_buffer_with_length(mem->bo->mtl_handle, mem->vk.size, 0u);
-@@ -138,8 +193,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+@@ -138,8 +219,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
           kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
        }
  
@@ -317,7 +360,7 @@ index 0e11cc2..fc9fa44 100644
     } else {
        result =
           kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
-@@ -184,6 +241,12 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+@@ -184,6 +267,12 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
        return VK_SUCCESS;
     }
  
@@ -331,18 +374,21 @@ index 0e11cc2..fc9fa44 100644
     const VkDeviceSize size = vk_device_memory_range(
        &mem->vk, pMemoryMapInfo->offset, pMemoryMapInfo->size);
 diff --git a/src/kosmickrisp/vulkan/kk_device_memory.h b/src/kosmickrisp/vulkan/kk_device_memory.h
-index 6aff54b..c2edb2d 100644
+index 6aff54b..f8bba4a 100644
 --- a/src/kosmickrisp/vulkan/kk_device_memory.h
 +++ b/src/kosmickrisp/vulkan/kk_device_memory.h
-@@ -27,5 +27,6 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_device_memory, vk.base, VkDeviceMemory,
+@@ -27,5 +27,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_device_memory, vk.base, VkDeviceMemory,
  
  extern const VkExternalMemoryProperties kk_mtlheap_mem_props;
  extern const VkExternalMemoryProperties kk_host_mem_props;
 +extern const VkExternalMemoryProperties kk_mtltexture_mem_props;
++
++struct kk_physical_device;
++uint32_t kk_mtltexture_memory_types(const struct kk_physical_device *pdev);
  
  #endif // KK_MEMORY_H
 diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
-index 5f9b787..67fff75 100644
+index 5f9b787..852214d 100644
 --- a/src/kosmickrisp/vulkan/kk_image.c
 +++ b/src/kosmickrisp/vulkan/kk_image.c
 @@ -273,16 +273,38 @@ kk_GetPhysicalDeviceImageFormatProperties2(
@@ -387,7 +433,7 @@ index 5f9b787..67fff75 100644
        return VK_ERROR_FORMAT_NOT_SUPPORTED;
  
     if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
-@@ -411,6 +433,27 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+@@ -411,6 +433,28 @@ kk_GetPhysicalDeviceImageFormatProperties2(
           ext_mem_props = &kk_host_mem_props;
           break;
        }
@@ -396,7 +442,8 @@ index 5f9b787..67fff75 100644
 +          * the same IOSurface. Other formats must fit a single texture.
 +          * Neither path supports heap aliasing or disjoint bindings.
 +          */
-+         if ((ycbcr_info != NULL &&
++         if ((pImageFormatInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) ||
++             (ycbcr_info != NULL &&
 +              (pImageFormatInfo->format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
 +               pImageFormatInfo->usage & ~VK_IMAGE_USAGE_SAMPLED_BIT)) ||
 +             (pImageFormatInfo->flags &
@@ -415,7 +462,7 @@ index 5f9b787..67fff75 100644
        default:
           /* From the Vulkan 1.3.256 spec:
            *
-@@ -461,6 +504,11 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+@@ -461,6 +505,11 @@ kk_GetPhysicalDeviceImageFormatProperties2(
         (pImageFormatInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
        return VK_ERROR_FORMAT_NOT_SUPPORTED;
  
@@ -427,7 +474,18 @@ index 5f9b787..67fff75 100644
     pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
        .maxExtent = maxExtent,
        .maxMipLevels = maxMipLevels,
-@@ -703,10 +751,12 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+@@ -680,6 +729,10 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
++   if (image->vk.external_handle_types &
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT)
++      memory_types &= kk_mtltexture_memory_types(pdev);
++
+    // TODO hope for the best?
+ 
+    uint64_t size_B = 0;
+@@ -703,10 +756,12 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
        switch (ext->sType) {
        case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
           VkMemoryDedicatedRequirements *dedicated = (void *)ext;
@@ -444,7 +502,7 @@ index 5f9b787..67fff75 100644
           break;
        }
        default:
-@@ -790,10 +840,19 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
+@@ -790,10 +845,19 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
     }
  
     pLayout->subresourceLayout = (VkSubresourceLayout){
@@ -468,7 +526,7 @@ index 5f9b787..67fff75 100644
        .depthPitch = 1u,
     };
  
-@@ -920,6 +979,24 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
+@@ -920,6 +984,24 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
     }
  #endif
  
@@ -493,3 +551,22 @@ index 5f9b787..67fff75 100644
     uint64_t offset_B = info->memoryOffset;
     if (image->disjoint) {
        const VkBindImagePlaneMemoryInfo *plane_info =
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 227273d..86a77d3 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1101,6 +1101,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .heapIndex = sysmem_heap_idx,
+    };
+ 
++   /* Opaque texture imports have no CPU mapping. Keep the ordinary unified
++    * host-visible type first, and offer a GPU-only type on the same heap.
++    */
++   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+ 
