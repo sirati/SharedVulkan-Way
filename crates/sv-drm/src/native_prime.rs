@@ -610,3 +610,53 @@ mod alias_tests {
         assert_eq!(page.load(), 42);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod fork_tests {
+    use super::*;
+    #[test]
+    fn inherited_native_fd_keeps_registered_identity_after_fork() {
+        let token = Token {
+            size: 16384,
+            nonce: [9; 16],
+            name: "/sv-shared-fork".into(),
+            record: String::new(),
+        };
+        let header = token.encode();
+        let raw = unsafe { libc::memfd_create(c"prime-fork".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(unsafe { libc::ftruncate(raw, token.size as _) }, 0);
+        assert_eq!(
+            unsafe { libc::pwrite(raw, header.as_ptr().cast(), header.len(), 0) },
+            header.len() as _
+        );
+        let registry = Registry::default();
+        let _owner = registry.register(fd.as_fd(), &header).unwrap();
+        let (expected, len) = identity(fd.as_fd()).unwrap();
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Only async-signal-safe syscalls in the forked test child. This
+            // checks kernel identity, not guest/runtime fork reconstruction.
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let okay = unsafe { libc::fstat(raw, st.as_mut_ptr()) } == 0;
+            let status = if okay {
+                let st = unsafe { st.assume_init() };
+                i32::from(
+                    st.st_dev as u64 != expected.dev
+                        || st.st_ino as u64 != expected.ino
+                        || st.st_size as u64 != len,
+                )
+            } else {
+                1
+            };
+            unsafe { libc::_exit(status) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert!(registry.import(fd.as_fd()).is_ok());
+    }
+}
