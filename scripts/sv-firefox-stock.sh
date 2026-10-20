@@ -46,7 +46,7 @@
 set -uo pipefail
 
 # Reject inherited sandbox overrides before launching any application.
-if env | grep -qE '^MOZ_(DISABLE_.*SANDBOX|FORCE_DISABLE_E10S_SANDBOX|CONTENT_SANDBOX_LEVEL|RDD_SANDBOX_LEVEL|GPU_SANDBOX_LEVEL)='; then
+if env | grep -E '^MOZ_(DISABLE_.*SANDBOX|FORCE_DISABLE_E10S_SANDBOX|CONTENT_SANDBOX_LEVEL|RDD_SANDBOX_LEVEL|GPU_SANDBOX_LEVEL)=' >/dev/null; then
   echo "FAIL: the invoking environment overrides a Firefox sandbox"
   exit 2
 fi
