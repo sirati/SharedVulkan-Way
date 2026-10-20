@@ -55,7 +55,7 @@ impl DispatchState {
         self.parameters.get(&wire).copied()
     }
 }
-fn profile(p: &p::VkVideoProfileInfoKHR) -> VideoResult<Profile> {
+pub(crate) fn profile(p: &p::VkVideoProfileInfoKHR) -> VideoResult<Profile> {
     let [p::PNextLink::VkVideoDecodeH264ProfileInfoKHR(h)] = p.p_next.as_slice() else {
         return Err(fail());
     };

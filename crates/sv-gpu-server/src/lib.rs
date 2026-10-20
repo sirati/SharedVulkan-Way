@@ -109,3 +109,13 @@ mod native_queue;
 
 #[cfg(target_os = "macos")]
 mod native_video_image;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod video_recording;
+
+#[cfg(target_os = "macos")]
+mod native_video_resources;
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod native_video_commands;
+

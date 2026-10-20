@@ -163,6 +163,8 @@ pub struct Objects {
     /// Driver images created to be bound to a shared section, whose
     /// requirements offer the application type 0 only.
     pub shared_images: std::collections::HashSet<u64>,
+    #[cfg(target_os = "macos")]
+    pub(crate) native_video: crate::native_video_resources::Resources,
     /// This session's fence record (§104.11), made by the first `svFenceRecord`.
     pub fence: Option<std::sync::Arc<crate::fence::SessionFence>>,
 }
@@ -188,6 +190,8 @@ impl Objects {
             #[cfg(target_os = "macos")]
             native_image_imports: HashMap::new(),
             shared_images: Default::default(),
+            #[cfg(target_os = "macos")]
+            native_video: Default::default(),
             fence: None,
         }
     }
@@ -470,6 +474,11 @@ impl Objects {
                 raws.dedup();
             }
             for raw in raws {
+                #[cfg(target_os = "macos")]
+                if (ty == H::VkImage && self.native_video.owns_image(vk::Image::from_raw(raw)))
+                    || (ty == H::VkDeviceMemory && self.native_video.owns_memory(vk::DeviceMemory::from_raw(raw))) {
+                    continue;
+                }
                 // SAFETY: the caller's contract; each handle was created on
                 // `device` by this session and is destroyed exactly once,
                 // because the table is cleared below.
@@ -533,6 +542,8 @@ impl Objects {
         #[cfg(target_os = "macos")]
         self.native_image_imports.clear();
         self.shared_images.clear();
+        #[cfg(target_os = "macos")]
+        self.native_video.clear();
         Ok(n)
     }
 
@@ -585,11 +596,23 @@ impl Objects {
             }
             *out.entry(format!("{:?}", o.ty)).or_insert(0) += 1;
         }
+        #[cfg(target_os = "macos")]
+        for view in self.native_video.views.values() {
+            if view.native.is_none() {
+                *out.entry("VkImageView".to_string()).or_insert(0) += 1;
+            }
+        }
         out
     }
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+            && {
+                #[cfg(target_os = "macos")]
+                { self.native_video.images.is_empty() && self.native_video.memories.is_empty() && self.native_video.views.is_empty() }
+                #[cfg(not(target_os = "macos"))]
+                { true }
+            }
     }
 }
 
