@@ -1,0 +1,286 @@
+--- a/src/guest.c
++++ b/src/guest.c
+@@ -32,6 +32,7 @@
+  *                           mixed permissions within a 2MB block (W^X)
+  */
+ #include "guest.h"
++#include "hl_pt_access.h"
+ #include "hl_shared.h"
+ #include "hl_copy.h"
+ #include "syscall_internal.h"  /* hl_verbose */
+@@ -675,122 +676,77 @@
+     g->naliases = 0;
+ }
+
+-/* Walk guest page tables to translate VA → GPA (offset in host_base).
+- * Returns the byte-level GPA or UINT64_MAX if unmapped.
+- * Handles L2 block descriptors (2MB) and L3 page descriptors (4KB). */
+-static uint64_t guest_walk_pt(const guest_t *g, uint64_t va) {
+-    uint64_t base = g->ipa_base;
+-
+-    /* L0 table (each entry covers 512GB) */
+-    const uint64_t *l0 = pt_at(g, g->ttbr0 - base);
+-    unsigned l0_idx = (unsigned)(va / (512ULL * BLOCK_1GB));
+-    if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID))
+-        return UINT64_MAX;
+-
+-    /* L1 table (each entry covers 1GB) */
+-    uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
+-    const uint64_t *l1 = pt_at(g, l1_ipa - base);
+-    unsigned l1_idx = (unsigned)((va / BLOCK_1GB) % 512);
+-    if (!(l1[l1_idx] & PT_VALID))
+-        return UINT64_MAX;
+-
+-    /* L2 table (each entry covers 2MB) */
+-    uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
+-    const uint64_t *l2 = pt_at(g, l2_ipa - base);
+-    unsigned l2_idx = (unsigned)((va / BLOCK_2MB) % 512);
+-    if (!(l2[l2_idx] & PT_VALID))
+-        return UINT64_MAX;
+-
+-    /* Check if L2 entry is a table (→ L3) or block descriptor.
+-     * Block: bits[1:0]=01 (PT_VALID only). Table: bits[1:0]=11. */
+-    if (l2[l2_idx] & PT_TABLE) {
+-        /* L3 page table (each entry covers 4KB) */
+-        uint64_t l3_ipa = l2[l2_idx] & 0xFFFFFFFFF000ULL;
+-        const uint64_t *l3 = pt_at(g, l3_ipa - base);
+-        unsigned l3_idx = (unsigned)((va / PAGE_SIZE) % 512);
+-        if (!(l3[l3_idx] & PT_VALID))
+-            return UINT64_MAX;
+-        uint64_t page_ipa = l3[l3_idx] & 0xFFFFFFFFF000ULL;
+-        return (page_ipa - base) + (va & (PAGE_SIZE - 1));
+-    }
+-
+-    /* Block descriptor: output IPA in bits[47:21] */
+-    uint64_t block_ipa = l2[l2_idx] & 0xFFFFFFE00000ULL;
+-    return (block_ipa - base) + (va & (BLOCK_2MB - 1));
+-}
+-
+-/* Resolve a guest virtual address to a host pointer and available size.
+- * Checks the primary mapping (host_base at ipa_base) first, then walks
+- * the guest page tables for non-identity-mapped addresses (e.g., rosetta
+- * at 128TB, or high-VA mmap regions used by rosetta's JIT).
+- * Returns NULL if the address is not in any mapping. If avail is non-NULL,
+- * stores the number of bytes available from gva to the end of its page/block. */
++/* Walk actual EL0 descriptors even for identity/legacy/kbuf addresses. A
++ * host pointer being in bounds does not grant guest read or write access. */
++static const uint64_t *guest_access_table(const void *context, uint64_t ipa) {
++    const guest_t *g = context;
++    if (ipa < g->ipa_base || (ipa & 4095) || g->guest_size < 4096) return NULL;
++    uint64_t off = ipa - g->ipa_base;
++    if (off < guest_page_table_pool_base(g) || off > g->guest_size - 4096)
++        return NULL;
++    return pt_at(g, off);
++}
++static int guest_access_translation(const guest_t *g, uint64_t va, int write,
++                                    int trusted, uint64_t *ipa, uint64_t *avail) {
++    uint64_t root;
++    if (va <= GUEST_USER_VA_MAX) root = g->ttbr0;
++    else if (g->kbuf_base && va >= KBUF_VA_BASE && va - KBUF_VA_BASE < KBUF_SIZE)
++        root = g->ttbr1;
++    else return -1;
++    return hl_pt_access_translate(g, guest_access_table, root, va, write,
++                                  trusted, ipa, avail);
++}
++static void *guest_primary_backing(const guest_t *g, uint64_t ipa, uint64_t *span) {
++    if (ipa >= g->ipa_base && ipa - g->ipa_base < g->guest_size) {
++        uint64_t off = ipa - g->ipa_base;
++        if (*span > g->guest_size - off) *span = g->guest_size - off;
++        return (uint8_t *)g->host_base + off;
++    }
++    return guest_overflow_resolve(g, ipa);
++}
++
++/* Trusted kernel access for initializing/clearing private mmap backing, not
++ * a syscall copyin/copyout interface. Caller owns mmap_lock and the mapping.
++ * External objects and all control storage are deliberately excluded. */
++void *guest_private_backing_ptr(const guest_t *g, uint64_t va, uint64_t *avail) {
++    uint64_t ipa, span;
++    if (guest_control_va_overlap(g, va, 1) ||
++        guest_access_translation(g, va, 0, 1, &ipa, &span) < 0 ||
++        ipa < g->ipa_base || guest_control_gpa_overlap(g, ipa - g->ipa_base, span) ||
++        hl_wc_contains(va) || hl_wc_ipa_busy(ipa, span) || hl_shm_ipa_busy(ipa, span))
++        return NULL;
++    void *ptr = guest_primary_backing(g, ipa, &span);
++    if (ptr && avail) *avail = span;
++    return ptr;
++}
++
+ static guest_extra_resolve_fn g_extra_resolve;
+-
+-void
+-guest_set_extra_resolve(guest_extra_resolve_fn fn)
+-{
+-    g_extra_resolve = fn;
+-}
+-
++void guest_set_extra_resolve(guest_extra_resolve_fn fn) { g_extra_resolve = fn; }
+ static void *gva_resolve_raw(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
+-    /* SysV SHM / other external host mappings (before identity fast path). */
++    uint64_t ipa, span;
++    if (guest_access_translation(g, gva, write, 0, &ipa, &span) < 0) return NULL;
++    /* Preserve external no-fallback denial and pinning after checking the
++     * same Stage-1 permissions that the guest CPU observes. */
++    uint64_t external_span = span;
+     int found;
+-    void *shared = hl_wc_resolve(gva, avail, write, &found);
+-    if (found) return shared;
++    void *ptr = hl_wc_resolve(gva, &external_span, write, &found);
++    if (found) {
++        if (external_span < span) span = external_span;
++        if (ptr && avail) *avail = span;
++        return ptr;
++    }
+     if (g_extra_resolve) {
+-        void *ep = g_extra_resolve(gva, avail);
+-        if (ep)
+-            return ep;
+-    }
+-    /* Fast path: primary region (identity-mapped at ipa_base) */
+-    if (gva >= g->ipa_base && gva < g->ipa_base + g->guest_size) {
+-        uint64_t off = gva - g->ipa_base;
+-        if (avail) *avail = g->guest_size - off;
+-        return (uint8_t *)g->host_base + off;
+-    }
+-    /* Legacy: allow raw offsets for internal use */
+-    if (gva < g->guest_size) {
+-        if (avail) *avail = g->guest_size - gva;
+-        return (uint8_t *)g->host_base + gva;
+-    }
+-    /* Kernel VA space (TTBR1): top 256MB mapped to kbuf_base.
+-     * Rosetta's kernel-space mmaps (MAP_FIXED at 0xFFFF....) land here. */
+-    if (g->kbuf_base && gva >= KBUF_VA_BASE) {
+-        uint64_t koff = gva - KBUF_VA_BASE;
+-        if (koff < KBUF_SIZE) {
+-            if (avail) *avail = KBUF_SIZE - koff;
+-            return (uint8_t *)g->kbuf_base + koff;
+-        }
+-    }
+-    /* Reject the non-canonical gap between the 48-bit user range and the
+-     * explicit TTBR1 kbuf window.  Feeding such an address to the table
+-     * walker aliases it through the low 48 address bits; Rosetta guests then
+-     * observe a bogus mapped pointer instead of the syscall's EFAULT. */
+-    if (gva > GUEST_USER_VA_MAX)
+-        return NULL;
+-    /* Walk page tables for high VAs (rosetta binary, JIT regions, etc.).
+-     * This correctly handles non-identity mappings where multiple mmap
+-     * calls share 2MB page table blocks — each VA resolves to whatever
+-     * GPA the page table actually maps it to. */
+-    uint64_t gpa = guest_walk_pt(g, gva);
+-    if (gpa != UINT64_MAX) {
+-        /* Within a 2MB block, GPAs are always contiguous (guest_split_block
+-         * and guest_update_perms preserve contiguity). Report remaining
+-         * bytes to end of the 2MB block. */
+-        uint64_t block_remain = BLOCK_2MB - (gva & (BLOCK_2MB - 1));
+-        if (gpa < g->guest_size) {
+-            if (avail) *avail = block_remain;
+-            return (uint8_t *)g->host_base + gpa;
+-        }
+-        /* Check overflow segments (GPA beyond primary buffer) */
+-        void *optr = guest_overflow_resolve(g, gpa);
+-        if (optr) {
+-            if (avail) *avail = block_remain;
+-            return optr;
+-        }
+-    }
+-    return NULL;
++        external_span = span;
++        ptr = g_extra_resolve(gva, &external_span);
++        if (ptr) {
++            if (external_span < span) span = external_span;
++            if (avail) *avail = span;
++            return ptr;
++        }
++    }
++    ptr = guest_primary_backing(g, ipa, &span);
++    if (ptr && avail) *avail = span;
++    return ptr;
+ }
+
+ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
+@@ -831,6 +787,29 @@
+
+ void *guest_ptr_access(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
+     return gva_resolve(g, gva, avail, write);
++}
++
++/* Preflight a caller-bounded native I/O range without assuming that adjacent
++ * guest pages have equal permissions or contiguous physical backing. The caller
++ * must retain its external-access scope through the final native operation. */
++void *guest_ptr_range_access(const guest_t *g, uint64_t va, uint64_t length,
++                              uint64_t *available, int write) {
++    if (available) *available = 0;
++    if (!length || length > UINT64_MAX - va) return NULL;
++    uint64_t span;
++    void *first = gva_resolve(g, va, &span, write);
++    if (!first || !span) return NULL;
++    uint64_t done = span < length ? span : length;
++    while (done < length) {
++        uint64_t next_span;
++        void *next = gva_resolve(g, va + done, &next_span, write);
++        if (!next || !next_span || done > UINTPTR_MAX - (uintptr_t)first ||
++            (uintptr_t)next != (uintptr_t)first + done) break;
++        uint64_t remain = length - done;
++        done += next_span < remain ? next_span : remain;
++    }
++    if (available) *available = done;
++    return first;
+ }
+
+ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
+--- a/src/guest.h
++++ b/src/guest.h
+@@ -315,6 +315,12 @@
+ /* External raw pointers require a live hl_wc_access_scope through final use.
+  * write is nonzero when native code may modify guest memory. */
+ void *guest_ptr_access(const guest_t *, uint64_t, uint64_t *, int write);
++/* Kernel-only private mmap initialization/clearing; requires mmap_lock and
++ * ownership of the mapping. Never use for syscall buffer copyin/copyout. */
++void *guest_private_backing_ptr(const guest_t *, uint64_t, uint64_t *);
++/* Native-I/O preflight: caller-bounded contiguous authorized prefix, checking
++ * each guest page. Keep the enclosing external-access scope until final use. */
++void *guest_ptr_range_access(const guest_t *, uint64_t, uint64_t, uint64_t *, int);
+
+ /* Optional VA→host resolver consulted before the primary/overflow paths.
+  * Used by SysV SHM so shared host pages are reachable even when IPA sits
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -673,7 +673,7 @@
+     for (uint64_t bva = va_block_start; bva < va_block_end; bva += BLOCK_2MB) {
+         /* Check if this 2MB block already has a page table mapping.
+          * guest_ptr uses page table walking for high VAs. */
+-        if (prot != LINUX_PROT_NONE && guest_ptr(g, bva) != NULL) {
++        if (prot != LINUX_PROT_NONE && guest_private_backing_ptr(g, bva, NULL) != NULL) {
+             /* Block already mapped — update permissions for the portion
+              * of this block that falls within the new mmap's VA range.
+              *
+@@ -809,7 +809,7 @@
+     uint64_t written = 0;
+     while (written < length) {
+         uint64_t resolved_avail;
+-        void *ptr = guest_ptr_access(g, va + written, &resolved_avail, 1);
++        void *ptr = guest_private_backing_ptr(g, va + written, &resolved_avail);
+         if (!ptr) {
+             fprintf(stderr, "hl: sys_mmap_high_va: guest_ptr(0x%llx) "
+                     "returned NULL (va=0x%llx written=0x%llx len=0x%llx)\n",
+@@ -1426,9 +1426,9 @@
+                  * the GPA-based region tracking entries. */
+                 uint64_t va_end = unmap_addr + unmap_len;
+                 for (uint64_t va = unmap_addr; va < va_end;
+-                     va += BLOCK_2MB) {
++                     va += 4096) {
+                     uint64_t resolved_avail;
+-                    void *ptr = guest_ptr_access(g, va, &resolved_avail, 1);
++                    void *ptr = guest_private_backing_ptr(g, va, &resolved_avail);
+                     if (!ptr) continue;
+                     /* Compute how much of this 2MB block to zero */
+                     uint64_t block_start = va & ~(BLOCK_2MB - 1);
+@@ -1554,7 +1554,7 @@
+
+                 for (uint64_t va = mprot_addr & ~4095ULL;
+                      va < va_end; va += 4096) {
+-                    if (!guest_ptr(g, va)) continue;  /* skip unmapped pages */
++                    if (!guest_private_backing_ptr(g, va, NULL)) continue;  /* skip unmapped pages */
+
+                     if (mprot_prot == LINUX_PROT_NONE) {
+                         guest_invalidate_ptes(g, va, va + 4096);
