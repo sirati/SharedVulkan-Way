@@ -249,8 +249,9 @@ app, together with `hyperlinux-runtime`, `hyperlinux-native` and the
 headless `hyperlinux-shared-probe` app. `nix/hyperlinux/stack.nix` assembles
 the native runtime, compositor, native session services, stock ARM64 Linux
 Firefox, Linux ELF ICD and stock upstream Linux Mesa. Its separate pinned
-runtime nixpkgs supplies the cross toolchain. Cached application and native
-Darwin dependencies use the main nixpkgs pin. The native KosmicKrisp provider
+runtime nixpkgs supplies the cross toolchain. Stock ARM64 application binaries use that same runtime pin, keeping their
+glibc ABI aligned with the custom Linux libraries. Native Darwin dependencies
+use the main nixpkgs pin. The native KosmicKrisp provider
 keeps the existing authorized import patch; this does not patch Linux Mesa.
 
 The headless app runs both the shared-page fixture and an embedded render-node

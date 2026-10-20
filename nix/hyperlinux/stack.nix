@@ -10,9 +10,9 @@ let
     crossSystem = "aarch64-linux";
     config.allowUnfree = true;
   };
-  # Stock application binaries can be substituted from the ARM64 Linux cache.
-  # The custom ICD/Mesa still cross-build on vmhost through `guest` above.
-  guestApps = import nativeSource { system = "aarch64-linux"; config.allowUnfree = true; };
+  # Use the same target libc source/version for stock apps and custom libraries.
+  # Both stock ARM64 Firefox and glibc are available from the binary cache.
+  guestApps = import inputs.nixpkgs { system = "aarch64-linux"; config.allowUnfree = true; };
   lib = pkgs.lib;
   project = lib.fileset.toSource {
     root = ../..;
