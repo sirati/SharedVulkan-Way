@@ -412,7 +412,7 @@
  
  #ifdef HAVE_SYS_SELECT_H
  #include <sys/select.h>
-@@ -204,8 +208,34 @@
+@@ -204,8 +208,36 @@
                      if (r == 0 || (r < 0 && errno == ENOTSOCK))
                          ioctl(f->fd, FIONREAD, &r);
  
@@ -422,9 +422,9 @@
 +                        struct stat st;
 +                        if (fstat(f->fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
 +                            /* Darwin FIFO FIONREAD can return zero with data
-+                             * buffered. Confirm bytes with a non-consuming
-+                             * read filter before retaining the presumed HUP.
-+                             * Leave the existing socket workaround unchanged. */
++                             * buffered. Query non-consuming read readiness;
++                             * only an explicit EOF event indicates hangup.
++                             * A concurrent reader may have drained the FIFO. */
 +                            int kq = kqueue();
 +                            if (kq < 0)
 +                                f->revents |= POLLERR;
@@ -438,10 +438,12 @@
 +                                pa_close(kq);
 +                                if (n < 0 || (n > 0 && (event.flags & EV_ERROR)))
 +                                    f->revents |= POLLERR;
-+                                else if (n > 0 && event.data > 0)
-+                                    f->revents |= POLLIN;
-+                                else
-+                                    f->revents |= POLLHUP;
++                                else if (n > 0) {
++                                    if (event.data > 0)
++                                        f->revents |= POLLIN;
++                                    if (event.flags & EV_EOF)
++                                        f->revents |= POLLHUP;
++                                }
 +                            }
 +                        } else
 +                            f->revents |= POLLHUP;
