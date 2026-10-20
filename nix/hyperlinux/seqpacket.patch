@@ -827,7 +827,7 @@
 +        if (out->host_fd < 0) {
 +            int saved = errno; hl_open_file_t *held = out->of;
 +            memset(out, 0, sizeof(*out)); pthread_mutex_unlock(&fd_lock);
-+            if (held) hl_open_file_release(held); errno = saved; return -1;
++            if (held) { hl_open_file_release(held); } errno = saved; return -1;
 +        }
 +        out->owns_host_fd = 1;
 +    }
