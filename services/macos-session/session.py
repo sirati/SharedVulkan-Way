@@ -67,51 +67,75 @@ async def ready(root):
 
 
 async def wait_for_startup(check, children, deadline):
-    """Wait within one monotonic startup budget, including a blocked probe."""
+    """Race readiness against child exit within one monotonic budget."""
+    probe = None
+    exits = []
     try:
+        if any(child.returncode is not None for child in children):
+            raise RuntimeError('Native service exited before readiness')
+        exits = [asyncio.create_task(child.wait()) for child in children]
         async with asyncio.timeout_at(deadline):
             while True:
-                if any(child.returncode is not None for child in children):
+                probe = asyncio.create_task(check())
+                done, _ = await asyncio.wait([probe, *exits], return_when=asyncio.FIRST_COMPLETED)
+                if any(task in done for task in exits) or any(child.returncode is not None for child in children):
                     raise RuntimeError('Native service exited before readiness')
-                if await check():
+                if await probe:
                     return
+                probe = None
                 await asyncio.sleep(0.05)
     except TimeoutError as error:
         raise RuntimeError('Native services did not become ready within the startup deadline') from error
+    finally:
+        tasks = exits + ([probe] if probe is not None else [])
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def launchctl(*arguments):
-    process = await asyncio.create_subprocess_exec('/bin/launchctl', *arguments,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+async def launchctl(*arguments, deadline):
+    spawning = asyncio.create_task(asyncio.create_subprocess_exec('/bin/launchctl', *arguments,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL))
+    process = None
     try:
-        return await asyncio.wait_for(process.wait(), 5)
-    except asyncio.TimeoutError:
-        process.terminate()
-        await process.wait()
-        raise SystemExit('launchctl did not respond')
+        async with asyncio.timeout_at(deadline):
+            process = await asyncio.shield(spawning)
+            return await process.wait()
+    finally:
+        # A cancelled spawn may already own a child. Reap that specific child;
+        # never terminate the service registered with launchd.
+        if process is None:
+            process = await spawning
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
 
 
 async def ensure():
     if sys.platform != 'darwin':
         raise SystemExit('Native macOS services only')
     root = runtime_directory()
-    try:
-        if await asyncio.wait_for(ready(root), 2):
-            print(root)
-            return
-    except TimeoutError:
-        pass
-    domain = f'gui/{os.getuid()}'
-    service = domain + '/org.waycompose.session-services'
-    if await launchctl('print', service) != 0:
-        if await launchctl('bootstrap', domain, os.environ['WC_SESSION_PLIST']) != 0:
-            # Concurrent application launch may already have registered it.
-            if await launchctl('print', service) != 0:
-                raise SystemExit('Cannot register native user services with launchd')
-    await launchctl('kickstart', service)
     deadline = asyncio.get_running_loop().time() + STARTUP_TIMEOUT
-    await wait_for_startup(lambda: ready(root), [], deadline)
-    print(root)
+    try:
+        async with asyncio.timeout_at(deadline):
+            try:
+                if await asyncio.wait_for(ready(root), 2):
+                    print(root)
+                    return
+            except TimeoutError:
+                pass
+            domain = f'gui/{os.getuid()}'
+            service = domain + '/org.waycompose.session-services'
+            if await launchctl('print', service, deadline=deadline) != 0:
+                if await launchctl('bootstrap', domain, os.environ['WC_SESSION_PLIST'], deadline=deadline) != 0:
+                    # Concurrent application launch may already have registered it.
+                    if await launchctl('print', service, deadline=deadline) != 0:
+                        raise SystemExit('Cannot register native user services with launchd')
+            await launchctl('kickstart', service, deadline=deadline)
+            await wait_for_startup(lambda: ready(root), [], deadline)
+            print(root)
+    except TimeoutError as error:
+        raise SystemExit('Native services did not become ready within the startup deadline') from error
 
 
 async def main():
@@ -165,8 +189,11 @@ load-module module-coreaudio-detect
             return (root / 'bus').exists() and (root / 'pulse/native').exists()
         await wait_for_startup(sockets_ready, children, deadline)
         children.append(await asyncio.create_subprocess_exec(sys.executable, os.environ['WC_PORTAL'], env=env))
-        async with asyncio.timeout_at(deadline):
+        async def connect_bus():
+            nonlocal bus
             bus = await MessageBus(bus_address=env['DBUS_SESSION_BUS_ADDRESS']).connect()
+            return True
+        await wait_for_startup(connect_bus, children, deadline)
         async def portal_ready():
             for name in ('org.freedesktop.portal.Desktop', 'org.freedesktop.impl.portal.desktop.waycompose'):
                 reply = await bus.call(Message(destination='org.freedesktop.DBus', path='/org/freedesktop/DBus',
