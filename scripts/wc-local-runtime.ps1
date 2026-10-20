@@ -34,10 +34,10 @@ function Save-Owned($o){
  $o.out.Result | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $e ($o.label+'.stdout'))
  $o.err.Result | Set-Content -Encoding UTF8 -LiteralPath (Join-Path $e ($o.label+'.stderr'))
 }
-function Wait-Owned($o,[int]$seconds){
+function Wait-Owned($o,[int]$seconds,[int]$expected=0){
  if(-not $o.p.WaitForExit($seconds*1000)){throw ($o.label+' timed out')}
  Save-Owned $o
- if($null -eq $o.p.ExitCode -or $o.p.ExitCode -ne 0){throw ($o.label+' failed: '+$o.p.ExitCode)}
+ if($null -eq $o.p.ExitCode -or $o.p.ExitCode -ne $expected){throw ($o.label+' failed: '+$o.p.ExitCode+' expected: '+$expected)}
 }
 function Set-State([string]$kind,[bool]$cygwin){
  foreach($part in @('home','config','data','state','cache','runtime','local')) {New-Item -ItemType Directory -Force -Path (Join-Path $Root "state\$kind\$part")|Out-Null}
@@ -114,11 +114,14 @@ foreach($kind in @('mingw','cygwin')){
     [OwnedLocalWindow]::Close($hwnd,[uint32]$serverOwned.p.Id)
    }
    Wait-Owned $clientOwned 15
-   Wait-Owned $serverOwned 15
+   if($mode -eq 'info'){Wait-Owned $serverOwned 15 4}else{Wait-Owned $serverOwned 15}
    $serverText=Get-Content -Raw $log
    if($mode -eq 'info'){
     $text=Get-Content -Raw (Join-Path $e "$kind-$mode-client.stdout")
     if($text -notmatch 'wl_compositor' -or $text -notmatch 'wl_shm'){throw 'upstream registry enumeration absent'}
+    if($serverText -notmatch '--once and the last client has gone; 0 toplevel\(s\), 0 frame\(s\) presented' -or
+       $serverText -notmatch 'no xdg_toplevel was ever created' -or
+       $serverText -notmatch '0 still held, 0 still alive, 0 client'){throw 'registry-only compositor exit lacked normal empty-session teardown'}
    }else{
     $text=Get-Content -Raw (Join-Path $e "$kind-$mode-client.stderr")
     if($text -notmatch 'simple-shm exiting'){throw 'unchanged application did not close normally'}
