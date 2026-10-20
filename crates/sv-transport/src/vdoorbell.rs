@@ -514,6 +514,18 @@ pub fn attach_host_reconnecting<T: BellTarget + ?Sized + 'static>(
     Ok((d, ok))
 }
 
+/// [`attach_host_reconnecting`] over [`connect_reconnecting_with`].
+#[cfg(unix)]
+pub fn attach_reconnecting_with<T: BellTarget + ?Sized + 'static>(
+    path: &str,
+    connect: impl Fn() -> std::io::Result<PortHandle> + Send + 'static,
+    target: Arc<T>,
+) -> std::io::Result<(Doorman, bool)> {
+    let (d, ok, wake) = connect_reconnecting_with(path, connect, target)?;
+    crate::park::install_cross_wake(Some(wake as Arc<dyn CrossWake>));
+    Ok((d, ok))
+}
+
 /// [`attach_host_reconnecting`] without installing the writer: the caller
 /// gets the wake to install or poke itself.
 #[cfg(unix)]
@@ -521,9 +533,22 @@ pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
     path: &str,
     target: Arc<T>,
 ) -> std::io::Result<(Doorman, bool, Arc<PortWake<SwapWriter>>)> {
+    let p = path.to_string();
+    connect_reconnecting_with(path, move || PortHandle::host_socket(&p), target)
+}
+
+/// [`connect_host_reconnecting`] with the connection made by `connect` rather
+/// than by `connect(2)` on a path: an ICD in a sandbox reaches the hub through
+/// the render node (waycompose-design.md §112). `path` is for the log.
+#[cfg(unix)]
+pub fn connect_reconnecting_with<T: BellTarget + ?Sized + 'static>(
+    path: &str,
+    connect: impl Fn() -> std::io::Result<PortHandle> + Send + 'static,
+    target: Arc<T>,
+) -> std::io::Result<(Doorman, bool, Arc<PortWake<SwapWriter>>)> {
     let writer = SwapWriter::default();
     let wake = Arc::new(PortWake::new(writer.clone()));
-    let first = PortHandle::host_socket(path).ok();
+    let first = connect().ok();
     let connected = first.is_some();
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicU64::new(0));
@@ -541,7 +566,7 @@ pub fn connect_host_reconnecting<T: BellTarget + ?Sized + 'static>(
                 }
                 let port = match next.take() {
                     Some(p) => p,
-                    None => match PortHandle::host_socket(&path) {
+                    None => match connect() {
                         Ok(p) => {
                             reconnects += 1;
                             eprintln!("[doorbell] reconnected to {path} (reconnect {reconnects})");

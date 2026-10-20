@@ -17,6 +17,10 @@ wc-handle = { workspace = true }
 # `brokered`: the hook through which a doorbell spec `broker:NAME` connects (§111.10).
 sv-transport = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Sandbox entry through the render node, with normal broker uid policy.
+sv-drm = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

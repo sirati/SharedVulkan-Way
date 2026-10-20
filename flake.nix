@@ -111,6 +111,8 @@
       devShells.default = pkgs.mkShell (kache.lib.withKache {inherit (pkgs) kache;} {
         packages = with pkgs; [
           rustToolchain
+          # Local cold-path and doorbell stand-ins used by the GPU e2e tests.
+          socat
 
           # --- Compilation cache ---------------------------------------------
           # kache caches rustc outputs by *content*, so every worktree keeps

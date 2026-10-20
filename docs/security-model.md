@@ -1492,6 +1492,42 @@ over). The compositor opens a section by the name the proxy passes, read and
 write for GDI's `CreateDIBSection`, and only reads it. The fence record
 (§104.11) is a page per GPU session that the compositor and other sessions only
 read.
+
+**The node's relay** (added with `waycompose-design.md` §112, branch
+`sf-relay`). With `--services PATH`, `sv-drm serve` also answers
+`DRM_IOCTL_SVDRM_CONNECT`: it moves one end of a socketpair from the caller to
+a service registered under the name the caller gives. The rules are plain OS
+identity, no secrets:
+
+* Any user may register on the control socket (0666), but `register NAME`
+  serves only the registrant's own `SO_PEERCRED` uid. `register NAME ANY-UID`
+  serves every uid and is refused unless the registrant is uid 0 or a system
+  uid (< 1000); such a service checks `SO_PEERCRED` itself. A live
+  `(NAME, scope)` cannot be registered twice, so a user cannot take over
+  another registration of the same scope while it is up; a registration ends
+  with its connection.
+* A caller reaches `(NAME, its uid)` or `(NAME, ANY-UID)`, nothing else:
+  `ENOENT` when nobody registered NAME, `EACCES` when only other uids did. The
+  check comes before `sv-drm` touches the caller's descriptors.
+* `sv-drm` takes the descriptor with `pidfd_getfd` (root, so Yama's scope 1
+  and 2 allow it), passes it only if it is an `AF_UNIX` stream or seqpacket
+  socket whose peer uid is the caller's, and never opens or connects anything
+  for a caller. The service sees the client's own `SO_PEERCRED` on it, and
+  `sv-hostd` and the bell hub check that uid again against their own.
+* The embedded system broker registers `waycompose-broker ANY-UID` when
+  the render-node services socket exists. It compares the forwarded uid and
+  pid with the socket's kernel credentials before handing it to its normal
+  accept path. The broker then applies its existing mapped-user policy to
+  hub connections and region access. A sandboxed client gains no cross-user
+  direct hub grant and no bypass of the broker's user mapping.
+* `conn UID PID` is sent without waiting: a service that stops reading costs
+  its clients `EAGAIN`, not the node.
+
+What a sandboxed client gains is exactly what the same user's unsandboxed
+process has: its own `sv-hostd` session and doorbell hub. Over that connection
+it receives descriptors for the objects it would otherwise open by name (the
+GPU pool's regions, which that user can already open), not names, since the
+sandbox forbids the opens.
 ### R40 — A macOS guest starts its sessions through a record in its own RAM
 Added 2026-10-19 with `waycompose-design.md` §103.15. On the macOS VM's host
 (role (a)), `wc-arena-host mac-sessiond` runs as the user in a user unit. It
