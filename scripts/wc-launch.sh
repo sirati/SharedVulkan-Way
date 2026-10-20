@@ -710,9 +710,28 @@ install_staged() {
   fi
 }
 
+# GPU Firefox is stock only with the native allocation library and DRM node.
+# Fail before ending an existing session or changing either installation.
+gpu_prerequisite_check() {
+  [ "$GPU_SESSIONS" -gt 0 ] || return 0
+  [ "$GPU_ENV_MODE" = write ] || { echo "error: GPU deployment requires WC_LAUNCH_GPU_ENV=write"; return 1; }
+  [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires the matched WC_LAUNCH_GPU_GTK store output"; return 1; }
+  [[ "$KOPPER_MESA" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_GPU_MESA"; return 1; }
+  [[ "$DMABUF_NODE" =~ ^/dev/dri/renderD[0-9]+$ ]] && [[ "$GPU_PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_DMABUF_NODE and WC_LAUNCH_GPU_PCI"; return 1; }
+  local expected actual
+  expected=$(sha256sum "$ROOT/crates/wc-proxy/protocols/wc-native-shm-v1.xml" "$ROOT/crates/wc-native-shm/include/wc-native-shm.h" | cut -d' ' -f1)
+  actual=$(h "test -c $DMABUF_NODE && test -f $GPU_GTK/lib/libgdk-3.so && test -f $KOPPER_MESA/lib/dri/zink_drv_video.so && cat $GPU_GTK/nix-support/wc-native-shm-abi") \
+    || { echo "error: GPU render-node, Mesa or shipped GTK prerequisite is unavailable on $HOST"; return 1; }
+  [ "$actual" = "$expected" ] || { echo "error: shipped GTK protocol/C ABI differs from this proxy build"; return 1; }
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
+  gpu_prerequisite_check || exit 2
   host_layout_check
   deploy_scope_check
   # A session from the last run holds both halves' binaries open. Ended through

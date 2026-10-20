@@ -965,17 +965,8 @@ start_app() {
   # knows whether those paths exist; a guest that asked for acceleration from a
   # host without it would get a Firefox that cannot start its renderer.
   #
-  # **And the profile gets `gfx.webrender.all` with it, never without it.**
-  # Firefox decides software or hardware WebRender from one fact: whether Mesa's
-  # EGL device says `EGL_MESA_device_software`. With no DRM node on this host
-  # Mesa has only its software device to give, so Firefox files Zink-on-a-GPU
-  # as `mesa/software-unknown` and blocklists hardware WebRender
-  # (FEATURE_FAILURE_SOFTWARE_GL). The pref overrides exactly that entry. Set
-  # without the GPU it would put hardware WebRender on llvmpipe, which is slower
-  # than the software WebRender Firefox would otherwise choose, so the two go
-  # together or not at all.
-  #
-  # §94: and only for an application whose definition does not say `gpu = off`.
+  # Stock Firefox keeps its graphics and decoder defaults. A configured GPU
+  # Firefox start requires the render node and shipped native GTK allocation.
   GPUENV=()
   if [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1058,6 +1049,25 @@ start_app() {
       echo "wc-session: NO RENDER NODE for $ID -- $DMABUF_NODE is there and sv-drm is not ($BASE/bin/sv-drm); frames are copied" | tee -a "$D/app.log" >&2
     fi
   fi
+  if [ -n "$PROFILE" ] && [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
+    [ -n "$GPU_ON" ] && [ ${#NSWRAP[@]} -gt 0 ] \
+      || die "GPU Firefox requires its session GPU and sv-drm render-node namespace"
+    [[ "${PCI:-}" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+      || die "GPU Firefox requires the guest GPU PCI identity"
+    NATIVE=0; STRICT=0; GTK_LIB=""
+    for line in "${GPUENV[@]}"; do
+      case "$line" in
+        WC_NATIVE_SHM=1) NATIVE=1 ;;
+        WC_NATIVE_SHM_STRICT=1) STRICT=1 ;;
+        LD_LIBRARY_PATH=*) GTK_LIB=${line#LD_LIBRARY_PATH=}; GTK_LIB=${GTK_LIB%%:*} ;;
+      esac
+    done
+    EXPECT_GTK=$(readlink -f "$BASE/bin/gpu-gtk" 2>/dev/null)
+    [ "$NATIVE" = 1 ] && [ "$STRICT" = 1 ] && [ -n "$EXPECT_GTK" ] \
+      && [ "$GTK_LIB" = "$EXPECT_GTK/lib" ] && [ -f "$GTK_LIB/libgdk-3.so" ] \
+      && [ -s "$EXPECT_GTK/nix-support/wc-native-shm-abi" ] \
+      || die "GPU Firefox requires the deployment's matched shipped GTK and strict original allocation"
+  fi
   # What `proxy` managed for this session's sound (§86). Read once, here.
   AUDIO=$(cat "$D/audio.state" 2>/dev/null || echo "none: no audio.state (a proxy from before §86)")
   case "$AUDIO" in
@@ -1082,13 +1092,6 @@ start_app() {
       # deployment ends Firefox, not of any one session.
       printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
         >> "$PROFILE/user.js"
-      # Only without the render node: a copying GPU path whose EGL device is
-      # the software one, which Firefox would otherwise refuse (§0.28). With
-      # the node Firefox decides for itself (§112).
-      if [ ${#GPUENV[@]} -gt 0 ] && [ ${#NSWRAP[@]} -eq 0 ]; then
-        printf '\n// Added by wc-session: this host forwards a GPU (%s).\nuser_pref("gfx.webrender.all", true);\n' "$BASE/gpu.env" \
-          >> "$PROFILE/user.js"
-      fi
       # AUDIO (§86): no server means Firefox's own null context, never a
       # Firefox that waits on an audio process for ever.
       case "$AUDIO" in

@@ -6,6 +6,13 @@ gtk3.overrideAttrs (old: {
   pname = "gtk3-native-shm";
   patches = (old.patches or []) ++ [ ./gtk-native-shm.patch ];
   buildInputs = (old.buildInputs or []) ++ [ wcNativeShm ];
+  postInstall = (old.postInstall or "") + ''
+    mkdir -p $out/nix-support
+    cat >$out/nix-support/wc-native-shm-abi <<'EOF'
+${builtins.hashFile "sha256" ../crates/wc-proxy/protocols/wc-native-shm-v1.xml}
+${builtins.hashFile "sha256" ../crates/wc-native-shm/include/wc-native-shm.h}
+EOF
+  '';
   postPatch = (old.postPatch or "") + ''
     cp ${./gtk-native-shm-helper.c} gdk/wayland/gtk-native-shm-helper.c
     cp ${./gtk-native-shm-helper.h} gdk/wayland/gtk-native-shm-helper.h
