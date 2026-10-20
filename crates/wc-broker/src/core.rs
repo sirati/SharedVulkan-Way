@@ -27,7 +27,8 @@
 //!    §108.4). It ends with `close`, with the connection, or with the process.
 //!    A retiring region whose last lease has ended is *drained*, which is what
 //!    lets its substrate answer `UNMAPPED`.
-//! 5. **A pool can be released as a whole** (§111.9, the macOS keeper). Where
+//! 5. **Exits are told** to the user's subscribers and admins (§111.3).
+//! 6. **A pool can be released as a whole** (§111.9, the macOS keeper). Where
 //!    one region of a pool carries the host's word for the whole session (the
 //!    boot page of a macOS session's ring window), the platform's probe of
 //!    that region releases every orphan of the pool at once, and ends the
@@ -135,7 +136,7 @@ pub enum Notice {
     /// Every lease on retiring region `id` of epoch `epoch` has ended.
     Drained(ObjId, u64),
     /// End process `pid`: it tied itself to a pool that has been released
-    /// (rule 5). The platform half ends it only while it still watches it.
+    /// (rule 6). The platform half ends it only while it still watches it.
     End(Pid),
 }
 
@@ -530,7 +531,7 @@ impl Core {
         }
     }
 
-    /// `tie POOL` (rule 5): this connection's process ends when its user's
+    /// `tie POOL` (rule 6): this connection's process ends when its user's
     /// pool `pool` is released. A process can only ask that of itself.
     pub fn tie(&mut self, conn: ConnId, pool: &str) -> Result<(), Refusal> {
         let Some(c) = self.conns.get(&conn) else { return refuse("not connected") };
@@ -544,7 +545,7 @@ impl Core {
     }
 
     /// The probe found the word orphan `id` carries for its whole pool set
-    /// (rule 5): every orphan of that user's pool goes, and the processes
+    /// (rule 6): every orphan of that user's pool goes, and the processes
     /// tied to it are ended. A region whose owner lives is not a probe's.
     pub fn pool_released(&mut self, id: ObjId) {
         let Some(r) = self.regions.get(&id) else { return };
@@ -739,7 +740,7 @@ mod tests {
         assert_eq!(c.stats().region_bytes, 0);
     }
 
-    /// Rule 5, the macOS keeper folded into the broker (§111.9): the boot
+    /// Rule 6, the macOS keeper folded into the broker (§111.9): the boot
     /// region's probe releases its whole pool, never another pool or another
     /// user's, never a live owner's, and ends the processes tied to it.
     #[test]

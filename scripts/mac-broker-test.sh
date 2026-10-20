@@ -90,7 +90,7 @@ phase_kill() {
   local before; before=$(panics)
   : >"$out"
   for i in $(seq 1 "$n"); do
-    vm "pkill -f 'Linux/Console.app' 2>/dev/null; true"; sleep 2
+    # The previous round's faces quit when its main process was killed (§103.13).
     vm "rm -f ~/Library/Logs/waycompose/main.log; open ~/Applications/Linux/Console.app"
     local sid=""
     for _ in $(seq 1 200); do
@@ -169,7 +169,8 @@ phase_users() {
     echo "== user 1 opens user 2's regions"
     local ids2; ids2=$(broker_log | grep "of uid:" | sed -n "s/.*region \([0-9]*\) of pool \([^:]*\): .* of uid:\([0-9]*\)/\1 \3/p" | awk -v me="$(vm 'id -u')" '$2!=me{print $1}' | tr '\n' ' ')
     for id in $ids2; do vm "\"$SYS/bin/wc-broker\" ctl 'open $id'"; done
-    vm "sudo -n pkill -u $U2 -f 'wc-launch --main'; kill ${sid#wcm-}"; sleep 8
+    local sid2; sid2=$(vm "sudo -n -u $U2 sed -n 's/.*main process: session \(wcm-[0-9]*\).*/\1/p' \"/Users/$U2/Library/Logs/waycompose/main.log\" | tail -1")
+    [ -n "$sid2" ] && vm "sudo -n kill ${sid2#wcm-}"; vm "kill ${sid#wcm-}"; sleep 8
     vm "sudo -n sysadminctl -deleteUser $U2 >/dev/null 2>&1; id $U2 2>&1 | head -1"
   } 2>&1 | tee "$out"
 }

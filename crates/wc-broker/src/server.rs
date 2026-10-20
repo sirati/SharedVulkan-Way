@@ -54,7 +54,7 @@ pub trait Platform: Send + Sync + 'static {
         false
     }
     /// Whether region `obj`, an orphan, carries its whole pool's release and
-    /// says it is set (core rule 5: the macOS session's boot page, §111.9).
+    /// says it is set (core rule 6: the macOS session's boot page, §111.9).
     /// Asked before [`Platform::released`]. Platforms without one say no.
     fn released_pool(&self, _obj: &Self::Object) -> bool {
         false

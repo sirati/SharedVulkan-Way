@@ -325,7 +325,10 @@ fn spawn_keeper_helper(sock: &str, role: &str) -> (std::process::Child, String) 
             return (c, l.to_string());
         }
         let n = out.read(&mut b).unwrap();
-        assert!(n > 0, "the helper ended early: {text}");
+        if n == 0 {
+            let _ = c.wait();
+            panic!("the helper ended early: {text}");
+        }
         got.extend_from_slice(&b[..n]);
     }
 }
