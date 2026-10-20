@@ -46,6 +46,12 @@ chmod 0600 "$T/var/lib/waycompose/key-trust/wct2/session.key"
 out=$(keyop key-prepare unused wct2 2>&1); rc=$?
 [ "$rc" != 0 ] && ok "unknown preseed with protected metadata is refused" || bad "unknown preseed adopted"
 [ ! -e "$T/var/lib/waycompose/key-trust/wct2/generated-here" ] && ok "unknown key gets no generation provenance" || bad "unknown key relabelled"
+rm -f "$T/var/lib/waycompose/key-trust/wct2/session.key"
+printf '%s\n' root-generated-candidate-v1 >"$T/var/lib/waycompose/key-trust/wct2/generated-here"
+printf '%s\n' root-generated-broker-confirmed-v1 >"$T/var/lib/waycompose/key-trust/wct2/broker-confirmed"
+chmod 0600 "$T/var/lib/waycompose/key-trust/wct2/generated-here" "$T/var/lib/waycompose/key-trust/wct2/broker-confirmed"
+out=$(keyop key-prepare unused wct2 2>&1); rc=$?
+[ "$rc" != 0 ] && [ ! -e "$T/var/lib/waycompose/key-trust/wct2/session.key" ] && ok "lost candidate cannot inherit a stale broker confirmation" || bad "lost candidate silently regenerated"
 rm -rf "$T/var/lib/waycompose/key-trust/wct2"
 
 S=$(stage wct1 "$(printf 'a%.0s' $(seq 64))")
