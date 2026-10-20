@@ -37211,7 +37211,7 @@ holder and adoption, and is not implemented.
   denial as process exit. It then reported the same pid before and after
   the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
   enforces an elapsed observation deadline, and validates a different live
-  replacement pid; a VM rerun is pending.
+  replacement pid; the corrected safety rerun is recorded below.
 * **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
   after): its `open` of user 1's regions, `find` of user 1's pool and
   `device wcbell` (held by user 1's main process) were refused by uid; it
@@ -37239,7 +37239,51 @@ holder and adoption, and is not implemented.
   run.
 * The harness's check that a user cannot open a port node itself used
   `head -c0`, which macOS rejects; the node modes above are the evidence.
-  Fixed for the next run.
+  Fixed before the safety rerun below.
+
+**Safety rerun, 3072 MiB VM, 2026-10-20 around 12:00-12:04.** Evidence is
+in `evidence/session-fixes/broker-mac/safe-rerun/`, outside git. The new broker
+was built after the no-timeout correction; no unsafe old baseline ran.
+
+* The corrected direct port-open probe and root-key read were refused.
+  The LaunchDaemon was root's, the ports 0600, the socket 0666 and the key
+  directory/key 0700/0600.
+* Five recorded main-process SIGKILL cycles each ended with host teardown,
+  the host release word and pool reclamation. Recursive panic-file counts
+  were four before and four after, and guest uptime continued throughout.
+  The harness used default foot settings and throwaway Linux HOME/XDG
+  state; Console ran on a private D-Bus session.
+* The root daemon held two orphan regions when SIGTERM arrived. A successful
+  root process-table snapshot observed its exit after 5210 ms, including SSH
+  observation overhead, and launchd reported a different live pid, 581 to
+  1265. Its log showed host release followed by `every region released;
+  exiting`. This replaces the original run's invalid 0.70 s assertion.
+* The 2000 Wayland round trips measured mean 3.240 ms, p50 1.231 ms,
+  p99 12.646 ms and maximum 1470.707 ms. The runtime ctypes/libwayland
+  fixture includes Python call overhead. This **fails** the 0.2 ms target;
+  it proves neither acceptable latency nor broker overhead relative to the
+  old unsafe baseline. Concurrent second-user sessions and fresh GPU timing
+  remain unproved by this rerun.
+* The successful VM run peaked at 4,423,475,200 bytes including QEMU/cache;
+  an earlier cold-start attempt peaked at 5,089,390,592 bytes before tests.
+  These observations include reclaimable cache, not only configured RAM. Cleanup
+  restored guest support/apps, host files and original unit arguments,
+  removed the test daemon/key, cleanly stopped the VM and restored its
+  original 4096 MiB configuration. The peer's `work` VM was untouched.
+
+**Restart ownership.** The restored older `mac-sessiond` exposed a separate
+isolation bug: startup adopted every active `wc-launch-*` unit, including
+unrelated `wcma-*`, `wcmb-*` and `wcmc-*` harness sessions with no known boot
+page. It then ran `down` for them. Restart state is now scoped by configured
+QMP path, VM hint, session script and key policy; each checkpoint carries that
+full owner description. Recovery requires a matching boot page in that VM
+and its configured MAC policy. A directory hash only names this state and is
+not trusted as authorization. Every managed session has a boot record, and
+ownership is checked again before teardown. Unowned/legacy global state is
+left untouched; failed host release retains the checkpoint for retry.
+Before upgrading the old service with live sessions, drain those sessions
+through their actual owner. Old global checkpoints cannot prove installation
+ownership and are not automatically migrated.
 
 #### 111.9.5 Limits
 
