@@ -182,7 +182,7 @@ impl NativeVideo {
         profile: Profile,
         info: &vk::VideoSessionCreateInfoKHR<'_>,
     ) -> VideoResult<u64> {
-        self.capabilities(profile)?;
+        let _ = self.capabilities(profile)?;
         if !info.flags.is_empty()
             || info.picture_format != FORMAT
             || info.reference_picture_format != FORMAT
