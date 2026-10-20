@@ -8,7 +8,7 @@ assert lib.assertMsg (hlCross.stdenv.buildPlatform.isLinux &&
 hlCross.overrideAttrs (old: {
   pname = "hl-waycompose";
   src = import ./source.nix;
-  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ];
+  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ];
   postPatch = (old.postPatch or "") + ''
     cp ${./hl_shared.c} src/hl_shared.c
     cp ${./hl_shared.h} src/hl_shared.h
@@ -18,6 +18,8 @@ hlCross.overrideAttrs (old: {
     cp ${./hl_drm.h} src/hl_drm.h
     cp ${./hl_socket.c} src/hl_socket.c
     cp ${./hl_socket.h} src/hl_socket.h
+      cp ${./hl_seqpacket.c} src/hl_seqpacket.c
+      cp ${./hl_seqpacket.h} src/hl_seqpacket.h
     cp ${./hl_script.h} src/hl_script.h
       cp ${./hl_copy.c} src/hl_copy.c
       cp ${./hl_copy.h} src/hl_copy.h

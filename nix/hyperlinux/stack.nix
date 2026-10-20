@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ];
+    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
@@ -80,6 +80,8 @@ let
       cp ${./hl_drm.h} src/hl_drm.h
       cp ${./hl_socket.c} src/hl_socket.c
       cp ${./hl_socket.h} src/hl_socket.h
+      cp ${./hl_seqpacket.c} src/hl_seqpacket.c
+      cp ${./hl_seqpacket.h} src/hl_seqpacket.h
       cp ${./hl_script.h} src/hl_script.h
       cp ${./hl_copy.c} src/hl_copy.c
       cp ${./hl_copy.h} src/hl_copy.h
@@ -171,6 +173,10 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  seqpacketClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-seqpacket-client"; source = ./seqpacket-client.c;
+    linkFlags = [ "-pthread" ];
+  };
   externalFaultClient = guest.callPackage ./client-probe.nix {
     programName = "hl-external-fault-client"; source = ./external-fault-client.c;
   };
@@ -225,6 +231,7 @@ let
       export XDG_STATE_HOME="$fixture/state" XDG_RUNTIME_DIR="$fixture/runtime" HL_NATIVE_FIXTURE="$fixture"
       "$HL_RUNNER" ${renderClient}/bin/hl-render-client
       "$HL_RUNNER" ${socketClient}/bin/hl-socket-client
+      "$HL_RUNNER" ${seqpacketClient}/bin/hl-seqpacket-client
       ${nativeFaultClients}/bin/hl-copy-fault-check
       ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
@@ -248,5 +255,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient probeRunner;
 }
