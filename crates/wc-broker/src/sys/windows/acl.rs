@@ -506,6 +506,7 @@ pub fn revert(state: &Path) -> Vec<String> {
     }
     if failed.is_empty() {
         let _ = std::fs::remove_file(state_file(state));
+        let _ = std::fs::remove_file(state.join("devices.secured"));
     } else if let Err(e) = write_state(state, &failed) {
         out.push(format!("could not save pending restoration: {e}"));
     }
