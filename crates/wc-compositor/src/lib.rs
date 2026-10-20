@@ -1832,9 +1832,22 @@ fn wayland_thread(
         }
     } else { None };
 
-    let listener = match socket {
-        Some(name) => ListeningSocket::bind(&name),
-        None => ListeningSocket::bind_auto("wayland", 1..32),
+    let private_name = socket.as_deref().unwrap_or("wayland-1");
+    #[cfg(windows)]
+    let private_path = match private_directory.as_ref()
+        .map(|directory| directory.socket_path(std::path::Path::new(private_name))).transpose()
+    {
+        Ok(path) => path,
+        Err(error) => { eprintln!("wc-compositor: private socket pathname: {error}"); state.quit(0); return 2; }
+    };
+    #[cfg(not(windows))]
+    let private_path: Option<std::path::PathBuf> = None;
+    let listener = match private_path {
+        Some(path) => ListeningSocket::bind_absolute(path),
+        None => match socket.as_deref() {
+            Some(name) => ListeningSocket::bind(name),
+            None => ListeningSocket::bind_auto("wayland", 1..32),
+        },
     };
     let listener = match listener {
         Ok(l) => l,
@@ -1848,8 +1861,7 @@ fn wayland_thread(
     #[cfg(windows)]
     let _private_socket = match private_directory {
         Some(directory) => {
-            let Some(name) = listener.socket_name() else { state.quit(0); return 2; };
-            match directory.seal(std::path::Path::new(name)) {
+            match directory.seal(std::path::Path::new(private_name)) {
                 Ok(pin) => Some(pin),
                 Err(error) => { eprintln!("wc-compositor: private local socket: {error}"); state.quit(0); return 2; }
             }
@@ -1877,7 +1889,7 @@ fn wayland_thread(
         listener
             .socket_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
+            .unwrap_or_else(|| private_name.to_owned())
     );
     let _ = std::io::stdout().flush();
 

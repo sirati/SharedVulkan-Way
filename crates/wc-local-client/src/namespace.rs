@@ -453,13 +453,16 @@ impl DirectoryPin {
                 .ok_or_else(|| deny("missing private runtime"))?,
         )
     }
-    pub fn seal(self, name: &Path) -> io::Result<SocketPin> {
+    pub fn socket_path(&self, name: &Path) -> io::Result<PathBuf> {
         if name.components().count() != 1
             || !matches!(name.components().next(), Some(Component::Normal(_)))
         {
             return Err(deny("private socket name must be one component"));
         }
-        let path = normalized(&self.path.join(name))?;
+        normalized(&self.path.join(name))
+    }
+    pub fn seal(self, name: &Path) -> io::Result<SocketPin> {
+        let path = self.socket_path(name)?;
         let file = open(&path, true, false)?;
         socket_type(&file)?;
         let sd = descriptor(&self.user, false)?;
