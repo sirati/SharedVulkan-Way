@@ -87,7 +87,9 @@ cleanup() {
   [ -n "${WINEPREFIX:-}" ] && WINEPREFIX="$WINEPREFIX" wineserver -k 2>/dev/null
   [ -n "$MC_POOL_FILE" ] && rm -f "$MC_POOL_FILE"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # A display of our own. A display number is a shared identity on this machine
 # (firefox-accel.md, "The Wayland WSI", §6), and **`-displayfd` is not enough
