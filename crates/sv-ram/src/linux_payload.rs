@@ -407,7 +407,7 @@ impl LocalProjection {
 mod tests {
     use super::*;
     use wc_broker::bar_registry::PhysicalBacking;
-    fn memfd(seals: i32) -> (File, BackingGeometry) {
+    pub(super) fn memfd(seals: i32) -> (File, BackingGeometry) {
         let name = std::ffi::CString::new("protected-payload-fixture").unwrap();
         let fd = unsafe {
             libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC)
@@ -429,7 +429,7 @@ mod tests {
         };
         (file, geometry)
     }
-    fn stable() -> i32 {
+    pub(super) fn stable() -> i32 {
         libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL
     }
     #[test]
@@ -596,3 +596,5 @@ mod tests {
         );
     }
 }
+
+pub mod protected;
