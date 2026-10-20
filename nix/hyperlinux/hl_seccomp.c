@@ -31,7 +31,8 @@ static int ancestor(struct hl_seccomp_filter *old, struct hl_seccomp_filter *p) 
 typedef struct { thread_entry_t *self; struct hl_seccomp_filter *p; int64_t bad; int apply; } sync_ctx;
 static void sync_one(thread_entry_t *t, void *opaque) {
     sync_ctx *c = opaque;
-    if (t->seccomp_tgid != c->self->seccomp_tgid) return;
+    if (t->seccomp_tgid != c->self->seccomp_tgid || t->vm_exited ||
+        atomic_load(&t->seccomp_killed)) return;
     if (!c->apply) {
         if (!c->bad && !ancestor(t->seccomp_filter, c->self->seccomp_filter))
             c->bad = t->guest_tid;
@@ -87,6 +88,7 @@ static int64_t install(guest_t *g, uint64_t flags, uint64_t addr) {
     return result;
 }
 int64_t hl_seccomp_prctl(guest_t *g, uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    op=(uint32_t)op; /* prctl option is a Linux int */
     if (op == 22) { /* PR_SET_SECCOMP */
         if (a != 2) return -22;
         return install(g, 0, b);
@@ -102,6 +104,7 @@ int64_t hl_seccomp_prctl(guest_t *g, uint64_t op, uint64_t a, uint64_t b, uint64
     return r;
 }
 int64_t hl_seccomp_syscall(guest_t *g, uint64_t op, uint64_t flags, uint64_t arg) {
+    op=(uint32_t)op; flags=(uint32_t)flags; /* Linux unsigned int ABI */
     if (op == 1) return install(g, flags, arg);
     if (op == 2) { /* SECCOMP_GET_ACTION_AVAIL */
         uint32_t a;
