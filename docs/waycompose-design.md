@@ -35208,7 +35208,7 @@ device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
 and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
 device.
 
-**Measured**, on a local test VM (QEMU 10.2.2 as testhost, 3 GiB, 4 vCPUs,
+**Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
 a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
 driver), two local non-admin users u1 and u2 run through the task scheduler;
 evidence in `/mnt/datasets/builds/evidence/session-fixes/broker-win/`:
@@ -35250,7 +35250,7 @@ holder ended, keys kept).
 
 **What remains.** Running the compositor and the GPU process on the VM under
 the broker end to end (the probe exercises the same calls, not the products);
-the stamping hook's implementation (windows-guest-ram's); a testhost run
+the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
 (not touched here).
 
 ### 111.9 macOS
