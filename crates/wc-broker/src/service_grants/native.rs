@@ -343,6 +343,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         authority: Arc<dyn NativeProviderAuthority>,
         limits: NativeLimits,
     ) -> io::Result<()> {
+        if self.drained {
+            return Err(denied("cannot enroll exporter in drained context"));
+        }
         let mut provider = self
             .native_exports
             .lock()

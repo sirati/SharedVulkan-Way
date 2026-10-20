@@ -40,6 +40,20 @@ pub struct GrantCensus {
     binding: Binding,
     channel: Arc<()>,
 }
+/// Non-Clone evidence that this owner stopped permanently after every current
+/// tracked grant completed actual durable release. Unknown exclusions stay.
+/// The controller must retain the original guard, drop old lifecycles/context,
+/// reopen EXISTING registry history, issue a fresh epoch/mutual challenge and
+/// independently authenticate the provider. This token cannot reset any ID,
+/// enrollment, replay history or store in place and does not perform rollover.
+pub struct DrainedContext<S: DurableStore, B: OriginalBacking> {
+    context: Arc<ServiceContext<S, B>>,
+}
+impl<S: DurableStore, B: OriginalBacking> DrainedContext<S, B> {
+    pub fn historical_exclusions(&self) -> io::Result<Vec<(u64, u64)>> {
+        self.context.exclusions()
+    }
+}
 /// Both-service barrier satisfied. Still no durable release has occurred.
 pub struct GrantReleaseReady {
     census: GrantCensus,
@@ -87,6 +101,38 @@ impl<B: OriginalBacking> Record<B> {
     }
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
+    /// Terminal drain permit for deliberate fresh-context rollover. A failed
+    /// attempt retains the owner; no live/unknown current grant can be skipped.
+    pub fn prepare_context_drain(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+    ) -> io::Result<DrainedContext<S, B>> {
+        self.check_lifecycle(lifecycle)?;
+        if !self.records.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "current grants have not all durably released",
+            ));
+        }
+        if let Err(error) = self.context.backing().validate_live_source() {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Some(provider) = self
+            .native_exports
+            .lock()
+            .map_err(|_| denied("native provider poisoned"))?
+            .as_ref()
+            && let Err(error) = provider.validate_live()
+        {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.drained = true;
+        Ok(DrainedContext {
+            context: self.context.clone(),
+        })
+    }
     pub fn begin_grant_close(
         &mut self,
         lifecycle: &Lifecycle<S, B>,
@@ -212,6 +258,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         let record = self.records.get_mut(&grant.id).unwrap();
         if let Err(error) = record.guard.original().validate_live_source() {
             record.quarantined = true;
+            self.poisoned = true;
             return Err(error);
         }
         let provider = self
@@ -222,6 +269,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             && let Err(error) = provider.validate_live()
         {
             record.quarantined = true;
+            self.poisoned = true;
             return Err(error);
         }
         Ok(())

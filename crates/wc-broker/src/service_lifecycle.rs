@@ -60,6 +60,7 @@ impl GrantChannel {
     }
 }
 
+pub const MAX_CONTEXT_SESSIONS: usize = 256;
 struct ServiceState<S: DurableStore> {
     registry: Registry<S>,
     sessions: Vec<(String, u64)>,
@@ -232,6 +233,12 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
             if state.sessions.contains(&session) {
                 return Err(denied(
                     "session lifecycle already started; retain replay state",
+                ));
+            }
+            if state.sessions.len() >= MAX_CONTEXT_SESSIONS {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "session replay history requires fully drained fresh context",
                 ));
             }
             state.sessions.push(session);
@@ -708,6 +715,40 @@ mod tests {
         let mut input = DOMAIN.to_vec();
         input.extend_from_slice(&bytes);
         Frame::from_wire(&bytes, &hmac_sha256(key, &input)).unwrap()
+    }
+    #[test]
+    fn recurring_session_history_is_bounded_and_refusal_keeps_existing_epoch() {
+        let (life, store, _) = initial(Origin::Linux);
+        let before = store.data.lock().unwrap().clone();
+        for index in 1..MAX_CONTEXT_SESSIONS {
+            let mut next = binding();
+            next.session += index as u64;
+            Lifecycle::start_with_challenge(
+                life.context.clone(),
+                ("test-install", KEY),
+                next,
+                BootstrapRole::Responder,
+                [9; 32],
+            )
+            .unwrap();
+        }
+        let mut next = binding();
+        next.session += MAX_CONTEXT_SESSIONS as u64;
+        let error = Lifecycle::start_with_challenge(
+            life.context.clone(),
+            ("test-install", KEY),
+            next,
+            BootstrapRole::Responder,
+            [9; 32],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            life.context.state().unwrap().sessions.len(),
+            MAX_CONTEXT_SESSIONS
+        );
+        assert_eq!(*store.data.lock().unwrap(), before);
     }
     #[test]
     fn mutual_handshake_gates_persistence_and_stream_replay() {

@@ -6,8 +6,9 @@
 //! after actual trusted completion remains a production gate on this finite BAR.
 //! Suballocation authority belongs only to the binding's producer origin.
 //! Native producer/consumer registrations are distinct and never stand in for
-//! remote processes. Cross-VM transfers explicitly refuse until typed current-
-//! channel remote registration and resource mirror transitions are implemented.
+//! remote processes. Typed current-channel mirrors preserve exact remote
+//! lineages without inventing native registrations. Native retirement and
+//! whole-grant release require separate opaque trusted completion authority.
 use crate::User;
 use crate::bar_control::{Allocator, Consumer, Extent, GrantIdentity, Key, Process, Transfer};
 use crate::bar_registry::{DurableStore, PhysicalBacking};
@@ -25,7 +26,8 @@ use std::{
 
 mod closing;
 mod grant_closing;
-pub use grant_closing::{GrantCensus, GrantClosing, GrantReleaseReady};
+pub mod history;
+pub use grant_closing::{DrainedContext, GrantCensus, GrantClosing, GrantReleaseReady};
 pub mod native;
 pub use closing::ClosingReference;
 mod remote;
@@ -286,7 +288,10 @@ pub struct ProtectedGrants<S: DurableStore, B: OriginalBacking> {
     records: BTreeMap<u64, Record<B>>,
     geometry: BackingGeometry,
     resource_limits: ResourceLimits,
+    closed_grants: history::ClosedGrantHistory,
     next_close: u64,
+    drained: bool,
+    poisoned: bool,
     next_projection: u64,
     native_exports: Arc<std::sync::Mutex<Option<native::Provider>>>,
 }
@@ -380,19 +385,34 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             records: BTreeMap::new(),
             geometry,
             resource_limits: ResourceLimits::new(64, 128, 256, 1024)?,
+            closed_grants: history::ClosedGrantHistory::new(129)?,
             next_close: 1,
+            drained: false,
+            poisoned: false,
             next_projection: 1,
             native_exports: Arc::new(std::sync::Mutex::new(None)),
         })
     }
     pub fn configure_resource_limits(&mut self, limits: ResourceLimits) -> io::Result<()> {
-        if !self.records.is_empty() {
+        if self.poisoned
+            || self.drained
+            || !self.records.is_empty()
+            || self.closed_grants.interval_count() != 0
+        {
             return Err(denied("resource policy already in use"));
         }
+        self.closed_grants = history::ClosedGrantHistory::new(
+            limits
+                .grants
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(|| denied("history capacity overflow"))?,
+        )?;
         self.resource_limits = limits;
         Ok(())
     }
     fn admit_grant(&self) -> io::Result<()> {
+        self.closed_grants.reserve_admission(self.records.len())?;
         if self.records.len() >= self.resource_limits.grants {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -402,6 +422,14 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         Ok(())
     }
     fn check_lifecycle(&self, lifecycle: &Lifecycle<S, B>) -> io::Result<()> {
+        if self.poisoned {
+            return Err(denied("canonical original source/provider quarantined"));
+        }
+        if self.drained {
+            return Err(denied(
+                "canonical owner terminally drained for context rollover",
+            ));
+        }
         if !lifecycle.belongs_to(&self.context) {
             return Err(denied("session belongs to another service context"));
         }
@@ -474,6 +502,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.check_lifecycle(lifecycle)?;
         self.admit_grant()?;
         let binding = lifecycle.incoming_grant(frame)?;
+        if self.closed_grants.is_closed(binding.grant) {
+            return Err(denied("old closed grant offer cannot reopen"));
+        }
         if self.records.contains_key(&binding.grant) {
             return Err(denied("canonical peer grant ID already installed"));
         }
@@ -2978,6 +3009,41 @@ mod tests {
         let ack = b.seal_grant_quiescent(&ll, &peer).unwrap();
         a.apply_remote(&wl, &ga, &ack).unwrap();
         a.complete_grant_barrier(&wl, &census).unwrap();
+    }
+    #[test]
+    fn context_drain_requires_every_current_grant_and_cannot_reset_old_owner() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        assert!(owner.prepare_context_drain(&life).is_err());
+        let (producer, _) = process(&mut owner, &life, &grant);
+        owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        assert!(unsafe { ProtectedGrants::start(context, layout()) }.is_err());
+    }
+    #[test]
+    fn explicit_empty_context_drain_preserves_unknown_exclusions_and_disables_old_namespace() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        context.backing().3.store(true, Ordering::SeqCst);
+        assert!(owner.grant(&mut life, GrantKind::Pixel, PAGE).is_err());
+        context.backing().3.store(false, Ordering::SeqCst);
+        let permit = owner.prepare_context_drain(&life).unwrap();
+        assert_eq!(permit.historical_exclusions().unwrap(), vec![(PAGE, PAGE)]);
+        assert!(owner.grant(&mut life, GrantKind::Pixel, PAGE).is_err());
+        assert!(owner.prepare_context_drain(&life).is_err());
+        assert!(unsafe { ProtectedGrants::start(context, layout()) }.is_err());
+    }
+    #[test]
+    fn failed_original_source_census_poison_is_owner_wide_and_irreversible() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        let first = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let second = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &second);
+        let (closing, _) = owner.begin_grant_close(&life, &first).unwrap();
+        context.backing().3.store(true, Ordering::SeqCst);
+        assert!(owner.mint_grant_census(&life, &closing).is_err());
+        context.backing().3.store(false, Ordering::SeqCst);
+        assert!(owner.allocate(&life, &producer, 1, PAGE).is_err());
+        assert!(owner.prepare_context_drain(&life).is_err());
+        assert_eq!(life.exclusions().unwrap(), vec![(PAGE, PAGE), (2 * PAGE, PAGE)]);
     }
     #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {
