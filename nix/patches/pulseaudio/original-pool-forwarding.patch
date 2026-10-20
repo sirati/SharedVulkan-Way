@@ -1,0 +1,827 @@
+--- a/src/pulse/internal.h
++++ b/src/pulse/internal.h
+@@ -60,6 +60,8 @@
+ 
+ #define PA_PROTOCOL_FLAG_SHM 0x80000000U
+ #define PA_PROTOCOL_FLAG_MEMFD 0x40000000U
++/* Explicit native-UID whole-pool trust; socket-only lease protocol v1. */
++#define PA_PROTOCOL_FLAG_ORIGINAL_POOL 0x20000000U
+ 
+ typedef struct pa_context_error {
+     int error;
+@@ -105,6 +107,7 @@
+     bool is_local:1;
+     bool do_shm:1;
+     bool memfd_on_local:1;
++    bool original_pool_requested:1;
+     bool server_specified:1;
+     bool no_fail:1;
+     bool do_autospawn:1;
+--- a/src/pulse/context.c
++++ b/src/pulse/context.c
+@@ -503,6 +503,7 @@
+             pa_tagstruct *reply;
+             bool shm_on_remote = false;
+             bool memfd_on_remote = false;
++            bool original_on_remote = false;
+ 
+             if (pa_tagstruct_getu32(t, &c->version) < 0 ||
+                 !pa_tagstruct_eof(t)) {
+@@ -526,6 +527,7 @@
+                  * tag reflects whether memfd is supported on the other PA end. */
+                 if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 31)
+                     memfd_on_remote = !!(c->version & PA_PROTOCOL_FLAG_MEMFD);
++                original_on_remote = !!(c->version & PA_PROTOCOL_FLAG_ORIGINAL_POOL);
+ 
+                 /* Reserve the two most-significant _bytes_ of the version tag
+                  * for flags. */
+@@ -552,6 +554,11 @@
+ #endif
+             }
+ 
++            if (c->original_pool_requested && (!original_on_remote || !c->do_shm ||
++                !memfd_on_remote || !c->memfd_on_local)) {
++                pa_context_fail(c, PA_ERR_NOTSUPPORTED);
++                goto finish;
++            }
+             pa_log_debug("Negotiated SHM: %s", pa_yes_no(c->do_shm));
+             pa_pstream_enable_shm(c->pstream, c->do_shm);
+ 
+@@ -561,9 +568,18 @@
+                     const char *reason;
+ 
+                     pa_pstream_enable_memfd(c->pstream);
++                    if (c->original_pool_requested && pa_pstream_enable_original_leases(c->pstream, false) < 0) {
++                        pa_context_fail(c, PA_ERR_PROTOCOL);
++                        goto finish;
++                    }
+                     if (pa_mempool_is_memfd_backed(c->mempool))
+-                        if (pa_pstream_register_memfd_mempool(c->pstream, c->mempool, &reason))
++                        if (pa_pstream_register_memfd_mempool(c->pstream, c->mempool, &reason)) {
+                             pa_log("Failed to regester memfd mempool. Reason: %s", reason);
++                            if (c->original_pool_requested) {
++                                pa_context_fail(c, PA_ERR_PROTOCOL);
++                                goto finish;
++                            }
++                        }
+ 
+                     /* Even if memfd pool registration fails, the negotiated SHM type
+                      * shall remain memfd as both endpoints claim to support it. */
+@@ -641,11 +657,24 @@
+ 
+     pa_log_debug("SHM possible: %s", pa_yes_no(c->do_shm));
+ 
++    {
++        const char *request = getenv("PULSE_ORIGINAL_POOL_LEASES");
++        c->original_pool_requested = request && pa_streq(request, "native-uid-whole-pool-v1");
++        if (c->original_pool_requested && (!c->do_shm || !c->memfd_on_local ||
++            getuid() != geteuid() || pa_pstream_prepare_original_owned(c->pstream) < 0)) {
++            pa_tagstruct_free(t);
++            pa_context_fail(c, PA_ERR_ACCESS);
++            pa_context_unref(c);
++            return;
++        }
++    }
++
+     /* Starting with protocol version 13 we use the MSB of the version
+      * tag for informing the other side if we could do SHM or not.
+      * Starting from version 31, second MSB is used to flag memfd support. */
+     pa_tagstruct_putu32(t, PA_PROTOCOL_VERSION | (c->do_shm ? PA_PROTOCOL_FLAG_SHM : 0) |
+-                        (c->memfd_on_local ? PA_PROTOCOL_FLAG_MEMFD: 0));
++                        (c->memfd_on_local ? PA_PROTOCOL_FLAG_MEMFD: 0) |
++                        (c->original_pool_requested ? PA_PROTOCOL_FLAG_ORIGINAL_POOL : 0));
+     pa_tagstruct_put_arbitrary(t, cookie, sizeof(cookie));
+ 
+ #ifdef HAVE_CREDS
+--- a/src/pulsecore/memblock.c
++++ b/src/pulsecore/memblock.c
+@@ -28,6 +28,8 @@
+ #include <unistd.h>
+ #include <signal.h>
+ #include <errno.h>
++#include <fcntl.h>
++#include <sys/stat.h>
+ 
+ #ifdef HAVE_VALGRIND_MEMCHECK_H
+ #include <valgrind/memcheck.h>
+@@ -156,6 +158,8 @@
+ struct pa_memexport {
+     pa_mutex *mutex;
+     bool quarantine_reserved;
++    size_t quarantine_size;
++    pa_memblock *forward_anchor;
+     pa_mempool *pool;
+ 
+     struct memexport_slot slots[PA_MEMEXPORT_SLOTS_MAX];
+@@ -1406,6 +1410,8 @@
+     e = pa_xnew(pa_memexport, 1);
+     e->mutex = pa_mutex_new(true, true);
+     e->quarantine_reserved = false;
++    e->quarantine_size = 0;
++    e->forward_anchor = NULL;
+     e->pool = p;
+     pa_mempool_ref(e->pool);
+     PA_LLIST_HEAD_INIT(struct memexport_slot, e->free_slots);
+@@ -1423,25 +1429,80 @@
+     return e;
+ }
+ 
+-/* Admission must precede any exported blocks. A reservation covers the
+- * entire backing pool, not merely its currently used block extents. */
+-int pa_memexport_enable_original_quarantine(pa_memexport *e) {
++static int reserve_original_quarantine(size_t amount) {
+     int current, size;
+-    pa_assert(e);
+-    pa_assert(!e->used_slots);
+-    if (e->quarantine_reserved)
+-        return 0;
+-    if (e->pool->memory.type != PA_MEM_TYPE_SHARED_MEMFD)
++    if (amount > PA_ORIGINAL_QUARANTINE_MAX)
+         return -1;
+-    if (e->pool->memory.size > PA_ORIGINAL_QUARANTINE_MAX)
+-        return -1;
+-    size = (int) e->pool->memory.size;
++    size = (int) amount;
+     do {
+         current = pa_atomic_load(&original_quarantine_reserved);
+         if (current > PA_ORIGINAL_QUARANTINE_MAX - size)
+             return -1;
+     } while (!pa_atomic_cmpxchg(&original_quarantine_reserved, current, current + size));
++    return 0;
++}
++
++/* Admission precedes exported blocks. Reserve the whole backing object. */
++int pa_memexport_enable_original_quarantine(pa_memexport *e) {
++    pa_assert(e);
++    pa_assert(!e->used_slots);
++    if (e->forward_anchor)
++        return -1;
++    if (e->quarantine_reserved)
++        return 0;
++    if (e->pool->memory.type != PA_MEM_TYPE_SHARED_MEMFD ||
++        reserve_original_quarantine(e->pool->memory.size) < 0)
++        return -1;
++    e->quarantine_size = e->pool->memory.size;
+     e->quarantine_reserved = true;
++    return 0;
++}
++
++int pa_memexport_enable_forward_quarantine(pa_memexport *e, pa_memblock *b) {
++    pa_memimport_segment *segment;
++    pa_original_memfd_info info;
++    pa_assert(e);
++    pa_assert(b);
++    pa_assert(!e->used_slots);
++    if (e->quarantine_reserved || b->pool != e->pool || b->type != PA_MEMBLOCK_IMPORTED)
++        return -1;
++    segment = b->per_type.imported.segment;
++    if (pa_memblock_get_original_memfd(b, &info) < 0)
++        return -1;
++    pa_close(info.fd);
++    if (reserve_original_quarantine(info.size) < 0)
++        return -1;
++    /* The anchor pins the segment identity even between downstream frames. */
++    e->forward_anchor = pa_memblock_ref(b);
++    e->quarantine_size = segment->memory.size;
++    e->quarantine_reserved = true;
++    return 0;
++}
++
++/* Caller owns the duplicated descriptor. O_RDWR whole-pool authority is
++ * explicit; neither protocol metadata nor this API attenuates it. */
++int pa_memblock_get_original_memfd(pa_memblock *b, pa_original_memfd_info *info) {
++    pa_shm *memory;
++    struct stat st;
++    int access, fd;
++    pa_assert(b);
++    pa_assert(info);
++    if (b->type != PA_MEMBLOCK_IMPORTED || !b->per_type.imported.segment->import->original_leases)
++        return -1;
++    memory = &b->per_type.imported.segment->memory;
++    if (memory->type != PA_MEM_TYPE_SHARED_MEMFD || memory->fd < 0 ||
++        fstat(memory->fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
++        st.st_size <= 0 || (uint64_t) st.st_size != memory->size)
++        return -1;
++    access = fcntl(memory->fd, F_GETFL);
++    if (access < 0 || (access & O_ACCMODE) != O_RDWR)
++        return -1;
++    if ((fd = fcntl(memory->fd, F_DUPFD_CLOEXEC, 3)) < 0)
++        return -1;
++    *info = (pa_original_memfd_info) {
++        .fd = fd, .dev = st.st_dev, .ino = st.st_ino, .size = memory->size,
++        .uid = st.st_uid, .access = access & O_ACCMODE, .source_id = memory->id
++    };
+     return 0;
+ }
+ 
+@@ -1453,8 +1514,13 @@
+         struct memexport_slot *slot;
+         /* These source-owned refs prevent allocator reuse and pool vacuum.
+          * No dead transport callback is kept reachable from pool exporters. */
+-        for (slot = e->used_slots; slot; slot = slot->next)
+-            pa_assert(!slot->block->foreign_origin);
++        for (slot = e->used_slots; slot; slot = slot->next) {
++            if (e->forward_anchor)
++                pa_assert(slot->block->type == PA_MEMBLOCK_IMPORTED &&
++                          slot->block->per_type.imported.segment == e->forward_anchor->per_type.imported.segment);
++            else
++                pa_assert(!slot->block->foreign_origin);
++        }
+         e->revoke_cb = NULL;
+         e->userdata = NULL;
+         pa_mutex_unlock(e->mutex);
+@@ -1462,7 +1528,7 @@
+         PA_LLIST_REMOVE(pa_memexport, e->pool->exports, e);
+         pa_mutex_unlock(e->pool->mutex);
+         pa_log_warn("Quarantined original export pool until process exit: size=%lu",
+-                    (unsigned long) e->pool->memory.size);
++                    (unsigned long) e->quarantine_size);
+         return;
+     }
+     while (e->used_slots)
+@@ -1474,7 +1540,9 @@
+     pa_mutex_unlock(e->pool->mutex);
+ 
+     if (e->quarantine_reserved)
+-        pa_atomic_sub(&original_quarantine_reserved, (int) e->pool->memory.size);
++        pa_atomic_sub(&original_quarantine_reserved, (int) e->quarantine_size);
++    if (e->forward_anchor)
++        pa_memblock_unref(e->forward_anchor);
+     pa_mempool_unref(e->pool);
+     pa_mutex_free(e->mutex);
+     pa_xfree(e);
+@@ -1587,7 +1655,11 @@
+ 
+     /* Caller must translate this distinct failure into transport refusal,
+      * never socket fallback. Quarantine capability covers owned blocks only. */
+-    if (e->quarantine_reserved && b->foreign_origin)
++    if (e->forward_anchor) {
++        if (b->type != PA_MEMBLOCK_IMPORTED ||
++            b->per_type.imported.segment != e->forward_anchor->per_type.imported.segment)
++            return -2;
++    } else if (e->quarantine_reserved && b->foreign_origin)
+         return -2;
+ 
+     if (!(b = memblock_shared_copy(e->pool, b)))
+--- a/src/pulsecore/memblock.h
++++ b/src/pulsecore/memblock.h
+@@ -159,6 +159,14 @@
+ pa_memexport* pa_memexport_new(pa_mempool *p, pa_memexport_revoke_cb_t cb, void *userdata);
+ void pa_memexport_free(pa_memexport *e);
+ int pa_memexport_enable_original_quarantine(pa_memexport *e);
++int pa_memexport_enable_forward_quarantine(pa_memexport *e, pa_memblock *b);
++typedef struct pa_original_memfd_info {
++    int fd;
++    uint64_t dev, ino, size;
++    uint32_t uid, source_id;
++    int access;
++} pa_original_memfd_info;
++int pa_memblock_get_original_memfd(pa_memblock *b, pa_original_memfd_info *info);
+ int pa_memexport_put(pa_memexport *e, pa_memblock *b, pa_mem_type_t *type, uint32_t *block_id,
+                      uint32_t *shm_id, size_t *offset, size_t * size);
+ int pa_memexport_process_release(pa_memexport *e, uint32_t id);
+--- a/src/pulsecore/shm.c
++++ b/src/pulsecore/shm.c
+@@ -395,7 +395,7 @@
+ static int shm_attach(pa_shm *m, pa_mem_type_t type, unsigned id, int memfd_fd, bool writable, bool for_cleanup) {
+ #if defined(HAVE_SHM_OPEN) || defined(HAVE_MEMFD)
+     char fn[32];
+-    int fd = -1;
++    int fd = -1, retained_fd = -1;
+     int prot;
+     struct stat st;
+ 
+@@ -443,6 +443,10 @@
+         goto fail;
+     }
+ 
++    if (type == PA_MEM_TYPE_SHARED_MEMFD &&
++        (retained_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3)) < 0)
++        goto fail;
++
+     prot = writable ? PROT_READ | PROT_WRITE : PROT_READ;
+     if ((m->ptr = mmap(NULL, PA_PAGE_ALIGN(st.st_size), prot, MAP_SHARED, fd, (off_t) 0)) == MAP_FAILED) {
+         pa_log("mmap() failed: %s", pa_cstrerror(errno));
+@@ -468,11 +472,13 @@
+     m->id = id;
+     m->size = (size_t) st.st_size;
+     m->do_unlink = false;
+-    m->fd = -1;
++    m->fd = retained_fd;
+ 
+     return 0;
+ 
+ fail:
++    if (retained_fd >= 0)
++        pa_close(retained_fd);
+     /* In case of memfds, caller maintains fd ownership */
+     if (fd >= 0 && type != PA_MEM_TYPE_SHARED_MEMFD)
+         pa_close(fd);
+--- a/src/pulsecore/pstream.c
++++ b/src/pulsecore/pstream.c
+@@ -25,6 +25,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
++#include <fcntl.h>
++#include <sys/stat.h>
+ 
+ #ifdef HAVE_NETINET_IN_H
+ #include <netinet/in.h>
+@@ -40,6 +42,10 @@
+ #include <pulsecore/refcnt.h>
+ #include <pulsecore/flist.h>
+ #include <pulsecore/macro.h>
++#include <pulsecore/hashmap.h>
++#include <pulsecore/random.h>
++#include <pulsecore/core-util.h>
++#include <pulsecore/pstream-util.h>
+ 
+ #include "pstream.h"
+ 
+@@ -122,6 +128,15 @@
+     size_t index;
+ };
+ 
++#define ORIGINAL_ALIAS_MAX 2
++struct original_alias {
++    bool used;
++    uint32_t id;
++    pa_original_memfd_info backing;
++    pa_mempool *pool; /* exporter owns the reference */
++    pa_memexport *export;
++};
++
+ struct pa_pstream {
+     PA_REFCNT_DECLARE;
+ 
+@@ -136,6 +151,12 @@
+     bool dead;
+     bool strict_original_pool;
+     bool rejected_foreign_pool;
++    bool original_socket_only;
++    bool original_forwarding;
++    bool original_owned_reserved;
++    size_t original_registered_size;
++    struct original_alias original_aliases[ORIGINAL_ALIAS_MAX];
++    pa_hashmap *original_release_ids;
+ 
+     struct {
+         union {
+@@ -246,6 +267,65 @@
+ #endif
+ 
+ static int do_write(pa_pstream *p);
++static void memexport_revoke_cb(pa_memexport *e, uint32_t block_id, void *userdata);
++
++/* Registration and data share the socket parser. SRB/migration is forbidden.
++ * A ledger entry retains its exact original segment and whole-pool budget. */
++static struct original_alias *original_alias_for(pa_pstream *p, pa_memblock *b, bool create) {
++    pa_original_memfd_info info;
++    pa_mempool *pool;
++    struct original_alias *slot = NULL;
++    pa_memexport *export = NULL;
++    unsigned i, attempt;
++    uint32_t id = 0;
++    if (!p->original_forwarding || !p->original_socket_only || !p->use_memfd ||
++        p->srb || p->srbpending || pa_memblock_get_original_memfd(b, &info) < 0)
++        return NULL;
++    pool = pa_memblock_get_pool(b);
++    for (i = 0; i < ORIGINAL_ALIAS_MAX; i++) {
++        struct original_alias *a = &p->original_aliases[i];
++        if (!a->used) {
++            if (!slot) slot = a;
++            continue;
++        }
++        if (a->pool == pool && a->backing.source_id == info.source_id &&
++            a->backing.dev == info.dev && a->backing.ino == info.ino &&
++            a->backing.size == info.size && a->backing.uid == info.uid &&
++            a->backing.access == info.access) {
++            pa_close(info.fd);
++            pa_mempool_unref(pool);
++            return a;
++        }
++    }
++    if (!create || !slot)
++        goto fail;
++    if (!(export = pa_memexport_new(pool, memexport_revoke_cb, p)) ||
++        pa_memexport_enable_forward_quarantine(export, b) < 0)
++        goto fail;
++    for (attempt = 0; attempt < 64; attempt++) {
++        pa_random(&id, sizeof(id));
++        if (id && id != UINT32_MAX &&
++            !pa_idxset_get_by_data(p->registered_memfd_ids, PA_UINT32_TO_PTR(id), NULL))
++            break;
++    }
++    if (attempt == 64 || pa_pstream_register_original_memfd_alias(p, id, info.fd) < 0)
++        goto fail;
++    *slot = (struct original_alias) {
++        .used = true, .id = id, .backing = info, .pool = pool, .export = export
++    };
++    pa_log_debug("Original pool alias: alias=%u source=%u dev=%llu ino=%llu size=%llu uid=%u access=%d",
++                 id, info.source_id, (unsigned long long) info.dev,
++                 (unsigned long long) info.ino, (unsigned long long) info.size,
++                 info.uid, info.access);
++    pa_mempool_unref(pool);
++    return slot;
++fail:
++    if (export) pa_memexport_free(export);
++    pa_close(info.fd);
++    pa_mempool_unref(pool);
++    return NULL;
++}
++
+ static int do_read(pa_pstream *p, struct pstream_read *re);
+ 
+ static void do_pstream_read_write(pa_pstream *p) {
+@@ -390,7 +470,23 @@
+         return err;
+     }
+ 
+-    if (pa_memimport_attach_memfd(p->import, shm_id, memfd_fd, true)) {
++    if (p->original_socket_only) {
++        struct stat st;
++        int flags = fcntl(memfd_fd, F_GETFL);
++        if (flags < 0 || (flags & O_ACCMODE) != O_RDWR || fstat(memfd_fd, &st) < 0 ||
++            !S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_size <= 0 ||
++            st.st_size > 128 * 1024 * 1024 ||
++            p->original_registered_size > 256 * 1024 * 1024 - (size_t) st.st_size)
++            return -1;
++        /* Include local symmetric registrations. Own + broker + one source
++         * pools fit; additional descriptor authority is bounded explicitly. */
++        if (pa_memimport_attach_memfd(p->import, shm_id, memfd_fd, true))
++            return -1;
++        p->original_registered_size += (size_t) st.st_size;
++        pa_log_debug("Original pool registration: id=%u dev=%llu ino=%llu size=%llu uid=%u access=%d",
++                     shm_id, (unsigned long long) st.st_dev, (unsigned long long) st.st_ino,
++                     (unsigned long long) st.st_size, (unsigned) st.st_uid, flags & O_ACCMODE);
++    } else if (pa_memimport_attach_memfd(p->import, shm_id, memfd_fd, true)) {
+         pa_log("Failed to create permanent mapping for memfd region with ID = %u", shm_id);
+         return err;
+     }
+@@ -506,7 +602,8 @@
+      * authority. Reject before queueing or publishing an export reference. */
+     if (p->rejected_foreign_pool ||
+         (p->strict_original_pool && chunk->memblock &&
+-         pa_memblock_has_foreign_origin(chunk->memblock))) {
++         pa_memblock_has_foreign_origin(chunk->memblock) &&
++         !original_alias_for(p, chunk->memblock, true))) {
+         if (!p->rejected_foreign_pool)
+             pa_log("Refusing foreign imported pool in strict original-pool mode");
+         p->rejected_foreign_pool = true;
+@@ -688,19 +785,56 @@
+             size_t shm_size = sizeof(uint32_t) * PA_PSTREAM_SHM_MAX;
+             pa_mempool *current_pool = pa_memblock_get_pool(p->write.current->chunk.memblock);
+             pa_memexport *current_export;
+-
+-            if (p->mempool == current_pool)
++            struct original_alias *alias = NULL;
++            int exported;
++
++            if (p->original_socket_only && pa_memblock_has_foreign_origin(p->write.current->chunk.memblock)) {
++                alias = original_alias_for(p, p->write.current->chunk.memblock, false);
++                if (!alias) {
++                    pa_mempool_unref(current_pool);
++                    p->rejected_foreign_pool = true;
++                    return;
++                }
++                current_export = alias->export;
++            } else if (p->original_socket_only && p->mempool != current_pool) {
++                pa_mempool_unref(current_pool);
++                p->rejected_foreign_pool = true;
++                return;
++            } else if (p->mempool == current_pool)
+                 pa_assert_se(current_export = p->export);
+             else
+                 pa_assert_se(current_export = pa_memexport_new(current_pool, memexport_revoke_cb, p));
+ 
+-            if (pa_memexport_put(current_export,
++            if (p->original_socket_only && !alias && !p->original_owned_reserved) {
++                if (pa_memexport_enable_original_quarantine(current_export) < 0) {
++                    pa_mempool_unref(current_pool);
++                    p->rejected_foreign_pool = true;
++                    return;
++                }
++                p->original_owned_reserved = true;
++            }
++
++            exported = pa_memexport_put(current_export,
+                                  p->write.current->chunk.memblock,
+                                  &type,
+                                  &block_id,
+                                  &shm_id,
+                                  &offset,
+-                                 &length) >= 0) {
++                                 &length);
++            if (exported >= 0) {
++                if (alias)
++                    shm_id = alias->id;
++                if (p->original_socket_only) {
++                    if (type != PA_MEM_TYPE_SHARED_MEMFD || !p->use_memfd ||
++                        !pa_idxset_get_by_data(p->registered_memfd_ids, PA_UINT32_TO_PTR(shm_id), NULL) ||
++                        pa_hashmap_get(p->original_release_ids, PA_UINT32_TO_PTR(block_id))) {
++                        pa_memexport_process_release(current_export, block_id);
++                        pa_mempool_unref(current_pool);
++                        p->rejected_foreign_pool = true;
++                        return;
++                    }
++                    pa_assert_se(pa_hashmap_put(p->original_release_ids, PA_UINT32_TO_PTR(block_id), current_export) == 0);
++                }
+ 
+                 if (type == PA_MEM_TYPE_SHARED_POSIX)
+                     send_payload = false;
+@@ -739,7 +873,9 @@
+ /*                 FIXME: Avoid memexport slot leaks. Call pa_memexport_process_release() */
+ /*                 pa_log_warn("Failed to export memory block."); */
+ 
+-            if (current_export != p->export)
++            if (exported < 0 && p->original_socket_only)
++                p->rejected_foreign_pool = true;
++            if (current_export != p->export && !alias)
+                 pa_memexport_free(current_export);
+             pa_mempool_unref(current_pool);
+         }
+@@ -782,8 +918,12 @@
+     pa_assert(p);
+     pa_assert(PA_REFCNT_VALUE(p) > 0);
+ 
++    if (p->original_socket_only && (!p->use_shm || !p->use_memfd || p->srb || p->srbpending))
++        return -1;
+     if (!p->write.current)
+         prepare_next_write_item(p);
++    if (p->rejected_foreign_pool)
++        return -1;
+ 
+     if (!p->write.current) {
+         /* The out queue is empty, so switching channels is safe */
+@@ -995,8 +1135,15 @@
+ 
+ /*             pa_log("Got release frame for %u", ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI])); */
+ 
+-            pa_assert(p->export);
+-            pa_memexport_process_release(p->export, ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI]));
++            if (p->original_socket_only) {
++                uint32_t id = ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI]);
++                pa_memexport *export = pa_hashmap_remove(p->original_release_ids, PA_UINT32_TO_PTR(id));
++                if (!export || pa_memexport_process_release(export, id) < 0)
++                    return -1;
++            } else {
++                pa_assert(p->export);
++                pa_memexport_process_release(p->export, ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI]));
++            }
+ 
+             goto frame_done;
+ 
+@@ -1007,7 +1154,9 @@
+ /*             pa_log("Got revoke frame for %u", ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI])); */
+ 
+             pa_assert(p->import);
+-            pa_memimport_process_revoke(p->import, ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI]));
++            if (pa_memimport_process_revoke(p->import, ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_OFFSET_HI])) < 0 &&
++                p->original_socket_only)
++                return -1;
+ 
+             goto frame_done;
+         }
+@@ -1286,13 +1435,32 @@
+         pa_pstream_set_srbchannel(p, NULL);
+ 
+     if (p->import) {
+-        pa_memimport_free(p->import);
++        pa_memimport *import = p->import;
+         p->import = NULL;
++        if (p->original_socket_only)
++            pa_memimport_orphan(import);
++        else
++            pa_memimport_free(import);
+     }
+ 
+     if (p->export) {
+         pa_memexport_free(p->export);
+         p->export = NULL;
++    }
++
++    {
++        unsigned i;
++        for (i = 0; i < ORIGINAL_ALIAS_MAX; i++) {
++            struct original_alias *alias = &p->original_aliases[i];
++            if (!alias->used) continue;
++            alias->used = false;
++            pa_memexport_free(alias->export);
++            pa_close(alias->backing.fd);
++        }
++        if (p->original_release_ids) {
++            pa_hashmap_free(p->original_release_ids);
++            p->original_release_ids = NULL;
++        }
+     }
+ 
+     if (p->io) {
+@@ -1361,6 +1529,13 @@
+     pa_assert(p);
+     pa_assert(PA_REFCNT_VALUE(p) > 0 || srb == NULL);
+ 
++    if (p->original_socket_only && srb) {
++        pa_srbchannel_free(srb);
++        p->rejected_foreign_pool = true;
++        if (p->defer_event)
++            p->mainloop->defer_enable(p->defer_event, 1);
++        return;
++    }
+     if (srb == p->srb)
+         return;
+ 
+@@ -1385,3 +1560,35 @@
+     pa_assert(!pa_pstream_is_pending(p));
+     p->strict_original_pool = true;
+ }
++
++int pa_pstream_prepare_original_owned(pa_pstream *p) {
++    pa_assert(p);
++    if (p->original_owned_reserved)
++        return 0;
++    if (!p->export)
++        p->export = pa_memexport_new(p->mempool, memexport_revoke_cb, p);
++    if (!p->export || pa_memexport_enable_original_quarantine(p->export) < 0)
++        return -1;
++    p->original_owned_reserved = true;
++    p->strict_original_pool = true;
++    return 0;
++}
++
++int pa_pstream_enable_original_leases(pa_pstream *p, bool forward) {
++    pa_assert(p);
++    if (!p->use_shm || !p->use_memfd || p->srb || p->srbpending || p->original_socket_only)
++        return -1;
++    pa_memimport_enable_original_leases(p->import);
++    p->original_socket_only = true;
++    p->original_forwarding = forward;
++    p->strict_original_pool = true;
++    p->original_release_ids = pa_hashmap_new(NULL, NULL);
++    return 0;
++}
++
++int pa_pstream_claim_original_alias(pa_pstream *p, uint32_t id) {
++    if (!p->original_socket_only || !p->original_forwarding || !p->registered_memfd_ids ||
++        !id || pa_idxset_get_by_data(p->registered_memfd_ids, PA_UINT32_TO_PTR(id), NULL))
++        return -1;
++    return pa_idxset_put(p->registered_memfd_ids, PA_UINT32_TO_PTR(id), NULL);
++}
+--- a/src/pulsecore/pstream.h
++++ b/src/pulsecore/pstream.h
+@@ -65,6 +65,9 @@
+ bool pa_pstream_is_pending(pa_pstream *p);
+ 
+ void pa_pstream_require_original_pool(pa_pstream *p);
++int pa_pstream_prepare_original_owned(pa_pstream *p);
++int pa_pstream_enable_original_leases(pa_pstream *p, bool forward);
++int pa_pstream_claim_original_alias(pa_pstream *p, uint32_t id);
+ 
+ void pa_pstream_enable_shm(pa_pstream *p, bool enable);
+ void pa_pstream_enable_memfd(pa_pstream *p);
+--- a/src/pulsecore/pstream-util.c
++++ b/src/pulsecore/pstream-util.c
+@@ -196,3 +196,21 @@
+     return -1;
+ #endif
+ }
++
++/* Original leases are socket-only. This packet precedes every alias frame
++ * in the same parser; registration failure must terminate the connection. */
++int pa_pstream_register_original_memfd_alias(pa_pstream *p, uint32_t alias, int fd) {
++#if defined(HAVE_CREDS) && defined(HAVE_MEMFD)
++    pa_tagstruct *t;
++    if (pa_pstream_claim_original_alias(p, alias) < 0)
++        return -1;
++    t = pa_tagstruct_new();
++    pa_tagstruct_putu32(t, PA_COMMAND_REGISTER_MEMFD_SHMID);
++    pa_tagstruct_putu32(t, (uint32_t) -1);
++    pa_tagstruct_putu32(t, alias);
++    pa_pstream_send_tagstruct_with_fds(p, t, 1, &fd, false);
++    return 0;
++#else
++    return -1;
++#endif
++}
+--- a/src/pulsecore/pstream-util.h
++++ b/src/pulsecore/pstream-util.h
+@@ -34,6 +34,8 @@
+ void pa_pstream_send_error(pa_pstream *p, uint32_t tag, uint32_t error);
+ void pa_pstream_send_simple_ack(pa_pstream *p, uint32_t tag);
+ 
++int pa_pstream_register_original_memfd_alias(pa_pstream *p, uint32_t alias, int fd);
++
+ int pa_pstream_register_memfd_mempool(pa_pstream *p, pa_mempool *pool, const char **fail_reason);
+ 
+ #endif
+--- a/src/pulsecore/protocol-native.c
++++ b/src/pulsecore/protocol-native.c
+@@ -2564,6 +2564,7 @@
+     pa_native_connection *c = PA_NATIVE_CONNECTION(userdata);
+     const void*cookie;
+     bool memfd_on_remote = false, do_memfd = false;
++    bool original_on_remote = false, do_original = false;
+     pa_tagstruct *reply;
+     pa_mem_type_t shm_type;
+     bool shm_on_remote = false, do_shm;
+@@ -2594,6 +2595,7 @@
+          * tag reflects whether memfd is supported on the other PA end. */
+         if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 31)
+             memfd_on_remote = !!(c->version & PA_PROTOCOL_FLAG_MEMFD);
++        original_on_remote = !!(c->version & PA_PROTOCOL_FLAG_ORIGINAL_POOL);
+ 
+         /* Reserve the two most-significant _bytes_ of the version tag
+          * for flags. */
+@@ -2705,9 +2707,21 @@
+         pa_log_debug("Negotiated SHM type: %s", pa_mem_type_to_string(shm_type));
+     }
+ 
++#ifdef HAVE_CREDS
++    {
++        const pa_creds *creds = pa_pdispatch_creds(pd);
++        do_original = c->options->original_pool_leases && original_on_remote &&
++            do_memfd && memfd_on_remote && creds && creds->uid == getuid() && getuid() == geteuid();
++    }
++#endif
++    if (do_original && pa_pstream_enable_original_leases(c->pstream, true) < 0) {
++        protocol_error(c);
++        return;
++    }
+     reply = reply_new(tag);
+     pa_tagstruct_putu32(reply, PA_PROTOCOL_VERSION | (do_shm ? 0x80000000 : 0) |
+-                        (do_memfd ? 0x40000000 : 0));
++                        (do_memfd ? 0x40000000 : 0) |
++                        (do_original ? PA_PROTOCOL_FLAG_ORIGINAL_POOL : 0));
+ 
+ #ifdef HAVE_CREDS
+ {
+@@ -2732,8 +2746,13 @@
+     if (shm_type == PA_MEM_TYPE_SHARED_MEMFD) {
+         const char *reason;
+ 
+-        if (pa_pstream_register_memfd_mempool(c->pstream, c->protocol->core->mempool, &reason))
++        if (pa_pstream_register_memfd_mempool(c->pstream, c->protocol->core->mempool, &reason)) {
+             pa_log("Failed to register memfd mempool. Reason: %s", reason);
++            if (do_original) {
++                protocol_error(c);
++                return;
++            }
++        }
+     }
+ 
+     setup_srbchannel(c, shm_type);
+@@ -5492,11 +5511,23 @@
+         return -1;
+     }
+ 
++    o->original_pool_leases = false;
++    if (pa_modargs_get_value_boolean(ma, "original-pool-leases", &o->original_pool_leases) < 0) {
++        pa_log("original-pool-leases= expects a boolean argument.");
++        return -1;
++    }
++    if (o->original_pool_leases)
++        o->strict_original_pool = true;
++
+     o->srbchannel = true;
+     if (pa_modargs_get_value_boolean(ma, "srbchannel", &o->srbchannel) < 0) {
+         pa_log("srbchannel= expects a boolean argument.");
+         return -1;
+     }
++
++    /* FD registrations and references must share one total socket order. */
++    if (o->original_pool_leases)
++        o->srbchannel = false;
+ 
+     if (pa_modargs_get_value_boolean(ma, "auth-anonymous", &o->auth_anonymous) < 0) {
+         pa_log("auth-anonymous= expects a boolean argument.");
+--- a/src/pulsecore/protocol-native.h
++++ b/src/pulsecore/protocol-native.h
+@@ -44,6 +44,7 @@
+     bool auth_anonymous;
+     bool srbchannel;
+     bool strict_original_pool;
++    bool original_pool_leases;
+     char *auth_group;
+     pa_ip_acl *auth_ip_acl;
+     pa_auth_cookie *auth_cookie;
+--- a/src/modules/module-protocol-stub.c
++++ b/src/modules/module-protocol-stub.c
+@@ -91,7 +91,7 @@
+ #  define TCPWRAP_SERVICE "pulseaudio-native"
+ #  define IPV4_PORT PA_NATIVE_DEFAULT_PORT
+ #  define UNIX_SOCKET PA_NATIVE_DEFAULT_UNIX_SOCKET
+-#  define MODULE_ARGUMENTS_COMMON "cookie", "auth-cookie", "auth-cookie-enabled", "auth-anonymous", "strict-original-pool",
++#  define MODULE_ARGUMENTS_COMMON "cookie", "auth-cookie", "auth-cookie-enabled", "auth-anonymous", "strict-original-pool", "original-pool-leases",
+ 
+ #  if defined(HAVE_CREDS) && !defined(USE_TCP_SOCKETS)
+ #    define MODULE_ARGUMENTS MODULE_ARGUMENTS_COMMON "auth-group", "auth-group-enable", "srbchannel",
+@@ -108,7 +108,8 @@
+ #    endif
+ 
+   PA_MODULE_DESCRIPTION("Native protocol "SOCKET_DESCRIPTION);
+-  PA_MODULE_USAGE("strict-original-pool=<refuse foreign imported-pool forwarding?> "
++  PA_MODULE_USAGE("original-pool-leases=<experimental native-UID whole-pool leases?> "
++                  "strict-original-pool=<refuse foreign imported-pool forwarding?> "
+                   "auth-anonymous=<don't check for cookies?> "
+                   "auth-cookie=<path to cookie file> "
+                   "auth-cookie-enabled=<enable cookie authentication?> "
