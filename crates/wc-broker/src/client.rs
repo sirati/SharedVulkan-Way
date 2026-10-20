@@ -627,3 +627,31 @@ pub mod lend {
         Some(unsafe { sv_transport::winpipe::Pipe::from_port_handle(h.into_raw_handle() as isize) })
     }
 }
+
+/// Install the existing canonical IOSurface broker-owner observation lifecycle.
+/// Shared by wc-launch and the native HyperLinux compositor. The Mach endpoint
+/// still authenticates audit UID/PID; this callback atomically binds its owner
+/// generation at the broker and revokes names on owner death or broker EOF.
+#[cfg(target_os = "macos")]
+pub fn install_iosection_observer() -> io::Result<()> {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let installed = INSTALLED.get_or_init(|| {
+        wc_handle::iosection::set_owner_observer(Box::new(|owner, sender| {
+            let mut observer = Client::connect(&path())?;
+            observer.hello("iosurface-observer")?;
+            observer.observe_owner(owner, sender.pid)?;
+            std::thread::Builder::new().name("iosurface-owner".into()).spawn(move || {
+                let ended = format!("!owner-ended {}", owner.connection);
+                loop {
+                    match observer.next_event() {
+                        Ok(event) if event != ended => continue,
+                        _ => break,
+                    }
+                }
+                wc_handle::iosection::revoke_owner(owner);
+            })?;
+            Ok(())
+        }))
+    });
+    if *installed { Ok(()) } else { Err(io::Error::other("IOSurface owner observer already installed")) }
+}
