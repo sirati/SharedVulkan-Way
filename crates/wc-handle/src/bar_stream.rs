@@ -100,7 +100,7 @@ impl Backing {
             Allocation::Consumer(consumer) => consumer.publish(),
         }
     }
-    fn control(self: &Arc<Self>, initialize: bool) -> io::Result<Arc<Control>> {
+    fn control(self: &Arc<Self>, initialize: bool) -> io::Result<Arc<Registration>> {
         // SAFETY: the stream subpartition is shared writable, page aligned,
         // bounds checked, and retained by this exact allocation guard.
         let region = Arc::new(unsafe {
@@ -118,7 +118,7 @@ impl Backing {
         .map_err(transport)?;
         let control = Arc::new(control);
         controls().add(&control);
-        Ok(control)
+        Ok(Arc::new(Registration { control }))
     }
 }
 struct Gate<'a>(&'a AtomicU64);
@@ -127,11 +127,25 @@ impl Drop for Gate<'_> {
         self.0.store(0, Ordering::Release);
     }
 }
+struct Registration {
+    control: Arc<Control>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        controls().remove_and_wait(&self.control);
+    }
+}
+impl std::ops::Deref for Registration {
+    type Target = Control;
+    fn deref(&self) -> &Control {
+        &self.control
+    }
+}
 struct State {
     backing: Arc<Backing>,
     writer: bool,
     channel: Mutex<ByteChannel>,
-    _control: Arc<Control>,
+    _control: Arc<Registration>,
 }
 impl State {
     fn wake(&self, lane: Lane) {
@@ -163,7 +177,11 @@ impl Stream {
     pub fn key(&self) -> Key {
         self.state.backing.key
     }
-    fn endpoint(backing: Arc<Backing>, writer: bool, control: Arc<Control>) -> io::Result<Self> {
+    fn endpoint(
+        backing: Arc<Backing>,
+        writer: bool,
+        control: Arc<Registration>,
+    ) -> io::Result<Self> {
         let channel = ByteChannel::open(
             &control,
             1,

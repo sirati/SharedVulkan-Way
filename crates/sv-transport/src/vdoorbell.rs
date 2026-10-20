@@ -305,6 +305,7 @@ impl BellTarget for Control {
 #[derive(Default)]
 pub struct ControlSet {
     members: std::sync::Mutex<Vec<std::sync::Weak<Control>>>,
+    scans: std::sync::Mutex<()>,
 }
 
 impl ControlSet {
@@ -317,6 +318,14 @@ impl ControlSet {
             m.retain(|w| w.strong_count() > 0);
             m.push(Arc::downgrade(control));
         }
+    }
+
+    /// Unregister a control and wait for actual scans that could retain it.
+    /// The caller must prevent concurrent re-registration of this control.
+    pub fn remove_and_wait(&self, control: &Arc<Control>) {
+        let _scan = self.scans.lock().unwrap_or_else(|e| e.into_inner());
+        let mut members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+        members.retain(|weak| !weak.ptr_eq(&Arc::downgrade(control)) && weak.strong_count() > 0);
     }
 
     /// Sessions currently in the set, after pruning the ended ones.
@@ -334,6 +343,7 @@ impl ControlSet {
 
 impl BellTarget for ControlSet {
     fn rescan(&self, woken: &AtomicU64) {
+        let _scan = self.scans.lock().unwrap_or_else(|e| e.into_inner());
         let live: Vec<Arc<Control>> = match self.members.lock() {
             Ok(m) => m.iter().filter_map(std::sync::Weak::upgrade).collect(),
             Err(_) => return,
@@ -344,6 +354,7 @@ impl BellTarget for ControlSet {
     }
 
     fn ring_token(&self, token: u8, woken: &AtomicU64) -> bool {
+        let _scan = self.scans.lock().unwrap_or_else(|e| e.into_inner());
         // Upgrade under the lock, ring outside it: `ring_local` is a syscall,
         // and a session joining should not wait behind one.
         let live: Vec<Arc<Control>> = match self.members.lock() {
@@ -1405,6 +1416,36 @@ mod tests {
         drop(host_end);
         assert_eq!(doorman.join(), ServeEnd::Closed);
         drop(a);
+    }
+
+    #[test]
+    fn removing_a_control_waits_for_scans_and_prevents_later_delivery() {
+        let (control, slot) = setup();
+        let set = ControlSet::new();
+        set.add(&control);
+        let scan = set.scans.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let set = set.clone();
+            let control = control.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                set.remove_and_wait(&control);
+                done_tx.send(()).unwrap();
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(scan);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(set.is_empty());
+        let wakes = AtomicU64::new(0);
+        assert!(!set.ring_token(crate::park::lane_token(slot, Lane::Reply), &wakes));
+        set.rescan(&wakes);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        assert_eq!(Arc::strong_count(&control), 1);
     }
 
     /// `Bell::ring` must poke the installed doorbell, so that no producer call
