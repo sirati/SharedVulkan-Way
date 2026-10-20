@@ -207,7 +207,11 @@ impl Submission {
             job: job.clone(),
             source: Mutex::new(Some(source)),
             destination: view(&job.destination)?,
-            setup: job.setup.as_ref().map(|r| view(&r.picture)).transpose()?,
+            // Non-reference setup invalidates its slot. Its reconstructed
+            // picture is not a required producer resource and may be ignored.
+            setup: if job.h264.is_reference {
+                job.setup.as_ref().map(|r| view(&r.picture)).transpose()?
+            } else { None },
             references: job
                 .references
                 .iter()
