@@ -48,7 +48,13 @@ impl NativeLimits {
 /// Every tracked backend must compare this exact Arc before CREATE, validate
 /// immutable INFO from that retained device and serialize CREATE through bind.
 /// A type name, caller string, path or supplied instance tuple is insufficient.
-pub unsafe trait NativeProviderAuthority: Send + Sync {}
+pub unsafe trait NativeProviderAuthority: Send + Sync {
+    /// Revalidate the exact retained raw device/module authority. Does not
+    /// validate any original source, which has its own native owner guard.
+    fn validate_live_provider(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no native provider liveness validator"))
+    }
+}
 pub(super) struct Provider {
     instance: Option<[u8; 16]>,
     authority: Arc<dyn NativeProviderAuthority>,

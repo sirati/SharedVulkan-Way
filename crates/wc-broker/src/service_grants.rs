@@ -84,6 +84,12 @@ pub unsafe trait OriginalBacking: Send + Sync + 'static {
     /// exposure. Success must mean the entire exact range was initialized.
     /// No replacement mapping, deferred scrub or logical-length-only zero.
     fn initialize_zeroed(&self, offset: u64, length: u64) -> io::Result<()>;
+    /// Requery the retained actual native original owner and source incarnation.
+    /// Opaque retention, stat/seals and a caller tuple cannot satisfy this.
+    /// Only implementations with a real LiveOriginalOwner may allow release.
+    fn validate_live_source(&self) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no native original source validator"))
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantKind {
