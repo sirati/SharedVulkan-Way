@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
@@ -29,7 +30,20 @@ int main(void) {
     int fd=mkstemp(path);assert(fd>=0);assert(!unlink(path));assert(!ftruncate(fd,16384));
     mapping=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);assert(mapping!=MAP_FAILED);
     char in[64]="metadata",out[64];
+    void *second=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);assert(second!=MAP_FAILED);
     assert(!hl_wc_copy(mapping,in,sizeof(in)));assert(!hl_wc_copy(out,mapping,sizeof(out)));
+    char disk[64];assert(pread(fd,disk,sizeof(disk),0)==sizeof(disk));
+    assert(!memcmp(in,disk,sizeof(in)) && !memcmp(in,second,sizeof(in)));
+    /* Exercise a full native page too. The copy must mutate the original
+     * file-backed shared allocation, never replace/COW the destination VMA. */
+    void *page=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(page!=MAP_FAILED);
+    memset(page,0xa5,16384);assert(!hl_wc_copy(mapping,page,16384));
+    assert(!memcmp(page,second,16384));
+    for(off_t off=0;off<16384;off+=sizeof(disk)) {
+        assert(pread(fd,disk,sizeof(disk),off)==sizeof(disk));
+        assert(!memcmp(disk,(char *)page+off,sizeof(disk)));
+    }
+    assert(!munmap(page,16384));assert(!munmap(second,16384));
     pthread_t thread;assert(!pthread_create(&thread,NULL,copy_reader,NULL));
     pthread_mutex_lock(&lock);while(!ready)pthread_cond_wait(&gate,&lock);
     assert(!ftruncate(fd,0));truncated=1;pthread_cond_broadcast(&gate);pthread_mutex_unlock(&lock);

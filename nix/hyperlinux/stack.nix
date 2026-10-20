@@ -82,6 +82,8 @@ let
       cp ${./hl_socket.h} src/hl_socket.h
       cp ${./hl_copy.c} src/hl_copy.c
       cp ${./hl_copy.h} src/hl_copy.h
+      cp ${./hl_atomic.c} src/hl_atomic.c
+      cp ${./hl_atomic.h} src/hl_atomic.h
       cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
     '';
     buildPhase = ''
@@ -136,6 +138,24 @@ let
   renderClient = guest.callPackage ./client-probe.nix {
     programName = "hl-render-client"; source = ./render-client.c;
   };
+  nativeFaultClients = t.stdenv.mkDerivation {
+    pname = "hl-native-fault-clients"; version = "0.1.0";
+    dontUnpack = true; dontStrip = true;
+    nativeBuildInputs = [ pkgs.rcodesign ];
+    buildPhase = ''
+      $CC -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
+        ${./copy-fault-check.c} ${./hl_copy.c} -o hl-copy-fault-check
+      $CC -std=c11 -O2 -Wall -Wextra -Werror -pthread -I${./.} \
+        ${./atomic-fault-check.c} ${./hl_atomic.c} -o hl-atomic-fault-check
+    '';
+    installPhase = ''
+      mkdir -p "$out/bin"
+      for program in hl-copy-fault-check hl-atomic-fault-check; do
+        cp "$program" "$out/bin/$program"
+        ${pkgs.rcodesign}/bin/rcodesign sign "$out/bin/$program"
+      done
+    '';
+  };
   zinkClient = guest.callPackage ./client-probe.nix {
     programName = "hl-zink-client"; source = ./zink-client.c;
     buildInputs = [ guestApps.libglvnd ];
@@ -182,7 +202,10 @@ let
       export XDG_STATE_HOME="$fixture/state" XDG_RUNTIME_DIR="$fixture/runtime" HL_NATIVE_FIXTURE="$fixture"
       "$HL_RUNNER" ${renderClient}/bin/hl-render-client
       "$HL_RUNNER" ${socketClient}/bin/hl-socket-client
+      ${nativeFaultClients}/bin/hl-copy-fault-check
+      ${nativeFaultClients}/bin/hl-atomic-fault-check
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
+      "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
     '';
   };
 in {

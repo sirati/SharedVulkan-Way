@@ -20,6 +20,8 @@ hlCross.overrideAttrs (old: {
     cp ${./hl_socket.h} src/hl_socket.h
       cp ${./hl_copy.c} src/hl_copy.c
       cp ${./hl_copy.h} src/hl_copy.h
+      cp ${./hl_atomic.c} src/hl_atomic.c
+      cp ${./hl_atomic.h} src/hl_atomic.h
     cp ${../../include/wc_hyperlinux.h} src/wc_hyperlinux.h
   '';
   WC_HYPERLINUX_LIB = "${backend}/lib/libwc_hyperlinux.a";
