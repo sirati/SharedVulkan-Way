@@ -966,3 +966,50 @@ index dfce9fc..e558a11 100644
              return va;
      }
      return 0;
+diff --git a/src/thread.c b/src/thread.c
+index 10753ca..6854b0e 100644
+--- a/src/thread.c
++++ b/src/thread.c
+@@ -19,6 +19,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <signal.h>
+ 
+ /* ---------- Thread table ---------- */
+ 
+@@ -37,7 +38,23 @@ _Thread_local thread_entry_t *current_thread = NULL;
+ 
+ /* ---------- Public API ---------- */
+ 
++/* Reserved native wakeup for blocked host syscalls during exit_group.
++ * Guest signal dispositions live separately in syscall_signal.c. */
++static void host_wait_interrupt(int signo) { (void)signo; }
++
+ void thread_init(void) {
++    struct sigaction wake = {0};
++    wake.sa_handler = host_wait_interrupt;
++    sigemptyset(&wake.sa_mask);
++    /* No SA_RESTART: recv/read/wait must return to the vCPU exit check. */
++    if (sigaction(SIGUSR2, &wake, NULL) < 0) {
++        perror("hl: install worker interrupt");
++        _exit(1);
++    }
++    sigset_t wake_mask;
++    sigemptyset(&wake_mask);
++    sigaddset(&wake_mask, SIGUSR2);
++    pthread_sigmask(SIG_UNBLOCK, &wake_mask, NULL);
+     pthread_mutex_lock(&thread_lock);
+     memset(thread_table, 0, sizeof(thread_table));
+     sp_el1_allocated = 0;
+@@ -316,6 +333,10 @@ void thread_join_workers(void) {
+             if (!__atomic_load_n(&thread_table[workers[w].idx].active,
+                                   __ATOMIC_ACQUIRE))
+                 break;
++            /* hv_vcpus_exit cannot wake a thread blocked inside a native
++             * syscall. A targeted non-restarting signal does, without
++             * shutdown() changing a socket inherited by another process. */
++            pthread_kill(workers[w].thr, SIGUSR2);
+             usleep(5000);
+         }
+ 

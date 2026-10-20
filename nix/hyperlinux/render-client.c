@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/socket.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,6 +19,14 @@
 struct version { int major, minor, patch; size_t name_len; char *name; size_t date_len; char *date; size_t desc_len; char *desc; };
 struct cap { uint64_t name, value; };
 struct prime { uint32_t handle, flags; int32_t fd; };
+static atomic_int worker_ready;
+static void *blocked_worker(void *arg) {
+    int fd = *(int *)arg;
+    atomic_store_explicit(&worker_ready, 1, memory_order_release);
+    char byte;
+    (void)recv(fd, &byte, 1, 0);
+    return NULL;
+}
 int main(void) {
     int node = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); assert(node >= 0);
     int alias = dup(node); assert(alias >= 0); close(node);
@@ -62,5 +73,10 @@ int main(void) {
     assert(fcntl(other,F_ADD_SEALS,F_SEAL_WRITE|F_SEAL_SEAL)==0);
     assert(fcntl(other,F_ADD_SEALS,0)<0 && errno==EPERM);
     close(other);
+    /* exit_group must interrupt native recv without shutting down aliases. */
+    int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    pthread_t worker; assert(pthread_create(&worker, NULL, blocked_worker, &sockets[0]) == 0);
+    while (!atomic_load_explicit(&worker_ready, memory_order_acquire)) usleep(100);
+    usleep(10000);
     puts("embedded DRM identity, dup, ioctl bounds/caps, quiet poll, fork refusal and sibling seals passed");
 }
