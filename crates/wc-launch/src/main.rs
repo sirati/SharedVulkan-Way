@@ -48,6 +48,7 @@ mod mac_hostint;
 #[cfg(target_os = "macos")]
 mod sound_mac;
 mod plan;
+mod single;
 #[cfg(windows)]
 mod shell;
 /// §92. The compositor's own taskbar-identity module, compiled in here too, so
@@ -66,6 +67,8 @@ pub enum Request<'a> {
     Open(&'a str),
 }
 mod token;
+// §92.12: which taskbar identity each application has, decided at deploy.
+mod taskbar_id;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -103,6 +106,13 @@ struct State {
     id: String,
     comp_log: String,
     comp_pid: u32,
+    /// §107: the shared compositor's pid, whose windows this session's are.
+    /// Never this installation's to kill (`--stop` reads `comp_pid` only);
+    /// [`find_window`] looks among its windows.
+    shared_pid: u32,
+    /// §107.11: this session's index in the shared compositor (0 with a
+    /// compositor of its own), whose windows a click measures.
+    session: u8,
     ready: bool,
 }
 
@@ -115,6 +125,8 @@ impl State {
                 "id" => s.id = v.into(),
                 "comp-log" => s.comp_log = v.into(),
                 "comp-pid" => s.comp_pid = v.parse().unwrap_or(0),
+                "shared-pid" => s.shared_pid = v.parse().unwrap_or(0),
+                "session-index" => s.session = v.parse().unwrap_or(0),
                 "ready" => s.ready = v == "1",
                 _ => {}
             }
@@ -123,10 +135,12 @@ impl State {
     }
     fn render(&self) -> String {
         format!(
-            "id={}\ncomp-log={}\ncomp-pid={}\nready={}\n",
+            "id={}\ncomp-log={}\ncomp-pid={}\nshared-pid={}\nsession-index={}\nready={}\n",
             self.id,
             self.comp_log,
             self.comp_pid,
+            self.shared_pid,
+            self.session,
             u8::from(self.ready)
         )
     }
@@ -398,6 +412,9 @@ fn run(
     let mut file: Option<&str> = None;
     let mut uninstall_assoc: Option<Option<&str>> = None;
     // §106 (end)
+    // §92.12: deploy's decision of each application's taskbar identity, and
+    // an installation's removal.
+    let (mut taskbar_ids, mut uninstall_taskbar, mut dry_run, mut test_install) = (false, false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -441,6 +458,10 @@ fn run(
                 uninstall_assoc = Some(next.map(String::as_str));
             }
             // §106 (end)
+            "--taskbar-ids" => taskbar_ids = true,
+            "--uninstall-taskbar" => uninstall_taskbar = true,
+            "--dry-run" => dry_run = true,
+            "--test-install" => test_install = true,
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => app = Some(other),
         }
@@ -454,6 +475,12 @@ fn run(
     }
     if stop {
         return win::stop(cfg, p, log);
+    }
+    if taskbar_ids {
+        return win::taskbar_ids(cfg, p, log, dry_run, test_install);
+    }
+    if uninstall_taskbar {
+        return win::uninstall_taskbar(cfg, p, log, dry_run);
     }
     if let Some(id) = install {
         return win::install(cfg, p, log, id);
@@ -539,13 +566,35 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    fn session_mutex(session: &str) -> String {
+        format!("Local\\waycompose-launch-{session}")
+    }
+
+    /// The question [`claim`] answers — is a session up, so that this click
+    /// is warm — asked without becoming the owner when none is: `OpenMutexW`
+    /// opens the owner's mutex and never creates one (§102.14).
+    fn session_alive(session: &str) -> bool {
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let name = wide(&session_mutex(session));
+        // SAFETY: a NUL-terminated name; the handle is closed at once.
+        unsafe {
+            let h = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+            if h.is_null() {
+                return false;
+            }
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+        true
+    }
+
     /// `Ok(Some)` — we are the owner. `Ok(None)` — somebody else is.
     fn claim(session: &str) -> Result<Option<Owner>, String> {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
         // `Local\` — per logon session, which is the right scope: the desktop
         // this compositor draws on belongs to one.
-        let name = wide(&format!("Local\\waycompose-launch-{session}"));
+        let name = wide(&session_mutex(session));
         // SAFETY: a null security descriptor and a NUL-terminated name.
         let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if h.is_null() {
@@ -781,10 +830,10 @@ mod win {
         }
     }
 
-    fn count_mapped(path: &Path) -> usize {
-        std::fs::read_to_string(path)
-            .map(|t| t.lines().filter(|l| l.contains(" mapped ")).count())
-            .unwrap_or(0)
+    /// The windows mapped so far: every one in a compositor of its own,
+    /// `session`'s only in the shared one (§107.11, [`plan::count_mapped`]).
+    fn count_mapped(path: &Path, session: u8) -> usize {
+        std::fs::read_to_string(path).map(|t| plan::count_mapped(&t, session)).unwrap_or(0)
     }
 
     // -------------------------------------------------------------- verbs ---
@@ -871,6 +920,10 @@ mod win {
     }
 
     /// The whole of it: make sure a session exists, then run the application.
+    ///
+    /// §102.14: a `single` application's plain run goes through
+    /// [`single_gate`] first, and only a click that holds its launch lock
+    /// gets past it.
     pub fn launch(
         cfg: &Config,
         p: &Paths,
@@ -878,6 +931,38 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+    ) -> Result<(), String> {
+        let Some((section, a)) = app.filter(|(_, a)| a.single && matches!(req, crate::Request::Run)) else {
+            return launch_as(cfg, p, log, app, req, t0, &mut None);
+        };
+        let Some(lock) = single_gate(cfg, p, log, section, a)? else {
+            return Ok(());
+        };
+        let mut one = Some(Single { section, app: a, lock: Some(lock), since: Instant::now(), failure: None, notice: None });
+        let r = launch_as(cfg, p, log, app, req, t0, &mut one);
+        let mut one = one.expect("never taken");
+        if let Err(e) = &r
+            && one.notice.is_none()
+        {
+            let f = one.failure.take().unwrap_or_else(|| crate::single::Failure::Session(e.clone()));
+            one.fail(log, f);
+        }
+        drop(one.lock.take());
+        // The process must outlive the dialog it opened.
+        if let Some(n) = one.notice.take() {
+            let _ = n.join();
+        }
+        r
+    }
+
+    fn launch_as(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        app: Option<(&str, &crate::config::App)>,
+        req: crate::Request,
+        t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         // §92. The first launch of an application on this installation, before
         // anything else: its relaunch file must exist before its first window
@@ -888,7 +973,7 @@ mod win {
         // §105: the host is reached only through a session's control ring, so
         // with no session up yet this is done once the session is, before the
         // application is asked for (`first_refresh` below).
-        let first = app.filter(|(section, a)| !relaunch_file(p, section, a).exists()).map(|(s, _)| s);
+        let first = app.filter(|(section, a)| !relaunch_file(cfg, p, section, a).exists()).map(|(s, _)| s);
         if let Some(section) = first
             && (cfg.debug_ssh_transport || p.ctl.exists())
         {
@@ -898,7 +983,7 @@ mod win {
             if let Some(section) = first
                 && !cfg.debug_ssh_transport
                 && let Some((_, a)) = app
-                && !relaunch_file(p, section, a).exists()
+                && !relaunch_file(cfg, p, section, a).exists()
             {
                 refresh(cfg, p, log, section, Refresh::Full);
             }
@@ -910,10 +995,13 @@ mod win {
         let mut owned = claim(&cfg.session)?;
         if owned.is_none() {
             log.say("a session is already up; joining it");
-            match join_and_start(cfg, p, log, app, req, t0) {
+            match join_and_start(cfg, p, log, app, req, t0, one) {
                 Ok(()) => return Ok(()),
                 Err(e) if !p.state.exists() => {
                     log.say(&format!("the session ended under this click ({e}); starting a new one"));
+                    if let Some(o) = one.as_mut() {
+                        o.failure = None;
+                    }
                     let deadline = Instant::now() + Duration::from_secs(30);
                     loop {
                         owned = claim(&cfg.session)?;
@@ -947,9 +1035,11 @@ mod win {
                 log.say(&format!("session up in {} ms", t0.elapsed().as_millis()));
                 first_refresh(log);
                 if let Some((section, a)) = app {
-                    let before = count_mapped(&p.comp_log);
-                    start_app(cfg, p, log, &s.id, a, req)?;
-                    let _ = report(log, &p.comp_log, before, t0, "cold", req);
+                    let before = count_mapped(&s.comp_log, s.session);
+                    start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+                    // §107.11: the session's log, which is the shared compositor's when it
+                    // joined one: this installation's own log then has no windows at all.
+                    let _ = shown(cfg, p, log, one, &s.comp_log, s.session, before, t0, "cold", req);
                     refresh(cfg, p, log, section, Refresh::Full);
                 }
                 // §92. While the session runs, its jump lists follow the
@@ -970,15 +1060,16 @@ mod win {
         app: Option<(&str, &crate::config::App)>,
         req: crate::Request,
         t0: Instant,
+        one: &mut Option<Single>,
     ) -> Result<(), String> {
         let s = join(p, 60)?;
         let Some((section, a)) = app else {
             log.say("--session with a session already up: nothing to do");
             return Ok(());
         };
-        let before = count_mapped(Path::new(&s.comp_log));
-        start_app(cfg, p, log, &s.id, a, req)?;
-        let shown = report(log, Path::new(&s.comp_log), before, t0, "warm", req);
+        let before = count_mapped(Path::new(&s.comp_log), s.session);
+        start_app(cfg, p, log, &s.id, a, req).inspect_err(|e| refused(one, e))?;
+        let shown = shown(cfg, p, log, one, Path::new(&s.comp_log), s.session, before, t0, "warm", req);
         refresh(cfg, p, log, section, Refresh::Full);
         shown
     }
@@ -1010,8 +1101,11 @@ mod win {
         let _ = std::fs::remove_file(&p.ctl);
         let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
         if !key.exists() {
-            return Err(format!(
-                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+            // §111.8: deploy moves the key to the broker's directory, which
+            // this user cannot read; the compositor asks the broker to sign.
+            log.say(&format!(
+                "no installation key at {}: the boot record is the broker's to sign (§111.8); \
+                 without a broker the host's session service refuses the session",
                 key.display()
             ));
         }
@@ -1024,6 +1118,7 @@ mod win {
         let gpu_kid = if cfg.gpu_sessions > 0 { spawn_gpu(cfg, p, log) } else { None };
         let mut argv = plan::compositor_argv(cfg, &socket, &p.comp_log.to_string_lossy());
         argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
+        argv.extend(plan::taskbar_argv(&taskbar_scope(cfg, p).render()));
         argv.extend(plan::boot_argv(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy()));
         if gpu_kid.is_some() {
             argv.push("--boot-gpu".into());
@@ -1094,11 +1189,11 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, ready: true }
+        State { id: id.clone(), comp_log: p.comp_log.display().to_string(), comp_pid, shared_pid: 0, session: 0, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: None, tunnel: None, gpus, comp_log: p.comp_log.clone(), session: 0 })
     }
 
     // ---------------------------------------- §107: the user's compositor ---
@@ -1152,7 +1247,7 @@ mod win {
     /// §107: the user's one compositor, started if nobody holds its mutex.
     /// Two launchers that both start one race for the mutex before either
     /// maps the device; the loser exits and both use the winner's socket.
-    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<(), String> {
+    fn ensure_compositor(cfg: &Config, p: &Paths, log: &mut Log) -> Result<u32, String> {
         let t = Instant::now();
         let mut kid: Option<Child> = None;
         if held(plan::COMPOSITOR_MUTEX) {
@@ -1165,7 +1260,7 @@ mod win {
         loop {
             if let Ok(r) = user_request(p, "ping", Some(Duration::from_secs(5))) {
                 log.say(&format!("compositor: {r} answers ({} ms)", t.elapsed().as_millis()));
-                return Ok(());
+                return Ok(plan::compositor_pid(&r));
             }
             if let Some(k) = kid.as_mut()
                 && let Ok(Some(rc)) = k.try_wait()
@@ -1191,8 +1286,11 @@ mod win {
         let _ = std::fs::remove_file(&p.ctl);
         let key = if cfg.session_key.is_empty() { p.key.clone() } else { cfg.session_key.clone().into() };
         if !key.exists() {
-            return Err(format!(
-                "no installation key at {} (deploy writes it); without it the host's session service refuses the session",
+            // §111.8: deploy moves the key to the broker's directory, which
+            // this user cannot read; the compositor asks the broker to sign.
+            log.say(&format!(
+                "no installation key at {}: the boot record is the broker's to sign (§111.8); \
+                 without a broker the host's session service refuses the session",
                 key.display()
             ));
         }
@@ -1212,15 +1310,33 @@ mod win {
                 spawn_shared_gpu(cfg, p, log);
             }
         }
-        ensure_compositor(cfg, p, log)?;
-        let line = plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy());
+        let shared_pid = ensure_compositor(cfg, p, log)?;
+        let scope = taskbar_scope(cfg, p).render();
+        let boot_line = |taskbar: Option<&str>| {
+            plan::boot_request(cfg, &id, &key.to_string_lossy(), &p.ctl.to_string_lossy(), gpu, &p.apps.to_string_lossy(), taskbar)
+        };
         log.say(&format!(
-            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}",
+            "transport: shared memory only (§105), one compositor for every installation (§107): installation {}, session {id}, taskbar {scope}",
             cfg.installation()
         ));
         let t_boot = Instant::now();
-        let said = user_request(p, &line, Some(Duration::from_secs(120))).map_err(|e| format!("the session did not start: {e}"))?;
+        let said = match user_request(p, &boot_line(Some(&scope)), Some(Duration::from_secs(120))) {
+            // §92.12: the user's compositor was started by an installation
+            // deployed before §92.12, and it refuses the field. The session
+            // still starts; its windows carry the application-wide identity
+            // until that compositor ends, which the log says.
+            Err(e) if e.contains("unknown boot field \"taskbar\"") => {
+                log.say(
+                    "taskbar: THE USER'S COMPOSITOR PREDATES §92.12: this session's windows carry the application-wide \
+                     identity until it ends, not this installation's (§92.12)",
+                );
+                user_request(p, &boot_line(None), Some(Duration::from_secs(120)))
+            }
+            r => r,
+        }
+        .map_err(|e| format!("the session did not start: {e}"))?;
         log.say(&format!("up: {said} ({} ms)", t_boot.elapsed().as_millis()));
+        let session = plan::boot_index(&said);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !p.ctl.exists() {
             if Instant::now() > deadline {
@@ -1231,11 +1347,11 @@ mod win {
         if !cfg.audio {
             log.say("audio: off in wc-launch.ini; the host gives Firefox a null audio context");
         }
-        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, ready: true }
+        State { id: id.clone(), comp_log: comp_log.clone(), comp_pid: 0, shared_pid, session, ready: true }
             .write(&p.state)
             .map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into() })
+        Ok(Session { id, comp: None, relay: None, tunnel: None, gpus: Vec::new(), comp_log: comp_log.into(), session })
     }
 
     /// §107: start a process that must outlive this launcher: the user's
@@ -1295,6 +1411,7 @@ mod win {
         // §92. Where this installation keeps each application's relaunch
         // file, so its windows can be pinned as the application.
         argv.extend(plan::relaunch_argv(&p.apps.to_string_lossy()));
+        argv.extend(plan::taskbar_argv(&taskbar_scope(cfg, p).render()));
         // IVSHMEM ARENA (§83). The arena is BAR2 of the VM's ivshmem device, so
         // its size is the device's, set on the VM host, and `arena-mib` decides
         // nothing. Said once per session so that a log read later cannot
@@ -1437,11 +1554,13 @@ mod win {
             id: id.clone(),
             comp_log: p.comp_log.display().to_string(),
             comp_pid,
+            shared_pid: 0,
+            session: 0,
             ready: true,
         };
         state.write(&p.state).map_err(|e| format!("state file: {e}"))?;
         log.say(&format!("cold start: {} ms", t.elapsed().as_millis()));
-        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone() })
+        Ok(Session { id, comp: Some(comp), relay: Some(relay), tunnel: Some(tunnel), gpus, comp_log: p.comp_log.clone(), session: 0 })
     }
 
     pub struct Session {
@@ -1455,6 +1574,8 @@ mod win {
         /// The GPU sides this session started (§86); empty without `gpu-sessions`.
         gpus: Vec<Child>,
         comp_log: std::path::PathBuf,
+        /// §107.11: its index in the shared compositor, 0 with its own.
+        session: u8,
     }
 
     /// The forwarded GPU (§86, §87): one `sv-guest.exe gpu guest` on the GPU
@@ -1702,6 +1823,7 @@ mod win {
     fn report(
         log: &mut Log,
         comp_log: &Path,
+        session: u8,
         before: usize,
         t0: Instant,
         kind: &str,
@@ -1714,7 +1836,7 @@ mod win {
         let optional = !matches!(req, crate::Request::Run);
         let deadline = Instant::now() + Duration::from_secs(if optional { 15 } else { 120 });
         loop {
-            if count_mapped(&path) > before {
+            if count_mapped(&path, session) > before {
                 log.say(&format!(
                     "CLICK-TO-WINDOW {} ms ({kind}, {} window(s) before)",
                     t0.elapsed().as_millis(),
@@ -1732,6 +1854,316 @@ mod win {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    // ------------------------------------------------- §102.14 single apps ---
+
+    /// A launch of a `single` application by the click that holds its launch
+    /// lock.
+    pub struct Single<'a> {
+        section: &'a str,
+        app: &'a crate::config::App,
+        /// Held from the gate until the window appears or the launch fails.
+        lock: Option<LaunchLock>,
+        since: Instant,
+        /// Why the launch failed, where the failure was seen; the outer
+        /// `launch` tells the user only if the launch ends in an error.
+        failure: Option<crate::single::Failure>,
+        /// The dialog's thread, joined before the process exits.
+        notice: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Single<'_> {
+        /// Let the lock go first — a second click must not wait on a dialog —
+        /// then tell the user, on a thread of its own, so an owner keeps
+        /// supervising its session while the dialog is up.
+        fn fail(&mut self, log: &mut Log, f: crate::single::Failure) {
+            drop(self.lock.take());
+            let langs = crate::appmeta::lang_candidates(&crate::shell::ui_languages());
+            let text = crate::single::message(&f, &self.app.title, crate::single::german(&langs));
+            log.say(&format!(
+                "single: {}: FAILED after {} ms ({f:?}); lock released; telling the user: {}",
+                self.section,
+                self.since.elapsed().as_millis(),
+                text.lines().next().unwrap_or("")
+            ));
+            let caption = self.app.title.clone();
+            self.notice = Some(std::thread::spawn(move || message_box(&caption, &text)));
+        }
+    }
+
+    fn refused(one: &mut Option<Single>, e: &str) {
+        if let Some(o) = one.as_mut() {
+            o.failure = Some(crate::single::Failure::Refused(e.to_string()));
+        }
+    }
+
+    /// After the host accepted the run: a plain application waits for the
+    /// compositor's `mapped` line ([`report`]); a single one for its own
+    /// window, so that the lock is let go exactly when a second click can
+    /// find what it is looking for.
+    #[allow(clippy::too_many_arguments)]
+    fn shown(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        one: &mut Option<Single>,
+        comp_log: &Path,
+        session: u8,
+        before: usize,
+        t0: Instant,
+        kind: &str,
+        req: crate::Request,
+    ) -> Result<(), String> {
+        use crate::single::{Launching, launching};
+        let Some(o) = one.as_mut() else { return report(log, comp_log, session, before, t0, kind, req) };
+        loop {
+            let w = find_window(cfg, p, o.section, o.app);
+            match launching(w.is_some(), o.since.elapsed()) {
+                Launching::Up => {
+                    drop(o.lock.take());
+                    log.say(&format!(
+                        "CLICK-TO-WINDOW {} ms ({kind}, single; its window is up, launch lock released)",
+                        t0.elapsed().as_millis()
+                    ));
+                    return Ok(());
+                }
+                Launching::NoWindow => {
+                    o.fail(log, crate::single::Failure::NoWindow);
+                    return Err("no window appeared".into());
+                }
+                Launching::Again => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// The launch lock, a named mutex this process owns.
+    pub struct LaunchLock(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LaunchLock {
+        fn drop(&mut self) {
+            // SAFETY: a mutex this thread owns (taken by the wait that made
+            // this value) and a handle this process has not closed.
+            unsafe {
+                windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// A handle to the launch lock that does not own it yet, closed on drop.
+    struct LockHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for LockHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle this process opened and has not closed.
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+            }
+        }
+    }
+
+    impl LockHandle {
+        fn open(name: &str) -> Result<LockHandle, String> {
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+            let n = wide(name);
+            // SAFETY: a null security descriptor and a NUL-terminated name;
+            // not initially owned, so this creates or opens and nothing more.
+            let h = unsafe { CreateMutexW(std::ptr::null(), 0, n.as_ptr()) };
+            if h.is_null() {
+                return Err(format!("CreateMutexW({name}): {}", std::io::Error::last_os_error()));
+            }
+            Ok(LockHandle(h))
+        }
+        fn wait(&self, ms: u32) -> crate::single::Lock {
+            // SAFETY: our handle.
+            crate::single::Lock::from_wait(unsafe {
+                windows_sys::Win32::System::Threading::WaitForSingleObject(self.0, ms)
+            })
+        }
+        /// The lock, now owned: its handle moves into the guard.
+        fn owned(mut self) -> LaunchLock {
+            LaunchLock(std::mem::replace(&mut self.0, std::ptr::null_mut()))
+        }
+    }
+
+    /// §102.14, before anything is sent to the host. `Ok(None)`: this click
+    /// is done (it focused the window, or went quietly). `Ok(Some)`: this
+    /// click launches, holding the lock.
+    fn single_gate(
+        cfg: &Config,
+        p: &Paths,
+        log: &mut Log,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Result<Option<LaunchLock>, String> {
+        use crate::single::{First, Lock, Waiting, first, waiting};
+        let t = Instant::now();
+        let window = find_window(cfg, p, section, app);
+        let name = crate::single::lock_name(&cfg.session, section);
+        let handle = LockHandle::open(&name)?;
+        let mut taken = Lock::Held;
+        match first(window.is_some(), || {
+            taken = handle.wait(0);
+            taken
+        }) {
+            First::Focus => {
+                let (hwnd, by) = window.expect("Focus only with a window");
+                focus(log, section, hwnd, by, "a window is already up");
+                return Ok(None);
+            }
+            First::Launch => {
+                log.say(&format!(
+                    "single: {section}: no window, nobody launching; launching, holding {name}{}",
+                    if taken == Lock::Abandoned { " (its last holder exited without letting go)" } else { "" }
+                ));
+                return Ok(Some(handle.owned()));
+            }
+            First::Wait => log.say(&format!(
+                "single: {section}: another click is launching it; waiting up to {} s for its window, no run sent",
+                crate::single::WAIT_BOUND.as_secs()
+            )),
+        }
+        let mut released = false;
+        loop {
+            let window = find_window(cfg, p, section, app);
+            match waiting(window.is_some(), released, t.elapsed()) {
+                Waiting::Focus => {
+                    let (hwnd, by) = window.expect("Focus only with a window");
+                    focus(log, section, hwnd, by, &format!("the other click's window is up after {} ms", t.elapsed().as_millis()));
+                    return Ok(None);
+                }
+                Waiting::FirstFailed => {
+                    log.say(&format!(
+                        "single: {section}: the other click's launch ended without a window (it tells the user); this click does nothing"
+                    ));
+                    return Ok(None);
+                }
+                Waiting::GaveUp => {
+                    log.say(&format!(
+                        "single: {section}: no window and no release in {} s; this click does nothing",
+                        crate::single::WAIT_BOUND.as_secs()
+                    ));
+                    return Ok(None);
+                }
+                Waiting::Again => {
+                    // Taken here means let go there. Let go at once (dropping
+                    // the guard), and look for the window once more.
+                    if handle.wait(250).ours() {
+                        released = true;
+                        // SAFETY: owned by this thread from the wait above.
+                        unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(handle.0) };
+                    }
+                }
+            }
+        }
+    }
+
+    /// The application's window in this installation's session, if it has
+    /// one: a visible, unowned top-level window of the session's compositor
+    /// with the application's identity, or its exact title where the identity
+    /// cannot be read. The compositor's pid is the state file's, and only
+    /// while the session's own mutex says the session is up — the same test
+    /// that makes a click warm.
+    fn find_window(
+        cfg: &Config,
+        p: &Paths,
+        section: &str,
+        app: &crate::config::App,
+    ) -> Option<(windows_sys::Win32::Foundation::HWND, crate::single::By)> {
+        if !session_alive(&cfg.session) {
+            return None;
+        }
+        let s = std::fs::read_to_string(&p.state).map(|t| State::parse(&t)).ok()?;
+        // §107: with the shared compositor the windows are its process's.
+        let pid = crate::single::window_pid(s.comp_pid, s.shared_pid);
+        if pid == 0 {
+            return None;
+        }
+        let (hwnds, ws) = windows_of(pid);
+        let aumid = app_aumid(cfg, p, section, app);
+        crate::single::find(&ws, pid, &aumid, &app.title).map(|(i, by)| (hwnds[i], by))
+    }
+
+    /// Every top-level window of process `pid`, as [`crate::single::Window`]s.
+    fn windows_of(pid: u32) -> (Vec<windows_sys::Win32::Foundation::HWND>, Vec<crate::single::Window>) {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, InternalGetWindowText, IsWindowVisible,
+        };
+        unsafe extern "system" fn each(hwnd: HWND, l: LPARAM) -> windows_sys::core::BOOL {
+            // SAFETY: `l` is the `Vec` below, alive for the whole enumeration.
+            unsafe { (*(l as *mut Vec<HWND>)).push(hwnd) };
+            1
+        }
+        let mut all: Vec<HWND> = Vec::new();
+        // SAFETY: the callback only pushes into `all`, which outlives the call.
+        unsafe { EnumWindows(Some(each), &mut all as *mut Vec<HWND> as LPARAM) };
+        crate::shell::init();
+        let mut hwnds = Vec::new();
+        let mut ws = Vec::new();
+        for h in all {
+            let mut owner_pid = 0u32;
+            // SAFETY: a handle from EnumWindows; a stale one answers 0.
+            unsafe { GetWindowThreadProcessId(h, &mut owner_pid) };
+            if owner_pid != pid {
+                continue;
+            }
+            let mut buf = [0u16; 512];
+            // SAFETY: as above. `InternalGetWindowText` reads the title
+            // without sending the window a message, so a busy compositor
+            // cannot hang this click.
+            let (visible, owned, n) = unsafe {
+                (
+                    IsWindowVisible(h) != 0,
+                    !GetWindow(h, GW_OWNER).is_null(),
+                    InternalGetWindowText(h, buf.as_mut_ptr(), buf.len() as i32),
+                )
+            };
+            let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            let aumid = if visible && !owned { crate::shell::window_aumid(h) } else { None };
+            hwnds.push(h);
+            ws.push(crate::single::Window { pid: owner_pid, visible, owned, aumid, title });
+        }
+        (hwnds, ws)
+    }
+
+    /// Restore the window if it is minimised, then bring it to the front.
+    /// This process is the one the user's click started, so Windows lets it
+    /// take the foreground; if it refuses, the taskbar button flashes.
+    fn focus(
+        log: &mut Log,
+        section: &str,
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        by: crate::single::By,
+        what: &str,
+    ) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync};
+        // SAFETY: a window handle just found; a stale one fails each call.
+        let (restored, front) = unsafe {
+            let iconic = IsIconic(hwnd) != 0;
+            if iconic {
+                ShowWindowAsync(hwnd, SW_RESTORE);
+            }
+            (iconic, SetForegroundWindow(hwnd) != 0)
+        };
+        log.say(&format!(
+            "single: {section}: {what} (hwnd 0x{:x}, by {}); {}{}; no run sent",
+            hwnd as usize,
+            match by {
+                crate::single::By::Identity => "identity",
+                crate::single::By::Title => "title",
+            },
+            if restored { "restored it, " } else { "" },
+            if front { "brought it to the front" } else { "SetForegroundWindow refused (the button flashes)" },
+        ));
+    }
+
+    fn message_box(caption: &str, text: &str) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+        let (c, t) = (wide(caption), wide(text));
+        // SAFETY: NUL-terminated strings that outlive the modal call.
+        unsafe { MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND) };
     }
 
     /// The owner stays for the session's life so that the mutex does, and so
@@ -1788,11 +2220,225 @@ mod win {
         // is a file nobody sees.
         let desktop = crate::shell::known_folder(&crate::shell::FOLDER_DESKTOP)?;
         let path = desktop.join(format!("{}.lnk", file_name(&app.title)));
-        crate::shell::save_link(&shortcut(p, id, app), &path)?;
+        crate::shell::save_link(&shortcut(cfg, p, id, app), &path)?;
         log.say(&format!("installed {}", path.display()));
         // §106: the types its desktop entry opens, from the host's answer
         // that `refresh` just cached. `--uninstall-assoc` takes them back.
         crate::hostint::deploy(cfg, &p.apps, &exe_path(), icon_path(p, id).as_deref(), id, cached_meta(p, id).as_ref(), log);
+        Ok(())
+    }
+
+    // ------------------------------------------------- §92.12 identities ---
+
+    /// A line in the log and on standard output (deploy reads the log; a
+    /// person running the verb by hand sees the output).
+    fn tell(log: &mut Log, msg: &str) {
+        log.say(msg);
+        println!("{msg}");
+    }
+
+    /// Every shortcut with one of our identities, in the three places one
+    /// can be: the user's pins, the desktop and the Start menu's programs.
+    fn scan_links(log: &mut Log) -> Vec<crate::taskbar_id::Link> {
+        use crate::taskbar_id::{Link, Place};
+        let mut dirs: Vec<(Place, std::path::PathBuf)> = Vec::new();
+        if let Some(a) = std::env::var_os("APPDATA") {
+            dirs.push((Place::Pinned, std::path::PathBuf::from(a).join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar")));
+        }
+        for (place, folder) in [(Place::Desktop, crate::shell::FOLDER_DESKTOP), (Place::StartMenu, crate::shell::FOLDER_PROGRAMS)] {
+            match crate::shell::known_folder(&folder) {
+                Ok(d) => dirs.push((place, d)),
+                Err(e) => tell(log, &format!("taskbar-id: {}: {e}", place.as_str())),
+            }
+        }
+        let mut out = Vec::new();
+        for (place, dir) in dirs {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let path = e.path();
+                if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+                    continue;
+                }
+                // Ours by identity; or, when the identity cannot be read, a
+                // shortcut of some installation's `wc-launch.exe`.
+                let launcher = |t: &str| Path::new(t).file_name().is_some_and(|n| n.eq_ignore_ascii_case("wc-launch.exe"));
+                match crate::shell::read_link(&path) {
+                    Ok((target, aumid))
+                        if aumid.as_deref().map_or(launcher(&target), |a| a.starts_with(crate::taskbar::PREFIX)) =>
+                    {
+                        out.push(Link { place, path: path.display().to_string(), target, aumid });
+                    }
+                    Ok(_) => {}
+                    Err(e) => tell(log, &format!("taskbar-id: {}: {e}", path.display())),
+                }
+            }
+        }
+        out
+    }
+
+    /// `%LOCALAPPDATA%\waycompose\taskbar\<identity>.owner`: which
+    /// installation holds an application-wide identity.
+    fn claim_path(p: &Paths, legacy: &str) -> std::path::PathBuf {
+        p.state_dir.join("taskbar").join(format!("{legacy}.owner"))
+    }
+
+    fn read_claim(p: &Paths, legacy: &str) -> Option<crate::taskbar_id::Claim> {
+        let text = std::fs::read_to_string(claim_path(p, legacy)).ok()?;
+        let owner = text.lines().next()?.trim().to_string();
+        let owner_exists = Path::new(&owner).exists();
+        (!owner.is_empty()).then_some(crate::taskbar_id::Claim { owner, owner_exists })
+    }
+
+    /// §92.12. `--taskbar-ids [--dry-run] [--test-install]`, run by deploy
+    /// after it copied the new ini: decide each application's identity
+    /// (`taskbar_id::decide`), write it into `wc-launch.ini`, claim the
+    /// application-wide identity where this installation keeps it, give this
+    /// installation's own unpinned shortcuts its own identity where it does
+    /// not, and remove the relaunch file of the form it no longer uses.
+    /// `wc-launch.ini.prev`, the ini deploy replaced, carries the decisions
+    /// of earlier deploys, so none flips.
+    pub fn taskbar_ids(cfg: &Config, p: &Paths, log: &mut Log, dry: bool, test: bool) -> Result<(), String> {
+        use crate::config::TaskbarId;
+        use crate::taskbar_id::{ClaimAction, Input, decide};
+        crate::shell::init();
+        let exe = exe_path();
+        let prev_path = p.exe_dir.join("wc-launch.ini.prev");
+        let carried = crate::config::taskbar_ids(&std::fs::read_to_string(&prev_path).unwrap_or_default());
+        let mut text = std::fs::read_to_string(&p.ini).map_err(|e| format!("{}: {e}", p.ini.display()))?;
+        let explicit = crate::config::taskbar_ids(&text);
+        let links = scan_links(log);
+        tell(log, &format!(
+            "taskbar-id: installation {}, {} shortcut(s) of a Waycompose launcher{}{}",
+            cfg.installation(),
+            links.len(),
+            if test { ", a test installation" } else { "" },
+            if dry { ", dry run" } else { "" }
+        ));
+        for l in &links {
+            tell(log, &format!(
+                "taskbar-id:   {} {} -> {} [{}]",
+                l.place.as_str(),
+                l.path,
+                l.target,
+                l.aumid.as_deref().unwrap_or("identity unreadable")
+            ));
+        }
+        let exists = |s: &str| Path::new(s).exists();
+        for (section, app) in &cfg.apps {
+            let legacy = legacy_aumid(p, section, app);
+            let own = appmeta::aumid(Some(cfg.installation()), &app.app_id, &app.desktop, cached_meta(p, section).as_ref());
+            let claim = read_claim(p, &legacy);
+            let d = decide(&Input {
+                legacy_aumid: &legacy,
+                own_exe: &exe,
+                persisted: carried.get(section).or(explicit.get(section)).copied(),
+                test,
+                claim: claim.as_ref(),
+                links: &links,
+                exists: &exists,
+            });
+            let (chosen, other) = if d.id == TaskbarId::Legacy { (&legacy, &own) } else { (&own, &legacy) };
+            tell(log, &format!("taskbar-id: {section} {} {chosen}: {}", d.id.as_str(), d.why));
+            for w in &d.warnings {
+                tell(log, &format!("taskbar-id: {section}: WARNING: {w}"));
+            }
+            for r in &d.rewrite {
+                tell(log, &format!("taskbar-id: {section}: {r}: {legacy} -> {own}"));
+            }
+            if dry {
+                continue;
+            }
+            text = crate::config::set_taskbar_id(&text, section, d.id)?;
+            if d.claim == ClaimAction::Write {
+                let c = claim_path(p, &legacy);
+                let _ = std::fs::create_dir_all(c.parent().unwrap_or(Path::new(".")));
+                std::fs::write(&c, format!("{exe}\n")).map_err(|e| format!("{}: {e}", c.display()))?;
+                tell(log, &format!("taskbar-id: {section}: claimed {legacy} ({})", c.display()));
+            }
+            for r in &d.rewrite {
+                if let Err(e) = crate::shell::set_link_aumid(Path::new(r), &own) {
+                    tell(log, &format!("taskbar-id: {section}: {r}: {e}"));
+                }
+            }
+            if let Some(f) = crate::taskbar::relaunch_file_name(other) {
+                let f = p.apps.join(f);
+                if f.exists() && std::fs::remove_file(&f).is_ok() {
+                    tell(log, &format!("taskbar-id: {section}: removed {}, the form this installation does not use", f.display()));
+                }
+            }
+        }
+        if !dry {
+            std::fs::write(&p.ini, &text).map_err(|e| format!("{}: {e}", p.ini.display()))?;
+            let _ = std::fs::remove_file(&prev_path);
+            Config::parse(&text).map_err(|e| format!("the ini with its taskbar ids does not parse: {e}"))?;
+            tell(log, &format!("taskbar-id: wrote {}", p.ini.display()));
+        }
+        Ok(())
+    }
+
+    /// §92.12. `--uninstall-taskbar [--dry-run]`: take back this
+    /// installation's jump lists (its own identity's, and the
+    /// application-wide one only while it holds the claim), its claims, its
+    /// desktop and Start menu shortcuts, its relaunch files and its jump-list
+    /// files. Never another installation's. Pins are the user's to take off
+    /// the taskbar, and are listed.
+    pub fn uninstall_taskbar(cfg: &Config, p: &Paths, log: &mut Log, dry: bool) -> Result<(), String> {
+        crate::shell::init();
+        let exe = exe_path();
+        let links = scan_links(log);
+        for (section, app) in &cfg.apps {
+            let legacy = legacy_aumid(p, section, app);
+            let own = appmeta::aumid(Some(cfg.installation()), &app.app_id, &app.desktop, cached_meta(p, section).as_ref());
+            let claim = read_claim(p, &legacy);
+            let r = crate::taskbar_id::plan_removal(app.taskbar_id, &own, &legacy, &exe, claim.as_ref(), &links);
+            tell(log, &format!(
+                "taskbar-id: remove {section}: jump list {}, claim {}, {} shortcut(s), {} pin(s) left to the user{}",
+                r.delete_list.as_deref().unwrap_or("(not this installation's)"),
+                if r.remove_claim { "removed" } else { "none" },
+                r.remove_links.len(),
+                r.pins_left.len(),
+                if dry { ", dry run" } else { "" }
+            ));
+            for l in &r.pins_left {
+                tell(log, &format!("taskbar-id:   pinned: {l}"));
+            }
+            if dry {
+                continue;
+            }
+            if let Some(id) = &r.delete_list
+                && let Err(e) = crate::shell::delete_jump_list(id)
+            {
+                tell(log, &format!("taskbar-id: {section}: {e}"));
+            }
+            if r.remove_claim {
+                let _ = std::fs::remove_file(claim_path(p, &legacy));
+            }
+            for l in &r.remove_links {
+                if let Err(e) = std::fs::remove_file(l) {
+                    tell(log, &format!("taskbar-id: {l}: {e}"));
+                }
+            }
+            if app.taskbar_id == crate::config::TaskbarId::Install {
+                let dir = jump_dir(cfg, p, section, app);
+                let _ = std::fs::remove_dir_all(&dir);
+                // `jumplist\<installation>`, once its last application is gone.
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+        if !dry {
+            let mut n = 0;
+            if let Ok(rd) = std::fs::read_dir(&p.apps) {
+                for e in rd.flatten() {
+                    let path = e.path();
+                    if path.extension().is_some_and(|x| x == crate::taskbar::RELAUNCH_EXT) && std::fs::remove_file(&path).is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+            tell(log, &format!("taskbar-id: removed {n} relaunch file(s) from {}", p.apps.display()));
+        }
         Ok(())
     }
 
@@ -1823,13 +2469,43 @@ mod win {
             .and_then(|t| appmeta::Meta::parse(&t).ok())
     }
 
-    fn app_aumid(p: &Paths, section: &str, app: &crate::config::App) -> String {
-        appmeta::aumid(&app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    /// §92.12. The installation whose identity an application carries here:
+    /// this one's, or `None` for the application-wide identity.
+    fn install_of<'a>(cfg: &'a Config, app: &crate::config::App) -> Option<&'a str> {
+        (app.taskbar_id == crate::config::TaskbarId::Install).then(|| cfg.installation())
+    }
+
+    fn app_aumid(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> String {
+        appmeta::aumid(install_of(cfg, app), &app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    }
+
+    /// The application-wide identity, which this installation carries only
+    /// with `taskbar-id = legacy` (§92.12).
+    fn legacy_aumid(p: &Paths, section: &str, app: &crate::config::App) -> String {
+        appmeta::aumid(None, &app.app_id, &app.desktop, cached_meta(p, section).as_ref())
+    }
+
+    /// §92.12. This installation's scope, for the boot and `--taskbar-scope`.
+    pub fn taskbar_scope(cfg: &Config, p: &Paths) -> crate::taskbar::Scope {
+        plan::taskbar_scope(cfg, |section, app| {
+            let meta = cached_meta(p, section);
+            appmeta::window_app_id(&app.app_id, &app.desktop, meta.as_ref()).to_string()
+        })
+    }
+
+    /// §92.12. The jump list's icons, removed pages and refresh period: the
+    /// application's directory as before for the application-wide identity,
+    /// which keeps what the user removed; the installation's own otherwise.
+    fn jump_dir(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
+        match install_of(cfg, app) {
+            None => p.jump.join(section),
+            Some(i) => p.jump.join(i).join(section),
+        }
     }
 
     /// The relaunch file the compositor will look for for this application.
-    pub fn relaunch_file(p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
-        let aumid = app_aumid(p, section, app);
+    pub fn relaunch_file(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> std::path::PathBuf {
+        let aumid = app_aumid(cfg, p, section, app);
         p.apps.join(crate::taskbar::relaunch_file_name(&aumid).unwrap_or_default())
     }
 
@@ -1839,14 +2515,14 @@ mod win {
     }
 
     /// The shortcut a click, the Start menu or a pin runs: `wc-launch.exe <section>`.
-    fn shortcut(p: &Paths, section: &str, app: &crate::config::App) -> crate::shell::LinkSpec {
+    fn shortcut(cfg: &Config, p: &Paths, section: &str, app: &crate::config::App) -> crate::shell::LinkSpec {
         crate::shell::LinkSpec {
             target: exe_path(),
             args: appmeta::quote_arg(section),
             workdir: p.exe_dir.display().to_string(),
             description: format!("{}, running on the Linux host", app.title),
             icon: icon_path(p, section),
-            aumid: Some(app_aumid(p, section, app)),
+            aumid: Some(app_aumid(cfg, p, section, app)),
             title: None,
         }
     }
@@ -1870,7 +2546,7 @@ mod win {
         crate::shell::init();
         let t = Instant::now();
         let _ = std::fs::create_dir_all(&p.apps);
-        let jump = p.jump.join(section);
+        let jump = jump_dir(cfg, p, section, app);
         let _ = std::fs::create_dir_all(&jump);
         let dark = crate::shell::taskbar_is_dark();
 
@@ -1892,7 +2568,7 @@ mod win {
             }
         }
         let meta = cached_meta(p, section);
-        let aumid = appmeta::aumid(&app.app_id, &app.desktop, meta.as_ref());
+        let aumid = appmeta::aumid(install_of(cfg, app), &app.app_id, &app.desktop, meta.as_ref());
 
         if what == Refresh::Full {
             // 2. The icon, the relaunch file and the Start menu entry.
@@ -1914,7 +2590,7 @@ mod win {
             match crate::shell::known_folder(&crate::shell::FOLDER_PROGRAMS) {
                 Ok(dir) => {
                     let lnk = dir.join(format!("{}.lnk", file_name(&app.title)));
-                    if let Err(e) = crate::shell::save_link(&shortcut(p, section, app), &lnk) {
+                    if let Err(e) = crate::shell::save_link(&shortcut(cfg, p, section, app), &lnk) {
                         log.say(&format!("pins: Start menu {}: {e}", lnk.display()));
                     }
                 }
@@ -2046,8 +2722,8 @@ mod win {
             loop {
                 let secs = cfg
                     .apps
-                    .keys()
-                    .filter_map(|s| std::fs::read_to_string(p.jump.join(s).join("refresh-secs")).ok())
+                    .iter()
+                    .filter_map(|(s, a)| std::fs::read_to_string(jump_dir(&cfg, &p, s, a).join("refresh-secs")).ok())
                     .filter_map(|s| s.trim().parse::<u64>().ok())
                     .min()
                     .unwrap_or(120)

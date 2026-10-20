@@ -4,11 +4,16 @@
 #
 #   scripts/wc-launch.sh deploy    cross-compile, copy both halves, write the ini
 #   scripts/wc-launch.sh install   put the shortcut on the guest's real desktop
+#   scripts/wc-launch.sh taskbar-plan       what deploy would decide for each
+#                                          application's taskbar identity (§92.12)
+#   scripts/wc-launch.sh uninstall-taskbar  this installation's jump lists, shortcuts
+#                                          and relaunch files, never another's
 #   scripts/wc-launch.sh cold      no session; click; time it
 #   scripts/wc-launch.sh warm      session already up; click; time it
 #   scripts/wc-launch.sh native    the same measurement for Windows' own Firefox
 #   scripts/wc-launch.sh shot      photograph the window that is up
 #   scripts/wc-launch.sh stop      end the session
+#   scripts/wc-launch.sh broker-show / broker-uninstall   the §111.8 broker service
 #   scripts/wc-launch.sh all       deploy, install, native, cold, warm, shot
 #
 # Run from inside `nix develop`.
@@ -167,6 +172,12 @@ esac
 # (`scripts/wc-port-access.ps1 install`), which is what lets a medium-integrity
 # launch open them. `skip` leaves the guest's device security alone.
 PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
+# §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
+# from Program Files) and gives it this installation's key; the broker opens
+# the devices for the user's processes, so the per-user port grant above is
+# superseded and its task removed. `skip` keeps §91's grant and the key in the
+# user's install directory, as before §111.
+BROKER="${WC_LAUNCH_BROKER:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 # §105: the pre-§105 transport (ssh exec, relay, tunnel) as an opt-in debug
@@ -519,6 +530,56 @@ UNIT
 }
 
 # ---------------------------------------------------------------- deploy -----
+# §92.12. Each application's taskbar identity: `Waycompose.install.<name>.<app>`
+# for this installation alone, or the application-wide `Waycompose.app.<app>`
+# where this is the installation whose pin (or, with no pin, whose desktop
+# shortcut) already carries it, so the user's taskbar does not change.
+# `wc-launch.exe --taskbar-ids` decides on the guest from the user's shortcuts
+# and the claim files, keeps any earlier decision (wc-launch.ini.prev), writes
+# `taskbar-id` into the ini, and gives this installation's own unpinned
+# shortcuts its own identity where it does not keep the old one. A test
+# installation (WC_LAUNCH_TEST_HOME set here, or a `test-home` file beside its
+# wc-session on the VM host) and WC_LAUNCH_TASKBAR_ID=install always get their
+# own. `dry` only prints the plan.
+taskbar_ids() {
+  local dry="${1:-}" flags="" why=""
+  if [ -n "${WC_LAUNCH_TEST_HOME:-}" ]; then why="WC_LAUNCH_TEST_HOME is set"
+  elif [ "${WC_LAUNCH_TASKBAR_ID:-auto}" = install ]; then why="WC_LAUNCH_TASKBAR_ID=install"
+  elif h "test -s $HOSTDIR/test-home"; then why="$HOSTDIR/test-home exists"
+  fi
+  [ -n "$why" ] && flags="--test-install"
+  [ "$dry" = dry ] && flags="$flags --dry-run"
+  local before out
+  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --taskbar-ids $flags" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  [ -n "$why" ] && note "a test installation ($why): its applications get its own taskbar identity"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  [ "$dry" = dry ] && return
+  case "$out" in
+    *"taskbar-id: wrote "*)
+      ok "taskbar identities (§92.12): $(printf '%s\n' "$out" | grep -E '^taskbar-id: [^ ]+ (legacy|install) ' | sed 's/^taskbar-id: //; s/:.*//' | paste -sd ';')" ;;
+    *) bad "wc-launch --taskbar-ids did not write the ini" ;;
+  esac
+}
+
+# §92.12. Take this installation off the taskbar: its own jump lists (and the
+# application-wide one only while it holds the claim), its claim, desktop and
+# Start menu shortcuts, relaunch and jump-list files. Never another
+# installation's. Pins are listed for the user to remove.
+do_uninstall_taskbar() {
+  echo "== uninstall-taskbar =="
+  local before out
+  before=$(g "wc -l < $APPDATA_MSYS/wc-launch-$SESSION.log 2>/dev/null" | tr -d '\r ')
+  g "export MSYS_NO_PATHCONV=1; cd $DIR_MSYS && ./wc-launch.exe --session-name $SESSION --uninstall-taskbar ${1:-}" >/dev/null 2>&1
+  out=$(g "tail -n +$((${before:-0} + 1)) $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep 'taskbar-id:' | sed 's/^\[[0-9]*\] //')
+  printf '%s\n' "$out" | sed 's/^/        /'
+  case "$out" in
+    *"relaunch file(s)"*|*"dry run"*) ok "this installation's taskbar presence removed${1:+ (dry run)}" ;;
+    *) bad "wc-launch --uninstall-taskbar said nothing" ;;
+  esac
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
@@ -600,7 +661,7 @@ do_deploy() {
     built_ok "${PIPESTATUS[0]}" "sv-hostd and sv-icd" || exit 1
     cp "$REL_WIN/sv-guest.exe" "$stage/sv-guest.exe"
   fi
-  cp "$ROOT/scripts/wc-port-access.ps1" "$stage/"
+  cp "$ROOT/scripts/wc-port-access.ps1" "$ROOT/scripts/wc-broker-install.ps1" "$stage/"
   write_runint "$stage/runint.ps1"
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
@@ -632,7 +693,7 @@ audio-volume = $AUDIO_VOLUME
 gpu-sessions = $GPU_SESSIONS
 gpu-arena-mib = $GPU_ARENA_MIB
 # §97: one pool over the whole GPU device, leased as each session needs it;
-# `slots` is §87's fixed slots of gpu-arena-mib.
+# \`slots\` is §87's fixed slots of gpu-arena-mib.
 gpu-arena  = ${WC_LAUNCH_GPU_ARENA:-pool}
 gpu-ivshmem-slot = ${WC_LAUNCH_GPU_SLOT:-0x1d}
 gpu-bell   = ${WC_LAUNCH_GPU_BELL-org.sirati.svbell.0}
@@ -642,6 +703,10 @@ wayland-bell = ${WC_LAUNCH_WAYLAND_BELL-org.sirati.wcbell.0}
 # §102: WC_LAUNCH_NESTED_GLOBALS=1 offers wp_single_pixel_buffer_manager_v1,
 # wp_viewporter and wp_presentation, which a nested compositor (KWin) needs.
 nested-compositor-globals = $([ "${WC_LAUNCH_NESTED_GLOBALS:-0}" = 1 ] && echo on || echo off)
+# §107: one compositor for every installation of the user; off is §105's own
+# compositor per installation (WC_LAUNCH_SHARED_COMPOSITOR=off), for an
+# installation that is not to join the shared one yet.
+shared-compositor = ${WC_LAUNCH_SHARED_COMPOSITOR:-on}
 
 [app.firefox]
 title = $TITLE
@@ -701,6 +766,10 @@ APPS
        ForEach-Object { Stop-Process -Id \\\$_.ProcessId -Force -ErrorAction SilentlyContinue }\"" \
     >/dev/null 2>&1
   sleep 1
+  # §92.12: the ini about to be replaced carries each application's taskbar
+  # identity (`taskbar-id`), decided by an earlier deploy; `--taskbar-ids`
+  # below reads it from here, so no decision flips.
+  g "cd $DIR_MSYS && if [ -f wc-launch.ini ]; then cp -f wc-launch.ini wc-launch.ini.prev; else rm -f wc-launch.ini.prev; fi" >/dev/null 2>&1
   scp "${SSHOPT[@]}" "$stage"/* "$GUEST:$DIRNAME/" >/dev/null || { echo "error: scp to the guest"; exit 1; }
   echo "  copied wc-launch.exe, sv-guest.exe, wc-desk.exe, probe-relay.exe and the ini to $DIR_WIN"
   # STAGE 42. `sv-guest.exe` is the GPU side, which is the binary the
@@ -711,6 +780,7 @@ APPS
   # run rather than diagnosed from a handshake failure during it.
   deployed_all "$stage" "$DIR_MSYS" g "re-run $0 deploy with nothing of ours running on the guest" \
     wc-launch.exe sv-guest.exe wc-desk.exe || exit 1
+  taskbar_ids
 
   # §91. The doorbell ports for a medium-integrity launch: the two port devices'
   # descriptor gains read and write for $PORT_USER (and nothing else changes),
@@ -719,7 +789,20 @@ APPS
   # descriptor until it is free (opening a held vioser port disconnects its
   # holder); the PnP property, which the next device start applies, is written
   # regardless. `scripts/wc-port-access.ps1 -Action uninstall` undoes all of it.
-  if [ "$PORT_ACCESS" = install ]; then
+  if [ "$BROKER" = install ]; then
+    # §111.8: the broker service. It sets the four devices to SYSTEM and
+    # Administrators only at every start, and lends them to the user's own
+    # processes; §91's task and grant are removed by the same script.
+    local bi
+    bi=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action install -Source '$DIR_WIN'" | tr -d '\r')
+    echo "$bi" | sed 's/^/        /'
+    if echo "$bi" | grep -q 'installed:'; then
+      ok "the broker service runs from Program Files as LocalSystem; the devices are lent by it"
+    else
+      bad "the broker service was not installed; sessions open the devices themselves (and a medium-integrity one is refused)"
+    fi
+  elif [ "$PORT_ACCESS" = install ]; then
     local pa
     pa=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
           -File '$DIR_WIN\\wc-port-access.ps1' -Action install -User $PORT_USER" | tr -d '\r')
@@ -747,13 +830,30 @@ APPS
            (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
            chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
-  printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
-      icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
-  key=""
-  local kchk
-  kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
-  [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
-    || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  if [ "$BROKER" = install ]; then
+    # §111.8: the key goes to the broker, which signs the boot record with
+    # it and with the caller's identity; the user cannot read it, so a user
+    # process cannot sign a record that claims another user.
+    local ki
+    ki=$(printf '%s' "$key" | g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r')
+    key=""
+    echo "$ki" | sed 's/^/        /'
+    if echo "$ki" | grep -q 'stored in'; then
+      g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/session.key" >/dev/null
+      ok "the installation key is the broker's (ProgramData\\waycompose\\keys, SYSTEM and Administrators only); the user's copy is removed"
+    else
+      bad "the installation key did not reach the broker"
+    fi
+  else
+    printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
+        icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
+    key=""
+    local kchk
+    kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
+    [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
+      || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  fi
   # §105: the installation, registered with the host's session service by name.
   h "mkdir -p \$HOME/.config/waycompose/installs && ln -sfn $HOSTDIR \$HOME/.config/waycompose/installs/$SESSION" >/dev/null
 
@@ -985,15 +1085,42 @@ do_install() {
   # §92. Since the shortcuts are written through IShellLinkW, the install also
   # wrote the icon, the relaunch file, the Start menu entry and the jump list,
   # and logged one `pins:` line per step that went wrong and one for the list.
-  local pins
+  local pins never_run=0
   pins=$(g "tail -30 $APPDATA_MSYS/wc-launch-$SESSION.log" | tr -d '\r' | grep '\] pins: ')
-  if g "test -s $DIR_MSYS/firefox.ico && test -s $DIR_MSYS/apps/Waycompose.app.firefox.relaunch && echo yes" | grep -q yes; then
-    ok "Firefox's own icon and its relaunch file: $DIR_WIN\\firefox.ico, $DIR_WIN\\apps\\Waycompose.app.firefox.relaunch"
+  # §92.12: the identity is this installation's own, or the application-wide
+  # one where deploy found the user's pin of it (`taskbar-id` in the ini).
+  # (A name with capitals also gets a hash suffix, which this check does not
+  # compute; deployed names are lower case.)
+  local tid aumid
+  tid=$(g "awk '/^\\[/{s=\$0} s==\"[app.firefox]\" && /^taskbar-id/{print \$3}' $DIR_MSYS/wc-launch.ini" | tr -d '\r')
+  if [ "$tid" = legacy ]; then aumid=Waycompose.app.firefox
+  else aumid="Waycompose.install.$(printf '%s' "$SESSION" | tr 'A-Z' 'a-z').firefox"; fi
+  # §107.11: the icon and the jump list are the host's answer about the
+  # application, and since §105 that answer comes over a session's control
+  # ring. An installation no session has run yet has nothing to ask and
+  # nothing cached; the first session's refresh writes both. That is not a
+  # failure; any other reason for a missing icon or list still is.
+  if printf '%s\n' "$pins" | grep -q 'no session to ask' \
+    && ! g "test -s $DIR_MSYS/apps/firefox.meta && echo cached" | grep -q cached; then
+    never_run=1
+  fi
+  if g "test -s $DIR_MSYS/apps/$aumid.relaunch && echo yes" | grep -q yes; then
+    ok "Firefox's relaunch file: $DIR_WIN\\apps\\$aumid.relaunch"
   else
-    bad "no icon or no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+    bad "no relaunch file"; printf '%s\n' "$pins" | sed 's/^/        /'
+  fi
+  if g "test -s $DIR_MSYS/firefox.ico && echo yes" | grep -q yes; then
+    ok "Firefox's own icon: $DIR_WIN\\firefox.ico"
+  elif [ "$never_run" = 1 ]; then
+    ok "no icon yet: no session of $SESSION has run, so there is no host to ask; the first session writes it"
+  else
+    bad "no icon"; printf '%s\n' "$pins" | sed 's/^/        /'
   fi
   case "$pins" in
     *"jump list "*" task(s)"*) ok "$(printf '%s\n' "$pins" | grep 'jump list ' | tail -1 | sed 's/^.*pins: //')" ;;
+    *"no desktop entry known yet"*) [ "$never_run" = 1 ] \
+      && ok "no jump list yet: no session of $SESSION has run; the first session commits it" \
+      || bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
     *) bad "no jump list: $(printf '%s\n' "$pins" | tail -2)" ;;
   esac
 }
@@ -1433,6 +1560,13 @@ do_verify() {
 n=""; warms=""; i=""
 case "$MODE" in
   deploy)  do_deploy ;;
+  broker-show)
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action show" | tr -d '\r' ;;
+  broker-uninstall)
+    # §111.8's revert: the service goes, the devices get their descriptors
+    # from before, and the keys stay (re-deploy with WC_LAUNCH_BROKER=skip
+    # puts a key back in the user's directory).
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action uninstall" | tr -d '\r' ;;
   bench)   do_bench ;;
   warmbench)
     n="${WC_LAUNCH_RUNS:-4}"; warms=""
@@ -1455,6 +1589,8 @@ case "$MODE" in
        done' | sed 's/^/        /' ;;
   verify)  do_verify ;;
   install) do_install ;;
+  taskbar-plan) echo "== taskbar-plan (dry run) =="; taskbar_ids dry ;;
+  uninstall-taskbar) do_uninstall_taskbar "${WC_LAUNCH_DRY_RUN:+--dry-run}" ;;
   cold)    do_cold ;;
   warm)    do_warm ;;
   native)  do_native ;;
@@ -1462,7 +1598,7 @@ case "$MODE" in
   stop)    do_stop ;;
   clock)   read_clock ;;
   all)     do_deploy; echo; do_install; echo; do_native; echo; do_cold; echo; do_warm; echo; do_shot ;;
-  *) echo "usage: $0 deploy|install|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
+  *) echo "usage: $0 deploy|install|taskbar-plan|uninstall-taskbar|cold|warm|bench|native|verify|shot|stop|clock|all"; exit 2 ;;
 esac
 
 echo

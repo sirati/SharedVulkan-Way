@@ -48,6 +48,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -n "$CLIENT" ] || { echo "no wayland-info"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $([ "${WC_NO_SSH_PROFILE:-debug}" = release ] && echo --release) $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -93,7 +99,7 @@ start_hub() {
   for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
 }
 start_service() {
-  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
     ${1:+--bell "$1"} --poll-ms "${2:-1000}" >>"$D/sessiond.log" 2>&1 &
   SVC=$!; PIDS+=("$SVC")
 }
@@ -196,6 +202,12 @@ echo "$SEQ" >"$D/state/wcns.seq"
 
 say "leg 5: no ring port at all: polled, said loudly, still no ssh"
 kill "$PORT" 2>/dev/null
+# The host end's loop outlives its socat for a moment and, with
+# `unlink-early`, made host.sock again after the rm below: the session then
+# found a doorbell socket, and the proxy never said it polls. Its loop and
+# listener go first.
+pkill -f "$D/qemu-host-end.sh" 2>/dev/null; pkill -f "UNIX-LISTEN:$D/host.sock" 2>/dev/null
+for _ in $(seq 1 40); do pgrep -f "UNIX-LISTEN:$D/host.sock" >/dev/null || break; sleep 0.05; done
 # A VM without the port has no chardev for a hub to hold either.
 kill "$HUB" 2>/dev/null; wait "$HUB" 2>/dev/null; rm -f "$D/hub/"*.sock "$D/host.sock"
 kill "$SVC" 2>/dev/null; wait "$SVC" 2>/dev/null

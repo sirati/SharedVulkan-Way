@@ -2492,13 +2492,13 @@ mod dmabuf_tests {
     }
 
     fn token(name: &str, size: u64) -> OwnedFd {
-        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into() };
-        sv_drm::token::create(&t).unwrap()
+        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into(), record: String::new() };
+        sv_drm::token::create(&t).unwrap().fd
     }
 
     /// The same bytes in a memfd nobody sealed.
     fn unsealed_token(name: &str, size: u64) -> OwnedFd {
-        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into() };
+        let t = sv_drm::token::Token { size, nonce: [7; 16], name: name.into(), record: String::new() };
         let bytes = t.encode();
         // SAFETY: a literal name and valid flags.
         let raw = unsafe { libc::memfd_create(c"unsealed".as_ptr(), libc::MFD_CLOEXEC) };
@@ -2694,6 +2694,70 @@ mod dmabuf_tests {
         dm.h.send_words(b, 0, &[]);
         assert_eq!(dm.upstream_since(n), vec![(b, 0, vec![])]);
         assert_eq!(event(&mut dm.h, 1, 1, &b.to_ne_bytes()).0, wire::message(1, 1, &b.to_ne_bytes()));
+    }
+
+    /// §104.11: a commit of a buffer whose token has a sync page is preceded
+    /// upstream by a `wc_gpu_fence_v1.wait` for the number in that page, on
+    /// an object at the id one past the client's highest, bound and destroyed
+    /// around it; its `delete_id` never reaches the client, and a number
+    /// already sent is not sent again.
+    #[test]
+    fn a_commit_waits_for_the_frames_gpu_work_in_the_compositor() {
+        let (mut dm, _) = setup("p104-fence", true);
+        const FENCE_NAME: u32 = 77;
+        let record = "/dev/shm/sv-fence-9-0-0011223344556677";
+        // The compositor announces its fence global; the client never sees it.
+        let (out, _) = event(&mut dm.h, dm.registry, 0, &global_body(FENCE_NAME, "wc_gpu_fence_v1", 1));
+        assert!(out.is_empty(), "hidden from the client");
+
+        let t = sv_drm::token::Token {
+            size: u64::from(W * H * 4),
+            nonce: [7; 16],
+            name: "Local\\sv-shared-9-1-0123456789abcdef".into(),
+            record: record.into(),
+        };
+        let created = sv_drm::token::create(&t).unwrap();
+        let p = dm.params();
+        dm.add(p, created.dup().unwrap(), 0, W * 4, MOD_LINEAR);
+        let b = dm.create_immed(p, W, H, crate::session::DRM_FORMAT_XRGB8888);
+        dm.h.send_words(dm.surface, 1, &[b, 0, 0]);
+
+        // Nothing exported yet: a plain commit.
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(dm.surface, 6, &[]);
+        assert_eq!(dm.upstream_since(n).iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(), [(dm.surface, 6)]);
+
+        // The ICD exported frame 5's sync fd: the commit is preceded by the wait.
+        created.mark(5);
+        let id = dm.h.session.objects.next_client_id();
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(dm.surface, 6, &[]);
+        let up = dm.upstream_since(n);
+        assert_eq!(up.len(), 4, "{up:?}");
+        let mut bind = Vec::new();
+        bind.extend_from_slice(&FENCE_NAME.to_ne_bytes());
+        wire::push_string(&mut bind, "wc_gpu_fence_v1");
+        bind.extend_from_slice(&1u32.to_ne_bytes());
+        bind.extend_from_slice(&id.to_ne_bytes());
+        assert_eq!(up[0], (dm.registry, 0, bind));
+        let mut wait = Vec::new();
+        wire::push_string(&mut wait, record);
+        wait.extend_from_slice(&0u32.to_ne_bytes());
+        wait.extend_from_slice(&5u32.to_ne_bytes());
+        assert_eq!(up[1], (id, 1, wait));
+        assert_eq!(up[2], (id, 0, vec![]));
+        assert_eq!((up[3].0, up[3].1), (dm.surface, 6));
+        assert_eq!(dm.h.session.stats.dmabuf_fence_waits, 1);
+
+        // The same number again: nothing more to wait for.
+        let n = dm.h.upstream_messages().len();
+        dm.h.send_words(dm.surface, 6, &[]);
+        assert_eq!(dm.upstream_since(n).len(), 1);
+
+        // The compositor's delete_id for the borrowed id is dropped; the
+        // client's own object at that id is then the client's again.
+        assert!(event(&mut dm.h, 1, 1, &id.to_ne_bytes()).0.is_empty());
+        assert_eq!(dm.h.id(), id, "the client's next id is the one borrowed");
     }
 
     #[test]

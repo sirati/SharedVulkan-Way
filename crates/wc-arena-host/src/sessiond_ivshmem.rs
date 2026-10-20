@@ -61,6 +61,9 @@ struct Args {
     /// §108 through §111.10: the guest-RAM substrate's flags, for the
     /// embedded component that serves them (`embedded()`).
     guest_ram: wc_broker::host::GuestRam,
+    /// Where the sessions it started itself are recorded (default
+    /// `$XDG_RUNTIME_DIR/wc-sessiond/live`).
+    live: Option<PathBuf>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -75,12 +78,13 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         users: None,
         server: String::new(),
         accept_unidentified: false,
-        agents: "/run/waycompose/agent".into(),
+        agents: "/run/waycompose-agent".into(),
         broker: None,
         gpu_region: None,
         hub_wl: None,
         hub_sv: None,
         guest_ram: Default::default(),
+        live: None,
     };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
@@ -102,6 +106,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--gpu-region" => a.gpu_region = Some(v()?.into()),
             "--hub-wl" => a.hub_wl = Some(v()?.into()),
             "--hub-sv" => a.hub_sv = Some(v()?.into()),
+            "--live" => a.live = Some(v()?.into()),
             "--guest-ram-boot" => a.guest_ram.boot = Some(v()?.into()),
             "--guest-ram-qemu-pid" | "--guest-ram-qemu-pidfile" | "--guest-ram" => {
                 use wc_broker::host::QemuRam;
@@ -581,8 +586,13 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     } else {
         say("NO DOORBELL HUB given: the arena's header page is read every poll interval only");
     }
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let mut live = Live::load(runtime.join("wc-sessiond/live"));
+    // The sessions this service started itself (not through an agent), so a
+    // restarted service still ends them. `--live`: a harness keeps its own.
+    let live_dir = args.live.clone().unwrap_or_else(|| {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        runtime.join("wc-sessiond/live")
+    });
+    let mut live = Live::load(live_dir);
     if !live.map.is_empty() {
         say(&format!("adopted running session(s): {:?}", live.map.keys().collect::<Vec<_>>()));
     }
@@ -876,6 +886,45 @@ mod tests {
         let mut p = page(0x77, &r, Some(&a));
         p[..8].fill(0);
         assert_eq!(check(&p, &inst, &st), Ok(None));
+    }
+
+    /// §111.6, §111.8: a record the guest's broker signed carries the guest
+    /// user it was signed for; the service takes it with the record, and a
+    /// record whose identity was rewritten in the page (by the user process
+    /// that can write it), removed, or made unreadable is refused.
+    #[test]
+    fn a_broker_signed_record_carries_its_identity_and_a_rewritten_one_is_refused() {
+        let t = tmp("identity");
+        let k = [5u8; 32];
+        install(&t.0, "wcivs", &k);
+        let (inst, st) = (t.0.join("installs"), t.0.join("state"));
+        let r = rec(0x77);
+        let alice = macboot::Identity { os: "windows".into(), user: "alice".into(), id: "S-1-5-21-1-2-3-1001".into() };
+        let bob = macboot::Identity { os: "windows".into(), user: "bob".into(), id: "S-1-5-21-1-2-3-1002".into() };
+        let a = macboot::Auth::sign_identity(&r, 2, Some(&alice), "wcivs", 20, &k);
+        let signed = || {
+            let mut p = page(0x77, &r, None);
+            // SAFETY: a 4096-byte buffer this test owns.
+            unsafe { macboot::publish_identity(p.as_mut_ptr(), &r, 2, Some(&alice), Some(&a)) };
+            p
+        };
+        let got = check(&signed(), &inst, &st).unwrap().unwrap();
+        assert_eq!((got.index, got.identity.as_ref()), (2, Some(&alice)));
+        let mut p = signed();
+        bob.write(&mut p);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not verify"), "another user's identity written over it");
+        let mut p = signed();
+        p[macboot::OFF_IDENTITY..macboot::OFF_IDENTITY + 8].fill(0);
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not verify"), "the identity removed");
+        let mut p = signed();
+        p[macboot::OFF_IDENTITY + 10] = b' ';
+        assert!(check(&p, &inst, &st).unwrap_err().contains("does not parse"), "an identity that does not parse");
+        // A record signed without a broker has none, and is §107's.
+        let b = macboot::Auth::sign_indexed(&r, 2, "wcivs", 21, &k);
+        let mut p = page(0x77, &r, None);
+        // SAFETY: as above.
+        unsafe { macboot::publish_identity(p.as_mut_ptr(), &r, 2, None, Some(&b)) };
+        assert_eq!(check(&p, &inst, &st).unwrap().unwrap().identity, None);
     }
 
     /// §107: a shared compositor's record carries its session's index, which

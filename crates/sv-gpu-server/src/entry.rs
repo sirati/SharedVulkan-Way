@@ -446,7 +446,7 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let control = Arc::new(control);
     let _doorman = match arg("--bell") {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+        Some(name) => match sv_gpu_server::pool_guest::open_bell(&name)
             .and_then(|p| sv_transport::vdoorbell::attach(p, Arc::clone(&control)))
         {
             Ok(d) => {
@@ -540,7 +540,7 @@ fn win_guest_ivshmem(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
     let geometry = geometry_for(arena_size);
     let started = std::time::Instant::now();
-    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    let (view, size, path) = sv_gpu_server::pool_guest::map_ivshmem_slot(pci)?;
     let plan = SlotPlan::new(size, geometry, max)?;
     eprintln!(
         "[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, {} session slot(s) of \
@@ -563,7 +563,7 @@ fn win_guest_ivshmem(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let set = sv_transport::vdoorbell::ControlSet::new();
     let _doorman = match arg("--bell") {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+        Some(name) => match sv_gpu_server::pool_guest::open_bell(&name)
             .and_then(|p| sv_transport::vdoorbell::attach_set(p, Arc::clone(&set)))
         {
             Ok(d) => {
@@ -1935,7 +1935,7 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => pci.parse()?,
     };
     let started = std::time::Instant::now();
-    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    let (view, size, path) = sv_gpu_server::pool_guest::map_ivshmem_slot(pci)?;
     eprintln!("[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, the pool's region 0", started.elapsed(), size >> 20);
     // SAFETY: the view lives until this function returns, which is never
     // while a session runs: `serve_pool` does not return while it serves,

@@ -80,6 +80,8 @@ block2 = "0.6"
 [target.'cfg(windows)'.dependencies]
 # §106: the host's platform calls for host integration (endpoints, the shell opener, handlers).
 wc-hostplat = { workspace = true }
+# §111.8: the arena device and the wcbell port, lent by the broker.
+wc-broker = { workspace = true }
 # GROWTH. `SuperfetchPfnQuery`, which is how a region this process has just
 # committed says *where its pages are* without the host having to search 13 GiB
 # of backing object for stamps. ~330 ms of guest CPU whatever the window, and

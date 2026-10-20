@@ -237,6 +237,16 @@ unsafe impl Send for Pipe {}
 /// through the one handle this returns.
 #[cfg(windows)]
 pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
+    // SAFETY: a handle this process just opened on a port, owned by nobody else.
+    open_virtio_port_handle(name, timeout_ms).map(|h| unsafe { Pipe::from_port_handle(h) })
+}
+
+/// The open half of [`open_virtio_port`]: the raw handle, opened overlapped,
+/// owned by the caller (§111.8: the broker opens the port, moves the handle
+/// into the process that rings it, and that process wraps it with
+/// [`Pipe::from_port_handle`]).
+#[cfg(windows)]
+pub fn open_virtio_port_handle(name: &str, timeout_ms: u32) -> Result<isize> {
     // **Two spellings, tried in order, and the second is not a guess.**
     //
     // `\\.\Global\<name>` is the one to want: the session-0 namespace, reachable
@@ -277,7 +287,7 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
     // is what the ten seconds are for. ERROR_ACCESS_DENIED is one of two
     // things: the port's descriptor refuses this token (vioser's default admits
     // only SYSTEM and Administrators, so a medium-integrity launch from Explorer
-    // is refused until `scripts/wc-port-access.ps1` has run), or another process
+    // is refused; since §111.8 the broker opens it and moves the handle), or another process
     // holds it (a port has one opener). Neither goes away in ten seconds, and
     // retrying for ten made every such launch ten seconds slower: §90.3's
     // `gpu ok … (10378 ms)`. One second covers a previous session that is still
@@ -300,7 +310,7 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
                 )
             };
             if handle != sys::INVALID_HANDLE_VALUE {
-                return Ok(Pipe { handle, server: false, overlapped: true });
+                return Ok(handle);
             }
             last = unsafe { sys::GetLastError() } as i32;
         }
@@ -309,8 +319,8 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
         if last == ERROR_ACCESS_DENIED && now >= denied_deadline.min(deadline) {
             return Err(Error::Os {
                 call: "CreateFileW (virtio-serial port: access denied, so either this token may \
-                       not open it -- vioser admits only Administrators until \
-                       scripts/wc-port-access.ps1 has granted the user, waycompose-design.md §91 -- \
+                       not open it -- the ports admit only SYSTEM and Administrators, and the \
+                       broker (sv-guest broker, waycompose-design.md §111.8) opens them for users -- \
                        or another process holds it)",
                 errno: last,
             });
@@ -324,6 +334,17 @@ pub fn open_virtio_port(name: &str, timeout_ms: u32) -> Result<Pipe> {
 
 #[cfg(windows)]
 impl Pipe {
+    /// Wrap a virtio-serial port handle opened overlapped, as
+    /// [`open_virtio_port_handle`] opens one (in this process, or in the
+    /// broker that moved it here, §111.8).
+    ///
+    /// # Safety
+    /// `handle` must be an open port handle opened with
+    /// `FILE_FLAG_OVERLAPPED`, owned by the caller and closed by nobody else.
+    pub unsafe fn from_port_handle(handle: isize) -> Pipe {
+        Pipe { handle, server: false, overlapped: true }
+    }
+
     /// Create the pipe and block until a client connects.
     ///
     /// One instance, because one session has one peer. `PIPE_REJECT_REMOTE_

@@ -88,8 +88,34 @@ pub struct Grow {
     pub start: Box<dyn FnOnce(Arc<SharedRegion>, Arc<crate::pool::PoolServer>) -> Result<(), String> + Send>,
 }
 
+/// The GPU process's doorbell port from `--bell`'s spec (§111.8): on a
+/// Windows guest the broker opens the port and moves it here; without a
+/// broker, or for any other spelling, [`PortHandle::open`] as before.
+///
+/// [`PortHandle::open`]: sv_transport::vdoorbell::PortHandle::open
+pub fn open_bell(spec: &str) -> std::io::Result<sv_transport::vdoorbell::PortHandle> {
+    #[cfg(windows)]
+    if let Some(p) = wc_broker::client::lend::port(spec, "gpu") {
+        return Ok(sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)));
+    }
+    sv_transport::vdoorbell::PortHandle::open(spec)
+}
+
+/// The ivshmem device in PCI slot `slot`, mapped (§111.8): lent by the broker
+/// when there is one, opened here otherwise; mapped by the same code either way.
+#[cfg(windows)]
+pub fn map_ivshmem_slot(slot: u8) -> std::io::Result<(wc_handle::MappedView, u64, String)> {
+    use wc_broker::client::lend;
+    if let Some(d) = lend::ivshmem_name(slot).and_then(|n| lend::ivshmem(&n, "gpu")) {
+        return wc_handle::map_ivshmem_device(d);
+    }
+    wc_handle::map_ivshmem_slot(slot)
+}
+
 /// Serve sessions from a pool over `boot`, for the life of the process.
 pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>, grow: Option<Grow>) -> Result<(), String> {
+    // §104.10 item 5: a GPU process that crashed left its sections behind.
+    crate::shared::sweep_stale_once();
     // SAFETY: only the address is taken, to name the pool's range for its
     // doorbell (§110); nothing is read or written through it here.
     let boot_base = unsafe { boot.base_ptr() } as usize;
@@ -145,7 +171,7 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>,
     // stands a socket in for the port.
     let _doorman = match &bell {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::open(name)
+        Some(name) => match open_bell(name)
             .and_then(|p| poolcold::attach_guest_bell_for(p, Arc::clone(&set), Arc::clone(&cold), boot_base, boot.len()))
         {
             Ok(d) => {

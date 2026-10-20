@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="wc_gpu_fence_v1">
+
+  <copyright>
+    SPDX-License-Identifier: MIT OR Apache-2.0
+  </copyright>
+
+  <description summary="wait for a GPU frame before reading a shared section">
+    The dma-buf path of docs/waycompose-design.md §104 hands the compositor a
+    wl_shm pool whose memory is a section the guest's GPU process writes. The
+    GPU work that writes a frame is numbered by the client's Vulkan driver
+    (sv-icd) when it is submitted, and the GPU process writes "completed up to
+    n" into a small named section, the fence record, when the work is done
+    (§104.11).
+
+    wc-proxy sends wait(record, n) immediately before the wl_surface.commit
+    of such a buffer, on an object it binds for that one message and destroys
+    right after. The compositor does not process the commit until the record
+    says completed >= n, or a short limit has passed.
+
+    Bound by wc-proxy only; it never offers this global to its clients.
+  </description>
+
+  <interface name="wc_gpu_fence_v1" version="1">
+    <request name="destroy" type="destructor"/>
+
+    <request name="wait">
+      <description summary="wait until record says completed >= seq">
+        record is a section name (Local\sv-fence-...) or, on a local run, a
+        /dev/shm path; its basename starts with "sv-fence-". It holds
+        "SVFENCE1" and then completed, a little-endian u64. seq is
+        seq_hi * 2^32 + seq_lo.
+      </description>
+      <arg name="record" type="string"/>
+      <arg name="seq_hi" type="uint"/>
+      <arg name="seq_lo" type="uint"/>
+    </request>
+  </interface>
+</protocol>

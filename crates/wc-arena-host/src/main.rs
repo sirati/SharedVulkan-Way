@@ -708,15 +708,19 @@ mod sessiond_ivshmem;
 /// the BAR file itself.
 #[cfg(unix)]
 fn broker_read(argv: &[String]) -> std::process::ExitCode {
-    use std::io::{Read, Write};
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
     let Some(path) = argv.first() else {
         eprintln!("usage: wc-arena-host broker-read PATH|broker:ID [BYTES]");
         return std::process::ExitCode::from(2);
     };
     let n: u64 = argv.get(1).and_then(|s| s.parse().ok()).unwrap_or(4096).min(1 << 20);
+    // Positional reads only: every fd of a broker region shares one file
+    // offset with the daemon's and the session's other processes'.
     let r = wc_broker::client::open_path(std::path::Path::new(path)).and_then(|f| {
-        let mut buf = Vec::new();
-        f.take(n).read_to_end(&mut buf)?;
+        let len = f.metadata()?.len().min(n) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact_at(&mut buf, 0)?;
         std::io::stdout().write_all(&buf)
     });
     match r {

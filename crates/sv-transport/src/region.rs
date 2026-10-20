@@ -832,6 +832,11 @@ pub fn shm_create(path: &str, len: u64) -> Result<std::fs::File> {
 /// names either by its `memory-backend-file` path or by `/proc/<pid>/fd/<n>`.
 #[cfg(target_os = "linux")]
 pub fn open_named(path: &str) -> Result<std::fs::File> {
+    // waycompose-design.md §111.10: a region the broker published for this
+    // process's user, which it may not open by path.
+    if let Some(r) = crate::brokered::open_region(path) {
+        return r.map_err(|e| Error::Os { call: "open(broker region)", errno: e.raw_os_error().unwrap_or(13 /* EACCES: refused by the broker */) });
+    }
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)

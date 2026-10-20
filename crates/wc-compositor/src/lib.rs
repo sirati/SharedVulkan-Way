@@ -53,6 +53,7 @@ pub mod grow;
 /// docs/waycompose-design.md §96: pointer locks, confinement and relative motion,
 /// the part of them that is arithmetic.
 mod hold;
+mod gpu_fence;
 /// §106: the host-integration channel, served by the process that owns the rings.
 pub mod hostint;
 mod icon;
@@ -675,6 +676,23 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
             }
+            // §92.12. The one-session compositor's installation, so its
+            // windows carry that installation's taskbar identity: `INSTALL`
+            // or `INSTALL:APP,…` (the apps that keep the application-wide
+            // one). A shared compositor learns it per session from `boot`.
+            "--taskbar-scope" => {
+                match it.next().map(|s| taskbar::Scope::parse(&s)) {
+                    Some(Ok(s)) => taskbar::set_default_scope(s),
+                    Some(Err(e)) => {
+                        eprintln!("wc-compositor: --taskbar-scope: {e}");
+                        return Err(2);
+                    }
+                    None => {
+                        eprintln!("wc-compositor: --taskbar-scope wants INSTALL[:APP,…]");
+                        return Err(2);
+                    }
+                }
+            }
             // §102. See `Args::nested_globals`.
             "--nested-compositor-globals" => args.nested_globals = true,
             // §85. 0 means "as soon as the last window is gone".
@@ -1233,7 +1251,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         } else {
             0
         };
-        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+        // §111.8: the broker opens the arena device (device 0, PCI slot
+        // 0x1c) and moves it here; this process maps it as it maps one it
+        // opened. Without a broker, the device is opened here as before.
+        #[cfg(windows)]
+        let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
+        #[cfg(not(windows))]
+        let lent: Option<()> = None;
+        let attached = match lent {
+            #[cfg(windows)]
+            Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
+            _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
+        };
+        let rings_at = match attached {
             Ok(r) => {
                 println!(
                     "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \

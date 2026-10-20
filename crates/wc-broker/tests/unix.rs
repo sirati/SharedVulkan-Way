@@ -243,3 +243,28 @@ fn a_service_is_reached_through_the_broker() {
     assert!(me.connect_service("nope").unwrap_err().to_string().contains("no service"));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// §112: a connection handed in rather than accepted (sv-drm forwards one end
+/// of a socket pair a sandboxed process made) is served like any other, and
+/// its identity is the pair's maker, as the kernel says.
+#[test]
+fn a_forwarded_connection_is_served_as_its_maker() {
+    let d = dir("inject");
+    std::fs::write(d.join("arena"), vec![0u8; 4096]).unwrap();
+    let unix = Unix::bind(d.join("broker.sock"), vec![DevicePath { name: "arena".into(), path: d.join("arena") }]).unwrap();
+    let inject = unix.injector();
+    let devices = vec![DeviceSpec { name: "arena".into(), allow: Allow::AnyUser }];
+    let config = Config { devices, services: vec![], keys: None, release: Release::OwnerFree, budget: None, run: 9 };
+    let b = Broker::new(unix, config);
+    std::thread::spawn(move || b.serve());
+    let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    inject.send(theirs).unwrap();
+    let mut s = mine;
+    s.write_all(b"hello sandboxed\n").unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(&s), &mut line).unwrap();
+    // SAFETY: no arguments.
+    let uid = unsafe { libc::geteuid() };
+    assert_eq!(line.trim(), format!("ok hello 0000000000000009 uid:{uid} {}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+}

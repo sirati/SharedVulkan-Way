@@ -224,21 +224,39 @@ pub struct RegionReply {
     pub len: u64,
     pub epoch: u64,
     pub pieces: Vec<Piece>,
+    /// What the platform's region-init hook said about a new region, one
+    /// word (§111.8: the guest-RAM stamp's nonce, §108.8). `None` without one.
+    pub note: Option<String>,
 }
 
 pub fn region_line(r: &crate::core::RegionInfo, pieces: &[Piece]) -> String {
-    format!("ok region {} {} {} {} {}", r.id, r.pool, r.len, r.epoch, pieces_text(pieces))
+    region_line_noted(r, pieces, None)
+}
+
+/// [`region_line`] with the region-init hook's word at the end (§111.8).
+pub fn region_line_noted(r: &crate::core::RegionInfo, pieces: &[Piece], note: Option<&str>) -> String {
+    let mut l = format!("ok region {} {} {} {} {}", r.id, r.pool, r.len, r.epoch, pieces_text(pieces));
+    if let Some(n) = note.filter(|n| !n.is_empty() && !n.contains([' ', '\n'])) {
+        l.push(' ');
+        l.push_str(n);
+    }
+    l
 }
 
 pub fn parse_region(line: &str) -> Result<RegionReply, String> {
     let w: Vec<&str> = line.split(' ').collect();
-    match w.as_slice() {
+    let (head, note) = match w.as_slice() {
+        [head @ .., note] if head.len() == 7 => (head, Some(note.to_string())),
+        all => (all, None),
+    };
+    match head {
         ["ok", "region", id, pool, len, epoch, pieces] => Ok(RegionReply {
             id: id.parse().map_err(|_| "id")?,
             pool: pool.to_string(),
             len: len.parse().map_err(|_| "len")?,
             epoch: epoch.parse().map_err(|_| "epoch")?,
             pieces: parse_pieces(pieces).ok_or("pieces")?,
+            note,
         }),
         _ => Err(reply_error(line)),
     }
@@ -303,6 +321,9 @@ mod tests {
         let r = parse_region(&region_line(&info, &pieces)).unwrap();
         assert_eq!((r.id, r.pool.as_str(), r.len, r.epoch), (3, "pool-1", 128 << 20, 2));
         assert_eq!(r.pieces, pieces);
+        assert_eq!(r.note, None);
+        let n = parse_region(&region_line_noted(&info, &pieces, Some("nonce=00ff"))).unwrap();
+        assert_eq!((n.note.as_deref(), &n.pieces), (Some("nonce=00ff"), &pieces));
         assert_eq!(parse_region("err no region 9").unwrap_err(), "no region 9");
     }
 }

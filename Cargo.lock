@@ -1294,6 +1294,7 @@ dependencies = [
  "sv-ram",
  "sv-transport",
  "sv-wire",
+ "wc-broker",
  "wc-handle",
 ]
 
@@ -1305,6 +1306,7 @@ dependencies = [
  "sv-gpu-server",
  "sv-ram",
  "sv-transport",
+ "wc-broker",
  "wc-compositor",
  "wc-handle",
 ]

@@ -16,7 +16,12 @@
 #   session; the nested-compositor globals for one session only; a wrong key refused while the others run; one session's proxy
 #   killed, the others unaffected, its regions reused by the next boot; the
 #   compositor killed and started again; `down` for all and the compositor's
-#   own end; a BAR too small for a third session's region, refused cleanly.
+#   own end; a BAR too small for a third session's region, refused cleanly; one pool over a
+#   second region (§110); host integration on beside the arena (§106); one
+#   installation closed and another opened while the compositor keeps running,
+#   on the slots the first gave back (§107.11).
+#
+# WC_MULTI_ONLY_REOPEN=1 runs leg 10 alone.
 #
 # Run from inside `nix develop` after
 # `cargo build -p wc-compositor -p wc-proxy -p wc-arena-host -p sv-hostd -p wc-launch`.
@@ -51,6 +56,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -x "$SHM" ] || { echo "no weston-presentation-shm"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -106,7 +117,7 @@ start_hub() {
   for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
 }
 start_service() {
-  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
     --bell "$D/hub/wl.sock" --poll-ms 60000 >>"$D/sessiond.log" 2>&1 &
   SVC=$!; PIDS+=("$SVC")
 }
@@ -118,7 +129,8 @@ start_compositor() {
   XDG_RUNTIME_DIR="$D/crt" WC_IVSHMEM_STANDIN="$D/arena" "$BIN/wc-compositor" \
     --arena-ivshmem 0 --arena-outbound 0:1048576 --wayland-rings "$D/guest.sock" \
     --socket "wcm$$-$tag" --in-band --timeout 600 --exit-when-empty $LINGER \
-    --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} >"$D/comp-$tag.log" 2>&1 &
+    --user-control "$D/user.ctl" --singleton "wc-multi-$$" ${region:+--pool-region-file "$region"} \
+    ${COMP_EXTRA:-} >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
   wait_line "$D/comp-$tag.log" 'user control socket' 20 || bad "compositor $tag: no user control socket"
 }
@@ -139,9 +151,9 @@ held_by() { # COMPLOG INDEX: MiB granted to session INDEX, as the compositor log
   grep -o "arena: session $2 granted region [^:]*: [0-9]* MiB at [0-9]* MiB" "$1" | awk '{s+=$7} END {print s+0}'
 }
 
-if [ -n "${WC_MULTI_ONLY_ONE_POOL:-}" ]; then start_port; start_hub; start_service; COMP=; fi
+if [ -n "${WC_MULTI_ONLY_ONE_POOL:-}${WC_MULTI_ONLY_REOPEN:-}" ]; then start_port; start_hub; start_service; COMP=; fi
 
-if [ -z "${WC_MULTI_ONLY_ONE_POOL:-}" ]; then
+if [ -z "${WC_MULTI_ONLY_ONE_POOL:-}${WC_MULTI_ONLY_REOPEN:-}" ]; then
 say "leg 1: one compositor, three installations booted at once"
 start_port; start_hub; start_service
 start_compositor 1
@@ -199,7 +211,9 @@ OLD_B=$(grep -o "arena: session $IDX_B granted region [^:]*: [0-9]* MiB at [0-9]
 P=$(proxy_pid "wcmb-$$-b")
 CLIENTS_BEFORE=$(grep -c 'disconnected' "$D/comp-1.log")
 T0=$(date +%s%N)
-kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
+# A unit that is not there shows MainPID 0, and `kill -9 0` is this script's
+# whole process group: the harness and whatever started it.
+[ "${P:-0}" -gt 0 ] && kill -9 "$P" 2>/dev/null && ok "killed session $IDX_B's proxy (pid $P)" || bad "no proxy pid for b"
 wait_line "$D/comp-1.log" "index $IDX_B, installation wcmb\) ENDED" 20 && ok "compositor ended session $IDX_B in $(ms "$T0") ms: $(grep -m1 -o "index $IDX_B, installation wcmb) ENDED.*" "$D/comp-1.log" | cut -c1-90)" || bad "session $IDX_B was never ended"
 wait_line "$D/comp-1.log" "arena: session $IDX_B's [0-9]* region" 10 && ok "$(grep -m1 -o "arena: session $IDX_B's.*" "$D/comp-1.log")" || bad "its regions did not come back"
 for t in a c; do R=$(request "$t" "raw status"); case "$R" in ok-raw*) ;; *) bad "after b's death, status $t: $R" ;; esac; done
@@ -273,6 +287,7 @@ ok "the sessions that have regions still answer: $(sessions)"
 for t in a b c; do request "${t}s" "raw down" >/dev/null; done
 
 fi
+if [ -z "${WC_MULTI_ONLY_REOPEN:-}" ]; then
 say "leg 7: one pool (§110): a 32 MiB BAR with a 256 MiB region beside it standing in for the GPU device"
 sleep $((LINGER + 1))
 kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
@@ -318,12 +333,105 @@ if [ -n "$INFO" ]; then
     || bad "session ${IDX_L:-x} did not end by its linger ($(sessions))"
   grep -q 'outlived it; closed' "$D/comp-5.log" && ok "a feed the proxy left behind was closed: $(grep -m1 -o 'ring slot [0-9]*: a feed.*' "$D/comp-5.log")"
 fi
-# Leg 9 (§108: the one pool growing from guest RAM, the proxies mapping
+# The guest-RAM leg (§108: the one pool growing from guest RAM, the proxies mapping
 # windows of grown regions) needs the broker, the one account that may make
 # udmabufs of guest RAM, which the user running this harness never is. It is
 # in the NixOS VM tests: scripts/sv-pool-grow-e2e.sh (the GPU pool) and
 # scripts/wc-guestram-vmtest.sh (the broker, its users and its rules).
-say "leg 9 (guest RAM): in the VM tests, scripts/sv-pool-grow-e2e.sh and scripts/wc-guestram-vmtest.sh"
+say "the guest-RAM leg (§108): in the VM tests, scripts/sv-pool-grow-e2e.sh and scripts/wc-guestram-vmtest.sh"
+
+say "leg 9: host integration (§106) on beside the arena: every session's service slots are its own"
+# The guest's compositor runs with --hostint (wc-launch.exe passes it), so each
+# session has an OWNER_HOSTINT slot beside its OWNER_ARENA slot. On the guest the
+# two once had one owner id, and a session's `grow` was answered with hostint's
+# hello (`not a grant: "hello 1 windows"`): no client got a buffer.
+sleep $((LINGER + 1))
+kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+kill "$PORT" 2>/dev/null; start_port
+COMP_EXTRA=--hostint start_compositor 6
+for t in a b c; do
+  R=$(boot "${t}h" "wcm$t" "$D/guest-wcm$t.key"); case "$R" in ok\ located*) ;; *) bad "hostint boot $t: $R" ;; esac
+  echo "$R" | awk '{print $3}' >"$D/idx-${t}h"
+done
+for t in a b c; do
+  R=$(request "${t}h" "raw run shm 96 30"); case "$R" in ok-raw*'run accepted'*) ;; *) bad "hostint run ${t}h: $R" ;; esac
+  keep_log "$D/run/wcm$t-$$-${t}h/proxy.log" "$D/proxy-${t}h.log"
+done
+sleep 5
+for t in a b c; do
+  I=$(cat "$D/idx-${t}h")
+  wait_line "$D/comp-6.log" "arena: session $I granted region" 15 && ok "session $I (wcm$t) got its region with hostint on" || bad "session $I (wcm$t) got no region with hostint on"
+  grep -q 'not a grant' "$D/proxy-${t}h.log" && bad "proxy ${t}h: $(grep -m1 -o 'not a grant.*' "$D/proxy-${t}h.log" | cut -c1-100)"
+done
+HS=$(grep -c 'hostint: on ring slot' "$D/comp-6.log")
+[ "$HS" -ge 3 ] && ok "hostint served on $HS slot(s): $(grep -o 'hostint: on ring slot [0-9]*' "$D/comp-6.log" | awk '{print $5}' | tr '\n' ' ')" || bad "hostint on only $HS slot(s)"
+MAPPED=$(grep -c ' mapped ' "$D/comp-6.log")
+[ "$MAPPED" -ge 3 ] && ok "$MAPPED window(s) mapped with hostint on" || bad "only $MAPPED window(s) mapped with hostint on"
+for t in a b c; do request "${t}h" "raw down" >/dev/null; done
+fi
+
+say "leg 10: reopen (§107.11): one installation opened and closed, then another opened, while the compositor keeps running"
+# The guest's reopen round of 2026-10-19: a session's hostint thread outlived
+# its session and kept reading its slot; once the slot was recycled, the next
+# owner's bytes went to that thread (foot on vkcube's old slot, no window).
+# Here session x stays up the whole leg, so the compositor never runs empty.
+# Session y (its four service slots, no client) and then session o open, and
+# both close. x's next client takes the three lowest slots they gave back, so
+# the reopened session n starts one slot below where o did: n's first client
+# lands on o's old hostint slot, which is what foot met on the guest. Every
+# channel of n must work, and o's hostint thread must have stopped.
+sleep $((LINGER + 1))
+kill "$COMP" 2>/dev/null; wait "$COMP" 2>/dev/null
+kill "$PORT" 2>/dev/null; start_port
+COMP_EXTRA=--hostint start_compositor 7
+L7=$D/comp-7.log
+slots_of() { # INDEX: every ring slot session INDEX was given, as the compositor logged it
+  grep -oE "slot [0-9]+ \(no ssh\), session $1 of|sound ring is slot [0-9]+ .*session $1 of|ring slot [0-9]+ of session $1[ ,]|session $1 asks for regions on ring slot [0-9]+|hostint: on ring slot [0-9]+ .*session $1 of" "$L7" \
+    | grep -oE 'slot [0-9]+' | awk '{print $2}' | sort -n | uniq | tr '\n' ' '
+}
+R=$(boot xr wcmc "$D/guest-wcmc.key"); case "$R" in ok\ located*) IDX_X=$(echo "$R" | awk '{print $3}') ;; *) bad "reopen: boot x: $R" ;; esac
+request xr "raw run shm 96 30" >/dev/null
+wait_line "$L7" "accepted on ring slot [0-9]* of session ${IDX_X:-x} " 15 || bad "reopen: no client of x"
+R=$(boot yr wcmd "$D/guest-wcmd.key"); case "$R" in ok\ located*) IDX_Y=$(echo "$R" | awk '{print $3}') ;; *) bad "reopen: boot y: $R" ;; esac
+wait_line "$L7" "hostint: on ring slot [0-9]*" 1; sleep 1
+R=$(boot or wcma "$D/guest-wcma.key"); case "$R" in ok\ located*) IDX_O=$(echo "$R" | awk '{print $3}') ;; *) bad "reopen: boot o: $R" ;; esac
+request or "raw run shm 96 30" >/dev/null
+wait_line "$L7" "accepted on ring slot [0-9]* of session ${IDX_O:-x} " 15 || bad "reopen: no client of o"
+wait_line "$L7" "arena: session ${IDX_O:-x} granted region" 15 || bad "reopen: o got no region"
+sleep 1
+O_H=$(grep -o 'hostint: on ring slot [0-9]*' "$L7" | sed -n 3p | awk '{print $5}')
+ok "session ${IDX_O:-?} (wcma) has slots $(slots_of "${IDX_O:-x}")and hostint on slot ${O_H:-?}"
+ENDED_BEFORE=$(grep -c 'hostint: the channel ended' "$L7")
+T0=$(date +%s%N)
+for t in yr or; do R=$(request "$t" "raw down"); case "$R" in ok*) ;; *) bad "reopen: down $t: $R" ;; esac; done
+wait_line "$L7" "index ${IDX_Y:-x}, installation wcmd\) ENDED" 15 || bad "reopen: y did not end"
+wait_line "$L7" "index ${IDX_O:-x}, installation wcma\) ENDED" 15 && ok "sessions ${IDX_Y:-?} and ${IDX_O:-?} ENDED $(ms "$T0") ms after their downs" || bad "reopen: o did not end"
+for _ in $(seq 1 60); do [ "$(grep -c 'hostint: the channel ended' "$L7")" -ge $((ENDED_BEFORE + 2)) ] && break; sleep 0.05; done
+[ "$(grep -c 'hostint: the channel ended' "$L7")" -ge $((ENDED_BEFORE + 2)) ] \
+  && ok "both hostint threads stopped within $(ms "$T0") ms of the downs: $(grep 'hostint: the channel ended' "$L7" | tail -1 | sed 's/^wc-compositor: //' | cut -c1-90)" \
+  || bad "$(( $(grep -c 'hostint: the channel ended' "$L7") - ENDED_BEFORE )) of the 2 ended sessions' hostint threads said the channel ended"
+# Past the quarantine (ringlink::QUARANTINE, 10 s), so o's slots are free.
+sleep 12
+request xr "raw run shm 96 30" >/dev/null
+sleep 2
+R=$(boot nr wcmb "$D/guest-wcmb.key"); case "$R" in ok\ located*) IDX_N=$(echo "$R" | awk '{print $3}'); ok "wcmb opened as session $IDX_N while the compositor kept running" ;; *) bad "reopen: boot n: $R" ;; esac
+wait_line "$L7" "session: control socket $D/ctl-nr.sock" 20 || bad "reopen: no control socket for n"
+R=$(request nr "raw run shm 96 30"); case "$R" in ok-raw*'run accepted'*) ok "the reopened session's control ring answers" ;; *) bad "reopen: run in n: $R" ;; esac
+keep_log "$D/run/wcmb-$$-nr/proxy.log" "$D/proxy-nr.log"
+wait_line "$L7" "arena: session ${IDX_N:-x} granted region" 15 && ok "session ${IDX_N:-?} got its region" || bad "reopen: session ${IDX_N:-?} got no region"
+wait_line "$L7" "accepted on ring slot [0-9]* of session ${IDX_N:-x} " 15 || bad "reopen: no client of n"
+for _ in $(seq 1 100); do [ "$(grep -c ' mapped ' "$L7")" -ge 4 ] && break; sleep 0.1; done
+MAPPED=$(grep -c ' mapped ' "$L7")
+[ "$MAPPED" -ge 4 ] && ok "$MAPPED window(s) mapped: x's two, o's, and the reopened session's" || bad "only $MAPPED window(s) mapped (x 2, o 1, n 1 expected)"
+wait_line "$D/proxy-nr.log" 'host says hello' 10 && ok "the reopened session's hostint heard the host's hello" || bad "reopen: n's hostint never heard the host"
+N_SLOTS=$(slots_of "${IDX_N:-x}")
+ON_H=$(grep -E "slot ${O_H:-x}[ ,(].*session ${IDX_N:-x}[ ,]|slot ${O_H:-x} of session ${IDX_N:-x}" "$L7" | tail -1 | sed 's/^wc-compositor: //; s/ (no socket.*//' | cut -c1-80)
+case " $N_SLOTS" in *" ${O_H:-x} "*) ok "o's old hostint slot ${O_H} is the reopened session's now (${ON_H}; its slots ${N_SLOTS}), and it works" ;;
+  *) ok "the reopened session's slots: ${N_SLOTS}(o's old hostint slot ${O_H:-?} went elsewhere)" ;; esac
+for _ in 1 2 3; do R=$(request nr "raw status"); case "$R" in ok-raw*) ;; *) bad "reopen: status n: $R" ;; esac; done
+grep -q "index ${IDX_N:-x}, installation wcmb) ENDED" "$L7" && bad "the reopened session ended by itself: $(grep -m1 -o "index ${IDX_N:-x}, installation wcmb) ENDED.*" "$L7")"
+grep -q 'REFUSED' "$L7" && bad "a refusal: $(grep -m1 REFUSED "$L7")"
+for t in xr nr; do request "$t" "raw down" >/dev/null; done
 
 if [ -n "${WC_MULTI_EVIDENCE:-}" ]; then mkdir -p "$WC_MULTI_EVIDENCE" && cp "$D"/*.log "$WC_MULTI_EVIDENCE"/ 2>/dev/null; fi
 echo "logs: $D"

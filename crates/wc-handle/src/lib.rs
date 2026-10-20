@@ -137,6 +137,11 @@ pub mod macboot;
 /// handle; dropping it is the release.
 pub use platform::{MappedView, map_ivshmem_slot};
 
+/// §111.8: an ivshmem device opened but not mapped, so that the broker can
+/// open it and the process it is moved into map it, by the same code.
+#[cfg(windows)]
+pub use platform::{IvshmemDevice, ivshmem_device_paths, map_ivshmem_device, open_ivshmem_path, open_ivshmem_slot};
+
 /// How many objects of each kind this process has mapped.
 ///
 /// See [`map_counts`]. Deliberately process-global and deliberately not
@@ -668,6 +673,38 @@ impl Handle {
         })
     }
 
+    /// Open the section object behind a `Section` or `SharedFile`, unmapped,
+    /// for a Win32 consumer that takes the object rather than a view.
+    ///
+    /// ADDED FOR §104's follow-up. The consumer is GDI: `CreateDIBSection`
+    /// over a client's buffer lets the compositor `BitBlt` the client's pixels
+    /// to its window without copying them first (wc-compositor's direct
+    /// present). GDI maps the object itself, and it refuses read-only sections
+    /// ("read-only DIB sections are not supported"), so this asks for read and
+    /// write access: `OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE)` for a
+    /// named section, `GENERIC_READ | GENERIC_WRITE` and `PAGE_READWRITE` for a
+    /// path (which is also how Wine reaches a Linux `/dev/shm` file). That is a
+    /// write path into a peer's buffer, against this crate's read-only default
+    /// for what arrives on the wire, and it is confined to this: the object is
+    /// handed to GDI as the *source* of a blit, this crate never maps it, and
+    /// nothing in the compositor draws into a DIB made from it.
+    ///
+    /// Fails for anything else (an arena slice has no object of its own), and
+    /// where the creator's security descriptor does not grant write access.
+    #[cfg(windows)]
+    pub fn open_section_object(&self) -> io::Result<SectionObject> {
+        match &self.descriptor {
+            Descriptor::Section { name, .. } => platform::open_section_object(name).map(SectionObject),
+            Descriptor::SharedFile { path, size } => {
+                platform::open_file_object(path, *size).map(SectionObject)
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{other:?} has no section object of its own"),
+            )),
+        }
+    }
+
     /// Take writable ownership of a shared-memory object **somebody else
     /// provided**.
     ///
@@ -916,6 +953,25 @@ impl MappingInner {
             MappingInner::Owned(v) => v.ptr(),
             MappingInner::Window(v) => v.ptr(),
         }
+    }
+}
+
+/// A section object opened by [`Handle::open_section_object`], closed on drop.
+#[cfg(windows)]
+pub struct SectionObject(platform::OwnedObject);
+
+#[cfg(windows)]
+impl SectionObject {
+    /// The `HANDLE`, valid for as long as `self`.
+    pub fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0.raw()
+    }
+}
+
+#[cfg(windows)]
+impl fmt::Debug for SectionObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SectionObject").field(&self.0.raw()).finish()
     }
 }
 
