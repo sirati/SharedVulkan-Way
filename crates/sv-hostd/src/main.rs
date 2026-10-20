@@ -17,6 +17,8 @@
 
 #[cfg(target_os = "linux")]
 fn main() -> std::process::ExitCode {
+    // waycompose-design.md §111.10: `broker:NAME` doorbell specs.
+    wc_broker::client::install_hooks();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -570,11 +572,15 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Read-write for the mailboxes' compare-and-swap and replies; the group
     // bit that lets this user read the file lets it write too (0660).
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(pooled_cold)
-        .open(&region)
-        .map_err(|e| format!("{region}: {e} (is this user in the region's group?)"))?;
+    // waycompose-design.md §111.10: `broker:ID`, the BAR the broker published
+    // for this user, who may not open the file itself.
+    let brokered = wc_broker::client::region_spec(std::path::Path::new(&region)).is_some();
+    let file = if brokered {
+        wc_broker::client::open_path(std::path::Path::new(&region))
+    } else {
+        std::fs::OpenOptions::new().read(true).write(pooled_cold).open(&region)
+    }
+    .map_err(|e| format!("{region}: {e} (is this user in the region's group, or is it published to them?)"))?;
     let region_len = file.metadata()?.len();
 
     let mailboxes = if pooled_cold {

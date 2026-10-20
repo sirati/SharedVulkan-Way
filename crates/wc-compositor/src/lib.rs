@@ -102,9 +102,9 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
-pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
+pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, set_boot_signer, shared_control, BootSigner};
 /// §110: the one pool's other regions (the GPU device's, from `sv-guest`).
-pub use session_svc::{add_pool_region, PoolRegion};
+pub use session_svc::{add_pool_region, replace_pool_region, PoolRegion};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -676,6 +676,23 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
             }
+            // §92.12. The one-session compositor's installation, so its
+            // windows carry that installation's taskbar identity: `INSTALL`
+            // or `INSTALL:APP,…` (the apps that keep the application-wide
+            // one). A shared compositor learns it per session from `boot`.
+            "--taskbar-scope" => {
+                match it.next().map(|s| taskbar::Scope::parse(&s)) {
+                    Some(Ok(s)) => taskbar::set_default_scope(s),
+                    Some(Err(e)) => {
+                        eprintln!("wc-compositor: --taskbar-scope: {e}");
+                        return Err(2);
+                    }
+                    None => {
+                        eprintln!("wc-compositor: --taskbar-scope wants INSTALL[:APP,…]");
+                        return Err(2);
+                    }
+                }
+            }
             // §102. See `Args::nested_globals`.
             "--nested-compositor-globals" => args.nested_globals = true,
             // §85. 0 means "as soon as the last window is gone".
@@ -1234,7 +1251,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         } else {
             0
         };
-        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+        // §111.8: the broker opens the arena device (device 0, PCI slot
+        // 0x1c) and moves it here; this process maps it as it maps one it
+        // opened. Without a broker, the device is opened here as before.
+        #[cfg(windows)]
+        let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
+        #[cfg(not(windows))]
+        let lent: Option<()> = None;
+        let attached = match lent {
+            #[cfg(windows)]
+            Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
+            _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
+        };
+        let rings_at = match attached {
             Ok(r) => {
                 println!(
                     "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \

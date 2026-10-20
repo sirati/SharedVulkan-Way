@@ -303,6 +303,7 @@ impl RingLink {
                 || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
                 || self.links.iter().any(|l| l.slot == slot)
                 || quarantined(slot)
+                || has_reader(slot)
                 || !crate::session_svc::may_recycle(self.control.ring_owner(slot).unwrap_or(0))
             {
                 continue;
@@ -581,6 +582,33 @@ pub fn set_boot_session(id: &str, outbound: u64, gpu: bool) {
     *BOOT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some((id.to_string(), outbound, gpu));
 }
 
+/// §111.6, §111.9: who signs a boot record. Given the record and the
+/// session's index, the privileged broker's authenticator over it and the
+/// identity of the user it read from this process's credentials (the macOS
+/// LaunchDaemon's `sign`). An error is logged and the record goes out as it
+/// did before the broker: unsigned in role (a), signed with the installation's
+/// key file in role (b).
+pub type BootSigner = Box<
+    dyn Fn(&wc_handle::macboot::Record, u8) -> Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>
+        + Send
+        + Sync,
+>;
+
+static BOOT_SIGNER: std::sync::OnceLock<BootSigner> = std::sync::OnceLock::new();
+
+/// The launcher, before the compositor starts: sign boot records with `s`.
+pub fn set_boot_signer(s: BootSigner) -> bool {
+    BOOT_SIGNER.set(s).is_ok()
+}
+
+/// The broker's signature over `rec`, if a signer is installed and it signed.
+pub(crate) fn broker_sign(
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+) -> Option<Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>> {
+    BOOT_SIGNER.get().map(|s| s(rec, index))
+}
+
 /// The compositor, as it provides arena 0 from guest RAM.
 pub fn note_guest_ram_arena(run: u64, pages: u32) {
     let mut g = ARENA0.lock().unwrap_or_else(|e| e.into_inner());
@@ -674,7 +702,19 @@ impl PendingRings {
                 // SAFETY: page 0 of the window this value owns, mapped and
                 // pinned, and not yet shared with anything but the host's sweep.
                 let page0 = unsafe { std::slice::from_raw_parts_mut(window.base(), wc_handle::arena::REGION_PAGE) };
-                rec.write(page0);
+                // §111.6: signed by the broker with who asked, when there is one.
+                match broker_sign(&rec, 0) {
+                    Some(Ok((auth, who))) => {
+                        // SAFETY: as above; nothing else in this process writes the page.
+                        unsafe { wc_handle::macboot::publish_identity(page0.as_mut_ptr(), &rec, 0, Some(&who), Some(&auth)) };
+                        println!("wc-compositor: boot record signed by the broker for {}", who.text());
+                    }
+                    Some(Err(e)) => {
+                        println!("wc-compositor: the broker did not sign the boot record ({e}); it goes out unsigned, as before §111");
+                        rec.write(page0);
+                    }
+                    None => rec.write(page0),
+                }
                 booting = true;
                 println!(
                     "wc-compositor: boot record for session {id} in page 0 of the ring window (arena run 0x{arena_run:016x}, \
@@ -830,6 +870,10 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
     }
     #[cfg(windows)]
     {
+        // §111.8: the broker opens the port and moves it here.
+        if let Some(p) = wc_broker::client::lend::port(name, "compositor") {
+            return Ok(sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)));
+        }
         sv_transport::winpipe::open_virtio_port(name, 500)
             .map(|p| sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)))
             .map_err(|e| std::io::Error::other(format!("{e}")))
@@ -1005,6 +1049,41 @@ pub fn quarantined(slot: u32) -> bool {
     let now = std::time::Instant::now();
     q.retain(|(_, until)| *until > now);
     q.iter().any(|(s, _)| *s == slot)
+}
+
+/// §107.11: the slots a thread of this process reads outside the Wayland
+/// thread's links: a session's control, sound, arena and hostint channels.
+/// [`RingLink::reap`] never recycles one of them, whatever its quarantine
+/// says, so a slot cannot mean somebody else's connection while an old
+/// reader of it is still running. One entry per [`SlotReader`].
+static READERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A thread's claim to read `slot`, held for as long as it may touch the
+/// slot's ring, and released when it is dropped.
+#[derive(Debug)]
+pub struct SlotReader {
+    slot: u32,
+}
+
+impl SlotReader {
+    pub fn new(slot: u32) -> SlotReader {
+        READERS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        SlotReader { slot }
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        let mut r = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = r.iter().position(|s| *s == self.slot) {
+            r.swap_remove(i);
+        }
+    }
+}
+
+/// Whether a thread still holds a [`SlotReader`] for `slot`.
+pub fn has_reader(slot: u32) -> bool {
+    READERS.lock().unwrap_or_else(|e| e.into_inner()).contains(&slot)
 }
 
 /// The ring region's geometry for the ivshmem tail: §107's 64 slots when this

@@ -10,6 +10,8 @@ description = "The shared_vulkan GPU side: ring consumers, the object table, Sla
 sv-proto.workspace = true
 sv-wire.workspace = true
 sv-transport.workspace = true
+# §108: the pool grows from guest RAM.
+sv-ram = { path = "../sv-ram" }
 # Pass 12: the generated wire → C raise pass, the driver's function table, and
 # the forwarding `Server` impl that covers 221 of the 239 commands.
 sv-gpu-entry.workspace = true
@@ -46,6 +48,8 @@ awe-probe = { path = "../awe-probe" }
 # the GPU sessions' arena is the second device, and a second copy of that FFI
 # would be the drift `awe-probe`'s comment above warns about.
 wc-handle = { path = "../wc-handle" }
+# §111.8: the GPU device and the svbell port, lent by the broker.
+wc-broker = { workspace = true }
 
 # macOS (waycompose-design.md §103.6): the session's extent is guest RAM pinned
 # by `wc_handle::arena::alloc_guest_ram_window`, superpages or wired pages, the
