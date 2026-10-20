@@ -9,8 +9,11 @@
 use crate::bar_registry::{DurableStore, EpochTicket, Registry};
 use crate::service_auth::{Authenticator, Frame, ServiceEndpoint, VerifiedMessage};
 use crate::service_bootstrap::{BootstrapBinding, BootstrapMessage, BootstrapPhase, DOMAIN};
-use crate::service_control::{Binding, Origin, Payload, Phase};
-use std::{io, sync::Arc};
+use crate::service_control::{Binding, Origin, Payload, Phase, Source};
+use std::{
+    io,
+    sync::{Arc, Mutex, MutexGuard},
+};
 use wc_handle::macboot::{KEY_LEN, hmac_sha256};
 
 fn denied(s: &str) -> io::Error {
@@ -44,92 +47,188 @@ pub struct GrantChannel {
     owner: Arc<()>,
 }
 
-/// Owns the exact registry instance, its fresh local ticket and bootstrap state.
-/// Keep this object across transport reconnects. A new instance durably advances
-/// only this origin's epoch; it cannot restore readiness from a saved journal.
-pub struct Lifecycle<S: DurableStore, B: Send + Sync + 'static> {
+struct ServiceState<S: DurableStore> {
     registry: Registry<S>,
+    sessions: Vec<(String, u64)>,
+    allocator_claimed: bool,
+    next_grant: u64,
+}
+/// One protected daemon incarnation for one original physical backing. This
+/// owns the durable registry and own service epoch ABOVE all installations and
+/// sessions. Starting another per-binding handshake never issues another epoch.
+pub struct ServiceContext<S: DurableStore, B: Send + Sync + 'static> {
+    state: Mutex<ServiceState<S>>,
     ticket: EpochTicket,
     endpoint: ServiceEndpoint,
+    source: Source,
+    original_backing: Arc<B>,
+}
+impl<S: DurableStore, B: Send + Sync + 'static> ServiceContext<S, B> {
+    /// Create exactly one canonical service context for the original backing.
+    ///
+    /// # Safety
+    /// Endpoint must name this protected daemon's own exact native process.
+    /// Source and registry must already be rooted to the actual retained full
+    /// original backing/device. Every alias and allocator route must use this
+    /// context, never a second store/context. No valid older snapshot may be
+    /// restored while original bytes live. No session metadata is authority.
+    pub unsafe fn start(
+        mut registry: Registry<S>,
+        endpoint: ServiceEndpoint,
+        source: Source,
+        original_backing: Arc<B>,
+    ) -> io::Result<Arc<Self>> {
+        let physical = registry.backing();
+        if source.host_device != physical.host_device
+            || source.host_inode != physical.host_inode
+            || source.bar_bytes != physical.bar_bytes
+        {
+            return Err(denied(
+                "service source differs from canonical registry backing",
+            ));
+        }
+        endpoint.ensure_live()?;
+        let ticket = registry.issue_next_service_epoch(endpoint.origin())?;
+        Ok(Arc::new(Self {
+            state: Mutex::new(ServiceState {
+                registry,
+                sessions: Vec::new(),
+                allocator_claimed: false,
+                next_grant: 1,
+            }),
+            ticket,
+            endpoint,
+            source,
+            original_backing,
+        }))
+    }
+    fn state(&self) -> io::Result<MutexGuard<'_, ServiceState<S>>> {
+        self.state
+            .lock()
+            .map_err(|_| denied("canonical service state poisoned"))
+    }
+    pub(crate) fn live(&self) -> io::Result<()> {
+        self.endpoint.ensure_live()?;
+        if !self.state()?.registry.owns_current_ticket(&self.ticket) {
+            return Err(denied("service local epoch is no longer current"));
+        }
+        Ok(())
+    }
+    /// Includes every old physical grant, regardless of installation/category.
+    pub fn exclusions(&self) -> io::Result<Vec<(u64, u64)>> {
+        self.live()?;
+        Ok(self.state()?.registry.exclusions())
+    }
+    pub(crate) fn backing(&self) -> &Arc<B> {
+        &self.original_backing
+    }
+    pub(crate) fn origin(&self) -> Origin {
+        self.endpoint.origin()
+    }
+    pub(crate) fn source(&self) -> &Source {
+        &self.source
+    }
+    pub(crate) fn claim_allocator(&self) -> io::Result<Vec<(u64, u64)>> {
+        self.live()?;
+        let mut state = self.state()?;
+        if state.allocator_claimed {
+            return Err(denied("canonical grant owner already claimed"));
+        }
+        state.allocator_claimed = true;
+        Ok(state.registry.exclusions())
+    }
+    pub(crate) fn next_grant(&self) -> io::Result<u64> {
+        self.live()?;
+        let mut state = self.state()?;
+        let id = state.next_grant;
+        state.next_grant = id
+            .checked_add(1)
+            .ok_or_else(|| denied("canonical grant IDs exhausted"))?;
+        Ok(id)
+    }
+}
+
+/// One independently challenged, pre-enrolled installation/session binding.
+/// Keep it and its grant streams across reconnects. The shared context issues
+/// the daemon epoch only once and retains every sibling session's streams.
+pub struct Lifecycle<S: DurableStore, B: Send + Sync + 'static> {
+    context: Arc<ServiceContext<S, B>>,
     binding: BootstrapBinding,
     key: [u8; KEY_LEN],
     role: BootstrapRole,
     stage: Stage,
     local_challenge: [u8; 32],
     peer: Option<(u64, [u8; 32])>,
-    _original_backing: Arc<B>,
     channel_owner: Arc<()>,
 }
 impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
-    /// Start one new service incarnation, never a reconnect of a live instance.
+    /// Start one enrolled binding without changing the daemon service epoch.
     ///
     /// # Safety
-    /// The endpoint must be this protected service's own native process. Key
-    /// must be the existing protected installation key for `installation`.
-    /// The full expected binding must already be enrolled by the canonical
-    /// source owner and protected SID-to-UID/VM/device configuration, with no
-    /// fields learned from Hello. `original_backing` must retain that exact
-    /// original kernel backing/device, and registry must be its one canonical
-    /// durable store. No old snapshot may be restored while those bytes live.
+    /// Key must be the existing protected key for exactly installation. The
+    /// complete binding and SID-to-UID policy must be pre-enrolled by the
+    /// canonical source owner, never learned from Hello/client input. The
+    /// same installation/session may be started only once in this context;
+    /// reconnect must retain its existing lifecycle and replay counters.
     pub unsafe fn start(
-        registry: Registry<S>,
-        endpoint: ServiceEndpoint,
+        context: Arc<ServiceContext<S, B>>,
         installation: &str,
         key: [u8; KEY_LEN],
         binding: BootstrapBinding,
         role: BootstrapRole,
-        original_backing: Arc<B>,
     ) -> io::Result<Self> {
         Self::start_with_challenge(
-            registry,
-            endpoint,
+            context,
             (installation, key),
             binding,
             role,
-            original_backing,
             random_challenge()?,
         )
     }
     fn start_with_challenge(
-        mut registry: Registry<S>,
-        endpoint: ServiceEndpoint,
+        context: Arc<ServiceContext<S, B>>,
         installation_key: (&str, [u8; KEY_LEN]),
         binding: BootstrapBinding,
         role: BootstrapRole,
-        original_backing: Arc<B>,
         local_challenge: [u8; 32],
     ) -> io::Result<Self> {
         let (installation, key) = installation_key;
         binding.validate()?;
-        if installation != binding.installation || local_challenge == [0; 32] {
-            return Err(denied("invalid rooted bootstrap installation or challenge"));
+        if installation != binding.installation
+            || binding.source != context.source
+            || local_challenge == [0; 32]
+        {
+            return Err(denied(
+                "invalid rooted bootstrap installation/source/challenge",
+            ));
         }
-        endpoint.ensure_live()?;
-        let ticket = registry.issue_next_service_epoch(endpoint.origin())?;
+        context.live()?;
+        let session = (binding.installation.clone(), binding.session);
+        {
+            let mut state = context.state()?;
+            if state.sessions.contains(&session) {
+                return Err(denied(
+                    "session lifecycle already started; retain replay state",
+                ));
+            }
+            state.sessions.push(session);
+        }
         Ok(Self {
-            registry,
-            ticket,
-            endpoint,
+            context,
             binding,
             key,
             role,
             stage: Stage::Initial,
             local_challenge,
             peer: None,
-            _original_backing: original_backing,
             channel_owner: Arc::new(()),
         })
     }
     fn live(&self) -> io::Result<()> {
-        self.endpoint.ensure_live()?;
-        if !self.registry.owns_current_ticket(&self.ticket) {
-            return Err(denied("bootstrap local epoch is no longer current"));
-        }
-        Ok(())
+        self.context.live()
     }
-    /// Historical old grants remain excluded even before bootstrap completes.
-    pub fn exclusions(&self) -> Vec<(u64, u64)> {
-        self.registry.exclusions()
+    pub fn exclusions(&self) -> io::Result<Vec<(u64, u64)>> {
+        self.context.exclusions()
     }
     pub fn ready(&self) -> io::Result<()> {
         self.live()?;
@@ -137,10 +236,46 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
             .peer
             .ok_or_else(|| denied("service pair not confirmed"))?
             .0;
-        if self.stage != Stage::Ready || !self.registry.confirmed_pair(&self.ticket, peer) {
+        if self.stage != Stage::Ready
+            || !self
+                .context
+                .state()?
+                .registry
+                .confirmed_pair(&self.context.ticket, peer)
+        {
             return Err(denied("service pair not durably confirmed"));
         }
         Ok(())
+    }
+    pub(crate) fn belongs_to(&self, context: &Arc<ServiceContext<S, B>>) -> bool {
+        Arc::ptr_eq(&self.context, context)
+    }
+    pub(crate) fn grant_binding(
+        &self,
+        grant: u64,
+        offset: u64,
+        length: u64,
+    ) -> io::Result<Binding> {
+        self.ready()?;
+        let local = self.context.ticket.value();
+        let peer = self.peer.unwrap().0;
+        let (windows_run, linux_run) = match self.context.endpoint.origin() {
+            Origin::Windows => (local, peer),
+            Origin::Linux => (peer, local),
+        };
+        Ok(Binding {
+            installation: self.binding.installation.clone(),
+            source: self.binding.source.clone(),
+            roles: self.binding.roles,
+            windows_run,
+            linux_run,
+            grant,
+            session: self.binding.session,
+            grant_offset: offset,
+            grant_length: length,
+            windows_sid: self.binding.windows_sid.clone(),
+            linux_uid: self.binding.linux_uid,
+        })
     }
     /// The initiator may emit Hello exactly once for this ticket.
     pub fn hello(&mut self) -> io::Result<Frame> {
@@ -169,11 +304,11 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
             return Err(denied("invalid bootstrap authentication"));
         }
         let m = BootstrapMessage::decode(frame.canonical())?;
-        if m.binding != self.binding || m.origin != opposite(self.endpoint.origin()) {
+        if m.binding != self.binding || m.origin != opposite(self.context.endpoint.origin()) {
             return Err(denied("bootstrap enrolled source or direction differs"));
         }
         let (local_epoch, local_challenge, peer_epoch, peer_challenge) =
-            match self.endpoint.origin() {
+            match self.context.endpoint.origin() {
                 Origin::Windows => (
                     m.windows_epoch,
                     m.windows_challenge,
@@ -200,7 +335,9 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
                 Ok(Some(result))
             }
             (BootstrapRole::Initiator, Stage::HelloSent, BootstrapPhase::Challenge) => {
-                if local_epoch != self.ticket.value() || local_challenge != self.local_challenge {
+                if local_epoch != self.context.ticket.value()
+                    || local_challenge != self.local_challenge
+                {
                     return Err(denied(
                         "bootstrap challenge does not answer fresh local Hello",
                     ));
@@ -213,7 +350,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
                 Ok(Some(result))
             }
             (BootstrapRole::Responder, Stage::ChallengeSent, BootstrapPhase::Confirm) => {
-                if local_epoch != self.ticket.value()
+                if local_epoch != self.context.ticket.value()
                     || local_challenge != self.local_challenge
                     || self.peer != Some((peer_epoch, peer_challenge))
                 {
@@ -231,8 +368,18 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         self.live()?;
         // SAFETY: only the two exact mutually challenged branches above reach
         // here. Their MAC, full pre-enrollment and fresh local ticket match.
-        unsafe {
-            self.registry.confirm_peer_epoch(&self.ticket, peer_epoch)?;
+        {
+            let mut state = self.context.state()?;
+            if !state
+                .registry
+                .confirmed_pair(&self.context.ticket, peer_epoch)
+            {
+                unsafe {
+                    state
+                        .registry
+                        .confirm_peer_epoch(&self.context.ticket, peer_epoch)?;
+                }
+            }
         }
         self.stage = Stage::Ready;
         self.ready()
@@ -241,9 +388,9 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         self.live()?;
         let (peer_epoch, peer_challenge) = self.peer.unwrap_or((0, [0; 32]));
         let (windows_epoch, windows_challenge, linux_epoch, linux_challenge) =
-            match self.endpoint.origin() {
+            match self.context.endpoint.origin() {
                 Origin::Windows => (
-                    self.ticket.value(),
+                    self.context.ticket.value(),
                     self.local_challenge,
                     peer_epoch,
                     peer_challenge,
@@ -251,13 +398,13 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
                 Origin::Linux => (
                     peer_epoch,
                     peer_challenge,
-                    self.ticket.value(),
+                    self.context.ticket.value(),
                     self.local_challenge,
                 ),
             };
         let canonical = BootstrapMessage {
             binding: self.binding.clone(),
-            origin: self.endpoint.origin(),
+            origin: self.context.endpoint.origin(),
             phase,
             windows_epoch,
             linux_epoch,
@@ -288,10 +435,15 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         }
         // SAFETY: canonical allocator and retained grant contract is required
         // of this method's caller; the registry verifies epochs and overlap.
-        let reservation = unsafe { self.registry.reserve(&self.ticket, binding)? };
+        let reservation = unsafe {
+            self.context
+                .state()?
+                .registry
+                .reserve(&self.context.ticket, binding)?
+        };
         let auth = unsafe {
             Authenticator::new(
-                self.endpoint.share(),
+                self.context.endpoint.share(),
                 &self.binding.installation,
                 self.key,
                 reservation.binding().clone(),
@@ -303,7 +455,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
             owner: self.channel_owner.clone(),
         })
     }
-    fn channel_ready(&self, channel: &GrantChannel) -> io::Result<()> {
+    pub(crate) fn channel_ready(&self, channel: &GrantChannel) -> io::Result<()> {
         self.ready()?;
         if !Arc::ptr_eq(&self.channel_owner, &channel.owner) {
             return Err(denied(
@@ -460,16 +612,18 @@ mod tests {
             Origin::Windows => [challenge; 32],
             Origin::Linux => [challenge + 100; 32],
         };
-        let life = Lifecycle::start_with_challenge(
-            registry,
-            endpoint(origin, process.clone()),
-            ("test-install", KEY),
-            binding(),
-            role,
-            Arc::new(()),
-            nonce,
-        )
-        .unwrap();
+        let context = unsafe {
+            ServiceContext::start(
+                registry,
+                endpoint(origin, process.clone()),
+                binding().source,
+                Arc::new(()),
+            )
+            .unwrap()
+        };
+        let life =
+            Lifecycle::start_with_challenge(context, ("test-install", KEY), binding(), role, nonce)
+                .unwrap();
         (life, store, process)
     }
     fn pair() -> (Life, Life) {
@@ -486,7 +640,7 @@ mod tests {
     }
     fn grant(w: &Life) -> Binding {
         let mut b = crate::service_control::fixture().binding;
-        b.windows_run = w.ticket.value();
+        b.windows_run = w.context.ticket.value();
         b.linux_run = w.peer.unwrap().0;
         b
     }
@@ -514,19 +668,19 @@ mod tests {
         // Reconnect retains these same objects and their sequence state.
         // A late/replayed peer Hello cannot reset this ready lifecycle,
         // stream replay counters, or its durable physical exclusions.
-        let exclusions = l.exclusions();
+        let exclusions = l.exclusions().unwrap();
         let late_hello = BootstrapMessage {
             binding: binding(),
             origin: Origin::Windows,
             phase: BootstrapPhase::Hello,
-            windows_epoch: w.ticket.value(),
+            windows_epoch: w.context.ticket.value(),
             linux_epoch: 0,
             windows_challenge: [9; 32],
             linux_challenge: [0; 32],
         };
         assert!(l.receive(&signed(&late_hello, &KEY)).is_err());
         l.ready().unwrap();
-        assert_eq!(l.exclusions(), exclusions);
+        assert_eq!(l.exclusions().unwrap(), exclusions);
         assert!(l.verify(&mut lc, &frame).is_err());
         let frame2 = w.seal(&mut wc, Phase::Allocate, payload).unwrap();
         assert_eq!(l.verify(&mut lc, &frame2).unwrap().message().sequence, 2);
@@ -612,11 +766,14 @@ mod tests {
         handshake(&mut w, &mut l);
         let b = grant(&w);
         let mut channel = unsafe { w.reserve_channel(b.clone(), Arc::new(())).unwrap() };
-        let expected = w.exclusions();
+        let expected = w.exclusions().unwrap();
         assert_eq!(expected, vec![(b.grant_offset, b.grant_length)]);
         // In-process ownership prevents outside issuance. Exercise the internal
         // defense too, as if a future owner adds another lifecycle operation.
-        w.registry
+        w.context
+            .state()
+            .unwrap()
+            .registry
             .issue_next_service_epoch(Origin::Windows)
             .unwrap();
         assert!(w.ready().is_err());
@@ -632,7 +789,7 @@ mod tests {
         let registry = Registry::open(ws.clone(), backing(), Origin::Windows).unwrap();
         let (w, _, _) = make(Origin::Windows, registry, ws, 3);
         assert!(w.ready().is_err());
-        assert_eq!(w.exclusions(), expected);
+        assert_eq!(w.exclusions().unwrap(), expected);
     }
     #[test]
     fn process_death_and_query_failure_revoke_every_shared_stream_permanently() {
@@ -653,6 +810,73 @@ mod tests {
                     .is_err()
             );
         }
+    }
+    #[test]
+    fn sibling_installations_share_one_epoch_without_resetting_live_streams() {
+        let (mut w, mut l) = pair();
+        handshake(&mut w, &mut l);
+        let epoch = w.context.ticket.value();
+        let mut channel = unsafe { w.reserve_channel(grant(&w), Arc::new(())).unwrap() };
+        let payload = crate::service_control::fixture().payload;
+        assert_eq!(
+            crate::service_control::Message::decode(
+                w.seal(&mut channel, Phase::Allocate, payload)
+                    .unwrap()
+                    .canonical()
+            )
+            .unwrap()
+            .sequence,
+            1
+        );
+        let mut b = binding();
+        b.installation = "second-install".into();
+        b.session += 1;
+        let mut sibling_w = Lifecycle::start_with_challenge(
+            w.context.clone(),
+            ("second-install", [7; 32]),
+            b.clone(),
+            BootstrapRole::Initiator,
+            [10; 32],
+        )
+        .unwrap();
+        let mut sibling_l = Lifecycle::start_with_challenge(
+            l.context.clone(),
+            ("second-install", [7; 32]),
+            b,
+            BootstrapRole::Responder,
+            [11; 32],
+        )
+        .unwrap();
+        assert!(sibling_w.ready().is_err());
+        handshake(&mut sibling_w, &mut sibling_l);
+        assert_eq!(sibling_w.context.ticket.value(), epoch);
+        w.ready().unwrap();
+        l.ready().unwrap();
+        assert_eq!(
+            crate::service_control::Message::decode(
+                w.seal(&mut channel, Phase::Allocate, payload)
+                    .unwrap()
+                    .canonical()
+            )
+            .unwrap()
+            .sequence,
+            2
+        );
+        assert!(
+            Lifecycle::start_with_challenge(
+                w.context.clone(),
+                ("test-install", KEY),
+                binding(),
+                BootstrapRole::Initiator,
+                [12; 32]
+            )
+            .is_err()
+        );
+        assert!(
+            sibling_w
+                .seal(&mut channel, Phase::Allocate, payload)
+                .is_err()
+        );
     }
     #[test]
     fn os_challenges_are_nonzero_and_independent() {
