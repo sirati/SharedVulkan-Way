@@ -9,6 +9,53 @@ pub(super) struct ExportKey {
     instance: [u8; 16],
     export: u64,
 }
+/// Protected admission policy. Limits count outstanding tickets, including
+/// failed or unknown exports. Completion returns admission only for its hold.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeLimits {
+    total: usize,
+    per_grant: usize,
+    per_reference: usize,
+    capacity_bytes: u64,
+}
+impl NativeLimits {
+    pub fn new(
+        total: usize,
+        per_grant: usize,
+        per_reference: usize,
+        capacity_bytes: u64,
+    ) -> io::Result<Self> {
+        if per_reference == 0
+            || per_reference > per_grant
+            || per_grant > total
+            || capacity_bytes == 0
+        {
+            return Err(denied("invalid native admission limits"));
+        }
+        Ok(Self {
+            total,
+            per_grant,
+            per_reference,
+            capacity_bytes,
+        })
+    }
+}
+/// Retained authenticated native device authority, enrolled by the launcher.
+///
+/// # Safety
+/// Implementors must retain the exact authenticated provider/device for the
+/// complete owner lifetime and guarantee fresh monotonic nonwrapping export IDs.
+/// Every tracked backend must compare this exact Arc before CREATE, validate
+/// immutable INFO from that retained device and serialize CREATE through bind.
+/// A type name, caller string, path or supplied instance tuple is insufficient.
+pub unsafe trait NativeProviderAuthority: Send + Sync {}
+pub(super) struct Provider {
+    instance: Option<[u8; 16]>,
+    authority: Arc<dyn NativeProviderAuthority>,
+    gate: Arc<Mutex<()>>,
+    pub(super) high_water: u64,
+    pub(super) limits: NativeLimits,
+}
 /// Immutable facts captured from an authenticated actual native exporter.
 /// This type has no safe wire/caller-tuple constructor.
 pub struct NativeExportIdentity {
@@ -87,7 +134,8 @@ pub struct ProjectionTicket {
     id: u64,
     owner: Arc<()>,
     state: Arc<Mutex<State>>,
-    exports: Arc<Mutex<BTreeMap<ExportKey, u64>>>,
+    exports: Arc<Mutex<Option<Provider>>>,
+    provider: Arc<dyn NativeProviderAuthority>,
     binding: Binding,
     allocation: u64,
     reference: ProjectionReference,
@@ -96,6 +144,12 @@ pub struct ProjectionTicket {
     access: ProjectionAccess,
 }
 impl ProjectionTicket {
+    /// Actual retained provider authority enrolled by the protected launcher.
+    /// Backend must compare this exact Arc with its own device guard before CREATE.
+    pub fn provider(&self) -> &Arc<dyn NativeProviderAuthority> {
+        &self.provider
+    }
+
     pub fn binding(&self) -> &Binding {
         &self.binding
     }
@@ -121,6 +175,9 @@ impl ProjectionTicket {
     /// retained its actual authenticated monitor and all lifetime/provenance
     /// guards, and verified actual kernel target equals `target`. It must keep
     /// returned authority through every projection-to-monitor transition.
+    /// This must remain synchronous inside the owner callback: fresh CREATE,
+    /// immutable validation and bind are serialized across every backend for
+    /// this owner. Export IDs must obey the enrolled monotonic contract.
     /// Errors/unknown native state must quarantine, never invent a new ticket.
     pub unsafe fn bind(
         self,
@@ -154,12 +211,20 @@ impl ProjectionTicket {
             .exports
             .lock()
             .map_err(|_| denied("native export namespace poisoned"))?;
-        if exports.contains_key(&identity.key) {
+        let provider = exports
+            .as_mut()
+            .ok_or_else(|| denied("native provider not enrolled"))?;
+        if provider
+            .instance
+            .is_some_and(|instance| instance != identity.key.instance)
+            || identity.key.export <= provider.high_water
+        {
             return Err(denied(
-                "native export already associated with another ticket",
+                "native provider changed or export identity is not fresh",
             ));
         }
-        exports.insert(identity.key.clone(), self.id);
+        provider.instance = Some(identity.key.instance);
+        provider.high_water = identity.key.export;
         state.stage = Stage::Bound(identity.key.clone());
         drop(exports);
         drop(state);
@@ -234,6 +299,39 @@ pub(super) struct Request {
     pub(super) access: ProjectionAccess,
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
+    /// Enroll one independently authenticated native exporter for this owner.
+    /// It cannot be replaced or cleared in this context, even after draining.
+    /// A changed provider requires complete two-service drain and fresh context.
+    ///
+    /// # Safety
+    /// The protected launcher must authenticate and retain the exact original
+    /// exporter device authority before enrollment. The first immutable INFO
+    /// pins its nonzero instance once; it can never reset in this context.
+    /// Every fresh CREATE must issue strictly increasing
+    /// nonzero IDs without wrap or reuse for that instance, including failures.
+    /// Every backend must serialize fresh CREATE through bind synchronously in
+    /// this owner's callback. Arbitrary existing exports cannot be enrolled.
+    pub unsafe fn enroll_native_provider(
+        &mut self,
+        authority: Arc<dyn NativeProviderAuthority>,
+        limits: NativeLimits,
+    ) -> io::Result<()> {
+        let mut provider = self
+            .native_exports
+            .lock()
+            .map_err(|_| denied("native provider poisoned"))?;
+        if provider.is_some() {
+            return Err(denied("native provider already enrolled"));
+        }
+        *provider = Some(Provider {
+            instance: None,
+            authority,
+            gate: Arc::new(Mutex::new(())),
+            high_water: 0,
+            limits,
+        });
+        Ok(())
+    }
     pub(super) fn tracked_extent<P: TrackedProjectionBackend<B>>(
         &mut self,
         lifecycle: &Lifecycle<S, B>,
@@ -249,6 +347,55 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             target,
             access,
         } = request;
+        let (limits, provider, gate) = {
+            let enrolled = self
+                .native_exports
+                .lock()
+                .map_err(|_| denied("native provider poisoned"))?;
+            let enrolled = enrolled.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "native provider not enrolled")
+            })?;
+            (
+                enrolled.limits,
+                enrolled.authority.clone(),
+                enrolled.gate.clone(),
+            )
+        };
+        let _provider_serial = gate
+            .lock()
+            .map_err(|_| denied("native provider admission gate poisoned"))?;
+        // Bounded active ledger, not a completion census. No native callback
+        // or ticket escapes until every admission dimension has capacity.
+        let mut total = 0usize;
+        let mut bytes = 0u64;
+        for r in self.records.values() {
+            total = total
+                .checked_add(r.native_holds.len())
+                .ok_or_else(|| denied("native admission overflow"))?;
+            for h in r.native_holds.values() {
+                bytes = bytes
+                    .checked_add(h.extent.capacity)
+                    .ok_or_else(|| denied("native capacity overflow"))?;
+            }
+        }
+        let current = &self.records[&grant.id];
+        let references = current
+            .native_holds
+            .values()
+            .filter(|h| h.allocation == allocation && h.reference == reference)
+            .count();
+        if total >= limits.total
+            || current.native_holds.len() >= limits.per_grant
+            || references >= limits.per_reference
+            || !bytes
+                .checked_add(extent.capacity)
+                .is_some_and(|n| n <= limits.capacity_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native projection admission saturated",
+            ));
+        }
         let record = self.records.get_mut(&grant.id).unwrap();
         let native = record
             .processes
@@ -281,6 +428,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             owner: self.identity.clone(),
             state,
             exports: self.native_exports.clone(),
+            provider,
             binding,
             allocation,
             reference,
