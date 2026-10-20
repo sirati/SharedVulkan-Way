@@ -1,0 +1,1 @@
+Checkpoint copies of source-only fixture and packaging helpers. These scripts are work in progress and are not product activation instructions. Runtime logs, credentials, binary evidence and live backings are excluded.
