@@ -21,6 +21,7 @@ pub mod holder;
 pub mod ident;
 pub mod pipe;
 pub mod service;
+mod readiness;
 
 use crate::core::{ObjId, Peer, Pid, RegionInfo, User};
 use crate::server::{Give, Platform};

@@ -466,9 +466,7 @@ pub fn main(args: &[String]) -> ExitCode {
         Some("ready") => {
             let ready = || -> Result<(), String> {
                 acl::verify_raw_protection(&a.devices)?;
-                let mut client = crate::client::Client::connect(&a.pipe).map_err(|e| e.to_string())?;
-                client.hello("installer-ready").map_err(|e| e.to_string())?;
-                client.stats().map_err(|e| e.to_string())?;
+                super::readiness::installed(&a.pipe).map_err(|e| e.to_string())?;
                 Ok(())
             };
             return match ready() {
