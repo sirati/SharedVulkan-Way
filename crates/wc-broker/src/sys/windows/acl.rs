@@ -225,16 +225,24 @@ pub fn set_property(instance: &str, sddl: Option<&str>) -> Result<(), String> {
 
 fn open_object(path: &str, access: u32) -> Result<Owned, String> {
     let w = wide(path);
-    // SAFETY: a live path; no attributes, no template.
-    let h = unsafe {
-        CreateFileW(w.as_ptr(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut())
-    };
-    if h == INVALID_HANDLE_VALUE {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        // SAFETY: a live path; no attributes, no template.
+        let h = unsafe {
+            CreateFileW(w.as_ptr(), access, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut())
+        };
+        if h != INVALID_HANDLE_VALUE { return Ok(Owned(h)); }
         let e = io::Error::last_os_error();
+        // vioser releases its exclusive opener asynchronously after close.
+        // A security read may briefly race that close. Retry only the read;
+        // busy or denied access never establishes protected descriptors.
+        if access == READ_CONTROL && e.raw_os_error() == Some(5) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
         let held = if e.raw_os_error() == Some(5) { " (a port has one opener: someone holds it)" } else { "" };
         return Err(format!("not opened: {e}{held}"));
     }
-    Ok(Owned(h))
 }
 
 /// The live DACL of the device object at `path`, as SDDL.

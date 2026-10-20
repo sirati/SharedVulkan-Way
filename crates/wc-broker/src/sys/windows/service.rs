@@ -465,8 +465,11 @@ pub fn main(args: &[String]) -> ExitCode {
     match a.action.as_deref() {
         Some("ready") => {
             let ready = || -> Result<(), String> {
-                acl::verify_raw_protection(&a.devices)?;
+                // Wait for the authenticated service to finish its startup
+                // verification before opening exclusive ports for a second
+                // independent check. Do not race its own ACL operations.
                 super::readiness::installed(&a.pipe).map_err(|e| e.to_string())?;
+                acl::verify_raw_protection(&a.devices)?;
                 Ok(())
             };
             return match ready() {
