@@ -39,6 +39,8 @@ impl Layout {
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 
 #[cfg(test)]
 mod tests {
