@@ -387,7 +387,7 @@ impl NativeVideo {
         Ok(())
     }
     pub fn begin(&mut self, command: u64, session: u64, parameters: u64) -> VideoResult<()> {
-        if self.scopes.contains_key(&command) || self.recordings.contains_key(&command) {
+        if self.scopes.contains_key(&command) {
             return invalid();
         }
         let p = self
@@ -481,7 +481,13 @@ impl NativeVideo {
             .scopes
             .remove(&command)
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        self.recordings.insert(command, scope.jobs.into());
+        let mut jobs = self
+            .recordings
+            .get(&command)
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        jobs.extend(scope.jobs);
+        self.recordings.insert(command, jobs.into());
         Ok(())
     }
     /// Clone on submit, including resubmission; reset/free alone discards recording.
@@ -720,5 +726,77 @@ mod tests_syntax {
         p.flags.set_field_pic_flag(0);
         p.flags.set_complementary_field_pair(1);
         assert!(H264Picture::from_std(&p).is_err());
+    }
+}
+#[cfg(test)]
+mod tests_multiple_scopes {
+    use super::*;
+    #[test]
+    fn multiple_scopes_append_jobs_and_preserve_prior_reset_boundaries() {
+        let mut v = NativeVideo::new(Ready {
+            hardware_h264: true,
+            joined_nv12_import: true,
+        });
+        let info = vk::VideoSessionCreateInfoKHR::default()
+            .picture_format(FORMAT)
+            .reference_picture_format(FORMAT)
+            .max_coded_extent(vk::Extent2D {
+                width: 32,
+                height: 32,
+            });
+        let id = v.create_session(Profile { idc: 100 }, &info).unwrap();
+        let p = v.create_parameters(id, None, 1, 1).unwrap();
+        let picture = Picture {
+            image_view: 9,
+            layer: 0,
+            offset: vk::Offset2D::default(),
+            extent: info.max_coded_extent,
+        };
+        let job = Decode {
+            session: v.session(id).unwrap(),
+            configuration: Configuration {
+                sps: Arc::from([1]),
+                pps: Arc::from([2]),
+            },
+            source_buffer: 1,
+            source_offset: 0,
+            source_range: 1,
+            slice_offsets: Arc::from([0]),
+            destination: picture,
+            setup: None,
+            references: Arc::from([]),
+            h264: H264Picture {
+                idr_pic_flag: true,
+                field_pic_flag: false,
+                bottom_field_flag: false,
+                is_reference: true,
+                is_intra: true,
+                frame_num: 0,
+                pic_order_cnt: [0, 0],
+                idr_pic_id: 0,
+                sps_id: 0,
+                pps_id: 0,
+            },
+            reset_before: true,
+            begin_references: Arc::from([]),
+        };
+        v.begin(7, id, p).unwrap();
+        v.scopes.get_mut(&7).unwrap().jobs.push(job.clone());
+        v.end(7).unwrap();
+        let old = v.recording(7).unwrap();
+        v.begin(7, id, p).unwrap();
+        v.reset_scope(7).unwrap();
+        let mut second = job;
+        second.source_buffer = 2;
+        second.reset_before = false;
+        v.scopes.get_mut(&7).unwrap().jobs.push(second);
+        v.end(7).unwrap();
+        let recorded = v.recording(7).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].source_buffer, 1);
+        assert_eq!(recorded[1].source_buffer, 2);
+        assert!(recorded[0].reset_before);
+        assert!(!recorded[1].reset_before);
     }
 }
