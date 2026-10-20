@@ -1,0 +1,572 @@
+diff --git a/src/kosmickrisp/bridge/meson.build b/src/kosmickrisp/bridge/meson.build
+index 8cbfbc9..8155f77 100644
+--- a/src/kosmickrisp/bridge/meson.build
++++ b/src/kosmickrisp/bridge/meson.build
+@@ -62,5 +62,7 @@ libmtl_bridge = static_library(
+ )
+ 
+ idep_mtl_bridge = declare_dependency(
++  dependencies : host_machine.system() == 'darwin'
++    ? [dependency('appleframeworks', modules : ['IOSurface'])] : [],
+   link_with : libmtl_bridge,
+ )
+diff --git a/src/kosmickrisp/bridge/mtl_texture.h b/src/kosmickrisp/bridge/mtl_texture.h
+index b32170b..c5f9174 100644
+--- a/src/kosmickrisp/bridge/mtl_texture.h
++++ b/src/kosmickrisp/bridge/mtl_texture.h
+@@ -17,6 +17,12 @@ struct kk_view_layout;
+ /* Utils*/
+ uint64_t mtl_texture_get_gpu_resource_id(mtl_texture *texture);
+ 
++/* Validate an NV12 IOSurface plane-0 handle and create its chroma texture.
++ * Returns a retained object, or NULL. No pixels are copied. */
++mtl_texture *mtl_new_nv12_chroma_texture(mtl_texture *texture, uint32_t width,
++                                        uint32_t height, uint64_t offsets[2],
++                                        uint32_t strides[2], uint64_t sizes[2]);
++
+ /* Texture view creation */
+ mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
+                                        const struct kk_view_layout *layout);
+diff --git a/src/kosmickrisp/bridge/mtl_texture.m b/src/kosmickrisp/bridge/mtl_texture.m
+index 496ce14..50011b4 100644
+--- a/src/kosmickrisp/bridge/mtl_texture.m
++++ b/src/kosmickrisp/bridge/mtl_texture.m
+@@ -13,6 +13,64 @@
+ #include "vulkan/vulkan.h"
+ 
+ #include <Metal/MTLTexture.h>
++#include <Metal/MTLDevice.h>
++#include <IOSurface/IOSurface.h>
++#include <stdint.h>
++
++mtl_texture *
++mtl_new_nv12_chroma_texture(mtl_texture *texture, uint32_t width,
++                             uint32_t height, uint64_t offsets[2],
++                             uint32_t strides[2], uint64_t sizes[2])
++{
++   @autoreleasepool {
++      id<MTLTexture> tex = (id<MTLTexture>)texture;
++      IOSurfaceRef surface = tex.iosurface;
++      if (!width || !height || !surface || tex.iosurfacePlane != 0 ||
++          tex.pixelFormat != MTLPixelFormatR8Unorm ||
++          tex.textureType != MTLTextureType2D || tex.width != width ||
++          tex.height != height || tex.mipmapLevelCount != 1 ||
++          tex.arrayLength != 1 || tex.sampleCount != 1 ||
++          !(tex.usage & MTLTextureUsageShaderRead) ||
++          IOSurfaceGetPlaneCount(surface) != 2 ||
++          IOSurfaceGetWidth(surface) != width ||
++          IOSurfaceGetHeight(surface) != height)
++         return NULL;
++      /* 420v and 420f differ in range, which Vulkan's conversion specifies. */
++      uint32_t format = IOSurfaceGetPixelFormat(surface);
++      if (format != 0x34323076 && format != 0x34323066)
++         return NULL;
++      size_t allocation = IOSurfaceGetAllocSize(surface);
++      for (unsigned p = 0; p < 2; p++) {
++         size_t w = p ? (width / 2u + width % 2u) : width;
++         size_t h = p ? (height / 2u + height % 2u) : height;
++         size_t element = p ? 2u : 1u;
++         size_t stride = IOSurfaceGetBytesPerRowOfPlane(surface, p);
++         uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surface);
++         uintptr_t plane = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, p);
++         if (!base || plane < base)
++            return NULL;
++         size_t offset = plane - base;
++         if (IOSurfaceGetWidthOfPlane(surface, p) != w ||
++             IOSurfaceGetHeightOfPlane(surface, p) != h ||
++             IOSurfaceGetBytesPerElementOfPlane(surface, p) != element ||
++             stride < w * element || stride > UINT32_MAX ||
++             offset > allocation || h > (allocation - offset) / stride)
++            return NULL;
++         offsets[p] = offset;
++         strides[p] = stride;
++         sizes[p] = h * stride;
++      }
++      if (offsets[0] + sizes[0] > offsets[1])
++         return NULL;
++      MTLTextureDescriptor *desc = [MTLTextureDescriptor
++         texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
++         width:(width / 2u + width % 2u) height:(height / 2u + height % 2u) mipmapped:NO];
++      desc.storageMode = tex.storageMode;
++      desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++      return [tex.device newTextureWithDescriptor:desc iosurface:surface plane:1];
++   }
++}
++
+ 
+ uint64_t
+ mtl_texture_get_gpu_resource_id(mtl_texture *texture)
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_texture.c b/src/kosmickrisp/bridge/stubs/mtl_texture.c
+index f71db0c..a601d14 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_texture.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_texture.c
+@@ -39,3 +39,11 @@ mtl_texture_replace_region(mtl_texture *texture, const void *host_ptr,
+                            struct mtl_texture_memory_copy *data)
+ {
+ }
++
++mtl_texture *
++mtl_new_nv12_chroma_texture(mtl_texture *texture, uint32_t width,
++                             uint32_t height, uint64_t offsets[2],
++                             uint32_t strides[2], uint64_t sizes[2])
++{
++   return NULL;
++}
+diff --git a/src/kosmickrisp/vulkan/kk_bo.c b/src/kosmickrisp/vulkan/kk_bo.c
+index 6926326..4c7b3ef 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.c
++++ b/src/kosmickrisp/vulkan/kk_bo.c
+@@ -75,12 +75,22 @@ void
+ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+ {
+    /* We may only have a mapped buffer, for example if the memory was imported
+-    * from a host pointer */
++    * from a host pointer, or only a texture if it was imported from an
++    * MTLTexture */
+    if (bo->mtl_handle)
+       kk_device_remove_heap_from_residency_set(dev, bo->mtl_handle);
+-   else
++   else if (bo->map)
+       kk_device_remove_buffer_from_residency_set(dev, bo->map);
+ 
++   if (bo->chroma_texture) {
++      kk_device_remove_texture_from_residency_set(dev, bo->chroma_texture);
++      mtl_release(bo->chroma_texture);
++   }
++   if (bo->texture) {
++      kk_device_remove_texture_from_residency_set(dev, bo->texture);
++      mtl_release(bo->texture);
++   }
++
+    mtl_release(bo->map);
+ 
+    if (bo->mtl_handle)
+diff --git a/src/kosmickrisp/vulkan/kk_bo.h b/src/kosmickrisp/vulkan/kk_bo.h
+index 6ea5ca6..2d48ad3 100644
+--- a/src/kosmickrisp/vulkan/kk_bo.h
++++ b/src/kosmickrisp/vulkan/kk_bo.h
+@@ -19,6 +19,12 @@ struct vk_object_base;
+ struct kk_bo {
+    mtl_heap *mtl_handle;
+    mtl_buffer *map;
++   /* Imported MTLTexture backing a dedicated image allocation */
++   mtl_texture *texture;
++   mtl_texture *chroma_texture;
++   struct kk_image *dedicated_image;
++   uint64_t plane_offsets[2], plane_sizes[2];
++   uint32_t plane_strides[2];
+    uint64_t size_B;
+    uint64_t gpu; // GPU address
+    void *cpu;    // CPU address
+diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_device.c
+index 216faed..b5510a1 100644
+--- a/src/kosmickrisp/vulkan/kk_device.c
++++ b/src/kosmickrisp/vulkan/kk_device.c
+@@ -463,6 +463,24 @@ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
++void
++kk_device_add_texture_to_residency_set(struct kk_device *dev,
++                                       mtl_texture *texture)
++{
++   simple_mtx_lock(&dev->residency_set.mutex);
++   mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
++   simple_mtx_unlock(&dev->residency_set.mutex);
++}
++
++void
++kk_device_remove_texture_from_residency_set(struct kk_device *dev,
++                                            mtl_texture *texture)
++{
++   simple_mtx_lock(&dev->residency_set.mutex);
++   mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
++   simple_mtx_unlock(&dev->residency_set.mutex);
++}
++
+ void
+ kk_device_make_resources_resident(struct kk_device *dev)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_device.h b/src/kosmickrisp/vulkan/kk_device.h
+index be4f3e7..25f188e 100644
+--- a/src/kosmickrisp/vulkan/kk_device.h
++++ b/src/kosmickrisp/vulkan/kk_device.h
+@@ -126,6 +126,10 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
+                                            mtl_buffer *buffer);
+ void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+                                                 mtl_buffer *buffer);
++void kk_device_add_texture_to_residency_set(struct kk_device *dev,
++                                            mtl_texture *texture);
++void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
++                                                 mtl_texture *texture);
+ void kk_device_make_resources_resident(struct kk_device *dev);
+ 
+ /* Required to create a sampler */
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index 0e11cc2..b867295 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -8,6 +8,7 @@
+ #include "kk_device_memory.h"
+ 
+ #include "kk_device.h"
++#include "kk_image.h"
+ #include "kk_entrypoints.h"
+ #include "kk_physical_device.h"
+ 
+@@ -38,6 +39,25 @@ const VkExternalMemoryProperties kk_host_mem_props = {
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT,
+ };
+ 
++/* An imported MTLTexture is bound as a whole to a single image */
++const VkExternalMemoryProperties kk_mtltexture_mem_props = {
++   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT |
++                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++   .exportFromImportedHandleTypes = 0,
++   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
++};
++
++uint32_t
++kk_mtltexture_memory_types(const struct kk_physical_device *pdev)
++{
++   uint32_t types = 0;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
++      if (!(pdev->mem_types[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         types |= BITFIELD_BIT(i);
++   }
++   return types;
++}
++
+ #ifdef VK_USE_PLATFORM_METAL_EXT
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_GetMemoryMetalHandlePropertiesEXT(
+@@ -48,17 +68,18 @@ kk_GetMemoryMetalHandlePropertiesEXT(
+    VK_FROM_HANDLE(kk_device, dev, device);
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+-   /* We only support heaps since that's the backing for all our memory and
+-    * simplifies implementation */
++   /* Heaps are the backing for all our memory. Textures can only be imported
++    * as dedicated image allocations. */
+    switch (handleType) {
+    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT:
++      pMemoryMetalHandleProperties->memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count);
++      break;
++   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT:
++      pMemoryMetalHandleProperties->memoryTypeBits = kk_mtltexture_memory_types(pdev);
+       break;
+    default:
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+-   pMemoryMetalHandleProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
+-
+    return VK_SUCCESS;
+ }
+ #endif /* VK_USE_PLATFORM_METAL_EXT */
+@@ -97,6 +118,16 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+    const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
+       pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+ 
++   /* Reject an incompatible type before creating or retaining resources. */
++   if (metal_info && metal_info->handleType ==
++                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
++      const struct kk_physical_device *pdev = kk_device_physical(dev);
++      if (pAllocateInfo->memoryTypeIndex >= pdev->mem_type_count ||
++          !(kk_mtltexture_memory_types(pdev) &
++            BITFIELD_BIT(pAllocateInfo->memoryTypeIndex)))
++         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   }
++
+    // TODO_KOSMICKRISP Do the actual memory allocation with alignment requirements
+    uint32_t alignment = (1ULL << 12);
+ 
+@@ -118,12 +149,62 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+          goto fail_alloc;
+       }
+ 
+-      if (import_metal) {
++      if (import_metal &&
++          metal_info->handleType ==
++             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
++         const VkMemoryDedicatedAllocateInfo *dedicated_info =
++            vk_find_struct_const(pAllocateInfo->pNext,
++                                 MEMORY_DEDICATED_ALLOCATE_INFO);
++
++         /* MTLTexture imports are DEDICATED_ONLY. The texture is the image's
++          * storage, there is no heap or buffer behind it. */
++         if (!dedicated_info || dedicated_info->image == VK_NULL_HANDLE) {
++            FREE(mem->bo);
++            result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                               "MTLTexture import requires a dedicated image");
++            goto fail_alloc;
++         }
++
++         VK_FROM_HANDLE(kk_image, image, dedicated_info->image);
++         if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
++            FREE(mem->bo);
++            result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++            goto fail_alloc;
++         }
++         if (image->vk.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) {
++            if (image->disjoint || image->vk.image_type != VK_IMAGE_TYPE_2D ||
++                image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
++                image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
++                image->vk.usage & ~VK_IMAGE_USAGE_SAMPLED_BIT) {
++               FREE(mem->bo);
++               result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++               goto fail_alloc;
++            }
++            mem->bo->chroma_texture = mtl_new_nv12_chroma_texture(
++               metal_info->handle, image->vk.extent.width,
++               image->vk.extent.height, mem->bo->plane_offsets,
++               mem->bo->plane_strides, mem->bo->plane_sizes);
++            if (!mem->bo->chroma_texture) {
++               FREE(mem->bo);
++               result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++               goto fail_alloc;
++            }
++            kk_device_add_texture_to_residency_set(dev, mem->bo->chroma_texture);
++         } else if (image->plane_count != 1) {
++            FREE(mem->bo);
++            result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++            goto fail_alloc;
++         }
++         mem->bo->dedicated_image = image;
++         mem->bo->texture = mtl_retain(metal_info->handle);
++         mem->bo->size_B = mem->vk.size;
++         kk_device_add_texture_to_residency_set(dev, mem->bo->texture);
++      } else if (import_metal) {
+          assert(metal_info->handleType ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT);
+ 
+-         /* We only support heaps since that's the backing for all our memory
+-          * and simplifies implementation */
++         /* Heaps are the backing for all our memory, which simplifies
++          * implementation */
+          mem->bo->mtl_handle = mtl_retain(metal_info->handle);
+          mem->bo->map =
+             mtl_new_buffer_with_length(mem->bo->mtl_handle, mem->vk.size, 0u);
+@@ -138,8 +219,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+       }
+ 
+-      mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+-      mem->bo->cpu = mtl_get_contents(mem->bo->map);
++      if (mem->bo->map) {
++         mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
++         mem->bo->cpu = mtl_get_contents(mem->bo->map);
++      }
+    } else {
+       result =
+          kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
+@@ -184,6 +267,12 @@ kk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+       return VK_SUCCESS;
+    }
+ 
++   /* Memory imported from an MTLTexture has no linear CPU view */
++   if (mem->bo->cpu == NULL) {
++      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
++                       "Memory object has no CPU mapping.");
++   }
++
+    const VkDeviceSize offset = pMemoryMapInfo->offset;
+    const VkDeviceSize size = vk_device_memory_range(
+       &mem->vk, pMemoryMapInfo->offset, pMemoryMapInfo->size);
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.h b/src/kosmickrisp/vulkan/kk_device_memory.h
+index 6aff54b..f8bba4a 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.h
++++ b/src/kosmickrisp/vulkan/kk_device_memory.h
+@@ -27,5 +27,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_device_memory, vk.base, VkDeviceMemory,
+ 
+ extern const VkExternalMemoryProperties kk_mtlheap_mem_props;
+ extern const VkExternalMemoryProperties kk_host_mem_props;
++extern const VkExternalMemoryProperties kk_mtltexture_mem_props;
++
++struct kk_physical_device;
++uint32_t kk_mtltexture_memory_types(const struct kk_physical_device *pdev);
+ 
+ #endif // KK_MEMORY_H
+diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
+index 5f9b787..852214d 100644
+--- a/src/kosmickrisp/vulkan/kk_image.c
++++ b/src/kosmickrisp/vulkan/kk_image.c
+@@ -273,16 +273,38 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+        pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   const bool mtltexture_import =
++      external_info != NULL &&
++      external_info->handleType ==
++         VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT;
++
+    /* TODO_KOSMICKRISP Linear images cannot be used as color attachments as long
+     * as input attachments are changed to arrays. Vulkan specifies that any
+     * image format supporting the color attachment feature also supports being
+     * used as an input attachment, and Metal disallows arrays for linear
+     * textures.
++    *
++    * An imported MTLTexture, such as one backed by an IOSurface, is renderable
++    * though, so allow color attachment usage there as long as the image is not
++    * used as an input attachment.
+     */
++   VkImageUsageFlags linear_unsupported_usage =
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++   if (mtltexture_import && ycbcr_info == NULL) {
++      linear_unsupported_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
++      if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR) {
++         features |=
++            kk_get_image_plane_format_features(pdev, pImageFormatInfo->format,
++                                               VK_IMAGE_TILING_OPTIMAL, 0u) &
++            (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
++             VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
++             VK_FORMAT_FEATURE_2_BLIT_DST_BIT);
++      }
++   }
+    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+-       (pImageFormatInfo->usage &
+-        (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
++       (pImageFormatInfo->usage & linear_unsupported_usage))
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
+@@ -411,6 +433,28 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+          ext_mem_props = &kk_host_mem_props;
+          break;
+       }
++      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT: {
++         /* NV12 imports use a luma texture and derive a chroma texture from
++          * the same IOSurface. Other formats must fit a single texture.
++          * Neither path supports heap aliasing or disjoint bindings.
++          */
++         if ((pImageFormatInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) ||
++             (ycbcr_info != NULL &&
++              (pImageFormatInfo->format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
++               pImageFormatInfo->usage & ~VK_IMAGE_USAGE_SAMPLED_BIT)) ||
++             (pImageFormatInfo->flags &
++              (VK_IMAGE_CREATE_DISJOINT_BIT |
++               VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT)) ||
++             (pImageFormatInfo->type == VK_IMAGE_TYPE_3D &&
++              (pImageFormatInfo->flags &
++               (VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
++                VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT)))) {
++            return vk_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
++                             "unsupported MTLTexture import image");
++         }
++         ext_mem_props = &kk_mtltexture_mem_props;
++         break;
++      }
+       default:
+          /* From the Vulkan 1.3.256 spec:
+           *
+@@ -461,6 +505,11 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+        (pImageFormatInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT))
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   if (mtltexture_import && ycbcr_info) {
++      maxMipLevels = 1;
++      maxArraySize = 1;
++      sampleCounts = VK_SAMPLE_COUNT_1_BIT;
++   }
+    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+       .maxExtent = maxExtent,
+       .maxMipLevels = maxMipLevels,
+@@ -680,6 +729,10 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+       }
+    }
+ 
++   if (image->vk.external_handle_types &
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT)
++      memory_types &= kk_mtltexture_memory_types(pdev);
++
+    // TODO hope for the best?
+ 
+    uint64_t size_B = 0;
+@@ -703,10 +756,12 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+       switch (ext->sType) {
+       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+          VkMemoryDedicatedRequirements *dedicated = (void *)ext;
+-         dedicated->prefersDedicatedAllocation =
+-            image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+-         dedicated->requiresDedicatedAllocation =
+-            image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++         const bool dedicated_only =
++            image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
++            (image->vk.external_handle_types &
++             VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT);
++         dedicated->prefersDedicatedAllocation = dedicated_only;
++         dedicated->requiresDedicatedAllocation = dedicated_only;
+          break;
+       }
+       default:
+@@ -790,10 +845,19 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
+    }
+ 
+    pLayout->subresourceLayout = (VkSubresourceLayout){
+-      .offset = offset_B,
+-      .size = plane->layout.size_B,
+-      .rowPitch = plane->layout.linear_stride_B,
+-      .arrayPitch = plane->layout.layer_stride_B,
++      .offset = plane->mem && plane->mem->bo->chroma_texture
++                   ? plane->mem_offset_B : offset_B,
++      /* Keep the allocation requirements independent of the imported backing.
++       * Only the bound subresource layout describes the actual IOSurface.
++       */
++      .size = plane->mem && plane->mem->bo->chroma_texture
++                 ? plane->mem->bo->plane_sizes[p] : plane->layout.size_B,
++      .rowPitch = plane->mem && plane->mem->bo->chroma_texture
++                     ? plane->mem->bo->plane_strides[p]
++                     : plane->layout.linear_stride_B,
++      .arrayPitch = plane->mem && plane->mem->bo->chroma_texture
++                       ? plane->mem->bo->plane_sizes[p]
++                       : plane->layout.layer_stride_B,
+       .depthPitch = 1u,
+    };
+ 
+@@ -920,6 +984,24 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
+    }
+ #endif
+ 
++   /* Memory imported from an MTLTexture is dedicated to this image and the
++    * texture is its storage */
++   if (mem->bo->texture) {
++      if (info->memoryOffset != 0 || mem->bo->dedicated_image != image ||
++          image->disjoint ||
++          image->plane_count != (mem->bo->chroma_texture ? 2 : 1))
++         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++      for (unsigned p = 0; p < image->plane_count; p++) {
++         struct kk_image_plane *plane = &image->planes[p];
++         plane->mem = mem;
++         plane->mem_offset_B = mem->bo->plane_offsets[p];
++         plane->mtl_handle = mtl_retain(p ? mem->bo->chroma_texture : mem->bo->texture);
++         plane->addr = mtl_texture_get_gpu_resource_id(plane->mtl_handle);
++      }
++
++      return VK_SUCCESS;
++   }
++
+    uint64_t offset_B = info->memoryOffset;
+    if (image->disjoint) {
+       const VkBindImagePlaneMemoryInfo *plane_info =
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index 227273d..86a77d3 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1101,6 +1101,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .heapIndex = sysmem_heap_idx,
+    };
+ 
++   /* Opaque texture imports have no CPU mapping. Keep the ordinary unified
++    * host-visible type first, and offer a GPU-only type on the same heap.
++    */
++   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+ 
