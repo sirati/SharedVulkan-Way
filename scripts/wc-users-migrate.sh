@@ -116,10 +116,16 @@ secure_path() {
   local uid=0; [ -z "$ROOT" ] || uid=$(id -u)
   [ ! -L "$1" ] && [ "$(stat -c '%u %a' "$1" 2>/dev/null)" = "$uid $2" ]
 }
-trusted_key() {
+generated_candidate() {
   local d="$TRUST/$1"
   secure_path "$VL" 755 && secure_path "$TRUST" 700 && secure_path "$d" 700 &&
-    secure_path "$d/session.key" 600 && secure_path "$d/broker-confirmed" 600 &&
+    secure_path "$d/session.key" 600 && secure_path "$d/generated-here" 600 &&
+    [ "$(cat "$d/generated-here")" = 'root-generated-candidate-v1' ] &&
+    grep -Eq '^[0-9a-f]{64}$' "$d/session.key"
+}
+trusted_key() {
+  local d="$TRUST/$1"
+  generated_candidate "$1" && secure_path "$d/broker-confirmed" 600 &&
     [ "$(cat "$d/broker-confirmed")" = 'root-generated-broker-confirmed-v1' ] &&
     grep -Eq '^[0-9a-f]{64}$' "$d/session.key"
 }
@@ -145,6 +151,27 @@ require_idle() {
     active=$(systemctl --machine="$u@.host" --user list-units --state=active --no-legend --plain 'wc-launch-*') || exit 1
     [ -z "$active" ] || { echo "active sessions must end before protected key or installation changes"; exit 1; }
   done
+}
+legacy_snapshot() {
+  local n=$1 base=$2 base_real=$3 nb_real=$4
+  local dest="$VL/protected-rollback/$n.preparing"
+  # Preserve the known application installation before candidate binaries or
+  # scripts replace it. Keys and paths are converted to the protected layout.
+  run install -d -m 0700 "$VL/protected-rollback"
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "unfinished application snapshot requires review"; exit 1; }
+  run cp -a "$base" "$dest"
+  run rm -f "$dest/session.key"
+  run cp "$TRUST/$n/session.key" "$dest/session.key"
+  own root:root "$dest"
+  run chmod -R go-w "$dest"
+  if [ -n "$REAL" ]; then run chown waycompose:waycompose "$dest/session.key"; fi
+  run chmod 0600 "$dest/session.key"
+  run sed -i -e "s|$base_real/|$nb_real/|g" -e "s|$base_real\$|$nb_real|g" -e "s|$AH_REAL/|~/|g" "$dest/apps.ini"
+  for f in gpu.env copy-scope dmabuf-node; do
+    [ -f "$dest/$f" ] && run sed -i "s|$base_real/|$nb_real/|g" "$dest/$f"
+  done
+  run rm -rf "$VL/protected-rollback/$n"
+  run mv "$dest" "$VL/protected-rollback/$n"
 }
 initial_snapshot() {
   local n=$1
@@ -185,16 +212,17 @@ if [[ "$VERB" = key-* ]]; then
       case "$legacy" in "$AH"/*) rm -f "$legacy/session.key" ;; esac
       if [ ! -e "$d/session.key" ]; then
         (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$d/session.key")
+        (umask 077; printf '%s\n' root-generated-candidate-v1 >"$d/generated-here")
       fi
-      secure_path "$d/session.key" 600 && grep -Eq '^[0-9a-f]{64}$' "$d/session.key" || { echo "invalid protected candidate"; exit 1; }
+      generated_candidate "$n" || { echo "unknown candidate provenance; refusing to adopt a preexisting key"; exit 1; }
     fi
   elif [ "$VERB" = key-export ]; then
-    secure_path "$VL" 755 && secure_path "$TRUST" 700 && secure_path "$d" 700 && secure_path "$d/session.key" 600 || exit 1
+    generated_candidate "$n" || { echo "unknown candidate provenance"; exit 1; }
     grep -Eq '^[0-9a-f]{64}$' "$d/session.key" || exit 1
     cat "$d/session.key"
     exit 0
   else
-    secure_path "$VL" 755 && secure_path "$TRUST" 700 && secure_path "$d" 700 && secure_path "$d/session.key" 600 || exit 1
+    generated_candidate "$n" || { echo "unknown candidate provenance"; exit 1; }
     # Only called after the broker's privileged stdin provisioning succeeded.
     [ ! -L "$d/broker-confirmed" ] || exit 1
     (umask 077; printf '%s\n' root-generated-broker-confirmed-v1 >"$d/broker-confirmed")
@@ -248,6 +276,7 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     if echo "$data" | grep -q '^UNSUPPORTED:'; then
       echo "  apps.ini names $(echo "$data" | grep '^UNSUPPORTED:' | cut -d: -f2-): move it by hand"; FAIL=1; continue
     fi
+    legacy_snapshot "$n" "$base" "$base_real" "$nb_real"
     if [ ! -e "$nb" ]; then run cp -a "$base" "$nb"; fi
     run rm -f "$nb/session.key"
     run cp -f "$TRUST/$n/session.key" "$nb/session.key"

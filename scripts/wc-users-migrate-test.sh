@@ -38,6 +38,16 @@ keyop() { ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" "$1" admin auto
 provision() { keyop key-prepare "$1" "$2" && keyop key-confirm "$1" "$2"; }
 run() { ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" install-staged admin auto "$@" 2>&1; }
 
+# Current ownership and mode cannot establish where an unknown key came from.
+mkdir -p "$T/var/lib/waycompose/key-trust/wct2"
+chmod 0700 "$T/var/lib/waycompose/key-trust" "$T/var/lib/waycompose/key-trust/wct2"
+printf '%064d' 0 >"$T/var/lib/waycompose/key-trust/wct2/session.key"
+chmod 0600 "$T/var/lib/waycompose/key-trust/wct2/session.key"
+out=$(keyop key-prepare unused wct2 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "unknown preseed with protected metadata is refused" || bad "unknown preseed adopted"
+[ ! -e "$T/var/lib/waycompose/key-trust/wct2/generated-here" ] && ok "unknown key gets no generation provenance" || bad "unknown key relabelled"
+rm -rf "$T/var/lib/waycompose/key-trust/wct2"
+
 S=$(stage wct1 "$(printf 'a%.0s' $(seq 64))")
 out=$(run "$S" wct1); rc=$?
 [ "$rc" != 0 ] && ok "legacy key without protected provenance is refused" || bad "legacy key accepted"
@@ -95,6 +105,24 @@ app_out=$(sh "$T/var/lib/waycompose/installs/wcivs/bin/fixture-app")
 [ "$app_out" = "restored application ran with original config" ] && ok "protected rollback restores a runnable application" || bad "rollback application failed"
 ! grep -q '^changed' "$T/var/lib/waycompose/installs/wcivs/apps.ini" && ok "protected rollback restores application configuration" || bad "rollback configuration failed"
 cmp -s "$T/var/lib/waycompose/installs/wcivs/session.key" "$T/var/lib/waycompose/key-trust/wcivs/session.key" && ok "protected rollback keeps the trusted verifier key" || bad "rollback restored old trust"
+# The first migration must retain a working pre-candidate application, even
+# when the new wc-session immediately fails. This never runs a desktop app.
+S=$(stage wct2 "$(printf 'e%.0s' $(seq 64))")
+ln -s "$S" "$T/home/admin/.config/waycompose/installs/wct2"
+provision "$S" wct2 || exit 1
+mkdir -p "$T/build-bin"
+printf '#!/bin/sh\nexit 91\n' >"$T/build-bin/wc-session"
+printf 'fixture\n' >"$T/build-bin/wc-arena-host"
+printf 'fixture\n' >"$T/build-bin/sv-hostd"
+ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" apply admin wctest "$T/build-bin" wct2 >"$T/first-apply.txt" 2>&1 || { cat "$T/first-apply.txt"; exit 1; }
+bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps >/dev/null 2>&1; rc=$?
+[ "$rc" = 91 ] && ok "first-migration candidate failure is reproduced" || bad "candidate unexpectedly worked"
+ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" rollback admin wctest unused wct2 >"$T/first-rollback.txt" 2>&1 || { cat "$T/first-rollback.txt"; exit 1; }
+app_out=$(bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps)
+[ "$app_out" = "apps ok" ] && ok "first-migration rollback restores pre-candidate executable" || bad "first migration had no working rollback"
+grep -q '/var/lib/waycompose/installs/wct2/bin/app-firefox' "$T/var/lib/waycompose/installs/wct2/apps.ini" && ok "first-migration rollback keeps protected system paths" || bad "rollback revived admin application paths"
+cmp -s "$T/var/lib/waycompose/installs/wct2/session.key" "$T/var/lib/waycompose/key-trust/wct2/session.key" && ok "first-migration rollback keeps rotated trust" || bad "first migration restored exposed key"
+
 # A shared verifier must not restart over another install's exposed key.
 mkdir -p "$T/var/lib/waycompose/installs/legacy-unmigrated"
 printf 'retired fixture\n' >"$T/var/lib/waycompose/installs/legacy-unmigrated/session.key"
