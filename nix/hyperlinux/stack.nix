@@ -169,6 +169,9 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  controlClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-control-access-client"; source = ./control-access-client.c;
+  };
   seccompClient = guest.callPackage ./client-probe.nix {
     programName = "hl-seccomp-client"; source = ./seccomp-client.c;
     linkFlags = [ "-pthread" ];
@@ -219,11 +222,16 @@ let
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-write
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-exec
+      for address in 0x100000 0x3c0000 0x3ff000; do
+        for mode in --syscalls --cpu-read --cpu-write --cpu-exec; do
+          "$HL_RUNNER" ${controlClient}/bin/hl-control-access-client "$mode" "$address"
+        done
+      done
       for mode in --basic --backend-denial --trap --tsync --stacked --tsync-divergent --kill-thread --arguments; do
         "$HL_RUNNER" ${seccompClient}/bin/hl-seccomp-client "$mode"
       done
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient probeRunner;
 }
