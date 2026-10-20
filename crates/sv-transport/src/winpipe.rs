@@ -156,7 +156,7 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
         // Completed at once; `done` may not be set on an overlapped handle,
         // so the count is taken from the overlapped record either way.
         let mut n = 0u32;
-        if unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 0) } != 0 {
+        if unsafe { sys::GetOverlappedResult(handle, &mut *ov, &mut n, 0) } != 0 {
             Ok(n)
         } else {
             Ok(done)
@@ -172,12 +172,12 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
             // ever. It is cancelled and then waited for, because the
             // OVERLAPPED and the buffer must outlive the request.
             let ms = if write { WRITE_TIMEOUT_MS } else { u32::MAX };
-            if unsafe { sys::GetOverlappedResultEx(handle, &mut ov, &mut n, ms, 0) } != 0 {
+            if unsafe { sys::GetOverlappedResultEx(handle, &mut *ov, &mut n, ms, 0) } != 0 {
                 Ok(n)
             } else {
                 let e = unsafe { sys::GetLastError() };
                 if write && e == sys::WAIT_TIMEOUT {
-                    unsafe { sys::CancelIoEx(handle, &mut ov) };
+                    unsafe { sys::CancelIoEx(handle, &mut *ov) };
                     if unsafe { sys::GetOverlappedResultEx(handle, &mut *ov, &mut n, WRITE_TIMEOUT_MS, 0) } == 0
                         && unsafe { core::ptr::read_volatile(&ov.internal) } == AsyncWriter::PENDING
                     {
