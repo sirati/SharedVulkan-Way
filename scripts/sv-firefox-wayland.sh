@@ -42,16 +42,15 @@ export __EGL_VENDOR_LIBRARY_FILENAMES=${SVWL_EGL_VENDOR:-/run/opengl-driver/shar
 # put Zink on a Wayland compositor that offers only `wl_shm` — it takes the DRM
 # door, finds no device, and loads llvmpipe — so Firefox as a Wayland client of
 # this weston, or of wc-proxy, renders in software whatever this ICD offers.
-# `nix/mesa-kopper-wayland.nix` is the system's own Mesa plus the override
-# platform_x11.c already has (`LIBGL_KOPPER_DRI2`). Built against the registry's
-# nixpkgs, which is the one the system Firefox comes from, so both load one
-# libwayland-client. `SVWL_KOPPER_MESA=none` measures stock Mesa instead.
+# Use upstream Mesa main, including its merged Zink VA frontend, with no
+# waycompose Mesa patch. The old variable name is retained for existing test
+# commands; the native render-node/default-settings proof is sv-firefox-stock.sh.
 KOPPER_MESA=${SVWL_KOPPER_MESA:-}
 if [ -z "$KOPPER_MESA" ] && { [ "$MODE" = firefox ] || [ "$MODE" = soak ] || [ "$MODE" = scroll ] || [ "$MODE" = two-windows ] || [ "$MODE" = probe ]; }; then
   KOPPER_MESA=$(nix build --no-link --print-out-paths --impure --expr \
-    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-kopper-wayland.nix {}" \
+    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" \
     2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
-  [ -n "$KOPPER_MESA" ] || { echo "FAIL: could not build nix/mesa-kopper-wayland.nix (SVWL_KOPPER_MESA=none to run stock Mesa)"; exit 1; }
+  [ -n "$KOPPER_MESA" ] || { echo "FAIL: could not build nix/mesa-zink-va.nix (SVWL_KOPPER_MESA=none to use the shell Mesa)"; exit 1; }
 fi
 if [ -n "$KOPPER_MESA" ] && [ "$KOPPER_MESA" != none ]; then
   export __EGL_VENDOR_LIBRARY_FILENAMES=$KOPPER_MESA/share/glvnd/egl_vendor.d/50_mesa.json
@@ -126,7 +125,6 @@ if [ "${SVWL_VULKAN_DECODE:-0}" = 1 ]; then
   cat >>"$RUN/profile/user.js" <<PREFS
 user_pref("media.hardware-video-decoding-vulkan.enabled", true);
 user_pref("media.hardware-video-decoding-vulkan.force-enabled", true);
-user_pref("media.hardware-video-decoding-vulkan.readback.enabled", true);
 PREFS
 fi
 

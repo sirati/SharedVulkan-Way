@@ -42,6 +42,29 @@ pub const QUEUE_FAMILY_FOREIGN: u32 = !2;
 pub const ASPECT_COLOR: u32 = 0x1;
 /// `VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT`.
 pub const ASPECT_MEMORY_PLANE_0: u32 = 0x80;
+/// `VK_IMAGE_ASPECT_PLANE_0_BIT`; planes 1 and 2 are the next two bits, as
+/// the memory planes are after `ASPECT_MEMORY_PLANE_0`.
+pub const ASPECT_PLANE_0: u32 = 0x10;
+
+/// How many planes a format has (§112): 2 for the `_2PLANE_` formats, 3 for
+/// the `_3PLANE_` ones, 1 for everything else. A LINEAR modifier image has as
+/// many memory planes as its format has planes.
+pub fn plane_count(format: i32) -> u32 {
+    match format {
+        // G8/G10X6/G12X4/G16 x {3P420, 2P420, 3P422, 2P422, 3P444}
+        1_000_156_002 | 1_000_156_004 | 1_000_156_006 => 3,
+        1_000_156_003 | 1_000_156_005 => 2,
+        1_000_156_012 | 1_000_156_014 | 1_000_156_016 => 3,
+        1_000_156_013 | 1_000_156_015 => 2,
+        1_000_156_022 | 1_000_156_024 | 1_000_156_026 => 3,
+        1_000_156_023 | 1_000_156_025 => 2,
+        1_000_156_029 | 1_000_156_031 | 1_000_156_033 => 3,
+        1_000_156_030 | 1_000_156_032 => 2,
+        // the four 2PLANE_444 formats
+        1_000_330_000..=1_000_330_003 => 2,
+        _ => 1,
+    }
+}
 /// `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`.
 pub const STAGE_ALL_COMMANDS: u32 = 0x10000;
 
@@ -103,8 +126,19 @@ fn stat_char_device(_path: &std::path::Path) -> Option<(u32, u32)> {
     None
 }
 
+#[cfg(test)]
+thread_local! { static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn test_enabled_scope<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset { fn drop(&mut self) { TEST_ENABLED.set(self.0); } }
+    let _reset = Reset(TEST_ENABLED.replace(true));
+    f()
+}
 /// Is the dma-buf path on?
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ENABLED.get() { return true; }
     node().is_some()
 }
 
@@ -321,9 +355,40 @@ pub struct DmabufImage {
     /// `VkImageDrmFormatModifierExplicitCreateInfoEXT`'s plane 0: offset and
     /// row pitch the importer asked for.
     pub explicit: Option<(u64, u64)>,
+    /// Every plane's explicit `(offset, row pitch)`, plane 0 first; `explicit`
+    /// is the first of them (§112: NV12 imported whole, two planes).
+    pub planes: [(u64, u64); 3],
+    pub nplanes: u8,
+    /// Added to every bind of this image: an import whose plane 0 is not at
+    /// the start of the dma-buf (an NV12 frame's chroma plane imported on
+    /// its own as R8G8, §112), checked against the driver's layout.
+    pub bind_offset: u64,
+    /// Full backend image requirement, checked after applying the explicit
+    /// layout translation before any bind reaches the real driver.
+    pub required_size: u64,
+    pub required_alignment: u64,
+    /// The image's `VkFormat`, for its plane count.
+    pub format: i32,
     /// Made with `VkExternalMemoryImageCreateInfo{DMA_BUF}`: bound to a
     /// shared section on the GPU side.
     pub external: bool,
+}
+
+/// Preserve the exact explicit plane offsets without wrapping arithmetic.
+pub(crate) fn explicit_base(wanted: &[(u64, u64)], actual: &[(u64, u64)], alignment: u64) -> Option<u64> {
+    if wanted.is_empty() || wanted.len() != actual.len() || alignment == 0 { return None; }
+    let base = wanted[0].0.checked_sub(actual[0].0)?;
+    (base % alignment == 0 && wanted.iter().zip(actual).all(|(w, a)| w.1 == a.1 && a.0.checked_add(base) == Some(w.0))).then_some(base)
+}
+
+impl DmabufImage {
+    pub(crate) fn translated_offset(&self, offset: u64) -> Option<u64> { offset.checked_add(self.bind_offset) }
+    pub(crate) fn binding_offset(&self, requested: u64, allocation_size: u64) -> Option<u64> {
+        let offset = self.translated_offset(requested)?;
+        (self.required_size > 0 && self.required_alignment > 0
+            && offset % self.required_alignment == 0
+            && offset.checked_add(self.required_size)? <= allocation_size).then_some(offset)
+    }
 }
 
 /// What the app side remembers about a semaphore created exportable as a
@@ -333,8 +398,27 @@ pub struct Semaphore {
     /// The queue of the last submit that signalled it, until an export
     /// consumes that signal.
     pub signal_queue: Option<u64>,
-    /// A sync fd was imported into it: the next wait on it is dropped.
+    /// The permanent payload was signaled by completed CPU-side acquisition.
     pub presignalled: bool,
+    /// A temporary already-complete SYNC_FD import shadows the permanent
+    /// payload until the next wait or copy-payload export restores it.
+    pub temporary_presignalled: bool,
+    /// Every local payload transition changes this revision, allowing failed
+    /// submissions to roll back only their own still-current reservation.
+    pub revision: u64,
+}
+impl Semaphore {
+    pub fn advance_revision(&mut self) {
+        self.revision = self.revision.checked_add(1).expect("semaphore revision exhausted");
+    }
+    pub fn consume_local_signal(&mut self) -> bool {
+        if self.temporary_presignalled {
+            self.temporary_presignalled = false;
+            true
+        } else {
+            std::mem::take(&mut self.presignalled)
+        }
+    }
 }
 
 /// The implicit-sync bookkeeping of §104.11, app side.
@@ -448,6 +532,7 @@ pub fn rewrite_families(src: &mut u32, dst: &mut u32) {
 /// when this path has nothing to do with the image.
 pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option<DmabufImage>, i32> {
     let mut img = DmabufImage::default();
+    img.format = ci.format.0;
     let mut ours = false;
     if ci.tiling.0 == TILING_DRM_FORMAT_MODIFIER {
         ours = true;
@@ -458,11 +543,15 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
                     linear |= x.p_drm_format_modifiers.contains(&DRM_FORMAT_MOD_LINEAR);
                 }
                 p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(x) => {
-                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR || x.p_plane_layouts.len() != 1 {
+                    let n = x.p_plane_layouts.len();
+                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR || n == 0 || n > 3 || n as u32 != plane_count(ci.format.0) {
                         return Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT);
                     }
-                    let pl = &x.p_plane_layouts[0];
-                    img.explicit = Some((pl.offset, pl.row_pitch));
+                    for (i, pl) in x.p_plane_layouts.iter().enumerate() {
+                        img.planes[i] = (pl.offset, pl.row_pitch);
+                    }
+                    img.nplanes = n as u8;
+                    img.explicit = Some(img.planes[0]);
                     linear = true;
                 }
                 _ => {}
@@ -498,6 +587,11 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
     if drop_external {
         ci.p_next.retain(|l| !matches!(l, p::PNextLink::VkExternalMemoryImageCreateInfo(x) if x.handle_types.0 != HOST_ALLOCATION));
     }
+    // This adapter binds one complete backing allocation. Plane-specific
+    // requirements and VkBindImagePlaneMemoryInfo are not implemented.
+    if ours && ci.flags.0 & 0x0000_0200 != 0 { // VK_IMAGE_CREATE_DISJOINT_BIT
+        return Err(VK_ERROR_FORMAT_NOT_SUPPORTED);
+    }
     Ok(ours.then_some(img))
 }
 
@@ -513,6 +607,7 @@ pub struct FormatQuery {
 /// for what this path will actually create. `Err` is the answer itself.
 pub fn rewrite_image_format_info(info: &mut p::VkPhysicalDeviceImageFormatInfo2) -> Result<FormatQuery, i32> {
     let mut q = FormatQuery::default();
+    let modifier = info.tiling.0 == TILING_DRM_FORMAT_MODIFIER;
     if info.tiling.0 == TILING_DRM_FORMAT_MODIFIER {
         let m = info.p_next.iter().find_map(|l| match l {
             p::PNextLink::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(x) => Some(x.drm_format_modifier),
@@ -540,6 +635,9 @@ pub fn rewrite_image_format_info(info: &mut p::VkPhysicalDeviceImageFormatInfo2)
     }
     if strip {
         info.p_next.retain(|l| !matches!(l, p::PNextLink::VkPhysicalDeviceExternalImageFormatInfo(_)));
+    }
+    if (modifier || q.dma_buf) && info.flags.0 & 0x0000_0200 != 0 {
+        return Err(VK_ERROR_FORMAT_NOT_SUPPORTED);
     }
     Ok(q)
 }
@@ -597,6 +695,12 @@ pub fn drop_presignalled_waits(s: &mut p::VkSubmitInfo, mut take: impl FnMut(u64
                 {
                     t.p_wait_semaphore_values.remove(i);
                     t.wait_semaphore_value_count = t.p_wait_semaphore_values.len() as u32;
+                }
+                if let p::PNextLink::VkDeviceGroupSubmitInfo(group) = l
+                    && i < group.p_wait_semaphore_device_indices.len()
+                {
+                    group.p_wait_semaphore_device_indices.remove(i);
+                    group.wait_semaphore_count = group.p_wait_semaphore_device_indices.len() as u32;
                 }
             }
         } else {
@@ -660,7 +764,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierPropertiesEXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: plane_count(format.0),
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags(linear),
                             };
                         }
@@ -677,7 +781,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierProperties2EXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: plane_count(format.0),
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags2(linear2),
                             };
                         }
@@ -774,6 +878,32 @@ mod tests {
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT));
         let mut ci = image(TILING_DRM_FORMAT_MODIFIER, vec![list(&[7])]);
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn disjoint_adapter_images_and_format_queries_are_refused() {
+        for tiling in [TILING_DRM_FORMAT_MODIFIER, TILING_LINEAR] {
+            let mut ci = image(tiling, vec![list(&[DRM_FORMAT_MOD_LINEAR]), external(DMA_BUF)]);
+            ci.flags = p::VkImageCreateFlags(0x0000_0200);
+            assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+        }
+        let mut ci = image(TILING_LINEAR, vec![]);
+        ci.flags = p::VkImageCreateFlags(0x0000_0200);
+        assert!(rewrite_image_create_info(&mut ci).unwrap().is_none());
+
+        let mut info = p::VkPhysicalDeviceImageFormatInfo2::default();
+        info.tiling = p::VkImageTiling(TILING_LINEAR);
+        info.flags = p::VkImageCreateFlags(0x0000_0200);
+        let mut external = p::VkPhysicalDeviceExternalImageFormatInfo::default();
+        external.handle_type = p::VkExternalMemoryHandleTypeFlagBits(DMA_BUF as i32);
+        info.p_next.push(p::PNextLink::VkPhysicalDeviceExternalImageFormatInfo(Box::new(external)));
+        assert_eq!(rewrite_image_format_info(&mut info), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+
+        let mut info = p::VkPhysicalDeviceImageFormatInfo2::default();
+        info.tiling = p::VkImageTiling(TILING_DRM_FORMAT_MODIFIER);
+        info.flags = p::VkImageCreateFlags(0x0000_0200);
+        info.p_next.push(p::PNextLink::VkPhysicalDeviceImageDrmFormatModifierInfoEXT(Box::default()));
+        assert_eq!(rewrite_image_format_info(&mut info), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
     }
 
     #[test]
@@ -921,5 +1051,34 @@ mod tests {
         let d = drm_properties(226, 128);
         assert!(!d.has_primary && d.has_render);
         assert_eq!((d.render_major, d.render_minor), (226, 128));
+    }
+}
+
+#[cfg(test)]
+mod explicit_layout_tests {
+    use super::*;
+    #[test]
+    fn chroma_shift_preserves_layout_and_checks_the_complete_image_extent() {
+        let wanted = [(8192, 256)];
+        assert_eq!(explicit_base(&wanted, &[(0, 256)], 4096), Some(8192));
+        let image = DmabufImage { bind_offset: 8192, required_size: 4096, required_alignment: 4096, ..Default::default() };
+        assert_eq!(image.translated_offset(0), Some(8192));
+        assert_eq!(image.binding_offset(0, 12288), Some(8192));
+        assert_eq!(image.binding_offset(0, 12287), None);
+        assert_eq!(image.binding_offset(1, 16384), None);
+        assert_eq!(image.binding_offset(u64::MAX, u64::MAX), None);
+        assert_eq!(image.translated_offset(u64::MAX), None);
+    }
+    #[test]
+    fn all_planes_must_share_one_checked_shift_and_exact_pitches() {
+        let actual = [(0, 256), (8192, 256)];
+        assert_eq!(explicit_base(&[(4096,256),(12288,256)], &actual, 4096), Some(4096));
+        assert_eq!(explicit_base(&[(4096,256),(12289,256)], &actual, 4096), None);
+        assert_eq!(explicit_base(&[(4096,256),(12288,128)], &actual, 4096), None);
+        assert_eq!(explicit_base(&[(1,256)], &[(2,256)], 1), None);
+        assert_eq!(explicit_base(&[(1,256),(0,256)], &[(0,256),(u64::MAX,256)], 1), None);
+        assert_eq!(explicit_base(&[(0,256)], &[(0,256)], 0), None);
+        let image = DmabufImage { bind_offset: u64::MAX - 4095, required_size: 4096, required_alignment: 1, ..Default::default() };
+        assert_eq!(image.binding_offset(0, u64::MAX), None);
     }
 }

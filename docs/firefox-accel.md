@@ -1,5 +1,9 @@
 # Firefox through the forwarder, measured
 
+For the current stock Firefox render-node and dma-buf implementation, see
+`waycompose-design.md` §112. The measurements below are historical and do
+not establish the final guest hardware or sandboxed decode gates.
+
 `goal-firefox.md`'s fourth clause — *"hardware acceleration is working for the
 renderer"* — had never been tested with Firefox. The chain is Firefox →
 WebRender → GL → Zink → shared_vulkan → the GPU, and every link but the first

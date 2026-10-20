@@ -48,8 +48,10 @@ the shared directory.
 `RANGE_MAP` accepts a process HANDLE from the SYSTEM broker's own handle table,
 not a PID. `ObReferenceObjectByHandle` checks its access in UserMode and retains
 the actual EPROCESS. Mapping requires `PROCESS_VM_OPERATION | SYNCHRONIZE`.
-The retained mapping-target process handle is captured with these rights
-during the pipe PID/SID check, rather than reopened later by PID. This check
+Only protected BAR mode captures the retained mapping-target process handle
+with the extra VM operation right at its first pipe PID/SID check, rather than
+reopening later by PID. Ordinary clients, readiness and holder authentication
+keep their original duplication, synchronization and limited-query mask. This check
 compares the candidate process token SID with the pipe token SID. It does not
 independently exclude same-SID PID reuse between querying the pipe PID and
 opening that process. Mapping and death watch use the same retained target

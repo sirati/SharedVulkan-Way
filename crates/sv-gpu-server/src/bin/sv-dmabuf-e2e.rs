@@ -25,6 +25,9 @@
 //! 6. a sync fd imported into a semaphore whose wait is then dropped (no
 //!    hang), `vkMapMemory` refused on shared memory, and the section's name
 //!    gone once both allocations are freed.
+//! 7. §112: an NV12 frame exported as one dma-buf, filled by a copy, read by
+//!    name at its reported plane layouts, and imported back plane by plane
+//!    (R8 and R8G8 at the chroma offset), as Firefox samples a decoded frame.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -221,7 +224,7 @@ fn run() -> Result<(), String> {
     }
     .map_err(|e| format!("vkCreateDevice with the dma-buf extensions: {e:?}"))?;
     let queue = unsafe { device.get_device_queue(0, 0) };
-    let r = work(&instance, &device, queue);
+    let r = work(&instance, &device, queue).and_then(|()| nv12(&instance, pd, &device, queue));
     unsafe {
         let _ = device.device_wait_idle();
         device.destroy_device(None);
@@ -469,6 +472,187 @@ fn work(instance: &ash::Instance, d: &ash::Device, queue: vk::Queue) -> Result<(
     Ok(())
 }
 
+
+/// §112, step 7: a video frame's way. An NV12 image made the way Firefox's
+/// Vulkan decoder and Zink's VA-API export make theirs (LINEAR modifier,
+/// DMA_BUF export, one dma-buf with two memory planes), filled by a copy, and
+/// imported back the way Firefox's compositor samples it: plane 0 as an R8
+/// image, plane 1 as an R8G8 image at the chroma plane's offset in the same
+/// dma-buf. Both imports read back what the copy wrote; the section, read by
+/// name, holds it at the layouts the export reported.
+fn nv12(instance: &ash::Instance, pd: vk::PhysicalDevice, d: &ash::Device, queue: vk::Queue) -> Result<(), String> {
+    const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
+    const Y: u8 = 0x50;
+    const UV: [u8; 2] = [0x60, 0x70];
+    let memfd = ash::khr::external_memory_fd::Device::new(instance, d);
+
+    let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); 8];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut mods);
+    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe { instance.get_physical_device_format_properties2(pd, NV12, &mut fp2) };
+    let _ = fp2;
+    let n = list.drm_format_modifier_count as usize;
+    check(
+        n == 1 && mods[0].drm_format_modifier == 0 && mods[0].drm_format_modifier_plane_count == 2,
+        format_args!("NV12: {n} modifier(s), LINEAR with {} memory planes", mods[0].drm_format_modifier_plane_count),
+    )?;
+
+    let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+    let lin = [0u64];
+    let mut list = vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&lin);
+    let mut ext = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let ci = image_info(usage).format(NV12).push_next(&mut list).push_next(&mut ext);
+    let frame = unsafe { d.create_image(&ci, None) }.map_err(|e| format!("vkCreateImage(NV12 export): {e:?}"))?;
+    let f = allocate(d, frame, None)?;
+    let fd = unsafe {
+        memfd.get_memory_fd(&vk::MemoryGetFdInfoKHR::default().memory(f.memory).handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT))
+    }
+    .map_err(|e| format!("vkGetMemoryFdKHR(NV12): {e:?}"))?;
+    // SAFETY: the descriptor vkGetMemoryFdKHR just gave us.
+    let owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let token = sv_drm::token::read(std::os::fd::AsFd::as_fd(&owned)).map_err(|e| format!("NV12 fd is not a token: {e}"))?;
+    let plane = |a: vk::ImageAspectFlags| unsafe {
+        d.get_image_subresource_layout(frame, vk::ImageSubresource { aspect_mask: a, mip_level: 0, array_layer: 0 })
+    };
+    let p0 = plane(vk::ImageAspectFlags::MEMORY_PLANE_0_EXT);
+    let p1 = plane(vk::ImageAspectFlags::MEMORY_PLANE_1_EXT);
+    check(
+        p0.row_pitch >= u64::from(W) && p1.row_pitch >= u64::from(W) && p1.offset >= p0.offset + p0.row_pitch * u64::from(H),
+        format_args!("NV12 memory planes: Y at {} pitch {}, CbCr at {} pitch {}", p0.offset, p0.row_pitch, p1.offset, p1.row_pitch),
+    )?;
+
+    // A host-visible staging buffer, both ways.
+    let len = (W * H + W * H / 2) as u64;
+    let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let host = (0..props.memory_type_count)
+        .find(|&i| {
+            props.memory_types[i as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+        })
+        .ok_or("no host-visible memory type")?;
+    let staging = unsafe {
+        d.create_buffer(
+            &vk::BufferCreateInfo::default().size(len).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST),
+            None,
+        )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    let req = unsafe { d.get_buffer_memory_requirements(staging) };
+    let smem = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(host), None) }
+        .map_err(|e| format!("{e:?}"))?;
+    unsafe { d.bind_buffer_memory(staging, smem, 0) }.map_err(|e| format!("{e:?}"))?;
+    let ptr = unsafe { d.map_memory(smem, 0, len, vk::MemoryMapFlags::empty()) }.map_err(|e| format!("{e:?}"))? as *mut u8;
+    // SAFETY: a mapping of `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
+    let ylen = (W * H) as usize;
+    bytes[..ylen].fill(Y);
+    for c in bytes[ylen..].chunks_mut(2) {
+        c.copy_from_slice(&UV);
+    }
+
+    let pool = unsafe { d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(0), None) }.map_err(|e| format!("{e:?}"))?;
+    let run = |rec: &dyn Fn(vk::CommandBuffer)| -> Result<(), String> {
+        let cb = unsafe { d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)) }
+            .map_err(|e| format!("{e:?}"))?[0];
+        unsafe { d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()) }.map_err(|e| format!("{e:?}"))?;
+        rec(cb);
+        unsafe { d.end_command_buffer(cb) }.map_err(|e| format!("{e:?}"))?;
+        let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?;
+        let cbs = [cb];
+        unsafe { d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], fence) }.map_err(|e| format!("{e:?}"))?;
+        let r = unsafe { d.wait_for_fences(&[fence], true, 10_000_000_000) };
+        unsafe { d.destroy_fence(fence, None) };
+        r.map_err(|e| format!("the copy's fence: {e:?}"))
+    };
+    let barrier = |img: vk::Image, aspect: vk::ImageAspectFlags, old: vk::ImageLayout, new: vk::ImageLayout| {
+        vk::ImageMemoryBarrier::default()
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .old_layout(old)
+            .new_layout(new)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+            .image(img)
+            .subresource_range(vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
+    };
+    let region = |off: u64, aspect: vk::ImageAspectFlags, w: u32, h: u32| vk::BufferImageCopy {
+        buffer_offset: off,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+        image_offset: vk::Offset3D::default(),
+        image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
+    };
+    run(&|cb| unsafe {
+        let b = [
+            barrier(frame, vk::ImageAspectFlags::PLANE_0, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+            barrier(frame, vk::ImageAspectFlags::PLANE_1, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+        ];
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &b);
+        d.cmd_copy_buffer_to_image(
+            cb,
+            staging,
+            frame,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region(0, vk::ImageAspectFlags::PLANE_0, W, H), region(ylen as u64, vk::ImageAspectFlags::PLANE_1, W / 2, H / 2)],
+        );
+    })?;
+
+    // The section, by name, at the layouts the export reported.
+    let sec = std::fs::read(&token.name).map_err(|e| format!("open {}: {e}", token.name))?;
+    let mut wrong = 0;
+    for y in 0..H as usize {
+        for x in 0..W as usize {
+            wrong += usize::from(sec[p0.offset as usize + y * p0.row_pitch as usize + x] != Y);
+        }
+    }
+    for y in 0..(H / 2) as usize {
+        for x in 0..(W / 2) as usize {
+            let o = p1.offset as usize + y * p1.row_pitch as usize + x * 2;
+            wrong += usize::from(sec[o..o + 2] != UV);
+        }
+    }
+    check(wrong == 0, format_args!("the NV12 frame is in the section at the reported layouts ({wrong} samples wrong)"))?;
+
+    // Firefox's compositor: each plane its own image on the same dma-buf.
+    for (fmt, pl, w, h, want) in [
+        (vk::Format::R8_UNORM, p0, W, H, vec![Y]),
+        (vk::Format::R8G8_UNORM, p1, W / 2, H / 2, UV.to_vec()),
+    ] {
+        let layouts = [vk::SubresourceLayout { offset: pl.offset, size: 0, row_pitch: pl.row_pitch, array_pitch: 0, depth_pitch: 0 }];
+        let mut ex = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default().drm_format_modifier(0).plane_layouts(&layouts);
+        let mut ext = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let ci = image_info(usage).format(fmt).extent(vk::Extent3D { width: w, height: h, depth: 1 }).push_next(&mut ex).push_next(&mut ext);
+        let img = unsafe { d.create_image(&ci, None) }
+            .map_err(|e| format!("vkCreateImage({fmt:?} import at offset {} pitch {}): {e:?}", pl.offset, pl.row_pitch))?;
+        let dup = unsafe { libc::dup(fd) };
+        let b = allocate(d, img, Some(dup))?;
+        bytes.fill(0);
+        run(&|cb| unsafe {
+            let bar = [barrier(img, vk::ImageAspectFlags::COLOR, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)];
+            d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &bar);
+            d.cmd_copy_image_to_buffer(cb, img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, staging, &[region(0, vk::ImageAspectFlags::COLOR, w, h)]);
+        })?;
+        let n = (w * h) as usize * want.len();
+        let bad = bytes[..n].chunks(want.len()).filter(|c| *c != want.as_slice()).count();
+        check(bad == 0, format_args!("{fmt:?} imported at offset {} reads the plane back ({bad} of {} texels wrong)", pl.offset, w * h))?;
+        unsafe {
+            d.destroy_image(img, None);
+            d.free_memory(b.memory, None);
+        }
+    }
+    unsafe {
+        let _ = d.device_wait_idle();
+        d.destroy_command_pool(pool, None);
+        d.unmap_memory(smem);
+        d.destroy_buffer(staging, None);
+        d.free_memory(smem, None);
+        d.destroy_image(frame, None);
+        d.free_memory(f.memory, None);
+    }
+    Ok(())
+}
 /// Wait, as the compositor does, until the fence record at `path` says
 /// `completed >= seq`; how long that took.
 pub fn wait_record(path: &str, seq: u64, limit: std::time::Duration) -> Result<std::time::Duration, String> {

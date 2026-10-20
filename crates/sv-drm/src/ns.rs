@@ -38,6 +38,12 @@ pub struct NsConfig {
     /// Testing only: bind this (existing) char device as `/dev/dri/renderD<minor>`
     /// over a tmpfs on `/dev/dri`.
     pub test_node: Option<PathBuf>,
+    /// Testing only: device nodes to hide, each covered with /dev/null, so
+    /// that libdrm and the drivers see no device behind them (a
+    /// workstation's other GPUs, waycompose-design.md §112).
+    pub hide: Vec<PathBuf>,
+    /// `--pci VVVV:DDDD`: present the node as a PCI device of these ids.
+    pub pci: Option<(u16, u16)>,
     pub cmd: Vec<OsString>,
 }
 
@@ -64,6 +70,17 @@ pub enum Entry {
 /// What the tmpfs over `/sys/dev/char` holds: the `existing` links (name,
 /// target), except one for our device number, plus the faux device.
 pub fn sysfs_plan(dev: (u32, u32), minor: u32, existing: &[(OsString, PathBuf)]) -> Vec<Entry> {
+    sysfs_plan_pci(dev, minor, None, existing)
+}
+
+/// The PCI slot the device is given with `--pci` (waycompose-design.md §112).
+pub const PCI_SLOT: &str = "0000:00:02.0";
+
+/// [`sysfs_plan`], and with `pci = Some((vendor, device))` the node is a PCI
+/// device of those ids instead of a faux one: libdrm then fills
+/// `deviceinfo.pci`, which Firefox's glxtest reads unconditionally for a
+/// hardware EGL device, and its GfxInfo applies the vendor's rules (§112).
+pub fn sysfs_plan_pci(dev: (u32, u32), minor: u32, pci: Option<(u16, u16)>, existing: &[(OsString, PathBuf)]) -> Vec<Entry> {
     let (maj, min) = dev;
     let ours = format!("{maj}:{min}");
     let mut v: Vec<Entry> = existing
@@ -86,6 +103,27 @@ pub fn sysfs_plan(dev: (u32, u32), minor: u32, existing: &[(OsString, PathBuf)])
         Entry::File(p(".svdrm/minor/uevent"), format!("MAJOR={maj}\nMINOR={min}\nDEVNAME=dri/{render}\n")),
         Entry::Link(p(&ours), p(".svdrm/minor")),
     ]);
+    if let Some((vendor, device)) = pci {
+        let d = format!(".svdrm/{PCI_SLOT}");
+        v.retain(|e| !matches!(e, Entry::Link(l, _) if l == &p(".svdrm/minor/device")));
+        v.extend([
+            Entry::Dir(p(&d)),
+            Entry::Dir(p(&format!("{d}/drm"))),
+            Entry::Dir(p(&format!("{d}/drm/{render}"))),
+            Entry::Link(p(&format!("{d}/subsystem")), p("../../bus/pci")),
+            Entry::File(
+                p(&format!("{d}/uevent")),
+                format!("DRIVER=svdrm\nPCI_ID={vendor:04X}:{device:04X}\nPCI_SLOT_NAME={PCI_SLOT}\n"),
+            ),
+            Entry::File(p(&format!("{d}/vendor")), format!("0x{vendor:04x}\n")),
+            Entry::File(p(&format!("{d}/device")), format!("0x{device:04x}\n")),
+            Entry::File(p(&format!("{d}/subsystem_vendor")), format!("0x{vendor:04x}\n")),
+            Entry::File(p(&format!("{d}/subsystem_device")), format!("0x{device:04x}\n")),
+            Entry::File(p(&format!("{d}/revision")), "0x00\n".into()),
+            Entry::File(p(&format!("{d}/class")), "0x030000\n".into()),
+            Entry::Link(p(".svdrm/minor/device"), p(&format!("../{PCI_SLOT}"))),
+        ]);
+    }
     v
 }
 
@@ -160,6 +198,14 @@ fn overlay(dir: &str, plan: &[Entry]) -> io::Result<()> {
     mount(None, dir, None, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | TMPFS_FLAGS, None)
 }
 
+/// `--hide`: /dev/null bound over a device node. A bind mount of a node that
+/// lives on the host's devtmpfs keeps working inside the user namespace,
+/// unlike a node bound into a tmpfs made there (see the module header).
+fn hide(node: &Path) -> io::Result<()> {
+    let s = node.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hide path"))?;
+    mount(Some("/dev/null"), s, None, libc::MS_BIND, None)
+}
+
 /// `--test-node`: a tmpfs on /dev/dri with `node` bound as renderD<minor>.
 fn test_node(node: &Path, minor: u32) -> io::Result<()> {
     let node_s = node.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "test node path"))?;
@@ -187,7 +233,7 @@ pub fn setup(cfg: &NsConfig) -> io::Result<()> {
     // SAFETY: getters without failure modes.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let existing = ctx(list_links(Path::new(SYS_DEV_CHAR)), || format!("list {SYS_DEV_CHAR}"))?;
-    let plan = sysfs_plan(cfg.dev, cfg.minor, &existing);
+    let plan = sysfs_plan_pci(cfg.dev, cfg.minor, cfg.pci, &existing);
 
     // 1: a user namespace where we are root, and our own mount namespace.
     // SAFETY: plain syscall.
@@ -203,6 +249,9 @@ pub fn setup(cfg: &NsConfig) -> io::Result<()> {
     overlay(SYS_DEV_CHAR, &plan)?;
     if let Some(n) = &cfg.test_node {
         test_node(n, cfg.minor)?;
+    }
+    for h in &cfg.hide {
+        hide(h)?;
     }
     // 2b: X11's socket directory, ours. In this namespace the host's
     // root-owned /tmp/.X11-unix shows as the overflow uid, and
@@ -289,6 +338,27 @@ mod tests {
         assert!(sub.file_name().unwrap().to_str().unwrap().starts_with("faux"));
         assert_eq!(std::fs::canonicalize(&dev).unwrap().file_name().unwrap(), FAUX_NAME);
         assert!(dev.join("drm/renderD129").is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// §112, `--pci`: libdrm's PCI questions get the given ids — the bus
+    /// from the subsystem link's basename, the slot from `uevent`, the ids
+    /// from the separate files, all through the `device` link.
+    #[test]
+    fn with_pci_the_node_is_a_pci_device_of_those_ids() {
+        let root = std::env::temp_dir().join(format!("sv-drm-pci-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        apply(&root, &sysfs_plan_pci((511, 128), 128, Some((0x8086, 0x9bc4)), &[])).unwrap();
+        let dev = root.join("511:128/device");
+        let sub = std::fs::read_link(dev.join("subsystem")).unwrap();
+        assert_eq!(sub.file_name().unwrap(), "pci");
+        assert_eq!(std::fs::canonicalize(&dev).unwrap().file_name().unwrap(), PCI_SLOT);
+        let read = |f: &str| std::fs::read_to_string(dev.join(f)).unwrap();
+        assert!(read("uevent").contains("PCI_SLOT_NAME=0000:00:02.0\n"));
+        assert_eq!(read("vendor"), "0x8086\n");
+        assert_eq!(read("device"), "0x9bc4\n");
+        assert!(dev.join("drm/renderD128").is_dir());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

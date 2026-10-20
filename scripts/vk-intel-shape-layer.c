@@ -48,7 +48,7 @@
  *   mkdir -p /tmp/shape && cp scripts/VkLayer_sv_intel_shape.json /tmp/shape/
  *   cc -shared -fPIC -O2 -o /tmp/shape/libVkLayer_sv_intel_shape.so scripts/vk-intel-shape-layer.c
  *   SVFD_GPU_LAYER_PATH=/tmp/shape SVFD_GPU_LAYERS=VK_LAYER_SV_intel_shape \
- *     scripts/sv-firefox-vulkan-decode.sh 140
+ *     scripts/sv-video-decode.sh (the Firefox harness it was written for, sv-firefox-vulkan-decode.sh, went with §112)
  */
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>

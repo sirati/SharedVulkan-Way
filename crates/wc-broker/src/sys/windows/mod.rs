@@ -293,7 +293,11 @@ impl Windows {
 
     fn identify(&self, pipe: &ServerPipe) -> io::Result<(Peer, Arc<Owned>)> {
         let (pid, sid) = ident::pipe_client(pipe.handle)?;
-        let process = Arc::new(ident::open_process_checked(pid, &sid)?);
+        let process = Arc::new(if self.protected_bar_mode {
+            ident::open_protected_process_checked(pid, &sid)?
+        } else {
+            ident::open_process_checked(pid, &sid)?
+        });
         let admin = sid == ident::SYSTEM_SID;
         Ok((Peer { pid, user: User::sid(&sid), admin }, process))
     }

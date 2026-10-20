@@ -223,7 +223,16 @@ DEBUG_SSH="${WC_LAUNCH_DEBUG_SSH_TRANSPORT:-0}"
 # allocated dynamically.
 GPU_ARENA_MIB="${WC_LAUNCH_GPU_ARENA_MIB:-64}"
 GPU_ENV_MODE="${WC_LAUNCH_GPU_ENV:-print}"
-KOPPER_MESA="${WC_LAUNCH_KOPPER_MESA:-}"
+# The Mesa the GPU sessions load (a store path on the host): Zink, its EGL
+# and GBM, and since §112 its VA-API driver (nix/mesa-zink-va.nix).
+# WC_LAUNCH_KOPPER_MESA is the older name of the same setting.
+KOPPER_MESA="${WC_LAUNCH_GPU_MESA:-${WC_LAUNCH_KOPPER_MESA:-}}"
+# §112.10: a shipped GTK output already copied into the host's Nix store.
+# Its original-page allocator uses the installation's existing broker policy.
+GPU_GTK="${WC_LAUNCH_GPU_GTK:-}"
+# §112: the guest GPU's PCI ids, VVVV:DDDD, which `sv-drm ns` gives the
+# render node ($HOSTDIR/gpu-pci).
+GPU_PCI="${WC_LAUNCH_GPU_PCI:-}"
 # §104. WC_LAUNCH_DMABUF_NODE=/dev/dri/renderD128: the proxy offers
 # zwp_linux_dmabuf_v1 on that node ($HOSTDIR/dmabuf-node, read by wc-session)
 # — the nested KWin's userspace render node. WC_LAUNCH_ICD_STORE=1: the ICD
@@ -502,7 +511,7 @@ Type=notify
 NotifyAccess=main
 FileDescriptorStoreMax=8
 FileDescriptorStorePreserve=yes
-ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena
+ExecStart=$hubbin bell-hub --port /run/windows-vm/wc-arena/svbell.sock=%t/wc-bell/sv.sock --port /run/windows-vm/wc-arena/wcbell.sock=%t/wc-bell/wl.sock,rings=/run/windows-vm/wc-arena/arena --drm-services /run/sv-drm/services.sock
 Restart=always
 RestartSec=2
 
@@ -736,9 +745,64 @@ install_staged() {
   fi
 }
 
+# Resolve the selected guest app ids through their real host-app definitions.
+# GPU sessions can also serve Minecraft or native apps, which need no GTK/VA.
+deployment_uses_gpu_firefox() {
+  local app hostapp definition exec gpu line
+  for app in ${WC_LAUNCH_INSTALL_APPS:-firefox}; do
+    hostapp=$app
+    if [ -n "${WC_LAUNCH_EXTRA_APP_BLOCKS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APP_BLOCKS" ]; then
+      definition=$(awk -v wanted="app.$app" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*host-app[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/,""); sub(/[[:space:]]*$/ ,""); print; exit }
+      ' "$WC_LAUNCH_EXTRA_APP_BLOCKS")
+      [ -z "$definition" ] || hostapp=$definition
+    fi
+    exec=""; gpu=on
+    if [ "$hostapp" = firefox ]; then
+      exec=$FIREFOX
+    elif [ -n "${WC_LAUNCH_EXTRA_APPS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APPS" ]; then
+      definition=$(awk -v wanted="$hostapp" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*(exec|gpu)[[:space:]]*=/ { print }
+      ' "$WC_LAUNCH_EXTRA_APPS")
+      while IFS= read -r line; do
+        case "$line" in
+          *exec*=*) exec=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+          *gpu*=*) gpu=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+        esac
+      done <<<"$definition"
+    fi
+    if [ "$gpu" = on ]; then
+      case "${exec##*/}" in firefox|firefox-bin|firefox-esr|.firefox-wrapped) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+
+# GPU Firefox is stock only with the native allocation library and DRM node.
+# Fail before ending an existing session or changing either installation.
+gpu_prerequisite_check() {
+  [ "$GPU_SESSIONS" -gt 0 ] || return 0
+  deployment_uses_gpu_firefox || return 0
+  [ "$GPU_ENV_MODE" = write ] || { echo "error: GPU deployment requires WC_LAUNCH_GPU_ENV=write"; return 1; }
+  [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires the matched WC_LAUNCH_GPU_GTK store output"; return 1; }
+  [[ "$KOPPER_MESA" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_GPU_MESA"; return 1; }
+  [[ "$DMABUF_NODE" =~ ^/dev/dri/renderD[0-9]+$ ]] && [[ "$GPU_PCI" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] \
+    || { echo "error: GPU deployment requires WC_LAUNCH_DMABUF_NODE and WC_LAUNCH_GPU_PCI"; return 1; }
+  local expected actual
+  expected=$(sha256sum "$ROOT/crates/wc-proxy/protocols/wc-native-shm-v1.xml" "$ROOT/crates/wc-native-shm/include/wc-native-shm.h" | cut -d' ' -f1)
+  actual=$(h "test -c $DMABUF_NODE && test -f $GPU_GTK/lib/libgdk-3.so && test -f $KOPPER_MESA/lib/dri/zink_drv_video.so && cat $GPU_GTK/nix-support/wc-native-shm-abi") \
+    || { echo "error: GPU render-node, Mesa or shipped GTK prerequisite is unavailable on $HOST"; return 1; }
+  [ "$actual" = "$expected" ] || { echo "error: shipped GTK protocol/C ABI differs from this proxy build"; return 1; }
+}
+
 do_deploy() {
   echo "== deploy =="
   [ -n "${WC_XKB_MINGW:-}" ] || { echo "error: run inside \`nix develop\`"; exit 2; }
+  gpu_prerequisite_check || exit 2
   host_layout_check
   deploy_scope_check
   broker_deploy_check || exit 2
@@ -1100,6 +1164,12 @@ APPS
     "") h "rm -f $HOSTDIR/dmabuf-node" >/dev/null ;;
     *) echo "error: WC_LAUNCH_DMABUF_NODE is a /dev/dri/renderD<N> path"; exit 1 ;;
   esac
+  case "$GPU_PCI" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F])
+      h "printf '%s' $GPU_PCI > $HOSTDIR/gpu-pci" >/dev/null ;;
+    "") h "rm -f $HOSTDIR/gpu-pci" >/dev/null ;;
+    *) echo "error: WC_LAUNCH_GPU_PCI is VVVV:DDDD"; exit 1 ;;
+  esac
   case "${WC_LAUNCH_COPY_SCOPE:-}" in
     buffer) h "printf buffer > $HOSTDIR/copy-scope" >/dev/null ;;
     ""|damage) h "rm -f $HOSTDIR/copy-scope" >/dev/null ;;
@@ -1115,8 +1185,8 @@ APPS
     *) bad "$HOSTDIR/apps.ini does not check: $apps"; exit 1 ;;
   esac
   if [ "$GPU_SESSIONS" -gt 0 ]; then
-    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so" >/dev/null 2>&1
-    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$HOST:$HOSTDIR/bin/" >/dev/null \
+    h "rm -f $HOSTDIR/bin/sv-hostd $HOSTDIR/bin/libsv_icd.so $HOSTDIR/bin/libsv_wlshim.so $HOSTDIR/bin/sv-drm" >/dev/null 2>&1
+    scp "${SSHOPT[@]}" "$REL_LINUX/sv-hostd" "$REL_LINUX/libsv_icd.so" "$REL_LINUX/libsv_wlshim.so" "$REL_LINUX/sv-drm" "$HOST:$HOSTDIR/bin/" >/dev/null \
       || { echo "error: scp of the GPU half to the VM host"; exit 1; }
     h "printf '{\"file_format_version\":\"1.0.1\",\"ICD\":{\"library_path\":\"%s\",\"api_version\":\"1.4.0\",\"library_arch\":\"64\",\"is_portability_driver\":false}}\\n' $HOSTDIR/bin/libsv_icd.so >$HOSTDIR/bin/sv_icd.json"
     deployed_is "$REL_LINUX/sv-hostd" "$HOSTDIR/bin/sv-hostd" h "re-run $0 deploy" || exit 1
@@ -1132,15 +1202,35 @@ APPS
     fi
     local genv
     genv="MESA_LOADER_DRIVER_OVERRIDE=zink
-LIBGL_KOPPER_DRI2=1
 __EGL_VENDOR_LIBRARY_FILENAMES=${KOPPER_MESA:-<mesa-kopper-wayland>}/share/glvnd/egl_vendor.d/50_mesa.json
 LIBGL_DRIVERS_PATH=${KOPPER_MESA:-<mesa-kopper-wayland>}/lib/dri
+LIBVA_DRIVER_NAME=zink
+LIBVA_DRIVERS_PATH=${KOPPER_MESA:-<mesa-zink-va>}/lib/dri
 VK_DRIVER_FILES=$icd_json"
+    if [ -n "$GPU_GTK" ]; then
+      case "$GPU_GTK" in
+        /nix/store/*) ;;
+        *) echo "error: WC_LAUNCH_GPU_GTK must name a GTK output in the host Nix store"; exit 1 ;;
+      esac
+      [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
+        || { echo "error: WC_LAUNCH_GPU_GTK must name one store output"; exit 1; }
+      h "test -f $GPU_GTK/lib/libgdk-3.so && nix-store -r $GPU_GTK --add-root $HOSTDIR/bin/gpu-gtk --indirect >/dev/null" \
+        || { bad "$GPU_GTK is not on $HOST; copy the shipped GTK closure there first"; exit 1; }
+      genv="$genv
+LD_LIBRARY_PATH=$GPU_GTK/lib
+WC_NATIVE_SHM=1
+WC_NATIVE_SHM_STRICT=1"
+    fi
+    # Only the legacy wl_shm-only path needs a forced software EGLDevice.
+    if [ -z "$DMABUF_NODE" ]; then
+      genv="$genv
+LIBGL_KOPPER_DRI2=1"
+    fi
     if [ "$GPU_ENV_MODE" = write ] && [ -n "$KOPPER_MESA" ]; then
       printf '%b\n' "$genv" | h "cat >$HOSTDIR/gpu.env"
       echo "  wrote $HOSTDIR/gpu.env: sessions with GPU sides render on the guest's GPU"
     else
-      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_KOPPER_MESA enable it); it would be:"
+      note "gpu.env NOT written (WC_LAUNCH_GPU_ENV=write and WC_LAUNCH_GPU_MESA enable it); it would be:"
       printf '%b\n' "$genv" | sed 's/^/          /'
     fi
   fi

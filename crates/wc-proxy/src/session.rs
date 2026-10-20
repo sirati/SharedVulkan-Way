@@ -959,6 +959,7 @@ pub struct Session {
     /// itself. `None` (the default) leaves every message as it was. See
     /// `session/dmabuf.rs`.
     dmabuf: Option<dmabuf::Dmabuf>,
+    native_shm: native_shm::NativeShm,
 }
 
 ///
@@ -1012,6 +1013,10 @@ const RECLAIM_FLOOR: std::time::Duration = std::time::Duration::from_millis(250)
 /// so returning them is exactly what `Drop` is for.
 impl Drop for Session {
     fn drop(&mut self) {
+        let native = self.native_shm.quarantined();
+        if native.0 != 0 {
+            eprintln!("[proxy] native GTK disconnect: {} allocation(s), {} bytes remain reserved until the transport ends; compositor/Cairo drain was not proved", native.0, native.1);
+        }
         let mut n = 0u64;
         let mut bytes = 0u64;
         // §109: the arena holds buffers' extents, the stub, and the extents of
@@ -1056,6 +1061,7 @@ impl Session {
             next_retired_pool: RETIRED_POOL_KEYS,
             buffers: HashMap::new(),
             foreign_buffers: std::collections::HashSet::new(),
+            native_shm: native_shm::NativeShm::new(),
             surfaces: HashMap::new(),
             stats: Stats::default(),
             trace: false,
@@ -1260,6 +1266,10 @@ impl Session {
         }
 
         let mut out = Vec::new();
+
+        if let Some(bytes) = self.native_request(&interface, header.object, header.opcode, body, &spans, fds)? {
+            return Ok(bytes);
+        }
 
         // §104. `zwp_linux_dmabuf_v1` and its objects are answered here, with
         // `--dmabuf-node`; a no-op without it.
@@ -2296,6 +2306,7 @@ impl Session {
         body: &[u8],
     ) -> Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>), Error> {
         self.stats.messages_server += 1;
+        if self.native_event(header.object, header.opcode) { return Ok((Vec::new(), Vec::new())); }
         // §104. Answers to objects the dma-buf path made upstream on the
         // client's behalf are this proxy's, not the client's.
         if let Some(bytes) = self.dmabuf_event(header.object, header.opcode, body) {
@@ -2429,6 +2440,10 @@ impl Session {
             rewritten = Some(b);
         }
 
+        if interface == "wl_buffer" && header.opcode == op::BUFFER_RELEASE {
+            self.native_released(header.object);
+        }
+
         // STAGE 16. The compositor has released a buffer, which is its own word
         // for "I am no longer reading those bytes" and is the reclaimer's
         // interlock. Forwarded unchanged — the client needs it far more than
@@ -2458,6 +2473,7 @@ impl Session {
                 }
                 return Ok((Vec::new(), Vec::new()));
             }
+            self.native_deleted(id);
             self.objects.forget(id);
             self.clip.drag_offers.remove(&id);
             self.clip.dropped_offers.remove(&id);
@@ -2521,6 +2537,7 @@ impl Session {
         // §104. The private `zwp_linux_dmabuf_v1` global rides in after the
         // compositor's `wl_shm`.
         self.dmabuf_registry(&interface, header.object, header.opcode, body, &spans, &mut out);
+        self.native_registry(&interface, header.object, header.opcode, body, &spans, &mut out);
         Ok((out, fds))
     }
 
@@ -2772,8 +2789,10 @@ impl Session {
             self.stats.foreign_commits += 1;
             // §104. A dma-buf buffer is the shared allocation itself: the
             // compositor reads it by name, so this commit moved nothing.
-            if self.is_dmabuf_buffer(buffer_id) {
-                self.stats.dmabuf_commits += 1;
+            let native = self.native_shm.contains_buffer(buffer_id);
+            if native { self.native_shm.committed(buffer_id); }
+            if self.is_dmabuf_buffer(buffer_id) || native {
+                if !native { self.stats.dmabuf_commits += 1; }
                 if sv_transport::frametrace::enabled() {
                     sv_transport::frametrace::emit(
                         "px.commit",
@@ -3465,6 +3484,7 @@ fn materialise(
 }
 
 mod dmabuf;
+mod native_shm;
 pub use dmabuf::{
     dev_major, dev_minor, render_node, DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888,
     GLOBAL_NAME as DMABUF_GLOBAL_NAME,
