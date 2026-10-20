@@ -157,9 +157,8 @@ impl Relay for Services {
             let e = &r[&(service.to_string(), scope)];
             (e.id, e.sock.try_clone().map_err(|_| libc::EIO)?)
         };
-        let got = take_fd(pid, fd)?;
+        let (got, tgid) = take_caller_fd(pid, fd)?;
         check_client_socket(got.as_fd(), uid)?;
-        let tgid = tgid_of(pid).unwrap_or(pid);
         match send_conn(&sock, uid, tgid, got.as_fd()) {
             Ok(()) => Ok(()),
             // The service is not reading: the client may try again.
@@ -201,38 +200,76 @@ fn errno() -> i32 {
 /// leader. The FUSE header names the calling *thread*.
 const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
 
-/// `pidfd_open` + `pidfd_getfd`: a duplicate of the caller's fd `fd`.
-pub fn take_fd(pid: u32, fd: i32) -> Result<OwnedFd, i32> {
+/// Pin the exact calling task, including nonleader FUSE caller threads.
+/// PIDFD_THREAD is Linux 6.9 ABI and also accepts a group leader. Unsupported
+/// kernels fail with their actual errno; never reopen a numeric TGID.
+fn open_task_pidfd(pid: u32) -> Result<OwnedFd, i32> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(libc::EINVAL);
+    }
+    // SAFETY: a plain syscall; the result is checked.
+    let r = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, PIDFD_THREAD) };
+    if r < 0 {
+        return Err(errno());
+    }
+    // SAFETY: a fresh descriptor we own.
+    Ok(unsafe { OwnedFd::from_raw_fd(r as i32) })
+}
+
+fn require_live_task(pidfd: BorrowedFd<'_>) -> Result<(), i32> {
+    let mut pollfd = libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd; zero timeout does not block.
+    let r = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if r < 0 {
+        return Err(errno());
+    }
+    if r == 0 {
+        return Ok(());
+    }
+    if pollfd.revents & libc::POLLNVAL != 0 {
+        return Err(libc::EBADF);
+    }
+    if pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        return Err(libc::ESRCH);
+    }
+    Err(libc::EIO)
+}
+
+fn task_tgid(pidfd: BorrowedFd<'_>, pid: u32) -> Result<u32, i32> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+    let field = |key: &str| s.lines().find_map(|l| l.strip_prefix(key))
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    let tgid = field("Tgid:").filter(|v| *v != 0).ok_or(libc::EIO)?;
+    if field("Pid:") != Some(pid) {
+        return Err(libc::EIO);
+    }
+    // If this task exited before/during the numeric proc lookup, refuse the
+    // result. Its exact thread pidfd stays open across the lookup, so PID reuse
+    // cannot make us accept another task's TGID. No numeric PID is reopened.
+    require_live_task(pidfd)?;
+    Ok(tgid)
+}
+
+fn take_caller_fd(pid: u32, fd: i32) -> Result<(OwnedFd, u32), i32> {
     if pid == 0 || fd < 0 {
         return Err(libc::EBADF);
     }
-    let open = |flags: libc::c_uint| -> Result<OwnedFd, i32> {
-        // SAFETY: a plain syscall; the result is checked.
-        let r = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, flags) };
-        if r < 0 {
-            return Err(errno());
-        }
-        // SAFETY: a fresh descriptor we own.
-        Ok(unsafe { OwnedFd::from_raw_fd(r as i32) })
-    };
-    let pidfd = match open(0) {
-        Err(libc::EINVAL) => open(PIDFD_THREAD).map_err(|_| libc::ESRCH)?,
-        Err(_) => return Err(libc::ESRCH),
-        Ok(p) => p,
-    };
-    // SAFETY: a plain syscall on a live pidfd; the result is checked.
+    let pidfd = open_task_pidfd(pid)?;
+    // SAFETY: a plain syscall on the pinned calling task; checked below.
     let r = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0 as libc::c_uint) };
     if r < 0 {
         return Err(errno());
     }
-    // SAFETY: pidfd_getfd installs a new descriptor (O_CLOEXEC) we own.
-    Ok(unsafe { OwnedFd::from_raw_fd(r as i32) })
+    // SAFETY: pidfd_getfd installs a fresh descriptor we own.
+    let got = unsafe { OwnedFd::from_raw_fd(r as i32) };
+    let tgid = task_tgid(pidfd.as_fd(), pid)?;
+    Ok((got, tgid))
 }
 
-/// The thread group of task `pid`, from `/proc/<pid>/status`.
-pub fn tgid_of(pid: u32) -> Option<u32> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    s.lines().find_map(|l| l.strip_prefix("Tgid:")).and_then(|v| v.trim().parse().ok())
+/// Duplicate the exact caller's descriptor through its pinned thread pidfd.
+pub fn take_fd(pid: u32, fd: i32) -> Result<OwnedFd, i32> {
+    take_caller_fd(pid, fd).map(|(fd, _)| fd)
 }
 
 fn sockopt_int(fd: BorrowedFd<'_>, opt: libc::c_int) -> Result<libc::c_int, i32> {
@@ -577,6 +614,60 @@ mod tests {
         assert!(s.add("x", Scope::Uid(6), b.try_clone().unwrap()).is_ok(), "per uid");
         s.remove(id);
         assert!(s.add("x", Scope::Uid(5), b).is_ok(), "free again once the first is gone");
+    }
+
+    #[test]
+    fn nonleader_caller_fd_and_tgid_keep_the_exact_thread() {
+        std::thread::spawn(|| {
+            // SAFETY: getter.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            assert_ne!(tid, std::process::id());
+            let original = std::fs::File::open("/dev/null").unwrap();
+            let (got, tgid) = take_caller_fd(tid, original.as_raw_fd()).unwrap();
+            assert_eq!(tgid, std::process::id());
+            use std::os::unix::fs::MetadataExt;
+            let expected = original.metadata().unwrap();
+            let actual = std::fs::File::from(got).metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino(), actual.rdev()),
+                       (expected.dev(), expected.ino(), expected.rdev()));
+            assert_eq!(take_fd(tid, -1).unwrap_err(), libc::EBADF);
+            let services = Services::new();
+            let (reg_ours, reg_theirs) = UnixStream::pair().unwrap();
+            // SAFETY: getter.
+            let uid = unsafe { libc::geteuid() };
+            services.add("worker", Scope::Uid(uid), reg_theirs).unwrap();
+            let mut registration = Registration::from_stream(reg_ours);
+            let (_client, far) = UnixStream::pair().unwrap();
+            services.connect(uid, tid, far.as_raw_fd(), "worker").unwrap();
+            let forwarded = registration.accept().unwrap();
+            assert_eq!((forwarded.uid, forwarded.pid), (uid, std::process::id()));
+            assert_eq!(peer_cred(&forwarded.stream).unwrap().pid as u32, std::process::id());
+        }).join().unwrap();
+    }
+
+    #[test]
+    fn exited_thread_pidfd_refuses_identity_and_errors_are_preserved() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (leave, wait) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: getter.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            tx.send(tid).unwrap();
+            wait.recv().unwrap();
+        });
+        let tid = rx.recv().unwrap();
+        let pinned = open_task_pidfd(tid).unwrap();
+        assert_eq!(task_tgid(pinned.as_fd(), tid), Ok(std::process::id()));
+        leave.send(()).unwrap();
+        thread.join().unwrap();
+        // pthread_join may return before do_exit publishes pidfd readability.
+        let mut exited = libc::pollfd { fd: pinned.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: a valid pollfd; bounded wait for the actual kernel exit receipt.
+        assert_eq!(unsafe { libc::poll(&mut exited, 1, 1000) }, 1);
+        assert_eq!(require_live_task(pinned.as_fd()), Err(libc::ESRCH));
+        assert!(task_tgid(pinned.as_fd(), tid).is_err());
+        assert_eq!(open_task_pidfd(0).unwrap_err(), libc::EINVAL);
+        assert_eq!(open_task_pidfd(u32::MAX).unwrap_err(), libc::EINVAL);
     }
 
     /// Registration over a real control socket, and a forwarded descriptor
