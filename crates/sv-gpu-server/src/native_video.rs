@@ -703,7 +703,7 @@ impl NativeVideo {
     }
 }
 #[cfg(test)]
-mod syntax_tests {
+mod tests_syntax {
     use super::*;
     #[test]
     fn progressive_picture_metadata_is_owned_and_fields_are_refused() {
