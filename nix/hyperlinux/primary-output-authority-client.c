@@ -55,6 +55,7 @@ static void message_output(int header, int crossing) {
     memset(message, 0, sizeof(*message)); message->msg_iov = &io; message->msg_iovlen = 1;
     message->msg_control = header ? control.bytes : (crossing ? protected - 8 : protected);
     message->msg_controllen = sizeof(control.bytes);
+    message->msg_flags = 0x40000000; /* Input field ignored; output store must visibly change it. */
     unsigned char *snapshot = malloc(page); CHECK(snapshot);
     memcpy(snapshot, protected, page); CHECK(mprotect(protected, page, PROT_READ) == 0);
     int sockets[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
