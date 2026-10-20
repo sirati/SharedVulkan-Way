@@ -458,9 +458,13 @@ pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
 /// kernel DACL. There is no independently attested drain/reset boundary yet.
 /// Verify every present raw device has the exact protected descriptor in both its live object and PnP property. Missing devices are optional and skipped.
 pub fn verify_raw_protection(devices: &[DeviceAt]) -> Result<(), String> {
+    verify_raw_protection_with(devices, find)
+}
+
+fn verify_raw_protection_with(devices: &[DeviceAt], mut lookup: impl FnMut(&DeviceAt) -> io::Result<Option<Found>>) -> Result<(), String> {
     for d in devices {
         if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
-        let Some(found) = find(d).map_err(|e| format!("{}: lookup failed: {e}", d.name))? else { continue; };
+        let Some(found) = lookup(d).map_err(|e| format!("{}: lookup failed: {e}", d.name))? else { continue; };
         if live(&found.live).map_err(|e| format!("{}: live ACL unreadable: {e}", d.name))? != DEVICE_SDDL { return Err(format!("{}: live ACL is not protected", d.name)); }
         if property(&found.instance).map_err(|e| format!("{}: PnP ACL unreadable: {e}", d.name))?.as_deref() != Some(DEVICE_SDDL) { return Err(format!("{}: PnP ACL is not protected", d.name)); }
     }
@@ -537,6 +541,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absent_optional_raw_devices_allow_startup_but_lookup_failure_refuses_it() {
+        let devices = vec![DeviceAt { name: "optional".into(), loc: DeviceLoc::IvshmemSlot(0) }];
+        assert!(verify_raw_protection_with(&devices, |_| Ok(None)).is_ok());
+        assert!(verify_raw_protection_with(&devices, |_| Err(io::Error::other("injected lookup failure")))
+            .unwrap_err().contains("injected lookup failure"));
+    }
+
+    #[test]
+    fn completed_empty_revert_allows_fresh_install() {
+        let dir = std::env::temp_dir().join(format!("wc-reinstall-{}", std::process::id()));
+        write_state(&dir, &[]).unwrap();
+        assert!(revert(&dir).is_empty());
+        assert!(!state_file(&dir).exists());
+        assert!(!dir.join("devices.secured").exists());
+        assert!(secure(&[], &dir).is_empty());
+        assert!(check_baseline(&dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn lost_baseline_never_becomes_fresh_but_explicit_fresh_empty_is_recorded() {
         let dir = std::env::temp_dir().join(format!("wc-lost-baseline-{}", std::process::id()));
         assert!(revert_check(&dir).is_err());
@@ -564,6 +588,7 @@ mod tests {
         assert!(revert_check(&dir).unwrap_err().contains("unsafe ACL restoration"));
         assert!(revert(&dir)[0].contains("unsafe ACL restoration"));
         assert_eq!(std::fs::read(state_file(&dir)).unwrap(), before);
+        assert!(dir.join("devices.secured").exists());
         let safe = vec![("renamed".into(), id.into(), "unused".into(), DEVICE_SDDL.into(), Some(DEVICE_SDDL.into()))];
         write_state(&dir, &safe).unwrap();
         assert!(revert_check(&dir).is_ok());
