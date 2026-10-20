@@ -1,0 +1,120 @@
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -10,6 +10,7 @@
+  *
+  * Also contains wait4, waitid, and the vCPU run loop.
+  */
++#include "hl_user_regs.h"
+ #include "syscall_proc.h"
+ #include "syscall_internal.h"
+ #include "syscall_signal.h"
+@@ -514,16 +515,35 @@
+         if (iov.iov_len < copy_len)
+             copy_len = iov.iov_len;
+ 
+-        if (guest_read(g, iov.iov_base, &target->ptrace_regs, copy_len) < 0)
++        /* Stage short writes against one stopped snapshot. Never let a
++         * partial copy or invalid PSTATE reach the owning vCPU. */
++        pthread_mutex_t *trace_lock = thread_get_lock();
++        pthread_mutex_lock(trace_lock);
++        if (target->guest_tid != pid || !target->active || !target->ptraced ||
++            !target->ptrace_stopped ||
++            target->tracer_tid != current_thread->guest_tid) {
++            pthread_mutex_unlock(trace_lock);
++            return -LINUX_ESRCH;
++        }
++        linux_user_pt_regs_t proposed = target->ptrace_regs;
++        pthread_mutex_unlock(trace_lock);
++        if (guest_read(g, iov.iov_base, &proposed, copy_len) < 0)
+             return -LINUX_EFAULT;
+-
+-        target->ptrace_regs_dirty = 1;
+-
+-        /* Write back actual bytes transferred */
++        if (!hl_user_regs_valid(proposed.pc, proposed.pstate))
++            return -LINUX_EINVAL;
+         iov.iov_len = copy_len;
+         if (guest_write(g, data, &iov, sizeof(iov)) < 0)
+             return -LINUX_EFAULT;
+-
++        pthread_mutex_lock(trace_lock);
++        if (target->guest_tid != pid || !target->active || !target->ptraced ||
++            !target->ptrace_stopped ||
++            target->tracer_tid != current_thread->guest_tid) {
++            pthread_mutex_unlock(trace_lock);
++            return -LINUX_ESRCH;
++        }
++        target->ptrace_regs = proposed;
++        target->ptrace_regs_dirty = 1;
++        pthread_mutex_unlock(trace_lock);
+         return 0;
+     }
+ 
+--- a/src/thread.c
++++ b/src/thread.c
+@@ -7,6 +7,7 @@
+  * Protected by a mutex since thread creation/destruction is infrequent
+  * relative to per-syscall access (which uses the lock-free TLS pointer).
+  */
++#include "hl_user_regs.h"
+ #include "thread.h"
+ #include "hl_seccomp.h"
+ #include "syscall_poll.h"
+@@ -452,7 +453,8 @@
+         pthread_cond_wait(&t->resume_cond, &thread_lock);
+ 
+     /* Apply register changes if tracer wrote via SETREGSET */
+-    if (t->ptrace_regs_dirty) {
++    if (t->ptrace_regs_dirty &&
++        hl_user_regs_valid(t->ptrace_regs.pc, t->ptrace_regs.pstate)) {
+         for (int i = 0; i < 31; i++)
+             vcpu_set_gpr(t->vcpu, (unsigned)i, t->ptrace_regs.regs[i]);
+         vcpu_set_sysreg(t->vcpu, HV_SYS_REG_SP_EL0,   t->ptrace_regs.sp);
+@@ -461,6 +463,8 @@
+         t->ptrace_regs_dirty = 0;
+     }
+ 
++    /* Reject any invalid snapshot even if an internal caller bypassed SETREGSET. */
++    t->ptrace_regs_dirty = 0;
+     int cont_sig = t->ptrace_cont_sig;
+     pthread_mutex_unlock(&thread_lock);
+ 
+--- a/src/syscall_signal.c
++++ b/src/syscall_signal.c
+@@ -12,6 +12,7 @@
+  *
+  * Reference: Linux arch/arm64/kernel/signal.c
+  */
++#include "hl_user_regs.h"
+ #include "syscall_signal.h"
+ #include "hl_status.h"
+ #include "syscall.h"        /* LINUX_E* errno constants */
+@@ -1096,6 +1097,10 @@
+     if (guest_read(g, sp, &frame, sizeof(frame)) < 0)
+         return -LINUX_EFAULT;
+ 
++    if (!hl_user_regs_valid(frame.uc.uc_mcontext.pc,
++                            hl_user_pstate(frame.uc.uc_mcontext.pstate)))
++        return -LINUX_EINVAL;
++
+     /* Restore all 31 GPRs */
+     for (int i = 0; i < 31; i++)
+         hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, frame.uc.uc_mcontext.regs[i]);
+@@ -1103,13 +1108,11 @@
+     /* Restore SP, PC, PSTATE */
+     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, frame.uc.uc_mcontext.sp);
+     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, frame.uc.uc_mcontext.pc);
+-    /* Sanitize PSTATE: clear EL0-prohibited bits to prevent a corrupted
+-     * sigframe from causing unexpected behavior. Matches Linux kernel's
+-     * valid_user_regs(): M[4:0]=mode+AArch32 flag, DAIF[9:6]=exception
+-     * masks, IL[20]=illegal state, SS[21]=software step. Bit 4 (M[4])
+-     * must be 0 for AArch64; bit 5 is RES0. */
++    /* Restore only architectural user-state bits. A forged frame cannot
++     * enter EL1/AArch32, mask IRQ, enable unsupported stepping, or retain
++     * privileged/reserved PSTATE fields. */
+     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1,
+-                         frame.uc.uc_mcontext.pstate & ~0x003F03FFULL);
++                         hl_user_pstate(frame.uc.uc_mcontext.pstate));
+ 
+     /* Restore FPSIMD state from the sigcontext __reserved area.
+      * The FPSIMD context starts at offset 0 of __reserved (after magic/size). */
