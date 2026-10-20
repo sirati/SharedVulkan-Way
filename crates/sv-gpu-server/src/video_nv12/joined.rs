@@ -79,12 +79,13 @@ impl Image {
         let mut props = vk::ImageFormatProperties2::default().push_next(&mut external);
         unsafe { driver.instance.get_physical_device_image_format_properties2(driver.pd, &query, &mut props) }
             .map_err(|error| format!("joined NV12 import query: {error:?}"))?;
+        let image_props = props.image_format_properties;
         let features = external.external_memory_properties.external_memory_features;
         let handles = external.external_memory_properties.compatible_handle_types;
         if !features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
             || !handles.contains(vk::ExternalMemoryHandleTypeFlags::from_raw(iosurface::MTLTEXTURE))
-            || props.image_format_properties.max_extent.width < layout.width as u32
-            || props.image_format_properties.max_extent.height < layout.height as u32 {
+            || image_props.max_extent.width < layout.width as u32
+            || image_props.max_extent.height < layout.height as u32 {
             return Err("joined NV12 dimensions/import support refused".into());
         }
         let mut external = vk::ExternalMemoryImageCreateInfo::default()

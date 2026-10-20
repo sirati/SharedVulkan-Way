@@ -33,10 +33,11 @@ impl Image {
         let mut external = vk::ExternalImageFormatProperties::default();
         let mut props = vk::ImageFormatProperties2::default().push_next(&mut external);
         unsafe { driver.instance.get_physical_device_image_format_properties2(driver.pd, &query, &mut props) }?;
+        let image_props = props.image_format_properties;
         if !external.external_memory_properties.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
             || !external.external_memory_properties.compatible_handle_types.contains(vk::ExternalMemoryHandleTypeFlags::from_raw(iosurface::MTLTEXTURE))
-            || props.image_format_properties.max_extent.width < width
-            || props.image_format_properties.max_extent.height < height {
+            || image_props.max_extent.width < width
+            || image_props.max_extent.height < height {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
         }
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
