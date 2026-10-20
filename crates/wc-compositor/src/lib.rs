@@ -1747,11 +1747,14 @@ fn wayland_thread(
     let _ = control;
 
     #[cfg(target_os = "macos")]
-    if let Err(error) = native_prime::start_section_service() {
-        eprintln!("wc-compositor: native IOSurface startup: {error}");
-        ui.send(platform::ToUi::Quit { clients: 0 });
-        return 2;
-    }
+    let _section_broker = match native_prime::start_section_service() {
+        Ok(owner) => owner,
+        Err(error) => {
+            eprintln!("wc-compositor: native IOSurface startup: {error}");
+            ui.send(platform::ToUi::Quit { clients: 0 });
+            return 2;
+        }
+    };
 
     let display: Display<State> = match Display::new() {
         Ok(d) => d,

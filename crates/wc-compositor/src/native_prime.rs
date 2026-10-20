@@ -458,13 +458,15 @@ impl Drop for Endpoint {
 /// The launchd job declares this service in MachServices and passes its name
 /// to the embedded GPU server too. Reuse the existing Mach receiver and broker
 /// owner observer. This runs before the Wayland socket advertises readiness.
-pub fn start_section_service() -> io::Result<()> {
+pub fn start_section_service() -> io::Result<Option<wc_broker::client::Client>> {
     let Some(service) = std::env::var_os("WC_GPU_SECTIONS") else {
-        return Ok(());
+        return Ok(None);
     };
     let service = service
         .into_string()
         .map_err(|_| invalid("invalid section service name"))?;
+    let mut broker = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+    broker.hello("main")?;
     wc_broker::client::install_iosection_observer()?;
     let port = wc_handle::iosection::check_in(&service).map_err(|code| {
         io::Error::other(format!(
@@ -474,5 +476,5 @@ pub fn start_section_service() -> io::Result<()> {
     std::thread::Builder::new()
         .name("sections".into())
         .spawn(move || wc_handle::iosection::serve(port))?;
-    Ok(())
+    Ok(Some(broker))
 }
