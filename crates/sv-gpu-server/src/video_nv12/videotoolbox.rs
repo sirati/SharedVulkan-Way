@@ -111,6 +111,7 @@ unsafe extern "C" {
         callback: *const Callback,
         output: *mut Ref,
     ) -> i32;
+    fn VTDecompressionSessionCanAcceptFormatDescription(session: Ref, format: Ref) -> u8;
     fn VTDecompressionSessionDecodeFrame(
         session: Ref,
         sample: Ref,
@@ -240,6 +241,7 @@ pub struct Decoder {
     _format: Owned,
     callbacks: Box<Callbacks>,
     next: usize,
+    parameter_sets: (Vec<u8>, Vec<u8>),
     pub coded_extent: [u32; 2],
     pub display_extent: [u32; 2],
     pub crop_origin: [u32; 2],
@@ -328,11 +330,65 @@ impl Decoder {
                 _format: format,
                 callbacks,
                 next: 1,
+                parameter_sets: (sps.to_vec(), pps.to_vec()),
                 coded_extent: extent.coded_extent,
                 display_extent: extent.display_extent,
                 crop_origin: extent.crop_origin,
             })
         }
+    }
+    /// Change only the sample's retained parameter-set description. Accepted
+    /// format changes preserve the session and its internal reference pictures.
+    /// Identical sets are a cheap no-op. Incompatible sets leave the old session,
+    /// format and geometry intact; the parent may recreate at an allowed reset
+    /// or IDR boundary. Ordinary drain never implies such a reset.
+    pub fn update_parameters(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), String> {
+        if self.parameter_sets.0 == sps && self.parameter_sets.1 == pps {
+            trace(format_args!("parameter update unchanged"));
+            return Ok(());
+        }
+        trace(format_args!(
+            "parameter update begin SPS_bytes={} PPS_bytes={}",
+            sps.len(),
+            pps.len()
+        ));
+        let geometry = validate_sps(sps)?;
+        validate_pps(pps)?;
+        let mut candidate = Owned(ptr::null_mut());
+        unsafe {
+            checked(
+                CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    ptr::null_mut(),
+                    2,
+                    [sps.as_ptr(), pps.as_ptr()].as_ptr(),
+                    [sps.len(), pps.len()].as_ptr(),
+                    4,
+                    &mut candidate.0,
+                ),
+                "updated H.264 format",
+            )?;
+        }
+        // No old-format callbacks remain when the following sample switches
+        // format. This drains output, without discarding VT reference state.
+        self.drain()?;
+        let accepts = unsafe {
+            VTDecompressionSessionCanAcceptFormatDescription(self.session.0, candidate.0)
+        } != 0;
+        trace(format_args!("parameter update compatible={accepts}"));
+        if !accepts {
+            return Err(
+                "VideoToolbox cannot accept parameter change without explicit reset/IDR boundary"
+                    .into(),
+            );
+        }
+        // All fallible platform calls completed. Commit the new owned format,
+        // metadata and geometry together; failure above leaves them untouched.
+        self._format = candidate;
+        self.parameter_sets = (sps.to_vec(), pps.to_vec());
+        self.coded_extent = geometry.coded_extent;
+        self.display_extent = geometry.display_extent;
+        self.crop_origin = geometry.crop_origin;
+        Ok(())
     }
     /// Submit one complete AVC access unit, with four-byte big-endian NAL sizes.
     /// The caller converts Annex B framing separately. The payload is not copied.
