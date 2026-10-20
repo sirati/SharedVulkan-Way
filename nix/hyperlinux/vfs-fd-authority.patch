@@ -1,0 +1,144 @@
+--- a/src/vfs.c
++++ b/src/vfs.c
+@@ -8,6 +8,7 @@
+ #include "syscall_internal.h"
+ #include "trace.h"
+ #include "fd_object.h"
++#include "hl_fd_lifecycle.h"
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -471,36 +472,68 @@
+  * running that back through the mount table. Without this fallback every
+  * *at() call with a real dirfd failed with ENOTDIR in rooted mode, because
+  * guest_path_hint is never assigned anywhere. */
+-static int dirfd_guest_path(int dirfd_guest, char *out, size_t out_sz) {
+-    if (dirfd_guest < 0 || dirfd_guest >= FD_TABLE_SIZE ||
+-        fd_table[dirfd_guest].type == FD_CLOSED)
+-        return -LINUX_EBADF;
++typedef struct {
++    hl_fd_ref_t ref;
++    int type;
++    void *vdir;
++    char *hint;
++} vfs_dirfd_snapshot_t;
++
++static void vfs_dirfd_drop(vfs_dirfd_snapshot_t *s) {
++    free(s->hint);
++    if (s->vdir) hl_vdir_release(s->vdir);
++    hl_fd_put(&s->ref);
++}
++
++/* Snapshot identity and path ownership together. Never consult the guest
++ * number again after releasing lifecycle exclusion. VFS locks are leaf
++ * locks and are only acquired after this snapshot is complete. */
++static int vfs_dirfd_snapshot(int guest_fd, vfs_dirfd_snapshot_t *s) {
++    HL_FD_LIFECYCLE_SCOPE;
++    memset(s, 0, sizeof(*s));
++    if (hl_fd_get_pinned(guest_fd, &s->ref) < 0) return -LINUX_EBADF;
++    pthread_mutex_lock(&fd_lock);
++    s->type = fd_table[guest_fd].type;
++    if (s->type == FD_VIRTUAL_DIR) {
++        s->vdir = fd_table[guest_fd].dir;
++        if (s->vdir) hl_vdir_retain(s->vdir);
++    }
++    const char *hint = s->ref.of ? s->ref.of->guest_path_hint : NULL;
++    if (hint) s->hint = strdup(hint);
++    int failed = hint && !s->hint;
++    pthread_mutex_unlock(&fd_lock);
++    if (failed) { vfs_dirfd_drop(s); return -LINUX_ENOMEM; }
++    return 0;
++}
+ 
+-    if (fd_table[dirfd_guest].of && fd_table[dirfd_guest].of->guest_path_hint) {
+-        snprintf(out, out_sz, "%s", fd_table[dirfd_guest].of->guest_path_hint);
++static int vfs_dirfd_path(const vfs_dirfd_snapshot_t *s,
++                          char *out, size_t out_sz) {
++    if (s->hint) {
++        snprintf(out, out_sz, "%s", s->hint);
+         return 0;
+     }
+-
+-    /* A synthetic directory fd (rooted "/" and mount-ancestor dirs) has no
+-     * host fd; its guest path lives on the hl_vdir_t so it can act as a
+-     * dirfd for openat/fstatat (V17: find/, ls -R). */
+-    if (fd_table[dirfd_guest].type == FD_VIRTUAL_DIR) {
+-        const char *gp = hl_vdir_path(fd_table[dirfd_guest].dir);
++    if (s->type == FD_VIRTUAL_DIR) {
++        const char *gp = hl_vdir_path(s->vdir);
+         if (!gp) return -LINUX_ENOTDIR;
+         snprintf(out, out_sz, "%s", gp);
+         return 0;
+     }
+-
+-    int host_fd = fd_to_host(dirfd_guest);
+-    if (host_fd < 0) return -LINUX_ENOTDIR;
+-
+-    /* F_GETPATH needs a buffer of at least MAXPATHLEN. */
++    if (s->ref.host_fd < 0) return -LINUX_ENOTDIR;
+     char hostbuf[HL_VFS_PATH_MAX];
+-    if (fcntl(host_fd, F_GETPATH, hostbuf) < 0) return -LINUX_ENOTDIR;
++    if (fcntl(s->ref.host_fd, F_GETPATH, hostbuf) < 0) return -LINUX_ENOTDIR;
+     if (hl_vfs_host_to_guest(hostbuf, out, out_sz) < 0) return -LINUX_ENOTDIR;
+     return 0;
+ }
+ 
++static int dirfd_guest_path(int guest_fd, char *out, size_t out_sz) {
++    vfs_dirfd_snapshot_t s;
++    int rc = vfs_dirfd_snapshot(guest_fd, &s);
++    if (rc < 0) return rc;
++    rc = vfs_dirfd_path(&s, out, out_sz);
++    vfs_dirfd_drop(&s);
++    return rc;
++}
++
+ int hl_vfs_resolve_at(int dirfd_guest, const char *guest_path,
+                       int follow_final_symlink, int create_mode,
+                       hl_vfs_resolve_t *out) {
+@@ -732,29 +765,25 @@
+ }
+ 
+ int hl_vfs_fchdir(int guest_fd) {
+-    if (guest_fd < 0 || guest_fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+-    if (fd_table[guest_fd].type == FD_CLOSED) return -LINUX_EBADF;
++    vfs_dirfd_snapshot_t s;
++    int rc = vfs_dirfd_snapshot(guest_fd, &s);
++    if (rc < 0) return rc;
++    int h = s.ref.host_fd;
+     if (hl_vfs_mode() == HL_FS_LEGACY) {
+-        int h = fd_to_host(guest_fd);
+-        if (h < 0) return -LINUX_EBADF;
+-        if (fchdir(h) < 0) return linux_errno();
+-        return 0;
++        rc = h < 0 ? -LINUX_EBADF : (fchdir(h) < 0 ? linux_errno() : 0);
++    } else {
++        struct stat dst;
++        if (h >= 0 && fstat(h, &dst) < 0) rc = linux_errno();
++        else if (h >= 0 && !S_ISDIR(dst.st_mode)) rc = -LINUX_ENOTDIR;
++        else if (h < 0 && s.type != FD_VIRTUAL_DIR) rc = -LINUX_ENOTDIR;
++        else {
++            char dirbase[HL_VFS_PATH_MAX];
++            rc = vfs_dirfd_path(&s, dirbase, sizeof(dirbase));
++            if (rc == 0) hl_vfs_set_cwd(dirbase);
++        }
+     }
+-    /* Linux: fchdir on a non-directory is ENOTDIR. Rooted mode only moved
+-     * the virtual CWD string, so fchdir(open("file")) "succeeded" and left
+-     * the process with a CWD that is not a directory. */
+-    int h = fd_to_host(guest_fd);
+-    struct stat dst;
+-    if (h >= 0 && fstat(h, &dst) == 0 && !S_ISDIR(dst.st_mode))
+-        return -LINUX_ENOTDIR;
+-    if (fd_table[guest_fd].type != FD_DIR && h < 0)
+-        return -LINUX_ENOTDIR;
+-
+-    char dirbase[HL_VFS_PATH_MAX];
+-    int drc = dirfd_guest_path(guest_fd, dirbase, sizeof(dirbase));
+-    if (drc < 0) return drc;
+-    hl_vfs_set_cwd(dirbase);
+-    return 0;
++    vfs_dirfd_drop(&s);
++    return rc;
+ }
+ 
+ int hl_vfs_getcwd(char *buf, size_t sz) {
