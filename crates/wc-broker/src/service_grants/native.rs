@@ -112,7 +112,7 @@ struct State {
 }
 /// Logical reference is owner-derived inside the opaque ticket. Merely
 /// constructing this value grants no authority or completion proof.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectionReference {
     Producer { registration: u64 },
     Consumer { registration: u64, consumer: u64 },
@@ -126,6 +126,15 @@ pub(super) struct Hold {
     extent: Extent,
     target: Arc<dyn ServiceProcess>,
     access: ProjectionAccess,
+}
+impl Hold {
+    pub(super) fn matches_reference(
+        &self,
+        allocation: u64,
+        reference: ProjectionReference,
+    ) -> bool {
+        self.allocation == allocation && self.reference == reference
+    }
 }
 /// Non-Clone authority minted only by the canonical owner before projection.
 /// It binds the exact context/grant/epochs/allocation generation/capacity/target
@@ -347,6 +356,12 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             target,
             access,
         } = request;
+        if self.records[&grant.id]
+            .closing
+            .contains_key(&(allocation, reference))
+        {
+            return Err(denied("exact projection reference closing or retired"));
+        }
         let (limits, provider, gate) = {
             let enrolled = self
                 .native_exports

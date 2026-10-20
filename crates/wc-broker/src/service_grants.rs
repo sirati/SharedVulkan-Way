@@ -23,7 +23,9 @@ use std::{
     },
 };
 
+mod closing;
 pub mod native;
+pub use closing::ClosingReference;
 mod remote;
 pub use remote::{
     RemoteAllocationId, RemoteApplied, RemoteConsumerId, RemotePending, RemoteRegistration,
@@ -186,6 +188,7 @@ struct Record<B: OriginalBacking> {
     remote: remote::State,
     native_holds: BTreeMap<u64, native::Hold>,
     untracked_native: bool,
+    closing: BTreeMap<(u64, native::ProjectionReference), bool>,
 }
 /// Owns all categories and all sessions in one physical free list. Construction
 /// claims the context exactly once; dropping it cannot start a parallel owner.
@@ -463,6 +466,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 remote: remote::State::default(),
                 native_holds: BTreeMap::new(),
                 untracked_native: false,
+                closing: BTreeMap::new(),
             },
         );
         Ok(GrantId {
@@ -585,6 +589,26 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .extent(allocation.key)
             .ok_or_else(|| denied("unknown canonical allocation"))
     }
+    fn producer_open(
+        &self,
+        lifecycle: &Lifecycle<S, B>,
+        producer: &RegisteredProcess,
+        allocation: &AllocationId,
+    ) -> io::Result<()> {
+        Self::same_grant(&producer.grant, &allocation.grant)?;
+        let record = self.record(lifecycle, &allocation.grant)?;
+        let reference = native::ProjectionReference::Producer {
+            registration: producer.process.registration(),
+        };
+        if record.producers.get(&allocation.key) != Some(&producer.process)
+            || record
+                .closing
+                .contains_key(&(allocation.key.allocation, reference))
+        {
+            return Err(denied("producer reference closing, retired or foreign"));
+        }
+        Ok(())
+    }
     fn same_grant(a: &GrantId, b: &GrantId) -> io::Result<()> {
         if a.id != b.id || !Arc::ptr_eq(&a.owner, &b.owner) {
             return Err(denied("resource belongs to another canonical grant"));
@@ -605,11 +629,16 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .unwrap()
             .table
             .allocate_reserved(process.process, length, capacity)?;
-        self.records
-            .get_mut(&process.grant.id)
-            .unwrap()
-            .producers
-            .insert(key, process.process);
+        let record = self.records.get_mut(&process.grant.id).unwrap();
+        if let Err(error) = record
+            .guard
+            .original()
+            .initialize_zeroed(extent.offset, extent.capacity)
+        {
+            record.quarantined = true;
+            return Err(error);
+        }
+        record.producers.insert(key, process.process);
         Ok((
             AllocationId {
                 grant: process.grant.clone(),
@@ -626,6 +655,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         length: u64,
     ) -> io::Result<Extent> {
         self.process_role(lifecycle, process, ProcessRole::Producer)?;
+        self.producer_open(lifecycle, process, allocation)?;
         self.allocation(lifecycle, allocation)?;
         Self::same_grant(&process.grant, &allocation.grant)?;
         self.records
@@ -643,6 +673,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     ) -> io::Result<PendingTransfer> {
         self.local_transfer(lifecycle, &allocation.grant)?;
         self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.producer_open(lifecycle, producer, allocation)?;
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         self.allocation(lifecycle, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
@@ -696,6 +727,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         backend: &mut P,
     ) -> io::Result<P::Projection> {
         self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.producer_open(lifecycle, producer, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         let record = self.record(lifecycle, &allocation.grant)?;
         if record.producers.get(&allocation.key) != Some(&producer.process) {
@@ -722,6 +754,15 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.record(lifecycle, &consumer.allocation.grant)?;
+        if record.closing.contains_key(&(
+            consumer.allocation.key.allocation,
+            native::ProjectionReference::Consumer {
+                registration: recipient.process.registration(),
+                consumer: consumer.consumer.reference(),
+            },
+        )) {
+            return Err(denied("consumer reference closing or released"));
+        }
         if record
             .consumers
             .get(&(consumer.allocation.key, consumer.consumer))
@@ -836,7 +877,13 @@ mod tests {
             Ok(())
         }
     }
-    struct Backing(BackingGeometry, Store, Origin, AtomicBool);
+    struct Backing(
+        BackingGeometry,
+        Store,
+        Origin,
+        AtomicBool,
+        Mutex<Vec<(u64, u64)>>,
+    );
     // SAFETY: geometry fixture only, not a native original-backing claim.
     unsafe impl OriginalBacking for Backing {
         fn geometry(&self) -> BackingGeometry {
@@ -846,10 +893,16 @@ mod tests {
             assert!(offset >= self.0.arena_base && offset + length <= self.0.physical.bar_bytes);
             // Verify ordering against the durable snapshot, not a local flag.
             let registry = Registry::open(self.1.clone(), self.0.physical, self.2).unwrap();
-            assert!(registry.exclusions().contains(&(offset, length)));
+            assert!(
+                registry
+                    .exclusions()
+                    .iter()
+                    .any(|(base, capacity)| offset >= *base && offset + length <= base + capacity)
+            );
             if self.3.load(Ordering::SeqCst) {
                 return Err(io::Error::other("partial initialization fixture failure"));
             }
+            self.4.lock().unwrap().push((offset, length));
             Ok(()) // simulated initialization, not a native memory claim
         }
     }
@@ -908,6 +961,7 @@ mod tests {
                     store,
                     origin,
                     AtomicBool::new(false),
+                    Mutex::new(Vec::new()),
                 )),
             )
             .unwrap()
@@ -1400,6 +1454,17 @@ mod tests {
             RemoteApplied::Prepared(pending) => pending,
             _ => panic!("pending"),
         };
+        // Simulated producer drain, with no producer native exports. The remote
+        // pending pin must already be represented inside the private table.
+        unsafe {
+            a.records
+                .get_mut(&ga.id)
+                .unwrap()
+                .table
+                .close_producer(p.process, allocation.key)
+                .unwrap();
+        }
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
         let (consumer, frame) = b.accept_remote(&ll, &c, &pending).unwrap();
         assert!(b.accept_remote(&ll, &c, &pending).is_err());
         assert!(matches!(
@@ -1407,6 +1472,8 @@ mod tests {
             RemoteApplied::Accepted
         ));
         assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        // Accept moved the same external pin without releasing the allocation.
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
         let target = b.records[&gb.id].processes[&c.process].process.clone();
         let mut backend = Backend {
             target,
@@ -1871,6 +1938,200 @@ mod tests {
         let owner = owner.into_inner().unwrap();
         assert!(owner.records[&grant.id].quarantined);
         assert_eq!(owner.records[&grant.id].native_holds.len(), 2);
+    }
+    #[test]
+    fn exact_producer_closing_drains_exports_preserves_pending_and_scrubs_reuse() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 2 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (recipient, _) = consumer_process(&mut owner, &life, &grant);
+        let (allocation, extent) = owner.allocate(&life, &producer, 1, 2 * PAGE).unwrap();
+        let pending = owner
+            .prepare(&life, &producer, &allocation, &recipient)
+            .unwrap();
+        let mut backend = TicketBackend {
+            target: target.clone(),
+            next: 0,
+            wrong: 0,
+        };
+        let authority = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        let closing = owner
+            .begin_close_producer(&life, &producer, &allocation)
+            .unwrap();
+        assert!(owner.resize(&life, &producer, &allocation, PAGE).is_err());
+        assert!(
+            owner
+                .prepare(&life, &producer, &allocation, &recipient)
+                .is_err()
+        );
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        let mut legacy = Backend {
+            target,
+            calls: 0,
+            fail: false,
+        };
+        assert!(
+            owner
+                .project_producer(&life, &producer, &allocation, &mut legacy)
+                .is_err()
+        );
+        assert_eq!(legacy.calls, 0);
+        assert_eq!(
+            owner
+                .finish_close_reference(&life, &closing)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let proof = unsafe { authority.prove_retired().unwrap() };
+        owner.complete_projection(&life, &grant, proof).unwrap();
+        owner.finish_close_reference(&life, &closing).unwrap();
+        assert!(owner.finish_close_reference(&life, &closing).is_err());
+        // Earlier pending still accepts after producer retirement.
+        let (consumer, _) = owner.accept(&life, &recipient, &pending).unwrap();
+        assert!(
+            owner.records[&grant.id]
+                .table
+                .extent(allocation.key)
+                .is_some()
+        );
+        let closing = owner
+            .begin_close_consumer(&life, &recipient, &consumer)
+            .unwrap();
+        owner.finish_close_reference(&life, &closing).unwrap();
+        assert!(
+            owner.records[&grant.id]
+                .table
+                .extent(allocation.key)
+                .is_none()
+        );
+        let (fresh, reused) = owner.allocate(&life, &producer, 1, 2 * PAGE).unwrap();
+        assert_ne!(fresh.key, allocation.key);
+        assert_eq!(reused.offset, extent.offset);
+        assert_eq!(reused.capacity, extent.capacity);
+        assert_eq!(
+            context.backing().4.lock().unwrap().last(),
+            Some(&(extent.offset, extent.capacity))
+        );
+    }
+    #[test]
+    fn consumer_closing_is_exact_for_same_process_and_extent() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 2 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (recipient, target) = consumer_process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let p1 = owner
+            .prepare(&life, &producer, &allocation, &recipient)
+            .unwrap();
+        let p2 = owner
+            .prepare(&life, &producer, &allocation, &recipient)
+            .unwrap();
+        let (c1, _) = owner.accept(&life, &recipient, &p1).unwrap();
+        let (c2, _) = owner.accept(&life, &recipient, &p2).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let a1 = owner
+            .project_consumer_tracked(&life, &recipient, &c1, &mut backend)
+            .unwrap();
+        let _a2 = owner
+            .project_consumer_tracked(&life, &recipient, &c2, &mut backend)
+            .unwrap();
+        let closing = owner.begin_close_consumer(&life, &recipient, &c1).unwrap();
+        assert!(
+            owner
+                .project_consumer_tracked(&life, &recipient, &c1, &mut backend)
+                .is_err()
+        );
+        let _a3 = owner
+            .project_consumer_tracked(&life, &recipient, &c2, &mut backend)
+            .unwrap();
+        assert!(owner.finish_close_reference(&life, &closing).is_err());
+        owner
+            .complete_projection(&life, &grant, unsafe { a1.prove_retired().unwrap() })
+            .unwrap();
+        owner.finish_close_reference(&life, &closing).unwrap();
+        assert!(
+            !owner.records[&grant.id]
+                .consumers
+                .contains_key(&(allocation.key, c1.consumer))
+        );
+        assert!(
+            owner.records[&grant.id]
+                .consumers
+                .contains_key(&(allocation.key, c2.consumer))
+        );
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 2);
+    }
+    #[test]
+    fn untracked_alias_and_native_target_death_cannot_finish_logical_close() {
+        for untracked in [false, true] {
+            let (mut owner, mut life, _, _, _, _, _, _) = setup();
+            let grant = owner.grant(&mut life, GrantKind::Pixel, 2 * PAGE).unwrap();
+            let (producer, target) = process(&mut owner, &life, &grant);
+            let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+            let mut authority = None;
+            if untracked {
+                let mut backend = Backend {
+                    target: target.clone(),
+                    calls: 0,
+                    fail: false,
+                };
+                owner
+                    .project_producer(&life, &producer, &allocation, &mut backend)
+                    .unwrap();
+            } else {
+                let mut backend = TicketBackend {
+                    target: target.clone(),
+                    next: 0,
+                    wrong: 0,
+                };
+                authority = Some(
+                    owner
+                        .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                        .unwrap(),
+                );
+            }
+            let closing = owner
+                .begin_close_producer(&life, &producer, &allocation)
+                .unwrap();
+            target.0.store(1, Ordering::SeqCst);
+            assert!(owner.finish_close_reference(&life, &closing).is_err());
+            assert!(
+                owner.records[&grant.id]
+                    .producers
+                    .contains_key(&allocation.key)
+            );
+            assert!(
+                owner.records[&grant.id]
+                    .table
+                    .extent(allocation.key)
+                    .is_some()
+            );
+            drop(authority); // Drop never supplies a native retirement fact.
+            assert!(owner.finish_close_reference(&life, &closing).is_err());
+        }
+    }
+    #[test]
+    fn suballocation_scrub_failure_quarantines_before_any_id_exposure() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 2 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        context.backing().3.store(true, Ordering::SeqCst);
+        assert!(owner.allocate(&life, &producer, 1, PAGE).is_err());
+        assert!(owner.records[&grant.id].quarantined);
+        assert!(owner.records[&grant.id].producers.is_empty());
+        context.backing().3.store(false, Ordering::SeqCst);
+        assert!(owner.allocate(&life, &producer, 1, PAGE).is_err());
     }
     #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {

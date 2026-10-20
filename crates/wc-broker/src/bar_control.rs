@@ -36,15 +36,25 @@ pub struct Transfer(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Consumer(u64);
 impl Consumer {
-    pub(crate) fn reference(self) -> u64 { self.0 }
+    pub(crate) fn reference(self) -> u64 {
+        self.0
+    }
 }
 
+/// Private non-native remote lineage pin. It is neither a process nor a
+/// native retirement proof. Moving it from pending to accepted preserves hold.
+pub(crate) struct ExternalHold {
+    key: Key,
+    id: u64,
+    identity: Arc<()>,
+}
 struct Allocation {
     user: User,
     producer: Option<Process>,
     extent: Extent,
     pending: BTreeMap<Transfer, Process>,
     consumers: BTreeMap<Consumer, Process>,
+    external: BTreeMap<u64, Arc<()>>,
 }
 /// An existing compositor-owned grant delegated to this broker namespace.
 /// These values are retained authority records, never read from BAR words.
@@ -261,6 +271,7 @@ impl Allocator {
                 extent,
                 pending: BTreeMap::new(),
                 consumers: BTreeMap::new(),
+                external: BTreeMap::new(),
             },
         );
         Ok((key, extent))
@@ -322,6 +333,31 @@ impl Allocator {
         a.consumers.insert(consumer, recipient);
         Ok((consumer, a.extent))
     }
+    /// Pin before any remote pending descriptor can be published.
+    pub(crate) fn pin_external(&mut self, producer: Process, key: Key) -> io::Result<ExternalHold> {
+        if self.owned(producer, key)?.producer != Some(producer) {
+            return Err(denied("not the external lineage producer"));
+        }
+        let id = self.serial()?;
+        let identity = Arc::new(());
+        self.allocations
+            .get_mut(&key)
+            .unwrap()
+            .external
+            .insert(id, identity.clone());
+        Ok(ExternalHold { key, id, identity })
+    }
+    pub(crate) fn check_external(&self, hold: &ExternalHold) -> io::Result<()> {
+        if !self
+            .allocations
+            .get(&hold.key)
+            .and_then(|a| a.external.get(&hold.id))
+            .is_some_and(|identity| Arc::ptr_eq(identity, &hold.identity))
+        {
+            return Err(denied("stale or foreign external lineage pin"));
+        }
+        Ok(())
+    }
     /// Explicit close is permitted only after all local mappings are gone.
     /// The transport must enforce this lifetime; a DLL destructor is not proof.
     ///
@@ -381,7 +417,11 @@ impl Allocator {
             // Reservations already bound to this dead recipient cannot become
             // mappings, but producer death alone never cancels a transfer.
             a.pending.retain(|_, recipient| *recipient != process);
-            if a.producer.is_none() && a.pending.is_empty() && a.consumers.is_empty() {
+            if a.producer.is_none()
+                && a.pending.is_empty()
+                && a.consumers.is_empty()
+                && a.external.is_empty()
+            {
                 empty.push(*key);
             }
         }
@@ -390,11 +430,12 @@ impl Allocator {
         }
     }
     fn reclaim(&mut self, key: Key) {
-        if self
-            .allocations
-            .get(&key)
-            .is_some_and(|a| a.producer.is_none() && a.pending.is_empty() && a.consumers.is_empty())
-        {
+        if self.allocations.get(&key).is_some_and(|a| {
+            a.producer.is_none()
+                && a.pending.is_empty()
+                && a.consumers.is_empty()
+                && a.external.is_empty()
+        }) {
             self.allocations.remove(&key);
         }
     }
@@ -411,6 +452,27 @@ mod tests {
         let p = a.register_process(User::sid("S-1-5-21-1")).unwrap();
         let c = a.register_process(User::sid("S-1-5-21-1")).unwrap();
         (a, p, c)
+    }
+    #[test]
+    fn external_pin_survives_producer_close_and_death_without_native_substitution() {
+        let (mut a, p, _) = setup();
+        let (key, extent) = a.allocate(p, 4096).unwrap();
+        let pin = a.pin_external(p, key).unwrap();
+        unsafe {
+            a.close_producer(p, key).unwrap();
+            a.process_dead(p);
+        }
+        assert_eq!(a.extent(key), Some(extent));
+        a.check_external(&pin).unwrap();
+        let other = a.register_process(User::sid("S-1-5-21-1")).unwrap();
+        let (_, next) = a.allocate(other, 4096).unwrap();
+        assert_ne!(next.offset, extent.offset);
+        // A coincident numeric key/run from another table is not this pin.
+        let (mut foreign, p, _) = setup();
+        let (same_key, _) = foreign.allocate(p, 4096).unwrap();
+        let _foreign_pin = foreign.pin_external(p, same_key).unwrap();
+        assert_eq!(same_key, key);
+        assert!(foreign.check_external(&pin).is_err());
     }
     #[test]
     fn canonical_header_offset_is_applied_once_and_overflow_refuses() {
