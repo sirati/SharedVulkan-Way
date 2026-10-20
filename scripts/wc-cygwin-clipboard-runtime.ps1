@@ -75,6 +75,9 @@ $paste = $null
 $output = $null
 try {
   $copy = Start-Process -FilePath (Join-Path $bin 'wl-copy.exe') -WorkingDirectory $bin -ArgumentList @('--foreground','--paste-once','--type','application/octet-stream',$payload) -PassThru -RedirectStandardOutput (Join-Path $evidence 'wl-copy.stdout.txt') -RedirectStandardError (Join-Path $evidence 'wl-copy.stderr.txt')
+  # Retain the actual process handle before it can exit, so Windows PowerShell
+  # can still obtain its exit status after the one-shot source completes.
+  $null = $copy.Handle
   $deadline = [DateTime]::UtcNow.AddSeconds(20)
   do {
     if ($copy.HasExited) { throw "wl-copy exited before selection: $($copy.ExitCode)" }
@@ -100,7 +103,7 @@ try {
   $errorTask.Result | Set-Content -Encoding UTF8 (Join-Path $evidence 'wl-paste.stderr.txt')
   if ($paste.ExitCode -ne 0) { throw "wl-paste failed: $($paste.ExitCode)" }
   if (-not $copy.WaitForExit(30000)) { throw 'wl-copy did not finish its one actual transfer' }
-  if ($copy.ExitCode -ne 0) { throw "wl-copy failed: $($copy.ExitCode)" }
+  if ($null -eq $copy.ExitCode -or $copy.ExitCode -ne 0) { throw "wl-copy failed or returned no exit status: $($copy.ExitCode)" }
   $actual = [IO.File]::ReadAllBytes((Join-Path $evidence 'clipboard.bin'))
   if ($actual.Length -ne $expected.Length) { throw "clipboard length differs: $($actual.Length)" }
   for ($i = 0; $i -lt $actual.Length; $i++) { if ($actual[$i] -ne $expected[$i]) { throw "clipboard differs at $i" } }
