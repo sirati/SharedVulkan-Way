@@ -14,6 +14,11 @@ pub struct Process {
     run: u64,
     registration: u64,
 }
+impl Process {
+    pub(crate) fn registration(self) -> u64 {
+        self.registration
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key {
     pub run: u64,
@@ -30,6 +35,9 @@ pub struct Extent {
 pub struct Transfer(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Consumer(u64);
+impl Consumer {
+    pub(crate) fn reference(self) -> u64 { self.0 }
+}
 
 struct Allocation {
     user: User,

@@ -23,6 +23,12 @@ use std::{
     },
 };
 
+pub mod native;
+mod remote;
+pub use remote::{
+    RemoteAllocationId, RemoteApplied, RemoteConsumerId, RemotePending, RemoteRegistration,
+};
+
 const PAGE: u64 = 4096;
 fn denied(s: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, s)
@@ -75,7 +81,7 @@ pub struct GrantId {
     id: u64,
     owner: Arc<()>,
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProcessRole {
     Producer,
     Consumer,
@@ -151,6 +157,7 @@ pub unsafe trait ProjectionBackend<B: OriginalBacking> {
     ) -> io::Result<Self::Projection>;
 }
 struct NativeProcess {
+    role: ProcessRole,
     process: Arc<dyn ServiceProcess>,
     revoked: AtomicBool,
 }
@@ -176,6 +183,9 @@ struct Record<B: OriginalBacking> {
     producers: BTreeMap<Key, Process>,
     consumers: BTreeMap<(Key, Consumer), Process>,
     quarantined: bool,
+    remote: remote::State,
+    native_holds: BTreeMap<u64, native::Hold>,
+    untracked_native: bool,
 }
 /// Owns all categories and all sessions in one physical free list. Construction
 /// claims the context exactly once; dropping it cannot start a parallel owner.
@@ -185,6 +195,8 @@ pub struct ProtectedGrants<S: DurableStore, B: OriginalBacking> {
     free: Vec<FreeRun>,
     records: BTreeMap<u64, Record<B>>,
     geometry: BackingGeometry,
+    next_projection: u64,
+    native_exports: Arc<std::sync::Mutex<BTreeMap<native::ExportKey, u64>>>,
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     /// Start the sole protected canonical allocator. The protected launcher
@@ -275,6 +287,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             free,
             records: BTreeMap::new(),
             geometry,
+            next_projection: 1,
+            native_exports: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
     fn check_lifecycle(&self, lifecycle: &Lifecycle<S, B>) -> io::Result<()> {
@@ -446,6 +460,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 producers: BTreeMap::new(),
                 consumers: BTreeMap::new(),
                 quarantined: false,
+                remote: remote::State::default(),
+                native_holds: BTreeMap::new(),
+                untracked_native: false,
             },
         );
         Ok(GrantId {
@@ -515,6 +532,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             return Err(denied("process user differs from canonical grant"));
         }
         let native = NativeProcess {
+            role,
             process,
             revoked: AtomicBool::new(false),
         };
@@ -738,6 +756,10 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .ok_or_else(|| denied("missing native projection target"))?
             .process
             .clone();
+        self.records
+            .get_mut(&allocation.grant.id)
+            .unwrap()
+            .untracked_native = true;
         match backend.project(guard, extent, target, access) {
             Ok(projection) => Ok(projection),
             Err(e) => {
@@ -1275,5 +1297,551 @@ mod tests {
             let (c, _) = context(Origin::Windows, Store::default(), false);
             assert!(unsafe { ProtectedGrants::start(c, bad) }.is_err());
         }
+    }
+    fn remote_setup() -> (
+        Owner,
+        Owner,
+        Life,
+        Life,
+        GrantId,
+        GrantId,
+        RegisteredProcess,
+        RegisteredProcess,
+        Arc<Watch>,
+    ) {
+        let (w, watch) = context(Origin::Windows, Store::default(), false);
+        let (l, _) = context(Origin::Linux, Store::default(), false);
+        let mut enrolled = binding();
+        enrolled.roles.consumer = Origin::Linux;
+        let mut wl = unsafe {
+            Lifecycle::start(
+                w.clone(),
+                "test-install",
+                KEY,
+                enrolled.clone(),
+                BootstrapRole::Initiator,
+            )
+            .unwrap()
+        };
+        let mut ll = unsafe {
+            Lifecycle::start(
+                l.clone(),
+                "test-install",
+                KEY,
+                enrolled,
+                BootstrapRole::Responder,
+            )
+            .unwrap()
+        };
+        let h = wl.hello().unwrap();
+        let c = ll.receive(&h).unwrap().unwrap();
+        let f = wl.receive(&c).unwrap().unwrap();
+        ll.receive(&f).unwrap();
+        let (mut a, mut b) = (owner(&w), owner(&l));
+        let ga = a.grant(&mut wl, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let frame = a.grant_frame(&wl, &ga).unwrap();
+        let gb = b.accept_grant(&mut ll, &frame).unwrap();
+        let (p, _) = process(&mut a, &wl, &ga);
+        let native = Arc::new(Watch(AtomicU8::new(0)));
+        let c = unsafe {
+            b.register_consumer(&ll, &gb, User::uid(binding().linux_uid), native)
+                .unwrap()
+        };
+        (a, b, wl, ll, ga, gb, p, c, watch)
+    }
+    #[test]
+    fn remote_registration_allocation_pending_accept_are_current_typed_and_one_shot() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        assert!(matches!(
+            b.apply_remote(&ll, &gb, &frame).unwrap(),
+            RemoteApplied::Registered(_)
+        ));
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        assert!(a.announce_registration(&wl, &p).is_err());
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote_consumer = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(reg) => reg,
+            _ => panic!("registration"),
+        };
+        let (allocation, extent) = a.allocate(&wl, &p, 1, 2 * PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        let mirrored = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Allocated(id, e) => {
+                assert_eq!(e, extent);
+                id
+            }
+            _ => panic!("allocation"),
+        };
+        assert!(a.announce_allocation(&wl, &p, &allocation).is_err());
+        let frame = a
+            .resize_and_announce(&wl, &p, &allocation, 2 * PAGE)
+            .unwrap();
+        assert!(
+            matches!(b.apply_remote(&ll,&gb,&frame).unwrap(),RemoteApplied::Resized(_,e) if e.offset==extent.offset&&e.capacity==extent.capacity&&e.length==2*PAGE)
+        );
+        let frame = a
+            .prepare_remote(&wl, &p, &allocation, &remote_consumer)
+            .unwrap();
+        let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Prepared(pending) => pending,
+            _ => panic!("pending"),
+        };
+        let (consumer, frame) = b.accept_remote(&ll, &c, &pending).unwrap();
+        assert!(b.accept_remote(&ll, &c, &pending).is_err());
+        assert!(matches!(
+            a.apply_remote(&wl, &ga, &frame).unwrap(),
+            RemoteApplied::Accepted
+        ));
+        assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        let target = b.records[&gb.id].processes[&c.process].process.clone();
+        let mut backend = Backend {
+            target,
+            calls: 0,
+            fail: false,
+        };
+        let (guard, e, access) = b
+            .project_remote_consumer(&ll, &c, &consumer, &mut backend)
+            .unwrap();
+        assert_eq!(
+            (e.offset, e.capacity, e.length),
+            (extent.offset, 2 * PAGE, 2 * PAGE)
+        );
+        assert_eq!(access, ProjectionAccess::ReadOnly);
+        assert_eq!(guard.binding().grant_offset, extent.offset);
+        let _ = mirrored; // opaque ID cannot authorize native producer operations.
+    }
+    // Test-only malicious privileged peer signer. Production owner has no
+    // arbitrary-payload signing API, and native adapters cannot call this.
+    fn forge_next(
+        owner: &mut Owner,
+        life: &Life,
+        grant: &GrantId,
+        phase: Phase,
+        payload: Payload,
+    ) -> Frame {
+        life.seal(
+            &mut owner.records.get_mut(&grant.id).unwrap().channel,
+            phase,
+            payload,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn remote_apply_rejects_unknown_duplicate_foreign_and_overlapping_resource_records() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let pid = p.process.registration();
+        let duplicate = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::RegisterProducer,
+            Payload {
+                producer_registration: pid,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &duplicate).is_err());
+        let (allocation, extent) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let unknown = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid + 999,
+                allocation: 99,
+                offset: extent.offset,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &unknown).is_err());
+        let good = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &good).unwrap();
+        let overlap = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid,
+                allocation: 999,
+                offset: extent.offset,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &overlap).is_err());
+        let moved = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Resize,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                offset: extent.offset + PAGE,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &moved).is_err());
+        let unaligned = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Allocate,
+            Payload {
+                producer_registration: pid,
+                allocation: 998,
+                offset: extent.offset + PAGE + 1,
+                capacity: PAGE,
+                length: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &unaligned).is_err());
+        let missing = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Prepare,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                recipient_registration: c.process.registration(),
+                transfer: 123,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &missing).is_err()); // local watch not yet announced to peer
+        let cframe = b.announce_registration(&ll, &c).unwrap();
+        a.apply_remote(&wl, &ga, &cframe).unwrap();
+        let wrong = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::Prepare,
+            Payload {
+                producer_registration: pid,
+                allocation: allocation.key.allocation,
+                recipient_registration: c.process.registration() + 1,
+                transfer: 124,
+                ..Payload::default()
+            },
+        );
+        assert!(b.apply_remote(&ll, &gb, &wrong).is_err());
+    }
+    #[test]
+    fn remote_apply_checks_live_context_and_native_consumer_at_actual_mutation() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, watch) = remote_setup();
+        let pframe = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &pframe).unwrap();
+        let cframe = b.announce_registration(&ll, &c).unwrap();
+        let recipient = match a.apply_remote(&wl, &ga, &cframe).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let aframe = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &aframe).unwrap();
+        let prepared = a.prepare_remote(&wl, &p, &allocation, &recipient).unwrap();
+        // Endpoint failure blocks apply despite a cryptographically valid frame.
+        watch.0.store(2, Ordering::SeqCst);
+        assert!(a.apply_remote(&wl, &ga, &cframe).is_err());
+        watch.0.store(0, Ordering::SeqCst);
+        assert!(a.prepare_remote(&wl, &p, &allocation, &recipient).is_err());
+        let _ = b.apply_remote(&ll, &gb, &prepared).unwrap(); // already-created remote pending remains valid
+    }
+    #[test]
+    fn remote_pending_apply_refuses_dead_exact_local_consumer_and_never_reuses_ids() {
+        let (mut a, mut b, wl, ll, ga, gb, p, _c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let native = Arc::new(Watch(AtomicU8::new(0)));
+        let c = unsafe {
+            b.register_consumer(&ll, &gb, User::uid(binding().linux_uid), native.clone())
+                .unwrap()
+        };
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        native.0.store(1, Ordering::SeqCst);
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        native.0.store(0, Ordering::SeqCst);
+        let next = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &next).is_err()); // native revocation persists
+        // No native death/failed apply removes canonical capacity or allows a
+        // producer to choose that same physical allocation under another key.
+        let (other, extent) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        assert_ne!(other.key, allocation.key);
+        assert_eq!(extent.offset, 2 * PAGE);
+    }
+    struct TicketBackend {
+        target: Arc<dyn ServiceProcess>,
+        next: u64,
+        wrong: u8,
+    }
+    // SAFETY: no actual native export; explicit state-machine receipt fixture.
+    unsafe impl native::TrackedProjectionBackend<Backing> for TicketBackend {
+        type Projection = native::NativeProjectionAuthority;
+        fn project_tracked(
+            &mut self,
+            guard: Arc<RetainedGrant<Backing>>,
+            ticket: native::ProjectionTicket,
+        ) -> io::Result<Self::Projection> {
+            let extent = ticket.extent();
+            let access = ticket.access();
+            let source = guard.original().geometry().physical;
+            self.next += 1;
+            let offset = extent.offset + if self.wrong == 1 { PAGE } else { 0 };
+            let access = if self.wrong == 2 {
+                ProjectionAccess::ReadOnly
+            } else {
+                access
+            };
+            let export = if self.wrong == 3 { 1 } else { self.next };
+            let identity = unsafe {
+                native::NativeExportIdentity::from_kernel(
+                    [5; 16],
+                    export,
+                    source,
+                    offset,
+                    extent.capacity,
+                    access,
+                )?
+            };
+            unsafe { ticket.bind(identity, self.target.clone()) }
+        }
+    }
+    #[test]
+    fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, extent) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let authority = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+        let exclusions = life.exclusions().unwrap();
+        // SAFETY: simulated all-alias monitor retirement, no kernel proof claim.
+        let proof = unsafe { authority.prove_retired().unwrap() };
+        owner.complete_projection(&life, &grant, proof).unwrap();
+        assert!(owner.records[&grant.id].native_holds.is_empty());
+        assert_eq!(
+            owner.records[&grant.id].table.extent(allocation.key),
+            Some(extent)
+        );
+        assert_eq!(
+            owner.records[&grant.id].producers.get(&allocation.key),
+            Some(&producer.process)
+        );
+        assert_eq!(life.exclusions().unwrap(), exclusions);
+        // Consuming a proof never permits reuse of its native export identity.
+        backend.wrong = 3;
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+    }
+    #[test]
+    fn native_ticket_rejects_wrong_range_rights_target_and_duplicate_export_identity() {
+        for wrong in [1, 2, 4] {
+            let (mut owner, mut life, _, _, _, _, _, _) = setup();
+            let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+            let (producer, target) = process(&mut owner, &life, &grant);
+            let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+            let target = if wrong == 4 {
+                Arc::new(Watch(AtomicU8::new(0))) as Arc<dyn ServiceProcess>
+            } else {
+                target
+            };
+            let mut backend = TicketBackend {
+                target,
+                next: 0,
+                wrong,
+            };
+            assert!(
+                owner
+                    .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                    .is_err()
+            );
+            assert!(owner.records[&grant.id].quarantined);
+            assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+        }
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 3,
+        };
+        let original = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 2);
+        drop(original); // Dropping a native authority is never completion.
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 2);
+    }
+    #[test]
+    fn native_proof_cannot_cross_owner_grant_or_revoked_context() {
+        let (mut a, mut life, _, _, _, _, _, watch) = setup();
+        let grant = a.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (p, target) = process(&mut a, &life, &grant);
+        let (allocation, _) = a.allocate(&life, &p, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let authority = a
+            .project_producer_tracked(&life, &p, &allocation, &mut backend)
+            .unwrap();
+        let proof = unsafe { authority.prove_retired().unwrap() };
+        let (mut other, mut otherlife, _, _, _, _, _, _) = setup();
+        let foreign = other
+            .grant(&mut otherlife, GrantKind::Pixel, 4 * PAGE)
+            .unwrap();
+        assert!(
+            other
+                .complete_projection(&otherlife, &foreign, proof)
+                .is_err()
+        );
+        assert_eq!(a.records[&grant.id].native_holds.len(), 1);
+        let authority = a
+            .project_producer_tracked(&life, &p, &allocation, &mut backend)
+            .unwrap();
+        let proof = unsafe { authority.prove_retired().unwrap() };
+        watch.0.store(2, Ordering::SeqCst);
+        assert!(a.complete_projection(&life, &grant, proof).is_err());
+        assert_eq!(a.records[&grant.id].native_holds.len(), 2);
+    }
+    #[test]
+    fn legacy_untracked_projection_permanently_disqualifies_complete_native_census() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (p, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &p, 1, PAGE).unwrap();
+        let mut backend = Backend {
+            target,
+            calls: 0,
+            fail: false,
+        };
+        owner
+            .project_producer(&life, &p, &allocation, &mut backend)
+            .unwrap();
+        assert!(owner.records[&grant.id].untracked_native);
+    }
+    #[test]
+    fn native_backend_success_without_exact_export_binding_is_quarantined() {
+        struct Unbound;
+        // SAFETY: deliberately broken test adapter returns no actual mapping.
+        // The owner must fail closed despite the adapter's success result.
+        unsafe impl native::TrackedProjectionBackend<Backing> for Unbound {
+            type Projection = ();
+            fn project_tracked(
+                &mut self,
+                _grant: Arc<RetainedGrant<Backing>>,
+                _ticket: native::ProjectionTicket,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut Unbound)
+                .is_err()
+        );
+        assert!(owner.records[&grant.id].quarantined);
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+    }
+
+    #[test]
+    fn native_tickets_distinguish_two_consumers_of_same_process_and_allocation() {
+        struct Capture {
+            inner: TicketBackend,
+            references: Vec<native::ProjectionReference>,
+        }
+        // SAFETY: state-machine only adapter, never a native retirement claim.
+        unsafe impl native::TrackedProjectionBackend<Backing> for Capture {
+            type Projection = native::NativeProjectionAuthority;
+            fn project_tracked(
+                &mut self,
+                grant: Arc<RetainedGrant<Backing>>,
+                ticket: native::ProjectionTicket,
+            ) -> io::Result<Self::Projection> {
+                self.references.push(ticket.reference());
+                native::TrackedProjectionBackend::project_tracked(&mut self.inner, grant, ticket)
+            }
+        }
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (consumer, target) = consumer_process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let pending1 = owner
+            .prepare(&life, &producer, &allocation, &consumer)
+            .unwrap();
+        let pending2 = owner
+            .prepare(&life, &producer, &allocation, &consumer)
+            .unwrap();
+        let (c1, _) = owner.accept(&life, &consumer, &pending1).unwrap();
+        let (c2, _) = owner.accept(&life, &consumer, &pending2).unwrap();
+        let mut backend = Capture {
+            inner: TicketBackend {
+                target,
+                next: 0,
+                wrong: 0,
+            },
+            references: Vec::new(),
+        };
+        let export1 = owner
+            .project_consumer_tracked(&life, &consumer, &c1, &mut backend)
+            .unwrap();
+        let export2 = owner
+            .project_consumer_tracked(&life, &consumer, &c2, &mut backend)
+            .unwrap();
+        assert_ne!(backend.references[0], backend.references[1]);
+        owner
+            .complete_projection(&life, &grant, unsafe { export1.prove_retired().unwrap() })
+            .unwrap();
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+        assert_eq!(owner.records[&grant.id].consumers.len(), 2);
+        owner
+            .complete_projection(&life, &grant, unsafe { export2.prove_retired().unwrap() })
+            .unwrap();
+        assert!(owner.records[&grant.id].native_holds.is_empty());
+        assert_eq!(owner.records[&grant.id].consumers.len(), 2);
     }
 }
