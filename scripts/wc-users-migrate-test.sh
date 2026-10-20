@@ -20,6 +20,15 @@ cat >"$T/etc/waycompose/users.conf" <<'EOF'
 vm guest desk installs=wcivs,wcmc
 vm guest wctest installs=wct1,wct2
 EOF
+# Synthetic trusted receipts exercise source binding only. Real receipts are
+# published after the distinct-UID stock-policy product proof, never by deploy.
+accept_policy() {
+  mkdir -p "$T/var/lib/waycompose/policy"
+  chmod 0755 "$T/var/lib/waycompose"
+  chmod 0700 "$T/var/lib/waycompose/policy"
+  printf 'stock-defaults-v1 %s\n' "$(sha256sum "$1" | cut -d' ' -f1)" >>"$T/var/lib/waycompose/policy/stock-session.sources"
+  chmod 0600 "$T/var/lib/waycompose/policy/stock-session.sources"
+}
 stage() { # NAME KEY
   local s="$T/home/admin/.cache/waycompose-stage/$1"
   mkdir -p "$s/bin"
@@ -32,6 +41,7 @@ exec     = /home/admin/.cache/waycompose-stage/$1/bin/app-firefox/bin/firefox
 profile  = /home/admin/.wc-launch/firefox-$1
 EOF
   printf 'VK_ICD_FILENAMES=/home/admin/.cache/waycompose-stage/%s/bin/sv_icd.json\n' "$1" >"$s/gpu.env"
+  accept_policy "$s/wc-session"
   echo "$s"
 }
 keyop() { ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" "$1" admin auto "$2" "$3"; }
@@ -89,6 +99,23 @@ chmod 0700 "$T/var/lib/waycompose/key-trust/wct1"
 out=$(run "$S" wct1); rc=$?
 [ "$rc" != 0 ] && [ ! -e "$I.new" ] && ok "replacement without a confirmed product baseline is refused before staging" || bad "untested replacement accepted"
 baseline wct1 >/dev/null || exit 1
+B="$T/var/lib/waycompose/protected-rollback/wct1"
+cp "$B/wc-session" "$T/accepted-session"
+printf '#!/bin/sh\necho old unreviewed policy\n' >"$B/wc-session"
+out=$(keyop rollback unused wct1 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "confirmation marker cannot bless different unreviewed baseline source" || bad "marker accepted changed policy source"
+cp "$T/accepted-session" "$B/wc-session"
+cp "$I/wc-session" "$T/candidate-session"
+rm "$S/wc-session"
+ln -s "$T/candidate-session" "$S/wc-session"
+out=$(run "$S" wct1); rc=$?
+[ "$rc" != 0 ] && ok "accepted hash cannot bless mutable staged script symlink" || bad "staged script symlink accepted"
+rm "$S/wc-session"
+cp "$T/candidate-session" "$S/wc-session"
+printf 'corrupt receipt entry\n' >>"$T/var/lib/waycompose/policy/stock-session.sources"
+out=$(run "$S" wct1); rc=$?
+[ "$rc" != 0 ] && ok "malformed source receipt refuses the whole deployment" || bad "corrupt receipt partially accepted"
+sed -i '$d' "$T/var/lib/waycompose/policy/stock-session.sources"
 # A second deploy: a new stage with another key; the installed key stays.
 S=$(stage wct1 "$(printf 'b%.0s' $(seq 64))")
 run "$S" wct1 >/dev/null
@@ -133,6 +160,7 @@ printf 'original presentation\n' >"$S/bin/libsv_wlshim.so"
 printf 'candidate renderer\n' >"$T/build-bin/wc-launch"
 printf 'candidate presentation\n' >"$T/build-bin/libsv_wlshim.so"
 printf 'broker-aware transport\n' >"$T/build-bin/wc-proxy"
+accept_policy "$T/build-bin/wc-session"
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" apply admin wctest "$T/build-bin" wct2 >"$T/first-apply.txt" 2>&1 || { cat "$T/first-apply.txt"; exit 1; }
 cmp -s "$S/bin/wc-launch" "$T/var/lib/waycompose/installs/wct2/bin/wc-launch" && cmp -s "$S/bin/libsv_wlshim.so" "$T/var/lib/waycompose/installs/wct2/bin/libsv_wlshim.so" && ok "first migration preserves original UI and presentation binaries" || bad "original UI was replaced"
 cmp -s "$T/build-bin/wc-proxy" "$T/var/lib/waycompose/installs/wct2/bin/wc-proxy" && ok "first migration upgrades broker-dependent transport" || bad "transport was left pre-broker"

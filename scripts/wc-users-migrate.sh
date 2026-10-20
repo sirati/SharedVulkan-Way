@@ -174,11 +174,26 @@ legacy_snapshot() {
   run rm -rf "$VL/legacy-original/$n"
   run mv "$dest" "$VL/legacy-original/$n"
 }
+# Root installs this allowlist only from accepted stock-policy source proofs.
+# A version label alone cannot bless older script bytes or an old baseline.
+stock_policy_source() {
+  local script=$1 digest line
+  secure_path "$VL" 755 && secure_path "$VL/policy" 700 &&
+    secure_path "$VL/policy/stock-session.sources" 600 && [ -f "$script" ] && [ ! -L "$script" ] || return 1
+  if grep -Eqv '^(stock-defaults-v1 [0-9a-f]{64}|#.*|)$' "$VL/policy/stock-session.sources"; then return 1; fi
+  digest=$(sha256sum "$script" | cut -d' ' -f1) || return 1
+  line="stock-defaults-v1 $digest"
+  grep -Fqx -- "$line" "$VL/policy/stock-session.sources" || return 1
+  printf '%s\n' "$line"
+}
 confirmed_baseline() {
-  local d="$VL/protected-rollback/$1"
+  local d="$VL/protected-rollback/$1" policy
   secure_path "$VL/protected-rollback" 700 && [ -d "$d" ] && [ ! -L "$d" ] &&
     secure_path "$d/.baseline-confirmed" 600 &&
-    [ "$(cat "$d/.baseline-confirmed")" = 'mapped-product-baseline-v1' ]
+    [ "$(cat "$d/.baseline-confirmed")" = 'mapped-product-baseline-v2' ] &&
+    secure_path "$d/.profile-policy" 600 || return 1
+  policy=$(stock_policy_source "$d/wc-session") || return 1
+  [ "$(cat "$d/.profile-policy")" = "$policy" ]
 }
 # This is an operator confirmation after a successful real mapped-user product
 # session, not a substitute for running that session. Never save an untested
@@ -190,12 +205,15 @@ if [ "$VERB" = baseline-confirm ]; then
     nb="$VL/installs/$n"; snap="$VL/protected-rollback/$n"; tmp="$snap.preparing"
     secure_path "$nb" 755 && [ -f "$nb/wc-session" ] && [ -f "$nb/apps.ini" ] &&
       cmp -s "$nb/session.key" "$TRUST/$n/session.key" || { echo "no protected current installation for $n"; exit 1; }
+    policy=$(stock_policy_source "$nb/wc-session") || { echo "installation source has no accepted stock-default policy proof"; exit 1; }
     run install -d -m 0700 "$VL/protected-rollback"
     secure_path "$VL/protected-rollback" 700 || exit 1
     [ ! -e "$tmp" ] && [ ! -L "$tmp" ] && [ ! -e "$snap.previous" ] && [ ! -L "$snap.previous" ] || { echo "unfinished baseline snapshot requires review"; exit 1; }
     run cp -a "$nb" "$tmp"
-    printf '%s\n' mapped-product-baseline-v1 >"$tmp/.baseline-confirmed"
-    run chmod 0600 "$tmp/.baseline-confirmed"
+    copied_policy=$(stock_policy_source "$tmp/wc-session") && [ "$copied_policy" = "$policy" ] || { echo "source changed during baseline copy"; exit 1; }
+    printf '%s\n' mapped-product-baseline-v2 >"$tmp/.baseline-confirmed"
+    printf '%s\n' "$policy" >"$tmp/.profile-policy"
+    run chmod 0600 "$tmp/.baseline-confirmed" "$tmp/.profile-policy"
     [ ! -e "$snap" ] || run mv "$snap" "$snap.previous"
     run mv "$tmp" "$snap"
     run rm -rf "$snap.previous"
@@ -275,6 +293,9 @@ if [ "$VERB" = apply ] || [ "$VERB" = install-staged ] || [ "$VERB" = rollback ]
 fi
 
 # ------------------------------------------------------------------- checks
+if [ "$VERB" = apply ]; then
+  stock_policy_source "$BINS/wc-session" >/dev/null || { echo "migration source has no accepted stock-default policy proof"; exit 1; }
+fi
 if [ "$VERB" != rollback ] && [ "$VERB" != verify ] && [ "$VERB" != remove-old ] && [ "$VERB" != install-staged ]; then
   for f in wc-arena-host sv-hostd wc-session; do
     [ -f "$BINS/$f" ] || { echo "no $BINS/$f: BIN-DIR must hold this branch's builds"; exit 1; }
@@ -333,6 +354,7 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     # The definitions are root's; the key the service's alone.
     own root:root "$nb"
     run chmod -R go-w "$nb"
+    stock_policy_source "$nb/wc-session" >/dev/null || { echo "copied migration source differs from accepted stock-default policy"; exit 1; }
     if [ -n "$REAL" ]; then run chown waycompose:waycompose "$nb/session.key"; else say "  (would chown waycompose $nb/session.key)"; fi
     run chmod 0600 "$nb/session.key"
     # GC roots made by deploy for bin/'s store links point at the old path.
@@ -404,6 +426,7 @@ if [ "$VERB" = install-staged ]; then
   n=${INSTALLS[0]}; st=$BINS
   nb="$VL/installs/$n"; nb_real=${nb#"$ROOT"}; st_real=${st#"$ROOT"}
   [ -f "$st/wc-session" ] && [ -f "$st/apps.ini" ] || { echo "$st is not a staged installation (no wc-session, apps.ini)"; exit 1; }
+  stock_policy_source "$st/wc-session" >/dev/null || { echo "staged source has no accepted stock-default policy proof"; exit 1; }
   case "$st_real" in "$AH_REAL"/*) ;; *) echo "the stage $st_real is not under ~$ADMIN"; exit 1 ;; esac
   if [ -n "$REAL" ]; then getent passwd waycompose >/dev/null || { echo "no account waycompose: this host has no system services"; exit 1; }; fi
   say "installation $n: $st_real -> $nb_real, its sessions as $DESK"
@@ -418,6 +441,7 @@ if [ "$VERB" = install-staged ]; then
   run cp -f "$TRUST/$n/session.key" "$tmp/session.key"
   own root:root "$tmp"
   run chmod -R go-w "$tmp"
+  stock_policy_source "$tmp/wc-session" >/dev/null || { echo "copied installation source differs from accepted stock-default policy"; exit 1; }
   if [ -n "$REAL" ]; then run chown waycompose:waycompose "$tmp/session.key"; else say "  (would chown waycompose $tmp/session.key)"; fi
   run chmod 0600 "$tmp/session.key"
   run sed -i -e "s|$st_real/|$nb_real/|g" -e "s|$st_real\$|$nb_real|g" -e "s|$AH_REAL/|~/|g" "$tmp/apps.ini"
