@@ -188,8 +188,21 @@ impl Link {
     }
 
     fn connect(&self) -> io::Result<()> {
-        let f = match open_pipe(&self.pipe) {
+        let first = {
+            let t = std::time::Instant::now();
+            loop {
+                match open_pipe(&self.pipe) {
+                    // Busy: the holder still serves a broker that just died.
+                    Err(e) if e.raw_os_error() == Some(231) && t.elapsed() < std::time::Duration::from_secs(5) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    r => break r,
+                }
+            }
+        };
+        let f = match first {
             Ok(f) => f,
+            Err(e) if e.raw_os_error() != Some(2) => return Err(e),
             Err(_) => {
                 let mut c = std::process::Command::new(&self.spawn.exe);
                 c.args(&self.spawn.args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
@@ -368,7 +381,18 @@ impl AsRaw for std::fs::File {
 /// `sv-guest broker holder-quit`: tell a running holder to let go of
 /// everything and exit (uninstall).
 pub fn quit(pipe: &str) -> io::Result<()> {
-    let mut f = open_pipe(pipe)?;
+    // The holder serves one broker at a time: a broker that just exited may
+    // still be its client for a moment.
+    let t = std::time::Instant::now();
+    let mut f = loop {
+        match open_pipe(pipe) {
+            Ok(f) => break f,
+            Err(e) if e.raw_os_error() == Some(231) && t.elapsed() < std::time::Duration::from_secs(5) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e),
+        }
+    };
     f.write_all(b"quit\n")?;
     let mut s = String::new();
     BufReader::new(f).read_line(&mut s)?;

@@ -312,3 +312,125 @@ fn write_overlapped(h: &OwnedHandle, bytes: &[u8]) {
         windows_sys::Win32::Foundation::CloseHandle(ov.hEvent);
     }
 }
+
+/// A holder, for `a_crashed_broker_gets_its_regions_back_from_the_holder`.
+#[test]
+fn holder_main() {
+    let Ok(pipe) = std::env::var("WC_BROKER_TEST_HOLDER_PIPE") else { return };
+    wc_broker::sys::windows::holder::serve(&pipe, wc_broker::sys::windows::holder::HOLDER_SDDL).unwrap();
+}
+
+/// A broker with a holder, in a process of its own, until it is killed.
+#[test]
+fn broker_main() {
+    let Ok(pipe) = std::env::var("WC_BROKER_TEST_BROKER_PIPE") else { return };
+    let hpipe = std::env::var("WC_BROKER_TEST_HOLDER_PIPE").unwrap();
+    let sddl = PIPE_SDDL.replace("(A;;0x0012008b;;;IU)", "(A;;0x0012008b;;;IU)(A;;0x0012008b;;;OW)(A;;0x0012008b;;;AU)");
+    let spawn = wc_broker::sys::windows::holder::Spawn {
+        exe: std::env::current_exe().unwrap(),
+        args: vec!["--exact".into(), "holder_main".into(), "--nocapture".into(), "--test-threads=1".into()],
+        env: vec![("WC_BROKER_TEST_HOLDER_PIPE".into(), hpipe.clone())],
+    };
+    let w = Windows::bind(&pipe, &sddl, Vec::new()).unwrap().with_holder(&hpipe, spawn).unwrap();
+    println!("HOLDER {}", w.holder_pid().unwrap());
+    let _ = std::io::stdout().flush();
+    let b = Broker::new(
+        w,
+        Config { devices: Vec::new(), services: Vec::new(), keys: None, release: Release::OwnerFree, budget: None, run: 9 },
+    );
+    b.serve().unwrap();
+}
+
+fn spawn_broker(pipe: &str, hpipe: &str) -> (std::process::Child, u32) {
+    let mut c = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "broker_main", "--nocapture", "--test-threads=1"])
+        .env("WC_BROKER_TEST_BROKER_PIPE", pipe)
+        .env("WC_BROKER_TEST_HOLDER_PIPE", hpipe)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(c.stdout.take().unwrap());
+    let mut line = String::new();
+    let pid = loop {
+        line.clear();
+        assert!(out.read_line(&mut line).unwrap() > 0, "the broker ended before starting");
+        if let Some(i) = line.find("HOLDER ") {
+            break line[i + 7..].trim().parse().unwrap();
+        }
+    };
+    std::thread::spawn(move || for _ in out.lines() {});
+    (c, pid)
+}
+
+/// §111.8's holder: a region whose provider has let go survives the
+/// broker's crash, comes back as an orphan in the next broker, and survives
+/// the holder's crash too.
+#[test]
+fn a_crashed_broker_gets_its_regions_back_from_the_holder() {
+    let tag = std::process::id();
+    let pipe = format!(r"\\.\pipe\wc-broker-test-hb-{tag}");
+    let hpipe = format!(r"\\.\pipe\wc-broker-test-holder-{tag}");
+    let (mut b1, h1) = spawn_broker(&pipe, &hpipe);
+    let connect = || {
+        let t = Instant::now();
+        loop {
+            match Client::connect(&pipe) {
+                Ok(c) => break c,
+                Err(e) => {
+                    assert!(t.elapsed() < Duration::from_secs(10), "{e}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    };
+    let mut c = connect();
+    c.hello("provider").unwrap();
+    let (r, hs) = c.alloc("keep", 1 << 20, false).unwrap();
+    let p = map(&hs[0], 1 << 20);
+    // SAFETY: inside the view.
+    unsafe { std::ptr::copy_nonoverlapping(b"survives".as_ptr(), p, 8) };
+    unmap(p);
+    drop(hs);
+    drop(c);
+    // Now only the broker and the holder hold the section. The broker dies.
+    b1.kill().unwrap();
+    let _ = b1.wait();
+    let (mut b2, h2) = spawn_broker(&pipe, &hpipe);
+    assert_eq!(h1, h2, "the second broker found the same holder");
+    let mut c = connect();
+    c.hello("provider").unwrap();
+    assert!(c.stats().unwrap().contains("orphans=1"), "{}", c.stats().unwrap());
+    assert_eq!(c.adopt("keep").unwrap(), vec![(r.id, 1 << 20)]);
+    let (_, hs) = c.open(r.id).unwrap();
+    let q = map(&hs[0], 1 << 20);
+    // SAFETY: inside the view.
+    assert_eq!(unsafe { std::slice::from_raw_parts(q, 8) }, b"survives", "the pages outlived the broker");
+    unmap(q);
+    drop(hs);
+    c.close(r.id).unwrap();
+    // The holder dies: the broker starts another and gives it the region.
+    let k = std::process::Command::new("taskkill").args(["/F", "/PID", &h1.to_string()]).output();
+    eprintln!("taskkill holder {h1}: {:?}", k.map(|o| o.status));
+    std::thread::sleep(Duration::from_millis(500));
+    // Kill this broker too: if the new holder had not been refilled, the
+    // region would be gone now.
+    b2.kill().unwrap();
+    let _ = b2.wait();
+    drop(c);
+    let (mut b3, h3) = spawn_broker(&pipe, &hpipe);
+    assert_ne!(h3, h1, "a new holder");
+    let mut c = connect();
+    c.hello("provider").unwrap();
+    assert_eq!(c.adopt("keep").unwrap(), vec![(r.id, 1 << 20)], "the refilled holder kept it");
+    let (_, hs) = c.open(r.id).unwrap();
+    let q = map(&hs[0], 1 << 20);
+    // SAFETY: inside the view.
+    assert_eq!(unsafe { std::slice::from_raw_parts(q, 8) }, b"survives");
+    unmap(q);
+    drop(hs);
+    c.close(r.id).unwrap();
+    c.free(r.id).unwrap();
+    b3.kill().unwrap();
+    let _ = b3.wait();
+    wc_broker::sys::windows::holder::quit(&hpipe).unwrap();
+}
