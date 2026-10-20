@@ -1266,6 +1266,8 @@ impl WindowState {
             vertical: v,
             v120_h,
             v120_v,
+            finger: false,
+            stop: false,
             time,
         });
     }
@@ -5916,7 +5918,7 @@ fn set_cursor(ui: &Rc<Ui>, spec: CursorSpec) {
             }
             (h, false, format!("{} ({})", icon.name(), stock.name))
         }
-        CursorSpec::Image { image, hotspot_x, hotspot_y } => {
+        CursorSpec::Image { image, hotspot_x, hotspot_y, .. } => {
             match make_cursor(image, *hotspot_x, *hotspot_y) {
                 Some(h) => (
                     h,
@@ -6282,6 +6284,8 @@ pub fn start(config: PlatformConfig) -> std::io::Result<Started> {
         },
         PumpInner { ui },
         primary_work_area(),
+        // §103.18: Windows' per-monitor DPI is not read yet.
+        1,
     ))
 }
 

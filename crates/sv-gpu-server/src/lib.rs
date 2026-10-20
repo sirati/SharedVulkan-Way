@@ -39,6 +39,10 @@ pub mod table;
 pub mod video_log;
 pub mod video_stable;
 pub mod video_views;
+pub mod video_nv12;
+pub mod metal_image;
+#[cfg(target_os = "macos")]
+pub mod iosurface;
 pub mod workload;
 
 /// The reserved object id for "the arena's own `VkDeviceMemory`".

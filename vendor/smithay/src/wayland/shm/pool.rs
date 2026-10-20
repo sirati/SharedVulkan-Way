@@ -203,6 +203,25 @@ fn guard_enter(map: &MemMap) {
     });
 }
 
+/// Unwind must disarm TLS before the pool map/read guard can be dropped.
+struct ContentGuard(bool);
+impl ContentGuard {
+    fn enter(map: &MemMap) -> Self {
+        // Construct only after enter succeeds. A rejected recursive access
+        // must leave the outer call's fault guard armed.
+        guard_enter(map);
+        Self(true)
+    }
+    fn finish(mut self) -> bool {
+        let failed = guard_leave();
+        self.0 = false;
+        failed
+    }
+}
+impl Drop for ContentGuard {
+    fn drop(&mut self) { if self.0 { guard_leave(); } }
+}
+
 /// Disarm the fault guard; returns whether a fault was caught during the access.
 #[cfg(unix)]
 fn guard_leave() -> bool {
@@ -243,6 +262,41 @@ impl Pool {
 
     pub fn with_data_mut<T, F: FnOnce(*mut u8, usize) -> T>(&self, f: F) -> Result<T, ()> {
         self.inner.as_ref().unwrap().with_data_mut(f)
+    }
+
+    #[cfg(unix)]
+    pub fn with_mapped_data<T>(&self, f: impl FnOnce(*const u8, usize, usize, usize) -> T) -> Result<Option<T>, ()> {
+        let inner = self.inner.as_ref().unwrap();
+        let guard = inner.map.read().map_err(|_| ())?;
+        let (base, mapped_len, logical_len, prefix) = match &inner.fd {
+            WireFd::Open(_) => {
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page <= 0 || guard.ptr.is_null() { return Err(()); }
+                let page = page as usize;
+                let mapped_len = guard.size.checked_add(page - 1).ok_or(())? / page * page;
+                if guard.ptr as usize % page != 0 { return Err(()); }
+                (guard.ptr.cast_const(), mapped_len, guard.size, 0)
+            }
+            WireFd::Named(_) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let Some(view) = guard._view.as_ref() else { return Ok(None); };
+                    let Some((base, mapped, logical, prefix)) = view.native_vm_span() else { return Ok(None); };
+                    let pool_logical = prefix.checked_add(guard.size).ok_or(())?;
+                    if pool_logical > logical { return Err(()); }
+                    (base, mapped, pool_logical, prefix)
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Ok(None);
+            }
+        };
+        // mmap covers the final partial native page. The window's prefix is
+        // added to BufferData.offset, and only the logical pool range is read.
+        // This read lock and retained view prevent resize/unmap across GPU use.
+        unsafe { place_sigbus_handler() };
+        let fault = ContentGuard::enter(&guard);
+        let result = f(base, mapped_len, logical_len, prefix);
+        if fault.finish() { Err(()) } else { Ok(Some(result)) }
     }
 
     /// The named object this pool was opened from (a refcounted clone), or
@@ -556,4 +610,25 @@ unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> *mut libc::c_void {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> *mut libc::c_void {
     unsafe { (*info).si_addr as _ }
+}
+
+#[cfg(all(test, unix))]
+mod native_mapping_tests {
+    use super::*;
+    #[test]
+    fn panic_disarms_tls_and_reentrant_failure_preserves_outer_guard() {
+        let map = MemMap { ptr: ptr::null_mut(), size: 0, _view: None };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ContentGuard::enter(&map);
+            panic!("capture failed");
+        }));
+        assert!(result.is_err());
+        SIGBUS_GUARD.with(|g| assert!(g.get().0.is_null()));
+        let outer = ContentGuard::enter(&map);
+        let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _nested = ContentGuard::enter(&map); }));
+        assert!(nested.is_err());
+        SIGBUS_GUARD.with(|g| assert_eq!(g.get().0, &map as *const MemMap));
+        assert!(!outer.finish());
+        SIGBUS_GUARD.with(|g| assert!(g.get().0.is_null()));
+    }
 }
