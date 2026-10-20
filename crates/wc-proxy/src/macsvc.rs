@@ -44,10 +44,17 @@ pub struct Services {
     pub index: u8,
 }
 
+/// Milliseconds since [`epoch`] of the last ping, plus one; 0 for none yet.
 static LAST_PING: AtomicU64 = AtomicU64::new(0);
 
+/// The lease's clock: monotonic, so a wall-clock step is not a lost lease.
+fn epoch() -> Instant {
+    static E: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *E.get_or_init(Instant::now)
+}
+
 fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    epoch().elapsed().as_millis() as u64 + 1
 }
 
 /// Start the services the arguments name. Each runs on a thread of its own.
@@ -62,7 +69,8 @@ pub fn start(control: &Arc<Control>, svc: &Services) {
                     .name("session-control".into())
                     .spawn(move || serve_control(c, ch, session.clone(), id.clone(), index))
                     .ok();
-                std::thread::Builder::new().name("lease".into()).spawn(watch_lease).ok();
+                let c = Arc::clone(control);
+                std::thread::Builder::new().name("lease".into()).spawn(move || watch_lease(c)).ok();
             }
             Err(e) => println!("[proxy] no session control ring: {e}"),
         }
@@ -264,17 +272,61 @@ pub fn command_words(line: &str, id: &str) -> String {
 
 
 /// Five seconds without a ping, once pings have started, end the process:
-/// the guest's pages are no longer the session's.
-fn watch_lease() {
+/// the guest's pages are no longer the session's. §113: unless the guest as
+/// a whole is stalled, which [`crate::lease::Judge`] tells from a dead one.
+fn watch_lease(control: Arc<Control>) {
+    let _ = epoch();
+    let cfg = crate::lease::Cfg::from_env();
+    let mut vm = crate::lease::ProcVm::from_env();
+    if let Some(w) = vm.as_mut() {
+        w.prime();
+    }
+    match &vm {
+        Some(w) => println!(
+            "[proxy] lease: a stalled guest is held up to {} s ({}), a silent one up to {} s without it (§113)",
+            cfg.frozen_max.as_secs(),
+            w.describe(),
+            cfg.blind_max.as_secs()
+        ),
+        None => println!("[proxy] lease: no VM witness; a silent guest is held up to {} s (§113)", cfg.blind_max.as_secs()),
+    }
+    let mut judge = crate::lease::Judge::new(cfg, Instant::now());
+    let mut holding: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        let now = Instant::now();
         let last = LAST_PING.load(Ordering::Relaxed);
-        if last != 0 && now_ms().saturating_sub(last) > 5000 {
-            println!(
-                "[proxy] LEASE LOST: no ping from the guest's main process for 5 s; its RAM may \
-                 already be reused, so this proxy stops before touching it again"
-            );
-            std::process::exit(4);
+        if last != 0 {
+            judge.ping(epoch() + Duration::from_millis(last - 1));
+        }
+        let beat = control.peer_beat().ok();
+        let verdict = match vm.as_mut() {
+            Some(w) => judge.tick(now, beat, w),
+            None => judge.tick(now, beat, &mut crate::lease::Blind),
+        };
+        match verdict {
+            crate::lease::Verdict::Live => {
+                if let Some(t) = holding.take() {
+                    println!("[proxy] lease: the guest is back after {} ms; the session goes on", t.elapsed().as_millis());
+                }
+            }
+            crate::lease::Verdict::Hold { silent, vm } => {
+                if holding.is_none() {
+                    holding = Some(now - silent);
+                    println!(
+                        "[proxy] lease: no ping for 5 s and the whole guest silent for {} ms ({vm:?}): \
+                         taken for a stalled guest, held",
+                        silent.as_millis()
+                    );
+                }
+            }
+            crate::lease::Verdict::Lost(why) => {
+                println!(
+                    "[proxy] LEASE LOST: {why}; its RAM may already be reused, so this proxy stops \
+                     before touching it again"
+                );
+                std::process::exit(4);
+            }
         }
     }
 }

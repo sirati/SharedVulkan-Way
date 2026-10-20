@@ -1203,7 +1203,8 @@ fn end(sess: &Arc<Sess>, why: &str) {
 }
 
 /// §107: a session ends when its proxy closes its control slot, when the
-/// proxy stops answering (`rtt` every two seconds, twice missed), or when its
+/// proxy stops answering (`rtt` every two seconds, twice missed; §113: not
+/// counting a probe this process was stalled through), or when its
 /// last client has been gone for the linger, which also tells the proxy
 /// `down`. A proxy that crashed is the first or the second; a flood of
 /// requests from one session waits for its own turn and nobody else's.
@@ -1211,10 +1212,16 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
     let Some(control) = crate::ringlink::shared_control() else { return };
     let slot = sess.service_slots.lock().unwrap_or_else(|e| e.into_inner()).first().copied();
     let linger = hub().and_then(|h| h.linger);
-    let mut misses = 0u32;
-    let mut last_probe = Instant::now();
+    let mut probes = Probes::new(Instant::now());
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        if let Some(gap) = probes.tick(Instant::now()) {
+            say(&format!(
+                "session {}: this process did not run for {} ms (the guest stalled?); a probe missed across it does not count (§113)",
+                sess.index,
+                gap.as_millis()
+            ));
+        }
         if sess.ended() {
             return;
         }
@@ -1233,21 +1240,74 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
             end(&sess, &format!("its last client left {} s ago (down: {})", linger.as_secs(), said.unwrap_or_else(|e| e)));
             return;
         }
-        if last_probe.elapsed() >= Duration::from_secs(2) {
-            last_probe = Instant::now();
+        if probes.due(Instant::now()) {
             // Only between requests: a request in flight is its own probe.
             if let Ok(turn) = ctl.turn.try_lock() {
-                match ctl.exchange("rtt", Duration::from_secs(2)) {
-                    Ok(_) => misses = 0,
-                    Err(e) => {
-                        misses += 1;
-                        if misses >= 2 {
-                            drop(turn);
-                            end(&sess, &format!("its proxy is silent ({e})"));
-                            return;
-                        }
-                    }
+                let t0 = Instant::now();
+                let r = ctl.exchange("rtt", PROBE_WITHIN);
+                if let Some(e) = probes.answer(t0, Instant::now(), r.err()) {
+                    drop(turn);
+                    end(&sess, &format!("its proxy is silent ({e})"));
+                    return;
                 }
+            }
+        }
+    }
+}
+
+/// How long one `rtt` probe waits for the proxy.
+const PROBE_WITHIN: Duration = Duration::from_secs(2);
+/// A gap this long in a loop that sleeps 250 ms is this process not running.
+const STALL: Duration = Duration::from_millis(1000);
+
+/// [`watch`]'s probes: one every two seconds, the session ends at the second
+/// miss in a row. §113: a probe whose wait this process spent stalled (the
+/// whole guest frozen, as a passed-through GPU waking from D3 does for
+/// seconds) is not a miss: the proxy could not answer a guest that did not
+/// run, and the guest cannot tell how long it was gone except by its clock.
+struct Probes {
+    last_tick: Instant,
+    last_probe: Instant,
+    misses: u32,
+}
+
+impl Probes {
+    fn new(now: Instant) -> Probes {
+        Probes { last_tick: now, last_probe: now, misses: 0 }
+    }
+
+    /// Each loop turn. A stall forgets the misses before it, and says how long.
+    fn tick(&mut self, now: Instant) -> Option<Duration> {
+        let gap = now.duration_since(self.last_tick);
+        self.last_tick = now;
+        (gap > STALL + Duration::from_millis(250)).then(|| {
+            self.misses = 0;
+            self.last_probe = now;
+            gap
+        })
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let due = now.duration_since(self.last_probe) >= Duration::from_secs(2);
+        if due {
+            self.last_probe = now;
+        }
+        due
+    }
+
+    /// A probe sent at `t0` that ended at `t1`; `Some(why)` ends the session.
+    fn answer(&mut self, t0: Instant, t1: Instant, err: Option<String>) -> Option<String> {
+        self.last_tick = t1;
+        match err {
+            None => {
+                self.misses = 0;
+                None
+            }
+            // Longer than the probe's own wait: this process stalled in it.
+            Some(_) if t1.duration_since(t0) > PROBE_WITHIN + STALL => None,
+            Some(e) => {
+                self.misses += 1;
+                (self.misses >= 2).then_some(e)
             }
         }
     }
@@ -1773,6 +1833,39 @@ fn wait_ended(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §113: two misses in a row end a session; a probe this process was
+    /// stalled through is not one, and a stall forgets the misses before it.
+    #[test]
+    fn probes_ride_out_a_stall_of_this_process() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut p = Probes::new(t0);
+        // An ordinary miss (the 2 s wait ran out), then an answer.
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(2000), ms(2001), None), None);
+        // Two ordinary misses in a row end it.
+        assert_eq!(p.answer(ms(3000), ms(5000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(5000), ms(7000), Some("no answer".into())), Some("no answer".into()));
+
+        // A miss, then the guest freezes for 8 s inside the next probe: its
+        // wait looked like 8 s, so it is not the second miss.
+        let mut p = Probes::new(t0);
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(2000), ms(10_000), Some("no answer".into())), None);
+        // And the next ordinary miss is only the second one.
+        assert_eq!(p.answer(ms(10_000), ms(12_000), Some("no answer".into())), Some("no answer".into()));
+
+        // A miss, then an 8 s gap between two loop turns: forgotten, and
+        // the next probe waits its two seconds again.
+        let mut p = Probes::new(t0);
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.tick(ms(2250)), None);
+        assert_eq!(p.tick(ms(10_250)), Some(Duration::from_secs(8)));
+        assert!(!p.due(ms(11_000)));
+        assert!(p.due(ms(12_250)));
+        assert_eq!(p.answer(ms(12_250), ms(14_250), Some("no answer".into())), None);
+    }
 
     #[test]
     fn a_boot_request_round_trips_and_spaces_in_paths_survive() {

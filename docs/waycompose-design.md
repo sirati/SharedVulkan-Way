@@ -36954,12 +36954,12 @@ tests): a stand-in device moved into a child, refused to the parent, free
 orphan adopted; `sign`; the holder restoring a region after the broker was
 killed and again after the holder was killed; RTT mean 41 µs, p99 59 µs.
 
-**Deploy.** `scripts/wc-launch.sh deploy` (default `WC_LAUNCH_BROKER=install`)
+**Deploy.** `WC_LAUNCH_BROKER=install scripts/wc-launch.sh deploy`
 runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
-`WC_LAUNCH_BROKER=skip` is the pre-§111 deploy. `wc-launch.sh broker-show`
+`WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
 holder ended, keys kept).
 
@@ -37340,6 +37340,35 @@ them in the host configuration's `wctestInstalls`, which adds
 `<guest-user> -> wctest installs=…` to the table. Deploy them into
 `/var/lib/waycompose/installs/<name>` as the migration script lays them out.
 
+**Deploying onto the system layout.** Once a host runs the system services,
+`scripts/wc-launch.sh deploy` in its old form would write the admin's hub and
+session service units back beside them, and two session services would race
+for every boot record. So it refuses on such a host (`/etc/waycompose/users.conf`
+or a system `wc-sessiond.service` present), and `install_services` refuses too.
+`WC_LAUNCH_HOST_LAYOUT=system` is the form for it:
+
+* the installation is built as before, in a stage in the admin's home
+  (`~/.cache/waycompose-stage/<name>`), GC roots included;
+* `scripts/wc-users-migrate.sh install-staged ADMIN auto STAGE NAME`, as root
+  (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
+  host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
+  paths become the installation's, the admin's home becomes `~/` (the mapped
+  user's), the GC roots are registered at their new path, an installed key is
+  kept, and the stage's copy of the key is deleted;
+* the deploy is refused unless `users.conf` maps the installation to a user. A
+  test installation is named in the host's `wctestInstalls`, so it runs as
+  `wctest`, with its profile in that user's home;
+* no unit is written, and the system hub's and session service's binaries are
+  left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
+  which is a doorbell blip of about a second for every session;
+* the debug ssh transport is not available with it.
+
+`scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
+(paths, key kept across a redeploy, the mapped user, refusals) and deploy's
+guard against a stubbed host (the old form refused on a system-services host,
+accepted on a plain one; the system layout refused for an unmapped
+installation and on a plain host).
+
 #### Tests
 
 * `wc_broker::usermap` (5), `wc_broker::host` (1), and in wc-arena-host:
@@ -37385,3 +37414,72 @@ them in the host configuration's `wctestInstalls`, which adds
   session; the guest proof is the coordinator's. Pool regions past the first
   (§110's `region_path` of a `broker:` boot name) are not reachable through
   the broker yet. That is the guest-RAM continuation's `find("gpu.<k>")`.
+
+## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
+
+**The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
+is silent", 08:36 and 09:25). The Windows guest had not crashed: for six to
+ten seconds no vCPU halted while the passed-through iGPU came out of D3. The
+guest's runtime power management wakes it about once a minute. pci.sys then
+restores its config space through `0xcf8/0xcfc`, and every one of those
+exits waits for QEMU's BQL. The other vCPUs spin behind it. The 5 s lease
+(§103.14) then ended the proxy, and the session went down with it. Evidence,
+host traces and the proposal for the stall itself are outside git, in
+/mnt/datasets/builds/evidence/frozen-guest/.
+
+**Three witnesses, and what each decides.**
+
+1. **This session's pings**, every 500 ms, as before.
+2. **The guest's heartbeat.** The compositor beats the owner word of the
+   ring control region every 100 ms on a thread of its own (`ringlink.rs`,
+   `start_guest_beat`). Every session's proxy can read it. If the heartbeat
+   moves while this session's pings have stopped, the guest runs and only
+   this session's side is gone, so the lease ends after 5 s, as before.
+3. **The VM's process on the host.** The proxy finds it through
+   `WC_LAUNCH_VM_PID`, `WC_LAUNCH_VM_PIDFILE` or `WC_LAUNCH_VM_UNIT` (a system
+   unit whose main process is QEMU) and reads `/proc/PID/task/*/stat`. This
+   needs no privilege and touches nothing in the VM. It is asked only while
+   pings and heartbeat have both stopped:
+   - a stopped thread, or at least two threads busy for the whole window
+     (vCPUs that never halt), means the guest is stalled. The lease holds it
+     for up to `WC_LAUNCH_LEASE_FROZEN_SECS` (60).
+   - a process that is gone, or one that is mostly idle, means the guest
+     runs but its compositor does not. The lease ends after 5 s.
+
+Without a VM witness, a silent guest is held for up to
+`WC_LAUNCH_LEASE_BLIND_SECS` (20). A guest build before §113 never beats, so
+it keeps the old 5 s. When the heartbeat comes back after a silence, the
+session's pinger gets a fresh 5 s. A gap in the proxy's own 250 ms ticks is
+the proxy stalling, not the guest, and restarts the clocks. The lease clock
+is monotonic now; it used to be the wall clock. The policy is
+`wc_proxy::lease::Judge`: pure, clocked by its caller, and unit-tested for
+each of these cases.
+
+**The guest's half.** A session's `watch` (§107) probes `rtt` every two
+seconds and ends the session at the second miss. A probe that took longer
+than its own 2 s wait plus a second was stalled in, so it is not a miss. A
+gap of over a second between two 250 ms turns of the loop clears the misses
+before it and is logged.
+
+**What is still slow.** A compositor that crashes on a guest that is itself
+busy (two or more threads running flat out) is taken for a stall and held
+for up to 60 s. Without a VM witness, any compositor crash is held for up to
+20 s. Its memory is safe in the meantime: the arena is the ivshmem BAR, or
+the keeper holds it (§103.15).
+
+**Proved.**
+- `wc_proxy::lease` tests: a session dying while the guest beats; an 8 s
+  freeze ridden out; a fresh lease after the freeze; a dead compositor on an
+  idle VM; a gone VM; the 60 s and 20 s bounds; a guest that never beats; a
+  stall of the proxy itself.
+- `session_svc` `probes_ride_out_a_stall_of_this_process`.
+- `scripts/wc-no-ssh.sh` leg 3a: the compositor is SIGSTOPped for 8 s, the
+  proxy holds, and the session answers afterwards. Leg 3 then kills it with
+  -9, and the lease ends in 5 s ("its VM process is gone").
+- `scripts/wc-multi-install.sh` leg 3b: the same 8 s stall under three
+  sessions of one compositor, and none of them ends.
+
+**Deploying it** needs a guest build (for the heartbeat) and, for the VM
+witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
+on testhost (nix-config). Without the guest build the old lease stands;
+without the unit the 20 s bound applies.
