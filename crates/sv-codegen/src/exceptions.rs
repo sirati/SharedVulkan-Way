@@ -1031,3 +1031,13 @@ mod tests {
         assert!(unserialisable_reason("VkAllocationCallbacks").unwrap().contains("function pointers"));
     }
 }
+
+/// Optional typed interception before wire handle mapping. Defaults preserve
+/// driver forwarding; queue workers can replay with the explicit bypass hook.
+pub const GPU_OPTIONAL_OVERRIDES: &[&str] = &[
+    "vkGetPhysicalDeviceVideoCapabilitiesKHR", "vkGetPhysicalDeviceVideoFormatPropertiesKHR", "vkCreateVideoSessionKHR",
+    "vkDestroyVideoSessionKHR", "vkCreateVideoSessionParametersKHR",
+    "vkUpdateVideoSessionParametersKHR", "vkDestroyVideoSessionParametersKHR",
+    "vkGetVideoSessionMemoryRequirementsKHR", "vkBindVideoSessionMemoryKHR",
+    "vkQueueSubmit", "vkQueueSubmit2", "vkQueueWaitIdle", "vkDeviceWaitIdle",
+];

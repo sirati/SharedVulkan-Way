@@ -1510,10 +1510,19 @@ fn emit_forward_command(
         }
     };
 
+    let optional_override = if crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str()) {
+        let hook = format_ident!("override_{}", naming::command_method(&c.name));
+        quote! {
+            if !__h.bypass_optional_overrides() {
+                if let Some(result) = __h.#hook(&a) { return result; }
+            }
+        }
+    } else { quote!() };
     let mut_a = if has_pre || submit_after_call { quote!(mut) } else { quote!() };
     Ok(quote! {
         let #mut_a a = a;
         let __h = &mut self.0;
+        #optional_override
         #unbind_block
         #pre
         #unpoison
@@ -1607,6 +1616,12 @@ fn emit_lower_full_pnext(cx: &Ctx<'_>) -> TokenStream {
 // ---------------------------------------------------------------------------
 
 fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
+    let optional_methods = cx.wire.commands.iter().filter(|c| crate::exceptions::GPU_OPTIONAL_OVERRIDES.contains(&c.name.as_str())).map(|c| {
+        let method = format_ident!("override_{}", naming::command_method(&c.name));
+        let args = format_ident!("{}Args", naming::opcode_variant(&c.name));
+        let ret = if c.generates_reply { let r=format_ident!("{}Reply",naming::opcode_variant(&c.name));quote!(sv_proto::#r) } else {quote!(())};
+        quote! { fn #method(&mut self, _args: &sv_proto::#args) -> Option<sv_wire::Result<#ret>> { None } }
+    });
     let methods = hand.iter().filter_map(|c| {
         let wire = cx.wire.commands.iter().find(|w| w.name == c.name)?;
         let m = naming::command_method(&c.name);
@@ -1636,6 +1651,8 @@ fn emit_host_trait(cx: &Ctx<'_>, hand: &[&AbiCommand]) -> TokenStream {
         /// honest measure of how much of a GPU side is hand-written: everything
         /// not named here is generated (docs/design.md §7.2, pass 12).
         pub trait GpuHost {
+            fn bypass_optional_overrides(&self) -> bool { false }
+            #(#optional_methods)*
             /// The driver's entry points.
             fn fns(&self) -> &DriverFns;
             /// App-assigned object id → the driver's own handle (docs/design.md §6.4).

@@ -20,10 +20,12 @@ pub struct Ready {
     pub hardware_h264: bool,
     /// Set only after the joined NV12 import and transfer path is usable.
     pub joined_nv12_import: bool,
+    /// Validated hardware decode, exact bound target and ordered queue completion.
+    pub native_queue_bound_decode: bool,
 }
 impl Ready {
     pub fn available(self) -> bool {
-        self.hardware_h264 && self.joined_nv12_import
+        self.hardware_h264 && self.joined_nv12_import && self.native_queue_bound_decode
     }
 }
 
@@ -174,7 +176,7 @@ impl NativeVideo {
             })
             .max_coded_extent(vk::Extent2D {
                 width: 4096,
-                height: 4096,
+                height: 2304,
             })
             .max_dpb_slots(16)
             .max_active_reference_pictures(16))
@@ -326,6 +328,7 @@ impl NativeVideo {
         for s in sps {
             if sets.sps.contains_key(&s.seq_parameter_set_id)
                 || s.profile_idc != p.session.profile.idc
+                || s.level_idc > 15
                 || u32::from(s.max_num_ref_frames) > p.session.dpb_slots
                 || s.flags.frame_mbs_only_flag() == 0
                 || s.chroma_format_idc != 1
@@ -345,6 +348,20 @@ impl NativeVideo {
                 .and_then(|v| v.checked_mul(16))
                 .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
             if width > p.session.extent.width || height > p.session.extent.height {
+                return unsupported();
+            }
+            const MAX_FS: [u32; 16] = [
+                99, 396, 396, 396, 396, 792, 1620, 1620, 3600, 5120, 8192, 8192, 8704, 22080,
+                36864, 36864,
+            ];
+            const MAX_DPB: [u32; 16] = [
+                396, 900, 2376, 2376, 2376, 4752, 8100, 8100, 18000, 20480, 32768, 32768, 34816,
+                110400, 184320, 184320,
+            ];
+            let macroblocks = (width / 16) * (height / 16);
+            if macroblocks > MAX_FS[s.level_idc as usize]
+                || macroblocks * u32::from(s.max_num_ref_frames) > MAX_DPB[s.level_idc as usize]
+            {
                 return unsupported();
             }
             let nal = unsafe { crate::video_nv12::h264_parameters::sps_nal(s) }
@@ -522,7 +539,7 @@ fn extent_valid(e: vk::Extent2D) -> bool {
     e.width >= 16
         && e.height >= 16
         && e.width <= 4096
-        && e.height <= 4096
+        && e.height <= 2304
         && e.width % 2 == 0
         && e.height % 2 == 0
 }
@@ -546,6 +563,7 @@ mod tests {
         NativeVideo::new(Ready {
             hardware_h264: true,
             joined_nv12_import: true,
+            native_queue_bound_decode: true,
         })
     }
     fn info() -> vk::VideoSessionCreateInfoKHR<'static> {
@@ -560,11 +578,20 @@ mod tests {
             .max_active_reference_pictures(4)
     }
     #[test]
-    fn readiness_requires_both_native_components() {
-        for (hardware_h264, joined_nv12_import) in [(false, false), (true, false), (false, true)] {
+    fn readiness_requires_all_native_components() {
+        for (hardware_h264, joined_nv12_import, native_queue_bound_decode) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+            (false, false, true),
+        ] {
             let mut v = NativeVideo::new(Ready {
                 hardware_h264,
                 joined_nv12_import,
+                native_queue_bound_decode,
             });
             assert!(v.create_session(Profile { idc: 100 }, &info()).is_err());
         }
@@ -749,6 +776,7 @@ mod tests_multiple_scopes {
         let mut v = NativeVideo::new(Ready {
             hardware_h264: true,
             joined_nv12_import: true,
+            native_queue_bound_decode: true,
         });
         let info = vk::VideoSessionCreateInfoKHR::default()
             .picture_format(FORMAT)
