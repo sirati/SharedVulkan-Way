@@ -18,6 +18,7 @@
 //!   runs on each new one.
 
 pub mod acl;
+pub mod bell_hub;
 pub mod holder;
 pub mod ident;
 pub mod pipe;
@@ -210,6 +211,7 @@ pub struct Windows {
     listener: Listener,
     devices: Vec<DeviceAt>,
     large_pages: bool,
+    bell_hub: Option<Arc<bell_hub::Hub>>,
     raw_device_paths: Option<BTreeMap<String, String>>,
     protected_bar_mode: bool,
     protected_bars: BTreeMap<String, Arc<protected_range::Device>>,
@@ -220,6 +222,14 @@ pub struct Windows {
     opened: Arc<Mutex<BTreeMap<Pid, Arc<Owned>>>>,
 }
 
+impl Drop for Windows {
+    fn drop(&mut self) {
+        // Process watches may retain the hub after the service stops. End its
+        // wake endpoints now; this never retires mappings or grant resources.
+        if let Some(hub) = &self.bell_hub { hub.shutdown(); }
+    }
+}
+
 impl Windows {
     /// Serve on pipe `name` with descriptor `sddl` ([`PIPE_SDDL`]).
     pub fn bind(name: &str, sddl: &str, devices: Vec<DeviceAt>) -> io::Result<Windows> {
@@ -228,6 +238,7 @@ impl Windows {
             listener: Listener::new(name, sddl)?,
             devices,
             large_pages,
+            bell_hub: None,
             raw_device_paths: None,
             protected_bar_mode: false,
             protected_bars: BTreeMap::new(),
@@ -235,6 +246,12 @@ impl Windows {
             holder: None,
             opened: Arc::default(),
         })
+    }
+
+    /// Enable broker-owned raw ports and wake-only per-process subscriptions.
+    pub fn with_bell_hub(mut self, sources: Vec<bell_hub::Source>) -> Self {
+        self.bell_hub = Some(bell_hub::Hub::new(sources));
+        self
     }
 
     /// Pin service raw-device opens to the exact interface whose durable
@@ -415,6 +432,7 @@ impl Platform for Windows {
             return false;
         };
         let (opened, mine) = (Arc::clone(&self.opened), Arc::clone(&process));
+        let bell_hub = self.bell_hub.clone();
         let exited: Box<dyn FnOnce() + Send> = Box::new(move || {
             {
                 let mut m = opened.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,6 +440,7 @@ impl Platform for Windows {
                     m.remove(&pid);
                 }
             }
+            if let Some(hub) = bell_hub { hub.process_exited(&mine); }
             exited();
         });
         watch_process(process, exited)
@@ -436,6 +455,9 @@ impl Platform for Windows {
         if self.protected_bar_mode && !matches!(d.loc, DeviceLoc::Port(_)) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied,
                 "protected mode never lends a raw BAR or path alias"));
+        }
+        if self.bell_hub.is_some() && matches!(d.loc, DeviceLoc::Port(_)) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "raw doorbell ports stay broker-owned; use wake subscription"));
         }
         let h = match &d.loc {
             DeviceLoc::IvshmemSlot(s) => match &self.raw_device_paths {
@@ -455,6 +477,13 @@ impl Platform for Windows {
             DeviceLoc::Path(p) => open_path(p)?,
         };
         Ok(Object { h, large: false })
+    }
+
+    fn open_service_for(&self, writer: &Writer, peer: &Peer, name: &str) -> io::Result<Object> {
+        let device = name.strip_prefix("bell:").ok_or_else(|| io::Error::other("unknown Windows local service"))?;
+        if writer.user != peer.user { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "wake subscriber identity mismatch")); }
+        self.bell_hub.as_ref().ok_or_else(|| io::Error::other("broker wake hub is unavailable"))?
+            .subscribe(device, &writer.user, Arc::clone(&writer.process))
     }
 
     fn create_region(&self, len: u64, large: bool) -> io::Result<Object> {

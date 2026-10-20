@@ -16,11 +16,10 @@
 //! * [`client`]: what a compositor, GPU process or proxy calls;
 //! * `daemon`: the `wc-broker` program on Unix (the macOS LaunchDaemon, §111.9).
 //!
-//! **It is a control plane only.** A device is opened by the broker and its
-//! handle moved into the process that asked; a region's handle is copied into
-//! it. From then on the doorbells, rings and regions are that process's own,
-//! exactly as when it opened them itself: nothing on a data path passes
-//! through the broker, and nothing is copied.
+//! It is a control plane. Device and region handles establish the original
+//! mappings; payload travels through those mappings and rings. Windows
+//! doorbell subscriptions keep one raw port in the broker and fan out only
+//! coalesced wake notifications through authenticated local endpoints.
 
 pub mod client;
 pub mod bar_control;
