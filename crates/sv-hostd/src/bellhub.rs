@@ -519,6 +519,28 @@ pub fn run(name: &str, upstream: impl Into<Upstream>, listener: UnixListener) ->
     run_kept(name, upstream.into(), listener, None, false)
 }
 
+/// Serve a broker-lent port without reopening its raw device or reconnecting
+/// outside the broker. The existing bounded hub queues and rescan rule apply.
+pub fn run_port(name: &str, port: sv_transport::vdoorbell::PortHandle,
+    listener: UnixListener) -> std::io::Result<Arc<Hub>> {
+    let hub = Hub::new(name);
+    let (reader, writer) = port.split()?;
+    let accepts = Arc::clone(&hub);
+    std::thread::Builder::new().name(format!("bell-{name}-accept")).spawn(move || {
+        for connection in listener.incoming() {
+            match connection {
+                Ok(client) => { let _ = accepts.add_client(client); }
+                Err(_) => break,
+            }
+        }
+    })?;
+    let upstream = Arc::clone(&hub);
+    std::thread::Builder::new().name(format!("bell-{name}-port")).spawn(move || {
+        let _ = upstream.serve_link(reader, writer, || {});
+    })?;
+    Ok(hub)
+}
+
 /// [`run`], starting from an upstream connection a previous hub process left
 /// open (§99.6), and, with `keep`, giving systemd a copy of every upstream
 /// connection it makes (`{name}-up` in the unit's file-descriptor store) so
@@ -611,6 +633,26 @@ pub fn run_kept(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn broker_lent_file_port_uses_bounded_hub_in_both_directions() {
+        use std::os::fd::OwnedFd;
+        let dir = tmpdir("lent-port");
+        let path = dir.join("hub.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (port, mut peer) = UnixStream::pair().unwrap();
+        let file = std::fs::File::from(OwnedFd::from(port));
+        let hub = run_port("lent-port", sv_transport::vdoorbell::PortHandle::File(file), listener).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.write_all(&[7]).unwrap();
+        assert_eq!(read_some(&mut peer, 1, Duration::from_secs(2)), [7]);
+        peer.write_all(&[9]).unwrap();
+        assert_eq!(read_some(&mut client, 1, Duration::from_secs(2)), [9]);
+        assert!(hub.stats.upstream_connects.load(Ordering::Relaxed) >= 1);
+        drop(peer);
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("bellhub-{tag}-{}", std::process::id()));

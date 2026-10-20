@@ -80,7 +80,7 @@ pub const ARENA_MEMORY_ID: u64 = u64::MAX - 1;
 ///
 /// **5** since §104.11: `svFenceRecord`, `svFenceMark` and `svFenceWait`, the
 /// sync fd export that does not wait.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = sv_proto::GPU_WIRE_VERSION;
 
 /// The identity the two sides must agree on before a single ring is claimed.
 ///

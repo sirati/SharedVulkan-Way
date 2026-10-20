@@ -64,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu --qmp <sock> [--vm <hint>] --run <hex> --control-pages <n> --arena-pages <n> [--verify]\n                \
                  [--locator scan|pfns|both] [--frames <guest-status.txt>]\n  \
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
-                 sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N] [--drm-services <sock>]\n                \
+                 sv-hostd ivshmem-serve (--region <file>|--region-device <broker-name> --region-bytes N) --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock>|--bell-device <broker-name>] [--bell-hub <path>] [--clients N] [--drm-services <sock>]\n                \
                  (--cold <sock>: the TCP cold path, debug only)\n  \
                  sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock>[,rings=<shm file>] [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
@@ -558,7 +558,12 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let arg = |k: &str| -> Option<String> {
         args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned()
     };
-    let region = arg("--region").ok_or("--region is required")?;
+    let device = arg("--region-device");
+    if device.is_some() && arg("--region").is_some() {
+        return Err("choose --region or --region-device, not both".into());
+    }
+    let region = arg("--region").or_else(|| device.as_ref().map(|d| format!("broker-device:{d}")))
+        .ok_or("--region or --region-device is required")?;
     let cold = arg("--cold").ok_or("--cold is required (pool, or a socket for the TCP debug path)")?;
     let pooled_cold = cold == "pool";
     let path = arg("--socket").ok_or("--socket is required")?;
@@ -575,13 +580,33 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // waycompose-design.md §111.10: `broker:ID`, the BAR the broker published
     // for this user, who may not open the file itself.
     let brokered = wc_broker::client::region_spec(std::path::Path::new(&region)).is_some();
-    let file = if brokered {
+    // Keep the broker connection alive for the entire device lease. No direct
+    // raw-resource open or fallback is allowed on this path.
+    let mut device_owner = if device.is_some() || arg("--bell-device").is_some() {
+        Some(wc_broker::client::own_connection("linux-bar-hostd")?)
+    } else { None };
+    if device.is_some() && !pooled_cold {
+        return Err("--region-device requires --cold pool".into());
+    }
+    let file = if let Some(name) = &device {
+        Ok(std::fs::File::from(device_owner.as_mut().unwrap().device(name)?))
+    } else if brokered {
         wc_broker::client::open_path(std::path::Path::new(&region))
     } else {
         std::fs::OpenOptions::new().read(true).write(pooled_cold).open(&region)
     }
     .map_err(|e| format!("{region}: {e} (is this user in the region's group, or is it published to them?)"))?;
     let region_len = file.metadata()?.len();
+    if device.is_some() {
+        let expected: u64 = arg("--region-bytes").ok_or("--region-device needs --region-bytes")?.parse()?;
+        if expected < sv_transport::poolhdr::HEADER_LEN || expected != region_len {
+            return Err("broker BAR size differs from the configured region bound".into());
+        }
+    }
+    let mapped_bar = if device.is_some() {
+        Some(Arc::new(sv_transport::region::SharedRegion::map_fd(file.as_fd(), 0,
+            usize::try_from(region_len)?)?))
+    } else { None };
 
     let mailboxes = if pooled_cold {
         if region_len < sv_transport::poolhdr::HEADER_LEN {
@@ -605,6 +630,25 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     let file = Arc::new(file);
 
+    if let Some(name) = arg("--bell-device") {
+        if arg("--bell").is_some() { return Err("choose --bell or --bell-device".into()); }
+        let hub = arg("--bell-hub").ok_or("--bell-device needs --bell-hub")?;
+        let port = std::fs::File::from(device_owner.as_mut().unwrap().device(&name)?);
+        let _ = std::fs::remove_file(&hub);
+        let listener = UnixListener::bind(&hub)?;
+        let hub_state = sv_hostd::bellhub::run_port("broker-device",
+            sv_transport::vdoorbell::PortHandle::File(port), listener)?;
+        if let Some(services) = arg("--drm-services") {
+            let svc = sv_drm::relay::service_name(sv_drm::relay::BELL_PREFIX, &hub);
+            let me = unsafe { libc::geteuid() };
+            sv_drm::relay::keep_registered(services.into(), svc, false, move |f| {
+                if sv_drm::relay::peer_cred(&f.stream).is_ok_and(|c| c.uid == me) {
+                    let _ = hub_state.add_client(f.stream);
+                }
+            })?;
+        }
+        eprintln!("sv-hostd: broker-lent guest doorbell {name} served on {hub}");
+    }
     if let Some(bell) = arg("--bell") {
         let hub = arg("--bell-hub").ok_or("--bell needs --bell-hub")?;
         match UnixStream::connect(&bell) {
@@ -643,17 +687,21 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let spawn_icd = {
         let next_client = Arc::clone(&next_client);
         let (file, region, cold) = (Arc::clone(&file), region.clone(), cold.clone());
-        let (mailboxes, cold_bell) = (mailboxes.clone(), cold_bell.clone());
+        let (mailboxes, cold_bell, mapped_bar) = (mailboxes.clone(), cold_bell.clone(), mapped_bar.clone());
         Arc::new(move |sock: UnixStream, via: &'static str| {
         let i = next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (file, region, cold) = (Arc::clone(&file), region.clone(), cold.clone());
-        let (mailboxes, cold_bell) = (mailboxes.clone(), cold_bell.clone());
+        let (mailboxes, cold_bell, mapped_bar) = (mailboxes.clone(), cold_bell.clone(), mapped_bar.clone());
         std::thread::spawn(move || {
             let t = std::time::Instant::now();
             let mut by_fd = false;
             let result = (|| -> Result<String, String> {
                 match recv(&sock).map_err(|e| format!("no attach request: {e}"))? {
-                    ColdMessage::AttachRequest => {}
+                    ColdMessage::AttachRequest => {
+                        if mapped_bar.is_some() {
+                            return Err("a broker-lent BAR requires descriptor attachment".into());
+                        }
+                    }
                     ColdMessage::AttachRequestFds => by_fd = true,
                     other => return Err(format!("expected AttachRequest, got {other:?}")),
                 }
@@ -680,8 +728,12 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             return false;
                         };
                         let mut m = [0u8; 8];
-                        file.read_exact_at(&mut m, control_offset + sv_transport::control::OFF_MAGIC).is_ok()
-                            && u64::from_le_bytes(m) == sv_transport::control::MAGIC
+                        let read = if let Some(pool) = &mapped_bar {
+                            pool.read_bytes(control_offset + sv_transport::control::OFF_MAGIC, &mut m).is_ok()
+                        } else {
+                            file.read_exact_at(&mut m, control_offset + sv_transport::control::OFF_MAGIC).is_ok()
+                        };
+                        read && u64::from_le_bytes(m) == sv_transport::control::MAGIC
                     };
                     let a = poolcold::host_attach(
                         mb,
@@ -690,7 +742,22 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         &poke,
                         claim_nonce(),
                         poolcold::HostTiming::default(),
-                        |h| sv_hostd::ivshmem::check_slot(&file, &region, region_len, &h.extent, h.generation),
+                        |h| {
+                            if let Some(pool) = &mapped_bar {
+                                sv_transport::poolattach::check(pool, h,
+                                    sv_transport::control::ProtocolIds::new(sv_proto::GPU_WIRE_VERSION, sv_proto::PROTOCOL_HASH))?;
+                                let sv_transport::cold::Locator::IvshmemPool { control_offset, .. } = h.extent.locator else {
+                                    return Err("the BAR offer is not pooled".into());
+                                };
+                                Ok(sv_transport::cold::Attachment {
+                                    object: region.clone(), arena_object: region.clone(), control_offset,
+                                    control_len: h.geometry.control_size, arena_offset: 0, arena_len: region_len,
+                                    generation: h.generation, run_count: 0,
+                                })
+                            } else {
+                                sv_hostd::ivshmem::check_slot(&file, &region, region_len, &h.extent, h.generation)
+                            }
+                        },
                         control_ready,
                     )?;
                     timing = format!(
@@ -705,7 +772,8 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // No names for a client that cannot open them: the
                     // objects it would have opened, opened here as the same
                     // user, travel with the message.
-                    let ctl = sv_transport::region::open_named(&at.object).map_err(|e| format!("{}: {e}", at.object))?;
+                    let ctl = if mapped_bar.is_some() { file.try_clone().map_err(|e| e.to_string())? }
+                        else { sv_transport::region::open_named(&at.object).map_err(|e| format!("{}: {e}", at.object))? };
                     let arena = if at.arena_object.is_empty() || at.arena_object == at.object {
                         None
                     } else {
@@ -731,7 +799,8 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     // ICD holds the connection.
                     sock.set_read_timeout(None).ok();
                     let (sock, region) = (sock.try_clone().map_err(|e| e.to_string())?, region.clone());
-                    std::thread::spawn(move || serve_regions(&sock, &region, i));
+                    let bar = mapped_bar.as_ref().map(|_| (Arc::clone(&file), region_len));
+                    std::thread::spawn(move || serve_regions(&sock, &region, i, bar));
                 }
                 // What was checked: a slot's every page, or a pooled session's
                 // control region only (its arena is the whole device, §97).
@@ -847,7 +916,8 @@ fn ivshmem_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// ICD would open as `poolhdr::region_path(region, k)`, opened here as the
 /// same user. Ends when the ICD closes the connection.
 #[cfg(target_os = "linux")]
-fn serve_regions(sock: &std::os::unix::net::UnixStream, region: &str, i: u64) {
+fn serve_regions(sock: &std::os::unix::net::UnixStream, region: &str, i: u64,
+    bar: Option<(std::sync::Arc<std::fs::File>, u64)>) {
     use std::os::fd::AsFd;
     use sv_transport::cold::{ColdMessage, recv, send};
     let mut given = 0u32;
@@ -860,7 +930,10 @@ fn serve_regions(sock: &std::os::unix::net::UnixStream, region: &str, i: u64) {
             }
             Err(_) => break,
         };
-        let opened = if k as usize >= sv_arena::pool::MAX_REGIONS {
+        let opened = if let Some((file, len)) = &bar {
+            if k != 0 { Err("the broker BAR exposes region 0 only; no dynamic regions are published".into()) }
+            else { file.try_clone().map(|f| (*len, f)).map_err(|e| e.to_string()) }
+        } else if k as usize >= sv_arena::pool::MAX_REGIONS {
             Err(format!("region {k} is past the pool's {} regions", sv_arena::pool::MAX_REGIONS))
         } else {
             let p = sv_transport::poolhdr::region_path(region, k);
