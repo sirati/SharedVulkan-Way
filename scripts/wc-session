@@ -911,6 +911,7 @@ sound_ring_args() {
 # Windows application does too.
 stock_gpu_prerequisite_check() {
   local NATIVE=0 STRICT=0 GTK_LIB="" EXPECT_GTK="" line
+  case "${DEF_EXEC##*/}" in firefox|firefox-bin|firefox-esr|.firefox-wrapped) ;; *) return 0 ;; esac
   if [ -n "$PROFILE" ] && [ "$DEF_GPU" = on ] && [ -f "$BASE/gpu.env" ]; then
     [ -n "$GPU_ON" ] && [ ${#NSWRAP[@]} -gt 0 ] \
       || die "GPU Firefox requires its session GPU and sv-drm render-node namespace"

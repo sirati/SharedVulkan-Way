@@ -710,10 +710,46 @@ install_staged() {
   fi
 }
 
+# Resolve the selected guest app ids through their real host-app definitions.
+# GPU sessions can also serve Minecraft or native apps, which need no GTK/VA.
+deployment_uses_gpu_firefox() {
+  local app hostapp definition exec gpu line
+  for app in ${WC_LAUNCH_INSTALL_APPS:-firefox}; do
+    hostapp=$app
+    if [ -n "${WC_LAUNCH_EXTRA_APP_BLOCKS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APP_BLOCKS" ]; then
+      definition=$(awk -v wanted="app.$app" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*host-app[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/,""); sub(/[[:space:]]*$/ ,""); print; exit }
+      ' "$WC_LAUNCH_EXTRA_APP_BLOCKS")
+      [ -z "$definition" ] || hostapp=$definition
+    fi
+    exec=""; gpu=on
+    if [ "$hostapp" = firefox ]; then
+      exec=$FIREFOX
+    elif [ -n "${WC_LAUNCH_EXTRA_APPS:-}" ] && [ -f "$WC_LAUNCH_EXTRA_APPS" ]; then
+      definition=$(awk -v wanted="$hostapp" '
+        /^[[:space:]]*\[/ { s=$0; sub(/^[[:space:]]*\[/,"",s); sub(/\].*$/,"",s) }
+        s==wanted && /^[[:space:]]*(exec|gpu)[[:space:]]*=/ { print }
+      ' "$WC_LAUNCH_EXTRA_APPS")
+      while IFS= read -r line; do
+        case "$line" in
+          *exec*=*) exec=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+          *gpu*=*) gpu=$(sed 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//' <<<"$line") ;;
+        esac
+      done <<<"$definition"
+    fi
+    if [ "$gpu" = on ]; then
+      case "${exec##*/}" in firefox|firefox-bin|firefox-esr|.firefox-wrapped) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+
 # GPU Firefox is stock only with the native allocation library and DRM node.
 # Fail before ending an existing session or changing either installation.
 gpu_prerequisite_check() {
   [ "$GPU_SESSIONS" -gt 0 ] || return 0
+  deployment_uses_gpu_firefox || return 0
   [ "$GPU_ENV_MODE" = write ] || { echo "error: GPU deployment requires WC_LAUNCH_GPU_ENV=write"; return 1; }
   [[ "$GPU_GTK" =~ ^/nix/store/[A-Za-z0-9.+_-]+$ ]] \
     || { echo "error: GPU deployment requires the matched WC_LAUNCH_GPU_GTK store output"; return 1; }
