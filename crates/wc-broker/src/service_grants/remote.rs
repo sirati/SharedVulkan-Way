@@ -471,6 +471,10 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .extent;
         let guard = record.guard.clone();
         let target = record.processes[&recipient.process].process.clone();
+        self.records
+            .get_mut(&recipient.grant.id)
+            .unwrap()
+            .untracked_native = true;
         match backend.project(guard, extent, target, ProjectionAccess::ReadOnly) {
             Ok(projection) => Ok(projection),
             Err(e) => {
@@ -481,5 +485,47 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 Err(e)
             }
         }
+    }
+    pub fn project_remote_consumer_tracked<P: native::TrackedProjectionBackend<B>>(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        recipient: &RegisteredProcess,
+        consumer: &RemoteConsumerId,
+        backend: &mut P,
+    ) -> io::Result<P::Projection> {
+        self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
+        Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
+        let record = self.records.get(&recipient.grant.id).unwrap();
+        let hold = record
+            .remote
+            .consumers
+            .get(&consumer.consumer)
+            .ok_or_else(|| denied("unknown remote consumer hold"))?;
+        if hold.allocation != consumer.allocation.allocation || hold.process != recipient.process {
+            return Err(denied(
+                "projection not accepted by exact native remote consumer",
+            ));
+        }
+        let extent = record
+            .remote
+            .allocations
+            .get(&hold.allocation)
+            .ok_or_else(|| denied("remote allocation mirror missing"))?
+            .extent;
+        self.tracked_extent(
+            lifecycle,
+            &recipient.grant,
+            native::Request {
+                allocation: consumer.allocation.allocation,
+                reference: native::ProjectionReference::RemoteConsumer {
+                    registration: recipient.process.registration(),
+                    consumer: consumer.consumer,
+                },
+                extent,
+                target: recipient.process,
+                access: ProjectionAccess::ReadOnly,
+            },
+            backend,
+        )
     }
 }

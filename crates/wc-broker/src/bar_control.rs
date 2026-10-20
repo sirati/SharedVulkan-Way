@@ -35,6 +35,9 @@ pub struct Extent {
 pub struct Transfer(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Consumer(u64);
+impl Consumer {
+    pub(crate) fn reference(self) -> u64 { self.0 }
+}
 
 struct Allocation {
     user: User,
