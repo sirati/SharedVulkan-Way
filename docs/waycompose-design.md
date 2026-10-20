@@ -37738,6 +37738,15 @@ generation with `services.waycompose`. For each installation it does this:
   with the current trusted key. Shared services and user mapping stay in place.
   Both confirmation and rollback require idle admin and mapped-user sessions.
 
+Migration replaces the running raw-resource ACLs completely and makes their
+owner/group root, with only the named service account allowed. It clears
+inherited default ACLs on the directory and removes base group grants, so
+processes retaining an old `wc-arena` supplementary group cannot reopen the
+BARs. A bounded real-UID fixture verified both fresh opens fail for an already
+running UID1000/GID982 process, while both retained shared mappings remain
+writable and the designated service UID can still open the files. It used
+isolated temporary files, not family BARs.
+
 A bounded native fixture now proves the service and signer at uid 1000 map
 an authenticated boot record to a real agent and application at uid 1001.
 The named stock `wayland-info` application reads the live registry through
