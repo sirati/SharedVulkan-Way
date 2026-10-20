@@ -19,7 +19,9 @@ publication. Fork transfers a bounded pointer-free snapshot over the existing
 IPC stream. Single-thread exec retains the existing thread state. Exec with other live
 threads fails with EOPNOTSUPP before changing memory or descriptors; the runtime
 does not implement sibling retirement or CLONE_VM address-space unsharing. CLONE_VM groups have
-separate thread-group identities. Security termination interrupts vCPUs and host
+separate thread-group identities. CLONE_VM without CLONE_THREAD requires
+CLONE_SIGHAND, since the runtime has one signal-disposition table per VM.
+Unsupported separate-disposition clones fail with EOPNOTSUPP. Security termination interrupts vCPUs and host
 waits and marks pending same-group clone children before they can run. Killing
 the main guest thread keeps the host VM alive until remaining workers exit.
 
