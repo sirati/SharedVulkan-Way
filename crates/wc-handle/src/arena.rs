@@ -202,6 +202,9 @@ pub fn attach_host_bar_leases(id: u32, file: &std::fs::File, expected_run: u64, 
     // Peer pixels remain read-only; only metadata and local output are writable.
     let directory = unsafe { crate::bar_lease::Directory::attach(metadata.ptr().cast_mut(), read.ptr(), write.ptr().cast_mut(),
         crate::bar_lease::Role::Host, len, start, expected_run, owners) }?;
+    let (stream_start, _) = directory.stream_partition();
+    // SAFETY: the complete stream tail lies inside the retained Host RW view.
+    unsafe { directory.enable_streams(write.ptr().cast_mut().add(stream_start - start))?; }
     let mut after = [0u8; ENCODED_LEN]; file.read_exact_at(&mut after, 0)?;
     if after != bytes { return Err(io::Error::other("BAR header changed while attaching leases")); }
     crate::bar_lease::register(id, directory)?;

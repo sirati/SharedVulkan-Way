@@ -228,3 +228,24 @@ keymap-selection fix `adfefe2c`, and the own acceptance fixture is committed
 with this document. The separate upstream application sources remain unchanged.
 The clone stopped normally and the native local 30-frame baseline passed.
 This proves cooperative normal completion, not protected broker retirement.
+
+The cooperative stream API uses header format 4 and control wire version 3.
+It reserves the upper half of the Host tail for shared writable stream control
+and bytes, separate from both pixel partitions. `Directory::enable_streams`
+requires an explicit retained writable view of that exact range. It does not
+grant access to peer pixels. Older format-3 clients must refuse this layout.
+
+`Handle::create_bar_pipe` returns paired read and write capabilities. Typed
+`BarStream` descriptors carry the same arena, slot and generation identity as
+allocation leases, plus their direction. Pending endpoint references are
+reserved before serialization and converted to independent received endpoint
+references. Clones share a local endpoint. Forwarded aliases serialize access
+through shared gates and a shared packet cursor, preserving unread bytes and
+credits in the original ring. Stream controls join the existing doorbell set.
+
+EOF follows the actual last writer closing and the ring draining. EPIPE follows
+the actual last reader closing. Those states never authorize privileged broker
+retirement. Crashed endpoint holds remain retained. Four focused Rust tests
+cover real Handle descriptor transfer, pending references, alias short reads,
+backpressure, EOF, EPIPE and normal allocation recycling. This API stage has
+no real Windows clipboard acceptance yet.

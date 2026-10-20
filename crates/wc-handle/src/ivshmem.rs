@@ -44,7 +44,7 @@ pub const MAGIC: [u8; 8] = *b"WCIVSHM1";
 /// region at the tail; a version-1 header reads as one with no rings.
 pub const VERSION: u32 = 2;
 /// Allocation-directory layout. Older version-2 readers must refuse it.
-pub const LEASE_VERSION: u32 = 3;
+pub const LEASE_VERSION: u32 = 4;
 /// How many bytes at the front of the region the header owns. One 4 KiB page,
 /// because the arena behind it is allocated in pages and must start on one.
 pub const HEADER_BYTES: u64 = 4096;
@@ -340,7 +340,7 @@ mod tests {
         assert!(Header::decode_for_leases(&legacy).is_err());
         let leased = h().encode_leases();
         let version = u32::from_le_bytes(leased[8..12].try_into().unwrap());
-        assert_eq!(version, 3);
+        assert_eq!(version, LEASE_VERSION);
         assert!(version != 1 && version != VERSION, "legacy reader must refuse lease bytes");
         assert_eq!(Header::decode_for_leases(&leased).unwrap(), h());
         assert!(Header::decode_for_leases(&leased[..64]).is_err());
@@ -367,8 +367,8 @@ mod tests {
         b[0] = 0;
         assert!(Header::decode(&b).unwrap_err().to_string().contains("no header"));
         let mut b = h().encode();
-        b[8] = 4;
-        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 4"));
+        b[8] = 5;
+        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 5"));
         let mut z = h();
         z.run_id = 0;
         assert!(Header::decode(&z.encode()).is_err());

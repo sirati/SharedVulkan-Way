@@ -120,6 +120,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod arena;
 pub mod bar_lease;
+pub mod bar_stream;
 pub mod section_provider;
 /// §107: the shared BAR cut into per-session regions.
 pub mod barpool;
@@ -192,6 +193,8 @@ pub const MAX_DESCRIPTOR_LEN: usize = 1024;
 pub enum Descriptor {
     /// A generation-checked allocation in the original authenticated BAR.
     BarLease { arena: u32, slot: u32, generation: u64 },
+    /// One direction of a generation-checked original-BAR byte stream.
+    BarStream { arena: u32, slot: u32, generation: u64, writer: bool },
     /// A shared memory object: `wl_shm.create_pool`, `wl_keyboard.keymap`, an
     /// ICC profile, a gamma ramp.
     ///
@@ -287,6 +290,7 @@ pub enum Descriptor {
 }
 
 const KIND_BAR_LEASE: u32 = 6;
+const KIND_BAR_STREAM: u32 = 7;
 const KIND_SECTION: u32 = 1;
 const KIND_PIPE: u32 = 2;
 const KIND_NT_HANDLE: u32 = 3;
@@ -354,6 +358,13 @@ impl Descriptor {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32);
         match self {
+            Self::BarStream { arena, slot, generation, writer } => {
+                out.extend_from_slice(&KIND_BAR_STREAM.to_le_bytes());
+                out.extend_from_slice(&arena.to_le_bytes());
+                out.extend_from_slice(&slot.to_le_bytes());
+                out.extend_from_slice(&u32::from(*writer).to_le_bytes());
+                out.extend_from_slice(&generation.to_le_bytes());
+            }
             Self::BarLease { arena, slot, generation } => {
                 out.extend_from_slice(&KIND_BAR_LEASE.to_le_bytes());
                 out.extend_from_slice(&arena.to_le_bytes());
@@ -398,6 +409,14 @@ impl Descriptor {
         }
         let mut r = Reader(bytes);
         let out = match r.u32()? {
+            KIND_BAR_STREAM => {
+                let arena = r.u32()?;
+                let slot = r.u32()?;
+                let writer = match r.u32()? { 0 => false, 1 => true,
+                    _ => return Err(DecodeError("invalid BAR stream direction")) };
+                let generation = r.u64()?;
+                Self::BarStream { arena, slot, generation, writer }
+            }
             KIND_BAR_LEASE => {
                 let arena = r.u32()?;
                 let slot = r.u32()?;
@@ -469,6 +488,7 @@ pub struct Handle {
 enum Owned {
     BarOwner(bar_lease::Owner),
     BarConsumer(bar_lease::Consumer),
+    BarStream(bar_stream::Stream),
     Object(platform::OwnedObject),
     /// A FIFO this process created for a peer to open. §81.
     ///
@@ -514,7 +534,10 @@ impl Handle {
 
     /// Receive one wire transfer, acquiring its exact remote consumer lease.
     pub fn receive_descriptor(descriptor: Descriptor) -> io::Result<Self> {
-        if let Descriptor::BarLease { arena, slot, generation } = descriptor {
+        if let Descriptor::BarStream { arena, slot, generation, writer } = descriptor {
+            let stream = bar_stream::Stream::receive(bar_lease::registered(arena)?, bar_lease::Key { slot, generation }, writer)?;
+            Ok(Self { descriptor, keepalive: Some(Arc::new(Owned::BarStream(stream))) })
+        } else if let Descriptor::BarLease { arena, slot, generation } = descriptor {
             let consumer = bar_lease::registered(arena)?.accept(bar_lease::Key { slot, generation })?;
             Ok(Self { descriptor, keepalive: Some(Arc::new(Owned::BarConsumer(consumer))) })
         } else { Ok(Self::from_descriptor(descriptor)) }
@@ -522,6 +545,7 @@ impl Handle {
 
     /// Allocate address-stable capacity through the selected original BAR.
     pub fn create_bar(arena: u32, role: bar_lease::Role, size: usize, capacity: usize) -> io::Result<Self> {
+        if role == bar_lease::Role::Stream { return Err(io::Error::other("use create_bar_pipe for stream allocations")); }
         let owner = bar_lease::registered(arena)?.allocate(role, size, capacity)?;
         let key = owner.key();
         Ok(Self { descriptor: Descriptor::BarLease { arena, slot: key.slot, generation: key.generation },
@@ -531,15 +555,37 @@ impl Handle {
     pub fn create_bar_outbound(arena: u32, size: usize) -> io::Result<Self> {
         Self::create_bar(arena, bar_lease::Role::Host, size, size)
     }
+    /// Create local read/write endpoints backed by the original BAR.
+    pub fn create_bar_pipe(arena: u32) -> io::Result<(Self, Self)> {
+        let (reader, writer) = bar_stream::Stream::pair(bar_lease::registered(arena)?)?;
+        let wrap = |stream: bar_stream::Stream| {
+            let key = stream.key();
+            Self { descriptor: Descriptor::BarStream { arena, slot: key.slot, generation: key.generation, writer: stream.writer() },
+                keepalive: Some(Arc::new(Owned::BarStream(stream))) }
+        };
+        Ok((wrap(reader), wrap(writer)))
+    }
+    /// Acquire this local stream capability without reopening a path/device.
+    pub fn open_bar_stream(&self) -> io::Result<bar_stream::Stream> {
+        match self.keepalive.as_deref() {
+            Some(Owned::BarStream(stream)) => Ok(stream.clone()),
+            _ => Err(io::Error::other("handle has no live BAR stream capability")),
+        }
+    }
     /// Reserve a reference before serializing a descriptor into a wire frame.
     pub fn prepare_transfer(&self) -> io::Result<PreparedTransfer> {
+        let stream = match (&self.descriptor, self.keepalive.as_deref()) {
+            (Descriptor::BarStream { .. }, Some(Owned::BarStream(stream))) => Some(stream.prepare()?),
+            (Descriptor::BarStream { .. }, _) => return Err(io::Error::other("BAR stream has no live transfer capability")),
+            _ => None,
+        };
         let transfer = match (&self.descriptor, self.keepalive.as_deref()) {
             (Descriptor::BarLease { .. }, Some(Owned::BarOwner(owner))) => Some(owner.publish()?),
             (Descriptor::BarLease { .. }, Some(Owned::BarConsumer(consumer))) => Some(consumer.publish()?),
             (Descriptor::BarLease { .. }, _) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "BAR descriptor has no live transfer capability")),
             _ => None,
         };
-        Ok(PreparedTransfer { bytes: self.descriptor.encode(), transfer })
+        Ok(PreparedTransfer { bytes: self.descriptor.encode(), transfer, stream })
     }
     /// Register a producer with the authenticated broker before exposing it.
     pub fn register_bar_producer(&self, producer_id: u64) -> io::Result<(bar_lease::Key, usize, usize)> {
@@ -940,7 +986,7 @@ impl Handle {
             Owned::BarConsumer(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "a BAR consumer has no pixel write capability")),
             // §81: a stream has no offsets. Writing "at" one is a category error
             // rather than a bounds failure, and the caller wants `pipe_end()`.
-            Owned::Pipe(_) => Err(io::Error::new(
+            Owned::Pipe(_) | Owned::BarStream(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "this handle is a stream, not a mapping: write to `pipe_end()` instead",
             )),
@@ -978,9 +1024,8 @@ enum WritableMapping {
 }
 impl Drop for WritableMapping {
     fn drop(&mut self) {
-        if let Self::Bar { _lease, .. } = self {
-            if let Owned::BarOwner(owner) = _lease.as_ref() { owner.release_mapping(); }
-        }
+        if let Self::Bar { _lease, .. } = self
+            && let Owned::BarOwner(owner) = _lease.as_ref() { owner.release_mapping(); }
     }
 }
 impl WritableMapping {
@@ -990,10 +1035,11 @@ impl WritableMapping {
 /// Prepared descriptor plus its pending remote reference. Drop rolls back only
 /// before any bytes have been emitted. Commit after a successful full frame,
 /// or conservatively after a partial write that cannot be disproven remotely.
-pub struct PreparedTransfer { bytes: Vec<u8>, transfer: Option<bar_lease::Transfer> }
+pub struct PreparedTransfer { bytes: Vec<u8>, transfer: Option<bar_lease::Transfer>, stream: Option<bar_stream::Transfer> }
 impl PreparedTransfer {
     pub fn bytes(&self) -> &[u8] { &self.bytes }
-    pub fn commit(mut self) { if let Some(transfer) = self.transfer.take() { transfer.commit(); } }
+    pub fn commit(mut self) { if let Some(transfer) = self.transfer.take() { transfer.commit(); }
+        if let Some(stream) = self.stream.take() { stream.commit(); } }
 }
 
 pub struct MappingMut {

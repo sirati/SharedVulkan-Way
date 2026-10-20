@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 // A BAR connection cannot turn a guest-supplied pathname into a host open.
 fn descriptor_allowed(encoding: FdEncoding, descriptor: &wc_handle::Descriptor) -> bool {
     match encoding {
-        FdEncoding::InBandLease(expected) => matches!(descriptor, wc_handle::Descriptor::BarLease { arena, generation, .. } if *arena == expected && *generation != 0),
+        FdEncoding::InBandLease(expected) => matches!(descriptor, wc_handle::Descriptor::BarLease { arena, generation, .. } | wc_handle::Descriptor::BarStream { arena, generation, .. } if *arena == expected && *generation != 0),
         FdEncoding::InBandArena(expected) => matches!(descriptor,
             wc_handle::Descriptor::ArenaSlice { arena, len, .. } if *arena == expected && *len > 0),
         _ => true,

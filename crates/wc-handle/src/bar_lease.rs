@@ -6,10 +6,10 @@
 //! consumer lease. A slot is reusable only after all three counts reach zero.
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Lease control dialect, distinct from legacy descriptor-free registry wire 1.
-pub const CONTROL_WIRE_VERSION: u32 = 2;
+pub const CONTROL_WIRE_VERSION: u32 = 3;
 pub const SLOTS: usize = 1024;
 pub const DIRECTORY_BYTES: usize = 128 * 1024;
 const MAGIC: u64 = 0x31455341454c4357;
@@ -30,6 +30,8 @@ const EXPOSED: usize = 9;
 pub enum Role {
     Guest = 1,
     Host = 2,
+    /// Cooperative stream rings, writable by both endpoints, never pixels.
+    Stream = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,7 @@ struct Inner {
     metadata: usize,
     data: usize,
     writable: usize,
+    stream_writable: AtomicUsize,
     local_role: Role,
     len: usize,
     run: u64,
@@ -70,6 +73,7 @@ impl Directory {
     /// only the complete local_role partition, starting at DIRECTORY_BYTES for
     /// Guest or host_start for Host. The peer pixel window can remain read-only.
     /// No peer may access the directory until initialization finishes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn initialize(
         metadata: *mut u8,
         data: *const u8,
@@ -80,10 +84,11 @@ impl Directory {
         run: u64,
         mapping: Arc<dyn Send + Sync>,
     ) -> io::Result<Self> {
-        if metadata as usize % 8 != 0
+        if !(metadata as usize).is_multiple_of(8)
             || run == 0
             || host_start < DIRECTORY_BYTES
             || host_start >= len
+            || local_role == Role::Stream
         {
             return Err(bad("invalid BAR allocation directory geometry"));
         }
@@ -96,6 +101,7 @@ impl Directory {
                 metadata: metadata as usize,
                 data: data as usize,
                 writable: writable as usize,
+                stream_writable: AtomicUsize::new(0),
                 local_role,
                 len,
                 run,
@@ -115,6 +121,7 @@ impl Directory {
     /// # Safety
     /// The same pointer/lifetime requirements as initialize apply. The metadata
     /// must have been initialized by that function, not ordinary file bytes.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn attach(
         metadata: *mut u8,
         data: *const u8,
@@ -125,10 +132,11 @@ impl Directory {
         run: u64,
         mapping: Arc<dyn Send + Sync>,
     ) -> io::Result<Self> {
-        if metadata as usize % 8 != 0
+        if !(metadata as usize).is_multiple_of(8)
             || run == 0
             || host_start < DIRECTORY_BYTES
             || host_start >= len
+            || local_role == Role::Stream
         {
             return Err(bad("invalid BAR allocation directory geometry"));
         }
@@ -137,6 +145,7 @@ impl Directory {
                 metadata: metadata as usize,
                 data: data as usize,
                 writable: writable as usize,
+                stream_writable: AtomicUsize::new(0),
                 local_role,
                 len,
                 run,
@@ -200,7 +209,8 @@ impl Directory {
         let role = self.slot(slot, ROLE).load(Ordering::Relaxed);
         let (start, limit) = match role {
             1 => (DIRECTORY_BYTES, self.inner.host_start),
-            2 => (self.inner.host_start, self.inner.len),
+            2 => (self.inner.host_start, self.stream_start()),
+            3 => (self.stream_start(), self.inner.len),
             _ => return Err(bad("invalid BAR allocation owner partition")),
         };
         if length == 0
@@ -220,10 +230,36 @@ impl Directory {
             self.slot(slot, CAPACITY).store(0, Ordering::Relaxed);
         }
     }
+    /// Exact stream subpartition, separate from both pixel partitions.
+    pub fn stream_partition(&self) -> (usize, usize) {
+        (self.stream_start(), self.inner.len - self.stream_start())
+    }
+    /// Enable cooperative streams only with an explicitly retained RW view.
+    ///
+    /// # Safety
+    /// `writable` must map the complete stream_partition() range of this exact
+    /// original BAR, coherent and writable by both peers, and remain live via
+    /// the mapping owner supplied at attach. This grants no pixel write access.
+    pub unsafe fn enable_streams(&self, writable: *mut u8) -> io::Result<()> {
+        if writable.is_null() || !(writable as usize).is_multiple_of(4096) {
+            return Err(bad("invalid BAR stream writable mapping"));
+        }
+        self.inner
+            .stream_writable
+            .compare_exchange(0, writable as usize, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| bad("BAR stream mapping already enabled"))?;
+        Ok(())
+    }
     /// Reserve address-stable capacity. Only logical length is initialized.
     /// Capacity never moves or grows beyond the original fixed BAR.
     pub fn allocate(&self, role: Role, length: usize, capacity: usize) -> io::Result<Owner> {
-        if role != self.inner.local_role {
+        if role == Role::Stream && self.inner.stream_writable.load(Ordering::Acquire) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "BAR stream writable mapping is not enabled",
+            ));
+        }
+        if role != self.inner.local_role && role != Role::Stream {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "BAR allocation belongs to the other peer partition",
@@ -242,7 +278,8 @@ impl Directory {
             .ok_or_else(|| io::Error::other("BAR allocation directory is full"))?;
         let (start, limit) = match role {
             Role::Guest => (DIRECTORY_BYTES, self.inner.host_start),
-            Role::Host => (self.inner.host_start, self.inner.len),
+            Role::Host => (self.inner.host_start, self.stream_start()),
+            Role::Stream => (self.stream_start(), self.inner.len),
         };
         let mut extents: Vec<_> = (0..SLOTS)
             .filter_map(|slot| {
@@ -319,10 +356,34 @@ impl Directory {
             key,
         })
     }
+    /// Upper half of the already shared-writable host tail is reserved for
+    /// stream control and bytes. Pixel allocators cannot consume this range.
+    fn stream_start(&self) -> usize {
+        (self.inner.host_start + (self.inner.len - self.inner.host_start) / 2) & !65535
+    }
+    pub(crate) fn stream_pointer(&self, key: Key) -> io::Result<*mut u8> {
+        if self.inner.stream_writable.load(Ordering::Acquire) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "BAR stream writable mapping is not enabled",
+            ));
+        }
+        let _guard = self.lock()?;
+        let slot = self.checked(key)?;
+        if self.slot(slot, ROLE).load(Ordering::Relaxed) != Role::Stream as u64 {
+            return Err(bad("BAR stream descriptor names a pixel allocation"));
+        }
+        Ok(self.owner_pointer(self.slot(slot, OFFSET).load(Ordering::Relaxed) as usize))
+    }
     fn owner_pointer(&self, offset: usize) -> *mut u8 {
+        if offset >= self.stream_start() {
+            return (self.inner.stream_writable.load(Ordering::Acquire) as *mut u8)
+                .wrapping_add(offset - self.stream_start());
+        }
         let start = match self.inner.local_role {
             Role::Guest => DIRECTORY_BYTES,
             Role::Host => self.inner.host_start,
+            Role::Stream => unreachable!("a directory attaches as Guest or Host"),
         };
         (self.inner.writable as *mut u8).wrapping_add(offset - start)
     }
@@ -506,11 +567,11 @@ impl Owner {
 }
 impl Drop for Owner {
     fn drop(&mut self) {
-        if let Ok(_guard) = self.directory.lock() {
-            if let Ok(slot) = self.directory.checked(self.key) {
-                self.directory.slot(slot, OWNER).store(0, Ordering::Relaxed);
-                self.directory.reclaim(slot);
-            }
+        if let Ok(_guard) = self.directory.lock()
+            && let Ok(slot) = self.directory.checked(self.key)
+        {
+            self.directory.slot(slot, OWNER).store(0, Ordering::Relaxed);
+            self.directory.reclaim(slot);
         }
     }
 }
@@ -535,14 +596,14 @@ impl Drop for Transfer {
         if self.committed {
             return;
         }
-        if let Ok(_guard) = self.directory.lock() {
-            if let Ok(slot) = self.directory.checked(self.key) {
-                let count = self.directory.slot(slot, PENDING).load(Ordering::Relaxed);
-                self.directory
-                    .slot(slot, PENDING)
-                    .store(count.saturating_sub(1), Ordering::Relaxed);
-                self.directory.reclaim(slot);
-            }
+        if let Ok(_guard) = self.directory.lock()
+            && let Ok(slot) = self.directory.checked(self.key)
+        {
+            let count = self.directory.slot(slot, PENDING).load(Ordering::Relaxed);
+            self.directory
+                .slot(slot, PENDING)
+                .store(count.saturating_sub(1), Ordering::Relaxed);
+            self.directory.reclaim(slot);
         }
     }
 }
@@ -564,14 +625,14 @@ impl Consumer {
 }
 impl Drop for Consumer {
     fn drop(&mut self) {
-        if let Ok(_guard) = self.directory.lock() {
-            if let Ok(slot) = self.directory.checked(self.key) {
-                let count = self.directory.slot(slot, CONSUMERS).load(Ordering::Relaxed);
-                self.directory
-                    .slot(slot, CONSUMERS)
-                    .store(count.saturating_sub(1), Ordering::Relaxed);
-                self.directory.reclaim(slot);
-            }
+        if let Ok(_guard) = self.directory.lock()
+            && let Ok(slot) = self.directory.checked(self.key)
+        {
+            let count = self.directory.slot(slot, CONSUMERS).load(Ordering::Relaxed);
+            self.directory
+                .slot(slot, CONSUMERS)
+                .store(count.saturating_sub(1), Ordering::Relaxed);
+            self.directory.reclaim(slot);
         }
     }
 }
