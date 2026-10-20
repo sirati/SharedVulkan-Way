@@ -37069,7 +37069,8 @@ the DMA buffer we implemented." And then, for every application: "the test for
 a correct implementation is that we can run applications natively without
 having to do any weird shit, like having to switch off a sandbox." So the
 applications are stock, with their default settings and their own sandboxes;
-what we ship below them (sv-icd, sv-drm, our Mesa) may be patched.
+sv-icd and sv-drm provide the hardware interfaces. Firefox and Zink's Mesa
+run without waycompose patches, as required by the later stock-Mesa rule.
 
 ### 112.1 What changed, in one paragraph
 
@@ -37146,8 +37147,9 @@ already renders KWin's frames this way.
 VA-API frontend merged upstream on 2026-10-16. The build contains
 `zink_drv_video.so`. Its initial supported decode codec is H.264. H.265
 and AV1 are separate gates and are not established by an H.264 result.
-Applications remain unpatched. The existing kopper Wayland patch changes
-our Mesa library only.
+Applications and Zink's Mesa remain unpatched. The former kopper Wayland
+patch and its derivation have been removed. Native clients use the render
+node instead of that old software-device override.
 
 ### 112.5 Decoded frames and their planes
 
@@ -37187,7 +37189,9 @@ Intel direct-present path in §104.12.
 ### 112.8 Removed application modifications and regression harness
 
 The Firefox readback patch, its package and decode scripts, marker detection
-and sandbox override were removed. Historical readback measurements in
+and sandbox override were removed. The Mesa kopper Wayland patch and its
+patched derivation were also removed; the pinned Mesa-main build uses its
+upstream Zink VA frontend without waycompose patches. Historical readback measurements in
 `video-decode.md` describe the former implementation, not the supported path.
 `sv-firefox-stock.sh` now uses WebDriver to read page results and runs video
 in the foreground. It does not force the hardware decoder or enable Firefox's

@@ -300,6 +300,8 @@ if [ -n "$GECKODRIVER" ] && [ -n "$JQ" ]; then
   sid=$(sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p' "$RUN/wd-session.json")
   if [ -n "$sid" ]; then
     # Collect results through WebDriver without changing media or console prefs.
+    payload=$("$JQ" -nc --arg url "file://$RUN/webgl.html" '{url:$url}')
+    wd "/session/$sid/url" "$payload" >"$RUN/navigation-webgl.json"
     wd "/session/$sid/execute/sync" '{"args":[],"script":"return document.getElementById(\"s\").textContent"}' >"$RUN/webgl.json"
     "$JQ" -r '"svfs webgl " + .value' "$RUN/webgl.json" >>"$RUN/page.log"
     for c in $CODECS; do
