@@ -34571,20 +34571,45 @@ machines.
    the layout is checked as for any attach), follows the header's run id to
    a new compositor, and rings nothing while the file has no rings.
    `bellhub::tests::the_hub_wakes_a_lane_waiter_in_a_shared_file_with_no_client`.
-3. **Every wait for an answer yields while it spins, and only the side that
+3. **The hub lets the thread it woke run first** (shared, Linux host). The
+   kernel trace showed the proxy's control thread, once the hub woke it,
+   waiting a median 60 µs for a CPU: in 40 of 41 traced requests the
+   scheduler had put it on the hub's own CPU (the wake is "affine"), where
+   the hub went on to send the byte to every client. The hub now yields
+   once after ringing a lane that had a waiter parked on it, before the
+   fan-out; with nobody waiting, the yield returns at once.
+4. **Every wait for an answer yields while it spins, and only the side that
    must spin does** (shared). 105.13's spins were busy loops. On the guest a
-   busy spin held its vCPU against the very thread it was waiting for:
-   Windows does not move a woken thread to an idle core that is parked, so
-   the launcher spinning for its answer kept the compositor's request
-   thread off the vCPU for the length of the spin, and two busy spinners on
-   one vCPU lost it for a 15.6 ms tick. The compositor's wait for the host's
-   answer now yields (`SwitchToThread`) for up to 2 ms (it was a busy 1 ms;
-   a third of the 20 ms-gap requests used to outlast it and need a bell
-   back), and the proxy's 200 µs spin yields too. The launcher no longer
-   spins at all: on a loaded guest (a game at half a core) its yielding spin
-   and the compositor's shared a vCPU and lost it to the load for 10–25 ms,
-   where a thread blocked on the socket is woken with the wait's priority
-   boost. `WC_LAUNCH_SPIN_US` and `WC_CTL_SPIN_US` set them, to measure.
+   busy spin held its vCPU against the very thread it was waiting for (the
+   launcher spinning kept the compositor's request thread off the vCPU, and
+   two busy spinners on one vCPU lost it for a 15.6 ms tick). The
+   compositor's wait for the host's answer now yields (`SwitchToThread`) for
+   up to 2 ms (it was a busy 1 ms; a third of the 20 ms-gap requests used to
+   outlast it and need a bell back), and the proxy's 200 µs spin yields
+   too. The launcher no longer spins at all: on a loaded guest its yielding
+   spin and the compositor's shared a vCPU and lost it to the load for
+   10–25 ms. `WC_LAUNCH_SPIN_US` and `WC_CTL_SPIN_US` set them, to measure.
+5. **Tried and taken out: the request's threads above normal priority.** On
+   a guest loaded by a game, 7 requests in 2000 took 2–53 ms, all of it the
+   guest's scheduler (a readied thread waiting one or two 15.6 ms ticks for
+   the quantum of the thread running where it was queued). Raising the
+   launcher's and the compositor's request threads to
+   `THREAD_PRIORITY_HIGHEST` for the request, and yielding with `Sleep(0)`,
+   made it worse: a high-priority thread that spins starves the
+   normal-priority threads the request needs. Measured in one lease, 1000
+   requests 20 ms apart and 60 1 s apart per configuration:
+
+   | bell writer | request threads | 20 ms: mean / p50 / p99 / max | 1 s: mean / p99 |
+   |---|---|---|---|
+   | inline (this section) | HIGHEST | 255 / 160 / 567 µs / 35 ms | 322 / 834 µs |
+   | **inline (this section)** | **normal** | **180 / 158 / 353 µs / 8.8 ms** | **298 / 470 µs** |
+   | detached thread (before) | HIGHEST | 440 ms / 480 ms / 612 ms / 2.0 s | 56 ms / 501 ms |
+   | detached thread (before) | normal | 310 / 160 / 1387 µs / 47 ms | 481 / 868 µs |
+
+   With the detached writer the starved thread was the bell writer itself,
+   and the bell then went out with the next lease ping, half a second
+   later. The change is not kept; what the loaded guest's ticks cost is
+   left to the guest's own scheduling.
 
 **Which hops are whose.** For another platform (the real Mac, §103.17):
 
@@ -34598,6 +34623,8 @@ machines.
 | the waiting thread's wake | `park`, `wlbytes` | shared (a futex on Linux, a shared word on macOS) |
 | the answer back while the asker spins (no bell) | `session_svc`, `macsvc` | shared |
 | a yielding spin, never a busy one, on the side that expects the answer | `session_svc`, `macsvc` | shared |
+| the hub yielding to the thread it just woke (the wake is affine) | `bellhub` | Linux hosts; any host whose hub and proxy share few cores |
+| a guest freeze while the passed-through GPU leaves D3 (up to ~6 s, about once a minute) | the guest's GPU driver, vfio | this VM; samples within one are set apart below |
 
 **What is left on the path, and why it is not software here.** The kick
 reaches the host through QEMU's main loop: its main thread is woken by the
