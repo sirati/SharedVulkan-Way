@@ -140,7 +140,7 @@ hub_up() {
   if [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ]; then
     [ -S "$HUBDIR/sv.sock" ] || [ -S "$HUBDIR/wl.sock" ]; return
   fi
-  local sd="env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user"
+  local sd="env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user"
   $sd is-active --quiet wc-bell-hub.service || $sd start wc-bell-hub.service >/dev/null 2>&1 || return 1
   for _ in $(seq 1 40); do
     $sd is-active --quiet wc-bell-hub.service && [ -S "$HUBDIR/sv.sock" ] && [ -S "$HUBDIR/wl.sock" ] && return 0
@@ -155,7 +155,7 @@ hub_up() {
 wl_hub() {
   [ -S "$HUBDIR/wl.sock" ] || return 1
   [ "${WC_LAUNCH_HUB_UNMANAGED:-}" = 1 ] && return 0
-  env XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active --quiet wc-bell-hub.service
+  env XDG_RUNTIME_DIR=/run/user/$UID_ systemctl --user is-active --quiet wc-bell-hub.service
 }
 wcbell_use() { if wl_hub || hub_up; then echo "$HUBDIR/wl.sock"; else echo "$WCBELL"; fi; }
 QMP="${WC_LAUNCH_QMP:-/run/windows-vm/qmp.sock}"
@@ -849,12 +849,15 @@ sound_ring_args() {
     *) return 0 ;;
   esac
   printf -- '--sound-pactl %q --sound-server %q --sound-dir %q --sound-prefix %q' "$PACTL" "$SRV" "$D" "$PREFIX"
-  PWNODE=$(pw_node_bin 2>/dev/null)
   case "$KIND" in
     pipewire) PWSOCK="$D/pw/pipewire-0" ;;
     system|user-pipewire) PWSOCK="/run/user/$UID_/pipewire-0" ;;
     *) PWSOCK="" ;;
   esac
+  # §105.14: looked for only when there is a PipeWire to use it with; the
+  # look is a scan of the store, 25–35 ms of every session's start.
+  PWNODE=""
+  [ -n "$PWSOCK" ] && PWNODE=$(pw_node_bin 2>/dev/null)
   # The socket may not exist yet when the server starts beside the proxy;
   # the proxy asks the server what it is when the first device arrives.
   [ -n "$PWNODE" ] && [ -n "$PWSOCK" ] && { [ -n "$GIVEN" ] || [ -S "$PWSOCK" ]; } \
@@ -1434,8 +1437,8 @@ proxy)
   ID="${1:-}"; check_id "$ID"
   D=$(dir_of "$ID")
   # §105.14: where the verb's time goes, in ms since it started.
-  STAMP0=$(date +%s%N)
-  stamp() { [ -d "$D" ] && echo "$1 $(( ($(date +%s%N) - STAMP0) / 1000000 ))" >>"$D/proxy.timing"; }
+  STAMP0=${EPOCHREALTIME/./}
+  stamp() { [ -d "$D" ] && echo "$1 $(( (${EPOCHREALTIME/./} - STAMP0) / 1000 ))" >>"$D/proxy.timing"; }
   # IVSHMEM ARENA (§83): this user, a user unit, no $ROOTC. The socket is made
   # by this user, so there is nothing to chown. `--arena-run` is the run id `up`
   # checked, and the proxy refuses a header carrying any other. No
@@ -1472,40 +1475,51 @@ proxy)
     fi
     [ -x "$BIN/wc-proxy" ] || die "no $BIN/wc-proxy"
     UNIT="wc-launch-$ID"
-    RUN=$(cat "$D/arena.run")
+    RUN=$(<"$D/arena.run")
     {
       echo '#!/usr/bin/env bash'
       echo 'export PATH=/run/current-system/sw/bin:/run/wrappers/bin'
       # §105: this host's settings, for the wc-session the control ring runs
       # (as §103.14 does): the unit does not inherit this process's environment.
-      [ $SERVICE = 1 ] && env | grep '^WC_LAUNCH_' | grep -v '^WC_LAUNCH_SERVICE=' | while IFS= read -r kv; do printf 'export %q\n' "$kv"; done
+      # §105.14: built-ins only from here to the unit's start; every fork
+      # here was ~2 ms of each session's start.
+      if [ $SERVICE = 1 ]; then
+        for kv in "${!WC_LAUNCH_@}"; do
+          [ "$kv" = WC_LAUNCH_SERVICE ] || printf 'export %q\n' "$kv=${!kv}"
+        done
+      fi
       # §88. A `WC_FRAME_TRACE=` line in gpu.env traces the proxy as well:
       # the frame timeline has a proxy half, and gpu.env is where a measured
-      # run already says what the session's frame should record.
-      ft=$(grep -m1 '^WC_FRAME_TRACE=' "$BASE/gpu.env" 2>/dev/null)
-      [ -n "$ft" ] && printf 'export %q\n' "$ft"
-      # §89: and its clock, so the proxy's half of an input timeline is on
-      # the machine's monotonic counter like the compositor's.
-      ft=$(grep -m1 '^WC_FRAME_TRACE_CLOCK=' "$BASE/gpu.env" 2>/dev/null)
-      [ -n "$ft" ] && printf 'export %q\n' "$ft"
-      # §105.14: the control round trip's hops, on the same clock.
-      ft=$(grep -m1 '^WC_HOP_TRACE=' "$BASE/gpu.env" 2>/dev/null)
-      [ -n "$ft" ] && printf 'export %q\n' "$ft"
+      # run already says what the session's frame should record. §89: and
+      # its clock, so the proxy's half of an input timeline is on the
+      # machine's monotonic counter like the compositor's. §105.14: and the
+      # control round trip's hops, on the same clock. The first of each.
+      if [ -f "$BASE/gpu.env" ]; then
+        local_seen=" "
+        while IFS= read -r ft; do
+          case "$ft" in
+            WC_FRAME_TRACE=*|WC_FRAME_TRACE_CLOCK=*|WC_HOP_TRACE=*)
+              [[ "$local_seen" == *" ${ft%%=*} "* ]] && continue
+              local_seen="$local_seen${ft%%=*} "
+              printf 'export %q\n' "$ft" ;;
+          esac
+        done <"$BASE/gpu.env"
+      fi
       printf 'rm -f %q\n' "$D/wl-proxy"
       # §89: the rings, when `up` found both them and their doorbell. The
       # tunnel's socket stays the upstream either way: the icon and clipboard
       # feeds use it, and so does a connection that cannot have a ring.
       RINGARGS=""
       UPARGS=$(printf -- '--upstream %q' "$D/up.sock")
-      [ "$(cat "$D/transport" 2>/dev/null)" = rings ] \
-        && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$(wcbell_use)")
+      # §105.14: the doorbell looked up once (it asks systemd twice).
+      BELLUSE=poll
+      [ -f "$D/transport" ] && [ "$(<"$D/transport")" = rings ] && BELLUSE=$(wcbell_use)
+      [ "$BELLUSE" != poll ] && RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q' "$BELLUSE")
       if [ $SERVICE = 1 ]; then
         UPARGS=""
-        BELLUSE=poll
-        [ "$(cat "$D/transport" 2>/dev/null)" = rings ] && BELLUSE=$(wcbell_use)
         RINGARGS=$(printf -- '--wayland-rings --wayland-bell %q --session-control %q --session-id %q' "$BELLUSE" "$BASE/wc-session" "$ID")
         # §107: a session of the guest's shared compositor.
-        IDX=$(cat "$D/session.index" 2>/dev/null)
+        IDX=""; [ -f "$D/session.index" ] && IDX=$(<"$D/session.index")
         [ -n "$IDX" ] && RINGARGS="$RINGARGS --session-index $IDX"
         # §110: the GPU device is region 1 of the one pool the shared
         # compositor leases Wayland buffers from when its BAR is full.
