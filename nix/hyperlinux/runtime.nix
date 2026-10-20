@@ -8,7 +8,7 @@ assert lib.assertMsg (hlCross.stdenv.buildPlatform.isLinux &&
 hlCross.overrideAttrs (old: {
   pname = "hl-waycompose";
   src = import ./source.nix;
-  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ];
+  patches = (old.patches or [ ]) ++ [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ./async-signal-context.patch ];
   postPatch = (old.postPatch or "") + ''
     cp ${./hl_shared.c} src/hl_shared.c
     cp ${./hl_shared.h} src/hl_shared.h
