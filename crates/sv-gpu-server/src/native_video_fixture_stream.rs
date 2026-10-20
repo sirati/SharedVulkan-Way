@@ -35,6 +35,8 @@ pub(crate) struct Frame {
     pub setup: Option<Metadata>,
     /// Union of actual per-slice lists, in first-use order.
     pub references: Vec<Prior>,
+    /// Uniform source luma oracle for original PCM/skip cases; baseline uses its spatial pattern.
+    pub expected_y: Option<u8>,
 }
 pub(crate) struct Stream {
     pub bytes: &'static [u8],
@@ -217,6 +219,7 @@ pub(crate) fn progressive_original() -> Result<Stream, String> {
             idr_pic_id: parsed.idr_pic_id,
             setup,
             references,
+            expected_y: None,
         });
         codec = plan.next;
         history = order.next;
@@ -228,6 +231,282 @@ pub(crate) fn progressive_original() -> Result<Stream, String> {
         frames,
     })
 }
+
+/// Original PCM/skip streams independently decoded by FFmpeg with exact pixels.
+/// These cases are source proofs, not authorization to open native capability gates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PcmCase {
+    Marking(u8),
+    Gap(u8),
+    Bootstrap(u8),
+    BSkip,
+}
+pub(crate) fn pcm_original(case: PcmCase) -> Result<Stream, String> {
+    use h264::{Marking, Operation};
+    let (bytes, poc_type): (&'static [u8], u32) = match case {
+        PcmCase::Marking(0) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc0-marking-64x64.h264"
+            ),
+            0,
+        ),
+        PcmCase::Marking(1) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc1-marking-64x64.h264"
+            ),
+            1,
+        ),
+        PcmCase::Marking(2) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc2-marking-64x64.h264"
+            ),
+            2,
+        ),
+        PcmCase::Gap(0) => (
+            include_bytes!("../examples/assets/videotoolbox-h264/original-pcm-poc0-gap-64x64.h264"),
+            0,
+        ),
+        PcmCase::Gap(1) => (
+            include_bytes!("../examples/assets/videotoolbox-h264/original-pcm-poc1-gap-64x64.h264"),
+            1,
+        ),
+        PcmCase::Gap(2) => (
+            include_bytes!("../examples/assets/videotoolbox-h264/original-pcm-poc2-gap-64x64.h264"),
+            2,
+        ),
+        PcmCase::Bootstrap(0) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc0-bootstrap-64x64.h264"
+            ),
+            0,
+        ),
+        PcmCase::Bootstrap(1) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc1-bootstrap-64x64.h264"
+            ),
+            1,
+        ),
+        PcmCase::Bootstrap(2) => (
+            include_bytes!(
+                "../examples/assets/videotoolbox-h264/original-pcm-poc2-bootstrap-64x64.h264"
+            ),
+            2,
+        ),
+        PcmCase::BSkip => (
+            include_bytes!("../examples/assets/videotoolbox-h264/original-pcm-b-skip-64x64.h264"),
+            0,
+        ),
+        _ => return Err("fixture POC type must be zero, one, or two".into()),
+    };
+    let mut nals = Vec::new();
+    let mut at = 0;
+    while at + 4 < bytes.len() {
+        if bytes[at..].starts_with(&[0, 0, 0, 1]) {
+            nals.push(at);
+            at += 4;
+        } else {
+            at += 1;
+        }
+    }
+    if nals.len() < 3 || nals[0] != 0 || bytes[4] & 31 != 7 || bytes[nals[1] + 4] & 31 != 8 {
+        return Err("original PCM fixture parameter framing mismatch".into());
+    }
+    let sps = 4..nals[1];
+    let pps = nals[1] + 4..nals[2];
+    let (expected_frame, expected_poc, expected_y, expected_prior): (
+        &[u32],
+        &[i32],
+        &[u8],
+        &[&[usize]],
+    ) = match case {
+        PcmCase::Marking(_) => (
+            &[0, 1, 2, 3, 1, 2, 3],
+            &[0, 2, 4, 6, 2, 4, 6],
+            &[40, 80, 40, 120, 120, 160, 160],
+            &[&[], &[], &[0], &[], &[3], &[], &[5]],
+        ),
+        PcmCase::Gap(_) => (&[0, 3, 4], &[0, 6, 8], &[40, 80, 80], &[&[], &[], &[1]]),
+        PcmCase::Bootstrap(_) => (&[3], &[6], &[120], &[&[]]),
+        PcmCase::BSkip => (
+            &[0, 1, 2, 2],
+            &[0, 4, 2, 6],
+            &[40, 120, 80, 120],
+            &[&[], &[], &[0, 1], &[1]],
+        ),
+    };
+    if nals.len() != expected_frame.len() + 2 {
+        return Err("original PCM fixture AU count mismatch".into());
+    }
+    let mut history = poc::History::default();
+    let mut codec = dpb::Dpb::default();
+    let mut owners = HashMap::new();
+    let mut frames = Vec::new();
+    for index in 0..expected_frame.len() {
+        let start = nals[index + 2];
+        let end = nals.get(index + 3).copied().unwrap_or(bytes.len());
+        let range = start..end;
+        let parsed = h264::parse(
+            bytes,
+            &range,
+            &[0],
+            &bytes[sps.clone()],
+            &bytes[pps.clone()],
+        )?;
+        let history_plan = history.plan_unproven(&parsed, matches!(case, PcmCase::Bootstrap(_)))?;
+        let limits = dpb::Limits {
+            max_frame_num: parsed.max_frame_num,
+            max_refs: parsed.max_refs,
+        };
+        let inferred = codec.synthesize_unproven(&history_plan.missing, limits)?;
+        let current = dpb::Picture {
+            frame_num: parsed.frame_num,
+            poc: history_plan.poc,
+        };
+        let lists = inferred.reference_lists(current, &parsed)?;
+        let mut references = Vec::new();
+        for generation in lists.iter().flat_map(|pair| pair.iter()).flatten() {
+            let frame_index = *owners
+                .get(generation)
+                .ok_or("PCM fixture predicts a non-existing frame")?;
+            if references
+                .iter()
+                .any(|prior: &Prior| prior.frame_index == frame_index)
+            {
+                continue;
+            }
+            let entry = inferred
+                .entries
+                .iter()
+                .find(|entry| entry.generation == *generation)
+                .ok_or("PCM source reference entry missing")?;
+            references.push(Prior {
+                frame_index,
+                metadata: metadata(entry)?,
+            });
+        }
+        let plan = inferred.plan(current, &parsed.marking, limits)?;
+        let setup = plan.current.as_ref().map(metadata).transpose()?;
+        let expected_idr = index == 0 && !matches!(case, PcmCase::Bootstrap(_));
+        let expected_intra = match case {
+            PcmCase::Marking(_) => matches!(index, 0 | 1 | 3 | 5),
+            PcmCase::Gap(_) => index < 2,
+            PcmCase::Bootstrap(_) => true,
+            PcmCase::BSkip => index < 2,
+        };
+        let expected_reference = !(matches!(case, PcmCase::BSkip) && index == 2);
+        if parsed.sequence.poc != poc_type
+            || parsed.sequence.coded_extent != [64, 64]
+            || parsed.max_refs != 4
+            || parsed.frame_num != expected_frame[index]
+            || history_plan.poc != [expected_poc[index]; 2]
+            || parsed.idr != expected_idr
+            || parsed.reference != expected_reference
+            || parsed.slices.iter().all(|slice| slice.kind == 2) != expected_intra
+            || references
+                .iter()
+                .map(|prior| prior.frame_index)
+                .collect::<Vec<_>>()
+                != expected_prior[index]
+        {
+            return Err(format!(
+                "original PCM source disagrees with independent frame oracle at {index}"
+            ));
+        }
+        let expected_marking = if expected_idr {
+            Marking::Idr {
+                no_output_prior: false,
+                long_term: false,
+            }
+        } else if !expected_reference {
+            Marking::NonReference
+        } else if matches!(case, PcmCase::Marking(_)) {
+            match index {
+                1 => Marking::Adaptive(vec![
+                    Operation::LimitLong { max_index_plus1: 2 },
+                    Operation::Promote {
+                        difference_minus1: 0,
+                        index: 1,
+                    },
+                ]),
+                3 => Marking::Adaptive(vec![Operation::ForgetAll]),
+                5 => Marking::Adaptive(vec![
+                    Operation::LimitLong { max_index_plus1: 1 },
+                    Operation::CurrentLong { index: 0 },
+                ]),
+                _ => Marking::Sliding,
+            }
+        } else {
+            Marking::Sliding
+        };
+        if parsed.marking != expected_marking {
+            return Err(format!("original PCM source marking differs at {index}"));
+        }
+        let expected_setup_frame = if matches!(case, PcmCase::Marking(_)) && matches!(index, 3 | 5)
+        {
+            0
+        } else {
+            expected_frame[index] as u16
+        };
+        let expected_setup_poc = if matches!(case, PcmCase::Marking(_)) && index == 3 {
+            [0; 2]
+        } else {
+            [expected_poc[index]; 2]
+        };
+        let expected_setup_long = matches!(case, PcmCase::Marking(_)) && index == 5;
+        if setup
+            .as_ref()
+            .map(|value| (value.frame_num, value.poc, value.long_term))
+            != expected_reference.then_some((
+                expected_setup_frame,
+                expected_setup_poc,
+                expected_setup_long,
+            ))
+        {
+            return Err(format!("original PCM source setup differs at {index}"));
+        }
+        // The gap case must have exactly the two inferred reference frames.
+        if history_plan.missing.len()
+            != if matches!(case, PcmCase::Gap(_)) && index == 1 {
+                2
+            } else {
+                0
+            }
+        {
+            return Err("original PCM source gap oracle differs".into());
+        }
+        if let Some(entry) = &plan.current {
+            owners.insert(entry.generation, index);
+        }
+        owners.retain(|generation, _| {
+            plan.next
+                .entries
+                .iter()
+                .any(|entry| entry.generation == *generation)
+        });
+        frames.push(Frame {
+            range,
+            slice_offsets: vec![0],
+            frame_num: parsed.frame_num as u16,
+            poc: history_plan.poc,
+            is_reference: parsed.reference,
+            is_intra: expected_intra,
+            idr: parsed.idr,
+            idr_pic_id: parsed.idr_pic_id,
+            setup,
+            references,
+            expected_y: Some(expected_y[index]),
+        });
+        codec = plan.next;
+        history = history_plan.next;
+    }
+    Ok(Stream {
+        bytes,
+        sps,
+        pps,
+        frames,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +531,45 @@ mod tests {
         assert_eq!(stream.bytes[stream.sps.start] & 31, 7);
         assert_eq!(stream.bytes[stream.pps.start] & 31, 8);
         assert_eq!(stream.frames[4].idr_pic_id, Some(1));
+    }
+    #[test]
+    fn original_pcm_streams_cover_actual_marking_gaps_bootstrap_and_b_lists() {
+        for ty in 0..=2 {
+            let marking = pcm_original(PcmCase::Marking(ty)).unwrap();
+            assert_eq!(
+                marking.frames[2].references[0].metadata,
+                Metadata {
+                    frame_num: 1,
+                    poc: [0; 2],
+                    long_term: true
+                }
+            );
+            assert_eq!(marking.frames[3].setup.as_ref().unwrap().poc, [0; 2]);
+            assert_eq!(
+                marking.frames[6].references[0].metadata,
+                Metadata {
+                    frame_num: 0,
+                    poc: [4; 2],
+                    long_term: true
+                }
+            );
+            assert_eq!(pcm_original(PcmCase::Gap(ty)).unwrap().frames.len(), 3);
+            assert_eq!(
+                pcm_original(PcmCase::Bootstrap(ty)).unwrap().frames[0].poc,
+                [6; 2]
+            );
+        }
+        let b = pcm_original(PcmCase::BSkip).unwrap();
+        assert!(!b.frames[2].is_reference);
+        assert_eq!(
+            b.frames[2]
+                .references
+                .iter()
+                .map(|prior| prior.frame_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(b.frames[2].expected_y, Some(80));
+        assert_eq!(b.frames[3].references[0].frame_index, 1);
     }
 }
