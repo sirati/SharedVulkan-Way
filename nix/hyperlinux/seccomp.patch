@@ -1,0 +1,768 @@
+diff --git a/Makefile b/Makefile
+index 6079262..dea6f78 100644
+--- a/Makefile
++++ b/Makefile
+@@ -87,7 +87,7 @@ HL_SRCS := $(addprefix $(SRC_DIR)/,hl.c guest.c elf.c syscall.c \
+            fork_ipc.c syscall_signal.c syscall_net.c stack.c \
+            thread.c futex.c vdso.c crash_report.c rosetta.c \
+            gdb_stub.c trace.c syscall_stats.c fd_object.c vfs.c device.c \
+-           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_copy.c hl_atomic.c)
++           audio.c audio_oss.c audio_coreaudio.c app_open.c hl_shared.c hl_seals.c hl_drm.c hl_socket.c hl_copy.c hl_atomic.c hl_seccomp.c hl_seccomp_bpf.c)
+ HL_HDRS := $(addprefix $(SRC_DIR)/,guest.h elf.h syscall.h \
+            syscall_internal.h syscall_fs.h syscall_io.h \
+            syscall_poll.h syscall_fd.h syscall_inotify.h \
+diff --git a/src/fork_ipc.c b/src/fork_ipc.c
+index 2ca2809..e878fa6 100644
+--- a/src/fork_ipc.c
++++ b/src/fork_ipc.c
+@@ -16,6 +16,7 @@
+ #include "syscall_poll.h"    /* wakeup_pipe_signal */
+ #include "hv_util.h"         /* HV_CHECK, SCTLR_* constants */
+ #include "guest.h"           /* guest_t, guest_init, guest_destroy, guest_get_used_regions, etc. */
++#include "hl_seccomp.h"
+ #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
+ #include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
+ #include "hl_shared.h"
+@@ -931,7 +932,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+     }
+ 
+     /* Close IPC socket */
+-    close(ipc_fd);
++    /* IPC closes after security state restoration. */
+ 
+     /* Step 8: Create vCPU and set up registers */
+     hv_vcpu_t vcpu;
+@@ -1001,6 +1002,12 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+      * after thread_register_main() so the per-thread blocked mask and
+      * altstack are properly restored to the thread entry. */
+     signal_set_state(&sig);
++    if (hl_seccomp_fork_receive(ipc_fd) < 0) {
++        close(ipc_fd);
++        guest_destroy(&g);
++        return 1;
++    }
++    close(ipc_fd);
+ 
+     /* The [vvar] time page is written only by the vDSO publisher thread,
+      * which does not exist in a fork child (threads are not inherited). The
+@@ -1066,7 +1073,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
+     int64_t child_tid = proc_alloc_pid();
+ 
+     /* Allocate thread table slot */
+-    thread_entry_t *t = thread_alloc(child_tid);
++    thread_entry_t *t = thread_alloc(child_tid, 0);
+     if (!t) {
+         fprintf(stderr, "hl: clone_thread: thread table full\n");
+         return -LINUX_EAGAIN;
+@@ -1194,7 +1201,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu, guest_t *g,
+         return -LINUX_EAGAIN;
+     }
+ 
+-    t->host_thread = host_thread;
++    /* The worker publishes pthread_self with its vCPU under thread_lock. */
+ 
+     if (verbose)
+         fprintf(stderr, "hl: clone_thread: child tid=%lld created\n",
+@@ -1337,7 +1344,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
+     int64_t child_tid = proc_alloc_pid();
+ 
+     /* Allocate thread table slot */
+-    thread_entry_t *t = thread_alloc(child_tid);
++    thread_entry_t *t = thread_alloc(child_tid, 1);
+     if (!t) {
+         fprintf(stderr, "hl: clone_vm: thread table full\n");
+         return -LINUX_EAGAIN;
+@@ -1446,7 +1453,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu, guest_t *g,
+         return -LINUX_EAGAIN;
+     }
+ 
+-    t->host_thread = host_thread;
++    /* The worker publishes pthread_self with its vCPU under thread_lock. */
+ 
+     if (verbose)
+         fprintf(stderr, "hl: clone_vm: child tid=%lld created "
+@@ -1539,14 +1546,17 @@ static void *vm_clone_thread_run(void *arg) {
+      * vm_exit_status uses wait-format: (exit_code << 8) for normal exit. */
+     pthread_mutex_t *lock = thread_get_lock();
+     pthread_mutex_lock(lock);
++    int security_killed=atomic_load(&t->seccomp_killed);
++    int64_t exited_tid=t->guest_tid;
+     t->vm_exited = 1;
++    thread_notify_exit_locked();
+     t->vm_exit_status = (exit_code & 0xFF) << 8;
+     pthread_cond_broadcast(&t->ptrace_cond);
+     pthread_mutex_unlock(lock);
+ 
+     if (verbose)
+         fprintf(stderr, "hl: vm_clone tid=%lld exiting (code=%d)\n",
+-                (long long)t->guest_tid, exit_code);
++                (long long)exited_tid, exit_code);
+ 
+     /* Check if this was the last VM-clone child. In real
+      * Linux, child exit delivers exit_signal (SIGCHLD) which interrupts
+@@ -1554,7 +1564,7 @@ static void *vm_clone_thread_run(void *arg) {
+      * requesting exit_group and interrupting all vCPUs. */
+     int last_clone = (thread_count_active_vm_clones() == 0);
+ 
+-    if (last_clone) {
++    if (last_clone && !security_killed) {
+         if (verbose)
+             fprintf(stderr, "hl: last vm_clone exited, triggering exit_group\n");
+         /* The main thread may be in hv_vcpu_run or a host wait. The shared
+@@ -2264,6 +2274,10 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+         return -LINUX_ENOMEM;
+     }
+ 
++    if (hl_seccomp_fork_send(ipc_sock) < 0) {
++        close(ipc_sock);
++        return -LINUX_ENOMEM;
++    }
+     close(ipc_sock);
+ 
+     /* After COW fork: parent stays on MAP_SHARED (no remap was done).
+@@ -2305,6 +2319,9 @@ int64_t sys_clone(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+      * Used by Rosetta's two-process JIT: the inferior shares guest memory
+      * but has a separate TID and is waitable via wait4/ptrace. */
+     if ((flags & LINUX_CLONE_VM) && !(flags & LINUX_CLONE_THREAD)) {
++        /* Separate sighand tables do not exist in one host VM. Refuse the
++         * unsupported process model instead of sharing security dispositions. */
++        if (!(flags & 0x800U)) return -95; /* CLONE_SIGHAND / EOPNOTSUPP */
+         return sys_clone_vm(vcpu, g, flags, child_stack,
+                             ptid_gva, tls, ctid_gva, verbose);
+     }
+diff --git a/src/futex.c b/src/futex.c
+index e77e2bb..b3201d4 100644
+--- a/src/futex.c
++++ b/src/futex.c
+@@ -254,7 +254,7 @@ static int64_t futex_wait(guest_t *g, uint64_t uaddr, uint32_t expected,
+             }
+             pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+ 
+-            if (atomic_load(&exit_group_requested) ||
++            if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+                 futex_interrupt_epoch() != irq_epoch) {
+                 ret = -LINUX_EINTR;
+                 break;
+@@ -725,7 +725,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+                 }
+                 pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+ 
+-                if (atomic_load(&exit_group_requested)) {
++                if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
+                     /* Dequeue and return */
+                     futex_waiter_t **pp2 = &b->head;
+                     while (*pp2) {
+diff --git a/src/syscall.c b/src/syscall.c
+index 166936d..081ba7f 100644
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -35,6 +35,7 @@
+ #include "syscall_inotify.h"
+ #include "futex.h"
+ #include "thread.h"
++#include "hl_seccomp.h"
+ #include "fd_object.h"
+ #include "trace.h"
+ #include "vfs.h"
+@@ -1194,7 +1195,41 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+     int64_t result = 0;
+     int should_exit = 0;
+ 
++    uint64_t seccomp_pc = 0;
++    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &seccomp_pc);
++    hl_seccomp_data sd = { .nr=(int32_t)x8, .arch=HL_AUDIT_ARCH_AARCH64,
++        .instruction_pointer=seccomp_pc, .args={x0,x1,x2,x3,x4,x5} };
++    uint32_t verdict = hl_seccomp_evaluate(&sd);
++    switch (verdict & 0xffff0000U) {
++    case 0x7fff0000U: /* ALLOW */
++    case 0x7ffc0000U: /* LOG: same execution behavior, no host logging sink */
++        break;
++    case 0x00050000U: { /* ERRNO */
++        unsigned error=verdict & 0xffffU;
++        result=-(int64_t)(error > 4095 ? 4095 : error);
++        goto seccomp_denied;
++    }
++    case 0x7ff00000U: /* TRACE without a PTRACE_O_TRACESECCOMP tracer */
++    case 0x7fc00000U: /* USER_NOTIF without an installed listener */
++        result=-LINUX_ENOSYS;
++        goto seccomp_denied;
++    case 0x00030000U: { /* TRAP preserves original X0 in the signal frame. */
++        int delivered=signal_force_seccomp(vcpu,g,exit_code,verdict & 0xffffU,
++                                            seccomp_pc,(int32_t)x8,sd.arch);
++        return delivered < 0 ? 1 : SYSCALL_EXEC_HAPPENED;
++    }
++    case 0x00000000U: /* KILL_THREAD */
++        *exit_code=thread_seccomp_terminate(0);
++        return 1;
++    default: /* KILL_PROCESS and unrecognized actions fail closed. */
++        *exit_code=thread_seccomp_terminate(1);
++        return 1;
++    }
++
+     switch ((int)x8) {
++    case 277: /* AArch64 seccomp */
++        result=hl_seccomp_syscall(g,x0,x1,x2);
++        break;
+     /* ---- Tier 1: assembly hello world ---- */
+     case SYS_write:
+         result = sys_write(g, (int)x0, x1, x2);
+@@ -1722,11 +1757,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+                 result = 0;
+             break;
+         }
++        case 21: /* PR_GET_SECCOMP */
++        case 22: /* PR_SET_SECCOMP */
+         case LINUX_PR_SET_NO_NEW_PRIVS:
+-            result = 0;  /* Stub: we never grant new privileges anyway */
+-            break;
+         case LINUX_PR_GET_NO_NEW_PRIVS:
+-            result = 1;  /* Always report no-new-privs as set */
++            result = hl_seccomp_prctl(g,x0,x1,x2,x3,x4);
+             break;
+         case LINUX_PR_SET_DUMPABLE:
+             result = 0;  /* Stub: core dumps not applicable */
+@@ -2369,6 +2404,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+         break;
+     }
+ 
++seccomp_denied:
+     if (syscall_stats_enabled()) {
+         if ((int)x8 == SYS_close && (int)x0 >= 0)
+             syscall_stats_clear_fd((int)x0);
+diff --git a/src/syscall_exec.c b/src/syscall_exec.c
+index 83d3cb7..63e5422 100644
+--- a/src/syscall_exec.c
++++ b/src/syscall_exec.c
+@@ -1,3 +1,4 @@
++#include "thread.h"
+ /* syscall_exec.c — execve syscall handler for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -68,6 +69,8 @@ static int read_string_array(guest_t *g, uint64_t array_gva,
+ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
+                    uint64_t path_gva, uint64_t argv_gva, uint64_t envp_gva,
+                    int verbose) {
++    int security_exec_scope __attribute__((cleanup(thread_exec_end)))=thread_exec_begin();
++    if (!security_exec_scope) return -95; /* EOPNOTSUPP: mm unsharing is absent */
+     /* Step 1: Read path from guest memory */
+     char guest_path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, guest_path, sizeof(guest_path)) < 0)
+diff --git a/src/syscall_inotify.c b/src/syscall_inotify.c
+index 635c04f..bb72b56 100644
+--- a/src/syscall_inotify.c
++++ b/src/syscall_inotify.c
+@@ -1,3 +1,4 @@
++#include "thread.h"
+ /* syscall_inotify.c — Linux inotify emulation via kqueue EVFILT_VNODE for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -540,7 +541,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva,
+                 nev = kevent(kq_fd, NULL, 0, &kev, 1, &ts);
+                 if (nev > 0) break;
+                 if (nev < 0 && errno != EINTR) return linux_errno();
+-                if (atomic_load(&exit_group_requested))
++                if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()))
+                     return -LINUX_EINTR;
+             }
+             if (nev <= 0)
+diff --git a/src/syscall_poll.c b/src/syscall_poll.c
+index f64c524..e916196 100644
+--- a/src/syscall_poll.c
++++ b/src/syscall_poll.c
+@@ -1,3 +1,4 @@
++#include "thread.h"
+ /* syscall_poll.c — Poll/select/epoll syscall handlers for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -248,7 +249,7 @@ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
+         ret = poll(host_fds, nfds + added_wakeup, host_timeout);
+ 
+         /* Check for exit_group / futex_interrupt after waking */
+-        if (atomic_load(&exit_group_requested) ||
++        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+             futex_interrupt_epoch() != irq_epoch) {
+             ret = -1;
+             errno = EINTR;
+@@ -481,7 +482,7 @@ int64_t sys_pselect6(guest_t *g, int nfds, uint64_t readfds_gva,
+                       exceptfds_gva ? &except_set : NULL,
+                       pts, NULL);
+ 
+-        if (atomic_load(&exit_group_requested) ||
++        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+             futex_interrupt_epoch() != irq_epoch) {
+             ret = -1;
+             errno = EINTR;
+@@ -873,7 +874,7 @@ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
+         nready = kevent(kq_fd, NULL, 0, kevents, cap,
+                         has_timeout ? &ts : &poll_ts);
+ 
+-        if (atomic_load(&exit_group_requested) ||
++        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+             futex_interrupt_epoch() != irq_epoch) {
+             nready = -1;
+             errno = EINTR;
+diff --git a/src/syscall_proc.c b/src/syscall_proc.c
+index 526ba67..a6583c9 100644
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -997,9 +997,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+     }
+ 
+     while (running) {
++        if (thread_seccomp_terminated()) { exit_code=128+LINUX_SIGSYS; break; }
+         /* Check if another thread called exit_group */
+-        if (atomic_load(&exit_group_requested)) {
+-            exit_code = atomic_load(&exit_group_code);
++        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
++            exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
+             break;
+         }
+ 
+@@ -1021,9 +1022,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+         if (watchdog)
+             alarm(0);
+ 
++        if (thread_seccomp_terminated()) { exit_code=128+LINUX_SIGSYS; break; }
+         /* Re-check exit_group after waking from hv_vcpu_run */
+-        if (atomic_load(&exit_group_requested)) {
+-            exit_code = atomic_load(&exit_group_code);
++        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
++            exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
+             break;
+         }
+ 
+@@ -1807,8 +1809,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+                  * loop back so the timeout check fires. */
+                 continue;
+             }
+-            if (atomic_load(&exit_group_requested)) {
+-                exit_code = atomic_load(&exit_group_code);
++            if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
++                exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
+                 break;
+             }
+ 
+@@ -1883,5 +1885,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+         alarm(0);
+     }
+ 
++    if (is_main && thread_seccomp_terminated()) thread_wait_other_workers();
+     return exit_code;
+ }
+diff --git a/src/syscall_signal.c b/src/syscall_signal.c
+index 0367bf6..39a08de 100644
+--- a/src/syscall_signal.c
++++ b/src/syscall_signal.c
+@@ -20,6 +20,7 @@
+ #include "thread.h"         /* current_thread, thread_entry_t */
+ #include "vdso.h"           /* VDSO_BASE */
+ 
++#include <stddef.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <pthread.h>
+@@ -771,38 +772,55 @@ static void build_sigcontext_reserved(uint8_t *reserved, uint64_t esr,
+     memset(reserved + off, 0, 8);
+ }
+ 
+-int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
++static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
++                               const linux_siginfo_t *forced) {
+     pthread_mutex_lock(&sig_lock);
+     uint64_t *blocked = thread_blocked_ptr();
+     uint64_t *saved_ptr = thread_saved_blocked_ptr();
+     int *valid_ptr = thread_saved_valid_ptr();
+-    uint64_t deliverable = deliverable_here_locked();
+-    if (deliverable == 0) {
+-        pthread_mutex_unlock(&sig_lock);
+-        return 0;
+-    }
+-
+-    /* Find lowest pending unblocked signal */
+-    int signum = __builtin_ctzll(deliverable) + 1;
++    int signum, delivered_si_code;
++    if (forced) {
++        /* A synchronous seccomp trap belongs to this exact vCPU. Do not
++         * enqueue/coalesce it or select an unrelated lower pending signal.
++         * Like Linux force_sig_info, blocked/ignored synchronous SIGSYS
++         * must not disappear and let the trapped syscall resume. */
++        signum = LINUX_SIGSYS;
++        delivered_si_code = forced->si_code;
++        linux_sigaction_t *forced_act = &sig_state.actions[signum - 1];
++        if ((*blocked & sig_bit(signum)) ||
++            forced_act->sa_handler == LINUX_SIG_IGN) {
++            forced_act->sa_handler = LINUX_SIG_DFL;
++            *blocked &= ~sig_bit(signum);
++        }
++    } else {
++        uint64_t deliverable = deliverable_here_locked();
++        if (deliverable == 0) {
++            pthread_mutex_unlock(&sig_lock);
++            return 0;
++        }
+ 
+-    /* Dequeue: for RT signals, decrement count and only clear the
+-     * pending bit when the queue is empty. Standard signals are
+-     * always cleared (single instance, bitmask semantics). */
+-    if (signum >= LINUX_SIGRTMIN) {
+-        int rt_idx = signum - LINUX_SIGRTMIN;
+-        if (sig_state.rt_queue[rt_idx] > 0)
+-            sig_state.rt_queue[rt_idx]--;
+-        if (sig_state.rt_queue[rt_idx] == 0)
++        /* Find lowest pending unblocked signal */
++        signum = __builtin_ctzll(deliverable) + 1;
++
++        /* Dequeue: for RT signals, decrement count and only clear the
++         * pending bit when the queue is empty. Standard signals are
++         * always cleared (single instance, bitmask semantics). */
++        if (signum >= LINUX_SIGRTMIN) {
++            int rt_idx = signum - LINUX_SIGRTMIN;
++            if (sig_state.rt_queue[rt_idx] > 0)
++                sig_state.rt_queue[rt_idx]--;
++            if (sig_state.rt_queue[rt_idx] == 0)
++                sig_state.pending &= ~sig_bit(signum);
++        } else {
+             sig_state.pending &= ~sig_bit(signum);
+-    } else {
+-        sig_state.pending &= ~sig_bit(signum);
+-    }
+-    /* si_code travels with the pending instance; clear the routing state
+-     * once the last instance is dequeued. */
+-    int delivered_si_code = sig_si_code[signum];
+-    if ((sig_state.pending & sig_bit(signum)) == 0) {
+-        sig_target_tid[signum] = 0;
+-        sig_si_code[signum] = LINUX_SI_USER;
++        }
++        /* si_code travels with the pending instance; clear the routing state
++         * once the last instance is dequeued. */
++        delivered_si_code = sig_si_code[signum];
++        if ((sig_state.pending & sig_bit(signum)) == 0) {
++            sig_target_tid[signum] = 0;
++            sig_si_code[signum] = LINUX_SI_USER;
++        }
+     }
+ 
+     int idx = signum - 1;
+@@ -812,7 +830,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+     if (act->sa_handler == LINUX_SIG_IGN) {
+         /* Ignored — discard signal. Clear any stale fault info so it
+          * doesn't leak into a later signal delivery. */
+-        pending_fault.valid = 0;
++        if (!forced) pending_fault.valid = 0;
+         pthread_mutex_unlock(&sig_lock);
+         return 0;
+     }
+@@ -820,13 +838,14 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+     if (act->sa_handler == LINUX_SIG_DFL) {
+         /* Apply default disposition */
+         sig_disposition_t disp = signal_default_disposition(signum);
+-        pending_fault.valid = 0;
++        if (!forced) pending_fault.valid = 0;
+         switch (disp) {
+         case SIG_DISP_TERM:
+         case SIG_DISP_CORE:
+             *exit_code = 128 + signum;
+             pthread_mutex_unlock(&sig_lock);
+-            *exit_code = proc_request_exit_group(*exit_code);
++            *exit_code = forced ? thread_seccomp_terminate(1)
++                                : proc_request_exit_group(*exit_code);
+             return -1;  /* Terminate */
+         case SIG_DISP_IGN:
+         case SIG_DISP_CONT:
+@@ -855,7 +874,9 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+     /* siginfo — fault signals use si_code/si_addr from pending_fault;
+      * non-fault signals use SI_USER with si_pid. */
+     frame.info.si_signo = signum;
+-    if (pending_fault.valid) {
++    if (forced) {
++        frame.info = *forced;
++    } else if (pending_fault.valid) {
+         frame.info.si_code = pending_fault.si_code;
+         /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union.
+          * On aarch64-linux, si_addr is a 64-bit pointer occupying both
+@@ -889,7 +910,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+      * frame_esr: raw ESR_EL1 for the extended context chain. Rosetta's
+      * SIGTRAP handler reads this to determine BRK immediate value. */
+     uint64_t frame_esr = 0;
+-    if (pending_fault.valid) {
++    if (!forced && pending_fault.valid) {
+         frame.uc.uc_mcontext.fault_address = pending_fault.addr;
+         frame_esr = pending_fault.esr;
+         pending_fault.valid = 0;  /* Consume (one-shot) */
+@@ -943,6 +964,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+                 signum, sizeof(frame));
+         *exit_code = 128 + signum;
+         pthread_mutex_unlock(&sig_lock);
++        if (forced) *exit_code = thread_seccomp_terminate(1);
+         return -1;
+     }
+ 
+@@ -1001,6 +1023,29 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+     return 1;
+ }
+ 
++int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
++    return signal_deliver_info(vcpu, g, exit_code, NULL);
++}
++
++int signal_force_seccomp(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
++                         uint16_t data, uint64_t call_addr,
++                         int32_t nr, uint32_t arch) {
++    /* Linux guest siginfo layout, independent of Darwin's siginfo_t. */
++    _Static_assert(sizeof(linux_siginfo_t) == 128, "Linux siginfo size");
++    _Static_assert(offsetof(linux_siginfo_t, si_pid) == 16,
++                   "Linux siginfo union offset");
++    linux_siginfo_t info;
++    memset(&info, 0, sizeof(info));
++    info.si_signo = LINUX_SIGSYS;
++    info.si_errno = data;
++    info.si_code = 1; /* SYS_SECCOMP */
++    unsigned char *payload = (unsigned char *)&info;
++    memcpy(payload + 16, &call_addr, sizeof(call_addr));
++    memcpy(payload + 24, &nr, sizeof(nr));
++    memcpy(payload + 28, &arch, sizeof(arch));
++    return signal_deliver_info(vcpu, g, exit_code, &info);
++}
++
+ /* ---------- rt_sigreturn ---------- */
+ 
+ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g) {
+diff --git a/src/syscall_signal.h b/src/syscall_signal.h
+index 7faa84b..d5cfdd9 100644
+--- a/src/syscall_signal.h
++++ b/src/syscall_signal.h
+@@ -241,6 +241,15 @@ int signal_pending(void);
+  * On terminate, *exit_code is set to 128 + signum. */
+ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
+ 
++/* Deliver synchronous seccomp SIGSYS to this exact vCPU, without touching
++ * the asynchronous pending queue. Blocked/ignored SIGSYS becomes fatal.
++ * Caller must preserve syscall-entry registers and skip normal result writeback
++ * and all backend execution when this returns. No thread-table lock may be held.
++ * Returns 1 for a handler frame or -1 for process termination. */
++int signal_force_seccomp(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
++                         uint16_t data, uint64_t call_addr,
++                         int32_t nr, uint32_t arch);
++
+ /* Handle rt_sigreturn (SYS 139): restore registers from rt_sigframe on
+  * the guest stack. Returns SYSCALL_EXEC_HAPPENED to skip X0 writeback. */
+ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g);
+diff --git a/src/thread.c b/src/thread.c
+index 6854b0e..5182f64 100644
+--- a/src/thread.c
++++ b/src/thread.c
+@@ -8,6 +8,8 @@
+  * relative to per-syscall access (which uses the lock-free TLS pointer).
+  */
+ #include "thread.h"
++#include "hl_seccomp.h"
++#include "syscall_poll.h"
+ #include "guest.h"   /* SHIM_DATA_BASE, BLOCK_2MB, GUEST_IPA_BASE */
+ #include "hv_util.h" /* vcpu_get_gpr, vcpu_get_sysreg */
+ 
+@@ -24,12 +26,14 @@
+ /* ---------- Thread table ---------- */
+ 
+ static thread_entry_t thread_table[MAX_THREADS];
++static pthread_cond_t thread_exit_cond = PTHREAD_COND_INITIALIZER;
+ static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 5 */
+ 
+ /* Bitmask tracking allocated SP_EL1 slots. Bit N set = slot N in use.
+  * MAX_THREADS=64 fits exactly in a uint64_t. Slot 0 is the main thread
+  * (top of shim data region); each subsequent slot is 4KB below. */
+ static uint64_t sp_el1_allocated = 0;
++static thread_entry_t *exec_owner;
+ 
+ /* Per-thread pointer to the current thread's entry. Set once when a
+  * host pthread starts running a guest vCPU. Syscall handlers read this
+@@ -75,6 +79,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+     t->clear_child_tid = 0;
+     t->sp_el1          = sp_el1;
+     t->active          = 1;
++    t->seccomp_tgid = tid;
+     t->altstack_flags  = LINUX_SS_DISABLE;
+     t->on_altstack     = 0;
+     thread_ptrace_init(t);
+@@ -88,15 +93,23 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+     current_thread = t;
+ }
+ 
+-thread_entry_t *thread_alloc(int64_t tid) {
++thread_entry_t *thread_alloc(int64_t tid, int new_group) {
+     thread_entry_t *result = NULL;
+ 
+     pthread_mutex_lock(&thread_lock);
++    if (exec_owner) { pthread_mutex_unlock(&thread_lock); return NULL; }
+     for (int i = 0; i < MAX_THREADS; i++) {
+         if (!thread_table[i].active) {
+             thread_entry_t *t = &thread_table[i];
+             memset(t, 0, sizeof(*t));
+             t->guest_tid = tid;
++            t->seccomp_tgid = new_group || !current_thread ? tid : current_thread->seccomp_tgid;
++            if (current_thread) {
++                t->no_new_privs = current_thread->no_new_privs;
++                t->seccomp_killed = !new_group && current_thread->seccomp_killed;
++                t->seccomp_filter = current_thread->seccomp_filter;
++                hl_seccomp_retain(t->seccomp_filter);
++            }
+             t->active    = 1;
+             t->altstack_flags = 2; /* LINUX_SS_DISABLE */
+             thread_ptrace_init(t);
+@@ -143,7 +156,10 @@ void thread_deactivate(thread_entry_t *t) {
+     /* Free SP_EL1 slot so it can be reused by future threads */
+     thread_free_sp_el1_locked(t->sp_el1);
+ 
++    hl_seccomp_release(t->seccomp_filter);
++    t->seccomp_filter = NULL;
+     t->active = 0;
++    pthread_cond_broadcast(&thread_exit_cond);
+ 
+     /* Do NOT destroy ptrace condvars here — a waiter woken by the
+      * broadcast above may still be inside pthread_cond_wait() trying
+@@ -161,6 +177,7 @@ void thread_publish_vcpu(thread_entry_t *t, hv_vcpu_t vcpu,
+     pthread_mutex_lock(&thread_lock);
+     t->vcpu = vcpu;
+     t->vexit = vexit;
++    t->host_thread = pthread_self();
+     t->vcpu_valid = 1;
+     pthread_mutex_unlock(&thread_lock);
+ }
+@@ -298,6 +315,11 @@ uint64_t thread_alloc_sp_el1(void) {
+     return sp;
+ }
+ 
++void thread_for_each_locked(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
++    for (int i=0;i<MAX_THREADS;++i)
++        if (thread_table[i].active) fn(&thread_table[i],ctx);
++}
++
+ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
+     pthread_mutex_lock(&thread_lock);
+     for (int i = 0; i < MAX_THREADS; i++) {
+@@ -497,7 +519,10 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+                  * (they skip it since the slot is collected here), so we
+                  * must destroy condvars to avoid resource leaks. */
+                 thread_free_sp_el1_locked(t->sp_el1);
++                hl_seccomp_release(t->seccomp_filter);
++                t->seccomp_filter=NULL;
+                 t->active = 0;
++                pthread_cond_broadcast(&thread_exit_cond);
+                 pthread_cond_destroy(&t->ptrace_cond);
+                 pthread_cond_destroy(&t->resume_cond);
+                 pthread_mutex_unlock(&thread_lock);
+@@ -532,3 +557,61 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+         }
+     }
+ }
++
++/* Seccomp termination is scoped to a Linux thread group, including groups
++ * represented by CLONE_VM inside one host VM. Host SIGUSR2 wakes blocked I/O. */
++int thread_seccomp_terminate(int whole_group) {
++    pthread_mutex_lock(&thread_lock);
++    thread_entry_t *self=current_thread;
++    for (int i=0;i<MAX_THREADS;++i) {
++        thread_entry_t *t=&thread_table[i];
++        if (!t->active || !self ||
++            (whole_group ? t->seccomp_tgid!=self->seccomp_tgid : t!=self)) continue;
++        t->seccomp_killed=1;
++        if (t!=self) {
++            if (t->vcpu_valid) {
++                hv_vcpus_exit(&t->vcpu,1);
++                pthread_kill(t->host_thread,SIGUSR2);
++            }
++        }
++    }
++    pthread_mutex_unlock(&thread_lock);
++    wakeup_pipe_signal();
++    return 128+31;
++}
++int thread_seccomp_terminated(void) {
++    return current_thread && atomic_load(&current_thread->seccomp_killed);
++}
++void thread_wait_other_workers(void) {
++    pthread_mutex_lock(&thread_lock);
++    for (;;) {
++        int others=0;
++        for (int i=0;i<MAX_THREADS;++i)
++            if (thread_table[i].active && !thread_table[i].vm_exited &&
++                &thread_table[i]!=current_thread) ++others;
++        if (!others) break;
++        pthread_cond_wait(&thread_exit_cond,&thread_lock);
++    }
++    pthread_mutex_unlock(&thread_lock);
++}
++
++/* Without mm unsharing and sibling retirement, replacing a multithreaded VM
++ * would leave old vCPUs executing the new image with potentially weaker filters.
++ * Refuse it before exec's point of no return, and exclude concurrent clones. */
++int thread_exec_begin(void) {
++    pthread_mutex_lock(&thread_lock);
++    int count=0;
++    for (int i=0;i<MAX_THREADS;++i) count+=!!thread_table[i].active;
++    int ok=count==1 && current_thread && !exec_owner;
++    if (ok) exec_owner=current_thread;
++    pthread_mutex_unlock(&thread_lock);
++    return ok;
++}
++void thread_exec_end(int *scope) {
++    if (!*scope) return;
++    pthread_mutex_lock(&thread_lock);
++    if (exec_owner==current_thread) exec_owner=NULL;
++    pthread_mutex_unlock(&thread_lock);
++}
++
++void thread_notify_exit_locked(void) { pthread_cond_broadcast(&thread_exit_cond); }
+diff --git a/src/thread.h b/src/thread.h
+index 540ba99..eccae0e 100644
+--- a/src/thread.h
++++ b/src/thread.h
+@@ -19,6 +19,7 @@
+ #include <Hypervisor/Hypervisor.h>
+ #include <pthread.h>
+ #include <stdint.h>
++#include <stdatomic.h>
+ #include "syscall.h"  /* linux_user_pt_regs_t */
+ 
+ /* Maximum number of concurrent guest threads in one VM. */
+@@ -33,6 +34,10 @@ typedef struct {
+     pthread_t     host_thread;     /* macOS host thread running this vCPU */
+     uint64_t      clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
+     uint64_t      sp_el1;          /* Per-thread EL1 stack top (IPA) */
++    struct hl_seccomp_filter *seccomp_filter; /* Protected by thread_lock */
++    int no_new_privs;
++    _Atomic int seccomp_killed; /* Written under thread_lock, wait paths read atomically */
++    int64_t seccomp_tgid; /* Explicit group identity, including CLONE_VM groups */
+     int           active;          /* Non-zero while thread is running */
+     /* Per-thread signal mask (POSIX requires each thread to have its own).
+      * Initialized to the parent's mask on clone, modified via rt_sigprocmask. */
+@@ -104,7 +109,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+ /* Allocate a new thread table slot for the given TID.
+  * Returns a pointer to the entry, or NULL if the table is full.
+  * The caller must fill in vcpu, vexit, host_thread, sp_el1. */
+-thread_entry_t *thread_alloc(int64_t tid);
++thread_entry_t *thread_alloc(int64_t tid, int new_group);
+ 
+ /* Mark a thread as inactive and release its table slot. */
+ void thread_deactivate(thread_entry_t *t);
+@@ -136,6 +141,12 @@ int thread_tid_alive(int64_t tid);
+ 
+ /* Count currently active threads. */
+ int thread_active_count(void);
++int thread_seccomp_terminate(int whole_group);
++int thread_seccomp_terminated(void);
++void thread_wait_other_workers(void);
++void thread_notify_exit_locked(void);
++int thread_exec_begin(void);
++void thread_exec_end(int *scope);
+ 
+ /* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KB slot
+  * counting down from the top of the shim data region. The IPA base
+@@ -146,6 +157,8 @@ uint64_t thread_alloc_sp_el1(void);
+ /* Iterate over all active threads, calling fn(entry, ctx) for each.
+  * Holds the thread table lock during iteration. */
+ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
++/* Internal security-state iteration: caller MUST hold thread_get_lock(). */
++void thread_for_each_locked(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
+ 
+ /* Count active VM-clone threads (is_vm_clone && !vm_exited).
+  * Used to detect when the last rosetta tracee exits. */
