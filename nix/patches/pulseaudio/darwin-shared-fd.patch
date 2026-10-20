@@ -270,18 +270,49 @@
  } pa_mem_type_t;
 --- a/src/pulsecore/pstream.c
 +++ b/src/pulsecore/pstream.c
-@@ -159,6 +159,10 @@
+@@ -159,6 +159,12 @@
       * pa_pstream_register_memfd_mempool() for more information. */
      bool use_shm, use_memfd;
      bool non_registered_memfd_id_error_logged;
 +    bool shared_fd_block_logged;
 +#ifdef OS_IS_DARWIN
 +    uint64_t received_shared_fd_bytes, received_socket_audio_bytes;
++    uint64_t sent_shared_fd_bytes, sent_posix_bytes, sent_socket_audio_bytes;
++    bool sent_shared_fd_block_logged;
 +#endif
      pa_idxset *registered_memfd_ids;
  
      pa_memimport *import;
-@@ -913,6 +917,10 @@
+@@ -817,6 +823,28 @@
+ 
+     if (p->write.index >= PA_PSTREAM_DESCRIPTOR_SIZE + ntohl(p->write.descriptor[PA_PSTREAM_DESCRIPTOR_LENGTH])) {
+         pa_assert(p->write.current);
++#ifdef OS_IS_DARWIN
++        /* Count only complete transmitted memblock frames, after transport
++         * selection and successful descriptor/reference or payload writes. */
++        if (p->write.current->type == PA_PSTREAM_ITEM_MEMBLOCK) {
++            uint32_t flags = ntohl(p->write.descriptor[PA_PSTREAM_DESCRIPTOR_FLAGS]);
++            size_t length = p->write.current->chunk.length;
++            if ((flags & PA_FLAG_SHMDATA) && (flags & PA_FLAG_SHMDATA_MEMFD_BLOCK)) {
++                p->sent_shared_fd_bytes += length;
++                if (!p->sent_shared_fd_block_logged) {
++                    const uint32_t *shm_info = (const uint32_t *) &p->write.minibuf[PA_PSTREAM_DESCRIPTOR_SIZE];
++                    pa_log_debug("Sent shared-fd audio block: id=%u offset=%u length=%u",
++                                 ntohl(shm_info[PA_PSTREAM_SHM_SHMID]),
++                                 ntohl(shm_info[PA_PSTREAM_SHM_INDEX]),
++                                 ntohl(shm_info[PA_PSTREAM_SHM_LENGTH]));
++                    p->sent_shared_fd_block_logged = true;
++                }
++            } else if (flags & PA_FLAG_SHMDATA)
++                p->sent_posix_bytes += length;
++            else
++                p->sent_socket_audio_bytes += length;
++        }
++#endif
+         item_free(p->write.current);
+         p->write.current = NULL;
+ 
+@@ -913,6 +941,10 @@
              p->read_ancil_data.creds = b.creds;
          }
          if (b.nfd > 0) {
@@ -292,7 +323,7 @@
              pa_assert(b.nfd <= MAX_ANCIL_DATA_FDS);
              p->read_ancil_data.nfd = b.nfd;
              memcpy(p->read_ancil_data.fds, b.fds, sizeof(int) * b.nfd);
-@@ -1020,6 +1028,9 @@
+@@ -1020,6 +1052,9 @@
          /* Frame complete */
  
          if (re->memblock) {
@@ -302,7 +333,7 @@
              memblock_complete(p, re);
  
              /* This was a memblock frame. We can unref the memblock now */
-@@ -1062,6 +1073,17 @@
+@@ -1062,6 +1097,17 @@
                  if (pa_log_ratelimit(PA_LOG_DEBUG))
                      pa_log_debug("Failed to import memory block.");
              }
@@ -320,7 +351,7 @@
  
              if (p->receive_memblock_callback) {
                  int64_t offset;
-@@ -1100,13 +1122,7 @@
+@@ -1100,13 +1146,7 @@
      re->data = NULL;
  
  #ifdef HAVE_CREDS
@@ -335,7 +366,7 @@
      p->read_ancil_data.creds_valid = false;
      p->read_ancil_data.nfd = 0;
  #endif
-@@ -1114,6 +1130,9 @@
+@@ -1114,6 +1154,9 @@
      return 0;
  
  fail:
@@ -345,7 +376,7 @@
      if (release_memblock)
          pa_memblock_release(release_memblock);
  
-@@ -1205,6 +1224,15 @@
+@@ -1205,6 +1248,22 @@
          return;
  
      p->dead = true;
@@ -355,9 +386,66 @@
 +                     (unsigned long long) p->received_shared_fd_bytes,
 +                     (unsigned long long) p->received_socket_audio_bytes);
 +#endif
++#ifdef OS_IS_DARWIN
++    if (p->sent_shared_fd_bytes || p->sent_posix_bytes || p->sent_socket_audio_bytes)
++        pa_log_debug("Sent audio totals: memfd=%llu posix=%llu socket=%llu",
++                     (unsigned long long) p->sent_shared_fd_bytes,
++                     (unsigned long long) p->sent_posix_bytes,
++                     (unsigned long long) p->sent_socket_audio_bytes);
++#endif
 +#ifdef HAVE_CREDS
 +    pa_cmsg_ancil_data_close_fds(&p->read_ancil_data);
 +#endif
  
      while (p->srb || p->is_srbpending) /* In theory there could be one active and one pending */
          pa_pstream_set_srbchannel(p, NULL);
+--- a/src/pulsecore/poll-posix.c
++++ b/src/pulsecore/poll-posix.c
+@@ -39,6 +39,10 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#ifdef OS_IS_DARWIN
++#include <sys/event.h>
++#include <sys/stat.h>
++#endif
+ 
+ #ifdef HAVE_SYS_SELECT_H
+ #include <sys/select.h>
+@@ -204,8 +208,34 @@
+                     if (r == 0 || (r < 0 && errno == ENOTSOCK))
+                         ioctl(f->fd, FIONREAD, &r);
+ 
+-                    if (r == 0)
+-                        f->revents |= POLLHUP;
++                    if (r == 0) {
++                        struct stat st;
++                        if (fstat(f->fd, &st) == 0 && S_ISFIFO(st.st_mode)) {
++                            /* Darwin FIFO FIONREAD can return zero with data
++                             * buffered. Confirm bytes with a non-consuming
++                             * read filter before retaining the presumed HUP.
++                             * Leave the existing socket workaround unchanged. */
++                            int kq = kqueue();
++                            if (kq < 0)
++                                f->revents |= POLLERR;
++                            else {
++                                struct kevent change, event;
++                                struct timespec timeout = { 0, 0 };
++                                int n;
++                                pa_make_fd_cloexec(kq);
++                                EV_SET(&change, f->fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, NULL);
++                                n = kevent(kq, &change, 1, &event, 1, &timeout);
++                                pa_close(kq);
++                                if (n < 0 || (n > 0 && (event.flags & EV_ERROR)))
++                                    f->revents |= POLLERR;
++                                else if (n > 0 && event.data > 0)
++                                    f->revents |= POLLIN;
++                                else
++                                    f->revents |= POLLHUP;
++                            }
++                        } else
++                            f->revents |= POLLHUP;
++                    }
+ #else /* !OS_IS_DARWIN */
+                     if (recv (f->fd, data, 64, MSG_PEEK) == -1) {
+                         if (errno == ESHUTDOWN || errno == ECONNRESET ||
