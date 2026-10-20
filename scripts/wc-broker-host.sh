@@ -8,7 +8,7 @@
 # (`wc-broker serve`), as the guest's privileged service will sign it.
 #
 # Everything runs as the invoking user, so "the mapped user" is this user too;
-# the NixOS VM test (nix-config testhost/tests/waycompose-users.nix) is
+# the NixOS VM test (waycompose-users.nix in the host configuration) is
 # where two Linux users and a system account are real. What this shows:
 #
 #   leg 1  an identity users.conf maps: located, the session's proxy has the
@@ -177,6 +177,11 @@ if [ -n "$PPID_" ] && [ "$PPID_" != 0 ]; then
   fi
 fi
 R=$(request a "raw status"); case "$R" in ok-raw*) ok "status round trip" ;; *) bad "status: $R" ;; esac
+# The broker is set-up only: the control ring's round trip is wc-no-ssh.sh's.
+cc -O2 -o "$D/probe-ctl-rtt" "$ROOT/scripts/probe-ctl-rtt.c" 2>/dev/null && {
+  sleep 2
+  R=$("$D/probe-ctl-rtt" "$D/ctl-a.sock" 10000 rtt 2>&1) && ok "control round trip (compare wc-no-ssh.sh): $R" || bad "rtt probe: $R"
+}
 
 say "leg 1b: the lease ends the session; the agent says ended; the regions go"
 kill -9 "$COMP"; wait "$COMP" 2>/dev/null; rm -f "$D/arena"
