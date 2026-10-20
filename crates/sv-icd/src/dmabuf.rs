@@ -24,6 +24,14 @@
 
 use sv_proto as p;
 
+/// Optional import-boundary diagnostics. This does not change adapter behavior.
+pub fn trace(args: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("SV_DMABUF_TRACE").is_some()) {
+        eprintln!("sv-icd: dma-buf trace pid={}: {args}", std::process::id());
+    }
+}
+
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
 pub const DMA_BUF: u32 = 0x200;
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT`: what the GPU side

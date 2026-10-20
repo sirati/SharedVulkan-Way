@@ -653,6 +653,16 @@ pub fn attach_ivshmem_with_rings(id: u32, device: u32, rings_len: u64) -> io::Re
     attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"), rings_len)
 }
 
+/// Provide the original BAR authenticated and exclusively locked by the host.
+/// The caller must retain its QEMU identity/initializer guard for this session.
+#[cfg(target_os = "linux")]
+pub fn provide_host_ivshmem(id: u32, file: &std::fs::File, origin: String, rings_len: u64) -> io::Result<IvshmemRegion> {
+    refuse_if_outbound(id)?;
+    let size = file.metadata()?.len();
+    let view = platform::map_bar_provider(file)?;
+    attach_ivshmem_view(id, view, size, origin, rings_len)
+}
+
 /// [`attach_ivshmem_with_rings`] for a device this process has already
 /// mapped (§111.8: one the broker opened and moved here, mapped by
 /// `map_ivshmem_device`). `mapped` is what the map returned.
@@ -2415,8 +2425,20 @@ mod tests {
         assert!(attach_ivshmem_view(IV, bad, size, "greedy".into(), size / 2 + RINGS).is_err());
         assert!(Header::decode(&std::fs::read(&path).unwrap()).is_ok(), "a refusal touched the region");
 
-        let view = platform::map_file_mut(&path, size as usize).unwrap();
-        let r = attach_ivshmem_view(IV, view, size, "test file".into(), RINGS).unwrap();
+        #[cfg(target_os = "linux")]
+        let r = {
+            let readonly = std::fs::File::open(&path).unwrap();
+            assert!(provide_host_ivshmem(IV, &readonly, "read-only".into(), RINGS).is_err());
+            assert!(Header::decode(&std::fs::read(&path).unwrap()).is_ok(), "failed writable mapping altered the header");
+            let original = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            // The registry owns the original shared mapping after this fd closes.
+            provide_host_ivshmem(IV, &original, "authenticated original fd".into(), RINGS).unwrap()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let r = {
+            let view = platform::map_file_mut(&path, size as usize).unwrap();
+            attach_ivshmem_view(IV, view, size, "test file".into(), RINGS).unwrap()
+        };
         assert_eq!(r.generation, 8, "one more than the header it replaced");
         assert_eq!(r.arena_len, size - HEADER_BYTES - RINGS);
         assert_eq!(r.rings, (size - RINGS, RINGS));

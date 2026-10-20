@@ -64,6 +64,7 @@ pub type Grower = Box<dyn Fn(u64) -> bool + Send + Sync>;
 /// The pool, shared by every session of this process.
 pub struct PoolServer {
     pool: Mutex<Pool>,
+    retained_owner: std::sync::atomic::AtomicBool,
     regions: RwLock<Vec<Option<Arc<SharedRegion>>>>,
     importer: Importer,
     /// The highest the pool's leased bytes have been logged at, in 32 MiB
@@ -96,6 +97,7 @@ impl PoolServer {
         regions[0] = Some(boot);
         Ok(Arc::new(PoolServer {
             pool: Mutex::new(pool),
+            retained_owner: std::sync::atomic::AtomicBool::new(false),
             regions: RwLock::new(regions),
             importer,
             logged_high: Mutex::new(0),
@@ -299,7 +301,12 @@ impl PoolServer {
 
     /// Keep a session's leases for ever (its driver may still use them).
     pub fn quarantine(&self, session: u64) {
+        self.retained_owner.store(true, std::sync::atomic::Ordering::Release);
         self.pool().quarantine(session);
+    }
+
+    pub(crate) fn owner_retained(&self) -> bool {
+        self.retained_owner.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -358,6 +365,17 @@ mod tests {
     use super::*;
 
     const M: u64 = 1 << 20;
+
+    #[test]
+    fn closing_an_account_cannot_clear_quarantined_process_ownership() {
+        let boot = Arc::new(SharedRegion::heap((64 * M) as usize).unwrap());
+        let server = PoolServer::new(PoolConfig::for_capacity(64 * M), boot, Importer::HostPointer).unwrap();
+        let session = server.open_session("uncertain cleanup");
+        assert!(!server.owner_retained());
+        server.quarantine(session.session);
+        server.close_session(session.session);
+        assert!(server.owner_retained());
+    }
 
     /// §108, address stability: a region's base and every lease's place in
     /// it stay where they are while other regions are added and retired; a

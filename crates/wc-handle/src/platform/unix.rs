@@ -771,6 +771,20 @@ pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
     ))
 }
 
+/// Map an already-authenticated original host BAR for its sole initializer.
+#[cfg(target_os = "linux")]
+pub(crate) fn map_bar_provider(file: &File) -> io::Result<MappedView> {
+    let len = usize::try_from(file.metadata()?.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BAR exceeds address space"))?;
+    if len == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty BAR")); }
+    // SAFETY: the kernel checks the live fd and requested mapping. The view owns
+    // this shared mapping; the caller retains the authenticated session guard.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED, file.as_raw_fd(), 0) };
+    if ptr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
+    Ok(MappedView { ptr: ptr.cast::<u8>().cast_const(), len })
+}
+
 /// Read-only checked window of an already-open host memory backend. The fd
 /// is opened and authenticated by the host, never by a guest pathname.
 #[cfg(target_os = "linux")]

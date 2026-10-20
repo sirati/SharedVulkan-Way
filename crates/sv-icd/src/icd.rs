@@ -2165,9 +2165,15 @@ impl Icd for SharedVulkan {
         let refused = |r: i32| {
             Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply { result: p::VkResult(r), p_image_format_properties: None })
         };
+        if let Some(i) = &args.p_image_format_info {
+            crate::dmabuf::trace(format_args!("image-format query format={} tiling={} usage={:#x} flags={:#x}", i.format.0, i.tiling.0, i.usage.0, i.flags.0));
+        }
         let q = match args.p_image_format_info.as_mut().map(|i| crate::dmabuf::rewrite_image_format_info(i)) {
             Some(Ok(q)) => q,
-            Some(Err(r)) => return refused(r),
+            Some(Err(r)) => {
+                crate::dmabuf::trace(format_args!("image-format adapter refused result={r}"));
+                return refused(r);
+            }
             None => crate::dmabuf::FormatQuery::default(),
         };
         if q.dma_buf
@@ -2176,12 +2182,14 @@ impl Icd for SharedVulkan {
             crate::dmabuf::want_external_answer(out);
         }
         let mut reply = forward::get_physical_device_image_format_properties2(t, args)?;
+        crate::dmabuf::trace(format_args!("image-format backend result={} dma_buf={}", reply.result.0, q.dma_buf));
         if q.dma_buf && reply.result.0 == 0 {
             let ok = reply
                 .p_image_format_properties
                 .as_mut()
                 .is_some_and(|o| crate::dmabuf::answer_image_format(o).is_ok());
             if !ok {
+                crate::dmabuf::trace(format_args!("image-format backend lacks host-allocation import support"));
                 return refused(crate::dmabuf::VK_ERROR_FORMAT_NOT_SUPPORTED);
             }
         }
@@ -2202,13 +2210,20 @@ impl Icd for SharedVulkan {
         if !crate::dmabuf::enabled() {
             return forward::create_image(t, args);
         }
+        if let Some(ci) = &args.p_create_info {
+            crate::dmabuf::trace(format_args!("create-image id={id} format={} {}x{} tiling={} usage={:#x} flags={:#x}", ci.format.0, ci.extent.width, ci.extent.height, ci.tiling.0, ci.usage.0, ci.flags.0));
+        }
         let img = match args.p_create_info.as_mut().map(|ci| crate::dmabuf::rewrite_image_create_info(ci)) {
             Some(Ok(img)) => img,
-            Some(Err(r)) => return Ok(p::VkCreateImageReply { result: p::VkResult(r), p_image: None }),
+            Some(Err(r)) => {
+                crate::dmabuf::trace(format_args!("create-image id={id} adapter refused result={r}"));
+                return Ok(p::VkCreateImageReply { result: p::VkResult(r), p_image: None });
+            }
             None => None,
         };
         let device = args.device;
         let reply = forward::create_image(t, args)?;
+        crate::dmabuf::trace(format_args!("create-image id={id} backend result={}", reply.result.0));
         let Some(img) = img else { return Ok(reply) };
         if reply.result.0 != 0 {
             return Ok(reply);
@@ -2746,6 +2761,7 @@ impl SharedVulkan {
                 if ty != crate::dmabuf::DMA_BUF {
                     return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
                 }
+                crate::dmabuf::trace(format_args!("import-memory id={id} fd={fd} size={} image={image:?}", info.allocation_size));
                 let Some(tok) = crate::dmabuf::read_token(fd) else {
                     return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
                 };
@@ -2757,6 +2773,7 @@ impl SharedVulkan {
                     return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
                 }
                 let r = t.import_shared(id, tok.size, image, &tok)?;
+                crate::dmabuf::trace(format_args!("import-memory id={id} token={} size={} backend result={r}", tok.name, tok.size));
                 if r != 0 {
                     return refused(r);
                 }

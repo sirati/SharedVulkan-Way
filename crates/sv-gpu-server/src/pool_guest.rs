@@ -36,6 +36,8 @@
 //! [`Locator::IvshmemPool`]: sv_transport::cold::Locator::IvshmemPool
 
 use crate::pool::{Importer, PoolBinding, PoolServer};
+use crate::idle_owner::IdleOwner;
+use crate::retained_graph::RetainedGraph;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -133,6 +135,7 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>,
         ..PoolConfig::for_capacity(boot.len() as u64 + grow.as_ref().map_or(0, |g| g.budget))
     };
     let server = PoolServer::new(pcfg, Arc::clone(&boot), Importer::HostPointer).map_err(|e| format!("{e}"))?;
+    let external_owner = grow.is_some() || POOL_HOOK.get().is_some();
     if let Some(g) = grow {
         (g.start)(Arc::clone(&boot), Arc::clone(&server))?;
     }
@@ -185,27 +188,39 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>,
         },
     };
     let live = Arc::new(AtomicU32::new(0));
+    let idle_owner = Arc::new(IdleOwner::default());
     if let Some(after) = cfg.exit_idle {
         let live = Arc::clone(&live);
-        std::thread::Builder::new()
+        let idle_owner = Arc::clone(&idle_owner);
+        let server = Arc::clone(&server);
+        // External pool hooks/growers have no session-worker retirement receipt.
+        if let Err(e) = std::thread::Builder::new()
             .name("sv-pool-idle".into())
             .spawn(move || {
                 let mut since = Instant::now();
+                let mut reported = false;
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     if live.load(Ordering::SeqCst) > 0 {
                         since = Instant::now();
                     } else if since.elapsed() >= after {
-                        eprintln!("[gpu] no session for {after:?}: this user's GPU process ends (§107); the next session starts another");
-                        std::process::exit(0);
+                        if idle_owner.claim_exit(external_owner || server.owner_retained()) {
+                            eprintln!("[gpu] no session for {after:?}: all admitted owners retired; GPU provider exits cooperatively");
+                            std::process::exit(0);
+                        }
+                        if !reported {
+                            eprintln!("[gpu] idle exit deferred: GPU ownership is not confirmed retired; retaining provider and original backing");
+                            reported = true;
+                        }
                     }
                 }
-            })
-            .map_err(|e| format!("{e}"))?;
+            }) {
+            eprintln!("[gpu] no idle-exit thread ({e}); retaining provider without automatic exit");
+        }
     }
 
     if let Some(port) = cfg.port {
-        return serve_tcp(port, server, pool_nonce, cfg, set, live);
+        return serve_tcp(port, server, pool_nonce, cfg, set, (live, idle_owner));
     }
 
     // The launcher waits for these words; they are the same as `win_guest`'s.
@@ -217,7 +232,7 @@ pub fn serve_pool(boot: Arc<SharedRegion>, cfg: PoolServe, bell: Option<String>,
         cfg.max_sessions,
         if _doorman.is_some() { "by doorbell" } else { "polled: no doorbell" }
     );
-    let mut offers = Offers { server, pool_nonce, cfg, set, live, cold: Arc::clone(&cold), n: 0, short: None };
+    let mut offers = Offers { server, pool_nonce, cfg, set, live, idle_owner, cold: Arc::clone(&cold), n: 0, short: None };
     let poke: poolcold::Poke = Arc::new(move || poolcold::poke_cross_at(boot_base));
     poolcold::serve_offers(
         &mailboxes,
@@ -238,6 +253,7 @@ struct Offers {
     cfg: PoolServe,
     set: Arc<sv_transport::vdoorbell::ControlSet>,
     live: Arc<AtomicU32>,
+    idle_owner: Arc<IdleOwner>,
     cold: Arc<ColdEvent>,
     n: u64,
     /// Why the last offer could not be made, so it is said once.
@@ -275,6 +291,11 @@ impl OfferSource for Offers {
     }
 
     fn accepted(&mut self, p: Prepared, outcome: Outcome) {
+        let Some(owner) = self.idle_owner.admit() else {
+            outcome.failed("GPU provider is retiring");
+            self.server.close_session(p.binding.session);
+            return;
+        };
         self.live.fetch_add(1, Ordering::AcqRel);
         let (server, cfg, set, live, cold) =
             (Arc::clone(&self.server), self.cfg, Arc::clone(&self.set), Arc::clone(&self.live), Arc::clone(&self.cold));
@@ -286,6 +307,7 @@ impl OfferSource for Offers {
                 Ok(()) => outcome.published(),
                 Err(e) => outcome.failed(&e),
             });
+            owner.finish(&outcome, server.owner_retained());
             live.fetch_sub(1, Ordering::AcqRel);
             // A place is free: the owner may offer again.
             cold.ring();
@@ -315,8 +337,9 @@ fn serve_tcp(
     pool_nonce: u64,
     cfg: PoolServe,
     set: Arc<sv_transport::vdoorbell::ControlSet>,
-    live: Arc<AtomicU32>,
+    owners: (Arc<AtomicU32>, Arc<IdleOwner>),
 ) -> Result<(), String> {
+    let (live, idle_owner) = owners;
     eprintln!(
         "[gpu] GPU COLD PATH ON TCP (debug only): --port {port} was given; the deployed cold path is the pool's \
          mailboxes, and nothing but a debugging session should pass --port"
@@ -339,7 +362,8 @@ fn serve_tcp(
         let server = Arc::clone(&server);
         let set = Arc::clone(&set);
         let live = Arc::clone(&live);
-        std::thread::spawn(move || {
+        let Some(owner) = idle_owner.admit() else { continue; };
+        if let Err(e) = std::thread::Builder::new().name(format!("sv-pool-tcp-{session}")).spawn(move || {
             let now = live.fetch_add(1, Ordering::AcqRel) + 1;
             if now > cfg.max_sessions {
                 live.fetch_sub(1, Ordering::AcqRel);
@@ -347,15 +371,19 @@ fn serve_tcp(
                 let reason = format!("all {} GPU session slots are taken (the pool's session limit)", cfg.max_sessions);
                 eprintln!("[gpu] session {session}: refused: {reason}");
                 let _ = sv_transport::stream::write_message(&mut stream, &ColdMessage::Refuse { code: 4, reason });
+                owner.confirm();
                 return;
             }
             let outcome = tcp_session(session, &server, pool_nonce, cfg, &set, stream);
+            owner.finish(&outcome, server.owner_retained());
             live.fetch_sub(1, Ordering::AcqRel);
             match outcome {
                 Ok(cmds) => eprintln!("[gpu] session {session} finished, {cmds} commands; {}", server.report()),
                 Err(e) => eprintln!("[gpu] session {session} ended: {e}; {}", server.report()),
             }
-        });
+        }) {
+            eprintln!("[gpu] session {session}: no TCP worker ({e}); retaining provider");
+        }
     }
     Ok(())
 }
@@ -515,24 +543,29 @@ fn run_prepared(
     // server holds for the life of the process, and the lease is this
     // session's until `close_session`, which runs after `control_region` and
     // everything made from it are gone.
-    let control_region = Arc::new(unsafe { SharedRegion::from_raw(boot.base_ptr().add(offset as usize), control.len as usize) });
+    let control_region = RetainedGraph::new(Arc::new(unsafe { SharedRegion::from_raw(boot.base_ptr().add(offset as usize), control.len as usize) }));
+    let binding_owner = RetainedGraph::new(binding.clone());
+    // map_lazy below has no native memory/fd yet. Its ordinary Arena may
+    // drop during setup failure; this pool binding still roots the original
+    // boot mapping, so dropping that temporary Arc cannot unmap native pages.
 
     let t = Instant::now();
     let setup = (|| -> Result<_, String> {
-        let driver = Driver::open(cfg.device).map_err(|e| format!("Driver::open: {e}"))?;
+        let driver = RetainedGraph::new(Arc::new(Driver::open(cfg.device).map_err(|e| format!("Driver::open: {e}"))?));
         let mut gpu_arena = arena::map_lazy(Arc::clone(&boot));
         gpu_arena.memory_type = crate::pool::host_pointer_memory_type(&driver, &boot, poolhdr::HEADER_LEN)?;
-        let control = Control::create(Arc::clone(&control_region), geometry, crate::protocol_ids(), 1)
-            .map_err(|e| format!("Control::create: {e}"))?;
+        let control = RetainedGraph::new(Arc::new(Control::create(Arc::clone(&control_region), geometry, crate::protocol_ids(), 1)
+            .map_err(|e| format!("Control::create: {e}"))?));
         control.stamp_epoch().map_err(|e| format!("stamp_epoch: {e}"))?;
         Ok((driver, gpu_arena, control))
     })();
     let (driver, gpu_arena, control) = match setup {
         Ok(v) => v,
         Err(e) => {
+            server.quarantine(binding.session);
             published(Err(e.clone()));
-            drop(control_region);
-            server.close_session(binding.session);
+            // The retained setup anchors keep every initialized native field,
+            // original control mapping and pool account even during unwinding.
             return Err(e);
         }
     };
@@ -543,16 +576,14 @@ fn run_prepared(
         gpu_arena.memory_type,
         t.elapsed()
     );
-    let control = Arc::new(control);
     set.add(&control);
-    published(Ok(()));
 
     let fns = driver.load_fns();
     crate::entry::report_missing_pub(&fns);
     let mut objects = Objects::new();
     objects.set_pooled(binding.clone());
     let shared = Arc::new(Shared {
-        driver: Arc::new(driver),
+        driver: Arc::clone(&driver),
         arena: gpu_arena,
         objects: Mutex::new(objects),
         fns: Arc::new(fns),
@@ -561,12 +592,18 @@ fn run_prepared(
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
+    // Keep a complete native graph independently of ordinary worker locals.
+    // These anchors leak on unwind/error, before Shared/Driver destructors can
+    // tear down an unconfirmed native device or its original backing.
+    let shared_owner = RetainedGraph::new(Arc::clone(&shared));
+    published(Ok(()));
     let served = sess::serve(Arc::clone(&control), Arc::clone(&shared), geometry.ring_slot_count, cfg.idle);
 
     // As §87's slot path: destroy what the application left if this side
     // knows how; otherwise keep the device and its leases for ever.
     let leftovers = shared.objects.lock().map(|o| o.leftovers()).unwrap_or_default();
-    let mut clean = Arc::strong_count(&shared) == 1;
+    // One local reference plus the scoped retained-graph anchor.
+    let mut clean = Arc::strong_count(&shared) == 2;
     // A session this side ended with an error may still have its application:
     // its ICD still maps the control region. Giving the region to the next
     // session would re-create a live session's rings under it (§97.10), so it
@@ -577,7 +614,8 @@ fn run_prepared(
     }
     if clean && !leftovers.is_empty() {
         let destroyed = shared.objects.lock().map_err(|_| vec!["poisoned".to_string()]).and_then(|mut o| unsafe {
-            let _ = shared.driver.device.device_wait_idle();
+            shared.driver.device.device_wait_idle()
+                .map_err(|e| vec![format!("GPU completion wait failed: {e:?}")])?;
             o.destroy_leftovers(&shared.driver.device, ash::vk::DeviceMemory::null())
         });
         match destroyed {
@@ -591,30 +629,38 @@ fn run_prepared(
             }
         }
     }
+    if clean && let Err(e) = unsafe { shared.driver.device.device_wait_idle() } {
+        eprintln!("[gpu] session {session}: GPU completion wait failed ({e:?}); keeping device and leases");
+        clean = false;
+    }
     if clean {
-        drop(control);
+        // GPU completion was checked above. Transfer the Shared anchor while
+        // all original control/driver/pool anchors remain retained.
+        drop(shared_owner.transfer());
         match Arc::try_unwrap(shared) {
             Ok(s) => {
+                let s = RetainedGraph::new(s);
                 let leases = s.objects.lock().map(|mut o| o.take_leases()).unwrap_or_default();
                 let n = unsafe {
-                    let _ = s.driver.device.device_wait_idle();
                     crate::pool::end_session(&binding, &s.driver.device, leases)
                 };
-                drop(s);
-                eprintln!("[gpu] session {session}: {n} lease(s) and the control region given back");
+                drop(s.transfer());
+                drop(control.transfer());
+                drop(driver.transfer());
+                drop(control_region.transfer());
+                drop(binding_owner.transfer());
+                eprintln!("[gpu] session {session}: {n} lease(s) and the control region given back after checked GPU completion");
             }
             Err(s) => {
+                let _retained = RetainedGraph::new(s);
                 server.quarantine(binding.session);
-                std::mem::forget(s);
                 return Err("the session's state is still shared; its leases are kept".into());
             }
         }
     } else {
         server.quarantine(binding.session);
-        std::mem::forget(shared);
-        std::mem::forget(control);
+        // Every retained anchor deliberately survives normal error return too.
     }
-    drop(control_region);
     served
 }
 
