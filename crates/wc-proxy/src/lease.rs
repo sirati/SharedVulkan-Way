@@ -365,7 +365,7 @@ mod tests {
             if beating {
                 beat += 1;
             }
-            if (t < stop_ping || back) && (t.as_millis() % 500 == 0) {
+            if (t < stop_ping || back) && t.as_millis().is_multiple_of(500) {
                 judge.ping(now);
             }
             match judge.tick(now, Some(beat), w) {
@@ -530,28 +530,41 @@ mod tests {
         assert_eq!(g.sample(Instant::now()), Vm::Gone);
     }
 
-    #[test]
-    fn the_proc_witness_sees_busy_threads() {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let spin: Vec<_> = (0..2)
-            .map(|_| {
-                let s = std::sync::Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !s.load(std::sync::atomic::Ordering::Relaxed) {
-                        std::hint::spin_loop();
-                    }
-                })
-            })
-            .collect();
-        let mut w = ProcVm::for_pid(std::process::id(), "/proc");
-        let t0 = Instant::now();
-        w.sample(t0);
-        std::thread::sleep(Duration::from_millis(1500));
-        let v = w.sample(Instant::now());
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for t in spin {
-            t.join().unwrap();
+    /// A fake `/proc` of one process: `threads` as (tid, state, ticks).
+    fn fake_proc(root: &std::path::Path, pid: u32, threads: &[(u32, char, u64)]) {
+        let task = root.join(pid.to_string()).join("task");
+        let _ = std::fs::remove_dir_all(&task);
+        for (tid, state, ticks) in threads {
+            let d = task.join(tid.to_string());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("stat"), format!("{tid} (CPU {tid}/KVM) {state} 1 2 3 4 5 6 7 8 9 10 {ticks} 0 0 0 20 0 1 0")).unwrap();
         }
-        assert!(matches!(v, Vm::Busy(n) if n >= 2), "{v:?}");
+    }
+
+    #[test]
+    fn the_proc_witness_tells_busy_idle_stopped_and_gone() {
+        let root = std::env::temp_dir().join(format!("wc-lease-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let t0 = Instant::now();
+        let mut w = ProcVm::for_pid(4242, &root);
+        let hz = w.hz as u64;
+        // Twelve vCPUs that never halt over two seconds: Busy(12).
+        fake_proc(&root, 4242, &(0..12).map(|i| (100 + i, 'R', 0)).collect::<Vec<_>>());
+        assert_eq!(w.sample(t0), Vm::Unknown, "one sample is no window");
+        fake_proc(&root, 4242, &(0..12).map(|i| (100 + i, 'R', 2 * hz)).collect::<Vec<_>>());
+        assert_eq!(w.sample(t0 + Duration::from_secs(2)), Vm::Busy(12));
+        // One busy thread (QEMU's main loop) and halted vCPUs: Idle.
+        let mut w = ProcVm::for_pid(4242, &root);
+        fake_proc(&root, 4242, &[(1, 'R', 0), (100, 'S', 0), (101, 'S', 0)]);
+        w.sample(t0);
+        fake_proc(&root, 4242, &[(1, 'R', 2 * hz), (100, 'S', hz / 10), (101, 'S', 1)]);
+        assert_eq!(w.sample(t0 + Duration::from_secs(2)), Vm::Idle);
+        // A stopped thread: Stopped, at once.
+        fake_proc(&root, 4242, &[(1, 'T', 0), (100, 'T', 0)]);
+        assert_eq!(ProcVm::for_pid(4242, &root).sample(t0), Vm::Stopped);
+        // No such process: Gone.
+        std::fs::remove_dir_all(root.join("4242")).unwrap();
+        assert_eq!(ProcVm::for_pid(4242, &root).sample(t0), Vm::Gone);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
