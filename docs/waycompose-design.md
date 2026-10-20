@@ -37598,6 +37598,7 @@ The following thirty-minute observation contained 13 complete GPU D0
 dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
 the busy-loop recovery under that workload. The process that triggers the
 periodic GPU wake remains unidentified.
+
 ## §114. Doorbell writer recovery
 
 A shared compositor outlives its installations. A failed doorbell write must
@@ -37608,12 +37609,19 @@ fd endpoints use that writer too, so a full port cannot block a ring caller.
 multi-install harness to exercise the guest's queued writer path.
 
 Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
-cancellation. If the driver still owns the request, its record, buffer and event
-remain allocated. Returning must not free memory the driver can still access.
-Reads retain their existing completion wait and use the caller's buffer.
+cancellation. Each pipe retains at most 32 still-pending synchronous writes,
+including their event, record and buffer. Writes are capped at 64 KiB per call,
+so the pending buffers consume at most 2 MiB per pipe. A full quarantine refuses
+new writes before allocating or submitting anything. Later completions reclaim
+entries and permit new writes. Pending status, rather than a particular timeout
+code, determines ownership on every return. A pipe with pending writes retains
+its original raw handle and outstanding allocations on shutdown, avoiding a
+blocking close and preserving every kernel buffer. Reads use their independent
+completion wait and never acquire the write quarantine's mutex.
 
 The default Windows `AsyncWriter` issues hints without waiting. Each request
-has an address-stable allocation. Requests still pending after 500 ms move to a
+has an address-stable allocation. The I/O manager publishes its pending status;
+an unexpected write error never clears that status or releases its buffer. Requests still pending after 500 ms move to a
 quarantine after cancellation, and fresh or completed allocations replace them
 in the active pool. Late completions permit reuse. The quarantine holds at most
 256 requests beyond the 32 active slots. If a driver stops completing every
@@ -37621,7 +37629,8 @@ request, hints eventually return `WouldBlock`; the application thread still
 runs. Shutdown retains any allocation and port reference whose request remains
 pending rather than waiting indefinitely for a broken driver.
 
-Tests cover a failed queued hint followed by a delivered hint, and simulated
-Windows cancellations that never complete followed by a late completion. The
+Tests cover a failed queued hint followed by a delivered hint, bounded repeated
+synchronous cancellation failures and handle retention during shutdown, and
+simulated Windows cancellations that never complete followed by a late completion. The
 simulation never submits the fabricated requests to a driver. Test evidence
 and guest measurements belong outside the repository.
