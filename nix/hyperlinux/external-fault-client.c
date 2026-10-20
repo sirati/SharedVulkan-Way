@@ -25,7 +25,9 @@ static void on_fault(int signum, siginfo_t *info, void *context) {
 int main(int argc, char **argv) {
     assert(argc == 2);
     int handled = !strcmp(argv[1], "handled");
-    assert(handled || !strcmp(argv[1], "default"));
+    int blocked = !strcmp(argv[1], "blocked");
+    int ignored = !strcmp(argv[1], "ignored");
+    assert(handled || blocked || ignored || !strcmp(argv[1], "default"));
     char path[] = "/tmp/hl-external-fault-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0 && !unlink(path) && !ftruncate(fd, 16384));
@@ -38,6 +40,13 @@ int main(int argc, char **argv) {
         sigemptyset(&action.sa_mask);
         assert(!sigaction(SIGBUS, &action, NULL));
     }
+    if (blocked) {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGBUS);
+        assert(!sigprocmask(SIG_BLOCK, &mask, NULL));
+    }
+    if (ignored) assert(signal(SIGBUS, SIG_IGN) != SIG_ERR);
     assert(!ftruncate(fd, 0));
     uint32_t value;
     __asm__ volatile("ldr %w0, [%1]" : "=r"(value) : "r"(fault_address) : "memory");

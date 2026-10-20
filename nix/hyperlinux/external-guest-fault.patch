@@ -1,6 +1,6 @@
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -1748,6 +1748,46 @@
+@@ -1748,6 +1748,45 @@
                      break;
                  }
                  }
@@ -34,9 +34,8 @@
 +                 * because this path has no shim ERET. */
 +                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc);
 +                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate);
-+                signal_set_fault_info(code, vexit->exception.virtual_address, esr);
-+                signal_queue(signum);
-+                if (signal_deliver(vcpu, g, &exit_code) < 0) {
++                if (signal_force_fault(vcpu, g, &exit_code, signum, code,
++                                       vexit->exception.virtual_address, esr) < 0) {
 +                    running = 0;
 +                } else {
 +                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc);
@@ -47,3 +46,101 @@
              } else if (ec == 0x30 || ec == 0x32) {
                  /* EC=0x30: Hardware breakpoint from lower EL (EL0).
                   * EC=0x32: Software step exception from lower EL.
+--- a/src/syscall_signal.c
++++ b/src/syscall_signal.c
+@@ -773,18 +773,18 @@
+ }
+
+ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+-                               const linux_siginfo_t *forced) {
++                               const linux_siginfo_t *forced, uint64_t fault_esr) {
+     pthread_mutex_lock(&sig_lock);
+     uint64_t *blocked = thread_blocked_ptr();
+     uint64_t *saved_ptr = thread_saved_blocked_ptr();
+     int *valid_ptr = thread_saved_valid_ptr();
+     int signum, delivered_si_code;
+     if (forced) {
+-        /* A synchronous seccomp trap belongs to this exact vCPU. Do not
++        /* A synchronous fault belongs to this exact vCPU. Do not
+          * enqueue/coalesce it or select an unrelated lower pending signal.
+-         * Like Linux force_sig_info, blocked/ignored synchronous SIGSYS
++         * Like Linux force_sig_info, blocked/ignored synchronous signals
+          * must not disappear and let the trapped syscall resume. */
+-        signum = LINUX_SIGSYS;
++        signum = forced->si_signo;
+         delivered_si_code = forced->si_code;
+         linux_sigaction_t *forced_act = &sig_state.actions[signum - 1];
+         if ((*blocked & sig_bit(signum)) ||
+@@ -844,7 +844,7 @@
+         case SIG_DISP_CORE:
+             *exit_code = 128 + signum;
+             pthread_mutex_unlock(&sig_lock);
+-            *exit_code = forced ? thread_seccomp_terminate(1)
++            *exit_code = forced && signum == LINUX_SIGSYS ? thread_seccomp_terminate(1)
+                                 : proc_request_exit_group(*exit_code);
+             return -1;  /* Terminate */
+         case SIG_DISP_IGN:
+@@ -910,7 +910,10 @@
+      * frame_esr: raw ESR_EL1 for the extended context chain. Rosetta's
+      * SIGTRAP handler reads this to determine BRK immediate value. */
+     uint64_t frame_esr = 0;
+-    if (!forced && pending_fault.valid) {
++    if (forced && fault_esr) {
++        memcpy(&frame.uc.uc_mcontext.fault_address, &forced->si_pid, 8);
++        frame_esr = fault_esr;
++    } else if (!forced && pending_fault.valid) {
+         frame.uc.uc_mcontext.fault_address = pending_fault.addr;
+         frame_esr = pending_fault.esr;
+         pending_fault.valid = 0;  /* Consume (one-shot) */
+@@ -964,7 +967,9 @@
+                 signum, sizeof(frame));
+         *exit_code = 128 + signum;
+         pthread_mutex_unlock(&sig_lock);
+-        if (forced) *exit_code = thread_seccomp_terminate(1);
++        if (forced)
++            *exit_code = signum == LINUX_SIGSYS ? thread_seccomp_terminate(1)
++                                               : proc_request_exit_group(*exit_code);
+         return -1;
+     }
+
+@@ -1024,7 +1027,7 @@
+ }
+
+ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code) {
+-    return signal_deliver_info(vcpu, g, exit_code, NULL);
++    return signal_deliver_info(vcpu, g, exit_code, NULL, 0);
+ }
+
+ int signal_force_seccomp(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+@@ -1043,7 +1046,18 @@
+     memcpy(payload + 16, &call_addr, sizeof(call_addr));
+     memcpy(payload + 24, &nr, sizeof(nr));
+     memcpy(payload + 28, &arch, sizeof(arch));
+-    return signal_deliver_info(vcpu, g, exit_code, &info);
++    return signal_deliver_info(vcpu, g, exit_code, &info, 0);
++}
++
++/* Deliver a CPU fault synchronously on its originating vCPU. */
++int signal_force_fault(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
++                       int signum, int code, uint64_t addr, uint64_t esr) {
++    linux_siginfo_t info;
++    memset(&info, 0, sizeof(info));
++    info.si_signo = signum;
++    info.si_code = code;
++    memcpy(&info.si_pid, &addr, sizeof(addr));
++    return signal_deliver_info(vcpu, g, exit_code, &info, esr);
+ }
+
+ /* ---------- rt_sigreturn ---------- */
+--- a/src/syscall_signal.h
++++ b/src/syscall_signal.h
+@@ -240,6 +240,9 @@
+  *         -1 if process should terminate (default TERM/CORE disposition).
+  * On terminate, *exit_code is set to 128 + signum. */
+ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
++/* Exact-vCPU synchronous CPU fault. Blocked/ignored faults become fatal. */
++int signal_force_fault(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
++                       int signum, int code, uint64_t addr, uint64_t esr);
+
+ /* Deliver synchronous seccomp SIGSYS to this exact vCPU, without touching
+  * the asynchronous pending queue. Blocked/ignored SIGSYS becomes fatal.
