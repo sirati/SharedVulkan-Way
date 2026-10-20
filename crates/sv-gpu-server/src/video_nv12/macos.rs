@@ -28,7 +28,8 @@ unsafe extern "C" {
     fn IOSurfaceGetHeightOfPlane(surface: *mut c_void, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerRowOfPlane(surface: *mut c_void, plane: usize) -> usize;
     fn IOSurfaceGetBytesPerElementOfPlane(surface: *mut c_void, plane: usize) -> usize;
-    fn IOSurfaceGetOffsetOfPlane(surface: *mut c_void, plane: usize) -> usize;
+    fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
+    fn IOSurfaceGetBaseAddressOfPlane(surface: *mut c_void, plane: usize) -> *mut c_void;
     fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
 }
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -75,13 +76,17 @@ impl Picture {
             let surface = CVPixelBufferGetIOSurface(buffer);
             if surface.is_null() || CVPixelBufferGetPlaneCount(buffer) != 2
                 || IOSurfaceGetPlaneCount(surface) != 2 { return Err("NV12 needs a two-plane IOSurface"); }
+            // Use documented IOSurface address metadata, never pixel reads.
+            let base = IOSurfaceGetBaseAddress(surface) as usize;
+            if base == 0 { return Err("NV12 surface has no address metadata"); }
             let mut planes = [Plane { width: 0, height: 0, offset: 0, stride: 0 }; 2];
             for (i, p) in planes.iter_mut().enumerate() {
                 if IOSurfaceGetBytesPerElementOfPlane(surface, i) != i + 1 { return Err("NV12 plane element size"); }
                 *p = Plane { width: CVPixelBufferGetWidthOfPlane(buffer, i),
                     height: CVPixelBufferGetHeightOfPlane(buffer, i),
                     stride: CVPixelBufferGetBytesPerRowOfPlane(buffer, i),
-                    offset: IOSurfaceGetOffsetOfPlane(surface, i) };
+                    offset: (IOSurfaceGetBaseAddressOfPlane(surface, i) as usize).checked_sub(base)
+                        .ok_or("NV12 plane precedes surface allocation")? };
                 if (p.width, p.height, p.stride) != (IOSurfaceGetWidthOfPlane(surface, i),
                     IOSurfaceGetHeightOfPlane(surface, i), IOSurfaceGetBytesPerRowOfPlane(surface, i)) {
                     return Err("CVPixelBuffer and IOSurface plane layouts disagree");
