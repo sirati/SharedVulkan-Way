@@ -8,7 +8,26 @@
  #include "hl_shared.h"
  #include "hl_copy.h"
  #include "syscall_internal.h"  /* hl_verbose */
-@@ -675,122 +676,77 @@
+@@ -527,12 +528,13 @@
+
+ /* ---------- Overflow segment management ---------- */
+
+-/* Resolve a GPA to a host pointer within overflow segments.
+- * Returns NULL if the GPA is not in any overflow segment. */
+-static void *guest_overflow_resolve(const guest_t *g, uint64_t gpa) {
++/* Overflow segment starts are absolute IPAs passed to hv_vm_map, not
++ * offsets from the primary mapping's ipa_base. Clip to the retained segment. */
++static void *guest_overflow_resolve(const guest_t *g, uint64_t ipa, uint64_t *span) {
+     for (int i = 0; i < g->noverflow; i++) {
+-        uint64_t off = gpa - g->overflow[i].ipa_start;
+-        if (off < g->overflow[i].size)
++        uint64_t off;
++        if (!hl_pt_backing_offset(ipa, g->overflow[i].ipa_start,
++                                  g->overflow[i].size, &off, span))
+             return (uint8_t *)g->overflow[i].host_base + off;
+     }
+     return NULL;
+@@ -675,122 +677,75 @@
      g->naliases = 0;
  }
 
@@ -83,12 +102,10 @@
 +                                  trusted, ipa, avail);
 +}
 +static void *guest_primary_backing(const guest_t *g, uint64_t ipa, uint64_t *span) {
-+    if (ipa >= g->ipa_base && ipa - g->ipa_base < g->guest_size) {
-+        uint64_t off = ipa - g->ipa_base;
-+        if (*span > g->guest_size - off) *span = g->guest_size - off;
++    uint64_t off;
++    if (!hl_pt_backing_offset(ipa, g->ipa_base, g->guest_size, &off, span))
 +        return (uint8_t *)g->host_base + off;
-+    }
-+    return guest_overflow_resolve(g, ipa);
++    return guest_overflow_resolve(g, ipa, span);
 +}
 +
 +/* Trusted kernel access for initializing/clearing private mmap backing, not
@@ -198,7 +215,7 @@
  }
 
  static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
-@@ -831,6 +787,29 @@
+@@ -831,6 +786,29 @@
 
  void *guest_ptr_access(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
      return gva_resolve(g, gva, avail, write);

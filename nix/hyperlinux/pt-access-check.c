@@ -49,5 +49,22 @@ int main(void) {
     tables[2][384] = 0x4003; tables[3][0] = 0xb00000 | 3 | (1 << 10) | (3 << 6);
     assert(!translate(UINT64_C(0xfffffffff0000000), 0, 0, &ipa, &avail) && ipa == 0xb00000);
     assert(translate(UINT64_C(0xfffffffff0000000), 1, 0, &ipa, &avail) < 0);
+    /* Nonidentity VA translation into an absolute overflow IPA, with a
+     * nonzero primary IPA base. Subtracting that base would resolve wrongly. */
+    memset(tables, 0, sizeof(tables));
+    tables[0][256] = 0x2003; tables[1][0] = 0x3003;
+    tables[2][2] = 0x4003;
+    tables[3][1] = UINT64_C(0x100a00000) | 3 | (1 << 10) | (1 << 6);
+    assert(!translate(UINT64_C(0x800000401123), 1, 0, &ipa, &avail));
+    uint64_t off;
+    assert(ipa == UINT64_C(0x100a00123));
+    assert(hl_pt_backing_offset(ipa, UINT64_C(0x100000000), 0x800000, &off, &avail) < 0);
+    assert(!hl_pt_backing_offset(ipa, UINT64_C(0x100a00000), 0x4000, &off, &avail) && off == 0x123);
+    assert(hl_pt_backing_offset(ipa - UINT64_C(0x100000000), UINT64_C(0x100a00000), 0x4000, &off, &avail) < 0);
+    avail = 4096;
+    assert(!hl_pt_backing_offset(UINT64_C(0x100a03fff), UINT64_C(0x100a00000), 0x4000, &off, &avail) && avail == 1);
+    /* A TTBR1 leaf's kbuf GPA is retained inside the primary buffer. */
+    avail = 4096;
+    assert(!hl_pt_backing_offset(0xb00123, 0, 0x1000000, &off, &avail) && off == 0xb00123);
     puts("pt-access-check: leaf/table permissions, invalid/AF denial, page bounds, aliases and TTBR1 passed");
 }
