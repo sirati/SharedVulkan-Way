@@ -34657,7 +34657,14 @@ wakes the control thread. Here the hub wakes it, which is why this branch
 does not show it; the plain path is a separate fix.
 
 The larger runs, with the hop trace on, so that every sample can be placed
-against the GPU's power transitions (`scripts/wc-hop-stats.py`):
+against the GPU's power transitions (`scripts/wc-hop-stats.py`). The statistics
+script converts both ends of each request with the timeline's fitted clock
+offset and drift. It refuses GPU-wake attribution without a clock fit; RTT
+statistics without a wake file still work with guest stamps alone. The
+machine-readable fit is available through `wc-hop-timeline.py RUNDIR
+--clock-json`. Regression checks run with `python3 scripts/test-wc-hop-stats.py`.
+Reanalysis of `final-c` with this conversion leaves the table below unchanged:
+
 
 | gap | n | mean | p50 | p99 | max | within a GPU wake (set apart) |
 |---|---|---|---|---|---|---|
@@ -34667,8 +34674,9 @@ against the GPU's power transitions (`scripts/wc-hop-stats.py`):
 | 1 s | 300 | 306.7 µs | 275.0 | 812.9 | 5.4 ms | 32, mean 309.0 |
 | 1 s, final configuration | 60 + 200 | 298–317 µs | 262–287 | 470–1341 | 5.5 ms | not traced |
 
-The bound is met back to back and, by the median, at 20 ms. It is **not**
-met by the mean at 1 s between requests: about 300 µs. Where it goes is in
+The mean target is met back to back and in the 180.2 µs final-configuration
+20 ms run. The larger 20 ms run fails it at 240.0 µs, despite its 144.7 µs
+median. The 1 s mean also fails at about 300 µs. Where it goes is in
 the timeline above: on the guest ~105 µs before the request is in the
 ring (a thread's wake on a halted vCPU and the vioser write), ~140 µs
 through QEMU, the hub and the proxy and back, and ~30 µs for the
