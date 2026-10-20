@@ -17,14 +17,48 @@ in this order:
    the external export handle types.
 4. Image creation and memory allocation follow.
 
-The macOS server changes a HOST_ALLOCATION external query into MTLTEXTURE import.
-It leaves a query without an external handle unchanged. The KosmicKrisp import
-patch permits LINEAR color attachments only for MTLTEXTURE import, while the
-server advertises LINEAR color-attachment format features for its IOSurface
-formats. Consequently stock Zink can reject the earlier plain LINEAR candidate
-before it ever asks for shared memory. This explains a possible absence of
-`svAllocShared`, but needs the query matrix on the actual guest to prove which
-candidate failed.
+The earlier implementation changed only HOST_ALLOCATION external queries and
+unconditionally added LINEAR format features. That did not resolve stock Zink's
+plain query and advertised support the ordinary allocation path did not provide.
+
+The current transport supplies one storage contract for supported plain and
+external LINEAR BGRA/RGBA 2D images. Both image-format query forms ask the real
+driver about MTLTEXTURE import. No driver refusal becomes success. The response
+requires IMPORTABLE, a compatible MTLTEXTURE handle, and sample-count one. Limits
+are narrowed to one mip level, one layer and one sample, matching the wrapper.
+Creation uses the same external texture chain and independently checks the exact
+usage, flags, dimensions and limits with the driver. Requirements allow only the
+transport's DEVICE_LOCAL type and require a dedicated image allocation. An
+ordinary dedicated vkAllocateMemory creates the IOSurface, wraps it as a Metal
+texture and imports that texture as the image's real memory. The normal bind
+path receives that actual image and imported memory with offset zero. The
+compositor export protocol is used only for exports; ordinary native images do
+not register names with a compositor.
+
+Additional LINEAR format features are conditional on the driver's optimal format
+features and successful MTLTEXTURE import queries for the corresponding usage.
+COLOR_ATTACHMENT, COLOR_ATTACHMENT_BLEND and BLIT_DST are never added solely
+because the format appears in a list. The permitted driver change remains
+`~/nix-config/darwin/patches/mesa/0001-kosmickrisp-import-mtltexture.patch`.
+Its kk_GetPhysicalDeviceImageFormatProperties2 path permits imported LINEAR
+color storage and keeps INPUT_ATTACHMENT refused; its memory import path binds
+the actual retained Metal texture. No Zink or Firefox patch is involved.
+
+A retained surface can be imported into another image only when its actual
+width, height, bytes per element, fourcc and pitch match that target image's
+layout, the layout offset is zero, and the entire required image span fits the
+surface's authoritative allocation. This check also applies to newly allocated
+surfaces. A target with different dimensions, RGBA/BGRA interpretation, stride,
+nonzero offset or excessive span is refused before creating/importing a texture.
+
+The portable metal_image regressions cover query/create storage consistency,
+restricted limits, actual import-feature requirements, unsupported usage, and
+source/target layout compatibility. The headless macos-linear-image example is
+the hardware gate for query, create, dedicated requirements, allocation and bind
+for all four supported formats. Cross-linking it does not prove a native driver
+run or rendered pixels. Stock Zink's INPUT_ATTACHMENT candidate remains a
+separate restriction, and the ordinary image route still requires this native
+hardware execution gate before it is claimed to work end to end.
 
 A second independent restriction concerns input attachments. Zink's
 `get_image_usage_for_feats` adds INPUT_ATTACHMENT for a render target unless both
