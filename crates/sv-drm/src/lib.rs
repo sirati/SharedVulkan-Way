@@ -29,3 +29,6 @@ pub mod token;
 pub mod relay;
 #[cfg(target_os = "linux")]
 pub mod fusenode;
+
+#[cfg(unix)]
+pub mod native_prime;
