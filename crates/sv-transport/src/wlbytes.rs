@@ -421,14 +421,9 @@ impl ByteChannel {
     /// Park on producer credits after recording the epoch before the caller's
     /// last readiness check. Consumer head publication rings this lane.
     pub fn wait_writable_since(&self, epoch: u32, timeout: std::time::Duration) -> Result<bool> {
-        use std::sync::atomic::Ordering;
         if self.write_capacity()? > 0 { return Ok(true); }
         let bell = self.tx_credit_bell()?;
-        bell.parked.fetch_add(1, Ordering::SeqCst);
-        if self.write_capacity()? == 0 {
-            crate::park::sys::wait(bell.wake, epoch, timeout);
-        }
-        bell.parked.fetch_sub(1, Ordering::SeqCst);
+        bell.wait_while(epoch, timeout, || -> Result<bool> { Ok(self.write_capacity()? == 0) })?;
         Ok(self.write_capacity()? > 0)
     }
 
@@ -603,17 +598,11 @@ impl ByteChannel {
 
     /// [`Self::wait_readable`], sleeping only if nothing rang since `epoch`.
     pub fn wait_readable_since(&self, epoch: u32, timeout: std::time::Duration) -> Result<bool> {
-        use std::sync::atomic::Ordering;
         if self.readable()? {
             return Ok(true);
         }
         let bell = self.rx_bell()?;
-        let seen = epoch;
-        bell.parked.fetch_add(1, Ordering::SeqCst);
-        if !self.readable()? {
-            crate::park::sys::wait(bell.wake, seen, timeout);
-        }
-        bell.parked.fetch_sub(1, Ordering::SeqCst);
+        bell.wait_while(epoch, timeout, || -> Result<bool> { Ok(!self.readable()?) })?;
         self.readable()
     }
 
@@ -1075,6 +1064,35 @@ mod tests {
         assert_eq!(first.read_shared(&mut rest, &cursor).unwrap(), ReadOutcome::Bytes(4));
         assert_eq!(&rest[..4], b"6789");
         assert!(writer.free_bytes().unwrap() > credit_before);
+    }
+
+    #[test]
+    fn readiness_query_error_disarms_the_canonical_bell() {
+        use std::sync::atomic::Ordering;
+        let (_control, writer, _reader) = pair();
+        let bell = writer.tx_credit_bell().unwrap();
+        let result = bell.wait_while(0, std::time::Duration::ZERO, || -> Result<bool> {
+            assert_eq!(bell.parked.load(Ordering::Acquire), 1);
+            Err(Error::BadColdMessage("query failed after arming"))
+        });
+        assert!(result.is_err());
+        assert_eq!(bell.parked.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn inconsistent_alias_readiness_snapshot_never_underflows_capacity() {
+        use std::sync::atomic::Ordering;
+        let (control, writer, _reader) = pair();
+        let base = control.ring_ctrl_offset(writer.slot()).unwrap();
+        let head = control.region().atomic_u64(base + crate::control::RC_CMD_HEAD).unwrap();
+        let tail = control.region().atomic_u64(base + crate::control::RC_CMD_TAIL).unwrap();
+        head.store(64, Ordering::Release);
+        tail.store(32, Ordering::Release);
+        assert_eq!(writer.write_capacity().unwrap(), 0);
+        head.store(0, Ordering::Release);
+        tail.store(writer.max_chunk() as u64 * 4, Ordering::Release);
+        assert_eq!(writer.write_capacity().unwrap(), 0);
+        tail.store(0, Ordering::Release);
+        assert!(writer.write_capacity().unwrap() > 0);
     }
 
 }

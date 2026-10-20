@@ -596,9 +596,14 @@ impl RingProducer {
     /// Payload bytes that fit now, including packet alignment and wrap pads.
     pub fn available_payload(&self) -> Result<usize> {
         self.check_generation()?;
-        let tail = self.region.atomic_u64(self.lanes.tail_off)?.load(Ordering::Relaxed);
+        // Read head first for independent readiness observers. A concurrent
+        // alias may produce and the consumer may advance between these loads;
+        // an inconsistent snapshot conservatively reports no writable payload.
         let head = self.region.atomic_u64(self.lanes.head_off)?.load(Ordering::Acquire);
-        let free = self.lanes.capacity - tail.wrapping_sub(head);
+        let tail = self.region.atomic_u64(self.lanes.tail_off)?.load(Ordering::Acquire);
+        let used = tail.wrapping_sub(head);
+        if used > self.lanes.capacity { return Ok(0); }
+        let free = self.lanes.capacity - used;
         let to_end = self.lanes.capacity - (tail & (self.lanes.capacity - 1));
         let contiguous = free.min(to_end) / PACKET_ALIGN * PACKET_ALIGN;
         let before = contiguous.saturating_sub(PACKET_HEADER_SIZE);
