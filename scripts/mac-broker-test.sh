@@ -41,7 +41,7 @@ say() { echo "[broker-test] $*"; }
 G='Library/Application Support/waycompose'
 SYS='/Library/Application Support/waycompose'
 broker_log() { vm "sudo -n cat /Library/Logs/waycompose/broker.log" 2>/dev/null; }
-panics() { vm 'ls /Library/Logs/DiagnosticReports/*.panic 2>/dev/null | wc -l' | tr -d ' '; }
+panics() { vm 'find /Library/Logs/DiagnosticReports -type f -name "*.panic" | wc -l' | tr -d ' '; }
 
 # The main process as mac-gpu.sh starts it; prints the session id.
 start_main() {
@@ -73,10 +73,12 @@ phase_rtt() {
   [ -n "$sid" ] || { say "no session"; return 1; }
   sleep 3
   say "session $sid; 2000 round trips"
-  WAYLAND_DISPLAY="/tmp/wc-launch/$sid/wl-proxy" "$SCR/rtt" 2000 | tee "$EVID/$TAG-rtt.txt"
+  local rc=0
+  WAYLAND_DISPLAY="/tmp/wc-launch/$sid/wl-proxy" "$SCR/rtt" 2000 | tee "$EVID/$TAG-rtt.txt" || rc=$?
   # The main process's CPU over 30 s idle, as §103.15 measured it.
   vm "top -l 2 -s 30 -pid ${sid#wcm-} -stats pid,cpu,command | tail -1" | tee -a "$EVID/$TAG-rtt.txt"
   vm "kill ${sid#wcm-}"; sleep 4
+  return "$rc"
 }
 
 phase_gpu() {
@@ -178,7 +180,7 @@ phase_users() {
 for p in "$@"; do
   case $p in
     state) phase_state ;;
-    rtt) phase_rtt ;;
+    rtt) phase_rtt || exit 1 ;;
     gpu) phase_gpu ;;
     kill) phase_kill "${KILLS:-5}" ;;
     term) phase_term || exit 1 ;;
