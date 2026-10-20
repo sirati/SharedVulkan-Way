@@ -12,7 +12,11 @@ its first pool. `Handle::create_section` then allocates the original backing
 from the same BAR ownership directory used by the Cygwin adapter. A provider
 failure ends allocation; it never falls back to a guest-local section. The
 mapping retains the BAR owner, while common producer, pending-transfer and
-consumer references protect every extent.
+consumer references coordinate each extent's normal lifetime. This directory
+is cooperative state, not a privileged allocation authority. Normal explicit
+Handle/map release can be measured; hostile peers and abrupt process death
+need the separate protected driver/broker retirement work. Abandoned mappings
+are retained rather than treating DLL teardown or elapsed time as a drain.
 
 Native applications must send resources through
 `wc_transport::send_handle_message`. That API prepares one resource transfer,
