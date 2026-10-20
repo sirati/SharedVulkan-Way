@@ -157,4 +157,3 @@ impl Token {
         Ok(Token { size, nonce, name: name.to_string(), record })
     }
 }
-

@@ -38,6 +38,8 @@ $Exe = Join-Path $Dir "sv-guest.exe"
 $Data = Join-Path $env:ProgramData "waycompose"
 $Keys = Join-Path $Data "keys"
 $OldTask = "waycompose port access"
+$Before = Join-Path $Data "pre-broker"
+$LegacyFiles = @("wc-port-access.ps1", "wc-port-access.log", "ports.json")
 
 function Say($s) { Write-Host "[wc-broker-install] $s" }
 
@@ -49,12 +51,24 @@ function Run([string]$exe, [string[]]$a) {
   return @($code, $out)
 }
 
+# Ownership grants WRITE_DAC independently of the DACL. Replace both the
+# owner and the entire DACL, including explicit grants from an older install.
+function Secure-Path([string]$p, [bool]$Directory, [bool]$UsersRead) {
+  $acl = Get-Acl -LiteralPath $p
+  $inherit = if ($Directory) { "OICI" } else { "" }
+  $sddl = "O:BAD:P(A;$inherit;FA;;;SY)(A;$inherit;FA;;;BA)"
+  if ($UsersRead) { $sddl += "(A;$inherit;FRFX;;;BU)" }
+  $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
+  $acl.SetSecurityDescriptorSddlForm($sddl, $sections)
+  Set-Acl -LiteralPath $p -AclObject $acl
+}
+
 function Secure-Dir([string]$d, [bool]$UsersRead) {
+  if ((Test-Path -LiteralPath $d) -and ((Get-Item -Force -LiteralPath $d).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "refusing reparse directory $d"
+  }
   New-Item -ItemType Directory -Force -Path $d | Out-Null
-  $g = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
-  if ($UsersRead) { $g += "*S-1-5-32-545:(OI)(CI)RX" }
-  $r = Run icacls.exe (@($d, "/inheritance:r", "/grant:r") + $g)
-  if ($r[0] -ne 0) { throw "icacls $d failed: $($r[1])" }
+  Secure-Path $d $true $UsersRead
 }
 
 switch ($Action) {
@@ -66,6 +80,14 @@ switch ($Action) {
     Secure-Dir $Data $false
     Secure-Dir $Keys $false
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    $baseline = Join-Path $Data "devices.txt"
+    if (-not (Test-Path $baseline)) {
+      if ($svc -or (Test-Path (Join-Path $Before "complete")) -or (Test-Path (Join-Path $Data "devices.secured"))) {
+        throw "lost device baseline; trusted recovery required before changing the service"
+      }
+      [IO.File]::WriteAllBytes($baseline, [byte[]]@())
+      Secure-Path $baseline $false $false
+    }
     if ($svc -and $svc.Status -ne "Stopped") {
       Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
       (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))
@@ -75,6 +97,7 @@ switch ($Action) {
       try { Remove-Item -Force $Exe } catch { Rename-Item -Force $Exe ("sv-guest.exe.old-" + (Get-Date -Format "yyyyMMddHHmmss")) }
     }
     Copy-Item -Force $src $Exe
+    Secure-Path $Exe $false $true
     # Not `sc.exe create binPath= "..."`: Windows PowerShell 5 passes the
     # quotes a path with a space needs to a native program mangled.
     $bin = "`"$Exe`" broker"
@@ -90,18 +113,41 @@ switch ($Action) {
     $r = Run sc.exe @("failure", $Name, "reset=", "86400", "actions=", "restart/1000/restart/5000/restart/30000")
     if ($r[0] -ne 0) { throw "sc.exe failure: $($r[1])" }
     Run sc.exe @("failureflag", $Name, "1") | Out-Null
+    # Keep the first baseline across upgrades and repeated installations.
+    if (-not (Test-Path (Join-Path $Before "complete"))) {
+      if (Test-Path $Before) { throw "incomplete pre-broker backup at $Before; restore or inspect it before retrying" }
+      Secure-Dir $Before $false
+      $task = Get-ScheduledTask -TaskName $OldTask -ErrorAction SilentlyContinue
+      if ($task) {
+        Export-ScheduledTask -TaskName $OldTask | Set-Content -Encoding Unicode (Join-Path $Before "task.xml")
+      }
+      foreach ($f in $LegacyFiles) {
+        $p = Join-Path $Dir $f
+        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $Before $f) }
+      }
+      New-Item -ItemType File -Path (Join-Path $Before "complete") -Force | Out-Null
+      Get-ChildItem -File $Before | ForEach-Object { Secure-Path $_.FullName $false $false }
+    }
     # §91's per-user grant is superseded: the broker sets the devices'
     # descriptors itself at every start.
     if (Get-ScheduledTask -TaskName $OldTask -ErrorAction SilentlyContinue) {
       Unregister-ScheduledTask -TaskName $OldTask -Confirm:$false
       Say "removed the task '$OldTask' (wc-port-access.ps1, §91)"
     }
-    foreach ($f in @("wc-port-access.ps1", "wc-port-access.log", "ports.json")) {
+    foreach ($f in $LegacyFiles) {
       Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Dir $f)
     }
     Start-Service -Name $Name
     (Get-Service -Name $Name).WaitForStatus("Running", (New-TimeSpan -Seconds 15))
-    Start-Sleep -Milliseconds 500
+    # SCM Running alone precedes asynchronous startup checks. Require the
+    # public broker to answer and independently verify current raw protection.
+    $until = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+      $ready = Run $Exe @("broker", "ready")
+      if ($ready[0] -eq 0) { break }
+      Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $until)
+    if ($ready[0] -ne 0) { throw "broker installation failed readiness/protection verification: $($ready[1])" }
     $log = Join-Path $Data "broker.log"
     if (Test-Path $log) { Get-Content -Tail 12 $log | ForEach-Object { Say "log: $_" } }
     Say "installed: $Exe as service $Name (LocalSystem, automatic, restarted on failure)"
@@ -111,11 +157,31 @@ switch ($Action) {
     $k = (@($input) -join "").Trim()
     if (-not $k) { $k = [Console]::In.ReadToEnd().Trim() }
     if ($k -notmatch '^[0-9a-f]{64}$') { throw "the key on stdin is not 64 hex digits" }
+    Secure-Dir $Data $false
     Secure-Dir $Keys $false
     $p = Join-Path $Keys "$Install.key"
-    [IO.File]::WriteAllText($p, $k)
-    $r = Run icacls.exe @($p, "/inheritance:r", "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F")
-    if ($r[0] -ne 0) { throw "icacls $p failed: $($r[1])" }
+    if ((Test-Path -LiteralPath $p) -and ((Get-Item -Force -LiteralPath $p).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw "refusing reparse key $p"
+    }
+    # Replace the object, never overwrite a formerly exposed key in place.
+    # A desktop process may still have the old object open with read sharing;
+    # changing its DACL cannot revoke that handle's access to new bytes.
+    $tmp = Join-Path $Keys (".key-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    try {
+      $stream = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        $bytes = [Text.Encoding]::ASCII.GetBytes($k)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+      } finally { $stream.Dispose() }
+      Secure-Path $tmp $false $false
+      # A failure leaves the signer unavailable rather than publishing to an
+      # existing object. The protected parent prevents desktop replacement.
+      if (Test-Path -LiteralPath $p) { Remove-Item -Force -LiteralPath $p }
+      Move-Item -LiteralPath $tmp -Destination $p
+    } finally {
+      if (Test-Path -LiteralPath $tmp) { Remove-Item -Force -LiteralPath $tmp }
+    }
     Say "key of installation $Install stored in $p (SYSTEM and Administrators only)"
   }
   "show" {
@@ -128,13 +194,71 @@ switch ($Action) {
     if (Test-Path $Keys) { Get-ChildItem $Keys | ForEach-Object { Say "key: $($_.Name)" } }
   }
   "uninstall" {
-    if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
-      Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
-      Run sc.exe @("delete", $Name) | Out-Null
+    # Saved legacy grant code can reopen raw devices after a safe descriptor
+    # restoration. Its old task or script is not a reviewed drain boundary.
+    # Refuse before touching the service, even with a restricted raw baseline.
+    foreach ($legacy in @("task.xml", "wc-port-access.ps1", "ports.json")) {
+      if (Test-Path -LiteralPath (Join-Path $Before $legacy)) {
+        throw "uninstall refused before service mutation: unreviewed legacy grant restoration ($legacy); retain broker protections and use protected application rollback"
+      }
+    }
+    # Do not stop a working broker when rollback would expose uncleared BARs.
+    if (-not (Test-Path $Exe)) { throw "broker executable missing; cannot prove safe uninstall" }
+    $check = Run $Exe @("broker", "revert-acl-check")
+    if ($check[0] -ne 0) { throw "uninstall refused before service mutation: $($check[1])" }
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    $wasRunning = $svc -and ($svc.Status -eq 'Running')
+    try {
+      # The holder serves one broker connection. Stop the broker to query it,
+      # keeping its service registration and every protection in place.
+      if ($svc -and $svc.Status -ne 'Stopped') {
+        Stop-Service -Name $Name -Force
+        (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))
+      }
+      $quit = Run $Exe @("broker", "holder-quit")
+      if ($quit[0] -ne 0) { throw "holder did not prove empty: $($quit[1])" }
+      $restore = Run $Exe @("broker", "revert-acl")
+      if ($restore[0] -ne 0) { throw "device restoration refused: $($restore[1])" }
+      Say "device: $($restore[1])"
+      if ((Test-Path (Join-Path $Data "devices.txt")) -or (Test-Path (Join-Path $Data "devices.secured"))) {
+        throw "device restoration incomplete; baseline or checkpoint retained for trusted recovery"
+      }
+    } catch {
+      $failure = $_
+      if ($wasRunning) {
+        try {
+          Start-Service -Name $Name
+          (Get-Service -Name $Name).WaitForStatus("Running", (New-TimeSpan -Seconds 15))
+        } catch { throw "uninstall refused; service recovery failed: $_; original failure: $failure" }
+      }
+      throw "uninstall refused; service/protection/binary retained: $failure"
+    }
+    if ($svc) {
+      $deleted = Run sc.exe @("delete", $Name)
+      if ($deleted[0] -ne 0) { throw "service deletion failed: $($deleted[1])" }
+    }
+    if (Test-Path (Join-Path $Before "complete")) {
+      foreach ($f in $LegacyFiles) {
+        $p = Join-Path $Before $f
+        if (Test-Path $p) {
+          $restored = Join-Path $Dir $f
+          Copy-Item -Force $p $restored
+          Secure-Path $restored $false $true
+        }
+      }
+      $xml = Join-Path $Before "task.xml"
+      if (Test-Path $xml) {
+        Register-ScheduledTask -TaskName $OldTask -Xml ([IO.File]::ReadAllText($xml)) -Force | Out-Null
+      }
+      Remove-Item -Recurse -Force $Before
     }
     if (Test-Path $Exe) {
-      & $Exe broker revert-acl | ForEach-Object { Say "device: $_" }
-      & $Exe broker holder-quit 2>$null | Out-Null
+      try { Remove-Item -Force $Exe }
+      catch { Rename-Item -Force $Exe ("sv-guest.exe.old-" + (Get-Date -Format "yyyyMMddHHmmss")) }
+    }
+    Get-ChildItem -Path $Dir -Filter "sv-guest.exe.old-*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if ((Test-Path $Dir) -and -not (Get-ChildItem -Force $Dir | Select-Object -First 1)) {
+      Remove-Item -Force $Dir
     }
     Say "uninstalled: the service is gone and the devices have their descriptors from before; $Keys is kept"
   }
