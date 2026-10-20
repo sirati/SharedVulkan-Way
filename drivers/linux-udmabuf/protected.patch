@@ -1,0 +1,345 @@
+--- a/drivers/dma-buf/udmabuf.c
++++ b/drivers/dma-buf/udmabuf.c
+@@ -15,6 +15,7 @@
+ #include <linux/udmabuf.h>
+ #include <linux/vmalloc.h>
+ #include <linux/iosys-map.h>
++#include "udmabuf-protected.h"
+ 
+ static int list_limit = 1024;
+ module_param(list_limit, int, 0644);
+@@ -25,6 +26,7 @@
+ MODULE_PARM_DESC(size_limit_mb, "Max size of a dmabuf, in megabytes. Default is 64.");
+ 
+ struct udmabuf {
++	struct udmabuf_retirement *retirement;
+ 	pgoff_t pagecount;
+ 	struct folio **folios;
+ 
+@@ -92,6 +94,8 @@
+ 
+ static const struct vm_operations_struct udmabuf_vm_ops = {
+ 	.fault = udmabuf_vm_fault,
++	.open = udmabuf_vma_open,
++	.close = udmabuf_vma_close,
+ };
+ 
+ static int mmap_udmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+@@ -101,9 +105,25 @@
+ 	if ((vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) == 0)
+ 		return -EINVAL;
+ 
++	if (ubuf->retirement) {
++		if (vma->vm_pgoff > ubuf->pagecount ||
++		    vma_pages(vma) > ubuf->pagecount - vma->vm_pgoff)
++			return -EINVAL;
++		if ((vma->vm_flags & VM_EXEC) ||
++		    (udmabuf_is_readonly(ubuf) && (vma->vm_flags & VM_WRITE)))
++			return -EACCES;
++		vm_flags_clear(vma, VM_MAYEXEC);
++		if (udmabuf_is_readonly(ubuf))
++			vm_flags_clear(vma, VM_MAYWRITE);
++	}
++	/* Retain this exact dma-buf file even if an importer called the
++	 * exporter directly instead of the public dma_buf_mmap helper. */
++	if (ubuf->retirement)
++		vma_set_file(vma, buf->file);
+ 	vma->vm_ops = &udmabuf_vm_ops;
+ 	vma->vm_private_data = ubuf;
+ 	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	udmabuf_vma_open(vma);
+ 	return 0;
+ }
+ 
+@@ -115,6 +135,8 @@
+ 	pgoff_t pg;
+ 
+ 	dma_resv_assert_held(buf->resv);
++	if (udmabuf_is_readonly(ubuf))
++		return -EACCES;
+ 
+ 	pages = kvmalloc_array(ubuf->pagecount, sizeof(*pages), GFP_KERNEL);
+ 	if (!pages)
+@@ -130,6 +152,8 @@
+ 		return -EINVAL;
+ 
+ 	iosys_map_set_vaddr(map, vaddr);
++	if (ubuf->retirement)
++		atomic_inc(&ubuf->retirement->vmaps);
+ 	return 0;
+ }
+ 
+@@ -140,6 +164,8 @@
+ 	dma_resv_assert_held(buf->resv);
+ 
+ 	vm_unmap_ram(map->vaddr, ubuf->pagecount);
++	if (ubuf->retirement)
++		atomic_dec(&ubuf->retirement->vmaps);
+ }
+ 
+ static struct sg_table *get_sg_table(struct device *dev, struct dma_buf *buf,
+@@ -186,14 +212,24 @@
+ static struct sg_table *map_udmabuf(struct dma_buf_attachment *at,
+ 				    enum dma_data_direction direction)
+ {
+-	return get_sg_table(at->dev, at->dmabuf, direction);
++	struct udmabuf *ubuf = at->dmabuf->priv;
++	struct sg_table *sg;
++	if (udmabuf_is_readonly(ubuf))
++		return ERR_PTR(-EACCES);
++	sg = get_sg_table(at->dev, at->dmabuf, direction);
++	if (!IS_ERR(sg) && ubuf->retirement)
++		atomic_inc(&ubuf->retirement->maps);
++	return sg;
+ }
+ 
+ static void unmap_udmabuf(struct dma_buf_attachment *at,
+ 			  struct sg_table *sg,
+ 			  enum dma_data_direction direction)
+ {
+-	return put_sg_table(at->dev, sg, direction);
++	struct udmabuf *ubuf = at->dmabuf->priv;
++	put_sg_table(at->dev, sg, direction);
++	if (ubuf->retirement)
++		atomic_dec(&ubuf->retirement->maps);
+ }
+ 
+ static void unpin_all_folios(struct udmabuf *ubuf)
+@@ -237,6 +273,10 @@
+ 	struct udmabuf *ubuf = buf->priv;
+ 	struct device *dev = ubuf->device->this_device;
+ 
++	if (ubuf->retirement) {
++		udmabuf_retire_buffer(buf);
++		return;
++	}
+ 	if (ubuf->sg)
+ 		put_sg_table(dev, ubuf->sg, ubuf->sg_dir);
+ 
+@@ -249,9 +289,13 @@
+ {
+ 	struct udmabuf *ubuf = buf->priv;
+ 	struct device *dev = ubuf->device->this_device;
++	enum dma_data_direction mapped = !ubuf->retirement ? direction :
++		(udmabuf_is_readonly(ubuf) ? DMA_FROM_DEVICE : DMA_BIDIRECTIONAL);
++	if (udmabuf_is_readonly(ubuf) && direction != DMA_FROM_DEVICE)
++		return -EACCES;
+ 
+ 	if (!ubuf->sg) {
+-		ubuf->sg = get_sg_table(dev, buf, direction);
++		ubuf->sg = get_sg_table(dev, buf, mapped);
+ 		if (IS_ERR(ubuf->sg)) {
+ 			int ret;
+ 
+@@ -259,11 +303,11 @@
+ 			ubuf->sg = NULL;
+ 			return ret;
+ 		} else {
+-			ubuf->sg_dir = direction;
++			ubuf->sg_dir = mapped;
+ 		}
+ 	}
+ 
+-	dma_sync_sgtable_for_cpu(dev, ubuf->sg, direction);
++	dma_sync_sgtable_for_cpu(dev, ubuf->sg, mapped);
+ 	return 0;
+ }
+ 
+@@ -273,14 +317,19 @@
+ 	struct udmabuf *ubuf = buf->priv;
+ 	struct device *dev = ubuf->device->this_device;
+ 
++	if (udmabuf_is_readonly(ubuf) && direction != DMA_FROM_DEVICE)
++		return -EACCES;
+ 	if (!ubuf->sg)
+ 		return -EINVAL;
+ 
+-	dma_sync_sgtable_for_device(dev, ubuf->sg, direction);
++	dma_sync_sgtable_for_device(dev, ubuf->sg,
++		ubuf->retirement ? ubuf->sg_dir : direction);
+ 	return 0;
+ }
+ 
+ static const struct dma_buf_ops udmabuf_ops = {
++	.attach = udmabuf_protected_attach,
++	.detach = udmabuf_protected_detach,
+ 	.map_dma_buf	   = map_udmabuf,
+ 	.unmap_dma_buf	   = unmap_udmabuf,
+ 	.release	   = release_udmabuf,
+@@ -301,7 +350,7 @@
+ 	if (!shmem_file(memfd) && !is_file_hugepages(memfd))
+ 		return -EBADFD;
+ 
+-	seals = memfd_fcntl(memfd, F_GET_SEALS, 0);
++	seals = udmabuf_protected_get_seals(memfd);
+ 	if (seals == -EINVAL)
+ 		return -EBADFD;
+ 
+@@ -321,7 +370,7 @@
+ 	exp_info.ops  = &udmabuf_ops;
+ 	exp_info.size = ubuf->pagecount << PAGE_SHIFT;
+ 	exp_info.priv = ubuf;
+-	exp_info.flags = O_RDWR;
++	exp_info.flags = udmabuf_is_readonly(ubuf) ? O_RDONLY : O_RDWR;
+ 
+ 	return dma_buf_export(&exp_info);
+ }
+@@ -372,9 +421,10 @@
+ 	return 0;
+ }
+ 
+-static long udmabuf_create(struct miscdevice *device,
++static struct dma_buf *udmabuf_create_buffer(struct miscdevice *device,
+ 			   struct udmabuf_create_list *head,
+-			   struct udmabuf_create_item *list)
++			   struct udmabuf_create_item *list,
++			   struct udmabuf_retirement *tracking, struct file *original)
+ {
+ 	unsigned long max_nr_folios = 0;
+ 	struct folio **folios = NULL;
+@@ -382,11 +432,14 @@
+ 	struct udmabuf *ubuf;
+ 	struct dma_buf *dmabuf;
+ 	long ret = -EINVAL;
+-	u32 i, flags;
++	u32 i;
+ 
+ 	ubuf = kzalloc(sizeof(*ubuf), GFP_KERNEL);
+ 	if (!ubuf)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
++	ubuf->retirement = tracking;
++	if (tracking)
++		kref_get(&tracking->refs);
+ 
+ 	pglimit = ((u64)size_limit_mb * 1024 * 1024) >> PAGE_SHIFT;
+ 	for (i = 0; i < head->count; i++) {
+@@ -419,7 +472,7 @@
+ 	}
+ 
+ 	for (i = 0; i < head->count; i++) {
+-		struct file *memfd = fget(list[i].memfd);
++		struct file *memfd = original ? get_file(original) : fget(list[i].memfd);
+ 
+ 		if (!memfd) {
+ 			ret = -EBADFD;
+@@ -431,6 +484,11 @@
+ 		 * memfd_add_seals(), which takes this lock in write mode.
+ 		 */
+ 		inode_lock_shared(file_inode(memfd));
++		if (tracking && (list[i].offset > i_size_read(file_inode(memfd)) ||
++		    list[i].size > i_size_read(file_inode(memfd)) - list[i].offset)) {
++			ret = -EINVAL;
++			goto out_unlock;
++		}
+ 		ret = check_memfd_seals(memfd);
+ 		if (ret)
+ 			goto out_unlock;
+@@ -444,31 +502,34 @@
+ 			goto err;
+ 	}
+ 
+-	flags = head->flags & UDMABUF_FLAGS_CLOEXEC ? O_CLOEXEC : 0;
+ 	dmabuf = export_udmabuf(ubuf, device);
+ 	if (IS_ERR(dmabuf)) {
+ 		ret = PTR_ERR(dmabuf);
+ 		goto err;
+ 	}
+-	/*
+-	 * Ownership of ubuf is held by the dmabuf from here.
+-	 * If the following dma_buf_fd() fails, dma_buf_put() cleans up both the
+-	 * dmabuf and the ubuf (through udmabuf_ops.release).
+-	 */
+-
+-	ret = dma_buf_fd(dmabuf, flags);
+-	if (ret < 0)
+-		dma_buf_put(dmabuf);
+-
+ 	kvfree(folios);
+-	return ret;
++	return dmabuf;
+ 
+ err:
+ 	deinit_udmabuf(ubuf);
+ err_noinit:
++	udmabuf_retirement_put(ubuf->retirement);
+ 	kfree(ubuf);
+ 	kvfree(folios);
+-	return ret;
++	return ERR_PTR(ret);
++}
++
++static long udmabuf_create(struct miscdevice *device,
++			 struct udmabuf_create_list *head, struct udmabuf_create_item *list)
++{
++	struct dma_buf *buf = udmabuf_create_buffer(device, head, list, NULL, NULL);
++	int fd;
++	if (IS_ERR(buf))
++		return PTR_ERR(buf);
++	fd = dma_buf_fd(buf, head->flags & UDMABUF_FLAGS_CLOEXEC ? O_CLOEXEC : 0);
++	if (fd < 0)
++		dma_buf_put(buf);
++	return fd;
+ }
+ 
+ static long udmabuf_ioctl_create(struct file *filp, unsigned long arg)
+@@ -517,6 +578,8 @@
+ 	long ret;
+ 
+ 	switch (ioctl) {
++	case UDMABUF_PROTECTED_CREATE:
++		return udmabuf_ioctl_protected(filp, arg);
+ 	case UDMABUF_CREATE:
+ 		ret = udmabuf_ioctl_create(filp, arg);
+ 		break;
+@@ -538,19 +601,32 @@
+ #endif
+ };
+ 
++#ifdef UDMABUF_TEST_NODE
++#define UDMABUF_NODE_NAME "udmabuf-protected-test"
++#else
++#define UDMABUF_NODE_NAME "udmabuf"
++#endif
++
+ static struct miscdevice udmabuf_misc = {
+ 	.minor          = MISC_DYNAMIC_MINOR,
+-	.name           = "udmabuf",
++	.name           = UDMABUF_NODE_NAME,
+ 	.fops           = &udmabuf_fops,
+ };
+ 
++#include "udmabuf-protected.c"
++
+ static int __init udmabuf_dev_init(void)
+ {
+ 	int ret;
+ 
++	get_random_bytes(udmabuf_instance, sizeof(udmabuf_instance));
++	udmabuf_retire_wq = alloc_workqueue("udmabuf-retire", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	if (!udmabuf_retire_wq)
++		return -ENOMEM;
+ 	ret = misc_register(&udmabuf_misc);
+ 	if (ret < 0) {
+ 		pr_err("Could not initialize udmabuf device\n");
++		destroy_workqueue(udmabuf_retire_wq);
+ 		return ret;
+ 	}
+ 
+@@ -559,6 +635,7 @@
+ 	if (ret < 0) {
+ 		pr_err("Could not setup DMA mask for udmabuf device\n");
+ 		misc_deregister(&udmabuf_misc);
++		destroy_workqueue(udmabuf_retire_wq);
+ 		return ret;
+ 	}
+ 
+@@ -567,6 +644,8 @@
+ 
+ static void __exit udmabuf_dev_exit(void)
+ {
++	/* Flush cleanup before destroying the device or module text. */
++	destroy_workqueue(udmabuf_retire_wq);
+ 	misc_deregister(&udmabuf_misc);
+ }
+ 
