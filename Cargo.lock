@@ -1878,6 +1878,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "uds_windows",
+ "wc-cygwin-link",
+ "wc-handle",
  "windows-sys",
 ]
 

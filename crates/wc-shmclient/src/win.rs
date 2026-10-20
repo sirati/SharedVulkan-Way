@@ -137,10 +137,10 @@ pub fn run(config: Config) -> ExitCode {
         descriptor.len()
     );
 
-    if c.send(proto::create_pool(&descriptor, pool_len, width, height))
-        .is_err()
+    if let Err(error) = wc_transport::send_handle_message(&mut c.stream, &handle, |encoded|
+        proto::create_pool(encoded, pool_len, width, height))
     {
-        return ExitCode::from(2);
+        return c.fail(&format!("pool descriptor transfer failed: {error}"));
     }
     println!("wc-shmclient: sent wl_shm.create_pool and two wl_shm_pool.create_buffer");
 
@@ -186,6 +186,12 @@ pub fn run(config: Config) -> ExitCode {
             }
         };
 
+        if committed + 1 == frames {
+            let hash = view.as_mut_slice()[base..base + buffer_len as usize].iter()
+                .fold(0xcbf29ce484222325u64, |h, byte| (h ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
+            println!("wc-shmclient: final pixel hash={hash:016x} frame={committed} slot={slot} bytes={buffer_len}");
+        }
+
         c.released[slot] = false;
         c.frame_done = false;
         if c.send(proto::present(slot, damage)).is_err() {
@@ -215,6 +221,11 @@ pub fn run(config: Config) -> ExitCode {
         slot ^= 1;
     }
 
+    // Completion means the compositor acknowledged the final submitted frame,
+    // not merely that its bytes entered a local socket or shared ring.
+    if committed == frames && !c.closed && !c.pump_until(Duration::from_secs(5), |c| c.frame_done) {
+        return c.fail("the final submitted frame was not acknowledged");
+    }
     if let Some(e) = c.failure.take() {
         eprintln!("wc-shmclient: FAIL — {e}");
         return ExitCode::from(1);
