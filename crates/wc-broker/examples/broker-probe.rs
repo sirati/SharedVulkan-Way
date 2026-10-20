@@ -233,8 +233,8 @@ mod win {
                         arena_pages: req.arena_pages, outbound: req.outbound,
                         rings_run: req.rings_run, rings_pages: req.rings_pages, gpu: req.gpu,
                     };
-                    let current_ok = auth.verifies_identity(&rec, req.seq, Some(&id), &current);
-                    let retired_ok = auth.verifies_identity(&rec, req.seq, Some(&id), &retired);
+                    let current_ok = auth.verifies_identity(&rec, req.index, Some(&id), &current);
+                    let retired_ok = auth.verifies_identity(&rec, req.index, Some(&id), &retired);
                     println!("RESULT rotated-signature current={current_ok} retired={retired_ok}");
                     if !current_ok || retired_ok { return Err("key rotation verification failed".into()); }
                     return Ok(());
