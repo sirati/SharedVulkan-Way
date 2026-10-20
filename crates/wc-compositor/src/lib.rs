@@ -1783,6 +1783,18 @@ fn wayland_thread(
     );
     let _ = std::io::stdout().flush();
 
+    #[cfg(target_os = "macos")]
+    let mut prime_endpoint = {
+        let path = listener.socket_name().map(std::path::PathBuf::from).unwrap_or_default();
+        let path = if path.is_absolute() { path } else {
+            std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default()).join(path)
+        };
+        match native_prime::Endpoint::bind(&path, state.native_prime.registry.clone()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => { eprintln!("wc-compositor: native PRIME endpoint: {error}"); state.quit(0); return 2; }
+        }
+    };
+
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;
     let mut empty_watch = exit_when_empty.map(EmptyWatch::new);
@@ -1913,6 +1925,11 @@ fn wayland_thread(
     let _ = std::io::stdout().flush();
 
     loop {
+        #[cfg(target_os = "macos")]
+        if let Err(error) = prime_endpoint.accept_pending() {
+            eprintln!("wc-compositor: native PRIME accept: {error}");
+            break;
+        }
         if pending_rings.as_mut().is_some_and(ringlink::PendingRings::poll) {
             match pending_rings.take().map(ringlink::PendingRings::into_link) {
                 Some(Ok((rl, reader))) => {
@@ -2254,3 +2271,6 @@ fn wayland_thread(
 pub fn probe_metal_retirement() -> Result<(), &'static str> {
     platform::macos_metal::probe_retirement()
 }
+
+#[cfg(target_os = "macos")]
+mod native_prime;
