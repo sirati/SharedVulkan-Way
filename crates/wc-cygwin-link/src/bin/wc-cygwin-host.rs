@@ -160,12 +160,38 @@ mod host {
                 .unwrap_or(0)
                 .checked_add(1)
                 .ok_or("BAR generation overflow")?;
+            let arena_len = rings_offset - wc_handle::ivshmem::HEADER_BYTES;
+            let host_start = arena_len
+                .checked_sub(4 * 1024 * 1024)
+                .ok_or("BAR has no outbound partition")?
+                & !65535;
+            if host_start <= wc_handle::bar_lease::DIRECTORY_BYTES as u64 {
+                return Err("BAR has no leased pixel capacity".into());
+            }
+            let allocation_view = Arc::new(SharedRegion::map_fd(
+                file.as_fd(),
+                wc_handle::ivshmem::HEADER_BYTES,
+                arena_len as usize,
+            )?);
+            // SAFETY: sole fresh backend initializer, before publishing Header.
+            unsafe {
+                wc_handle::bar_lease::Directory::initialize(
+                    allocation_view.base_ptr(),
+                    allocation_view.base_ptr(),
+                    allocation_view.base_ptr().add(host_start as usize),
+                    wc_handle::bar_lease::Role::Host,
+                    arena_len as usize,
+                    host_start as usize,
+                    run_id,
+                    allocation_view.clone(),
+                )
+            }?;
             let header = wc_handle::ivshmem::Header {
                 run_id,
                 generation,
                 region_len: bar.len,
                 arena_id,
-                outbound: (0, 0),
+                outbound: (host_start, arena_len - host_start),
                 rings: (rings_offset, geometry.control_size),
             };
             println!(
@@ -201,7 +227,14 @@ mod host {
         let control = Arc::new(Control::create(
             region,
             geometry,
-            ProtocolIds::new(1, sv_proto::PROTOCOL_HASH),
+            ProtocolIds::new(
+                if header.is_some() {
+                    wc_handle::bar_lease::CONTROL_WIRE_VERSION
+                } else {
+                    1
+                },
+                sv_proto::PROTOCOL_HASH,
+            ),
             1,
         )?);
         // SAFETY: eventfd returns a fresh owned fd, checked before ownership.
@@ -221,7 +254,7 @@ mod host {
         if let Some((lease, value)) = &header {
             // SAFETY: initialization and doorbell attachment completed before publication.
             unsafe {
-                wc_handle::ivshmem::write_into(lease.0.base_ptr(), value);
+                wc_handle::ivshmem::write_leases_into(lease.0.base_ptr(), value);
             }
         }
         println!(

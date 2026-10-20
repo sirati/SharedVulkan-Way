@@ -28,6 +28,8 @@
 //! So the transport is AF_UNIX on both platforms. What differs is only how an
 //! `h` argument crosses, which is `wc-handle`'s problem and not this crate's.
 
+pub mod framed;
+
 use std::io;
 use std::path::Path;
 
@@ -42,6 +44,18 @@ mod imp {
 }
 
 pub use imp::{Listener, Stream};
+
+#[cfg(windows)]
+mod bar_client;
+
+/// Finish the process's explicit native BAR connection before process exit.
+/// Call after releasing application mappings. Rust process exit does not join
+/// the socket pumps, so merely dropping the socket cannot prove ring teardown.
+/// This does not retire abandoned allocations or replace mapping ownership.
+pub fn finish_bar_connection() {
+    #[cfg(windows)]
+    wc_cygwin_link::wc_bridge_close();
+}
 
 /// The type a [`Stream`] or [`Listener`] borrows as, for handing to a poller.
 ///
@@ -177,6 +191,10 @@ pub fn peer_credentials(stream: &Stream) -> io::Result<PeerCredentials> {
 
 /// Connect to a Wayland server at an absolute path.
 pub fn connect(path: &Path) -> io::Result<Stream> {
+    #[cfg(windows)]
+    if path.as_os_str() == "broker-bar" || std::env::var_os("WC_WAYLAND_RING").is_some_and(|v| v == "1") {
+        return bar_client::connect();
+    }
     Stream::connect(path)
 }
 
@@ -282,6 +300,17 @@ pub fn socket_dir() -> io::Result<std::path::PathBuf> {
     }
 }
 
+/// Send one framed protocol message carrying a shared handle. The closure
+/// wraps the prepared descriptor body with the protocol framing. This is the
+/// ownership emission boundary, not Descriptor::encode.
+pub fn send_handle_message(stream: &mut Stream, handle: &wc_handle::Handle,
+    frame: impl FnOnce(&[u8]) -> Vec<u8>) -> io::Result<()> {
+    let abort = stream.try_clone()?;
+    framed::send_handle_frame(stream, handle, frame, || {
+        let _ = abort.shutdown(std::net::Shutdown::Both);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,3 +343,4 @@ mod tests {
         }
     }
 }
+

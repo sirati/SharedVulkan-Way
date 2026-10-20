@@ -43,6 +43,8 @@ pub const MAGIC: [u8; 8] = *b"WCIVSHM1";
 /// not know. Version 2 (waycompose-design.md §89) added the Wayland rings'
 /// region at the tail; a version-1 header reads as one with no rings.
 pub const VERSION: u32 = 2;
+/// Allocation-directory layout. Older version-2 readers must refuse it.
+pub const LEASE_VERSION: u32 = 3;
 /// How many bytes at the front of the region the header owns. One 4 KiB page,
 /// because the arena behind it is allocated in pages and must start on one.
 pub const HEADER_BYTES: u64 = 4096;
@@ -124,6 +126,19 @@ impl Header {
     /// another machine and "bad header" is not a message anybody can act on.
     /// A version-1 header is read as one with no rings: it is what a compositor
     /// from before §89 wrote, and the fields it has mean what they meant.
+    /// Require the allocation-directory format before touching control/pixels.
+    pub fn decode_for_leases(b: &[u8]) -> io::Result<Header> {
+        if b.len() < ENCODED_LEN || u32::from_le_bytes(b[OFF_VERSION..OFF_VERSION + 4].try_into().unwrap()) != LEASE_VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "BAR allocation directory requires lease header format 3"));
+        }
+        Self::decode(b)
+    }
+    /// Encode the incompatible allocation-directory format explicitly.
+    pub fn encode_leases(&self) -> [u8; ENCODED_LEN] {
+        let mut bytes = self.encode();
+        bytes[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&LEASE_VERSION.to_le_bytes());
+        bytes
+    }
     pub fn decode(b: &[u8]) -> io::Result<Header> {
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
         if b.len() < ENCODED_LEN_V1 {
@@ -139,12 +154,12 @@ impl Header {
             )));
         }
         let version = u32_at(OFF_VERSION);
-        if version != 1 && version != VERSION {
+        if version != 1 && version != VERSION && version != LEASE_VERSION {
             return Err(bad(format!(
-                "header version {version}, and this reader knows 1 and {VERSION}"
+                "header version {version}, and this reader knows 1, {VERSION} and {LEASE_VERSION}"
             )));
         }
-        if version == VERSION && b.len() < ENCODED_LEN {
+        if version != 1 && b.len() < ENCODED_LEN {
             return Err(bad(format!("{} bytes is shorter than a version-{VERSION} header", b.len())));
         }
         let header_bytes = u32_at(OFF_HEADER_BYTES) as u64;
@@ -209,6 +224,19 @@ impl Header {
 /// hypervisor and synchronise through the magic.
 pub unsafe fn write_into(page: *mut u8, h: &Header) {
     let bytes = h.encode();
+    // SAFETY: inherited caller contract.
+    unsafe { write_encoded(page, &bytes); }
+}
+/// Publish allocation-directory format 3 with the same release ordering.
+///
+/// # Safety
+/// page must cover ENCODED_LEN writable retained bytes, as write_into.
+pub unsafe fn write_leases_into(page: *mut u8, h: &Header) {
+    let bytes = h.encode_leases();
+    // SAFETY: inherited caller contract.
+    unsafe { write_encoded(page, &bytes); }
+}
+unsafe fn write_encoded(page: *mut u8, bytes: &[u8; ENCODED_LEN]) {
     // SAFETY: the caller promises `page` covers `ENCODED_LEN` bytes. Volatile,
     // because the reader is not in this program and the compiler must not
     // merge, reorder or drop these stores on the grounds that nothing here
@@ -307,6 +335,21 @@ mod tests {
     }
 
     #[test]
+    fn allocation_layout_has_explicit_incompatible_format_boundary() {
+        let legacy = h().encode();
+        assert!(Header::decode_for_leases(&legacy).is_err());
+        let leased = h().encode_leases();
+        let version = u32::from_le_bytes(leased[8..12].try_into().unwrap());
+        assert_eq!(version, 3);
+        assert!(version != 1 && version != VERSION, "legacy reader must refuse lease bytes");
+        assert_eq!(Header::decode_for_leases(&leased).unwrap(), h());
+        assert!(Header::decode_for_leases(&leased[..64]).is_err());
+        let mut page = [0u8; ENCODED_LEN];
+        // SAFETY: owned complete output header.
+        unsafe { write_leases_into(page.as_mut_ptr(), &h()); }
+        assert_eq!(page, leased);
+    }
+    #[test]
     fn a_header_round_trips_and_the_layout_is_the_one_written_down() {
         let b = h().encode();
         assert_eq!(&b[0..8], b"WCIVSHM1");
@@ -324,8 +367,8 @@ mod tests {
         b[0] = 0;
         assert!(Header::decode(&b).unwrap_err().to_string().contains("no header"));
         let mut b = h().encode();
-        b[8] = 3;
-        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 3"));
+        b[8] = 4;
+        assert!(Header::decode(&b).unwrap_err().to_string().contains("version 4"));
         let mut z = h();
         z.run_id = 0;
         assert!(Header::decode(&z.encode()).is_err());

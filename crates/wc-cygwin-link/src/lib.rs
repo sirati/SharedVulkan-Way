@@ -31,7 +31,7 @@ impl PoolWindow {
 #[cfg(windows)]
 mod windows {
     use super::PoolWindow;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
     use sv_transport::control::{Control, Geometry, ProtocolIds};
@@ -45,6 +45,9 @@ mod windows {
         reader_kick: Kicker,
         closed: AtomicBool,
         pool: Mutex<PoolWindow>,
+        directory: Option<wc_handle::bar_lease::Directory>,
+        handles: Mutex<std::collections::HashMap<u64, wc_handle::Handle>>,
+        next_handle: AtomicU64,
         pool_base: usize,
         mapping_base: usize,
         mapping_len: usize,
@@ -69,7 +72,7 @@ mod windows {
         for (offset, byte) in bytes.iter_mut().enumerate().skip(8) {
             *byte = unsafe { (base as *const u8).add(offset).read_volatile() };
         }
-        Header::decode(&bytes).map_err(|e| e.to_string())
+        Header::decode_for_leases(&bytes).map_err(|e| e.to_string())
     }
     impl Connection {
         fn valid(&self) -> bool {
@@ -135,7 +138,14 @@ mod windows {
                 owner.clone(),
             )
         });
-        let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+        let ids = ProtocolIds::new(
+            if header.is_some() {
+                wc_handle::bar_lease::CONTROL_WIRE_VERSION
+            } else {
+                1
+            },
+            sv_proto::PROTOCOL_HASH,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         let control = loop {
             match Control::attach(Arc::clone(&region), ids) {
@@ -159,11 +169,43 @@ mod windows {
         if let Some(wake) = sv_transport::park::cross_wake() {
             wake.poke(sv_transport::park::RESCAN_TOKEN);
         }
+        let directory = if let Some((_, header)) = header {
+            if header.outbound.1 != 0 {
+                if header.outbound.0.checked_add(header.outbound.1) != Some(header.arena_len()) {
+                    return Err("BAR host partition differs".into());
+                }
+                // SAFETY: original driver mapping retained, metadata and the
+                // exact guest producer partition are inside validated Header.
+                let directory = unsafe {
+                    wc_handle::bar_lease::Directory::attach(
+                        pool_base as *mut u8,
+                        pool_base as *const u8,
+                        (pool_base + wc_handle::bar_lease::DIRECTORY_BYTES) as *mut u8,
+                        wc_handle::bar_lease::Role::Guest,
+                        pixel_len,
+                        header.outbound.0 as usize,
+                        header.run_id,
+                        owner.clone(),
+                    )
+                }
+                .map_err(|e| e.to_string())?;
+                wc_handle::bar_lease::register(header.arena_id, directory.clone())
+                    .map_err(|e| e.to_string())?;
+                Some(directory)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         Ok(Connection {
             rx: Mutex::new(rx),
             tx: Mutex::new(tx),
             reader_kick,
             closed: AtomicBool::new(false),
+            directory,
+            handles: Mutex::new(std::collections::HashMap::new()),
+            next_handle: AtomicU64::new(1),
             pool: Mutex::new(PoolWindow {
                 len: pixel_len,
                 used: 0,
@@ -267,6 +309,217 @@ mod windows {
         }
     }
 
+    /// Native client provider. The Handle, every map and every remote consumer
+    /// retain the same allocation; there is no second mapping or allocator.
+    pub fn native_pool_handle(size: u64) -> std::io::Result<wc_handle::Handle> {
+        let c = CONNECTION
+            .get()
+            .ok_or_else(|| std::io::Error::other("BAR bridge is not open"))?;
+        if c.closed.load(Ordering::Acquire) || !c.valid() || c.directory.is_none() {
+            return Err(std::io::Error::other(
+                "live BAR lease directory is required",
+            ));
+        }
+        let size = usize::try_from(size)
+            .map_err(|_| std::io::Error::other("pool size exceeds address space"))?;
+        let default_capacity = size
+            .checked_next_power_of_two()
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| std::io::Error::other("pool capacity overflow"))?
+            .max(1024 * 1024);
+        let capacity = match std::env::var("WC_BAR_POOL_CAPACITY") {
+            Ok(text) => text
+                .parse::<usize>()
+                .map_err(|_| std::io::Error::other("invalid WC_BAR_POOL_CAPACITY"))?,
+            Err(_) => default_capacity,
+        };
+        wc_handle::Handle::create_bar(
+            c.arena
+                .ok_or_else(|| std::io::Error::other("missing BAR arena"))?,
+            wc_handle::bar_lease::Role::Guest,
+            size,
+            capacity,
+        )
+    }
+
+    fn hold_handle(c: &Connection, handle: wc_handle::Handle) -> Result<u64, ()> {
+        let id = c
+            .next_handle
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .map_err(|_| ())?;
+        c.handles.lock().map_err(|_| ())?.insert(id, handle);
+        Ok(id)
+    }
+    /// Create a Cygwin token's producer lease.
+    ///
+    /// # Safety
+    /// Every output pointer must name a writable live object.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn wc_bridge_lease_create(
+        len: usize,
+        address: *mut usize,
+        offset: *mut u64,
+        capacity: *mut usize,
+        lease: *mut u64,
+    ) -> i32 {
+        if address.is_null() || offset.is_null() || capacity.is_null() || lease.is_null() {
+            return -1;
+        }
+        let Ok(handle) = native_pool_handle(len as u64) else {
+            return -1;
+        };
+        let wc_handle::Descriptor::BarLease {
+            slot, generation, ..
+        } = *handle.descriptor()
+        else {
+            return -1;
+        };
+        let Some(c) = CONNECTION.get() else { return -1 };
+        let Some(directory) = &c.directory else {
+            return -1;
+        };
+        let Ok((start, _, cap)) = directory.extent(wc_handle::bar_lease::Key { slot, generation })
+        else {
+            return -1;
+        };
+        let Ok(mut mapping) = handle.map_mut() else {
+            return -1;
+        };
+        let pointer = mapping.as_mut_slice().as_mut_ptr() as usize;
+        let Ok(id) = hold_handle(c, handle) else {
+            return -1;
+        };
+        // SAFETY: caller supplies all writable output objects.
+        unsafe {
+            address.write(pointer);
+            offset.write(start as u64);
+            capacity.write(cap);
+            lease.write(id);
+        }
+        0
+    }
+    /// Encode a pending transfer of the retained token lease, never a raw fd.
+    ///
+    /// # Safety
+    /// words must name seven writable u32 objects.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn wc_bridge_lease_words(lease: u64, words: *mut u32) -> i32 {
+        if words.is_null() {
+            return -1;
+        }
+        let Some(c) = CONNECTION.get() else { return -1 };
+        if !c.valid() {
+            return -1;
+        }
+        let Ok(handles) = c.handles.lock() else {
+            return -1;
+        };
+        let Some(handle) = handles.get(&lease) else {
+            return -1;
+        };
+        let Ok(prepared) = handle.prepare_transfer() else {
+            return -1;
+        };
+        if prepared.bytes().len() != 24 {
+            return -1;
+        }
+        // SAFETY: caller guarantees seven writable words.
+        unsafe {
+            words.write(24);
+            for (index, bytes) in prepared.bytes().chunks_exact(4).enumerate() {
+                words
+                    .add(index + 1)
+                    .write(u32::from_le_bytes(bytes.try_into().unwrap()));
+            }
+        }
+        prepared.commit();
+        0
+    }
+    /// Materialize an incoming capability as a local Cygwin identity token.
+    ///
+    /// # Safety
+    /// words names seven readable u32 objects; every output names a writable object.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn wc_bridge_lease_import(
+        words: *const u32,
+        address: *mut usize,
+        len: *mut usize,
+        lease: *mut u64,
+    ) -> i32 {
+        if words.is_null() || address.is_null() || len.is_null() || lease.is_null() {
+            return -1;
+        }
+        let Some(c) = CONNECTION.get() else { return -1 };
+        if !c.valid() {
+            return -1;
+        }
+        let mut bytes = [0u8; 24];
+        // SAFETY: caller provides seven readable words.
+        unsafe {
+            if words.read() != 24 {
+                return -1;
+            }
+            for (index, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+                chunk.copy_from_slice(&words.add(index + 1).read().to_le_bytes());
+            }
+        }
+        let Ok(descriptor) = wc_handle::Descriptor::decode(&bytes) else {
+            return -1;
+        };
+        let wc_handle::Descriptor::BarLease { arena, .. } = descriptor else {
+            return -1;
+        };
+        if Some(arena) != c.arena {
+            return -1;
+        }
+        let Ok(handle) = wc_handle::Handle::receive_descriptor(descriptor) else {
+            return -1;
+        };
+        let Ok(mapping) = handle.map() else { return -1 };
+        let pointer = mapping.as_slice().as_ptr() as usize;
+        let size = mapping.len();
+        let Ok(id) = hold_handle(c, handle) else {
+            return -1;
+        };
+        // SAFETY: caller guarantees writable output objects.
+        unsafe {
+            address.write(pointer);
+            len.write(size);
+            lease.write(id);
+        }
+        0
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn wc_bridge_lease_grow(lease: u64, len: usize) -> i32 {
+        let Some(c) = CONNECTION.get() else { return -1 };
+        if !c.valid() {
+            return -1;
+        }
+        let Ok(handles) = c.handles.lock() else {
+            return -1;
+        };
+        if handles
+            .get(&lease)
+            .is_some_and(|handle| handle.grow_bar(len).is_ok())
+        {
+            0
+        } else {
+            -1
+        }
+    }
+    #[unsafe(no_mangle)]
+    pub extern "C" fn wc_bridge_lease_drop(lease: u64) -> i32 {
+        let Some(c) = CONNECTION.get() else { return -1 };
+        let Ok(mut handles) = c.handles.lock() else {
+            return -1;
+        };
+        if handles.remove(&lease).is_some() {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// Refuse Cygwin VM operations overlapping any retained device page.
     #[unsafe(no_mangle)]
     pub extern "C" fn wc_bridge_bar_overlap(address: usize, length: usize) -> i32 {
@@ -298,6 +551,10 @@ mod windows {
         let Some(c) = CONNECTION.get() else { return -1 };
         let Some(id) = c.arena else { return -1 };
         if c.closed.load(Ordering::Acquire) || !c.valid() {
+            return -1;
+        }
+        // Legacy ArenaSlice allocation must never overlap a lease directory.
+        if c.directory.is_some() {
             return -1;
         }
         let Ok(mut pool) = c.pool.lock() else {
@@ -394,3 +651,8 @@ mod tests {
         assert_eq!(pool.reserve(65536), Some(0));
     }
 }
+
+#[cfg(windows)]
+pub use windows::{
+    native_pool_handle, wc_bridge_close, wc_bridge_open, wc_bridge_read, wc_bridge_write,
+};

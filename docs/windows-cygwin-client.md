@@ -167,3 +167,45 @@ executable basename check detects unsupported launchers; it does not authenticat
 arbitrary executable paths. Attach repeats the device's memory-backend link,
 sharing, size, path and retained inode checks before returning. Device hotplug
 and backend reassignment must remain disabled for the attached session.
+
+## Allocation leases under development
+
+The next API uses a generation-checked `BarLease` descriptor. An allocation
+reserves address-stable capacity inside the original fixed BAR. Only its
+logical length is initialized or mapped; growing it initializes newly exposed
+bytes in place. It cannot extend the physical BAR or move existing pixels.
+The default reservation is four times the next power of two of the initial
+size, with a 1 MiB minimum. `WC_BAR_POOL_CAPACITY` selects an explicit capacity.
+Exhaustion fails rather than switching backing or copying pixels.
+
+The directory reserves the first 128 KiB of the arena and supports 1,024 live
+allocations with generation-checked slot reuse. The host output partition is
+separate from guest pixels. Linux maps guest pixels read-only, and maps only
+atomic metadata and its own output partition writable. A pending wire transfer
+retains the allocation before the descriptor is emitted. Receiving it converts
+that reservation to a consumer lease. The last consumer Handle or Mapping must
+drop before reuse, independently of producer close. A stuck metadata lock
+returns an error without stealing the lock or releasing any reference.
+
+This shared directory is cooperative coordination state. Client-writable
+metadata does not authenticate a producer or authorize privileged retirement.
+The broker integration requires separate trusted allocation records and an
+actual retained process HANDLE proven exited. The cooperative directory has
+no production retirement API. Kernel-death recovery must use independent
+protected allocation and consumer records. DLL teardown retains outstanding local
+capabilities and mappings; it does not pretend they completed or that the host
+drained. Protected broker/driver integration is separate work.
+
+The POSIX companion now tracks fd duplication, explicit close and each mapping.
+It supports incoming read-only keymap tokens and logical `ftruncate` growth.
+The library decoder materializes typed incoming descriptors before event
+dispatch. These new paths require their own runtime acceptance. The earlier
+12-frame evidence above remains the validation boundary for the previous
+bounded implementation. Clipboard stream descriptors are not implemented by
+this API stage.
+
+Allocation directories require header format 3 and control wire version 2.
+The old registry-only wire version remains 1, and ordinary ivshmem publishers
+retain format 2. A retained format-2 client must reject format 3 before it can
+claim rings or write pool offset zero. New lease clients require format 3
+explicitly. This prevents an older allocator from overwriting directory bytes.
