@@ -251,6 +251,7 @@
 
           # --- Misc --------------------------------------------------------
           pkg-config
+          python3 # Local Windows and isolated latency test drivers.
           # Reading the shared-memory region while debugging both ends.
           # Phase 1 deliberately left wine out because it was not in the binary
           # cache and cost an hour of source build on shell entry. That is no
