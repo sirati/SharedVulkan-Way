@@ -517,11 +517,18 @@ play() {
   # touching it.
   mark "steady begin"; sleep 30; mark "steady end"
   xdotool key Escape; sleep 2; shot "$RUN/p7-paused.png"; mark paused
-  # Alt+F4 follows Windows' ordinary WM_CLOSE path through Wine and the
-  # compositor. Window position logs are diagnostic text, not a stable input
-  # API; the former geometry parser produced a negative click and never closed.
-  xdotool key alt+F4
-  mark "closed the window"
+  # The isolated Wine desktop has no X window manager to implement Alt+F4.
+  # Click the real caption close button using the live X window geometry.
+  local w X Y WIDTH HEIGHT SCREEN WINDOW
+  w=$(xdotool search --onlyvisible --name '^Minecraft ' 2>/dev/null | tail -1)
+  if [ -z "$w" ]; then mark "close failed: no visible Minecraft window"; return 1; fi
+  eval "$(xdotool getwindowgeometry --shell "$w")"
+  if [ "${WIDTH:-0}" -le 30 ] || [ "${HEIGHT:-0}" -le 30 ]; then
+    mark "close failed: invalid live window geometry"; return 1
+  fi
+  mark "close geometry window=$w x=$X y=$Y width=$WIDTH height=$HEIGHT"
+  xdotool mousemove $((X + WIDTH - 13)) $((Y + 14)) click 1
+  mark "clicked the window close button"
 }
 
 verdict() {
