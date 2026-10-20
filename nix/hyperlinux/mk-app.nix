@@ -58,10 +58,10 @@ let
       [[ -S "$session/${waylandSocket}" && -S "$session/${gpuSocket}" ]] || {
         echo 'Hyper Linux Wayland/GPU endpoints are not ready' >&2; exit 1;
       }
-      mkdir -p "$session/shm" "$HOME/.local/state/waycompose/hl/${name}"
+      mkdir -p "$session/tmp" "$session/shm" "$HOME/.local/state/waycompose/hl/${name}"
       guest_runtime="/run/user/$uid"
       unset DISPLAY XAUTHORITY DYLD_LIBRARY_PATH DYLD_INSERT_LIBRARIES
-      export XDG_RUNTIME_DIR="$guest_runtime"
+      export XDG_RUNTIME_DIR="$guest_runtime" TMPDIR=/tmp
       export WAYLAND_DISPLAY=${lib.escapeShellArg waylandSocket}
       export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=waycompose
       export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland SDL_VIDEODRIVER=wayland MOZ_ENABLE_WAYLAND=1
@@ -82,7 +82,7 @@ let
       exec ${hl}/bin/hl --fs-mode=rooted --isolated --sysroot ${root} \
         --guest-home /home/user --guest-cwd /home/user \
         --bind "$HOME:/home/user" --bind "$session:$guest_runtime" \
-        --bind "$session:$session" --bind "$session/shm:/dev/shm" \
+        --bind "$session:$session" --bind "$session/shm:/dev/shm" --bind "$session/tmp:/tmp" \
         --bind "${root}/dev/dri:/dev/dri:ro" --bind "${root}/sys:/sys:ro" \
         --bind "/nix/store:/nix/store:ro" \
         ${lib.getExe program} ${lib.escapeShellArgs defaultArgs} "$@"

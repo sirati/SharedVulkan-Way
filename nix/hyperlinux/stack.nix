@@ -177,9 +177,11 @@ let
       #!${native.bashNonInteractive}/bin/bash
       set -euo pipefail
       fixture="''${HL_NATIVE_FIXTURE:-$(dirname "$2")}"
+      mkdir -p "$fixture/tmp"
+      export TMPDIR=/tmp
       exec ${hl}/bin/hl --timeout 30 --audio-backend null --fs-mode=rooted --isolated --sysroot ${probeRoot} \
         --guest-home /home/user --guest-cwd /home/user \
-        --bind "$HOME:/home/user" --bind "$fixture:$fixture" \
+        --bind "$HOME:/home/user" --bind "$fixture:$fixture" --bind "$fixture/tmp:/tmp" \
         --bind "/nix/store:/nix/store:ro" "$@"
     '';
   };
