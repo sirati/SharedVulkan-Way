@@ -35430,6 +35430,90 @@ caught it.
   that left a feed behind did not happen on this machine in the run without
   the fix either; the unit test is the reproduction.
 
+### 107.11 A session's service threads outlived it and read the next owner's slot
+
+Branch `stale-service-threads`, 2026-10-20, from master `8bdac97`. Found in the
+guest's reopen round of 2026-10-19 (evidence in
+`/mnt/datasets/builds/evidence/multi-install/hostint-stale-bug/`).
+
+**What was seen.** In a reopen round, foot of a new session connected on ring
+slot 18, which had been vkcube's session's hostint slot, and never made a
+window. The compositor never logged `hostint: the channel ended` for any
+session that had ended.
+
+**The cause.** A session's hostint thread read its slot until the proxy wrote
+the end of stream. `end` marks a session's service slots `DEAD` and
+quarantines them, but the proxy of an ended session often writes no end of
+stream, and the hostint reader never looked at the slot's state. When the
+quarantine (10 s) ran out, `RingLink::reap` recycled the slot, the next claim
+made it `Live` again, and the old thread, still reading the same lane, took
+the new owner's bytes. The arena thread had the same shape: it looked at
+`sess.ended()` only after a 100 ms wait. The control channel was safe: `end`
+takes it away (`Ctl::close`). So was sound: `soundring::spawn` ends on `DEAD`.
+
+**The fix.** Every per-session service thread stops when its session ends,
+and a slot is never recycled while one of them may still read it.
+
+1. **A reader registry** (`ringlink::SlotReader`). `session_channel` hands out
+   one with each service channel: control, sound, arena and hostint. The
+   thread holds it until it will touch the ring no more. `RingLink::reap`
+   recycles no slot that has a reader, whatever its quarantine says.
+   `session_channel` also closes a channel found after its session ended, so
+   a service that was still waiting for its slot does not leave it open.
+2. **hostint stops by either signal.** `hostint::RingLink` ends when its owner
+   says stop (the session ended), or when the slot is `DEAD` with nothing left
+   to read, as well as on the end of stream. `serve_windows` and
+   `serve_logging` serve on the session's own thread, so the reader is held
+   until the serving returns. The Windows handlers thread checks once a second
+   whether the channel has ended. The log names the slot:
+   `hostint: the channel ended (slot N)`.
+3. **The arena thread** stops on `DEAD` too (`service_over`).
+
+**Tests.**
+* `hostint::reopen_tests`: a session's hostint thread is served as
+  `session_svc` serves it, and the session ends by the session end, by `DEAD`,
+  or by both. The thread must stop and give up its reader, and the slot then
+  comes back. The next session's client claims it and sends 256 KiB, which
+  must arrive whole and in order. A slot with a reader is not recycled. With
+  the stop and `DEAD` checks taken out, all four fail ("the session's hostint
+  thread is still reading slot 1").
+* `scripts/wc-multi-install.sh` leg 10, the reopen
+  (`WC_MULTI_ONLY_REOPEN=1` runs it alone). Session x stays up the whole leg,
+  sessions y and o open, both close, x opens a client, and session n opens on
+  their old slots: its first client lands on o's old hostint slot. Before the
+  fix: neither ended session's hostint thread said the channel ended, n got
+  no arena region, and its window never mapped. After the fix: both threads
+  stop within about 200 ms of the downs, and n's control, arena, hostint and
+  window all work.
+
+**Also on this branch.**
+* `CLICK-TO-WINDOW never` with a shared compositor. The cold path counted
+  mapped windows in the installation's own compositor log, which has none
+  when the session joined the user's compositor. The launcher now reads the
+  session's log, and with a shared compositor it counts only its own session's
+  toplevels: the compositor logs `xdg_toplevel created (#N) -> window W of
+  session S`, and the state file keeps `session-index` from the `boot`
+  answer (`plan::count_mapped`, `plan::boot_index`).
+* `wc-launch.sh deploy`: the generated `wc-launch.ini` had `` `slots` `` in an
+  unquoted heredoc, which ran `slots` as a command. It is escaped now. The
+  install check also accepts a never-run installation: the icon and the jump
+  list come from the host over a session's control ring, so before the first
+  session they are reported as pending (`no session to ask`, nothing cached)
+  instead of failing. The relaunch file is still required.
+* `scripts/wc-no-ssh.sh` leg 5 ("no ring port at all") raced its own harness.
+  The host end's socat loop, with `unlink-early`, could make `host.sock` again
+  just after the leg removed it. The session then found a doorbell socket,
+  and the proxy never said it polls. This failed twice in a row on this
+  branch, and passed once on master by timing. The leg now stops the loop and
+  its listener first.
+
+**Gates**, after the merge of master. `cargo test --workspace --no-fail-fast`: 115 binaries, 3329 passed,
+0 failed, 9 ignored. `cargo clippy --workspace --all-targets`: no error, no
+warning in a file this section changed. `cargo check --workspace --target
+x86_64-pc-windows-gnu` and the macOS check of `wc-launch` and `wc-compositor`:
+exit 0. `scripts/wc-xref.sh --list`: exit 0. `scripts/wc-multi-install.sh`:
+OK, all ten legs. `scripts/wc-no-ssh.sh`: OK in every run after the leg 5 fix (five).
+
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same

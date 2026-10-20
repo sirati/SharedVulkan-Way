@@ -5419,9 +5419,12 @@ impl XdgShellHandler for State {
         // the pointer and keyboard for a menu, and a new window is about to
         // take both. WLCS `grabbed_popup_gets_done_event_when_new_toplevel_created`.
         self.dismiss_grabs_above(0, "a new toplevel was created");
+        // §107.11: a shared compositor says whose window it is, so that
+        // installation's launcher measures its click by its own window.
         println!(
-            "wc-compositor: xdg_toplevel created (#{}) -> window {id}",
-            self.toplevels
+            "wc-compositor: xdg_toplevel created (#{}) -> window {id}{}",
+            self.toplevels,
+            if session == 0 { String::new() } else { format!(" of session {session}") }
         );
 
         self.ui.send(ToUi::Create {

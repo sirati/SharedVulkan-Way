@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 use sv_transport::wlbytes::{self, ByteChannel, Endpoint, ReadOutcome, OWNER_ARENA, OWNER_AUDIO, OWNER_CONTROL};
 use wc_handle::barpool::BarPool;
 
+use crate::ringlink::SlotReader;
+
 /// What a launcher asked for: on the command line (`--boot-*`), or in a
 /// `boot` request on the user's control socket (§107).
 #[derive(Debug, Clone, Default)]
@@ -758,10 +760,36 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
 
 /// [`service_channel`] for one of `sess`'s services: its index in the owner
 /// id, and its slot remembered so the session's end closes it.
-fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<ByteChannel> {
+///
+/// §107.11: the [`SlotReader`] keeps the slot from being recycled while the
+/// thread that holds it may still read it; the thread drops it only once it
+/// will touch the ring no more. A channel found after the session ended (its
+/// service was still waiting for the slot when [`end`] closed the others) is
+/// closed here instead, under the same lock `end` takes, so no slot of an
+/// ended session is ever left open.
+fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<(ByteChannel, SlotReader)> {
     let ch = service_channel(wlbytes::with_session(owner, sess.index), wait)?;
-    sess.service_slots.lock().unwrap_or_else(|e| e.into_inner()).push(ch.slot());
-    Some(ch)
+    let reader = SlotReader::new(ch.slot());
+    let mut slots = sess.service_slots.lock().unwrap_or_else(|e| e.into_inner());
+    if sess.ended() {
+        drop(slots);
+        if let Some(c) = crate::ringlink::shared_control() {
+            let _ = c.kill_ring(ch.slot());
+            crate::ringlink::quarantine(ch.slot());
+        }
+        say(&format!("session {}: slot {} came after the session ended; closed", sess.index, ch.slot()));
+        return None;
+    }
+    slots.push(ch.slot());
+    Some((ch, reader))
+}
+
+/// §107.11: whether a service thread of `sess` must stop reading `ch` now:
+/// its session has ended, or the slot is DEAD with nothing left to read.
+fn service_over(sess: &Sess, ch: &ByteChannel) -> bool {
+    sess.ended()
+        || crate::ringlink::shared_control().is_some_and(|c| c.ring_state(ch.slot()).ok() == Some(sv_transport::control::RingState::Dead))
+            && !ch.readable().unwrap_or(false)
 }
 
 /// §105.14: a request's thread, raised above normal priority while it waits
@@ -848,11 +876,15 @@ struct Ctl {
     ch: Mutex<Option<ByteChannel>>,
     /// One request at a time: replies are matched to requests by order.
     turn: Mutex<()>,
+    /// §107.11: the control slot's reader, given up with the channel.
+    reader: Mutex<Option<SlotReader>>,
 }
 
 impl Ctl {
     fn close(&self) {
         *self.ch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // After the channel: nothing of this process reads the slot now.
+        self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     fn write_all(&self, mut b: &[u8]) -> Result<(), String> {
@@ -968,7 +1000,7 @@ impl Ctl {
 /// After the boot: control, lease, sound, and for a shared compositor the
 /// session's arena and its watch.
 fn services(sess: Arc<Sess>) {
-    let Some(ch) = session_channel(&sess, OWNER_CONTROL, Duration::from_secs(20)) else {
+    let Some((ch, reader)) = session_channel(&sess, OWNER_CONTROL, Duration::from_secs(20)) else {
         if !multi() {
             say("session: the host never opened the control ring; ending");
             std::process::exit(3);
@@ -977,7 +1009,7 @@ fn services(sess: Arc<Sess>) {
         return;
     };
     say(&format!("session: control on ring slot {} (no ssh){}", ch.slot(), index_note(&sess)));
-    let ctl = Arc::new(Ctl { ch: Mutex::new(Some(ch)), turn: Mutex::new(()) });
+    let ctl = Arc::new(Ctl { ch: Mutex::new(Some(ch)), turn: Mutex::new(()), reader: Mutex::new(Some(reader)) });
     *sess.ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&ctl));
     sess.up.store(true, Ordering::SeqCst);
     if let Some(h) = hub() {
@@ -1006,8 +1038,11 @@ fn services(sess: Arc<Sess>) {
     if let Some(vol) = sess.cfg.audio_volume {
         let s = Arc::clone(&sess);
         let _ = std::thread::Builder::new().name("session-sound".into()).spawn(move || {
+            // §107.11: the sound ring's thread ends when the slot is DEAD,
+            // which the session's end makes it; the reader is held until it
+            // has (both players below return only after the ring's end).
             match session_channel(&s, OWNER_AUDIO, Duration::from_secs(20)) {
-                Some(ch) => {
+                Some((ch, _reader)) => {
                     say(&format!("audio: the session's sound ring is slot {} (§103.16, no ssh){}", ch.slot(), index_note(&s)));
                     // §106.3: every endpoint a stream, both directions, the
                     // defaults following Windows'. The single default-output
@@ -1044,16 +1079,21 @@ fn services(sess: Arc<Sess>) {
     #[cfg(not(target_os = "macos"))]
     if let Some(hcfg) = crate::hostint::configured() {
         // §107: the session's own slot, its index in the owner id.
+        // §107.11: served on this thread, which holds the slot's reader
+        // until the serving ends: at the session's end, or the slot's.
         let hs = Arc::clone(&sess);
         let _ = std::thread::Builder::new().name("session-hostint".into()).spawn(move || {
             match session_channel(&hs, sv_transport::wlbytes::OWNER_HOSTINT, Duration::from_secs(20)) {
-                Some(ch) => {
-                    say(&format!("hostint: on ring slot {} (no ssh)", ch.slot()));
+                Some((ch, _reader)) => {
+                    say(&format!("hostint: on ring slot {} (no ssh){}", ch.slot(), index_note(&hs)));
+                    let s2 = Arc::clone(&hs);
+                    let stop: crate::hostint::Stop = Box::new(move || s2.ended());
                     #[cfg(windows)]
-                    crate::hostint::start_windows(ch, hcfg, say);
+                    crate::hostint::serve_windows(ch, hcfg, say, stop);
                     #[cfg(target_os = "linux")]
-                    crate::hostint::start_logging(ch, hcfg, say);
+                    crate::hostint::serve_logging(ch, hcfg, say, stop);
                 }
+                None if hs.ended() => {}
                 None => say("hostint: the host opened no host-integration slot; links and files stay on their side"),
             }
         });
@@ -1184,7 +1224,9 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
 /// own, which only this session's clients may name.
 fn serve_arena(sess: Arc<Sess>) {
     let Some(h) = hub() else { return };
-    let Some(mut ch) = session_channel(&sess, OWNER_ARENA, Duration::from_secs(30)) else {
+    // §107.11: the reader is held for the whole loop, which ends with the
+    // session or the slot.
+    let Some((mut ch, _reader)) = session_channel(&sess, OWNER_ARENA, Duration::from_secs(30)) else {
         if !sess.ended() {
             say(&format!("arena: session {} opened no arena channel; its proxy allocates nothing", sess.index));
         }
@@ -1197,6 +1239,7 @@ fn serve_arena(sess: Arc<Sess>) {
         match ch.read(&mut tmp) {
             Ok(ReadOutcome::Bytes(n)) => buf.extend_from_slice(&tmp[..n]),
             Ok(ReadOutcome::Eof) | Err(_) => break,
+            Ok(ReadOutcome::Empty) if service_over(&sess, &ch) => break,
             Ok(ReadOutcome::Empty) => {
                 let _ = ch.wait_readable(Duration::from_millis(100));
                 continue;
