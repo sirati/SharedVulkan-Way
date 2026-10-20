@@ -25,9 +25,9 @@
 +
 +                    if (running && test_trigger) {
 +                        test_defer_injected = 1;
-+                        signal_queue_directed(LINUX_SIGUSR1, current_thread->tid,
++                        signal_queue_directed(LINUX_SIGUSR1, current_thread->guest_tid,
 +                                              LINUX_SI_TKILL);
-+                        signal_queue_directed(LINUX_SIGUSR2, current_thread->tid,
++                        signal_queue_directed(LINUX_SIGUSR2, current_thread->guest_tid,
 +                                              LINUX_SI_TKILL);
 +                        HV_CHECK_CTX(hv_vcpus_exit(&vcpu, 1), vcpu, g);
 +                        fprintf(stderr, "HL_TEST_DEFERRED_EL1 queued after safe syscall check\n");
