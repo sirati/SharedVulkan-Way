@@ -51,6 +51,32 @@ index dab2512..709d9d7 100644
      pthread_mutex_lock(&dev_lock);
      for (int i = 0; i < g_nnodes; i++) {
          if (strcmp(g_nodes[i].name, base) == 0) {
+diff --git a/src/fd_object.c b/src/fd_object.c
+index e8cfaa2..61d77a2 100644
+--- a/src/fd_object.c
++++ b/src/fd_object.c
+@@ -392,8 +392,10 @@ int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
+     uint32_t new_fd_flags = cloexec ? LINUX_O_CLOEXEC : 0;
+     if (cloexec && new_host >= 0)
+         fcntl(new_host, F_SETFD, FD_CLOEXEC);
++    /* Device registry pointers are static and non-owning, including aliases. */
++    void *device_node = kind == FD_DEVICE && ref.desc ? ref.desc->dir : NULL;
+     hl_descriptor_t *nd = hl_descriptor_create(of, new_host, new_fd_flags,
+-                                               kind, NULL);
++                                               kind, device_node);
+     if (!nd) {
+         if (new_host >= 0) close(new_host);
+         hl_open_file_release(of);
+@@ -451,7 +453,8 @@ int hl_fd_dup3(int oldfd, int newfd, int flags) {
+     int kind = of ? of->kind : fd_table[oldfd].type;
+     hl_descriptor_t *nd = NULL;
+     if (of) {
+-        nd = hl_descriptor_create(of, new_host, fd_flags, kind, NULL);
++        void *device_node = kind == FD_DEVICE && ref.desc ? ref.desc->dir : NULL;
++        nd = hl_descriptor_create(of, new_host, fd_flags, kind, device_node);
+         if (!nd) {
+             if (new_host >= 0) close(new_host);
+             if (of) hl_open_file_release(of);
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
 index 1041c94..7cd2ea6 100644
 --- a/src/fork_ipc.c

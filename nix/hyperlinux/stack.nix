@@ -148,7 +148,7 @@ let
       export HL_SHARED_PEER=${backend}/bin/wc-hl-shared-peer
       export HL_SHARED_CLIENT=${probeClient}/bin/hl-shared-client
       export HL_RUNNER=${probeRunner}
-      export HL_PROBE_ROOT="''${TMPDIR:-/tmp}"
+      export HL_PROBE_ROOT="''${HL_PROBE_ROOT:-/tmp}"
       ${native.bashNonInteractive}/bin/bash ${../../scripts/hl-shared-probe.sh}
       fixture=$(mktemp -d "$HL_PROBE_ROOT/hl-render.XXXXXXXX")
       trap 'rm -rf -- "$fixture"' EXIT
