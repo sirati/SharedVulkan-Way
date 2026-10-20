@@ -23,6 +23,9 @@ struct Resolved {
     source: Mutex<Option<Prepared>>,
     destination: Arc<Image>,
     setup: Option<Arc<Image>>,
+    // Logical setup descriptor validity/lifetime also applies to nonreference
+    // pictures, even though that image is not a producer write target.
+    _setup_descriptor: Option<Arc<Image>>,
     references: Vec<Arc<Image>>,
     begin_references: Vec<Arc<Image>>,
 }
@@ -203,15 +206,15 @@ impl Submission {
                 job.source_range,
             )
             .map_err(|_| invalid())?;
+        let setup_descriptor = job.setup.as_ref().map(|r| view(&r.picture)).transpose()?;
         Ok(Resolved {
             job: job.clone(),
             source: Mutex::new(Some(source)),
             destination: view(&job.destination)?,
-            // Non-reference setup invalidates its slot. Its reconstructed
-            // picture is not a required producer resource and may be ignored.
-            setup: if job.h264.is_reference {
-                job.setup.as_ref().map(|r| view(&r.picture)).transpose()?
-            } else { None },
+            // Non-reference setup invalidates its slot without a producer
+            // write. Its supplied descriptor must still name a valid resource.
+            setup: if job.h264.is_reference { setup_descriptor.clone() } else { None },
+            _setup_descriptor: setup_descriptor,
             references: job
                 .references
                 .iter()

@@ -234,12 +234,9 @@ impl GpuServer {
             })
     }
     fn native_queue_enabled(&self) -> bool {
-        self.shared
-            .native_video
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .video
-            .available()
+        if self.shared.driver.native_submission_failure().is_some() { return true; }
+        let state = self.shared.native_video.lock().unwrap_or_else(|e| e.into_inner());
+        state.failure().is_some() || state.video.available()
     }
     pub(crate) fn native_queue_submit(
         &self,
