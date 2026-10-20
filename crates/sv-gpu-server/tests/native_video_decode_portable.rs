@@ -295,4 +295,47 @@ mod integration {
                 .contains("unknown native DPB slot")
         );
     }
+    #[test]
+    fn original_non_idr_i_bootstraps_and_resets_despite_absent_stock_intra_flag() {
+        let bytes = include_bytes!("../examples/assets/videotoolbox-h264/non-idr-intra-64x50.h264");
+        let mut j = job();
+        j.h264.frame_num = 3;
+        j.h264.pic_order_cnt = [8, 8];
+        j.source_range = 121;
+        j.configuration = Configuration {
+            sps: bytes[4..26].to_vec(),
+            pps: bytes[30..35].to_vec(),
+        };
+        let setup = j.setup.as_mut().unwrap();
+        setup.h264.frame_num = 3;
+        setup.h264.pic_order_cnt = [8, 8];
+        let dst = Arc::new(Image::default());
+        let dpb = Arc::new(Image::default());
+        let mut runtime = Runtime::default();
+        for reset in [false, true] {
+            j.reset_before = reset;
+            let mut r = resources(dst.clone(), Some(dpb.clone()), false);
+            r.source = Arc::new(Bytes(bytes.to_vec()));
+            r.source_range = 35..156;
+            unsafe { runtime.execute(&j, r) }.unwrap();
+        }
+        assert_eq!(dst.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(dpb.writes.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn unproven_nonreference_intra_bootstrap_remains_gated() {
+        let mut j = job();
+        j.h264.is_reference = false;
+        let mut r = resources(
+            Arc::new(Image::default()),
+            Some(Arc::new(Image::default())),
+            false,
+        );
+        r.source = Arc::new(Bytes(vec![0, 0, 1, 0x01, 0xb8]));
+        assert!(
+            unsafe { Runtime::default().execute(&j, r) }
+                .unwrap_err()
+                .contains("independent intra reference")
+        );
+    }
 }

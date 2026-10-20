@@ -96,6 +96,9 @@ impl Dpb {
                 if picture.frame_num != 0 {
                     return Err("IDR frame_num must be zero".into());
                 }
+                if *long_term && limits.max_refs == 0 {
+                    return Err("SPS max_refs0 forbids IDR long-term flag".into());
+                }
                 next.entries.clear();
                 next.max_long_term_index = long_term.then_some(0);
                 current.long_term = long_term.then_some(0);
@@ -562,6 +565,21 @@ mod tests {
             .unwrap();
         assert_eq!(next.next.entries.len(), 1);
         assert_eq!(next.removed, vec![1]);
+        assert!(
+            d.plan(
+                picture(0),
+                &Marking::Idr {
+                    no_output_prior: false,
+                    long_term: true
+                },
+                limits
+            )
+            .is_err()
+        );
+        let long_limits = Limits {
+            max_frame_num: 16,
+            max_refs: 1,
+        };
         let long = d
             .plan(
                 picture(0),
@@ -569,12 +587,12 @@ mod tests {
                     no_output_prior: false,
                     long_term: true,
                 },
-                limits,
+                long_limits,
             )
             .unwrap();
         assert!(
             long.next
-                .plan(picture(1), &Marking::Sliding, limits)
+                .plan(picture(1), &Marking::Sliding, long_limits)
                 .is_err()
         );
     }

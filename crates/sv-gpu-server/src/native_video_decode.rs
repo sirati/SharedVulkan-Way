@@ -11,8 +11,8 @@ use std::{collections::HashMap, ops::Range, sync::Arc};
 mod dpb;
 #[path = "native_video_h264.rs"]
 mod h264;
-// Enable only after the fresh hardware non-IDR I fixture is proven natively.
-const NON_IDR_INTRA_BOOTSTRAP_VALIDATED: bool = false;
+#[path = "native_video_lists.rs"]
+mod lists;
 
 pub(crate) struct Resources {
     pub source: Arc<dyn CompressedBytes>,
@@ -176,9 +176,13 @@ impl Runtime {
         }
         let reset = job.reset_before || state.decoder.is_none();
         if reset && !idr {
-            if !actual.intra || !job.references.is_empty() {
-                return Err("native decoder reset requires an independent intra picture".into());
+            if !actual.intra || !actual.reference || !job.references.is_empty() {
+                return Err(
+                    "native decoder reset requires an independent intra reference picture".into(),
+                );
             }
+            // Native intra40 proved fresh hardware decode, exact display/coded
+            // target copies, and joined Vulkan sampling of this guarded path.
             h264::independent_intra(
                 source.bytes(),
                 &source_range,
@@ -188,9 +192,6 @@ impl Runtime {
                 job.h264.frame_num,
                 job.h264.pic_order_cnt,
             )?;
-            if !NON_IDR_INTRA_BOOTSTRAP_VALIDATED {
-                return Err("native non-IDR intra bootstrap awaits hardware validation".into());
-            }
         }
         let mut slots = state.slots.clone();
         if reset || idr {

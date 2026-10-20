@@ -113,3 +113,14 @@ against the frame4 pattern. Native --intra-bootstrap starts a fresh required-
 hardware VT decoder and uses source frame4 for every raw-pixel oracle. Coded,
 copy-target and joined-target modes remain available. Native proof is required
 before the production runtime enables non-IDR intra reset/bootstrap.
+
+Native intra40 validation of exact commit5929c81c:
+  display-copy, coded64-copy and coded64 joined Vulkan sampling all exited0.
+  Fresh required-hardware decoder received only the original non-IDR I frame4.
+  Original input release and retained outputs after source mmap overwrite passed.
+  Joined RGB maximum error 1.1920929e-7.
+  Native artifact /nix/store/2v3g0f2q3hi9985z36jwdvffjvhrkcwg-waycompose-darwin-video-probes-arm64-apple-darwin-1
+  Evidence vt-intra-native40.log and vt-intra-cleanup40.log under parent evidence.
+Production bootstrap now accepts parsed POC0 reference I pictures with default marking,
+matching original frame_num and POC computed from fresh state. POC1/non-IDR
+POC2 bootstrap, non-reference I bootstrap and adaptive MMCO bootstrap remain refused pending validation.

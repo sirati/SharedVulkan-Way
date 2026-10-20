@@ -482,6 +482,9 @@ pub(super) fn parse(
                 active[1] = active_count(b.ue()?)?;
             }
         }
+        if active.iter().any(|count| *count > 16) {
+            return Err("progressive active reference count exceeds sixteen".into());
+        }
         let mut lists = [Vec::new(), Vec::new()];
         if kind != 2 {
             lists[0] = modifications(&mut b)?;
@@ -569,10 +572,7 @@ pub(super) fn independent_intra(
                 let delta = if p.bottom_poc { b.se()? } else { 0 };
                 [top, top.checked_add(delta).ok_or("bootstrap POC overflow")?]
             }
-            2 => {
-                let value = 2 * i32::from(frame_num) - i32::from(nal[0] & 96 == 0);
-                [value, value]
-            }
+            2 => return Err("POC type2 non-IDR bootstrap awaits hardware validation".into()),
             // POC type1 needs the cycle offsets and previous-frame state
             // reconciled before it can bootstrap this staging runtime.
             _ => return Err("POC type1 intra bootstrap is not implemented".into()),
@@ -960,5 +960,88 @@ mod tests {
             frames += 1;
         }
         assert_eq!(frames, 8);
+    }
+    #[test]
+    fn progressive_active_reference_limit_is_sixteen_not_field_limit_thirty_two() {
+        let (s, p) = parameters(false, 0);
+        let mut b = slice_prefix(0);
+        b.bit(true);
+        b.ue(16);
+        let mut bytes = vec![0, 0, 1];
+        bytes.extend(b.nal(0x41));
+        assert!(
+            parse(&bytes, &(0..bytes.len()), &[0], &s, &p)
+                .unwrap_err()
+                .contains("exceeds sixteen")
+        );
+    }
+    fn sps_for_poc(kind: u32) -> Vec<u8> {
+        let mut b = Writer::default();
+        b.fixed(66, 8);
+        b.fixed(0, 8);
+        b.fixed(30, 8);
+        b.ue(0);
+        b.ue(0);
+        b.ue(kind);
+        if kind == 1 {
+            b.bit(false);
+            b.se(-1);
+            b.se(2);
+            b.ue(2);
+            b.se(2);
+            b.se(2);
+        }
+        b.ue(3);
+        b.bit(false);
+        b.ue(3);
+        b.ue(3);
+        b.bit(true);
+        b.bit(true);
+        b.bit(false);
+        b.bit(false);
+        b.nal(0x67)
+    }
+    #[test]
+    fn parses_poc_type1_delta_before_reference_marking() {
+        let s = sps_for_poc(1);
+        let (_, p) = parameters(false, 0);
+        let mut b = Writer::default();
+        b.ue(0);
+        b.ue(0);
+        b.ue(0);
+        b.fixed(3, 4);
+        b.se(-2);
+        b.bit(false);
+        b.bit(false); // default active count and no list changes
+        b.bit(true);
+        b.ue(1);
+        b.ue(1);
+        b.ue(0);
+        let parsed = one_slice(b, &s, &p, true);
+        assert_eq!(parsed.poc.delta, [-2, 0]);
+        assert_eq!(
+            parsed.marking,
+            Marking::Adaptive(vec![Operation::ForgetShort {
+                difference_minus1: 1
+            }])
+        );
+    }
+    #[test]
+    fn unproven_poc2_non_idr_bootstrap_stays_gated() {
+        let s = sps_for_poc(2);
+        let (_, p) = parameters(false, 0);
+        let mut b = Writer::default();
+        b.ue(0);
+        b.ue(2);
+        b.ue(0);
+        b.fixed(3, 4);
+        b.bit(false);
+        let mut bytes = vec![0, 0, 1];
+        bytes.extend(b.nal(0x41));
+        assert!(
+            independent_intra(&bytes, &(0..bytes.len()), &[0], &s, &p, 3, [6, 6])
+                .unwrap_err()
+                .contains("awaits hardware validation")
+        );
     }
 }
