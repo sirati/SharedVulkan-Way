@@ -45,6 +45,10 @@ static void sync_one(thread_entry_t *t, void *opaque) {
 static int64_t install(guest_t *g, uint64_t flags, uint64_t addr) {
     /* No listener, SPEC_ALLOW, logging, or TSYNC_ESRCH flags are implemented. */
     if (flags & ~1ULL) return -22;
+    pthread_mutex_lock(thread_get_lock());
+    int permitted=current_thread && current_thread->no_new_privs;
+    pthread_mutex_unlock(thread_get_lock());
+    if (!permitted) return -13;
     struct { uint16_t len; uint8_t pad[6]; uint64_t filter; } f;
     if (guest_read(g, addr, &f, sizeof(f)) < 0) return -14;
     if (!f.len || f.len > HL_SECCOMP_MAX_INSNS) return -22;
