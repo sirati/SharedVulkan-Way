@@ -408,7 +408,9 @@ fi
 stats=$(grep -m1 "commits, " "$RUN/proxy.log")
 commits=$(sed -n 's/.*dmabuf_commits=\([0-9]*\).*/\1/p' <<<"$stats")
 zc=$(grep -c "px.commit .*zero_copy=1" "$RUN/proxy-trace.txt" 2>/dev/null)
-cp=$(grep "px.commit" "$RUN/proxy-trace.txt" 2>/dev/null | grep -vc "zero_copy=1")
+# `copied` is a byte count. Empty/damage-only commits with copied=0 do not
+# become copies merely because they carry no zero_copy marker.
+cp=$(grep -Ec "px.commit .*copied=[1-9][0-9]*" "$RUN/proxy-trace.txt" 2>/dev/null)
 say "proxy: $stats"
 [ "${cp:-0}" -eq 0 ] || bad "the proxy copied $cp Firefox commits"
 [ "${zc:-0}" -gt 100 ] && ok "$zc of Firefox's commits reached the compositor as sections, zero copy ($cp copied ones)" \
