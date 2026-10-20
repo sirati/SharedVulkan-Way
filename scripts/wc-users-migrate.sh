@@ -12,6 +12,7 @@
 #   wc-users-migrate.sh verify   ADMIN DESKTOP BIN-DIR INSTALL...   check the new layout, as DESKTOP
 #   wc-users-migrate.sh remove-old ADMIN DESKTOP BIN-DIR INSTALL... delete the admin's copies (after a
 #                                                                     session was seen working)
+#   wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL...  confirm a successful real mapped-user session
 #   wc-users-migrate.sh rollback ADMIN DESKTOP BIN-DIR INSTALL...   restore a protected system-layout installation snapshot
 #   wc-users-migrate.sh install-staged ADMIN auto STAGE NAME          (wc-launch.sh deploy, system layout:
 #                                                                     one staged installation in; its user
@@ -50,7 +51,7 @@ VERB=${1:-}; ADMIN=${2:-}; DESK=${3:-}; BINS=${4:-}
 shift 4 2>/dev/null || { sed -n '3,40p' "$0"; exit 2; }
 INSTALLS=("$@")
 [ ${#INSTALLS[@]} -gt 0 ] || { echo "no installation named"; exit 2; }
-case "$VERB" in plan|apply|verify|remove-old|rollback|install-staged|key-prepare|key-export|key-confirm|services-restart) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
+case "$VERB" in plan|apply|verify|remove-old|rollback|install-staged|baseline-confirm|key-prepare|key-export|key-confirm|services-restart) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
 
 ROOT=${ROOT:-}
 REAL=1; [ "$(id -u)" = 0 ] && [ -z "$ROOT" ] || REAL=""
@@ -154,10 +155,10 @@ require_idle() {
 }
 legacy_snapshot() {
   local n=$1 base=$2 base_real=$3 nb_real=$4
-  local dest="$VL/protected-rollback/$n.preparing"
-  # Preserve the known application installation before candidate binaries or
-  # scripts replace it. Keys and paths are converted to the protected layout.
-  run install -d -m 0700 "$VL/protected-rollback"
+  local dest="$VL/legacy-original/$n.preparing"
+  # Preserve pre-broker recovery history, not an executable rollback baseline.
+  # Keys and paths are converted to the protected layout.
+  run install -d -m 0700 "$VL/legacy-original"
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "unfinished application snapshot requires review"; exit 1; }
   run cp -a "$base" "$dest"
   run rm -f "$dest/session.key"
@@ -170,16 +171,45 @@ legacy_snapshot() {
   for f in gpu.env copy-scope dmabuf-node; do
     [ -f "$dest/$f" ] && run sed -i "s|$base_real/|$nb_real/|g" "$dest/$f"
   done
-  run rm -rf "$VL/protected-rollback/$n"
-  run mv "$dest" "$VL/protected-rollback/$n"
+  run rm -rf "$VL/legacy-original/$n"
+  run mv "$dest" "$VL/legacy-original/$n"
 }
-initial_snapshot() {
-  local n=$1
-  if [ ! -e "$VL/protected-rollback/$n" ]; then
+confirmed_baseline() {
+  local d="$VL/protected-rollback/$1"
+  secure_path "$VL/protected-rollback" 700 && [ -d "$d" ] && [ ! -L "$d" ] &&
+    secure_path "$d/.baseline-confirmed" 600 &&
+    [ "$(cat "$d/.baseline-confirmed")" = 'mapped-product-baseline-v1' ]
+}
+# This is an operator confirmation after a successful real mapped-user product
+# session, not a substitute for running that session. Never save an untested
+# deployment candidate automatically as the installation's rollback baseline.
+if [ "$VERB" = baseline-confirm ]; then
+  require_idle
+  for n in "${INSTALLS[@]}"; do
+    require_trust "$n"
+    nb="$VL/installs/$n"; snap="$VL/protected-rollback/$n"; tmp="$snap.preparing"
+    secure_path "$nb" 755 && [ -f "$nb/wc-session" ] && [ -f "$nb/apps.ini" ] &&
+      cmp -s "$nb/session.key" "$TRUST/$n/session.key" || { echo "no protected current installation for $n"; exit 1; }
     run install -d -m 0700 "$VL/protected-rollback"
-    run cp -a "$VL/installs/$n" "$VL/protected-rollback/$n"
-  fi
-}
+    secure_path "$VL/protected-rollback" 700 || exit 1
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] && [ ! -e "$snap.previous" ] && [ ! -L "$snap.previous" ] || { echo "unfinished baseline snapshot requires review"; exit 1; }
+    run cp -a "$nb" "$tmp"
+    printf '%s\n' mapped-product-baseline-v1 >"$tmp/.baseline-confirmed"
+    run chmod 0600 "$tmp/.baseline-confirmed"
+    [ ! -e "$snap" ] || run mv "$snap" "$snap.previous"
+    run mv "$tmp" "$snap"
+    run rm -rf "$snap.previous"
+    # Keep original application packages alive after a candidate replaces the
+    # live installation's GC roots. The tested baseline is a root of its own.
+    for l in "$snap"/bin/*; do
+      [ -L "$l" ] || continue
+      t=$(readlink "$l"); case "$t" in /nix/store/*) ;; *) continue ;; esac
+      if [ -n "$REAL" ]; then run nix-store --add-root "$l" --indirect -r "$t" >/dev/null; else say "  (would register baseline GC root $l -> $t)"; fi
+    done
+    say "$n: confirmed tested mapped-product baseline saved; current trust and security infrastructure retained"
+  done
+  exit 0
+fi
 if [ "$VERB" = services-restart ]; then
   sys restart wc-bell-hub.service wc-sessiond.service
   exit 0
@@ -291,9 +321,12 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     if [ ! -e "$nb" ]; then run cp -a "$base" "$nb"; fi
     run rm -f "$nb/session.key"
     run cp -f "$TRUST/$n/session.key" "$nb/session.key"
-    # This branch's builds over every file of bin/ they name; links stay.
+    # Upgrade broker-dependent binaries; preserve original UI/presentation.
     for f in "$base"/bin/*; do
       b=$(basename "$f")
+      # Keep the known original UI/profile renderer and presentation library.
+      # Device-opening and broker-dependent transport components are upgraded.
+      case "$b" in wc-launch|libsv_wlshim.so) continue ;; esac
       [ -f "$BINS/$b" ] && [ ! -L "$f" ] && run install -m 0755 "$BINS/$b" "$nb/bin/$b"
     done
     run install -m 0755 "$BINS/wc-session" "$nb/wc-session"
@@ -351,7 +384,8 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     else say "  (would drop u:$ADMIN, u:$DESK and add u:waycompose on $f)"; fi
   done
 
-  for n in "${INSTALLS[@]}"; do initial_snapshot "$n"; run rm -f "$TRUST/$n/rotation-pending"; done
+  for n in "${INSTALLS[@]}"; do run rm -f "$TRUST/$n/rotation-pending"; done
+  say "run a real mapped-user product session, then baseline-confirm before any application update or rollback"
   say "6. the system services start; $DESK's agent listens"
   sys restart wc-bell-hub.service wc-sessiond.service
   if [ -n "$REAL" ]; then run loginctl enable-linger "$DESK"; fi
@@ -373,6 +407,9 @@ if [ "$VERB" = install-staged ]; then
   case "$st_real" in "$AH_REAL"/*) ;; *) echo "the stage $st_real is not under ~$ADMIN"; exit 1 ;; esac
   if [ -n "$REAL" ]; then getent passwd waycompose >/dev/null || { echo "no account waycompose: this host has no system services"; exit 1; }; fi
   say "installation $n: $st_real -> $nb_real, its sessions as $DESK"
+  if [ -e "$nb" ]; then
+    confirmed_baseline "$n" || { echo "$n has no confirmed mapped-product rollback baseline; run the product successfully, then baseline-confirm"; exit 1; }
+  fi
   tmp="$nb.new"
   run rm -rf "$tmp"
   run install -d -m 0755 "$VL/installs"
@@ -390,13 +427,10 @@ if [ "$VERB" = install-staged ]; then
   done
   if [ "$FAIL" = 0 ]; then
     if [ -e "$nb" ]; then
-      if cmp -s "$nb/session.key" "$TRUST/$n/session.key"; then
-        run install -d -m 0700 "$VL/protected-rollback"
-        run rm -rf "$VL/protected-rollback/$n"
-        run cp -a "$nb" "$VL/protected-rollback/$n"
-      else
-        secure_path "$TRUST/$n/rotation-pending" 600 && [ ! -e "$nb/session.key" ] || { echo "refusing snapshot of an untrusted verifier"; exit 1; }
-      fi
+      confirmed_baseline "$n" || { echo "$n has no confirmed mapped-product rollback baseline; run the product successfully, then baseline-confirm"; exit 1; }
+      cmp -s "$nb/session.key" "$TRUST/$n/session.key" ||
+        { secure_path "$TRUST/$n/rotation-pending" 600 && [ ! -e "$nb/session.key" ]; } ||
+        { echo "existing installation has an untrusted verifier"; exit 1; }
       run mv "$nb" "$nb.old"
     fi
     run mv "$tmp" "$nb"
@@ -409,7 +443,7 @@ if [ "$VERB" = install-staged ]; then
     done
     # The admin's copy of the key goes: the service's is the only one.
     run rm -f "$st/session.key"
-    initial_snapshot "$n"
+    say "confirm a successful real mapped-user session with baseline-confirm before replacing this installation"
     run rm -f "$TRUST/$n/rotation-pending"
     if [ -n "$REAL" ]; then
       runuser -u "$DESK" -- env HOME="$DH" bash "$nb/wc-session" apps >/dev/null 2>&1 \
@@ -466,7 +500,7 @@ if [ "$VERB" = rollback ]; then
   say "restore protected installation snapshots; keep system identity, broker and current keys"
   for n in "${INSTALLS[@]}"; do
     snap="$VL/protected-rollback/$n"; nb="$VL/installs/$n"
-    secure_path "$VL/protected-rollback" 700 && [ -d "$snap" ] && [ ! -L "$snap" ] || { echo "no protected snapshot for $n"; exit 1; }
+    confirmed_baseline "$n" || { echo "no confirmed mapped-product baseline for $n"; exit 1; }
     [ -f "$snap/wc-session" ] && [ -f "$snap/apps.ini" ] || exit 1
     [ ! -e "$nb.rollback-new" ] || { echo "rollback staging already exists"; exit 1; }
   done

@@ -37711,16 +37711,43 @@ generation with `services.waycompose`. For each installation it does this:
   beneath the system layout, with its current trusted key. It keeps the
   system services, user mapping and broker protection. It never restores
   admin user units, desktop raw-resource ACLs or an exposed old key. A
-  missing protected snapshot refuses rollback. The first protected install
-  creates its initial snapshot, and later deploys snapshot the prior
-  protected installation. Rollback requires idle admin and mapped-user
-  session managers; it restores installation apps, configuration and bins,
-  while keeping shared service binaries and the mapping unchanged.
+  missing confirmed snapshot refuses rollback. First migration preserves
+  the original `wc-launch` profile renderer and `libsv_wlshim.so` presentation
+  library while upgrading the broker-dependent launcher script, proxy, ICD
+  and transport services. The pre-broker installation is kept under
+  `legacy-original` as recovery history, not executable rollback.
 
-The earlier legacy-layout dry run does not establish protected rollback.
-The current fixture checks protected snapshot restoration, key rotation,
-trusted-key reuse and refusal of unconfirmed provenance. Live migration
-remains pending.
+  Run a real mapped-user product session successfully, end it, then invoke
+  `wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL`.
+  This explicit operator confirmation snapshots that tested protected
+  installation. It does not run the product test itself. Replacing an
+  installation requires a confirmed baseline; deployments never overwrite it
+  automatically. Confirm a later candidate only after its own successful
+  product session. Rollback restores the accepted application's configuration
+  and binaries, including its known-working broker-aware transport baseline,
+  with the current trusted key. Shared services and user mapping stay in place.
+  Both confirmation and rollback require idle admin and mapped-user sessions.
+
+A bounded native fixture now proves the service and signer at uid 1000 map
+an authenticated boot record to a real agent and application at uid 1001.
+The named stock `wayland-info` application reads the live registry through
+`wc-session`, the proxy and control rings. Its proxy holds the descriptor the
+broker opened while direct opens of the service-owned synthetic BARs fail.
+The private user manager and every application use synthetic HOME/XDG paths;
+family VM, render-node and DRM paths are masked in both fixture namespaces.
+
+The rollback fixture executes the actual installed original `wc-launch`
+profile renderer, confirms a baseline only after that mapped-user product
+session ends, deploys a broken renderer and changed preferences, then runs
+`rollback`. The original renderer bytes and false preference return and the
+real application runs again. Transport hashes, service/signer processes,
+current protected key and an independent shared mapping/sentinel remain
+unchanged. The original presentation shim is restored by hash; GPU presentation
+is not exercised. This is a native synthetic-BAR fixture, separate from the
+real Windows broker tests, and does not restore pre-broker transports.
+Evidence is `distinct-uid-original-renderer-rollback.txt` beneath
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`.
+Family migration and deployment remain pending review.
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
