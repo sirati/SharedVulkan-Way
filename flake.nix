@@ -31,7 +31,8 @@
     kache,
     ...
   }:
-    flake-utils.lib.eachSystem ["x86_64-linux"] (system: let
+    nixpkgs.lib.recursiveUpdate
+    (flake-utils.lib.eachSystem ["x86_64-linux"] (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [rust-overlay.overlays.default kache.overlays.default];
@@ -506,7 +507,7 @@
         .system
         .build
         .vm;
-    }) // (let
+    })) (let
       stack = import ./nix/hyperlinux/stack.nix {
         inputs = inputs // {
           nixpkgs = inputs.hyperlinux-runtime-nixpkgs;
