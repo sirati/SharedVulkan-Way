@@ -4,7 +4,9 @@
 RUNDIR holds guest/*.txt (WC_HOP_TRACE of the launcher, L-<pid>.txt, and
 the compositor) and host/proxy-*.txt (the proxy's WC_HOP_TRACE).
 
-    wc-hop-timeline.py RUNDIR [GAP_FILTER_MS]
+    wc-hop-timeline.py RUNDIR [--clock-json]
+
+--clock-json prints the fitted clock model without the per-hop tables.
 
 Guest stamps (QueryPerformanceCounter ns, every guest process) and the
 proxy's (CLOCK_MONOTONIC ns). The clock offset comes from the back-to-back
@@ -13,7 +15,7 @@ host P.tx -> guest C.reply; the offset of the fastest tenth is the median of
 ((g1 + g2) - (h1 + h2)) / 2, refitted as a line over time when there are back-to-back
 runs at both ends.
 """
-import bisect, glob, os, statistics, sys
+import bisect, glob, json, os, statistics, sys
 
 run = sys.argv[1]
 
@@ -90,6 +92,8 @@ def coarse_points(sub):
                 sc += 1
         if best is None or sc > best[0]:
             best = (sc, cand)
+    if best is None:
+        return []
     cand = best[1]
     pts = []
     for s, g1, g2 in sub:
@@ -131,6 +135,15 @@ def fit_offset():
 
 fit = fit_offset()
 off, how = fit if fit else ((lambda t: 0.0), "no offset")
+if "--clock-json" in sys.argv[2:]:
+    reference = reqs[0][0] if reqs else 0
+    print(json.dumps({
+        "description": how,
+        "reference_ns": reference,
+        "offset_ns": off(reference) if fit else None,
+        "slope": (off(reference + 1_000_000_000) - off(reference)) / 1_000_000_000 if fit else None,
+    }))
+    sys.exit(0)
 print("clock:", how)
 
 order = ["L.send", "C.line", "C.ringtx0", "bell.poke", "bell.wr0", "bell.issued", "bell.wr1", "C.ringtx1",
