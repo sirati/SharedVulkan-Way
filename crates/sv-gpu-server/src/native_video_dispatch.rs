@@ -39,7 +39,7 @@ impl DispatchState {
         self.failure
     }
     pub fn available(&self) -> bool {
-        self.video.available()
+        self.failure.is_none() && self.video.available()
     }
     pub fn session(&self, wire: u64) -> Option<u64> {
         self.sessions.get(&wire).copied()
@@ -120,6 +120,9 @@ impl GpuServer {
         let state = self.shared.native_video.lock().unwrap();
         let mut reply = p::VkGetPhysicalDeviceVideoCapabilitiesKHRReply::default();
         let r = (|| -> VideoResult<()> {
+            if !state.available() {
+                return Err(fail());
+            }
             let profile = profile(a.p_video_profile.as_deref().ok_or_else(invalid)?)?;
             let c = state.video.capabilities(profile)?;
             let mut out = a.p_capabilities.clone().ok_or_else(invalid)?;
