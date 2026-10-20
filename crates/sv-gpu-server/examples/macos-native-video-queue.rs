@@ -7,8 +7,11 @@ fn main() {
         std::process::exit(1);
     });
     let sync2 = std::env::args().any(|a| a == "--sync2");
-    match sv_gpu_server::native_video_queue_fixture::run(sync2) {
-        Ok(()) => println!("PASS native queue fixture sync2={sync2}"),
+    let wire_recording = std::env::args().any(|a| a == "--wire-recording");
+    match sv_gpu_server::native_video_queue_fixture::run_mode(sync2, wire_recording) {
+        Ok(()) => {
+            println!("PASS native queue fixture sync2={sync2} wire_recording={wire_recording}")
+        }
         Err(error) => {
             eprintln!("FAIL native queue fixture: {error}");
             // Native owners must not unwind after an uncertain completion.

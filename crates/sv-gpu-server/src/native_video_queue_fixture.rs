@@ -1,7 +1,8 @@
 //! Isolated real-driver queue fixture. Readiness is enabled only on its Shared.
-//! Decode metadata is installed manually. This does not prove stock wire
-//! session/parameter parsing, product activation, or valid application reset
-//! of a pending command buffer. The snapshot probe mutates fixture metadata.
+//! The default mode installs metadata manually. The wire-recording mode creates
+//! resources, session parameters and coding commands through Forward. Neither
+//! mode activates product readiness or proves the stock application's calls.
+//! The snapshot probe mutates fixture metadata, not pending application state.
 use crate::{
     arena,
     driver::Driver,
@@ -29,6 +30,9 @@ impl Drop for CompletionGuard {
         }
     }
 }
+
+#[path = "native_video_queue_wire_fixture.rs"]
+mod wire_recording;
 
 const STREAM: &[u8] = include_bytes!("../examples/assets/videotoolbox-h264/progressive-64x50.h264");
 const DEVICE: u64 = 1;
@@ -101,6 +105,14 @@ fn first_picture() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
 /// library used by macos-videotoolbox-decode, linked only for this feature.
 /// This function owns its isolated Shared and never changes product readiness.
 pub fn run(sync2: bool) -> Result<(), String> {
+    run_mode(sync2, false)
+}
+
+pub fn run_mode(sync2: bool, wire_recording: bool) -> Result<(), String> {
+    if wire_recording {
+        return self::wire_recording::run(sync2);
+    }
+
     let (sps, pps, payload) = first_picture()?;
     let driver = Arc::new(Driver::open(0).map_err(|e| e.to_string())?);
     let region = Arc::new(SharedRegion::heap(1 << 20).map_err(|e| e.to_string())?);
@@ -326,10 +338,76 @@ pub fn run(sync2: bool) -> Result<(), String> {
         video_stable: Mutex::new(Default::default()),
         poisoned: Default::default(),
     });
-    let mut rpc = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
+    let rpc = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&shared)));
+    submit_and_verify(
+        rpc,
+        sync2,
+        false,
+        shared,
+        destination,
+        setup,
+        source_buffer,
+        pool,
+    )
+}
+
+fn submit_and_verify(
+    mut rpc: sv_gpu_entry::Forward<GpuServer>,
+    sync2: bool,
+    wire_recording: bool,
+    shared: Arc<Shared>,
+    destination: Arc<Image>,
+    setup: Arc<Image>,
+    source_buffer: vk::Buffer,
+    pool: vk::CommandPool,
+) -> Result<(), String> {
+    let driver = Arc::clone(&shared.driver);
+    let (timeline, binary, fence) = {
+        let objects = shared.objects();
+        (
+            objects
+                .get::<vk::Semaphore>(HandleType::VkSemaphore, TIMELINE)
+                .map_err(|e| format!("{e:?}"))?,
+            objects
+                .get::<vk::Semaphore>(HandleType::VkSemaphore, BINARY)
+                .map_err(|e| format!("{e:?}"))?,
+            objects
+                .get::<vk::Fence>(HandleType::VkFence, FENCE)
+                .map_err(|e| format!("{e:?}"))?,
+        )
+    };
+    let job = {
+        let state = shared.native_video.lock().unwrap();
+        let plan = state
+            .plans
+            .video(COMMAND)
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("missing video plan")?;
+        plan.iter()
+            .find_map(|step| match step {
+                crate::video_recording::Step::Decode(job) => Some(job.clone()),
+                _ => None,
+            })
+            .ok_or("missing decode")?
+    };
+    if wire_recording {
+        let canonical_sps = [
+            0x67, 0x42, 0xc0, 0x0a, 0xda, 0x10, 0x9f, 0x88, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0xc8,
+            0x3c, 0x22, 0x11, 0xa8,
+        ];
+        let (_, original_pps, _) = first_picture()?;
+        if job.configuration.sps.as_ref() != canonical_sps
+            || job.configuration.pps.as_ref() != original_pps
+        {
+            return Err(
+                "wire Std parameter serialization differs from verified canonical NALs".into(),
+            );
+        }
+    }
     let mut completion = CompletionGuard(true);
-    // Earlier ordinary native work signals the binary once. It also supplies
-    // the actual initial layout transitions before video ownership transfers.
+    // Earlier ordinary native work signals the binary once. Manual mode also
+    // places initial image transitions there; wire mode records its transitions
+    // in the video plan before decode.
     checked(
         wire(rpc.queue_submit(p::VkQueueSubmitArgs {
             queue: p::VkQueue(QUEUE),
@@ -444,7 +522,7 @@ pub fn run(sync2: bool) -> Result<(), String> {
     }
     completion.0 = false;
     println!(
-        "queue fixture sync2={sync2} original_arena=true distinct_setup=true future_host_signal=true binary_wait=true user_fence=true accepted_snapshot=true pixels=32"
+        "queue fixture sync2={sync2} wire_recording={wire_recording} original_arena=true distinct_setup=true future_host_signal=true binary_wait=true user_fence=true accepted_snapshot=true pixels=32"
     );
     // All native work is retired before these fixture-only handles are freed.
     unsafe {
