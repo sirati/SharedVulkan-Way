@@ -270,7 +270,8 @@ if [ -n "${SVFS_MESA:-}" ]; then
 else
   FFENV+=(LIBVA_DRIVERS_PATH=/nonexistent LIBVA_DRIVER_NAME=none)
 fi
-[ -n "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ] || {
+# An explicit client Mesa must not be overwritten by the GPU-side driver.
+[ -n "${SVFS_MESA:-}${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ] || {
   m=$(dirname "$(dirname "$(dirname "$(dirname "$ICD")")")")
   [ -f "$m/share/glvnd/egl_vendor.d/50_mesa.json" ] && FFENV+=(__EGL_VENDOR_LIBRARY_FILENAMES="$m/share/glvnd/egl_vendor.d/50_mesa.json")
 }
