@@ -40,3 +40,19 @@ two vCPUs, no network or physical-device passthrough, and a ten-minute bound.
 A real root CUSE endpoint and unchanged Firefox default-sandbox software run
 were observed. These alone do not prove driver initialization, GPU rendering
 or hardware video decode. Those require the separate BAR/fill and RDD gates.
+
+The bounded kernel fixture then passed `vk-probe --fill-buffer` against an
+RTX 5090 on the VM host. The guest verified all 65,536 words in 256 KiB
+after a transfer-to-host barrier and fence. An independent read of QEMU's
+original shared backing found the complete contiguous GPU-written pattern.
+Hostd mapped the root-owned PCI resource, whose direct open by the desktop
+UID was denied. The app could not connect to the GPU socket path and
+attached through the real CUSE relay by descriptor. The actual virtio-serial
+doorbell was attached. The 26 ring waits averaged 1.753 ms on that run,
+which does not meet the 200 us latency target.
+
+These gates passed: 49 hostd and 158 transport unit tests, including the
+broker-lent file-port hub test, and native builds of hostd, broker, ICD,
+GPU server and probe. Five stopwatch tests were ignored. Clippy completed
+with existing warnings outside the changed lines. Strict warning denial
+stopped on pre-existing render-node warnings.
