@@ -130,8 +130,13 @@ acceptance test. A pair of arbitrary unrelated textures does not establish a
 valid multi-plane VkImage. Never infer chroma pitch or plane offset from width.
 
 The guest also needs a stock media frontend that actually selects Vulkan Video.
-Advertising Vulkan decode alone does not make stock Firefox call it. Verify the
-stock Mesa VA-API frontend, Firefox's VA-API selection and the sandboxed render
-node independently before claiming hardware Firefox decode. The end-to-end proof
-must identify the selected hardware decoder, decoded output format and frame
+Advertising Vulkan decode alone does not make stock Firefox call it. Release
+Firefox 157 does not enable direct Vulkan decode by default; its Vulkan decode
+preference is Nightly-only and the current GfxInfo path blocklists every device.
+Use default Firefox VA-API through the upstream Zink VA frontend, which consumes
+forwarded Vulkan Video. Do not enable experimental Firefox preferences for the
+proof. Verify the stock Mesa VA-API frontend, Firefox's VA-API selection and the
+sandboxed render node independently. Firefox's FFmpeg decoder can log
+`VA-API FFmpeg init successful` and `VA-API frame pts=`. The end-to-end proof must
+also identify the selected hardware decoder, decoded output format and frame
 completion without readback.
