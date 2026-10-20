@@ -52,7 +52,10 @@ pub unsafe trait NativeProviderAuthority: Send + Sync {
     /// Revalidate the exact retained raw device/module authority. Does not
     /// validate any original source, which has its own native owner guard.
     fn validate_live_provider(&self) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "no native provider liveness validator"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no native provider liveness validator",
+        ))
     }
 }
 pub(super) struct Provider {
@@ -61,6 +64,15 @@ pub(super) struct Provider {
     gate: Arc<Mutex<()>>,
     pub(super) high_water: u64,
     pub(super) limits: NativeLimits,
+}
+impl Provider {
+    pub(super) fn validate_live(&self) -> io::Result<()> {
+        let _serial = self
+            .gate
+            .lock()
+            .map_err(|_| denied("native provider gate poisoned"))?;
+        self.authority.validate_live_provider()
+    }
 }
 /// Immutable facts captured from an authenticated actual native exporter.
 /// This type has no safe wire/caller-tuple constructor.
@@ -362,6 +374,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             target,
             access,
         } = request;
+        self.records[&grant.id].open_for_work()?;
         if self.records[&grant.id]
             .closing
             .contains_key(&(allocation, reference))

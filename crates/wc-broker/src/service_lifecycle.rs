@@ -45,10 +45,19 @@ enum Stage {
 pub struct GrantChannel {
     auth: Authenticator,
     owner: Arc<()>,
+    identity: Arc<()>,
     // Preserve the opaque LIVE durable-reservation token. Reopened unknown
     // records cannot recreate one. This confers no release API yet; a future
     // complete current census/closing barrier must consume it exactly once.
     _reservation: Reservation,
+}
+impl GrantChannel {
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+    pub(crate) fn has_work_budget(&self, required: u64) -> bool {
+        self.auth.has_work_budget(required)
+    }
 }
 
 struct ServiceState<S: DurableStore> {
@@ -500,6 +509,7 @@ impl<S: DurableStore, B: Send + Sync + 'static> Lifecycle<S, B> {
         Ok(GrantChannel {
             auth,
             owner: self.channel_owner.clone(),
+            identity: Arc::new(()),
             _reservation: reservation,
         })
     }

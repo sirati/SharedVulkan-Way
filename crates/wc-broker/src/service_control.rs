@@ -73,6 +73,7 @@ pub enum Phase {
     GrantReleaseCommit = 14,
     TransferCancelAck = 15,
     PrepareDeclined = 16,
+    GrantLocalQuiescent = 17,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Payload {
@@ -138,7 +139,10 @@ impl Message {
         let p = self.payload;
         let barrier = matches!(
             self.phase,
-            Phase::GrantClosing | Phase::GrantQuiescent | Phase::GrantReleaseCommit
+            Phase::GrantClosing
+                | Phase::GrantQuiescent
+                | Phase::GrantReleaseCommit
+                | Phase::GrantLocalQuiescent
         );
         if barrier != (p.close_generation != 0) {
             return Err(bad("service control close generation differs from phase"));
@@ -153,7 +157,10 @@ impl Message {
         let no_extent = p.offset == 0 && p.capacity == 0 && p.length == 0;
         let shape = match self.phase {
             Phase::Grant | Phase::GrantRetired => p == Payload::default(),
-            Phase::GrantClosing | Phase::GrantQuiescent | Phase::GrantReleaseCommit => {
+            Phase::GrantClosing
+            | Phase::GrantQuiescent
+            | Phase::GrantReleaseCommit
+            | Phase::GrantLocalQuiescent => {
                 p == Payload {
                     close_generation: p.close_generation,
                     ..Payload::default()
@@ -308,6 +315,7 @@ impl Message {
             14 => Phase::GrantReleaseCommit,
             15 => Phase::TransferCancelAck,
             16 => Phase::PrepareDeclined,
+            17 => Phase::GrantLocalQuiescent,
             _ => return Err(bad("unknown service control phase")),
         };
         let sequence = r.u64()?;
@@ -458,6 +466,7 @@ mod tests {
             Phase::GrantClosing,
             Phase::GrantQuiescent,
             Phase::GrantReleaseCommit,
+            Phase::GrantLocalQuiescent,
         ] {
             let mut message = fixture();
             message.phase = phase;

@@ -24,6 +24,8 @@ use std::{
 };
 
 mod closing;
+mod grant_closing;
+pub use grant_closing::{GrantCensus, GrantClosing, GrantReleaseReady};
 pub mod native;
 pub use closing::ClosingReference;
 mod remote;
@@ -88,7 +90,10 @@ pub unsafe trait OriginalBacking: Send + Sync + 'static {
     /// Opaque retention, stat/seals and a caller tuple cannot satisfy this.
     /// Only implementations with a real LiveOriginalOwner may allow release.
     fn validate_live_source(&self) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "no native original source validator"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no native original source validator",
+        ))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +230,8 @@ struct Record<B: OriginalBacking> {
     closing: BTreeMap<(u64, native::ProjectionReference), bool>,
     lineage_digest: [u8; 32],
     lineage_revision: u64,
+    barrier: Option<grant_closing::Barrier>,
+    local_pending: BTreeMap<(Key, Transfer), Process>,
 }
 impl<B: OriginalBacking> Record<B> {
     fn bump_lineage(&mut self) -> io::Result<()> {
@@ -279,6 +286,7 @@ pub struct ProtectedGrants<S: DurableStore, B: OriginalBacking> {
     records: BTreeMap<u64, Record<B>>,
     geometry: BackingGeometry,
     resource_limits: ResourceLimits,
+    next_close: u64,
     next_projection: u64,
     native_exports: Arc<std::sync::Mutex<Option<native::Provider>>>,
 }
@@ -372,6 +380,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             records: BTreeMap::new(),
             geometry,
             resource_limits: ResourceLimits::new(64, 128, 256, 1024)?,
+            next_close: 1,
             next_projection: 1,
             native_exports: Arc::new(std::sync::Mutex::new(None)),
         })
@@ -582,6 +591,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 closing: BTreeMap::new(),
                 lineage_digest,
                 lineage_revision: 0,
+                barrier: None,
+                local_pending: BTreeMap::new(),
             },
         );
         Ok(GrantId {
@@ -647,6 +658,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     ) -> io::Result<RegisteredProcess> {
         self.require_role(lifecycle, grant, role)?;
         let record = self.record(lifecycle, grant)?;
+        record.open_for_work()?;
         if user != record.table.grant().user {
             return Err(denied("process user differs from canonical grant"));
         }
@@ -736,6 +748,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     ) -> io::Result<()> {
         Self::same_grant(&producer.grant, &allocation.grant)?;
         let record = self.record(lifecycle, &allocation.grant)?;
+        record.open_for_work()?;
         let reference = native::ProjectionReference::Producer {
             registration: producer.process.registration(),
         };
@@ -762,6 +775,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         capacity: u64,
     ) -> io::Result<(AllocationId, Extent)> {
         self.process_role(lifecycle, process, ProcessRole::Producer)?;
+        self.records[&process.grant.id].open_for_work()?;
         if self.records[&process.grant.id].table.admitted_allocations()
             >= self.resource_limits.allocations
         {
@@ -839,6 +853,11 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .unwrap()
             .table
             .prepare(producer.process, allocation.key, recipient.process)?;
+        self.records
+            .get_mut(&allocation.grant.id)
+            .unwrap()
+            .local_pending
+            .insert((allocation.key, transfer), recipient.process);
         Ok(PendingTransfer {
             allocation: allocation.clone(),
             transfer,
@@ -860,6 +879,11 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .unwrap()
             .table
             .accept(recipient.process, pending.allocation.key, pending.transfer)?;
+        self.records
+            .get_mut(&pending.allocation.grant.id)
+            .unwrap()
+            .local_pending
+            .remove(&(pending.allocation.key, pending.transfer));
         self.records
             .get_mut(&pending.allocation.grant.id)
             .unwrap()
@@ -909,6 +933,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.record(lifecycle, &consumer.allocation.grant)?;
+        record.open_for_work()?;
         if record.closing.contains_key(&(
             consumer.allocation.key.allocation,
             native::ProjectionReference::Consumer {
@@ -975,7 +1000,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         lifecycle: &Lifecycle<S, B>,
         grant: &GrantId,
     ) -> io::Result<Frame> {
-        self.record(lifecycle, grant)?;
+        self.record(lifecycle, grant)?.open_for_work()?;
         if self.context.origin() != self.context.grantor() {
             return Err(denied("only canonical grantor may announce a whole grant"));
         }
@@ -1041,6 +1066,13 @@ mod tests {
     );
     // SAFETY: geometry fixture only, not a native original-backing claim.
     unsafe impl OriginalBacking for Backing {
+        fn validate_live_source(&self) -> io::Result<()> {
+            if self.3.load(Ordering::SeqCst) {
+                Err(io::Error::other("simulated original owner failed"))
+            } else {
+                Ok(())
+            }
+        }
         fn geometry(&self) -> BackingGeometry {
             self.0
         }
@@ -1160,7 +1192,11 @@ mod tests {
     }
     struct TestProvider;
     // SAFETY: explicit simulated provider, no kernel authority claim.
-    unsafe impl native::NativeProviderAuthority for TestProvider {}
+    unsafe impl native::NativeProviderAuthority for TestProvider {
+        fn validate_live_provider(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
     fn owner(c: &Context) -> Owner {
         let mut owner = unsafe { ProtectedGrants::start(c.clone(), layout()).unwrap() };
         // Explicit simulated monotonic provider, never a native enrollment claim.
@@ -1568,6 +1604,70 @@ mod tests {
         let c = unsafe {
             b.register_consumer(&ll, &gb, User::uid(binding().linux_uid), native)
                 .unwrap()
+        };
+        (a, b, wl, ll, ga, gb, p, c, watch)
+    }
+    fn inverse_remote_setup() -> (
+        Owner,
+        Owner,
+        Life,
+        Life,
+        GrantId,
+        GrantId,
+        RegisteredProcess,
+        RegisteredProcess,
+        Arc<Watch>,
+    ) {
+        let (w, watch) = context(Origin::Windows, Store::default(), false);
+        let (l, _) = context(Origin::Linux, Store::default(), false);
+        let mut enrolled = binding();
+        enrolled.roles.producer = Origin::Linux;
+        enrolled.roles.consumer = Origin::Windows;
+        let mut wl = unsafe {
+            Lifecycle::start(
+                w.clone(),
+                "test-install",
+                KEY,
+                enrolled.clone(),
+                BootstrapRole::Initiator,
+            )
+            .unwrap()
+        };
+        let mut ll = unsafe {
+            Lifecycle::start(
+                l.clone(),
+                "test-install",
+                KEY,
+                enrolled,
+                BootstrapRole::Responder,
+            )
+            .unwrap()
+        };
+        let h = wl.hello().unwrap();
+        let c = ll.receive(&h).unwrap().unwrap();
+        let f = wl.receive(&c).unwrap().unwrap();
+        ll.receive(&f).unwrap();
+        let (mut a, mut b) = (owner(&w), owner(&l));
+        let ga = a.grant(&mut wl, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let frame = a.grant_frame(&wl, &ga).unwrap();
+        let gb = b.accept_grant(&mut ll, &frame).unwrap();
+        let p = unsafe {
+            b.register_producer(
+                &ll,
+                &gb,
+                User::uid(binding().linux_uid),
+                Arc::new(Watch(AtomicU8::new(0))),
+            )
+            .unwrap()
+        };
+        let c = unsafe {
+            a.register_consumer(
+                &wl,
+                &ga,
+                User::sid(&binding().windows_sid),
+                Arc::new(Watch(AtomicU8::new(0))),
+            )
+            .unwrap()
         };
         (a, b, wl, ll, ga, gb, p, c, watch)
     }
@@ -2553,6 +2653,331 @@ mod tests {
             assert!(a.records[&ga.id].closing.is_empty());
             assert!(b.records[&gb.id].closing.is_empty());
         }
+    }
+    #[test]
+    fn whole_grant_barrier_requires_both_current_censuses_and_never_frees_reservation() {
+        let (mut a, mut b, wl, ll, ga, gb, p, _, _) = remote_setup();
+        let exclusions = wl.exclusions().unwrap();
+        let (closing, frame) = a.begin_grant_close(&wl, &ga).unwrap();
+        assert!(a.allocate(&wl, &p, 1, PAGE).is_err());
+        assert!(a.announce_registration(&wl, &p).is_err());
+        let peer_close = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::GrantClosing(c) => c,
+            _ => panic!(),
+        };
+        let local = a.mint_grant_census(&wl, &closing).unwrap();
+        assert!(a.complete_grant_barrier(&wl, &local).is_err());
+        assert!(a.mint_grant_census(&wl, &closing).is_err());
+        let peer = b.mint_grant_census(&ll, &peer_close).unwrap();
+        assert!(b.complete_grant_barrier(&ll, &peer).is_err());
+        let wrong = forge_next(
+            &mut b,
+            &ll,
+            &gb,
+            Phase::GrantQuiescent,
+            Payload {
+                close_generation: 2,
+                ..Payload::default()
+            },
+        );
+        assert!(a.apply_remote(&wl, &ga, &wrong).is_err());
+        let ack = b.seal_grant_quiescent(&ll, &peer).unwrap();
+        assert!(b.seal_grant_quiescent(&ll, &peer).is_err());
+        assert!(matches!(
+            a.apply_remote(&wl, &ga, &ack).unwrap(),
+            RemoteApplied::GrantQuiescent
+        ));
+        let ready = a.complete_grant_barrier(&wl, &local).unwrap();
+        assert_eq!(ready.binding(), a.records[&ga.id].guard.binding());
+        assert_eq!(ready.close_generation(), 1);
+        assert!(a.complete_grant_barrier(&wl, &local).is_err());
+        assert!(a.apply_remote(&wl, &ga, &ack).is_err());
+        assert_eq!(wl.exclusions().unwrap(), exclusions);
+        assert_eq!(ll.exclusions().unwrap(), exclusions);
+        // A test-only privileged commit is not a registry release receipt.
+        let commit = forge_next(
+            &mut a,
+            &wl,
+            &ga,
+            Phase::GrantReleaseCommit,
+            Payload {
+                close_generation: 1,
+                ..Payload::default()
+            },
+        );
+        assert!(matches!(
+            b.apply_remote(&ll, &gb, &commit).unwrap(),
+            RemoteApplied::GrantReleaseCommitted
+        ));
+        b.complete_grant_barrier(&ll, &peer).unwrap();
+        assert_eq!(ll.exclusions().unwrap(), exclusions);
+    }
+    #[test]
+    fn whole_grant_closing_blocks_exports_but_preserves_preexisting_accept_and_native_drain() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 2 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (recipient, _) = consumer_process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let pending = owner
+            .prepare(&life, &producer, &allocation, &recipient)
+            .unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let authority = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        let (closing, _) = owner.begin_grant_close(&life, &grant).unwrap();
+        assert!(owner.resize(&life, &producer, &allocation, PAGE).is_err());
+        assert!(
+            owner
+                .prepare(&life, &producer, &allocation, &recipient)
+                .is_err()
+        );
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert!(owner.mint_grant_census(&life, &closing).is_err());
+        let producer_close = owner
+            .begin_close_producer(&life, &producer, &allocation)
+            .unwrap();
+        owner
+            .complete_projection(&life, &grant, unsafe { authority.prove_retired().unwrap() })
+            .unwrap();
+        owner
+            .finish_close_reference(&life, &producer_close)
+            .unwrap();
+        assert!(owner.mint_grant_census(&life, &closing).is_err());
+        let (consumer, _) = owner.accept(&life, &recipient, &pending).unwrap();
+        let consumer_close = owner
+            .begin_close_consumer(&life, &recipient, &consumer)
+            .unwrap();
+        owner
+            .finish_close_reference(&life, &consumer_close)
+            .unwrap();
+        owner.mint_grant_census(&life, &closing).unwrap();
+    }
+    #[test]
+    fn failed_actual_source_requery_blocks_census_and_quarantines_grant() {
+        let (mut owner, mut life, _, context, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let (closing, _) = owner.begin_grant_close(&life, &grant).unwrap();
+        context.backing().3.store(true, Ordering::SeqCst);
+        assert!(owner.mint_grant_census(&life, &closing).is_err());
+        assert!(owner.records[&grant.id].quarantined);
+        assert_eq!(life.exclusions().unwrap(), vec![(PAGE, PAGE)]);
+    }
+    #[test]
+    fn peer_whole_census_recovers_only_remaining_unknown_pending_in_that_closed_grant() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        b.resource_limits = ResourceLimits::new(1, 2, 1, 4).unwrap();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (first, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &first).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let (second, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &second).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        let frame = a.prepare_remote(&wl, &p, &second, &remote).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err());
+        for allocation in [&first, &second] {
+            let close = a.begin_close_producer(&wl, &p, allocation).unwrap();
+            let retired = a.finish_close_reference(&wl, &close).unwrap().unwrap();
+            let result = b.apply_remote(&ll, &gb, &retired);
+            assert_eq!(result.is_ok(), allocation.key == first.key);
+        }
+        assert!(a.records[&ga.id].table.extent(second.key).is_some());
+        let (close, frame) = a.begin_grant_close(&wl, &ga).unwrap();
+        let peer_close = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::GrantClosing(c) => c,
+            _ => panic!(),
+        };
+        assert!(a.mint_grant_census(&wl, &close).is_err());
+        let peer_census = b.mint_grant_census(&ll, &peer_close).unwrap();
+        let ack = b.seal_grant_quiescent(&ll, &peer_census).unwrap();
+        let before = a.records[&ga.id].lineage_revision;
+        a.apply_remote(&wl, &ga, &ack).unwrap();
+        assert!(a.records[&ga.id].lineage_revision > before);
+        assert!(a.records[&ga.id].table.extent(second.key).is_none());
+        let census = a.mint_grant_census(&wl, &close).unwrap();
+        a.complete_grant_barrier(&wl, &census).unwrap();
+        assert_eq!(wl.exclusions().unwrap(), vec![(PAGE, 4 * PAGE)]);
+    }
+    #[test]
+    fn live_accepted_native_view_blocks_peer_census_and_earlier_accept_must_apply_first() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Prepared(p) => p,
+            _ => panic!(),
+        };
+        let (consumer, accepted) = b.accept_remote(&ll, &c, &pending).unwrap(); // Still in flight to a.
+        let target = b.records[&gb.id].processes[&c.process].process.clone();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let authority = b
+            .project_remote_consumer_tracked(&ll, &c, &consumer, &mut backend)
+            .unwrap();
+        let producer_close = a.begin_close_producer(&wl, &p, &allocation).unwrap();
+        let retired = a
+            .finish_close_reference(&wl, &producer_close)
+            .unwrap()
+            .unwrap();
+        b.apply_remote(&ll, &gb, &retired).unwrap();
+        let (close, frame) = a.begin_grant_close(&wl, &ga).unwrap();
+        let peer_close = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::GrantClosing(c) => c,
+            _ => panic!(),
+        };
+        assert!(b.mint_grant_census(&ll, &peer_close).is_err());
+        let consumer_close = b.begin_close_remote_consumer(&ll, &c, &consumer).unwrap();
+        assert!(b.mint_grant_census(&ll, &peer_close).is_err());
+        b.complete_projection(&ll, &gb, unsafe { authority.prove_retired().unwrap() })
+            .unwrap();
+        let released = b
+            .finish_close_reference(&ll, &consumer_close)
+            .unwrap()
+            .unwrap();
+        let peer_census = b.mint_grant_census(&ll, &peer_close).unwrap();
+        let ack = b.seal_grant_quiescent(&ll, &peer_census).unwrap();
+        assert!(a.apply_remote(&wl, &ga, &ack).is_err()); // Strict gap: Accept not applied.
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
+        a.apply_remote(&wl, &ga, &accepted).unwrap();
+        a.apply_remote(&wl, &ga, &released).unwrap();
+        a.apply_remote(&wl, &ga, &ack).unwrap();
+        let census = a.mint_grant_census(&wl, &close).unwrap();
+        a.complete_grant_barrier(&wl, &census).unwrap();
+    }
+    #[test]
+    fn canonical_local_census_recovers_inverse_producer_pending_without_false_initial_closing_authority()
+     {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = inverse_remote_setup();
+        a.resource_limits = ResourceLimits::new(1, 2, 1, 4).unwrap();
+        let frame = b.announce_registration(&ll, &p).unwrap();
+        a.apply_remote(&wl, &ga, &frame).unwrap();
+        let frame = a.announce_registration(&wl, &c).unwrap();
+        let remote = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (first, _) = b.allocate(&ll, &p, 1, PAGE).unwrap();
+        let frame = b.announce_allocation(&ll, &p, &first).unwrap();
+        a.apply_remote(&wl, &ga, &frame).unwrap();
+        let (second, _) = b.allocate(&ll, &p, 1, PAGE).unwrap();
+        let frame = b.announce_allocation(&ll, &p, &second).unwrap();
+        assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        let frame = b.prepare_remote(&ll, &p, &second, &remote).unwrap();
+        assert!(a.apply_remote(&wl, &ga, &frame).is_err());
+        for allocation in [&first, &second] {
+            let close = b.begin_close_producer(&ll, &p, allocation).unwrap();
+            let retired = b.finish_close_reference(&ll, &close).unwrap().unwrap();
+            let result = a.apply_remote(&wl, &ga, &retired);
+            assert_eq!(result.is_ok(), allocation.key == first.key);
+        }
+        let (close, frame) = a.begin_grant_close(&wl, &ga).unwrap();
+        let peer_close = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::GrantClosing(c) => c,
+            _ => panic!(),
+        };
+        assert!(b.records[&gb.id].table.extent(second.key).is_some());
+        assert!(b.mint_grant_census(&ll, &peer_close).is_err());
+        let census = a.mint_grant_census(&wl, &close).unwrap();
+        let statement = a.seal_grant_local_quiescent(&wl, &census).unwrap();
+        assert!(a.seal_grant_local_quiescent(&wl, &census).is_err());
+        assert!(matches!(
+            b.apply_remote(&ll, &gb, &statement).unwrap(),
+            RemoteApplied::GrantLocalQuiescent
+        ));
+        assert!(b.records[&gb.id].table.extent(second.key).is_none());
+        assert!(b.apply_remote(&ll, &gb, &statement).is_err());
+        let peer = b.mint_grant_census(&ll, &peer_close).unwrap();
+        let ack = b.seal_grant_quiescent(&ll, &peer).unwrap();
+        a.apply_remote(&wl, &ga, &ack).unwrap();
+        a.complete_grant_barrier(&wl, &census).unwrap();
+    }
+    #[test]
+    fn inverse_live_native_consumer_blocks_canonical_local_quiescence_until_exact_drain() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = inverse_remote_setup();
+        let frame = b.announce_registration(&ll, &p).unwrap();
+        a.apply_remote(&wl, &ga, &frame).unwrap();
+        let frame = a.announce_registration(&wl, &c).unwrap();
+        let remote = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = b.allocate(&ll, &p, 1, PAGE).unwrap();
+        let frame = b.announce_allocation(&ll, &p, &allocation).unwrap();
+        a.apply_remote(&wl, &ga, &frame).unwrap();
+        let frame = b.prepare_remote(&ll, &p, &allocation, &remote).unwrap();
+        let pending = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Prepared(p) => p,
+            _ => panic!(),
+        };
+        let (consumer, accepted) = a.accept_remote(&wl, &c, &pending).unwrap(); // In flight.
+        let target = a.records[&ga.id].processes[&c.process].process.clone();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        let authority = a
+            .project_remote_consumer_tracked(&wl, &c, &consumer, &mut backend)
+            .unwrap();
+        let producer_close = b.begin_close_producer(&ll, &p, &allocation).unwrap();
+        let retired = b
+            .finish_close_reference(&ll, &producer_close)
+            .unwrap()
+            .unwrap();
+        a.apply_remote(&wl, &ga, &retired).unwrap();
+        let (close, frame) = a.begin_grant_close(&wl, &ga).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &frame).is_err()); // Earlier Accept still in flight.
+        b.apply_remote(&ll, &gb, &accepted).unwrap();
+        let peer_close = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::GrantClosing(c) => c,
+            _ => panic!(),
+        };
+        assert!(a.mint_grant_census(&wl, &close).is_err());
+        let consumer_close = a.begin_close_remote_consumer(&wl, &c, &consumer).unwrap();
+        assert!(a.mint_grant_census(&wl, &close).is_err());
+        a.complete_projection(&wl, &ga, unsafe { authority.prove_retired().unwrap() })
+            .unwrap();
+        let released = a
+            .finish_close_reference(&wl, &consumer_close)
+            .unwrap()
+            .unwrap();
+        let census = a.mint_grant_census(&wl, &close).unwrap();
+        let statement = a.seal_grant_local_quiescent(&wl, &census).unwrap();
+        assert!(b.apply_remote(&ll, &gb, &statement).is_err()); // Earlier release in flight.
+        b.apply_remote(&ll, &gb, &released).unwrap();
+        b.apply_remote(&ll, &gb, &statement).unwrap();
+        let peer = b.mint_grant_census(&ll, &peer_close).unwrap();
+        let ack = b.seal_grant_quiescent(&ll, &peer).unwrap();
+        a.apply_remote(&wl, &ga, &ack).unwrap();
+        a.complete_grant_barrier(&wl, &census).unwrap();
     }
     #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {

@@ -42,6 +42,10 @@ pub enum RemoteApplied {
     CancellationAcknowledged,
     Declined(Frame),
     DeclineAcknowledged,
+    GrantClosing(GrantClosing),
+    GrantQuiescent,
+    GrantLocalQuiescent,
+    GrantReleaseCommitted,
 }
 struct Allocation {
     retired: bool,
@@ -82,6 +86,77 @@ pub(super) struct State {
     next_consumer: u64,
 }
 impl<B: OriginalBacking> Record<B> {
+    pub(super) fn has_remote_serial_budget(&self) -> bool {
+        u64::try_from(self.remote.incoming_pending.len())
+            .ok()
+            .and_then(|n| n.checked_add(2))
+            .is_some_and(|required| u64::MAX - self.remote.next_consumer >= required)
+            && self.remote.next_transfer < u64::MAX - 2
+    }
+    pub(super) fn recover_outgoing_after_peer_census(&mut self, generation: u64) -> io::Result<()> {
+        if self.remote.outgoing_pending.is_empty() && self.remote.outgoing_consumers.is_empty() {
+            return Ok(());
+        }
+        // The whole-grant peer census is stronger authority than an individual
+        // unknown-lineage ACK. Every earlier Accept/Release was ordered before
+        // this current authenticated no-future-export statement.
+        for hold in self
+            .remote
+            .outgoing_pending
+            .values()
+            .chain(self.remote.outgoing_consumers.values())
+        {
+            self.table.check_external(&hold.external)?;
+        }
+        self.bump_lineage()?;
+        for (id, hold, pending) in std::mem::take(&mut self.remote.outgoing_pending)
+            .into_iter()
+            .map(|(id, hold)| (id, hold, true))
+            .chain(
+                std::mem::take(&mut self.remote.outgoing_consumers)
+                    .into_iter()
+                    .map(|(id, hold)| (id, hold, false)),
+            )
+        {
+            use sha2::Digest;
+            let mut digest = sha2::Sha256::new();
+            digest.update(b"wc-broker/whole-peer-census-external-terminal/v1\0");
+            digest.update(self.lineage_digest);
+            digest.update(self.lineage_revision.to_le_bytes());
+            digest.update(generation.to_le_bytes());
+            digest.update([u8::from(pending)]);
+            digest.update(id.to_le_bytes());
+            digest.update(hold.allocation.allocation.to_le_bytes());
+            digest.update(hold.producer.registration().to_le_bytes());
+            digest.update(hold.recipient.to_le_bytes());
+            // SAFETY: exact privileged peer's complete whole-grant census under
+            // the irreversible current barrier proves no view/future accept for
+            // every remaining lineage in this record, not a caller count.
+            unsafe {
+                self.table.release_external(hold.external)?;
+            }
+            self.lineage_digest = digest.finalize().into();
+        }
+        Ok(())
+    }
+    pub(super) fn admitted_remote_allocations(&self) -> usize {
+        self.remote.allocations.len()
+    }
+    pub(super) fn enumerate_remote_census(&self) -> io::Result<()> {
+        if !self.remote.incoming_pending.is_empty()
+            || !self.remote.outgoing_pending.is_empty()
+            || !self.remote.consumers.is_empty()
+            || !self.remote.outgoing_consumers.is_empty()
+            || !self.remote.announced_allocations.is_empty()
+            || !self.remote.allocations.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote exact lineage census incomplete",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn admitted_references(&self) -> usize {
         self.table.admitted_references()
             + self.remote.incoming_pending.len()
@@ -243,6 +318,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     ) -> io::Result<Frame> {
         self.process_role(lifecycle, native, native.role)?;
         let record = self.records.get_mut(&native.grant.id).unwrap();
+        record.open_for_work()?;
         if !record.remote.announced_processes.insert(native.process) {
             return Err(denied("native registration already announced"));
         }
@@ -451,6 +527,21 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         let message = lifecycle.verify(&mut record.channel, frame)?;
         let message = message.message();
         let p = message.payload;
+        if matches!(
+            message.phase,
+            Phase::GrantClosing
+                | Phase::GrantQuiescent
+                | Phase::GrantReleaseCommit
+                | Phase::GrantLocalQuiescent
+        ) {
+            return self.apply_grant_barrier(grant, message.phase, p.close_generation);
+        }
+        if matches!(
+            message.phase,
+            Phase::RegisterProducer | Phase::RegisterConsumer | Phase::Allocate | Phase::Resize
+        ) {
+            record.open_for_work()?;
+        }
         let binding = record.guard.binding();
         match message.phase {
             Phase::RegisterProducer | Phase::RegisterConsumer => {
@@ -545,6 +636,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 ))
             }
             Phase::Prepare => {
+                if record.barrier.is_some() {
+                    return Err(denied("whole grant closing forbids new pending"));
+                }
                 let allocation = record
                     .remote
                     .allocations
@@ -570,7 +664,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 }
                 record.processes[&recipient].live()?;
                 record.remote.highest_incoming_transfer = p.transfer;
-                if record.admitted_references() >= self.resource_limits.references {
+                if record.admitted_references() >= self.resource_limits.references
+                    || record.open_for_work().is_err()
+                {
                     let decline = lifecycle
                         .seal(&mut record.channel, Phase::PrepareDeclined, p)
                         .inspect_err(|_| {
@@ -789,6 +885,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.records.get(&recipient.grant.id).unwrap();
+        record.open_for_work()?;
         if record.closing.contains_key(&(
             consumer.allocation.allocation,
             native::ProjectionReference::RemoteConsumer {
@@ -839,6 +936,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.records.get(&recipient.grant.id).unwrap();
+        record.open_for_work()?;
         if record.closing.contains_key(&(
             consumer.allocation.allocation,
             native::ProjectionReference::RemoteConsumer {

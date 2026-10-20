@@ -291,13 +291,20 @@ impl Authenticator {
     fn ensure_live(&mut self) -> io::Result<()> {
         self.endpoint.ensure_live()
     }
+    pub(crate) fn has_work_budget(&self, required: u64) -> bool {
+        required != 0
+            && [self.next_send, self.next_receive]
+                .into_iter()
+                .all(|next| next.is_some_and(|next| u64::MAX - next >= required - 1))
+    }
     fn check_role(&self, origin: Origin, phase: Phase) -> io::Result<()> {
         let roles = self.binding.roles;
         let required = match phase {
             Phase::Grant
             | Phase::GrantRetired
             | Phase::GrantClosing
-            | Phase::GrantReleaseCommit => roles.grantor,
+            | Phase::GrantReleaseCommit
+            | Phase::GrantLocalQuiescent => roles.grantor,
             Phase::GrantQuiescent => opposite(roles.grantor),
             Phase::RegisterProducer
             | Phase::Allocate
@@ -368,7 +375,11 @@ mod tests {
     #[test]
     fn closing_and_cancel_ack_roles_are_current_binding_directions() {
         let (windows, linux) = pair();
-        for phase in [Phase::GrantClosing, Phase::GrantReleaseCommit] {
+        for phase in [
+            Phase::GrantClosing,
+            Phase::GrantReleaseCommit,
+            Phase::GrantLocalQuiescent,
+        ] {
             assert!(linux.check_role(Origin::Linux, phase).is_ok());
             assert!(windows.check_role(Origin::Windows, phase).is_err());
         }
@@ -408,6 +419,34 @@ mod tests {
         let changed = Frame::from_wire(&changed.encode().unwrap(), &frame.mac).unwrap();
         assert!(receiver.verify(&changed).is_err());
         assert!(receiver.verify(&frame).is_ok());
+    }
+    #[test]
+    fn work_admission_leaves_actual_nonwrapping_sequences_for_closing() {
+        let mut auth = auth(Origin::Linux, fixture().binding);
+        auth.next_send = Some(u64::MAX - 3);
+        assert!(!auth.has_work_budget(8));
+        assert!(auth.has_work_budget(4));
+        for _ in 0..4 {
+            auth.seal(
+                Phase::GrantClosing,
+                Payload {
+                    close_generation: 1,
+                    ..Payload::default()
+                },
+            )
+            .unwrap();
+        }
+        assert!(!auth.has_work_budget(1));
+        assert!(
+            auth.seal(
+                Phase::GrantClosing,
+                Payload {
+                    close_generation: 1,
+                    ..Payload::default()
+                }
+            )
+            .is_err()
+        );
     }
     #[test]
     fn ordinary_user_cannot_create_service_authority() {

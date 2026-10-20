@@ -449,6 +449,7 @@ impl Allocator {
             self.allocations.remove(&key);
         }
     }
+    pub(crate) fn has_serial_budget(&self, required: u64) -> bool { required != 0 && u64::MAX - self.next >= required }
     // Admission bookkeeping only. Neither value is retirement authority.
     pub(crate) fn admitted_allocations(&self) -> usize { self.allocations.len() }
     pub(crate) fn admitted_references(&self) -> usize { self.allocations.values().map(|a| a.pending.len() + a.consumers.len()).sum() }
