@@ -115,6 +115,20 @@ int hl_wc_contains(uint64_t va) {
     pthread_mutex_unlock(&lock);
     return found;
 }
+int hl_wc_fault_matches(uint64_t va, uint64_t ipa) {
+    int matched = 0;
+    pthread_mutex_lock(&lock);
+    for (view *v = views; v; v = v->next) {
+        if (va >= v->va && va < v->end) {
+            uint64_t expected = v->o->ipa + v->o->map.data_offset +
+                                v->offset + va - v->va;
+            matched = ipa == expected;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return matched;
+}
 int hl_wc_ipa_busy(uint64_t lo, uint64_t span) {
     int busy = 0;
     pthread_mutex_lock(&lock);

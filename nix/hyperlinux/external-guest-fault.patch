@@ -1,0 +1,49 @@
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -1748,6 +1748,46 @@
+                     break;
+                 }
+                 }
++            } else if (ec == 0x24 &&
++                       !(vexit->exception.syndrome & ((1ULL << 7) | (1ULL << 10))) &&
++                       (((vexit->exception.syndrome & 0x3c) == 0x04) ||
++                        ((vexit->exception.syndrome & 0x3c) == 0x0c) ||
++                        ((vexit->exception.syndrome & 0x3f) == 0x10)) &&
++                       hl_wc_fault_matches(vexit->exception.virtual_address,
++                                           vexit->exception.physical_address)) {
++                /* Truncation can invalidate the original host-backed page.
++                 * HVF sends that stage-2 abort directly here, bypassing the
++                 * shim. Never replace the backing or relax its permissions.
++                 * Only precise external faults from EL0 are guest signals. */
++                uint64_t pc, pstate;
++                if (hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc) != HV_SUCCESS ||
++                    hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &pstate) != HV_SUCCESS ||
++                    (pstate & 0x1f) != 0) {
++                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                                 "external data abort outside EL0");
++                    exit_code = 128;
++                    running = 0;
++                    break;
++                }
++                uint64_t esr = vexit->exception.syndrome;
++                uint32_t fsc_type = (uint32_t)((esr & 0x3f) >> 2);
++                int signum = fsc_type == 3 ? LINUX_SIGSEGV : LINUX_SIGBUS;
++                int code = fsc_type == 3 ? LINUX_SEGV_ACCERR : LINUX_BUS_ADRERR;
++                /* Signal frames use ELR_EL1/SPSR_EL1, normally saved by the
++                 * shim. Supply live EL0 state and resume the handler directly
++                 * because this path has no shim ERET. */
++                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc);
++                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate);
++                signal_set_fault_info(code, vexit->exception.virtual_address, esr);
++                signal_queue(signum);
++                if (signal_deliver(vcpu, g, &exit_code) < 0) {
++                    running = 0;
++                } else {
++                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc);
++                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &pstate);
++                    hv_vcpu_set_reg(vcpu, HV_REG_PC, pc);
++                    hv_vcpu_set_reg(vcpu, HV_REG_CPSR, pstate);
++                }
+             } else if (ec == 0x30 || ec == 0x32) {
+                 /* EC=0x30: Hardware breakpoint from lower EL (EL0).
+                  * EC=0x32: Software step exception from lower EL.
