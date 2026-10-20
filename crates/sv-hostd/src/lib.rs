@@ -82,6 +82,8 @@ pub mod ivshmem;
 pub mod locate;
 #[cfg(target_os = "linux")]
 pub mod qemu;
+#[cfg(target_os = "linux")]
+pub mod qemu_bar;
 
 /// How the daemon obtained the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

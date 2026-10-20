@@ -1,0 +1,43 @@
+diff --git a/ivshmem/Device.c b/ivshmem/Device.c
+index 593be5c..d2da3f7 100644
+--- a/ivshmem/Device.c
++++ b/ivshmem/Device.c
+@@ -32,0 +33 @@ NTSTATUS IVSHMEMCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
++    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, IVSHMEMRangeCallerContext);
+@@ -42,0 +44 @@ NTSTATUS IVSHMEMCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
++    IVSHMEMRangeInitialize(device);
+@@ -231,0 +234 @@ NTSTATUS IVSHMEMEvtDevicePrepareHardware(_In_ WDFDEVICE Device,
++    if (NT_SUCCESS(result)) IVSHMEMRangeReady(Device);
+@@ -242,0 +246 @@ NTSTATUS IVSHMEMEvtDeviceReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIS
++    IVSHMEMRangeDrain(Device);
+diff --git a/ivshmem/Device.h b/ivshmem/Device.h
+index 55de47a..fc8650f 100644
+--- a/ivshmem/Device.h
++++ b/ivshmem/Device.h
+@@ -1,0 +2 @@
++#include "Range.h"
+@@ -28,0 +30 @@ typedef struct _DEVICE_CONTEXT
++    IVSHMEM_RANGE_STATE range;
+diff --git a/ivshmem/Driver.h b/ivshmem/Driver.h
+index 210e7c6..0770a53 100644
+--- a/ivshmem/Driver.h
++++ b/ivshmem/Driver.h
+@@ -1 +1 @@
+-#include <ntddk.h>
++#include <ntifs.h>
+diff --git a/ivshmem/Queue.c b/ivshmem/Queue.c
+index b991197..136715c 100644
+--- a/ivshmem/Queue.c
++++ b/ivshmem/Queue.c
+@@ -257,0 +258,2 @@ static NTSTATUS ioctl_request_mmap(const PDEVICE_CONTEXT DeviceContext,
++    /* Protected range maps are cached; mixed-cache physical aliases are invalid. */
++    if (in->cacheMode != IVSHMEM_CACHE_CACHED) return STATUS_INVALID_PARAMETER;
+diff --git a/ivshmem/ivshmem.vcxproj b/ivshmem/ivshmem.vcxproj
+index 61e189a..802e7bf 100755
+--- a/ivshmem/ivshmem.vcxproj
++++ b/ivshmem/ivshmem.vcxproj
+@@ -32,0 +33 @@
++    <ClCompile Include="Range.c" />
+@@ -38,0 +40,2 @@
++    <ClInclude Include="Range.h" />
++    <ClInclude Include="RangeBounds.h" />

@@ -306,6 +306,10 @@ pub struct Config {
     /// Linux guest maps through virtio-fs DAX); empty is role (a), guest RAM.
     /// `WC_MAC_ARENA_STANDIN` overrides it.
     pub arena_file: String,
+    /// §103.19, macOS role (b): the GPU pool's file beside the arena, which
+    /// `gpu-server` serves every GPU session from (`pool-guest`); empty is
+    /// role (a)'s one GPU session in guest RAM.
+    pub gpu_file: String,
     /// §102. `nested-compositor-globals = on` asks the compositor for the three
     /// globals a nested compositor needs from its host —
     /// `wp_single_pixel_buffer_manager_v1`, `wp_viewporter` and `wp_presentation`
@@ -369,6 +373,7 @@ impl Default for Config {
             gpu_icd: String::new(),
             wayland_bell: "org.sirati.wcbell.0".into(),
             arena_file: String::new(),
+            gpu_file: String::new(),
             nested_globals: false,
             hostint: HostInt::default(),
             installation: String::new(),
@@ -506,6 +511,7 @@ impl Config {
                 ("session", "gpu-bell") => cfg.gpu_bell = v.into(),
                 ("session", "wayland-bell") => cfg.wayland_bell = v.into(),
                 ("session", "arena-file") => cfg.arena_file = v.into(),
+                ("session", "gpu-file") => cfg.gpu_file = v.into(),
                 ("session", "installation") => cfg.installation = v.into(),
                 ("session", "session-key") => cfg.session_key = v.into(),
                 ("session", "debug-ssh-transport") => {
@@ -928,6 +934,7 @@ mod gpu_tests {
         assert_eq!(p("wayland-bell = org.example.x.0\n").unwrap().wayland_bell, "org.example.x.0");
         assert_eq!(p("").unwrap().arena_file, "");
         assert_eq!(p("arena-file = /Volumes/shm/arena\n").unwrap().arena_file, "/Volumes/shm/arena");
+        assert_eq!(p("gpu-file = /Volumes/shm/gpu\n").unwrap().gpu_file, "/Volumes/shm/gpu");
     }
 
     /// §102. The nested-compositor globals are off unless the ini asks.

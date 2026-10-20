@@ -1,0 +1,30 @@
+{
+  "wayland-1.24.0.tar.xz": {
+    "url": "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz",
+    "sha256": "82892487a01ad67b334eca83b54317a7c86a03a89cfadacfef5211f11a5d0536"
+  },
+  "weston-info.c": {
+    "url": "https://gitlab.freedesktop.org/wayland/weston/-/raw/1.4/clients/weston-info.c",
+    "sha256": "942026dec5783e359ea6fea4a771b69476146a650b21ec9755f992cfee7c38f4"
+  },
+  "os-compatibility.h": {
+    "url": "https://gitlab.freedesktop.org/wayland/weston/-/raw/1.4/shared/os-compatibility.h",
+    "sha256": "745e65898d815959719a12a99d29114fc5897647a66c5da0a35536c5ae9a06e2"
+  },
+  "simple-shm.c": {
+    "url": "https://gitlab.freedesktop.org/wayland/weston/-/raw/10.0.0/clients/simple-shm.c",
+    "sha256": "8403c094f710217a0b310edad53d738e860e94e9103f1fc6c3664e13b7292aa2"
+  },
+  "zalloc.h": {
+    "url": "https://gitlab.freedesktop.org/wayland/weston/-/raw/10.0.0/include/libweston/zalloc.h",
+    "sha256": "baf4e089d4e0a9850c02aaa161651bbfdb079e134144373a215714a70bd15d3a"
+  },
+  "xdg-shell.xml": {
+    "url": "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1.45/stable/xdg-shell/xdg-shell.xml",
+    "sha256": "9d9e27038ca722f159a361293f8c6cd270dab907ab52de5b8ecfbb8d6b9651c2"
+  },
+  "fullscreen-shell-unstable-v1.xml": {
+    "url": "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/raw/1.45/unstable/fullscreen-shell/fullscreen-shell-unstable-v1.xml",
+    "sha256": "fcc50bf0b48610d55bbe096a53da433e8557ea36a31feba2d77bf0cb9181bb52"
+  }
+}

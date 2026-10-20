@@ -340,6 +340,12 @@ pub enum FdEncoding {
     /// the only dialect available on Windows because `SCM_RIGHTS` has no
     /// equivalent there — which is what makes it the default there.
     InBand,
+    /// In-band descriptors restricted to one preauthenticated BAR arena.
+    /// Other arenas and host pathname/section/pipe descriptors are refused
+    /// before a protocol handler can open or map anything they name.
+    InBandArena(u32),
+    /// Authenticated original BAR allocation with consumer-completion leases.
+    InBandLease(u32),
 }
 
 impl Default for FdEncoding {

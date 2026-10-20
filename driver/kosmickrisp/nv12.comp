@@ -1,0 +1,8 @@
+#version 450
+layout(local_size_x=1,local_size_y=1) in;
+layout(set=0,binding=0) uniform sampler2D picture;
+layout(set=0,binding=1,std430) buffer Result { vec4 pixels[]; } result;
+void main() {
+    uvec2 p=gl_GlobalInvocationID.xy;
+    result.pixels[p.y*4+p.x]=textureLod(picture,(vec2(p)+0.5)/vec2(4),0.0);
+}

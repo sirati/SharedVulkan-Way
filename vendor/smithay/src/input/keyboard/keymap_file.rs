@@ -85,11 +85,17 @@ impl KeymapFile {
         // in-band-peer versus out-of-band-peer, and Windows is simply a platform
         // on which every peer is the former.
         let sealed = self.sealed.as_ref();
-        let unsealed_ok = supports_sealed || encoding == crate::utils::os::FdEncoding::InBand;
+        let in_band = matches!(
+            encoding,
+            crate::utils::os::FdEncoding::InBand
+                | crate::utils::os::FdEncoding::InBandArena(_)
+                | crate::utils::os::FdEncoding::InBandLease(_)
+        );
+        let unsealed_ok = supports_sealed || in_band;
         if let Some(file) = unsealed_ok.then_some(sealed).flatten() {
             return file.with_proto_fd(encoding, |fd| cb(fd, file.size()));
         }
-        if encoding == crate::utils::os::FdEncoding::InBand {
+        if in_band {
             return Err(std::io::Error::other(
                 "no keymap object to name for an in-band peer: creating it failed earlier",
             ));

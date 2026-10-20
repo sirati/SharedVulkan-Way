@@ -260,6 +260,93 @@ class Contract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.open(options=options)).error_name, 'org.freedesktop.portal.Error.InvalidArgument')
 
 
+class Startup(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_can_exceed_old_five_second_bound(self):
+        loop = asyncio.get_running_loop()
+        begin = loop.time()
+        async def delayed():
+            return loop.time() - begin >= 5.05
+        await native_session.wait_for_startup(delayed, [], begin + native_session.STARTUP_TIMEOUT)
+        self.assertGreaterEqual(loop.time() - begin, 5.05)
+
+    async def test_deadline_cancels_a_blocked_probe(self):
+        cancelled = asyncio.Event()
+        async def blocked():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with self.assertRaisesRegex(RuntimeError, 'startup deadline'):
+            await native_session.wait_for_startup(blocked, [], asyncio.get_running_loop().time() + 0.03)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_early_child_exit_never_publishes_readiness(self):
+        class Exited:
+            returncode = 1
+        probe = AsyncMock(return_value=True)
+        with self.assertRaisesRegex(RuntimeError, 'exited before readiness'):
+            await native_session.wait_for_startup(probe, [Exited()], asyncio.get_running_loop().time() + 1)
+        probe.assert_not_awaited()
+
+
+    async def test_child_exit_cancels_blocked_readiness(self):
+        exited = asyncio.Event()
+        cancelled = asyncio.Event()
+        class Child:
+            returncode = None
+            async def wait(self):
+                await exited.wait()
+                self.returncode = 1
+                return 1
+        async def blocked():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.02, exited.set)
+        begin = loop.time()
+        with self.assertRaisesRegex(RuntimeError, 'exited before readiness'):
+            await native_session.wait_for_startup(blocked, [Child()], begin + 1)
+        self.assertTrue(cancelled.is_set())
+        self.assertLess(loop.time() - begin, 0.5)
+
+    async def test_stalled_launchctl_is_killed_and_reaped(self):
+        stopped = asyncio.Event()
+        class ControlChild:
+            returncode = None
+            killed = False
+            waits = 0
+            async def wait(self):
+                self.waits += 1
+                await stopped.wait()
+                self.returncode = -9
+                return self.returncode
+            def kill(self):
+                self.killed = True
+                stopped.set()
+        child = ControlChild()
+        with patch.object(native_session.asyncio, 'create_subprocess_exec', new=AsyncMock(return_value=child)) as spawn:
+            with self.assertRaises(TimeoutError):
+                await native_session.launchctl('print', 'private-test', deadline=asyncio.get_running_loop().time() + 0.03)
+        self.assertTrue(child.killed)
+        self.assertEqual(child.returncode, -9)
+        self.assertEqual(child.waits, 2)
+        spawn.assert_awaited_once()
+
+    async def test_ensure_budget_includes_initial_probe(self):
+        async def blocked(root):
+            await asyncio.Event().wait()
+        with patch.object(native_session.sys, 'platform', 'darwin'), \
+             patch.object(native_session, 'STARTUP_TIMEOUT', 0.03), \
+             patch.object(native_session, 'runtime_directory', return_value=Path('/unused-private-fixture')), \
+             patch.object(native_session, 'ready', new=blocked), \
+             patch.object(native_session, 'launchctl', new=AsyncMock()) as invoke:
+            with self.assertRaisesRegex(SystemExit, 'startup deadline'):
+                await native_session.ensure()
+        invoke.assert_not_awaited()
+
+
 if __name__ == '__main__':
     # Test HOME and every XDG directory are private even though no app runs.
     with tempfile.TemporaryDirectory(dir='/mnt/datasets', prefix='wc-portal-test-') as home:

@@ -17,6 +17,8 @@
 //!                        raw-device-owners.txt binds PnP instance IDs to reviewed SIDs;
 //!                        absent/untrusted policy reserves all raw BARs
 //!   --no-acl             leave the devices' descriptors alone
+//!   --protected-bar      reserve raw BAR lending, require protected driver capabilities;
+//!                        does not enable the unfinished client control protocol
 //!   --budget-mib N       the most region memory held at once
 //!   --holder-pipe NAME   the holder's pipe (\\.\pipe\waycompose-broker-holder)
 //!   --no-holder          keep no copy of the regions in a holder process
@@ -62,6 +64,7 @@ pub struct Args {
     pub keys: PathBuf,
     pub state: PathBuf,
     pub acl: bool,
+    pub protected_bar: bool,
     pub budget: Option<u64>,
     pub holder: bool,
     pub holder_pipe: String,
@@ -82,6 +85,7 @@ impl Args {
             keys: program_data().join("keys"),
             state: program_data(),
             acl: true,
+            protected_bar: false,
             budget: None,
             holder: true,
             holder_pipe: super::holder::HOLDER_PIPE.to_string(),
@@ -92,6 +96,7 @@ impl Args {
             match x.as_str() {
                 "--console" => a.console = true,
                 "--no-acl" => a.acl = false,
+                "--protected-bar" => a.protected_bar = true,
                 "--pipe" => a.pipe = val()?,
                 "--pipe-sddl" => a.pipe_sddl = val()?,
                 "--keys" => a.keys = val()?.into(),
@@ -339,9 +344,28 @@ fn serve(a: &Args) -> Result<(), String> {
             allow,
         });
     }
+    if a.protected_bar && (!system || !a.acl) {
+        return Err("protected BAR mode requires SYSTEM and raw-device ACL protection".into());
+    }
+    let protected_paths = paths.clone();
     let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?
         .with_raw_device_paths(paths)
         .with_region_init(Box::new(stamp_guest_ram));
+    let platform = if a.protected_bar {
+        let mut platform = platform.reserve_bars_for_protected_mode();
+        for d in &a.devices {
+            if matches!(d.loc, DeviceLoc::IvshmemSlot(_)) {
+                let path = protected_paths.get(&d.name)
+                    .ok_or_else(|| format!("protected BAR {} has no validated original-device binding", d.name))?;
+                let original = wc_handle::open_ivshmem_path(path.clone()).map_err(|e| e.to_string())?;
+                let device = super::protected_range::Device::from_original(original)
+                    .map_err(|e| format!("protected BAR {} unavailable, raw lending stays disabled: {e}", d.name))?;
+                platform = platform.with_protected_bar(&d.name, device).map_err(|e| e.to_string())?;
+            }
+        }
+        log("protected BAR capability mode: no raw handles are lent; client control remains inactive");
+        platform
+    } else { platform };
     let platform = if a.holder {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let spawn = super::holder::Spawn {

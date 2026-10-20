@@ -362,6 +362,24 @@ mod unix_client {
             super::parse_signed(&l, &req.install).map_err(io::Error::other)
         }
 
+        /// A generation token for this authenticated, kernel-watched connection.
+        pub fn owner_token(&mut self) -> io::Result<wc_handle::iosection_policy::Owner> {
+            let (line, _) = self.call(&Request::Owner)?;
+            match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["ok", "owner", run, connection] => Ok(wc_handle::iosection_policy::Owner {
+                    run: run.parse().map_err(|_| io::Error::other("owner run"))?,
+                    connection: connection.parse().map_err(|_| io::Error::other("owner connection"))?,
+                }),
+                _ => Err(io::Error::other("invalid owner reply")),
+            }
+        }
+
+        /// Atomically observe a token against the kernel-audited sender PID.
+        /// next_event() returns !owner-ended CONNECTION on disconnect or death.
+        pub fn observe_owner(&mut self, owner: wc_handle::iosection_policy::Owner, pid: u32) -> io::Result<()> {
+            self.call(&Request::ObserveOwner { run: owner.run, connection: owner.connection, pid }).map(|_| ())
+        }
+
         pub fn subscribe(&mut self) -> io::Result<()> {
             self.call(&Request::Subscribe).map(|_| ())
         }
@@ -651,4 +669,32 @@ pub mod lend {
         // handle here.
         Some(unsafe { sv_transport::winpipe::Pipe::from_port_handle(h.into_raw_handle() as isize) })
     }
+}
+
+/// Install the existing canonical IOSurface broker-owner observation lifecycle.
+/// Shared by wc-launch and the native HyperLinux compositor. The Mach endpoint
+/// still authenticates audit UID/PID; this callback atomically binds its owner
+/// generation at the broker and revokes names on owner death or broker EOF.
+#[cfg(target_os = "macos")]
+pub fn install_iosection_observer() -> io::Result<()> {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let installed = INSTALLED.get_or_init(|| {
+        wc_handle::iosection::set_owner_observer(Box::new(|owner, sender| {
+            let mut observer = Client::connect(&path())?;
+            observer.hello("iosurface-observer")?;
+            observer.observe_owner(owner, sender.pid)?;
+            std::thread::Builder::new().name("iosurface-owner".into()).spawn(move || {
+                let ended = format!("!owner-ended {}", owner.connection);
+                loop {
+                    match observer.next_event() {
+                        Ok(event) if event != ended => continue,
+                        _ => break,
+                    }
+                }
+                wc_handle::iosection::revoke_owner(owner);
+            })?;
+            Ok(())
+        }))
+    });
+    if *installed { Ok(()) } else { Err(io::Error::other("IOSurface owner observer already installed")) }
 }

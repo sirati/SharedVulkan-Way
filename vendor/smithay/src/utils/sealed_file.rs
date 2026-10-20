@@ -262,6 +262,26 @@ impl SealedFile {
         F: FnOnce(crate::utils::os::BorrowedProtoFd<'_>) -> T,
     {
         match encoding {
+            crate::utils::os::FdEncoding::InBandLease(arena) => {
+                let handle = crate::utils::os::Handle::create_bar_outbound(arena, self.size)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    if let Some(bytes) = &self.bytes { handle.write_at(0, bytes)?; }
+                    else {
+                        let mut bytes = vec![0; self.size];
+                        self.file.read_exact_at(&mut bytes, 0)?;
+                        handle.write_at(0, &bytes)?;
+                    }
+                }
+                #[cfg(windows)]
+                handle.write_at(0, self.handle.map()?.as_slice())?;
+                Ok(f(crate::utils::os::BorrowedProtoFd::Named(&handle)))
+            }
+            crate::utils::os::FdEncoding::InBandArena(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this connection only permits its authenticated BAR arena",
+            )),
             crate::utils::os::FdEncoding::InBand => {
                 let handle = self.named()?;
                 Ok(f(crate::utils::os::BorrowedProtoFd::Named(&handle)))

@@ -54,7 +54,7 @@ pub fn protocol_ids() -> sv_transport::control::ProtocolIds {
 }
 
 /// See `sv_gpu_server::WIRE_VERSION`, which says why this is 5.
-pub const WIRE_VERSION: u32 = 5;
+pub const WIRE_VERSION: u32 = sv_proto::GPU_WIRE_VERSION;
 
 /// The environment variable that points at a GPU side.
 ///

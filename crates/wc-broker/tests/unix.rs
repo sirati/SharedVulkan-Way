@@ -582,3 +582,30 @@ fn a_failed_lease_record_sends_no_handles_and_leaves_no_holder() {
     assert!(b.holders(id).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn owner_generation_is_revoked_by_connection_close() {
+    let d = dir("owner-generation");
+    let sock = start(&d, false);
+    let mut owner = Client::connect(&sock).unwrap();
+    owner.hello("gpu").unwrap();
+    let token = owner.owner_token().unwrap();
+    assert_eq!(token.run, 7);
+    let mut observer = Client::connect(&sock).unwrap();
+    observer.hello("observer").unwrap();
+    let mut wrong_run = token;
+    wrong_run.run += 1;
+    assert!(observer.observe_owner(wrong_run, std::process::id()).is_err());
+    assert!(observer.observe_owner(token, std::process::id().wrapping_add(1)).is_err());
+    observer.observe_owner(token, std::process::id()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(observer.next_event()).unwrap());
+    drop(owner);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+        format!("!owner-ended {}", token.connection));
+    let mut replacement = Client::connect(&sock).unwrap();
+    replacement.hello("gpu").unwrap();
+    assert_ne!(replacement.owner_token().unwrap(), token);
+    assert!(replacement.observe_owner(token, std::process::id()).is_err());
+    std::fs::remove_dir_all(d).unwrap();
+}

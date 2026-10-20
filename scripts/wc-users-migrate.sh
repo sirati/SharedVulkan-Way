@@ -12,6 +12,7 @@
 #   wc-users-migrate.sh verify   ADMIN DESKTOP BIN-DIR INSTALL...   check the new layout, as DESKTOP
 #   wc-users-migrate.sh remove-old ADMIN DESKTOP BIN-DIR INSTALL... delete the admin's copies (after a
 #                                                                     session was seen working)
+#   wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL...  confirm a successful real mapped-user session
 #   wc-users-migrate.sh rollback ADMIN DESKTOP BIN-DIR INSTALL...   restore a protected system-layout installation snapshot
 #   wc-users-migrate.sh install-staged ADMIN auto STAGE NAME          (wc-launch.sh deploy, system layout:
 #                                                                     one staged installation in; its user
@@ -50,7 +51,7 @@ VERB=${1:-}; ADMIN=${2:-}; DESK=${3:-}; BINS=${4:-}
 shift 4 2>/dev/null || { sed -n '3,40p' "$0"; exit 2; }
 INSTALLS=("$@")
 [ ${#INSTALLS[@]} -gt 0 ] || { echo "no installation named"; exit 2; }
-case "$VERB" in plan|apply|verify|remove-old|rollback|install-staged|key-prepare|key-export|key-confirm|services-restart) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
+case "$VERB" in plan|apply|verify|remove-old|rollback|install-staged|baseline-confirm|key-prepare|key-export|key-confirm|services-restart) ;; *) echo "unknown verb $VERB"; exit 2 ;; esac
 
 ROOT=${ROOT:-}
 REAL=1; [ "$(id -u)" = 0 ] && [ -z "$ROOT" ] || REAL=""
@@ -79,6 +80,27 @@ run() { # a step: printed, and done unless planning
 own() { # USER[:GROUP] PATH... (recursive)
   local who=$1; shift
   if [ -n "$REAL" ]; then run chown -R "$who" "$@"; else say "  (would chown -R $who $*)"; fi
+}
+# Replace all discretionary grants, including cached supplementary groups.
+# Open descriptors and mappings remain valid; this revokes future raw opens.
+secure_live_raw() {
+  local service=${1:-waycompose} f acl
+  for f in "$ARENA_DIR" "$ARENA_DIR"/arena "$ARENA_DIR"/gpu "$ARENA_DIR"/*.sock; do
+    [ ! -L "$f" ] || { echo "raw resource is a symlink: $f"; return 1; }
+    [ -e "$f" ] || continue
+    if [ -n "$REAL" ]; then
+      run chown root:root "$f"
+      if [ -d "$f" ]; then
+        run setfacl -k "$f"
+        acl="u::rwx,u:$service:r-x,g::---,m::r-x,o::---"
+      else
+        acl="u::rw-,u:$service:rw-,g::---,m::rw-,o::---"
+      fi
+      run setfacl --set "$acl" "$f"
+    else
+      say "  (would replace owner, named, group and other raw grants with root/$service only on $f)"
+    fi
+  done
 }
 as_user() { # USER CMD...: a systemctl --user of USER
   local u=$1; shift
@@ -154,10 +176,10 @@ require_idle() {
 }
 legacy_snapshot() {
   local n=$1 base=$2 base_real=$3 nb_real=$4
-  local dest="$VL/protected-rollback/$n.preparing"
-  # Preserve the known application installation before candidate binaries or
-  # scripts replace it. Keys and paths are converted to the protected layout.
-  run install -d -m 0700 "$VL/protected-rollback"
+  local dest="$VL/legacy-original/$n.preparing"
+  # Preserve pre-broker recovery history, not an executable rollback baseline.
+  # Keys and paths are converted to the protected layout.
+  run install -d -m 0700 "$VL/legacy-original"
   [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "unfinished application snapshot requires review"; exit 1; }
   run cp -a "$base" "$dest"
   run rm -f "$dest/session.key"
@@ -170,16 +192,63 @@ legacy_snapshot() {
   for f in gpu.env copy-scope dmabuf-node; do
     [ -f "$dest/$f" ] && run sed -i "s|$base_real/|$nb_real/|g" "$dest/$f"
   done
-  run rm -rf "$VL/protected-rollback/$n"
-  run mv "$dest" "$VL/protected-rollback/$n"
+  run rm -rf "$VL/legacy-original/$n"
+  run mv "$dest" "$VL/legacy-original/$n"
 }
-initial_snapshot() {
-  local n=$1
-  if [ ! -e "$VL/protected-rollback/$n" ]; then
+# Root installs this allowlist only from accepted stock-policy source proofs.
+# A version label alone cannot bless older script bytes or an old baseline.
+stock_policy_source() {
+  local script=$1 digest line
+  secure_path "$VL" 755 && secure_path "$VL/policy" 700 &&
+    secure_path "$VL/policy/stock-session.sources" 600 && [ -f "$script" ] && [ ! -L "$script" ] || return 1
+  if grep -Eqv '^(stock-defaults-v1 [0-9a-f]{64}|#.*|)$' "$VL/policy/stock-session.sources"; then return 1; fi
+  digest=$(sha256sum "$script" | cut -d' ' -f1) || return 1
+  line="stock-defaults-v1 $digest"
+  grep -Fqx -- "$line" "$VL/policy/stock-session.sources" || return 1
+  printf '%s\n' "$line"
+}
+confirmed_baseline() {
+  local d="$VL/protected-rollback/$1" policy
+  secure_path "$VL/protected-rollback" 700 && [ -d "$d" ] && [ ! -L "$d" ] &&
+    secure_path "$d/.baseline-confirmed" 600 &&
+    [ "$(cat "$d/.baseline-confirmed")" = 'mapped-product-baseline-v2' ] &&
+    secure_path "$d/.profile-policy" 600 || return 1
+  policy=$(stock_policy_source "$d/wc-session") || return 1
+  [ "$(cat "$d/.profile-policy")" = "$policy" ]
+}
+# This is an operator confirmation after a successful real mapped-user product
+# session, not a substitute for running that session. Never save an untested
+# deployment candidate automatically as the installation's rollback baseline.
+if [ "$VERB" = baseline-confirm ]; then
+  require_idle
+  for n in "${INSTALLS[@]}"; do
+    require_trust "$n"
+    nb="$VL/installs/$n"; snap="$VL/protected-rollback/$n"; tmp="$snap.preparing"
+    secure_path "$nb" 755 && [ -f "$nb/wc-session" ] && [ -f "$nb/apps.ini" ] &&
+      cmp -s "$nb/session.key" "$TRUST/$n/session.key" || { echo "no protected current installation for $n"; exit 1; }
+    policy=$(stock_policy_source "$nb/wc-session") || { echo "installation source has no accepted stock-default policy proof"; exit 1; }
     run install -d -m 0700 "$VL/protected-rollback"
-    run cp -a "$VL/installs/$n" "$VL/protected-rollback/$n"
-  fi
-}
+    secure_path "$VL/protected-rollback" 700 || exit 1
+    [ ! -e "$tmp" ] && [ ! -L "$tmp" ] && [ ! -e "$snap.previous" ] && [ ! -L "$snap.previous" ] || { echo "unfinished baseline snapshot requires review"; exit 1; }
+    run cp -a "$nb" "$tmp"
+    copied_policy=$(stock_policy_source "$tmp/wc-session") && [ "$copied_policy" = "$policy" ] || { echo "source changed during baseline copy"; exit 1; }
+    printf '%s\n' mapped-product-baseline-v2 >"$tmp/.baseline-confirmed"
+    printf '%s\n' "$policy" >"$tmp/.profile-policy"
+    run chmod 0600 "$tmp/.baseline-confirmed" "$tmp/.profile-policy"
+    [ ! -e "$snap" ] || run mv "$snap" "$snap.previous"
+    run mv "$tmp" "$snap"
+    run rm -rf "$snap.previous"
+    # Keep original application packages alive after a candidate replaces the
+    # live installation's GC roots. The tested baseline is a root of its own.
+    for l in "$snap"/bin/*; do
+      [ -L "$l" ] || continue
+      t=$(readlink "$l"); case "$t" in /nix/store/*) ;; *) continue ;; esac
+      if [ -n "$REAL" ]; then run nix-store --add-root "$l" --indirect -r "$t" >/dev/null; else say "  (would register baseline GC root $l -> $t)"; fi
+    done
+    say "$n: confirmed tested mapped-product baseline saved; current trust and security infrastructure retained"
+  done
+  exit 0
+fi
 if [ "$VERB" = services-restart ]; then
   sys restart wc-bell-hub.service wc-sessiond.service
   exit 0
@@ -245,6 +314,9 @@ if [ "$VERB" = apply ] || [ "$VERB" = install-staged ] || [ "$VERB" = rollback ]
 fi
 
 # ------------------------------------------------------------------- checks
+if [ "$VERB" = apply ]; then
+  stock_policy_source "$BINS/wc-session" >/dev/null || { echo "migration source has no accepted stock-default policy proof"; exit 1; }
+fi
 if [ "$VERB" != rollback ] && [ "$VERB" != verify ] && [ "$VERB" != remove-old ] && [ "$VERB" != install-staged ]; then
   for f in wc-arena-host sv-hostd wc-session; do
     [ -f "$BINS/$f" ] || { echo "no $BINS/$f: BIN-DIR must hold this branch's builds"; exit 1; }
@@ -291,15 +363,19 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     if [ ! -e "$nb" ]; then run cp -a "$base" "$nb"; fi
     run rm -f "$nb/session.key"
     run cp -f "$TRUST/$n/session.key" "$nb/session.key"
-    # This branch's builds over every file of bin/ they name; links stay.
+    # Upgrade broker-dependent binaries; preserve original UI/presentation.
     for f in "$base"/bin/*; do
       b=$(basename "$f")
+      # Keep the known original UI/profile renderer and presentation library.
+      # Device-opening and broker-dependent transport components are upgraded.
+      case "$b" in wc-launch|libsv_wlshim.so) continue ;; esac
       [ -f "$BINS/$b" ] && [ ! -L "$f" ] && run install -m 0755 "$BINS/$b" "$nb/bin/$b"
     done
     run install -m 0755 "$BINS/wc-session" "$nb/wc-session"
     # The definitions are root's; the key the service's alone.
     own root:root "$nb"
     run chmod -R go-w "$nb"
+    stock_policy_source "$nb/wc-session" >/dev/null || { echo "copied migration source differs from accepted stock-default policy"; exit 1; }
     if [ -n "$REAL" ]; then run chown waycompose:waycompose "$nb/session.key"; else say "  (would chown waycompose $nb/session.key)"; fi
     run chmod 0600 "$nb/session.key"
     # GC roots made by deploy for bin/'s store links point at the old path.
@@ -342,16 +418,11 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     run mv "$AH/.config/waycompose/installs/$n" "$BACKUP/links/$n"
   done
 
-  say "5. the running VM's ACLs: only the service account by name"
-  for f in "$ARENA_DIR" "$ARENA_DIR"/arena "$ARENA_DIR"/gpu "$ARENA_DIR"/*.sock; do
-    [ -e "$f" ] || continue
-    if [ -n "$REAL" ]; then
-      run setfacl -x "u:$ADMIN" "$f" 2>/dev/null; run setfacl -x "u:$DESK" "$f" 2>/dev/null
-      if [ -d "$f" ]; then run setfacl -m u:waycompose:rx "$f"; else run setfacl -m u:waycompose:rw "$f"; fi
-    else say "  (would drop u:$ADMIN, u:$DESK and add u:waycompose on $f)"; fi
-  done
+  say "5. the running VM's raw permissions: root and the service account only"
+  secure_live_raw
 
-  for n in "${INSTALLS[@]}"; do initial_snapshot "$n"; run rm -f "$TRUST/$n/rotation-pending"; done
+  for n in "${INSTALLS[@]}"; do run rm -f "$TRUST/$n/rotation-pending"; done
+  say "run a real mapped-user product session, then baseline-confirm before any application update or rollback"
   say "6. the system services start; $DESK's agent listens"
   sys restart wc-bell-hub.service wc-sessiond.service
   if [ -n "$REAL" ]; then run loginctl enable-linger "$DESK"; fi
@@ -370,9 +441,13 @@ if [ "$VERB" = install-staged ]; then
   n=${INSTALLS[0]}; st=$BINS
   nb="$VL/installs/$n"; nb_real=${nb#"$ROOT"}; st_real=${st#"$ROOT"}
   [ -f "$st/wc-session" ] && [ -f "$st/apps.ini" ] || { echo "$st is not a staged installation (no wc-session, apps.ini)"; exit 1; }
+  stock_policy_source "$st/wc-session" >/dev/null || { echo "staged source has no accepted stock-default policy proof"; exit 1; }
   case "$st_real" in "$AH_REAL"/*) ;; *) echo "the stage $st_real is not under ~$ADMIN"; exit 1 ;; esac
   if [ -n "$REAL" ]; then getent passwd waycompose >/dev/null || { echo "no account waycompose: this host has no system services"; exit 1; }; fi
   say "installation $n: $st_real -> $nb_real, its sessions as $DESK"
+  if [ -e "$nb" ]; then
+    confirmed_baseline "$n" || { echo "$n has no confirmed mapped-product rollback baseline; run the product successfully, then baseline-confirm"; exit 1; }
+  fi
   tmp="$nb.new"
   run rm -rf "$tmp"
   run install -d -m 0755 "$VL/installs"
@@ -381,6 +456,7 @@ if [ "$VERB" = install-staged ]; then
   run cp -f "$TRUST/$n/session.key" "$tmp/session.key"
   own root:root "$tmp"
   run chmod -R go-w "$tmp"
+  stock_policy_source "$tmp/wc-session" >/dev/null || { echo "copied installation source differs from accepted stock-default policy"; exit 1; }
   if [ -n "$REAL" ]; then run chown waycompose:waycompose "$tmp/session.key"; else say "  (would chown waycompose $tmp/session.key)"; fi
   run chmod 0600 "$tmp/session.key"
   run sed -i -e "s|$st_real/|$nb_real/|g" -e "s|$st_real\$|$nb_real|g" -e "s|$AH_REAL/|~/|g" "$tmp/apps.ini"
@@ -390,13 +466,10 @@ if [ "$VERB" = install-staged ]; then
   done
   if [ "$FAIL" = 0 ]; then
     if [ -e "$nb" ]; then
-      if cmp -s "$nb/session.key" "$TRUST/$n/session.key"; then
-        run install -d -m 0700 "$VL/protected-rollback"
-        run rm -rf "$VL/protected-rollback/$n"
-        run cp -a "$nb" "$VL/protected-rollback/$n"
-      else
-        secure_path "$TRUST/$n/rotation-pending" 600 && [ ! -e "$nb/session.key" ] || { echo "refusing snapshot of an untrusted verifier"; exit 1; }
-      fi
+      confirmed_baseline "$n" || { echo "$n has no confirmed mapped-product rollback baseline; run the product successfully, then baseline-confirm"; exit 1; }
+      cmp -s "$nb/session.key" "$TRUST/$n/session.key" ||
+        { secure_path "$TRUST/$n/rotation-pending" 600 && [ ! -e "$nb/session.key" ]; } ||
+        { echo "existing installation has an untrusted verifier"; exit 1; }
       run mv "$nb" "$nb.old"
     fi
     run mv "$tmp" "$nb"
@@ -409,7 +482,7 @@ if [ "$VERB" = install-staged ]; then
     done
     # The admin's copy of the key goes: the service's is the only one.
     run rm -f "$st/session.key"
-    initial_snapshot "$n"
+    say "confirm a successful real mapped-user session with baseline-confirm before replacing this installation"
     run rm -f "$TRUST/$n/rotation-pending"
     if [ -n "$REAL" ]; then
       runuser -u "$DESK" -- env HOME="$DH" bash "$nb/wc-session" apps >/dev/null 2>&1 \
@@ -466,7 +539,7 @@ if [ "$VERB" = rollback ]; then
   say "restore protected installation snapshots; keep system identity, broker and current keys"
   for n in "${INSTALLS[@]}"; do
     snap="$VL/protected-rollback/$n"; nb="$VL/installs/$n"
-    secure_path "$VL/protected-rollback" 700 && [ -d "$snap" ] && [ ! -L "$snap" ] || { echo "no protected snapshot for $n"; exit 1; }
+    confirmed_baseline "$n" || { echo "no confirmed mapped-product baseline for $n"; exit 1; }
     [ -f "$snap/wc-session" ] && [ -f "$snap/apps.ini" ] || exit 1
     [ ! -e "$nb.rollback-new" ] || { echo "rollback staging already exists"; exit 1; }
   done

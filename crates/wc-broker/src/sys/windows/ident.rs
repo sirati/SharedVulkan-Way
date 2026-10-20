@@ -12,7 +12,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_DUP_HANDLE,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION,
 };
 
 use super::pipe::wide;
@@ -115,13 +115,39 @@ pub fn pipe_client(pipe: HANDLE) -> io::Result<(u32, String)> {
     Ok((pid, token_user(tok.0)?))
 }
 
+#[derive(Clone, Copy)]
+enum ProcessAccess { Ordinary, ProtectedBar }
+impl ProcessAccess {
+    const fn mask(self) -> u32 {
+        let ordinary = PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        match self {
+            Self::Ordinary => ordinary,
+            Self::ProtectedBar => ordinary | PROCESS_VM_OPERATION,
+        }
+    }
+}
+
 /// Open process `pid` for what the broker does with it (watch it, put
 /// handles into it), and check that its own token's user is `sid`: the
 /// pipe told the pid, and a pid can be reused between that and this open, so
-/// the process must be shown to be the same user's.
+/// the process must be shown to be the same user's. This excludes cross-user
+/// reuse, not same-SID reuse. Retain this exact object for every subsequent
+/// mapping and death watch; do not treat the SID check alone as proof of the
+/// original pipe peer process object.
 pub fn open_process_checked(pid: u32, sid: &str) -> io::Result<Owned> {
-    // SAFETY: plain call; checked below.
-    let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    open_process_with_access(pid, sid, ProcessAccess::Ordinary)
+}
+
+/// Initial capture for a protected BAR mapping target. Request the extra
+/// mapping right at this first authenticated open; never reopen by PID later.
+pub(super) fn open_protected_process_checked(pid: u32, sid: &str) -> io::Result<Owned> {
+    open_process_with_access(pid, sid, ProcessAccess::ProtectedBar)
+}
+
+fn open_process_with_access(pid: u32, sid: &str, access: ProcessAccess) -> io::Result<Owned> {
+    // SAFETY: plain call; checked below. Ordinary callers retain the original
+    // access mask, including readiness and holder authentication.
+    let h = unsafe { OpenProcess(access.mask(), 0, pid) };
     if h.is_null() {
         return Err(os(&format!("OpenProcess({pid})")));
     }
@@ -203,3 +229,16 @@ pub fn enable_privilege(name: &str) -> io::Result<bool> {
     Ok(unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED)
 }
 
+
+#[cfg(test)]
+mod process_access_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_readiness_and_holder_access_excludes_vm_operation() {
+        let ordinary = PROCESS_DUP_HANDLE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        assert_eq!(ProcessAccess::Ordinary.mask(), ordinary);
+        assert_eq!(ProcessAccess::Ordinary.mask() & PROCESS_VM_OPERATION, 0);
+        assert_eq!(ProcessAccess::ProtectedBar.mask(), ordinary | PROCESS_VM_OPERATION);
+    }
+}

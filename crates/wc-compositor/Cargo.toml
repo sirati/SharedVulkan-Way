@@ -72,6 +72,7 @@ wc-broker = { workspace = true }
 # §103.7: the AppKit platform. The objc2 family (MIT) enables every framework
 # class by default; only the macOS build compiles any of it.
 [target.'cfg(target_os = "macos")'.dependencies]
+sv-drm = { path = "../sv-drm" }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
@@ -159,3 +160,6 @@ windows-sys = { workspace = true, features = [
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_System_Com",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sv-hostd = { workspace = true }

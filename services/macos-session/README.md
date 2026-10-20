@@ -28,6 +28,34 @@ repository asset or a target-machine fetch. The result also exposes
 `hostTools` so its Mach-O executable and package closure can be inspected
 before copying the realized service package to the target.
 
+The constructor's `pulseAudio` output comes from `nix/macos-pulseaudio.nix`.
+This Linux-built, signed native provider enables Darwin Unix descriptor
+passing and kernel peer UID/GID checks through `getpeereid`. It implements
+PulseAudio's existing memfd wire protocol using anonymous shared descriptors
+on Darwin, preserving the original guest descriptor for `MAP_SHARED` imports.
+The Darwin allocator creates an exclusive mode-0600 file with CLOEXEC inside
+the private Pulse runtime directory and immediately unlinks it. Regular backing
+lets both endpoints validate ownership and compare stable device/inode identity.
+This does not implement a generic Linux memfd syscall or Linux kernel seals;
+PulseAudio does not use sealing operations for these pools. Imported pools
+require native user ownership, regular backing and bounded size. Truncated or
+unexpected ancillary descriptors are closed, including disconnect paths.
+
+Unchanged Linux libpulse also requires Hyper Linux's generic `SO_PASSCRED`
+translation to deliver credentials from the actual native peer. Enabling the
+server's advertised SHM capability alone does not prove shared audio. Debug
+logs identify imported device/inode/size and the first successfully received
+shared-fd audio block. On connection close, they report bytes received through
+shared references or socket payloads. A private null-sink fixture can verify
+mapping identity and reference transport. The low-level assembler accepts an
+explicit `pulseAudio` provider; its compatibility default is `pkgs.pulseaudio`.
+
+Startup has one monotonic 30-second budget for native sockets, bus
+connection and portal ownership. `--ensure` uses the same bounded readiness
+window. A child exit fails immediately; a stalled readiness call is cancelled
+at the deadline and the supervisor cleans up its children without publishing
+readiness.
+
 The module installs one Aqua LaunchAgent, `org.waycompose.session-services`.
 The package also contains its plist for deployments without nix-darwin.
 Installation sources do not load or change a live service. Do not install the

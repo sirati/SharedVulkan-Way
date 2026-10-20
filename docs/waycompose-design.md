@@ -32627,7 +32627,7 @@ is added to the common modes. The mapping:
 | `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
 | `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
 | `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
-| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x. Superseded by 103.18: the output's scale is the screen's, and the layer's `contentsScale` follows |
 | `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
 
 **The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
@@ -33426,11 +33426,71 @@ the bell port: no ssh, socket, TCP or vsock in the session's path.
 * The proxy's microphone source failed to load (`mkfifo sound-2.fifo: File
   exists`) once the Mac's devices were re-announced.
 
+### 103.18 Output scale: Retina without blur
+
+Until this section every surface pixel was one Mac point, and on a Retina
+screen AppKit doubled the layer: correct and soft (103.7's table). Now the one
+output has an integer scale S, which the platform gives (`Started::scale`):
+the main screen's `backingScaleFactor`, rounded, at least 1, on macOS; 1 on
+Win32 and headless. `--output-scale N` overrides it, for a harness. It is read
+through `State::scale_for(surface)`, so a platform with a scale per monitor
+(Windows' per-monitor DPI) changes that function and the output setup, not the
+readers.
+
+**Logical stays logical.** Configure sizes, window geometry, input, pointer
+constraints, popup placement, `ToUi::Map`/`Resize`/`MovePopup` and the
+control socket's rectangles are in surface units, which are Mac points. Only
+pixels are in device pixels.
+
+**What a client sees at S > 1:**
+
+| | S = 1 (unchanged) | S > 1 |
+|---|---|---|
+| `wl_output.mode` | logical size | logical size × S |
+| `wl_output.scale` | not sent (1) | S |
+| `wl_compositor` | version 5 | version 6 |
+| `wl_surface.preferred_buffer_scale` | never | S, at `new_surface` |
+| a buffer of scale B ≠ 1 | drawn unscaled, and logged | honoured |
+
+**Pixels.** A surface's staging shadow, and so a window's shadow, is its
+logical size × S. A buffer with B = S is copied 1:1. Any other B is a view
+(`surface::view_of`, §102's path): the whole buffer resampled, nearest
+neighbour, to (buffer / B) × S, which is ×2 for an Xwayland or other B = 1
+client on S = 2. A viewport's destination is logical, so it is × S as well.
+Surface damage is mapped into buffer pixels (× B), buffer damage into the
+shadow by the view (S / B, widened by a pixel), and subsurface offsets (× S)
+when the tree is composed. Readers that want a size (bounds, hit test,
+pointer holds, the geometry-only commit, `mapped_windows`) divide by S
+(`State::surface_size`). The shadow carries its scale (`Shadow::scale`), so
+the platform knows how many points it is.
+
+**macOS.** The layer's `contentsScale` is set to the shadow's scale on every
+present, since AppKit resets it when a window changes screen; window and popup
+frames already come from logical sizes. The face's IOSurface pair is the
+shadow's size in pixels, and `ToFace::Surface` carries the scale. A client
+cursor's `NSImage` is sized in points (`image / B`, `CursorSpec::Image.scale`),
+with the hotspot in points; Win32 ignores the scale, as before.
+
+**Checked here (Linux, headless, `--output-scale 2`).** weston-terminal
+(version 5, told by `wl_output.scale` and `enter`) drew at B = 2 into a
+1484x854 shadow for a 742x427 window, after a first B = 1 frame that was
+doubled; foot (version 6) read `preferred_buffer_scale(2)` before its first
+frame; weston-presentation-shm stayed at B = 1 and was doubled. At S = 1
+weston-terminal's frame hashes were those of the binary before this section.
+The macOS half (`contentsScale`, the cursor's size, popup frames on a Retina
+screen) was compiled, not run.
+
+**Not built.** Fractional scale (`wp_fractional_scale_v1` with viewporter,
+for 125 % and 150 %), which this does not design out: the scale is per output
+and the view path already resamples. A scale that changes while running (a
+window moved to a screen of another scale): S is read once at start. Windows'
+per-monitor DPI. A filter better than nearest neighbour for B ≠ S.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
   what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
-  Retina scale above 1. SVG icons (the host's resolver
+  Fractional scale (integer Retina scale is 103.18). SVG icons (the host's resolver
   has no renderer, as on Windows). A frequent-pages section in the Dock menu
   (`macbundle::dock_items` takes them, and the launcher does not fetch
   `frequent` yet).
@@ -37651,16 +37711,113 @@ generation with `services.waycompose`. For each installation it does this:
   beneath the system layout, with its current trusted key. It keeps the
   system services, user mapping and broker protection. It never restores
   admin user units, desktop raw-resource ACLs or an exposed old key. A
-  missing protected snapshot refuses rollback. The first protected install
-  creates its initial snapshot, and later deploys snapshot the prior
-  protected installation. Rollback requires idle admin and mapped-user
-  session managers; it restores installation apps, configuration and bins,
-  while keeping shared service binaries and the mapping unchanged.
+  missing confirmed snapshot refuses rollback. First migration preserves
+  the original `wc-launch` profile renderer and `libsv_wlshim.so` presentation
+  library while upgrading the broker-dependent launcher script, proxy, ICD
+  and transport services. The pre-broker installation is kept under
+  `legacy-original` as recovery history, not executable rollback.
 
-The earlier legacy-layout dry run does not establish protected rollback.
-The current fixture checks protected snapshot restoration, key rotation,
-trusted-key reuse and refusal of unconfirmed provenance. Live migration
-remains pending.
+  Run a real mapped-user product session successfully, end it, then invoke
+  `wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL`.
+  This explicit operator confirmation snapshots that tested protected
+  installation. It does not run the product test itself. Replacing an
+  installation requires a confirmed baseline; deployments never overwrite it
+  automatically. Confirm a later candidate only after its own successful
+  product session. Root first installs the accepted stock-policy source hashes
+  in `/var/lib/waycompose/policy/stock-session.sources`, owned by root with
+  mode 0600 beneath a root-owned 0700 directory. Each line is
+  `stock-defaults-v1 SHA256`, from the exact script accepted by the real
+  mapped-user stock-policy proof. Deployment never creates this receipt.
+  Confirmation records that source hash alongside the tested snapshot;
+  deployment and rollback validate the actual script bytes against it.
+  Old pre-stock snapshots or a newly added version label alone cannot pass.
+  Adding a reviewed policy source requires its own successful product proof;
+  preserve an older receipt entry only while that source remains approved.
+  Rollback restores the accepted application's configuration
+  and binaries, including its known-working broker-aware transport baseline,
+  with the current trusted key. Shared services and user mapping stay in place.
+  Both confirmation and rollback require idle admin and mapped-user sessions.
+
+Before first-install SCM changes, the Windows installer creates a fresh
+privileged Data directory object and empty signer tree under a validated
+parent. It moves the entire old Data object into a newly protected recovery
+container without traversing or normalizing retired descendants. A retained
+old writable directory handle can change only that retired generation.
+Directory creation uses native atomic create-new semantics and supplies its
+owner/DACL at creation. Anchor validation walks from a verified local fixed
+HarddiskVolume root through every parent. It rejects ambiguous paths, SUBST,
+reparse ancestors and unprivileged replacement/ACL rights. Only DELETE alone
+on the verified volume root is exempt, since that object has no removable
+parent entry. The same right on any nonroot ancestor refuses. Existing raw security history refuses fresh replacement
+and requires trusted recovery.
+
+Existing-service installs require protected directory-generation receipts
+bound to current NTFS object IDs, plus per-install key enrollment receipts.
+The key action requires a valid fresh Data generation and creates each new key
+object with privileged security at creation. The executable directory similarly
+requires fresh generation provenance; unknown, exposed or reparse binary
+directories refuse before Data or SCM changes. Unknown keys and stale receipts
+cannot bless replacement objects merely through owner/DACL normalization.
+
+Actual Windows filesystem fixtures exercised writable old parent handles,
+retired ACL edits and relative injected-directory/key creation. The active
+Data/Keys object identities and ACLs remained unchanged. A retained writable
+old key handle prevented old-directory rename; the installer failed closed
+without publishing a new generation. Fixtures also verified native name
+collision, raw-history and unsafe-anchor refusals and binary-directory
+provenance/reparse checks. No actual family/service/device objects were touched.
+
+Migration replaces the running raw-resource ACLs completely and makes their
+owner/group root, with only the named service account allowed. It clears
+inherited default ACLs on the directory and removes base group grants, so
+processes retaining an old `wc-arena` supplementary group cannot reopen the
+BARs. A bounded real-UID fixture verified both fresh opens fail for an already
+running UID1000/GID982 process, while both retained shared mappings remain
+writable and the designated service UID can still open the files. It used
+isolated temporary files, not family BARs.
+
+A bounded native fixture now proves the service and signer at uid 1000 map
+an authenticated boot record to a real agent and application at uid 1001.
+The named stock `wayland-info` application reads the live registry through
+`wc-session`, the proxy and control rings. Its proxy holds the descriptor the
+broker opened while direct opens of the service-owned synthetic BARs fail.
+The private user manager and every application use synthetic HOME/XDG paths;
+family VM, render-node and DRM paths are masked in both fixture namespaces.
+
+The rollback fixture executes the actual installed original `wc-launch`
+profile renderer, confirms a baseline only after that mapped-user product
+session ends, deploys a broken renderer and changed preferences, then runs
+`rollback`. The original renderer bytes and false preference return and the
+real application runs again. Transport hashes, service/signer processes,
+current protected key and an independent shared mapping/sentinel remain
+unchanged. The original presentation shim is restored by hash; GPU presentation
+is not exercised. This is a native synthetic-BAR fixture, separate from the
+real Windows broker tests, and does not restore pre-broker transports.
+Evidence is `distinct-uid-original-renderer-rollback.txt` beneath
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`.
+Family migration and deployment remain pending review.
+
+The integrated stock-policy fixture uses exact `64caaa6a` launcher policy with
+accepted `e5e19fdb` runtime handling, frozen as `19a3819c` with script SHA256
+`7e793295d0d0fb8f52dffaf09d64601c3d3d7b33081333d2ce5d103d89dc3d13`.
+Both real mapped-user sessions, before baseline and after protected rollback,
+removed exact old generated graphics/readback blocks from `user.js` and their
+persisted values from `prefs.js`, preserving an unrelated manual custom
+preference. A deliberately broken original-renderer replacement prevented the
+application from starting; rollback restored the actual original renderer and
+real application success. Baseline-v2 and the private source receipt were
+created only after the initial successful session ended.
+
+The fixture wrapper is named `firefox` to select the actual Firefox policy
+branch, and executes the stock `wayland-info` payload through the live rings.
+It does not run a browser or exercise GPU presentation or VA decoding. Source,
+recipe and native input hashes were verified before execution, including the
+original-product renderer/shim manifest. The controller used 436.7 MiB peak,
+within a 512 MiB/2 CPU slice; both controller and private manager mask family
+BARs, render nodes and DRM registration paths. Fixture/input trees, processes,
+units, uploads and transient limits were removed. The host canonical mapped
+runtime remained absent. No production source receipt was created.
+
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up

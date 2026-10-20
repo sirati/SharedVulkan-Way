@@ -20,6 +20,15 @@ cat >"$T/etc/waycompose/users.conf" <<'EOF'
 vm guest desk installs=wcivs,wcmc
 vm guest wctest installs=wct1,wct2
 EOF
+# Synthetic trusted receipts exercise source binding only. Real receipts are
+# published after the distinct-UID stock-policy product proof, never by deploy.
+accept_policy() {
+  mkdir -p "$T/var/lib/waycompose/policy"
+  chmod 0755 "$T/var/lib/waycompose"
+  chmod 0700 "$T/var/lib/waycompose/policy"
+  printf 'stock-defaults-v1 %s\n' "$(sha256sum "$1" | cut -d' ' -f1)" >>"$T/var/lib/waycompose/policy/stock-session.sources"
+  chmod 0600 "$T/var/lib/waycompose/policy/stock-session.sources"
+}
 stage() { # NAME KEY
   local s="$T/home/admin/.cache/waycompose-stage/$1"
   mkdir -p "$s/bin"
@@ -32,10 +41,12 @@ exec     = /home/admin/.cache/waycompose-stage/$1/bin/app-firefox/bin/firefox
 profile  = /home/admin/.wc-launch/firefox-$1
 EOF
   printf 'VK_ICD_FILENAMES=/home/admin/.cache/waycompose-stage/%s/bin/sv_icd.json\n' "$1" >"$s/gpu.env"
+  accept_policy "$s/wc-session"
   echo "$s"
 }
 keyop() { ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" "$1" admin auto "$2" "$3"; }
 provision() { keyop key-prepare "$1" "$2" && keyop key-confirm "$1" "$2"; }
+baseline() { keyop baseline-confirm unused "$1"; }
 run() { ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" install-staged admin auto "$@" 2>&1; }
 
 # Current ownership and mode cannot establish where an unknown key came from.
@@ -84,6 +95,27 @@ chmod 0755 "$T/var/lib/waycompose/key-trust/wct1"
 out=$(run "$S" wct1); rc=$?
 [ "$rc" != 0 ] && ok "unprotected provenance directory is refused" || bad "unprotected provenance accepted"
 chmod 0700 "$T/var/lib/waycompose/key-trust/wct1"
+# A candidate cannot overwrite the rollback baseline before explicit acceptance.
+out=$(run "$S" wct1); rc=$?
+[ "$rc" != 0 ] && [ ! -e "$I.new" ] && ok "replacement without a confirmed product baseline is refused before staging" || bad "untested replacement accepted"
+baseline wct1 >/dev/null || exit 1
+B="$T/var/lib/waycompose/protected-rollback/wct1"
+cp "$B/wc-session" "$T/accepted-session"
+printf '#!/bin/sh\necho old unreviewed policy\n' >"$B/wc-session"
+out=$(keyop rollback unused wct1 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "confirmation marker cannot bless different unreviewed baseline source" || bad "marker accepted changed policy source"
+cp "$T/accepted-session" "$B/wc-session"
+cp "$I/wc-session" "$T/candidate-session"
+rm "$S/wc-session"
+ln -s "$T/candidate-session" "$S/wc-session"
+out=$(run "$S" wct1); rc=$?
+[ "$rc" != 0 ] && ok "accepted hash cannot bless mutable staged script symlink" || bad "staged script symlink accepted"
+rm "$S/wc-session"
+cp "$T/candidate-session" "$S/wc-session"
+printf 'corrupt receipt entry\n' >>"$T/var/lib/waycompose/policy/stock-session.sources"
+out=$(run "$S" wct1); rc=$?
+[ "$rc" != 0 ] && ok "malformed source receipt refuses the whole deployment" || bad "corrupt receipt partially accepted"
+sed -i '$d' "$T/var/lib/waycompose/policy/stock-session.sources"
 # A second deploy: a new stage with another key; the installed key stays.
 S=$(stage wct1 "$(printf 'b%.0s' $(seq 64))")
 run "$S" wct1 >/dev/null
@@ -104,6 +136,7 @@ out=$(ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" install-staged admi
 
 # Protected rollback restores the prior applications while keeping current trust.
 printf '#!/bin/sh\nprintf "restored application ran with original config\\n"\n' >"$T/var/lib/waycompose/installs/wcivs/bin/fixture-app"
+baseline wcivs >/dev/null || exit 1
 printf 'changed\n' >"$S/apps.ini"
 run "$S" wcivs >/dev/null || exit 1
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" rollback admin desk unused wcivs >/dev/null || exit 1
@@ -111,23 +144,43 @@ app_out=$(sh "$T/var/lib/waycompose/installs/wcivs/bin/fixture-app")
 [ "$app_out" = "restored application ran with original config" ] && ok "protected rollback restores a runnable application" || bad "rollback application failed"
 ! grep -q '^changed' "$T/var/lib/waycompose/installs/wcivs/apps.ini" && ok "protected rollback restores application configuration" || bad "rollback configuration failed"
 cmp -s "$T/var/lib/waycompose/installs/wcivs/session.key" "$T/var/lib/waycompose/key-trust/wcivs/session.key" && ok "protected rollback keeps the trusted verifier key" || bad "rollback restored old trust"
-# The first migration must retain a working pre-candidate application, even
-# when the new wc-session immediately fails. This never runs a desktop app.
+# First migration's pre-broker script is historical data, not a usable
+# rollback. Accept a working protected baseline before an application update.
 S=$(stage wct2 "$(printf 'e%.0s' $(seq 64))")
 ln -s "$S" "$T/home/admin/.config/waycompose/installs/wct2"
 provision "$S" wct2 || exit 1
 mkdir -p "$T/build-bin"
-printf '#!/bin/sh\nexit 91\n' >"$T/build-bin/wc-session"
+printf '#!/bin/sh\nexec "$(dirname "$0")/bin/profile-renderer"\n' >"$T/build-bin/wc-session"
 printf 'fixture\n' >"$T/build-bin/wc-arena-host"
 printf 'fixture\n' >"$T/build-bin/sv-hostd"
+printf '#!/bin/sh\nprintf "apps ok\\n"\n' >"$S/bin/profile-renderer"
+chmod 0755 "$S/bin/profile-renderer"
+printf 'original renderer\n' >"$S/bin/wc-launch"
+printf 'original presentation\n' >"$S/bin/libsv_wlshim.so"
+printf 'candidate renderer\n' >"$T/build-bin/wc-launch"
+printf 'candidate presentation\n' >"$T/build-bin/libsv_wlshim.so"
+printf 'broker-aware transport\n' >"$T/build-bin/wc-proxy"
+accept_policy "$T/build-bin/wc-session"
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" apply admin wctest "$T/build-bin" wct2 >"$T/first-apply.txt" 2>&1 || { cat "$T/first-apply.txt"; exit 1; }
+cmp -s "$S/bin/wc-launch" "$T/var/lib/waycompose/installs/wct2/bin/wc-launch" && cmp -s "$S/bin/libsv_wlshim.so" "$T/var/lib/waycompose/installs/wct2/bin/libsv_wlshim.so" && ok "first migration preserves original UI and presentation binaries" || bad "original UI was replaced"
+cmp -s "$T/build-bin/wc-proxy" "$T/var/lib/waycompose/installs/wct2/bin/wc-proxy" && ok "first migration upgrades broker-dependent transport" || bad "transport was left pre-broker"
+ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" rollback admin wctest unused wct2 >"$T/unconfirmed-rollback.txt" 2>&1; rc=$?
+[ "$rc" != 0 ] && [ -f "$T/var/lib/waycompose/legacy-original/wct2/wc-session" ] && ok "pre-broker script is retained as history and cannot be called a tested rollback" || bad "untested legacy rollback accepted"
+app_out=$(bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps)
+[ "$app_out" = "apps ok" ] || { bad "baseline fixture failed"; exit 1; }
+baseline wct2 >/dev/null || exit 1
+S=$(stage wct2 "$(printf 'f%.0s' $(seq 64))")
+printf '#!/bin/sh\nexec "$(dirname "$0")/bin/profile-renderer"\n' >"$S/wc-session"
+printf '#!/bin/sh\nexit 91\n' >"$S/bin/profile-renderer"
+chmod 0755 "$S/bin/profile-renderer"
+run "$S" wct2 >/dev/null || exit 1
 bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps >/dev/null 2>&1; rc=$?
-[ "$rc" = 91 ] && ok "first-migration candidate failure is reproduced" || bad "candidate unexpectedly worked"
+[ "$rc" = 91 ] && ok "candidate application-renderer failure is reproduced" || bad "candidate unexpectedly worked"
 ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" rollback admin wctest unused wct2 >"$T/first-rollback.txt" 2>&1 || { cat "$T/first-rollback.txt"; exit 1; }
 app_out=$(bash "$T/var/lib/waycompose/installs/wct2/wc-session" apps)
-[ "$app_out" = "apps ok" ] && ok "first-migration rollback restores pre-candidate executable" || bad "first migration had no working rollback"
-grep -q '/var/lib/waycompose/installs/wct2/bin/app-firefox' "$T/var/lib/waycompose/installs/wct2/apps.ini" && ok "first-migration rollback keeps protected system paths" || bad "rollback revived admin application paths"
-cmp -s "$T/var/lib/waycompose/installs/wct2/session.key" "$T/var/lib/waycompose/key-trust/wct2/session.key" && ok "first-migration rollback keeps rotated trust" || bad "first migration restored exposed key"
+[ "$app_out" = "apps ok" ] && ok "confirmed rollback restores the prior application renderer" || bad "confirmed baseline did not restore product fixture"
+grep -q '/var/lib/waycompose/installs/wct2/bin/app-firefox' "$T/var/lib/waycompose/installs/wct2/apps.ini" && ok "rollback keeps protected system paths" || bad "rollback revived admin application paths"
+cmp -s "$T/var/lib/waycompose/installs/wct2/session.key" "$T/var/lib/waycompose/key-trust/wct2/session.key" && ok "rollback keeps rotated trust" || bad "rollback restored exposed key"
 
 # A shared verifier must not restart over another install's exposed key.
 mkdir -p "$T/var/lib/waycompose/installs/legacy-unmigrated"

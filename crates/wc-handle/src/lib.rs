@@ -119,6 +119,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod arena;
+pub mod bar_lease;
+pub mod section_provider;
 /// §107: the shared BAR cut into per-session regions.
 pub mod barpool;
 /// GROWTH. The host→guest channel that asks for another region, as a message
@@ -128,6 +130,9 @@ pub mod grow;
 /// IVSHMEM ARENA. The header at the front of an ivshmem region, encoded and
 /// decoded by the same code on both sides of the hypervisor.
 pub mod ivshmem;
+pub mod iosection_policy;
+#[cfg(target_os = "macos")]
+pub mod iosection;
 mod platform;
 pub mod publish;
 pub mod macboot;
@@ -188,6 +193,8 @@ pub const MAX_DESCRIPTOR_LEN: usize = 1024;
 /// the answer is a replacement protocol rather than a shimmed fd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Descriptor {
+    /// A generation-checked allocation in the original authenticated BAR.
+    BarLease { arena: u32, slot: u32, generation: u64 },
     /// A shared memory object: `wl_shm.create_pool`, `wl_keyboard.keymap`, an
     /// ICC profile, a gamma ramp.
     ///
@@ -282,6 +289,7 @@ pub enum Descriptor {
     },
 }
 
+const KIND_BAR_LEASE: u32 = 6;
 const KIND_SECTION: u32 = 1;
 const KIND_PIPE: u32 = 2;
 const KIND_NT_HANDLE: u32 = 3;
@@ -349,6 +357,13 @@ impl Descriptor {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32);
         match self {
+            Self::BarLease { arena, slot, generation } => {
+                out.extend_from_slice(&KIND_BAR_LEASE.to_le_bytes());
+                out.extend_from_slice(&arena.to_le_bytes());
+                out.extend_from_slice(&slot.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&generation.to_le_bytes());
+            }
             Self::Section { name, size } => {
                 out.extend_from_slice(&KIND_SECTION.to_le_bytes());
                 out.extend_from_slice(&size.to_le_bytes());
@@ -386,6 +401,13 @@ impl Descriptor {
         }
         let mut r = Reader(bytes);
         let out = match r.u32()? {
+            KIND_BAR_LEASE => {
+                let arena = r.u32()?;
+                let slot = r.u32()?;
+                if r.u32()? != 0 { return Err(DecodeError("nonzero BAR lease reserved word")); }
+                let generation = r.u64()?;
+                Self::BarLease { arena, slot, generation }
+            }
             KIND_SECTION => {
                 let size = r.u64()?;
                 Self::Section { name: r.string()?, size }
@@ -448,6 +470,8 @@ pub struct Handle {
 /// section and unlinking a file for one, returning a range to the outbound
 /// window's free list for the other.
 enum Owned {
+    BarOwner(bar_lease::Owner),
+    BarConsumer(bar_lease::Consumer),
     Object(platform::OwnedObject),
     /// A FIFO this process created for a peer to open. §81.
     ///
@@ -491,6 +515,56 @@ impl Handle {
         Self { descriptor, keepalive: None }
     }
 
+    /// Receive one wire transfer, acquiring its exact remote consumer lease.
+    pub fn receive_descriptor(descriptor: Descriptor) -> io::Result<Self> {
+        if let Descriptor::BarLease { arena, slot, generation } = descriptor {
+            let consumer = bar_lease::registered(arena)?.accept(bar_lease::Key { slot, generation })?;
+            Ok(Self { descriptor, keepalive: Some(Arc::new(Owned::BarConsumer(consumer))) })
+        } else { Ok(Self::from_descriptor(descriptor)) }
+    }
+
+    /// Allocate address-stable capacity through the selected original BAR.
+    pub fn create_bar(arena: u32, role: bar_lease::Role, size: usize, capacity: usize) -> io::Result<Self> {
+        let owner = bar_lease::registered(arena)?.allocate(role, size, capacity)?;
+        let key = owner.key();
+        Ok(Self { descriptor: Descriptor::BarLease { arena, slot: key.slot, generation: key.generation },
+            keepalive: Some(Arc::new(Owned::BarOwner(owner))) })
+    }
+    /// Create immutable-content output inside this host's BAR partition.
+    pub fn create_bar_outbound(arena: u32, size: usize) -> io::Result<Self> {
+        Self::create_bar(arena, bar_lease::Role::Host, size, size)
+    }
+    /// Reserve a reference before serializing a descriptor into a wire frame.
+    pub fn prepare_transfer(&self) -> io::Result<PreparedTransfer> {
+        let transfer = match (&self.descriptor, self.keepalive.as_deref()) {
+            (Descriptor::BarLease { .. }, Some(Owned::BarOwner(owner))) => Some(owner.publish()?),
+            (Descriptor::BarLease { .. }, Some(Owned::BarConsumer(consumer))) => Some(consumer.publish()?),
+            (Descriptor::BarLease { .. }, _) => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "BAR descriptor has no live transfer capability")),
+            _ => None,
+        };
+        Ok(PreparedTransfer { bytes: self.descriptor.encode(), transfer })
+    }
+    /// Register a producer with the authenticated broker before exposing it.
+    pub fn register_bar_producer(&self, producer_id: u64) -> io::Result<(bar_lease::Key, usize, usize)> {
+        match self.keepalive.as_deref() {
+            Some(Owned::BarOwner(owner)) => owner.register_producer(producer_id),
+            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "not a BAR producer")),
+        }
+    }
+    pub fn grow_bar(&self, size: usize) -> io::Result<()> {
+        match self.keepalive.as_deref() {
+            Some(Owned::BarOwner(owner)) => owner.grow(size),
+            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "not a BAR allocation owner")),
+        }
+    }
+    fn bar_extent(&self) -> io::Result<(*const u8, usize)> {
+        match self.keepalive.as_deref() {
+            Some(Owned::BarOwner(owner)) => Ok((owner.pointer()?.cast_const(), owner.extent()?.1)),
+            Some(Owned::BarConsumer(consumer)) => Ok((consumer.pointer()?, consumer.extent()?.1)),
+            _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "BAR descriptor has no retained lease")),
+        }
+    }
+
     /// What this handle refers to.
     pub fn descriptor(&self) -> &Descriptor {
         &self.descriptor
@@ -498,13 +572,16 @@ impl Handle {
 
     /// True if this process created the object and is keeping it alive.
     pub fn is_owner(&self) -> bool {
-        self.keepalive.is_some()
+        self.keepalive.as_deref().is_some_and(|owned| !matches!(owned, Owned::BarConsumer(_)))
     }
 
     /// Create a new shared-memory object of `size` bytes and return a handle to
     /// it. The returned handle owns the object; the descriptor may be sent to a
     /// peer, which can then [`map`](Handle::map) it.
     pub fn create_section(size: u64) -> io::Result<Self> {
+        if let Some(result) = section_provider::allocate(size) {
+            return result;
+        }
         let name = platform::random_section_name();
         let object = platform::create_section(&name, size)?;
         Ok(Self {
@@ -745,6 +822,12 @@ impl Handle {
     /// one ran would not really have added it (docs/waycompose-design.md §8.4).
     pub fn map(&self) -> io::Result<Mapping> {
         match &self.descriptor {
+            Descriptor::BarLease { .. } => {
+                let (pointer, len) = self.bar_extent()?;
+                let lease = self.keepalive.as_ref().ok_or_else(|| io::Error::other("missing BAR lease"))?.clone();
+                counters::ARENA_SLICE.fetch_add(1, Ordering::Relaxed);
+                Ok(Mapping { inner: MappingInner::Bar { pointer: pointer as usize, _lease: lease }, offset: 0, len })
+            }
             Descriptor::Section { name, size } => {
                 let len = usize::try_from(*size)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "section too large"))?;
@@ -804,6 +887,12 @@ impl Handle {
                 "not the owner of this object",
             ));
         };
+        if let Owned::BarOwner(owner) = &**owned {
+            let pointer = owner.pointer()? as usize;
+            let len = owner.extent()?.1;
+            owner.claim_mapping()?;
+            return Ok(MappingMut { inner: WritableMapping::Bar { pointer, _lease: owned.clone() }, len });
+        }
         let Owned::Object(object) = &**owned else {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -814,7 +903,7 @@ impl Handle {
         let size = self.owned_object_size()?;
         let len = usize::try_from(size)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "section too large"))?;
-        platform::map_section_mut(object, len).map(|inner| MappingMut { inner, len })
+        platform::map_section_mut(object, len).map(|inner| MappingMut { inner: WritableMapping::Owned(inner), len })
     }
 
     /// The size of the OS object this handle *created*, for the two writer
@@ -850,6 +939,8 @@ impl Handle {
             ));
         };
         match &**owned {
+            Owned::BarOwner(owner) => owner.write_at(usize::try_from(offset).map_err(|_| io::Error::other("BAR write offset overflow"))?, bytes),
+            Owned::BarConsumer(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "a BAR consumer has no pixel write capability")),
             // §81: a stream has no offsets. Writing "at" one is a category error
             // rather than a bounds failure, and the caller wants `pipe_end()`.
             Owned::Pipe(_) => Err(io::Error::new(
@@ -884,8 +975,32 @@ impl Handle {
 /// See [`Handle::map_mut`]. There is no `Sync` here and there deliberately is
 /// on [`Mapping`]: a read-only view can be shared freely, a writable one is
 /// exclusive to whoever holds the `&mut`.
+enum WritableMapping {
+    Owned(platform::WritableView),
+    Bar { pointer: usize, _lease: Arc<Owned> },
+}
+impl Drop for WritableMapping {
+    fn drop(&mut self) {
+        if let Self::Bar { _lease, .. } = self {
+            if let Owned::BarOwner(owner) = _lease.as_ref() { owner.release_mapping(); }
+        }
+    }
+}
+impl WritableMapping {
+    fn ptr(&self) -> *const u8 { match self { Self::Owned(view) => view.ptr(), Self::Bar { pointer, .. } => *pointer as *const u8 } }
+    fn ptr_mut(&mut self) -> *mut u8 { match self { Self::Owned(view) => view.ptr_mut(), Self::Bar { pointer, .. } => *pointer as *mut u8 } }
+}
+/// Prepared descriptor plus its pending remote reference. Drop rolls back only
+/// before any bytes have been emitted. Commit after a successful full frame,
+/// or conservatively after a partial write that cannot be disproven remotely.
+pub struct PreparedTransfer { bytes: Vec<u8>, transfer: Option<bar_lease::Transfer> }
+impl PreparedTransfer {
+    pub fn bytes(&self) -> &[u8] { &self.bytes }
+    pub fn commit(mut self) { if let Some(transfer) = self.transfer.take() { transfer.commit(); } }
+}
+
 pub struct MappingMut {
-    inner: platform::WritableView,
+    inner: WritableMapping,
     len: usize,
 }
 
@@ -942,6 +1057,7 @@ impl fmt::Debug for MappingMut {
 /// that outlives every pool cut from it — so the window must keep the region
 /// alive without owning it, and must not unmap on drop.
 enum MappingInner {
+    Bar { pointer: usize, _lease: Arc<Owned> },
     Owned(platform::MappedView),
     /// A window into a region held by the [`arena`] registry.
     Window(Arc<platform::MappedView>),
@@ -950,6 +1066,7 @@ enum MappingInner {
 impl MappingInner {
     fn ptr(&self) -> *const u8 {
         match self {
+            MappingInner::Bar { pointer, .. } => *pointer as *const u8,
             MappingInner::Owned(v) => v.ptr(),
             MappingInner::Window(v) => v.ptr(),
         }
@@ -1005,6 +1122,19 @@ impl Mapping {
         // `ptr + offset .. + len` is inside the one mapping the `Arc` keeps
         // alive.
         unsafe { std::slice::from_raw_parts(self.inner.ptr().add(self.offset), self.len) }
+    }
+
+    /// Native VM pages retaining this original mapping, not a copied payload.
+    /// Returns base, VM extent, logical extent and the window's byte prefix.
+    /// IOSurface CPU views are excluded; those use their native texture import.
+    /// The caller must retain this Mapping until its GPU reader completes.
+    #[cfg(target_os = "macos")]
+    pub fn native_vm_span(&self) -> Option<(*const u8, usize, usize, usize)> {
+        let view = match &self.inner { MappingInner::Owned(v) => v, MappingInner::Window(v) => v.as_ref() };
+        if view.is_iosurface() { return None; }
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        let (base, mapped, logical, prefix) = iosection_policy::mapped_span(view.ptr() as usize, self.offset, self.len, page)?;
+        Some((base as *const u8, mapped, logical, prefix))
     }
 
     /// Length of the mapping in bytes.

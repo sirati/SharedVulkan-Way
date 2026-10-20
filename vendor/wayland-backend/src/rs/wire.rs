@@ -19,6 +19,16 @@ use crate::protocol::{Argument, ArgumentType, Message};
 
 use smallvec::SmallVec;
 
+// A BAR connection cannot turn a guest-supplied pathname into a host open.
+fn descriptor_allowed(encoding: FdEncoding, descriptor: &wc_handle::Descriptor) -> bool {
+    match encoding {
+        FdEncoding::InBandLease(expected) => matches!(descriptor, wc_handle::Descriptor::BarLease { arena, generation, .. } if *arena == expected && *generation != 0),
+        FdEncoding::InBandArena(expected) => matches!(descriptor,
+            wc_handle::Descriptor::ArenaSlice { arena, len, .. } if *arena == expected && *len > 0),
+        _ => true,
+    }
+}
+
 /// Error generated when trying to serialize a message into buffers
 #[derive(Debug)]
 pub enum MessageWriteError {
@@ -118,6 +128,7 @@ pub fn write_to_buffers(
     encoding: FdEncoding,
 ) -> Result<usize, MessageWriteError> {
     let orig_payload_len = payload.len();
+    let mut transfers = Vec::new();
     // Helper function to write a u32 or a RawProtoFd to its buffer
     fn write_buf(u: u32, payload: &mut [u8]) -> Result<&mut [u8], MessageWriteError> {
         if payload.len() >= 4 {
@@ -209,9 +220,15 @@ pub fn write_to_buffers(
                     fds.push(dup_fd);
                     payload
                 }
-                (FdEncoding::InBand, RawWireFd::Named(handle)) => {
+                (FdEncoding::InBand | FdEncoding::InBandArena(_) | FdEncoding::InBandLease(_), RawWireFd::Named(handle)) => {
+                    if !descriptor_allowed(encoding, handle.descriptor()) {
+                        return Err(MessageWriteError::WrongDialect { wanted: encoding });
+                    }
                     let _ = &fds; // no control message on this path
-                    write_array_to_payload(&handle.descriptor().encode(), payload)?
+                    let prepared = handle.prepare_transfer().map_err(MessageWriteError::DupFdFailed)?;
+                    let remaining = write_array_to_payload(prepared.bytes(), payload)?;
+                    transfers.push(prepared);
+                    remaining
                 }
                 // The caller brought the wrong kind. Down here neither can be
                 // made from the other — see `MessageWriteError::WrongDialect`.
@@ -224,6 +241,7 @@ pub fn write_to_buffers(
     header[..4].copy_from_slice(&msg.sender_id.to_ne_bytes());
     header[4..]
         .copy_from_slice(&(((wrote_size as u32) << 16) | u32::from(msg.opcode)).to_ne_bytes());
+    for transfer in transfers { transfer.commit(); }
     Ok(orig_payload_len - payload.len())
 }
 
@@ -345,9 +363,10 @@ pub fn parse_message<'a>(
                         read_array_from_payload(front as usize, tail).and_then(|(v, rest)| {
                             tail = rest;
                             match wc_handle::Descriptor::decode(v) {
-                                Ok(d) => {
-                                    Ok(Argument::Fd(WireFd::Named(wc_handle::Handle::from_descriptor(d))))
+                                Ok(d) if descriptor_allowed(encoding, &d) => {
+                                    wc_handle::Handle::receive_descriptor(d).map(|handle| Argument::Fd(WireFd::Named(handle))).map_err(|_| MessageParseError::Malformed)
                                 }
+                                Ok(_) => Err(MessageParseError::Malformed),
                                 // A descriptor we cannot parse is a malformed
                                 // message, not a missing fd: the bytes were
                                 // there and they were wrong.
@@ -539,4 +558,30 @@ mod tests {
             "got {err:?}"
         );
     }
+    #[test]
+    fn arena_policy_refuses_other_arenas_and_host_names_before_dispatch() {
+        use wc_handle::{Descriptor, Handle};
+        let cases = [
+            (Descriptor::ArenaSlice { arena: 42, offset: 0, len: 4096 }, true),
+            (Descriptor::ArenaSlice { arena: 43, offset: 0, len: 4096 }, false),
+            (Descriptor::ArenaSlice { arena: 42, offset: 0, len: 0 }, false),
+            (Descriptor::SharedFile { path: "/must-never-open".into(), size: 4096 }, false),
+            (Descriptor::Section { name: "/must-never-open".into(), size: 4096 }, false),
+            (Descriptor::Pipe { name: "/must-never-open".into(), peer_reads: true }, false),
+            (Descriptor::NtHandle { value: 4, object_kind: 0 }, false),
+        ];
+        for (descriptor, allowed) in cases {
+            let message = Message { sender_id: 3, opcode: 0,
+                args: smallvec![Argument::Fd(RawWireFd::Named(Handle::from_descriptor(descriptor)))] };
+            let mut bytes = [0u8; 1024];
+            let mut fds = Vec::new();
+            let written = write_to_buffers(&message, &mut bytes, &mut fds, FdEncoding::InBand).unwrap();
+            let parsed = parse_message(&bytes[..written], &[ArgumentType::Fd],
+                &mut VecDeque::new(), FdEncoding::InBandArena(42));
+            assert_eq!(parsed.is_ok(), allowed);
+            let encoded = write_to_buffers(&message, &mut bytes, &mut fds, FdEncoding::InBandArena(42));
+            assert_eq!(encoded.is_ok(), allowed);
+        }
+    }
+
 }
