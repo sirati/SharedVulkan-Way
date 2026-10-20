@@ -128,6 +128,7 @@ pub mod grow;
 /// IVSHMEM ARENA. The header at the front of an ivshmem region, encoded and
 /// decoded by the same code on both sides of the hypervisor.
 pub mod ivshmem;
+pub mod iosection_policy;
 #[cfg(target_os = "macos")]
 pub mod iosection;
 mod platform;

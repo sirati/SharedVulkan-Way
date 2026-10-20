@@ -237,6 +237,22 @@ fn now_micros() -> u64 {
 /// session's boot page. Without it the session is refused: the host would
 /// write into pages this process's death frees.
 fn connect_broker(log: &Log, pool: &str, install: &str) -> Result<BrokerConn, String> {
+    wc_handle::iosection::set_owner_observer(Box::new(|owner, sender| {
+        let mut observer = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+        observer.hello("iosurface-observer")?;
+        observer.observe_owner(owner, sender.pid)?;
+        std::thread::Builder::new().name("iosurface-owner".into()).spawn(move || {
+            let ended = format!("!owner-ended {}", owner.connection);
+            loop {
+                match observer.next_event() {
+                    Ok(event) if event != ended => continue,
+                    _ => break,
+                }
+            }
+            wc_handle::iosection::revoke_owner(owner);
+        })?;
+        Ok(())
+    }));
     let path = wc_broker::client::path();
     let mut c = wc_broker::client::Client::connect(&path).map_err(|e| e.to_string())?;
     let h = c.hello("main").map_err(|e| format!("the broker at {path} refused hello: {e}"))?;

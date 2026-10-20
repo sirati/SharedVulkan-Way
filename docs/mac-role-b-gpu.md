@@ -189,3 +189,26 @@ attempts both dedicated imports. It inventories hardware H.264 support without
 advertising it as implemented Vulkan capability. A real decode callback,
 reference-picture lifetime, initial ownership/layout transitions and sampling
 verification still require hardware and the remaining video implementation.
+
+
+### IOSurface registration lifetime
+
+The V2 section protocol carries a broker run and connection generation. Before
+accepting its first name, the compositor asks the shared broker to observe that
+live connection and compare its authenticated PID with the kernel Mach audit
+trailer. User identity also has to match. The owner connection remains open in
+the GPU process. Disconnect, kernel process exit, or observer broker EOF removes
+all discoverable names for that owner. Existing CF references held by consumers
+remain valid until those consumers retire. There is no separate keeper, PID
+poller or reclamation timer.
+
+ADD validates its exact message shape, descriptor count/type/disposition, name
+and audit trailer before importing the surface. Every successfully received
+message destroys unadopted Mach rights, including rejected complex messages.
+Persistent receive errors clear registration state and end the receive loop.
+Allocation size comes only from IOSurfaceGetAllocSize; checked non-planar
+geometry must fit it. The sender waits for registration acknowledgement before
+publishing the export token and withdraws a possibly delivered registration
+when acknowledgement fails. The two-second request timeout does not reclaim
+live consumer references. Native Mach right accounting and GPU completion still
+require the authorized hardware validation gate.

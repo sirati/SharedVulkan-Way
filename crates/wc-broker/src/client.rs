@@ -319,6 +319,24 @@ mod unix_client {
             super::parse_signed(&l, &req.install).map_err(io::Error::other)
         }
 
+        /// A generation token for this authenticated, kernel-watched connection.
+        pub fn owner_token(&mut self) -> io::Result<wc_handle::iosection_policy::Owner> {
+            let (line, _) = self.call(&Request::Owner)?;
+            match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["ok", "owner", run, connection] => Ok(wc_handle::iosection_policy::Owner {
+                    run: run.parse().map_err(|_| io::Error::other("owner run"))?,
+                    connection: connection.parse().map_err(|_| io::Error::other("owner connection"))?,
+                }),
+                _ => Err(io::Error::other("invalid owner reply")),
+            }
+        }
+
+        /// Atomically observe a token against the kernel-audited sender PID.
+        /// next_event() returns !owner-ended CONNECTION on disconnect or death.
+        pub fn observe_owner(&mut self, owner: wc_handle::iosection_policy::Owner, pid: u32) -> io::Result<()> {
+            self.call(&Request::ObserveOwner { run: owner.run, connection: owner.connection, pid }).map(|_| ())
+        }
+
         pub fn subscribe(&mut self) -> io::Result<()> {
             self.call(&Request::Subscribe).map(|_| ())
         }

@@ -246,19 +246,34 @@ fn service() -> Option<u32> {
     })
 }
 
-/// Tell the compositor section `name` is `surface`.
-pub fn announce(name: &str, surface: &Surface) {
-    if let Some(s) = service() {
-        let kr = wc_handle::iosection::send(s, name, surface);
-        if kr != 0 {
-            eprintln!("[gpu] sending section {name} to the compositor: {kr}");
-        }
+/// Keep the authenticated owner connection open for this GPU process lifetime.
+fn owner() -> Result<wc_handle::iosection::Owner, String> {
+    static CONNECTION: Mutex<Option<(wc_broker::client::Client, wc_handle::iosection::Owner)>> = Mutex::new(None);
+    let mut g = CONNECTION.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_none() {
+        let mut c = wc_broker::client::Client::connect(&wc_broker::client::path()).map_err(|e| e.to_string())?;
+        c.hello("gpu").map_err(|e| e.to_string())?;
+        let token = c.owner_token().map_err(|e| e.to_string())?;
+        *g = Some((c, token));
     }
+    Ok(g.as_ref().expect("initialized").1)
 }
 
-/// Section `name` is gone from this process.
+/// Publish only after the compositor has acknowledged an authenticated ADD.
+pub fn announce(name: &str, surface: &Surface) -> Result<(), String> {
+    let s = service().ok_or("no compositor IOSurface service")?;
+    let owner = owner()?;
+    let kr = wc_handle::iosection::send(s, owner, name, surface);
+    if kr != 0 {
+        // ADD may have arrived before its reply was lost. Withdraw that name.
+        let _ = wc_handle::iosection::send_gone(s, owner, name);
+        return Err(format!("registering IOSurface {name}: {kr}"));
+    }
+    Ok(())
+}
+
 pub fn retire(name: &str) {
-    if let Some(s) = service() {
-        let _ = wc_handle::iosection::send_gone(s, name);
+    if let (Some(s), Ok(owner)) = (service(), owner()) {
+        let _ = wc_handle::iosection::send_gone(s, owner, name);
     }
 }

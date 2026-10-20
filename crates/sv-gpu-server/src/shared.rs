@@ -577,9 +577,13 @@ fn alloc_iosurface(driver: &Driver, image: vk::Image, want: u32) -> Result<(Shar
     let (section, memory, memory_type) = crate::iosurface::make(driver, image, want)?;
     let len = section.surface.len() as u64;
     let nonce = random_bytes::<16>();
+    if let Err(e) = crate::iosurface::announce(&name, &section.surface) {
+        // Memory must retire before its retained Metal texture and IOSurface.
+        unsafe { driver.device.free_memory(memory, None) };
+        return Err(e);
+    }
     let kept = section.surface.retain();
     registry(|r| r.insert(name.clone(), Entry { nonce, size: len, refs: 1, marks: HashMap::new(), surface: Some(kept) }));
-    crate::iosurface::announce(&name, &section.surface);
     Ok((SharedImport { name, memory, memory_type, view: View { region: None, _ios: Some(section), len } }, nonce))
 }
 
