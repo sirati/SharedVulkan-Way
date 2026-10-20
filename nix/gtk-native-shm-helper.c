@@ -83,6 +83,14 @@ static void state_free(void *opaque)
   g_free(state);
 }
 
+void wc_gtk_native_shm_display_finish(GdkWaylandDisplay *display)
+{
+  /* Called before wl_display_disconnect. Live Cairo owners hold a display
+   * reference, so finalization cannot invalidate their queue or proxies. */
+  WcNativeState *state = g_object_steal_data(G_OBJECT(display), "wc-native-shm");
+  if (state) state_free(state);
+}
+
 static WcNativeState *state_get(GdkWaylandDisplay *display)
 {
   WcNativeState *state = g_object_get_data(G_OBJECT(display), "wc-native-shm");
@@ -155,6 +163,14 @@ int wc_gtk_native_shm_create(GdkWaylandDisplay *display, int size,
   hold->mapping = state->mapping;
   state->mapping = NULL;
   *pool = wl_shm_create_pool(display->shm, wc_native_shm_fd(hold->mapping), offset + size);
+  if (!*pool) {
+    wc_native_shm_close(hold->mapping);
+    wc_native_shm_v1_release(state->manager, hold->serial);
+    g_object_unref(hold->display);
+    g_free(hold);
+    g_mutex_unlock(&state->mutex);
+    return -1;
+  }
   *pixels = wc_native_shm_data(hold->mapping);
   *buffer_offset = offset;
   *owner = hold;
