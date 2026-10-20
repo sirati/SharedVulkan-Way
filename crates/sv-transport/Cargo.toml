@@ -12,3 +12,4 @@ description = "Control region, rings, handshake, parkers and the cold path (desi
 # is deliberately nothing else: this crate is one of the three that is allowed
 # `unsafe`, and a dependency here is a dependency inside that boundary.
 sv-wire = { workspace = true }
+arena-record.workspace = true

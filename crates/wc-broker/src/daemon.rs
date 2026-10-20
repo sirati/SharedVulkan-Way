@@ -38,7 +38,7 @@ use std::time::Duration;
 /// Host-visible wired regions have no elapsed-time release. Only the host's
 /// release word proves it has stopped writing into their guest RAM.
 fn region_release() -> Release {
-    Release::Probe { after: None }
+    crate::core::HOST_VISIBLE_RELEASE
 }
 
 #[cfg(target_os = "macos")]
@@ -148,7 +148,8 @@ pub fn serve(a: ServeArgs) -> Result<(), String> {
     let mut unix = Unix::bind(&a.socket, paths).map_err(|e| format!("{}: {e}", a.socket))?;
     unix = unix.with_services(a.services.iter().map(|(n, p)| DevicePath { name: n.clone(), path: p.clone() }).collect());
     if cfg!(target_os = "macos") {
-        unix = unix.mac_keeper();
+        unix = unix.mac_keeper().with_persistent_holder(&std::env::current_exe().map_err(|e| e.to_string())?)
+            .map_err(|e| format!("independent wired holder: {e}"))?;
     }
     let devices = a.devices.iter().map(|(n, _)| DeviceSpec { name: n.clone(), allow: Allow::AnyUser }).collect();
     let mut rnd = [0u8; 8];
@@ -263,6 +264,7 @@ pub fn launchd_plist(bin: &str) -> String {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ExitTimeOut</key><integer>0</integer>
+  <key>AbandonProcessGroup</key><true/>
   <key>StandardErrorPath</key><string>/Library/Logs/waycompose/broker.log</string>
   <key>StandardOutPath</key><string>/Library/Logs/waycompose/broker.log</string>
 </dict>
@@ -274,6 +276,7 @@ pub fn launchd_plist(bin: &str) -> String {
 
 pub fn main(args: Vec<String>) -> std::process::ExitCode {
     let r = match args.first().map(String::as_str) {
+        Some("__hold-wired") => crate::sys::wired_holder::run().map_err(|e| e.to_string()),
         Some("ctl") => ctl(&args[1..]),
         Some("plist") => match args.get(1) {
             Some(bin) => {
@@ -347,6 +350,7 @@ mod tests {
     fn the_launch_daemon_does_not_force_kill_retained_regions() {
         let p = launchd_plist("/Library/Application Support/waycompose/bin/wc-broker");
         assert!(p.contains("<key>KeepAlive</key><true/>"));
+        assert!(p.contains("<key>AbandonProcessGroup</key><true/>"), "launchd must leave independent holders alive after broker death");
         assert!(p.contains("<string>/Library/Application Support/waycompose/bin/wc-broker</string><string>serve</string>"));
         let t: u64 = p.split("<key>ExitTimeOut</key><integer>").nth(1).unwrap().split('<').next().unwrap().parse().unwrap();
         assert_eq!(t, 0, "launchd must not SIGKILL a broker retaining host-visible RAM");

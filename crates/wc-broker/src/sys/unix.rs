@@ -43,6 +43,33 @@ pub struct Region {
     release_word: Option<usize>,
 }
 
+impl Region {
+    pub(super) fn wired(fd: OwnedFd, len: u64, release_word: Option<usize>) -> io::Result<Self> {
+        let n = usize::try_from(len).map_err(|_| io::Error::other("region too large"))?;
+        let mut region = Self { fd, map: None, release_word };
+        // SAFETY: a live, fixed-size shared-memory fd provided by the broker.
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED, region.fd.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
+        region.map = Some((p as usize, n));
+        // SAFETY: this process's own live mapping. Other processes' mlock
+        // state is independent, so broker exit cannot unwire this mapping.
+        if unsafe { libc::mlock(p, n) } != 0 {
+            return Err(io::Error::other(format!("wiring the region: {}", io::Error::last_os_error())));
+        }
+        Ok(region)
+    }
+
+    pub(super) fn boot_released(&self) -> bool {
+        let Some((addr, len)) = self.map else { return false };
+        if len < wc_handle::arena::REGION_PAGE { return false; }
+        let page0 = addr as *const u8;
+        // SAFETY: the owned live mapping contains the complete boot page.
+        let page = unsafe { std::slice::from_raw_parts(page0, wc_handle::arena::REGION_PAGE) };
+        wc_handle::macboot::is_boot_page(page) && unsafe { wc_handle::macboot::load_released(page0) }
+    }
+}
+
 impl Drop for Region {
     fn drop(&mut self) {
         if let Some((addr, len)) = self.map.take() {
@@ -90,6 +117,7 @@ pub struct Unix {
     /// releases its whole pool when the host's release word there is set.
     boot_release: bool,
     watcher: Watcher,
+    holder: Mutex<Option<super::wired_holder::WiredHolder>>,
 }
 
 impl Unix {
@@ -130,6 +158,7 @@ impl Unix {
             release_word: None,
             boot_release: false,
             watcher: Watcher::start()?,
+            holder: Mutex::new(None),
         })
     }
 
@@ -180,6 +209,12 @@ impl Unix {
         self.wire = true;
         self.boot_release = true;
         self
+    }
+
+    /// Start an independent retention process before any host-visible grant.
+    pub fn with_persistent_holder(self, executable: &std::path::Path) -> io::Result<Self> {
+        *self.holder.lock().unwrap_or_else(|e| e.into_inner()) = Some(super::wired_holder::WiredHolder::start(executable)?);
+        Ok(self)
     }
 
     /// An object for a region the embedding process made (the host role).
@@ -271,23 +306,24 @@ impl Platform for Unix {
 
     fn create_region(&self, len: u64, _large: bool) -> io::Result<Object> {
         let fd = make_region_fd(len)?;
-        let mut region = Region { fd, map: None, release_word: self.release_word };
-        if self.wire {
-            let n = usize::try_from(len).map_err(|_| io::Error::other("region too large"))?;
-            // SAFETY: a fresh fd of `len` bytes, mapped shared, read-write.
-            let p = unsafe {
-                libc::mmap(std::ptr::null_mut(), n, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, region.fd.as_raw_fd(), 0)
-            };
-            if p == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            region.map = Some((p as usize, n));
-            // SAFETY: the mapping just made.
-            if unsafe { libc::mlock(p, n) } != 0 {
-                return Err(io::Error::other(format!("wiring the region: {}", io::Error::last_os_error())));
-            }
-        }
+        let region = if self.wire {
+            Region::wired(fd, len, self.release_word)?
+        } else {
+            Region { fd, map: None, release_word: self.release_word }
+        };
         Ok(Object::Region(region))
+    }
+
+    fn region_made(&self, info: &crate::core::RegionInfo, user: &User, obj: &Object) -> io::Result<Option<String>> {
+        if let Object::Region(region) = obj
+            && let Some(holder) = self.holder.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            holder.retain(info, user, region)?;
+        }
+        Ok(None)
+    }
+
+    fn region_destroyed(&self, id: crate::core::ObjId) {
+        if let Some(holder) = self.holder.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { holder.remove(id); }
     }
 
     fn send(&self, w: &mut UnixStream, make: &dyn Fn(&[String]) -> String, give: Vec<Give<'_, Object>>) -> io::Result<()> {
@@ -343,16 +379,7 @@ impl Platform for Unix {
 
     fn released_pool(&self, obj: &Object) -> bool {
         match obj {
-            Object::Region(Region { map: Some((addr, len)), .. })
-                if self.boot_release && *len >= wc_handle::arena::REGION_PAGE =>
-            {
-                let page0 = *addr as *const u8;
-                // SAFETY: the first page of a live mapping this broker holds;
-                // the host writes into it, so it is read as plain bytes once
-                // and the release word with an acquire load.
-                let page = unsafe { std::slice::from_raw_parts(page0, wc_handle::arena::REGION_PAGE) };
-                wc_handle::macboot::is_boot_page(page) && unsafe { wc_handle::macboot::load_released(page0) }
-            }
+            Object::Region(region) if self.boot_release => region.boot_released(),
             _ => false,
         }
     }

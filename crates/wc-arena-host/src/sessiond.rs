@@ -199,46 +199,93 @@ fn release_in(file: &std::fs::File, f: &Found) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Where this service keeps each live session's boot page, so a restarted
-/// service can still release it.
-fn state_dir() -> PathBuf {
-    let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    rt.join("wc-mac-sessiond")
+/// Restart state belongs to this exact VM, session script and key directory.
+/// A directory hash is only a filesystem namespace, never authorization: each
+/// checkpoint also carries the full owner text, checked before it is read.
+struct SessionState {
+    dir: PathBuf,
+    owner: String,
 }
 
-fn remember(f: &Found) {
-    let d = state_dir();
-    let _ = std::fs::create_dir_all(&d);
-    let r = &f.rec;
-    let _ = std::fs::write(
-        d.join(&r.session),
-        format!(
-            "{} {} {} {} {} {} {}\n",
-            f.offset, r.arena_run, r.arena_pages, r.outbound, r.rings_run, r.rings_pages, u8::from(r.gpu)
-        ),
-    );
+impl SessionState {
+    fn new(args: &Args, runtime: PathBuf) -> Self {
+        let owner = format!("wc-mac-sessiond-v2\nqmp={:?}\nvm={:?}\nsession={:?}\nkeys={:?}\n", args.qmp, args.vm, args.session, args.keys);
+        let hash = owner.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+        Self { dir: runtime.join("wc-mac-sessiond").join(format!("{hash:016x}")), owner }
+    }
+
+    fn remember(&self, f: &Found) {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::create_dir_all(&self.dir).is_err() {
+            say("cannot persist owned session state; restart adoption will be unavailable");
+            return;
+        }
+        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        let r = &f.rec;
+        let text = format!("{}{} {} {} {} {} {} {}\n", self.owner, f.offset, r.arena_run, r.arena_pages, r.outbound, r.rings_run, r.rings_pages, u8::from(r.gpu));
+        if let Err(e) = std::fs::write(self.dir.join(&r.session), text) {
+            say(&format!("session {}: cannot persist ownership: {e}", r.session));
+        }
+    }
+
+    fn recall(&self, id: &str) -> Option<Found> {
+        if !macboot::valid_id(id) { return None; }
+        let text = std::fs::read_to_string(self.dir.join(id)).ok()?;
+        let values = text.strip_prefix(&self.owner)?;
+        let v: Vec<u64> = values.split_whitespace().map(str::parse).collect::<Result<_, _>>().ok()?;
+        let [offset, arena_run, arena_pages, outbound, rings_run, rings_pages, gpu] = v[..] else { return None };
+        if gpu > 1 { return None; }
+        Some(Found {
+            rec: macboot::Record { session: id.to_string(), arena_run, arena_pages: u32::try_from(arena_pages).ok()?, outbound, rings_run, rings_pages: u32::try_from(rings_pages).ok()?, gpu: gpu != 0 },
+            offset,
+        })
+    }
+
+    fn forget(&self, id: &str) {
+        let _ = std::fs::remove_file(self.dir.join(id));
+    }
+
+    /// Enumerate only owned checkpoints, never every wc-launch-* unit in the
+    /// user manager. An on-disk record alone is insufficient: it must still
+    /// match a boot page in this configured VM and pass its key policy.
+    fn recover_in(&self, file: &std::fs::File, keys: Option<&std::path::Path>) -> HashMap<String, Found> {
+        let mut live = HashMap::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return live };
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Some(found) = self.recall(&id) else { continue };
+            if verify_owned_page(file, &found, keys).is_ok() {
+                live.insert(id, found);
+            }
+        }
+        live
+    }
 }
 
-fn recall(id: &str) -> Option<Found> {
-    let text = std::fs::read_to_string(state_dir().join(id)).ok()?;
-    let v: Vec<u64> = text.split_whitespace().filter_map(|w| w.parse().ok()).collect();
-    let [offset, arena_run, arena_pages, outbound, rings_run, rings_pages, gpu] = v[..] else { return None };
-    Some(Found {
-        rec: macboot::Record {
-            session: id.to_string(),
-            arena_run,
-            arena_pages: u32::try_from(arena_pages).ok()?,
-            outbound,
-            rings_run,
-            rings_pages: u32::try_from(rings_pages).ok()?,
-            gpu: gpu != 0,
-        },
-        offset,
-    })
+fn verify_owned_page(file: &std::fs::File, found: &Found, keys: Option<&std::path::Path>) -> Result<(), String> {
+    let mut page = vec![0u8; wc_handle::arena::REGION_PAGE];
+    sv_hostd::qemu::read_at(file, found.offset, &mut page).map_err(|e| e.to_string())?;
+    if macboot::Record::read(&page).as_ref() != Some(&found.rec) {
+        return Err("owned checkpoint does not match this VM's boot page".into());
+    }
+    let at = macboot::OFF_RELEASED;
+    if u64::from_le_bytes(page[at..at + 8].try_into().map_err(|_| "short release word")?) == macboot::RELEASED {
+        return Err("the owned boot page was already released".into());
+    }
+    who(&page, keys).map(|_| ())
 }
 
-fn forget(id: &str) {
-    let _ = std::fs::remove_file(state_dir().join(id));
+fn recover(args: &Args, state: &SessionState) -> Result<HashMap<String, Found>, String> {
+    if !state.dir.is_dir() { return Ok(HashMap::new()); }
+    let mut entries = std::fs::read_dir(&state.dir).map_err(|e| e.to_string())?;
+    let has_owned = entries.any(|entry| {
+        entry.ok()
+            .and_then(|e| e.file_name().to_str().map(str::to_string))
+            .is_some_and(|id| state.recall(&id).is_some())
+    });
+    if !has_owned { return Ok(HashMap::new()); }
+    let target = sv_hostd::qemu::QemuTarget::discover(&args.qmp, &args.vm).map_err(|e| e.to_string())?;
+    Ok(state.recover_in(&target.file, args.keys.as_deref()))
 }
 
 /// What the user's service manager says of a session's proxy unit.
@@ -273,22 +320,6 @@ pub(crate) fn unit_state(id: &str) -> UnitState {
 /// that says it is gone makes this false.
 pub(crate) fn unit_active(id: &str) -> bool {
     unit_state(id) != UnitState::Gone
-}
-
-/// Sessions whose proxy units are running now: a restarted service adopts
-/// them, so it still runs their `down`.
-fn running_sessions() -> Vec<String> {
-    let out = Command::new("systemctl")
-        .args(["--user", "list-units", "--plain", "--no-legend", "--state=active", "wc-launch-*"])
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next())
-        .filter_map(|u| u.strip_prefix("wc-launch-")?.strip_suffix(".service"))
-        .filter(|id| !id.starts_with("audio-") && !id.starts_with("gpu-") && macboot::valid_id(id))
-        .map(str::to_string)
-        .collect()
 }
 
 /// The hello reader: a thread on the doorbell hub, reconnecting, which sends
@@ -353,8 +384,15 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     if let Some(b) = &args.bell {
         spawn_bell(b.clone(), tx.clone());
     }
-    let mut live: HashMap<String, Option<Found>> =
-        running_sessions().into_iter().map(|id| { let f = recall(&id); (id, f) }).collect();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let state = SessionState::new(&args, runtime);
+    let (mut live, mut recovery_pending) = match recover(&args, &state) {
+        Ok(live) => (live, false),
+        Err(e) => {
+            say(&format!("cannot validate restart ownership yet; leaving units untouched and retrying: {e}"));
+            (HashMap::new(), true)
+        }
+    };
     if !live.is_empty() {
         say(&format!("adopted running session(s): {:?}", live.keys().collect::<Vec<_>>()));
     }
@@ -371,6 +409,12 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
     loop {
         let tick = Duration::from_secs(2);
         let woke = rx.recv_timeout(tick).is_ok();
+        // A busy QMP endpoint is temporary, not a reason to lose ownership
+        // of valid checkpoints. No unit is touched before validation succeeds.
+        if recovery_pending && let Ok(owned) = recover(&args, &state) {
+            live.extend(owned);
+            recovery_pending = false;
+        }
         // At most one sweep a second, however often the guest rings: a
         // sweep reads all of guest RAM (R40).
         if woke && let Some(t) = last_sweep {
@@ -381,12 +425,24 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
         let due = !args.sweep.is_zero() && last_sweep.is_none_or(|t| t.elapsed() >= args.sweep);
         if woke || due {
             last_sweep = Some(Instant::now());
-            serve(&args, &mut live, &mut served, if woke { "hello" } else { "timer" });
+            serve(&args, &state, &mut live, &mut served, if woke { "hello" } else { "timer" });
         }
         live.retain(|id, found| {
             if unit_active(id) {
                 return true;
             }
+            // Revalidate before teardown as well: VM memory may have changed
+            // since startup, and a missing boot page never authorizes down.
+            let target = match sv_hostd::qemu::QemuTarget::discover(&args.qmp, &args.vm)
+                .map_err(|e| e.to_string())
+                .and_then(|target| verify_owned_page(&target.file, found, args.keys.as_deref()).map(|_| target))
+            {
+                Ok(target) => target,
+                Err(e) => {
+                    say(&format!("session {id}: teardown ownership unavailable ({e}); leaving units untouched"));
+                    return true;
+                }
+            };
             match verb(&args.session, &["down", id]) {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
                 // §105.14: a `down` that could not stop the units keeps the
@@ -398,18 +454,20 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
             }
             // Only now, with its proxy and GPU units gone, may the guest
             // free the session's windows.
-            match found.as_ref().map(|f| release(&args.qmp, &args.vm, f)) {
-                Some(Ok(())) => say(&format!("session {id}: released to the guest")),
-                Some(Err(e)) => say(&format!("session {id}: not released ({e}); the guest's keeper waits out its limit")),
-                None => say(&format!("session {id}: no boot page known; the guest's keeper waits out its limit")),
+            match release_in(&target.file, found) {
+                Ok(()) => say(&format!("session {id}: released to the guest")),
+                Err(e) => {
+                    say(&format!("session {id}: not released ({e}); retaining ownership and retrying"));
+                    return true;
+                },
             }
-            forget(id);
+            state.forget(id);
             false
         });
     }
 }
 
-fn serve(args: &Args, live: &mut HashMap<String, Option<Found>>, served: &mut HashSet<u64>, why: &str) {
+fn serve(args: &Args, state: &SessionState, live: &mut HashMap<String, Found>, served: &mut HashSet<u64>, why: &str) {
     let t0 = Instant::now();
     let target = match sv_hostd::qemu::QemuTarget::discover(&args.qmp, &args.vm) {
         Ok(t) => t,
@@ -477,8 +535,8 @@ fn serve(args: &Args, live: &mut HashMap<String, Option<Found>>, served: &mut Ha
                 match verb(&args.session, &["proxy", &r.session]) {
                     Ok(p) => {
                         say(&format!("session {}: started in {:?} after the hello's sweep: {p}", r.session, t0.elapsed()));
-                        remember(&f);
-                        live.insert(r.session.clone(), Some(f.clone()));
+                        state.remember(&f);
+                        live.insert(r.session.clone(), f.clone());
                         // The session's GPU server, which the main process
                         // started in the guest and which offers its cold page
                         // under the session's label (§103.15).
@@ -587,6 +645,71 @@ mod tests {
         sv_hostd::qemu::read_at(&f, found.offset, &mut pg).unwrap();
         assert!(pg.iter().all(|b| *b == 0), "the reused page was written");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The recovered map is the only input to restart teardown. Unrelated
+    /// wc-launch units, legacy global checkpoints, forged ownership and a
+    /// checkpoint for a missing boot page must never enter that map.
+    #[test]
+    fn restart_adopts_only_its_own_checkpoints_and_matching_vm_boot_pages() {
+        let rec = record();
+        let (file, path) = backend(32, 13, &rec);
+        let found = sweep(&file, file.metadata().unwrap().len()).unwrap().remove(0);
+        let runtime = std::env::temp_dir().join(format!("wc-sessiond-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime);
+        let args = Args { qmp: "/vm/one/qmp.sock".into(), vm: "/vm/one".into(), session: "/install/one/wc-session".into(), keys: None, bell: None, sweep: Duration::ZERO };
+        let state = SessionState::new(&args, runtime.clone());
+        state.remember(&found);
+        let foreign = ["wcma-3549754-ap", "wcmb-3549754-bp", "wcmc-3549754-cp"];
+        let values = format!("{} {} {} {} {} {} {}\n", found.offset, rec.arena_run, rec.arena_pages, rec.outbound, rec.rings_run, rec.rings_pages, u8::from(rec.gpu));
+        // Old startup listed these active unit names even with no checkpoint.
+        // Legacy global records are also insufficient evidence of ownership.
+        for id in foreign {
+            std::fs::write(runtime.join("wc-mac-sessiond").join(id), &values).unwrap();
+            // Even a current owner header cannot invent a missing boot page.
+            std::fs::write(state.dir.join(id), format!("{}{}", state.owner, values)).unwrap();
+        }
+        let other = Args { qmp: "/vm/two/qmp.sock".into(), vm: "/vm/two".into(), session: "/install/two/wc-session".into(), keys: None, bell: None, sweep: Duration::ZERO };
+        let other_state = SessionState::new(&other, runtime.clone());
+        other_state.remember(&found);
+        assert_ne!(state.dir, other_state.dir);
+        // A directory hash is not trusted if foreign owner text is copied in.
+        let forged = "other-owner-77";
+        std::fs::copy(other_state.dir.join(&rec.session), state.dir.join(forged)).unwrap();
+        let live = state.recover_in(&file, None);
+        assert_eq!(live.len(), 1);
+        assert!(live.contains_key(&rec.session));
+        assert!(foreign.iter().all(|id| !live.contains_key(*id)));
+        assert!(!live.contains_key(forged));
+        // A crash after release but before checkpoint removal cannot adopt
+        // a new unrelated unit that later reused this session name.
+        file.write_all_at(&macboot::RELEASED.to_le_bytes(), found.offset + macboot::OFF_RELEASED as u64).unwrap();
+        assert!(state.recover_in(&file, None).is_empty());
+        // A reused boot page prevents adoption even with an intact owned file.
+        file.write_all_at(&[0u8; wc_handle::arena::REGION_PAGE], found.offset).unwrap();
+        assert!(state.recover_in(&file, None).is_empty());
+        assert!(foreign.iter().all(|id| state.dir.join(id).exists()), "unrelated state was removed");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(runtime);
+    }
+
+    #[test]
+    fn restart_checkpoint_scope_includes_vm_install_and_key_policy() {
+        let runtime = PathBuf::from("/runtime");
+        let make = |qmp: &str, vm: &str, session: &str, keys: Option<&str>| Args {
+            qmp: qmp.into(), vm: vm.into(), session: session.into(), keys: keys.map(PathBuf::from), bell: None, sweep: Duration::ZERO,
+        };
+        let original = SessionState::new(&make("/vm/a/qmp", "a", "/install/a/wc-session", None), runtime.clone());
+        for args in [
+            make("/vm/b/qmp", "a", "/install/a/wc-session", None),
+            make("/vm/a/qmp", "b", "/install/a/wc-session", None),
+            make("/vm/a/qmp", "a", "/install/b/wc-session", None),
+            make("/vm/a/qmp", "a", "/install/a/wc-session", Some("/keys")),
+        ] {
+            let other = SessionState::new(&args, runtime.clone());
+            assert_ne!(original.dir, other.dir);
+            assert_ne!(original.owner, other.owner);
+        }
     }
 
     /// §111.9: the identity the guest's broker signed is reported, and with

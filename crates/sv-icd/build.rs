@@ -121,18 +121,26 @@ fn main() {
     // driver silently — no error, no device, nothing to grep for.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
-    let windows = target_os == "windows";
-    let lib_name = if windows { "sv_icd.dll" } else { "libsv_icd.so" };
+    let lib_name = match target_os.as_str() {
+        "windows" => "sv_icd.dll",
+        "macos" => "libsv_icd.dylib",
+        _ => "libsv_icd.so",
+    };
     let lib_path = profile_dir.join(lib_name);
 
     // On Windows the manifest is *not* given an absolute path. The binaries are
     // built here and copied to the guest, so a path into this machine's build
     // tree is wrong the moment it arrives; the loader resolves a bare filename
     // relative to the manifest's own directory, which is exactly the property a
-    // copied pair of files needs. On Linux the absolute path is kept, because
+    // copied pair of files needs. macOS uses an explicit relative directory so
+    // the loader resolves beside the manifest rather than in dyld search paths.
+    // On Linux the absolute path is kept, because
     // there the manifest is consumed where it was built.
-    let library_path =
-        if windows { lib_name.to_string() } else { lib_path.display().to_string() };
+    let library_path = match target_os.as_str() {
+        "windows" => lib_name.to_string(),
+        "macos" => format!("./{lib_name}"),
+        _ => lib_path.display().to_string(),
+    };
 
     let manifest = format!(
         "{{\n  \"file_format_version\": \"1.0.1\",\n  \"ICD\": {{\n    \
