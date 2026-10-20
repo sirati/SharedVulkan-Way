@@ -777,10 +777,10 @@ impl Icd for SharedVulkan {
         let mut out = p::VkExternalSemaphoreProperties::default();
         let ty = args.p_external_semaphore_info.as_ref().map_or(0, |i| i.handle_type.0 as u32);
         if crate::dmabuf::enabled() && ty == crate::dmabuf::SYNC_FD {
-            out.export_from_imported_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
+            out.export_from_imported_handle_types = p::VkExternalSemaphoreHandleTypeFlags(0);
             out.compatible_handle_types = p::VkExternalSemaphoreHandleTypeFlags(ty);
-            // EXPORTABLE | IMPORTABLE.
-            out.external_semaphore_features = p::VkExternalSemaphoreFeatureFlags(0x3);
+            // EXPORTABLE only; arbitrary pending sync-file imports are unsupported.
+            out.external_semaphore_features = p::VkExternalSemaphoreFeatureFlags(0x1);
         }
         Ok(p::VkGetPhysicalDeviceExternalSemaphorePropertiesReply {
             p_external_semaphore_properties: Some(Box::new(out)),
@@ -937,11 +937,9 @@ impl Icd for SharedVulkan {
         })
     }
 
-    /// A sync fd on the dma-buf path (§104) is accepted and closed, and the
-    /// semaphore's next wait is dropped rather than forwarded: nothing on the
-    /// GPU side would ever signal it, and a wait nobody signals hangs the
-    /// guest's GPU. The fd is -1 from this ICD's own exports, and whatever a
-    /// foreign one guarded happened on this process's side already.
+    /// Only the special already-complete SYNC_FD payload (-1) is supported.
+    /// Pending foreign sync files need an asynchronous retained-fd bridge;
+    /// refusal leaves descriptor ownership with the caller.
     fn import_semaphore_fd_khr(
         &self,
         args: p::VkImportSemaphoreFdKHRArgs,
@@ -949,8 +947,8 @@ impl Icd for SharedVulkan {
         if let Some(info) = args.p_import_semaphore_fd_info.as_ref()
             && crate::dmabuf::enabled()
             && info.handle_type.0 as u32 == crate::dmabuf::SYNC_FD
+            && info.fd == -1
         {
-            crate::dmabuf::close_fd(info.fd);
             self.state().semaphores.entry(info.semaphore.0).or_default().presignalled = true;
             return Ok(p::VkImportSemaphoreFdKHRReply { result: p::VkResult(0) });
         }
@@ -3126,3 +3124,7 @@ mod tests {
 #[cfg(test)]
 #[path = "explicit_requirements_tests.rs"]
 mod explicit_requirements_tests;
+
+#[cfg(all(test, unix))]
+#[path = "external_sync_scope_tests.rs"]
+mod external_sync_scope_tests;
