@@ -463,7 +463,7 @@ fn acknowledge(bytes: &mut Receive, status: i32) {
 /// keeps the returned name and may pass it directly to `serve` in the same
 /// process; no bootstrap registration or launchd/global service is used.
 #[cfg(target_os = "macos")]
-pub fn private_service_port() -> Result<Port, Kr> {
+pub fn private_service_port() -> Result<u32, Kr> {
     let mut port = 0;
     let kr = unsafe { mach_port_allocate(mach_task_self_, 1, &mut port) };
     if kr == 0 { Ok(port) } else { Err(kr) }
