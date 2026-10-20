@@ -12,7 +12,7 @@ index dea6f78..b124b66 100644
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index e878fa6..6cabe97 100644
+index e878fa6..3db8c7c 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
 @@ -17,6 +17,7 @@
@@ -77,7 +77,23 @@ index e878fa6..6cabe97 100644
      pthread_cond_broadcast(&t->ptrace_cond);
      pthread_mutex_unlock(lock);
  
-@@ -1681,6 +1698,8 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -1612,6 +1629,15 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+         return -LINUX_ENOMEM;
+     }
+ 
++    /* Runtime-private sockets must never occupy guest-seeded stdio numbers. */
++    for (int i=0;i<2;++i) {
++        if (sock_fds[i]<3) {
++            int moved=fcntl(sock_fds[i],F_DUPFD_CLOEXEC,3);
++            if (moved<0) { close(sock_fds[0]); close(sock_fds[1]); return -LINUX_ENOMEM; }
++            close(sock_fds[i]); sock_fds[i]=moved;
++        }
++    }
++
+     /* Step 2: Find our own executable path */
+     char self_path[LINUX_PATH_MAX];
+     uint32_t path_len = sizeof(self_path);
+@@ -1681,6 +1707,8 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          return -LINUX_ENOMEM;
      }
  
@@ -86,7 +102,7 @@ index e878fa6..6cabe97 100644
      /* Close child's end of socketpair in parent */
      close(sock_fds[1]);
      int ipc_sock = sock_fds[0];
-@@ -2278,24 +2297,39 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -2278,24 +2306,39 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          close(ipc_sock);
          return -LINUX_ENOMEM;
      }
@@ -133,7 +149,7 @@ index e878fa6..6cabe97 100644
  
      if (verbose)
 diff --git a/src/syscall_proc.c b/src/syscall_proc.c
-index a6583c9..da12846 100644
+index a6583c9..6375af8 100644
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
 @@ -19,6 +19,7 @@
@@ -236,7 +252,7 @@ index a6583c9..da12846 100644
              pthread_cond_broadcast(&pid_cond);
              pthread_mutex_unlock(&pid_lock);
              return;
-@@ -597,199 +575,78 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
+@@ -597,199 +575,81 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
      return guest_write(g, gva, &lru, sizeof(lru));
  }
  
@@ -480,12 +496,15 @@ index a6583c9..da12846 100644
 +            if (p->exited) p->active=0;
 +            pthread_mutex_unlock(&pid_lock);
 +            return proc_wait_result(g,gpid,status,status_gva,rusage_gva,&ru);
-+        }
+         }
 +        if (!found) { pthread_mutex_unlock(&pid_lock); return -LINUX_ECHILD; }
 +        if (options & 1) { pthread_mutex_unlock(&pid_lock); return 0; }
-+        if (atomic_load(&exit_group_requested) || thread_seccomp_terminated() || signal_pending()) {
-+            pthread_mutex_unlock(&pid_lock); return -LINUX_EINTR;
-         }
++        /* sig_lock ranks below pid_lock. Drop pid_lock while inspecting actions. */
++        pthread_mutex_unlock(&pid_lock);
++        int interrupted=atomic_load(&exit_group_requested) || thread_seccomp_terminated() ||
++                        signal_wait_interrupt_pending();
++        pthread_mutex_lock(&pid_lock);
++        if (interrupted) { pthread_mutex_unlock(&pid_lock); return -LINUX_EINTR; }
 +        struct timespec ts;
 +        clock_gettime(CLOCK_REALTIME,&ts);
 +        ts.tv_nsec+=100000000;
@@ -498,7 +517,7 @@ index a6583c9..da12846 100644
  }
  
  /* ---------- sys_waitid ---------- */
-@@ -858,22 +715,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+@@ -858,22 +718,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                  status = proc_table[i].exit_status;
                  ret = proc_table[i].host_pid;
              } else {
@@ -526,7 +545,7 @@ index a6583c9..da12846 100644
              /* Fill siginfo_t in guest memory */
              if (infop_gva) {
                  uint8_t si[SIGINFO_SIZE];
-@@ -907,13 +755,6 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+@@ -907,13 +758,6 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
                  }
              }
  
@@ -540,6 +559,18 @@ index a6583c9..da12846 100644
              pthread_mutex_unlock(&pid_lock);
              return 0; /* waitid returns 0 on success */
          }
+@@ -934,6 +778,11 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+             return 0;
+         }
+ 
++        pthread_mutex_unlock(&pid_lock);
++        int interrupted=atomic_load(&exit_group_requested) || thread_seccomp_terminated() ||
++                        signal_wait_interrupt_pending();
++        pthread_mutex_lock(&pid_lock);
++        if (interrupted) { pthread_mutex_unlock(&pid_lock); return -LINUX_EINTR; }
+         /* Blocking: wait on condvar (100ms timeout as safety net) */
+         struct timespec ts;
+         clock_gettime(CLOCK_REALTIME, &ts);
 diff --git a/src/syscall_proc.h b/src/syscall_proc.h
 index f13c935..192e6d7 100644
 --- a/src/syscall_proc.h
@@ -565,7 +596,7 @@ index f13c935..192e6d7 100644
  /* ---------- ptrace ---------- */
  
 diff --git a/src/syscall_signal.c b/src/syscall_signal.c
-index 39a08de..99227b9 100644
+index 39a08de..3194b0b 100644
 --- a/src/syscall_signal.c
 +++ b/src/syscall_signal.c
 @@ -13,6 +13,7 @@
@@ -576,7 +607,33 @@ index 39a08de..99227b9 100644
  #include "syscall.h"        /* LINUX_E* errno constants */
  #include "syscall_fd.h"     /* signalfd_notify */
  #include "syscall_poll.h"   /* wakeup_pipe_signal */
-@@ -844,6 +845,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+@@ -286,6 +287,25 @@ static uint64_t deliverable_here_locked(void) {
+     return mask;
+ }
+ 
++int signal_wait_interrupt_pending(void) {
++    pthread_mutex_lock(&sig_lock);
++    uint64_t pending=deliverable_here_locked();
++    int interrupt=0;
++    while (pending) {
++        int sig=__builtin_ctzll(pending)+1;
++        pending &= pending-1;
++        uint64_t handler=sig_state.actions[sig-1].sa_handler;
++        if (handler==LINUX_SIG_IGN) continue;
++        if (handler==LINUX_SIG_DFL) {
++            sig_disposition_t disp=signal_default_disposition(sig);
++            if (disp==SIG_DISP_IGN || disp==SIG_DISP_CONT) continue;
++        }
++        interrupt=1; break;
++    }
++    pthread_mutex_unlock(&sig_lock);
++    return interrupt;
++}
++
+ int signal_pending(void) {
+     pthread_mutex_lock(&sig_lock);
+     int result = deliverable_here_locked() != 0;
+@@ -844,6 +864,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
          case SIG_DISP_CORE:
              *exit_code = 128 + signum;
              pthread_mutex_unlock(&sig_lock);
@@ -584,7 +641,7 @@ index 39a08de..99227b9 100644
              *exit_code = forced ? thread_seccomp_terminate(1)
                                  : proc_request_exit_group(*exit_code);
              return -1;  /* Terminate */
-@@ -964,6 +966,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
+@@ -964,6 +985,7 @@ static int signal_deliver_info(hv_vcpu_t vcpu, guest_t *g, int *exit_code,
                  signum, sizeof(frame));
          *exit_code = 128 + signum;
          pthread_mutex_unlock(&sig_lock);
@@ -592,6 +649,19 @@ index 39a08de..99227b9 100644
          if (forced) *exit_code = thread_seccomp_terminate(1);
          return -1;
      }
+diff --git a/src/syscall_signal.h b/src/syscall_signal.h
+index d5cfdd9..f11bdea 100644
+--- a/src/syscall_signal.h
++++ b/src/syscall_signal.h
+@@ -233,6 +233,8 @@ void signal_consume(int signum);
+ 
+ /* Check if any unblocked signal is pending. */
+ int signal_pending(void);
++/* Ignored/default-ignore signals do not interrupt a blocking guest wait. */
++int signal_wait_interrupt_pending(void);
+ 
+ /* Deliver the highest-priority pending unblocked signal to the guest.
+  * Builds an rt_sigframe on the guest stack and redirects vCPU to handler.
 diff --git a/src/thread.c b/src/thread.c
 index 5182f64..9c581b8 100644
 --- a/src/thread.c
