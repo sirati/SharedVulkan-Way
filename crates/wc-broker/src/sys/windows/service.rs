@@ -102,7 +102,7 @@ impl Args {
                     let (n, l) = v.split_once('=').ok_or_else(|| format!("--device {v}: NAME=LOCATION"))?;
                     a.devices.push(DeviceAt { name: n.to_string(), loc: DeviceLoc::parse(l)? });
                 }
-                "show" | "revert-acl" | "revert-acl-check" | "holder" | "holder-quit" if a.action.is_none() => a.action = Some(x.clone()),
+                "show" | "ready" | "revert-acl" | "revert-acl-check" | "holder" | "holder-quit" if a.action.is_none() => a.action = Some(x.clone()),
                 "--holder-pipe" => a.holder_pipe = val()?,
                 "--no-holder" => a.holder = false,
                 other => return Err(format!("unknown argument {other:?}")),
@@ -463,6 +463,19 @@ pub fn main(args: &[String]) -> ExitCode {
         }
     };
     match a.action.as_deref() {
+        Some("ready") => {
+            let ready = || -> Result<(), String> {
+                acl::verify_raw_protection(&a.devices)?;
+                let mut client = crate::client::Client::connect(&a.pipe).map_err(|e| e.to_string())?;
+                client.hello("installer-ready").map_err(|e| e.to_string())?;
+                client.stats().map_err(|e| e.to_string())?;
+                Ok(())
+            };
+            return match ready() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => { eprintln!("broker not ready: {e}"); ExitCode::from(1) }
+            };
+        }
         Some("show") => {
             for l in acl::show(&a.devices) {
                 println!("{l}");

@@ -139,7 +139,15 @@ switch ($Action) {
     }
     Start-Service -Name $Name
     (Get-Service -Name $Name).WaitForStatus("Running", (New-TimeSpan -Seconds 15))
-    Start-Sleep -Milliseconds 500
+    # SCM Running alone precedes asynchronous startup checks. Require the
+    # public broker to answer and independently verify current raw protection.
+    $until = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+      $ready = Run $Exe @("broker", "ready")
+      if ($ready[0] -eq 0) { break }
+      Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $until)
+    if ($ready[0] -ne 0) { throw "broker installation failed readiness/protection verification: $($ready[1])" }
     $log = Join-Path $Data "broker.log"
     if (Test-Path $log) { Get-Content -Tail 12 $log | ForEach-Object { Say "log: $_" } }
     Say "installed: $Exe as service $Name (LocalSystem, automatic, restarted on failure)"
