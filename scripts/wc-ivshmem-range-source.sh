@@ -15,7 +15,7 @@ git -C "$dest" fetch --quiet --depth=1 origin "$upstream"
 git -C "$dest" checkout --quiet --detach FETCH_HEAD
 [[ $(git -C "$dest" rev-parse HEAD) == "$upstream" ]]
 # vcxproj is upstream CRLF/BOM. git apply handles its whitespace in the patch.
-git -C "$dest" apply --check --ignore-space-change "$root/drivers/windows-ivshmem/protected-ranges.patch"
-git -C "$dest" apply --ignore-space-change "$root/drivers/windows-ivshmem/protected-ranges.patch"
+git -C "$dest" apply --check --unidiff-zero --ignore-space-change "$root/drivers/windows-ivshmem/protected-ranges.patch"
+git -C "$dest" apply --unidiff-zero --ignore-space-change "$root/drivers/windows-ivshmem/protected-ranges.patch"
 cp "$root/drivers/windows-ivshmem/Range.c" "$root/drivers/windows-ivshmem/Range.h" "$root/drivers/windows-ivshmem/RangeBounds.h" "$dest/ivshmem/"
 echo "prepared pinned driver source at $dest; no build or installation performed"

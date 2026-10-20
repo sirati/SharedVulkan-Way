@@ -107,8 +107,8 @@ automatic cross-user reassignment or guest-memory scrubbing is implemented.
 
 `wc-broker::service_control` defines a bounded canonical cross-VM frame under
 `wc-broker/service-control/v1`, separate from public boot signing. It binds the
-installation, both privileged service epochs, original source identities and
-BAR geometry, session grant, SID to UID mapping, process registrations, exact
+installation, both privileged service epochs, original source identities,
+separate hardware and canonical pool generations, BAR geometry, session grant, SID to UID mapping, process registrations, exact
 allocation/transfer/consumer phase, and strict sequence. Parsing does not grant
 authority. Only service-only authentication and retained resource records can
 authorize a state transition. Endpoint authentication also polls the
