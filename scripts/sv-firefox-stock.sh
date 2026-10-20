@@ -46,7 +46,7 @@
 set -uo pipefail
 
 # Reject inherited sandbox overrides before launching any application.
-if env | grep -qE '^MOZ_DISABLE_.*SANDBOX='; then
+if env | grep -qE '^MOZ_(DISABLE_.*SANDBOX|FORCE_DISABLE_E10S_SANDBOX|CONTENT_SANDBOX_LEVEL|RDD_SANDBOX_LEVEL|GPU_SANDBOX_LEVEL)='; then
   echo "FAIL: the invoking environment overrides a Firefox sandbox"
   exit 2
 fi
@@ -313,7 +313,7 @@ if [ -n "$GECKODRIVER" ] && [ -n "$JQ" ]; then
       "$JQ" -r '"svfs " + .value' "$RUN/video-$c.json" >>"$RUN/page.log"
     done
     wd "/session/$sid/moz/context" '{"context":"chrome"}' >/dev/null
-    wd "/session/$sid/execute/async" '{"args":[],"script":"const done = arguments[arguments.length-1]; const {Troubleshoot} = ChromeUtils.importESModule(\"resource://gre/modules/Troubleshoot.sys.mjs\"); Troubleshoot.snapshot().then(s => done(JSON.stringify({media: {codecSupportInfo: s.media.codecSupportInfo}, sandbox: s.sandbox, graphics: {featureLog: s.graphics.featureLog, adapterDescription: s.graphics.adapterDescription, driverVendor: s.graphics.driverVendor, windowLayerManagerType: s.graphics.windowLayerManagerType, webgl2Renderer: s.graphics.webgl2Renderer, failures: s.graphics.failures}})), e => done(String(e)));"}' \
+    wd "/session/$sid/execute/async" '{"args":[],"script":"const done = arguments[arguments.length-1]; const {Troubleshoot} = ChromeUtils.importESModule(\"resource://gre/modules/Troubleshoot.sys.mjs\"); Troubleshoot.snapshot().then(s => done(JSON.stringify({prefOverrides:[\"gfx.webrender.all\",\"media.hardware-video-decoding.enabled\",\"media.hardware-video-decoding.force-enabled\",\"media.hardware-video-decoding-vulkan.enabled\",\"media.ffmpeg.vaapi.enabled\",\"security.sandbox.content.level\",\"security.sandbox.rdd.level\",\"media.rdd-process.enabled\"].filter(k=>Services.prefs.prefHasUserValue(k)), defaultContentSandboxLevel: Services.prefs.getDefaultBranch(\"\").getIntPref(\"security.sandbox.content.level\"), media: {codecSupportInfo: s.media.codecSupportInfo}, sandbox: s.sandbox, graphics: {featureLog: s.graphics.featureLog, adapterDescription: s.graphics.adapterDescription, driverVendor: s.graphics.driverVendor, windowLayerManagerType: s.graphics.windowLayerManagerType, webgl2Renderer: s.graphics.webgl2Renderer, failures: s.graphics.failures}})), e => done(String(e)));"}' \
       >"$RUN/support.json"
   fi
 fi
@@ -378,11 +378,25 @@ grep -a -q "VA-API FFmpeg init successful" "$RUN"/moz.log* 2>/dev/null && ok "th
 [ "${n:-0}" -gt 100 ] && ok "$n frames decoded by VA-API on the forwarded device and handed over as dma-bufs" \
   || { bad "only ${n:-0} VA-API-decoded frames were exported"; logs | grep -a -iE 'VULKAN.*(fail|error)|Failed to' | head -8 | sed 's/^/        /'; }
 
+overrides=$(sup '.prefOverrides[]?')
+if [ "${SVFS_LAVAPIPE_FORCE_WR:-0}" = 1 ]; then
+  overrides=$(grep -vx 'gfx.webrender.all' <<<"$overrides")
+fi
+if [ "$(sup '.prefOverrides | type')" = array ] && [ -z "$overrides" ]; then
+  if [ "${SVFS_LAVAPIPE_FORCE_WR:-0}" = 1 ]; then
+    ok "no overrides beyond the explicit lavapipe-only WebRender test preference"
+  else
+    ok "graphics, decoder and sandbox preferences retain their defaults"
+  fi
+else
+  bad "graphics, decoder or sandbox preferences were overridden: ${overrides:-unknown}"
+fi
 level=$(sup '.sandbox.effectiveContentSandboxLevel')
-if [[ "$level" =~ ^[0-9]+$ ]] && [ "$level" -gt 0 ]; then
+default_level=$(sup '.defaultContentSandboxLevel')
+if [[ "$level" =~ ^[0-9]+$ ]] && [ "$level" -gt 0 ] && [ "$level" = "$default_level" ]; then
   ok "Firefox reports an active content sandbox at level $level"
 else
-  bad "Firefox did not report an active content sandbox: ${level:-unknown}"
+  bad "Firefox content sandbox level ${level:-unknown} differs from its default ${default_level:-unknown}"
 fi
 if grep -qE '^Seccomp:[[:space:]]+2$' "$RUN/rdd-status.txt" &&
    grep -qE '^NoNewPrivs:[[:space:]]+1$' "$RUN/rdd-status.txt"; then
