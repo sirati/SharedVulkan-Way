@@ -1780,6 +1780,99 @@ mod tests {
         }
     }
     #[test]
+    fn native_admission_checks_total_grant_and_capacity_before_callback() {
+        for dimension in 0..3 {
+            let (mut owner, mut life, _, _, _, _, _, _) = setup();
+            let limits = match dimension {
+                0 => native::NativeLimits::new(1, 1, 1, 8 * PAGE),
+                1 => native::NativeLimits::new(4, 1, 1, 8 * PAGE),
+                _ => native::NativeLimits::new(4, 4, 4, PAGE),
+            }
+            .unwrap();
+            owner
+                .native_exports
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .limits = limits;
+            let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+            let (producer, target) = process(&mut owner, &life, &grant);
+            let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+            let mut backend = TicketBackend {
+                target,
+                next: 0,
+                wrong: 0,
+            };
+            let _held = owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .unwrap();
+            let other_grant = if dimension == 0 {
+                owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap()
+            } else {
+                grant.clone()
+            };
+            let (other_producer, target) = process(&mut owner, &life, &other_grant);
+            let (other, _) = owner.allocate(&life, &other_producer, 1, PAGE).unwrap();
+            backend.target = target;
+            assert_eq!(
+                owner
+                    .project_producer_tracked(&life, &other_producer, &other, &mut backend)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(backend.next, 1);
+            assert!(!owner.records[&other_grant.id].quarantined);
+        }
+    }
+    #[test]
+    fn native_competing_first_bind_instances_serialize_and_pin_one() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        // Safe concurrent access must serialize the sole &mut owner. The inner
+        // provider gate remains held throughout each actual backend callback.
+        let owner = std::sync::Mutex::new(owner);
+        let start = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = [0, 4]
+                .into_iter()
+                .map(|wrong| {
+                    let owner = &owner;
+                    let start = &start;
+                    let life = &life;
+                    let producer = &producer;
+                    let allocation = &allocation;
+                    let target = target.clone();
+                    scope.spawn(move || {
+                        let mut backend = TicketBackend {
+                            target,
+                            next: wrong as u64,
+                            wrong,
+                        };
+                        start.wait();
+                        owner
+                            .lock()
+                            .unwrap()
+                            .project_producer_tracked(life, producer, allocation, &mut backend)
+                            .is_ok()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|ok| **ok).count(), 1);
+        let owner = owner.into_inner().unwrap();
+        assert!(owner.records[&grant.id].quarantined);
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 2);
+    }
+    #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {
         let (mut owner, mut life, _, _, _, _, _, _) = setup();
         let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
