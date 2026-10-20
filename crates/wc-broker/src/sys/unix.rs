@@ -702,6 +702,27 @@ mod render_node_tests {
     }
 
     #[test]
+    fn render_node_registration_reaches_a_service_that_starts_late() {
+        let dir = std::env::temp_dir().join(format!("wc-broker-late-drm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services_path = dir.join("services.sock");
+        let _ = std::fs::remove_file(&services_path);
+        let unix = Unix::bind(dir.join("broker.sock"), Vec::new()).unwrap();
+        assert!(!services_path.exists());
+        // This returns without the node's service socket being present.
+        unix.register_render_node(&services_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let services = sv_drm::relay::Services::new();
+        services.listen(UnixListener::bind(&services_path).unwrap()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while services.is_empty() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(services.len(), 1, "broker registration did not retry after the node service appeared");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn broker_render_node_handoff_applies_the_mapped_user_service_policy() {
         for mapped in [true, false] {
             let dir = std::env::temp_dir().join(format!("wc-broker-render-{}-{mapped}", std::process::id()));
