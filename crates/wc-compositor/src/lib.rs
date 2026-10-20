@@ -2290,9 +2290,15 @@ mod native_prime;
 /// until the process is terminated. No launchd or GUI activation occurs.
 #[cfg(target_os = "macos")]
 pub fn run_headless_section_fixture() -> std::io::Result<()> {
-    let _owner = native_prime::start_section_service()?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
-                                           "WC_GPU_SECTIONS is unset"))?;
-    eprintln!("NV12_SECTION_SERVICE_READY");
+    let private = std::env::var_os("WC_NV12_PRIVATE_NAMESPACE").is_some();
+    if private {
+        let (_owner, port) = native_prime::start_private_section_service()?;
+        eprintln!("NV12_PRIVATE_SECTION_READY port={port}");
+    } else {
+        let _owner = native_prime::start_section_service()?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
+                                               "WC_GPU_SECTIONS is unset"))?;
+        eprintln!("NV12_SECTION_SERVICE_READY");
+    }
     loop { std::thread::park(); }
 }
