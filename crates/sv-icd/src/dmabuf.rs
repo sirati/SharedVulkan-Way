@@ -127,7 +127,18 @@ fn stat_char_device(_path: &std::path::Path) -> Option<(u32, u32)> {
 }
 
 /// Is the dma-buf path on?
+#[cfg(test)]
+thread_local! { static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn test_enabled_scope<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset { fn drop(&mut self) { TEST_ENABLED.set(self.0); } }
+    let _reset = Reset(TEST_ENABLED.replace(true));
+    f()
+}
 pub fn enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ENABLED.get() { return true; }
     node().is_some()
 }
 

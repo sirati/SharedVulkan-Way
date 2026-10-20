@@ -419,6 +419,8 @@ pub struct SharedVulkan {
     pub arena_len: u64,
     state: Mutex<State>,
     transport: Option<crate::transport::RingTransport>,
+    #[cfg(test)]
+    test_transport: Option<Box<dyn sv_icd_entry::Transport>>,
     /// What `vkEnumerateInstanceVersion` answers and what every instance this
     /// driver creates is stamped with.
     ///
@@ -495,6 +497,8 @@ impl SharedVulkan {
             arena_len,
             state: Mutex::new(State::new(Box::new(allocator))),
             transport: None,
+            #[cfg(test)]
+            test_transport: None,
             // No driver behind us, so there is nothing to negotiate against and
             // the ceiling is the honest answer: a standalone driver implements
             // exactly the profile and no more.
@@ -575,6 +579,8 @@ impl SharedVulkan {
             arena_len: attached.arena_len,
             state: Mutex::new(State::new(allocator)),
             transport: Some(attached.transport),
+            #[cfg(test)]
+            test_transport: None,
             api_version,
             device_api_version,
             device_extensions: Vec::new(),
@@ -860,7 +866,13 @@ impl SharedVulkan {
     }
 
     /// The transport, if this process is connected to a GPU side.
+    #[cfg(test)]
+    pub(crate) fn set_test_transport(&mut self, transport: Box<dyn sv_icd_entry::Transport>) {
+        self.test_transport = Some(transport);
+    }
     pub fn wire(&self) -> Option<&dyn sv_icd_entry::Transport> {
+        #[cfg(test)]
+        if let Some(transport) = &self.test_transport { return Some(transport.as_ref()); }
         self.transport.as_ref().map(|t| t as &dyn sv_icd_entry::Transport)
     }
 

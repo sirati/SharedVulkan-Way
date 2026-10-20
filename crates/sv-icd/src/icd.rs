@@ -2237,22 +2237,61 @@ impl Icd for SharedVulkan {
         forward::bind_image_memory2(t, args)
     }
 
-    /// As `create_image`, for an image that does not exist yet.
+    fn get_image_memory_requirements(
+        &self,
+        args: p::VkGetImageMemoryRequirementsArgs,
+    ) -> IcdResult<p::VkGetImageMemoryRequirementsReply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetImageMemoryRequirements")); };
+        let image = args.image.0;
+        let mut reply = forward::get_image_memory_requirements(t, args)?;
+        if let Some(requirements) = reply.p_memory_requirements.as_mut() {
+            self.translate_image_requirements(image, requirements)?;
+        }
+        Ok(reply)
+    }
+
+    fn get_image_memory_requirements2(
+        &self,
+        args: p::VkGetImageMemoryRequirements2Args,
+    ) -> IcdResult<p::VkGetImageMemoryRequirements2Reply> {
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetImageMemoryRequirements2")); };
+        let image = args.p_info.as_ref().map_or(0, |i| i.image.0);
+        let mut reply = forward::get_image_memory_requirements2(t, args)?;
+        if let Some(requirements) = reply.p_memory_requirements.as_mut() {
+            self.translate_image_requirements(image, &mut requirements.memory_requirements)?;
+        }
+        Ok(reply)
+    }
+
+    /// Explicit layouts require real backend subresource origins to calculate
+    /// their binding shift. Resolve a private temporary image exactly as create
+    /// would, rather than assuming a driver origin for this handle-free query.
     fn get_device_image_memory_requirements(
         &self,
         mut args: p::VkGetDeviceImageMemoryRequirementsArgs,
     ) -> IcdResult<p::VkGetDeviceImageMemoryRequirementsReply> {
-        let Some(t) = self.wire() else {
-            return Err(LowerError::NotImplemented("vkGetDeviceImageMemoryRequirements"));
-        };
-        if crate::dmabuf::enabled()
-            && let Some(ci) = args.p_info.as_mut().and_then(|i| i.p_create_info.as_mut())
-            && let Err(r) = crate::dmabuf::rewrite_image_create_info(ci)
-        {
-            sv_icd_entry::report_always(&format_args!(
-                "vkGetDeviceImageMemoryRequirements: an image this driver cannot create ({r})"
-            ));
-            return Err(LowerError::Result(r));
+        let Some(t) = self.wire() else { return Err(LowerError::NotImplemented("vkGetDeviceImageMemoryRequirements")); };
+        if crate::dmabuf::enabled() {
+            let original = args.p_info.as_ref().and_then(|i| i.p_create_info.as_ref()).cloned();
+            if let Some(original) = original {
+                let mut rewritten = original.clone();
+                let image = crate::dmabuf::rewrite_image_create_info(&mut rewritten).map_err(LowerError::Result)?;
+                if image.as_ref().is_some_and(|i| i.explicit.is_some()) {
+                    let created = self.create_image(p::VkCreateImageArgs { device: args.device, p_create_info: Some(original), p_image: None })?;
+                    if created.result.0 != 0 { return Err(LowerError::Result(created.result.0)); }
+                    let image = created.p_image.ok_or(LowerError::Shape("temporary explicit image missing"))?;
+                    let queried = self.get_image_memory_requirements2(p::VkGetImageMemoryRequirements2Args {
+                        device: args.device,
+                        p_info: Some(Box::new(p::VkImageMemoryRequirementsInfo2 { image, ..Default::default() })),
+                        p_memory_requirements: args.p_memory_requirements.clone(),
+                    });
+                    let destroyed = self.destroy_image(p::VkDestroyImageArgs { device: args.device, image });
+                    let reply = queried?;
+                    destroyed?;
+                    return Ok(p::VkGetDeviceImageMemoryRequirementsReply { p_memory_requirements: reply.p_memory_requirements });
+                }
+                if let Some(info) = args.p_info.as_mut() { info.p_create_info = Some(rewritten); }
+            }
         }
         forward::get_device_image_memory_requirements(t, args)
     }
@@ -2531,6 +2570,15 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
 }
 
 impl SharedVulkan {
+    /// Keep backend requirements unchanged internally. Application-visible size
+    /// includes the exact explicit origin that the bind implementation adds.
+    fn translate_image_requirements(&self, image: u64, requirements: &mut p::VkMemoryRequirements) -> IcdResult<()> {
+        if let Some(image) = self.state().dmabuf_images.get(&image).filter(|i| i.explicit.is_some()) {
+            requirements.size = image.translated_offset(requirements.size)
+                .ok_or(LowerError::Result(crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT))?;
+        }
+        Ok(())
+    }
     /// `MEMORY_PLANE_0` of a LINEAR modifier image is the colour aspect to the
     /// driver behind the GPU side, which never saw a modifier (§104).
     /// (The aspect is valid only for a modifier image, so the image is not
@@ -3074,3 +3122,7 @@ mod tests {
         assert_eq!(samplers(&w), vec![POISON], "a reset pool's sets are forgotten");
     }
 }
+
+#[cfg(test)]
+#[path = "explicit_requirements_tests.rs"]
+mod explicit_requirements_tests;
