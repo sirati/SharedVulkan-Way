@@ -241,6 +241,7 @@ pub fn run(config: Config) -> ExitCode {
     // Only now may the section go. See §2.5.
     drop(view);
     drop(handle);
+    wc_transport::finish_bar_connection();
     ExitCode::SUCCESS
 }
 

@@ -48,6 +48,15 @@ pub use imp::{Listener, Stream};
 #[cfg(windows)]
 mod bar_client;
 
+/// Finish the process's explicit native BAR connection before process exit.
+/// Call after releasing application mappings. Rust process exit does not join
+/// the socket pumps, so merely dropping the socket cannot prove ring teardown.
+/// This does not retire abandoned allocations or replace mapping ownership.
+pub fn finish_bar_connection() {
+    #[cfg(windows)]
+    wc_cygwin_link::wc_bridge_close();
+}
+
 /// The type a [`Stream`] or [`Listener`] borrows as, for handing to a poller.
 ///
 /// On Unix this is a file descriptor. On Windows it is a `SOCKET`, which is the

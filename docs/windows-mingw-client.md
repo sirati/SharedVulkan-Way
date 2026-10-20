@@ -32,6 +32,11 @@ Wayland protocol implementation remain the same; its pool emission now uses
 the common resource-transfer boundary. It waits for the final frame callback
 before reporting completion and records the final pixels' hash, allowing a
 Linux compositor's presented hash to establish that those pixels arrived.
+After releasing its Handle and mapping, it calls
+`wc_transport::finish_bar_connection` synchronously. Native process exit does
+not join socket pump threads, so dropping a socket just before exit is not a
+ring teardown acknowledgement. This explicit finish closes the normal
+connection; it does not retire abandoned allocations.
 
 This native fixture is our own client. It is separate from the unchanged
 upstream Cygwin Weston client evidence. It does not establish general native
@@ -44,4 +49,7 @@ Runtime prerequisites are the single disposable `wcram` fixture's separate
 Wayland BAR at slot 0x1c and GPU BAR at 0x1d, the protected broker SID bindings,
 and a Linux compositor attached to the authenticated pixel subwindow. The
 native client uses the same pinned run and arena identity as the Cygwin route.
-No raw device-open fallback or file-arena bypass is enabled.
+No raw device-open fallback or file-arena bypass is enabled. The directory
+layout uses header format 3 and control wire version 2. Legacy format-2
+clients must reject this header before touching pixel or allocation metadata;
+new lease clients also reject legacy headers and control versions.
