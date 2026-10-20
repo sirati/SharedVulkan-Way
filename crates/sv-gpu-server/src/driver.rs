@@ -29,6 +29,9 @@
 use ash::vk;
 use std::ffi::CStr;
 
+#[path = "driver_queue_contract.rs"]
+mod queue_contract;
+
 /// Everything that can go wrong talking to a driver.
 #[derive(Debug)]
 pub enum DriverError {
@@ -1319,5 +1322,17 @@ impl Driver {
             .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?);
         *queue = Some(std::sync::Arc::clone(&created));
         Ok(created)
+    }
+}
+
+impl Driver {
+    pub(crate) fn validate_queue_requests(&self, info: &sv_proto::VkDeviceCreateInfo) -> std::result::Result<(), vk::Result> {
+        queue_contract::validate_requests(&self.served, info)
+    }
+    pub(crate) fn served_queue(&self, family: u32, index: u32, flags: u32) -> Option<vk::Queue> {
+        queue_contract::queue(&self.served, family, index, flags)
+    }
+    pub(crate) fn native_video_queue_contract(&self) -> bool {
+        queue_contract::single_gct(&self.served, self.queue_family, self.queue)
     }
 }
