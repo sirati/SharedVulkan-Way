@@ -37738,6 +37738,17 @@ generation with `services.waycompose`. For each installation it does this:
   with the current trusted key. Shared services and user mapping stay in place.
   Both confirmation and rollback require idle admin and mapped-user sessions.
 
+Before any first-install SCM changes, the Windows installer quarantines an
+existing key tree into privileged recovery storage and creates an empty signer
+tree. It replaces recovery owners and DACLs without reading key material.
+Existing-service installs require privileged protected metadata and explicit
+per-install enrollment receipts bound to the current NTFS file ID. The key
+action creates those receipts only after publishing a fresh protected key
+object. Unknown keys, stale receipts and reparse trees refuse before service
+mutation. Actual Windows filesystem fixtures verified these paths, including
+a desktop-owned key with a protected-looking SYSTEM/Administrators DACL and
+a retained original read handle.
+
 Migration replaces the running raw-resource ACLs completely and makes their
 owner/group root, with only the named service account allowed. It clears
 inherited default ACLs on the directory and removes base group grants, so
