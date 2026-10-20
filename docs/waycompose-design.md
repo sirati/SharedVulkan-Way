@@ -36433,6 +36433,37 @@ so its guest-RAM part is the two VM tests now. Not covered end to end in a
 VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
 the same `find` + `map_fixed` per part as the ICD).
 
+
+**Shared broker keeper integration, 2026-10-20.** Branch
+`windows-guest-ram-broker`, checked after merging the broker shutdown fix
+from master. The final code checks cover 60 `sv-ram` and `wc-broker` tests,
+the Windows target for `sv-guest`, `sv-ram` and `wc-broker`, strict Clippy on
+`sv-ram` and `wc-broker` with dependencies excluded, and the
+NixOS guest-RAM broker VM test above. Full dependency linting also reports a
+pre-existing empty doc-comment line in `wc-handle/src/grow.rs`.
+
+A separate disposable Windows VM, with 3 GiB RAM and four vCPUs, ran the
+new broker backend through the compatibility `ram keeper` command. Its
+host instrument continued writing into the lent RAM during each crash.
+
+| check | result |
+|---|---|
+| ordinary allocation and release | two sessions, six grows of 64 and 128 MiB; 576 MiB filled and verified, large-page translations active, no refusal or error |
+| provider killed while the host writes | one orphan adopted by the replacement provider and freed after `UNMAPPED`; broker statistics returned to zero |
+| provider then broker killed while the host writes | the independent holder survived, the new broker restored the section, and the next provider adopted and freed it after `UNMAPPED`; statistics returned to zero |
+| holder killed while two sessions allocate and retire | the broker replaced its holder; one allocation was refused while no holder was available and its retry succeeded; 220 grows and 13.75 GiB verified, no bad word or stalled counter; statistics returned to zero |
+| memory reserve | while two 128 MiB sections were held, Windows still reported about 1.8 GiB available; the 1 GiB reserve stayed intact |
+| guest health and cleanup | every watchdog probe succeeded; the host instrument exited before the VM stopped, and its overlay was retained |
+
+The holder restart registry also retains its lock while duplicating section
+handles. A region's destruction cannot close and reuse a handle from an
+in-flight refill. A refused allocation removes its restart record before
+its section handle is closed.
+
+The Intel driver's import of these views and the proxy's grown arena window
+still need their separate end-to-end proofs. These tests ran only in the
+disposable local VMs.
+
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
 Written 2026-10-19, branch `lazy-shm-pools`, from master `3955922`. The same
