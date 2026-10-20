@@ -295,3 +295,59 @@ impl Picture {
         Ok(())
     }
 }
+
+impl Picture {
+    /// Fresh storage for an application-bound video image. Contents remain
+    /// undefined until a completed decoder picture is copied into it on Metal.
+    /// The allocation is independent of VT's reusable output pool.
+    pub fn allocate_target(width: usize, height: usize, range: Range) -> Result<Arc<Self>, String> {
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            return Err("video target dimensions refused".into());
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            fn CFDictionaryCreateMutable(allocator: *const c_void, capacity: isize,
+                keys: *const c_void, values: *const c_void) -> *mut c_void;
+            fn CFDictionarySetValue(dictionary: *mut c_void, key: *const c_void, value: *const c_void);
+            fn CFRelease(value: *mut c_void);
+            static kCFTypeDictionaryKeyCallBacks: c_void;
+            static kCFTypeDictionaryValueCallBacks: c_void;
+            static kCFBooleanTrue: *const c_void;
+        }
+        #[link(name = "CoreVideo", kind = "framework")]
+        unsafe extern "C" {
+            fn CVPixelBufferCreate(allocator: *const c_void, width: usize, height: usize,
+                format: u32, attributes: *mut c_void, output: *mut *mut c_void) -> i32;
+            static kCVPixelBufferIOSurfacePropertiesKey: *const c_void;
+            static kCVPixelBufferMetalCompatibilityKey: *const c_void;
+        }
+        struct Dictionary(*mut c_void);
+        impl Drop for Dictionary { fn drop(&mut self) { unsafe { CFRelease(self.0) } } }
+        unsafe {
+            let dictionary = || {
+                let value = CFDictionaryCreateMutable(std::ptr::null(), 0,
+                    (&raw const kCFTypeDictionaryKeyCallBacks).cast(),
+                    (&raw const kCFTypeDictionaryValueCallBacks).cast());
+                if value.is_null() { Err("video target dictionary allocation") } else { Ok(Dictionary(value)) }
+            };
+            let attributes = dictionary()?;
+            let surface = dictionary()?;
+            CFDictionarySetValue(attributes.0, kCVPixelBufferIOSurfacePropertiesKey, surface.0);
+            CFDictionarySetValue(attributes.0, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+            let mut buffer = std::ptr::null_mut();
+            let format = u32::from_be_bytes(match range { Range::Video => *b"420v", Range::Full => *b"420f" });
+            let status = CVPixelBufferCreate(std::ptr::null(), width, height, format, attributes.0, &mut buffer);
+            if status != 0 || buffer.is_null() {
+                if !buffer.is_null() { CVBufferRelease(buffer); }
+                return Err(format!("video target pixel-buffer allocation: OSStatus {status}"));
+            }
+            let picture = Self::from_completed_buffer(buffer).map_err(str::to_owned);
+            CVBufferRelease(buffer);
+            let picture = picture?;
+            if picture.layout.width != width || picture.layout.height != height || picture.range != range {
+                return Err("video target allocation changed requested dimensions/range".into());
+            }
+            Ok(picture)
+        }
+    }
+}
