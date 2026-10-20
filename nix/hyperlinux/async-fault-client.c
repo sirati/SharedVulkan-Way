@@ -17,7 +17,8 @@ static void *fault_address;
 static _Atomic int in_bus, asynchronous;
 static pid_t main_pid, main_tid;
 static void on_async(int signum) {
-    if (signum != SIGUSR1 || !atomic_load_explicit(&in_bus, memory_order_acquire) ||
+    if (syscall(SYS_gettid) != main_tid || signum != SIGUSR1 ||
+        !atomic_load_explicit(&in_bus, memory_order_acquire) ||
         atomic_load_explicit(&asynchronous, memory_order_relaxed)) _exit(92);
     atomic_store_explicit(&asynchronous, 1, memory_order_release);
 }
