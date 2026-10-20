@@ -1,0 +1,363 @@
+--- a/meson.build
++++ b/meson.build
+@@ -369,7 +369,10 @@
+   endif
+ endforeach
+ 
+-if cc.has_header_symbol('sys/syscall.h', 'SYS_memfd_create') \
++# Darwin supports this protocol with anonymous shared descriptors, not a
++# Linux memfd syscall or Linux kernel seals.
++if host_machine.system() == 'darwin' \
++  or cc.has_header_symbol('sys/syscall.h', 'SYS_memfd_create') \
+   or cc.has_function('memfd_create')
+   cdata.set('HAVE_MEMFD', 1)
+ endif
+--- a/src/pulsecore/creds.h
++++ b/src/pulsecore/creds.h
+@@ -34,7 +34,7 @@
+ typedef struct pa_creds pa_creds;
+ typedef struct pa_cmsg_ancil_data pa_cmsg_ancil_data;
+ 
+-#if (defined(SCM_CREDENTIALS) || defined(SCM_CREDS)) && !defined(OS_IS_DARWIN)
++#if defined(OS_IS_DARWIN) || defined(SCM_CREDENTIALS) || defined(SCM_CREDS)
+ 
+ #define HAVE_CREDS 1
+ 
+--- a/src/pulsecore/iochannel.c
++++ b/src/pulsecore/iochannel.c
+@@ -261,7 +261,10 @@
+ 
+ #ifdef HAVE_CREDS
+ 
+-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__GNU__)
++#if defined(OS_IS_DARWIN)
++/* Credentials come from getpeereid, never client-supplied control data. */
++typedef pa_creds pa_ucred_t;
++#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__GNU__)
+ typedef struct cmsgcred pa_ucred_t;
+ #define SCM_CREDENTIALS SCM_CREDS
+ #else
+@@ -287,28 +290,48 @@
+     if (getsockname(io->ifd, &sa.sa, &l) < 0)
+         return false;
+ 
++#ifdef OS_IS_DARWIN
++    {
++        uid_t uid;
++        gid_t gid;
++        return sa.sa.sa_family == AF_UNIX && getpeereid(io->ifd, &uid, &gid) == 0;
++    }
++#else
+     return sa.sa.sa_family == AF_UNIX;
++#endif
+ }
+ 
+ int pa_iochannel_creds_enable(pa_iochannel *io) {
+-#if !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) && !defined(__GNU__)
++#if !defined(OS_IS_DARWIN) && !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) && !defined(__GNU__)
+     int t = 1;
+ #endif
+ 
+     pa_assert(io);
+     pa_assert(io->ifd >= 0);
+ 
+-#if !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) && !defined(__GNU__)
++#if !defined(OS_IS_DARWIN) && !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) && !defined(__GNU__)
+     if (setsockopt(io->ifd, SOL_SOCKET, SO_PASSCRED, &t, sizeof(t)) < 0) {
+         pa_log_error("setsockopt(SOL_SOCKET, SO_PASSCRED): %s", pa_cstrerror(errno));
+         return -1;
+     }
+ #endif
+ 
++#ifdef OS_IS_DARWIN
++    if (!pa_iochannel_creds_supported(io)) {
++        errno = ENOTSUP;
++        return -1;
++    }
++#endif
+     return 0;
+ }
+ 
+ ssize_t pa_iochannel_write_with_creds(pa_iochannel*io, const void*data, size_t l, const pa_creds *ucred) {
++#ifdef OS_IS_DARWIN
++    /* The receiving endpoint queries kernel peer identity. Darwin has no
++     * SCM_CREDENTIALS message and must never accept an asserted UID. */
++    (void) ucred;
++    return pa_iochannel_write(io, data, l);
++#else
+     ssize_t r;
+     struct msghdr mh;
+     struct iovec iov;
+@@ -359,6 +382,7 @@
+     }
+ 
+     return r;
++#endif
+ }
+ 
+ /* For more details on FD passing, check the cmsg(3) manpage
+@@ -453,6 +477,7 @@
+             if (cmh->cmsg_level != SOL_SOCKET)
+                 continue;
+ 
++#ifndef OS_IS_DARWIN
+             if (cmh->cmsg_type == SCM_CREDENTIALS) {
+                 pa_ucred_t u;
+                 pa_assert(cmh->cmsg_len == CMSG_LEN(sizeof(pa_ucred_t)));
+@@ -466,20 +491,40 @@
+ #endif
+                 ancil_data->creds_valid = true;
+             }
+-            else if (cmh->cmsg_type == SCM_RIGHTS) {
+-                int nfd = (cmh->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+-                if (nfd > MAX_ANCIL_DATA_FDS) {
+-                    int i;
+-                    pa_log("Trying to receive too many file descriptors!");
+-                    for (i = 0; i < nfd; i++)
+-                        pa_close(((int*) CMSG_DATA(cmh))[i]);
++            else
++#endif
++            if (cmh->cmsg_type == SCM_RIGHTS) {
++                int i, nfd;
++                if (cmh->cmsg_len < CMSG_LEN(0) ||
++                    (cmh->cmsg_len - CMSG_LEN(0)) % sizeof(int) != 0) {
++                    mh.msg_flags |= MSG_CTRUNC;
+                     continue;
+                 }
+-                memcpy(ancil_data->fds, CMSG_DATA(cmh), nfd * sizeof(int));
+-                ancil_data->nfd = nfd;
+-                ancil_data->close_fds_on_cleanup = true;
++                nfd = (cmh->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++                for (i = 0; i < nfd; i++) {
++                    int fd;
++                    memcpy(&fd, (uint8_t*) CMSG_DATA(cmh) + i * sizeof(int), sizeof(fd));
++                    if (ancil_data->nfd == MAX_ANCIL_DATA_FDS) {
++                        pa_close(fd);
++                        mh.msg_flags |= MSG_CTRUNC;
++                    } else {
++                        pa_make_fd_cloexec(fd);
++                        ancil_data->fds[ancil_data->nfd++] = fd;
++                        ancil_data->close_fds_on_cleanup = true;
++                    }
++                }
+             }
+         }
++
++        if (mh.msg_flags & MSG_CTRUNC) {
++            pa_cmsg_ancil_data_close_fds(ancil_data);
++            errno = EPROTO;
++            return -1;
++        }
++#ifdef OS_IS_DARWIN
++        if (getpeereid(io->ifd, &ancil_data->creds.uid, &ancil_data->creds.gid) == 0)
++            ancil_data->creds_valid = true;
++#endif
+ 
+         io->readable = io->hungup = false;
+         enable_events(io);
+--- a/src/pulsecore/memfd-wrappers.h
++++ b/src/pulsecore/memfd-wrappers.h
+@@ -20,7 +20,7 @@
+   License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
+ ***/
+ 
+-#if defined(HAVE_MEMFD) && !defined(HAVE_MEMFD_CREATE)
++#if defined(HAVE_MEMFD) && !defined(HAVE_MEMFD_CREATE) && !defined(OS_IS_DARWIN)
+ 
+ #include <sys/syscall.h>
+ #include <fcntl.h>
+--- a/src/pulsecore/shm.c
++++ b/src/pulsecore/shm.c
+@@ -141,6 +141,43 @@
+     return 0;
+ }
+ 
++#ifdef OS_IS_DARWIN
++/* Pulse's memfd wire protocol needs an anonymous shared fd, not Linux seals.
++ * No Pulse path calls F_ADD_SEALS. Never expose this as a generic memfd syscall. */
++static int anonymous_shared_fd(mode_t mode) {
++    char leaf[32], *name;
++    unsigned id[2];
++    int fd, saved_errno, attempt;
++
++    for (attempt = 0; attempt < 16; attempt++) {
++        pa_random(id, sizeof(id));
++        pa_snprintf(leaf, sizeof(leaf), "pulse-fd-%08x-%08x", id[0], id[1]);
++        if (!(name = pa_runtime_path(leaf)))
++            return -1;
++        fd = pa_open_cloexec(name, O_RDWR|O_CREAT|O_EXCL, mode);
++        if (fd < 0) {
++            saved_errno = errno;
++            pa_xfree(name);
++            if (saved_errno == EEXIST)
++                continue;
++            errno = saved_errno;
++            return -1;
++        }
++        if (unlink(name) < 0) {
++            saved_errno = errno;
++            pa_close(fd);
++            pa_xfree(name);
++            errno = saved_errno;
++            return -1;
++        }
++        pa_xfree(name);
++        return fd;
++    }
++    errno = EEXIST;
++    return -1;
++}
++#endif
++
+ static int sharedmem_create(pa_shm *m, pa_mem_type_t type, size_t size, mode_t mode) {
+ #if defined(HAVE_SHM_OPEN) || defined(HAVE_MEMFD)
+     char fn[32];
+@@ -164,11 +201,15 @@
+ #endif
+ #ifdef HAVE_MEMFD
+     case PA_MEM_TYPE_SHARED_MEMFD:
++#ifdef OS_IS_DARWIN
++        fd = anonymous_shared_fd(mode);
++#else
+         /* For linux >= 6.3 create fd with MFD_NOEXEC_SEAL flag */
+         fd = memfd_create("pulseaudio", MFD_ALLOW_SEALING|MFD_CLOEXEC|MFD_NOEXEC_SEAL);
+         /* Retry creating fd without MFD_NOEXEC_SEAL to support linux < 6.3 */
+         if (fd < 0)
+             fd = memfd_create("pulseaudio", MFD_ALLOW_SEALING|MFD_CLOEXEC);
++#endif
+         break;
+ #endif
+     default:
+@@ -387,6 +428,14 @@
+         goto fail;
+     }
+ 
++#ifdef OS_IS_DARWIN
++    if (type == PA_MEM_TYPE_SHARED_MEMFD &&
++        (!S_ISREG(st.st_mode) || st.st_uid != getuid())) {
++        pa_log("Refusing shared descriptor without native user ownership");
++        goto fail;
++    }
++#endif
++
+     if (st.st_size <= 0 ||
+         st.st_size > (off_t) MAX_SHM_SIZE + (off_t) shm_marker_size(type) ||
+         PA_ALIGN((size_t) st.st_size) != (size_t) st.st_size) {
+@@ -408,6 +457,13 @@
+     if (type != PA_MEM_TYPE_SHARED_MEMFD)
+         pa_assert_se(pa_close(fd) == 0);
+ 
++#ifdef OS_IS_DARWIN
++    if (type == PA_MEM_TYPE_SHARED_MEMFD)
++        pa_log_debug("Imported shared fd: id=%u dev=%llu ino=%llu uid=%u size=%llu writable=%s",
++                     id, (unsigned long long) st.st_dev, (unsigned long long) st.st_ino,
++                     (unsigned) st.st_uid, (unsigned long long) st.st_size, pa_yes_no(writable));
++#endif
++
+     m->type = type;
+     m->id = id;
+     m->size = (size_t) st.st_size;
+--- a/src/pulsecore/mem.h
++++ b/src/pulsecore/mem.h
+@@ -27,7 +27,7 @@
+ 
+ typedef enum pa_mem_type {
+     PA_MEM_TYPE_SHARED_POSIX,         /* Data is shared and created using POSIX shm_open() */
+-    PA_MEM_TYPE_SHARED_MEMFD,         /* Data is shared and created using Linux memfd_create() */
++    PA_MEM_TYPE_SHARED_MEMFD,         /* Data is shared through a descriptor; memfd on Linux, anonymous shared file on Darwin */
+     PA_MEM_TYPE_PRIVATE,              /* Data is private and created using classic memory allocation
+                                          (posix_memalign(), malloc() or anonymous mmap()) */
+ } pa_mem_type_t;
+--- a/src/pulsecore/pstream.c
++++ b/src/pulsecore/pstream.c
+@@ -159,6 +159,10 @@
+      * pa_pstream_register_memfd_mempool() for more information. */
+     bool use_shm, use_memfd;
+     bool non_registered_memfd_id_error_logged;
++    bool shared_fd_block_logged;
++#ifdef OS_IS_DARWIN
++    uint64_t received_shared_fd_bytes, received_socket_audio_bytes;
++#endif
+     pa_idxset *registered_memfd_ids;
+ 
+     pa_memimport *import;
+@@ -913,6 +917,10 @@
+             p->read_ancil_data.creds = b.creds;
+         }
+         if (b.nfd > 0) {
++            if (p->read_ancil_data.nfd > 0) {
++                pa_cmsg_ancil_data_close_fds(&b);
++                goto fail;
++            }
+             pa_assert(b.nfd <= MAX_ANCIL_DATA_FDS);
+             p->read_ancil_data.nfd = b.nfd;
+             memcpy(p->read_ancil_data.fds, b.fds, sizeof(int) * b.nfd);
+@@ -1020,6 +1028,9 @@
+         /* Frame complete */
+ 
+         if (re->memblock) {
++#ifdef OS_IS_DARWIN
++            p->received_socket_audio_bytes += ntohl(re->descriptor[PA_PSTREAM_DESCRIPTOR_LENGTH]);
++#endif
+             memblock_complete(p, re);
+ 
+             /* This was a memblock frame. We can unref the memblock now */
+@@ -1062,6 +1073,17 @@
+                 if (pa_log_ratelimit(PA_LOG_DEBUG))
+                     pa_log_debug("Failed to import memory block.");
+             }
++
++#ifdef OS_IS_DARWIN
++            if (b && type == PA_MEM_TYPE_SHARED_MEMFD)
++                p->received_shared_fd_bytes += pa_memblock_get_length(b);
++            if (b && type == PA_MEM_TYPE_SHARED_MEMFD && !p->shared_fd_block_logged) {
++                pa_log_debug("Received shared-fd audio block: id=%u offset=%u length=%u",
++                             shm_id, ntohl(re->shm_info[PA_PSTREAM_SHM_INDEX]),
++                             ntohl(re->shm_info[PA_PSTREAM_SHM_LENGTH]));
++                p->shared_fd_block_logged = true;
++            }
++#endif
+ 
+             if (p->receive_memblock_callback) {
+                 int64_t offset;
+@@ -1100,13 +1122,7 @@
+     re->data = NULL;
+ 
+ #ifdef HAVE_CREDS
+-    /* FIXME: Close received ancillary data fds if the pstream's
+-     * receive_packet_callback did not do so.
+-     *
+-     * Malicious clients can attach fds to unknown commands, or attach them
+-     * to commands that does not expect fds. By doing so, server will reach
+-     * its open fd limit and future clients' SHM transfers will always fail.
+-     */
++    pa_cmsg_ancil_data_close_fds(&p->read_ancil_data);
+     p->read_ancil_data.creds_valid = false;
+     p->read_ancil_data.nfd = 0;
+ #endif
+@@ -1114,6 +1130,9 @@
+     return 0;
+ 
+ fail:
++#ifdef HAVE_CREDS
++    pa_cmsg_ancil_data_close_fds(&p->read_ancil_data);
++#endif
+     if (release_memblock)
+         pa_memblock_release(release_memblock);
+ 
+@@ -1205,6 +1224,15 @@
+         return;
+ 
+     p->dead = true;
++#ifdef OS_IS_DARWIN
++    if (p->received_shared_fd_bytes || p->received_socket_audio_bytes)
++        pa_log_debug("Shared-fd audio totals: shared=%llu socket=%llu",
++                     (unsigned long long) p->received_shared_fd_bytes,
++                     (unsigned long long) p->received_socket_audio_bytes);
++#endif
++#ifdef HAVE_CREDS
++    pa_cmsg_ancil_data_close_fds(&p->read_ancil_data);
++#endif
+ 
+     while (p->srb || p->is_srbpending) /* In theory there could be one active and one pending */
+         pa_pstream_set_srbchannel(p, NULL);
