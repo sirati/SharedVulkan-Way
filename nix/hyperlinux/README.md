@@ -91,8 +91,9 @@ continues to use the pinned mapping directly in the kernel.
 `copy-fault-check.c` is a native Darwin regression for deterministic and
 concurrent truncate during these production copy operations. The Linux ELF
 `shared-access-client.c` also covers truncated output and pathname buffers.
-External futex atomic fault isolation is a separate pending gate; kernel copies
-alone do not make native CPU atomics on a truncated file safe.
+External futex atomic fault isolation uses the exact-PC leaf helpers described
+below. Kernel copies alone do not make native CPU atomics on a truncated file
+safe.
 
 The native GPU endpoint defaults to eight session slots, matching the existing
 pool endpoint. `--sessions` accepts 1 through 64. A slot covers the admission
@@ -125,3 +126,21 @@ is not native proof. The integrated Linux ELF acceptance also exercises
 truncated futex words; its separate `--guest-map-fault` mode must print a guest
 signal marker for a direct CPU load after truncate. That mode distinguishes a
 delivered guest fault from a native host crash.
+
+
+Initial application commands may be interpreter scripts, including the stock
+Nix Firefox wrapper. The runtime resolves each shebang interpreter through the
+guest filesystem and preserves its optional argument and the script arguments.
+The wrapper runs unchanged, including its library environment setup. Interpreter
+nesting is bounded to four scripts and lines to 256 bytes.
+
+Darwin does not externalize SCM_RIGHTS descriptors during MSG_PEEK. The runtime
+refuses recvmsg peeks with a guest ancillary buffer before receiving anything,
+so native placeholder zeroes cannot become guest descriptors or close fd0.
+Data-only peeks retain their existing behavior. Full ancillary peeking requires
+a shared receive cache and is not implemented by this guard.
+
+The seccomp implementation and its scope are documented in [SECCOMP.md](SECCOMP.md).
+Passing its enforcement fixtures does not establish that the unchanged Firefox
+sandbox and all subprocess launch paths work. Keep default browser startup,
+privileged-memory isolation and application sandbox acceptance as separate gates.
