@@ -868,9 +868,11 @@ impl Icd for SharedVulkan {
     /// stored in the token's sync page; with no export in front, a batch is
     /// about to use the image, and the next submit waits for its producer.
     fn get_memory_fd_khr(&self, args: p::VkGetMemoryFdKHRArgs) -> IcdResult<p::VkGetMemoryFdKHRReply> {
+        crate::video_trace::event("get-memory-fd app", format_args!("{args:?}"));
         let refuse = Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(VK_ERROR_TOO_MANY_OBJECTS), p_fd: None });
         let Some(info) = args.p_get_fd_info.as_ref() else { return refuse };
         if !crate::dmabuf::enabled() || info.handle_type.0 as u32 != crate::dmabuf::DMA_BUF {
+            crate::video_trace::event("get-memory-fd refused", format_args!("reason=disabled-or-not-dma-buf handle_type={:#x}", info.handle_type.0));
             return refuse;
         }
         let memory = info.memory.0;
@@ -902,8 +904,12 @@ impl Icd for SharedVulkan {
             self.send_mark(mk, if fd.is_some() { memory } else { 0 })?;
         }
         match fd {
-            Some(fd) => Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(0), p_fd: Some(fd) }),
+            Some(fd) => {
+                crate::video_trace::event("get-memory-fd reply", format_args!("memory={memory} fd={fd} result=0"));
+                Ok(p::VkGetMemoryFdKHRReply { result: p::VkResult(0), p_fd: Some(fd) })
+            }
             None => {
+                crate::video_trace::event("get-memory-fd refused", format_args!("memory={memory} reason=no-exportable-shared-memory-or-fd-dup-failed"));
                 sv_icd_entry::report_always(&format_args!(
                     "vkGetMemoryFdKHR(DMA_BUF) of memory {} which was not allocated exportable",
                     info.memory.0
@@ -1041,16 +1047,26 @@ impl Icd for SharedVulkan {
         &self,
         args: p::VkAllocateMemoryArgs,
     ) -> IcdResult<p::VkAllocateMemoryReply> {
+        crate::video_trace::event("allocate-memory app", format_args!("{args:?}"));
         let Some(info) = args.p_allocate_info.as_ref() else {
             return Err(LowerError::Shape("vkAllocateMemory: no VkMemoryAllocateInfo"));
         };
+        if crate::video_trace::enabled() {
+            let trace_export_bits = info.p_next.iter().fold(0, |bits, link| match link {
+                p::PNextLink::VkExportMemoryAllocateInfo(x) => bits | x.handle_types.0,
+                _ => bits,
+            });
+            crate::video_trace::event("allocate-memory export-bits", format_args!("handle_types={trace_export_bits:#x} dma_buf_export_requested={}", trace_export_bits & crate::dmabuf::DMA_BUF != 0));
+        }
         if crate::dmabuf::enabled()
             && let Some(reply) = self.allocate_shared(info)?
         {
+            crate::video_trace::event("allocate-memory shared-reply", format_args!("{reply:?}"));
             return Ok(reply);
         }
         let mut s = self.state();
         let id = s.mint();
+        crate::video_trace::event("allocate-memory ordinary", format_args!("memory={id} dma_buf_shared=false info={info:?}"));
         let type_index = info.memory_type_index;
         if type_index >= 4 {
             return Err(LowerError::Shape("vkAllocateMemory: no such memory type"));
@@ -1202,11 +1218,13 @@ impl Icd for SharedVulkan {
                     p_memory: Some(p::VkDeviceMemory(id)),
                 },
             )?;
+            crate::video_trace::event("allocate-memory provider-reply", format_args!("memory={id} {reply:?}"));
             if reply.result.0 != 0 {
                 self.state().memories.remove(&id);
                 return Ok(reply);
             }
         }
+        crate::video_trace::event("allocate-memory ordinary-reply", format_args!("memory={id} result=0"));
         Ok(p::VkAllocateMemoryReply {
             result: p::VkResult(0),
             p_memory: Some(p::VkDeviceMemory(id)),
@@ -2149,6 +2167,19 @@ impl Icd for SharedVulkan {
         forward::get_physical_device_format_properties2(t, args)
     }
 
+    fn get_physical_device_video_format_properties_khr(
+        &self,
+        args: p::VkGetPhysicalDeviceVideoFormatPropertiesKHRArgs,
+    ) -> IcdResult<p::VkGetPhysicalDeviceVideoFormatPropertiesKHRReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkGetPhysicalDeviceVideoFormatPropertiesKHR"));
+        };
+        crate::video_trace::event("video-format request", format_args!("{args:?}"));
+        let reply = forward::get_physical_device_video_format_properties_khr(t, args);
+        crate::video_trace::event("video-format reply", format_args!("{reply:?}"));
+        reply
+    }
+
     /// A modifier query is a LINEAR query, and a `DMA_BUF` query is asked as
     /// `HOST_ALLOCATION` — the driver's answer for what will actually be
     /// created — and answered as `DMA_BUF`.
@@ -2165,9 +2196,13 @@ impl Icd for SharedVulkan {
         let refused = |r: i32| {
             Ok(p::VkGetPhysicalDeviceImageFormatProperties2Reply { result: p::VkResult(r), p_image_format_properties: None })
         };
+        crate::video_trace::event("image-format app", format_args!("{args:?}"));
         let q = match args.p_image_format_info.as_mut().map(|i| crate::dmabuf::rewrite_image_format_info(i)) {
             Some(Ok(q)) => q,
-            Some(Err(r)) => return refused(r),
+            Some(Err(r)) => {
+                crate::video_trace::event("image-format adapter-refused", format_args!("result={r}"));
+                return refused(r);
+            }
             None => crate::dmabuf::FormatQuery::default(),
         };
         if q.dma_buf
@@ -2175,16 +2210,21 @@ impl Icd for SharedVulkan {
         {
             crate::dmabuf::want_external_answer(out);
         }
-        let mut reply = forward::get_physical_device_image_format_properties2(t, args)?;
+        crate::video_trace::event("image-format provider-request", format_args!("{args:?}"));
+        let result = forward::get_physical_device_image_format_properties2(t, args);
+        crate::video_trace::event("image-format provider-reply", format_args!("{result:?}"));
+        let mut reply = result?;
         if q.dma_buf && reply.result.0 == 0 {
             let ok = reply
                 .p_image_format_properties
                 .as_mut()
                 .is_some_and(|o| crate::dmabuf::answer_image_format(o).is_ok());
             if !ok {
+                crate::video_trace::event("image-format adapter-refused", format_args!("reason=no-host-allocation-import result={}", crate::dmabuf::VK_ERROR_FORMAT_NOT_SUPPORTED));
                 return refused(crate::dmabuf::VK_ERROR_FORMAT_NOT_SUPPORTED);
             }
         }
+        crate::video_trace::event("image-format app-reply", format_args!("{reply:?}"));
         Ok(reply)
     }
 
@@ -2202,13 +2242,20 @@ impl Icd for SharedVulkan {
         if !crate::dmabuf::enabled() {
             return forward::create_image(t, args);
         }
+        crate::video_trace::event("create-image app", format_args!("{args:?}"));
         let img = match args.p_create_info.as_mut().map(|ci| crate::dmabuf::rewrite_image_create_info(ci)) {
             Some(Ok(img)) => img,
-            Some(Err(r)) => return Ok(p::VkCreateImageReply { result: p::VkResult(r), p_image: None }),
+            Some(Err(r)) => {
+                crate::video_trace::event("create-image adapter-refused", format_args!("image={id} result={r}"));
+                return Ok(p::VkCreateImageReply { result: p::VkResult(r), p_image: None });
+            }
             None => None,
         };
         let device = args.device;
-        let reply = forward::create_image(t, args)?;
+        crate::video_trace::event("create-image provider-request", format_args!("{args:?}"));
+        let result = forward::create_image(t, args);
+        crate::video_trace::event("create-image provider-reply", format_args!("image={id} {result:?}"));
+        let reply = result?;
         let Some(img) = img else { return Ok(reply) };
         if reply.result.0 != 0 {
             return Ok(reply);
@@ -2278,6 +2325,7 @@ impl Icd for SharedVulkan {
     /// An import whose planes start inside the dma-buf is bound that far in
     /// (§112).
     fn bind_image_memory(&self, mut args: p::VkBindImageMemoryArgs) -> IcdResult<p::VkBindImageMemoryReply> {
+        crate::video_trace::event("bind_image_memory app", format_args!("{args:?}"));
         let Some(t) = self.wire() else {
             return Err(LowerError::NotImplemented("vkBindImageMemory"));
         };
@@ -2291,10 +2339,14 @@ impl Icd for SharedVulkan {
                 args.memory_offset = offset;
             }
         }
-        forward::bind_image_memory(t, args)
+        crate::video_trace::event("bind_image_memory provider-request", format_args!("{args:?}"));
+        let reply = forward::bind_image_memory(t, args);
+        crate::video_trace::event("bind_image_memory provider-reply", format_args!("{reply:?}"));
+        reply
     }
 
     fn bind_image_memory2(&self, mut args: p::VkBindImageMemory2Args) -> IcdResult<p::VkBindImageMemory2Reply> {
+        crate::video_trace::event("bind_image_memory2 app", format_args!("{args:?}"));
         let Some(t) = self.wire() else {
             return Err(LowerError::NotImplemented("vkBindImageMemory2"));
         };
@@ -2310,7 +2362,10 @@ impl Icd for SharedVulkan {
                 }
             }
         }
-        forward::bind_image_memory2(t, args)
+        crate::video_trace::event("bind_image_memory2 provider-request", format_args!("{args:?}"));
+        let reply = forward::bind_image_memory2(t, args);
+        crate::video_trace::event("bind_image_memory2 provider-reply", format_args!("{reply:?}"));
+        reply
     }
 
     fn get_image_memory_requirements(

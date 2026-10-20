@@ -43,6 +43,7 @@ pub mod present;
 pub mod state;
 pub mod transport;
 pub mod wsi;
+mod video_trace;
 
 /// The identity this build puts in the handshake, and checks on attach.
 ///
