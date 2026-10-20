@@ -21,7 +21,8 @@ struct stream_token {
     int writer, pump, notify[2], running, joining, joined, fork_shared;
     dev_t device;
     ino_t inode;
-    _Atomic int stop, want;
+    _Atomic int stop;
+    _Atomic uint64_t requested;
     struct fd_ref *fds;
     pthread_t watcher, worker;
     struct stream_token *next;
@@ -107,19 +108,22 @@ static void stream_join(struct stream_token *stream)
 static void *stream_watch(void *opaque)
 {
     struct stream_token *stream = opaque;
+    uint64_t fulfilled = 0;
     for (;;) {
         uint32_t epoch;
         if (wc_bridge_stream_epoch(stream->lease, &epoch)) break;
         /* Capture the epoch before this final local check. A concurrent last
          * fd close kicks the retained native waiter, including before park. */
         if (atomic_load_explicit(&stream->stop, memory_order_acquire)) return NULL;
-        int wanted = atomic_load_explicit(&stream->want, memory_order_acquire);
+        uint64_t requested = atomic_load_explicit(&stream->requested, memory_order_acquire);
+        int wanted = requested != fulfilled;
         int state = wc_bridge_stream_watch(stream->lease, epoch, wanted, 3600000);
         if (atomic_load_explicit(&stream->stop, memory_order_acquire)) return NULL;
         if (state < 0) break;
         if (state & 2) { stream_notify(stream); return NULL; }
         if (wanted && (state & 1)) {
-            atomic_store_explicit(&stream->want, 0, memory_order_release);
+            /* A new request racing this completion must remain outstanding. */
+            fulfilled = requested;
             stream_notify(stream);
         }
     }
@@ -129,7 +133,7 @@ static void *stream_watch(void *opaque)
 }
 static void stream_want(struct stream_token *stream)
 {
-    atomic_store_explicit(&stream->want, 1, memory_order_release);
+    atomic_fetch_add_explicit(&stream->requested, 1, memory_order_release);
     wc_bridge_stream_kick(stream->lease);
 }
 static void *stream_pump(void *opaque)
