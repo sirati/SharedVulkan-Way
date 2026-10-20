@@ -3,9 +3,9 @@
 use crate::qemu::Qmp;
 use serde_json::{Value, json};
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -61,16 +61,32 @@ impl PendingOriginal {
     /// launcher configuration. The command must directly execute trusted QEMU,
     /// not a wrapper that substitutes its own executable/arguments. Hotplug and
     /// QMP/backend mutation must remain exclusively under this owner afterwards.
-    /// No external SIGCHLD handler/reaper may reap this owned child.
+    /// No external SIGCHLD handler/reaper may reap this owned child. Entire
+    /// command, environment and any pre_exec callbacks must be immutable trusted
+    /// configuration. This API rejects reserved topology/daemonization options
+    /// and requires a direct canonical ELF, but does not authenticate arbitrary
+    /// code or validate every QEMU option. Ancestors and parent namespace must
+    /// remain protected against other writers throughout launch/enrollment.
     pub unsafe fn launch(
         self,
         mut command: Command,
         qmp_path: &Path,
     ) -> io::Result<LaunchedOriginal> {
-        let executable = std::fs::metadata(command.get_program())?;
-        if !executable.is_file() {
-            return Err(denied("QEMU executable is not a regular file"));
+        validate_command(&command)?;
+        let program = Path::new(command.get_program());
+        if !program.is_absolute() || std::fs::canonicalize(program)? != program {
+            return Err(denied("QEMU must be an absolute canonical executable path"));
         }
+        let mut executable_file = File::open(program)?;
+        let executable = executable_file.metadata()?;
+        let mut magic = [0; 4];
+        executable_file.read_exact(&mut magic)?;
+        if !executable.is_file() || magic != *b"\x7fELF" || executable.mode() & 0o022 != 0 {
+            return Err(denied(
+                "QEMU must be the immutable direct ELF executable, not a wrapper",
+            ));
+        }
+        let qmp_parent = protected_qmp_parent(qmp_path)?;
         // The child's own pre-exec code captures its pidfd and sends the exact
         // object over a private socketpair. No parent-side PID lookup race.
         let mut pair = [-1; 2];
@@ -136,7 +152,65 @@ impl PendingOriginal {
             pidfd,
             executable: (executable.dev(), executable.ino()),
             qmp_path: qmp_path.to_owned(),
+            qmp_parent,
+            _executable: executable_file,
         })
+    }
+}
+fn validate_command(command: &Command) -> io::Result<()> {
+    for argument in command.get_args() {
+        let text = argument
+            .to_str()
+            .ok_or_else(|| denied("non-UTF8 protected QEMU argument"))?;
+        let option = text.trim_start_matches('-').split('=').next().unwrap_or("");
+        if text.starts_with('-')
+            && matches!(
+                option,
+                "qmp"
+                    | "add-fd"
+                    | "device"
+                    | "object"
+                    | "readconfig"
+                    | "writeconfig"
+                    | "config"
+                    | "mon"
+                    | "monitor"
+                    | "daemonize"
+                    | "run-with"
+                    | "runas"
+            )
+        {
+            return Err(denied(
+                "QEMU command overrides protected launch topology or child ownership",
+            ));
+        }
+    }
+    Ok(())
+}
+fn protected_parent(path: &Path) -> io::Result<File> {
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = directory.metadata()?;
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+        return Err(denied(
+            "QMP parent is not a private service-owned directory",
+        ));
+    }
+    Ok(directory)
+}
+fn protected_qmp_parent(path: &Path) -> io::Result<File> {
+    if path.file_name().is_none() {
+        return Err(denied("QMP path has no socket filename"));
+    }
+    let directory = protected_parent(path.parent().ok_or_else(|| denied("QMP parent missing"))?)?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(directory),
+        Err(error) => Err(error),
+        Ok(_) => Err(denied(
+            "QMP endpoint already exists before protected launch",
+        )),
     }
 }
 // Called only in pre_exec. Stack buffers and async-signal-safe syscalls only.
@@ -212,6 +286,8 @@ pub struct LaunchedOriginal {
     pidfd: OwnedFd,
     executable: (u64, u64),
     qmp_path: PathBuf,
+    qmp_parent: File,
+    _executable: File,
 }
 impl Drop for LaunchedOriginal {
     fn drop(&mut self) {
@@ -233,6 +309,16 @@ impl Drop for LaunchedOriginal {
 impl LaunchedOriginal {
     /// Caller waits for its private QMP socket, then enrolls this exact child.
     pub fn enroll(mut self, arena_base: u64) -> io::Result<EnrolledOriginal> {
+        let parent = protected_parent(
+            self.qmp_path
+                .parent()
+                .ok_or_else(|| denied("QMP parent missing"))?,
+        )?;
+        let expected = self.qmp_parent.metadata()?;
+        let actual = parent.metadata()?;
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            return Err(denied("protected QMP parent changed after launch"));
+        }
         let mut qmp = Qmp::connect(&self.qmp_path)?;
         let pid = qmp.peer_pid()?;
         let child = self
@@ -425,5 +511,66 @@ impl EnrolledOriginal {
     }
     pub fn ensure_live(&self) -> io::Result<()> {
         self.owner.ensure_live()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    #[test]
+    fn command_cannot_override_private_topology_or_detach_child() {
+        for argument in [
+            "-qmp",
+            "--qmp=unix:foreign",
+            "-add-fd",
+            "-device",
+            "-object",
+            "-readconfig",
+            "-mon",
+            "-daemonize",
+            "-run-with",
+        ] {
+            let mut command = Command::new("/unused-trusted-qemu");
+            command.arg(argument);
+            assert!(validate_command(&command).is_err(), "{argument}");
+        }
+        let mut command = Command::new("/unused-trusted-qemu");
+        command.args([
+            "-machine",
+            "q35",
+            "-accel",
+            "tcg,thread=single",
+            "-nodefaults",
+        ]);
+        validate_command(&command).unwrap();
+    }
+    #[test]
+    fn existing_endpoint_and_nonprivate_parent_refuse_before_connect() {
+        let name = format!(
+            "wc-qmp-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let endpoint = directory.join("qmp.sock");
+        assert!(protected_qmp_parent(&endpoint).is_ok());
+        std::fs::write(&endpoint, b"foreign endpoint must not be touched").unwrap();
+        assert!(protected_qmp_parent(&endpoint).is_err());
+        assert_eq!(
+            std::fs::read(&endpoint).unwrap(),
+            b"foreign endpoint must not be touched"
+        );
+        std::fs::remove_file(&endpoint).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(protected_qmp_parent(&endpoint).is_err());
+        std::fs::remove_dir(&directory).unwrap();
     }
 }
