@@ -2,8 +2,9 @@
 //! proof of canonical grant ownership. No record is ever released here.
 //!
 //! Unactivated until every original allocator consults these exclusions. The
-//! Unix store is implemented; a Windows protected durable-store adapter is
-//! still required before Windows-side activation. Neither store detects a
+//! Unix and protected Windows NTFS stores are implemented. Windows requires
+//! privileged whole-volume flush authority and refuses unsupported storage.
+//! Neither store detects a
 //! privileged restoration of an older valid filesystem image: canonical
 //! provisioning/recovery must never roll back this state while backing lives.
 use crate::service_control::{Binding, Message, Origin, Payload, Phase};
@@ -454,6 +455,8 @@ impl<'a> Cursor<'a> {
 
 #[cfg(unix)]
 pub mod unix;
+#[cfg(windows)]
+pub mod windows;
 
 #[cfg(test)]
 mod tests {
