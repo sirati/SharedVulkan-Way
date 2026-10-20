@@ -570,6 +570,8 @@ static int run_nv12(bool narrow) {
        .device = dev,
        .queue = queue,
        .queue_family = 0,
+       .src_queue_family = 0,
+       .dst_queue_family = VK_QUEUE_FAMILY_EXTERNAL,
        .memory_properties = &mp,
        .image = image,
        .old_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -581,6 +583,17 @@ static int run_nv12(bool narrow) {
        .x_chroma = VK_CHROMA_LOCATION_MIDPOINT,
        .y_chroma = VK_CHROMA_LOCATION_MIDPOINT};
    struct kk_nv12_fixture_job *job = NULL;
+   CHECK(kk_nv12_fixture_transition_start(&helper_info, VK_IMAGE_LAYOUT_GENERAL,
+                                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                          0, &job));
+   CHECK(kk_nv12_fixture_wait(job, 10000000000ull));
+   CHECK(kk_nv12_fixture_destroy(job));
+   job = NULL;
+   helper_info.old_layout = VK_IMAGE_LAYOUT_GENERAL;
+   helper_info.src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+   helper_info.src_access = 0;
+   helper_info.src_queue_family = VK_QUEUE_FAMILY_EXTERNAL;
+   helper_info.dst_queue_family = 0;
    CHECK(kk_nv12_fixture_start(&helper_info, &job));
    float helper_pixels[64];
    CHECK(kk_nv12_fixture_read(job, 10000000000ull, helper_pixels));

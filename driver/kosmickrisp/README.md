@@ -91,3 +91,12 @@ results to the independently sampled known image in both range cases. This
 helper is separate from production decode, queue synchronization and lifetime
 management. A VideoToolbox fixture must still check actual decoded/copied
 frames with its own oracle and retain each owner until GPU completion.
+For repeated external writes, use `kk_nv12_fixture_transition_start` to release
+from the internal queue family to core `VK_QUEUE_FAMILY_EXTERNAL`, transitioning
+to `GENERAL`, then `kk_nv12_fixture_wait` and destroy the completed release job.
+After the Metal producer completes, start a sampling job with an acquire from
+`EXTERNAL` to the internal family and the matching `GENERAL` old layout. The
+helper records the caller's explicit source/destination family indices. Both
+indices may instead be `IGNORED` when no ownership transfer is needed. This
+provider does not advertise `EXT_queue_family_foreign`, so `FOREIGN_EXT` is
+not a substitute for the supported same-device external ownership route.

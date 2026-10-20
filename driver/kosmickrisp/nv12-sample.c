@@ -7,23 +7,25 @@
 #define FUNCTIONS(F)                                                           \
    F(CreateSamplerYcbcrConversion)                                             \
    F(DestroySamplerYcbcrConversion)                                            \
-   F(CreateSampler) F(DestroySampler) F(CreateImageView) F(DestroyImageView)   \
-       F(CreateBuffer) F(DestroyBuffer) F(GetBufferMemoryRequirements)         \
-           F(AllocateMemory) F(FreeMemory) F(BindBufferMemory) F(MapMemory)    \
-               F(UnmapMemory) F(CreateDescriptorSetLayout) F(                  \
-                   DestroyDescriptorSetLayout) F(CreatePipelineLayout)         \
-                   F(DestroyPipelineLayout) F(CreateShaderModule) F(           \
-                       DestroyShaderModule) F(CreateComputePipelines)          \
-                       F(DestroyPipeline) F(CreateDescriptorPool) F(           \
-                           DestroyDescriptorPool) F(AllocateDescriptorSets)    \
-                           F(UpdateDescriptorSets) F(CreateCommandPool) F(     \
-                               DestroyCommandPool) F(AllocateCommandBuffers)   \
-                               F(BeginCommandBuffer) F(CmdPipelineBarrier)     \
-                                   F(CmdBindPipeline) F(CmdBindDescriptorSets) \
-                                       F(CmdDispatch) F(EndCommandBuffer) F(   \
-                                           CreateFence) F(DestroyFence)        \
-                                           F(QueueSubmit) F(WaitForFences) F(  \
-                                               GetFenceStatus)                 \
+   F(CreateSampler)                                                            \
+   F(DestroySampler)                                                           \
+   F(CreateImageView)                                                          \
+   F(DestroyImageView) F(CreateBuffer) F(DestroyBuffer)                        \
+       F(GetBufferMemoryRequirements) F(AllocateMemory) F(FreeMemory)          \
+           F(BindBufferMemory) F(MapMemory) F(UnmapMemory)                     \
+               F(CreateDescriptorSetLayout) F(DestroyDescriptorSetLayout) F(   \
+                   CreatePipelineLayout) F(DestroyPipelineLayout)              \
+                   F(CreateShaderModule) F(DestroyShaderModule) F(             \
+                       CreateComputePipelines) F(DestroyPipeline)              \
+                       F(CreateDescriptorPool) F(DestroyDescriptorPool) F(     \
+                           AllocateDescriptorSets) F(UpdateDescriptorSets)     \
+                           F(CreateCommandPool) F(DestroyCommandPool)          \
+                               F(AllocateCommandBuffers) F(BeginCommandBuffer) \
+                                   F(CmdPipelineBarrier) F(CmdBindPipeline) F( \
+                                       CmdBindDescriptorSets) F(CmdDispatch)   \
+                                       F(EndCommandBuffer) F(CreateFence) F(   \
+                                           DestroyFence) F(QueueSubmit)        \
+                                           F(WaitForFences) F(GetFenceStatus)  \
                                                F(InvalidateMappedMemoryRanges)
 struct kk_nv12_fixture_job {
    VkDevice device;
@@ -80,14 +82,13 @@ static void cleanup(struct kk_nv12_fixture_job *j) {
       if (result != VK_SUCCESS)                                                \
          goto fail;                                                            \
    } while (0)
-VkResult kk_nv12_fixture_start(const struct kk_nv12_fixture_info *i,
-                               struct kk_nv12_fixture_job **out_job) {
+static VkResult make_job(const struct kk_nv12_fixture_info *i,
+                         struct kk_nv12_fixture_job **out_job) {
    if (!out_job)
       return VK_ERROR_INITIALIZATION_FAILED;
    *out_job = NULL;
    if (!i || !i->get_device_proc_addr || !i->device || !i->queue || !i->image ||
-       !i->memory_properties || !i->src_stage ||
-       i->memory_properties->memoryTypeCount > VK_MAX_MEMORY_TYPES)
+       !i->src_stage)
       return VK_ERROR_INITIALIZATION_FAILED;
    struct kk_nv12_fixture_job *j = calloc(1, sizeof(*j));
    if (!j)
@@ -101,7 +102,21 @@ VkResult kk_nv12_fixture_start(const struct kk_nv12_fixture_info *i,
    }
    FUNCTIONS(LOAD)
 #undef LOAD
-   VkResult result;
+   *out_job = j;
+   return VK_SUCCESS;
+}
+VkResult kk_nv12_fixture_start(const struct kk_nv12_fixture_info *i,
+                               struct kk_nv12_fixture_job **out_job) {
+   if (!out_job)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   *out_job = NULL;
+   if (!i || !i->memory_properties ||
+       i->memory_properties->memoryTypeCount > VK_MAX_MEMORY_TYPES)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   struct kk_nv12_fixture_job *j;
+   VkResult result = make_job(i, &j);
+   if (result != VK_SUCCESS)
+      return result;
    TRY(j->CreateSamplerYcbcrConversion(
        j->device,
        &(VkSamplerYcbcrConversionCreateInfo){
@@ -268,8 +283,8 @@ VkResult kk_nv12_fixture_start(const struct kk_nv12_fixture_info *i,
        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
        .oldLayout = i->old_layout,
        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .srcQueueFamilyIndex = i->src_queue_family,
+       .dstQueueFamilyIndex = i->dst_queue_family,
        .image = i->image,
        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
    j->CmdPipelineBarrier(cmd, i->src_stage,
@@ -305,12 +320,76 @@ fail:
    cleanup(j);
    return result;
 }
+VkResult kk_nv12_fixture_transition_start(
+    const struct kk_nv12_fixture_info *i, VkImageLayout new_layout,
+    VkPipelineStageFlags dst_stage, VkAccessFlags dst_access,
+    struct kk_nv12_fixture_job **out_job) {
+   if (!out_job)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   *out_job = NULL;
+   if (!dst_stage)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   struct kk_nv12_fixture_job *j;
+   VkResult result = make_job(i, &j);
+   if (result != VK_SUCCESS)
+      return result;
+   TRY(j->CreateCommandPool(
+       j->device,
+       &(VkCommandPoolCreateInfo){
+           .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+           .queueFamilyIndex = i->queue_family},
+       NULL, &j->command_pool));
+   VkCommandBuffer cmd;
+   TRY(j->AllocateCommandBuffers(
+       j->device,
+       &(VkCommandBufferAllocateInfo){
+           .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+           .commandPool = j->command_pool,
+           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+           .commandBufferCount = 1},
+       &cmd));
+   TRY(j->BeginCommandBuffer(
+       cmd, &(VkCommandBufferBeginInfo){
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
+   VkImageMemoryBarrier barrier = {
+       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+       .srcAccessMask = i->src_access,
+       .dstAccessMask = dst_access,
+       .oldLayout = i->old_layout,
+       .newLayout = new_layout,
+       .srcQueueFamilyIndex = i->src_queue_family,
+       .dstQueueFamilyIndex = i->dst_queue_family,
+       .image = i->image,
+       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+   j->CmdPipelineBarrier(cmd, i->src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1,
+                         &barrier);
+   TRY(j->EndCommandBuffer(cmd));
+   TRY(j->CreateFence(
+       j->device,
+       &(VkFenceCreateInfo){.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}, NULL,
+       &j->fence));
+   result =
+       j->QueueSubmit(i->queue, 1,
+                      &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                      .commandBufferCount = 1,
+                                      .pCommandBuffers = &cmd},
+                      j->fence);
+   *out_job = j;
+   return result;
+fail:
+   cleanup(j);
+   return result;
+}
+VkResult kk_nv12_fixture_wait(struct kk_nv12_fixture_job *j, uint64_t timeout) {
+   if (!j)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   return j->WaitForFences(j->device, 1, &j->fence, VK_TRUE, timeout);
+}
 VkResult kk_nv12_fixture_read(struct kk_nv12_fixture_job *j, uint64_t timeout,
                               float rgba[64]) {
-   if (!j || !rgba)
+   if (!j || !rgba || !j->mapped)
       return VK_ERROR_INITIALIZATION_FAILED;
-   VkResult result =
-       j->WaitForFences(j->device, 1, &j->fence, VK_TRUE, timeout);
+   VkResult result = kk_nv12_fixture_wait(j, timeout);
    if (result != VK_SUCCESS)
       return result;
    result = j->InvalidateMappedMemoryRanges(
