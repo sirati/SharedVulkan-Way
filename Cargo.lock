@@ -1749,6 +1749,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-cygwin-link"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sv-proto",
+ "sv-transport",
+ "wc-broker",
+ "wc-handle",
+]
+
+[[package]]
 name = "wc-desk"
 version = "0.1.0"
 dependencies = [

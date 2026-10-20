@@ -1,0 +1,20 @@
+[package]
+name = "wc-cygwin-link"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sv-transport = { workspace = true }
+sv-proto = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+wc-broker = { workspace = true }
+wc-handle = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
