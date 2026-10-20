@@ -227,7 +227,14 @@ mod host {
         let control = Arc::new(Control::create(
             region,
             geometry,
-            ProtocolIds::new(1, sv_proto::PROTOCOL_HASH),
+            ProtocolIds::new(
+                if header.is_some() {
+                    wc_handle::bar_lease::CONTROL_WIRE_VERSION
+                } else {
+                    1
+                },
+                sv_proto::PROTOCOL_HASH,
+            ),
             1,
         )?);
         // SAFETY: eventfd returns a fresh owned fd, checked before ownership.
@@ -247,7 +254,7 @@ mod host {
         if let Some((lease, value)) = &header {
             // SAFETY: initialization and doorbell attachment completed before publication.
             unsafe {
-                wc_handle::ivshmem::write_into(lease.0.base_ptr(), value);
+                wc_handle::ivshmem::write_leases_into(lease.0.base_ptr(), value);
             }
         }
         println!(

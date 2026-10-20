@@ -72,7 +72,7 @@ mod windows {
         for (offset, byte) in bytes.iter_mut().enumerate().skip(8) {
             *byte = unsafe { (base as *const u8).add(offset).read_volatile() };
         }
-        Header::decode(&bytes).map_err(|e| e.to_string())
+        Header::decode_for_leases(&bytes).map_err(|e| e.to_string())
     }
     impl Connection {
         fn valid(&self) -> bool {
@@ -138,7 +138,14 @@ mod windows {
                 owner.clone(),
             )
         });
-        let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
+        let ids = ProtocolIds::new(
+            if header.is_some() {
+                wc_handle::bar_lease::CONTROL_WIRE_VERSION
+            } else {
+                1
+            },
+            sv_proto::PROTOCOL_HASH,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         let control = loop {
             match Control::attach(Arc::clone(&region), ids) {
@@ -547,7 +554,9 @@ mod windows {
             return -1;
         }
         // Legacy ArenaSlice allocation must never overlap a lease directory.
-        if c.directory.is_some() { return -1; }
+        if c.directory.is_some() {
+            return -1;
+        }
         let Ok(mut pool) = c.pool.lock() else {
             return -1;
         };

@@ -202,3 +202,9 @@ dispatch. These new paths require their own runtime acceptance. The earlier
 12-frame evidence above remains the validation boundary for the previous
 bounded implementation. Clipboard stream descriptors are not implemented by
 this API stage.
+
+Allocation directories require header format 3 and control wire version 2.
+The old registry-only wire version remains 1, and ordinary ivshmem publishers
+retain format 2. A retained format-2 client must reject format 3 before it can
+claim rings or write pool offset zero. New lease clients require format 3
+explicitly. This prevents an older allocator from overwriting directory bytes.
