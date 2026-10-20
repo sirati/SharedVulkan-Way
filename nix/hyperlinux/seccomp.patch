@@ -274,40 +274,46 @@ index f64c524..e916196 100644
              nready = -1;
              errno = EINTR;
 diff --git a/src/syscall_proc.c b/src/syscall_proc.c
-index 526ba67..676ec22 100644
+index 526ba67..a6583c9 100644
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -997,8 +997,9 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+@@ -997,9 +997,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
      }
  
      while (running) {
 +        if (thread_seccomp_terminated()) { exit_code=128+LINUX_SIGSYS; break; }
          /* Check if another thread called exit_group */
 -        if (atomic_load(&exit_group_requested)) {
+-            exit_code = atomic_load(&exit_group_code);
 +        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
-             exit_code = atomic_load(&exit_group_code);
++            exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
              break;
          }
-@@ -1021,8 +1022,9 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+ 
+@@ -1021,9 +1022,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
          if (watchdog)
              alarm(0);
  
 +        if (thread_seccomp_terminated()) { exit_code=128+LINUX_SIGSYS; break; }
          /* Re-check exit_group after waking from hv_vcpu_run */
 -        if (atomic_load(&exit_group_requested)) {
+-            exit_code = atomic_load(&exit_group_code);
 +        if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
-             exit_code = atomic_load(&exit_group_code);
++            exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
              break;
          }
-@@ -1807,7 +1809,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+ 
+@@ -1807,8 +1809,8 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
                   * loop back so the timeout check fires. */
                  continue;
              }
 -            if (atomic_load(&exit_group_requested)) {
+-                exit_code = atomic_load(&exit_group_code);
 +            if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated())) {
-                 exit_code = atomic_load(&exit_group_code);
++                exit_code = thread_seccomp_terminated() ? 128+LINUX_SIGSYS : atomic_load(&exit_group_code);
                  break;
              }
+ 
 @@ -1883,5 +1885,6 @@ int vcpu_run_loop(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
          alarm(0);
      }
