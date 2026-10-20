@@ -42,6 +42,10 @@ pub const QUEUE_FAMILY_FOREIGN: u32 = !2;
 pub const ASPECT_COLOR: u32 = 0x1;
 /// `VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT`.
 pub const ASPECT_MEMORY_PLANE_0: u32 = 0x80;
+pub const ASPECT_MEMORY_PLANE_1: u32 = 0x100;
+pub const ASPECT_PLANE_0: u32 = 0x10;
+pub const ASPECT_PLANE_1: u32 = 0x20;
+pub const FORMAT_NV12: i32 = 1_000_156_003;
 /// `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT`.
 pub const STAGE_ALL_COMMANDS: u32 = 0x10000;
 
@@ -324,6 +328,20 @@ pub struct DmabufImage {
     /// Made with `VkExternalMemoryImageCreateInfo{DMA_BUF}`: bound to a
     /// shared section on the GPU side.
     pub external: bool,
+    /// Exact NV12 descriptor, checked against authenticated storage at bind.
+    pub nv12_planes: Option<[(u64, u64); 2]>,
+    pub nv12: bool,
+    /// Dedicated memory successfully imported from an authenticated token.
+    pub imported_memory: Option<u64>,
+}
+
+impl DmabufImage {
+    /// Bind only the dedicated allocation that successfully imported this token.
+    pub fn allows_imported_bind(&self, memory: u64, offset: u64, size: u64) -> bool {
+        self.nv12_planes.is_some_and(|planes| {
+            offset == 0 && self.imported_memory == Some(memory) && nv12_layout_fits(planes, size)
+        })
+    }
 }
 
 /// What the app side remembers about a semaphore created exportable as a
@@ -446,9 +464,34 @@ pub fn rewrite_families(src: &mut u32, dst: &mut u32) {
 /// Make a `VkImageCreateInfo` one the GPU side can create: a modifier image
 /// becomes LINEAR, a dma-buf image becomes a host-allocation one. `Ok(None)`
 /// when this path has nothing to do with the image.
-pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option<DmabufImage>, i32> {
+pub fn rewrite_image_create_info(
+    ci: &mut p::VkImageCreateInfo,
+) -> Result<Option<DmabufImage>, i32> {
     let mut img = DmabufImage::default();
     let mut ours = false;
+    img.nv12 = ci.format.0 == FORMAT_NV12;
+    if img.nv12
+        && (ci.extent.width != 64
+            || ci.extent.height != 64
+            || ci.extent.depth != 1
+            || ci.mip_levels != 1
+            || ci.array_layers != 1
+            || ci.samples.0 != 1
+            || ci.image_type.0 != 1
+            || ci.flags.0 & 0x200 != 0)
+    {
+        return Err(VK_ERROR_FORMAT_NOT_SUPPORTED);
+    }
+    if img.nv12 {
+        let modifiers = ci.p_next.iter().filter(|l| matches!(l,
+            p::PNextLink::VkImageDrmFormatModifierListCreateInfoEXT(_)
+                | p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(_))).count();
+        let external = ci.p_next.iter().filter(|l| matches!(l,
+            p::PNextLink::VkExternalMemoryImageCreateInfo(_))).count();
+        if modifiers > 1 || external > 1 {
+            return Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT);
+        }
+    }
     if ci.tiling.0 == TILING_DRM_FORMAT_MODIFIER {
         ours = true;
         let mut linear = false;
@@ -458,11 +501,28 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
                     linear |= x.p_drm_format_modifiers.contains(&DRM_FORMAT_MOD_LINEAR);
                 }
                 p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(x) => {
-                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR || x.p_plane_layouts.len() != 1 {
+                    let count = if img.nv12 { 2 } else { 1 };
+                    if x.drm_format_modifier != DRM_FORMAT_MOD_LINEAR
+                        || x.drm_format_modifier_plane_count != count
+                        || x.p_plane_layouts.len() != count as usize
+                        || img.explicit.is_some()
+                        || img.nv12_planes.is_some()
+                    {
                         return Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT);
                     }
-                    let pl = &x.p_plane_layouts[0];
-                    img.explicit = Some((pl.offset, pl.row_pitch));
+                    if img.nv12 {
+                        let planes = std::array::from_fn(|i| {
+                            let p = &x.p_plane_layouts[i];
+                            (p.offset, p.row_pitch)
+                        });
+                        if !nv12_layout_fits(planes, u64::MAX) {
+                            return Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT);
+                        }
+                        img.nv12_planes = Some(planes);
+                    } else {
+                        let pl = &x.p_plane_layouts[0];
+                        img.explicit = Some((pl.offset, pl.row_pitch));
+                    }
                     linear = true;
                 }
                 _ => {}
@@ -499,6 +559,29 @@ pub fn rewrite_image_create_info(ci: &mut p::VkImageCreateInfo) -> Result<Option
         ci.p_next.retain(|l| !matches!(l, p::PNextLink::VkExternalMemoryImageCreateInfo(x) if x.handle_types.0 != HOST_ALLOCATION));
     }
     Ok(ours.then_some(img))
+}
+
+/// Check complete 64x64 Y and 32x32 interleaved UV row spans without overflow.
+/// Offsets/pitches must also match the original bound Picture exactly.
+pub fn nv12_layout_fits(planes: [(u64, u64); 2], size: u64) -> bool {
+    let mut ends = [0; 2];
+    for (i, (offset, pitch)) in planes.iter().copied().enumerate() {
+        if pitch < 64 {
+            return false;
+        }
+        let rows = if i == 0 { 64 } else { 32 };
+        let Some(end) = pitch
+            .checked_mul(rows)
+            .and_then(|span| offset.checked_add(span))
+        else {
+            return false;
+        };
+        if end > size {
+            return false;
+        }
+        ends[i] = end;
+    }
+    ends[0] <= planes[1].0 || ends[1] <= planes[0].0
 }
 
 /// What [`rewrite_image_format_info`] found.
@@ -660,7 +743,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierPropertiesEXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: if format.0 == FORMAT_NV12 { 2 } else { 1 },
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags(linear),
                             };
                         }
@@ -677,7 +760,7 @@ pub unsafe extern "system" fn get_physical_device_format_properties2(
                         if n == 1 {
                             *(*l).p_drm_format_modifier_properties = sv_icd_entry::VkDrmFormatModifierProperties2EXT {
                                 drm_format_modifier: DRM_FORMAT_MOD_LINEAR,
-                                drm_format_modifier_plane_count: 1,
+                                drm_format_modifier_plane_count: if format.0 == FORMAT_NV12 { 2 } else { 1 },
                                 drm_format_modifier_tiling_features: sv_icd_entry::VkFormatFeatureFlags2(linear2),
                             };
                         }
@@ -774,6 +857,86 @@ mod tests {
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT));
         let mut ci = image(TILING_DRM_FORMAT_MODIFIER, vec![list(&[7])]);
         assert_eq!(rewrite_image_create_info(&mut ci), Err(VK_ERROR_FORMAT_NOT_SUPPORTED));
+    }
+
+    fn nv12_descriptor(planes: [(u64, u64); 2]) -> p::VkImageCreateInfo {
+        let mut ex = p::VkImageDrmFormatModifierExplicitCreateInfoEXT::default();
+        ex.drm_format_modifier_plane_count = 2;
+        ex.p_plane_layouts = planes
+            .into_iter()
+            .map(|(offset, row_pitch)| {
+                let mut p = p::VkSubresourceLayout::default();
+                p.offset = offset;
+                p.row_pitch = row_pitch;
+                p
+            })
+            .collect();
+        let mut ci = image(
+            TILING_DRM_FORMAT_MODIFIER,
+            vec![
+                p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(Box::new(ex)),
+                external(DMA_BUF),
+            ],
+        );
+        ci.format = p::VkFormat(FORMAT_NV12);
+        ci.image_type = p::VkImageType(1);
+        ci.extent.width = 64;
+        ci.extent.height = 64;
+        ci.extent.depth = 1;
+        ci.mip_levels = 1;
+        ci.array_layers = 1;
+        ci.samples = p::VkSampleCountFlagBits(1);
+        ci
+    }
+
+    #[test]
+    fn nv12_retains_both_original_descriptor_planes_until_authenticated_bind() {
+        let planes = [(128, 128), (8320, 128)];
+        let mut ci = nv12_descriptor(planes);
+        let img = rewrite_image_create_info(&mut ci).unwrap().unwrap();
+        assert_eq!(img.nv12_planes, Some(planes));
+        assert_eq!(img.explicit, None);
+        assert_eq!(img.imported_memory, None);
+        assert!(img.nv12 && img.external);
+        assert_eq!(ci.tiling.0, TILING_LINEAR);
+        assert!(nv12_layout_fits(planes, 12416));
+        assert!(!nv12_layout_fits(planes, 12415));
+    }
+
+    #[test]
+    fn nv12_bind_requires_the_authenticated_dedicated_memory() {
+        let mut img = rewrite_image_create_info(&mut nv12_descriptor([(0, 64), (4096, 64)]))
+            .unwrap().unwrap();
+        assert!(!img.allows_imported_bind(17, 0, 6144));
+        img.imported_memory = Some(17);
+        assert!(img.allows_imported_bind(17, 0, 6144));
+        assert!(!img.allows_imported_bind(18, 0, 6144));
+        assert!(!img.allows_imported_bind(17, 1, 6144));
+        assert!(!img.allows_imported_bind(17, 0, 6143));
+    }
+
+    #[test]
+    fn nv12_rejects_overlap_short_rows_overflow_and_disjoint() {
+        for planes in [
+            [(0, 64), (4095, 64)],
+            [(0, 63), (4096, 64)],
+            [(0, u64::MAX), (4096, 64)],
+            [(u64::MAX - 1, 64), (0, 64)],
+        ] {
+            assert!(!nv12_layout_fits(planes, u64::MAX));
+            assert!(rewrite_image_create_info(&mut nv12_descriptor(planes)).is_err());
+        }
+        let mut ci = nv12_descriptor([(0, 64), (4096, 64)]);
+        ci.flags.0 |= 0x200;
+        assert!(rewrite_image_create_info(&mut ci).is_err());
+        let mut ci = nv12_descriptor([(0, 64), (4096, 64)]);
+        ci.extent.width = 128;
+        assert!(rewrite_image_create_info(&mut ci).is_err());
+        let mut ci = nv12_descriptor([(0, 64), (4096, 64)]);
+        if let p::PNextLink::VkImageDrmFormatModifierExplicitCreateInfoEXT(ex) = &mut ci.p_next[0] {
+            ex.drm_format_modifier_plane_count = 1;
+        }
+        assert!(rewrite_image_create_info(&mut ci).is_err());
     }
 
     #[test]

@@ -2167,6 +2167,73 @@ impl Icd for SharedVulkan {
         Ok(reply)
     }
 
+    fn bind_image_memory(
+        &self,
+        args: p::VkBindImageMemoryArgs,
+    ) -> IcdResult<p::VkBindImageMemoryReply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory"));
+        };
+        if !self.nv12_bind_allowed(args.image.0, args.memory.0, args.memory_offset) {
+            return Ok(p::VkBindImageMemoryReply {
+                result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE),
+            });
+        }
+        let (device, image, memory) = (args.device, args.image, args.memory);
+        let reply = forward::bind_image_memory(t, args)?;
+        if reply.result.0 == 0 && !self.nv12_bound_layout_matches(device, image, memory)? {
+            return Ok(p::VkBindImageMemoryReply {
+                result: p::VkResult(
+                    crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT,
+                ),
+            });
+        }
+        Ok(reply)
+    }
+
+    fn bind_image_memory2(
+        &self,
+        args: p::VkBindImageMemory2Args,
+    ) -> IcdResult<p::VkBindImageMemory2Reply> {
+        let Some(t) = self.wire() else {
+            return Err(LowerError::NotImplemented("vkBindImageMemory2"));
+        };
+        if args.bind_info_count as usize != args.p_bind_infos.len()
+            || args.p_bind_infos.iter().any(|b| {
+                !self.nv12_bind_allowed(b.image.0, b.memory.0, b.memory_offset)
+                    || (self
+                        .state()
+                        .dmabuf_images
+                        .get(&b.image.0)
+                        .is_some_and(|i| i.nv12)
+                        && !b.p_next.is_empty())
+            })
+        {
+            return Ok(p::VkBindImageMemory2Reply {
+                result: p::VkResult(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE),
+            });
+        }
+        let checks = args
+            .p_bind_infos
+            .iter()
+            .map(|b| (b.image, b.memory))
+            .collect::<Vec<_>>();
+        let device = args.device;
+        let reply = forward::bind_image_memory2(t, args)?;
+        if reply.result.0 == 0 {
+            for (image, memory) in checks {
+                if !self.nv12_bound_layout_matches(device, image, memory)? {
+                    return Ok(p::VkBindImageMemory2Reply {
+                        result: p::VkResult(
+                            crate::dmabuf::VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(reply)
+    }
+
     fn destroy_image(&self, args: p::VkDestroyImageArgs) -> IcdResult<()> {
         let Some(t) = self.wire() else {
             return Err(LowerError::NotImplemented("vkDestroyImage"));
@@ -2455,23 +2522,94 @@ fn limits(c: &sv_icd_entry::VkPhysicalDeviceLimits) -> p::VkPhysicalDeviceLimits
 }
 
 impl SharedVulkan {
-    /// `MEMORY_PLANE_0` of a LINEAR modifier image is the colour aspect to the
-    /// driver behind the GPU side, which never saw a modifier (§104).
-    /// (The aspect is valid only for a modifier image, so the image is not
-    /// looked up: whichever image names it was made through this path.)
-    fn plane_to_colour(&self, _image: u64, aspect: &mut p::VkImageAspectFlags) {
-        if aspect.0 == crate::dmabuf::ASPECT_MEMORY_PLANE_0 {
-            aspect.0 = crate::dmabuf::ASPECT_COLOR;
+    /// Translate modifier memory planes to the exact joined image planes.
+    fn plane_to_colour(&self, image: u64, aspect: &mut p::VkImageAspectFlags) {
+        let nv12 = self
+            .state()
+            .dmabuf_images
+            .get(&image)
+            .is_some_and(|i| i.nv12);
+        *aspect = p::VkImageAspectFlags(match aspect.0 {
+            crate::dmabuf::ASPECT_MEMORY_PLANE_0 if nv12 => crate::dmabuf::ASPECT_PLANE_0,
+            crate::dmabuf::ASPECT_MEMORY_PLANE_1 if nv12 => crate::dmabuf::ASPECT_PLANE_1,
+            crate::dmabuf::ASPECT_MEMORY_PLANE_0 => crate::dmabuf::ASPECT_COLOR,
+            a => a,
+        });
+    }
+
+    fn nv12_bind_allowed(&self, image: u64, memory: u64, offset: u64) -> bool {
+        let state = self.state();
+        let Some(img) = state.dmabuf_images.get(&image) else {
+            return true;
+        };
+        if img.nv12_planes.is_none() { return true; }
+        state.shared_memories.get(&memory).is_some_and(|m| {
+            img.allows_imported_bind(memory, offset, m.token.size)
+        })
+    }
+
+    /// The server has authenticated the dedicated token and imported its original
+    /// Picture. Only a bound layout is authoritative for this imported storage.
+    fn nv12_bound_layout_matches(
+        &self,
+        device: p::VkDevice,
+        image: p::VkImage,
+        memory: p::VkDeviceMemory,
+    ) -> IcdResult<bool> {
+        let expected = self
+            .state()
+            .dmabuf_images
+            .get(&image.0)
+            .and_then(|i| i.nv12_planes);
+        let Some(expected) = expected else {
+            return Ok(true);
+        };
+        if !self.nv12_bind_allowed(image.0, memory.0, 0) {
+            return Ok(false);
         }
+        let Some(t) = self.wire() else {
+            return Ok(false);
+        };
+        for (index, expected) in expected.into_iter().enumerate() {
+            let mut sub = p::VkImageSubresource::default();
+            sub.aspect_mask = p::VkImageAspectFlags(if index == 0 {
+                crate::dmabuf::ASPECT_PLANE_0
+            } else {
+                crate::dmabuf::ASPECT_PLANE_1
+            });
+            let got = forward::get_image_subresource_layout(
+                t,
+                p::VkGetImageSubresourceLayoutArgs {
+                    device,
+                    image,
+                    p_subresource: Some(Box::new(sub)),
+                    p_layout: Some(Box::default()),
+                },
+            )?;
+            if got.p_layout.map(|l| (l.offset, l.row_pitch)) != Some(expected) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// `vkAllocateMemory` on the dma-buf path (§104): an import of a token, or
     /// an exportable allocation. `None` when the allocation is neither, and
     /// goes the ordinary way.
-    fn allocate_shared(&self, info: &p::VkMemoryAllocateInfo) -> IcdResult<Option<p::VkAllocateMemoryReply>> {
-        let refused = |r: i32| Ok(Some(p::VkAllocateMemoryReply { result: p::VkResult(r), p_memory: None }));
+    fn allocate_shared(
+        &self,
+        info: &p::VkMemoryAllocateInfo,
+    ) -> IcdResult<Option<p::VkAllocateMemoryReply>> {
+        let refused = |r: i32| {
+            Ok(Some(p::VkAllocateMemoryReply {
+                result: p::VkResult(r),
+                p_memory: None,
+            }))
+        };
         let import = info.p_next.iter().find_map(|l| match l {
-            p::PNextLink::VkImportMemoryFdInfoKHR(x) if x.handle_type.0 != 0 => Some((x.handle_type.0 as u32, x.fd)),
+            p::PNextLink::VkImportMemoryFdInfoKHR(x) if x.handle_type.0 != 0 => {
+                Some((x.handle_type.0 as u32, x.fd))
+            }
             _ => None,
         });
         let export = info.p_next.iter().any(|l| {
@@ -2488,6 +2626,27 @@ impl SharedVulkan {
                 _ => None,
             })
             .unwrap_or(0);
+        if self
+            .state()
+            .dmabuf_images
+            .get(&image)
+            .is_some_and(|i| i.nv12)
+            && (info
+                .p_next
+                .iter()
+                .filter(|l| matches!(l, p::PNextLink::VkImportMemoryFdInfoKHR(_)))
+                .count()
+                > 1
+                || info
+                    .p_next
+                    .iter()
+                    .filter(|l| matches!(l, p::PNextLink::VkMemoryDedicatedAllocateInfo(_)))
+                    .count()
+                    != 1
+                || (import.is_some() && export))
+        {
+            return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
+        }
         let Some(t) = self.ring_transport() else {
             return refused(crate::dmabuf::VK_ERROR_OUT_OF_DEVICE_MEMORY);
         };
@@ -2517,6 +2676,17 @@ impl SharedVulkan {
                     ));
                     return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
                 }
+                if let Some(img) = self.state().dmabuf_images.get(&image).copied() {
+                    if img.nv12
+                        && (img.imported_memory.is_some()
+                            || !img.external
+                            || !img
+                                .nv12_planes
+                                .is_some_and(|p| crate::dmabuf::nv12_layout_fits(p, tok.size)))
+                    {
+                        return refused(crate::dmabuf::VK_ERROR_INVALID_EXTERNAL_HANDLE);
+                    }
+                }
                 let r = t.import_shared(id, tok.size, image, &tok)?;
                 if r != 0 {
                     return refused(r);
@@ -2524,6 +2694,11 @@ impl SharedVulkan {
                 // The specification hands the descriptor to the implementation
                 // on a successful import; it is kept, as the token file a
                 // re-export dups and whose sync page a user of it reads.
+                if let Some(img) = self.state().dmabuf_images.get_mut(&image) {
+                    if img.nv12 {
+                        img.imported_memory = Some(id);
+                    }
+                }
                 let file = crate::dmabuf::adopt(fd, &tok);
                 (tok, file)
             }
@@ -2544,10 +2719,22 @@ impl SharedVulkan {
         let size = token.size;
         {
             let mut s = self.state();
-            s.memories.insert(id, Memory { memory_type_index: 0, allocation: None, size, mapped: false });
-            s.shared_memories.insert(id, crate::dmabuf::SharedMem { token, file });
+            s.memories.insert(
+                id,
+                Memory {
+                    memory_type_index: 0,
+                    allocation: None,
+                    size,
+                    mapped: false,
+                },
+            );
+            s.shared_memories
+                .insert(id, crate::dmabuf::SharedMem { token, file });
         }
-        Ok(Some(p::VkAllocateMemoryReply { result: p::VkResult(0), p_memory: Some(p::VkDeviceMemory(id)) }))
+        Ok(Some(p::VkAllocateMemoryReply {
+            result: p::VkResult(0),
+            p_memory: Some(p::VkDeviceMemory(id)),
+        }))
     }
 
     /// The session's fence record (§104.11), asked of the GPU side once.
