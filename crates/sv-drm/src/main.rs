@@ -3,7 +3,7 @@
 //! ```text
 //! sv-drm serve [--minor 128] [--devname dri/renderD128] [--owner UID] [--group GID]
 //!              [--mode 0660] [--state FILE]                          (root)
-//! sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] -- CMD ARGS...
+//! sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] [--hide NODE]... -- CMD ARGS...
 //! ```
 
 #[cfg(target_os = "linux")]
@@ -32,7 +32,7 @@ mod linux {
 
     const USAGE: &str = "usage:
   sv-drm serve [--minor 128] [--devname dri/renderD<minor>] [--owner UID] [--group GID] [--mode 0660] [--state FILE]
-  sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] -- CMD [ARGS...]";
+  sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] [--hide NODE]... -- CMD [ARGS...]";
 
     pub fn main() -> i32 {
         let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -303,14 +303,16 @@ mod linux {
     // ---- ns ----
 
     fn ns_main(args: Vec<OsString>) -> Result<i32, String> {
-        let (fl, cmd) = flags(args, &["--state", "--dev", "--minor", "--test-node"])?;
+        let (fl, cmd) = flags(args, &["--state", "--dev", "--minor", "--test-node", "--hide"])?;
         let (mut dev, mut minor, mut test_node, mut state) = (None, None, None, None);
+        let mut hide = Vec::new();
         for (k, v) in fl {
             match k.as_str() {
                 "--dev" => dev = Some(ns::parse_dev(&v).ok_or_else(|| format!("--dev {v}: not MAJ:MIN"))?),
                 "--minor" => minor = Some(num::<u32>(&k, &v)?),
                 "--test-node" => test_node = Some(PathBuf::from(v)),
                 "--state" => state = Some(PathBuf::from(v)),
+                "--hide" => hide.push(PathBuf::from(v)),
                 _ => unreachable!(),
             }
         }
@@ -331,7 +333,7 @@ mod linux {
         if cmd.is_empty() {
             return Err(format!("ns needs a command after --\n{USAGE}"));
         }
-        let cfg = NsConfig { dev, minor, test_node, cmd };
+        let cfg = NsConfig { dev, minor, test_node, hide, cmd };
         let e = ns::run(&cfg);
         eprintln!("sv-drm: ns: {e}");
         Ok(127)

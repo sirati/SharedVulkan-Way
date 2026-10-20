@@ -38,6 +38,10 @@ pub struct NsConfig {
     /// Testing only: bind this (existing) char device as `/dev/dri/renderD<minor>`
     /// over a tmpfs on `/dev/dri`.
     pub test_node: Option<PathBuf>,
+    /// Testing only: device nodes to hide, each covered with /dev/null, so
+    /// that libdrm and the drivers see no device behind them (a
+    /// workstation's other GPUs, waycompose-design.md §112).
+    pub hide: Vec<PathBuf>,
     pub cmd: Vec<OsString>,
 }
 
@@ -160,6 +164,14 @@ fn overlay(dir: &str, plan: &[Entry]) -> io::Result<()> {
     mount(None, dir, None, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | TMPFS_FLAGS, None)
 }
 
+/// `--hide`: /dev/null bound over a device node. A bind mount of a node that
+/// lives on the host's devtmpfs keeps working inside the user namespace,
+/// unlike a node bound into a tmpfs made there (see the module header).
+fn hide(node: &Path) -> io::Result<()> {
+    let s = node.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hide path"))?;
+    mount(Some("/dev/null"), s, None, libc::MS_BIND, None)
+}
+
 /// `--test-node`: a tmpfs on /dev/dri with `node` bound as renderD<minor>.
 fn test_node(node: &Path, minor: u32) -> io::Result<()> {
     let node_s = node.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "test node path"))?;
@@ -203,6 +215,9 @@ pub fn setup(cfg: &NsConfig) -> io::Result<()> {
     overlay(SYS_DEV_CHAR, &plan)?;
     if let Some(n) = &cfg.test_node {
         test_node(n, cfg.minor)?;
+    }
+    for h in &cfg.hide {
+        hide(h)?;
     }
     // 2b: X11's socket directory, ours. In this namespace the host's
     // root-owned /tmp/.X11-unix shows as the overflow uid, and
