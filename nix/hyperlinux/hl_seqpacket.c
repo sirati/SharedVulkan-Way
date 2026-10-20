@@ -138,7 +138,7 @@ ssize_t hl_wc_seqpacket_recv(int fd, struct msghdr *message, int flags, int full
     }
     record_header header; struct stat st;
     if (token != 1 || !count || native.msg_flags & MSG_CTRUNC ||
-        fstat(rights[0], &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 0 || (st.st_mode & 0777) != 0 ||
+        fstat(rights[0], &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 0 || (st.st_mode & 0777) != 0600 ||
         !marker_get(rights[0]) || full_io(rights[0], &header, sizeof(header), 0, 0) < 0 ||
         header.magic != RECORD_MAGIC || header.length > HL_WC_SEQPACKET_MAX ||
         st.st_size != (off_t)(sizeof(header) + header.length)) { errno = EPROTO; goto fail; }

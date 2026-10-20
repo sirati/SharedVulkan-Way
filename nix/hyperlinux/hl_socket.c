@@ -54,7 +54,7 @@ int hl_wc_socket_is_state(int fd) {
     uint64_t magic = 0, contents = 0;
     struct stat st;
     return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == geteuid() &&
-        st.st_nlink == 0 && (st.st_mode & 0777) == 0 && st.st_size == sizeof(shared_option) &&
+        st.st_nlink == 0 && (st.st_mode & 0777) == 0600 && st.st_size == sizeof(shared_option) &&
         pread(fd, &contents, sizeof(contents), 0) == sizeof(contents) && contents == MAGIC &&
         fgetxattr(fd, ATTR, &magic, sizeof(magic), 0, 0) == sizeof(magic) && magic == MAGIC;
 }
@@ -152,14 +152,24 @@ void hl_wc_socket_transfer_end(hl_wc_socket_transfers *t) {
     for (unsigned i = 0; i < t->count; i++) close(t->fds[i]);
 }
 int hl_wc_socket_transfer(int channel, const int *guest, unsigned count,
-    int *native, unsigned *out, hl_wc_socket_transfers *t) {
+    int *native, unsigned *out, hl_wc_socket_transfers *t, int trusted) {
     unsigned n = 0;
     for (unsigned i = 0; i < count; i++) {
-        hl_fd_ref_t ref;
-        if (hl_fd_get(guest[i], &ref) < 0) return -1;
-        int alias = fcntl(ref.host_fd, F_DUPFD_CLOEXEC, 0);
-        int state = alias >= 0 ? export_option(ref.of) : -1;
-        hl_fd_put(&ref);
+        pthread_mutex_lock(&fd_lock);
+        int gfd = guest[i];
+        if (gfd < 0 || gfd >= FD_TABLE_SIZE || fd_table[gfd].type == FD_CLOSED) {
+            pthread_mutex_unlock(&fd_lock); errno = EBADF; return -1;
+        }
+        int kind = fd_table[gfd].type;
+        if (trusted && kind != FD_REGULAR && kind != FD_STDIO && kind != FD_PIPE && kind != FD_SOCKET) {
+            pthread_mutex_unlock(&fd_lock); errno = EOPNOTSUPP; return -1;
+        }
+        hl_open_file_t *of = fd_table[gfd].of;
+        if (of) hl_open_file_retain(of);
+        int alias = fcntl(fd_table[gfd].host_fd, F_DUPFD_CLOEXEC, 0);
+        pthread_mutex_unlock(&fd_lock);
+        int state = alias >= 0 ? export_option(of) : -1;
+        if (of) hl_open_file_release(of);
         if (alias < 0) return -1;
         if (t->count == 64 || n == 64) { close(alias); if (state >= 0) close(state); errno = EMSGSIZE; return -1; }
         native[n++] = alias; t->fds[t->count++] = alias;
@@ -168,48 +178,55 @@ int hl_wc_socket_transfer(int channel, const int *guest, unsigned count,
         if (state < 0) continue;
         /* A native consumer cannot preserve our option's shared identity.
          * Refuse rather than silently returning a false option on reimport. */
-        if (!hl_wc_socket_same_runtime(channel)) { close(state); errno = EOPNOTSUPP; return -1; }
+        if (!trusted && !hl_wc_socket_same_runtime(channel)) { close(state); errno = EOPNOTSUPP; return -1; }
         if (t->count == 64 || n == 64) { close(state); errno = EMSGSIZE; return -1; }
         native[n++] = state; t->fds[t->count++] = state;
     }
     *out = n; return 0;
 }
-static int alloc_socket(int, int, int);
-int hl_wc_socket_receive(int channel, int *native, unsigned count, int *guest, unsigned *out, int cloexec) {
-    unsigned n = 0;
+static int alloc_socket(int, int, int, hl_descriptor_t **);
+int hl_wc_socket_receive(int channel, int *native, unsigned count, int *guest, unsigned *out,
+    int cloexec, int trusted, hl_wc_socket_transfers *received) {
+    unsigned n = 0, start = received->count;
     for (unsigned i = 0; i < count; i++) {
         int fd = native[i]; native[i] = -1;
-        if (hl_wc_socket_is_state(fd)) { close(fd); goto fail; }
+        if (hl_wc_socket_is_state(fd)) { close(fd); errno = EPROTO; goto fail; }
+        if (received->count == 64) { close(fd); errno = EMSGSIZE; goto fail; }
         int type; socklen_t len = sizeof(type);
         int is_socket = getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0;
         if (fcntl(fd, F_SETFD, cloexec ? FD_CLOEXEC : 0) < 0) { close(fd); goto fail; }
-        int gfd;
+        int gfd; hl_descriptor_t *identity = NULL;
         if (is_socket) {
             int backing = -1;
             if (i + 1 < count && hl_wc_socket_is_state(native[i + 1])) {
-                if (!hl_wc_socket_same_runtime(channel)) { close(fd); goto fail; }
+                if (!trusted && !hl_wc_socket_same_runtime(channel)) { close(fd); goto fail; }
                 backing = native[++i]; native[i] = -1;
             }
-            gfd = alloc_socket(fd, 0, backing);
+            gfd = alloc_socket(fd, 0, backing, &identity);
             if (backing >= 0) close(backing);
-        }
-        else {
+        } else {
             int native_flags = fcntl(fd, F_GETFL);
             if (native_flags < 0) { close(fd); goto fail; }
-            hl_open_file_t *of = hl_open_file_create(FD_REGULAR, &hl_fd_ops_host_file, mac_to_linux_status_flags(native_flags), NULL);
+            struct stat st;
+            if (fstat(fd, &st) < 0) { close(fd); goto fail; }
+            hl_open_file_t *of = hl_open_file_create(S_ISFIFO(st.st_mode) ? FD_PIPE : FD_REGULAR, &hl_fd_ops_host_file, mac_to_linux_status_flags(native_flags), NULL);
             if (!of) { close(fd); goto fail; }
             if (hl_wc_memfd_adopt(of, fd) < 0) { hl_open_file_release(of); close(fd); goto fail; }
-            gfd = hl_fd_install(of, fd, cloexec ? LINUX_O_CLOEXEC : 0);
+            gfd = hl_fd_install_retained(of, fd, cloexec ? LINUX_O_CLOEXEC : 0, &identity);
         }
         if (gfd < 0) goto fail;
+        received->fds[received->count] = gfd;
+        received->descriptors[received->count++] = identity;
         guest[n++] = gfd;
     }
     *out = n; return 0;
-fail:
-    for (unsigned i = 0; i < count; i++) if (native[i] >= 0) close(native[i]);
-    for (unsigned i = 0; i < n; i++) sys_close(guest[i]);
-    errno = EINVAL; return -1;
-}
+fail: {
+    int saved = errno;
+    for (unsigned i = 0; i < count; i++) if (native[i] >= 0) { close(native[i]); native[i] = -1; }
+    for (unsigned i = start; i < received->count; i++) hl_wc_socket_received_close(received, received->fds[i]);
+    received->count = start;
+    errno = saved; return -1;
+}}
 
 static socket_state *new_state(void) {
     int backing = hl_wc_socket_private_file();
@@ -223,7 +240,7 @@ static socket_state *new_state(void) {
     }
     int saved = errno; close(backing); errno = saved; return state;
 }
-static int alloc_socket(int native, int seqpacket, int backing) {
+static int alloc_socket(int native, int seqpacket, int backing, hl_descriptor_t **identity) {
     hl_open_file_t *of = hl_open_file_create(FD_SOCKET, &hl_fd_ops_host_file, 0, NULL);
     if (!of) { close(native); return -1; }
     int flags = fcntl(native, F_GETFL);
@@ -238,13 +255,27 @@ static int alloc_socket(int native, int seqpacket, int backing) {
         hl_open_file_release(of); close(native); errno = EINVAL; return -1;
     }
     int cloexec = fcntl(native, F_GETFD);
-    return hl_fd_install(of, native, cloexec >= 0 && (cloexec & FD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
+    return hl_fd_install_retained(of, native, cloexec >= 0 && (cloexec & FD_CLOEXEC) ? LINUX_O_CLOEXEC : 0, identity);
 }
-int hl_wc_socket_alloc(int native) { return alloc_socket(native, 0, -1); }
-int hl_wc_socket_alloc_seqpacket(int native) { return alloc_socket(native, 1, -1); }
+int hl_wc_socket_alloc(int native) { return alloc_socket(native, 0, -1, NULL); }
+int hl_wc_socket_alloc_seqpacket(int native) { return alloc_socket(native, 1, -1, NULL); }
+int hl_wc_socket_alloc_retained(int native, int seqpacket, hl_descriptor_t **identity) { return alloc_socket(native, seqpacket, -1, identity); }
 
+void hl_wc_socket_received_close(hl_wc_socket_transfers *t, int fd) {
+    for (unsigned i = 0; i < t->count; i++) if (t->fds[i] == fd && t->descriptors[i]) {
+        hl_fd_detached_t detached = {0};
+        if (hl_fd_remove_exact(fd, t->descriptors[i], &detached) == 0) hl_fd_detached_finish(&detached);
+        hl_descriptor_release(t->descriptors[i]); t->descriptors[i] = NULL; t->fds[i] = -1;
+        return;
+    }
+}
 void hl_wc_socket_received_end(hl_wc_socket_transfers *t) {
-    for (unsigned i = 0; i < t->count; i++) if (t->fds[i] >= 0) sys_close(t->fds[i]);
+    for (unsigned i = 0; i < t->count; i++) hl_wc_socket_received_close(t, t->fds[i]);
+    t->count = 0;
+}
+void hl_wc_socket_received_commit(hl_wc_socket_transfers *t) {
+    for (unsigned i = 0; i < t->count; i++) if (t->descriptors[i]) hl_descriptor_release(t->descriptors[i]);
+    t->count = 0;
 }
 
 int hl_wc_socket_enabled(hl_open_file_t *of) {
@@ -269,6 +300,7 @@ int hl_wc_socket_seqpacket(int fd) {
 }
 
 /* Mode zero at creation closes the mkstemp-before-unlink pathname race.
+ * Restore owner permissions only after unlink for native xattr authorization.
  * The seqpacket caller refuses native root, which bypasses inode checks.
  * Guest fd tables never
  * expose these fds. No writable pathname alias exists after unlink. */
@@ -281,7 +313,19 @@ int hl_wc_socket_private_file(void) {
         int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0);
         if (fd < 0) { if (errno == EEXIST) continue; return -1; }
         if (unlink(path) < 0) { int saved = errno; close(fd); errno = saved; return -1; }
+        if (fchmod(fd, 0600) < 0) { int saved = errno; close(fd); errno = saved; return -1; }
         return fd;
     }
     errno = EEXIST; return -1;
+}
+
+void hl_wc_socket_native_end(hl_wc_socket_native_guard *guard) {
+    if (!guard->message) return;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(guard->message); c; c = CMSG_NXTHDR(guard->message, c)) {
+        if (c->cmsg_len < CMSG_LEN(0)) break;
+        if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+        unsigned count = (unsigned)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+        int *fds = (int *)CMSG_DATA(c);
+        for (unsigned i = 0; i < count; i++) if (fds[i] >= 0) { close(fds[i]); fds[i] = -1; }
+    }
 }

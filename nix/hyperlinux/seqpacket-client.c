@@ -7,8 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -115,6 +117,14 @@ static void records(void) {
     struct pollfd pollfd = { fd[1], POLLIN, 0 };
     CHECK(poll(&pollfd, 1, 0) == 1 && (pollfd.revents & POLLIN));
     CHECK(read(fd[1], bytes, sizeof(bytes)) == 0); empty(fd[1]);
+    int duplicate = fcntl(fd[0], F_DUPFD_CLOEXEC, 300); CHECK(duplicate >= 300);
+    CHECK(dup3(fd[0], duplicate, O_CLOEXEC) == duplicate);
+    CHECK(fcntl(duplicate, F_GETFD) & FD_CLOEXEC);
+    CHECK(dup2(fd[0], duplicate) == duplicate && !(fcntl(duplicate, F_GETFD) & FD_CLOEXEC));
+    int type = 0; socklen_t type_length = sizeof(type);
+    CHECK(getsockopt(duplicate, SOL_SOCKET, SO_TYPE, &type, &type_length) == 0 && type == SOCK_SEQPACKET);
+    CHECK(write(duplicate, "dup", 3) == 3 && read(fd[1], bytes, sizeof(bytes)) == 3 && !memcmp(bytes, "dup", 3));
+    CHECK(close(duplicate) == 0);
     close_pair(fd); puts("SEQPACKET records PASS");
 }
 static void rights(void) {
@@ -144,6 +154,20 @@ static void rights(void) {
     send_fd(fd[0], "truncated", 9, alias);
     CHECK(receive(fd[1], bytes, 1, MSG_CMSG_CLOEXEC, &passed, &flags, 1) == 1);
     CHECK((flags & MSG_TRUNC) && passed >= 0); CHECK(close(passed) == 0);
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(2 * sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct iovec io = { (void *)"partial", 7 };
+    struct msghdr message = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes) };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(2 * sizeof(int));
+    int two_rights[2] = { alias, alias }; memcpy(CMSG_DATA(header), two_rights, sizeof(two_rights));
+    CHECK(sendmsg(fd[0], &message, MSG_NOSIGNAL) == 7);
+    memset(&control, 0, sizeof(control)); io.iov_base = bytes; io.iov_len = sizeof(bytes);
+    message.msg_controllen = CMSG_LEN(sizeof(int)); message.msg_flags = 0;
+    CHECK(recvmsg(fd[1], &message, MSG_CMSG_CLOEXEC) == 7 && (message.msg_flags & MSG_CTRUNC));
+    header = CMSG_FIRSTHDR(&message); CHECK(header && header->cmsg_len == CMSG_LEN(sizeof(int)));
+    memcpy(&passed, CMSG_DATA(header), sizeof(passed)); CHECK(fcntl(passed, F_GETFD) & FD_CLOEXEC);
+    CHECK(close(passed) == 0); empty(fd[1]);
     CHECK(close(alias) == 0); close_pair(fd);
     puts("SEQPACKET rights identity CLOEXEC offsets dup PASS");
 }
@@ -229,7 +253,66 @@ static void unsupported(void) {
     CHECK(bind(fd[0], (struct sockaddr *)&address, sizeof(address)) == -1 && errno == EOPNOTSUPP);
     CHECK(connect(fd[0], (struct sockaddr *)&address, sizeof(address)) == -1 && errno == EOPNOTSUPP);
     CHECK(listen(fd[0], 1) == -1 && errno == EOPNOTSUPP);
+    send_fd(fd[0], "not-error-queue", 15, -1);
+    char bytes[32]; int passed, flags;
+    CHECK(receive(fd[1], bytes, sizeof(bytes), MSG_ERRQUEUE, &passed, &flags, 0) == -1 && errno == EOPNOTSUPP);
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 15 && !memcmp(bytes, "not-error-queue", 15));
+    CHECK(send(fd[0], "oob", 3, MSG_OOB | MSG_NOSIGNAL) == -1 && errno == EOPNOTSUPP); empty(fd[1]);
+    int special = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC); CHECK(special >= 0);
+    CHECK(dup3(fd[0], special, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    unsigned long long counter = 1, output = 0;
+    CHECK(write(special, &counter, sizeof(counter)) == sizeof(counter));
+    CHECK(read(special, &output, sizeof(output)) == sizeof(output) && output == 1);
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    memset(&control, 0, sizeof(control)); struct iovec io = { (void *)"synthetic", 9 };
+    struct msghdr message = { .msg_iov = &io, .msg_iovlen = 1, .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes) };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS; header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &special, sizeof(special));
+    CHECK(sendmsg(fd[0], &message, MSG_NOSIGNAL) == -1 && errno == EOPNOTSUPP); empty(fd[1]);
+    CHECK(close(special) == 0);
     close_pair(fd); puts("SEQPACKET unsupported operations PASS");
+}
+static void byte_copy_refusal(void) {
+    if (linux_reference) return;
+    int fd[2], pipefd[2]; pair(fd); CHECK(pipe(pipefd) == 0);
+    int file = memfd_create("seqpacket-copy-refusal", MFD_CLOEXEC); CHECK(file >= 0);
+    CHECK(write(file, "input", 5) == 5 && lseek(file, 0, SEEK_SET) == 0);
+    off_t offset = 0;
+    CHECK(sendfile(fd[0], file, &offset, 5) == -1 && errno == EOPNOTSUPP);
+    CHECK(offset == 0 && lseek(file, 0, SEEK_CUR) == 0); empty(fd[1]);
+    struct iovec io = { (void *)"raw", 3 };
+    CHECK(vmsplice(fd[0], &io, 1, 0) == -1 && errno == EOPNOTSUPP); empty(fd[1]);
+    send_fd(fd[0], "preserved", 9, -1);
+    CHECK(splice(fd[1], NULL, pipefd[1], NULL, 9, SPLICE_F_NONBLOCK) == -1 && errno == EOPNOTSUPP);
+    char bytes[32]; CHECK(read(fd[1], bytes, sizeof(bytes)) == 9 && !memcmp(bytes, "preserved", 9));
+    send_fd(fd[0], "record", 6, -1);
+    CHECK(copy_file_range(fd[1], NULL, file, NULL, 6, 0) == -1 && errno == EOPNOTSUPP);
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 6 && !memcmp(bytes, "record", 6));
+    CHECK(lseek(file, 0, SEEK_CUR) == 0);
+    CHECK(close(file) == 0 && close(pipefd[0]) == 0 && close(pipefd[1]) == 0); close_pair(fd);
+    puts("SEQPACKET byte copy refusal preserves input PASS");
+}
+static void sender_exit(void) {
+    int channel[2]; pair(channel);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        CHECK(close(channel[1]) == 0);
+        int response[2]; pair(response);
+        send_fd(response[0], "after-exit", 10, -1);
+        send_fd(channel[0], "endpoint", 8, response[1]);
+        close_pair(response); CHECK(close(channel[0]) == 0); _exit(0);
+    }
+    CHECK(close(channel[0]) == 0);
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char bytes[32]; int endpoint, flags;
+    CHECK(receive(channel[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC, &endpoint, &flags, 1) == 8 && endpoint >= 0);
+    int type = 0; socklen_t length = sizeof(type);
+    CHECK(getsockopt(endpoint, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_SEQPACKET);
+    CHECK(read(endpoint, bytes, sizeof(bytes)) == 10 && !memcmp(bytes, "after-exit", 10));
+    CHECK(read(endpoint, bytes, sizeof(bytes)) == 0);
+    CHECK(close(endpoint) == 0 && close(channel[1]) == 0);
+    puts("SEQPACKET queued endpoint after sender exit PASS");
 }
 static void fork_exec(const char *self) {
     int fd[2]; pair(fd);
@@ -262,6 +345,6 @@ int main(int argc, char **argv) {
     }
     CHECK(argc == 1 || (argc == 2 && !strcmp(argv[1], "--linux-reference")));
     linux_reference = argc == 2;
-    records(); rights(); endpoints(); shutdowns(); readiness(); unsupported(); fork_exec(argv[0]);
+    records(); rights(); endpoints(); shutdowns(); readiness(); unsupported(); byte_copy_refusal(); fork_exec(argv[0]); sender_exit();
     puts("SEQPACKET ALL PASS"); return 0;
 }
