@@ -909,12 +909,82 @@ sound_ring_args() {
 # DBUS is passed so that a second launch reaches the first one's instance
 # instead of colliding on its profile lock -- which is what a second click on a
 # Windows application does too.
-# Older deployments wrote this automatic force preference into managed profiles.
-# Removing it from user.js alone does not clear Firefox's persisted prefs.js.
-clear_legacy_webrender_pref() {
-  local profile=$1
-  [ -f "$profile/prefs.js" ] || return 0
-  sed -i '/^user_pref("gfx\.webrender\.all", true);$/d' "$profile/prefs.js"
+# Remove only complete legacy blocks carrying wc-session's exact provenance.
+# A retained user declaration of the same key always wins over migration.
+clear_legacy_graphics_prefs() {
+  local profile=$1 stage
+  [ -f "$profile/user.js" ] || return 0
+  stage=$(mktemp -d "$profile/.wc-pref-upgrade-XXXXXX") || return 1
+  awk -v stage="$stage" '
+    { line[NR]=$0 }
+    END {
+      gfx="user_pref(\"gfx.webrender.all\", true);"
+      media="media.hardware-video-decoding-vulkan"
+      m1="user_pref(\"" media ".enabled\", true);"
+      m2="user_pref(\"" media ".force-enabled\", true);"
+      m3="user_pref(\"" media ".readback.enabled\", true);"
+      for(i=1;i<=NR;i++) {
+        if(line[i] ~ /^\/\/ Added by wc-session: this host forwards a GPU \(.+\)\.$/ && line[i+1]==gfx) {
+          gone[i]=gone[i+1]=1; owned["gfx.webrender.all"]=gfx
+        }
+        if(line[i]=="// Added by wc-session: Vulkan video decode, read back to host memory, on the forwarded GPU." && line[i+1]==m1 && line[i+2]==m2 && line[i+3]==m3) {
+          gone[i]=gone[i+1]=gone[i+2]=gone[i+3]=1
+          owned[media ".enabled"]=m1; owned[media ".force-enabled"]=m2; owned[media ".readback.enabled"]=m3
+        }
+      }
+      changed=0
+      for(i=1;i<=NR;i++) {
+        if(!gone[i]) print line[i]
+        else changed=1
+      }
+      if(changed) print "yes" > (stage "/changed")
+      for(key in owned) {
+        manual=0
+        for(i=1;i<=NR;i++) if(!gone[i] && index(line[i],"\"" key "\"")) manual=1
+        if(!manual) print owned[key] > (stage "/persisted")
+      }
+    }
+  ' "$profile/user.js" >"$stage/user.js" || { rm -rf "$stage"; return 1; }
+  if [ -f "$stage/changed" ]; then
+    chmod --reference="$profile/user.js" "$stage/user.js" || { rm -rf "$stage"; return 1; }
+    if [ -s "$stage/persisted" ] && [ -f "$profile/prefs.js" ]; then
+      awk 'NR==FNR { generated[$0]=1; next } !($0 in generated)' "$stage/persisted" "$profile/prefs.js" >"$stage/prefs.js" \
+        && chmod --reference="$profile/prefs.js" "$stage/prefs.js" \
+        || { rm -rf "$stage"; return 1; }
+      # Commit persisted values first. A later user.js failure leaves its
+      # provenance intact, so retry can safely complete the migration.
+      mv "$stage/prefs.js" "$profile/prefs.js" || { rm -rf "$stage"; return 1; }
+    fi
+    mv "$stage/user.js" "$profile/user.js" || { rm -rf "$stage"; return 1; }
+  fi
+  rm -rf "$stage"
+}
+
+# Preserve user content and replace only our complete bounded generated block.
+install_managed_profile_prefs() {
+  local profile=$1 rendered=$2 stage
+  stage=$(mktemp "$profile/.wc-managed-prefs-XXXXXX") || return 1
+  if [ -f "$profile/user.js" ]; then
+    awk '
+      { line[NR]=$0 }
+      END {
+        for(i=1;i<=NR;i++) {
+          if(line[i]=="// BEGIN wc-session managed preferences") {
+            stop=0
+            for(j=i+1;j<=NR;j++) if(line[j]=="// END wc-session managed preferences") { stop=j; break }
+            if(stop) { i=stop; continue }
+          }
+          print line[i]
+        }
+      }
+    ' "$profile/user.js" >"$stage" || { rm -f "$stage"; return 1; }
+    chmod --reference="$profile/user.js" "$stage" || { rm -f "$stage"; return 1; }
+  fi
+  echo '// BEGIN wc-session managed preferences' >>"$stage" \
+    && cat "$rendered" >>"$stage" \
+    && echo '// END wc-session managed preferences' >>"$stage" \
+    || { rm -f "$stage"; return 1; }
+  mv "$stage" "$profile/user.js"
 }
 
 stock_gpu_prerequisite_check() {
@@ -1095,9 +1165,8 @@ start_app() {
   esac
   case "$PROFILE" in
     "$HOME"/.wc-launch/*)
-      cp "$R/user.js" "$PROFILE/user.js" 2>/dev/null
       case "${DEF_EXEC##*/}" in
-        firefox|firefox-bin|firefox-esr|.firefox-wrapped) clear_legacy_webrender_pref "$PROFILE" ;;
+        firefox|firefox-bin|firefox-esr|.firefox-wrapped) clear_legacy_graphics_prefs "$PROFILE" || die "could not upgrade generated graphics preferences" ;;
       esac
       # NO "OPEN FIREFOX IN TROUBLESHOOT MODE?" (§86 item 6, §87). A launcher
       # session can end with Firefox still running -- `down`, the guest logging
@@ -1108,16 +1177,17 @@ start_app() {
       # count off. Every launcher profile, always: it is a property of how this
       # deployment ends Firefox, not of any one session.
       printf '\n// Added by wc-session: a session that ends under Firefox is not a startup crash.\nuser_pref("toolkit.startup.max_resumed_crashes", -1);\n' \
-        >> "$PROFILE/user.js"
+        >> "$R/user.js"
       # AUDIO (§86): no server means Firefox's own null context, never a
       # Firefox that waits on an audio process for ever.
       case "$AUDIO" in
         pulse*|pipewire*|user-pipewire*|system*) ;;
         *)
           printf '\n// Added by wc-session: this session has no audio server (%s).\nuser_pref("media.cubeb.force_null_context", true);\n' "$AUDIO" \
-            >> "$PROFILE/user.js"
+            >> "$R/user.js"
           ;;
       esac
+      install_managed_profile_prefs "$PROFILE" "$R/user.js" || die "could not refresh managed preferences"
       ;;
   esac
 

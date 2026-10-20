@@ -65,10 +65,4 @@ DEF_ENV=()
 
 DEF_EXEC=/fixture/bin/native-app; GPU_ON=''; NSWRAP=(); GPUENV=()
 stock_gpu_prerequisite_check; echo 'PASS runtime native app needs no GTK/VA'
-source <(sed -n '/^clear_legacy_webrender_pref() {/,/^}/p' scripts/wc-session)
-mkdir -p "$STAGE/profile"
-printf '%s\n' 'user_pref("gfx.webrender.all", true);' 'user_pref("keep.user.setting", 7);' >"$STAGE/profile/prefs.js"
-clear_legacy_webrender_pref "$STAGE/profile"
-! grep -F 'gfx.webrender.all' "$STAGE/profile/prefs.js"
-grep -F 'keep.user.setting' "$STAGE/profile/prefs.js" >/dev/null
-echo 'PASS clears only the legacy automatic force preference'
+bash "$ROOT/scripts/wc-profile-upgrade-test.sh"
