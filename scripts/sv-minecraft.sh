@@ -16,8 +16,8 @@
 #   wc-compositor.exe   under Wine on an Xvfb, as scripts/sv-firefox-wayland.sh
 #                       runs it: the Windows compositor, with real window
 #                       messages, real `ClipCursor` and real raw input
-#   wc-proxy            the game's Wayland server: `wl_shm` and nothing that
-#                       carries a descriptor, every buffer into an arena
+#   wc-proxy            the game's Wayland server: shared-memory buffers and
+#                       native dma-buf imports through the forwarded render node
 #   sv-gpu-server       the GPU side, on this machine's AMD iGPU (RADV) and
 #                       nothing else: the loader is only ever shown radeon_icd
 #   the game            Minecraft 1.21.11 in **demo mode**, a native Wayland
