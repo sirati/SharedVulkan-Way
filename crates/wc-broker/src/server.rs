@@ -110,12 +110,16 @@ struct Held<O> {
     pieces: Vec<(u64, u64)>,
 }
 
+/// A durable lease check, run before any region handle reaches a client.
+pub type LeaseCheck = Box<dyn FnMut(&RegionInfo, Pid) -> io::Result<()> + Send>;
+
 struct State<P: Platform> {
     core: Core,
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
     writers: BTreeMap<ConnId, Arc<Mutex<P::Writer>>>,
     on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
     on_leased: Vec<Box<dyn FnMut(ObjId, Pid) + Send>>,
+    on_leased_checked: Vec<LeaseCheck>,
 }
 
 /// A running broker. Cloned into every connection's thread; also what a
@@ -167,6 +171,7 @@ impl<P: Platform> Broker<P> {
                 writers: BTreeMap::new(),
                 on_drained: Vec::new(),
                 on_leased: Vec::new(),
+                on_leased_checked: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
@@ -405,6 +410,12 @@ impl<P: Platform> Broker<P> {
                     let pieces: Vec<(u64, u64)> = held.iter().flat_map(|h| h.pieces.iter().copied()).collect();
                     // Before the fds leave: an embedder that records holders
                     // has this one before it can map anything.
+                    for f in st.on_leased_checked.iter_mut() {
+                        if let Err(e) = f(&info, peer.pid) {
+                            let _ = st.core.close(id, rid);
+                            return p.push(w, &format!("err lease record: {e}"));
+                        }
+                    }
                     for f in st.on_leased.iter_mut() {
                         f(rid, peer.pid);
                     }
@@ -565,6 +576,12 @@ impl<P: Platform> Broker<P> {
     /// before a crash. Under the broker's lock, like [`Self::on_drained`].
     pub fn on_leased(&self, f: Box<dyn FnMut(ObjId, Pid) + Send>) {
         self.lock().on_leased.push(f);
+    }
+
+    /// Add a fallible lease check under the broker lock. A failure closes
+    /// the new lease and sends no handles. Checks must never call the broker.
+    pub fn on_leased_checked(&self, f: LeaseCheck) {
+        self.lock().on_leased_checked.push(f);
     }
 
     /// The processes holding a lease on region `id` now, so that a

@@ -30,14 +30,10 @@
 //! still map regions. So every published region is recorded in the daemon's
 //! state directory: its runs (the stamps no longer prove them once the guest
 //! has written over them) and the processes that hold it (pid and start
-//! time). The record is written when a region is published and on every
-//! beat in which its holders changed. A new run publishes the recorded
-//! regions that the table still holds, so clients can find them again. It
-//! answers `UNMAPPED` for one only when the new broker's leases have drained
-//! *and* every recorded holder has exited. The one gap is a lease taken in
-//! the last beat (250 ms) before the daemon crashed: the record misses it.
-//! The broker owner was asked for a hook that runs before a lease's fds are
-//! sent; with it, this gap closes.
+//! time). Every lease is recorded synchronously before its handles leave
+//! the broker. A failed record refuses the lease. A new run republishes the
+//! recorded regions and waits for both its current leases and every recorded
+//! holder to exit before answering `UNMAPPED`.
 
 use crate::peer::{Mapped, Mappers, Peer, PeerEvent};
 use crate::peerloop::{self, Ram, TableOff, Waker};
@@ -65,6 +61,8 @@ pub trait Publisher: Send + Sync + 'static {
     /// and from the broker's threads, with the broker's lock held, so it must
     /// not call back.
     fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>);
+    /// Check and persist a lease before its handles are sent.
+    fn on_leased_checked(&self, f: wc_broker::server::LeaseCheck);
     /// The processes holding a lease on region `id`.
     fn holders(&self, id: u64) -> Vec<u32>;
 }
@@ -82,6 +80,9 @@ impl Publisher for wc_broker::server::Broker<wc_broker::sys::unix::Unix> {
     }
     fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>) {
         wc_broker::server::Broker::on_drained(self, f)
+    }
+    fn on_leased_checked(&self, f: wc_broker::server::LeaseCheck) {
+        wc_broker::server::Broker::on_leased_checked(self, f)
     }
     fn holders(&self, id: u64) -> Vec<u32> {
         wc_broker::server::Broker::holders(self, id)
@@ -192,6 +193,7 @@ pub struct BrokerMappers {
     live: BTreeMap<(u32, u64), Published>,
     drained: Arc<Mutex<BTreeSet<u64>>>,
     state: Option<PathBuf>,
+    durable: Arc<Mutex<DurableRecords>>,
 }
 
 fn say(s: &str) {
@@ -244,6 +246,7 @@ fn parse_procs(s: &str) -> Option<BTreeSet<Proc>> {
 }
 
 /// One record of the state file.
+#[derive(Clone)]
 struct Record {
     k: u32,
     epoch: u64,
@@ -251,36 +254,107 @@ struct Record {
     holders: BTreeSet<Proc>,
 }
 
+type DurableRecords = BTreeMap<(u32, u64), (u64, Record)>;
+
+/// Atomic replacement and fsync complete before any lease handles are sent.
+fn write_records<'a>(
+    path: &std::path::Path,
+    records: impl Iterator<Item = &'a Record>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    for p in records {
+        let runs = p
+            .runs
+            .iter()
+            .map(|(o, l)| format!("{o}:{l}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            file,
+            "region {} {} {} {}",
+            p.k,
+            p.epoch,
+            runs,
+            procs_text(&p.holders)
+        )?;
+    }
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl BrokerMappers {
     /// `state`: the daemon's private directory, where published regions are
     /// recorded across its restarts.
-    pub fn new(publisher: Arc<dyn Publisher>, owner: Owner, pool: &str, make: Box<MakeParts>, state: Option<PathBuf>, waker: Waker) -> BrokerMappers {
+    pub fn new(publisher: Arc<dyn Publisher>, owner: Owner, pool: &str, make: Box<MakeParts>, state: Option<PathBuf>, waker: Waker,
+    ) -> BrokerMappers {
         let drained = Arc::new(Mutex::new(BTreeSet::new()));
         let d = Arc::clone(&drained);
         publisher.on_drained(Box::new(move |id, _epoch| {
             d.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
             waker.wake();
         }));
-        BrokerMappers { publisher, owner, uid: None, pool: pool.to_string(), make, live: BTreeMap::new(), drained, state }
+        let durable = Arc::new(Mutex::new(DurableRecords::new()));
+        let records = durable.clone();
+        let prefix = format!("{pool}.");
+        let path = state.as_ref().map(|d| d.join(format!("{pool}.regions")));
+        publisher.on_leased_checked(Box::new(move |info, pid| {
+            if !info.pool.starts_with(&prefix) {
+                return Ok(());
+            }
+            let mut records = records.lock().unwrap_or_else(|e| e.into_inner());
+            let record = records
+                .values_mut()
+                .find(|(id, _)| *id == info.id)
+                .map(|(_, record)| record)
+                .ok_or_else(|| std::io::Error::other("guest region is not recorded yet"))?;
+            let holder = Proc::of(pid).ok_or_else(|| {
+                std::io::Error::other("cannot identify the lease holder's start time")
+            })?;
+            record.holders.insert(holder);
+            if let Some(path) = &path {
+                write_records(path, records.values().map(|(_, record)| record))?;
+            }
+            Ok(())
+        }));
+        BrokerMappers { publisher, owner, uid: None, pool: pool.to_string(), make, live: BTreeMap::new(), drained, state,
+            durable,
+        }
     }
 
     fn state_file(&self) -> Option<PathBuf> {
         self.state.as_ref().map(|d| d.join(format!("{}.regions", self.pool)))
     }
 
-    /// Record what is published and who holds it (atomically, in the daemon's
-    /// private directory).
+    /// Polling cannot erase a lease recorded concurrently before handle send.
+    /// Recorded holders remain until their region is removed.
     fn save(&self) {
-        let Some(path) = self.state_file() else { return };
-        let mut s = String::new();
+        let mut records = self.durable.lock().unwrap_or_else(|e| e.into_inner());
+        records.retain(|key, _| self.live.contains_key(key));
         for ((k, _), p) in &self.live {
-            let runs: Vec<String> = p.runs.iter().map(|(o, l)| format!("{o}:{l}")).collect();
-            let all: BTreeSet<Proc> = p.holders.union(&p.inherited).copied().collect();
-            s.push_str(&format!("region {k} {} {} {}\n", p.epoch, runs.join(","), procs_text(&all)));
+            let (_, record) = records.entry((*k, p.epoch)).or_insert_with(|| {
+                (
+                    p.id,
+                    Record {
+                        k: *k,
+                        epoch: p.epoch,
+                        runs: p.runs.clone(),
+                        holders: BTreeSet::new(),
+                    },
+                )
+            });
+            record
+                .holders
+                .extend(p.holders.union(&p.inherited).copied());
         }
-        let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, s).and_then(|_| std::fs::rename(&tmp, &path)) {
-            say(&format!("{}: {e}; a restart of this daemon would not know what it published", path.display()));
+        if let Some(path) = self.state_file()
+            && let Err(e) = write_records(&path, records.values().map(|(_, record)| record)) {
+            say(&format!("{}: {e}; new leases will be refused until their records can be written", path.display()));
         }
     }
 
@@ -364,7 +438,22 @@ impl BrokerMappers {
                     say(&format!("region {} (epoch {}): published by the previous run; its holders then: {}, alive now: {}", r.k, r.epoch, procs_text(&r.holders), procs_text(&alive)));
                     self.live.insert((r.k, r.epoch), Published { id, epoch: r.epoch, runs: r.runs, retiring: false, holders: BTreeSet::new(), inherited: alive, held_logged: false });
                 }
-                Err(e) => say(&format!("region {} (epoch {}) of the previous run: {e}", r.k, r.epoch)),
+                Err(e) => {
+                    say(&format!("region {} (epoch {}) of the previous run: {e}", r.k, r.epoch));
+                    // A failed re-publication must not forget old mappings.
+                    self.live.insert(
+                        (r.k, r.epoch),
+                        Published {
+                            id: u64::MAX,
+                            epoch: r.epoch,
+                            runs: r.runs,
+                            retiring: false,
+                            holders: BTreeSet::new(),
+                            inherited: alive,
+                            held_logged: false,
+                        },
+                    );
+                }
             }
         }
         self.save();
@@ -625,11 +714,16 @@ mod tests {
         retiring: Mutex<BTreeSet<u64>>,
         next: Mutex<u64>,
         cb: Mutex<Vec<Drained>>,
+        lease_cb: Mutex<Vec<wc_broker::server::LeaseCheck>>,
         pieces: Mutex<BTreeMap<u64, Vec<(u64, u64)>>>,
     }
 
     impl Fake {
         fn open(&self, id: u64, pid: u32) {
+            let info = wc_broker::core::RegionInfo { id, pool: "gpu.2".into(), len: 0, epoch: 0 };
+            for f in self.lease_cb.lock().unwrap().iter_mut() {
+                f(&info, pid).unwrap();
+            }
             self.leases.lock().unwrap().get_mut(&id).unwrap().push(pid);
         }
         fn close(&self, id: u64) {
@@ -668,6 +762,9 @@ mod tests {
         }
         fn on_drained(&self, f: Box<dyn FnMut(u64, u64) + Send>) {
             self.cb.lock().unwrap().push(f);
+        }
+        fn on_leased_checked(&self, f: wc_broker::server::LeaseCheck) {
+            self.lease_cb.lock().unwrap().push(f);
         }
         fn holders(&self, id: u64) -> Vec<u32> {
             let mut v = self.leases.lock().unwrap().get(&id).cloned().unwrap_or_default();
@@ -813,7 +910,7 @@ mod tests {
             peer.scan(|_| {});
             p.poll().unwrap();
             fake.open(1, child.id());
-            peer.beat(); // records the holder
+            // No beat: the lease is already durable before open returns.
             e
         };
         let text = std::fs::read_to_string(state.join("gpu.regions")).unwrap();
@@ -838,6 +935,51 @@ mod tests {
         let ev = peer.scan(|_| {});
         assert!(ev.contains(&PeerEvent::Unmapped { entry: e, k: 2 }), "{ev:?}");
         assert!(matches!(p.poll().unwrap()[0], Event::Freed { k: 2, .. }));
+    }
+
+    #[test]
+    fn a_beat_cannot_erase_a_holder_recorded_after_its_snapshot() {
+        let r = rig(16);
+        let state = r.dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sim = SimGuestRam::open(r.ram_path.to_str().unwrap()).unwrap();
+        let mut provider = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
+        let mut peer = peer(&r);
+        let fake = Arc::new(Fake::default());
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), Some(state.clone()))));
+        provider.announce(2, 2 << 20).unwrap();
+        peer.scan(|_| {});
+        provider.poll().unwrap();
+        let info = wc_broker::core::RegionInfo { id: 1, pool: "gpu.2".into(), len: 2 << 20, epoch: 1 };
+        // The callback has recorded a lease, while the beat's holder snapshot
+        // is still empty. Updating that snapshot must not erase the record.
+        fake.lease_cb.lock().unwrap()[0](&info, std::process::id()).unwrap();
+        peer.beat();
+        let text = std::fs::read_to_string(state.join("gpu.regions")).unwrap();
+        assert!(text.contains(&format!(" {}@", std::process::id())), "{text}");
+    }
+
+    #[test]
+    fn a_lease_with_an_unwritable_record_is_refused() {
+        let r = rig(16);
+        let state = r.dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sim = SimGuestRam::open(r.ram_path.to_str().unwrap()).unwrap();
+        let mut provider = Provider::start(view(&r.boot), 4096, sim, 1).unwrap();
+        let mut peer = peer(&r);
+        let fake = Arc::new(Fake::default());
+        peer.set_mappers(Box::new(mappers(&fake, Owner::Uid(1000), Some(state.clone()))));
+        provider.announce(2, 2 << 20).unwrap();
+        peer.scan(|_| {});
+        provider.poll().unwrap();
+        // Turn the record's destination into a directory. The atomic rename
+        // must fail, and the new holder must receive no handles.
+        std::fs::remove_file(state.join("gpu.regions")).unwrap();
+        std::fs::create_dir(state.join("gpu.regions")).unwrap();
+        let info = wc_broker::core::RegionInfo { id: 1, pool: "gpu.2".into(), len: 2 << 20, epoch: 1 };
+        let mut callbacks = fake.lease_cb.lock().unwrap();
+        assert!(callbacks[0](&info, std::process::id()).is_err());
+        assert!(fake.holders(1).is_empty());
     }
 
     /// The pool reuses a region index while the previous epoch still waits

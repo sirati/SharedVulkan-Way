@@ -36262,17 +36262,15 @@ R43 accepts that: one host user is one trust domain.
 
 ### 108.16 Not done, and not proven
 
-* **The broker**: built and proven in a VM (108.18). One gap remains: a
-  lease taken in the last beat before the daemon crashes is not in its
-  record.
+* **The broker**: built and proven in a VM (108.18). Lease records are now
+  written before handle transfer, with a failed write refusing the lease.
 * **The Intel driver's import of a large-page section view** (108.11).
-* **The GPU process does not ring `0xFB`**; both sides poll while a region
-  is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
-  the region manager the pool's port.
-* **A keeper service install** with restart-on-failure; the test VM used a
-  scheduled task. It becomes a module of the shared Windows service (108.10).
-* **The kept-keeper residual** (108.10): a keeper and every provider of a
-  pool killed together before the host lets go.
+* **Region doorbells** are wired through the pool's per-range port lookup.
+  Commit `48b90cc` rings `0xFB` on announce and retire and rescans on reopen.
+* **The Windows region backend** now uses the shared broker service and its
+  independent holder. The old keeper command is a compatibility alias for that broker.
+  A simultaneous kill of the provider, broker and holder still loses pages;
+  an ordinary provider or broker crash retains them.
 * **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
   the user.
 * **The peer's own restart** (the broker daemon's): handled by its record
@@ -36336,13 +36334,27 @@ and lease files.
   newest live one, and each epoch is answered on its own.
 * **The daemon's own restart.** The component records every published
   region in its state directory: its runs, and its holders as (pid, start
-  time), written at publish and in every beat in which they change. A new run
-  publishes the recorded regions the table still holds, so their holders can
-  find them again. It answers one only once the new broker has drained it
-  *and* every recorded holder has exited (`broker::holders`, §111). Not
-  covered: a lease taken in the last beat (250 ms) before a crash. A hook
-  that runs before a lease's fds are sent would close that gap. It has been
-  asked of the broker's owner.
+  time). `on_leased_checked` writes and fsyncs an atomic replacement before
+  a region's handles leave the broker. The callback refuses an unregistered
+  region or a failed write, rolling back the new lease without sending fds.
+  It shares a lock with the peer's record updates, so a beat cannot erase a
+  newly recorded holder. A new run republishes the recorded regions and
+  answers only once its current leases have drained and every recorded
+  holder has exited. Failed re-publication also retains the old holders.
+
+**Windows provider integration.** `KeeperSubstrate` now connects to the
+shared Windows broker and requests `alloc guest-ram.POOL BYTES large`.
+The service's region-init hook stamps every 2 MiB page with a random nonce
+and returns it in the allocation reply. The provider adopts that user's
+orphans on reconnect and opens their section handles. It sends `close` and
+`free` only after the peer's `UNMAPPED`. Regions remain address-stable for
+their whole epoch. The Windows backend keeps max(1 GiB, 15% of physical RAM)
+available for Windows, with the existing `WC_RAM_RESERVE_MIB` override.
+A failed copy into the independent holder now refuses allocation, rather
+than silently losing protection against a broker crash. The old `sv-guest ram keeper` command forwards to the shared broker's
+console mode for existing test tasks. Its old pipe and allocator are removed.
+`--grow-keeper` and `ram test` both use the broker client.
+
 
 **The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
 a process that passes the kernel's ptrace access check, which needs the same
