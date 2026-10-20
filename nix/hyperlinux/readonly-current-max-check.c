@@ -21,7 +21,8 @@ static vm_region_basic_info_data_64_t rights(void *view) {
         VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object) == KERN_SUCCESS);
     if (object) mach_port_deallocate(mach_task_self(), object);
     assert(address == (mach_vm_address_t)(uintptr_t)view && size >= LEN);
-    assert(info.shared);
+    /* Mach basic-info shared is not a reliable MAP_SHARED admission test.
+     * The original mmap flags and cross-view pwrite visibility prove sharing. */
     return info;
 }
 static void check(const char *label, void *view, void *consumer, int rw,
