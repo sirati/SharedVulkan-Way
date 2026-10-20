@@ -52,6 +52,11 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "macos", test))]
+mod latest;
+#[cfg(target_os = "macos")]
+pub type MetalMailbox = Arc<latest::Latest<Arc<wc_handle::iosection::Surface>>>;
+
 
 use crate::surface::{PixelFormat, Rect, Shadow};
 
@@ -501,6 +506,9 @@ pub enum ToUi {
     },
     /// The shadow has new pixels in these rectangles, in surface coordinates.
     Present { id: WindowId, damage: Vec<Rect> },
+    /// Immutable GPU-completed tree output; source buffers are already retired.
+    #[cfg(target_os = "macos")]
+    MetalPresent { id: WindowId, mailbox: MetalMailbox },
     /// §104's follow-up: draw the window from this client buffer from now on,
     /// not from its shadow (`Some`), or go back to the shadow, which is whole
     /// again (`None`); `damage` is what changed, in window coordinates.

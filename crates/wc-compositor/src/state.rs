@@ -353,6 +353,16 @@ struct DirectPresent {
     opaque_black: std::collections::HashSet<WlSurface>,
 }
 
+#[cfg(target_os = "macos")]
+struct MetalSurface {
+    pixels: Arc<wc_handle::iosection::Surface>,
+    format: PixelFormat,
+    raw_spec: crate::surface::BufferSpec,
+    view: Option<View>,
+    /// Staging contains geometry only until a CPU fallback materializes it.
+    dirty: bool,
+}
+
 /// What `State::tree_now` finds: every surface of the tree with where it sits,
 /// the declared window geometry, the surfaces that are drawn (bottom to top),
 /// and their shape.
@@ -670,6 +680,12 @@ pub struct State {
     /// `surface.rs`) while still being able to redraw a subsurface that has not
     /// committed this frame.
     staging: HashMap<WlSurface, Shadow>,
+    #[cfg(target_os = "macos")]
+    metal_surfaces: HashMap<WlSurface, MetalSurface>,
+    #[cfg(target_os = "macos")]
+    metal_outputs: HashMap<WindowId, Arc<wc_handle::iosection::Surface>>,
+    #[cfg(target_os = "macos")]
+    metal_mailboxes: HashMap<WindowId, crate::platform::MetalMailbox>,
     /// §102: the buffer behind every surface whose viewport makes its picture
     /// something other than the buffer itself, at the buffer's own size.
     ///
@@ -1198,6 +1214,12 @@ impl State {
                 ..DirectPresent::default()
             },
             staging: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            metal_surfaces: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            metal_outputs: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            metal_mailboxes: HashMap::new(),
             viewed: HashMap::new(),
             windows: HashMap::new(),
             negotiated_decoration: HashMap::new(),
@@ -3078,7 +3100,22 @@ impl State {
     fn reapply_view(&mut self, surface: &WlSurface) {
         let Some((src, dst, scale)) = self.viewport_of(surface) else { return };
         let out = self.scale_for(surface);
-        let changed = if let Some(entry) = self.viewed.get(surface) {
+        #[cfg(target_os = "macos")]
+        let gpu_changed = if let Some(raw_spec) = self.metal_surfaces.get(surface).map(|s| s.raw_spec) {
+            let Ok(view) = self.metal_view(surface, raw_spec) else { return; };
+            let source = self.metal_surfaces.get_mut(surface).expect("just read");
+            let changed = source.view != view;
+            if changed {
+                source.view = view;
+                source.dirty = true;
+                let size = view.map_or((raw_spec.width, raw_spec.height), |v| v.dst);
+                self.staging.entry(surface.clone()).or_insert_with(Shadow::empty).reset(size.0, size.1, raw_spec.format);
+            }
+            Some(changed)
+        } else { None };
+        #[cfg(not(target_os = "macos"))]
+        let gpu_changed = None::<bool>;
+        let changed = gpu_changed.unwrap_or_else(|| if let Some(entry) = self.viewed.get(surface) {
             match view_of((entry.raw.width(), entry.raw.height()), scale, src, dst, out) {
                 Some(view) if view == entry.view => false,
                 Some(view) => {
@@ -3095,7 +3132,7 @@ impl State {
                 }
             }
         } else {
-            let Some(shown) = self.staging.get(surface).filter(|s| !s.is_empty()) else { return };
+            let Some(shown) = self.staging.get(surface).filter(|s| !s.is_empty()) else { return false };
             match view_of((shown.width(), shown.height()), scale, src, dst, out) {
                 None => false,
                 Some(view) => {
@@ -3107,7 +3144,7 @@ impl State {
                     true
                 }
             }
-        };
+        });
         if !changed {
             return;
         }
@@ -3142,7 +3179,7 @@ impl State {
             self.ui.send(ToUi::Resize { id, width: w, height: h });
         }
         let damage = vec![Rect::new(0, 0, w, h).scaled(out, 1)];
-        self.ui.send(ToUi::Present { id, damage });
+        self.send_present(id, damage);
     }
 
     /// Copy a committed buffer into the shadow and tell the platform.
@@ -3213,6 +3250,8 @@ impl State {
         let viewport = self.viewport_of(surface);
         let nested = self.nested.is_some();
         let out = self.scale_for(surface);
+        #[cfg(target_os = "macos")]
+        let captured = (!unfinished).then(|| self.capture_metal_surface(surface, buffer)).flatten();
         let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
         let viewed = &mut self.viewed;
         let mut result: Option<(Vec<Rect>, i32, i32)> = None;
@@ -3222,7 +3261,14 @@ impl State {
         // Ask each source in turn. Today there is one; the loop is what lets a
         // buffer that lives in an arena rather than a `wl_shm` pool arrive
         // without this function changing (docs/goal-firefox.md).
+        #[cfg(target_os = "macos")]
+        if let Some(spec) = captured {
+            staging.reset(spec.width, spec.height, spec.format);
+            result = Some((vec![Rect::new(0, 0, spec.width, spec.height)], spec.width, spec.height));
+            served_by = "Metal original backing";
+        }
         for source in &self.sources {
+            if result.is_some() { break; }
             let read = source.with_pixels(buffer, &mut |bytes, spec| {
                 black = spec.width == 1
                     && spec.height == 1
@@ -3283,6 +3329,9 @@ impl State {
             }
         }
 
+        #[cfg(target_os = "macos")]
+        if captured.is_none() { self.metal_surfaces.remove(surface); }
+
         // **Release before presenting, and unconditionally.** The client may
         // reuse the buffer the instant this returns, which is exactly what a
         // single-buffered client is waiting to do; the pixels it might overwrite
@@ -3310,6 +3359,8 @@ impl State {
         // left for a future traversal to find.
         if self.cursor_surface.as_ref() == Some(surface) {
             self.staging.remove(surface);
+            #[cfg(target_os = "macos")]
+            self.metal_surfaces.remove(surface);
             self.viewed.remove(surface);
             return;
         }
@@ -3540,10 +3591,7 @@ impl State {
             // exactly why the store is keyed by app id and not by window.
             self.apply_stored_icon(id, &app_id);
         }
-        self.ui.send(ToUi::Present {
-            id,
-            damage: composited,
-        });
+        self.send_present(id, composited);
     }
 
     // -----------------------------------------------------------------------
@@ -4099,6 +4147,18 @@ impl State {
             })
             .collect();
 
+        #[cfg(target_os = "macos")]
+        let gpu_output = self.compose_metal_tree(&drawn, (gx, gy), (pw, ph), k);
+        #[cfg(target_os = "macos")]
+        if gpu_output.is_none() {
+            for (surface, _) in &drawn {
+                if !self.materialize_metal_surface(surface) { return (Vec::new(), 0, 0); }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        self.note_path(root, gpu_output.is_some(), if gpu_output.is_some() {
+            "ordered surface tree, clipped premultiplied layers, GPU-completed owned snapshots"
+        } else { "a surface or Metal device requires the CPU fallback" });
         let window = self.windows.get_mut(root).expect("caller checked");
         // The one place this number is decided, for the pixels *and* for the
         // pointer. See `Window::content_offset`.
@@ -4164,6 +4224,17 @@ impl State {
         let mut shadow = shadow.lock().unwrap_or_else(|e| e.into_inner());
         let reshaped = shadow.reset(pw, ph, format) || shadow.scale() != k;
         shadow.set_scale(k);
+        #[cfg(target_os = "macos")]
+        if let Some(output) = gpu_output {
+            self.metal_outputs.insert(wid, output);
+            self.metal_mailboxes.entry(wid).or_default();
+            return (vec![Rect::new(0, 0, pw, ph)], gw, gh);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_outputs.remove(&wid);
+            if let Some(mailbox) = self.metal_mailboxes.remove(&wid) { mailbox.take(); }
+        }
         // §95: every surface after the first is drawn *over* what is under it
         // (`Shadow::compose_over`), so what is under it must be this frame's.
         // The first surface's copy repaints the canvas wherever it covers it,
@@ -4199,6 +4270,124 @@ impl State {
 // ---------------------------------------------------------------------------
 
 impl State {
+    fn send_present(&self, id: WindowId, damage: Vec<Rect>) {
+        #[cfg(target_os = "macos")]
+        if let Some(output) = self.metal_outputs.get(&id)
+            && let Some(mailbox) = self.metal_mailboxes.get(&id) {
+            if mailbox.replace(Arc::clone(output)) {
+                self.ui.send(ToUi::MetalPresent { id, mailbox: Arc::clone(mailbox) });
+            }
+            return;
+        }
+        self.ui.send(ToUi::Present { id, damage });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn metal_view(&self, surface: &WlSurface, spec: crate::surface::BufferSpec) -> Result<Option<View>, &'static str> {
+        let (scale, transform) = compositor::with_states(surface, |st| {
+            let mut attrs = st.cached_state.get::<SurfaceAttributes>(); let attrs = attrs.current();
+            (attrs.buffer_scale, attrs.buffer_transform)
+        });
+        if transform != wl_output::Transform::Normal { return Err("buffer transform requires fallback"); }
+        if self.nested.is_some() && !compositor::with_states(surface, |st|
+            ensure_viewport_valid(st, (spec.width / scale.max(1), spec.height / scale.max(1)).into())) {
+            return Err("invalid committed viewport");
+        }
+        Ok(match self.viewport_of(surface) {
+            Some((src, dst, scale)) => view_of((spec.width, spec.height), scale, src, dst, self.scale_for(surface)),
+            None => None,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn capture_metal_surface(&mut self, surface: &WlSurface, buffer: &wl_buffer::WlBuffer) -> Option<crate::surface::BufferSpec> {
+        use smithay::reexports::wayland_server::protocol::wl_shm;
+        if self.direct.off || self.cursor_surface.as_ref() == Some(surface) { return None; }
+        let snapshot = |pixels: Arc<wc_handle::iosection::Surface>, spec: crate::surface::BufferSpec, offset: u32| {
+            self.metal_view(surface, spec)?;
+            let frame = DirectFrame { key: 0, surface: pixels, offset,
+                width: spec.width, height: spec.height, stride: spec.stride, format: spec.format };
+            crate::platform::macos_metal::capture(&frame).map(|pixels| (pixels, spec))
+        };
+        let result = if let Some((pixels, spec, guard)) = crate::native_prime::gpu_source(buffer) {
+            // Retain the original native token FD/identity and producer surface
+            // until capture has completed every GPU read of the original pages.
+            let result = snapshot(pixels, spec, 0);
+            drop(guard);
+            result
+        } else if let Some((handle, data)) = compositor_shm_handle(buffer).filter(|(handle, _)|
+            matches!(handle.descriptor(), wc_handle::Descriptor::SharedFile { path, .. } if path.starts_with(wc_handle::iosection::PREFIX))) {
+            let spec = crate::surface::BufferSpec { width: data.width, height: data.height, stride: data.stride,
+                format: match data.format { wl_shm::Format::Argb8888 => PixelFormat::Argb8888,
+                    wl_shm::Format::Xrgb8888 => PixelFormat::Xrgb8888, _ => return None } };
+            spec.required_len()?;
+            let wc_handle::Descriptor::SharedFile { path, .. } = handle.descriptor() else { return None; };
+            let pixels = Arc::new(wc_handle::iosection::surface(path)?);
+            snapshot(pixels, spec, u32::try_from(data.offset).ok()?)
+        } else {
+            // The provider guarantees the native mmap extent and retains its
+            // original FD + pool read lock across this synchronous GPU wait.
+            let captured = smithay::wayland::shm::with_buffer_mapping(buffer, |base, mapped_len, logical_len, data| {
+                let spec = crate::surface::BufferSpec { width: data.width, height: data.height, stride: data.stride,
+                    format: match data.format { wl_shm::Format::Argb8888 => PixelFormat::Argb8888,
+                        wl_shm::Format::Xrgb8888 => PixelFormat::Xrgb8888, _ => return Err("mapped pixel format") } };
+                self.metal_view(surface, spec)?;
+                let offset = usize::try_from(data.offset).map_err(|_| "mapped negative offset")?;
+                // SAFETY: with_buffer_mapping holds the original mapping and
+                // gives its native page-rounded VM extent. GPU completion is
+                // observed before this closure returns and before buffer release.
+                unsafe { crate::platform::macos_metal::capture_mapping(base, mapped_len, logical_len, offset, spec) }
+                    .map(|pixels| (pixels, spec))
+            }).ok().flatten()?;
+            captured
+        };
+        let (pixels, spec) = match result {
+            Ok(output) => output,
+            Err(why) => { eprintln!("wc-compositor: Metal surface capture refused: {why}"); return None; }
+        };
+        let view = self.metal_view(surface, spec).ok()?;
+        let size = view.map_or((spec.width, spec.height), |v| v.dst);
+        let staged = crate::surface::BufferSpec { width: size.0, height: size.1, stride: size.0.checked_mul(4)?, format: spec.format };
+        self.viewed.remove(surface);
+        self.metal_surfaces.insert(surface.clone(), MetalSurface { pixels, format: spec.format, raw_spec: spec, view, dirty: true });
+        Some(staged)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn materialize_metal_surface(&mut self, surface: &WlSurface) -> bool {
+        let Some(source) = self.metal_surfaces.get_mut(surface).filter(|s| s.dirty) else { return true; };
+        let staging = self.staging.entry(surface.clone()).or_insert_with(Shadow::empty);
+        let result = unsafe { source.pixels.read_snapshot(|bytes, width, height, stride| {
+            let spec = crate::surface::BufferSpec { width: width as i32, height: height as i32,
+                stride: stride as i32, format: source.format };
+            if let Some(view) = source.view {
+                let mut raw = Shadow::empty();
+                raw.blit(bytes, spec, &[Rect::new(0, 0, spec.width, spec.height)]);
+                staging.scale_from(&raw, &view, None);
+            } else {
+                staging.blit(bytes, spec, &[Rect::new(0, 0, spec.width, spec.height)]);
+            }
+        }) };
+        if result.is_some() { source.dirty = false; true } else { false }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn compose_metal_tree(&self, drawn: &[(WlSurface, (i32, i32))], origin: (i32, i32), size: (i32, i32), scale: i32)
+        -> Option<Arc<wc_handle::iosection::Surface>> {
+        if self.direct.off { return None; }
+        let mut layers = Vec::new();
+        for (surface, at) in drawn {
+            if !self.staging.contains_key(surface) { continue; }
+            let source = self.metal_surfaces.get(surface)?;
+            let at = (at.0.checked_sub(origin.0)?.checked_mul(scale)?, at.1.checked_sub(origin.1)?.checked_mul(scale)?);
+            layers.push(crate::platform::macos_metal::Layer { surface: Arc::clone(&source.pixels), at, alpha: source.format.has_alpha(), view: source.view });
+        }
+        match crate::platform::macos_metal::compose(size.0, size.1, &layers) {
+            Ok(output) => Some(output),
+            Err(why) => { eprintln!("wc-compositor: Metal tree composition refused: {why}"); None }
+        }
+    }
+
     /// May this commit be shown by drawing `buffer` itself, with nothing read
     /// into a shadow? `Err(None)` when the question does not arise (not a
     /// section, not Windows, a window not composited yet), `Err(Some(why))`
@@ -4221,12 +4410,12 @@ impl State {
         root: &WlSurface,
         buffer: &wl_buffer::WlBuffer,
     ) -> Result<DirectFrame, Option<String>> {
-        #[cfg(not(any(windows, target_os = "macos")))]
+        #[cfg(not(windows))]
         {
             let _ = (surface, root, buffer);
             Err(None)
         }
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(windows)]
         {
             use smithay::reexports::wayland_server::protocol::wl_shm;
             if self.direct.off {
@@ -4489,6 +4678,11 @@ impl State {
     /// buffer): the platform stops drawing from the buffer, which then goes
     /// back to its client. Nothing is composited; nothing will be shown.
     fn drop_direct(&mut self, id: WindowId, shown: Option<DirectShown>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_outputs.remove(&id);
+            if let Some(mailbox) = self.metal_mailboxes.remove(&id) { mailbox.take(); }
+        }
         let Some(shown) = shown else { return };
         self.direct.serial += 1;
         let serial = self.direct.serial;
@@ -4548,7 +4742,7 @@ impl State {
         w.path_said = Some(direct);
         if direct {
             #[cfg(target_os = "macos")]
-            println!("wc-compositor: window {} uses Metal composition from its IOSurface, with no CPU readback ({detail})", w.id);
+            println!("wc-compositor: window {} uses Metal tree composition with no CPU readback ({detail})", w.id);
             #[cfg(not(target_os = "macos"))]
             println!(
                 "wc-compositor: window {} is drawn directly from its client's buffer, which this \
@@ -4559,6 +4753,11 @@ impl State {
             println!("wc-compositor: window {} is drawn from its shadow: {detail}", w.id);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn compositor_shm_handle(buffer: &wl_buffer::WlBuffer) -> Option<(wc_handle::Handle, smithay::wayland::shm::BufferData)> {
+    smithay::wayland::shm::buffer_pool_handle(buffer).ok().flatten()
 }
 
 /// What a window's popups have to fit inside, if anything has said.
@@ -5076,6 +5275,8 @@ impl CompositorHandler for State {
     /// `surface_under` after the surface itself was gone.
     fn destroyed(&mut self, surface: &WlSurface) {
         self.staging.remove(surface);
+        #[cfg(target_os = "macos")]
+        self.metal_surfaces.remove(surface);
         self.fence_stale.remove(surface);
         self.direct.opaque_black.remove(surface);
         self.viewed.remove(surface);
@@ -5244,6 +5445,8 @@ impl CompositorHandler for State {
                 // it is the same leak `cursor_surface` above already guards
                 // against by hand.
                 self.staging.remove(surface);
+                #[cfg(target_os = "macos")]
+                self.metal_surfaces.remove(surface);
                 self.viewed.remove(surface);
                 if let Some(window) = self.windows.get_mut(surface) {
                     // A null buffer unmaps the surface. The toplevel still
@@ -5272,7 +5475,7 @@ impl CompositorHandler for State {
                         let (damage, w, h) = self.compose_tree(&root, surface, &[]);
                         if w > 0 && h > 0 {
                             let id = self.windows[&root].id;
-                            self.ui.send(ToUi::Present { id, damage });
+                            self.send_present(id, damage);
                         }
                     }
                 }
@@ -5353,10 +5556,7 @@ impl CompositorHandler for State {
                         );
                         // The whole window, because the crop moved: every pixel
                         // of it now shows a different part of the buffer.
-                        self.ui.send(ToUi::Present {
-                            id,
-                            damage: vec![Rect::new(0, 0, w, h).scaled(self.scale_for(surface), 1)],
-                        });
+                        self.send_present(id, vec![Rect::new(0, 0, w, h).scaled(self.scale_for(surface), 1)]);
                         // §96, found by Minecraft: **a client still choosing
                         // its size has chosen this one**, and the window
                         // follows — the rule §91 made for the buffer path,
@@ -6120,6 +6320,8 @@ impl XdgShellHandler for State {
         }
         if let Some(window) = self.windows.remove(surface.wl_surface()) {
             self.staging.remove(surface.wl_surface());
+            #[cfg(target_os = "macos")]
+            self.metal_surfaces.remove(surface.wl_surface());
             println!(
                 "wc-compositor: xdg_popup destroyed -> window {} ({} frames presented)",
                 window.id, window.presented

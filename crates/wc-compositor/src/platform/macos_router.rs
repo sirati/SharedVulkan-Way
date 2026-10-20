@@ -101,6 +101,7 @@ type Stale = Option<Vec<(i32, i32, i32, i32)>>;
 
 struct Surf {
     immutable: bool,
+    alpha: bool,
     s: [Surface; 2],
     back: u8,
     w: i32,
@@ -278,7 +279,7 @@ impl R {
             // a CPU shadow that stopped following direct commits.
             if macmach::send_surfaces(port, id, w.next_gen, [&surf.s[0], &surf.s[1]]) != 0 { return; }
             let m = ToFace::Surface { id, generation: w.next_gen, w: surf.w,
-                h: surf.h, alpha: true, scale: surf.scale };
+                h: surf.h, alpha: surf.alpha, scale: surf.scale };
             self.send(fid, &m);
             self.send(fid, &ToFace::Present { id, buffer: 0 });
             return;
@@ -301,7 +302,7 @@ impl R {
             if macmach::send_surfaces(port, id, generation, [&a, &b]) != 0 {
                 return;
             }
-            w.surf = Some(Surf { immutable: false, s: [a, b], back: 0, w: sw, h: sh, scale, stale: [None, None] });
+            w.surf = Some(Surf { immutable: false, alpha, s: [a, b], back: 0, w: sw, h: sh, scale, stale: [None, None] });
             fresh = Some(ToFace::Surface { id, generation, w: sw, h: sh, alpha, scale });
         }
         let surf = w.surf.as_mut().expect("surface pair");
@@ -370,7 +371,7 @@ impl R {
         }
         // SAFETY: retain the complete output before moving it into the face state.
         let snapshot = Arc::new(unsafe { wc_handle::iosection::Surface::retain_raw(output.as_ptr()) });
-        w.surf = Some(Surf { immutable: true, s: [output.retain(), output], back: 0,
+        w.surf = Some(Surf { immutable: true, alpha: frame.format.has_alpha(), s: [output.retain(), output], back: 0,
             w: frame.width, h: frame.height, scale, stale: [None, None] });
         self.send(fid, &ToFace::Surface { id, generation, w: frame.width,
             h: frame.height, alpha: frame.format.has_alpha(), scale });
@@ -435,7 +436,26 @@ impl R {
             }
             // WC_FACE_FULL_COPY=1: every present copies the whole window, as
             // before §103.15, for the comparison.
+            ToUi::MetalPresent { id, mailbox } => {
+                let Some(output) = mailbox.take() else { return true; };
+                if let Some(w) = self.wins.get_mut(&id) {
+                    if let Some(generation) = w.next_gen.checked_add(1) {
+                        let scale = w.shadow.lock().unwrap_or_else(|e| e.into_inner()).scale();
+                        let pixels = unsafe { Surface::retain_raw(output.as_ptr()) };
+                        let (width, height) = pixels.size();
+                        w.next_gen = generation;
+                        w.surf = Some(Surf { immutable: true, alpha: true, s: [pixels.retain(), pixels],
+                            back: 0, w: width, h: height, scale, stale: [None, None] });
+                    }
+                }
+                // Retain even before a face connects. A reconnect/expose sends
+                // this same immutable completed output, without CPU shadow IO.
+                self.present(id);
+            }
             ToUi::Present { id, damage } => {
+                if let Some(w) = self.wins.get_mut(&id) {
+                    if w.surf.as_ref().is_some_and(|s| s.immutable) { w.surf = None; }
+                }
                 let full = full_copy();
                 if std::env::var_os("WC_FACE_DAMAGE_DEBUG").is_some() {
                     println!("wc-compositor: present {id}: damage {:?}", damage.iter().map(|r| (r.x, r.y, r.w, r.h)).collect::<Vec<_>>());

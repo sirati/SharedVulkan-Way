@@ -66,6 +66,20 @@ pub fn geometry(width: usize, height: usize, bpp: usize, pitch: usize, allocatio
     (end <= allocation).then_some(allocation)
 }
 
+/// Native VM coverage for a bounded window into an existing page-aligned map.
+/// The logical range remains distinct from the kernel-rounded last page.
+pub fn mapped_span(base: usize, offset: usize, len: usize, page: usize) -> Option<(usize, usize, usize, usize)> {
+    if page == 0 || base == 0 || base % page != 0 || len == 0 { return None; }
+    offset.checked_add(len)?;
+    let prefix = offset % page;
+    let logical = prefix.checked_add(len)?;
+    let mapped = logical.checked_add(page - 1)?.checked_div(page)?.checked_mul(page)?;
+    if mapped > isize::MAX as usize { return None; }
+    let start = base.checked_add(offset - prefix)?;
+    start.checked_add(mapped)?;
+    Some((start, mapped, logical, prefix))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sender { pub uid: u32, pub pid: u32, pub pid_version: u32 }
 /// Parse the kernel audit trailer requested with MACH_RCV_TRAILER_AUDIT.
@@ -131,6 +145,13 @@ mod tests {
             let mut b=add();put(&mut b,at,value);assert_eq!(parse(&b),None);
         }
         let mut b=add();b[48]=0;assert_eq!(parse(&b),None);
+    }
+    #[test] fn vm_span_keeps_original_window_offset_and_logical_tail_bounds() {
+        assert_eq!(mapped_span(0x10000, 4097, 17, 4096), Some((0x11000, 4096, 18, 1)));
+        assert_eq!(mapped_span(0x10000, 16380, 8, 16384), Some((0x10000, 32768, 16388, 16380)));
+        for args in [(1,0,1,4096),(0x10000,0,0,4096),(0x10000,usize::MAX,2,4096),(0x10000,0,1,0)] {
+            assert_eq!(mapped_span(args.0,args.1,args.2,args.3),None);
+        }
     }
     #[test] fn gone_requires_exact_noncomplex_shape() {
         let mut b = vec![0; GONE_SIZE];

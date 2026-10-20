@@ -35,6 +35,14 @@ path receives that actual image and imported memory with offset zero. The
 compositor export protocol is used only for exports; ordinary native images do
 not register names with a compositor.
 
+Metal texture usage follows the requested Vulkan usage. ShaderWrite is required
+for STORAGE and TRANSFER_DST, ShaderRead for sampled/storage/transfer source,
+and RenderTarget for color attachment/transfer destination. SRGB color-only
+images remain eligible. SRGB STORAGE and TRANSFER_DST are refused because the
+current driver import does not implement the required UNORM backing and SRGB
+render-view relationship. Query, feature reporting, creation and allocation use
+the same restriction.
+
 Additional LINEAR format features are conditional on the driver's optimal format
 features and successful MTLTEXTURE import queries for the corresponding usage.
 COLOR_ATTACHMENT, COLOR_ATTACHMENT_BLEND and BLIT_DST are never added solely
@@ -110,48 +118,36 @@ must not be attributed to modifier rewriting without reproducing its chain.
 
 ## Metal composition and source retirement
 
-The compositor now implements a no-CPU-readback path for a complete, single
-ARGB8888 root surface backed by an imported BGRA IOSurface. It checks the window
-geometry, scale, format, offset, dimensions and pitch. The first frame still uses
-the ordinary path to establish the tree. Crops, transforms, subsurfaces, XRGB
-alpha normalization and unsupported Metal devices use the shadow path.
+The compositor captures each supported source into an immutable IOSurface, then
+composes the actual surface tree on Metal. It handles ARGB and opaque XRGB,
+subsurface placement, clipping, normal-transform viewport crops and nearest
+scaling. Native PRIME sources retain the registered source and producer-sync
+guard through GPU completion. Ordinary wl_shm sources expose their original
+mapped pages to a Metal buffer with newBufferWithBytesNoCopy. The capture kernel
+reads the declared offset and stride directly. No CPU pixel copy or readback
+occurs on this supported path.
 
-`macos_metal::snapshot` wraps the source and a fresh compositor-owned output as
-Metal textures, encodes a GPU blit and calls `MTLCommandBuffer.waitUntilCompleted`.
-Apple documents this method as blocking until the command buffer's execution
-finishes. Only a completed command with status Completed produces MetalCopied.
-Textures and both IOSurfaces remain owned across the wait, including errors.
-References: Apple's MTLCommandBuffer `waitUntilCompleted()` and `status` APIs.
+Each command keeps its source mappings, Metal resources and IOSurfaces alive
+until waitUntilCompleted returns with status Completed. Only then does Wayland
+release the source buffer. Composition uses retained immutable captures, so a
+viewport-only commit does not reread a released producer buffer. Unsupported
+transforms, formats or mappings use the existing shadow path. If a captured tree
+needs that fallback, it materializes its owned immutable captures.
 
-The owned output is immutable for its complete lifetime. The router transfers
-its Mach rights to the face before its Surface and Present messages; a face
-restart can resend that same immutable output. The standalone AppKit backend
-also assigns only this owned output to its layer. Neither the layer nor the
-face ever receives the application allocation as layer contents. This is Metal
-GPU composition, not direct CALayer scanout. It uses one GPU copy and no CPU
-readback on eligible steady-state frames.
+The router and standalone backend retain immutable output for expose and face
+restart. A latest-output mailbox permits only one pending UI wakeup per window;
+newer output replaces queued intermediate allocations. CPU fallback invalidates
+the mailbox epoch. Outputs are never recycled or rewritten while consumers can
+retain them. Core Animation and transferred Mach rights own display references.
+This is Metal composition with GPU capture, not direct scanout. No QoS or
+watchdog settings change.
 
-MetalCopied carries an independent retained output back to Wayland state. The
-client buffer is released after that GPU completion, so even a client reusing
-one buffer need not wait for another frame to release it. If the scene later
-requires CPU composition, it reads the immutable output once, not the released
-application allocation. An error before completion leaves the source held until
-the ordinary fallback has copied it. Normal Windows direct-paint lifetime rules
-remain unchanged. `WC_DIRECT_PRESENT=off` disables this fast path too.
-
-Fresh outputs are never recycled or rewritten. Core Animation retains its
-contents; Mach rights and the state snapshot retain any other consumers. Display
-retirement therefore cannot race a write into an old output. This initial
-implementation trades allocation cost for a documented source-retirement
-contract. Pooling those outputs requires a separate display-consumer retirement
-contract. No QoS or watchdog setting changes are involved.
-
-The headless `macos-metal-retirement` example creates a padded source fixture,
-copies it on Metal, immediately rewrites the source, makes a second snapshot,
-and checks that both outputs retain their expected distinct pixels. CPU access
-in that example is fixture setup and verification, not the product path. Build
-it on the build host for aarch64-darwin. A real-Metal run, rapid reuse, fallback,
-resize and face-restart runs remain hardware gates, not inferred successes.
+The headless macos-metal-retirement example verifies source overwrite after
+completion, padded and unaligned original shared-memory input, opaque XRGB,
+alpha blending, clipping, subsurface placement, viewport crop and scaling, and
+metadata-only viewport changes. Its CPU reads are diagnostic verification only.
+Cross-linking cannot validate runtime Metal shader compilation. Native execution
+and full application presentation remain distinct acceptance gates.
 
 ## VideoToolbox decode
 

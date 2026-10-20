@@ -67,6 +67,9 @@ impl MappedView {
         self.ptr
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_iosurface(&self) -> bool { self._owner.is_some() }
+
     /// §110: a view of memory somebody else mapped and keeps mapped for the
     /// life of the process (the GPU device's BAR in the shared compositor).
     /// Its length is 0, so dropping it unmaps nothing.

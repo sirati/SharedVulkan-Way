@@ -503,6 +503,7 @@ struct MacWin {
     shared: Rc<WinShared>,
     _delegate: Option<Retained<WcDelegate>>,
     shadow: Arc<Mutex<Shadow>>,
+    metal_output: Option<Arc<wc_handle::iosection::Surface>>,
     kind: WindowKind,
     mapped: bool,
     icons: Vec<IconImage>,
@@ -1708,7 +1709,15 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
                 place_popup(id, parent, x, y, width, height);
             }
         }
-        ToUi::Present { id, damage } => present(id, &damage),
+        ToUi::Present { id, damage } => {
+            with_win(id, |w| w.metal_output = None);
+            present(id, &damage);
+        }
+        ToUi::MetalPresent { id, mailbox } => {
+                let Some(output) = mailbox.take() else { return; };
+            with_win(id, |w| w.metal_output = Some(output));
+            present(id, &[]);
+        }
         ToUi::Direct { id, frame, damage: _, serial } => {
             let ok = if let Some(frame) = frame {
                 match super::macos_metal::snapshot(&frame) {
@@ -2009,6 +2018,7 @@ fn create(
                     shared,
                     _delegate: delegate,
                     shadow,
+                    metal_output: None,
                     kind,
                     mapped: false,
                     icons: Vec::new(),
@@ -2156,7 +2166,7 @@ fn place_popup(id: WindowId, parent: WindowId, x: i32, y: i32, width: i32, heigh
 }
 
 fn present(id: WindowId, _damage: &[Rect]) {
-    let Some((shadow, view)) = with_win(id, |w| (w.shadow.clone(), w.view.clone())) else { return };
+    let Some((shadow, view, metal)) = with_win(id, |w| (w.shadow.clone(), w.view.clone(), w.metal_output.clone())) else { return };
     // §103.13: a face shows the main process's IOSurface itself. Core
     // Animation reads the surface directly, so nothing is copied here.
     let surf = face_surfaces(|m| {
@@ -2173,6 +2183,17 @@ fn present(id: WindowId, _damage: &[Rect]) {
                 let _: () = msg_send![&*layer, setOpaque: !alpha];
                 let _: () = msg_send![&*layer, setContentsScale: f64::from(scale)];
                 let _: () = msg_send![&*layer, setContents: ptr.cast::<AnyObject>()];
+            }
+        }
+        return;
+    }
+    if let Some(output) = metal {
+        let scale = shadow.lock().unwrap_or_else(|e| e.into_inner()).scale();
+        if let Some(layer) = view_layer(&view) {
+            unsafe {
+                let _: () = msg_send![&*layer, setOpaque: false];
+                let _: () = msg_send![&*layer, setContentsScale: f64::from(scale)];
+                let _: () = msg_send![&*layer, setContents: output.as_ptr().cast::<AnyObject>()];
             }
         }
         return;

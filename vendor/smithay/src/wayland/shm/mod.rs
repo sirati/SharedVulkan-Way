@@ -565,13 +565,17 @@ macro_rules! delegate_shm {
 /// pool length. GPU accesses must stay within logical buffer bounds and finish
 /// before the callback returns. This does not prevent a client truncating its
 /// file; a caller must use the platform's safe original-page pin/import API.
-/// Named/foreign mappings return `Ok(None)`, since their VM extent is unknown.
+/// On macOS named VM mappings use their retained original page extent too.
+/// Foreign/IOSurface CPU views return `Ok(None)` and use native texture import.
 #[cfg(unix)]
 pub fn with_buffer_mapping<T>(
     buffer: &wl_buffer::WlBuffer,
     f: impl FnOnce(*const u8, usize, usize, BufferData) -> T,
 ) -> Result<Option<T>, BufferAccessError> {
     let data = buffer.data::<ShmBufferUserData>().ok_or(BufferAccessError::NotManaged)?;
-    data.pool.with_mapped_data(|base, mapped, logical| f(base, mapped, logical, data.data))
-        .map_err(|()| BufferAccessError::BadMap)
+    data.pool.with_mapped_data(|base, mapped, logical, prefix| {
+        let mut spec = data.data;
+        spec.offset = spec.offset.checked_add(i32::try_from(prefix).ok()?)?;
+        Some(f(base, mapped, logical, spec))
+    }).map(Option::flatten).map_err(|()| BufferAccessError::BadMap)
 }

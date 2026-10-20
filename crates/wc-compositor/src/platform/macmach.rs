@@ -158,6 +158,14 @@ impl Surface {
         }
     }
 
+    /// Retain a live IOSurface supplied by the GPU compositor.
+    /// # Safety
+    /// The pointer must name a live IOSurface for the duration of this call.
+    pub unsafe fn retain_raw(raw: *mut c_void) -> Self {
+        unsafe { CFRetain(raw) };
+        Self(raw)
+    }
+
     /// Another owner; immutable GPU snapshots may be shared by both face slots.
     pub fn retain(&self) -> Surface {
         // SAFETY: the returned value owns the new CF reference.
