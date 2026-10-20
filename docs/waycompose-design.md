@@ -37605,7 +37605,11 @@ generation with `services.waycompose`. For each installation it does this:
   beneath the system layout, with its current trusted key. It keeps the
   system services, user mapping and broker protection. It never restores
   admin user units, desktop raw-resource ACLs or an exposed old key. A
-  missing protected snapshot refuses rollback.
+  missing protected snapshot refuses rollback. The first protected install
+  creates its initial snapshot, and later deploys snapshot the prior
+  protected installation. Rollback requires idle admin and mapped-user
+  session managers; it restores installation apps, configuration and bins,
+  while keeping shared service binaries and the mapping unchanged.
 
 The earlier legacy-layout dry run does not establish protected rollback.
 The current fixture checks protected snapshot restoration, key rotation,
@@ -37654,7 +37658,9 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
 * the debug ssh transport is not available with it.
 
 Before the first privileged-identity migration, `key-prepare` stops both
-legacy and system verifiers after refusing active sessions. It generates a
+legacy and system verifiers after refusing active sessions. It disables the
+legacy admin units and removes retired verifier keys before provisioning,
+so a restart or reboot cannot revive exposed trust. It generates a
 fresh key beneath root-owned `/var/lib/waycompose/key-trust/<name>` with
 0700 directories and 0600 files. `key-export` sends that candidate directly
 to the deploy channel, never into the admin's staging tree. The Windows
@@ -37663,7 +37669,9 @@ records protected provenance. `apply` and `install-staged` refuse keys
 without that provenance. They never infer historical secrecy from a key's
 current owner or mode. Failure keeps the old verifier stopped; retry uses
 the same protected candidate. Already protected deployments reuse their
-key. Privileged broker provisioning through the old user layout is refused.
+key. Every script-managed shared-verifier restart first checks that all
+installed directories have protected broker-confirmed provenance and match
+their registry key; a partially migrated directory leaves services stopped. Privileged broker provisioning through the old user layout is refused.
 The root helper and privileged deployment channel are trusted administration
 interfaces, not interfaces exposed to desktop clients.
 
