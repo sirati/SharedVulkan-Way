@@ -344,17 +344,6 @@ impl GpuServer {
         self.shared.driver.served.iter().map(|f| crate::convert::queue_family(&f.props)).collect()
     }
 
-    /// The queue `vkGetDeviceQueue(family, …)` names. A family we did not
-    /// advertise gets the first queue rather than nothing — the command returns
-    /// `void`, and `sv_icd::icd::get_device_queue` has already said so.
-    fn queue_for_family(&self, family: u32) -> vk::Queue {
-        self.shared
-            .driver
-            .served
-            .get(family as usize)
-            .map(|f| f.queue)
-            .unwrap_or(self.shared.driver.queue)
-    }
 }
 
 /// The two video links of a `VkQueueFamilyProperties2` reply, for one family.
@@ -502,6 +491,17 @@ impl GpuHost for GpuServer {
     fn override_get_semaphore_counter_value(&mut self,_a:&p::VkGetSemaphoreCounterValueArgs)->Option<WireResult<p::VkGetSemaphoreCounterValueReply>> {self.native_failed_status()}
     #[cfg(target_os = "macos")]
     fn override_wait_semaphores(&mut self,a:&p::VkWaitSemaphoresArgs)->Option<WireResult<p::VkWaitSemaphoresReply>> {self.native_wait_semaphores(a)}
+
+    #[cfg(target_os = "macos")]
+    fn override_create_event(&mut self,a:&p::VkCreateEventArgs)->Option<WireResult<p::VkCreateEventReply>> {self.native_event_create(a)}
+    #[cfg(target_os = "macos")]
+    fn override_destroy_event(&mut self,a:&p::VkDestroyEventArgs)->Option<WireResult<()>> {self.native_event_destroy(a)}
+    #[cfg(target_os = "macos")]
+    fn override_set_event(&mut self,a:&p::VkSetEventArgs)->Option<WireResult<p::VkSetEventReply>> {self.native_event_set(a)}
+    #[cfg(target_os = "macos")]
+    fn override_reset_event(&mut self,a:&p::VkResetEventArgs)->Option<WireResult<p::VkResetEventReply>> {self.native_event_reset(a)}
+    #[cfg(target_os = "macos")]
+    fn override_get_event_status(&mut self,a:&p::VkGetEventStatusArgs)->Option<WireResult<p::VkGetEventStatusReply>> {self.native_event_status(a)}
 
     #[cfg(target_os = "macos")]
     fn capture_recorded_commands(&self, wire: u64) -> bool { self.native_captures_recorded_commands(wire) }
@@ -867,6 +867,12 @@ impl GpuHost for GpuServer {
     }
 
     fn create_device(&mut self, a: p::VkCreateDeviceArgs) -> WireResult<p::VkCreateDeviceReply> {
+        let Some(info) = a.p_create_info.as_deref() else {
+            return Ok(p::VkCreateDeviceReply { result: fail(vk::Result::ERROR_INITIALIZATION_FAILED), p_device: None });
+        };
+        if let Err(error) = self.shared.driver.validate_queue_requests(info) {
+            return Ok(p::VkCreateDeviceReply { result: fail(error), p_device: None });
+        }
         // The application's requested feature set is **not** honoured, and that
         // is a real limitation rather than an oversight: the device it is asking
         // for already exists. `crate::driver` compensates by enabling every
@@ -922,7 +928,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueueArgs,
     ) -> WireResult<p::VkGetDeviceQueueReply> {
-        let q = self.queue_for_family(a.queue_family_index);
+        let q = self.shared.driver.served_queue(a.queue_family_index, a.queue_index, 0)
+            .ok_or(WireError::Table)?;
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }
@@ -933,8 +940,9 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetDeviceQueue2Args,
     ) -> WireResult<p::VkGetDeviceQueue2Reply> {
-        let family = a.p_queue_info.as_ref().map(|i| i.queue_family_index).unwrap_or(0);
-        let q = self.queue_for_family(family);
+        let info = a.p_queue_info.as_ref().ok_or(WireError::Table)?;
+        let q = self.shared.driver.served_queue(info.queue_family_index, info.queue_index, info.flags.0)
+            .ok_or(WireError::Table)?;
         if let Some(id) = a.p_queue {
             self.shared.objects().insert(id.0, HandleType::VkQueue, q);
         }

@@ -113,6 +113,12 @@ mod native_video_image;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod video_recording;
 
+#[cfg(any(target_os = "macos", test))]
+mod native_video_events;
+
+#[cfg(target_os = "macos")]
+mod native_video_event_dispatch;
+
 #[cfg(target_os = "macos")]
 mod native_video_resources;
 

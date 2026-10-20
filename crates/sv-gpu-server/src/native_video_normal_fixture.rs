@@ -11,7 +11,11 @@ use std::{
     time::Duration,
 };
 static FINISHED: OnceLock<Mutex<Option<mpsc::Sender<Result<(), vk::Result>>>>> = OnceLock::new();
-pub(super) fn native_job_finished(result: Result<(), vk::Result>) {
+pub(super) fn native_job_finished(fence: u64, result: Result<(), vk::Result>) {
+    // Prefix/event-only Jobs do not prove the selected decode producer retired.
+    if fence != FENCE {
+        return;
+    }
     if let Some(tx) = FINISHED
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -73,6 +77,7 @@ pub(super) fn run(
     let destination = Arc::clone(&fixture.destination);
     let setup = Arc::clone(&fixture.setup);
     let fence = fixture.user_fence;
+    let event_prefix = fixture.event_prefix.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let body = std::thread::Builder::new()
         .name("fixture-verification".into())
@@ -89,6 +94,7 @@ pub(super) fn run(
                 job,
                 fence,
                 body_progress,
+                event_prefix,
             );
             let _ = done_tx.send(result);
         })
@@ -180,6 +186,12 @@ pub(super) fn run(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
+    if let Some(prefix) = &fixture.event_prefix {
+        let mut rpc = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&fixture.shared)));
+        if let Err(error) = unsafe { prefix.cleanup_after_retirement(&mut rpc) } {
+            cancellation::parked(fixture, &format!("retired prefix cleanup failed: {error}"));
+        }
+    }
     unsafe {
         cleanup(&fixture, binary);
     }

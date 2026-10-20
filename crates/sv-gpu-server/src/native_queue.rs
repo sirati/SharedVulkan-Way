@@ -134,7 +134,12 @@ impl video_worker::Submission for Job {
         }
         #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
         if self.video.is_some() {
-            crate::native_video_queue_fixture::native_job_finished(result);
+            let fence = match self.call.as_ref() {
+                Some(Call::Submit(args)) => args.fence.0,
+                Some(Call::Submit2(args)) => args.fence.0,
+                _ => 0,
+            };
+            crate::native_video_queue_fixture::native_job_finished(fence, result);
         }
     }
 }
@@ -143,6 +148,9 @@ impl GpuServer {
         if self.shared.driver.native_submission_failure().is_some() {
             return Err(vk::Result::ERROR_DEVICE_LOST);
         }
+        let admission = Arc::clone(&self.shared.native_video.lock().unwrap_or_else(|e|e.into_inner()).admission);
+        let _admission = admission.lock().unwrap_or_else(|e|e.into_inner());
+        let queue_wire = match &call { Call::Submit(a) => a.queue.0, Call::Submit2(a) => a.queue.0, _ => 0 };
         let batches = {
             let state = self
                 .shared
@@ -169,7 +177,7 @@ impl GpuServer {
         // records native barriers but never waits or reads compressed payload.
         let video = batches
             .map(|batches| {
-                crate::native_video_queue::Submission::prepare(Arc::clone(&self.shared), batches)
+                crate::native_video_queue::Submission::prepare(Arc::clone(&self.shared), queue_wire, batches)
             })
             .transpose()?;
         let (done, receiver) = if wait {
@@ -238,8 +246,14 @@ impl GpuServer {
             })
     }
     fn native_queue_enabled(&self) -> bool {
-        if self.shared.driver.native_submission_failure().is_some() { return true; }
-        let state = self.shared.native_video.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.driver.native_submission_failure().is_some() {
+            return true;
+        }
+        let state = self
+            .shared
+            .native_video
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         state.failure().is_some() || state.video.available()
     }
     pub(crate) fn native_queue_submit(

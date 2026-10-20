@@ -2,6 +2,7 @@
 use crate::{
     native_video::Decode,
     native_video_decode::{self, Runtime},
+    native_video_events::{Events, Lowered, Operation, Ticket},
     native_video_image::Image,
     native_video_source::Prepared,
     native_video_submits::Batch,
@@ -11,7 +12,7 @@ use crate::{
 };
 use ash::vk::{self, Handle};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 use sv_proto::HandleType;
@@ -38,6 +39,47 @@ struct BatchPlan {
     actions: Vec<Action>,
     signals: Vec<video_submit::Semaphore>,
     fence: vk::Fence,
+    event_ticket: Option<usize>,
+}
+struct EventReservation {
+    ticket: Ticket,
+    committed: bool,
+}
+fn event_operations(steps: &[Step], operations: &mut Vec<Operation>) {
+    for step in steps {
+        match step {
+            Step::Native(call) => {
+                if let Some(op) = Operation::from_recorded(call) {
+                    operations.push(op);
+                }
+            }
+            Step::Execute { secondaries, .. } => {
+                for child in secondaries.iter() {
+                    event_operations(&child.steps, operations);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+fn validate_secondary_generations(
+    steps: &[Step],
+    plans: &video_recording::Plans,
+) -> Result<(), vk::Result> {
+    for step in steps {
+        if let Step::Execute { secondaries, .. } = step {
+            for child in secondaries.iter() {
+                let current = plans
+                    .secondary_snapshot(child.wire)
+                    .map_err(|_| invalid())?;
+                if current.generation != child.generation {
+                    return Err(invalid());
+                }
+                validate_secondary_generations(&child.steps, plans)?;
+            }
+        }
+    }
+    Ok(())
 }
 pub(crate) struct Submission {
     shared: Arc<Shared>,
@@ -48,17 +90,33 @@ pub(crate) struct Submission {
     submitted: bool,
     retired: bool,
     retained_fences: Vec<vk::Fence>,
+    events: Arc<Mutex<Events>>,
+    event_reservations: Vec<EventReservation>,
 }
 impl Submission {
     /// Resolve every allocation, synchronization handle and immutable recording
     /// before submitting any native work. No compressed payload is read here.
-    pub(crate) fn prepare(shared: Arc<Shared>, batches: Vec<Batch>) -> Result<Self, vk::Result> {
+    pub(crate) fn prepare(
+        shared: Arc<Shared>,
+        queue: u64,
+        batches: Vec<Batch>,
+    ) -> Result<Self, vk::Result> {
+        if !shared.driver.native_video_queue_contract() {
+            return Err(invalid());
+        }
         let runtime = Arc::clone(
             &shared
                 .native_video
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .runtime,
+        );
+        let events = Arc::clone(
+            &shared
+                .native_video
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .events,
         );
         let pool = unsafe {
             shared.driver.device.create_command_pool(
@@ -76,8 +134,69 @@ impl Submission {
             submitted: false,
             retired: false,
             retained_fences: vec![],
+            events,
+            event_reservations: vec![],
         };
-        for batch in batches {
+        // Freeze all command generations first. No native producer is started.
+        let frozen = {
+            let state = result
+                .shared
+                .native_video
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            batches
+                .into_iter()
+                .map(|batch| {
+                    let plans = batch
+                        .commands
+                        .iter()
+                        .map(|wire| state.plans.video(*wire).map_err(|_| invalid()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for plan in plans.iter().flatten() {
+                        validate_secondary_generations(plan, &state.plans)?;
+                    }
+                    let begins = batch
+                        .commands
+                        .iter()
+                        .map(|wire| state.plans.begin_info(*wire).cloned().ok())
+                        .collect::<Vec<_>>();
+                    Ok((batch, plans, begins))
+                })
+                .collect::<Result<Vec<_>, vk::Result>>()?
+        };
+        // One HOST snapshot and projected reservation transaction covers every
+        // batch. Native recording starts only after all reservations succeed.
+        let prepared = {
+            let mut events = result.events.lock().unwrap_or_else(|e| e.into_inner());
+            let mut prepared = Vec::new();
+            for (batch, plans, begins) in frozen {
+                let mut operations = Vec::new();
+                for (plan, begin) in plans.iter().zip(&begins) {
+                    if let Some(plan) = plan {
+                        let before = operations.len();
+                        event_operations(plan, &mut operations);
+                        if operations.len() != before && begin.is_none() {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                let (ticket, lowered) = if operations.is_empty() {
+                    (None, VecDeque::new())
+                } else {
+                    let plan = events.plan(queue, &operations).map_err(|_| invalid())?;
+                    let ticket = events.reserve(&plan).map_err(|_| invalid())?;
+                    let index = result.event_reservations.len();
+                    result.event_reservations.push(EventReservation {
+                        ticket,
+                        committed: false,
+                    });
+                    (Some(index), VecDeque::from(plan.lowered))
+                };
+                prepared.push((batch, plans, begins, ticket, lowered));
+            }
+            prepared
+        };
+        for (batch, plans, begins, event_ticket, mut event_lowered) in prepared {
             let semaphores = |semaphores: &[crate::native_video_submits::Semaphore]| -> Result<Vec<_>,vk::Result> {
                 let objects = result.shared.objects();
                 semaphores.iter().map(|s| Ok(video_submit::Semaphore {
@@ -96,23 +215,16 @@ impl Submission {
                     .map_err(|_| invalid())?
             };
             let mut actions = vec![];
-            for &wire in batch.commands.iter() {
-                let plan = result
-                    .shared
-                    .native_video
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .plans
-                    .video(wire)
-                    .map_err(|_| invalid())?;
+            for ((&wire, plan), begin) in batch.commands.iter().zip(plans).zip(begins) {
                 if let Some(plan) = plan {
+                    let begin = begin.unwrap_or_default();
                     let mut segment = None;
                     let mut state = Vec::<Arc<sv_gpu_entry::RecordedCall>>::new();
                     for step in plan.iter() {
                         match step {
                             Step::Barrier(original) => {
                                 let (lowered, handles) = result.resolve_barrier(original)?;
-                                let command = result.segment(&mut segment, &state)?;
+                                let command = result.segment(&mut segment, &state, wire, &begin)?;
                                 unsafe {
                                     crate::native_video_barriers::record(
                                         &result.shared.driver,
@@ -125,8 +237,8 @@ impl Submission {
                                 }?;
                             }
                             Step::Native(call) => {
-                                let command = result.segment(&mut segment, &state)?;
-                                result.replay_native(command, call)?;
+                                let command = result.segment(&mut segment, &state, wire, &begin)?;
+                                result.record_call(command, call, &mut event_lowered)?;
                                 // Secondary execution invalidates the primary's native state.
                                 if call.name() == "vkCmdExecuteCommands" {
                                     state.clear();
@@ -137,6 +249,16 @@ impl Submission {
                                 ) {
                                     state.push(Arc::clone(call));
                                 }
+                            }
+                            Step::Execute { call, secondaries } => {
+                                let command = result.segment(&mut segment, &state, wire, &begin)?;
+                                result.execute_secondaries(
+                                    command,
+                                    call,
+                                    secondaries,
+                                    &mut event_lowered,
+                                )?;
+                                state.clear();
                             }
                             Step::Decode(job) => {
                                 result.flush_segment(&mut segment, &mut actions)?;
@@ -166,14 +288,141 @@ impl Submission {
                     actions.push(Action::Native(command));
                 }
             }
+            if !event_lowered.is_empty() {
+                return Err(invalid());
+            }
             result.batches.push(BatchPlan {
                 waits,
                 actions,
                 signals,
                 fence,
+                event_ticket,
             });
         }
         Ok(result)
+    }
+    fn execute_secondaries(
+        &mut self,
+        command: vk::CommandBuffer,
+        call: &sv_gpu_entry::RecordedCall,
+        secondaries: &[video_recording::SecondarySnapshot],
+        lowered: &mut VecDeque<Lowered>,
+    ) -> Result<(), vk::Result> {
+        if !call.available(&self.shared.fns) {
+            return Err(invalid());
+        }
+        let sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(args) = call else {
+            return Err(invalid());
+        };
+        if args.p_command_buffers.len() != secondaries.len()
+            || args.command_buffer_count as usize != secondaries.len()
+        {
+            return Err(invalid());
+        }
+        for (wire, snapshot) in args.p_command_buffers.iter().zip(secondaries) {
+            if wire.0 != snapshot.wire {
+                return Err(invalid());
+            }
+            let child = self.secondary(snapshot, lowered)?;
+            // Each occurrence receives a private recording, including repeated
+            // wire IDs. Ordinary secondary execution invalidates primary state.
+            unsafe {
+                self.shared
+                    .driver
+                    .device
+                    .cmd_execute_commands(command, &[child]);
+            }
+        }
+        Ok(())
+    }
+    fn secondary(
+        &mut self,
+        snapshot: &video_recording::SecondarySnapshot,
+        lowered: &mut VecDeque<Lowered>,
+    ) -> Result<vk::CommandBuffer, vk::Result> {
+        let command = unsafe {
+            self.shared.driver.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .level(vk::CommandBufferLevel::SECONDARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        let mut host = crate::server::GpuServer::new(Arc::clone(&self.shared));
+        host.native_queue_worker = true;
+        host.native_record_replay = Some((snapshot.wire, command.as_raw()));
+        let mut forward = sv_gpu_entry::Forward::new(host);
+        use sv_proto::Server;
+        let reply = forward
+            .begin_command_buffer(sv_proto::VkBeginCommandBufferArgs {
+                command_buffer: sv_proto::VkCommandBuffer(snapshot.wire),
+                p_begin_info: Some(Box::new((*snapshot.begin).clone())),
+            })
+            .map_err(|_| invalid())?;
+        if reply.result.0 != 0 {
+            return Err(invalid());
+        }
+        for step in snapshot.steps.iter() {
+            match step {
+                Step::Native(call) => self.record_call(command, call, lowered)?,
+                Step::Barrier(original) => {
+                    let (lowered, handles) = self.resolve_barrier(original)?;
+                    unsafe {
+                        crate::native_video_barriers::record(
+                            &self.shared.driver,
+                            command,
+                            &lowered,
+                            |ty, wire| handles.get(&(ty, wire)).copied().ok_or_else(invalid),
+                        )
+                    }?;
+                }
+                Step::Execute { call, secondaries } => {
+                    self.execute_secondaries(command, call, secondaries, lowered)?
+                }
+                Step::Decode(_) => return Err(invalid()),
+            }
+        }
+        unsafe { self.shared.driver.device.end_command_buffer(command) }?;
+        Ok(command)
+    }
+    fn record_call(
+        &mut self,
+        command: vk::CommandBuffer,
+        call: &sv_gpu_entry::RecordedCall,
+        lowered: &mut VecDeque<Lowered>,
+    ) -> Result<(), vk::Result> {
+        if Operation::from_recorded(call).is_none() {
+            return self.replay_native(command, call);
+        }
+        let (barriers, write) = match lowered.pop_front().ok_or_else(invalid)? {
+            Lowered::NoOp => return Ok(()),
+            Lowered::Set { before, write, .. } => (
+                before,
+                Some(sv_gpu_entry::RecordedCall::VkCmdSetEvent2(Box::new(write))),
+            ),
+            Lowered::Reset { before, write, .. } => (
+                before,
+                Some(sv_gpu_entry::RecordedCall::VkCmdResetEvent2(Box::new(
+                    write,
+                ))),
+            ),
+            Lowered::Wait { barriers, .. } => (barriers, None),
+        };
+        for barrier in barriers {
+            let (barrier, handles) = self.resolve_barrier(&barrier)?;
+            unsafe {
+                crate::native_video_barriers::record(
+                    &self.shared.driver,
+                    command,
+                    &barrier,
+                    |ty, wire| handles.get(&(ty, wire)).copied().ok_or_else(invalid),
+                )
+            }?;
+        }
+        if let Some(write) = write {
+            self.replay_native(command, &write)?;
+        }
+        Ok(())
     }
     fn replay_native(
         &self,
@@ -182,6 +431,24 @@ impl Submission {
     ) -> Result<(), vk::Result> {
         if !call.available(&self.shared.fns) {
             return Err(invalid());
+        }
+        if let sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(args) = call {
+            let state = self.shared.native_video.lock().unwrap();
+            for child in &args.p_command_buffers {
+                if state.plans.video(child.0).map_err(|_| invalid())?.is_some() {
+                    return Err(invalid());
+                }
+            }
+            drop(state);
+            let objects = self.shared.objects();
+            for child in &args.p_command_buffers {
+                let native = objects
+                    .get::<vk::CommandBuffer>(HandleType::VkCommandBuffer, child.0)
+                    .map_err(|_| invalid())?;
+                if self.shared.poisoned.get(native.as_raw()).is_some() {
+                    return Err(invalid());
+                }
+            }
         }
         let mut host = crate::server::GpuServer::new(Arc::clone(&self.shared));
         host.native_queue_worker = true;
@@ -197,11 +464,34 @@ impl Submission {
         &self,
         segment: &mut Option<vk::CommandBuffer>,
         state: &[Arc<sv_gpu_entry::RecordedCall>],
+        wire: u64,
+        begin: &sv_proto::VkCommandBufferBeginInfo,
     ) -> Result<vk::CommandBuffer, vk::Result> {
         if let Some(command) = *segment {
             return Ok(command);
         }
-        let command = self.command()?;
+        let command = unsafe {
+            self.shared.driver.device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        let mut host = crate::server::GpuServer::new(Arc::clone(&self.shared));
+        host.native_queue_worker = true;
+        host.native_record_replay = Some((wire, command.as_raw()));
+        let mut forward = sv_gpu_entry::Forward::new(host);
+        use sv_proto::Server;
+        let reply = forward
+            .begin_command_buffer(sv_proto::VkBeginCommandBufferArgs {
+                command_buffer: sv_proto::VkCommandBuffer(wire),
+                p_begin_info: Some(Box::new(begin.clone())),
+            })
+            .map_err(|_| invalid())?;
+        if reply.result.0 != 0 {
+            return Err(invalid());
+        }
         for call in state {
             self.replay_native(command, call)?;
         }
@@ -405,6 +695,20 @@ impl Submission {
         Ok(command)
     }
     pub(crate) unsafe fn execute(&mut self) -> Result<(), vk::Result> {
+        let result = unsafe { self.execute_inner() };
+        if result.is_err() {
+            let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            for event in self
+                .event_reservations
+                .iter()
+                .filter(|event| !event.committed)
+            {
+                let _ = events.fail(&event.ticket);
+            }
+        }
+        result
+    }
+    unsafe fn execute_inner(&mut self) -> Result<(), vk::Result> {
         let shared = Arc::clone(&self.shared);
         let _queue = shared.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.submitted = true;
@@ -421,6 +725,10 @@ impl Submission {
                 runtime: &self.runtime,
                 jobs,
                 next: 0,
+                events: &self.events,
+                event: batch
+                    .event_ticket
+                    .map(|index| &mut self.event_reservations[index]),
             };
             let work: Vec<_> = batch
                 .actions
@@ -456,8 +764,28 @@ struct Executor<'a> {
     runtime: &'a Arc<Mutex<Runtime>>,
     jobs: Vec<&'a Arc<Resolved>>,
     next: usize,
+    events: &'a Arc<Mutex<Events>>,
+    event: Option<&'a mut EventReservation>,
 }
 impl video_submit::DecodeExecutor for Executor<'_> {
+    fn needs_body_completion(&self) -> bool {
+        self.event.is_some()
+    }
+    fn body_completed(&mut self) -> Result<(), vk::Result> {
+        if let Some(event) = self.event.as_mut() {
+            // Real native body fence and every intervening VT/input producer
+            // completed. Commit before original batch signals become visible.
+            unsafe {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .complete(&event.ticket)
+            }
+            .map_err(|_| invalid())?;
+            event.committed = true;
+        }
+        Ok(())
+    }
     fn decode_completed(&mut self, job: &Decode) -> Result<(), vk::Result> {
         let resolved = self.jobs.get(self.next).ok_or_else(invalid)?;
         if !std::ptr::eq(&resolved.job, job) {
@@ -493,6 +821,24 @@ impl video_submit::DecodeExecutor for Executor<'_> {
 }
 impl Drop for Submission {
     fn drop(&mut self) {
+        // All pre-accept preparation is serialized through enqueue. Roll back
+        // tail reservations in reverse order only when no native work started.
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        for event in self
+            .event_reservations
+            .iter()
+            .rev()
+            .filter(|event| !event.committed)
+        {
+            if !self.submitted {
+                if unsafe { events.cancel_unaccepted(&event.ticket) }.is_err() {
+                    let _ = events.fail(&event.ticket);
+                }
+            } else {
+                let _ = events.fail(&event.ticket);
+            }
+        }
+        drop(events);
         assert!(
             !self.submitted || self.retired,
             "native video owners dropped before retirement"

@@ -24,6 +24,14 @@ pub(crate) enum Work<'a> {
 /// input allocation and every output/reference allocation through completion.
 pub(crate) trait DecodeExecutor {
     fn decode_completed(&mut self, job: &Decode) -> Result<(), vk::Result>;
+    /// Event metadata commits require proof of the real final native body.
+    fn needs_body_completion(&self) -> bool {
+        false
+    }
+    /// Called only after final native fence completion, before user signals.
+    fn body_completed(&mut self) -> Result<(), vk::Result> {
+        Ok(())
+    }
 }
 
 /// Run only on the device submission worker, never in the submitting RPC.
@@ -78,6 +86,9 @@ pub(crate) unsafe fn submit(
             }
         }
     }
+    complete_body(executor, &mut native, |commands| unsafe {
+        native_completed(driver, &[], commands, retained_fences)
+    })?;
     let signals: Vec<_> = signals
         .iter()
         .map(|s| {
@@ -98,13 +109,28 @@ pub(crate) unsafe fn submit(
     let last = vk::SubmitInfo2::default()
         .command_buffer_infos(&native)
         .signal_semaphore_infos(&signals);
-    // Final native segments retain their asynchronous behavior. The Vulkan
-    // fence/semaphore signals are downstream of every completed decoder write.
+    // Without a body-completion hook, final native segments stay asynchronous.
+    // With one, this signal-only batch follows the completed body and commit.
     unsafe {
         driver
             .device
             .queue_submit2(driver.queue, &[last], completion)
     }
+}
+
+/// Keep the completion proof and metadata commit before constructing user
+/// signals. Even an empty final body needs a fence for prior queue prefixes.
+fn complete_body<T>(
+    executor: &mut impl DecodeExecutor,
+    native: &mut Vec<T>,
+    complete: impl FnOnce(&[T]) -> Result<(), vk::Result>,
+) -> Result<(), vk::Result> {
+    if executor.needs_body_completion() {
+        complete(native)?;
+        native.clear();
+        executor.body_completed()?;
+    }
+    Ok(())
 }
 
 unsafe fn native_completed(
@@ -159,4 +185,94 @@ pub(crate) unsafe fn complete(
     retained_fences: &mut Vec<vk::Fence>,
 ) -> Result<(), vk::Result> {
     unsafe { native_completed(driver, &[], &[], retained_fences) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::RefCell, rc::Rc};
+    struct Executor {
+        required: bool,
+        commit: Result<(), vk::Result>,
+        order: Rc<RefCell<Vec<&'static str>>>,
+    }
+    impl DecodeExecutor for Executor {
+        fn decode_completed(&mut self, _: &Decode) -> Result<(), vk::Result> {
+            Ok(())
+        }
+        fn needs_body_completion(&self) -> bool {
+            self.required
+        }
+        fn body_completed(&mut self) -> Result<(), vk::Result> {
+            self.order.borrow_mut().push("commit");
+            self.commit
+        }
+    }
+    #[test]
+    fn body_fence_precedes_commit_and_signal_for_nonempty_and_empty_suffixes() {
+        for body in [vec![17, 23], vec![]] {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let mut executor = Executor {
+                required: true,
+                commit: Ok(()),
+                order: order.clone(),
+            };
+            let mut native = body.clone();
+            complete_body(&mut executor, &mut native, |commands| {
+                assert_eq!(commands, body);
+                order.borrow_mut().push("fence");
+                Ok(())
+            })
+            .unwrap();
+            assert!(native.is_empty());
+            order.borrow_mut().push("signal");
+            assert_eq!(*order.borrow(), ["fence", "commit", "signal"]);
+        }
+    }
+    #[test]
+    fn fence_or_commit_failure_stops_before_signal_and_preserves_pending_body() {
+        for fence_failure in [false, true] {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let mut executor = Executor {
+                required: true,
+                commit: Err(vk::Result::ERROR_DEVICE_LOST),
+                order: order.clone(),
+            };
+            let mut native = vec![17];
+            let result = complete_body(&mut executor, &mut native, |_| {
+                order.borrow_mut().push("fence");
+                if fence_failure {
+                    Err(vk::Result::ERROR_DEVICE_LOST)
+                } else {
+                    Ok(())
+                }
+            });
+            if result.is_ok() {
+                order.borrow_mut().push("signal");
+            }
+            assert_eq!(result, Err(vk::Result::ERROR_DEVICE_LOST));
+            if fence_failure {
+                assert_eq!(native, [17]);
+                assert_eq!(*order.borrow(), ["fence"]);
+            } else {
+                assert!(native.is_empty());
+                assert_eq!(*order.borrow(), ["fence", "commit"]);
+            }
+        }
+    }
+    #[test]
+    fn ordinary_executor_keeps_final_native_body_asynchronous() {
+        struct Ordinary;
+        impl DecodeExecutor for Ordinary {
+            fn decode_completed(&mut self, _: &Decode) -> Result<(), vk::Result> {
+                Ok(())
+            }
+        }
+        let mut native = vec![17];
+        complete_body(&mut Ordinary, &mut native, |_| {
+            panic!("unexpected final body wait")
+        })
+        .unwrap();
+        assert_eq!(native, [17]);
+    }
 }

@@ -22,6 +22,20 @@ pub enum Step {
     Barrier(Barrier),
     Decode(Decode),
     Native(Arc<sv_gpu_entry::RecordedCall>),
+    Execute {
+        call: Arc<sv_gpu_entry::RecordedCall>,
+        secondaries: Arc<[SecondarySnapshot]>,
+    },
+}
+/// Immutable recording generation, independent of later reset/free/rebegin.
+#[derive(Clone)]
+pub struct SecondarySnapshot {
+    pub wire: u64,
+    pub generation: u64,
+    pub begin: Arc<p::VkCommandBufferBeginInfo>,
+    pub steps: Arc<[Step]>,
+    pub has_events: bool,
+    pub unknown_state: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rejected(pub &'static str);
@@ -140,7 +154,7 @@ impl NativeScope {
         }
         Ok(())
     }
-    fn cut(&self) -> Result<()> {
+    fn cut(&self, event_lowering: bool) -> Result<()> {
         if !self.closed() {
             return Err(Rejected(
                 "external decode would split an active native scope",
@@ -149,7 +163,7 @@ impl NativeScope {
         if self.unknown_state {
             return Err(Rejected("native state restoration is not audited"));
         }
-        if self.events {
+        if self.events && !event_lowering {
             return Err(Rejected(
                 "native event provenance lowering is not implemented",
             ));
@@ -159,23 +173,33 @@ impl NativeScope {
 }
 struct Recording {
     mode: Mode,
+    video_incompatible: bool,
     scope: bool,
     ended: bool,
     poison: Option<&'static str>,
     steps: Vec<Step>,
     finished: Option<Arc<[Step]>>,
     native: NativeScope,
+    generation: u64,
+    begin: Option<Arc<p::VkCommandBufferBeginInfo>>,
+    primary_begin: Option<p::VkCommandBufferBeginInfo>,
+    snapshot: Option<SecondarySnapshot>,
 }
 impl Default for Recording {
     fn default() -> Self {
         Self {
             mode: Mode::Undecided,
+            video_incompatible: false,
             scope: false,
             ended: false,
             poison: None,
             steps: vec![],
             finished: None,
             native: NativeScope::default(),
+            generation: 0,
+            begin: None,
+            primary_begin: None,
+            snapshot: None,
         }
     }
 }
@@ -192,8 +216,34 @@ pub struct Plans {
     buffers: HashMap<u64, Recording>,
     allocations: HashMap<u64, u64>,
     secondary: std::collections::HashSet<u64>,
+    generation: u64,
+    event_lowering: bool,
 }
 impl Plans {
+    /// Internal activation only after the queue owns complete event lowering.
+    /// An ordinary End has already moved calls to native replay, so late
+    /// activation rejects such event recordings rather than replaying them raw.
+    pub fn enable_event_lowering(&mut self) {
+        self.event_lowering = true;
+        for (wire, recording) in &mut self.buffers {
+            if !self.secondary.contains(wire)
+                && recording.native.events
+                && recording.ended
+                && recording.finished.is_none()
+            {
+                recording.poison = Some("event lowering enabled after ordinary event replay");
+            }
+        }
+    }
+    pub fn mark_video_incompatible(&mut self, wire: u64) -> Result<()> {
+        let r = self.recording(wire)?;
+        if r.mode == Mode::Video {
+            r.poison = Some("video recording has incompatible begin metadata");
+            return Err(Rejected(r.poison.unwrap()));
+        }
+        r.video_incompatible = true;
+        Ok(())
+    }
     pub fn allocated(&mut self, pool: u64, wires: &[u64]) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         if pool == 0
@@ -220,9 +270,10 @@ impl Plans {
         self.buffers.contains_key(&wire)
     }
     pub fn is_video(&self, wire: u64) -> bool {
-        self.buffers
-            .get(&wire)
-            .is_some_and(|r| r.mode == Mode::Video)
+        self.buffers.get(&wire).is_some_and(|r| {
+            r.mode == Mode::Video
+                || (self.event_lowering && !self.secondary.contains(&wire) && r.native.events)
+        })
     }
     pub fn pool_buffers(&self, pool: u64) -> Vec<u64> {
         self.allocations
@@ -245,12 +296,61 @@ impl Plans {
         if wire == 0 {
             return Err(Rejected("null command buffer"));
         }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(Rejected("command buffer generation exhausted"))?;
         let mut recording = Recording::default();
+        recording.generation = self.generation;
         if self.secondary.contains(&wire) {
             recording.mode = Mode::Ordinary;
         }
         self.buffers.insert(wire, recording);
         Ok(())
+    }
+    /// Preserve exact owned begin/inheritance metadata after successful native Begin.
+    /// Primary recordings move metadata without an additional Arc allocation.
+    pub fn set_begin_info(&mut self, wire: u64, begin: p::VkCommandBufferBeginInfo) -> Result<()> {
+        let secondary = self.secondary.contains(&wire);
+        let r = self.recording(wire)?;
+        if r.begin.is_some() || r.primary_begin.is_some() || !r.steps.is_empty() {
+            return Err(Rejected("begin metadata set after recording started"));
+        }
+        if secondary {
+            r.begin = Some(Arc::new(begin));
+        } else {
+            r.primary_begin = Some(begin);
+        }
+        Ok(())
+    }
+    /// Borrow exact metadata without allocating/cloning an ordinary primary.
+    pub fn begin_info(&self, wire: u64) -> Result<&p::VkCommandBufferBeginInfo> {
+        let r = self
+            .buffers
+            .get(&wire)
+            .ok_or(Rejected("unknown command buffer"))?;
+        r.primary_begin
+            .as_ref()
+            .or(r.begin.as_deref())
+            .ok_or(Rejected("missing exact command buffer begin metadata"))
+    }
+    pub fn secondary_snapshot(&self, wire: u64) -> Result<SecondarySnapshot> {
+        let r = self
+            .buffers
+            .get(&wire)
+            .ok_or(Rejected("unknown secondary recording"))?;
+        if !self.secondary.contains(&wire)
+            || !r.ended
+            || r.poison.is_some()
+            || r.mode == Mode::Video
+        {
+            return Err(Rejected(
+                "secondary recording is unfinished, poisoned or synthetic",
+            ));
+        }
+        r.snapshot
+            .clone()
+            .ok_or(Rejected("secondary lacks immutable begin metadata"))
     }
     pub fn reset(&mut self, wire: u64) {
         self.buffers.remove(&wire);
@@ -278,6 +378,33 @@ impl Plans {
     pub fn poisoned(&self, wire: u64) -> Option<&'static str> {
         self.buffers.get(&wire).and_then(|r| r.poison)
     }
+    pub fn executed(&mut self, wire: u64, secondaries: &[u64]) -> Result<()> {
+        let mut events = false;
+        for child in secondaries {
+            let recording = self
+                .buffers
+                .get(child)
+                .ok_or(Rejected("unknown secondary recording"))?;
+            if !self.secondary.contains(child)
+                || !recording.ended
+                || recording.poison.is_some()
+                || recording.mode == Mode::Video
+            {
+                return Err(Rejected(
+                    "secondary recording is unfinished, poisoned or synthetic",
+                ));
+            }
+            events |= recording.native.events;
+        }
+        let secondary = self.secondary.contains(&wire);
+        let r = self.recording(wire)?;
+        r.native.events |= events;
+        if events && r.mode == Mode::Ordinary && !secondary {
+            r.poison = Some("secondary events follow uncaptured ordinary commands");
+            return Err(Rejected(r.poison.unwrap()));
+        }
+        Ok(())
+    }
     pub fn note_ordinary_command(&mut self, wire: u64, name: &str) {
         if matches!(
             name,
@@ -290,6 +417,9 @@ impl Plans {
         ) {
             if let Some(r) = self.buffers.get_mut(&wire) {
                 r.native.events = true;
+                if r.mode == Mode::Ordinary && !self.secondary.contains(&wire) {
+                    r.poison = Some("event follows uncaptured ordinary commands");
+                }
             }
         }
     }
@@ -297,31 +427,56 @@ impl Plans {
         self.buffers.get(&wire).is_some_and(|r| r.native.events)
     }
     pub fn captures_native(&self, wire: u64) -> bool {
-        self.buffers
-            .get(&wire)
-            .is_some_and(|r| r.mode != Mode::Ordinary && !r.ended && r.poison.is_none())
+        self.buffers.get(&wire).is_some_and(|r| {
+            (r.mode != Mode::Ordinary || self.secondary.contains(&wire))
+                && !r.ended
+                && r.poison.is_none()
+        })
     }
     pub fn native(&mut self, call: sv_gpu_entry::RecordedCall) -> Result<()> {
-        let secondary_events = if let sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(args) = &call
-        {
-            args.p_command_buffers
-                .iter()
-                .any(|cb| self.has_events(cb.0))
+        let children = if let sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(args) = &call {
+            if args.command_buffer_count as usize != args.p_command_buffers.len() {
+                return Err(Rejected("secondary command buffer count mismatch"));
+            }
+            Some(
+                args.p_command_buffers
+                    .iter()
+                    .map(|cb| self.secondary_snapshot(cb.0))
+                    .collect::<Result<Vec<_>>>()?,
+            )
         } else {
-            false
+            None
         };
-        let r = self.recording(call.command_buffer())?;
-        r.native.events |= secondary_events;
+        let wire = call.command_buffer();
+        if !self.captures_native(wire) {
+            return Err(Rejected("native call cannot enter uncaptured recording"));
+        }
+        let r = self.recording(wire)?;
+        if let Some(children) = &children {
+            r.native.events |= children.iter().any(|child| child.has_events);
+            // Ordinary secondary execution invalidates all primary state. The
+            // secondary is replayed whole, so none of its bindings restore into
+            // the primary. NV inheritance exceptions remain outside this path.
+            r.native.unknown_state = false;
+        }
         if r.scope && !call.allowed_in_video_scope() {
             return Err(Rejected("native command is not permitted in a video scope"));
         }
         r.native.apply(&call)?;
-        r.steps.push(Step::Native(Arc::new(call)));
+        let call = Arc::new(call);
+        r.steps.push(match children {
+            Some(children) => Step::Execute {
+                call,
+                secondaries: children.into(),
+            },
+            None => Step::Native(call),
+        });
         Ok(())
     }
     pub fn barrier(&mut self, barrier: Barrier) -> Result<BarrierAction> {
+        let secondary = self.secondary.contains(&barrier.command());
         let r = self.recording(barrier.command())?;
-        if r.mode == Mode::Ordinary {
+        if r.mode == Mode::Ordinary && !secondary {
             return Ok(BarrierAction::Forward(barrier));
         }
         r.steps.push(Step::Barrier(barrier));
@@ -330,12 +485,25 @@ impl Plans {
     /// Parent must replay the returned list successfully before this ordinary
     /// command is forwarded. Replay must bypass both interception hooks.
     pub fn prepare_ordinary(&mut self, wire: u64) -> Result<Vec<Barrier>> {
+        if self.secondary.contains(&wire) {
+            self.poison(wire, "uncaptured secondary command cannot be reconstructed");
+            return Err(Rejected(
+                "uncaptured secondary command cannot be reconstructed",
+            ));
+        }
         let r = self.recording(wire)?;
+        if r.native.events {
+            r.poison = Some("uncaptured command would discard event recording");
+            return Err(Rejected(r.poison.unwrap()));
+        }
         if r.mode == Mode::Video {
             r.poison = Some("ordinary command mixed with synthetic video");
             return Err(Rejected(r.poison.unwrap()));
         }
-        if r.steps.iter().any(|s| matches!(s, Step::Native(_))) {
+        if r.steps
+            .iter()
+            .any(|s| matches!(s, Step::Native(_) | Step::Execute { .. }))
+        {
             r.poison = Some("uncaptured command cannot discard owned native recording");
             return Err(Rejected(r.poison.unwrap()));
         }
@@ -344,28 +512,39 @@ impl Plans {
             .drain(..)
             .map(|s| match s {
                 Step::Barrier(b) => b,
-                Step::Decode(_) | Step::Native(_) => unreachable!(),
+                Step::Decode(_) | Step::Native(_) | Step::Execute { .. } => unreachable!(),
             })
             .collect())
     }
     pub fn begin_scope(&mut self, wire: u64) -> Result<()> {
+        if self.secondary.contains(&wire) {
+            self.poison(
+                wire,
+                "video scopes are forbidden in secondary command buffers",
+            );
+            return Err(Rejected(
+                "video scopes are forbidden in secondary command buffers",
+            ));
+        }
+        let event_lowering = self.event_lowering;
         let r = self.recording(wire)?;
-        if r.scope || r.mode == Mode::Ordinary {
+        if r.scope || r.mode == Mode::Ordinary || r.video_incompatible {
             r.poison = Some("video coding scope mixed with ordinary recording");
             return Err(Rejected(r.poison.unwrap()));
         }
-        r.native.cut()?;
+        r.native.cut(event_lowering)?;
         r.mode = Mode::Video;
         r.scope = true;
         Ok(())
     }
     pub fn decode(&mut self, wire: u64, decode: Decode) -> Result<()> {
+        let event_lowering = self.event_lowering;
         let r = self.recording(wire)?;
         if !r.scope {
             r.poison = Some("decode outside video coding scope");
             return Err(Rejected(r.poison.unwrap()));
         }
-        r.native.cut()?;
+        r.native.cut(event_lowering)?;
         r.steps.push(Step::Decode(decode));
         Ok(())
     }
@@ -379,6 +558,8 @@ impl Plans {
         Ok(())
     }
     pub fn end(&mut self, wire: u64) -> Result<End> {
+        let secondary = self.secondary.contains(&wire);
+        let event_lowering = self.event_lowering;
         let r = self.recording(wire)?;
         if r.scope {
             r.poison = Some("command buffer ended inside video coding scope");
@@ -387,15 +568,32 @@ impl Plans {
         if !r.native.closed() {
             return Err(Rejected("command buffer ended inside native scope"));
         }
-        if r.mode == Mode::Video && r.native.events {
+        if r.mode == Mode::Video && r.native.events && !event_lowering {
             r.poison = Some("native event provenance lowering is not implemented");
             return Err(Rejected(r.poison.unwrap()));
         }
         r.ended = true;
-        if r.mode == Mode::Video {
+        if r.mode == Mode::Video || (!secondary && event_lowering && r.native.events) {
+            if r.mode == Mode::Ordinary {
+                r.poison = Some("cannot route incomplete ordinary event history");
+                return Err(Rejected(r.poison.unwrap()));
+            }
             let steps: Arc<[Step]> = std::mem::take(&mut r.steps).into();
             r.finished = Some(steps.clone());
             Ok(End::Video(steps))
+        } else if secondary {
+            let steps: Arc<[Step]> = std::mem::take(&mut r.steps).into();
+            if let Some(begin) = &r.begin {
+                r.snapshot = Some(SecondarySnapshot {
+                    wire,
+                    generation: r.generation,
+                    begin: begin.clone(),
+                    steps: steps.clone(),
+                    has_events: r.native.events,
+                    unknown_state: r.native.unknown_state,
+                });
+            }
+            Ok(End::Ordinary(steps.iter().cloned().collect()))
         } else {
             Ok(End::Ordinary(std::mem::take(&mut r.steps)))
         }
@@ -671,7 +869,6 @@ mod tests {
         assert_eq!(args.p_buffers[0].0, 81);
         assert_eq!(args.p_offsets, [16]);
         assert!(matches!(&snapshot[1], Step::Decode(job) if job.source_buffer == 11));
-        assert!(plans.captures_native(7));
     }
     #[test]
     fn events_after_last_decode_are_not_forwarded_to_native_noop_wait() {
@@ -692,6 +889,9 @@ mod tests {
         let mut plans = Plans::default();
         plans.allocated_secondary(3, &[8]).unwrap();
         plans.begin(8).unwrap();
+        plans
+            .set_begin_info(8, p::VkCommandBufferBeginInfo::default())
+            .unwrap();
         plans.note_ordinary_command(8, "vkCmdWaitEvents2");
         plans.end(8).unwrap();
         plans.begin(7).unwrap();
@@ -705,6 +905,256 @@ mod tests {
             )))
             .unwrap();
         assert!(plans.begin_scope(7).is_err());
+    }
+    #[test]
+    fn secondary_execution_rejects_unfinished_and_poisoned_recordings() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8]).unwrap();
+        plans.begin(7).unwrap();
+        plans.begin(8).unwrap();
+        assert!(plans.executed(7, &[8]).is_err());
+        plans.end(8).unwrap();
+        plans.poison(8, "missing native implementation");
+        assert!(plans.executed(7, &[8]).is_err());
+    }
+    #[test]
+    fn nested_secondary_event_metadata_reaches_primary_cut_validation() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8, 9]).unwrap();
+        plans.begin(9).unwrap();
+        plans.note_ordinary_command(9, "vkCmdWaitEvents2");
+        plans.end(9).unwrap();
+        plans.begin(8).unwrap();
+        plans.executed(8, &[9]).unwrap();
+        plans.end(8).unwrap();
+        plans.begin(7).unwrap();
+        plans.executed(7, &[8]).unwrap();
+        assert!(plans.begin_scope(7).is_err());
+    }
+    #[test]
+    fn secondary_snapshot_retains_exact_calls_begin_and_generation_after_reuse() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8]).unwrap();
+        plans.begin(8).unwrap();
+        let mut begin = p::VkCommandBufferBeginInfo::default();
+        begin.flags = p::VkCommandBufferUsageFlags(2);
+        plans.set_begin_info(8, begin).unwrap();
+        assert!(plans.captures_native(8));
+        assert!(matches!(
+            plans.barrier(barrier(8, 42)).unwrap(),
+            BarrierAction::Deferred
+        ));
+        let mut wait = p::VkCmdWaitEvents2Args::default();
+        wait.command_buffer = p::VkCommandBuffer(8);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdWaitEvents2(Box::new(wait)))
+            .unwrap();
+        let End::Ordinary(replay) = plans.end(8).unwrap() else {
+            panic!()
+        };
+        assert_eq!(replay.len(), 2);
+        let snapshot = plans.secondary_snapshot(8).unwrap();
+        assert_eq!(snapshot.begin.flags.0, 2);
+        assert_eq!(snapshot.steps.len(), 2);
+        assert!(snapshot.has_events);
+        assert!(matches!(&snapshot.steps[0], Step::Barrier(b) if marker(b) == 42));
+        let Step::Native(saved) = &snapshot.steps[1] else {
+            panic!()
+        };
+        let Step::Native(replayed) = &replay[1] else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(saved, replayed));
+        plans.begin(8).unwrap();
+        plans
+            .set_begin_info(8, p::VkCommandBufferBeginInfo::default())
+            .unwrap();
+        plans.end(8).unwrap();
+        assert_ne!(
+            snapshot.generation,
+            plans.secondary_snapshot(8).unwrap().generation
+        );
+        plans.free(&[8]);
+        assert_eq!(snapshot.begin.flags.0, 2);
+        assert_eq!(snapshot.steps.len(), 2);
+    }
+    #[test]
+    fn nested_execute_owns_child_generation_and_event_history() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8, 9]).unwrap();
+        plans.begin(9).unwrap();
+        plans
+            .set_begin_info(9, p::VkCommandBufferBeginInfo::default())
+            .unwrap();
+        let mut wait = p::VkCmdWaitEvents2Args::default();
+        wait.command_buffer = p::VkCommandBuffer(9);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdWaitEvents2(Box::new(wait)))
+            .unwrap();
+        plans.end(9).unwrap();
+        let child_generation = plans.secondary_snapshot(9).unwrap().generation;
+        for (wire, child) in [(8, 9), (7, 8)] {
+            plans.begin(wire).unwrap();
+            plans
+                .set_begin_info(wire, p::VkCommandBufferBeginInfo::default())
+                .unwrap();
+            let mut execute = p::VkCmdExecuteCommandsArgs::default();
+            execute.command_buffer = p::VkCommandBuffer(wire);
+            execute.command_buffer_count = 1;
+            execute.p_command_buffers = vec![p::VkCommandBuffer(child)];
+            plans
+                .native(sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(Box::new(
+                    execute,
+                )))
+                .unwrap();
+            if wire == 8 {
+                plans.end(wire).unwrap();
+            }
+        }
+        plans.reset(9);
+        plans.reset(8);
+        assert!(plans.begin_scope(7).is_err());
+        let Step::Execute { secondaries, .. } = &plans.buffers[&7].steps[0] else {
+            panic!()
+        };
+        let Step::Execute {
+            secondaries: children,
+            ..
+        } = &secondaries[0].steps[0]
+        else {
+            panic!()
+        };
+        assert_eq!(children[0].generation, child_generation);
+        assert!(children[0].has_events);
+    }
+    #[test]
+    fn secondary_reconstruction_rejects_missing_begin_and_uncaptured_calls() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8]).unwrap();
+        plans.begin(8).unwrap();
+        plans.end(8).unwrap();
+        assert!(plans.secondary_snapshot(8).is_err());
+        plans.begin(8).unwrap();
+        assert!(plans.prepare_ordinary(8).is_err());
+        assert!(plans.end(8).is_err());
+        plans.begin(8).unwrap();
+        assert!(plans.begin_scope(8).is_err());
+    }
+    fn record_wait(plans: &mut Plans, wire: u64) {
+        let mut wait = p::VkCmdWaitEvents2Args::default();
+        wait.command_buffer = p::VkCommandBuffer(wire);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdWaitEvents2(Box::new(wait)))
+            .unwrap();
+    }
+    #[test]
+    fn event_only_primary_routes_only_after_explicit_activation() {
+        for enabled in [false, true] {
+            let mut plans = Plans::default();
+            if enabled {
+                plans.enable_event_lowering();
+            }
+            plans.begin(7).unwrap();
+            plans
+                .set_begin_info(7, p::VkCommandBufferBeginInfo::default())
+                .unwrap();
+            plans.mark_video_incompatible(7).unwrap();
+            assert!(plans.captures_native(7));
+            record_wait(&mut plans, 7);
+            assert_eq!(plans.is_video(7), enabled);
+            let end = plans.end(7).unwrap();
+            if enabled {
+                let End::Video(snapshot) = end else { panic!() };
+                assert_eq!(snapshot.len(), 1);
+                assert_eq!(plans.video(7).unwrap().unwrap().len(), 1);
+            } else {
+                assert!(matches!(end, End::Ordinary(_)));
+            }
+            assert!(plans.begin_info(7).is_ok());
+        }
+    }
+    #[test]
+    fn activated_event_history_can_span_decode_cuts() {
+        let mut plans = Plans::default();
+        plans.enable_event_lowering();
+        plans.begin(7).unwrap();
+        record_wait(&mut plans, 7);
+        plans.begin_scope(7).unwrap();
+        plans.decode(7, decode(11)).unwrap();
+        plans.end_scope(7).unwrap();
+        record_wait(&mut plans, 7);
+        let End::Video(snapshot) = plans.end(7).unwrap() else {
+            panic!()
+        };
+        assert!(matches!(
+            &snapshot[..],
+            [Step::Native(_), Step::Decode(_), Step::Native(_)]
+        ));
+    }
+    #[test]
+    fn activated_nested_secondary_events_route_event_only_primary() {
+        let mut plans = Plans::default();
+        plans.enable_event_lowering();
+        plans.allocated_secondary(3, &[8, 9]).unwrap();
+        plans.begin(9).unwrap();
+        plans
+            .set_begin_info(9, p::VkCommandBufferBeginInfo::default())
+            .unwrap();
+        record_wait(&mut plans, 9);
+        assert!(matches!(plans.end(9).unwrap(), End::Ordinary(_)));
+        for (wire, child) in [(8, 9), (7, 8)] {
+            plans.begin(wire).unwrap();
+            plans
+                .set_begin_info(wire, p::VkCommandBufferBeginInfo::default())
+                .unwrap();
+            let mut execute = p::VkCmdExecuteCommandsArgs::default();
+            execute.command_buffer = p::VkCommandBuffer(wire);
+            execute.command_buffer_count = 1;
+            execute.p_command_buffers = vec![p::VkCommandBuffer(child)];
+            plans
+                .native(sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(Box::new(
+                    execute,
+                )))
+                .unwrap();
+            if wire == 8 {
+                assert!(!plans.is_video(wire));
+                assert!(matches!(plans.end(wire).unwrap(), End::Ordinary(_)));
+            }
+        }
+        assert!(plans.is_video(7));
+        assert!(matches!(plans.end(7).unwrap(), End::Video(_)));
+    }
+    #[test]
+    fn incompatible_video_metadata_keeps_capture_but_rejects_video_scope() {
+        let mut plans = Plans::default();
+        plans.enable_event_lowering();
+        plans.begin(7).unwrap();
+        plans.mark_video_incompatible(7).unwrap();
+        assert!(plans.captures_native(7));
+        assert!(plans.begin_scope(7).is_err());
+    }
+    #[test]
+    fn late_activation_cannot_recover_already_replayed_event_calls() {
+        let mut plans = Plans::default();
+        plans.begin(7).unwrap();
+        record_wait(&mut plans, 7);
+        assert!(matches!(plans.end(7).unwrap(), End::Ordinary(_)));
+        plans.enable_event_lowering();
+        assert!(plans.is_video(7));
+        assert!(plans.video(7).is_err());
+    }
+    #[test]
+    fn uncaptured_primary_prefix_cannot_later_route_events() {
+        let mut plans = Plans::default();
+        plans.enable_event_lowering();
+        plans.begin(7).unwrap();
+        plans.prepare_ordinary(7).unwrap();
+        plans.note_ordinary_command(7, "vkCmdSetEvent2");
+        assert!(plans.end(7).is_err());
+        plans.begin(7).unwrap();
+        record_wait(&mut plans, 7);
+        assert!(plans.prepare_ordinary(7).is_err());
+        assert!(plans.end(7).is_err());
     }
     #[test]
     fn ordinary_first_command_flushes_deferred_barriers_once_in_original_order() {
@@ -747,7 +1197,9 @@ mod tests {
             .map(|step| match step {
                 Step::Barrier(b) => marker(b),
                 Step::Decode(d) => d.source_buffer,
-                Step::Native(_) => panic!("unexpected native call in barrier-only test"),
+                Step::Native(_) | Step::Execute { .. } => {
+                    panic!("unexpected native call in barrier-only test")
+                }
             })
             .collect();
         assert_eq!(values, vec![1, 11, 2, 12, 3]);
@@ -865,12 +1317,11 @@ mod pool_tests {
 mod secondary_tests {
     use super::*;
     #[test]
-    fn secondary_buffers_keep_native_recording_but_refuse_video_staging() {
+    fn secondary_buffers_capture_native_recording_but_refuse_video_staging() {
         let mut plans = Plans::default();
         plans.allocated_secondary(10, &[7]).unwrap();
         plans.begin(7).unwrap();
         assert!(!plans.allows_video(7));
-        assert!(plans.prepare_ordinary(7).unwrap().is_empty());
         assert!(plans.begin_scope(7).is_err());
         assert!(plans.poisoned(7).is_some());
         plans.free(&[7]);

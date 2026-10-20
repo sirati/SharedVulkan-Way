@@ -23,6 +23,8 @@ use sv_transport::region::SharedRegion;
 
 #[path = "native_video_cancel_fixture.rs"]
 mod cancellation;
+#[path = "native_video_event_fixture.rs"]
+mod event_prefix;
 #[path = "native_video_normal_fixture.rs"]
 mod normal;
 #[path = "native_video_queue_wire_fixture.rs"]
@@ -40,13 +42,14 @@ struct Fixture {
     timeline: vk::Semaphore,
     diagnostic_fence: Option<vk::Fence>,
     user_fence: vk::Fence,
+    event_prefix: Option<Arc<event_prefix::Prepared>>,
 }
 
 pub fn run_cancel_waits(sync2: bool) -> Result<(), String> {
     cancellation::run(sync2)
 }
-pub(crate) fn native_job_finished(result: Result<(), vk::Result>) {
-    normal::native_job_finished(result);
+pub(crate) fn native_job_finished(fence: u64, result: Result<(), vk::Result>) {
+    normal::native_job_finished(fence, result);
 }
 pub(crate) fn native_wait_submitted() {
     cancellation::native_wait_submitted();
@@ -373,7 +376,7 @@ pub fn run_mode(sync2: bool, wire_recording: bool) -> Result<(), String> {
 }
 
 fn submit_and_verify(
-    rpc: sv_gpu_entry::Forward<GpuServer>,
+    mut rpc: sv_gpu_entry::Forward<GpuServer>,
     sync2: bool,
     wire_recording: bool,
     shared: Arc<Shared>,
@@ -429,6 +432,19 @@ fn submit_and_verify(
             .device
             .create_fence(&vk::FenceCreateInfo::default(), None)
     })?);
+    let event_prefix = if std::env::args().any(|a| a == "--event-prefix") {
+        shared
+            .native_video
+            .lock()
+            .unwrap()
+            .plans
+            .enable_event_lowering();
+        let prefix = Arc::new(event_prefix::Prepared::prepare(&mut rpc)?);
+        prefix.resource_report();
+        Some(prefix)
+    } else {
+        None
+    };
     let fixture = Fixture {
         rpc,
         shared,
@@ -441,6 +457,7 @@ fn submit_and_verify(
         timeline,
         diagnostic_fence,
         user_fence: fence,
+        event_prefix,
     };
     normal::run(fixture, sync2, wire_recording, job, binary)
 }
@@ -454,6 +471,7 @@ fn verification_body(
     job: Decode,
     fence: vk::Fence,
     progress: Arc<normal::Progress>,
+    event_prefix: Option<Arc<event_prefix::Prepared>>,
 ) -> Result<(), String> {
     let driver = Arc::clone(&shared.driver);
     // Earlier ordinary native work signals the binary once. Manual mode also
@@ -489,18 +507,25 @@ fn verification_body(
         checked(
             wire(rpc.queue_submit2(p::VkQueueSubmit2Args {
                 queue: p::VkQueue(QUEUE),
-                submit_count: 1,
-                p_submits: vec![p::VkSubmitInfo2 {
-                    wait_semaphore_info_count: 2,
-                    p_wait_semaphore_infos: vec![semaphore(TIMELINE, 1), semaphore(BINARY, 0)],
-                    command_buffer_info_count: 1,
-                    p_command_buffer_infos: vec![p::VkCommandBufferSubmitInfo {
-                        command_buffer: p::VkCommandBuffer(COMMAND),
-                        device_mask: 1,
+                submit_count: if event_prefix.is_some() { 2 } else { 1 },
+                p_submits: {
+                    let mut batches = event_prefix
+                        .iter()
+                        .map(|prefix| prefix.prefix_submit2())
+                        .collect::<Vec<_>>();
+                    batches.push(p::VkSubmitInfo2 {
+                        wait_semaphore_info_count: 2,
+                        p_wait_semaphore_infos: vec![semaphore(TIMELINE, 1), semaphore(BINARY, 0)],
+                        command_buffer_info_count: 1,
+                        p_command_buffer_infos: vec![p::VkCommandBufferSubmitInfo {
+                            command_buffer: p::VkCommandBuffer(COMMAND),
+                            device_mask: 1,
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    }],
-                    ..Default::default()
-                }],
+                    });
+                    batches
+                },
                 fence: p::VkFence(FENCE),
             }))?
             .result,
@@ -509,31 +534,41 @@ fn verification_body(
         checked(
             wire(rpc.queue_submit(p::VkQueueSubmitArgs {
                 queue: p::VkQueue(QUEUE),
-                submit_count: 1,
-                p_submits: vec![p::VkSubmitInfo {
-                    p_next: vec![p::PNextLink::VkTimelineSemaphoreSubmitInfo(Box::new(
-                        p::VkTimelineSemaphoreSubmitInfo {
-                            wait_semaphore_value_count: 2,
-                            p_wait_semaphore_values: vec![1, 0],
-                            ..Default::default()
-                        },
-                    ))],
-                    wait_semaphore_count: 2,
-                    p_wait_semaphores: vec![p::VkSemaphore(TIMELINE), p::VkSemaphore(BINARY)],
-                    p_wait_dst_stage_mask: vec![
-                        p::VkPipelineStageFlags(
-                            vk::PipelineStageFlags::ALL_COMMANDS.as_raw()
-                        );
-                        2
-                    ],
-                    command_buffer_count: 1,
-                    p_command_buffers: vec![p::VkCommandBuffer(COMMAND)],
-                    ..Default::default()
-                }],
+                submit_count: if event_prefix.is_some() { 2 } else { 1 },
+                p_submits: {
+                    let mut batches = event_prefix
+                        .iter()
+                        .map(|prefix| prefix.prefix_submit())
+                        .collect::<Vec<_>>();
+                    batches.push(p::VkSubmitInfo {
+                        p_next: vec![p::PNextLink::VkTimelineSemaphoreSubmitInfo(Box::new(
+                            p::VkTimelineSemaphoreSubmitInfo {
+                                wait_semaphore_value_count: 2,
+                                p_wait_semaphore_values: vec![1, 0],
+                                ..Default::default()
+                            },
+                        ))],
+                        wait_semaphore_count: 2,
+                        p_wait_semaphores: vec![p::VkSemaphore(TIMELINE), p::VkSemaphore(BINARY)],
+                        p_wait_dst_stage_mask: vec![
+                            p::VkPipelineStageFlags(
+                                vk::PipelineStageFlags::ALL_COMMANDS.as_raw()
+                            );
+                            2
+                        ],
+                        command_buffer_count: 1,
+                        p_command_buffers: vec![p::VkCommandBuffer(COMMAND)],
+                        ..Default::default()
+                    });
+                    batches
+                },
                 fence: p::VkFence(FENCE),
             }))?
             .result,
         )?;
+    }
+    if let Some(prefix) = &event_prefix {
+        prefix.observe(&mut rpc)?;
     }
     // Submit has returned while HOST timeline remains zero. Prove it cannot
     // have signaled the final user fence before the future HOST signal.

@@ -529,6 +529,7 @@ pub(super) fn prepare() -> Result<Fixture, String> {
         .get::<vk::Fence>(HandleType::VkFence, FENCE)
         .map_err(|e| format!("{e:?}"))?;
     Ok(Fixture {
+        event_prefix: None,
         diagnostic_fence: None,
         user_fence,
         timeline,

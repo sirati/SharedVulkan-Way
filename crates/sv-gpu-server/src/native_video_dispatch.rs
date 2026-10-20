@@ -21,6 +21,8 @@ fn wire_result(r: VideoResult<()>) -> p::VkResult {
 #[derive(Default)]
 pub struct DispatchState {
     pub plans: crate::video_recording::Plans,
+    pub(crate) admission: std::sync::Arc<std::sync::Mutex<()>>,
+    pub(crate) events: std::sync::Arc<std::sync::Mutex<crate::native_video_events::Events>>,
     pub video: NativeVideo,
     pub(crate) runtime: std::sync::Arc<std::sync::Mutex<crate::native_video_decode::Runtime>>,
     failure: Option<vk::Result>,
@@ -128,7 +130,7 @@ impl GpuServer {
         let state = self.shared.native_video.lock().unwrap();
         let mut reply = p::VkGetPhysicalDeviceVideoCapabilitiesKHRReply::default();
         let r = (|| -> VideoResult<()> {
-            if !state.available() {
+            if !state.available() || !self.shared.driver.native_video_queue_contract() {
                 return Err(fail());
             }
             let profile = profile(a.p_video_profile.as_deref().ok_or_else(invalid)?)?;
@@ -166,7 +168,7 @@ impl GpuServer {
         let mut state = self.shared.native_video.lock().unwrap();
         let mut reply = p::VkCreateVideoSessionKHRReply::default();
         let r = (|| -> VideoResult<()> {
-            if !state.available() {
+            if !state.available() || !self.shared.driver.native_video_queue_contract() {
                 return Err(fail());
             }
             let c = a.p_create_info.as_deref().ok_or_else(invalid)?;
@@ -423,7 +425,7 @@ impl GpuServer {
         let state = self.shared.native_video.lock().unwrap();
         let mut reply = p::VkGetPhysicalDeviceVideoFormatPropertiesKHRReply::default();
         let r = (|| -> VideoResult<()> {
-            if !state.available() {
+            if !state.available() || !self.shared.driver.native_video_queue_contract() {
                 return Err(fail());
             }
             let info = a.p_video_format_info.as_deref().ok_or_else(invalid)?;

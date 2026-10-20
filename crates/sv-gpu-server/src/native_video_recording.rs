@@ -71,7 +71,7 @@ impl GpuServer {
         for step in steps {
             match step {
                 Step::Barrier(barrier) => self.replay_barriers(wire, vec![barrier])?,
-                Step::Native(call) => {
+                Step::Native(call) | Step::Execute { call, .. } => {
                     let call = Arc::try_unwrap(call).unwrap_or_else(|call| (*call).clone());
                     self.replay_recording(|f| call.replay(f))?;
                 }
@@ -192,8 +192,22 @@ impl GpuServer {
                         && info.flags.0 & vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE.as_raw()
                             == 0
                 });
-            if !video_compatible {
-                let _ = state.plans.prepare_ordinary(a.command_buffer.0);
+            if let Some(info) = a.p_begin_info.as_deref() {
+                if state
+                    .plans
+                    .set_begin_info(a.command_buffer.0, info.clone())
+                    .is_err()
+                {
+                    drop(state);
+                    let _ = self.recording_error(
+                        a.command_buffer.0,
+                        "failed to retain native begin metadata",
+                    );
+                    return Some(Ok(p::VkBeginCommandBufferReply { result: failed() }));
+                }
+            }
+            if !video_compatible && state.plans.allows_video(a.command_buffer.0) {
+                let _ = state.plans.mark_video_incompatible(a.command_buffer.0);
             }
         }
         Some(result)
@@ -340,16 +354,33 @@ impl GpuServer {
         if !self.native_recording_enabled() {
             return None;
         }
-        let state = self.shared.native_video.lock().unwrap();
-        let unsupported = a
-            .p_command_buffers
-            .iter()
-            .any(|cb| state.plans.is_video(cb.0));
-        drop(state);
-        if unsupported {
+        let children: Vec<_> = a.p_command_buffers.iter().map(|cb| cb.0).collect();
+        let tracked = self
+            .shared
+            .native_video
+            .lock()
+            .unwrap()
+            .plans
+            .executed(a.command_buffer.0, &children);
+        if let Err(error) = tracked {
+            return Some(self.recording_error(a.command_buffer.0, error.0));
+        }
+        let poisoned = {
+            let objects = self.shared.objects();
+            children.iter().any(|wire| {
+                match objects.get::<vk::CommandBuffer>(p::HandleType::VkCommandBuffer, *wire) {
+                    Ok(command) => {
+                        use ash::vk::Handle;
+                        self.shared.poisoned.get(command.as_raw()).is_some()
+                    }
+                    Err(_) => true,
+                }
+            })
+        };
+        if poisoned {
             Some(self.recording_error(
                 a.command_buffer.0,
-                "secondary execution mixed with synthetic video",
+                "secondary native command buffer is poisoned or unmapped",
             ))
         } else {
             None
