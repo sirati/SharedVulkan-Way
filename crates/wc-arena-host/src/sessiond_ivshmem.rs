@@ -383,6 +383,15 @@ impl Brokered {
             }
         }
         let unix = Unix::bind(path, Vec::new())?.with_services(services);
+        // The system broker is the only cross-user sandbox entry. A forwarded
+        // socket retains its creator's credentials; Connect uses `users` above.
+        #[cfg(target_os = "linux")]
+        {
+            let services = Path::new("/run/sv-drm/services.sock");
+            if services.exists() {
+                unix.register_render_node(services)?;
+            }
+        }
         let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
         let config = wc_broker::server::Config {
             devices: Vec::new(),

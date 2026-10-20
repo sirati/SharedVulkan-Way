@@ -58,6 +58,8 @@ pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(5);
 pub const GPU_PREFIX: &str = "sv-gpu:";
 /// The doorbell hub: `sv-bell:` + `SV_BELL`.
 pub const BELL_PREFIX: &str = "sv-bell:";
+/// The system broker, whose normal per-user policy applies after forwarding.
+pub const BROKER_SERVICE: &str = "waycompose-broker";
 
 /// A service name: 1..=63 bytes of printable ASCII without space, so that it
 /// fits the ioctl's field with its NUL and is one word on the control line.

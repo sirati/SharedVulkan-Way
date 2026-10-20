@@ -1714,6 +1714,7 @@ name = "wc-broker"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sv-drm",
  "sv-transport",
  "wc-handle",
  "windows-sys",
