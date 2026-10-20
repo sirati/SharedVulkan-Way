@@ -195,6 +195,10 @@ impl<S: DurableStore> Registry<S> {
             poisoned: false,
         })
     }
+    /// Full original backing geometry retained by this exclusion namespace.
+    pub fn backing(&self) -> PhysicalBacking {
+        self.backing
+    }
     /// The ticket is still this live registry instance's issued local epoch.
     /// This establishes no peer authority or pair readiness.
     pub fn owns_current_ticket(&self, ticket: &EpochTicket) -> bool {
