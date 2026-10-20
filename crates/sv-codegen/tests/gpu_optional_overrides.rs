@@ -13,6 +13,7 @@ fn optional_hooks_precede_mapping_and_support_explicit_worker_bypass() {
         .filter(|c| !c.is_whitespace())
         .collect();
     for method in [
+        "create_event", "destroy_event", "set_event", "reset_event", "get_event_status",
         "bind_image_memory",
         "bind_image_memory2",
         "bind_buffer_memory",
