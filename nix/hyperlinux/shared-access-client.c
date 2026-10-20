@@ -53,6 +53,14 @@ int main(int argc,char **argv) {
     if(map==MAP_FAILED) {
         int error=errno;
         fprintf(stderr,"O_RDONLY MAP_SHARED PROT_READ failed: errno=%d (%s), fd=%d flags=%d\n",error,strerror(error),ro,fcntl(ro,F_GETFL));
+        if(!ftruncate(rw,65536)) {
+            errno=0;void *probe=mmap(NULL,65536,PROT_READ,MAP_SHARED,ro,0);int e=errno;
+            fprintf(stderr,"diagnostic RO64KiB result=%s errno=%d (%s)\n",probe==MAP_FAILED?"failed":"mapped",e,strerror(e));
+            if(probe!=MAP_FAILED)assert(!munmap(probe,65536));
+            errno=0;probe=mmap(NULL,16384,PROT_READ|PROT_WRITE,MAP_SHARED,rw,0);e=errno;
+            fprintf(stderr,"diagnostic RW16KiB result=%s errno=%d (%s)\n",probe==MAP_FAILED?"failed":"mapped",e,strerror(e));
+            if(probe!=MAP_FAILED)assert(!munmap(probe,16384));
+        }
         errno=error;perror("shared access read-only mmap");
         return 1;
     }
