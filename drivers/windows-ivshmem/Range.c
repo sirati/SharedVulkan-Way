@@ -286,7 +286,7 @@ VOID IVSHMEMRangeCallerContext(WDFDEVICE Device, WDFREQUEST Request)
         WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
         return;
     }
-    if (code != IOCTL_IVSHMEM_RANGE_QUERY && code != IOCTL_IVSHMEM_RANGE_MAP && code != IOCTL_IVSHMEM_RANGE_UNMAP && code != IOCTL_IVSHMEM_RANGE_CONFIGURE) {
+    if (code != IOCTL_IVSHMEM_RANGE_QUERY && code != IOCTL_IVSHMEM_RANGE_MAP && code != IOCTL_IVSHMEM_RANGE_UNMAP && code != IOCTL_IVSHMEM_RANGE_CONFIGURE && code != IOCTL_IVSHMEM_RANGE_POLICY_QUERY) {
         status = WdfDeviceEnqueueRequest(Device, Request);
         if (!NT_SUCCESS(status)) WdfRequestComplete(Request, status);
         return;
@@ -297,7 +297,23 @@ VOID IVSHMEMRangeCallerContext(WDFDEVICE Device, WDFREQUEST Request)
     if (s->Ready) {
         size_t input = parameters.Parameters.DeviceIoControl.InputBufferLength;
         size_t output = parameters.Parameters.DeviceIoControl.OutputBufferLength;
-        if (code == IOCTL_IVSHMEM_RANGE_CONFIGURE) {
+        if (code == IOCTL_IVSHMEM_RANGE_POLICY_QUERY) {
+            IVSHMEM_RANGE_POLICY_STATUS *out;
+            status = STATUS_INFO_LENGTH_MISMATCH;
+            if (input == 0 && output == sizeof(*out)) {
+                status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+                if (NT_SUCCESS(status)) {
+                    RtlZeroMemory(out, sizeof(*out));
+                    out->Configured = s->Configured ? 1 : 0;
+                    if (s->Configured) out->Policy = s->Policy;
+                    else {
+                        out->Policy.Version = IVSHMEM_RANGE_VERSION;
+                        out->Policy.Generation = s->Generation;
+                    }
+                    written = sizeof(*out);
+                }
+            }
+        } else if (code == IOCTL_IVSHMEM_RANGE_CONFIGURE) {
             status = configure(Device, Request, input, output);
         } else if (code == IOCTL_IVSHMEM_RANGE_MAP) {
             status = map_range(Device, Request, input, output, &written);

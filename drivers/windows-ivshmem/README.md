@@ -43,7 +43,11 @@ immutable policy per generation: one writable payload window and one disjoint
 read-only window. Every other page, including boot, control, directory and ring
 metadata, is outside client mappings. Both windows must come from trusted
 original BAR geometry and retained grants. The driver does not infer them from
-the shared directory.
+the shared directory. `RANGE_POLICY_QUERY` lets a restarted privileged service
+read that actual immutable policy and compare it with rooted original geometry.
+An unconfigured policy is explicit and still returns its actual generation;
+a stale retained capability generation or an unsupported query refuses. It is not a
+mapping census and does not prove any old grant or byte range is free.
 
 `RANGE_MAP` accepts a process HANDLE from the SYSTEM broker's own handle table,
 not a PID. `ObReferenceObjectByHandle` checks its access in UserMode and retains
@@ -119,6 +123,13 @@ after death or a liveness-query error. Reconnect cannot reset replay state.
 The Windows own-service adapter checks the current primary SYSTEM SID and
 duplicates the actual current process object, without reopening a PID.
 
+`wc-broker::service_bootstrap` defines bounded Hello, Challenge and Confirm
+frames without requiring or granting a region. It carries independent
+32-byte service challenges and durable epochs. The lifecycle must generate
+challenges with the OS CSPRNG and compare the entire already-enrolled expected
+source binding. A Hello cannot supply missing expected source fields or
+authorize mapping. The codec does not establish peer authority.
+
 These APIs are not yet wired into the production client protocol. In the
 Windows-client-to-Linux-compositor topology, the next integration must retain
 an authoritative existing session grant without creating a second whole-device
@@ -132,7 +143,7 @@ cannot be adopted by reading client-writable tuples.
 
 ## Validation
 
-The Rust broker cross-checks for Windows. Six local state-machine tests cover
+The Rust broker cross-checks for Windows. Seven local state-machine tests cover
 producer death with pending and live consumers, forged consumer completion,
 and retirement of a kernel-confirmed dead recipient. A bounded native Windows
 fixture confirms that the retained producer process HANDLE fires retirement
