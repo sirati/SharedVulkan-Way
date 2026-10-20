@@ -420,14 +420,14 @@ static void unsupported(void) {
     if (linux_reference) return;
     /* Both raw legacy and modern dup sources must refuse special targets
      * before publication; old state stays attached to its original number. */
-    int special = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); CHECK(special >= 0);
+    int legacy_target = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); CHECK(legacy_target >= 0);
     int legacy[2], modern[2]; CHECK(pipe(legacy) == 0); pair(modern);
-    CHECK(dup3(legacy[0], special, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
-    CHECK(dup3(modern[0], special, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
-    uint64_t one = 1, value = 0;
-    CHECK(write(special, &one, sizeof(one)) == sizeof(one));
-    CHECK(read(special, &value, sizeof(value)) == sizeof(value) && value == 1);
-    CHECK(close(special) == 0 && close(legacy[0]) == 0 && close(legacy[1]) == 0);
+    CHECK(dup3(legacy[0], legacy_target, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    CHECK(dup3(modern[0], legacy_target, O_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    uint64_t one = 1, event_value = 0;
+    CHECK(write(legacy_target, &one, sizeof(one)) == sizeof(one));
+    CHECK(read(legacy_target, &event_value, sizeof(event_value)) == sizeof(event_value) && event_value == 1);
+    CHECK(close(legacy_target) == 0 && close(legacy[0]) == 0 && close(legacy[1]) == 0);
     close_pair(modern);
     CHECK(socket(AF_UNIX, SOCK_SEQPACKET, 0) == -1 && errno == EOPNOTSUPP);
     int fd[2]; pair(fd); int value = 8192;
