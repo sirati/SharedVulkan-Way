@@ -34754,9 +34754,13 @@ manager), `a_session_is_forgotten_only_after_a_down_that_worked`.
   PulseAudio (25–35 ms), asked systemd for the doorbell twice, and forked
   some twenty `cat`, `grep`, `id` and `date`. The verb now stamps its
   stages into `proxy.timing`, which the service puts in its log line.
-* **The session's PulseAudio is not waited for.** It starts beside the
-  proxy and `proxy` returns without it; `run` waits for its state only
-  while it is still starting.
+* **Tried and put back: not waiting for the session's PulseAudio.** With
+  `proxy` returning before the server listened, the guest's sound ring
+  announced its device first and the proxy made no sink for it
+  (`scripts/wc-no-ssh.sh`, leg 1b). The guest numbers below were measured
+  in that state; the wait is back, and its cost is whatever PulseAudio's
+  start takes beyond the proxy's own (both start together). They are to be
+  measured again.
 
 Measured on the guest (test installation `wcil`, whose application is
 `foot`, so the window's own start is shorter than Firefox's):
