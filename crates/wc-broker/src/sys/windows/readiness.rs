@@ -99,10 +99,12 @@ fn exchange(handle: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn installed(path: &str) -> io::Result<()> {
+pub(super) fn installed(path: &str, verify_protection: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     let pid = service_pid()?;
-    let (handle, _process) = trusted_pipe(path, pid, ident::SYSTEM_SID)?;
+    let (handle, process) = trusted_pipe(path, pid, ident::SYSTEM_SID)?;
     exchange(handle.0)?;
+    verify_protection()?;
+    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT { return Err(io::Error::other("broker exited during readiness")); }
     if service_pid()? != pid { return Err(io::Error::other("broker service changed during readiness")); }
     Ok(())
 }

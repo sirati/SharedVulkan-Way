@@ -468,8 +468,9 @@ pub fn main(args: &[String]) -> ExitCode {
                 // Wait for the authenticated service to finish its startup
                 // verification before opening exclusive ports for a second
                 // independent check. Do not race its own ACL operations.
-                super::readiness::installed(&a.pipe).map_err(|e| e.to_string())?;
-                acl::verify_raw_protection(&a.devices)?;
+                super::readiness::installed(&a.pipe, || {
+                    acl::verify_raw_protection(&a.devices).map_err(std::io::Error::other)
+                }).map_err(|e| e.to_string())?;
                 Ok(())
             };
             return match ready() {
