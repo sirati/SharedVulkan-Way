@@ -15,10 +15,13 @@ in {
     mkdir -p "$out/bin"
     c++ -std=c++17 -Wall -Wextra -Werror ${source}/tests/ranges.cpp -o ranges
     ./ranges
+    ${t.pkgs.llvmPackages.clang-unwrapped}/bin/clang++ --target=x86_64-apple-macosx14.0 \
+      -isysroot ${t.sdk} -std=c++17 -fsyntax-only ${source}/tests/mach-abi.cpp
+    ${t.compiler}/bin/aarch64-apple-darwin-c++ -std=c++17 -fsyntax-only ${source}/tests/mach-abi.cpp
     ${t.compiler}/bin/aarch64-apple-darwin-c++ -std=c++17 -Wall -Wextra -Werror \
       ${source}/tests/ranges.cpp -o "$out/bin/wc-pci-abi-check"
   '';
-  # Intel only. The existing Darwin toolchain's native clang and lld build a
+  # Intel only. The existing Darwin toolchain's native clang and classic ld64 build a
   # kernel binary from public IOKit SDK headers. No signing/loading here.
   kext = t.pkgs.runCommand "wc-ivshmem-kext-unsigned" {
     nativeBuildInputs = [ t.pkgs.bash t.pkgs.python3 ];

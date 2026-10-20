@@ -30,3 +30,6 @@ wc-broker.workspace = true
 [target.'cfg(windows)'.dependencies]
 wc-broker.workspace = true
 wc-handle.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wc-broker.workspace = true

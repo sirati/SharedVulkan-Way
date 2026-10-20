@@ -118,7 +118,7 @@ pub(crate) fn instance() -> Option<&'static state::SharedVulkan> {
         // to use a GPU side and quietly given a driver that answers everything
         // from a table would produce plausible nonsense, which is the one
         // failure mode this project must not have.
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         if let Some(sock) = std::env::var_os(SOCKET_ENV) {
             let sock = sock.to_string_lossy().into_owned();
             return match state::SharedVulkan::connected(&sock) {

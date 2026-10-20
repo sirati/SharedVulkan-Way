@@ -444,7 +444,7 @@ impl Drop for RingTransport {
 /// The heartbeat has to be independent of what the side is doing, because that
 /// is what it *means*. R4's distinction between "slow" and "gone" is not
 /// answerable by a signal only the not-busy send.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const BEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// What the app side learned when it attached.
@@ -505,7 +505,7 @@ fn lower(e: sv_transport::Error) -> LowerError {
 /// How the doorbell hub at `path` (`SV_BELL`) is reached, every time the
 /// doorman (re)connects: directly, and on Linux, when that fails and
 /// `SV_DRM_NODE` is set, through the render node (§112).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn bell_connector(path: &str) -> impl Fn() -> std::io::Result<sv_transport::vdoorbell::PortHandle> + Send + 'static {
     let path = path.to_string();
     move || match sv_transport::vdoorbell::PortHandle::host_socket(&path) {
@@ -628,6 +628,10 @@ pub(crate) mod relay {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "macos_guest.rs"]
+mod macos_guest;
 
 impl RingTransport {
     /// Connect to whichever side is serving the cold path, attach, claim rings.
@@ -926,7 +930,7 @@ impl RingTransport {
     /// Extracted when the Windows path was written, because it is 60 lines and
     /// duplicating it is how the two platforms come to claim rings in a
     /// different order.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn finish_attach(
         control_region: Arc<SharedRegion>,
         arena: Arc<SharedRegion>,
@@ -1029,9 +1033,9 @@ impl RingTransport {
         // optimisation is unavailable would be worse than not having it.
         // Unix only: the host end of the chardev is a Unix socket, which is what
         // the cross-VM topology has. Named-section Windows sessions use local
-        // wakes. The Windows ivshmem client installs its per-BAR doorman before
-        // this method; its process-owned ControlSet dispatches all sessions.
-        #[cfg(unix)]
+        // wakes. Windows and macOS PCI clients install a per-BAR receiver
+        // before this method; their ControlSets dispatch all process sessions.
+        #[cfg(target_os = "linux")]
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             // §99: reconnecting, so a restarted hub costs this session only
@@ -1060,7 +1064,7 @@ impl RingTransport {
             },
         };
 
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         let doorman: Option<sv_transport::vdoorbell::Doorman> = None;
 
         arm_park_report();
@@ -1110,9 +1114,17 @@ impl RingTransport {
         })
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    pub fn connect(socket: &str) -> Result<Attached, String> {
+        if !cfg!(target_arch = "x86_64") { return Err("the PCI guest driver supports Intel macOS only".into()); }
+        let name = socket.strip_prefix("broker-pci:")
+            .ok_or("macOS Vulkan client requires SV_SOCKET=broker-pci:POOL and the Intel PCI guest driver")?;
+        macos_guest::connect(name)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub fn connect(_socket: &str) -> Result<Attached, String> {
-        Err("this build has a cold path for Linux and Windows only".into())
+        Err("this build has a cold path for Linux, macOS and Windows only".into())
     }
 
     fn ring(&self, class: RingClass) -> &Mutex<Ring> {
@@ -2346,7 +2358,7 @@ impl RingTransport {
     /// `svArenaInfo`, on the instance ring. `None` for any failure, which is
     /// a fixed arena: a GPU side too old to know the question is refused at
     /// attach by `WIRE_VERSION` before it gets here.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn arena_info(&self, name: &str) -> Option<sv_proto::sv::ArenaInfoReply> {
         let mut cmd = Vec::new();
         sv_proto::sv::ArenaInfo::named(name).encode(&mut cmd).ok()?;
