@@ -880,8 +880,8 @@ pub fn run_main(argv: Vec<String>) -> std::process::ExitCode {
     let r = match argv.get(1).map(String::as_str) {
         Some("guest" | "mem-guest") => mem_guest(&argv),
         // §103.19: a Mac hosting the Linux VM serves every GPU session from
-        // one pool in a file both sides map (a RAM-disk file the VM sees
-        // through virtio-fs DAX), as the Linux development loop does.
+        // one pool in a tagged POSIX shm object both sides map through
+        // virtio-fs DAX, using the same pool loop as Linux.
         Some("pool-guest") => linux_pool_guest(&argv),
         Some("probe") => mac_probe(&argv),
         _ => {
@@ -2023,6 +2023,7 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // §108: `--grow-ram FILE` (or `memfd:MIB`, which the broker can make
     // udmabufs of) stands in for the Windows guest's RAM;
     // regions are scattered 2 MiB units of it, located by the host's probe.
+    #[cfg(target_os = "linux")]
     let grow = match arg("--grow-ram") {
         None => None,
         Some(ram) => {
@@ -2035,6 +2036,13 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 }),
             })
         }
+    };
+    #[cfg(target_os = "macos")]
+    let grow = {
+        if arg("--grow-ram").is_some() {
+            return Err("--grow-ram is a Linux-only guest-RAM simulation option".into());
+        }
+        None
     };
     Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"), grow)?)
 }
