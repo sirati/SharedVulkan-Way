@@ -260,3 +260,19 @@ no window and starts no session service. Package construction and these
 acceptance fixtures do not establish default application acceleration, Zink
 presentation or VA-API decode. Those require the complete unchanged Linux
 client stack against the native compositor and its selected driver.
+
+The corrected public headless package passed on Neo, including the embedded
+render node's character identity through dup, ioctl bounds and caps, quiet poll,
+refusal to fork a live DRM context, and shared seal state across a supported
+sibling fork. A separate joined fixture ran unchanged ARM64 Linux dbus-send
+through hl and authenticated by EXTERNAL against the native bus. A real portal
+Settings.ReadOne request returned its setting. Stock pactl and pacat authenticated
+and drained zero PCM to an isolated native null sink without audible output.
+
+That playback does not establish shared audio payloads. Live maps show the
+Linux client's emulated memfd pool and the server's separate POSIX SHM pool.
+Stock Linux Pulse requires incoming SCM_CREDENTIALS before enabling its SHM
+path; hl currently does not implement SO_PASSCRED/received credentials. Native
+Darwin Pulse also advertises no memfd/fd-passing capability. Both ends need a
+compatible authenticated shared-memory path. No client configuration override
+or authentication bypass is used to hide that gap.

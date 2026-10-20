@@ -31,7 +31,7 @@ in base.overrideAttrs (old: {
   outputs = [ "out" ];
   mesonFlags = builtins.filter (f: !omitFlag f) old.mesonFlags ++ [
     "-Dgallium-va=enabled" "-Dgallium-rusticl=false" "-Dteflon=false"
-    "-Dintel-rt=disabled" "-Dllvm=disabled"
+    "-Dintel-rt=disabled" "-Dllvm=disabled" "-Dglx=disabled" "-Dxlib-lease=disabled"
   ];
   buildInputs = builtins.filter (d: !unrelated d) old.buildInputs;
   nativeBuildInputs = [ meson ninja pkg-config bison flex file patchelf

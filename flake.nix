@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     # ARM64 Linux bootstrap and the existing native KosmicKrisp provider use
     # the already audited runtime package set, independently of the dev shell.
-    hyperlinux-runtime-nixpkgs.url = "github:NixOS/nixpkgs/afce96367b2e37fc29afb5543573cd49db3357b7";
+    hyperlinux-runtime-nixpkgs.url = "github:NixOS/nixpkgs/7fd4004d0511991fff3a0524856a9be09e28c5f0";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
