@@ -71,7 +71,7 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "$1 is missing; run this inside 'nix develop'"; }
 
 # nixpkgs, from the registry, so the Prism here is the one deployed to the host.
-nixpath() { nix build --no-link --print-out-paths "nixpkgs#$1" 2>/dev/null | head -1; }
+nixpath() { nix build --max-jobs 2 --cores 8 --no-link --print-out-paths "nixpkgs#$1" 2>/dev/null | head -1; }
 PRISM=$(nixpath prismlauncher) || true
 JDK=$(nixpath jdk21) || true
 XDOTOOL=$(nixpath xdotool) || true
@@ -79,6 +79,24 @@ GLFW=$(nixpath glfw3-minecraft) || true
 [ -x "$PRISM/bin/prismlauncher" ] && [ -x "$JDK/bin/java" ] && [ -x "$XDOTOOL/bin/xdotool" ] \
   && [ -e "$GLFW/lib/libglfw.so.3" ] || die "could not fetch prismlauncher, jdk21, xdotool and glfw3-minecraft"
 export PATH="$XDOTOOL/bin:$PATH"
+
+# Resolve every optional package while the caller still holds its build lock.
+# The runtime has no Nix builds and closes the lock fd before spawning children.
+MC_MESA=${SVMC_MESA:-}
+MC_VVL=""
+MC_PYTHON=""
+if [ "$CMD" = run ]; then
+  MC_PYTHON=$(nixpath python3)
+  if [ -z "$MC_MESA" ]; then
+    MC_MESA=$(nix build --max-jobs 2 --cores 8 --no-link --print-out-paths --impure --expr \
+      "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" 2>/dev/null | head -1)
+  fi
+  [ -n "$MC_MESA" ] || die "could not build nix/mesa-zink-va.nix"
+  if [ "${SVMC_VALIDATE:-0}" = 1 ] || [ "${SVMC_APP_VALIDATE:-0}" = 1 ]; then
+    MC_VVL=$(nixpath vulkan-validation-layers)
+  fi
+fi
+
 
 KIDS=()
 MC_POOL_FILE=""
@@ -273,6 +291,10 @@ kill_game() {
 # --------------------------------------------------------------------- run ---
 run() {
   local inst=$1 secs=${2:-150}
+  # All package and Mesa builds above are complete. Runtime children must not
+  # retain cg's inherited exclusive build lock after this run ends.
+  exec 9>&-
+
   need wine; need magick; need xwd
   [ -s "$CAP/$inst/stdin" ] || die "no recorded launch for $inst; run '$0 setup' first"
   local BIN=$ROOT/target/release WINBIN=${SVMC_WINBIN:-$ROOT/target/x86_64-pc-windows-gnu/debug}
@@ -359,7 +381,7 @@ run() {
   local GPU_ICD=${SVMC_GPU_ICD:-${SV_MESA:-/run/opengl-driver}/share/vulkan/icd.d/radeon_icd.x86_64.json}
   local -a GPU_ENV=(VK_DRIVER_FILES="$GPU_ICD")
   if [ "${SVMC_VALIDATE:-0}" = 1 ]; then
-    local VVL; VVL=$(nixpath vulkan-validation-layers)
+    local VVL=$MC_VVL
     GPU_ENV+=(VK_LAYER_PATH="$VVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
   local -a GPU_ARGS=(serve --clients 16 --arena $(( ${SVMC_GPU_ARENA_MIB:-512} << 20 )))
@@ -404,13 +426,7 @@ run() {
   KIDS+=($(cat "$RUN/gpu.pid"))
 
   # ---- the game, as Prism launched it, with the session's environment
-  local KM=${SVMC_MESA:-}
-  if [ -z "$KM" ]; then
-    KM=$(nix build --no-link --print-out-paths --impure --expr \
-    "(builtins.getFlake \"nixpkgs\").legacyPackages.x86_64-linux.callPackage $ROOT/nix/mesa-zink-va.nix {}" \
-    2>/dev/null | grep -v -- '-[a-z_]*$' | head -1)
-  fi
-  [ -n "$KM" ] || die "could not build nix/mesa-zink-va.nix"
+  local KM=$MC_MESA
   local LDP; LDP=$(sed -n 's/^LD_LIBRARY_PATH=//p' "$CAP/$inst/env")
   local -a GAME_ENV=(
     HOME="$RUN/home" XDG_CONFIG_HOME="$RUN/config" XDG_DATA_HOME="$RUN/data"
@@ -436,7 +452,7 @@ run() {
   # GPU side's layer sees what the driver was handed. A VUID in both is the
   # application's; one only on the GPU side is ours.
   if [ "${SVMC_APP_VALIDATE:-0}" = 1 ]; then
-    local AVVL; AVVL=$(nixpath vulkan-validation-layers)
+    local AVVL=$MC_VVL
     GAME_ENV+=(VK_LAYER_PATH="$AVVL/share/vulkan/explicit_layer.d" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
   fi
   # `SVMC_GAME_ENV`: extra `NAME=value` words for the game alone (`SV_DEBUG=1`,
@@ -577,7 +593,7 @@ verdict() {
       || bad "F11 did not make the window fullscreen and back: $(grep -i fullscreen "$C" | tr '\n' ';')"
   fi
   # Frame pacing, from the ICD's own present timestamps in the trace.
-  local PY; PY=$(nixpath python3)/bin/python3
+  local PY=$MC_PYTHON/bin/python3
   if [ -x "$PY" ]; then
     "$PY" "$ROOT/scripts/sv-minecraft-fps.py" "$RUN/trace" "$RUN/marks.txt" >"$RUN/fps.txt" 2>&1
     sed 's/^/  /' "$RUN/fps.txt"
