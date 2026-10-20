@@ -5421,7 +5421,6 @@ impl XdgShellHandler for State {
         self.dismiss_grabs_above(0, "a new toplevel was created");
         // §107.11: a shared compositor says whose window it is, so that
         // installation's launcher measures its click by its own window.
-        let session = surface.wl_surface().client().map_or(0, |c| client_session(&c));
         println!(
             "wc-compositor: xdg_toplevel created (#{}) -> window {id}{}",
             self.toplevels,

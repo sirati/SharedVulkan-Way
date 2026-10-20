@@ -35307,12 +35307,12 @@ and a slot is never recycled while one of them may still read it.
   branch, and passed once on master by timing. The leg now stops the loop and
   its listener first.
 
-**Gates.** `cargo test --workspace --no-fail-fast`: 114 binaries, 3279 passed,
+**Gates**, after the merge of master. `cargo test --workspace --no-fail-fast`: 115 binaries, 3329 passed,
 0 failed, 9 ignored. `cargo clippy --workspace --all-targets`: no error, no
 warning in a file this section changed. `cargo check --workspace --target
 x86_64-pc-windows-gnu` and the macOS check of `wc-launch` and `wc-compositor`:
 exit 0. `scripts/wc-xref.sh --list`: exit 0. `scripts/wc-multi-install.sh`:
-OK, all ten legs. `scripts/wc-no-ssh.sh`: OK, three runs out of three.
+OK, all ten legs. `scripts/wc-no-ssh.sh`: OK in every run after the leg 5 fix (five).
 
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
