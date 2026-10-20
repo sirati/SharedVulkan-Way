@@ -203,6 +203,13 @@ if [[ "$VERB" = key-* ]]; then
         [ ! -e "$dir" ] && [ ! -L "$dir" ] && install -d -m 0700 "$dir"
         secure_path "$dir" 700 || { echo "untrusted key directory"; exit 1; }
       done
+      # Serialize actual generation so concurrent deploys cannot export two
+      # different candidates for one confirmation marker.
+      [ ! -L "$TRUST/.prepare.lock" ] || exit 1
+      umask 077
+      exec {KEY_LOCK}>"$TRUST/.prepare.lock"
+      secure_path "$TRUST/.prepare.lock" 600 || exit 1
+      flock "$KEY_LOCK"
       [ ! -L "$d/rotation-pending" ] || exit 1
       (umask 077; printf '%s\n' protected-rotation-pending-v1 >"$d/rotation-pending")
       # Deleting the retired verifier prevents a reboot or service restart
@@ -211,6 +218,10 @@ if [[ "$VERB" = key-* ]]; then
       legacy=$(base_of "$n") || legacy=""
       case "$legacy" in "$AH"/*) rm -f "$legacy/session.key" ;; esac
       if [ ! -e "$d/session.key" ]; then
+        for marker in generated-here broker-confirmed; do
+          [ ! -e "$d/$marker" ] && [ ! -L "$d/$marker" ] || { echo "lost candidate with prior provenance requires trusted recovery"; exit 1; }
+        done
+
         (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$d/session.key")
         (umask 077; printf '%s\n' root-generated-candidate-v1 >"$d/generated-here")
       fi
