@@ -102,7 +102,7 @@ impl Args {
                     let (n, l) = v.split_once('=').ok_or_else(|| format!("--device {v}: NAME=LOCATION"))?;
                     a.devices.push(DeviceAt { name: n.to_string(), loc: DeviceLoc::parse(l)? });
                 }
-                "show" | "revert-acl" | "holder" | "holder-quit" if a.action.is_none() => a.action = Some(x.clone()),
+                "show" | "revert-acl" | "revert-acl-check" | "holder" | "holder-quit" if a.action.is_none() => a.action = Some(x.clone()),
                 "--holder-pipe" => a.holder_pipe = val()?,
                 "--no-holder" => a.holder = false,
                 other => return Err(format!("unknown argument {other:?}")),
@@ -481,12 +481,22 @@ pub fn main(args: &[String]) -> ExitCode {
             return match super::holder::quit(&a.holder_pipe) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("sv-guest broker holder-quit: {e} (no holder running?)");
+                    eprintln!("sv-guest broker holder-quit: {e}");
                     ExitCode::from(1)
                 }
             };
         }
+        Some("revert-acl-check") => {
+            return match acl::revert_check(&a.state) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => { eprintln!("{e}"); ExitCode::from(1) }
+            };
+        }
         Some("revert-acl") => {
+            if let Err(e) = acl::revert_check(&a.state) {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
             for l in acl::revert(&a.state) {
                 println!("{l}");
             }

@@ -155,7 +155,10 @@ switch ($Action) {
     if (Test-Path $Keys) { Get-ChildItem $Keys | ForEach-Object { Say "key: $($_.Name)" } }
   }
   "uninstall" {
+    # Do not stop a working broker when rollback would expose uncleared BARs.
     if (-not (Test-Path $Exe)) { throw "broker executable missing; cannot prove safe uninstall" }
+    $check = Run $Exe @("broker", "revert-acl-check")
+    if ($check[0] -ne 0) { throw "uninstall refused before service mutation: $($check[1])" }
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     $wasRunning = $svc -and ($svc.Status -eq 'Running')
     try {

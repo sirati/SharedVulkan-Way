@@ -1750,7 +1750,11 @@ resources.
   and no blind memory wipe. The same SID may resume while old host/GPU writes
   remain possible. This is a single-owner safety restriction, not multi-user
   BAR handover. A future cross-user transfer requires positive host/GPU drain
-  and clearing after drain. The host must preserve the physical resource's
+  and clearing after drain. Uninstall and `revert-acl` refuse any saved raw
+  live/PnP descriptor that would restore desktop access. Keeping a SID file
+  alone cannot enforce ownership after such a kernel ACL rollback. There is
+  no operator override without an independently proved clean/drained boundary.
+  The host must preserve the physical resource's
   owner across VM/device replacement: Windows cannot attest that a host has
   substituted new backing memory behind an identical PnP identity.
 * **What a dead process leaves.** Its device handle becomes available again
@@ -1786,3 +1790,12 @@ resources.
   binary is installed where users cannot write (a SYSTEM service running a
   user-writable file would hand that user SYSTEM).
 * The platform paragraphs follow.
+
+
+Windows holder shutdown refuses atomically while any retained section exists.
+An error or missing shutdown reply is failure. Uninstall checks raw ACL rollback
+before stopping the service, then retains the service registration, protection,
+binary and recovery files until the holder confirms empty. If a retained
+section blocks uninstall, the previously running service is restarted and
+adopts the holder's sections. No quit or uninstall path clears sections or
+uses a timeout as evidence of host/GPU release.

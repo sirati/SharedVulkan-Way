@@ -416,10 +416,28 @@ pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
     out
 }
 
+/// Refuse rollback that would expose uncleared physical memory through a
+/// direct device open. A persisted SID binding cannot police a reverted
+/// kernel DACL. There is no independently attested drain/reset boundary yet.
+pub fn revert_check(state: &Path) -> Result<(), String> {
+    let rows = read_state(state).map_err(|e| format!("cannot read baseline: {e}"))?;
+    for (_, instance, path, original, property) in rows {
+        let raw = instance.to_ascii_lowercase().starts_with(r"pci\ven_1af4&dev_1110")
+            || path.to_ascii_lowercase().contains("df576976-569d-4672-95a0-f57e4ea0b210");
+        if raw && (original != DEVICE_SDDL || property.as_deref() != Some(DEVICE_SDDL)) {
+            return Err(format!("raw device {instance}: unsafe ACL restoration refused; no proven clean/drained device boundary"));
+        }
+    }
+    Ok(())
+}
+
 /// Undo [`secure`]: each recorded device gets its descriptor from before
 /// back, live and in its PnP property. Failed restorations stay recorded.
 /// Legacy records without a PnP original are refused, never guessed.
 pub fn revert(state: &Path) -> Vec<String> {
+    if let Err(e) = revert_check(state) {
+        return vec![format!("devices not restored: {e}")];
+    }
     let rows = match read_state(state) {
         Ok(rows) => rows,
         Err(e) => return vec![format!("devices not restored: cannot read baseline: {e}")],
@@ -468,6 +486,23 @@ pub fn show(devices: &[DeviceAt]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permissive_raw_rollback_is_refused_before_any_mutation() {
+        let dir = std::env::temp_dir().join(format!("wc-raw-rollback-{}", std::process::id()));
+        let id = r"PCI\VEN_1AF4&DEV_1110&SUBSYS_11001AF4\PRIVATE-TEST";
+        let rows = vec![("renamed".into(), id.into(), "unused".into(),
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;WD)".into(), Some(DEVICE_SDDL.into()))];
+        write_state(&dir, &rows).unwrap();
+        let before = std::fs::read(state_file(&dir)).unwrap();
+        assert!(revert_check(&dir).unwrap_err().contains("unsafe ACL restoration"));
+        assert!(revert(&dir)[0].contains("unsafe ACL restoration"));
+        assert_eq!(std::fs::read(state_file(&dir)).unwrap(), before);
+        let safe = vec![("renamed".into(), id.into(), "unused".into(), DEVICE_SDDL.into(), Some(DEVICE_SDDL.into()))];
+        write_state(&dir, &safe).unwrap();
+        assert!(revert_check(&dir).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn saved_descriptors_keep_property_and_reject_corruption() {

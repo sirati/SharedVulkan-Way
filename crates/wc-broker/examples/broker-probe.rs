@@ -57,6 +57,17 @@ mod win {
     pub fn run(a: &[String]) -> Result<(), String> {
         let arg = |i: usize| a.get(i).cloned().unwrap_or_default();
         match arg(0).as_str() {
+            "protect-raw" => {
+                use wc_broker::sys::windows::{DeviceLoc, acl, default_devices};
+                for d in default_devices() {
+                    if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+                    let f = acl::find(&d).map_err(|e| e.to_string())?.ok_or("missing private-clone BAR")?;
+                    acl::set_property(&f.instance, Some(acl::DEVICE_SDDL))?;
+                    acl::set_live(&f.live, acl::DEVICE_SDDL)?;
+                    println!("RESULT protected-raw {}", f.instance);
+                }
+                Ok(())
+            }
             "sentinel-write" | "sentinel-read" => {
                 let mut c = client("raw-bar-sentinel")?;
                 let h = c.device(&arg(1)).map_err(|e| e.to_string())?;
