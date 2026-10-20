@@ -12,7 +12,7 @@ index dea6f78..b124b66 100644
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index e878fa6..abcd633 100644
+index e878fa6..6cabe97 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
 @@ -17,6 +17,7 @@
@@ -128,12 +128,12 @@ index e878fa6..abcd633 100644
 +        pid_t waited;
 +        do { waited=waitpid(child_host_pid,&status,0); } while (waited<0 && errno==EINTR);
 +        /* Another guest waiter may already have collected this exact child. */
-+        if (waited==child_host_pid) proc_mark_child_exited(child_host_pid,status);
++        if (waited==child_host_pid) proc_mark_child_exited(child_host_pid,child_guest_pid,status);
      }
  
      if (verbose)
 diff --git a/src/syscall_proc.c b/src/syscall_proc.c
-index a6583c9..180e94f 100644
+index a6583c9..da12846 100644
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
 @@ -19,6 +19,7 @@
@@ -144,7 +144,7 @@ index a6583c9..180e94f 100644
  
  #include <stdatomic.h>
  #include <stdio.h>
-@@ -381,31 +382,10 @@ int64_t proc_alloc_pid(void) {
+@@ -381,32 +382,16 @@ int64_t proc_alloc_pid(void) {
      return pid;
  }
  
@@ -177,9 +177,15 @@ index a6583c9..180e94f 100644
 -int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
 +int proc_register_child_status(pid_t host_pid,int64_t guest_pid_val,int status_fd) {
      pthread_mutex_lock(&pid_lock);
++    for (int i=0;i<PROC_TABLE_SIZE;++i) {
++        if (proc_table[i].active && proc_table[i].host_pid==host_pid) {
++            pthread_mutex_unlock(&pid_lock); return -1;
++        }
++    }
      for (int i = 0; i < PROC_TABLE_SIZE; i++) {
          if (!proc_table[i].active) {
-@@ -414,28 +394,17 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
+             proc_table[i].active = 1;
+@@ -414,38 +399,31 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val) {
              proc_table[i].guest_pid = guest_pid_val;
              proc_table[i].exited = 0;
              proc_table[i].exit_status = 0;
@@ -212,12 +218,16 @@ index a6583c9..180e94f 100644
              PROC_TABLE_SIZE, (long long)guest_pid_val);
      return -1;
  }
-@@ -444,8 +413,11 @@ void proc_mark_child_exited(pid_t host_pid, int status) {
+ 
+-void proc_mark_child_exited(pid_t host_pid, int status) {
++void proc_mark_child_exited(pid_t host_pid,int64_t expected_guest_pid,int status) {
      pthread_mutex_lock(&pid_lock);
      for (int i = 0; i < PROC_TABLE_SIZE; i++) {
-         if (proc_table[i].active && proc_table[i].host_pid == host_pid) {
+-        if (proc_table[i].active && proc_table[i].host_pid == host_pid) {
 -            proc_table[i].exited = 1;
 -            proc_table[i].exit_status = status;
++        if (proc_table[i].active && proc_table[i].host_pid == host_pid &&
++            proc_table[i].guest_pid==expected_guest_pid) {
 +            if (!proc_table[i].exited) {
 +                proc_table[i].exit_status = hl_status_collect(proc_table[i].status_fd,status);
 +                proc_table[i].status_fd=-1;
@@ -226,118 +236,315 @@ index a6583c9..180e94f 100644
              pthread_cond_broadcast(&pid_cond);
              pthread_mutex_unlock(&pid_lock);
              return;
-@@ -597,6 +569,28 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
+@@ -597,199 +575,78 @@ static int write_rusage_to_guest(guest_t *g, uint64_t gva,
      return guest_write(g, gva, &lru, sizeof(lru));
  }
  
-+/* Host wait completion is the only trigger for reading the private channel.
-+ * Reads are nonblocking and bounded; no guest pointer or blocking I/O is used
-+ * with pid_lock. The cached Linux status also preserves waitid WNOWAIT. */
-+static int proc_cache_child_status(pid_t host_pid,int64_t expected_guest_pid,int status) {
-+    if (!WIFEXITED(status) && !WIFSIGNALED(status))
-+        return hl_status_collect(-1,status);
-+    pthread_mutex_lock(&pid_lock);
-+    for (int i=0;i<PROC_TABLE_SIZE;++i) {
-+        proc_entry_t *p=&proc_table[i];
-+        if (p->active && p->host_pid==host_pid && p->guest_pid==expected_guest_pid) {
-+            if (!p->exited) {
-+                p->exit_status=hl_status_collect(p->status_fd,status);
-+                p->status_fd=-1; p->exited=1;
-+            }
-+            status=p->exit_status;
-+            break;
-+        }
+-/* ---------- sys_wait4 ---------- */
+-
+-int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+-                  int options, uint64_t rusage_gva) {
++/* Terminal private-fd reads are bounded and nonblocking. Caller owns pid_lock.
++ * Consuming waiters remove the identity before copying results to guest memory,
++ * so a second waiter cannot observe the same terminal event. */
++static int proc_collect_status_unlocked(proc_entry_t *p,int host_status) {
++    if (!WIFEXITED(host_status) && !WIFSIGNALED(host_status))
++        return hl_status_collect(-1,host_status);
++    if (!p->exited) {
++        p->exit_status=hl_status_collect(p->status_fd,host_status);
++        p->status_fd=-1; p->exited=1;
 +    }
-+    pthread_mutex_unlock(&pid_lock);
-+    return status;
++    return p->exit_status;
 +}
-+
- /* ---------- sys_wait4 ---------- */
++static int64_t proc_wait_result(guest_t *g,int64_t gpid,int status,
++                                uint64_t status_gva,uint64_t rusage_gva,
++                                const struct rusage *ru) {
++    int32_t ls=status;
++    if (status_gva && guest_write(g,status_gva,&ls,sizeof(ls))<0) return -LINUX_EFAULT;
++    if (rusage_gva && write_rusage_to_guest(g,rusage_gva,ru)<0) return -LINUX_EFAULT;
++    signal_queue(LINUX_SIGCHLD);
++    return gpid;
++}
  
- int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
-@@ -667,12 +661,13 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
-                 pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
-                                   rusage_gva ? &ru : NULL);
-                 if (ret > 0) {
-+                    status=proc_cache_child_status(host_pid,gpid,status);
-                     if (status_gva) {
-                         int32_t linux_status = status;
-                         if (guest_write(g, status_gva, &linux_status, 4) < 0) {
-                             /* Child already reaped — match Linux: return EFAULT */
-                             pthread_mutex_lock(&pid_lock);
+-    /* First check for ptraced or vm-clone children in the thread table.
+-     * Rosetta's two-process JIT uses clone(CLONE_VM) + ptrace, and the
+-     * child runs as an in-process thread, not a separate host process.
+-     * thread_ptrace_wait handles both ptrace-stopped and vm-exited states. */
++/* ---------- sys_wait4 ---------- */
++int64_t sys_wait4(guest_t *g,int pid,uint64_t status_gva,int options,uint64_t rusage_gva) {
+     if (current_thread) {
+-        int ptrace_status = 0;
+-        int64_t ptrace_tid = thread_ptrace_wait(
+-            current_thread->guest_tid, pid, &ptrace_status, options);
+-        if (ptrace_tid > 0) {
+-            if (status_gva) {
+-                int32_t ls = ptrace_status;
+-                if (guest_write(g, status_gva, &ls, sizeof(ls)) < 0)
+-                    return -LINUX_EFAULT;
+-            }
+-            return ptrace_tid;
+-        }
+-        /* ptrace_tid == 0: no matching children or WNOHANG — fall through
+-         * to the process table for regular fork children. */
++        int status=0;
++        int64_t tid=thread_ptrace_wait(current_thread->guest_tid,pid,&status,options);
++        if (tid>0) return proc_wait_result(g,tid,status,status_gva,rusage_gva,&(struct rusage){0});
+     }
+-
+-    /* Translate Linux wait options */
+-    int mac_options = 0;
+-    if (options & 1) mac_options |= WNOHANG;     /* WNOHANG = 1 on both */
+-    if (options & 2) mac_options |= WUNTRACED;   /* WUNTRACED = 2 on both */
+-    if (options & 8) mac_options |= WCONTINUED;  /* WCONTINUED: Linux=8, macOS=0x10 */
+-
++    int mac_options=WNOHANG;
++    if (options & 2) mac_options|=WUNTRACED;
++    if (options & 8) mac_options|=WCONTINUED;
+     pthread_mutex_lock(&pid_lock);
+-
+-    if (pid == -1) {
+-        /* Wait for any child.  Always poll with WNOHANG first so we
+-         * don't block on one specific child while another exits.  If
+-         * blocking (no WNOHANG) and no child is ready, sleep briefly
+-         * and retry — this gives correct "wait for any" semantics. */
+-        for (;;) {
+-            int found_any_child = 0;
+-            for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+-                if (!proc_table[i].active)
+-                    continue;
+-                found_any_child = 1;
+-                if (proc_table[i].exited) {
+-                    /* Already reaped (from CLONE_VFORK wait) */
+-                    int64_t gpid = proc_table[i].guest_pid;
+-                    int32_t linux_status = proc_table[i].exit_status;
+-                    proc_table[i].active = 0;
+-                    pthread_mutex_unlock(&pid_lock);
+-                    if (status_gva &&
+-                        guest_write(g, status_gva, &linux_status, 4) < 0)
+-                        return -LINUX_EFAULT;
+-                    /* Pre-exited entries have no rusage; zero-fill. */
+-                    if (rusage_gva)
+-                        write_rusage_to_guest(g, rusage_gva,
+-                                              &(struct rusage){0});
+-                    return gpid;
+-                }
+-
+-                pid_t host_pid = proc_table[i].host_pid;
+-                int64_t gpid = proc_table[i].guest_pid;
+-                int slot = i;
+-                pthread_mutex_unlock(&pid_lock);
+-
+-                int status;
+-                struct rusage ru;
+-                pid_t ret = wait4(host_pid, &status, mac_options | WNOHANG,
+-                                  rusage_gva ? &ru : NULL);
+-                if (ret > 0) {
+-                    if (status_gva) {
+-                        int32_t linux_status = status;
+-                        if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+-                            /* Child already reaped — match Linux: return EFAULT */
+-                            pthread_mutex_lock(&pid_lock);
 -                            if (proc_table[slot].active &&
-+                            if (proc_table[slot].active && proc_table[slot].exited &&
-                                 proc_table[slot].host_pid == host_pid)
-                                 proc_table[slot].active = 0;
-                             pthread_mutex_unlock(&pid_lock);
-@@ -682,14 +677,14 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
-                     if (rusage_gva &&
-                         write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                         pthread_mutex_lock(&pid_lock);
+-                                proc_table[slot].host_pid == host_pid)
+-                                proc_table[slot].active = 0;
+-                            pthread_mutex_unlock(&pid_lock);
+-                            return -LINUX_EFAULT;
+-                        }
+-                    }
+-                    if (rusage_gva &&
+-                        write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+-                        pthread_mutex_lock(&pid_lock);
 -                        if (proc_table[slot].active &&
-+                        if (proc_table[slot].active && proc_table[slot].exited &&
-                             proc_table[slot].host_pid == host_pid)
-                             proc_table[slot].active = 0;
-                         pthread_mutex_unlock(&pid_lock);
-                         return -LINUX_EFAULT;
-                     }
-                     pthread_mutex_lock(&pid_lock);
+-                            proc_table[slot].host_pid == host_pid)
+-                            proc_table[slot].active = 0;
+-                        pthread_mutex_unlock(&pid_lock);
+-                        return -LINUX_EFAULT;
+-                    }
+-                    pthread_mutex_lock(&pid_lock);
 -                    if (proc_table[slot].active &&
-+                    if (proc_table[slot].active && proc_table[slot].exited &&
-                         proc_table[slot].host_pid == host_pid)
-                         proc_table[slot].active = 0;
-                     pthread_mutex_unlock(&pid_lock);
-@@ -752,11 +747,12 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
-             pid_t ret = wait4(host_pid, &status, mac_options,
-                               rusage_gva ? &ru : NULL);
-             if (ret > 0) {
-+                status=proc_cache_child_status(host_pid,gpid,status);
-                 if (status_gva) {
-                     int32_t linux_status = status;
-                     if (guest_write(g, status_gva, &linux_status, 4) < 0) {
-                         pthread_mutex_lock(&pid_lock);
+-                        proc_table[slot].host_pid == host_pid)
+-                        proc_table[slot].active = 0;
+-                    pthread_mutex_unlock(&pid_lock);
+-                    return gpid;
+-                }
+-                /* ret == 0 (not exited) or ret < 0 (error): try next */
+-                pthread_mutex_lock(&pid_lock);
+-            }
+-
+-            if (!found_any_child) {
+-                pthread_mutex_unlock(&pid_lock);
+-                return -LINUX_ECHILD;
+-            }
+-            if (mac_options & WNOHANG) {
+-                pthread_mutex_unlock(&pid_lock);
+-                return 0;
+-            }
+-
+-            /* Blocking mode: no child exited yet.  Wait on condvar for
+-             * a child exit notification (signaled by proc_mark_child_exited).
+-             * Use timedwait with 100ms timeout as a safety net — the condvar
+-             * handles normal exits, the timeout catches edge cases where
+-             * the host wait4 detects exit before proc_mark_child_exited. */
+-            struct timespec ts;
+-            clock_gettime(CLOCK_REALTIME, &ts);
+-            ts.tv_nsec += 100000000; /* 100ms */
+-            if (ts.tv_nsec >= 1000000000) {
+-                ts.tv_sec++;
+-                ts.tv_nsec -= 1000000000;
+-            }
+-            pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
+-        }
+-    }
+-
+-    /* Wait for specific guest PID */
+-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+-        if (proc_table[i].active && proc_table[i].guest_pid == pid) {
+-            if (proc_table[i].exited) {
+-                int64_t gpid = proc_table[i].guest_pid;
+-                int32_t linux_status = proc_table[i].exit_status;
+-                proc_table[i].active = 0;
+-                pthread_mutex_unlock(&pid_lock);
+-                if (status_gva &&
+-                    guest_write(g, status_gva, &linux_status, 4) < 0)
+-                    return -LINUX_EFAULT;
+-                /* Pre-exited entries have no rusage; zero-fill. */
+-                if (rusage_gva)
+-                    write_rusage_to_guest(g, rusage_gva,
+-                                          &(struct rusage){0});
+-                return gpid;
+-            }
+-
+-            pid_t host_pid = proc_table[i].host_pid;
+-            int64_t gpid = proc_table[i].guest_pid;
+-            int slot = i;
+-            pthread_mutex_unlock(&pid_lock);
+-
++    for (;;) {
++        int found=0;
++        for (int i=0;i<PROC_TABLE_SIZE;++i) {
++            proc_entry_t *p=&proc_table[i];
++            if (!p->active || (pid!=-1 && p->guest_pid!=pid)) continue;
++            found=1;
++            int64_t gpid=p->guest_pid;
+             int status;
+-            struct rusage ru;
+-            pid_t ret = wait4(host_pid, &status, mac_options,
+-                              rusage_gva ? &ru : NULL);
+-            if (ret > 0) {
+-                if (status_gva) {
+-                    int32_t linux_status = status;
+-                    if (guest_write(g, status_gva, &linux_status, 4) < 0) {
+-                        pthread_mutex_lock(&pid_lock);
 -                        if (proc_table[slot].active &&
-+                        if (proc_table[slot].active && proc_table[slot].exited &&
-                             proc_table[slot].host_pid == host_pid)
-                             proc_table[slot].active = 0;
-                         pthread_mutex_unlock(&pid_lock);
-@@ -766,7 +762,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
-                 if (rusage_gva &&
-                     write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                     pthread_mutex_lock(&pid_lock);
+-                            proc_table[slot].host_pid == host_pid)
+-                            proc_table[slot].active = 0;
+-                        pthread_mutex_unlock(&pid_lock);
+-                        return -LINUX_EFAULT;
+-                    }
+-                }
+-                if (rusage_gva &&
+-                    write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
+-                    pthread_mutex_lock(&pid_lock);
 -                    if (proc_table[slot].active &&
-+                    if (proc_table[slot].active && proc_table[slot].exited &&
-                         proc_table[slot].host_pid == host_pid)
-                         proc_table[slot].active = 0;
+-                        proc_table[slot].host_pid == host_pid)
+-                        proc_table[slot].active = 0;
++            struct rusage ru={0};
++            if (p->exited) status=p->exit_status;
++            else {
++                /* WNOHANG prevents blocking while serializing native reaping.
++                 * A child PID cannot be reused/registered between reap and claim. */
++                pid_t ret=wait4(p->host_pid,&status,mac_options,rusage_gva ? &ru : NULL);
++                if (ret==0) continue;
++                if (ret<0) {
++                    int error=errno;
++                    if (error==EINTR) continue;
++                    if (error==ECHILD) continue; /* VFORK reaper may be publishing its cache. */
                      pthread_mutex_unlock(&pid_lock);
-@@ -774,7 +770,7 @@ int64_t sys_wait4(guest_t *g, int pid, uint64_t status_gva,
+-                    return -LINUX_EFAULT;
++                    errno=error; return linux_errno();
                  }
-                 pthread_mutex_lock(&pid_lock);
-                 /* Re-validate slot: another thread may have reaped it */
+-                pthread_mutex_lock(&pid_lock);
+-                /* Re-validate slot: another thread may have reaped it */
 -                if (proc_table[slot].active &&
-+                if (proc_table[slot].active && proc_table[slot].exited &&
-                     proc_table[slot].host_pid == host_pid)
-                     proc_table[slot].active = 0;
-                 pthread_mutex_unlock(&pid_lock);
-@@ -872,6 +868,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
-                     continue; /* Child may have been reaped concurrently */
-                 }
-                 pthread_mutex_lock(&pid_lock);
-+                if (!proc_table[i].active || proc_table[i].host_pid!=ret) continue;
-+                if (!proc_table[i].exited) {
-+                    proc_table[i].exit_status=hl_status_collect(proc_table[i].status_fd,status);
-+                    proc_table[i].status_fd=-1;
-+                    proc_table[i].exited=1;
-+                }
-+                status=proc_table[i].exit_status;
+-                    proc_table[slot].host_pid == host_pid)
+-                    proc_table[slot].active = 0;
+-                pthread_mutex_unlock(&pid_lock);
+-                /* Queue SIGCHLD for parent process */
+-                signal_queue(LINUX_SIGCHLD);
+-                return gpid;
+-            } else if (ret == 0) {
+-                return 0; /* WNOHANG */
++                status=proc_collect_status_unlocked(p,status);
+             }
+-            return linux_errno();
++            if (p->exited) p->active=0;
++            pthread_mutex_unlock(&pid_lock);
++            return proc_wait_result(g,gpid,status,status_gva,rusage_gva,&ru);
++        }
++        if (!found) { pthread_mutex_unlock(&pid_lock); return -LINUX_ECHILD; }
++        if (options & 1) { pthread_mutex_unlock(&pid_lock); return 0; }
++        if (atomic_load(&exit_group_requested) || thread_seccomp_terminated() || signal_pending()) {
++            pthread_mutex_unlock(&pid_lock); return -LINUX_EINTR;
+         }
++        struct timespec ts;
++        clock_gettime(CLOCK_REALTIME,&ts);
++        ts.tv_nsec+=100000000;
++        if (ts.tv_nsec>=1000000000) { ++ts.tv_sec; ts.tv_nsec-=1000000000; }
++        pthread_cond_timedwait(&pid_cond,&pid_lock,&ts);
+     }
+-    pthread_mutex_unlock(&pid_lock);
+-
+-    return -LINUX_ECHILD;
+ }
+ 
+ /* ---------- sys_waitid ---------- */
+@@ -858,22 +715,13 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                 status = proc_table[i].exit_status;
+                 ret = proc_table[i].host_pid;
+             } else {
+-                pid_t host_pid = proc_table[i].host_pid;
+-                pthread_mutex_unlock(&pid_lock);
+-                ret = waitpid(host_pid, &status, WNOHANG);
+-                if (ret == 0) {
+-                    /* This child hasn't exited yet — continue checking
+-                     * others (P_ALL must scan all children). */
+-                    pthread_mutex_lock(&pid_lock);
+-                    continue;
+-                }
+-                if (ret < 0) {
+-                    pthread_mutex_lock(&pid_lock);
+-                    continue; /* Child may have been reaped concurrently */
+-                }
+-                pthread_mutex_lock(&pid_lock);
++                ret=waitpid(proc_table[i].host_pid,&status,WNOHANG);
++                if (ret<=0) continue;
++                status=proc_collect_status_unlocked(&proc_table[i],status);
              }
  
++            if (!(options & LINUX_WNOWAIT)) proc_table[i].active=0;
++
              /* Fill siginfo_t in guest memory */
+             if (infop_gva) {
+                 uint8_t si[SIGINFO_SIZE];
+@@ -907,13 +755,6 @@ int64_t sys_waitid(guest_t *g, int idtype, int64_t id,
+                 }
+             }
+ 
+-            /* Don't remove from table if WNOWAIT is set.
+-             * Re-validate slot after re-locking (another thread may have
+-             * reused it while we released the lock for waitpid). */
+-            if (!(options & LINUX_WNOWAIT) &&
+-                proc_table[i].active && proc_table[i].host_pid == ret)
+-                proc_table[i].active = 0;
+-
+             pthread_mutex_unlock(&pid_lock);
+             return 0; /* waitid returns 0 on success */
+         }
 diff --git a/src/syscall_proc.h b/src/syscall_proc.h
-index f13c935..fb8e970 100644
+index f13c935..192e6d7 100644
 --- a/src/syscall_proc.h
 +++ b/src/syscall_proc.h
-@@ -90,12 +90,14 @@ typedef struct {
+@@ -90,15 +90,17 @@ typedef struct {
      pid_t   host_pid;   /* macOS process ID of child hl instance */
      int64_t guest_pid;  /* Guest-visible PID assigned to child */
      int     exited;     /* 1 if child has exited */
@@ -352,7 +559,11 @@ index f13c935..fb8e970 100644
 +int proc_register_child_status(pid_t host_pid,int64_t guest_pid,int status_fd);
  
  /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
- void proc_mark_child_exited(pid_t host_pid, int status);
+-void proc_mark_child_exited(pid_t host_pid, int status);
++void proc_mark_child_exited(pid_t host_pid,int64_t guest_pid,int status);
+ 
+ /* ---------- ptrace ---------- */
+ 
 diff --git a/src/syscall_signal.c b/src/syscall_signal.c
 index 39a08de..99227b9 100644
 --- a/src/syscall_signal.c
