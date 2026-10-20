@@ -29,6 +29,7 @@ pub mod core;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod daemon;
 pub mod proto;
+pub mod raw_device;
 pub mod server;
 pub mod sys;
 pub mod usermap;
