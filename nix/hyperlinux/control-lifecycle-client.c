@@ -67,7 +67,7 @@ static void *worker(void *unused) {
     }
     worker_fault=1;cpu_access();return NULL;
 }
-static void exec_rejected(void) {
+static void exec_rejected(int later, int tail) {
     /* This minimal ELF is parseable and fits the primary allocation, but its
      * PT_LOAD would overwrite control storage. No interpreter obscures which
      * preflight rejected it. An ET_EXEC address must stay unrelocated. */
@@ -76,11 +76,15 @@ static void exec_rejected(void) {
     h.e_ident[EI_CLASS]=ELFCLASS64;h.e_ident[EI_DATA]=ELFDATA2LSB;
     h.e_ident[EI_VERSION]=EV_CURRENT;h.e_type=ET_EXEC;h.e_machine=EM_AARCH64;
     h.e_version=EV_CURRENT;h.e_ehsize=sizeof(h);h.e_phoff=sizeof(h);
-    h.e_phentsize=sizeof(Elf64_Phdr);h.e_phnum=1;h.e_entry=target;
+    h.e_phentsize=sizeof(Elf64_Phdr);h.e_phnum=later ? 2 : 1;h.e_entry=target;
     Elf64_Phdr p={.p_type=PT_LOAD,.p_flags=PF_R|PF_W|PF_X,
         .p_offset=4096,.p_vaddr=target,.p_filesz=4,.p_memsz=4096,.p_align=4096};
+    Elf64_Phdr first=p;
+    if(later)first.p_vaddr=0x400000;
+    if(tail){p.p_memsz=1;p.p_filesz=1;p.p_align=1;}
     uint32_t ret_instruction=0xd65f03c0;
-    assert(write(fd,&h,sizeof(h))==sizeof(h));assert(write(fd,&p,sizeof(p))==sizeof(p));
+    assert(write(fd,&h,sizeof(h))==sizeof(h));assert(write(fd,&first,sizeof(first))==sizeof(first));
+    if(later)assert(write(fd,&p,sizeof(p))==sizeof(p));
     assert(pwrite(fd,&ret_instruction,4,4096)==4);assert(!fchmod(fd,0700));close(fd);
     unsigned char *sentinel=mmap(NULL,4096,PROT_READ|PROT_WRITE,
         MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(sentinel!=MAP_FAILED);
@@ -98,7 +102,9 @@ static void exec_rejected(void) {
 int main(int argc,char **argv) {
     assert(argc==3);char *end;target=strtoull(argv[2],&end,0);assert(!*end && target);
     main_tid=(pid_t)syscall(SYS_gettid);
-    if(!strcmp(argv[1],"--exec-reject")){exec_rejected();return 0;}
+    if(!strcmp(argv[1],"--exec-reject")){exec_rejected(0,0);return 0;}
+    if(!strcmp(argv[1],"--exec-later-reject")){exec_rejected(1,0);return 0;}
+    if(!strcmp(argv[1],"--exec-tail-reject")){exec_rejected(1,1);return 0;}
     if(!strncmp(argv[1],"--worker-",9)) {
         operation=argv[1]+9;pthread_t thread;assert(!pthread_create(&thread,NULL,worker,NULL));
         assert(!pthread_join(thread,NULL));assert(!strcmp(operation,"syscalls"));
