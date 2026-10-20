@@ -18,6 +18,16 @@ and copied to the target. Pass that pre-realized `sessionServices` into the
 application factory. Never use target-native compilation to fill missing
 compiled artifacts; missing target substitutes require a vmhost cross-build.
 
+`nix/macos-session-package.nix` constructs both the opener and services with
+`pkgs = darwinPkgs`, `buildPkgs = linuxPkgs`, a Linux Rust toolchain including
+`aarch64-apple-darwin` standard libraries, and the existing private Apple SDK
+passed as `sdk`. Both builders run on Linux. The opener uses the existing
+clang/lld ARM64 Darwin cross-link setup and Cargo.lock; target programs are
+never run during the build. The SDK remains an explicit private input, not a
+repository asset or a target-machine fetch. The result also exposes
+`hostTools` so its Mach-O executable and package closure can be inspected
+before copying the realized service package to the target.
+
 The module installs one Aqua LaunchAgent, `org.waycompose.session-services`.
 The package also contains its plist for deployments without nix-darwin.
 Installation sources do not load or change a live service. Do not install the

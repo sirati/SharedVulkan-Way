@@ -2,6 +2,7 @@
 # or cross-built beforehand. hostTools must contain a vmhost-built Mach-O opener.
 { pkgs, buildPkgs, hostTools }:
 assert buildPkgs.stdenv.buildPlatform.isLinux;
+assert pkgs.stdenv.hostPlatform.isDarwin;
 let
   source = pkgs.lib.cleanSourceWith {
     src = ../services/macos-session;
