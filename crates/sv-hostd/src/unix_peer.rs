@@ -155,10 +155,18 @@ impl UnixPeer {
         if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        if descriptor.revents & libc::POLLNVAL != 0 {
+        if descriptor.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
             return Err(invalid("retained service pidfd became invalid"));
         }
         Ok(descriptor.revents & libc::POLLIN != 0)
+    }
+}
+
+// SAFETY: the only liveness query polls the original SO_PEERPIDFD descriptor.
+// No message field, socket EOF or reopened numeric PID participates.
+unsafe impl wc_broker::service_auth::ServiceProcess for UnixPeer {
+    fn exited(&self) -> io::Result<bool> {
+        UnixPeer::exited(self)
     }
 }
 
@@ -251,6 +259,7 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
         let peer = UnixPeer::capture(&stream).unwrap();
+        let service_process: &dyn wc_broker::service_auth::ServiceProcess = &peer;
         assert_eq!(peer.credentials().pid, child.0.id());
         let expected = Executable::from_file(&File::open(executable).unwrap()).unwrap();
         let policy = Policy {
@@ -275,12 +284,12 @@ mod tests {
         stream.write_all(b"C").unwrap();
         assert_eq!(stream.read(&mut ready).unwrap(), 0);
         assert!(
-            !peer.exited().unwrap(),
+            !service_process.exited().unwrap(),
             "endpoint close is not kernel process death"
         );
         child.0.stdin.as_mut().unwrap().write_all(b"Q").unwrap();
         assert!(child.0.wait().unwrap().success());
-        assert!(peer.exited().unwrap());
+        assert!(service_process.exited().unwrap());
         assert!(peer.require(policy).is_err());
     }
 }
