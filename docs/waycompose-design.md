@@ -36963,6 +36963,30 @@ installation's key on stdin, and the user's `session.key` is deleted.
 and `broker-uninstall` (service deleted, devices' descriptors restored,
 holder ended, keys kept).
 
+**Rollback baseline.** The first broker start records each device's live DACL
+and PnP descriptor before changing either. PnP security is read through the
+binary `SPDRP_SECURITY` property, including its mandatory label; the SDDL
+property is for writing. A five-column `devices.txt` stores both originals,
+written before the change. Unreadable or invalid snapshots refuse changes.
+Uninstall retains failed restoration records for retry and refuses an older
+four-column baseline whose PnP original is unknown.
+
+The installer preserves the earlier port-access task XML and its script,
+log and port map under ProgramData before removing them. Reinstall keeps
+the first snapshot. Uninstall restores it, stops the holder before restoring
+the live descriptors, removes the service binary, and removes its Program
+Files directory if empty. A failed restoration keeps the executable and the
+snapshot. Installation keys remain available for a later reinstall.
+
+Verified on a private Windows 11 clone with 2 GiB, four vCPUs, two 64 MiB
+ivshmem BARs and both virtio-serial ports. Two installs followed by uninstall
+restore all four live/PnP descriptors, the task's exported XML and SHA256s of
+all three legacy files. An independent port-access query confirms mandatory
+labels match. A corrupt snapshot refuses uninstall and keeps recovery files;
+repairing it allows retry. With no earlier task/files, uninstall creates none
+and removes the empty directory. Evidence is
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/roundtrip-final.txt`.
+
 **What remains.** Running the compositor and the GPU process on the VM under
 the broker end to end (the probe exercises the same calls, not the products);
 the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest

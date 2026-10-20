@@ -38,6 +38,8 @@ $Exe = Join-Path $Dir "sv-guest.exe"
 $Data = Join-Path $env:ProgramData "waycompose"
 $Keys = Join-Path $Data "keys"
 $OldTask = "waycompose port access"
+$Before = Join-Path $Data "pre-broker"
+$LegacyFiles = @("wc-port-access.ps1", "wc-port-access.log", "ports.json")
 
 function Say($s) { Write-Host "[wc-broker-install] $s" }
 
@@ -90,13 +92,27 @@ switch ($Action) {
     $r = Run sc.exe @("failure", $Name, "reset=", "86400", "actions=", "restart/1000/restart/5000/restart/30000")
     if ($r[0] -ne 0) { throw "sc.exe failure: $($r[1])" }
     Run sc.exe @("failureflag", $Name, "1") | Out-Null
+    # Keep the first baseline across upgrades and repeated installations.
+    if (-not (Test-Path (Join-Path $Before "complete"))) {
+      if (Test-Path $Before) { throw "incomplete pre-broker backup at $Before; restore or inspect it before retrying" }
+      Secure-Dir $Before $false
+      $task = Get-ScheduledTask -TaskName $OldTask -ErrorAction SilentlyContinue
+      if ($task) {
+        Export-ScheduledTask -TaskName $OldTask | Set-Content -Encoding Unicode (Join-Path $Before "task.xml")
+      }
+      foreach ($f in $LegacyFiles) {
+        $p = Join-Path $Dir $f
+        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $Before $f) }
+      }
+      New-Item -ItemType File -Path (Join-Path $Before "complete") -Force | Out-Null
+    }
     # §91's per-user grant is superseded: the broker sets the devices'
     # descriptors itself at every start.
     if (Get-ScheduledTask -TaskName $OldTask -ErrorAction SilentlyContinue) {
       Unregister-ScheduledTask -TaskName $OldTask -Confirm:$false
       Say "removed the task '$OldTask' (wc-port-access.ps1, §91)"
     }
-    foreach ($f in @("wc-port-access.ps1", "wc-port-access.log", "ports.json")) {
+    foreach ($f in $LegacyFiles) {
       Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $Dir $f)
     }
     Start-Service -Name $Name
@@ -129,12 +145,33 @@ switch ($Action) {
   }
   "uninstall" {
     if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
-      Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+      Stop-Service -Name $Name -Force
+      (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))
       Run sc.exe @("delete", $Name) | Out-Null
     }
     if (Test-Path $Exe) {
+      Run $Exe @("broker", "holder-quit") | Out-Null
       & $Exe broker revert-acl | ForEach-Object { Say "device: $_" }
-      & $Exe broker holder-quit 2>$null | Out-Null
+      if (Test-Path (Join-Path $Data "devices.txt")) { throw "device restoration incomplete; baseline retained for retry" }
+    }
+    if (Test-Path (Join-Path $Before "complete")) {
+      foreach ($f in $LegacyFiles) {
+        $p = Join-Path $Before $f
+        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $Dir $f) }
+      }
+      $xml = Join-Path $Before "task.xml"
+      if (Test-Path $xml) {
+        Register-ScheduledTask -TaskName $OldTask -Xml ([IO.File]::ReadAllText($xml)) -Force | Out-Null
+      }
+      Remove-Item -Recurse -Force $Before
+    }
+    if (Test-Path $Exe) {
+      try { Remove-Item -Force $Exe }
+      catch { Rename-Item -Force $Exe ("sv-guest.exe.old-" + (Get-Date -Format "yyyyMMddHHmmss")) }
+    }
+    Get-ChildItem -Path $Dir -Filter "sv-guest.exe.old-*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    if ((Test-Path $Dir) -and -not (Get-ChildItem -Force $Dir | Select-Object -First 1)) {
+      Remove-Item -Force $Dir
     }
     Say "uninstalled: the service is gone and the devices have their descriptors from before; $Keys is kept"
   }
