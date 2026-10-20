@@ -459,6 +459,16 @@ fn acknowledge(bytes: &mut Receive, status: i32) {
     if kr != 0 { unsafe { mach_msg_destroy((&raw mut ack).cast()) }; }
 }
 
+/// Allocate an unregistered private receive right in this task. The caller
+/// keeps the returned name and may pass it directly to `serve` in the same
+/// process; no bootstrap registration or launchd/global service is used.
+#[cfg(target_os = "macos")]
+pub fn private_service_port() -> Result<Port, Kr> {
+    let mut port = 0;
+    let kr = unsafe { mach_port_allocate(mach_task_self_, 1, &mut port) };
+    if kr == 0 { Ok(port) } else { Err(kr) }
+}
+
 /// Receive kernel-validated Mach messages with audit trailers. Every successful
 /// receive, accepted or rejected, destroys all unadopted rights. A persistent
 /// receive error terminates this endpoint; it never busy-loops.

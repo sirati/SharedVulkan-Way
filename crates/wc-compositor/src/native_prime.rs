@@ -448,3 +448,18 @@ pub fn start_section_service() -> io::Result<Option<wc_broker::client::Client>> 
         .spawn(move || wc_handle::iosection::serve(port))?;
     Ok(Some(broker))
 }
+
+/// Start an authenticated private endpoint without bootstrap registration.
+/// The returned broker owner and receive name stay in this process; messages
+/// still pass the existing UID/audit and owner-generation checks.
+pub fn start_private_section_service() -> io::Result<(wc_broker::client::Client, u32)> {
+    let mut broker = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+    broker.hello("nv12-fixture")?;
+    wc_broker::client::install_iosection_observer()?;
+    let port = wc_handle::iosection::private_service_port()
+        .map_err(|code| io::Error::other(format!("private Mach port allocation failed: {code}")))?;
+    let receive = port;
+    std::thread::Builder::new().name("private-sections".into())
+        .spawn(move || wc_handle::iosection::serve(receive))?;
+    Ok((broker, port))
+}
