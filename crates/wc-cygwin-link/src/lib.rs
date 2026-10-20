@@ -157,7 +157,7 @@ mod windows {
         if control.layout().geometry != Geometry::for_wayland() {
             return Err("Wayland control geometry does not match its pool window".into());
         }
-        let port = wc_broker::client::lend::port("org.sirati.wcbell.0", "wayland-client")
+        let port = wc_broker::client::lend::bell_port("org.sirati.wcbell.0", "wayland-client")
             .ok_or("broker did not lend the Wayland doorbell")?;
         let controls = wc_handle::bar_stream::controls();
         controls.add(&control);
