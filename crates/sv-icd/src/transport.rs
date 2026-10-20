@@ -808,6 +808,9 @@ impl RingTransport {
     /// exists to make: the platform layer differs and the transport does not.
     #[cfg(windows)]
     pub fn connect(session: &str) -> Result<Attached, String> {
+        if let Some(slot) = session.strip_prefix("ivshmem:") {
+            return windows_guest::connect(slot);
+        }
         use sv_transport::cold::ColdMessage;
         use sv_transport::stream::{read_message, write_message};
         use sv_transport::{winpipe, winshm};
@@ -2337,7 +2340,7 @@ impl RingTransport {
     /// `svArenaInfo`, on the instance ring. `None` for any failure, which is
     /// a fixed arena: a GPU side too old to know the question is refused at
     /// attach by `WIRE_VERSION` before it gets here.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn arena_info(&self, name: &str) -> Option<sv_proto::sv::ArenaInfoReply> {
         let mut cmd = Vec::new();
         sv_proto::sv::ArenaInfo::named(name).encode(&mut cmd).ok()?;
@@ -2560,3 +2563,7 @@ impl Drop for RamHold {
         }
     }
 }
+
+#[cfg(windows)]
+#[path = "windows_guest.rs"]
+mod windows_guest;
