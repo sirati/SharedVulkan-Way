@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ];
+    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ./guest-status.patch ./seqpacket.patch ./async-signal-context.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
@@ -173,6 +173,10 @@ let
   accessClient = guest.callPackage ./client-probe.nix {
     programName = "hl-shared-access-client"; source = ./shared-access-client.c;
   };
+  asyncFaultClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-async-fault-client"; source = ./async-fault-client.c;
+    linkFlags = [ "-pthread" ];
+  };
   seqpacketClient = guest.callPackage ./client-probe.nix {
     programName = "hl-seqpacket-client"; source = ./seqpacket-client.c;
     linkFlags = [ "-pthread" ];
@@ -238,6 +242,7 @@ let
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-map-fault
       "$HL_RUNNER" ${externalFaultClient}/bin/hl-external-fault-client handled
       "$HL_RUNNER" ${externalFaultClient}/bin/hl-external-fault-client pending
+      "$HL_RUNNER" ${asyncFaultClient}/bin/hl-async-fault-client
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-write
       "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client --guest-readonly-exec
       for address in 0x100000 0x3c0000 0x3ff000; do
@@ -255,5 +260,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient asyncFaultClient probeRunner;
 }

@@ -24,6 +24,7 @@ patch -d "$out/source" -p1 < "$project/nix/hyperlinux/external-guest-fault.patch
 patch -d "$out/source" -p1 < "$project/nix/hyperlinux/peek-rights-guard.patch"
 patch -d "$out/source" -p1 < "$project/nix/hyperlinux/guest-status.patch"
 patch -d "$out/source" -p1 < "$project/nix/hyperlinux/seqpacket.patch"
+patch -d "$out/source" -p1 < "$project/nix/hyperlinux/async-signal-context.patch"
 cp "$project"/nix/hyperlinux/hl_{shared,seals,drm,socket,copy,atomic,seccomp,seccomp_bpf,status,seqpacket}.{c,h} "$out/source/src/"
 cp "$project/nix/hyperlinux/hl_script.h" "$out/source/src/"
 cp "$project/include/wc_hyperlinux.h" "$out/source/src/"
