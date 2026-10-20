@@ -52,13 +52,16 @@ query is outside the allowed scope.
 ## Format-list crash isolation
 
 `scripts/probe-vk-formats.c` tests legacy format properties, properties2,
-properties3, both modifier-list versions, and their combined chain. It tests
+properties3, both modifier-list versions, and their combined chain. It also
+tests VkSubpassResolvePerformanceQueryEXT, alone and with properties3, when the
+multisampled-render-to-single-sampled extension is advertised. Current upstream
+vulkaninfo includes that structure in its generated format chain. It tests
 count and fill calls separately and flushes the format and chain before every
 call. The last unmatched `begin` line identifies a crashing call. A single
 format and chain can be replayed by passing their numeric values.
 
 The probe sweeps core formats, YCbCr, ASTC HDR and PVRTC. It does not enable
-modifiers when the extension is absent, or properties3 below Vulkan 1.3.
+modifiers when the extension is absent, or properties3 without Vulkan 1.3 or its KHR extension.
 Run the same probe with the dma-buf environment off and on, then directly against
 the native driver when available. Preserve the exact executable and ICD hashes
 with the output outside the source repository. A crash without dma-buf enabled
