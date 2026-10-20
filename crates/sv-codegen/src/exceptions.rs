@@ -1049,3 +1049,57 @@ pub const GPU_OPTIONAL_OVERRIDES: &[&str] = &[
     "vkQueueSubmit", "vkQueueSubmit2", "vkQueueWaitIdle", "vkDeviceWaitIdle",
     "vkGetFenceStatus", "vkWaitForFences", "vkGetSemaphoreCounterValue", "vkWaitSemaphores",
 ];
+
+/// Pure command-buffer state that may be reconstructed, in original order,
+/// after an external producer boundary with no rendering/query/predicate scope.
+/// These commands only bind objects or write dynamic/push state; they do not
+/// execute work, touch event/query state, or begin/end scopes. Ordered replay is
+/// required for descriptor-layout disturbance, incremental push constants,
+/// shader-stage unbinding and dynamic vertex-stride interactions.
+///
+/// This is an explicit semantic allowlist, not a CmdSet/CmdBind name rule or the
+/// registry tasks=state label. Unknown state remains UnsupportedState. Template
+/// descriptor payloads, descriptor buffers/heaps, device addresses, XFB bindings
+/// and vendor-specific state need separate ownership and semantic review.
+pub const GPU_RECORDED_RESTORABLE_STATE: &[&str] = &[
+    "vkCmdBindPipeline", "vkCmdBindShadersEXT",
+    "vkCmdBindDescriptorSets", "vkCmdBindDescriptorSets2",
+    "vkCmdBindVertexBuffers", "vkCmdBindVertexBuffers2",
+    "vkCmdBindIndexBuffer", "vkCmdBindIndexBuffer2",
+    "vkCmdPushConstants", "vkCmdPushConstants2",
+    "vkCmdPushDescriptorSet", "vkCmdPushDescriptorSet2",
+    "vkCmdSetDeviceMask",
+    "vkCmdSetViewport", "vkCmdSetScissor", "vkCmdSetLineWidth",
+    "vkCmdSetDepthBias", "vkCmdSetBlendConstants", "vkCmdSetDepthBounds",
+    "vkCmdSetStencilCompareMask", "vkCmdSetStencilWriteMask", "vkCmdSetStencilReference",
+    "vkCmdSetCullMode", "vkCmdSetFrontFace", "vkCmdSetPrimitiveTopology",
+    "vkCmdSetViewportWithCount", "vkCmdSetScissorWithCount",
+    "vkCmdSetDepthTestEnable", "vkCmdSetDepthWriteEnable", "vkCmdSetDepthCompareOp",
+    "vkCmdSetDepthBoundsTestEnable", "vkCmdSetStencilTestEnable", "vkCmdSetStencilOp",
+    "vkCmdSetRasterizerDiscardEnable", "vkCmdSetDepthBiasEnable", "vkCmdSetPrimitiveRestartEnable",
+    "vkCmdSetLogicOpEXT", "vkCmdSetPatchControlPointsEXT",
+    "vkCmdSetTessellationDomainOriginEXT", "vkCmdSetDepthClampEnableEXT",
+    "vkCmdSetPolygonModeEXT", "vkCmdSetRasterizationSamplesEXT", "vkCmdSetSampleMaskEXT",
+    "vkCmdSetAlphaToCoverageEnableEXT", "vkCmdSetAlphaToOneEnableEXT", "vkCmdSetLogicOpEnableEXT",
+    "vkCmdSetColorBlendEnableEXT", "vkCmdSetColorBlendEquationEXT", "vkCmdSetColorWriteMaskEXT",
+    "vkCmdSetRasterizationStreamEXT", "vkCmdSetConservativeRasterizationModeEXT",
+    "vkCmdSetExtraPrimitiveOverestimationSizeEXT", "vkCmdSetDepthClipEnableEXT",
+    "vkCmdSetSampleLocationsEnableEXT", "vkCmdSetColorBlendAdvancedEXT",
+    "vkCmdSetProvokingVertexModeEXT", "vkCmdSetLineRasterizationModeEXT",
+    "vkCmdSetLineStippleEnableEXT", "vkCmdSetDepthClipNegativeOneToOneEXT",
+    "vkCmdSetVertexInputEXT", "vkCmdSetColorWriteEnableEXT", "vkCmdSetLineStipple",
+    "vkCmdSetSampleLocationsEXT", "vkCmdSetDepthBias2EXT", "vkCmdSetDepthClampRangeEXT",
+    "vkCmdSetAttachmentFeedbackLoopEnableEXT", "vkCmdSetFragmentShadingRateKHR",
+];
+
+/// These change only the current rendering instance. They are retained in the
+/// intact native rendering segment and must never be replayed outside it.
+pub const GPU_RECORDED_SCOPE_LOCAL_STATE: &[&str] = &[
+    "vkCmdSetRenderingAttachmentLocations", "vkCmdSetRenderingInputAttachmentIndices",
+];
+
+/// Generated execution may change bindings despite its registry action label.
+/// It requires explicit state invalidation/restoration semantics before a cut.
+pub const GPU_RECORDED_UNAUDITED_STATE_EFFECTS: &[&str] = &[
+    "vkCmdExecuteGeneratedCommandsEXT", "vkCmdExecuteGeneratedCommandsNV",
+];

@@ -404,6 +404,10 @@ pub struct Command {
     /// the restricted sub-decoder of docs/design.md §6.5 is allowed to accept.
     pub cmd_buffer_level: Option<String>,
     pub queues: Option<String>,
+    // Registry tasks classify possible state; they do not prove safe restoration.
+    pub tasks: Option<String>,
+    // Registry video-coding scope validity, separate from native replay safety.
+    pub video_coding: Option<String>,
     pub render_pass: Option<String>,
     /// Parameters the registry marks as implicitly externally synchronised.
     pub implicit_externsync: Vec<String>,
@@ -903,6 +907,8 @@ impl Model {
                             error_codes: split_list(d.errorcodes.as_deref()),
                             cmd_buffer_level: d.cmdbufferlevel.clone(),
                             queues: d.queues.clone(),
+                            tasks: d.tasks.clone(),
+                            video_coding: d.videocoding.clone(),
                             render_pass: d.renderpass.clone(),
                             implicit_externsync: d.implicitexternsyncparams.clone(),
                         },
