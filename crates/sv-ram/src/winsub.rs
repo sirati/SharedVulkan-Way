@@ -110,8 +110,8 @@ impl Substrate for KeeperSubstrate {
         // Our view and handle first, then the broker's: the last holder goes
         // only after the peer has let go.
         self.open.remove(&id);
-        // Adopted regions acquired a lease through open; new allocations
-        // have only their ownership. Closing a missing lease is harmless.
+        // Allocations and adopted regions opened above each have a lease
+        // on this connection. End it before releasing the owner's section.
         let _ = self.broker.close(u64::from(id));
         self.broker.free(u64::from(id)).map_err(|e| e.to_string())
     }
