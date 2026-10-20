@@ -27,6 +27,54 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
 };
 
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+};
+
+/// Exact directory object created protected at canonical enrollment. An
+/// observed file ID in a legacy directory is not proof of its history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryIdentity {
+    volume: u64,
+    file: [u8; 16],
+}
+impl DirectoryIdentity {
+    pub fn volume(&self) -> u64 {
+        self.volume
+    }
+    pub fn file(&self) -> [u8; 16] {
+        self.file
+    }
+    /// Restore only the canonical owner's protected fresh-enrollment record.
+    ///
+    /// # Safety
+    /// These fields must come from the protected record established by
+    /// create_fresh, never a wire claim or a just-observed legacy directory.
+    /// The canonical owner must exclude rollback/substitution of that record.
+    pub unsafe fn from_rooted_record(volume: u64, file: [u8; 16]) -> Self {
+        Self { volume, file }
+    }
+}
+fn directory_identity(handle: HANDLE) -> io::Result<DirectoryIdentity> {
+    let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(DirectoryIdentity {
+        volume: id.VolumeSerialNumber,
+        file: id.FileId.Identifier,
+    })
+}
+
 const SECURITY: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const READ_CONTROL: u32 = 0x0002_0000;
 const DELETE: u32 = 0x0001_0000;
@@ -109,9 +157,43 @@ impl DirectoryStore {
     /// The privileged canonical original-backing owner must select its one
     /// trusted state directory, through protected ancestors. Its full lifetime
     /// must exclude restoration of old state images or alternate directories.
+    /// expected must be the exact fresh-directory object identity retained in
+    /// independent protected canonical enrollment, never discovered by reading
+    /// the directory being admitted. A tightened legacy ACL proves no history.
     /// The caller must run as SYSTEM or an elevated administrator; this backend
     /// requires volume-flush authority and never weakens ACLs to obtain it.
-    pub unsafe fn open(path: &Path) -> io::Result<Self> {
+    pub unsafe fn open(path: &Path, expected: DirectoryIdentity) -> io::Result<Self> {
+        unsafe { Self::open_pinned(path, Some(expected)) }
+    }
+    /// Atomically create a new protected directory, refusing every existing
+    /// object. Never repair a legacy directory and certify it as fresh: old
+    /// desktop WRITE_DAC handles would survive such repair.
+    ///
+    /// # Safety
+    /// The canonical privileged owner must choose a fresh canonical path under
+    /// trusted ancestors and durably retain the returned object identity in
+    /// its protected enrollment. Creating a new path is not permission to reset
+    /// an existing physical backing's exclusion history.
+    pub unsafe fn create_fresh(path: &Path) -> io::Result<Self> {
+        let sd = Sd::from_sddl(SECURITY)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: 0,
+        };
+        let name = wide(
+            path.to_str()
+                .ok_or_else(|| invalid("registry path is not Unicode"))?,
+        );
+        if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { Self::open_pinned(path, None) }
+    }
+    pub fn identity(&self) -> io::Result<DirectoryIdentity> {
+        directory_identity(self.directory.0)
+    }
+    unsafe fn open_pinned(path: &Path, expected: Option<DirectoryIdentity>) -> io::Result<Self> {
         let path = wide(
             path.to_str()
                 .ok_or_else(|| invalid("registry path is not Unicode"))?,
@@ -133,6 +215,13 @@ impl DirectoryStore {
         }
         let directory = Owned(handle);
         check(directory.0, true)?;
+        if let Some(expected) = expected
+            && directory_identity(directory.0)? != expected
+        {
+            return Err(invalid(
+                "registry directory differs from fresh enrolled object",
+            ));
+        }
         let volume = volume_for(directory.0)?;
         let lock = child(directory.0, "lock", true, 3)?; // FILE_OPEN_IF, sharing denied
         check(lock.as_raw_handle(), false)?;
@@ -446,8 +535,6 @@ mod tests {
     use super::*;
     use crate::bar_registry::{PhysicalBacking, Registry};
     use crate::service_control::{Binding, Origin, Roles, Source};
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
     fn backing() -> PhysicalBacking {
         PhysicalBacking {
             host_device: 7,
@@ -507,8 +594,19 @@ mod tests {
         );
         path
     }
+    // Test fixtures were freshly created with explicit security above. Native
+    // production reopen must instead use its protected enrollment receipt.
+    fn identity(path: &Path) -> DirectoryIdentity {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap();
+        directory_identity(file.as_raw_handle()).unwrap()
+    }
     fn open(path: &Path) -> DirectoryStore {
-        unsafe { DirectoryStore::open(path).unwrap() }
+        unsafe { DirectoryStore::open(path, identity(path)).unwrap() }
     }
     #[test]
     fn crash_worker() {
@@ -533,6 +631,22 @@ mod tests {
     }
     #[test]
     fn native_ntfs_protection_crash_and_uncertain_commit() {
+        let parent = directory(SECURITY);
+        let fresh = parent.join("fresh");
+        let store = unsafe { DirectoryStore::create_fresh(&fresh).unwrap() };
+        let enrolled = store.identity().unwrap();
+        drop(store);
+        assert!(unsafe { DirectoryStore::create_fresh(&fresh) }.is_err());
+        let store = unsafe { DirectoryStore::open(&fresh, enrolled).unwrap() };
+        drop(store);
+        let replacement = parent.join("other");
+        let store = unsafe { DirectoryStore::create_fresh(&replacement).unwrap() };
+        drop(store);
+        assert!(
+            unsafe { DirectoryStore::open(&replacement, enrolled) }.is_err(),
+            "fresh object substitution accepted"
+        );
+        std::fs::remove_dir_all(parent).unwrap();
         let path = directory(SECURITY);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -546,7 +660,7 @@ mod tests {
         assert!(status.success());
         let store = open(&path);
         assert!(
-            unsafe { DirectoryStore::open(&path) }.is_err(),
+            unsafe { DirectoryStore::open(&path, identity(&path)) }.is_err(),
             "exclusive lock bypassed"
         );
         assert!(
@@ -591,14 +705,14 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
 
         let broad = directory("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)");
-        assert!(unsafe { DirectoryStore::open(&broad) }.is_err());
+        assert!(unsafe { DirectoryStore::open(&broad, identity(&broad)) }.is_err());
         std::fs::remove_dir_all(broad).unwrap();
         let owned = directory(&format!(
             "O:{}D:P(A;;FA;;;SY)(A;;FA;;;BA)",
             crate::sys::windows::ident::current_user().unwrap()
         ));
         assert!(
-            unsafe { DirectoryStore::open(&owned) }.is_err(),
+            unsafe { DirectoryStore::open(&owned, identity(&owned)) }.is_err(),
             "desktop creator ownership trusted"
         );
         std::fs::remove_dir_all(owned).unwrap();
