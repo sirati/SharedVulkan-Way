@@ -123,12 +123,21 @@ unsafe fn native_completed(
         .wait_semaphore_infos(waits)
         .command_buffer_infos(commands);
     let submitted = unsafe { driver.device.queue_submit2(driver.queue, &[batch], fence) };
+    #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+    if submitted.is_ok() && !waits.is_empty() {
+        crate::native_video_queue_fixture::native_wait_submitted();
+    }
     let result = match submitted {
         Ok(()) => loop {
             if driver.native_submission_failure().is_some() {
                 break Err(vk::Result::ERROR_DEVICE_LOST);
             }
-            match unsafe { driver.device.wait_for_fences(&[fence], true, 50_000_000) } {
+            let slice = unsafe { driver.device.wait_for_fences(&[fence], true, 50_000_000) };
+            let slice = crate::native_video_wait_result::observed_slice(
+                slice,
+                driver.native_submission_failure(),
+            );
+            match slice {
                 Err(vk::Result::TIMEOUT) => continue,
                 result => break result,
             }

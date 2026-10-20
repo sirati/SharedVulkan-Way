@@ -132,6 +132,10 @@ impl video_worker::Submission for Job {
         if let Some(done) = self.done.take() {
             let _ = done.send(result);
         }
+        #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+        if self.video.is_some() {
+            crate::native_video_queue_fixture::native_job_finished(result);
+        }
     }
 }
 impl GpuServer {

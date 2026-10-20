@@ -1,20 +1,24 @@
 //! Coordinated native hardware fixture. Build on vmhost, run only in an approved window.
 #[cfg(target_os = "macos")]
 fn main() {
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-        eprintln!("native queue fixture watchdog expired");
-        std::process::exit(1);
-    });
+    let cancel_waits = std::env::args().any(|a| a == "--cancel-waits");
     let sync2 = std::env::args().any(|a| a == "--sync2");
     let wire_recording = std::env::args().any(|a| a == "--wire-recording");
-    match sv_gpu_server::native_video_queue_fixture::run_mode(sync2, wire_recording) {
+    let result = if cancel_waits {
+        sv_gpu_server::native_video_queue_fixture::run_cancel_waits(sync2)
+    } else {
+        sv_gpu_server::native_video_queue_fixture::run_mode(sync2, wire_recording)
+    };
+    match result {
         Ok(()) => {
-            println!("PASS native queue fixture sync2={sync2} wire_recording={wire_recording}")
+            println!(
+                "PASS native queue fixture sync2={sync2} wire_recording={wire_recording} cancel_waits={cancel_waits}"
+            )
         }
         Err(error) => {
             eprintln!("FAIL native queue fixture: {error}");
-            // Native owners must not unwind after an uncertain completion.
+            // The fixture returns errors only after proving safe owner release.
+            // Unproven cases retain their graph inside the controller.
             std::process::exit(1);
         }
     }

@@ -21,18 +21,39 @@ use std::sync::{Arc, Mutex};
 use sv_proto::{self as p, HandleType, Server};
 use sv_transport::region::SharedRegion;
 
-struct CompletionGuard(bool);
-impl Drop for CompletionGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            eprintln!("fixture native completion unproven; exiting before owner release");
-            std::process::exit(1);
-        }
-    }
-}
-
+#[path = "native_video_cancel_fixture.rs"]
+mod cancellation;
+#[path = "native_video_normal_fixture.rs"]
+mod normal;
 #[path = "native_video_queue_wire_fixture.rs"]
 mod wire_recording;
+
+struct Fixture {
+    rpc: sv_gpu_entry::Forward<GpuServer>,
+    shared: Arc<Shared>,
+    destination: Arc<Image>,
+    setup: Arc<Image>,
+    source: vk::Buffer,
+    pool: vk::CommandPool,
+    image_requirement_bytes: [u64; 2],
+    source_bytes: u64,
+    timeline: vk::Semaphore,
+    diagnostic_fence: Option<vk::Fence>,
+    user_fence: vk::Fence,
+}
+
+pub fn run_cancel_waits(sync2: bool) -> Result<(), String> {
+    cancellation::run(sync2)
+}
+pub(crate) fn native_job_finished(result: Result<(), vk::Result>) {
+    normal::native_job_finished(result);
+}
+pub(crate) fn native_wait_submitted() {
+    cancellation::native_wait_submitted();
+}
+pub(crate) fn frontend_wait_slice(fence: bool, result: vk::Result) {
+    cancellation::frontend_wait_slice(fence, result);
+}
 
 const STREAM: &[u8] = include_bytes!("../examples/assets/videotoolbox-h264/progressive-64x50.h264");
 const DEVICE: u64 = 1;
@@ -352,7 +373,7 @@ pub fn run_mode(sync2: bool, wire_recording: bool) -> Result<(), String> {
 }
 
 fn submit_and_verify(
-    mut rpc: sv_gpu_entry::Forward<GpuServer>,
+    rpc: sv_gpu_entry::Forward<GpuServer>,
     sync2: bool,
     wire_recording: bool,
     shared: Arc<Shared>,
@@ -401,10 +422,47 @@ fn submit_and_verify(
             );
         }
     }
-    let mut completion = CompletionGuard(true);
+    let image_requirement_bytes = [destination.requirements().size, setup.requirements().size];
+    let source_bytes = unsafe { driver.device.get_buffer_memory_requirements(source_buffer) }.size;
+    let diagnostic_fence = Some(native(unsafe {
+        driver
+            .device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+    })?);
+    let fixture = Fixture {
+        rpc,
+        shared,
+        destination,
+        setup,
+        source: source_buffer,
+        pool,
+        image_requirement_bytes,
+        source_bytes,
+        timeline,
+        diagnostic_fence,
+        user_fence: fence,
+    };
+    normal::run(fixture, sync2, wire_recording, job, binary)
+}
+
+fn verification_body(
+    mut rpc: sv_gpu_entry::Forward<GpuServer>,
+    sync2: bool,
+    shared: Arc<Shared>,
+    destination: Arc<Image>,
+    setup: Arc<Image>,
+    job: Decode,
+    fence: vk::Fence,
+    progress: Arc<normal::Progress>,
+) -> Result<(), String> {
+    let driver = Arc::clone(&shared.driver);
     // Earlier ordinary native work signals the binary once. Manual mode also
     // places initial image transitions there; wire mode records its transitions
     // in the video plan before decode.
+    progress
+        .attempted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    progress.check()?;
     checked(
         wire(rpc.queue_submit(p::VkQueueSubmitArgs {
             queue: p::VkQueue(QUEUE),
@@ -420,6 +478,7 @@ fn submit_and_verify(
         }))?
         .result,
     )?;
+    progress.check()?;
     if sync2 {
         let semaphore = |id, value| p::VkSemaphoreSubmitInfo {
             semaphore: p::VkSemaphore(id),
@@ -490,6 +549,15 @@ fn submit_and_verify(
         replacement.source_buffer = u64::MAX;
         install(&mut state, replacement)?;
     }
+    progress
+        .signal
+        .compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .map_err(|_| "fixture cancelled before HOST signal".to_string())?;
     checked(
         wire(rpc.signal_semaphore(p::VkSignalSemaphoreArgs {
             device: p::VkDevice(DEVICE),
@@ -515,7 +583,14 @@ fn submit_and_verify(
     // images must observe both writes, without copying into a different target.
     for (role, image) in [("destination", &destination), ("setup", &setup)] {
         let _queue = shared.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+        progress.check()?;
+        progress
+            .sampler_live
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         unsafe { sample(&driver, image.image(), role) }?;
+        progress
+            .sampler_live
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
     checked(
         wire(rpc.queue_wait_idle(p::VkQueueWaitIdleArgs {
@@ -525,24 +600,6 @@ fn submit_and_verify(
     )?;
     if let Some(error) = shared.native_video.lock().unwrap().failure() {
         return Err(format!("worker failure {error:?}"));
-    }
-    completion.0 = false;
-    println!(
-        "queue fixture sync2={sync2} wire_recording={wire_recording} original_arena=true distinct_setup=true future_host_signal=true binary_wait=true user_fence=true accepted_snapshot=true pixels=32"
-    );
-    // All native work is retired before these fixture-only handles are freed.
-    unsafe {
-        for view in shared.objects().native_video.views.values() {
-            if let Some(view) = view.native {
-                driver.device.destroy_image_view(view, None);
-            }
-        }
-        driver.device.destroy_buffer(source_buffer, None);
-        driver.device.free_memory(shared.arena.memory, None);
-        driver.device.destroy_fence(fence, None);
-        driver.device.destroy_semaphore(binary, None);
-        driver.device.destroy_semaphore(timeline, None);
-        driver.device.destroy_command_pool(pool, None);
     }
     Ok(())
 }

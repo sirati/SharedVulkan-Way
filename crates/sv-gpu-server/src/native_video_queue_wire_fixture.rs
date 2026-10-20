@@ -343,6 +343,20 @@ fn record(rpc: &mut Rpc, source_len: u64) -> Result<(), String> {
     Ok(())
 }
 pub(super) fn run(sync2: bool) -> Result<(), String> {
+    let fixture = prepare()?;
+    submit_and_verify(
+        fixture.rpc,
+        sync2,
+        true,
+        fixture.shared,
+        fixture.destination,
+        fixture.setup,
+        fixture.source,
+        fixture.pool,
+    )
+}
+
+pub(super) fn prepare() -> Result<Fixture, String> {
     let (_, _, payload) = first_picture()?;
     let driver = Arc::new(Driver::open(0).map_err(|e| e.to_string())?);
     let region = Arc::new(SharedRegion::heap(1 << 20).map_err(|e| e.to_string())?);
@@ -504,5 +518,27 @@ pub(super) fn run(sync2: bool) -> Result<(), String> {
         .result,
     )?;
     println!("wire fixture resources/session/Std parameters/coding recorded through Forward");
-    submit_and_verify(rpc, sync2, true, shared, destination, setup, source, pool)
+    let timeline = shared
+        .objects()
+        .get::<vk::Semaphore>(HandleType::VkSemaphore, TIMELINE)
+        .map_err(|e| format!("{e:?}"))?;
+    let image_requirement_bytes = [destination.requirements().size, setup.requirements().size];
+    let source_bytes = payload.len() as u64;
+    let user_fence = shared
+        .objects()
+        .get::<vk::Fence>(HandleType::VkFence, FENCE)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(Fixture {
+        diagnostic_fence: None,
+        user_fence,
+        timeline,
+        image_requirement_bytes,
+        source_bytes,
+        rpc,
+        shared,
+        destination,
+        setup,
+        source,
+        pool,
+    })
 }

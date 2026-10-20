@@ -184,10 +184,13 @@ impl crate::server::GpuServer {
                 || elapsed_ns(start),
                 || failed_shared(&shared),
                 |slice| {
-                    vk::Result::from_raw(
+                    let result = vk::Result::from_raw(
                         unsafe { native(device, a.fence_count, handles.as_ptr(), wait_all, slice) }
                             .0,
-                    )
+                    );
+                    #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+                    crate::native_video_queue_fixture::frontend_wait_slice(true, result);
+                    result
                 },
             );
             Ok(p::VkWaitForFencesReply {
@@ -237,7 +240,12 @@ impl crate::server::GpuServer {
                 a.timeout,
                 || elapsed_ns(start),
                 || failed_shared(&shared),
-                |slice| vk::Result::from_raw(unsafe { native(device, &info, slice) }.0),
+                |slice| {
+                    let result = vk::Result::from_raw(unsafe { native(device, &info, slice) }.0);
+                    #[cfg(all(target_os = "macos", feature = "native-video-fixture"))]
+                    crate::native_video_queue_fixture::frontend_wait_slice(false, result);
+                    result
+                },
             );
             Ok(p::VkWaitSemaphoresReply {
                 result: p::VkResult(result.as_raw()),
