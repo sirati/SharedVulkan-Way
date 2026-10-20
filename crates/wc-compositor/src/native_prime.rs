@@ -325,7 +325,8 @@ impl Dispatch<ZwpLinuxBufferParamsV1, Params> for State {
                     init.init(buffer_id, source);
                 }
                 Err(error) => {
-                    params.post_error(
+                    init.post_error(
+                        buffer_id,
                         zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
                         error.to_string(),
                     );
