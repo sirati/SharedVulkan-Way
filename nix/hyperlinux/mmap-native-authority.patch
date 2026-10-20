@@ -1,0 +1,77 @@
+--- a/src/syscall.c
++++ b/src/syscall.c
+@@ -660,11 +660,10 @@
+  * non-identity page table entries (VA→GPA), and register a VA alias so
+  * syscall handlers can resolve the high VA to a host pointer. */
+ static int64_t sys_mmap_high_va(guest_t *g, uint64_t va, uint64_t length,
+-                                int prot, int flags, int fd, int64_t offset) {
++                                int prot, int flags, int host_fd, int64_t offset) {
+     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+ 
+     if (!is_anon && hl_trace_on(HL_TRACE_PROC)) {
+-        int host_fd = fd_to_host(fd);
+         char host_path[LINUX_PATH_MAX] = "(unavailable)";
+         char guest_path[LINUX_PATH_MAX] = "(unmapped)";
+         if (host_fd >= 0)
+@@ -867,8 +866,7 @@
+          * was munmapped) could contain stale data. */
+         memset(ptr, 0, chunk);
+ 
+-        if (!is_anon && fd >= 0) {
+-            int host_fd = fd_to_host(fd);
++        if (!is_anon) {
+             if (host_fd < 0) return -LINUX_EBADF;
+             ssize_t nr = pread(host_fd, ptr, chunk,
+                                offset + (int64_t)written);
+@@ -891,6 +889,16 @@
+     int is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+     if (!is_anon && (flags & LINUX_MAP_SHARED))
+         return hl_wc_mmap(g, addr, length, prot, flags, fd, offset);
++    /* Keep one native identity through every metadata read and pread. A
++     * guest close/dup2 must not redirect any part of this mapping to a
++     * subsequently reused internal host descriptor. */
++    hl_fd_ref_t file __attribute__((cleanup(hl_fd_put))) = {0};
++    int host_fd = -1;
++    if (!is_anon) {
++        if (hl_fd_get_pinned(fd, &file) < 0 || file.host_fd < 0)
++            return -LINUX_EBADF;
++        host_fd = file.host_fd;
++    }
+     int needs_exec = (prot & LINUX_PROT_EXEC) != 0;
+     int is_prot_none = (prot == LINUX_PROT_NONE);
+ 
+@@ -943,8 +951,7 @@
+             }
+ 
+             /* File-backed: pread data into kbuf */
+-            if (!is_anon && fd >= 0) {
+-                int host_fd = fd_to_host(fd);
++            if (!is_anon) {
+                 if (host_fd < 0) return -LINUX_EBADF;
+                 ssize_t nr = pread(host_fd, (uint8_t *)g->kbuf_base + koff,
+                                    length, offset);
+@@ -988,7 +995,7 @@
+             if (is_noreplace && guest_region_overlaps(g, addr, addr + length))
+                 return -LINUX_EEXIST;
+             if (hl_wc_unmap(g, addr, length) < 0) return -LINUX_ENOMEM;
+-            return sys_mmap_high_va(g, addr, length, prot, flags, fd, offset);
++            return sys_mmap_high_va(g, addr, length, prot, flags, host_fd, offset);
+         }
+         result_off = off;
+ 
+@@ -1048,7 +1055,6 @@
+                 /* Zero first, then overlay with file data. This matches
+                  * Linux MAP_FIXED semantics: pages beyond EOF are zeroed. */
+                 memset((uint8_t *)g->host_base + result_off, 0, length);
+-                int host_fd = fd_to_host(fd);
+                 if (host_fd < 0) return -LINUX_EBADF;
+                 ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
+                                    length, offset);
+@@ -1184,7 +1190,6 @@
+      * Skip for PROT_NONE: the region has no page table entries yet;
+      * data is faulted in when mprotect makes the pages accessible. */
+     if (!is_anon && fd >= 0 && !is_prot_none) {
+-        int host_fd = fd_to_host(fd);
+         if (host_fd < 0) return -LINUX_EBADF;
+         ssize_t nr = pread(host_fd, (uint8_t *)g->host_base + result_off,
+                            length, offset);
