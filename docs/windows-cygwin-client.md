@@ -199,13 +199,32 @@ drained. Protected broker/driver integration is separate work.
 The POSIX companion now tracks fd duplication, explicit close and each mapping.
 It supports incoming read-only keymap tokens and logical `ftruncate` growth.
 The library decoder materializes typed incoming descriptors before event
-dispatch. These new paths require their own runtime acceptance. The earlier
-12-frame evidence above remains the validation boundary for the previous
-bounded implementation. Clipboard stream descriptors are not implemented by
-this API stage.
+dispatch. The format-3 acceptance below validates those paths. Clipboard
+stream descriptors are not implemented by this API stage.
 
 Allocation directories require header format 3 and control wire version 2.
 The old registry-only wire version remains 1, and ordinary ivshmem publishers
 retain format 2. A retained format-2 client must reject format 3 before it can
 claim rings or write pool offset zero. New lease clients require format 3
 explicitly. This prevents an older allocator from overwriting directory bytes.
+
+
+The real Windows `lease-real-windows-3` run validates incoming keyboard-v5
+keymaps, address-stable growth from 4,096 to 16,384 bytes, 12 presentations with
+12 distinct hashes, and 128 remote-held buffer recycling checks. The directory
+recorded 388 allocation lifetimes and zero live allocations after compositor
+exit. The final direct-BAR frame hash `0dd2c6f84ac57325` matched a presentation.
+Protocol traffic was 16,160 request and 11,572 reply bytes with zero kernel fds.
+One recycling check needed one additional allocation and roundtrip. A sync
+reply alone is not completion evidence; the allocator still waited for actual
+consumer references to disappear. The retained format-2 binary refused header
+format 3, and wrong-run, wrong-slot and backend-reuse checks also passed.
+
+Evidence is under
+`/mnt/datasets/builds/evidence/windows-cygwin-client/lease-real-windows-3`.
+Its bundle and manifest retain exact application/DLL hashes. The native DLL
+uses format-3 source through `58d454c5`, the Linux compositor additionally uses
+keymap-selection fix `adfefe2c`, and the own acceptance fixture is committed
+with this document. The separate upstream application sources remain unchanged.
+The clone stopped normally and the native local 30-frame baseline passed.
+This proves cooperative normal completion, not protected broker retirement.
