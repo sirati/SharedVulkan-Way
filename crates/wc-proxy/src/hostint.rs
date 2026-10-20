@@ -761,8 +761,10 @@ mod tests {
         let e = std::fs::read_to_string(apps.join("wc-host-n0.desktop")).unwrap();
         assert!(e.contains("Name=Notepad (Windows)") && e.contains("Exec=\"/opt/wc/wc-host-open\" --with n0 %U"), "{e}");
         assert!(apps.join("wc-host-browser.desktop").exists());
-        let m = std::fs::read_to_string(dir.join("hostint/xdg-config/mimeapps.list")).unwrap();
-        assert!(m.contains("text/plain=wc-host-n0.desktop"));
+        wait_for("default handler", || {
+            std::fs::read_to_string(dir.join("hostint/xdg-config/mimeapps.list"))
+                .unwrap_or_default().contains("text/plain=wc-host-n0.desktop")
+        });
         wait_for("roots", || std::fs::read_to_string(dir.join("hostint/roots")).unwrap_or_default().trim() == sl);
 
         // A handler the host no longer offers is removed.

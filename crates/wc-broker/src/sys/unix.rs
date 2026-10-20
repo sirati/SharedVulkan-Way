@@ -709,7 +709,7 @@ mod render_node_tests {
             let hub_path = dir.join("hub.sock");
             let _ = std::fs::remove_file(&hub_path);
             let hub = UnixListener::bind(&hub_path).unwrap();
-            let mut unix = Unix::bind(&dir.join("broker.sock"), Vec::new()).unwrap()
+            let mut unix = Unix::bind(dir.join("broker.sock"), Vec::new()).unwrap()
                 .with_services(vec![DevicePath { name: "sv-hub".into(), path: hub_path }]);
             // Treat the test process as a desktop client, rather than the
             // system account that is creating this broker in the test.
