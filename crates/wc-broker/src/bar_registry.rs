@@ -3,6 +3,10 @@
 use crate::service_control::{Binding, Message, Origin, Payload, Phase};
 use std::io;
 
+/// Whole original backing file at byte zero. Enrollment must derive dev/ino
+/// and exact file length from its retained privileged fd, not a path or wire
+/// message. Nonzero backend offsets/subfile aliases are unsupported and must
+/// be refused, since this schema cannot identify their physical aliasing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysicalBacking {
     pub host_device: u64,
@@ -613,7 +617,17 @@ mod tests {
     fn missing_truncated_and_wrong_original_backing_fail_closed() {
         assert!(Registry::open(Memory::default(), backing(), Origin::Windows).is_err());
         let memory = Memory::default();
-        drop(fresh(memory.clone()));
+        let mut original = fresh(memory.clone());
+        let ticket = original.issue_next_service_epoch(Origin::Windows).unwrap();
+        unsafe {
+            original.confirm_peer_epoch(&ticket, 101).unwrap();
+        }
+        unsafe {
+            original
+                .reserve(&ticket, binding(ticket.value(), 101, 4096))
+                .unwrap();
+        }
+        drop(original);
         assert!(
             unsafe { Registry::initialize_fresh(memory.clone(), backing(), Origin::Windows) }
                 .is_err()
