@@ -153,6 +153,7 @@ struct Args {
     arenas: Vec<(u32, u64, String)>,
     /// Host mapping of a live QMP-authenticated ivshmem BAR, not a file fixture.
     qemu_arenas: Vec<(u32, u64, u8, String, String)>,
+    provide_qemu_bar: Option<(u32, u8, String, String)>,
     /// DYNAMIC ARENA, fixture only: where to find regions the peer grew into.
     /// See `wc_handle::arena::set_grow_dir` for why the deployment needs none.
     arena_grow_dir: Option<String>,
@@ -397,6 +398,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         expect_presents: 0,
         arenas: Vec::new(),
         qemu_arenas: Vec::new(),
+        provide_qemu_bar: None,
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
         ivshmem_arena: None,
@@ -473,6 +475,16 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
             // the normal spelling and a naive split on ':' would eat it.
+            "--provide-qemu-bar" => {
+                let Some(value) = it.next() else { return Err(2); };
+                let parts: Vec<_> = value.splitn(4, ':').collect();
+                if parts.len() != 4 || args.provide_qemu_bar.is_some() {
+                    eprintln!("wc-compositor: --provide-qemu-bar needs one id:slot:device:qmp");
+                    return Err(2);
+                }
+                let (Ok(id), Ok(slot)) = (parts[0].parse(), parts[1].parse()) else { return Err(2); };
+                args.provide_qemu_bar = Some((id, slot, parts[2].to_owned(), parts[3].to_owned()));
+            }
             "--arena-qemu-bar" => {
                 let Some(value) = it.next() else {
                     eprintln!("wc-compositor: --arena-qemu-bar needs id:run:slot:device:qmp");
@@ -764,7 +776,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
     // is nowhere to put them, and the other two ring flags name other regions.
     // §103.15: with --wayland-rings-guest-ram the region is this process's
     // RAM and --wayland-rings names only its doorbell.
-    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() && !ringlink::wants_guest_ram_rings() {
+    if args.wayland_rings.is_some() && args.ivshmem_arena.is_none() && args.provide_qemu_bar.is_none() && !ringlink::wants_guest_ram_rings() {
         eprintln!("wc-compositor: --wayland-rings keeps the tail of the --arena-ivshmem region, and there is none");
         return Err(2);
     }
@@ -772,6 +784,14 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         eprintln!("wc-compositor: --wayland-rings and --wayland-ring/--wayland-cold each name the one ring region");
         return Err(2);
     }
+    if args.provide_qemu_bar.is_some() && (args.ivshmem_arena.is_some() || !args.qemu_arenas.is_empty()
+        || !args.guest_arenas.is_empty() || !args.arenas.is_empty() || !args.provide_arenas.is_empty()
+        || ringlink::wants_guest_ram_rings() || args.wayland_rings.is_none()) {
+        eprintln!("wc-compositor: --provide-qemu-bar needs its own single arena and --wayland-rings");
+        return Err(2);
+    }
+    #[cfg(not(target_os = "linux"))]
+    if args.provide_qemu_bar.is_some() { return Err(2); }
     Ok(args)
 }
 
@@ -1296,10 +1316,15 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     }
     // §105: the rings are kept whether or not the port opens. Without it they
     // are polled, said loudly; there is no socket path to fall back to.
-    let mut bell_port = match (&args.wayland_rings, args.ivshmem_arena) {
+    let provided_ivshmem = args.ivshmem_arena.or_else(|| args.provide_qemu_bar.as_ref().map(|p| (p.0, 0)));
+    let mut bell_port = match (&args.wayland_rings, provided_ivshmem) {
         (Some(port), Some(_)) => match ringlink::open_bell_port(port) {
             Ok(p) => Some((port.clone(), Some(p))),
             Err(e) => {
+                if args.provide_qemu_bar.is_some() {
+                    eprintln!("wc-compositor: host BAR wake channel {port} failed: {e}");
+                    return std::process::ExitCode::from(2);
+                }
                 println!(
                     "wc-compositor: NO DOORBELL: the port {port} did not open ({e}); the Wayland \
                      rings are kept and polled every millisecond, which costs CPU while the session lives"
@@ -1310,7 +1335,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         _ => None,
     };
     let mut ivshmem_rings: Option<(ringlink::RingLink, Option<Box<dyn std::io::Read + Send>>)> = None;
-    if let Some((id, dev)) = args.ivshmem_arena {
+    if let Some((id, dev)) = provided_ivshmem {
         if args.guest_arenas.iter().any(|(gid, _)| *gid == id) {
             eprintln!("wc-compositor: arena {id} is named by both --arena-guest-ram and --arena-ivshmem");
             return std::process::ExitCode::from(2);
@@ -1327,11 +1352,28 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
         #[cfg(not(windows))]
         let lent: Option<()> = None;
-        let attached = match lent {
+        #[cfg(target_os = "linux")]
+        let host_provider = args.provide_qemu_bar.as_ref();
+        #[cfg(not(target_os = "linux"))]
+        let host_provider: Option<&(u32, u8, String, String)> = None;
+        let attached = if let Some((_, slot, device, qmp)) = host_provider {
+            #[cfg(target_os = "linux")]
+            {
+                sv_hostd::qemu_bar::QemuBar::open(std::path::Path::new(qmp), device, *slot, true)
+                    .and_then(|bar| {
+                        let region = wc_handle::arena::provide_host_ivshmem(id, &bar.file,
+                            format!("QEMU {} device {} backend {}", bar.pid, bar.device, bar.backend), rings_len)?;
+                        qemu_arena_guards.push(bar);
+                        Ok(region)
+                    })
+            }
+            #[cfg(not(target_os = "linux"))]
+            { let _ = (slot, device, qmp); unreachable!("parse rejects host provider on this platform") }
+        } else { match lent {
             #[cfg(windows)]
             Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
             _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
-        };
+        }};
         let rings_at = match attached {
             Ok(r) => {
                 println!(
@@ -1359,10 +1401,16 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
                 // The tail stays kept and is published as rings: the arena ends
                 // there either way. The proxy finds no control region in it and
                 // falls back, connection by connection, and says so.
-                Err(e) => println!(
-                    "wc-compositor: WAYLAND RINGS UNAVAILABLE: the ring region could not be made \
-                     ({e}); every connection uses the socket"
-                ),
+                Err(e) => {
+                    if args.provide_qemu_bar.is_some() {
+                        eprintln!("wc-compositor: host BAR rings failed: {e}");
+                        return std::process::ExitCode::from(2);
+                    }
+                    println!(
+                        "wc-compositor: WAYLAND RINGS UNAVAILABLE: the ring region could not be made \
+                         ({e}); every connection uses the socket"
+                    );
+                }
             }
         }
     }
@@ -1503,7 +1551,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     // exists, and before the socket: a client cannot connect before the proxy
     // has read it, and the proxy cannot read it before this line. Every field,
     // a release fence, then the magic (`wc_handle::ivshmem::write_into`).
-    if let Some((id, _)) = args.ivshmem_arena {
+    if let Some((id, _)) = provided_ivshmem {
         match wc_handle::arena::publish_ivshmem(id) {
             Ok(h) => {
                 println!(
