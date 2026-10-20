@@ -358,14 +358,23 @@ impl Plan {
 /// first half, and what the Wayland rings are found by (§89): they are in the
 /// same file, so the same run-id check is what keeps a proxy off a previous
 /// compositor's rings.
+/// §111.10: the file behind a BAR, by path, or as region `broker:ID` from the
+/// broker (whose fd is read-write). A session that runs as a mapped user
+/// cannot open the BAR file itself: the daemon published it for that user.
+pub fn open_backing(path: &Path, write: bool) -> io::Result<std::fs::File> {
+    if wc_broker::client::region_spec(path).is_some() {
+        return wc_broker::client::open_path(path);
+    }
+    std::fs::OpenOptions::new().read(true).write(write).open(path)
+}
+
 pub fn ivshmem_header(path: &Path, expected_run: u64) -> io::Result<wc_handle::ivshmem::Header> {
     read_ivshmem_header(path, expected_run).map(|(h, _)| h)
 }
 
 fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle::ivshmem::Header, u64)> {
-    use std::io::Read;
     use wc_handle::ivshmem::{ENCODED_LEN, Header};
-    let mut f = std::fs::File::open(path).map_err(|e| {
+    let f = open_backing(path, false).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -377,7 +386,8 @@ fn read_ivshmem_header(path: &Path, expected_run: u64) -> io::Result<(wc_handle:
     })?;
     let file_len = f.metadata()?.len();
     let mut b = [0u8; ENCODED_LEN];
-    f.read_exact(&mut b)?;
+    // Positional: a broker region's fds share one file offset (§111.10).
+    std::os::unix::fs::FileExt::read_exact_at(&f, &mut b, 0)?;
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {m}", path.display()));
     let h = Header::decode(&b).map_err(|e| bad(e.to_string()))?;
     if h.run_id != expected_run {
@@ -415,11 +425,20 @@ impl StitchedRegion {
     /// compositor that sees nothing, which is the most expensive possible bug
     /// in this file and is one flag away.
     pub fn attach(plan: &Plan) -> io::Result<StitchedRegion> {
+        use std::os::fd::AsFd;
+        let file = open_backing(&plan.object, true)?;
+        let parts: Vec<_> = plan.runs.iter().map(|r| (file.as_fd(), r)).collect();
+        Self::attach_parts(plan.len, &parts, plan.object.display().to_string())
+    }
+
+    /// The same, with each run from its own descriptor: §108's guest-RAM
+    /// regions, whose udmabufs the broker gives (`file_offset` is the offset
+    /// in that run's descriptor).
+    pub fn attach_parts(len: u64, parts: &[(std::os::fd::BorrowedFd<'_>, &Run)], origin: String) -> io::Result<StitchedRegion> {
         use std::os::fd::AsRawFd;
 
-        let len = usize::try_from(plan.len)
+        let len = usize::try_from(len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "arena too large"))?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(&plan.object)?;
 
         // One reservation first, so the runs land next to each other and the
         // arena's offsets mean something. `PROT_NONE` so that a hole — a run
@@ -444,11 +463,11 @@ impl StitchedRegion {
         let region = StitchedRegion {
             base: base.cast::<u8>(),
             len,
-            runs: plan.runs.len(),
-            origin: plan.object.display().to_string(),
+            runs: parts.len(),
+            origin,
         };
         // Owns the reservation from here, so every early return unmaps it.
-        for (i, r) in plan.runs.iter().enumerate() {
+        for (i, (fd, r)) in parts.iter().enumerate() {
             let (off, rlen) = (
                 usize::try_from(r.arena_offset).unwrap_or(usize::MAX),
                 usize::try_from(r.len).unwrap_or(usize::MAX),
@@ -468,7 +487,7 @@ impl StitchedRegion {
                     rlen,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_SHARED | libc::MAP_FIXED,
-                    file.as_raw_fd(),
+                    fd.as_raw_fd(),
                     r.file_offset as libc::off_t,
                 )
             };

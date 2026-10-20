@@ -261,13 +261,21 @@ impl<T: BellTarget + ?Sized> BellTarget for WithCold<T> {
         if token == COLD_TOKEN {
             return self.cold.ring_token(token, woken);
         }
+        // §108: the host answered in the region table.
+        if token == crate::regiontab::REGION_TOKEN {
+            woken.fetch_add(1, Ordering::Relaxed);
+            crate::regiontab::wake::notify();
+            return true;
+        }
         self.lanes.ring_token(token, woken)
     }
 
     /// The port was (re)opened, or the hub said so (`RESCAN_TOKEN`, §105):
-    /// the mailbox waiter and every session's lanes look again.
+    /// the mailbox waiter, the region table's waiters and every session's
+    /// lanes look again.
     fn rescan(&self, woken: &AtomicU64) {
         ColdEvent::reopened(&self.cold);
+        crate::regiontab::wake::notify();
         self.lanes.rescan(woken);
     }
 }
@@ -312,6 +320,18 @@ pub fn attach_guest_bell_for<T: BellTarget + ?Sized + 'static>(
 pub fn poke_cross_at(base: usize) {
     if let Some(w) = crate::park::cross_wake_at(base) {
         w.poke(COLD_TOKEN);
+    }
+}
+
+/// §108: ring [`crate::regiontab::REGION_TOKEN`] on the wake of the pool
+/// mapped at `base` (or the process's). False: no doorbell, the caller polls.
+pub fn poke_region_at(base: usize) -> bool {
+    match crate::park::cross_wake_at(base).or_else(crate::park::cross_wake) {
+        Some(w) => {
+            w.poke(crate::regiontab::REGION_TOKEN);
+            true
+        }
+        None => false,
     }
 }
 
@@ -836,7 +856,7 @@ pub struct HubBell {
 impl HubBell {
     pub fn connect(path: &str, event: Arc<ColdEvent>) -> std::io::Result<HubBell> {
         use std::io::Read;
-        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        let stream = crate::brokered::connect(path)?;
         let mut reader = stream.try_clone()?;
         let writer = Mutex::new(crate::vdoorbell::DontWaitWriter(stream.try_clone()?));
         event.reopened();

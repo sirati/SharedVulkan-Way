@@ -53,6 +53,7 @@ pub mod grow;
 /// docs/waycompose-design.md §96: pointer locks, confinement and relative motion,
 /// the part of them that is arithmetic.
 mod hold;
+mod gpu_fence;
 /// §106: the host-integration channel, served by the process that owns the rings.
 pub mod hostint;
 mod icon;
@@ -101,9 +102,9 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
-pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
+pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, set_boot_signer, shared_control, BootSigner};
 /// §110: the one pool's other regions (the GPU device's, from `sv-guest`).
-pub use session_svc::{add_pool_region, PoolRegion};
+pub use session_svc::{add_pool_region, replace_pool_region, PoolRegion};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -690,6 +691,23 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
                 };
                 taskbar::set_relaunch_dir(std::path::PathBuf::from(dir));
             }
+            // §92.12. The one-session compositor's installation, so its
+            // windows carry that installation's taskbar identity: `INSTALL`
+            // or `INSTALL:APP,…` (the apps that keep the application-wide
+            // one). A shared compositor learns it per session from `boot`.
+            "--taskbar-scope" => {
+                match it.next().map(|s| taskbar::Scope::parse(&s)) {
+                    Some(Ok(s)) => taskbar::set_default_scope(s),
+                    Some(Err(e)) => {
+                        eprintln!("wc-compositor: --taskbar-scope: {e}");
+                        return Err(2);
+                    }
+                    None => {
+                        eprintln!("wc-compositor: --taskbar-scope wants INSTALL[:APP,…]");
+                        return Err(2);
+                    }
+                }
+            }
             // §102. See `Args::nested_globals`.
             "--nested-compositor-globals" => args.nested_globals = true,
             // §85. 0 means "as soon as the last window is gone".
@@ -1248,7 +1266,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         } else {
             0
         };
-        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+        // §111.8: the broker opens the arena device (device 0, PCI slot
+        // 0x1c) and moves it here; this process maps it as it maps one it
+        // opened. Without a broker, the device is opened here as before.
+        #[cfg(windows)]
+        let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
+        #[cfg(not(windows))]
+        let lent: Option<()> = None;
+        let attached = match lent {
+            #[cfg(windows)]
+            Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
+            _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
+        };
+        let rings_at = match attached {
             Ok(r) => {
                 println!(
                     "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \
@@ -1911,11 +1941,10 @@ fn wayland_thread(
                 println!("wc-compositor: session {s} ended: {n} connection(s) closed");
                 session_svc::dropped(s);
             }
-            for (slot, stream, session) in rl.accept() {
+            for (slot, stream, session, feed) in rl.accept() {
                 let index = (state.clients_seen + 1) as u32;
-                match display
-                    .handle()
-                    .insert_client(stream, Arc::new(ClientState::in_session(index, session)))
+                let data = if feed { ClientState::feed_in_session(index, session) } else { ClientState::in_session(index, session) };
+                match display.handle().insert_client(stream, Arc::new(data))
                 {
                     Ok(client) => {
                         // §79. **A ring slot is the proxy by construction**, so this
@@ -1933,9 +1962,10 @@ fn wayland_thread(
                         }
                         state.clients_seen += 1;
                         println!(
-                            "wc-compositor: client {index} accepted on ring slot {slot}{} \
+                            "wc-compositor: client {index} accepted on ring slot {slot}{}{} \
                              (no socket crossed the VM boundary, h in band)",
-                            if session == 0 { String::new() } else { format!(" of session {session}") }
+                            if session == 0 { String::new() } else { format!(" of session {session}") },
+                            if feed { ", a feed" } else { "" }
                         );
                         let _ = std::io::stdout().flush();
                         // §72. **The same two calls as the socket accept, and
@@ -2099,16 +2129,29 @@ fn wayland_thread(
             state.trace_commits = 0;
         }
 
-        let mut live = 0;
-        display
-            .handle()
-            .backend_handle()
-            .with_all_clients(|_| live += 1);
+        let mut ids = Vec::new();
+        display.handle().backend_handle().with_all_clients(|id| ids.push(id));
+        let live = ids.len() as u32;
+        // §107.10: the clients that keep a session up are the applications.
+        // A proxy's icon and clipboard feeds are clients to smithay and no
+        // reason to stay: one its proxy failed to close kept the wcns session
+        // of 2026-10-19 up for eight minutes past its linger, until `--stop`.
+        let apps = ids
+            .into_iter()
+            .filter(|id| {
+                display
+                    .handle()
+                    .backend_handle()
+                    .get_client_data(id.clone())
+                    .ok()
+                    .is_none_or(|d| d.downcast_ref::<ClientState>().is_none_or(|c| !c.feed))
+            })
+            .count();
         // STAGE 54. Carried out of the loop so the exit report can say whether
         // the windows still standing have clients behind them.
         live_at_exit = live;
 
-        if once && state.clients_seen > 0 && live == 0 {
+        if once && state.clients_seen > 0 && apps == 0 {
             println!(
                 "wc-compositor: --once and the last client has gone; {} toplevel(s), {} frame(s) presented",
                 state.toplevels, state.presents
@@ -2130,14 +2173,14 @@ fn wayland_thread(
 
         // §107: a shared compositor ends once its last session has, not when
         // one installation's last window closes.
-        if session_svc::multi() && live == 0 && session_svc::shared_compositor_idle() {
+        if session_svc::multi() && apps == 0 && session_svc::shared_compositor_idle() {
             println!("wc-compositor: no session has been up for the linger and no client is connected; ending");
             code = 0;
             break;
         }
         if let Some(w) = empty_watch.as_mut().filter(|_| !session_svc::multi())
             && w.tick(Instant::now(), state.live_toplevels(), state.toplevels > 0, state.clients_seen)
-            && live == 0
+            && apps == 0
         {
             println!(
                 "wc-compositor: the session's last window closed {} s ago, no client has \
@@ -2156,10 +2199,10 @@ fn wayland_thread(
         // live browser was a crash report with our name on it. Under
         // `--exit-when-empty` (the launcher's sessions) the deadline waits for
         // the clients to go; everything else keeps the hard deadline it had.
-        if Instant::now() > deadline && empty_watch.is_some() && live > 0 {
+        if Instant::now() > deadline && empty_watch.is_some() && apps > 0 {
             if !deadline_deferred {
                 println!(
-                    "wc-compositor: the session deadline has passed with {live} client(s) \
+                    "wc-compositor: the session deadline has passed with {apps} client(s) \
                      connected; it ends when they have gone"
                 );
                 deadline_deferred = true;

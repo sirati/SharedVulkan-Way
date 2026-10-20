@@ -12,8 +12,9 @@
 #
 #   scripts/wc-no-ssh.sh     legs: boot and requests; the sequence number and
 #                            replay; a wrong key; the hub restarted under a
-#                            session (the rescan); the lease when the
-#                            compositor dies; and no ring port at all (polled)
+#                            session (the rescan); the guest stalled for 8 s
+#                            (SIGSTOP) and ridden out (§113); the lease when
+#                            the compositor dies; and no ring port at all (polled)
 #
 # Run from inside `nix develop` after
 # `cargo build -p wc-compositor -p wc-proxy -p wc-arena-host -p sv-hostd -p wc-launch`.
@@ -48,6 +49,12 @@ trap cleanup EXIT
 
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
 [ -n "$CLIENT" ] || { echo "no wayland-info"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $([ "${WC_NO_SSH_PROFILE:-debug}" = release ] && echo --release) $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -72,6 +79,9 @@ ln -s "$INST" "$D/installs/wcns"
 
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
 export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=120
+# §113: the "VM" whose process tells a stalled guest from a dead one is the
+# compositor itself here; start_compositor writes its pid.
+export WC_LAUNCH_VM_PIDFILE="$D/vm.pid"
 PACAT=$(ls /nix/store/*-pulseaudio-1*/bin/pacat 2>/dev/null | head -1)
 [ -n "$PACAT" ] || export WC_LAUNCH_AUDIO=off
 
@@ -93,7 +103,7 @@ start_hub() {
   for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
 }
 start_service() {
-  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+  "$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
     ${1:+--bell "$1"} --poll-ms "${2:-1000}" >>"$D/sessiond.log" 2>&1 &
   SVC=$!; PIDS+=("$SVC")
 }
@@ -108,6 +118,7 @@ start_compositor() {
     --boot-session "wcns-$$-$tag" --boot-install wcns --boot-key "$key" \
     --control-socket "$D/ctl-$tag.sock" --session-audio 0 >"$D/comp-$tag.log" 2>&1 &
   COMP=$!; PIDS+=("$COMP")
+  echo "$COMP" >"$D/vm.pid"
 }
 wait_line() { # FILE REGEX SECS
   local i; for i in $(seq 1 $(($3 * 10))); do grep -qE "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1
@@ -171,10 +182,21 @@ T0=$(date +%s%N); R=$(request a "raw status"); T1=$(date +%s%N)
 case "$R" in ok-raw*) ok "after a hub restart: answered in $(( (T1 - T0) / 1000000 )) ms" ;; *) bad "after the hub restart: $R" ;; esac
 grep -c 'reconnected' "$PLOG" >/dev/null && ok "proxy: $(grep -m1 -o '\[doorbell\] reconnected.*' "$PLOG")"
 
+say "leg 3a (§113): the whole guest stalls for 8 s (SIGSTOP), and the session rides it out"
+grep -q 'lease: a stalled guest is held' "$PLOG" && ok "proxy: $(grep -m1 -o 'lease: a stalled.*' "$PLOG" | cut -c1-110)" || bad "the proxy has no VM witness: $(grep -m1 'lease:' "$PLOG")"
+kill -STOP "$COMP"; sleep 8; kill -CONT "$COMP"
+wait_line "$D/proxy-a.log" 'the guest is back' 5 && ok "proxy: $(grep -m1 -o 'taken for a stalled guest' "$D/proxy-a.log"), then $(grep -m1 -o 'the guest is back after [0-9]* ms' "$D/proxy-a.log")" || bad "the proxy never said it held a stalled guest"
+grep -q 'LEASE LOST' "$D/proxy-a.log" && bad "the proxy ended over a stall: $(grep -o 'LEASE LOST.*' "$D/proxy-a.log" | cut -c1-120)"
+R=$(request a "raw status")
+case "$R" in ok-raw*) ok "after an 8 s stall the session answers" ;; *) bad "after the stall: $R" ;; esac
+grep -q "session wcns-$$-a ended" "$D/sessiond.log" && bad "the service took the session down over a stall"
+
 say "leg 3: the lease: the compositor dies, the proxy ends within seconds, the service takes the session down"
 kill -9 "$COMP"; wait "$COMP" 2>/dev/null
 T0=$(date +%s)
-wait_line "$D/proxy-a.log" 'LEASE LOST' 15 && ok "proxy: LEASE LOST after $(( $(date +%s) - T0 )) s" || bad "the proxy outlived its lease"
+# §113: the guest's heartbeat stops with its pings, and the VM witness (its
+# process gone) says dead rather than stalled: the old five seconds.
+wait_line "$D/proxy-a.log" 'LEASE LOST' 8 && ok "proxy: LEASE LOST after $(( $(date +%s) - T0 )) s: $(grep -o 'LEASE LOST: [^;]*' "$D/proxy-a.log" | cut -c1-110)" || bad "the proxy outlived its lease"
 wait_line "$D/sessiond.log" "session wcns-$$-a ended" 15 && ok "service: $(grep -o "session wcns-$$-a ended.*" "$D/sessiond.log" | cut -c1-90)" || bad "the service never took the session down"
 
 say "leg 4: a record replayed, and one signed with the wrong key"
@@ -196,6 +218,12 @@ echo "$SEQ" >"$D/state/wcns.seq"
 
 say "leg 5: no ring port at all: polled, said loudly, still no ssh"
 kill "$PORT" 2>/dev/null
+# The host end's loop outlives its socat for a moment and, with
+# `unlink-early`, made host.sock again after the rm below: the session then
+# found a doorbell socket, and the proxy never said it polls. Its loop and
+# listener go first.
+pkill -f "$D/qemu-host-end.sh" 2>/dev/null; pkill -f "UNIX-LISTEN:$D/host.sock" 2>/dev/null
+for _ in $(seq 1 40); do pgrep -f "UNIX-LISTEN:$D/host.sock" >/dev/null || break; sleep 0.05; done
 # A VM without the port has no chardev for a hub to hold either.
 kill "$HUB" 2>/dev/null; wait "$HUB" 2>/dev/null; rm -f "$D/hub/"*.sock "$D/host.sock"
 kill "$SVC" 2>/dev/null; wait "$SVC" 2>/dev/null

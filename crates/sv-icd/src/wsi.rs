@@ -213,14 +213,15 @@ pub fn surface_present_modes(_target: PresentTarget) -> Vec<i32> {
 /// `vkCreateSwapchainKHR`.
 pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -> IcdResult<u64> {
     trace!(
-        "vkCreateSwapchainKHR: {:?} {}x{} format {} usage {:#x} images {} mode {}",
+        "vkCreateSwapchainKHR: {:?} {}x{} format {} usage {:#x} images {} mode {} alpha {}",
         desc.target,
         desc.width,
         desc.height,
         desc.format,
         desc.image_usage,
         desc.min_image_count,
-        desc.present_mode
+        desc.present_mode,
+        if desc.premultiplied_alpha { "premultiplied" } else { "opaque" }
     );
     if icd.wire().is_none() {
         // A swapchain image is a real `VkImage` on a real device. With no GPU
@@ -303,7 +304,7 @@ pub fn create_swapchain(icd: &SharedVulkan, device: u64, desc: &SwapchainDesc) -
     }
 
     let id = IcdLocal::mint_id(icd);
-    let target = crate::present::Target::open(desc.target, desc.width, desc.height);
+    let target = crate::present::Target::open(desc.target, desc.width, desc.height, desc.premultiplied_alpha);
     let wl_slot = target.wl_slot();
     icd.swapchains().insert(
         id,

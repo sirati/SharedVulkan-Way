@@ -522,6 +522,10 @@ impl RingTransport {
         use std::os::unix::net::UnixStream;
         use sv_transport::cold::{ColdMessage, send};
 
+        // waycompose-design.md §111.10: the GPU BAR's name may be `broker:ID`
+        // and the bell `broker:sv-hub`, both reached through the broker.
+        #[cfg(target_os = "linux")]
+        wc_broker::client::install_hooks();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let sock = loop {
             match UnixStream::connect(socket) {
@@ -858,8 +862,13 @@ impl RingTransport {
         let doorman = match std::env::var(crate::BELL_ENV) {
             Err(_) => None,
             // §99: reconnecting, so a restarted hub costs this session only
-            // the bells in the gap.
-            Ok(path) => match sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
+            // the bells in the gap. waycompose-design.md §111.10: a
+            // `broker:NAME` spec is a connection the broker makes for us.
+            Ok(path) => match {
+                #[cfg(target_os = "linux")]
+                wc_broker::client::install_hooks();
+                sv_transport::vdoorbell::attach_host_reconnecting(&path, Arc::clone(&control))
+            }
                 .map_err(|e| e.to_string())
             {
                 Ok((d, true)) => {
@@ -2076,6 +2085,11 @@ pub struct PoolView {
     source: PoolSource,
     /// `(region, bytes mapped)`.
     mapped: Mutex<Vec<(u32, u64)>>,
+    /// §108: regions in the guest's RAM this process maps: how many of its
+    /// leases are in each, the bytes mapped, and the broker lease it holds
+    /// while it maps the region (the host answers `UNMAPPED` only once every
+    /// such lease has ended).
+    ram: Mutex<std::collections::BTreeMap<u32, RamHold>>,
     pub granule: u64,
     pub session_cap: u64,
     pub capacity: u64,
@@ -2119,6 +2133,7 @@ impl Attached {
         t.pool = Some(PoolView {
             source,
             mapped: Mutex::new(vec![(0, arena_len)]),
+            ram: Mutex::new(std::collections::BTreeMap::new()),
             granule: info.lease_granule,
             session_cap: info.session_cap,
             capacity: info.capacity,
@@ -2172,6 +2187,21 @@ impl RingTransport {
             return Err(LowerError::Result(r.result));
         }
         let (region, local) = sv_arena::pool::split(r.offset);
+        // §108: a region in the guest's RAM, from the broker (any region
+        // with no file of its own beside the pool's, §110).
+        if region > 0 && self.ram_region(pool, region) {
+            let mut ram = pool.ram.lock().unwrap_or_else(|e| e.into_inner());
+            if let std::collections::btree_map::Entry::Vacant(e) = ram.entry(region) {
+                let hold = self.map_ram_region(pool, region)?;
+                e.insert(hold);
+            }
+            let h = ram.get_mut(&region).expect("inserted above");
+            if local + r.len > h.len {
+                return Err(LowerError::Shape("a lease past the end of its guest-RAM region"));
+            }
+            h.leases += 1;
+            return Ok((r.offset, r.len, r.memory_type));
+        }
         let covered = pool
             .mapped
             .lock()
@@ -2218,7 +2248,18 @@ impl RingTransport {
         if r.result != 0 {
             return Ok(Err(r.result));
         }
-        Ok(Ok(crate::dmabuf::SharedToken { size: r.size, nonce: r.nonce, name: r.name }))
+        Ok(Ok(crate::dmabuf::SharedToken { size: r.size, nonce: r.nonce, name: r.name, record: String::new() }))
+    }
+
+    /// `svFenceRecord` (§104.11): the session's fence record, or the GPU
+    /// side's refusal.
+    pub fn fence_record(&self) -> IcdResult<Result<String, i32>> {
+        let mut cmd = Vec::new();
+        sv_proto::sv::FenceRecord.encode(&mut cmd).map_err(LowerError::Wire)?;
+        let mut reply = Vec::new();
+        self.call(RingClass::Device, sv_proto::sv::SV_FENCE_RECORD, &cmd, &mut reply)?;
+        let r = sv_proto::sv::FenceRecordReply::decode(&reply).map_err(LowerError::Wire)?;
+        Ok(if r.result == 0 { Ok(r.name) } else { Err(r.result) })
     }
 
     /// `svImportShared` (§104): the section a token names, imported under
@@ -2240,9 +2281,102 @@ impl RingTransport {
         let mut reply = Vec::new();
         self.call(RingClass::Device, sv_proto::sv::SV_RELEASE_ARENA, &cmd, &mut reply)?;
         let r = sv_proto::sv::ReleaseArenaReply::decode(&reply).map_err(LowerError::Wire)?;
+        // §108 rule 4: the last lease of a guest-RAM region gone, this
+        // process stops mapping it (the range becomes PROT_NONE, so a stale
+        // pointer faults here instead of reaching the guest), then closes
+        // its broker lease (`RamHold`'s drop).
+        if let Some(pool) = self.pool.as_ref() {
+            let (region, _) = sv_arena::pool::split(offset);
+            let mut ram = pool.ram.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = ram.get_mut(&region) {
+                h.leases = h.leases.saturating_sub(1);
+                if h.leases == 0 {
+                    let h = ram.remove(&region).expect("present");
+                    #[cfg(target_os = "linux")]
+                    let _ = self.arena.unmap_fixed(u64::from(region) * sv_arena::pool::REGION_STRIDE, h.len);
+                    drop(h);
+                }
+            }
+        }
         if r.result != 0 {
             return Err(LowerError::Result(r.result));
         }
         Ok(())
+    }
+
+    /// Whether region `k` is guest RAM: one this process maps already, or
+    /// one with no file beside the pool's (§110's regions are files).
+    #[cfg(target_os = "linux")]
+    fn ram_region(&self, pool: &PoolView, k: u32) -> bool {
+        if pool.ram.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&k) {
+            return true;
+        }
+        match &pool.source {
+            PoolSource::Path(boot) => !std::path::Path::new(&sv_transport::poolhdr::region_path(boot, k)).exists(),
+            _ => true,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ram_region(&self, _pool: &PoolView, _k: u32) -> bool {
+        false
+    }
+
+    /// Map guest-RAM region `k` from the broker (§108.15, §111): `find
+    /// gpu.<k>` gives this process's user the region's udmabufs and a lease
+    /// on it, held until the region is unmapped again. Each part is mapped at
+    /// its fixed place in the region's stride, and its fd closed (the mapping
+    /// keeps the pages).
+    #[cfg(target_os = "linux")]
+    fn map_ram_region(&self, _pool: &PoolView, k: u32) -> IcdResult<RamHold> {
+        use std::os::fd::AsFd;
+        let pool = format!("gpu.{k}");
+        let (r, fds) = wc_broker::client::find_region(&pool).map_err(|e| {
+            eprintln!("sv-icd: guest-RAM region {k}: the broker: {e}");
+            LowerError::Shape("a guest-RAM region the broker does not give this user")
+        })?;
+        let base = u64::from(k) * sv_arena::pool::REGION_STRIDE;
+        let bad = r.len == 0
+            || r.len > sv_arena::pool::REGION_STRIDE
+            || r.pieces.iter().map(|p| p.len).sum::<u64>() != r.len
+            || r.pieces.iter().any(|p| p.offset.checked_add(p.len).is_none_or(|e| e > r.len));
+        if bad {
+            let _ = wc_broker::client::close_region(r.id);
+            return Err(LowerError::Shape("a malformed guest-RAM region from the broker"));
+        }
+        for (p, fd) in r.pieces.iter().zip(&fds) {
+            if let Err(e) = self.arena.map_fixed(base + p.offset, fd.as_fd(), 0, p.len) {
+                let _ = self.arena.unmap_fixed(base, r.len);
+                let _ = wc_broker::client::close_region(r.id);
+                return Err(lower(e));
+            }
+        }
+        Ok(RamHold { leases: 0, len: r.len, id: r.id })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn map_ram_region(&self, _pool: &PoolView, _k: u32) -> IcdResult<RamHold> {
+        Err(LowerError::Shape("a guest-RAM region on this system"))
+    }
+}
+
+/// One guest-RAM region this process maps (§108).
+pub struct RamHold {
+    leases: u64,
+    len: u64,
+    /// The broker's region, whose lease this process holds while it maps it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    id: u64,
+}
+
+/// Unmapped first (the caller), then the lease ends: the host answers
+/// `UNMAPPED` only after this.
+impl Drop for RamHold {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = wc_broker::client::close_region(self.id) {
+            // The connection is gone: the lease ended with it.
+            eprintln!("sv-icd: closing broker region {}: {e}", self.id);
+        }
     }
 }

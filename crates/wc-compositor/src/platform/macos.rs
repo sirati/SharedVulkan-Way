@@ -1709,6 +1709,8 @@ fn handle(mtm: MainThreadMarker, cmd: ToUi) {
             }
         }
         ToUi::Present { id, damage } => present(id, &damage),
+        // Never sent off Windows; see its definition.
+        ToUi::Direct { .. } => {}
         ToUi::ShiftOrigin { id, dx, dy } => {
             if let Some((window, _, _)) = handles(id) {
                 let mut f = window.frame();

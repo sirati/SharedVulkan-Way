@@ -819,6 +819,20 @@ impl Control {
         })
     }
 
+    /// Attach only to ring this region's lanes (waycompose-design.md §105.14):
+    /// the doorbell hub wakes a lane's waiters itself and never reads or
+    /// writes a ring, so it needs the layout (which is checked as in
+    /// [`Control::attach`]) but not the protocol the rings carry, whose ids
+    /// it takes from the region.
+    pub fn attach_for_bells(region: Arc<SharedRegion>) -> Result<Control> {
+        let ids = ProtocolIds {
+            layout_version: LAYOUT_VERSION,
+            wire_version: region.atomic_u32(OFF_WIRE_VERSION)?.load(Ordering::Relaxed),
+            protocol_hash: region.atomic_u64(OFF_PROTOCOL_HASH)?.load(Ordering::Relaxed),
+        };
+        Control::attach(region, ids)
+    }
+
     fn protocol_ids(&self) -> Result<ProtocolIds> {
         Ok(ProtocolIds {
             layout_version: self.region.atomic_u32(OFF_LAYOUT_VERSION)?.load(Ordering::Relaxed),

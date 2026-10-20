@@ -589,6 +589,19 @@ pub fn attach_ivshmem_with_rings(id: u32, device: u32, rings_len: u64) -> io::Re
     attach_ivshmem_view(id, view, size, format!("ivshmem device {device} ({path})"), rings_len)
 }
 
+/// [`attach_ivshmem_with_rings`] for a device this process has already
+/// mapped (§111.8: one the broker opened and moved here, mapped by
+/// `map_ivshmem_device`). `mapped` is what the map returned.
+pub fn attach_ivshmem_mapped(
+    id: u32,
+    mapped: (platform::MappedView, u64, String),
+    rings_len: u64,
+) -> io::Result<IvshmemRegion> {
+    refuse_if_outbound(id)?;
+    let (view, size, path) = mapped;
+    attach_ivshmem_view(id, view, size, format!("ivshmem device {path}, from the broker"), rings_len)
+}
+
 /// The Wayland rings' region of arena `id`, as `(base, len)`: the tail
 /// [`attach_ivshmem_with_rings`] kept out of the arena, or an error when none
 /// was kept.
@@ -785,6 +798,21 @@ pub unsafe fn register_borrowed_base(id: u32, ptr: *const u8, len: usize, origin
         Attached { view: Arc::new(platform::MappedView::borrowed(ptr)), len, origin, provided: false, base: 0, fixed: true },
     );
     Ok(())
+}
+
+/// §108: forget a base [`register_borrowed_base`] registered, because the
+/// region it named went away (a GPU pool region retired and its slot reused).
+/// The caller makes sure no window of it is still attached.
+pub fn unregister_borrowed_base(id: u32) -> io::Result<()> {
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    match guard.get(&id) {
+        Some(a) if a.fixed && !a.provided => {
+            guard.remove(&id);
+            Ok(())
+        }
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("arena {id} is not a borrowed base"))),
+        None => Ok(()),
+    }
 }
 
 /// §110: map the file at `path` read-write for the rest of the process and

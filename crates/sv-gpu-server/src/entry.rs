@@ -446,7 +446,7 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let control = Arc::new(control);
     let _doorman = match arg("--bell") {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+        Some(name) => match sv_gpu_server::pool_guest::open_bell(&name)
             .and_then(|p| sv_transport::vdoorbell::attach(p, Arc::clone(&control)))
         {
             Ok(d) => {
@@ -540,7 +540,7 @@ fn win_guest_ivshmem(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
     let geometry = geometry_for(arena_size);
     let started = std::time::Instant::now();
-    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    let (view, size, path) = sv_gpu_server::pool_guest::map_ivshmem_slot(pci)?;
     let plan = SlotPlan::new(size, geometry, max)?;
     eprintln!(
         "[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, {} session slot(s) of \
@@ -563,7 +563,7 @@ fn win_guest_ivshmem(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let set = sv_transport::vdoorbell::ControlSet::new();
     let _doorman = match arg("--bell") {
         None => None,
-        Some(name) => match sv_transport::vdoorbell::PortHandle::guest_port(&name)
+        Some(name) => match sv_gpu_server::pool_guest::open_bell(&name)
             .and_then(|p| sv_transport::vdoorbell::attach_set(p, Arc::clone(&set)))
         {
             Ok(d) => {
@@ -1940,13 +1940,28 @@ fn win_guest_pool(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         None => pci.parse()?,
     };
     let started = std::time::Instant::now();
-    let (view, size, path) = wc_handle::map_ivshmem_slot(pci)?;
+    let (view, size, path) = sv_gpu_server::pool_guest::map_ivshmem_slot(pci)?;
     eprintln!("[gpu] ivshmem slot {pci:#04x} ({path}) mapped in {:.2?}: {} MiB, the pool's region 0", started.elapsed(), size >> 20);
     // SAFETY: the view lives until this function returns, which is never
     // while a session runs: `serve_pool` does not return while it serves,
     // and the process ends with it.
     let boot = Arc::new(unsafe { sv_transport::region::SharedRegion::from_raw(view.ptr().cast_mut(), size as usize) });
-    let r = sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"));
+    // §108: `--grow-keeper` grows the pool from the guest's own RAM through
+    // the SYSTEM keeper (`sv-guest ram keeper`), up to `--grow-budget` MiB.
+    let grow = if args.iter().any(|a| a == "--grow-keeper") {
+        let budget = arg("--grow-budget").map_or(Ok(4096u64), |s| s.parse())? << 20;
+        let pool = format!("gpu:{}", std::env::var("USERNAME").unwrap_or_default());
+        Some(sv_gpu_server::pool_guest::Grow {
+            budget,
+            start: Box::new(move |boot, server| {
+                let sub = sv_ram::winsub::KeeperSubstrate::connect(&pool)?;
+                sv_gpu_server::regions::RegionManager::start(boot, server, sub, budget).map(|_| ())
+            }),
+        })
+    } else {
+        None
+    };
+    let r = sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"), grow);
     drop(view);
     Ok(r?)
 }
@@ -2005,5 +2020,21 @@ fn linux_pool_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let len = f.metadata()?.len();
     let boot = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, len as usize)?);
     eprintln!("[gpu] pool file {path}: {} MiB, the pool's region 0", len >> 20);
-    Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"))?)
+    // §108: `--grow-ram FILE` (or `memfd:MIB`, which the broker can make
+    // udmabufs of) stands in for the Windows guest's RAM;
+    // regions are scattered 2 MiB units of it, located by the host's probe.
+    let grow = match arg("--grow-ram") {
+        None => None,
+        Some(ram) => {
+            let budget = arg("--grow-budget").map_or(Ok(2048u64), |s| s.parse())? << 20;
+            Some(sv_gpu_server::pool_guest::Grow {
+                budget,
+                start: Box::new(move |boot, server| {
+                    let sub = sv_ram::simram::SimGuestRam::open(&ram)?;
+                    sv_gpu_server::regions::RegionManager::start(boot, server, sub, budget).map(|_| ())
+                }),
+            })
+        }
+    };
+    Ok(sv_gpu_server::pool_guest::serve_pool(boot, cfg, arg("--bell"), grow)?)
 }

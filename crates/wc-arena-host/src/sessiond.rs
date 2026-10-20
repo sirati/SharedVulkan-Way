@@ -39,10 +39,13 @@ struct Args {
     session: PathBuf,
     bell: Option<String>,
     sweep: Duration,
+    /// §111.9: the installations' keys; with them a record must carry a MAC
+    /// that verifies, over the identity the guest's broker read.
+    keys: Option<PathBuf>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
-    let mut a = Args { qmp: PathBuf::new(), vm: String::new(), session: PathBuf::new(), bell: None, sweep: Duration::from_secs(5) };
+    let mut a = Args { qmp: PathBuf::new(), vm: String::new(), session: PathBuf::new(), bell: None, sweep: Duration::from_secs(5), keys: None };
     let mut it = argv.iter();
     while let Some(k) = it.next() {
         let mut v = || it.next().cloned().ok_or(format!("{k} needs a value"));
@@ -51,13 +54,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--vm" => a.vm = v()?,
             "--session" => a.session = v()?.into(),
             "--bell" => a.bell = Some(v()?),
+            "--keys" => a.keys = Some(v()?.into()),
             "--sweep-secs" => a.sweep = Duration::from_secs(v()?.parse().map_err(|e| format!("--sweep-secs: {e}"))?),
             _ => return Err(format!("unknown argument {k}")),
         }
     }
     if a.qmp.as_os_str().is_empty() || a.vm.is_empty() || a.session.as_os_str().is_empty() {
         return Err("usage: wc-arena-host mac-sessiond --qmp SOCK --vm HINT --session WC-SESSION \
-                    [--bell HUB-SOCKET] [--sweep-secs N]"
+                    [--bell HUB-SOCKET] [--sweep-secs N] [--keys DIR]"
             .into());
     }
     Ok(a)
@@ -65,6 +69,32 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 
 fn say(msg: &str) {
     println!("wc-mac-sessiond: {msg}");
+}
+
+/// §111.6, §111.9: who asked for the session, as the guest's broker (the
+/// macOS LaunchDaemon) wrote it into the boot page. With `keys`, the record
+/// must carry an authenticator that verifies under its installation's key
+/// over that identity, or the session is refused; without, the identity is
+/// only reported, marked unverified, as before §111 nothing was checked here.
+fn who(page: &[u8], keys: Option<&std::path::Path>) -> Result<String, String> {
+    let id = macboot::Identity::read(page);
+    let text = id.as_ref().map_or_else(|| "no identity".to_string(), macboot::Identity::text);
+    let Some(dir) = keys else { return Ok(format!("{text} (unverified)")) };
+    let rec = macboot::Record::read(page).ok_or("no boot record")?;
+    let auth = macboot::Auth::read(page).ok_or("the boot record is not signed (no broker in the guest?)")?;
+    if !macboot::valid_installation(&auth.installation) {
+        return Err("the boot record names no valid installation".into());
+    }
+    let path = dir.join(format!("{}.key", auth.installation));
+    let key = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| macboot::parse_key(&t))
+        .ok_or_else(|| format!("no key for installation {} ({})", auth.installation, path.display()))?;
+    let index = macboot::session_index(page).unwrap_or(0);
+    if !auth.verifies_identity(&rec, index, id.as_ref(), &key) {
+        return Err(format!("the boot record does not verify under installation {}'s key for {text}", auth.installation));
+    }
+    Ok(format!("{text} (verified, installation {})", auth.installation))
 }
 
 /// A boot record found by a sweep: where page 0 is in the backing file.
@@ -211,11 +241,38 @@ fn forget(id: &str) {
     let _ = std::fs::remove_file(state_dir().join(id));
 }
 
+/// What the user's service manager says of a session's proxy unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnitState {
+    Running,
+    Gone,
+    /// The manager did not answer (§105.14): it re-executes during a NixOS
+    /// switch, and `systemctl` then fails. Not a reason to end anything.
+    Unknown,
+}
+
+/// `systemctl --user is-active`'s first line of output, classified. A unit
+/// the manager no longer knows is `inactive`; no line at all is a manager
+/// that did not answer.
+pub(crate) fn classify_is_active(stdout: &str) -> UnitState {
+    match stdout.lines().next().map(str::trim) {
+        Some("inactive" | "failed") => UnitState::Gone,
+        Some("active" | "activating" | "deactivating" | "reloading" | "refreshing") => UnitState::Running,
+        _ => UnitState::Unknown,
+    }
+}
+
+pub(crate) fn unit_state(id: &str) -> UnitState {
+    match Command::new("systemctl").args(["--user", "is-active", &format!("wc-launch-{id}")]).output() {
+        Ok(out) => classify_is_active(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => UnitState::Unknown,
+    }
+}
+
+/// Whether the session's proxy unit may still be running: only a manager
+/// that says it is gone makes this false.
 pub(crate) fn unit_active(id: &str) -> bool {
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", &format!("wc-launch-{id}")])
-        .status()
-        .is_ok_and(|s| s.success())
+    unit_state(id) != UnitState::Gone
 }
 
 /// Sessions whose proxy units are running now: a restarted service adopts
@@ -332,7 +389,12 @@ pub fn main(argv: &[String]) -> std::process::ExitCode {
             }
             match verb(&args.session, &["down", id]) {
                 Ok(r) => say(&format!("session {id} ended: {r}")),
-                Err(e) => say(&format!("session {id} ended; {e}")),
+                // §105.14: a `down` that could not stop the units keeps the
+                // session, and nothing is released while they may still write.
+                Err(e) => {
+                    say(&format!("session {id} ended, but {e}; trying again"));
+                    return true;
+                }
             }
             // Only now, with its proxy and GPU units gone, may the guest
             // free the session's windows.
@@ -380,6 +442,19 @@ fn serve(args: &Args, live: &mut HashMap<String, Option<Found>>, served: &mut Ha
             "boot record for session {} after {swept:?} ({why}): arena run 0x{:016x} ({} pages), rings run 0x{:016x} ({} pages)",
             r.session, r.arena_run, r.arena_pages, r.rings_run, r.rings_pages
         ));
+        let mut pg = vec![0u8; wc_handle::arena::REGION_PAGE];
+        let asked = sv_hostd::qemu::read_at(&target.file, f.offset, &mut pg)
+            .map_err(|e| e.to_string())
+            .and_then(|_| who(&pg, args.keys.as_deref()));
+        match asked {
+            Ok(w) => say(&format!("session {}: asked by {w}", r.session)),
+            Err(e) => {
+                let _ = answer(&target.file, &f, macboot::State::Failed, &e);
+                say(&format!("session {}: refused: {e}", r.session));
+                let _ = release(&args.qmp, &args.vm, &f);
+                continue;
+            }
+        }
         let t1 = Instant::now();
         let (ar, ap, out, rr, rp) = (
             format!("0x{:016x}", r.arena_run),
@@ -512,5 +587,41 @@ mod tests {
         sv_hostd::qemu::read_at(&f, found.offset, &mut pg).unwrap();
         assert!(pg.iter().all(|b| *b == 0), "the reused page was written");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// §111.9: the identity the guest's broker signed is reported, and with
+    /// `--keys` a record that does not verify for it is refused.
+    #[test]
+    fn who_asked_is_read_and_with_keys_verified() {
+        let rec = macboot::Record {
+            session: "wcm-77".into(),
+            arena_run: 5,
+            arena_pages: 16,
+            outbound: 0,
+            rings_run: 6,
+            rings_pages: 4,
+            gpu: false,
+        };
+        let key = [7u8; macboot::KEY_LEN];
+        let alice = macboot::Identity { os: "macos".into(), user: "alice".into(), id: "501".into() };
+        let auth = macboot::Auth::sign_identity(&rec, 0, Some(&alice), "wcm", 9, &key);
+        let mut page = vec![0u8; wc_handle::arena::REGION_PAGE];
+        // SAFETY: a page-sized buffer of this test's own.
+        unsafe { macboot::publish_identity(page.as_mut_ptr(), &rec, 0, Some(&alice), Some(&auth)) };
+        assert_eq!(who(&page, None).unwrap(), "os=macos user=alice id=501 (unverified)");
+        let dir = std::env::temp_dir().join(format!("wc-sessiond-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(dir.join("wcm.key"), hex).unwrap();
+        assert_eq!(who(&page, Some(&dir)).unwrap(), "os=macos user=alice id=501 (verified, installation wcm)");
+        // Another user's identity written over it: the MAC no longer verifies.
+        macboot::Identity { user: "bob".into(), id: "502".into(), ..alice.clone() }.write(&mut page);
+        assert!(who(&page, Some(&dir)).unwrap_err().contains("does not verify"));
+        // A record without a broker's signature.
+        let mut bare = vec![0u8; wc_handle::arena::REGION_PAGE];
+        rec.write(&mut bare);
+        assert_eq!(who(&bare, None).unwrap(), "no identity (unverified)");
+        assert!(who(&bare, Some(&dir)).unwrap_err().contains("not signed"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

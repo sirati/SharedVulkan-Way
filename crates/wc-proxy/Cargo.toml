@@ -57,3 +57,5 @@ png = "0.18"
 sv-drm = { path = "../sv-drm" }
 # §106: host integration's pure core (wire format, audio plan, desktop entries).
 wc-hostint = { workspace = true }
+# §111.10: the BAR file and the doorbell hub through the broker (`broker:`).
+wc-broker = { workspace = true }

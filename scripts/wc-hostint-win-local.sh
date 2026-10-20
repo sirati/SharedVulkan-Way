@@ -56,6 +56,12 @@ trap cleanup EXIT
 
 echo "wc-hostint-win-local $STAMP, tree $(git -C "$ROOT" rev-parse --short HEAD)$(git -C "$ROOT" diff --quiet || echo '+dirty')"
 [ -x "$SOCAT" ] || { echo "no socat"; exit 2; }
+# Built here, a no-op when they are current: a binary older than the sources
+# runs yesterday's flags against today's harness and fails like the code's
+# fault (a compositor that refused an argument, then a leg with no pid).
+if command -v cargo >/dev/null; then
+  (cd "$ROOT" && cargo build -q $(for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch wc-host-open; do printf -- '--bin %s ' "$b"; done)) || { echo "cargo build failed"; exit 2; }
+fi
 for b in wc-compositor wc-proxy wc-arena-host sv-hostd wc-launch wc-host-open; do
   [ -x "$BIN/$b" ] || { echo "no $BIN/$b: build it first"; exit 2; }
 done
@@ -114,7 +120,7 @@ for _ in $(seq 1 50); do [ -S "$D/guest.sock" ] && break; sleep 0.1; done
 "$BIN/sv-hostd" bell-hub --port "$D/host.sock=$D/hub/wl.sock" >>"$D/hub.log" 2>&1 &
 HUB=$!; PIDS+=("$HUB")
 for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
-"$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+"$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
   --bell "$D/hub/wl.sock" --poll-ms 60000 >>"$D/sessiond.log" 2>&1 &
 SVC=$!; PIDS+=("$SVC")
 

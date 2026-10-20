@@ -335,12 +335,13 @@ pub fn alloc_locked_region(
     Ok(LockedRegion { view, len, locked, pinning: if locked { "mlock" } else { "none" } })
 }
 
-/// §103.15: who else holds this process's guest-RAM windows. Called with a
-/// POSIX shared-memory name and a length once the window is wired and
-/// stamped; returns once that process has mapped and wired the same object
-/// too (an error refuses the window).
+/// §103.15, §111.9: who holds this process's guest-RAM windows besides it.
+/// Called with a window's length; returns a descriptor of a shared-memory
+/// object of at least that length which the holder (the broker) has already
+/// mapped and wired, and keeps until the host has let go of it. An error
+/// refuses the window.
 #[cfg(target_os = "macos")]
-pub type RegionKeeper = Box<dyn Fn(&str, usize) -> io::Result<()> + Send + Sync>;
+pub type RegionKeeper = Box<dyn Fn(usize) -> io::Result<std::os::fd::OwnedFd> + Send + Sync>;
 
 #[cfg(target_os = "macos")]
 static KEEPER: std::sync::OnceLock<RegionKeeper> = std::sync::OnceLock::new();
@@ -356,42 +357,33 @@ pub fn set_region_keeper(k: RegionKeeper) -> bool {
 /// frees its wired pages at once and reuses them, and a proxy that wrote
 /// pixels into them for the rest of its lease corrupted kernel memory (three
 /// panics, "element modified after free", the payload Console's background).
-/// So the window is a POSIX shared-memory object, wired here and by a keeper
-/// process, which lets go only once the host says it has stopped. The name
-/// is unlinked as soon as the keeper holds it, so nothing else can open it.
+/// So the window is a shared-memory object that the keeper (§111.9: the
+/// broker, a LaunchDaemon) made, mapped and wired *before* this process
+/// stamps it, so before the host can find it, and holds until the host says
+/// it has stopped. The object has no name: only descriptors reach it.
 #[cfg(target_os = "macos")]
-fn alloc_kept(len: usize, stamp: &dyn Fn(u32, &mut [u8]), keeper: &(dyn Fn(&str, usize) -> io::Result<()> + Send + Sync)) -> io::Result<LockedRegion> {
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    // PSHMNAMLEN is 31.
-    let name = format!("/wck{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let cname = std::ffi::CString::new(name.clone()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: a NUL-terminated name; O_EXCL, so a stale object is never reused.
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600 as libc::c_uint) };
-    if fd < 0 {
+fn alloc_kept(len: usize, stamp: &dyn Fn(u32, &mut [u8]), keeper: &(dyn Fn(usize) -> io::Result<std::os::fd::OwnedFd> + Send + Sync)) -> io::Result<LockedRegion> {
+    use std::os::fd::AsRawFd;
+    let fd = keeper(len).map_err(|e| io::Error::new(e.kind(), format!("the region keeper gave no window of {len} bytes: {e}")))?;
+    // SAFETY: a zeroed stat is a valid out-parameter; the descriptor is live.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || (st.st_size as u64) < len as u64 {
+        return Err(io::Error::other(format!("the region keeper's object is {} bytes, not {len}", st.st_size)));
+    }
+    // SAFETY: a shared mapping of an object at least `len` bytes long; checked below.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+    if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    let unlink = || unsafe { libc::shm_unlink(cname.as_ptr()) };
-    // SAFETY: our descriptor; macOS sizes a shm object once.
-    let sized = unsafe { libc::ftruncate(fd, len as libc::off_t) } == 0;
-    let ptr = if sized {
-        // SAFETY: a shared mapping of the object just sized; checked below.
-        unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) }
-    } else {
-        libc::MAP_FAILED
-    };
-    let e = io::Error::last_os_error();
-    // SAFETY: our descriptor; the mapping (if any) keeps the object.
-    unsafe { libc::close(fd) };
-    if ptr == libc::MAP_FAILED {
-        unlink();
-        return Err(e);
-    }
-    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, #[cfg(target_os = "macos")] _owner: None };
-    // Wire, then stamp, as alloc_wired does.
+    // The mapping keeps the object; the descriptor closes here.
+    drop(fd);
+    let view = MappedView { ptr: ptr.cast::<u8>().cast_const(), len, _owner: None };
+    // Wired here too, as alloc_wired does: the keeper's wiring is what
+    // outlives this process, this one is what the host's locate expects of
+    // a live session.
     // SAFETY: the mapping is live and `len` bytes long.
     if unsafe { libc::mlock(ptr, len) } != 0 {
         let e = io::Error::last_os_error();
-        unlink();
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             crate::arena::refusal_text(&format!("wired pages (mlock: {e}) for {len} bytes; check vm.user_wire_limit")),
@@ -402,9 +394,6 @@ fn alloc_kept(len: usize, stamp: &dyn Fn(u32, &mut [u8]), keeper: &(dyn Fn(&str,
     for (i, page) in bytes.chunks_exact_mut(REGION_PAGE).enumerate() {
         stamp(i as u32, page);
     }
-    let held = keeper(&name, len);
-    unlink();
-    held.map_err(|e| io::Error::new(e.kind(), format!("the region keeper did not take {name}: {e}")))?;
     Ok(LockedRegion { view, len, locked: true, pinning: "wired+kept" })
 }
 

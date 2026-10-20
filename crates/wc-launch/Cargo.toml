@@ -30,11 +30,16 @@ wc-compositor = { path = "../wc-compositor" }
 sv-transport = { workspace = true }
 # §103.15: the boot record's GPU label.
 wc-handle = { workspace = true }
+# §111.9: the LaunchDaemon holds the session's windows, lends the doorbell
+# ports and signs the boot record.
+wc-broker = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # §105: the compositor's control socket, which carries this launcher's
 # requests to the host's session over the rings; AF_UNIX, as the Wayland one.
 wc-transport = { workspace = true }
+# §105.14: the hop trace (`frametrace::hop`), on the clock the compositor uses.
+sv-transport = { workspace = true }
 windows-sys = { workspace = true, features = [
   # CloseHandle, GetLastError, ERROR_ALREADY_EXISTS.
   "Win32_Foundation",
@@ -61,4 +66,9 @@ windows-sys = { workspace = true, features = [
   "Win32_UI_Shell",
   "Win32_Globalization",
   "Win32_System_Registry",
+  # §102.14. A single application's window: find it (`EnumWindows`, its
+  # identity through `SHGetPropertyStoreForWindow`), bring it to the front, and
+  # tell the user in a `MessageBoxW` when a launch fails.
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell_PropertiesSystem",
 ] }

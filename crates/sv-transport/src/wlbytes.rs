@@ -181,12 +181,44 @@ pub const OWNER_AUDIO: u64 = SERVICE_TAG | 2;
 pub const OWNER_HOSTINT: u64 = SERVICE_TAG | 3;
 
 /// §107: the session's arena: the proxy asks the compositor for regions of
-/// the shared BAR (`grow`) and gives them back (`release`).
-pub const OWNER_ARENA: u64 = SERVICE_TAG | 3;
+/// the shared BAR (`grow`) and gives them back (`release`). Its own number:
+/// §107 and §106 were written apart and both took 3, so on a guest with host
+/// integration on, a session's `grow` was answered with hostint's hello.
+pub const OWNER_ARENA: u64 = SERVICE_TAG | 4;
+
+/// Every session service's owner id, each claimed once per session. A new
+/// service goes here, and the test below keeps the numbers apart.
+pub const SERVICE_OWNERS: [u64; 4] = [OWNER_CONTROL, OWNER_AUDIO, OWNER_HOSTINT, OWNER_ARENA];
 
 /// Whether an owner id names a session service rather than a client.
 pub fn is_service(owner_id: u64) -> bool {
     owner_id >> 56 == SERVICE_TAG >> 56
+}
+
+/// §103.14: a proxy's feed for one of its clients (the icon feed; with
+/// [`CLIP_FEED`] too, the clipboard feed). The low bits are the ordinal of the
+/// client connection the feed serves. A feed is a Wayland client to the
+/// compositor, but not an application: it must not keep a session alive, and
+/// it has no business outliving the connection it serves (§107.10).
+pub const FEED_TAG: u64 = 1 << 40;
+/// With [`FEED_TAG`]: the clipboard feed rather than the icon feed.
+pub const CLIP_FEED: u64 = 1 << 39;
+
+/// The owner id of client `ordinal`'s icon feed (`clip`: its clipboard feed).
+pub fn feed_owner(ordinal: u64, clip: bool) -> u64 {
+    FEED_TAG | if clip { CLIP_FEED } else { 0 } | (ordinal & (CLIP_FEED - 1))
+}
+
+/// Whether an owner id names a proxy's feed rather than an application's
+/// connection.
+pub fn is_feed(owner_id: u64) -> bool {
+    !is_service(owner_id) && without_session(owner_id) & FEED_TAG != 0
+}
+
+/// The ordinal of the client connection an owner id belongs to: its own for
+/// a connection, the one it serves for a feed. Same session either way.
+pub fn client_ordinal(owner_id: u64) -> u64 {
+    without_session(owner_id) & (CLIP_FEED - 1)
 }
 
 /// §107: where a claim says which session of a shared compositor it is.
@@ -221,7 +253,7 @@ mod session_tag_tests {
 
     #[test]
     fn a_session_index_rides_in_the_owner_id_and_leaves_the_rest_alone() {
-        for base in [1u64, 7, (1 << 40) | 3, (1 << 40) | (1 << 39) | 3, OWNER_CONTROL, OWNER_AUDIO, OWNER_ARENA] {
+        for base in [1u64, 7, (1 << 40) | 3, (1 << 40) | (1 << 39) | 3, OWNER_CONTROL, OWNER_AUDIO, OWNER_HOSTINT, OWNER_ARENA] {
             for idx in [0u8, 1, 2, 200, 255] {
                 let o = with_session(base, idx);
                 assert_eq!(session_of(o), idx);
@@ -229,11 +261,35 @@ mod session_tag_tests {
                 assert_eq!(is_service(o), is_service(base), "the service tag survives the index");
             }
         }
+        // §107.10: a feed knows whose it is, in any session.
+        for idx in [0u8, 3] {
+            let app = with_session(42, idx);
+            let icons = with_session(feed_owner(42, false), idx);
+            let clip = with_session(feed_owner(42, true), idx);
+            assert!(!is_feed(app) && is_feed(icons) && is_feed(clip));
+            assert_eq!([client_ordinal(app), client_ordinal(icons), client_ordinal(clip)], [42; 3]);
+            assert_eq!(session_of(clip), idx);
+        }
+        assert_eq!(feed_owner(3, true), (1 << 40) | (1 << 39) | 3, "the ids proxies have claimed with since §103.14");
+        assert!(!is_feed(OWNER_CONTROL) && !is_feed(with_session(OWNER_AUDIO, 2)));
         // An untagged id is session 0: every proxy from before §107.
         assert_eq!(session_of(OWNER_CONTROL), 0);
         assert_eq!(session_of(5), 0);
         // Re-tagging replaces, never ORs two sessions together.
         assert_eq!(session_of(with_session(with_session(9, 3), 4)), 4);
+    }
+
+    /// A compositor finds a session's service slot by its owner id alone, so
+    /// two services with one number share whichever slot is found first.
+    #[test]
+    fn every_session_service_has_its_own_owner_id() {
+        for (i, a) in SERVICE_OWNERS.iter().enumerate() {
+            assert!(is_service(*a));
+            assert_eq!(session_of(*a), 0, "a service id carries no session index of its own");
+            for b in &SERVICE_OWNERS[i + 1..] {
+                assert_ne!(a, b, "two session services share owner id {a:#x}");
+            }
+        }
     }
 }
 

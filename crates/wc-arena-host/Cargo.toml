@@ -37,12 +37,17 @@ description = "Locate the guest compositor's arena in QEMU's memory backend and 
 sv-hostd = { path = "../sv-hostd" }
 # `ExtentDesc`, which is how the arena is described to the locator.
 sv-transport = { path = "../sv-transport" }
+# §108: the region protocol's host peer (`wc-arena-host ram-peer`).
+sv-ram = { path = "../sv-ram" }
 # `RunList`, the coalesced result.
 sv-arena = { path = "../sv-arena" }
 # The definitive stamp layout.
 arena-record = { path = "../arena-record" }
 # And our own side of the same twenty bytes.
 wc-handle = { path = "../wc-handle" }
+# §111.10: the client role's broker, embedded in the session service, and
+# the users.conf map.
+wc-broker = { path = "../wc-broker" }
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid`, for the session service's refusal to run as root and its key check.

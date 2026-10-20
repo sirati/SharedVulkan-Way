@@ -59,6 +59,8 @@ use std::time::{Duration, Instant};
 use sv_transport::wlbytes::{self, ByteChannel, Endpoint, ReadOutcome, OWNER_ARENA, OWNER_AUDIO, OWNER_CONTROL};
 use wc_handle::barpool::BarPool;
 
+use crate::ringlink::SlotReader;
+
 /// What a launcher asked for: on the command line (`--boot-*`), or in a
 /// `boot` request on the user's control socket (§107).
 #[derive(Debug, Clone, Default)]
@@ -73,6 +75,10 @@ pub struct Config {
     pub nested: bool,
     /// §107: where this installation keeps its relaunch files (§92).
     pub relaunch_dir: Option<PathBuf>,
+    /// §92.12: how this installation's windows are named on the taskbar
+    /// (`taskbar=INSTALL[:APP,…]`). `None` from a launcher before §92.12,
+    /// whose windows keep the application-wide identity.
+    pub taskbar: Option<crate::taskbar::Scope>,
 }
 
 impl Config {
@@ -85,6 +91,13 @@ impl Config {
         }
         if !wc_handle::macboot::valid_installation(&self.install) {
             return Err(format!("{:?} is not an installation name", self.install));
+        }
+        // §92.12: a session names its own installation's windows, never
+        // another's.
+        if let Some(t) = &self.taskbar
+            && t.install != self.install
+        {
+            return Err(format!("taskbar={} is not installation {}'s scope", t.render(), self.install));
         }
         Ok(())
     }
@@ -117,6 +130,9 @@ impl Config {
         if let Some(d) = &self.relaunch_dir {
             f.push(format!("relaunch={}", d.display()));
         }
+        if let Some(t) = &self.taskbar {
+            f.push(format!("taskbar={}", t.render()));
+        }
         f.join("\t")
     }
 
@@ -143,6 +159,7 @@ impl Config {
                 "audio" => c.audio_volume = Some(v.parse::<u8>().map_err(|_| format!("audio={v}: a volume, 0..100"))?.min(100)),
                 "nested" => c.nested = v == "1",
                 "relaunch" => c.relaunch_dir = Some(v.into()),
+                "taskbar" => c.taskbar = Some(crate::taskbar::Scope::parse(v)?),
                 _ => return Err(format!("unknown boot field {k:?}")),
             }
         }
@@ -255,6 +272,34 @@ fn say(msg: &str) {
 
 fn now_micros() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
+}
+
+/// §111.6: the record signed by the privileged service at `sock` for this
+/// process's user, and the identity it signed. On a Linux server the broker
+/// (`wc-broker`, which holds `<install>.key`), named `broker:SOCK` as the
+/// key file. Windows reaches its service through `sign`.
+#[cfg(unix)]
+fn sign_by_broker(
+    sock: &str,
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+    install: &str,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    let mut c = wc_broker::client::Client::connect(sock).map_err(|e| e.to_string())?;
+    let req = wc_broker::proto::SignReq {
+        install: install.to_string(),
+        session: rec.session.clone(),
+        index,
+        arena_run: rec.arena_run,
+        arena_pages: rec.arena_pages,
+        outbound: rec.outbound,
+        rings_run: rec.rings_run,
+        rings_pages: rec.rings_pages,
+        gpu: rec.gpu,
+        seq: now_micros(),
+    };
+    let (auth, id) = c.sign(&req).map_err(|e| format!("the broker at {sock} would not sign: {e}"))?;
+    Ok((auth, Some(id)))
 }
 
 // ------------------------------------------------------------ the singleton ---
@@ -614,8 +659,16 @@ fn boot_session(cfg: Config) -> Result<(Arc<Sess>, String), String> {
     let sess = Arc::new(Sess::new(index, cfg));
     h.sessions.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&sess));
     h.ever.store(true, Ordering::Relaxed);
-    if let Some(d) = &sess.cfg.relaunch_dir {
-        crate::taskbar::add_relaunch_dir(d.clone());
+    // §92.12: the installation its windows are named for, and where its
+    // relaunch files are.
+    let refused = crate::taskbar::add_session(index, sess.cfg.taskbar.clone(), sess.cfg.relaunch_dir.clone());
+    if !refused.is_empty() {
+        say(&format!(
+            "taskbar: session {index} ({}) asked for the application-wide identity of {}, which another \
+             installation's session holds; its windows get their own (§92.12)",
+            sess.cfg.install,
+            refused.join(", ")
+        ));
     }
     let answer = {
         let _turn = h.boot_turn.lock().unwrap_or_else(|e| e.into_inner());
@@ -634,14 +687,78 @@ fn boot_session(cfg: Config) -> Result<(Arc<Sess>, String), String> {
     }
 }
 
+/// The record's authenticator (§111.6, §111.8). The broker signs it with the
+/// installation's key, which this process cannot read once deploy has moved
+/// it to the broker's directory, and covers the identity it read from this
+/// process's token. Without a broker it is signed here from the
+/// installation's key file, as before §111, with no identity.
+fn sign(
+    cfg: &Config,
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
+    use wc_handle::macboot;
+    let seq = now_micros();
+    // §111.9: a signer the launcher installed (the macOS broker).
+    match crate::ringlink::broker_sign(rec, index) {
+        Some(Ok((auth, who))) if auth.installation == cfg.install => {
+            say(&format!("boot: the broker signed the record for {}", who.text()));
+            return Ok((auth, Some(who)));
+        }
+        Some(Ok(_)) => say("boot: the broker signed for another installation; signing with the key file"),
+        Some(Err(e)) => say(&format!("boot: the broker did not sign ({e}); signing with the key file")),
+        None => {}
+    }
+    // A Linux server's broker, named as the key file (§111.10).
+    #[cfg(unix)]
+    if let Some(sock) = cfg.key_file.to_str().and_then(|s| s.strip_prefix("broker:")) {
+        let (auth, identity) = sign_by_broker(sock, rec, index, &cfg.install)?;
+        if let Some(i) = &identity {
+            say(&format!("boot: the broker signed the record for {}", i.text()));
+        }
+        return Ok((auth, identity));
+    }
+    #[cfg(windows)]
+    {
+        let req = wc_broker::proto::SignReq {
+            install: cfg.install.clone(),
+            session: rec.session.clone(),
+            index,
+            arena_run: rec.arena_run,
+            arena_pages: rec.arena_pages,
+            outbound: rec.outbound,
+            rings_run: rec.rings_run,
+            rings_pages: rec.rings_pages,
+            gpu: rec.gpu,
+            seq,
+        };
+        let t = Instant::now();
+        match wc_broker::client::process_client("compositor").and_then(|mut c| c.sign(&req)) {
+            Ok((auth, identity)) => {
+                say(&format!(
+                    "boot: record signed by the broker in {} us for {}",
+                    t.elapsed().as_micros(),
+                    identity.text()
+                ));
+                return Ok((auth, Some(identity)));
+            }
+            Err(e) => say(&format!(
+                "boot: the broker did not sign ({e}); signing with the key file {}",
+                cfg.key_file.display()
+            )),
+        }
+    }
+    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
+    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
+    Ok((macboot::Auth::sign_indexed(rec, index, &cfg.install, seq, &key), None))
+}
+
 /// Write the record, ring, and wait for the answer.
 fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
     use wc_handle::macboot;
     let cfg = &sess.cfg;
     let id = h.arena;
     let t0 = Instant::now();
-    let text = std::fs::read_to_string(&cfg.key_file).map_err(|e| format!("the installation key {}: {e}", cfg.key_file.display()))?;
-    let key = macboot::parse_key(&text).ok_or_else(|| format!("{} is not 64 hex digits", cfg.key_file.display()))?;
     let (run, region_len, rings_len) = wc_handle::arena::ivshmem_identity(id).map_err(|e| e.to_string())?;
     if rings_len == 0 {
         return Err("the region kept no Wayland rings, and without them nothing can cross".into());
@@ -656,12 +773,14 @@ fn boot(h: &Hub, sess: &Sess) -> Result<String, String> {
         rings_pages: (rings_len / 4096) as u32,
         gpu: cfg.gpu,
     };
-    let auth = macboot::Auth::sign_indexed(&rec, sess.index, &cfg.install, now_micros(), &key);
+    let (auth, identity) = sign(cfg, &rec, sess.index)?;
     let page0 = wc_handle::arena::ivshmem_header_page(id).map_err(|e| e.to_string())?;
     // SAFETY: the header page of the device this process maps, for the life of
     // the process; nothing else in this process writes past the header's 80
-    // bytes of it, and the boot turn keeps other boots out.
-    unsafe { macboot::publish_indexed(page0, &rec, sess.index, Some(&auth)) };
+    // bytes of it, and the boot turn keeps other boots out. The identity area
+    // is written (or cleared, without one) before the record, so a record is
+    // never read with another boot's identity.
+    unsafe { macboot::publish_identity(page0, &rec, sess.index, identity.as_ref(), Some(&auth)) };
     let bell = sv_transport::park::cross_wake();
     say(&format!(
         "boot: record for session {} of installation {} in the header page (run 0x{run:016x}, index {}, gpu {}); {}",
@@ -735,16 +854,52 @@ fn service_channel(owner: u64, wait: Duration) -> Option<ByteChannel> {
 
 /// [`service_channel`] for one of `sess`'s services: its index in the owner
 /// id, and its slot remembered so the session's end closes it.
-fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<ByteChannel> {
+///
+/// §107.11: the [`SlotReader`] keeps the slot from being recycled while the
+/// thread that holds it may still read it; the thread drops it only once it
+/// will touch the ring no more. A channel found after the session ended (its
+/// service was still waiting for the slot when [`end`] closed the others) is
+/// closed here instead, under the same lock `end` takes, so no slot of an
+/// ended session is ever left open.
+fn session_channel(sess: &Sess, owner: u64, wait: Duration) -> Option<(ByteChannel, SlotReader)> {
     let ch = service_channel(wlbytes::with_session(owner, sess.index), wait)?;
-    sess.service_slots.lock().unwrap_or_else(|e| e.into_inner()).push(ch.slot());
-    Some(ch)
+    let reader = SlotReader::new(ch.slot());
+    let mut slots = sess.service_slots.lock().unwrap_or_else(|e| e.into_inner());
+    if sess.ended() {
+        drop(slots);
+        if let Some(c) = crate::ringlink::shared_control() {
+            let _ = c.kill_ring(ch.slot());
+            crate::ringlink::quarantine(ch.slot());
+        }
+        say(&format!("session {}: slot {} came after the session ended; closed", sess.index, ch.slot()));
+        return None;
+    }
+    slots.push(ch.slot());
+    Some((ch, reader))
 }
 
-/// How long a request waits for its answer before it parks (§105.13): a
-/// millisecond covers the host waking from its park and answering, so the
-/// answer needs no doorbell back. Only while a request is outstanding.
-const SPIN: Duration = Duration::from_millis(1);
+/// §107.11: whether a service thread of `sess` must stop reading `ch` now:
+/// its session has ended, or the slot is DEAD with nothing left to read.
+fn service_over(sess: &Sess, ch: &ByteChannel) -> bool {
+    sess.ended()
+        || crate::ringlink::shared_control().is_some_and(|c| c.ring_state(ch.slot()).ok() == Some(sv_transport::control::RingState::Dead))
+            && !ch.readable().unwrap_or(false)
+}
+
+/// How long a request waits for its answer before it parks (§105.13): the
+/// host waking from its park and answering takes 0.1–1.5 ms on an idle
+/// guest, and an answer seen here needs no doorbell back (§105.14). A
+/// yielding wait, and only while a request is outstanding.
+/// `WC_CTL_SPIN_US` overrides it, for measuring (§105.14).
+fn spin() -> Duration {
+    static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("WC_CTL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(Duration::from_millis(2), Duration::from_micros)
+    })
+}
 
 /// The control channel, shared by the lease and the requests. The channel
 /// lock is held for one read or write at a time, never across a request, so
@@ -755,11 +910,15 @@ struct Ctl {
     ch: Mutex<Option<ByteChannel>>,
     /// One request at a time: replies are matched to requests by order.
     turn: Mutex<()>,
+    /// §107.11: the control slot's reader, given up with the channel.
+    reader: Mutex<Option<SlotReader>>,
 }
 
 impl Ctl {
     fn close(&self) {
         *self.ch.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // After the channel: nothing of this process reads the slot now.
+        self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     fn write_all(&self, mut b: &[u8]) -> Result<(), String> {
@@ -793,6 +952,7 @@ impl Ctl {
                 let ch = g.as_mut().ok_or("the session has ended")?;
                 match ch.read(&mut buf).map_err(|e| e.to_string())? {
                     ReadOutcome::Bytes(n) => {
+                        sv_transport::frametrace::hop("C.reply");
                         out.extend_from_slice(&buf[..n]);
                         return Ok(());
                     }
@@ -806,14 +966,20 @@ impl Ctl {
                 // tens of microseconds; look for it before parking, which
                 // would add a doorbell round trip.
                 let t0 = Instant::now();
-                while t0.elapsed() < SPIN && !ch.readable().unwrap_or(true) {
-                    std::hint::spin_loop();
+                while t0.elapsed() < spin() && !ch.readable().unwrap_or(true) {
+                    // §105.14: a yielding spin. A busy one held its vCPU
+                    // against the launcher on the guest, and both lost a
+                    // 15.6 ms tick to it (Windows does not move a woken
+                    // thread to a parked core).
+                    std::thread::yield_now();
                 }
                 if ch.readable().unwrap_or(true) {
                     continue;
                 }
                 // Short, so the lease never waits long behind this lock.
+                sv_transport::frametrace::hop("C.park");
                 let _ = ch.wait_readable(crate::ringlink::ring_wait_slice().min(Duration::from_millis(20)));
+                sv_transport::frametrace::hop("C.unpark");
             }
         }
     }
@@ -841,7 +1007,9 @@ impl Ctl {
     /// [`Ctl::request`] for a caller that holds the turn.
     fn exchange(&self, line: &str, within: Duration) -> Result<Vec<u8>, String> {
         self.drain_stale();
+        sv_transport::frametrace::hop("C.ringtx0");
         self.write_all(format!("{line}\n").as_bytes())?;
+        sv_transport::frametrace::hop("C.ringtx1");
         let deadline = Instant::now() + within;
         let mut got = Vec::new();
         let nl = loop {
@@ -866,7 +1034,7 @@ impl Ctl {
 /// After the boot: control, lease, sound, and for a shared compositor the
 /// session's arena and its watch.
 fn services(sess: Arc<Sess>) {
-    let Some(ch) = session_channel(&sess, OWNER_CONTROL, Duration::from_secs(20)) else {
+    let Some((ch, reader)) = session_channel(&sess, OWNER_CONTROL, Duration::from_secs(20)) else {
         if !multi() {
             say("session: the host never opened the control ring; ending");
             std::process::exit(3);
@@ -875,7 +1043,7 @@ fn services(sess: Arc<Sess>) {
         return;
     };
     say(&format!("session: control on ring slot {} (no ssh){}", ch.slot(), index_note(&sess)));
-    let ctl = Arc::new(Ctl { ch: Mutex::new(Some(ch)), turn: Mutex::new(()) });
+    let ctl = Arc::new(Ctl { ch: Mutex::new(Some(ch)), turn: Mutex::new(()), reader: Mutex::new(Some(reader)) });
     *sess.ctl.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&ctl));
     sess.up.store(true, Ordering::SeqCst);
     if let Some(h) = hub() {
@@ -904,8 +1072,11 @@ fn services(sess: Arc<Sess>) {
     if let Some(vol) = sess.cfg.audio_volume {
         let s = Arc::clone(&sess);
         let _ = std::thread::Builder::new().name("session-sound".into()).spawn(move || {
+            // §107.11: the sound ring's thread ends when the slot is DEAD,
+            // which the session's end makes it; the reader is held until it
+            // has (both players below return only after the ring's end).
             match session_channel(&s, OWNER_AUDIO, Duration::from_secs(20)) {
-                Some(ch) => {
+                Some((ch, _reader)) => {
                     say(&format!("audio: the session's sound ring is slot {} (§103.16, no ssh){}", ch.slot(), index_note(&s)));
                     // §106.3: every endpoint a stream, both directions, the
                     // defaults following Windows'. The single default-output
@@ -942,16 +1113,21 @@ fn services(sess: Arc<Sess>) {
     #[cfg(not(target_os = "macos"))]
     if let Some(hcfg) = crate::hostint::configured() {
         // §107: the session's own slot, its index in the owner id.
+        // §107.11: served on this thread, which holds the slot's reader
+        // until the serving ends: at the session's end, or the slot's.
         let hs = Arc::clone(&sess);
         let _ = std::thread::Builder::new().name("session-hostint".into()).spawn(move || {
             match session_channel(&hs, sv_transport::wlbytes::OWNER_HOSTINT, Duration::from_secs(20)) {
-                Some(ch) => {
-                    say(&format!("hostint: on ring slot {} (no ssh)", ch.slot()));
+                Some((ch, _reader)) => {
+                    say(&format!("hostint: on ring slot {} (no ssh){}", ch.slot(), index_note(&hs)));
+                    let s2 = Arc::clone(&hs);
+                    let stop: crate::hostint::Stop = Box::new(move || s2.ended());
                     #[cfg(windows)]
-                    crate::hostint::start_windows(ch, hcfg, say);
+                    crate::hostint::serve_windows(ch, hcfg, say, stop);
                     #[cfg(target_os = "linux")]
-                    crate::hostint::start_logging(ch, hcfg, say);
+                    crate::hostint::serve_logging(ch, hcfg, say, stop);
                 }
+                None if hs.ended() => {}
                 None => say("hostint: the host opened no host-integration slot; links and files stay on their side"),
             }
         });
@@ -1021,15 +1197,14 @@ fn end(sess: &Arc<Sess>, why: &str) {
             ));
         }
     }
-    if let Some(d) = &sess.cfg.relaunch_dir {
-        crate::taskbar::remove_relaunch_dir(d);
-    }
+    crate::taskbar::remove_session(sess.index);
     h.sessions.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| !Arc::ptr_eq(s, sess));
     h.changed.notify_all();
 }
 
 /// §107: a session ends when its proxy closes its control slot, when the
-/// proxy stops answering (`rtt` every two seconds, twice missed), or when its
+/// proxy stops answering (`rtt` every two seconds, twice missed; §113: not
+/// counting a probe this process was stalled through), or when its
 /// last client has been gone for the linger, which also tells the proxy
 /// `down`. A proxy that crashed is the first or the second; a flood of
 /// requests from one session waits for its own turn and nobody else's.
@@ -1037,10 +1212,16 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
     let Some(control) = crate::ringlink::shared_control() else { return };
     let slot = sess.service_slots.lock().unwrap_or_else(|e| e.into_inner()).first().copied();
     let linger = hub().and_then(|h| h.linger);
-    let mut misses = 0u32;
-    let mut last_probe = Instant::now();
+    let mut probes = Probes::new(Instant::now());
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        if let Some(gap) = probes.tick(Instant::now()) {
+            say(&format!(
+                "session {}: this process did not run for {} ms (the guest stalled?); a probe missed across it does not count (§113)",
+                sess.index,
+                gap.as_millis()
+            ));
+        }
         if sess.ended() {
             return;
         }
@@ -1059,21 +1240,74 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
             end(&sess, &format!("its last client left {} s ago (down: {})", linger.as_secs(), said.unwrap_or_else(|e| e)));
             return;
         }
-        if last_probe.elapsed() >= Duration::from_secs(2) {
-            last_probe = Instant::now();
+        if probes.due(Instant::now()) {
             // Only between requests: a request in flight is its own probe.
             if let Ok(turn) = ctl.turn.try_lock() {
-                match ctl.exchange("rtt", Duration::from_secs(2)) {
-                    Ok(_) => misses = 0,
-                    Err(e) => {
-                        misses += 1;
-                        if misses >= 2 {
-                            drop(turn);
-                            end(&sess, &format!("its proxy is silent ({e})"));
-                            return;
-                        }
-                    }
+                let t0 = Instant::now();
+                let r = ctl.exchange("rtt", PROBE_WITHIN);
+                if let Some(e) = probes.answer(t0, Instant::now(), r.err()) {
+                    drop(turn);
+                    end(&sess, &format!("its proxy is silent ({e})"));
+                    return;
                 }
+            }
+        }
+    }
+}
+
+/// How long one `rtt` probe waits for the proxy.
+const PROBE_WITHIN: Duration = Duration::from_secs(2);
+/// A gap this long in a loop that sleeps 250 ms is this process not running.
+const STALL: Duration = Duration::from_millis(1000);
+
+/// [`watch`]'s probes: one every two seconds, the session ends at the second
+/// miss in a row. §113: a probe whose wait this process spent stalled (the
+/// whole guest frozen, as a passed-through GPU waking from D3 does for
+/// seconds) is not a miss: the proxy could not answer a guest that did not
+/// run, and the guest cannot tell how long it was gone except by its clock.
+struct Probes {
+    last_tick: Instant,
+    last_probe: Instant,
+    misses: u32,
+}
+
+impl Probes {
+    fn new(now: Instant) -> Probes {
+        Probes { last_tick: now, last_probe: now, misses: 0 }
+    }
+
+    /// Each loop turn. A stall forgets the misses before it, and says how long.
+    fn tick(&mut self, now: Instant) -> Option<Duration> {
+        let gap = now.duration_since(self.last_tick);
+        self.last_tick = now;
+        (gap > STALL + Duration::from_millis(250)).then(|| {
+            self.misses = 0;
+            self.last_probe = now;
+            gap
+        })
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let due = now.duration_since(self.last_probe) >= Duration::from_secs(2);
+        if due {
+            self.last_probe = now;
+        }
+        due
+    }
+
+    /// A probe sent at `t0` that ended at `t1`; `Some(why)` ends the session.
+    fn answer(&mut self, t0: Instant, t1: Instant, err: Option<String>) -> Option<String> {
+        self.last_tick = t1;
+        match err {
+            None => {
+                self.misses = 0;
+                None
+            }
+            // Longer than the probe's own wait: this process stalled in it.
+            Some(_) if t1.duration_since(t0) > PROBE_WITHIN + STALL => None,
+            Some(e) => {
+                self.misses += 1;
+                (self.misses >= 2).then_some(e)
             }
         }
     }
@@ -1084,7 +1318,9 @@ fn watch(ctl: Arc<Ctl>, sess: Arc<Sess>) {
 /// own, which only this session's clients may name.
 fn serve_arena(sess: Arc<Sess>) {
     let Some(h) = hub() else { return };
-    let Some(mut ch) = session_channel(&sess, OWNER_ARENA, Duration::from_secs(30)) else {
+    // §107.11: the reader is held for the whole loop, which ends with the
+    // session or the slot.
+    let Some((mut ch, _reader)) = session_channel(&sess, OWNER_ARENA, Duration::from_secs(30)) else {
         if !sess.ended() {
             say(&format!("arena: session {} opened no arena channel; its proxy allocates nothing", sess.index));
         }
@@ -1097,6 +1333,7 @@ fn serve_arena(sess: Arc<Sess>) {
         match ch.read(&mut tmp) {
             Ok(ReadOutcome::Bytes(n)) => buf.extend_from_slice(&tmp[..n]),
             Ok(ReadOutcome::Eof) | Err(_) => break,
+            Ok(ReadOutcome::Empty) if service_over(&sess, &ch) => break,
             Ok(ReadOutcome::Empty) => {
                 let _ = ch.wait_readable(Duration::from_millis(100));
                 continue;
@@ -1158,11 +1395,25 @@ fn arena_request(h: &Hub, sess: &Sess, line: &str) -> String {
                     drop(pool);
                     let mut why = e.to_string();
                     for (region, base, src) in pool_regions() {
-                        match src.lease(sess.index, &sess.cfg.install, min) {
-                            Ok((off, len)) => match grant_external(h, sess, region, base, &src, off, len) {
+                        match src.lease_in(sess.index, &sess.cfg.install, min) {
+                            Ok((0, off, len)) => match grant_external(h, sess, region, base, &src, off, len) {
                                 Ok(reply) => return reply,
                                 Err(e) => why = format!("{why}; region {region}: {e}"),
                             },
+                            // §108: the lease landed in a region the allocator
+                            // added at run time; its own entry releases it.
+                            Ok((d, off, len)) => {
+                                let r = region + d;
+                                let Some((_, b, s)) = pool_regions().into_iter().find(|(k, _, _)| *k == r) else {
+                                    src.release(off);
+                                    why = format!("{why}; region {r} was leased in but never registered");
+                                    continue;
+                                };
+                                match grant_external(h, sess, r, b, &s, off, len) {
+                                    Ok(reply) => return reply,
+                                    Err(e) => why = format!("{why}; region {r}: {e}"),
+                                }
+                            }
                             Err(e) => why = format!("{why}; region {region} ({}): {e}", src.describe()),
                         }
                     }
@@ -1255,6 +1506,13 @@ pub trait PoolRegion: Send + Sync {
     /// `len` bytes for session `session` of installation `install`, as
     /// `(offset, len)` within this region's mapping.
     fn lease(&self, session: u8, install: &str, len: u64) -> Result<(u64, u64), String>;
+    /// §108: the same, for an allocator whose lease may land in another region
+    /// of the one pool (a GPU pool that grew from guest RAM): `(delta, offset,
+    /// len)`, the range being in region `this + delta`, which the allocator has
+    /// registered with [`replace_pool_region`] before answering.
+    fn lease_in(&self, session: u8, install: &str, len: u64) -> Result<(u32, u64, u64), String> {
+        self.lease(session, install, len).map(|(o, l)| (0, o, l))
+    }
     /// The range at `offset` goes back.
     fn release(&self, offset: u64);
     /// For the log: what the region is.
@@ -1286,6 +1544,24 @@ pub unsafe fn add_pool_region(region: u32, ptr: *const u8, len: usize, src: Arc<
     say(&format!("sessions: pool region {region} ({} MiB, {}) serves Wayland buffers when a session's BAR is full", len >> 20, src.describe()));
     POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).push((region, base, src));
     Ok(())
+}
+
+/// §108: (re)register region `region` at `[ptr, ptr + len)`: a region of the
+/// GPU pool added at run time, whose slot may be reused at another address
+/// after a retire. The caller makes sure no grant of the old one is live.
+///
+/// # Safety
+/// As [`add_pool_region`].
+pub unsafe fn replace_pool_region(region: u32, ptr: *const u8, len: usize, src: Arc<dyn PoolRegion>) -> Result<(), String> {
+    {
+        let mut regions = POOL_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = regions.iter().position(|(r, _, _)| *r == region) {
+            let (_, base, _) = regions.remove(i);
+            wc_handle::arena::unregister_borrowed_base(base).map_err(|e| e.to_string())?;
+        }
+    }
+    // SAFETY: the caller's contract.
+    unsafe { add_pool_region(region, ptr, len, src) }
 }
 
 /// §110, for the harness and for a machine with no GPU pool in this process:
@@ -1456,9 +1732,11 @@ fn lines(mut conn: wc_transport::Stream, mut f: impl FnMut(&str) -> Vec<u8>) {
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
             }
         };
+        sv_transport::frametrace::hop("C.line");
         if conn.write_all(&f(&line)).is_err() {
             return;
         }
+        sv_transport::frametrace::hop("C.socktx");
     }
 }
 
@@ -1556,6 +1834,39 @@ fn wait_ended(id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// §113: two misses in a row end a session; a probe this process was
+    /// stalled through is not one, and a stall forgets the misses before it.
+    #[test]
+    fn probes_ride_out_a_stall_of_this_process() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut p = Probes::new(t0);
+        // An ordinary miss (the 2 s wait ran out), then an answer.
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(2000), ms(2001), None), None);
+        // Two ordinary misses in a row end it.
+        assert_eq!(p.answer(ms(3000), ms(5000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(5000), ms(7000), Some("no answer".into())), Some("no answer".into()));
+
+        // A miss, then the guest freezes for 8 s inside the next probe: its
+        // wait looked like 8 s, so it is not the second miss.
+        let mut p = Probes::new(t0);
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.answer(ms(2000), ms(10_000), Some("no answer".into())), None);
+        // And the next ordinary miss is only the second one.
+        assert_eq!(p.answer(ms(10_000), ms(12_000), Some("no answer".into())), Some("no answer".into()));
+
+        // A miss, then an 8 s gap between two loop turns: forgotten, and
+        // the next probe waits its two seconds again.
+        let mut p = Probes::new(t0);
+        assert_eq!(p.answer(ms(0), ms(2000), Some("no answer".into())), None);
+        assert_eq!(p.tick(ms(2250)), None);
+        assert_eq!(p.tick(ms(10_250)), Some(Duration::from_secs(8)));
+        assert!(!p.due(ms(11_000)));
+        assert!(p.due(ms(12_250)));
+        assert_eq!(p.answer(ms(12_250), ms(14_250), Some("no answer".into())), None);
+    }
+
     #[test]
     fn a_boot_request_round_trips_and_spaces_in_paths_survive() {
         let c = Config {
@@ -1567,6 +1878,7 @@ mod tests {
             audio_volume: Some(80),
             nested: true,
             relaunch_dir: Some(r"C:\Users\First Last\wcivs\apps".into()),
+            taskbar: Some(crate::taskbar::Scope::parse("wcivs:firefox").unwrap()),
         };
         let line = c.request_line();
         assert!(!line.contains('\n'));
@@ -1574,6 +1886,7 @@ mod tests {
         assert_eq!(back.request_line(), line);
         assert_eq!(back.key_file, c.key_file);
         assert!(back.gpu && back.nested);
+        assert_eq!(back.taskbar, c.taskbar);
         assert_eq!(back.audio_volume, Some(80));
     }
 
@@ -1600,5 +1913,19 @@ mod tests {
         assert!(Config::parse_request(&format!("{ok}\tcolour=red")).unwrap_err().contains("unknown boot field"));
         assert!(Config::parse_request(&format!("{ok}\taudio=loud")).is_err());
         assert!(Config::parse_request("bootx\tsession=s-1").is_err());
+    }
+
+    /// §92.12: the session names its own installation's windows: a scope
+    /// of another installation, or one that is not a scope, is refused.
+    #[test]
+    fn a_boot_s_taskbar_scope_is_its_own_installation_s() {
+        let ok = "boot\tsession=s-1\tinstall=wcivs\tkey=k";
+        let c = Config::parse_request(&format!("{ok}\ttaskbar=wcivs:firefox")).unwrap();
+        assert_eq!(c.taskbar.unwrap().identity("firefox", 1), "Waycompose.app.firefox");
+        let c = Config::parse_request(&format!("{ok}\ttaskbar=wcivs")).unwrap();
+        assert_eq!(c.taskbar.unwrap().identity("firefox", 1), "Waycompose.install.wcivs.firefox");
+        assert!(Config::parse_request(ok).unwrap().taskbar.is_none(), "a launcher before §92.12");
+        assert!(Config::parse_request(&format!("{ok}\ttaskbar=wcpins")).unwrap_err().contains("not installation wcivs"));
+        assert!(Config::parse_request(&format!("{ok}\ttaskbar=wcivs:a b")).is_err());
     }
 }

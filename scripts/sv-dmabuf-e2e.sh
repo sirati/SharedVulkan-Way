@@ -11,7 +11,8 @@
 # character device, and its st_rdev is what the ICD reports.
 #
 #   sv-dmabuf-e2e   Zink's calls, minus GL: export, token, import, clear,
-#                   SYNC_FD, and the pixels read from /dev/shm by name
+#                   SYNC_FD (returned at once), the fence record waited on
+#                   as the compositor does, the pixels read from /dev/shm
 #   gl-probe        with SV_DRM_NODE set, twice: the sv-pool-e2e command, and
 #                   on Zink over sv-icd (see below): nothing regressed
 #   egl-dmabuf      EGL_EXT_image_dma_buf_import on Zink over sv-icd: a
@@ -103,11 +104,15 @@ check "gl-probe on Zink over sv-icd (exit $rz)" '[ $rz = 0 ] && grep -q "rendere
 if [ "$rc" = skip ]; then echo "  skip egl-dmabuf"; else
   check "egl-dmabuf: Zink rendered into an imported dma-buf, pixels in the section (exit $rc)" '[ $rc = 0 ]'
   check "the import went through svImportShared" 'grep -q "imported (type" "$RUN/gpu.log"'
+  # §104.11: Zink's implicit-sync export (vkGetSemaphoreFdKHR, then the
+  # memory's fd) was numbered for its section, and nobody waited for it.
+  check "both sessions' sync fd exports were marked for their section, not waited for" \
+    '[ "$(grep -c "first sync fd export.*marked without waiting, for /dev/shm/sv-shared-" "$RUN/gpu.log")" -ge 2 ]'
 fi
 check "no lost device anywhere" '! grep -qi "DEVICE_LOST\|lost device" "$RUN"/*.log'
 check "no section left in /dev/shm by this GPU process (pid $GPID)" 'grep -q "sv-shared-$GPID-" "$RUN/gpu.log" && ! ls /dev/shm/sv-shared-$GPID-* >/dev/null 2>&1'
 echo "---- the GPU side's account ----"
-grep -E "shared section|svAllocShared|svImportShared|shared image" "$RUN/gpu.log" | cut -c1-300 | tail -20
+grep -E "shared section|svAllocShared|svImportShared|shared image|fence record|sync fd export" "$RUN/gpu.log" | cut -c1-300 | tail -20
 echo "run dir: $RUN"
 [ $FAIL = 0 ] && { say "sv-dmabuf-e2e: PASS"; rm -f "$RUN/gpu"; } || say "sv-dmabuf-e2e: FAIL"
 exit $FAIL

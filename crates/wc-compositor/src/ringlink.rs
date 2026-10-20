@@ -59,6 +59,10 @@ struct Link {
     slot: u32,
     /// §107: the session the proxy that claimed it said it is (0: none).
     session: u8,
+    /// The owner id it was claimed with: which client connection it is, or
+    /// which one it is a feed for (§107.10).
+    owner: u64,
+    accepted_at: std::time::Instant,
     channel: ByteChannel,
     /// Our end of the pair. smithay holds the other.
     local: wc_transport::Stream,
@@ -299,6 +303,7 @@ impl RingLink {
                 || self.control.ring_kind(slot).ok() != Some(RingKind::Wayland)
                 || self.links.iter().any(|l| l.slot == slot)
                 || quarantined(slot)
+                || has_reader(slot)
                 || !crate::session_svc::may_recycle(self.control.ring_owner(slot).unwrap_or(0))
             {
                 continue;
@@ -317,7 +322,7 @@ impl RingLink {
     /// ever accepted once; `seen` is not pruned, because a `Dead` slot is never
     /// reused within a generation (`Control::kill_ring`'s own rule) and so a
     /// slot number cannot come back meaning something else.
-    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream, u8)> {
+    pub fn accept(&mut self) -> Vec<(u32, wc_transport::Stream, u8, bool)> {
         let live = match ByteChannel::live_connections(&self.control) {
             Ok(v) => v,
             Err(_) => return Vec::new(),
@@ -365,6 +370,8 @@ impl RingLink {
             self.links.push(Link {
                 slot,
                 session,
+                owner,
+                accepted_at: std::time::Instant::now(),
                 channel,
                 local,
                 to_local: Vec::new(),
@@ -372,7 +379,7 @@ impl RingLink {
                 ring_eof: false,
                 dead: false,
             });
-            out.push((slot, theirs, session));
+            out.push((slot, theirs, session, sv_transport::wlbytes::is_feed(owner)));
         }
         out
     }
@@ -389,7 +396,42 @@ impl RingLink {
             link.pump();
         }
         self.links.retain(|l| !l.dead);
+        self.close_orphan_feeds();
     }
+
+    /// §107.10: a feed whose client connection has gone is closed, in case
+    /// its proxy did not close it. A proxy's icon and clipboard feeds live
+    /// and die with the connection they serve; one left behind is a Wayland
+    /// client that is no application, and it used to keep its session up for
+    /// ever (the wcns session of 2026-10-19, after the bridge returned on an
+    /// error without ending its ring). The proxy claims the connection before
+    /// its feeds, so a feed is given [`ORPHAN_GRACE`] to have been seen with
+    /// it before it counts as left behind.
+    fn close_orphan_feeds(&mut self) {
+        use sv_transport::wlbytes::{client_ordinal, is_feed};
+        let apps: Vec<(u8, u64)> = self
+            .links
+            .iter()
+            .filter(|l| !l.dead && !is_feed(l.owner))
+            .map(|l| (l.session, client_ordinal(l.owner)))
+            .collect();
+        for link in self.links.iter_mut().filter(|l| !l.dead && is_feed(l.owner)) {
+            if link.accepted_at.elapsed() < ORPHAN_GRACE || apps.contains(&(link.session, client_ordinal(link.owner))) {
+                continue;
+            }
+            println!(
+                "wc-compositor: ring slot {}: a feed of client connection {} outlived it; closed",
+                link.slot,
+                client_ordinal(link.owner)
+            );
+            let _ = link.channel.write_eof();
+            let _ = self.control.kill_ring(link.slot);
+            quarantine(link.slot);
+            link.dead = true;
+        }
+        self.links.retain(|l| !l.dead);
+    }
+
 
     /// §107: end every connection of `session`: its clients are disconnected
     /// (smithay sees their sockets close, after what they had already sent),
@@ -408,10 +450,11 @@ impl RingLink {
         n
     }
 
-    /// §107: how many connections each session has now.
+    /// §107: how many application connections each session has now. Feeds
+    /// are not counted (§107.10): they keep no session alive.
     pub fn connections_by_session(&self) -> std::collections::HashMap<u8, usize> {
         let mut m = std::collections::HashMap::new();
-        for l in self.links.iter().filter(|l| !l.dead) {
+        for l in self.links.iter().filter(|l| !l.dead && !sv_transport::wlbytes::is_feed(l.owner)) {
             *m.entry(l.session).or_insert(0) += 1;
         }
         m
@@ -517,6 +560,34 @@ pub fn guest_ram_rings_located() {
     LOCATED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// How often this process beats the ring region's owner heartbeat (§113).
+pub const GUEST_BEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Make `control` the ring region every service uses, and beat for it.
+fn publish_shared(control: &Arc<Control>) {
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(control));
+    start_guest_beat();
+}
+
+/// §113: the guest's heartbeat. Every 100 ms, for as long as this process
+/// runs, the owner word of the ring region moves, on a thread that does
+/// nothing else. Every session's proxy reads it: a session whose pings stop
+/// while this moves is gone; pings and this stopping together is the whole
+/// guest stalled (its GPU waking from D3 held every vCPU for up to ten
+/// seconds on testhost), which the proxy's lease rides out.
+fn start_guest_beat() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("guest-beat".into()).spawn(|| loop {
+        if let Some(c) = shared_control() {
+            let _ = c.beat_now();
+        }
+        std::thread::sleep(GUEST_BEAT_EVERY);
+    });
+}
+
 /// The ring region, once made: the launcher's control and sound channels are
 /// ring slots of it.
 pub fn shared_control() -> Option<Arc<Control>> {
@@ -537,6 +608,33 @@ static BOOT_STATUS: std::sync::Mutex<Option<Result<(), String>>> = std::sync::Mu
 /// `wc_handle::macboot::gpu_label(id)`, for the host to serve.
 pub fn set_boot_session(id: &str, outbound: u64, gpu: bool) {
     *BOOT_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some((id.to_string(), outbound, gpu));
+}
+
+/// §111.6, §111.9: who signs a boot record. Given the record and the
+/// session's index, the privileged broker's authenticator over it and the
+/// identity of the user it read from this process's credentials (the macOS
+/// LaunchDaemon's `sign`). An error is logged and the record goes out as it
+/// did before the broker: unsigned in role (a), signed with the installation's
+/// key file in role (b).
+pub type BootSigner = Box<
+    dyn Fn(&wc_handle::macboot::Record, u8) -> Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>
+        + Send
+        + Sync,
+>;
+
+static BOOT_SIGNER: std::sync::OnceLock<BootSigner> = std::sync::OnceLock::new();
+
+/// The launcher, before the compositor starts: sign boot records with `s`.
+pub fn set_boot_signer(s: BootSigner) -> bool {
+    BOOT_SIGNER.set(s).is_ok()
+}
+
+/// The broker's signature over `rec`, if a signer is installed and it signed.
+pub(crate) fn broker_sign(
+    rec: &wc_handle::macboot::Record,
+    index: u8,
+) -> Option<Result<(wc_handle::macboot::Auth, wc_handle::macboot::Identity), String>> {
+    BOOT_SIGNER.get().map(|s| s(rec, index))
 }
 
 /// The compositor, as it provides arena 0 from guest RAM.
@@ -632,7 +730,19 @@ impl PendingRings {
                 // SAFETY: page 0 of the window this value owns, mapped and
                 // pinned, and not yet shared with anything but the host's sweep.
                 let page0 = unsafe { std::slice::from_raw_parts_mut(window.base(), wc_handle::arena::REGION_PAGE) };
-                rec.write(page0);
+                // §111.6: signed by the broker with who asked, when there is one.
+                match broker_sign(&rec, 0) {
+                    Some(Ok((auth, who))) => {
+                        // SAFETY: as above; nothing else in this process writes the page.
+                        unsafe { wc_handle::macboot::publish_identity(page0.as_mut_ptr(), &rec, 0, Some(&who), Some(&auth)) };
+                        println!("wc-compositor: boot record signed by the broker for {}", who.text());
+                    }
+                    Some(Err(e)) => {
+                        println!("wc-compositor: the broker did not sign the boot record ({e}); it goes out unsigned, as before §111");
+                        rec.write(page0);
+                    }
+                    None => rec.write(page0),
+                }
                 booting = true;
                 println!(
                     "wc-compositor: boot record for session {id} in page 0 of the ring window (arena run 0x{arena_run:016x}, \
@@ -701,7 +811,7 @@ impl PendingRings {
         let ids = ProtocolIds::new(1, sv_proto::PROTOCOL_HASH);
         let control = Arc::new(Control::create(region, self.geometry, ids, 1).map_err(|e| e.to_string())?);
         control.stamp_epoch().map_err(|e| e.to_string())?;
-        *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+        publish_shared(&control);
         let reader = match self.bell {
             Some(b) => {
                 println!(
@@ -788,6 +898,10 @@ pub fn open_bell_port(name: &str) -> std::io::Result<sv_transport::vdoorbell::Po
     }
     #[cfg(windows)]
     {
+        // §111.8: the broker opens the port and moves it here.
+        if let Some(p) = wc_broker::client::lend::port(name, "compositor") {
+            return Ok(sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)));
+        }
         sv_transport::winpipe::open_virtio_port(name, 500)
             .map(|p| sv_transport::vdoorbell::PortHandle::Pipe(Arc::new(p)))
             .map_err(|e| std::io::Error::other(format!("{e}")))
@@ -819,7 +933,7 @@ pub fn over_ivshmem(id: u32, port: Option<sv_transport::vdoorbell::PortHandle>) 
     control.stamp_epoch().map_err(|e| e.to_string())?;
     let control = Arc::new(control);
     // §105: the session's service threads (control, sound) use the same region.
-    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&control));
+    publish_shared(&control);
     let reader = match port {
         Some(port) => {
             let (reader, writer) = port.split().map_err(|e| e.to_string())?;
@@ -944,6 +1058,10 @@ pub const SLOTS_PER_SESSION: usize = 28;
 
 pub const QUARANTINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// §107.10: how long a feed may be connected without the client connection
+/// it serves before [`RingLink::pump`] closes it.
+pub const ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 static QUARANTINED: std::sync::Mutex<Vec<(u32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
 
 /// Keep `slot` from being recycled for [`QUARANTINE`].
@@ -959,6 +1077,41 @@ pub fn quarantined(slot: u32) -> bool {
     let now = std::time::Instant::now();
     q.retain(|(_, until)| *until > now);
     q.iter().any(|(s, _)| *s == slot)
+}
+
+/// §107.11: the slots a thread of this process reads outside the Wayland
+/// thread's links: a session's control, sound, arena and hostint channels.
+/// [`RingLink::reap`] never recycles one of them, whatever its quarantine
+/// says, so a slot cannot mean somebody else's connection while an old
+/// reader of it is still running. One entry per [`SlotReader`].
+static READERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// A thread's claim to read `slot`, held for as long as it may touch the
+/// slot's ring, and released when it is dropped.
+#[derive(Debug)]
+pub struct SlotReader {
+    slot: u32,
+}
+
+impl SlotReader {
+    pub fn new(slot: u32) -> SlotReader {
+        READERS.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        SlotReader { slot }
+    }
+}
+
+impl Drop for SlotReader {
+    fn drop(&mut self) {
+        let mut r = READERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = r.iter().position(|s| *s == self.slot) {
+            r.swap_remove(i);
+        }
+    }
+}
+
+/// Whether a thread still holds a [`SlotReader`] for `slot`.
+pub fn has_reader(slot: u32) -> bool {
+    READERS.lock().unwrap_or_else(|e| e.into_inner()).contains(&slot)
 }
 
 /// The ring region's geometry for the ivshmem tail: §107's 64 slots when this
@@ -978,5 +1131,73 @@ mod quarantine_tests {
         super::quarantine(61);
         assert!(super::quarantined(61));
         assert!(!super::quarantined(62));
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+    use sv_transport::wlbytes::{feed_owner, with_session};
+
+    fn link_pair() -> (RingLink, Control) {
+        let g = Geometry::small();
+        let r = Arc::new(sv_transport::region::SharedRegion::heap(g.control_size as usize).unwrap());
+        let ids = ProtocolIds::new(1, 2);
+        let owner = Control::create(Arc::clone(&r), g, ids, 1).unwrap();
+        (RingLink::over(Arc::new(owner)), Control::attach(r, ids).unwrap())
+    }
+
+    /// §107.10: a feed is a client to smithay and nothing more. It does not
+    /// count as a session's connection, and once the connection it serves
+    /// has gone it is closed even if its proxy never closes it -- the wcns
+    /// session of 2026-10-19 that stayed up past its linger for ever.
+    #[test]
+    fn a_feed_keeps_no_session_up_and_does_not_outlive_its_client() {
+        let (mut rl, proxy) = link_pair();
+        let app = ByteChannel::claim(&proxy, with_session(5, 0)).unwrap();
+        let icons = ByteChannel::claim(&proxy, with_session(feed_owner(5, false), 0)).unwrap();
+        let mut accepted = rl.accept();
+        accepted.sort_by_key(|a| a.0);
+        let feeds: Vec<bool> = accepted.iter().map(|a| a.3).collect();
+        assert_eq!(feeds, [false, true], "the connection, then its feed");
+        assert_eq!(rl.connections_by_session().get(&0), Some(&1), "the feed is not counted");
+
+        // The application goes, as a proxy ends a connection.
+        let mut app = app;
+        app.write_eof().unwrap();
+        app.kill(&proxy).unwrap();
+        rl.pump();
+        rl.reap();
+        assert_eq!(rl.connections_by_session().get(&0), None);
+        assert_eq!(rl.links.len(), 1, "the feed is still within its grace");
+
+        std::thread::sleep(ORPHAN_GRACE + std::time::Duration::from_millis(50));
+        rl.pump();
+        assert!(rl.links.is_empty(), "the feed outlived its client and was closed");
+        // And its proxy is told: the end of stream, and the slot marked dead.
+        let mut icons = icons;
+        let mut buf = [0u8; 8];
+        assert_eq!(icons.read(&mut buf).unwrap(), ReadOutcome::Eof);
+        assert_eq!(
+            proxy.ring_state(icons.slot()).unwrap(),
+            sv_transport::control::RingState::Dead
+        );
+    }
+
+    /// A feed whose client is still connected is left alone, however long.
+    #[test]
+    fn a_feed_of_a_live_client_stays() {
+        let (mut rl, proxy) = link_pair();
+        let _app = ByteChannel::claim(&proxy, with_session(8, 0)).unwrap();
+        let _clip = ByteChannel::claim(&proxy, with_session(feed_owner(8, true), 0)).unwrap();
+        // Another client's connection does not make this feed's.
+        let _other = ByteChannel::claim(&proxy, with_session(9, 0)).unwrap();
+        // Held: they are smithay's ends, and dropping one is a disconnect.
+        let accepted = rl.accept();
+        assert_eq!(accepted.len(), 3);
+        std::thread::sleep(ORPHAN_GRACE + std::time::Duration::from_millis(50));
+        rl.pump();
+        assert_eq!(rl.links.len(), 3);
+        assert_eq!(rl.connections_by_session().get(&0), Some(&2));
     }
 }

@@ -10,6 +10,8 @@ description = "App-side daemon: owns the extent's descriptor, hands the fd and t
 sv-transport = { workspace = true }
 sv-arena = { workspace = true }
 sv-wire = { workspace = true }
+# §105.14: the ivshmem header, which names the rings the hub rings directly.
+wc-handle = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The stamped page record, defined once and shared with the guest half. design.md
@@ -22,3 +24,6 @@ arena-record = { path = "../arena-record" }
 # Stitching a scattered extent into one contiguous view is `mmap(MAP_FIXED)` per
 # run, which has no safe spelling.
 libc = { workspace = true }
+# waycompose-design.md §111.10: the GPU BAR (`--region broker:ID`) and the
+# doorbell hub (`--cold-bell broker:sv-hub`) through the broker.
+wc-broker = { workspace = true }
