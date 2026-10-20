@@ -12,7 +12,7 @@ index dea6f78..b124b66 100644
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index e878fa6..09ac00a 100644
+index e878fa6..abcd633 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
 @@ -17,6 +17,7 @@
@@ -86,7 +86,7 @@ index e878fa6..09ac00a 100644
      /* Close child's end of socketpair in parent */
      close(sock_fds[1]);
      int ipc_sock = sock_fds[0];
-@@ -2278,24 +2297,34 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -2278,24 +2297,39 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          close(ipc_sock);
          return -LINUX_ENOMEM;
      }
@@ -97,19 +97,24 @@ index e878fa6..09ac00a 100644
       * The shm fd is kept open so subsequent forks can also use COW.
       * The child has its own MAP_PRIVATE view of the same file. */
  
++    /* Retain a separate writer before committing the reader to the table.
++     * Another guest waiter may collect a crashed child and close/reuse its fd. */
++    int run_fd=dup(ipc_sock);
++    if (run_fd<0) { close(ipc_sock); return -LINUX_ENOMEM; }
      /* Step 6: Record child in process table */
 -    proc_register_child(child_host_pid, child_guest_pid);
 +    if (proc_register_child_status(child_host_pid,child_guest_pid,ipc_sock)<0) {
-+        close(ipc_sock);
++        close(run_fd); close(ipc_sock);
 +        return -LINUX_EAGAIN;
 +    }
 +    unregistered_child=0; /* The process table now owns its identity/channel. */
 +    uint32_t run=IPC_MAGIC_RUN;
-+    if (ipc_write_all(ipc_sock,&run,sizeof(run))<0) {
++    if (ipc_write_all(run_fd,&run,sizeof(run))<0) {
 +        /* The committed child remains waitable even if its host setup failed.
 +         * EOF releases a child still waiting on RUN; keep the read half for status. */
-+        shutdown(ipc_sock,SHUT_WR);
++        shutdown(run_fd,SHUT_WR);
 +    }
++    close(run_fd);
  
      /* Step 7: For CLONE_VFORK, wait until child exits or execs.
       * Since we can't detect exec, just wait for child to exit for now.
