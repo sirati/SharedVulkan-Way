@@ -14,7 +14,7 @@ term_probe() {
   local pids
   pids=$(vm 'sudo -n /bin/ps -axo pid=') || return 2
   awk -v pid="$1" '
-    NF != 1 || $1 !~ /^[1-9][0-9]*$/ { bad = 1 }
+    NF != 1 || $1 !~ /^[0-9]+$/ { bad = 1 }
     $1 == pid { found = 1 }
     END { if (bad || NR == 0) exit 2; print found ? "alive" : "exited" }
   ' <<<"$pids"

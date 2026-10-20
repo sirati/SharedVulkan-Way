@@ -27,7 +27,7 @@ run_case() (
           sudo_error) return 1 ;;
           malformed) echo unexpected ;;
           dead_replacement) echo 1 ;;
-          *) printf '1\n200\n' ;;
+          *) printf '0\n1\n200\n' ;;
         esac ;;
       *) echo "unexpected command: $*" >&2; return 99 ;;
     esac
