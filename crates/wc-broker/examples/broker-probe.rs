@@ -57,6 +57,41 @@ mod win {
     pub fn run(a: &[String]) -> Result<(), String> {
         let arg = |i: usize| a.get(i).cloned().unwrap_or_default();
         match arg(0).as_str() {
+            "sentinel-write" | "sentinel-read" => {
+                let mut c = client("raw-bar-sentinel")?;
+                let h = c.device(&arg(1)).map_err(|e| e.to_string())?;
+                // SAFETY: the broker moved an unmapped ivshmem device here.
+                let d =
+                    unsafe { wc_handle::IvshmemDevice::from_raw(h.into_raw_handle() as _, arg(1)) };
+                let (view, size, _) =
+                    wc_handle::map_ivshmem_device(d).map_err(|e| e.to_string())?;
+                let marker = b"wc-private-clone-prior-user-sentinel";
+                let offset = 65536;
+                if size < (offset + marker.len()) as u64 {
+                    return Err("BAR too short".into());
+                }
+                if arg(0) == "sentinel-write" {
+                    // SAFETY: checked above; this probe is only for a private
+                    // clone with no compositor or host/GPU writer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            marker.as_ptr(),
+                            view.ptr().cast_mut().add(offset),
+                            marker.len(),
+                        )
+                    };
+                    println!("RESULT sentinel-written size={size}");
+                } else {
+                    // SAFETY: checked above; no private-clone writer is live.
+                    let found =
+                        unsafe { std::slice::from_raw_parts(view.ptr().add(offset), marker.len()) };
+                    println!(
+                        "RESULT prior-user-sentinel-visible={} size={size}",
+                        found == marker
+                    );
+                }
+                Ok(())
+            }
             "hold" => {
                 let mut c = client("probe")?;
                 let t = Instant::now();

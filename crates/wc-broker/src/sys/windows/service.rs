@@ -14,6 +14,8 @@
 //!                        repeated; without any, the four of a waycompose guest
 //!   --keys DIR           the installations' keys (C:\ProgramData\waycompose\keys)
 //!   --state DIR          the broker's own files (C:\ProgramData\waycompose)
+//!                        raw-device-owners.txt binds PnP instance IDs to reviewed SIDs;
+//!                        absent/untrusted policy reserves all raw BARs
 //!   --no-acl             leave the devices' descriptors alone
 //!   --budget-mib N       the most region memory held at once
 //!   --holder-pipe NAME   the holder's pipe (\\.\pipe\waycompose-broker-holder)
@@ -144,6 +146,87 @@ pub fn secure_dir(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Read through one exclusively held handle and require a privileged owner
+/// plus the exact protected SYSTEM/Administrators DACL. Merely residing in
+/// ProgramData does not make a pre-existing user-owned file authoritative.
+fn read_raw_owners(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .access_mode(0x8000_0000 | 0x0002_0000)
+        .share_mode(0)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let fields = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut sd = std::ptr::null_mut();
+    // SAFETY: live file handle with READ_CONTROL and descriptor out-pointer.
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            fields,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if result != 0 {
+        return Err(format!("raw owner security query: {result}"));
+    }
+    let mut text = std::ptr::null_mut();
+    // SAFETY: descriptor returned above and live string out-pointer.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            1,
+            fields,
+            &mut text,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: allocated by GetSecurityInfo.
+    unsafe { LocalFree(sd) };
+    if ok == 0 {
+        return Err("raw owner security conversion failed".into());
+    }
+    let mut n = 0;
+    // SAFETY: conversion returned a terminated UTF-16 string.
+    while unsafe { *text.add(n) } != 0 {
+        n += 1;
+    }
+    // SAFETY: measured above, allocated by conversion and freed once.
+    let descriptor = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, n) });
+    unsafe { LocalFree(text.cast()) };
+    if ![
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+        "O:SYD:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+    ]
+    .contains(&descriptor.as_str())
+    {
+        return Err(format!(
+            "untrusted raw-device ownership file security: {descriptor}"
+        ));
+    }
+    if file.metadata().map_err(|e| e.to_string())?.len() >= 1024 * 1024 {
+        return Err("raw-device ownership file too large".into());
+    }
+    let mut text = String::new();
+    file.take(1024 * 1024)
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
 /// Start everything and serve until the process ends.
 fn serve(a: &Args) -> Result<(), String> {
     let me = super::ident::current_user().unwrap_or_default();
@@ -152,9 +235,7 @@ fn serve(a: &Args) -> Result<(), String> {
     if system {
         // The keys move here from the users' install directories (§111.8):
         // only SYSTEM and Administrators may read them.
-        if let Err(e) = secure_dir(&a.state).and_then(|()| secure_dir(&a.keys)) {
-            log(&format!("WARNING: {e}"));
-        }
+        secure_dir(&a.state).and_then(|()| secure_dir(&a.keys))?;
     }
     if a.acl {
         for l in acl::secure(&a.devices, &a.state) {
@@ -163,7 +244,62 @@ fn serve(a: &Args) -> Result<(), String> {
     } else {
         log("--no-acl: the devices' descriptors are left alone");
     }
-    let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?;
+    // Missing, unreadable or corrupt policy never becomes first-claim. Keep
+    // ports/signing available while reserving every unbound raw BAR.
+    let owners = read_raw_owners(&a.state.join("raw-device-owners.txt"))
+        .and_then(|s| crate::raw_device::bindings(&s));
+    if let Err(e) = &owners {
+        log(&format!("raw BAR lending disabled: {e}"));
+    }
+    let mut paths = std::collections::BTreeMap::new();
+    let mut devices = Vec::new();
+    for d in &a.devices {
+        let allow = match &d.loc {
+            DeviceLoc::Port(_) => Allow::AnyUser,
+            DeviceLoc::IvshmemSlot(_) => {
+                let found = acl::find(d).map_err(|e| e.to_string())?;
+                let owner = found
+                    .as_ref()
+                    .and_then(|f| {
+                        owners
+                            .as_ref()
+                            .ok()
+                            .and_then(|o| o.get(&f.instance.to_ascii_lowercase()))
+                    })
+                    .cloned();
+                if let (Some(f), Some(owner)) = (found, owner) {
+                    // A policy file cannot compensate for a device that a
+                    // desktop user can open directly. Failed/unknown ACL
+                    // installation must never enable a new broker grant.
+                    if acl::live(&f.live).as_deref() != Ok(acl::DEVICE_SDDL)
+                        || acl::property(&f.instance).ok().flatten().as_deref() != Some(acl::DEVICE_SDDL)
+                    {
+                        log(&format!("raw device {} reserved: device ACL protection is unknown", d.name));
+                        devices.push(DeviceSpec { name: d.name.clone(), allow: Allow::Users(Vec::new()) });
+                        continue;
+                    }
+                    paths.insert(d.name.clone(), f.live);
+                    Allow::Users(vec![owner])
+                } else {
+                    log(&format!(
+                        "raw device {} reserved: no reviewed physical-device SID binding",
+                        d.name
+                    ));
+                    Allow::Users(Vec::new())
+                }
+            }
+            // Arbitrary paths can alias physical memory and bypass slot
+            // ownership. They remain available only to explicit library
+            // test brokers, never the installed service.
+            DeviceLoc::Path(_) => Allow::Users(Vec::new()),
+        };
+        devices.push(DeviceSpec {
+            name: d.name.clone(),
+            allow,
+        });
+    }
+    let platform = Windows::bind(&a.pipe, &a.pipe_sddl, a.devices.clone()).map_err(|e| format!("pipe {}: {e}", a.pipe))?
+        .with_raw_device_paths(paths);
     let platform = if a.holder {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let spawn = super::holder::Spawn {
@@ -182,7 +318,6 @@ fn serve(a: &Args) -> Result<(), String> {
         "large pages: {}",
         if platform.large_pages() { "SeLockMemoryPrivilege held" } else { "not available (alloc ... large is refused)" }
     ));
-    let devices = a.devices.iter().map(|d| DeviceSpec { name: d.name.clone(), allow: Allow::AnyUser }).collect();
     let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
         ^ (u64::from(std::process::id()) << 40);
     let broker = Broker::new(
