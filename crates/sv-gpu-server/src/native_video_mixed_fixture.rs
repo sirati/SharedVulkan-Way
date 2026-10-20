@@ -3,6 +3,8 @@
 //! for native-video-fixture. Literal bounds and no shader loop keep work fixed
 //! even if push-constant restoration fails. No product payload copy.
 use super::*;
+#[path = "native_video_render_secondary_fixture.rs"]
+mod render_secondary;
 const BUFFERS: [u64; 3] = [180, 181, 182];
 const SHADER: u64 = 183;
 const SET_LAYOUT: u64 = 184;
@@ -26,6 +28,7 @@ pub(super) struct Prepared {
     pipeline: bool,
     queries: bool,
     query_pools: usize,
+    render_secondary: Option<render_secondary::Prepared>,
 }
 impl Prepared {
     pub(super) fn prepare(rpc: &mut sv_gpu_entry::Forward<GpuServer>) -> Result<Self, String> {
@@ -39,6 +42,7 @@ impl Prepared {
             pipeline: false,
             queries: std::env::args().any(|a| a == "--mixed-queries"),
             query_pools: 0,
+            render_secondary: None,
         };
         if let Err(error) = value.prepare_inner(rpc) {
             let cleanup = unsafe { value.cleanup_after_retirement(rpc) };
@@ -341,6 +345,12 @@ impl Prepared {
                 self.query_pools += 1;
             }
         }
+        if std::env::args().any(|a| a == "--mixed-render-secondary") {
+            self.render_secondary = Some(render_secondary::Prepared::prepare(
+                rpc,
+                next.max(source_bytes),
+            )?);
+        }
         Ok(())
     }
     pub(super) fn record_before_decode(
@@ -348,6 +358,9 @@ impl Prepared {
         rpc: &mut sv_gpu_entry::Forward<GpuServer>,
         cb: u64,
     ) -> Result<(), String> {
+        if let Some(render) = &self.render_secondary {
+            render.record_before_decode(rpc, cb)?;
+        }
         if self.queries {
             for (id, count) in [(OCCLUSION, 1), (TIMESTAMPS, 2)] {
                 wire(rpc.cmd_reset_query_pool(p::VkCmdResetQueryPoolArgs {
@@ -456,7 +469,17 @@ impl Prepared {
             vk::PipelineStageFlags::HOST,
             vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE,
             vk::AccessFlags::HOST_READ,
-        )
+        )?;
+        if let Some(render) = &self.render_secondary {
+            render.record_after_decode(rpc, cb)?;
+        }
+        Ok(())
+    }
+    pub(super) fn verify_recording(&self, shared: &Shared, primary: u64) -> Result<(), String> {
+        if let Some(render) = &self.render_secondary {
+            render.verify_recording(shared, primary)?;
+        }
+        Ok(())
     }
     /// Call only after the existing controller observes the original user fence.
     pub(super) fn verify(&self, shared: &Shared) -> Result<(), String> {
@@ -480,6 +503,9 @@ impl Prepared {
                     ));
                 }
             }
+        }
+        if let Some(render) = &self.render_secondary {
+            render.verify(shared)?;
         }
         println!(
             "mixed compute_after_decode=true rebind_after_decode=false dispatches=1 workgroups=4 shader_loops=0 words=1024 payload_words=960 copy_bytes=4096 original_arena=true header_canaries=true"
@@ -537,6 +563,9 @@ impl Prepared {
         Ok(())
     }
     pub(super) fn resource_report(&self) {
+        if let Some(render) = &self.render_secondary {
+            render.resource_report();
+        }
         println!(
             "mixed_query_resources query_pools={} occlusion_queries={} timestamp_queries={}",
             self.query_pools,
@@ -554,6 +583,11 @@ impl Prepared {
         &self,
         rpc: &mut sv_gpu_entry::Forward<GpuServer>,
     ) -> Result<(), String> {
+        if let Some(render) = &self.render_secondary {
+            unsafe {
+                render.cleanup_after_retirement(rpc)?;
+            }
+        }
         for &id in &[OCCLUSION, TIMESTAMPS][..self.query_pools] {
             wire(rpc.destroy_query_pool(p::VkDestroyQueryPoolArgs {
                 device: p::VkDevice(DEVICE),

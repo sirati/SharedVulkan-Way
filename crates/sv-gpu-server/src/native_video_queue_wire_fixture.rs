@@ -494,7 +494,23 @@ pub(super) fn prepare() -> Result<Fixture, String> {
     } else {
         None
     };
-    record(&mut rpc, payload.len() as u64, mixed.as_deref())?;
+    let recorded =
+        record(&mut rpc, payload.len() as u64, mixed.as_deref()).and_then(|()| match &mixed {
+            Some(mixed) => mixed.verify_recording(&shared, COMMAND),
+            None => Ok(()),
+        });
+    if let Err(error) = recorded {
+        // No submission has occurred. Prepared helpers deliberately have no
+        // Drop because only this caller can prove the preaccept disposition.
+        if let Some(mixed) = &mixed {
+            if let Err(cleanup) = unsafe { mixed.cleanup_after_retirement(&mut rpc) } {
+                return Err(format!(
+                    "{error}; mixed recording preaccept cleanup: {cleanup}"
+                ));
+            }
+        }
+        return Err(error);
+    }
     // Test diagnostics resolve canonical owners only after wire recording has
     // completed. These lookups never mutate Plans or resource metadata.
     let (destination, setup, source, pool) = {
