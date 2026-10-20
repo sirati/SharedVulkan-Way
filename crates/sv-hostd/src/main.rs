@@ -66,7 +66,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve (--region <file>|--region-device <broker-name> --region-bytes N) --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock>|--bell-device <broker-name>] [--bell-hub <path>] [--clients N] [--drm-services <sock>]\n                \
                  (--cold <sock>: the TCP cold path, debug only)\n  \
-                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock>[,rings=<shm file>] [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
+                 sv-hostd bell-hub (--port <chardev sock|dev:NAME>=<hub sock>|--broker-port <device name>=<hub sock>)[,rings=<shm file>] [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -1595,20 +1595,26 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("bell-hub: inherited {} descriptor(s) from the previous run: {names:?}", names.len());
     }
     let mut hubs = Vec::new();
+    let mut broker_owners = Vec::new();
     for (i, a) in args.iter().enumerate() {
-        if a != "--port" {
+        if a != "--port" && a != "--broker-port" {
             continue;
         }
-        let spec = args.get(i + 1).ok_or("--port wants UPSTREAM=HUB")?;
-        let (up, at) = spec.split_once('=').ok_or("--port wants UPSTREAM=HUB")?;
+        let spec = args.get(i + 1).ok_or("bell port wants UPSTREAM=HUB")?;
+        let (up, at) = spec.split_once('=').ok_or("bell port wants UPSTREAM=HUB")?;
+        let broker_device = a == "--broker-port";
+        if broker_device && keep {
+            return Err("broker-port needs its live broker connection; descriptor-store restart is unsupported".into());
+        }
         // §105.14: `,rings=FILE` names the shared-memory file whose rings this
         // port's bytes ring; the hub then wakes their waiters itself.
         let (at, rings) = match at.split_once(",rings=") {
             Some((a, r)) => (a, Some(r)),
             None => (at, None),
         };
+        let broker_name = up;
         let up = sv_hostd::bellhub::Upstream::parse(up);
-        let name = up.name();
+        let name = if broker_device { format!("broker-{broker_name}") } else { up.name() };
         let listen_key = format!("{name}-listen");
         let l = match kept.remove(&listen_key) {
             // The same listening socket as before the restart: a client that
@@ -1623,8 +1629,23 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let inherited = kept.remove(&format!("{name}-up"));
-        eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
-        let hub = sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?;
+        if broker_device {
+            eprintln!("bell-hub {name}: serving broker-lent device {broker_name} on {at} (0600)");
+        } else {
+            eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
+        }
+        let hub = if broker_device {
+            if inherited.is_some() { return Err("broker-port cannot adopt a stored upstream fd".into()); }
+            let mut owner = wc_broker::client::Client::connect(&wc_broker::client::path())?;
+            owner.hello("wayland-bell-hub")?;
+            let file = std::fs::File::from(owner.device(broker_name)?);
+            let hub = sv_hostd::bellhub::run_port(&name,
+                sv_transport::vdoorbell::PortHandle::File(file), l)?;
+            broker_owners.push(owner);
+            hub
+        } else {
+            sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?
+        };
         if let Some(r) = rings {
             eprintln!("bell-hub {name}: rings the lanes of the rings in {r} itself (§105.14)");
             hub.set_direct_rings(r);
@@ -1647,7 +1668,7 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         hubs.push(hub);
     }
     if hubs.is_empty() {
-        return Err("bell-hub needs at least one --port UPSTREAM=HUB".into());
+        return Err("bell-hub needs at least one --port or --broker-port UPSTREAM=HUB".into());
     }
     let _ = sv_hostd::sdfd::notify("READY=1");
     loop {
