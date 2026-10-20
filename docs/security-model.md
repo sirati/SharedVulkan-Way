@@ -1605,7 +1605,8 @@ lent and will reuse. What can go wrong, and what holds it:
     holder before any handles leave; failed persistence refuses the lease.
     Recovery validates a versioned checksum and every record. Unreadable,
     missing or malformed journals block the whole pool without overwriting
-    the journal or answering `UNMAPPED`. Production cannot disable durable
+    the journal or answering any table entry. A new state directory may
+    initialize only against an empty region table. Production cannot disable durable
     state, and old unversioned journals require a controlled migration;
   * every host mapper unmaps to `PROT_NONE`, so a stale pointer faults in its
     own process;

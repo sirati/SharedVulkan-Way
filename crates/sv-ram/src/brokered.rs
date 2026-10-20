@@ -443,10 +443,6 @@ impl BrokerMappers {
         Ok(id)
     }
 
-    /// After a restart of the daemon: publish again what the previous run
-    /// published and the table still holds (same region, same epoch), for
-    /// the previous run's holders to find again; it is answered `UNMAPPED`
-    /// only once they have all exited.
     /// A lost directory cannot prove there were no earlier transferred handles.
     /// Initialize only while the shared table has no live regions at all.
     fn initialize_empty(&mut self, peer: &Peer) {
@@ -461,6 +457,8 @@ impl BrokerMappers {
             }
     }
 
+    /// Republish matching durable records after restart. Previous holders
+    /// must all exit before the peer may answer UNMAPPED.
     pub fn inherit(&mut self, peer: &Peer) {
         if self.recovery_error.is_some() {
             return; // Recovery requires a trusted journal and a fresh daemon.
