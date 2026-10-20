@@ -299,6 +299,8 @@ if [ -n "$GECKODRIVER" ] && [ -n "$JQ" ]; then
       >"$RUN/support.json"
   fi
 fi
+# What the compositor put on its desktop, for a reader to judge.
+(xwd -root -silent -display ":$DISP" | magick xwd:- "$RUN/screen.png") 2>/dev/null
 wait $FF 2>/dev/null
 
 # ------------------------------------------------------------------ verdict ---
