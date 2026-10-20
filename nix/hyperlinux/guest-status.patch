@@ -12,7 +12,7 @@ index dea6f78..b124b66 100644
             syscall_internal.h syscall_fs.h syscall_io.h \
             syscall_poll.h syscall_fd.h syscall_inotify.h \
 diff --git a/src/fork_ipc.c b/src/fork_ipc.c
-index e878fa6..002ee2e 100644
+index e878fa6..09ac00a 100644
 --- a/src/fork_ipc.c
 +++ b/src/fork_ipc.c
 @@ -17,6 +17,7 @@
@@ -23,16 +23,32 @@ index e878fa6..002ee2e 100644
  #include "thread.h"          /* thread_alloc, thread_alloc_sp_el1, current_thread */
  #include "vdso.h"            /* vdso_build, vdso_publisher_start/stop */
  #include "hl_shared.h"
-@@ -1007,7 +1008,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+@@ -52,7 +53,8 @@
+ /* Magic values for IPC frame delimiters */
+ #define IPC_MAGIC_HEADER  0x484C464BU  /* "HLFK" */
+ #define IPC_MAGIC_SENTINEL 0x484C4F4BU /* "HLOK" */
+-#define IPC_VERSION       9            /* v8: transferable external shared views */
++#define IPC_VERSION       10           /* v10: explicit guest status and run commit */
++#define IPC_MAGIC_RUN     0x484C5255U   /* "HLRU" */
+ #define IPC_FD_HAS_OBJECT 1            /* ipc_fd_entry_t.pad: synthetic open-file follows */
+ #define IPC_FD_RECREATE_EPOLL 2        /* ipc_fd_entry_t.pad: epoll state follows */
+ 
+@@ -1007,7 +1009,13 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
          guest_destroy(&g);
          return 1;
      }
 -    close(ipc_fd);
++    /* A fork child cannot dispatch guest syscalls until its parent has
++     * committed a waitable identity and transferred ownership of this fd. */
++    uint32_t run;
++    if (ipc_read_all(ipc_fd,&run,sizeof(run))<0 || run!=IPC_MAGIC_RUN) {
++        close(ipc_fd); guest_destroy(&g); return 1;
++    }
 +    /* Keep ipc_fd private until final guest termination is reported. */
  
      /* The [vvar] time page is written only by the vDSO publisher thread,
       * which does not exist in a fork child (threads are not inherited). The
-@@ -1028,6 +1029,7 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
+@@ -1028,10 +1036,19 @@ int fork_child_main(int ipc_fd, int verbose, int timeout_sec) {
      int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec, 1 /* forked main */);
  
      vdso_publisher_stop();
@@ -40,7 +56,19 @@ index e878fa6..002ee2e 100644
      guest_destroy(&g);
      return exit_code;
  }
-@@ -1550,7 +1552,7 @@ static void *vm_clone_thread_run(void *arg) {
+ 
++/* Every error before process-table commit owns exactly this spawned host
++ * child. No guest thread can wait on it and it has not received RUN yet. */
++static void retire_unregistered_child(pid_t *pid) {
++    if (*pid<=0) return;
++    (void)kill(*pid,SIGKILL);
++    while (waitpid(*pid,NULL,0)<0 && errno==EINTR) {}
++}
++
+ /* ---------- sys_clone ---------- */
+ 
+ /* Linux clone flags */
+@@ -1550,7 +1567,7 @@ static void *vm_clone_thread_run(void *arg) {
      int64_t exited_tid=t->guest_tid;
      t->vm_exited = 1;
      thread_notify_exit_locked();
@@ -49,7 +77,16 @@ index e878fa6..002ee2e 100644
      pthread_cond_broadcast(&t->ptrace_cond);
      pthread_mutex_unlock(lock);
  
-@@ -2278,24 +2280,30 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+@@ -1681,6 +1698,8 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
+         return -LINUX_ENOMEM;
+     }
+ 
++    pid_t unregistered_child __attribute__((cleanup(retire_unregistered_child)))=child_host_pid;
++
+     /* Close child's end of socketpair in parent */
+     close(sock_fds[1]);
+     int ipc_sock = sock_fds[0];
+@@ -2278,24 +2297,34 @@ static int64_t sys_clone_fork(hv_vcpu_t vcpu, guest_t *g, uint64_t flags,
          close(ipc_sock);
          return -LINUX_ENOMEM;
      }
@@ -64,10 +101,14 @@ index e878fa6..002ee2e 100644
 -    proc_register_child(child_host_pid, child_guest_pid);
 +    if (proc_register_child_status(child_host_pid,child_guest_pid,ipc_sock)<0) {
 +        close(ipc_sock);
-+        /* Only this successfully spawned child is ours to retire. */
-+        kill(child_host_pid,SIGKILL);
-+        while (waitpid(child_host_pid,NULL,0)<0 && errno==EINTR) {}
 +        return -LINUX_EAGAIN;
++    }
++    unregistered_child=0; /* The process table now owns its identity/channel. */
++    uint32_t run=IPC_MAGIC_RUN;
++    if (ipc_write_all(ipc_sock,&run,sizeof(run))<0) {
++        /* The committed child remains waitable even if its host setup failed.
++         * EOF releases a child still waiting on RUN; keep the read half for status. */
++        shutdown(ipc_sock,SHUT_WR);
 +    }
  
      /* Step 7: For CLONE_VFORK, wait until child exits or execs.
