@@ -387,8 +387,8 @@ fn check_binding(backing: PhysicalBacking, b: &Binding) -> io::Result<()> {
     if b.source.host_device != backing.host_device
         || b.source.host_inode != backing.host_inode
         || b.source.bar_bytes != backing.bar_bytes
-        || b.grant_offset % 4096 != 0
-        || b.grant_length % 4096 != 0
+        || !b.grant_offset.is_multiple_of(4096)
+        || !b.grant_length.is_multiple_of(4096)
     {
         return Err(invalid("grant differs from retained physical BAR geometry"));
     }
