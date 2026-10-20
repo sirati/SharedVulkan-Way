@@ -37575,3 +37575,26 @@ the keeper holds it (§103.15).
 witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
 on testhost (nix-config). Without the guest build the old lease stands;
 without the unit the 20 s bound applies.
+
+**The QEMU cause and live recovery.** A configuration switch restarted the
+host's input-injection daemon. Its old evdev node disappeared while QEMU
+still held it open. `virtio_input_host_event` returned from `read` with
+`ENODEV` but left its fd handler registered, so the main loop repeatedly
+polled the dead device and starved vCPU requests for the BQL. The host
+configuration now has a staged patch that unregisters that handler on a
+permanent read error, and prevents switches from restarting the daemon.
+The QEMU patch takes effect at the next planned VM start.
+
+On 2026-10-20 the approved live recovery removed only the dead input PCI
+device through QMP, waited for `DEVICE_DELETED`, and re-added it against
+the current evdev node with the same device ID, PCI bus and slot. The VM
+process and desktop session stayed running. Main-thread CPU fell from
+99.8% to 3.2% over five-second samples. The replacement retained its BAR
+addresses, Windows reported its driver ready, and the guest consumed the
+input queue descriptors. Desktop input delivery still needs a visible
+check. This operation did not change the GPU or its power state.
+
+The following thirty-minute observation contained 13 complete GPU D0
+dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
+the busy-loop recovery under that workload. The process that triggers the
+periodic GPU wake remains unidentified.
