@@ -163,7 +163,7 @@ impl PlaneTextures {
             let mut query_ext = vk::PhysicalDeviceExternalImageFormatInfo::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::from_raw(iosurface::MTLTEXTURE));
             let query = vk::PhysicalDeviceImageFormatInfo2::default().push_next(&mut query_ext)
-                .format(format).image_type(vk::ImageType::TYPE_2D)
+                .format(format).ty(vk::ImageType::TYPE_2D)
                 .tiling(vk::ImageTiling::LINEAR).usage(vk::ImageUsageFlags::SAMPLED);
             let mut external_props = vk::ExternalImageFormatProperties::default();
             let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
