@@ -129,6 +129,9 @@ fn main() -> std::io::Result<()> {
         std::ptr::write_volatile(writable, 0x3d);
         std::ptr::write_volatile(writable.add(4096 + 100), 0x7b);
     }
+    // Complete CPU writes before observing the second mapping. Volatile alone
+    // is not a producer/consumer memory barrier for write-combined mappings.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     require(
         unsafe { std::ptr::read_volatile(readable) } == 0x3d
             && unsafe { std::ptr::read_volatile(readable.add(4096 + 100)) } == 0x7b,
