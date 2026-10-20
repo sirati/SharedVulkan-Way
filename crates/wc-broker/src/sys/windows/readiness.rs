@@ -140,6 +140,23 @@ mod tests {
     }
 
     #[test]
+    fn readiness_refuses_a_non_system_server_even_with_matching_pid() {
+        if ident::current_user().unwrap() == ident::SYSTEM_SID { return; }
+        let name = format!(r"\\.\pipe\wc-ready-sid-{}", std::process::id());
+        let endpoint = name.clone();
+        let (end, wait) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let listener = pipe::Listener::new(&endpoint, super::super::PIPE_SDDL).unwrap();
+            let _pipe = listener.accept().unwrap();
+            let _ = wait.recv();
+        });
+        let error = connect_private(&name, std::process::id(), ident::SYSTEM_SID).err().expect("non-SYSTEM server accepted");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        end.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn readiness_stalled_verified_private_server_has_a_bounded_io_deadline() {
         let name = format!(r"\\.\pipe\wc-ready-stall-{}", std::process::id());
         let endpoint = name.clone();
