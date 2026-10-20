@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/event.h>
+#define close hl_wc_socket_native_close
 #define RECORD_ATTR HL_WC_XATTR_PREFIX "seqpacket.record.v1"
 #define RECORD_MAGIC UINT64_C(0x5743534551523031)
 #define RIGHTS_MAX 64u
@@ -72,6 +74,41 @@ int hl_wc_seqpacket_pair(int pair[2]) {
 fail: {
     int saved = errno; close(pair[0]); close(pair[1]); errno = saved; return -1;
 }}
+/* Register the metadata vnode before retrying I/O. Shutdown publishes its
+ * marker and explicitly writes this inode, so no cross-process wake is lost. */
+static ssize_t record_io(hl_open_file_t *of, int fd, struct msghdr *message, int flags, int writing) {
+    int status = fcntl(fd, F_GETFL);
+    if (status < 0) return -1;
+    int nonblock = (flags & MSG_DONTWAIT) || (status & O_NONBLOCK);
+    int queue = -1, watch = -1;
+    ssize_t result;
+    for (;;) {
+        size_t capacity = message->msg_controllen;
+        result = hl_wc_socket_record_attempt(of, fd, message, flags, writing);
+        if (result >= 0 || nonblock || (errno != EAGAIN && errno != EWOULDBLOCK)) break;
+        message->msg_controllen = capacity;
+        if (queue < 0) {
+            watch = hl_wc_socket_state_watch(of);
+            if (watch < 0) break;
+            queue = kqueue();
+            if (queue < 0) break;
+            if (fcntl(queue, F_SETFD, FD_CLOEXEC) < 0) break;
+            struct kevent changes[2];
+            EV_SET(&changes[0], fd, writing ? EVFILT_WRITE : EVFILT_READ, EV_ADD, 0, 0, NULL);
+            EV_SET(&changes[1], watch, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE, 0, NULL);
+            if (kevent(queue, changes, 2, NULL, 0, NULL) < 0) break;
+            /* Shutdown can precede registration. Recheck before waiting. */
+            continue;
+        }
+        struct kevent event;
+        if (kevent(queue, NULL, 0, &event, 1, NULL) < 0) break;
+        if (event.flags & EV_ERROR) { errno = event.data ? (int)event.data : EIO; break; }
+    }
+    int saved = errno;
+    if (queue >= 0) close(queue);
+    if (watch >= 0) close(watch);
+    errno = saved; return result;
+}
 ssize_t hl_wc_seqpacket_send(hl_open_file_t *of, int fd, const struct msghdr *message, int flags) {
     if (flags & (MSG_PEEK | MSG_OOB) || message->msg_name || message->msg_namelen) {
         errno = EOPNOTSUPP; return -1;
@@ -115,10 +152,9 @@ ssize_t hl_wc_seqpacket_send(hl_open_file_t *of, int fd, const struct msghdr *me
     struct cmsghdr *c = CMSG_FIRSTHDR(&native);
     c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(count * sizeof(int));
     memcpy(CMSG_DATA(c), rights, count * sizeof(int));
-    ssize_t n = sendmsg(fd, &native, flags & ~(MSG_EOR | MSG_WAITALL));
+    ssize_t n = record_io(of, fd, &native, flags & ~(MSG_EOR | MSG_WAITALL), 1);
     if (n != 1) {
         if (n >= 0) errno = EIO;
-        else if (errno == EINVAL && hl_wc_socket_read_closed(of, 1)) errno = EPIPE;
         goto fail;
     }
     close(backing); return (ssize_t)size;
@@ -128,14 +164,13 @@ fail:
 ssize_t hl_wc_seqpacket_recv(hl_open_file_t *of, int fd, struct msghdr *message, int flags, int full_length) {
     /* Darwin MSG_PEEK does not externalize SCM_RIGHTS. Refuse before receive. */
     if (flags & (MSG_PEEK | MSG_OOB)) { errno = EOPNOTSUPP; return -1; }
-    if (hl_wc_socket_read_closed(of, 0)) { message->msg_flags = 0; message->msg_namelen = 0; message->msg_controllen = 0; return 0; }
     int rights[RIGHTS_MAX + 1]; unsigned count = 0;
     union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(rights))]; } ancillary;
     memset(&ancillary, 0, sizeof(ancillary));
     char token = 0; struct iovec iov = { &token, 1 };
     struct msghdr native = { .msg_iov = &iov, .msg_iovlen = 1,
         .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes) };
-    ssize_t n = recvmsg(fd, &native, flags & ~(MSG_WAITALL | MSG_EOR));
+    ssize_t n = record_io(of, fd, &native, flags & ~(MSG_WAITALL | MSG_EOR), 0);
     if (n < 0) return -1;
     message->msg_flags = 0; message->msg_namelen = 0;
     if (!n) { message->msg_controllen = 0; return 0; }

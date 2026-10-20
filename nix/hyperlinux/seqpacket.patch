@@ -952,6 +952,15 @@
  
  /* Single source of truth for releasing an fd's `.dir` handle by kind.
   *
+@@ -348,7 +354,7 @@
+ int hl_fd_dup_from(int oldfd, int minfd, int cloexec) {
+     hl_fd_ref_t ref;
+     if (minfd < 0 || minfd >= FD_TABLE_SIZE) return -LINUX_EINVAL;
+-    if (hl_fd_get(oldfd, &ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(oldfd, &ref) < 0) return -LINUX_EBADF;
+ 
+     int new_host = -1;
+     if (ref.host_fd >= 0) {
 @@ -405,22 +411,12 @@
          return -LINUX_ENOMEM;
      }
@@ -976,6 +985,15 @@
      hl_fd_put(&ref);
      if (hl_trace_on(HL_TRACE_FD))
          hl_trace(HL_TRACE_FD, "dup old=%d new=%d host=%d", oldfd, gfd, new_host);
+@@ -435,7 +431,7 @@
+     if (newfd < 0 || newfd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+ 
+     hl_fd_ref_t ref;
+-    if (hl_fd_get(oldfd, &ref) < 0) return -LINUX_EBADF;
++    if (hl_fd_get_pinned(oldfd, &ref) < 0) return -LINUX_EBADF;
+ 
+     int new_host = -1;
+     if (ref.host_fd >= 0) {
 @@ -465,6 +461,13 @@
          }
      }

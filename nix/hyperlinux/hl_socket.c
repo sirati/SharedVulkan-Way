@@ -19,11 +19,26 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stddef.h>
 #define ATTR HL_WC_XATTR_PREFIX "socket.v1"
 #define MAGIC UINT64_C(0x5743534f434b3031)
-typedef struct { uint64_t magic; _Atomic uint32_t passcred; _Atomic uint32_t seqpacket; uint64_t endpoints[2]; _Atomic uint32_t read_shutdown[2]; } shared_option;
+typedef struct { uint64_t magic; _Atomic uint32_t passcred; _Atomic uint32_t seqpacket; uint64_t endpoints[2]; _Atomic uint8_t read_shutdown[2]; } shared_option;
 typedef struct { int fd; shared_option *option; int side; } socket_state;
-static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t state_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+/* POSIX inode locks are process-owned and any close releases them. Every
+ * private-state close uses this same local mutex, including ancillary cleanup.
+ * The inode lock supplies interprocess exclusion and is released on death. */
+int hl_wc_socket_native_close(int fd) {
+    pthread_mutex_lock(&state_lock);
+    int result = close(fd), saved = errno;
+    pthread_mutex_unlock(&state_lock);
+    errno = saved; return result;
+}
+#define close hl_wc_socket_native_close
+static int pair_lock(socket_state *s, int type) {
+    struct flock lock = { .l_type = type, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1 };
+    return fcntl(s->fd, type == F_UNLCK ? F_SETLK : F_SETLKW, &lock);
+}
 static int stream_socket(int fd) {
     int type; socklen_t n = sizeof(type);
     struct sockaddr_storage addr; socklen_t len = sizeof(addr);
@@ -126,6 +141,14 @@ static int export_option(hl_open_file_t *of) {
     int result = s ? fcntl(s->fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (s && result < 0) result = -2;
     pthread_mutex_unlock(&state_lock);
+    return result;
+}
+/* Caller owns this private alias and must use native_close, because closing
+ * any alias would otherwise release an active process-owned inode lock. */
+int hl_wc_socket_state_watch(hl_open_file_t *of) {
+    int result = export_option(of);
+    if (result == -2) return -1;
+    if (result < 0) errno = EINVAL;
     return result;
 }
 int hl_wc_socket_export(int fd) {
@@ -367,21 +390,64 @@ int hl_wc_socket_read_closed(hl_open_file_t *of, int peer) {
         atomic_load_explicit(&s->option->read_shutdown[s->side ^ !!peer], memory_order_acquire);
     pthread_mutex_unlock(&state_lock); return result;
 }
+/* Each native attempt is nonblocking while holding the pair inode lock.
+ * A sender cannot commit after a receiver observes logical shutdown and an
+ * empty queue. Blocking callers release the lock before waiting for readiness. */
+ssize_t hl_wc_socket_record_attempt(hl_open_file_t *of, int native,
+    struct msghdr *message, int flags, int writing) {
+    pthread_mutex_lock(&state_lock);
+    socket_state *s = of ? of->socket_state : NULL;
+    if (!s || !atomic_load(&s->option->seqpacket)) {
+        pthread_mutex_unlock(&state_lock); errno = EINVAL; return -1;
+    }
+    if (pair_lock(s, F_WRLCK) < 0) {
+        int saved = errno; pthread_mutex_unlock(&state_lock); errno = saved; return -1;
+    }
+    ssize_t result;
+    if (writing && atomic_load_explicit(&s->option->read_shutdown[s->side ^ 1], memory_order_acquire)) {
+        result = -1; errno = EPIPE;
+    } else {
+        result = writing ? sendmsg(native, message, flags | MSG_DONTWAIT)
+                         : recvmsg(native, message, flags | MSG_DONTWAIT);
+        if (!writing && result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+            atomic_load_explicit(&s->option->read_shutdown[s->side], memory_order_acquire)) {
+            result = 0;
+        }
+    }
+    int saved = errno;
+    pair_lock(s, F_UNLCK);
+    pthread_mutex_unlock(&state_lock);
+    errno = saved; return result;
+}
 int hl_wc_socket_shutdown_pair(hl_open_file_t *of, int native, int how) {
     if (how < 0 || how > 2) { errno = EINVAL; return -1; }
-    if (how != SHUT_WR) {
-        pthread_mutex_lock(&state_lock);
-        socket_state *s = of ? of->socket_state : NULL;
-        if (!s || !atomic_load(&s->option->seqpacket)) { pthread_mutex_unlock(&state_lock); errno = EINVAL; return -1; }
-        /* This store is the logical read-shutdown linearization point.
-         * It survives dup/fork/exec/SCM_RIGHTS aliases. Darwin's native
-         * shutdown supplies wakeups and closes queued native rights. */
-        atomic_store_explicit(&s->option->read_shutdown[s->side], 1, memory_order_release);
-        pthread_mutex_unlock(&state_lock);
-        if (shutdown(native, SHUT_RD) < 0 && errno != ENOTCONN) return -1;
+    pthread_mutex_lock(&state_lock);
+    socket_state *s = of ? of->socket_state : NULL;
+    if (!s || !atomic_load(&s->option->seqpacket)) {
+        pthread_mutex_unlock(&state_lock); errno = EINVAL; return -1;
     }
-    /* Darwin's combined shutdown skips SHUT_WR if already read-closed.
-     * Separate idempotent halves preserve the Linux pair behavior. */
-    if (how != SHUT_RD && shutdown(native, SHUT_WR) < 0 && errno != ENOTCONN) return -1;
-    return 0;
+    if (pair_lock(s, F_WRLCK) < 0) {
+        int saved = errno; pthread_mutex_unlock(&state_lock); errno = saved; return -1;
+    }
+    /* Darwin SHUT_RD destroys queued records and their rights. Preserve the
+     * queue, mark logical shutdown, then let receives drain it before EOF. */
+    int result = 0;
+    if (how != SHUT_WR) {
+        /* A single-byte write both publishes the shared mmap marker and
+         * emits NOTE_WRITE. No committed store can precede a failed wake.
+         * Byte-sized flags avoid a partially visible multi-byte update.
+         * Darwin's coherent MAP_SHARED file mapping is the reader view;
+         * no native userspace stores compete with these kernel byte writes. */
+        uint8_t closed = 1;
+        ssize_t written;
+        do { written = pwrite(s->fd, &closed, sizeof(closed),
+            offsetof(shared_option, read_shutdown) + s->side); } while (written < 0 && errno == EINTR);
+        if (written != sizeof(closed)) { if (written >= 0) errno = EIO; result = -1; }
+    }
+    if (!result && how != SHUT_RD) result = shutdown(native, SHUT_WR);
+    if (result < 0 && errno == ENOTCONN) result = 0;
+    int saved = errno;
+    pair_lock(s, F_UNLCK);
+    pthread_mutex_unlock(&state_lock);
+    errno = saved; return result;
 }
