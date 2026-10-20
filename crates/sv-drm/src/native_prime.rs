@@ -115,8 +115,9 @@ impl Registry {
         owner.register(fd.try_clone_to_owned()?, canonical)?;
         Ok(owner)
     }
-    /// Call only after authenticating the native connection's uid and binding
-    /// its lifetime to the existing broker owner/run. No guest-supplied UID.
+    /// Transport callers authenticate the native connection UID first. This
+    /// owner controls token discovery only. Import consumers must separately
+    /// resolve section names through the existing broker-owned section table.
     pub fn owner(&self) -> io::Result<Owner> {
         let mut s = self.0.lock().map_err(|_| invalid("registry poisoned"))?;
         s.next = s
@@ -320,9 +321,10 @@ fn receive(stream: &mut UnixStream) -> io::Result<Option<(OwnedFd, [u8; REQUEST_
     stream.read_exact(&mut bytes[1..])?;
     Ok(Some((fd, bytes)))
 }
-/// Run in the existing native server's connection worker, after broker
-/// owner/run binding. Socket discovery/binding belongs to that server, not to
-/// this module. EOF revokes discovery. Existing imported guards remain valid.
+/// Run in the existing native server's UID-authenticated connection worker.
+/// Token discovery follows connection lifetime. This does not authorize the
+/// section name; the native consumer resolves it through the existing broker
+/// owner-generation table. EOF revokes discovery; imported guards survive.
 pub fn serve_connection(
     mut stream: UnixStream,
     expected_uid: libc::uid_t,
