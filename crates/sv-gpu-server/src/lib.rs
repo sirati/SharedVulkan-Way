@@ -97,3 +97,6 @@ pub(crate) mod native_video;
 
 #[cfg(target_os = "macos")]
 mod video_submit;
+
+#[cfg(any(target_os = "macos", test))]
+mod video_worker;

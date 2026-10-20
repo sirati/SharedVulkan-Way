@@ -26,6 +26,7 @@ pub(crate) trait DecodeExecutor {
     fn decode_completed(&mut self, job: &Decode) -> Result<(), vk::Result>;
 }
 
+/// Run only on the device submission worker, never in the submitting RPC.
 /// Execute supported video work in order, between the original wait and signal
 /// operations. Each native segment completes before the next external producer
 /// starts. Each external producer completes before subsequent native work can
