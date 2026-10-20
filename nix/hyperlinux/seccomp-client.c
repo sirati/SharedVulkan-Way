@@ -6,6 +6,7 @@
 #include <linux/seccomp.h>
 #include <linux/audit.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <ucontext.h>
@@ -67,7 +68,110 @@ static void *worker(void *unused) {
     errno=0; long r=syscall(SYS_getppid);
     return (void *)(long)(before==0 && r==-1 && errno==77 && prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
 }
+static void *status_worker(void *unused) {
+    (void)unused;
+    atomic_store(&stage,1);
+    for (;;) sched_yield();
+    return NULL;
+}
+static atomic_int wait_ready,wait_winners,wait_losers,wait_errors;
+static void *consuming_waiter(void *opaque) {
+    pid_t child=*(pid_t *)opaque;
+    atomic_fetch_add(&wait_ready,1);
+    int status; pid_t ret;
+    do { ret=waitpid(child,&status,0); } while (ret<0 && errno==EINTR);
+    if (ret==child && WIFEXITED(status) && WEXITSTATUS(status)==159)
+        atomic_fetch_add(&wait_winners,1);
+    else if (ret<0 && errno==ECHILD) atomic_fetch_add(&wait_losers,1);
+    else atomic_fetch_add(&wait_errors,1);
+    return NULL;
+}
+static int concurrent_wait_tests(void) {
+    for (int i=0;i<8;++i) {
+        int fds[2]; CHECK(pipe(fds)==0);
+        atomic_store(&wait_ready,0); atomic_store(&wait_winners,0);
+        atomic_store(&wait_losers,0); atomic_store(&wait_errors,0);
+        pid_t child=fork(); CHECK(child>=0);
+        if (!child) {
+            close(fds[1]); char c;
+            if (read(fds[0],&c,1)!=1) _exit(95);
+            close(fds[0]); _exit(159);
+        }
+        close(fds[0]);
+        pthread_t a,b;
+        CHECK(pthread_create(&a,NULL,consuming_waiter,&child)==0);
+        CHECK(pthread_create(&b,NULL,consuming_waiter,&child)==0);
+        while (atomic_load(&wait_ready)!=2) sched_yield();
+        CHECK(write(fds[1],"x",1)==1); close(fds[1]);
+        CHECK(pthread_join(a,NULL)==0 && pthread_join(b,NULL)==0);
+        CHECK(atomic_load(&wait_winners)==1 && atomic_load(&wait_losers)==1 && !atomic_load(&wait_errors));
+    }
+    puts("seccomp concurrent waits: eight children each consumed exactly once by two waiters");
+    return 0;
+}
+static int wait_status_tests(const char *self) {
+    for (int mode=0;mode<11;++mode) {
+        pid_t child=mode==10 ? (pid_t)syscall(SYS_clone,(unsigned long)CLONE_VFORK|SIGCHLD,0,0,0,0) : fork();
+        CHECK(child>=0);
+        if (!child) {
+            if (mode==0) _exit(159);
+            if (mode==8) _exit(143);
+            if (mode==9) {
+                pthread_t t; CHECK(pthread_create(&t,NULL,killed_worker,NULL)==0);
+                CHECK(pthread_join(t,NULL)==0 && atomic_load(&stage)==1);
+                _exit(159);
+            }
+            if (mode==6) { raise(SIGTERM); _exit(92); }
+            CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
+            if (mode==3) {
+                struct sigaction a={0}; a.sa_handler=SIG_IGN;
+                CHECK(sigaction(SIGSYS,&a,NULL)==0);
+            }
+            if (mode==4) {
+                sigset_t set; sigemptyset(&set); sigaddset(&set,SIGSYS);
+                CHECK(pthread_sigmask(SIG_BLOCK,&set,NULL)==0);
+            }
+            unsigned action=mode==1 || mode==7 || mode==10 ? SECCOMP_RET_KILL_PROCESS :
+                            mode==5 ? SECCOMP_RET_KILL_THREAD : SECCOMP_RET_TRAP|73;
+            CHECK(filter(SYS_getppid,action,0)==0);
+            if (mode==1) {
+                pthread_t t; CHECK(pthread_create(&t,NULL,status_worker,NULL)==0);
+                while (!atomic_load(&stage)) sched_yield();
+            }
+            if (mode==7) {
+                char *args[]={(char *)self,"--status-exec-child",NULL};
+                execv(self,args); _exit(93);
+            }
+            syscall(SYS_getppid);
+            _exit(94);
+        }
+        int status;
+        if (mode==2) {
+            siginfo_t info={0};
+            CHECK(waitid(P_PID,(id_t)child,&info,WEXITED|WNOWAIT)==0);
+            CHECK(info.si_pid==child && info.si_status==SIGSYS &&
+                  (info.si_code==CLD_KILLED || info.si_code==CLD_DUMPED));
+            memset(&info,0,sizeof(info));
+            CHECK(waitid(P_PID,(id_t)child,&info,WEXITED|WNOWAIT)==0 &&
+                  info.si_pid==child && info.si_status==SIGSYS);
+        }
+        CHECK(waitpid(mode==1 ? -1 : child,&status,0)==child);
+        if (mode==0 || mode==8 || mode==9) {
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status)==(mode==8 ? 143 : 159));
+        } else {
+            CHECK(WIFSIGNALED(status) && WTERMSIG(status)==(mode==6 ? SIGTERM : SIGSYS));
+        }
+        errno=0; CHECK(waitpid(child,&status,WNOHANG)==-1 && errno==ECHILD);
+    }
+    CHECK(concurrent_wait_tests()==0);
+    puts("seccomp fatal waits: KILL_PROCESS group, TRAP default/ignored/blocked, KILL_THREAD, SIGTERM, exec, VFORK cache, WNOWAIT, worker-only fatal and normal159/143 passed");
+    return 0;
+}
 int main(int argc,char **argv) {
+    if (argc==2 && !strcmp(argv[1],"--status-exec-child")) {
+        syscall(SYS_getppid); return 94;
+    }
+    if (argc==2 && !strcmp(argv[1],"--wait-status")) return wait_status_tests(argv[0]);
     if (argc==2 && !strcmp(argv[1],"--exec-child")) {
         errno=0; CHECK(syscall(SYS_getppid)==-1 && errno==71);
         CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
