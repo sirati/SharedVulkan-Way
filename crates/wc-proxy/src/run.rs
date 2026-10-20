@@ -481,6 +481,8 @@ fn parse_args() -> Result<Args, String> {
 }
 
 pub fn main() -> std::process::ExitCode {
+    // §111.10: a doorbell spec `broker:NAME` is a connection the broker makes.
+    wc_broker::client::install_hooks();
     // §92. `wc-proxy desktop …` answers questions about a desktop entry for
     // `wc-session` and exits; it is a verb of this binary because the icon
     // resolver it sits beside is here, and the VM host already has the binary.

@@ -26,6 +26,8 @@
 
 use std::process::ExitCode;
 
+mod ram;
+
 /// Which half to run.
 ///
 /// The two halves are separate processes' worth of work and they take different
@@ -46,12 +48,14 @@ fn usage() -> String {
         "sv-guest — the in-VM half of shared_vulkan + waycompose\n\
          \n\
          usage: sv-guest <{}> [args…]\n\
+         {}\
          \n\
          built with: {}\n\
          \n\
          `gpu` takes sv-gpu-server's arguments; `wayland` takes\n\
          wc-compositor's. Both halves share one arena — see docs/one-binary.md.",
         halves.join("|"),
+        if cfg!(windows) { "       sv-guest broker [--console] …  the SYSTEM service (§111.8)\n" } else { "" },
         if halves.is_empty() { "no halves — this binary does nothing".to_string() } else { halves.join(", ") },
     )
 }
@@ -65,6 +69,10 @@ fn main() -> ExitCode {
     };
 
     match half.as_str() {
+        // §111.8: the SYSTEM service that lends the devices, on every build:
+        // it is neither half, and the guest has one binary.
+        #[cfg(windows)]
+        "broker" => wc_broker::sys::windows::service::main(&args.collect::<Vec<_>>()),
         #[cfg(feature = "gpu")]
         "gpu" => sv_gpu_server::entry::run_main(half_argv("sv-guest gpu", args)),
         #[cfg(all(feature = "wayland", feature = "gpu"))]
@@ -86,6 +94,7 @@ fn main() -> ExitCode {
             eprintln!("sv-guest: this binary was built without the `wayland` feature");
             ExitCode::from(2)
         }
+        "ram" => ram::main(args.collect()),
         "-h" | "--help" => {
             println!("{}", usage());
             ExitCode::SUCCESS
@@ -134,26 +143,79 @@ mod one_pool {
     pub struct GpuRegion {
         server: Arc<PoolServer>,
         sessions: Mutex<HashMap<u8, u64>>,
+        /// §108: GPU pool regions registered as arena regions, and where.
+        known: Mutex<HashMap<u32, usize>>,
+    }
+
+    /// §108: region `k` ≥ 1 of the GPU pool (grown from guest RAM), as region
+    /// `1 + k` of the Wayland arena. Leases are made through [`GpuRegion`];
+    /// this entry only gives them back to the right region.
+    pub struct GpuSubRegion {
+        server: Arc<PoolServer>,
+        k: u32,
+    }
+
+    impl wc_compositor::PoolRegion for GpuSubRegion {
+        fn lease(&self, _session: u8, _install: &str, _len: u64) -> Result<(u64, u64), String> {
+            Err("leased through the GPU pool's region 1".into())
+        }
+        fn release(&self, offset: u64) {
+            let _ = self.server.release(sv_arena::pool::pool_offset(self.k, offset));
+        }
+        fn describe(&self) -> String {
+            format!("region {} of the GPU pool, the guest's RAM (§108)", self.k)
+        }
+    }
+
+    impl GpuRegion {
+        /// Make sure GPU pool region `k` is the arena's region `1 + k`, at the
+        /// address this process maps it now (a retired slot may come back
+        /// elsewhere).
+        fn register(&self, k: u32) -> Result<(), String> {
+            let view = self.server.region(k).ok_or_else(|| format!("the GPU pool has no region {k}"))?;
+            let ptr = unsafe { view.base_ptr() } as usize;
+            let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+            if known.get(&k) == Some(&ptr) {
+                return Ok(());
+            }
+            let src = Arc::new(GpuSubRegion { server: Arc::clone(&self.server), k });
+            // SAFETY: the region manager keeps the view until the pool has
+            // given the region up, which needs every lease in it (and so every
+            // Wayland grant of it) gone first.
+            unsafe { wc_compositor::replace_pool_region(1 + k, ptr as *const u8, view.len(), src) }?;
+            known.insert(k, ptr);
+            Ok(())
+        }
     }
 
     impl wc_compositor::PoolRegion for GpuRegion {
         fn lease(&self, session: u8, install: &str, len: u64) -> Result<(u64, u64), String> {
+            match self.lease_in(session, install, len)? {
+                (0, off, len) => Ok((off, len)),
+                (d, off, _) => {
+                    let _ = self.server.release(sv_arena::pool::pool_offset(d, off));
+                    Err(format!("the GPU pool leased in its region {d}"))
+                }
+            }
+        }
+
+        fn lease_in(&self, session: u8, install: &str, len: u64) -> Result<(u32, u64, u64), String> {
             let s = *self
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .entry(session)
                 .or_insert_with(|| self.server.open_session(&format!("wayland {install} (session {session})")).session);
-            let l = self
-                .server
-                .lease_raw(s, len, sv_arena::pool::Purpose::Dedicated)
-                .map_err(|e| e.to_string())?;
+            // §108: a full pool grows, for a Wayland buffer as for a GPU one.
+            let l = self.server.lease_growing(s, len, sv_arena::pool::Purpose::Dedicated)?;
             let (region, offset) = sv_arena::pool::split(l.offset);
-            if region != 0 {
+            if region != 0
+                && let Err(e) = self.register(region)
+            {
                 let _ = self.server.release(l.offset);
-                return Err(format!("the GPU pool leased in its region {region}, which this process does not map"));
+                return Err(e);
             }
-            Ok((offset, l.len))
+            Ok((region, offset, l.len))
         }
 
         fn release(&self, offset: u64) {
@@ -177,7 +239,7 @@ mod one_pool {
         let (wayland, gpu) = split(args);
         if let Some(gpu) = gpu {
             sv_gpu_server::pool_guest::set_pool_hook(Box::new(|server, boot| {
-                let src = Arc::new(GpuRegion { server: Arc::clone(server), sessions: Mutex::new(HashMap::new()) });
+                let src = Arc::new(GpuRegion { server: Arc::clone(server), sessions: Mutex::new(HashMap::new()), known: Mutex::new(HashMap::new()) });
                 // SAFETY: `boot` is the GPU device's mapping, which the GPU
                 // pool keeps for the life of the process (`serve_pool` does not
                 // return while it serves).
@@ -192,7 +254,11 @@ mod one_pool {
                 eprintln!("sv-guest: the GPU pool ended ({rc:?}); the compositor goes on without it");
             });
         }
-        wc_compositor::run_from(super::half_argv("sv-guest wayland", wayland.into_iter()))
+        let rc = wc_compositor::run_from(super::half_argv("sv-guest wayland", wayland.into_iter()));
+        // §108: the process ends with its GPU pool; give the regions back
+        // first rather than leave them to the keeper.
+        sv_gpu_server::regions::retire_all(std::time::Duration::from_secs(5));
+        rc
     }
 
     #[cfg(test)]
@@ -215,7 +281,7 @@ mod one_pool {
             let boot = Arc::new(sv_transport::region::SharedRegion::heap(64 << 20).unwrap());
             let cfg = sv_arena::pool::PoolConfig::for_capacity(64 << 20);
             let server = PoolServer::new(cfg, boot, sv_gpu_server::pool::Importer::HostPointer).unwrap();
-            let r = GpuRegion { server: Arc::clone(&server), sessions: Mutex::new(HashMap::new()) };
+            let r = GpuRegion { server: Arc::clone(&server), sessions: Mutex::new(HashMap::new()), known: Mutex::new(HashMap::new()) };
             let gpu = server.open_session("gpu app");
             let mut spans = Vec::new();
             for i in 0..6u64 {

@@ -30,6 +30,9 @@ wc-compositor = { path = "../wc-compositor" }
 sv-transport = { workspace = true }
 # §103.15: the boot record's GPU label.
 wc-handle = { workspace = true }
+# §111.9: the LaunchDaemon holds the session's windows, lends the doorbell
+# ports and signs the boot record.
+wc-broker = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # §105: the compositor's control socket, which carries this launcher's

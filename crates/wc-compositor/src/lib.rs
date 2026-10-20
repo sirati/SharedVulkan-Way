@@ -102,9 +102,9 @@ use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use platform::{FrameStyle, PlatformConfig};
 /// §103.14: the guest-RAM ring region, for the macOS launcher's control and
 /// sound channels and its bootstrap.
-pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, shared_control};
+pub use ringlink::{boot_status, guest_ram_rings_located, ring_wait_slice, set_boot_session, set_boot_signer, shared_control, BootSigner};
 /// §110: the one pool's other regions (the GPU device's, from `sv-guest`).
-pub use session_svc::{add_pool_region, PoolRegion};
+pub use session_svc::{add_pool_region, replace_pool_region, PoolRegion};
 /// §103.8: the Dock menu, which the macOS launcher fills.
 #[cfg(target_os = "macos")]
 pub use platform::{face_early, run_face, set_dock_menu, DockItem};
@@ -1251,7 +1251,19 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         } else {
             0
         };
-        let rings_at = match wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len) {
+        // §111.8: the broker opens the arena device (device 0, PCI slot
+        // 0x1c) and moves it here; this process maps it as it maps one it
+        // opened. Without a broker, the device is opened here as before.
+        #[cfg(windows)]
+        let lent = if dev == 0 { wc_broker::client::lend::ivshmem("arena", "compositor") } else { None };
+        #[cfg(not(windows))]
+        let lent: Option<()> = None;
+        let attached = match lent {
+            #[cfg(windows)]
+            Some(d) => wc_handle::map_ivshmem_device(d).and_then(|m| wc_handle::arena::attach_ivshmem_mapped(id, m, rings_len)),
+            _ => wc_handle::arena::attach_ivshmem_with_rings(id, dev, rings_len),
+        };
+        let rings_at = match attached {
             Ok(r) => {
                 println!(
                     "wc-compositor: arena {id} provided from ivshmem: run 0x{:016x}, {} bytes, \

@@ -47,6 +47,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+/// A doorbell hub reached through the broker (`broker:NAME`, §111.10).
+pub mod brokered;
 pub mod cold;
 /// The cold path in the extent's first page (waycompose-design.md §103.6).
 pub mod coldpage;
@@ -61,6 +63,10 @@ pub mod park;
 pub mod poolcold;
 pub mod poolhdr;
 pub mod region;
+pub mod regiontab;
+pub mod lpstamp;
+#[cfg(windows)]
+pub mod winram;
 pub mod ring;
 pub mod stream;
 pub mod winpipe;

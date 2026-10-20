@@ -120,7 +120,7 @@ for _ in $(seq 1 50); do [ -S "$D/guest.sock" ] && break; sleep 0.1; done
 "$BIN/sv-hostd" bell-hub --port "$D/host.sock=$D/hub/wl.sock" >>"$D/hub.log" 2>&1 &
 HUB=$!; PIDS+=("$HUB")
 for _ in $(seq 1 50); do [ -S "$D/hub/wl.sock" ] && break; sleep 0.1; done
-"$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" \
+"$BIN/wc-arena-host" sessiond --ivshmem "$D/arena" --installs "$D/installs" --state "$D/state" --live "$D/live" \
   --bell "$D/hub/wl.sock" --poll-ms 60000 >>"$D/sessiond.log" 2>&1 &
 SVC=$!; PIDS+=("$SVC")
 

@@ -137,6 +137,11 @@ pub mod macboot;
 /// handle; dropping it is the release.
 pub use platform::{MappedView, map_ivshmem_slot};
 
+/// §111.8: an ivshmem device opened but not mapped, so that the broker can
+/// open it and the process it is moved into map it, by the same code.
+#[cfg(windows)]
+pub use platform::{IvshmemDevice, ivshmem_device_paths, map_ivshmem_device, open_ivshmem_path, open_ivshmem_slot};
+
 /// How many objects of each kind this process has mapped.
 ///
 /// See [`map_counts`]. Deliberately process-global and deliberately not

@@ -13,6 +13,7 @@
 #   scripts/wc-launch.sh native    the same measurement for Windows' own Firefox
 #   scripts/wc-launch.sh shot      photograph the window that is up
 #   scripts/wc-launch.sh stop      end the session
+#   scripts/wc-launch.sh broker-show / broker-uninstall   the §111.8 broker service
 #   scripts/wc-launch.sh all       deploy, install, native, cold, warm, shot
 #
 # Run from inside `nix develop`.
@@ -171,6 +172,12 @@ esac
 # (`scripts/wc-port-access.ps1 install`), which is what lets a medium-integrity
 # launch open them. `skip` leaves the guest's device security alone.
 PORT_ACCESS="${WC_LAUNCH_PORT_ACCESS:-install}"
+# §111.8. `deploy` installs the broker service (`sv-guest broker`, LocalSystem,
+# from Program Files) and gives it this installation's key; the broker opens
+# the devices for the user's processes, so the per-user port grant above is
+# superseded and its task removed. `skip` keeps §91's grant and the key in the
+# user's install directory, as before §111.
+BROKER="${WC_LAUNCH_BROKER:-install}"
 PORT_USER="${WC_LAUNCH_PORT_USER:-${SITE_GUEST_USER}}"
 GPU_SESSIONS="${WC_LAUNCH_GPU_SESSIONS:-0}"
 # §105: the pre-§105 transport (ssh exec, relay, tunnel) as an opt-in debug
@@ -654,7 +661,7 @@ do_deploy() {
     built_ok "${PIPESTATUS[0]}" "sv-hostd and sv-icd" || exit 1
     cp "$REL_WIN/sv-guest.exe" "$stage/sv-guest.exe"
   fi
-  cp "$ROOT/scripts/wc-port-access.ps1" "$stage/"
+  cp "$ROOT/scripts/wc-port-access.ps1" "$ROOT/scripts/wc-broker-install.ps1" "$stage/"
   write_runint "$stage/runint.ps1"
   write_click  "$stage/click.ps1"
   write_native "$stage/native.ps1"
@@ -782,7 +789,20 @@ APPS
   # descriptor until it is free (opening a held vioser port disconnects its
   # holder); the PnP property, which the next device start applies, is written
   # regardless. `scripts/wc-port-access.ps1 -Action uninstall` undoes all of it.
-  if [ "$PORT_ACCESS" = install ]; then
+  if [ "$BROKER" = install ]; then
+    # §111.8: the broker service. It sets the four devices to SYSTEM and
+    # Administrators only at every start, and lends them to the user's own
+    # processes; §91's task and grant are removed by the same script.
+    local bi
+    bi=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action install -Source '$DIR_WIN'" | tr -d '\r')
+    echo "$bi" | sed 's/^/        /'
+    if echo "$bi" | grep -q 'installed:'; then
+      ok "the broker service runs from Program Files as LocalSystem; the devices are lent by it"
+    else
+      bad "the broker service was not installed; sessions open the devices themselves (and a medium-integrity one is refused)"
+    fi
+  elif [ "$PORT_ACCESS" = install ]; then
     local pa
     pa=$(g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
           -File '$DIR_WIN\\wc-port-access.ps1' -Action install -User $PORT_USER" | tr -d '\r')
@@ -810,13 +830,30 @@ APPS
            (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >$HOSTDIR/session.key); \
            chmod 600 $HOSTDIR/session.key; cat $HOSTDIR/session.key")
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no installation key on the VM host"; exit 1; }
-  printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
-      icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
-  key=""
-  local kchk
-  kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
-  [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
-    || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  if [ "$BROKER" = install ]; then
+    # §111.8: the key goes to the broker, which signs the boot record with
+    # it and with the caller's identity; the user cannot read it, so a user
+    # process cannot sign a record that claims another user.
+    local ki
+    ki=$(printf '%s' "$key" | g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass \
+          -File '$DIR_WIN\\wc-broker-install.ps1' -Action key -Install $SESSION" | tr -d '\r')
+    key=""
+    echo "$ki" | sed 's/^/        /'
+    if echo "$ki" | grep -q 'stored in'; then
+      g "export MSYS_NO_PATHCONV=1; rm -f $DIR_MSYS/session.key" >/dev/null
+      ok "the installation key is the broker's (ProgramData\\waycompose\\keys, SYSTEM and Administrators only); the user's copy is removed"
+    else
+      bad "the installation key did not reach the broker"
+    fi
+  else
+    printf '%s' "$key" | g "export MSYS_NO_PATHCONV=1; cat >$DIR_MSYS/session.key; \
+        icacls '$DIR_WIN\\session.key' /inheritance:r /grant:r '${SITE_GUEST_USER}:R' >/dev/null" >/dev/null
+    key=""
+    local kchk
+    kchk=$(g "export MSYS_NO_PATHCONV=1; icacls '$DIR_WIN\\session.key'" | tr -d '\r' | grep -c ':(R)')
+    [ "$kchk" = 1 ] && ok "the installation key is on the guest, readable by ${SITE_GUEST_USER} alone" \
+      || bad "the installation key's ACL on the guest is not one reader ($kchk)"
+  fi
   # §105: the installation, registered with the host's session service by name.
   h "mkdir -p \$HOME/.config/waycompose/installs && ln -sfn $HOSTDIR \$HOME/.config/waycompose/installs/$SESSION" >/dev/null
 
@@ -1523,6 +1560,13 @@ do_verify() {
 n=""; warms=""; i=""
 case "$MODE" in
   deploy)  do_deploy ;;
+  broker-show)
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action show" | tr -d '\r' ;;
+  broker-uninstall)
+    # §111.8's revert: the service goes, the devices get their descriptors
+    # from before, and the keys stay (re-deploy with WC_LAUNCH_BROKER=skip
+    # puts a key back in the user's directory).
+    g "export MSYS2_ARG_CONV_EXCL='*'; powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$DIR_WIN\\wc-broker-install.ps1' -Action uninstall" | tr -d '\r' ;;
   bench)   do_bench ;;
   warmbench)
     n="${WC_LAUNCH_RUNS:-4}"; warms=""

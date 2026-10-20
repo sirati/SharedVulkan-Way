@@ -1055,6 +1055,69 @@ pub fn map_ivshmem(index: u32) -> io::Result<(MappedView, u64, String)> {
 /// is in the device instance path as the last component: `…&0&E8` is device
 /// 0x1d function 0, because that component is `devfn = slot << 3 | function`.
 pub fn map_ivshmem_slot(slot: u8) -> io::Result<(MappedView, u64, String)> {
+    map_ivshmem_device(open_ivshmem_slot(slot)?)
+}
+
+fn map_ivshmem_path(path: String) -> io::Result<(MappedView, u64, String)> {
+    map_ivshmem_device(open_ivshmem_path(path)?)
+}
+
+/// An open ivshmem device that has not been mapped yet: the handle and the
+/// path it was opened by.
+///
+/// §111.8: the two halves of [`map_ivshmem_slot`], so that the privileged
+/// broker can do the first (it alone may open the device) and move the handle
+/// into the compositor or the GPU process, which does the second. The driver
+/// ties its one mapping to the handle that asked for it, whoever opened it,
+/// so a moved handle maps exactly as one the process opened itself.
+pub struct IvshmemDevice {
+    handle: HANDLE,
+    path: String,
+}
+
+// SAFETY: a kernel handle, usable from any thread.
+unsafe impl Send for IvshmemDevice {}
+
+impl IvshmemDevice {
+    /// Give up ownership of the handle (to move it into another process).
+    pub fn into_raw(self) -> HANDLE {
+        let h = self.handle;
+        std::mem::forget(self);
+        h
+    }
+
+    /// Take ownership of a handle on an ivshmem device that has not been
+    /// mapped, such as one the broker moved into this process.
+    ///
+    /// # Safety
+    /// `handle` must be an open handle on an ivshmem device, owned by the
+    /// caller and closed by nobody else.
+    pub unsafe fn from_raw(handle: HANDLE, path: String) -> IvshmemDevice {
+        IvshmemDevice { handle, path }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for IvshmemDevice {
+    fn drop(&mut self) {
+        // SAFETY: owned, closed once.
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Every present ivshmem device's interface path, sorted (§111.8: the
+/// broker finds its devices, and sets their security, by these).
+pub fn ivshmem_device_paths() -> io::Result<Vec<String>> {
+    ivshmem_paths()
+}
+
+/// Open, but do not map, the ivshmem device in PCI slot `slot`.
+pub fn open_ivshmem_slot(slot: u8) -> io::Result<IvshmemDevice> {
     let paths = ivshmem_paths()?;
     let path = crate::ivshmem::path_for_slot(&paths, slot).ok_or_else(|| {
         io::Error::new(
@@ -1066,10 +1129,11 @@ pub fn map_ivshmem_slot(slot: u8) -> io::Result<(MappedView, u64, String)> {
             ),
         )
     })?;
-    map_ivshmem_path(path)
+    open_ivshmem_path(path)
 }
 
-fn map_ivshmem_path(path: String) -> io::Result<(MappedView, u64, String)> {
+/// Open, but do not map, the ivshmem device at interface path `path`.
+pub fn open_ivshmem_path(path: String) -> io::Result<IvshmemDevice> {
     let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: a live NUL-terminated path; no security attributes, no template.
     let handle = unsafe {
@@ -1087,6 +1151,15 @@ fn map_ivshmem_path(path: String) -> io::Result<(MappedView, u64, String)> {
         let e = io::Error::last_os_error();
         return Err(io::Error::new(e.kind(), format!("opening ivshmem device {path}: {e}")));
     }
+    Ok(IvshmemDevice { handle, path })
+}
+
+/// Map an open ivshmem device into this process **read-write and cached**:
+/// the second half of [`map_ivshmem_slot`], for a device this process opened
+/// or was given (§111.8). The view owns the handle from here.
+pub fn map_ivshmem_device(dev: IvshmemDevice) -> io::Result<(MappedView, u64, String)> {
+    let path = dev.path.clone();
+    let handle = dev.into_raw();
     // From here every early return must close `handle`.
     let close = |e: io::Error| {
         // SAFETY: the handle opened above, closed once on this error path.

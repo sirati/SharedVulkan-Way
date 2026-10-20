@@ -497,6 +497,181 @@ pub unsafe fn publish_indexed(page0: *mut u8, rec: &Record, index: u8, auth: Opt
     }
 }
 
+// ------------------------------------------- §111.6: who asked, signed
+
+/// §111.6: where the record says which server-side user asked for the
+/// session. Written only by the privileged service (the Windows SYSTEM
+/// service, the macOS LaunchDaemon), which read it from the caller's token or
+/// credentials and alone holds the installation's key: a user process that
+/// writes another identity here cannot make the MAC verify. Zero, as every
+/// writer before §111 left it, is "no identity" and the MAC is §107's.
+///
+/// ```text
+///   page 0, from OFF_IDENTITY (1920)
+///   0   magic "WCIDNT01"
+///   8   u16 length, then the identity's text (at most IDENTITY_MAX bytes)
+/// ```
+pub const OFF_IDENTITY: usize = 1920;
+pub const IDENTITY_MAGIC: [u8; 8] = *b"WCIDNT01";
+pub const IDENTITY_MAX: usize = 246;
+
+/// A server-side user as the privileged service saw it: the operating
+/// system, the account name, and the account's stable id (a SID, a uid).
+/// Its text is `os=windows user=NAME id=S-1-5-21-…`: words without spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub os: String,
+    pub user: String,
+    pub id: String,
+}
+
+fn identity_word_ok(w: &str) -> bool {
+    !w.is_empty() && w.len() <= 80 && w.bytes().all(|b| b.is_ascii_graphic() && b != b'=')
+}
+
+impl Identity {
+    pub fn text(&self) -> String {
+        format!("os={} user={} id={}", self.os, self.user, self.id)
+    }
+
+    pub fn parse(text: &str) -> Option<Identity> {
+        let mut it = text.split(' ');
+        let mut take = |k: &str| it.next()?.strip_prefix(k)?.strip_prefix('=').filter(|v| identity_word_ok(v)).map(str::to_string);
+        let (os, user, id) = (take("os")?, take("user")?, take("id")?);
+        if it.next().is_some() {
+            return None;
+        }
+        Some(Identity { os, user, id })
+    }
+
+    /// Write it into page 0 (`page` is the whole page).
+    pub fn write(&self, page: &mut [u8]) {
+        let t = self.text();
+        let n = t.len().min(IDENTITY_MAX);
+        let a = &mut page[OFF_IDENTITY..OFF_IDENTITY + 10 + IDENTITY_MAX];
+        a.fill(0);
+        a[0..8].copy_from_slice(&IDENTITY_MAGIC);
+        a[8..10].copy_from_slice(&(n as u16).to_le_bytes());
+        a[10..10 + n].copy_from_slice(&t.as_bytes()[..n]);
+    }
+
+    /// The identity in page 0: `None` for none, or for one that does not parse
+    /// (no host acts on a session whose identity it cannot read).
+    pub fn read(page: &[u8]) -> Option<Identity> {
+        let a = page.get(OFF_IDENTITY..OFF_IDENTITY + 10 + IDENTITY_MAX)?;
+        if a[0..8] != IDENTITY_MAGIC {
+            return None;
+        }
+        let n = usize::from(u16::from_le_bytes([a[8], a[9]])).min(IDENTITY_MAX);
+        Identity::parse(std::str::from_utf8(&a[10..10 + n]).ok()?)
+    }
+}
+
+/// Whether page 0 has an identity area at all (its magic), whatever it says.
+pub fn has_identity(page: &[u8]) -> bool {
+    page.get(OFF_IDENTITY..OFF_IDENTITY + 8) == Some(&IDENTITY_MAGIC[..])
+}
+
+/// §111.6: [`auth_message_indexed`] with the identity covered. With no
+/// identity it is exactly §107's message.
+pub fn auth_message_identity(rec: &Record, index: u8, identity: Option<&Identity>, installation: &str, seq: u64) -> Vec<u8> {
+    let mut m = auth_message_indexed(rec, index, installation, seq);
+    if let Some(id) = identity {
+        let t = id.text();
+        m.extend_from_slice(b"wcboot-identity-v1\0");
+        m.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        m.extend_from_slice(t.as_bytes());
+    }
+    m
+}
+
+impl Auth {
+    /// §111.6: the privileged service's signature over a record, its index
+    /// and the identity it read from the caller.
+    pub fn sign_identity(
+        rec: &Record,
+        index: u8,
+        identity: Option<&Identity>,
+        installation: &str,
+        seq: u64,
+        key: &[u8; KEY_LEN],
+    ) -> Auth {
+        Auth {
+            installation: installation.to_string(),
+            seq,
+            mac: hmac_sha256(key, &auth_message_identity(rec, index, identity, installation, seq)),
+        }
+    }
+
+    pub fn verifies_identity(&self, rec: &Record, index: u8, identity: Option<&Identity>, key: &[u8; KEY_LEN]) -> bool {
+        mac_eq(&self.mac, &hmac_sha256(key, &auth_message_identity(rec, index, identity, &self.installation, self.seq)))
+    }
+}
+
+/// §111.6: [`publish_indexed`] with an identity area (cleared when `None`).
+///
+/// # Safety
+/// As [`publish`].
+pub unsafe fn publish_identity(page0: *mut u8, rec: &Record, index: u8, identity: Option<&Identity>, auth: Option<&Auth>) {
+    use std::sync::atomic::{AtomicU64, Ordering, fence};
+    let mut page = vec![0u8; 4096];
+    if let Some(id) = identity {
+        id.write(&mut page);
+    }
+    // SAFETY: the caller's contract. The record's magic is cleared first, so
+    // a reader never pairs the new identity with the old record; the record
+    // and its magic follow in `publish_indexed`.
+    unsafe {
+        let magic = &*(page0.add(OFF) as *const AtomicU64);
+        magic.store(0, Ordering::Relaxed);
+        fence(Ordering::Release);
+        std::ptr::copy_nonoverlapping(page.as_ptr().add(OFF_IDENTITY), page0.add(OFF_IDENTITY), 10 + IDENTITY_MAX);
+        publish_indexed(page0, rec, index, auth);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn rec() -> Record {
+        Record { session: "wcivs-9".into(), arena_run: 0xAB, arena_pages: 32768, outbound: 1 << 20, rings_run: 0xAB, rings_pages: 1536, gpu: false }
+    }
+
+    #[test]
+    fn an_identity_reads_back_and_a_bad_one_is_none() {
+        let id = Identity { os: "windows".into(), user: "guest-user".into(), id: "S-1-5-21-1-2-3-1001".into() };
+        assert_eq!(Identity::parse(&id.text()), Some(id.clone()));
+        let mut p = vec![0u8; 4096];
+        assert_eq!(Identity::read(&p), None);
+        id.write(&mut p);
+        assert_eq!(Identity::read(&p), Some(id));
+        for bad in ["", "os=windows", "os=windows user=a b id=c", "user=a os=b id=c", "os=w user= id=c", "os=w user=a id=c extra=d"] {
+            assert_eq!(Identity::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The point of §111.6: the identity is covered, so a user process that
+    /// rewrites it in the page it can write makes the record fail.
+    #[test]
+    fn the_identity_is_covered_by_the_mac_and_none_is_sections_107s() {
+        let key = [9u8; KEY_LEN];
+        let r = rec();
+        let a = Identity { os: "windows".into(), user: "alice".into(), id: "S-1-5-21-1-2-3-1001".into() };
+        let b = Identity { os: "windows".into(), user: "bob".into(), id: "S-1-5-21-1-2-3-1002".into() };
+        let auth = Auth::sign_identity(&r, 2, Some(&a), "wcivs", 5, &key);
+        let mut p = vec![0u8; 4096];
+        // SAFETY: a 4096-byte buffer this test owns.
+        unsafe { publish_identity(p.as_mut_ptr(), &r, 2, Some(&a), Some(&auth)) };
+        let (r2, a2, id2) = (Record::read(&p).unwrap(), Auth::read(&p).unwrap(), Identity::read(&p));
+        assert!(a2.verifies_identity(&r2, 2, id2.as_ref(), &key));
+        b.write(&mut p);
+        assert!(!a2.verifies_identity(&r2, 2, Identity::read(&p).as_ref(), &key), "another user's identity, written over it");
+        assert!(!a2.verifies_identity(&r2, 2, None, &key), "the identity removed");
+        assert_eq!(auth_message_identity(&r, 2, None, "wcivs", 5), auth_message_indexed(&r, 2, "wcivs", 5));
+    }
+}
+
 #[cfg(test)]
 mod auth_tests {
     use super::*;
