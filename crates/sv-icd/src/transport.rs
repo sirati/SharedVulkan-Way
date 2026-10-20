@@ -508,8 +508,8 @@ fn lower(e: sv_transport::Error) -> LowerError {
 #[cfg(unix)]
 fn bell_connector(path: &str) -> impl Fn() -> std::io::Result<sv_transport::vdoorbell::PortHandle> + Send + 'static {
     let path = path.to_string();
-    move || match sv_transport::brokered::connect(&path) {
-        Ok(s) => Ok(sv_transport::vdoorbell::PortHandle::Unix(s)),
+    move || match sv_transport::vdoorbell::PortHandle::host_socket(&path) {
+        Ok(h) => Ok(h),
         Err(e) => {
             #[cfg(target_os = "linux")]
             if let Some(r) = relay::connect(sv_drm::relay::BELL_PREFIX, &path) {
