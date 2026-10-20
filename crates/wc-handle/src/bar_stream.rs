@@ -141,6 +141,45 @@ impl std::ops::Deref for Registration {
         &self.control
     }
 }
+// A counted endpoint exists before its transport objects can be constructed.
+// Keep its rollback separate from State so construction errors close it too.
+struct EndpointReference {
+    backing: Arc<Backing>,
+    writer: bool,
+    control: Option<Arc<Registration>>,
+    transferred: bool,
+}
+impl EndpointReference {
+    fn new(backing: Arc<Backing>, writer: bool) -> Self {
+        Self {
+            backing,
+            writer,
+            control: None,
+            transferred: false,
+        }
+    }
+}
+impl Drop for EndpointReference {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+        self.backing
+            .word(Backing::count(self.writer))
+            .fetch_sub(1, Ordering::SeqCst);
+        self.backing.close_if_unused(self.writer);
+        if let Some(control) = &self.control {
+            wake_control(control, Lane::Command);
+        }
+    }
+}
+fn wake_control(control: &Control, lane: Lane) {
+    if let Ok(control) = RingCtrl::open(control, 1)
+        && let Ok(bell) = control.bell(lane)
+    {
+        bell.ring();
+    }
+}
 struct State {
     backing: Arc<Backing>,
     writer: bool,
@@ -149,11 +188,7 @@ struct State {
 }
 impl State {
     fn wake(&self, lane: Lane) {
-        if let Ok(control) = RingCtrl::open(&self._control, 1)
-            && let Ok(bell) = control.bell(lane)
-        {
-            bell.ring();
-        }
+        wake_control(&self._control, lane);
     }
 }
 impl Drop for State {
@@ -177,11 +212,9 @@ impl Stream {
     pub fn key(&self) -> Key {
         self.state.backing.key
     }
-    fn endpoint(
-        backing: Arc<Backing>,
-        writer: bool,
-        control: Arc<Registration>,
-    ) -> io::Result<Self> {
+    fn endpoint(mut reference: EndpointReference, control: Arc<Registration>) -> io::Result<Self> {
+        reference.control = Some(control.clone());
+        let writer = reference.writer;
         let channel = ByteChannel::open(
             &control,
             1,
@@ -192,9 +225,10 @@ impl Stream {
             },
         )
         .map_err(transport)?;
+        reference.transferred = true;
         Ok(Self {
             state: Arc::new(State {
-                backing,
+                backing: reference.backing.clone(),
                 writer,
                 channel: Mutex::new(channel),
                 _control: control,
@@ -213,6 +247,8 @@ impl Stream {
         });
         backing.word(READER).store(1, Ordering::Relaxed);
         backing.word(WRITER).store(1, Ordering::Relaxed);
+        let reader = EndpointReference::new(backing.clone(), false);
+        let writer = EndpointReference::new(backing.clone(), true);
         let control = backing.control(true)?;
         let channel = ByteChannel::claim(&control, 1).map_err(transport)?;
         if channel.slot() != 1 {
@@ -221,8 +257,8 @@ impl Stream {
         drop(channel);
         backing.word(0).store(MAGIC, Ordering::Release);
         Ok((
-            Self::endpoint(backing.clone(), false, control.clone())?,
-            Self::endpoint(backing, true, control)?,
+            Self::endpoint(reader, control.clone())?,
+            Self::endpoint(writer, control)?,
         ))
     }
     pub(crate) fn receive(directory: Directory, key: Key, writer: bool) -> io::Result<Self> {
@@ -252,6 +288,7 @@ impl Stream {
         backing
             .word(Backing::count(writer))
             .fetch_add(1, Ordering::SeqCst);
+        let reference = EndpointReference::new(backing.clone(), writer);
         if backing
             .word(Backing::pending(writer))
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -259,13 +296,10 @@ impl Stream {
             })
             .is_err()
         {
-            backing
-                .word(Backing::count(writer))
-                .fetch_sub(1, Ordering::SeqCst);
             return Err(error("BAR stream endpoint has no pending transfer"));
         }
         let control = backing.control(false)?;
-        Self::endpoint(backing, writer, control)
+        Self::endpoint(reference, control)
     }
     pub(crate) fn prepare(&self) -> io::Result<Transfer> {
         let allocation = self.state.backing.publish()?;
@@ -568,6 +602,59 @@ mod tests {
         drop(reader);
         assert!(directory.extent(key).is_err());
     }
+    #[test]
+    fn malformed_received_control_balances_the_consumed_endpoint_reference() {
+        let directory = fixture();
+        let (reader, writer) = Stream::pair(directory.clone()).unwrap();
+        let key = reader.key();
+        writer.prepare().unwrap().commit();
+        drop(writer);
+        let backing = &reader.state.backing;
+        assert_eq!(backing.word(WRITER_PENDING).load(Ordering::SeqCst), 1);
+        // Preserve the live reader and allocation while rejecting the
+        // incoming writer's malformed control handshake.
+        let magic = unsafe { &*((backing.address + HEADER) as *const AtomicU64) };
+        let original = magic.swap(0, Ordering::SeqCst);
+        assert!(Stream::receive(directory.clone(), key, true).is_err());
+        magic.store(original, Ordering::SeqCst);
+        assert_eq!(backing.word(WRITER).load(Ordering::SeqCst), 0);
+        assert_eq!(backing.word(WRITER_PENDING).load(Ordering::SeqCst), 0);
+        assert_eq!(backing.word(WRITER_CLOSED).load(Ordering::Acquire), 1);
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        assert!(directory.extent(key).is_ok());
+        drop(reader);
+        assert!(directory.extent(key).is_err());
+    }
+
+    #[test]
+    fn failed_second_pair_endpoint_balances_both_references() {
+        let directory = fixture();
+        let (reader, writer) = Stream::pair(directory.clone()).unwrap();
+        let key = reader.key();
+        let backing = reader.state.backing.clone();
+        let control = reader.state._control.clone();
+        // Model the second endpoint's ByteChannel construction failure after
+        // the first has become a State, using an invalid ring kind.
+        backing.word(WRITER).fetch_add(1, Ordering::SeqCst);
+        let reference = EndpointReference::new(backing.clone(), true);
+        let entry = control.layout().ring_dir_entry(1).unwrap();
+        let kind = control
+            .region()
+            .atomic_u32(entry + sv_transport::control::RD_KIND)
+            .unwrap();
+        let original = kind.swap(0, Ordering::SeqCst);
+        assert!(Stream::endpoint(reference, control.clone()).is_err());
+        kind.store(original, Ordering::SeqCst);
+        assert_eq!(backing.word(WRITER).load(Ordering::SeqCst), 1);
+        drop(reader);
+        drop(writer);
+        assert_eq!(backing.word(READER).load(Ordering::SeqCst), 0);
+        assert_eq!(backing.word(WRITER).load(Ordering::SeqCst), 0);
+        drop(control);
+        drop(backing);
+        assert!(directory.extent(key).is_err());
+    }
+
     #[test]
     fn short_reads_across_aliases_preserve_bytes_and_ring_credits() {
         let directory = fixture();
