@@ -42,3 +42,15 @@ from VideoToolbox decode, guest forwarding and real application validation.
 
 Build and runtime evidence is kept outside git. Compilation alone does not
 establish successful native import or YCbCr sampling.
+
+The pinned provider and native fixture cross-build passed on Linux. The exact
+signed binaries then passed the isolated headless fixture on native A18 Pro
+hardware. Both full and narrow range cases verified all 16 pixels after the
+GPU fence, including negative RGB values produced by the specified conversion.
+The fixture also verified actual plane offsets/pitches, stable allocation
+requirements and refusal of unsupported queries and wrong-plane handles.
+The renderer's existing ordinary single-plane allocation fixture passed with
+unchanged SRGB shader-write and input-attachment refusals. That allocation
+fixture does not establish single-plane rendering or sampling completion.
+VideoToolbox production, renderer retirement and guest/application completion
+remain separate integration work.
