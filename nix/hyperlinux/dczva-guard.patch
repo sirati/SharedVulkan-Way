@@ -20,7 +20,7 @@
  5:  hvc #12
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -1484,6 +1484,36 @@
+@@ -1484,6 +1484,42 @@
                      break;
                  }
  
@@ -34,6 +34,10 @@
 +                    addr = original & UINT64_C(0x00ffffffffffffff);
 +                    addr &= ~UINT64_C(63);
 +                    uint8_t *slots[4];
++                    /* mmap_lock excludes VMA/PTE writers while resolver
++                     * snapshots all four pages and performs the stores.
++                     * Do not hold the PT reader lock across shared metadata. */
++                    pthread_mutex_lock(&mmap_lock);
 +                    int ok = addr <= UINT64_MAX - 64;
 +                    for (unsigned i = 0; ok && i < 4; ++i) {
 +                        uint64_t avail = 0;
@@ -41,6 +45,7 @@
 +                        if (!slots[i] || avail < 16) ok = 0;
 +                    }
 +                    if (!ok) {
++                        pthread_mutex_unlock(&mmap_lock);
 +                        uint64_t far = original & UINT64_C(0x00ffffffffffffff);
 +                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, far);
 +                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ESR_EL1,
@@ -50,6 +55,7 @@
 +                    }
 +                    static const uint8_t zero[16] = {0};
 +                    for (unsigned i = 0; i < 4; ++i) memcpy(slots[i], zero, 16);
++                    pthread_mutex_unlock(&mmap_lock);
 +                    hv_vcpu_set_reg(vcpu, HV_REG_X0, 0);
 +                    break;
 +                }
