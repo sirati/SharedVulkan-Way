@@ -1,0 +1,59 @@
+--- a/src/shim.S
++++ b/src/shim.S
+@@ -341,13 +341,10 @@
+     cmp x10, #31
+     b.eq 6f                        /* XZR → address is 0, skip (nop) */
+     lsl x10, x10, #3              /* Byte offset in frame */
+-    ldr x11, [sp, x10]            /* x11 = VA from Xt */
+-    and x11, x11, #~63            /* Align down to 64-byte cache line */
+-    /* Zero 64 bytes using four STP pairs */
+-    stp xzr, xzr, [x11, #0]
+-    stp xzr, xzr, [x11, #16]
+-    stp xzr, xzr, [x11, #32]
+-    stp xzr, xzr, [x11, #48]
++    ldr x11, [sp, x10]            /* x11 = original tagged VA from Xt */
++    mov x0, x11                   /* HVC14 checked zero request */
++    hvc #14
++    cbnz x0, handle_el0_fault     /* host supplied ESR/FAR and refuses */
+ 6:  /* Forward to host for counting, then I-cache maintenance */
+ 
+ 5:  hvc #12
+--- a/src/syscall_proc.c
++++ b/src/syscall_proc.c
+@@ -1484,6 +1484,36 @@
+                     break;
+                 }
+ 
++                case 14: {
++                    /* HVC #14: checked DC ZVA emulation. x0 carries the
++                     * original EL0 operand. Never issue EL1 stores directly. */
++                    uint64_t original, addr;
++                    if (hv_vcpu_get_reg(vcpu, HV_REG_X0, &original) != HV_SUCCESS) {
++                        exit_code = 128; running = 0; break;
++                    }
++                    addr = original & UINT64_C(0x00ffffffffffffff);
++                    addr &= ~UINT64_C(63);
++                    uint8_t *slots[4];
++                    int ok = addr <= UINT64_MAX - 64;
++                    for (unsigned i = 0; ok && i < 4; ++i) {
++                        uint64_t avail = 0;
++                        slots[i] = guest_ptr_access(g, addr + i * 16, &avail, 1);
++                        if (!slots[i] || avail < 16) ok = 0;
++                    }
++                    if (!ok) {
++                        uint64_t far = original & UINT64_C(0x00ffffffffffffff);
++                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, far);
++                        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ESR_EL1,
++                                            (UINT64_C(0x24) << 26) | 0x4f);
++                        hv_vcpu_set_reg(vcpu, HV_REG_X0, 1);
++                        break;
++                    }
++                    static const uint8_t zero[16] = {0};
++                    for (unsigned i = 0; i < 4; ++i) memcpy(slots[i], zero, 16);
++                    hv_vcpu_set_reg(vcpu, HV_REG_X0, 0);
++                    break;
++                }
++
+                 case 12: {
+                     /* HVC #12: System instruction trap (EC=0x18 Direction=0).
+                      * The shim forwards trapped cache maintenance instructions
