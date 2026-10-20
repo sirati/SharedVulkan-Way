@@ -56,6 +56,8 @@ pub fn parse_signed(line: &str, install: &str) -> Result<(wc_handle::macboot::Au
 
 #[cfg(unix)]
 pub use unix_client::Client;
+#[cfg(target_os = "macos")]
+pub use unix_client::MachRegion;
 #[cfg(unix)]
 pub use process::{close_region, find_region, install_hooks, open_path, open_region, own_connection, region_spec};
 
@@ -129,6 +131,9 @@ mod process {
         if r.pieces.len() != 1 || r.pieces[0].offset != 0 {
             return Err(io::Error::other(format!("region {id} is {} piece(s); a file-like region is one", r.pieces.len())));
         }
+        if fds.len() != 1 || r.pieces[0].handle != "fd" {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "this region is a Mach mapping, not a file"));
+        }
         let fd = fds.remove(0);
         let out = std::fs::File::from(fd.try_clone()?);
         SHARED.lock().unwrap_or_else(|e| e.into_inner()).regions.insert(id, fd);
@@ -194,6 +199,28 @@ mod unix_client {
         events: VecDeque<String>,
     }
 
+    /// Owns the received VM mapping and the ordinary broker connection that
+    /// keeps its existing lease alive. Dropping the last region owner closes it.
+    #[cfg(target_os = "macos")]
+    pub struct MachRegion {
+        mapping: sv_transport::mach::Mapping,
+        reply: RegionReply,
+        _lease: Client,
+    }
+    #[cfg(target_os = "macos")]
+    impl MachRegion {
+        pub fn as_ptr(&self) -> *mut u8 { self.mapping.as_ptr() }
+        pub fn len(&self) -> usize { self.mapping.len() }
+        pub fn is_empty(&self) -> bool { self.mapping.is_empty() }
+        pub fn info(&self) -> &RegionReply { &self.reply }
+        pub fn wait_irq(&self, seen:u32) -> io::Result<u32> {
+            crate::sys::macos_mach::wait_irq(self.reply.id, self.reply.epoch, 0, seen, 0, self.reply.len)
+        }
+        pub fn ring(&self, peer: u16, vector: u16) -> io::Result<()> {
+            crate::sys::macos_mach::ring(self.reply.id, self.reply.epoch, 0, peer, vector, 0, self.reply.len)
+        }
+    }
+
     impl Client {
         pub fn connect(path: &str) -> io::Result<Client> {
             let s = match UnixStream::connect(path) {
@@ -254,8 +281,11 @@ mod unix_client {
         fn region(&mut self, req: &Request) -> io::Result<(RegionReply, Vec<OwnedFd>)> {
             let (l, fds) = self.call(req)?;
             let r = proto::parse_region(&l).map_err(io::Error::other)?;
-            if r.pieces.len() != fds.len() {
-                return Err(io::Error::other(format!("{} piece(s) and {} fd(s)", r.pieces.len(), fds.len())));
+            let fd_count = r.pieces.iter().filter(|p| p.handle == "fd").count();
+            let supported = r.pieces.iter().all(|p| p.handle == "fd" ||
+                cfg!(target_os = "macos") && p.handle == "mach");
+            if !supported || fd_count != fds.len() {
+                return Err(io::Error::other(format!("unsupported region handles or {} expected fd(s), {} received", fd_count, fds.len())));
             }
             Ok((r, fds))
         }
@@ -275,6 +305,19 @@ mod unix_client {
         /// `gpu.<k>`), and its fds.
         pub fn find(&mut self, pool: &str) -> io::Result<(RegionReply, Vec<OwnedFd>)> {
             self.region(&Request::Find { pool: pool.into() })
+        }
+
+        /// Find and map one PCI BAR slice. This consumes the connection so its
+        /// lease cannot be closed while any retained mapping owner exists.
+        #[cfg(target_os = "macos")]
+        pub fn find_mach(mut self, pool: &str) -> io::Result<MachRegion> {
+            let (reply, fds) = self.find(pool)?;
+            if !fds.is_empty() || reply.pieces.len() != 1 || reply.pieces[0].handle != "mach" ||
+                reply.pieces[0].offset != 0 || reply.pieces[0].len != reply.len {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "expected one complete PCI Mach slice"));
+            }
+            let mapping = crate::sys::macos_mach::redeem(reply.id, reply.epoch, 0, 0, reply.len)?;
+            Ok(MachRegion { mapping, reply, _lease: self })
         }
 
         pub fn close(&mut self, id: u64) -> io::Result<()> {

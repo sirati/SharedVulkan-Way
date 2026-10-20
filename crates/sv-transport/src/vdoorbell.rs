@@ -654,13 +654,12 @@ impl DetachedWriter {
     pub fn spawn<W: Write + Send + 'static>(mut w: W) -> std::io::Result<DetachedWriter> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(Self::QUEUE);
         std::thread::Builder::new().name("sv-bell-write".into()).spawn(move || {
-            // Ends when every sender is gone, or the socket is.
+            // Ends when every sender is gone. A failed hint must not silence later sessions.
             while let Ok(b) = rx.recv() {
                 crate::frametrace::hop("bell.wr0");
-                if w.write_all(&b).and_then(|()| w.flush()).is_err() {
-                    break;
+                if w.write_all(&b).and_then(|()| w.flush()).is_ok() {
+                    crate::frametrace::hop("bell.wr1");
                 }
-                crate::frametrace::hop("bell.wr1");
             }
         })?;
         Ok(DetachedWriter { tx })
@@ -862,10 +861,10 @@ impl PortHandle {
             #[cfg(unix)]
             PortHandle::File(f) => {
                 let w = f.try_clone()?;
-                (Box::new(f), Box::new(w))
+                (Box::new(f), Box::new(DetachedWriter::spawn(w)?))
             }
             #[cfg(unix)]
-            PortHandle::Fds(r, w) => (Box::new(r), Box::new(w)),
+            PortHandle::Fds(r, w) => (Box::new(r), Box::new(DetachedWriter::spawn(w)?)),
             // The writer never blocks its caller (waycompose-design.md §97.10):
             // a hub that stops reading — on the guest, a stale session's
             // `sv-hostd` held QEMU's one connection and the next hub's sat
@@ -876,7 +875,11 @@ impl PortHandle {
             PortHandle::Unix(s) => {
                 let w = s.try_clone()?;
                 #[cfg(target_os = "linux")]
-                let w: Box<dyn Write + Send> = Box::new(DontWaitWriter(w));
+                let w: Box<dyn Write + Send> = if std::env::var("WC_BELL_INLINE").is_ok_and(|v| v == "0") {
+                    Box::new(DetachedWriter::spawn(w)?)
+                } else {
+                    Box::new(DontWaitWriter(w))
+                };
                 #[cfg(not(target_os = "linux"))]
                 let w: Box<dyn Write + Send> = Box::new(DetachedWriter::spawn(w)?);
                 (Box::new(s), w)
@@ -1555,5 +1558,30 @@ mod rescan_tests {
         let end = serve_port(bytes, &t, &AtomicBool::new(false), &AtomicU64::new(0));
         assert_eq!(end, ServeEnd::Closed);
         assert_eq!((t.0.load(Ordering::Relaxed), t.1.load(Ordering::Relaxed)), (2, 2), "the open and the token");
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    #[test]
+    fn detached_writer_recovers_after_a_failed_hint() {
+        struct Flaky { first: bool, tx: std::sync::mpsc::Sender<u8> }
+        impl Write for Flaky {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                self.tx.send(b[0]).unwrap();
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut writer = DetachedWriter::spawn(Flaky { first: true, tx }).unwrap();
+        writer.write_all(&[7]).unwrap();
+        writer.write_all(&[9]).unwrap();
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(), 9);
     }
 }

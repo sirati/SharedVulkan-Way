@@ -96,6 +96,8 @@ enum Backing {
     /// single-process tests and the `Vec<u8>`-backed arena of docs/design.md §13
     /// step 2 use.
     Heap(std::alloc::Layout),
+    /// A borrowed mapping whose owner is retained through every slice.
+    Owned { _owner: std::sync::Arc<dyn Send + Sync> },
     /// `mmap(MAP_SHARED)` of a file descriptor. The real one.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Mapped,
@@ -414,6 +416,26 @@ impl SharedRegion {
         SharedRegion { base, len, backing: Backing::Borrowed }
     }
 
+    /// Retain the external owner of a mapping. All slices keep it alive.
+    ///
+    /// # Safety
+    /// `base` must be page-aligned and valid for `len` writable bytes until
+    /// `owner` is dropped. Only the owner may release the mapping.
+    pub unsafe fn from_raw_owned(base: *mut u8, len: usize, owner: std::sync::Arc<dyn Send + Sync>) -> Self {
+        assert!(len > 0 && (base as usize).is_multiple_of(PAGE));
+        Self { base, len, backing: Backing::Owned { _owner: owner } }
+    }
+
+    /// A page-aligned subrange which retains this mapping and its owner.
+    pub fn slice(self: &std::sync::Arc<Self>, offset: u64, len: u64) -> Result<Self> {
+        self.check(offset, len)?;
+        if len == 0 || !offset.is_multiple_of(PAGE as u64) || !len.is_multiple_of(PAGE as u64) {
+            return Err(Error::BadGeometry("a region slice must contain whole pages"));
+        }
+        // SAFETY: checked above, and the cloned parent retains the mapping.
+        Ok(unsafe { Self::from_raw_owned(self.base.add(offset as usize), len as usize, self.clone()) })
+    }
+
     /// Take a mapped Windows section object as a region.
     ///
     /// The counterpart of [`SharedRegion::map_fd`], and deliberately the *whole*
@@ -576,7 +598,7 @@ impl Drop for SharedRegion {
             },
             // Somebody else's memory. Freeing it here would be a double free of
             // the guest provider's window.
-            Backing::Borrowed => {}
+            Backing::Borrowed | Backing::Owned { .. } => {}
             // The section's own `Drop` unmaps the view and closes the handle,
             // in that order. Nothing to do here but let it run.
             #[cfg(windows)]

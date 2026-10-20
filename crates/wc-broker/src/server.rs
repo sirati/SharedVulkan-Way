@@ -611,6 +611,20 @@ impl<P: Platform> Broker<P> {
         self.lock().on_leased_checked.push(f);
     }
 
+    /// Redeem one piece over another OS-authenticated local channel. The
+    /// existing core lease is checked under the same lock that holds the
+    /// objects alive and serializes close/retire. The callback must not call
+    /// the broker. It must finish transferring the capability before return.
+    pub fn with_region_lease<T>(&self, peer: &Peer, id: ObjId, epoch: u64, piece: usize,
+        transfer: impl FnOnce(&P::Object, u64, u64) -> io::Result<T>) -> io::Result<T> {
+        let st = self.lock();
+        st.core.leased_region(peer, id, epoch).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.0))?;
+        let held = st.objs.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "region object missing"))?;
+        let (obj, (offset, len)) = held.iter().flat_map(|h| h.pieces.iter().map(move |p| (&h.obj, *p)))
+            .nth(piece).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "region piece missing"))?;
+        transfer(obj, offset, len)
+    }
+
     /// The processes holding a lease on region `id` now, so that a
     /// restarted embedder can watch them again.
     pub fn holders(&self, id: ObjId) -> Vec<Pid> {

@@ -239,3 +239,10 @@ impl fmt::Display for Error {
 impl core::error::Error for Error {}
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// Validation of GPU-owner pool offers for either client operating system.
+pub mod poolattach;
+
+/// Owned Mach memory-entry rights and retained shared mappings.
+#[cfg(target_os = "macos")]
+pub mod mach;

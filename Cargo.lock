@@ -1337,6 +1337,7 @@ dependencies = [
  "sv-transport",
  "sv-wire",
  "wc-broker",
+ "wc-handle",
 ]
 
 [[package]]
@@ -1386,6 +1387,7 @@ dependencies = [
 name = "sv-transport"
 version = "0.1.0"
 dependencies = [
+ "arena-record",
  "sv-wire",
 ]
 
