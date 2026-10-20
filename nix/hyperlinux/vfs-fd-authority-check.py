@@ -38,7 +38,12 @@ int main(void) {
  assert(held.st_ino!=reused.st_ino);
  int cwd=open(".",O_RDONLY);assert(fchdir(snap.ref.host_fd)==0);
  struct stat current;assert(stat(".",&current)==0&&current.st_ino==held.st_ino);
- assert(fchdir(cwd)==0);close(cwd);vfs_dirfd_drop(&snap);
+ assert(fchdir(cwd)==0);close(cwd);
+#ifdef __APPLE__
+ char nativepath[4096];assert(vfs_dirfd_path(&snap,nativepath,sizeof(nativepath))==0);
+ struct stat resolved;assert(stat(nativepath,&resolved)==0&&resolved.st_ino==held.st_ino);
+#endif
+ vfs_dirfd_drop(&snap);
  hl_open_file_t *of=hl_open_file_create(FD_REGULAR,NULL,0,NULL);assert(of);
  of->guest_path_hint=strdup(a);fd_table[g].of=of;
  assert(vfs_dirfd_snapshot(g,&snap)==0);
