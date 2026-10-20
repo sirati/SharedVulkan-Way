@@ -514,6 +514,8 @@ fn daemon_shutdown_retains_live_regions_and_orphans_until_explicit_release() {
 }
 
 /// `on_leased` sees a lease, with its holder's pid, before the fds arrive.
+/// This fixture uses Linux memfd_create.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_lease_is_told_before_its_fds_are_sent() {
     let d = dir("leased");
