@@ -151,6 +151,8 @@ struct Args {
     /// compositor starts; here it is a flag, which is the same fact supplied
     /// the same way — out of band.
     arenas: Vec<(u32, u64, String)>,
+    /// Host mapping of a live QMP-authenticated ivshmem BAR, not a file fixture.
+    qemu_arenas: Vec<(u32, u64, u8, String, String)>,
     /// DYNAMIC ARENA, fixture only: where to find regions the peer grew into.
     /// See `wc_handle::arena::set_grow_dir` for why the deployment needs none.
     arena_grow_dir: Option<String>,
@@ -389,6 +391,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         log: None,
         expect_presents: 0,
         arenas: Vec::new(),
+        qemu_arenas: Vec::new(),
         arena_grow_dir: None,
         guest_arenas: Vec::new(),
         ivshmem_arena: None,
@@ -464,6 +467,22 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             // `id:size:path`, split from the left twice so a Windows path with
             // a drive letter in it survives — `0:67108864:Z:\tmp\wc-arena` is
             // the normal spelling and a naive split on ':' would eat it.
+            "--arena-qemu-bar" => {
+                let Some(value) = it.next() else {
+                    eprintln!("wc-compositor: --arena-qemu-bar needs id:run:slot:device:qmp");
+                    return Err(2);
+                };
+                let parts: Vec<_> = value.splitn(5, ':').collect();
+                if parts.len() != 5 {
+                    eprintln!("wc-compositor: invalid --arena-qemu-bar specification");
+                    return Err(2);
+                }
+                let (Ok(id), Ok(run), Ok(slot)) = (parts[0].parse(), parts[1].parse(), parts[2].parse()) else {
+                    eprintln!("wc-compositor: invalid BAR id/run/slot");
+                    return Err(2);
+                };
+                args.qemu_arenas.push((id, run, slot, parts[3].to_owned(), parts[4].to_owned()));
+            }
             "--arena" => {
                 let Some(v) = it.next() else {
                     eprintln!("wc-compositor: --arena needs id:size:path");
@@ -1159,6 +1178,41 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             }
         }
     }
+    if args.qemu_arenas.len() > 1 {
+        eprintln!("wc-compositor: one authenticated QEMU BAR arena per bounded session");
+        return std::process::ExitCode::from(2);
+    }
+    let qemu_arena_id = args.qemu_arenas.first().map(|arena| arena.0);
+    // Keep the authenticated QEMU fd and identity guard alive with its views.
+    #[cfg(target_os = "linux")]
+    let mut qemu_arena_guards = Vec::new();
+    for (id, run, slot, device, qmp) in &args.qemu_arenas {
+        #[cfg(target_os = "linux")]
+        {
+            let result = sv_hostd::qemu_bar::QemuBar::open(std::path::Path::new(qmp), device, *slot, false)
+                .and_then(|bar| {
+                    wc_handle::arena::attach_host_ivshmem(*id, &bar.file, *run,
+                        format!("QEMU {} device {} backend {}", bar.pid, bar.device, bar.backend))?;
+                    Ok(bar)
+                });
+            match result {
+                Ok(bar) => {
+                    println!("wc-compositor: QEMU BAR arena {id} run {run} pid {} device {} backend {} bytes {}", bar.pid, bar.device, bar.backend, bar.len);
+                    qemu_arena_guards.push(bar);
+                }
+                Err(error) => {
+                    eprintln!("wc-compositor: QEMU BAR attach refused: {error}");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, run, slot, device, qmp);
+            eprintln!("wc-compositor: host QEMU BAR arenas require Linux");
+            return std::process::ExitCode::from(2);
+        }
+    }
     // DYNAMIC ARENA. On the file fixture the peer can grow into regions this
     // process was never told about, because `--arena` names one and there is no
     // request in the protocol for a second. This says where to find them. On
@@ -1587,7 +1641,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
         .spawn(move || {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
-                args.decorations, ui, event_rx, control, args.in_band, args.exit_when_empty,
+                args.decorations, ui, event_rx, control, args.in_band, qemu_arena_id, args.exit_when_empty,
                 args.nested_globals || session_svc::multi());
             thread_exit.store(code, Ordering::SeqCst);
         });
@@ -1715,11 +1769,13 @@ fn wayland_thread(
     control: ControlHook,
     // §79. See `Args::in_band`.
     in_band: bool,
+    in_band_arena: Option<u32>,
     exit_when_empty: Option<Duration>,
     // §102. See `Args::nested_globals`.
     nested_globals: bool,
 ) -> u8 {
     use std::io::Write as _;
+    let in_band_encoding = in_band_arena.map(FdEncoding::InBandArena).unwrap_or(FdEncoding::InBand);
 
     // `mut` here rather than in the parameter list so the Windows build, where
     // the hook is a unit struct, does not carry an unused-mut.
@@ -1935,7 +1991,7 @@ fn wayland_thread(
                         // requires — nothing has been read off this connection yet.
                         if let Err(e) = display
                             .handle()
-                            .set_client_fd_encoding(client.id(), FdEncoding::InBand)
+                            .set_client_fd_encoding(client.id(), in_band_encoding)
                         {
                             eprintln!(
                                 "wc-compositor: ring slot {slot} could not be set in-band: {e}"
@@ -1991,10 +2047,10 @@ fn wayland_thread(
                         // §79. A socket carries no identity, so the dialect is
                         // whatever `--in-band` says. Default is out of band,
                         // which is what a stock libwayland client is.
-                        if in_band {
+                        if in_band || in_band_arena.is_some() {
                             if let Err(e) = display
                                 .handle()
-                                .set_client_fd_encoding(client.id(), FdEncoding::InBand)
+                                .set_client_fd_encoding(client.id(), in_band_encoding)
                             {
                                 eprintln!("wc-compositor: client {index} not set in-band: {e}");
                             } else {

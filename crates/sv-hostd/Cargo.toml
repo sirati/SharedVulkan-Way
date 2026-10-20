@@ -14,6 +14,7 @@ sv-wire = { workspace = true }
 wc-handle = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+serde_json = "1"
 # The stamped page record, defined once and shared with the guest half. design.md
 # §12 calls `arena-record` "the stamped page record, defined **once** so a match
 # cannot be an artefact of the two sides disagreeing about a field offset" — and

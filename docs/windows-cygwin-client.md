@@ -36,7 +36,7 @@ not a passing buffer test. `weston-info` is a real, unmodified libwayland
 application, but it only queries globals and does not map a window.
 
 The separate `wc-cygwin-link` native DLL and in-process libwayland adapter support
-one descriptor-free registry connection across a VM boundary. The library
+one bounded connection across a VM boundary. The library
 preserves Cygwin's local socketpair and POSIX readiness for the application,
 with no fork or target compiler. With `WC_WAYLAND_RING=1`, libwayland selects
 the ring adapter while the unchanged application still calls wl_display_connect. The adapter's
@@ -45,7 +45,7 @@ Windows broker. Every control/ring view retains the actual driver mapping
 owner. The Linux `wc-cygwin-host` connects the ring to a Linux Wayland socket,
 uses an eventfd doorbell wake without a periodic idle poll, and refuses any
 compositor SCM_RIGHTS event. It never creates, resizes or truncates the
-QEMU BAR backing object. The object must already be at least 6 MiB.
+QEMU BAR backing object. The registry-only layout requires at least 6 MiB; the rendered layout also reserves the header and pixel window.
 
 Build the native bridge through the shared build wrapper, then include it
 in the Cygwin bundle:
@@ -67,11 +67,9 @@ device is present. Keep profiles and HOME/XDG state under a throwaway run
 root. A same-machine MinGW test or a registry roundtrip cannot establish a
 rendered Cygwin window, a zero-copy wl_shm path, or hardware Vulkan results.
 
-Rendered Cygwin clients still require a BAR-backed application mmap/fd
-adapter and descriptor translation at the Linux compositor boundary.
-Ordinary file-backed Cygwin mmap followed by copying pixels into a BAR is
-not an accepted substitute. GPU forwarding remains upstream Mesa/Zink and
-is owned by the Windows Vulkan client work.
+The rendered path below supplies a BAR-backed application mmap/fd adapter
+and descriptor translation at the Linux compositor boundary. GPU forwarding
+remains upstream Mesa/Zink and is owned by the Windows Vulkan client work.
 
 
 Real Windows checks on 2026-10-20 used the shared disposable unaccelerated
@@ -88,4 +86,72 @@ Unchanged Cygwin `weston-info` enumerated the Linux compositor globals through
 broker-lent BAR rings and the doorbell. The host recorded 136 request bytes,
 1,008 reply bytes and zero descriptors. The Linux compositor was headless;
 this proves registry/roundtrip compatibility only. The clone stopped normally
-after the host writer exited. Real Cygwin rendered buffers remain unsupported.
+after the host writer exited. That registry run did not test rendered buffers.
+
+## BAR-backed rendered client path
+
+The rendered integration adds a shipped Cygwin POSIX companion DLL. The upstream
+Weston 10 `simple-shm.c` source is pinned and unchanged. It is rebuilt against
+that companion and the integrated libwayland; the build checks its PE imports
+so `mmap` and `os_create_anonymous_file` resolve to the companion. This does not
+claim compatibility with arbitrary prebuilt executables importing only the
+original Cygwin runtime.
+
+The companion creates an unlinked local file as an fd identity token, retaining
+a duplicate so a closed/reused descriptor number cannot acquire another pool's
+identity. It never maps that file. Its shared `mmap` returns the native DLL's
+pointer into a newly reserved BAR extent. Application stores therefore land in
+the same pages Linux reads. Unrelated mappings call the real `cygwin1.dll`
+implementation; unsupported mapping shapes fail explicitly.
+
+In the rendered layout, the existing WCIVSHMEM header occupies the first page,
+the pixel arena follows it, and the 6 MiB control/ring region occupies the tail.
+Both ends check the pinned nonzero run ID, arena ID, device size and geometry.
+The integrated libwayland serializer encodes each supported pool fd as the
+existing in-band `ArenaSlice` descriptor. The Linux compositor uses its existing
+`WireFd::Named` path. It maps only the read-only pixel window; neither header
+nor ring bytes can be addressed by a pool descriptor.
+
+`wc-cygwin-host --qemu-bar QMP DEVICE SLOT ARENA RUN WAYLAND_SOCKET WCBELL_SOCKET`
+checks the kernel-authenticated QMP peer, the live PCI slot/function/vendor/
+device/BAR2, its linked shared memory backend, and the exact backing inode held
+open by QEMU. It retains that descriptor. The compositor's matching
+`--arena-qemu-bar id:run:slot:device:qmp` performs the same identity checks.
+This is the host side of actual QEMU BAR RAM, without the file-arena fixture
+exception or a filesystem crossing the VM boundary.
+
+Allocation is bounded to 64 pools and the BAR pixel window. Extents are not
+recycled during the process, so destroying a local pool fd cannot invalidate
+pixels still retained by compositor buffers. Disconnect joins both Cygwin pump
+threads and marks the ring dead before session teardown. Token holds close at
+process teardown; the operating system releases the retained device mapping.
+This bounded implementation does not yet support pool growth, arbitrary file
+mapping semantics, received keyboard-map descriptors, or clipboard pipes.
+Received descriptors of those unsupported kinds are rejected before dispatch.
+
+The bounded host path requires a fresh BAR backend for each session and holds
+an exclusive initializer lock. It refuses every previously initialized header,
+including an invalidated one. It therefore cannot reassign an old process's
+pixel extents after a host restart. A long-running service with independently
+restarted clients needs a broker-owned allocation and retirement protocol;
+this proof does not substitute a reused offset for that protocol.
+
+
+The rendered path passed on real Windows on 2026-10-20. The unchanged rebuilt
+Weston simple-shm client mapped one 250,000-byte BAR pool directly. The Linux
+headless compositor presented 12 frames with 12 distinct pixel hashes. A final
+BAR snapshot matched a hash recorded by an actual presentation. The control
+rings carried 1,216 request bytes and 1,376 reply bytes, with zero kernel fds.
+The client exited normally, joined both pumps, closed its retained token fd,
+and marked the ring dead. Wrong PCI slot, Linux run identity, Windows run
+identity and backend reuse checks all refused the invalid operation. A real
+Cygwin unrelated anonymous mmap/munmap fallback also passed.
+
+Evidence is under
+`/mnt/datasets/builds/evidence/windows-cygwin-client/render-real-windows-2`.
+The PNG is a forensic capture after both applications exited. It is outside
+the live transport. No screenshot inspection or hardware GPU rendering is
+claimed. This run also repeated the native MinGW same-kernel GDI test with
+30 committed/presented frames and normal teardown. That native result does
+not establish a native MinGW cross-VM pixel path. The disposable clone stopped
+normally after both tests.

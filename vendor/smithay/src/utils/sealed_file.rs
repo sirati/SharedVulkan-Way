@@ -262,6 +262,10 @@ impl SealedFile {
         F: FnOnce(crate::utils::os::BorrowedProtoFd<'_>) -> T,
     {
         match encoding {
+            crate::utils::os::FdEncoding::InBandArena(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this connection only permits its authenticated BAR arena",
+            )),
             crate::utils::os::FdEncoding::InBand => {
                 let handle = self.named()?;
                 Ok(f(crate::utils::os::BorrowedProtoFd::Named(&handle)))

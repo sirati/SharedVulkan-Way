@@ -159,3 +159,6 @@ windows-sys = { workspace = true, features = [
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_System_Com",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sv-hostd = { workspace = true }

@@ -1,6 +1,6 @@
-//! A descriptor-free reverse Wayland bridge for the Cygwin registry proof.
+//! A reverse Wayland byte bridge with an optional authenticated BAR arena.
 //! Never use read() to silently discard compositor SCM_RIGHTS: fd-bearing
-//! events are refused, and rendered/shm client support is not claimed.
+//! events are refused. BAR pool descriptors use the existing in-band dialect.
 #[cfg(target_os = "linux")]
 mod host {
     use std::io::{self, Write};
@@ -13,6 +13,14 @@ mod host {
     use sv_transport::region::SharedRegion;
     use sv_transport::vdoorbell::{self, BellTarget};
     use sv_transport::wlbytes::{ByteChannel, Endpoint, ReadOutcome};
+
+    struct HeaderLease(Arc<SharedRegion>);
+    impl Drop for HeaderLease {
+        fn drop(&mut self) {
+            // SAFETY: this host owns publication for the whole retained page.
+            let _ = unsafe { wc_handle::ivshmem::invalidate(self.0.base_ptr()) };
+        }
+    }
 
     struct Wake {
         control: Arc<Control>,
@@ -104,24 +112,90 @@ mod host {
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = std::env::args().collect();
-        if args.len() != 4 {
-            return Err(
-                "usage: wc-cygwin-host EXISTING_BAR_FILE LINUX_WAYLAND_SOCKET WCBELL_SOCKET".into(),
-            );
-        }
-        // The QEMU memory backend must already exist. Never create, resize,
-        // or truncate a device backing object while a VM has it mapped.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&args[1])?;
         let geometry = Geometry::for_wayland();
-        if file.metadata()?.len() < geometry.control_size {
-            return Err("Wayland BAR is smaller than control geometry".into());
-        }
+        let (file, socket_path, bell_path, control_offset, header, _bar_guard) = if args.len() == 9
+            && args[1] == "--qemu-bar"
+        {
+            let slot: u8 = args[4].parse()?;
+            let arena_id: u32 = args[5].parse()?;
+            let run_id: u64 = args[6].parse()?;
+            if run_id == 0 {
+                return Err("zero BAR run identity".into());
+            }
+            let bar = sv_hostd::qemu_bar::QemuBar::open(
+                std::path::Path::new(&args[2]),
+                &args[3],
+                slot,
+                true,
+            )?;
+            let rings_offset = bar
+                .len
+                .checked_sub(geometry.control_size)
+                .ok_or("BAR is smaller than rings")?;
+            if rings_offset <= wc_handle::ivshmem::HEADER_BYTES
+                || !rings_offset.is_multiple_of(4096)
+            {
+                return Err("BAR has no aligned pixel window".into());
+            }
+            let file = bar.file.try_clone()?;
+            // One bounded session per backend lifetime. Even an invalidated
+            // prior header forbids reuse while a Windows process could retain
+            // its BAR mapping; create a fresh VM backend after guest teardown.
+            use std::os::unix::fs::FileExt;
+            let mut previous = [0u8; wc_handle::ivshmem::ENCODED_LEN];
+            file.read_exact_at(&mut previous, 0)?;
+            if previous.iter().any(|byte| *byte != 0) {
+                return Err(
+                    "Wayland BAR backend was already initialized; refusing session/extent reuse"
+                        .into(),
+                );
+            }
+            let page = Arc::new(SharedRegion::map_fd(
+                file.as_fd(),
+                0,
+                wc_handle::ivshmem::HEADER_BYTES as usize,
+            )?);
+            // SAFETY: retained writable header page, sole fixture publisher.
+            let generation = unsafe { wc_handle::ivshmem::invalidate(page.base_ptr()) }
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or("BAR generation overflow")?;
+            let header = wc_handle::ivshmem::Header {
+                run_id,
+                generation,
+                region_len: bar.len,
+                arena_id,
+                outbound: (0, 0),
+                rings: (rings_offset, geometry.control_size),
+            };
+            println!(
+                "WC_CYGWIN_BAR pid={} device={} backend={} bytes={} run={} arena={}",
+                bar.pid, bar.device, bar.backend, bar.len, run_id, arena_id
+            );
+            (
+                file,
+                &args[7],
+                &args[8],
+                rings_offset,
+                Some((HeaderLease(page), header)),
+                Some(bar),
+            )
+        } else if args.len() == 4 {
+            // Existing descriptor-free registry fixture. Never create or resize.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&args[1])?;
+            if file.metadata()?.len() < geometry.control_size {
+                return Err("Wayland BAR is smaller than control geometry".into());
+            }
+            (file, &args[2], &args[3], 0, None, None)
+        } else {
+            return Err("usage: wc-cygwin-host EXISTING_BAR_FILE WAYLAND_SOCKET WCBELL_SOCKET | --qemu-bar QMP DEVICE SLOT ARENA RUN WAYLAND_SOCKET WCBELL_SOCKET".into());
+        };
         let region = Arc::new(SharedRegion::map_fd(
             file.as_fd(),
-            0,
+            control_offset,
             geometry.control_size as usize,
         )?);
         let control = Arc::new(Control::create(
@@ -140,9 +214,15 @@ mod host {
             control: Arc::clone(&control),
             event,
         });
-        let (_door, connected) = vdoorbell::attach_host_reconnecting(&args[3], Arc::clone(&wake))?;
+        let (_door, connected) = vdoorbell::attach_host_reconnecting(bell_path, Arc::clone(&wake))?;
         if !connected {
             return Err("Wayland doorbell is not connected".into());
+        }
+        if let Some((lease, value)) = &header {
+            // SAFETY: initialization and doorbell attachment completed before publication.
+            unsafe {
+                wc_handle::ivshmem::write_into(lease.0.base_ptr(), value);
+            }
         }
         println!(
             "WC_CYGWIN_HOST_READY control_bytes={} descriptor_mode=refuse",
@@ -169,7 +249,7 @@ mod host {
                 }
                 if let Some(slot) = slots.first() {
                     channel = Some(ByteChannel::open(&control, *slot, Endpoint::Peer)?);
-                    let s = UnixStream::connect(&args[2])?;
+                    let s = UnixStream::connect(socket_path)?;
                     s.set_nonblocking(true)?;
                     socket = Some(s);
                 }
@@ -224,10 +304,18 @@ mod host {
                 }
                 if eof && to_socket.is_empty() && to_ring.is_empty() {
                     let _ = ch.write_eof();
-                    println!(
-                        "WC_CYGWIN_HOST_DONE request_bytes={requests} reply_bytes={replies} fds_crossed=0"
-                    );
-                    return Ok(());
+                    if header.is_none()
+                        || control.ring_state(ch.slot())? == sv_transport::control::RingState::Dead
+                    {
+                        println!(
+                            "WC_CYGWIN_HOST_DONE request_bytes={requests} reply_bytes={replies} fds_crossed=0 ring_dead={}",
+                            u8::from(
+                                control.ring_state(ch.slot())?
+                                    == sv_transport::control::RingState::Dead
+                            )
+                        );
+                        return Ok(());
+                    }
                 }
                 if to_ring.len() > 65536 || to_socket.len() > 65536 {
                     return Err("bounded bridge queue overflow".into());
@@ -240,9 +328,10 @@ mod host {
                 bell.parked
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            if channel
-                .as_ref()
-                .is_some_and(|c| c.readable().unwrap_or(true))
+            if !eof
+                && channel
+                    .as_ref()
+                    .is_some_and(|c| c.readable().unwrap_or(true))
             {
                 if let Some(bell) = &parked {
                     bell.parked
@@ -257,7 +346,11 @@ mod host {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: socket.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                    fd: if eof {
+                        -1
+                    } else {
+                        socket.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+                    },
                     events: libc::POLLIN
                         | if to_socket.is_empty() {
                             0

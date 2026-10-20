@@ -17,4 +17,6 @@ wc-broker = { workspace = true }
 wc-handle = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+sv-hostd = { workspace = true }
+wc-handle = { workspace = true }
 libc = { workspace = true }

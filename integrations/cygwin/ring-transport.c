@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -18,6 +19,26 @@ __declspec(dllimport) intptr_t wc_bridge_write(const uint8_t *, size_t);
 __declspec(dllimport) void wc_bridge_close(void);
 
 struct pump { int socket; unsigned references; pthread_mutex_t lock; };
+static pthread_mutex_t owner_lock = PTHREAD_MUTEX_INITIALIZER;
+static int owner_fd = -1;
+static pthread_t owner_tx, owner_rx;
+
+void wc_cygwin_ring_disconnect(int fd)
+{
+    pthread_mutex_lock(&owner_lock);
+    if (fd != owner_fd) { pthread_mutex_unlock(&owner_lock); return; }
+    owner_fd = -1;
+    pthread_t tx = owner_tx, rx = owner_rx;
+    pthread_mutex_unlock(&owner_lock);
+    /* EOF follows all bytes already written. Keep the read side open until
+     * the request pump has drained and published its final ring state. */
+    shutdown(fd, SHUT_WR);
+    pthread_join(tx, NULL);
+    shutdown(fd, SHUT_RDWR);
+    pthread_join(rx, NULL);
+    fprintf(stderr, "WC_CYGWIN_PUMPS_JOINED threads=2\n");
+}
+
 
 static void release(struct pump *p)
 {
@@ -94,6 +115,8 @@ int wc_cygwin_ring_socket(void)
         wc_bridge_close(); shutdown(sockets[0], SHUT_RDWR); close(sockets[0]);
         release(p); pthread_join(tx, NULL); errno = EAGAIN; return -1;
     }
-    pthread_detach(tx); pthread_detach(rx);
+    pthread_mutex_lock(&owner_lock);
+    owner_fd = sockets[0]; owner_tx = tx; owner_rx = rx;
+    pthread_mutex_unlock(&owner_lock);
     return sockets[0];
 }

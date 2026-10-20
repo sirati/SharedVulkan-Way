@@ -147,6 +147,36 @@ pub fn attach(id: u32, path: &str, size: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Attach the pixel window of an authenticated live QEMU ivshmem backend.
+/// The host must retain its QEMU/backend identity guard for the whole session.
+/// Header and rings are excluded from every ArenaSlice addressable byte.
+#[cfg(target_os = "linux")]
+pub fn attach_host_ivshmem(id: u32, file: &std::fs::File, expected_run: u64, origin: String) -> io::Result<()> {
+    use crate::ivshmem::{Header, HEADER_BYTES, ENCODED_LEN};
+    use std::os::unix::fs::FileExt;
+    if expected_run == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero BAR run identity")); }
+    let mut bytes = [0u8; ENCODED_LEN];
+    file.read_exact_at(&mut bytes, 0)?;
+    let header = Header::decode(&bytes)?;
+    if header.run_id != expected_run || header.arena_id != id || header.region_len != file.metadata()?.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "BAR run/arena/backend size identity differs"));
+    }
+    let len = usize::try_from(header.arena_len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "BAR pixel window exceeds address space"))?;
+    let view = platform::map_file_window(file, HEADER_BYTES, len)?;
+    let mut after = [0u8; ENCODED_LEN];
+    file.read_exact_at(&mut after, 0)?;
+    if bytes != after {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "BAR header changed while attaching"));
+    }
+    let mut guard = registry().write().map_err(|_| io::Error::other("arena registry poisoned"))?;
+    if guard.contains_key(&id) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "BAR arena already attached"));
+    }
+    guard.insert(id, Attached { view: Arc::new(view), len, origin, provided: false, base: 0, fixed: true });
+    Ok(())
+}
+
 /// Attach arena `id` as a **file this process may write**: the local twin of
 /// [`attach_guest_ram`], for a machine with no hypervisor in it.
 ///
@@ -2503,4 +2533,34 @@ mod release_tests {
         assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
     }
 
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod host_bar_tests {
+    use super::*;
+    use crate::ivshmem::{Header, HEADER_BYTES};
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn authenticated_host_bar_excludes_header_and_rings() {
+        let id = 9491;
+        let path = std::env::temp_dir().join(format!("wc-host-bar-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len(HEADER_BYTES * 3).unwrap();
+        let header = Header { run_id: 77, generation: 1, region_len: HEADER_BYTES * 3,
+            arena_id: id, outbound: (0, 0), rings: (HEADER_BYTES * 2, HEADER_BYTES) };
+        file.write_all(&header.encode()).unwrap();
+        file.seek(SeekFrom::Start(HEADER_BYTES)).unwrap();
+        file.write_all(&vec![0x53; HEADER_BYTES as usize]).unwrap();
+        assert!(attach_host_ivshmem(id, &file, 76, "wrong run".into()).is_err());
+        assert!(attach_host_ivshmem(id + 1, &file, 77, "wrong arena".into()).is_err());
+        attach_host_ivshmem(id, &file, 77, "retained test BAR".into()).unwrap();
+        drop(file);
+        let handle = crate::Handle::from_descriptor(crate::Descriptor::ArenaSlice { arena: id, offset: 0, len: HEADER_BYTES });
+        let view = handle.map().unwrap();
+        assert!(view.as_slice().iter().all(|byte| *byte == 0x53));
+        let outside = crate::Handle::from_descriptor(crate::Descriptor::ArenaSlice { arena: id, offset: HEADER_BYTES, len: 1 });
+        assert!(outside.map().is_err());
+    }
 }
