@@ -249,8 +249,61 @@ index 1041c94..2ca2809 100644
      /* Sysroot path (for dynamic linker library resolution) */
      char sysroot_ipc[LINUX_PATH_MAX] = {0};
      const char *sr = proc_get_sysroot();
+diff --git a/src/futex.c b/src/futex.c
+index bbf5a81..ff3d999 100644
+--- a/src/futex.c
++++ b/src/futex.c
+@@ -1,3 +1,4 @@
++#include "hl_shared.h"
+ /* futex.c — Linux futex emulation for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -483,7 +484,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+     if (op_shift) op_arg = (int)(1U << (op_arg & 0x1F));
+ 
+     /* Atomically modify *uaddr2 */
+-    uint32_t *word2 = (uint32_t *)guest_ptr(g, uaddr2);
++    uint32_t *word2 = (uint32_t *)guest_ptr_access(g, uaddr2, NULL, 1);
+     if (!word2) {
+         if (idx1 != idx2) pthread_mutex_unlock(&b2->lock);
+         pthread_mutex_unlock(&b1->lock);
+@@ -595,7 +596,7 @@ static int64_t futex_wake_op(guest_t *g, uint64_t uaddr, uint32_t val,
+  * one queued waiter so another waiter cannot be stranded by a fast unlock. */
+ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+                               uint64_t timeout_gva) {
+-    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
++    uint32_t *word = (uint32_t *)guest_ptr_access(g, uaddr, NULL, 1);
+     if (!word) return -LINUX_EFAULT;
+ 
+     uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+@@ -773,7 +774,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr,
+ /* FUTEX_TRYLOCK_PI: Non-blocking version of LOCK_PI.
+  * CAS 0 → TID; if the lock is held, return -EAGAIN immediately. */
+ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
+-    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
++    uint32_t *word = (uint32_t *)guest_ptr_access(g, uaddr, NULL, 1);
+     if (!word) return -LINUX_EFAULT;
+ 
+     uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+@@ -797,7 +798,7 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr) {
+  * owner must observe FUTEX_WAITERS while another waiter remains, otherwise
+  * its legal userspace fast unlock can strand that waiter indefinitely. */
+ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+-    uint32_t *word = (uint32_t *)guest_ptr(g, uaddr);
++    uint32_t *word = (uint32_t *)guest_ptr_access(g, uaddr, NULL, 1);
+     if (!word) return -LINUX_EFAULT;
+ 
+     uint32_t tid = current_thread ? (uint32_t)current_thread->guest_tid
+@@ -851,6 +852,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr) {
+ 
+ int64_t sys_futex(guest_t *g, uint64_t uaddr, int op, uint32_t val,
+                   uint64_t timeout_gva, uint64_t uaddr2, uint32_t val3) {
++    HL_WC_ACCESS_SCOPE;
+     int cmd = op & FUTEX_CMD_MASK;
+ 
+     switch (cmd) {
 diff --git a/src/guest.c b/src/guest.c
-index 1fa8b35..6457d95 100644
+index 1fa8b35..79aa517 100644
 --- a/src/guest.c
 +++ b/src/guest.c
 @@ -32,6 +32,7 @@
@@ -278,16 +331,82 @@ index 1fa8b35..6457d95 100644
      if (g->host_base) {
          munmap(g->host_base, g->guest_size);
          g->host_base = NULL;
-@@ -696,6 +698,8 @@ guest_set_extra_resolve(guest_extra_resolve_fn fn)
+@@ -694,8 +696,11 @@ guest_set_extra_resolve(guest_extra_resolve_fn fn)
+     g_extra_resolve = fn;
+ }
  
- static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
+-static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
++static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
      /* SysV SHM / other external host mappings (before identity fast path). */
-+    void *shared = hl_wc_resolve(gva, avail);
-+    if (shared) return shared;
++    int found;
++    void *shared = hl_wc_resolve(gva, avail, write, &found);
++    if (found) return shared;
      if (g_extra_resolve) {
          void *ep = g_extra_resolve(gva, avail);
          if (ep)
-@@ -827,6 +831,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
+@@ -752,14 +757,19 @@ static void *gva_resolve(const guest_t *g, uint64_t gva, uint64_t *avail) {
+ }
+ 
+ void *guest_ptr(const guest_t *g, uint64_t gva) {
+-    return gva_resolve(g, gva, NULL);
++    return gva_resolve(g, gva, NULL, 0);
+ }
+ 
+ void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail) {
+-    return gva_resolve(g, gva, avail);
++    return gva_resolve(g, gva, avail, 0);
++}
++
++void *guest_ptr_access(const guest_t *g, uint64_t gva, uint64_t *avail, int write) {
++    return gva_resolve(g, gva, avail, write);
+ }
+ 
+ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
++    HL_WC_ACCESS_SCOPE;
+     /* Loop across 2MB block boundaries. Each gva_resolve() call returns
+      * the host pointer and available bytes to the end of the current
+      * 2MB block. Multi-block reads (e.g., large structs spanning a
+@@ -767,7 +777,7 @@ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
+     size_t copied = 0;
+     while (copied < len) {
+         uint64_t avail;
+-        void *ptr = gva_resolve(g, gva + copied, &avail);
++        void *ptr = gva_resolve(g, gva + copied, &avail, 0);
+         if (!ptr) return -1;
+         size_t chunk = len - copied;
+         if (chunk > avail) chunk = avail;
+@@ -778,11 +788,12 @@ int guest_read(const guest_t *g, uint64_t gva, void *dst, size_t len) {
+ }
+ 
+ int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len) {
++    HL_WC_ACCESS_SCOPE;
+     /* Loop across 2MB block boundaries (see guest_read comment). */
+     size_t copied = 0;
+     while (copied < len) {
+         uint64_t avail;
+-        void *ptr = gva_resolve(g, gva + copied, &avail);
++        void *ptr = gva_resolve(g, gva + copied, &avail, 1);
+         if (!ptr) return -1;
+         size_t chunk = len - copied;
+         if (chunk > avail) chunk = avail;
+@@ -793,6 +804,7 @@ int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len) {
+ }
+ 
+ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
++    HL_WC_ACCESS_SCOPE;
+     if (max == 0) return -1; /* Prevent underflow in max - 1 */
+     size_t copied = 0;
+     size_t limit = max - 1;
+@@ -802,7 +814,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
+      * region and scans for NUL within the available bytes. */
+     while (copied < limit) {
+         uint64_t avail;
+-        void *ptr = gva_resolve(g, gva + copied, &avail);
++        void *ptr = gva_resolve(g, gva + copied, &avail, 0);
+         if (!ptr) break;
+ 
+         size_t remain = limit - copied;
+@@ -827,6 +839,7 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max) {
  /* ---------- guest_reset ---------- */
  
  void guest_reset(guest_t *g) {
@@ -295,7 +414,7 @@ index 1fa8b35..6457d95 100644
      /* Zero only actually-used memory regions. With a potentially 1TB
       * address space, memset of the entire range would fault in all
       * demand-paged memory for no benefit. PROT_NONE regions (e.g., GHC's
-@@ -2016,3 +2021,32 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
+@@ -2016,3 +2029,32 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
  
      return 0;
  }
@@ -329,7 +448,7 @@ index 1fa8b35..6457d95 100644
 +    return 0;
 +}
 diff --git a/src/guest.h b/src/guest.h
-index a7da8fb..c7c483b 100644
+index a7da8fb..b5b6c33 100644
 --- a/src/guest.h
 +++ b/src/guest.h
 @@ -17,6 +17,13 @@
@@ -346,7 +465,16 @@ index a7da8fb..c7c483b 100644
  #include <stdint.h>
  #include <stddef.h>
  
-@@ -302,6 +309,7 @@ void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail);
+@@ -296,12 +303,16 @@ void *guest_ptr(const guest_t *g, uint64_t gva);
+  * the current memory region. Use this when passing guest buffers directly
+  * to host syscalls (read/write) to prevent accessing past the region. */
+ void *guest_ptr_avail(const guest_t *g, uint64_t gva, uint64_t *avail);
++/* External raw pointers require a live hl_wc_access_scope through final use.
++ * write is nonzero when native code may modify guest memory. */
++void *guest_ptr_access(const guest_t *, uint64_t, uint64_t *, int write);
+ 
+ /* Optional VA→host resolver consulted before the primary/overflow paths.
+  * Used by SysV SHM so shared host pages are reachable even when IPA sits
   * inside the primary IPA span (40-bit full-size primary). */
  typedef void *(*guest_extra_resolve_fn)(uint64_t gva, uint64_t *avail);
  void guest_set_extra_resolve(guest_extra_resolve_fn fn);
@@ -459,7 +587,7 @@ index 9d1b246..9e15c29 100644
          if ((size_t)len >= sizeof(buf)) len = sizeof(buf) - 1;
          return proc_synthetic_fd(buf, len);
 diff --git a/src/syscall.c b/src/syscall.c
-index a0f5f67..e58dd00 100644
+index a0f5f67..6cf1e25 100644
 --- a/src/syscall.c
 +++ b/src/syscall.c
 @@ -19,6 +19,8 @@
@@ -505,7 +633,15 @@ index a0f5f67..e58dd00 100644
          /* Remove any existing region coverage in the fixed range */
          guest_region_remove(g, result_off, result_off + length);
  
-@@ -1289,6 +1297,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1155,6 +1163,7 @@ static int64_t sys_mmap(guest_t *g, uint64_t addr, uint64_t length,
+ /* ---------- Main dispatch ---------- */
+ 
+ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
++    HL_WC_ACCESS_SCOPE;
+     uint64_t x0, x1, x2, x3, x4, x5, x8;
+ 
+     hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
+@@ -1289,6 +1298,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          /* Linux returns EINVAL for non-page-aligned address or zero length */
          if ((unmap_addr & 4095) || x1 == 0) { result = -LINUX_EINVAL; break; }
          uint64_t unmap_len = (x1 + 4095) & ~4095ULL;
@@ -513,7 +649,7 @@ index a0f5f67..e58dd00 100644
          if (unmap_len == 0) { result = -LINUX_EINVAL; break; }  /* overflow */
          if (unmap_addr > UINT64_MAX - unmap_len) {
              result = -LINUX_EINVAL;
-@@ -1296,6 +1305,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1296,6 +1306,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          }
          pthread_mutex_lock(&mmap_lock);
  
@@ -522,7 +658,7 @@ index a0f5f67..e58dd00 100644
          if (unmap_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
              /* Kernel VA (TTBR1 kbuf): zero the backing memory and
               * remove region tracking. PTEs remain valid — kbuf L2
-@@ -1421,6 +1432,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1421,6 +1433,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          }
          pthread_mutex_lock(&mmap_lock);
  
@@ -531,7 +667,7 @@ index a0f5f67..e58dd00 100644
          if (mprot_addr > GUEST_USER_VA_MAX && g->kbuf_base) {
              /* Kbuf (TTBR1 kernel VA): update page permissions via
               * kbuf page table helpers. */
-@@ -1526,12 +1539,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -1526,12 +1540,10 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          break;
  
      /* ---- Identity and info syscalls ---- */
@@ -548,7 +684,7 @@ index a0f5f67..e58dd00 100644
      case SYS_gettimeofday:
          result = sys_gettimeofday(g, x0, x1);
          break;
-@@ -2000,8 +2011,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2000,8 +2012,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          result = 0;  /* Stub: pretend success */
          break;
      case SYS_getresuid: {
@@ -558,7 +694,7 @@ index a0f5f67..e58dd00 100644
          if ((x0 && guest_write(g, x0, &uid, 4) < 0) ||
              (x1 && guest_write(g, x1, &uid, 4) < 0) ||
              (x2 && guest_write(g, x2, &uid, 4) < 0)) {
-@@ -2012,7 +2022,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2012,7 +2023,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          break;
      }
      case SYS_getresgid: {
@@ -567,7 +703,7 @@ index a0f5f67..e58dd00 100644
          if ((x0 && guest_write(g, x0, &gid, 4) < 0) ||
              (x1 && guest_write(g, x1, &gid, 4) < 0) ||
              (x2 && guest_write(g, x2, &gid, 4) < 0)) {
-@@ -2274,13 +2284,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2274,13 +2285,19 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          char template[] = "/tmp/hl-memfd-XXXXXX";
          int fd = mkstemp(template);
          if (fd < 0) { result = linux_errno(); break; }
@@ -593,7 +729,7 @@ index a0f5f67..e58dd00 100644
          break;
      }
      case SYS_mlock:
-@@ -2288,9 +2304,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
+@@ -2288,9 +2305,11 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, int verbose) {
          result = 0;  /* Stub: pretend success */
          break;
      case SYS_msync: {
@@ -609,7 +745,7 @@ index a0f5f67..e58dd00 100644
      }
      case SYS_mincore:
 diff --git a/src/syscall_fs.c b/src/syscall_fs.c
-index b7b3337..2f5d2b4 100644
+index b7b3337..2535218 100644
 --- a/src/syscall_fs.c
 +++ b/src/syscall_fs.c
 @@ -7,6 +7,8 @@
@@ -677,6 +813,24 @@ index b7b3337..2f5d2b4 100644
      if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
      if (fd_table[fd].type == FD_CLOSED) return -LINUX_EBADF;
  
+@@ -1315,7 +1333,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+     if (fd_table[fd].type == FD_VIRTUAL_DIR) {
+         hl_vdir_t *vd = (hl_vdir_t *)fd_table[fd].dir;
+         if (!vd) return -LINUX_ENOTDIR;
+-        if (!guest_ptr(g, buf_gva)) return -LINUX_EFAULT;
++        if (!guest_ptr_access(g, buf_gva, NULL, 1)) return -LINUX_EFAULT;
+         size_t pos = 0;
+         uint8_t ent[280];
+         /* "." and ".." first, then one entry per child mount component. */
+@@ -1346,7 +1364,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+     DIR *dir = (DIR *)fd_table[fd].dir;
+     if (!dir) return -LINUX_ENOTDIR;
+ 
+-    if (!guest_ptr(g, buf_gva)) return -LINUX_EFAULT;
++    if (!guest_ptr_access(g, buf_gva, NULL, 1)) return -LINUX_EFAULT;
+ 
+     size_t guest_pos = 0;
+     struct dirent *de;
 @@ -1587,6 +1605,9 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags) {
      if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
          return -LINUX_EFAULT;
@@ -734,10 +888,15 @@ index b7b3337..2f5d2b4 100644
      int ret = fremovexattr(host_fd, name, 0);
      return ret < 0 ? linux_errno() : 0;
 diff --git a/src/syscall_io.c b/src/syscall_io.c
-index 5c6d8f1..03d3c49 100644
+index 5c6d8f1..72d460e 100644
 --- a/src/syscall_io.c
 +++ b/src/syscall_io.c
-@@ -14,6 +14,7 @@
+@@ -1,3 +1,4 @@
++#include "hl_shared.h"
+ /* syscall_io.c — Core I/O syscall handlers for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -14,6 +15,7 @@
  #include "syscall_inotify.h"
  #include "syscall.h"
  #include "syscall_internal.h"
@@ -745,7 +904,15 @@ index 5c6d8f1..03d3c49 100644
  #include "syscall_proc.h"
  #include "syscall_signal.h"
  #include "rosetta.h"
-@@ -286,8 +287,9 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+@@ -270,6 +272,7 @@ static uint32_t mac_lflag_to_linux(tcflag_t mf) {
+ /* ---------- basic read/write ---------- */
+ 
+ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
++    HL_WC_ACCESS_SCOPE;
+     if (fd >= 0 && fd < FD_TABLE_SIZE && fd_table[fd].type == FD_EVENTFD)
+         return eventfd_write(fd, g, buf_gva, count);
+ 
+@@ -286,8 +289,9 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
          }
      }
  
@@ -757,7 +924,7 @@ index 5c6d8f1..03d3c49 100644
  
      /* Linux: write(fd, NULL, 0) returns 0, not EFAULT */
      if (count == 0) return 0;
-@@ -301,7 +303,7 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+@@ -301,7 +305,7 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
      if (!buf) return -LINUX_EFAULT;
      if (count > avail) count = avail;
  
@@ -766,19 +933,54 @@ index 5c6d8f1..03d3c49 100644
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -372,8 +374,9 @@ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
+@@ -312,6 +316,7 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+ }
+ 
+ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
++    HL_WC_ACCESS_SCOPE;
+     if (fd >= 0 && fd < FD_TABLE_SIZE) {
+         if (fd_table[fd].type == FD_EVENTFD)
+             return eventfd_read(fd, g, buf_gva, count);
+@@ -345,7 +350,7 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+     /* Resolve buffer and cap count to available contiguous guest bytes.
+      * Prevents host read() from writing past the guest buffer boundary. */
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_avail(g, buf_gva, &avail);
++    void *buf = guest_ptr_access(g, buf_gva, &avail, 1);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+@@ -355,6 +360,7 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count) {
+ 
+ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
+                     uint64_t count, int64_t offset) {
++    HL_WC_ACCESS_SCOPE;
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+@@ -362,7 +368,7 @@ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
+     if (count == 0) return 0;
+ 
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_avail(g, buf_gva, &avail);
++    void *buf = guest_ptr_access(g, buf_gva, &avail, 1);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+@@ -372,8 +378,10 @@ int64_t sys_pread64(guest_t *g, int fd, uint64_t buf_gva,
  
  int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
                       uint64_t count, int64_t offset) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
++    HL_WC_ACCESS_SCOPE;
 +    hl_wc_seal_guard guard __attribute__((cleanup(hl_wc_seal_end))) = { .lockfd = -1 };
 +    if (hl_wc_seal_guest(fd, HL_WC_SEAL_PIN, 0, &guard) < 0) return linux_errno();
 +    int host_fd = guard.fd;
  
      /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
      if (count == 0) return 0;
-@@ -383,7 +386,7 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
+@@ -383,7 +391,7 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
      if (!buf) return -LINUX_EFAULT;
      if (count > avail) count = avail;
  
@@ -787,7 +989,50 @@ index 5c6d8f1..03d3c49 100644
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -531,14 +534,15 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+@@ -398,7 +406,7 @@ int64_t sys_pwrite64(guest_t *g, int fd, uint64_t buf_gva,
+  * and guest_ptr_avail for each buffer (caps to contiguous bytes).
+  * Returns 0 on success, -LINUX_EFAULT on bad guest pointer. */
+ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
+-                               struct iovec *host_iov) {
++                               struct iovec *host_iov, int write) {
+     linux_iovec_t guest_iov[1024]; /* UIO_MAXIOV */
+     if (iovcnt > 1024) iovcnt = 1024;
+     if (guest_read(g, iov_gva, guest_iov,
+@@ -411,7 +419,7 @@ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
+             continue;
+         }
+         uint64_t avail = 0;
+-        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
++        void *base = guest_ptr_access(g, guest_iov[i].iov_base, &avail, write);
+         if (!base) return -LINUX_EFAULT;
+         /* Cap to contiguous bytes within the 2MB block */
+         uint64_t len = guest_iov[i].iov_len;
+@@ -423,6 +431,7 @@ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
+ }
+ 
+ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
++    HL_WC_ACCESS_SCOPE;
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+     {
+         hl_fd_ref_t ref;
+@@ -473,7 +482,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+ 
+     struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 1);
+     if (err < 0) return err;
+ 
+     ssize_t ret = readv(host_fd, host_iov, iovcnt);
+@@ -481,6 +490,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+ }
+ 
+ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
++    HL_WC_ACCESS_SCOPE;
+     /* Special FD types: glibc may use writev() for eventfd wakeup writes.
+      * Delegate using the first iov entry.  Use giov.iov_len (not the
+      * sum of all iovs) — the data is at giov.iov_base which is only
+@@ -531,14 +541,15 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
          }
      }
  
@@ -798,7 +1043,8 @@ index 5c6d8f1..03d3c49 100644
 +    int host_fd = guard.fd;
  
      struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
-     int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 0);
      if (err < 0) return err;
  
 -    ssize_t ret = writev(host_fd, host_iov, iovcnt);
@@ -806,19 +1052,36 @@ index 5c6d8f1..03d3c49 100644
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -564,15 +568,16 @@ int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
+@@ -550,12 +561,13 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt) {
+ 
+ int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
+                    int iovcnt, int64_t offset) {
++    HL_WC_ACCESS_SCOPE;
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+ 
+     struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 1);
+     if (err < 0) return err;
+ 
+     ssize_t ret = preadv(host_fd, host_iov, iovcnt, offset);
+@@ -564,15 +576,17 @@ int64_t sys_preadv(guest_t *g, int fd, uint64_t iov_gva,
  
  int64_t sys_pwritev(guest_t *g, int fd, uint64_t iov_gva,
                      int iovcnt, int64_t offset) {
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
++    HL_WC_ACCESS_SCOPE;
 +    hl_wc_seal_guard guard __attribute__((cleanup(hl_wc_seal_end))) = { .lockfd = -1 };
 +    if (hl_wc_seal_guest(fd, HL_WC_SEAL_PIN, 0, &guard) < 0) return linux_errno();
 +    int host_fd = guard.fd;
      if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
  
      struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
-     int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov);
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 0);
      if (err < 0) return err;
  
 -    ssize_t ret = pwritev(host_fd, host_iov, iovcnt, offset);
@@ -826,7 +1089,7 @@ index 5c6d8f1..03d3c49 100644
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -1458,7 +1463,10 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
+@@ -1458,7 +1472,10 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
      int64_t new_size = offset + len;
      if (new_size < offset) return -LINUX_EFBIG;  /* Overflow check */
      if (new_size > st.st_size) {
@@ -838,7 +1101,7 @@ index 5c6d8f1..03d3c49 100644
              return linux_errno();
      }
      return 0;
-@@ -1466,7 +1474,9 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
+@@ -1466,7 +1483,9 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len) {
  
  int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
                       uint64_t offset_gva, uint64_t count) {
@@ -849,7 +1112,7 @@ index 5c6d8f1..03d3c49 100644
      int host_in = fd_to_host(in_fd);
      if (host_out < 0 || host_in < 0) return -LINUX_EBADF;
  
-@@ -1496,7 +1506,7 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
+@@ -1496,7 +1515,7 @@ int64_t sys_sendfile(guest_t *g, int out_fd, int in_fd,
          }
          if (nr == 0) break;  /* EOF */
  
@@ -858,7 +1121,7 @@ index 5c6d8f1..03d3c49 100644
          if (nw < 0) {
              if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
              if (total > 0) break;  /* Report partial success below */
-@@ -1525,7 +1535,9 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
+@@ -1525,7 +1544,9 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
                              uint64_t len, unsigned int flags) {
      (void)flags;
      int host_in = fd_to_host(fd_in);
@@ -869,7 +1132,7 @@ index 5c6d8f1..03d3c49 100644
      if (host_in < 0 || host_out < 0) return -LINUX_EBADF;
  
      /* Read optional offsets from guest memory */
-@@ -1559,9 +1571,9 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
+@@ -1559,9 +1580,9 @@ int64_t sys_copy_file_range(guest_t *g, int fd_in, uint64_t off_in_gva,
  
          ssize_t nw;
          if (off_out >= 0) {
@@ -881,7 +1144,7 @@ index 5c6d8f1..03d3c49 100644
          }
          if (nw < 0) {
              if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -1598,7 +1610,9 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
+@@ -1598,7 +1619,9 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
                     size_t len, unsigned int flags) {
      (void)flags;
      int host_in = fd_to_host(fd_in);
@@ -892,7 +1155,7 @@ index 5c6d8f1..03d3c49 100644
      if (host_in < 0 || host_out < 0) return -LINUX_EBADF;
  
      /* Handle offsets */
-@@ -1631,8 +1645,8 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
+@@ -1631,8 +1654,8 @@ int64_t sys_splice(guest_t *g, int fd_in, uint64_t off_in_gva,
          size_t written = 0;
          while (written < (size_t)r) {
              ssize_t w = (off_out >= 0)
@@ -903,9 +1166,11 @@ index 5c6d8f1..03d3c49 100644
              if (w <= 0) {
                  if (w < 0) { rw_error = 1; saved_errno = errno; }
                  if (w < 0 && saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -1667,8 +1681,9 @@ done:
+@@ -1666,9 +1689,11 @@ done:
+ /* vmsplice: emulate as writev to the pipe fd */
  int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
                       unsigned long nr_segs, unsigned int flags) {
++    HL_WC_ACCESS_SCOPE;
      (void)flags;
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
@@ -915,7 +1180,7 @@ index 5c6d8f1..03d3c49 100644
      if (nr_segs > 1024) return -LINUX_EINVAL;  /* UIO_MAXIOV */
      if (nr_segs > 64) nr_segs = 64;  /* local processing limit */
  
-@@ -1686,7 +1701,7 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
+@@ -1686,7 +1711,7 @@ int64_t sys_vmsplice(guest_t *g, int fd, uint64_t iov_gva,
          uint64_t len = liov.iov_len;
          if (len > avail) len = avail;
  
@@ -925,10 +1190,15 @@ index 5c6d8f1..03d3c49 100644
              if (errno == EPIPE) signal_queue(LINUX_SIGPIPE);
              return total > 0 ? (int64_t)total : linux_errno();
 diff --git a/src/syscall_net.c b/src/syscall_net.c
-index 161ffc9..db314e2 100644
+index 161ffc9..375d6b2 100644
 --- a/src/syscall_net.c
 +++ b/src/syscall_net.c
-@@ -11,7 +11,10 @@
+@@ -1,3 +1,4 @@
++#include "hl_shared.h"
+ /* syscall_net.c — Socket/networking syscalls for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -11,7 +12,10 @@
   *   - Socket options: SOL_SOCKET option constants differ
   */
  #include "syscall_net.h"
@@ -939,7 +1209,25 @@ index 161ffc9..db314e2 100644
  #include "syscall_signal.h"  /* signal_queue for SIGPIPE */
  #include "syscall_io.h"      /* rosettad_is_socket */
  #include "syscall_fs.h"      /* hl_fs_open_parent_beneath (rooted confinement) */
-@@ -518,8 +521,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
+@@ -457,7 +461,7 @@ static int msghdr_simple_stream(const linux_msghdr_t *m) {
+ /* Build host iovec[0..iovlen) from guest msg_iov; iovlen capped at 64. */
+ static int64_t msg_build_host_iov(guest_t *g, const linux_msghdr_t *lmsg,
+                                   struct iovec *host_iov, int max_iov,
+-                                  int *out_iovlen) {
++                                  int *out_iovlen, int write) {
+     if (lmsg->msg_iovlen > (uint64_t)max_iov) return -LINUX_EINVAL;
+     int n = (int)lmsg->msg_iovlen;
+     *out_iovlen = n;
+@@ -477,7 +481,7 @@ static int64_t msg_build_host_iov(guest_t *g, const linux_msghdr_t *lmsg,
+             continue;
+         }
+         uint64_t avail = 0;
+-        void *base = guest_ptr_avail(g, guest_iov[i].iov_base, &avail);
++        void *base = guest_ptr_access(g, guest_iov[i].iov_base, &avail, write);
+         if (!base) return -LINUX_EFAULT;
+         uint64_t len = guest_iov[i].iov_len;
+         if (len > avail) len = avail;
+@@ -518,8 +522,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
          int one = 1;
          setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
  
@@ -950,7 +1238,7 @@ index 161ffc9..db314e2 100644
  
          int linux_flags_val = cloexec ? LINUX_O_CLOEXEC : 0;
          fd_table[gfd].linux_flags = linux_flags_val;
-@@ -551,8 +554,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
+@@ -551,8 +555,8 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol) {
      int one = 1;
      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
  
@@ -961,7 +1249,7 @@ index 161ffc9..db314e2 100644
  
      int linux_flags = 0;
      if (cloexec) linux_flags |= LINUX_O_CLOEXEC;
-@@ -583,14 +586,14 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
+@@ -583,14 +587,14 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
          setsockopt(fds[i], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
      }
  
@@ -980,7 +1268,7 @@ index 161ffc9..db314e2 100644
          return -LINUX_EMFILE;
      }
  
-@@ -600,8 +603,8 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
+@@ -600,8 +604,8 @@ int64_t sys_socketpair(guest_t *g, int domain, int type, int protocol,
  
      int32_t guest_fds[2] = { gfd0, gfd1 };
      if (guest_write(g, sv_gva, guest_fds, 8) < 0) {
@@ -991,7 +1279,7 @@ index 161ffc9..db314e2 100644
          return -LINUX_EFAULT;
      }
  
-@@ -700,8 +703,8 @@ static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
+@@ -700,8 +704,8 @@ static int64_t do_accept(guest_t *g, int fd, uint64_t addr_gva,
      int one = 1;
      setsockopt(new_fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
  
@@ -1002,7 +1290,30 @@ index 161ffc9..db314e2 100644
      fd_table[gfd].linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
  
      /* Write back peer address if requested. The accept has already
-@@ -1024,6 +1027,13 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
+@@ -897,6 +901,7 @@ int64_t sys_getpeername(guest_t *g, int fd, uint64_t addr_gva,
+ 
+ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
+                    int linux_flags, uint64_t dest_gva, uint32_t addrlen) {
++    HL_WC_ACCESS_SCOPE;
+ 
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+@@ -969,12 +974,13 @@ int64_t sys_sendto(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
+ 
+ int64_t sys_recvfrom(guest_t *g, int fd, uint64_t buf_gva, uint64_t len,
+                      int flags, uint64_t src_gva, uint64_t addrlen_gva) {
++    HL_WC_ACCESS_SCOPE;
+ 
+     int host_fd = fd_to_host(fd);
+     if (host_fd < 0) return -LINUX_EBADF;
+ 
+     uint64_t avail = 0;
+-    void *buf = len > 0 ? guest_ptr_avail(g, buf_gva, &avail) : NULL;
++    void *buf = len > 0 ? guest_ptr_access(g, buf_gva, &avail, 1) : NULL;
+     if (!buf && len > 0) return -LINUX_EFAULT;
+     if (len > avail) len = avail;
+ 
+@@ -1024,6 +1030,13 @@ int64_t sys_setsockopt(guest_t *g, int fd, int level, int optname,
      int host_fd = fd_to_host(fd);
      if (host_fd < 0) return -LINUX_EBADF;
  
@@ -1016,7 +1327,7 @@ index 161ffc9..db314e2 100644
      int mac_level = level;
      int mac_optname = optname;
  
-@@ -1076,6 +1086,35 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
+@@ -1076,6 +1089,35 @@ int64_t sys_getsockopt(guest_t *g, int fd, int level, int optname,
      int host_fd = fd_to_host(fd);
      if (host_fd < 0) return -LINUX_EBADF;
  
@@ -1052,9 +1363,11 @@ index 161ffc9..db314e2 100644
      int mac_level = level;
      int mac_optname = optname;
  
-@@ -1174,8 +1213,10 @@ int64_t sys_shutdown(int fd, int how) {
+@@ -1173,9 +1215,12 @@ int64_t sys_shutdown(int fd, int how) {
+ }
  
  int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
++    HL_WC_ACCESS_SCOPE;
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
@@ -1065,7 +1378,25 @@ index 161ffc9..db314e2 100644
  
      linux_msghdr_t lmsg;
      if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
-@@ -1291,38 +1332,42 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+@@ -1193,7 +1238,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+         (linux_flags & ~MSG_FP_LINUX_OK) == 0) {
+         struct iovec host_iov[64];
+         int iovlen = 0;
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 0);
+         if (err < 0) return err;
+ 
+         ssize_t ret;
+@@ -1242,7 +1287,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+     struct iovec host_iov[64];
+     int iovlen = 0;
+     {
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 0);
+         if (err < 0) return err;
+     }
+ 
+@@ -1291,38 +1336,42 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
              if (lcmsg_len > lctl_len - lpos) break;
              size_t ldata_len = (size_t)(lcmsg_len - 16);
  
@@ -1131,9 +1462,11 @@ index 161ffc9..db314e2 100644
  
              /* Advance to next Linux cmsghdr (8-byte aligned) */
              lpos += (size_t)((lcmsg_len + 7) & ~7ULL);
-@@ -1375,9 +1420,14 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+@@ -1374,10 +1423,16 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags) {
+ }
  
  int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
++    HL_WC_ACCESS_SCOPE;
  
 -    int host_fd = fd_to_host(fd);
 -    if (host_fd < 0) return -LINUX_EBADF;
@@ -1148,7 +1481,7 @@ index 161ffc9..db314e2 100644
      linux_msghdr_t lmsg;
      if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
          return -LINUX_EFAULT;
-@@ -1389,7 +1439,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1389,11 +1444,11 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
       * Dominant path for X11 display sockets under GTK (idle EAGAIN storm
       * and event reads). SCM_RIGHTS / PEEK / OOB take the full path below.
       */
@@ -1157,7 +1490,21 @@ index 161ffc9..db314e2 100644
          (flags & ~MSG_FP_LINUX_OK) == 0) {
          struct iovec host_iov[64];
          int iovlen = 0;
-@@ -1485,7 +1535,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 1);
+         if (err < 0) return err;
+ 
+         /* Always go through recvmsg here. recv()/readv() cannot report
+@@ -1423,7 +1478,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+     struct iovec host_iov[64];
+     int iovlen = 0;
+     {
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 1);
+         if (err < 0) return err;
+     }
+ 
+@@ -1485,7 +1540,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
       *
       * SOL_SOCKET: macOS=0xFFFF → Linux=1
       * CMSG_ALIGN: macOS=4, Linux=8 */
@@ -1166,7 +1513,7 @@ index 161ffc9..db314e2 100644
          uint8_t linux_ctrl[512];
          size_t lpos = 0;
  
-@@ -1493,11 +1543,27 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1493,11 +1548,27 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
          for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
               cmsg = CMSG_NXTHDR(&msg, cmsg)) {
              if (cmsg->cmsg_len < CMSG_LEN(0)) continue; /* malformed */
@@ -1198,7 +1545,7 @@ index 161ffc9..db314e2 100644
              /* Linux CMSG_LEN = 16 + data_len */
              uint64_t lcmsg_len = 16 + data_len;
              /* Linux CMSG_SPACE = ALIGN8(lcmsg_len) */
-@@ -1508,68 +1574,21 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1508,68 +1579,21 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
               * be closed or they leak in hl forever. */
              if (lpos + lcmsg_space > sizeof(linux_ctrl) ||
                  lpos + lcmsg_space > lmsg.msg_controllen) {
@@ -1274,7 +1621,7 @@ index 161ffc9..db314e2 100644
  
              /* Build Linux cmsghdr */
              memset(linux_ctrl + lpos, 0, lcmsg_space);
-@@ -1581,6 +1600,20 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1581,6 +1605,20 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
              lpos += lcmsg_space;
          }
  
@@ -1295,7 +1642,7 @@ index 161ffc9..db314e2 100644
          if (lpos > 0) {
              if (guest_write(g, lmsg.msg_control, linux_ctrl, lpos) < 0)
                  return -LINUX_EFAULT;
-@@ -1600,6 +1633,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1600,6 +1638,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
              return -LINUX_EFAULT;
      }
  
@@ -1304,7 +1651,7 @@ index 161ffc9..db314e2 100644
      /* Update msg_flags in guest (offset 48 in linux_msghdr_t).
       * macOS msg_flags use macOS values — translate to Linux. */
      /* Preserve any CTRUNC raised while translating the control buffer;
-@@ -1609,6 +1644,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
+@@ -1609,6 +1649,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags) {
      if (guest_write(g, msg_gva + 48, &mflags, 4) < 0)
          return -LINUX_EFAULT;
  

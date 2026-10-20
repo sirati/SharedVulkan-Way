@@ -57,3 +57,27 @@ Sending such a socket through an arbitrary native peer fails with EOPNOTSUPP,
 because that peer cannot preserve the shared option state for a later import.
 Unix datagram credential semantics are explicitly unsupported. This is connected
 stream support, not a claim of complete Linux per-message credential semantics.
+
+External guest pointers use thread-local nested access scopes. The dispatcher
+and raw-pointer syscall helpers hold a scope through native I/O completion,
+including vectored and message I/O. Resolving a shared view pins its owner and
+checks the requested read or write permission. An access denial cannot fall
+back to the primary guest buffer. Copy helpers create shorter nested scopes
+for callers outside syscall dispatch. A raw external pointer without a scope
+is refused.
+
+Unmapping removes guest mappings and Stage-2 access immediately. If a native
+call still holds a pointer, its backing, PRIME owner, writable seal reservation
+and IPA reservation survive until the final scope ends. Successful Stage-2
+removal plus final pointer completion releases those resources. A failed
+Stage-2 removal retains the existing VM-destruction requirement.
+
+`shared-access-check.c` compiles the actual resolver, protection, unmap and
+retirement code against HVF/page-table stubs. It deterministically pauses a
+reader after pointer acquisition, unmaps from another thread, and verifies
+that pointer completion precedes backing release and IPA reuse. It also tests
+read-only and PROT_NONE denial on genuine native read-only pages.
+`shared-access-client.c` exercises ordinary Linux scalar, vectored and message
+syscalls against O_RDONLY, PROT_READ and PROT_NONE shared views. It must also
+pass under the integrated runtime before native acceptance is claimed. Its
+gettimeofday check explicitly invokes the syscall to avoid a vDSO write.

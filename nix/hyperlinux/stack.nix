@@ -134,6 +134,9 @@ let
   renderClient = guest.callPackage ./client-probe.nix {
     programName = "hl-render-client"; source = ./render-client.c;
   };
+  accessClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-shared-access-client"; source = ./shared-access-client.c;
+  };
   socketClient = guest.callPackage ./client-probe.nix {
     programName = "hl-socket-client"; source = ./socket-client.c;
   };
@@ -172,6 +175,7 @@ let
       export XDG_STATE_HOME="$fixture/state" XDG_RUNTIME_DIR="$fixture/runtime" HL_NATIVE_FIXTURE="$fixture"
       "$HL_RUNNER" ${renderClient}/bin/hl-render-client
       "$HL_RUNNER" ${socketClient}/bin/hl-socket-client
+      "$HL_RUNNER" ${accessClient}/bin/hl-shared-access-client
     '';
   };
 in {
