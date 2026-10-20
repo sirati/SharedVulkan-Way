@@ -81,6 +81,27 @@ own() { # USER[:GROUP] PATH... (recursive)
   local who=$1; shift
   if [ -n "$REAL" ]; then run chown -R "$who" "$@"; else say "  (would chown -R $who $*)"; fi
 }
+# Replace all discretionary grants, including cached supplementary groups.
+# Open descriptors and mappings remain valid; this revokes future raw opens.
+secure_live_raw() {
+  local service=${1:-waycompose} f acl
+  for f in "$ARENA_DIR" "$ARENA_DIR"/arena "$ARENA_DIR"/gpu "$ARENA_DIR"/*.sock; do
+    [ ! -L "$f" ] || { echo "raw resource is a symlink: $f"; return 1; }
+    [ -e "$f" ] || continue
+    if [ -n "$REAL" ]; then
+      run chown root:root "$f"
+      if [ -d "$f" ]; then
+        run setfacl -k "$f"
+        acl="u::rwx,u:$service:r-x,g::---,m::r-x,o::---"
+      else
+        acl="u::rw-,u:$service:rw-,g::---,m::rw-,o::---"
+      fi
+      run setfacl --set "$acl" "$f"
+    else
+      say "  (would replace owner, named, group and other raw grants with root/$service only on $f)"
+    fi
+  done
+}
 as_user() { # USER CMD...: a systemctl --user of USER
   local u=$1; shift
   if [ -n "$REAL" ]; then run systemctl --machine="$u@.host" --user "$@"; else say "  (would: systemctl --user -M $u@ $*)"; fi
@@ -397,14 +418,8 @@ if [ "$VERB" = plan ] || [ "$VERB" = apply ]; then
     run mv "$AH/.config/waycompose/installs/$n" "$BACKUP/links/$n"
   done
 
-  say "5. the running VM's ACLs: only the service account by name"
-  for f in "$ARENA_DIR" "$ARENA_DIR"/arena "$ARENA_DIR"/gpu "$ARENA_DIR"/*.sock; do
-    [ -e "$f" ] || continue
-    if [ -n "$REAL" ]; then
-      run setfacl -x "u:$ADMIN" "$f" 2>/dev/null; run setfacl -x "u:$DESK" "$f" 2>/dev/null
-      if [ -d "$f" ]; then run setfacl -m u:waycompose:rx "$f"; else run setfacl -m u:waycompose:rw "$f"; fi
-    else say "  (would drop u:$ADMIN, u:$DESK and add u:waycompose on $f)"; fi
-  done
+  say "5. the running VM's raw permissions: root and the service account only"
+  secure_live_raw
 
   for n in "${INSTALLS[@]}"; do run rm -f "$TRUST/$n/rotation-pending"; done
   say "run a real mapped-user product session, then baseline-confirm before any application update or rollback"
