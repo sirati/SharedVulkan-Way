@@ -74,35 +74,50 @@ the native driver when available. Preserve the exact executable and ICD hashes
 with the output outside the source repository. A crash without dma-buf enabled
 must not be attributed to modifier rewriting without reproducing its chain.
 
-## IOSurface direct presentation
+## Metal composition and source retirement
 
-The existing shared image allocation imports an IOSurface-backed Metal texture
-and transfers its Mach send right to the compositor under its section name.
-The compositor currently reads that mapping into its shadow. The Windows-only
-DirectFrame path cannot simply be enabled on macOS. Both macOS UI implementations
-currently ignore ToUi::Direct, and the face process needs its own IOSurface right.
+The compositor now implements a no-CPU-readback path for a complete, single
+ARGB8888 root surface backed by an imported BGRA IOSurface. It checks the window
+geometry, scale, format, offset, dimensions and pitch. The first frame still uses
+the ordinary path to establish the tree. Crops, transforms, subsurfaces, XRGB
+alpha normalization and unsupported Metal devices use the shadow path.
 
-A safe direct implementation needs all of these properties:
+`macos_metal::snapshot` wraps the source and a fresh compositor-owned output as
+Metal textures, encodes a GPU blit and calls `MTLCommandBuffer.waitUntilCompleted`.
+Apple documents this method as blocking until the command buffer's execution
+finishes. Only a completed command with status Completed produces MetalCopied.
+Textures and both IOSurfaces remain owned across the wait, including errors.
+References: Apple's MTLCommandBuffer `waitUntilCompleted()` and `status` APIs.
 
-- The candidate is one complete visible surface, with matching geometry,
-  format, pitch and supported crop/scale. Other trees use the current compositor.
-- The producing GPU session's fence record completes before the layer receives
-  the surface. Importing or retaining an IOSurface is not a GPU completion wait.
-- The UI process retains the IOSurface and increments its use count for the
-  complete display lifetime. Face routing transfers a Mach right, not a global
-  IOSurface id. These operations stay within the Mac.
-- Wayland releases the client buffer only after the presentation consumer has
-  stopped reading it. IOSurface use counts alone do not prevent the application
-  from reusing and overwriting a released buffer. A CALayer transaction callback
-  alone does not establish that the display has retired its reads. The chosen
-  presentation API needs a documented completion event or explicit consumer
-  fence, plus tests for rapid reuse, resize, fallback and process death.
-- A fallback first installs the shadow and acknowledges the transition before
-  dropping the prior direct frame. The broker retains any guest-RAM mapping
-  until the existing release protocol permits freeing it.
+The owned output is immutable for its complete lifetime. The router transfers
+its Mach rights to the face before its Surface and Present messages; a face
+restart can resend that same immutable output. The standalone AppKit backend
+also assigns only this owned output to its layer. Neither the layer nor the
+face ever receives the application allocation as layer contents. This is Metal
+GPU composition, not direct CALayer scanout. It uses one GPU copy and no CPU
+readback on eligible steady-state frames.
 
-Until the consumer completion contract is implemented, direct CALayer assignment
-would introduce a buffer-reuse race and is not a zero-copy completion claim.
+MetalCopied carries an independent retained output back to Wayland state. The
+client buffer is released after that GPU completion, so even a client reusing
+one buffer need not wait for another frame to release it. If the scene later
+requires CPU composition, it reads the immutable output once, not the released
+application allocation. An error before completion leaves the source held until
+the ordinary fallback has copied it. Normal Windows direct-paint lifetime rules
+remain unchanged. `WC_DIRECT_PRESENT=off` disables this fast path too.
+
+Fresh outputs are never recycled or rewritten. Core Animation retains its
+contents; Mach rights and the state snapshot retain any other consumers. Display
+retirement therefore cannot race a write into an old output. This initial
+implementation trades allocation cost for a documented source-retirement
+contract. Pooling those outputs requires a separate display-consumer retirement
+contract. No QoS or watchdog setting changes are involved.
+
+The headless `macos-metal-retirement` example creates a padded source fixture,
+copies it on Metal, immediately rewrites the source, makes a second snapshot,
+and checks that both outputs retain their expected distinct pixels. CPU access
+in that example is fixture setup and verification, not the product path. Build
+it on the build host for aarch64-darwin. A real-Metal run, rapid reuse, fallback,
+resize and face-restart runs remain hardware gates, not inferred successes.
 
 ## VideoToolbox decode
 
@@ -140,3 +155,37 @@ sandboxed render node independently. Firefox's FFmpeg decoder can log
 `VA-API FFmpeg init successful` and `VA-API frame pts=`. The end-to-end proof must
 also identify the selected hardware decoder, decoded output format and frame
 completion without readback.
+
+
+### Implemented NV12 import boundary
+
+`sv_gpu_server::video_nv12` validates independent plane dimensions, offsets,
+strides, allocation bounds and non-overlap, including odd luma sizes and checked
+arithmetic. The macOS backend retains the completed CVPixelBuffer and its color
+attachments. It verifies that CoreVideo and IOSurface agree on both planes and
+that their element sizes are one byte for Y and two bytes for interleaved UV.
+Full-range and video-range fourccs remain distinct. It does not guess a color
+matrix from resolution.
+
+The backend wraps actual IOSurface plane zero as R8 and plane one as RG8. Both
+Metal textures keep their original completed picture alive. It can import those
+textures as two dedicated single-plane Vulkan images using the existing
+KosmicKrisp MTLTEXTURE platform patch. It queries importability first and refuses
+an image whose reported row pitch disagrees with the decoder plane. Images and
+memory are freed before the textures and decoded picture, after the unsafe
+consumer contract has required all GPU readers to retire. Partial import errors
+clean up already-created objects.
+
+This is an initial two-plane backend boundary. It is not a multi-plane NV12
+VkImage, a Vulkan Video session implementation or a claim of Firefox decode.
+No codec, queue or extension is synthesized or advertised. The subsequent driver
+work must combine the plane handles into one Vulkan YCbCr image before exposing
+that image through the stock Zink VA frontend. The standalone plane pair cannot
+substitute for those image semantics.
+
+The headless `macos-nv12-import` example allocates an IOSurface-backed NV12
+fixture, validates both native plane layouts, wraps the Metal textures and
+attempts both dedicated imports. It inventories hardware H.264 support without
+advertising it as implemented Vulkan capability. A real decode callback,
+reference-picture lifetime, initial ownership/layout transitions and sampling
+verification still require hardware and the remaining video implementation.
