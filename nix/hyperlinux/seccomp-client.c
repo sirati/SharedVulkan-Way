@@ -76,6 +76,9 @@ int main(int argc,char **argv) {
     CHECK(argc==2);
     CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==0);
     if (!strcmp(argv[1],"--basic")) {
+        errno=0; CHECK(prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,NULL)==-1 && errno==EFAULT);
+        errno=0; CHECK(syscall(SYS_seccomp,SECCOMP_SET_MODE_FILTER,1,NULL)==-1 && errno==EFAULT);
+        errno=0; CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,5)==-1 && errno==EINVAL);
         errno=0; CHECK(filter(SYS_getppid,SECCOMP_RET_ERRNO|71,0)==-1 && errno==EACCES);
         errno=0; CHECK(prctl(PR_SET_NO_NEW_PRIVS,0,0,0,0)==-1 && errno==EINVAL);
         CHECK(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)==0);
