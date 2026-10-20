@@ -7,6 +7,8 @@ pub const NAME_MAX: usize = 64;
 pub const ADD: i32 = 0x5153_0003;
 pub const GONE: i32 = 0x5153_0004;
 pub const ACK: i32 = 0x5153_0005;
+/// Explicit planar registration; ordinary ADD remains nonplanar.
+pub const ADD_NV12: i32 = 0x5153_0006;
 pub const COMPLEX: u32 = 0x8000_0000;
 pub const ADD_SIZE: usize = 124;
 pub const GONE_SIZE: usize = 108;
@@ -18,6 +20,7 @@ pub struct Owner { pub run: u64, pub connection: u64 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
     Add { name: String, port: u32, owner: Owner },
+    AddNv12 { name: String, port: u32, owner: Owner },
     Gone { name: String, owner: Owner },
 }
 fn word(b: &[u8], at: usize) -> Option<u32> {
@@ -36,7 +39,7 @@ pub fn parse(bytes: &[u8]) -> Option<Message> {
     let id = word(bytes, 20)? as i32;
     if size > bytes.len() { return None; }
     let (name_at, owner_at) = match id {
-        ADD if size == ADD_SIZE && bits & COMPLEX != 0 => {
+        ADD | ADD_NV12 if size == ADD_SIZE && bits & COMPLEX != 0 => {
             // A received port descriptor contains one MOVE_SEND send right,
             // descriptor type zero, and a live non-null port name.
             if bits & 0xff != 18 || word(bytes, 8)? == 0 || word(bytes, 24)? != 1
@@ -53,8 +56,12 @@ pub fn parse(bytes: &[u8]) -> Option<Message> {
     let owner = Owner { run: wide(bytes, owner_at)?, connection: wide(bytes, owner_at + 8)? };
     if owner.connection == 0 { return None; }
     let name = String::from_utf8(name.to_vec()).ok()?;
-    Some(if id == ADD { Message::Add { name, port: word(bytes, 28)?, owner } }
-        else { Message::Gone { name, owner } })
+    Some(match id {
+        ADD => Message::Add { name, port: word(bytes, 28)?, owner },
+        ADD_NV12 => Message::AddNv12 { name, port: word(bytes, 28)?, owner },
+        GONE => Message::Gone { name, owner },
+        _ => return None,
+    })
 }
 
 /// Authoritative allocation bounds for a non-planar pixel surface.
@@ -93,6 +100,18 @@ pub fn audit(bytes: &[u8]) -> Option<Sender> {
     Some(Sender { uid: word(bytes, at + 20 + 4)?, pid, pid_version: word(bytes, at + 20 + 7 * 4)? })
 }
 
+/// Registration kind is part of lookup authority. An NV12 section is never
+/// returned to an ordinary section consumer, including CPU mapping callers.
+pub enum Section<T> { Ordinary(T), Nv12(T) }
+impl<T> Section<T> {
+    pub fn ordinary(&self) -> Option<&T> {
+        match self { Self::Ordinary(value) => Some(value), Self::Nv12(_) => None }
+    }
+    pub fn nv12(&self) -> Option<&T> {
+        match self { Self::Nv12(value) => Some(value), Self::Ordinary(_) => None }
+    }
+}
+
 /// Only the broker observer authorizes adding an owner. Revocation removes
 /// discoverable names; independent retained consumers are not invalidated.
 pub struct Registry<T> {
@@ -129,6 +148,54 @@ mod tests {
         put(&mut b, 8, 71); put(&mut b, 20, ADD as u32); put(&mut b, 24, 1);
         put(&mut b, 28, 91); put(&mut b, 36, 17 << 16); put(&mut b, 40, 5);
         b[44..49].copy_from_slice(b"ios.x"); put(&mut b, 116, 9); b
+    }
+    #[test]
+    fn nv12_add_has_an_explicit_discriminator_and_the_same_capability_shape() {
+        let ordinary = add();
+        let mut planar = ordinary.clone();
+        put(&mut planar, 20, ADD_NV12 as u32);
+        let expected_owner = Owner { run: 0, connection: 9 };
+        assert_eq!(parse(&planar), Some(Message::AddNv12 {
+            name: "ios.x".into(), port: 91, owner: expected_owner,
+        }));
+        assert!(matches!(parse(&ordinary), Some(Message::Add { .. })));
+        for (at, value) in [(4, ADD_SIZE as u32 + 4), (0, 18), (24, 2),
+            (28, 0), (32, 1), (36, 19 << 16), (40, 65)] {
+            let mut bad = planar.clone(); put(&mut bad, at, value);
+            assert_eq!(parse(&bad), None);
+        }
+        let mut bad = planar.clone(); bad[116..124].fill(0);
+        assert_eq!(parse(&bad), None);
+        let mut unknown = planar; put(&mut unknown, 20, ADD_NV12 as u32 + 1);
+        assert_eq!(parse(&unknown), None);
+    }
+    #[test]
+    fn typed_lookup_and_owner_revocation_preserve_independent_consumers() {
+        use std::rc::Rc;
+        let owner = Owner { run: 7, connection: 9 };
+        let other = Owner { run: 7, connection: 10 };
+        let mut registry = Registry::default();
+        let original = Rc::new(17);
+        assert!(!registry.insert(owner, "ios.before-owner".into(), Section::Nv12(original.clone())));
+        registry.add_owner(owner);
+        registry.add_owner(other);
+        assert!(registry.insert(owner, "ios.planar".into(), Section::Nv12(original.clone())));
+        assert!(registry.insert(owner, "ios.ordinary".into(), Section::Ordinary(Rc::new(23))));
+        assert!(registry.get("ios.planar").unwrap().ordinary().is_none());
+        assert!(registry.get("ios.ordinary").unwrap().nv12().is_none());
+        let retained = registry.get("ios.planar").unwrap().nv12().unwrap().clone();
+        assert!(Rc::ptr_eq(&original, &retained));
+        // A live competing owner cannot replace another kind or withdraw it.
+        assert!(!registry.insert(other, "ios.planar".into(), Section::Ordinary(Rc::new(99))));
+        registry.remove(other, "ios.planar");
+        assert!(registry.get("ios.planar").is_some());
+        registry.revoke(owner);
+        assert!(registry.get("ios.planar").is_none());
+        assert!(registry.get("ios.ordinary").is_none());
+        assert_eq!(*retained, 17);
+        assert!(Rc::ptr_eq(&original, &retained));
+        assert_eq!(Rc::strong_count(&original), 2);
+        assert!(!registry.insert(owner, "ios.resurrected".into(), Section::Nv12(original.clone())));
     }
     #[test] fn accepts_exact_received_shape_and_owner_generation() {
         assert_eq!(parse(&add()), Some(Message::Add { name: "ios.x".into(), port: 91,

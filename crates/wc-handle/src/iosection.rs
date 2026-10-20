@@ -18,8 +18,13 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::{Mutex, OnceLock};
-use crate::iosection_policy::{self as policy, Message, Registry, Sender};
+use crate::iosection_policy::{self as policy, Message, Registry, Section, Sender};
 pub use crate::iosection_policy::Owner;
+
+/// Strict metadata validation for typed NV12 registration. Ordinary sections
+/// and CPU mapping retain their existing nonplanar contract.
+#[path = "iosection_nv12_policy.rs"]
+pub mod nv12_geometry;
 
 type Port = u32;
 type Kr = i32;
@@ -72,6 +77,7 @@ struct GoneMsg {
 }
 
 const ID_ADD: i32 = policy::ADD;
+const ID_ADD_NV12: i32 = policy::ADD_NV12;
 const ID_GONE: i32 = policy::GONE;
 const MOVE_SEND: u32 = 17;
 const COPY_SEND: u32 = 19;
@@ -117,6 +123,11 @@ unsafe extern "C" {
     fn IOSurfaceUnlock(s: *mut c_void, flags: u32, seed: *mut u32) -> i32;
     fn IOSurfaceGetBytesPerElement(s: *mut c_void) -> usize;
     fn IOSurfaceGetPlaneCount(s: *mut c_void) -> usize;
+    fn IOSurfaceGetWidthOfPlane(s: *mut c_void, plane: usize) -> usize;
+    fn IOSurfaceGetHeightOfPlane(s: *mut c_void, plane: usize) -> usize;
+    fn IOSurfaceGetBytesPerElementOfPlane(s: *mut c_void, plane: usize) -> usize;
+    fn IOSurfaceGetBytesPerRowOfPlane(s: *mut c_void, plane: usize) -> usize;
+    fn IOSurfaceGetOffsetOfPlane(s: *mut c_void, plane: usize) -> usize;
     fn IOSurfaceGetPixelFormat(s: *mut c_void) -> u32;
     fn IOSurfaceGetWidth(s: *mut c_void) -> usize;
     fn IOSurfaceGetBaseAddress(s: *mut c_void) -> *mut c_void;
@@ -237,6 +248,31 @@ impl Surface {
     pub fn pixel_format(&self) -> u32 { unsafe { IOSurfaceGetPixelFormat(self.0) } }
     pub fn plane_count(&self) -> usize { unsafe { IOSurfaceGetPlaneCount(self.0) } }
 
+    /// Read original plane metadata without locking or accessing pixel storage.
+    pub fn plane_metadata(&self, plane: usize) -> Option<nv12_geometry::Plane> {
+        if plane >= self.plane_count() { return None; }
+        // SAFETY: this owner retains the live IOSurface and the index is bounded.
+        Some(unsafe { nv12_geometry::Plane {
+            width: IOSurfaceGetWidthOfPlane(self.0, plane),
+            height: IOSurfaceGetHeightOfPlane(self.0, plane),
+            bytes_per_element: IOSurfaceGetBytesPerElementOfPlane(self.0, plane),
+            bytes_per_row: IOSurfaceGetBytesPerRowOfPlane(self.0, plane),
+            offset: IOSurfaceGetOffsetOfPlane(self.0, plane),
+        } })
+    }
+    /// Validate metadata for the original joined 420v target. This does not
+    /// authorize broker publication or relax the existing nonplanar protocol.
+    pub fn nv12_geometry(&self) -> Result<nv12_geometry::Nv12Geometry, nv12_geometry::Rejected> {
+        let plane_count = self.plane_count();
+        if plane_count != 2 { return Err(nv12_geometry::Rejected::PlaneCount); }
+        let y = self.plane_metadata(0).ok_or(nv12_geometry::Rejected::PlaneCount)?;
+        let uv = self.plane_metadata(1).ok_or(nv12_geometry::Rejected::PlaneCount)?;
+        nv12_geometry::Nv12Geometry::validate(nv12_geometry::Surface {
+            width: self.width(), height: self.height(), pixel_format: self.pixel_format(),
+            allocation_size: self.len(), plane_count, planes: [y, uv],
+        })
+    }
+
     pub fn bytes_per_row(&self) -> usize {
         // SAFETY: a live surface.
         unsafe { IOSurfaceGetBytesPerRow(self.0) }
@@ -280,7 +316,7 @@ impl Drop for Surface {
 
 /// Native names are retained only for a live broker connection generation.
 #[derive(Default)]
-struct Table { registry: Registry<Surface>, identities: HashMap<Owner, Sender> }
+struct Table { registry: Registry<Section<Surface>>, identities: HashMap<Owner, Sender> }
 static TABLE: Mutex<Option<Table>> = Mutex::new(None);
 fn table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     let mut g = TABLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -296,7 +332,7 @@ pub fn set_owner_observer(observer: OwnerObserver) -> bool { OBSERVER.set(observ
 pub fn revoke_owner(owner: Owner) {
     table(|t| { t.registry.revoke(owner); t.identities.remove(&owner); });
 }
-fn register(owner: Owner, sender: Sender, name: String, surface: Surface) -> bool {
+fn register(owner: Owner, sender: Sender, name: String, surface: Section<Surface>) -> bool {
     table(|t| {
         if let Some(known) = t.identities.get(&owner) {
             if *known != sender { return false; }
@@ -314,11 +350,16 @@ fn register(owner: Owner, sender: Sender, name: String, surface: Surface) -> boo
 
 /// Retain an imported GPU section without mapping or reading its pixels.
 pub fn surface(name: &str) -> Option<Surface> {
-    table(|t| t.registry.get(name).map(Surface::retain))
+    table(|t| t.registry.get(name).and_then(Section::ordinary).map(Surface::retain))
+}
+/// Retain only an explicitly registered NV12 section. This does not prove
+/// producer completion, grant CPU access, or retire any producer/consumer job.
+pub fn nv12_surface(name: &str) -> Option<Surface> {
+    table(|t| t.registry.get(name).and_then(Section::nv12).map(Surface::retain))
 }
 pub(crate) fn lookup(name: &str) -> Option<(Surface, *const u8, usize)> {
     table(|t| {
-        let s = t.registry.get(name)?;
+        let s = t.registry.get(name)?.ordinary()?;
         if !s.valid_geometry() || s.base().is_null() { return None; }
         Some((s.retain(), s.base(), s.len()))
     })
@@ -353,8 +394,19 @@ fn name_field(name: &str) -> Option<(u32, [u8; NAME_MAX])> {
 /// Register a section under a live shared-broker connection generation. The
 /// synchronous acknowledgment prevents an exported token from outrunning ADD.
 pub fn send(service: Port, owner: Owner, name: &str, surface: &Surface) -> Kr {
-    let Some((name_len, name)) = name_field(name) else { return -1 };
     if !surface.valid_geometry() { return -1; }
+    send_add(service, owner, name, surface, ID_ADD)
+}
+
+/// Register the exact retained two-plane 64x64 420v surface under the same
+/// audited owner protocol. The acknowledgment proves registration only;
+/// callers must separately retain/synchronize all GPU producers and readers.
+pub fn send_nv12(service: Port, owner: Owner, name: &str, surface: &Surface) -> Kr {
+    if surface.nv12_geometry().is_err() { return -1; }
+    send_add(service, owner, name, surface, ID_ADD_NV12)
+}
+fn send_add(service: Port, owner: Owner, name: &str, surface: &Surface, id: i32) -> Kr {
+    let Some((name_len, name)) = name_field(name) else { return -1 };
     let mut reply = 0;
     let kr = unsafe { mach_port_allocate(mach_task_self_, 1, &mut reply) };
     if kr != 0 { return kr; }
@@ -364,7 +416,7 @@ pub fn send(service: Port, owner: Owner, name: &str, surface: &Surface) -> Kr {
     let mut m = AddMsg {
         h: Header { bits: COPY_SEND | (MAKE_SEND_ONCE << 8) | BITS_COMPLEX,
             size: std::mem::size_of::<AddMsg>() as u32, remote: service, local: reply.0,
-            id: ID_ADD, ..Default::default() },
+            id, ..Default::default() },
         count: 1, surface: PortDesc { name: port, pad1: 0, bits: MOVE_SEND << 16 },
         name_len, name, owner,
     };
@@ -434,7 +486,17 @@ pub fn serve(service: Port) {
                     let raw = unsafe { IOSurfaceLookupFromMachPort(port) };
                     if !raw.is_null() {
                         let s = Surface(raw);
-                        if s.valid_geometry() && register(owner, sender, name, s) { status = 0; }
+                        if s.valid_geometry() && register(owner, sender, name, Section::Ordinary(s)) { status = 0; }
+                    }
+                }
+                Some(Message::AddNv12 { name, port, owner }) => {
+                    // The same delivered capability and broker-authenticated
+                    // owner flow, with independent strict planar validation.
+                    let raw = unsafe { IOSurfaceLookupFromMachPort(port) };
+                    if !raw.is_null() {
+                        let s = Surface(raw);
+                        if s.nv12_geometry().is_ok()
+                            && register(owner, sender, name, Section::Nv12(s)) { status = 0; }
                     }
                 }
                 Some(Message::Gone { name, owner }) => {
