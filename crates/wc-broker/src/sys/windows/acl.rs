@@ -353,13 +353,13 @@ fn write_state(dir: &Path, rows: &[SavedDevice]) -> io::Result<()> {
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     std::fs::rename(pending, state_file(dir))?;
-    std::fs::File::open(state_file(dir))?.sync_all()?;
+    std::fs::OpenOptions::new().write(true).open(state_file(dir))?.sync_all()?;
     let checkpoint = dir.join("devices.secured.pending");
     let mut file = std::fs::File::create(&checkpoint)?;
     writeln!(file, "{}", rows.len())?;
     file.sync_all()?;
     std::fs::rename(checkpoint, dir.join("devices.secured"))?;
-    std::fs::File::open(dir.join("devices.secured"))?.sync_all()
+    std::fs::OpenOptions::new().write(true).open(dir.join("devices.secured"))?.sync_all()
 }
 
 fn check_baseline(state: &Path) -> Result<Vec<SavedDevice>, String> {
@@ -523,6 +523,23 @@ pub fn show(devices: &[DeviceAt]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_baseline_never_becomes_fresh_but_explicit_fresh_empty_is_recorded() {
+        let dir = std::env::temp_dir().join(format!("wc-lost-baseline-{}", std::process::id()));
+        assert!(revert_check(&dir).is_err());
+        assert!(secure(&[], &dir).is_empty());
+        assert!(revert_check(&dir).is_ok());
+        let rows = vec![("port".into(), "instance".into(), "path".into(), DEVICE_SDDL.into(), Some(DEVICE_SDDL.into()))];
+        write_state(&dir, &rows).unwrap();
+        std::fs::write(state_file(&dir), "").unwrap();
+        assert!(revert_check(&dir).unwrap_err().contains("incomplete"));
+        std::fs::remove_file(state_file(&dir)).unwrap();
+        assert!(revert_check(&dir).unwrap_err().contains("missing"));
+        assert!(secure(&[], &dir)[0].contains("lost baseline"));
+        assert!(!state_file(&dir).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn permissive_raw_rollback_is_refused_before_any_mutation() {
