@@ -1,0 +1,174 @@
+--- a/src/guest.c
++++ b/src/guest.c
+@@ -33,6 +33,7 @@
+  */
+ #include "guest.h"
+ #include "hl_pt_access.h"
++#include "hl_pt_domain.h"
+ #include "hl_shared.h"
+ #include "hl_copy.h"
+ #include "syscall_internal.h"  /* hl_verbose */
+@@ -124,6 +125,7 @@
+  * Returns GPA of the page, or 0 on pool exhaustion.
+  * Acquires pt_lock internally. Caller typically holds mmap_lock. */
+ static uint64_t pt_alloc_page(guest_t *g) {
++    HL_PT_WRITE_SCOPE;
+     pthread_mutex_lock(&pt_lock);
+     uint64_t pool_base = guest_page_table_pool_base(g);
+     uint64_t pool_end = guest_page_table_pool_end(g);
+@@ -165,6 +167,7 @@
+
+ /* Return a page-table page to the pool for reuse (see pt_free_list). */
+ static void pt_free_page(guest_t *g, uint64_t gpa) {
++    HL_PT_WRITE_SCOPE;
+     pthread_mutex_lock(&pt_lock);
+     if (g->pt_free_count < (int)(sizeof(g->pt_free_list)/sizeof(g->pt_free_list[0])))
+         g->pt_free_list[g->pt_free_count++] = gpa;
+@@ -442,6 +445,7 @@
+ }
+
+ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa) {
++    HL_PT_WRITE_SCOPE;
+     if (guest_control_gpa_overlap(g, kbuf_gpa, KBUF_SIZE)) return -1;
+     /* Validate: kbuf_gpa must be 2MB-aligned and fit within primary buffer */
+     if ((kbuf_gpa & (BLOCK_2MB - 1)) != 0) {
+@@ -689,6 +693,7 @@
+ }
+ static int guest_access_translation(const guest_t *g, uint64_t va, int write,
+                                     int trusted, uint64_t *ipa, uint64_t *avail) {
++    HL_PT_READ_SCOPE;
+     uint64_t root;
+     if (va <= GUEST_USER_VA_MAX) root = g->ttbr0;
+     else if (g->kbuf_base && va >= KBUF_VA_BASE && va - KBUF_VA_BASE < KBUF_SIZE)
+@@ -905,9 +910,19 @@
+
+     /* Zero page table pool (not tracked in region array) */
+     uint64_t pt_pool_base = guest_page_table_pool_base(g);
+-    if (g->pt_pool_next > pt_pool_base)
+-        memset((uint8_t *)g->host_base + pt_pool_base, 0,
+-               g->pt_pool_next - pt_pool_base);
++    {
++        /* hl_wc_reset has completed before taking the PT-domain writer.
++         * No external mapping lock is acquired inside this reset scope. */
++        HL_PT_WRITE_SCOPE;
++        if (g->pt_pool_next > pt_pool_base)
++            memset((uint8_t *)g->host_base + pt_pool_base, 0,
++                   g->pt_pool_next - pt_pool_base);
++        pt_pool_warned = 0;
++        g->pt_pool_next = pt_pool_base;
++        g->pt_free_count = 0;
++        g->ttbr0 = 0;
++        g->ttbr1 = 0;
++    }
+
+     /* Zero shim code + data (not tracked in region array by guest_reset
+      * callers — shim regions are added AFTER reset by the exec path) */
+@@ -915,15 +930,12 @@
+            SHIM_DATA_BASE + BLOCK_2MB - SHIM_BASE);
+
+     /* Reset allocation state */
+-    pt_pool_warned = 0;  /* Reset 80% warning for new binary */
+-    g->pt_pool_next = pt_pool_base;
+     g->brk_base = BRK_BASE_DEFAULT;
+     g->brk_current = BRK_BASE_DEFAULT;
+     g->mmap_next = MMAP_BASE;
+     g->mmap_end = MMAP_INITIAL_END;
+     g->mmap_rx_next = MMAP_RX_BASE;
+     g->mmap_rx_end = MMAP_RX_INITIAL_END;
+-    g->ttbr0 = 0;
+     g->need_tlbi = 0;
+     /* Note: TTBR1 page tables are destroyed by the PT pool zeroing above.
+      * Caller must call guest_init_kbuf() to rebuild them if kbuf is needed
+@@ -1351,6 +1363,7 @@
+ }
+
+ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t base = g->ipa_base;
+
+     /* Allocate L0 table */
+@@ -1463,6 +1476,7 @@
+  * (during HVC #5 handling). Sets g->need_tlbi so the shim flushes the
+  * TLB before returning to EL0. */
+ int guest_extend_page_tables(guest_t *g, uint64_t start, uint64_t end, int perms) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t base = g->ipa_base;
+
+     /* Navigate to L0 table */
+@@ -1554,6 +1568,7 @@
+ static int guest_unmap_va_range_impl(guest_t *g, uint64_t va_start,
+                                      uint64_t va_end, int collapse)
+ {
++    HL_PT_WRITE_SCOPE;
+     uint64_t base = g->ipa_base;
+     int cleared = 0;
+     for (uint64_t va = va_start; va < va_end; va += BLOCK_2MB) {
+@@ -1624,6 +1639,7 @@
+
+ static int guest_map_va_range_impl(guest_t *g, uint64_t va_start, uint64_t va_end,
+                        uint64_t gpa_start, int perms, int *skipped_out) {
++    HL_PT_WRITE_SCOPE;
+     if (va_end < va_start ||
+         guest_control_gpa_overlap(g, gpa_start, va_end - va_start)) return -1;
+     uint64_t base = g->ipa_base;
+@@ -1775,6 +1791,7 @@
+  * Extracts the output IPA from the existing descriptor — correct for both
+  * identity-mapped (VA=GPA) and non-identity (high VA→low GPA) regions. */
+ static int split_l2_block(guest_t *g, uint64_t *l2_entry) {
++    HL_PT_WRITE_SCOPE;
+     if (!l2_entry) return -1;
+
+     /* Already a table descriptor (previously split) — nothing to do */
+@@ -1802,12 +1819,14 @@
+ }
+
+ int guest_split_block(guest_t *g, uint64_t block_gpa) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t block_start = ALIGN_2MB_DOWN(block_gpa);
+     uint64_t *l2_entry = find_l2_entry(g, block_start);
+     return split_l2_block(g, l2_entry);
+ }
+
+ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t base = g->ipa_base;
+
+     /* Page-align the range */
+@@ -1899,11 +1918,13 @@
+ }
+
+ int guest_kbuf_split_block(guest_t *g, uint64_t block_va) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t *l2_entry = kbuf_find_l2_entry(g, block_va);
+     return split_l2_block(g, l2_entry);
+ }
+
+ int guest_kbuf_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
++    HL_PT_WRITE_SCOPE;
+     start = start & ~(PAGE_SIZE - 1);
+     end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+@@ -1954,6 +1975,7 @@
+ }
+
+ int guest_kbuf_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end) {
++    HL_PT_WRITE_SCOPE;
+     start = start & ~(PAGE_SIZE - 1);
+     end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+@@ -1994,6 +2016,7 @@
+ }
+
+ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms) {
++    HL_PT_WRITE_SCOPE;
+     uint64_t base = g->ipa_base;
+
+     /* Page-align the range */
+@@ -2087,6 +2110,7 @@
+  * mmap_lock. Host-page alignment is handled by Rust, not guest VA placement. */
+ int guest_map_shared_pages(guest_t *g, uint64_t va, uint64_t len,
+                           uint64_t ipa, int perms) {
++    HL_PT_WRITE_SCOPE;
+     if (guest_control_va_overlap(g, va, len)) return -1;
+     if (ipa >= g->ipa_base && ipa - g->ipa_base < g->guest_size &&
+         guest_control_gpa_overlap(g, ipa - g->ipa_base, len)) return -1;
