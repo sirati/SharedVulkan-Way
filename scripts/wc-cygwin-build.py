@@ -166,6 +166,10 @@ def build(root, bridge_dir=None):
                           REPO / 'crates/sv-transport/src/ring.rs',
                           REPO / 'crates/sv-transport/src/park.rs',
                           REPO / 'crates/sv-transport/src/vdoorbell.rs',
+                          REPO / 'crates/wc-broker/src/client.rs',
+                          REPO / 'crates/wc-broker/src/core.rs',
+                          REPO / 'crates/wc-broker/src/server.rs',
+                          REPO / 'crates/wc-broker/src/sys/windows/bell_hub.rs',
                           REPO / 'crates/wc-cygwin-link/Cargo.toml')
         if any(file.stat().st_mtime_ns > (bridge / 'wc_cygwin_link.dll').stat().st_mtime_ns
                for file in native_sources):
