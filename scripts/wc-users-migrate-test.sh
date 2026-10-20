@@ -95,6 +95,12 @@ app_out=$(sh "$T/var/lib/waycompose/installs/wcivs/bin/fixture-app")
 [ "$app_out" = "restored application ran with original config" ] && ok "protected rollback restores a runnable application" || bad "rollback application failed"
 ! grep -q '^changed' "$T/var/lib/waycompose/installs/wcivs/apps.ini" && ok "protected rollback restores application configuration" || bad "rollback configuration failed"
 cmp -s "$T/var/lib/waycompose/installs/wcivs/session.key" "$T/var/lib/waycompose/key-trust/wcivs/session.key" && ok "protected rollback keeps the trusted verifier key" || bad "rollback restored old trust"
+# A shared verifier must not restart over another install's exposed key.
+mkdir -p "$T/var/lib/waycompose/installs/legacy-unmigrated"
+printf 'retired fixture\n' >"$T/var/lib/waycompose/installs/legacy-unmigrated/session.key"
+out=$(ROOT="$T" bash "$ROOT_DIR/scripts/wc-users-migrate.sh" services-restart admin desk unused wcivs 2>&1); rc=$?
+[ "$rc" != 0 ] && ok "shared verifier restart refuses any unmigrated installation" || bad "shared verifier accepted untrusted install"
+rm -rf "$T/var/lib/waycompose/installs/legacy-unmigrated"
 # wc-launch.sh deploy's guard: its two functions, with the host's commands run
 # here against this tree.
 guard() { # LAYOUT SESSION -> output, rc

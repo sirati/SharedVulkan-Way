@@ -186,6 +186,14 @@ switch ($Action) {
     if (Test-Path $Keys) { Get-ChildItem $Keys | ForEach-Object { Say "key: $($_.Name)" } }
   }
   "uninstall" {
+    # Saved legacy grant code can reopen raw devices after a safe descriptor
+    # restoration. Its old task or script is not a reviewed drain boundary.
+    # Refuse before touching the service, even with a restricted raw baseline.
+    foreach ($legacy in @("task.xml", "wc-port-access.ps1", "ports.json")) {
+      if (Test-Path -LiteralPath (Join-Path $Before $legacy)) {
+        throw "uninstall refused before service mutation: unreviewed legacy grant restoration ($legacy); retain broker protections and use protected application rollback"
+      }
+    }
     # Do not stop a working broker when rollback would expose uncleared BARs.
     if (-not (Test-Path $Exe)) { throw "broker executable missing; cannot prove safe uninstall" }
     $check = Run $Exe @("broker", "revert-acl-check")

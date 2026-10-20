@@ -84,7 +84,7 @@ as_user() { # USER CMD...: a systemctl --user of USER
   local u=$1; shift
   if [ -n "$REAL" ]; then run systemctl --machine="$u@.host" --user "$@"; else say "  (would: systemctl --user -M $u@ $*)"; fi
 }
-sys() { if [ "$1" = restart ] || [ "$1" = start ]; then require_all_trust; fi; if [ -n "$REAL" ]; then run systemctl "$@"; else say "  (would: systemctl $*)"; fi; }
+sys() { if [ -z "$DRY" ] && { [ "$1" = restart ] || [ "$1" = start ]; }; then require_all_trust; fi; if [ -n "$REAL" ]; then run systemctl "$@"; else say "  (would: systemctl $*)"; fi; }
 
 [ -d "$AH" ] || { echo "no home for $ADMIN ($AH)"; exit 1; }
 [ -d "$DH" ] || { echo "no home for $DESK ($DH)"; exit 1; }
