@@ -1,0 +1,15 @@
+--- a/src/syscall_net.c
++++ b/src/syscall_net.c
+@@ -1437,6 +1437,12 @@
+     if (guest_read(g, msg_gva, &lmsg, sizeof(lmsg)) < 0)
+         return -LINUX_EFAULT;
+ 
++    /* XNU MSG_PEEK zeroes SCM_RIGHTS data instead of externalizing FDs.
++     * Those zeroes are not descriptors and must never enter import/cleanup.
++     * A real shared receive cache is required for Linux ancillary peeking. */
++    if ((flags & 2) && lmsg.msg_control && lmsg.msg_controllen)
++        return -LINUX_EOPNOTSUPP;
++
+     int mac_flags = translate_msg_flags(flags);
+ 
+     /*

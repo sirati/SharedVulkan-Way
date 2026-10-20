@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static void option(int fd, int expected) {
@@ -40,6 +41,14 @@ int main(void) {
     c=CMSG_FIRSTHDR(&msg); c->cmsg_level=SOL_SOCKET; c->cmsg_type=SCM_RIGHTS; c->cmsg_len=CMSG_LEN(sizeof(alias));
     memcpy(CMSG_DATA(c),&alias,sizeof(alias)); assert(sendmsg(t[0],&msg,0)==1);
     memset(&ctrl,0,sizeof(ctrl)); msg.msg_controllen=CMSG_SPACE(sizeof(int));
+    int stdin_flags=fcntl(0,F_GETFD);
+    struct stat stdin_before,stdin_after;assert(!fstat(0,&stdin_before));
+    int lowest=dup(0);assert(lowest>=0);assert(!close(lowest));
+    errno=0;assert(recvmsg(t[1],&msg,MSG_PEEK)==-1 && errno==EOPNOTSUPP);
+    assert(fcntl(0,F_GETFD)==stdin_flags);
+    assert(!fstat(0,&stdin_after));
+    assert(stdin_before.st_dev==stdin_after.st_dev && stdin_before.st_ino==stdin_after.st_ino);
+    int unchanged=dup(0);assert(unchanged==lowest);assert(!close(unchanged));
     assert(recvmsg(t[1],&msg,MSG_CMSG_CLOEXEC)==1 && !(msg.msg_flags&MSG_CTRUNC));
     c=CMSG_FIRSTHDR(&msg); assert(c && c->cmsg_type==SCM_RIGHTS && c->cmsg_len==CMSG_LEN(sizeof(int)));
     int received; memcpy(&received,CMSG_DATA(c),sizeof(received)); option(received,1);

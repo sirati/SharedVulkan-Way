@@ -68,7 +68,7 @@ let
   hl = t.stdenv.mkDerivation {
     pname = "hl-waycompose"; version = "0.3.0-rc2";
     src = import ./source.nix;
-    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ];
+    patches = [ ./host-backed-mappings.patch ./initial-scripts.patch ./seccomp.patch ./external-guest-fault.patch ./peek-rights-guard.patch ];
     nativeBuildInputs = [ pkgs.gnumake pkgs.python3 pkgs.rcodesign ];
     dontConfigure = true; dontStrip = true; dontPatchELF = true; dontPatchShebangs = true;
     postPatch = ''
