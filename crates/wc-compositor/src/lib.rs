@@ -1781,18 +1781,6 @@ fn wayland_thread(
         }
     };
 
-    // Fixed, greppable, and explicitly flushed. A Windows binary under Wine
-    // with a redirected stdout is fully buffered, so a harness waiting for this
-    // line would otherwise wait forever while the compositor worked perfectly.
-    println!(
-        "wc-compositor: listening on {}",
-        listener
-            .socket_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    );
-    let _ = std::io::stdout().flush();
-
     #[cfg(target_os = "macos")]
     let mut prime_endpoint = {
         let path = listener.socket_name().map(std::path::PathBuf::from).unwrap_or_default();
@@ -1804,6 +1792,18 @@ fn wayland_thread(
             Err(error) => { eprintln!("wc-compositor: native PRIME endpoint: {error}"); state.quit(0); return 2; }
         }
     };
+
+    // Fixed, greppable, and explicitly flushed. A Windows binary under Wine
+    // with a redirected stdout is fully buffered, so a harness waiting for this
+    // line would otherwise wait forever while the compositor worked perfectly.
+    println!(
+        "wc-compositor: listening on {}",
+        listener
+            .socket_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let _ = std::io::stdout().flush();
 
     let mut display = display;
     let deadline = Instant::now() + idle_timeout;

@@ -14,7 +14,7 @@ use smithay::reexports::wayland_server::{
 };
 use std::io;
 use std::os::fd::AsFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use sv_drm::native_prime::{Imported, Registry, SyncPage};
@@ -373,7 +373,7 @@ pub struct Endpoint {
     listener: UnixListener,
     path: PathBuf,
     registry: Registry,
-    workers: Vec<(UnixStream, std::thread::JoinHandle<()>)>,
+    connections: sv_drm::native_prime::Connections,
 }
 impl Endpoint {
     pub fn bind(wayland_socket: &Path, registry: Registry) -> io::Result<Self> {
@@ -410,51 +410,17 @@ impl Endpoint {
             listener,
             path,
             registry,
-            workers: Vec::new(),
+            connections: sv_drm::native_prime::Connections::default(),
         })
     }
     pub fn accept_pending(&mut self) -> io::Result<()> {
-        // Bound live workers by removing completed owner connections on each
-        // existing accept turn. Each remaining connection owns live tokens.
-        let mut index = 0;
-        while index < self.workers.len() {
-            if self.workers[index].1.is_finished() {
-                let (_, worker) = self.workers.swap_remove(index);
-                let _ = worker.join();
-            } else {
-                index += 1;
-            }
-        }
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    let cancel = stream.try_clone()?;
-                    let registry = self.registry.clone();
-                    let worker = std::thread::spawn(move || {
-                        let _ = sv_drm::native_prime::serve_connection(
-                            stream,
-                            unsafe { libc::getuid() },
-                            &registry,
-                        );
-                    });
-                    self.workers.push((cancel, worker));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        self.connections
+            .accept_pending(&self.listener, &self.registry)?;
+        Ok(())
     }
 }
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        for (stream, _) in &self.workers {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        for (_, worker) in self.workers.drain(..) {
-            let _ = worker.join();
-        }
         let _ = std::fs::remove_file(&self.path);
     }
 }

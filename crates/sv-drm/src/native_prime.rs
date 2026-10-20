@@ -14,7 +14,21 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
+mod connections;
+pub use connections::{ACCEPT_BUDGET, AcceptReport, Connections, MAX_CONNECTIONS};
+
 pub const MAX_HEADER: usize = 448;
+/// Resource budget for discoverable control metadata, independent of image
+/// allocation size or backing. An owner can register 1024 distinct exported
+/// images, at most 448 KiB of frozen headers plus decoded metadata and 1024 FDs.
+/// This allows hundreds of live exported images across apps in a multiplexed
+/// runtime connection; it is not a measured Firefox allocation ceiling.
+/// Repeated registration is idempotent. No backing slots are preallocated.
+pub const MAX_OWNER_REGISTRATIONS: usize = 1024;
+/// The whole registry retains at most 8192 discoverable token FDs and 3.5 MiB
+/// of frozen header bytes. Consumer guards already handed out retain their
+/// original pages independently. Reject excess; never evict live registrations.
+pub const MAX_REGISTRATIONS: usize = 8192;
 /// Fixed wire request: little-endian header length, then zero-padded header.
 /// One SCM_RIGHTS descriptor accompanies the first byte. ACK is 0 or 1.
 pub const REQUEST_LEN: usize = MAX_HEADER + 4;
@@ -102,14 +116,35 @@ struct Entry {
     imported: Arc<Imported>,
     owners: HashSet<u64>,
 }
-#[derive(Default)]
 struct State {
     next: u64,
     entries: HashMap<Identity, Entry>,
+    owner_counts: HashMap<u64, usize>,
+    owner_limit: usize,
+    entry_limit: usize,
+}
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            entries: HashMap::new(),
+            owner_counts: HashMap::new(),
+            owner_limit: MAX_OWNER_REGISTRATIONS,
+            entry_limit: MAX_REGISTRATIONS,
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub struct Registry(Arc<Mutex<State>>);
 impl Registry {
+    #[cfg(test)]
+    fn limited(owner_limit: usize, entry_limit: usize) -> Self {
+        Self(Arc::new(Mutex::new(State {
+            owner_limit,
+            entry_limit,
+            ..State::default()
+        })))
+    }
     pub fn register(&self, fd: BorrowedFd<'_>, canonical: &[u8]) -> io::Result<Owner> {
         let owner = self.owner()?;
         owner.register(fd.try_clone_to_owned()?, canonical)?;
@@ -124,9 +159,11 @@ impl Registry {
             .next
             .checked_add(1)
             .ok_or_else(|| invalid("owner generation exhausted"))?;
+        let id = s.next;
+        s.owner_counts.insert(id, 0);
         Ok(Owner {
             registry: self.clone(),
-            id: s.next,
+            id,
         })
     }
     pub fn import(&self, fd: BorrowedFd<'_>) -> io::Result<Arc<Imported>> {
@@ -174,6 +211,24 @@ impl Owner {
             .0
             .lock()
             .map_err(|_| invalid("registry poisoned"))?;
+        let new_identity = state
+            .entries
+            .get(&id)
+            .is_none_or(|e| !e.owners.contains(&self.id));
+        if new_identity
+            && state.owner_counts.get(&self.id).copied().unwrap_or(0) >= state.owner_limit
+        {
+            return Err(io::Error::other(format!(
+                "native PRIME owner registration limit reached ({})",
+                state.owner_limit
+            )));
+        }
+        if !state.entries.contains_key(&id) && state.entries.len() >= state.entry_limit {
+            return Err(io::Error::other(format!(
+                "native PRIME registry registration limit reached ({})",
+                state.entry_limit
+            )));
+        }
         if let Some(existing) = state.entries.get_mut(&id) {
             if existing.imported.header.as_ref() != header || existing.imported.len != len {
                 return Err(invalid("identity already registered differently"));
@@ -193,12 +248,19 @@ impl Owner {
                 },
             );
         }
+        if new_identity {
+            *state
+                .owner_counts
+                .get_mut(&self.id)
+                .expect("live registration owner") += 1;
+        }
         Ok(())
     }
 }
 impl Drop for Owner {
     fn drop(&mut self) {
         if let Ok(mut s) = self.registry.0.lock() {
+            s.owner_counts.remove(&self.id);
             s.entries.retain(|_, e| {
                 e.owners.remove(&self.id);
                 !e.owners.is_empty()
@@ -347,9 +409,8 @@ pub fn serve_connection(
             owner.register(fd, &request[4..4 + n])
         };
         stream.write_all(&[u8::from(result.is_err())])?;
-        if result.is_err() {
-            return result;
-        }
+        // The bounded frame was consumed completely. A rejected registration
+        // does not revoke this owner's previously accepted live allocations.
     }
     Ok(())
 }
@@ -502,6 +563,77 @@ mod tests {
         assert!(registry.import(fd.as_fd()).is_err());
         assert_eq!(consumer.token().encode(), bytes);
     }
+    #[test]
+    fn owner_registration_limit_rejects_without_evicting_live_tokens() {
+        let registry = Registry::limited(4, 8);
+        let owner = registry.owner().unwrap();
+        let mut aliases = Vec::new();
+        for _ in 0..4 {
+            let (fd, bytes) = fixture();
+            owner.register(fd.try_clone().unwrap(), &bytes).unwrap();
+            aliases.push((fd, bytes));
+        }
+        let (extra, bytes) = fixture();
+        let error = owner
+            .register(extra.try_clone().unwrap(), &bytes)
+            .unwrap_err();
+        assert!(error.to_string().contains("registration limit"));
+        assert!(registry.import(extra.as_fd()).is_err());
+        for (fd, bytes) in &aliases {
+            // Idempotent registration at the cap does not consume a slot.
+            owner.register(fd.try_clone().unwrap(), bytes).unwrap();
+            assert!(registry.import(fd.as_fd()).is_ok());
+        }
+        let other = registry.register(extra.as_fd(), &bytes).unwrap();
+        assert!(registry.import(extra.as_fd()).is_ok());
+        drop(other);
+        assert!(registry.import(aliases[0].0.as_fd()).is_ok());
+    }
+
+    #[test]
+    fn registry_fd_budget_rejects_without_eviction_and_recovers_on_owner_close() {
+        let registry = Registry::limited(2, 3);
+        let first = registry.owner().unwrap();
+        let second = registry.owner().unwrap();
+        let mut keep = Vec::new();
+        for owner in [&first, &first, &second] {
+            let (fd, header) = fixture();
+            owner.register(fd.try_clone().unwrap(), &header).unwrap();
+            keep.push(fd);
+        }
+        let (extra, header) = fixture();
+        let error = second
+            .register(extra.try_clone().unwrap(), &header)
+            .unwrap_err();
+        assert!(error.to_string().contains("registry registration limit"));
+        for fd in &keep {
+            assert!(registry.import(fd.as_fd()).is_ok());
+        }
+        drop(first);
+        assert!(registry.import(keep[2].as_fd()).is_ok());
+        second
+            .register(extra.try_clone().unwrap(), &header)
+            .unwrap();
+        assert!(registry.import(extra.as_fd()).is_ok());
+    }
+
+    #[test]
+    fn rejected_bounded_frame_keeps_previous_owner_registrations_alive() {
+        let registry = Registry::default();
+        let (fd, bytes) = fixture();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let copy = registry.clone();
+        let worker =
+            std::thread::spawn(move || serve_connection(server, unsafe { libc::geteuid() }, &copy));
+        register(&mut client, fd.as_fd(), &bytes).unwrap();
+        assert!(register(&mut client, fd.as_fd(), &[0]).is_err());
+        assert!(registry.import(fd.as_fd()).is_ok());
+        register(&mut client, fd.as_fd(), &bytes).unwrap();
+        drop(client);
+        worker.join().unwrap().unwrap();
+        assert!(registry.import(fd.as_fd()).is_err());
+    }
+
     #[test]
     fn wrong_native_uid_is_rejected() {
         let registry = Registry::default();
