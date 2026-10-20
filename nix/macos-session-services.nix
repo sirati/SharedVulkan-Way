@@ -1,6 +1,6 @@
 # Assemble on vmhost, with Darwin runtime dependencies fetched from substitutes
 # or cross-built beforehand. hostTools must contain a vmhost-built Mach-O opener.
-{ pkgs, buildPkgs, hostTools }:
+{ pkgs, buildPkgs, hostTools, pulseAudio ? pkgs.pulseaudio }:
 assert buildPkgs.stdenv.buildPlatform.isLinux;
 assert pkgs.stdenv.hostPlatform.isDarwin;
 let
@@ -22,7 +22,7 @@ let
     #!${pkgs.runtimeShell}
     export PYTHONPATH=${dbusNext}/${python.sitePackages}
     export WC_DBUS_DAEMON=${pkgs.dbus}/bin/dbus-daemon
-    export WC_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
+    export WC_PULSEAUDIO=${pulseAudio}/bin/pulseaudio
     export WC_PORTAL=$out/libexec/waycompose/portal.py
     export WC_PORTAL_OPENER=${hostTools}/bin/wc-portal-open
     export WC_SESSION_PLIST=$out/Library/LaunchAgents/org.waycompose.session-services.plist
