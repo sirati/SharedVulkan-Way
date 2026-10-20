@@ -1582,3 +1582,52 @@ installation's session at once, where before it ended one. The next click
 starts a new compositor with a new run id, which voids every old record,
 region and slot (`waycompose-design.md` §107.6). The host side is one user,
 as above.
+
+### R44 — One privileged broker per machine: users by uid or SID, handles moved, keys held
+
+`waycompose-design.md` §111. Until §111 every installation's resources were
+reachable by whoever could open them: on Windows one named user was granted
+the ports (R32) and the BAR was the first opener's; on the VM host every
+session ran as the one admin account that installed it; installation keys sat
+in the user's own directory. §111 puts one privileged component on each
+machine (`wc-broker`: a SYSTEM service on Windows, a LaunchDaemon on macOS, a
+system service under its own account on Linux) between users and those
+resources.
+
+* **What a user is.** A uid or a SID, read from the kernel (`SO_PEERCRED`,
+  `getpeereid`, the pipe client's token checked against the process's own).
+  Nothing the client sends names a user. There are no integrity levels, keys
+  or tickets beyond §105's: the user asked for exactly this ("just look at the
+  user identification and not much more"). A user who shares their own
+  resources with another of their processes is within their rights.
+* **What the broker hands out, and to whom.** A device (an ivshmem BAR, a
+  virtio-serial port) to one process at a time, of one user at a time, moved
+  so that the broker keeps no handle; a region only to the user that owns it
+  (and admins); a service connection only to the users it is for. Devices and
+  ports are ACL'd to the broker's account and administrators, so a user
+  process cannot open them past it. Windows regions are unnamed sections, so
+  no name reaches them.
+* **What a dead process leaves.** Its devices are free the moment the kernel
+  reports the exit; its regions are held as orphans until the same user's
+  next provider of the pool frees them after the host has let go (the keeper
+  rule of R43 and §103.15, now one implementation); its leases end, and a
+  retiring region whose last lease ended is drained.
+* **Who asked for a session.** The boot record carries the identity the
+  broker read from the caller, under the installation's MAC, and the key is
+  readable only by the broker (§111.6). The compositor holds the BAR
+  read-write and can write any bytes into the header page, but it cannot make
+  a record for another user verify.
+* **What it does not change.** The data path: once moved or copied, a handle
+  is the process's own, and rings, doorbells, the arena and GPU memory are
+  shared exactly as before (R10, R21). The broker is not a reference monitor
+  for every access, only for who gets a handle.
+
+**What this does not protect.**
+* A process of user A that holds the BAR can read and write the whole BAR,
+  including regions §107 granted to A's other sessions; per-session windows on
+  the host side are follow-up work (R43's dma-bufs).
+* The broker is now the most privileged component of the project on each
+  machine. Its surface is the line protocol above, parsed strictly; its
+  binary is installed where users cannot write (a SYSTEM service running a
+  user-writable file would hand that user SYSTEM).
+* The platform paragraphs follow.
