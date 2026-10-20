@@ -96,6 +96,8 @@ enum Backing {
     /// single-process tests and the `Vec<u8>`-backed arena of docs/design.md §13
     /// step 2 use.
     Heap(std::alloc::Layout),
+    /// A borrowed mapping whose owner is retained through every slice.
+    Owned { _owner: std::sync::Arc<dyn Send + Sync> },
     /// `mmap(MAP_SHARED)` of a file descriptor. The real one.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Mapped,
@@ -123,6 +125,42 @@ pub struct SharedRegion {
 // I5.
 unsafe impl Send for SharedRegion {}
 unsafe impl Sync for SharedRegion {}
+
+/// Open a shared file for reading and writing (§103.19). On macOS a file
+/// tagged `user.krun.shm` stands for the POSIX shared memory object it names:
+/// the Mac's libkrun maps that object when the Linux VM maps the file through
+/// virtio-fs DAX, so this side must map it too, not the file's own (empty)
+/// blocks. Anywhere else, and for an untagged file, it is the file.
+#[cfg(unix)]
+pub fn open_shared(path: &str) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        unsafe extern "C" {
+            fn fgetxattr(fd: i32, name: *const i8, value: *mut u8, size: usize, position: u32, options: i32) -> isize;
+            fn shm_open(name: *const i8, oflag: i32, ...) -> i32;
+        }
+        const O_RDWR: i32 = 2;
+        let mut name = [0u8; 32];
+        // SAFETY: a NUL-terminated attribute name and a buffer of the size
+        // given, for a descriptor this function holds.
+        let n = unsafe { fgetxattr(file.as_raw_fd(), c"user.krun.shm".as_ptr(), name.as_mut_ptr(), name.len() - 1, 0, 0) };
+        if n > 0 {
+            // `name` stays NUL-terminated: at most len - 1 bytes were read.
+            // SAFETY: a NUL-terminated name.
+            let fd = unsafe { shm_open(name.as_ptr().cast(), O_RDWR) };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error();
+                let shown = String::from_utf8_lossy(&name[..n as usize]).into_owned();
+                return Err(std::io::Error::new(e.kind(), format!("{path}: shared memory {shown}: {e}")));
+            }
+            // SAFETY: a descriptor shm_open just returned, owned from here.
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+    }
+    Ok(file)
+}
 
 impl SharedRegion {
     /// A private, zeroed, page-aligned region.
@@ -378,6 +416,26 @@ impl SharedRegion {
         SharedRegion { base, len, backing: Backing::Borrowed }
     }
 
+    /// Retain the external owner of a mapping. All slices keep it alive.
+    ///
+    /// # Safety
+    /// `base` must be page-aligned and valid for `len` writable bytes until
+    /// `owner` is dropped. Only the owner may release the mapping.
+    pub unsafe fn from_raw_owned(base: *mut u8, len: usize, owner: std::sync::Arc<dyn Send + Sync>) -> Self {
+        assert!(len > 0 && (base as usize).is_multiple_of(PAGE));
+        Self { base, len, backing: Backing::Owned { _owner: owner } }
+    }
+
+    /// A page-aligned subrange which retains this mapping and its owner.
+    pub fn slice(self: &std::sync::Arc<Self>, offset: u64, len: u64) -> Result<Self> {
+        self.check(offset, len)?;
+        if len == 0 || !offset.is_multiple_of(PAGE as u64) || !len.is_multiple_of(PAGE as u64) {
+            return Err(Error::BadGeometry("a region slice must contain whole pages"));
+        }
+        // SAFETY: checked above, and the cloned parent retains the mapping.
+        Ok(unsafe { Self::from_raw_owned(self.base.add(offset as usize), len as usize, self.clone()) })
+    }
+
     /// Take a mapped Windows section object as a region.
     ///
     /// The counterpart of [`SharedRegion::map_fd`], and deliberately the *whole*
@@ -540,7 +598,7 @@ impl Drop for SharedRegion {
             },
             // Somebody else's memory. Freeing it here would be a double free of
             // the guest provider's window.
-            Backing::Borrowed => {}
+            Backing::Borrowed | Backing::Owned { .. } => {}
             // The section's own `Drop` unmaps the view and closes the handle,
             // in that order. Nothing to do here but let it run.
             #[cfg(windows)]

@@ -110,6 +110,9 @@ struct Held<O> {
     pieces: Vec<(u64, u64)>,
 }
 
+/// A durable lease check, run before any region handle reaches a client.
+pub type LeaseCheck = Box<dyn FnMut(&RegionInfo, Pid) -> io::Result<()> + Send>;
+
 struct State<P: Platform> {
     core: Core,
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
@@ -117,6 +120,7 @@ struct State<P: Platform> {
     on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
     quiescing: bool,
     on_leased: Vec<Box<dyn FnMut(ObjId, Pid) + Send>>,
+    on_leased_checked: Vec<LeaseCheck>,
 }
 
 /// A running broker. Cloned into every connection's thread; also what a
@@ -169,6 +173,7 @@ impl<P: Platform> Broker<P> {
                 on_drained: Vec::new(),
                 quiescing: false,
                 on_leased: Vec::new(),
+                on_leased_checked: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
@@ -284,7 +289,10 @@ impl<P: Platform> Broker<P> {
 
     /// Serve one connection until it ends.
     pub fn client(&self, conn: P::Conn, writer: P::Writer, peer: Peer) {
-        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let Ok(id) = self.next_conn.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) else {
+            log("connection generations exhausted");
+            return;
+        };
         let writer = Arc::new(Mutex::new(writer));
         {
             let mut st = self.lock();
@@ -293,7 +301,9 @@ impl<P: Platform> Broker<P> {
         }
         let me = self.clone();
         let pid = peer.pid;
-        if !self.platform.watch(pid, Box::new(move || me.exited(pid))) {
+        let watched = self.platform.watch(pid, Box::new(move || me.exited(pid)));
+        self.lock().core.owner_watch_ready(id, watched);
+        if !watched {
             log(&format!("connection {id}: process {pid} cannot be watched; its connection stands for it"));
         }
         let mut rd = BufReader::new(conn);
@@ -417,6 +427,12 @@ impl<P: Platform> Broker<P> {
                     let pieces: Vec<(u64, u64)> = held.iter().flat_map(|h| h.pieces.iter().copied()).collect();
                     // Before the fds leave: an embedder that records holders
                     // has this one before it can map anything.
+                    for f in st.on_leased_checked.iter_mut() {
+                        if let Err(e) = f(&info, peer.pid) {
+                            let _ = st.core.close(id, rid);
+                            return p.push(w, &format!("err lease record: {e}"));
+                        }
+                    }
                     for f in st.on_leased.iter_mut() {
                         f(rid, peer.pid);
                     }
@@ -491,6 +507,16 @@ impl<P: Platform> Broker<P> {
                     log(&format!("sign refused to process {} of {}: {e}", peer.pid, peer.user));
                     p.push(w, &format!("err {e}"))
                 }
+            },
+            Request::Owner => match st.core.owner(id) {
+                Ok(connection) => p.push(w, &format!("ok owner {} {connection}", self.run)),
+                Err(r) => refused(w, r),
+            },
+            Request::ObserveOwner { run, connection, pid } => {
+                if *run != self.run { p.push(w, "err owner belongs to another broker run") }
+                else { match st.core.observe_owner(id, *connection, *pid) {
+                    Ok(()) => p.push(w, "ok"), Err(r) => refused(w, r),
+                } }
             },
             Request::Subscribe => match st.core.subscribe(id) {
                 Ok(()) => p.push(w, "ok"),
@@ -577,6 +603,26 @@ impl<P: Platform> Broker<P> {
     /// before a crash. Under the broker's lock, like [`Self::on_drained`].
     pub fn on_leased(&self, f: Box<dyn FnMut(ObjId, Pid) + Send>) {
         self.lock().on_leased.push(f);
+    }
+
+    /// Add a fallible lease check under the broker lock. A failure closes
+    /// the new lease and sends no handles. Checks must never call the broker.
+    pub fn on_leased_checked(&self, f: LeaseCheck) {
+        self.lock().on_leased_checked.push(f);
+    }
+
+    /// Redeem one piece over another OS-authenticated local channel. The
+    /// existing core lease is checked under the same lock that holds the
+    /// objects alive and serializes close/retire. The callback must not call
+    /// the broker. It must finish transferring the capability before return.
+    pub fn with_region_lease<T>(&self, peer: &Peer, id: ObjId, epoch: u64, piece: usize,
+        transfer: impl FnOnce(&P::Object, u64, u64) -> io::Result<T>) -> io::Result<T> {
+        let st = self.lock();
+        st.core.leased_region(peer, id, epoch).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.0))?;
+        let held = st.objs.get(&id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "region object missing"))?;
+        let (obj, (offset, len)) = held.iter().flat_map(|h| h.pieces.iter().map(move |p| (&h.obj, *p)))
+            .nth(piece).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "region piece missing"))?;
+        transfer(obj, offset, len)
     }
 
     /// The processes holding a lease on region `id` now, so that a

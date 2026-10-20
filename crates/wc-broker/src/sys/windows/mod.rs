@@ -21,6 +21,7 @@ pub mod holder;
 pub mod ident;
 pub mod pipe;
 pub mod service;
+mod readiness;
 
 use crate::core::{ObjId, Peer, Pid, RegionInfo, User};
 use crate::server::{Give, Platform};
@@ -166,6 +167,7 @@ pub struct Windows {
     listener: Listener,
     devices: Vec<DeviceAt>,
     large_pages: bool,
+    raw_device_paths: Option<BTreeMap<String, String>>,
     region_init: Option<RegionInit>,
     holder: Option<Arc<holder::Link>>,
     /// Process handles opened at accept, for `watch`: the process the pid
@@ -181,10 +183,18 @@ impl Windows {
             listener: Listener::new(name, sddl)?,
             devices,
             large_pages,
+            raw_device_paths: None,
             region_init: None,
             holder: None,
             opened: Arc::default(),
         })
+    }
+
+    /// Pin service raw-device opens to the exact interface whose durable
+    /// owner was checked at startup. Aliases cannot select a different BAR.
+    pub fn with_raw_device_paths(mut self, paths: BTreeMap<String, String>) -> Self {
+        self.raw_device_paths = Some(paths);
+        self
     }
 
     /// Run `f` on every new region (§108.8's stamp plugs in here).
@@ -344,7 +354,18 @@ impl Platform for Windows {
             .find(|d| d.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("device {name} has no location here")))?;
         let h = match &d.loc {
-            DeviceLoc::IvshmemSlot(s) => wc_handle::open_ivshmem_slot(*s)?.into_raw(),
+            DeviceLoc::IvshmemSlot(s) => match &self.raw_device_paths {
+                Some(paths) => {
+                    let path = paths.get(name).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "raw device has no trusted durable owner",
+                        )
+                    })?;
+                    wc_handle::open_ivshmem_path(path.clone())?.into_raw()
+                }
+                None => wc_handle::open_ivshmem_slot(*s)?.into_raw(),
+            },
             DeviceLoc::Port(p) => sv_transport::winpipe::open_virtio_port_handle(p, 500)
                 .map_err(|e| io::Error::other(format!("port {p}: {e}")))? as HANDLE,
             DeviceLoc::Path(p) => open_path(p)?,
@@ -368,6 +389,23 @@ impl Platform for Windows {
                     io::ErrorKind::InvalidInput,
                     format!("a large-page region is a whole number of {unit}-byte pages, not {len} bytes"),
                 ));
+            }
+            // Keep the guest's working memory available, as the old keeper
+            // did. A broker budget alone does not account for other apps.
+            let (total, available) = sv_transport::winram::memory_status();
+            let reserve = std::env::var("WC_RAM_RESERVE_MIB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or((1u64 << 30).max(total / 100 * 15), |m| {
+                    m.saturating_mul(1 << 20)
+                });
+            if available < len.saturating_add(reserve) {
+                return Err(io::Error::other(format!(
+                    "budget: {} MiB asked, {} MiB available, {} MiB kept for Windows",
+                    len >> 20,
+                    available >> 20,
+                    reserve >> 20
+                )));
             }
             flags |= SEC_LARGE_PAGES;
         }
@@ -454,10 +492,13 @@ impl Platform for Windows {
         if let Some(h) = &self.holder
             && let Err(e) = h.add(info, user, obj.h)
         {
-            // Not fatal: the provider and the broker hold it; only a crash
-            // of both would lose it.
-            eprintln!("[wc-broker] region {}: the holder did not take a copy ({e})", info.id);
+            // Link::add registers the raw handle before transferring it.
+            // The failed allocation drops that handle, so the restart
+            // watcher must not retain it and later duplicate a reused value.
+            h.del(info.id);
+            return Err(e);
         }
+
         Ok(note)
     }
 

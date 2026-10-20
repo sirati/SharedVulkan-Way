@@ -34,3 +34,5 @@ pub mod fusenode;
 pub mod token_wire;
 #[cfg(unix)]
 pub mod relay_api;
+#[cfg(unix)]
+pub mod native_prime;

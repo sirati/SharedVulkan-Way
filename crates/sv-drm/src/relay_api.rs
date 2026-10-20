@@ -139,4 +139,3 @@ pub trait Relay: Send + Sync {
     /// Forward fd `fd` of task `pid` (uid `uid`) to the service `service`.
     fn connect(&self, uid: u32, pid: u32, fd: i32, service: &str) -> Result<(), i32>;
 }
-

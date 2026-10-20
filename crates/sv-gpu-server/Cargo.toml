@@ -57,6 +57,7 @@ wc-broker = { workspace = true }
 # allocator §103.3 measured for the compositor's arena.
 [target.'cfg(target_os = "macos")'.dependencies]
 wc-handle = { path = "../wc-handle" }
+wc-broker.workspace = true
 
 [dev-dependencies]
 # Only so the two sides' shared constants can be *compared* rather than each

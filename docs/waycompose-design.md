@@ -32627,7 +32627,7 @@ is added to the common modes. The mapping:
 | `Key`, `KeyboardFocus` | `keyDown:`/`keyUp:`/`flagsChanged:`; `kVK_*` to evdev table (written here from Apple's `Events.h`, not taken from cocoa-way) |
 | `Layout` | `TISCopyCurrentKeyboardLayoutInputSource`, read when a window becomes key and on the 250 ms timer, mapped to the compiled-in `us`/`gb`/`de`/`fr` |
 | `Resized`, `Activated`, `Minimized`, `CloseRequested` | `NSWindowDelegate`: `windowDidResize:`, `windowDidBecomeKey:`, `windowDidMiniaturize:`, `windowShouldClose:` (returns NO and asks the client) |
-| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x |
+| scale | one point per surface pixel. The compositor supports buffer scale 1 only (`state.rs`), so on a Retina screen AppKit scales the layer up: correct and soft. The VM's screen is 1x. Superseded by 103.18: the output's scale is the screen's, and the layer's `contentsScale` follows |
 | `IdleInhibit` | `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep)` |
 
 **The Cmd key.** A Mac user presses Cmd+C to copy, and a Linux application
@@ -33426,11 +33426,71 @@ the bell port: no ssh, socket, TCP or vsock in the session's path.
 * The proxy's microphone source failed to load (`mkfifo sound-2.fifo: File
   exists`) once the Mac's devices were re-announced.
 
+### 103.18 Output scale: Retina without blur
+
+Until this section every surface pixel was one Mac point, and on a Retina
+screen AppKit doubled the layer: correct and soft (103.7's table). Now the one
+output has an integer scale S, which the platform gives (`Started::scale`):
+the main screen's `backingScaleFactor`, rounded, at least 1, on macOS; 1 on
+Win32 and headless. `--output-scale N` overrides it, for a harness. It is read
+through `State::scale_for(surface)`, so a platform with a scale per monitor
+(Windows' per-monitor DPI) changes that function and the output setup, not the
+readers.
+
+**Logical stays logical.** Configure sizes, window geometry, input, pointer
+constraints, popup placement, `ToUi::Map`/`Resize`/`MovePopup` and the
+control socket's rectangles are in surface units, which are Mac points. Only
+pixels are in device pixels.
+
+**What a client sees at S > 1:**
+
+| | S = 1 (unchanged) | S > 1 |
+|---|---|---|
+| `wl_output.mode` | logical size | logical size × S |
+| `wl_output.scale` | not sent (1) | S |
+| `wl_compositor` | version 5 | version 6 |
+| `wl_surface.preferred_buffer_scale` | never | S, at `new_surface` |
+| a buffer of scale B ≠ 1 | drawn unscaled, and logged | honoured |
+
+**Pixels.** A surface's staging shadow, and so a window's shadow, is its
+logical size × S. A buffer with B = S is copied 1:1. Any other B is a view
+(`surface::view_of`, §102's path): the whole buffer resampled, nearest
+neighbour, to (buffer / B) × S, which is ×2 for an Xwayland or other B = 1
+client on S = 2. A viewport's destination is logical, so it is × S as well.
+Surface damage is mapped into buffer pixels (× B), buffer damage into the
+shadow by the view (S / B, widened by a pixel), and subsurface offsets (× S)
+when the tree is composed. Readers that want a size (bounds, hit test,
+pointer holds, the geometry-only commit, `mapped_windows`) divide by S
+(`State::surface_size`). The shadow carries its scale (`Shadow::scale`), so
+the platform knows how many points it is.
+
+**macOS.** The layer's `contentsScale` is set to the shadow's scale on every
+present, since AppKit resets it when a window changes screen; window and popup
+frames already come from logical sizes. The face's IOSurface pair is the
+shadow's size in pixels, and `ToFace::Surface` carries the scale. A client
+cursor's `NSImage` is sized in points (`image / B`, `CursorSpec::Image.scale`),
+with the hotspot in points; Win32 ignores the scale, as before.
+
+**Checked here (Linux, headless, `--output-scale 2`).** weston-terminal
+(version 5, told by `wl_output.scale` and `enter`) drew at B = 2 into a
+1484x854 shadow for a 742x427 window, after a first B = 1 frame that was
+doubled; foot (version 6) read `preferred_buffer_scale(2)` before its first
+frame; weston-presentation-shm stayed at B = 1 and was doubled. At S = 1
+weston-terminal's frame hashes were those of the binary before this section.
+The macOS half (`contentsScale`, the cursor's size, popup frames on a Retina
+screen) was compiled, not run.
+
+**Not built.** Fractional scale (`wp_fractional_scale_v1` with viewporter,
+for 125 % and 150 %), which this does not design out: the scale is per output
+and the view path already resamples. A scale that changes while running (a
+window moved to a screen of another scale): S is read once at start. Windows'
+per-monitor DPI. A filter better than nearest neighbour for B ≠ S.
+
 ### 103.12 Not built, and not proven
 
 * **Not built.** Drag and drop in either direction. IME and dead keys beyond
   what XKB composes in the client (no `NSTextInputClient`, no `text-input-v3`).
-  Retina scale above 1. SVG icons (the host's resolver
+  Fractional scale (integer Retina scale is 103.18). SVG icons (the host's resolver
   has no renderer, as on Windows). A frequent-pages section in the Dock menu
   (`macbundle::dock_items` takes them, and the launcher does not fetch
   `frequent` yet).
@@ -36273,17 +36333,15 @@ R43 accepts that: one host user is one trust domain.
 
 ### 108.16 Not done, and not proven
 
-* **The broker**: built and proven in a VM (108.18). One gap remains: a
-  lease taken in the last beat before the daemon crashes is not in its
-  record.
+* **The broker**: built and proven in a VM (108.18). Lease records are now
+  written before handle transfer, with a failed write refusing the lease.
 * **The Intel driver's import of a large-page section view** (108.11).
-* **The GPU process does not ring `0xFB`**; both sides poll while a region
-  is in flight (108.9). Ringing needs §110.3's per-range port lookup to give
-  the region manager the pool's port.
-* **A keeper service install** with restart-on-failure; the test VM used a
-  scheduled task. It becomes a module of the shared Windows service (108.10).
-* **The kept-keeper residual** (108.10): a keeper and every provider of a
-  pool killed together before the host lets go.
+* **Region doorbells** are wired through the pool's per-range port lookup.
+  Commit `48b90cc` rings `0xFB` on announce and retire and rescans on reopen.
+* **The Windows region backend** now uses the shared broker service and its
+  independent holder. The old keeper command is a compatibility alias for that broker.
+  A simultaneous kill of the provider, broker and holder still loses pages;
+  an ordinary provider or broker crash retains them.
 * **The arena BAR shrinking to a bootstrap**: a VM configuration change, for
   the user.
 * **The peer's own restart** (the broker daemon's): handled by its record
@@ -36347,13 +36405,59 @@ and lease files.
   newest live one, and each epoch is answered on its own.
 * **The daemon's own restart.** The component records every published
   region in its state directory: its runs, and its holders as (pid, start
-  time), written at publish and in every beat in which they change. A new run
-  publishes the recorded regions the table still holds, so their holders can
-  find them again. It answers one only once the new broker has drained it
-  *and* every recorded holder has exited (`broker::holders`, §111). Not
-  covered: a lease taken in the last beat (250 ms) before a crash. A hook
-  that runs before a lease's fds are sent would close that gap. It has been
-  asked of the broker's owner.
+  time). `on_leased_checked` writes and fsyncs an atomic replacement before
+  a region's handles leave the broker. The callback refuses an unregistered
+  region or a failed write, rolling back the new lease without sending fds.
+  It shares a lock with the peer's record updates, so a beat cannot erase a
+  newly recorded holder. A new run republishes the recorded regions and
+  answers only once its current leases have drained and every recorded
+  holder has exited. Failed re-publication also retains the old holders.
+
+**A journal that cannot be trusted blocks recovery.** Before publishing any
+inherited region, the component checks the complete journal's version,
+checksum and every record. Missing or unreadable files, malformed records,
+truncation, duplicate epochs and mapped entries without records block the
+whole pool. The peer freezes every table answer, including `REFUSED` for
+new announcements and `UNMAPPED` for unknown epochs. A refusal could also
+let the provider free memory handed to a mapper before `MAPPED` was written. Heartbeats leave the damaged
+file untouched. Restoring a trusted journal and restarting the daemon is
+required to resume recovery; a timeout never clears the block.
+
+Only a newly created private state directory with a demonstrably empty
+shared region table gets an initial, durably empty journal. A nonempty
+table blocks initialization, including ANNOUNCED entries before MAPPED. An existing directory with a missing journal is not treated as a
+first start. Production `GuestRamComponent` construction requires this
+directory; explicitly in-memory simulations retain their test-only mode.
+Unversioned journals are rejected because older heartbeat records cannot
+prove holder completeness. Their migration requires old mappings to have
+ended, rather than adding an integrity header to potentially incomplete
+holder records. A completed `UNMAPPED` entry needs no journal record while
+the provider finishes its cleanup.
+
+Recovery correction validation, 2026-10-20, code `5bc0ae9`: all 63 scoped
+`sv-ram`/`wc-broker` tests passed, as did strict scoped Clippy with
+`--all-targets --no-deps -- -D warnings`. The retained-mapper regression covers
+eight journal failures, including loss of the entire directory while the
+entry is ANNOUNCED with no answer. The NixOS guest-RAM broker VM test passed.
+Its unreadable and malformed journal cases kept alice's actual udmabuf mapping
+at the same address with unchanged bytes over 55 and 47 checks respectively.
+After trusted journal restoration and daemon restart, retirement still waited
+for alice to release her mapping before UNMAPPED and free. The test cleaned up
+its QEMU. No Windows VM rerun was needed for this Linux recovery correction.
+
+**Windows provider integration.** `KeeperSubstrate` now connects to the
+shared Windows broker and requests `alloc guest-ram.POOL BYTES large`.
+The service's region-init hook stamps every 2 MiB page with a random nonce
+and returns it in the allocation reply. The provider adopts that user's
+orphans on reconnect and opens their section handles. It sends `close` and
+`free` only after the peer's `UNMAPPED`. Regions remain address-stable for
+their whole epoch. The Windows backend keeps max(1 GiB, 15% of physical RAM)
+available for Windows, with the existing `WC_RAM_RESERVE_MIB` override.
+A failed copy into the independent holder now refuses allocation, rather
+than silently losing protection against a broker crash. The old `sv-guest ram keeper` command forwards to the shared broker's
+console mode for existing test tasks. Its old pipe and allocator are removed.
+`--grow-keeper` and `ram test` both use the broker client.
+
 
 **The daemon needs QEMU's uid and gid.** `/proc/<qemu>/fd` is open only to
 a process that passes the kernel's ptrace access check, which needs the same
@@ -36420,6 +36524,37 @@ needs an account that may make udmabufs, which the harness's user never is,
 so its guest-RAM part is the two VM tests now. Not covered end to end in a
 VM: the proxy mapping a window of a grown region (`ProvidedRegion::ram_window`,
 the same `find` + `map_fixed` per part as the ICD).
+
+
+**Shared broker keeper integration, 2026-10-20.** Branch
+`windows-guest-ram-broker`, checked after merging the broker shutdown fix
+from master. The final code checks cover 60 `sv-ram` and `wc-broker` tests,
+the Windows target for `sv-guest`, `sv-ram` and `wc-broker`, strict Clippy on
+`sv-ram` and `wc-broker` with dependencies excluded, and the
+NixOS guest-RAM broker VM test above. Full dependency linting also reports a
+pre-existing empty doc-comment line in `wc-handle/src/grow.rs`.
+
+A separate disposable Windows VM, with 3 GiB RAM and four vCPUs, ran the
+new broker backend through the compatibility `ram keeper` command. Its
+host instrument continued writing into the lent RAM during each crash.
+
+| check | result |
+|---|---|
+| ordinary allocation and release | two sessions, six grows of 64 and 128 MiB; 576 MiB filled and verified, large-page translations active, no refusal or error |
+| provider killed while the host writes | one orphan adopted by the replacement provider and freed after `UNMAPPED`; broker statistics returned to zero |
+| provider then broker killed while the host writes | the independent holder survived, the new broker restored the section, and the next provider adopted and freed it after `UNMAPPED`; statistics returned to zero |
+| holder killed while two sessions allocate and retire | the broker replaced its holder; one allocation was refused while no holder was available and its retry succeeded; 220 grows and 13.75 GiB verified, no bad word or stalled counter; statistics returned to zero |
+| memory reserve | while two 128 MiB sections were held, Windows still reported about 1.8 GiB available; the 1 GiB reserve stayed intact |
+| guest health and cleanup | every watchdog probe succeeded; the host instrument exited before the VM stopped, and its overlay was retained |
+
+The holder restart registry also retains its lock while duplicating section
+handles. A region's destruction cannot close and reuse a handle from an
+in-flight refill. A refused allocation removes its restart record before
+its section handle is closed.
+
+The Intel driver's import of these views and the proxy's grown arena window
+still need their separate end-to-end proofs. These tests ran only in the
+disposable local VMs.
 
 ## 109. Lazy `wl_shm` pools: the arena holds what buffers cover, and the stream never falls out of step
 
@@ -36886,8 +37021,9 @@ the Looking Glass B7 ivshmem driver leaves its devices
 process mapped the GPU device directly before the broker (`direct-opened`,
 `bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
 another process holds cannot be opened to change its descriptor (vioser is
-exclusive); it keeps its live descriptor until it is free, and the property
-takes over at its next start.
+exclusive). Startup refuses if the port's live or PnP protection cannot be
+verified. Security reads retry access-denied opens for up to two seconds to
+allow asynchronous driver closes to finish; unreadable protection still fails.
 
 **Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
 `SEC_COMMIT`), so no other process can open one by name; `large` adds
@@ -36913,7 +37049,10 @@ died is started again and given every region. So a region the host still
 maps is lost only if the broker, the holder and every provider die together;
 before the holder, the broker's crash while the provider was down was enough.
 An orderly stop of the service leaves the holder running (an upgrade keeps
-the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+the regions). `sv-guest broker holder-quit` atomically refuses while any
+region remains. Normal region release permits holder exit. On refusal,
+uninstall retains the binary, service, protections and recovery state, and
+restarts a previously running service to adopt retained regions.
 
 **Signing (§111.6).** `Platform::identity` is `os=windows
 user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
@@ -36933,6 +37072,10 @@ device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
 `[wc-broker] device NAME: not from the broker (WHY); opening it directly`,
 and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
 device.
+
+The following measurements describe the original broker. Its cross-SID raw
+BAR regrant and unconditional uninstall behavior are superseded by the
+ownership and checked-shutdown restrictions below.
 
 **Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
 a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
@@ -36970,14 +37113,78 @@ runs `wc-broker-install.ps1 -Action install` over its administrator channel:
 Program Files, the service, failure actions, the §91 task and its files
 removed, the service started. Then `-Action key -Install NAME` with the
 installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=key` registers only this installation's key in an already
+running broker. It never installs or restarts the service and is allowed for
+tests. The key and its protected parent directories belong to Administrators
+and grant access only to SYSTEM and Administrators. Provisioning replaces the
+key object using a protected temporary file, then replaces the whole DACL.
+An already-open handle to an old readable key cannot observe the rotated
+bytes. Reparse directories and key paths are refused. The service executable
+and recovery files also have privileged ownership. This matters because an
+owner can change a DACL even without a grant in that DACL.
+Installation does not trust SCM's transient Running state alone. The ready
+command opens an overlapped pipe, checks its kernel server PID against the
+current running SCM service and its token SID against SYSTEM, then checks
+hello/stats. While the verified process remains pinned, it independently
+checks both live and PnP protection for present BARs and doorbell ports, then
+rechecks process liveness and SCM before success. Each exchange has a one-second I/O deadline; cancellation is
+drained before its buffers disappear. Generic private/user broker clients
+keep their existing connection behavior.
+
 `WC_LAUNCH_BROKER=skip`, the default, is the pre-§111 deploy: the broker is guest-wide, so a deploy installs it only when asked for by name, and a test installation is refused it (2026-10-20: the default had been `install`, and a test installation's deploy put the broker under the deployment guest's production installations). `wc-launch.sh broker-show`
 and `broker-uninstall` (service deleted, devices' descriptors restored,
-holder ended, keys kept).
+holder ended, keys kept). A deploy with `skip` refuses if the broker already
+exists, before stopping a session or copying any files. Use `key` there;
+recreating a desktop-readable signing key would defeat the broker identity
+check. Unknown service status also refuses the deploy.
+
+**Rollback baseline and refusal.** The first broker start records each device's
+live DACL and PnP descriptor before changing either. Binary `SPDRP_SECURITY`
+includes the mandatory label. The five-column `devices.txt` and durable count
+checkpoint are flushed before mutation. Missing, truncated, unreadable or
+invalid installed history requires trusted recovery. A fresh install records
+an explicit empty baseline; restart cannot invent lost history. Independent
+startup verification requires both live and PnP descriptors on the BARs and
+doorbell ports to remain protected, even when securing failed or rollback history was lost. Unknown or
+permissive protection fails before the public pipe or signer is created.
+Missing optional devices are skipped. Protected devices with missing history
+can still recover retained holder sections; their uninstall stays refused.
+
+Uninstall checks before stopping the service whether either original raw BAR
+descriptor could expose old bytes. Anything beyond the exact protected SYSTEM
+and Administrators DACL refuses restoration. Direct `revert-acl` enforces the
+same check. Retaining the SID file cannot police direct opens through a
+permissive DACL. Uninstall is therefore unavailable for ordinary pre-broker
+permissive raw baselines and is not an application rollback procedure. The
+installer retains the original port task/files and all recovery state on
+refusal. Any saved legacy grant task, script or port map also refuses uninstall
+before service mutation. Such unreviewed code could undo safe raw descriptors
+later, so protected original ACLs alone do not make legacy task restoration safe. Only an empty holder and protected raw baseline permit removal.
+
+Raw BAR ownership is bound to the canonical physical PnP instance and a
+privileged reviewed SID policy. Process exit, holder or broker restart, and
+protocol alias changes cannot reassign it. Missing or untrusted policy denies
+access. There is no first-claim or reset API. This is a single-owner limitation
+until host/GPU drain can be proved.
+
+A private Windows clone proved old BAR bytes crossed SIDs before this policy.
+The corrected binary refuses the other SID after process exit, holder
+replacement and broker restart; the owner still reads its original bytes.
+Both ordinary users are denied direct raw opens. An actual-section proof
+retained `user1-secret` through refused uninstall and direct refused holder
+quit, recovered the same holder, then adopted/read and normally released it.
+Unsafe raw rollback and missing-baseline uninstall refuse before service
+mutation. Evidence is
+`/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`, especially
+`raw-policy-clone.txt`, `raw-policy-alias.txt`,
+`uninstall-lifetime-proof.txt` and `uninstall-direct-open-denied.txt`.
+The final real Windows unit run passed all 30 tests in
+`uninstall-windows-units-final.txt`.
 
 **What remains.** Running the compositor and the GPU process on the VM under
-the broker end to end (the probe exercises the same calls, not the products);
-the stamping hook's implementation (windows-guest-ram's); a run on the deployment guest
-(not touched here).
+the broker end to end under the mapped Linux user (the probe exercises the
+same calls, not the products), and a run on the deployment guest (not touched
+here). The large-page stamping hook is implemented by `stamp_guest_ram`.
 
 ### 111.9 macOS
 
@@ -37072,9 +37279,27 @@ or an existing broker socket before changing either end's installed files;
 it no longer issues `launchctl bootout`. To upgrade, first end sessions and
 verify their host release, SIGTERM the daemon, wait for its exit, and prevent
 new sessions before unloading its job. Never force bootout of an old broker
-that still holds regions. A crash, explicit SIGKILL, or VM termination still
-removes this process's holds; crash-safe retention needs an independent
-holder and adoption, and is not implemented.
+that still holds regions.
+
+**Independent retention after broker death.** Before any region grant, a
+private retention process receives the already allocated shared-memory fd,
+creates its own shared mapping, independently calls `mlock`, and acknowledges
+success. It is another invocation of `wc-broker`, with no public socket,
+allocator or authorization endpoint. The broker alone decides grants and
+normal destruction. The holder uses a separate session/process group, and
+launchd's `AbandonProcessGroup` preserves it when the broker exits.
+
+Broker EOF never frees its mappings. The holder restores their metadata as
+orphans in the same `Core` lifetime engine, uses `Release::Probe { after: None }`,
+and frees only the matching user's pool when its boot page carries the host
+release word. Other pools remain wired. No deadline, signal handler or channel
+error unwinds existing holds. A missing or failed holder refuses new grants.
+This covers a broker-process crash with a surviving holder. It does not cover
+holder and broker failure together, VM termination, or the GPU server's own
+extent. A region never stamped with a boot release page may remain held
+indefinitely after broker death. New brokers do not yet re-adopt old holders;
+those holders independently wait for host release rather than freeing on
+restart.
 
 #### 111.9.4 Tests
 
@@ -37136,7 +37361,7 @@ holder and adoption, and is not implemented.
   denial as process exit. It then reported the same pid before and after
   the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
   enforces an elapsed observation deadline, and validates a different live
-  replacement pid; a VM rerun is pending.
+  replacement pid; the corrected safety rerun is recorded below.
 * **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
   after): its `open` of user 1's regions, `find` of user 1's pool and
   `device wcbell` (held by user 1's main process) were refused by uid; it
@@ -37164,7 +37389,81 @@ holder and adoption, and is not implemented.
   run.
 * The harness's check that a user cannot open a port node itself used
   `head -c0`, which macOS rejects; the node modes above are the evidence.
-  Fixed for the next run.
+  Fixed before the safety rerun below.
+
+**Safety rerun, 3072 MiB VM, 2026-10-20 around 12:00-12:04.** Evidence is
+in `evidence/session-fixes/broker-mac/safe-rerun/`, outside git. The new broker
+was built after the no-timeout correction; no unsafe old baseline ran.
+
+* The corrected direct port-open probe and root-key read were refused.
+  The LaunchDaemon was root's, the ports 0600, the socket 0666 and the key
+  directory/key 0700/0600.
+* Five recorded main-process SIGKILL cycles each ended with host teardown,
+  the host release word and pool reclamation. Recursive panic-file counts
+  were four before and four after, and guest uptime continued throughout.
+  The harness used default foot settings and throwaway Linux HOME/XDG
+  state; Console ran on a private D-Bus session.
+* The root daemon held two orphan regions when SIGTERM arrived. A successful
+  root process-table snapshot observed its exit after 5210 ms, including SSH
+  observation overhead, and launchd reported a different live pid, 581 to
+  1265. Its log showed host release followed by `every region released;
+  exiting`. This replaces the original run's invalid 0.70 s assertion.
+* The 2000 Wayland round trips measured mean 3.240 ms, p50 1.231 ms,
+  p99 12.646 ms and maximum 1470.707 ms. The runtime ctypes/libwayland
+  fixture includes Python call overhead. This **fails** the 0.2 ms target;
+  it proves neither acceptable latency nor broker overhead relative to the
+  old unsafe baseline. Concurrent second-user sessions and fresh GPU timing
+  remain unproved by this rerun.
+* The successful VM run peaked at 4,423,475,200 bytes including QEMU/cache;
+  an earlier cold-start attempt peaked at 5,089,390,592 bytes before tests.
+  These observations include reclaimable cache, not only configured RAM. Cleanup
+  restored guest support/apps, host files and original unit arguments,
+  removed the test daemon/key, cleanly stopped the VM and restored its
+  original 4096 MiB configuration. The peer's `work` VM was untouched.
+
+**Restart ownership.** The restored older `mac-sessiond` exposed a separate
+isolation bug: startup adopted every active `wc-launch-*` unit, including
+unrelated `wcma-*`, `wcmb-*` and `wcmc-*` harness sessions with no known boot
+page. It then ran `down` for them. Restart state is now scoped by configured
+QMP path, VM hint, session script and key policy; each checkpoint carries that
+full owner description. Recovery requires a matching boot page in that VM
+and its configured MAC policy. A directory hash only names this state and is
+not trusted as authorization. Every managed session has a boot record, and
+ownership is checked again before teardown. Unowned/legacy global state is
+left untouched; failed host release retains the checkpoint for retry.
+Before upgrading the old service with live sessions, drain those sessions
+through their actual owner. Old global checkpoints cannot prove installation
+ownership and are not automatically migrated.
+
+**Independent-holder macOS runtime proof, 2026-10-20.** The disposable
+`wayland-host` VM ran at 3072 MiB under an exclusive run lease, using the
+vmhost-built broker from `5ec8367`. A native fixture allocated two 64 KiB regions
+in pool A and one in pool B, stamped them, closed every fd and mapping, and
+exited before the broker was killed. No GUI or application workload was used.
+
+The root LaunchDaemon broker PID 383 was SIGKILLed. Twelve seconds later its
+separate holder PID 385 remained, reparented to launchd. Native
+`mach_vm_region(..., VM_REGION_BASIC_INFO_64, ...)` inspection reported
+`user_wired_count=1` for all three independent holder mappings, at the same
+addresses observed before broker death. The host wrote sentinel values directly
+through QEMU's shared guest-RAM backend both before and after the broker kill;
+Mach reads of the holder's mappings verified both values.
+
+The host then wrote pool A's release word exactly once, stopped accessing that
+pool, and observed both A mappings disappear while B remained wired at the same
+address with its sentinel intact. Pool B's release ended the holder. A successful
+sudo process-table snapshot positively established its absence. Panic-file
+counts stayed 4 before and 4 after. This proves broker-process SIGKILL retention
+and per-pool host release in this macOS VM; it does not test simultaneous
+holder/broker death, a full graphical session or the GPU server's own extent.
+
+The VM was cleanly stopped, its exact prior 4096 MiB configuration restored, and
+the temporary job, binaries and socket removed. Both existing host units kept
+their PIDs and arguments throughout. Measured VM-unit MemoryPeak was
+5,239,672,832 bytes including QEMU/cache. Evidence is in
+`evidence/session-fixes/broker-mac/holder-vm/`. An earlier successful run is
+retained as `holder-vm-first`; the final run strengthened holder-exit observation
+with a successful full process-table query.
 
 #### 111.9.5 Limits
 
@@ -37172,14 +37471,14 @@ holder and adoption, and is not implemented.
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** Normal SIGTERM retains every
-  live and orphan region until release, and launchd has no automatic
-  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
-  launchd restarts it, but the new
-  process holds none of the old one's regions: a main process that dies after
-  that, before its session's release, is the §103.15 case again. The broker
-  has no state to lose otherwise. A main process could hand its fds back to a
-  new broker (`adopt` with fds); not built.
+* **Independent holder limits.** A broker-process crash leaves its separate
+  wired holder alive until host release. Simultaneous holder/broker death or
+  VM termination still loses those wires. Restarted brokers do not re-adopt
+  the old holders, so old allocations remain private to their original
+  clients until host release; missing release pages retain memory indefinitely.
+  The disposable macOS VM proof above verifies independent wiring and
+  launchd survival for a broker-process SIGKILL. It does not establish safety
+  against failure of the holder itself or a terminated VM.
 * **The GPU server's own extent** is still its own superpages: kept by
   nothing if the GPU server itself crashes while `sv-hostd` serves it
   (§103.15's remaining case). Moving it into the broker would change its
@@ -37408,12 +37707,20 @@ generation with `services.waycompose`. For each installation it does this:
   for the admin and the desktop user are dropped and one for `waycompose` is
   added; the VM is not restarted;
 * `remove-old` deletes the admin's copies only after a session was seen
-  working; `rollback` puts the admin's units and links back.
+  working. `rollback` restores a previous protected installation snapshot
+  beneath the system layout, with its current trusted key. It keeps the
+  system services, user mapping and broker protection. It never restores
+  admin user units, desktop raw-resource ACLs or an exposed old key. A
+  missing protected snapshot refuses rollback. The first protected install
+  creates its initial snapshot, and later deploys snapshot the prior
+  protected installation. Rollback requires idle admin and mapped-user
+  session managers; it restores installation apps, configuration and bins,
+  while keeping shared service binaries and the mapping unchanged.
 
-A dry run under `ROOT=` on a tree shaped like the VM host's (three
-installations, a profile with a lock file, Prism data with absolute paths and
-a binary file) gave the expected tree for plan, apply, rollback, apply again
-and remove-old. Not run on the VM host itself.
+The earlier legacy-layout dry run does not establish protected rollback.
+The current fixture checks protected snapshot restoration, key rotation,
+trusted-key reuse and refusal of unconfirmed provenance. Live migration
+remains pending.
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
@@ -37445,8 +37752,9 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
   host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
   paths become the installation's, the admin's home becomes `~/` (the mapped
-  user's), the GC roots are registered at their new path, an installed key is
-  kept, and the stage's copy of the key is deleted;
+  user's), and the GC roots are registered at their new path. Only a
+  root-generated, broker-confirmed key is installed. A legacy stage key is
+  discarded;
 * the deploy is refused unless `users.conf` maps the installation to a user. A
   test installation is named in the host's `wctestInstalls`, so it runs as
   `wctest`, with its profile in that user's home;
@@ -37454,6 +37762,42 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
   which is a doorbell blip of about a second for every session;
 * the debug ssh transport is not available with it.
+
+Before the first privileged-identity migration, `key-prepare` stops both
+legacy and system verifiers after refusing active sessions. It disables the
+legacy admin units and removes retired verifier keys before provisioning,
+so a restart or reboot cannot revive exposed trust. It generates a
+fresh key beneath root-owned `/var/lib/waycompose/key-trust/<name>` with
+0700 directories and 0600 files. `key-export` sends that candidate directly
+to the deploy channel, never into the admin's staging tree. The Windows
+broker's privileged key provisioning must succeed before `key-confirm`
+records protected provenance. `apply` and `install-staged` refuse keys
+without that provenance. They never infer historical secrecy from a key's
+current owner or mode. Failure keeps the old verifier stopped; retry uses
+the same protected candidate. Already protected deployments reuse their
+key. Every script-managed shared-verifier restart first checks that all
+installed directories have protected broker-confirmed provenance and match
+their registry key; a partially migrated directory leaves services stopped. Privileged broker provisioning through the old user layout is refused.
+Generation provenance is written only when the helper actually generates a
+candidate. A preexisting key with root ownership and 0600 mode but no such
+provenance is refused, not relabelled. A lost candidate cannot inherit an old
+broker confirmation. A generated candidate interrupted before broker
+confirmation can be retried unchanged. Generation is serialized.
+
+The focused fixture reproduces a first migration whose candidate `wc-session`
+exits 91, then runs the restored original executable after protected rollback.
+It checks normalized system paths and the current trusted key. This is an
+isolated filesystem fixture, not a live mapped-user application session.
+The private Windows clone additionally passed real broker signing and host
+boot-record verification with the replacement key while rejecting the retired
+key. An already-open handle to the previously readable key retained only the
+retired bytes after replacement. The replacement object allowed only SYSTEM
+and Administrators. Evidence and the recipe are outside git in
+`evidence/session-fixes/broker-rollback/key-rotation-proof.txt` and
+`key-rotation-proof.ps1`; neither records key bytes or fingerprints.
+
+The root helper and privileged deployment channel are trusted administration
+interfaces, not interfaces exposed to desktop clients.
 
 `scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
 (paths, key kept across a redeploy, the mapped user, refusals) and deploy's
@@ -37598,6 +37942,7 @@ The following thirty-minute observation contained 13 complete GPU D0
 dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
 the busy-loop recovery under that workload. The process that triggers the
 periodic GPU wake remains unidentified.
+
 ## 112. Stock Firefox on the dma-buf path
 
 This branch provides the render-node relay prerequisite only. The stock
@@ -37758,3 +38103,56 @@ the shared-memory data path. Linux-only dependencies leave the other platform
 backends unchanged. Regression tests send a real forwarded socket through the
 broker protocol: mapped access receives a hub fd, unmapped access is refused,
 and forged uid or pid metadata never reaches the broker's incoming queue.
+
+## §114. Doorbell writer recovery
+
+A shared compositor outlives its installations. A failed doorbell write must
+therefore leave later hints usable. `DetachedWriter` consumes the next queued
+hint after a write error instead of ending its thread. Unix file and inherited
+fd endpoints use that writer too, so a full port cannot block a ring caller.
+`WC_BELL_INLINE=0` selects it for Linux sockets as well, allowing the local
+multi-install harness to exercise the guest's queued writer path.
+
+Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
+cancellation. Each pipe retains at most 32 still-pending synchronous writes,
+including their event, record and buffer. Writes are capped at 64 KiB per call,
+so the pending buffers consume at most 2 MiB per pipe. A full quarantine refuses
+new writes before allocating or submitting anything. Later completions reclaim
+entries and permit new writes. Pending status, rather than a particular timeout
+code, determines ownership on every return. A pipe with pending writes retains
+its original raw handle and outstanding allocations on shutdown, avoiding a
+blocking close and preserving every kernel buffer. Reads use their independent
+completion wait and never acquire the write quarantine's mutex.
+
+The default Windows `AsyncWriter` issues hints without waiting. Each request
+has an address-stable allocation. The I/O manager publishes its pending status;
+an unexpected write error never clears that status or releases its buffer. Requests still pending after 500 ms move to a
+quarantine after cancellation, and fresh or completed allocations replace them
+in the active pool. Late completions permit reuse. The quarantine holds at most
+256 requests beyond the 32 active slots. If a driver stops completing every
+request, hints eventually return `WouldBlock`; the application thread still
+runs. Shutdown retains any allocation and port reference whose request remains
+pending rather than waiting indefinitely for a broken driver.
+
+Both writer implementations reserve from one process-wide budget before
+allocating a record, buffer or event. It permits at most 1024 records/slots and
+32 MiB of write buffers across live and deliberately retained allocations.
+AsyncWriter reserves its slots up front, leaving its ordinary write path free
+of budget operations. A retained allocation keeps its reservation forever, so
+constructing another Pipe or AsyncWriter cannot reset the safety cap. Full
+budgets refuse new allocations; existing owners can reclaim capacity after
+completion or normal destruction. Abandoned allocations have no background
+reaper and remain charged until process exit. Stuck handles are never closed to
+recover capacity. Each retained original handle has at least one charged record.
+
+The broker currently refuses a second device grant to the same process, opens
+ports exclusively and transfers handles with DUPLICATE_CLOSE_SOURCE. The budget
+does not rely on those restrictions: repeated wrappers or async writers still
+share the same limits.
+
+Tests cover a failed queued hint followed by a delivered hint, bounded repeated
+synchronous cancellation failures and handle retention during shutdown,
+repeated Pipe and AsyncWriter lifetimes sharing record and byte budgets,
+constructor rollback, and simulated Windows cancellations that never complete followed by a late completion. The
+simulation never submits the fabricated requests to a driver. Test evidence
+and guest measurements belong outside the repository.

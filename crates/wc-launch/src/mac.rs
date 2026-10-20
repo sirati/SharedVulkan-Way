@@ -216,6 +216,7 @@ fn pin_in_dock(bundle: &Path) -> Result<(), String> {
 
 unsafe extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
+    fn dup2(from: i32, to: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
@@ -236,6 +237,7 @@ fn now_micros() -> u64 {
 /// session's boot page. Without it the session is refused: the host would
 /// write into pages this process's death frees.
 fn connect_broker(log: &Log, pool: &str, install: &str) -> Result<BrokerConn, String> {
+    wc_broker::client::install_iosection_observer().map_err(|e| e.to_string())?;
     let path = wc_broker::client::path();
     let mut c = wc_broker::client::Client::connect(&path).map_err(|e| e.to_string())?;
     let h = c.hello("main").map_err(|e| format!("the broker at {path} refused hello: {e}"))?;
@@ -373,7 +375,7 @@ fn run_main(cfg: Config) -> ExitCode {
     let id = plan::run_id(&cfg.session, std::process::id());
     let log = Log::open(&log_dir().join("main.log"));
     log.say(&format!("main process: session {id}"));
-    // Role (b) (§103.17) maps a file, not guest RAM: nothing of this process
+    // Role (b) (§103.17) maps a tagged POSIX shm object: nothing of this process
     // is freed under the host's writes, and without a broker its record is
     // signed with the installation's key file, as before §111.
     let role_b = std::env::var("WC_MAC_ARENA_STANDIN").ok().or_else(|| Some(cfg.arena_file.clone())).is_some_and(|s| !s.is_empty());
@@ -403,9 +405,9 @@ fn run_main(cfg: Config) -> ExitCode {
     let _ = std::fs::remove_file(&comp_log);
     // The arena backend (§103.13): one arena per main process, so one per
     // user session, shared by every application. Guest RAM when macOS is the
-    // VM (role (a)); with WC_MAC_ARENA_STANDIN=<file>, a file the Linux guest
-    // maps too (role (b), §103.17: a Mac hosting the Linux VM, the file on a
-    // RAM disk the hypervisor shares through virtio-fs DAX), which the
+    // VM (role (a)); with WC_MAC_ARENA_STANDIN=<tag>, a POSIX shm object the
+    // Linux guest maps too (role (b), §103.17: a Mac hosting the Linux VM,
+    // whose hypervisor resolves the tag through virtio-fs DAX), which the
     // compositor maps as its ivshmem device and boots as the Windows guest
     // does (§105).
     let standin = std::env::var("WC_MAC_ARENA_STANDIN")
@@ -528,6 +530,11 @@ fn run_main(cfg: Config) -> ExitCode {
         "--log".into(),
         comp_log.to_string_lossy().into_owned(),
     ]);
+    // §102, as plan::compositor_argv: wp_viewporter among them, which
+    // Firefox sizes its content subsurface with at an output scale above 1.
+    if cfg.nested_globals {
+        argv.push("--nested-compositor-globals".into());
+    }
     // SIGTERM (a shutdown, a logout, a `kill`): take the session down over
     // the control ring and go, so the host stops and releases at once rather
     // than after its lease, and the broker holds the windows for seconds.
@@ -574,35 +581,80 @@ fn start_gpu_server(cfg: &Config, id: &str, log: &Log, via_broker: bool) -> Opti
     }
     let label = wc_handle::macboot::gpu_label(id);
     let out = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_dir().join("gpu.log"));
-    let server_args: Vec<String> = vec![
-        "gpu".into(),
-        "guest".into(),
-        "--label".into(),
-        label.into(),
-        "--arena".into(),
-        (cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string(),
-        "--idle".into(),
-        "43200".into(),
-    ];
-    // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
-    // when the VM has it; without it the GPU rings poll. §111.9: the port's
-    // node is root's, so the broker moves it into the GPU server, which
-    // `--gpu-exec` asks for under this process's id before it becomes it.
-    let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
-    let has_bell = bell.as_deref().is_some_and(|d| Path::new(d).exists());
-    let mut c = if via_broker {
-        let mut c = Command::new(installed_exe());
-        c.args(["--gpu-exec", id, if has_bell { "svbell" } else { "-" }, "--", &cfg.gpu_server]).args(&server_args);
-        c
-    } else {
+    let mut c = if !cfg.gpu_file.is_empty() {
         let mut c = Command::new(&cfg.gpu_server);
-        c.args(&server_args);
-        if let Some(dev) = bell.as_deref().filter(|_| has_bell) {
-            c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+        c.stdin(Stdio::null());
+        // §103.19: the images an application exports (its dma-bufs) are
+        // IOSurfaces the GPU server renders into; it sends each to this
+        // process's service as a mach port, and the compositor maps it by the
+        // section name the application's token carries.
+        let service = format!("org.waycompose.sections.{}", std::process::id());
+        match wc_handle::iosection::check_in(&service) {
+            Ok(port) => {
+                std::thread::Builder::new().name("sections".into()).spawn(move || wc_handle::iosection::serve(port)).ok();
+                c.env("WC_GPU_SECTIONS", &service);
+            }
+            Err(kr) => log.say(&format!("GPU SECTIONS: bootstrap_check_in {service}: {kr}; applications' buffers cannot be shown")),
+        }
+        // §103.19, role (b): one pool in the file beside the arena, for every
+        // GPU session of this main process; the guest's `wc-session gpu`
+        // attaches each session to it (`ivshmem-serve --cold pool`).
+        c.args(["gpu", "pool-guest", "--pool-file", &cfg.gpu_file, "--sessions"])
+            .arg(cfg.gpu_sessions.max(1).to_string())
+            .args(["--idle", "60"]);
+        // The doorbell: the hypervisor's FIFO pair for the GPU's port, at
+        // fixed numbers in the child (ours are close-on-exec).
+        if !cfg.gpu_bell.is_empty() {
+            match fifo_fds(&cfg.gpu_bell) {
+                Ok((r, w)) => {
+                    c.args(["--bell", "fd:30,31"]);
+                    // SAFETY: only dup2, which is async-signal-safe, between
+                    // fork and exec.
+                    unsafe {
+                        std::os::unix::process::CommandExt::pre_exec(&mut c, move || {
+                            if dup2(r, 30) < 0 || dup2(w, 31) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                Err(e) => log.say(&format!("GPU DOORBELL: {e}; the GPU rings are polled")),
+            }
         }
         c
+    } else {
+        let server_args: Vec<String> = vec![
+            "gpu".into(),
+            "guest".into(),
+            "--label".into(),
+            label.into(),
+            "--arena".into(),
+            (cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string(),
+            "--idle".into(),
+            "43200".into(),
+        ];
+        // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
+        // when the VM has it; without it the GPU rings poll. §111.9: the port's
+        // node is root's, so the broker moves it into the GPU server, which
+        // `--gpu-exec` asks for under this process's id before it becomes it.
+        let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
+        let has_bell = bell.as_deref().is_some_and(|d| Path::new(d).exists());
+        let mut c = if via_broker {
+            let mut c = Command::new(installed_exe());
+            c.args(["--gpu-exec", id, if has_bell { "svbell" } else { "-" }, "--", &cfg.gpu_server]).args(&server_args);
+            c
+        } else {
+            let mut c = Command::new(&cfg.gpu_server);
+            c.args(&server_args);
+            if let Some(dev) = bell.as_deref().filter(|_| has_bell) {
+                c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+            }
+            c
+        };
+        c.stdin(Stdio::null());
+        c
     };
-    c.stdin(Stdio::null());
     if !cfg.gpu_icd.is_empty() {
         c.env("VK_DRIVER_FILES", &cfg.gpu_icd);
     }
@@ -722,6 +774,12 @@ fn socket_request(path: &Path, line: &str) -> Result<String, String> {
 /// read-write so neither open waits for, nor ends with, the other side; the
 /// descriptors live as long as this process.
 fn fifo_bell(prefix: &str) -> Result<String, String> {
+    let (r, w) = fifo_fds(prefix)?;
+    Ok(format!("fd:{r},{w}"))
+}
+
+/// [`fifo_bell`]'s two descriptors, close-on-exec, for this process's life.
+fn fifo_fds(prefix: &str) -> Result<(i32, i32), String> {
     use std::os::fd::IntoRawFd;
     let open = |end: &str| {
         let p = format!("{prefix}.{end}");
@@ -729,7 +787,7 @@ fn fifo_bell(prefix: &str) -> Result<String, String> {
     };
     let r = open("from-guest")?.into_raw_fd();
     let w = open("to-guest")?.into_raw_fd();
-    Ok(format!("fd:{r},{w}"))
+    Ok((r, w))
 }
 
 /// The ring slot the host claimed for a session service, once it has.

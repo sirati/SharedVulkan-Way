@@ -128,6 +128,9 @@ pub mod grow;
 /// IVSHMEM ARENA. The header at the front of an ivshmem region, encoded and
 /// decoded by the same code on both sides of the hypervisor.
 pub mod ivshmem;
+pub mod iosection_policy;
+#[cfg(target_os = "macos")]
+pub mod iosection;
 mod platform;
 pub mod publish;
 pub mod macboot;
@@ -1005,6 +1008,19 @@ impl Mapping {
         // `ptr + offset .. + len` is inside the one mapping the `Arc` keeps
         // alive.
         unsafe { std::slice::from_raw_parts(self.inner.ptr().add(self.offset), self.len) }
+    }
+
+    /// Native VM pages retaining this original mapping, not a copied payload.
+    /// Returns base, VM extent, logical extent and the window's byte prefix.
+    /// IOSurface CPU views are excluded; those use their native texture import.
+    /// The caller must retain this Mapping until its GPU reader completes.
+    #[cfg(target_os = "macos")]
+    pub fn native_vm_span(&self) -> Option<(*const u8, usize, usize, usize)> {
+        let view = match &self.inner { MappingInner::Owned(v) => v, MappingInner::Window(v) => v.as_ref() };
+        if view.is_iosurface() { return None; }
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        let (base, mapped, logical, prefix) = iosection_policy::mapped_span(view.ptr() as usize, self.offset, self.len, page)?;
+        Some((base as *const u8, mapped, logical, prefix))
     }
 
     /// Length of the mapping in bytes.

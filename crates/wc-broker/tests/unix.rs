@@ -545,3 +545,67 @@ fn a_lease_is_told_before_its_fds_are_sent() {
     assert_eq!(rx.try_recv().unwrap(), (id, std::process::id()), "told before the reply was read");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A failed durable record refuses the lease without leaking handles or a
+/// lease that would prevent the region draining.
+#[test]
+fn a_failed_lease_record_sends_no_handles_and_leaves_no_holder() {
+    let d = dir("lease-record-failed");
+    let unix = Unix::bind(d.join("broker.sock"), vec![]).unwrap();
+    let b = Broker::new(
+        unix,
+        Config {
+            devices: vec![],
+            services: vec![],
+            keys: None,
+            release: Release::OwnerFree,
+            budget: None,
+            run: 3,
+        },
+    );
+    b.on_leased_checked(Box::new(|_, _| Err(std::io::Error::other("disk full"))));
+    let fd = unsafe { libc::memfd_create(c"lease-record".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) }, 0);
+    let id = b.publish(
+        User::uid(unsafe { libc::geteuid() }),
+        "gpu.0",
+        1,
+        vec![(Unix::object(fd), 0, 4096)],
+    );
+    let serving = b.clone();
+    std::thread::spawn(move || serving.serve());
+    let mut c = Client::connect(&d.join("broker.sock").to_string_lossy()).unwrap();
+    let error = c.find("gpu.0").unwrap_err();
+    assert!(error.to_string().contains("disk full"), "{error}");
+    assert!(b.holders(id).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn owner_generation_is_revoked_by_connection_close() {
+    let d = dir("owner-generation");
+    let sock = start(&d, false);
+    let mut owner = Client::connect(&sock).unwrap();
+    owner.hello("gpu").unwrap();
+    let token = owner.owner_token().unwrap();
+    assert_eq!(token.run, 7);
+    let mut observer = Client::connect(&sock).unwrap();
+    observer.hello("observer").unwrap();
+    let mut wrong_run = token;
+    wrong_run.run += 1;
+    assert!(observer.observe_owner(wrong_run, std::process::id()).is_err());
+    assert!(observer.observe_owner(token, std::process::id().wrapping_add(1)).is_err());
+    observer.observe_owner(token, std::process::id()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(observer.next_event()).unwrap());
+    drop(owner);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+        format!("!owner-ended {}", token.connection));
+    let mut replacement = Client::connect(&sock).unwrap();
+    replacement.hello("gpu").unwrap();
+    assert_ne!(replacement.owner_token().unwrap(), token);
+    assert!(replacement.observe_owner(token, std::process::id()).is_err());
+    std::fs::remove_dir_all(d).unwrap();
+}
