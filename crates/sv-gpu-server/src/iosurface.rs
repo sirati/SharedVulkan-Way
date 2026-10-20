@@ -111,7 +111,7 @@ unsafe extern "C" {
 }
 
 /// One Metal texture on an IOSurface, owned (+1).
-pub struct Texture(*mut c_void);
+pub struct Texture(pub(crate) *mut c_void);
 
 // SAFETY: Metal textures may be used and released from any thread.
 unsafe impl Send for Texture {}
@@ -137,6 +137,14 @@ fn device() -> *mut c_void {
 /// `[device newTextureWithDescriptor:d iosurface:surface plane:0]`, render
 /// target and shader read/write.
 fn texture(surface: &Surface, mtl_format: u64, width: u32, height: u32) -> Option<Texture> {
+    // SAFETY: the reference owns a live IOSurface throughout this call.
+    unsafe { texture_plane(surface.as_ptr(), mtl_format, width, height, 0, 1 | 2 | 4 | 0x10) }
+}
+
+/// Wrap one actual IOSurface plane. Caller owns the live surface and supplies
+/// the plane's true dimensions and a Metal format matching its element size.
+pub(crate) unsafe fn texture_plane(surface: *mut c_void, mtl_format: u64,
+    width: u32, height: u32, plane: u64, usage: u64) -> Option<Texture> {
     let dev = device();
     if dev.is_null() {
         return None;
@@ -161,12 +169,12 @@ fn texture(surface: &Surface, mtl_format: u64, width: u32, height: u32) -> Optio
         let set: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) = std::mem::transmute(objc_msgSend as *const ());
         // MTLTextureUsageShaderRead | ShaderWrite | RenderTarget | PixelFormatView
         // (an SRGB or UNORM view of the other, which Zink makes).
-        set(desc, sel_registerName(c"setUsage:".as_ptr()), 1 | 2 | 4 | 0x10);
+        set(desc, sel_registerName(c"setUsage:".as_ptr()), usage);
         // MTLStorageModeShared: an IOSurface's memory is the CPU's too.
         set(desc, sel_registerName(c"setStorageMode:".as_ptr()), 0);
         let new: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, u64) -> *mut c_void =
             std::mem::transmute(objc_msgSend as *const ());
-        let t = new(dev, sel_registerName(c"newTextureWithDescriptor:iosurface:plane:".as_ptr()), desc, surface.as_ptr(), 0);
+        let t = new(dev, sel_registerName(c"newTextureWithDescriptor:iosurface:plane:".as_ptr()), desc, surface, plane);
         (!t.is_null()).then_some(Texture(t))
     }
 }
