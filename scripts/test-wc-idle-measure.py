@@ -141,6 +141,107 @@ class Validation(unittest.TestCase):
             with self.assertRaisesRegex(m.Refused, 'fingerprint mismatch'):
                 m.report(root, 2000)
 
+    def test_broker_key_metadata_requires_provisioned_privileged_key(self):
+        acl = {'protected': True, 'owner': 'S-1-5-32-544',
+               'allow': ['S-1-5-18', 'S-1-5-32-544']}
+        valid = {'local_key': False, 'service': 'Running', 'length': 64,
+                 'directory': acl.copy(), 'key': acl.copy()}
+        m.broker_key_metadata(valid)
+        invalid = [dict(valid, local_key=True), dict(valid, length=0),
+                   dict(valid, service='Stopped'), {}]
+        for field in ('directory', 'key'):
+            for change in ({'owner': 'S-1-5-21-123-1001'}, {'protected': False},
+                           {'allow': acl['allow'] + ['S-1-5-32-545']}):
+                invalid.append(dict(valid, **{field: dict(acl, **change)}))
+        for bad in invalid:
+            with self.subTest(bad=bad), self.assertRaises(m.Refused):
+                m.broker_key_metadata(bad)
+
+    def test_unidentified_mapping_is_refused_even_with_identified_mapping(self):
+        c = config()
+        rows = (f"{c['server']} {c['guest_user']} wctest installs=wcil\n"
+                f"{c['server']} - wctest installs=wcil\n")
+        with self.assertRaisesRegex(m.Refused, 'unidentified'):
+            m.check_mapping(rows, c)
+
+    def test_signing_proof_requires_correct_authenticated_user(self):
+        text = 'wc-compositor: boot: record signed by the broker in 53 us for os=windows user=test id=S-1-5-21-123-1001'
+        m.signed_identity(text, 'test')
+        for bad in ('', text.replace('user=test', 'user=other'),
+                    text + '\nboot: broker did not sign; signing with the key file'):
+            with self.subTest(bad=bad), self.assertRaises(m.Refused):
+                m.signed_identity(bad, 'test')
+
+    def test_denied_key_metadata_is_not_treated_as_provisioned(self):
+        h = m.Harness(config())
+        h.guest = lambda script: (_ for _ in ()).throw(m.Refused('access denied'))
+        with self.assertRaisesRegex(m.Refused, 'access denied'):
+            h.check_broker_key()
+
+    def test_signing_evidence_is_read_after_saved_byte_offset(self):
+        h = m.Harness(config())
+        scripts = []
+        fresh = ('boot: record signed by the broker in 1 us for os=windows user='
+                 + h.c['guest_user'] + ' id=S-1-5-21-123-1001')
+        def guest(script):
+            scripts.append(script)
+            return fresh
+        h.guest = guest
+        self.assertEqual(h.verify_signed_boot('compositor.log', {'length': 4321, 'prefix_sha256': 'a' * 64}), fresh)
+        self.assertIn('$f.Seek(4321,', scripts[0])
+        self.assertIn('Prefix-Hash $f 4321', scripts[0])
+        self.assertIn('compositor log prefix changed', scripts[0])
+
+    def test_existing_log_is_always_snapshotted_without_process_inference(self):
+        h = m.Harness(config())
+        scripts = []
+        snapshot = {'length': 8000, 'prefix_sha256': 'a' * 64, 'file_id': '00000001:0000000000000002'}
+        def guest(script):
+            scripts.append(script)
+            return json.dumps(snapshot)
+        h.guest = guest
+        _, actual = h.compositor_log_offset()
+        self.assertEqual(actual, snapshot)
+        self.assertNotIn('Get-CimInstance', scripts[0])
+        self.assertIn('$length = $f.Length', scripts[0])
+        self.assertIn('Prefix-Hash $f $length', scripts[0])
+
+    def test_replaced_log_identity_is_checked_before_reading_suffix(self):
+        h = m.Harness(config())
+        def guest(script):
+            guard = script.index("if ([LogIdentity]::Read($f) -ne '00000001:0000000000000002')")
+            self.assertLess(guard, script.index('$f.Seek(8000,'))
+            raise m.Refused('compositor log file replaced during measurement')
+        h.guest = guest
+        with self.assertRaisesRegex(m.Refused, 'file replaced'):
+            h.verify_signed_boot('compositor.log', {
+                'length': 8000, 'prefix_sha256': 'a' * 64, 'file_id': '00000001:0000000000000002'})
+
+    def test_changed_or_truncated_log_refusal_prevents_stale_signing(self):
+        h = m.Harness(config())
+        def guest(script):
+            self.assertIn('Prefix-Hash $f 8000', script)
+            self.assertIn('$file.Length -lt $length', script)
+            raise m.Refused('compositor log prefix changed during measurement')
+        h.guest = guest
+        with self.assertRaisesRegex(m.Refused, 'prefix changed'):
+            h.verify_signed_boot('compositor.log', {'length': 8000, 'prefix_sha256': 'a' * 64})
+
+    def test_key_probe_never_reads_secret_contents(self):
+        h = m.Harness(config())
+        scripts = []
+        acl = {'protected': True, 'owner': 'S-1-5-32-544',
+               'allow': ['S-1-5-18', 'S-1-5-32-544']}
+        def guest(script):
+            scripts.append(script)
+            return json.dumps({'local_key': False, 'service': 'Running', 'length': 64,
+                               'directory': acl, 'key': acl})
+        h.guest = guest
+        h.check_broker_key()
+        self.assertIn('Get-Acl', scripts[0])
+        for forbidden in ('Get-Content', 'Get-FileHash', '[IO.File]::Open', 'ReadAll'):
+            self.assertNotIn(forbidden, scripts[0])
+
     def test_wrong_system_layout_never_touches_guest(self):
         harness = m.Harness(config())
         harness.command = lambda *a, **k: ''
@@ -185,6 +286,15 @@ class Stub(m.Harness):
         if script.startswith('Get-Content'):
             return '1 L.send\n200001 L.recv\n1000200001 L.send\n1000400001 L.recv\n'
         return ''
+
+    def compositor_log_offset(self):
+        return 'compositor.log', 0
+
+    def verify_signed_boot(self, log, offset):
+        return 'authenticated fixture'
+
+    def check_broker_key(self):
+        return {}
 
     def read_log(self):
         return 'transport rings: confirmed'
