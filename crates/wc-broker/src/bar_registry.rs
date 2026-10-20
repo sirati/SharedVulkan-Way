@@ -1,5 +1,11 @@
 //! Durable exclusions for original BAR bytes. This is not an allocator or
 //! proof of canonical grant ownership. No record is ever released here.
+//!
+//! Unactivated until every original allocator consults these exclusions. The
+//! Unix store is implemented; a Windows protected durable-store adapter is
+//! still required before Windows-side activation. Neither store detects a
+//! privileged restoration of an older valid filesystem image: canonical
+//! provisioning/recovery must never roll back this state while backing lives.
 use crate::service_control::{Binding, Message, Origin, Payload, Phase};
 use std::io;
 
@@ -611,6 +617,34 @@ mod tests {
         assert!(unsafe { registry.confirm_peer_epoch(&w2, 500) }.is_err());
         assert!(unsafe { registry.reserve(&w2, binding(w2.value(), 500, 8192)) }.is_err());
         assert_eq!(registry.exclusions(), vec![(4096, 4096)]);
+    }
+
+    #[test]
+    fn peer_confirmation_is_durable_before_admission_and_never_resumes_on_open() {
+        for failure in [1, 2] {
+            let memory = Memory::default();
+            let mut registry = fresh(memory.clone());
+            let local = registry.issue_next_service_epoch(Origin::Windows).unwrap();
+            *memory.failure.lock().unwrap() = failure;
+            assert!(unsafe { registry.confirm_peer_epoch(&local, 500) }.is_err());
+            assert!(!registry.confirmed_pair(&local, 500));
+            assert!(
+                unsafe { registry.reserve(&local, binding(local.value(), 500, 4096)) }.is_err()
+            );
+            drop(registry);
+            *memory.failure.lock().unwrap() = 0;
+            let mut registry = Registry::open(memory, backing(), Origin::Windows).unwrap();
+            assert!(!registry.confirmed_pair(&local, 500));
+            assert!(unsafe { registry.confirm_peer_epoch(&local, 500) }.is_err());
+            let new_local = registry.issue_next_service_epoch(Origin::Windows).unwrap();
+            if failure == 2 {
+                assert!(unsafe { registry.confirm_peer_epoch(&new_local, 499) }.is_err());
+            }
+            unsafe {
+                registry.confirm_peer_epoch(&new_local, 500).unwrap();
+            }
+            assert!(registry.confirmed_pair(&new_local, 500));
+        }
     }
 
     #[test]
