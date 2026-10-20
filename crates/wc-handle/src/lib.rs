@@ -1130,7 +1130,13 @@ impl Mapping {
     /// The caller must retain this Mapping until its GPU reader completes.
     #[cfg(target_os = "macos")]
     pub fn native_vm_span(&self) -> Option<(*const u8, usize, usize, usize)> {
-        let view = match &self.inner { MappingInner::Owned(v) => v, MappingInner::Window(v) => v.as_ref() };
+        let view = match &self.inner {
+            MappingInner::Owned(v) => v,
+            MappingInner::Window(v) => v.as_ref(),
+            // A BAR lease retains its pointer but does not describe a native
+            // VM mapping extent suitable for importing into an IOSurface.
+            MappingInner::Bar { .. } => return None,
+        };
         if view.is_iosurface() { return None; }
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
         let (base, mapped, logical, prefix) = iosection_policy::mapped_span(view.ptr() as usize, self.offset, self.len, page)?;
