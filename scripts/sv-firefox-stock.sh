@@ -106,6 +106,12 @@ else
   exit 2
 fi
 
+# All inputs are already built. Runtime children must not retain cg's build
+# lock while the browser and Wine compositor are running.
+exec 9>&-
+if [ -n "${SVFS_GTK:-}" ]; then
+  SVFS_GTK=$(readlink -f "$SVFS_GTK")
+fi
 mkdir -p "$SCRATCH"
 RUN=$(mktemp -d "$SCRATCH/run-XXXXXX")
 mkdir -p "$RUN/keymaps" "$RUN/rt" "$RUN/home" "$RUN/profile" "$RUN/pools" "$RUN/frames" "$RUN/xdg/config" "$RUN/xdg/data" "$RUN/xdg/state" "$RUN/xdg/cache"
@@ -118,7 +124,9 @@ cleanup() {
   wineserver -k 2>/dev/null
   rm -f "${POOL:-}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ ! -f "$WINEPREFIX/system.reg" ] || [ ! -d "$WINEPREFIX/drive_c/windows" ]; then
   say "booting a Wine prefix in $WINEPREFIX"
