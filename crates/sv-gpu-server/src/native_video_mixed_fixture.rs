@@ -1,6 +1,7 @@
 //! Feature-only mixed compute/decode/copy probe on the original imported arena.
-//! Shader provenance: ../gpu-probe/shaders/arena.comp, compiled by this crate's
-//! existing build.rs to OUT_DIR/arena.spv. No independent shader/payload copy.
+//! Shader provenance: examples/assets/mixed-video/bounded.comp, compiled only
+//! for native-video-fixture. Literal bounds and no shader loop keep work fixed
+//! even if push-constant restoration fails. No product payload copy.
 use super::*;
 const BUFFERS: [u64; 3] = [180, 181, 182];
 const SHADER: u64 = 183;
@@ -9,10 +10,12 @@ const PIPE_LAYOUT: u64 = 185;
 const DESCRIPTOR_POOL: u64 = 186;
 const SET: u64 = 187;
 const PIPELINE: u64 = 188;
+const OCCLUSION: u64 = 189;
+const TIMESTAMPS: u64 = 190;
 const BYTES: u64 = 4096;
 const SENTINEL: u32 = 0x73569b21;
 const CANARY: u32 = 0xa17e5eed;
-static SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arena.spv"));
+static SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bounded-mixed.spv"));
 pub(super) struct Prepared {
     offsets: [u64; 3],
     buffers: usize,
@@ -21,6 +24,8 @@ pub(super) struct Prepared {
     pipe_layout: bool,
     descriptor_pool: bool,
     pipeline: bool,
+    queries: bool,
+    query_pools: usize,
 }
 impl Prepared {
     pub(super) fn prepare(rpc: &mut sv_gpu_entry::Forward<GpuServer>) -> Result<Self, String> {
@@ -32,6 +37,8 @@ impl Prepared {
             pipe_layout: false,
             descriptor_pool: false,
             pipeline: false,
+            queries: std::env::args().any(|a| a == "--mixed-queries"),
+            query_pools: 0,
         };
         if let Err(error) = value.prepare_inner(rpc) {
             let cleanup = unsafe { value.cleanup_after_retirement(rpc) };
@@ -62,7 +69,7 @@ impl Prepared {
         }
         .limits;
         if limits.max_storage_buffer_range < u32::try_from(BYTES).unwrap()
-            || limits.max_compute_work_group_count[0] < 1
+            || limits.max_compute_work_group_count[0] < 4
             || limits.max_compute_work_group_size[0] < 256
             || limits.max_compute_work_group_invocations < 256
             || limits.max_push_constants_size < 8
@@ -297,6 +304,43 @@ impl Prepared {
             .result,
         )?;
         self.pipeline = true;
+        if self.queries {
+            let families = unsafe {
+                shared
+                    .driver
+                    .instance
+                    .get_physical_device_queue_family_properties(shared.driver.pd)
+            };
+            let family = families
+                .get(shared.driver.queue_family as usize)
+                .ok_or("missing mixed query family")?;
+            if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                || family.timestamp_valid_bits != 64
+                || limits.timestamp_compute_and_graphics == 0
+            {
+                return Err(
+                    "mixed queries require graphics and full 64-bit compute timestamps".into(),
+                );
+            }
+            for (id, ty, count) in [
+                (OCCLUSION, vk::QueryType::OCCLUSION, 1),
+                (TIMESTAMPS, vk::QueryType::TIMESTAMP, 2),
+            ] {
+                checked(
+                    wire(rpc.create_query_pool(p::VkCreateQueryPoolArgs {
+                        device: p::VkDevice(DEVICE),
+                        p_query_pool: Some(p::VkQueryPool(id)),
+                        p_create_info: Some(Box::new(p::VkQueryPoolCreateInfo {
+                            query_type: p::VkQueryType(ty.as_raw()),
+                            query_count: count,
+                            ..Default::default()
+                        })),
+                    }))?
+                    .result,
+                )?;
+                self.query_pools += 1;
+            }
+        }
         Ok(())
     }
     pub(super) fn record_before_decode(
@@ -304,6 +348,22 @@ impl Prepared {
         rpc: &mut sv_gpu_entry::Forward<GpuServer>,
         cb: u64,
     ) -> Result<(), String> {
+        if self.queries {
+            for (id, count) in [(OCCLUSION, 1), (TIMESTAMPS, 2)] {
+                wire(rpc.cmd_reset_query_pool(p::VkCmdResetQueryPoolArgs {
+                    command_buffer: p::VkCommandBuffer(cb),
+                    query_pool: p::VkQueryPool(id),
+                    first_query: 0,
+                    query_count: count,
+                }))?;
+            }
+            wire(rpc.cmd_begin_query(p::VkCmdBeginQueryArgs {
+                command_buffer: p::VkCommandBuffer(cb),
+                query_pool: p::VkQueryPool(OCCLUSION),
+                query: 0,
+                flags: p::VkQueryControlFlags(0),
+            }))?;
+        }
         wire(rpc.cmd_fill_buffer(p::VkCmdFillBufferArgs {
             command_buffer: p::VkCommandBuffer(cb),
             dst_buffer: p::VkBuffer(BUFFERS[0]),
@@ -319,6 +379,14 @@ impl Prepared {
             vk::AccessFlags::HOST_WRITE | vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
         )?;
+        if self.queries {
+            wire(rpc.cmd_end_query(p::VkCmdEndQueryArgs {
+                command_buffer: p::VkCommandBuffer(cb),
+                query_pool: p::VkQueryPool(OCCLUSION),
+                query: 0,
+            }))?;
+            timestamp(rpc, cb, 0)?;
+        }
         wire(rpc.cmd_bind_pipeline(p::VkCmdBindPipelineArgs {
             command_buffer: p::VkCommandBuffer(cb),
             pipeline_bind_point: p::VkPipelineBindPoint(vk::PipelineBindPoint::COMPUTE.as_raw()),
@@ -352,10 +420,13 @@ impl Prepared {
         rpc: &mut sv_gpu_entry::Forward<GpuServer>,
         cb: u64,
     ) -> Result<(), String> {
+        if self.queries {
+            timestamp(rpc, cb, 1)?;
+        }
         // No pipeline, descriptors or push constants are rebound after decode.
         wire(rpc.cmd_dispatch(p::VkCmdDispatchArgs {
             command_buffer: p::VkCommandBuffer(cb),
-            group_count_x: 1,
+            group_count_x: 4,
             group_count_y: 1,
             group_count_z: 1,
         }))?;
@@ -411,11 +482,67 @@ impl Prepared {
             }
         }
         println!(
-            "mixed compute_after_decode=true rebind_after_decode=false dispatches=1 words=1024 payload_words=960 copy_bytes=4096 original_arena=true header_canaries=true"
+            "mixed compute_after_decode=true rebind_after_decode=false dispatches=1 workgroups=4 shader_loops=0 words=1024 payload_words=960 copy_bytes=4096 original_arena=true header_canaries=true"
+        );
+        Ok(())
+    }
+    /// Query result retrieval happens after the original user fence, never
+    /// during pre-accept recording or from a timeout cleanup path.
+    pub(super) fn verify_queries(
+        &self,
+        rpc: &mut sv_gpu_entry::Forward<GpuServer>,
+    ) -> Result<(), String> {
+        if !self.queries {
+            return Ok(());
+        }
+        let mut values = Vec::new();
+        let mut availability = Vec::new();
+        for (id, count) in [(OCCLUSION, 1), (TIMESTAMPS, 2)] {
+            let reply = wire(
+                rpc.get_query_pool_results(p::VkGetQueryPoolResultsArgs {
+                    device: p::VkDevice(DEVICE),
+                    query_pool: p::VkQueryPool(id),
+                    first_query: 0,
+                    query_count: count,
+                    data_size: u64::from(count) * 16,
+                    stride: 16,
+                    flags: p::VkQueryResultFlags(
+                        (vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY)
+                            .as_raw(),
+                    ),
+                    p_data: vec![0; count as usize * 16],
+                }),
+            )?;
+            checked(reply.result)?;
+            if reply.p_data.len() != count as usize * 16 {
+                return Err("mixed query result size differs".into());
+            }
+            for record in reply.p_data.chunks_exact(16) {
+                let value = u64::from_le_bytes(record[..8].try_into().unwrap());
+                let available = u64::from_le_bytes(record[8..].try_into().unwrap());
+                if available == 0 {
+                    return Err("mixed completed query remains unavailable".into());
+                }
+                values.push(value);
+                availability.push(available);
+            }
+        }
+        if values[0] != 0 || values[1] == 0 || values[2] <= values[1] {
+            return Err(format!("mixed query oracle differs: {values:?}"));
+        }
+        println!(
+            "mixed_queries occlusion={} availability={availability:?} timestamp_before={} timestamp_after={} timestamp_bits=64 timestamp_strictly_increasing=true native_reset=true render_draw=false",
+            values[0], values[1], values[2]
         );
         Ok(())
     }
     pub(super) fn resource_report(&self) {
+        println!(
+            "mixed_query_resources query_pools={} occlusion_queries={} timestamp_queries={}",
+            self.query_pools,
+            usize::from(self.queries),
+            usize::from(self.queries) * 2
+        );
         println!(
             "mixed_resources original_arena_buffers=3 buffer_bytes=12288 shader_modules=1 pipelines=1 descriptor_sets=1 descriptor_pools=1"
         );
@@ -427,6 +554,13 @@ impl Prepared {
         &self,
         rpc: &mut sv_gpu_entry::Forward<GpuServer>,
     ) -> Result<(), String> {
+        for &id in &[OCCLUSION, TIMESTAMPS][..self.query_pools] {
+            wire(rpc.destroy_query_pool(p::VkDestroyQueryPoolArgs {
+                device: p::VkDevice(DEVICE),
+                query_pool: p::VkQueryPool(id),
+                ..Default::default()
+            }))?;
+        }
         if self.pipeline {
             wire(rpc.destroy_pipeline(p::VkDestroyPipelineArgs {
                 device: p::VkDevice(DEVICE),
@@ -493,5 +627,18 @@ fn barrier(
             ..Default::default()
         }],
         ..Default::default()
+    }))
+}
+
+fn timestamp(
+    rpc: &mut sv_gpu_entry::Forward<GpuServer>,
+    cb: u64,
+    query: u32,
+) -> Result<(), String> {
+    wire(rpc.cmd_write_timestamp2(p::VkCmdWriteTimestamp2Args {
+        command_buffer: p::VkCommandBuffer(cb),
+        stage: p::VkPipelineStageFlags2(vk::PipelineStageFlags2::ALL_COMMANDS.as_raw()),
+        query_pool: p::VkQueryPool(TIMESTAMPS),
+        query,
     }))
 }

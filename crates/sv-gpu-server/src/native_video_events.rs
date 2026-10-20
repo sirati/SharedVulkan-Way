@@ -1180,6 +1180,39 @@ mod tests {
         );
     }
     #[test]
+    fn queue_wire_aliases_qualify_only_through_the_same_actual_queue() {
+        use ash::vk::{self, Handle};
+        use sv_proto::HandleType;
+        let mut objects = crate::table::Objects::new();
+        objects.insert(2, HandleType::VkQueue, vk::Queue::from_raw(10));
+        objects.insert(222, HandleType::VkQueue, vk::Queue::from_raw(10));
+        objects.insert(333, HandleType::VkQueue, vk::Queue::from_raw(11));
+        let actual = |wire| {
+            objects
+                .get::<vk::Queue>(HandleType::VkQueue, wire)
+                .unwrap()
+                .as_raw()
+        };
+        let mut events = Events::new(4);
+        events.create(1, 0).unwrap();
+        events.create(2, 0).unwrap();
+        let dependency = dep(1);
+        let signal = events
+            .plan(actual(2), &[set2(1, dependency.clone()), set(2)])
+            .unwrap();
+        events.reserve(&signal).unwrap();
+        assert!(
+            events
+                .plan(
+                    actual(222),
+                    &[wait2(1, dependency.clone()), wait(2, 0x1000)]
+                )
+                .is_ok()
+        );
+        assert!(events.plan(actual(333), &[wait2(1, dependency)]).is_err());
+        assert!(events.plan(actual(333), &[wait(2, 0x1000)]).is_err());
+    }
+    #[test]
     fn pending_bound_and_revision_exhaustion_refuse_without_partial_reservation() {
         let mut events = Events::new(1);
         events.create(1, 0).unwrap();
