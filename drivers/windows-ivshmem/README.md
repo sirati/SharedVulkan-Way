@@ -48,6 +48,8 @@ The overlay explicitly declares `PsAcquireProcessExitSynchronization` and
 them but its public headers do not declare them. This is an undocumented kernel
 ABI dependency. The successful cross-link verifies symbol availability in that
 import library, not support or behavior on any target Windows installation.
+See [the source compatibility audit](COMPATIBILITY.md) for checked signatures,
+target evidence gaps, documented DDI constraints and alternatives evaluated.
 Replacing or accepting this dependency requires a separate compatibility review.
 The cross-build still emits upstream/WDK warnings, including ignored upstream
 `#pragma align`, Microsoft enum extensions and deprecated pool allocation.
