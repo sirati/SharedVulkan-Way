@@ -184,6 +184,17 @@ static void test_streams(void)
     assert(writable.revents & POLLERR);
     assert(write(fds[1], "x", 1) < 0 && errno == EPIPE);
     assert(!close(fds[1]));
+    /* Failed dup2 must leave the old tracked target live. Successful
+     * replacement must close that endpoint and retain only the new alias. */
+    int other[2];
+    assert(!pipe2(fds, O_CLOEXEC) && !pipe2(other, O_CLOEXEC));
+    assert(dup2(-1, other[0]) < 0 && errno == EBADF);
+    assert(write(other[1], "a", 1) == 1 && read(other[0], bytes, 1) == 1 && bytes[0] == 'a');
+    assert(dup2(fds[0], fds[0]) == fds[0]);
+    assert(dup2(fds[0], other[0]) == other[0]);
+    assert(!close(fds[0]));
+    assert(write(fds[1], "b", 1) == 1 && read(other[0], bytes, 1) == 1 && bytes[0] == 'b');
+    assert(!close(other[0]) && !close(fds[1]) && !close(other[1]));
     for (unsigned id = 100; id < next_mock_endpoint; ++id) assert(!mock_endpoints[id].live);
     alarm(0);
     fprintf(stderr, "WC_CYGWIN_STREAM_MOCK bytes=262144 pending_blocks_eof=1 poll=1 duplicate=1 stdio_close=1 fork_exec_local_pipe=1 eof=1 epipe=1 all_workers_joined=1\n");
