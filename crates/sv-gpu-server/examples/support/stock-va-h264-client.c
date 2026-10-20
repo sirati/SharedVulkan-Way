@@ -1,9 +1,9 @@
 /* Source-only bounded stock-libva probe. No driver, libva or asset modifications.
  * Build: cc -std=c11 -Wall -Wextra -Werror stock-va-h264-client.c \
- *           $(pkg-config --cflags --libs libva libva-drm) -o stock-va-h264-client
+ *           $(pkg-config --cflags --libs libva libva-drm egl glesv2) -o stock-va-h264-client
  * Input MUST be original-pcm-poc0-marking-64x64.h264 from this repository.
  * Submit exactly its first THREE original VCL NALs: IDR, marking I_PCM, P-skip.
- * No decoded pixel is mapped, copied or read by this program.
+ * No CPU NV12 read/map/copy. Optional GPU sampling reads diagnostic RGBA only.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <va/va.h>
@@ -46,6 +46,8 @@ static bool va_ok(VAStatus status, const char *operation) {
     if (uncertain) retain(operation);
     return false;
 }
+#include "stock-va-gpu-sample.h"
+
 static uint64_t checksum(const uint8_t *data, size_t size) {
     uint64_t value = UINT64_C(0xcbf29ce484222325);
     for (size_t i = 0; i < size; ++i) value = (value ^ data[i]) * UINT64_C(0x100000001b3);
@@ -257,13 +259,14 @@ static bool handoff(const char *path, const VADRMPRIMESurfaceDescriptor *desc) {
 }
 int main(int argc, char **argv) {
     const char *drm_path = NULL, *stream_path = NULL, *socket_path = NULL;
-    bool hold = false;
+    bool hold = false, gpu_sample = false;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--hold")) hold = true;
+        else if (!strcmp(argv[i], "--gpu-sample")) gpu_sample = true;
         else if (i + 1 < argc && !strcmp(argv[i], "--drm")) drm_path = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--stream")) stream_path = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--socket")) socket_path = argv[++i];
-        else { fprintf(stderr, "usage: %s --drm PATH --stream ORIGINAL_PCM_MARKING0 [--socket SEQPACKET_PATH | --hold]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s --drm PATH --stream ORIGINAL_PCM_MARKING0 [--socket SEQPACKET_PATH | --hold] [--gpu-sample]\n", argv[0]); return 2; }
     }
     require(drm_path && stream_path && !(hold && socket_path), "required paths or conflicting handoff modes");
     FILE *file = fopen(stream_path, "rb"); require(file != NULL, "open original stream");
@@ -351,6 +354,8 @@ int main(int argc, char **argv) {
         }
     }
     fflush(NULL);
+    if (gpu_sample && !stock_va_gpu_sample(&exported)) goto cleanup;
+    fflush(NULL);
     if (socket_path && !handoff(socket_path, &exported)) { fprintf(stderr, "handoff failed before ownership transfer: %s\n", strerror(errno)); goto cleanup; }
     if (hold) {
         printf("STOCK_VA_HOLD pid=%ld release_byte=R owners=3surfaces+context+config+exportFDs\n", (long)getpid()); fflush(NULL);
@@ -369,6 +374,6 @@ cleanup:
     if (config != VA_INVALID_ID && !va_ok(vaDestroyConfig(display, config), "cleanup config")) status = 1;
     if (initialized && !va_ok(vaTerminate(display), "vaTerminate")) status = 1;
     close(drm_fd);
-    if (status == 0) printf("PASS stock_va_original_vcl frames=3 dependent_long_term_p=true actual_sync=true prime2_export=true gpu_pixel_validation=false cleanup=true\n");
+    if (status == 0) printf("PASS stock_va_original_vcl frames=3 dependent_long_term_p=true actual_sync=true prime2_export=true gpu_pixel_validation=%s cleanup=true\n", gpu_sample ? "true" : "false");
     return status;
 }
