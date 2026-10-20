@@ -325,6 +325,12 @@ impl Dispatch<ZwpLinuxBufferParamsV1, Params> for State {
                     init.init(buffer_id, source);
                 }
                 Err(error) => {
+                    // Request dispatch ignores DataInit's global-bind error slot.
+                    // Kill the creating params resource before consuming New.
+                    params.post_error(
+                        zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
+                        error.to_string(),
+                    );
                     init.post_error(
                         buffer_id,
                         zwp_linux_buffer_params_v1::Error::InvalidWlBuffer,
