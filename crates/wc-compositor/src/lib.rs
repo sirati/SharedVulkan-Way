@@ -1189,9 +1189,9 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
     for (id, run, slot, device, qmp) in &args.qemu_arenas {
         #[cfg(target_os = "linux")]
         {
-            let result = sv_hostd::qemu_bar::QemuBar::open(std::path::Path::new(qmp), device, *slot, false)
+            let result = sv_hostd::qemu_bar::QemuBar::open_peer_writer(std::path::Path::new(qmp), device, *slot)
                 .and_then(|bar| {
-                    wc_handle::arena::attach_host_ivshmem(*id, &bar.file, *run,
+                    wc_handle::arena::attach_host_bar_leases(*id, &bar.file, *run,
                         format!("QEMU {} device {} backend {}", bar.pid, bar.device, bar.backend))?;
                     Ok(bar)
                 });
@@ -1775,7 +1775,7 @@ fn wayland_thread(
     nested_globals: bool,
 ) -> u8 {
     use std::io::Write as _;
-    let in_band_encoding = in_band_arena.map(FdEncoding::InBandArena).unwrap_or(FdEncoding::InBand);
+    let in_band_encoding = in_band_arena.map(FdEncoding::InBandLease).unwrap_or(FdEncoding::InBand);
 
     // `mut` here rather than in the parameter list so the Windows build, where
     // the hook is a unit struct, does not carry an unused-mut.

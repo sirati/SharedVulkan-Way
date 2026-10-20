@@ -748,3 +748,19 @@ pub(crate) fn map_file_window(file: &File, offset: u64, len: usize) -> io::Resul
     if ptr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
     Ok(MappedView { ptr: ptr.cast(), len })
 }
+
+/// Writable metadata or local-producer window of the authenticated BAR.
+#[cfg(target_os = "linux")]
+pub(crate) fn map_file_window_mut(file: &File, offset: u64, len: usize) -> io::Result<MappedView> {
+    let end = offset.checked_add(len as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mapping window overflows"))?;
+    if len == 0 || end > file.metadata()?.len() || offset > i64::MAX as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "mapping window exceeds backend"));
+    }
+    // SAFETY: checked aligned retained-file window; callers restrict this to
+    // shared atomic metadata or bytes owned by this process's producer role.
+    let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED, file.as_raw_fd(), offset as libc::off_t) };
+    if ptr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
+    Ok(MappedView { ptr: ptr.cast(), len })
+}

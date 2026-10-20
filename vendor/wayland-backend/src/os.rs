@@ -344,6 +344,8 @@ pub enum FdEncoding {
     /// Other arenas and host pathname/section/pipe descriptors are refused
     /// before a protocol handler can open or map anything they name.
     InBandArena(u32),
+    /// Authenticated original BAR allocation with consumer-completion leases.
+    InBandLease(u32),
 }
 
 impl Default for FdEncoding {

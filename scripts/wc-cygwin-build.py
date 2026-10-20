@@ -164,7 +164,8 @@ def build(root, bridge_dir=None):
         native_hashes = {str(file.relative_to(REPO)): digest(file) for file in native_sources}
         (output / 'bar-posix.def').write_text(
             'LIBRARY cygwc-posix-0.dll\nEXPORTS\n'
-            'mmap\nmunmap\nos_create_anonymous_file\nwc_cygwin_fd_words\nwc_cygwin_ring_enabled\n')
+            'mmap\nmunmap\nclose\ndup\ndup2\nfcntl\nftruncate\nos_create_anonymous_file\n'
+            'wc_cygwin_fd_words\nwc_cygwin_fd_from_words\nwc_cygwin_ring_enabled\n')
         compile(INTEGRATION / 'bar-posix.c', output / 'bar-posix.o')
         link([output / 'bar-posix.o', output / 'bar-posix.def', bridge / 'libwc_cygwin_link.dll.a'],
              output / 'cygwc-posix-0.dll', shared=True,
@@ -180,8 +181,9 @@ def build(root, bridge_dir=None):
             needle, 'fd = getenv("WC_WAYLAND_RING") && strcmp(getenv("WC_WAYLAND_RING"), "1") == 0 ? wc_cygwin_ring_socket() : connect_to_socket(name);'))
         connection_file = source / 'src/connection.c'
         connection = connection_file.read_text()
-        connection = ('extern int wc_cygwin_ring_enabled(void);\n'
-                      'extern int wc_cygwin_fd_words(int, unsigned int *);\n' + connection)
+        connection = ('#include <stddef.h>\nextern int wc_cygwin_ring_enabled(void);\n'
+                      'extern int wc_cygwin_fd_words(int, unsigned int *);\n'
+                      'extern int wc_cygwin_fd_from_words(const unsigned int *, size_t);\n' + connection)
         copy_start = connection.index('copy_fds_to_connection(struct wl_closure *closure,')
         copy_body = connection.index('{', copy_start) + 1
         connection = (connection[:copy_body] +
@@ -205,7 +207,19 @@ def build(root, bridge_dir=None):
             '\t\t\tif ((size_t)(end - p) < 7) goto overflow;\n'
             '\t\t\tif (wc_cygwin_fd_words(closure->args[i].h, p)) return -1;\n'
             '\t\t\tp += 7;\n\t\t\tbreak;')
-        connection_file.write_text(connection[:serial_start] + serial + connection[serial_end:])
+        connection = connection[:serial_start] + serial + connection[serial_end:]
+        demarshal_start = connection.index('wl_connection_demarshal(struct wl_connection *connection,')
+        demarshal_end = connection.index('\nint\nwl_closure_lookup_objects(', demarshal_start)
+        demarshal = connection[demarshal_start:demarshal_end]
+        fd_start = demarshal.index('case WL_ARG_FD:') + len('case WL_ARG_FD:')
+        demarshal = demarshal[:fd_start] + (
+            '\n\t\t\tif (wc_cygwin_ring_enabled()) {\n'
+            '\t\t\t\tif ((size_t)(end - p) < 7 || p[0] != 24) { errno = EPROTO; goto err; }\n'
+            '\t\t\t\tfd = wc_cygwin_fd_from_words(p, (size_t)(end - p));\n'
+            '\t\t\t\tif (fd < 0) goto err;\n'
+            '\t\t\t\tclosure->args[i].h = fd; p += 7; break;\n'
+            '\t\t\t}\n') + demarshal[fd_start:]
+        connection_file.write_text(connection[:demarshal_start] + demarshal + connection[demarshal_end:])
     objects = []
     for name in ('wayland-util', 'wayland-client', 'connection'):
         target = output / (name + '.o')
@@ -253,9 +267,13 @@ def build(root, bridge_dir=None):
         link(app_objects, output / 'weston-simple-shm.exe',
              libraries=['-lwc-cygwin-posix', '-lwayland-client'])
         imports = pe_imports(output / 'weston-simple-shm.exe', symbols=True)
-        for function in ('mmap', 'os_create_anonymous_file'):
+        for function in ('mmap', 'close', 'os_create_anonymous_file'):
             if function not in imports.get('cygwc-posix-0.dll', []):
                 raise RuntimeError(f'rendered application bypasses BAR POSIX runtime: {function}')
+        library_imports = pe_imports(dll, symbols=True)
+        for function in ('close', 'fcntl', 'wc_cygwin_fd_from_words'):
+            if function not in library_imports.get('cygwc-posix-0.dll', []):
+                raise RuntimeError(f'libwayland bypasses BAR fd lifetime boundary: {function}')
         if digest(upstream / 'clients/simple-shm.c') != sources['simple-shm.c']['sha256']:
             raise RuntimeError('rendered application source was modified')
     bundle = root / 'bundle'
