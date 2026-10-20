@@ -6,14 +6,14 @@ use native::ProjectionReference;
 /// Owner-minted exact closing reference. No caller-selected count or process
 /// lifetime fact can construct or satisfy this token.
 pub struct ClosingReference {
-    grant: GrantId,
-    allocation: u64,
-    reference: ProjectionReference,
-    process: Process,
-    local: Option<(Key, Option<Consumer>)>,
+    pub(super) grant: GrantId,
+    pub(super) allocation: u64,
+    pub(super) reference: ProjectionReference,
+    pub(super) process: Process,
+    pub(super) local: Option<(Key, Option<Consumer>)>,
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
-    fn mark_closing(&mut self, token: ClosingReference) -> io::Result<ClosingReference> {
+    pub(super) fn mark_closing(&mut self, token: ClosingReference) -> io::Result<ClosingReference> {
         let record = self.records.get_mut(&token.grant.id).unwrap();
         if record
             .closing
@@ -32,7 +32,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         producer: &RegisteredProcess,
         allocation: &AllocationId,
     ) -> io::Result<ClosingReference> {
-        self.process_role(lifecycle, producer, ProcessRole::Producer)?;
+        self.retained_role(lifecycle, producer, ProcessRole::Producer)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
         let record = self.record(lifecycle, &allocation.grant)?;
         if record.producers.get(&allocation.key) != Some(&producer.process) {
@@ -54,7 +54,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         recipient: &RegisteredProcess,
         consumer: &ConsumerId,
     ) -> io::Result<ClosingReference> {
-        self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
+        self.retained_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.record(lifecycle, &recipient.grant)?;
         if record
@@ -82,7 +82,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         &mut self,
         lifecycle: &Lifecycle<S, B>,
         token: &ClosingReference,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Frame>> {
         let record = self.record(lifecycle, &token.grant)?;
         if record.closing.get(&(token.allocation, token.reference)) != Some(&false) {
             return Err(denied("unknown or completed logical closing reference"));
@@ -98,7 +98,11 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 "exact native lineage is not drained",
             ));
         }
+        if token.local.is_none() {
+            return self.finish_remote_consumer_close(lifecycle, token);
+        }
         let record = self.records.get_mut(&token.grant.id).unwrap();
+        let mut terminal_frame = None;
         match token.local {
             Some((key, None)) => {
                 if record.producers.get(&key) != Some(&token.process) {
@@ -110,6 +114,23 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                     record.table.close_producer(token.process, key)?;
                 }
                 record.producers.remove(&key);
+                if record.remote_producer_announced(key) {
+                    match lifecycle.seal(
+                        &mut record.channel,
+                        Phase::ProducerRetired,
+                        Payload {
+                            producer_registration: token.process.registration(),
+                            allocation: key.allocation,
+                            ..Payload::default()
+                        },
+                    ) {
+                        Ok(frame) => terminal_frame = Some(frame),
+                        Err(error) => {
+                            record.quarantined = true;
+                            return Err(error);
+                        }
+                    }
+                }
             }
             Some((key, Some(consumer))) => {
                 if record.consumers.get(&(key, consumer)) != Some(&token.process) {
@@ -134,6 +155,6 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .closing
             .get_mut(&(token.allocation, token.reference))
             .unwrap() = true;
-        Ok(())
+        Ok(terminal_frame)
     }
 }

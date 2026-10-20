@@ -28,7 +28,8 @@ pub mod native;
 pub use closing::ClosingReference;
 mod remote;
 pub use remote::{
-    RemoteAllocationId, RemoteApplied, RemoteConsumerId, RemotePending, RemoteRegistration,
+    OutgoingTransfer, RemoteAllocationId, RemoteApplied, RemoteConsumerId, RemotePending,
+    RemoteRegistration,
 };
 
 const PAGE: u64 = 4096;
@@ -556,6 +557,24 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             .get(&process.process)
             .ok_or_else(|| denied("unknown native process registration"))?
             .live()
+    }
+    // Drain authority retains the exact native registration but never treats
+    // target death as retirement. Closing may start after target termination.
+    fn retained_role(
+        &self,
+        lifecycle: &Lifecycle<S, B>,
+        process: &RegisteredProcess,
+        role: ProcessRole,
+    ) -> io::Result<()> {
+        if process.role != role {
+            return Err(denied("native registration role differs"));
+        }
+        self.require_role(lifecycle, &process.grant, role)?;
+        let record = self.record(lifecycle, &process.grant)?;
+        if record.processes.get(&process.process).map(|p| p.role) != Some(role) {
+            return Err(denied("unknown retained native registration"));
+        }
+        Ok(())
     }
     fn process_role(
         &self,
@@ -1985,7 +2004,8 @@ mod tests {
         assert_eq!(
             owner
                 .finish_close_reference(&life, &closing)
-                .unwrap_err()
+                .err()
+                .unwrap()
                 .kind(),
             io::ErrorKind::WouldBlock
         );
@@ -2132,6 +2152,168 @@ mod tests {
         assert!(owner.records[&grant.id].producers.is_empty());
         context.backing().3.store(false, Ordering::SeqCst);
         assert!(owner.allocate(&life, &producer, 1, PAGE).is_err());
+    }
+    #[test]
+    fn remote_accept_cancel_has_one_terminal_winner_and_keeps_exact_pin() {
+        for accept_first in [false, true] {
+            let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+            let frame = a.announce_registration(&wl, &p).unwrap();
+            b.apply_remote(&ll, &gb, &frame).unwrap();
+            let frame = b.announce_registration(&ll, &c).unwrap();
+            let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+                RemoteApplied::Registered(r) => r,
+                _ => panic!(),
+            };
+            let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+            let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+            b.apply_remote(&ll, &gb, &frame).unwrap();
+            let (outgoing, frame) = a
+                .prepare_remote_with_handle(&wl, &p, &allocation, &remote)
+                .unwrap();
+            let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+                RemoteApplied::Prepared(p) => p,
+                _ => panic!(),
+            };
+            let closing = a.begin_close_producer(&wl, &p, &allocation).unwrap();
+            let retired = a.finish_close_reference(&wl, &closing).unwrap().unwrap();
+            b.apply_remote(&ll, &gb, &retired).unwrap();
+            let cancel = a.begin_cancel_remote(&wl, &p, &outgoing).unwrap();
+            assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
+            if accept_first {
+                let (_, accepted) = b.accept_remote(&ll, &c, &pending).unwrap();
+                assert!(b.apply_remote(&ll, &gb, &cancel).is_err());
+                assert!(matches!(
+                    a.apply_remote(&wl, &ga, &accepted).unwrap(),
+                    RemoteApplied::Accepted
+                ));
+                assert!(a.records[&ga.id].table.extent(allocation.key).is_some());
+            } else {
+                let ack = match b.apply_remote(&ll, &gb, &cancel).unwrap() {
+                    RemoteApplied::Cancelled(ack) => ack,
+                    _ => panic!(),
+                };
+                assert!(b.accept_remote(&ll, &c, &pending).is_err());
+                assert!(matches!(
+                    a.apply_remote(&wl, &ga, &ack).unwrap(),
+                    RemoteApplied::CancellationAcknowledged
+                ));
+                assert!(a.records[&ga.id].table.extent(allocation.key).is_none());
+                assert!(a.apply_remote(&wl, &ga, &ack).is_err());
+            }
+            assert!(a.begin_cancel_remote(&wl, &p, &outgoing).is_err());
+        }
+    }
+    #[test]
+    fn remote_consumer_release_requires_exact_native_drain_after_barrier() {
+        let (mut a, mut b, wl, ll, ga, gb, p, c, _) = remote_setup();
+        let frame = a.announce_registration(&wl, &p).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = b.announce_registration(&ll, &c).unwrap();
+        let remote = match a.apply_remote(&wl, &ga, &frame).unwrap() {
+            RemoteApplied::Registered(r) => r,
+            _ => panic!(),
+        };
+        let (allocation, _) = a.allocate(&wl, &p, 1, PAGE).unwrap();
+        let frame = a.announce_allocation(&wl, &p, &allocation).unwrap();
+        b.apply_remote(&ll, &gb, &frame).unwrap();
+        let frame = a.prepare_remote(&wl, &p, &allocation, &remote).unwrap();
+        let pending = match b.apply_remote(&ll, &gb, &frame).unwrap() {
+            RemoteApplied::Prepared(p) => p,
+            _ => panic!(),
+        };
+        let (consumer, accepted) = b.accept_remote(&ll, &c, &pending).unwrap();
+        a.apply_remote(&wl, &ga, &accepted).unwrap();
+        let target = b.records[&gb.id].processes[&c.process].process.clone();
+        let mut backend = TicketBackend {
+            target: target.clone(),
+            next: 0,
+            wrong: 0,
+        };
+        let authority = b
+            .project_remote_consumer_tracked(&ll, &c, &consumer, &mut backend)
+            .unwrap();
+        let closing = b.begin_close_remote_consumer(&ll, &c, &consumer).unwrap();
+        assert!(
+            b.project_remote_consumer_tracked(&ll, &c, &consumer, &mut backend)
+                .is_err()
+        );
+        let mut legacy = Backend {
+            target,
+            calls: 0,
+            fail: false,
+        };
+        assert!(
+            b.project_remote_consumer(&ll, &c, &consumer, &mut legacy)
+                .is_err()
+        );
+        assert_eq!(legacy.calls, 0);
+        assert!(b.finish_close_reference(&ll, &closing).is_err());
+        b.complete_projection(&ll, &gb, unsafe { authority.prove_retired().unwrap() })
+            .unwrap();
+        let released = b.finish_close_reference(&ll, &closing).unwrap().unwrap();
+        assert!(matches!(
+            a.apply_remote(&wl, &ga, &released).unwrap(),
+            RemoteApplied::ConsumerReleased
+        ));
+        assert!(a.apply_remote(&wl, &ga, &released).is_err());
+        let closing = a.begin_close_producer(&wl, &p, &allocation).unwrap();
+        let retired = a.finish_close_reference(&wl, &closing).unwrap().unwrap();
+        assert!(matches!(
+            b.apply_remote(&ll, &gb, &retired).unwrap(),
+            RemoteApplied::ProducerRetired
+        ));
+        assert!(a.records[&ga.id].table.extent(allocation.key).is_none());
+    }
+    #[test]
+    fn closing_token_cannot_cross_owner_or_revoked_current_channel() {
+        let (mut owner, mut life, _, _, _, _, _, endpoint) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let (producer, _) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let closing = owner
+            .begin_close_producer(&life, &producer, &allocation)
+            .unwrap();
+        let (mut other, other_life, _, _, _, _, _, _) = setup();
+        assert!(other.finish_close_reference(&other_life, &closing).is_err());
+        endpoint.0.store(1, Ordering::SeqCst);
+        assert!(owner.finish_close_reference(&life, &closing).is_err());
+        endpoint.0.store(0, Ordering::SeqCst);
+        assert!(owner.finish_close_reference(&life, &closing).is_err());
+        assert!(
+            owner.records[&grant.id]
+                .producers
+                .contains_key(&allocation.key)
+        );
+    }
+    #[test]
+    fn dead_native_target_can_enter_close_but_still_needs_exact_native_proof() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target: target.clone(),
+            next: 0,
+            wrong: 0,
+        };
+        let authority = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        target.0.store(1, Ordering::SeqCst);
+        let closing = owner
+            .begin_close_producer(&life, &producer, &allocation)
+            .unwrap();
+        assert!(owner.finish_close_reference(&life, &closing).is_err());
+        owner
+            .complete_projection(&life, &grant, unsafe { authority.prove_retired().unwrap() })
+            .unwrap();
+        owner.finish_close_reference(&life, &closing).unwrap();
+        assert!(
+            owner.records[&grant.id]
+                .table
+                .extent(allocation.key)
+                .is_none()
+        );
     }
     #[test]
     fn native_ticket_retires_only_its_exact_projection_not_logical_or_durable_holds() {

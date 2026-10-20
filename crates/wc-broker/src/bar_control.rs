@@ -358,6 +358,16 @@ impl Allocator {
         }
         Ok(())
     }
+    /// # Safety
+    /// Exact privileged peer transition must prove this remote lineage cannot
+    /// export again: trusted consumer close or the terminal accept/cancel winner.
+    /// Parsing, a native enum and a client request cannot supply that proof.
+    pub(crate) unsafe fn release_external(&mut self, hold: ExternalHold) -> io::Result<()> {
+        self.check_external(&hold)?;
+        self.allocations.get_mut(&hold.key).unwrap().external.remove(&hold.id);
+        self.reclaim(hold.key);
+        Ok(())
+    }
     /// Explicit close is permitted only after all local mappings are gone.
     /// The transport must enforce this lifetime; a DLL destructor is not proof.
     ///

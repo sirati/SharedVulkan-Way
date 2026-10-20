@@ -15,6 +15,11 @@ pub struct RemoteAllocationId {
     grant: GrantId,
     allocation: u64,
 }
+/// Owner-minted outgoing pending lineage. A wire transfer number cannot mint it.
+pub struct OutgoingTransfer {
+    grant: GrantId,
+    transfer: u64,
+}
 #[derive(Clone)]
 pub struct RemotePending {
     allocation: RemoteAllocationId,
@@ -31,8 +36,13 @@ pub enum RemoteApplied {
     Resized(RemoteAllocationId, Extent),
     Prepared(RemotePending),
     Accepted,
+    ProducerRetired,
+    ConsumerReleased,
+    Cancelled(Frame),
+    CancellationAcknowledged,
 }
 struct Allocation {
+    retired: bool,
     producer: u64,
     extent: Extent,
 }
@@ -43,11 +53,13 @@ struct IncomingPending {
 }
 struct OutgoingPending {
     external: crate::bar_control::ExternalHold,
+    cancelling: bool,
     allocation: Key,
     producer: Process,
     recipient: u64,
 }
 struct Consumer {
+    producer: u64,
     allocation: u64,
     process: Process,
 }
@@ -64,6 +76,11 @@ pub(super) struct State {
     announced_allocations: BTreeSet<Key>,
     next_transfer: u64,
     next_consumer: u64,
+}
+impl<B: OriginalBacking> Record<B> {
+    pub(super) fn remote_producer_announced(&self, key: Key) -> bool {
+        self.remote.announced_allocations.contains(&key)
+    }
 }
 impl State {
     fn serial(counter: &mut u64) -> io::Result<u64> {
@@ -98,6 +115,94 @@ fn remote_extent(binding: &Binding, p: Payload) -> io::Result<Extent> {
     })
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
+    pub fn begin_close_remote_consumer(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        recipient: &RegisteredProcess,
+        consumer: &RemoteConsumerId,
+    ) -> io::Result<ClosingReference> {
+        self.retained_role(lifecycle, recipient, ProcessRole::Consumer)?;
+        Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
+        let record = self.record(lifecycle, &recipient.grant)?;
+        let hold = record
+            .remote
+            .consumers
+            .get(&consumer.consumer)
+            .ok_or_else(|| denied("unknown remote consumer"))?;
+        if hold.allocation != consumer.allocation.allocation || hold.process != recipient.process {
+            return Err(denied("not exact remote consumer"));
+        }
+        self.mark_closing(ClosingReference {
+            grant: recipient.grant.clone(),
+            allocation: hold.allocation,
+            reference: native::ProjectionReference::RemoteConsumer {
+                registration: recipient.process.registration(),
+                consumer: consumer.consumer,
+            },
+            process: recipient.process,
+            local: None,
+        })
+    }
+    pub(super) fn finish_remote_consumer_close(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        token: &ClosingReference,
+    ) -> io::Result<Option<Frame>> {
+        let record = self.record(lifecycle, &token.grant)?;
+        if record.closing.get(&(token.allocation, token.reference)) != Some(&false)
+            || record.untracked_native
+            || record
+                .native_holds
+                .values()
+                .any(|h| h.matches_reference(token.allocation, token.reference))
+        {
+            return Err(denied(
+                "remote consumer closing barrier or native drain incomplete",
+            ));
+        }
+        let native::ProjectionReference::RemoteConsumer {
+            registration,
+            consumer,
+        } = token.reference
+        else {
+            return Err(denied("not remote consumer closing token"));
+        };
+        let record = self.records.get_mut(&token.grant.id).unwrap();
+        let hold = record
+            .remote
+            .consumers
+            .get(&consumer)
+            .ok_or_else(|| denied("remote consumer already released"))?;
+        if hold.allocation != token.allocation
+            || hold.process != token.process
+            || registration != hold.process.registration()
+        {
+            return Err(denied("remote consumer closing lineage differs"));
+        }
+        let producer = hold.producer;
+        record.remote.consumers.remove(&consumer);
+        *record
+            .closing
+            .get_mut(&(token.allocation, token.reference))
+            .unwrap() = true;
+        match lifecycle.seal(
+            &mut record.channel,
+            Phase::ConsumerReleased,
+            Payload {
+                producer_registration: producer,
+                recipient_registration: registration,
+                allocation: token.allocation,
+                consumer,
+                ..Payload::default()
+            },
+        ) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(error) => {
+                record.quarantined = true;
+                Err(error)
+            }
+        }
+    }
     /// Emit only after actual native watch enrollment at its exact local role.
     pub fn announce_registration(
         &mut self,
@@ -202,6 +307,47 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         allocation: &AllocationId,
         recipient: &RemoteRegistration,
     ) -> io::Result<Frame> {
+        self.prepare_remote_with_handle(lifecycle, producer, allocation, recipient)
+            .map(|(_, frame)| frame)
+    }
+    pub fn begin_cancel_remote(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        producer: &RegisteredProcess,
+        transfer: &OutgoingTransfer,
+    ) -> io::Result<Frame> {
+        self.retained_role(lifecycle, producer, ProcessRole::Producer)?;
+        Self::same_grant(&producer.grant, &transfer.grant)?;
+        let record = self.records.get_mut(&transfer.grant.id).unwrap();
+        let pending = record
+            .remote
+            .outgoing_pending
+            .get_mut(&transfer.transfer)
+            .ok_or_else(|| denied("outgoing pending already terminal or foreign"))?;
+        if pending.producer != producer.process || pending.cancelling {
+            return Err(denied("not exact open outgoing pending"));
+        }
+        pending.cancelling = true;
+        let payload = Payload {
+            producer_registration: pending.producer.registration(),
+            recipient_registration: pending.recipient,
+            allocation: pending.allocation.allocation,
+            transfer: transfer.transfer,
+            ..Payload::default()
+        };
+        lifecycle
+            .seal(&mut record.channel, Phase::TransferCancelled, payload)
+            .inspect_err(|_| {
+                record.quarantined = true;
+            })
+    }
+    pub fn prepare_remote_with_handle(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        producer: &RegisteredProcess,
+        allocation: &AllocationId,
+        recipient: &RemoteRegistration,
+    ) -> io::Result<(OutgoingTransfer, Frame)> {
         self.process_role(lifecycle, producer, ProcessRole::Producer)?;
         self.producer_open(lifecycle, producer, allocation)?;
         Self::same_grant(&producer.grant, &allocation.grant)?;
@@ -227,12 +373,13 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             transfer,
             OutgoingPending {
                 external,
+                cancelling: false,
                 allocation: allocation.key,
                 producer: producer.process,
                 recipient: recipient.registration,
             },
         );
-        lifecycle.seal(
+        let frame = lifecycle.seal(
             &mut record.channel,
             Phase::Prepare,
             Payload {
@@ -242,7 +389,14 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 transfer,
                 ..Payload::default()
             },
-        )
+        )?;
+        Ok((
+            OutgoingTransfer {
+                grant: allocation.grant.clone(),
+                transfer,
+            },
+            frame,
+        ))
     }
     /// Verify and mutate in this single current-context owner operation. No
     /// method accepts a historical VerifiedMessage for later resource apply.
@@ -292,6 +446,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 record.remote.allocations.insert(
                     p.allocation,
                     Allocation {
+                        retired: false,
                         producer: p.producer_registration,
                         extent,
                     },
@@ -311,7 +466,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                     .allocations
                     .get(&p.allocation)
                     .ok_or_else(|| denied("unknown remote resize allocation"))?;
-                if old.producer != p.producer_registration
+                if old.retired
+                    || old.producer != p.producer_registration
                     || old.extent.offset != extent.offset
                     || old.extent.capacity != extent.capacity
                     || old.extent.length > extent.length
@@ -340,7 +496,8 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                     .allocations
                     .get(&p.allocation)
                     .ok_or_else(|| denied("unknown remote prepare allocation"))?;
-                if allocation.producer != p.producer_registration
+                if allocation.retired
+                    || allocation.producer != p.producer_registration
                     || record.remote.seen_incoming_transfers.contains(&p.transfer)
                 {
                     return Err(denied("foreign producer or duplicate pending transfer"));
@@ -394,6 +551,89 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 record.remote.outgoing_consumers.insert(p.consumer, hold);
                 Ok(RemoteApplied::Accepted)
             }
+            Phase::ProducerRetired => {
+                let allocation = record
+                    .remote
+                    .allocations
+                    .get_mut(&p.allocation)
+                    .ok_or_else(|| denied("unknown retired remote producer allocation"))?;
+                if allocation.retired || allocation.producer != p.producer_registration {
+                    return Err(denied("foreign or duplicate producer retirement"));
+                }
+                allocation.retired = true;
+                Ok(RemoteApplied::ProducerRetired)
+            }
+            Phase::ConsumerReleased => {
+                let hold = record
+                    .remote
+                    .outgoing_consumers
+                    .get(&p.consumer)
+                    .ok_or_else(|| denied("unknown exact remote consumer release"))?;
+                if hold.allocation.allocation != p.allocation
+                    || hold.producer.registration() != p.producer_registration
+                    || hold.recipient != p.recipient_registration
+                {
+                    return Err(denied("remote consumer release lineage differs"));
+                }
+                record.table.check_external(&hold.external)?;
+                let hold = record
+                    .remote
+                    .outgoing_consumers
+                    .remove(&p.consumer)
+                    .unwrap();
+                // SAFETY: current authenticated privileged consumer service can
+                // emit this exact transition only after its closing/native drain.
+                unsafe {
+                    record.table.release_external(hold.external)?;
+                }
+                Ok(RemoteApplied::ConsumerReleased)
+            }
+            Phase::TransferCancelled => {
+                let pending = record
+                    .remote
+                    .incoming_pending
+                    .get(&p.transfer)
+                    .ok_or_else(|| denied("pending already accepted, cancelled or unknown"))?;
+                if pending.allocation != p.allocation
+                    || pending.producer != p.producer_registration
+                    || pending.recipient.registration() != p.recipient_registration
+                {
+                    return Err(denied("cancel request lineage differs"));
+                }
+                // No preaccept projection route exists. Removing this pending
+                // is the serialized no-future-accept barrier before ACK emission.
+                record.remote.incoming_pending.remove(&p.transfer);
+                let ack = lifecycle
+                    .seal(&mut record.channel, Phase::TransferCancelAck, p)
+                    .inspect_err(|_| {
+                        record.quarantined = true;
+                    })?;
+                Ok(RemoteApplied::Cancelled(ack))
+            }
+            Phase::TransferCancelAck => {
+                let pending = record
+                    .remote
+                    .outgoing_pending
+                    .get(&p.transfer)
+                    .ok_or_else(|| {
+                        denied("cancel ACK for accepted, cancelled or unknown pending")
+                    })?;
+                if !pending.cancelling
+                    || pending.allocation.allocation != p.allocation
+                    || pending.producer.registration() != p.producer_registration
+                    || pending.recipient != p.recipient_registration
+                {
+                    return Err(denied("cancel ACK lineage or state differs"));
+                }
+                record.table.check_external(&pending.external)?;
+                let pending = record.remote.outgoing_pending.remove(&p.transfer).unwrap();
+                // SAFETY: exact privileged peer has atomically burned the only
+                // unaccepted pending before ACK; Accept can no longer win there.
+                unsafe {
+                    record.table.release_external(pending.external)?;
+                }
+                Ok(RemoteApplied::CancellationAcknowledged)
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "wire phase is not typed registration/resource apply; native retirement proof required",
@@ -428,6 +668,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         record.remote.consumers.insert(
             consumer,
             Consumer {
+                producer,
                 allocation: prepared.allocation,
                 process: recipient.process,
             },
@@ -463,6 +704,15 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.records.get(&recipient.grant.id).unwrap();
+        if record.closing.contains_key(&(
+            consumer.allocation.allocation,
+            native::ProjectionReference::RemoteConsumer {
+                registration: recipient.process.registration(),
+                consumer: consumer.consumer,
+            },
+        )) {
+            return Err(denied("remote consumer closing or released"));
+        }
         let hold = record
             .remote
             .consumers
@@ -504,6 +754,15 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         self.process_role(lifecycle, recipient, ProcessRole::Consumer)?;
         Self::same_grant(&recipient.grant, &consumer.allocation.grant)?;
         let record = self.records.get(&recipient.grant.id).unwrap();
+        if record.closing.contains_key(&(
+            consumer.allocation.allocation,
+            native::ProjectionReference::RemoteConsumer {
+                registration: recipient.process.registration(),
+                consumer: consumer.consumer,
+            },
+        )) {
+            return Err(denied("remote consumer closing or released"));
+        }
         let hold = record
             .remote
             .consumers
