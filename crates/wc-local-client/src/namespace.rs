@@ -191,6 +191,66 @@ fn open(path: &Path, write_security: bool, directory: bool) -> io::Result<Owned>
     }
     Ok(Owned(raw))
 }
+// Each component opens relative to the already retained parent kernel handle.
+// No lexical ancestor is resolved again, so temporary-reparse/restore changes
+// cannot redirect acquisition to a different directory tree.
+fn open_child(parent: &Owned, name: &std::ffi::OsStr) -> io::Result<Owned> {
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    let name = name
+        .to_str()
+        .ok_or_else(|| deny("non-Unicode relative component"))?;
+    if name.is_empty() || name.contains(['/', '\\', ':']) {
+        return Err(deny("relative name must be one component"));
+    }
+    let mut text: Vec<u16> = name.encode_utf16().collect();
+    let bytes = u16::try_from(text.len() * 2).map_err(|_| deny("relative pathname bound"))?;
+    let unicode = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: text.as_mut_ptr(),
+    };
+    let object = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.0,
+        ObjectName: &unicode,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        ..Default::default()
+    };
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let mut raw = std::ptr::null_mut();
+    let result = unsafe {
+        NtCreateFile(
+            &mut raw,
+            READ_CONTROL | FILE_READ_ATTRIBUTES | 0x0010_0000,
+            &object,
+            &mut status,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(result) } as i32,
+        ));
+    }
+    Ok(Owned(raw))
+}
 fn attributes(object: &Owned) -> io::Result<FILE_ATTRIBUTE_TAG_INFO> {
     let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
     if unsafe {
@@ -307,9 +367,12 @@ fn validate(sd: &Sd, user: &str, strict: bool, directory: bool) -> io::Result<()
         } else if u32::from(header.AceFlags) & INHERIT_ONLY_ACE == 0
             && !trusted_ancestor(&sid, user)
         {
-            // Creating unrelated children is harmless while each path component is
-            // pinned. Altering an existing component or its security is not.
-            const MUTATE: u32 = 0x000d_0150 | 0x1000_0000 | 0x4000_0000;
+            // Handles deny write-data/delete sharing. Attributes and EAs are
+            // not covered by sharing, but cannot redirect a nonempty directory:
+            // FSCTL_SET_REPARSE_POINT refuses STATUS_DIRECTORY_NOT_EMPTY.
+            // The full chain is revalidated after every next child is pinned.
+            // Changing owner/DACL is not covered by sharing and remains fatal.
+            const MUTATE: u32 = WRITE_DAC | WRITE_OWNER | 0x1000_0000;
             if allowed.Mask & MUTATE != 0 {
                 return Err(deny("ancestor grants namespace mutation to another SID"));
             }
@@ -340,7 +403,10 @@ impl DirectoryPin {
             if matches!(component, Component::Prefix(_)) {
                 continue;
             }
-            let object = open(&current, false, true)?;
+            let object = match ancestors.last() {
+                Some(parent) => open_child(parent, component.as_os_str())?,
+                None => open(&current, false, true)?,
+            };
             let info = attributes(&object)?;
             if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
                 || info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -349,6 +415,27 @@ impl DirectoryPin {
             }
             validate(&security(&object)?, &user, current == path, true)?;
             ancestors.push(object);
+        }
+        // Every child was opened relative to its retained parent handle, so
+        // each retained parent-child identity edge is exact. Recheck tags and
+        // security after acquiring the whole chain. Every ancestor now contains
+        // its pinned next child and cannot become empty.
+        // Microsoft documents that setting a reparse point on a nonempty
+        // directory fails with STATUS_DIRECTORY_NOT_EMPTY:
+        // https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/fsctl-set-reparse-point
+        for (index, object) in ancestors.iter().enumerate() {
+            let info = attributes(object)?;
+            if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+                || info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(deny("namespace ancestry changed during acquisition"));
+            }
+            validate(
+                &security(object)?,
+                &user,
+                index + 1 == ancestors.len(),
+                true,
+            )?;
         }
         Ok(Self {
             path,
@@ -459,6 +546,238 @@ pub fn prepare(base: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn broad_modify_ancestor_cannot_replace_or_redirect_pinned_children() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        let base = std::env::var_os("WC_LOCAL_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("wc-modify-{}", std::process::id()));
+        let user = current_sid().unwrap();
+        let text = wide(&format!(
+            "O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;AU)"
+        ));
+        let mut sd = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let sd = Sd(sd);
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: 0,
+        };
+        assert_ne!(
+            unsafe { CreateDirectoryW(wide(base.to_str().unwrap()).as_ptr(), &sa) },
+            0
+        );
+        let directory = prepare(&base).unwrap();
+        let extra = |rights| {
+            let raw = unsafe {
+                CreateFileW(
+                    wide(base.to_str().unwrap()).as_ptr(),
+                    rights,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(Owned(raw))
+            }
+        };
+        for right in [FILE_WRITE_DATA, 0x0001_0000] {
+            let before = extra(right).unwrap();
+            assert!(
+                DirectoryPin::open(&directory).is_err(),
+                "preexisting write/delete handle was ignored"
+            );
+            drop(before);
+        }
+        let pin = DirectoryPin::open(&directory).unwrap();
+        assert!(extra(FILE_WRITE_DATA).is_err());
+        assert!(extra(0x0001_0000).is_err());
+        assert!(std::fs::rename(&base, base.with_extension("replaced")).is_err());
+        assert!(std::fs::remove_dir(&directory).is_err());
+        assert!(std::fs::rename(&directory, base.join("replacement-child")).is_err());
+        // Build a valid mount-point reparse buffer. Use an existing absolute
+        // directory target. A bad buffer must not masquerade as a sharing test.
+        let target = format!("\\??\\{}", base.to_str().unwrap());
+        let target: Vec<u16> = target.encode_utf16().collect();
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&0xa000_0003u32.to_le_bytes());
+        buffer.extend_from_slice(&((8 + (target.len() + 2) * 2) as u16).to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        for n in [0, target.len() * 2, (target.len() + 1) * 2, 0] {
+            buffer.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        for c in target.iter().copied().chain([0, 0]) {
+            buffer.extend_from_slice(&c.to_le_bytes());
+        }
+        let control = |handle: &Owned| {
+            let mut returned = 0;
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle.0,
+                    0x0009_00a4,
+                    buffer.as_ptr().cast(),
+                    buffer.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            (ok, io::Error::last_os_error().raw_os_error())
+        };
+        // Attribute-only handles are deliberately not assumed to be denied by
+        // sharing. Whether open succeeds or fails, no reparse redirect may work.
+        if let Ok(attributes_only) = extra(FILE_WRITE_ATTRIBUTES) {
+            let (ok, error) = control(&attributes_only);
+            assert_eq!(ok, 0, "attribute-only handle redirected pinned ancestry");
+            assert!(
+                matches!(error, Some(5 | 32 | 145)),
+                "unexpected reparse refusal: {error:?}"
+            );
+        }
+        for object in &pin._ancestors {
+            assert_eq!(
+                attributes(object).unwrap().FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT,
+                0
+            );
+        }
+        drop(pin);
+        // Positive control on an owned empty directory verifies the identical
+        // reparse buffer and native control call, then removes the junction.
+        let probe = base.join("empty-control");
+        std::fs::create_dir(&probe).unwrap();
+        let raw = unsafe {
+            CreateFileW(
+                wide(probe.to_str().unwrap()).as_ptr(),
+                0x4000_0000,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE);
+        let handle = Owned(raw);
+        assert_ne!(control(&handle).0, 0, "positive reparse control failed");
+        drop(handle);
+        std::fs::remove_dir(&probe).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
+    #[test]
+    fn relative_open_refuses_temporary_reparse_and_restore_aba() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        let base = std::env::var_os("WC_LOCAL_TEST_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("wc-aba-{}", std::process::id()));
+        let parent = base.join("parent");
+        let target = base.join("target");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(target.join("child")).unwrap();
+        // Deliberately weaken only this test handle's sharing to permit an ABA
+        // attack even where production pin sharing would already stop it.
+        let make = |rights| {
+            let raw = unsafe {
+                CreateFileW(
+                    wide(parent.to_str().unwrap()).as_ptr(),
+                    rights,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(raw, INVALID_HANDLE_VALUE);
+            Owned(raw)
+        };
+        let retained = make(READ_CONTROL | FILE_READ_ATTRIBUTES);
+        let attacker = make(0x4000_0000);
+        let nt: Vec<u16> = format!("\\??\\{}", target.display())
+            .encode_utf16()
+            .collect();
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&0xa000_0003u32.to_le_bytes());
+        buffer.extend_from_slice(&((8 + (nt.len() + 2) * 2) as u16).to_le_bytes());
+        buffer.extend_from_slice(&0u16.to_le_bytes());
+        for n in [0, nt.len() * 2, (nt.len() + 1) * 2, 0] {
+            buffer.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        for c in nt.into_iter().chain([0, 0]) {
+            buffer.extend_from_slice(&c.to_le_bytes());
+        }
+        let control = |code, bytes: &[u8]| {
+            let mut returned = 0;
+            unsafe {
+                DeviceIoControl(
+                    attacker.0,
+                    code,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        assert_ne!(
+            control(0x0009_00a4, &buffer),
+            0,
+            "test could not install temporary junction"
+        );
+        assert!(
+            parent.join("child").is_dir(),
+            "lexical positive control must follow redirect"
+        );
+        let acquired = open_child(&retained, std::ffi::OsStr::new("child"));
+        let mut delete = Vec::new();
+        delete.extend_from_slice(&0xa000_0003u32.to_le_bytes());
+        delete.extend_from_slice(&[0; 4]);
+        assert_ne!(
+            control(0x0009_00ac, &delete),
+            0,
+            "test could not restore ordinary parent"
+        );
+        assert_eq!(
+            attributes(&retained).unwrap().FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT,
+            0
+        );
+        assert!(
+            acquired.is_err(),
+            "relative acquisition followed temporary reparse before restoration"
+        );
+        assert!(!parent.join("child").exists());
+        drop(attacker);
+        drop(retained);
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::remove_dir(target.join("child")).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::remove_dir(&base).unwrap();
+    }
     #[test]
     fn private_acl_refuses_cross_sid_owner_and_untrusted_grants() {
         let user = current_sid().unwrap();

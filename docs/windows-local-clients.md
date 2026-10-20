@@ -10,7 +10,13 @@ named sections. The compositor opens those sections directly.
 `wc_transport` local socket and `wc_handle` named-section implementation. It
 adds no allocator or keeper process. Each endpoint lives in a protected full-SID directory. The adapter audits its
 owner, DACL and ancestry, rejects reparse directories, and retains directory
-and exact socket file handles that prevent replacement. The server seals the
+and exact socket file handles that prevent replacement. It opens each directory
+component relative to its retained parent with NtCreateFile and OBJ_DONT_REPARSE,
+so a temporary reparse and restoration cannot substitute another ancestry.
+Foreign grants of WRITE_DAC, WRITE_OWNER or GENERIC_ALL are refused. Other
+ancestor metadata grants rely on denied write/delete sharing and the NTFS rule
+that a nonempty directory cannot become a reparse point. Every ancestor retains
+its next child, and the adapter checks all tags and ACLs again after acquisition. The server seals the
 AF_UNIX socket to the current SID and SYSTEM before publishing readiness.
 Clients audit and pin that actual socket before connecting. Windows enforces
 socket write access on connection. This uses filesystem access control, not a
