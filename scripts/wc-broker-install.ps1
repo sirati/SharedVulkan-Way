@@ -212,7 +212,9 @@ switch ($Action) {
       $restore = Run $Exe @("broker", "revert-acl")
       if ($restore[0] -ne 0) { throw "device restoration refused: $($restore[1])" }
       Say "device: $($restore[1])"
-      if (Test-Path (Join-Path $Data "devices.txt")) { throw "device restoration incomplete; baseline retained for retry" }
+      if ((Test-Path (Join-Path $Data "devices.txt")) -or (Test-Path (Join-Path $Data "devices.secured"))) {
+        throw "device restoration incomplete; baseline or checkpoint retained for trusted recovery"
+      }
     } catch {
       $failure = $_
       if ($wasRunning) {
