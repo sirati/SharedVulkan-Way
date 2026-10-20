@@ -113,7 +113,10 @@ impl<B: OriginalBacking> RetainedGrant<B> {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProjectionAccess { ReadOnly, ReadWrite }
+pub enum ProjectionAccess {
+    ReadOnly,
+    ReadWrite,
+}
 
 /// Native projection adapter bound to an independently authenticated exact
 /// target process, or protected remote export endpoint.
@@ -294,6 +297,9 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         capacity: u64,
     ) -> io::Result<GrantId> {
         self.check_lifecycle(lifecycle)?;
+        if self.context.origin() != self.context.grantor() {
+            return Err(denied("only source-wide canonical grantor may choose original ranges"));
+        }
         let length = capacity
             .checked_add(PAGE - 1)
             .map(|n| n & !(PAGE - 1))
@@ -319,6 +325,34 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         }
         let id = self.context.next_grant()?;
         let binding = lifecycle.grant_binding(id, offset, length)?;
+        self.install(lifecycle, binding, kind, None)
+    }
+    /// Mirror ONLY an authenticated canonical peer offer. This service cannot
+    /// choose a fresh physical range or synthesize a grant from shared metadata.
+    pub fn accept_grant(&mut self, lifecycle: &mut Lifecycle<S,B>, frame: &Frame) -> io::Result<GrantId> {
+        self.check_lifecycle(lifecycle)?;
+        let binding = lifecycle.incoming_grant(frame)?;
+        if self.records.contains_key(&binding.grant) { return Err(denied("canonical peer grant ID already installed")); }
+        let offset = binding.grant_offset;
+        let length = binding.grant_length;
+        if !offset.is_multiple_of(PAGE) || !length.is_multiple_of(PAGE) {
+            return Err(denied("canonical peer grant is not page aligned"));
+        }
+        let end = offset.checked_add(length).ok_or_else(|| denied("canonical peer grant overflow"))?;
+        let i = self.free.iter().position(|r| offset >= r.offset && end <= r.offset+r.length)
+            .ok_or_else(|| denied("canonical peer grant overlaps history or protected layout"))?;
+        let run = self.free.remove(i);
+        let kind = run.kind;
+        if run.offset < offset { self.free.push(FreeRun {kind,offset:run.offset,length:offset-run.offset}); }
+        if end < run.offset+run.length { self.free.push(FreeRun {kind,offset:end,length:run.offset+run.length-end}); }
+        self.free.sort_by_key(|r|r.offset);
+        self.install(lifecycle,binding,kind,Some(frame))
+    }
+    fn install(&mut self, lifecycle: &mut Lifecycle<S,B>, binding: Binding,
+        kind: GrantKind, first_frame: Option<&Frame>) -> io::Result<GrantId> {
+        let id = binding.grant;
+        let offset = binding.grant_offset;
+        let length = binding.grant_length;
         let guard = Arc::new(RetainedGrant {
             backing: self.context.backing().clone(),
             binding: binding.clone(),
@@ -326,10 +360,16 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         });
         // SAFETY: this sole canonical owner selected disjoint physical bytes
         // after importing all durable history; guard retains full original.
-        let channel = unsafe { lifecycle.reserve_channel(binding.clone(), guard.clone())? };
+        let mut channel = unsafe { lifecycle.reserve_channel(binding.clone(), guard.clone())? };
         // Full-capacity initialization follows durable reservation. An error
         // leaves the complete physical range excluded without grant exposure.
-        guard.backing.initialize_zeroed(offset, length)?;
+        if let Some(frame) = first_frame {
+            // The canonical peer already initialized these ORIGINAL bytes.
+            // Verify/consume sequence1 after reservation, never re-zero them.
+            lifecycle.verify(&mut channel, frame)?;
+        } else {
+            guard.backing.initialize_zeroed(offset, length)?;
+        }
         let region =
             u32::try_from(id).map_err(|_| denied("canonical bookkeeping IDs exhausted"))?;
         let grant = wc_handle::barpool::Grant {
@@ -531,7 +571,13 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
                 "projection target is not the original allocation producer",
             ));
         }
-        self.project(lifecycle, allocation, producer.process, ProjectionAccess::ReadWrite, backend)
+        self.project(
+            lifecycle,
+            allocation,
+            producer.process,
+            ProjectionAccess::ReadWrite,
+            backend,
+        )
     }
     /// Project only an accepted consumer's exact retained native process.
     pub fn project_consumer<P: ProjectionBackend<B>>(
@@ -551,7 +597,13 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
         {
             return Err(denied("projection target is not this allocation consumer"));
         }
-        self.project(lifecycle, &consumer.allocation, recipient.process, ProjectionAccess::ReadOnly, backend)
+        self.project(
+            lifecycle,
+            &consumer.allocation,
+            recipient.process,
+            ProjectionAccess::ReadOnly,
+            backend,
+        )
     }
     // Any native projection error quarantines the full canonical grant because
     // exposure may be uncertain. No subsequent descriptor or mutation escapes.
@@ -586,9 +638,17 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     /// Announce only this service-owned, durable, initialized existing grant.
     /// Resource messages need typed canonical-resource adapters; callers cannot
     /// supply arbitrary allocation/transfer payloads through this owner.
-    pub fn grant_frame(&mut self, lifecycle: &Lifecycle<S,B>, grant: &GrantId) -> io::Result<Frame> {
-        self.record(lifecycle,grant)?;
-        lifecycle.seal(&mut self.records.get_mut(&grant.id).unwrap().channel, Phase::Grant, Payload::default())
+    pub fn grant_frame(
+        &mut self,
+        lifecycle: &Lifecycle<S, B>,
+        grant: &GrantId,
+    ) -> io::Result<Frame> {
+        self.record(lifecycle, grant)?;
+        lifecycle.seal(
+            &mut self.records.get_mut(&grant.id).unwrap().channel,
+            Phase::Grant,
+            Payload::default(),
+        )
     }
     /// Evidence is historical only. No resource mutation accepts it later.
     pub fn verify(
@@ -648,7 +708,9 @@ mod tests {
             // Verify ordering against the durable snapshot, not a local flag.
             let registry = Registry::open(self.1.clone(), self.0.physical, self.2).unwrap();
             assert!(registry.exclusions().contains(&(offset, length)));
-            if self.3.load(Ordering::SeqCst) { return Err(io::Error::other("partial initialization fixture failure")); }
+            if self.3.load(Ordering::SeqCst) {
+                return Err(io::Error::other("partial initialization fixture failure"));
+            }
             Ok(()) // simulated initialization, not a native memory claim
         }
     }
@@ -667,7 +729,9 @@ mod tests {
     type Life = Lifecycle<Store, Backing>;
     type Owner = ProtectedGrants<Store, Backing>;
     fn binding() -> BootstrapBinding {
-        BootstrapBinding::from(&crate::service_control::fixture().binding)
+        let mut binding = BootstrapBinding::from(&crate::service_control::fixture().binding);
+        binding.roles.grantor = Origin::Windows;
+        binding
     }
     fn physical() -> PhysicalBacking {
         let s = binding().source;
@@ -695,9 +759,16 @@ mod tests {
                 registry,
                 endpoint,
                 binding().source,
-                Arc::new(Backing(BackingGeometry {
-                    physical: physical(), arena_base: PAGE,
-                }, store, origin, AtomicBool::new(false))),
+                binding().roles.grantor,
+                Arc::new(Backing(
+                    BackingGeometry {
+                        physical: physical(),
+                        arena_base: PAGE,
+                    },
+                    store,
+                    origin,
+                    AtomicBool::new(false),
+                )),
             )
             .unwrap()
         };
@@ -784,10 +855,7 @@ mod tests {
         let stream = o.grant(&mut b, GrantKind::Stream, PAGE).unwrap();
         assert_eq!(range(&o, &output), (8 * MIB, PAGE));
         assert_eq!(range(&o, &stream), (12 * MIB, PAGE));
-        assert!(
-            o.grant_frame(&b, &ga)
-                .is_err()
-        );
+        assert!(o.grant_frame(&b, &ga).is_err());
         assert!(o.record(&a, &gb).is_err());
     }
     #[test]
@@ -882,7 +950,9 @@ mod tests {
             o.project_consumer(&life, &other, &consumer, &mut backend)
                 .is_err()
         );
-        let (_, _, access) = o.project_consumer(&life, &c, &consumer, &mut backend).unwrap();
+        let (_, _, access) = o
+            .project_consumer(&life, &c, &consumer, &mut backend)
+            .unwrap();
         assert_eq!(access, ProjectionAccess::ReadOnly);
         assert_eq!(backend.calls, 1);
         let grown = o.resize(&life, &p, &a, 2 * PAGE).unwrap();
@@ -931,10 +1001,27 @@ mod tests {
         context.backing().3.store(true, Ordering::SeqCst);
         assert!(o.grant(&mut life, GrantKind::Pixel, PAGE).is_err());
         assert!(o.records.is_empty());
-        assert_eq!(context.exclusions().unwrap(), vec![(PAGE,PAGE)]);
+        assert_eq!(context.exclusions().unwrap(), vec![(PAGE, PAGE)]);
         context.backing().3.store(false, Ordering::SeqCst);
         let next = o.grant(&mut life, GrantKind::Pixel, PAGE).unwrap();
-        assert_eq!(range(&o,&next),(2*PAGE,PAGE));
+        assert_eq!(range(&o, &next), (2 * PAGE, PAGE));
+    }
+    #[test]
+    fn peer_mirrors_only_canonical_offers_without_choosing_ranges_or_reinitializing() {
+        let (mut canonical, mut grantor, mut peer, _, peer_context, _, _, _) = setup();
+        let mut mirror = owner(&peer_context);
+        assert!(mirror.grant(&mut peer, GrantKind::Pixel, PAGE).is_err());
+        let grant = canonical.grant(&mut grantor, GrantKind::Pixel, PAGE).unwrap();
+        let offer = canonical.grant_frame(&grantor, &grant).unwrap();
+        // Re-zeroing after canonical publication could destroy live producer
+        // bytes. Mirror installation must only reserve/verify this offer.
+        peer_context.backing().3.store(true, Ordering::SeqCst);
+        let installed = mirror.accept_grant(&mut peer, &offer).unwrap();
+        assert_eq!(range(&mirror, &installed), range(&canonical, &grant));
+        assert!(mirror.accept_grant(&mut peer, &offer).is_err());
+        assert!(mirror.verify(&peer, &installed, &offer).is_err());
+        assert_eq!(peer_context.exclusions().unwrap(), vec![(PAGE,PAGE)]);
+        assert!(mirror.grant_frame(&peer, &installed).is_err());
     }
     #[test]
     fn layout_rejects_overlap_header_outside_and_unaligned_ranges() {
