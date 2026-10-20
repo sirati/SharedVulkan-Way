@@ -169,15 +169,30 @@
      if (ret < 0) {
          int saved_errno = errno;
          if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
-@@ -1770,7 +1773,7 @@
+@@ -1770,9 +1773,12 @@
  
          if (liov.iov_len == 0) continue;
          uint64_t avail = 0;
 -        void *src = guest_ptr_avail(g, liov.iov_base, &avail);
-+        void *src = guest_ptr_range_access(g, liov.iov_base, liov.iov_len, &avail, 0);
++        uint64_t request = liov.iov_len;
++        if (total >= UINT64_C(0x7ffff000)) break;
++        if (request > UINT64_C(0x7ffff000) - total) request = UINT64_C(0x7ffff000) - total;
++        void *src = guest_ptr_range_access(g, liov.iov_base, request, &avail, 0);
          if (!src) return total > 0 ? (int64_t)total : -LINUX_EFAULT;
-         uint64_t len = liov.iov_len;
+-        uint64_t len = liov.iov_len;
++        uint64_t len = request;
          if (len > avail) len = avail;
+ 
+         ssize_t w = hl_wc_write(host_fd, src, len);
+@@ -1781,7 +1787,7 @@
+             return total > 0 ? (int64_t)total : linux_errno();
+         }
+         total += w;
+-        if ((uint64_t)w < len) break;
++        if ((uint64_t)w < len || len < liov.iov_len) break;
+     }
+ 
+     return (int64_t)total;
 --- a/src/syscall_net.c
 +++ b/src/syscall_net.c
 @@ -1,3 +1,4 @@
