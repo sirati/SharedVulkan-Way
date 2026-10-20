@@ -37651,11 +37651,22 @@ generation with `services.waycompose`. For each installation it does this:
   beneath the system layout, with its current trusted key. It keeps the
   system services, user mapping and broker protection. It never restores
   admin user units, desktop raw-resource ACLs or an exposed old key. A
-  missing protected snapshot refuses rollback. The first protected install
-  creates its initial snapshot, and later deploys snapshot the prior
-  protected installation. Rollback requires idle admin and mapped-user
-  session managers; it restores installation apps, configuration and bins,
-  while keeping shared service binaries and the mapping unchanged.
+  missing confirmed snapshot refuses rollback. First migration preserves
+  the original `wc-launch` profile renderer and `libsv_wlshim.so` presentation
+  library while upgrading the broker-dependent launcher script, proxy, ICD
+  and transport services. The pre-broker installation is kept under
+  `legacy-original` as recovery history, not executable rollback.
+
+  Run a real mapped-user product session successfully, end it, then invoke
+  `wc-users-migrate.sh baseline-confirm ADMIN DESKTOP unused INSTALL`.
+  This explicit operator confirmation snapshots that tested protected
+  installation. It does not run the product test itself. Replacing an
+  installation requires a confirmed baseline; deployments never overwrite it
+  automatically. Confirm a later candidate only after its own successful
+  product session. Rollback restores the accepted application's configuration
+  and binaries, including its known-working broker-aware transport baseline,
+  with the current trusted key. Shared services and user mapping stay in place.
+  Both confirmation and rollback require idle admin and mapped-user sessions.
 
 The earlier legacy-layout dry run does not establish protected rollback.
 The current fixture checks protected snapshot restoration, key rotation,
