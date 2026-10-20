@@ -216,8 +216,10 @@ mod win_client {
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
-    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    };
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
     /// A handle the broker put into this process, from its value in a reply.
@@ -251,7 +253,7 @@ mod win_client {
                 let h = unsafe {
                     CreateFileW(
                         w.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
+                        GENERIC_READ | FILE_WRITE_DATA,
                         0,
                         std::ptr::null(),
                         OPEN_EXISTING,

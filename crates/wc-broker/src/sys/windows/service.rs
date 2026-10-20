@@ -9,7 +9,7 @@
 //! sv-guest broker holder-quit        tell the holder to let go of everything and exit
 //!
 //!   --pipe NAME          the pipe (\\.\pipe\waycompose-broker)
-//!   --pipe-sddl SDDL     who may connect (PIPE_SDDL: SYSTEM, Administrators, interactive users)
+//!   --pipe-sddl SDDL     who may connect (PIPE_SDDL: SYSTEM, Administrators, authenticated users)
 //!   --device NAME=LOC    a device to lend, LOC is ivshmem:SLOT, port:NAME or path:PATH;
 //!                        repeated; without any, the four of a waycompose guest
 //!   --keys DIR           the installations' keys (C:\ProgramData\waycompose\keys)

@@ -31,12 +31,10 @@ fn start(d: &std::path::Path, tag: &str) -> String {
     std::fs::create_dir_all(&keys).unwrap();
     std::fs::write(keys.join("wcivs.key"), "07".repeat(32)).unwrap();
     let pipe = format!(r"\\.\pipe\wc-broker-test-{tag}-{}", std::process::id());
-    // The test runs as an ordinary user, who is not in IU under Wine or a
-    // batch logon: the pipe admits the creator's own account here.
-    let sddl = PIPE_SDDL.replace("(A;;0x0012008b;;;IU)", "(A;;0x0012008b;;;IU)(A;;0x0012008b;;;OW)(A;;0x0012008b;;;AU)");
+    let sddl = PIPE_SDDL;
     let w = Windows::bind(
         &pipe,
-        &sddl,
+        sddl,
         vec![DeviceAt { name: "dev".into(), loc: DeviceLoc::Path(d.join("dev").to_string_lossy().into_owned()) }],
     )
     .unwrap();
@@ -325,13 +323,13 @@ fn holder_main() {
 fn broker_main() {
     let Ok(pipe) = std::env::var("WC_BROKER_TEST_BROKER_PIPE") else { return };
     let hpipe = std::env::var("WC_BROKER_TEST_HOLDER_PIPE").unwrap();
-    let sddl = PIPE_SDDL.replace("(A;;0x0012008b;;;IU)", "(A;;0x0012008b;;;IU)(A;;0x0012008b;;;OW)(A;;0x0012008b;;;AU)");
+    let sddl = PIPE_SDDL;
     let spawn = wc_broker::sys::windows::holder::Spawn {
         exe: std::env::current_exe().unwrap(),
         args: vec!["--exact".into(), "holder_main".into(), "--nocapture".into(), "--test-threads=1".into()],
         env: vec![("WC_BROKER_TEST_HOLDER_PIPE".into(), hpipe.clone())],
     };
-    let w = Windows::bind(&pipe, &sddl, Vec::new()).unwrap().with_holder(&hpipe, spawn).unwrap();
+    let w = Windows::bind(&pipe, sddl, Vec::new()).unwrap().with_holder(&hpipe, spawn).unwrap();
     println!("HOLDER {}", w.holder_pid().unwrap());
     let _ = std::io::stdout().flush();
     let b = Broker::new(

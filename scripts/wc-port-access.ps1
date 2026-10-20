@@ -1,4 +1,9 @@
 <#
+  SUPERSEDED by the broker service (sv-guest broker, waycompose-design.md
+  §111.8): it sets these ports, and the ivshmem devices, to SYSTEM and
+  Administrators only and opens them for the user's processes. This script is
+  what WC_LAUNCH_BROKER=skip still runs.
+
   wc-port-access.ps1 -- let ONE user's medium-integrity processes open the two
   virtio-serial ports waycompose rings: org.sirati.wcbell.0 (the Wayland rings'
   doorbell, waycompose-design.md §89) and org.sirati.svbell.0 (the GPU sessions'

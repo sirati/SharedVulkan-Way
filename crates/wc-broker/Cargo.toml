@@ -35,3 +35,7 @@ windows-sys = { workspace = true, features = [
   "Win32_System_Services",
   "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The tests and examples/broker-probe.rs map sections and open ports.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading", "Win32_Storage_FileSystem"] }

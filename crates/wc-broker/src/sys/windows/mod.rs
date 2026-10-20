@@ -42,12 +42,18 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEONLYONCE,
 };
 
-/// Who may connect: SYSTEM and Administrators fully, interactive users with
-/// read and `FILE_WRITE_DATA` only (0x12019b would include
-/// `FILE_CREATE_PIPE_INSTANCE`, which would let a user make an instance of
-/// the broker's pipe and answer in its place). What each may then *have* is
-/// decided per request, by SID.
-pub const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012008b;;;IU)";
+/// Who may connect: SYSTEM and Administrators fully, every authenticated
+/// local user with `0x12019b`: read, `FILE_WRITE_DATA` and the write of
+/// attributes, but not `FILE_APPEND_DATA`, which on a pipe is
+/// `FILE_CREATE_PIPE_INSTANCE` and would let a user make an instance of the
+/// broker's pipe and answer in its place (so a client opens with
+/// `GENERIC_READ | FILE_WRITE_DATA`, not `GENERIC_WRITE`). Authenticated
+/// users, not only interactive ones: a process the task scheduler or a
+/// service starts for a user carries a batch or service logon, and it is
+/// that user's all the same. Remote clients are refused by
+/// `PIPE_REJECT_REMOTE_CLIENTS`. What each may then *have* is decided per
+/// request, by SID.
+pub const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)";
 
 /// What a device the broker lends is, on this machine.
 #[derive(Clone, Debug, PartialEq, Eq)]

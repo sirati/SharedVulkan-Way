@@ -35090,7 +35090,168 @@ trusted party; no new cryptography.
 
 ### 111.8 Windows
 
-(Written by the Windows half's branch.)
+Written 2026-10-20, branch `broker-win`. The code is
+`crates/wc-broker/src/sys/windows/` (the platform half, the service, the
+holder, the devices' security), the Windows `Client` in `client.rs`,
+`sv-guest broker`, and `scripts/wc-broker-install.ps1` run by
+`scripts/wc-launch.sh deploy`.
+
+**The service.** `sv-guest broker` runs under the service control manager as
+`waycompose-broker`, `LocalSystem`, automatic start, restarted 1 s, 5 s and
+30 s after a failure. Its binary is `C:\Program Files\waycompose\sv-guest.exe`,
+which users may read and run but not write: a SYSTEM service that ran a file
+its user could replace would hand that user SYSTEM. `--console` runs the same
+code in a console, for tests. Its log is `C:\ProgramData\waycompose\broker.log`.
+
+**The pipe.** `\\.\pipe\waycompose-broker`, `PIPE_REJECT_REMOTE_CLIENTS`, the
+first instance made with `FILE_FLAG_FIRST_PIPE_INSTANCE` (so whoever made the
+name first makes the broker fail to start, instead of sharing it). The
+descriptor gives SYSTEM and Administrators everything and authenticated users
+`0x12019b`: read, `FILE_WRITE_DATA`, attributes, but not
+`FILE_APPEND_DATA`, which on a pipe is `FILE_CREATE_PIPE_INSTANCE` and would let
+a user answer in the broker's place. A client therefore opens it with
+`GENERIC_READ | FILE_WRITE_DATA` and identification-level impersonation only.
+The first build granted `0x12008b` (no write at all) and its client asked for
+`GENERIC_WRITE`; Wine enforced neither, the test VM refused every user. Every
+authenticated user, not only `INTERACTIVE`, because a process the task
+scheduler or a service starts for a user carries a batch or service logon and
+is that user's all the same.
+
+**Who asks.** Per connection: `GetNamedPipeClientProcessId`; the user SID of
+the client's token by `ImpersonateNamedPipeClient`, `OpenThreadToken`
+(as self) and `RevertToSelf` (a thread that cannot revert ends the process);
+then `OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE |
+PROCESS_QUERY_LIMITED_INFORMATION)` on that pid and the process's own token
+must name the same SID, so a pid reused between the two is refused. The user
+is `sid:S-1-5-21-…`. Only SYSTEM (`S-1-5-18`) is an admin: an administrator's
+process is one more user here, and was refused the arena while u1 held it.
+
+**Liveness.** The process handle opened at connect, waited on by the thread
+pool (`RegisterWaitForSingleObject`, once). Every connection of one process
+shares that handle; the exit is told to the core once per watch, and the wait
+is unregistered outside its own callback.
+
+**Handles.** `DuplicateHandle` into the client's process, values in the
+reply. A device is moved (`DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE`):
+the broker keeps no handle, so the ivshmem driver's release and vioser's
+close run in the holder's process exactly as when it opened the device
+itself. A region is copied (`DUPLICATE_SAME_ACCESS`). If the reply cannot be
+written, the handles just put into the client are closed there again.
+
+**Devices.** `arena` = ivshmem in PCI slot 0x1c, `gpu` = slot 0x1d,
+`wcbell` and `svbell` = the virtio-serial ports by name (`--device
+NAME=ivshmem:SLOT|port:NAME|path:PATH` changes them; `path:` is a stand-in
+for tests). The open is the code the processes used before, split in two:
+`wc_handle::open_ivshmem_slot` + `map_ivshmem_device` (what
+`map_ivshmem_slot` now is), and `sv_transport::winpipe::open_virtio_port_handle`
++ `Pipe::from_port_handle` (what `open_virtio_port` now is). The broker
+calls the first half, the compositor or GPU process the second, so the
+mapping and the port I/O are the same code as before the broker.
+
+**The devices' security, which replaces `wc-port-access.ps1` (§91).** At
+every start the broker gives the four devices `D:P(A;;FA;;;SY)(A;;FA;;;BA)`,
+as the PnP security property (applied at every device start, with nothing of
+ours running) and on the live device object, finding the ports by name as the
+script did. It re-enables a recorded port left disabled (§99.6). What each
+device had before is kept in `C:\ProgramData\waycompose\devices.txt` for
+`sv-guest broker revert-acl`. The baseline on the test VM is worth stating:
+the Looking Glass B7 ivshmem driver leaves its devices
+`(A;;0x1201bf;;;WD)`, read and write for Everyone, and an ordinary user's
+process mapped the GPU device directly before the broker (`direct-opened`,
+`bw ... 4.97 GiB/s` as u1). After it, the same open is access denied. A port
+another process holds cannot be opened to change its descriptor (vioser is
+exclusive); it keeps its live descriptor until it is free, and the property
+takes over at its next start.
+
+**Regions.** Unnamed pagefile sections (`CreateFileMappingW` with no name,
+`SEC_COMMIT`), so no other process can open one by name; `large` adds
+`SEC_LARGE_PAGES` when the broker holds `SeLockMemoryPrivilege` (SYSTEM does)
+and the length is a whole number of large pages, and is refused otherwise.
+The region-init hook (`Windows::with_region_init`) is where §108.8's stamp
+plugs in: `Fn(&mut [u8], region id, page size) -> io::Result<Option<String>>`,
+called once on each new region with the whole region mapped into the broker
+for the call only; the word it returns ends the `ok region` reply (the
+nonce), an error refuses the alloc. The windows-guest-ram keeper's protocol
+maps onto the broker's: `hello POOL` is `hello` + `adopt POOL`, `alloc` and
+`free` are the same, and pools are per SID by construction.
+
+**The holder.** Proposed from the windows-guest-ram side and adopted: the
+broker starts `sv-guest broker holder`, a second SYSTEM process that holds a
+`DuplicateHandle` copy of every region and does nothing else (it never maps
+one). Its pipe, `\\.\pipe\waycompose-broker-holder`, admits SYSTEM and its
+owner; the broker checks that the holder's process runs as its own account.
+`add`, `del`, `list` and `quit` are its protocol. A restarted broker lists
+the holder's regions, duplicates each back out, and serves it as an orphan of
+its user's pool under its old id (`Core::restore_orphan`). A holder that
+died is started again and given every region. So a region the host still
+maps is lost only if the broker, the holder and every provider die together;
+before the holder, the broker's crash while the provider was down was enough.
+An orderly stop of the service leaves the holder running (an upgrade keeps
+the regions); `sv-guest broker holder-quit` ends it, which uninstall does.
+
+**Signing (§111.6).** `Platform::identity` is `os=windows
+user=<LookupAccountSidW name, %XX-escaped to one word> id=<SID>`. The keys are
+`C:\ProgramData\waycompose\keys\<install>.key`, SYSTEM and Administrators
+only. The compositor's boot path asks the broker (`Client::sign`) and
+publishes with `macboot::publish_identity`; without a broker it signs from
+the installation's key file as before, with one log line. `wc-launch` no
+longer refuses to start when the user's key file is gone (deploy moves it).
+The host's sessiond verifies with `verifies_identity` when the identity area
+is present, refuses one that does not parse, and hands the identity on in its
+`Request` for 111.10.
+
+**Integration.** The compositor asks for `arena` (its `--arena-ivshmem`
+device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
+`svbell`, each over one connection per process kept for the process's life
+(`client::process_client`). A missing or refusing broker gives one line,
+`[wc-broker] device NAME: not from the broker (WHY); opening it directly`,
+and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
+device.
+
+**Measured**, on a local test VM (QEMU 10.2.2 as testhost, 3 GiB, 4 vCPUs,
+a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
+driver), two local non-admin users u1 and u2 run through the task scheduler;
+evidence in `/mnt/datasets/builds/evidence/session-fixes/broker-win/`:
+
+| what | result |
+|---|---|
+| u1 asks for `arena`, maps the 64 MiB BAR | lent in 1.2 ms (process start excluded), mapped 67108864 |
+| u2 asks for `arena` while u1 holds it | `device arena is held by another user's process` |
+| u2 opens the arena, or `wcbell`, directly | access denied (error 5) |
+| u2 `OpenProcess(PROCESS_DUP_HANDLE)` on u1's region holder | access denied |
+| u2 `open` of u1's region by id; `adopt gpu` | `region 1 is another user's`; 0 adopted |
+| `taskkill /F` of u1's holder | arena lent again 69 ms after taskkill started (taskkill itself 47 ms; one attempt) |
+| u2 after that | lent and mapped |
+| `sign` as u1 and as u2 | `os=windows user=u1 id=…-1001` and `user=u2 id=…-1002`; MAC verifies for its own identity, not for a rewritten one, not with it removed |
+| control RTT (`stats`, u1, 5000) | mean 101 µs, p50 70 µs, p99 911 µs |
+| `alloc` of a 2 MiB region | 207 µs |
+| `sign` | 0.4 to 0.6 ms (reads the key file) |
+| write+read through the GPU BAR, 5 runs each | lent: median 14.1 GiB/s; opened directly: 13.2 GiB/s (the same mapping code; the spread, 9.9 to 17.6, is the VM's) |
+| a port lent | ~101 ms, all of it vioser's: a raw `CreateFileW` on the port takes ~100 ms, and so does its `CloseHandle`, with no Rust code involved (`portopen.ps1`) |
+| u1's process ends with a region of pool `keep`; the service process is killed (`taskkill /F`) | the service manager restarted it, serving 1.6 s after the kill; the holder had kept the region; u2 adopted 0, u1 adopted it and read back what it wrote |
+| `wc-launch.sh broker-uninstall`'s script | service deleted, holder ended, the four devices' PnP property removed and live descriptors restored to the driver's |
+
+So the broker adds one request per device per process start (well under the
+0.2 ms bar of §105 at the median), nothing per frame, and the data path is
+the same code and speed. Under Wine (`tests/windows.rs`, own `WINEPREFIX`, 8
+tests): a stand-in device moved into a child, refused to the parent, free
+0.14 ms after the child was killed; a section mapped in two processes; an
+orphan adopted; `sign`; the holder restoring a region after the broker was
+killed and again after the holder was killed; RTT mean 41 µs, p99 59 µs.
+
+**Deploy.** `scripts/wc-launch.sh deploy` (default `WC_LAUNCH_BROKER=install`)
+runs `wc-broker-install.ps1 -Action install` over its administrator channel:
+Program Files, the service, failure actions, the §91 task and its files
+removed, the service started. Then `-Action key -Install NAME` with the
+installation's key on stdin, and the user's `session.key` is deleted.
+`WC_LAUNCH_BROKER=skip` is the pre-§111 deploy. `wc-launch.sh broker-show`
+and `broker-uninstall` (service deleted, devices' descriptors restored,
+holder ended, keys kept).
+
+**What remains.** Running the compositor and the GPU process on the VM under
+the broker end to end (the probe exercises the same calls, not the products);
+the stamping hook's implementation (windows-guest-ram's); a testhost run
+(not touched here).
 
 ### 111.9 macOS
 
