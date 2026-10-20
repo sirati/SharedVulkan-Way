@@ -183,6 +183,8 @@ pub struct GpuServer {
     #[cfg(target_os = "macos")]
     pub(crate) native_queue_worker: bool,
     #[cfg(target_os = "macos")]
+    pub(crate) native_record_replay: Option<(u64, u64)>,
+    #[cfg(target_os = "macos")]
     pub(crate) native_fatal: Option<crate::native_queue::Fatal>,
     pub shared: std::sync::Arc<Shared>,
     /// The last table failure, so the ring can put a real diagnosis in
@@ -274,6 +276,8 @@ impl GpuServer {
         GpuServer {
             #[cfg(target_os = "macos")]
             native_queue_worker: false,
+            #[cfg(target_os = "macos")]
+            native_record_replay: None,
             #[cfg(target_os = "macos")]
             native_fatal: None,
             shared,
@@ -500,6 +504,11 @@ impl GpuHost for GpuServer {
     fn override_wait_semaphores(&mut self,a:&p::VkWaitSemaphoresArgs)->Option<WireResult<p::VkWaitSemaphoresReply>> {self.native_wait_semaphores(a)}
 
     #[cfg(target_os = "macos")]
+    fn capture_recorded_commands(&self, wire: u64) -> bool { self.native_captures_recorded_commands(wire) }
+    #[cfg(target_os = "macos")]
+    fn capture_recorded_command(&mut self, call: sv_gpu_entry::RecordedCall) -> WireResult<()> { self.native_capture_recorded_command(call) }
+
+    #[cfg(target_os = "macos")]
     fn prepare_recorded_command(&mut self,name:&'static str,wire:u64)->WireResult<()> {self.native_prepare_recorded_command(name,wire)}
 
     #[cfg(target_os = "macos")]
@@ -586,6 +595,12 @@ impl GpuHost for GpuServer {
     }
 
     fn map_handle(&mut self, ty: HandleType, id: u64) -> WireResult<u64> {
+        #[cfg(target_os = "macos")]
+        if ty == HandleType::VkCommandBuffer {
+            if let Some((wire, native)) = self.native_record_replay {
+                if id == wire { return Ok(native); }
+            }
+        }
         if id == 0 {
             return Ok(0);
         }

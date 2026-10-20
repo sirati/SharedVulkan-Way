@@ -1,8 +1,8 @@
-//! macOS recording hooks. Original owned wire barriers are delayed until the
-//! recording is known to be ordinary, or retained in an immutable video plan.
+//! macOS recording hooks. Original owned wire calls replay at ordinary End or
+//! remain in an immutable mixed plan for private native-segment preparation.
 use crate::{
     server::GpuServer,
-    video_recording::{Barrier, BarrierAction, End},
+    video_recording::{Barrier, BarrierAction, End, Step},
 };
 use ash::vk;
 use std::sync::Arc;
@@ -43,8 +43,57 @@ impl GpuServer {
         self.last_error = Some(why.into());
         Err(sv_wire::WireError::UnknownCommand { opcode: 0 })
     }
+    pub(crate) fn native_captures_recorded_commands(&self, wire: u64) -> bool {
+        self.native_recording_enabled()
+            && self
+                .shared
+                .native_video
+                .lock()
+                .unwrap()
+                .plans
+                .captures_native(wire)
+    }
+    pub(crate) fn native_capture_recorded_command(
+        &mut self,
+        call: sv_gpu_entry::RecordedCall,
+    ) -> Result<()> {
+        let wire = call.command_buffer();
+        if !call.available(&self.shared.fns) {
+            return self.recording_error(wire, "captured command has no native implementation");
+        }
+        let result = self.shared.native_video.lock().unwrap().plans.native(call);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => self.recording_error(wire, error.0),
+        }
+    }
+    fn replay_steps(&mut self, wire: u64, steps: Vec<Step>) -> Result<()> {
+        for step in steps {
+            match step {
+                Step::Barrier(barrier) => self.replay_barriers(wire, vec![barrier])?,
+                Step::Native(call) => {
+                    let call = Arc::try_unwrap(call).unwrap_or_else(|call| (*call).clone());
+                    self.replay_recording(|f| call.replay(f))?;
+                }
+                Step::Decode(_) => {
+                    return self.recording_error(wire, "decode in ordinary native replay");
+                }
+            }
+        }
+        Ok(())
+    }
     fn replay_barriers(&mut self, wire: u64, barriers: Vec<Barrier>) -> Result<()> {
         for barrier in barriers {
+            let lowered = {
+                let objects = self.shared.objects();
+                crate::video_recording::lower(&barrier, |wire| {
+                    objects.native_video.images.contains_key(&wire)
+                })
+            };
+            let barrier = match lowered {
+                Ok(value) => value,
+                Err(error) => return self.recording_error(wire, error.0),
+            };
             let result = match barrier {
                 Barrier::Legacy(args) => self.replay_recording(|f| f.cmd_pipeline_barrier(args)),
                 Barrier::Sync2(args) => self.replay_recording(|f| f.cmd_pipeline_barrier2(args)),
@@ -61,7 +110,7 @@ impl GpuServer {
     }
     pub(crate) fn native_prepare_recorded_command(
         &mut self,
-        _name: &'static str,
+        name: &'static str,
         wire: u64,
     ) -> Result<()> {
         if !self.native_recording_enabled() {
@@ -72,6 +121,7 @@ impl GpuServer {
             if !state.plans.contains(wire) {
                 return Ok(());
             }
+            state.plans.note_ordinary_command(wire, name);
             state.plans.prepare_ordinary(wire)
         };
         match barriers {
@@ -163,7 +213,7 @@ impl GpuServer {
             .plans
             .end(a.command_buffer.0);
         let prepared = match ended {
-            Ok(End::Ordinary(barriers)) => self.replay_barriers(a.command_buffer.0, barriers),
+            Ok(End::Ordinary(steps)) => self.replay_steps(a.command_buffer.0, steps),
             Ok(End::Video(_)) => Ok(()),
             Err(error) => self.recording_error(a.command_buffer.0, error.0),
         };
@@ -291,10 +341,10 @@ impl GpuServer {
             return None;
         }
         let state = self.shared.native_video.lock().unwrap();
-        let unsupported = state.plans.is_video(a.command_buffer.0)
-            || a.p_command_buffers
-                .iter()
-                .any(|cb| state.plans.is_video(cb.0));
+        let unsupported = a
+            .p_command_buffers
+            .iter()
+            .any(|cb| state.plans.is_video(cb.0));
         drop(state);
         if unsupported {
             Some(self.recording_error(

@@ -1,5 +1,5 @@
-//! Owned wire recordings. Parent replays ordinary barriers before forwarding
-//! the first ordinary command, and lowers video barriers only at submission.
+//! Owned primary wire recordings. Ordinary commands replay once at End; mixed
+//! plans retain immutable calls and split native recording only at decode cuts.
 use crate::native_video::Decode;
 use ash::vk;
 use std::{collections::HashMap, sync::Arc};
@@ -21,6 +21,7 @@ impl Barrier {
 pub enum Step {
     Barrier(Barrier),
     Decode(Decode),
+    Native(Arc<sv_gpu_entry::RecordedCall>),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rejected(pub &'static str);
@@ -31,6 +32,131 @@ enum Mode {
     Ordinary,
     Video,
 }
+#[derive(Default)]
+struct NativeScope {
+    render: Option<u8>,
+    queries: u32,
+    conditional: bool,
+    feedback: bool,
+    unknown_state: bool,
+    events: bool,
+}
+impl NativeScope {
+    fn closed(&self) -> bool {
+        self.render.is_none() && self.queries == 0 && !self.conditional && !self.feedback
+    }
+    fn apply(&mut self, call: &sv_gpu_entry::RecordedCall) -> Result<()> {
+        let name = call.name();
+        let managed = match name {
+            "vkCmdBeginRenderPass" | "vkCmdBeginRenderPass2" => {
+                if self.render.replace(1).is_some() {
+                    return Err(Rejected("nested native rendering scope"));
+                }
+                true
+            }
+            "vkCmdBeginRendering" => {
+                if self.render.replace(2).is_some() {
+                    return Err(Rejected("nested native rendering scope"));
+                }
+                true
+            }
+            "vkCmdEndRenderPass" | "vkCmdEndRenderPass2" => {
+                if self.render.take() != Some(1) {
+                    return Err(Rejected("unmatched native render pass end"));
+                }
+                true
+            }
+            "vkCmdEndRendering" => {
+                if self.render.take() != Some(2) {
+                    return Err(Rejected("unmatched dynamic rendering end"));
+                }
+                true
+            }
+            "vkCmdNextSubpass" | "vkCmdNextSubpass2" => {
+                if self.render != Some(1) {
+                    return Err(Rejected("subpass outside native render pass"));
+                }
+                true
+            }
+            "vkCmdBeginQuery" | "vkCmdBeginQueryIndexedEXT" => {
+                self.queries = self
+                    .queries
+                    .checked_add(1)
+                    .ok_or(Rejected("query nesting overflow"))?;
+                true
+            }
+            "vkCmdEndQuery" | "vkCmdEndQueryIndexedEXT" => {
+                self.queries = self
+                    .queries
+                    .checked_sub(1)
+                    .ok_or(Rejected("unmatched native query end"))?;
+                true
+            }
+            "vkCmdBeginConditionalRenderingEXT" => {
+                self.conditional = true;
+                true
+            }
+            "vkCmdEndConditionalRenderingEXT" => {
+                self.conditional = false;
+                true
+            }
+            "vkCmdBeginTransformFeedbackEXT" => {
+                self.feedback = true;
+                true
+            }
+            "vkCmdEndTransformFeedbackEXT" => {
+                self.feedback = false;
+                true
+            }
+            // Labels legally span CB and submit boundaries and have no native
+            // graphics state that must be reconstructed at a decode cut.
+            "vkCmdBeginDebugUtilsLabelEXT"
+            | "vkCmdEndDebugUtilsLabelEXT"
+            | "vkCmdInsertDebugUtilsLabelEXT"
+            | "vkCmdDebugMarkerBeginEXT"
+            | "vkCmdDebugMarkerEndEXT"
+            | "vkCmdDebugMarkerInsertEXT" => true,
+            _ => false,
+        };
+        if !managed
+            && matches!(
+                call.restoration(),
+                sv_gpu_entry::RecordedRestoration::UnsupportedState
+            )
+        {
+            self.unknown_state = true;
+        }
+        if matches!(
+            name,
+            "vkCmdSetEvent"
+                | "vkCmdResetEvent"
+                | "vkCmdWaitEvents"
+                | "vkCmdSetEvent2"
+                | "vkCmdResetEvent2"
+                | "vkCmdWaitEvents2"
+        ) {
+            // Typed event provenance lowering is the next staging increment.
+            self.events = true;
+        }
+        Ok(())
+    }
+    fn cut(&self) -> Result<()> {
+        if !self.closed() {
+            return Err(Rejected(
+                "external decode would split an active native scope",
+            ));
+        }
+        if self.unknown_state {
+            return Err(Rejected("native state restoration is not audited"));
+        }
+        if self.events {
+            return Err(Rejected(
+                "native event provenance lowering is not implemented",
+            ));
+        }
+        Ok(())
+    }
+}
 struct Recording {
     mode: Mode,
     scope: bool,
@@ -38,6 +164,7 @@ struct Recording {
     poison: Option<&'static str>,
     steps: Vec<Step>,
     finished: Option<Arc<[Step]>>,
+    native: NativeScope,
 }
 impl Default for Recording {
     fn default() -> Self {
@@ -48,11 +175,12 @@ impl Default for Recording {
             poison: None,
             steps: vec![],
             finished: None,
+            native: NativeScope::default(),
         }
     }
 }
 pub enum End {
-    Ordinary(Vec<Barrier>),
+    Ordinary(Vec<Step>),
     Video(Arc<[Step]>),
 }
 pub enum BarrierAction {
@@ -150,6 +278,47 @@ impl Plans {
     pub fn poisoned(&self, wire: u64) -> Option<&'static str> {
         self.buffers.get(&wire).and_then(|r| r.poison)
     }
+    pub fn note_ordinary_command(&mut self, wire: u64, name: &str) {
+        if matches!(
+            name,
+            "vkCmdSetEvent"
+                | "vkCmdResetEvent"
+                | "vkCmdWaitEvents"
+                | "vkCmdSetEvent2"
+                | "vkCmdResetEvent2"
+                | "vkCmdWaitEvents2"
+        ) {
+            if let Some(r) = self.buffers.get_mut(&wire) {
+                r.native.events = true;
+            }
+        }
+    }
+    pub fn has_events(&self, wire: u64) -> bool {
+        self.buffers.get(&wire).is_some_and(|r| r.native.events)
+    }
+    pub fn captures_native(&self, wire: u64) -> bool {
+        self.buffers
+            .get(&wire)
+            .is_some_and(|r| r.mode != Mode::Ordinary && !r.ended && r.poison.is_none())
+    }
+    pub fn native(&mut self, call: sv_gpu_entry::RecordedCall) -> Result<()> {
+        let secondary_events = if let sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(args) = &call
+        {
+            args.p_command_buffers
+                .iter()
+                .any(|cb| self.has_events(cb.0))
+        } else {
+            false
+        };
+        let r = self.recording(call.command_buffer())?;
+        r.native.events |= secondary_events;
+        if r.scope && !call.allowed_in_video_scope() {
+            return Err(Rejected("native command is not permitted in a video scope"));
+        }
+        r.native.apply(&call)?;
+        r.steps.push(Step::Native(Arc::new(call)));
+        Ok(())
+    }
     pub fn barrier(&mut self, barrier: Barrier) -> Result<BarrierAction> {
         let r = self.recording(barrier.command())?;
         if r.mode == Mode::Ordinary {
@@ -166,12 +335,16 @@ impl Plans {
             r.poison = Some("ordinary command mixed with synthetic video");
             return Err(Rejected(r.poison.unwrap()));
         }
+        if r.steps.iter().any(|s| matches!(s, Step::Native(_))) {
+            r.poison = Some("uncaptured command cannot discard owned native recording");
+            return Err(Rejected(r.poison.unwrap()));
+        }
         r.mode = Mode::Ordinary;
         Ok(r.steps
             .drain(..)
             .map(|s| match s {
                 Step::Barrier(b) => b,
-                Step::Decode(_) => unreachable!(),
+                Step::Decode(_) | Step::Native(_) => unreachable!(),
             })
             .collect())
     }
@@ -181,6 +354,7 @@ impl Plans {
             r.poison = Some("video coding scope mixed with ordinary recording");
             return Err(Rejected(r.poison.unwrap()));
         }
+        r.native.cut()?;
         r.mode = Mode::Video;
         r.scope = true;
         Ok(())
@@ -191,6 +365,7 @@ impl Plans {
             r.poison = Some("decode outside video coding scope");
             return Err(Rejected(r.poison.unwrap()));
         }
+        r.native.cut()?;
         r.steps.push(Step::Decode(decode));
         Ok(())
     }
@@ -209,21 +384,20 @@ impl Plans {
             r.poison = Some("command buffer ended inside video coding scope");
             return Err(Rejected(r.poison.unwrap()));
         }
+        if !r.native.closed() {
+            return Err(Rejected("command buffer ended inside native scope"));
+        }
+        if r.mode == Mode::Video && r.native.events {
+            r.poison = Some("native event provenance lowering is not implemented");
+            return Err(Rejected(r.poison.unwrap()));
+        }
         r.ended = true;
         if r.mode == Mode::Video {
             let steps: Arc<[Step]> = std::mem::take(&mut r.steps).into();
             r.finished = Some(steps.clone());
             Ok(End::Video(steps))
         } else {
-            Ok(End::Ordinary(
-                r.steps
-                    .drain(..)
-                    .map(|s| match s {
-                        Step::Barrier(b) => b,
-                        Step::Decode(_) => unreachable!(),
-                    })
-                    .collect(),
-            ))
+            Ok(End::Ordinary(std::mem::take(&mut r.steps)))
         }
     }
     pub fn video(&self, wire: u64) -> Result<Option<Arc<[Step]>>> {
@@ -427,6 +601,112 @@ mod tests {
         }
     }
     #[test]
+    fn native_scope_after_video_closes_before_next_decode_boundary() {
+        let mut plans = Plans::default();
+        plans.begin(7).unwrap();
+        plans.begin_scope(7).unwrap();
+        plans.end_scope(7).unwrap();
+        let mut begin = p::VkCmdBeginRenderingArgs::default();
+        begin.command_buffer = p::VkCommandBuffer(7);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdBeginRendering(Box::new(
+                begin,
+            )))
+            .unwrap();
+        assert!(plans.begin_scope(7).is_err());
+    }
+    #[test]
+    fn native_render_scope_and_barrier_remain_in_one_owned_recording() {
+        let mut plans = Plans::default();
+        plans.begin(7).unwrap();
+        let mut begin = p::VkCmdBeginRenderingArgs::default();
+        begin.command_buffer = p::VkCommandBuffer(7);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdBeginRendering(Box::new(
+                begin,
+            )))
+            .unwrap();
+        plans.barrier(barrier(7, 3)).unwrap();
+        let mut end = p::VkCmdEndRenderingArgs::default();
+        end.command_buffer = p::VkCommandBuffer(7);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdEndRendering(Box::new(end)))
+            .unwrap();
+        let End::Ordinary(steps) = plans.end(7).unwrap() else {
+            panic!("ordinary scope became video");
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [Step::Native(_), Step::Barrier(_), Step::Native(_)]
+        ));
+    }
+    #[test]
+    fn mixed_snapshot_keeps_original_owned_state_after_editable_reset() {
+        let mut plans = Plans::default();
+        plans.begin(7).unwrap();
+        let mut bind = p::VkCmdBindVertexBuffersArgs::default();
+        bind.command_buffer = p::VkCommandBuffer(7);
+        bind.binding_count = 1;
+        bind.p_buffers = vec![p::VkBuffer(81)];
+        bind.p_offsets = vec![16];
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdBindVertexBuffers(
+                Box::new(bind),
+            ))
+            .unwrap();
+        plans.begin_scope(7).unwrap();
+        plans.decode(7, decode(11)).unwrap();
+        plans.end_scope(7).unwrap();
+        let End::Video(snapshot) = plans.end(7).unwrap() else {
+            panic!("missing mixed snapshot");
+        };
+        plans.reset(7);
+        plans.begin(7).unwrap();
+        let Step::Native(call) = &snapshot[0] else {
+            panic!("state order changed");
+        };
+        let sv_gpu_entry::RecordedCall::VkCmdBindVertexBuffers(args) = call.as_ref() else {
+            panic!("state kind changed");
+        };
+        assert_eq!(args.p_buffers[0].0, 81);
+        assert_eq!(args.p_offsets, [16]);
+        assert!(matches!(&snapshot[1], Step::Decode(job) if job.source_buffer == 11));
+        assert!(plans.captures_native(7));
+    }
+    #[test]
+    fn events_after_last_decode_are_not_forwarded_to_native_noop_wait() {
+        let mut plans = Plans::default();
+        plans.begin(7).unwrap();
+        plans.begin_scope(7).unwrap();
+        plans.decode(7, decode(11)).unwrap();
+        plans.end_scope(7).unwrap();
+        let mut wait = p::VkCmdWaitEvents2Args::default();
+        wait.command_buffer = p::VkCommandBuffer(7);
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdWaitEvents2(Box::new(wait)))
+            .unwrap();
+        assert!(plans.end(7).is_err());
+    }
+    #[test]
+    fn secondary_event_history_prevents_a_later_video_cut() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(3, &[8]).unwrap();
+        plans.begin(8).unwrap();
+        plans.note_ordinary_command(8, "vkCmdWaitEvents2");
+        plans.end(8).unwrap();
+        plans.begin(7).unwrap();
+        let mut execute = p::VkCmdExecuteCommandsArgs::default();
+        execute.command_buffer = p::VkCommandBuffer(7);
+        execute.command_buffer_count = 1;
+        execute.p_command_buffers = vec![p::VkCommandBuffer(8)];
+        plans
+            .native(sv_gpu_entry::RecordedCall::VkCmdExecuteCommands(Box::new(
+                execute,
+            )))
+            .unwrap();
+        assert!(plans.begin_scope(7).is_err());
+    }
+    #[test]
     fn ordinary_first_command_flushes_deferred_barriers_once_in_original_order() {
         let mut plans = Plans::default();
         plans.begin(7).unwrap();
@@ -467,6 +747,7 @@ mod tests {
             .map(|step| match step {
                 Step::Barrier(b) => marker(b),
                 Step::Decode(d) => d.source_buffer,
+                Step::Native(_) => panic!("unexpected native call in barrier-only test"),
             })
             .collect();
         assert_eq!(values, vec![1, 11, 2, 12, 3]);

@@ -106,11 +106,13 @@ impl Submission {
                     .video(wire)
                     .map_err(|_| invalid())?;
                 if let Some(plan) = plan {
+                    let mut segment = None;
+                    let mut state = Vec::<Arc<sv_gpu_entry::RecordedCall>>::new();
                     for step in plan.iter() {
                         match step {
                             Step::Barrier(original) => {
                                 let (lowered, handles) = result.resolve_barrier(original)?;
-                                let command = result.command()?;
+                                let command = result.segment(&mut segment, &state)?;
                                 unsafe {
                                     crate::native_video_barriers::record(
                                         &result.shared.driver,
@@ -121,10 +123,23 @@ impl Submission {
                                         },
                                     )
                                 }?;
-                                unsafe { result.shared.driver.device.end_command_buffer(command) }?;
-                                actions.push(Action::Native(command));
+                            }
+                            Step::Native(call) => {
+                                let command = result.segment(&mut segment, &state)?;
+                                result.replay_native(command, call)?;
+                                // Secondary execution invalidates the primary's native state.
+                                if call.name() == "vkCmdExecuteCommands" {
+                                    state.clear();
+                                }
+                                if matches!(
+                                    call.restoration(),
+                                    sv_gpu_entry::RecordedRestoration::AuditedState
+                                ) {
+                                    state.push(Arc::clone(call));
+                                }
                             }
                             Step::Decode(job) => {
+                                result.flush_segment(&mut segment, &mut actions)?;
                                 let resolved = Arc::new(result.resolve_decode(job)?);
                                 let mut targets = vec![Arc::clone(&resolved.destination)];
                                 if let Some(setup) = &resolved.setup {
@@ -138,6 +153,7 @@ impl Submission {
                             }
                         }
                     }
+                    result.flush_segment(&mut segment, &mut actions)?;
                 } else {
                     let command = result
                         .shared
@@ -158,6 +174,50 @@ impl Submission {
             });
         }
         Ok(result)
+    }
+    fn replay_native(
+        &self,
+        command: vk::CommandBuffer,
+        call: &sv_gpu_entry::RecordedCall,
+    ) -> Result<(), vk::Result> {
+        if !call.available(&self.shared.fns) {
+            return Err(invalid());
+        }
+        let mut host = crate::server::GpuServer::new(Arc::clone(&self.shared));
+        host.native_queue_worker = true;
+        host.native_record_replay = Some((call.command_buffer(), command.as_raw()));
+        let mut forward = sv_gpu_entry::Forward::new(host);
+        call.clone().replay(&mut forward).map_err(|_| invalid())?;
+        if self.shared.poisoned.get(command.as_raw()).is_some() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    fn segment(
+        &self,
+        segment: &mut Option<vk::CommandBuffer>,
+        state: &[Arc<sv_gpu_entry::RecordedCall>],
+    ) -> Result<vk::CommandBuffer, vk::Result> {
+        if let Some(command) = *segment {
+            return Ok(command);
+        }
+        let command = self.command()?;
+        for call in state {
+            self.replay_native(command, call)?;
+        }
+        *segment = Some(command);
+        Ok(command)
+    }
+    fn flush_segment(
+        &self,
+        segment: &mut Option<vk::CommandBuffer>,
+        actions: &mut Vec<Action>,
+    ) -> Result<(), vk::Result> {
+        if let Some(command) = segment.take() {
+            unsafe { self.shared.driver.device.end_command_buffer(command) }?;
+            actions.push(Action::Native(command));
+        }
+        Ok(())
     }
     fn command(&self) -> Result<vk::CommandBuffer, vk::Result> {
         let command = unsafe {
@@ -213,7 +273,11 @@ impl Submission {
             destination: view(&job.destination)?,
             // Non-reference setup invalidates its slot without a producer
             // write. Its supplied descriptor must still name a valid resource.
-            setup: if job.h264.is_reference { setup_descriptor.clone() } else { None },
+            setup: if job.h264.is_reference {
+                setup_descriptor.clone()
+            } else {
+                None
+            },
             _setup_descriptor: setup_descriptor,
             references: job
                 .references
