@@ -275,6 +275,15 @@ static void unsupported(void) {
     memcpy(CMSG_DATA(header), &special, sizeof(special));
     CHECK(sendmsg(fd[0], &message, MSG_NOSIGNAL) == -1 && errno == EOPNOTSUPP); empty(fd[1]);
     CHECK(close(special) == 0);
+    int file = memfd_create("seqpacket-control-limit", MFD_CLOEXEC); CHECK(file >= 0);
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(60 * sizeof(int))]; } large_control;
+    memset(&large_control, 0, sizeof(large_control));
+    int many[60]; for (unsigned i = 0; i < 60; i++) many[i] = file;
+    message.msg_control = large_control.bytes; message.msg_controllen = sizeof(large_control.bytes);
+    header = CMSG_FIRSTHDR(&message); header->cmsg_level = SOL_SOCKET; header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(many)); memcpy(CMSG_DATA(header), many, sizeof(many));
+    CHECK(sendmsg(fd[0], &message, MSG_NOSIGNAL) == -1 && errno == EMSGSIZE); empty(fd[1]);
+    CHECK(fcntl(file, F_GETFD) >= 0 && close(file) == 0);
     close_pair(fd); puts("SEQPACKET unsupported operations PASS");
 }
 static void byte_copy_refusal(void) {

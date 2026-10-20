@@ -91,6 +91,9 @@ ssize_t hl_wc_seqpacket_send(int fd, const struct msghdr *message, int flags) {
         if (bytes % sizeof(int) || bytes / sizeof(int) > RIGHTS_MAX + 1 - count) { errno = EMSGSIZE; return -1; }
         memcpy(rights + count, CMSG_DATA(c), bytes); count += bytes / sizeof(int);
     }
+    /* Control plus token must fit even an empty socket. Otherwise a
+     * blocking native stream can wait forever when control equals hiwat. */
+    if (CMSG_SPACE(count * sizeof(int)) >= HL_WC_SEQPACKET_BUFFER) { errno = EMSGSIZE; return -1; }
     int backing = hl_wc_socket_private_file();
     if (backing < 0) return -1;
     int result_errno = 0;
