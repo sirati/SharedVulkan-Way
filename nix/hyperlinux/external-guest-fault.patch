@@ -1,6 +1,6 @@
 --- a/src/syscall_proc.c
 +++ b/src/syscall_proc.c
-@@ -1748,6 +1748,45 @@
+@@ -1748,6 +1748,56 @@
                      break;
                  }
                  }
@@ -32,16 +32,27 @@
 +                /* Signal frames use ELR_EL1/SPSR_EL1, normally saved by the
 +                 * shim. Supply live EL0 state and resume the handler directly
 +                 * because this path has no shim ERET. */
-+                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc);
-+                hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate);
++                if (hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, pc) != HV_SUCCESS ||
++                    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, pstate) != HV_SUCCESS) {
++                    crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                                 "failed to save external fault context");
++                    exit_code = 128;
++                    running = 0;
++                    break;
++                }
 +                if (signal_force_fault(vcpu, g, &exit_code, signum, code,
 +                                       vexit->exception.virtual_address, esr) < 0) {
 +                    running = 0;
 +                } else {
-+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc);
-+                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &pstate);
-+                    hv_vcpu_set_reg(vcpu, HV_REG_PC, pc);
-+                    hv_vcpu_set_reg(vcpu, HV_REG_CPSR, pstate);
++                    if (hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &pc) != HV_SUCCESS ||
++                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &pstate) != HV_SUCCESS ||
++                        hv_vcpu_set_reg(vcpu, HV_REG_PC, pc) != HV_SUCCESS ||
++                        hv_vcpu_set_reg(vcpu, HV_REG_CPSR, pstate) != HV_SUCCESS) {
++                        crash_report(vcpu, g, CRASH_UNEXPECTED_EC,
++                                     "failed to resume external fault handler");
++                        exit_code = 128;
++                        running = 0;
++                    }
 +                }
              } else if (ec == 0x30 || ec == 0x32) {
                  /* EC=0x30: Hardware breakpoint from lower EL (EL0).
