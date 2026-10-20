@@ -37797,6 +37797,28 @@ Evidence is `distinct-uid-original-renderer-rollback.txt` beneath
 `/mnt/datasets/builds/evidence/session-fixes/broker-rollback/`.
 Family migration and deployment remain pending review.
 
+The integrated stock-policy fixture uses exact `64caaa6a` launcher policy with
+accepted `e5e19fdb` runtime handling, frozen as `19a3819c` with script SHA256
+`7e793295d0d0fb8f52dffaf09d64601c3d3d7b33081333d2ce5d103d89dc3d13`.
+Both real mapped-user sessions, before baseline and after protected rollback,
+removed exact old generated graphics/readback blocks from `user.js` and their
+persisted values from `prefs.js`, preserving an unrelated manual custom
+preference. A deliberately broken original-renderer replacement prevented the
+application from starting; rollback restored the actual original renderer and
+real application success. Baseline-v2 and the private source receipt were
+created only after the initial successful session ended.
+
+The fixture wrapper is named `firefox` to select the actual Firefox policy
+branch, and executes the stock `wayland-info` payload through the live rings.
+It does not run a browser or exercise GPU presentation or VA decoding. Source,
+recipe and native input hashes were verified before execution, including the
+original-product renderer/shim manifest. The controller used 436.7 MiB peak,
+within a 512 MiB/2 CPU slice; both controller and private manager mask family
+BARs, render nodes and DRM registration paths. Fixture/input trees, processes,
+units, uploads and transient limits were removed. The host canonical mapped
+runtime remained absent. No production source receipt was created.
+
+
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
 as root through win7-desktop.nix's sudo rule. That rule's users are now an
