@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
+unset WC_LAUNCH_INSTALL_APPS WC_LAUNCH_EXTRA_APPS WC_LAUNCH_EXTRA_APP_BLOCKS
 source <(sed -n '/^deployment_uses_gpu_firefox() {/,/^}/p' scripts/wc-launch.sh)
 source <(sed -n '/^gpu_prerequisite_check() {/,/^}/p' scripts/wc-launch.sh)
 STAGE=$(mktemp -d /mnt/datasets/builds/wcrun/native-gtk-policy-XXXXXX)
@@ -51,6 +52,8 @@ ln -s "$BASE/gtk" "$BASE/bin/gpu-gtk"
 GPU_ON=''; NSWRAP=(); GPUENV=(); DEF_ENV=(); PCI=''
 reject_runtime() { if (stock_gpu_prerequisite_check); then echo "FAIL runtime accepted $1"; exit 1; fi; echo "PASS runtime rejects $1"; }
 reject_runtime missing-gpu-and-node
+PROFILE=''; reject_runtime Firefox-without-explicit-profile
+PROFILE="$BASE/profile"
 GPU_ON=1; NSWRAP=(/fixture/sv-drm ns --); reject_runtime missing-pci
 PCI=8086:a7a8; GPUENV=(WC_NATIVE_SHM=1); reject_runtime missing-strict-library
 GPUENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_STRICT=1 LD_LIBRARY_PATH=/wrong/lib); reject_runtime foreign-library
