@@ -78,6 +78,7 @@ pub(super) fn run(
     let setup = Arc::clone(&fixture.setup);
     let fence = fixture.user_fence;
     let event_prefix = fixture.event_prefix.clone();
+    let mixed = fixture.mixed.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let body = std::thread::Builder::new()
         .name("fixture-verification".into())
@@ -95,6 +96,7 @@ pub(super) fn run(
                 fence,
                 body_progress,
                 event_prefix,
+                mixed,
             );
             let _ = done_tx.send(result);
         })
@@ -190,6 +192,12 @@ pub(super) fn run(
         let mut rpc = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&fixture.shared)));
         if let Err(error) = unsafe { prefix.cleanup_after_retirement(&mut rpc) } {
             cancellation::parked(fixture, &format!("retired prefix cleanup failed: {error}"));
+        }
+    }
+    if let Some(mixed) = &fixture.mixed {
+        let mut rpc = sv_gpu_entry::Forward::new(GpuServer::new(Arc::clone(&fixture.shared)));
+        if let Err(error) = unsafe { mixed.cleanup_after_retirement(&mut rpc) } {
+            cancellation::parked(fixture, &format!("retired mixed cleanup failed: {error}"));
         }
     }
     unsafe {

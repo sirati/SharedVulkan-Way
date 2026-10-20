@@ -25,6 +25,8 @@ use sv_transport::region::SharedRegion;
 mod cancellation;
 #[path = "native_video_event_fixture.rs"]
 mod event_prefix;
+#[path = "native_video_mixed_fixture.rs"]
+mod mixed_compute;
 #[path = "native_video_normal_fixture.rs"]
 mod normal;
 #[path = "native_video_queue_wire_fixture.rs"]
@@ -43,6 +45,7 @@ struct Fixture {
     diagnostic_fence: Option<vk::Fence>,
     user_fence: vk::Fence,
     event_prefix: Option<Arc<event_prefix::Prepared>>,
+    mixed: Option<Arc<mixed_compute::Prepared>>,
 }
 
 pub fn run_cancel_waits(sync2: bool) -> Result<(), String> {
@@ -372,6 +375,7 @@ pub fn run_mode(sync2: bool, wire_recording: bool) -> Result<(), String> {
         setup,
         source_buffer,
         pool,
+        None,
     )
 }
 
@@ -384,6 +388,7 @@ fn submit_and_verify(
     setup: Arc<Image>,
     source_buffer: vk::Buffer,
     pool: vk::CommandPool,
+    mixed: Option<Arc<mixed_compute::Prepared>>,
 ) -> Result<(), String> {
     let driver = Arc::clone(&shared.driver);
     let (timeline, binary, fence) = {
@@ -458,6 +463,7 @@ fn submit_and_verify(
         diagnostic_fence,
         user_fence: fence,
         event_prefix,
+        mixed,
     };
     normal::run(fixture, sync2, wire_recording, job, binary)
 }
@@ -472,6 +478,7 @@ fn verification_body(
     fence: vk::Fence,
     progress: Arc<normal::Progress>,
     event_prefix: Option<Arc<event_prefix::Prepared>>,
+    mixed: Option<Arc<mixed_compute::Prepared>>,
 ) -> Result<(), String> {
     let driver = Arc::clone(&shared.driver);
     // Earlier ordinary native work signals the binary once. Manual mode also
@@ -614,6 +621,9 @@ fn verification_body(
         }))?
         .result,
     )?;
+    if let Some(mixed) = &mixed {
+        mixed.verify(&shared)?;
+    }
     // The user fence follows decode and ownership acquire. Sampling these exact
     // images must observe both writes, without copying into a different target.
     for (role, image) in [("destination", &destination), ("setup", &setup)] {

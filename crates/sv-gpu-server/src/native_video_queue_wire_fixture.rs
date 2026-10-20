@@ -215,7 +215,11 @@ fn parameters(rpc: &mut Rpc, queue_family: u32) -> Result<(), String> {
     )?;
     Ok(())
 }
-fn record(rpc: &mut Rpc, source_len: u64) -> Result<(), String> {
+fn record(
+    rpc: &mut Rpc,
+    source_len: u64,
+    mixed: Option<&mixed_compute::Prepared>,
+) -> Result<(), String> {
     checked(
         wire(rpc.begin_command_buffer(p::VkBeginCommandBufferArgs {
             command_buffer: p::VkCommandBuffer(COMMAND),
@@ -223,6 +227,9 @@ fn record(rpc: &mut Rpc, source_len: u64) -> Result<(), String> {
         }))?
         .result,
     )?;
+    if let Some(mixed) = mixed {
+        mixed.record_before_decode(rpc, COMMAND)?;
+    }
     let barriers = vec![
         (DST_IMAGE, vk::ImageLayout::VIDEO_DECODE_DST_KHR),
         (SETUP_IMAGE, vk::ImageLayout::VIDEO_DECODE_DPB_KHR),
@@ -334,6 +341,9 @@ fn record(rpc: &mut Rpc, source_len: u64) -> Result<(), String> {
         command_buffer: p::VkCommandBuffer(COMMAND),
         p_end_coding_info: Some(Box::new(Default::default())),
     }))?;
+    if let Some(mixed) = mixed {
+        mixed.record_after_decode(rpc, COMMAND)?;
+    }
     checked(
         wire(rpc.end_command_buffer(p::VkEndCommandBufferArgs {
             command_buffer: p::VkCommandBuffer(COMMAND),
@@ -353,6 +363,7 @@ pub(super) fn run(sync2: bool) -> Result<(), String> {
         fixture.setup,
         fixture.source,
         fixture.pool,
+        fixture.mixed,
     )
 }
 
@@ -463,7 +474,14 @@ pub(super) fn prepare() -> Result<Fixture, String> {
         }))?
         .result,
     )?;
-    record(&mut rpc, payload.len() as u64)?;
+    let mixed = if std::env::args().any(|a| a == "--mixed-compute") {
+        let mixed = Arc::new(mixed_compute::Prepared::prepare(&mut rpc)?);
+        mixed.resource_report();
+        Some(mixed)
+    } else {
+        None
+    };
+    record(&mut rpc, payload.len() as u64, mixed.as_deref())?;
     // Test diagnostics resolve canonical owners only after wire recording has
     // completed. These lookups never mutate Plans or resource metadata.
     let (destination, setup, source, pool) = {
@@ -530,6 +548,7 @@ pub(super) fn prepare() -> Result<Fixture, String> {
         .map_err(|e| format!("{e:?}"))?;
     Ok(Fixture {
         event_prefix: None,
+        mixed,
         diagnostic_fence: None,
         user_fence,
         timeline,
