@@ -19,11 +19,16 @@ wc-handle = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# §111.8: the broker opens the ivshmem devices and the virtio-serial ports by
+# the same code the compositor and the GPU process map and wrap them with.
+sv-transport = { workspace = true }
 windows-sys = { workspace = true, features = [
+  "Win32_Devices_DeviceAndDriverInstallation",
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
+  "Win32_System_Console",
   "Win32_System_IO",
   "Win32_System_Memory",
   "Win32_System_Pipes",
