@@ -609,3 +609,38 @@ fn owner_generation_is_revoked_by_connection_close() {
     assert!(replacement.observe_owner(token, std::process::id()).is_err());
     std::fs::remove_dir_all(d).unwrap();
 }
+
+/// The isolated publisher must lease the ORIGINAL object at offset zero,
+/// retain it across a client close, and carry its exact physical inode.
+#[cfg(target_os = "linux")]
+#[test]
+fn published_original_device_keeps_full_zero_offset_identity_and_lifetime() {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let d = dir("original-device-publication");
+    let raw = unsafe { libc::memfd_create(c"original-fixture".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(raw >= 0);
+    let original = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    original.set_len(8192).unwrap();
+    let identity = original.metadata().unwrap();
+    let unix = Unix::bind(d.join("broker.sock"), vec![]).unwrap();
+    let broker = Broker::new(unix, Config { devices: vec![], services: vec![], keys: None,
+        release: Release::OwnerFree, budget: Some(0), run: 17 });
+    let id = broker.publish(User::uid(unsafe { libc::geteuid() }), "wayland", 31,
+        vec![(wc_broker::sys::unix::Object::Device(original.into()), 0, 8192)]);
+    let serving = broker.clone();
+    std::thread::spawn(move || serving.serve());
+    for _ in 0..2 {
+        let mut client = Client::connect(&d.join("broker.sock").to_string_lossy()).unwrap();
+        let (region, mut fds) = client.open(id).unwrap();
+        assert_eq!((region.id,region.len,region.epoch),(id,8192,31));
+        assert_eq!((region.pieces[0].offset,region.pieces[0].len),(0,8192));
+        assert_eq!(fds.len(),1);
+        let file = std::fs::File::from(fds.remove(0));
+        let mapped_identity = file.metadata().unwrap();
+        assert_eq!((mapped_identity.dev(),mapped_identity.ino()),(identity.dev(),identity.ino()));
+        assert!(!broker.holders(id).is_empty());
+        drop(client); drop(file);
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
