@@ -91,13 +91,17 @@ unsafe impl Sync for Region {}
 pub enum Object {
     Device(OwnedFd),
     Region(Region),
+    #[cfg(target_os = "macos")]
+    MachRegion(Arc<super::macos_pci::Mapping>),
 }
 
 impl Object {
-    fn fd(&self) -> RawFd {
+    fn fd(&self) -> Option<RawFd> {
         match self {
-            Object::Device(f) => f.as_raw_fd(),
-            Object::Region(r) => r.fd.as_raw_fd(),
+            Object::Device(f) => Some(f.as_raw_fd()),
+            Object::Region(r) => Some(r.fd.as_raw_fd()),
+            #[cfg(target_os = "macos")]
+            Object::MachRegion(_) => None,
         }
     }
 }
@@ -327,14 +331,14 @@ impl Platform for Unix {
     }
 
     fn send(&self, w: &mut UnixStream, make: &dyn Fn(&[String]) -> String, give: Vec<Give<'_, Object>>) -> io::Result<()> {
-        let fds: Vec<RawFd> = give
-            .iter()
-            .map(|g| match g {
-                Give::Move(o) => o.fd(),
-                Give::Copy(o) => o.fd(),
-            })
-            .collect();
-        let texts = vec![String::from("fd"); fds.len()];
+        let mut fds = Vec::new();
+        let texts: Vec<String> = give.iter().map(|g| {
+            let obj = match g { Give::Move(o) => o, Give::Copy(o) => *o };
+            match obj.fd() {
+                Some(fd) => { fds.push(fd); "fd".into() }
+                None => "mach".into(),
+            }
+        }).collect();
         let mut line = make(&texts);
         line.push('\n');
         send_with_fds(w, line.as_bytes(), &fds)
