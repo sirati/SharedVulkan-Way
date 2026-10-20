@@ -142,6 +142,8 @@ void fd_special_subsystem_close(int guest_fd, int type) {
     (void)guest_fd; (void)type;
 }
 
+void epoll_instance_destroy(void *instance) { free(instance); }
+
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("FAIL %s\n", m); fails++; } \
     else printf("OK %s\n", m); } while (0)

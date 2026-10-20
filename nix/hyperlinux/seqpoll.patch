@@ -1,0 +1,751 @@
+--- a/src/syscall_poll.c
++++ b/src/syscall_poll.c
+@@ -9,6 +9,9 @@
+  */
+ #include "syscall_poll.h"
+ #include "syscall.h"
++#include "fd_object.h"
++#include "hl_socket.h"
++#include "hl_seqpoll.h"
+ #include "syscall_internal.h"
+ #include "syscall_signal.h"
+ #include "syscall_proc.h"  /* exit_group_requested */
+@@ -118,6 +121,9 @@
+ int64_t sys_ppoll(guest_t *g, uint64_t fds_gva, uint32_t nfds,
+                   uint64_t timeout_gva, uint64_t sigmask_gva) {
+     if (nfds > 256) return -LINUX_EINVAL;
++    hl_seqpoll_refs held __attribute__((cleanup(hl_seqpoll_refs_end))) = {0};
++    hl_open_file_t *seq_options[257] = {0};
++    int have_seq_options = 0;
+ 
+     /* Read pollfd array from guest (layout is identical to macOS) */
+     linux_pollfd_t guest_fds[256];
+@@ -138,12 +144,16 @@
+         guest_fds[i].revents = 0;
+         if (gfd < 0) {
+             host_fds[i].fd = -1; /* deliberately ignored */
+-        } else if (gfd >= FD_TABLE_SIZE || fd_table[gfd].type == FD_CLOSED) {
++        } else if (hl_fd_get_pinned(gfd, &held.refs[i]) < 0) {
+             host_fds[i].fd = -1;
+             guest_fds[i].revents = (uint16_t)POLLNVAL;
+             nval_count++;
+         } else {
+-            host_fds[i].fd = fd_to_host(gfd);
++            host_fds[i].fd = held.refs[i].host_fd;
++            if (hl_wc_socket_seqpacket_of(held.refs[i].of)) {
++                seq_options[i] = held.refs[i].of;
++                have_seq_options = 1;
++            }
+             if (host_fds[i].fd < 0) {
+                 /* Open descriptor with no host alias — /dev/mixer is pure
+                  * emulation and installs host_fd = -1. Linux reports a
+@@ -246,7 +256,7 @@
+     int pure_wake = 0;
+     if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
+     do {
+-        ret = poll(host_fds, nfds + added_wakeup, host_timeout);
++        ret = have_seq_options ? hl_seqpoll_wait(host_fds, nfds + added_wakeup, seq_options, host_timeout) : poll(host_fds, nfds + added_wakeup, host_timeout);
+ 
+         /* Check for exit_group / futex_interrupt after waking */
+         if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+@@ -327,8 +337,16 @@
+      * restores it. The sixth argument is a pointer to a struct:
+      *   { const sigset_t *ss; size_t ss_len; }   */
+     if (nfds < 0 || nfds > FD_SETSIZE) return -LINUX_EINVAL;
++    hl_seqpoll_refs held __attribute__((cleanup(hl_seqpoll_refs_end))) = {0};
++    hl_open_file_t *seq_options[FD_SETSIZE] = {0};
++    int mapped_host[FD_TABLE_SIZE];
++    for (int i = 0; i < FD_TABLE_SIZE; i++) mapped_host[i] = -1;
++    int have_seq_options = 0;
+ 
+     fd_set read_set, write_set, except_set;
++    uint64_t orig_rbits[FD_TABLE_SIZE / 64] = {0};
++    uint64_t orig_wbits[FD_TABLE_SIZE / 64] = {0};
++    uint64_t orig_ebits[FD_TABLE_SIZE / 64] = {0};
+     FD_ZERO(&read_set);
+     FD_ZERO(&write_set);
+     FD_ZERO(&except_set);
+@@ -356,6 +374,9 @@
+             return -LINUX_EFAULT;
+         if (exceptfds_gva && guest_read(g, exceptfds_gva, ebits, bitmask_bytes) < 0)
+             return -LINUX_EFAULT;
++        memcpy(orig_rbits, rbits, sizeof(orig_rbits));
++        memcpy(orig_wbits, wbits, sizeof(orig_wbits));
++        memcpy(orig_ebits, ebits, sizeof(orig_ebits));
+ 
+         for (int i = 0; i < nfds; i++) {
+             int in_set = 0;
+@@ -365,10 +386,10 @@
+             if (!in_set) continue;
+ 
+             /* Linux: invalid fd in select set → EBADF */
+-            if (i >= FD_TABLE_SIZE || fd_table[i].type == FD_CLOSED)
++            if (hl_fd_get_pinned(i, &held.refs[i]) < 0)
+                 return -LINUX_EBADF;
+-
+-            int host_fd = fd_to_host(i);
++            int host_fd = held.refs[i].host_fd;
++            mapped_host[i] = host_fd;
+             if (host_fd < 0) {
+                 /* Valid fd, no host alias: report ready rather than
+                  * failing the entire select with EBADF. */
+@@ -384,7 +405,11 @@
+             }
+             /* Guard against host fds exceeding FD_SETSIZE (macOS stack
+              * buffer overflow if the host fd number is >= FD_SETSIZE). */
+-            if (host_fd >= FD_SETSIZE) continue;
++            if (host_fd >= FD_SETSIZE) return -LINUX_EINVAL;
++            if (hl_wc_socket_seqpacket_of(held.refs[i].of)) {
++                seq_options[host_fd] = held.refs[i].of;
++                have_seq_options = 1;
++            }
+             if (host_fd > max_host_fd) max_host_fd = host_fd;
+ 
+             if (rbits[i / 64] & (1ULL << (i % 64)))
+@@ -476,7 +501,9 @@
+         else
+             pts = &poll_ts;
+ 
+-        ret = pselect(max_host_fd + 1,
++        ret = have_seq_options ? hl_seqpoll_select(max_host_fd + 1, &read_set,
++                                    writefds_gva ? &write_set : NULL,
++                                    exceptfds_gva ? &except_set : NULL, pts, seq_options) : pselect(max_host_fd + 1,
+                       (readfds_gva || added_wakeup) ? &read_set : NULL,
+                       writefds_gva ? &write_set : NULL,
+                       exceptfds_gva ? &except_set : NULL,
+@@ -529,7 +556,7 @@
+              * always-ready result back in here. */
+             rbits[i / 64] |= always_r[i / 64];
+             wbits[i / 64] |= always_w[i / 64];
+-            int host_fd = fd_to_host(i);
++            int host_fd = mapped_host[i];
+             if (host_fd < 0) continue;
+             if (host_fd >= FD_SETSIZE) continue;  /* Must match setup loop guard */
+             if (readfds_gva && FD_ISSET(host_fd, &read_set))
+@@ -597,37 +624,118 @@
+                              * waiting for EPOLL_CTL_MOD re-arm.
+                              * kqueue removed the event, so we prevent
+                              * reporting but allow MOD. */
++    int      host_fd;       /* exact native descriptor at registration */
++    int      state_watch;   /* private vnode watch, or -1 */
++    hl_open_file_t *of;     /* retained description for metadata watch */
++    uint64_t object_id;     /* stable identity for reused guest fds */
++    uint64_t generation;    /* rejects events copied before MOD/reuse */
+ } epoll_reg_t;
+ 
+ /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance
+  * has its own registration table so multiple epoll instances watching
+  * the same FD don't overwrite each other's user data. */
+ typedef struct {
++    unsigned refs;
+     epoll_reg_t regs[FD_TABLE_SIZE];
+ } epoll_instance_t;
+-
+-static int64_t epoll_add_filters(int kq_fd, int guest_fd, int host_fd,
++static pthread_mutex_t epoll_state_lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
++static uint64_t epoll_generation;
++static void epoll_unlock(pthread_mutex_t **lock) { if (*lock) pthread_mutex_unlock(*lock); }
++static uintptr_t epoll_tag(int fd, const epoll_reg_t *reg) {
++    return ((uintptr_t)reg->generation << 10) | (unsigned)fd;
++}
++static int epoll_tag_fd(uintptr_t tag) { return (int)(tag & 1023); }
++static int epoll_tag_matches(uintptr_t tag, const epoll_reg_t *reg) {
++    return (tag >> 10) == reg->generation;
++}
++
++static void epoll_reg_release(epoll_reg_t *reg) {
++    if (!reg) return;
++    if (reg->state_watch >= 0) {
++        hl_wc_socket_native_close(reg->state_watch);
++        reg->state_watch = -1;
++    }
++    if (reg->of) { hl_open_file_release(reg->of); reg->of = NULL; }
++    reg->host_fd = -1;
++    reg->active = 0;
++    reg->oneshot_armed = 0;
++}
++
++void epoll_instance_destroy(void *instance) {
++    epoll_instance_t *inst = (epoll_instance_t *)instance;
++    if (!inst) return;
++    pthread_mutex_lock(&epoll_state_lock);
++    if (--inst->refs == 0) {
++        for (int i = 0; i < FD_TABLE_SIZE; i++) epoll_reg_release(&inst->regs[i]);
++        free(inst);
++    }
++    pthread_mutex_unlock(&epoll_state_lock);
++}
++typedef struct { epoll_instance_t *inst; int native; } epoll_handle;
++static void epoll_handle_end(epoll_handle *handle) {
++    if (handle->native >= 0) close(handle->native);
++    if (handle->inst) epoll_instance_destroy(handle->inst);
++}
++static int epoll_handle_get(int guest_fd, epoll_handle *handle) {
++    pthread_mutex_lock(&epoll_state_lock);
++    pthread_mutex_lock(&fd_lock);
++    int result = -LINUX_EBADF;
++    if (guest_fd >= 0 && guest_fd < FD_TABLE_SIZE && fd_table[guest_fd].type != FD_CLOSED) {
++        result = -LINUX_EINVAL;
++        if (fd_table[guest_fd].type == FD_EPOLL && fd_table[guest_fd].dir) {
++            handle->native = fcntl(fd_table[guest_fd].host_fd, F_DUPFD_CLOEXEC, 0);
++            if (handle->native < 0) result = linux_errno();
++            else {
++                handle->inst = fd_table[guest_fd].dir;
++                handle->inst->refs++;
++                result = 0;
++            }
++        }
++    }
++    pthread_mutex_unlock(&fd_lock);
++    pthread_mutex_unlock(&epoll_state_lock);
++    return result;
++}
++static void epoll_file_destroy(hl_open_file_t *of) {
++    epoll_instance_destroy(of->state); of->state = NULL;
++}
++static const hl_fd_ops_t epoll_file_ops = { .destroy = epoll_file_destroy };
++
++
++static int64_t epoll_add_filters(int kq_fd, int guest_fd, epoll_reg_t *reg,
+                                  uint32_t events) {
+-    struct kevent changes[2];
++    struct kevent changes[3];
+     int nchanges = 0;
+     uint16_t kflags = EV_ADD;
+     if (events & LINUX_EPOLLET) kflags |= EV_CLEAR;
+     if (events & LINUX_EPOLLONESHOT) kflags |= EV_ONESHOT;
+ 
+-    void *udata = (void *)(uintptr_t)guest_fd;
++    void *udata = (void *)epoll_tag(guest_fd, reg);
+     if (events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+-        EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
++        EV_SET(&changes[nchanges], reg->host_fd, EVFILT_READ,
+                kflags, 0, 0, udata);
+         nchanges++;
+     }
+     if (events & LINUX_EPOLLOUT) {
+-        EV_SET(&changes[nchanges], host_fd, EVFILT_WRITE,
++        EV_SET(&changes[nchanges], reg->host_fd, EVFILT_WRITE,
+                kflags, 0, 0, udata);
+         nchanges++;
+     }
+-
+-    if (nchanges > 0 && kevent(kq_fd, changes, nchanges, NULL, 0, NULL) < 0)
++    if (reg->of && hl_wc_socket_seqpacket_of(reg->of)) {
++        reg->state_watch = hl_wc_socket_state_watch(reg->of);
++        if (reg->state_watch < 0) return -LINUX_EOPNOTSUPP;
++        EV_SET(&changes[nchanges], reg->state_watch, EVFILT_VNODE,
++               EV_ADD | EV_CLEAR, NOTE_WRITE, 0, udata);
++        nchanges++;
++    }
++
++    if (nchanges > 0 && kevent(kq_fd, changes, nchanges, NULL, 0, NULL) < 0) {
++        if (reg->state_watch >= 0) {
++            hl_wc_socket_native_close(reg->state_watch);
++            reg->state_watch = -1;
++        }
+         return linux_errno();
++    }
+     return 0;
+ }
+ 
+@@ -641,102 +749,109 @@
+     /* Allocate per-instance registration table */
+     epoll_instance_t *inst = calloc(1, sizeof(epoll_instance_t));
+     if (!inst) { close(kq); return -LINUX_ENOMEM; }
+-
+-    int gfd = fd_alloc(FD_EPOLL, kq);
+-    if (gfd < 0) { free(inst); close(kq); return -LINUX_EMFILE; }
+-
+-    fd_table[gfd].dir = inst;
+-    int lflags = 0;
+-    if (flags & LINUX_EPOLL_CLOEXEC) lflags |= LINUX_O_CLOEXEC;
+-    fd_table[gfd].linux_flags = lflags;
+-
+-    return gfd;
++    inst->refs = 1;
++    for (int i = 0; i < FD_TABLE_SIZE; i++) { inst->regs[i].host_fd = -1; inst->regs[i].state_watch = -1; }
++    hl_open_file_t *of = hl_open_file_create(FD_EPOLL, &epoll_file_ops, 0, inst);
++    if (!of) { epoll_instance_destroy(inst); close(kq); return -LINUX_ENOMEM; }
++    int gfd = hl_fd_install(of, kq, flags & LINUX_EPOLL_CLOEXEC ? LINUX_O_CLOEXEC : 0);
++    return gfd < 0 ? linux_errno() : gfd;
+ }
+ 
+ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
+                        uint64_t event_gva) {
+-    /* Linux returns EINVAL when trying to add an epoll fd to itself */
+     if (fd == epfd) return -LINUX_EINVAL;
+-
+-    int kq_fd = fd_to_host(epfd);
+-    if (kq_fd < 0) return -LINUX_EBADF;
+-    if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
+-
+-    epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
+-    if (!inst) return -LINUX_EINVAL;
+-
+-    int host_fd = fd_to_host(fd);
+-    if (host_fd < 0) return -LINUX_EBADF;
+-
++    epoll_handle handle __attribute__((cleanup(epoll_handle_end))) = { .native = -1 };
++    int error = epoll_handle_get(epfd, &handle);
++    if (error) return error;
++    pthread_mutex_t *locked __attribute__((cleanup(epoll_unlock))) = &epoll_state_lock;
++    pthread_mutex_lock(locked);
++    int kq_fd = handle.native;
++    epoll_instance_t *inst = handle.inst;
++    if (fd < 0 || fd >= FD_TABLE_SIZE) return -LINUX_EBADF;
+     epoll_reg_t *reg = &inst->regs[fd];
+ 
++    /* Closing a target drops its native filters. Do not delete a stale
++     * native integer after reuse, which could belong to a new registration. */
++    if (reg->active && reg->of) {
++        hl_fd_ref_t cur = {0};
++        int current = hl_fd_get_pinned(fd, &cur) == 0 && cur.of &&
++            cur.of->object_id == reg->object_id && cur.host_fd == reg->host_fd;
++        hl_fd_put(&cur);
++        if (!current) epoll_reg_release(reg);
++    }
++
+     if (op == LINUX_EPOLL_CTL_DEL) {
+-        /* Linux returns ENOENT when removing an unregistered fd */
+         if (!reg->active) return -LINUX_ENOENT;
+-
+-        /* Remove all filters for this fd. EPOLLRDHUP alone registers
+-         * EVFILT_READ (see ADD path), so check both EPOLLIN and EPOLLRDHUP. */
+-        struct kevent changes[2];
+-        int nchanges = 0;
+-        {
+-            if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+-                EV_SET(&changes[nchanges], host_fd, EVFILT_READ,
+-                       EV_DELETE, 0, 0, NULL);
+-                nchanges++;
+-            }
+-            if (reg->events & LINUX_EPOLLOUT) {
+-                EV_SET(&changes[nchanges], host_fd, EVFILT_WRITE,
+-                       EV_DELETE, 0, 0, NULL);
+-                nchanges++;
+-            }
+-            /* Ignore errors from EV_DELETE (fd might already be closed) */
+-            kevent(kq_fd, changes, nchanges, NULL, 0, NULL);
+-            reg->active = 0;
+-            reg->oneshot_armed = 0; /* Clear stale state for potential re-add */
+-        }
++        struct kevent del[2]; int n = 0;
++        if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP))
++            EV_SET(&del[n++], reg->host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
++        if (reg->events & LINUX_EPOLLOUT)
++            EV_SET(&del[n++], reg->host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
++        if (n) (void)kevent(kq_fd, del, n, NULL, 0, NULL);
++        epoll_reg_release(reg);
+         return 0;
+     }
+ 
+-    /* Linux semantics: ADD fails with EEXIST if already registered;
+-     * MOD fails with ENOENT if not registered. Note: oneshot_armed registrations
+-     * (EPOLLONESHOT fired, waiting for re-arm) are still valid for MOD. */
+     if (op == LINUX_EPOLL_CTL_ADD && reg->active) return -LINUX_EEXIST;
+     if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed)
+         return -LINUX_ENOENT;
+ 
+-    /* ADD or MOD: read the epoll_event from guest */
+     linux_epoll_event_t ev;
+     if (guest_read(g, event_gva, &ev, sizeof(ev)) < 0)
+         return -LINUX_EFAULT;
+ 
+-    /* For MOD, remove old registrations first if they exist in kqueue.
+-     * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check
+-     * both EPOLLIN and EPOLLRDHUP — same logic as CTL_DEL.
+-     * Skip deletion if oneshot_armed (kqueue already removed it). */
+-    if (op == LINUX_EPOLL_CTL_MOD && reg->active && !reg->oneshot_armed) {
+-        struct kevent del[2];
+-        int ndel = 0;
+-        if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
+-            EV_SET(&del[ndel], host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+-            ndel++;
+-        }
+-        if (reg->events & LINUX_EPOLLOUT) {
+-            EV_SET(&del[ndel], host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+-            ndel++;
+-        }
+-        kevent(kq_fd, del, ndel, NULL, 0, NULL);
+-    }
+-
+-    int64_t add_result = epoll_add_filters(kq_fd, fd, host_fd, ev.events);
+-    if (add_result < 0) return add_result;
+-
+-    /* Store registration data in per-instance table.
+-     * Clear oneshot_armed when MOD successfully re-arms. */
+-    reg->events = ev.events;
+-    reg->data = ev.data;
+-    reg->active = 1;
+-    reg->oneshot_armed = 0;
+-
++    hl_fd_ref_t new_ref = {0};
++    if (hl_fd_get_pinned(fd, &new_ref) < 0 || new_ref.host_fd < 0) {
++        if (new_ref.desc || new_ref.of) hl_fd_put(&new_ref);
++        return -LINUX_EBADF;
++    }
++    if (new_ref.of && hl_wc_socket_seqpacket_of(new_ref.of) &&
++        (ev.events & ~(LINUX_EPOLLIN | LINUX_EPOLLOUT | LINUX_EPOLLRDHUP | LINUX_EPOLLERR | LINUX_EPOLLHUP))) {
++        hl_fd_put(&new_ref);
++        return -LINUX_EOPNOTSUPP;
++    }
++    epoll_reg_t fresh;
++    memset(&fresh, 0, sizeof(fresh));
++    fresh.host_fd = new_ref.host_fd;
++    fresh.state_watch = -1;
++    fresh.of = new_ref.of;
++    fresh.object_id = new_ref.of ? new_ref.of->object_id : 0;
++    if (new_ref.of) hl_open_file_retain(new_ref.of);
++    fresh.events = ev.events;
++    fresh.data = ev.data;
++    fresh.active = 1;
++    fresh.generation = ++epoll_generation;
++    if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
++        struct kevent del[2]; int n = 0;
++        if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP))
++            EV_SET(&del[n++], reg->host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
++        if (reg->events & LINUX_EPOLLOUT)
++            EV_SET(&del[n++], reg->host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
++        if (n) (void)kevent(kq_fd, del, n, NULL, 0, NULL);
++        epoll_reg_release(reg);
++    }
++
++    int64_t add_result;
++    if (new_ref.owns_host_fd) {
++        /* Legacy refs own a temporary dup. Register the table alias while
++         * close is excluded, then release the temporary after registration. */
++        pthread_mutex_lock(&fd_lock);
++        if (fd_table[fd].type == FD_CLOSED || fd_table[fd].desc || fd_table[fd].of) {
++            add_result = -LINUX_EBADF;
++        } else {
++            fresh.host_fd = fd_table[fd].host_fd;
++            add_result = epoll_add_filters(kq_fd, fd, &fresh, ev.events);
++        }
++        pthread_mutex_unlock(&fd_lock);
++    } else {
++        add_result = epoll_add_filters(kq_fd, fd, &fresh, ev.events);
++    }
++    hl_fd_put(&new_ref);
++    if (add_result < 0) {
++        epoll_reg_release(&fresh);
++        return add_result;
++    }
++    *reg = fresh;
+     return 0;
+ }
+ 
+@@ -786,16 +901,24 @@
+     }
+     fd_table[epfd].dir = inst;
+     fd_table[epfd].linux_flags = linux_flags;
++    inst->refs = 1;
++    for (int j = 0; j < FD_TABLE_SIZE; j++) { inst->regs[j].host_fd = -1; inst->regs[j].state_watch = -1; }
+ 
+     for (int i = 0; i < num_regs; i++) {
+         int fd = regs[i].guest_fd;
+         if (fd < 0 || fd >= FD_TABLE_SIZE || fd == epfd)
+             return -1;
+-        int host_fd = fd_to_host(fd);
+-        if (host_fd < 0) return -1;
+-
++        hl_fd_ref_t ref = {0};
++        if (hl_fd_get_pinned(fd, &ref) < 0 || ref.host_fd < 0) {
++            hl_fd_put(&ref); return -1;
++        }
+         epoll_reg_t *reg = &inst->regs[fd];
+-        if (reg->active) return -1;
++        if (reg->active) { hl_fd_put(&ref); return -1; }
++        reg->host_fd = ref.owns_host_fd ? fd_to_host(fd) : ref.host_fd;
++        reg->of = ref.of;
++        reg->object_id = ref.of ? ref.of->object_id : 0;
++        if (reg->of) hl_open_file_retain(reg->of);
++        reg->generation = ++epoll_generation;
+         reg->events = regs[i].events;
+         reg->data = regs[i].data;
+         reg->active = 1;
+@@ -803,9 +926,36 @@
+ 
+         /* EV_ONESHOT removes the host filter after delivery.  Preserve that
+          * fired-but-still-registered state and let EPOLL_CTL_MOD re-arm it. */
+-        if (!reg->oneshot_armed &&
+-            epoll_add_filters(kq, fd, host_fd, reg->events) < 0)
+-            return -1;
++        int64_t result = reg->oneshot_armed ? 0 : epoll_add_filters(kq, fd, reg, reg->events);
++        hl_fd_put(&ref);
++        if (result < 0) return -1;
++    }
++    return 0;
++}
++
++/* Fork restores epoll filters before socket option metadata. Call once after
++ * all socket states are imported, while the new guest is still quiescent. */
++int hl_epoll_refresh_socket_states(void) {
++    for (int ep = 0; ep < FD_TABLE_SIZE; ep++) {
++        if (fd_table[ep].type != FD_EPOLL || !fd_table[ep].dir) continue;
++        epoll_instance_t *inst = fd_table[ep].dir;
++        for (int fd = 0; fd < FD_TABLE_SIZE; fd++) {
++            epoll_reg_t *reg = &inst->regs[fd];
++            if (!reg->active || reg->of) continue;
++            hl_fd_ref_t ref = {0};
++            if (hl_fd_get_pinned(fd, &ref) < 0) continue;
++            if (!hl_wc_socket_seqpacket_of(ref.of)) { hl_fd_put(&ref); continue; }
++            if (reg->events & ~(LINUX_EPOLLIN | LINUX_EPOLLOUT | LINUX_EPOLLRDHUP | LINUX_EPOLLERR | LINUX_EPOLLHUP)) {
++                hl_fd_put(&ref); errno = EOPNOTSUPP; return -1;
++            }
++            reg->of = ref.of;
++            hl_open_file_retain(reg->of);
++            reg->object_id = reg->of->object_id;
++            reg->host_fd = ref.host_fd;
++            int64_t result = epoll_add_filters(fd_table[ep].host_fd, fd, reg, reg->events);
++            hl_fd_put(&ref);
++            if (result < 0) return -1;
++        }
+     }
+     return 0;
+ }
+@@ -813,13 +963,12 @@
+ int64_t sys_epoll_pwait(guest_t *g, int epfd, uint64_t events_gva,
+                          int maxevents, int timeout_ms,
+                          uint64_t sigmask_gva) {
+-    int kq_fd = fd_to_host(epfd);
+-    if (kq_fd < 0) return -LINUX_EBADF;
+-    if (fd_table[epfd].type != FD_EPOLL) return -LINUX_EINVAL;
++    epoll_handle handle __attribute__((cleanup(epoll_handle_end))) = { .native = -1 };
++    int error = epoll_handle_get(epfd, &handle);
++    if (error) return error;
++    int kq_fd = handle.native;
++    epoll_instance_t *inst = handle.inst;
+     if (maxevents <= 0) return -LINUX_EINVAL;
+-
+-    epoll_instance_t *inst = (epoll_instance_t *)fd_table[epfd].dir;
+-    if (!inst) return -LINUX_EINVAL;
+ 
+     /* Atomically install signal mask for the duration of the wait */
+     uint64_t saved_mask = 0;
+@@ -835,6 +984,7 @@
+ 
+     /* Convert timeout */
+     int has_timeout = (timeout_ms >= 0);
++    int64_t deadline = has_timeout ? hl_seqpoll_now() + (int64_t)timeout_ms * 1000000 : INT64_MAX;
+     struct timespec ts;
+     if (has_timeout) {
+         ts.tv_sec = timeout_ms / 1000;
+@@ -856,7 +1006,7 @@
+      * and loop so exit_group can interrupt. Cap maxevents before multiply
+      * to avoid signed integer overflow when maxevents is very large. */
+     if (maxevents > 128) maxevents = 128;
+-    int cap = maxevents * 2; /* Each epoll fd can produce 2 kevents */
++    int cap = maxevents * 3; /* read, write, and logical-state vnode events */
+     if (cap > 256) cap = 256;
+     /* Reserve one slot for the wakeup pipe event */
+     if (added_wakeup && cap < 256) cap++;
+@@ -871,9 +1021,58 @@
+     int pure_wake = 0;   /* see the note in sys_ppoll */
+     if (added_wakeup) atomic_fetch_add(&poll_waiters, 1);
+     do {
+-        nready = kevent(kq_fd, NULL, 0, kevents, cap,
+-                        has_timeout ? &ts : &poll_ts);
+-
++        pthread_mutex_lock(&epoll_state_lock);
++        struct timespec sample = {0};
++        nready = kevent(kq_fd, NULL, 0, kevents, cap, &sample);
++        if (nready >= 0) {
++            for (int fd = 0; fd < FD_TABLE_SIZE && nready < cap; fd++) {
++                epoll_reg_t *reg = &inst->regs[fd];
++                if (!reg->active || reg->oneshot_armed || !reg->of ||
++                    !hl_wc_socket_seqpacket_of(reg->of)) continue;
++                hl_fd_ref_t cur = {0};
++                int current = hl_fd_get_pinned(fd, &cur) == 0 && cur.of &&
++                    cur.of->object_id == reg->object_id && cur.host_fd == reg->host_fd;
++                hl_fd_put(&cur);
++                if (!current) { epoll_reg_release(reg); continue; }
++                int own = hl_wc_socket_read_closed(reg->of, 0);
++                if ((own && (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP))) ||
++                    (own && hl_wc_socket_read_closed(reg->of, 1))) {
++                    EV_SET(&kevents[nready], reg->host_fd, EVFILT_VNODE,
++                        0, 0, 0, (void *)epoll_tag(fd, reg));
++                    nready++;
++                }
++            }
++        }
++        pthread_mutex_unlock(&epoll_state_lock);
++        if (!nready) {
++            if (has_timeout) {
++                int64_t remaining = deadline - hl_seqpoll_now();
++                if (remaining < 0) remaining = 0;
++                ts = (struct timespec){ remaining / 1000000000, remaining % 1000000000 };
++            }
++            nready = kevent(kq_fd, NULL, 0, kevents, cap,
++                            has_timeout ? &ts : (added_wakeup ? NULL : &poll_ts));
++        }
++
++        pthread_mutex_lock(&epoll_state_lock);
++        if (nready > 0) {
++            for (int i = 0; i < nready; i++) {
++                uintptr_t tag = (uintptr_t)kevents[i].udata;
++                if (tag == UINTPTR_MAX) continue;
++                int gfd = epoll_tag_fd(tag);
++                if (!inst->regs[gfd].active || !epoll_tag_matches(tag, &inst->regs[gfd])) {
++                    kevents[i] = kevents[--nready]; i--; continue;
++                }
++                if (kevents[i].filter != EVFILT_VNODE) continue;
++                int fd = epoll_tag_fd((uintptr_t)kevents[i].udata);
++                epoll_reg_t *reg = fd >= 0 && fd < FD_TABLE_SIZE ? &inst->regs[fd] : NULL;
++                int own = reg && reg->active && epoll_tag_matches((uintptr_t)kevents[i].udata, reg) && reg->of && hl_wc_socket_read_closed(reg->of, 0);
++                int relevant = own && ((reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) ||
++                    hl_wc_socket_read_closed(reg->of, 1));
++                if (!relevant) { kevents[i] = kevents[--nready]; i--; }
++            }
++        }
++        pthread_mutex_unlock(&epoll_state_lock);
+         if ((atomic_load(&exit_group_requested) || thread_seccomp_terminated()) ||
+             futex_interrupt_epoch() != irq_epoch) {
+             nready = -1;
+@@ -901,7 +1100,7 @@
+                 if (nready == 0) { pure_wake = 1; break; }
+             }
+         }
+-    } while (nready == 0 && !has_timeout);
++    } while (nready == 0 && (!has_timeout || hl_seqpoll_now() < deadline));
+     if (added_wakeup) atomic_fetch_sub(&poll_waiters, 1);
+ 
+     int saved_errno = errno;
+@@ -923,6 +1122,8 @@
+ 
+     if (nready < 0) { errno = saved_errno; return linux_errno(); }
+ 
++    pthread_mutex_t *locked __attribute__((cleanup(epoll_unlock))) = &epoll_state_lock;
++    pthread_mutex_lock(locked);
+     /* Merge kevent results into epoll_event results. Multiple kevents
+      * for the same fd (READ + WRITE) merge into one epoll_event.
+      * Use guest FD (not user data) as the merge key — two different
+@@ -931,22 +1132,39 @@
+     int out_gfds[256];  /* Parallel array tracking which guest FD each entry is for */
+     int nout = 0;
+ 
+-    for (int i = 0; i < nready && nout < maxevents; i++) {
+-        int gfd = (int)(uintptr_t)kevents[i].udata;
+-        if (gfd < 0 || gfd >= FD_TABLE_SIZE || !inst->regs[gfd].active)
++    for (int i = 0; i < nready; i++) {
++        int gfd = epoll_tag_fd((uintptr_t)kevents[i].udata);
++        if (gfd < 0 || gfd >= FD_TABLE_SIZE || !inst->regs[gfd].active ||
++            !epoll_tag_matches((uintptr_t)kevents[i].udata, &inst->regs[gfd]))
+             continue;
+ 
+         epoll_reg_t *reg = &inst->regs[gfd];
++        if (reg->of) {
++            hl_fd_ref_t current = {0};
++            if (hl_fd_get_pinned(gfd, &current) < 0 || !current.of ||
++                current.of->object_id != reg->object_id) {
++                hl_fd_put(&current);
++                continue;
++            }
++            hl_fd_put(&current);
++        }
+ 
+         /* Check if we already have an entry for this guest fd */
+         int merged = 0;
+         for (int j = 0; j < nout; j++) {
+             if (out_gfds[j] == gfd) {
+                 /* Same fd — merge events */
+-                if (kevents[i].filter == EVFILT_READ)
++                if (kevents[i].filter == EVFILT_READ && (reg->events & LINUX_EPOLLIN))
+                     out[j].events |= LINUX_EPOLLIN;
+-                if (kevents[i].filter == EVFILT_WRITE)
++                if (kevents[i].filter == EVFILT_WRITE && (reg->events & LINUX_EPOLLOUT))
+                     out[j].events |= LINUX_EPOLLOUT;
++                if (kevents[i].filter == EVFILT_VNODE && reg->of) {
++                    if (hl_wc_socket_read_closed(reg->of, 0)) {
++                        if (reg->events & LINUX_EPOLLIN) out[j].events |= LINUX_EPOLLIN;
++                        if (reg->events & LINUX_EPOLLRDHUP) out[j].events |= LINUX_EPOLLRDHUP;
++                    }
++                    if (hl_wc_socket_read_closed(reg->of, 0) && hl_wc_socket_read_closed(reg->of, 1)) out[j].events |= LINUX_EPOLLHUP;
++                }
+                 if (kevents[i].flags & EV_EOF) {
+                     out[j].events |= LINUX_EPOLLHUP;
+                     if (kevents[i].filter == EVFILT_READ &&
+@@ -960,15 +1178,22 @@
+             }
+         }
+ 
+-        if (!merged) {
++        if (!merged && nout < maxevents) {
+             out_gfds[nout] = gfd;
+             out[nout].events = 0;
+             out[nout]._pad = 0;
+             out[nout].data = reg->data;
+-            if (kevents[i].filter == EVFILT_READ)
++            if (kevents[i].filter == EVFILT_READ && (reg->events & LINUX_EPOLLIN))
+                 out[nout].events |= LINUX_EPOLLIN;
+-            if (kevents[i].filter == EVFILT_WRITE)
++            if (kevents[i].filter == EVFILT_WRITE && (reg->events & LINUX_EPOLLOUT))
+                 out[nout].events |= LINUX_EPOLLOUT;
++            if (kevents[i].filter == EVFILT_VNODE && reg->of) {
++                if (hl_wc_socket_read_closed(reg->of, 0)) {
++                    if (reg->events & LINUX_EPOLLIN) out[nout].events |= LINUX_EPOLLIN;
++                    if (reg->events & LINUX_EPOLLRDHUP) out[nout].events |= LINUX_EPOLLRDHUP;
++                }
++                if (hl_wc_socket_read_closed(reg->of, 0) && hl_wc_socket_read_closed(reg->of, 1)) out[nout].events |= LINUX_EPOLLHUP;
++            }
+             if (kevents[i].flags & EV_EOF) {
+                 out[nout].events |= LINUX_EPOLLHUP;
+                 if (kevents[i].filter == EVFILT_READ &&
+@@ -977,6 +1202,7 @@
+             }
+             if (kevents[i].flags & EV_ERROR)
+                 out[nout].events |= LINUX_EPOLLERR;
++            if (out[nout].events == 0) continue;
+             nout++;
+         }
+     }
+--- a/src/syscall_poll.h
++++ b/src/syscall_poll.h
+@@ -19,6 +19,8 @@
+                      uint64_t timeout_gva, uint64_t sigmask_gva);
+ 
+ /* epoll (emulated via kqueue) */
++void epoll_instance_destroy(void *instance);
++int hl_epoll_refresh_socket_states(void);
+ int64_t sys_epoll_create1(int flags);
+ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd,
+                        uint64_t event_gva);
+--- a/src/fd_object.c
++++ b/src/fd_object.c
+@@ -111,7 +111,7 @@
+             if (d->type == FD_DIR)
+                 closedir((DIR *)d->dir);
+             else if (d->type == FD_EPOLL)
+-                free(d->dir);
++                epoll_instance_destroy(d->dir);
+             d->dir = NULL;
+         }
+         hl_open_file_release(d->of);
+@@ -144,7 +144,7 @@
+         if (atomic_load(&d->fd_flags) & LINUX_O_CLOEXEC)
+             fd_table[guest_fd].linux_flags |= LINUX_O_CLOEXEC;
+     }
+-    fd_table[guest_fd].dir = d->dir;
++    fd_table[guest_fd].dir = d->type == FD_EPOLL && d->of ? d->of->state : d->dir;
+     fd_table[guest_fd].of = d->of;
+ }
+ 
+@@ -379,7 +379,7 @@
+ void hl_fd_free_dir(int type, void *dir) {
+     if (!dir) return;
+     if (type == FD_DIR) closedir((DIR *)dir);
+-    else if (type == FD_EPOLL) free(dir);
++    else if (type == FD_EPOLL) epoll_instance_destroy(dir);
+     else if (type == FD_VIRTUAL_DIR) hl_vdir_release(dir);  /* refcounted */
+     /* FD_DEVICE and everything else: not owned here. */
+ }
+--- a/src/fd_object.h
++++ b/src/fd_object.h
+@@ -17,6 +17,7 @@
+  */
+ #ifndef FD_OBJECT_H
+ #define FD_OBJECT_H
++void epoll_instance_destroy(void *);
+ 
+ #include <stdint.h>
+ #include <stddef.h>

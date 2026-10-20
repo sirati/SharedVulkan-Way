@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/select.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -221,6 +222,160 @@ static void shared_shutdown(void) {
     CHECK(close(endpoint) == 0 && close(fd[0]) == 0); close_pair(channel);
     puts("SEQPACKET shared shutdown through rights and fork PASS");
 }
+static void queued_read_shutdown(void) {
+    for (int writer_closed = 0; writer_closed < 2; writer_closed++) {
+        int fd[2], pipefd[2]; pair(fd); CHECK(pipe(pipefd) == 0);
+        CHECK(write(pipefd[1], "R", 1) == 1);
+        send_fd(fd[0], "queued", 6, pipefd[0]);
+        CHECK(close(pipefd[0]) == 0 && close(pipefd[1]) == 0);
+        send_fd(fd[0], "second", 6, -1);
+        if (writer_closed) CHECK(shutdown(fd[0], SHUT_WR) == 0);
+        int alias = dup(fd[1]); CHECK(alias >= 0);
+        CHECK(shutdown(alias, SHUT_RD) == 0 && close(alias) == 0);
+        CHECK(send(fd[0], "late", 4, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+        char bytes[32]; int passed, flags;
+        CHECK(receive(fd[1], bytes, sizeof(bytes), MSG_CMSG_CLOEXEC, &passed, &flags, 1) == 6);
+        CHECK(!memcmp(bytes, "queued", 6) && passed >= 0);
+        CHECK(read(passed, bytes, sizeof(bytes)) == 1 && bytes[0] == 'R');
+        CHECK(close(passed) == 0);
+        CHECK(read(fd[1], bytes, sizeof(bytes)) == 6 && !memcmp(bytes, "second", 6));
+        CHECK(read(fd[1], bytes, sizeof(bytes)) == 0);
+        CHECK(read(fd[1], bytes, sizeof(bytes)) == 0);
+        close_pair(fd);
+    }
+    int fd[2]; pair(fd); send_fd(fd[0], "forkqueue", 9, -1);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) { CHECK(shutdown(fd[1], SHUT_RD) == 0); _exit(0); }
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char bytes[32]; CHECK(read(fd[1], bytes, sizeof(bytes)) == 9 && !memcmp(bytes, "forkqueue", 9));
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 0); close_pair(fd);
+    /* Firefox's receiver blocks before another thread/process calls SHUT_RD. */
+    pair(fd); CHECK(fcntl(fd[1], F_SETFL, 0) == 0);
+    child = fork(); CHECK(child >= 0);
+    if (!child) { usleep(50000); CHECK(shutdown(fd[1], SHUT_RD) == 0); _exit(0); }
+    CHECK(read(fd[1], bytes, sizeof(bytes)) == 0);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close_pair(fd);
+    puts("SEQPACKET queued SHUT_RD rights dup fork and blocking wake PASS");
+}
+static void shutdown_readiness(void) {
+    for (int kind = 0; kind < 3; kind++) {
+        int fd[2]; pair(fd); int ep = -1;
+        struct epoll_event event = { .events = EPOLLIN | EPOLLRDHUP, .data.u64 = 19 }, result;
+        if (kind == 1) {
+            ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+            CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == 0);
+        }
+        pid_t child = fork(); CHECK(child >= 0);
+        if (!child) { usleep(50000); CHECK(shutdown(fd[1], SHUT_RD) == 0); _exit(0); }
+        if (kind == 0) {
+            struct pollfd p = { fd[1], POLLIN | POLLRDHUP, 0 };
+            CHECK(poll(&p, 1, 2000) == 1 && (p.revents & POLLIN) && (p.revents & POLLRDHUP));
+            CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLIN) && (p.revents & POLLRDHUP));
+        } else if (kind == 1) {
+            CHECK(epoll_wait(ep, &result, 1, 2000) == 1 && result.data.u64 == 19 &&
+                  (result.events & EPOLLIN) && (result.events & EPOLLRDHUP));
+            CHECK(epoll_wait(ep, &result, 1, 0) == 1 && (result.events & EPOLLIN) &&
+                  (result.events & EPOLLRDHUP));
+            event.events |= EPOLLOUT;
+            CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, fd[1], &event) == 0);
+            CHECK(epoll_wait(ep, &result, 1, 0) == 1 &&
+                  (result.events & EPOLLIN) && (result.events & EPOLLOUT));
+        } else {
+            fd_set r, w; FD_ZERO(&r); FD_SET(fd[1], &r);
+            struct timespec bounded = {2, 0};
+            CHECK(pselect(fd[1] + 1, &r, NULL, NULL, &bounded, NULL) == 1 && FD_ISSET(fd[1], &r));
+            FD_ZERO(&r); FD_ZERO(&w); FD_SET(fd[1], &r); FD_SET(fd[1], &w);
+            struct timespec zero = {0};
+            CHECK(pselect(fd[1] + 1, &r, &w, NULL, &zero, NULL) == 2 &&
+                  FD_ISSET(fd[1], &r) && FD_ISSET(fd[1], &w));
+        }
+        int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(shutdown(fd[0], SHUT_RD) == 0);
+        struct pollfd p = {fd[1], POLLIN | POLLRDHUP, 0};
+        CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLHUP));
+        if (ep >= 0) CHECK(close(ep) == 0);
+        close_pair(fd);
+    }
+    /* A read-closed peer cannot fabricate writable readiness on a full queue. */
+    int fd[2]; pair(fd); unsigned count = 0; char byte;
+    for (;;) {
+        ssize_t n = send(fd[0], "B", 1, MSG_NOSIGNAL);
+        if (n < 0) { CHECK(errno == EAGAIN); break; }
+        CHECK(n == 1); CHECK(++count < 65536);
+    }
+    CHECK(count > 0 && shutdown(fd[1], SHUT_RD) == 0);
+    struct pollfd p = {fd[0], POLLOUT, 0}; CHECK(poll(&p, 1, 0) == 0);
+    CHECK(send(fd[0], "late", 4, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    for (unsigned i = 0; i < count; i++) CHECK(read(fd[1], &byte, 1) == 1 && byte == 'B');
+    CHECK(read(fd[1], &byte, 1) == 0); close_pair(fd);
+    /* Registration metadata must not retain the actual endpoint transport. */
+    pair(fd); int ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+    struct epoll_event event = { .events = EPOLLIN, .data.u64 = 29 }, result;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == 0 && close(fd[1]) == 0);
+    CHECK(recv(fd[0], &byte, 1, MSG_DONTWAIT) == 0);
+    CHECK(close(fd[0]) == 0 && close(ep) == 0);
+    /* Preserve ordinary legacy pipe epoll behavior while adding metadata. */
+    int pipefd[2]; CHECK(pipe(pipefd) == 0); ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, pipefd[0], &event) == 0 && close(pipefd[1]) == 0);
+    CHECK(epoll_wait(ep, &result, 1, 1000) == 1 && (result.events & EPOLLHUP));
+    CHECK(close(pipefd[0]) == 0 && close(ep) == 0);
+    /* The child's epoll imports precede socket metadata in the fork protocol. */
+    pair(fd); ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == 0);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        CHECK(epoll_wait(ep, &result, 1, 2000) == 1 && (result.events & EPOLLIN));
+        _exit(0);
+    }
+    usleep(50000); CHECK(shutdown(fd[1], SHUT_RD) == 0);
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(close(ep) == 0); close_pair(fd);
+    if (!linux_reference) {
+        pair(fd); ep = epoll_create1(EPOLL_CLOEXEC); CHECK(ep >= 0);
+        event.events = EPOLLIN | EPOLLET;
+        CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == -1 && errno == EOPNOTSUPP);
+        event.events = EPOLLIN; CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, fd[1], &event) == 0);
+        event.events |= EPOLLONESHOT;
+        CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, fd[1], &event) == -1 && errno == EOPNOTSUPP);
+        send_fd(fd[0], "kept", 4, -1);
+        CHECK(epoll_wait(ep, &result, 1, 0) == 1 && (result.events & EPOLLIN));
+        CHECK(close(ep) == 0); close_pair(fd);
+    }
+    puts("SEQPACKET event-driven shutdown poll epoll pselect lifetime PASS");
+}
+static void shutdown_send_race(void) {
+    int fd[2], report[2]; pair(fd); CHECK(pipe(report) == 0);
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) {
+        CHECK(close(report[0]) == 0);
+        unsigned accepted = 0;
+        for (;;) {
+            ssize_t n = send(fd[0], "R", 1, MSG_NOSIGNAL);
+            if (n == 1) { accepted++; continue; }
+            CHECK(n == -1);
+            if (errno == EPIPE) break;
+            CHECK(errno == EAGAIN); usleep(1000);
+        }
+        CHECK(write(report[1], &accepted, sizeof(accepted)) == sizeof(accepted));
+        _exit(0);
+    }
+    CHECK(close(report[1]) == 0); usleep(50000);
+    CHECK(shutdown(fd[1], SHUT_RD) == 0);
+    unsigned drained = 0; char byte;
+    for (;;) {
+        ssize_t n = recv(fd[1], &byte, 1, MSG_DONTWAIT);
+        if (!n) break;
+        CHECK(n == 1 && byte == 'R'); drained++;
+    }
+    unsigned accepted = 0;
+    CHECK(read(report[0], &accepted, sizeof(accepted)) == sizeof(accepted));
+    CHECK(accepted > 0 && drained == accepted);
+    int status; CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(read(fd[1], &byte, 1) == 0);
+    CHECK(close(report[0]) == 0); close_pair(fd);
+    puts("SEQPACKET concurrent accepted records preserved across SHUT_RD PASS");
+}
 static void readiness(void) {
     int fd[2]; pair(fd);
     struct pollfd p = { fd[0], POLLIN | POLLOUT, 0 };
@@ -375,6 +530,6 @@ int main(int argc, char **argv) {
     }
     CHECK(argc == 1 || (argc == 2 && !strcmp(argv[1], "--linux-reference")));
     linux_reference = argc == 2;
-    records(); rights(); endpoints(); shutdowns(); shared_shutdown(); readiness(); unsupported(); byte_copy_refusal(); fork_exec(argv[0]); sender_exit();
+    records(); rights(); endpoints(); shutdowns(); shared_shutdown(); queued_read_shutdown(); shutdown_readiness(); shutdown_send_race(); readiness(); unsupported(); byte_copy_refusal(); fork_exec(argv[0]); sender_exit();
     puts("SEQPACKET ALL PASS"); return 0;
 }
