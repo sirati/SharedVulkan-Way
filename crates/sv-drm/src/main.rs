@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! sv-drm serve [--minor 128] [--devname dri/renderD128] [--owner UID] [--group GID]
-//!              [--mode 0660] [--state FILE]                          (root)
+//!              [--mode 0660] [--state FILE] [--services SOCK]          (root)
+//! sv-drm fuse-node --mount DIR --services SOCK [--name renderD128] -- CMD ARGS...   (test harness)
 //! sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] -- CMD ARGS...
 //! ```
 
@@ -29,9 +30,11 @@ mod linux {
     use sv_drm::cuse::{self, DevInfo, Server, Stop};
     use sv_drm::drm::{DrmNode, ProcResolver};
     use sv_drm::ns::{self, NsConfig};
+    use sv_drm::relay::{self, Services};
 
     const USAGE: &str = "usage:
-  sv-drm serve [--minor 128] [--devname dri/renderD<minor>] [--owner UID] [--group GID] [--mode 0660] [--state FILE]
+  sv-drm serve [--minor 128] [--devname dri/renderD<minor>] [--owner UID] [--group GID] [--mode 0660] [--state FILE] [--services SOCK]
+  sv-drm fuse-node --mount DIR --services SOCK [--name renderD128] -- CMD [ARGS...]   (test harness: the node as a FUSE file, no root)
   sv-drm ns (--state FILE | --dev MAJ:MIN) [--minor N] [--test-node PATH] -- CMD [ARGS...]";
 
     pub fn main() -> i32 {
@@ -44,6 +47,7 @@ mod linux {
         let r = match sub.to_str() {
             Some("serve") => serve(args),
             Some("ns") => ns_main(args),
+            Some("fuse-node") => fuse_node(args),
             Some("-h" | "--help" | "help") => {
                 println!("{USAGE}");
                 return 0;
@@ -102,14 +106,15 @@ mod linux {
         group: Option<u32>,
         mode: u32,
         state: Option<PathBuf>,
+        services: Option<PathBuf>,
     }
 
     fn serve_args(args: Vec<OsString>) -> Result<ServeArgs, String> {
-        let (fl, rest) = flags(args, &["--minor", "--devname", "--owner", "--group", "--mode", "--state"])?;
+        let (fl, rest) = flags(args, &["--minor", "--devname", "--owner", "--group", "--mode", "--state", "--services"])?;
         if !rest.is_empty() {
             return Err("serve takes no command".into());
         }
-        let mut a = ServeArgs { minor: 128, devname: String::new(), owner: None, group: None, mode: 0o660, state: None };
+        let mut a = ServeArgs { minor: 128, devname: String::new(), owner: None, group: None, mode: 0o660, state: None, services: None };
         for (k, v) in fl {
             match k.as_str() {
                 "--minor" => a.minor = num(&k, &v)?,
@@ -123,6 +128,7 @@ mod linux {
                         .ok_or_else(|| format!("--mode: not an octal mode: {v}"))?
                 }
                 "--state" => a.state = Some(PathBuf::from(v)),
+                "--services" => a.services = Some(PathBuf::from(v)),
                 _ => unreachable!(),
             }
         }
@@ -266,8 +272,19 @@ mod linux {
         // SAFETY: a fresh descriptor we own.
         let dev = unsafe { OwnedFd::from_raw_fd(raw) };
         let sig = signal_fd()?;
+        // §112: the services a sandboxed client reaches through the node.
+        let node = match &a.services {
+            Some(p) => {
+                let svc = Services::new();
+                let l = relay::bind_services(p).map_err(|e| format!("--services {}: {e}", p.display()))?;
+                svc.listen(l).map_err(|e| format!("--services: {e}"))?;
+                eprintln!("sv-drm: services registered on {} (0666)", p.display());
+                DrmNode::with_relay(ProcResolver, svc)
+            }
+            None => DrmNode::new(ProcResolver),
+        };
         let mut server = Server::new(
-            DrmNode::new(ProcResolver),
+            node,
             DevInfo { devname: a.devname.clone(), dev_major: 0, dev_minor: a.minor },
         );
         let mut announced = false;
@@ -298,6 +315,62 @@ mod linux {
             Ok(Stop::InitFailed(why)) => Err(format!("CUSE_INIT: {why}")),
             Err(e) => Err(format!("{e}")),
         }
+    }
+
+    // ---- fuse-node (test harness) ----
+
+    /// The node's handler behind `DIR/NAME` on an unprivileged FUSE mount,
+    /// with `--services` as `serve` has it, and `CMD` run as a child (Yama's
+    /// scope 1 lets a non-root `pidfd_getfd` reach descendants only). Exits
+    /// with `CMD`'s status. Not a render node: the file is a regular file.
+    fn fuse_node(args: Vec<OsString>) -> Result<i32, String> {
+        let (fl, cmd) = flags(args, &["--mount", "--services", "--name"])?;
+        let (mut mount, mut services, mut name) = (None, None, "renderD128".to_string());
+        for (k, v) in fl {
+            match k.as_str() {
+                "--mount" => mount = Some(PathBuf::from(v)),
+                "--services" => services = Some(PathBuf::from(v)),
+                "--name" => name = v,
+                _ => unreachable!(),
+            }
+        }
+        let mount = mount.ok_or("--mount is required")?;
+        let services = services.ok_or("--services is required")?;
+        if cmd.is_empty() {
+            return Err(format!("fuse-node needs a command after --\n{USAGE}"));
+        }
+        if !cuse::devname_ok(&name) || name.contains('/') {
+            return Err(format!("--name {name:?}: one plain file name"));
+        }
+        let svc = Services::new();
+        let l = relay::bind_services(&services).map_err(|e| format!("--services {}: {e}", services.display()))?;
+        svc.listen(l).map_err(|e| format!("--services: {e}"))?;
+        let (dev, _watch) = sv_drm::fusenode::mount(&mount).map_err(|e| format!("mounting {}: {e}", mount.display()))?;
+        // SAFETY: getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let server = Server::new(
+            DrmNode::with_relay(ProcResolver, svc),
+            DevInfo { devname: name.clone(), dev_major: 0, dev_minor: 128 },
+        );
+        let mut fs = sv_drm::fusenode::FsNode::new(server, &name, uid, gid);
+        std::thread::Builder::new()
+            .name("sv-drm-fuse".into())
+            .spawn(move || {
+                let r = cuse::serve(dev.as_fd(), &mut fs, || Ok(true), |_| Ok(()));
+                eprintln!("sv-drm: fuse-node: the loop ended: {r:?}");
+            })
+            .map_err(|e| format!("{e}"))?;
+        eprintln!(
+            "sv-drm: fuse-node: {}/{name} (a FUSE file standing in for the node; test harness), services on {}",
+            mount.display(),
+            services.display()
+        );
+        let st = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .status()
+            .map_err(|e| format!("{:?}: {e}", cmd[0]))?;
+        let _ = std::fs::remove_file(&services);
+        Ok(st.code().unwrap_or(128 + std::os::unix::process::ExitStatusExt::signal(&st).unwrap_or(0)))
     }
 
     // ---- ns ----

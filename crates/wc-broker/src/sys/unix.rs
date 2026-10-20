@@ -142,6 +142,21 @@ impl Unix {
         self.inject.clone()
     }
 
+    /// Register the same broker through sv-drm for sandboxed clients. System
+    /// services may accept every uid; the kernel peer identity and existing
+    /// broker policy still decide every request. No user mapping lives here.
+    #[cfg(target_os = "linux")]
+    pub fn register_render_node(&self, services: &std::path::Path) -> io::Result<()> {
+        let inject = self.injector();
+        // SAFETY: geteuid has no preconditions.
+        let any_uid = unsafe { libc::geteuid() } <= sv_drm::relay::SYSTEM_UID_MAX;
+        sv_drm::relay::keep_registered(services.into(), sv_drm::relay::BROKER_SERVICE.into(), any_uid, move |f| {
+            if let Err(e) = inject_render_client(&inject, f) {
+                eprintln!("[wc-broker] refused render-node handoff: {e}");
+            }
+        })
+    }
+
     /// The local services `connect` reaches: a socket path each.
     pub fn with_services(mut self, services: Vec<DevicePath>) -> Unix {
         self.services = services;
@@ -368,6 +383,17 @@ fn raw_if_tty(f: &std::fs::File) {
             }
         }
     }
+}
+
+/// Validate the carrier's metadata against the socket before it reaches
+/// the broker's normal SO_PEERCRED authentication and request policy.
+#[cfg(target_os = "linux")]
+fn inject_render_client(inject: &std::sync::mpsc::Sender<UnixStream>, f: sv_drm::relay::Forwarded) -> io::Result<()> {
+    let peer = sv_drm::relay::peer_cred(&f.stream)?;
+    if peer.uid != f.uid || peer.pid <= 0 || peer.pid as u32 != f.pid {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "render-node peer uid/pid differs from its handoff"));
+    }
+    inject.send(f.stream).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "broker stopped"))
 }
 
 /// The account name of `uid`, from the password database.
@@ -642,6 +668,113 @@ impl Watcher {
             }
             w.insert(pid, (None, vec![exited]));
             true
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod render_node_tests {
+    use super::*;
+    use crate::proto::Request;
+    use crate::server::{Broker, Config};
+    use crate::{Allow, DeviceSpec, Release};
+    use sv_drm::relay::Forwarded;
+
+    fn forwarded(stream: UnixStream) -> Forwarded {
+        let c = sv_drm::relay::peer_cred(&stream).unwrap();
+        Forwarded { uid: c.uid, pid: c.pid as u32, stream }
+    }
+
+    #[test]
+    fn forged_render_node_uid_or_pid_never_enters_the_broker() {
+        let (send, recv) = std::sync::mpsc::channel();
+        for forge_uid in [true, false] {
+            let (_client, stream) = UnixStream::pair().unwrap();
+            let mut f = forwarded(stream);
+            if forge_uid {
+                f.uid = f.uid.wrapping_add(1);
+            } else {
+                f.pid = f.pid.wrapping_add(1);
+            }
+            assert_eq!(inject_render_client(&send, f).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(matches!(recv.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn render_node_registration_reaches_a_service_that_starts_late() {
+        let dir = std::env::temp_dir().join(format!("wc-broker-late-drm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let services_path = dir.join("services.sock");
+        let _ = std::fs::remove_file(&services_path);
+        let unix = Unix::bind(dir.join("broker.sock"), Vec::new()).unwrap();
+        assert!(!services_path.exists());
+        // This returns without the node's service socket being present.
+        unix.register_render_node(&services_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let services = sv_drm::relay::Services::new();
+        services.listen(UnixListener::bind(&services_path).unwrap()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while services.is_empty() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(services.len(), 1, "broker registration did not retry after the node service appeared");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_render_node_handoff_applies_the_mapped_user_service_policy() {
+        for mapped in [true, false] {
+            let dir = std::env::temp_dir().join(format!("wc-broker-render-{}-{mapped}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let hub_path = dir.join("hub.sock");
+            let _ = std::fs::remove_file(&hub_path);
+            let hub = UnixListener::bind(&hub_path).unwrap();
+            let mut unix = Unix::bind(dir.join("broker.sock"), Vec::new()).unwrap()
+                .with_services(vec![DevicePath { name: "sv-hub".into(), path: hub_path }]);
+            // Treat the test process as a desktop client, rather than the
+            // system account that is creating this broker in the test.
+            unix.admins.clear();
+            let inject = unix.injector();
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let f = forwarded(stream);
+            let uid = f.uid;
+            let config = Config {
+                devices: Vec::new(),
+                services: vec![DeviceSpec {
+                    name: "sv-hub".into(),
+                    allow: Allow::Users(vec![User::uid(if mapped { uid } else { uid.wrapping_add(1) })]),
+                }],
+                keys: None, release: Release::OwnerFree, budget: None, run: 1,
+            };
+            let broker = Broker::new(unix, config);
+            std::thread::spawn(move || broker.serve());
+            inject_render_client(&inject, f).unwrap();
+            let mut buf = Vec::new();
+            let mut fds = Vec::new();
+            writeln!(client, "{}", Request::Hello { role: "rdd-test".into() }.line()).unwrap();
+            let hello = recv_line(&client, &mut buf, &mut fds).unwrap().unwrap();
+            assert!(hello.starts_with("ok hello "), "{hello}");
+            assert!(hello.contains(&format!(" uid:{uid} ")), "the relay changed the kernel user: {hello}");
+            assert!(fds.is_empty());
+            writeln!(client, "{}", Request::Connect { name: "sv-hub".into() }.line()).unwrap();
+            let reply = recv_line(&client, &mut buf, &mut fds).unwrap().unwrap();
+            if mapped {
+                assert!(reply.starts_with("ok connect sv-hub "), "{reply}");
+                assert_eq!(fds.len(), 1);
+                let mut connected = UnixStream::from(fds.remove(0));
+                connected.write_all(b"mapped").unwrap();
+                let (mut server, _) = hub.accept().unwrap();
+                let mut bytes = [0u8; 6];
+                std::io::Read::read_exact(&mut server, &mut bytes).unwrap();
+                assert_eq!(&bytes, b"mapped");
+            } else {
+                assert!(reply.starts_with("err service sv-hub is not for "), "{reply}");
+                assert!(fds.is_empty());
+            }
+            drop(client);
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }

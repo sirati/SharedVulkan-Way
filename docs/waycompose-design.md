@@ -33229,7 +33229,10 @@ three times while Console scrolled panicked the guest kernel three times:
 `[data.kalloc.4096]: element modified after free`, the page full of
 `0xff1c1c1e`, Console's background colour. macOS frees a dead process's wired
 pages at once and reuses them; the proxy wrote pixels into them for the rest of
-its 5 s lease. This was 103.14's design and is fixed here:
+its 5 s lease. The keeper below was the initial fix. Its elapsed-time
+release and bounded shutdown were also unsafe: §111.9.3 replaces them with
+release-word-only retention and an unbounded safe shutdown wait. The bullets
+below describe the historical keeper, not the current broker policy.
 
 * While a keeper is installed (`wc_handle::arena::set_region_keeper`), every
   guest-RAM window the main process makes is a POSIX shared-memory object,
@@ -34657,7 +34660,14 @@ wakes the control thread. Here the hub wakes it, which is why this branch
 does not show it; the plain path is a separate fix.
 
 The larger runs, with the hop trace on, so that every sample can be placed
-against the GPU's power transitions (`scripts/wc-hop-stats.py`):
+against the GPU's power transitions (`scripts/wc-hop-stats.py`). The statistics
+script converts both ends of each request with the timeline's fitted clock
+offset and drift. It refuses GPU-wake attribution without a clock fit; RTT
+statistics without a wake file still work with guest stamps alone. The
+machine-readable fit is available through `wc-hop-timeline.py RUNDIR
+--clock-json`. Regression checks run with `python3 scripts/test-wc-hop-stats.py`.
+Reanalysis of `final-c` with this conversion leaves the table below unchanged:
+
 
 | gap | n | mean | p50 | p99 | max | within a GPU wake (set apart) |
 |---|---|---|---|---|---|---|
@@ -34667,8 +34677,9 @@ against the GPU's power transitions (`scripts/wc-hop-stats.py`):
 | 1 s | 300 | 306.7 µs | 275.0 | 812.9 | 5.4 ms | 32, mean 309.0 |
 | 1 s, final configuration | 60 + 200 | 298–317 µs | 262–287 | 470–1341 | 5.5 ms | not traced |
 
-The bound is met back to back and, by the median, at 20 ms. It is **not**
-met by the mean at 1 s between requests: about 300 µs. Where it goes is in
+The mean target is met back to back and in the 180.2 µs final-configuration
+20 ms run. The larger 20 ms run fails it at 240.0 µs, despite its 144.7 µs
+median. The 1 s mean also fails at about 300 µs. Where it goes is in
 the timeline above: on the guest ~105 µs before the request is in the
 ring (a thread's wake on a halted vCPU and the vioser write), ~140 µs
 through QEMU, the hub and the proxy and back, and ~30 µs for the
@@ -37080,37 +37091,115 @@ offset 1728 happened to be nonzero. So, additively:
   sends SIGKILL only to a pid the watcher still watches, and a port that is a
   tty is put in raw mode before it is moved.
 
-The release words are unchanged: the host's `mac-sessiond` writes
-`macboot::RELEASED` once the proxy's and GPU units have ended. The fallback
-is the keeper's, 600 s as an orphan (`--release-after`).
+The host's `mac-sessiond` writes `macboot::RELEASED` once the proxy's and
+GPU units have ended. The daemon uses `Release::Probe { after: None }`.
+Elapsed time cannot prove that the host stopped writing, so there is no
+timeout release and `--release-after` is rejected. The original 600-second
+fallback could free wired pages while the host still wrote into them.
 
-**Shutdown** (103.15): on SIGTERM the daemon keeps running the release rules
-for at most 10 s while it holds orphans, then exits; the plist gives it 15 s
-(`ExitTimeOut`) before launchd's SIGKILL. The main process still answers
-SIGTERM with `down`, so the host releases within about 1–2 s.
+**Shutdown**: SIGTERM first quiesces allocation under the broker's state
+lock, then keeps serving and probing until **all** live and orphan regions
+are released. It waits indefinitely if needed. The original ten-second
+orphan-only wait could exit with live or orphan host mappings and was unsafe.
+The plist now sets `ExitTimeOut` to zero, disabling launchd's automatic
+shutdown SIGKILL deadline. The installer refuses to replace a loaded broker
+or an existing broker socket before changing either end's installed files;
+it no longer issues `launchctl bootout`. To upgrade, first end sessions and
+verify their host release, SIGTERM the daemon, wait for its exit, and prevent
+new sessions before unloading its job. Never force bootout of an old broker
+that still holds regions. A crash, explicit SIGKILL, or VM termination still
+removes this process's holds; crash-safe retention needs an independent
+holder and adoption, and is not implemented.
 
 #### 111.9.4 Tests
 
 * `core::tests` (+2): a released boot region frees its whole pool and ends its
   tie, and nothing of another pool, another user's pool of the same name, or a
   live owner's; a pool that times out ends its ties once.
-* `tests/unix.rs` (+2), the keeper on a real socket, as Linux runs the same
+* `tests/unix.rs`, the keeper on a real socket, as Linux runs the same
   code but the watcher: a "main" process allocates the arena and the ring
   window and writes a boot page, a "GPU server" ties itself; the main process
   is killed with SIGKILL; the two regions stay held and readable for 2.5 s
   without the word; the test writes `RELEASED` into the boot page as the host
   does, and within a tick both regions are gone and the GPU process is
-  SIGKILLed. A second test: an arena page with the release value at the
-  offset releases nothing (it is not a boot page), and the pool goes at its
-  time limit with its tie.
-* `daemon::tests` (2): `serve`'s arguments and defaults; the plist keeps the
-  daemon alive and gives it longer than its own shutdown wait.
+  SIGKILLed. This test uses no timeout release, matching the daemon. A
+  separate generic core-policy test uses an explicit optional timeout; it
+  does not select the policy used for host-visible wired RAM.
+* `daemon::tests`: `serve` arguments reject timeout-release overrides; a
+  simulated month without a host release retains both orphan regions; the
+  release word frees the pool; the plist disables forced-kill deadlines.
+* `daemon_shutdown_retains_live_regions_and_orphans_until_explicit_release`:
+  a real daemon receives SIGTERM with a live region, remains alive beyond
+  the old ten-second limit, then retains the orphan, rejects allocation and
+  exits only after explicit adoption/free. Runs on Linux without a VM.
+* `scripts/mac-broker-term-test.sh`: VM stubs cover a root daemon staying
+  alive, actual exit plus a live replacement, probe/transport errors, an
+  unchanged pid, invalid pid output and a dead replacement. Shutdown
+  observation uses a monotonic 12-second deadline, comprising the expected
+  ten-second released-pool case and a two-second scheduling/SSH margin.
+  Every VM call is bounded by the remaining deadline; retained active
+  regions correctly make this timing gate fail rather than force an exit.
 * `wc-arena-host`: `who_asked_is_read_and_with_keys_verified` (the identity
   reported, verified with `--keys`, refused when another user's identity is
   written over it or the record is unsigned). `sessiond_ivshmem` verifies with
   `verifies_identity`, which is §107's check when there is no identity.
 
-VM_RESULTS
+**In the VM** (wayland-host, 4096 MiB, 2026-10-20 11:06–11:20,
+`scripts/mac-broker-test.sh` driven by a waiter; evidence in
+`/mnt/datasets/builds/evidence/session-fixes/broker-mac/`, `broker-*.txt`,
+`keeper-*.txt`, `broker-daemon.log`, `vmrun.log`):
+
+* **The daemon and the ports.** launchd ran it (`keepalive | runatload`).
+  The port nodes became `crw------- root wheel`, the socket
+  `srw-rw-rw-`, the keys directory `drwx------` and the key `-rw-------`, all
+  root's. The VM's user could not read the key. The daemon lent `wcbell` to
+  every main process and `svbell` to the GPU server (`device ... lent to
+  process N`), and logged each exit by kqueue (`process N (main) exited`).
+* **SIGKILL of the main process under load, 5 times** (Console open, foot on
+  this side scrolling `seq` into the session): every time the broker held
+  the session's two windows (64 MiB arena, 6 MiB rings) as orphans after the
+  exit, the host's session service took the session down and wrote the
+  release word, and the broker freed the pool on it (`the release word of
+  pool wcm-N is set; freeing the pool's orphans`). Kernel panic reports
+  before 0, after 0; the guest stayed up.
+* **The GPU server** was tied to its session (`ends with pool`), its exit
+  seen, and its session's pool freed by the release word; 300 frames
+  presented (PASS).
+* **SIGTERM to the daemon** while it held 2 orphans: the daemon logged its
+  shutdown wait, but exit and restart were not proved. The harness queried
+  the root daemon with an unprivileged `kill -0`, which treats permission
+  denial as process exit. It then reported the same pid before and after
+  the signal. The 0.70 s measurement is invalid. The harness now requires a successful root probe and positive PID absence,
+  enforces an elapsed observation deadline, and validates a different live
+  replacement pid; a VM rerun is pending.
+* **A second macOS user** (`wctest2`, made with `sysadminctl`, deleted
+  after): its `open` of user 1's regions, `find` of user 1's pool and
+  `device wcbell` (held by user 1's main process) were refused by uid; it
+  could not read the key; its own `alloc` worked; `sign` named it
+  (`os=macos user=wctest2 id=503`). The host logged user 1's sessions as
+  `asked by os=macos user=<user> id=501 (verified, installation wcm)`.
+  `svbell`, free at that moment, was lent to user 2: a free device goes to
+  any user, one at a time, by design.
+
+**Not shown by this run, and why:**
+
+* **Wayland round trip and present time, before and after.** The VM was
+  slow throughout. The host's memory group for the macOS VMs was near its
+  limit while another instance ran, and every number was far from §103.15's
+  in both builds: the GPU present was 8.50 ms/frame with the keeper and
+  23.35 ms/frame with the broker (§103.15: 0.56), and the broker's
+  2000 round trips gave p50 3.52 ms, p99 179 ms (§103.15: 0.248, 0.322). The
+  keeper's round-trip leg produced no number: its main process had already
+  ended when the client connected. Nothing on the data path changed (the
+  doorbell is the same port, now an inherited fd; the windows are the same
+  wired pages), but "the same within noise" is **not measured**; it needs a
+  rerun on a quiet host.
+* **The second user's own session.** Its main process, started with
+  `sudo -u` from ssh, wrote no log, so a second session side by side was not
+  run.
+* The harness's check that a user cannot open a port node itself used
+  `head -c0`, which macOS rejects; the node modes above are the evidence.
+  Fixed for the next run.
 
 #### 111.9.5 Limits
 
@@ -37118,7 +37207,10 @@ VM_RESULTS
   A second macOS user's session gets no doorbell: it polls its rings, and the
   host finds its record only by a periodic sweep (`--sweep-secs`). A port per
   user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
-* **A broker that dies loses its holds.** launchd restarts it, but the new
+* **A broker that dies loses its holds.** Normal SIGTERM retains every
+  live and orphan region until release, and launchd has no automatic
+  SIGKILL deadline, but a crash or explicit forced kill is still unsafe.
+  launchd restarts it, but the new
   process holds none of the old one's regions: a main process that dies after
   that, before its session's release, is the §103.15 case again. The broker
   has no state to lose otherwise. A main process could hand its fds back to a
@@ -37518,3 +37610,186 @@ the keeper holds it (§103.15).
 witness, `WC_LAUNCH_VM_UNIT=windows-vm` in the session service's environment
 on testhost (nix-config). Without the guest build the old lease stands;
 without the unit the 20 s bound applies.
+
+**The QEMU cause and live recovery.** A configuration switch restarted the
+host's input-injection daemon. Its old evdev node disappeared while QEMU
+still held it open. `virtio_input_host_event` returned from `read` with
+`ENODEV` but left its fd handler registered, so the main loop repeatedly
+polled the dead device and starved vCPU requests for the BQL. The host
+configuration now has a staged patch that unregisters that handler on a
+permanent read error, and prevents switches from restarting the daemon.
+The QEMU patch takes effect at the next planned VM start.
+
+On 2026-10-20 the approved live recovery removed only the dead input PCI
+device through QMP, waited for `DEVICE_DELETED`, and re-added it against
+the current evdev node with the same device ID, PCI bus and slot. The VM
+process and desktop session stayed running. Main-thread CPU fell from
+99.8% to 3.2% over five-second samples. The replacement retained its BAR
+addresses, Windows reported its driver ready, and the guest consumed the
+input queue descriptors. Desktop input delivery still needs a visible
+check. This operation did not change the GPU or its power state.
+
+The following thirty-minute observation contained 13 complete GPU D0
+dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
+the busy-loop recovery under that workload. The process that triggers the
+periodic GPU wake remains unidentified.
+## 112. Stock Firefox on the dma-buf path
+
+This branch provides the render-node relay prerequisite only. The stock
+Firefox swapchain, default-settings hardware selection and guest video proof
+remain on the separate stock-firefox branch. No application patch or sandbox
+exception is introduced here.
+
+
+### 112.x The render node introduces a sandboxed client to its GPU services
+
+Branch `sf-relay`. Stock Firefox decodes video in its RDD process, and that
+process loads our ICD inside Firefox's default sandbox. The sandbox (Firefox
+157, `security/sandbox/linux`) gives it the `/dev/dri` tree read-write, every
+DRM (`'d'`) and dma-buf (`'b'`) ioctl, `socketpair(AF_UNIX, STREAM|SEQPACKET)`,
+`sendmsg`/`recvmsg`, `mmap`, `memfd_create` and `F_ADD_SEALS`. It does not let
+the process `connect()` to `SV_SOCKET` or `SV_BELL`, nor open the GPU pool's
+file by name. A real driver reaches its kernel side through `renderD128`; ours
+now reaches its services the same way.
+
+**The ioctl.** `sv-drm serve --services PATH` answers one driver-private
+ioctl, `DRM_IOCTL_SVDRM_CONNECT` = `DRM_IOW(DRM_COMMAND_BASE + 0, struct
+drm_svdrm_connect)` = `0x40446440`, with
+
+```c
+struct drm_svdrm_connect {
+    __s32 fd;          /* the caller's end of a socketpair it made */
+    char  service[64]; /* NUL-terminated, 1..63 bytes of 0x21..0x7e */
+};
+```
+
+`sv-drm` takes the uid and the calling task from the FUSE header, looks the
+name up, and only then takes the descriptor with `pidfd_open` (falling back to
+`PIDFD_THREAD`, because the header names the calling thread) and
+`pidfd_getfd`. It passes it on only if it is an `AF_UNIX` stream or seqpacket
+socket whose `SO_PEERCRED` uid is the caller's. Without `--services` the ioctl
+answers `EOPNOTSUPP`.
+
+**Registration.** The control socket (`--services`, mode 0666, its directory
+made 0755 if absent) takes one line per connection: `register NAME` serves
+the registrant's own `SO_PEERCRED` uid; `register NAME ANY-UID` serves every
+uid and is refused unless the registrant is uid 0 or a system uid (< 1000),
+which then does its own `SO_PEERCRED` check. A refused registration is closed
+without a reply. A registration lives as long as its connection; anything the
+registrant sends after the line ends it. A second registration of a
+`(NAME, scope)` that is still live is refused (the first one wins until its
+connection closes). For each forwarded client `sv-drm` sends `conn UID PID\n`
+on the registration connection with the descriptor as `SCM_RIGHTS`, in one
+`sendmsg` with `MSG_DONTWAIT`: a service that does not read costs the client
+an `EAGAIN`, never the node's loop. PID is the caller's thread group, in
+`sv-drm`'s pid namespace. This is the shape agreed with `wc-broker`
+(`register waycompose-broker ANY-UID`).
+
+**Forwarding.** A caller of uid U asking for NAME reaches `(NAME, U)` if
+registered, else `(NAME, ANY-UID)`. Nothing registered under NAME is
+`ENOENT`; NAME registered only for other uids is `EACCES`. `sv-drm` never
+opens a file or connects anywhere for a caller; it moves a socket the caller
+made to a service that asked for it.
+
+**Names.** `sv-gpu:` + `SV_SOCKET` and `sv-bell:` + `SV_BELL`, byte for byte
+as both sides were given them (`sv_drm::relay::service_name`). When that is
+not a valid name (too long, or a space in the path), the name is the prefix,
+`#`, and the path's 64-bit FNV-1a hash in 16 hex digits.
+
+**sv-hostd.** `ivshmem-serve --drm-services PATH` registers
+`sv-gpu:<--socket>` for its own uid, keeps the registration (re-registering a
+second after it ends), checks each forwarded client's `SO_PEERCRED` uid once
+more, and serves it exactly as an accepted connection. `bell-hub
+--drm-services PATH` registers `sv-bell:<hub socket>` per port and adds
+forwarded clients to the hub.
+
+**The cold path by descriptor.** Three messages, new tags, so an old daemon
+refuses them as unexpected and an old ICD never sends them:
+
+| message | tag | meaning |
+|---|---|---|
+| `AttachRequestFds` | 9 | the client cannot open names: answer with descriptors |
+| `RegionRequest { k: u32 }` | 10 | after such an attach: region `k` of the pool |
+| `Region { k: u32, len: u64 }` | 11 | region `k` is `len` bytes; its descriptor comes with it |
+
+The `Attach` that answers `AttachRequestFds` carries no names. It comes with
+the control object's descriptor and, if the arena is another object, the
+arena's (`sv_transport::localfd::MAX_FDS` is 2 now). The objects are the ones
+a named client would have opened, opened by `sv-hostd` as the same user. The
+connection then stays open, and `RegionRequest { k }` is answered with
+`poolhdr::region_path(region, k)`'s descriptor, or `Refuse`.
+
+**sv-icd.** Only when `SV_DRM_NODE` is set and the direct path fails. Either
+`connect(SV_SOCKET)` fails (each retry within the existing 10 s also tries the
+node), or the names in the `Attach` do not open (then the exchange starts over
+through the node). In both cases the ICD opens the node, makes a socketpair,
+issues the ioctl, and runs the same exchange asking for descriptors. The pool
+is then `PoolSource::Relay`: region 0 and every later region come by
+`RegionRequest`. The doorbell's connector tries `SV_BELL` and then the node,
+on every reconnect. Everything else is unchanged; Windows and macOS builds do
+not have this code.
+
+**What a test without root can show.** `/dev/cuse` is root's, so locally the
+node is `sv-drm fuse-node`: the same handler behind one regular file on an
+unprivileged FUSE mount. A FUSE file answers ioctls in restricted mode, where
+the kernel copies the argument by the size and direction in the number, which
+is all this ioctl needs, so the ICD runs its real open, socketpair and ioctl.
+The differences from `serve`: the file is not a character device, so the
+dma-buf path stays off; and `pidfd_getfd` runs without root, which Yama's
+scope 1 allows only for descendants, so `fuse-node` runs the clients as its
+children. `serve` runs as root and has `CAP_SYS_PTRACE`, so the clients do
+not need to be its descendants; under Yama's scope 3 nobody can call
+`pidfd_getfd` and the relay cannot work.
+
+`scripts/sv-relay-e2e.sh` runs `sv-pool-e2e.sh`'s topology (pool-guest on
+lavapipe, `ivshmem-serve` with the mailbox cold path, the bell hub) with both
+sockets behind a directory made mode 000, so `connect()` fails with `EACCES`
+as in the sandbox. Results are in 112.x.1.
+
+**Not shown here.** That Firefox's RDD sandbox lets exactly this through (the
+open of the node by its path through the broker, the `'d'` ioctl with this
+number, the socketpair): that needs the real node, which needs root, and the
+real Firefox. CUSE delivers the same header (uid, calling thread, in
+`sv-drm`'s namespaces) as FUSE, and both carry the ioctl through the same
+`fuse_do_ioctl`, but with CUSE in unrestricted mode, which costs one retry
+round (unit-tested over the CUSE harness, not with a kernel).
+
+#### 112.x.1 Checked locally
+
+| test | result |
+|---|---|
+| `sv-drm` unit tests (`relay`, `drm`, `fusenode`) | the ioctl number and struct; the registration rule (ANY-UID refused for uid ≥ 1000) and the forwarding rule (own uid, then ANY-UID; `EACCES`, `ENOENT`) as pure functions; through the CUSE harness, both by `Server::handle` and by `cuse::serve` over a seqpacket socketpair: an unregistered name is `ENOENT`, a caller of another uid is `EACCES`, a granted one reaches the service, which sees the client's `SO_PEERCRED`; a socketpair made by a forked child reaches the service with the child's pid and uid; a registration ends with its connection |
+| `sv-transport`, `sv-icd` unit tests | the three new messages round-trip; an `Attach` with two descriptors; `RegionRequest` answered by a descriptor and by a refusal |
+| `scripts/sv-relay-e2e.sh` | PASS: both services registered through `--drm-services`; without `SV_DRM_NODE` the ICD is refused (`Permission denied`); with it, two `vulkaninfo`, two `gl-probe` frames on Zink and three pool fills pass as in `sv-pool-e2e.sh`, every attach (≥ 7) by descriptor through the node, every pool region by `RegionRequest`, the doorbell through the node, every session's leases given back |
+| `scripts/sv-pool-e2e.sh`, `scripts/sv-dmabuf-e2e.sh` | PASS, PASS (unchanged paths) |
+| `cargo test -p sv-drm -p sv-hostd -p sv-icd -p sv-transport` | 284 passed, 0 failed, 5 ignored |
+| `cargo clippy` on those crates, `--all-targets` | no warning in a line this branch wrote |
+| `cargo check --workspace --target x86_64-pc-windows-gnu`; `-p wc-launch -p wc-compositor --target x86_64-apple-darwin` | exit 0 |
+
+Logs: `/mnt/datasets/builds/evidence/stock-firefox/relay/`.
+
+Not exercised by a test: a pool region other than 0 by `RegionRequest` (the
+local pool has one region; the ICD's path is the same call with another `k`);
+`ivshmem-serve`'s built-in `--bell` hub and `sv-hostd serve`/`qemu-serve`,
+which do not register; an `ANY-UID` registration accepted (the tests run as a
+user; the rule is a pure function, tested).
+
+#### 112.x.2 System broker entry for mapped sandboxed clients
+
+A system bell hub keeps its direct relay restricted to its own uid. Desktop
+users reach it through the existing broker service policy instead. On Linux,
+the embedded session broker registers `waycompose-broker` on
+`/run/sv-drm/services.sock`, retrying if the render service starts later,
+with `ANY-UID` only for a system uid. A sandboxed broker
+client whose direct socket connection fails can use `SV_DRM_NODE` to reach
+that endpoint. The broker checks the forwarded uid and pid against the
+socket's kernel credentials before injecting it into the ordinary accept
+path. That path authenticates the peer again and applies its existing mapped
+user list to `Connect sv-hub` and `Connect wl-hub`.
+
+The ICD preserves `broker:NAME` connections when using the reconnect callback.
+There is no second mapping table, direct cross-user hub grant, or change to
+the shared-memory data path. Linux-only dependencies leave the other platform
+backends unchanged. Regression tests send a real forwarded socket through the
+broker protocol: mapped access receives a hub fd, unmapped access is refused,
+and forged uid or pid metadata never reaches the broker's incoming queue.

@@ -17,8 +17,9 @@
 #           process killed with SIGKILL; the broker's log must show the
 #           windows held as orphans until the release word, and the guest's
 #           panic count and uptime must stay.
-#   term  : SIGTERM to the daemon while it holds orphans: it exits within
-#           10 s, and launchd starts it again (KeepAlive).
+#   term  : SIGTERM with releasable orphans: observe exit within 10 s plus
+#           2 s scheduling/SSH margin, then a live replacement from launchd.
+#           Unreleased regions must keep it alive; this phase must fail.
 #   users : a second macOS user (sysadminctl, deleted at the end): its
 #           processes cannot open the first user's regions, cannot take the
 #           ports, and the boot record the broker signs for it names it.
@@ -27,6 +28,7 @@
 # never into the repository. The VM is reached over the VM manager's own ssh,
 # as every harness here does; the product never is.
 set -uo pipefail
+source "$(dirname "$0")/lib/mac-broker-term.sh"
 inst=${MACVM_INSTANCE:-wayland-host}
 idir=/mnt/datasets/macvm/instances/$inst
 VMUSER=$(sed -n 's/.*"user": "\([^"]*\)".*/\1/p' "$idir/instance.json")
@@ -60,7 +62,7 @@ phase_state() {
     echo "== ports"; vm "ls -l /dev/cu.org.sirati.*"
     echo "== socket"; vm "ls -ld /var/run/waycompose /var/run/waycompose/broker.sock"
     echo "== keys"; vm "sudo -n ls -la \"$SYS/keys\" \"$SYS/bin\""
-    echo "== the VM's user opens a port itself"; vm "head -c0 /dev/cu.org.sirati.wcbell.0 && echo OPENED || echo refused: \$?" 2>&1
+    echo "== the VM's user opens a port itself"; vm "( : </dev/cu.org.sirati.wcbell.0 ) 2>/dev/null && echo OPENED || echo refused: \$?" 2>&1
     echo "== the VM's user reads a key"; vm "cat \"$SYS/keys/wcm.key\" >/dev/null 2>&1 && echo READ || echo refused"
     echo "== stats"; vm "\"$SYS/bin/wc-broker\" ctl 'hello state' stats"
   } 2>&1 | tee "$out"
@@ -124,18 +126,16 @@ phase_kill() {
 phase_term() {
   local out="$EVID/$TAG-term.txt"
   {
-    local p0; p0=$(vm "sudo -n launchctl print system/org.waycompose.broker | sed -n 's/.*pid = //p'")
+    local p0; p0=$(term_launchd_pid) || return 1;
+    term_pid "$p0" || { echo "FAIL: invalid original daemon PID"; return 1; }
     echo "daemon pid $p0"
     # Orphans to hold: a main process killed, the host given no time.
-    local sid; sid=$(start_main); sleep 2
+    local sid; sid=$(start_main);
+    [[ $sid =~ ^wcm-[1-9][0-9]*$ ]] || { echo "FAIL: no live main session"; return 1; }
+    sleep 2
     vm "kill -9 ${sid#wcm-}"; sleep 0.5
     vm "\"$SYS/bin/wc-broker\" ctl 'hello term' stats"
-    local t0; t0=$(date +%s.%N)
-    vm "sudo -n kill -TERM $p0"
-    for _ in $(seq 1 300); do vm "kill -0 $p0 2>/dev/null" || break; sleep 0.1; done
-    echo "the daemon ended $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}') s after SIGTERM"
-    sleep 3
-    echo "relaunched by launchd: pid $(vm "sudo -n launchctl print system/org.waycompose.broker | sed -n 's/.*pid = //p'")"
+    term_wait_restart "$p0" || return 1
     broker_log | grep -E "SIGTERM|orphan|exiting" | tail -4
   } 2>&1 | tee "$out"
 }
@@ -155,7 +155,7 @@ phase_users() {
     for id in $ids; do vm "$as2 'open $id'"; done
     vm "$as2 'find $sid' 'device wcbell' 'device svbell'"
     echo "== user 2 opens the port nodes and user 1's keys itself"
-    vm "sudo -n -u $U2 sh -c 'head -c0 /dev/cu.org.sirati.wcbell.0 && echo OPENED || echo refused'" 2>&1
+    vm "sudo -n -u $U2 sh -c '( : </dev/cu.org.sirati.wcbell.0 ) 2>/dev/null && echo OPENED || echo refused'" 2>&1
     vm "sudo -n -u $U2 sh -c 'cat \"$SYS/keys/wcm.key\" >/dev/null 2>&1 && echo READ || echo refused'"
     echo "== user 2's own region and its signature"
     vm "$as2 'hello u2' 'alloc u2pool 8192' 'sign wcm u2-1 0 1 2 0 3 2 0 1' stats"
@@ -181,7 +181,7 @@ for p in "$@"; do
     rtt) phase_rtt ;;
     gpu) phase_gpu ;;
     kill) phase_kill "${KILLS:-5}" ;;
-    term) phase_term ;;
+    term) phase_term || exit 1 ;;
     users) phase_users ;;
     *) echo "unknown phase $p"; exit 2 ;;
   esac

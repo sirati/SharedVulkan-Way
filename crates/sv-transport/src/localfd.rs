@@ -53,10 +53,11 @@ use std::os::unix::net::UnixStream;
 
 /// The most descriptors one message may carry.
 ///
-/// One, and it is the dma-buf. It was two before the boundary rule: the control
-/// region used to be a second memfd, and it is a named object on every path now
-/// — so the count fell out of the rule rather than being tuned.
-pub const MAX_FDS: usize = 1;
+/// Two since waycompose-design.md §112: a client reached through the render
+/// node cannot open names, so its `Attach` comes with the control object's
+/// descriptor and, when the arena is another object, the arena's. Otherwise
+/// it is the dma-buf alone. Both fit the 24 bytes `CMSG_SPACE` rounds one to.
+pub const MAX_FDS: usize = 2;
 
 /// Send a message, passing up to [`MAX_FDS`] descriptors with it.
 ///
@@ -305,12 +306,32 @@ mod tests {
         assert_eq!(&out, b"crossed");
     }
 
+    /// waycompose-design.md §112: an `Attach` by descriptor carries the control
+    /// object and the arena, two descriptors, and both arrive.
     #[test]
-    fn the_control_buffer_holds_exactly_one_descriptor() {
+    #[cfg_attr(miri, ignore = "socketpair and sendmsg are syscalls Miri does not implement")]
+    fn two_descriptors_cross_with_an_attach() {
+        use crate::region::memfd;
+        use std::os::fd::AsFd;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (c, r) = (memfd("ctl", 4096).unwrap(), memfd("arena", 8192).unwrap());
+        let msg = ColdMessage::Region { k: 1, len: 8192 };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).unwrap();
+        send_with_fds(&a, &buf, &[c.as_fd(), r.as_fd()]).unwrap();
+        let (got, fds) = recv_all(&b).unwrap();
+        assert_eq!(got, msg);
+        assert_eq!(fds.len(), 2);
+        let len = |f: &OwnedFd| std::fs::File::from(f.try_clone().unwrap()).metadata().unwrap().len();
+        assert_eq!((len(&fds[0]), len(&fds[1])), (4096, 8192), "in order");
+        assert!(send_with_fds(&a, &buf, &[c.as_fd(), r.as_fd(), c.as_fd()]).is_err());
+    }
+
+    #[test]
+    fn the_control_buffer_holds_two_descriptors() {
         assert_eq!(sys::cmsg_space(1), sys::CMSG_SPACE_MAX_FDS);
-        // Two would still fit in the 24 bytes `CMSG_SPACE` rounds to, and it is
-        // `MAX_FDS` rather than the buffer that says one is the limit now.
-        assert_eq!(MAX_FDS, 1);
+        assert_eq!(sys::cmsg_space(MAX_FDS), sys::CMSG_SPACE_MAX_FDS);
+        assert_eq!(MAX_FDS, 2);
         assert!(sys::cmsg_space(3) > sys::CMSG_SPACE_MAX_FDS);
     }
 }
