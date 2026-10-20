@@ -196,7 +196,7 @@ pub struct ProtectedGrants<S: DurableStore, B: OriginalBacking> {
     records: BTreeMap<u64, Record<B>>,
     geometry: BackingGeometry,
     next_projection: u64,
-    native_exports: Arc<std::sync::Mutex<BTreeMap<native::ExportKey, u64>>>,
+    native_exports: Arc<std::sync::Mutex<Option<native::Provider>>>,
 }
 impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
     /// Start the sole protected canonical allocator. The protected launcher
@@ -288,7 +288,7 @@ impl<S: DurableStore, B: OriginalBacking> ProtectedGrants<S, B> {
             records: BTreeMap::new(),
             geometry,
             next_projection: 1,
-            native_exports: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            native_exports: Arc::new(std::sync::Mutex::new(None)),
         })
     }
     fn check_lifecycle(&self, lifecycle: &Lifecycle<S, B>) -> io::Result<()> {
@@ -949,8 +949,21 @@ mod tests {
             },
         ]
     }
+    struct TestProvider;
+    // SAFETY: explicit simulated provider, no kernel authority claim.
+    unsafe impl native::NativeProviderAuthority for TestProvider {}
     fn owner(c: &Context) -> Owner {
-        unsafe { ProtectedGrants::start(c.clone(), layout()).unwrap() }
+        let mut owner = unsafe { ProtectedGrants::start(c.clone(), layout()).unwrap() };
+        // Explicit simulated monotonic provider, never a native enrollment claim.
+        unsafe {
+            owner
+                .enroll_native_provider(
+                    Arc::new(TestProvider),
+                    native::NativeLimits::new(64, 32, 16, 64 * MIB).unwrap(),
+                )
+                .unwrap()
+        };
+        owner
     }
     fn setup() -> (
         Owner,
@@ -1606,6 +1619,9 @@ mod tests {
             let access = ticket.access();
             let source = guard.original().geometry().physical;
             self.next += 1;
+            if self.wrong == 5 {
+                return Err(denied("simulated failed CREATE"));
+            }
             let offset = extent.offset + if self.wrong == 1 { PAGE } else { 0 };
             let access = if self.wrong == 2 {
                 ProjectionAccess::ReadOnly
@@ -1615,7 +1631,7 @@ mod tests {
             let export = if self.wrong == 3 { 1 } else { self.next };
             let identity = unsafe {
                 native::NativeExportIdentity::from_kernel(
-                    [5; 16],
+                    if self.wrong == 4 { [6; 16] } else { [5; 16] },
                     export,
                     source,
                     offset,
@@ -1624,6 +1640,143 @@ mod tests {
                 )?
             };
             unsafe { ticket.bind(identity, self.target.clone()) }
+        }
+    }
+    #[test]
+    fn native_admission_recovers_for_repeated_exact_retirements() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        owner
+            .native_exports
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .limits = native::NativeLimits::new(2, 2, 1, PAGE).unwrap();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 0,
+            wrong: 0,
+        };
+        for _ in 0..100 {
+            let authority = owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .unwrap();
+            assert_eq!(
+                owner
+                    .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            // Rejection happened before CREATE, and did not quarantine the grant.
+            assert!(!owner.records[&grant.id].quarantined);
+            let proof = unsafe { authority.prove_retired().unwrap() };
+            owner.complete_projection(&life, &grant, proof).unwrap();
+            assert!(owner.records[&grant.id].native_holds.is_empty());
+        }
+        assert_eq!(backend.next, 100);
+        assert_eq!(
+            owner
+                .native_exports
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .high_water,
+            100
+        );
+    }
+    #[test]
+    fn native_limits_require_positive_ordered_policy_and_pin_one_provider() {
+        assert!(native::NativeLimits::new(0, 0, 0, PAGE).is_err());
+        assert!(native::NativeLimits::new(1, 2, 1, PAGE).is_err());
+        assert!(native::NativeLimits::new(2, 1, 2, PAGE).is_err());
+        assert!(native::NativeLimits::new(2, 1, 1, 0).is_err());
+        let (mut owner, _, _, _, _, _, _, _) = setup();
+        assert!(
+            unsafe {
+                owner.enroll_native_provider(
+                    Arc::new(TestProvider),
+                    native::NativeLimits::new(2, 1, 1, PAGE).unwrap(),
+                )
+            }
+            .is_err()
+        );
+    }
+    #[test]
+    fn native_high_water_accepts_burned_gaps_but_refuses_out_of_order() {
+        let (mut owner, mut life, _, _, _, _, _, _) = setup();
+        let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+        let (producer, target) = process(&mut owner, &life, &grant);
+        let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+        let mut backend = TicketBackend {
+            target,
+            next: 10,
+            wrong: 0,
+        };
+        let authority = owner
+            .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+            .unwrap();
+        let proof = unsafe { authority.prove_retired().unwrap() };
+        owner.complete_projection(&life, &grant, proof).unwrap();
+        backend.next = 8;
+        assert!(
+            owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .is_err()
+        );
+        assert!(owner.records[&grant.id].quarantined);
+        assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+        assert_eq!(
+            owner
+                .native_exports
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .high_water,
+            11
+        );
+    }
+    #[test]
+    fn native_provider_mismatch_and_failed_create_keep_admission_and_quarantine() {
+        for wrong in [4, 5] {
+            let (mut owner, mut life, _, _, _, _, _, _) = setup();
+            let grant = owner.grant(&mut life, GrantKind::Pixel, 4 * PAGE).unwrap();
+            let (producer, target) = process(&mut owner, &life, &grant);
+            let (allocation, _) = owner.allocate(&life, &producer, 1, PAGE).unwrap();
+            let mut backend = TicketBackend {
+                target,
+                next: 0,
+                wrong: 0,
+            };
+            let authority = owner
+                .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                .unwrap();
+            let proof = unsafe { authority.prove_retired().unwrap() };
+            owner.complete_projection(&life, &grant, proof).unwrap();
+            backend.wrong = wrong;
+            assert!(
+                owner
+                    .project_producer_tracked(&life, &producer, &allocation, &mut backend)
+                    .is_err()
+            );
+            assert!(owner.records[&grant.id].quarantined);
+            assert_eq!(owner.records[&grant.id].native_holds.len(), 1);
+            assert_eq!(
+                owner
+                    .native_exports
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .high_water,
+                1
+            );
         }
     }
     #[test]
