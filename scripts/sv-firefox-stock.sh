@@ -42,6 +42,8 @@
 #   SVFS_CODECS    "H264" (default); "H264 HEVC" once Zink's VA driver has H.265
 #   SVFS_MESA      the GPU sessions' Mesa (a store path of nix/mesa-zink-va.nix);
 #                  without it there is no VA-API driver and no decode check passes
+#   SVFS_GTK       shipped GTK original-backing library output (optional)
+#   SVFS_NATIVE_SHM_FIXTURE 1 explicitly permits local named-file allocations
 #   SVFS_BIN       Linux build dir (default target/release)
 set -uo pipefail
 
@@ -237,7 +239,12 @@ printf '{"file_format_version":"1.0.1","ICD":{"library_path":"%s","api_version":
   "$BIN/libsv_icd.so" >"$RUN/sv_icd.json"
 
 # -------------------------------------------------------------------- proxy ---
-WC_FRAME_TRACE="$RUN/proxy-trace.txt" XDG_RUNTIME_DIR="$RUN/rt" "$BIN/wc-proxy" \
+NATIVE_ENV=()
+if [ -n "${SVFS_GTK:-}" ]; then
+  [ -f "$SVFS_GTK/lib/libgdk-3.so" ] || { echo "no shipped GTK library at $SVFS_GTK"; exit 2; }
+  NATIVE_ENV=(WC_NATIVE_SHM=1 WC_NATIVE_SHM_FIXTURE="${SVFS_NATIVE_SHM_FIXTURE:-0}")
+fi
+env "${NATIVE_ENV[@]}" WC_FRAME_TRACE="$RUN/proxy-trace.txt" XDG_RUNTIME_DIR="$RUN/rt" "$BIN/wc-proxy" \
   --upstream "$NODE_SOCK" --socket wl-proxy --runtime-dir "$RUN/rt" \
   --transport shared-file --pool-dir "$RUN/pools" \
   --peer-prefix "$(winepath -w "$RUN/pools" 2>/dev/null)\\" \
@@ -264,6 +271,10 @@ FFENV=(
   ${SVFS_DEVICE_TYPE:+SV_DEVICE_TYPE=$SVFS_DEVICE_TYPE}
   MOZ_LOG="PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:4,WidgetWayland:3" MOZ_LOG_FILE="$RUN/moz.log"
 )
+if [ -n "${SVFS_GTK:-}" ]; then
+  FFENV+=(LD_LIBRARY_PATH="$SVFS_GTK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    WC_NATIVE_SHM_STRICT=1 WC_NATIVE_SHM_FIXTURE="${SVFS_NATIVE_SHM_FIXTURE:-0}")
+fi
 # The GPU sessions' Mesa (nix/mesa-zink-va.nix): Zink for EGL and GBM, and
 # its VA-API driver, the only one Firefox can find (LIBVA_DRIVER_NAME=zink).
 if [ -n "${SVFS_MESA:-}" ]; then
@@ -330,7 +341,11 @@ descendants() {
   done
 }
 : >"$RUN/rdd-status.txt"
+: >"$RUN/gtk-maps.txt"
 for pid in $(descendants "$FF"); do
+  if [ -n "${SVFS_GTK:-}" ]; then
+    grep -E 'libgdk-3\.so|libwc_native_shm\.so' "/proc/$pid/maps" >>"$RUN/gtk-maps.txt" 2>/dev/null || true
+  fi
   if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "RDD Process" ]; then
     grep -E '^(Name|Pid|NoNewPrivs|Seccomp):' "/proc/$pid/status" >>"$RUN/rdd-status.txt"
   fi
@@ -347,6 +362,12 @@ logs() { cat "$RUN"/moz.log* 2>/dev/null; }
 say "---- the verdict ($RUN) ----"
 "$JQ" -r '.value' "$RUN/support.json" >"$RUN/support.data.json" 2>/dev/null
 sup() { "$JQ" -r "$1" "$RUN/support.data.json" 2>/dev/null; }
+
+if [ -n "${SVFS_GTK:-}" ]; then
+  grep -F "$SVFS_GTK/lib/libgdk-3.so" "$RUN/gtk-maps.txt" >/dev/null \
+    && ok "the browser loaded the shipped GTK original-backing library" \
+    || bad "the browser did not load the requested shipped GTK library"
+fi
 
 lm=$(sup '.graphics.windowLayerManagerType')
 adapter=$(sup '.graphics.adapterDescription')
