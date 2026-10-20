@@ -30,6 +30,8 @@ pub mod core;
 pub mod daemon;
 pub mod proto;
 pub mod server;
+pub mod service_control;
+pub mod service_auth;
 pub mod sys;
 pub mod usermap;
 
