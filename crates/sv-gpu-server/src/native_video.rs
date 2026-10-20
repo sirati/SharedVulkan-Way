@@ -34,6 +34,14 @@ pub struct Profile {
     pub idc: u32,
 }
 impl Profile {
+    // Codec syntax accepted inside this session; resource profile identity is
+    // still the profile used at session creation. Preserve the actual SPS IDC.
+    fn supports_sps_profile(self, idc: u32) -> bool {
+        matches!(
+            (self.idc, idc),
+            (100, 66 | 77 | 100) | (77, 66 | 77) | (66, 66)
+        )
+    }
     pub fn validate(
         base: &vk::VideoProfileInfoKHR<'_>,
         h264: &vk::VideoDecodeH264ProfileInfoKHR<'_>,
@@ -327,7 +335,7 @@ impl NativeVideo {
         let mut sets = (*p.sets).clone();
         for s in sps {
             if sets.sps.contains_key(&s.seq_parameter_set_id)
-                || s.profile_idc != p.session.profile.idc
+                || !p.session.profile.supports_sps_profile(s.profile_idc)
                 || s.level_idc > 15
                 || u32::from(s.max_num_ref_frames) > p.session.dpb_slots
                 || s.flags.frame_mbs_only_flag() == 0
@@ -904,5 +912,72 @@ mod tests_level {
         assert!(unsafe { v.update_parameters(p, 1, &[s], &[]) }.is_err());
         s.max_num_ref_frames = 5;
         unsafe { v.update_parameters(p, 1, &[s], &[]) }.unwrap();
+    }
+}
+#[cfg(test)]
+mod tests_zink_profile {
+    use super::*;
+    #[test]
+    fn stock_zink_high_session_keeps_actual_baseline_and_main_parameter_syntax() {
+        // zink_video_create_session forces AVC_HIGH for session/resources.
+        // fill_sps still selects profile_idc from h264->base.profile.
+        for actual in [66, 77] {
+            let mut video = NativeVideo::new(Ready {
+                hardware_h264: true,
+                joined_nv12_import: true,
+                native_queue_bound_decode: true,
+            });
+            let info = vk::VideoSessionCreateInfoKHR::default()
+                .picture_format(FORMAT)
+                .reference_picture_format(FORMAT)
+                .max_coded_extent(vk::Extent2D {
+                    width: 32,
+                    height: 32,
+                })
+                .max_dpb_slots(4)
+                .max_active_reference_pictures(4);
+            let session = video.create_session(Profile { idc: 100 }, &info).unwrap();
+            let parameters = video.create_parameters(session, None, 1, 1).unwrap();
+            let mut s: vk::native::StdVideoH264SequenceParameterSet = unsafe { std::mem::zeroed() };
+            s.profile_idc = actual;
+            s.level_idc = 7;
+            s.chroma_format_idc = 1;
+            s.pic_order_cnt_type = 2;
+            s.log2_max_frame_num_minus4 = 2;
+            s.max_num_ref_frames = 1;
+            s.pic_width_in_mbs_minus1 = 1;
+            s.pic_height_in_map_units_minus1 = 1;
+            s.flags.set_frame_mbs_only_flag(1);
+            s.flags.set_direct_8x8_inference_flag(1);
+            let mut p: vk::native::StdVideoH264PictureParameterSet = unsafe { std::mem::zeroed() };
+            p.flags
+                .set_entropy_coding_mode_flag(u32::from(actual == 77));
+            unsafe { video.initialize_parameters(parameters, &[s], &[p]) }.unwrap();
+            video.begin(1, session, parameters).unwrap();
+            let configuration = video.configuration(1, 0, 0).unwrap();
+            assert_eq!(&configuration.sps[..2], &[0x67, actual as u8]);
+            assert_eq!(configuration.pps[0], 0x68);
+            assert_eq!(video.session(session).unwrap().profile.idc, 100);
+            assert_eq!(s.pic_order_cnt_type, 2);
+            assert_eq!(s.log2_max_frame_num_minus4, 2);
+            assert_eq!(p.flags.entropy_coding_mode_flag(), u32::from(actual == 77));
+        }
+    }
+    #[test]
+    fn supported_profile_syntax_does_not_expand_lower_profile_sessions() {
+        for (session, sps, accepted) in [
+            (100, 66, true),
+            (100, 77, true),
+            (100, 100, true),
+            (77, 66, true),
+            (77, 77, true),
+            (77, 100, false),
+            (66, 66, true),
+            (66, 77, false),
+            (66, 100, false),
+            (100, 244, false),
+        ] {
+            assert_eq!(Profile { idc: session }.supports_sps_profile(sps), accepted);
+        }
     }
 }
