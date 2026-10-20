@@ -184,6 +184,8 @@ fn win_serve(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
@@ -471,6 +473,8 @@ fn win_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
@@ -774,6 +778,8 @@ fn ivshmem_session(
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
@@ -1166,6 +1172,8 @@ fn mem_guest(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
@@ -1510,6 +1518,8 @@ fn serve(
             fns: Arc::clone(&fns),
             queue_lock: Arc::clone(&queue_lock),
             pool_lock: Arc::clone(&pool_lock),
+            #[cfg(target_os = "macos")]
+            native_video: Default::default(),
             video_stable: Default::default(),
             poisoned: Default::default(),
         });
@@ -1658,6 +1668,8 @@ fn attach(
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });
@@ -1854,6 +1866,8 @@ fn guest(
         fns: Arc::new(fns),
         queue_lock: Arc::new(std::sync::Mutex::new(())),
         pool_lock: Arc::new(std::sync::Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });

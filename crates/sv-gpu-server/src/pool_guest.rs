@@ -558,6 +558,8 @@ fn run_prepared(
         fns: Arc::new(fns),
         queue_lock: Arc::new(Mutex::new(())),
         pool_lock: Arc::new(Mutex::new(())),
+        #[cfg(target_os = "macos")]
+        native_video: Default::default(),
         video_stable: Default::default(),
         poisoned: Default::default(),
     });

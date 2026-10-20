@@ -73,3 +73,6 @@ mod tests {
         assert_eq!(l.validate(), Err("NV12 plane dimensions"));
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod joined;

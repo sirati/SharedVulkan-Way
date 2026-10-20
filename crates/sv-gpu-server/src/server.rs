@@ -69,6 +69,8 @@ use sv_wire::{Result as WireResult, WireError};
 /// - `queue_lock` is **per device** and is the one thing that is shared *and*
 ///   mutable. See its own documentation.
 pub struct Shared {
+    #[cfg(target_os = "macos")]
+    pub native_video: Mutex<crate::native_video_dispatch::DispatchState>,
     pub driver: Arc<Driver>,
     pub arena: Arena,
     pub objects: Mutex<Objects>,
@@ -476,6 +478,27 @@ fn no_info() -> WireError {
 }
 
 impl GpuHost for GpuServer {
+    #[cfg(target_os = "macos")]
+    fn override_get_physical_device_video_format_properties_khr(&mut self, a: &p::VkGetPhysicalDeviceVideoFormatPropertiesKHRArgs) -> Option<WireResult<p::VkGetPhysicalDeviceVideoFormatPropertiesKHRReply>> { self.native_get_physical_device_video_format_properties_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_get_physical_device_video_capabilities_khr(&mut self, a: &p::VkGetPhysicalDeviceVideoCapabilitiesKHRArgs) -> Option<WireResult<p::VkGetPhysicalDeviceVideoCapabilitiesKHRReply>> { self.native_get_physical_device_video_capabilities_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_create_video_session_khr(&mut self, a: &p::VkCreateVideoSessionKHRArgs) -> Option<WireResult<p::VkCreateVideoSessionKHRReply>> { self.native_create_video_session_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_video_session_khr(&mut self, a: &p::VkDestroyVideoSessionKHRArgs) -> Option<WireResult<()>> { self.native_destroy_video_session_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_create_video_session_parameters_khr(&mut self, a: &p::VkCreateVideoSessionParametersKHRArgs) -> Option<WireResult<p::VkCreateVideoSessionParametersKHRReply>> { self.native_create_video_session_parameters_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_update_video_session_parameters_khr(&mut self, a: &p::VkUpdateVideoSessionParametersKHRArgs) -> Option<WireResult<p::VkUpdateVideoSessionParametersKHRReply>> { self.native_update_video_session_parameters_khr(a) }
+
+    #[cfg(target_os = "macos")]
+    fn override_destroy_video_session_parameters_khr(&mut self, a: &p::VkDestroyVideoSessionParametersKHRArgs) -> Option<WireResult<()>> { self.native_destroy_video_session_parameters_khr(a) }
+
     // -- the hooks the generated passes consult -----------------------------
 
     fn fns(&self) -> &DriverFns {
@@ -1520,6 +1543,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkGetVideoSessionMemoryRequirementsKHRArgs,
     ) -> WireResult<p::VkGetVideoSessionMemoryRequirementsKHRReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_get_video_session_memory_requirements_khr(&a){return result;}
         let session = self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?;
         let Some(vq) = self.shared.driver.video_queue.as_ref() else {
             self.note_missing("vkGetVideoSessionMemoryRequirementsKHR");
@@ -1583,6 +1608,8 @@ impl GpuHost for GpuServer {
         &mut self,
         a: p::VkBindVideoSessionMemoryKHRArgs,
     ) -> WireResult<p::VkBindVideoSessionMemoryKHRReply> {
+        #[cfg(target_os = "macos")]
+        if let Some(result)=self.native_bind_video_session_memory_khr(&a){return result;}
         let session = vk::VideoSessionKHR::from_raw(
             self.map_handle(HandleType::VkVideoSessionKHR, a.video_session.0)?,
         );
