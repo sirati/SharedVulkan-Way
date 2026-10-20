@@ -70,7 +70,10 @@ pub(crate) unsafe fn submit(
         }
     }
     let signals: Vec<_> = signals.iter().map(|s| vk::SemaphoreSubmitInfo::default()
-        .semaphore(s.handle).value(s.value).stage_mask(s.stage)).collect();
+        .semaphore(s.handle).value(s.value).stage_mask(
+            if s.stage.intersects(vk::PipelineStageFlags2::VIDEO_DECODE_KHR) {
+                vk::PipelineStageFlags2::ALL_COMMANDS
+            } else { s.stage })).collect();
     let last = vk::SubmitInfo2::default().command_buffer_infos(&native)
         .signal_semaphore_infos(&signals);
     // Final native segments retain their asynchronous behavior. The Vulkan
