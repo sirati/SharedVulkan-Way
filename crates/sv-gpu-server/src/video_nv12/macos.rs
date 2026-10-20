@@ -154,6 +154,7 @@ impl Drop for ImportedPlanes {
     }
 }
 impl PlaneTextures {
+    pub(crate) fn first_handle(&self) -> *mut c_void { self.textures[0].0 }
     pub fn picture(&self) -> &Arc<Picture> { &self.picture }
 
     /// # Safety
