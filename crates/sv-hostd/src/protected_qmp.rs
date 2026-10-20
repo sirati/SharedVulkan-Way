@@ -606,6 +606,18 @@ impl EnrolledOriginal {
     pub fn ensure_live(&self) -> io::Result<()> {
         self.owner.ensure_live()
     }
+    /// Pause only this exact owned source through its retained QMP connection.
+    /// This supplies no alias completion, native retirement or release proof.
+    pub fn pause_owned_source(&self) -> io::Result<()> {
+        self.owner.ensure_live()?;
+        let mut qmp = self
+            .owner
+            .qmp
+            .lock()
+            .map_err(|_| denied("QMP original owner poisoned"))?;
+        reply(&mut qmp, json!({"execute":"stop"}))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
