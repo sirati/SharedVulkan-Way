@@ -173,7 +173,7 @@ let
     mkdir -p "$out/lib" "$out/include"
     glslangValidator -V --target-env vulkan1.1 --vn nv12_spv \
       -o nv12_spv.h ${./nv12.comp}
-    ${cc} --target=arm64-apple-macosx15.0 -O2 -Wall -Werror \
+    ${cc} --target=arm64-apple-macosx15.0 -O2 -Wall -Werror -Qunused-arguments \
       -I${pkgs.vulkan-headers}/include -I. -I${./.} \
       -c ${./nv12-sample.c} -o nv12-sample.o
     ${llvm}/bin/llvm-ar rcs "$out/lib/libkk_nv12_fixture.a" nv12-sample.o
