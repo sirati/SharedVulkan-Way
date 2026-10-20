@@ -260,6 +260,35 @@ class Contract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.open(options=options)).error_name, 'org.freedesktop.portal.Error.InvalidArgument')
 
 
+class Startup(unittest.IsolatedAsyncioTestCase):
+    async def test_readiness_can_exceed_old_five_second_bound(self):
+        loop = asyncio.get_running_loop()
+        begin = loop.time()
+        async def delayed():
+            return loop.time() - begin >= 5.05
+        await native_session.wait_for_startup(delayed, [], begin + native_session.STARTUP_TIMEOUT)
+        self.assertGreaterEqual(loop.time() - begin, 5.05)
+
+    async def test_deadline_cancels_a_blocked_probe(self):
+        cancelled = asyncio.Event()
+        async def blocked():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with self.assertRaisesRegex(RuntimeError, 'startup deadline'):
+            await native_session.wait_for_startup(blocked, [], asyncio.get_running_loop().time() + 0.03)
+        self.assertTrue(cancelled.is_set())
+
+    async def test_early_child_exit_never_publishes_readiness(self):
+        class Exited:
+            returncode = 1
+        probe = AsyncMock(return_value=True)
+        with self.assertRaisesRegex(RuntimeError, 'exited before readiness'):
+            await native_session.wait_for_startup(probe, [Exited()], asyncio.get_running_loop().time() + 1)
+        probe.assert_not_awaited()
+
+
 if __name__ == '__main__':
     # Test HOME and every XDG directory are private even though no app runs.
     with tempfile.TemporaryDirectory(dir='/mnt/datasets', prefix='wc-portal-test-') as home:
