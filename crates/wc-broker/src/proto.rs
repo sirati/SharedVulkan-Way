@@ -13,6 +13,7 @@
 //! close ID                      -> ok
 //! free ID                       -> ok
 //! adopt POOL                    -> ok adopted [ID:LEN ...]
+//! tie POOL                      -> ok                (end this process when POOL is released, §111.9)
 //! connect NAME                  -> ok connect NAME HANDLE   (a fresh connection to a local service)
 //! sign INSTALL SESSION INDEX ARUN APAGES OUTBOUND RRUN RPAGES GPU SEQ
 //!                               -> ok signed SEQ MAC IDENTITY...
@@ -43,6 +44,7 @@ pub enum Request {
     Close { id: u64 },
     Free { id: u64 },
     Adopt { pool: String },
+    Tie { pool: String },
     Connect { name: String },
     Sign(SignReq),
     Subscribe,
@@ -125,6 +127,10 @@ impl Request {
                 arity(2)?;
                 Request::Adopt { pool: name(1)? }
             }
+            "tie" => {
+                arity(2)?;
+                Request::Tie { pool: name(1)? }
+            }
             "connect" => {
                 arity(2)?;
                 Request::Connect { name: name(1)? }
@@ -173,6 +179,7 @@ impl Request {
             Request::Close { id } => format!("close {id}"),
             Request::Free { id } => format!("free {id}"),
             Request::Adopt { pool } => format!("adopt {pool}"),
+            Request::Tie { pool } => format!("tie {pool}"),
             Request::Connect { name } => format!("connect {name}"),
             Request::Sign(s) => format!(
                 "sign {} {} {} {} {} {} {} {} {} {}",
@@ -283,6 +290,7 @@ mod tests {
             Request::Close { id: 7 },
             Request::Free { id: 7 },
             Request::Adopt { pool: "gpu".into() },
+            Request::Tie { pool: "wcm-501".into() },
             Request::Connect { name: "wl-hub".into() },
             Request::Sign(SignReq {
                 install: "wcivs".into(),

@@ -699,6 +699,16 @@ fn sign(
 ) -> Result<(wc_handle::macboot::Auth, Option<wc_handle::macboot::Identity>), String> {
     use wc_handle::macboot;
     let seq = now_micros();
+    // §111.9: a signer the launcher installed (the macOS broker).
+    match crate::ringlink::broker_sign(rec, index) {
+        Some(Ok((auth, who))) if auth.installation == cfg.install => {
+            say(&format!("boot: the broker signed the record for {}", who.text()));
+            return Ok((auth, Some(who)));
+        }
+        Some(Ok(_)) => say("boot: the broker signed for another installation; signing with the key file"),
+        Some(Err(e)) => say(&format!("boot: the broker did not sign ({e}); signing with the key file")),
+        None => {}
+    }
     // A Linux server's broker, named as the key file (§111.10).
     #[cfg(unix)]
     if let Some(sock) = cfg.key_file.to_str().and_then(|s| s.strip_prefix("broker:")) {

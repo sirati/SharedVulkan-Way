@@ -16,7 +16,7 @@
 //! `wc-launch --session SECTION` runs a face without a bundle, for the
 //! harnesses.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
@@ -106,8 +106,8 @@ pub fn main(args: Vec<String>) -> ExitCode {
         }
         return if ok && !sections.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
-    if args.iter().any(|a| a == "--keeper") {
-        return run_keeper();
+    if args.iter().any(|a| a == "--gpu-exec") {
+        return run_gpu_exec(&args);
     }
     if args.iter().any(|a| a == "--main") {
         return run_main(cfg);
@@ -212,160 +212,138 @@ fn pin_in_dock(bundle: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// -------------------------------------------------------------- keeper ---
-
-/// The pipe to the keeper, shared by the region hook and the GPU server's
-/// registration.
-type KeeperPipe = Arc<Mutex<(std::process::ChildStdin, std::io::BufReader<std::process::ChildStdout>)>>;
+// -------------------------------------------------------------- broker ---
 
 unsafe extern "C" {
-    fn shm_open(name: *const std::ffi::c_char, oflag: i32, ...) -> i32;
-    fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
-    fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
-    fn close(fd: i32) -> i32;
-    fn kill(pid: i32, sig: i32) -> i32;
     fn signal(sig: i32, handler: usize) -> usize;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
-/// §103.15: start the keeper and make it the holder of every guest-RAM
-/// window this process makes from now on. Without one the session is
-/// refused: the host would write into pages this process's death frees.
-fn start_keeper(log: &Log) -> Result<KeeperPipe, String> {
-    let mut c = Command::new(installed_exe());
-    c.arg("--keeper").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    // Not in this process's group: a signal for the main process's group
-    // must not take the keeper with it.
-    std::os::unix::process::CommandExt::process_group(&mut c, 0);
-    let mut child = c.spawn().map_err(|e| format!("could not start the keeper: {e}"))?;
-    let (Some(i), Some(o)) = (child.stdin.take(), child.stdout.take()) else {
-        return Err("the keeper has no pipes".into());
-    };
-    log.say(&format!("keeper {} holds this session's windows until the host releases them", child.id()));
-    // Never waited for: it outlives this process by design.
-    std::mem::forget(child);
-    let pipe: KeeperPipe = Arc::new(Mutex::new((i, std::io::BufReader::new(o))));
-    let p2 = Arc::clone(&pipe);
-    let installed = wc_handle::arena::set_region_keeper(Box::new(move |name: &str, len: usize| {
-        let mut g = p2.lock().unwrap_or_else(|e| e.into_inner());
-        writeln!(g.0, "hold {name} {len}")?;
-        g.0.flush()?;
-        let mut line = String::new();
-        g.1.read_line(&mut line)?;
-        if line.trim() == format!("held {name}") {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!("the keeper said {:?}", line.trim())))
+/// The main process's connection to the broker (§111.9), open for the
+/// process's life: the broker watches the process through it, and the
+/// session's windows are this connection's until the process ends.
+type BrokerConn = Arc<Mutex<wc_broker::client::Client>>;
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
+}
+
+/// §103.15, §111.9: the LaunchDaemon `org.waycompose.broker` becomes the
+/// holder of every guest-RAM window this process makes from now on, as pool
+/// `pool` (the session id), and the signer of its boot record. It makes each
+/// window, maps and wires it before this process stamps it, and keeps it
+/// after this process has died until the host writes the release word in the
+/// session's boot page. Without it the session is refused: the host would
+/// write into pages this process's death frees.
+fn connect_broker(log: &Log, pool: &str, install: &str) -> Result<BrokerConn, String> {
+    let path = wc_broker::client::path();
+    let mut c = wc_broker::client::Client::connect(&path).map_err(|e| e.to_string())?;
+    let h = c.hello("main").map_err(|e| format!("the broker at {path} refused hello: {e}"))?;
+    log.say(&format!("broker {path} (run {}) holds this session's windows as pool {pool}, for {}", h.run, h.user));
+    let conn: BrokerConn = Arc::new(Mutex::new(c));
+    let (c2, p2) = (Arc::clone(&conn), pool.to_string());
+    let installed = wc_handle::arena::set_region_keeper(Box::new(move |len: usize| {
+        let mut g = c2.lock().unwrap_or_else(|e| e.into_inner());
+        let (r, mut fds) = g.alloc(&p2, len as u64, false)?;
+        if fds.len() != 1 || r.len < len as u64 {
+            return Err(std::io::Error::other(format!("region {}: {} bytes in {} piece(s) for {len}", r.id, r.len, fds.len())));
         }
+        Ok(fds.remove(0))
     }));
     if !installed {
         return Err("a region keeper was already installed".into());
     }
-    Ok(pipe)
+    // §111.6: the record says which macOS user asked, and only the broker,
+    // which holds the installation's key, can make that verify.
+    let (c3, inst) = (Arc::clone(&conn), install.to_string());
+    wc_compositor::set_boot_signer(Box::new(move |rec: &wc_handle::macboot::Record, index: u8| {
+        let req = wc_broker::proto::SignReq {
+            install: inst.clone(),
+            session: rec.session.clone(),
+            index,
+            arena_run: rec.arena_run,
+            arena_pages: rec.arena_pages,
+            outbound: rec.outbound,
+            rings_run: rec.rings_run,
+            rings_pages: rec.rings_pages,
+            gpu: rec.gpu,
+            seq: now_micros(),
+        };
+        c3.lock().unwrap_or_else(|e| e.into_inner()).sign(&req).map_err(|e| e.to_string())
+    }));
+    Ok(conn)
 }
 
-/// `wc-launch --keeper` (§103.15): map and wire every window the main
-/// process names on stdin, and keep them until the host's session service
-/// writes the release word in the ring window's boot page, which it does once
-/// the session's proxy and GPU units have ended. Stdin's end is the main
-/// process's end, however it came. Then the session's GPU servers go, and
-/// with this process the last hold on the pages.
+/// A doorbell port, moved into this process by the broker (§111.9): `fd:N`.
+/// The port nodes are root's, so the broker is the only way to them; a
+/// refusal (another user's session holds the port) is logged, and the port's
+/// own name is returned, which opens only where the nodes are not root's.
+fn broker_port(conn: &BrokerConn, device: &str, port: &str, log: &Log) -> String {
+    use std::os::fd::IntoRawFd;
+    match conn.lock().unwrap_or_else(|e| e.into_inner()).device(device) {
+        Ok(fd) => {
+            let n = fd.into_raw_fd();
+            log.say(&format!("doorbell {device} ({port}) moved into this process by the broker, fd {n}"));
+            format!("fd:{n}")
+        }
+        Err(e) => {
+            log.say(&format!("doorbell {device}: the broker refused ({e}); trying {port} directly"));
+            port.to_string()
+        }
+    }
+}
+
+/// `wc-launch --gpu-exec POOL DEVICE -- PROGRAM ARGS...` (§111.9): become the
+/// session's GPU server. Before the exec, which keeps this process's id, it
+/// tells the broker it is pool POOL's GPU server (`tie`: the broker ends it
+/// once the host has released the pool, as the keeper did), and takes the
+/// GPU doorbell DEVICE (`-` for none) from it, passed on as `--bell fd:N`.
+fn run_gpu_exec(args: &[String]) -> ExitCode {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::process::CommandExt;
+    let Some(i) = args.iter().position(|a| a == "--gpu-exec") else { return ExitCode::from(2) };
+    let (Some(pool), Some(device), Some(dash)) = (args.get(i + 1), args.get(i + 2), args.iter().position(|a| a == "--")) else {
+        eprintln!("wc-launch: --gpu-exec POOL DEVICE -- PROGRAM ARGS...");
+        return ExitCode::from(2);
+    };
+    let Some(program) = args.get(dash + 1) else {
+        eprintln!("wc-launch: --gpu-exec: no program");
+        return ExitCode::from(2);
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(&args[dash + 2..]);
+    let path = wc_broker::client::path();
+    match wc_broker::client::Client::connect(&path) {
+        Ok(mut c) => {
+            if let Err(e) = c.hello("gpu").and_then(|_| c.tie(pool)) {
+                eprintln!("wc-launch: the broker did not tie the GPU server to pool {pool}: {e}");
+            }
+            if device != "-" {
+                match c.device(device) {
+                    Ok(fd) => {
+                        let n = fd.into_raw_fd();
+                        // SAFETY: F_SETFD (2) to 0 on our own descriptor: it
+                        // must survive the exec.
+                        unsafe { fcntl(n, 2, 0) };
+                        cmd.args(["--bell", &format!("fd:{n}")]);
+                        eprintln!("wc-launch: GPU doorbell {device} moved into the GPU server by the broker, fd {n}");
+                    }
+                    Err(e) => eprintln!("wc-launch: GPU doorbell {device}: the broker refused ({e}); its rings poll"),
+                }
+            }
+        }
+        Err(e) => eprintln!("wc-launch: no broker for the GPU server ({e}); nothing ends it after the host's release"),
+    }
+    let e = cmd.exec();
+    eprintln!("wc-launch: {program}: {e}");
+    ExitCode::from(1)
+}
+
 /// SIGTERM seen (§103.15): macOS is shutting down, or someone asked.
 static TERMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn on_term(_sig: i32) {
     TERMED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// After a SIGTERM the keeper waits at most this long for the release: the
-/// main process takes its session down on the same signal (`run_main`), so
-/// the release comes in about 2 s, and a shutdown must not stall on us.
-const TERM_LIMIT: Duration = Duration::from_secs(10);
-
-fn run_keeper() -> ExitCode {
-    let log = Log::open(&log_dir().join("keeper.log"));
-    // SAFETY: SIG_IGN for SIGHUP (1); SIGTERM (15) only shortens the wait.
-    // Ignoring SIGTERM outright stalled every macOS shutdown (launchd waited
-    // for this process until it killed it).
-    unsafe {
-        signal(1, 1);
-        signal(15, on_term as extern "C" fn(i32) as usize);
-    }
-    let mut held: Vec<(usize, usize)> = Vec::new();
-    let mut gpus: Vec<i32> = Vec::new();
-    let mut out = std::io::stdout();
-    for line in std::io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        let w: Vec<&str> = line.split_whitespace().collect();
-        match w.as_slice() {
-            ["hold", name, len] => {
-                let reply = match (std::ffi::CString::new(*name), len.parse::<usize>()) {
-                    (Ok(c), Ok(len)) => {
-                        // SAFETY: a NUL-terminated name; O_RDWR (2) of an
-                        // object the main process created a moment ago.
-                        let fd = unsafe { shm_open(c.as_ptr(), 2) };
-                        // PROT_READ|PROT_WRITE, MAP_SHARED.
-                        let p = if fd >= 0 { unsafe { mmap(std::ptr::null_mut(), len, 3, 1, fd, 0) } } else { usize::MAX as *mut _ };
-                        if fd >= 0 {
-                            // SAFETY: our descriptor; the mapping keeps the object.
-                            unsafe { close(fd) };
-                        }
-                        // SAFETY: a live mapping of `len` bytes.
-                        if p as usize != usize::MAX && unsafe { mlock(p, len) } == 0 {
-                            held.push((p as usize, len));
-                            format!("held {name}")
-                        } else {
-                            format!("err {name}: {}", std::io::Error::last_os_error())
-                        }
-                    }
-                    _ => format!("err {line}"),
-                };
-                if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
-                    break;
-                }
-            }
-            ["gpu", pid] => {
-                if let Ok(p) = pid.parse() {
-                    gpus.push(p);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mb = held.iter().map(|h| h.1).sum::<usize>() >> 20;
-    log.say(&format!("the main process is gone; holding {} window(s), {mb} MiB, until the host releases them", held.len()));
-    // The ring window's first page is the boot page.
-    let boot = held.iter().map(|h| h.0 as *const u8).find(|p| {
-        // SAFETY: a held mapping of at least one page.
-        wc_handle::macboot::is_boot_page(unsafe { std::slice::from_raw_parts(*p, wc_handle::arena::REGION_PAGE) })
-    });
-    let limit = Duration::from_secs(600);
-    let t0 = Instant::now();
-    let mut termed_at: Option<Instant> = None;
-    let released = loop {
-        // SAFETY: the boot page, held.
-        if boot.is_some_and(|p| unsafe { wc_handle::macboot::load_released(p) }) {
-            break true;
-        }
-        if TERMED.load(std::sync::atomic::Ordering::SeqCst) && termed_at.is_none() {
-            termed_at = Some(Instant::now());
-        }
-        if t0.elapsed() > limit || termed_at.is_some_and(|t| t.elapsed() > TERM_LIMIT) {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    for pid in gpus {
-        // SAFETY: SIGKILL (9) to a GPU server this session started.
-        unsafe { kill(pid, 9) };
-    }
-    log.say(&if released {
-        format!("released by the host after {:?}; freeing", t0.elapsed())
-    } else if boot.is_none() {
-        format!("no boot page among the windows; freeing after {limit:?}")
-    } else {
-        format!("NO RELEASE from the host in {:?}{}; freeing anyway", t0.elapsed(), if termed_at.is_some() { " (SIGTERM)" } else { "" })
-    });
-    ExitCode::SUCCESS
 }
 
 // ------------------------------------------------------------- session ---
@@ -395,10 +373,18 @@ fn run_main(cfg: Config) -> ExitCode {
     let id = plan::run_id(&cfg.session, std::process::id());
     let log = Log::open(&log_dir().join("main.log"));
     log.say(&format!("main process: session {id}"));
-    let keeper = match start_keeper(&log) {
-        Ok(k) => k,
+    // Role (b) (§103.17) maps a file, not guest RAM: nothing of this process
+    // is freed under the host's writes, and without a broker its record is
+    // signed with the installation's key file, as before §111.
+    let role_b = std::env::var("WC_MAC_ARENA_STANDIN").ok().or_else(|| Some(cfg.arena_file.clone())).is_some_and(|s| !s.is_empty());
+    let broker = match connect_broker(&log, &id, cfg.installation()) {
+        Ok(b) => Some(b),
+        Err(e) if role_b => {
+            log.say(&format!("no broker ({e}); role (b) signs with the key file"));
+            None
+        }
         Err(e) => {
-            log.say(&format!("NO KEEPER, NO SESSION: {e}"));
+            log.say(&format!("NO BROKER, NO SESSION: {e} (the LaunchDaemon org.waycompose.broker holds guest RAM, §111.9)"));
             return ExitCode::from(1);
         }
     };
@@ -501,19 +487,19 @@ fn run_main(cfg: Config) -> ExitCode {
                     return ExitCode::from(1);
                 }
             },
-            None => bell,
+            // §111.9: the port's node is root's; the broker moves it in.
+            None => match &broker {
+                Some(b) => broker_port(b, "wcbell", &bell, &log),
+                None => bell,
+            },
         };
         argv.extend(["--wayland-rings".into(), spec]);
     }
     // §103.15: the session's GPU server, started here rather than by a
     // harness's ssh. Its cold page carries the session's label; the host's
-    // session service serves it once the boot record says so.
-    let gpu = start_gpu_server(&cfg, &id, &log);
-    if let Some(g) = &gpu {
-        // The keeper ends it, once the host has stopped serving it.
-        let mut k = keeper.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = writeln!(k.0, "gpu {}", g.id()).and_then(|()| k.0.flush());
-    }
+    // session service serves it once the boot record says so. The broker
+    // ends it once the host has stopped serving it (`--gpu-exec`, `tie`).
+    let gpu = start_gpu_server(&cfg, &id, &log, broker.is_some());
     match &standin {
         Some(file) => {
             // SAFETY: before the compositor's threads exist.
@@ -544,7 +530,7 @@ fn run_main(cfg: Config) -> ExitCode {
     ]);
     // SIGTERM (a shutdown, a logout, a `kill`): take the session down over
     // the control ring and go, so the host stops and releases at once rather
-    // than after its lease, and the keeper is not left waiting.
+    // than after its lease, and the broker holds the windows for seconds.
     {
         // SAFETY: the handler only stores an atomic.
         unsafe { signal(15, on_term as extern "C" fn(i32) as usize) };
@@ -573,30 +559,50 @@ fn run_main(cfg: Config) -> ExitCode {
             Err(e) => log.say(&format!("down: {e}")),
         }
     }
-    // The GPU server is the keeper's to end (above), after the host's release.
+    // The GPU server is the broker's to end, after the host's release; and
+    // this process's windows stay the broker's until then (§111.9).
     drop(gpu);
+    drop(broker);
     let _ = std::fs::remove_dir_all(&rt);
     code
 }
 
 /// `sv-guest gpu guest --label <session>`, for the life of the main process.
-fn start_gpu_server(cfg: &Config, id: &str, log: &Log) -> Option<std::process::Child> {
+fn start_gpu_server(cfg: &Config, id: &str, log: &Log, via_broker: bool) -> Option<std::process::Child> {
     if cfg.gpu_server.is_empty() {
         return None;
     }
     let label = wc_handle::macboot::gpu_label(id);
     let out = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_dir().join("gpu.log"));
-    let mut c = Command::new(&cfg.gpu_server);
-    c.args(["gpu", "guest", "--label", label, "--arena"])
-        .arg((cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string())
-        .args(["--idle", "43200"])
-        .stdin(Stdio::null());
+    let server_args: Vec<String> = vec![
+        "gpu".into(),
+        "guest".into(),
+        "--label".into(),
+        label.into(),
+        "--arena".into(),
+        (cfg.gpu_arena_mib.max(16) * 1024 * 1024).to_string(),
+        "--idle".into(),
+        "43200".into(),
+    ];
     // Its rings' doorbell (§103.15): the second legacy virtio-serial port,
-    // when the VM has it; without it the GPU rings poll.
+    // when the VM has it; without it the GPU rings poll. §111.9: the port's
+    // node is root's, so the broker moves it into the GPU server, which
+    // `--gpu-exec` asks for under this process's id before it becomes it.
     let bell = if cfg.gpu_bell.is_empty() { None } else { Some(format!("/dev/{}", cfg.gpu_bell)) };
-    if let Some(dev) = bell.as_deref().filter(|d| Path::new(d).exists()) {
-        c.args(["--bell", &format!("dev:{}", &dev[5..])]);
-    }
+    let has_bell = bell.as_deref().is_some_and(|d| Path::new(d).exists());
+    let mut c = if via_broker {
+        let mut c = Command::new(installed_exe());
+        c.args(["--gpu-exec", id, if has_bell { "svbell" } else { "-" }, "--", &cfg.gpu_server]).args(&server_args);
+        c
+    } else {
+        let mut c = Command::new(&cfg.gpu_server);
+        c.args(&server_args);
+        if let Some(dev) = bell.as_deref().filter(|_| has_bell) {
+            c.args(["--bell", &format!("dev:{}", &dev[5..])]);
+        }
+        c
+    };
+    c.stdin(Stdio::null());
     if !cfg.gpu_icd.is_empty() {
         c.env("VK_DRIVER_FILES", &cfg.gpu_icd);
     }

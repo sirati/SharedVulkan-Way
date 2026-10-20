@@ -86,6 +86,9 @@ pub struct Unix {
     /// macOS: map and wire every region, and watch this word for its release.
     wire: bool,
     release_word: Option<usize>,
+    /// macOS (§111.9): a region whose page 0 is a session's boot page
+    /// releases its whole pool when the host's release word there is set.
+    boot_release: bool,
     watcher: Watcher,
 }
 
@@ -125,6 +128,7 @@ impl Unix {
             admins: vec![0, me],
             wire: cfg!(target_os = "macos"),
             release_word: None,
+            boot_release: false,
             watcher: Watcher::start()?,
         })
     }
@@ -149,6 +153,17 @@ impl Unix {
     pub fn keep_wired(mut self, release_word: Option<usize>) -> Unix {
         self.wire = true;
         self.release_word = release_word;
+        self
+    }
+
+    /// The macOS keeper (§103.15, §111.9): every region is mapped and wired
+    /// by the broker for its whole life, and a pool's orphans go when the
+    /// host writes the release word in the pool's boot page (page 0 of the
+    /// session's ring window, `wc_handle::macboot`), which the broker finds
+    /// among the pool's regions by its stamp and record.
+    pub fn mac_keeper(mut self) -> Unix {
+        self.wire = true;
+        self.boot_release = true;
         self
     }
 
@@ -235,6 +250,7 @@ impl Platform for Unix {
                 Err(e)
             }
         })?;
+        raw_if_tty(&f);
         Ok(Object::Device(OwnedFd::from(f)))
     }
 
@@ -307,6 +323,49 @@ impl Platform for Unix {
                 v != 0
             }
             _ => false,
+        }
+    }
+
+    fn released_pool(&self, obj: &Object) -> bool {
+        match obj {
+            Object::Region(Region { map: Some((addr, len)), .. })
+                if self.boot_release && *len >= wc_handle::arena::REGION_PAGE =>
+            {
+                let page0 = *addr as *const u8;
+                // SAFETY: the first page of a live mapping this broker holds;
+                // the host writes into it, so it is read as plain bytes once
+                // and the release word with an acquire load.
+                let page = unsafe { std::slice::from_raw_parts(page0, wc_handle::arena::REGION_PAGE) };
+                wc_handle::macboot::is_boot_page(page) && unsafe { wc_handle::macboot::load_released(page0) }
+            }
+            _ => false,
+        }
+    }
+
+    fn end(&self, pid: Pid) {
+        // Only a process still watched: an exit already seen means the pid
+        // may be another process's by now.
+        if self.watcher.watching(pid) {
+            // SAFETY: a signal to a pid; no memory is involved.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+}
+
+/// A doorbell port that is a serial device (macOS: a virtio console's `cu.*`
+/// node) is put in raw mode before it is moved, as
+/// `PortHandle::guest_port` does for a port it opens itself: the holder gets
+/// `fd:N`, which takes the descriptor as it is.
+fn raw_if_tty(f: &std::fs::File) {
+    let fd = f.as_raw_fd();
+    // SAFETY: a live descriptor; `t` is a zeroed, valid termios.
+    unsafe {
+        if libc::isatty(fd) == 1 {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) == 0 {
+                libc::cfmakeraw(&mut t);
+                libc::tcsetattr(fd, libc::TCSANOW, &t);
+            }
         }
     }
 }
@@ -540,6 +599,10 @@ impl Watcher {
             })?;
             Ok(Watcher { kq, waiting })
         }
+    }
+
+    fn watching(&self, pid: Pid) -> bool {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&pid)
     }
 
     fn watch(&self, pid: Pid, exited: Exited) -> bool {

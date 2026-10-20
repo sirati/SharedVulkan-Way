@@ -35874,7 +35874,169 @@ the stamping hook's implementation (windows-guest-ram's); a run on the deploymen
 
 ### 111.9 macOS
 
-(Written by the macOS half's branch.)
+Branch `broker-mac`. Role (a), the macOS VM, is built and was run in the VM
+(below). Role (b), the real Mac, is designed only (111.9.6).
+
+#### 111.9.1 What the LaunchDaemon is
+
+`wc-broker serve` runs as the LaunchDaemon `org.waycompose.broker`: root,
+started at boot, restarted by launchd whenever it ends (`KeepAlive`). It is
+the one privileged component of a macOS server and replaces three things:
+
+| before | now |
+|---|---|
+| `wc-launch --keeper`, a child of each main process, mapping and wiring the session's windows by their shm names (§103.15) | the broker makes each window (`alloc POOL BYTES`, the pool is the session id), maps and wires it, and keeps it after the main process dies |
+| the main process and the GPU server opening `/dev/cu.org.sirati.{wcbell,svbell}.0` themselves (the nodes were 0666) | the nodes are root's and 0600; the broker opens a port, sets raw mode and moves the fd in (`device wcbell`, `device svbell`) |
+| role (a): an unsigned boot record; role (b): a record signed with `session.key` from the user's support directory | the broker signs (`sign`) with `/Library/Application Support/waycompose/keys/<install>.key` (0600, in a 0700 directory, both root's) over the identity it read with `getpeereid` (`os=macos user=NAME id=UID`) |
+
+Its socket is `/var/run/waycompose/broker.sock`, mode 0666; every request is
+decided by the caller's uid (111.3). The binary, the keys and the plist
+(`/Library/LaunchDaemons/org.waycompose.broker.plist`, written by
+`wc-broker plist BIN`, so it has one source) are root's and not writable by
+any user. `scripts/mac-launch-install.sh` installs and bootstraps it; the
+host keeps the installation's key in `$BASE/keys` and runs `mac-sessiond
+--keys` with it.
+
+#### 111.9.2 The main process and the GPU server
+
+* **Windows.** `wc_handle::arena::set_region_keeper` now takes a function
+  from a length to an fd. The main process installs one that asks the broker
+  (`alloc <session> <len>`). `alloc_kept` maps the fd, wires it and stamps it.
+  The broker wired the object before the stamps exist, so it holds the pages
+  before the host can find them, which is a stronger order than the keeper's
+  (it mapped after the stamps, before the hello). The objects are POSIX shm,
+  unlinked by the broker the moment it made them: no name reaches them, only
+  the fds the broker sends.
+* **No broker, no session** (role (a)): the main process refuses to start,
+  as it refused without a keeper (`NO BROKER, NO SESSION` in `main.log`).
+  Role (b) maps a file and runs on without one, signing with the key file.
+* **Doorbells.** The main process asks `device wcbell` and passes the fd to
+  the compositor as `--wayland-rings fd:N`; the doorman and wake code are
+  unchanged and run on that fd. If the broker refuses (another user's session
+  holds the port), the port's own name is passed and its open fails on the
+  root-only node, which the compositor logs, and the rings poll.
+* **The GPU server** starts as `wc-launch --gpu-exec <session> svbell --
+  sv-guest gpu guest ...`. Before `exec`, which keeps the pid, it says
+  `hello gpu`, `tie <session>` and `device svbell`, and adds `--bell fd:N`.
+  So the broker watches the GPU server's pid, the port is the GPU server's,
+  and the server is ended when its session is released, as the keeper ended
+  it.
+* **The boot record.** `wc_compositor::set_boot_signer` takes the broker's
+  `sign`; `ringlink` (role (a)) and `session_svc` (role (b)) publish the
+  record with `publish_identity`. Without a signer, or when it refuses, the
+  record goes out as before, with one log line.
+
+#### 111.9.3 The release rule, per pool (the core and server changes)
+
+The keeper's rule was "every window of the session goes when the release word
+in the session's boot page is set". The release word is in one region, the
+ring window's page 0, and decides for all of the session's regions; a
+per-region probe would have released the arena on any page whose word at
+offset 1728 happened to be nonzero. So, additively:
+
+* `core.rs`, rule 6: `pool_released(id)` destroys every orphan of the region's
+  (user, pool) and ends the pool's tied processes; `tie(conn, pool)` records
+  that the caller's process ends with the pool (only itself); `tick` ends the
+  ties of a pool whose last orphan went by time; `Notice::End(pid)`;
+  `role(pid)` and `tied(pid)` for logs and tests.
+* `proto.rs`: `tie POOL -> ok`. `client.rs`: `Client::tie`.
+* `server.rs`: `Platform::released_pool(&obj)` (default no), asked before
+  `released`; `Platform::end(pid)` (default nothing); `Broker::drain_orphans
+  (limit)` for a shutdown; a log line per process exit with the orphans it
+  left.
+* `sys/unix.rs`: `Unix::mac_keeper()` (wire every region; the pool probe is
+  `macboot::is_boot_page` and `load_released` on the region's page 0), `end`
+  sends SIGKILL only to a pid the watcher still watches, and a port that is a
+  tty is put in raw mode before it is moved.
+
+The release words are unchanged: the host's `mac-sessiond` writes
+`macboot::RELEASED` once the proxy's and GPU units have ended. The fallback
+is the keeper's, 600 s as an orphan (`--release-after`).
+
+**Shutdown** (103.15): on SIGTERM the daemon keeps running the release rules
+for at most 10 s while it holds orphans, then exits; the plist gives it 15 s
+(`ExitTimeOut`) before launchd's SIGKILL. The main process still answers
+SIGTERM with `down`, so the host releases within about 1–2 s.
+
+#### 111.9.4 Tests
+
+* `core::tests` (+2): a released boot region frees its whole pool and ends its
+  tie, and nothing of another pool, another user's pool of the same name, or a
+  live owner's; a pool that times out ends its ties once.
+* `tests/unix.rs` (+2), the keeper on a real socket, as Linux runs the same
+  code but the watcher: a "main" process allocates the arena and the ring
+  window and writes a boot page, a "GPU server" ties itself; the main process
+  is killed with SIGKILL; the two regions stay held and readable for 2.5 s
+  without the word; the test writes `RELEASED` into the boot page as the host
+  does, and within a tick both regions are gone and the GPU process is
+  SIGKILLed. A second test: an arena page with the release value at the
+  offset releases nothing (it is not a boot page), and the pool goes at its
+  time limit with its tie.
+* `daemon::tests` (2): `serve`'s arguments and defaults; the plist keeps the
+  daemon alive and gives it longer than its own shutdown wait.
+* `wc-arena-host`: `who_asked_is_read_and_with_keys_verified` (the identity
+  reported, verified with `--keys`, refused when another user's identity is
+  written over it or the record is unsigned). `sessiond_ivshmem` verifies with
+  `verifies_identity`, which is §107's check when there is no identity.
+
+VM_RESULTS
+
+#### 111.9.5 Limits
+
+* **One wcbell port.** The VM has one rings port, and a port has one holder.
+  A second macOS user's session gets no doorbell: it polls its rings, and the
+  host finds its record only by a periodic sweep (`--sweep-secs`). A port per
+  user (`org.sirati.wcbell.N`, a chardev each on the hub) is the fix.
+* **A broker that dies loses its holds.** launchd restarts it, but the new
+  process holds none of the old one's regions: a main process that dies after
+  that, before its session's release, is the §103.15 case again. The broker
+  has no state to lose otherwise. A main process could hand its fds back to a
+  new broker (`adopt` with fds); not built.
+* **The GPU server's own extent** is still its own superpages: kept by
+  nothing if the GPU server itself crashes while `sv-hostd` serves it
+  (§103.15's remaining case). Moving it into the broker would change its
+  pinning from superpages to wired 4 KiB pages, which this work must not do.
+* `end` checks that the pid is still watched, but the kqueue exit event and
+  the release can race by microseconds; the pid would then have to be reused
+  in that window.
+
+#### 111.9.6 Role (b), the real Mac (designed, not built)
+
+On the real Mac the Linux VM is a user's libkrun process. Its shared memory is
+a file on a RAM-disk volume shared through virtio-fs DAX
+(`/Volumes/linux-vm-shm/arena`); its doorbells are FIFO pairs the VM manager
+makes (`~/.local/state/linux-vm/bells/<name>.{to-guest,from-guest}`). Both
+belong to the VM, and the VM belongs to one Mac user.
+
+What the same LaunchDaemon does there, with no code beyond what exists:
+
+* **Signs.** `session_svc` asks the broker when the main process has one;
+  `sessiond_ivshmem` in the guest verifies the identity. The peer moves
+  `session.key` from the support directory into the daemon's keys directory
+  and installs the daemon (`wc-broker plist`, the same plist).
+* **Watches** the main process and logs its exit; nothing is held, because
+  file pages are not freed when a process dies (the file holds them; only a
+  truncate would, and nothing truncates a live arena). No keeper is needed in
+  role (b).
+
+The arena file and the bell FIFOs stay the user's, 0600 in the user's own
+directories. With one VM per user that is already per-user isolation, and
+routing them through the broker would add a hop for nothing.
+
+If one Linux VM is to serve several Mac users (as the macOS VM in role (a)
+serves its users), the peer would change:
+
+1. The VM manager runs as a LaunchDaemon (or under the broker's account), and
+   makes the arena file and the FIFOs root's, 0600, in a root directory
+   (`/var/run/waycompose/vm/<vm>/`).
+2. The broker lends a bell as **two descriptors** (`device wcbell` answering
+   `fd fd`, a device of two paths): an additive change to the device reply
+   and `Client::device`.
+3. The broker opens the arena file and publishes each session's part of it
+   as a region of that user's pool (`Broker::publish`, then `find <pool>`),
+   and `WC_IVSHMEM_STANDIN` takes an inherited fd instead of a path.
+4. `mac.rs` replaces `fifo_bell(prefix)` with `device wcbell` and the
+   `arena-file` path with `find`.
 
 ### 111.10 The Linux host: sessions run as the mapped user
 

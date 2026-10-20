@@ -286,6 +286,12 @@ mod unix_client {
                 .collect())
         }
 
+        /// End this process when this user's pool `pool` is released (§111.9:
+        /// a macOS session's GPU server, once the host has stopped serving it).
+        pub fn tie(&mut self, pool: &str) -> io::Result<()> {
+            self.call(&Request::Tie { pool: pool.into() }).map(|_| ())
+        }
+
         /// A fresh connection to local service `name`, made by the broker.
         pub fn connect_service(&mut self, name: &str) -> io::Result<OwnedFd> {
             let (l, mut fds) = self.call(&Request::Connect { name: name.into() })?;
