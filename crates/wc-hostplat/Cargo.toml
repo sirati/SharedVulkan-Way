@@ -49,3 +49,7 @@ block2 = "0.6"
 [[bin]]
 name = "wc-hostint-probe"
 path = "src/bin/wc-hostint-probe.rs"
+
+[[bin]]
+name = "wc-portal-open"
+path = "src/bin/wc-portal-open.rs"
