@@ -35,6 +35,11 @@ pub trait Platform: Send + Sync + 'static {
     /// Call `exited` once, when process `pid` has exited. Returns false if
     /// the process could not be watched (it is already gone).
     fn watch(&self, pid: Pid, exited: Box<dyn FnOnce() + Send>) -> bool;
+    /// Watch the exact authenticated connection process when the platform has
+    /// a retained kernel identity, instead of looking it up again by PID.
+    fn watch_for(&self, _writer: &Self::Writer, pid: Pid, exited: Box<dyn FnOnce() + Send>) -> bool {
+        self.watch(pid, exited)
+    }
     /// Open device `name` (the platform half knows where it is).
     fn open_device(&self, name: &str) -> io::Result<Self::Object>;
     /// Make the object of a new region.
@@ -306,7 +311,10 @@ impl<P: Platform> Broker<P> {
         }
         let me = self.clone();
         let pid = peer.pid;
-        let watched = self.platform.watch(pid, Box::new(move || me.exited(pid)));
+        let watched = {
+            let writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+            self.platform.watch_for(&writer, pid, Box::new(move || me.exited(pid)))
+        };
         self.lock().core.owner_watch_ready(id, watched);
         if !watched {
             log(&format!("connection {id}: process {pid} cannot be watched; its connection stands for it"));

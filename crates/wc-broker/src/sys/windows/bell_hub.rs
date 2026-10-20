@@ -67,11 +67,9 @@ impl Hub {
                 "broker wake hub stopped",
             ));
         }
-        if ports.get(device).is_some_and(|p| {
-            p.failed.load(Ordering::Acquire) && p.workers.load(Ordering::Acquire) == 0
-        }) {
-            ports.remove(device);
-        }
+        // A worker ending is not native IO retirement. A failed source keeps
+        // its original handle and every uncertain read/write generation for
+        // this hub's lifetime. Explicit reattach cannot silently reopen it.
         if !ports.contains_key(device) {
             ports.insert(device.into(), Port::open(&source.path, self.slots.clone())?);
         }
@@ -145,7 +143,37 @@ struct Port {
     changed: Condvar,
     workers: AtomicUsize,
     stop: Owned,
+    readiness: Mutex<Readiness>,
+    read_changed: Condvar,
+    ever_ready: AtomicBool,
+    #[cfg(test)]
+    test_probes: Mutex<std::collections::VecDeque<Probe>>,
+    #[cfg(test)]
+    test_attempts: AtomicUsize,
 }
+#[cfg(test)]
+enum Probe {
+    Completed1450,
+    Ready1450,
+    IncompleteRead,
+    Gate1450 {
+        entered: Arc<Owned>,
+        release: Arc<Owned>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Starting,
+    Ready,
+    Unavailable,
+}
+struct Readiness {
+    phase: Phase,
+    waiters: usize,
+}
+
 impl Port {
     fn open(path: &str, slots: Arc<AtomicUsize>) -> io::Result<Arc<Self>> {
         // The service pins this exact ACL-checked physical interface. Do not
@@ -166,6 +194,16 @@ impl Port {
             changed: Condvar::new(),
             workers: AtomicUsize::new(0),
             stop: event()?,
+            readiness: Mutex::new(Readiness {
+                phase: Phase::Idle,
+                waiters: 0,
+            }),
+            read_changed: Condvar::new(),
+            ever_ready: AtomicBool::new(false),
+            #[cfg(test)]
+            test_probes: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            test_attempts: AtomicUsize::new(0),
         });
         for reader in [true, false] {
             let owner = port.clone();
@@ -185,7 +223,10 @@ impl Port {
                     } else {
                         owner.write_raw();
                     }
+                    let guard = owner.readiness.lock().unwrap_or_else(|e| e.into_inner());
                     owner.workers.fetch_sub(1, Ordering::Release);
+                    owner.read_changed.notify_all();
+                    drop(guard);
                 })
                 .is_err()
             {
@@ -195,7 +236,59 @@ impl Port {
         }
         Ok(port)
     }
+    /// One actual cold read probe per explicit subscription attempt. A known
+    /// completed initial 1450 has no admitted subscribers or raw writes, so a
+    /// later caller may retry on this SAME retained handle, without polling.
+    fn ensure_ready(&self) -> io::Result<()> {
+        let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        if self.failed.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "wake source failed; native IO ownership stays retained",
+            ));
+        }
+        if state.phase == Phase::Ready {
+            return Ok(());
+        }
+        if matches!(state.phase, Phase::Idle | Phase::Unavailable) {
+            if state.waiters != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "wake host not attached",
+                ));
+            }
+            state.phase = Phase::Starting;
+            self.read_changed.notify_all();
+        }
+        state.waiters += 1;
+        self.read_changed.notify_all();
+        while state.phase == Phase::Starting && !self.failed.load(Ordering::Acquire) {
+            state = self
+                .read_changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        state.waiters -= 1;
+        if state.phase == Phase::Ready && !self.failed.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "wake source not attached or failed",
+            ))
+        }
+    }
+    fn admitted_read(&self) {
+        // No raw writer can issue before an actual pending/successful read.
+        let guard = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        self.ever_ready.store(true, Ordering::Release);
+        self.changed.notify_all();
+        drop(guard);
+        let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        state.phase = Phase::Ready;
+        self.read_changed.notify_all();
+    }
     fn subscribe(self: &Arc<Self>, process: Arc<Owned>) -> io::Result<Object> {
+        self.ensure_ready()?;
         if self.failed.load(Ordering::Acquire) {
             return Err(io::Error::other("wake source ended; reattach explicitly"));
         }
@@ -313,6 +406,9 @@ impl Port {
         }
         self.changed.notify_all();
         drop(guard);
+        let state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        self.read_changed.notify_all();
+        drop(state);
         let members = std::mem::take(&mut *self.members.lock().unwrap_or_else(|e| e.into_inner()));
         for sub in members.into_values() {
             sub.close();
@@ -320,16 +416,96 @@ impl Port {
         self.changed.notify_all();
         cancel(self.raw);
     }
+    fn read_attempt(self: &Arc<Self>) -> io::Result<bool> {
+        #[cfg(test)]
+        {
+            self.test_attempts.fetch_add(1, Ordering::AcqRel);
+            let probe = self
+                .test_probes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match probe {
+                Some(Probe::Completed1450) => return Err(io::Error::from_raw_os_error(1450)),
+                Some(Probe::Ready1450) => {
+                    self.admitted_read();
+                    return Err(io::Error::from_raw_os_error(1450));
+                }
+                Some(Probe::Gate1450 { entered, release }) => {
+                    unsafe {
+                        windows_sys::Win32::System::Threading::SetEvent(entered.0);
+                    }
+                    let events = [release.0, self.stop.0];
+                    let status = unsafe {
+                        windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                            2,
+                            events.as_ptr(),
+                            0,
+                            windows_sys::Win32::System::Threading::INFINITE,
+                        )
+                    };
+                    return Err(io::Error::from_raw_os_error(
+                        if status == windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
+                            1450
+                        } else {
+                            995
+                        },
+                    ));
+                }
+                Some(Probe::IncompleteRead) => {
+                    return read_wake_ops(
+                        self.clone(),
+                        self.raw,
+                        self.stop.0 as usize,
+                        2000,
+                        || self.admitted_read(),
+                        |_, _| windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+                        |_, ov, _| {
+                            assert_eq!(unsafe { std::ptr::read_volatile(&(*ov).Internal) }, 0x103);
+                            Err(io::Error::from_raw_os_error(995))
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        read_wake_announce(
+            self.clone(),
+            self.raw,
+            self.stop.0 as usize,
+            windows_sys::Win32::System::Threading::INFINITE,
+            || self.admitted_read(),
+        )
+    }
     fn read_raw(self: &Arc<Self>) {
-        while !self.failed.load(Ordering::Acquire) {
-            match read_wake(
-                self.clone(),
-                self.raw,
-                self.stop.0 as usize,
-                windows_sys::Win32::System::Threading::INFINITE,
-            ) {
+        loop {
+            let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+            while matches!(state.phase, Phase::Idle | Phase::Unavailable)
+                && !self.failed.load(Ordering::Acquire)
+            {
+                state = self
+                    .read_changed
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            if self.failed.load(Ordering::Acquire) {
+                return;
+            }
+            drop(state);
+            let result = self.read_attempt();
+            match result {
                 Ok(true) => self.broadcast(),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.raw_os_error() == Some(1450)
+                        && !self.ever_ready.load(Ordering::Acquire) =>
+                {
+                    // The read completed synchronously, before any raw write or
+                    // subscriber was admitted. Keep this handle, park, and let
+                    // only a new explicit subscription trigger another probe.
+                    let mut state = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+                    state.phase = Phase::Unavailable;
+                    self.read_changed.notify_all();
+                }
                 _ => {
                     self.fail();
                     return;
@@ -340,7 +516,9 @@ impl Port {
     fn write_raw(&self) {
         loop {
             let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            while !*dirty && !self.failed.load(Ordering::Acquire) {
+            while (!*dirty || !self.ever_ready.load(Ordering::Acquire))
+                && !self.failed.load(Ordering::Acquire)
+            {
                 dirty = self.changed.wait(dirty).unwrap_or_else(|e| e.into_inner());
             }
             if self.failed.load(Ordering::Acquire) {
@@ -452,13 +630,57 @@ fn event() -> io::Result<Owned> {
 /// Own every kernel-visible read byte and OVERLAPPED until actual completion.
 /// The stop event also covers cancellation requested just before ReadFile.
 fn read_wake<T>(owner: Arc<T>, raw: usize, stop: usize, timeout: u32) -> io::Result<bool> {
+    read_wake_announce(owner, raw, stop, timeout, || {})
+}
+fn read_wake_announce<T>(
+    owner: Arc<T>,
+    raw: usize,
+    stop: usize,
+    timeout: u32,
+    admitted: impl FnOnce(),
+) -> io::Result<bool> {
+    read_wake_ops(
+        owner,
+        raw,
+        stop,
+        timeout,
+        admitted,
+        |events, timeout| unsafe {
+            windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                2,
+                events.as_ptr(),
+                0,
+                timeout,
+            )
+        },
+        |handle, ov, done| {
+            if unsafe { windows_sys::Win32::System::IO::GetOverlappedResult(handle, ov, done, 1) }
+                != 0
+            {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        },
+    )
+}
+fn read_wake_ops<T>(
+    owner: Arc<T>,
+    raw: usize,
+    stop: usize,
+    timeout: u32,
+    admitted: impl FnOnce(),
+    wait: impl FnOnce(&[HANDLE; 2], u32) -> u32,
+    finish: impl FnOnce(
+        HANDLE,
+        *const windows_sys::Win32::System::IO::OVERLAPPED,
+        *mut u32,
+    ) -> io::Result<()>,
+) -> io::Result<bool> {
     use windows_sys::Win32::{
         Foundation::{ERROR_IO_PENDING, WAIT_OBJECT_0},
         Storage::FileSystem::ReadFile,
-        System::{
-            IO::{GetOverlappedResult, OVERLAPPED},
-            Threading::WaitForMultipleObjects,
-        },
+        System::IO::OVERLAPPED,
     };
     struct ReadOp<T> {
         ov: OVERLAPPED,
@@ -487,6 +709,13 @@ fn read_wake<T>(owner: Arc<T>, raw: usize, stop: usize, timeout: u32) -> io::Res
         )
     };
     let error = (ok == 0).then(io::Error::last_os_error);
+    if ok != 0
+        || error
+            .as_ref()
+            .is_some_and(|e| e.raw_os_error() == Some(ERROR_IO_PENDING as i32))
+    {
+        admitted();
+    }
     let pending = || unsafe { std::ptr::read_volatile(&op.ov.Internal) == 0x103 };
     if error
         .as_ref()
@@ -496,14 +725,13 @@ fn read_wake<T>(owner: Arc<T>, raw: usize, stop: usize, timeout: u32) -> io::Res
         let handles = [op.ov.hEvent, stop as HANDLE];
         // SAFETY: both retained live events; stop is checked even if close won
         // the race before this read was issued. No periodic wake interval.
-        let status = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout) };
+        let status = wait(&handles, timeout);
         if status != WAIT_OBJECT_0 {
             unsafe {
                 CancelIoEx(raw as HANDLE, &op.ov);
             }
         }
-        let completed = unsafe { GetOverlappedResult(raw as HANDLE, &op.ov, &mut done, 1) };
-        let completion_error = (completed == 0).then(io::Error::last_os_error);
+        let completion_error = finish(raw as HANDLE, &op.ov, &mut done).err();
         if unsafe { std::ptr::read_volatile(&op.ov.Internal) } == 0x103 {
             // A broken completion API cannot authorize freeing kernel-owned
             // storage. Retain the owner too, including its global worker slot.
@@ -613,6 +841,293 @@ mod tests {
             read_wake(pipe.clone(), raw, stop.0 as usize, 2000).unwrap(),
             "wake pipe ended"
         );
+    }
+
+    fn fixture() -> (Arc<Port>, Arc<Pipe>, usize) {
+        let (server, raw, client) = pair().unwrap();
+        let (host, host_raw) = peer(client);
+        (
+            Port::start(server, raw, Arc::new(AtomicUsize::new(0))).unwrap(),
+            host,
+            host_raw,
+        )
+    }
+    fn wait_workers(port: &Port) {
+        let mut state = port.readiness.lock().unwrap();
+        while port.workers.load(Ordering::Acquire) != 0 {
+            let (next, result) = port
+                .read_changed
+                .wait_timeout(state, std::time::Duration::from_secs(2))
+                .unwrap();
+            state = next;
+            assert!(!result.timed_out(), "native workers failed to stop");
+        }
+    }
+    fn failed_hub(port: &Arc<Port>) -> (Arc<Hub>, User) {
+        let user = User::sid(&super::super::ident::current_user().unwrap());
+        let hub = Hub::new(vec![Source {
+            device: "fixture".into(),
+            path: r"\\.\must-not-open-again".into(),
+            owner: user.clone(),
+        }]);
+        hub.ports
+            .lock()
+            .unwrap()
+            .insert("fixture".into(), port.clone());
+        (hub, user)
+    }
+
+    #[test]
+    fn failed_completion_keeps_original_raw_generation_after_workers_end() {
+        let (port, _host, _) = fixture();
+        port.test_probes
+            .lock()
+            .unwrap()
+            .push_back(Probe::IncompleteRead);
+        let (hub, user) = failed_hub(&port);
+        // This issues a genuine pending named-pipe read. Only the completion
+        // API answer is fault-injected, leaving Internal == STATUS_PENDING.
+        let _ = hub.subscribe("fixture", &user, process());
+        assert_eq!(
+            unsafe { WaitForSingleObject(port.stop.0, 2000) },
+            WAIT_OBJECT_0
+        );
+        wait_workers(&port);
+        assert_eq!(
+            hub.subscribe("fixture", &user, process())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::Other
+        );
+        assert!(Arc::ptr_eq(
+            hub.ports.lock().unwrap().get("fixture").unwrap(),
+            &port
+        ));
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn failed_raw_write_source_is_sticky_even_with_no_live_worker() {
+        let (port, _host, _) = fixture();
+        port.ensure_ready().unwrap();
+        // A write failure can retain opaque native records in Pipe's
+        // quarantine. Thread completion supplies no proof of their drain.
+        port.fail();
+        wait_workers(&port);
+        let (hub, user) = failed_hub(&port);
+        assert!(hub.subscribe("fixture", &user, process()).is_err());
+        assert!(Arc::ptr_eq(
+            hub.ports.lock().unwrap().get("fixture").unwrap(),
+            &port
+        ));
+    }
+
+    #[test]
+    fn completed_cold_1450_retries_only_on_explicit_subscription_same_handle() {
+        let (port, host, _) = fixture();
+        port.test_probes
+            .lock()
+            .unwrap()
+            .push_back(Probe::Completed1450);
+        let raw = port.raw;
+        assert_eq!(
+            port.ensure_ready().err().unwrap().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert!(!port.failed.load(Ordering::Acquire));
+        assert!(!port.ever_ready.load(Ordering::Acquire));
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 1);
+        let (client, client_raw) = peer(port.subscribe(process()).unwrap());
+        assert_eq!(port.raw, raw);
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 2);
+        (&*host).write_all(&[RESCAN]).unwrap();
+        notification(&client, client_raw);
+        port.fail();
+        wait_workers(&port);
+    }
+
+    #[test]
+    fn concurrent_subscribers_share_one_cold_probe_and_stop_wakes_waiters() {
+        let (port, _host, _) = fixture();
+        let entered = Arc::new(event().unwrap());
+        let release = Arc::new(event().unwrap());
+        port.test_probes.lock().unwrap().push_back(Probe::Gate1450 {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let first = port.clone();
+        let first = std::thread::spawn(move || first.ensure_ready());
+        assert_eq!(
+            unsafe { WaitForSingleObject(entered.0, 2000) },
+            WAIT_OBJECT_0
+        );
+        let second = port.clone();
+        let second = std::thread::spawn(move || second.ensure_ready());
+        let mut state = port.readiness.lock().unwrap();
+        while state.waiters < 2 {
+            let (next, timeout) = port
+                .read_changed
+                .wait_timeout(state, std::time::Duration::from_secs(2))
+                .unwrap();
+            state = next;
+            assert!(
+                !timeout.timed_out(),
+                "second subscriber did not join the probe"
+            );
+        }
+        drop(state);
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 1);
+        // The release gate remains closed. Only actual hub shutdown ends it.
+        port.fail();
+        assert!(first.join().unwrap().is_err());
+        assert!(second.join().unwrap().is_err());
+        wait_workers(&port);
+    }
+
+    #[test]
+    fn pending_admission_then_1450_is_sticky_not_a_cold_retry() {
+        let (port, _host, _) = fixture();
+        port.test_probes.lock().unwrap().push_back(Probe::Ready1450);
+        let _ = port.ensure_ready();
+        assert_eq!(
+            unsafe { WaitForSingleObject(port.stop.0, 2000) },
+            WAIT_OBJECT_0
+        );
+        wait_workers(&port);
+        assert!(port.ever_ready.load(Ordering::Acquire));
+        assert!(port.ensure_ready().is_err());
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cold_idle_worker_stops_without_attempting_a_read() {
+        let (port, _host, _) = fixture();
+        port.fail();
+        wait_workers(&port);
+        assert_eq!(port.test_attempts.load(Ordering::Acquire), 0);
+        assert!(port.ensure_ready().is_err());
+    }
+
+    #[test]
+    fn connection_watch_uses_its_retained_process_after_pid_map_replacement() {
+        use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn child() -> Child {
+            Child(
+                std::process::Command::new("powershell.exe")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Start-Sleep -Seconds 60",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        let mut first_child = child();
+        let mut second_child = child();
+        let sid = super::super::ident::current_user().unwrap();
+        let first =
+            Arc::new(super::super::ident::open_process_checked(first_child.0.id(), &sid).unwrap());
+        let second =
+            Arc::new(super::super::ident::open_process_checked(second_child.0.id(), &sid).unwrap());
+        let (port, _host, _) = fixture();
+        let _first_endpoint = port.subscribe(first.clone()).unwrap();
+        let _second_endpoint = port.subscribe(second.clone()).unwrap();
+        let first_registration = port
+            .members
+            .lock()
+            .unwrap()
+            .values()
+            .find(|s| Arc::ptr_eq(&s.process, &first))
+            .unwrap()
+            .clone();
+        let second_registration = port
+            .members
+            .lock()
+            .unwrap()
+            .values()
+            .find(|s| Arc::ptr_eq(&s.process, &second))
+            .unwrap()
+            .clone();
+        let hub = Hub::new(Vec::new());
+        hub.ports
+            .lock()
+            .unwrap()
+            .insert("fixture".into(), port.clone());
+        let mut windows = super::super::Windows::bind(
+            &format!(r"\\.\pipe\wc-bell-watch-{}", std::process::id()),
+            super::super::holder::HOLDER_SDDL,
+            Vec::new(),
+        )
+        .unwrap();
+        windows.bell_hub = Some(hub);
+        // Force exactly the production interleave: another accept replaces the
+        // numeric map before this connection registers its process watch.
+        windows
+            .opened
+            .lock()
+            .unwrap()
+            .insert(first_child.0.id(), second.clone());
+        let (dummy_pipe, raw, _dummy_client) = pair().unwrap();
+        let mut handle = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    raw as HANDLE,
+                    GetCurrentProcess(),
+                    &mut handle,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            },
+            0
+        );
+        let writer = super::super::Writer {
+            pipe: Arc::new(super::super::pipe::ServerPipe { handle }),
+            process: first,
+            user: User::sid(&sid),
+        };
+        let exited = Arc::new(event().unwrap());
+        let signal = exited.clone();
+        assert!(crate::server::Platform::watch_for(
+            &windows,
+            &writer,
+            first_child.0.id(),
+            Box::new(move || {
+                unsafe {
+                    windows_sys::Win32::System::Threading::SetEvent(signal.0);
+                }
+            })
+        ));
+        first_child.0.kill().unwrap();
+        first_child.0.wait().unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(exited.0, 2000) },
+            WAIT_OBJECT_0
+        );
+        assert!(first_registration.closed.load(Ordering::Acquire));
+        assert!(!second_registration.closed.load(Ordering::Acquire));
+        assert!(second_child.0.try_wait().unwrap().is_none());
+        assert_eq!(port.members.lock().unwrap().len(), 1);
+        drop(writer);
+        drop(dummy_pipe);
+        port.fail();
+        wait_workers(&port);
     }
 
     #[test]
