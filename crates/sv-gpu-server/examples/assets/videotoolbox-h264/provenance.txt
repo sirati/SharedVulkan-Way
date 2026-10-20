@@ -1,0 +1,43 @@
+Synthetic VideoToolbox decode fixture, generated on devhost.
+No external media or third-party image content is included.
+
+Asset: progressive-64x50.h264
+SHA256: 51cdf8efcda0a076eee679c57765d055ee904f3f77a1275dbb63d6261e39dc99
+Size: 1997 bytes
+
+Encoder executable:
+/nix/store/i5dzymmqgcc1qw90pqnpalj24m66iqik-ffmpeg-full-8.0.1-bin/bin/ffmpeg
+FFmpeg 8.0.1, libavformat 62.3.100, libavcodec 62.11.100, libx264 core 164.
+The encoder's own SEI records its x264 version/options in the asset.
+Reproduction command:
+python3 generate.py /path/to/ffmpeg-with-libx264
+The checked-in generator records the exact ffmpeg arguments and raw input.
+Different x264 versions may produce different compressed bytes.
+
+Input: eight progressive 64x50 planar yuv420p frames at 25fps.
+For each frame f=0..7:
+  Y(x,y) = 40 + 12*f + 8*floor(x/16) + 6*floor(y/10)
+  U(x,y) = 64 + 5*f
+  V(x,y) = 192 - 5*f
+The SPS reports a 64x64 coded extent and 64x50 display extent with bottom crop.
+Encoder settings: Constrained Baseline, QP12, no B frames, one reference,
+IDR every four frames, AUDs and repeated parameter sets. Encoder log confirms
+2 I pictures and 6 P pictures. All pictures have one VCL slice NAL.
+
+devhost software sanity check:
+ffmpeg -i progressive-64x50.h264 -f rawvideo -pixel_format yuv420p reference.yuv
+Decoded size: 38400 bytes, eight 4800-byte frames.
+Maximum absolute difference from the generated raw Y/U/V input: 1.
+The macOS fixture allows maximum error 4 per channel across every visible pixel.
+This check validates the asset and expected pattern, not VideoToolbox.
+
+Runtime fixture: ../../macos-videotoolbox-decode.rs
+Build/sign on vmhost through the coordinated build flow. Run on the Mac only in
+the parent-coordinated Neo window. No GUI, Vulkan loader, or running compositor
+is required. The fixture sets a 30-second alarm. Success requires eight actual
+hardware-required VT decode completions, valid NV12 IOSurface Pictures, expected
+cropped geometry, all visible Y/U/V pixels within tolerance, and unchanged
+retained output after source-mmap overwrite. The overwrite occurs only after
+session drain/drop and Arc::try_unwrap proves every compressed-block reference
+has been released. CPU pixel readback occurs only in this diagnostic example.
+No macOS execution is claimed by the vmhost software sanity check.
