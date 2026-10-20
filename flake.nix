@@ -88,6 +88,8 @@
       libxkbcommonMingw = pkgsUnsupported.callPackage ./nix/libxkbcommon-mingw.nix {};
     in {
       packages.libxkbcommon-mingw = libxkbcommonMingw;
+      packages.libffi-mingw = pkgs.pkgsCross.mingwW64.libffi;
+      packages.pthreads-mingw = pkgs.pkgsCross.mingwW64.windows.pthreads;
       # §106.3: the session PipeWire's native nodes for the sound ring.
       packages.wc-pw-node = pkgs.callPackage ./nix/wc-pw-node.nix {};
 
