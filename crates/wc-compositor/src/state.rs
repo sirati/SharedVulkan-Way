@@ -507,6 +507,7 @@ pub struct State {
     /// See the note on the import for why a clipboard is a prerequisite for
     /// input.
     _data_device: DataDeviceState,
+    data_control: Option<smithay::wayland::selection::wlr_data_control::DataControlState>,
     /// ADDED FOR STAGE 9. Both decoration protocols; see the import.
     _xdg_decoration: XdgDecorationState,
     kde_decoration: KdeDecorationState,
@@ -1116,6 +1117,7 @@ impl State {
             xdg_shell: XdgShellState::new::<State>(dh),
             output,
             _data_device: DataDeviceState::new::<State>(dh),
+            data_control: None,
             _xdg_decoration: XdgDecorationState::new::<State>(dh),
             // **This one line decides how many title bars the window has**, and
             // it is `default_mode` on the *manager*, sent once at bind, rather
@@ -6359,6 +6361,34 @@ impl SelectionHandler for State {
         );
     }
 }
+
+impl State {
+    /// Explicit capability, absent by default. The actual local socket peer's
+    /// kernel credentials and established lease dialect both gate visibility.
+    pub(crate) fn enable_data_control(&mut self, display: &DisplayHandle) {
+        let handle = display.clone();
+        self.data_control = Some(smithay::wayland::selection::wlr_data_control::DataControlState::new::<Self, _>(
+            display, None, move |client| {
+                #[cfg(unix)]
+                {
+                    // SAFETY: geteuid has no pointer arguments or side effects.
+                    let uid = unsafe { libc::geteuid() };
+                    client.get_credentials(&handle).is_ok_and(|credentials| credentials.uid == uid)
+                        && matches!(handle.backend_handle().client_fd_encoding(client.id()),
+                            smithay::utils::os::FdEncoding::InBandLease(_))
+                }
+                #[cfg(not(unix))]
+                { let _ = (&handle, client); false }
+            }));
+        println!("wc-compositor: opt-in data-control visibility requires OS same-user and BAR lease identity");
+    }
+}
+impl smithay::wayland::selection::wlr_data_control::DataControlHandler for State {
+    fn data_control_state(&self) -> &smithay::wayland::selection::wlr_data_control::DataControlState {
+        self.data_control.as_ref().expect("data-control requests require its opt-in global")
+    }
+}
+smithay::delegate_data_control!(State);
 
 impl DataDeviceHandler for State {
     fn data_device_state(&self) -> &DataDeviceState {

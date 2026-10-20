@@ -130,6 +130,8 @@ struct Args {
     dump_frames: Option<std::path::PathBuf>,
     debug_icon: bool,
     simulate_wm: bool,
+    /// Opt-in selection control for OS same-user authenticated BAR clients.
+    allow_data_control: bool,
     /// Force the poll loop back onto `Sleep`, with its 15.6 ms quantum.
     ///
     /// The control for the cadence question (docs/waycompose-design.md §13.8). One binary,
@@ -387,6 +389,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
         dump_frames: None,
         debug_icon: false,
         simulate_wm: false,
+        allow_data_control: false,
         poll_coarse: false,
         log: None,
         expect_presents: 0,
@@ -439,6 +442,7 @@ fn parse_args(argv: &[String]) -> Result<Args, u8> {
             "--in-band" => args.in_band = true,
             "--debug-icon" => args.debug_icon = true,
             "--simulate-wm" => args.simulate_wm = true,
+            "--allow-data-control" => args.allow_data_control = true,
             "--poll-coarse" => args.poll_coarse = true,
             "--log" => args.log = it.next().map(Into::into),
             "--arena-frames" => args.arena_frames = it.next(),
@@ -1642,7 +1646,7 @@ pub fn run_from(argv: Vec<String>) -> std::process::ExitCode {
             let code = wayland_thread(args.once, args.socket, args.wayland_ring, args.wayland_cold, ivshmem_rings, args.idle_timeout, args.debug_icon,
                 args.expect_presents, args.poll_coarse, layout, args.output,
                 args.decorations, ui, event_rx, control, args.in_band, qemu_arena_id, args.exit_when_empty,
-                args.nested_globals || session_svc::multi());
+                args.nested_globals || session_svc::multi(), args.allow_data_control);
             thread_exit.store(code, Ordering::SeqCst);
         });
     let wayland = match wayland {
@@ -1773,6 +1777,7 @@ fn wayland_thread(
     exit_when_empty: Option<Duration>,
     // §102. See `Args::nested_globals`.
     nested_globals: bool,
+    allow_data_control: bool,
 ) -> u8 {
     use std::io::Write as _;
     let in_band_encoding = in_band_arena.map(FdEncoding::InBandLease).unwrap_or(FdEncoding::InBand);
@@ -1794,6 +1799,7 @@ fn wayland_thread(
     };
     let dh = display.handle();
     let mut state = State::new(&dh, ui, events, debug_icon, &layout, output, decorations, nested_globals);
+    if allow_data_control { state.enable_data_control(&dh); }
 
     let listener = match socket {
         Some(name) => ListeningSocket::bind(&name),
