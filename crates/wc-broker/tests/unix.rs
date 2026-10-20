@@ -305,6 +305,8 @@ fn keeper_helper() {
     }
 }
 
+// The child is returned; every caller kills and waits for it.
+#[allow(clippy::zombie_processes)]
 fn spawn_keeper_helper(sock: &str, role: &str) -> (std::process::Child, String) {
     let mut c = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "keeper_helper", "--nocapture", "--test-threads=1"])
@@ -410,5 +412,30 @@ fn a_pool_with_no_release_goes_after_its_limit() {
     let st = wait_exit(&mut gpu, Duration::from_secs(6)).expect("ended at the limit");
     assert_eq!(st.signal(), Some(libc::SIGKILL));
     assert!(me.stats().unwrap().contains("regions=0"), "{}", me.stats().unwrap());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// §112: a connection handed in rather than accepted (sv-drm forwards one end
+/// of a socket pair a sandboxed process made) is served like any other, and
+/// its identity is the pair's maker, as the kernel says.
+#[test]
+fn a_forwarded_connection_is_served_as_its_maker() {
+    let d = dir("inject");
+    std::fs::write(d.join("arena"), vec![0u8; 4096]).unwrap();
+    let unix = Unix::bind(d.join("broker.sock"), vec![DevicePath { name: "arena".into(), path: d.join("arena") }]).unwrap();
+    let inject = unix.injector();
+    let devices = vec![DeviceSpec { name: "arena".into(), allow: Allow::AnyUser }];
+    let config = Config { devices, services: vec![], keys: None, release: Release::OwnerFree, budget: None, run: 9 };
+    let b = Broker::new(unix, config);
+    std::thread::spawn(move || b.serve());
+    let (mine, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    inject.send(theirs).unwrap();
+    let mut s = mine;
+    s.write_all(b"hello sandboxed\n").unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(&s), &mut line).unwrap();
+    // SAFETY: no arguments.
+    let uid = unsafe { libc::geteuid() };
+    assert_eq!(line.trim(), format!("ok hello 0000000000000009 uid:{uid} {}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
 }

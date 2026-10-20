@@ -6,7 +6,7 @@
 //! session asks a handful of questions when it starts, and the doorbells,
 //! rings and regions it is given are its own from then on.
 
-use crate::core::{Core, ConnId, DeviceSpec, Notice, ObjId, Peer, Pid, Refusal, Release};
+use crate::core::{Core, ConnId, DeviceSpec, Notice, ObjId, Peer, Pid, Refusal, RegionInfo, Release, User};
 use crate::proto::{self, Piece, Request};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader};
@@ -62,6 +62,21 @@ pub trait Platform: Send + Sync + 'static {
     /// End process `pid`, which tied itself to a pool now released. Only
     /// called while the broker still watches the process.
     fn end(&self, _pid: Pid) {}
+    /// A region was just made for `user` (§111.8): the platform may stamp it
+    /// (§108.8, through its region-init hook) and record it where a restarted
+    /// broker finds it again (the Windows holder). What it returns is one
+    /// word for the end of the `ok region` reply; an error undoes the alloc.
+    fn region_made(&self, _info: &RegionInfo, _user: &User, _obj: &Self::Object) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+    /// Region `id` is gone; the broker's own object is dropped after this.
+    fn region_destroyed(&self, _id: ObjId) {}
+    /// Regions a previous run of the broker held that still exist (the
+    /// Windows holder's copies), with their users: each comes back as an
+    /// orphan of its pool, for its user's next provider to adopt.
+    fn restore(&self) -> Vec<(RegionInfo, User, Self::Object)> {
+        Vec::new()
+    }
     /// Who the caller is, as the boot record's identity (§111.6): the
     /// platform reads it from the kernel's credentials or token, never from
     /// anything the caller sent. `None`: this platform does not sign.
@@ -99,7 +114,7 @@ struct State<P: Platform> {
     core: Core,
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
     writers: BTreeMap<ConnId, Arc<Mutex<P::Writer>>>,
-    on_drained: Option<Box<dyn FnMut(ObjId, u64) + Send>>,
+    on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
 }
 
 /// A running broker. Cloned into every connection's thread; also what a
@@ -137,13 +152,19 @@ impl<P: Platform> Broker<P> {
     pub fn new(platform: P, config: Config) -> Broker<P> {
         let mut core = Core::new(config.devices);
         core.set_budget(config.budget);
+        let mut objs = BTreeMap::new();
+        for (info, user, obj) in platform.restore() {
+            log(&format!("region {} of pool {} ({} bytes, {user}): kept across a restart, now an orphan", info.id, info.pool, info.len));
+            core.restore_orphan(&info, user, config.release, Instant::now());
+            objs.insert(info.id, vec![Held { obj, pieces: vec![(0, info.len)] }]);
+        }
         Broker {
             platform: Arc::new(platform),
             state: Arc::new(Mutex::new(State {
                 core,
-                objs: BTreeMap::new(),
+                objs,
                 writers: BTreeMap::new(),
-                on_drained: None,
+                on_drained: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
             release: config.release,
@@ -166,6 +187,7 @@ impl<P: Platform> Broker<P> {
         for n in st.core.drain() {
             match n {
                 Notice::Destroy(id) => {
+                    self.platform.region_destroyed(id);
                     if st.objs.remove(&id).is_some() {
                         log(&format!("region {id}: the broker's handle is closed"));
                     }
@@ -177,7 +199,7 @@ impl<P: Platform> Broker<P> {
                     }
                 }
                 Notice::Drained(id, epoch) => {
-                    if let Some(f) = st.on_drained.as_mut() {
+                    for f in st.on_drained.iter_mut() {
                         f(id, epoch);
                     }
                 }
@@ -341,9 +363,19 @@ impl<P: Platform> Broker<P> {
                 Ok(info) => match p.create_region(*len, *large) {
                     Ok(obj) => {
                         let held = Held { obj, pieces: vec![(0, *len)] };
+                        let note = match p.region_made(&info, &peer.user, &held.obj) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                st.core.alloc_failed(info.id);
+                                return p.push(w, &format!("err cannot prepare region {}: {e}", info.id));
+                            }
+                        };
                         let r = p.send(
                             w,
-                            &|h| proto::region_line(&info, &[Piece { handle: h[0].clone(), offset: 0, len: info.len }]),
+                            &|h| {
+                                let piece = [Piece { handle: h[0].clone(), offset: 0, len: info.len }];
+                                proto::region_line_noted(&info, &piece, note.as_deref())
+                            },
                             vec![Give::Copy(&held.obj)],
                         );
                         st.objs.insert(info.id, vec![held]);
@@ -511,9 +543,18 @@ impl<P: Platform> Broker<P> {
         self.settle(&mut st);
     }
 
-    /// Called with each retiring region whose last lease has ended.
+    /// Add a callback for each retiring region whose last lease has ended.
+    /// Every callback added is called, in order. **They run under the
+    /// broker's lock**: a callback must only hand the event on (send it on a
+    /// channel), never call back into the broker.
     pub fn on_drained(&self, f: Box<dyn FnMut(ObjId, u64) + Send>) {
-        self.lock().on_drained = Some(f);
+        self.lock().on_drained.push(f);
+    }
+
+    /// The processes holding a lease on region `id` now, so that a
+    /// restarted embedder can watch them again.
+    pub fn holders(&self, id: ObjId) -> Vec<Pid> {
+        self.lock().core.holders(id)
     }
 
     pub fn stats(&self) -> crate::core::Stats {
