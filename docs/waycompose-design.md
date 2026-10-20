@@ -38234,6 +38234,54 @@ per-app environment overrides. Fixture mode is never enabled by deployment.
 Current broker migration and mapped-user authorization guards still apply.
 Family deployment remains held for review.
 
+### 112.11 Image ownership and hardware decode gates
+
+An acquired swapchain image is reserved before its index is returned. In the
+zero-copy path, its states are available, acquired, submitting, compositor-owned
+and quarantined. Only `wl_buffer.release` can move compositor-owned back to
+available. A release cannot revoke an unpresented acquisition, and submission,
+numbering or commit failures quarantine the image instead of returning it to
+the application. The copy path also reserves acquired images and releases them
+only after its present finishes successfully. Its former ten-second wait no
+longer grants ownership of an image that remains in use.
+
+Acquisition honors zero-timeout `VK_NOT_READY` and finite `VK_TIMEOUT` results.
+One deadline covers contention for the WSI state lock and the event wait. A
+prepared Wayland read spans the unlocked poll/read interval; timeout, error,
+wake and write-only readiness cancel it. This prevents another application
+reader from draining a release into the private queue immediately before the
+WSI waits on an empty socket. Actual libwayland two-reader/private-queue tests
+exercise this handshake. `wl_display_read_events` still synchronizes with other
+application readers; the deadline does not bound an arbitrarily stalled
+application thread inside libwayland's reader protocol.
+
+Swapchain destruction checks GPU completion and compositor ownership separately.
+A GPU idle result is not a compositor release, nor is destroying a `wl_buffer`.
+If completion is unproved, destruction retains the complete proxy, callback
+storage and original backing instead of freeing or recycling it. This is a
+fail-closed retention limit: the last displayed image, and the swapchain's
+other retained objects, can remain allocated until process exit. It is not an
+automatic retirement implementation. Detaching an old swapchain from the
+borrowed `wl_surface` would risk removing a newer swapchain's frame and is not
+used to manufacture a drain proof.
+
+Explicit dma-buf image origins are preserved across create, requirements,
+allocation, bind and both layout query APIs. Requirement sizes include the
+translated origin; binding checks the complete extent and alignment against
+the actual tracked allocation with checked arithmetic. A zero-copy swapchain
+whose backend reports a nonzero image origin is refused, because its current
+Wayland image tuple has no offset field. It does not advertise an offset of
+zero for different bytes.
+
+devhost's RTX 5090 with NVIDIA driver 595.104.02 reports H264, H265, AV1 and VP9
+Vulkan Video decode support. A bounded four-frame H264 test at 320x180 decodes
+345,600 NV12 bytes identically to libavcodec both directly and through the
+forwarder. All 81 H264/H265/AV1 capability lines also match byte for byte,
+excluding the ICD's timing footer. This test uses no swapchain and proves
+Vulkan Video forwarding, not stock Firefox VA-API selection or a benchmark.
+Its evidence is in `evidence/stock-firefox/hardware/`. No family guest or GPU
+assignment changes were made.
+
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
 
 **The fault.** On testhost on 2026-10-20 sessions ended twice ("its proxy
