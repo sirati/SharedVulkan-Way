@@ -517,7 +517,7 @@ play() {
   # touching it.
   mark "steady begin"; sleep 30; mark "steady end"
   xdotool key Escape; sleep 2; shot "$RUN/p7-paused.png"; mark paused
-  # The isolated Wine desktop has no X window manager to implement Alt+F4.
+  # Alt+F4 did not deliver a close in this isolated Wine desktop.
   # Click the real caption close button using the live X window geometry.
   local w X Y WIDTH HEIGHT SCREEN WINDOW
   w=$(xdotool search --onlyvisible --name '^Minecraft ' 2>/dev/null | tail -1)
