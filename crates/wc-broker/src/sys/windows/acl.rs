@@ -456,6 +456,17 @@ pub fn secure(devices: &[DeviceAt], state: &Path) -> Vec<String> {
 /// Refuse rollback that would expose uncleared physical memory through a
 /// direct device open. A persisted SID binding cannot police a reverted
 /// kernel DACL. There is no independently attested drain/reset boundary yet.
+/// Verify every present raw device has the exact protected descriptor in both its live object and PnP property. Missing devices are optional and skipped.
+pub fn verify_raw_protection(devices: &[DeviceAt]) -> Result<(), String> {
+    for d in devices {
+        if !matches!(d.loc, DeviceLoc::IvshmemSlot(_)) { continue; }
+        let Some(found) = find(d).map_err(|e| format!("{}: lookup failed: {e}", d.name))? else { continue; };
+        if live(&found.live).map_err(|e| format!("{}: live ACL unreadable: {e}", d.name))? != DEVICE_SDDL { return Err(format!("{}: live ACL is not protected", d.name)); }
+        if property(&found.instance).map_err(|e| format!("{}: PnP ACL unreadable: {e}", d.name))?.as_deref() != Some(DEVICE_SDDL) { return Err(format!("{}: PnP ACL is not protected", d.name)); }
+    }
+    Ok(())
+}
+
 pub fn revert_check(state: &Path) -> Result<(), String> {
     let rows = check_baseline(state)?;
     for (_, instance, path, original, property) in rows {

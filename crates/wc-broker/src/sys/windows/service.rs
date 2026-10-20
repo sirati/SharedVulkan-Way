@@ -284,6 +284,7 @@ fn serve(a: &Args) -> Result<(), String> {
     } else {
         log("--no-acl: the devices' descriptors are left alone");
     }
+    acl::verify_raw_protection(&a.devices)?;
     // Missing, unreadable or corrupt policy never becomes first-claim. Keep
     // ports/signing available while reserving every unbound raw BAR.
     let owners = read_raw_owners(&a.state.join("raw-device-owners.txt"))
