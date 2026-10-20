@@ -10,6 +10,8 @@ description = "App-side daemon: owns the extent's descriptor, hands the fd and t
 sv-transport = { workspace = true }
 sv-arena = { workspace = true }
 sv-wire = { workspace = true }
+# §105.14: the ivshmem header, which names the rings the hub rings directly.
+wc-handle = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The stamped page record, defined once and shared with the guest half. design.md

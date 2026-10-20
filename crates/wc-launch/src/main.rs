@@ -766,9 +766,51 @@ mod win {
             Ok(CtlClient { s, buf: Vec::with_capacity(4096) })
         }
 
+        /// How long a request looks for its answer before it blocks
+        /// (§105.14). **Off**: measured on the guest, it saved ~15 µs on an
+        /// idle machine and cost 10–25 ms outliers on a loaded one, where it
+        /// and the compositor's own wait for the host shared a vCPU and lost
+        /// it to the load for a quantum. A blocked thread woken by the answer
+        /// gets the wake's priority boost, a spinning one does not.
+        /// `WC_LAUNCH_SPIN_US` turns it on, for measuring.
+        fn spin() -> Duration {
+            static S: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+            *S.get_or_init(|| {
+                std::env::var("WC_LAUNCH_SPIN_US")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .map_or(Duration::ZERO, Duration::from_micros)
+            })
+        }
+
         fn fill(&mut self) -> Result<(), String> {
             use std::io::Read;
             let mut tmp = [0u8; 16 * 1024];
+            let spin = Self::spin();
+            if !spin.is_zero() && self.s.set_nonblocking(true).is_ok() {
+                let t0 = Instant::now();
+                let got = loop {
+                    match self.s.read(&mut tmp) {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && t0.elapsed() < spin => {
+                            // §105.14: yielding, so the compositor thread this
+                            // request woke may run on this processor.
+                            std::thread::yield_now();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break None,
+                        r => break Some(r),
+                    }
+                };
+                let _ = self.s.set_nonblocking(false);
+                match got {
+                    Some(Ok(0)) => return Err("the compositor closed the control socket".into()),
+                    Some(Ok(n)) => {
+                        self.buf.extend_from_slice(&tmp[..n]);
+                        return Ok(());
+                    }
+                    Some(Err(e)) => return Err(format!("control socket: {e}")),
+                    None => sv_transport::frametrace::hop("L.block"),
+                }
+            }
             match self.s.read(&mut tmp) {
                 Ok(0) => Err("the compositor closed the control socket".into()),
                 Ok(n) => {
@@ -870,9 +912,12 @@ mod win {
                 std::thread::sleep(gap);
             }
             let t1 = Instant::now();
+            sv_transport::frametrace::hop("L.send");
             said = c.request(&format!("raw {verb}"))?;
+            sv_transport::frametrace::hop("L.recv");
             us.push(t1.elapsed().as_secs_f64() * 1e6);
         }
+        sv_transport::frametrace::hop_flush();
         let mut sorted = us.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f).round() as usize];

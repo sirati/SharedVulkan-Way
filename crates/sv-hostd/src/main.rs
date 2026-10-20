@@ -66,7 +66,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                  sv-hostd qemu-serve [--qmp <sock>] --cold <sock|mem[:LABEL]|file:PATH> [--cold ...] --socket <path> [--vm <hint>] [--clients N] [--drop-to UID:GID]\n  \
                  sv-hostd ivshmem-serve --region <file> --cold pool [--cold-bell <hub sock>] --socket <path> [--bell <chardev sock> --bell-hub <path>] [--clients N] [--drm-services <sock>]\n                \
                  (--cold <sock>: the TCP cold path, debug only)\n  \
-                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock> [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
+                 sv-hostd bell-hub --port <chardev sock|dev:NAME>=<hub sock>[,rings=<shm file>] [--port ...] [--drm-services <sock>]   (§99: one per user, every session shares it)\n  \
                  sv-hostd broker --listen <sock> [--socket-gid GID] [--qmp <sock>] [--vm <hint>] [--runroot /tmp/wc-launch]\n  \
                  sv-hostd broker-request --broker <sock> --dir <session dir> --sessions N"
             );
@@ -1528,6 +1528,12 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         let spec = args.get(i + 1).ok_or("--port wants UPSTREAM=HUB")?;
         let (up, at) = spec.split_once('=').ok_or("--port wants UPSTREAM=HUB")?;
+        // §105.14: `,rings=FILE` names the shared-memory file whose rings this
+        // port's bytes ring; the hub then wakes their waiters itself.
+        let (at, rings) = match at.split_once(",rings=") {
+            Some((a, r)) => (a, Some(r)),
+            None => (at, None),
+        };
         let up = sv_hostd::bellhub::Upstream::parse(up);
         let name = up.name();
         let listen_key = format!("{name}-listen");
@@ -1546,6 +1552,10 @@ fn bell_hub_serve(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let inherited = kept.remove(&format!("{name}-up"));
         eprintln!("bell-hub {name}: serving {up} to every session on {at} (0600)");
         let hub = sv_hostd::bellhub::run_kept(&name, up, l, inherited, keep)?;
+        if let Some(r) = rings {
+            eprintln!("bell-hub {name}: rings the lanes of the rings in {r} itself (§105.14)");
+            hub.set_direct_rings(r);
+        }
         // §112: the same hub through the render node, for an ICD in a
         // sandbox that may not connect to it. This uid's clients only.
         if let Some(services) = drm_services.clone() {

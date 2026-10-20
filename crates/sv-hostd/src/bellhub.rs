@@ -57,8 +57,121 @@ struct Client {
     pending: Arc<AtomicU64>,
 }
 
+/// The lanes a guest's byte names, woken by the hub itself
+/// (waycompose-design.md §105.14).
+///
+/// A byte from the guest used to reach the thread parked on its lane in three
+/// wakes on the host: this hub's reader, the proxy's doorman (a client of this
+/// hub), and the doorman's futex wake of the waiting thread. Measured on the
+/// Windows guest with the host idle, the last two cost 45–60 µs of a request
+/// that crossed by doorbell. The lanes' wake words are in the ring region at
+/// the tail of the shared-memory file, which this hub can map as well as the
+/// proxy can; a `FUTEX_WAKE` on a shared file mapping reaches a waiter in any
+/// process that maps the same file. So the hub rings the lane first, and the
+/// waiter wakes on the hub's own thread's wake. The clients still get every
+/// byte, as before: their wake of the same lane is a spurious one, and a
+/// process that waits some other way (an eventfd per connection) still
+/// depends on it.
+///
+/// The file's header names the ring region and the run that made it
+/// (`wc_handle::ivshmem`); a new run is attached again, and a file with no
+/// rings, or rings not made yet, rings nothing.
+pub struct DirectRings {
+    path: std::path::PathBuf,
+    state: Mutex<DirectState>,
+}
+
+#[derive(Default)]
+struct DirectState {
+    head: Option<sv_transport::region::SharedRegion>,
+    run: u64,
+    control: Option<Arc<sv_transport::control::Control>>,
+}
+
+impl DirectRings {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> DirectRings {
+        DirectRings { path: path.into(), state: Mutex::new(DirectState::default()) }
+    }
+
+    fn open(&self) -> Option<std::fs::File> {
+        std::fs::OpenOptions::new().read(true).write(true).open(&self.path).ok()
+    }
+
+    /// The control region of the run the header names now, if it has one.
+    fn current(&self, st: &mut DirectState) -> Option<Arc<sv_transport::control::Control>> {
+        use std::os::fd::AsFd;
+        use wc_handle::ivshmem::{ENCODED_LEN, Header};
+        if st.head.is_none() {
+            let f = self.open()?;
+            st.head = sv_transport::region::SharedRegion::map_fd(f.as_fd(), 0, 4096).ok();
+        }
+        let head = st.head.as_ref()?;
+        // The run id is at offset 16 (`wc_handle::ivshmem`), checked again by
+        // the decode below whenever it changes.
+        let run = head.atomic_u64(16).ok()?.load(Ordering::Acquire);
+        if run == 0 {
+            return None;
+        }
+        if run == st.run {
+            return st.control.clone();
+        }
+        let mut b = [0u8; ENCODED_LEN];
+        head.read_bytes(0, &mut b).ok()?;
+        let h = Header::decode(&b).ok()?;
+        if h.run_id != run {
+            return None;
+        }
+        st.control = None;
+        if h.rings.1 == 0 {
+            st.run = run;
+            return None;
+        }
+        let f = self.open()?;
+        let region = sv_transport::region::SharedRegion::map_fd(f.as_fd(), h.rings.0, h.rings.1 as usize).ok()?;
+        match sv_transport::control::Control::attach_for_bells(Arc::new(region)) {
+            Ok(c) => {
+                st.run = run;
+                st.control = Some(Arc::new(c));
+            }
+            // The compositor publishes the header before it makes the rings:
+            // look again at the next byte.
+            Err(sv_transport::Error::NotReady) => {}
+            Err(_) => st.run = run,
+        }
+        st.control.clone()
+    }
+
+    /// Wake the waiters of every lane `bytes` name; on `RESCAN_TOKEN`, every lane.
+    /// Returns whether a lane it rang had a waiter parked on it.
+    pub fn ring(&self, bytes: &[u8]) -> bool {
+        use sv_transport::vdoorbell::BellTarget;
+        let c = {
+            let Ok(mut st) = self.state.lock() else { return false };
+            self.current(&mut st)
+        };
+        let Some(c) = c else { return false };
+        let woken = AtomicU64::new(0);
+        let mut waiter = false;
+        for &t in bytes {
+            if t == sv_transport::park::RESCAN_TOKEN {
+                c.rescan(&woken);
+            } else if t & 0x80 == 0 {
+                let (slot, lane) = sv_transport::park::lane_from_token(t);
+                waiter |= sv_transport::ring::RingCtrl::open(&c, slot)
+                    .and_then(|r| r.bell(lane).map(|b| b.parked.load(Ordering::Acquire) > 0))
+                    .unwrap_or(false);
+                c.ring_token(t, &woken);
+            }
+        }
+        waiter
+    }
+}
+
 /// One port: an upstream (QEMU's chardev) and the clients that share it.
 pub struct Hub {
+    /// §105.14: the rings this port's guest bytes name, rung before the
+    /// clients are told.
+    direct: std::sync::OnceLock<DirectRings>,
     name: String,
     clients: Mutex<Vec<Client>>,
     up: Mutex<Option<SyncSender<Vec<u8>>>>,
@@ -73,6 +186,7 @@ pub struct Hub {
 impl Hub {
     pub fn new(name: &str) -> Arc<Hub> {
         Arc::new(Hub {
+            direct: std::sync::OnceLock::new(),
             name: name.to_string(),
             clients: Mutex::new(Vec::new()),
             up: Mutex::new(None),
@@ -83,8 +197,26 @@ impl Hub {
         })
     }
 
+    /// §105.14: ring the lanes of the rings in `file` directly as well, for
+    /// every byte from the guest (and every rescan). Once; later calls are
+    /// ignored.
+    pub fn set_direct_rings(&self, file: impl Into<std::path::PathBuf>) {
+        let _ = self.direct.set(DirectRings::new(file));
+    }
+
     /// Bytes from the guest, to every client. Never blocks.
     fn fan_out(&self, b: &[u8]) {
+        // §105.14: ring the lanes first, and if that woke a waiter, let it
+        // run before the clients are told. Linux puts a thread this one wakes on this CPU (the wake
+        // is "affine"), and on the VM host's two user cores the proxy's
+        // control thread waited there for the fan-out below: 60 µs (median
+        // of 41 traced requests, 40 of them on the hub's own CPU). One yield
+        // costs a microsecond when nobody waits.
+        if let Some(d) = self.direct.get()
+            && d.ring(b)
+        {
+            std::thread::yield_now();
+        }
         self.stats.down.fetch_add(b.len() as u64, Ordering::Relaxed);
         let Ok(mut c) = self.clients.lock() else { return };
         c.retain(|cl| {
@@ -656,6 +788,66 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(d.join("hub.sock")).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §105.14: a thread parked on a lane of rings in a shared file is woken
+    /// by the hub's own reading of the guest's byte, with no client at all:
+    /// the hub maps the file itself and its futex wake reaches the waiter's
+    /// mapping. The waiter's slice is 30 s, so only a delivered wake ends it.
+    #[test]
+    fn the_hub_wakes_a_lane_waiter_in_a_shared_file_with_no_client() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::FileExt;
+        use sv_transport::control::{Control, Geometry, ProtocolIds, RingStatus};
+        use sv_transport::park::{Deadline, Futex, ParkOutcome, Parker, WaitSite};
+        use sv_transport::ring::{Lane, RingCtrl, RingId};
+        let d = tmpdir("direct");
+        let file = d.join("arena");
+        let g = Geometry::for_wayland();
+        let (off, len) = (8192u64, g.control_size);
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&file).unwrap();
+        f.set_len(off + len).unwrap();
+        let h = wc_handle::ivshmem::Header {
+            run_id: 0x77,
+            generation: 1,
+            region_len: off + len,
+            arena_id: 0,
+            outbound: (0, 0),
+            rings: (off, len),
+        };
+        f.write_all_at(&h.encode(), 0).unwrap();
+        let region = Arc::new(sv_transport::region::SharedRegion::map_fd(f.as_fd(), off, len as usize).unwrap());
+        let control = Arc::new(Control::create(region, g, ProtocolIds::new(1, 0xabcd), 1).unwrap());
+
+        let qemu = fake_qemu(&d.join("qemu.sock"));
+        let hub = run("t", d.join("qemu.sock"), bind_private(&d.join("hub.sock")).unwrap()).unwrap();
+        hub.set_direct_rings(&file);
+        let mut guest = qemu.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Past the fresh upstream's rescan, which rings every lane.
+        std::thread::sleep(Duration::from_millis(200));
+        let c = Arc::clone(&control);
+        let waiter = std::thread::spawn(move || {
+            let ctrl = RingCtrl::open(&c, 3).unwrap();
+            let bell = ctrl.bell(Lane::Command).unwrap();
+            let start = bell.wake.load(Ordering::Acquire);
+            let ready = || bell.wake.load(Ordering::Acquire) != start;
+            let status = || RingStatus::Idle;
+            let site = WaitSite::new(RingId(3), &ready, &status).with_bell(bell);
+            let p = Futex { spins: 0, yields: 0, slice: Duration::from_secs(30), first_slice: Duration::from_secs(30) };
+            let t0 = Instant::now();
+            (p.park(&site, Deadline::after(Duration::from_secs(30))), t0.elapsed())
+        });
+        // Parked by now.
+        let ctrl = RingCtrl::open(&control, 3).unwrap();
+        let t = Instant::now();
+        while ctrl.bell(Lane::Command).unwrap().parked.load(Ordering::Acquire) == 0 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        guest.write_all(&[sv_transport::park::lane_token(3, Lane::Command)]).unwrap();
+        let (outcome, took) = waiter.join().unwrap();
+        assert_eq!(outcome, ParkOutcome::Woken);
+        assert!(took < Duration::from_secs(5), "the waiter waited {took:?}: the hub's wake never reached it");
+        assert_eq!(hub.client_count(), 0, "a client could have done the waking");
     }
 
     #[test]

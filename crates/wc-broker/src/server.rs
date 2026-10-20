@@ -115,6 +115,7 @@ struct State<P: Platform> {
     objs: BTreeMap<ObjId, Vec<Held<P::Object>>>,
     writers: BTreeMap<ConnId, Arc<Mutex<P::Writer>>>,
     on_drained: Vec<Box<dyn FnMut(ObjId, u64) + Send>>,
+    quiescing: bool,
     on_leased: Vec<Box<dyn FnMut(ObjId, Pid) + Send>>,
 }
 
@@ -166,6 +167,7 @@ impl<P: Platform> Broker<P> {
                 objs,
                 writers: BTreeMap::new(),
                 on_drained: Vec::new(),
+                quiescing: false,
                 on_leased: Vec::new(),
             })),
             next_conn: Arc::new(AtomicU64::new(1)),
@@ -257,6 +259,13 @@ impl<P: Platform> Broker<P> {
         self.settle(&mut st);
     }
 
+    /// Refuse new client allocations before waiting for all regions to drain.
+    /// The same lock protects allocation and this flag, so an empty region count
+    /// cannot race a new allocation during normal daemon shutdown.
+    pub fn quiesce(&self) {
+        self.lock().quiescing = true;
+    }
+
     /// A shutdown (§103.15): keep the release rules running for at most
     /// `limit` while orphans are held, so a host that is releasing them is
     /// waited for, and a shutdown never waits longer. Returns the orphans
@@ -328,6 +337,9 @@ impl<P: Platform> Broker<P> {
         let p = &*self.platform;
         let refused = |w: &mut P::Writer, r: Refusal| p.push(w, &format!("err {r}"));
         let mut st = self.lock();
+        if st.quiescing && matches!(req, Request::Alloc { .. }) {
+            return p.push(w, "err broker is shutting down; new regions refused");
+        }
         let out = match req {
             Request::Hello { role } => match st.core.hello(id, role) {
                 Ok(()) => {

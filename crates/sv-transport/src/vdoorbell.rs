@@ -144,6 +144,7 @@ impl<W: Write + Send> CrossWake for PortWake<W> {
         // an error would be a worse bug than the latency it exists to fix — the
         // consumer's slice still bounds the damage, which is precisely what
         // `slice` being finite is for.
+        crate::frametrace::hop("bell.poke");
         let Ok(mut p) = self.port.lock() else {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -206,6 +207,7 @@ pub fn serve_port<R: Read, T: BellTarget + ?Sized>(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return ServeEnd::Failed,
         };
+        crate::frametrace::hop("door.rx");
         // Several bytes may arrive in one read when the peer rang more than one
         // lane before this thread was scheduled. Each is independent.
         for &token in &buf[..n] {
@@ -654,9 +656,11 @@ impl DetachedWriter {
         std::thread::Builder::new().name("sv-bell-write".into()).spawn(move || {
             // Ends when every sender is gone, or the socket is.
             while let Ok(b) = rx.recv() {
+                crate::frametrace::hop("bell.wr0");
                 if w.write_all(&b).and_then(|()| w.flush()).is_err() {
                     break;
                 }
+                crate::frametrace::hop("bell.wr1");
             }
         })?;
         Ok(DetachedWriter { tx })
@@ -888,7 +892,20 @@ impl PortHandle {
             // never stop a ring thread, and with it every session this process
             // serves. A session killed mid-run stopped the guest's GPU process
             // for every other session exactly so.
-            PortHandle::Pipe(p) => (Box::new(SharedPipe(p.clone())), Box::new(DetachedWriter::spawn(SharedPipe(p))?)),
+            //
+            // §105.14: and the writer is not a thread. `AsyncWriter` issues the
+            // overlapped write from the caller and never waits for it, which
+            // keeps that promise without a second thread's wake on the
+            // request's path. `WC_BELL_INLINE=0` keeps the detached writer, to
+            // compare against.
+            PortHandle::Pipe(p) => {
+                let w: Box<dyn Write + Send> = if std::env::var("WC_BELL_INLINE").is_ok_and(|v| v == "0") {
+                    Box::new(DetachedWriter::spawn(SharedPipe(p.clone()))?)
+                } else {
+                    Box::new(crate::winpipe::AsyncWriter::new(p.clone())?)
+                };
+                (Box::new(SharedPipe(p)), w)
+            }
         })
     }
 }
