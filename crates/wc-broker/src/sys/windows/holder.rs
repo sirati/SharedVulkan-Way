@@ -26,7 +26,7 @@
 //! add ID LEN POOL USER HANDLE   -> ok      HANDLE is already in the holder
 //! del ID                        -> ok
 //! list                          -> ok N, then N lines ID LEN POOL USER HANDLE
-//! quit                          -> ok, and the holder exits (uninstall)
+//! quit                          -> ok only when empty; otherwise err retained
 //! ```
 
 use super::ident::{self, Owned};
@@ -70,7 +70,7 @@ pub fn serve(pipe: &str, sddl: &str) -> io::Result<()> {
         let who = ident::pipe_client(p.handle).map(|x| x.1).unwrap_or_default();
         match conversation(&p, &mut kept) {
             Ok(true) => {
-                eprintln!("[wc-broker holder] quit: {} region(s) let go", kept.len());
+                eprintln!("[wc-broker holder] empty holder quit");
                 return Ok(());
             }
             Ok(false) | Err(_) => {
@@ -112,8 +112,13 @@ fn conversation(p: &ServerPipe, kept: &mut BTreeMap<u64, Kept>) -> io::Result<bo
                 }
             }
             ["quit"] => {
+                // Requests are serialized on this connection. No add or del
+                // can race the empty check and successful shutdown reply.
+                if !kept.is_empty() {
+                    write(p, &format!("err retained {} region(s); normal release required\n", kept.len()))?;
+                    continue;
+                }
                 write(p, "ok\n")?;
-                kept.clear();
                 return Ok(true);
             }
             _ => out = "err unknown\n".into(),
@@ -382,8 +387,8 @@ impl AsRaw for std::fs::File {
     }
 }
 
-/// `sv-guest broker holder-quit`: tell a running holder to let go of
-/// everything and exit (uninstall).
+/// Ask an empty holder to exit. A retained region is never released by
+/// shutdown, timeout or uninstall; only the normal release path removes it.
 pub fn quit(pipe: &str) -> io::Result<()> {
     // The holder serves one broker at a time: a broker that just exited may
     // still be its client for a moment.
@@ -400,5 +405,59 @@ pub fn quit(pipe: &str) -> io::Result<()> {
     f.write_all(b"quit\n")?;
     let mut s = String::new();
     BufReader::new(f).read_line(&mut s)?;
+    if s != "ok\n" && s != "ok\r\n" {
+        return Err(io::Error::other(format!("holder refused quit: {}", s.trim_end())));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile};
+
+    #[test]
+    fn retained_section_refuses_quit_and_preserves_bytes_until_del() {
+        let pipe = format!(r"\\.\pipe\wc-holder-quit-test-{}", std::process::id());
+        let endpoint = pipe.clone();
+        let worker = std::thread::spawn(move || serve(&endpoint, HOLDER_SDDL).unwrap());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut f = loop {
+            match open_pipe(&pipe) {
+                Ok(f) => break f,
+                Err(_) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => panic!("holder did not start: {e}"),
+            }
+        };
+        // SAFETY: an unnamed private section; the holder takes sole ownership
+        // of the handle through add below, as a transferred duplicate would.
+        let h = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 4096, std::ptr::null()) };
+        assert!(!h.is_null());
+        let view = unsafe { MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 4096) };
+        assert!(!view.Value.is_null());
+        unsafe { std::ptr::write_volatile(view.Value.cast::<u8>(), 0x6d); UnmapViewOfFile(view); }
+        writeln!(f, "add 1 4096 test sid:S-1-5-18 {:#x}", h as usize).unwrap();
+        let mut rd = BufReader::new(f);
+        let mut reply = String::new();
+        rd.read_line(&mut reply).unwrap();
+        assert_eq!(reply, "ok\n");
+        drop(rd);
+        assert!(quit(&pipe).unwrap_err().to_string().contains("retained 1 region"));
+        assert!(!worker.is_finished());
+        // The temporary view was unmapped before quit. Only the retained
+        // handle now keeps the section and its bytes alive.
+        let view = unsafe { MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 4096) };
+        assert!(!view.Value.is_null());
+        assert_eq!(unsafe { std::ptr::read_volatile(view.Value.cast::<u8>()) }, 0x6d);
+        unsafe { UnmapViewOfFile(view); }
+        let mut f = open_pipe(&pipe).unwrap();
+        f.write_all(b"del 1\n").unwrap();
+        let mut rd = BufReader::new(f);
+        reply.clear();
+        rd.read_line(&mut reply).unwrap();
+        assert_eq!(reply, "ok\n");
+        drop(rd);
+        quit(&pipe).unwrap();
+        worker.join().unwrap();
+    }
 }

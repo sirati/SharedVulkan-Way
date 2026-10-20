@@ -155,15 +155,35 @@ switch ($Action) {
     if (Test-Path $Keys) { Get-ChildItem $Keys | ForEach-Object { Say "key: $($_.Name)" } }
   }
   "uninstall" {
-    if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
-      Stop-Service -Name $Name -Force
-      (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))
-      Run sc.exe @("delete", $Name) | Out-Null
-    }
-    if (Test-Path $Exe) {
-      Run $Exe @("broker", "holder-quit") | Out-Null
-      & $Exe broker revert-acl | ForEach-Object { Say "device: $_" }
+    if (-not (Test-Path $Exe)) { throw "broker executable missing; cannot prove safe uninstall" }
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    $wasRunning = $svc -and ($svc.Status -eq 'Running')
+    try {
+      # The holder serves one broker connection. Stop the broker to query it,
+      # keeping its service registration and every protection in place.
+      if ($svc -and $svc.Status -ne 'Stopped') {
+        Stop-Service -Name $Name -Force
+        (Get-Service -Name $Name).WaitForStatus("Stopped", (New-TimeSpan -Seconds 15))
+      }
+      $quit = Run $Exe @("broker", "holder-quit")
+      if ($quit[0] -ne 0) { throw "holder did not prove empty: $($quit[1])" }
+      $restore = Run $Exe @("broker", "revert-acl")
+      if ($restore[0] -ne 0) { throw "device restoration refused: $($restore[1])" }
+      Say "device: $($restore[1])"
       if (Test-Path (Join-Path $Data "devices.txt")) { throw "device restoration incomplete; baseline retained for retry" }
+    } catch {
+      $failure = $_
+      if ($wasRunning) {
+        try {
+          Start-Service -Name $Name
+          (Get-Service -Name $Name).WaitForStatus("Running", (New-TimeSpan -Seconds 15))
+        } catch { throw "uninstall refused; service recovery failed: $_; original failure: $failure" }
+      }
+      throw "uninstall refused; service/protection/binary retained: $failure"
+    }
+    if ($svc) {
+      $deleted = Run sc.exe @("delete", $Name)
+      if ($deleted[0] -ne 0) { throw "service deletion failed: $($deleted[1])" }
     }
     if (Test-Path (Join-Path $Before "complete")) {
       foreach ($f in $LegacyFiles) {
