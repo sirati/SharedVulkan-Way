@@ -12,6 +12,10 @@ use crate::{
 use ash::vk;
 use std::sync::{Arc, Mutex};
 
+#[path = "native_video_image_contract.rs"]
+mod contract;
+pub(crate) use contract::Contract;
+
 struct Allocation {
     memory: vk::DeviceMemory,
     storage: joined::Storage,
@@ -22,6 +26,7 @@ pub(crate) struct Image {
     image: vk::Image,
     width: u32,
     height: u32,
+    contract: Contract,
     allocation: Mutex<Option<Allocation>>,
     /// Color/range attachments remain on the real completed decoder picture.
     /// Allocation fourcc alone is not the interpretation of copied NV12 bytes.
@@ -33,6 +38,27 @@ impl Image {
         width: u32,
         height: u32,
     ) -> Result<Arc<Self>, vk::Result> {
+        Self::create_with_contract(driver, width, height, Contract::diagnostic())
+    }
+    /// Mutable native backing for validated stock plane views. Logical VIDEO
+    /// usage is a separate server contract; no input native flags are dropped.
+    pub(crate) fn create_config(
+        driver: Arc<Driver>,
+        width: u32,
+        height: u32,
+        flags: vk::ImageCreateFlags,
+        usage: vk::ImageUsageFlags,
+        formats: &[vk::Format],
+    ) -> Result<Arc<Self>, vk::Result> {
+        let contract = Contract::mutable(flags, usage, formats)?;
+        Self::create_with_contract(driver, width, height, contract)
+    }
+    pub(crate) fn create_with_contract(
+        driver: Arc<Driver>,
+        width: u32,
+        height: u32,
+        contract: Contract,
+    ) -> Result<Arc<Self>, vk::Result> {
         if width == 0 || height == 0 || width > 4096 || height > 2304 {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
         }
@@ -40,12 +66,20 @@ impl Image {
         let mut ext = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(
             vk::ExternalMemoryHandleTypeFlags::from_raw(iosurface::MTLTEXTURE),
         );
-        let query = vk::PhysicalDeviceImageFormatInfo2::default()
+        let mut format_list = vk::ImageFormatListCreateInfo::default();
+        if let Some(formats) = contract.view_formats() {
+            format_list = format_list.view_formats(formats);
+        }
+        let mut query = vk::PhysicalDeviceImageFormatInfo2::default()
             .push_next(&mut ext)
             .format(format)
             .ty(vk::ImageType::TYPE_2D)
             .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED);
+            .flags(contract.flags())
+            .usage(contract.usage());
+        if contract.view_formats().is_some() {
+            query = query.push_next(&mut format_list);
+        }
         let mut external = vk::ExternalImageFormatProperties::default();
         let mut props = vk::ImageFormatProperties2::default().push_next(&mut external);
         unsafe {
@@ -72,7 +106,11 @@ impl Image {
         let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(
             vk::ExternalMemoryHandleTypeFlags::from_raw(iosurface::MTLTEXTURE),
         );
-        let info = vk::ImageCreateInfo::default()
+        let mut create_list = vk::ImageFormatListCreateInfo::default();
+        if let Some(formats) = contract.view_formats() {
+            create_list = create_list.view_formats(formats);
+        }
+        let mut info = vk::ImageCreateInfo::default()
             .push_next(&mut external)
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -85,17 +123,25 @@ impl Image {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .flags(contract.flags())
+            .usage(contract.usage())
             .initial_layout(vk::ImageLayout::PREINITIALIZED);
+        if contract.view_formats().is_some() {
+            info = info.push_next(&mut create_list);
+        }
         let image = unsafe { driver.device.create_image(&info, None) }?;
         Ok(Arc::new(Self {
             driver,
             image,
             width,
             height,
+            contract,
             allocation: Mutex::new(None),
             producer: Mutex::new(None),
         }))
+    }
+    pub(crate) fn contract(&self) -> Contract {
+        self.contract
     }
     pub(crate) fn image(&self) -> vk::Image {
         self.image
