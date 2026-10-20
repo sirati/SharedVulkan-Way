@@ -180,6 +180,13 @@ let
     programName = "hl-async-fault-client"; source = ./async-fault-client.c;
     linkFlags = [ "-pthread" ];
   };
+  primaryOutputClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-primary-output-authority-client"; source = ./primary-output-authority-client.c;
+  };
+  ptracePstateClient = guest.callPackage ./client-probe.nix {
+    programName = "hl-ptrace-pstate-client"; source = ./ptrace-pstate-client.c;
+    linkFlags = [ "-pthread" ];
+  };
   seqpacketCleanupClient = guest.callPackage ./client-probe.nix {
     programName = "hl-seqpacket-cleanup-client"; source = ./seqpacket-cleanup-client.c;
   };
@@ -266,5 +273,5 @@ let
     '';
   };
 in {
-  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient seqpacketCleanupClient asyncFaultClient fatalBusWaitClient probeRunner;
+  inherit hl backend hostTools kosmickrisp session compositor firefox probe zinkClient seccompClient controlClient controlLifecycleClient externalFaultClient seqpacketClient seqpacketCleanupClient primaryOutputClient ptracePstateClient asyncFaultClient fatalBusWaitClient probeRunner;
 }

@@ -1,0 +1,365 @@
+--- a/src/syscall_io.c
++++ b/src/syscall_io.c
+@@ -1,3 +1,4 @@
++#include "hl_guest_iov.h"
+ #include "hl_seqpacket.h"
+ #include "hl_shared.h"
+ /* syscall_io.c — Core I/O syscall handlers for hl
+@@ -314,13 +315,17 @@
+      * guest_ptr_avail returns the host pointer and remaining bytes in
+      * the current region — prevents host write() from reading past
+      * the guest buffer boundary. */
++    if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000);
++    uint64_t original_count = count;
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_avail(g, buf_gva, &avail);
++    void *buf = guest_ptr_range_access(g, buf_gva, count, &avail, 0);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+-    struct iovec record_iov = { buf, count };
+-    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, &record_iov, 1, 1) : hl_wc_write(host_fd, buf, count);
++    struct iovec record_iov[HL_GUEST_IOV_MAX]; int record_count = 0;
++    if (record_socket && hl_guest_iov_append(g, buf_gva, original_count,
++                                            record_iov, &record_count, 0) < 0) return linux_errno();
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, record_iov, record_count, 1) : hl_wc_write(host_fd, buf, count);
+     if (ret < 0) {
+         int saved_errno = errno;
+         if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+@@ -368,13 +373,17 @@
+ 
+     /* Resolve buffer and cap count to available contiguous guest bytes.
+      * Prevents host read() from writing past the guest buffer boundary. */
++    if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000);
++    uint64_t original_count = count;
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_access(g, buf_gva, &avail, 1);
++    void *buf = guest_ptr_range_access(g, buf_gva, count, &avail, 1);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+-    struct iovec record_iov = { buf, count };
+-    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, &record_iov, 1, 0) : read(host_fd, buf, count);
++    struct iovec record_iov[HL_GUEST_IOV_MAX]; int record_count = 0;
++    if (record_socket && hl_guest_iov_append(g, buf_gva, original_count,
++                                            record_iov, &record_count, 1) < 0) return linux_errno();
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, record_iov, record_count, 0) : read(host_fd, buf, count);
+     return ret < 0 ? linux_errno() : ret;
+ }
+ 
+@@ -387,8 +396,9 @@
+     /* Linux: pread(fd, NULL, 0, off) returns 0, not EFAULT */
+     if (count == 0) return 0;
+ 
++    if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000);
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_access(g, buf_gva, &avail, 1);
++    void *buf = guest_ptr_range_access(g, buf_gva, count, &avail, 1);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+@@ -406,8 +416,9 @@
+     /* Linux: pwrite(fd, NULL, 0, off) returns 0, not EFAULT */
+     if (count == 0) return 0;
+ 
++    if (count > UINT64_C(0x7ffff000)) count = UINT64_C(0x7ffff000);
+     uint64_t avail = 0;
+-    void *buf = guest_ptr_avail(g, buf_gva, &avail);
++    void *buf = guest_ptr_range_access(g, buf_gva, count, &avail, 0);
+     if (!buf) return -LINUX_EFAULT;
+     if (count > avail) count = avail;
+ 
+@@ -426,27 +437,15 @@
+  * and guest_ptr_avail for each buffer (caps to contiguous bytes).
+  * Returns 0 on success, -LINUX_EFAULT on bad guest pointer. */
+ static int64_t build_host_iov(guest_t *g, uint64_t iov_gva, int iovcnt,
+-                               struct iovec *host_iov, int write) {
+-    linux_iovec_t guest_iov[1024]; /* UIO_MAXIOV */
+-    if (iovcnt > 1024) iovcnt = 1024;
+-    if (guest_read(g, iov_gva, guest_iov,
+-                   iovcnt * sizeof(linux_iovec_t)) < 0)
++                               struct iovec *host_iov, int *host_count, int write) {
++    linux_iovec_t guest_iov[1024];
++    if (iovcnt < 0 || iovcnt > 1024) return -LINUX_EINVAL;
++    if (guest_read(g, iov_gva, guest_iov, (size_t)iovcnt * sizeof(*guest_iov)) < 0)
+         return -LINUX_EFAULT;
+-    for (int i = 0; i < iovcnt; i++) {
+-        if (guest_iov[i].iov_len == 0) {
+-            host_iov[i].iov_base = NULL;
+-            host_iov[i].iov_len = 0;
+-            continue;
+-        }
+-        uint64_t avail = 0;
+-        void *base = guest_ptr_access(g, guest_iov[i].iov_base, &avail, write);
+-        if (!base) return -LINUX_EFAULT;
+-        /* Cap to contiguous bytes within the 2MB block */
+-        uint64_t len = guest_iov[i].iov_len;
+-        if (len > avail) len = avail;
+-        host_iov[i].iov_base = base;
+-        host_iov[i].iov_len = len;
+-    }
++    *host_count = 0;
++    for (int i = 0; i < iovcnt; i++)
++        if (hl_guest_iov_append(g, guest_iov[i].iov_base, guest_iov[i].iov_len,
++                                host_iov, host_count, write) < 0) return linux_errno();
+     return 0;
+ }
+ 
+@@ -505,11 +504,12 @@
+     if (host_fd < 0) return -LINUX_EBADF;
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+ 
+-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 1);
++    struct iovec *host_iov = alloca(HL_GUEST_IOV_MAX * sizeof(struct iovec));
++    int host_count;
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, &host_count, 1);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, iovcnt, 0) : readv(host_fd, host_iov, iovcnt);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, host_count, 0) : readv(host_fd, host_iov, host_count);
+     return ret < 0 ? linux_errno() : ret;
+ }
+ 
+@@ -575,11 +575,12 @@
+     guard.ownfd = 1;
+     int host_fd = guard.fd;
+ 
+-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 0);
++    struct iovec *host_iov = alloca(HL_GUEST_IOV_MAX * sizeof(struct iovec));
++    int host_count;
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, &host_count, 0);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, iovcnt, 1) : hl_wc_writev(host_fd, host_iov, iovcnt);
++    ssize_t ret = record_socket ? hl_wc_seqpacket_io(io_ref.of, host_fd, host_iov, host_count, 1) : hl_wc_writev(host_fd, host_iov, host_count);
+     if (ret < 0) {
+         int saved_errno = errno;
+         if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+@@ -596,11 +597,12 @@
+     if (host_fd < 0) return -LINUX_EBADF;
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+ 
+-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 1);
++    struct iovec *host_iov = alloca(HL_GUEST_IOV_MAX * sizeof(struct iovec));
++    int host_count;
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, &host_count, 1);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = preadv(host_fd, host_iov, iovcnt, offset);
++    ssize_t ret = preadv(host_fd, host_iov, host_count, offset);
+     return ret < 0 ? linux_errno() : ret;
+ }
+ 
+@@ -612,11 +614,12 @@
+     int host_fd = guard.fd;
+     if (iovcnt <= 0 || iovcnt > 1024) return -LINUX_EINVAL;
+ 
+-    struct iovec *host_iov = alloca(iovcnt * sizeof(struct iovec));
+-    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, 0);
++    struct iovec *host_iov = alloca(HL_GUEST_IOV_MAX * sizeof(struct iovec));
++    int host_count;
++    int64_t err = build_host_iov(g, iov_gva, iovcnt, host_iov, &host_count, 0);
+     if (err < 0) return err;
+ 
+-    ssize_t ret = hl_wc_pwritev(host_fd, host_iov, iovcnt, offset);
++    ssize_t ret = hl_wc_pwritev(host_fd, host_iov, host_count, offset);
+     if (ret < 0) {
+         int saved_errno = errno;
+         if (saved_errno == EPIPE) signal_queue(LINUX_SIGPIPE);
+@@ -1770,7 +1773,7 @@
+ 
+         if (liov.iov_len == 0) continue;
+         uint64_t avail = 0;
+-        void *src = guest_ptr_avail(g, liov.iov_base, &avail);
++        void *src = guest_ptr_range_access(g, liov.iov_base, liov.iov_len, &avail, 0);
+         if (!src) return total > 0 ? (int64_t)total : -LINUX_EFAULT;
+         uint64_t len = liov.iov_len;
+         if (len > avail) len = avail;
+--- a/src/syscall_net.c
++++ b/src/syscall_net.c
+@@ -1,3 +1,4 @@
++#include "hl_guest_iov.h"
+ #include "hl_shared.h"
+ /* syscall_net.c — Socket/networking syscalls for hl
+  *
+@@ -464,32 +465,20 @@
+                                   struct iovec *host_iov, int max_iov,
+                                   int *out_iovlen, int write) {
+     if (lmsg->msg_iovlen > (uint64_t)max_iov) return -LINUX_EINVAL;
+-    int n = (int)lmsg->msg_iovlen;
+-    *out_iovlen = n;
+-    if (n <= 0) return 0;
+-
+-    struct {
+-        uint64_t iov_base;
+-        uint64_t iov_len;
+-    } guest_iov[64];
+-    if (guest_read(g, lmsg->msg_iov, guest_iov, (size_t)n * 16) < 0)
++    struct { uint64_t iov_base, iov_len; } guest_iov[HL_GUEST_IOV_MAX];
++    if (guest_read(g, lmsg->msg_iov, guest_iov, (size_t)lmsg->msg_iovlen * 16) < 0)
+         return -LINUX_EFAULT;
+-
+-    for (int i = 0; i < n; i++) {
+-        if (guest_iov[i].iov_len == 0) {
+-            host_iov[i].iov_base = NULL;
+-            host_iov[i].iov_len = 0;
+-            continue;
+-        }
+-        uint64_t avail = 0;
+-        void *base = guest_ptr_access(g, guest_iov[i].iov_base, &avail, write);
+-        if (!base) return -LINUX_EFAULT;
+-        uint64_t len = guest_iov[i].iov_len;
+-        if (len > avail) len = avail;
+-        host_iov[i].iov_base = base;
+-        host_iov[i].iov_len = (size_t)len;
+-    }
++    *out_iovlen = 0;
++    for (unsigned i = 0; i < lmsg->msg_iovlen; i++)
++        if (hl_guest_iov_append(g, guest_iov[i].iov_base, guest_iov[i].iov_len,
++                                host_iov, out_iovlen, write) < 0) return linux_errno();
+     return 0;
++}
++static ssize_t guest_vector_send(int fd, struct iovec *iov, int count, int flags,
++                                  const void *address, socklen_t address_length) {
++    struct msghdr message = { .msg_iov = iov, .msg_iovlen = count,
++        .msg_name = (void *)address, .msg_namelen = address_length };
++    return sendmsg(fd, &message, flags);
+ }
+ 
+ /* ---------- Syscall implementations ---------- */
+@@ -890,15 +879,12 @@
+     hl_open_file_t *description __attribute__((unused)) = native_ref.of;
+     if (hl_wc_socket_seqpacket_of(description) && (linux_flags & ~(0x40 | 0x80 | 0x4000))) return -LINUX_EOPNOTSUPP;
+ 
+-    uint64_t avail = 0;
+-    void *buf = len > 0 ? guest_ptr_avail(g, buf_gva, &avail) : NULL;
+-    if (!buf && len > 0) return -LINUX_EFAULT;
+-    if (len > avail) len = avail;
++    struct iovec vectors[HL_GUEST_IOV_MAX]; int vector_count = 0;
++    if (hl_guest_iov_append(g, buf_gva, len, vectors, &vector_count, 0) < 0) return linux_errno();
+ 
+     if (hl_wc_socket_seqpacket_of(description)) {
+         if (dest_gva || addrlen) return -LINUX_EOPNOTSUPP;
+-        struct iovec iov = { buf, len };
+-        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++        struct msghdr msg = { .msg_iov = vectors, .msg_iovlen = vector_count };
+         ssize_t n = hl_wc_seqpacket_send(description, host_fd, &msg, translate_msg_flags(linux_flags));
+         if (n < 0) { if (errno == EPIPE && !(linux_flags & 0x4000)) signal_queue(LINUX_SIGPIPE); return linux_errno(); }
+         return n;
+@@ -930,7 +916,7 @@
+                                         &rel_un, &rel_len, &cf);
+             if (cc < 0) return cc;                 /* refuse: escapes the bind */
+             if (cc == 1) {
+-                ssize_t ret = sendto(host_fd, buf, len, mac_flags,
++                ssize_t ret = guest_vector_send(host_fd, vectors, vector_count, mac_flags,
+                                      (struct sockaddr *)&rel_un, rel_len);
+                 int e = errno;
+                 unix_confine_end(&cf);
+@@ -945,7 +931,7 @@
+             /* cc == 0: legacy mode — fall through to the absolute-path sendto. */
+         }
+ 
+-        ssize_t ret = sendto(host_fd, buf, len, mac_flags,
++        ssize_t ret = guest_vector_send(host_fd, vectors, vector_count, mac_flags,
+                               (struct sockaddr *)&mac_sa, (socklen_t)mac_len);
+         if (ret < 0) {
+             if (errno == EPIPE && !suppress_sigpipe)
+@@ -954,7 +940,7 @@
+         }
+         return ret;
+     } else {
+-        ssize_t ret = send(host_fd, buf, len, mac_flags);
++        ssize_t ret = guest_vector_send(host_fd, vectors, vector_count, mac_flags, NULL, 0);
+         if (ret < 0) {
+             if (errno == EPIPE && !suppress_sigpipe)
+                 signal_queue(LINUX_SIGPIPE);
+@@ -974,14 +960,11 @@
+     hl_open_file_t *description __attribute__((unused)) = native_ref.of;
+     if (hl_wc_socket_seqpacket_of(description) && (flags & ~(0x20 | 0x40 | 0x100 | 0x40000000))) return -LINUX_EOPNOTSUPP;
+ 
+-    uint64_t avail = 0;
+-    void *buf = len > 0 ? guest_ptr_access(g, buf_gva, &avail, 1) : NULL;
+-    if (!buf && len > 0) return -LINUX_EFAULT;
+-    if (len > avail) len = avail;
++    struct iovec vectors[HL_GUEST_IOV_MAX]; int vector_count = 0;
++    if (hl_guest_iov_append(g, buf_gva, len, vectors, &vector_count, 1) < 0) return linux_errno();
+ 
+     if (hl_wc_socket_seqpacket_of(description)) {
+-        struct iovec iov = { buf, len };
+-        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++        struct msghdr msg = { .msg_iov = vectors, .msg_iovlen = vector_count };
+         ssize_t n = hl_wc_seqpacket_recv(description, host_fd, &msg, translate_msg_flags(flags), !!(flags & 0x20));
+         if (n < 0) return linux_errno();
+         if (src_gva && addrlen_gva) { uint32_t zero = 0; if (guest_write(g, addrlen_gva, &zero, 4) < 0) return -LINUX_EFAULT; }
+@@ -992,13 +975,11 @@
+     struct sockaddr_storage mac_sa;
+     socklen_t mac_len = sizeof(mac_sa);
+ 
+-    ssize_t ret;
+-    if (src_gva && addrlen_gva) {
+-        ret = recvfrom(host_fd, buf, len, mac_flags,
+-                       (struct sockaddr *)&mac_sa, &mac_len);
+-    } else {
+-        ret = recv(host_fd, buf, len, mac_flags);
+-    }
++    struct msghdr native = { .msg_iov = vectors, .msg_iovlen = vector_count,
++        .msg_name = src_gva && addrlen_gva ? &mac_sa : NULL,
++        .msg_namelen = src_gva && addrlen_gva ? mac_len : 0 };
++    ssize_t ret = recvmsg(host_fd, &native, mac_flags);
++    mac_len = native.msg_namelen;
+     if (ret < 0) return linux_errno();
+ 
+     /* Write back source address if requested */
+@@ -1256,9 +1237,9 @@
+      */
+     if (!hl_wc_socket_seqpacket_of(description) && msghdr_simple_stream(&lmsg) &&
+         (linux_flags & ~MSG_FP_LINUX_OK) == 0) {
+-        struct iovec host_iov[64];
++        struct iovec host_iov[HL_GUEST_IOV_MAX];
+         int iovlen = 0;
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 0);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, HL_GUEST_IOV_MAX, &iovlen, 0);
+         if (err < 0) return err;
+ 
+         ssize_t ret;
+@@ -1304,10 +1285,10 @@
+     }
+ 
+     /* Build host iovec from guest iovec */
+-    struct iovec host_iov[64];
++    struct iovec host_iov[HL_GUEST_IOV_MAX];
+     int iovlen = 0;
+     {
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 0);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, HL_GUEST_IOV_MAX, &iovlen, 0);
+         if (err < 0) return err;
+     }
+ 
+@@ -1482,9 +1463,9 @@
+      */
+     if (!seqpacket && !passcred && msghdr_simple_stream(&lmsg) &&
+         (flags & ~MSG_FP_LINUX_OK) == 0) {
+-        struct iovec host_iov[64];
++        struct iovec host_iov[HL_GUEST_IOV_MAX];
+         int iovlen = 0;
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 1);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, HL_GUEST_IOV_MAX, &iovlen, 1);
+         if (err < 0) return err;
+ 
+         /* Always go through recvmsg here. recv()/readv() cannot report
+@@ -1511,10 +1492,10 @@
+     }
+ 
+     /* Build host iovec from guest iovec */
+-    struct iovec host_iov[64];
++    struct iovec host_iov[HL_GUEST_IOV_MAX];
+     int iovlen = 0;
+     {
+-        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, 64, &iovlen, 1);
++        int64_t err = msg_build_host_iov(g, &lmsg, host_iov, HL_GUEST_IOV_MAX, &iovlen, 1);
+         if (err < 0) return err;
+     }
+ 
