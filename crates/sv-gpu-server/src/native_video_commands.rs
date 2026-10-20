@@ -258,7 +258,9 @@ mod host {
     use crate::{native_video_dispatch::DispatchState, server::GpuServer};
     use sv_gpu_entry::GpuHost;
     fn active(state: &DispatchState, command: u64) -> bool {
-        state.video.scope_active(command) || state.plans.is_video(command)
+        state.video.scope_active(command)
+            || state.plans.is_video(command)
+            || state.plans.poisoned(command).is_some()
     }
     impl GpuServer {
         fn native_recording_answer(

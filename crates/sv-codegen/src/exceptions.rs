@@ -1035,7 +1035,7 @@ mod tests {
 /// Optional typed interception before wire handle mapping. Defaults preserve
 /// driver forwarding; queue workers can replay with the explicit bypass hook.
 pub const GPU_OPTIONAL_OVERRIDES: &[&str] = &[
-    "vkBindImageMemory", "vkBindImageMemory2",
+    "vkBindImageMemory", "vkBindImageMemory2", "vkBindBufferMemory", "vkBindBufferMemory2",
     "vkCmdPipelineBarrier", "vkCmdPipelineBarrier2", "vkCmdControlVideoCodingKHR",
     "vkBeginCommandBuffer", "vkEndCommandBuffer", "vkResetCommandBuffer",
     "vkAllocateCommandBuffers", "vkFreeCommandBuffers",

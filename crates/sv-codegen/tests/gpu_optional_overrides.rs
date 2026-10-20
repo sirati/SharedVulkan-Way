@@ -15,6 +15,8 @@ fn optional_hooks_precede_mapping_and_support_explicit_worker_bypass() {
     for method in [
         "bind_image_memory",
         "bind_image_memory2",
+        "bind_buffer_memory",
+        "bind_buffer_memory2",
         "queue_submit",
         "queue_submit2",
         "queue_wait_idle",

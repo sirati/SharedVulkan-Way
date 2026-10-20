@@ -63,6 +63,7 @@ pub enum BarrierAction {
 pub struct Plans {
     buffers: HashMap<u64, Recording>,
     allocations: HashMap<u64, u64>,
+    secondary: std::collections::HashSet<u64>,
 }
 impl Plans {
     pub fn allocated(&mut self, pool: u64, wires: &[u64]) -> Result<()> {
@@ -78,6 +79,14 @@ impl Plans {
             self.allocations.insert(*wire, pool);
         }
         Ok(())
+    }
+    pub fn allocated_secondary(&mut self, pool: u64, wires: &[u64]) -> Result<()> {
+        self.allocated(pool, wires)?;
+        self.secondary.extend(wires.iter().copied());
+        Ok(())
+    }
+    pub fn allows_video(&self, wire: u64) -> bool {
+        !self.secondary.contains(&wire)
     }
     pub fn contains(&self, wire: u64) -> bool {
         self.buffers.contains_key(&wire)
@@ -108,7 +117,11 @@ impl Plans {
         if wire == 0 {
             return Err(Rejected("null command buffer"));
         }
-        self.buffers.insert(wire, Recording::default());
+        let mut recording = Recording::default();
+        if self.secondary.contains(&wire) {
+            recording.mode = Mode::Ordinary;
+        }
+        self.buffers.insert(wire, recording);
         Ok(())
     }
     pub fn reset(&mut self, wire: u64) {
@@ -117,6 +130,7 @@ impl Plans {
     pub fn free(&mut self, wires: &[u64]) {
         for wire in wires {
             self.allocations.remove(wire);
+            self.secondary.remove(wire);
             self.reset(*wire)
         }
     }
@@ -564,5 +578,24 @@ mod pool_tests {
         p.free(&[3]);
         assert!(!p.contains(3));
         assert!(p.pool_buffers(11).is_empty());
+    }
+}
+#[cfg(test)]
+mod secondary_tests {
+    use super::*;
+    #[test]
+    fn secondary_buffers_keep_native_recording_but_refuse_video_staging() {
+        let mut plans = Plans::default();
+        plans.allocated_secondary(10, &[7]).unwrap();
+        plans.begin(7).unwrap();
+        assert!(!plans.allows_video(7));
+        assert!(plans.prepare_ordinary(7).unwrap().is_empty());
+        assert!(plans.begin_scope(7).is_err());
+        assert!(plans.poisoned(7).is_some());
+        plans.free(&[7]);
+        plans.allocated(10, &[7]).unwrap();
+        plans.begin(7).unwrap();
+        assert!(plans.allows_video(7));
+        plans.begin_scope(7).unwrap();
     }
 }
