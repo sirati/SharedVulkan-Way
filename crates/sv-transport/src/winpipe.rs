@@ -129,22 +129,27 @@ const WRITE_TIMEOUT_MS: u32 = 500;
 
 #[cfg(windows)]
 fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::result::Result<u32, u32> {
-    // SAFETY: a fresh manual-reset event, closed below on every path.
+    // SAFETY: a fresh manual-reset event, closed after completion or retained with pending I/O.
     let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
     if event == 0 {
         return Err(unsafe { sys::GetLastError() });
     }
-    let mut ov = sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event };
+    let mut ov = Box::new(sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event });
+    let mut owned = if write { vec![0u8; len as usize] } else { Vec::new() };
+    if write {
+        // SAFETY: the caller supplies len readable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(buf, owned.as_mut_ptr(), len as usize) };
+    }
+    let io_buf = if write { owned.as_mut_ptr() } else { buf };
     let mut done: u32 = 0;
-    // SAFETY: `buf` is valid for `len` bytes for the duration of the call,
-    // which does not return before the operation has completed: either the
-    // call finishes synchronously or `GetOverlappedResult` waits for it.
+    // SAFETY: reads wait for completion before returning to the caller.
+    // Writes own their buffer and record, retaining both if cancellation stalls.
     let ok = unsafe {
-        let ovp = (&raw mut ov).cast::<core::ffi::c_void>();
+        let ovp = (&raw mut *ov).cast::<core::ffi::c_void>();
         if write {
-            sys::WriteFile(handle, buf, len, &mut done, ovp)
+            sys::WriteFile(handle, io_buf, len, &mut done, ovp)
         } else {
-            sys::ReadFile(handle, buf, len, &mut done, ovp)
+            sys::ReadFile(handle, io_buf, len, &mut done, ovp)
         }
     };
     let result = if ok != 0 {
@@ -173,7 +178,16 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
                 let e = unsafe { sys::GetLastError() };
                 if write && e == sys::WAIT_TIMEOUT {
                     unsafe { sys::CancelIoEx(handle, &mut ov) };
-                    let _ = unsafe { sys::GetOverlappedResult(handle, &mut ov, &mut n, 1) };
+                    if unsafe { sys::GetOverlappedResultEx(handle, &mut *ov, &mut n, WRITE_TIMEOUT_MS, 0) } == 0
+                        && unsafe { core::ptr::read_volatile(&ov.internal) } == AsyncWriter::PENDING
+                    {
+                        // vioser can leave cancellation pending indefinitely. The kernel
+                        // still owns these addresses. Quarantine them rather than block
+                        // this writer forever or free memory under the driver.
+                        std::mem::forget(ov);
+                        std::mem::forget(owned);
+                        return Err(sys::WAIT_TIMEOUT);
+                    }
                     Err(sys::WAIT_TIMEOUT)
                 } else {
                     Err(e)
@@ -194,14 +208,16 @@ fn overlapped_io(handle: isize, write: bool, buf: *mut u8, len: u32) -> core::re
 /// sat on the critical path of every request that found the host parked.
 /// Here the caller issues the overlapped `WriteFile` itself (the virtqueue
 /// kick happens inside that call) and returns; the record and its byte live
-/// in a slot of a fixed pool until the write completes, which the next write
-/// notices. Nothing blocks: a pool whose writes all still pend (a host end
-/// that stopped draining, §99.5) has them cancelled and the byte refused,
-/// which the bell counts as dropped, as it did a full queue.
+/// in an address-stable slot until the write completes. Requests that exceed
+/// the write timeout are cancelled and quarantined, so a broken cancellation
+/// cannot occupy the active pool forever. At most 256 quarantined requests are
+/// retained; complete port failure then refuses hints without blocking callers.
 #[cfg(windows)]
+#[allow(clippy::vec_box)] // Each pending record must retain its address when vectors grow.
 pub struct AsyncWriter {
     pipe: std::sync::Arc<Pipe>,
-    slots: Box<[AsyncSlot]>,
+    slots: Vec<Box<AsyncSlot>>,
+    retired: Vec<Box<AsyncSlot>>,
 }
 
 #[cfg(windows)]
@@ -209,6 +225,15 @@ struct AsyncSlot {
     ov: sys::Overlapped,
     buf: [u8; 16],
     busy: bool,
+    started: std::time::Instant,
+}
+
+#[cfg(windows)]
+impl Drop for AsyncSlot {
+    fn drop(&mut self) {
+        // Only completed slots are dropped. Outstanding requests are retained.
+        unsafe { sys::CloseHandle(self.ov.event) };
+    }
 }
 
 #[cfg(windows)]
@@ -217,6 +242,7 @@ unsafe impl Send for AsyncWriter {}
 #[cfg(windows)]
 impl AsyncWriter {
     const SLOTS: usize = 32;
+    const MAX_RETIRED: usize = 256;
     /// `STATUS_PENDING`: what `Internal` holds while a request is in flight
     /// (the `HasOverlappedIoCompleted` macro).
     const PENDING: usize = 0x103;
@@ -229,22 +255,40 @@ impl AsyncWriter {
             if event == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            slots.push(AsyncSlot {
+            slots.push(Box::new(AsyncSlot {
                 ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
                 buf: [0; 16],
                 busy: false,
-            });
+                started: std::time::Instant::now(),
+            }));
         }
-        Ok(AsyncWriter { pipe, slots: slots.into_boxed_slice() })
+        Ok(AsyncWriter { pipe, slots, retired: Vec::new() })
     }
 
     fn reap(&mut self) {
-        for s in self.slots.iter_mut().filter(|s| s.busy) {
-            // SAFETY: a volatile read of a field the I/O manager writes when
-            // the request completes; the slot does not move (boxed slice).
-            if unsafe { core::ptr::read_volatile(&s.ov.internal) } != Self::PENDING {
+        for s in self.slots.iter_mut().chain(self.retired.iter_mut()) {
+            if s.busy && unsafe { core::ptr::read_volatile(&s.ov.internal) } != Self::PENDING {
                 s.busy = false;
             }
+        }
+        for i in 0..self.slots.len() {
+            if !self.slots[i].busy || self.slots[i].started.elapsed().as_millis() < WRITE_TIMEOUT_MS as u128 {
+                continue;
+            }
+            unsafe { sys::CancelIoEx(self.pipe.handle, &mut self.slots[i].ov) };
+            let replacement = if let Some(j) = self.retired.iter().position(|s| !s.busy) {
+                self.retired.swap_remove(j)
+            } else if self.retired.len() < Self::MAX_RETIRED {
+                let event = unsafe { sys::CreateEventW(core::ptr::null_mut(), 1, 0, core::ptr::null()) };
+                if event == 0 { continue; }
+                Box::new(AsyncSlot {
+                    ov: sys::Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event },
+                    buf: [0; 16], busy: false, started: std::time::Instant::now(),
+                })
+            } else {
+                continue;
+            };
+            self.retired.push(std::mem::replace(&mut self.slots[i], replacement));
         }
     }
 }
@@ -268,9 +312,8 @@ impl std::io::Write for AsyncWriter {
         s.ov.internal = Self::PENDING;
         s.ov.internal_high = 0;
         let mut done = 0u32;
-        // SAFETY: the slot's buffer and record live in a boxed slice this
-        // writer owns, and `drop` cancels and waits for every request still
-        // in flight before they are freed.
+        // SAFETY: each slot has its own stable allocation. Pending slots
+        // retain their buffer and record, including during shutdown.
         let ok = unsafe {
             sys::WriteFile(handle, s.buf.as_ptr(), n as u32, &mut done, (&raw mut s.ov).cast::<core::ffi::c_void>())
         };
@@ -287,6 +330,7 @@ impl std::io::Write for AsyncWriter {
             }
         }
         s.busy = true;
+        s.started = std::time::Instant::now();
         crate::frametrace::hop("bell.issued");
         Ok(n)
     }
@@ -299,19 +343,20 @@ impl std::io::Write for AsyncWriter {
 #[cfg(windows)]
 impl Drop for AsyncWriter {
     fn drop(&mut self) {
-        let handle = self.pipe.handle;
-        for s in self.slots.iter_mut() {
+        for mut s in self.slots.drain(..).chain(self.retired.drain(..)) {
             if s.busy {
-                let mut n = 0u32;
-                // SAFETY: the record of a request on this handle; waited for
-                // so the record outlives it.
-                unsafe {
-                    sys::CancelIoEx(handle, &mut s.ov);
-                    sys::GetOverlappedResult(handle, &mut s.ov, &mut n, 1);
+                unsafe { sys::CancelIoEx(self.pipe.handle, &mut s.ov) };
+                let mut n = 0;
+                if unsafe { sys::GetOverlappedResult(self.pipe.handle, &mut s.ov, &mut n, 0) } == 0
+                    && unsafe { core::ptr::read_volatile(&s.ov.internal) } == Self::PENDING
+                {
+                    // Preserve the port too: closing it can itself wait on the
+                    // same broken driver's cancellation. No shutdown wait.
+                    std::mem::forget(self.pipe.clone());
+                    std::mem::forget(s);
+                    continue;
                 }
             }
-            // SAFETY: the slot's own event, closed once.
-            unsafe { sys::CloseHandle(s.ov.event) };
         }
     }
 }
@@ -654,7 +699,7 @@ impl std::io::Write for &Pipe {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        // An overlapped write has completed when `overlapped_io` returns, and
+        // An overlapped write has completed or been retained after timeout, and
         // a flush on the handle is one more call that could queue behind the
         // reader on a driver that serialises it; there is nothing to flush.
         if self.overlapped {
@@ -703,5 +748,51 @@ mod tests {
         let s = "e2e-1234";
         assert!(super::pipe_name(s).ends_with(s));
         assert!(crate::winshm::section_name(s).ends_with(s));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod async_writer_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_cancels_do_not_consume_the_active_pool() {
+        // No driver receives these records. Mark them pending to model a
+        // driver that never completes cancellation, without loading vioser.
+        let pipe = std::sync::Arc::new(Pipe { handle: sys::INVALID_HANDLE_VALUE, server: false, overlapped: true });
+        let mut writer = AsyncWriter::new(pipe).unwrap();
+        for slot in &mut writer.slots {
+            slot.busy = true;
+            slot.ov.internal = AsyncWriter::PENDING;
+            slot.started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        }
+        let address = &writer.slots[0].ov as *const sys::Overlapped;
+        writer.reap();
+        assert_eq!(writer.retired.len(), AsyncWriter::SLOTS);
+        assert!(writer.slots.iter().all(|slot| !slot.busy));
+        assert_eq!(address, &writer.retired[0].ov as *const sys::Overlapped);
+        // Model a late completion, then require reuse of the retired slot.
+        writer.retired[0].ov.internal = 0;
+        writer.slots[0].busy = true;
+        writer.slots[0].ov.internal = AsyncWriter::PENDING;
+        writer.slots[0].started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        writer.reap();
+        assert_eq!(writer.retired.len(), AsyncWriter::SLOTS);
+        assert_eq!(address, &writer.slots[0].ov as *const sys::Overlapped);
+        // Repeated permanent failure is bounded, even when no cancel completes.
+        for _ in 0..12 {
+            for slot in &mut writer.slots {
+                slot.busy = true;
+                slot.ov.internal = AsyncWriter::PENDING;
+                slot.started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+            }
+            writer.reap();
+        }
+        assert_eq!(writer.retired.len(), AsyncWriter::MAX_RETIRED);
+        assert!(writer.slots.iter().all(|slot| slot.busy));
+        // The fake outstanding operations have no kernel owner and may be freed.
+        for slot in writer.slots.iter_mut().chain(writer.retired.iter_mut()) {
+            slot.busy = false;
+        }
     }
 }

@@ -73,6 +73,7 @@ installation() {
   local n=$1 I=$D/inst-$1
   mkdir -p "$I/bin"
   cp "$ROOT/scripts/wc-session" "$I/wc-session"
+  printf '%s\n' "$D/test-home" >"$I/test-home"
   for b in wc-proxy wc-arena-host wc-launch sv-hostd; do ln -sf "$BIN/$b" "$I/bin/$b"; done
   cat >"$I/apps.ini" <<EOF
 [shm]
@@ -95,6 +96,7 @@ EOF
 for n in wcma wcmb wcmc wcmd; do installation "$n"; done
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$D/wrong.key"
 
+export WC_LAUNCH_TEST_HOME="$D/test-home"
 export WC_LAUNCH_RUN="$D/run" WC_LAUNCH_ARENA="$D/arena" WC_LAUNCH_WCBELL="$D/host.sock"
 export WC_LAUNCH_BELL_HUB="$D/hub" WC_LAUNCH_HUB_UNMANAGED=1 WC_LAUNCH_SESSION_SECS=600
 # §113: the compositor stands for the VM whose process tells a stalled guest

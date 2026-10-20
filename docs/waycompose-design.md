@@ -37598,3 +37598,30 @@ The following thirty-minute observation contained 13 complete GPU D0
 dwells, median 0.189 s, maximum 1.394 s, with none above 5 s. This confirms
 the busy-loop recovery under that workload. The process that triggers the
 periodic GPU wake remains unidentified.
+## §114. Doorbell writer recovery
+
+A shared compositor outlives its installations. A failed doorbell write must
+therefore leave later hints usable. `DetachedWriter` consumes the next queued
+hint after a write error instead of ending its thread. Unix file and inherited
+fd endpoints use that writer too, so a full port cannot block a ring caller.
+`WC_BELL_INLINE=0` selects it for Linux sockets as well, allowing the local
+multi-install harness to exercise the guest's queued writer path.
+
+Windows overlapped writes wait at most 500 ms, then allow another 500 ms for
+cancellation. If the driver still owns the request, its record, buffer and event
+remain allocated. Returning must not free memory the driver can still access.
+Reads retain their existing completion wait and use the caller's buffer.
+
+The default Windows `AsyncWriter` issues hints without waiting. Each request
+has an address-stable allocation. Requests still pending after 500 ms move to a
+quarantine after cancellation, and fresh or completed allocations replace them
+in the active pool. Late completions permit reuse. The quarantine holds at most
+256 requests beyond the 32 active slots. If a driver stops completing every
+request, hints eventually return `WouldBlock`; the application thread still
+runs. Shutdown retains any allocation and port reference whose request remains
+pending rather than waiting indefinitely for a broken driver.
+
+Tests cover a failed queued hint followed by a delivered hint, and simulated
+Windows cancellations that never complete followed by a late completion. The
+simulation never submits the fabricated requests to a driver. Test evidence
+and guest measurements belong outside the repository.
