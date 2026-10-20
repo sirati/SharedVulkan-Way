@@ -34,3 +34,11 @@ wc-broker = { workspace = true }
 
 # Unactivated protected original-page adapter, never the legacy whole-BAR client path.
 sv-ram = { path = "../sv-ram" }
+
+[features]
+# Explicit disposable native harness only; never enabled by daemon startup.
+protected-payload-fixture = []
+
+[[example]]
+name = "protected_qmp_flow"
+required-features = ["protected-payload-fixture"]

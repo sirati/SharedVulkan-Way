@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
-    use sv_hostd::{protected_qmp::PendingOriginal, qemu::Qmp};
+    use sv_hostd::protected_qmp::PendingOriginal;
     use sv_ram::linux_payload::{
         ServiceLocalBackend,
         protected::{NativeExportState, ProtectedBackend},
@@ -111,6 +111,7 @@ fn main() -> std::io::Result<()> {
         bar_bytes: enrolled.physical().bar_bytes,
     };
     let flow = unsafe { canonical::run(enrolled.backing(), &mut backend, source, &state)? };
+    println!("CANONICAL: durable context/grant and typed RW/RO projections created");
     let canonical::Flow {
         producer,
         consumer,
@@ -157,8 +158,10 @@ fn main() -> std::io::Result<()> {
         } < 0,
         "canonical RO mapping upgraded to execute",
     )?;
+    println!("CANONICAL: shared original bytes and immutable RO write/execute denial verified");
     let consumer_monitor = consumer.into_monitor();
     retired(&consumer_monitor)?;
+    println!("CANONICAL: exact consumer monitor retired");
     let mut pipe = [-1; 2];
     require(
         unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } == 0,
@@ -202,14 +205,16 @@ fn main() -> std::io::Result<()> {
     )?;
     // Actual kernel completion is checked independently after child exit.
     retired(&producer_monitor)?;
+    println!(
+        "CANONICAL: surviving child alias kept producer LIVE; exact monitor retired after final alias"
+    );
     require(
         owner.exclusions()? == durable_exclusions,
         "canonical exclusion changed after native retirement",
     )?;
     // Mutating our own disposable QEMU status must invalidate native source
     // liveness without treating either source death or pause as grant retirement.
-    let mut control = Qmp::connect(&qmp)?;
-    control.command("{\"execute\":\"stop\"}")?;
+    enrolled.pause_owned_source()?;
     require(
         enrolled.ensure_live().is_err(),
         "paused QMP source remained enrolled live",
@@ -221,9 +226,30 @@ fn main() -> std::io::Result<()> {
             .is_err(),
         "source invalidation allowed original mutation",
     )?;
+    println!("CANONICAL: paused original source refused further mutation");
+    // Canonical retained guards intentionally need not drop this backing. Use
+    // explicit controller authority after both actual kernel monitors retired;
+    // do not weaken retention merely to make a Child destructor run.
+    unsafe {
+        enrolled.shutdown_owned_fixture_source()?;
+    }
+    require(
+        enrolled.ensure_live().is_err(),
+        "exited source remained live",
+    )?;
+    require(
+        enrolled
+            .backing()
+            .initialize_zeroed(physical_offset, 4096)
+            .is_err(),
+        "exited source allowed original mutation",
+    )?;
+    require(
+        owner.exclusions()? == durable_exclusions,
+        "controller cleanup changed canonical exclusions",
+    )?;
     println!(
-        "CANONICAL NATIVE PASS: actual QMP/fdset original -> durable registry/context/grant -> typed producerRW/consumerRO -> surviving native alias LIVE -> exact monitors RETIRED; canonical exclusions retained {:?}. SIMULATED remote bootstrap only; no GPU/crossVM/release",
-        durable_exclusions
+        "CANONICAL: retained-channel quit and exact pidfd/Child wait completed; dead source refused, exclusions retained"
     );
     drop((owner, producer_monitor, consumer_monitor));
     // Reopen the protected snapshot after its exclusive context lock ends.
@@ -240,6 +266,10 @@ fn main() -> std::io::Result<()> {
     )?;
     drop(reopened);
     drop((backend, enrolled));
+    println!(
+        "CANONICAL NATIVE PASS: actual QMP inherited original -> durable registry/context/grant -> typed producerRW/consumerRO -> surviving native alias LIVE -> exact monitors RETIRED; durable exclusions retained {:?}. SIMULATED remote bootstrap only; no GPU/crossVM/release",
+        durable_exclusions
+    );
     // Registry evidence remains in this private directory. No deletion/reset API.
     Ok(())
 }
