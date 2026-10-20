@@ -28,10 +28,10 @@ index b32170b..c5f9174 100644
  mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
                                         const struct kk_view_layout *layout);
 diff --git a/src/kosmickrisp/bridge/mtl_texture.m b/src/kosmickrisp/bridge/mtl_texture.m
-index 496ce14..4e11af5 100644
+index 496ce14..4d1d448 100644
 --- a/src/kosmickrisp/bridge/mtl_texture.m
 +++ b/src/kosmickrisp/bridge/mtl_texture.m
-@@ -13,6 +13,66 @@
+@@ -13,6 +13,64 @@
  #include "vulkan/vulkan.h"
  
  #include <Metal/MTLTexture.h>
@@ -75,8 +75,6 @@ index 496ce14..4e11af5 100644
 +         if (IOSurfaceGetWidthOfPlane(surface, p) != w ||
 +             IOSurfaceGetHeightOfPlane(surface, p) != h ||
 +             IOSurfaceGetBytesPerElementOfPlane(surface, p) != element ||
-+             IOSurfaceGetElementWidthOfPlane(surface, p) != 1 ||
-+             IOSurfaceGetElementHeightOfPlane(surface, p) != 1 ||
 +             stride < w * element || stride > UINT32_MAX ||
 +             offset > allocation || h > (allocation - offset) / stride)
 +            return NULL;
@@ -344,7 +342,7 @@ index 6aff54b..c2edb2d 100644
  
  #endif // KK_MEMORY_H
 diff --git a/src/kosmickrisp/vulkan/kk_image.c b/src/kosmickrisp/vulkan/kk_image.c
-index 5f9b787..10447a7 100644
+index 5f9b787..67fff75 100644
 --- a/src/kosmickrisp/vulkan/kk_image.c
 +++ b/src/kosmickrisp/vulkan/kk_image.c
 @@ -273,16 +273,38 @@ kk_GetPhysicalDeviceImageFormatProperties2(
@@ -446,17 +444,31 @@ index 5f9b787..10447a7 100644
           break;
        }
        default:
-@@ -790,7 +840,8 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
+@@ -790,10 +840,19 @@ kk_get_image_subresource_layout(struct kk_device *dev, struct kk_image *image,
     }
  
     pLayout->subresourceLayout = (VkSubresourceLayout){
 -      .offset = offset_B,
+-      .size = plane->layout.size_B,
+-      .rowPitch = plane->layout.linear_stride_B,
+-      .arrayPitch = plane->layout.layer_stride_B,
 +      .offset = plane->mem && plane->mem->bo->chroma_texture
 +                   ? plane->mem_offset_B : offset_B,
-       .size = plane->layout.size_B,
-       .rowPitch = plane->layout.linear_stride_B,
-       .arrayPitch = plane->layout.layer_stride_B,
-@@ -920,6 +971,28 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
++      /* Keep the allocation requirements independent of the imported backing.
++       * Only the bound subresource layout describes the actual IOSurface.
++       */
++      .size = plane->mem && plane->mem->bo->chroma_texture
++                 ? plane->mem->bo->plane_sizes[p] : plane->layout.size_B,
++      .rowPitch = plane->mem && plane->mem->bo->chroma_texture
++                     ? plane->mem->bo->plane_strides[p]
++                     : plane->layout.linear_stride_B,
++      .arrayPitch = plane->mem && plane->mem->bo->chroma_texture
++                       ? plane->mem->bo->plane_sizes[p]
++                       : plane->layout.layer_stride_B,
+       .depthPitch = 1u,
+    };
+ 
+@@ -920,6 +979,24 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
     }
  #endif
  
@@ -473,10 +485,6 @@ index 5f9b787..10447a7 100644
 +         plane->mem_offset_B = mem->bo->plane_offsets[p];
 +         plane->mtl_handle = mtl_retain(p ? mem->bo->chroma_texture : mem->bo->texture);
 +         plane->addr = mtl_texture_get_gpu_resource_id(plane->mtl_handle);
-+         if (mem->bo->chroma_texture) {
-+            plane->layout.linear_stride_B = mem->bo->plane_strides[p];
-+            plane->layout.size_B = mem->bo->plane_sizes[p];
-+         }
 +      }
 +
 +      return VK_SUCCESS;
