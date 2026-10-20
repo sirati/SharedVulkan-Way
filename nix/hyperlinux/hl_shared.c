@@ -1,6 +1,9 @@
 /* Embedded Rust backing + HVF maps. Host sockets carry bootstrap and bells only.
  * mmap_lock serializes changes with fork, exec, munmap and mprotect. The private
  * lock protects resolver readers; it is never held while acquiring shm_lock. */
+#ifdef HL_WC_SHARED_TEST
+#include "shared-test-platform.h"
+#else
 #include "hl_shared.h"
 #include "hl_seals.h"
 #include <sys/stat.h>
@@ -15,13 +18,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#endif
 
 #define BLOCK (2ULL*1024*1024)
 typedef struct owner {
     wc_hl_backing *backing;
     wc_hl_mapping map;
     uint64_t ipa, span;
-    int refs, writable;
+    int refs, writable, pins, retired, stage2_removed;
     int seal_fd;
     uint64_t seal_id;
     dev_t dev; ino_t ino;
@@ -41,11 +45,57 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int overlap(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     return a < d && c < b;
 }
-void *hl_wc_resolve(uint64_t va, uint64_t *avail) {
+typedef struct access_pin { owner *o; struct access_pin *next; } access_pin;
+static _Thread_local hl_wc_access_scope *access_scope;
+static void free_owner(owner *o) {
+    hl_wc_seal_untrack(o->seal_fd, o->seal_id);
+    if (o->seal_fd >= 0) close(o->seal_fd);
+    wc_hl_prime_release(o->prime);
+    wc_hl_backing_release(o->backing);
+    free(o);
+}
+void hl_wc_access_begin(hl_wc_access_scope *scope) {
+    *scope = (hl_wc_access_scope){ .previous = access_scope };
+    access_scope = scope;
+}
+void hl_wc_access_end(hl_wc_access_scope *scope) {
+    if (access_scope != scope) abort();
+    access_scope = scope->previous;
+    pthread_mutex_lock(&lock);
+    access_pin *pin = scope->pins;
+    while (pin) {
+        access_pin *next = pin->next;
+        owner *o = pin->o;
+        if (--o->pins == 0 && o->retired && o->stage2_removed) {
+            owner **at = &retained;
+            while (*at && *at != o) at = &(*at)->retained_next;
+            if (*at != o) abort();
+            *at = o->retained_next;
+            free_owner(o);
+        }
+        free(pin); pin = next;
+    }
+    pthread_mutex_unlock(&lock);
+}
+void *hl_wc_resolve(uint64_t va, uint64_t *avail, int write, int *found) {
     void *p = NULL;
+    *found = 0;
     pthread_mutex_lock(&lock);
     for (view *v = views; v; v = v->next) {
         if (va >= v->va && va < v->end) {
+            *found = 1;
+            /* No fallback to the primary buffer on access denial. */
+            if (!access_scope || !(v->prot & (write ? LINUX_PROT_WRITE : LINUX_PROT_READ)) ||
+                (write && !v->o->writable)) break;
+            access_pin *pin = access_scope->pins;
+            while (pin && pin->o != v->o) pin = pin->next;
+            if (!pin) {
+                pin = malloc(sizeof(*pin));
+                if (!pin) break;
+                *pin = (access_pin){ .o = v->o, .next = access_scope->pins };
+                access_scope->pins = pin;
+                v->o->pins++;
+            }
             if (avail) *avail = v->end - va;
             p = (char *)v->o->map.base + v->o->map.data_offset + v->offset + va - v->va;
             break;
@@ -87,21 +137,20 @@ static void release_owner(guest_t *g, owner *o) {
     if (--o->refs) return;
     /* Remove Stage-2 before dropping the Rust-owned host view. Restore only
      * the private primary reservation, never memset an external allocation. */
-    if (hv_vm_unmap(o->ipa, o->map.mapped_len) != HV_SUCCESS) {
-        /* A failed Stage-2 removal is not a release acknowledgement. Keep
-         * both the allocation and its IPA reservation until VM destruction. */
-        o->refs = 1;
+    o->stage2_removed = hv_vm_unmap(o->ipa, o->map.mapped_len) == HV_SUCCESS;
+    if (o->stage2_removed)
+        hv_vm_map((char *)g->host_base + o->ipa - g->ipa_base,
+            o->ipa, o->span, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+    if (!o->stage2_removed || o->pins) {
+        /* A pin covers the complete native pointer use, including blocking IO.
+         * Stage-2 removal precedes retirement. Failed removal remains held
+         * until VM destruction. Neither case permits IPA or backing reuse. */
+        o->retired = 1;
         o->retained_next = retained;
         retained = o;
         return;
     }
-    hv_vm_map((char *)g->host_base + o->ipa - g->ipa_base,
-        o->ipa, o->span, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
-    hl_wc_seal_untrack(o->seal_fd, o->seal_id);
-    if (o->seal_fd >= 0) close(o->seal_fd);
-    wc_hl_prime_release(o->prime);
-    wc_hl_backing_release(o->backing);
-    free(o);
+    free_owner(o);
 }
 /* Split before mutation. Allocation failure leaves the original view intact. */
 static int split_at(uint64_t at) {
@@ -179,6 +228,7 @@ int hl_wc_protect(guest_t *g, uint64_t lo, uint64_t len, int prot) {
     return rc;
 }
 
+#ifndef HL_WC_SHARED_TEST
 static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
     int flags, int hfd, uint64_t offset, int inherited, void *prime) {
     if (g->is_rosetta) { wc_hl_prime_release(prime); return -LINUX_EOPNOTSUPP; }
@@ -231,17 +281,17 @@ static int64_t map_host(guest_t *g, uint64_t addr, uint64_t len, int prot,
         goto no_memory;
     }
     o->refs = 1;
-    if (fixed && hl_wc_unmap(g, addr, len) < 0) { release_owner(g, o); free(v); return -LINUX_ENOMEM; }
+    if (fixed && hl_wc_unmap(g, addr, len) < 0) { pthread_mutex_lock(&lock); release_owner(g, o); pthread_mutex_unlock(&lock); free(v); return -LINUX_ENOMEM; }
     int perms = MEM_PERM_R | ((prot & LINUX_PROT_WRITE) ? MEM_PERM_W : 0);
     if (guest_map_shared_pages(g, addr, len, o->ipa + o->map.data_offset,
         prot ? perms : 0) < 0) {
         guest_invalidate_ptes(g, addr, addr + len);
-        release_owner(g, o); free(v); return -LINUX_ENOMEM;
+        pthread_mutex_lock(&lock); release_owner(g, o); pthread_mutex_unlock(&lock); free(v); return -LINUX_ENOMEM;
     }
     guest_region_remove(g, addr, addr + len);
     if (guest_region_add(g, addr, addr + len, prot, flags, offset, "[waycompose-shared]") < 0) {
         guest_invalidate_ptes(g, addr, addr + len);
-        release_owner(g, o); free(v); return -LINUX_ENOMEM;
+        pthread_mutex_lock(&lock); release_owner(g, o); pthread_mutex_unlock(&lock); free(v); return -LINUX_ENOMEM;
     }
     *v = (view){ .va = addr, .end = addr + len, .prot = prot, .o = o };
     pthread_mutex_lock(&lock);
@@ -385,3 +435,5 @@ void hl_wc_prime_attach(int fd, const void *prime) {
     pthread_mutex_unlock(&lock);
     pthread_mutex_unlock(&mmap_lock);
 }
+
+#endif /* !HL_WC_SHARED_TEST */
