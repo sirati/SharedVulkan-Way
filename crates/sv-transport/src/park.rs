@@ -201,6 +201,19 @@ impl Bell<'_> {
         }
     }
 
+    /// Arm this canonical lane, recheck the caller's condition, and wait only
+    /// while it remains true. The epoch precedes the caller's final local
+    /// stop/queue check. Errors disarm the waiter before returning.
+    pub fn wait_while<E>(&self, epoch: u32, timeout: Duration, waiting: impl FnOnce() -> core::result::Result<bool, E>) -> core::result::Result<(), E> {
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        let condition = waiting();
+        if matches!(&condition, Ok(true)) && self.wake.load(Ordering::Acquire) == epoch {
+            sys::wait(self.wake, epoch, timeout);
+        }
+        self.parked.fetch_sub(1, Ordering::SeqCst);
+        condition.map(|_| ())
+    }
+
     /// Wake a local waiter **without** poking the cross-VM doorbell.
     ///
     /// This is what the receiving end of a [`CrossWake`] calls: a byte has

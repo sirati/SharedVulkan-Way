@@ -593,6 +593,20 @@ impl RingProducer {
         Ok(self.lanes.capacity - (tail - head))
     }
 
+    /// Payload bytes that fit now, including packet alignment and wrap pads.
+    pub fn available_payload(&self) -> Result<usize> {
+        self.check_generation()?;
+        let tail = self.region.atomic_u64(self.lanes.tail_off)?.load(Ordering::Relaxed);
+        let head = self.region.atomic_u64(self.lanes.head_off)?.load(Ordering::Acquire);
+        let free = self.lanes.capacity - tail.wrapping_sub(head);
+        let to_end = self.lanes.capacity - (tail & (self.lanes.capacity - 1));
+        let contiguous = free.min(to_end) / PACKET_ALIGN * PACKET_ALIGN;
+        let before = contiguous.saturating_sub(PACKET_HEADER_SIZE);
+        let after = (free.saturating_sub(to_end) / PACKET_ALIGN * PACKET_ALIGN)
+            .saturating_sub(PACKET_HEADER_SIZE);
+        Ok(before.max(after).min(self.max_payload()) as usize)
+    }
+
     pub fn capacity(&self) -> u64 {
         self.lanes.capacity
     }
@@ -744,6 +758,7 @@ impl RingConsumer {
                 self.region
                     .atomic_u64(self.lanes.head_off)?
                     .store(head + len64, Ordering::Release);
+                self.ctrl.bell(self.lanes.lane)?.ring();
                 continue;
             }
             let packet_kind = match kind {
@@ -852,6 +867,13 @@ impl RingConsumer {
 
     /// Release the packet [`RingConsumer::next`] returned and publish its seqno
     /// as completed — which is what every barrier against this ring waits on.
+    /// Leave the peeked packet in the ring without releasing any space.
+    /// A caller may inspect it again later, including through another consumer
+    /// that serializes access to the same lane.
+    pub fn defer(&mut self) {
+        self.pending = None;
+    }
+
     pub fn advance(&mut self) -> Result<()> {
         let Pending { head, len, seqno } = match self.pending.take() {
             Some(p) => p,
@@ -864,6 +886,9 @@ impl RingConsumer {
             .atomic_u64(self.ctrl.base + RC_COMPLETED_SEQNO)?
             .store(seqno, Ordering::Release);
         self.region.atomic_u64(self.lanes.head_off)?.store(head + len, Ordering::Release);
+        // Credit publication uses this same canonical lane bell. A writer
+        // parks here with the same epoch/recheck handshake as a reader.
+        self.ctrl.bell(self.lanes.lane)?.ring();
         Ok(())
     }
 
