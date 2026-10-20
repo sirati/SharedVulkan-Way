@@ -2056,7 +2056,7 @@ impl PoolTransport for Arena {
         };
         let offset = lease.offset.checked_add(*offset).ok_or_else(|| io::Error::other("native GTK backing offset overflow"))?;
         let end = offset.checked_add(*len).ok_or_else(|| io::Error::other("native GTK backing length overflow"))?;
-        let (_, fd) = lease.pieces.iter().zip(&lease.fds).find(|(p,_)|
+        let (piece, fd) = lease.pieces.iter().zip(&lease.fds).find(|(p,_)|
             p.offset <= offset && p.offset.checked_add(p.len).is_some_and(|e| e >= end))
             .ok_or_else(|| io::Error::other("native GTK allocation crosses bounded broker fd parts"))?;
         Ok(NativeBacking { description: wc_native_shm::Backing::Broker { id: lease.id, run: lease.run, epoch: lease.epoch, offset },
