@@ -38035,14 +38035,14 @@ allocations require existing broker-leased guest RAM or registered contiguous
 BAR backing and the existing mapped user policy. No new sandbox exception, broker authorization policy, or raw
 QEMU RAM descriptor is introduced.
 
-On `55d1987`, all workspace tests pass: 3,455 passed, zero failed, ten
-ignored. Clippy completes with existing warnings; Windows workspace and
+After reviewed master `cad1f9bf` is merged as `ee45a51`, all workspace tests
+pass: 3,465 passed, zero failed, ten ignored. Clippy completes with existing warnings; Windows workspace and
 selected macOS checks pass. The native regressions cover original-page
 painting, SCM_RIGHTS identity and lifetime, broker retirement through mapping
 use, broker run/epoch rejection, foreign anon-inode rejection with matching
 stat metadata, mismatched transport-source rejection, registered BAR mapping
 and actual-header validation, dual-lifetime reclamation, and refusal to guess
-drain after premature destruction. The GTK package and release proxy build.
+drain after premature destruction. The GTK package, Linux releases and Windows releases build.
 
 The disposable NixOS kernel test passes as ordinary user `alice`, with normal
 `ptrace_scope=1`. Actual udmabufs pass duplicate identity and reject a foreign
@@ -38069,13 +38069,32 @@ fixture measures the live X window geometry for that click. The older log
 geometry parser and the attempted Alt+F4 did not deliver a close request.
 Its local FPS under concurrent tests is not a hardware benchmark.
 
-`WC_LAUNCH_GPU_GTK` selects a shipped GTK store output already copied to the
-host. Deployment checks its GDK and retains its closure with a GC root, then
-writes its library path and strict allocator setting into `gpu.env`. The session
-exports allocator enablement to the proxy as well as the application. Fixture
-mode is never enabled by deployment. The current broker migration and mapped
-user authorization guards still apply. Family deployment remains held for
-review.
+The local screenshot's black rectangle outside Firefox belongs to Wine's
+1920x1200 Explorer desktop, not the 1288x1044 compositor window. Before/after
+window trees, PID properties and images establish that ownership. Wine retains
+uncovered pixels after child windows resize or leave. The fixture calls
+`PaintDesktop` with `DCX_CLIPCHILDREN`, then requests repaint: the uncovered
+background returns to blue while Firefox remains drawn. It does not paint over
+an application child or change the Wayland copy count.
+
+GPU Firefox deployment requires `WC_LAUNCH_GPU_GTK`, a shipped GTK store output
+already copied to the host, plus the render node, guest PCI identity and Zink
+VA driver. Before ending an existing session, deployment checks those inputs
+and compares the GTK output's protocol XML/C-header hashes with its proxy
+source. It retains the output with a GC root and writes its library path and
+strict allocation settings into `gpu.env`. The session enables the allocator
+on the proxy and refuses GPU Firefox startup without the matching library,
+namespace and PCI prerequisites. It never writes a WebRender force preference;
+it clears the legacy automatic true value from managed Firefox profiles.
+Lavapipe's explicit force preference exists only in the test fixture.
+
+These GTK/VA checks apply to the selected GPU Firefox applications: selected
+guest app ids resolve through their `host-app` aliases and host `exec`/`gpu`
+definitions. Minecraft, native apps and Firefox with `gpu=off` acquire no GTK/VA
+dependency. Tests cover these cases, missing prerequisites, ABI mismatch and
+per-app environment overrides. Fixture mode is never enabled by deployment.
+Current broker migration and mapped-user authorization guards still apply.
+Family deployment remains held for review.
 
 ## 113. A guest that stalls is not a guest that died: the lease rides out a frozen VM
 
