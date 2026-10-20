@@ -191,6 +191,24 @@ index 166936d..081ba7f 100644
      if (syscall_stats_enabled()) {
          if ((int)x8 == SYS_close && (int)x0 >= 0)
              syscall_stats_clear_fd((int)x0);
+diff --git a/src/syscall_exec.c b/src/syscall_exec.c
+index 83d3cb7..63e5422 100644
+--- a/src/syscall_exec.c
++++ b/src/syscall_exec.c
+@@ -1,3 +1,4 @@
++#include "thread.h"
+ /* syscall_exec.c — execve syscall handler for hl
+  *
+  * Copyright 2025 Moritz Angermann <moritz@zw3rk.com>, zw3rk pte. ltd.
+@@ -68,6 +69,8 @@ static int read_string_array(guest_t *g, uint64_t array_gva,
+ int64_t sys_execve(hv_vcpu_t vcpu, guest_t *g,
+                    uint64_t path_gva, uint64_t argv_gva, uint64_t envp_gva,
+                    int verbose) {
++    int security_exec_scope __attribute__((cleanup(thread_exec_end)))=thread_exec_begin();
++    if (!security_exec_scope) return -95; /* EOPNOTSUPP: mm unsharing is absent */
+     /* Step 1: Read path from guest memory */
+     char guest_path[LINUX_PATH_MAX];
+     if (guest_read_str(g, path_gva, guest_path, sizeof(guest_path)) < 0)
 diff --git a/src/syscall_inotify.c b/src/syscall_inotify.c
 index 635c04f..bb72b56 100644
 --- a/src/syscall_inotify.c
@@ -486,7 +504,7 @@ index 7faa84b..d5cfdd9 100644
   * the guest stack. Returns SYSCALL_EXEC_HAPPENED to skip X0 writeback. */
  int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g);
 diff --git a/src/thread.c b/src/thread.c
-index 6854b0e..615c035 100644
+index 6854b0e..5dc7274 100644
 --- a/src/thread.c
 +++ b/src/thread.c
 @@ -8,6 +8,8 @@
@@ -498,7 +516,7 @@ index 6854b0e..615c035 100644
  #include "guest.h"   /* SHIM_DATA_BASE, BLOCK_2MB, GUEST_IPA_BASE */
  #include "hv_util.h" /* vcpu_get_gpr, vcpu_get_sysreg */
  
-@@ -24,6 +26,7 @@
+@@ -24,12 +26,14 @@
  /* ---------- Thread table ---------- */
  
  static thread_entry_t thread_table[MAX_THREADS];
@@ -506,7 +524,14 @@ index 6854b0e..615c035 100644
  static pthread_mutex_t thread_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 5 */
  
  /* Bitmask tracking allocated SP_EL1 slots. Bit N set = slot N in use.
-@@ -75,6 +78,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+  * MAX_THREADS=64 fits exactly in a uint64_t. Slot 0 is the main thread
+  * (top of shim data region); each subsequent slot is 4KB below. */
+ static uint64_t sp_el1_allocated = 0;
++static thread_entry_t *exec_owner;
+ 
+ /* Per-thread pointer to the current thread's entry. Set once when a
+  * host pthread starts running a guest vCPU. Syscall handlers read this
+@@ -75,6 +79,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
      t->clear_child_tid = 0;
      t->sp_el1          = sp_el1;
      t->active          = 1;
@@ -514,7 +539,7 @@ index 6854b0e..615c035 100644
      t->altstack_flags  = LINUX_SS_DISABLE;
      t->on_altstack     = 0;
      thread_ptrace_init(t);
-@@ -88,7 +92,7 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
+@@ -88,15 +93,23 @@ void thread_register_main(hv_vcpu_t vcpu, hv_vcpu_exit_t *vexit,
      current_thread = t;
  }
  
@@ -523,7 +548,9 @@ index 6854b0e..615c035 100644
      thread_entry_t *result = NULL;
  
      pthread_mutex_lock(&thread_lock);
-@@ -97,6 +101,13 @@ thread_entry_t *thread_alloc(int64_t tid) {
++    if (exec_owner) { pthread_mutex_unlock(&thread_lock); return NULL; }
+     for (int i = 0; i < MAX_THREADS; i++) {
+         if (!thread_table[i].active) {
              thread_entry_t *t = &thread_table[i];
              memset(t, 0, sizeof(*t));
              t->guest_tid = tid;
@@ -537,7 +564,7 @@ index 6854b0e..615c035 100644
              t->active    = 1;
              t->altstack_flags = 2; /* LINUX_SS_DISABLE */
              thread_ptrace_init(t);
-@@ -143,7 +154,10 @@ void thread_deactivate(thread_entry_t *t) {
+@@ -143,7 +156,10 @@ void thread_deactivate(thread_entry_t *t) {
      /* Free SP_EL1 slot so it can be reused by future threads */
      thread_free_sp_el1_locked(t->sp_el1);
  
@@ -548,7 +575,7 @@ index 6854b0e..615c035 100644
  
      /* Do NOT destroy ptrace condvars here — a waiter woken by the
       * broadcast above may still be inside pthread_cond_wait() trying
-@@ -161,6 +175,7 @@ void thread_publish_vcpu(thread_entry_t *t, hv_vcpu_t vcpu,
+@@ -161,6 +177,7 @@ void thread_publish_vcpu(thread_entry_t *t, hv_vcpu_t vcpu,
      pthread_mutex_lock(&thread_lock);
      t->vcpu = vcpu;
      t->vexit = vexit;
@@ -556,7 +583,7 @@ index 6854b0e..615c035 100644
      t->vcpu_valid = 1;
      pthread_mutex_unlock(&thread_lock);
  }
-@@ -298,6 +313,11 @@ uint64_t thread_alloc_sp_el1(void) {
+@@ -298,6 +315,11 @@ uint64_t thread_alloc_sp_el1(void) {
      return sp;
  }
  
@@ -568,7 +595,7 @@ index 6854b0e..615c035 100644
  void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx) {
      pthread_mutex_lock(&thread_lock);
      for (int i = 0; i < MAX_THREADS; i++) {
-@@ -532,3 +552,39 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
+@@ -532,3 +554,58 @@ int64_t thread_ptrace_wait(int64_t tracer_tid, int pid, int *out_status,
          }
      }
  }
@@ -608,8 +635,27 @@ index 6854b0e..615c035 100644
 +    }
 +    pthread_mutex_unlock(&thread_lock);
 +}
++
++/* Without mm unsharing and sibling retirement, replacing a multithreaded VM
++ * would leave old vCPUs executing the new image with potentially weaker filters.
++ * Refuse it before exec's point of no return, and exclude concurrent clones. */
++int thread_exec_begin(void) {
++    pthread_mutex_lock(&thread_lock);
++    int count=0;
++    for (int i=0;i<MAX_THREADS;++i) count+=!!thread_table[i].active;
++    int ok=count==1 && current_thread && !exec_owner;
++    if (ok) exec_owner=current_thread;
++    pthread_mutex_unlock(&thread_lock);
++    return ok;
++}
++void thread_exec_end(int *scope) {
++    if (!*scope) return;
++    pthread_mutex_lock(&thread_lock);
++    if (exec_owner==current_thread) exec_owner=NULL;
++    pthread_mutex_unlock(&thread_lock);
++}
 diff --git a/src/thread.h b/src/thread.h
-index 540ba99..ea2eaec 100644
+index 540ba99..d79b6a9 100644
 --- a/src/thread.h
 +++ b/src/thread.h
 @@ -19,6 +19,7 @@
@@ -640,17 +686,19 @@ index 540ba99..ea2eaec 100644
  
  /* Mark a thread as inactive and release its table slot. */
  void thread_deactivate(thread_entry_t *t);
-@@ -136,6 +141,9 @@ int thread_tid_alive(int64_t tid);
+@@ -136,6 +141,11 @@ int thread_tid_alive(int64_t tid);
  
  /* Count currently active threads. */
  int thread_active_count(void);
 +int thread_seccomp_terminate(int whole_group);
 +int thread_seccomp_terminated(void);
 +void thread_wait_other_workers(void);
++int thread_exec_begin(void);
++void thread_exec_end(int *scope);
  
  /* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KB slot
   * counting down from the top of the shim data region. The IPA base
-@@ -146,6 +154,8 @@ uint64_t thread_alloc_sp_el1(void);
+@@ -146,6 +156,8 @@ uint64_t thread_alloc_sp_el1(void);
  /* Iterate over all active threads, calling fn(entry, ctx) for each.
   * Holds the thread table lock during iteration. */
  void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
