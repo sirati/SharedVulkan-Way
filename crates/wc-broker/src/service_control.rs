@@ -19,6 +19,7 @@ pub struct Source {
     pub host_inode: u64,
     pub qemu_start: u64,
     pub driver_generation: u64,
+    pub bar_run: u64,
     pub bar_bytes: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +103,7 @@ impl Message {
             || s.host_inode == 0
             || s.qemu_start == 0
             || s.driver_generation == 0
+            || s.bar_run == 0
             || s.bar_bytes == 0
             || b.windows_run == 0
             || b.linux_run == 0
@@ -202,6 +204,7 @@ impl Message {
             s.host_inode,
             s.qemu_start,
             s.driver_generation,
+            s.bar_run,
             s.bar_bytes,
             b.windows_run,
             b.linux_run,
@@ -271,6 +274,7 @@ impl Message {
             host_inode: r.u64()?,
             qemu_start: r.u64()?,
             driver_generation: r.u64()?,
+            bar_run: r.u64()?,
             bar_bytes: r.u64()?,
         };
         let binding = Binding {
@@ -364,6 +368,7 @@ pub(crate) fn fixture() -> Message {
                 host_inode: 47,
                 qemu_start: 911,
                 driver_generation: 7,
+                bar_run: 17,
                 bar_bytes: 16 << 20,
             },
             roles: Roles {
