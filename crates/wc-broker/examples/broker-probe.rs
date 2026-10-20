@@ -12,6 +12,7 @@
 //!                                      in PID, and by the broker's `open ID`
 //! broker-probe adopt POOL              adopt this user's orphans of POOL, read and free them
 //! broker-probe sign INSTALL            the broker's signature and identity
+//! broker-probe sign-check INSTALL      verify current/retired keys from stdin, metadata only
 //! broker-probe rtt N                   N stats requests, timed
 //! broker-probe bw SLOT direct|broker   memcpy bandwidth through the mapped BAR
 //! ```
@@ -202,7 +203,7 @@ mod win {
                 }
                 Ok(())
             }
-            "sign" => {
+            "sign" | "sign-check" => {
                 let mut c = client("probe")?;
                 let req = wc_broker::proto::SignReq {
                     install: arg(1),
@@ -219,6 +220,25 @@ mod win {
                 let t = Instant::now();
                 let (auth, id) = c.sign(&req).map_err(|e| e.to_string())?;
                 let us = t.elapsed().as_micros();
+                if arg(0) == "sign-check" {
+                    use std::io::Read;
+                    let mut input = String::new();
+                    std::io::stdin().read_to_string(&mut input).map_err(|_| "reading verification input failed")?;
+                    let mut lines = input.lines();
+                    let current = lines.next().and_then(wc_handle::macboot::parse_key).ok_or("invalid current verification key")?;
+                    let retired = lines.next().and_then(wc_handle::macboot::parse_key).ok_or("invalid retired verification key")?;
+                    if lines.next().is_some() { return Err("unexpected verification input".into()); }
+                    let rec = wc_handle::macboot::Record {
+                        session: req.session.clone(), arena_run: req.arena_run,
+                        arena_pages: req.arena_pages, outbound: req.outbound,
+                        rings_run: req.rings_run, rings_pages: req.rings_pages, gpu: req.gpu,
+                    };
+                    let current_ok = auth.verifies_identity(&rec, req.seq, Some(&id), &current);
+                    let retired_ok = auth.verifies_identity(&rec, req.seq, Some(&id), &retired);
+                    println!("RESULT rotated-signature current={current_ok} retired={retired_ok}");
+                    if !current_ok || retired_ok { return Err("key rotation verification failed".into()); }
+                    return Ok(());
+                }
                 let mac: String = auth.mac.iter().map(|b| format!("{b:02x}")).collect();
                 println!("RESULT signed us={us} identity={:?} mac={mac}", id.text());
                 // With the key (a test's), check what the host's sessiond

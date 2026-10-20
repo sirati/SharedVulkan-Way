@@ -37012,6 +37012,10 @@ device 0) and `wcbell`, the GPU process for `gpu` (its `--ivshmem-slot`) and
 and the open as before; `WC_BROKER=off` skips it. `wc-launch` needs no
 device.
 
+The following measurements describe the original broker. Its cross-SID raw
+BAR regrant and unconditional uninstall behavior are superseded by the
+ownership and checked-shutdown restrictions below.
+
 **Measured**, on a local test VM (the deployment host's QEMU 10.2.2, 3 GiB, 4 vCPUs,
 a 64 MiB ivshmem device at 0x1c and one at 0x1d, the Looking Glass B7
 driver), two local non-admin users u1 and u2 run through the task scheduler;
@@ -37533,12 +37537,16 @@ generation with `services.waycompose`. For each installation it does this:
   for the admin and the desktop user are dropped and one for `waycompose` is
   added; the VM is not restarted;
 * `remove-old` deletes the admin's copies only after a session was seen
-  working; `rollback` puts the admin's units and links back.
+  working. `rollback` restores a previous protected installation snapshot
+  beneath the system layout, with its current trusted key. It keeps the
+  system services, user mapping and broker protection. It never restores
+  admin user units, desktop raw-resource ACLs or an exposed old key. A
+  missing protected snapshot refuses rollback.
 
-A dry run under `ROOT=` on a tree shaped like the VM host's (three
-installations, a profile with a lock file, Prism data with absolute paths and
-a binary file) gave the expected tree for plan, apply, rollback, apply again
-and remove-old. Not run on the VM host itself.
+The earlier legacy-layout dry run does not establish protected rollback.
+The current fixture checks protected snapshot restoration, key rotation,
+trusted-key reuse and refusal of unconfirmed provenance. Live migration
+remains pending.
 
 **wclinux is the exception.** The nested "Windows 7 (Linux)" demo desktop
 runs as the desktop user, like his applications. Its seat is still brought up
@@ -37570,8 +37578,9 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   (`WC_LAUNCH_HOST_ROOT`, default `sudo -n`; `sudokey run --` on the deployment
   host), replaces `/var/lib/waycompose/installs/<name>` by it. The stage's
   paths become the installation's, the admin's home becomes `~/` (the mapped
-  user's), the GC roots are registered at their new path, an installed key is
-  kept, and the stage's copy of the key is deleted;
+  user's), and the GC roots are registered at their new path. Only a
+  root-generated, broker-confirmed key is installed. A legacy stage key is
+  discarded;
 * the deploy is refused unless `users.conf` maps the installation to a user. A
   test installation is named in the host's `wctestInstalls`, so it runs as
   `wctest`, with its profile in that user's home;
@@ -37579,6 +37588,20 @@ or a system `wc-sessiond.service` present), and `install_services` refuses too.
   left alone. `WC_LAUNCH_SYSTEM_BINS=install` replaces them and restarts both,
   which is a doorbell blip of about a second for every session;
 * the debug ssh transport is not available with it.
+
+Before the first privileged-identity migration, `key-prepare` stops both
+legacy and system verifiers after refusing active sessions. It generates a
+fresh key beneath root-owned `/var/lib/waycompose/key-trust/<name>` with
+0700 directories and 0600 files. `key-export` sends that candidate directly
+to the deploy channel, never into the admin's staging tree. The Windows
+broker's privileged key provisioning must succeed before `key-confirm`
+records protected provenance. `apply` and `install-staged` refuse keys
+without that provenance. They never infer historical secrecy from a key's
+current owner or mode. Failure keeps the old verifier stopped; retry uses
+the same protected candidate. Already protected deployments reuse their
+key. Privileged broker provisioning through the old user layout is refused.
+The root helper and privileged deployment channel are trusted administration
+interfaces, not interfaces exposed to desktop clients.
 
 `scripts/wc-users-migrate-test.sh` runs `install-staged` in a dry tree
 (paths, key kept across a redeploy, the mapped user, refusals) and deploy's
