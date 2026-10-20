@@ -2049,6 +2049,7 @@ fn wayland_thread(
                                 "wc-compositor: ring slot {slot} could not be set in-band: {e}"
                             );
                         }
+                        ClientState::authorize_data_control(&client, &display.handle());
                         state.clients_seen += 1;
                         println!(
                             "wc-compositor: client {index} accepted on ring slot {slot}{}{} \
@@ -2110,6 +2111,7 @@ fn wayland_thread(
                                 let _ = std::io::stdout().flush();
                             }
                         }
+                        ClientState::authorize_data_control(&client, &display.handle());
                         state.clients_seen += 1;
                         arm_arena_for_first_client(&mut grow, state.clients_seen);
                     }

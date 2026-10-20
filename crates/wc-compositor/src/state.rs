@@ -850,6 +850,7 @@ pub struct State {
 /// Per-client data.
 #[derive(Default)]
 pub struct ClientState {
+    data_control_allowed: std::sync::atomic::AtomicBool,
     compositor_state: CompositorClientState,
     /// Which connection this is, counted from 1 in accept order.
     ///
@@ -871,6 +872,20 @@ pub struct ClientState {
 }
 
 impl ClientState {
+    /// Called after encoding setup and before dispatch, outside backend locks.
+    pub(crate) fn authorize_data_control(client: &Client, handle: &DisplayHandle) {
+        #[cfg(unix)]
+        if let Some(data) = client.get_data::<Self>() {
+            // SAFETY: geteuid has no pointer arguments or side effects.
+            let uid = unsafe { libc::geteuid() };
+            let allowed = client.get_credentials(handle).is_ok_and(|credentials| credentials.uid == uid)
+                && matches!(handle.backend_handle().client_fd_encoding(client.id()),
+                    smithay::utils::os::FdEncoding::InBandLease(_));
+            data.data_control_allowed.store(allowed, std::sync::atomic::Ordering::Release);
+        }
+        #[cfg(not(unix))]
+        let _ = (client, handle);
+    }
     pub fn new(index: u32) -> ClientState {
         ClientState { index, ..Default::default() }
     }
@@ -6749,19 +6764,12 @@ impl State {
     /// Explicit capability, absent by default. The actual local socket peer's
     /// kernel credentials and established lease dialect both gate visibility.
     pub(crate) fn enable_data_control(&mut self, display: &DisplayHandle) {
-        let handle = display.clone();
         self.data_control = Some(smithay::wayland::selection::wlr_data_control::DataControlState::new::<Self, _>(
-            display, None, move |client| {
-                #[cfg(unix)]
-                {
-                    // SAFETY: geteuid has no pointer arguments or side effects.
-                    let uid = unsafe { libc::geteuid() };
-                    client.get_credentials(&handle).is_ok_and(|credentials| credentials.uid == uid)
-                        && matches!(handle.backend_handle().client_fd_encoding(client.id()),
-                            smithay::utils::os::FdEncoding::InBandLease(_))
-                }
-                #[cfg(not(unix))]
-                { let _ = (&handle, client); false }
+            display, None, |client| {
+                // Registry visibility runs under the backend lock. Read only
+                // the trusted capability captured at accept; never reenter it.
+                client.get_data::<ClientState>().is_some_and(|data|
+                    data.data_control_allowed.load(std::sync::atomic::Ordering::Acquire))
             }));
         println!("wc-compositor: opt-in data-control visibility requires OS same-user and BAR lease identity");
     }
