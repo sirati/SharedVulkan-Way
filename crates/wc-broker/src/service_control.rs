@@ -7,9 +7,13 @@
 //! independently prove a compositor mapping has ceased to exist.
 use std::io;
 
-pub const DOMAIN: &[u8] = b"wc-broker/service-control/v1\0";
+// v2 wire input deliberately refuses v1. bar_registry currently embeds these
+// messages in durable records, so old snapshots also refuse startup until a
+// separate archival decoder imports exclusions. Never reinitialize old history
+// on this refusal. Archival import cannot mint live epoch/reservation authority.
+pub const DOMAIN: &[u8] = b"wc-broker/service-control/v2\0";
 pub const MAX_BYTES: usize = 4096;
-const MAGIC: &[u8; 8] = b"WCBCTL01";
+const MAGIC: &[u8; 8] = b"WCBCTL02";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
@@ -64,6 +68,10 @@ pub enum Phase {
     Resize = 9,
     RegisterProducer = 10,
     RegisterConsumer = 11,
+    GrantClosing = 12,
+    GrantQuiescent = 13,
+    GrantReleaseCommit = 14,
+    TransferCancelAck = 15,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Payload {
@@ -75,6 +83,7 @@ pub struct Payload {
     pub offset: u64,
     pub capacity: u64,
     pub length: u64,
+    pub close_generation: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -126,6 +135,13 @@ impl Message {
             return Err(bad("incomplete service control binding"));
         }
         let p = self.payload;
+        let barrier = matches!(
+            self.phase,
+            Phase::GrantClosing | Phase::GrantQuiescent | Phase::GrantReleaseCommit
+        );
+        if barrier != (p.close_generation != 0) {
+            return Err(bad("service control close generation differs from phase"));
+        }
         let extent = p.capacity != 0
             && p.length != 0
             && p.length <= p.capacity
@@ -136,6 +152,12 @@ impl Message {
         let no_extent = p.offset == 0 && p.capacity == 0 && p.length == 0;
         let shape = match self.phase {
             Phase::Grant | Phase::GrantRetired => p == Payload::default(),
+            Phase::GrantClosing | Phase::GrantQuiescent | Phase::GrantReleaseCommit => {
+                p == Payload {
+                    close_generation: p.close_generation,
+                    ..Payload::default()
+                }
+            }
             Phase::RegisterProducer => {
                 p.producer_registration != 0
                     && p == Payload {
@@ -158,7 +180,7 @@ impl Message {
                     && p.consumer == 0
                     && extent
             }
-            Phase::Prepare | Phase::TransferCancelled => {
+            Phase::Prepare | Phase::TransferCancelled | Phase::TransferCancelAck => {
                 p.producer_registration != 0
                     && p.recipient_registration != 0
                     && p.allocation != 0
@@ -243,6 +265,7 @@ impl Message {
             p.offset,
             p.capacity,
             p.length,
+            p.close_generation,
         ] {
             put64(&mut out, n);
         }
@@ -276,6 +299,10 @@ impl Message {
             9 => Phase::Resize,
             10 => Phase::RegisterProducer,
             11 => Phase::RegisterConsumer,
+            12 => Phase::GrantClosing,
+            13 => Phase::GrantQuiescent,
+            14 => Phase::GrantReleaseCommit,
+            15 => Phase::TransferCancelAck,
             _ => return Err(bad("unknown service control phase")),
         };
         let sequence = r.u64()?;
@@ -317,6 +344,7 @@ impl Message {
             offset: r.u64()?,
             capacity: r.u64()?,
             length: r.u64()?,
+            close_generation: r.u64()?,
         };
         if !r.0.is_empty() {
             return Err(bad("trailing service control bytes"));
@@ -420,6 +448,70 @@ pub(crate) fn fixture() -> Message {
 mod tests {
     use super::*;
     #[test]
+    fn closing_phases_have_dedicated_nonzero_generation_and_no_resource_fields() {
+        for phase in [
+            Phase::GrantClosing,
+            Phase::GrantQuiescent,
+            Phase::GrantReleaseCommit,
+        ] {
+            let mut message = fixture();
+            message.phase = phase;
+            message.payload = Payload {
+                close_generation: 91,
+                ..Payload::default()
+            };
+            let bytes = message.encode().unwrap();
+            assert_eq!(Message::decode(&bytes).unwrap(), message);
+            for field in 0..8 {
+                let mut invalid = message.clone();
+                match field {
+                    0 => invalid.payload.producer_registration = 1,
+                    1 => invalid.payload.recipient_registration = 1,
+                    2 => invalid.payload.allocation = 1,
+                    3 => invalid.payload.transfer = 1,
+                    4 => invalid.payload.consumer = 1,
+                    5 => invalid.payload.offset = 1,
+                    6 => invalid.payload.capacity = 1,
+                    _ => invalid.payload.length = 1,
+                }
+                assert!(invalid.encode().is_err());
+            }
+            message.payload.close_generation = 0;
+            assert!(message.encode().is_err());
+        }
+        let mut resource = fixture();
+        resource.payload.close_generation = 91;
+        assert!(resource.encode().is_err());
+    }
+    #[test]
+    fn cancel_ack_requires_exact_pending_tuple_without_native_completion_fields() {
+        let mut message = fixture();
+        message.phase = Phase::TransferCancelAck;
+        message.payload = Payload {
+            producer_registration: 3,
+            recipient_registration: 4,
+            allocation: 5,
+            transfer: 6,
+            ..Payload::default()
+        };
+        assert_eq!(
+            Message::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
+        for field in 0..4 {
+            let mut missing = message.clone();
+            match field {
+                0 => missing.payload.producer_registration = 0,
+                1 => missing.payload.recipient_registration = 0,
+                2 => missing.payload.allocation = 0,
+                _ => missing.payload.transfer = 0,
+            }
+            assert!(missing.encode().is_err());
+        }
+        message.payload.close_generation = 1;
+        assert!(message.encode().is_err());
+    }
+    #[test]
     fn canonical_frame_rejects_every_truncation_and_trailing_bytes() {
         let message = fixture();
         let bytes = message.encode().unwrap();
@@ -431,7 +523,7 @@ mod tests {
         trailing.push(0);
         assert!(Message::decode(&trailing).is_err());
         let mut alternate_version = bytes;
-        alternate_version[7] = b'2';
+        alternate_version[7] = b'1';
         assert!(Message::decode(&alternate_version).is_err());
         assert!(Message::decode(&vec![0; MAX_BYTES + 1]).is_err());
     }

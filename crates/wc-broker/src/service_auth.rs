@@ -294,14 +294,21 @@ impl Authenticator {
     fn check_role(&self, origin: Origin, phase: Phase) -> io::Result<()> {
         let roles = self.binding.roles;
         let required = match phase {
-            Phase::Grant | Phase::GrantRetired => roles.grantor,
+            Phase::Grant
+            | Phase::GrantRetired
+            | Phase::GrantClosing
+            | Phase::GrantReleaseCommit => roles.grantor,
+            Phase::GrantQuiescent => opposite(roles.grantor),
             Phase::RegisterProducer
             | Phase::Allocate
             | Phase::Resize
             | Phase::Prepare
             | Phase::ProducerRetired
             | Phase::TransferCancelled => roles.producer,
-            Phase::RegisterConsumer | Phase::Accept | Phase::ConsumerReleased => roles.consumer,
+            Phase::RegisterConsumer
+            | Phase::Accept
+            | Phase::ConsumerReleased
+            | Phase::TransferCancelAck => roles.consumer,
         };
         if origin != required {
             return Err(denied("service control phase is not this endpoint's role"));
@@ -356,6 +363,50 @@ mod tests {
         let mut signed = domain.to_vec();
         signed.extend_from_slice(&canonical);
         Frame::from_wire(&canonical, &hmac_sha256(key, &signed)).unwrap()
+    }
+    #[test]
+    fn closing_and_cancel_ack_roles_are_current_binding_directions() {
+        let (windows, linux) = pair();
+        for phase in [Phase::GrantClosing, Phase::GrantReleaseCommit] {
+            assert!(linux.check_role(Origin::Linux, phase).is_ok());
+            assert!(windows.check_role(Origin::Windows, phase).is_err());
+        }
+        assert!(
+            windows
+                .check_role(Origin::Windows, Phase::GrantQuiescent)
+                .is_ok()
+        );
+        assert!(
+            linux
+                .check_role(Origin::Linux, Phase::GrantQuiescent)
+                .is_err()
+        );
+        assert!(
+            linux
+                .check_role(Origin::Linux, Phase::TransferCancelAck)
+                .is_ok()
+        );
+        assert!(
+            windows
+                .check_role(Origin::Windows, Phase::TransferCancelAck)
+                .is_err()
+        );
+        let mut sender = auth(Origin::Linux, fixture().binding);
+        let mut receiver = auth(Origin::Windows, fixture().binding);
+        let frame = sender
+            .seal(
+                Phase::GrantClosing,
+                Payload {
+                    close_generation: 7,
+                    ..Payload::default()
+                },
+            )
+            .unwrap();
+        let mut changed = Message::decode(&frame.canonical).unwrap();
+        changed.payload.close_generation += 1;
+        let changed = Frame::from_wire(&changed.encode().unwrap(), &frame.mac).unwrap();
+        assert!(receiver.verify(&changed).is_err());
+        assert!(receiver.verify(&frame).is_ok());
     }
     #[test]
     fn ordinary_user_cannot_create_service_authority() {
