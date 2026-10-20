@@ -24,6 +24,11 @@ void hl_wc_socket_drop(hl_open_file_t *of) { (void)of; }
 
 fd_entry_t fd_table[FD_TABLE_SIZE];
 pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef __APPLE__
+pthread_mutex_t hl_fd_lifecycle_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+#else
+pthread_mutex_t hl_fd_lifecycle_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+#endif
 int hl_verbose = 0;
 
 static uint64_t free_bits[(FD_TABLE_SIZE + 63) / 64];
