@@ -37969,6 +37969,14 @@ Hardware VA decode remains unavailable on lavapipe, so the overall harness
 correctly fails its hardware-decode checks. Default guest hardware gates remain
 open.
 
+The stock Minecraft GL local regression also passes with upstream Mesa/Zink
+and the pool/lavapipe fixture: 4,968 presents, pointer lock and 30 raw motions,
+release, F2 screenshot, no crash, and clean exit 0 after the caption close
+button produces `xdg_toplevel.close` and Minecraft logs `Stopping!`. The
+fixture measures the live X window geometry for that click. The older log
+geometry parser and the attempted Alt+F4 did not deliver a close request.
+Its local FPS under concurrent tests is not a hardware benchmark.
+
 `WC_LAUNCH_GPU_GTK` selects a shipped GTK store output already copied to the
 host. Deployment checks its GDK and retains its closure with a GC root, then
 writes its library path and strict allocator setting into `gpu.env`. The session
